@@ -700,14 +700,20 @@ pub async fn get_history(
 
     let summaries: Vec<EventSummary> = events
         .into_iter()
-        .map(|event| EventSummary {
-            id: event.id.to_string(),
-            sequence_number: event.sequence_number,
-            timestamp: event.timestamp.to_rfc3339(),
-            operation_type: operation_kind(&event.operation),
-            operation: serde_json::to_value(&event.operation).unwrap_or(serde_json::Value::Null),
-            author: author_label(&event.author),
-            author_kind: author_kind(&event.author),
+        .map(|event| {
+            let operation =
+                serde_json::to_value(&event.operation).unwrap_or(serde_json::Value::Null);
+            let affected_parts = affected_solids(&operation);
+            EventSummary {
+                id: event.id.to_string(),
+                sequence_number: event.sequence_number,
+                timestamp: event.timestamp.to_rfc3339(),
+                operation_type: operation_kind(&event.operation),
+                operation,
+                author: author_label(&event.author),
+                author_kind: author_kind(&event.author),
+                affected_parts,
+            }
         })
         .collect();
 
@@ -771,6 +777,17 @@ pub struct EventSummary {
     pub author: String,
     /// Author classification for UI tinting: "user" | "ai" | "system"
     pub author_kind: String,
+    /// Top-level solid parts this event produced or modified — the per-part
+    /// swimlane grouping key. Only `solid:*` ids (fillet/chamfer face outputs,
+    /// drawing outputs, and no-output parameter moulds are excluded, so no
+    /// phantom lanes). Consumed operands live in the operation's `inputs`,
+    /// never here: a boolean that consumes `solid:0` + `solid:1` to produce
+    /// `solid:2` is one event on `solid:2`'s lane. Empty for non-geometry
+    /// events (drawing, mould, checkpoint) → frontend groups them in a
+    /// session lane. `#[serde(default)]` keeps older persisted payloads
+    /// (pre-this-field) deserializable.
+    #[serde(default)]
+    pub affected_parts: Vec<String>,
 }
 
 // ─── Feature Tree (operation-graph browser) ─────────────────────────
@@ -834,14 +851,20 @@ pub async fn get_feature_tree(
 
     let summaries: Vec<EventSummary> = events
         .into_iter()
-        .map(|event| EventSummary {
-            id: event.id.to_string(),
-            sequence_number: event.sequence_number,
-            timestamp: event.timestamp.to_rfc3339(),
-            operation_type: operation_kind(&event.operation),
-            operation: serde_json::to_value(&event.operation).unwrap_or(serde_json::Value::Null),
-            author: author_label(&event.author),
-            author_kind: author_kind(&event.author),
+        .map(|event| {
+            let operation =
+                serde_json::to_value(&event.operation).unwrap_or(serde_json::Value::Null);
+            let affected_parts = affected_solids(&operation);
+            EventSummary {
+                id: event.id.to_string(),
+                sequence_number: event.sequence_number,
+                timestamp: event.timestamp.to_rfc3339(),
+                operation_type: operation_kind(&event.operation),
+                operation,
+                author: author_label(&event.author),
+                author_kind: author_kind(&event.author),
+                affected_parts,
+            }
         })
         .collect();
 
@@ -909,6 +932,25 @@ fn lineage_from_operation(op: &serde_json::Value) -> Lineage {
     let mut lineage = Lineage::default();
     walk_for_lineage(op, &mut lineage);
     lineage
+}
+
+/// The top-level solid parts an event produced or modified — the swimlane
+/// grouping key on `EventSummary::affected_parts`. Reuses the operation's
+/// `outputs` lineage, keeping only `solid:*` ids so that fillet/chamfer face
+/// outputs (`face:*`), drawing outputs (`drawing:*`), and parameter moulds
+/// (no output at all) never invent phantom lanes. Consumed operands stay in
+/// `inputs` and are deliberately excluded: a boolean that consumes `solid:0`
+/// + `solid:1` to produce `solid:2` is one event on `solid:2`'s lane only.
+/// De-duplicated, first-seen order preserved.
+fn affected_solids(op_json: &serde_json::Value) -> Vec<String> {
+    let lineage = lineage_from_operation(op_json);
+    let mut seen = std::collections::HashSet::new();
+    lineage
+        .outputs
+        .into_iter()
+        .filter(|id| id.starts_with("solid:"))
+        .filter(|id| seen.insert(id.clone()))
+        .collect()
 }
 
 fn walk_for_lineage(value: &serde_json::Value, lineage: &mut Lineage) {
@@ -2616,4 +2658,71 @@ pub async fn scrub_timeline(
         "objects": objects,
         "assemblies": assemblies,
     })))
+}
+
+#[cfg(test)]
+mod affected_parts_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// The serialized `Operation::Generic` wire shape the history and
+    /// feature-tree mappers actually feed to `affected_solids` — matching a
+    /// live event payload: `{command_type, parameters:{inputs,outputs,params},
+    /// type:"Generic"}`. Verified against `GET /api/timeline/history/main`
+    /// (outputs are namespaced strings like `solid:2`, `face:5`, `drawing:…`).
+    fn generic_op(inputs: &[&str], outputs: &[&str]) -> serde_json::Value {
+        json!({
+            "command_type": "test_op",
+            "parameters": {
+                "inputs": inputs,
+                "outputs": outputs,
+                "params": {}
+            },
+            "type": "Generic"
+        })
+    }
+
+    #[test]
+    fn boolean_lands_on_produced_solid_not_consumed_operands() {
+        // A boolean consumes solid:0 + solid:1 and produces solid:2. The event
+        // belongs on solid:2's lane ONLY — the operands are inputs, not parts
+        // this op affected. (Mutation guard: an impl that read `inputs` instead
+        // of `outputs` returns [solid:0, solid:1] and fails here.)
+        let op = generic_op(&["solid:0", "solid:1"], &["solid:2"]);
+        let parts = affected_solids(&op);
+        assert_eq!(parts, vec!["solid:2".to_string()]);
+        assert!(!parts.contains(&"solid:0".to_string()));
+        assert!(!parts.contains(&"solid:1".to_string()));
+    }
+
+    #[test]
+    fn fillet_keeps_solid_drops_face_sub_entities() {
+        // fillet/chamfer record outputs [solid, ...new faces]; a face is not a
+        // part and must never become a phantom lane. (Mutation guard: an impl
+        // without the `solid:` filter returns the faces too and fails.)
+        let op = generic_op(&["solid:0"], &["solid:0", "face:5", "face:6"]);
+        assert_eq!(affected_solids(&op), vec!["solid:0".to_string()]);
+    }
+
+    #[test]
+    fn drawing_and_mould_have_no_part_lane() {
+        // A drawing outputs `drawing:*`; a parameter-mould has no output at
+        // all — both belong in the session lane (empty affected_parts), never
+        // on a solid lane.
+        let drawing = generic_op(&[], &["drawing:a28f4179-aa3c-4752-b680-b975a6fe3496"]);
+        assert!(affected_solids(&drawing).is_empty());
+        let mould = generic_op(&[], &[]);
+        assert!(affected_solids(&mould).is_empty());
+    }
+
+    #[test]
+    fn multi_solid_output_lands_on_each_lane_deduped() {
+        // A split-style op producing two solids lands on both lanes; a repeated
+        // id is de-duplicated, first-seen order preserved.
+        let op = generic_op(&["solid:9"], &["solid:3", "solid:4", "solid:3"]);
+        assert_eq!(
+            affected_solids(&op),
+            vec!["solid:3".to_string(), "solid:4".to_string()]
+        );
+    }
 }

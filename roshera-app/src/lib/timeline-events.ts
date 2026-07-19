@@ -20,6 +20,12 @@ export interface EventSummary {
   author: string // clean display name
   /** Backend-emitted classification: "user" | "ai" | "system". */
   author_kind?: AuthorKind
+  /** Top-level solid parts this event produced or modified, as namespaced
+   *  ids ("solid:2", …). Excludes consumed operands (they're inputs) and
+   *  sub-entities (face/edge). Empty for non-geometry events (drawing,
+   *  mould, checkpoint). Drives the per-part swimlane grouping; absent on
+   *  responses from a backend that predates the field. */
+  affected_parts?: string[]
 }
 
 export type AuthorKind = 'user' | 'ai' | 'system'

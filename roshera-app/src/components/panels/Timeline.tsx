@@ -1,5 +1,6 @@
-import { Fragment, useState, useEffect, useLayoutEffect, useCallback, useRef } from 'react'
+import { Fragment, useState, useEffect, useLayoutEffect, useCallback, useMemo, useRef } from 'react'
 import { useWSStore } from '@/stores/ws-store'
+import { useSceneStore } from '@/stores/scene-store'
 import { cn } from '@/lib/utils'
 import {
   type EventSummary,
@@ -115,6 +116,197 @@ function Connector() {
     <span className="text-muted-foreground/40 text-base leading-none self-start pt-[1px]">
       ──
     </span>
+  )
+}
+
+// ─── Per-part swimlanes (Certified Timeline slice 1) ────────────────
+//
+// One canonical event log, grouped into lanes by the part each event
+// touched (`EventSummary.affected_parts`, backend-computed). Consumed
+// operands are NOT here (they're inputs), so a boolean that merges two
+// solids into a third appears only on the third's lane. Events with no
+// solid output (drawings, parameter moulds) collect in a session lane.
+
+const SESSION_LANE = '·session'
+
+/** Lane label = the SAME name the browser/model tree shows for that solid.
+ *  `liveNames` maps a kernel solid id ("solid:2" lane key) to the live scene
+ *  object's `name` (custom names from create/rename included) via
+ *  `analyticalGeometry.solidId` — the same resolution PartDimensions uses.
+ *  Consumed/historical solids have no live object, so they honestly fall back
+ *  to the kernel default `solid_N`. The session bucket → "session". */
+function laneLabel(key: string, liveNames: Map<string, string>): string {
+  const live = liveNames.get(key)
+  if (live) return live
+  const m = key.match(/^solid:(.+)$/)
+  if (m) return `solid_${m[1]}`
+  if (key === SESSION_LANE) return 'session'
+  return key
+}
+
+interface Lane {
+  key: string
+  label: string
+  events: EventSummary[]
+}
+
+/** Bucket events into per-part lanes in first-appearance order; the
+ *  session lane (non-geometry events) always sorts last. An event that
+ *  affects multiple parts appears on each of their lanes. */
+function groupIntoLanes(
+  events: EventSummary[],
+  liveNames: Map<string, string>,
+): Lane[] {
+  const order: string[] = []
+  const buckets = new Map<string, EventSummary[]>()
+  for (const ev of events) {
+    const keys = ev.affected_parts && ev.affected_parts.length > 0
+      ? ev.affected_parts
+      : [SESSION_LANE]
+    for (const k of keys) {
+      const bucket = buckets.get(k)
+      if (bucket) {
+        bucket.push(ev)
+      } else {
+        buckets.set(k, [ev])
+        order.push(k)
+      }
+    }
+  }
+  return order
+    .sort((a, b) => (a === SESSION_LANE ? 1 : b === SESSION_LANE ? -1 : 0))
+    .map((k) => ({
+      key: k,
+      label: laneLabel(k, liveNames),
+      events: buckets.get(k) ?? [],
+    }))
+}
+
+function LaneTrack({
+  events,
+  latestId,
+  now,
+  onContextMenu,
+}: {
+  events: EventSummary[]
+  latestId: string | undefined
+  now: number
+  onContextMenu: (e: React.MouseEvent, event: EventSummary) => void
+}) {
+  return (
+    <div className="flex-1 min-w-0 overflow-x-auto overflow-y-hidden flex items-start gap-0 whitespace-nowrap px-2 py-1">
+      {events.map((event, i) => (
+        <Fragment key={event.id}>
+          {i > 0 && <Connector />}
+          <EventNode
+            event={event}
+            isLatest={event.id === latestId}
+            now={now}
+            onContextMenu={onContextMenu}
+          />
+        </Fragment>
+      ))}
+      <span className="text-muted-foreground/40 self-start pt-[1px] ml-1 text-base leading-none">
+        →
+      </span>
+    </div>
+  )
+}
+
+/** Vertical stack of per-part lanes — the by-part view. The globally
+ *  latest event pulses on whichever lane it sits in. */
+function Swimlanes({
+  events,
+  liveNames,
+  now,
+  onContextMenu,
+  loading,
+}: {
+  events: EventSummary[]
+  liveNames: Map<string, string>
+  now: number
+  onContextMenu: (e: React.MouseEvent, event: EventSummary) => void
+  loading: boolean
+}) {
+  if (events.length === 0) {
+    return (
+      <div className="text-[12px] text-muted-foreground/60 px-3 py-3">
+        {loading ? '⋯ loading' : '∅ no operations yet'}
+      </div>
+    )
+  }
+  const lanes = groupIntoLanes(events, liveNames)
+  const latestId = events[events.length - 1]?.id
+  // Cap the dock at ~2.5 lanes and scroll the rest, so the panel never
+  // grows tall enough to crowd the 3D viewport no matter how many parts
+  // exist. A subtle scrollbar signals there's more below.
+  return (
+    <div className="max-h-[124px] overflow-y-auto">
+      {lanes.map((lane) => (
+        <div
+          key={lane.key}
+          className="flex items-stretch border-b border-border/40 last:border-b-0 min-h-[46px]"
+        >
+          <div className="w-[92px] shrink-0 flex flex-col justify-center gap-0 px-2.5 border-r border-border/40">
+            <span className="text-[11px] text-foreground/90 truncate leading-tight">
+              {lane.label}
+            </span>
+            <span className="text-[9px] text-muted-foreground/60 leading-tight">
+              {lane.events.length} op{lane.events.length === 1 ? '' : 's'}
+            </span>
+          </div>
+          <LaneTrack
+            events={lane.events}
+            latestId={latestId}
+            now={now}
+            onContextMenu={onContextMenu}
+          />
+        </div>
+      ))}
+    </div>
+  )
+}
+
+/** Flat, time-ordered strip across all parts — the by-time view (the
+ *  original layout). Nodes tint their short label by affected part so the
+ *  interleave stays legible. */
+function FlatStrip({
+  events,
+  now,
+  onContextMenu,
+  loading,
+}: {
+  events: EventSummary[]
+  now: number
+  onContextMenu: (e: React.MouseEvent, event: EventSummary) => void
+  loading: boolean
+}) {
+  if (events.length === 0) {
+    return (
+      <div className="text-[12px] text-muted-foreground/60 px-3 py-3">
+        {loading ? '⋯ loading' : '∅ no operations yet'}
+      </div>
+    )
+  }
+  return (
+    <div className="overflow-x-auto overflow-y-hidden px-3 py-2">
+      <div className="flex items-start gap-0 whitespace-nowrap">
+        {events.map((event, i) => (
+          <Fragment key={event.id}>
+            {i > 0 && <Connector />}
+            <EventNode
+              event={event}
+              isLatest={i === events.length - 1}
+              now={now}
+              onContextMenu={onContextMenu}
+            />
+          </Fragment>
+        ))}
+        <span className="text-muted-foreground/40 self-start pt-[1px] ml-1 text-base leading-none">
+          →
+        </span>
+      </div>
+    </div>
   )
 }
 
@@ -729,6 +921,54 @@ export function Timeline() {
   // visually and adds little when you're focused on a single branch,
   // so it stays out of the way until you ask for it.
   const [overviewExpanded, setOverviewExpanded] = useState(false)
+  // Grouping mode for the strip. `part` = per-part swimlanes (default),
+  // `time` = the flat chronological strip. Remembered across sessions so
+  // the panel opens the way it was left.
+  const [viewMode, setViewMode] = useState<'part' | 'time'>(() => {
+    if (typeof window === 'undefined') return 'part'
+    return window.localStorage.getItem('roshera.timeline.view') === 'time'
+      ? 'time'
+      : 'part'
+  })
+  const setView = useCallback((m: 'part' | 'time') => {
+    setViewMode(m)
+    try {
+      window.localStorage.setItem('roshera.timeline.view', m)
+    } catch {
+      // localStorage unavailable (private mode / SSR) — in-memory only.
+    }
+  }, [])
+  // Live solid-id → display-name map, from the same scene store the browser
+  // tree renders (`obj.name` via `analyticalGeometry.solidId`). Keeps lane
+  // labels byte-identical to the tree for live parts — including custom
+  // names from create/rename. Memoized on the objects Map reference (the
+  // store replaces it on every scene mutation).
+  const sceneObjects = useSceneStore((s) => s.objects)
+  const liveNames = useMemo(() => {
+    const m = new Map<string, string>()
+    for (const [, obj] of sceneObjects) {
+      const sid = obj.analyticalGeometry?.solidId
+      if (sid !== undefined && obj.name) m.set(`solid:${sid}`, obj.name)
+    }
+    return m
+  }, [sceneObjects])
+  // Collapse the event body to just the controls row, reclaiming the dock's
+  // vertical space for the viewport. Remembered across sessions.
+  const [bodyCollapsed, setBodyCollapsed] = useState<boolean>(() => {
+    if (typeof window === 'undefined') return false
+    return window.localStorage.getItem('roshera.timeline.collapsed') === '1'
+  })
+  const toggleCollapsed = useCallback(() => {
+    setBodyCollapsed((prev) => {
+      const next = !prev
+      try {
+        window.localStorage.setItem('roshera.timeline.collapsed', next ? '1' : '0')
+      } catch {
+        // localStorage unavailable — in-memory only.
+      }
+      return next
+    })
+  }, [])
   const selectBranch = useCallback(async (branchId: string) => {
     if (branchId === activeBranchId) return
     try {
@@ -1165,9 +1405,19 @@ export function Timeline() {
         </div>
       )}
 
-      <div className="flex items-center gap-2 px-3 py-1.5 h-[80px]">
-        {/* Header: title + glyph actions */}
+      {/* Controls row: title + glyph actions, grouping toggle, branch chip */}
+      <div className="flex items-center gap-2 px-3 py-1.5">
         <div className="flex items-center gap-0.5 shrink-0 text-[13px]">
+          <button
+            type="button"
+            onClick={toggleCollapsed}
+            title={bodyCollapsed ? 'Expand timeline' : 'Collapse timeline'}
+            aria-label={bodyCollapsed ? 'Expand timeline' : 'Collapse timeline'}
+            aria-expanded={!bodyCollapsed}
+            className="text-foreground/55 hover:text-foreground transition-colors text-[11px] leading-none px-0.5"
+          >
+            {bodyCollapsed ? '▸' : '▾'}
+          </button>
           <span className="text-foreground/80 mr-1">timeline</span>
           <HeaderButton onClick={handleUndo} title="Undo (Ctrl+Z)" ariaLabel="Undo">↶</HeaderButton>
           <HeaderButton onClick={handleRedo} title="Redo (Ctrl+Shift+Z)" ariaLabel="Redo">↷</HeaderButton>
@@ -1187,33 +1437,45 @@ export function Timeline() {
 
         <span className="text-muted-foreground/40 shrink-0 text-[13px]">│</span>
 
-        {/* Event stream with terminal-style connectors */}
-        <div className="flex-1 min-w-0 overflow-x-auto overflow-y-hidden">
-          {events.length === 0 ? (
-            <div className="text-[12px] text-muted-foreground/60 px-2 py-3">
-              {loading ? '⋯ loading' : '∅ no operations yet'}
-            </div>
-          ) : (
-            <div className="flex items-start gap-0 whitespace-nowrap">
-              {events.map((event, i) => (
-                <Fragment key={event.id}>
-                  {i > 0 && <Connector />}
-                  <EventNode
-                    event={event}
-                    isLatest={i === events.length - 1}
-                    now={now}
-                    onContextMenu={handleEventContextMenu}
-                  />
-                </Fragment>
-              ))}
-              <span className="text-muted-foreground/40 self-start pt-[1px] ml-1 text-base leading-none">→</span>
-            </div>
-          )}
+        {/* Grouping toggle: per-part swimlanes (default) vs flat by-time */}
+        <div
+          className="inline-flex shrink-0 rounded border border-border overflow-hidden text-[11px]"
+          role="group"
+          aria-label="Timeline grouping"
+        >
+          <button
+            type="button"
+            onClick={() => setView('part')}
+            aria-pressed={viewMode === 'part'}
+            title="Group operations into per-part lanes"
+            className={cn(
+              'px-2 py-0.5 transition-colors',
+              viewMode === 'part'
+                ? 'bg-accent/40 text-foreground font-medium'
+                : 'text-muted-foreground hover:text-foreground hover:bg-accent/30',
+            )}
+          >
+            by&nbsp;part
+          </button>
+          <button
+            type="button"
+            onClick={() => setView('time')}
+            aria-pressed={viewMode === 'time'}
+            title="Show all parts in one chronological strip"
+            className={cn(
+              'px-2 py-0.5 transition-colors border-l border-border',
+              viewMode === 'time'
+                ? 'bg-accent/40 text-foreground font-medium'
+                : 'text-muted-foreground hover:text-foreground hover:bg-accent/30',
+            )}
+          >
+            by&nbsp;time
+          </button>
         </div>
 
-        {/* Right side: branch chip (active branch + count of others)
-            and the expand/collapse toggle. Click anywhere on the chip
-            to expand. */}
+        <div className="flex-1" />
+
+        {/* Branch chip + expand/collapse toggle for the branch graph. */}
         <button
           type="button"
           onClick={() => setOverviewExpanded((v) => !v)}
@@ -1240,6 +1502,30 @@ export function Timeline() {
           </span>
         </button>
       </div>
+
+      {/* Event body: per-part swimlanes (default) or the flat by-time strip.
+          Collapsible to reclaim viewport space; height-capped with internal
+          scroll so it never crowds the 3D view. */}
+      {!bodyCollapsed && (
+        <div className="border-t border-border/40">
+          {viewMode === 'part' ? (
+            <Swimlanes
+              events={events}
+              liveNames={liveNames}
+              now={now}
+              onContextMenu={handleEventContextMenu}
+              loading={loading}
+            />
+          ) : (
+            <FlatStrip
+              events={events}
+              now={now}
+              onContextMenu={handleEventContextMenu}
+              loading={loading}
+            />
+          )}
+        </div>
+      )}
 
       {menu && (
         <EventContextMenu
