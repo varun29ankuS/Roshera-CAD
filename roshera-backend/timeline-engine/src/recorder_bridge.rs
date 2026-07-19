@@ -39,7 +39,27 @@ use parking_lot::RwLock as PlRwLock;
 use tokio::sync::{mpsc, oneshot, RwLock};
 
 use crate::timeline::Timeline;
-use crate::types::{Author, BranchId, Operation};
+use crate::types::{Author, BranchId, Operation, TimelineEvent};
+
+/// Durability sink for the recorded event log.
+///
+/// The drain worker calls [`EventSink::persist`] once for every event that
+/// lands in the [`Timeline`], right after `add_operation` succeeds and with the
+/// event's authoritative (burned) `sequence_number` already assigned. The write
+/// runs on the worker task — off the kernel's synchronous `record()` path — so
+/// persistence never blocks the geometry kernel.
+///
+/// This trait is the dependency-inversion boundary for durability: timeline-engine
+/// defines it and knows nothing about the concrete database. The api-server
+/// supplies an implementation that bridges to `session-manager`'s
+/// `DatabasePersistence`, so no `timeline-engine → session-manager` dependency is
+/// introduced. A `persist` error is logged loudly by the worker and never
+/// crashes it — the in-memory timeline is still correct; only durability of that
+/// one event is at risk (surfaced honestly, never silently).
+#[async_trait::async_trait]
+pub trait EventSink: Send + Sync {
+    async fn persist(&self, event: &TimelineEvent) -> Result<(), String>;
+}
 
 /// Bounded channel capacity for the recorder MPSC. Sized to absorb the
 /// worst sustained burst from a fast AI agent (≈ thousands of ops/sec)
@@ -120,7 +140,7 @@ pub type SharedTimeline = Arc<RwLock<Timeline>>;
 /// Future work may promote well-known kinds to their typed `Operation`
 /// variants; the current envelope format is the lowest-common-denominator
 /// that preserves every byte the kernel emitted.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct TimelineRecorder {
     tx: mpsc::Sender<RecorderCmd>,
     author: Author,
@@ -140,6 +160,20 @@ pub struct TimelineRecorder {
     /// must not leak partial events that the delete path cannot
     /// reconcile.
     staging: Arc<PlRwLock<StagingState>>,
+    /// Optional durability sink. When present, the drain worker persists every
+    /// event it applies to the timeline. `None` = in-memory-only (the pre-
+    /// durability behaviour and every test that does not exercise persistence).
+    sink: Option<Arc<dyn EventSink>>,
+}
+
+impl std::fmt::Debug for TimelineRecorder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TimelineRecorder")
+            .field("author", &self.author)
+            .field("branch_id", &*self.branch_id.read())
+            .field("has_sink", &self.sink.is_some())
+            .finish()
+    }
 }
 
 /// Per-recorder transactional staging state. Cloned `TimelineRecorder`
@@ -179,6 +213,25 @@ impl TimelineRecorder {
         Self::with_capacity(timeline, author, branch_id, RECORDER_CHANNEL_CAPACITY)
     }
 
+    /// Like [`new`](Self::new) but attaches a durability [`EventSink`]. Every
+    /// event the drain worker applies to the timeline is also persisted through
+    /// `sink`, off the kernel's synchronous record path. This is the
+    /// constructor the api-server uses at boot when durability is enabled.
+    pub fn new_with_sink(
+        timeline: SharedTimeline,
+        author: Author,
+        branch_id: BranchId,
+        sink: Arc<dyn EventSink>,
+    ) -> Self {
+        Self::with_capacity_and_sink(
+            timeline,
+            author,
+            branch_id,
+            RECORDER_CHANNEL_CAPACITY,
+            Some(sink),
+        )
+    }
+
     /// Construct a recorder with an explicit channel capacity. Tests
     /// use a small capacity to exercise the overflow path; production
     /// goes through [`TimelineRecorder::new`] which uses
@@ -189,11 +242,25 @@ impl TimelineRecorder {
         branch_id: BranchId,
         capacity: usize,
     ) -> Self {
+        Self::with_capacity_and_sink(timeline, author, branch_id, capacity, None)
+    }
+
+    /// The full constructor: explicit channel capacity and an optional
+    /// durability [`EventSink`]. All other constructors funnel here so the
+    /// worker-spawn logic lives in exactly one place.
+    pub fn with_capacity_and_sink(
+        timeline: SharedTimeline,
+        author: Author,
+        branch_id: BranchId,
+        capacity: usize,
+        sink: Option<Arc<dyn EventSink>>,
+    ) -> Self {
         let (tx, mut rx) = mpsc::channel::<RecorderCmd>(capacity);
         let branch_id = Arc::new(PlRwLock::new(branch_id));
 
         let worker_branch = Arc::clone(&branch_id);
         let worker_timeline = timeline;
+        let worker_sink = sink.clone();
         tokio::spawn(async move {
             while let Some(cmd) = rx.recv().await {
                 match cmd {
@@ -204,13 +271,39 @@ impl TimelineRecorder {
                         // restarting the worker.
                         let target = *worker_branch.read();
                         let guard = worker_timeline.read().await;
-                        if let Err(err) = guard.add_operation(op, author, target).await {
-                            tracing::warn!(
-                                target: "timeline.recorder_bridge",
-                                kind = %record.kind,
-                                error = %err,
-                                "timeline.add_operation failed — event dropped"
-                            );
+                        match guard.add_operation(op, author, target).await {
+                            Ok(event_id) => {
+                                // Durability write-through. The event now carries
+                                // its burned `sequence_number`; persist it before
+                                // moving on. We clone it out and drop the timeline
+                                // read guard before the DB await so persistence
+                                // never holds the timeline lock across I/O.
+                                if let Some(sink) = worker_sink.as_ref() {
+                                    let persisted = guard.get_event(event_id);
+                                    drop(guard);
+                                    if let Some(event) = persisted {
+                                        if let Err(err) = sink.persist(&event).await {
+                                            tracing::error!(
+                                                target: "timeline.recorder_bridge",
+                                                kind = %record.kind,
+                                                sequence = event.sequence_number,
+                                                error = %err,
+                                                "durability: failed to persist event — \
+                                                 in-memory timeline is correct but this \
+                                                 event is NOT on disk"
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                tracing::warn!(
+                                    target: "timeline.recorder_bridge",
+                                    kind = %record.kind,
+                                    error = %err,
+                                    "timeline.add_operation failed — event dropped"
+                                );
+                            }
                         }
                     }
                     RecorderCmd::Flush(resp) => {
@@ -236,6 +329,7 @@ impl TimelineRecorder {
             author,
             branch_id,
             staging: Arc::new(PlRwLock::new(StagingState::default())),
+            sink,
         }
     }
 

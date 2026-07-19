@@ -24,6 +24,9 @@ mod bounded_exec;
 mod branches;
 mod csketch;
 mod drawing_mgr;
+mod durability;
+#[cfg(test)]
+mod durability_boot_tests;
 mod error_catalog;
 mod fillet_payload;
 #[cfg(test)]
@@ -193,6 +196,11 @@ pub struct AppState {
 
     // Database
     database: Arc<dyn DatabasePersistence + Send + Sync>,
+
+    // Durability (task #39): the honest, typed boot outcome — whether the
+    // persisted event log replayed cleanly, was quarantined, or was disabled.
+    // Read by `GET /api/durability/status`.
+    durability_status: durability::SharedDurabilityStatus,
 
     // Additional fields for handlers
     export_engine: Arc<export_engine::ExportEngine>,
@@ -7528,6 +7536,21 @@ async fn stream_logs() -> Sse<impl Stream<Item = Result<SseEvent, std::convert::
     Sse::new(stream)
 }
 
+/// `GET /api/durability/status` — the honest, typed durability boot outcome
+/// (task #39). Surfaces whether the persisted event log replayed cleanly, was
+/// quarantined (and where it broke), was empty, or is disabled. A quarantined
+/// document is reported here, never silently served as complete.
+async fn durability_status_endpoint(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let status = state.durability_status.read().await.clone();
+    let quarantined = matches!(status, durability::DurabilityStatus::Quarantined { .. });
+    Json(serde_json::json!({
+        "session_id": durability::DURABILITY_SESSION_ID,
+        "durability_enabled": durability::durability_enabled(),
+        "quarantined": quarantined,
+        "status": status,
+    }))
+}
+
 async fn enhanced_health(State(state): State<AppState>) -> Json<serde_json::Value> {
     // Increment request counter
     TOTAL_REQUESTS.fetch_add(1, Ordering::Relaxed);
@@ -8167,11 +8190,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // hit `None` and silently no-op, leaving the timeline empty regardless
     // of what the user does. See timeline-engine/src/recorder_bridge.rs
     // for the sync→async bridge implementation.
-    let timeline_recorder = Arc::new(timeline_engine::TimelineRecorder::new(
-        Arc::clone(&timeline),
-        timeline_engine::Author::System,
-        timeline_engine::BranchId::main(),
-    ));
+    // Durability (task #39): when enabled, the recorder's drain worker writes
+    // every event through to the persisted event log (`DatabaseEventSink`),
+    // off the kernel's synchronous record path. `ROSHERA_DURABILITY=off`
+    // disables it and yields the pre-durability in-memory-only recorder.
+    let timeline_recorder = if durability::durability_enabled() {
+        let sink: Arc<dyn timeline_engine::EventSink> =
+            Arc::new(durability::DatabaseEventSink::new(database.clone()));
+        Arc::new(timeline_engine::TimelineRecorder::new_with_sink(
+            Arc::clone(&timeline),
+            timeline_engine::Author::System,
+            timeline_engine::BranchId::main(),
+            sink,
+        ))
+    } else {
+        Arc::new(timeline_engine::TimelineRecorder::new(
+            Arc::clone(&timeline),
+            timeline_engine::Author::System,
+            timeline_engine::BranchId::main(),
+        ))
+    };
     {
         // Attach the same recorder twice: once to the kernel (as a
         // trait object) so it gets called on every successful op, and
@@ -8226,6 +8264,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         branch_manager,
         hierarchy_manager,
         database,
+        durability_status: Arc::new(RwLock::new(durability::DurabilityStatus::Empty)),
         export_engine,
         request_metrics: Arc::new(DashMap::new()),
         command_metrics: Arc::new(Mutex::new(metrics::CommandMetrics::default())),
@@ -8281,6 +8320,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // overridable via ROSHERA_OP_TIMEOUT*_SECS. Resolved once here.
         op_budgets: bounded_exec::OpBudgets::from_env(),
     };
+
+    // Durability boot replay (task #39). Load the persisted event log and
+    // replay it into the fresh model BEFORE the server starts serving, so a
+    // reconnecting client sees the document it left. A fresh/empty database
+    // boots blank exactly as before; a log the kernel cannot faithfully
+    // rebuild is quarantined (clean prefix served, break named on
+    // `/api/durability/status`), never served as a wrong model.
+    match durability::boot_replay(&state).await {
+        durability::DurabilityStatus::Quarantined {
+            first_break_sequence,
+            first_break_kind,
+            events_served,
+            events_total,
+            ..
+        } => {
+            tracing::error!(
+                first_break_sequence,
+                %first_break_kind,
+                events_served,
+                events_total,
+                "durability: booted with a QUARANTINED document — serving the clean prefix only"
+            );
+        }
+        other => {
+            tracing::info!(?other, "durability: boot replay complete");
+        }
+    }
 
     // Background sweeper for expired transactions. The TX_TTL inside
     // `TransactionManager` (1 hour) only documents intent; without an
@@ -8360,6 +8426,9 @@ pub(crate) fn build_router(state: AppState) -> Router {
         // Root and health
         .route("/", get(root))
         .route("/health", get(enhanced_health))
+        // Durability (task #39): honest, typed boot outcome — clean / empty /
+        // quarantined / disabled. Never serves a partial model as complete.
+        .route("/api/durability/status", get(durability_status_endpoint))
         // WebSocket
         .route("/ws", get(protocol::message_handlers::websocket_handler))
         // AI endpoints

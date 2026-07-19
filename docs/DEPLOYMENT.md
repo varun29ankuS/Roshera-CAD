@@ -51,6 +51,7 @@ Copy `.env.partner.example` to `.env` beside the compose file and fill it in.
 | `PUBLIC_WS_URL` (build arg `VITE_WS_URL`) | `roshera-app/src/lib/ws-client.ts:185` | `/ws` (root-relative; the browser resolves it to `ws://`/`wss://` same-origin). Set an absolute `ws(s)://host/ws` only for a split-origin deployment. |
 | `HTTP_PORT` / `API_PORT` | compose port maps | `8080` (UI) / `8081` (direct REST/WS). |
 | `ROSHERA_OP_TIMEOUT_SECS` (+ per-class `ROSHERA_OP_TIMEOUT_{BOOLEAN,BLEND,OTHER}_SECS`) | `api-server/src/bounded_exec.rs` (`OpBudgets::from_env`, resolved once at startup) | Wall-clock budget for heavy mutating kernel ops (Task #41). Defaults **ON** and generous: boolean/blend 60 s, other 120 s. An op that exceeds its budget runs on a discarded clone and the request returns `504 op_timeout` (non-retryable) while the live model and its write lock stay untouched — a runaway corefinement can no longer pin the instance. Precedence per class: per-class var → global `ROSHERA_OP_TIMEOUT_SECS` → compiled default. A value of `0`/unparseable is ignored (the guard cannot be disabled). |
+| `ROSHERA_DURABILITY` | `api-server/src/durability.rs` (`durability_enabled`) | Durability escape hatch (Task #39). Defaults **ON**: when `DATABASE_URL` is present (it always is — boot-critical), every recorded timeline event is persisted to the `timeline_events` table and replayed into the model on boot. Set `ROSHERA_DURABILITY=off` (case-insensitive) to disable persistence + boot replay for a throwaway dev instance that behaves like the pre-durability server (blank on every start). Any other value leaves durability on. Boot outcome is exposed at `GET /api/durability/status` (typed: `active` / `empty` / `quarantined` / `disabled`). |
 
 ### Auth posture — secure by default (important)
 
@@ -115,36 +116,70 @@ cause is an unreachable DB (it will have exited) or a bad `DATABASE_URL`.
 
 ---
 
-## 5. What does NOT survive a restart (durability gap — be honest)
+## 5. What survives a restart, and what does NOT (durability — be honest)
 
-**The geometry model and the design timeline are in-memory only.** The kernel
-model is an `Arc<RwLock<BRepModel>>` built fresh at boot (`main.rs:7998`), and
-the timeline/branches live in in-memory `DashMap`s. Postgres persists **only**
-the auth/session tables (`users`, `sessions` — `database.rs:290+`).
+**Durability Slice 1 (Task #39) is live: the event log is persisted, and the
+geometry model is rebuilt by replaying it on boot.** Every recorded kernel
+operation (create/extrude/revolve/boolean/fillet/chamfer/transform, assembly
+`*` events, and `drawing.create_from_part`) is appended to the Postgres
+`timeline_events` table transactionally as it happens (`durability.rs`,
+`DatabaseEventSink`), and on boot the log is loaded and replayed into a fresh
+`BRepModel` before the server serves (`durability::boot_replay`).
 
-Consequence: **restarting the `backend` container loses all geometry and
-timeline history.** User accounts and login sessions survive (they are in
-Postgres); nothing you modeled does. The `roshera-data:/app/data` volume and the
-`/app/data` directory in the image are **reserved mount points for the future
-durability slice** (snapshot + event-log storage) — they exist so the storage
-path is stable when that lands, but **nothing writes to them today.**
+**Survives a restart now:**
+- The **geometry** — solids come back with the same shape (re-derived by
+  replaying the log; the boolean/fillet/etc. are re-executed, so a bored solid
+  is watertight exactly as it was live).
+- The **timeline history** — event ids, sequence numbers, and kinds are
+  byte-identical after a restart (`GET /api/timeline/history/{branch}`).
+- User accounts and login sessions (unchanged — Postgres `users`/`sessions`).
 
-Treat a partner instance as ephemeral for geometry until the durability slice
-ships. Do not promise a partner that their models persist across a restart.
+**Does NOT survive yet (honest residual — spec `2026-07-19-durability-design.md`
+slices 3–4):**
+- **Solid names and colours.** These are written to `Solid::name` /
+  `AppState.solid_colors` *outside* any recorded event (spec §2.3), so a
+  replayed solid boots with a default name and no colour. **Slice 3** closes
+  this by emitting rename/colour events with replay arms.
+- **Public UUID identity.** The uuid↔solid mapping is not persisted this slice
+  (spec §2.7 classes it derivable-on-replay), so a restored solid gets a *new*
+  uuid. Addressing works (list the parts to get current uuids); a uuid held by
+  an agent across a restart does not. Stable uuids are **Slice 3**.
+- **Labels / GD&T annotations.** Recorded as `label.*`/`gdt.*` events but
+  honestly skipped on replay (`NonGeometryStale`); re-materialising them is
+  **Slice 3**.
+- **Issued API keys / session tokens.** Held in memory (`session-manager`
+  `AuthManager`); a restart invalidates them. Persisting them is **Slice 4**.
+- **Blackboard notes.** In-memory only.
+
+**Honesty gate.** If the log contains an event this kernel cannot faithfully
+replay (an unknown kind, a `sweep_profile`/`loft_profiles` — spec §2.2, or a
+corrupt row), the affected document is **quarantined**: the clean prefix up to
+the first break is served, the break is named loudly in the logs and at
+`GET /api/durability/status`, and the tail is refused — never served as a
+subtly-wrong model. A fresh/empty database boots blank exactly as before.
+
+**No snapshots yet** (spec §4.2): boot is a full replay of the log, so a very
+large document boots slowly. Snapshots as a replay accelerator are **Slice 2**.
+The `roshera-data:/app/data` volume remains reserved for those snapshot blobs.
 
 ## 6. Backup story
 
-**There is no application-level backup today.** What you can back up:
+The durable document lives in Postgres, so a Postgres backup now captures the
+geometry + timeline, not just auth:
 
-- **Postgres** (auth/session only) via the `pgdata` volume, e.g.
+- **Postgres** (auth/session **and the event log** — `timeline_events`,
+  `durable_branches`) via the `pgdata` volume, e.g.
   `docker compose -f docker-compose.partner.yml exec postgres \
-   pg_dump -U roshera roshera > roshera-auth-$(date +%F).sql`.
+   pg_dump -U roshera roshera > roshera-$(date +%F).sql`. Restoring this dump
+  into a fresh stack reproduces the document on the next boot (the server
+  replays the restored log).
 - **Exports** written to the `exports` volume (`/app/exports`) — STL/OBJ/STEP/ROS
   files a user explicitly exported.
 
-Geometry/timeline state cannot be backed up because it is not persisted. A real
-backup story arrives with the durability slice; until then, this section is
-deliberately short and honest rather than aspirational.
+Caveat (matches §5): a `pg_dump` restore brings back geometry + timeline, but
+solid names/colours, labels/GD&T, and API keys are not yet in the log, so they
+do not come back until Slices 3–4 land. A scripted backup/restore runbook with
+a fingerprint-verified round-trip is **Slice 5**.
 
 ---
 

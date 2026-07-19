@@ -54,7 +54,7 @@ pub use rebuild_certificate::{
     certify_rebuild, certify_rebuild_with_drawings, FeatureStatus, FeatureVerdict,
     RebuildCertificate,
 };
-pub use recorder_bridge::{SharedTimeline, TimelineRecorder};
+pub use recorder_bridge::{EventSink, SharedTimeline, TimelineRecorder};
 pub use replay::{
     apply_event, rebuild_model_from_events, rederive_part_drawing, DrawingRederive, DrawingStore,
     ReplayError, ReplayOutcome,

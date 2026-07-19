@@ -633,6 +633,24 @@ pub async fn create_branch(
         )
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
+    // Durability (#39): persist the branch's metadata so its identity + fork
+    // point survive a restart. The event log already tags each event with its
+    // branch_id; this makes the branch itself restorable on boot.
+    let fork_sequence = state
+        .timeline
+        .read()
+        .await
+        .get_branch_head(&parent)
+        .unwrap_or(0) as i64;
+    crate::durability::persist_branch(
+        &state,
+        branch_id,
+        Some(parent),
+        fork_sequence,
+        request.name.clone(),
+    )
+    .await;
+
     Ok(Json(BranchInfo {
         id: branch_id.to_string(),
         name: request.name,

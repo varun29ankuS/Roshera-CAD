@@ -195,6 +195,19 @@ pub trait DatabasePersistence: Send + Sync {
         end: i64,
     ) -> Result<Vec<TimelineEventData>, SessionError>;
     async fn get_event_count(&self, session_id: &str) -> Result<i64, SessionError>;
+    /// Load the entire persisted event log for a document, ordered by
+    /// `sequence_number` ASC (the stable replay order — never `timestamp`).
+    /// This is the durability boot-replay read path.
+    async fn load_all_timeline_events(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<TimelineEventData>, SessionError>;
+
+    // Durability: branch metadata (fork points) so non-`main` branches survive
+    // a restart. `timeline_events.branch_id` already remembers which branch an
+    // event belongs to; these persist the branch RECORD itself.
+    async fn save_branch(&self, branch: &BranchRecord) -> Result<(), SessionError>;
+    async fn load_branches(&self, session_id: &str) -> Result<Vec<BranchRecord>, SessionError>;
 }
 
 /// Session metadata
@@ -246,6 +259,26 @@ pub struct TimelineEventData {
     pub timestamp: DateTime<Utc>,
     pub data: serde_json::Value,
     pub branch_id: Option<String>,
+    /// Monotonic, stable ordering key inside a document (the timeline's burned
+    /// `sequence_number`). Durability replay orders by THIS, never by
+    /// `timestamp` — two events created inside the same millisecond would
+    /// otherwise replay out of order and rebuild the wrong model.
+    pub sequence_number: i64,
+}
+
+/// A persisted branch record — the branch metadata (fork point, parent, name,
+/// lifecycle state) durability needs to recreate a non-`main` branch on boot.
+/// The full [`timeline_engine::Branch`] is not serialized; the fields here are
+/// exactly what a boot-time `rehydrate_branch` reconstructs, plus an opaque
+/// `data` blob for forward-compatible extension.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BranchRecord {
+    pub session_id: String,
+    pub branch_id: String,
+    pub parent_branch_id: Option<String>,
+    pub fork_sequence: i64,
+    pub name: String,
+    pub data: serde_json::Value,
 }
 
 /// PostgreSQL implementation
@@ -421,17 +454,27 @@ impl PostgresDatabase {
             reason: format!("Failed to create api_keys table: {}", e),
         })?;
 
-        // Create timeline_events table (without INDEX inside CREATE TABLE)
+        // Create timeline_events table (without INDEX inside CREATE TABLE).
+        //
+        // Durability note: the event log is the persisted source of truth, so
+        // this table is intentionally FK-FREE. The pre-durability schema
+        // referenced `sessions(id)` and `users(id)`; those FKs made it
+        // impossible to persist a kernel event unless a matching session AND
+        // user row existed first — but the live geometry recording path
+        // (`Author::System` onto branch `main`) opens neither. Removing the FKs
+        // lets an event be written the instant the kernel emits it. The
+        // `sequence_number` column is the stable replay-ordering key.
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS timeline_events (
                 id VARCHAR(255) PRIMARY KEY,
-                session_id VARCHAR(255) NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-                event_type VARCHAR(50) NOT NULL,
-                user_id VARCHAR(255) NOT NULL REFERENCES users(id),
+                session_id VARCHAR(255) NOT NULL,
+                event_type VARCHAR(255) NOT NULL,
+                user_id VARCHAR(255) NOT NULL,
                 timestamp TIMESTAMPTZ NOT NULL,
                 data JSONB NOT NULL,
-                branch_id VARCHAR(255)
+                branch_id VARCHAR(255),
+                sequence_number BIGINT NOT NULL DEFAULT 0
             )
             "#,
         )
@@ -440,6 +483,54 @@ impl PostgresDatabase {
         .map_err(|e| SessionError::PersistenceError {
             reason: format!("Failed to create timeline_events table: {}", e),
         })?;
+
+        // Idempotent migrations for a database created by a PRE-durability
+        // build (the live silo already ran the old CREATE TABLE): add the
+        // ordering column and drop the two blocking foreign keys. All three
+        // are `IF [NOT] EXISTS` / default-name based, so they are no-ops on a
+        // freshly-created table and safe to run on every boot.
+        for stmt in [
+            "ALTER TABLE timeline_events ADD COLUMN IF NOT EXISTS sequence_number BIGINT NOT NULL DEFAULT 0",
+            "ALTER TABLE timeline_events DROP CONSTRAINT IF EXISTS timeline_events_session_id_fkey",
+            "ALTER TABLE timeline_events DROP CONSTRAINT IF EXISTS timeline_events_user_id_fkey",
+            // Pre-durability schema declared event_type VARCHAR(50); widen it so
+            // no recorded kind can overflow the column on an existing silo.
+            "ALTER TABLE timeline_events ALTER COLUMN event_type TYPE VARCHAR(255)",
+        ] {
+            sqlx::query(stmt).execute(&self.pool).await.map_err(|e| {
+                SessionError::PersistenceError {
+                    reason: format!("Failed timeline_events migration ({stmt}): {}", e),
+                }
+            })?;
+        }
+
+        // Durability: branch metadata (fork points). Recreated on boot so
+        // non-`main` branches survive a restart.
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS durable_branches (
+                session_id VARCHAR(255) NOT NULL,
+                branch_id VARCHAR(255) NOT NULL,
+                parent_branch_id VARCHAR(255),
+                fork_sequence BIGINT NOT NULL DEFAULT 0,
+                name VARCHAR(255) NOT NULL,
+                data JSONB NOT NULL,
+                PRIMARY KEY (session_id, branch_id)
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| SessionError::PersistenceError {
+            reason: format!("Failed to create durable_branches table: {}", e),
+        })?;
+
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_timeline_session_seq ON timeline_events(session_id, sequence_number)")
+            .execute(&self.pool)
+            .await
+            .map_err(|e| SessionError::PersistenceError {
+                reason: format!("Failed to create timeline seq index: {}", e),
+            })?;
 
         // Create indexes
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_timeline_session_time ON timeline_events(session_id, timestamp)")
@@ -1219,8 +1310,8 @@ impl DatabasePersistence for PostgresDatabase {
     ) -> Result<(), SessionError> {
         sqlx::query(
             r#"
-            INSERT INTO timeline_events (id, session_id, event_type, user_id, timestamp, data, branch_id)
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            INSERT INTO timeline_events (id, session_id, event_type, user_id, timestamp, data, branch_id, sequence_number)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
             "#
         )
         .bind(&event.id)
@@ -1230,6 +1321,7 @@ impl DatabasePersistence for PostgresDatabase {
         .bind(event.timestamp)
         .bind(&event.data)
         .bind(&event.branch_id)
+        .bind(event.sequence_number)
         .execute(&self.pool)
         .await
         .map_err(|e| SessionError::PersistenceError {
@@ -1247,11 +1339,11 @@ impl DatabasePersistence for PostgresDatabase {
     ) -> Result<Vec<TimelineEventData>, SessionError> {
         let rows = sqlx::query(
             r#"
-            SELECT * FROM timeline_events 
-            WHERE session_id = $1 
-                AND timestamp >= $2 
+            SELECT * FROM timeline_events
+            WHERE session_id = $1
+                AND timestamp >= $2
                 AND timestamp <= $3
-            ORDER BY timestamp ASC
+            ORDER BY sequence_number ASC
             "#,
         )
         .bind(session_id)
@@ -1263,18 +1355,7 @@ impl DatabasePersistence for PostgresDatabase {
             reason: format!("Failed to load timeline events: {}", e),
         })?;
 
-        let events = rows
-            .into_iter()
-            .map(|row| TimelineEventData {
-                id: row.get("id"),
-                session_id: row.get("session_id"),
-                event_type: row.get("event_type"),
-                user_id: row.get("user_id"),
-                timestamp: row.get("timestamp"),
-                data: row.get("data"),
-                branch_id: row.get("branch_id"),
-            })
-            .collect();
+        let events = rows.into_iter().map(row_to_timeline_event_pg).collect();
 
         Ok(events)
     }
@@ -1290,6 +1371,89 @@ impl DatabasePersistence for PostgresDatabase {
                 })?;
 
         Ok(row.get("count"))
+    }
+
+    async fn load_all_timeline_events(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<TimelineEventData>, SessionError> {
+        let rows = sqlx::query(
+            "SELECT * FROM timeline_events WHERE session_id = $1 ORDER BY sequence_number ASC",
+        )
+        .bind(session_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| SessionError::PersistenceError {
+            reason: format!("Failed to load all timeline events: {}", e),
+        })?;
+
+        Ok(rows.into_iter().map(row_to_timeline_event_pg).collect())
+    }
+
+    async fn save_branch(&self, branch: &BranchRecord) -> Result<(), SessionError> {
+        sqlx::query(
+            r#"
+            INSERT INTO durable_branches (session_id, branch_id, parent_branch_id, fork_sequence, name, data)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            ON CONFLICT (session_id, branch_id) DO UPDATE
+                SET parent_branch_id = EXCLUDED.parent_branch_id,
+                    fork_sequence = EXCLUDED.fork_sequence,
+                    name = EXCLUDED.name,
+                    data = EXCLUDED.data
+            "#,
+        )
+        .bind(&branch.session_id)
+        .bind(&branch.branch_id)
+        .bind(&branch.parent_branch_id)
+        .bind(branch.fork_sequence)
+        .bind(&branch.name)
+        .bind(&branch.data)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| SessionError::PersistenceError {
+            reason: format!("Failed to save branch: {}", e),
+        })?;
+        Ok(())
+    }
+
+    async fn load_branches(&self, session_id: &str) -> Result<Vec<BranchRecord>, SessionError> {
+        let rows = sqlx::query(
+            "SELECT * FROM durable_branches WHERE session_id = $1 ORDER BY fork_sequence ASC",
+        )
+        .bind(session_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| SessionError::PersistenceError {
+            reason: format!("Failed to load branches: {}", e),
+        })?;
+        Ok(rows.into_iter().map(row_to_branch_record).collect())
+    }
+}
+
+/// Map a `timeline_events` row into a [`TimelineEventData`]. Shared by the
+/// range and load-all read paths so the column list stays in one place.
+fn row_to_timeline_event_pg(row: sqlx::postgres::PgRow) -> TimelineEventData {
+    TimelineEventData {
+        id: row.get("id"),
+        session_id: row.get("session_id"),
+        event_type: row.get("event_type"),
+        user_id: row.get("user_id"),
+        timestamp: row.get("timestamp"),
+        data: row.get("data"),
+        branch_id: row.get("branch_id"),
+        sequence_number: row.get("sequence_number"),
+    }
+}
+
+/// Map a `durable_branches` row into a [`BranchRecord`].
+fn row_to_branch_record(row: sqlx::postgres::PgRow) -> BranchRecord {
+    BranchRecord {
+        session_id: row.get("session_id"),
+        branch_id: row.get("branch_id"),
+        parent_branch_id: row.get("parent_branch_id"),
+        fork_sequence: row.get("fork_sequence"),
+        name: row.get("name"),
+        data: row.get("data"),
     }
 }
 
@@ -1454,7 +1618,10 @@ impl SqliteDatabase {
             reason: format!("Failed to create api_keys table: {}", e),
         })?;
 
-        // Create timeline_events table
+        // Create timeline_events table. FK-free by design (see the PostgreSQL
+        // arm's note): durability persists a kernel event the instant it is
+        // emitted, before any session/user row exists. `sequence_number` is
+        // the stable replay-ordering key.
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS timeline_events (
@@ -1465,8 +1632,7 @@ impl SqliteDatabase {
                 timestamp DATETIME NOT NULL,
                 data JSON NOT NULL,
                 branch_id TEXT,
-                FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE,
-                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+                sequence_number INTEGER NOT NULL DEFAULT 0
             )
             "#,
         )
@@ -1475,6 +1641,43 @@ impl SqliteDatabase {
         .map_err(|e| SessionError::PersistenceError {
             reason: format!("Failed to create timeline_events table: {}", e),
         })?;
+
+        // Idempotent additive migration for a pre-durability SQLite file. SQLite
+        // cannot drop a FK via ALTER, but a fresh durability DB (and every test
+        // DB) is created by the FK-free CREATE above; this only backfills the
+        // ordering column on an older file. A duplicate-column error means the
+        // column already exists — swallowed via `.ok()`.
+        sqlx::query(
+            "ALTER TABLE timeline_events ADD COLUMN sequence_number INTEGER NOT NULL DEFAULT 0",
+        )
+        .execute(&self.pool)
+        .await
+        .ok();
+
+        // Durability: branch metadata (fork points).
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS durable_branches (
+                session_id TEXT NOT NULL,
+                branch_id TEXT NOT NULL,
+                parent_branch_id TEXT,
+                fork_sequence INTEGER NOT NULL DEFAULT 0,
+                name TEXT NOT NULL,
+                data JSON NOT NULL,
+                PRIMARY KEY (session_id, branch_id)
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| SessionError::PersistenceError {
+            reason: format!("Failed to create durable_branches table: {}", e),
+        })?;
+
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_timeline_events_seq ON timeline_events(session_id, sequence_number)")
+            .execute(&self.pool)
+            .await
+            .ok();
 
         // Create indices for performance
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_objects_session ON objects(session_id)")
@@ -2127,8 +2330,8 @@ impl DatabasePersistence for SqliteDatabase {
     ) -> Result<(), SessionError> {
         sqlx::query(
             r#"
-            INSERT INTO timeline_events (id, session_id, event_type, user_id, timestamp, data, branch_id)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            INSERT INTO timeline_events (id, session_id, event_type, user_id, timestamp, data, branch_id, sequence_number)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
             "#
         )
         .bind(&event.id)
@@ -2138,6 +2341,7 @@ impl DatabasePersistence for SqliteDatabase {
         .bind(event.timestamp)
         .bind(&event.data)
         .bind(&event.branch_id)
+        .bind(event.sequence_number)
         .execute(&self.pool)
         .await
         .map_err(|e| SessionError::PersistenceError {
@@ -2155,11 +2359,11 @@ impl DatabasePersistence for SqliteDatabase {
     ) -> Result<Vec<TimelineEventData>, SessionError> {
         let rows = sqlx::query(
             r#"
-            SELECT * FROM timeline_events 
-            WHERE session_id = ?1 
-            AND timestamp >= ?2 
+            SELECT * FROM timeline_events
+            WHERE session_id = ?1
+            AND timestamp >= ?2
             AND timestamp <= ?3
-            ORDER BY timestamp ASC
+            ORDER BY sequence_number ASC
             "#,
         )
         .bind(session_id)
@@ -2171,18 +2375,7 @@ impl DatabasePersistence for SqliteDatabase {
             reason: format!("Failed to load timeline events: {}", e),
         })?;
 
-        let events = rows
-            .into_iter()
-            .map(|row| TimelineEventData {
-                id: row.get("id"),
-                session_id: row.get("session_id"),
-                event_type: row.get("event_type"),
-                user_id: row.get("user_id"),
-                timestamp: row.get("timestamp"),
-                data: row.get("data"),
-                branch_id: row.get("branch_id"),
-            })
-            .collect();
+        let events = rows.into_iter().map(row_to_timeline_event_sqlite).collect();
 
         Ok(events)
     }
@@ -2198,6 +2391,88 @@ impl DatabasePersistence for SqliteDatabase {
                 })?;
 
         Ok(row.get("count"))
+    }
+
+    async fn load_all_timeline_events(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<TimelineEventData>, SessionError> {
+        let rows = sqlx::query(
+            "SELECT * FROM timeline_events WHERE session_id = ?1 ORDER BY sequence_number ASC",
+        )
+        .bind(session_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| SessionError::PersistenceError {
+            reason: format!("Failed to load all timeline events: {}", e),
+        })?;
+
+        Ok(rows.into_iter().map(row_to_timeline_event_sqlite).collect())
+    }
+
+    async fn save_branch(&self, branch: &BranchRecord) -> Result<(), SessionError> {
+        sqlx::query(
+            r#"
+            INSERT INTO durable_branches (session_id, branch_id, parent_branch_id, fork_sequence, name, data)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            ON CONFLICT (session_id, branch_id) DO UPDATE
+                SET parent_branch_id = excluded.parent_branch_id,
+                    fork_sequence = excluded.fork_sequence,
+                    name = excluded.name,
+                    data = excluded.data
+            "#,
+        )
+        .bind(&branch.session_id)
+        .bind(&branch.branch_id)
+        .bind(&branch.parent_branch_id)
+        .bind(branch.fork_sequence)
+        .bind(&branch.name)
+        .bind(&branch.data)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| SessionError::PersistenceError {
+            reason: format!("Failed to save branch: {}", e),
+        })?;
+        Ok(())
+    }
+
+    async fn load_branches(&self, session_id: &str) -> Result<Vec<BranchRecord>, SessionError> {
+        let rows = sqlx::query(
+            "SELECT * FROM durable_branches WHERE session_id = ?1 ORDER BY fork_sequence ASC",
+        )
+        .bind(session_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| SessionError::PersistenceError {
+            reason: format!("Failed to load branches: {}", e),
+        })?;
+        Ok(rows.into_iter().map(sqlite_row_to_branch_record).collect())
+    }
+}
+
+/// Map a SQLite `timeline_events` row into a [`TimelineEventData`].
+fn row_to_timeline_event_sqlite(row: sqlx::sqlite::SqliteRow) -> TimelineEventData {
+    TimelineEventData {
+        id: row.get("id"),
+        session_id: row.get("session_id"),
+        event_type: row.get("event_type"),
+        user_id: row.get("user_id"),
+        timestamp: row.get("timestamp"),
+        data: row.get("data"),
+        branch_id: row.get("branch_id"),
+        sequence_number: row.get("sequence_number"),
+    }
+}
+
+/// Map a SQLite `durable_branches` row into a [`BranchRecord`].
+fn sqlite_row_to_branch_record(row: sqlx::sqlite::SqliteRow) -> BranchRecord {
+    BranchRecord {
+        session_id: row.get("session_id"),
+        branch_id: row.get("branch_id"),
+        parent_branch_id: row.get("parent_branch_id"),
+        fork_sequence: row.get("fork_sequence"),
+        name: row.get("name"),
+        data: row.get("data"),
     }
 }
 

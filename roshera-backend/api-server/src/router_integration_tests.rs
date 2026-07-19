@@ -75,8 +75,6 @@ use uuid::Uuid;
 /// surfacing a real LLM client from a unit-test build would tie
 /// the suite to network availability.
 pub(crate) async fn make_test_state() -> AppState {
-    let model = Arc::new(RwLock::new(BRepModel::new()));
-
     let db_config = DatabaseConfig {
         db_type: DatabaseType::SQLite,
         url: "sqlite::memory:".to_string(),
@@ -88,6 +86,18 @@ pub(crate) async fn make_test_state() -> AppState {
         Arc::new(SqliteDatabase::new(&db_config).await.expect(
             "sqlite::memory: must initialise — sqlx + sqlite feature is in session-manager's deps",
         ));
+    make_test_state_with_database(database, None).await
+}
+
+/// Build an `AppState` over a caller-supplied database and an optional
+/// durability [`EventSink`]. Used by [`make_test_state`] (in-memory db, no
+/// sink) and by the durability boot tests (a FILE-backed sqlite db + a real
+/// sink, so the persisted state survives a simulated restart).
+pub(crate) async fn make_test_state_with_database(
+    database: Arc<dyn DatabasePersistence + Send + Sync>,
+    sink: Option<Arc<dyn timeline_engine::EventSink>>,
+) -> AppState {
+    let model = Arc::new(RwLock::new(BRepModel::new()));
 
     let broadcast_manager = BroadcastManager::new();
     let session_manager = Arc::new(SessionManager::new(broadcast_manager));
@@ -137,11 +147,19 @@ pub(crate) async fn make_test_state() -> AppState {
     let timeline = Arc::new(RwLock::new(Timeline::new(TimelineConfig::default())));
     let branch_manager = Arc::new(BranchManager::new());
 
-    let timeline_recorder = Arc::new(TimelineRecorder::new(
-        Arc::clone(&timeline),
-        timeline_engine::Author::System,
-        timeline_engine::BranchId::main(),
-    ));
+    let timeline_recorder = Arc::new(match sink {
+        Some(s) => TimelineRecorder::new_with_sink(
+            Arc::clone(&timeline),
+            timeline_engine::Author::System,
+            timeline_engine::BranchId::main(),
+            s,
+        ),
+        None => TimelineRecorder::new(
+            Arc::clone(&timeline),
+            timeline_engine::Author::System,
+            timeline_engine::BranchId::main(),
+        ),
+    });
     {
         let recorder: Arc<dyn geometry_engine::operations::recorder::OperationRecorder> =
             timeline_recorder.clone();
@@ -187,6 +205,7 @@ pub(crate) async fn make_test_state() -> AppState {
         branch_manager,
         hierarchy_manager,
         database,
+        durability_status: Arc::new(RwLock::new(crate::durability::DurabilityStatus::Empty)),
         export_engine,
         request_metrics: Arc::new(DashMap::new()),
         command_metrics: Arc::new(Mutex::new(metrics::CommandMetrics::default())),

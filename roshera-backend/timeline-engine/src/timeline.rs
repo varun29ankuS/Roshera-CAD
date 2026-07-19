@@ -617,7 +617,7 @@ impl Timeline {
     }
 
     /// Get current head of a branch
-    fn get_branch_head(&self, branch_id: &BranchId) -> TimelineResult<EventIndex> {
+    pub fn get_branch_head(&self, branch_id: &BranchId) -> TimelineResult<EventIndex> {
         let branch_events = self
             .branch_events
             .get(branch_id)
@@ -686,6 +686,106 @@ impl Timeline {
     /// Get an event by ID
     pub fn get_event(&self, event_id: EventId) -> Option<TimelineEvent> {
         self.events.get(&event_id).map(|entry| entry.clone())
+    }
+
+    /// Durability boot restore: reinstate a persisted branch (by its metadata)
+    /// and seed an empty per-branch event index for it. The branch's events are
+    /// restored separately by [`rehydrate_events`](Self::rehydrate_events); this
+    /// only re-establishes the branch's existence and fork point so those events
+    /// have a home. `main` always exists (created by [`Timeline::new`]) and is
+    /// never overwritten. A restored branch is reinstated `Active`.
+    pub fn rehydrate_branch(
+        &self,
+        id: BranchId,
+        name: String,
+        parent: Option<BranchId>,
+        fork_event_index: EventIndex,
+    ) {
+        if id == BranchId::main() {
+            return;
+        }
+        let branch = Branch {
+            id,
+            name,
+            fork_point: ForkPoint {
+                branch_id: parent.unwrap_or_else(BranchId::main),
+                event_index: fork_event_index,
+                timestamp: Utc::now(),
+            },
+            parent,
+            events: Arc::new(DashMap::new()),
+            state: BranchState::Active,
+            metadata: crate::BranchMetadata {
+                created_by: Author::System,
+                created_at: Utc::now(),
+                purpose: crate::BranchPurpose::UserExploration {
+                    description: "restored from durable storage".to_string(),
+                },
+                ai_context: None,
+                checkpoints: Vec::new(),
+            },
+            protected: false,
+            hidden: false,
+        };
+        self.branch_events.entry(id).or_default();
+        self.branches.insert(id, branch);
+    }
+
+    /// Durability boot restore: reinsert persisted events verbatim, preserving
+    /// their original `id`, `sequence_number`, `timestamp`, and `author`.
+    ///
+    /// This is deliberately NOT `add_operation`: re-appending would mint fresh
+    /// ids/timestamps and re-burn sequence numbers, so the restored history
+    /// would no longer match what was persisted (the timeline history endpoint
+    /// must return byte-identical event ids/sequences after a restart). Events
+    /// must be pre-sorted by `sequence_number`. Any event whose branch does not
+    /// exist is an error — a corrupt/truncated log surfaces loudly rather than
+    /// silently dropping events.
+    ///
+    /// After restoring, the global `event_counter` is advanced past the highest
+    /// restored sequence so subsequent live appends never collide with a
+    /// restored one.
+    pub fn rehydrate_events(&self, events: Vec<TimelineEvent>) -> TimelineResult<()> {
+        let mut next_seq = self.event_counter.load(Ordering::SeqCst);
+        for event in events {
+            let branch_id = event.metadata.branch_id;
+            let seq = event.sequence_number;
+            let event_id = event.id;
+
+            let branch_events = self
+                .branch_events
+                .get(&branch_id)
+                .ok_or(TimelineError::BranchNotFound(branch_id))?;
+            branch_events.insert(seq, event_id);
+            drop(branch_events);
+
+            // Mirror the entity→event index so entity-scoped queries (and the
+            // dependency projection) work on a restored log exactly as on a
+            // live one.
+            if let Ok((required, optional)) = self.extract_operation_entities(&event.operation) {
+                for entity in required.into_iter().chain(optional) {
+                    self.entity_events.entry(entity).or_default().push(event_id);
+                }
+            }
+
+            self.events.insert(event_id, event);
+            next_seq = next_seq.max(seq.saturating_add(1));
+        }
+
+        // Advance the counter past every restored sequence (monotonic CAS).
+        let mut cur = self.event_counter.load(Ordering::SeqCst);
+        while cur < next_seq {
+            match self.event_counter.compare_exchange(
+                cur,
+                next_seq,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => break,
+                Err(actual) => cur = actual,
+            }
+        }
+        Ok(())
     }
 
     /// Get checkpoints for a branch
