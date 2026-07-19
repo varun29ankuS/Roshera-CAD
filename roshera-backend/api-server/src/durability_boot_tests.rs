@@ -110,6 +110,65 @@ fn get(uri: &str) -> Request<Body> {
         .expect("request must build")
 }
 
+fn del(uri: &str) -> Request<Body> {
+    Request::builder()
+        .method(Method::DELETE)
+        .uri(uri)
+        .body(Body::empty())
+        .expect("request must build")
+}
+
+/// Build ONE bored box (box − cylinder) through the router WITHOUT flushing.
+/// Returns the boolean result's public uuid. Callers that need the durability
+/// barrier flush the recorder themselves after composing the full session.
+async fn build_bored_box(state: &AppState, box_edge: f64) {
+    let (s, body) = dispatch(
+        state,
+        post(
+            "/api/geometry/box",
+            json!({ "width": box_edge, "depth": box_edge, "height": box_edge }),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "box create must succeed; body = {body}");
+    let uuid_box = body["object"]["id"]
+        .as_str()
+        .expect("box response must carry object.id")
+        .to_string();
+
+    let (s, body) = dispatch(
+        state,
+        post(
+            "/api/geometry/cylinder",
+            json!({ "center": [0.0, 0.0, -box_edge], "axis": [0.0, 0.0, 1.0], "radius": 1.5, "height": box_edge * 3.0 }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "cylinder create must succeed; body = {body}"
+    );
+    let uuid_cyl = body["object"]["id"]
+        .as_str()
+        .expect("cylinder response must carry object.id")
+        .to_string();
+
+    let (s, body) = dispatch(
+        state,
+        post(
+            "/api/geometry/boolean",
+            json!({ "operation": "difference", "object_a": uuid_box, "object_b": uuid_cyl }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "boolean difference must succeed; body = {body}"
+    );
+}
+
 /// A geometry fingerprint that reflects the actual surviving solids without
 /// depending on internal store compaction: `(solid_count, total_triangles,
 /// total_mesh_vertices)` over every solid's default tessellation. Deterministic
@@ -487,5 +546,253 @@ async fn mutation_disabling_boot_replay_yields_empty_model() {
         "with boot_replay DISABLED the rebooted model MUST be empty (the persisted log is not \
          replayed); got {} solids — if this is non-zero, (a) is not actually exercising replay",
         model.solids.len()
+    );
+}
+
+// =====================================================================
+// Durability Slice 1.1 — the recorded-but-unreplayable `delete_solid` gap
+// (task #39.1). Found live one hour after Slice 1 shipped: a mid-session
+// `clear_parts` records a `delete_solid` per removed solid; on reboot the
+// replay dispatch had no arm for it, so boot QUARANTINED at the first delete
+// and served only the clean prefix — every post-delete solid was safe in the
+// log but unservable.
+// =====================================================================
+
+/// (a) THE LIVE SEQUENCE: build geometry → `clear_parts` (records
+/// `delete_solid`) → build MORE geometry → reboot. Before the `delete_solid`
+/// replay arm, boot quarantined at the delete and the post-delete geometry
+/// never came back. After the fix, the WHOLE log replays: status `active`,
+/// `events_replayed == events_total`, and the post-clear solid is restored and
+/// addressable.
+///
+/// Mutation proof: remove the `delete_solid` arm from `dispatch_generic` and
+/// this regresses to `quarantined` (first_break_kind = `delete_solid`), the
+/// post-clear geometry vanishes, and the two asserts below fail.
+#[tokio::test]
+async fn clear_parts_midsession_then_rebuild_survives_reboot() {
+    let path = temp_db_path();
+
+    let (fp_before, total_events) = {
+        let db = open_db(&path).await;
+        let state = build_state(db, true).await;
+
+        // Two parts + a boolean, exactly like the live session's opening.
+        build_bored_box(&state, 10.0).await;
+        {
+            let model = state.model.read().await;
+            assert_eq!(
+                model.solids.len(),
+                1,
+                "the first difference must leave exactly one solid"
+            );
+        }
+
+        // `clear_parts`: DELETE /api/agent/parts — records a `delete_solid` per
+        // remaining solid. This is the event that quarantined the tail live.
+        let (s, body) = dispatch(&state, del("/api/agent/parts")).await;
+        assert_eq!(s, StatusCode::OK, "clear_parts must succeed; body = {body}");
+        {
+            let model = state.model.read().await;
+            assert_eq!(model.solids.len(), 0, "clear_parts must empty the model");
+        }
+
+        // Build MORE geometry AFTER the delete — the geometry that was safe in
+        // the log but unservable before the fix.
+        build_bored_box(&state, 6.0).await;
+
+        state
+            .timeline_recorder
+            .flush()
+            .await
+            .expect("recorder flush must succeed");
+
+        let fp = geom_fingerprint(&state).await;
+        assert_eq!(
+            fp.0, 1,
+            "after clear + rebuild exactly one (post-clear) solid must be live; fp = {fp:?}"
+        );
+        let total = state
+            .database
+            .get_event_count(durability::DURABILITY_SESSION_ID)
+            .await
+            .expect("event count must query");
+        assert!(
+            total >= 7,
+            "the session must have persisted the create/boolean/delete/create/boolean chain; \
+             got {total} events"
+        );
+        (fp, total)
+    };
+
+    // ---- Reboot over the SAME db file. ----
+    let db2 = open_db(&path).await;
+    let state2 = build_state(db2, true).await;
+
+    // The WHOLE log replayed — NOT quarantined at the delete.
+    let (s, body) = dispatch(&state2, get("/api/durability/status")).await;
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "status endpoint must return 200; body = {body}"
+    );
+    assert_eq!(
+        body["quarantined"], false,
+        "the log must replay cleanly, NOT quarantine at the mid-session delete; body = {body}"
+    );
+    assert_eq!(
+        body["status"]["state"], "active",
+        "durability status must be `active` after a clean full replay; body = {body}"
+    );
+    assert_eq!(
+        body["status"]["events_replayed"],
+        json!(total_events),
+        "every persisted event must be replayed (delete included), not just the clean prefix; \
+         body = {body}"
+    );
+
+    // The post-clear geometry is back and byte-identical.
+    let fp_after = geom_fingerprint(&state2).await;
+    assert_eq!(
+        fp_after, fp_before,
+        "the post-clear geometry (solid count + tessellation) must be identical after reboot; \
+         before = {fp_before:?}, after = {fp_after:?}"
+    );
+
+    // And it is addressable by a freshly-minted uuid with a positive volume.
+    let uuid = state2
+        .uuid_to_local
+        .iter()
+        .next()
+        .map(|e| *e.key())
+        .expect("a uuid must be registered for the restored post-clear solid");
+    let (s, body) = dispatch(&state2, get(&format!("/api/agent/parts/uuid/{uuid}/mass"))).await;
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "GET by uuid must resolve the restored post-clear solid; body = {body}"
+    );
+    let volume = body["volume"]
+        .as_f64()
+        .or_else(|| body["volume"]["value"].as_f64());
+    assert!(
+        volume.map(|v| v > 0.0).unwrap_or(false),
+        "the restored post-clear bored box must report a positive volume; body = {body}"
+    );
+}
+
+/// (b) DELETE SEMANTICS: create A (big) and B (small) → delete A → reboot →
+/// exactly one solid survives, it is B (its volume, not A's), and exactly one
+/// uuid is registered (the deleted A leaves no dangling resolution).
+#[tokio::test]
+async fn delete_one_of_two_leaves_only_the_survivor_after_reboot() {
+    let path = temp_db_path();
+
+    // B is a 4-cube (volume 64); A is a 10-cube (volume 1000) — distinct
+    // volumes so the survivor is identifiable after uuids are re-minted.
+    let b_volume = 4.0_f64.powi(3);
+
+    {
+        let db = open_db(&path).await;
+        let state = build_state(db, true).await;
+
+        let (s, body) = dispatch(
+            &state,
+            post(
+                "/api/geometry/box",
+                json!({ "width": 10.0, "depth": 10.0, "height": 10.0 }),
+            ),
+        )
+        .await;
+        assert_eq!(
+            s,
+            StatusCode::OK,
+            "box A create must succeed; body = {body}"
+        );
+        let uuid_a = body["object"]["id"]
+            .as_str()
+            .expect("box A response must carry object.id")
+            .to_string();
+
+        let (s, body) = dispatch(
+            &state,
+            post(
+                "/api/geometry/box",
+                json!({ "width": 4.0, "depth": 4.0, "height": 4.0 }),
+            ),
+        )
+        .await;
+        assert_eq!(
+            s,
+            StatusCode::OK,
+            "box B create must succeed; body = {body}"
+        );
+
+        // Delete A specifically.
+        let (s, body) = dispatch(&state, del(&format!("/api/geometry/{uuid_a}"))).await;
+        assert_eq!(s, StatusCode::OK, "delete of A must succeed; body = {body}");
+        {
+            let model = state.model.read().await;
+            assert_eq!(model.solids.len(), 1, "only B must remain live pre-reboot");
+        }
+
+        state
+            .timeline_recorder
+            .flush()
+            .await
+            .expect("recorder flush must succeed");
+    }
+
+    // ---- Reboot. ----
+    let db2 = open_db(&path).await;
+    let state2 = build_state(db2, true).await;
+
+    // Not quarantined — the delete replays.
+    let (s, body) = dispatch(&state2, get("/api/durability/status")).await;
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "status endpoint must return 200; body = {body}"
+    );
+    assert_eq!(
+        body["quarantined"], false,
+        "a `delete_solid` in the log must NOT quarantine the reboot; body = {body}"
+    );
+
+    // Exactly one solid, exactly one uuid — the deleted A leaves no residue.
+    {
+        let model = state2.model.read().await;
+        assert_eq!(
+            model.solids.len(),
+            1,
+            "exactly the survivor B must be present after reboot; got {} solids",
+            model.solids.len()
+        );
+    }
+    assert_eq!(
+        state2.uuid_to_local.len(),
+        1,
+        "exactly one uuid must resolve after reboot — the deleted A must not resurrect"
+    );
+
+    // The survivor is B (volume 64), never A (volume 1000).
+    let uuid = state2
+        .uuid_to_local
+        .iter()
+        .next()
+        .map(|e| *e.key())
+        .expect("a uuid must be registered for the survivor");
+    let (s, body) = dispatch(&state2, get(&format!("/api/agent/parts/uuid/{uuid}/mass"))).await;
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "GET by uuid must resolve the survivor; body = {body}"
+    );
+    let volume = body["volume"]
+        .as_f64()
+        .or_else(|| body["volume"]["value"].as_f64())
+        .expect("survivor must report a volume");
+    assert!(
+        (volume - b_volume).abs() < 1e-6,
+        "the survivor must be B (volume {b_volume}), not the deleted A (volume 1000); got {volume}"
     );
 }

@@ -34,7 +34,9 @@
 //!   rectangle}_2d`, `create_{box,sphere,cylinder,cone,plane}_3d`
 //! - **Direct ops**: `extrude_face`, `revolve_face`,
 //!   `boolean_{union,intersection,difference}`, `fillet_edges`,
-//!   `chamfer_edges`, `transform_{solid,faces,edges}`
+//!   `chamfer_edges`, `transform_{solid,faces,edges}`, `delete_solid`
+//!   (cascade solid removal — the durability #39 Slice-1.1 arm; a delete of an
+//!   already-absent solid is an idempotent no-op)
 //! - **Lossy-record ops**: `sweep_profile` and `loft_profiles` are
 //!   skipped with a structured error because the kernel currently records
 //!   profile *edges*, not the parent profile *face* — which is what the
@@ -1358,6 +1360,47 @@ fn dispatch_generic(
             let transform = matrix4_field(inner, "transform", kind)?;
             transform_edges(model, edge_ids, transform, TransformOptions::default())
                 .map_err(|e| kernel_err(kind, &e))?;
+            Ok(())
+        }
+
+        // ----------------------------------------------------------------
+        // Solid deletion (durability #39, Slice 1.1). The live DELETE
+        // endpoints (`delete_solid_core`: `DELETE /api/geometry/{id}`, its
+        // `/api/agent/parts/{id}` alias, and `clear_parts` →
+        // `DELETE /api/agent/parts`) record ONE `delete_solid` per removed
+        // solid — a CASCADE delete of the kernel B-Rep. Without a replay arm
+        // this kind hit the `UnknownKind` fallback and QUARANTINED the whole
+        // post-delete tail on boot (the landmine found live: a mid-session
+        // `clear_parts` at sequence 3 made 42 downstream events unservable).
+        //
+        // Semantics mirror the live op exactly (`operations::delete::delete_solid`
+        // with `cascade`): the solid and its shells/faces/edges/loops are gone,
+        // debris is pruned, and any later event that still references the removed
+        // solid dangles honestly (the kernel rejects it → a typed break) rather
+        // than being silently rebound. The recorded `solid_id` is resolved through
+        // the replay `id_remap` to the live entity. A delete of a solid that no
+        // longer resolves — already consumed by an upstream boolean, or removed by
+        // an earlier delete — is an idempotent no-op: the intended end-state (the
+        // solid absent) already holds, so it is NOT a replay break (mirrors the
+        // idempotent `assembly.delete` arm). The uuid↔solid mapping is not touched
+        // here — boot re-derives it from the surviving solids after replay, so a
+        // deleted solid simply never receives a fresh uuid.
+        "delete_solid" => {
+            let solid_raw = num_field(inner, "solid_id", kind)? as u64;
+            let solid = remap_id(solid_raw, id_remap) as SolidId;
+            let cascade = inner
+                .get("cascade")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            if model.solids.get(solid).is_some() {
+                geometry_engine::operations::delete::delete_solid(model, solid, cascade)
+                    .map_err(|e| kernel_err(kind, &e))?;
+            }
+            // Drop any remap entries that pointed at the now-removed live solid so
+            // a stale recorded id cannot later resolve to a deleted entity; a
+            // genuine later reference to it then falls through to the kernel's
+            // own liveness check and dangles honestly.
+            id_remap.retain(|_, v| *v != solid as u64);
             Ok(())
         }
 
