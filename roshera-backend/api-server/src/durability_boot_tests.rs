@@ -796,3 +796,376 @@ async fn delete_one_of_two_leaves_only_the_survivor_after_reboot() {
         "the survivor must be B (volume {b_volume}), not the deleted A (volume 1000); got {volume}"
     );
 }
+
+// =====================================================================
+// Durability Slice 1.2 — replay fidelity for the typed/sampled revolve
+// endpoint (task #39.2). Found live on a 45-event boot: the typed
+// `profile_segments` revolve recorded only its INTERNAL `revolve_face`
+// steps (whose `face_id` names a never-recorded profile face), so boot
+// QUARANTINED at `revolve_face` (barrel: "face_id=166 not found") while an
+// earlier typed revolve served with NO solid produced — a silent no-op.
+// The self-contained `revolve_typed` / `revolve_meridian` events + their
+// replay arms rebuild from the recorded profile with zero session-local
+// references; the legacy `revolve_face` event now fails loud (dangling)
+// instead of serving a phantom.
+// =====================================================================
+
+/// The mixed nozzle-style typed profile (line + arc + nurbs, closed after
+/// auto-close; axis at r = 0). Mirrors the live `/api/geometry/revolve`
+/// `profile_segments` payload that quarantined boot.
+fn typed_barrel_segments() -> Value {
+    json!([
+        {"type": "line", "start": [0.0, 0.0], "end": [5.0, 0.0]},
+        {"type": "line", "start": [5.0, 0.0], "end": [5.0, 3.0]},
+        {"type": "arc", "center": [6.0, 3.0], "radius": 1.0,
+         "start_angle": std::f64::consts::PI,
+         "end_angle": std::f64::consts::FRAC_PI_2, "ccw": false},
+        {"type": "line", "start": [6.0, 4.0], "end": [4.0, 6.0]},
+        {"type": "nurbs", "degree": 3,
+         "control_points": [[4.0, 6.0], [3.5, 6.8], [2.6, 6.2], [2.0, 7.0]],
+         "knots": [0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0]},
+        {"type": "line", "start": [2.0, 7.0], "end": [0.0, 7.0]}
+    ])
+}
+
+/// POST a typed `profile_segments` revolve (full 360°) at `axis_origin`;
+/// returns the created part's public uuid string.
+async fn seed_typed_revolve(state: &AppState, axis_origin: [f64; 3], name: &str) -> String {
+    let (s, body) = dispatch(
+        state,
+        post(
+            "/api/geometry/revolve",
+            json!({
+                "profile_segments": typed_barrel_segments(),
+                "axis_origin": axis_origin,
+                "segments": 48,
+                "name": name,
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "typed profile_segments revolve must succeed; body = {body}"
+    );
+    body["object"]["id"]
+        .as_str()
+        .expect("revolve response must carry object.id")
+        .to_string()
+}
+
+/// (a) A typed `profile_segments` revolve (line + arc + nurbs, axis off-origin)
+/// round-trips a reboot: the solid comes back byte-identical, status is
+/// `active`, NOT quarantined at `revolve_face`.
+///
+/// Mutation proof: delete the `revolve_typed` replay arm in
+/// `timeline-engine/src/replay.rs` (so the event falls through to `UnknownKind`)
+/// and boot regresses to `quarantined` — the `quarantined == false` and
+/// `state == "active"` asserts fail and the solid does not come back.
+#[tokio::test]
+async fn typed_profile_segments_revolve_survives_reboot() {
+    let path = temp_db_path();
+
+    let fp_before = {
+        let db = open_db(&path).await;
+        let state = build_state(db, true).await;
+        // Axis off-origin, exactly like the live wheel-barrel revolve.
+        let _uuid = seed_typed_revolve(&state, [520.0, 0.0, 0.0], "wheel barrel").await;
+        state
+            .timeline_recorder
+            .flush()
+            .await
+            .expect("recorder flush must succeed");
+        let fp = geom_fingerprint(&state).await;
+        assert_eq!(
+            fp.0, 1,
+            "the typed revolve must build exactly one solid; fp = {fp:?}"
+        );
+        fp
+    };
+
+    // ---- Reboot over the SAME db file. ----
+    let db2 = open_db(&path).await;
+    let state2 = build_state(db2, true).await;
+
+    let (s, body) = dispatch(&state2, get("/api/durability/status")).await;
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "status endpoint must return 200; body = {body}"
+    );
+    assert_eq!(
+        body["quarantined"], false,
+        "the typed revolve must REPLAY, not quarantine at revolve_face; body = {body}"
+    );
+    assert_eq!(
+        body["status"]["state"], "active",
+        "durability status must be `active` after a clean typed-revolve replay; body = {body}"
+    );
+
+    let fp_after = geom_fingerprint(&state2).await;
+    assert_eq!(
+        fp_after, fp_before,
+        "the typed revolved solid (count + tessellation) must be identical after reboot; \
+         before = {fp_before:?}, after = {fp_after:?}"
+    );
+
+    // Addressable by a freshly-minted uuid with a positive volume.
+    let uuid = state2
+        .uuid_to_local
+        .iter()
+        .next()
+        .map(|e| *e.key())
+        .expect("a uuid must be registered for the restored typed revolve");
+    let (s, body) = dispatch(&state2, get(&format!("/api/agent/parts/uuid/{uuid}/mass"))).await;
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "GET by uuid must resolve the restored typed revolve; body = {body}"
+    );
+    let volume = body["volume"]
+        .as_f64()
+        .or_else(|| body["volume"]["value"].as_f64());
+    assert!(
+        volume.map(|v| v > 0.0).unwrap_or(false),
+        "the restored typed revolve must report a positive volume; body = {body}"
+    );
+}
+
+/// (b) THE GALLERY SEQUENCE: create + boolean (plate) → `clear_parts` → typed
+/// revolve (nozzle) → drill (cylinder + boolean-difference on the nozzle) →
+/// second typed revolve (barrel) → reboot. Every part must come back, the log
+/// must replay in FULL (`events_replayed == events_total`, not quarantined), and
+/// the post-reboot part count must match pre-reboot. The drill's boolean
+/// consuming the revolve output exercises the `revolve_typed` arm's
+/// `stamp_outputs` (a downstream op resolving the revolve's recorded solid id).
+#[tokio::test]
+async fn gallery_typed_revolves_and_drill_survive_reboot() {
+    let path = temp_db_path();
+
+    let (fp_before, total_events) = {
+        let db = open_db(&path).await;
+        let state = build_state(db, true).await;
+
+        // create + boolean → one injector-plate solid.
+        build_bored_box(&state, 10.0).await;
+        // clear_parts → records a delete_solid per solid.
+        let (s, body) = dispatch(&state, del("/api/agent/parts")).await;
+        assert_eq!(s, StatusCode::OK, "clear_parts must succeed; body = {body}");
+        {
+            let model = state.model.read().await;
+            assert_eq!(model.solids.len(), 0, "clear_parts must empty the model");
+        }
+
+        // Typed revolve #1 (nozzle) at the origin axis.
+        let nozzle = seed_typed_revolve(&state, [0.0, 0.0, 0.0], "nozzle").await;
+
+        // Drill: a cylinder bored through the nozzle centre via boolean
+        // difference — the downstream op that must resolve the revolve output.
+        let (s, body) = dispatch(
+            &state,
+            post(
+                "/api/geometry/cylinder",
+                json!({ "center": [0.0, 0.0, -2.0], "axis": [0.0, 0.0, 1.0], "radius": 1.0, "height": 20.0 }),
+            ),
+        )
+        .await;
+        assert_eq!(
+            s,
+            StatusCode::OK,
+            "drill cylinder must succeed; body = {body}"
+        );
+        let drill = body["object"]["id"]
+            .as_str()
+            .expect("cylinder object.id")
+            .to_string();
+        let (s, body) = dispatch(
+            &state,
+            post(
+                "/api/geometry/boolean",
+                json!({ "operation": "difference", "object_a": nozzle, "object_b": drill }),
+            ),
+        )
+        .await;
+        assert_eq!(
+            s,
+            StatusCode::OK,
+            "drill boolean must succeed; body = {body}"
+        );
+
+        // Typed revolve #2 (barrel) at an off-origin axis.
+        let _barrel = seed_typed_revolve(&state, [520.0, 0.0, 0.0], "wheel barrel").await;
+
+        state
+            .timeline_recorder
+            .flush()
+            .await
+            .expect("recorder flush must succeed");
+
+        let fp = geom_fingerprint(&state).await;
+        assert_eq!(
+            fp.0, 2,
+            "pre-reboot: the drilled nozzle + the barrel = two solids; fp = {fp:?}"
+        );
+        let total = state
+            .database
+            .get_event_count(durability::DURABILITY_SESSION_ID)
+            .await
+            .expect("event count must query");
+        (fp, total)
+    };
+
+    // ---- Reboot. ----
+    let db2 = open_db(&path).await;
+    let state2 = build_state(db2, true).await;
+
+    let (s, body) = dispatch(&state2, get("/api/durability/status")).await;
+    assert_eq!(s, StatusCode::OK, "status 200; body = {body}");
+    assert_eq!(
+        body["quarantined"], false,
+        "the whole gallery must replay, not quarantine; body = {body}"
+    );
+    assert_eq!(
+        body["status"]["events_replayed"],
+        json!(total_events),
+        "every persisted event must be replayed (no quarantined tail); body = {body}"
+    );
+
+    let fp_after = geom_fingerprint(&state2).await;
+    assert_eq!(
+        fp_after, fp_before,
+        "all gallery parts must be back and byte-identical after reboot; \
+         before = {fp_before:?}, after = {fp_after:?}"
+    );
+    {
+        let model = state2.model.read().await;
+        assert_eq!(
+            model.solids.len(),
+            2,
+            "post-reboot part count must match pre-reboot (2); got {}",
+            model.solids.len()
+        );
+    }
+}
+
+/// (c) ANTI-SILENT-NO-OP PIN: four INDEPENDENT create-class events (box, typed
+/// revolve, cylinder, typed revolve) with no booleans/deletes → after reboot
+/// there must be exactly four solids. A served create-class event that produced
+/// no geometry (the silent no-op the nozzle exhibited) would drop the count.
+#[tokio::test]
+async fn every_served_create_event_produces_its_solid_after_reboot() {
+    let path = temp_db_path();
+
+    {
+        let db = open_db(&path).await;
+        let state = build_state(db, true).await;
+
+        let (s, b) = dispatch(
+            &state,
+            post(
+                "/api/geometry/box",
+                json!({ "width": 4.0, "depth": 4.0, "height": 4.0 }),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "box; body = {b}");
+        let _ = seed_typed_revolve(&state, [0.0, 0.0, 0.0], "nozzle").await;
+        let (s, b) = dispatch(
+            &state,
+            post(
+                "/api/geometry/cylinder",
+                json!({ "center": [100.0, 0.0, 0.0], "axis": [0.0, 0.0, 1.0], "radius": 2.0, "height": 8.0 }),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "cylinder; body = {b}");
+        let _ = seed_typed_revolve(&state, [520.0, 0.0, 0.0], "barrel").await;
+
+        state
+            .timeline_recorder
+            .flush()
+            .await
+            .expect("recorder flush must succeed");
+
+        let fp = geom_fingerprint(&state).await;
+        assert_eq!(
+            fp.0, 4,
+            "four independent creates must leave four live solids; fp = {fp:?}"
+        );
+    }
+
+    let db2 = open_db(&path).await;
+    let state2 = build_state(db2, true).await;
+
+    let (s, body) = dispatch(&state2, get("/api/durability/status")).await;
+    assert_eq!(s, StatusCode::OK, "status 200; body = {body}");
+    assert_eq!(
+        body["quarantined"], false,
+        "no create-class event may quarantine; body = {body}"
+    );
+    let model = state2.model.read().await;
+    assert_eq!(
+        model.solids.len(),
+        4,
+        "ANTI-SILENT-NO-OP: every served create-class event must produce its solid — \
+         4 creates in, {} solids out after reboot",
+        model.solids.len()
+    );
+}
+
+/// (e) The sampled `(r,z)`-polyline revolve path (`revolve_meridian`) also
+/// round-trips a reboot — the same recording gap, fixed the same way.
+#[tokio::test]
+async fn sampled_meridian_revolve_survives_reboot() {
+    let path = temp_db_path();
+
+    let fp_before = {
+        let db = open_db(&path).await;
+        let state = build_state(db, true).await;
+        // A closed annular meridian (r from 1 to 4) → a revolved tube.
+        let (s, body) = dispatch(
+            &state,
+            post(
+                "/api/geometry/revolve",
+                json!({
+                    "profile": [[1.0, 0.0], [4.0, 0.0], [4.0, 5.0], [1.0, 5.0]],
+                    "axis_origin": [0.0, 0.0, 0.0],
+                    "axis_direction": [0.0, 0.0, 1.0],
+                    "segments": 48,
+                    "name": "sampled tube",
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(
+            s,
+            StatusCode::OK,
+            "sampled revolve must succeed; body = {body}"
+        );
+        state
+            .timeline_recorder
+            .flush()
+            .await
+            .expect("recorder flush must succeed");
+        let fp = geom_fingerprint(&state).await;
+        assert_eq!(fp.0, 1, "sampled revolve builds one solid; fp = {fp:?}");
+        fp
+    };
+
+    let db2 = open_db(&path).await;
+    let state2 = build_state(db2, true).await;
+
+    let (s, body) = dispatch(&state2, get("/api/durability/status")).await;
+    assert_eq!(s, StatusCode::OK, "status 200; body = {body}");
+    assert_eq!(
+        body["quarantined"], false,
+        "the sampled revolve must replay, not quarantine at revolve_face; body = {body}"
+    );
+    let fp_after = geom_fingerprint(&state2).await;
+    assert_eq!(
+        fp_after, fp_before,
+        "the sampled revolved solid must be identical after reboot; \
+         before = {fp_before:?}, after = {fp_after:?}"
+    );
+}

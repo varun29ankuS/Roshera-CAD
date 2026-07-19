@@ -4403,8 +4403,7 @@ async fn create_revolve_primitive(
 ) -> Result<Json<serde_json::Value>, error_catalog::ApiError> {
     use error_catalog::{ApiError, ErrorCode};
     use geometry_engine::operations::revolve::{
-        axis_frame, revolve_meridian, revolve_profile_regions_strict, revolve_smooth_nozzle,
-        revolve_smooth_solid, revolve_spline_meridian, RevolveOptions,
+        axis_frame, revolve_profile_regions_strict, revolve_sampled_dispatch, RevolveOptions,
     };
     use geometry_engine::tessellation::{tessellate_solid, TessellationParams};
     use std::time::Instant;
@@ -4549,6 +4548,16 @@ async fn create_revolve_primitive(
         }
     }
 
+    // DURABILITY Slice 1.2: revolve builds through the kernel entries whose
+    // internal `revolve_face`/boolean steps reference SESSION-LOCAL profile
+    // faces — ids that were never emitted as recorded outputs, so a
+    // per-`revolve_face` event cannot be faithfully replayed at boot (it would
+    // revolve whatever unrelated live face happened to share that id — a silent
+    // wrong-solid / no-op). Suppress those inner records and emit ONE
+    // self-contained, replayable event below (mirrors the csketch revolve
+    // route). The suppression window spans BOTH build arms and closes on every
+    // exit path (including `?`) via the guard's Drop.
+    let suppress = crate::csketch::RecorderSuppressGuard::new(&state.timeline_recorder);
     let result_solid_id = if let Some(edges) = &profile_segments {
         // Piecewise-analytic revolve (spec 2026-07-19 Slice B): lift the
         // [r,z] segments through the SAME axis frame as revolve_meridian
@@ -4590,6 +4599,9 @@ async fn create_revolve_primitive(
         // Parametric revolve: revolve the (r, z) meridian AND retain it as the
         // part's construction geometry, so the part remembers how it was made and
         // its profile is recoverable + editable (the #25 edit→regenerate loop).
+        // `revolve_sampled_dispatch` is the SINGLE mode-selection shared with the
+        // `revolve_meridian` replay arm — the live build and its durable replay
+        // run the identical kernel entry.
         let opts = RevolveOptions {
             axis_origin: Point3::new(axis_origin[0], axis_origin[1], axis_origin[2]),
             axis_direction: Vector3::new(axis_dir[0], axis_dir[1], axis_dir[2]),
@@ -4597,44 +4609,66 @@ async fn create_revolve_primitive(
             segments,
             ..Default::default()
         };
-        if wall_thickness > 0.0 {
-            revolve_smooth_nozzle(&mut model, profile, wall_thickness, opts).map_err(|e| {
-                ApiError::new(
-                    ErrorCode::InvalidParameter,
-                    format!("smooth nozzle revolve failed: {e:?}"),
-                )
-            })?
-        } else if smooth && bore_radius > 0.0 {
-            revolve_spline_meridian(&mut model, profile, bore_radius, opts).map_err(|e| {
-                ApiError::new(
-                    ErrorCode::InvalidParameter,
-                    format!("smooth revolve failed: {e:?}"),
-                )
-            })?
-        } else if smooth {
-            // Smooth SOLID of revolution (no bore): fit ONE NURBS wall → one
-            // SurfaceOfRevolution face that closes to the apex (nose cone / dome /
-            // teardrop) — zero meridian band rings.
-            revolve_smooth_solid(&mut model, profile, opts).map_err(|e| {
-                ApiError::new(
-                    ErrorCode::InvalidParameter,
-                    format!("smooth solid revolve failed: {e:?}"),
-                )
-            })?
-        } else {
-            revolve_meridian(&mut model, profile, opts).map_err(|e| {
-                ApiError::new(
-                    ErrorCode::InvalidParameter,
-                    format!("revolve failed: {e:?}"),
-                )
-            })?
-        }
+        revolve_sampled_dispatch(
+            &mut model,
+            profile,
+            smooth,
+            bore_radius,
+            wall_thickness,
+            opts,
+        )
+        .map_err(|e| {
+            ApiError::new(
+                ErrorCode::InvalidParameter,
+                format!("revolve failed: {e:?}"),
+            )
+        })?
     } else {
         // Unreachable by construction (`profile` is Some exactly when
         // `profile_segments` is None), kept as an honest typed error
         // rather than a panic path.
         return Err(ApiError::missing_field("profile"));
     };
+    // Close the suppression window before emitting the self-contained event.
+    drop(suppress);
+
+    // The replayable record — everything needed to rebuild this solid from an
+    // empty model, applied through the SAME kernel entry (no session-local ids).
+    // The typed path records `revolve_typed` (piecewise-analytic strict); the
+    // sampled path records `revolve_meridian` (carrying the mode flags so replay
+    // selects the identical `revolve_sampled_dispatch` branch).
+    {
+        use geometry_engine::operations::recorder::OperationRecorder as _;
+        let record = if let Some(edges) = &profile_segments {
+            geometry_engine::operations::recorder::RecordedOperation::new("revolve_typed")
+                .with_parameters(serde_json::json!({
+                    "profile_segments": edges,
+                    "axis_origin": axis_origin,
+                    "axis_direction": axis_dir,
+                    "angle_deg": angle_deg,
+                    "segments": segments,
+                    "name": display_name,
+                }))
+                .with_output_solids([result_solid_id as u64])
+        } else {
+            geometry_engine::operations::recorder::RecordedOperation::new("revolve_meridian")
+                .with_parameters(serde_json::json!({
+                    "profile": profile,
+                    "axis_origin": axis_origin,
+                    "axis_direction": axis_dir,
+                    "angle_deg": angle_deg,
+                    "segments": segments,
+                    "smooth": smooth,
+                    "bore_radius": bore_radius,
+                    "wall_thickness": wall_thickness,
+                    "name": display_name,
+                }))
+                .with_output_solids([result_solid_id as u64])
+        };
+        if let Err(e) = state.timeline_recorder.record(record) {
+            tracing::warn!("revolve event not recorded: {e}");
+        }
+    }
 
     // Persist the generating profile (replay-proof) so it is always recoverable
     // via GET /api/agent/parts/{id}/profile for the edit→regenerate loop. A

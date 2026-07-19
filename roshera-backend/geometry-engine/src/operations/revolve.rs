@@ -429,6 +429,42 @@ fn revolve_profile_regions_impl(
     Ok(accumulator)
 }
 
+/// Sampled-`(r, z)`-meridian revolve dispatch, shared by the api-server
+/// `POST /api/geometry/revolve` endpoint (sampled `profile` polyline form) and
+/// the timeline `revolve_meridian` replay arm, so the live build and its
+/// durable replay run the IDENTICAL kernel entry with no live-vs-replay drift
+/// (mirrors the `revolve_profile_regions` sharing used by the typed path).
+///
+/// The four modes are mutually exclusive and selected EXACTLY as the endpoint
+/// documents them — the single source of truth for the selection:
+///
+/// * `wall_thickness > 0` → [`revolve_smooth_nozzle`] (contoured shell: the
+///   `profile` is the inner flow contour, the outer wall is offset radially by
+///   `wall_thickness`, both NURBS-fit).
+/// * `smooth && bore_radius > 0` → [`revolve_spline_meridian`] (one smooth NURBS
+///   outer wall, hollowed by a coaxial bore).
+/// * `smooth` → [`revolve_smooth_solid`] (one NURBS wall closing to the apex).
+/// * otherwise → [`revolve_meridian`] (faceted polyline meridian, retained as
+///   the part's construction geometry).
+pub fn revolve_sampled_dispatch(
+    model: &mut BRepModel,
+    profile_rz: &[(f64, f64)],
+    smooth: bool,
+    bore_radius: f64,
+    wall_thickness: f64,
+    options: RevolveOptions,
+) -> OperationResult<SolidId> {
+    if wall_thickness > 0.0 {
+        revolve_smooth_nozzle(model, profile_rz, wall_thickness, options)
+    } else if smooth && bore_radius > 0.0 {
+        revolve_spline_meridian(model, profile_rz, bore_radius, options)
+    } else if smooth {
+        revolve_smooth_solid(model, profile_rz, options)
+    } else {
+        revolve_meridian(model, profile_rz, options)
+    }
+}
+
 /// Orthonormal `(â, ê1, ê2)` frame of a revolution axis, with `ê1` the canonical
 /// radial reference direction at which a `(r, z)` meridian's `r` is laid out.
 ///

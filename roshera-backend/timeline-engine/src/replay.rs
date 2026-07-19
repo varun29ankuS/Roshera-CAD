@@ -37,6 +37,13 @@
 //!   `chamfer_edges`, `transform_{solid,faces,edges}`, `delete_solid`
 //!   (cascade solid removal — the durability #39 Slice-1.1 arm; a delete of an
 //!   already-absent solid is an idempotent no-op)
+//! - **Self-contained revolve** (durability #39 Slice-1.2): `revolve_typed`
+//!   (typed piecewise-analytic `profile_segments`) and `revolve_meridian`
+//!   (sampled `(r,z)` polyline, all four smooth/bore/wall modes) rebuild from
+//!   the recorded profile + world axis with zero session-local references. The
+//!   legacy `revolve_face` event, whose `face_id` names a never-recorded
+//!   internal profile face, is fail-loud: it dangles (quarantines) rather than
+//!   revolve a coincidentally-numbered live face.
 //! - **Lossy-record ops**: `sweep_profile` and `loft_profiles` are
 //!   skipped with a structured error because the kernel currently records
 //!   profile *edges*, not the parent profile *face* — which is what the
@@ -1404,8 +1411,26 @@ fn dispatch_generic(
             Ok(())
         }
 
+        // DURABILITY Slice 1.2 — a recorded `revolve_face` references the
+        // INTERNAL profile face the kernel built inside a revolve (created by
+        // `create_face_from_profile*`), which is never emitted as a recorded
+        // output and therefore never enters `id_remap`. Resolving `face_raw` by
+        // raw fallback would revolve whatever UNRELATED live face happened to
+        // share that numeric id — a silent wrong-solid (or, when the id resolved
+        // to nothing buildable, a phantom served event with no geometry). Such an
+        // event is unreplayable by construction: fail LOUD as a dangling
+        // reference so boot QUARANTINES honestly at it, never serves a phantom.
+        // New logs record the self-contained `revolve_typed` / `revolve_meridian`
+        // events below instead; only pre-1.2 logs reach this arm, and they must
+        // break rather than lie.
         "revolve_face" => {
             let face_raw = num_field(inner, "face_id", kind)? as u64;
+            if !id_remap.contains_key(&face_raw) {
+                return Err(ReplayError::DanglingReference {
+                    kind: kind.to_string(),
+                    entity: format!("face:{face_raw}"),
+                });
+            }
             let face_id = remap_id(face_raw, id_remap) as FaceId;
             let axis_origin_v = vec3_field(inner, "axis_origin").unwrap_or(Vector3::ZERO);
             let axis_direction = vec3_field(inner, "axis_direction").unwrap_or(Vector3::Z);
@@ -1431,6 +1456,107 @@ fn dispatch_generic(
             };
             let new_solid =
                 revolve_face(model, face_id, options).map_err(|e| kernel_err(kind, &e))?;
+            stamp_outputs(new_solid as u64, &recorded_outputs, id_remap);
+            Ok(())
+        }
+
+        // DURABILITY Slice 1.2 — self-contained typed piecewise-analytic revolve
+        // (the `POST /api/geometry/revolve` `profile_segments` path). Carries the
+        // typed profile edges + world axis, so it rebuilds from an empty model
+        // with ZERO session-local references, through the SAME strict kernel
+        // entry the live endpoint uses (`revolve_profile_regions_strict`) — no
+        // live/replay drift, no faceted fallback.
+        "revolve_typed" => {
+            let edges: Vec<geometry_engine::sketch2d::sketch_topology::ProfileEdge> = inner
+                .get("profile_segments")
+                .cloned()
+                .and_then(|v| serde_json::from_value(v).ok())
+                .ok_or_else(|| ReplayError::InvalidParameters {
+                    kind: kind.to_string(),
+                    reason: "missing/malformed `profile_segments`".to_string(),
+                })?;
+            let axis_origin_v = vec3_field(inner, "axis_origin").unwrap_or(Vector3::ZERO);
+            let axis_direction = vec3_field(inner, "axis_direction").unwrap_or(Vector3::Z);
+            let segments = inner
+                .get("segments")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as u32)
+                .unwrap_or(48);
+            let (axis, e1, _e2) = geometry_engine::operations::revolve::axis_frame(axis_direction)
+                .map_err(|e| kernel_err(kind, &e))?;
+            let region = geometry_engine::operations::extrude::ProfileRegion {
+                outer: geometry_engine::operations::extrude::ProfileLoop::Edges(edges),
+                holes: Vec::new(),
+            };
+            let new_solid = geometry_engine::operations::revolve::revolve_profile_regions_strict(
+                model,
+                Point3::new(axis_origin_v.x, axis_origin_v.y, axis_origin_v.z),
+                e1,
+                axis,
+                &[region],
+                [0.0, 0.0],
+                [0.0, 1.0],
+                // The typed endpoint is full-360° only (it refuses partial
+                // angles); replay the identical full revolution.
+                std::f64::consts::TAU,
+                segments,
+                geometry_engine::math::Tolerance::default(),
+            )
+            .map_err(|e| kernel_err(kind, &e))?;
+            stamp_outputs(new_solid as u64, &recorded_outputs, id_remap);
+            Ok(())
+        }
+
+        // DURABILITY Slice 1.2 — self-contained sampled `(r,z)`-meridian revolve
+        // (the `POST /api/geometry/revolve` `profile` polyline path, all four
+        // modes). The recorded mode flags select the SAME
+        // `revolve_sampled_dispatch` branch the live endpoint took, so the
+        // durable replay runs the identical kernel entry.
+        "revolve_meridian" => {
+            let profile: Vec<(f64, f64)> = inner
+                .get("profile")
+                .cloned()
+                .and_then(|v| serde_json::from_value::<Vec<(f64, f64)>>(v).ok())
+                .ok_or_else(|| ReplayError::InvalidParameters {
+                    kind: kind.to_string(),
+                    reason: "missing/malformed `profile` [r,z] polyline".to_string(),
+                })?;
+            let axis_origin_v = vec3_field(inner, "axis_origin").unwrap_or(Vector3::ZERO);
+            let axis_direction = vec3_field(inner, "axis_direction").unwrap_or(Vector3::Z);
+            let angle_deg = num_field(inner, "angle_deg", kind).unwrap_or(360.0);
+            let segments = inner
+                .get("segments")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as u32)
+                .unwrap_or(48);
+            let smooth = inner
+                .get("smooth")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let bore_radius = inner
+                .get("bore_radius")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            let wall_thickness = inner
+                .get("wall_thickness")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            let options = RevolveOptions {
+                axis_origin: Point3::new(axis_origin_v.x, axis_origin_v.y, axis_origin_v.z),
+                axis_direction,
+                angle: angle_deg.to_radians(),
+                segments,
+                ..RevolveOptions::default()
+            };
+            let new_solid = geometry_engine::operations::revolve::revolve_sampled_dispatch(
+                model,
+                &profile,
+                smooth,
+                bore_radius,
+                wall_thickness,
+                options,
+            )
+            .map_err(|e| kernel_err(kind, &e))?;
             stamp_outputs(new_solid as u64, &recorded_outputs, id_remap);
             Ok(())
         }
@@ -1911,6 +2037,79 @@ mod tests {
             outputs: Default::default(),
             metadata: EventMetadata::default(),
         }
+    }
+
+    /// DURABILITY Slice 1.2 anti-silent-no-op pin (item 4): a legacy
+    /// `revolve_face` event names an INTERNAL profile face (`face_id`) that was
+    /// never emitted as a recorded output — so it is not in `id_remap`. Even
+    /// when a live face with that numeric id EXISTS (here the box owns faces
+    /// 0..=5), replaying must NOT revolve that unrelated face: it must fail loud
+    /// as a `Dangling` break so boot quarantines honestly instead of serving a
+    /// silent wrong-solid.
+    ///
+    /// Mutation proof: delete the `id_remap.contains_key(&face_raw)` guard in the
+    /// `revolve_face` arm and this regresses — the kernel revolves the box's
+    /// face 3 (a coincidental success, or a `KernelError` that is not `Dangling`),
+    /// so `first_break` is either None or a non-Dangling verdict and both asserts
+    /// below fail.
+    #[test]
+    fn legacy_revolve_face_event_dangles_never_revolves_a_coincidental_face() {
+        // seq 0: a box (owns faces 0..=5, none of them a recorded output).
+        let mut boxx = mk_event(
+            "create_box_3d",
+            serde_json::json!({
+                "params": { "Create3D": {
+                    "primitive_type": "box",
+                    "parameters": { "width": 20.0, "height": 20.0, "depth": 20.0 },
+                    "timestamp": 0
+                }},
+                "inputs": [], "outputs": ["solid:1"]
+            }),
+        );
+        boxx.sequence_number = 0;
+
+        // seq 1: a pre-1.2 `revolve_face` naming face 3 — a real box face, but
+        // never a recorded output, so unreplayable by construction.
+        let mut rev = mk_event(
+            "revolve_face",
+            serde_json::json!({
+                "params": {
+                    "face_id": 3,
+                    "axis_origin": [0.0, 0.0, 0.0],
+                    "axis_direction": [0.0, 0.0, 1.0],
+                    "angle": std::f64::consts::TAU,
+                    "pitch": 0.0,
+                    "segments": 32,
+                    "cap_ends": true
+                },
+                "inputs": ["face:3"], "outputs": ["solid:2"]
+            }),
+        );
+        rev.sequence_number = 1;
+
+        let events = vec![boxx, rev];
+        let (_model, cert) = crate::rebuild_certificate::certify_rebuild(&events, None);
+
+        let first = cert
+            .first_break()
+            .expect("the unreplayable revolve_face must be a break, never a silent success");
+        assert_eq!(
+            first.kind, "revolve_face",
+            "the break must be attributed to the revolve_face event; got {first:?}"
+        );
+        assert!(
+            matches!(
+                first.status,
+                crate::rebuild_certificate::FeatureStatus::Dangling { .. }
+            ),
+            "a revolve_face whose face id was never a recorded output must DANGLE (not \
+             revolve a coincidentally-numbered live face); got {:?}",
+            first.status
+        );
+        assert!(
+            !cert.is_sound(),
+            "a dangling revolve_face taints the rebuild soundness"
+        );
     }
 
     #[test]
