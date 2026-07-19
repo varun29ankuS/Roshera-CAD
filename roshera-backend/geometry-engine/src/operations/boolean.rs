@@ -586,6 +586,32 @@ pub fn boolean_operation(
             }
         }
 
+        // Step 4.5 — disjoint-difference honesty gate. A Difference whose
+        // tool grazed NOTHING (zero intersection curves, zero coplanar
+        // contact) and contributed NO face to the result would "succeed" by
+        // returning a copy of A: the silent no-op that let a mis-centered
+        // drill bore report "hole drilled" while the part was untouched.
+        // Selection non-empty distinguishes this from the A ⊆ B annihilation
+        // case, which falls through to the typed `EmptyResult` below. The
+        // enclosed-void case (B strictly inside A) keeps B's faces in the
+        // selection, so it never trips this gate.
+        if matches!(operation, BooleanOp::Difference) && !selected_faces.is_empty() {
+            let any_contact = intersections.iter().any(|fi| {
+                !fi.curves.is_empty()
+                    || !fi.coplanar_curves_a.is_empty()
+                    || !fi.coplanar_curves_b.is_empty()
+            });
+            let tool_contributed = selected_faces.iter().any(|f| f.from_solid == solid_b);
+            if !any_contact && !tool_contributed {
+                pipeline_trace(format_args!(
+                    "stage=disjoint_difference_gate REFUSED: tool solid_b={} never \
+                     touches target solid_a={}",
+                    solid_b, solid_a,
+                ));
+                return Err(OperationError::DisjointDifference);
+            }
+        }
+
         // Step 5: Reconstruct topology from selected faces
         let result_solid =
             reconstruct_topology(model, selected_faces, &options, operation, solid_b)?;

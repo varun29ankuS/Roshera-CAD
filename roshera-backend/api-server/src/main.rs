@@ -1512,7 +1512,32 @@ async fn boolean_operation(
             operation,
             BooleanOptions::default(),
         )
-        .map_err(ApiError::kernel_error)?;
+        .map_err(|e| match e {
+            // Honesty gate: a difference whose tool never touches the
+            // target is a caller positioning error, not a kernel fault —
+            // surface the typed refusal (400, non-retryable) instead of
+            // the generic 500 kernel_error. Both operands are rolled
+            // back intact and keep their UUID mappings.
+            geometry_engine::operations::OperationError::DisjointDifference => ApiError::new(
+                ErrorCode::BooleanDisjoint,
+                format!(
+                    "difference removed nothing: tool {uuid_b} does not \
+                     intersect target {uuid_a} — the cut misses the part \
+                     entirely, so no hole was drilled"
+                ),
+            )
+            .with_hint(
+                "Re-position the tool so it overlaps the target (check the \
+                 pattern center / axis against the part's actual location), \
+                 then retry."
+                    .to_string(),
+            )
+            .with_details(serde_json::json!({
+                "object_a": uuid_a.to_string(),
+                "object_b": uuid_b.to_string(),
+            })),
+            other => ApiError::kernel_error(other),
+        })?;
         if let (Some(name), Some(result)) = (base_kernel_name, model.solids.get_mut(id)) {
             result.name = Some(name);
         }

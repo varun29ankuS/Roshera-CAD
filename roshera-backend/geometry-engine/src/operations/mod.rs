@@ -204,6 +204,19 @@ pub enum OperationError {
     /// distinct from a malformed-input / failed-construction error.
     EmptyResult,
 
+    /// `A ∖ B` where the tool B never touches the target A: no face–face
+    /// intersection curve exists and no B-derived face survives selection,
+    /// so the "result" would be A returned unchanged. The kernel refuses to
+    /// report a mutation that mutated nothing — a subtract that removes zero
+    /// material is a caller positioning error (the canonical producer is a
+    /// drill bore ringed around the wrong center, missing the part entirely),
+    /// and silently succeeding here is exactly the "holes: N, volume
+    /// unchanged" lie the self-certification contract forbids. The operands
+    /// are rolled back intact. Sibling of [`OperationError::EmptyResult`]:
+    /// that variant is "the answer is nothing", this one is "the cut would
+    /// change nothing".
+    DisjointDifference,
+
     /// Feature too small for tolerance
     FeatureTooSmall,
 
@@ -270,6 +283,12 @@ impl std::fmt::Display for OperationError {
             }
             OperationError::InvalidBRep(msg) => write!(f, "Invalid B-Rep: {}", msg),
             OperationError::EmptyResult => write!(f, "Operation result is the empty solid"),
+            OperationError::DisjointDifference => write!(
+                f,
+                "Difference tool does not intersect the target: the operands are \
+                 disjoint, so the cut would remove nothing (target returned unchanged \
+                 is not a result this kernel reports as success)"
+            ),
             OperationError::FeatureTooSmall => write!(f, "Feature too small for current tolerance"),
             OperationError::NotImplemented(msg) => write!(f, "Not implemented: {}", msg),
             OperationError::InternalError(msg) => write!(f, "Internal error: {}", msg),

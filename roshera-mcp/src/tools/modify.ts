@@ -271,16 +271,31 @@ export function registerModifyTools(server: McpServer) {
   server.tool(
     "drill_pattern",
     "ONE-CALL hole pattern: drill `count` bores of radius `hole_r` on a ring " +
-      "of radius `ring_r` (centered at cx,cy on `plane`) through a target — " +
-      "creates the bore cylinders AND subtracts them in one call. Bores run " +
-      "along the plane normal from `z_offset` for `depth`: size them to " +
-      "OVERSHOOT both faces. REFUSES overlapping adjacent holes up front " +
-      "(2·ring_r·sin(π/count) must exceed 2·hole_r — that regime drives a " +
-      "known open boolean bug). Certified per hole; halts on the first " +
-      "unsound step.",
+      "of radius `ring_r` through a target — creates the bore cylinders AND " +
+      "subtracts them in one call. The ring is centered at WORLD `center` " +
+      "when given (REQUIRED for any part not at the origin — the standard " +
+      "planes all pass through [0,0,0]), else at cx,cy on `plane`; bores run " +
+      "along `axis` (default: the plane normal) from `z_offset` for `depth`: " +
+      "size them to OVERSHOOT both faces. A bore that misses the target is a " +
+      "TYPED backend refusal (boolean_disjoint), never a silent no-op. " +
+      "REFUSES overlapping adjacent holes up front (2·ring_r·sin(π/count) " +
+      "must exceed 2·hole_r — that regime drives a known open boolean bug). " +
+      "Certified per hole; halts on the first unsound step.",
     {
       object: z.string().uuid().describe("object_uuid of the solid to drill"),
       plane: PlaneSchema.default("xy"),
+      center: z
+        .tuple([z.number(), z.number(), z.number()])
+        .optional()
+        .describe(
+          "WORLD-space pattern center [x,y,z] — overrides the plane origin. " +
+            "Use the target part's actual location (cx/cy still apply as " +
+            "in-plane offsets on top).",
+        ),
+      axis: z
+        .tuple([z.number(), z.number(), z.number()])
+        .optional()
+        .describe("WORLD-space bore direction [x,y,z] — overrides the plane normal"),
       cx: z.number().default(0).describe("pattern center (plane coords)"),
       cy: z.number().default(0),
       count: z.number().int().min(1).max(64),
@@ -296,6 +311,8 @@ export function registerModifyTools(server: McpServer) {
     async ({
       object,
       plane,
+      center,
+      axis,
       cx,
       cy,
       count,
@@ -323,19 +340,42 @@ export function registerModifyTools(server: McpServer) {
           }
         }
         const p = resolvePlane(plane);
-        const n = unit3(cross3(p.u, p.v));
+        // World-space pattern frame. `center` overrides the plane origin and
+        // `axis` overrides the plane normal — WITHOUT these overrides every
+        // standard plane passes through the WORLD ORIGIN, and a caller-sent
+        // `center` used to be silently STRIPPED by the schema (zod drops
+        // unknown keys), so off-origin parts got their bolt ring drilled
+        // around [0,0,0] and missed entirely (confirmed live 2026-07-18).
+        let o = p.o;
+        let u = p.u;
+        let v = p.v;
+        let n = unit3(cross3(p.u, p.v));
+        if (axis) {
+          n = unit3(axis);
+          // Ring basis ⊥ the bore direction: seed with the world axis least
+          // parallel to `n` so the cross product never degenerates.
+          const ax = Math.abs(n[0]);
+          const ay = Math.abs(n[1]);
+          const az = Math.abs(n[2]);
+          const seed =
+            ax <= ay && ax <= az ? [1, 0, 0] : ay <= az ? [0, 1, 0] : [0, 0, 1];
+          u = unit3(cross3(seed, n));
+          v = cross3(n, u);
+        }
+        if (center) o = center;
         const bores: string[] = [];
+        const boreCenters: number[][] = [];
         for (let k = 0; k < count; k++) {
           const th = ((start_angle_deg + (360 * k) / count) * Math.PI) / 180;
           const hx = cx + ring_r * Math.cos(th);
           const hy = cy + ring_r * Math.sin(th);
-          const center = [0, 1, 2].map(
-            (i) => p.o[i] + hx * p.u[i] + hy * p.v[i] + z_offset * n[i],
+          const boreCenter = [0, 1, 2].map(
+            (i) => o[i] + hx * u[i] + hy * v[i] + z_offset * n[i],
           );
           // fast:true — bore blanks are analytic primitives; the difference
           // step's perceive() certifies the merged result that actually matters.
           const r = await api("POST", "/api/geometry/cylinder", {
-            center,
+            center: boreCenter,
             axis: n,
             radius: hole_r,
             height: depth,
@@ -345,16 +385,28 @@ export function registerModifyTools(server: McpServer) {
           const uuid = r.object?.id;
           if (!uuid) throw new Error(`bore ${k + 1}/${count}: no uuid returned`);
           bores.push(uuid);
+          boreCenters.push(boreCenter);
         }
         let lastId: number | null = null;
         for (let k = 0; k < bores.length; k++) {
           // fast:true — perceive() below is the single per-hole cert gate.
-          await api("POST", "/api/geometry/boolean", {
-            operation: "difference",
-            object_a: object,
-            object_b: bores[k],
-            fast: true,
-          });
+          // A bore that misses the target surfaces the backend's typed
+          // boolean_disjoint refusal — re-throw it naming WHICH hole missed
+          // and where it was placed, so the agent can fix center/axis.
+          try {
+            await api("POST", "/api/geometry/boolean", {
+              operation: "difference",
+              object_a: object,
+              object_b: bores[k],
+              fast: true,
+            });
+          } catch (e) {
+            const msg = e instanceof Error ? e.message : String(e);
+            const at = boreCenters[k].map((c) => c.toFixed(3)).join(", ");
+            throw new Error(
+              `hole ${k + 1}/${count} at [${at}] failed: ${msg}`,
+            );
+          }
           lastId = await newestPartId();
           const pv = await perceive(lastId);
           if (pv && pv.sound !== true) {

@@ -83,6 +83,15 @@ pub enum ErrorCode {
     /// Phase-2 typed-surface variant. Non-retryable — the caller
     /// must change inputs (radius, selection, …) before retrying.
     BlendFailed,
+    /// A Boolean difference whose tool operand never touches the target:
+    /// the kernel found zero intersection curves and the tool contributed
+    /// no face, so the "result" would have been the target returned
+    /// unchanged. Surfaced as a typed refusal instead of a silent no-op
+    /// success (the drill-pattern "holes drilled, volume unchanged" lie).
+    /// `details` carries `object_a` (target) and `object_b` (tool).
+    /// Non-retryable — the caller must re-position the tool (fix the
+    /// pattern `center` / `axis`) before retrying.
+    BooleanDisjoint,
     /// The kernel succeeded but tessellation produced no triangles —
     /// almost always a kernel defect, never a client bug.
     TessellationEmpty,
@@ -178,6 +187,7 @@ impl ErrorCode {
             | ErrorCode::UnknownShapeType
             | ErrorCode::InvalidJson
             | ErrorCode::BlendFailed
+            | ErrorCode::BooleanDisjoint
             | ErrorCode::IdempotencyKeyEmpty
             | ErrorCode::IdempotencyKeyTooLong => StatusCode::BAD_REQUEST,
 
@@ -220,6 +230,7 @@ impl ErrorCode {
             | ErrorCode::UnknownShapeType
             | ErrorCode::InvalidJson
             | ErrorCode::BlendFailed
+            | ErrorCode::BooleanDisjoint
             | ErrorCode::SolidNotFound
             | ErrorCode::PartNotFound
             | ErrorCode::IdempotencyKeyEmpty
@@ -258,6 +269,7 @@ impl ErrorCode {
             ErrorCode::InvalidJson => "invalid_json",
             ErrorCode::KernelError => "kernel_error",
             ErrorCode::BlendFailed => "blend_failed",
+            ErrorCode::BooleanDisjoint => "boolean_disjoint",
             ErrorCode::TessellationEmpty => "tessellation_empty",
             ErrorCode::SolidNotFound => "solid_not_found",
             ErrorCode::PartNotFound => "part_not_found",
@@ -292,6 +304,7 @@ impl ErrorCode {
             ErrorCode::InvalidJson,
             ErrorCode::KernelError,
             ErrorCode::BlendFailed,
+            ErrorCode::BooleanDisjoint,
             ErrorCode::TessellationEmpty,
             ErrorCode::SolidNotFound,
             ErrorCode::PartNotFound,

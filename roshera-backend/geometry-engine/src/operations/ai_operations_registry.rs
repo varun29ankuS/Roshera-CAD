@@ -1677,6 +1677,7 @@ impl OperationError {
             OperationError::CoplanarFaces(_) => "coplanar_faces",
             OperationError::BlendFailed(_) => "blend_failed",
             OperationError::EmptyResult => "empty_result",
+            OperationError::DisjointDifference => "disjoint_difference",
         }
     }
 

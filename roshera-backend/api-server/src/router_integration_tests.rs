@@ -4916,3 +4916,222 @@ async fn boolean_result_inherits_base_operand_kernel_name() {
          name; got {names:?}"
     );
 }
+
+// =====================================================================
+// Tests — drill-pattern positional honesty (drill_pattern silent-miss
+// bug, confirmed live 2026-07-18): the MCP `drill_pattern` tool drills
+// by creating bore cylinders at explicit world `center`/`axis` via
+// POST /api/geometry/cylinder and subtracting them via
+// POST /api/geometry/boolean. Two invariants are pinned here:
+//
+//   1. The bore's `center` is honored end-to-end — drilling an
+//      OFF-ORIGIN part at its own location must remove the analytic
+//      hole volume (mutation guard: hardcoding the cylinder handler's
+//      center to the origin must turn this RED).
+//   2. A difference whose tool never touches the target must be a
+//      TYPED error, never a silent success that returns the target
+//      unchanged while the caller reports "holes drilled".
+// =====================================================================
+
+/// Fetch a part's volume through the agent mass-properties surface.
+async fn part_volume_by_uuid(state: &AppState, uuid: &str) -> f64 {
+    let (status, body) = dispatch(
+        state,
+        json_get(&format!("/api/agent/parts/uuid/{uuid}/mass")),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "mass properties for {uuid} must 200; body = {body}"
+    );
+    let v = body["volume"].as_f64();
+    v.unwrap_or_else(|| panic!("mass report must carry a numeric volume; body = {body}"))
+}
+
+/// Drilling an off-origin part AT ITS OWN LOCATION must remove material.
+///
+/// This is the REST-level pin for the live 2026-07-18 failure: gear
+/// blanks positioned off-origin "drilled" with no volume change. The
+/// bore blank is created exactly the way the MCP `drill_pattern` tool
+/// creates it — explicit world `center` and `axis` on
+/// POST /api/geometry/cylinder — and subtracted. The blank's volume
+/// must drop by the analytic through-hole volume π·r²·h.
+///
+/// The target is deliberately a BOX (independent placement path): a
+/// mutation that snaps the cylinder handler's `center` to the origin
+/// moves the bore but not the target, so the cut misses and this test
+/// goes RED — pinning that the bore is built at the REQUESTED center.
+#[tokio::test]
+async fn drill_off_origin_center_removes_hole_volume() {
+    let state = make_test_state().await;
+
+    // Gear-blank stand-in far from the world origin: 80×80×20 plate
+    // spanning x ∈ [160, 240], y ∈ [-190, -110], z ∈ [0, 20].
+    let (bs, bbody) = dispatch(
+        &state,
+        json_post(
+            "/api/geometry/box",
+            json!({
+                "center": [200.0, -150.0, 0.0],
+                "width": 80.0, "depth": 80.0, "height": 20.0,
+                "name":   "gear_blank",
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(bs, StatusCode::OK, "blank create must 200; body = {bbody}");
+    let blank_uuid = bbody["object"]["id"]
+        .as_str()
+        .expect("blank uuid")
+        .to_string();
+    let v0 = part_volume_by_uuid(&state, &blank_uuid).await;
+    let expected_blank = 80.0 * 80.0 * 20.0;
+    assert!(
+        (v0 - expected_blank).abs() / expected_blank < 0.02,
+        "blank volume must be ≈ 80·80·20 = {expected_blank:.1}, got {v0:.1}"
+    );
+
+    // Bore blank AT THE PART'S LOCATION (ring offset +25 in x), exactly
+    // the drill_pattern construction: overshoot both faces (z −1 … 21).
+    let (cs, cbody) = dispatch(
+        &state,
+        json_post(
+            "/api/geometry/cylinder",
+            json!({
+                "center": [225.0, -150.0, -1.0],
+                "axis":   [0.0, 0.0, 1.0],
+                "radius": 5.0,
+                "height": 22.0,
+                "name":   "bore 1/1",
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(cs, StatusCode::OK, "bore create must 200; body = {cbody}");
+    let bore_uuid = cbody["object"]["id"]
+        .as_str()
+        .expect("bore uuid")
+        .to_string();
+
+    let (os, obody) = dispatch(
+        &state,
+        json_post(
+            "/api/geometry/boolean",
+            json!({
+                "operation": "difference",
+                "object_a": blank_uuid,
+                "object_b": bore_uuid,
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        os,
+        StatusCode::OK,
+        "difference at the part's true location must succeed; body = {obody}"
+    );
+
+    // The result keeps the blank's UUID (a cut is a feature ON the part).
+    let v1 = part_volume_by_uuid(&state, &blank_uuid).await;
+    let hole = std::f64::consts::PI * 5.0 * 5.0 * 20.0;
+    let removed = v0 - v1;
+    assert!(
+        (removed - hole).abs() / hole < 0.02,
+        "drilling at the part's off-origin location must remove the analytic \
+         hole volume ≈ {hole:.1}; removed {removed:.1} (v0 = {v0:.1}, v1 = {v1:.1}) — \
+         a removed ≈ 0 means the bore was NOT built at the requested center \
+         (origin-drilling regression)"
+    );
+}
+
+/// HONESTY: a difference whose tool misses the target entirely must be a
+/// typed error — never HTTP 200 with the target returned unchanged.
+///
+/// This is the silent-success lie from the live 2026-07-18 session: bores
+/// ringed around the world origin, part 250 mm away, and the surface
+/// reported success + SOUND while cutting nothing.
+#[tokio::test]
+async fn boolean_difference_tool_missing_target_is_typed_error() {
+    let state = make_test_state().await;
+
+    // Part far from the origin.
+    let (bs, bbody) = dispatch(
+        &state,
+        json_post(
+            "/api/geometry/cylinder",
+            json!({
+                "center": [200.0, -150.0, 0.0],
+                "axis":   [0.0, 0.0, 1.0],
+                "radius": 40.0,
+                "height": 20.0,
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(bs, StatusCode::OK, "blank create must 200; body = {bbody}");
+    let blank_uuid = bbody["object"]["id"]
+        .as_str()
+        .expect("blank uuid")
+        .to_string();
+    let v0 = part_volume_by_uuid(&state, &blank_uuid).await;
+
+    // Bore ringed around the WORLD ORIGIN — misses the part by ~220 mm.
+    let (cs, cbody) = dispatch(
+        &state,
+        json_post(
+            "/api/geometry/cylinder",
+            json!({
+                "center": [30.0, 0.0, -1.0],
+                "axis":   [0.0, 0.0, 1.0],
+                "radius": 5.0,
+                "height": 22.0,
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(cs, StatusCode::OK, "bore create must 200; body = {cbody}");
+    let bore_uuid = cbody["object"]["id"]
+        .as_str()
+        .expect("bore uuid")
+        .to_string();
+
+    let (os, obody) = dispatch(
+        &state,
+        json_post(
+            "/api/geometry/boolean",
+            json!({
+                "operation": "difference",
+                "object_a": blank_uuid,
+                "object_b": bore_uuid,
+            }),
+        ),
+    )
+    .await;
+    assert_ne!(
+        os,
+        StatusCode::OK,
+        "a difference that cuts NOTHING must not report success — silent \
+         success here is the drill_pattern 'holes: N with zero effect' lie; \
+         body = {obody}"
+    );
+    assert_eq!(
+        obody["error_code"].as_str(),
+        Some("boolean_disjoint"),
+        "the miss must surface as the typed boolean_disjoint catalog code; \
+         body = {obody}"
+    );
+    assert_eq!(
+        obody["success"].as_bool(),
+        Some(false),
+        "typed errors carry success:false; body = {obody}"
+    );
+
+    // Rollback contract: the target must survive the refused cut unchanged.
+    let v1 = part_volume_by_uuid(&state, &blank_uuid).await;
+    assert!(
+        (v0 - v1).abs() < 1e-6,
+        "a refused disjoint difference must leave the target intact; \
+         v0 = {v0:.3}, v1 = {v1:.3}"
+    );
+}
