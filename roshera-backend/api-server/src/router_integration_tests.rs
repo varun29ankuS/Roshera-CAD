@@ -5135,3 +5135,152 @@ async fn boolean_difference_tool_missing_target_is_typed_error() {
          v0 = {v0:.3}, v1 = {v1:.3}"
     );
 }
+
+// =====================================================================
+// Race regression — id-mapping flip atomicity on same-UUID upserts
+// =====================================================================
+
+/// Seed two axis-aligned 10-unit boxes that overlap along +X, register
+/// a public UUID for each, and return `(uuid_a, solid_a, uuid_b,
+/// solid_b)`. Box A is centred at the origin (spans `[-5, 5]³`); box B
+/// is translated `+6` along X (spans `[1, 11] × [-5, 5]²`) so the pair
+/// share the slab `x ∈ [1, 5]` — a non-degenerate union the kernel
+/// boolean accepts, consuming both operands and minting a fresh
+/// `SolidId` for the result.
+async fn seed_two_overlapping_boxes(state: &AppState) -> (Uuid, SolidId, Uuid, SolidId) {
+    use geometry_engine::operations::transform::{translate, TransformOptions};
+
+    let solid_a;
+    let solid_b;
+    {
+        let mut model_guard = state.model.write().await;
+        let model: &mut BRepModel = &mut *model_guard;
+
+        solid_a = match TopologyBuilder::new(model)
+            .create_box_3d(10.0, 10.0, 10.0)
+            .expect("box A must build for positive size")
+        {
+            GeometryId::Solid(id) => id,
+            other => panic!("expected solid for box A, got {:?}", other),
+        };
+        solid_b = match TopologyBuilder::new(model)
+            .create_box_3d(10.0, 10.0, 10.0)
+            .expect("box B must build for positive size")
+        {
+            GeometryId::Solid(id) => id,
+            other => panic!("expected solid for box B, got {:?}", other),
+        };
+        translate(
+            model,
+            vec![solid_b],
+            Vector3::new(1.0, 0.0, 0.0),
+            6.0,
+            TransformOptions::default(),
+        )
+        .expect("in-place translate of box B must succeed");
+    }
+
+    let uuid_a = Uuid::new_v4();
+    let uuid_b = Uuid::new_v4();
+    state.register_id_mapping(uuid_a, solid_a);
+    state.register_id_mapping(uuid_b, solid_b);
+    (uuid_a, solid_a, uuid_b, solid_b)
+}
+
+/// **Race regression (id-mapping atomicity).** A same-UUID upsert
+/// (`boolean_operation`) must flip the `uuid → solid_id` mapping under
+/// the *same* model write lock that mutates the kernel — never in a
+/// separate, later, lock-free step. Otherwise a window opens (the whole
+/// tessellation pass ran inside it) during which the persisting
+/// operand's UUID still resolves to the kernel solid the boolean just
+/// deleted, and any concurrent UUID-addressed request (a rename, a
+/// query) 404s `SolidNotFound` against a part that is live both before
+/// and after the op — a silently-lost edit.
+///
+/// The interleaving is forced *deterministically*, not raced. The test
+/// holds the model write lock and parks — in order — the real boolean
+/// handler and a prober behind it (tokio's `RwLock` is fair / FIFO),
+/// then releases. The boolean runs its entire write-lock scope, then
+/// parks on its tessellation *read* lock, which sits behind the
+/// prober's already-queued *write* request. The prober therefore
+/// observes the model at exactly the instant the boolean's kernel
+/// mutation is visible but before tessellation — the precise window the
+/// bug lived in. Invariant checked: the persisting UUID resolves to a
+/// solid that is present in `model.solids`.
+#[tokio::test]
+async fn boolean_id_mapping_flip_is_atomic_with_kernel_mutation() {
+    use std::time::Duration;
+
+    let state = make_test_state().await;
+    let (uuid_a, solid_a, uuid_b, _solid_b) = seed_two_overlapping_boxes(&state).await;
+
+    // Park order is established by holding the write lock while each
+    // participant reaches its own `.await` on it. 100 ms is far longer
+    // than the microseconds a spawned task needs to reach its first lock
+    // acquisition; correctness rests on FIFO fairness, not on timing.
+    let main_guard = state.model.write().await;
+
+    // Participant 1: the real boolean handler, through the live router.
+    let bool_state = state.clone();
+    let bool_task = tokio::spawn(async move {
+        dispatch(
+            &bool_state,
+            json_post(
+                "/api/geometry/boolean",
+                json!({
+                    "operation": "union",
+                    "object_a": uuid_a.to_string(),
+                    "object_b": uuid_b.to_string(),
+                }),
+            ),
+        )
+        .await
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await; // boolean parks on the write lock
+
+    // Participant 2: a prober queued behind the boolean's write scope
+    // and ahead of its tessellation read. It snapshots the mapping vs
+    // the model at the post-mutation / pre-tessellation instant.
+    let probe_state = state.clone();
+    let probe_task = tokio::spawn(async move {
+        let model = probe_state.model.write().await;
+        let resolved = probe_state.get_local_id(&uuid_a);
+        let present = resolved.map(|sid| model.solids.get(sid).is_some());
+        (resolved, present)
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await; // prober parks behind the boolean
+
+    drop(main_guard);
+
+    let (resolved, present) = probe_task.await.expect("prober task must not panic");
+    let (status, body) = bool_task.await.expect("boolean task must not panic");
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the union of two overlapping boxes must succeed through the router; \
+         body = {body}"
+    );
+
+    // Precondition: the kernel must have minted a fresh SolidId (it
+    // removes both operands). If the result reused solid_a's id there
+    // would be no stale-mapping window and the test would be vacuous.
+    assert_ne!(
+        body["solid_id"].as_u64(),
+        Some(solid_a as u64),
+        "precondition: the kernel boolean must mint a fresh SolidId distinct \
+         from the consumed operand solid_a={solid_a}; body = {body}"
+    );
+
+    // The persisting operand's UUID must ALWAYS resolve to a solid that
+    // is present in the model. Pre-fix, the mapping still points at the
+    // deleted `solid_a` at this instant → `present == Some(false)`.
+    assert_eq!(
+        present,
+        Some(true),
+        "id-mapping race: at the instant the boolean's kernel mutation became \
+         visible, uuid_a resolved to {resolved:?}, which is NOT present in \
+         model.solids — a concurrent UUID-addressed request would 404 \
+         SolidNotFound against a live part (consumed solid_a was {solid_a})"
+    );
+}

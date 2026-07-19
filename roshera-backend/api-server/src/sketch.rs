@@ -2416,6 +2416,16 @@ pub async fn extrude_cut_sketch(
         if let (Some(name), Some(result)) = (host_name, model.solids.get_mut(cut_id)) {
             result.name = Some(name);
         }
+        // Re-point the target UUID under the SAME write lock (see
+        // main.rs::boolean_operation): the remap must be atomic with the
+        // kernel mutation, else a window opened (spanning tessellation)
+        // where `body.target_id` still resolved to the consumed target
+        // solid and a concurrent UUID-addressed request 404'd
+        // SolidNotFound against a body that is live before and after.
+        if cut_id != target_solid_id {
+            state.unregister_id_mapping(&body.target_id);
+            state.register_id_mapping(body.target_id, cut_id);
+        }
         cut_id
     };
 
@@ -2439,14 +2449,10 @@ pub async fn extrude_cut_sketch(
     }
     let (vertices, indices, normals, face_ids) = crate::flatten_tri_mesh(&tri_mesh);
 
-    // Identity-preserving modify: the user's intent is "cut this
-    // body". Re-point the target's UUID at whatever kernel solid id
-    // the boolean returned (often a fresh id) so frontend selection
-    // and timeline references stay intact.
-    if result_solid_id != target_solid_id {
-        state.unregister_id_mapping(&body.target_id);
-        state.register_id_mapping(body.target_id, result_solid_id);
-    }
+    // Identity-preserving modify: the user's intent is "cut this body".
+    // The target's UUID was already re-pointed at the boolean's result
+    // solid under the model write lock above (atomic with the kernel
+    // mutation) so frontend selection and timeline references stay intact.
     let result_id_str = body.target_id.to_string();
 
     let display_name = format!("Cut {result_solid_id}");

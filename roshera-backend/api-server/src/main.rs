@@ -1541,6 +1541,19 @@ async fn boolean_operation(
         if let (Some(name), Some(result)) = (base_kernel_name, model.solids.get_mut(id)) {
             result.name = Some(name);
         }
+        // Flip the id-mapping while the model write lock is STILL held, so
+        // the {kernel mutation, UUID remap} pair is observed atomically by
+        // any concurrent reader. Operand B is consumed → its mapping is
+        // dropped; operand A persists as the result → its UUID is
+        // re-pointed at the new solid. Done outside the lock (after
+        // tessellation, as it used to be), a window opened where `uuid_a`
+        // still resolved to the just-deleted `solid_a`, so a concurrent
+        // UUID-addressed request (e.g. rename_part_by_uuid) 404'd
+        // SolidNotFound against a part that is live before and after.
+        // `solid_a`/`solid_b`/`uuid_a`/`uuid_b` are captured locals, so the
+        // later `tombstone_consumed_uuids` call is unaffected by moving this.
+        state.unregister_id_mapping(&uuid_b);
+        state.register_id_mapping(uuid_a, id);
         id
         // model write guard drops here
     };
@@ -1579,18 +1592,15 @@ async fn boolean_operation(
         state.tombstone_consumed_uuids(event_id, [(solid_a, uuid_a), (solid_b, uuid_b)]);
     }
 
-    // Operand B (the tool) is consumed and gone. Operand A (the base) PERSISTS
-    // as the result: keep its UUID so the part retains its identity, name,
-    // selection and outliner place across the feature — a cut/boss/blend is a
-    // feature ON the part, not a brand-new part. The frontend preserves the
-    // user-visible name on a same-UUID upsert, so the part stops being renamed
-    // "Difference N"/"Union N" on every boolean. Only B's mapping is dropped;
-    // A's UUID is remapped to the new result solid.
-    state.unregister_id_mapping(&uuid_b);
-
+    // Operand B (the tool) is consumed and gone; operand A (the base)
+    // PERSISTS as the result and keeps its UUID so the part retains its
+    // identity, name, selection and outliner place across the feature —
+    // a cut/boss/blend is a feature ON the part, not a brand-new part.
+    // The id-mapping was already flipped under the model write lock above
+    // (unregister uuid_b, remap uuid_a → result) to keep it atomic with
+    // the kernel mutation; only the display bindings are derived here.
     let result_uuid = uuid_a;
     let result_id_str = result_uuid.to_string();
-    state.register_id_mapping(result_uuid, result_solid_id);
 
     let op_label = match operation {
         BooleanOp::Union => "union",
@@ -1754,7 +1764,7 @@ async fn shell_solid(
     let thickness_abs = thickness.abs();
     let result_solid_id = {
         let mut model = model_handle.write().await;
-        kernel_offset_solid(
+        let new_id = kernel_offset_solid(
             &mut model,
             solid_id,
             thickness_abs,
@@ -1765,7 +1775,18 @@ async fn shell_solid(
                 ..OffsetOptions::default()
             },
         )
-        .map_err(ApiError::kernel_error)?
+        .map_err(ApiError::kernel_error)?;
+        // Re-point the host UUID under the SAME write lock (see
+        // boolean_operation): if the kernel minted a fresh SolidId the
+        // remap must be atomic with the mutation, else a window opened
+        // (spanning tessellation) where `object_uuid` still resolved to
+        // the retired solid and a concurrent UUID-addressed request 404'd
+        // SolidNotFound against a body that is live before and after.
+        if new_id != solid_id {
+            state.unregister_id_mapping(&object_uuid);
+            state.register_id_mapping(object_uuid, new_id);
+        }
+        new_id
         // model write guard drops here
     };
 
@@ -1792,15 +1813,10 @@ async fn shell_solid(
     let (vertices, indices, normals, face_ids) = flatten_tri_mesh(&tri_mesh);
 
     // Identity-preserving modify: the user's intent is "hollow this
-    // body". The body keeps its UUID and its user-visible name; only
-    // the topology changes. If the kernel returned a different
-    // `SolidId` (it can — offset sometimes mints a fresh `SolidId`
-    // when the topology change is structural), re-point the existing
-    // public UUID at the new kernel id rather than swapping the UUID.
-    if result_solid_id != solid_id {
-        state.unregister_id_mapping(&object_uuid);
-        state.register_id_mapping(object_uuid, result_solid_id);
-    }
+    // body". The body keeps its UUID and its user-visible name; only the
+    // topology changes. The id-mapping was already re-pointed under the
+    // model write lock above (atomic with the kernel mutation); only the
+    // display binding is derived here.
     let result_id_str = object_uuid.to_string();
 
     let display_name = format!("Shell {}", result_solid_id);
@@ -5182,7 +5198,18 @@ async fn extrude_face_endpoint(
             distance,
             ..ExtrudeOptions::default()
         };
-        extrude_face(&mut model, face_id, options).map_err(ApiError::kernel_error)?
+        let new_id = extrude_face(&mut model, face_id, options).map_err(ApiError::kernel_error)?;
+        // Re-point the host UUID under the SAME write lock (see
+        // boolean_operation): when the kernel mints a fresh SolidId the
+        // remap must be atomic with the mutation, else a window opened
+        // (spanning tessellation) where `object_uuid` still resolved to
+        // the retired host solid and a concurrent UUID-addressed request
+        // 404'd SolidNotFound against a live part.
+        if new_id != host_solid_id {
+            state.unregister_id_mapping(&object_uuid);
+            state.register_id_mapping(object_uuid, new_id);
+        }
+        new_id
     };
 
     let (tri_mesh, tessellation_ms) = {
@@ -5204,15 +5231,11 @@ async fn extrude_face_endpoint(
     }
     let (vertices, indices, normals, face_ids) = flatten_tri_mesh(&tri_mesh);
 
-    // Preserve the host UUID across the operation. Re-point the
-    // mapping only when the kernel chose to mint a fresh `SolidId`
-    // internally; the user-facing UUID stays put either way so the
-    // browser / feature tree / selection / agent reports survive
-    // the modification.
-    if result_solid_id != host_solid_id {
-        state.unregister_id_mapping(&object_uuid);
-        state.register_id_mapping(object_uuid, result_solid_id);
-    }
+    // Preserve the host UUID across the operation. The mapping was
+    // already re-pointed under the model write lock above (atomic with
+    // the kernel mutation) when the kernel minted a fresh `SolidId`; the
+    // user-facing UUID stays put either way so the browser / feature
+    // tree / selection / agent reports survive the modification.
     let result_id_str = object_uuid.to_string();
 
     let name = format!("FaceExtrude {result_solid_id}");
