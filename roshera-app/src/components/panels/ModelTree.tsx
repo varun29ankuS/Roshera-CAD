@@ -1027,8 +1027,13 @@ function TreeContextMenu({
     // DURABLE — the kernel solid's name is the single source every reload
     // (scene snapshot), the timeline lanes, and the agent surface derive
     // from. Without it a refresh reverted the rename to solid_N.
+    const previous = localObj.name
     updateObject(localObj.id, { name: next })
     void (async () => {
+      // Roll the optimistic update back on a failed persist — otherwise the
+      // tree shows the new name while the kernel (the source every reload
+      // derives from) kept the old one, and the next snapshot silently
+      // reverts it with no explanation.
       try {
         const resp = await fetch(
           `/api/parts/uuid/${encodeURIComponent(localObj.id)}/name`,
@@ -1040,9 +1045,13 @@ function TreeContextMenu({
         )
         if (!resp.ok) {
           console.error('[browser] rename persist failed:', resp.status)
+          updateObject(localObj.id, { name: previous })
+          window.alert(`Rename failed (${resp.status}) — reverted to "${previous}".`)
         }
       } catch (err) {
         console.error('[browser] rename persist error:', err)
+        updateObject(localObj.id, { name: previous })
+        window.alert(`Rename failed (backend unreachable) — reverted to "${previous}".`)
       }
     })()
   }, [localObj, updateObject, onClose])

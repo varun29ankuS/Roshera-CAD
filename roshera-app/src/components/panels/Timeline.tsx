@@ -925,10 +925,16 @@ export function Timeline() {
   // `time` = the flat chronological strip. Remembered across sessions so
   // the panel opens the way it was left.
   const [viewMode, setViewMode] = useState<'part' | 'time'>(() => {
-    if (typeof window === 'undefined') return 'part'
-    return window.localStorage.getItem('roshera.timeline.view') === 'time'
-      ? 'time'
-      : 'part'
+    // try/catch matches the guarded writes below: localStorage ACCESS can
+    // throw at runtime (private-mode Safari, storage-partitioned iframes,
+    // policy-disabled Web Storage), not just be absent under SSR.
+    try {
+      return window.localStorage.getItem('roshera.timeline.view') === 'time'
+        ? 'time'
+        : 'part'
+    } catch {
+      return 'part'
+    }
   })
   const setView = useCallback((m: 'part' | 'time') => {
     setViewMode(m)
@@ -955,8 +961,11 @@ export function Timeline() {
   // Collapse the event body to just the controls row, reclaiming the dock's
   // vertical space for the viewport. Remembered across sessions.
   const [bodyCollapsed, setBodyCollapsed] = useState<boolean>(() => {
-    if (typeof window === 'undefined') return false
-    return window.localStorage.getItem('roshera.timeline.collapsed') === '1'
+    try {
+      return window.localStorage.getItem('roshera.timeline.collapsed') === '1'
+    } catch {
+      return false
+    }
   })
   const toggleCollapsed = useCallback(() => {
     setBodyCollapsed((prev) => {
