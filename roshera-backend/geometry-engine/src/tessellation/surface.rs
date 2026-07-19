@@ -8457,6 +8457,83 @@ pub(crate) fn point_inside_face_uv(u: f64, v: f64, face: &Face, model: &BRepMode
     is_point_inside_face(u, v, face, model)
 }
 
+/// A loop's projected/unwrapped UV polygon (20 samples per edge, closed
+/// implicitly last→first). Exposed for `operations::section`'s quotient-space
+/// even-odd membership test on boolean-trimmed periodic analytic faces: that
+/// test wraps each edge's Δu short-way per edge, so it needs the raw sampled
+/// polygon rather than the winding-number machinery built on top of it.
+pub(crate) fn loop_polygon_uv(
+    loop_id: crate::primitives::r#loop::LoopId,
+    face: &Face,
+    model: &BRepModel,
+) -> Vec<(f64, f64)> {
+    let loop_data = match model.loops.get(loop_id) {
+        Some(l) => l,
+        None => return Vec::new(),
+    };
+    let surface = match model.surfaces.get(face.surface_id) {
+        Some(s) => s,
+        None => return Vec::new(),
+    };
+    project_loop_uv_unwrapped(loop_data, model, surface, 20, false)
+}
+
+/// Does the face's UV parameter domain coincide with its own UV bounding box?
+///
+/// This is the EXACT soundness condition for `operations::section`'s cheap
+/// UV-bbox trim (`trim_curve_to_uv_bbox`): the bbox test keeps every section
+/// sample inside `[u_min, u_max] × [v_min, v_max]`, which equals face
+/// membership only when the face is the full rectangle. Untouched analytic
+/// primitives (box sides, plain cylinder laterals, rims) satisfy it; a face
+/// that a boolean has re-trimmed — e.g. a cross-drilled bore wall carrying the
+/// Steinmetz intersection curve of the other bore, task #33 — does NOT, and
+/// must go through the winding-number face-domain trim or the section keeps
+/// wall fragments running straight across the drilled-away void (the
+/// "diagonal chords across the cruciform" defect).
+///
+/// Decision:
+/// * any inner loop (hole) → not rectangular;
+/// * outer loop projected/unwrapped to UV: seam-degenerate (< 3 samples or
+///   ~zero area, e.g. a sphere's seam-only loop) means the face covers the
+///   full surface domain → rectangular;
+/// * otherwise rectangular iff |loop area| fills the loop's own UV bbox
+///   (0.1% relative slack for projection/chord noise — a real boolean bite is
+///   orders of magnitude larger).
+pub(crate) fn face_uv_domain_is_rectangular(face: &Face, model: &BRepModel) -> bool {
+    if !face.inner_loops.is_empty() {
+        return false;
+    }
+    let surface = match model.surfaces.get(face.surface_id) {
+        Some(s) => s,
+        None => return true,
+    };
+    let loop_data = match model.loops.get(face.outer_loop) {
+        Some(l) => l,
+        None => return true,
+    };
+    let polygon = project_loop_uv_unwrapped(loop_data, model, surface, 10, false);
+    if polygon.len() < 3 {
+        return true; // seam-degenerate outer loop: face covers the full domain
+    }
+    let mut u_min = f64::INFINITY;
+    let mut u_max = f64::NEG_INFINITY;
+    let mut v_min = f64::INFINITY;
+    let mut v_max = f64::NEG_INFINITY;
+    for &(u, v) in &polygon {
+        u_min = u_min.min(u);
+        u_max = u_max.max(u);
+        v_min = v_min.min(v);
+        v_max = v_max.max(v);
+    }
+    let bbox_area = (u_max - u_min) * (v_max - v_min);
+    const DEGENERATE_AREA_TOL: f64 = 1e-12;
+    if bbox_area <= DEGENERATE_AREA_TOL {
+        return true; // collapsed to a line/point in UV: same as seam-degenerate
+    }
+    let area = polygon_signed_area_uv(&polygon).abs();
+    area >= bbox_area * (1.0 - 1e-3)
+}
+
 /// Check if a parameter point is inside face boundaries using winding number algorithm
 pub(crate) fn is_point_inside_face(u: f64, v: f64, face: &Face, model: &BRepModel) -> bool {
     // Robust path for a sphere trimmed by coplanar cut circles: an

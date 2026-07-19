@@ -68,7 +68,8 @@ use crate::primitives::surface::{Plane, SurfaceType};
 use crate::primitives::topology_builder::BRepModel;
 use crate::tessellation::adaptive::compute_plane_axes;
 use crate::tessellation::surface::{
-    get_face_parameter_bounds, point_inside_face_uv, triangulate_planar_polygon,
+    face_uv_domain_is_rectangular, get_face_parameter_bounds, point_inside_face_uv,
+    triangulate_planar_polygon,
 };
 
 /// Result of intersecting a single solid with a plane. One cap per
@@ -165,6 +166,20 @@ pub fn section_solid_by_plane(
                     kind,
                     fragments.len() - before
                 );
+                for f in &fragments[before..] {
+                    if let (Some(a), Some(b)) = (f.points.first(), f.points.last()) {
+                        eprintln!(
+                            "[sec]    frag {} pts ({:.3},{:.3},{:.3})->({:.3},{:.3},{:.3})",
+                            f.points.len(),
+                            a.x,
+                            a.y,
+                            a.z,
+                            b.x,
+                            b.y,
+                            b.z
+                        );
+                    }
+                }
             }
         }
     }
@@ -598,24 +613,24 @@ fn collect_face_fragments(
         return;
     }
 
-    // SEC.4: dispatch on surface type. Tier-1 analytic primitives whose
-    // faces have axis-aligned rectangular parameter domains (Plane,
-    // Cylinder, Sphere, Cone, Torus) can use the cheap UV-bbox trim.
-    // Tier-2 surfaces whose faces can carry arbitrary parameter-space
-    // trim loops (NURBS, B-Spline, Ruled, Offset, SurfaceOfRevolution)
-    // need the full winding-number point-in-face test on each sample —
-    // their UV bbox over-includes regions outside the face proper.
-    //
-    // Note: even tier-1 primitives can in principle carry non-rectangular
-    // trim loops (e.g. a planar face with a circular hole). Those are
-    // exercised by SEC.4's face-domain path for *parametric* surfaces;
-    // analytic primitives in the current B-Rep construction pipeline
-    // always emit rectangular UV faces, so we keep the fast path for
-    // them. If that invariant breaks, the symptom is over-inclusion of
-    // segments outside the face, not under-inclusion — caller-side
-    // chaining will detect and drop the spurious fragments.
+    // SEC.4: dispatch on the face's ACTUAL parameter domain, not on surface
+    // type. Tier-2 surfaces (NURBS, B-Spline, Ruled, Offset,
+    // SurfaceOfRevolution) always carry arbitrary parameter-space trim loops
+    // and need the full winding-number point-in-face test on each sample.
+    // Tier-1 analytic primitives (Cylinder, Sphere, Cone, Torus) get the
+    // cheap UV-bbox trim ONLY when the face's UV domain really is its bbox
+    // (`face_uv_domain_is_rectangular`) — the soundness condition the old
+    // type-only dispatch assumed unconditionally. That assumption is FALSE
+    // after a boolean re-trims an analytic wall: a cross-drilled bore wall
+    // (task #33) carries the OTHER bore's Steinmetz intersection curve as a
+    // trim boundary, and the bbox trim then keeps the section generators
+    // running straight across the drilled-away void. The old comment claimed
+    // chaining would drop such over-included fragments, but they end exactly
+    // on real fragment endpoints (the bore mouths), so they CHAIN — into one
+    // self-overlapping "full rectangle + diagonal chord" loop instead of the
+    // four re-entrant corner pieces.
     let surface_kind = surface.surface_type();
-    let needs_face_domain_trim = matches!(
+    let tier2_parametric = matches!(
         surface_kind,
         SurfaceType::BSpline
             | SurfaceType::NURBS
@@ -623,10 +638,42 @@ fn collect_face_fragments(
             | SurfaceType::Offset
             | SurfaceType::SurfaceOfRevolution
     );
+    // Task #33: a tier-1 analytic face whose UV domain is NOT its bbox has
+    // been re-trimmed by a boolean (cross-drilled bore wall carrying the other
+    // bore's Steinmetz curve). Its trim loops can straddle the periodic seam
+    // and wind the full period, so it takes the quotient-space even-odd trim
+    // (`trim_curve_to_trimmed_analytic_face`), not the universal-cover winding
+    // test (which mis-unwraps full-wrap loops) and not the bbox trim (which
+    // keeps generators running straight across the drilled-away void — the
+    // "full rectangle + diagonal chords" defect).
+    let analytic_trimmed = !tier2_parametric && !face_uv_domain_is_rectangular(face, model);
+    if std::env::var("ROSHERA_SEC_TRACE").is_ok() {
+        eprintln!(
+            "[sec]    face {} kind={:?} tier2={} analytic_trimmed={} inner_loops={} uv=[{:.3},{:.3}]x[{:.3},{:.3}]",
+            face_id,
+            surface_kind,
+            tier2_parametric,
+            analytic_trimmed,
+            face.inner_loops.len(),
+            u_min,
+            u_max,
+            v_min,
+            v_max
+        );
+    }
 
     for curve in &curves {
-        if needs_face_domain_trim {
+        if tier2_parametric {
             trim_curve_to_face(curve, face, model, u_min, u_max, v_min, v_max, out);
+        } else if analytic_trimmed {
+            trim_curve_to_trimmed_analytic_face(
+                curve,
+                face,
+                model,
+                plane_origin,
+                plane_normal,
+                out,
+            );
         } else {
             trim_curve_to_uv_bbox(curve, u_min, u_max, v_min, v_max, out);
         }
@@ -689,6 +736,290 @@ fn trim_curve_to_uv_bbox(
                 {
                     current.push(boundary);
                 }
+            }
+            if current.len() >= 2 {
+                out.push(Polyline3D {
+                    points: std::mem::take(&mut current),
+                });
+            } else {
+                current.clear();
+            }
+        }
+        prev_inside = now_inside;
+        prev_pt = Some(sample);
+    }
+
+    if current.len() >= 2 {
+        out.push(Polyline3D { points: current });
+    }
+}
+
+/// Wrap `x` into the half-open interval `(-period/2, period/2]`.
+fn wrap_half_period(x: f64, period: f64) -> f64 {
+    let mut r = x % period;
+    if r > period * 0.5 {
+        r -= period;
+    } else if r <= -period * 0.5 {
+        r += period;
+    }
+    r
+}
+
+/// Even-odd face membership in the surface's QUOTIENT parameter space
+/// (task #33). For a boolean-trimmed periodic analytic face (a cross-drilled
+/// bore wall), the trim boundary can straddle the seam and wind the full
+/// period — e.g. the two Steinmetz "scallops" joined at their tangency points
+/// form ONE closed loop of winding number 1 around the cylinder. The
+/// universal-cover winding test (`point_inside_face_uv`) mis-unwraps such
+/// loops (their lifted polygon is not closed in the cover), so membership is
+/// decided here by a vertical ray cast evaluated modulo the period:
+///
+/// * each polygon edge's Δu is wrapped short-way per edge (loop samples are
+///   dense — 20 per edge — so every chord is much shorter than half a
+///   period), which represents the loop faithfully in the quotient cylinder
+///   with no unwrap state;
+/// * a crossing is counted when the edge straddles the query's u line
+///   (half-open `(a > 0) != (b > 0)` convention, consistent at shared
+///   vertices and u-extrema) with the crossing v strictly above the query;
+/// * membership = odd crossing parity over ALL loops together — no
+///   outer/inner distinction needed (a full-wrap boundary is neither a
+///   classic outer nor a classic hole).
+///
+/// The ray runs along +v, the non-periodic axis of every tier-1 analytic
+/// surface routed here (cylinder/cone/sphere: u is the angle). For a
+/// doubly-periodic torus v is also wrapped short-way, which makes the ray a
+/// half-period probe — correct while the trim boundary stays within half a
+/// v-period of the query, the case for bore-like trims. A face whose loops
+/// are all seam-degenerate (< 3 samples) covers its full domain: inside.
+fn face_membership_evenodd_quotient(
+    u: f64,
+    v: f64,
+    face: &crate::primitives::face::Face,
+    model: &BRepModel,
+) -> bool {
+    let surface = match model.surfaces.get(face.surface_id) {
+        Some(s) => s,
+        None => return false,
+    };
+    let period_u = surface.period_u();
+    let period_v = surface.period_v();
+
+    let mut loop_ids = vec![face.outer_loop];
+    loop_ids.extend_from_slice(&face.inner_loops);
+
+    let mut crossings = 0usize;
+    let mut any_polygon = false;
+    for lid in loop_ids {
+        let poly = crate::tessellation::surface::loop_polygon_uv(lid, face, model);
+        let n = poly.len();
+        if n < 3 {
+            continue;
+        }
+        any_polygon = true;
+        for i in 0..n {
+            let (u0, v0) = poly[i];
+            let (u1, v1) = poly[(i + 1) % n];
+            // Endpoint u relative to the query, edge Δu wrapped short-way.
+            let mut a = u0 - u;
+            let mut du = u1 - u0;
+            if let Some(p) = period_u {
+                a = wrap_half_period(a, p);
+                du = wrap_half_period(du, p);
+            }
+            let b = a + du;
+            if (a > 0.0) != (b > 0.0) {
+                let denom = a - b;
+                if denom.abs() < 1e-300 {
+                    continue;
+                }
+                let t = a / denom;
+                let mut dv0 = v0 - v;
+                let mut dvd = v1 - v0;
+                if let Some(p) = period_v {
+                    dv0 = wrap_half_period(dv0, p);
+                    dvd = wrap_half_period(dvd, p);
+                }
+                if dv0 + dvd * t > 0.0 {
+                    crossings += 1;
+                }
+            }
+        }
+    }
+    if !any_polygon {
+        // Only seam-degenerate loops: the face covers the whole domain.
+        return true;
+    }
+    crossings % 2 == 1
+}
+
+/// All crossings of the face's trim EDGES (outer + inner loops, evaluated on
+/// the true 3D curves) with the cut plane.
+///
+/// These are the exact 3D points where any trimmed section fragment on this
+/// face must terminate: a fragment endpoint lies simultaneously on the
+/// section curve (face surface ∩ plane) and on a trim edge, and the trim
+/// edge is SHARED with the neighbouring face — so snapping both faces'
+/// bisection-located endpoints onto these crossings makes the corner weld
+/// exact. Without the snap, each face localises the endpoint against its own
+/// 20-samples-per-edge chorded loop polygon, and the two chord sagittas
+/// disagree by far more than the chain weld epsilon (1e-6), so the cruciform
+/// corner loops never close.
+fn face_edge_plane_crossings(
+    face: &crate::primitives::face::Face,
+    model: &BRepModel,
+    cut_origin: Point3,
+    cut_normal: Vector3,
+) -> Vec<Point3> {
+    const SAMPLES: usize = 128;
+    let signed = |p: &Point3| -> f64 {
+        cut_normal.dot(&Vector3::new(
+            p.x - cut_origin.x,
+            p.y - cut_origin.y,
+            p.z - cut_origin.z,
+        ))
+    };
+
+    let mut loop_ids = vec![face.outer_loop];
+    loop_ids.extend_from_slice(&face.inner_loops);
+
+    let mut out: Vec<Point3> = Vec::new();
+    for lid in loop_ids {
+        let lp = match model.loops.get(lid) {
+            Some(l) => l,
+            None => continue,
+        };
+        for &eid in &lp.edges {
+            let edge = match model.edges.get(eid) {
+                Some(e) => e,
+                None => continue,
+            };
+            let eval = |s: f64| -> Option<Point3> { edge.evaluate(s, &model.curves).ok() };
+            let mut prev = match eval(0.0) {
+                Some(p) => p,
+                None => continue,
+            };
+            let mut prev_s = 0.0;
+            let mut prev_g = signed(&prev);
+            for k in 1..=SAMPLES {
+                let s = k as f64 / SAMPLES as f64;
+                let p = match eval(s) {
+                    Some(p) => p,
+                    None => {
+                        prev_s = s;
+                        continue;
+                    }
+                };
+                let g = signed(&p);
+                if prev_g == 0.0 {
+                    out.push(prev);
+                } else if g != 0.0 && (prev_g < 0.0) != (g < 0.0) {
+                    // Bisect the bracketing parameter interval on the exact curve.
+                    let (mut lo, mut hi) = (prev_s, s);
+                    let side_lo = prev_g < 0.0;
+                    let mut hit = p;
+                    for _ in 0..50 {
+                        let mid = 0.5 * (lo + hi);
+                        match eval(mid) {
+                            Some(pm) => {
+                                if (signed(&pm) < 0.0) == side_lo {
+                                    lo = mid;
+                                } else {
+                                    hi = mid;
+                                }
+                                hit = pm;
+                            }
+                            None => break,
+                        }
+                    }
+                    out.push(hit);
+                }
+                prev = p;
+                prev_s = s;
+                prev_g = g;
+            }
+            if prev_g == 0.0 {
+                out.push(prev);
+            }
+        }
+    }
+    out
+}
+
+/// Trim a section curve to a boolean-trimmed tier-1 analytic face (task #33):
+/// quotient-space even-odd membership per sample, boundary transitions
+/// localised by bisection and then SNAPPED onto the nearest trim-edge ∩
+/// cut-plane crossing (see [`face_edge_plane_crossings`]) so both faces
+/// sharing the trim edge emit bitwise-converged endpoints and the chain
+/// welds. The snap radius is the local bracketing sample spacing: the
+/// bisected point can never be farther than one marching step from the true
+/// crossing, while distinct crossings on a real part are separated by full
+/// feature spans.
+fn trim_curve_to_trimmed_analytic_face(
+    curve: &ParametricIntersectionCurve,
+    face: &crate::primitives::face::Face,
+    model: &BRepModel,
+    cut_origin: Point3,
+    cut_normal: Vector3,
+    out: &mut Vec<Polyline3D>,
+) {
+    let candidates = face_edge_plane_crossings(face, model, cut_origin, cut_normal);
+    let member = |u: f64, v: f64| -> bool { face_membership_evenodd_quotient(u, v, face, model) };
+    let inside = |p: &ParametricIntersectionPoint| -> bool { member(p.u, p.v) };
+
+    let snap = |p: Point3, radius: f64| -> Point3 {
+        let mut best: Option<(f64, Point3)> = None;
+        for c in &candidates {
+            let d = (*c - p).magnitude();
+            if best.map_or(true, |(bd, _)| d < bd) {
+                best = Some((d, *c));
+            }
+        }
+        match best {
+            Some((d, c)) if d <= radius => c,
+            _ => p,
+        }
+    };
+
+    // Bisect the inside/outside transition between two consecutive samples in
+    // (u, v), then snap the interpolated 3D point onto the exact trim-edge
+    // crossing shared with the neighbouring face.
+    let boundary_3d =
+        |a: &ParametricIntersectionPoint, b: &ParametricIntersectionPoint| -> Point3 {
+            let mut t_lo = 0.0;
+            let mut t_hi = 1.0;
+            let a_inside = inside(a);
+            for _ in 0..30 {
+                let t_mid = 0.5 * (t_lo + t_hi);
+                let u_mid = a.u + (b.u - a.u) * t_mid;
+                let v_mid = a.v + (b.v - a.v) * t_mid;
+                if member(u_mid, v_mid) == a_inside {
+                    t_lo = t_mid;
+                } else {
+                    t_hi = t_mid;
+                }
+            }
+            let t = 0.5 * (t_lo + t_hi);
+            let p = a.position + (b.position - a.position) * t;
+            let bracket = (b.position - a.position).magnitude();
+            snap(p, bracket.max(1e-6))
+        };
+
+    let mut current: Vec<Point3> = Vec::new();
+    let mut prev_inside = false;
+    let mut prev_pt: Option<&ParametricIntersectionPoint> = None;
+
+    for sample in &curve.points {
+        let now_inside = inside(sample);
+        if now_inside && !prev_inside {
+            if let Some(prev) = prev_pt {
+                current.push(boundary_3d(prev, sample));
+            }
+            current.push(sample.position);
+        } else if now_inside && prev_inside {
+            current.push(sample.position);
+        } else if !now_inside && prev_inside {
+            if let Some(prev) = prev_pt {
+                current.push(boundary_3d(prev, sample));
             }
             if current.len() >= 2 {
                 out.push(Polyline3D {
