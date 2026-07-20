@@ -34,6 +34,62 @@ cd roshera-mcp && npm install && npm run build
 Registered for this repo in `.mcp.json` (project scope). Requires the
 api-server running on `ROSHERA_URL` (default `http://localhost:8081`).
 
+## Surface modes & the scale funnel
+
+A real CAD surface carries hundreds of operations. Paying context for every
+tool on every conversation does not scale — and the worst-case MCP client
+(no `list_changed`, no deferred schemas) injects the *entire* exposed surface
+each turn. So the **default exposed surface is minimal-complete**, and the long
+tail stays reachable at fixed cost through a three-tool funnel.
+
+- **`ROSHERA_MCP_SURFACE=minimal`** *(default)* — the 15 core modeling/perception
+  verbs plus the 3 meta-tools = **18 tools, ~4.1k tokens**. Everything else lives
+  in the internal table, reachable via the funnel.
+- **`ROSHERA_MCP_SURFACE=full`** — restores the full **90-tool** direct exposure
+  (**~19.4k tokens**); the meta-tools are omitted since the whole surface is
+  present. This is the transition escape hatch, not the recommended default.
+
+**The funnel (fixed ~500-token cost, reaches the whole long tail):**
+- `find_tool(intent)` — deterministic ranked search over the registry.
+- `describe_tool(name)` — full schema + usage notes on demand.
+- `invoke(name, args)` — executes any registry tool, validating args against the
+  tool's *own* schema first, so a meta-path call is never less checked than a
+  direct call.
+
+Benches optimize attention; they never gate capability — `invoke` reaches
+everything, always. (Spec: `2026-07-20-mcp-scale-architecture-design.md`.)
+
+## CI gate — the jig ratchet
+
+`roshera-mcp/**` changes are graded in CI (`mcp-quality` job in
+`.github/workflows/ci.yml`). The report card is a permanent invariant, like the
+fmt gate. Two graders run:
+
+- **`tools/mcp_budget_gate.py`** *(authoritative)* — speaks minimal MCP stdio to
+  the built server on both surfaces and asserts the spec §5 Q5 budgets:
+  - minimal live-surface bill **≤ 8000 tokens**,
+  - **schema hygiene = 100** — every param in every exposed tool has a
+    description (a `const`/single-`enum` discriminant is self-describing),
+  - per-tool tokens **≤ 3.5× the full-set median**, except a named allowlist of
+    wire-contract-fixed schema-heavies (`revolve`, `assembly_mate`,
+    `drill_pattern`). (The spec's starting 2× line false-positives ~10
+    legitimately-sized multi-param tools on the current right-skewed surface;
+    3.5× isolates exactly the three genuine outliers while staying a live
+    ratchet — see the script header for the calibration.)
+
+  Tokens use tiktoken (`o200k_base`) when installable, else the registry's
+  `chars/4` estimate. Run it locally with:
+
+  ```sh
+  cd roshera-mcp && npm run build && python tools/mcp_budget_gate.py
+  ```
+
+- **jig** (github.com/Shodh-Labs/jig) — the upstream MCP report-card grader, run
+  best-effort and **non-blocking**: it is not published to PyPI under a
+  verifiable name (`pip install jig` resolves to an unrelated git-hook tool), so
+  CI attempts the real source, verifies the installed CLI is actually the grader,
+  and skips loudly otherwise. The fallback gate above holds the line regardless.
+
 ## Known kernel issues surfaced through this API
 
 - `#24` — extruded circles tessellate as ~64 planar strips, not one

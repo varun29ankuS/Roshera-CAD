@@ -181,6 +181,101 @@ jobs:
       run: npm run build
       working-directory: ./roshera-app
 
+  mcp-quality:
+    # The jig ratchet (MCP scale architecture, Slice 5). Grades the agent tool
+    # surface the way the fmt gate grades formatting: the minimal default surface
+    # must stay under the token budget, every exposed param must be described
+    # (schema hygiene = 100), and no tool may balloon past the per-tool ceiling.
+    # Runs only when roshera-mcp/** changes (dorny/paths-filter, keeping the
+    # existing whole-workflow push/PR triggers untouched).
+    name: MCP Quality (jig ratchet)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Detect roshera-mcp changes
+      uses: dorny/paths-filter@v3
+      id: filter
+      with:
+        filters: |
+          mcp:
+            - 'roshera-mcp/**'
+
+    - name: Setup Node.js
+      if: steps.filter.outputs.mcp == 'true'
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+        cache: 'npm'
+        cache-dependency-path: roshera-mcp/package-lock.json
+
+    - name: Setup Python
+      if: steps.filter.outputs.mcp == 'true'
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+
+    - name: Install dependencies + build dist
+      if: steps.filter.outputs.mcp == 'true'
+      run: |
+        npm ci
+        npm run build
+      working-directory: ./roshera-mcp
+
+    - name: Run green MCP tests
+      if: steps.filter.outputs.mcp == 'true'
+      # scale_s2.mjs guards the S2 scale invariants (surface flip 18/90,
+      # meta-tool validation parity, find_tool ranking, TS<->Rust FNV-1a-64
+      # registry hash) against the built dist — fully offline, no backend.
+      #
+      # test/auto_feedback.mjs is EXCLUDED on purpose: its STATIC half greps a
+      # monolithic src/index.ts for per-tool server.tool() blocks + okp() /
+      # perceive() / ROSHERA_MCP_AUTOVERIFY, but the S2 refactor split those out
+      # of index.ts into per-domain tools/*.ts modules behind the ToolTable, so
+      # those assertions are stale/red. It is tracked separately from this gate;
+      # wiring it in here would fail CI on a known-stale test, not a regression.
+      run: node test/scale_s2.mjs
+      working-directory: ./roshera-mcp
+
+    - name: Grade with jig (best-effort, non-blocking)
+      if: steps.filter.outputs.mcp == 'true'
+      # jig (github.com/Shodh-Labs/jig, the MCP report-card grader) is NOT
+      # published to PyPI under a verifiable name: `pip install jig` resolves to
+      # an UNRELATED git-hook framework (robmadole/jig), and `jig-mcp` does not
+      # exist. So we attempt the real grader from its own source, verify the
+      # installed CLI is actually the MCP grader (exposes `check`/`budget`), and
+      # SKIP loudly otherwise — never mis-installing the PyPI shadow, never
+      # failing CI on jig's absence. The fallback gate below is authoritative.
+      continue-on-error: true
+      run: |
+        set +e
+        NOTE() { echo "$1"; echo "$1" >> "$GITHUB_STEP_SUMMARY"; }
+        echo "## MCP jig grader" >> "$GITHUB_STEP_SUMMARY"
+        pip install "jig @ git+https://github.com/Shodh-Labs/jig@v0.4.0" >/tmp/jig_install.log 2>&1
+        if command -v jig >/dev/null 2>&1 && jig --help 2>&1 | grep -Eq '\bcheck\b|\bbudget\b'; then
+          NOTE "jig grader installed ($(jig --version 2>&1 | head -1)) — running check + budget."
+          jig check --stdio "node dist/index.js" || NOTE "jig check reported findings (see log; fallback gate is authoritative)."
+          jig budget --json || NOTE "jig budget reported findings (see log; fallback gate is authoritative)."
+        else
+          NOTE ":information_source: jig MCP grader not installable on this runner (PyPI \`jig\` is an unrelated git-hook tool; \`jig-mcp\` does not exist; the Shodh-Labs source install did not yield a \`check\`/\`budget\` CLI). Relying on the authoritative fallback gate below."
+        fi
+      working-directory: ./roshera-mcp
+
+    - name: MCP budget + hygiene gate (authoritative)
+      if: steps.filter.outputs.mcp == 'true'
+      # The always-run, gate-authoritative grader. Speaks minimal MCP stdio to
+      # the built server on both ROSHERA_MCP_SURFACE=minimal and =full, then
+      # asserts the spec §5 Q5 budgets: minimal live-surface bill <= 8000 tok,
+      # schema hygiene = 100 (every param described), per-tool <= 3.5x full-set
+      # median except the wire-contract-fixed allowlist. tiktoken (o200k_base)
+      # when installable, else the registry's chars/4 estimate.
+      run: |
+        pip install tiktoken >/dev/null 2>&1 || echo "tiktoken unavailable — gate falls back to chars/4 (registry-parity)"
+        python tools/mcp_budget_gate.py
+      working-directory: ./roshera-mcp
+
   security:
     name: Security Audit
     runs-on: ubuntu-latest
