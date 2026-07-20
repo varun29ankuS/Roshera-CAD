@@ -12,6 +12,9 @@
 // test framework's failure mechanism.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
+mod agent_registry;
+#[cfg(test)]
+mod agent_registry_tests;
 mod assembly_instances;
 mod assembly_mates;
 mod assembly_mgr;
@@ -9128,6 +9131,12 @@ pub(crate) fn build_router(state: AppState) -> Router {
             get(handlers::agent::part_orbit),
         )
         .route("/api/agent/scene/orbit", get(handlers::agent::scene_orbit))
+        // Kernel-served tool registry (MCP scale architecture Slice 1 / Layer 0):
+        // single source of truth for the agent-facing operation inventory.
+        .route(
+            "/api/agent/tool-registry",
+            get(crate::agent_registry::tool_registry),
+        )
         .route(
             "/api/agent/parts/{id}/truth",
             get(handlers::agent::part_truth),
