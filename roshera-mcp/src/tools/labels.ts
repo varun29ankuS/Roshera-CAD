@@ -11,15 +11,15 @@ import { api, ok, fail, BASE, AUTH_HEADERS } from "../core.js";
 export function registerLabelTools(server: McpServer) {
   server.tool(
     "label_create",
-    "PIN a name to a feature (e.g. call the min-radius face 'throat'). Target " +
-      "by id (`entity_id` + `kind`), by DESCRIPTION (`selector` shaped like " +
-      "select_face/select_edge — resolves or REFUSES), or as a section " +
-      "(`kind`:'section' + `origin` + `normal`). Re-using a name REPLACES it " +
-      "(`replaced:true`). Returns the resolved entity/plane.",
+    "PIN a name to a feature (e.g. 'throat'). Target by id (`entity_id`+`kind`), " +
+      "by DESCRIPTION (`selector`, select_face/select_edge shape), or as a " +
+      "section (kind:'section' + origin + normal). Re-using a name REPLACES it.",
     {
-      part_id: z.number().int(),
+      part_id: z.number().int().describe("part id (list_parts)"),
       name: z.string().min(1).describe("the label, e.g. 'throat' (unique per part)"),
-      kind: z.enum(["vertex", "edge", "face", "section"]),
+      kind: z
+        .enum(["vertex", "edge", "face", "section"])
+        .describe("entity kind to pin (or 'section' for a cutting plane)"),
       entity_id: z
         .number()
         .int()
@@ -33,14 +33,14 @@ export function registerLabelTools(server: McpServer) {
             "select_edge body, e.g. '{\"kind\":\"cylindrical\",\"extremal\":\"smallest_area\"}'",
         ),
       origin: z
-        .tuple([z.number(), z.number(), z.number()])
+        .array(z.number()).length(3)
         .optional()
         .describe("section only: a point on the cutting plane"),
       normal: z
-        .tuple([z.number(), z.number(), z.number()])
+        .array(z.number()).length(3)
         .optional()
         .describe("section only: the plane normal"),
-      description: z.string().optional(),
+      description: z.string().optional().describe("optional free-text note stored with the label"),
     },
     async ({ part_id, name, kind, entity_id, selector, origin, normal, description }) => {
       try {
@@ -76,10 +76,9 @@ export function registerLabelTools(server: McpServer) {
 
   server.tool(
     "label_list",
-    "LIST every label on a part: name, kind, world anchor, display color, the " +
-      "kernel-MEASURED key dimension (e.g. Ø2.00 mm), the GD&T verdict " +
-      "(in_spec/out_of_spec/not_verified), staleness, description.",
-    { part_id: z.number().int() },
+    "LIST a part's labels: name, kind, world anchor, colour, kernel-MEASURED key " +
+      "dimension (e.g. Ø2.00 mm), GD&T verdict, staleness, description.",
+    { part_id: z.number().int().describe("part id (list_parts)") },
     async ({ part_id }) => {
       try {
         return ok(await api("GET", `/api/agent/parts/${part_id}/labels`));
@@ -92,11 +91,10 @@ export function registerLabelTools(server: McpServer) {
   server.tool(
     "label_resolve",
     "RESOLVE a label name to the live entity id or section plane it pins. " +
-      "REFUSES with not_found / dangling — never returns a wrong entity. Turns " +
-      "'fillet the throat edge' into a concrete id.",
+      "REFUSES not_found / dangling — never a wrong entity.",
     {
-      part_id: z.number().int(),
-      name: z.string().min(1),
+      part_id: z.number().int().describe("part id (list_parts)"),
+      name: z.string().min(1).describe("the label name to resolve"),
     },
     async ({ part_id, name }) => {
       try {
@@ -113,12 +111,10 @@ export function registerLabelTools(server: McpServer) {
 
   server.tool(
     "propose_labels",
-    "AUTO-PROPOSE labels: the kernel recognizes features (throat = min-radius " +
-      "station, exit = axis-extremal cap, chamber = max-radius barrel, fillet " +
-      "= constant-radius blend) and SUGGESTS name + pinning assertion — it " +
-      "does NOT apply them. Confirm one via label_create with the returned " +
-      "`selector`. Returns { proposals: [...] }.",
-    { part_id: z.number().int() },
+    "AUTO-PROPOSE labels: the kernel recognizes features (throat, exit, chamber, " +
+      "fillet) and SUGGESTS name + pinning `selector` — does NOT apply them. " +
+      "Confirm one via label_create with the returned selector.",
+    { part_id: z.number().int().describe("part id (list_parts)") },
     async ({ part_id }) => {
       try {
         return ok(await api("GET", `/api/agent/parts/${part_id}/propose-labels`));
@@ -130,10 +126,9 @@ export function registerLabelTools(server: McpServer) {
 
   server.tool(
     "label_delete",
-    "REMOVE a label by name. deleted:true when it existed; 404 when not — " +
-      "reported honestly.",
+    "REMOVE a label by name. deleted:true when it existed; 404 when not.",
     {
-      part_id: z.number().int(),
+      part_id: z.number().int().describe("part id (list_parts)"),
       name: z.string().min(1).describe("the label to remove"),
     },
     async ({ part_id, name }) => {
@@ -152,11 +147,10 @@ export function registerLabelTools(server: McpServer) {
 
   server.tool(
     "label_rename",
-    "RENAME a label, preserving its binding. 404 when the old name is " +
-      "unknown; 409 when the new name is taken by a DIFFERENT label (never " +
-      "silently clobbers).",
+    "RENAME a label, preserving its binding. 404 if old unknown; 409 if new name " +
+      "is taken by a different label (never clobbers).",
     {
-      part_id: z.number().int(),
+      part_id: z.number().int().describe("part id (list_parts)"),
       name: z.string().min(1).describe("the existing label name"),
       new_name: z.string().min(1).describe("the new name (unique per part)"),
     },

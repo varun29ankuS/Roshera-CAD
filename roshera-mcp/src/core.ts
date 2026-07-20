@@ -674,9 +674,9 @@ export const PlaneSchema = z
   .union([
     z.enum(["xy", "xz", "yz"]),
     z.object({
-      origin: z.tuple([z.number(), z.number(), z.number()]),
-      u_axis: z.tuple([z.number(), z.number(), z.number()]),
-      v_axis: z.tuple([z.number(), z.number(), z.number()]),
+      origin: z.array(z.number()).length(3).describe("plane origin [x,y,z] mm"),
+      u_axis: z.array(z.number()).length(3).describe("plane in-plane x axis [x,y,z]"),
+      v_axis: z.array(z.number()).length(3).describe("plane in-plane y axis [x,y,z]"),
     }),
   ])
   .describe("'xy' | 'xz' | 'yz' or {origin, u_axis, v_axis} (e.g. from plane_from_face)");

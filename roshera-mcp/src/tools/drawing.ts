@@ -2,8 +2,8 @@
  * Drawing comprehension tools (campaign #55) — the agent's CERTIFIED readback
  * surface over a Roshera engineering sheet.
  *
- * `read_drawing` returns the queryable semantic sheet + its live certificate;
- * `drawing_query` answers ONE typed, scoped question (toleranced diameter, FCF
+ * `drawing_read_semantics` returns the queryable semantic sheet + its live
+ * certificate; `drawing_query` answers ONE typed, scoped question (toleranced diameter, FCF
  * datum, what SECTION A-A cuts through, dimension/hole/entity-at) with
  * provenance + a live-check verdict. Every answer is certified against the LIVE
  * model — never pixel inference — and honest-refuses (render_only /
@@ -101,16 +101,15 @@ function answerLine(a: any): string {
 }
 
 export function registerDrawingTools(server: McpServer): void {
-  // ── read_drawing ─────────────────────────────────────────────────────────
+  // ── drawing_read_semantics ─────────────────────────────────────────────
   server.tool(
-    "read_drawing",
-    "READ a Roshera engineering sheet as CERTIFIED ground truth — the semantic " +
-      "model (views, dimensions with PIDs + tolerances, hole table with datums, " +
-      "GD&T blocks, SECTION cut-through) PLUS a live certificate that re-measures " +
-      "the model NOW. Verdicts per fact: consistent | stale | dangling | " +
-      "render_only | unprovenanced. Never pixel inference — the sheet MODEL is " +
-      "the truth; a stale sheet is reported stale, never parroted. Use " +
-      "drawing_query for one scoped question.",
+    "drawing_read_semantics",
+    "READ the SEMANTIC model of a sheet + a live certificate (queryable data, " +
+      "NOT a file): views, dimensions with PIDs+tolerances, hole table, GD&T " +
+      "blocks, SECTION cut-through, and a re-measured-NOW verdict per fact " +
+      "(consistent | stale | dangling | render_only | unprovenanced). Never " +
+      "pixel inference. Use drawing_query for ONE scoped question; " +
+      "drawing_export_sheet to save a PDF/DXF/SVG file.",
     {
       drawing_id: z.string().uuid().describe("drawing_id from make_drawing"),
     },
@@ -146,14 +145,10 @@ export function registerDrawingTools(server: McpServer): void {
   // ── drawing_query ────────────────────────────────────────────────────────
   server.tool(
     "drawing_query",
-    "ASK one typed, scoped question of a Roshera sheet, answered CERTIFIED " +
-      "against the live model with provenance + a live-check verdict. Kinds: " +
-      "toleranced_diameter (tag|face_id|pid → limits or honest 'fit designation, " +
-      "no fabricated limits', or the general tolerance labelled as general); fcf " +
-      "(index|feature_pid|datum → which datums it references + live/dangling); " +
-      "section_cuts (what SECTION A-A cuts through, in order); hole (tag); " +
-      "dimension_of (face_id|pid|label); entity_at (view + xy_mm → refuses " +
-      "render_only on hatch/raster). Refusals are surfaced verbatim.",
+    "ASK one typed, scoped question of a sheet, answered CERTIFIED against the " +
+      "live model with provenance + a verdict. Kinds: toleranced_diameter, fcf " +
+      "(which datums it references), section_cuts (what SECTION A-A cuts, in " +
+      "order), hole, dimension_of, entity_at. Refusals surfaced verbatim.",
     {
       drawing_id: z.string().uuid().describe("drawing_id from make_drawing"),
       kind: z
@@ -175,7 +170,7 @@ export function registerDrawingTools(server: McpServer): void {
       label: z.string().optional().describe("dimension label substring (dimension_of)"),
       view: z.number().int().optional().describe("view index (entity_at)"),
       xy_mm: z
-        .tuple([z.number(), z.number()])
+        .array(z.number()).length(2)
         .optional()
         .describe("view-space coordinate [x, y] in mm (entity_at)"),
     },

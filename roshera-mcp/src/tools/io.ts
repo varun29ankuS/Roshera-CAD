@@ -15,13 +15,10 @@ import {
 export function registerIoTools(server: McpServer) {
   server.tool(
     "import_step",
-    "IMPORT a STEP file (AP203/AP214/AP242) as real B-Rep solids — planar/" +
-      "quadric/toroidal faces, NURBS curves+surfaces, revolution/extrusion " +
-      "surfaces, voids, assembly instances. Give a `path` OR inline `content`. " +
-      "Every solid gets the FULL kernel certificate (brep_valid ∧ watertight ∧ " +
-      "manifold ∧ oriented ∧ sound); ok:false = a solid imported but is NOT sound " +
-      "(see report.validation for the failing dimension per solid). Unsupported " +
-      "entities are listed honestly.",
+    "IMPORT a STEP file (AP203/214/242) as real B-Rep solids. Give `path` OR " +
+      "inline `content`. Each solid gets the FULL certificate; ok:false = a " +
+      "solid imported but is NOT sound (see coverage.validation). Unsupported " +
+      "entities listed honestly.",
     {
       path: z
         .string()
@@ -87,13 +84,15 @@ export function registerIoTools(server: McpServer) {
 
   server.tool(
     "export_part",
-    "EXPORT parts to a real CAD file on disk — STEP (AP242, mm), STL, or OBJ " +
-      "— and return the absolute path. The production hand-off: the STEP " +
-      "opens in FreeCAD/SolidWorks/slicers. `objects` empty = every solid. " +
-      "Saves to `save_path` if given, else ~/Desktop/<file_name>.",
+    "EXPORT parts to a CAD file on disk — STEP (AP242, mm), STL, or OBJ — and " +
+      "return the absolute path. `objects` empty = every solid. Saves to " +
+      "`save_path`, else ~/Desktop/<file_name>.",
     {
-      format: z.enum(["STEP", "STL", "OBJ"]).default("STEP"),
-      objects: z.array(z.string().uuid()).default([]),
+      format: z.enum(["STEP", "STL", "OBJ"]).default("STEP").describe("output file format"),
+      objects: z
+        .array(z.string().uuid())
+        .default([])
+        .describe("object_uuids to export; empty = every solid"),
       file_name: z
         .string()
         .regex(/^[\w.-]+$/)
@@ -102,7 +101,10 @@ export function registerIoTools(server: McpServer) {
         .string()
         .optional()
         .describe("absolute destination path; overrides file_name/Desktop"),
-      quality: z.enum(["Low", "Medium", "High"]).default("High"),
+      quality: z
+        .enum(["Low", "Medium", "High"])
+        .default("High")
+        .describe("tessellation quality for STL/OBJ meshes"),
     },
     async ({ format, objects, file_name, save_path, quality }) => {
       try {
@@ -128,13 +130,10 @@ export function registerIoTools(server: McpServer) {
 
   server.tool(
     "make_drawing",
-    "Generate a 2D engineering DRAWING: the standard four-view sheet (Front/" +
-      "Top/Right + iso) with hidden-line removal, centerlines, automatic " +
-      "dimensions (each feature dimensioned once, in its best view — ISO " +
-      "129-1 dedup). Returns the drawing id AND a QUALITY report whose " +
-      "invariants CANNOT be fooled (label collisions, redundant/on-geometry " +
-      "dimensions — the verifier reads the exact boxes the renderer inks). " +
-      "Treat passed:false like a watertightness failure.",
+    "Generate a 2D engineering DRAWING: four-view sheet (Front/Top/Right + iso), " +
+      "hidden-line removal, centerlines, ISO-129 deduped dimensions. Returns the " +
+      "drawing id + a QUALITY report (label collisions, redundant dims); treat " +
+      "passed:false like a watertightness failure.",
     {
       part_id: z.number().int().describe("kernel part/solid id from list_parts"),
       name: z.string().optional().describe("title-block name for the sheet"),
@@ -154,7 +153,7 @@ export function registerIoTools(server: McpServer) {
                 } advisory issue(s))`
               : `LAYOUT ISSUES — ${q.issues?.length ?? 0} finding(s); see quality.issues`
             : "drawing created (no quality report)",
-          note: "Open in the Drawing workspace, or fetch_drawing to save PDF/DXF/SVG to disk.",
+          note: "Open in the Drawing workspace, or drawing_export_sheet to save PDF/DXF/SVG to disk.",
         });
       } catch (e) {
         return fail(e);
@@ -163,12 +162,13 @@ export function registerIoTools(server: McpServer) {
   );
 
   server.tool(
-    "fetch_drawing",
-    "SAVE a drawing produced by make_drawing to disk as PDF, DXF, or SVG and " +
-      "return the absolute file path — the shop-ready sheet.",
+    "drawing_export_sheet",
+    "SAVE the RENDERED sheet from make_drawing to disk as a PDF/DXF/SVG FILE — " +
+      "the shop-ready sheet — and return the absolute path. For the queryable " +
+      "semantic data (not a file) use drawing_read_semantics instead.",
     {
       drawing_id: z.string().uuid().describe("drawing_id from make_drawing"),
-      format: z.enum(["pdf", "dxf", "svg"]).default("pdf"),
+      format: z.enum(["pdf", "dxf", "svg"]).default("pdf").describe("output file format"),
       file_name: z
         .string()
         .regex(/^[\w.-]+$/)

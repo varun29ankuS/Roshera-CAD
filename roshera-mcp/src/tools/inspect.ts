@@ -22,7 +22,7 @@ export function registerInspectTools(server: McpServer) {
     "get_part",
     "Full report for one part: world placement (center, dimensions, anchor " +
       "datum), topology fingerprint, name.",
-    { part_id: z.number().int() },
+    { part_id: z.number().int().describe("part id (list_parts)") },
     async ({ part_id }) => {
       try {
         return ok(await api("GET", `/api/agent/parts/${part_id}`));
@@ -34,12 +34,10 @@ export function registerInspectTools(server: McpServer) {
 
   server.tool(
     "mass_properties",
-    "Exact mass properties: volume (mm^3), mass (kg), center of mass (mm), " +
-      "inertia tensor + principal moments (kg·mm^2), principal axes " +
-      "(mesh-integrated, accuracy-gated against closed form). The response's " +
-      "'units' object carries these same labels per-field — authoritative, " +
-      "not just this description.",
-    { part_id: z.number().int() },
+    "Exact mass properties: volume (mm³), mass (kg), centre of mass (mm), " +
+      "inertia tensor + principal moments (kg·mm²), principal axes " +
+      "(accuracy-gated). The response's 'units' object carries per-field labels.",
+    { part_id: z.number().int().describe("part id (list_parts)") },
     async ({ part_id }) => {
       try {
         return ok(await api("GET", `/api/agent/parts/${part_id}/mass`));
@@ -52,10 +50,9 @@ export function registerInspectTools(server: McpServer) {
   server.tool(
     "verify_claim",
     "VERIFY a math claim against kernel GROUND TRUTH. Bind each variable in " +
-      "`expr` to an exact measurement (volume / surface_area / face_area / " +
-      "edge_length / constant), assert `expected`; evaluated deterministically " +
-      "(NOT an LLM). Three-state verdict: verified | false (with abs_error) | " +
-      "refused (a binding could not resolve — never a silent pass).",
+      "`expr` to an exact measurement, assert `expected`; evaluated " +
+      "deterministically (NOT an LLM). Verdict: verified | false (with " +
+      "abs_error) | refused (a binding didn't resolve — never a silent pass).",
     {
       expr: z
         .string()
@@ -64,14 +61,17 @@ export function registerInspectTools(server: McpServer) {
         .array(
           z.object({
             var: z.string().describe("variable name used in expr"),
-            measure: z.object({
-              kind: z.enum([
-                "volume",
-                "surface_area",
-                "face_area",
-                "edge_length",
-                "constant",
-              ]),
+            measure: z
+              .object({
+              kind: z
+                .enum([
+                  "volume",
+                  "surface_area",
+                  "face_area",
+                  "edge_length",
+                  "constant",
+                ])
+                .describe("what exact quantity to measure"),
               part: z
                 .string()
                 .optional()
@@ -79,7 +79,8 @@ export function registerInspectTools(server: McpServer) {
               face: z.number().int().optional().describe("face id — for face_area"),
               edge: z.number().int().optional().describe("edge id — for edge_length"),
               value: z.number().optional().describe("the value — for constant"),
-            }),
+            })
+              .describe("the exact quantity to bind this variable to"),
           }),
         )
         .describe("variable→measurement bindings"),
@@ -107,10 +108,9 @@ export function registerInspectTools(server: McpServer) {
 
   server.tool(
     "get_revolve_profile",
-    "RECOVER the editable meridian a revolved part was built from — the [r,z] " +
-      "half-plane profile. Read it, edit a radius, call revolve again to " +
-      "REGENERATE (the edit→regenerate loop). 404 if not built by a revolve.",
-    { part_id: z.number().int() },
+    "RECOVER the editable [r,z] meridian a revolved part was built from. Read " +
+      "it, edit a radius, call revolve again to REGENERATE. 404 if not a revolve.",
+    { part_id: z.number().int().describe("part id (list_parts)") },
     async ({ part_id }) => {
       try {
         return ok(await api("GET", `/api/agent/parts/${part_id}/profile`));
@@ -122,10 +122,9 @@ export function registerInspectTools(server: McpServer) {
 
   server.tool(
     "get_face",
-    "Per-face report: surface type, area, principal curvatures, boundary " +
-      "edges, neighbours. Face ids come from render_part mode 'ids' or " +
-      "get_pointer.",
-    { face_id: z.number().int() },
+    "Per-face report: surface type, area, principal curvatures, boundary edges, " +
+      "neighbours. Face ids from render_part 'ids' or get_pointer.",
+    { face_id: z.number().int().describe("kernel face id (render 'ids' legend or get_pointer)") },
     async ({ face_id }) => {
       try {
         return ok(await api("GET", `/api/agent/faces/${face_id}`));
@@ -137,12 +136,11 @@ export function registerInspectTools(server: McpServer) {
 
   server.tool(
     "part_distance",
-    "MEASURE two parts' spatial relationship from their world AABBs: gap " +
-      "(clearance), overlap (penetration), center distance, and the unit " +
-      "direction a→b. For clearance checks and nudge decisions.",
+    "MEASURE two parts from their world AABBs: gap (clearance), overlap " +
+      "(penetration), centre distance, unit direction a→b. For clearance/nudge decisions.",
     {
-      part_a: z.number().int(),
-      part_b: z.number().int(),
+      part_a: z.number().int().describe("part id (list_parts)"),
+      part_b: z.number().int().describe("part id (list_parts)"),
     },
     async ({ part_a, part_b }) => {
       try {
@@ -155,10 +153,10 @@ export function registerInspectTools(server: McpServer) {
 
   server.tool(
     "part_features",
-    "READ analytic FEATURE sizes off the B-Rep: every face's feature dimension " +
-      "(cylinder diameters + axes for bores/bosses, plane normals) plus a " +
-      "distinct-diameter summary. Exact values, never measured from pixels.",
-    { part_id: z.number().int().describe("kernel part id from list_parts") },
+    "READ analytic FEATURE sizes off the B-Rep: per-face feature dimensions " +
+      "(cylinder diameters + axes for bores/bosses, plane normals) + a distinct-" +
+      "diameter summary. Exact, never from pixels.",
+    { part_id: z.number().int().describe("part id (list_parts)") },
     async ({ part_id }) => {
       try {
         return ok(await api("GET", `/api/agent/parts/${part_id}/features`));
@@ -170,21 +168,27 @@ export function registerInspectTools(server: McpServer) {
 
   server.tool(
     "select_face",
-    "Address a face by DESCRIPTION — the kernel resolves it or REFUSES (never " +
-      "picks among equal matches). Give a surface `kind`, optional `normal_dir`, " +
-      "optional `extremal` tie-breaker. Returns face_id + persistent_id, or " +
-      "`ambiguous` (candidates) / `not_found`.",
+    "Address a face by DESCRIPTION — resolves it or REFUSES (never picks among " +
+      "equal matches). Returns face_id + persistent_id, or ambiguous / not_found.",
     {
-      part_id: z.number().int(),
+      part_id: z.number().int().describe("part id (list_parts)"),
       kind: z
         .enum(["any", "planar", "cylindrical", "spherical", "conical", "toroidal", "nurbs"])
-        .default("any"),
-      normal_dir: z.tuple([z.number(), z.number(), z.number()]).optional(),
+        .default("any")
+        .describe("surface-type filter"),
+      normal_dir: z
+        .array(z.number()).length(3)
+        .optional()
+        .describe("keep faces whose normal aligns with [x,y,z] (within angle_tol_deg)"),
       extremal: z
         .enum(["none", "largest_area", "smallest_area", "most_along"])
-        .default("none"),
-      along: z.tuple([z.number(), z.number(), z.number()]).optional(),
-      angle_tol_deg: z.number().default(12),
+        .default("none")
+        .describe("tie-breaker (most_along uses `along`)"),
+      along: z
+        .array(z.number()).length(3)
+        .optional()
+        .describe("direction for most_along (default: normal_dir, else +Z)"),
+      angle_tol_deg: z.number().default(12).describe("normal match tolerance (degrees)"),
     },
     async ({ part_id, kind, normal_dir, extremal, along, angle_tol_deg }) => {
       try {
@@ -211,20 +215,35 @@ export function registerInspectTools(server: McpServer) {
 
   server.tool(
     "select_edge",
-    "Address an EDGE by description — resolves or REFUSES. `curve_kind`, a " +
-      "`blend` filter (filleted/chamfered/unblended), optional `convexity` " +
-      "(convex/concave) — concave = re-entrant/interior edges, target these to " +
-      "fillet a concave corner — optional `direction`, optional `extremal`. " +
-      "Returns edge_id + persistent_id, or `ambiguous` / `not_found`.",
+    "Address an EDGE by description — resolves or REFUSES. Returns edge_id + " +
+      "persistent_id, or ambiguous / not_found.",
     {
-      part_id: z.number().int(),
-      curve_kind: z.enum(["any", "line", "arc", "circle", "nurbs"]).default("any"),
-      blend: z.enum(["any", "filleted", "chamfered", "unblended"]).default("any"),
-      convexity: z.enum(["any", "convex", "concave"]).default("any"),
-      direction: z.tuple([z.number(), z.number(), z.number()]).optional(),
-      extremal: z.enum(["none", "longest", "shortest", "most_along"]).default("none"),
-      along: z.tuple([z.number(), z.number(), z.number()]).optional(),
-      angle_tol_deg: z.number().default(12),
+      part_id: z.number().int().describe("part id (list_parts)"),
+      curve_kind: z
+        .enum(["any", "line", "arc", "circle", "nurbs"])
+        .default("any")
+        .describe("edge curve-type filter"),
+      blend: z
+        .enum(["any", "filleted", "chamfered", "unblended"])
+        .default("any")
+        .describe("keep only already filleted/chamfered/unblended edges"),
+      convexity: z
+        .enum(["any", "convex", "concave"])
+        .default("any")
+        .describe("concave = re-entrant edges (target to fillet a concave corner)"),
+      direction: z
+        .array(z.number()).length(3)
+        .optional()
+        .describe("keep edges whose tangent aligns with [x,y,z] (within angle_tol_deg)"),
+      extremal: z
+        .enum(["none", "longest", "shortest", "most_along"])
+        .default("none")
+        .describe("tie-breaker (most_along uses `along`)"),
+      along: z
+        .array(z.number()).length(3)
+        .optional()
+        .describe("direction for most_along (default: direction, else +Z)"),
+      angle_tol_deg: z.number().default(12).describe("tangent match tolerance (degrees)"),
     },
     async ({ part_id, curve_kind, blend, convexity, direction, extremal, along, angle_tol_deg }) => {
       try {
@@ -253,10 +272,10 @@ export function registerInspectTools(server: McpServer) {
     "Set a part's display RGB for scene_view renders. Registry-only — does NOT " +
       "modify geometry.",
     {
-      part_id: z.number().int().describe("kernel part id from list_parts"),
-      r: z.number().int().min(0).max(255),
-      g: z.number().int().min(0).max(255),
-      b: z.number().int().min(0).max(255),
+      part_id: z.number().int().describe("part id (list_parts)"),
+      r: z.number().int().min(0).max(255).describe("red 0–255"),
+      g: z.number().int().min(0).max(255).describe("green 0–255"),
+      b: z.number().int().min(0).max(255).describe("blue 0–255"),
     },
     async ({ part_id, r, g, b }) => {
       try {
@@ -270,12 +289,10 @@ export function registerInspectTools(server: McpServer) {
 
   server.tool(
     "document_units",
-    "Display-only document unit setting (mm/cm/m/in/ft). The model stays " +
-      "mm-native forever; switching units re-renders all labels and verdicts " +
-      "in the chosen unit at display time — geometry, certificates, and stored " +
-      "values are never converted. No arg → GET current unit. With arg → PATCH " +
-      "and echo the new state. See dimension_part / measure_faces — their " +
-      "labels already follow this setting server-side.",
+    "Display-only document unit (mm/cm/m/in/ft). Model stays mm-native; " +
+      "switching re-renders labels/verdicts at display time — geometry and stored " +
+      "values are never converted. No arg → GET; with arg → PATCH and echo. " +
+      "dimension_part / measure_faces labels follow this.",
     {
       unit: z
         .enum(["mm", "cm", "m", "in", "ft"])

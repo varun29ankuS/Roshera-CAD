@@ -48,22 +48,18 @@ function buildTransform(
 export function registerAssemblyTools(server: McpServer) {
   server.tool(
     "assembly_verify",
-    "CERTIFY A KINEMATIC ASSEMBLY — the non-fakeable 'does this physically go " +
-      "together AND move without collision?' verdict. Declare mates and " +
-      "mechanisms; the kernel solves constraints and returns a 5-dimension " +
-      "certificate: mates_consistent, fully_grounded (a part with no mate " +
-      "path to ground is FLOATING, named in floating_instances), dof+mobility, " +
-      "no_static_interference, swept_clearance_ok (Parry CCD over each " +
-      "mechanism's full range, conservative by `epsilon`). is_sound = AND of " +
-      "all five — catches a floating massing a shaded render cannot.\n" +
-      "MATE: {\"kind\":\"Concentric\"|\"Coincident\"|\"Fixed\", \"a\":<iid>, " +
-      "\"feature_a\":{\"Axis\":{\"origin\":[..],\"direction\":[..]}} or " +
-      "{\"Face\":{\"point\":[..],\"normal\":[..]}}, \"b\":<iid>, \"feature_b\":{...}}. " +
-      "Concentric = two Axis; Coincident = two Face (ANTIPARALLEL normals).\n" +
-      "MECHANISM: {\"moving\":<iid>, \"joint\":{\"Revolute\":{\"axis_origin\":[..]," +
-      "\"axis_dir\":[..]}} | {\"Prismatic\":{...}} | {\"Spherical\":{\"center\":[..]}} | " +
-      "\"Fixed\", \"base_translation\":[..], \"base_rotation\":[x,y,z,w], " +
-      "\"range\":[lo,hi], \"samples\":<n>}.",
+    "One-shot kinematic assembly certificate from a self-contained spec (no " +
+      "prior assembly_create). Declare parts + mates + mechanisms inline; " +
+      "returns a 5-dim verdict: mates_consistent, fully_grounded (no floating " +
+      "part), dof+mobility, no_static_interference, swept_clearance_ok (Parry " +
+      "CCD, conservative by `epsilon`). is_sound = AND of all five.\n" +
+      "MATE: {kind:'Concentric'|'Coincident'|'Fixed', a:<iid>, feature_a:{Axis:" +
+      "{origin,direction}}|{Face:{point,normal}}, b, feature_b} (Concentric=2 " +
+      "Axis; Coincident=2 Face, antiparallel).\n" +
+      "MECHANISM: {moving:<iid>, joint:{Revolute:{axis_origin,axis_dir}}|" +
+      "{Prismatic:{…}}|{Spherical:{center}}|'Fixed', base_translation, " +
+      "base_rotation:[x,y,z,w], range:[lo,hi], samples}.\n" +
+      "Persistent workflow: assembly_create + assembly_mate + assembly_certify.",
     {
       ground: z
         .number()
@@ -81,7 +77,7 @@ export function registerAssemblyTools(server: McpServer) {
               .array(z.number())
               .length(3)
               .optional()
-              .describe("world position [x,y,z] (default origin)"),
+              .describe("world position [x,y,z] mm (default origin)"),
             rotation: z
               .array(z.number())
               .length(4)
@@ -102,7 +98,7 @@ export function registerAssemblyTools(server: McpServer) {
         .number()
         .optional()
         .default(0.0)
-        .describe("tessellation deviation bound; certified clearance = parry_distance − epsilon"),
+        .describe("tessellation deviation bound (mm); certified clearance = parry_distance − epsilon"),
     },
     async ({ ground, parts, mates, mechanisms, epsilon }) => {
       try {
@@ -122,9 +118,9 @@ export function registerAssemblyTools(server: McpServer) {
 
   server.tool(
     "assembly_create",
-    "Create a TRUE assembly: a named scene of positioned part INSTANCES (not " +
-      "a boolean merge). Instances REFERENCE parts by id and reuse geometry — " +
-      "the same part can be placed many times. Returns the assembly id.",
+    "Create a TRUE assembly: a named scene of positioned part INSTANCES (not a " +
+      "boolean merge). Instances reference parts by id and reuse geometry — the " +
+      "same part can be placed many times. Returns the assembly id.",
     { name: z.string().min(1).describe("display name, e.g. 'gearbox'") },
     async ({ name }) => {
       try {
@@ -139,38 +135,35 @@ export function registerAssemblyTools(server: McpServer) {
   server.tool(
     "assembly_add_instance",
     "Place an INSTANCE of an existing part into an assembly at a world pose " +
-      "(same object twice = two instances, no copy). Pose: `position` + " +
-      "optional `rotation_deg` about `rotation_axis`, OR a raw row-major 4×4 " +
-      "`transform`. Returns the instance id + assembly perception.",
+      "(same object twice = two instances, no copy). Returns the instance id + " +
+      "assembly perception.",
     {
-      assembly_id: z.string().describe("assembly id from assembly_create"),
+      assembly_id: z.string().describe("assembly id"),
       object: z
         .string()
-        .describe(
-          "the part's object_uuid (from a create_* response or boolean result) — same object twice = two instances",
-        ),
+        .describe("the part's object_uuid (from a create_* or boolean result)"),
       position: z
         .array(z.number())
         .length(3)
         .optional()
         .describe("world translation [x,y,z] mm"),
-      rotation_deg: z.number().optional(),
+      rotation_deg: z.number().optional().describe("rotation angle about rotation_axis (degrees)"),
       rotation_axis: z
         .array(z.number())
         .length(3)
         .optional()
-        .describe("unit axis for rotation_deg, e.g. [0,0,1]"),
+        .describe("unit rotation axis, e.g. [0,0,1]"),
       transform: z
         .array(z.array(z.number()).length(4))
         .length(4)
         .optional()
-        .describe("raw row-major 4×4 (overrides position/rotation)"),
+        .describe("raw row-major 4×4 pose (overrides position/rotation)"),
       name: z.string().optional().describe("placement name, e.g. 'wheel-FL'"),
       color: z
         .array(z.number().int().min(0).max(255))
         .length(3)
         .optional()
-        .describe("per-instance RGB"),
+        .describe("per-instance display RGB (0–255)"),
     },
     async ({
       assembly_id,
@@ -207,9 +200,9 @@ export function registerAssemblyTools(server: McpServer) {
   server.tool(
     "assembly_list_instances",
     "List an assembly's instances with PERCEPTION: instance_count vs " +
-      "unique_part_count (the gap is the reuse), each instance's part/" +
-      "transform/soundness, combined bbox, all_sound.",
-    { assembly_id: z.string() },
+      "unique_part_count (the gap is the reuse), each instance's part/transform/" +
+      "soundness, combined bbox, all_sound.",
+    { assembly_id: z.string().describe("assembly id") },
     async ({ assembly_id }) => {
       try {
         return ok(await api("GET", `/api/assembly/${assembly_id}`));
@@ -222,15 +215,26 @@ export function registerAssemblyTools(server: McpServer) {
   server.tool(
     "assembly_transform_instance",
     "Re-pose ONE instance without touching the others or the referenced part. " +
-      "`position`/`rotation_deg`/`rotation_axis` or a raw `transform`. Returns " +
-      "the updated assembly perception.",
+      "Returns the updated assembly perception.",
     {
-      assembly_id: z.string(),
+      assembly_id: z.string().describe("assembly id"),
       instance_id: z.string().describe("instance id from assembly_list_instances"),
-      position: z.array(z.number()).length(3).optional(),
-      rotation_deg: z.number().optional(),
-      rotation_axis: z.array(z.number()).length(3).optional(),
-      transform: z.array(z.array(z.number()).length(4)).length(4).optional(),
+      position: z
+        .array(z.number())
+        .length(3)
+        .optional()
+        .describe("world translation [x,y,z] mm"),
+      rotation_deg: z.number().optional().describe("rotation angle about rotation_axis (degrees)"),
+      rotation_axis: z
+        .array(z.number())
+        .length(3)
+        .optional()
+        .describe("unit rotation axis, e.g. [0,0,1]"),
+      transform: z
+        .array(z.array(z.number()).length(4))
+        .length(4)
+        .optional()
+        .describe("raw row-major 4×4 pose (overrides position/rotation)"),
     },
     async ({
       assembly_id,
@@ -263,18 +267,22 @@ export function registerAssemblyTools(server: McpServer) {
 
   server.tool(
     "assembly_view",
-    "SEE A WHOLE ASSEMBLY: composite every instance into one image at its " +
-      "instance transform, from an orbit camera (az/el, world-Z up). mode " +
-      "'diagnostic' highlights open (red) / non-manifold (magenta) edges.",
+    "SEE A WHOLE ASSEMBLY: composite every instance at its transform into one " +
+      "image from an orbit camera (world-Z up). mode 'diagnostic' highlights " +
+      "open (red) / non-manifold (magenta) edges.",
     {
-      assembly_id: z.string(),
+      assembly_id: z.string().describe("assembly id"),
       az: z.number().default(35).describe("azimuth degrees around world Z"),
       el: z.number().default(20).describe("elevation degrees above horizon"),
       mode: z
         .enum(["shaded", "ids", "depth", "normals", "diagnostic"])
-        .default("shaded"),
-      size: z.number().int().min(64).max(2048).default(720),
-      quality: z.enum(["coarse", "medium", "fine"]).default("medium"),
+        .default("shaded")
+        .describe("render channel"),
+      size: z.number().int().min(64).max(2048).default(720).describe("image size in px"),
+      quality: z
+        .enum(["coarse", "medium", "fine"])
+        .default("medium")
+        .describe("tessellation quality"),
     },
     async ({ assembly_id, az, el, mode, size, quality }) => {
       try {
@@ -315,32 +323,20 @@ export function registerAssemblyTools(server: McpServer) {
     label: z
       .string()
       .optional()
-      .describe(
-        "DURABLE: a label naming a face (label → PID → assertion). Prefer this — " +
-          "it follows the face through geometry edits.",
-      ),
-    pid: z
-      .string()
-      .optional()
-      .describe("a raw persistent face id (durable, but unnamed)"),
+      .describe("DURABLE (best): a face label; follows the face through edits"),
+    pid: z.string().optional().describe("raw persistent face id (durable, unnamed)"),
     face_id: z
       .number()
       .optional()
-      .describe(
-        "a live kernel face id. Durability is DERIVED: the face's PID when it has " +
-          "one, else a geometric fingerprint (degraded — reported per mate).",
-      ),
+      .describe("live kernel face id; durability derived (PID if any, else fingerprint)"),
     frame: z
       .object({
-        origin: z.array(z.number()).length(3),
-        z_axis: z.array(z.number()).length(3),
-        x_axis: z.array(z.number()).length(3),
+        origin: z.array(z.number()).length(3).describe("origin [x,y,z] mm"),
+        z_axis: z.array(z.number()).length(3).describe("z axis (the joint axis)"),
+        x_axis: z.array(z.number()).length(3).describe("x axis"),
       })
       .optional()
-      .describe(
-        "RAW coordinates (datum-style). NOT durable, and must sit on the part's " +
-          "real geometry or the certificate refuses it as a fabricated joint.",
-      ),
+      .describe("RAW coords (NOT durable); must sit on real geometry or certify refuses it"),
   });
 
   async function makeConnector(assembly_id: string, spec: any): Promise<string> {
@@ -360,27 +356,20 @@ export function registerAssemblyTools(server: McpServer) {
 
   server.tool(
     "assembly_mate",
-    "MATE two instances — connectors + mate in ONE call. A mate is ONE " +
-      "relationship between two coordinate FRAMES, and the mate IS the joint: " +
-      "its DOF signature is exact by construction, so you never stack " +
-      "constraints and hope.\n" +
-      "JOINTS (primary): Fastened (0 DOF, the rigid lock) · Revolute{limits} " +
-      "(1 rot about z) · Slider{limits} (1 trans along z) · " +
-      "Cylindrical{rot_limits,trans_limits} (rot+trans) · Planar (2 trans + " +
-      "spin) · Ball (3 rot) · PinSlot{slot_dir_x,limits}.\n" +
-      "OVERLAYS: Distance{value} · Angle{value} · Parallel · Tangent.\n" +
-      "COUPLINGS (pass `couples` = the mate ids they relate): GearRatio{ratio} " +
-      "and RackPinion{pinion_radius} take 2; Screw{lead} takes 1 (a " +
-      "Cylindrical). The reference configuration is captured from the CURRENT " +
-      "poses.\n" +
-      "REFUSED (typed, never a silent zero-DOF lie): Cam, Path, Symmetric.\n" +
-      "LIMITS are first-class: `{\"Revolute\":{\"limits\":[-0.1,0.1]}}` bounds " +
-      "the joint AND gives assembly_certify a finite range to sweep. A " +
-      "rotation without limits is swept over a full turn; a TRANSLATION " +
-      "without limits has unbounded travel and honestly REFUSES to be " +
-      "certified — declare limits if you want a verdict.",
+    "MATE two instances — connectors + mate in ONE call. A mate relates two " +
+      "FRAMES and IS the joint (exact DOF by construction).\n" +
+      "JOINTS: Fastened (0 DOF) · Revolute{limits} (1 rot/z) · Slider{limits} " +
+      "(1 trans/z) · Cylindrical{rot_limits,trans_limits} · Planar (2 trans+" +
+      "spin) · Ball (3 rot) · PinSlot{slot_dir_x,limits}. OVERLAYS: " +
+      "Distance{value} mm · Angle{value} rad · Parallel · Tangent. COUPLINGS " +
+      "(pass `couples` = related mate ids): GearRatio{ratio} & " +
+      "RackPinion{pinion_radius} take 2, Screw{lead} takes 1.\n" +
+      "REFUSED (typed): Cam, Path, Symmetric.\n" +
+      "LIMITS (rot=rad, trans=mm) give assembly_certify a finite range: a " +
+      "rotation without limits sweeps a full turn; a translation without limits " +
+      "refuses certification.",
     {
-      assembly_id: z.string().uuid(),
+      assembly_id: z.string().uuid().describe("assembly id"),
       action: z
         .enum(["create", "edit", "remove"])
         .default("create")
@@ -389,15 +378,15 @@ export function registerAssemblyTools(server: McpServer) {
         .any()
         .optional()
         .describe(
-          'the mate kind, e.g. "Fastened" or {"Revolute":{"limits":[-0.1,0.1]}} ' +
+          "the mate kind, e.g. 'Fastened' or {Revolute:{limits:[-0.1,0.1]}} " +
             "(required for create/edit)",
         ),
-      a: connectorSpec.optional().describe("side A (required for create)"),
-      b: connectorSpec.optional().describe("side B (required for create)"),
+      a: connectorSpec.optional().describe("side A connector (required for create)"),
+      b: connectorSpec.optional().describe("side B connector (required for create)"),
       couples: z
         .array(z.string().uuid())
         .optional()
-        .describe("for coupling kinds: the mate ids whose parameters are related"),
+        .describe("for coupling kinds: the related mate ids"),
       mate_id: z
         .string()
         .uuid()
@@ -440,19 +429,17 @@ export function registerAssemblyTools(server: McpServer) {
 
   server.tool(
     "assembly_solve",
-    "SOLVE the mate system: the parts are PLACED by their mates, not by you. " +
-      "Returns the solved pose of every instance plus per-mate facts " +
-      "(enforced/violation/anchor provenance) and a compact verdict " +
-      "(constrainedness + any conflict witnesses) — you can never mutate " +
-      "blind. `converged:false` means the mates cannot all hold; read the " +
-      "witnesses to see which ones fight.",
+    "SOLVE the mate system: parts are PLACED by their mates. Returns each " +
+      "instance's solved pose, per-mate facts (enforced/violation/anchor) and a " +
+      "verdict (constrainedness + conflict witnesses). `converged:false` = the " +
+      "mates cannot all hold; the witnesses name which fight.",
     {
-      assembly_id: z.string().uuid(),
+      assembly_id: z.string().uuid().describe("assembly id"),
       ground: z
         .string()
         .uuid()
         .optional()
-        .describe("the instance that never moves (defaults to the first)"),
+        .describe("grounded instance (default: first)"),
     },
     async ({ assembly_id, ground }) => {
       try {
@@ -469,27 +456,20 @@ export function registerAssemblyTools(server: McpServer) {
 
   server.tool(
     "assembly_certify",
-    "THE FULL CERTIFICATE — the non-fakeable 'does this go together AND move " +
-      "without collision?' verdict. `is_sound` is the AND of: mates_consistent " +
-      "· fully_grounded (a part with no mate path to ground is FLOATING) · " +
-      "no_static_interference · swept_clearance_ok · mates_anchored (no joint " +
-      "declared against an invented coordinate) · mates_in_contact (no paper " +
-      "joint) · mates_enforced.\n" +
-      "MOBILITY IS REPORTED, NOT FAILED: a mechanism is a design, not a defect.\n" +
-      "The `sweeps` carry one fact per motion, over joints DERIVED FROM YOUR " +
-      "MATES — nothing is authored, so nothing can be authored wrong. Each " +
-      "carries its method (continuous TOI — no tunneling), the ε it ran at, " +
-      "and any motion-stamped contact. A sweep it cannot certify REFUSES with " +
-      "a reason instead of pretending.\n" +
-      "ε is KERNEL-DERIVED from the real tessellation bound; you may only " +
-      "RAISE it. Certified clearance = distance − ε, always conservative.",
+    "THE FULL CERTIFICATE. `is_sound` = AND of: mates_consistent · " +
+      "fully_grounded (no floating part) · no_static_interference · " +
+      "swept_clearance_ok · mates_anchored (no invented coordinate) · " +
+      "mates_in_contact · mates_enforced. Mobility is REPORTED, not failed. " +
+      "`sweeps` = one fact per motion (continuous TOI, no tunneling) with ε and " +
+      "any contact; an uncertifiable sweep REFUSES with a reason. Certified " +
+      "clearance = distance − ε.",
     {
-      assembly_id: z.string().uuid(),
-      ground: z.string().uuid().optional(),
+      assembly_id: z.string().uuid().describe("assembly id"),
+      ground: z.string().uuid().optional().describe("grounded instance"),
       epsilon: z
         .number()
         .optional()
-        .describe("only honoured ABOVE the kernel floor — you cannot ask for less"),
+        .describe("clearance margin (mm); honoured only ABOVE the kernel floor"),
     },
     async ({ assembly_id, ground, epsilon }) => {
       try {
@@ -507,14 +487,11 @@ export function registerAssemblyTools(server: McpServer) {
 
   server.tool(
     "assembly_dof",
-    "DOF + per-instance constrainment: which instances are fully located, " +
-      "which still MOVE (and how — 'rotation about axis A through point P', " +
-      "twist-decoded, not just a number), which are over-constrained and via " +
-      "which mates. Also reports STRUCTURAL vs NUMERIC DOF side by side: when " +
-      "they disagree (`special_geometry:true`) the counting rule lied and the " +
-      "geometry is the truth — a four-bar's mobility is a property of its " +
-      "CONFIGURATION. Meshless and cheap; read it before you trust a layout.",
-    { assembly_id: z.string().uuid() },
+    "DOF + per-instance constrainment: which instances are fully located, which " +
+      "MOVE (and how — 'rotation about axis A through P'), which are over-" +
+      "constrained and via which mates. Reports STRUCTURAL vs NUMERIC DOF; when " +
+      "they disagree (`special_geometry:true`) the geometry is the truth. Cheap.",
+    { assembly_id: z.string().uuid().describe("assembly id") },
     async ({ assembly_id }) => {
       try {
         return ok(await api("GET", `/api/assembly/${assembly_id}/dof`));
@@ -526,28 +503,22 @@ export function registerAssemblyTools(server: McpServer) {
 
   server.tool(
     "assembly_drag",
-    "DRIVE A JOINT — your kinematic hand. Set a joint parameter and the " +
-      "affected chain re-solves around it; the poses are written back.\n" +
-      "param: 'rotation' (θ about the connector z) or 'translation' (s along " +
-      "it). Only joints whose freedom those two span are driveable: Revolute " +
-      "(θ), Slider (s), Cylindrical (both). Planar, Ball and PinSlot REFUSE " +
-      "with a reason — driving θ on a Planar would leave its in-plane " +
-      "translations free, so the answer would be an artefact, not kinematics. " +
-      "Drive the base joint of a coupling, never the coupling.\n" +
-      "LIMITS CLAMP, they do not error: ask for more than the joint has and " +
-      "you get its limit plus a `limit` fact saying you bottomed out.\n" +
-      "`converged:false` = the drive was UNREACHABLE (something locks it); " +
-      "every pose is restored and nothing is written — never a half-stroke.\n" +
-      "`scope` names exactly what moved. `rank_transitions` warns that the " +
-      "stroke passed through a singular pose where the mechanism gains a DOF.",
+    "DRIVE A JOINT: set a joint parameter, the affected chain re-solves, poses " +
+      "written back. Driveable: Revolute (rotation), Slider (translation), " +
+      "Cylindrical (both); Planar/Ball/PinSlot REFUSE. Drive a coupling's base " +
+      "joint, not the coupling. Limits CLAMP (not error). `converged:false` = " +
+      "UNREACHABLE, all poses restored (never a half-stroke). `rank_transitions` " +
+      "warns of a singular pose.",
     {
-      assembly_id: z.string().uuid(),
+      assembly_id: z.string().uuid().describe("assembly id"),
       mate_id: z.string().uuid().describe("the joint to drive"),
-      param: z.enum(["rotation", "translation"]),
+      param: z
+        .enum(["rotation", "translation"])
+        .describe("rotation about the connector z, or translation along it"),
       value: z
         .number()
-        .describe("target value (radians for rotation, length for translation)"),
-      ground: z.string().uuid().optional(),
+        .describe("target value (radians for rotation, mm for translation)"),
+      ground: z.string().uuid().optional().describe("grounded instance"),
     },
     async ({ assembly_id, mate_id, param, value, ground }) => {
       try {
@@ -567,21 +538,15 @@ export function registerAssemblyTools(server: McpServer) {
 
   server.tool(
     "assembly_interference",
-    "WHAT TOUCHES, AND AT WHAT ANGLE — the perception you need to fix a " +
-      "mechanism without rendering it. `static_pairs` are overlaps at the " +
-      "solved pose. `sweeps` walk every joint DERIVED from your mates through " +
-      "its range with continuous time-of-impact (a thin blade CANNOT slip " +
-      "between samples) and return motion-stamped facts: 'instances A and B " +
-      "interpenetrate by 0.42 at θ=0.15'. `first_contact` is where the motion " +
-      "first closes; `min_certified_clearance` is the conservative bound " +
-      "(distance − ε) over the whole motion.\n" +
-      "A sweep with a `refusal` was NOT certified and says why (unbounded " +
-      "slider travel has no finite range) — an honest refusal, not a pass. A " +
-      "`manifold_violation` means the motion leaves what the mates allow.",
+    "WHAT TOUCHES, AND WHEN — fix a mechanism without rendering. `static_pairs` " +
+      "= overlaps at the solved pose. `sweeps` walk every mate-derived joint " +
+      "through its range with continuous TOI, returning motion-stamped facts. " +
+      "`first_contact` = where motion first closes; `min_certified_clearance` = " +
+      "distance − ε. A `refusal` = not certified (says why).",
     {
-      assembly_id: z.string().uuid(),
-      ground: z.string().uuid().optional(),
-      epsilon: z.number().optional(),
+      assembly_id: z.string().uuid().describe("assembly id"),
+      ground: z.string().uuid().optional().describe("grounded instance"),
+      epsilon: z.number().optional().describe("clearance margin (mm) above the kernel floor"),
     },
     async ({ assembly_id, ground, epsilon }) => {
       try {

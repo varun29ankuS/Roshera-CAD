@@ -110,17 +110,13 @@ export function registerGdtTools(server: McpServer): void {
 
   server.tool(
     "gdt_datum",
-    "DESIGNATE a face as a datum feature (with label + target) OR LIST the " +
-      "current datum reference frame (without label/target). " +
-      "Datums pin to PersistentIds — they dangle honestly when their source " +
-      "face is consumed by a later boolean (never silently re-bound). " +
-      "Qualifying surfaces: planar → datum plane, cylindrical → datum axis; " +
-      "all others (spheres, NURBS blobs) are REFUSED. " +
-      "State is session-only: a server restart clears the DRF. " +
-      "Target by face_id (from render_part mode:'ids') or by selector (same " +
-      "shape as select_face).",
+    "DESIGNATE a face as a datum (label + target) OR LIST current datums (omit " +
+      "label/target). Datums pin to PersistentIds and dangle honestly when their " +
+      "face is consumed. Qualifying: planar → datum plane, cylindrical → datum " +
+      "axis; else REFUSED. Session-only. Target by face_id or `selector` " +
+      "(select_face shape).",
     {
-      part_id: z.number().int().describe("kernel part id from list_parts"),
+      part_id: z.number().int().describe("part id (list_parts)"),
       label: z
         .string()
         .optional()
@@ -214,25 +210,16 @@ export function registerGdtTools(server: McpServer): void {
 
   server.tool(
     "gdt_fcf",
-    "AUTHOR a Feature Control Frame and get its IMMEDIATE kernel-certified " +
-      "verdict. Verdicts are exact measurements against the B-Rep — not " +
-      "pixel estimates, not mesh approximations. The FCF is stored and " +
-      "re-evaluated on every gdt_report call. " +
-      "Characteristics: flatness (⏥, no datum), perpendicularity (⊥) and " +
-      "parallelism (∥) against a datum PLANE — target may be a planar face OR " +
-      "a cylindrical feature (its AXIS: ⊥ measures L·sinθ tilt over the bore " +
-      "length; ∥ measures the axis's departure from the plane), position (⌖, " +
-      "basic dims required). " +
-      "Position frames: single datum plane (part-corner origin), two datum " +
-      "planes A|B (A∩B line origin), or plane + center-axis |A|B| (the " +
-      "bolt-circle callout — origin = datum axis B ∩ datum plane A, basic " +
-      "[x, y] is Cartesian from that center). basic: [x, y] mm. Position " +
-      "verdicts DISCLOSE their resolved DRF (origin + derivation) so the " +
-      "convention is self-certifying. " +
-      "datum_refs must already be designated via gdt_datum or the request is " +
-      "refused (422). State is session-only: server restart clears annotations.",
+    "AUTHOR a Feature Control Frame; returns an IMMEDIATE certified verdict " +
+      "(exact B-Rep, never pixels). Stored + re-evaluated on every gdt_report. " +
+      "Characteristics: flatness (⏥, no datum); perpendicularity (⊥) / " +
+      "parallelism (∥) vs a datum PLANE (target = planar face OR cylindrical " +
+      "AXIS); position (⌖, needs `basic`). Position DRF origin: 1 plane = part " +
+      "corner; 2 planes A|B = their intersection; plane + axis |A|B| " +
+      "(bolt-circle) = axis B ∩ plane A. Verdicts DISCLOSE the DRF. datum_refs " +
+      "must already exist (gdt_datum) or refused (422). Session-only.",
     {
-      part_id: z.number().int().describe("kernel part id from list_parts"),
+      part_id: z.number().int().describe("part id (list_parts)"),
       characteristic: z
         .enum(["flatness", "perpendicularity", "parallelism", "position"])
         .describe("GD&T characteristic to evaluate"),
@@ -259,7 +246,7 @@ export function registerGdtTools(server: McpServer): void {
             "e.g. '{\"kind\":\"planar\",\"normal_dir\":[0,0,1]}'",
         ),
       basic: z
-        .tuple([z.number(), z.number()])
+        .array(z.number()).length(2)
         .optional()
         .describe(
           "basic dims [x, y] mm relative to DRF origin — required for position",
@@ -334,11 +321,10 @@ export function registerGdtTools(server: McpServer): void {
   server.tool(
     "gdt_report",
     "ALL GD&T state for a part: datum list (label, kind, live/dangling) + one " +
-      "compact verdict line per FCF annotation, all re-evaluated live against " +
-      "the current B-Rep. Dangling datums/features reported honestly — never " +
-      "silently dropped. State is session-only (cleared on server restart).",
+      "compact verdict line per FCF annotation, re-evaluated live against the " +
+      "B-Rep. Dangling reported honestly. Session-only (cleared on restart).",
     {
-      part_id: z.number().int().describe("kernel part id from list_parts"),
+      part_id: z.number().int().describe("part id (list_parts)"),
     },
     async ({ part_id }) => {
       try {

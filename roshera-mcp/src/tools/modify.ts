@@ -25,7 +25,7 @@ export function registerModifyTools(server: McpServer) {
     "delete_part",
     "Delete one part (timeline-recorded, undo-safe). WARNING: kernel part ids " +
       "RENUMBER after deletion — re-run list_parts before further deletes.",
-    { part_id: z.number().int() },
+    { part_id: z.number().int().describe("part id (list_parts)") },
     async ({ part_id }) => {
       try {
         return ok(await api("DELETE", `/api/agent/parts/${part_id}`));
@@ -52,17 +52,18 @@ export function registerModifyTools(server: McpServer) {
   server.tool(
     "shell",
     "HOLLOW a solid to a constant wall thickness (wall grows inward), opening " +
-      "the listed cap faces. `object` is the OBJECT UUID (not a kernel part " +
-      "id). `faces_to_remove` from select_face or a render 'ids' legend; [] = " +
-      "fully closed void (rarely the intent). Identity-preserving. Shelling " +
-      "can leave a self-intersecting or open wall — ALWAYS verify_part.",
+      "the listed cap faces. Identity-preserving (same uuid). Shelling can leave " +
+      "a self-intersecting or open wall — ALWAYS verify_part.",
     {
       object: z.string().uuid().describe("object_uuid of the solid to hollow"),
-      thickness: z.number().describe("wall thickness (inward); must be non-zero"),
+      thickness: z.number().describe("inward wall thickness (mm); must be non-zero"),
       faces_to_remove: z
         .array(z.number().int().nonnegative())
         .default([])
-        .describe("face ids of the caps to open; [] = closed void"),
+        .describe(
+          "cap face ids to open (from select_face or a render 'ids' legend); " +
+            "[] = fully closed void (rarely the intent)",
+        ),
     },
     async ({ object, thickness, faces_to_remove }) => {
       try {
@@ -89,18 +90,18 @@ export function registerModifyTools(server: McpServer) {
 
   server.tool(
     "fillet_edges",
-    "ROUND (fillet) edges with a constant radius. `edge_ids` from select_edge " +
-      "or a render 'ids' legend; OMIT to blend ALL edges (over-split hole rims " +
-      "auto-heal; seams / over-radius edges are skipped — it rounds everything " +
-      "it can rather than refusing the whole op). Identity-preserving. Check " +
-      "the returned verdict before trusting it.",
+    "ROUND (fillet) edges with a constant radius. Identity-preserving. OMIT " +
+      "edge_ids to blend ALL edges (over-radius/seam edges are skipped rather " +
+      "than refusing the whole op). Check the returned verdict before trusting it.",
     {
-      part_id: z.number().int().describe("kernel part id from list_parts"),
-      radius: z.number().positive().describe("fillet radius in model units"),
+      part_id: z.number().int().describe("part id (list_parts)"),
+      radius: z.number().positive().describe("fillet radius (mm)"),
       edge_ids: z
         .array(z.number().int().nonnegative())
         .optional()
-        .describe("edges to round; omit for ALL edges"),
+        .describe(
+          "edges to round (from select_edge or a render 'ids' legend); omit for ALL edges",
+        ),
     },
     async ({ part_id, radius, edge_ids }) => {
       try {
@@ -137,17 +138,18 @@ export function registerModifyTools(server: McpServer) {
 
   server.tool(
     "chamfer_edges",
-    "BEVEL (chamfer) edges with an equal-distance flat set back `distance` on " +
-      "each adjacent face. `edge_ids` from select_edge or a render 'ids' " +
-      "legend; OMIT to chamfer ALL edges. Identity-preserving. Chamfers can " +
-      "self-intersect at tight corners — check the returned verdict.",
+    "BEVEL (chamfer) edges with an equal-distance flat set back on each adjacent " +
+      "face. Identity-preserving. OMIT edge_ids to chamfer ALL edges. Chamfers " +
+      "can self-intersect at tight corners — check the returned verdict.",
     {
-      part_id: z.number().int().describe("kernel part id from list_parts"),
-      distance: z.number().positive().describe("chamfer setback in model units"),
+      part_id: z.number().int().describe("part id (list_parts)"),
+      distance: z.number().positive().describe("setback distance on each face (mm)"),
       edge_ids: z
         .array(z.number().int().nonnegative())
         .optional()
-        .describe("edges to bevel; omit for ALL edges"),
+        .describe(
+          "edges to bevel (from select_edge or a render 'ids' legend); omit for ALL edges",
+        ),
     },
     async ({ part_id, distance, edge_ids }) => {
       try {
@@ -179,12 +181,13 @@ export function registerModifyTools(server: McpServer) {
 
   server.tool(
     "boolean",
-    "Combine two solids: union / difference (cut b out of a) / intersection. " +
-      "Operands are OBJECT UUIDs, not kernel part ids. Both operands are " +
-      "consumed; a new solid is born. ALWAYS verify_part after differences " +
-      "(bores/slots can leave open faces).",
+    "Combine two solids by OBJECT UUID. Both operands are CONSUMED; a new solid " +
+      "is born. ALWAYS verify_part after differences (bores/slots can leave open " +
+      "faces). For many tools against one base, use boolean_many.",
     {
-      op: z.enum(["union", "difference", "intersection"]),
+      op: z
+        .enum(["union", "difference", "intersection"])
+        .describe("difference cuts object_b out of object_a"),
       object_a: z.string().uuid().describe("object_uuid of the base solid"),
       object_b: z.string().uuid().describe("object_uuid of the tool solid"),
     },
@@ -213,13 +216,13 @@ export function registerModifyTools(server: McpServer) {
 
   server.tool(
     "boolean_many",
-    "BATCH boolean: ONE op (difference or union) of MANY tool solids against " +
-      "a base, sequentially, in a single call. Every step is certified; the " +
-      "batch HALTS at the first unsound step and names the tool that did it. " +
-      "The base keeps its uuid; consumed tools are gone.",
+    "BATCH boolean: apply MANY tool solids against one base sequentially in a " +
+      "single call. Every step is certified; the batch HALTS at the first " +
+      "unsound step and names the tool that did it. The base keeps its uuid; " +
+      "consumed tools are gone.",
     {
-      op: z.enum(["union", "difference"]),
-      base: z.string().uuid().describe("object_uuid of the base solid"),
+      op: z.enum(["union", "difference"]).describe("operation applied at each step"),
+      base: z.string().uuid().describe("object_uuid of the base solid (kept)"),
       tools: z
         .array(z.string().uuid())
         .min(1)
@@ -270,43 +273,32 @@ export function registerModifyTools(server: McpServer) {
 
   server.tool(
     "drill_pattern",
-    "ONE-CALL hole pattern: drill `count` bores of radius `hole_r` on a ring " +
-      "of radius `ring_r` through a target — creates the bore cylinders AND " +
-      "subtracts them in one call. The ring is centered at WORLD `center` " +
-      "when given (REQUIRED for any part not at the origin — the standard " +
-      "planes all pass through [0,0,0]), else at cx,cy on `plane`; bores run " +
-      "along `axis` (default: the plane normal) from `z_offset` for `depth`: " +
-      "size them to OVERSHOOT both faces. A bore that misses the target is a " +
-      "TYPED backend refusal (boolean_disjoint), never a silent no-op. " +
-      "REFUSES overlapping adjacent holes up front (2·ring_r·sin(π/count) " +
-      "must exceed 2·hole_r — that regime drives a known open boolean bug). " +
-      "Certified per hole; halts on the first unsound step.",
+    "ONE-CALL bolt-circle: create `count` bore cylinders on a ring of radius " +
+      "`ring_r` and subtract them from a target in one call. Ring is centred at " +
+      "world `center` (REQUIRED for any part not at the origin — standard planes " +
+      "pass through [0,0,0]), else cx,cy on `plane`; bores run along `axis` " +
+      "(default plane normal) — size `depth`/`z_offset` to OVERSHOOT both faces. " +
+      "REFUSES overlapping adjacent holes up front (chord spacing must exceed " +
+      "2·hole_r). Certified per hole; halts on the first unsound step.",
     {
       object: z.string().uuid().describe("object_uuid of the solid to drill"),
-      plane: PlaneSchema.default("xy"),
+      plane: PlaneSchema.default("xy").describe("ring plane when center/axis omitted"),
       center: z
-        .tuple([z.number(), z.number(), z.number()])
+        .array(z.number()).length(3)
         .optional()
-        .describe(
-          "WORLD-space pattern center [x,y,z] — overrides the plane origin. " +
-            "Use the target part's actual location (cx/cy still apply as " +
-            "in-plane offsets on top).",
-        ),
+        .describe("world ring centre [x,y,z] mm — REQUIRED off-origin; overrides plane origin (cx/cy still add)"),
       axis: z
-        .tuple([z.number(), z.number(), z.number()])
+        .array(z.number()).length(3)
         .optional()
-        .describe("WORLD-space bore direction [x,y,z] — overrides the plane normal"),
-      cx: z.number().default(0).describe("pattern center (plane coords)"),
-      cy: z.number().default(0),
-      count: z.number().int().min(1).max(64),
-      ring_r: z.number().positive().describe("ring radius the hole centers sit on"),
-      hole_r: z.number().positive(),
-      depth: z.number().positive().describe("bore length (overshoot the part!)"),
-      z_offset: z
-        .number()
-        .default(-1)
-        .describe("bore start along the normal (default −1 = 1mm under the plane)"),
-      start_angle_deg: z.number().default(0),
+        .describe("world bore direction [x,y,z]; overrides plane normal"),
+      cx: z.number().default(0).describe("ring-centre u offset (mm)"),
+      cy: z.number().default(0).describe("ring-centre v offset (mm)"),
+      count: z.number().int().min(1).max(64).describe("number of holes"),
+      ring_r: z.number().positive().describe("radius the hole centres sit on (mm)"),
+      hole_r: z.number().positive().describe("bore radius (mm)"),
+      depth: z.number().positive().describe("bore length (mm); overshoot the part"),
+      z_offset: z.number().default(-1).describe("bore start along normal (mm); −1 = 1mm under plane"),
+      start_angle_deg: z.number().default(0).describe("first hole angle about the ring (degrees)"),
     },
     async ({
       object,
@@ -440,25 +432,28 @@ export function registerModifyTools(server: McpServer) {
 
   server.tool(
     "transform",
-    "Move and/or rotate a solid IN PLACE by its object_uuid (identity " +
-      "preserved — same uuid). Rotation (about optional center, default " +
-      "origin) applies first, then translation. Angle in DEGREES.",
+    "Move and/or rotate a solid IN PLACE by its object_uuid (identity preserved " +
+      "— same uuid). Rotation (about optional center, default origin) applies " +
+      "first, then translation.",
     {
       object: z.string().uuid().describe("object_uuid of the solid to move"),
       translation: z
-        .tuple([z.number(), z.number(), z.number()])
+        .array(z.number()).length(3)
         .optional()
-        .describe("[dx, dy, dz] world-space offset"),
+        .describe("[dx, dy, dz] world-space offset (mm)"),
       rotation: z
         .object({
-          axis: z.tuple([z.number(), z.number(), z.number()]),
-          angle_deg: z.number(),
+          axis: z
+            .array(z.number()).length(3)
+            .describe("rotation axis direction [x,y,z]"),
+          angle_deg: z.number().describe("rotation angle in DEGREES"),
           center: z
-            .tuple([z.number(), z.number(), z.number()])
+            .array(z.number()).length(3)
             .optional()
-            .describe("pivot point, default origin"),
+            .describe("pivot point [x,y,z] mm; default origin"),
         })
-        .optional(),
+        .optional()
+        .describe("optional rotation; applied before translation"),
     },
     async ({ object, translation, rotation }) => {
       try {

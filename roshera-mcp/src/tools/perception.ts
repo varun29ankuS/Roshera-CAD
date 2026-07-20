@@ -7,17 +7,17 @@ import { api, ok, fail, ApiError } from "../core.js";
 export function registerPerceptionTools(server: McpServer) {
   server.tool(
     "render_part",
-    "SEE a part: deterministic offscreen render as an image. mode 'ids' paints " +
-      "each face a flat color + returns a color→face_id legend (address " +
-      "topology); 'diagnostic' highlights defects; 'depth'/'normals' are exact " +
-      "G-buffer channels.",
+    "SEE a part: deterministic offscreen render as an image. mode 'ids' returns " +
+      "a color→face_id legend (to address topology); 'diagnostic' highlights " +
+      "defects; 'depth'/'normals' are exact G-buffer channels.",
     {
-      part_id: z.number().int().describe("kernel part id from list_parts"),
+      part_id: z.number().int().describe("part id (list_parts)"),
       mode: z
         .enum(["shaded", "ids", "depth", "normals", "diagnostic"])
-        .default("shaded"),
-      view: z.enum(["iso", "front", "top", "right"]).default("iso"),
-      size: z.number().int().min(64).max(2048).default(512),
+        .default("shaded")
+        .describe("render channel ('ids' returns a face_id legend; 'diagnostic' highlights defects)"),
+      view: z.enum(["iso", "front", "top", "right"]).default("iso").describe("camera view"),
+      size: z.number().int().min(64).max(2048).default(512).describe("image size in px"),
     },
     async ({ part_id, mode, view, size }) => {
       try {
@@ -52,13 +52,11 @@ export function registerPerceptionTools(server: McpServer) {
 
   server.tool(
     "ground_truth",
-    "The kernel's OWN account of a part — not a guess. Returns PROVENANCE " +
-      "(designed surface via revolve/loft/boolean/… vs a bare primitive " +
-      "stand-in), the computed validity certificate (brep_valid, watertight, " +
-      "manifold, euler, sound), and the display-mesh verdict " +
-      "(tessellation_clean + worst_face). Non-fakeable: `designed:false` or " +
-      "`sound:false` means stop and fix, not ship.",
-    { part_id: z.number().int().describe("kernel part id from list_parts") },
+    "The kernel's OWN account of a part: PROVENANCE (designed surface vs bare " +
+      "primitive), the validity certificate (brep_valid, watertight, manifold, " +
+      "euler, sound), and the display-mesh verdict. `designed:false` or " +
+      "`sound:false` = stop and fix.",
+    { part_id: z.number().int().describe("part id (list_parts)") },
     async ({ part_id }) => {
       try {
         return ok(await api("GET", `/api/agent/parts/${part_id}/truth`));
@@ -71,11 +69,10 @@ export function registerPerceptionTools(server: McpServer) {
   server.tool(
     "occupancy_view",
     "Non-deceivable SDF X-ray: a slice-stack ('#'=solid, '.'=empty) sampled " +
-      "from the kernel's EXACT solid — reveals internal cavities, wall " +
-      "thickness and through-holes a shaded render can hide. Each layer is a " +
-      "z-slice (rows by y, cols by x).",
+      "from the EXACT solid — reveals internal cavities, wall thickness and " +
+      "through-holes a render hides. Each layer is a z-slice (rows y, cols x).",
     {
-      part_id: z.number().int().describe("kernel part id from list_parts"),
+      part_id: z.number().int().describe("part id (list_parts)"),
       n: z
         .number()
         .int()
@@ -101,17 +98,17 @@ export function registerPerceptionTools(server: McpServer) {
 
   server.tool(
     "scene_view",
-    "SEE THE WHOLE SCENE: composite every part into one image from an orbit " +
-      "camera (azimuth/elevation, world-Z up), auto-framed. The way to inspect " +
-      "a multi-part scene from any angle. mode 'diagnostic' highlights open " +
-      "(red) / non-manifold (magenta) edges.",
+    "SEE THE WHOLE SCENE: composite every part into one auto-framed image from " +
+      "an orbit camera (azimuth/elevation, world-Z up). mode 'diagnostic' " +
+      "highlights open (red) / non-manifold (magenta) edges.",
     {
       az: z.number().default(35).describe("azimuth degrees around world Z"),
       el: z.number().default(20).describe("elevation degrees above the horizon"),
       mode: z
         .enum(["shaded", "ids", "depth", "normals", "diagnostic"])
-        .default("shaded"),
-      size: z.number().int().min(64).max(2048).default(720),
+        .default("shaded")
+        .describe("render channel ('diagnostic' highlights open/non-manifold edges)"),
+      size: z.number().int().min(64).max(2048).default(720).describe("image size in px"),
       quality: z
         .enum(["coarse", "medium", "fine"])
         .default("medium")
@@ -140,16 +137,14 @@ export function registerPerceptionTools(server: McpServer) {
 
   server.tool(
     "verify_part",
-    "EXPLICIT FULL CERTIFICATE — the expensive checks the ambient verdict " +
-      "skips: brep_valid + watertight + manifold + self-intersection-free + " +
-      "construction/tessellation/mesh-quality. The authoritative 'is this a " +
-      "real closed solid' answer; display-mesh edge counts are reported " +
-      "separately (T-junctions are render quality, not a defect). ALWAYS call " +
-      "after a boolean or multi-feature build. Returns the diagnostic image " +
-      "(red=open, magenta=non-manifold).",
+    "EXPLICIT FULL CERTIFICATE — the expensive checks the ambient verdict skips: " +
+      "brep_valid + watertight + manifold + self-intersection-free + " +
+      "construction/tessellation/mesh-quality. The authoritative 'is this a real " +
+      "closed solid' answer. ALWAYS call after a boolean or multi-feature build. " +
+      "Returns a diagnostic image (red=open, magenta=non-manifold).",
     {
-      part_id: z.number().int().describe("kernel part id from list_parts"),
-      view: z.enum(["iso", "front", "top", "right"]).default("iso"),
+      part_id: z.number().int().describe("part id (list_parts)"),
+      view: z.enum(["iso", "front", "top", "right"]).default("iso").describe("camera view for the diagnostic image"),
     },
     async ({ part_id, view }) => {
       try {
@@ -218,8 +213,7 @@ export function registerPerceptionTools(server: McpServer) {
   server.tool(
     "get_pointer",
     "What is the HUMAN pointing at in the viewport? Returns their latest click " +
-      "(object, face_id, world position) joined with the kernel's hover report. " +
-      "Grounds 'this face / this hole / here'.",
+      "(object, face_id, world position) + hover report. Grounds 'this face / here'.",
     {},
     async () => {
       try {
@@ -235,13 +229,18 @@ export function registerPerceptionTools(server: McpServer) {
 
   server.tool(
     "section_view",
-    "CUTAWAY: slice a part with a plane (point `p` + `normal`) and return the " +
-      "cross-section image + section area. The way to SEE a hollow interior, " +
-      "wall thickness, bores.",
+    "CUTAWAY: slice a part with a plane (point `p` + `normal`); returns the " +
+      "cross-section image + section area. SEE a hollow interior, wall thickness, bores.",
     {
-      part_id: z.number().int(),
-      p: z.tuple([z.number(), z.number(), z.number()]).default([0, 0, 0]),
-      normal: z.tuple([z.number(), z.number(), z.number()]).default([1, 0, 0]),
+      part_id: z.number().int().describe("part id (list_parts)"),
+      p: z
+        .array(z.number()).length(3)
+        .default([0, 0, 0])
+        .describe("a point on the cutting plane [x,y,z] mm"),
+      normal: z
+        .array(z.number()).length(3)
+        .default([1, 0, 0])
+        .describe("the cutting-plane normal [x,y,z]"),
     },
     async ({ part_id, p, normal }) => {
       try {
@@ -265,12 +264,10 @@ export function registerPerceptionTools(server: McpServer) {
   server.tool(
     "dimension_part",
     "DIMENSION a part in one call: a 2×2 multi-view image with leader+label " +
-      "callouts AND the structured table (id, kind, value, face ids, 3D " +
-      "anchor). Includes POSITION rows — each bore/boss axis's X/Y offsets " +
-      "from a NAMED datum (part corner by default), the dims a machinist " +
-      "locates holes with. Values read off analytic surfaces, never pixels. " +
-      "Labels follow the document unit (see document_units).",
-    { part_id: z.number().int().describe("kernel part id from list_parts") },
+      "callouts AND a structured table (id, kind, value, face ids, 3D anchor), " +
+      "including POSITION rows (each bore/boss axis's X/Y offsets from a NAMED " +
+      "datum). Values off analytic surfaces, never pixels. Labels follow document_units.",
+    { part_id: z.number().int().describe("part id (list_parts)") },
     async ({ part_id }) => {
       try {
         const r = await api("GET", `/api/agent/parts/${part_id}/dimensions`);
@@ -322,15 +319,11 @@ export function registerPerceptionTools(server: McpServer) {
 
   server.tool(
     "measure_faces",
-    "MEASURE the exact relation between two faces (or inspect one): " +
-      "plane‖plane → distance, planes at an angle → dihedral (outward-normal " +
-      "convention, 0–180°), parallel cylinder axes → center distance (bolt " +
-      "circles), cylinder axis ⟂ plane → axis-to-plane distance, single " +
-      "cylindrical face → Ø, single plane → area+normal. Kernel-exact; " +
-      "REFUSES with a reason when faces don't admit the relation (skew axes, " +
-      "footpoint outside the face's trimmed boundary, consumed face) — never " +
-      "a guessed number. Face ids from select_face / render 'ids' legend. " +
-      "Labels follow the document unit (see document_units).",
+    "MEASURE the exact relation of two faces (or inspect one): plane‖plane → " +
+      "distance; angled planes → dihedral (0–180°); parallel cylinder axes → " +
+      "centre distance (bolt circles); axis ⟂ plane → axis-to-plane distance; " +
+      "one cylinder → Ø; one plane → area+normal. Kernel-exact; REFUSES on " +
+      "skew/consumed faces. Face ids from select_face / render 'ids'.",
     {
       part_a: z.number().int().describe("kernel part id of the first face's solid"),
       face_a: z.number().int().describe("first face id"),
@@ -375,10 +368,9 @@ export function registerPerceptionTools(server: McpServer) {
 
   server.tool(
     "part_coverage",
-    "COVERAGE honesty: which faces the 4 standard views actually SHOW vs leave " +
-      "unseen — so you know when to request another camera angle instead of " +
-      "assuming you saw the whole part.",
-    { part_id: z.number().int().describe("kernel part id from list_parts") },
+    "COVERAGE honesty: which faces the 4 standard views SHOW vs leave unseen — " +
+      "so you know when to request another camera angle.",
+    { part_id: z.number().int().describe("part id (list_parts)") },
     async ({ part_id }) => {
       try {
         return ok(await api("GET", `/api/agent/parts/${part_id}/coverage`));

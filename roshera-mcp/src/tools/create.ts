@@ -17,12 +17,15 @@ import {
 export function registerCreateTools(server: McpServer) {
   server.tool(
     "create_sketch",
-    "Start a sketch session on a plane. Returns sketch_id for the shape/" +
-      "point/extrude tools. Prefer the composite tools (create_box / " +
-      "create_cylinder) when they fit — fewer round trips.",
+    "Start a click-draft sketch session on a plane; returns sketch_id for " +
+      "sketch_points/sketch_add_shape/sketch_extrude. Prefer create_box / " +
+      "create_cylinder when they fit (fewer round trips); prefer psketch_* for " +
+      "constraint-exact geometry.",
     {
       plane: PlaneSchema,
-      tool: z.enum(["rectangle", "circle", "polyline"]),
+      tool: z
+        .enum(["rectangle", "circle", "polyline"])
+        .describe("first shape's kind"),
     },
     async ({ plane, tool }) => {
       try {
@@ -36,12 +39,14 @@ export function registerCreateTools(server: McpServer) {
 
   server.tool(
     "sketch_add_shape",
-    "Add another shape to an existing sketch (e.g. hole circles inside an " +
-      "outer boundary — region detection assigns outer/hole roles at extrude " +
-      "time). Returns the new shape_index.",
+    "Add another shape to an existing sketch (e.g. hole circles inside an outer " +
+      "boundary — outer/hole roles are assigned at extrude time). Returns the " +
+      "new shape_index.",
     {
-      sketch_id: z.string(),
-      tool: z.enum(["rectangle", "circle", "polyline"]),
+      sketch_id: z.string().describe("sketch_id from create_sketch"),
+      tool: z
+        .enum(["rectangle", "circle", "polyline"])
+        .describe("shape kind to add"),
     },
     async ({ sketch_id, tool }) => {
       try {
@@ -55,13 +60,21 @@ export function registerCreateTools(server: McpServer) {
 
   server.tool(
     "sketch_points",
-    "BATCH-add points to a sketch shape in one call (rectangle: 2 corners; " +
-      "circle: center then a radius point; polyline: every vertex of the " +
-      "closed polygon). shape_index omitted = the first shape.",
+    "BATCH-add plane-local points to a sketch shape in one call.",
     {
-      sketch_id: z.string(),
-      points: z.array(z.tuple([z.number(), z.number()])).min(1),
-      shape_index: z.number().int().optional(),
+      sketch_id: z.string().describe("sketch_id from create_sketch"),
+      points: z
+        .array(z.array(z.number()).length(2))
+        .min(1)
+        .describe(
+          "plane-local [u,v] points (mm). rectangle: 2 opposite corners; " +
+            "circle: center then a rim point; polyline: every vertex of the closed polygon",
+        ),
+      shape_index: z
+        .number()
+        .int()
+        .optional()
+        .describe("target shape (from sketch_add_shape); omit = first shape"),
     },
     async ({ sketch_id, points, shape_index }) => {
       try {
@@ -81,12 +94,15 @@ export function registerCreateTools(server: McpServer) {
 
   server.tool(
     "sketch_extrude",
-    "Extrude the sketch into a solid. Multi-shape sketches get region " +
-      "detection (outer boundary + holes). Returns the new part id + placement.",
+    "Extrude the sketch into a solid along the plane normal. Multi-shape " +
+      "sketches get region detection (outer boundary + holes). Returns the new " +
+      "part id + placement.",
     {
-      sketch_id: z.string(),
-      distance: z.number(),
-      name: z.string().optional(),
+      sketch_id: z.string().describe("sketch_id from create_sketch"),
+      distance: z
+        .number()
+        .describe("extrusion length (mm) along the plane normal; sign sets direction"),
+      name: z.string().optional().describe("display name"),
     },
     async ({ sketch_id, distance, name }) => {
       try {
@@ -104,10 +120,15 @@ export function registerCreateTools(server: McpServer) {
 
   server.tool(
     "plane_from_face",
-    "Derive a sketch plane FROM an existing planar face ('sketch on this " +
-      "face'). object_id = the part's public UUID; face_id from get_pointer or " +
-      "render legend. Returns {origin, u_axis, v_axis}.",
-    { object_id: z.string().uuid(), face_id: z.number().int() },
+    "Derive a sketch plane FROM an existing planar face ('sketch on this face'). " +
+      "Returns {origin, u_axis, v_axis} to pass as a `plane` to create_*/create_sketch.",
+    {
+      object_id: z.string().uuid().describe("the part's public object UUID"),
+      face_id: z
+        .number()
+        .int()
+        .describe("planar face id from get_pointer or a render 'ids' legend"),
+    },
     async ({ object_id, face_id }) => {
       try {
         return ok(
@@ -123,25 +144,22 @@ export function registerCreateTools(server: McpServer) {
     "create_box",
     {
       description:
-        "ONE-CALL analytic box: width × depth extruded by height. Base centre " +
-        "is `center` [x,y,z] when given (any world point), else (cx, cy) on the " +
-        "named `plane`. Orientation follows the plane; height is along the " +
-        "plane normal. Returns part id + placement.",
+        "ONE-CALL analytic box: `width`×`depth` on the plane, extruded `height` " +
+        "along +normal. The box BASE sits at the base-centre; it is NOT centred " +
+        "on the base point. Returns part id + placement.",
       inputSchema: z
         .object({
-          plane: PlaneSchema.default("xy"),
-          cx: z.number().default(0),
-          cy: z.number().default(0),
+          plane: PlaneSchema.default("xy").describe("orientation: width→u, depth→v, height→u×v"),
+          cx: z.number().default(0).describe("base-centre u offset (mm)"),
+          cy: z.number().default(0).describe("base-centre v offset (mm)"),
           center: z
-            .tuple([z.number(), z.number(), z.number()])
+            .array(z.number()).length(3)
             .optional()
-            .describe(
-              "explicit world base-centre [x,y,z]; overrides plane+cx+cy",
-            ),
-          width: z.number().positive(),
-          depth: z.number().positive(),
-          height: z.number(),
-          name: z.string().optional(),
+            .describe("explicit world base-centre [x,y,z] mm; overrides plane+cx+cy"),
+          width: z.number().positive().describe("size along u (mm)"),
+          depth: z.number().positive().describe("size along v (mm)"),
+          height: z.number().describe("extrusion along normal (mm)"),
+          name: z.string().optional().describe("display name"),
         })
         .strict(),
     },
@@ -180,28 +198,25 @@ export function registerCreateTools(server: McpServer) {
     "create_cylinder",
     {
       description:
-        "ONE-CALL analytic cylinder with one smooth lateral face. Base centre " +
-        "is `center` [x,y,z] when given (any world point), else (cx, cy) on the " +
-        "named `plane`. `axis` sets the extrusion direction (default = plane " +
-        "normal). Returns part id + placement.",
+        "ONE-CALL analytic cylinder with one smooth lateral face. Its BASE-face " +
+        "centre sits at `center` (or cx,cy on the plane); it extrudes `height` " +
+        "along +`axis`, NOT centred on the base point. Returns part id + placement.",
       inputSchema: z
         .object({
-          plane: PlaneSchema.default("xy"),
-          cx: z.number().default(0),
-          cy: z.number().default(0),
+          plane: PlaneSchema.default("xy").describe("orientation when center/axis omitted"),
+          cx: z.number().default(0).describe("base-centre u offset (mm)"),
+          cy: z.number().default(0).describe("base-centre v offset (mm)"),
           center: z
-            .tuple([z.number(), z.number(), z.number()])
+            .array(z.number()).length(3)
             .optional()
-            .describe(
-              "explicit world base-centre [x,y,z]; overrides plane+cx+cy",
-            ),
+            .describe("explicit world base-centre [x,y,z] mm; overrides plane+cx+cy"),
           axis: z
-            .tuple([z.number(), z.number(), z.number()])
+            .array(z.number()).length(3)
             .optional()
-            .describe("extrusion axis [x,y,z]; defaults to the plane normal"),
-          radius: z.number().positive(),
-          height: z.number(),
-          name: z.string().optional(),
+            .describe("extrusion direction [x,y,z]; default = plane normal"),
+          radius: z.number().positive().describe("radius (mm)"),
+          height: z.number().describe("extrusion length along +axis (mm)"),
+          name: z.string().optional().describe("display name"),
         })
         .strict(),
     },
@@ -237,16 +252,22 @@ export function registerCreateTools(server: McpServer) {
 
   server.tool(
     "create_cone",
-    "ONE-CALL analytic cone or frustum. base_radius at `center`; top_radius " +
-      "(default 0 = apex) at center+axis*height. True smooth cone surface. " +
-      "Returns part id + placement.",
+    "ONE-CALL analytic cone or frustum with a true smooth cone surface. " +
+      "`base_radius` sits at `center`; `top_radius` (0 = sharp apex) at " +
+      "center+axis·height. Returns part id + placement.",
     {
-      center: z.tuple([z.number(), z.number(), z.number()]).default([0, 0, 0]),
-      axis: z.tuple([z.number(), z.number(), z.number()]).default([0, 0, 1]),
-      base_radius: z.number().nonnegative(),
-      top_radius: z.number().nonnegative().default(0),
-      height: z.number().positive(),
-      name: z.string().optional(),
+      center: z
+        .array(z.number()).length(3)
+        .default([0, 0, 0])
+        .describe("world base-face centre [x,y,z] mm"),
+      axis: z
+        .array(z.number()).length(3)
+        .default([0, 0, 1])
+        .describe("apex direction [x,y,z]"),
+      base_radius: z.number().nonnegative().describe("base radius (mm)"),
+      top_radius: z.number().nonnegative().default(0).describe("top radius (mm); 0 = apex"),
+      height: z.number().positive().describe("base-to-top along axis (mm)"),
+      name: z.string().optional().describe("display name"),
     },
     async ({ center, axis, base_radius, top_radius, height, name }) => {
       try {
@@ -277,16 +298,15 @@ export function registerCreateTools(server: McpServer) {
     "create_sphere",
     {
       description:
-        "ONE-CALL analytic sphere of `radius`, centred at `center` [x,y,z] " +
-        "(default origin). Returns part id + placement.",
+        "ONE-CALL analytic sphere of `radius` at `center`. Returns part id + placement.",
       inputSchema: z
         .object({
-          radius: z.number().positive(),
+          radius: z.number().positive().describe("sphere radius (mm)"),
           center: z
-            .tuple([z.number(), z.number(), z.number()])
+            .array(z.number()).length(3)
             .optional()
-            .describe("world centre [x,y,z]; defaults to the origin"),
-          name: z.string().optional(),
+            .describe("world centre [x,y,z] mm; defaults to the origin"),
+          name: z.string().optional().describe("display name"),
         })
         .strict(),
     },
@@ -316,86 +336,73 @@ export function registerCreateTools(server: McpServer) {
 
   server.tool(
     "revolve",
-    "SOLID OF REVOLUTION from a closed [r,z] meridian profile — the primitive " +
-      "for any axisymmetric part (nozzles, vessels, a rocket engine in one " +
-      "op). Revolved about the axis (default +Z, 360°); one op, watertight. " +
-      "Profile must be a simple loop, all r ≥ 0, not crossing the axis. Hollow " +
-      "part = trace the wall cross-section. PREFER `profile_segments` (typed " +
-      "line/arc/nurbs segments) for nozzles/vessels: each segment becomes its " +
-      "EXACT surface — line → cylinder/cone/plane, arc → torus/sphere, nurbs " +
-      "spline → one smooth revolved wall — distinct exact faces in one op, no " +
-      "faceting, no booleans. Typed segments are full-360° only and exclusive " +
-      "with profile/smooth/bore_radius/wall_thickness.",
+    "Solid of revolution from a closed [r,z] meridian (mm) about an axis — " +
+      "axisymmetric parts (nozzles, vessels) watertight in one op. Give ONE of " +
+      "`profile` (sampled polyline) or `profile_segments` (typed line/arc/nurbs, " +
+      "each revolved to an EXACT surface — the right mode for nozzles/vessels). " +
+      "Loop must be simple, r≥0, not crossing the axis; hollow = trace the wall " +
+      "section. smooth/bore_radius/wall_thickness apply to `profile` only.",
     {
       profile: z
-        .array(z.tuple([z.number(), z.number()]))
+        .array(z.array(z.number()).length(2))
         .min(3)
         .optional()
-        .describe(
-          "closed [r,z] meridian profile, chord-sampled (auto-closes " +
-            "last→first); give exactly one of profile | profile_segments",
-        ),
+        .describe("closed [r,z] meridian (mm); r=from axis, z=along axis; auto-closes"),
       profile_segments: z
         .array(
           z.discriminatedUnion("type", [
             z.object({
               type: z.literal("line"),
-              start: z.tuple([z.number(), z.number()]),
-              end: z.tuple([z.number(), z.number()]),
+              start: z.array(z.number()).length(2).describe("[r,z] mm"),
+              end: z.array(z.number()).length(2).describe("[r,z] mm"),
             }),
             z.object({
               type: z.literal("arc"),
-              center: z.tuple([z.number(), z.number()]),
-              radius: z.number().positive(),
-              start_angle: z.number().describe("radians, from +r toward +z"),
-              end_angle: z.number(),
-              ccw: z.boolean().describe("sweep direction start_angle → end_angle"),
+              center: z.array(z.number()).length(2).describe("centre [r,z] mm"),
+              radius: z.number().positive().describe("mm"),
+              start_angle: z.number().describe("radians (+r→+z)"),
+              end_angle: z.number().describe("radians (+r→+z)"),
+              ccw: z.boolean().describe("sweep start→end sense"),
             }),
             z.object({
               type: z.literal("nurbs"),
-              degree: z.number().int().min(1).max(7),
-              control_points: z.array(z.tuple([z.number(), z.number()])).min(2),
-              weights: z.array(z.number()).optional(),
-              knots: z.array(z.number()),
+              degree: z.number().int().min(1).max(7).describe("degree"),
+              control_points: z
+                .array(z.array(z.number()).length(2))
+                .min(2)
+                .describe("[r,z] CPs mm"),
+              weights: z.array(z.number()).optional().describe("rational weights, one per CP"),
+              knots: z.array(z.number()).describe("knot vector (CPs+degree+1)"),
             }),
           ]),
         )
         .min(1)
         .optional()
         .describe(
-          "TYPED [r,z] meridian segments in loop order (auto-closes with a " +
-            "line): exact per-segment surfaces — vertical line → cylinder, " +
-            "sloped → cone, horizontal → planar cap, arc → exact torus " +
-            "(off-axis) or sphere (on-axis center), nurbs → one smooth " +
-            "revolved wall. The right mode for nozzles/pressure vessels " +
-            "(chamber cylinder + converging cone + throat arcs + bell " +
-            "spline in ONE part). Full-360° only; on-axis/spindle arcs and " +
-            "circles crossing the axis are refused with a typed error.",
+          "typed [r,z] segments in loop order (auto-closes): line→cylinder/cone/" +
+            "cap, arc→torus/sphere, nurbs→smooth wall. Full-360° ONLY; exclusive " +
+            "with profile/smooth/bore_radius/wall_thickness",
         ),
-      axis_origin: z.tuple([z.number(), z.number(), z.number()]).default([0, 0, 0]),
-      axis_direction: z.tuple([z.number(), z.number(), z.number()]).default([0, 0, 1]),
-      angle_deg: z.number().default(360),
-      segments: z.number().int().min(3).max(512).default(96),
+      axis_origin: z
+        .array(z.number()).length(3)
+        .default([0, 0, 0])
+        .describe("point on the axis [x,y,z] mm"),
+      axis_direction: z
+        .array(z.number()).length(3)
+        .default([0, 0, 1])
+        .describe("axis direction [x,y,z]"),
+      angle_deg: z.number().default(360).describe("sweep degrees (profile_segments must be 360)"),
+      segments: z.number().int().min(3).max(512).default(96).describe("angular tessellation count"),
       smooth: z
         .boolean()
         .optional()
-        .describe(
-          "fit a SMOOTH NURBS curve through `profile` (the outer wall) so the " +
-            "revolved wall is ONE surface — needs bore_radius",
-        ),
-      bore_radius: z
-        .number()
-        .optional()
-        .describe("hollow bore radius for a smooth-walled tube (with smooth=true)"),
+        .describe("`profile` mode: fit a smooth NURBS wall (needs bore_radius)"),
+      bore_radius: z.number().optional().describe("hollow bore radius (mm) for smooth=true"),
       wall_thickness: z
         .number()
         .optional()
-        .describe(
-          "CONTOURED nozzle/vessel (e.g. a Rao bell): `profile` is the INNER flow " +
-            "contour, outer wall offset by this thickness — both walls ONE smooth " +
-            "SurfaceOfRevolution",
-        ),
-      name: z.string().optional(),
+        .describe("contoured mode: `profile` = inner contour, outer offset by this (mm)"),
+      name: z.string().optional().describe("display name"),
     },
     async ({
       profile,
@@ -444,17 +451,31 @@ export function registerCreateTools(server: McpServer) {
     "nurbs_loft",
     "Watertight FREEFORM SOLID: skin one NURBS surface through a stack of " +
       "cross-section rings — for organic shapes revolve/extrude can't make " +
-      "(bulged barrels, ogives, lobed transitions). `sections` = ordered open " +
-      "rings of [x,y,z] points, SAME count each (auto-closed); first and last " +
-      "must be planar (they become caps). degree_v=3 gives G2 along the loft.",
+      "(bulged barrels, ogives, lobed transitions). First and last rings become " +
+      "planar caps.",
     {
       sections: z
-        .array(z.array(z.tuple([z.number(), z.number(), z.number()])).min(3))
+        .array(z.array(z.array(z.number()).length(3)).min(3))
         .min(2)
-        .describe("stack of cross-section rings (each open, equal point count)"),
-      degree_u: z.number().int().min(1).max(7).default(3).describe("degree around the section"),
-      degree_v: z.number().int().min(1).max(7).default(3).describe("degree along the loft (3 = G2)"),
-      name: z.string().optional(),
+        .describe(
+          "ordered stack of OPEN cross-section rings of [x,y,z] points (mm), " +
+            "SAME count each (auto-closed); first/last must be planar (caps)",
+        ),
+      degree_u: z
+        .number()
+        .int()
+        .min(1)
+        .max(7)
+        .default(3)
+        .describe("NURBS degree around each section"),
+      degree_v: z
+        .number()
+        .int()
+        .min(1)
+        .max(7)
+        .default(3)
+        .describe("NURBS degree along the loft (3 = G2 continuity)"),
+      name: z.string().optional().describe("display name"),
     },
     async ({ sections, degree_u, degree_v, name }) => {
       try {

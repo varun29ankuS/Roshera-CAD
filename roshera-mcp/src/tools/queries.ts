@@ -7,14 +7,13 @@ import { api, ok, fail } from "../core.js";
 export function registerQueryTools(server: McpServer) {
   server.tool(
     "point_query",
-    "PROBE a world point against a part: SIGNED DISTANCE (negative inside, " +
-      "positive outside), inside/outside/on classification, nearest boundary " +
-      "face + exact closest point. Exact-analytic, never a mesh lookup — a " +
+    "PROBE a world point vs a part: SIGNED DISTANCE (− inside, + outside), " +
+      "inside/outside/on, nearest face + exact closest point. Exact-analytic — a " +
       "point in a through-hole reads OUTSIDE.",
     {
-      part_id: z.number().int().describe("kernel part id from list_parts"),
+      part_id: z.number().int().describe("part id (list_parts)"),
       point: z
-        .tuple([z.number(), z.number(), z.number()])
+        .array(z.number()).length(3)
         .describe("world-space query point [x, y, z]"),
     },
     async ({ part_id, point }) => {
@@ -30,16 +29,17 @@ export function registerQueryTools(server: McpServer) {
 
   server.tool(
     "ray_query",
-    "CAST a ray through a part: ORDERED face crossings (face id, exact hit " +
-      "point, oriented normal, distance), near→far. Exact analytic surface " +
-      "intersections clipped to real trim loops — never a mesh approximation. " +
-      "Two crossings of a wall = its thickness; empty hits = missed.",
+    "CAST a ray through a part: ORDERED face crossings (id, exact hit point, " +
+      "oriented normal, distance), near→far. Exact analytic, clipped to real " +
+      "trim loops. Two crossings of a wall = its thickness; empty = missed.",
     {
-      part_id: z.number().int().describe("kernel part id from list_parts"),
-      origin: z.tuple([z.number(), z.number(), z.number()]),
+      part_id: z.number().int().describe("part id (list_parts)"),
+      origin: z
+        .array(z.number()).length(3)
+        .describe("ray start point [x,y,z] mm (world)"),
       direction: z
-        .tuple([z.number(), z.number(), z.number()])
-        .describe("need not be unit length"),
+        .array(z.number()).length(3)
+        .describe("ray direction [x,y,z]; need not be unit length"),
     },
     async ({ part_id, origin, direction }) => {
       try {
@@ -57,14 +57,15 @@ export function registerQueryTools(server: McpServer) {
 
   server.tool(
     "region_query",
-    "ASK 'what is in here?': a BOX (center + half_extents) or SPHERE (center + " +
-      "radius) region returns which parts/faces meet it and whether it is " +
-      "EMPTY. Omit part_id to scan the whole scene (clearance-envelope check). " +
-      "Face extents are exact trim-curve envelopes; box wins if both given.",
+    "ASK 'what is in here?': a BOX (center+half_extents) or SPHERE " +
+      "(center+radius) returns which parts/faces meet it and whether EMPTY. Omit " +
+      "part_id to scan the whole scene; box wins if both given.",
     {
-      center: z.tuple([z.number(), z.number(), z.number()]),
+      center: z
+        .array(z.number()).length(3)
+        .describe("region centre [x,y,z] mm (world)"),
       half_extents: z
-        .tuple([z.number(), z.number(), z.number()])
+        .array(z.number()).length(3)
         .optional()
         .describe("box half-extents — supply for a BOX region"),
       radius: z

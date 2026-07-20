@@ -27,14 +27,11 @@ function refusalOrFail(e: unknown) {
 export function registerTimelineTools(server: McpServer) {
   server.tool(
     "timeline_mould",
-    "Edit a recorded parameter and re-derive the model (#64 parametric DAG). " +
-      "The edit is APPENDED as a `param.mould` override event and the branch " +
-      "is full-replayed with it folded in — the original event is never " +
-      "mutated (append-only). Downstream features re-derive; PID references " +
-      "survive a dimensional edit. An edit that breaks a downstream feature is " +
-      "REFUSED with a typed verdict (never a silent bad model). Target by " +
-      "`target_event_id`+`parameter` (raw key like 'radius'/'width'), or by a " +
-      "stable `name` bound via bind_parameter_name.",
+    "Edit a recorded parameter and re-derive the model (#64 parametric DAG). The " +
+      "edit is APPENDED as a param.mould override; the branch re-derives (append-" +
+      "only; PIDs survive). An edit that breaks a downstream feature is REFUSED " +
+      "with a typed verdict. Target by target_event_id+parameter, or a `name` " +
+      "bound via bind_parameter_name.",
     {
       value: z.number().describe("the new dimensional value"),
       target_event_id: z
@@ -49,7 +46,7 @@ export function registerTimelineTools(server: McpServer) {
         .string()
         .optional()
         .describe("stable parameter name to target (see bind_parameter_name)"),
-      branch: z.string().default("main"),
+      branch: z.string().default("main").describe("timeline branch id ('main' = trunk)"),
     },
     async ({ value, target_event_id, parameter, name, branch }) => {
       try {
@@ -74,15 +71,14 @@ export function registerTimelineTools(server: McpServer) {
 
   server.tool(
     "bind_parameter_name",
-    "Bind a stable, agent-friendly NAME to a recorded (event, parameter) so a " +
-      "mould can target it by name (#64 Slice 3). Appended `param.name` event " +
-      "(append-only, latest-binding-wins). The parameter must be a numeric " +
-      "dimension of the target event, else the bind is refused.",
+    "Bind a stable NAME to a recorded (event, parameter) so a mould can target " +
+      "it by name. Appended, latest-binding-wins. The parameter must be a " +
+      "numeric dimension of the target event, else refused.",
     {
       name: z.string().describe("the name to bind, e.g. 'bore_diameter'"),
       target_event_id: z.string().describe("event UUID whose parameter to name"),
       parameter: z.string().describe("raw numeric parameter key, e.g. 'radius'"),
-      branch: z.string().default("main"),
+      branch: z.string().default("main").describe("timeline branch id ('main' = trunk)"),
     },
     async ({ name, target_event_id, parameter, branch }) => {
       try {
@@ -101,13 +97,10 @@ export function registerTimelineTools(server: McpServer) {
 
   server.tool(
     "rebuild_certificate",
-    "The honest per-feature rebuild certificate for a branch's CURRENT state " +
-      "(#64 Slice 5). For every feature: Rebuilt / Unaffected / Failed{reason} / " +
-      "Dangling{entity} (a reference that no longer resolves) / Blocked{by} " +
-      "(downstream of a break), plus the dirty sequences and a re-measured " +
-      "`is_sound` recomputed from the B-Rep (never asserted). Use after a mould " +
-      "to see exactly what the edit did to every dependent.",
-    { branch: z.string().default("main") },
+    "Per-feature rebuild certificate for a branch's CURRENT state: each feature " +
+      "Rebuilt / Unaffected / Failed / Dangling / Blocked, plus dirty sequences " +
+      "and a re-measured `is_sound`. Use after a mould to see what the edit did.",
+    { branch: z.string().default("main").describe("timeline branch id ('main' = trunk)") },
     async ({ branch }) => {
       try {
         const r = await api(
@@ -125,7 +118,10 @@ export function registerTimelineTools(server: McpServer) {
     "timeline_scrub",
     "Look at the scene AS OF a past event — non-destructive (live scene " +
       "untouched). Returns object count + mesh stats at that moment.",
-    { branch: z.string().default("main"), sequence: z.number().int() },
+    {
+      branch: z.string().default("main").describe("timeline branch id ('main' = trunk)"),
+      sequence: z.number().int().describe("event sequence number to view the scene as-of"),
+    },
     async ({ branch, sequence }) => {
       try {
         const r = await api("GET", `/api/timeline/scrub/${branch}/${sequence}`);
@@ -147,10 +143,9 @@ export function registerTimelineTools(server: McpServer) {
 
   server.tool(
     "clear_timeline",
-    "Reset a timeline branch to ZERO events and wipe the live model to match " +
-      "— DESTRUCTIVE and irreversible (the event ledger is rewritten, not " +
-      "undoable). Use clear_parts instead for an empty scene with preserved " +
-      "history.",
+    "Reset a branch to ZERO events and wipe the live model — DESTRUCTIVE and " +
+      "irreversible (the ledger is rewritten). Use clear_parts instead for an " +
+      "empty scene with preserved history.",
     {
       branch_id: z
         .string()
