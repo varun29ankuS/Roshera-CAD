@@ -1,0 +1,461 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>The Certificate — Roshera</title>
+<meta name="description" content="Anatomy of a validity certificate: nine conjuncts, what is deliberately excluded, how each invariant is actually computed, and where each check is narrower than its name.">
+<link rel="icon" href="logo.png">
+<link rel="stylesheet" href="site.css">
+</head>
+<body>
+
+<header class="titleblock">
+  <div class="tb">
+    <p class="tb-name"><a href="index.html"><img src="logo.png" alt="" width="30" height="30">Roshera</a></p>
+    <nav class="tb-nav">
+      <a href="index.html">The Claim</a>
+      <a href="certificate.html" aria-current="page">The Certificate</a>
+      <a href="casebook.html">Casebook</a>
+      <a href="envelope.html">Envelope</a>
+    </nav>
+    <div class="tb-meta">
+      <span><b>Sheet</b> 02</span>
+      <span><b>Scope</b> soundness</span>
+    </div>
+  </div>
+</header>
+
+<div class="sheet">
+
+  <!-- ===== opening ===== -->
+  <section class="plate">
+    <div class="grid">
+      <div class="col">
+        <p class="eyebrow">Sheet 02 — anatomy</p>
+        <h1>Nine things must be true.<br><em>The tenth is that nobody may assert them.</em></h1>
+        <p class="lede">A certificate is worth exactly as much as the thing that computes it. If a
+        caller can write <code>sound: true</code> into a field, the field is marketing. So the
+        kernel's certificate is a <strong>computed verdict</strong>, and the struct that carries it
+        says so on its first line.</p>
+
+        <figure style="margin-top:1.8rem">
+          <pre>/// The kernel's COMPUTED verdict on a solid — never written by the caller.
+/// `is_sound()` is the honest "this is a real, closed, manufacturable solid"
+/// gate: a valid B-Rep that is watertight and manifold.</pre>
+          <figcaption><span>provenance.rs:504</span><span>ValidityCertificate</span></figcaption>
+        </figure>
+
+        <p class="drop">Soundness is a conjunction of nine independent predicates. That choice is
+        the whole design. An OR, or a score, or a weighted heuristic would let a part pass while
+        carrying a defect that one of the checks could see perfectly well — and the entire value of
+        the certificate is that it cannot be talked around.</p>
+
+        <p>Each conjunct exists because it catches a defect class the others structurally cannot.
+        This is not asserted in the abstract; it is documented field by field, at the field.</p>
+
+        <figure>
+          <pre>pub fn is_sound(&amp;self) -&gt; bool {
+    self.brep_valid
+        &amp;&amp; self.watertight
+        &amp;&amp; self.manifold
+        &amp;&amp; self.oriented
+        &amp;&amp; self.self_intersection_free
+        &amp;&amp; self.construction_consistent.is_sound()
+        &amp;&amp; self.eyes_consistent.is_sound()
+        &amp;&amp; self.tessellation.clean
+        &amp;&amp; self.mesh_quality.clean
+}</pre>
+          <figcaption><span>provenance.rs:573</span><span>verbatim</span></figcaption>
+        </figure>
+      </div>
+
+      <div class="margin">
+        <div class="note">
+          <b>Note 1 — why nine and not three</b>
+          A mesh can close (no boundary edges) and be manifold (no three-way edges) and still have
+          two triangles winding the same way across a shared edge. Watertight cannot see it.
+          Manifold cannot see it. Only <code>oriented</code> can. Every conjunct earns its place by
+          being the sole witness to some failure.
+        </div>
+
+        <figure class="dwg" style="margin-top:1.6rem">
+          <svg viewBox="0 0 360 300" role="img" aria-label="Diagram: nine invariants feeding a single AND gate">
+            <g class="dim" fill="var(--ink-3)" font-size="10">
+              <text x="4" y="26">brep_valid</text>
+              <text x="4" y="52">watertight</text>
+              <text x="4" y="78">manifold</text>
+              <text x="4" y="104">oriented</text>
+              <text x="4" y="130">self_intersection_free</text>
+              <text x="4" y="156">construction_consistent</text>
+              <text x="4" y="182">eyes_consistent</text>
+              <text x="4" y="208">tessellation.clean</text>
+              <text x="4" y="234">mesh_quality.clean</text>
+            </g>
+            <g stroke="var(--blue)" stroke-width="1.1" fill="none">
+              <path d="M140,22 H196 M140,48 H196 M140,74 H196 M140,100 H196 M140,126 H196
+                       M140,152 H196 M140,178 H196 M140,204 H196 M140,230 H196"/>
+              <!-- AND gate body -->
+              <path d="M200,10 V242 H236 A46,116 0 0 0 236,10 Z" fill="var(--blue-wash)" stroke-width="1.6"/>
+              <path d="M282,126 H304"/>
+            </g>
+            <text class="lbl" x="228" y="130" text-anchor="middle" fill="var(--ink-2)">AND</text>
+            <text class="dim" x="310" y="123" fill="var(--ok)">sound</text>
+            <g stroke="var(--ink-3)" stroke-width=".8" stroke-dasharray="3 3">
+              <path d="M166,262 H200"/>
+            </g>
+            <text class="dim" x="4" y="266">euler · counts · labels · debris</text>
+            <text class="dim" x="206" y="266" fill="var(--ink-3)">reported</text>
+          </svg>
+          <figcaption><span>Soundness gate</span><span>9 conjuncts</span></figcaption>
+        </figure>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== what is excluded ===== -->
+  <section class="plate">
+    <div class="grid wide">
+      <div class="margin">
+        <div class="note hold">
+          <b>Note 2 — the exclusion that took a bug to find</b>
+          Before <code>model_debris_orphan_faces</code> existed, orphan faces left behind by a broken
+          boolean carried <code>solid_id: None</code>, and their boundary-edge errors leaked into
+          <em>every</em> part's <code>brep_valid</code> verdict. One bad operation could make an
+          untouched part report unsound. The fix was to attribute debris at model scope — visible,
+          loud, and not charged to a part that did nothing wrong.
+        </div>
+        <figure>
+          <pre>/// A label is an ANNOTATION, not a geometric
+/// feature, so an `Inconsistent` verdict does
+/// NOT affect `is_sound()` — it is its own
+/// honest flag the agent/frontend can surface
+/// (stale labels rendered amber).</pre>
+          <figcaption><span>provenance.rs:539</span><span>labels_consistent</span></figcaption>
+        </figure>
+      </div>
+
+      <div class="col">
+        <p class="eyebrow">The discipline of exclusion</p>
+        <h2>What is reported but never gated</h2>
+        <p>A certificate that gates on everything it measures is as dishonest as one that gates on
+        nothing — it fails parts for reasons that are not defects, and the people receiving it
+        learn to ignore it. Five things are measured and deliberately kept out of the AND.</p>
+        <p>Four are simple counts backing a boolean that <em>is</em> gated: the Euler
+        characteristic, boundary edges, non-manifold edges, inconsistent directed edges. They are
+        diagnostics, not verdicts. If <code>watertight</code> is false you want to know it was
+        four boundary edges and not four hundred.</p>
+        <p>The other two exclusions are substantive, and each encodes a judgement about what a
+        certificate is <em>for</em>. A stale <strong>label</strong> means an annotation no longer
+        holds — the geometry is untouched, and failing the solid would be a category error.
+        <strong>Model debris</strong> means orphan faces exist somewhere in the model; real, worth
+        surfacing, and specifically <em>not this part's fault</em>.</p>
+
+        <h3>The second split, inside mesh quality</h3>
+        <p>The same discipline recurs one level down. <code>mesh_quality</code> measures four
+        things and gates on two.</p>
+        <figure>
+          <pre>// `clean` (which gates `is_sound`) keys ONLY on the true mesh-TOPOLOGY
+// defects — a facet that bridges across a periodic lateral
+// (`boundary_crossing`) or folds far off the surface (`normal_deviation`).
+// Both are 0 on a clean part. Aspect ratio and min-angle are SHAPE-quality
+// readouts …, NOT gates: a faithful tessellation routinely carries aspect ~150-
+// 290 slivers …, so gating on them would flag every real part. They are the
+// OPTIMISATION ORACLE — the number to drive down — not a soundness bar.</pre>
+          <figcaption><span>provenance.rs:467</span><span>MeshQuality::evaluate</span></figcaption>
+        </figure>
+        <p>A sliver triangle with an aspect ratio of 290 is ugly. It is not a lie. Keeping it out
+        of the gate is what lets the gate mean something when it does fire — and the number stays
+        on the certificate as the thing to improve.</p>
+
+        <h3>An unsound verdict must say why</h3>
+        <p>There was a period where a solid whose mesh dimensions failed certified as
+        <code>sound: false, errors: []</code> — a verdict with no actionable content. Every failing
+        gated dimension now synthesises a typed entry, so the certificate always names the
+        dimension that sank it.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== how computed, with caveats ===== -->
+  <section class="plate">
+    <div class="grid">
+      <div class="col">
+        <p class="eyebrow">Mechanism</p>
+        <h2>How each invariant is actually computed</h2>
+        <p>Names are marketing until you read the implementation. Four of the nine are derived from
+        a single welded-mesh pass at chord 0.1 with a weld epsilon of 1e-6: vertices are quantised
+        onto a grid, degenerate triangles are dropped rather than counted, and a directed-edge
+        multiset is accumulated over every surviving triangle.</p>
+        <p>From that one structure: an edge is <strong>boundary</strong> exactly when its undirected
+        incidence is one; <strong>non-manifold</strong> when it exceeds two; the mesh is
+        <strong>oriented</strong> when no directed edge is traversed more than once; and the
+        <strong>Euler characteristic</strong> is V − E + F over referenced welded vertices.</p>
+
+        <div class="tw" style="margin:1.6rem 0">
+          <table>
+            <thead><tr><th>Invariant</th><th>Actually performed</th><th>Density</th></tr></thead>
+            <tbody>
+              <tr><td>brep_valid</td><td>Scoped validation; errors owned by other solids or by orphan topology are filtered out</td><td class="st">mesh-independent</td></tr>
+              <tr><td>watertight</td><td>Zero mesh edges with undirected incidence 1</td><td class="st">chord 0.1</td></tr>
+              <tr><td>manifold</td><td>Zero mesh edges with incidence &gt; 2</td><td class="st">chord 0.1</td></tr>
+              <tr><td>oriented</td><td>Zero directed edges traversed more than once</td><td class="st">chord 0.1</td></tr>
+              <tr><td>self_intersection_free</td><td>Spatial-hash broad phase, exact AABB reject, triangle–triangle narrow phase</td><td class="st">chord 0.5</td></tr>
+              <tr><td>construction_consistent</td><td>Every profile point inside the solid's bbox, expanded by max(1% diagonal, tol)</td><td class="st">bbox</td></tr>
+              <tr><td>eyes_consistent</td><td>Every recognised feature resolves to a live face of the expected surface type</td><td class="st">topological</td></tr>
+              <tr><td>tessellation.clean</td><td>No degenerate facets; stored and analytic normals agree with winding</td><td class="st">display</td></tr>
+              <tr><td>mesh_quality.clean</td><td>No periodic boundary-crossing facets; normal deviation under 40°</td><td class="st">display</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <h3>Where the name is broader than the check</h3>
+        <p>This is the part a competitor would leave out, which is precisely why it belongs here. In
+        four places the implementation is narrower than the field name suggests, and anyone relying
+        on this certificate should know exactly where.</p>
+        <p><strong>Orientation is local.</strong> The check finds directed edges traversed twice —
+        two facets winding the same way across a shared edge. A mesh in which <em>every</em> facet
+        is uniformly inverted has no repeated directed edge and passes. Outward-ness is not tested.</p>
+        <p><strong>Self-intersection is gross.</strong> It runs on an audit tessellation at chord
+        0.5 — coarser than the watertightness pass — on the reasoning that gross self-overlap is
+        visible at low density. The broad phase is exact; the approximation is in the density. A
+        shallow self-intersection below that resolution is not detected.</p>
+        <p><strong>Boundary conformance is u-only.</strong> Facets are tested for bridging across a
+        periodic seam only on surfaces that declare a u-period. A torus's second period is not
+        tested; a planar face contributes zero crossings by construction.</p>
+        <p><strong>Construction consistency is a bounding box.</strong> It catches a sketch that has
+        drifted or been orphaned — the case it was built for. It does not verify that the profile
+        still generates the solid.</p>
+      </div>
+
+      <div class="margin">
+        <div class="note stop">
+          <b>Note 3 — a check that fails closed</b>
+          <code>eyes_consistent</code> is the only reconcile-family check inside the gate, and it
+          resolves ambiguity against itself: a live face whose surface type cannot be resolved is
+          treated as <em>inconsistent</em>, not as passing. Its expected-surface map is coarse —
+          holes and bosses expect cylinders, fillets expect tori, chamfers expect planes — so a
+          variable-radius fillet reads as inconsistent. That is the intended direction of error.
+        </div>
+
+        <div class="note">
+          <b>Note 4 — no stale certificates</b>
+          The certificate cache is invalidated at every mutating seam, so a cached
+          <code>Some</code> is always current as of the last mutation. Model-debris count is the
+          exception: it is re-stamped on every return, even from cache, because a debris note that
+          outlived the debris would be a lie.
+        </div>
+
+        <figure class="dwg">
+          <svg viewBox="0 0 360 250" role="img" aria-label="Timeline diagram: certificate computed synchronously under the write lock, reconcile spawned asynchronously after">
+            <g stroke="var(--rule)" stroke-width="1"><path d="M20,206 H340"/></g>
+            <g stroke="var(--blue)" stroke-width="1.4" fill="var(--blue-wash)">
+              <rect x="40" y="60" width="150" height="34"/>
+            </g>
+            <text class="dim" x="115" y="82" text-anchor="middle" fill="var(--ink)">write lock held</text>
+            <g stroke="var(--ink-2)" stroke-width="1.2" fill="none">
+              <rect x="52" y="106" width="52" height="26"/>
+              <rect x="112" y="106" width="70" height="26"/>
+            </g>
+            <text class="dim" x="78" y="123" text-anchor="middle">mutate</text>
+            <text class="dim" x="147" y="123" text-anchor="middle">certify</text>
+            <g stroke="var(--ink-3)" stroke-width="1.2" stroke-dasharray="5 3" fill="none">
+              <rect x="206" y="106" width="120" height="26"/>
+            </g>
+            <text class="dim" x="266" y="123" text-anchor="middle">reconcile (async)</text>
+            <g stroke="var(--ink-3)" stroke-width=".9"><path d="M190,94 L206,106"/></g>
+            <text class="dim" x="40" y="228">t0</text>
+            <text class="dim" x="176" y="228" text-anchor="middle">≈44 ms</text>
+            <text class="dim" x="326" y="228" text-anchor="end">later, advisory</text>
+            <text class="lbl" x="20" y="36" fill="var(--ink-2)">RESPONSE PATH</text>
+          </svg>
+          <figcaption><span>Sync gate, async advisory</span><span>chokepoint</span></figcaption>
+        </figure>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== the chokepoint ===== -->
+  <section class="plate">
+    <div class="grid wide">
+      <div class="margin">
+        <figure>
+          <pre>/// SOUNDNESS CONTRACT — the verdict must NEVER
+/// claim `sound: true` it has not actually
+/// verified. This runs SYNCHRONOUSLY, under the
+/// model write lock, on EVERY create/loft/
+/// boolean/etc., so it must be both TRUSTWORTHY
+/// and FAST.</pre>
+          <figcaption><span>main.rs:1129</span><span>certified_response</span></figcaption>
+        </figure>
+        <div class="note hold">
+          <b>Note 5 — the regression that set the rule</b>
+          The expensive self-intersection pass was once pulled off the hot path for latency. The
+          ambient verdict then reported <code>sound: true</code> from only the cheap checks — so a
+          self-intersecting solid was certified sound on every build. The code's own verdict on
+          that period: <em>"That defeats the moat: a verdict that asserts soundness it never
+          checked."</em> The resolution was to make the full check fast, not to drop it.
+        </div>
+      </div>
+
+      <div class="col">
+        <p class="eyebrow">The chokepoint</p>
+        <h2>Under the lock, on every mutation, or it means nothing</h2>
+        <p>The certificate is computed inside the same write guard that performed the mutation, at
+        fifteen call sites — every primitive, boolean, blend, transform, extrude, revolve, loft and
+        import. There is no path that mutates geometry and returns without passing through it.</p>
+        <p>The codebase puts the cost at roughly <strong>44 ms on a 19.8k-triangle part</strong> in
+        release, and judges that acceptable on the hot path. That is the trade being made
+        explicitly: every operation pays a fixed verification tax so that no operation can lie.</p>
+        <p>Callers may opt out per request with <code>"fast": true</code>, which returns only the
+        lightweight perception block. The default — absent flag, or <code>"fast": false</code> — is
+        the <strong>full certificate</strong>. One endpoint refuses the opt-out entirely:
+        <strong>STEP import</strong> hard-codes full verification, on the grounds that a STEP file
+        is untrusted external input.</p>
+
+        <h3>What the reconcile layer is, precisely</h3>
+        <p>A second, render-based check views the solid from fourteen viewpoints — distributed by
+        Fibonacci-sphere sampling for even coverage — and reconciles what it sees against what the
+        kernel claims, face by face. It is genuinely independent, and when it runs it is honest
+        about coverage rather than guessing at occlusion.</p>
+        <p>It is also <strong>advisory, and does not gate the mutation</strong>. It runs off the
+        write lock on an owned snapshot, capped at two concurrent, and under burst it is skipped
+        entirely and left pending. The source says so three separate times, including
+        <em>"Advisory severity. Never affects <code>is_sound</code>. Gating lives in the
+        certificate."</em></p>
+        <p>The distinction is worth stating plainly because the two things share a name. The
+        render-free feature check is synchronous and gating. The fourteen-viewpoint render is
+        asynchronous and advisory. Anyone who tells you their kernel renders every mutation from
+        fourteen angles before accepting it is describing something we deliberately did not build:
+        it would put a render in front of every write.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== sketch certificate ===== -->
+  <section class="plate">
+    <div class="grid">
+      <div class="col">
+        <p class="eyebrow">The second certificate</p>
+        <h2>Sketches: freedom is reported, conflict is failed</h2>
+        <p>A constraint sketch has a different honesty problem. An under-constrained sketch is not
+        broken — it is a legal, useful intermediate state that every draughtsman works in. So the
+        sketch certificate deliberately does <em>not</em> gate on degrees of freedom.</p>
+        <figure>
+          <pre>/// The single can't-lie predicate: a sketch is SOUND when its constraint
+/// system is satisfiable, its geometry is valid, and it does not
+/// self-intersect. DOF freedom and open profiles are reported, not failed.
+pub fn is_sound(&amp;self) -&gt; bool {
+    self.constraint_consistent &amp;&amp; self.entities_valid &amp;&amp; self.self_intersection_free
+}</pre>
+          <figcaption><span>sketch_certificate.rs:411</span><span>verbatim</span></figcaption>
+        </figure>
+        <p>Degrees of freedom are accounted structurally — points contribute two, circles three,
+        arcs five, splines 2n — and constraints subtract what they remove. Constraints referencing
+        unsupported entities are excluded from the tally rather than counted, which is what keeps
+        the arithmetic honest rather than merely tidy.</p>
+        <p>Conflicts, however, override the count. Two independent detectors run: a numerical rank
+        diagnosis, and a static-pair check. They are unioned, because the numerical pass can miss —
+        a line direction collapsing to zero <em>vacuously</em> satisfies both parallel and
+        perpendicular. The codebase's note on this is that solvers of the DCM and OCCT class need
+        both, and so do we.</p>
+
+        <h3>What a conflict witness contains</h3>
+        <p>When a sketch over-constrains, the certificate does not say "over-constrained". It
+        returns a <strong>minimal conflicting constraint set</strong> — the specific constraints
+        that cannot hold together, each with its type and residual, ascending by id.</p>
+        <p>Minimisation uses QuickXplain (Junker, AAAI-04), which finds a size-<em>k</em> core among
+        <em>n</em> candidates in O(<em>k</em>·log(<em>n</em>/<em>k</em>)) oracle calls. The oracle is
+        an isolated re-solve under exactly that subset. A false negative can only enlarge the
+        witness; it can never fabricate satisfiability.</p>
+      </div>
+
+      <div class="margin">
+        <div class="note">
+          <b>Note 6 — minimality is never fabricated</b>
+          The witness carries a <code>minimal</code> flag. It is true when QuickXplain completed or
+          the conflict is a static pair. It is false when the oracle-call cap of 128 was exceeded or
+          the re-solve could not reproduce the rank diagnosis — in which case the honest
+          un-minimised conflict set is returned rather than a smaller set that was never proven.
+        </div>
+        <figure>
+          <pre>pub struct ConflictWitness {
+    pub kind: WitnessKind,
+    pub constraints: Vec&lt;WitnessConstraint&gt;,
+    pub minimal: bool,
+    pub oracle_calls: usize,
+}</pre>
+          <figcaption><span>sketch_certificate.rs:232</span><span>witness</span></figcaption>
+        </figure>
+        <div class="note">
+          <b>Note 7 — colouring as a queryable fact</b>
+          Per-entity constrainment — fully constrained, under-constrained with a free-DOF count, or
+          over-constrained with the specific constraint ids responsible — is exposed as kernel data
+          rather than as a colour in a viewport. It is the sketch colouring every CAD user knows,
+          made machine-readable.
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== rebuild certificate ===== -->
+  <section class="plate">
+    <div class="grid wide">
+      <div class="margin">
+        <figure>
+          <pre>//! The "kernel cannot lie" thesis says a mould
+//! that breaks a downstream feature must surface
+//! as a *typed verdict*, never a silent bad or
+//! partial model … a **re-measured** `is_sound()`
+//! verdict recomputed from the resulting B-Rep —
+//! never asserted.</pre>
+          <figcaption><span>rebuild_certificate.rs:1</span><span>module doc</span></figcaption>
+        </figure>
+        <div class="note hold">
+          <b>Note 8 — one honest asymmetry</b>
+          Unlike the sketch and solid certificates, <code>RebuildCertificate::is_sound()</code> is a
+          getter over a stored boolean. The re-measurement happened at construction. It is still
+          measured rather than asserted — but it is measured <em>then</em>, not at the moment you
+          ask.
+        </div>
+      </div>
+      <div class="col">
+        <p class="eyebrow">The third certificate</p>
+        <h2>Editing the past without lying about the present</h2>
+        <p>History here is event-sourced: an edit to an earlier operation is a new event appended to
+        the timeline, never a mutation of the original. Replaying it can break something downstream
+        — a fillet whose edge no longer exists, a boolean whose operand changed shape.</p>
+        <p>The rebuild certificate is the account of that. Every feature gets a status: rebuilt,
+        unaffected, failed with a reason, dangling with the missing entity, blocked by an earlier
+        break, or <em>stale</em> — the honest arm for document-level events like drawings that have
+        no geometric replay and therefore reflect an older part without being broken.</p>
+        <p>The global verdict is true only when every feature rebuilt or was unaffected, no
+        reference dangled, and the resulting B-Rep validates on re-measurement. Otherwise the mould
+        is refused and the certificate names the first break.</p>
+      </div>
+    </div>
+  </section>
+
+  <nav class="rail">
+    <a href="casebook.html">
+      <span class="n">Sheet 03</span><span class="t">Casebook</span>
+      <p>Six times the kernel caught something — including once when the thing it caught was itself.</p>
+    </a>
+    <a href="envelope.html">
+      <span class="n">Sheet 04</span><span class="t">Envelope</span>
+      <p>The honest capability map, verified line by line against the source tree.</p>
+    </a>
+    <a href="index.html">
+      <span class="n">Sheet 01</span><span class="t">The Claim</span>
+      <p>Why a kernel driven by machines has to carry its own proof.</p>
+    </a>
+  </nav>
+
+  <footer>
+    <span>Roshera — self-certifying geometry for machine operators</span>
+    <span>Alpha</span>
+    <span>Quotations verbatim from source</span>
+  </footer>
+</div>
+</body>
+</html>

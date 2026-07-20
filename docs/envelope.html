@@ -1,0 +1,259 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Envelope — Roshera</title>
+<meta name="description" content="The honest capability map of a self-certifying geometry kernel: what is live, what is partial, what is designed but not shipped — verified against the source tree rather than intent.">
+<link rel="icon" href="logo.png">
+<link rel="stylesheet" href="site.css">
+</head>
+<body>
+
+<header class="titleblock">
+  <div class="tb">
+    <p class="tb-name"><a href="index.html"><img src="logo.png" alt="" width="30" height="30">Roshera</a></p>
+    <nav class="tb-nav">
+      <a href="index.html">The Claim</a>
+      <a href="certificate.html">The Certificate</a>
+      <a href="casebook.html">Casebook</a>
+      <a href="envelope.html" aria-current="page">Envelope</a>
+    </nav>
+    <div class="tb-meta">
+      <span><b>Sheet</b> 04</span>
+      <span><b>Rev</b> alpha</span>
+    </div>
+  </div>
+</header>
+
+<div class="sheet">
+
+  <section class="plate">
+    <div class="grid">
+      <div class="col">
+        <p class="eyebrow">Sheet 04 — envelope</p>
+        <h1>The map is maintained<br><em>against the source, not the intent.</em></h1>
+        <p class="lede">A kernel that sells honest refusal and conceals its own limitations has
+        already failed its own test. So this is the capability map, and the rule for it is simple:
+        <strong>a row moves when an implementation moves</strong>, not when a plan does.</p>
+        <p>Every row below was checked by reading the code rather than the roadmap. Where a
+        capability is narrower than its name, the note says how. Where something is designed but
+        not shipped, it is marked designed — which here means <em>specified in detail and not
+        written</em>, not <em>nearly done</em>.</p>
+      </div>
+      <div class="margin">
+        <div class="note">
+          <b>How to read this</b>
+          <strong>Live</strong> — implemented, reachable end to end, tested.
+          <strong>Partial</strong> — real and usable inside a stated gate; the gate is named.
+          <strong>Designed</strong> — specified, not implemented. No row claims a capability the
+          source does not support.
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== the map ===== -->
+  <section class="plate">
+    <div class="grid" style="grid-template-columns:1fr">
+      <div style="min-width:0">
+        <p class="eyebrow">The map</p>
+        <h2>What works today</h2>
+        <div class="tw" style="margin-top:1.4rem">
+          <table>
+            <thead><tr><th style="width:26%">Capability</th><th style="width:12%">State</th><th>What that means precisely</th></tr></thead>
+            <tbody>
+              <tr>
+                <td>B-Rep core — primitives, booleans, extrude, revolve, loft, sweep</td>
+                <td class="st"><span class="dot a"></span>live</td>
+                <td>Real implementations, reachable over REST, and replayable from the event log.</td>
+              </tr>
+              <tr>
+                <td>Soundness certificate</td>
+                <td class="st"><span class="dot a"></span>live</td>
+                <td>Nine-conjunct AND, computed synchronously under the model write lock at fifteen mutating call sites. Full certificate is the default; callers may opt out per request, except STEP import, which refuses the opt-out.</td>
+              </tr>
+              <tr>
+                <td>Sketch certificate — DOF, conflict witnesses</td>
+                <td class="st"><span class="dot a"></span>live</td>
+                <td>Minimal conflicting constraint sets via QuickXplain, per-entity constrainment, honest <code>minimal: false</code> when the oracle cap is hit rather than a fabricated core.</td>
+              </tr>
+              <tr>
+                <td>Rebuild certificate — editing history</td>
+                <td class="st"><span class="dot a"></span>live</td>
+                <td>Per-feature verdicts after a mould; global soundness re-measured from the resulting B-Rep, never asserted.</td>
+              </tr>
+              <tr>
+                <td>Agent surface — MCP and REST</td>
+                <td class="st"><span class="dot a"></span>live</td>
+                <td>Minimal default surface of ~18 tools with a meta-tool funnel reaching the long tail, workbenches, and a program ledger. The meta path validates against the same schema as a direct call, so it is never less checked.</td>
+              </tr>
+              <tr>
+                <td>Durable event log — replay and quarantine</td>
+                <td class="st"><span class="dot a"></span>live</td>
+                <td>Write-through persistence, pure-replay boot, and honest quarantine that serves the clean prefix and refuses the tail. Verified live by killing the process and resurrecting the model.</td>
+              </tr>
+              <tr>
+                <td>Auth posture</td>
+                <td class="st"><span class="dot a"></span>live</td>
+                <td>Secure by default on an empty environment; the bypass requires an explicit insecure flag. Middleware is global rather than per-route, and the websocket is not exempt.</td>
+              </tr>
+              <tr>
+                <td>Exact predicates</td>
+                <td class="st"><span class="dot b"></span>partial</td>
+                <td>A genuine Shewchuk adaptive cascade — orient2d, orient3d, incircle — but consumed by five files, and inside the boolean confined to <strong>2D arrangement decisions</strong>. The 3D surface–surface intersection path is not on exact predicates.</td>
+              </tr>
+              <tr>
+                <td>Piecewise-analytic revolve — arcs to exact Torus / Sphere</td>
+                <td class="st"><span class="dot b"></span>partial</td>
+                <td>Real analytic band classification, gated to full 360° profiles with no inner loops. Exactness is guaranteed only on the typed strict path; the permissive path currently falls back to a faceted approximation. <em>Making strict the default is decided and queued.</em></td>
+              </tr>
+              <tr>
+                <td>Independent 14-viewpoint reconcile</td>
+                <td class="st"><span class="dot b"></span>partial</td>
+                <td>Genuinely independent and honest about coverage when it runs — but <strong>advisory</strong>. It runs off the write lock, capped at two concurrent, and is skipped under burst. It does not gate a mutation.</td>
+              </tr>
+              <tr>
+                <td>NURBS ↔ analytic corefinement</td>
+                <td class="st"><span class="dot b"></span>partial</td>
+                <td>Shared-imprint corefinement is live: a NURBS × analytic cut produces a single shared edge, which is what makes the result manifold and the mesh watertight. Levin-method quadric intersection curves are live. Exact axisymmetric SSI is outstanding.</td>
+              </tr>
+              <tr>
+                <td>Fillet</td>
+                <td class="st"><span class="dot b"></span>partial</td>
+                <td>The more mature of the two blends. Constant-radius is solid; mixed-convexity corners return a typed refusal naming the literature that solves them.</td>
+              </tr>
+              <tr>
+                <td>Chamfer</td>
+                <td class="st"><span class="dot b"></span>partial</td>
+                <td>Closed-edge rim chamfers support <strong>plane–cylinder pairs only</strong>; cone, torus and revolve-seam rims return NotImplemented. Sequential single-edge blends at a shared corner are refused outright, because they corrupt the solid.</td>
+              </tr>
+              <tr>
+                <td>Blend × boolean ordering</td>
+                <td class="st"><span class="dot b"></span>partial</td>
+                <td>Chamfering before a boolean can leave a solid unsound at the seam; the kernel detects it and halts rather than serving it. Drill first, chamfer last. One defect in this family is fixed; the ordering sensitivity is not fully closed.</td>
+              </tr>
+              <tr>
+                <td>Marcher unification</td>
+                <td class="st"><span class="dot b"></span>in flight</td>
+                <td>The duplicated boolean-local marcher is being deleted in favour of the canonical one. See <a href="casebook.html">Case 03</a>.</td>
+              </tr>
+              <tr>
+                <td>Exact axisymmetric SSI</td>
+                <td class="st"><span class="dot c"></span>designed</td>
+                <td>Coaxial revolution pairs still march rather than resolving to exact circles. Specified; not written.</td>
+              </tr>
+              <tr>
+                <td>Lossless durability snapshots</td>
+                <td class="st"><span class="dot c"></span>designed</td>
+                <td>Boot is a full log replay. Snapshots are specified but not implemented, so boot time grows with history length.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== the narrow places ===== -->
+  <section class="plate">
+    <div class="grid">
+      <div class="col">
+        <p class="eyebrow">Known narrowness</p>
+        <h2>Four places the check is narrower than the name</h2>
+        <p>These are repeated from <a href="certificate.html">Sheet 02</a> because they belong on
+        the capability map too. Anyone relying on the certificate should know exactly where its
+        coverage thins.</p>
+        <p><strong>Orientation is local.</strong> The check catches two facets winding the same way
+        across a shared edge. A mesh in which every facet is uniformly inverted has no repeated
+        directed edge and passes. Outward-ness is not tested.</p>
+        <p><strong>Self-intersection is gross.</strong> It runs on a coarse audit tessellation —
+        coarser than the watertightness pass — on the reasoning that gross self-overlap is visible
+        at low density. The search is exact; the approximation is the density. A shallow
+        self-intersection below that resolution is not detected.</p>
+        <p><strong>Boundary conformance is u-only.</strong> Facets are tested for bridging a
+        periodic seam only on surfaces declaring a u-period. A torus's second period is not tested.</p>
+        <p><strong>Construction consistency is a bounding box.</strong> It catches a sketch that has
+        drifted or been orphaned. It does not verify that the profile still generates the solid.</p>
+
+        <h3>And what is deliberately excluded from soundness</h3>
+        <p>Stale labels do not fail a solid — an annotation is not geometry. Model debris is
+        reported at model scope rather than charged to a part that did nothing wrong. Sliver aspect
+        ratios are reported as an optimisation target, not gated, because a faithful tessellation
+        routinely carries them and gating would flag every real part.</p>
+      </div>
+      <div class="margin">
+        <div class="note hold">
+          <b>Documentation rot is a real failure mode</b>
+          At least one comment in the tree describes a defect the code beneath it no longer has,
+          and several internal figures circulated as fact turned out to be unverifiable when
+          checked against source. The rule that produced this page — read the implementation, not
+          the note — exists because the notes were wrong more than once.
+        </div>
+        <div class="note">
+          <b>What we have deliberately not built</b>
+          A render in front of every write. It would make the fourteen-viewpoint check gating, and
+          it would put a GPU in the critical path of every mutation. The synchronous gate is
+          structural; the render is advisory. We would rather say that plainly than imply a
+          stronger guarantee than we enforce.
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== direction ===== -->
+  <section class="plate">
+    <div class="grid wide">
+      <div class="margin">
+        <div class="spec">
+          <div class="spec-hd"><span>Next, in order</span><span>queued</span></div>
+          <dl>
+            <dt>marcher unification</dt><dd>in flight</dd>
+            <dt>exact axisymmetric SSI</dt><dd>next</dd>
+            <dt>strict revolve default</dt><dd>decided</dd>
+            <dt>durability snapshots</dt><dd>specified</dd>
+            <dt>auth key persistence</dt><dd>specified</dd>
+          </dl>
+        </div>
+      </div>
+      <div class="col">
+        <p class="eyebrow">Direction</p>
+        <h2>Where the work goes next</h2>
+        <p>The near-term queue is unglamorous and mostly about closing the gap between what the
+        kernel computes exactly and what it computes approximately. Unifying the marcher removes a
+        duplicated implementation that drifted from its twin. Exact axisymmetric intersection turns
+        a class of coaxial revolutions from marched approximations into exact circles.</p>
+        <p>Making strict analytic revolve the default is the one with a visible cost: some calls
+        that previously returned a faceted approximation will begin returning a typed refusal
+        instead. That is the trade this project exists to make. An approximation the caller did not
+        ask for and cannot see is the failure mode; a refusal they can act on is not.</p>
+        <p>Further out sits the parity work — the exact-predicate coverage widening from the 2D
+        arrangement layer into the 3D intersection path, and exact mass properties on trimmed
+        surfaces. Neither is close, and neither is claimed.</p>
+      </div>
+    </div>
+  </section>
+
+  <nav class="rail">
+    <a href="index.html">
+      <span class="n">Sheet 01</span><span class="t">The Claim</span>
+      <p>Why a kernel driven by machines has to carry its own proof.</p>
+    </a>
+    <a href="certificate.html">
+      <span class="n">Sheet 02</span><span class="t">The Certificate</span>
+      <p>Nine conjuncts, what is excluded, and where each check is narrower than its name.</p>
+    </a>
+    <a href="casebook.html">
+      <span class="n">Sheet 03</span><span class="t">Casebook</span>
+      <p>Six cases — five of them failures of silent success rather than crashes.</p>
+    </a>
+  </nav>
+
+  <footer>
+    <span>Roshera — self-certifying geometry for machine operators</span>
+    <span>Alpha</span>
+    <span>Rows move when implementations move</span>
+  </footer>
+</div>
+</body>
+</html>

@@ -1,0 +1,175 @@
+/* ===========================================================================
+   Roshera — technical publication stylesheet
+   The page is a drawing sheet: paper ground, drafting rules, a title block,
+   a wide margin column for revision notes. Dark theme is a film negative.
+   =========================================================================== */
+
+:root{
+  /* drafting vellum: faintly cool, never cream */
+  --paper:#F5F6F3; --paper-2:#ECEEE9; --paper-3:#E2E5DF;
+  --rule:#C7CBC4; --rule-2:#DBDED7; --rule-hair:#E6E9E3;
+  --ink:#11161A; --ink-2:#3F484E; --ink-3:#6E777D;
+  --blue:#1C4E6B; --blue-2:#2A6E93; --blue-wash:rgba(28,78,107,.06);
+  --ok:#2C6B44; --hold:#8A5A14; --stop:#9B3B33;
+  --serif:"Constantia","Cambria","Iowan Old Style","Palatino Linotype",Georgia,serif;
+  --tech:"Bahnschrift","DIN Alternate","Arial Narrow",system-ui,sans-serif;
+  --mono:"Cascadia Mono",Consolas,ui-monospace,"SF Mono",Menlo,monospace;
+  --sheet:1240px; --col:660px;
+}
+/* Paper is the design, not a light-mode variant: this sheet is deliberately
+   single-world and does NOT follow prefers-color-scheme. A considered dark
+   film-negative is still available to anyone who explicitly toggles it. */
+:root[data-theme="dark"]{
+  --paper:#0F1416; --paper-2:#161D20; --paper-3:#1E272B;
+  --rule:#2E3B41; --rule-2:#242F34; --rule-hair:#1C2529;
+  --ink:#E9EDEE; --ink-2:#A9B5BA; --ink-3:#78858B;
+  --blue:#7FC1E6; --blue-2:#9CD2F0; --blue-wash:rgba(127,193,230,.08);
+  --ok:#5FBE85; --hold:#D9A24F; --stop:#D9736A;
+}
+:root[data-theme="light"]{
+  --paper:#F1F2EF; --paper-2:#E7E9E4; --paper-3:#DCDFD9;
+  --rule:#C2C6BF; --rule-2:#D6D9D3; --rule-hair:#E0E3DD;
+  --ink:#13171A; --ink-2:#454D52; --ink-3:#767E83;
+  --blue:#1C4E6B; --blue-2:#2A6E93; --blue-wash:rgba(28,78,107,.06);
+  --ok:#2C6B44; --hold:#8A5A14; --stop:#9B3B33;
+}
+
+*{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{
+  margin:0;background:var(--paper);color:var(--ink);
+  font-family:var(--serif);font-size:18px;line-height:1.66;
+  -webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility;
+}
+a{color:var(--blue);text-decoration-thickness:1px;text-underline-offset:3px}
+a:hover{color:var(--blue-2)}
+
+/* ---------- sheet frame ---------- */
+.sheet{max-width:var(--sheet);margin:0 auto;padding:0 clamp(1rem,4vw,2.6rem)}
+
+/* ---------- title block (masthead) ---------- */
+.titleblock{border-bottom:2px solid var(--ink)}
+.tb{display:grid;grid-template-columns:1fr;gap:0;
+    max-width:var(--sheet);margin:0 auto;padding:0 clamp(1rem,4vw,2.6rem)}
+@media(min-width:820px){.tb{grid-template-columns:auto 1fr auto;align-items:end}}
+.tb-name{font-family:var(--tech);font-size:1.12rem;font-weight:600;letter-spacing:.34em;
+  text-transform:uppercase;margin:0;padding:1.1rem 0 .85rem;color:var(--ink)}
+.tb-name a{color:inherit;text-decoration:none;display:flex;align-items:center;gap:.6rem}
+.tb-name img{display:block;width:30px;height:30px;flex:none}
+.tb-nav{display:flex;gap:1.4rem;padding:0 0 .95rem;font-family:var(--tech);
+  font-size:.78rem;letter-spacing:.16em;text-transform:uppercase}
+@media(min-width:820px){.tb-nav{padding-left:2.4rem}}
+.tb-nav a{color:var(--ink-3);text-decoration:none;padding-bottom:.15rem;border-bottom:1px solid transparent}
+.tb-nav a:hover{color:var(--ink)}
+.tb-nav a[aria-current]{color:var(--ink);border-bottom-color:var(--blue)}
+.tb-meta{display:flex;gap:1.3rem;padding:0 0 .95rem;font-family:var(--mono);
+  font-size:.68rem;letter-spacing:.08em;text-transform:uppercase;color:var(--ink-3)}
+.tb-meta b{color:var(--ink-2);font-weight:400}
+
+/* ---------- editorial grid: text column + margin column ---------- */
+.plate{padding:clamp(2.6rem,6vw,5rem) 0;border-bottom:1px solid var(--rule)}
+.plate:last-of-type{border-bottom:0}
+.grid{display:grid;grid-template-columns:1fr;gap:clamp(1.4rem,3vw,2.6rem)}
+@media(min-width:1000px){
+  .grid{grid-template-columns:minmax(0,var(--col)) minmax(0,1fr);align-items:start}
+  .grid.wide{grid-template-columns:minmax(0,1fr) minmax(0,var(--col))}
+}
+.col{min-width:0;max-width:68ch}
+.margin{min-width:0}
+@media(min-width:1000px){.margin{padding-top:.4rem}}
+
+/* ---------- headings ---------- */
+.eyebrow{font-family:var(--tech);font-size:.76rem;letter-spacing:.2em;text-transform:uppercase;
+  color:var(--blue);margin:0 0 1rem;display:flex;align-items:center;gap:.75rem}
+.eyebrow::after{content:"";flex:1;height:1px;background:var(--rule)}
+h1{font-family:var(--serif);font-weight:400;font-size:clamp(2.3rem,5.4vw,3.9rem);
+  line-height:1.06;letter-spacing:-.012em;margin:0 0 1.3rem;text-wrap:balance}
+h1 em{font-style:italic;color:var(--blue)}
+h2{font-family:var(--serif);font-weight:400;font-size:clamp(1.6rem,3.4vw,2.35rem);
+  line-height:1.14;letter-spacing:-.008em;margin:0 0 1rem;text-wrap:balance}
+h3{font-family:var(--tech);font-weight:600;font-size:.9rem;letter-spacing:.14em;
+  text-transform:uppercase;color:var(--ink-2);margin:2.4rem 0 .8rem}
+.lede{font-size:clamp(1.1rem,2.1vw,1.32rem);line-height:1.56;color:var(--ink-2);margin:0 0 1.3rem}
+.lede strong{color:var(--ink);font-weight:600}
+p{margin:0 0 1.15rem}
+.col p{color:var(--ink-2)}
+.col strong{color:var(--ink);font-weight:600}
+.drop::first-letter{float:left;font-size:3.5em;line-height:.86;padding:.06em .1em 0 0;
+  color:var(--blue);font-weight:400}
+
+/* ---------- marginalia: revision notes ---------- */
+.note{border-left:2px solid var(--blue);padding:.1rem 0 .1rem .9rem;margin:0 0 1.5rem;
+  font-family:var(--mono);font-size:.79rem;line-height:1.62;color:var(--ink-2)}
+.note b{display:block;font-family:var(--tech);font-size:.7rem;letter-spacing:.16em;
+  text-transform:uppercase;color:var(--blue);margin-bottom:.35rem;font-weight:600}
+.note.hold{border-left-color:var(--hold)} .note.hold b{color:var(--hold)}
+.note.stop{border-left-color:var(--stop)} .note.stop b{color:var(--stop)}
+
+/* ---------- drawing plates ---------- */
+figure{margin:0 0 1.4rem}
+.dwg{border:1px solid var(--rule);background:var(--paper-2);position:relative}
+.dwg svg{display:block;width:100%;height:auto}
+.dwg-cap,figcaption{border-top:1px solid var(--rule);padding:.5rem .8rem;
+  font-family:var(--mono);font-size:.68rem;letter-spacing:.06em;text-transform:uppercase;
+  color:var(--ink-3);display:flex;justify-content:space-between;gap:1rem;flex-wrap:wrap}
+.viewer{border:1px solid var(--rule);background:var(--paper-3);position:relative;overflow:hidden}
+.viewer canvas{display:block;width:100%;height:clamp(300px,34vw,420px);touch-action:none;cursor:grab}
+.viewer canvas:active{cursor:grabbing}
+.viewer .hud{position:absolute;top:.6rem;left:.7rem;right:.7rem;display:flex;gap:.6rem;
+  font-family:var(--mono);font-size:.64rem;letter-spacing:.1em;text-transform:uppercase;
+  color:var(--ink-3);pointer-events:none;flex-wrap:wrap}
+.viewer .hud .r{margin-left:auto}
+.viewer .key{position:absolute;left:.7rem;bottom:.7rem;display:flex;flex-direction:column;gap:.24rem;
+  font-family:var(--mono);font-size:.65rem;color:var(--ink-2);pointer-events:none}
+.viewer .key i{display:inline-block;width:9px;height:9px;margin-right:.45rem;vertical-align:middle}
+.fallback{display:none;padding:2rem 1rem;text-align:center;font-family:var(--mono);
+  font-size:.76rem;color:var(--ink-3);line-height:1.7}
+
+/* ---------- stamps & data ---------- */
+.stamp{font-family:var(--mono);font-size:.68rem;font-weight:700;letter-spacing:.14em;
+  padding:.12rem .48rem;border:1.5px solid currentColor;white-space:nowrap}
+.stamp.ok{color:var(--ok)} .stamp.hold{color:var(--hold)} .stamp.stop{color:var(--stop)}
+
+.spec{border:1px solid var(--rule);background:var(--paper-2)}
+.spec-hd{padding:.55rem .8rem;border-bottom:1px solid var(--rule);font-family:var(--tech);
+  font-size:.72rem;letter-spacing:.16em;text-transform:uppercase;color:var(--ink-3);
+  display:flex;justify-content:space-between;gap:1rem;flex-wrap:wrap}
+.spec dl{margin:0;padding:.7rem .8rem;display:grid;grid-template-columns:auto 1fr;
+  gap:.1rem .9rem;font-family:var(--mono);font-size:.78rem}
+.spec dt{color:var(--ink-3);white-space:nowrap}
+.spec dd{margin:0;color:var(--ink);font-variant-numeric:tabular-nums;text-align:right}
+
+pre{margin:0;padding:.85rem;overflow-x:auto;font-family:var(--mono);font-size:.78rem;
+  line-height:1.62;color:var(--ink-2);background:var(--paper-2);border:1px solid var(--rule)}
+pre .k{color:var(--blue)} pre .t{color:var(--ok);font-weight:600}
+pre .n{color:var(--ink)} pre .s{color:var(--hold)}
+code{font-family:var(--mono);font-size:.88em;background:var(--blue-wash);padding:.06em .3em}
+
+.tw{overflow-x:auto;border:1px solid var(--rule)}
+table{border-collapse:collapse;width:100%;min-width:540px;font-family:var(--tech);font-size:.92rem}
+th,td{text-align:left;padding:.6rem .85rem;border-bottom:1px solid var(--rule-2);vertical-align:top}
+thead th{font-family:var(--mono);font-size:.66rem;letter-spacing:.12em;text-transform:uppercase;
+  color:var(--ink-3);background:var(--paper-2);border-bottom:1px solid var(--rule)}
+tbody tr:last-child td{border-bottom:0}
+td.st{font-family:var(--mono);font-size:.74rem;white-space:nowrap}
+.dot{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:.45rem;vertical-align:middle}
+.dot.a{background:var(--ok)} .dot.b{background:var(--hold)} .dot.c{background:var(--ink-3)}
+
+/* ---------- next-page rail ---------- */
+.rail{display:grid;gap:1px;background:var(--rule);border:1px solid var(--rule);
+  grid-template-columns:1fr;margin:clamp(2rem,5vw,3.4rem) 0 0}
+@media(min-width:760px){.rail{grid-template-columns:repeat(3,1fr)}}
+.rail a{background:var(--paper);padding:1.1rem;text-decoration:none;display:block;
+  transition:background .18s}
+.rail a:hover{background:var(--paper-2)}
+.rail .n{font-family:var(--mono);font-size:.66rem;letter-spacing:.14em;text-transform:uppercase;
+  color:var(--blue);display:block;margin-bottom:.4rem}
+.rail .t{font-family:var(--serif);font-size:1.16rem;color:var(--ink);display:block;margin-bottom:.3rem}
+.rail p{margin:0;font-size:.9rem;color:var(--ink-3);font-family:var(--serif)}
+
+footer{border-top:2px solid var(--ink);padding:1.5rem 0 3rem;font-family:var(--mono);
+  font-size:.71rem;color:var(--ink-3);display:flex;flex-wrap:wrap;gap:.55rem 1.6rem;align-items:baseline}
+
+/* drawing primitives used inside SVG */
+.dim{font-family:var(--mono);font-size:10.5px;fill:var(--ink-3)}
+.lbl{font-family:var(--tech);font-size:11px;fill:var(--ink-2);letter-spacing:.08em}

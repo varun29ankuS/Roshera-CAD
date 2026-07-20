@@ -1,0 +1,529 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Casebook — Roshera</title>
+<meta name="description" content="Six cases from a self-certifying geometry kernel. Five are failures of silent success rather than crashes — including one where the kernel caught itself serving wrong geometry.">
+<link rel="icon" href="logo.png">
+<link rel="stylesheet" href="site.css">
+</head>
+<body>
+
+<header class="titleblock">
+  <div class="tb">
+    <p class="tb-name"><a href="index.html"><img src="logo.png" alt="" width="30" height="30">Roshera</a></p>
+    <nav class="tb-nav">
+      <a href="index.html">The Claim</a>
+      <a href="certificate.html">The Certificate</a>
+      <a href="casebook.html" aria-current="page">Casebook</a>
+      <a href="envelope.html">Envelope</a>
+    </nav>
+    <div class="tb-meta">
+      <span><b>Sheet</b> 03</span>
+      <span><b>Cases</b> 6</span>
+    </div>
+  </div>
+</header>
+
+<div class="sheet">
+
+  <section class="plate">
+    <div class="grid">
+      <div class="col">
+        <p class="eyebrow">Sheet 03 — casebook</p>
+        <h1>Five of these six<br><em>are failures of silent success.</em></h1>
+        <p class="lede">Not one of them is a crash. A crash is the easy case: it announces itself,
+        it has a stack trace, and nothing downstream is built on top of it. These are the other
+        kind — where the kernel returned a confident, well-formed, wrong answer.</p>
+        <p class="lede">A phantom revolve that served the wrong geometry. A section that reported
+        the uncut area. A marcher whose output was, in the source's own words, <em>silent noise</em>.
+        A union that dropped two faces. A drill that reported four holes while removing no material.</p>
+        <p>Each is reproduced here with the verbatim source text, the exact figures, and the commit
+        that closed it. Where a case is weaker than its reputation, it says so — including one
+        whose documentation outlived the bug it described.</p>
+      </div>
+      <div class="margin">
+        <div class="note">
+          <b>Provenance</b>
+          Every quotation on this page is verbatim from the repository — commit messages, doc
+          comments, error definitions, test assertions. Figures that could not be confirmed
+          first-hand against source were cut rather than rounded, including three that had
+          circulated internally as fact.
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== CASE 1 ===== -->
+  <section class="plate">
+    <div class="grid">
+      <div class="col">
+        <p class="eyebrow">Case 01 — the phantom effect</p>
+        <h2>An integer that meant something else in the next process</h2>
+        <p>The timeline is event-sourced: a model is rebuilt by replaying what happened to it. A
+        revolve was recorded as <code>revolve_face</code> carrying the kernel's <em>internal</em>
+        profile face id — a handle that is meaningful only inside the session that minted it.</p>
+        <p>On a forty-five-event log, one such id no longer resolved, and boot quarantined honestly.
+        The other did something far worse: it <strong>resolved to an unrelated live face</strong>
+        that happened to share the number, and the replay silently revolved the wrong geometry.
+        A served event, a plausible solid, no error anywhere.</p>
+        <p>The fix is at the recording root, not in replay, and the reasoning is stated where the
+        guard lives:</p>
+        <figure>
+          <pre>// Resolving `face_raw` by raw fallback would revolve whatever UNRELATED
+// live face happened to share that numeric id — a silent wrong-solid (or,
+// when the id resolved to nothing buildable, a phantom served event with no
+// geometry). Such an event is unreplayable by construction: fail LOUD as a
+// dangling reference so boot QUARANTINES honestly at it, never serves a
+// phantom.</pre>
+          <figcaption><span>replay.rs:1414</span><span>verbatim</span></figcaption>
+        </figure>
+        <p>Legacy events of that shape are now refused rather than migrated. There is no lossy
+        upgrade path, because any upgrade would have to guess which face was meant.</p>
+        <figure>
+          <pre>#[error("dangling reference in {kind}: {entity} no longer resolves")]
+DanglingReference { kind: String, entity: String }</pre>
+          <figcaption><span>replay.rs:128</span><span>a reference-durability failure, not a numeric one</span></figcaption>
+        </figure>
+        <p>The regression test does not check that replay fails. It checks that replay fails
+        <em>for the right reason</em> — seeding a box that owns faces 0 to 5, then replaying a
+        <code>revolve_face</code> naming face 3, which would otherwise succeed by coincidence.</p>
+        <figure>
+          <pre>/// Mutation proof: delete the `id_remap.contains_key(&amp;face_raw)` guard in
+/// the `revolve_face` arm and this regresses — the kernel revolves the box's
+/// face 3 (a coincidental success, or a `KernelError` that is not `Dangling`)</pre>
+          <figcaption><span>replay.rs:2056</span><span>regression guard</span></figcaption>
+        </figure>
+      </div>
+      <div class="margin">
+        <div class="note stop">
+          <b>The worst class of lie</b>
+          A crash loses you an operation. A quarantine loses you a session. This lost you the
+          <em>truth</em> — a stored history that replayed into a different part than the one it
+          recorded, with every layer reporting success.
+        </div>
+        <div class="note">
+          <b>Found by the system, in production</b>
+          This was not caught by a test. Durability quarantine surfaced it within hours of
+          shipping, on a real log, because boot refuses to serve a prefix it cannot prove.
+          <em>"a booted model is <strong>proven</strong>, not assumed … the tail is refused rather
+          than served as a subtly-wrong model."</em>
+        </div>
+        <figure>
+          <pre>"durability: QUARANTINE — the log contains an
+ event this kernel cannot faithfully replay;
+ serving the clean prefix and refusing the
+ tail. is_sound={}"</pre>
+          <figcaption><span>durability.rs:310</span><span>quarantine</span></figcaption>
+        </figure>
+        <div class="spec">
+          <div class="spec-hd"><span>Case 01</span><span class="stamp ok">FIXED</span></div>
+          <dl>
+            <dt>events in log</dt><dd>45</dd>
+            <dt>recorded miss</dt><dd>face_id=166</dd>
+            <dt>commit</dt><dd>f1a417bd</dd>
+            <dt>replay arms added</dt><dd>2</dd>
+          </dl>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== CASE 2 ===== -->
+  <section class="plate">
+    <div class="grid wide">
+      <div class="margin">
+        <figure class="dwg">
+          <svg viewBox="0 0 320 300" role="img" aria-label="Diagram: cross-drilled block sectioned through both bore axes, showing the cruciform void that should be subtracted">
+            <g stroke="var(--blue)" stroke-width="1.5" fill="none">
+              <rect x="40" y="60" width="240" height="160"/>
+            </g>
+            <path d="M40,108 H280 M40,172 H280 M112,60 V220 M208,60 V220"
+                  stroke="var(--blue-2)" stroke-width="1" stroke-dasharray="6 3" opacity=".8"/>
+            <g fill="var(--blue-wash)" stroke="var(--blue)" stroke-width="1.2">
+              <path d="M40,108 H112 V60 H208 V108 H280 V172 H208 V220 H112 V172 H40 Z"
+                    fill="none" stroke-dasharray="4 3"/>
+            </g>
+            <g fill="var(--stop)" opacity=".16">
+              <rect x="40" y="108" width="240" height="64"/>
+              <rect x="112" y="60" width="96" height="160"/>
+            </g>
+            <text class="dim" x="160" y="145" text-anchor="middle" fill="var(--ink-2)">void</text>
+            <text class="dim" x="76" y="90" text-anchor="middle">22×12</text>
+            <text class="dim" x="244" y="90" text-anchor="middle">22×12</text>
+            <text class="dim" x="76" y="200" text-anchor="middle">22×12</text>
+            <text class="dim" x="244" y="200" text-anchor="middle">22×12</text>
+            <text class="dim" x="160" y="248" text-anchor="middle">remaining material = 1056 mm²</text>
+            <text class="lbl" x="40" y="44" fill="var(--ink-2)">SECTION THROUGH BOTH BORE AXES</text>
+          </svg>
+          <figcaption><span>60×40×40 block, two Ø16 through-bores</span><span>reported 4000</span></figcaption>
+        </figure>
+        <div class="spec">
+          <div class="spec-hd"><span>Case 02 — the arithmetic</span><span class="stamp ok">FIXED</span></div>
+          <dl>
+            <dt>undrilled rectangle</dt><dd>2400 mm²</dd>
+            <dt>truth, axis plane</dt><dd>1056 mm²</dd>
+            <dt>reported by the bug</dt><dd>4000 mm²</dd>
+            <dt>truth, offset plane</dt><dd>≈1307 mm²</dd>
+            <dt>commit</dt><dd>11be5412</dd>
+          </dl>
+        </div>
+      </div>
+
+      <div class="col">
+        <p class="eyebrow">Case 02 — the confident wrong area</p>
+        <h2>A fast path guarded by an invariant that stopped being true</h2>
+        <p>Sectioning a cross-drilled block through both bore axes returned a number larger than
+        the undrilled block — 4000 mm² where the solid rectangle is 2400 and the true cruciform is
+        1056. It also drew a phantom diagonal edge across the void.</p>
+        <p>What makes this case instructive is that the code was not wrong when it was written.
+        A tier-one bounding-box fast path assumed <strong>analytic faces are never
+        boolean-trimmed</strong>. That held — until booleans began trimming analytic faces, at
+        which point a cross-drilled bore wall started carrying the other bore's Steinmetz curve as
+        a trim boundary.</p>
+        <figure>
+          <pre>the tier-1 bbox fast path assumed analytic faces are never boolean-trimmed;
+a cross-drilled bore wall carries the other bore's Steinmetz curve as a trim
+boundary, so section generators ran straight across the drilled-away void and
+chained into a self-overlapping loop</pre>
+          <figcaption><span>commit 11be5412</span><span>defect 1 of 3</span></figcaption>
+        </figure>
+        <p>Two further defects sat underneath: the winding test broke on full-wrap trim loops,
+        and the seam force-include bypassed the hole test entirely. The two Steinmetz scallops,
+        joined at their tangency points, form a single closed loop whose lifted polygon is not
+        closed in the universal cover — so the membership test mis-unwrapped it.</p>
+        <p>The fix does not repair that winding test. It routes around it, into an even-odd
+        membership test in quotient parameter space, behind a new soundness gate that asks whether
+        the face's UV domain is actually rectangular before taking the shortcut. The real content
+        of the fix is <strong>checking the assumption instead of inheriting it</strong>.</p>
+        <p>The assertion carries the diagnosis in its own failure text:</p>
+        <figure>
+          <pre>"axis-plane cruciform area {area:.2} vs analytic {expected:.2} (rel {rel:.4});
+ caps={} — full-rect 2400 means the void was not subtracted at all"</pre>
+          <figcaption><span>section_cruciform.rs</span><span>regression guard, 4 tests</span></figcaption>
+        </figure>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== CASE 3 ===== -->
+  <section class="plate">
+    <div class="grid">
+      <div class="col">
+        <p class="eyebrow">Case 03 — the marcher that never marched</p>
+        <h2>Two hundred thousand steps, two millimetres of progress</h2>
+        <p>Surface–surface intersection for pairs with no closed-form solution falls back to
+        marching: predict along the tangent, correct back onto both surfaces, repeat until the
+        curve closes. The boolean engine carried its own copy of that marcher, and the copy had two
+        problems that compounded.</p>
+        <p>The first is arithmetic. The step size is tied to the distance tolerance —
+        <code>tolerance.distance() × 10</code>, which with a 1e-6 tolerance gives a step of
+        <strong>1e-5 world units</strong>. The hard cap is <strong>200,000 steps</strong>. So the
+        reach of a single trace is two world units per direction. A Ø100 ring has a circumference
+        near 314. The marcher could traverse about <strong>two per cent of it</strong> before
+        hitting the cap.</p>
+        <p>The second is what happens at the cap. The partial trace is discarded with
+        <code>Ok(None)</code> — a return value indistinguishable from <em>"these surfaces do not
+        intersect"</em>. And because the seed grid samples <code>0..=20</code> in both parameters,
+        <strong>441 candidate seeds</strong> feed the loop, each one re-running the same doomed
+        two-per-cent trace, because this copy of the marcher had no seed-consumption array.</p>
+        <figure>
+          <pre>// HARD STEP CAP per direction. The marching step is tied to the distance
+// tolerance (≈1e-5), so a curve on unit-scale primitives needs ~10^6 steps;
+// for a pair with NO analytic SSI arm (cone×cylinder, cone×sphere, …) the
+// march can also fail to ever close → a true HANG that freezes the kernel
+// (the worst failure class).</pre>
+          <figcaption><span>boolean.rs at 763e9e16</span><span>verbatim</span></figcaption>
+        </figure>
+        <p>The cap was added as an explicit safety measure, and the commit that added it refused to
+        overstate what it had done: <em>"This stops the freeze; it does NOT make cone∘cylinder
+        geometrically correct (the marched curve is discarded)."</em> A hang became a wrong answer,
+        knowingly, as the lesser evil — and it was labelled as such.</p>
+
+        <h3>The structural cause: one marcher got the fixes, its twin did not</h3>
+        <p>A separate commit hardened the <em>canonical</em> marcher — adding alternating
+        projection, curvature-adaptive stepping, periodic seam wrap, one curve per branch, citing
+        Patrikalakis and Maekawa. Its diagnosis of the original defect is the best sentence in this
+        casebook:</p>
+        <figure>
+          <pre>The general surface-surface marcher (the freeform fallback the analytic
+QSIC producers gate ahead of) did not actually march.
+
+correct_to_intersection took the predicted point but ignored it (_predicted),
+re-projecting from the anchor's own (uv1,uv2). The anchor already lies on the
+intersection, so the corrector returned the anchor unchanged and every trace
+collapsed to one repeated point. The analytic paths masked it; the marcher
+output was silent noise.</pre>
+          <figcaption><span>commit efb090cc</span><span>verbatim</span></figcaption>
+        </figure>
+        <p>That commit touched the canonical implementation and one new test file. It did not touch
+        the boolean engine's copy — which is precisely why the copy was still marching two per cent
+        of a ring, 441 times, a year later.</p>
+      </div>
+
+      <div class="margin">
+        <div class="note hold">
+          <b>Citation notice</b>
+          Line numbers for this case are cited against committed <code>763e9e16</code>. A fix is in
+          flight as this sheet is written: it deletes the duplicated marcher outright and delegates
+          to the canonical one. At the time of writing, <code>MAX_MARCH_STEPS</code> occurs three
+          times at HEAD and zero times in the working tree.
+        </div>
+        <div class="spec">
+          <div class="spec-hd"><span>Case 03 — the arithmetic</span><span class="stamp hold">IN FLIGHT</span></div>
+          <dl>
+            <dt>step size</dt><dd>1e-5</dd>
+            <dt>step cap</dt><dd>200,000</dd>
+            <dt>reach per direction</dt><dd>2 units</dd>
+            <dt>Ø100 ring circumference</dt><dd>≈314</dd>
+            <dt>traced before discard</dt><dd>≈2 %</dd>
+            <dt>candidate seeds</dt><dd>441</dd>
+            <dt>seed consumption</dt><dd>none</dd>
+          </dl>
+        </div>
+        <div class="note">
+          <b>The RED evidence</b>
+          Before the canonical fix, a sphere–sphere overlap traced <em>11 points, n_distinct=1,
+          bbox_diag=0.0000</em> against an expected 2.4495 — a "curve" that was one point repeated
+          eleven times. After: <em>1 closed circle, 69 distinct points, bbox_diag=2.4491</em>.
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== CASE 4 ===== -->
+  <section class="plate">
+    <div class="grid wide">
+      <div class="margin">
+        <div class="note hold">
+          <b>The weakest case here, kept deliberately</b>
+          Its headline artifact is a stale comment. Its face counts live in commit prose rather than
+          in assertions. And the error type it was reputed to produce does not occur in that file at
+          all. It is included because a casebook that only prints its strong cases is doing the
+          thing this kernel exists to prevent.
+        </div>
+        <div class="spec">
+          <div class="spec-hd"><span>Case 04</span><span class="stamp ok">FIXED</span></div>
+          <dl>
+            <dt>repro banked</dt><dd>11:42:40</dd>
+            <dt>fixed</dt><dd>14:14:00</dd>
+            <dt>elapsed</dt><dd>2 h 32 m</dd>
+            <dt>failure signal</dt><dd>edges_used_once</dd>
+            <dt>edges</dt><dd>1, 5, 9, 10</dd>
+          </dl>
+        </div>
+      </div>
+      <div class="col">
+        <p class="eyebrow">Case 04 — idempotence</p>
+        <h2>A ∪ B = A, except the second time</h2>
+        <p>If B is contained in A, unioning them should return A unchanged. It did — once. Applied
+        a second time, with the operand's faces coincident with the earlier union's imprint, it
+        produced an <strong>open shell</strong>: four edges used exactly once, where a closed solid
+        requires two.</p>
+        <p>The cause was a face that vanished quietly. Region extraction returned zero loops, the
+        fragment loop therefore iterated nothing, and the only short-circuit that would have
+        preserved the face fired earlier in the pipeline:</p>
+        <figure>
+          <pre>split_face_by_curves silently DROPPED any face whose post-arrangement
+extract_regions returned 0 loops (the fragment loop iterates nothing; the only
+unsplit short-circuit fires pre-arrangement). Trigger: a repeated coincident-
+contained union whose re-imprint cuts diverge in vertex identity (the chamfer's
+corner-clip) -- both coincident +X caps hit 0 loops and vanished; Union's
+OnBoundary from_a-only rule dropped B's twin -&gt; open shell (edges 1,5,9,10).</pre>
+          <figcaption><span>commit 955f9f7</span><span>verbatim</span></figcaption>
+        </figure>
+        <p>The chamfer is what made it reproduce: its corner-clip caused the re-imprint to diverge
+        in vertex identity, so the second union's cuts were not recognised as the same cuts. A
+        control case without the chamfer does <em>not</em> reproduce, and is kept as a documented
+        control rather than deleted.</p>
+        <p>The fix is a post-arrangement fallback — zero extracted loops with active cuts means
+        preserve the face unsplit — and it was mutation-proven: disabling the fallback returns the
+        identical open shell.</p>
+        <h3>The part worth admitting</h3>
+        <p>The test's own doc comment still says it is left <code>#[ignore]</code>d and instructs
+        the reader to run it with <code>--ignored</code>. That is no longer true: the attribute is
+        gone, the test runs, and the defect was fixed two and a half hours after the repro was
+        banked. <strong>The comment outlived the bug it described.</strong> Documentation rot in a
+        codebase whose thesis is that it cannot lie is worth printing rather than quietly
+        correcting.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== CASE 5 ===== -->
+  <section class="plate">
+    <div class="grid">
+      <div class="col">
+        <p class="eyebrow">Case 05 — two layers agreeing on a lie</p>
+        <h2>Four holes reported, no material removed</h2>
+        <p>A bolt pattern on an off-origin part was drilled around the world origin. The agent
+        received <em>"holes: 4"</em> and a sound certificate, and the volume never changed.</p>
+        <p>It took two independent failures to produce that, one on each side of the language
+        boundary. The tool schema had no <code>center</code> parameter, so the argument was
+        <strong>silently stripped</strong> before the request was ever sent — the structural-typing
+        default that exists as a safety feature, acting as a data-loss channel. And the kernel, on
+        receiving a difference whose tool never touches the target, returned a copy of the target
+        as 200 and SOUND.</p>
+        <p>The second half is the one that matters here, because the first is a schema bug and the
+        second was a philosophy bug. A cut that removes nothing is now a typed refusal:</p>
+        <figure>
+          <pre>"Difference tool does not intersect the target: the operands are disjoint,
+ so the cut would remove nothing (target returned unchanged is not a result
+ this kernel reports as success)"</pre>
+          <figcaption><span>operations/mod.rs:286</span><span>DisjointDifference</span></figcaption>
+        </figure>
+        <p>The gate is deliberately narrow, and the narrowness is the interesting engineering.
+        It fires only when faces were selected and neither operand contributed contact — so
+        annihilation, where A is wholly inside B, still falls through to an empty result, and
+        enclosed voids keep B's faces and never trip it.</p>
+        <figure>
+          <pre>if matches!(operation, BooleanOp::Difference) &amp;&amp; !selected_faces.is_empty() {
+    let any_contact = intersections.iter().any(|fi| { !fi.curves.is_empty() || ... });
+    let tool_contributed = selected_faces.iter().any(|f| f.from_solid == solid_b);
+    if !any_contact &amp;&amp; !tool_contributed {
+        return Err(OperationError::DisjointDifference);
+    }
+}</pre>
+          <figcaption><span>boolean.rs:596</span><span>the gate</span></figcaption>
+        </figure>
+        <p>Mutation proof, from the commit: hardcoding the cylinder centre back to the origin goes
+        red — caught by the new refusal rather than by the geometry.</p>
+      </div>
+      <div class="margin">
+        <div class="note">
+          <b>Why two layers matter</b>
+          Either failure alone would have been visible. The schema strip alone would have drilled
+          the wrong place and shown it. The blessing alone would have needed a caller who already
+          passed the wrong centre. Together they produced a confident, certified, entirely wrong
+          result — which is the argument for typed refusals at every layer rather than validation
+          at one.
+        </div>
+        <div class="spec">
+          <div class="spec-hd"><span>Case 05</span><span class="stamp ok">FIXED</span></div>
+          <dl>
+            <dt>reported holes</dt><dd>4</dd>
+            <dt>material removed</dt><dd>0</dd>
+            <dt>status returned</dt><dd>200 SOUND</dd>
+            <dt>now</dt><dd>400 boolean_disjoint</dd>
+            <dt>retryable</dt><dd>no</dd>
+          </dl>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== CASE 6 ===== -->
+  <section class="plate">
+    <div class="grid">
+      <div class="col">
+        <p class="eyebrow">Case 06 — the institutional response</p>
+        <h2>Where "I don't know" is a return value</h2>
+        <p>The five cases above share a shape: the kernel had something true to say and said
+        something else. The response was not more tests. It was making refusal and uncertainty into
+        first-class types, so that the honest answer is expressible.</p>
+
+        <h3>A tri-state instead of a boolean</h3>
+        <p>Geometric tolerance verification returns a three-valued verdict, and the reasoning is in
+        the type's own doc comment:</p>
+        <figure>
+          <pre>/// The verdict of a conformance check. A tri-state, never a bare bool, so an
+/// unimplemented characteristic is reported honestly rather than as a pass.
+///
+/// The kernel does NOT yet verify this characteristic/feature combination.
+/// Carries a machine-readable reason. Never substituted by a pass.</pre>
+          <figcaption><span>gdt/verify.rs:64</span><span>Conformance::NotYetVerified</span></figcaption>
+        </figure>
+        <p>The measurement accessor returns an option, not a boolean — <code>None</code> when
+        nothing was measured. An unimplemented check cannot silently read as conformant, because
+        the type has nowhere to put that lie.</p>
+
+        <h3>A refusal that names what it cannot do, and why</h3>
+        <figure>
+          <pre>"Edges {} and {} share corner vertex {} with MIXED convexity (a convex blend
+ edge and a concave blend edge meet here). …no single sphere/plane is tangent
+ to both convexities. Mixed-convexity corners require an N-sided Gregory /
+ GB-patch corner blend (Charrot-Gregory 1984; Vaitkus-Várady-Salvi GB-patches,
+ CAGD 2018) — not yet implemented (Task #82 / F5)…"</pre>
+          <figcaption><span>lifecycle.rs:894</span><span>NotImplemented</span></figcaption>
+        </figure>
+        <p>It names the entities, the geometric reason it is impossible with the current
+        machinery, the literature that solves it, and the task tracking it. An agent can act on
+        that; so can a person.</p>
+
+        <h3>The commit that fixed a refusal rather than a feature</h3>
+        <p>The message above used to be <em>correct but misleading</em>: a mixed-convexity corner
+        fell through to a generic branch that called it a same-kind corner patch and recommended a
+        workaround which does not apply. The operation failed either way. The commit changed
+        nothing about what the kernel can do — only about what it says — and closed with the line
+        that is the thesis of this entire page:</p>
+        <figure>
+          <pre>An honest refusal must also be an accurate one.</pre>
+          <figcaption><span>commit fcf9c2f3</span><span>verbatim</span></figcaption>
+        </figure>
+
+        <h3>And one refusal that was itself a bug</h3>
+        <p>A blend refusal once advised applying each edge in a separate call. A later gate
+        established that this is exactly the sequence that corrupts the solid. The advice had been
+        recommending the corruption:</p>
+        <figure>
+          <pre>"Do NOT apply these edges in separate single-edge calls — sequential
+ single-edge blends at a shared corner are unsupported (they corrupt the
+ solid) and are refused."</pre>
+          <figcaption><span>lifecycle.rs:913</span><span>verbatim</span></figcaption>
+        </figure>
+        <p>Two more worth naming: <code>OpTimeout</code>, which states that <em>"the model is
+        unchanged"</em> because the operation ran on a discarded clone; and the pair
+        <code>EmptyResult</code> and <code>DisjointDifference</code> — the same observable symptom
+        split into two typed causes, <em>"the answer is nothing"</em> and <em>"the cut would change
+        nothing."</em></p>
+      </div>
+
+      <div class="margin">
+        <div class="note">
+          <b>The distinction that matters</b>
+          Most systems treat error strings as plumbing — written once, never read, never tested.
+          Here they are product surface: versioned, asserted against, and occasionally the entire
+          subject of a commit.
+        </div>
+        <figure>
+          <pre>"operation '{op_kind}' exceeded its
+ {budget_secs}s time budget and was aborted;
+ the model is unchanged"</pre>
+          <figcaption><span>error_catalog.rs:510</span><span>OpTimeout</span></figcaption>
+        </figure>
+        <div class="note hold">
+          <b>Coda</b>
+          Two admissions belong on this page. Case 04's documentation is stale — it describes a
+          defect the code beneath it no longer has. Case 03's fix is landing as this sheet is
+          written, which means its line citations describe history within days of publication.
+          A casebook about a kernel that cannot lie is more credible for saying so than for
+          quietly tidying up.
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <nav class="rail">
+    <a href="envelope.html">
+      <span class="n">Sheet 04</span><span class="t">Envelope</span>
+      <p>The honest capability map, verified line by line against the source tree.</p>
+    </a>
+    <a href="certificate.html">
+      <span class="n">Sheet 02</span><span class="t">The Certificate</span>
+      <p>Nine conjuncts, what is excluded, and where each check is narrower than its name.</p>
+    </a>
+    <a href="index.html">
+      <span class="n">Sheet 01</span><span class="t">The Claim</span>
+      <p>Why a kernel driven by machines has to carry its own proof.</p>
+    </a>
+  </nav>
+
+  <footer>
+    <span>Roshera — self-certifying geometry for machine operators</span>
+    <span>Alpha</span>
+    <span>Quotations verbatim from source</span>
+  </footer>
+</div>
+</body>
+</html>

@@ -1,0 +1,317 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Roshera — geometry that carries its own proof</title>
+<meta name="description" content="A self-certifying B-Rep geometry kernel for machine operators. Every operation returns a verifiable certificate; outside its envelope it refuses rather than approximates.">
+<link rel="icon" href="logo.png">
+<link rel="stylesheet" href="site.css">
+</head>
+<body>
+
+<header class="titleblock">
+  <div class="tb">
+    <p class="tb-name"><a href="index.html"><img src="logo.png" alt="" width="30" height="30">Roshera</a></p>
+    <nav class="tb-nav">
+      <a href="index.html" aria-current="page">The Claim</a>
+      <a href="certificate.html">The Certificate</a>
+      <a href="casebook.html">Casebook</a>
+      <a href="envelope.html">Envelope</a>
+    </nav>
+    <div class="tb-meta">
+      <span><b>Rev</b> alpha</span>
+      <span><b>Kernel</b> Rust B-Rep</span>
+      <span><b>Surface</b> MCP · REST</span>
+    </div>
+  </div>
+</header>
+
+<div class="sheet">
+
+  <!-- ================= 1. the claim ================= -->
+  <section class="plate">
+    <div class="grid">
+      <div class="col">
+        <p class="eyebrow">Self-certifying geometry kernel</p>
+        <h1>An agent can build the part.<br><em>Proving it didn't lie is the product.</em></h1>
+        <p class="lede">Roshera is a native Rust B-Rep kernel built to be driven by machines rather
+        than operated by hand. Every operation that touches geometry returns a
+        <strong>verifiable certificate</strong>: soundness across nine structural invariants, DOF
+        accounting, conflict witnesses.</p>
+        <p class="lede">Where it cannot answer inside a verified envelope, it
+        <strong>refuses with a typed error</strong> rather than returning an approximation labelled
+        exact.</p>
+
+        <p class="drop">The reason this matters is not craftsmanship. It is that the operator has
+        changed. For forty years a geometry kernel answered to a human with eyes — someone who would
+        notice a face flipped inside out, a bore that didn't go through, a fillet that quietly ate a
+        neighbouring feature. The kernel could be approximately honest because a person was holding
+        the other end of the contract.</p>
+
+        <p>An agent has no eyes. It receives a solid, believes it, and builds the next twelve
+        operations on top. A wrong answer does not announce itself at the moment it is produced —
+        it surfaces four steps later as a part that will not manufacture, and by then the reasoning
+        that produced it is gone. <strong>Silence is the failure mode</strong>, and no amount of
+        model capability fixes it, because the model is not the thing that is wrong.</p>
+
+        <p>So the contract has to move into the kernel. Not a confidence score, not a validation
+        pass you can forget to run — a structural proof, computed under the same lock as the
+        mutation, returned with every single call, failing closed.</p>
+      </div>
+
+      <div class="margin">
+        <figure class="dwg">
+          <svg viewBox="0 0 400 500" role="img" aria-label="Engineering drawing of a 50 millimetre pipe flange: sectioned front elevation and plan view with dimensions">
+            <defs>
+              <pattern id="hatchA" width="6" height="6" patternTransform="rotate(45)" patternUnits="userSpaceOnUse">
+                <line x1="0" y1="0" x2="0" y2="6" stroke="var(--blue)" stroke-width=".9" opacity=".5"/>
+              </pattern>
+              <marker id="arH" markerWidth="9" markerHeight="9" refX="8" refY="3" orient="auto">
+                <path d="M0,0 L8,3 L0,6 z" fill="var(--ink-3)"/>
+              </marker>
+              <marker id="arT" markerWidth="9" markerHeight="9" refX="1" refY="3" orient="auto">
+                <path d="M8,0 L0,3 L8,6 z" fill="var(--ink-3)"/>
+              </marker>
+            </defs>
+
+            <!-- ---------- SECTION A-A (front elevation) ---------- -->
+            <g stroke="var(--blue)" stroke-width="1.5" fill="url(#hatchA)">
+              <!-- left half section -->
+              <path d="M60,168 L60,196 L146,196 L146,168 L120,168 L120,146
+                       L112,146 L112,168 Z"/>
+              <!-- right half section -->
+              <path d="M232,168 L232,146 L224,146 L224,168 L198,168 L198,196
+                       L284,196 L284,168 Z"/>
+            </g>
+            <!-- chamfer ticks -->
+            <g stroke="var(--blue)" stroke-width="1.5" fill="none">
+              <path d="M60,172 L64,168 M60,192 L64,196 M284,172 L280,168 M284,192 L280,196"/>
+            </g>
+            <!-- bolt hole in section (hidden-ish) -->
+            <g stroke="var(--ink-3)" stroke-width="1" stroke-dasharray="5 3" fill="none">
+              <path d="M84,168 L84,196 M96,168 L96,196 M248,168 L248,196 M260,168 L260,196"/>
+            </g>
+            <!-- centre lines -->
+            <line x1="172" y1="128" x2="172" y2="214" stroke="var(--blue-2)" stroke-width=".9"
+                  stroke-dasharray="12 3 3 3" opacity=".9"/>
+            <line x1="44" y1="182" x2="300" y2="182" stroke="var(--blue-2)" stroke-width=".9"
+                  stroke-dasharray="12 3 3 3" opacity=".9"/>
+
+            <!-- dimensions: OD -->
+            <g stroke="var(--ink-3)" stroke-width=".85">
+              <line x1="60" y1="238" x2="284" y2="238" marker-start="url(#arT)" marker-end="url(#arH)"/>
+              <line x1="60" y1="200" x2="60" y2="242" stroke-width=".5"/>
+              <line x1="284" y1="200" x2="284" y2="242" stroke-width=".5"/>
+            </g>
+            <text class="dim" x="172" y="253" text-anchor="middle">&#216;50</text>
+
+            <!-- dimension: bore -->
+            <g stroke="var(--ink-3)" stroke-width=".85">
+              <line x1="146" y1="138" x2="198" y2="138" marker-start="url(#arT)" marker-end="url(#arH)"/>
+            </g>
+            <text class="dim" x="172" y="132" text-anchor="middle">&#216;16</text>
+
+            <!-- dimension: plate thickness -->
+            <g stroke="var(--ink-3)" stroke-width=".85">
+              <line x1="306" y1="168" x2="306" y2="196" marker-start="url(#arT)" marker-end="url(#arH)"/>
+              <line x1="288" y1="168" x2="310" y2="168" stroke-width=".5"/>
+              <line x1="288" y1="196" x2="310" y2="196" stroke-width=".5"/>
+            </g>
+            <text class="dim" x="314" y="185">6</text>
+
+            <!-- dimension: overall height -->
+            <g stroke="var(--ink-3)" stroke-width=".85">
+              <line x1="340" y1="146" x2="340" y2="196" marker-start="url(#arT)" marker-end="url(#arH)"/>
+              <line x1="226" y1="146" x2="344" y2="146" stroke-width=".5"/>
+            </g>
+            <text class="dim" x="348" y="174">13</text>
+
+            <!-- chamfer callout, kept clear of the bore dimension -->
+            <g stroke="var(--ink-3)" stroke-width=".7" fill="none">
+              <path d="M62,170 L48,116 L128,116"/>
+            </g>
+            <text class="dim" x="126" y="112" text-anchor="end">0.8&#215;45&#176; ALL ROUND</text>
+            <text class="lbl" x="44" y="222">SECTION A&#8211;A</text>
+
+            <!-- ---------- PLAN VIEW ---------- -->
+            <g transform="translate(172,372)">
+              <circle r="86" fill="none" stroke="var(--blue)" stroke-width="1.5"/>
+              <circle r="83" fill="none" stroke="var(--blue)" stroke-width=".8" opacity=".7"/>
+              <circle r="45" fill="none" stroke="var(--blue)" stroke-width="1.5"/>
+              <circle r="42" fill="none" stroke="var(--blue)" stroke-width=".8" opacity=".7"/>
+              <circle r="28" fill="none" stroke="var(--blue)" stroke-width="1.5"/>
+              <circle r="25" fill="none" stroke="var(--blue)" stroke-width=".8" opacity=".7"/>
+              <!-- bolt circle -->
+              <circle r="65" fill="none" stroke="var(--blue-2)" stroke-width=".9"
+                      stroke-dasharray="10 3 2 3" opacity=".9"/>
+              <!-- bolt holes -->
+              <g fill="none" stroke="var(--blue)" stroke-width="1.4">
+                <circle cx="65" cy="0" r="9"/><circle cx="-65" cy="0" r="9"/>
+                <circle cx="0" cy="65" r="9"/><circle cx="0" cy="-65" r="9"/>
+              </g>
+              <g fill="none" stroke="var(--blue)" stroke-width=".7" opacity=".7">
+                <circle cx="65" cy="0" r="11.5"/><circle cx="-65" cy="0" r="11.5"/>
+                <circle cx="0" cy="65" r="11.5"/><circle cx="0" cy="-65" r="11.5"/>
+              </g>
+              <!-- centre marks -->
+              <g stroke="var(--blue-2)" stroke-width=".9" opacity=".9">
+                <line x1="-100" y1="0" x2="100" y2="0" stroke-dasharray="12 3 3 3"/>
+                <line x1="0" y1="-100" x2="0" y2="100" stroke-dasharray="12 3 3 3"/>
+              </g>
+              <!-- section arrows -->
+              <g stroke="var(--ink-2)" stroke-width="1.3" fill="none">
+                <path d="M-104,0 L-104,-14 L-92,-14" marker-end="url(#arH)"/>
+                <path d="M104,0 L104,-14 L92,-14" marker-end="url(#arH)"/>
+              </g>
+              <text class="lbl" x="-112" y="16">A</text>
+              <text class="lbl" x="106" y="16">A</text>
+              <!-- PCD callout, below the view so it never sits on the geometry -->
+              <g stroke="var(--ink-3)" stroke-width=".7" fill="none">
+                <path d="M46,46 L74,86"/>
+              </g>
+              <text class="dim" x="0" y="106" text-anchor="middle">4&#215;&#216;5 ON &#216;38 PCD</text>
+            </g>
+          </svg>
+          <figcaption><span>Flange &#216;50 — as built by an agent, MCP calls</span><span>Solid 12 · SOUND</span></figcaption>
+        </figure>
+
+        <div class="note">
+          <b>Note 1 — provenance</b>
+          Dimensions above are the part in the session on the right, not an illustration. Its
+          certificate is reproduced in full on <a href="certificate.html">The Certificate</a>.
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= 2. the part, live ================= -->
+  <section class="plate">
+    <div class="grid wide">
+      <div class="margin">
+        <figure class="viewer">
+          <canvas id="gl" aria-label="Rotating pipe flange shaded by analytic surface type"></canvas>
+          <div class="hud"><span>Solid 12</span><span class="stamp ok">SOUND</span>
+            <span class="r">drag to orbit</span></div>
+          <div class="key">
+            <span><i style="background:#D98A3C"></i>Conical &times;13 — chamfers</span>
+            <span><i style="background:#5B93C7"></i>Cylindrical &times;7</span>
+            <span><i style="background:#8FA1B8"></i>Planar &times;3</span>
+          </div>
+          <div class="fallback" id="fb">&#216;50 flange — 23 analytic faces,
+            0.8&#215;45&#176; chamfers on all 39 convex edges.</div>
+        </figure>
+        <figcaption style="border:1px solid var(--rule);border-top:0">
+          <span>Surfaces coloured by kernel classification</span><span>23 faces</span>
+        </figcaption>
+      </div>
+
+      <div class="col">
+        <p class="eyebrow">What you are looking at</p>
+        <h2>Twenty-three faces, and the kernel knows what each one is</h2>
+        <p>That is not a mesh with a smooth shader on it. It is twenty-three analytic faces —
+        planar, cylindrical, conical — and the colours are the kernel's own surface classification,
+        not decoration. Every band on a chamfer is a real <strong>0.8&#215;45&#176; conical
+        face</strong> carried on its own surface, not a darkened edge in a triangle soup.</p>
+        <p>The distinction is load-bearing. A face that knows it is a cylinder of radius 8 gives an
+        exact bore area, an exact mass moment, and a watertight mesh at any tessellation density. A
+        face that is merely 400 triangles which happen to lie near a cylinder gives you numbers that
+        look right and drift — and it cannot answer the question <em>"is this a through bore?"</em>
+        at all.</p>
+        <p>Chamfering all thirty-nine convex edges in a single call is the operation where kernels
+        quietly produce a leaky solid: each blend removes material at a vertex where three surfaces
+        already disagree. This one returned <strong>watertight, manifold, zero boundary edges</strong>,
+        with the Euler characteristic unchanged at &minus;8 — the four bolt holes and the bore still
+        correctly accounted for after the blend.</p>
+
+        <div class="spec" style="margin-top:1.6rem">
+          <div class="spec-hd"><span>Certificate — solid 12</span><span class="stamp ok">SOUND</span></div>
+          <dl>
+            <dt>watertight</dt><dd>true</dd>
+            <dt>manifold</dt><dd>true</dd>
+            <dt>oriented</dt><dd>true</dd>
+            <dt>self-intersection free</dt><dd>true</dd>
+            <dt>euler characteristic</dt><dd>&minus;8</dd>
+            <dt>boundary edges</dt><dd>0</dd>
+            <dt>non-manifold edges</dt><dd>0</dd>
+            <dt>errors</dt><dd>[ ]</dd>
+          </dl>
+        </div>
+
+        <div class="note stop" style="margin-top:1.5rem">
+          <b>Note 2 — order dependence, observed live</b>
+          Applying the chamfers <em>before</em> drilling the bolt holes left this solid unsound at
+          the seam, and the kernel halted after the first hole rather than serving the rest. Drill
+          first, chamfer last. The family of coincident-face weld defects behind this is discussed
+          on the <a href="casebook.html">Casebook</a>, including one that is now fixed and one whose
+          documentation outlived the bug.
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= 3. the wager ================= -->
+  <section class="plate">
+    <div class="grid">
+      <div class="col">
+        <p class="eyebrow">The wager</p>
+        <h2>A kernel that refuses is worth more than one that guesses</h2>
+        <p>Every kernel has an envelope. The question is what happens at its edge. The industry's
+        default answer is to return something — a fitted surface, a tolerance-widened weld, a
+        result that is <em>probably</em> fine — because a human will catch it if it isn't.</p>
+        <p>We take the opposite position, and it costs us. A refusal is a worse demo than a wrong
+        answer, because the wrong answer looks like a part. But a refusal is the only response an
+        agent can actually act on: it names the entities, states the reason, and says what to do
+        instead. The agent recovers on the next call. A silent approximation cannot be recovered
+        from, because nothing knows it happened.</p>
+        <p>This is also why the envelope is published rather than hidden. A kernel selling honest
+        refusal that conceals its own limitations has already failed its own test — so
+        <a href="envelope.html">the map of what does and does not work</a> is a first-class page of
+        this site, maintained against the source tree rather than against intent.</p>
+      </div>
+      <div class="margin">
+        <figure>
+          <pre><span class="s">REFUSED</span>  chamfer_edges
+
+Edges 32 and 2 share corner vertex 0 —
+same-kind corner-patch synthesis for this
+vertex kind is not yet implemented.
+Do not apply sequentially.</pre>
+        </figure>
+        <div class="note hold">
+          <b>Note 3 — what a good refusal contains</b>
+          The entities (edges 32 and 2, vertex 0), the mechanism (same-kind corner patch), the
+          status (not yet implemented — not "invalid input"), and the trap to avoid (sequential
+          application, which would silently produce a different wrong answer). The agent recovered
+          on the following call and chamfered all thirty-nine edges in one pass.
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ================= rail ================= -->
+  <nav class="rail">
+    <a href="certificate.html">
+      <span class="n">Sheet 02</span><span class="t">The Certificate</span>
+      <p>What is in it, why it is an AND, what is deliberately excluded, and what fails closed.</p>
+    </a>
+    <a href="casebook.html">
+      <span class="n">Sheet 03</span><span class="t">Casebook</span>
+      <p>Six times the kernel caught something — including once when the thing it caught was itself.</p>
+    </a>
+    <a href="envelope.html">
+      <span class="n">Sheet 04</span><span class="t">Envelope</span>
+      <p>The honest capability map, verified line by line against the source tree.</p>
+    </a>
+  </nav>
+
+  <footer>
+    <span>Roshera — self-certifying geometry for machine operators</span>
+    <span>Alpha</span>
+    <span>Figures captured from live sessions</span>
+  </footer>
+</div>
+
+<script src="viewer.js"></script>
+</body>
+</html>

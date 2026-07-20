@@ -15,6 +15,12 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-FSL--1.1--Apache--2.0-blue" alt="License" /></a>
 </p>
 
+<p align="center">
+  <strong><a href="https://varun29ankus.github.io/Roshera-CAD/">Read the technical sheets →</a></strong>
+  <br />
+  <sub>The Claim · The Certificate · Casebook · Envelope</sub>
+</p>
+
 ---
 
 <p align="center">
@@ -29,7 +35,9 @@
 
 Roshera is an **agent runtime for geometry**. The product is the kernel and the bridge it exposes: a native Rust B-Rep engine whose primitives, topology, and operations carry enough semantic structure for an LLM to query, reason about, and drive directly. Humans orchestrate; agents execute. The React/Three.js frontend that ships in this repo is one client of that runtime — it talks to the kernel over REST + WebSocket the same way an external agent would.
 
-The differentiator is the readable surface: geometry is not just triangles, it is a queryable model with named features, intent, and history. And every operation an agent runs returns the kernel's **full validity certificate** — watertight, manifold, oriented, self-intersection-free, mesh-quality-clean, plus a dual-eye consistency check between what was built, what renders, and what the feature recognizer sees — so the geometry carries its own proof of correctness instead of a render that merely looks right. Many things work, many things don't — see [Status](#status) for what's actually usable today.
+The differentiator is the readable surface: geometry is not just triangles, it is a queryable model with named features, intent, and history. And every operation an agent runs returns the kernel's **full validity certificate** — a nine-conjunct AND over brep-validity, watertightness, manifoldness, orientation, self-intersection, construction consistency, feature consistency, and two mesh-quality dimensions — computed synchronously under the model write lock and failing closed. The geometry carries its own proof instead of a render that merely looks right.
+
+A second, render-based reconcile views each solid from fourteen viewpoints and cross-checks what it sees against what the kernel claims. That layer is **advisory**: it runs off the write lock and does not gate a mutation. The distinction matters, so it is stated here rather than blurred — see [The Certificate](https://varun29ankus.github.io/Roshera-CAD/certificate.html) for the anatomy, and [Status](#status) for what's actually usable today.
 
 ## Why a certificate matters
 
@@ -93,13 +101,19 @@ What follows is honest about what's tested versus what's implemented but rough. 
 | **Topology** | Manifold detection, adjacency | Tested |
 | **Tessellation** | Per-surface dispatch, adaptive subdivision | Works for analytic surfaces; extruded curved profiles still have watertightness issues |
 | **Operations** | Extrude (draft, taper, twist) | Implemented; side-face seam bugs being chased |
-| | Boolean (union, intersect, difference) | Implemented; edge cases (e.g. drill-through-cube) still fail in places |
-| | Fillet (constant-radius) | Implemented, lightly tested |
-| | Chamfer, Offset, Sewing | Implemented, lightly tested |
-| | Revolve (full/partial) | Implemented, lightly tested |
+| | Boolean (union, intersect, difference) | Works, incl. shared-imprint corefinement for NURBS × analytic cuts; coincident-face weld has known ordering sensitivity |
+| | Fillet (constant-radius) | Works; mixed-convexity corners return a typed refusal naming the literature |
+| | Chamfer | Works; closed-edge rim chamfers are **plane–cylinder only** — cone/torus/revolve-seam rims return NotImplemented |
+| | Offset, Sewing | Implemented, lightly tested |
+| | Revolve (full/partial) | Works; piecewise-analytic bands (arc → exact Torus/Sphere) on the typed strict path, 360° profiles without inner loops |
 | | Sweep (single path) | Implemented; multi-guide not done |
 | | Loft (ruled surfaces) | Implemented; smooth NURBS loft not done |
-| **Sketch 2D** | Newton-Raphson constraint solver | Implemented |
+| **Certificates** | Soundness (per-operation) | Nine-conjunct AND, synchronous under the write lock, 15 mutating call sites |
+| | Sketch — DOF, conflict witnesses | Minimal conflicting constraint sets via QuickXplain; honest `minimal: false` rather than a fabricated core |
+| | Rebuild (timeline mould) | Per-feature verdicts; global soundness re-measured from the resulting B-Rep |
+| **Sketch 2D** | Constraint solver + DR-plan | Works; per-entity constrainment exposed as queryable kernel facts |
+| **Durability** | Event-log persistence, replay, quarantine | Works; boot is a full replay (snapshots not implemented). Verified live by kill + resurrect |
+| **Agent surface** | MCP minimal surface + meta-tool funnel | Works; ~18 default tools, long tail reachable via `invoke` with identical schema validation |
 | **Assembly** | Data model + mates | Defined; constraint solver not done |
 | **Export** | STL, OBJ, encrypted .ros | Works |
 | | STEP | Skeleton in place; output not validated |
@@ -109,7 +123,12 @@ What follows is honest about what's tested versus what's implemented but rough. 
 | **Infrastructure** | Timeline (event-sourced history) | Works |
 | | RAG (Vamana vector index) | Works |
 | | Session manager (multi-user, RBAC) | Works |
+| | Auth posture | Secure by default on an empty environment; bypass requires an explicit insecure flag. Key persistence outstanding |
 | **Frontend** | React + R3F viewport, toolbar, chat | Works; rough around the edges |
+
+For a capability map maintained against the source tree rather than intent — including the four
+places a check is deliberately narrower than its name — see
+[Envelope](https://varun29ankus.github.io/Roshera-CAD/envelope.html).
 
 ## Performance
 
