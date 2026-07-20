@@ -9,6 +9,8 @@
 
 import { ToolTable, RegisteredTool, estimateTokens } from "./registry.js";
 import { registerMetaTools } from "./metatools.js";
+import { Workbench, registerWorkbenchTool } from "./workbench.js";
+import { registerCadProgram } from "./cad_program.js";
 import { registerPerceptionTools } from "./tools/perception.js";
 import { registerInspectTools } from "./tools/inspect.js";
 import { registerQueryTools } from "./tools/queries.js";
@@ -23,7 +25,12 @@ import { registerAssemblyTools } from "./tools/assembly.js";
 import { registerGdtTools } from "./tools/gdt.js";
 import { registerDrawingTools } from "./tools/drawing.js";
 
-/** The 15 core modeling + perception verbs always in the default surface. */
+/**
+ * The core modeling + perception verbs always in the default surface, plus the
+ * two composition/attention tools (workbench, cad_program) added in S3/S4 — all
+ * always exposed in minimal mode so a bench switch and a certified program are
+ * one predictable call away.
+ */
 export const CORE_SURFACE = [
   "create_box",
   "create_cylinder",
@@ -40,6 +47,8 @@ export const CORE_SURFACE = [
   "mass_properties",
   "delete_part",
   "clear_parts",
+  "workbench",
+  "cad_program",
 ];
 
 /** The 3 meta-tools — the fixed-cost funnel to the long tail. */
@@ -49,11 +58,20 @@ export const META_SURFACE = ["find_tool", "describe_tool", "invoke"];
 export const MINIMAL_SURFACE = [...CORE_SURFACE, ...META_SURFACE];
 
 /**
- * Register every tool + the three meta-tools into one fresh table. The meta-
- * tools close over that same table (find_tool / describe_tool / invoke all read
- * and dispatch from it).
+ * Register every kernel tool, the two composition tools (workbench, cad_program),
+ * and the three meta-tools into one fresh table, and build the session Workbench
+ * controller over it. The meta-tools + cad_program close over that same table
+ * (find_tool / describe_tool / invoke / cad_program all read and dispatch from
+ * it); the Workbench controller owns the bench-switch state machine.
+ *
+ * `index.ts` calls this to get both the table and the controller (which it then
+ * wires to the live server's enable/disable). The test suite and the thin
+ * `buildTable()` alias use only the table.
  */
-export function buildTable(): ToolTable {
+export function buildTableWithControls(): {
+  table: ToolTable;
+  workbench: Workbench;
+} {
   const table = new ToolTable();
   registerPerceptionTools(table);
   registerInspectTools(table);
@@ -68,8 +86,23 @@ export function buildTable(): ToolTable {
   registerAssemblyTools(table);
   registerGdtTools(table);
   registerDrawingTools(table);
+  // Composition tools (S3/S4) — registered into the SAME table so find_tool
+  // surfaces them and the token bill counts them.
+  const workbench = new Workbench(table, MINIMAL_SURFACE, resolveSurfaceMode());
+  registerWorkbenchTool(table, workbench);
+  registerCadProgram(table, table);
+  // Meta-tools last (they close over the fully-populated table).
   registerMetaTools(table, table);
-  return table;
+  return { table, workbench };
+}
+
+/**
+ * Build only the tool table (the meta-tools + cad_program close over it). The
+ * S3/S4 Workbench controller is discarded — used by tests and any caller that
+ * needs the static surface without the live bench state machine.
+ */
+export function buildTable(): ToolTable {
+  return buildTableWithControls().table;
 }
 
 export type SurfaceMode = "minimal" | "full";

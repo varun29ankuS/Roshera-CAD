@@ -31,7 +31,7 @@ import { BASE, AUTH_HEADERS } from "./core.js";
 import { RegisteredTool, canonicalJson, fnv1a64hex } from "./registry.js";
 import { setRegistryWarning } from "./metatools.js";
 import {
-  buildTable,
+  buildTableWithControls,
   resolveSurfaceMode,
   exposedNamesFor,
   billFor,
@@ -54,29 +54,67 @@ const server = new McpServer({
   icons: [{ src: ROSHERA_ICON, mimeType: "image/svg+xml", sizes: ["48x48"] }],
 });
 
-// ── 1. Register EVERY tool + the 3 meta-tools into the single internal table ──
+// ── 1. Register EVERY tool + composition + meta-tools into the single table ──
 // (Assembly + surface policy live in surface.ts, shared with the test suite.)
-const table = buildTable();
+// The Workbench controller (S3) rides along, owning the bench-switch state.
+const { table, workbench } = buildTableWithControls();
 
 // ── 2. Mount the active surface onto the live server ─────────────────────────
-// Default = minimal-complete (15 core verbs + 3 meta-tools); everything else is
-// in the table but reachable only via invoke. ROSHERA_MCP_SURFACE=full exposes
-// all 90+ directly (transition escape hatch).
-/** Mount one table entry as a live MCP tool, preserving its exact schema. */
-function mount(entry: RegisteredTool): void {
-  server.registerTool(
+// Default = minimal-complete (core verbs + workbench/cad_program + 3 meta-tools);
+// everything else is in the table, reachable via invoke. ROSHERA_MCP_SURFACE=full
+// exposes all directly (transition escape hatch).
+/**
+ * Mount one table entry as a live MCP tool, preserving its exact schema. Returns
+ * the SDK's registered-tool handle so a bench switch can enable()/disable() it
+ * (each flip emits `tools/list_changed`). `enabled:false` mounts a bench tool
+ * present-but-hidden until its bench is entered.
+ */
+function mount(entry: RegisteredTool, enabled = true) {
+  const handle = server.registerTool(
     entry.name,
     { description: entry.description, inputSchema: entry.schema as any },
     entry.handler,
   );
+  if (!enabled) handle.disable();
+  return handle;
 }
 
 const mode = resolveSurfaceMode();
-const exposedNames = exposedNamesFor(table, mode);
 
-for (const name of exposedNames) {
-  const entry = table.get(name);
-  if (entry) mount(entry);
+// The names actually mounted as live MCP tools (for the bill + the sanity guard).
+const exposedNames: string[] = [];
+
+if (mode === "full") {
+  // Everything exposed directly; benches are inactive (workbench → no-op notice).
+  for (const name of exposedNamesFor(table, "full")) {
+    const entry = table.get(name);
+    if (entry) {
+      mount(entry, true);
+      exposedNames.push(name);
+    }
+  }
+} else {
+  // Minimal: core+meta enabled; every switchable-bench tool mounted DISABLED so
+  // a workbench switch can reveal/retire it via the SDK's list_changed path.
+  for (const name of exposedNamesFor(table, "minimal")) {
+    const entry = table.get(name);
+    if (entry) {
+      mount(entry, true);
+      exposedNames.push(name);
+    }
+  }
+  const benchHandles = new Map<string, ReturnType<typeof mount>>();
+  for (const name of workbench.allSwitchableBenchTools()) {
+    const entry = table.get(name);
+    if (entry) benchHandles.set(name, mount(entry, false));
+  }
+  // Wire the controller's transition to the real server handles. enable()/
+  // disable() each emit tools/list_changed; capable clients refresh, others
+  // keep the long tail via invoke (workbench's returned notice says so).
+  workbench.setApply((toEnable, toDisable) => {
+    for (const n of toDisable) benchHandles.get(n)?.disable();
+    for (const n of toEnable) benchHandles.get(n)?.enable();
+  });
 }
 
 // A minimal-surface sanity guard: every intended tool must have been present in

@@ -4,7 +4,8 @@
 // (build first: `npm run build`). Four groups, matching the S2 spec:
 //   (a) validation parity  — invoke(create_box, bad) === direct-call error;
 //                            invoke(create_box, good) produces the identical POST.
-//   (b) surface flip       — minimal exposes exactly 18; full exposes 90.
+//   (b) surface flip       — minimal exposes exactly 20; full exposes 92.
+//                            (S3/S4 added 2 core tools: workbench + cad_program.)
 //   (c) find_tool ranking  — intent queries surface the right tools top-3.
 //   (d) hash vector        — TS FNV-1a-64 matches pinned reference vectors.
 //
@@ -86,30 +87,32 @@ console.log("(d) HASH: TS FNV-1a-64 reproduces canonical reference vectors");
 }
 
 // ── (b) Surface flip (pure) ──────────────────────────────────────────────────
-console.log("(b) SURFACE: minimal exposes 18, full exposes 90");
+console.log("(b) SURFACE: minimal exposes 20, full exposes 92");
 const table = buildTable();
 {
-  if (table.size === 93) pass("table holds 93 tools (90 kernel + 3 meta)");
-  else fail(`table size ${table.size}, expected 93`);
+  // S3/S4 added 2 core composition tools (workbench + cad_program): 90 kernel
+  // + 2 composition + 3 meta = 95.
+  if (table.size === 95) pass("table holds 95 tools (90 kernel + 2 composition + 3 meta)");
+  else fail(`table size ${table.size}, expected 95`);
 
   const minimal = exposedNamesFor(table, "minimal");
-  if (minimal.length === 18) pass("minimal surface exposes exactly 18 tools");
-  else fail(`minimal surface exposes ${minimal.length}, expected 18`);
+  if (minimal.length === 20) pass("minimal surface exposes exactly 20 tools");
+  else fail(`minimal surface exposes ${minimal.length}, expected 20`);
 
   const minimalSet = new Set(minimal);
   const expectedSet = new Set(MINIMAL_SURFACE);
   if (minimal.length === expectedSet.size && [...expectedSet].every((n) => minimalSet.has(n)))
-    pass("minimal surface = the 15 core + 3 meta names exactly");
+    pass("minimal surface = the 17 core + 3 meta names exactly");
   else fail(`minimal surface names differ: ${minimal.join(",")}`);
 
-  if (CORE_SURFACE.length === 15) pass("core list is 15 tools");
-  else fail(`core list is ${CORE_SURFACE.length}, expected 15`);
+  if (CORE_SURFACE.length === 17) pass("core list is 17 tools (15 verbs + workbench + cad_program)");
+  else fail(`core list is ${CORE_SURFACE.length}, expected 17`);
   if (META_SURFACE.length === 3) pass("meta list is 3 tools");
   else fail(`meta list is ${META_SURFACE.length}, expected 3`);
 
   const full = exposedNamesFor(table, "full");
-  if (full.length === 90) pass("full surface exposes exactly 90 tools (meta excluded)");
-  else fail(`full surface exposes ${full.length}, expected 90`);
+  if (full.length === 92) pass("full surface exposes exactly 92 tools (meta excluded)");
+  else fail(`full surface exposes ${full.length}, expected 92`);
   if (!full.some((n) => META_SURFACE.includes(n)))
     pass("full surface omits the meta-tools (they are the minimal-surface mechanism)");
   else fail("full surface unexpectedly includes meta-tools");

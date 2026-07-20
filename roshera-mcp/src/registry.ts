@@ -149,6 +149,8 @@ const EXPERIMENTAL = new Set<string>([
 
 const BENCH_OF: Record<string, Bench> = {
   // core
+  workbench: "core",
+  cad_program: "core",
   create_box: "core",
   create_cylinder: "core",
   create_sphere: "core",

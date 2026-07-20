@@ -268,6 +268,45 @@ export async function validateArgsLikeSdk(
   return parseResult.data;
 }
 
+/**
+ * Thrown by `validateOp` when a name is not in the table. Distinct from the
+ * `McpError(InvalidParams)` a bad-ARGS validation throws, so callers can render
+ * an unknown name (friendly "did you mean") differently from a schema failure
+ * (the identical typed error a direct call throws), while both are still a
+ * single up-front validation stop for `cad_program`.
+ */
+export class UnknownToolError extends Error {
+  constructor(
+    public readonly toolName: string,
+    public readonly nearest: string[],
+  ) {
+    super(`unknown tool '${toolName}'`);
+    this.name = "UnknownToolError";
+  }
+}
+
+/**
+ * Resolve + validate ONE op against the table exactly as `invoke` (and thus a
+ * direct call) does: unknown name → `UnknownToolError` (with nearest matches),
+ * bad args → the identical `McpError(InvalidParams,…)` a direct call throws.
+ * Returns `{entry, parsed}` (defaults + coercions applied) on success. This is
+ * the single shared resolve/validate path `invoke` and `cad_program` both run —
+ * no second validator, no drift between meta-path and direct-path checking.
+ */
+export async function validateOp(
+  table: ToolTable,
+  name: string,
+  args: unknown,
+): Promise<{ entry: RegisteredTool; parsed: any }> {
+  const entry = table.get(name);
+  if (!entry) {
+    const near = rankTools(table, name, undefined, 5).map((r) => r.name);
+    throw new UnknownToolError(name, near);
+  }
+  const parsed = await validateArgsLikeSdk(entry, args ?? {}, name);
+  return { entry, parsed };
+}
+
 // ─── Registration ────────────────────────────────────────────────────────────
 
 const FUNNEL_HINT =
@@ -374,22 +413,28 @@ export function registerMetaTools(host: ToolHost, table: ToolTable): void {
         .describe("the tool's arguments object (validated by its own schema)"),
     },
     async ({ name, args }, extra) => {
-      const entry = table.get(name);
-      if (!entry) {
-        const near = rankTools(table, name, undefined, 5).map((r) => r.name);
-        return fail(
-          new Error(
-            `cannot invoke unknown tool '${name}'.` +
-              (near.length ? ` Nearest matches: ${near.join(", ")}.` : "") +
-              " Use find_tool to search by intent, then invoke the exact name.",
-          ),
-        );
+      let resolved;
+      try {
+        // VALIDATION PARITY: the shared resolve/validate path — a bad arg throws
+        // the identical McpError a direct call throws (bubbles to the SDK, same
+        // typed result), which cad_program runs up front over its whole batch.
+        resolved = await validateOp(table, name, args ?? {});
+      } catch (e) {
+        if (e instanceof UnknownToolError) {
+          return fail(
+            new Error(
+              `cannot invoke unknown tool '${name}'.` +
+                (e.nearest.length
+                  ? ` Nearest matches: ${e.nearest.join(", ")}.`
+                  : "") +
+                " Use find_tool to search by intent, then invoke the exact name.",
+            ),
+          );
+        }
+        throw e; // bad-args McpError → identical typed error as a direct call
       }
-      // VALIDATION PARITY: parse through the tool's own schema exactly as a
-      // direct call would; a bad arg throws the identical typed error here.
-      const parsed = await validateArgsLikeSdk(entry, args ?? {}, name);
       // DISPATCH PARITY: the same handler the direct tool surface calls.
-      return await entry.handler(parsed, extra);
+      return await resolved.entry.handler(resolved.parsed, extra);
     },
   );
 }
