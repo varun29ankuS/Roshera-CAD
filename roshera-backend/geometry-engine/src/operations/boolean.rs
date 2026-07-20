@@ -15219,75 +15219,118 @@ fn presplit_boundary_t_junctions(
 /// overlap a single boundary edge that existed PRIOR to T-junction
 /// splitting; this function is its post-split counterpart.
 ///
-/// Coincidence is GEOMETRIC, not merely endpoint-sharing. A cut that shares
-/// BOTH endpoints with a boundary sub-edge yet bulges into the face interior
-/// — the canonical case being an arc whose two ends land on the same straight
+/// Coincidence is GEOMETRIC, not endpoint-sharing. A cut that shares BOTH
+/// endpoints with a boundary sub-edge yet bulges into the face interior — the
+/// canonical case being an arc whose two ends land on the same straight
 /// boundary edge (a "bite", e.g. a cylinder cross-section imprinted on a box
-/// cap) — is a genuine splitting curve that must be kept: dropping it by
-/// vertex pair alone leaves the face unsplit (no hole where the tool passes
-/// through). We therefore compare interior sample points and drop the cut only
-/// when it actually retraces the boundary edge within tolerance.
+/// cap) — is a genuine splitting curve that must be kept: dropping it by vertex
+/// pair alone leaves the face unsplit (no hole where the tool passes through).
+/// We therefore compare interior sample points and drop the cut only when it
+/// actually retraces a boundary edge within tolerance.
+///
+/// # Coincidence must not require matching endpoints (task #54)
+///
+/// This test used to CONSIDER only cuts whose endpoint vertex pair equalled a
+/// boundary edge's vertex pair, which silently limited it to cuts spanning a
+/// boundary edge end to end. A cut that lies on a boundary edge for only PART
+/// of its length has fresh vertices in that edge's interior, matches no pair,
+/// and was never examined.
+///
+/// That case is not exotic: it is what a working marcher produces whenever the
+/// intersection curve coincides with a face rim. The nozzle throat
+/// (`frustum_union_frustum_throat_27`) is the reference — two frustums meet
+/// along a shared r=6 circle that is simultaneously a rim of both cone faces
+/// and the true surface-surface intersection. The throat lies exactly on both
+/// cones' parameter-domain boundary, so the trace terminates early and yields
+/// roughly a twelfth of the rim. Imprinted, that fragment duplicated a stretch
+/// of rim, the DCEL walk produced a malformed cycle (edge 2 traversed twice in
+/// `loop[0] edges=[2, 44, 43, 42, 2, ...]`), and the solid went from watertight
+/// to 198 boundary edges.
+///
+/// So every splitting edge is now projected onto every boundary edge's curve.
+/// A cut is coincident when all of its interior samples lie on that curve
+/// within tolerance AND land inside the boundary edge's own parametric extent
+/// — the extent check keeps a cut that runs along the *continuation* of a
+/// boundary edge (same underlying curve, different stretch), which genuinely
+/// splits the face.
+///
+/// This is deliberately NOT a length test. Retracing the boundary is what
+/// drops a cut, at any length; a short cut in the face interior is kept, and a
+/// long one that departs the boundary anywhere is kept. Discarding cuts for
+/// being short would trade a visible defect for an invisible one — silently
+/// dropping legitimate open branches.
 fn drop_cuts_coincident_with_boundary(
     graph: &mut IntersectionGraph,
     model: &BRepModel,
     tolerance: &Tolerance,
 ) {
-    let mut boundary_by_pair: HashMap<(VertexId, VertexId), Vec<EdgeId>> = HashMap::new();
-    for (&eid, ge) in &graph.edges {
-        if ge.edge_type != EdgeType::Boundary {
-            continue;
-        }
-        let (a, b) = (ge.start_vertex, ge.end_vertex);
-        if a == u32::MAX || b == u32::MAX || a == b {
-            continue;
-        }
-        let pair = if a < b { (a, b) } else { (b, a) };
-        boundary_by_pair.entry(pair).or_default().push(eid);
-    }
+    let tol = tolerance.distance();
+    let tol_sq = tol * tol;
 
-    let tol_sq = tolerance.distance() * tolerance.distance();
-    // Three interior samples of an edge's underlying curve (¼, ½, ¾ of its
-    // parametric range). For a circular arc vs its chord the deviation is
-    // maximal at the midpoint, so this reliably separates a real bite from a
-    // true retrace; arcs whose sagitta is below tolerance are within the
-    // boundary and correctly treated as coincident.
-    let samples = |eid: EdgeId| -> Option<[Point3; 3]> {
+    // Interior samples of an edge, as fractions of its parametric range. Five
+    // rather than three: a cut that merely CROSSES a boundary edge touches it at
+    // isolated points, and the more interior samples must all lie on the
+    // boundary, the harder it is for a crossing to masquerade as a retrace.
+    // Endpoints are excluded — a cut legitimately shares those with the
+    // boundary.
+    const SAMPLE_FRACTIONS: [f64; 5] = [0.1, 0.3, 0.5, 0.7, 0.9];
+
+    let sample_edge = |eid: EdgeId| -> Option<Vec<Point3>> {
         let e = model.edges.get(eid)?;
         let c = model.curves.get(e.curve_id)?;
         let (t0, t1) = (e.param_range.start, e.param_range.end);
-        let at = |f: f64| c.evaluate(t0 + (t1 - t0) * f).ok().map(|p| p.position);
-        Some([at(0.25)?, at(0.5)?, at(0.75)?])
+        SAMPLE_FRACTIONS
+            .iter()
+            .map(|f| {
+                c.evaluate(t0 + (t1 - t0) * f)
+                    .ok()
+                    .map(|p: crate::primitives::curve::CurvePoint| p.position)
+            })
+            .collect()
+    };
+
+    let boundary_ids: Vec<EdgeId> = graph
+        .edges
+        .iter()
+        .filter(|(_, ge)| ge.edge_type == EdgeType::Boundary)
+        .map(|(&eid, _)| eid)
+        .collect();
+
+    // True when every sample of the cut lies on `beid`'s curve within tolerance
+    // AND within that edge's own parametric extent.
+    let retraces = |cut_samples: &[Point3], beid: EdgeId| -> bool {
+        let Some(be) = model.edges.get(beid) else {
+            return false;
+        };
+        let Some(bc) = model.curves.get(be.curve_id) else {
+            return false;
+        };
+        let (bt0, bt1) = (be.param_range.start, be.param_range.end);
+        let (lo, hi) = if bt0 <= bt1 { (bt0, bt1) } else { (bt1, bt0) };
+        // Parametric slack proportional to the extent: absorbs the projection's
+        // own convergence residual without admitting a neighbouring stretch.
+        let slack = ((hi - lo).abs() * 1.0e-6).max(1.0e-9);
+
+        cut_samples
+            .iter()
+            .all(|p| match bc.closest_point(p, *tolerance) {
+                Ok((t, foot)) => {
+                    let d = *p - foot;
+                    let on_curve = d.x * d.x + d.y * d.y + d.z * d.z <= tol_sq;
+                    let in_extent = t >= lo - slack && t <= hi + slack;
+                    on_curve && in_extent
+                }
+                Err(_) => false,
+            })
     };
 
     let redundant: Vec<EdgeId> = graph
         .edges
         .iter()
         .filter(|(_, ge)| ge.edge_type == EdgeType::Splitting)
-        .filter_map(|(&eid, ge)| {
-            let (a, b) = (ge.start_vertex, ge.end_vertex);
-            if a == u32::MAX || b == u32::MAX || a == b {
-                return None;
-            }
-            let pair = if a < b { (a, b) } else { (b, a) };
-            let bnd = boundary_by_pair.get(&pair)?;
-            let cut = samples(eid)?;
-            // Drop only if the cut retraces SOME boundary edge with the same
-            // endpoints at every interior sample (a genuine duplicate), not a
-            // chord/arc that merely shares endpoints.
-            let coincident = bnd.iter().any(|&beid| {
-                // A boundary edge may be parameterised start→end opposite to
-                // the cut; compare against both sample orders.
-                samples(beid).is_some_and(|bs| {
-                    let near = |p: Point3, q: Point3| {
-                        let d = p - q;
-                        d.x * d.x + d.y * d.y + d.z * d.z <= tol_sq
-                    };
-                    let fwd = near(cut[0], bs[0]) && near(cut[1], bs[1]) && near(cut[2], bs[2]);
-                    let rev = near(cut[0], bs[2]) && near(cut[1], bs[1]) && near(cut[2], bs[0]);
-                    fwd || rev
-                })
-            });
-            if coincident {
+        .filter_map(|(&eid, _)| {
+            let cut = sample_edge(eid)?;
+            if boundary_ids.iter().any(|&beid| retraces(&cut, beid)) {
                 Some(eid)
             } else {
                 None
@@ -20931,6 +20974,201 @@ mod tests {
         assert!(
             used < EVAL_BUDGET,
             "marching SSI used {used} surface evaluations on one unmarchable pair (budget {EVAL_BUDGET}) — the doomed march is being repeated per seed"
+        );
+    }
+
+    /// Task #54 fixtures: a face whose boundary carries a full circular rim.
+    /// Returns `(model, graph, rim_edge)` with the rim registered as a
+    /// `Boundary` edge.
+    ///
+    /// Mirrors the nozzle throat (`frustum_union_frustum_throat_27`): the two
+    /// frustums meet along a shared r=6 circle at z=-12, which is at once a rim
+    /// of both cone faces and the true surface-surface intersection.
+    fn rim_fixture() -> (BRepModel, IntersectionGraph, EdgeId) {
+        use crate::primitives::curve::{Circle, ParameterRange};
+        use crate::primitives::edge::{Edge, EdgeOrientation};
+
+        let mut model = BRepModel::new();
+        let rim = Circle::new(Point3::new(0.0, 0.0, -12.0), Vector3::Z, 6.0).expect("rim");
+        let rim_curve = model.curves.add(Box::new(rim));
+        let seam = model.vertices.add_or_find(6.0, 0.0, -12.0, 1e-9);
+        let rim_edge = model.edges.add(Edge::new(
+            0,
+            seam,
+            seam,
+            rim_curve,
+            EdgeOrientation::Forward,
+            ParameterRange::new(0.0, 1.0),
+        ));
+        let mut graph = IntersectionGraph::new();
+        graph.add_edge(rim_edge, EdgeType::Boundary);
+        (model, graph, rim_edge)
+    }
+
+    /// Add an arc of the rim circle spanning `[t0, t1]` of the full turn as a
+    /// `Splitting` cut, with fresh endpoint vertices at its own ends.
+    fn add_rim_arc_cut(
+        model: &mut BRepModel,
+        graph: &mut IntersectionGraph,
+        t0: f64,
+        t1: f64,
+    ) -> EdgeId {
+        use crate::primitives::curve::{Arc, ParameterRange};
+        use crate::primitives::edge::{Edge, EdgeOrientation};
+
+        let two_pi = std::f64::consts::PI * 2.0;
+        let (a0, a1) = (t0 * two_pi, t1 * two_pi);
+        let arc = Arc::new(Point3::new(0.0, 0.0, -12.0), Vector3::Z, 6.0, a0, a1).expect("arc");
+        let v0 = model
+            .vertices
+            .add_or_find(6.0 * a0.cos(), 6.0 * a0.sin(), -12.0, 1e-9);
+        let v1 = model
+            .vertices
+            .add_or_find(6.0 * a1.cos(), 6.0 * a1.sin(), -12.0, 1e-9);
+        let curve = model.curves.add(Box::new(arc));
+        let eid = model.edges.add(Edge::new(
+            0,
+            v0,
+            v1,
+            curve,
+            EdgeOrientation::Forward,
+            ParameterRange::new(0.0, 1.0),
+        ));
+        graph.add_edge(eid, EdgeType::Splitting);
+        eid
+    }
+
+    /// Task #54 RED: a cut lying ON a boundary rim but spanning only PART of it
+    /// must be recognised as boundary-coincident.
+    ///
+    /// A geometry-aware marcher traces the nozzle throat circle, but the throat
+    /// sits exactly on the parameter-domain boundary of both cones, so the trace
+    /// terminates early and yields roughly a twelfth of the rim. That fragment
+    /// is imprinted as a cut. Both existing coincidence filters key on the cut's
+    /// endpoint VERTEX PAIR matching a boundary edge's vertex pair, so a partial
+    /// arc — whose endpoints are fresh vertices in the rim's interior — matches
+    /// nothing and survives as a splitting edge. It then duplicates a stretch of
+    /// the rim, the DCEL walk yields a malformed cycle (observed:
+    /// `loop[0] edges=[2, 44, 43, 42, 2, ...]`, edge 2 traversed twice), and the
+    /// nozzle goes from watertight to 198 boundary edges.
+    ///
+    /// Coincidence is a property of GEOMETRY, not of endpoint identity: a cut
+    /// lying on the rim retraces the rim whether it covers all of it or a
+    /// twelfth of it.
+    #[test]
+    fn partial_arc_on_rim_is_boundary_coincident() {
+        let (mut model, mut graph, _rim) = rim_fixture();
+        // One twelfth of the rim, matching the observed traced fragment.
+        let frag = add_rim_arc_cut(&mut model, &mut graph, 0.0, 1.0 / 12.0);
+        graph.resolve_vertices(&model);
+        assert!(
+            graph.edges.contains_key(&frag),
+            "fixture must register the fragment as a splitting edge"
+        );
+
+        drop_cuts_coincident_with_boundary(&mut graph, &model, &Tolerance::default());
+
+        assert!(
+            !graph.edges.contains_key(&frag),
+            "a cut lying on the rim for a twelfth of its length still RETRACES the rim \
+and must be dropped; leaving it duplicates rim topology and breaks the DCEL cycle walk"
+        );
+    }
+
+    /// Guard for the fix above: dropping must be driven by lying ON the
+    /// boundary, never by being short. A stubby cut in the face INTERIOR is a
+    /// legitimate splitting curve and must survive — this is what separates a
+    /// geometric coincidence test from a fragment filter, which would silently
+    /// discard valid open branches.
+    #[test]
+    fn short_interior_cut_is_kept() {
+        use crate::primitives::curve::{Line, ParameterRange};
+        use crate::primitives::edge::{Edge, EdgeOrientation};
+
+        let (mut model, mut graph, _rim) = rim_fixture();
+        // A short chord well inside the rim (radius 6): (0,0) to (0.5,0.5).
+        let v0 = model.vertices.add_or_find(0.0, 0.0, -12.0, 1e-9);
+        let v1 = model.vertices.add_or_find(0.5, 0.5, -12.0, 1e-9);
+        let line = Line::new(Point3::new(0.0, 0.0, -12.0), Point3::new(0.5, 0.5, -12.0));
+        let curve = model.curves.add(Box::new(line));
+        let cut = model.edges.add(Edge::new(
+            0,
+            v0,
+            v1,
+            curve,
+            EdgeOrientation::Forward,
+            ParameterRange::new(0.0, 1.0),
+        ));
+        graph.add_edge(cut, EdgeType::Splitting);
+        graph.resolve_vertices(&model);
+
+        drop_cuts_coincident_with_boundary(&mut graph, &model, &Tolerance::default());
+
+        assert!(
+            graph.edges.contains_key(&cut),
+            "a short cut in the face interior is a genuine split and must be kept — \
+coincidence must be decided by lying on the boundary, not by length"
+        );
+    }
+
+    /// Guard: a cut lying on a boundary edge's underlying CURVE but outside that
+    /// edge's own parametric extent is not retracing it and must be kept.
+    ///
+    /// Built on a straight line so the projection genuinely lands ON the curve
+    /// with a near-zero residual, leaving the parametric extent as the ONLY
+    /// thing that can distinguish the two stretches. (An arc fixture cannot test
+    /// this: `closest_point` clamps to the arc, so the residual alone rejects
+    /// the cut and the extent check is never exercised.)
+    ///
+    /// Shape: one curve is the line x in [0, 10] at y=0, z=-12. The boundary
+    /// edge covers only x in [0, 3]. The cut lies on x in [5, 7] — same line,
+    /// disjoint stretch, so it splits the face and must survive.
+    #[test]
+    fn cut_on_boundary_curve_outside_its_extent_is_kept() {
+        use crate::primitives::curve::{Line, ParameterRange};
+        use crate::primitives::edge::{Edge, EdgeOrientation};
+
+        let mut model = BRepModel::new();
+        let spine = Line::new(Point3::new(0.0, 0.0, -12.0), Point3::new(10.0, 0.0, -12.0));
+        let spine_curve = model.curves.add(Box::new(spine));
+
+        // Boundary edge: only the first 30% of the line (x in [0, 3]).
+        let v_a = model.vertices.add_or_find(0.0, 0.0, -12.0, 1e-9);
+        let v_b = model.vertices.add_or_find(3.0, 0.0, -12.0, 1e-9);
+        let bnd = model.edges.add(Edge::new(
+            0,
+            v_a,
+            v_b,
+            spine_curve,
+            EdgeOrientation::Forward,
+            ParameterRange::new(0.0, 0.3),
+        ));
+        let mut graph = IntersectionGraph::new();
+        graph.add_edge(bnd, EdgeType::Boundary);
+
+        // Cut: a separate stretch of the SAME line, x in [5, 7].
+        let cut_line = Line::new(Point3::new(5.0, 0.0, -12.0), Point3::new(7.0, 0.0, -12.0));
+        let cut_curve = model.curves.add(Box::new(cut_line));
+        let v_c = model.vertices.add_or_find(5.0, 0.0, -12.0, 1e-9);
+        let v_d = model.vertices.add_or_find(7.0, 0.0, -12.0, 1e-9);
+        let cut_edge = model.edges.add(Edge::new(
+            0,
+            v_c,
+            v_d,
+            cut_curve,
+            EdgeOrientation::Forward,
+            ParameterRange::new(0.0, 1.0),
+        ));
+        graph.add_edge(cut_edge, EdgeType::Splitting);
+        graph.resolve_vertices(&model);
+
+        drop_cuts_coincident_with_boundary(&mut graph, &model, &Tolerance::default());
+
+        assert!(
+            graph.edges.contains_key(&cut_edge),
+            "a cut on the boundary edge's underlying CURVE but outside that edge's \
+parametric extent lies on a different stretch entirely — it splits the face and \
+must be kept"
         );
     }
 
