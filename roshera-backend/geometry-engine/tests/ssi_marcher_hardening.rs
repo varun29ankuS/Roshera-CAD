@@ -120,6 +120,82 @@ fn sphere_sphere_overlap_traces_full_circle() {
     );
 }
 
+/// **Task #50 — geometry-aware marching step.**
+///
+/// Same configuration as `sphere_sphere_overlap_traces_full_circle`, scaled up
+/// by 500×: two spheres of radius 500 offset by 500 along X. The intersection
+/// is a circle of radius 500·√3/2 ≈ 433 in the plane x = 250, circumference
+/// ≈ 2721.
+///
+/// A marcher whose step is derived from the *tolerance* rather than the
+/// *feature size* cannot cover this: with a fixed nominal chord and a bounded
+/// step budget its maximum reachable arc length is a constant independent of
+/// the model scale, so the trace stops a fixed distance in and the loop never
+/// closes. A geometry-aware step scales the chord with the traced feature, so
+/// the same step budget covers the circle at any scale.
+///
+/// Bounded by construction — the marcher's own step cap makes this fast in
+/// both the passing and the failing case; the assertion is on traced
+/// *structure* (arc length / closure), never on wall-clock.
+#[test]
+fn large_scale_circle_is_fully_traced_and_closes() {
+    let r_sphere = 500.0;
+    let s1 = Sphere::new(Point3::ORIGIN, r_sphere).expect("s1");
+    let s2 = Sphere::new(Point3::new(r_sphere, 0.0, 0.0), r_sphere).expect("s2");
+    let t = tol();
+    let curves = intersect_surfaces(&s1, &s2, &t).expect("ssi");
+    assert!(!curves.is_empty(), "overlapping spheres must intersect");
+
+    let best = curves
+        .iter()
+        .max_by_key(|c| stats(c).n_distinct)
+        .expect("at least one curve");
+    let st = stats(best);
+
+    let r = r_sphere * (3.0_f64).sqrt() / 2.0;
+    let expected_circumference = 2.0 * std::f64::consts::PI * r;
+    let expected_diag = 2.0 * r * (2.0_f64).sqrt();
+
+    eprintln!(
+        "large_scale: curves={} n_points={} n_distinct={} bbox_diag={:.3} (exp {:.3}) arc_len={:.3} (exp {:.3}) closed={}",
+        curves.len(),
+        st.n_points,
+        st.n_distinct,
+        st.bbox_diag,
+        expected_diag,
+        st.arc_len,
+        expected_circumference,
+        best.is_closed
+    );
+
+    assert!(
+        st.bbox_diag > 0.9 * expected_diag,
+        "traced bbox diagonal {:.3} vs expected {:.3} — step is not geometry-aware, \
+         the trace covers only a tolerance-sized fraction of a large feature",
+        st.bbox_diag,
+        expected_diag
+    );
+    assert!(
+        st.arc_len > 0.9 * expected_circumference,
+        "traced arc length {:.3} of an expected {:.3} circumference — the marching step \
+         does not scale with feature size (fixed nominal chord × fixed step budget = \
+         a scale-independent maximum reach)",
+        st.arc_len,
+        expected_circumference
+    );
+    assert!(
+        best.is_closed,
+        "a circle of radius {r:.1} must close; an unclosed trace means the step budget \
+         ran out before the loop came back to the seed"
+    );
+    assert_eq!(
+        curves.len(),
+        1,
+        "one circle expected; {} curves means partial traces were kept as separate branches",
+        curves.len()
+    );
+}
+
 /// Small cylinders (radius 0.2) crossing orthogonally. High curvature of the
 /// intersection relative to a fixed world-space step stresses adaptive step
 /// control. Every sample must lie on both cylinders and the polyline must

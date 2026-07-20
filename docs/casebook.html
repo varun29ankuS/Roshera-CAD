@@ -260,18 +260,57 @@ output was silent noise.</pre>
         <p>That commit touched the canonical implementation and one new test file. It did not touch
         the boolean engine's copy — which is precisely why the copy was still marching two per cent
         of a ring, 441 times, a year later.</p>
+
+        <h3>The canonical marcher had the same disease, differently</h3>
+        <p>Measuring rather than assuming turned up a second finding: the canonical implementation
+        is <em>also</em> geometry-blind. A nominal chord of 0.01, a maximum step factor of 8 and a
+        cap of 4,000 steps give a <strong>scale-independent maximum reach of 640 world units</strong>
+        — regardless of how large the feature is. On a circle of circumference 2,720.699 it traced
+        <strong>639.660</strong> and stopped. Not a bug in the tracing; a constant that assumed a
+        scale.</p>
+        <p>The fix derives the chord from the geometry instead: the bounding diagonal of the seed
+        cloud divided by 64, floored at the tolerance. Both scales now trace with the same sample
+        count, and the test binary went from <strong>11.34 s to 0.02 s</strong>. Separately, the
+        step budget was hoisted to be <strong>per surface pair</strong> rather than per seed, so an
+        unmarchable pair costs one budget instead of one per seed — <strong>1.2 million</strong>
+        evaluations where it previously cost about <strong>24 million</strong>.</p>
+
+        <h3>And then the interesting part: the bug was load-bearing</h3>
+        <p>The obvious next move is to delete the duplicate and call the canonical one. That was
+        attempted, and it <strong>broke a shipped watertightness test</strong> — a frustum union
+        that had been watertight came back with 198 boundary edges.</p>
+        <p>The reason is worth sitting with. That test passes today <em>because the marcher is
+        broken</em>. Its twenty seeds all hit the step cap, the tracer returns no curves at all, and
+        the part is then built correctly by an entirely different route — the coincident-rim weld
+        path. Give it a <em>working</em> tracer and it traces the throat circle for real — but only
+        a twelfth of it, because that throat sits exactly on the domain boundary of both cones — and
+        imprinting that fragment produces a doubled edge.</p>
+        <p>So a latent defect in the imprint pipeline has been sitting behind a broken marcher,
+        invisible, for as long as both have existed. Fixing the marcher properly does not fix the
+        part; it <strong>surfaces the older defect</strong>. The work stopped there rather than
+        inventing a filter to discard awkward curve fragments, because that filter would silently
+        drop legitimate open branches — trading a visible defect for an invisible one, which is the
+        exact trade this kernel exists to refuse.</p>
+        <p>The duplicated marcher therefore still exists. That is an honest debt, and it is written
+        down as one.</p>
       </div>
 
       <div class="margin">
         <div class="note hold">
           <b>Citation notice</b>
-          Line numbers for this case are cited against committed <code>763e9e16</code>. A fix is in
-          flight as this sheet is written: it deletes the duplicated marcher outright and delegates
-          to the canonical one. At the time of writing, <code>MAX_MARCH_STEPS</code> occurs three
-          times at HEAD and zero times in the working tree.
+          Line numbers for this case are cited against committed <code>763e9e16</code>. The step
+          size and budget are fixed; the duplicated implementation is not, and the reason is in the
+          body — removing it regresses a test that passes only because the marcher is broken.
+        </div>
+        <div class="note">
+          <b>An honest note on the mutation proof</b>
+          The first mutation — disabling seed consumption — <em>did not</em> fail the new test:
+          deduplication masked it, and four times the work still fitted inside the budget. The
+          budget was tightened on that evidence until the mutation was caught. A mutation test that
+          passes when it should fail is a test that was not yet measuring what it claimed.
         </div>
         <div class="spec">
-          <div class="spec-hd"><span>Case 03 — the arithmetic</span><span class="stamp hold">IN FLIGHT</span></div>
+          <div class="spec-hd"><span>Case 03 — the arithmetic</span><span class="stamp hold">PARTLY FIXED</span></div>
           <dl>
             <dt>step size</dt><dd>1e-5</dd>
             <dt>step cap</dt><dd>200,000</dd>

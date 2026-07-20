@@ -175,12 +175,65 @@ fn intersect_plane_plane(
     Ok(vec![curve])
 }
 
+/// Legacy fixed nominal chord, retained only as the fallback for a seed cloud
+/// too sparse to measure a feature size from. Unit-scale by construction.
+const FALLBACK_NOMINAL_STEP: f64 = 0.01;
+
+/// Nominal marching chords across the intersection's own bounding diagonal.
+///
+/// The chord that the adaptive step law converges to is `TURN_TARGET · R`,
+/// where `R` is the local radius of curvature of the intersection curve; the
+/// nominal chord only has to sit inside the `[MIN_STEP_FACTOR, MAX_STEP_FACTOR]`
+/// window around it. For a circular branch the seed-cloud diagonal is `2√2·R`,
+/// so `diagonal / 64 ≈ 0.044·R` lands comfortably above the window's lower
+/// edge (`0.2·R / 8 = 0.025·R`) at every model scale.
+const CHORDS_PER_FEATURE_DIAGONAL: f64 = 64.0;
+
+/// Geometry-aware nominal marching chord, derived from the world-space extent
+/// of the seed cloud — i.e. from the size of the feature actually being traced.
+///
+/// A chord tied to the distance *tolerance* instead makes the marcher's maximum
+/// reach (`chord × step budget`) a constant independent of model scale: a
+/// diameter-100 ring at a 1e-5 chord needs ~3·10⁷ steps and can never be
+/// covered, so every trace is truncated and discarded. Deriving the chord from
+/// the feature makes the step count scale-free.
+fn nominal_march_step(seeds: &[IntersectionPoint], tolerance: &Tolerance) -> f64 {
+    if seeds.len() < 2 {
+        return FALLBACK_NOMINAL_STEP;
+    }
+    let (mut lo, mut hi) = (
+        Point3::new(f64::MAX, f64::MAX, f64::MAX),
+        Point3::new(f64::MIN, f64::MIN, f64::MIN),
+    );
+    for s in seeds {
+        lo = Point3::new(
+            lo.x.min(s.position.x),
+            lo.y.min(s.position.y),
+            lo.z.min(s.position.z),
+        );
+        hi = Point3::new(
+            hi.x.max(s.position.x),
+            hi.y.max(s.position.y),
+            hi.z.max(s.position.z),
+        );
+    }
+    let diagonal = (hi - lo).magnitude();
+    if !diagonal.is_finite() || diagonal <= 0.0 {
+        return FALLBACK_NOMINAL_STEP;
+    }
+    (diagonal / CHORDS_PER_FEATURE_DIAGONAL).max(tolerance.distance() * 10.0)
+}
+
 /// Predictor–corrector marching from grid-found seeds.
 ///
 /// Each connected intersection branch is traced once: after a seed is traced,
 /// every remaining seed lying on the traced polyline is consumed so the same
 /// branch is not re-traced from every grid seed that landed on it. This is
 /// what turns the (deduplicated) seed *cloud* into one curve per component.
+///
+/// The marching chord is derived from the traced feature's size
+/// ([`nominal_march_step`]), so the step budget covers a branch at any model
+/// scale.
 fn intersect_surfaces_marching(
     surface1: &dyn Surface,
     surface2: &dyn Surface,
@@ -191,11 +244,12 @@ fn intersect_surfaces_marching(
     let seeds = find_intersection_seeds(surface1, surface2, tolerance)?;
     let mut consumed = vec![false; seeds.len()];
 
+    let nominal_step = nominal_march_step(&seeds, tolerance);
+
     // Coverage radius for consuming seeds that fall on an already-traced
     // branch. Generous relative to the nominal chord so a seed sitting
     // between two traced samples is still absorbed.
-    const NOMINAL_STEP: f64 = 0.01;
-    let coverage = (NOMINAL_STEP * 4.0).max(tolerance.distance() * 100.0);
+    let coverage = (nominal_step * 4.0).max(tolerance.distance() * 100.0);
     let coverage_sq = coverage * coverage;
 
     for i in 0..seeds.len() {
@@ -204,10 +258,11 @@ fn intersect_surfaces_marching(
         }
         consumed[i] = true;
 
-        let curve = match trace_intersection_curve(surface1, surface2, seeds[i], tolerance) {
-            Ok(c) if c.points.len() >= 2 => c,
-            _ => continue,
-        };
+        let curve =
+            match trace_intersection_curve(surface1, surface2, seeds[i], tolerance, nominal_step) {
+                Ok(c) if c.points.len() >= 2 => c,
+                _ => continue,
+            };
 
         // Consume every remaining seed that lies on this traced branch.
         for (j, seed) in seeds.iter().enumerate() {
@@ -598,6 +653,7 @@ fn trace_intersection_curve(
     surface2: &dyn Surface,
     seed: IntersectionPoint,
     tolerance: &Tolerance,
+    nominal_step: f64,
 ) -> MathResult<IntersectionCurve> {
     let mut curve = IntersectionCurve {
         points: vec![seed.position],
@@ -615,6 +671,7 @@ fn trace_intersection_curve(
         seed,
         1.0,
         tolerance,
+        nominal_step,
         &mut closed,
     )?;
 
@@ -643,6 +700,7 @@ fn trace_intersection_curve(
         reversed_seed,
         1.0,
         tolerance,
+        nominal_step,
         &mut closed_back,
     )?;
 
@@ -682,10 +740,10 @@ fn trace_direction(
     mut current: IntersectionPoint,
     direction: f64,
     tolerance: &Tolerance,
+    nominal_step: f64,
     closed_out: &mut bool,
 ) -> MathResult<()> {
     const MAX_STEPS: usize = 4000;
-    const NOMINAL_STEP: f64 = 0.01;
     /// Floor on subdivision: when the prediction step has been halved
     /// to this fraction of nominal and the corrector still diverges,
     /// give up cleanly. Six halvings ≈ 1/64 of nominal = 1.5e-4 in
@@ -707,7 +765,7 @@ fn trace_direction(
     let mut total_steps = 0usize;
 
     while total_steps < MAX_STEPS {
-        let step_size = NOMINAL_STEP * step_factor;
+        let step_size = nominal_step * step_factor;
         let predicted_pos = current.position + current.tangent * (step_size * direction);
 
         let corrected_opt = correct_to_intersection(

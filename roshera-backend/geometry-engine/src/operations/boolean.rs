@@ -1892,6 +1892,19 @@ fn plane_general_intersection(
     Ok(out)
 }
 
+/// HARD STEP CAP for the general marching SSI, shared by every seed on one
+/// surface pair. The marching step is tied to the distance tolerance (~1e-5),
+/// so a curve on unit-scale primitives needs ~10^6 steps; for a pair with NO
+/// analytic SSI arm (cone x cylinder, cone x sphere, ...) the march can also
+/// fail to ever close — a true HANG that freezes the kernel (the worst failure
+/// class). Bound it: a real intersection curve on bounded analytic primitives
+/// needs far fewer points; exhausting the budget means the march is
+/// non-terminating/unreliable, so those curves are discarded rather than
+/// hanging or feeding a truncated garbage curve downstream. The proper fix for
+/// those pairs is an analytic SSI arm (task #7) / a geometry-scaled step —
+/// tracked separately; this is the safety guard.
+const MAX_MARCH_STEPS: usize = 200_000;
+
 /// Marching algorithm for surface intersection
 fn march_surface_intersection(
     surface_a: &dyn Surface,
@@ -1903,9 +1916,28 @@ fn march_surface_intersection(
     // Find initial intersection points using grid sampling
     let initial_points = find_initial_intersection_points(surface_a, surface_b, tolerance)?;
 
-    // March from each initial point
+    // March from each initial point under a budget shared by the WHOLE surface
+    // pair (task #50). The per-march cap alone bounds one trace but not the
+    // pipeline: on a large feature the tolerance-derived step cannot cover the
+    // curve, so every seed burns the full cap on the same doomed branch and is
+    // discarded — ~20 seeds on a diameter-100 ring cost ~10^8 surface
+    // evaluations and over two minutes of wall-clock to produce nothing. A
+    // shared budget makes an unmarchable pair cost O(cap) instead of
+    // O(seeds x cap); the curves that are emitted are unchanged.
+    let mut budget = MAX_MARCH_STEPS;
     for start_point in initial_points {
-        if let Some(curve) = march_from_point(surface_a, surface_b, start_point, tolerance)? {
+        if budget == 0 {
+            if pipeline_trace_enabled() {
+                eprintln!(
+                    "[bool]   march_surface_intersection: pair step budget \
+                     {MAX_MARCH_STEPS} exhausted — remaining seeds not marched"
+                );
+            }
+            break;
+        }
+        if let Some(curve) =
+            march_from_point(surface_a, surface_b, start_point, tolerance, &mut budget)?
+        {
             curves.push(curve);
         }
     }
@@ -4581,6 +4613,7 @@ fn march_from_point(
     surface_b: &dyn Surface,
     start: IntersectionPoint,
     tolerance: &Tolerance,
+    budget: &mut usize,
 ) -> OperationResult<Option<SurfaceIntersectionCurve>> {
     // HARD STEP CAP per direction. The marching step is tied to the distance
     // tolerance (≈1e-5), so a curve on unit-scale primitives needs ~10^6 steps;
@@ -4592,8 +4625,6 @@ fn march_from_point(
     // rather than hang or feed a truncated garbage curve downstream. The proper
     // fix for those pairs is an analytic SSI arm (task #7) / a geometry-scaled
     // step — tracked separately; this is the safety guard.
-    const MAX_MARCH_STEPS: usize = 200_000;
-
     // Collect each direction into its own Vec (forward + backward) and splice at
     // the end, so the backward branch is O(n) instead of the old insert(0, …)
     // which made a long march quadratic.
@@ -4603,11 +4634,9 @@ fn march_from_point(
     for direction in &[1.0, -1.0] {
         let mut current = start.clone();
         let mut step_size = tolerance.distance() * 10.0;
-        let mut steps = 0usize;
 
         loop {
-            steps += 1;
-            if steps > MAX_MARCH_STEPS {
+            if *budget == 0 {
                 // Non-terminating march — bail the whole curve as unreliable.
                 if pipeline_trace_enabled() {
                     eprintln!(
@@ -4617,6 +4646,7 @@ fn march_from_point(
                 }
                 return Ok(None);
             }
+            *budget -= 1;
 
             // Compute tangent direction
             let tangent = compute_intersection_tangent(surface_a, surface_b, &current)?;
@@ -20729,6 +20759,180 @@ mod tests {
     use crate::math::{Point3, Tolerance, Vector3};
     use crate::primitives::surface::{Cylinder, Plane, Sphere};
     use crate::primitives::topology_builder::{BRepModel, TopologyBuilder};
+
+    /// Task #50 — work-budget instrumentation for the general SSI marcher.
+    ///
+    /// The boolean face-face marcher used to (a) re-march the *same*
+    /// intersection branch once per grid seed that landed on it, because it had
+    /// no branch consumption, and (b) step by a fixed multiple of the distance
+    /// tolerance regardless of feature size. On a large feature the two compound:
+    /// each of ~20 seeds burns the whole step cap on the same doomed partial
+    /// trace, discards it, and starts over — ~10^8 surface evaluations, observed
+    /// live as a multi-minute boolean hang.
+    ///
+    /// This wrapper counts surface evaluations and *aborts* once a budget is
+    /// exceeded, so the pathological case is observed as a bounded, fast failure
+    /// (an exceeded budget) instead of a hang. The assertion is on evaluation
+    /// count and traced structure — never on wall-clock.
+    mod ssi_work_budget {
+        use crate::math::{MathError, MathResult, Matrix4, Point3, Tolerance};
+        use crate::primitives::surface::{
+            OffsetSurface, Surface, SurfaceIntersectionResult, SurfacePoint, SurfaceType,
+        };
+        use std::any::Any;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        /// A `Surface` decorator that tallies every evaluation and refuses to
+        /// evaluate past `budget`, converting a runaway march into a prompt
+        /// typed error.
+        #[derive(Debug)]
+        pub struct CountingSurface {
+            inner: Box<dyn Surface>,
+            pub evals: Arc<AtomicUsize>,
+            budget: usize,
+        }
+
+        impl CountingSurface {
+            pub fn new(inner: Box<dyn Surface>, evals: Arc<AtomicUsize>, budget: usize) -> Self {
+                Self {
+                    inner,
+                    evals,
+                    budget,
+                }
+            }
+
+            fn charge(&self) -> MathResult<()> {
+                let n = self.evals.fetch_add(1, Ordering::Relaxed);
+                if n >= self.budget {
+                    return Err(MathError::InvalidParameter(format!(
+                        "ssi-work-budget: surface evaluation budget {} exceeded",
+                        self.budget
+                    )));
+                }
+                Ok(())
+            }
+        }
+
+        impl Surface for CountingSurface {
+            fn surface_type(&self) -> SurfaceType {
+                self.inner.surface_type()
+            }
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+            fn clone_box(&self) -> Box<dyn Surface> {
+                self.inner.clone_box()
+            }
+            fn evaluate_full(&self, u: f64, v: f64) -> MathResult<SurfacePoint> {
+                self.charge()?;
+                self.inner.evaluate_full(u, v)
+            }
+            fn parameter_bounds(&self) -> ((f64, f64), (f64, f64)) {
+                self.inner.parameter_bounds()
+            }
+            fn is_closed_u(&self) -> bool {
+                self.inner.is_closed_u()
+            }
+            fn is_closed_v(&self) -> bool {
+                self.inner.is_closed_v()
+            }
+            fn transform(&self, matrix: &Matrix4) -> Box<dyn Surface> {
+                self.inner.transform(matrix)
+            }
+            fn type_name(&self) -> &'static str {
+                self.inner.type_name()
+            }
+            fn closest_point(
+                &self,
+                point: &Point3,
+                tolerance: Tolerance,
+            ) -> MathResult<(f64, f64)> {
+                self.charge()?;
+                self.inner.closest_point(point, tolerance)
+            }
+            fn offset(&self, distance: f64) -> Box<dyn Surface> {
+                self.inner.offset(distance)
+            }
+            fn offset_exact(
+                &self,
+                distance: f64,
+                tolerance: Tolerance,
+            ) -> MathResult<OffsetSurface> {
+                self.inner.offset_exact(distance, tolerance)
+            }
+            fn offset_variable(
+                &self,
+                distance_fn: Box<dyn Fn(f64, f64) -> f64 + Send + Sync>,
+                tolerance: Tolerance,
+            ) -> MathResult<Box<dyn Surface>> {
+                self.inner.offset_variable(distance_fn, tolerance)
+            }
+            fn intersect(
+                &self,
+                other: &dyn Surface,
+                tolerance: Tolerance,
+            ) -> Vec<SurfaceIntersectionResult> {
+                self.inner.intersect(other, tolerance)
+            }
+        }
+    }
+
+    /// Task #50 RED: marching a surface pair must cost O(step cap), not
+    /// O(seeds x step cap).
+    ///
+    /// Fixture: a diameter-100 cylinder (radius 50, axis +Z, height 20 centred
+    /// on z = 0) against the plane z = 0 — the thin-wall / capped-tube pairing
+    /// that produced the observed hang. The intersection is a single circle of
+    /// radius 50, circumference ~314.
+    ///
+    /// The seeder's 20x20 grid puts its middle `v` row exactly on z = 0, so 20
+    /// seeds land on that one circle. The marching step is a fixed
+    /// `tolerance * 10` ~ 1e-5, so covering 314 units would need ~3e7 steps:
+    /// the march cannot complete and is discarded as unreliable. That much is
+    /// by design. What is NOT by design is doing it twenty times over — every
+    /// seed re-runs the identical doomed march, which is ~1e8 surface
+    /// evaluations and the >120 s hang that was observed live.
+    ///
+    /// The invariant this pins: the step budget is spent by the surface PAIR,
+    /// so an unmarchable pair costs one cap's worth of work no matter how many
+    /// seeds sit on it. Asserted on evaluation count, never on wall-clock.
+    #[test]
+    fn unmarchable_pair_costs_one_step_budget_not_one_per_seed() {
+        use ssi_work_budget::CountingSurface;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        // One exhausted 200 000-step budget costs ~1.2e6 surface evaluations
+        // (~6 per step). The budget below admits that single march with room to
+        // spare while being far below the ~2.4e6 a SECOND full march would
+        // reach — so re-marching the same doomed branch trips it.
+        const EVAL_BUDGET: usize = 2_000_000;
+
+        let r = 50.0_f64;
+        let evals = Arc::new(AtomicUsize::new(0));
+        let cyl = Cylinder::new_finite(Point3::new(0.0, 0.0, -10.0), Vector3::Z, r, 20.0)
+            .expect("cylinder");
+        let plane = Plane::new(Point3::ORIGIN, Vector3::Z, Vector3::X).expect("plane");
+        let sa = CountingSurface::new(Box::new(cyl), Arc::clone(&evals), EVAL_BUDGET);
+        let sb = CountingSurface::new(Box::new(plane), Arc::clone(&evals), EVAL_BUDGET);
+
+        let tol = Tolerance::from_distance(1e-6);
+        let result = march_surface_intersection(&sa, &sb, &tol);
+        let used = evals.load(Ordering::Relaxed);
+
+        eprintln!("unmarchable_pair: evaluations={used} ok={}", result.is_ok());
+
+        assert!(
+            result.is_ok(),
+            "marching SSI blew the {EVAL_BUDGET}-evaluation budget ({used} used) on a single circle of radius {r:.1}: {:?}. The step budget is being spent once per seed instead of once per surface pair.",
+            result.err()
+        );
+        assert!(
+            used < EVAL_BUDGET,
+            "marching SSI used {used} surface evaluations on one unmarchable pair (budget {EVAL_BUDGET}) — the doomed march is being repeated per seed"
+        );
+    }
 
     /// A circle that crosses a straight line transversally must report BOTH
     /// crossings. Regression guard for the pattern-search refinement in
