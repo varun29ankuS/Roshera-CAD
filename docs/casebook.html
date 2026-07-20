@@ -282,17 +282,36 @@ output was silent noise.</pre>
         <p>The reason is worth sitting with. That test passes today <em>because the marcher is
         broken</em>. Its twenty seeds all hit the step cap, the tracer returns no curves at all, and
         the part is then built correctly by an entirely different route — the coincident-rim weld
-        path. Give it a <em>working</em> tracer and it traces the throat circle for real — but only
-        a twelfth of it, because that throat sits exactly on the domain boundary of both cones — and
-        imprinting that fragment produces a doubled edge.</p>
-        <p>So a latent defect in the imprint pipeline has been sitting behind a broken marcher,
-        invisible, for as long as both have existed. Fixing the marcher properly does not fix the
-        part; it <strong>surfaces the older defect</strong>. The work stopped there rather than
-        inventing a filter to discard awkward curve fragments, because that filter would silently
-        drop legitimate open branches — trading a visible defect for an invisible one, which is the
-        exact trade this kernel exists to refuse.</p>
-        <p>The duplicated marcher therefore still exists. That is an honest debt, and it is written
-        down as one.</p>
+        path. Give it a working tracer and it produces a curve fragment that the imprint pipeline
+        then mishandles into a doubled edge.</p>
+
+        <h3>The root cause was not what anyone thought — including us</h3>
+        <p>The first diagnosis was that the fragment lay exactly on the shared rim, and that the
+        imprint pipeline failed to recognise a <em>partial</em> arc as boundary-coincident. That
+        framing was published on this page. It was wrong, and measuring rather than reasoning is
+        what caught it.</p>
+        <p>Instrumenting the coincidence predicate gave the fragment's actual residual against the
+        rim: <strong>3.948 × 10⁻²</strong>, where rim-coincidence would be around 10⁻⁷. The fragment
+        is not on the rim. It is <strong>0.04 away from it</strong>.</p>
+        <p>The reason it is 0.04 away is the real finding, and it is a soundness problem in its own
+        right. The marcher's step law targets a fixed <em>turn</em> per step — 0.2 radians — which
+        fixes the chord at a constant fraction of local radius, roughly half a per cent. That is a
+        shape-fidelity criterion. It is scale-free, which sounds like a virtue, and it is
+        <strong>entirely independent of the distance tolerance the caller passed in</strong>.</p>
+        <p>So at a radius of 6, handed a tolerance of 10⁻⁶, the marcher returns a polyline sitting
+        0.03 to 0.04 away from the true curve — about <strong>thirty thousand times coarser than
+        requested</strong> — and says nothing. Every consumer downstream believes it received
+        geometry accurate to the tolerance it asked for. <em>The marcher does not honour its own
+        contract</em>, and that only became visible when unification pointed its output at a
+        pipeline that actually requires tolerance-accurate input.</p>
+        <p>The principled fix is to bound the chord by the caller's tolerance rather than by turn
+        angle. It was implemented, and it is correct and bounded on the original case. It also makes
+        the frustum union <strong>hang</strong> — no completion in fifteen minutes — for reasons not
+        yet diagnosed. It was reverted rather than left in the tree.</p>
+        <p>So: one real imprint defect found and fixed along the way, a wrong root cause corrected by
+        measurement, the true root cause identified and its fix deferred because it exposes something
+        worse. The duplicated marcher still exists. All of that is written down as debt rather than
+        rounded up into a claim of completion.</p>
       </div>
 
       <div class="margin">
