@@ -1,6 +1,6 @@
 /** Modification tools — shell, blends, booleans (single + batch), transform, delete. */
 
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { ToolHost } from "../registry.js";
 import { z } from "zod";
 import {
   api,
@@ -20,7 +20,7 @@ import {
   unit3,
 } from "../core.js";
 
-export function registerModifyTools(server: McpServer) {
+export function registerModifyTools(server: ToolHost) {
   server.tool(
     "delete_part",
     "Delete one part (timeline-recorded, undo-safe). WARNING: kernel part ids " +

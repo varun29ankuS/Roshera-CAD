@@ -1,6 +1,6 @@
 /** I/O tools — STEP import, CAD-file export, drawing generation + fetch. */
 
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { ToolHost } from "../registry.js";
 import { z } from "zod";
 import {
   api,
@@ -12,7 +12,7 @@ import {
   defaultSaveDir,
 } from "../core.js";
 
-export function registerIoTools(server: McpServer) {
+export function registerIoTools(server: ToolHost) {
   server.tool(
     "import_step",
     "IMPORT a STEP file (AP203/214/242) as real B-Rep solids. Give `path` OR " +

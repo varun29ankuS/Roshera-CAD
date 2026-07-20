@@ -10,7 +10,7 @@
  * unprovenanced) rather than fabricate.
  */
 
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { ToolHost } from "../registry.js";
 import { z } from "zod";
 import { api, ok, fail } from "../core.js";
 
@@ -100,7 +100,7 @@ function answerLine(a: any): string {
   }
 }
 
-export function registerDrawingTools(server: McpServer): void {
+export function registerDrawingTools(server: ToolHost): void {
   // ── drawing_read_semantics ─────────────────────────────────────────────
   server.tool(
     "drawing_read_semantics",

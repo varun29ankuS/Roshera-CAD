@@ -1,6 +1,6 @@
 /** Creation tools — sketches, composite primitives, revolve, loft. */
 
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { ToolHost } from "../registry.js";
 import { z } from "zod";
 import {
   api,
@@ -14,7 +14,7 @@ import {
   cross3,
 } from "../core.js";
 
-export function registerCreateTools(server: McpServer) {
+export function registerCreateTools(server: ToolHost) {
   server.tool(
     "create_sketch",
     "Start a click-draft sketch session on a plane; returns sketch_id for " +

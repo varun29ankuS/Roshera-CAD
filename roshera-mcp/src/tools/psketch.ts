@@ -1,10 +1,10 @@
 /** Parametric sketching (csketch — constraint-solver backed). */
 
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { ToolHost } from "../registry.js";
 import { z } from "zod";
 import { api, ok, fail, okp, newestPartId } from "../core.js";
 
-export function registerPsketchTools(server: McpServer) {
+export function registerPsketchTools(server: ToolHost) {
   server.tool(
     "psketch_begin",
     "START a new PARAMETRIC sketch session (constraint-solver backed, XY plane); " +

@@ -4,11 +4,11 @@
  * Resolution REFUSES on unknown/ambiguous rather than guessing.
  */
 
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { ToolHost } from "../registry.js";
 import { z } from "zod";
 import { api, ok, fail, BASE, AUTH_HEADERS } from "../core.js";
 
-export function registerLabelTools(server: McpServer) {
+export function registerLabelTools(server: ToolHost) {
   server.tool(
     "label_create",
     "PIN a name to a feature (e.g. 'throat'). Target by id (`entity_id`+`kind`), " +

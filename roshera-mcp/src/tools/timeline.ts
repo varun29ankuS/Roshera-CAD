@@ -1,6 +1,6 @@
 /** Timeline tools — event-sourced history: scrub, clear. */
 
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { ToolHost } from "../registry.js";
 import { z } from "zod";
 import { randomUUID } from "node:crypto";
 import { api, ok, fail, ApiError } from "../core.js";
@@ -24,7 +24,7 @@ function refusalOrFail(e: unknown) {
   return fail(e);
 }
 
-export function registerTimelineTools(server: McpServer) {
+export function registerTimelineTools(server: ToolHost) {
   server.tool(
     "timeline_mould",
     "Edit a recorded parameter and re-derive the model (#64 parametric DAG). The " +

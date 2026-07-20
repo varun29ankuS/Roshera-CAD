@@ -1,10 +1,10 @@
 /** Spatial-query tools — exact-analytic point / ray / region probes. */
 
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { ToolHost } from "../registry.js";
 import { z } from "zod";
 import { api, ok, fail } from "../core.js";
 
-export function registerQueryTools(server: McpServer) {
+export function registerQueryTools(server: ToolHost) {
   server.tool(
     "point_query",
     "PROBE a world point vs a part: SIGNED DISTANCE (− inside, + outside), " +

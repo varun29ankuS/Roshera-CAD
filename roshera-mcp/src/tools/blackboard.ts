@@ -4,7 +4,7 @@
  * here shows up live in the frontend Blackboard panel.
  */
 
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { ToolHost } from "../registry.js";
 import { z } from "zod";
 import { api, ok, fail } from "../core.js";
 
@@ -43,7 +43,7 @@ const SCOPE_ARGS = {
     .describe("'document' | 'part:<uuid>' | 'assembly:<uuid>'; wins over part_id"),
 };
 
-export function registerBlackboardTools(server: McpServer) {
+export function registerBlackboardTools(server: ToolHost) {
   server.tool(
     "blackboard_add_entry",
     "WRITE a line to a Blackboard notebook the human SEES live (markdown + " +

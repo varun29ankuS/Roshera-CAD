@@ -13,29 +13,31 @@
  *  - PLACEMENT IS EXPLICIT: create tools take coordinates and echo world
  *    placement.
  *
- * Structure: shared plumbing in core.ts; tools grouped by domain under
- * tools/ (perception, inspect, queries, create, modify, psketch, io,
- * timeline, blackboard, labels, assembly).
+ * SCALE (Slice 2, spec 2026-07-20-mcp-scale-architecture-design.md):
+ *  Every tool registers its {name, schema, handler} into ONE internal table
+ *  (registry.ts). The DEFAULT exposed MCP surface is minimal-complete — the
+ *  ~15 core modeling/perception tools + the 3 meta-tools — so the worst-case
+ *  client (no list_changed, injects the whole surface every turn) pays a small
+ *  fixed bill, while the entire long tail stays reachable via find_tool /
+ *  describe_tool / invoke. ROSHERA_MCP_SURFACE=full restores the full 90-tool
+ *  exposure (transition escape hatch).
  *
  * Server URL via ROSHERA_URL (default http://localhost:8081).
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { BASE } from "./core.js";
-import { registerPerceptionTools } from "./tools/perception.js";
-import { registerInspectTools } from "./tools/inspect.js";
-import { registerQueryTools } from "./tools/queries.js";
-import { registerCreateTools } from "./tools/create.js";
-import { registerModifyTools } from "./tools/modify.js";
-import { registerPsketchTools } from "./tools/psketch.js";
-import { registerIoTools } from "./tools/io.js";
-import { registerTimelineTools } from "./tools/timeline.js";
-import { registerBlackboardTools } from "./tools/blackboard.js";
-import { registerLabelTools } from "./tools/labels.js";
-import { registerAssemblyTools } from "./tools/assembly.js";
-import { registerGdtTools } from "./tools/gdt.js";
-import { registerDrawingTools } from "./tools/drawing.js";
+import { BASE, AUTH_HEADERS } from "./core.js";
+import { RegisteredTool, canonicalJson, fnv1a64hex } from "./registry.js";
+import { setRegistryWarning } from "./metatools.js";
+import {
+  buildTable,
+  resolveSurfaceMode,
+  exposedNamesFor,
+  billFor,
+  MINIMAL_SURFACE,
+  META_SURFACE,
+} from "./surface.js";
 
 // The Roshera mark (roshera-app/public/favicon.svg, inlined as a data URI so the
 // server stays self-contained). MCP clients that render server icons (per the MCP
@@ -52,20 +54,144 @@ const server = new McpServer({
   icons: [{ src: ROSHERA_ICON, mimeType: "image/svg+xml", sizes: ["48x48"] }],
 });
 
-registerPerceptionTools(server);
-registerInspectTools(server);
-registerQueryTools(server);
-registerCreateTools(server);
-registerModifyTools(server);
-registerPsketchTools(server);
-registerIoTools(server);
-registerTimelineTools(server);
-registerBlackboardTools(server);
-registerLabelTools(server);
-registerAssemblyTools(server);
-registerGdtTools(server);
-registerDrawingTools(server);
+// ── 1. Register EVERY tool + the 3 meta-tools into the single internal table ──
+// (Assembly + surface policy live in surface.ts, shared with the test suite.)
+const table = buildTable();
+
+// ── 2. Mount the active surface onto the live server ─────────────────────────
+// Default = minimal-complete (15 core verbs + 3 meta-tools); everything else is
+// in the table but reachable only via invoke. ROSHERA_MCP_SURFACE=full exposes
+// all 90+ directly (transition escape hatch).
+/** Mount one table entry as a live MCP tool, preserving its exact schema. */
+function mount(entry: RegisteredTool): void {
+  server.registerTool(
+    entry.name,
+    { description: entry.description, inputSchema: entry.schema as any },
+    entry.handler,
+  );
+}
+
+const mode = resolveSurfaceMode();
+const exposedNames = exposedNamesFor(table, mode);
+
+for (const name of exposedNames) {
+  const entry = table.get(name);
+  if (entry) mount(entry);
+}
+
+// A minimal-surface sanity guard: every intended tool must have been present in
+// the table. A typo in CORE_SURFACE would silently shrink the surface — refuse.
+if (mode === "minimal") {
+  const missing = MINIMAL_SURFACE.filter((n) => !table.has(n));
+  if (missing.length) {
+    console.error(
+      `roshera-mcp FATAL: minimal surface names not found in the table: ${missing.join(", ")}`,
+    );
+    process.exit(1);
+  }
+}
+
+// ── 3. Token bill (the MEASURE) ──────────────────────────────────────────────
+const minimalBill = billFor(table, MINIMAL_SURFACE);
+const fullBill = billFor(table, table.names());
+const exposedBill = billFor(table, exposedNames);
+
+// ── 4. Consume the kernel-served registry (Layer 0), honest fallback ─────────
+//
+// Try GET /api/agent/tool-registry for purpose/bench/token metadata + the drift
+// hash. On FETCH FAILURE (the current live situation — the running :8081 backend
+// predates the endpoint and 404s) use the compiled-in local table silently but
+// logged. On SUCCESS verify the hash and the tool-name inventory; on MISMATCH
+// serve local and warn once per session in meta-tool output (spec §3.4).
+async function consumeRegistry(): Promise<void> {
+  const REGISTRY_TIMEOUT_MS = (() => {
+    const n = Number(process.env.ROSHERA_MCP_REGISTRY_TIMEOUT_MS);
+    return Number.isFinite(n) && n > 0 ? n : 3000;
+  })();
+  let payload: any;
+  try {
+    const res = await fetch(`${BASE}/api/agent/tool-registry`, {
+      headers: { "X-Roshera-Agent": "Claude", ...AUTH_HEADERS },
+      signal: AbortSignal.timeout(REGISTRY_TIMEOUT_MS),
+    });
+    if (!res.ok) {
+      console.error(
+        `roshera-mcp: tool-registry endpoint returned ${res.status} — serving compiled local table (${table.size} tools). ` +
+          `(Expected until the backend is rebuilt past registry Slice 1.)`,
+      );
+      return;
+    }
+    payload = await res.json();
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(
+      `roshera-mcp: tool-registry endpoint unavailable (${msg}) — serving compiled local table (${table.size} tools).`,
+    );
+    return;
+  }
+
+  const served: any[] = Array.isArray(payload?.tools) ? payload.tools : [];
+  const servedHash: string | undefined = payload?.registry_hash;
+
+  // (a) Algorithm/canonicalization parity: reproduce the backend's own hash over
+  //     its own served tools. Equality proves TS↔Rust FNV-1a-64 + canonical-JSON
+  //     agreement live; inequality means an encoder skew worth surfacing.
+  if (servedHash) {
+    const reHash = fnv1a64hex(canonicalJson(served));
+    if (reHash === servedHash) {
+      console.error(
+        `roshera-mcp: tool-registry hash verified (${servedHash}) — TS↔Rust FNV-1a-64 parity confirmed over ${served.length} tools.`,
+      );
+    } else {
+      console.error(
+        `roshera-mcp: tool-registry hash SKEW — backend=${servedHash} ts-recompute=${reHash}. ` +
+          `Serving local table; canonicalization differs (investigate, do not trust cross-language hashes yet).`,
+      );
+      setRegistryWarning(
+        `registry hash could not be reproduced (backend=${servedHash}, local recompute=${reHash}); serving the compiled local table.`,
+      );
+    }
+  }
+
+  // (b) Inventory drift: does the live kernel expose a different tool set than
+  //     the compiled table? A real mismatch is loud (serve local + warn once).
+  const servedNames = new Set(
+    served.map((t) => t?.name).filter((n): n is string => typeof n === "string"),
+  );
+  const localNames = new Set(table.names());
+  // Meta-tools are MCP-only; they never appear in the kernel registry.
+  for (const m of META_SURFACE) localNames.delete(m);
+  const onlyBackend = [...servedNames].filter((n) => !localNames.has(n));
+  const onlyLocal = [...localNames].filter((n) => !servedNames.has(n));
+  if (onlyBackend.length || onlyLocal.length) {
+    const parts: string[] = [];
+    if (onlyBackend.length)
+      parts.push(`in kernel but not compiled: ${onlyBackend.join(", ")}`);
+    if (onlyLocal.length)
+      parts.push(`compiled but not in kernel: ${onlyLocal.join(", ")}`);
+    const warn = `tool inventory drift — ${parts.join("; ")}. Serving the compiled local table; run a rebuild to reconcile.`;
+    console.error(`roshera-mcp: ${warn}`);
+    setRegistryWarning(warn);
+  } else if (servedNames.size) {
+    console.error(
+      `roshera-mcp: tool inventory matches the kernel registry (${servedNames.size} tools).`,
+    );
+  }
+}
+
+// ── 5. Report the active mode + surface + token bill to stderr ───────────────
+const tail =
+  mode === "minimal"
+    ? "Long tail reachable via find_tool/describe_tool/invoke."
+    : "Full exposure (transition escape hatch); the funnel meta-tools are omitted.";
+console.error(
+  `roshera-mcp surface: ${mode.toUpperCase()} — exposing ${exposedNames.length}/${table.size} tools ` +
+    `(~${exposedBill} tokens). Bills: minimal=${minimalBill}, full=${fullBill}. ${tail}`,
+);
 
 const transport = new StdioServerTransport();
 await server.connect(transport);
+// Registry consumption is best-effort and must not gate startup; run it after
+// connect so the surface is live immediately even if the backend is slow/down.
+void consumeRegistry();
 console.error(`roshera-mcp connected (API: ${BASE})`);

@@ -8,7 +8,7 @@
  * surfaces `"persistence":"session"` on every response as the honesty signal.
  */
 
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { ToolHost } from "../registry.js";
 import { z } from "zod";
 import { api, ok, fail, BASE, ApiError, AUTH_HEADERS } from "../core.js";
 
@@ -105,7 +105,7 @@ function refusalFrom(e: unknown): ReturnType<typeof fail> | null {
 
 // ─── Tool registration ─────────────────────────────────────────────────
 
-export function registerGdtTools(server: McpServer): void {
+export function registerGdtTools(server: ToolHost): void {
   // ── gdt_datum ──────────────────────────────────────────────────────────
 
   server.tool(

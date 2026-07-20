@@ -1,10 +1,10 @@
 /** Perception tools — the agent's eyes: renders, X-rays, sections, certs. */
 
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { ToolHost } from "../registry.js";
 import { z } from "zod";
 import { api, ok, fail, ApiError } from "../core.js";
 
-export function registerPerceptionTools(server: McpServer) {
+export function registerPerceptionTools(server: ToolHost) {
   server.tool(
     "render_part",
     "SEE a part: deterministic offscreen render as an image. mode 'ids' returns " +

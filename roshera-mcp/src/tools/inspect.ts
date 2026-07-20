@@ -1,10 +1,10 @@
 /** Inspection tools — read facts off the live model: parts, faces, features. */
 
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { ToolHost } from "../registry.js";
 import { z } from "zod";
 import { api, ok, fail, BASE, ApiError, setDocumentUnitCache, AUTH_HEADERS } from "../core.js";
 
-export function registerInspectTools(server: McpServer) {
+export function registerInspectTools(server: ToolHost) {
   server.tool(
     "list_parts",
     "List every part in the live model (id, name, kind).",

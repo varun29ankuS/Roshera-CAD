@@ -3,7 +3,7 @@
  * geometry (not a boolean merge), plus the kinematic assembly certificate.
  */
 
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { ToolHost } from "../registry.js";
 import { z } from "zod";
 import { api, ok, fail } from "../core.js";
 
@@ -45,7 +45,7 @@ function buildTransform(
   return m;
 }
 
-export function registerAssemblyTools(server: McpServer) {
+export function registerAssemblyTools(server: ToolHost) {
   server.tool(
     "assembly_verify",
     "One-shot kinematic assembly certificate from a self-contained spec (no " +
