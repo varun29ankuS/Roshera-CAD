@@ -10,9 +10,10 @@
       }
     },
     "code-review-graph": {
-      "command": "uvx",
+      "command": "python",
       "args": [
-        "code-review-graph",
+        "-m",
+        "code_review_graph",
         "serve"
       ],
       "cwd": "C:\\Users\\Varun Sharma\\Roshera-CAD",
