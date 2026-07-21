@@ -140,6 +140,12 @@ harness = false
 name = "boolean_classification"
 harness = false
 
+# Pitch-deck measurement (task #57): soundness-certificate compute cost
+# (cold vs memoized) on a box, an f7 bored boolean, and a filleted cube.
+[[bench]]
+name = "certificate_cost"
+harness = false
+
 [[bin]]
 name = "bench_runner"
 path = "src/bin/bench_runner.rs"
