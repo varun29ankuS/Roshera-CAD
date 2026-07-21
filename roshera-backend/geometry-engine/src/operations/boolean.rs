@@ -20572,6 +20572,88 @@ mod tests {
     use crate::math::{Point3, Tolerance, Vector3};
     use crate::primitives::surface::{Cylinder, Plane, Sphere};
     use crate::primitives::topology_builder::{BRepModel, TopologyBuilder};
+    /// Task #55 — the boolean's general SSI marcher must reach a large feature.
+    ///
+    /// The deleted duplicate marcher stepped a fixed `tolerance × 10` chord with
+    /// no curvature adaptation under a shared step budget, giving a total reach
+    /// of ~2 world units regardless of feature size: any intersection curve
+    /// longer than that was traced part-way and then discarded, so the boolean
+    /// silently reported "no intersection" on ordinary large features.
+    /// Delegating to the canonical marcher (geometry-aware step) restores reach.
+    ///
+    /// A large curved NURBS patch (a ~100×100 bowl in z) crossed by a coaxial
+    /// cylinder of radius 30 meets in a closed loop of radius ≈ 30 (bbox
+    /// diagonal ≈ 84, circumference ≈ 188) — far beyond the old ~2-unit reach.
+    /// A `NURBS` surface forms no closed-form pair with `Cylinder`, so
+    /// `surface_surface_intersection` routes to `march_surface_intersection`,
+    /// the exact path the boolean uses in production. The open patch has
+    /// distinct parameter corners, so the general-position marcher seeds it
+    /// (a periodic surface such as a full torus collapses the seed prefilter —
+    /// a separate seeding limitation, deliberately avoided here).
+    #[test]
+    fn boolean_marcher_reaches_large_nurbs_cylinder_ring_55() {
+        use crate::math::nurbs::NurbsSurface;
+        use crate::primitives::surface::GeneralNurbsSurface;
+
+        // 5×5 clamped bicubic control net over x,y ∈ [0,100], with a bowl in z
+        // (z ranges ~[-10, +20]) so the patch is unambiguously non-planar.
+        let deg = 3usize;
+        let n = 5usize;
+        let coord = |k: usize| 25.0 * k as f64; // 0, 25, 50, 75, 100
+        let mut grid: Vec<Vec<Point3>> = Vec::with_capacity(n);
+        for i in 0..n {
+            let mut row = Vec::with_capacity(n);
+            for j in 0..n {
+                let x = coord(i);
+                let y = coord(j);
+                let z = 0.006 * ((x - 50.0).powi(2) + (y - 50.0).powi(2)) - 10.0;
+                row.push(Point3::new(x, y, z));
+            }
+            grid.push(row);
+        }
+        let weights = vec![vec![1.0; n]; n];
+        // Clamped knot vector for n=5, degree=3: one interior knot at 0.5.
+        let knots = vec![0.0, 0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0, 1.0];
+        let nurbs = NurbsSurface::new(grid, weights, knots.clone(), knots, deg, deg)
+            .expect("valid clamped nurbs patch");
+        let patch = GeneralNurbsSurface { nurbs };
+
+        let cyl = Cylinder::new(Point3::new(50.0, 50.0, 0.0), Vector3::Z, 30.0).expect("cylinder");
+        let tol = Tolerance::from_distance(1e-6);
+
+        let curves = surface_surface_intersection(&patch, &cyl, &tol).expect("ssi");
+
+        assert!(
+            !curves.is_empty(),
+            "large NURBS-patch × cylinder intersection was discarded — marcher \
+             reach did not scale with feature size (curves={})",
+            curves.len()
+        );
+
+        // The traced geometry must span the feature, not a ~2-unit stub. The
+        // radius-30 loop has a bbox diagonal ≈ 84; the old reach was ~2, so any
+        // extent past a few units proves the marcher covered the whole feature.
+        let mut max_extent = 0.0_f64;
+        for sic in &curves {
+            let range = sic.curve.parameter_range();
+            let (mut lo, mut hi) = (
+                Point3::new(f64::MAX, f64::MAX, f64::MAX),
+                Point3::new(f64::MIN, f64::MIN, f64::MIN),
+            );
+            for i in 0..=64 {
+                let t = range.start + (range.end - range.start) * (i as f64 / 64.0);
+                let p = sic.curve.point_at(t).expect("curve point");
+                lo = Point3::new(lo.x.min(p.x), lo.y.min(p.y), lo.z.min(p.z));
+                hi = Point3::new(hi.x.max(p.x), hi.y.max(p.y), hi.z.max(p.z));
+            }
+            max_extent = max_extent.max((hi - lo).magnitude());
+        }
+        assert!(
+            max_extent > 20.0,
+            "traced curve spans only {max_extent:.3} world units — a partial stub, \
+             not the radius-30 loop (expected bbox diagonal ≈ 84)"
+        );
+    }
 
     /// Task #50 — work-budget instrumentation for the general SSI marcher.
     ///
