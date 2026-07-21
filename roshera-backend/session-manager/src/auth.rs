@@ -3,6 +3,7 @@
 //! This module provides JWT-based authentication, API key management,
 //! and security features for the CAD system.
 
+use crate::database::DatabasePersistence;
 use argon2::{
     password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
     Argon2,
@@ -14,7 +15,7 @@ use jwt::{SignWithKey, VerifyWithKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use shared_types::SessionError;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use uuid::Uuid;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -180,6 +181,15 @@ pub struct AuthManager {
     failed_attempts: Arc<DashMap<String, Vec<DateTime<Utc>>>>,
     /// Rate limiting tracking
     rate_limits: Arc<DashMap<String, Vec<DateTime<Utc>>>>,
+    /// Durable API-key store (auth Slice 3, task #42). Set exactly once at
+    /// boot via [`AuthManager::attach_api_key_store`] before the server
+    /// serves traffic. When present, [`AuthManager::provision_api_key`]
+    /// write-throughs every minted key and [`AuthManager::load_persisted_api_keys`]
+    /// rehydrates them on startup, so provisioned keys survive a restart
+    /// instead of dying with the in-memory `api_keys` map. When absent
+    /// (unit tests, no database, or `ROSHERA_DURABILITY=off`) the manager
+    /// is purely in-memory, exactly as before this slice.
+    api_key_store: OnceLock<Arc<dyn DatabasePersistence>>,
     /// Configuration
     config: AuthConfig,
 }
@@ -435,6 +445,7 @@ impl AuthManager {
             revoked_tokens: Arc::new(DashMap::new()),
             failed_attempts: Arc::new(DashMap::new()),
             rate_limits: Arc::new(DashMap::new()),
+            api_key_store: OnceLock::new(),
             config,
         })
     }
@@ -701,6 +712,89 @@ impl AuthManager {
         });
 
         Ok((raw_key, api_key))
+    }
+
+    /// Attach the durable API-key store (auth Slice 3, task #42).
+    ///
+    /// Set-once: the store is wired at boot, before the server serves
+    /// traffic, so a `&self` setter backed by [`OnceLock`] is correct — no
+    /// interior `RwLock` is needed for a value that never changes after
+    /// startup. A second attach is a boot-wiring bug (two stores would
+    /// disagree on what is durable); it is logged and ignored rather than
+    /// panicking, since the lint policy denies `panic!` and a startup
+    /// misconfiguration must not take the process down.
+    pub fn attach_api_key_store(&self, store: Arc<dyn DatabasePersistence>) {
+        if self.api_key_store.set(store).is_err() {
+            tracing::warn!(
+                target: "auth",
+                "attach_api_key_store called twice — keeping the first store, ignoring the second"
+            );
+        }
+    }
+
+    /// Provision a new API key and, when a durable store is attached,
+    /// persist it before returning so it survives a restart (Slice 3).
+    ///
+    /// This is the durable counterpart of [`create_api_key`](Self::create_api_key):
+    /// it mints the key in memory, then write-throughs the (already hashed)
+    /// record to the store. If the persist fails the in-memory entry is
+    /// rolled back and the error returned, so a key handed back to a caller
+    /// is ALWAYS durable — never a phantom that would vanish on the next
+    /// boot. Only the SHA-256 `key_hash` is persisted; the raw secret is
+    /// returned to the caller exactly once and never stored, matching
+    /// `create_api_key`.
+    ///
+    /// With no store attached the behaviour is identical to
+    /// `create_api_key` (in-memory only), so tests and scratch instances
+    /// are unaffected.
+    pub async fn provision_api_key(
+        &self,
+        user_id: &str,
+        name: &str,
+        permissions: Vec<String>,
+        expires_in_days: Option<i64>,
+    ) -> Result<(String, ApiKey), SessionError> {
+        let (raw_key, api_key) =
+            self.create_api_key(user_id, name, permissions, expires_in_days)?;
+
+        if let Some(store) = self.api_key_store.get() {
+            if let Err(e) = store.save_api_key(&api_key).await {
+                // Roll back the in-memory insert: a key that could not be
+                // persisted must not be honoured, or it would work until the
+                // next restart and then silently disappear — precisely the
+                // Slice-3 defect. Fail loud instead.
+                self.api_keys.remove(&api_key.id);
+                return Err(e);
+            }
+        }
+
+        Ok((raw_key, api_key))
+    }
+
+    /// Reinstate a persisted key into the in-memory map WITHOUT
+    /// re-persisting it (boot-restore only; mirrors the timeline's
+    /// `rehydrate_*` pattern). Keyed by the key id, exactly as
+    /// [`create_api_key`](Self::create_api_key) inserts.
+    pub fn restore_api_key(&self, api_key: ApiKey) {
+        self.api_keys.insert(api_key.id.clone(), api_key);
+    }
+
+    /// Load every persisted API key into memory at boot (Slice 3). Returns
+    /// the number of keys restored. A no-op returning `Ok(0)` when no store
+    /// is attached, so callers can invoke it unconditionally. The restored
+    /// keys carry their real `active` flag, so a revoked key stays denied
+    /// after a restart.
+    pub async fn load_persisted_api_keys(&self) -> Result<usize, SessionError> {
+        let store = match self.api_key_store.get() {
+            Some(store) => store,
+            None => return Ok(0),
+        };
+        let keys = store.load_all_api_keys().await?;
+        let restored = keys.len();
+        for key in keys {
+            self.restore_api_key(key);
+        }
+        Ok(restored)
     }
 
     /// Verify API key

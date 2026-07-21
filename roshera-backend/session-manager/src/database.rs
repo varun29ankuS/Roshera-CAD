@@ -181,6 +181,13 @@ pub trait DatabasePersistence: Send + Sync {
     async fn save_api_key(&self, api_key: &ApiKey) -> Result<(), SessionError>;
     async fn load_api_key(&self, key_id: &str) -> Result<ApiKey, SessionError>;
     async fn delete_api_key(&self, key_id: &str) -> Result<(), SessionError>;
+    /// Load every persisted API key, ordered by `created_at` ASC for a
+    /// deterministic restore. This is the auth boot-restore read path
+    /// (Slice 3): [`crate::auth::AuthManager::load_persisted_api_keys`]
+    /// rehydrates the in-memory key set from it on startup. The mapping is
+    /// FAITHFUL to every field — in particular `active`, so a revoked key
+    /// stays revoked across a restart rather than silently reviving.
+    async fn load_all_api_keys(&self) -> Result<Vec<ApiKey>, SessionError>;
 
     // Timeline operations
     async fn save_timeline_event(
@@ -430,7 +437,18 @@ impl PostgresDatabase {
             reason: format!("Failed to create tokens table: {}", e),
         })?;
 
-        // Create api_keys table
+        // Create api_keys table.
+        //
+        // Durability/auth note (Slice 3, task #42): this table is intentionally
+        // FK-FREE on `user_id`. The pre-Slice-3 schema declared
+        // `user_id ... REFERENCES users(id)`, which made it impossible to
+        // persist an API key unless a matching `users` row existed first — but
+        // Roshera's primary client is an AGENT authenticating by API key, not a
+        // registered human user, so an agent key legitimately has no `users`
+        // row. This mirrors exactly the FK removal the durability work applied
+        // to `timeline_events` for the same reason. `user_id` remains an
+        // attribution/index column; referential integrity for keys is not
+        // enforced at the database layer.
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS api_keys (
@@ -438,7 +456,7 @@ impl PostgresDatabase {
                 name VARCHAR(255) NOT NULL,
                 key_hash VARCHAR(255) NOT NULL,
                 prefix VARCHAR(20) NOT NULL,
-                user_id VARCHAR(255) NOT NULL REFERENCES users(id),
+                user_id VARCHAR(255) NOT NULL,
                 permissions TEXT[],
                 rate_limit JSONB,
                 created_at TIMESTAMPTZ NOT NULL,
@@ -453,6 +471,17 @@ impl PostgresDatabase {
         .map_err(|e| SessionError::PersistenceError {
             reason: format!("Failed to create api_keys table: {}", e),
         })?;
+
+        // Idempotent migration for a pre-Slice-3 silo whose api_keys table was
+        // created with the blocking `user_id` foreign key: drop it so agent
+        // keys (no `users` row) can be persisted. Default-named and
+        // `IF EXISTS`, so this is a no-op on a freshly-created FK-free table.
+        sqlx::query("ALTER TABLE api_keys DROP CONSTRAINT IF EXISTS api_keys_user_id_fkey")
+            .execute(&self.pool)
+            .await
+            .map_err(|e| SessionError::PersistenceError {
+                reason: format!("Failed to drop api_keys user_id FK: {}", e),
+            })?;
 
         // Create timeline_events table (without INDEX inside CREATE TABLE).
         //
@@ -1272,23 +1301,7 @@ impl DatabasePersistence for PostgresDatabase {
                 id: key_id.to_string(),
             })?;
 
-        let permissions: Vec<String> = row.get("permissions");
-        let rate_limit: serde_json::Value = row.get("rate_limit");
-        let rate_limit = serde_json::from_value(rate_limit).ok();
-
-        Ok(ApiKey {
-            id: row.get("id"),
-            name: row.get("name"),
-            key_hash: row.get("key_hash"),
-            prefix: row.get("prefix"),
-            user_id: row.get("user_id"),
-            permissions,
-            rate_limit,
-            created_at: row.get("created_at"),
-            last_used: row.get("last_used"),
-            expires_at: row.get("expires_at"),
-            active: row.get("active"),
-        })
+        Ok(row_to_api_key_pg(row))
     }
 
     async fn delete_api_key(&self, key_id: &str) -> Result<(), SessionError> {
@@ -1301,6 +1314,17 @@ impl DatabasePersistence for PostgresDatabase {
             })?;
 
         Ok(())
+    }
+
+    async fn load_all_api_keys(&self) -> Result<Vec<ApiKey>, SessionError> {
+        let rows = sqlx::query("SELECT * FROM api_keys ORDER BY created_at ASC")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| SessionError::PersistenceError {
+                reason: format!("Failed to load all API keys: {}", e),
+            })?;
+
+        Ok(rows.into_iter().map(row_to_api_key_pg).collect())
     }
 
     async fn save_timeline_event(
@@ -1442,6 +1466,28 @@ fn row_to_timeline_event_pg(row: sqlx::postgres::PgRow) -> TimelineEventData {
         data: row.get("data"),
         branch_id: row.get("branch_id"),
         sequence_number: row.get("sequence_number"),
+    }
+}
+
+/// Map an `api_keys` row into an [`ApiKey`] (PostgreSQL). Shared by the
+/// single-key and load-all read paths so the column mapping stays in one
+/// place and is faithful to every field (`prefix`, `rate_limit`, `active`).
+fn row_to_api_key_pg(row: sqlx::postgres::PgRow) -> ApiKey {
+    let permissions: Vec<String> = row.get("permissions");
+    let rate_limit_json: serde_json::Value = row.get("rate_limit");
+    let rate_limit = serde_json::from_value(rate_limit_json).ok();
+    ApiKey {
+        id: row.get("id"),
+        name: row.get("name"),
+        key_hash: row.get("key_hash"),
+        prefix: row.get("prefix"),
+        user_id: row.get("user_id"),
+        permissions,
+        rate_limit,
+        created_at: row.get("created_at"),
+        last_used: row.get("last_used"),
+        expires_at: row.get("expires_at"),
+        active: row.get("active"),
     }
 }
 
@@ -1593,7 +1639,10 @@ impl SqliteDatabase {
             reason: format!("Failed to create tokens table: {}", e),
         })?;
 
-        // Create api_keys table
+        // Create api_keys table. FK-free on `user_id` by design (see the
+        // PostgreSQL arm's note): an agent key authenticates without a
+        // registered `users` row, so a `REFERENCES users(id)` constraint would
+        // block persistence — the same reason `timeline_events` is FK-free.
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS api_keys (
@@ -1607,8 +1656,7 @@ impl SqliteDatabase {
                 created_at DATETIME NOT NULL,
                 expires_at DATETIME,
                 last_used DATETIME,
-                active BOOLEAN NOT NULL DEFAULT 1,
-                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+                active BOOLEAN NOT NULL DEFAULT 1
             )
             "#,
         )
@@ -2323,6 +2371,23 @@ impl DatabasePersistence for SqliteDatabase {
         Ok(())
     }
 
+    async fn load_all_api_keys(&self) -> Result<Vec<ApiKey>, SessionError> {
+        // Unlike the legacy single-key `load_api_key` above (which drops
+        // `prefix`/`rate_limit` and hardcodes `active = true`), the boot
+        // restore path MUST be faithful: a key persisted with `active =
+        // false` has to come back denied, and the per-key `rate_limit`
+        // has to survive so AUDIT-H9 enforcement is unchanged after a
+        // restart. `row_to_api_key_sqlite` reads every column.
+        let rows = sqlx::query("SELECT * FROM api_keys ORDER BY created_at ASC")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| SessionError::PersistenceError {
+                reason: format!("Failed to load all API keys: {}", e),
+            })?;
+
+        Ok(rows.into_iter().map(row_to_api_key_sqlite).collect())
+    }
+
     async fn save_timeline_event(
         &self,
         _session_id: &str,
@@ -2461,6 +2526,29 @@ fn row_to_timeline_event_sqlite(row: sqlx::sqlite::SqliteRow) -> TimelineEventDa
         data: row.get("data"),
         branch_id: row.get("branch_id"),
         sequence_number: row.get("sequence_number"),
+    }
+}
+
+/// Map a SQLite `api_keys` row into a fully-populated [`ApiKey`]. Used by the
+/// durability boot-restore path (`load_all_api_keys`); unlike `load_api_key`
+/// it preserves `prefix`, `rate_limit`, and the real `active` flag.
+fn row_to_api_key_sqlite(row: sqlx::sqlite::SqliteRow) -> ApiKey {
+    let permissions_json: serde_json::Value = row.get("permissions");
+    let permissions = serde_json::from_value(permissions_json).unwrap_or_default();
+    let rate_limit_json: serde_json::Value = row.get("rate_limit");
+    let rate_limit = serde_json::from_value(rate_limit_json).ok().flatten();
+    ApiKey {
+        id: row.get("id"),
+        name: row.get("name"),
+        key_hash: row.get("key_hash"),
+        prefix: row.get("prefix"),
+        user_id: row.get("user_id"),
+        permissions,
+        rate_limit,
+        created_at: row.get("created_at"),
+        last_used: row.get("last_used"),
+        expires_at: row.get("expires_at"),
+        active: row.get("active"),
     }
 }
 

@@ -8385,6 +8385,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // Auth Slice 3 (task #42): restore persisted API keys. Before this,
+    // provisioned keys lived only in the in-memory DashMap and died on
+    // restart — the last volatile auth state after the durability work.
+    // Attach the shared database as the AuthManager's key store (write-
+    // through for `provision_api_key`) and rehydrate every persisted key so
+    // it authenticates again after a reboot. Gated on the same flag as the
+    // event log: `ROSHERA_DURABILITY=off` keeps the instance a fully-volatile
+    // scratch server. Restored keys carry their real `active` flag, so a
+    // revoked key stays denied across the restart.
+    if durability::durability_enabled() {
+        let auth_manager = state.session_manager.auth_manager();
+        auth_manager.attach_api_key_store(state.database.clone());
+        match auth_manager.load_persisted_api_keys().await {
+            Ok(restored) => {
+                tracing::info!(
+                    target: "auth",
+                    restored,
+                    "auth: restored {restored} persisted API key(s) at boot"
+                );
+            }
+            Err(e) => {
+                tracing::error!(
+                    target: "auth",
+                    error = %e,
+                    "auth: failed to restore persisted API keys at boot — \
+                     previously provisioned keys may not authenticate until reprovisioned"
+                );
+            }
+        }
+    }
+
     // Background sweeper for expired transactions. The TX_TTL inside
     // `TransactionManager` (1 hour) only documents intent; without an
     // active driver, an agent that crashed between `begin` and
