@@ -103,8 +103,15 @@ $cargoArgs += "--nocapture"
 Write-Host ""
 Write-Host "Running: cargo $($cargoArgs -join ' ')" -ForegroundColor Yellow
 
-$stdoutFile = Join-Path $env:TEMP "red-gate-stdout.txt"
-$stderrFile = Join-Path $env:TEMP "red-gate-stderr.txt"
+# Unique per invocation: two gate instances (or a rerun started while a
+# previous instance is still reporting) must never share capture files. A
+# fixed path let a second run overwrite the first's captures BEFORE the
+# first computed its verdict — the first instance then judged the second
+# run's PARTIAL output and passed a gate that had a real failure in it
+# (observed 2026-07-21, box_sphere_conquered_band_gate).
+$stamp = "{0}-{1}" -f $PID, (Get-Date -Format "yyyyMMdd-HHmmss")
+$stdoutFile = Join-Path $env:TEMP "red-gate-stdout-$stamp.txt"
+$stderrFile = Join-Path $env:TEMP "red-gate-stderr-$stamp.txt"
 
 $proc = Start-Process -FilePath "cargo" `
     -ArgumentList $cargoArgs `
@@ -118,9 +125,13 @@ $stderrLines = @()
 if (Test-Path $stdoutFile) { $stdoutLines = Get-Content $stdoutFile -ErrorAction SilentlyContinue }
 if (Test-Path $stderrFile) { $stderrLines = Get-Content $stderrFile -ErrorAction SilentlyContinue }
 
-# Print all output for visibility.
-if ($stderrLines) { $stderrLines | ForEach-Object { Write-Host $_ } }
-if ($stdoutLines) { $stdoutLines | ForEach-Object { Write-Host $_ } }
+# Print all output for visibility — as TWO bulk writes, not per-line
+# Write-Host: a full-suite run is >1 MB and the per-line loop took ~1 h on
+# a redirected console, during which the fixed-path capture files were
+# overwritten by a second instance (see stamp note above).
+if ($stderrLines) { Write-Host ($stderrLines -join [Environment]::NewLine) }
+if ($stdoutLines) { Write-Host ($stdoutLines -join [Environment]::NewLine) }
+Write-Host "capture files: $stdoutFile · $stderrFile"
 
 # Extract the ordered list of binaries from stderr.
 # Cargo prints "Running tests/foo.rs (...)" to stderr, one per binary, in order.
