@@ -14998,31 +14998,42 @@ fn presplit_boundary_t_junctions(
 /// We therefore compare interior sample points and drop the cut only when it
 /// actually retraces a boundary edge within tolerance.
 ///
-/// # Coincidence must not require matching endpoints (task #54)
+/// # Coincidence is geometric, not endpoint identity (task #54)
 ///
 /// This test used to CONSIDER only cuts whose endpoint vertex pair equalled a
 /// boundary edge's vertex pair, which silently limited it to cuts spanning a
-/// boundary edge end to end. A cut that lies on a boundary edge for only PART
-/// of its length has fresh vertices in that edge's interior, matches no pair,
-/// and was never examined.
+/// boundary edge end to end. It now projects every splitting edge's interior
+/// samples geometrically, so a cut that lies on a rim regardless of where its
+/// endpoints fall is examined.
 ///
-/// That case is not exotic: it is what a working marcher produces whenever the
-/// intersection curve coincides with a face rim. The nozzle throat
-/// (`frustum_union_frustum_throat_27`) is the reference — two frustums meet
-/// along a shared r=6 circle that is simultaneously a rim of both cone faces
-/// and the true surface-surface intersection. The throat lies exactly on both
-/// cones' parameter-domain boundary, so the trace terminates early and yields
-/// roughly a twelfth of the rim. Imprinted, that fragment duplicated a stretch
-/// of rim, the DCEL walk produced a malformed cycle (edge 2 traversed twice in
-/// `loop[0] edges=[2, 44, 43, 42, 2, ...]`), and the solid went from watertight
-/// to 198 boundary edges.
+/// The reference is the nozzle throat (`frustum_union_frustum_throat_27`): two
+/// coaxial frustums meet along a shared r=6 circle that is at once a rim of
+/// both cone faces and their true surface-surface intersection. Once the
+/// marcher was unified (#55) it traces that throat as a full closed circle and
+/// the boolean imprints it as a cut — which then doubles the rim, the DCEL walk
+/// produces a malformed cycle (edge 2 traversed twice in
+/// `loop[0] edges=[2, 44, 43, 42, 2, ...]`), and the solid goes from watertight
+/// to 198 boundary edges. (An earlier account of this case claimed the marcher
+/// returned only a twelfth of the rim and that the defect was a partial arc not
+/// matching an endpoint pair. Measurement disproved both: the marcher returns
+/// the whole circle, and the two real reasons the cut survived are below.)
 ///
-/// So every splitting edge is now projected onto every boundary edge's curve.
-/// A cut is coincident when all of its interior samples lie on that curve
-/// within tolerance AND land inside the boundary edge's own parametric extent
-/// — the extent check keeps a cut that runs along the *continuation* of a
-/// boundary edge (same underlying curve, different stretch), which genuinely
-/// splits the face.
+/// A cut is coincident when EVERY interior sample lies on a boundary edge's
+/// curve within the coincidence band AND inside that edge's parametric extent.
+/// Two properties matter, both measured on the throat:
+///
+/// * **Different samples may match different boundary edges.** By the time this
+///   runs, `presplit_boundary_t_junctions` has split the rim at the cut's
+///   endpoints, so the rim is a chain of arcs over one circle curve. A
+///   full-rim cut lies across all of them; requiring a SINGLE edge to hold
+///   every sample failed, and the cut survived. Each sample need only land on
+///   SOME rim arc.
+/// * **The band budgets for the marched residual.** The throat is a
+///   near-tangent intersection; the marcher's positional error there is a few ×
+///   the distance tolerance (measured 1.16e-6 at tol=1e-6). The band is
+///   τ_coincide = 10·τ_weld, not 1·tol, so the marched curve reads as on the
+///   rim. The extent check still keeps a cut on the *continuation* of a
+///   boundary edge (same curve, different stretch), which genuinely splits.
 ///
 /// This is deliberately NOT a length test. Retracing the boundary is what
 /// drops a cut, at any length; a short cut in the face interior is kept, and a
@@ -15035,7 +15046,21 @@ fn drop_cuts_coincident_with_boundary(
     tolerance: &Tolerance,
 ) {
     let tol = tolerance.distance();
-    let tol_sq = tol * tol;
+    // Coincidence band. A cut handed to this filter is frequently a MARCHED
+    // approximation of a surface-surface intersection, not an exact curve. Where
+    // the two surfaces meet at a shallow angle — the nozzle throat, two coaxial
+    // cones sharing an r=6 rim — the marcher's corrector drives its constraint
+    // residual to `tol`, but the near-tangency amplifies that into a positional
+    // error of a few × `tol` (measured 1.16e-6 at tol=1e-6 on
+    // `frustum_union_frustum_throat_27`). Judging "does this cut retrace an
+    // existing boundary edge" at exactly 1·tol therefore rejects the throat
+    // curve and lets it double the rim. This is a COINCIDENCE decision, so it
+    // uses the kernel's coincidence band τ_coincide = 10·τ_weld (see
+    // math::tolerance) — wide enough for the marched residual, still far tighter
+    // than any real feature offset.
+    const COINCIDENCE_BAND_FACTOR: f64 = 10.0;
+    let band = tol * COINCIDENCE_BAND_FACTOR;
+    let band_sq = band * band;
 
     // Interior samples of an edge, as fractions of its parametric range. Five
     // rather than three: a cut that merely CROSSES a boundary edge touches it at
@@ -15066,32 +15091,40 @@ fn drop_cuts_coincident_with_boundary(
         .map(|(&eid, _)| eid)
         .collect();
 
-    // True when every sample of the cut lies on `beid`'s curve within tolerance
-    // AND within that edge's own parametric extent.
-    let retraces = |cut_samples: &[Point3], beid: EdgeId| -> bool {
-        let Some(be) = model.edges.get(beid) else {
-            return false;
-        };
-        let Some(bc) = model.curves.get(be.curve_id) else {
-            return false;
-        };
-        let (bt0, bt1) = (be.param_range.start, be.param_range.end);
-        let (lo, hi) = if bt0 <= bt1 { (bt0, bt1) } else { (bt1, bt0) };
-        // Parametric slack proportional to the extent: absorbs the projection's
-        // own convergence residual without admitting a neighbouring stretch.
-        let slack = ((hi - lo).abs() * 1.0e-6).max(1.0e-9);
-
-        cut_samples
-            .iter()
-            .all(|p| match bc.closest_point(p, *tolerance) {
+    // True when a single interior sample lies on SOME boundary edge's curve
+    // within the coincidence band AND within that edge's own parametric extent.
+    //
+    // Different samples of one cut may be covered by DIFFERENT boundary edges.
+    // A rim that `presplit_boundary_t_junctions` fragmented into arcs is still
+    // ONE boundary, and a cut that retraces the whole rim projects each of its
+    // samples onto whichever arc that stretch became. The earlier formulation
+    // asked a single boundary edge to contain EVERY sample; the full-circle
+    // throat cut lies across three rim arcs, no one of which holds all five
+    // samples, so it was wrongly kept and doubled the rim.
+    let covered = |p: &Point3| -> bool {
+        boundary_ids.iter().any(|&beid| {
+            let Some(be) = model.edges.get(beid) else {
+                return false;
+            };
+            let Some(bc) = model.curves.get(be.curve_id) else {
+                return false;
+            };
+            let (bt0, bt1) = (be.param_range.start, be.param_range.end);
+            let (lo, hi) = if bt0 <= bt1 { (bt0, bt1) } else { (bt1, bt0) };
+            // Parametric slack proportional to the extent: absorbs the
+            // projection's own convergence residual without admitting a
+            // neighbouring stretch of the same curve.
+            let slack = ((hi - lo).abs() * 1.0e-6).max(1.0e-9);
+            match bc.closest_point(p, *tolerance) {
                 Ok((t, foot)) => {
                     let d = *p - foot;
-                    let on_curve = d.x * d.x + d.y * d.y + d.z * d.z <= tol_sq;
+                    let on_curve = d.x * d.x + d.y * d.y + d.z * d.z <= band_sq;
                     let in_extent = t >= lo - slack && t <= hi + slack;
                     on_curve && in_extent
                 }
                 Err(_) => false,
-            })
+            }
+        })
     };
 
     let redundant: Vec<EdgeId> = graph
@@ -15100,7 +15133,12 @@ fn drop_cuts_coincident_with_boundary(
         .filter(|(_, ge)| ge.edge_type == EdgeType::Splitting)
         .filter_map(|(&eid, _)| {
             let cut = sample_edge(eid)?;
-            if boundary_ids.iter().any(|&beid| retraces(&cut, beid)) {
+            // EVERY interior sample must lie on the boundary. A cut that merely
+            // crosses the boundary, or bulges into the face interior (a "bite"),
+            // has at least one sample off it and is kept. Dropping is driven by
+            // retracing the boundary, never by length — a short interior cut
+            // survives.
+            if cut.iter().all(&covered) {
                 Some(eid)
             } else {
                 None
@@ -20890,23 +20928,16 @@ mod tests {
         eid
     }
 
-    /// Task #54 RED: a cut lying ON a boundary rim but spanning only PART of it
-    /// must be recognised as boundary-coincident.
+    /// Task #54: a cut lying ON a boundary rim but spanning only PART of it —
+    /// with fresh endpoint vertices in the rim's interior — must be recognised
+    /// as boundary-coincident.
     ///
-    /// A geometry-aware marcher traces the nozzle throat circle, but the throat
-    /// sits exactly on the parameter-domain boundary of both cones, so the trace
-    /// terminates early and yields roughly a twelfth of the rim. That fragment
-    /// is imprinted as a cut. Both existing coincidence filters key on the cut's
-    /// endpoint VERTEX PAIR matching a boundary edge's vertex pair, so a partial
-    /// arc — whose endpoints are fresh vertices in the rim's interior — matches
-    /// nothing and survives as a splitting edge. It then duplicates a stretch of
-    /// the rim, the DCEL walk yields a malformed cycle (observed:
-    /// `loop[0] edges=[2, 44, 43, 42, 2, ...]`, edge 2 traversed twice), and the
-    /// nozzle goes from watertight to 198 boundary edges.
-    ///
-    /// Coincidence is a property of GEOMETRY, not of endpoint identity: a cut
-    /// lying on the rim retraces the rim whether it covers all of it or a
-    /// twelfth of it.
+    /// The predecessor filters keyed on the cut's endpoint VERTEX PAIR matching
+    /// a boundary edge's vertex pair, so a partial arc whose endpoints are fresh
+    /// vertices matched nothing and survived as a splitting edge, duplicating a
+    /// stretch of the rim. Coincidence is a property of GEOMETRY, not of
+    /// endpoint identity: a cut lying on the rim retraces it whether it covers
+    /// all of the rim or a twelfth of it.
     #[test]
     fn partial_arc_on_rim_is_boundary_coincident() {
         let (mut model, mut graph, _rim) = rim_fixture();
@@ -21021,6 +21052,131 @@ coincidence must be decided by lying on the boundary, not by length"
             "a cut on the boundary edge's underlying CURVE but outside that edge's \
 parametric extent lies on a different stretch entirely — it splits the face and \
 must be kept"
+        );
+    }
+
+    /// Task #54 RED (fragmented rim): a cut that retraces a rim which a prior
+    /// pre-split has broken into several boundary arcs must still be recognised
+    /// as boundary-coincident.
+    ///
+    /// This is the measured mechanism behind `frustum_union_frustum_throat_27`.
+    /// The unified marcher (#55) traces the shared throat as a full closed
+    /// circle. Imprinting it registers the cut and then
+    /// `presplit_boundary_t_junctions` splits the rim boundary edge at the cut's
+    /// endpoints, so by the time `drop_cuts_coincident_with_boundary` runs the
+    /// rim is no longer one edge but a chain of arcs over the SAME circle curve.
+    /// The full-circle cut lies across every arc; no single arc contains all of
+    /// its samples. The earlier formulation asked "does one boundary edge
+    /// contain every sample", answered no, kept the cut, and it doubled the rim
+    /// (`loop[0] edges=[2, 44, 43, 42, 2, ...]`, edge 2 traversed twice → 198
+    /// boundary edges).
+    ///
+    /// Coincidence with the rim is a property of the rim as a whole, not of any
+    /// one fragment of it: every sample of the cut lies on SOME rim arc.
+    #[test]
+    fn cut_retracing_a_presplit_fragmented_rim_is_dropped() {
+        use crate::primitives::curve::{Circle, ParameterRange};
+        use crate::primitives::edge::{Edge, EdgeOrientation};
+
+        let mut model = BRepModel::new();
+        // One rim circle curve, shared by both boundary arcs — exactly what a
+        // pre-split of a closed rim produces (sub-ranges of one curve).
+        let rim = Circle::new(Point3::new(0.0, 0.0, -12.0), Vector3::Z, 6.0).expect("rim");
+        let rim_curve = model.curves.add(Box::new(rim));
+        let seam = model.vertices.add_or_find(6.0, 0.0, -12.0, 1e-9);
+        let mid = model.vertices.add_or_find(-6.0, 0.0, -12.0, 1e-9);
+        // Rim fragmented into two half-circle boundary arcs [0,0.5] and [0.5,1].
+        let arc_a = model.edges.add(Edge::new(
+            0,
+            seam,
+            mid,
+            rim_curve,
+            EdgeOrientation::Forward,
+            ParameterRange::new(0.0, 0.5),
+        ));
+        let arc_b = model.edges.add(Edge::new(
+            0,
+            mid,
+            seam,
+            rim_curve,
+            EdgeOrientation::Forward,
+            ParameterRange::new(0.5, 1.0),
+        ));
+        let mut graph = IntersectionGraph::new();
+        graph.add_edge(arc_a, EdgeType::Boundary);
+        graph.add_edge(arc_b, EdgeType::Boundary);
+
+        // Cut: the whole rim, on the same circle, as one splitting edge.
+        let cut = add_rim_arc_cut(&mut model, &mut graph, 0.0, 1.0);
+        graph.resolve_vertices(&model);
+        assert!(
+            graph.edges.contains_key(&cut),
+            "fixture must register the whole-rim cut as a splitting edge"
+        );
+
+        drop_cuts_coincident_with_boundary(&mut graph, &model, &Tolerance::default());
+
+        assert!(
+            !graph.edges.contains_key(&cut),
+            "a cut retracing a rim that was pre-split into arcs still retraces the \
+rim; each sample lands on one arc or another and the cut must be dropped, not \
+kept to double the rim"
+        );
+    }
+
+    /// Task #54 RED (marched residual): a cut that is a MARCHED approximation of
+    /// the rim — off it by a few × the distance tolerance, as the surface-surface
+    /// marcher legitimately produces near a shallow-angle (near-tangent)
+    /// intersection — must still be recognised as boundary-coincident.
+    ///
+    /// The throat of two coaxial cones is where they meet at a shallow angle.
+    /// The marcher's corrector drives its constraint residual to `tol` but the
+    /// near-tangency amplifies that into a positional error of ~1.16e-6 at
+    /// tol=1e-6 (measured on `frustum_union_frustum_throat_27`). Judged at
+    /// exactly 1·tol the throat curve reads as "off the rim" and is kept,
+    /// doubling it. The coincidence band must budget for the marched residual.
+    ///
+    /// Fixture: a cut arc on a circle offset radially by 1.5e-6 from the rim —
+    /// above 1·tol (would be rejected by the old band) and far below the real
+    /// feature scale.
+    #[test]
+    fn marched_cut_offset_within_coincidence_band_is_dropped() {
+        use crate::primitives::curve::{Arc, ParameterRange};
+        use crate::primitives::edge::{Edge, EdgeOrientation};
+
+        let (mut model, mut graph, _rim) = rim_fixture();
+
+        // A quarter-turn arc on a circle 1.5e-6 outside the rim (radius
+        // 6 + 1.5e-6): every sample lies 1.5e-6 off the true rim.
+        let offset = 6.0 + 1.5e-6;
+        let two_pi = std::f64::consts::PI * 2.0;
+        let (a0, a1) = (0.0, 0.25 * two_pi);
+        let arc = Arc::new(Point3::new(0.0, 0.0, -12.0), Vector3::Z, offset, a0, a1).expect("arc");
+        let v0 = model
+            .vertices
+            .add_or_find(offset * a0.cos(), offset * a0.sin(), -12.0, 1e-9);
+        let v1 = model
+            .vertices
+            .add_or_find(offset * a1.cos(), offset * a1.sin(), -12.0, 1e-9);
+        let curve = model.curves.add(Box::new(arc));
+        let cut = model.edges.add(Edge::new(
+            0,
+            v0,
+            v1,
+            curve,
+            EdgeOrientation::Forward,
+            ParameterRange::new(0.0, 1.0),
+        ));
+        graph.add_edge(cut, EdgeType::Splitting);
+        graph.resolve_vertices(&model);
+
+        drop_cuts_coincident_with_boundary(&mut graph, &model, &Tolerance::default());
+
+        assert!(
+            !graph.edges.contains_key(&cut),
+            "a marched cut sitting 1.5e-6 off the rim (a few × the 1e-6 tolerance, \
+as a near-tangent intersection legitimately produces) still retraces the rim and \
+must be dropped; a 1·tol band rejects it and lets it double the rim"
         );
     }
 
