@@ -1544,7 +1544,16 @@ async fn boolean_operation(
                 solid_a,
                 solid_b,
                 operation,
-                BooleanOptions::default(),
+                // Product policy (task #34): at the API surface a difference
+                // that removes nothing is a caller positioning error, not a
+                // silent no-op. Opt into the typed DisjointDifference refusal
+                // so a bore-miss surfaces `boolean_disjoint` (mapped below).
+                // The kernel primitive itself stays honest math (A∖B = A for
+                // disjoint B) for direct callers via the default options.
+                BooleanOptions {
+                    refuse_disjoint_difference: true,
+                    ..BooleanOptions::default()
+                },
             )
             .map_err(|e| match e {
                 // Honesty gate: a difference whose tool never touches the

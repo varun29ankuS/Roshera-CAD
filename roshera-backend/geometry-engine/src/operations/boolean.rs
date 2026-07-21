@@ -123,6 +123,24 @@ pub struct BooleanOptions {
 
     /// Tolerance for coincidence checks
     pub coincidence_tolerance: f64,
+
+    /// Opt-in policy: refuse a `Difference` whose tool grazed NOTHING
+    /// (`A ∖ B` with `B` disjoint from `A`) with a typed
+    /// [`OperationError::DisjointDifference`] instead of returning `A`
+    /// unchanged.
+    ///
+    /// The general Boolean primitive is honest math: `A ∖ B = A` when `B`
+    /// is disjoint from `A`, so the default is `false` and the operation
+    /// returns `A` unchanged — the mathematically exact result (an
+    /// OCCT/Parasolid-equivalent contract, and what the #91 conquered-band
+    /// gate asserts). "A cut that removes nothing is a caller error" is a
+    /// PRODUCT-level policy, not a property of the primitive, so it is
+    /// opt-in: the api-server difference endpoint enables it (task #34) so a
+    /// mis-positioned drill bore surfaces a typed `boolean_disjoint` refusal
+    /// rather than a silent no-op, while direct kernel callers get the exact
+    /// set-theoretic result. Applies only to `Difference`; `A ⊆ B`
+    /// annihilation still falls through to `EmptyResult`.
+    pub refuse_disjoint_difference: bool,
 }
 
 impl Default for BooleanOptions {
@@ -132,6 +150,7 @@ impl Default for BooleanOptions {
             allow_non_manifold: false,
             merge_coincident: true,
             coincidence_tolerance: 1e-8,
+            refuse_disjoint_difference: false,
         }
     }
 }
@@ -586,8 +605,8 @@ pub fn boolean_operation(
             }
         }
 
-        // Step 4.5 — disjoint-difference honesty gate. A Difference whose
-        // tool grazed NOTHING (zero intersection curves, zero coplanar
+        // Step 4.5 — disjoint-difference honesty gate (OPT-IN). A Difference
+        // whose tool grazed NOTHING (zero intersection curves, zero coplanar
         // contact) and contributed NO face to the result would "succeed" by
         // returning a copy of A: the silent no-op that let a mis-centered
         // drill bore report "hole drilled" while the part was untouched.
@@ -595,7 +614,18 @@ pub fn boolean_operation(
         // case, which falls through to the typed `EmptyResult` below. The
         // enclosed-void case (B strictly inside A) keeps B's faces in the
         // selection, so it never trips this gate.
-        if matches!(operation, BooleanOp::Difference) && !selected_faces.is_empty() {
+        //
+        // This refusal is a PRODUCT-level policy, not a property of the
+        // primitive: mathematically `A ∖ B = A` for disjoint `B`, and that
+        // exact result is what direct kernel callers (and the #91
+        // conquered-band gate) require. It fires only when the caller opts in
+        // via `refuse_disjoint_difference` (the api-server difference endpoint
+        // sets it so a bore-miss surfaces `boolean_disjoint`); with the flag
+        // off the pipeline falls through and returns `A` unchanged.
+        if options.refuse_disjoint_difference
+            && matches!(operation, BooleanOp::Difference)
+            && !selected_faces.is_empty()
+        {
             let any_contact = intersections.iter().any(|fi| {
                 !fi.curves.is_empty()
                     || !fi.coplanar_curves_a.is_empty()
