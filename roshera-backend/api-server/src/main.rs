@@ -20,6 +20,7 @@ mod assembly_mates;
 mod assembly_mgr;
 mod auth_middleware;
 mod auth_slice1_tests;
+mod auth_slice4_tests;
 mod blackboard;
 #[cfg(test)]
 mod blend_failed_harness;

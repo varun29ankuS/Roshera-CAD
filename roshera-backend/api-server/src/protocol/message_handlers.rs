@@ -241,7 +241,8 @@ async fn handle_websocket_connection(socket: WebSocket, state: AppState) {
     // upgrade). Authentication therefore happens in-band: the client
     // sends a `ClientMessage::Authenticate` frame carrying a JWT, and
     // only after that token verifies may it drive the command surface
-    // (GeometryCommand, AICommand, TimelineCommand, ExportCommand).
+    // (GeometryCommand, AICommand, TimelineCommand, ExportCommand,
+    // SessionCommand).
     //
     // Before this gate the `Authenticate` handler verified the token but
     // used the claims only to build a reply — it set no connection state
@@ -319,14 +320,17 @@ async fn handle_websocket_connection(socket: WebSocket, state: AppState) {
 
     // In-band auth gate for the command surface. Invoked at the top of
     // every command arm that mutates state or spends budget
-    // (GeometryCommand, AICommand, TimelineCommand, ExportCommand). When
-    // the connection has not authenticated, it replies with an
-    // `auth_required` error carrying the client's `request_id` and
-    // `continue`s the receive loop — the command is never dispatched.
-    // `Ping`, `Authenticate`, and the subscription/query frames are
-    // deliberately not gated: a client must be able to ping and to
-    // authenticate, and read-only subscription bookkeeping carries no
-    // mutation or budget. Expands in place so it borrows `sender`,
+    // (GeometryCommand, AICommand, TimelineCommand, ExportCommand,
+    // SessionCommand — session create/join/leave, object share, and
+    // presence all mutate shared session state, so an anonymous socket
+    // must not reach them). When the connection has not authenticated, it
+    // replies with an `auth_required` error carrying the client's
+    // `request_id` and `continue`s the receive loop — the command is
+    // never dispatched. `Ping`, `Authenticate`, and the
+    // subscription/query frames are deliberately not gated: a client must
+    // be able to ping and to authenticate, and read-only subscription
+    // bookkeeping carries no mutation or budget. Expands in place so it
+    // borrows `sender`,
     // `ws_authenticated`, and `user_id` from this scope and its
     // `continue` targets the receive loop.
     macro_rules! require_ws_auth {
@@ -946,6 +950,7 @@ async fn handle_websocket_connection(socket: WebSocket, state: AppState) {
                                 command,
                                 request_id,
                             } => {
+                                require_ws_auth!(request_id);
                                 // Handle session commands
                                 match command {
                                     super::protocol::SessionWSCommand::JoinSession {
