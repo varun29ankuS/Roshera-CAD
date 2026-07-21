@@ -257,11 +257,32 @@ impl KnotVector {
             )));
         }
 
-        // Check multiplicity constraints
+        // Check multiplicity constraints.
+        //
+        // The multiplicity of the knot at `i` is the length of the equal-valued
+        // RUN starting there. A knot vector is non-decreasing (enforced by
+        // `KnotVector::new`), so equal values are necessarily contiguous and the
+        // run length is the multiplicity — there is no need to rescan the whole
+        // vector per distinct knot, which is what `multiplicity()` does.
+        //
+        // That rescan made this validator O(n²), and `NurbsCurve::new` calls it
+        // on every construction. Since `primitives::NurbsCurve::evaluate`
+        // reconstructs its math-layer curve per evaluation, the cost landed on
+        // the single-point evaluation path: a 5,441-control-point curve — what a
+        // tolerance-accurate SSI trace of a radius-6 circle fits — took 160 ms
+        // per point, and the boolean's curve/curve intersection budgets
+        // thousands of evaluations per pair. That is the whole of the
+        // "frustum union hangs" report: not a non-terminating loop, a quadratic
+        // validator on a hot path.
         let mut i = 0;
         while i < self.knots.len() {
             let knot_value = self.knots[i];
-            let mult = self.multiplicity(knot_value);
+            let mut mult = 1;
+            while i + mult < self.knots.len()
+                && (self.knots[i + mult] - knot_value).abs() < consts::EPSILON
+            {
+                mult += 1;
+            }
 
             // Multiplicity cannot exceed degree + 1
             if mult > degree + 1 {

@@ -1892,60 +1892,44 @@ fn plane_general_intersection(
     Ok(out)
 }
 
-/// HARD STEP CAP for the general marching SSI, shared by every seed on one
-/// surface pair. The marching step is tied to the distance tolerance (~1e-5),
-/// so a curve on unit-scale primitives needs ~10^6 steps; for a pair with NO
-/// analytic SSI arm (cone x cylinder, cone x sphere, ...) the march can also
-/// fail to ever close — a true HANG that freezes the kernel (the worst failure
-/// class). Bound it: a real intersection curve on bounded analytic primitives
-/// needs far fewer points; exhausting the budget means the march is
-/// non-terminating/unreliable, so those curves are discarded rather than
-/// hanging or feeding a truncated garbage curve downstream. The proper fix for
-/// those pairs is an analytic SSI arm (task #7) / a geometry-scaled step —
-/// tracked separately; this is the safety guard.
-const MAX_MARCH_STEPS: usize = 200_000;
-
-/// Marching algorithm for surface intersection
+/// General surface-surface intersection for the boolean pipeline, delegated to
+/// the kernel's canonical marcher (task #55).
+///
+/// This used to be a second, independent implementation of predictor-corrector
+/// marching (`find_initial_intersection_points` + `march_from_point`), living
+/// alongside [`crate::math::surface_intersection::intersect_surfaces`] and
+/// disagreeing with it. The duplicate had a chord fixed at `tolerance × 10`
+/// with no curvature adaptation, giving a total reach of `cap × chord` ≈ 2
+/// world units regardless of feature size, so any curve larger than that was
+/// traced partially and then discarded — the boolean silently saw "no
+/// intersection" on ordinary large features. One marcher, one step law, one
+/// set of guarantees.
 fn march_surface_intersection(
     surface_a: &dyn Surface,
     surface_b: &dyn Surface,
     tolerance: &Tolerance,
 ) -> OperationResult<Vec<SurfaceIntersectionCurve>> {
-    let mut curves = Vec::new();
+    let traced =
+        crate::math::surface_intersection::intersect_surfaces(surface_a, surface_b, tolerance)
+            .map_err(|e| {
+                OperationError::NumericalError(format!("surface-surface intersection: {e}"))
+            })?;
 
-    // Find initial intersection points using grid sampling
-    let initial_points = find_initial_intersection_points(surface_a, surface_b, tolerance)?;
-
-    // March from each initial point under a budget shared by the WHOLE surface
-    // pair (task #50). The per-march cap alone bounds one trace but not the
-    // pipeline: on a large feature the tolerance-derived step cannot cover the
-    // curve, so every seed burns the full cap on the same doomed branch and is
-    // discarded — ~20 seeds on a diameter-100 ring cost ~10^8 surface
-    // evaluations and over two minutes of wall-clock to produce nothing. A
-    // shared budget makes an unmarchable pair cost O(cap) instead of
-    // O(seeds x cap); the curves that are emitted are unchanged.
-    let mut budget = MAX_MARCH_STEPS;
-    for start_point in initial_points {
-        if budget == 0 {
-            if pipeline_trace_enabled() {
-                eprintln!(
-                    "[bool]   march_surface_intersection: pair step budget \
-                     {MAX_MARCH_STEPS} exhausted — remaining seeds not marched"
-                );
-            }
-            break;
+    let mut curves = Vec::with_capacity(traced.len());
+    for t in traced {
+        if t.points.len() < 2 {
+            continue;
         }
-        if let Some(curve) =
-            march_from_point(surface_a, surface_b, start_point, tolerance, &mut budget)?
-        {
-            curves.push(curve);
-        }
+        let curve = fit_curve_to_polyline(&t.points, tolerance)?;
+        curves.push(SurfaceIntersectionCurve {
+            curve,
+            on_surface_a: create_parametric_curve(&t.params1),
+            on_surface_b: create_parametric_curve(&t.params2),
+            crossings: Vec::new(),
+        });
     }
 
-    // Merge curves that connect
-    let merged_curves = merge_connected_curves(curves, tolerance)?;
-
-    Ok(merged_curves)
+    merge_connected_curves(curves, tolerance)
 }
 
 /// Analytical plane-plane intersection
@@ -4523,66 +4507,6 @@ fn plane_torus_intersection(
     }])
 }
 
-fn find_initial_intersection_points(
-    surface_a: &dyn Surface,
-    surface_b: &dyn Surface,
-    tolerance: &Tolerance,
-) -> OperationResult<Vec<IntersectionPoint>> {
-    let mut points = Vec::new();
-
-    // Grid sampling parameters
-    const GRID_SIZE: usize = 20;
-
-    // Get parameter bounds for both surfaces
-    let (u_bounds_a, v_bounds_a) = surface_a.parameter_bounds();
-    let (u_min_a, u_max_a) = u_bounds_a;
-    let (v_min_a, v_max_a) = v_bounds_a;
-
-    let (u_bounds_b, v_bounds_b) = surface_b.parameter_bounds();
-    let (u_min_b, u_max_b) = u_bounds_b;
-    let (v_min_b, v_max_b) = v_bounds_b;
-
-    // closest_point() does not enforce parameter bounds, so we reject hits
-    // that fall outside surface B's actual domain (within a small slack).
-    let bound_slack = tolerance.distance().max(1e-9);
-
-    // Sample surface A
-    for i in 0..=GRID_SIZE {
-        for j in 0..=GRID_SIZE {
-            let u_a = u_min_a + (u_max_a - u_min_a) * (i as f64) / (GRID_SIZE as f64);
-            let v_a = v_min_a + (v_max_a - v_min_a) * (j as f64) / (GRID_SIZE as f64);
-
-            let point_a = surface_a.evaluate_full(u_a, v_a)?;
-
-            // Find closest point on surface B
-            if let Ok((u_b, v_b)) = surface_b.closest_point(&point_a.position, *tolerance) {
-                if u_b < u_min_b - bound_slack
-                    || u_b > u_max_b + bound_slack
-                    || v_b < v_min_b - bound_slack
-                    || v_b > v_max_b + bound_slack
-                {
-                    continue;
-                }
-                let point_b = surface_b.evaluate_full(u_b, v_b)?;
-
-                let distance = (point_a.position - point_b.position).magnitude();
-                if distance < tolerance.distance() {
-                    points.push(IntersectionPoint {
-                        position: (point_a.position + point_b.position) * 0.5,
-                        params_a: (u_a, v_a),
-                        params_b: (u_b, v_b),
-                    });
-                }
-            }
-        }
-    }
-
-    // Remove duplicate points
-    deduplicate_points(&mut points, tolerance);
-
-    Ok(points)
-}
-
 #[derive(Debug, Clone)]
 struct IntersectionPoint {
     position: Point3,
@@ -4590,182 +4514,28 @@ struct IntersectionPoint {
     params_b: (f64, f64),
 }
 
-/// Remove duplicate intersection points
-fn deduplicate_points(points: &mut Vec<IntersectionPoint>, tolerance: &Tolerance) {
-    let mut i = 0;
-    while i < points.len() {
-        let mut j = i + 1;
-        while j < points.len() {
-            if (points[i].position - points[j].position).magnitude() < tolerance.distance() {
-                points.swap_remove(j);
-            } else {
-                j += 1;
-            }
-        }
-        i += 1;
-    }
-}
-
-/// March along intersection curve from a starting point
-#[allow(clippy::expect_used)] // tangent magnitude verified > tolerance before normalize().expect()
-fn march_from_point(
-    surface_a: &dyn Surface,
-    surface_b: &dyn Surface,
-    start: IntersectionPoint,
-    tolerance: &Tolerance,
-    budget: &mut usize,
-) -> OperationResult<Option<SurfaceIntersectionCurve>> {
-    // HARD STEP CAP per direction. The marching step is tied to the distance
-    // tolerance (≈1e-5), so a curve on unit-scale primitives needs ~10^6 steps;
-    // for a pair with NO analytic SSI arm (cone×cylinder, cone×sphere, …) the
-    // march can also fail to ever close → a true HANG that freezes the kernel
-    // (the worst failure class). Bound it: a real intersection curve on bounded
-    // analytic primitives needs far fewer points; exceeding the cap means the
-    // march is non-terminating/unreliable, so discard this curve (Ok(None))
-    // rather than hang or feed a truncated garbage curve downstream. The proper
-    // fix for those pairs is an analytic SSI arm (task #7) / a geometry-scaled
-    // step — tracked separately; this is the safety guard.
-    // Collect each direction into its own Vec (forward + backward) and splice at
-    // the end, so the backward branch is O(n) instead of the old insert(0, …)
-    // which made a long march quadratic.
-    let mut fwd: Vec<IntersectionPoint> = Vec::new();
-    let mut bwd: Vec<IntersectionPoint> = Vec::new();
-
-    for direction in &[1.0, -1.0] {
-        let mut current = start.clone();
-        let mut step_size = tolerance.distance() * 10.0;
-
-        loop {
-            if *budget == 0 {
-                // Non-terminating march — bail the whole curve as unreliable.
-                if pipeline_trace_enabled() {
-                    eprintln!(
-                        "[bool]   march_from_point: step cap {MAX_MARCH_STEPS} hit \
-                         (non-terminating SSI — discarding curve; needs analytic arm)"
-                    );
-                }
-                return Ok(None);
-            }
-            *budget -= 1;
-
-            // Compute tangent direction
-            let tangent = compute_intersection_tangent(surface_a, surface_b, &current)?;
-            if tangent.magnitude() < tolerance.distance() {
-                break; // Degenerate tangent
-            }
-
-            // Take a step. `normalize()` is guaranteed Some because the
-            // magnitude check above ensures tangent is well above zero.
-            let normalized_tangent = tangent
-                .normalize()
-                .expect("tangent magnitude verified > tolerance above");
-            let next_pos = current.position + normalized_tangent * step_size * *direction;
-
-            // Project onto both surfaces
-            let (u_a, v_a) = surface_a.closest_point(&next_pos, *tolerance)?;
-            let (u_b, v_b) = surface_b.closest_point(&next_pos, *tolerance)?;
-
-            let point_a = surface_a.point_at(u_a, v_a)?;
-            let point_b = surface_b.point_at(u_b, v_b)?;
-
-            let distance = (point_a - point_b).magnitude();
-
-            if distance > tolerance.distance() * 2.0 {
-                // Step failed - reduce step size
-                step_size *= 0.5;
-                if step_size < tolerance.distance() {
-                    break; // Can't make progress
-                }
-                continue;
-            }
-
-            // Accept the step
-            let next = IntersectionPoint {
-                position: (point_a + point_b) * 0.5,
-                params_a: (u_a, v_a),
-                params_b: (u_b, v_b),
-            };
-
-            // Check for loop closure against the seed point.
-            if fwd.len() + bwd.len() > 3 {
-                let dist_to_start = (next.position - start.position).magnitude();
-                if dist_to_start < tolerance.distance() * 2.0 {
-                    break; // Closed loop found
-                }
-            }
-
-            if *direction > 0.0 {
-                fwd.push(next.clone());
-            } else {
-                bwd.push(next.clone());
-            }
-            current = next;
-
-            // Adaptive step size
-            if distance < tolerance.distance() * 0.5 {
-                step_size = (step_size * 1.5).min(tolerance.distance() * 20.0);
-            }
-        }
-    }
-
-    // Splice: backward branch (reversed) + seed + forward branch.
-    let mut points = Vec::with_capacity(bwd.len() + 1 + fwd.len());
-    points.extend(bwd.iter().rev().cloned());
-    points.push(start.clone());
-    points.extend(fwd.iter().cloned());
-    let params_a: Vec<(f64, f64)> = points.iter().map(|p| p.params_a).collect();
-    let params_b: Vec<(f64, f64)> = points.iter().map(|p| p.params_b).collect();
-
-    if points.len() < 2 {
-        return Ok(None);
-    }
-
-    // Fit curve to points
-    let curve = fit_curve_to_points(&points, tolerance)?;
-
-    // Create parametric representations
-    let on_surface_a = create_parametric_curve(&params_a);
-    let on_surface_b = create_parametric_curve(&params_b);
-
-    Ok(Some(SurfaceIntersectionCurve {
-        curve,
-        on_surface_a,
-        on_surface_b,
-        crossings: Vec::new(),
-    }))
-}
-
-/// Compute tangent direction at intersection point
-fn compute_intersection_tangent(
-    surface_a: &dyn Surface,
-    surface_b: &dyn Surface,
-    point: &IntersectionPoint,
-) -> OperationResult<Vector3> {
-    let eval_a = surface_a.evaluate_full(point.params_a.0, point.params_a.1)?;
-    let eval_b = surface_b.evaluate_full(point.params_b.0, point.params_b.1)?;
-
-    let normal_a = eval_a.normal;
-    let normal_b = eval_b.normal;
-
-    let tangent = normal_a.cross(&normal_b);
-
-    Ok(tangent)
-}
-
 /// Fit a curve to intersection points
 fn fit_curve_to_points(
     points: &[IntersectionPoint],
     tolerance: &Tolerance,
 ) -> OperationResult<Box<dyn Curve>> {
+    let positions: Vec<Point3> = points.iter().map(|p| p.position).collect();
+    fit_curve_to_polyline(&positions, tolerance)
+}
+
+/// Fit a curve through a traced 3-D polyline.
+///
+/// Two samples give a `Line`; more give a cubic NURBS fit.
+fn fit_curve_to_polyline(
+    positions: &[Point3],
+    tolerance: &Tolerance,
+) -> OperationResult<Box<dyn Curve>> {
     use crate::primitives::curve::{Line, NurbsCurve};
 
-    if points.len() == 2 {
-        // Simple line
-        Ok(Box::new(Line::new(points[0].position, points[1].position)))
+    if positions.len() == 2 {
+        Ok(Box::new(Line::new(positions[0], positions[1])))
     } else {
-        // Fit NURBS curve
-        let positions: Vec<Point3> = points.iter().map(|p| p.position).collect();
-        let nurbs = NurbsCurve::fit_to_points(&positions, 3, tolerance.distance())?;
+        let nurbs = NurbsCurve::fit_to_points(positions, 3, tolerance.distance())?;
         Ok(Box::new(nurbs))
     }
 }

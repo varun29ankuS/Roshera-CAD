@@ -241,10 +241,23 @@ fn intersect_surfaces_marching(
 ) -> MathResult<Vec<IntersectionCurve>> {
     let mut curves = Vec::new();
 
+    let t_start = std::time::Instant::now();
     let seeds = find_intersection_seeds(surface1, surface2, tolerance)?;
     let mut consumed = vec![false; seeds.len()];
 
     let nominal_step = nominal_march_step(&seeds, tolerance);
+
+    if ssi_trace_enabled() {
+        eprintln!(
+            "[ssi] pair {:?}x{:?} seeds={} nominal_step={:.6e} tol={:.3e} (seeding {:.1?})",
+            surface1.surface_type(),
+            surface2.surface_type(),
+            seeds.len(),
+            nominal_step,
+            tolerance.distance(),
+            t_start.elapsed(),
+        );
+    }
 
     // Coverage radius for consuming seeds that fall on an already-traced
     // branch. Generous relative to the nominal chord so a seed sitting
@@ -258,11 +271,20 @@ fn intersect_surfaces_marching(
         }
         consumed[i] = true;
 
+        let t_branch = std::time::Instant::now();
         let curve =
             match trace_intersection_curve(surface1, surface2, seeds[i], tolerance, nominal_step) {
                 Ok(c) if c.points.len() >= 2 => c,
                 _ => continue,
             };
+        if ssi_trace_enabled() {
+            eprintln!(
+                "[ssi]   branch from seed {i}: points={} closed={} ({:.1?})",
+                curve.points.len(),
+                curve.is_closed,
+                t_branch.elapsed(),
+            );
+        }
 
         // Consume every remaining seed that lies on this traced branch.
         for (j, seed) in seeds.iter().enumerate() {
@@ -283,7 +305,25 @@ fn intersect_surfaces_marching(
 
     deduplicate_curves(&mut curves, tolerance);
 
+    if ssi_trace_enabled() {
+        eprintln!(
+            "[ssi] pair done: {} curve(s), total {:.1?}",
+            curves.len(),
+            t_start.elapsed(),
+        );
+    }
+
     Ok(curves)
+}
+
+/// `ROSHERA_SSI_TRACE=1` turns on step-level marcher diagnostics on stderr.
+/// Off by default and read once; a marcher that cannot be observed cannot be
+/// diagnosed, and the previous unification attempt stalled precisely because
+/// its non-termination had no instrumentation to name a mechanism.
+fn ssi_trace_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("ROSHERA_SSI_TRACE").is_ok_and(|v| v != "0"))
 }
 
 /// Grid-sample surface 1 and project each sample onto surface 2; retain
@@ -714,14 +754,25 @@ fn trace_intersection_curve(
 /// Single-direction predictor–corrector tracing with curvature-adaptive step
 /// control and tangent-consistent loop closure.
 ///
-/// **Step control.** The chord (prediction step) is sized so the intersection
-/// curve turns by no more than `TURN_TARGET` radians between consecutive
-/// samples: after each accepted point the step is scaled by
-/// `TURN_TARGET / turn`, clamped to `[MIN_STEP_FACTOR, MAX_STEP_FACTOR]` of
-/// nominal. A step that turns more than `2·TURN_TARGET` is rejected and retried
-/// at half size from the same anchor. This keeps chord (sagitta) error bounded
-/// in high-curvature regions and lets the trace stride across gentle ones —
-/// the arc-length / curvature step law of Patrikalakis & Maekawa (2002) §5.8.
+/// **Step control.** Two criteria bound the chord, and the smaller wins.
+///
+/// 1. *Sagitta (accuracy).* The polyline this function emits is consumed as a
+///    geometric approximation of the intersection curve, so its deviation from
+///    the true curve must respect the caller's DISTANCE tolerance. For a chord
+///    `c` on a curve of local radius `R` the mid-chord deviation is
+///    `s = c²/(8R)`, so `s ≤ tol` requires `c ≤ √(8·R·tol)`. `R` is estimated
+///    from the step just taken as `travel / turn`.
+/// 2. *Turn (shape fidelity).* The curve turns by no more than `TURN_TARGET`
+///    radians per sample, so a branch is never caricatured by a handful of
+///    long chords even when `tol` is loose.
+///
+/// A turn criterion ALONE is scale-free and therefore tolerance-blind: it
+/// fixes the chord at `TURN_TARGET·R` and the sagitta at `TURN_TARGET²/8 · R`
+/// ≈ 0.5 % of the radius, whatever tolerance the caller passed. At `R = 6`
+/// with `tol = 1e-6` that is a polyline 0.03–0.04 from the true curve —
+/// ~30,000× coarser than requested, and silently so. The sagitta term is what
+/// makes this function honour its own contract. (Arc-length / curvature step
+/// law: Patrikalakis & Maekawa (2002) §5.8.)
 ///
 /// **Divergence.** When the corrector declares divergence (near-tangency, or
 /// a predicted point in the wrong basin) the step is halved and retried down
@@ -743,29 +794,52 @@ fn trace_direction(
     nominal_step: f64,
     closed_out: &mut bool,
 ) -> MathResult<()> {
-    const MAX_STEPS: usize = 4000;
-    /// Floor on subdivision: when the prediction step has been halved
-    /// to this fraction of nominal and the corrector still diverges,
-    /// give up cleanly. Six halvings ≈ 1/64 of nominal = 1.5e-4 in
-    /// world units, well below any meaningful chord-tolerance.
-    const MIN_STEP_FACTOR: f64 = 1.0 / 64.0;
+    /// Sample budget for ONE direction of ONE branch. Sized so a full circular
+    /// branch is traceable at the sagitta chord across the model scales the
+    /// kernel supports: a diameter-100 ring at `tol = 1e-6` has a sagitta chord
+    /// of `√(8·50·1e-6) = 0.02` against a circumference of 314, i.e. ~15,700
+    /// samples. This is a guard against a non-terminating trace, not a working
+    /// limit: every branch the kernel actually traces must finish well inside
+    /// it, and one that does not is a defect to diagnose, not a curve to trust.
+    const MAX_STEPS: usize = 65_536;
     /// Ceiling on step growth over gentle (near-flat) curve regions so the
     /// trace covers length efficiently without under-sampling. Kept modest so
     /// the chord-scaled closure radius stays tight enough to close a loop near
     /// its true seed rather than a step early.
     const MAX_STEP_FACTOR: f64 = 8.0;
-    /// Target curve turning per sample (radians). ~11.5°: keeps a circle's
-    /// chord-sagitta error near 0.5 % of the radius.
+    /// Target curve turning per sample (radians). ~11.5°.
     const TURN_TARGET: f64 = 0.20;
+
+    let tol = tolerance.distance();
+
+    // Absolute floor on the prediction chord, in world units. The step law now
+    // works in world units rather than in multiples of nominal, because the
+    // sagitta chord is an ABSOLUTE length: on a large feature it is a far
+    // smaller fraction of nominal than any fixed factor floor would permit, so
+    // a factor floor (the previous `nominal/64`) would clamp the step ABOVE
+    // the accuracy requirement and the trace could never meet its tolerance.
+    //
+    // The floor is also the divergence give-up point: when the corrector still
+    // fails at this chord the trace ends cleanly with a valid partial curve.
+    // It must stay strictly positive — a step law that can halve toward zero
+    // cannot terminate, and a bound that is never reached is not a bound.
+    let step_floor = (tol * 10.0).max(f64::MIN_POSITIVE);
+    let step_ceiling = nominal_step * MAX_STEP_FACTOR;
 
     let seed_pos = curve.points.first().copied().unwrap_or(current.position);
     let seed_tangent = current.tangent * direction;
 
-    let mut step_factor = 1.0_f64;
+    let mut step_size = nominal_step.max(step_floor);
     let mut total_steps = 0usize;
+    // Diagnostics: retries never advance `total_steps`, so they are the only
+    // way this loop can spin without consuming budget. Counting them by cause
+    // is what distinguishes "unbounded stepping" from "non-terminating retry".
+    let (mut n_diverge, mut n_stationary, mut n_reject, mut n_iters) =
+        (0usize, 0usize, 0usize, 0usize);
+    let mut why = "budget";
 
     while total_steps < MAX_STEPS {
-        let step_size = nominal_step * step_factor;
+        n_iters += 1;
         let predicted_pos = current.position + current.tangent * (step_size * direction);
 
         let corrected_opt = correct_to_intersection(
@@ -787,15 +861,18 @@ fn trace_direction(
                 // side of an inflection. If we've already halved
                 // below the floor, declare the trace done; the
                 // partial curve up to `current` is still valid.
-                step_factor *= 0.5;
-                if step_factor < MIN_STEP_FACTOR {
+                n_diverge += 1;
+                if step_size <= step_floor {
+                    why = "diverged-at-floor";
                     break;
                 }
+                step_size = (step_size * 0.5).max(step_floor);
                 continue;
             }
         };
 
         if is_out_of_bounds(surface1, corrected.uv1) || is_out_of_bounds(surface2, corrected.uv2) {
+            why = "out-of-bounds";
             break;
         }
 
@@ -807,10 +884,12 @@ fn trace_direction(
             // The corrector fell back onto (essentially) the anchor — no
             // forward progress. Shrink and retry; give up at the floor so a
             // stationary corrector can never spin the full step budget.
-            step_factor *= 0.5;
-            if step_factor < MIN_STEP_FACTOR {
+            n_stationary += 1;
+            if step_size <= step_floor {
+                why = "stationary-at-floor";
                 break;
             }
+            step_size = (step_size * 0.5).max(step_floor);
             continue;
         }
         let oriented_tangent = if corrected.tangent.dot(&travel) < 0.0 {
@@ -825,10 +904,19 @@ fn trace_direction(
             .clamp(-1.0, 1.0);
         let turn = cos_turn.acos();
 
-        // Reject an over-large turn (chord skipped a high-curvature bend) and
-        // retry at half step from the same anchor.
-        if turn > 2.0 * TURN_TARGET && step_factor > MIN_STEP_FACTOR {
-            step_factor *= 0.5;
+        // Reject a step that violates either criterion and retry at half the
+        // chord from the same anchor:
+        //   * turn  — the chord skipped a high-curvature bend;
+        //   * sagitta — the chord's mid-point deviation from the true arc,
+        //     `travel·turn/8` (substituting `R = travel/turn` into `c²/8R`),
+        //     exceeds the caller's distance tolerance.
+        // Both are gated on `step_size > step_floor` so the retry always
+        // terminates: the chord strictly decreases and the floor is positive.
+        let over_turn = turn > 2.0 * TURN_TARGET;
+        let over_sagitta = travel_len * turn * 0.125 > tol;
+        if (over_turn || over_sagitta) && step_size > step_floor {
+            n_reject += 1;
+            step_size = (step_size * 0.5).max(step_floor);
             continue;
         }
 
@@ -841,6 +929,7 @@ fn trace_direction(
             let tangent_aligned = oriented_tangent.dot(&seed_tangent) > 0.5;
             if dist_to_seed < close_radius && tangent_aligned {
                 *closed_out = true;
+                why = "closed";
                 break;
             }
         }
@@ -856,13 +945,30 @@ fn trace_direction(
         };
         total_steps += 1;
 
-        // Curvature-adaptive step update: scale toward the turning target.
+        // Curvature-adaptive step update: scale toward the turning target,
+        // then clamp to the sagitta chord for the local radius of curvature.
         let scale = if turn > 1e-9 {
             (TURN_TARGET / turn).clamp(0.5, 2.0)
         } else {
             2.0
         };
-        step_factor = (step_factor * scale).clamp(MIN_STEP_FACTOR, MAX_STEP_FACTOR);
+        // R = travel / turn. A vanishing turn means a locally straight branch,
+        // where the sagitta imposes no bound at all.
+        let sagitta_chord = if turn > 1e-9 {
+            (8.0 * (travel_len / turn) * tol).sqrt()
+        } else {
+            f64::INFINITY
+        };
+        step_size = (step_size * scale)
+            .min(sagitta_chord)
+            .min(step_ceiling)
+            .max(step_floor);
+    }
+
+    if ssi_trace_enabled() {
+        eprintln!(
+            "[ssi]     dir {direction:+.0}: {why} steps={total_steps} iters={n_iters}              retries(diverge={n_diverge} stationary={n_stationary} reject={n_reject})              final_step={step_size:.3e} floor={step_floor:.3e}"
+        );
     }
 
     Ok(())
