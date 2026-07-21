@@ -363,7 +363,9 @@ async fn boot_replay_inner(state: &AppState) -> DurabilityStatus {
     //    uuid↔solid registry so every restored solid is addressable by uuid.
     //    `rebuild_model_from_events` detaches/reattaches the recorder for the
     //    duration, so this replay does not re-record (or re-persist) anything.
-    {
+    //    The replay `id_remap` (recorded solid id → live solid id) is kept for
+    //    the Slice-3 side-channel restore below.
+    let id_remap = {
         let mut model = state.model.write().await;
         let outcome = rebuild_model_from_events(&mut model, &chosen);
         tracing::info!(
@@ -383,9 +385,122 @@ async fn boot_replay_inner(state: &AppState) -> DurabilityStatus {
             let uuid = Uuid::new_v4();
             state.register_id_mapping(uuid, solid_id);
         }
-    }
+        outcome.id_remap
+    };
+
+    // 8. DURABILITY Slice 3 (#39, spec §2.3): re-attach the unrecorded-mutation
+    //    side channels that live OUTSIDE the B-Rep model — part colours
+    //    (`set_color` events → `AppState.solid_colors`) and the editable revolve
+    //    meridian (`revolve_meridian` events → `AppState.solid_profiles`). Names
+    //    ride `Solid::name` and are already restored by the geometry replay above
+    //    (the `set_name` arm); colours and profiles are display-registry state
+    //    that geometry replay does not touch, so they are re-derived from their
+    //    durable events here and re-keyed onto the rebuilt solids through the
+    //    replay `id_remap`.
+    restore_side_channels(state, &chosen, &id_remap).await;
 
     status
+}
+
+/// Re-attach the Slice-3 display-registry side channels (spec §2.3) after a boot
+/// replay. `solid_colors` and `solid_profiles` live in `AppState`, not the B-Rep
+/// model, so `rebuild_model_from_events` does not restore them. Each is re-derived
+/// from its durable event, re-keyed from the recorded solid id to the live solid
+/// id via `id_remap`, and applied ONLY when the target solid survived the replay
+/// (a colour set on a solid later consumed by a boolean leaves no dangling
+/// registry entry). Events replay in sequence order, so the latest colour of a
+/// solid wins by natural overwrite.
+async fn restore_side_channels(
+    state: &AppState,
+    events: &[TimelineEvent],
+    id_remap: &std::collections::HashMap<u64, u64>,
+) {
+    let live: std::collections::HashSet<u32> = {
+        let model = state.model.read().await;
+        model.solids.iter().map(|(id, _)| id).collect()
+    };
+    let resolve = |recorded: u64| -> u32 { *id_remap.get(&recorded).unwrap_or(&recorded) as u32 };
+
+    for event in events {
+        let Operation::Generic {
+            command_type,
+            parameters,
+        } = &event.operation
+        else {
+            continue;
+        };
+        let params = parameters.get("params").unwrap_or(parameters);
+        match command_type.as_str() {
+            "set_color" => {
+                let recorded = parameters
+                    .get("inputs")
+                    .and_then(|v| v.as_array())
+                    .and_then(|a| a.first())
+                    .and_then(parse_solid_ref);
+                let rgb = params.get("rgb").and_then(parse_rgb);
+                if let (Some(recorded), Some(rgb)) = (recorded, rgb) {
+                    let live_id = resolve(recorded);
+                    if live.contains(&live_id) {
+                        state.solid_colors.insert(live_id, rgb);
+                    }
+                }
+            }
+            "revolve_meridian" => {
+                let recorded = parameters
+                    .get("outputs")
+                    .and_then(|v| v.as_array())
+                    .and_then(|a| a.first())
+                    .and_then(parse_solid_ref);
+                let profile = params.get("profile").and_then(parse_profile);
+                if let (Some(recorded), Some(profile)) = (recorded, profile) {
+                    let live_id = resolve(recorded);
+                    if live.contains(&live_id) {
+                        state.solid_profiles.insert(live_id, profile);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Parse a `"solid:<id>"` (or bare-integer) entity reference to the recorded
+/// kernel id used as an `id_remap` key.
+fn parse_solid_ref(v: &serde_json::Value) -> Option<u64> {
+    if let Some(s) = v.as_str() {
+        let (_, id) = s.split_once(':')?;
+        id.parse::<u64>().ok()
+    } else {
+        v.as_u64()
+    }
+}
+
+/// Parse a `[r, g, b]` colour array (0..255) from a `set_color` payload.
+fn parse_rgb(v: &serde_json::Value) -> Option<[u8; 3]> {
+    let a = v.as_array()?;
+    if a.len() != 3 {
+        return None;
+    }
+    let c = |i: usize| -> Option<u8> { a.get(i)?.as_u64().map(|n| n as u8) };
+    Some([c(0)?, c(1)?, c(2)?])
+}
+
+/// Parse a revolve meridian polyline (`[[r, z], ...]`) from a `revolve_meridian`
+/// payload into the `[r, z]` form `AppState.solid_profiles` stores.
+fn parse_profile(v: &serde_json::Value) -> Option<Vec<[f64; 2]>> {
+    let a = v.as_array()?;
+    let mut out = Vec::with_capacity(a.len());
+    for pt in a {
+        let p = pt.as_array()?;
+        let r = p.first()?.as_f64()?;
+        let z = p.get(1)?.as_f64()?;
+        out.push([r, z]);
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
 }
 
 /// Reinstate a persisted branch into the live timeline at boot.

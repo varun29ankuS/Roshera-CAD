@@ -1734,6 +1734,61 @@ fn dispatch_generic(
             Ok(())
         }
 
+        // DURABILITY Slice 3 (#39, spec §2.3) — durable part display name.
+        // `rename_part_by_uuid` and `persist_display_name` append a `set_name`
+        // event: `inputs[0]` = `solid:<id>` (the named solid), `params.name` =
+        // the string. The name RIDES the model — it is written to `Solid::name`
+        // here — so it survives EVERY replay path (boot, scrub, undo/redo), not
+        // just a boot-side restore. A target that was consumed by a later op
+        // (boolean/delete) is a benign no-op: naming a solid that no longer
+        // exists changes no geometry and is not a soundness break.
+        "set_name" => {
+            let name = inner.get("name").and_then(|v| v.as_str()).ok_or_else(|| {
+                ReplayError::InvalidParameters {
+                    kind: kind.to_string(),
+                    reason: "missing `name`".to_string(),
+                }
+            })?;
+            let target_raw = parameters
+                .get("inputs")
+                .and_then(|v| v.as_array())
+                .and_then(|a| a.first())
+                .and_then(|v| parse_entity_ref(v, "solid"))
+                .ok_or_else(|| ReplayError::InvalidParameters {
+                    kind: kind.to_string(),
+                    reason: "inputs[0] expected `solid:<id>`".to_string(),
+                })?;
+            let target = remap_id(target_raw, id_remap) as SolidId;
+            if let Some(solid) = model.solids.get_mut(target) {
+                solid.name = Some(name.to_string());
+            }
+            Ok(())
+        }
+
+        // DURABILITY Slice 3 (#39, spec §2.3) — durable part colour. Colour is a
+        // DISPLAY-registry property (`AppState.solid_colors`), NOT a B-Rep
+        // property, so replaying a `set_color` event is a geometry no-op here:
+        // it changes nothing in the model. It must NOT be an `UnknownKind`
+        // (which would quarantine the tail) — it is a recognised, geometry-
+        // neutral document event. The colour itself is re-attached at boot by
+        // `durability::boot_replay`, which scans `set_color` events and re-keys
+        // them onto the rebuilt solids through this replay's `id_remap`. We
+        // still validate the payload so a corrupt record surfaces honestly.
+        "set_color" => {
+            let ok = inner
+                .get("rgb")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len() == 3)
+                .unwrap_or(false);
+            if !ok {
+                return Err(ReplayError::InvalidParameters {
+                    kind: kind.to_string(),
+                    reason: "missing/malformed `rgb` [r,g,b]".to_string(),
+                });
+            }
+            Ok(())
+        }
+
         unknown => Err(fallback_error(unknown)),
     }
 }

@@ -1285,6 +1285,10 @@ pub async fn set_part_color(
     Json(c): Json<ColorBody>,
 ) -> Json<serde_json::Value> {
     state.solid_colors.insert(id, [c.r, c.g, c.b]);
+    // DURABILITY Slice 3 (#39): record the colour as a durable event so it
+    // survives a replay-only boot. Before this, `solid_colors` was RAM-only and
+    // a restart lost every colour.
+    crate::record_set_color(&state, id, [c.r, c.g, c.b]);
     // Push the colour to the live viewport: resolve the kernel solid id to its
     // public object UUID and broadcast an `ObjectColor` frame. Registry-only
     // when there's no UUID mapping (e.g. a solid never surfaced to the scene) —

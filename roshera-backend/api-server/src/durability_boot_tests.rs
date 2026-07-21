@@ -377,7 +377,10 @@ async fn timeline_history_survives_reboot() {
 async fn unknown_event_quarantines_and_serves_clean_prefix() {
     let path = temp_db_path();
 
-    // Boot 1: one valid box (2 events: create_box_3d @0, transform_solid @1).
+    // Boot 1: one valid box. The box create yields several clean events
+    // (create_box_3d, transform_solid, and a Slice-3 set_name); the exact count
+    // is asserted RELATIVE to the total below so it stays robust as the create
+    // path evolves.
     {
         let db = open_db(&path).await;
         let state = build_state(db, true).await;
@@ -468,9 +471,18 @@ async fn unknown_event_quarantines_and_serves_clean_prefix() {
         body["status"]["first_break_kind"], "quarantine_probe_unknown_op",
         "the quarantine must NAME the offending event kind; body = {body}"
     );
+    // The clean prefix is exactly everything BEFORE the single injected unknown
+    // event (asserted relative to the total, not a hardcoded count).
+    let served = body["status"]["events_served"]
+        .as_u64()
+        .expect("events_served");
+    let total = body["status"]["events_total"]
+        .as_u64()
+        .expect("events_total");
     assert_eq!(
-        body["status"]["events_served"], 2,
-        "exactly the 2-event clean prefix must be served; body = {body}"
+        served,
+        total - 1,
+        "exactly the clean prefix (all but the one injected unknown) must be served; body = {body}"
     );
 }
 
@@ -1167,5 +1179,229 @@ async fn sampled_meridian_revolve_survives_reboot() {
         fp_after, fp_before,
         "the sampled revolved solid must be identical after reboot; \
          before = {fp_before:?}, after = {fp_after:?}"
+    );
+}
+
+// =====================================================================
+// (f) DURABILITY Slice 3 — unrecorded-mutation closure (#39, spec §2.3)
+//
+// Rename, colour, and the editable revolve meridian are written to in-memory
+// state AFTER (or entirely outside) any recorded event, so a pure-replay boot
+// loses them even when the geometry rebuilds perfectly. These are RED-first
+// against a boot that only replays geometry: each drives the live endpoint,
+// reboots over the same DB file, and asserts the mutation came back.
+// =====================================================================
+
+/// Rename a part, reboot, the name persists. Before Slice 3 the rename endpoint
+/// (`POST /api/parts/uuid/{uuid}/name`) recorded NO event — it only wrote
+/// `Solid::name` in RAM and rebroadcast — so a replay-only boot restored the
+/// geometry under the default name. Asserts the durable `set_name` event carries
+/// the rename across a restart. The name RIDES the model (`Solid::name`), so it
+/// is set during geometry replay, not a boot-side side-channel.
+#[tokio::test]
+async fn renamed_part_name_survives_reboot() {
+    let path = temp_db_path();
+
+    {
+        let db = open_db(&path).await;
+        let state = build_state(db, true).await;
+        let (s, body) = dispatch(
+            &state,
+            post(
+                "/api/geometry/box",
+                json!({ "width": 6.0, "depth": 6.0, "height": 6.0 }),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "box create; body = {body}");
+        let uuid = body["object"]["id"]
+            .as_str()
+            .expect("box response must carry object.id")
+            .to_string();
+
+        let (s, body) = dispatch(
+            &state,
+            post(
+                &format!("/api/parts/uuid/{uuid}/name"),
+                json!({ "name": "Crankshaft" }),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "rename must succeed; body = {body}");
+        state
+            .timeline_recorder
+            .flush()
+            .await
+            .expect("recorder flush must succeed");
+
+        // Sanity: the live model carries the new name pre-reboot.
+        let live = {
+            let m = state.model.read().await;
+            let names: Vec<Option<String>> = m.solids.iter().map(|(_, s)| s.name.clone()).collect();
+            names.into_iter().next().flatten()
+        };
+        assert_eq!(
+            live.as_deref(),
+            Some("Crankshaft"),
+            "pre-reboot name must be set"
+        );
+    }
+
+    let db2 = open_db(&path).await;
+    let state2 = build_state(db2, true).await;
+
+    let (s, body) = dispatch(&state2, get("/api/durability/status")).await;
+    assert_eq!(s, StatusCode::OK, "status 200; body = {body}");
+    assert_eq!(
+        body["quarantined"], false,
+        "a set_name event must NOT quarantine the log; body = {body}"
+    );
+
+    let restored = {
+        let m = state2.model.read().await;
+        let names: Vec<Option<String>> = m.solids.iter().map(|(_, s)| s.name.clone()).collect();
+        names.into_iter().next().flatten()
+    };
+    assert_eq!(
+        restored.as_deref(),
+        Some("Crankshaft"),
+        "the renamed part's name must survive a replay-only boot; got {restored:?}"
+    );
+}
+
+/// Set a part's colour, reboot, the colour persists. Before Slice 3
+/// `set_part_color` only wrote `AppState.solid_colors` (RAM), so a reboot lost
+/// it. Colour is a display-registry property (not a B-Rep property), so the
+/// durable `set_color` event is a geometry no-op on replay and the colour is
+/// re-keyed onto the rebuilt solid by `boot_replay` through the replay id-remap.
+#[tokio::test]
+async fn part_colour_survives_reboot() {
+    let path = temp_db_path();
+
+    {
+        let db = open_db(&path).await;
+        let state = build_state(db, true).await;
+        let (s, body) = dispatch(
+            &state,
+            post(
+                "/api/geometry/box",
+                json!({ "width": 5.0, "depth": 5.0, "height": 5.0 }),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "box create; body = {body}");
+
+        let sid: u32 = {
+            let m = state.model.read().await;
+            let ids: Vec<u32> = m.solids.iter().map(|(id, _)| id as u32).collect();
+            ids.into_iter().next().expect("one solid")
+        };
+        let (s, body) = dispatch(
+            &state,
+            post(
+                &format!("/api/agent/parts/{sid}/color"),
+                json!({ "r": 200, "g": 30, "b": 40 }),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "set colour; body = {body}");
+        state
+            .timeline_recorder
+            .flush()
+            .await
+            .expect("recorder flush must succeed");
+    }
+
+    let db2 = open_db(&path).await;
+    let state2 = build_state(db2, true).await;
+
+    let (s, body) = dispatch(&state2, get("/api/durability/status")).await;
+    assert_eq!(
+        body["quarantined"], false,
+        "a set_color event must NOT quarantine the log; body = {body}"
+    );
+    assert_eq!(s, StatusCode::OK, "status 200");
+
+    let sid: u32 = {
+        let m = state2.model.read().await;
+        let ids: Vec<u32> = m.solids.iter().map(|(id, _)| id as u32).collect();
+        ids.into_iter().next().expect("one restored solid")
+    };
+    let (s, body) = dispatch(&state2, get(&format!("/api/agent/parts/{sid}/color"))).await;
+    assert_eq!(s, StatusCode::OK, "colour GET; body = {body}");
+    assert_eq!(
+        body["color"],
+        json!([200, 30, 40]),
+        "the part colour must survive a replay-only boot; body = {body}"
+    );
+}
+
+/// A sampled-meridian revolve's editable profile (`AppState.solid_profiles`,
+/// the #25 edit→regenerate loop) survives a reboot. The `revolve_meridian` event
+/// already carries the profile polyline (Slice 1.2); Slice 3 restores
+/// `solid_profiles` from it on boot so `GET /parts/{id}/profile` works after a
+/// restart. RED-first: before the boot restore, `solid_profiles` is empty after
+/// a reboot even though the geometry rebuilds.
+#[tokio::test]
+async fn revolve_meridian_profile_survives_reboot() {
+    let path = temp_db_path();
+
+    {
+        let db = open_db(&path).await;
+        let state = build_state(db, true).await;
+        let (s, body) = dispatch(
+            &state,
+            post(
+                "/api/geometry/revolve",
+                json!({
+                    "profile": [[1.0, 0.0], [4.0, 0.0], [4.0, 5.0], [1.0, 5.0]],
+                    "axis_origin": [0.0, 0.0, 0.0],
+                    "axis_direction": [0.0, 0.0, 1.0],
+                    "segments": 48,
+                    "name": "tube",
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "revolve; body = {body}");
+        state
+            .timeline_recorder
+            .flush()
+            .await
+            .expect("recorder flush must succeed");
+        assert!(
+            !state.solid_profiles.is_empty(),
+            "the profile must be stored pre-reboot"
+        );
+    }
+
+    let db2 = open_db(&path).await;
+    let state2 = build_state(db2, true).await;
+
+    assert!(
+        !state2.solid_profiles.is_empty(),
+        "the editable revolve meridian must be restored on a replay-only boot"
+    );
+    let restored: Vec<[f64; 2]> = state2
+        .solid_profiles
+        .iter()
+        .next()
+        .map(|e| e.value().clone())
+        .expect("a restored profile");
+    assert_eq!(
+        restored.len(),
+        4,
+        "the 4-point meridian must round-trip; got {restored:?}"
+    );
+    // The restored profile is keyed to a LIVE solid id (resolved via the replay
+    // id-remap), so the edit→regenerate endpoint can find it.
+    let live_ids: Vec<u32> = {
+        let m = state2.model.read().await;
+        m.solids.iter().map(|(id, _)| id as u32).collect()
+    };
+    let keyed: Vec<u32> = state2.solid_profiles.iter().map(|e| *e.key()).collect();
+    assert!(
+        keyed.iter().all(|k| live_ids.contains(k)),
+        "restored profiles must be keyed to live solids; keyed = {keyed:?}, live = {live_ids:?}"
     );
 }

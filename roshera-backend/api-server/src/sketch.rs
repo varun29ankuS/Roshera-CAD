@@ -2133,7 +2133,7 @@ pub async fn extrude_sketch(
         .name
         .clone()
         .unwrap_or_else(|| format!("Sketch {result_solid_id}"));
-    crate::persist_display_name(&model_handle, result_solid_id, &display_name).await;
+    crate::persist_display_name(&state, &model_handle, result_solid_id, &display_name).await;
 
     // Build the multi-shape descriptor that powers the frontend's
     // "what is being extruded" hover tooltip. Each entry carries the
@@ -2699,7 +2699,7 @@ pub async fn revolve_sketch(
         .name
         .clone()
         .unwrap_or_else(|| format!("Revolve {result_solid_id}"));
-    crate::persist_display_name(&model_handle, result_solid_id, &display_name).await;
+    crate::persist_display_name(&state, &model_handle, result_solid_id, &display_name).await;
 
     let shapes_descriptor: Vec<serde_json::Value> = shape_polygons
         .iter()

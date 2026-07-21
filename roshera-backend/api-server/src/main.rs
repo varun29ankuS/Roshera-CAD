@@ -733,7 +733,7 @@ async fn create_geometry(
     let object_uuid = Uuid::new_v4();
     let object_id = object_uuid.to_string();
     let display_name = format!("{} {}", capitalize(&shape_type), solid_id);
-    persist_display_name(&model_handle, solid_id, &display_name).await;
+    persist_display_name(&state, &model_handle, solid_id, &display_name).await;
 
     state.register_id_mapping(object_uuid, solid_id);
 
@@ -3177,7 +3177,7 @@ async fn pattern_linear_endpoint(
         state.register_id_mapping(result_uuid, new_solid_id);
 
         let display_name = format!("Linear Pattern {} #{}", solid_id, i);
-        persist_display_name(&model_handle, new_solid_id, &display_name).await;
+        persist_display_name(&state, &model_handle, new_solid_id, &display_name).await;
         let parameters = serde_json::json!({
             "source": object_uuid.to_string(),
             "instance": i,
@@ -3354,7 +3354,7 @@ async fn pattern_circular_endpoint(
         state.register_id_mapping(result_uuid, new_solid_id);
 
         let display_name = format!("Circular Pattern {} #{}", solid_id, i);
-        persist_display_name(&model_handle, new_solid_id, &display_name).await;
+        persist_display_name(&state, &model_handle, new_solid_id, &display_name).await;
         let parameters = serde_json::json!({
             "source": object_uuid.to_string(),
             "instance": i,
@@ -3570,7 +3570,7 @@ async fn create_extrude(
     state.register_id_mapping(result_uuid, result_solid_id);
 
     let name = display_name.unwrap_or_else(|| format!("Extrude {result_solid_id}"));
-    persist_display_name(&model_handle, result_solid_id, &name).await;
+    persist_display_name(&state, &model_handle, result_solid_id, &name).await;
     let parameters = serde_json::json!({
         "profile":   profile_arr,
         "direction": [direction.x, direction.y, direction.z],
@@ -3734,7 +3734,7 @@ async fn create_cylinder_primitive(
     state.register_id_mapping(result_uuid, result_solid_id);
 
     let name = display_name.unwrap_or_else(|| format!("Cylinder {result_solid_id}"));
-    persist_display_name(&model_handle, result_solid_id, &name).await;
+    persist_display_name(&state, &model_handle, result_solid_id, &name).await;
     let parameters = serde_json::json!({
         "center": c, "axis": ax, "radius": radius, "height": height,
     });
@@ -3932,7 +3932,7 @@ async fn create_box_primitive(
     state.register_id_mapping(result_uuid, result_solid_id);
 
     let name = display_name.unwrap_or_else(|| format!("Box {result_solid_id}"));
-    persist_display_name(&model_handle, result_solid_id, &name).await;
+    persist_display_name(&state, &model_handle, result_solid_id, &name).await;
     let parameters = serde_json::json!({
         "center": center, "u_axis": u, "v_axis": v,
         "width": width, "depth": depth, "height": height,
@@ -4111,7 +4111,7 @@ async fn create_cone_primitive(
     state.register_id_mapping(result_uuid, result_solid_id);
 
     let name = display_name.unwrap_or_else(|| format!("Cone {result_solid_id}"));
-    persist_display_name(&model_handle, result_solid_id, &name).await;
+    persist_display_name(&state, &model_handle, result_solid_id, &name).await;
     let parameters = serde_json::json!({
         "center": c, "axis": ax,
         "base_radius": base_radius, "top_radius": top_radius, "height": height,
@@ -4708,7 +4708,7 @@ async fn create_revolve_primitive(
     state.register_id_mapping(result_uuid, result_solid_id);
 
     let name = display_name.unwrap_or_else(|| format!("Revolve {result_solid_id}"));
-    persist_display_name(&model_handle, result_solid_id, &name).await;
+    persist_display_name(&state, &model_handle, result_solid_id, &name).await;
     let parameters = serde_json::json!({
         "profile": profile,
         "profile_segments": profile_segments,
@@ -4898,7 +4898,7 @@ async fn import_step_geometry(
             Some(b) => format!("{b} {}", i + 1),
             None => format!("Imported {solid_id}"),
         };
-        persist_display_name(&model_handle, solid_id, &name).await;
+        persist_display_name(&state, &model_handle, solid_id, &name).await;
         let parameters = serde_json::json!({ "source": "step_import", "index": i });
         broadcast_object_created(
             &id_str,
@@ -5066,7 +5066,7 @@ async fn create_nurbs_loft_primitive(
     state.register_id_mapping(result_uuid, result_solid_id);
 
     let name = display_name.unwrap_or_else(|| format!("NURBS Loft {result_solid_id}"));
-    persist_display_name(&model_handle, result_solid_id, &name).await;
+    persist_display_name(&state, &model_handle, result_solid_id, &name).await;
     let parameters = serde_json::json!({
         "sections": n_sections, "ring_points": ring_points,
         "degree_u": degree_u, "degree_v": degree_v,
@@ -6423,6 +6423,11 @@ async fn rename_part_by_uuid(
         [0.0, 0.0, 0.0],
     );
 
+    // DURABILITY Slice 3 (#39): the rename is now a recorded event, so it
+    // survives a replay-only boot. Before this, the endpoint wrote `Solid::name`
+    // in RAM and rebroadcast only — a restart lost the rename.
+    record_set_name(&state, solid_id, name);
+
     Ok(Json(serde_json::json!({
         "success":  true,
         "solid_id": solid_id,
@@ -7348,13 +7353,62 @@ pub(crate) async fn current_scene_frames(state: &AppState) -> Vec<String> {
 /// upserts (booleans) must NOT call this with their generated label — the
 /// result inherits the base operand's name instead (same-UUID identity).
 pub(crate) async fn persist_display_name(
+    state: &AppState,
     model_handle: &reconcile_task::ModelHandle,
     solid_id: geometry_engine::primitives::solid::SolidId,
     name: &str,
 ) {
-    let mut model = model_handle.write().await;
-    if let Some(solid) = model.solids.get_mut(solid_id) {
-        solid.name = Some(name.to_string());
+    {
+        let mut model = model_handle.write().await;
+        if let Some(solid) = model.solids.get_mut(solid_id) {
+            solid.name = Some(name.to_string());
+        }
+    }
+    record_set_name(state, solid_id, name);
+}
+
+/// DURABILITY Slice 3 (#39, spec §2.3) — append a durable `set_name` event so a
+/// part's display name survives a replay-only boot. `persist_display_name`
+/// writes the name to `Solid::name` in memory; this records the SAME binding as
+/// a timeline event (target solid in `inputs[0]`, string in `params.name`) so a
+/// rebuilt model re-attaches it via the `set_name` replay arm. The name thus
+/// rides the model and survives every replay path, not just a boot restore.
+/// Best-effort: an event that fails to enqueue is logged, never fatal — the live
+/// in-memory name is unaffected. Skipped when durability is disabled, for parity
+/// with the pre-durability server.
+pub(crate) fn record_set_name(
+    state: &AppState,
+    solid_id: geometry_engine::primitives::solid::SolidId,
+    name: &str,
+) {
+    if !durability::durability_enabled() {
+        return;
+    }
+    use geometry_engine::operations::recorder::OperationRecorder as _;
+    let record = geometry_engine::operations::recorder::RecordedOperation::new("set_name")
+        .with_parameters(serde_json::json!({ "name": name }))
+        .with_input_solids([solid_id as u64]);
+    if let Err(e) = state.timeline_recorder.record(record) {
+        tracing::warn!(target: "durability", "set_name event not recorded: {e}");
+    }
+}
+
+/// DURABILITY Slice 3 (#39, spec §2.3) — append a durable `set_color` event so a
+/// part's display colour survives a replay-only boot. `set_part_color` writes
+/// the colour to `AppState.solid_colors` (a display registry outside the B-Rep
+/// model); this records it as a timeline event (target solid in `inputs[0]`,
+/// RGB in `params.rgb`) so `durability::boot_replay` re-keys it onto the rebuilt
+/// solid through the replay id-remap. Best-effort + durability-gated as above.
+pub(crate) fn record_set_color(state: &AppState, solid_id: u32, rgb: [u8; 3]) {
+    if !durability::durability_enabled() {
+        return;
+    }
+    use geometry_engine::operations::recorder::OperationRecorder as _;
+    let record = geometry_engine::operations::recorder::RecordedOperation::new("set_color")
+        .with_parameters(serde_json::json!({ "rgb": [rgb[0], rgb[1], rgb[2]] }))
+        .with_input_solids([solid_id as u64]);
+    if let Err(e) = state.timeline_recorder.record(record) {
+        tracing::warn!(target: "durability", "set_color event not recorded: {e}");
     }
 }
 

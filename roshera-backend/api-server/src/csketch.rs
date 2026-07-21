@@ -2099,7 +2099,7 @@ pub async fn extrude_csketch(
         .name
         .clone()
         .unwrap_or_else(|| format!("CSketch {result_solid_id}"));
-    crate::persist_display_name(&model_handle, result_solid_id, &display_name).await;
+    crate::persist_display_name(&state, &model_handle, result_solid_id, &display_name).await;
 
     let parameters = serde_json::json!({
         "csketch_id": id.to_string(),
@@ -2619,7 +2619,7 @@ pub async fn revolve_csketch(
         .name
         .clone()
         .unwrap_or_else(|| format!("CSketch revolve {result_solid_id}"));
-    crate::persist_display_name(&model_handle, result_solid_id, &display_name).await;
+    crate::persist_display_name(&state, &model_handle, result_solid_id, &display_name).await;
 
     let parameters = serde_json::json!({
         "csketch_id":     id.to_string(),
