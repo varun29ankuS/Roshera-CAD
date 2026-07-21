@@ -6816,6 +6816,21 @@ fn split_cone_face_by_circles(
         inner_loops: Vec::new(),
     });
     // Frustum bands between consecutive circles (the last pair is the base band).
+    //
+    // OUTER = the LARGER-radius rim (`hi_loop`, larger axial distance from the
+    // apex), INNER = the smaller (`lo_loop`). A conical band develops into a
+    // planar annular sector whose apex maps to the origin and whose radial
+    // coordinate is the axial distance `v`; the OUTER boundary of that annulus
+    // is therefore always the larger-`v` (larger-radius) circle, and the smaller
+    // circle is the hole. Emitting the reverse (small rim as outer) inverts the
+    // band's winding relative to its inherited outward orientation whenever the
+    // cone widens AWAY from the apex — i.e. any ordinary frustum whose base is
+    // its wide end. That surfaced as the #27 nozzle: unioning a convergent and a
+    // divergent frustum at a shared throat, the divergent lateral's band came out
+    // inverted, so its large exit rim was shared with the exit cap at the SAME
+    // orientation and validation rejected the solid. (The apex-tip band above is
+    // unaffected — its single boundary is the smallest circle, the tip's only
+    // rim.)
     for i in 0..circles.len() - 1 {
         let (v_lo, lo_loop) = (&circles[i].0, &circles[i].1);
         let (v_hi, hi_loop) = (&circles[i + 1].0, &circles[i + 1].1);
@@ -6823,11 +6838,11 @@ fn split_cone_face_by_circles(
             was_split: true,
             original_face: face_id,
             surface: surface_id,
-            boundary_edges: lo_loop.clone(),
+            boundary_edges: hi_loop.clone(),
             classification: FaceClassification::OnBoundary,
             from_solid: origin_solid,
             interior_point: Some(cone_point((v_lo + v_hi) * 0.5)),
-            inner_loops: vec![hi_loop.clone()],
+            inner_loops: vec![lo_loop.clone()],
         });
     }
     Some(faces)
@@ -28254,5 +28269,55 @@ must be dropped; a 1·tol band rejects it and lets it double the rim"
                 }
             }
         }
+    }
+
+    /// Task #27 (cone-band winding) — a DIVERGENT frustum lateral (base radius >
+    /// top radius, so the base is the wide end FAR from the apex) must not have
+    /// its `split_cone_face_by_circles` band inverted.
+    ///
+    /// The banding decomposes a cut cone lateral into axial frustum bands; each
+    /// band's OUTER loop must be the larger-radius rim (the annulus develops with
+    /// the apex at the origin, so the larger `v` is the outer boundary). The old
+    /// code made the smaller (apex-side) rim the outer loop, which is correct only
+    /// when the cone narrows away from the apex. For a divergent frustum unioned
+    /// to a convergent one at a coincident throat, that inverted the divergent
+    /// lateral, so its wide exit rim was traversed by the exit cap with the SAME
+    /// orientation and `validate_solid_scoped` rejected the solid (a real B-Rep
+    /// orientation defect, not a tessellation artifact). This is the lib-layer
+    /// mechanism guard for the `frustum_union_frustum_throat_27` integration RED.
+    #[test]
+    fn cone_band_divergent_frustum_orientation_27() {
+        let mut m = BRepModel::new();
+        // convergent: r6 @ z=-12 (throat) → r20 @ z=0
+        let conv = expect_solid(
+            TopologyBuilder::new(&mut m)
+                .create_cone_3d(Point3::new(0.0, 0.0, -12.0), Vector3::Z, 6.0, 20.0, 12.0)
+                .expect("convergent frustum"),
+        );
+        // divergent: r18 @ z=-30 (exit) → r6 @ z=-12 (throat, coincident)
+        let div = expect_solid(
+            TopologyBuilder::new(&mut m)
+                .create_cone_3d(Point3::new(0.0, 0.0, -30.0), Vector3::Z, 18.0, 6.0, 18.0)
+                .expect("divergent frustum"),
+        );
+        let res = boolean_operation(
+            &mut m,
+            conv,
+            div,
+            BooleanOp::Union,
+            BooleanOptions::default(),
+        )
+        .expect("nozzle union must succeed");
+        let v = crate::primitives::validation::validate_solid_scoped(
+            &mut m,
+            res,
+            Tolerance::default(),
+            crate::primitives::validation::ValidationLevel::Standard,
+        );
+        assert!(
+            v.is_valid,
+            "divergent-frustum throat union must be orientation-valid, got errors: {:?}",
+            v.errors
+        );
     }
 }
