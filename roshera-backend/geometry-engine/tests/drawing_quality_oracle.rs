@@ -58,6 +58,7 @@ fn rect_view(
         hidden_circles: Vec::new(),
         shaded_raster: None,
         hatch_polylines: Vec::new(),
+        polyline_sources: Vec::new(),
     }
 }
 

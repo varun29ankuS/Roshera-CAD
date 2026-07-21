@@ -286,6 +286,10 @@ pub fn project_solid_view(
         hidden_circles: Vec::new(),
         shaded_raster: None,
         hatch_polylines: Vec::new(),
+        // A plain projection carries no HLR edge lineage; the HLR sheet path
+        // (`dimensioning::build_hlr_view`) populates this. Empty → readback
+        // refuses on these polylines rather than guessing.
+        polyline_sources: Vec::new(),
     })
 }
 

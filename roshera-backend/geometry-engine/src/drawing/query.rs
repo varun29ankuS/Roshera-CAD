@@ -112,7 +112,7 @@ pub struct TolerancedDiameterAnswer {
 /// The entity-at answer.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct EntityAtAnswer {
-    /// `dimension` | `circle`.
+    /// `dimension` | `circle` | `edge`.
     pub role: String,
     pub label: Option<String>,
     pub face_ids: Vec<u32>,
@@ -390,6 +390,28 @@ pub fn answer_query(
                     label: Some(d.label.clone()),
                     face_ids: d.entities.clone(),
                     pid: d.pid.clone(),
+                });
+            }
+            // Provenanced silhouette / edge polyline: the HLR projector threaded
+            // this segment's B-Rep lineage (edge id + adjacent faces) parallel to
+            // `polylines`. A source with neither an edge id nor any face id is
+            // genuinely anonymous and is skipped so the fall-through refuses.
+            for (poly, src) in v.polylines.iter().zip(v.polyline_sources.iter()) {
+                let hit = poly
+                    .points
+                    .windows(2)
+                    .any(|w| point_seg_dist(p, w[0], w[1]) <= HIT_TOL);
+                if !hit {
+                    continue;
+                }
+                if src.edge_id.is_none() && src.face_ids.is_empty() {
+                    continue;
+                }
+                return DrawingAnswer::EntityAt(EntityAtAnswer {
+                    role: "edge".to_string(),
+                    label: None,
+                    face_ids: src.face_ids.clone(),
+                    pid: None,
                 });
             }
             // Anonymous polyline / empty space: lineage genuinely lost → refuse.
@@ -687,5 +709,72 @@ mod tests {
             ),
             "a raster coordinate must refuse render_only: {ans:?}"
         );
+    }
+
+    /// `entity_at` on a plain SILHOUETTE edge (an HLR-projected B-Rep edge that
+    /// is neither a true circle nor a dimension line) answers with provenance —
+    /// the edge's adjacent B-Rep face ids — rather than refusing `unprovenanced`.
+    /// Campaign #55 residual: view-polyline edge provenance (spec §3.2). Before
+    /// the projector threads per-polyline lineage, this coordinate is anonymous
+    /// ink and answers a refusal → RED.
+    #[test]
+    fn entity_at_on_silhouette_edge_is_provenanced() {
+        // A plain 30×20×10 box: every orthographic outline edge is a clean
+        // silhouette with known adjacent faces and NO circular/dimensional
+        // ambiguity once the auto-dimensions are set aside.
+        let mut m = BRepModel::new();
+        let b = sid(TopologyBuilder::new(&mut m)
+            .create_box_3d(30.0, 20.0, 10.0)
+            .expect("box"));
+        let mut drawing = standard_drawing_auto(&m, b, uuid::Uuid::nil()).expect("sheet");
+
+        // Pick the first ORTHOGRAPHIC view (no shaded raster) that carries
+        // outline polylines, and isolate the polyline path by clearing the
+        // auto-dimensions and circles on it (they take precedence in
+        // `entity_at` and are not the subject under test).
+        let vi = drawing
+            .views
+            .iter()
+            .position(|v| v.shaded_raster.is_none() && !v.polylines.is_empty())
+            .expect("an orthographic view with outline polylines");
+        {
+            let v = &mut drawing.views[vi];
+            v.dimensions.clear();
+            v.circles.clear();
+            v.hatch_polylines.clear();
+        }
+
+        // A point on the interior of the first outline segment.
+        let seg = {
+            let v = &drawing.views[vi];
+            let poly = v
+                .polylines
+                .iter()
+                .find(|p| p.points.len() >= 2)
+                .expect("a polyline segment");
+            let a = poly.points[0];
+            let bpt = poly.points[1];
+            [0.5 * (a[0] + bpt[0]), 0.5 * (a[1] + bpt[1])]
+        };
+
+        let cert = certify_drawing(&m, &drawing);
+        let ans = answer_query(
+            &drawing,
+            &cert,
+            &DrawingQuery::EntityAt {
+                view: vi,
+                xy_mm: seg,
+            },
+        );
+        match ans {
+            DrawingAnswer::EntityAt(a) => {
+                assert_eq!(a.role, "edge", "a silhouette edge answers role=edge");
+                assert!(
+                    !a.face_ids.is_empty(),
+                    "a silhouette edge answer carries its adjacent B-Rep face ids: {a:?}"
+                );
+            }
+            other => panic!("silhouette edge must answer provenanced, got {other:?}"),
+        }
     }
 }

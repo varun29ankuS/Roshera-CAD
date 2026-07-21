@@ -1067,6 +1067,7 @@ mod tests {
                 hidden_circles: Vec::new(),
                 shaded_raster: None,
                 hatch_polylines: Vec::new(),
+                polyline_sources: Vec::new(),
             });
         }
         let layers = assign_view_layers(&drawing.views);
@@ -1125,6 +1126,7 @@ mod tests {
                 hidden_circles: Vec::new(),
                 shaded_raster: None,
                 hatch_polylines: Vec::new(),
+                polyline_sources: Vec::new(),
             });
         }
 
@@ -1260,6 +1262,7 @@ mod tests {
             hidden_circles: Vec::new(),
             shaded_raster: None,
             hatch_polylines: Vec::new(),
+            polyline_sources: Vec::new(),
         });
 
         let layout = compute_layout(&drawing);

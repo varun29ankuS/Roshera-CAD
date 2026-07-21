@@ -669,6 +669,13 @@ fn build_hlr_view(
         let mut all = edges.visible;
         all.extend(edges.hidden);
         view.polylines = all;
+        // Keep the provenance parallel to `polylines` (visible then hidden), so
+        // `entity_at` can name an edge by its lineage. (The iso cell is drawn as
+        // a shaded raster and `entity_at` refuses render_only there before
+        // reaching these — but the lockstep invariant is maintained regardless.)
+        let mut all_sources = edges.visible_sources;
+        all_sources.extend(edges.hidden_sources);
+        view.polyline_sources = all_sources;
         view.hidden_polylines = Vec::new();
         let mut all_circles = edges.circles;
         all_circles.extend(edges.hidden_circles);
@@ -676,6 +683,7 @@ fn build_hlr_view(
         view.hidden_circles = Vec::new();
     } else {
         view.polylines = edges.visible;
+        view.polyline_sources = edges.visible_sources;
         view.hidden_polylines = edges.hidden;
         view.circles = select_circles(edges.circles);
         view.hidden_circles = select_circles(edges.hidden_circles);

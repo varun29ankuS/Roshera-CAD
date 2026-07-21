@@ -374,6 +374,12 @@ pub struct ViewEdges {
     pub hidden: Vec<Polyline2d>,
     pub circles: Vec<super::types::ProjectedCircle>,
     pub hidden_circles: Vec<super::types::ProjectedCircle>,
+    /// Per-polyline B-Rep lineage, parallel to [`Self::visible`] (campaign #55
+    /// residual — view-polyline edge provenance). `visible_sources[i]` is the
+    /// edge/face identity of `visible[i]`.
+    pub visible_sources: Vec<super::types::PolylineSource>,
+    /// Per-polyline lineage parallel to [`Self::hidden`].
+    pub hidden_sources: Vec<super::types::PolylineSource>,
 }
 
 /// `(center3d, unit normal, radius)` if `curve` lies on a circle (a full
@@ -603,6 +609,8 @@ pub(crate) fn project_solid_edges_visibility_mode(
         hidden: Vec::new(),
         circles: Vec::new(),
         hidden_circles: Vec::new(),
+        visible_sources: Vec::new(),
+        hidden_sources: Vec::new(),
     };
     // Co-circular arc-edges of each camera-facing rim, keyed by quantised
     // (centre, radius), regrouped after the edge walk into one drawn circle.
@@ -787,15 +795,28 @@ pub(crate) fn project_solid_edges_visibility_mode(
                         }
                     }
 
+                    // The edge's B-Rep lineage — this whole run set came from the
+                    // single edge `*edge_id`; occlusion clipping splits it into
+                    // runs but every run still belongs to that one edge, so the
+                    // 1:1 edge link survives. The adjacent faces are the reverse
+                    // map already built for circle identity.
+                    let src_faces = edge_faces.get(edge_id).cloned().unwrap_or_default();
                     for (visible, pts) in runs {
                         let pl = Polyline2d::from_points(pts);
                         if pl.points.len() < 2 {
                             continue;
                         }
+                        let source = super::types::PolylineSource {
+                            edge_id: Some(*edge_id),
+                            face_ids: src_faces.clone(),
+                            role: super::types::PolylineRole::Edge,
+                        };
                         if visible {
                             out.visible.push(pl);
+                            out.visible_sources.push(source);
                         } else {
                             out.hidden.push(pl);
+                            out.hidden_sources.push(source);
                         }
                     }
                 }
@@ -817,11 +838,22 @@ pub(crate) fn project_solid_edges_visibility_mode(
         } else if g.all_hidden {
             out.hidden_circles.push(circ);
         } else {
+            // A mixed rim falls back to per-arc polylines: the single-edge link
+            // is dissolved (the rim regrouped several arc-edges), so `edge_id` is
+            // None — but the rim's adjacent faces are known, so readback can still
+            // name the feature. Pushed in lockstep with `visible`/`hidden`.
             for (vis, pl) in g.fallback {
+                let source = super::types::PolylineSource {
+                    edge_id: None,
+                    face_ids: g.face_ids.clone(),
+                    role: super::types::PolylineRole::Edge,
+                };
                 if vis {
                     out.visible.push(pl);
+                    out.visible_sources.push(source);
                 } else {
                     out.hidden.push(pl);
+                    out.hidden_sources.push(source);
                 }
             }
         }
@@ -875,6 +907,41 @@ mod tests {
         // hidden (they project onto the same square but classify hidden).
         assert!(!e.visible.is_empty(), "some visible edges");
         assert!(!e.hidden.is_empty(), "some hidden edges (the back face)");
+    }
+
+    /// Campaign #55 residual: the HLR projector threads per-polyline B-Rep
+    /// lineage parallel to `visible`/`hidden`. The invariant is a strict 1:1
+    /// pairing (so `entity_at` can index it safely), and a box's clean outline
+    /// edges each name their producing edge + at least one adjacent face.
+    #[test]
+    fn projected_polylines_carry_edge_and_face_lineage() {
+        let mut m = BRepModel::new();
+        let b = sid(TopologyBuilder::new(&mut m)
+            .create_box_3d(30.0, 20.0, 10.0)
+            .expect("box"));
+        let e = project_solid_edges_visibility(&m, b, ProjectionType::Front, DEFAULT_CURVE_SAMPLES)
+            .expect("vis");
+        assert_eq!(
+            e.visible.len(),
+            e.visible_sources.len(),
+            "sources are parallel (1:1) to visible polylines"
+        );
+        assert_eq!(
+            e.hidden.len(),
+            e.hidden_sources.len(),
+            "sources are parallel (1:1) to hidden polylines"
+        );
+        assert!(!e.visible_sources.is_empty(), "some visible sources");
+        for s in &e.visible_sources {
+            assert!(
+                s.edge_id.is_some(),
+                "a clean box outline segment names its producing edge: {s:?}"
+            );
+            assert!(
+                !s.face_ids.is_empty(),
+                "a box outline segment names at least one adjacent face: {s:?}"
+            );
+        }
     }
 
     #[test]

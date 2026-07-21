@@ -278,6 +278,56 @@ pub struct ProjectedView {
     /// `polylines`) parsing.
     #[serde(default)]
     pub hatch_polylines: Vec<Polyline2d>,
+    /// Per-polyline provenance, parallel to [`Self::polylines`] (campaign #55
+    /// residual — spec §3.2, view-polyline edge provenance). `polyline_sources[i]`
+    /// is the B-Rep lineage of `polylines[i]`: the edge id (when a single edge
+    /// produced the segment) plus the adjacent face ids the HLR projector
+    /// already resolves. Populated by the HLR sheet path
+    /// ([`super::dimensioning`]'s `build_hlr_view`); EMPTY for views built
+    /// outside it (a plain projection, a section outline) — an empty vector
+    /// means "no lineage available", so readback refuses rather than guessing.
+    /// A segment whose 1:1 edge link is genuinely dissolved by HLR
+    /// clipping/merging carries `edge_id: None`. `#[serde(default)]` keeps older
+    /// serialized drawings parsing.
+    #[serde(default)]
+    pub polyline_sources: Vec<PolylineSource>,
+}
+
+/// The topological role of a projected polyline, surfaced for semantic readback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolylineRole {
+    /// A silhouette / outline edge of the solid.
+    Silhouette,
+    /// A generic projected B-Rep edge (interior or boundary).
+    Edge,
+    /// Section material hatch texture (ink evidence of material, never geometry).
+    Hatch,
+    /// The boundary outline of a section cut.
+    SectionOutline,
+}
+
+/// Provenance for one projected polyline: the B-Rep lineage the HLR projector
+/// resolved for it — the ENTITY IDENTITY link from a view-space line back to
+/// topology, parallel to [`ProjectedCircle::face_ids`] but for edges.
+///
+/// `edge_id` is `Some` only when a single B-Rep edge produced the segment; HLR
+/// occlusion clipping keeps that link (a clipped run still belongs to its one
+/// edge), but a co-circular rim that falls back to arcs can lose it, in which
+/// case `edge_id` is `None` while `face_ids` may still be known. A source with
+/// no `edge_id` AND empty `face_ids` is genuinely anonymous, and `entity_at`
+/// refuses `unprovenanced` on it rather than fabricate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolylineSource {
+    /// The B-Rep edge id, when one edge unambiguously produced this segment.
+    #[serde(default)]
+    pub edge_id: Option<u32>,
+    /// B-Rep face ids adjacent to the producing edge (the same identity the
+    /// projector threads onto circles).
+    #[serde(default)]
+    pub face_ids: Vec<u32>,
+    /// The polyline's topological role.
+    pub role: PolylineRole,
 }
 
 /// A deterministic shaded-solid raster that REPLACES the wireframe line work
@@ -874,6 +924,10 @@ mod tests {
         assert!(
             back.views[0].hatch_polylines.is_empty(),
             "hatch_polylines defaults to empty"
+        );
+        assert!(
+            back.views[0].polyline_sources.is_empty(),
+            "polyline_sources defaults to empty"
         );
         assert_eq!(back.views[0].dimensions.len(), 1);
         assert!(

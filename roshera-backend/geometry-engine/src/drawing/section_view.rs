@@ -180,6 +180,9 @@ pub fn section_view(
         hidden_circles: Vec::new(),
         shaded_raster: None,
         hatch_polylines: hatch,
+        // The section outline carries no per-edge provenance (`SectionCap` has
+        // no per-face lineage — Slice 1-2 finding); empty → readback refuses.
+        polyline_sources: Vec::new(),
     })
 }
 

@@ -676,6 +676,7 @@ mod tests {
             hidden_circles: Vec::new(),
             shaded_raster: None,
             hatch_polylines: Vec::new(),
+            polyline_sources: Vec::new(),
         };
         let mut d = Drawing::new("cert-fixture", SheetSize::A3);
         d.add_view(view);

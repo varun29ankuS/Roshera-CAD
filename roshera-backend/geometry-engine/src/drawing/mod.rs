@@ -65,8 +65,8 @@ pub use sheet_certificate::{
 pub use svg::render_drawing_svg;
 pub use types::{
     Drawing, DrawingId, GeneralTolerance, PlacedDatumSymbol, PlacedFcfBlock, Polyline2d,
-    ProjectedView, ProjectedViewId, ProjectionType, SectionSemantics, ShadedRaster, SheetSize,
-    TitleBlock, ToleranceRef, ViewExtent, ViewSource,
+    PolylineRole, PolylineSource, ProjectedView, ProjectedViewId, ProjectionType, SectionSemantics,
+    ShadedRaster, SheetSize, TitleBlock, ToleranceRef, ViewExtent, ViewSource,
 };
 pub use verify::{verify_drawing, DrawingIssue, DrawingIssueKind, DrawingQualityReport, Severity};
 pub use visibility::{is_point_hidden, project_solid_edges_visibility, ViewEdges};
