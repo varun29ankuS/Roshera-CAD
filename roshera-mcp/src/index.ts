@@ -105,6 +105,11 @@ if (mode === "full") {
   }
   const benchHandles = new Map<string, ReturnType<typeof mount>>();
   for (const name of workbench.allSwitchableBenchTools()) {
+    // A bench tool that is ALSO in the always-on core surface (e.g.
+    // blackboard_add_entry) is already mounted enabled above; mounting it
+    // again would throw. Leave it out of benchHandles so bench switches
+    // never disable it.
+    if (exposedNames.includes(name)) continue;
     const entry = table.get(name);
     if (entry) benchHandles.set(name, mount(entry, false));
   }

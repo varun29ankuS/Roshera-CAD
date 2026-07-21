@@ -46,9 +46,13 @@ const SCOPE_ARGS = {
 export function registerBlackboardTools(server: ToolHost) {
   server.tool(
     "blackboard_add_entry",
-    "WRITE a line to a Blackboard notebook the human SEES live (markdown + " +
-      "$math$). Per-part (part_id), document-wide (omit), or assembly (scope). " +
-      "Returns the line id.",
+    "Your notebook TO the human: show your working as you design — the given " +
+      "values, the derivation, the result, the design rationale behind a part " +
+      "(markdown + $math$; the human sees each line live and can edit it). " +
+      "Write it UNPROMPTED whenever a dimension, tolerance, or shape came from " +
+      "a calculation or a decision worth defending — an engineer's notebook, " +
+      "not a chat log. Per-part (part_id), document-wide (omit), or assembly " +
+      "(scope). Returns the line id.",
     {
       text: z.string().describe("markdown + $math$ source for the line"),
       author: z.enum(["agent", "user"]).default("agent").describe("who the line is attributed to"),
@@ -71,7 +75,9 @@ export function registerBlackboardTools(server: ToolHost) {
 
   server.tool(
     "blackboard_edit_entry",
-    "EDIT a Blackboard line by id (from blackboard_list); appears live. Pass the " +
+    "EDIT a Blackboard line by id (from blackboard_list); appears live. Keep the " +
+      "notebook truthful: when a recalculation changes a number you already " +
+      "wrote, update the line rather than appending a correction. Pass the " +
       "same part_id/scope it was listed under.",
     {
       id: z.string().describe("line id from blackboard_list"),
@@ -94,8 +100,10 @@ export function registerBlackboardTools(server: ToolHost) {
 
   server.tool(
     "blackboard_list",
-    "READ a Blackboard notebook: lines (id, author, text) in order. part_id for " +
-      "a part's notebook; omit for document-wide; scope for an assembly.",
+    "READ a Blackboard notebook: lines (id, author, text) in order. The human " +
+      "can add and edit lines too — read it to pick up their notes and replies. " +
+      "part_id for a part's notebook; omit for document-wide; scope for an " +
+      "assembly.",
     { ...SCOPE_ARGS },
     async ({ part_id, scope }) => {
       try {

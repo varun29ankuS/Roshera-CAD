@@ -93,7 +93,10 @@ const localStorageAdapter: BlackboardPersistenceAdapter = {
       if (!raw) return null
       const parsed = JSON.parse(raw) as Partial<BlackboardSnapshot>
       if (!Array.isArray(parsed.lines) || !Array.isArray(parsed.events)) return null
-      return { lines: parsed.lines, events: parsed.events }
+      const snapshot = { lines: parsed.lines, events: parsed.events }
+      // An untouched copy of the retired demo notebook is not user content.
+      if (isLegacySeedSnapshot(snapshot)) return null
+      return snapshot
     } catch {
       // Corrupt payload — start clean rather than crash the panel.
       return null
@@ -118,16 +121,21 @@ export function setBlackboardAdapter(next: BlackboardPersistenceAdapter): void {
   adapter = next
 }
 
-const WELCOME_LINES: BlackboardLine[] = [
-  { id: 'rao-0', text: '# Rao Bell Nozzle — Notebook\nParabolic-approximation (80% bell), built and verified **watertight** in the kernel. Every line is editable — click to edit, Enter to commit.', author: 'agent', createdAt: 0, updatedAt: 0 },
-  { id: 'rao-1', text: '**Given:** $p_c = 7\\,\\text{MPa}$, $T_c = 3500\\,\\text{K}$, $\\gamma = 1.22$, $R = 320\\,\\text{J·kg}^{-1}\\text{K}^{-1}$, $p_a = 101\\,\\text{kPa}$, throat radius $R_t = 50\\,\\text{mm}$.', author: 'agent', createdAt: 0, updatedAt: 0 },
-  { id: 'rao-2', text: '**Expansion ratio** — areas measured on the as-built solid:\n$$\\varepsilon = \\frac{A_e}{A_t} = \\frac{\\pi R_e^2}{\\pi R_t^2} = \\frac{0.1963}{0.00785} = 25.0$$', author: 'agent', createdAt: 0, updatedAt: 0 },
-  { id: 'rao-3', text: '**Rao contour (80% bell):** initial angle $\\theta_n = 33^\\circ$, exit angle $\\theta_e = 9^\\circ$, divergent length\n$$L_n = 0.8\\,\\frac{R_t(\\sqrt{\\varepsilon}-1)}{\\tan 15^\\circ} = 11.94\\,R_t$$\nabout 20% shorter than a $15^\\circ$ cone of the same $\\varepsilon$.', author: 'agent', createdAt: 0, updatedAt: 0 },
-  { id: 'rao-4', text: '**Exit Mach** — supersonic root of the area–Mach relation:\n$$\\frac{A_e}{A_t} = \\frac{1}{M_e}\\left[\\frac{2}{\\gamma+1}\\Big(1+\\tfrac{\\gamma-1}{2}M_e^2\\Big)\\right]^{\\frac{\\gamma+1}{2(\\gamma-1)}} = 25 \\;\\Rightarrow\\; M_e = 4.01$$', author: 'agent', createdAt: 0, updatedAt: 0 },
-  { id: 'rao-5', text: '**Exit pressure ratio** (isentropic): $\\dfrac{p_e}{p_c} = \\left(1+\\tfrac{\\gamma-1}{2}M_e^2\\right)^{-\\frac{\\gamma}{\\gamma-1}} = 3.5\\times10^{-3}$.', author: 'agent', createdAt: 0, updatedAt: 0 },
-  { id: 'rao-6', text: '**Thrust coefficient:**\n$$C_F = \\sqrt{\\frac{2\\gamma^2}{\\gamma-1}\\Big(\\frac{2}{\\gamma+1}\\Big)^{\\frac{\\gamma+1}{\\gamma-1}}\\!\\Big[1-\\big(\\tfrac{p_e}{p_c}\\big)^{\\frac{\\gamma-1}{\\gamma}}\\Big]} + \\Big(\\frac{p_e-p_a}{p_c}\\Big)\\varepsilon = 1.46$$', author: 'agent', createdAt: 0, updatedAt: 0 },
-  { id: 'rao-7', text: '**Performance:** $c^{*} = 1622\\,\\text{m/s}$, thrust $F = C_F\\,p_c\\,A_t = 80.4\\,\\text{kN}$, specific impulse $I_{sp} = \\dfrac{C_F\\,c^{*}}{g_0} = 242\\,\\text{s}$ (sea level, this propellant).', author: 'agent', createdAt: 0, updatedAt: 0 },
-]
+/**
+ * The retired hard-coded demo notebook ("Rao Bell Nozzle") seeded every fresh
+ * Document scope with `rao-*` line ids. The Blackboard now starts empty — it
+ * shows only what an agent or the user actually wrote — but cached copies of
+ * that demo still live in localStorage. This detects one: seed lines only
+ * (`rao-*` ids) and an empty event log, i.e. the user never touched it. Such
+ * a snapshot is discarded on load; an edited one is user content and kept.
+ */
+export function isLegacySeedSnapshot(snapshot: BlackboardSnapshot): boolean {
+  return (
+    snapshot.events.length === 0 &&
+    snapshot.lines.length > 0 &&
+    snapshot.lines.every((l) => l.id.startsWith('rao-'))
+  )
+}
 
 interface BlackboardState {
   /** The notebook currently shown — `'document'`, `part:<uuid>`, or
@@ -171,14 +179,13 @@ function persist(scope: BlackboardScope, state: Pick<BlackboardState, 'lines' | 
   adapter.save(scope, { lines: state.lines, events: state.events })
 }
 
-/** The seed for a scope when it has no cached snapshot. Only the Document
- *  scope carries the welcome content; a part starts as an empty notebook. */
-function seedFor(scope: BlackboardScope): BlackboardSnapshot {
-  if (scope === DOCUMENT_SCOPE) return { lines: WELCOME_LINES, events: [] }
+/** Every scope with no cached snapshot starts as an EMPTY notebook — the
+ *  Blackboard carries only lines an agent or the user actually wrote. */
+function emptyNotebook(): BlackboardSnapshot {
   return { lines: [], events: [] }
 }
 
-const initial = adapter.load(DOCUMENT_SCOPE) ?? seedFor(DOCUMENT_SCOPE)
+const initial = adapter.load(DOCUMENT_SCOPE) ?? emptyNotebook()
 
 export const useBlackboardStore = create<BlackboardState>((set, get) => ({
   activeScope: DOCUMENT_SCOPE,
@@ -254,7 +261,7 @@ export const useBlackboardStore = create<BlackboardState>((set, get) => ({
       // Show the scope's local cache instantly (empty notebook for a fresh
       // part — never the previous part's lines); the adapter hydrates the
       // authoritative backend document right after.
-      const cached = adapter.load(scope) ?? seedFor(scope)
+      const cached = adapter.load(scope) ?? emptyNotebook()
       return { activeScope: scope, lines: cached.lines, events: cached.events }
     }),
 
@@ -265,10 +272,8 @@ export const useBlackboardStore = create<BlackboardState>((set, get) => ({
   clearBoard: () => {
     void get
     set((state) => {
-      // Reseed only the document scope with the welcome content; a part's
-      // notebook clears to empty.
-      const seed = seedFor(state.activeScope)
-      const lines = [...seed.lines]
+      // Every scope clears to an empty notebook.
+      const lines: BlackboardLine[] = []
       const events: BlackboardEvent[] = []
       persist(state.activeScope, { lines, events })
       return { lines, events }

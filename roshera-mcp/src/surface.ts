@@ -49,6 +49,9 @@ export const CORE_SURFACE = [
   "clear_parts",
   "workbench",
   "cad_program",
+  // The agent→human notebook write verb stays in the default surface so every
+  // agent knows the channel exists; list/edit/clear live in the labels bench.
+  "blackboard_add_entry",
 ];
 
 /** The 3 meta-tools — the fixed-cost funnel to the long tail. */

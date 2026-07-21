@@ -238,7 +238,8 @@ export function registerWorkbenchTool(host: ToolHost, wb: Workbench): void {
       "small (≤35). modes: 'sketch' (create_sketch/psketch_*), 'assembly' " +
       "(assembly_*), 'drawing' (make_drawing/dimension/gdt_*), 'analysis' " +
       "(ray/region/occupancy/coverage/distance/ground_truth), 'labels' (label_*/" +
-      "blackboard_*), 'core_only' (retire any bench), 'status' (report the active " +
+      "blackboard_* — the shared human-visible notebook: read the human's notes, " +
+      "edit lines), 'core_only' (retire any bench), 'status' (report the active " +
       "bench, exposed count, token bill, and per-bench tool counts).",
     {
       mode: z

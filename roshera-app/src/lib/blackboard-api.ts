@@ -44,6 +44,7 @@ import {
   type BlackboardPersistenceAdapter,
   type BlackboardLine,
   DOCUMENT_SCOPE,
+  isLegacySeedSnapshot,
   setBlackboardAdapter,
   useBlackboardStore,
 } from '@/stores/blackboard-store'
@@ -75,7 +76,10 @@ function loadLocal(scope: BlackboardScope): BlackboardSnapshot | null {
     if (!raw) return null
     const parsed = JSON.parse(raw) as Partial<BlackboardSnapshot>
     if (!Array.isArray(parsed.lines) || !Array.isArray(parsed.events)) return null
-    return { lines: parsed.lines, events: parsed.events }
+    const snapshot = { lines: parsed.lines, events: parsed.events }
+    // An untouched copy of the retired demo notebook is not user content.
+    if (isLegacySeedSnapshot(snapshot)) return null
+    return snapshot
   } catch {
     return null
   }
@@ -171,7 +175,7 @@ function findLine(snapshot: BlackboardSnapshot, id: string): BlackboardLine | un
  */
 async function persistDelta(scope: BlackboardScope, next: BlackboardSnapshot): Promise<void> {
   const prev = baseline(scope)
-  // clearBoard resets events to empty (and lines to just the welcome line).
+  // clearBoard resets events to empty (and lines to empty).
   if (next.events.length === 0 && prev.events.length > 0) {
     try {
       await clearBackend(scope)
