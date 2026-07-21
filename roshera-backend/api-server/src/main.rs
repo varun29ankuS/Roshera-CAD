@@ -21,6 +21,7 @@ mod assembly_mgr;
 mod auth_middleware;
 mod auth_slice1_tests;
 mod auth_slice4_tests;
+mod auth_slice5_tests;
 mod blackboard;
 #[cfg(test)]
 mod blend_failed_harness;
@@ -9355,6 +9356,14 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route("/api/auth/register", post(register))
         .route("/api/auth/logout", post(logout))
         .route("/api/auth/refresh", post(refresh_token))
+        // API-key lifecycle (Slice 5). Deliberately NOT in the
+        // auth-middleware open-path list: every route here requires a
+        // validated credential, and provisioning is self-service only.
+        .route(
+            "/api/auth/keys",
+            post(provision_api_key_handler).get(list_api_keys_handler),
+        )
+        .route("/api/auth/keys/{id}", delete(revoke_api_key_handler))
         // Admin endpoints
         .route(
             "/api/admin/users/{id}/permissions",

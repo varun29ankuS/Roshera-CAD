@@ -1,13 +1,16 @@
-//! Authentication handlers for login, registration, and token management
+//! Authentication handlers for login, registration, token management,
+//! and the API-key lifecycle (Slice 5: provision / list / revoke).
 
+use crate::auth_middleware::AuthInfo;
 use crate::AppState;
 use axum::{
-    extract::State,
+    extract::{Extension, Path, State},
     http::{header::AUTHORIZATION, HeaderMap, StatusCode},
     response::{Json, Result},
 };
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use session_manager::SessionError;
 use tracing::{error, info, warn};
 
 /// Response payload for the logout endpoint.
@@ -401,6 +404,250 @@ fn get_user_permission_strings() -> Vec<String> {
         "ModifyGeometry".to_string(),
         "ExportGeometry".to_string(),
     ]
+}
+
+// =====================================================================
+// API-key lifecycle (Slice 5)
+// =====================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct ProvisionKeyRequest {
+    pub name: String,
+    /// Requested permission strings. Omitted ⇒ the user baseline. Any
+    /// string outside the baseline is refused (never silently clamped).
+    pub permissions: Option<Vec<String>>,
+    pub expires_in_days: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ProvisionKeyResponse {
+    pub success: bool,
+    pub id: Option<String>,
+    /// The raw secret — returned exactly once, at provisioning. Only its
+    /// SHA-256 hash is stored; it can never be retrieved again.
+    pub key: Option<String>,
+    pub prefix: Option<String>,
+    pub name: Option<String>,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub message: String,
+    pub error: Option<String>,
+}
+
+/// The public projection of an API key. Deliberately a separate struct
+/// from `session_manager::ApiKey` so `key_hash` can never leak through a
+/// serializer change.
+#[derive(Debug, Serialize)]
+pub struct ApiKeySummary {
+    pub id: String,
+    pub name: String,
+    pub prefix: String,
+    pub created_at: DateTime<Utc>,
+    pub last_used: Option<DateTime<Utc>>,
+    pub expires_at: Option<DateTime<Utc>>,
+    pub active: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ListKeysResponse {
+    pub success: bool,
+    pub keys: Vec<ApiKeySummary>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RevokeKeyResponse {
+    pub success: bool,
+    pub message: String,
+    pub error: Option<String>,
+}
+
+/// `POST /api/auth/keys` — provision an API key for the authenticated
+/// caller (self-service; the key is always minted for `auth_info.user_id`).
+///
+/// The raw key appears in this response and nowhere else, ever. Requested
+/// permissions must be a subset of the user baseline — anything broader is
+/// a typed refusal, because a caller must not be able to mint a credential
+/// stronger than the one they authenticated with.
+pub async fn provision_api_key_handler(
+    State(state): State<AppState>,
+    Extension(auth_info): Extension<AuthInfo>,
+    Json(payload): Json<ProvisionKeyRequest>,
+) -> (StatusCode, Json<ProvisionKeyResponse>) {
+    let name = payload.name.trim();
+    if name.is_empty() || name.len() > 64 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ProvisionKeyResponse {
+                success: false,
+                id: None,
+                key: None,
+                prefix: None,
+                name: None,
+                expires_at: None,
+                message: "Key name must be 1–64 characters".to_string(),
+                error: Some("INVALID_KEY_NAME".to_string()),
+            }),
+        );
+    }
+
+    let baseline = get_user_permission_strings();
+    let permissions = payload.permissions.unwrap_or_else(|| baseline.clone());
+    if let Some(outside) = permissions.iter().find(|p| !baseline.contains(p)) {
+        warn!(
+            "API-key provisioning refused for {} — permission outside baseline: {}",
+            auth_info.user_id, outside
+        );
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ProvisionKeyResponse {
+                success: false,
+                id: None,
+                key: None,
+                prefix: None,
+                name: None,
+                expires_at: None,
+                message: format!(
+                    "Permission '{outside}' is outside the user baseline and cannot be granted to a key"
+                ),
+                error: Some("PERMISSIONS_OUTSIDE_BASELINE".to_string()),
+            }),
+        );
+    }
+
+    let auth_manager = state.session_manager.auth_manager();
+    match auth_manager
+        .provision_api_key(
+            &auth_info.user_id,
+            name,
+            permissions,
+            payload.expires_in_days,
+        )
+        .await
+    {
+        Ok((raw_key, api_key)) => {
+            info!(
+                "API key '{}' ({}) provisioned for user {}",
+                api_key.name, api_key.id, auth_info.user_id
+            );
+            (
+                StatusCode::OK,
+                Json(ProvisionKeyResponse {
+                    success: true,
+                    id: Some(api_key.id),
+                    key: Some(raw_key),
+                    prefix: Some(api_key.prefix),
+                    name: Some(api_key.name),
+                    expires_at: api_key.expires_at,
+                    message: "Store this key now — it cannot be retrieved again".to_string(),
+                    error: None,
+                }),
+            )
+        }
+        Err(e) => {
+            error!(
+                "API-key provisioning failed for user {}: {:?}",
+                auth_info.user_id, e
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ProvisionKeyResponse {
+                    success: false,
+                    id: None,
+                    key: None,
+                    prefix: None,
+                    name: None,
+                    expires_at: None,
+                    message: "Key could not be provisioned durably".to_string(),
+                    error: Some("PROVISION_FAILED".to_string()),
+                }),
+            )
+        }
+    }
+}
+
+/// `GET /api/auth/keys` — list the caller's own keys. No secret material:
+/// the response carries the display prefix and metadata only.
+pub async fn list_api_keys_handler(
+    State(state): State<AppState>,
+    Extension(auth_info): Extension<AuthInfo>,
+) -> (StatusCode, Json<ListKeysResponse>) {
+    let keys = state
+        .session_manager
+        .auth_manager()
+        .list_api_keys(&auth_info.user_id)
+        .into_iter()
+        .map(|k| ApiKeySummary {
+            id: k.id,
+            name: k.name,
+            prefix: k.prefix,
+            created_at: k.created_at,
+            last_used: k.last_used,
+            expires_at: k.expires_at,
+            active: k.active,
+        })
+        .collect();
+    (
+        StatusCode::OK,
+        Json(ListKeysResponse {
+            success: true,
+            keys,
+            error: None,
+        }),
+    )
+}
+
+/// `DELETE /api/auth/keys/{id}` — revoke the caller's own key, durably.
+///
+/// A key that does not exist and a key owned by someone else are the same
+/// typed NOT_FOUND, so key ids cannot be probed. A persist failure is a
+/// 500, not a success — the manager rolls the in-memory flip back, so the
+/// reported state always matches what the next boot will load.
+pub async fn revoke_api_key_handler(
+    State(state): State<AppState>,
+    Extension(auth_info): Extension<AuthInfo>,
+    Path(key_id): Path<String>,
+) -> (StatusCode, Json<RevokeKeyResponse>) {
+    match state
+        .session_manager
+        .auth_manager()
+        .revoke_api_key(&auth_info.user_id, &key_id)
+        .await
+    {
+        Ok(()) => {
+            info!("API key {} revoked by user {}", key_id, auth_info.user_id);
+            (
+                StatusCode::OK,
+                Json(RevokeKeyResponse {
+                    success: true,
+                    message: "Key revoked".to_string(),
+                    error: None,
+                }),
+            )
+        }
+        Err(SessionError::AccessDenied) => (
+            StatusCode::NOT_FOUND,
+            Json(RevokeKeyResponse {
+                success: false,
+                message: "No such key".to_string(),
+                error: Some("KEY_NOT_FOUND".to_string()),
+            }),
+        ),
+        Err(e) => {
+            error!(
+                "API-key revocation persist failed for user {} key {}: {:?}",
+                auth_info.user_id, key_id, e
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(RevokeKeyResponse {
+                    success: false,
+                    message: "Revocation could not be persisted — the key is still active"
+                        .to_string(),
+                    error: Some("REVOCATION_PERSIST_FAILED".to_string()),
+                }),
+            )
+        }
+    }
 }
 
 #[cfg(test)]

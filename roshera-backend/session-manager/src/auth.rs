@@ -797,6 +797,61 @@ impl AuthManager {
         Ok(restored)
     }
 
+    /// List every API key owned by `user_id`, oldest first (all states,
+    /// including revoked — the owner sees their full key inventory).
+    /// Callers exposing this over a wire must project away `key_hash`;
+    /// the full record is returned so internal callers keep the
+    /// expiry/active detail.
+    pub fn list_api_keys(&self, user_id: &str) -> Vec<ApiKey> {
+        let mut keys: Vec<ApiKey> = self
+            .api_keys
+            .iter()
+            .filter(|entry| entry.value().user_id == user_id)
+            .map(|entry| entry.value().clone())
+            .collect();
+        keys.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        keys
+    }
+
+    /// Revoke `key_id` owned by `user_id`, durably (Slice 5).
+    ///
+    /// Ownership is enforced here, not at the route: a key that does not
+    /// exist and a key owned by someone else both return
+    /// [`SessionError::AccessDenied`], so a caller cannot probe which key
+    /// ids exist.
+    ///
+    /// Durability mirrors [`provision_api_key`](Self::provision_api_key)'s
+    /// fail-loud contract in reverse: the in-memory flip happens first
+    /// (the very next `verify_api_key` must refuse), then the write-through.
+    /// If the persist fails the in-memory flip is rolled back and the error
+    /// returned — a revocation this method reports as done can never
+    /// silently resurrect on the next boot.
+    pub async fn revoke_api_key(&self, user_id: &str, key_id: &str) -> Result<(), SessionError> {
+        // Flip under a short-lived guard, released before any await.
+        let revoked = {
+            let mut entry = self
+                .api_keys
+                .get_mut(key_id)
+                .ok_or(SessionError::AccessDenied)?;
+            if entry.value().user_id != user_id {
+                return Err(SessionError::AccessDenied);
+            }
+            entry.value_mut().active = false;
+            entry.value().clone()
+        };
+
+        if let Some(store) = self.api_key_store.get() {
+            if let Err(e) = store.save_api_key(&revoked).await {
+                if let Some(mut entry) = self.api_keys.get_mut(key_id) {
+                    entry.value_mut().active = true;
+                }
+                return Err(e);
+            }
+        }
+
+        Ok(())
+    }
+
     /// Verify API key
     pub fn verify_api_key(&self, raw_key: &str) -> Result<ApiKey, SessionError> {
         // Hash the provided key

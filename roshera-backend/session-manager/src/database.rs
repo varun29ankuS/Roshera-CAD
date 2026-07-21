@@ -1270,6 +1270,17 @@ impl DatabasePersistence for PostgresDatabase {
             r#"
             INSERT INTO api_keys (id, name, key_hash, prefix, user_id, permissions, rate_limit, created_at, last_used, expires_at, active)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            ON CONFLICT (id) DO UPDATE SET
+                name = EXCLUDED.name,
+                key_hash = EXCLUDED.key_hash,
+                prefix = EXCLUDED.prefix,
+                user_id = EXCLUDED.user_id,
+                permissions = EXCLUDED.permissions,
+                rate_limit = EXCLUDED.rate_limit,
+                created_at = EXCLUDED.created_at,
+                last_used = EXCLUDED.last_used,
+                expires_at = EXCLUDED.expires_at,
+                active = EXCLUDED.active
             "#
         )
         .bind(&api_key.id)
@@ -2310,6 +2321,17 @@ impl DatabasePersistence for SqliteDatabase {
             r#"
             INSERT INTO api_keys (id, key_hash, prefix, user_id, name, permissions, rate_limit, created_at, expires_at, last_used, active)
             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+            ON CONFLICT(id) DO UPDATE SET
+                key_hash = excluded.key_hash,
+                prefix = excluded.prefix,
+                user_id = excluded.user_id,
+                name = excluded.name,
+                permissions = excluded.permissions,
+                rate_limit = excluded.rate_limit,
+                created_at = excluded.created_at,
+                expires_at = excluded.expires_at,
+                last_used = excluded.last_used,
+                active = excluded.active
             "#
         )
         .bind(&key.id)
