@@ -14,6 +14,8 @@ import massPropertiesHonesty from "./12-mass-properties-honesty.mjs";
 import coincidentFaceRobustness from "./13-coincident-face-robustness.mjs";
 import quadricSsiHonesty from "./14-quadric-ssi-honesty.mjs";
 import drawingComprehension from "./15-drawing-comprehension.mjs";
+import shelfBracket from "./16-shelf-bracket.mjs";
+import nema17MotorMount from "./17-nema17-motor-mount.mjs";
 
 export const scenarios = [
   gear,
@@ -31,4 +33,6 @@ export const scenarios = [
   coincidentFaceRobustness,
   quadricSsiHonesty,
   drawingComprehension,
+  shelfBracket,
+  nema17MotorMount,
 ];

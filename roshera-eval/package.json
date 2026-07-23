@@ -10,7 +10,7 @@
   "scripts": {
     "test": "node run.mjs",
     "eval": "node run.mjs",
-    "test:oracle": "node test/oracle-10.mjs && node test/oracle-11.mjs && node test/oracle-12.mjs && node test/oracle-13.mjs && node test/oracle-14.mjs && node test/oracle-15.mjs"
+    "test:oracle": "node test/oracle-10.mjs && node test/oracle-11.mjs && node test/oracle-12.mjs && node test/oracle-13.mjs && node test/oracle-14.mjs && node test/oracle-15.mjs && node test/oracle-16.mjs && node test/oracle-17.mjs"
   },
   "engines": {
     "node": ">=18"

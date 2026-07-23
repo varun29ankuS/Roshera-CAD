@@ -45,6 +45,9 @@ integration). Nothing here is graded by an LLM.
 | 12 | Mass-properties provenance | box volume == closed form · cylinder vol == πr²h | a mesh estimate labelled `Approximate` (never `Exact`); the self-certified error bound must HOLD |
 | 13 | ε=1e-6 coincident-face union | χ=2 · vol == merged-block oracle · sound | `sound:true` may never mask open/non-manifold edges or orphan sliver faces |
 | 14 | Quadric SSI — cyl∘sphere bite + near-tangency | volume physically bounded · sound ⟹ genus-0 | unsound must NAME its defect; the near-tangency case REFUSES rather than faking a clean solid |
+| 15 | Certified drawing comprehension (semantic sheet readback) | toleranced-Ø / FCF / datum answered from provenance | HATCH ink refuses `render_only`; an unprovenanced question refuses `unprovenanced` |
+| 16 | Wall-mounted shelf bracket (FDM PLA) — founder task spec 2026-07-23 §B | sound at every step · watertight+manifold · fits 220×160×60 · 2×M6 @ 60 mm frozen · single-piece · mass (PLA) = ranking | sound ⟹ watertight; stress/deflection/orientation/wall/overhang DECLARED `unscored`, never fake-scored |
+| 17 | Vibration-aware NEMA 17 motor mount (FDM PETG) — founder task spec 2026-07-23 Part 2 | sound at every step · fits 90×70×60 · 4×M3 @ 31 mm sq + Ø22 boss + 2×M5 · single-piece · mass (PETG) = ranking | f₁≥120 Hz modal + stress/deflection/wall/overhang/orientation/thermal DECLARED `unscored`, never fake-scored |
 
 ### The honesty through-line
 
@@ -105,14 +108,29 @@ roshera-eval/
     geom.mjs               deterministic profile generators + shoelace oracle
     builders.mjs           shared build recipes (extrude, drill, fillet-all, flange)
   scenarios/
-    01-gear.mjs ... 14-quadric-ssi-honesty.mjs
+    01-gear.mjs ... 17-nema17-motor-mount.mjs
     index.mjs              the ordered corpus
   test/
-    oracle-10.mjs ... oracle-14.mjs   dry validation of each honesty oracle
+    oracle-10.mjs ... oracle-17.mjs   dry validation of each honesty oracle
 ```
 
-`npm run test:oracle` runs every dry-validation harness (10–14) with no
+`npm run test:oracle` runs every dry-validation harness (10–17) with no
 backend; `npm run eval` runs the live corpus.
+
+### Honesty by omission (scenarios 16–17)
+
+The founder-authored task specs (2026-07-23) carry criteria this kernel cannot
+yet compute — von Mises stress, deflection, f₁ ≥ 120 Hz modal, wall-thickness
+minimums, overhang/support, print orientation, thermal. Those are NOT dropped
+and NOT graded by a stand-in number: each scenario declares them in an
+`unscored_criteria` manifest (criterion · spec_ref · reason), and the scored
+subset is exactly the honestly-verifiable subset (soundness at every step,
+watertight/manifold, envelope, the frozen bolt interfaces at spec Ø and spacing,
+single-piece topology, mass as the ranking metric). `test/oracle-16.mjs` and
+`oracle-17.mjs` enforce the contract offline: they prove the honest transcript
+passes, every planted lie is caught, AND no scored check ever touches an
+unscoreable gate. When the physics/printability scoring bridge lands, those
+declared criteria migrate from `unscored_criteria` into scored checks.
 
 ## v2 direction
 
