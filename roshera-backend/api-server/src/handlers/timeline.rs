@@ -22,6 +22,11 @@ use timeline_engine::{
 use tracing::{error, info};
 use uuid::Uuid;
 
+use crate::blackboard::{BlackboardLine, BlackboardScope};
+use crate::durability::DurabilityStatus;
+use geometry_engine::readable::MassPropertiesReport;
+use timeline_engine::event_certificate::EventCertificate;
+
 /// Request to record an operation
 #[derive(Serialize, Deserialize)]
 pub struct RecordOperationRequest {
@@ -1681,6 +1686,319 @@ pub async fn get_rebuild_certificate(
     let target = timeline_engine::OverrideSet::collect(&events).min_target_sequence();
     let (_model, cert) = certify_rebuild(&events, target);
     Ok(Json(cert))
+}
+
+// ─── Evidence-pack export ───────────────────────────────────────────
+//
+// One call bundling a document's recorded design history into the
+// reviewable-evidence format the AI-training-data industry assembles by
+// hand: per-operation record + certificate + measured metrics + the
+// agent's notebook, machine-readable.
+//
+// # Honesty contract (mirrors the rest of the kernel)
+//
+// The pack REPORTS recorded history — it never fabricates a certificate
+// for an operation that carries none, and never recomputes a verdict
+// silently:
+//   * `operations[].certificate` is read verbatim from the event's
+//     metadata via [`EventCertificate::from_metadata`]; absent reads back
+//     as `null` with an explicit `certificate_absent_reason`, never a
+//     fabricated green.
+//   * A live re-measured verdict lives ONLY under the separately-labeled
+//     `recomputed` field (a [`RebuildCertificate`] + `recomputed_at`), so
+//     a re-measured number can never be mistaken for recorded history.
+//   * Quarantined / unreplayable history is surfaced in
+//     `manifest.durability` (mirroring [`DurabilityStatus`]), never
+//     silently omitted.
+//
+// Field names are snake_case; every number is a JSON number, not a
+// string — a `metrics.json`-shaped bundle.
+
+/// Query string for [`get_evidence_pack`]. Document scope; `branch`
+/// selects the recorded history (default `main`), `notebook` selects the
+/// blackboard scope (default the document-wide notebook).
+#[derive(Deserialize)]
+pub struct EvidencePackQuery {
+    /// Branch whose recorded operations are bundled. `"main"` or a UUID;
+    /// defaults to `main`. Same scoping idiom as `history/{branch_id}` and
+    /// `rebuild-certificate/{branch_id}`.
+    #[serde(default)]
+    pub branch: Option<String>,
+    /// Blackboard scope token (`"document"`, `"part:<uuid>"`,
+    /// `"assembly:<uuid>"`, a bare part UUID). Defaults to the document
+    /// notebook — the document-scope pack's natural home.
+    #[serde(default)]
+    pub notebook: Option<String>,
+}
+
+/// The reviewable-evidence scope this pack was generated for.
+#[derive(Serialize)]
+pub struct EvidenceScope {
+    /// Branch label (`"main"` or a UUID) the operations came from.
+    pub branch: String,
+    /// Canonical notebook scope key the notebook lines came from.
+    pub notebook: String,
+}
+
+/// Pack manifest — provenance of the bundle itself.
+#[derive(Serialize)]
+pub struct EvidenceManifest {
+    /// RFC 3339 UTC time the pack was generated.
+    pub generated_at: String,
+    /// The api-server / kernel package version (compile-time
+    /// `CARGO_PKG_VERSION`) — the honest, always-available build stamp.
+    pub kernel_version: String,
+    /// What this pack covers.
+    pub scope: EvidenceScope,
+    /// Number of recorded operations bundled.
+    pub operation_count: usize,
+    /// The durability boot outcome. A quarantined document (an event this
+    /// kernel cannot faithfully replay) is reported here — the clean prefix
+    /// served + the quarantine boundary + reason — never hidden as if the
+    /// history were whole.
+    pub durability: DurabilityStatus,
+}
+
+/// One recorded operation's evidence row.
+#[derive(Serialize)]
+pub struct EvidenceOperation {
+    /// Branch-local monotonic sequence number.
+    pub sequence: u64,
+    /// Event UUID.
+    pub event_id: String,
+    /// Kernel operation kind (`create_box_3d`, `boolean_union`, …).
+    pub op_kind: String,
+    /// The recorded parameter payload (verbatim recorded truth) — the
+    /// `Operation::Generic` parameters, or the full tagged operation for
+    /// typed variants.
+    pub params: serde_json::Value,
+    /// RFC 3339 timestamp the operation was recorded.
+    pub timestamp: String,
+    /// Display name of the author.
+    pub author: String,
+    /// Author classification: `"user" | "ai" | "system"`.
+    pub author_kind: String,
+    /// The certificate AS RECORDED on this event — read from metadata,
+    /// NEVER recomputed or invented. `null` when the event carries none.
+    pub certificate: Option<EventCertificate>,
+    /// Why `certificate` is `null`, present only when it is. An honest
+    /// "not certified", never a fabricated verdict.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub certificate_absent_reason: Option<String>,
+}
+
+/// One live solid's final-state evidence, with provenance-labeled metrics.
+#[derive(Serialize)]
+pub struct EvidencePart {
+    /// Kernel solid id.
+    pub solid_id: u32,
+    /// Public UUID, when one is registered for this solid.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uuid: Option<String>,
+    /// User-facing name, when set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Mass properties WITH their per-quantity exactness provenance labels
+    /// (`provenance`, `units`, `method`). `null` for a degenerate solid.
+    pub mass_properties: Option<MassPropertiesReport>,
+    /// Why `mass_properties` is `null`, present only when it is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mass_properties_absent_reason: Option<String>,
+}
+
+/// The document's final geometry state.
+#[derive(Serialize)]
+pub struct EvidenceFinalState {
+    /// Every live solid, ascending by id.
+    pub parts: Vec<EvidencePart>,
+}
+
+/// A SEPARATELY-LABELED re-measured verdict — recomputed NOW from the
+/// immutable log, never conflated with recorded history.
+#[derive(Serialize)]
+pub struct EvidenceRecompute {
+    /// RFC 3339 UTC time the recompute ran.
+    pub recomputed_at: String,
+    /// Plain-language note that this is a fresh re-measurement, not history.
+    pub note: String,
+    /// The honest per-feature rebuild certificate (`certify_rebuild`):
+    /// Rebuilt/Unaffected/Failed/Dangling/Blocked verdicts + a re-measured
+    /// `is_sound`, recomputed from the resulting B-Rep.
+    pub rebuild_certificate: RebuildCertificate,
+}
+
+/// The full evidence pack — one machine-readable JSON bundle.
+#[derive(Serialize)]
+pub struct EvidencePack {
+    pub manifest: EvidenceManifest,
+    pub operations: Vec<EvidenceOperation>,
+    pub final_state: EvidenceFinalState,
+    /// The agent's notebook — blackboard lines verbatim (id, text, author,
+    /// created/updated timestamps).
+    pub notebook: Vec<BlackboardLine>,
+    pub recomputed: EvidenceRecompute,
+}
+
+/// The recorded parameter payload for an operation: the `Operation::Generic`
+/// parameters verbatim (the path every live kernel call takes), or the full
+/// tagged operation for typed variants.
+fn evidence_params(op: &Operation) -> serde_json::Value {
+    match generic_parameters(op) {
+        Some(params) => params.clone(),
+        None => serde_json::to_value(op).unwrap_or(serde_json::Value::Null),
+    }
+}
+
+/// Human-readable branch label — `"main"` for the trunk, else the UUID.
+fn branch_id_label(branch: &BranchId) -> String {
+    if branch.is_main() {
+        "main".to_string()
+    } else {
+        branch.to_string()
+    }
+}
+
+/// `GET /api/evidence-pack` — bundle a document's recorded design history
+/// into a single reviewable-evidence JSON pack (document scope;
+/// `?branch=` / `?notebook=` optional).
+///
+/// Authenticated by the global auth layer (`/api/evidence-pack` is not on
+/// the public allowlist). The pack REPORTS recorded history: per-operation
+/// certificates are read from event metadata (absent → `null` + reason,
+/// never fabricated); a re-measured verdict lives only under the labeled
+/// `recomputed` field; quarantined history surfaces in `manifest.durability`.
+pub async fn get_evidence_pack(
+    State(state): State<AppState>,
+    Query(query): Query<EvidencePackQuery>,
+) -> Result<Json<EvidencePack>, StatusCode> {
+    let branch_id = match query.branch.as_deref() {
+        Some(b) => resolve_branch_ref(b)?,
+        None => BranchId::main(),
+    };
+    let notebook_scope = match query.notebook.as_deref() {
+        Some(tok) => BlackboardScope::parse(tok).ok_or(StatusCode::BAD_REQUEST)?,
+        None => BlackboardScope::Document,
+    };
+
+    // Drain in-flight recorder ops so the pack reflects every recorded
+    // operation the client has issued, not just those the background
+    // worker happened to have drained by the time this request arrived.
+    let _ = state.timeline_recorder.flush().await;
+
+    // Recorded history, in sequence order (the immutable event log).
+    let events = {
+        let timeline = state.timeline.read().await;
+        let mut all = timeline
+            .get_branch_events(&branch_id, None, None)
+            .map_err(|_| StatusCode::NOT_FOUND)?;
+        all.sort_by_key(|e| e.sequence_number);
+        all
+    };
+
+    // Per-operation record. The certificate is read AS RECORDED from the
+    // event's metadata; absent reads back as `null` with an explicit reason.
+    let operations: Vec<EvidenceOperation> = events
+        .iter()
+        .map(|event| {
+            let certificate = EventCertificate::from_metadata(&event.metadata);
+            let certificate_absent_reason = if certificate.is_none() {
+                Some(
+                    "no certificate is recorded on this event; the pack reports \
+                     recorded history and never fabricates one. See the pack's \
+                     `recomputed` field for a separately-labeled re-measured verdict."
+                        .to_string(),
+                )
+            } else {
+                None
+            };
+            EvidenceOperation {
+                sequence: event.sequence_number,
+                event_id: event.id.to_string(),
+                op_kind: operation_kind(&event.operation),
+                params: evidence_params(&event.operation),
+                timestamp: event.timestamp.to_rfc3339(),
+                author: author_label(&event.author),
+                author_kind: author_kind(&event.author),
+                certificate,
+                certificate_absent_reason,
+            }
+        })
+        .collect();
+
+    // Final geometry state: every live solid with its mass properties AND
+    // their per-quantity exactness provenance labels. `mass_properties_for`
+    // is cache-warming (takes `&mut model`), so a write guard is held; a
+    // degenerate solid reports `null` + reason, never a fabricated number.
+    let parts = {
+        let mut model = state.model.write().await;
+        let seeds: Vec<(u32, Option<String>)> = model
+            .solids
+            .iter()
+            .map(|(id, solid)| (id, solid.name.clone()))
+            .collect();
+        let mut parts = Vec::with_capacity(seeds.len());
+        for (solid_id, name) in seeds {
+            let uuid = state.get_uuid(solid_id).map(|u| u.to_string());
+            let (mass_properties, mass_properties_absent_reason) =
+                match model.mass_properties_for(solid_id) {
+                    Some(report) => (Some(report), None),
+                    None => (
+                        None,
+                        Some(
+                            "mass properties unavailable: the solid is degenerate or \
+                             carries no computable volume."
+                                .to_string(),
+                        ),
+                    ),
+                };
+            parts.push(EvidencePart {
+                solid_id,
+                uuid,
+                name,
+                mass_properties,
+                mass_properties_absent_reason,
+            });
+        }
+        parts.sort_by_key(|p| p.solid_id);
+        parts
+    };
+
+    // The agent's notebook — blackboard lines verbatim (author + timestamps).
+    let notebook = state.blackboard.snapshot(&notebook_scope).await.lines;
+
+    // A SEPARATE, clearly-labeled re-measured verdict — recomputed NOW from
+    // the immutable log via `certify_rebuild`, never conflated with recorded
+    // history. Rooted at the earliest active mould target (widest dirty set),
+    // matching `get_rebuild_certificate`.
+    let target = timeline_engine::OverrideSet::collect(&events).min_target_sequence();
+    let (_model, rebuild_certificate) = certify_rebuild(&events, target);
+    let recomputed = EvidenceRecompute {
+        recomputed_at: chrono::Utc::now().to_rfc3339(),
+        note: "Re-measured NOW from the immutable event log — NOT recorded history. \
+               Per-feature verdicts (Rebuilt/Unaffected/Failed/Dangling/Blocked) and \
+               `is_sound` are recomputed from the resulting B-Rep."
+            .to_string(),
+        rebuild_certificate,
+    };
+
+    let manifest = EvidenceManifest {
+        generated_at: chrono::Utc::now().to_rfc3339(),
+        kernel_version: env!("CARGO_PKG_VERSION").to_string(),
+        scope: EvidenceScope {
+            branch: branch_id_label(&branch_id),
+            notebook: notebook_scope.key(),
+        },
+        operation_count: operations.len(),
+        durability: state.durability_status.read().await.clone(),
+    };
+
+    Ok(Json(EvidencePack {
+        manifest,
+        operations,
+        final_state: EvidenceFinalState { parts },
+        notebook,
+        recomputed,
+    }))
 }
 
 /// One addressable timeline session in the `GET /api/timeline/sessions` list.

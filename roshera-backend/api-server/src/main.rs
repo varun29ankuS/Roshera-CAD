@@ -33,6 +33,7 @@ mod durability;
 #[cfg(test)]
 mod durability_boot_tests;
 mod error_catalog;
+mod evidence_pack_tests;
 mod fillet_payload;
 #[cfg(test)]
 mod fillet_radius_harness;
@@ -9438,6 +9439,19 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route(
             "/api/timeline/rebuild-certificate/{branch_id}",
             get(crate::handlers::timeline::get_rebuild_certificate),
+        )
+        // Evidence-pack export (document scope): one call bundling a
+        // branch's recorded operations + their certificates AS RECORDED,
+        // final-state mass properties with provenance, and the agent's
+        // notebook into a single machine-readable JSON pack. Authenticated
+        // by the global auth layer (non-exempt path). Honest by
+        // construction: an absent per-op certificate is `null` with a
+        // reason (never fabricated), a re-measured verdict lives only under
+        // the labeled `recomputed` field, and quarantined history surfaces
+        // in `manifest.durability`.
+        .route(
+            "/api/evidence-pack",
+            get(crate::handlers::timeline::get_evidence_pack),
         )
         // Disambiguate against the session-scoped undo/redo also re-
         // exported via `handlers::*` (handlers/session.rs). The
