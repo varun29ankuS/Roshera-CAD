@@ -147,7 +147,7 @@ places a check is deliberately narrower than its name — see
 
 ## Performance
 
-Numbers below are labeled with the date and machine they were taken on. Criterion, release/bench profile (`CARGO_PROFILE_BENCH_LTO=off`, `CARGO_PROFILE_BENCH_CODEGEN_UNITS=16`), median estimate. These are internal regression figures, not comparisons against any third-party kernel. Reproduce with the commands at the end. Full detail in [BENCHMARKS.md](BENCHMARKS.md).
+Numbers below are labeled with the date, machine, and build profile they were taken on — the profile matters: the workspace's default bench profile builds with full LTO (`lto = true`, `codegen-units = 1`), and disabling LTO measures ~3–4× slower on these benches. The certificate table below is the default full-LTO profile; the older math/primitive tables were taken under the previous `LTO=off` methodology and are marked for re-measurement. These are internal regression figures, not comparisons against any third-party kernel. Reproduce with the commands at the end. Full detail in [BENCHMARKS.md](BENCHMARKS.md).
 
 ### Certificate cost (`certificate_cost`)
 
@@ -206,8 +206,9 @@ Fresh timings for both are omitted here rather than published from a loaded mach
 
 ```bash
 cd roshera-backend
-CARGO_PROFILE_BENCH_LTO=off CARGO_PROFILE_BENCH_CODEGEN_UNITS=16 \
-  cargo bench -p geometry-engine \
+# Default profile = the workspace's full-LTO release settings (this is what
+# the certificate table was measured with; expect a long first compile).
+cargo bench -p geometry-engine \
   --bench geometry_bench --bench certificate_cost \
   --bench tessellation_bench --bench boolean_classification
 ```
