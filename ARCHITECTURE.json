@@ -1,0 +1,687 @@
+{
+  "atlas_version": "1.0",
+  "generated": "2026-07-27",
+  "git_rev": "0857ca85",
+  "how_to_use": "This file is a machine-readable map of the Roshera workspace as it stood at git_rev, assembled from five independently verified mapper reports (backend, kernel, frontend, agent-layers, flows). It exists so an agent orchestrating changes can orient quickly without re-deriving structure from scratch. Code is the ultimate truth: this atlas describes one revision and decays from there — re-verify any fact against the current tree before relying on it for a consequential decision, especially module paths, line numbers, and counts.",
+  "product_thesis": "Roshera is an agent runtime for geometry, not a CAD tool in the traditional sense: the backend/SDK is the product and the React viewport is one thin client among possible clients, with agents (Claude) as the primary orchestrated actor and humans directing at a higher level. The system is built star-topology around a self-certifying B-Rep kernel (geometry-engine) that cannot lie — every mutating operation is checked against a nine-conjunct validity certificate computed fresh from geometry, never asserted, so soundness claims are always re-derived rather than trusted from history. The governing discipline is honest refusal over silent wrong answers: operations outside a verified envelope return typed errors (DisjointDifference, EmptyResult, BlendFailed, quarantine states, Unavailable mass properties) rather than approximations mislabeled as exact. History is event-sourced on a timeline, not a parametric feature tree, and the frontend is backend-driven — no client-side geometry kernel, no client-side mesh generation, sub-element picks are server-resolved.",
+  "components": [
+    {
+      "id": "shared-types",
+      "name": "shared-types",
+      "kind": "rust-crate",
+      "path": "roshera-backend/shared-types",
+      "purpose": "Core DTOs shared across the entire workspace: geometry representations, commands, materials, session, and error types. No geometric logic.",
+      "key_modules": [
+        {"path": "roshera-backend/shared-types/src/api", "role": "API-facing DTO shapes"},
+        {"path": "roshera-backend/shared-types/src/commands", "role": "Command/CommandResult types"},
+        {"path": "roshera-backend/shared-types/src/geometry", "role": "geometry reps (CADObject, MeshData, AnalyticalGeometry, Transform3D)"},
+        {"path": "roshera-backend/shared-types/src/geometry_commands", "role": "geometry command payloads, ExportFormat enum"},
+        {"path": "roshera-backend/shared-types/src/timeline_types", "role": "timeline/event DTOs"},
+        {"path": "roshera-backend/shared-types/src/session", "role": "session DTOs"},
+        {"path": "roshera-backend/shared-types/src/vision", "role": "ViewportCapture/CameraInfo/SceneObject DTOs"}
+      ],
+      "interfaces": [{"kind": "lib", "detail": "Rust library, consumed by every non-leaf crate in the workspace"}],
+      "depends_on": [],
+      "invariants": ["No geometric logic lives here — pure data shapes"],
+      "notes": ["Leaf crate: zero intra-workspace dependencies"]
+    },
+    {
+      "id": "geometry-engine",
+      "name": "geometry-engine",
+      "kind": "rust-crate",
+      "path": "roshera-backend/geometry-engine",
+      "purpose": "The B-Rep kernel — 'high-performance boundary representation engine'. The sink every non-leaf crate in the workspace reaches. Hosts the self-certifying invariant (ValidityCertificate), exact predicates, booleans/blends/sketch solver/tessellation, and the readable/ surface that makes Roshera an agent runtime for geometry.",
+      "key_modules": [
+        {"path": "roshera-backend/geometry-engine/src/primitives/topology_builder.rs", "role": "BRepModel host; certify_solid/compute_certificate/certificate; record_operation funnel (recorder + cert-invalidation seam)"},
+        {"path": "roshera-backend/geometry-engine/src/primitives/mass_properties.rs", "role": "exact analytic mass props via per-face Gauss quadrature (divergence theorem)"},
+        {"path": "roshera-backend/geometry-engine/src/operations", "role": "every kernel verb: boolean, extrude, revolve, sweep, loft, fillet, chamfer, offset/shell, transform, pattern, mould, section, trim, blend infra"},
+        {"path": "roshera-backend/geometry-engine/src/math/exact_predicates.rs", "role": "adaptive-precision exact predicates (robust orientation/sidedness)"},
+        {"path": "roshera-backend/geometry-engine/src/sketch2d", "role": "2D sketch primitives + constraint solver stack (Newton-Raphson, DR-plan decomposition)"},
+        {"path": "roshera-backend/geometry-engine/src/tessellation", "role": "mesh/curve/surface tessellation, curved CDT, LRU content-hashed cache"},
+        {"path": "roshera-backend/geometry-engine/src/perception/reconcile.rs", "role": "dual-eye truth/scene/semantic cross-check (advisory, one axis gates certificate)"},
+        {"path": "roshera-backend/geometry-engine/src/readable", "role": "agent-facing wire records, dimensioning, feature extraction, blackboard claim verification"},
+        {"path": "roshera-backend/geometry-engine/src/queries", "role": "spatial query core — 'queries never mutate the model' (point/region/relational/field/occupancy/raycast/measure/select)"},
+        {"path": "roshera-backend/geometry-engine/src/drawing", "role": "DXF/PDF/SVG drawing generation, layout, dimensioning, GD&T, section views"},
+        {"path": "roshera-backend/geometry-engine/src/gdt", "role": "GD&T model, DRF, fit, sidecar, verify"},
+        {"path": "roshera-backend/geometry-engine/src/harness", "role": "kernel measurement + ablation harness (boolean, brep_integrity, defect_injection, watertight, etc.)"}
+      ],
+      "interfaces": [{"kind": "lib", "detail": "Rust library; no direct network surface — reached only through api-server"}],
+      "depends_on": ["shared-types"],
+      "invariants": [
+        "Nine-conjunct ValidityCertificate::is_sound() re-derived from geometry on every certify_solid call, never asserted from history",
+        "Workspace lints deny unwrap_used/expect_used/panic in production code (lib.rs relaxes only under cfg(test))",
+        "record_operation funnel invalidates the certificate cache for every input/output solid on every mutating op, even with no recorder attached — 'no code path can observe a stale certificate'",
+        "Mass properties never fabricated: per-quantity Exactness enum (Exact/Approximate{method,bound}/Unavailable)",
+        "Generalized Euler–Poincaré check (V-E+F-R = 2(S-G)), not naive V-E+F=2"
+      ],
+      "notes": ["208 top-level integration test files + 5 Criterion benches; KNOWN_REDS.md currently empty (30 pre-existing reds fixed 2026-07-07, ratchet permanent)"]
+    },
+    {
+      "id": "session-manager",
+      "name": "session-manager",
+      "kind": "rust-crate",
+      "path": "roshera-backend/session-manager",
+      "purpose": "Session state, persistence, RBAC, and real-time collaboration support.",
+      "key_modules": [
+        {"path": "roshera-backend/session-manager/src/auth", "role": "JWT + API-key AuthManager"},
+        {"path": "roshera-backend/session-manager/src/database", "role": "DatabasePersistence trait + Postgres/SQLite impls"},
+        {"path": "roshera-backend/session-manager/src/permissions", "role": "RBAC permission checks"},
+        {"path": "roshera-backend/session-manager/src/collaboration", "role": "multi-user session collaboration"},
+        {"path": "roshera-backend/session-manager/src/timeline_integration", "role": "bridges session state to timeline-engine"}
+      ],
+      "interfaces": [{"kind": "lib", "detail": "Rust library, consumed by api-server and ai-integration"}],
+      "depends_on": ["shared-types", "timeline-engine"],
+      "invariants": ["session_manager is the sole AuthManager owner in AppState"],
+      "notes": []
+    },
+    {
+      "id": "timeline-engine",
+      "name": "timeline-engine",
+      "kind": "rust-crate",
+      "path": "roshera-backend/timeline-engine",
+      "purpose": "Event-sourced design history and replay — the timeline is a mould, not a parametric feature tree.",
+      "key_modules": [
+        {"path": "roshera-backend/timeline-engine/src/timeline.rs", "role": "core Timeline / timeline_impl"},
+        {"path": "roshera-backend/timeline-engine/src/branch", "role": "BranchManager, merge"},
+        {"path": "roshera-backend/timeline-engine/src/replay", "role": "rebuild BRepModel from events"},
+        {"path": "roshera-backend/timeline-engine/src/incremental", "role": "dirty-subtree parametric-DAG rebuild (#64)"},
+        {"path": "roshera-backend/timeline-engine/src/mould", "role": "parameter override events (#16)"},
+        {"path": "roshera-backend/timeline-engine/src/rebuild_certificate.rs", "role": "soundness re-measured on rebuild, never asserted"},
+        {"path": "roshera-backend/timeline-engine/src/recorder_bridge.rs", "role": "TimelineRecorder — sync-kernel to async MPSC bridge"},
+        {"path": "roshera-backend/timeline-engine/src/storage", "role": "DEAD CODE — file-based StorageEngine defined but never referenced outside its own mod.rs"},
+        {"path": "roshera-backend/timeline-engine/src/event_certificate.rs", "role": "EventCertificate type — defined, no production producer (see known_gaps_and_stale)"}
+      ],
+      "interfaces": [{"kind": "lib", "detail": "Rust library, consumed by session-manager, export-engine, ai-integration, verdict-harness, api-server"}],
+      "depends_on": ["shared-types", "geometry-engine"],
+      "invariants": ["RecordedOperation kind/params/typed-inputs-outputs only via with_input_*/with_output_* builders — never hand-assembled"],
+      "notes": ["storage/StorageEngine is dead code — live persistence is api-server/src/durability.rs + session-manager::database"]
+    },
+    {
+      "id": "api-server",
+      "name": "api-server",
+      "kind": "rust-crate",
+      "path": "roshera-backend/api-server",
+      "purpose": "Axum HTTP/WebSocket/SSE server; the star-topology orchestrator binary — 'contains no geometric logic' itself, delegates all geometry work to geometry-engine via the other crates.",
+      "key_modules": [
+        {"path": "roshera-backend/api-server/src/main.rs", "role": "9745-line entry point: build_router, AppState, boot sequence, most handlers inline"},
+        {"path": "roshera-backend/api-server/src/durability.rs", "role": "event-log durability: DatabaseEventSink::persist, boot_replay, quarantine logic"},
+        {"path": "roshera-backend/api-server/src/reconcile_task.rs", "role": "async 14-viewpoint dual-eye reconcile driver (VIEWPOINTS=14, line 51)"},
+        {"path": "roshera-backend/api-server/src/auth_middleware.rs", "role": "AuthPosture (Required default / InsecureDevBypass), path_is_exempt, scoped permission gates"},
+        {"path": "roshera-backend/api-server/src/blackboard.rs", "role": "BlackboardManager — per-scope notebooks, append-only event log"},
+        {"path": "roshera-backend/api-server/src/handlers/agent.rs", "role": "48 handler fns — thin REST projection of kernel readable/"},
+        {"path": "roshera-backend/api-server/src/handlers/timeline.rs", "role": "evidence-pack, timeline CRUD, branch management"}
+      ],
+      "interfaces": [
+        {"kind": "rest", "detail": "the full REST surface — see api_surface"},
+        {"kind": "ws", "detail": "GET /ws — realtime geometry/timeline/AI/session protocol"},
+        {"kind": "sse", "detail": "GET /api/logs/stream; POST /api/ai/command/stream"}
+      ],
+      "depends_on": ["shared-types", "geometry-engine", "session-manager", "timeline-engine", "ai-integration", "export-engine", "assembly-engine"],
+      "invariants": [
+        "AppState.model: Arc<RwLock<BRepModel>> is the single process-wide kernel instance",
+        "certified_response computes the certificate synchronously under the model write lock (memoized) before any response leaves the process",
+        "Dual-eye 14-viewpoint reconcile always runs off the write lock, fire-and-forget, never blocks a mutation response"
+      ],
+      "notes": ["Auth-exempt paths are exactly /, /health, /api/auth/login|register|refresh, and /ws + /ws/* (upgrade only)"]
+    },
+    {
+      "id": "ai-integration",
+      "name": "ai-integration",
+      "kind": "rust-crate",
+      "path": "roshera-backend/ai-integration",
+      "purpose": "Natural-language processing that translates/delegates to the kernel — never builds geometry itself. API-only AI (hosted providers only; local runtimes explicitly not permitted).",
+      "key_modules": [
+        {"path": "roshera-backend/ai-integration/src/providers", "role": "claude.rs, mock.rs, native_factory.rs, universal_endpoint.rs"},
+        {"path": "roshera-backend/ai-integration/src/executor.rs", "role": "parsed AI commands to kernel boolean/offset/transform + primitives"},
+        {"path": "roshera-backend/ai-integration/src/full_integration_executor.rs", "role": "broader executor: export, timeline, session, fillet/chamfer/revolve/extrude, tessellation"},
+        {"path": "roshera-backend/ai-integration/src/smart_router.rs", "role": "top-level command routing"},
+        {"path": "roshera-backend/ai-integration/src/pipeline", "role": "vision pipeline routing ViewportCapture"}
+      ],
+      "interfaces": [{"kind": "lib", "detail": "Rust library, wired into api-server behind ai_configured (set iff ANTHROPIC_API_KEY present at boot)"}],
+      "depends_on": ["shared-types", "geometry-engine", "session-manager", "timeline-engine", "export-engine"],
+      "invariants": ["ProviderUnavailable pattern: every entry point errors when the API key is absent — no offline fallback or mock outside cfg(test)/mock-providers feature"],
+      "notes": ["Only ClaudeProvider is actually compiled/implemented; config/vision.toml lists other provider profiles but they are not wired"]
+    },
+    {
+      "id": "export-engine",
+      "name": "export-engine",
+      "kind": "rust-crate",
+      "path": "roshera-backend/export-engine",
+      "purpose": "Export to CAD interchange formats: STL, OBJ, STEP, ROS (DXF/PDF drawing export lives in geometry-engine/drawing, not here).",
+      "key_modules": [
+        {"path": "roshera-backend/export-engine/src/formats.rs", "role": "validate_mesh_for_export gate (counts, normals, caps 15M verts/5M tris, index bounds) — AUDIT-H12"},
+        {"path": "roshera-backend/export-engine/src/formats/step", "role": "three-tier handler-dispatch STEP importer (tier1 planar/cylindrical, tier2 NURBS, tier3 shells/solid/assembly) + writer.rs exporter"},
+        {"path": "roshera-backend/export-engine/src/formats/ros.rs", "role": ".ros v3.1 writer: 128-byte header + mandatory HIST + mandatory PROV + optional GEOM/SIGN"},
+        {"path": "roshera-backend/export-engine/src/formats/timeline_chunk.rs", "role": "HIST chunk carrying TimelineEvent (why export-engine depends on timeline-engine, not ros-format alone)"}
+      ],
+      "interfaces": [{"kind": "lib", "detail": "Rust library, consumed by api-server and ai-integration"}],
+      "depends_on": ["shared-types", "geometry-engine", "timeline-engine", "ros-format"],
+      "invariants": ["STEP import pipeline is honest: no silent fallback — ImportReport names what happened"],
+      "notes": []
+    },
+    {
+      "id": "ros-format",
+      "name": "ros-format",
+      "kind": "rust-crate",
+      "path": "roshera-backend/ros-format",
+      "purpose": "Geometry-free building blocks for the .ros v3.1 format, split out so bridge/SDK consumers can read/write .ros without pulling in the kernel.",
+      "key_modules": [
+        {"path": "roshera-backend/ros-format/src/header.rs", "role": "128-byte format header"},
+        {"path": "roshera-backend/ros-format/src/aipr", "role": "AI-provenance PROV chunk"},
+        {"path": "roshera-backend/ros-format/src/signature.rs", "role": "Ed25519 signing"},
+        {"path": "roshera-backend/ros-format/src/access", "role": "RBAC/ABAC access control"},
+        {"path": "roshera-backend/ros-format/src/merkle.rs", "role": "merkle integrity structures"}
+      ],
+      "interfaces": [{"kind": "lib", "detail": "Rust library"}],
+      "depends_on": [],
+      "invariants": [],
+      "notes": ["Leaf crate. HIST chunk (needs TimelineEvent) intentionally stays in export-engine, not here"]
+    },
+    {
+      "id": "verdict-harness",
+      "name": "verdict-harness",
+      "kind": "rust-crate",
+      "path": "roshera-backend/verdict-harness",
+      "purpose": "Research harness for multi-agent coordination atop timeline-engine — resolves conflicting branch mutations via a simulated room. Explicitly not wired into production.",
+      "key_modules": [
+        {"path": "roshera-backend/verdict-harness/src/resolver.rs", "role": "VerdictResolver: Deterministic/Quorum/Veto/Authority"},
+        {"path": "roshera-backend/verdict-harness/src/room.rs", "role": "RoomSimulator — drains proposals per tick, commits as Operation::Generic{command_type:\"verdict.commit\"}"},
+        {"path": "roshera-backend/verdict-harness/src/types.rs", "role": "Proposal/Vote/VerdictOutcome"}
+      ],
+      "interfaces": [{"kind": "lib", "detail": "Rust library; exploratory, not consumed by api-server"}],
+      "depends_on": ["shared-types", "timeline-engine"],
+      "invariants": [],
+      "notes": ["Explicitly exploratory / research-only per source comments"]
+    },
+    {
+      "id": "assembly-engine",
+      "name": "assembly-engine",
+      "kind": "rust-crate",
+      "path": "roshera-backend/assembly-engine",
+      "purpose": "Kinematic assembly: instance + mate model, SE(3) mate solve, interference and swept-clearance checks (Parry3D-f64 backed). Sound assembly means interference-free across every reachable DOF configuration, not just the current pose.",
+      "key_modules": [
+        {"path": "roshera-backend/assembly-engine/src/solver.rs", "role": "SE(3) mate solve — analytic screw-calculus Jacobian, gauss_newton — 'the moat'"},
+        {"path": "roshera-backend/assembly-engine/src/interference.rs", "role": "static interference — Parry TriMesh, exact EPA penetration depth, convex-hull + VHACD decomposition"},
+        {"path": "roshera-backend/assembly-engine/src/sweep.rs", "role": "swept CCD — mate-derived joints, screw_between, Parry nonlinear TOI (Rapier CCD)"},
+        {"path": "roshera-backend/assembly-engine/src/grounding.rs", "role": "'no-float' grounding checks"},
+        {"path": "roshera-backend/assembly-engine/src/certificate.rs", "role": "AssemblyCertificate"}
+      ],
+      "interfaces": [{"kind": "lib", "detail": "Rust library, depended on only by api-server"}],
+      "depends_on": [],
+      "invariants": [],
+      "notes": ["Fully standalone: zero intra-workspace dependencies (only parry3d-f64 + serde, grep-confirmed) — an observation, not a defect"]
+    },
+    {
+      "id": "roshera-app",
+      "name": "roshera-app",
+      "kind": "react-app",
+      "path": "roshera-app",
+      "purpose": "Thin display layer — React 19 / Vite / TypeScript / Three.js viewport. Renders backend-tessellated mesh buffers only; no client-side geometry kernel or mesh generation.",
+      "key_modules": [
+        {"path": "roshera-app/src/App.tsx", "role": "top-level composition: TopBar, ViewportBridge, CommandPalette, LoginDialog + mode-conditional workspaces (Modeling/Assembly/Drawing)"},
+        {"path": "roshera-app/src/components/viewport", "role": "~30 files: CADViewport, CADMesh (server mesh rendering + sub-element pick), AgentEyePanel (live server-rendered agent views)"},
+        {"path": "roshera-app/src/lib/ws-client.ts", "role": "WSClient — reconnect exp backoff cap 10s unlimited, 30s heartbeat, in-band Authenticate on open"},
+        {"path": "roshera-app/src/lib/ws-bridge.ts", "role": "routes ServerMessages into zustand stores; full-scene resync on every reconnect"},
+        {"path": "roshera-app/src/lib/ws-schemas.ts", "role": "zod discriminated-union validation of every inbound WS frame"},
+        {"path": "roshera-app/src/stores", "role": "9 zustand stores: scene, blackboard, chat, command-palette, doc-mode, assembly, theme, units, ws"}
+      ],
+      "interfaces": [
+        {"kind": "rest", "detail": "domain REST clients: assembly-api, csketch-api, drawings-api, export-api, labels-api, measure-api, parts-api, section-api, sketch-api, timeline-events, units-api"},
+        {"kind": "ws", "detail": "/ws (primary realtime) + dev-only /ws/viewport-bridge (external-tool eyes, gated by env)"}
+      ],
+      "depends_on": ["api-server"],
+      "invariants": ["No client-side mesh generation; sub-element picks are server-resolved (client sends raw triangle index, backend replies with authoritative topology)"],
+      "notes": ["Drawings are fully server-rendered SVG injected via dangerouslySetInnerHTML (backend escape_xml-sanitized)"]
+    },
+    {
+      "id": "roshera-mcp",
+      "name": "roshera-mcp",
+      "kind": "mcp-server",
+      "path": "roshera-mcp",
+      "purpose": "MCP server exposing the kernel to agents. One ToolTable feeds both the direct MCP surface and the meta-funnel — no dual schema/handler maintenance.",
+      "key_modules": [
+        {"path": "roshera-mcp/src/surface.ts", "role": "CORE_SURFACE (18) + META_SURFACE (3) = MINIMAL_SURFACE (21, default)"},
+        {"path": "roshera-mcp/src/metatools.ts", "role": "find_tool (deterministic ranked search), describe_tool (full JSON schema), invoke (same validator + same handler as direct calls)"},
+        {"path": "roshera-mcp/src/workbench.ts", "role": "SWITCHABLE_BENCHES [sketch, assembly, drawing, analysis, labels]; LIVE_SURFACE_CEILING=35; long tail always reachable via invoke"},
+        {"path": "roshera-mcp/src/core.ts", "role": "BASE=ROSHERA_URL; ApiKey auth header; X-Roshera-Agent: Claude on every request; ambient perception (PERCEPTION_TIMEOUT_MS=4000, best-effort)"},
+        {"path": "roshera-mcp/src/registry.ts", "role": "token-billing (estimateTokens), BENCH_OF, EXPERIMENTAL stability set"},
+        {"path": "roshera-mcp/src/index.ts", "role": "consumeRegistry() drift-hash check against kernel-served /api/agent/tool-registry (FNV-1a-64 over canonical JSON)"}
+      ],
+      "interfaces": [{"kind": "mcp", "detail": "stdio MCP server (node roshera-mcp/dist/index.js); talks REST to api-server"}],
+      "depends_on": ["api-server"],
+      "invariants": ["invoke validates via the identical SDK normalizer as direct calls, then dispatches to the same handler — 'a meta-path call is never less checked'"],
+      "notes": ["Requires `npm run build` (dist/) + MCP reconnect after any tool change"]
+    },
+    {
+      "id": "roshera-eval",
+      "name": "roshera-eval",
+      "kind": "eval-harness",
+      "path": "roshera-eval",
+      "purpose": "Certificate-scored agent evaluation scenarios (AGENT-EVAL-α) — the harness measures the whole system, not just the model.",
+      "key_modules": [
+        {"path": "roshera-eval/lib/harness.mjs", "role": "DIMS=[correctness,soundness,honesty,performance]; CERT_DIMS; Checks collector (sound/unsound canaries); runScenario/runSuite/scorecard"},
+        {"path": "roshera-eval/scenarios", "role": "17 scenarios, each {id,title,dims,budgetMs,run} + pure oracle() dry-testable without a backend"},
+        {"path": "roshera-eval/lib/client.mjs", "role": "thin HTTP client, X-Roshera-Agent: AgentEvalAlpha, mirrors the exact REST shapes roshera-mcp uses (straight REST, not through MCP protocol)"},
+        {"path": "roshera-eval/run.mjs", "role": "preflights /health, runs suite, writes report.json, exit code = failed count"}
+      ],
+      "interfaces": [{"kind": "cli", "detail": "npm run (eval suite) / npm run test:oracle (offline, no backend)"}],
+      "depends_on": ["api-server"],
+      "invariants": ["request() never throws on 4xx/5xx — scenarios assert on honest refusals themselves"],
+      "notes": []
+    },
+    {
+      "id": "docs-site",
+      "name": "docs (GitHub Pages)",
+      "kind": "docs-site",
+      "path": "docs",
+      "purpose": "Public GitHub-Pages technical sheets describing the product claim, certificate, casebook, and envelope.",
+      "key_modules": [
+        {"path": "docs/index.html", "role": "The Claim"},
+        {"path": "docs/certificate.html", "role": "certificate explainer"},
+        {"path": "docs/casebook.html", "role": "case studies"},
+        {"path": "docs/envelope.html", "role": "verified-envelope explainer"},
+        {"path": "docs/DEPLOYMENT.md", "role": "partner-instance runbook: Docker Compose (postgres + backend + nginx SPA, single-origin proxy)"}
+      ],
+      "interfaces": [{"kind": "lib", "detail": "static site, no runtime dependency on the backend"}],
+      "depends_on": [],
+      "invariants": [],
+      "notes": []
+    },
+    {
+      "id": "red-gate-script",
+      "name": "red-gate.ps1",
+      "kind": "script",
+      "path": "roshera-backend/scripts/red-gate.ps1",
+      "purpose": "Required pre-merge CI gate: runs `cargo test -p geometry-engine --no-fail-fast`, diffs the result against KNOWN_REDS.md.",
+      "key_modules": [
+        {"path": "roshera-backend/scripts/red-gate.ps1", "role": "exit 0 allowlist-match / 1 NEW_RED / 2 RATCHET_VIOLATION / 3 both"}
+      ],
+      "interfaces": [{"kind": "cli", "detail": "invoked pre-merge; --lib green alone is explicitly insufficient"}],
+      "depends_on": ["geometry-engine"],
+      "invariants": ["Ratchet: KNOWN_REDS entries only removed on green, never added without a diagnosis doc"],
+      "notes": ["KNOWN_REDS.md currently empty (30 pre-existing reds fixed 2026-07-07)"]
+    }
+  ],
+  "dependency_edges": [
+    ["geometry-engine", "shared-types"],
+    ["session-manager", "shared-types"],
+    ["session-manager", "timeline-engine"],
+    ["timeline-engine", "shared-types"],
+    ["timeline-engine", "geometry-engine"],
+    ["export-engine", "shared-types"],
+    ["export-engine", "geometry-engine"],
+    ["export-engine", "timeline-engine"],
+    ["export-engine", "ros-format"],
+    ["ai-integration", "shared-types"],
+    ["ai-integration", "geometry-engine"],
+    ["ai-integration", "session-manager"],
+    ["ai-integration", "timeline-engine"],
+    ["ai-integration", "export-engine"],
+    ["verdict-harness", "shared-types"],
+    ["verdict-harness", "timeline-engine"],
+    ["api-server", "shared-types"],
+    ["api-server", "geometry-engine"],
+    ["api-server", "session-manager"],
+    ["api-server", "timeline-engine"],
+    ["api-server", "ai-integration"],
+    ["api-server", "export-engine"],
+    ["api-server", "assembly-engine"],
+    ["roshera-app", "api-server"],
+    ["roshera-mcp", "api-server"],
+    ["roshera-eval", "api-server"]
+  ],
+  "api_surface": {
+    "rest_groups": [
+      {
+        "prefix": "/api/geometry",
+        "routes_sample": ["POST /api/geometry", "GET /api/geometry/{id}", "DELETE /api/geometry/{id}", "POST /api/geometry/boolean", "POST /api/geometry/extrude|box|cylinder|cone|revolve|nurbs_loft", "POST /api/geometry/fillet|chamfer|shell|mirror|transform|pattern/linear|pattern/circular", "POST /api/geometry/import_step", "GET /api/geometry/{id}/properties"],
+        "auth": "required; create routes gated require_create_geometry, modify routes gated require_modify_geometry"
+      },
+      {
+        "prefix": "/api/sketch, /api/csketch",
+        "routes_sample": ["POST /api/sketch", "POST /api/sketch/{id}/point", "PUT /api/sketch/{id}/plane|tool", "POST /api/sketch/{id}/extrude|extrude_cut|revolve", "GET /api/sketch/{id}/regions|recognize|certify|render", "POST /api/csketch/{id}/constraint|solve|drag", "GET /api/csketch/{id}/dof|certify", "POST /api/csketch/{id}/trim|extend|offset|mirror|pattern"],
+        "auth": "required"
+      },
+      {
+        "prefix": "/api/assembly, /api/assemblies",
+        "routes_sample": ["POST /api/assembly", "POST /api/assembly/{id}/instance", "GET /api/assembly/{id}/view", "POST /api/assembly/{id}/connector|mate|solve|certify|dof|drag|interference", "POST/GET /api/assemblies"],
+        "auth": "required — three parallel surfaces: positioned-instance (assembly_instances.rs), kinematic mate-connector (assembly_mates.rs), mate-centric multi-part scenes (assembly_mgr.rs)"
+      },
+      {
+        "prefix": "/api/drawings, /api/parts",
+        "routes_sample": ["POST/GET /api/drawings", "GET /api/drawings/{id}/svg|pdf|dxf", "GET /api/drawings/{id}/quality|semantic|certificate", "POST /api/drawings/{id}/query", "POST/GET /api/parts", "GET /api/parts/{id}/drawing.svg"],
+        "auth": "required"
+      },
+      {
+        "prefix": "/api/blackboard",
+        "routes_sample": ["GET /api/blackboard", "POST /api/blackboard/entries", "PATCH|DELETE /api/blackboard/entries/{id}", "POST /api/blackboard/clear"],
+        "auth": "GET is open-read; mutating routes gated require_modify_geometry"
+      },
+      {
+        "prefix": "/api/agent",
+        "routes_sample": ["GET /api/agent/parts, /api/agent/parts/{id}, /mass, /profile, /obb, /render, /dimensioned, /features, /perception, /section, /best-view, /orbit", "POST /api/agent/verify-claim", "GET /api/agent/tool-registry", "POST /api/agent/faces/{face_id}/tolerance|datums|fcf|size-tolerance", "GET /api/agent/gdt, /verify", "POST /api/agent/measure, /point-query, /ray-query, /region-query", "GET /api/agent/faces/{id}, /edges/{id}, /hover/{id}", "GET/POST /api/agent/pointer", "POST /api/agent/select-face|select-edge, /color"],
+        "auth": "required — thin REST projection of kernel readable/, 48 handler fns"
+      },
+      {
+        "prefix": "/api/evidence-pack, /api/timeline, /api/branches",
+        "routes_sample": ["GET /api/evidence-pack", "POST /api/timeline/init|record", "GET /api/timeline/history|dependency-graph", "POST /api/timeline/mould, /parameter-name, /rebuild-certificate, /undo, /redo, /replay, /truncate, /clear, /checkpoint(s), /scrub", "POST /api/timeline/branch/create|switch", "GET/POST /api/branches", "POST /api/branches/merge, /name-suggestions"],
+        "auth": "required (not on the exempt path list)"
+      },
+      {
+        "prefix": "/api/export, /api/download",
+        "routes_sample": ["POST /api/export", "GET /api/download/{filename}"],
+        "auth": "required; gated require_export_geometry"
+      },
+      {
+        "prefix": "/api/sessions",
+        "routes_sample": ["POST/GET /api/sessions", "POST /api/sessions/{id}/join|leave"],
+        "auth": "required"
+      },
+      {
+        "prefix": "/api/auth",
+        "routes_sample": ["POST /api/auth/login|register|refresh (exempt)", "POST /api/auth/logout (NOT exempt)", "POST/GET /api/auth/keys", "DELETE /api/auth/keys/{id}"],
+        "auth": "login/register/refresh exempt; logout and key routes deliberately require auth"
+      },
+      {
+        "prefix": "/api/admin",
+        "routes_sample": ["POST /api/admin/users/{id}/permissions", "POST /api/admin/roles"],
+        "auth": "required, admin-scoped"
+      },
+      {
+        "prefix": "/api/tx",
+        "routes_sample": ["POST /api/tx/... (atomic multi-step plans via X-Roshera-Tx-Id)"],
+        "auth": "required"
+      },
+      {
+        "prefix": "/api/kernel, /api/frame, /api/hierarchy, /api/datums",
+        "routes_sample": ["GET /api/kernel/state", "GET /api/frame (server-rendered PNG for VLM agents)", "GET /api/hierarchy/{session_id}...", "GET/POST /api/datums..."],
+        "auth": "required"
+      },
+      {
+        "prefix": "/api/logs, /ws/viewport-bridge, /api/viewport",
+        "routes_sample": ["GET /api/logs/stream (SSE)", "GET /ws/viewport-bridge (dev-only, ROSHERA_DEV_BRIDGE=1)", "/api/viewport/* (dev-only)"],
+        "auth": "required except where noted"
+      }
+    ],
+    "websocket": {
+      "endpoint": "GET /ws",
+      "handler": "protocol::message_handlers (api-server), inlined in one match in handle_websocket_connection",
+      "client_messages": ["Authenticate", "GeometryCommand", "TimelineCommand", "AICommand", "SessionCommand", "ExportCommand", "Subscribe", "Unsubscribe", "Query", "Ping"],
+      "server_messages": ["Welcome", "Authenticated/AuthenticationFailed", "Success/Error", "GeometryUpdate", "TimelineUpdate", "SessionUpdate", "ExportComplete", "AIResponse", "SystemEvent", "Progress", "Pong"],
+      "auth": "in-band Authenticate frame sent as the first message after onopen (browsers cannot set WS upgrade headers); the upgrade path itself is on the exempt list"
+    },
+    "sse": [
+      "GET /api/logs/stream (main.rs:7610)",
+      "POST /api/ai/command/stream (main.rs:6599, token streaming)"
+    ],
+    "auth_exempt_paths": ["/", "/health", "/api/auth/login", "/api/auth/register", "/api/auth/refresh", "/ws", "/ws/*"]
+  },
+  "mcp_surface": {
+    "default_tools": [
+      "create_box", "create_cylinder", "create_sphere", "create_cone", "boolean", "revolve",
+      "get_part", "list_parts", "render_part", "scene_view", "section_view", "verify_part",
+      "mass_properties", "delete_part", "clear_parts", "workbench", "cad_program", "blackboard_add_entry",
+      "find_tool", "describe_tool", "invoke"
+    ],
+    "meta_funnel": "find_tool does deterministic ranked search (name-token IDF + curated synonym groups + bench filter + exact-name bonus, no LLM/embeddings). describe_tool returns the full JSON schema (same schema generator the SDK uses) plus purpose/bench/stability/token estimate. invoke validates arguments with the identical SDK normalizer as a direct call and dispatches to the same handler function — a meta-path call is never less checked than a direct one.",
+    "benches": {
+      "sketch": ["create_sketch", "sketch_add_shape", "sketch_points", "sketch_extrude", "plane_from_face", "psketch_begin", "psketch_add_entity", "psketch_constrain", "psketch_solve", "psketch_certify", "psketch_dof", "psketch_op", "psketch_extrude", "psketch_revolve"],
+      "assembly": ["assembly_verify", "assembly_create", "assembly_add_instance", "assembly_list_instances", "assembly_transform_instance", "assembly_view", "assembly_mate", "assembly_solve", "assembly_certify", "assembly_dof", "assembly_drag", "assembly_interference"],
+      "drawing": ["make_drawing", "drawing_read_semantics", "drawing_query", "drawing_export_sheet", "dimension_part", "gdt_datum", "gdt_fcf", "gdt_report"],
+      "analysis": ["point_query", "ray_query", "region_query", "occupancy_view", "part_coverage", "part_distance", "part_features", "ground_truth", "measure_faces", "verify_claim", "get_face", "get_revolve_profile"],
+      "labels": ["label_create", "label_list", "label_resolve", "label_rename", "label_delete", "propose_labels", "blackboard_add_entry", "blackboard_edit_entry", "blackboard_list", "blackboard_clear"]
+    },
+    "full_registry_size": "~95 tools measured in-repo; a stale source comment (index.ts:22) still says '~90-tool' — treat the measured figure as authoritative",
+    "notes": [
+      "SWITCHABLE_BENCHES = [sketch, assembly, drawing, analysis, labels]; core + meta are always on",
+      "LIVE_SURFACE_CEILING = 35 tool handles active at once; the long tail beyond that is always reachable via invoke, so bench switching is an attention optimizer, never a capability gate",
+      "EXPERIMENTAL stability set includes nurbs_loft, drill_pattern, timeline_mould, bind_parameter_name, rebuild_certificate, timeline_scrub, psketch_op, all assembly kinematic tools (verify/mate/solve/certify/dof/drag/interference), drawing_read_semantics, drawing_query",
+      "Layer 0 drift check: consumeRegistry() fetches /api/agent/tool-registry post-connect (3000ms timeout, never gates startup), recomputes an FNV-1a-64 hash over canonical JSON identical to the kernel's own agent_registry.rs hash — mismatch logs a 'hash SKEW' warning and falls back to the compiled local table",
+      "core.ts sends X-Roshera-Agent: Claude on every request so api-server's agent_author_layer attributes ops in the timeline"
+    ]
+  },
+  "certificate": {
+    "conjuncts": [
+      {"name": "brep_valid", "meaning": "validate_solid_scoped passes: Euler–Poincaré, manifold edges, pcurve references, orientation consistency, no degenerate/self-overlap faces"},
+      {"name": "watertight", "meaning": "tessellated mesh has zero boundary edges (manifold_report, chord 0.1, weld 1e-6)"},
+      {"name": "manifold", "meaning": "every mesh edge borders exactly 2 faces"},
+      {"name": "oriented", "meaning": "every directed mesh edge is traversed at most once — catches flipped-normal defects invisible to watertight+manifold alone"},
+      {"name": "self_intersection_free", "meaning": "coarse-chord (0.5) mesh self-intersection scan"},
+      {"name": "construction_consistent", "meaning": "linked source-sketch construction geometry stays co-located within a tolerance-band-expanded bbox (tri-state; only Inconsistent blocks soundness)"},
+      {"name": "eyes_consistent", "meaning": "dual-eye render-free Truth<->Semantic cross-check: every RecognizedFeature must reference a live face and sit on the surface type its label implies; fails closed"},
+      {"name": "tessellation.clean", "meaning": "display-tessellation quality: no degenerate facets, normal agreement >=0.98, analytic agreement >=0.999, zero off-surface facets"},
+      {"name": "mesh_quality.clean", "meaning": "zero boundary-crossing facets and max normal deviation <=40 degrees (aspect-ratio and min-angle are reported, not gated)"}
+    ],
+    "carried_not_gating": [
+      "labels_consistent — tri-state annotation-defect signal; annotation defects are not geometric defects so they don't fail is_sound()",
+      "model_debris_orphan_faces — a model-level fact (not this solid's fault), re-scanned on every certificate() call regardless of cache"
+    ],
+    "computed_at": "geometry-engine/src/primitives/topology_builder.rs — BRepModel::certificate (~2642, hot path clones cache under short RwLock read) / compute_certificate (~2687, private, always recomputes from geometry) / certify_solid (~2899, public wrapper)",
+    "memoization": "Solid.cached_certificate: RwLock<Option<ValidityCertificate>> (solid.rs ~534). Lock is never held across the heavy compute: short read to check cache, compute lock-free, short write to store; last-write-wins, idempotent recompute.",
+    "invalidation_seams": [
+      "record_operation funnel (topology_builder.rs ~2472): for every RecordedOperation input/output solid, invalidate_certificate() fires before the recorder-forward guard, so it runs even with no recorder attached (e.g. during timeline replay)",
+      "SolidStore::get_mut backstop (~1840): invalidates on any mutable borrow of a solid, regardless of call site",
+      "Sidecar writes self-invalidate, e.g. set_solid_construction (~2529)"
+    ],
+    "advisory_reconcile": "The 14-viewpoint dual-eye reconcile (api-server/src/reconcile_task.rs, VIEWPOINTS=14 at line 51) is advisory-severity and explicitly documented to never affect is_sound(). It runs off the write lock on an owned ModelSnapshot, fire-and-forget, capped at MAX_CONCURRENT_RECONCILES=2. It is distinct from conjunct 7 (eyes_consistent/TruthSemantic), which is synchronous, render-free, and is the one dual-eye axis that does gate the certificate. render/viewpoint.rs (EYE-6, viewpoint-entropy best-view) is a separate on-demand selector, unrelated to the fixed 14.",
+    "mass_properties_provenance": "MassPropertiesMethod is Analytical (exact divergence-theorem, planar solids) or Tessellated{rel_tolerance} (Tonon 2004, approx 5e-3 at fine tessellation). Each quantity (volume, center_of_mass, inertia) carries its own Exactness — Exact / Approximate{method, rel_error_bound} / Unavailable — independently, so e.g. volume can be exact while inertia is mesh-estimated. The kernel refuses to fabricate a mass-property number rather than silently degrade its exactness label."
+  },
+  "persistence": {
+    "tables": [
+      "users (auth)", "sessions", "objects (per-session cache, PK (id, session_id))", "permissions (RBAC)",
+      "tokens (JWT/refresh hashes)", "api_keys (FK-free user_id by design — agent keys have no users row)",
+      "timeline_events (durability log; FK-free; data JSONB = whole serialized TimelineEvent; sequence_number BIGINT is the replay key; indexed on (session_id, sequence_number))",
+      "durable_branches (branch metadata surviving restart)"
+    ],
+    "durability_model": "Append-only event log via api-server/src/durability.rs DatabaseEventSink::persist (one transactional row per TimelineEvent, written by TimelineRecorder's drain worker off the kernel's synchronous path). Boot replay loads all rows for a fixed single-tenant DURABILITY_SESSION_ID = 'roshera-durability-main', ordered by sequence_number, then rebuilds the BRepModel by replaying events (recorder detached during replay — no re-record/re-persist loop). Quarantine: certify_rebuild re-measures soundness from a full trial replay; if a break or corrupt row is found, only the clean prefix (sequence < break) is served, the break is named in logs and via GET /api/durability/status, and the tail is refused rather than silently served.",
+    "in_memory_only": [
+      "uuid_to_local / local_to_uuid ID maps (fresh UUIDs minted every boot)",
+      "consumed_uuids (undo tombstones)",
+      "solid_colors / solid_profiles (re-derived from the durable log at boot; the map itself is volatile)",
+      "reconcile caches, request/command/performance metrics, viewport_bridge state",
+      "transaction manager state, sketch/csketch sessions",
+      "the BRepModel itself — only durability path is a full event replay at boot, there is no snapshot"
+    ],
+    "durability_off_behavior": "ROSHERA_DURABILITY=off (case-insensitive match on 'off') yields a fully volatile scratch server: blank boot (no replay), all persist calls become no-ops, and API-key rehydration is skipped entirely."
+  },
+  "auth_model": {
+    "posture": "AuthPosture::Required is the default — an empty environment enforces auth and returns 401 before any handler runs. AuthPosture::InsecureDevBypass activates only via ROSHERA_DEV_INSECURE=1|true, logs a loud warning every boot, and injects a permissive sentinel AuthInfo (also bypasses the 100 req/min rate limit).",
+    "schemes": [
+      "Bearer <jwt> -> validate_jwt",
+      "ApiKey <key> -> validate_api_key",
+      "Both schemes are validated through the single session-manager AuthManager"
+    ],
+    "key_lifecycle": "provision_api_key_handler (auth.rs:471) writes through AuthManager::provision_api_key; list (570) and revoke (605) are separate handlers. Keys are rehydrated from the durable api_keys table at boot (gated on durability_enabled) via attach_api_key_store + load_persisted_api_keys, so keys and their revoked state survive a restart. There is no provisioning HTTP route beyond these handlers and no self-service revocation endpoint documented for agents.",
+    "exempt_paths": ["/", "/health", "/api/auth/login", "/api/auth/register", "/api/auth/refresh", "/ws", "/ws/*"],
+    "ws_auth": "in-band Authenticate frame — the WS upgrade itself is exempt (browsers cannot set upgrade headers), so the client must send {type:'Authenticate', token} as its first message after onopen; the command surface is gated per-connection on that frame, not on the upgrade request"
+  },
+  "flows": [
+    {
+      "id": "mutating-operation",
+      "name": "Mutating operation (e.g. create_cylinder / boolean)",
+      "steps": [
+        {"n": 1, "where": "roshera-mcp", "what": "tool call (create_cylinder / boolean) goes through shared api() in core.ts", "file": "roshera-mcp/src/tools/create.ts, roshera-mcp/src/tools/modify.ts, roshera-mcp/src/core.ts"},
+        {"n": 2, "where": "roshera-mcp -> api-server", "what": "fetch with X-Roshera-Agent: Claude + Authorization: ApiKey <key> (or none under dev-insecure)", "file": "roshera-mcp/src/core.ts"},
+        {"n": 3, "where": "api-server routing", "what": "POST /api/geometry/cylinder -> create_cylinder_primitive; POST /api/geometry/boolean -> boolean_operation, which runs on a deep clone in spawn_blocking under a per-class time budget off the write lock (Task #41), then swaps the mutated clone back under a brief write guard", "file": "roshera-backend/api-server/src/main.rs:3650, main.rs:1448, bounded_exec.rs"},
+        {"n": 4, "where": "geometry-engine", "what": "TopologyBuilder::create_cylinder_3d / operations::boolean::boolean_operation executes; every kernel entry point ends with model.record_operation(...) which invalidates the certificate cache for all input/output solids and forwards to the attached OperationRecorder", "file": "roshera-backend/geometry-engine/src/primitives/topology_builder.rs:2472"},
+        {"n": 5, "where": "api-server, under the model write lock", "what": "certified_response tessellates then synchronously certifies the solid (memoized; cold path recomputes) and embeds the perception line (sound/brep_valid/watertight/manifold/oriented/self_intersection_free/verdict/cert) in the JSON response — the chokepoint", "file": "roshera-backend/api-server/src/main.rs:1171"},
+        {"n": 6, "where": "timeline-engine", "what": "record_operation forwards to TimelineRecorder::record, a non-blocking try_send into a bounded 16,384-slot MPSC channel; a background tokio worker drains it FIFO into Timeline::add_operation, minting a sequence_number and appending a TimelineEvent", "file": "roshera-backend/timeline-engine/src/recorder_bridge.rs"},
+        {"n": 7, "where": "api-server durability", "what": "the same drain worker calls DatabaseEventSink::persist (off the kernel's sync path) to append the event as a Postgres row keyed on DURABILITY_SESSION_ID", "file": "roshera-backend/api-server/src/durability.rs"},
+        {"n": 8, "where": "api-server response", "what": "returns {success, solid_id, perception, object, stats}; the MCP tool returns {object_uuid, part_id, placement}", "file": "roshera-backend/api-server/src/main.rs"},
+        {"n": 9, "where": "api-server -> roshera-app", "what": "broadcast_object_created sends an ObjectCreated frame on the process-wide broadcaster to every /ws client; ws-bridge queues the upsert into the scene store for CADViewport (dual-eye reconcile fires separately, async, never blocking this response)", "file": "roshera-backend/api-server/src/main.rs:7426, roshera-app/src/lib/ws-bridge.ts"}
+      ]
+    },
+    {
+      "id": "certificate-lifecycle",
+      "name": "Certificate lifecycle",
+      "steps": [
+        {"n": 1, "where": "geometry-engine", "what": "certify_solid wraps certificate(): hot path clones the RwLock-cached certificate; cold path calls compute_certificate and stores the result (last-write-wins, lock never held across compute)", "file": "roshera-backend/geometry-engine/src/primitives/topology_builder.rs:2899"},
+        {"n": 2, "where": "geometry-engine", "what": "invalidation fires from three seams: the record_operation funnel over inputs/outputs, set_solid_construction, and the SolidStore::get_mut backstop on any mutable borrow", "file": "roshera-backend/geometry-engine/src/primitives/topology_builder.rs:2472-2490, 2529"},
+        {"n": 3, "where": "api-server, async, advisory", "what": "certified_response spawns reconcile_task::spawn_reconcile fire-and-forget: a brief read lock takes a ModelSnapshot, drops the guard, renders 14 Fibonacci-sphere viewpoints, and runs reconcile_full (truth cert vs scene render vs semantic features), caching by (solid_id, perception_fingerprint) under a 2-way concurrency semaphore — never blocks the mutation response", "file": "roshera-backend/api-server/src/reconcile_task.rs"},
+        {"n": 4, "where": "timeline-engine", "what": "rebuild_certificate::certify_rebuild produces a RebuildCertificate with per-feature FeatureStatus (Rebuilt/Unaffected/Failed/Dangling/Blocked/Stale) and a re-measured, never-asserted global is_sound, rooted at the earliest active mould target", "file": "roshera-backend/timeline-engine/src/rebuild_certificate.rs"},
+        {"n": 5, "where": "timeline-engine", "what": "EventCertificate is defined (from_solid_certificate/skipped_solid/for_sketch/for_assembly + store_in) but has no production producer: store_in is called exactly once, from the module's own #[cfg(test)]; the only production consumer, from_metadata, always reads None, so every real evidence-pack event carries a null certificate plus certificate_absent_reason", "file": "roshera-backend/timeline-engine/src/event_certificate.rs:407"}
+      ]
+    },
+    {
+      "id": "durability-and-boot",
+      "name": "Durability & boot",
+      "steps": [
+        {"n": 1, "where": "api-server main()", "what": "builds a fresh BRepModel, then constructs DatabaseConfig{PostgreSQL, run_migrations:true} and connects via PostgresDatabase::new", "file": "roshera-backend/api-server/src/main.rs"},
+        {"n": 2, "where": "session-manager", "what": "'migrations' means inline CREATE TABLE IF NOT EXISTS statements in run_migrations(), not sqlx::migrate!", "file": "roshera-backend/session-manager/src/database.rs:297,330"},
+        {"n": 3, "where": "api-server durability", "what": "boot_replay: ROSHERA_DURABILITY=off -> Disabled (blank boot); else restore branch metadata, load all timeline events, empty -> Empty; deserialize rows tracking the earliest corrupt row; certify_rebuild finds the first replay break", "file": "roshera-backend/api-server/src/durability.rs:212"},
+        {"n": 4, "where": "api-server durability", "what": "quarantine boundary = min(first replay break, first corrupt row); if present, only the clean prefix (sequence < boundary) is served as Quarantined{...}, logged as an error and never hidden; otherwise Active{events_replayed}. Chosen events rehydrate with original ids/sequences, the recorder stays detached during replay (no re-record/re-persist), and a fresh UUID is minted per restored solid", "file": "roshera-backend/api-server/src/durability.rs"},
+        {"n": 5, "where": "api-server", "what": "GET /api/durability/status reports {session_id, durability_enabled, quarantined, status} — quarantine is always surfaced, never hidden", "file": "roshera-backend/api-server/src/main.rs:7646"},
+        {"n": 6, "where": "api-server", "what": "API key rehydration (gated on durability_enabled): attach_api_key_store + load_persisted_api_keys restores real active/revoked flags", "file": "roshera-backend/api-server/src/main.rs:8463"}
+      ]
+    },
+    {
+      "id": "auth",
+      "name": "Auth",
+      "steps": [
+        {"n": 1, "where": "api-server", "what": "register: username validated (>=3 alnum/_/-), user_id = 'user_{username}', duplicate check, Argon2 hash_password + complexity check, save_user", "file": "roshera-backend/api-server/src/handlers/auth.rs"},
+        {"n": 2, "where": "api-server", "what": "login: load UserData, is_active check, Argon2 verify_password, create_token (SessionToken with embedded JWT refresh) returns {token, refresh_token, expires_in, permissions}", "file": "roshera-backend/api-server/src/handlers/auth.rs"},
+        {"n": 3, "where": "api-server", "what": "path_is_exempt gates exactly /, /health, /api/auth/login|register|refresh, /ws and /ws/* (upgrade only). Required posture: Authorization header dispatches to validate_jwt (Bearer) or verify_api_key (ApiKey), else 401 AUTH_INVALID_FORMAT. InsecureDevBypass injects dev_auth_info with a loud warning", "file": "roshera-backend/api-server/src/auth_middleware.rs:187"},
+        {"n": 4, "where": "api-server", "what": "key lifecycle: provision_api_key_handler / list / revoke; keys survive restart per the durability boot flow", "file": "roshera-backend/api-server/src/handlers/auth.rs:471,570,605"},
+        {"n": 5, "where": "roshera-mcp", "what": "sends the ApiKey scheme only (stdio server credential model) — no Bearer/JWT flow in MCP itself", "file": "roshera-mcp/src/core.ts"}
+      ]
+    },
+    {
+      "id": "blackboard",
+      "name": "Blackboard",
+      "steps": [
+        {"n": 1, "where": "roshera-mcp / roshera-app", "what": "blackboard_add_entry -> POST /api/blackboard/entries {text, author, part_id?, scope?}; list/edit/clear counterparts, scoped via ?scope= or ?part_id=", "file": "roshera-mcp/src/tools/blackboard.ts"},
+        {"n": 2, "where": "api-server", "what": "BlackboardScope is Part{id}/Assembly{id}/Document; BlackboardManager keeps per-scope notebooks (lines + append-only BlackboardEvent log of Add/Edit/Delete)", "file": "roshera-backend/api-server/src/blackboard.rs:321,538"},
+        {"n": 3, "where": "roshera-app", "what": "blackboard-api.ts polls every 2500ms, re-hydrates on scope change, applies remote snapshot only when the fetched scope is the active one; the adapter's save() diffs the append-only event log against a baseline into a single POST/PATCH/DELETE", "file": "roshera-app/src/lib/blackboard-api.ts"},
+        {"n": 4, "where": "roshera-app", "what": "Blackboard.tsx reads the store; activeScope is driven by viewport selection (part scope vs document scope)", "file": "roshera-app/src/components/panels/Blackboard.tsx"}
+      ]
+    },
+    {
+      "id": "evidence-pack",
+      "name": "Evidence pack",
+      "steps": [
+        {"n": 1, "where": "api-server", "what": "GET /api/evidence-pack (authenticated, not an open path) dispatches to get_evidence_pack", "file": "roshera-backend/api-server/src/main.rs:9453, handlers/timeline.rs:1870"},
+        {"n": 2, "where": "api-server", "what": "resolves ?branch=/?notebook=, first calls timeline_recorder.flush() to drain any in-flight MPSC events so the pack reflects everything recorded so far, then reads branch events sorted by sequence", "file": "roshera-backend/api-server/src/handlers/timeline.rs"},
+        {"n": 3, "where": "api-server", "what": "builds operations[] (sequence, event_id, op_kind, params verbatim, timestamp, author, author_kind, certificate = EventCertificate::from_metadata), final_state.parts[] (mass properties per live solid, provenance-labeled), notebook (blackboard snapshot verbatim), recomputed (separately labeled EvidenceRecompute from certify_rebuild), and a manifest (generated_at, kernel_version, scope, operation_count, durability status)", "file": "roshera-backend/api-server/src/handlers/timeline.rs:1904-1911"},
+        {"n": 4, "where": "api-server", "what": "honesty rules are enforced in code: an absent certificate is null plus certificate_absent_reason (never fabricated — and today fires on every real event per the EventCertificate gap); a degenerate solid gets null mass_properties plus a reason; the recompute note literally reads 'Re-measured NOW ... NOT recorded history'; quarantine state is always surfaced via manifest.durability, never omitted", "file": "roshera-backend/api-server/src/handlers/timeline.rs"}
+      ]
+    },
+    {
+      "id": "eval",
+      "name": "Eval",
+      "steps": [
+        {"n": 1, "where": "roshera-eval", "what": "run.mjs preflights /health, loads the 17-scenario index, runs the suite, prints a scorecard, clears parts, writes report.json; exit code equals the number of failed scenarios", "file": "roshera-eval/run.mjs"},
+        {"n": 2, "where": "roshera-eval", "what": "lib/client.mjs is a thin HTTP client sending X-Roshera-Agent: AgentEvalAlpha over the same REST surface roshera-mcp uses — straight REST, not through the MCP protocol", "file": "roshera-eval/lib/client.mjs"},
+        {"n": 3, "where": "roshera-eval", "what": "each scenario exports {id, title, dims, budgetMs, run(ctx, t)} where ctx = {c, time, geom} and t = Checks", "file": "roshera-eval/scenarios"},
+        {"n": 4, "where": "roshera-eval", "what": "four scoring dimensions: correctness (analytic/structural oracles), soundness (t.sound asserts perception.sound===true against CERT_DIMS), honesty (t.unsound asserts the kernel correctly refused, e.g. the saddle canary scenario 08), performance (budgetMs wall-clock)", "file": "roshera-eval/lib/harness.mjs"}
+      ]
+    },
+    {
+      "id": "drawing",
+      "name": "Drawing",
+      "steps": [
+        {"n": 1, "where": "roshera-mcp", "what": "make_drawing -> POST /api/parts/{part_id}/drawing?name=", "file": "roshera-mcp/src/tools/io.ts"},
+        {"n": 2, "where": "api-server", "what": "create_part_drawing(_by_uuid) -> create_part_drawing_inner -> build_standard_drawing_off_lock: a brief read lock takes a ModelSnapshot, drops the guard, then the heavy build runs on spawn_blocking off the lock", "file": "roshera-backend/api-server/src/main.rs:9007, drawing_mgr.rs:664,589"},
+        {"n": 3, "where": "geometry-engine", "what": "standard_drawing_auto builds pass 1 (unit-scale extents for Front/Top/Right/Iso, pick_sheet + layout_four_view) then pass 2 per projection (HLR visibility, dimensions, centerlines), dedups dimensions globally per ISO-129, attaches the hole table, attaches SECTION A-A when bore sites exist, attaches GD&T annotations and ISO-286-style tolerances, and places the pictorial isometric last via free-space search", "file": "roshera-backend/geometry-engine/src/drawing/dimensioning.rs:909,564"},
+        {"n": 4, "where": "api-server", "what": "verify_drawing runs a quality check, the drawing is inserted into state.drawings, and a drawing.create_from_part timeline event is recorded with the source solid as input so the sheet is downstream in the feature DAG (mould marks it dirty and re-derives)", "file": "roshera-backend/api-server/src/drawing_mgr.rs"},
+        {"n": 5, "where": "roshera-mcp / api-server", "what": "drawing_export_sheet -> GET /api/drawings/{id}/pdf -> export_pdf -> render_drawing_pdf returns bytes; dxf/svg are symmetric", "file": "roshera-backend/api-server/src/drawing_mgr.rs:859, geometry-engine/src/drawing/pdf.rs"},
+        {"n": 6, "where": "roshera-mcp", "what": "a separate certified-readback surface (drawing_read_semantics/drawing_query -> /semantic, /query) re-certifies against the LIVE model via certify_off_lock and honestly refuses render_only or unprovenanced content", "file": "roshera-mcp/src/tools/drawing.ts"}
+      ]
+    },
+    {
+      "id": "assembly",
+      "name": "Assembly",
+      "steps": [
+        {"n": 1, "where": "roshera-mcp", "what": "create, add_instance, list_instances, transform_instance, mate, solve, certify, dof, drag, interference, view, plus a one-shot assembly_verify", "file": "roshera-mcp/src/tools/assembly.ts"},
+        {"n": 2, "where": "api-server", "what": "create_assembly / add_instance write true-assembly instances that reference shared kernel geometry by part_id/transform — no boolean merge", "file": "roshera-backend/api-server/src/assembly_instances.rs:389,441"},
+        {"n": 3, "where": "api-server", "what": "create_mate writes the assembly doc under the model+doc write lock, then records the op_mate_add event after dropping the locks", "file": "roshera-backend/api-server/src/assembly_mates.rs:1374"},
+        {"n": 4, "where": "api-server + assembly-engine", "what": "solve -> solve_core -> Assembly::solve(): rigid-body blocks + mate/driven-joint index set, analytic screw-calculus Jacobian, gauss_newton iterates g->0; success records op_solve with poses", "file": "roshera-backend/api-server/src/assembly_mates.rs:1449, assembly-engine/src/solver.rs, jacobian.rs"},
+        {"n": 5, "where": "api-server + assembly-engine", "what": "certify: prepare_certify resolves connectors and tessellates under locks, then the heavy certificate (mates-consistent, fully-grounded, DOF/mobility, static interference, swept clearance) runs off the locks on an owned snapshot — the same off-lock discipline as reconcile", "file": "roshera-backend/api-server/src/assembly_mates.rs:1477"},
+        {"n": 6, "where": "assembly-engine", "what": "static interference uses Parry TriMesh per instance local frame with exact EPA penetration depth on convex-hull/VHACD pieces; swept interference derives mechanisms/joints from mates and certifies continuous clearance via Parry nonlinear TOI (Rapier CCD machinery) between exact screw motions, producing first_contact and min_certified_clearance", "file": "roshera-backend/assembly-engine/src/interference.rs, sweep.rs"},
+        {"n": 7, "where": "api-server", "what": "view -> view_assembly composes one PNG per instance (part_id -> kernel solid + transform + color) via render::render_instances_dir — geometry is referenced per-instance, never merged", "file": "roshera-backend/api-server/src/assembly_instances.rs:531"}
+      ]
+    }
+  ],
+  "eval_corpus": [
+    {"id": "01", "title": "Spur gear m=2 z=16 + keyed bore", "one_line": "chi=0, 293 faces, volume approx 5555.8 shoelace-checked, mass approx 0.0436kg"},
+    {"id": "02", "title": "Rao-bell nozzle", "one_line": "revolve+wall2; chi=0; volume approx 16309.7; meridian 320mm^2"},
+    {"id": "03", "title": "Injector plate, 36 bores", "one_line": "chi=-70, genus 36; volume must equal the analytic value"},
+    {"id": "04", "title": "Bulkhead, 4 pockets + fillet-all", "one_line": "pre-fillet volume 51200 exact; result must be graceful and sound"},
+    {"id": "05", "title": "Pocketed + bored block", "one_line": "56000 exact volume; chi=-6"},
+    {"id": "06", "title": "Hub flange GD&T + drawing", "one_line": "flatness/perpendicularity/position in spec; drawing quality check passed"},
+    {"id": "07", "title": "STEP round-trip blended flange", "one_line": "re-imported solid must still be sound"},
+    {"id": "08", "title": "Cross-bore saddle (#35 guard)", "one_line": "Steinmetz oracle; the former honesty canary is now a soundness tripwire"},
+    {"id": "09", "title": "Gear four-view drawing", "one_line": "under 90 seconds; /health stays live under load"},
+    {"id": "10", "title": "Kinematic hinge + slider", "one_line": "floating part is named, conflict is witnessed, unbounded sweep refuses"},
+    {"id": "11", "title": "Certified sketch to bore (#45)", "one_line": "0 DOF case; over-constrained case reports Conflicting with a witness"},
+    {"id": "12", "title": "Mass-properties provenance", "one_line": "closed-form result matches; mesh-derived result is labeled Approximate, never Exact"},
+    {"id": "13", "title": "Epsilon=1e-6 coincident-face union", "one_line": "chi=2; a sound verdict may never mask open or non-manifold edges"},
+    {"id": "14", "title": "Quadric SSI cylinder-sphere bite + near-tangency", "one_line": "an unsound result must name the defect; near-tangency refuses rather than guesses"},
+    {"id": "15", "title": "Certified drawing comprehension", "one_line": "hatch ink refuses render_only; unprovenanced content refuses"},
+    {"id": "16", "title": "Shelf bracket, FDM PLA", "one_line": "sound at every step; stress/deflection/orientation/wall/overhang are declared unscored"},
+    {"id": "17", "title": "NEMA17 motor mount, PETG", "one_line": "f1>=120Hz modal + stress declared unscored, never fake-scored"}
+  ],
+  "known_gaps_and_stale": [
+    {
+      "finding": "EventCertificate has no production producer",
+      "evidence": "timeline-engine/src/event_certificate.rs defines store_in(metadata); grepping the whole roshera-backend workspace shows store_in( is called exactly once, from the module's own #[cfg(test)] (event_certificate.rs:407). The only production consumer is the read-side from_metadata.",
+      "implication": "Every real evidence-pack event's certificate field reads None and is served as null plus a certificate_absent_reason — evidence packs today carry no per-operation certificates for real activity, only for the module's own test."
+    },
+    {
+      "finding": "timeline-engine's storage/ StorageEngine is dead code",
+      "evidence": "A file-based StorageEngine (event_log/index/snapshot) is defined in timeline-engine/src/storage but grep-confirmed never referenced outside its own mod.rs.",
+      "implication": "Live persistence is entirely api-server/src/durability.rs (DatabaseEventSink) + session-manager::database — the storage/ module is inert and should not be assumed to be the durability path."
+    },
+    {
+      "finding": "Backend CLAUDE.md says 7 crates; the tree has 10",
+      "evidence": "roshera-backend/Cargo.toml workspace members list 10 crates including ros-format, verdict-harness, and assembly-engine, which the backend-local CLAUDE.md does not mention.",
+      "implication": "The backend-local documentation is stale relative to the actual workspace shape; don't trust its crate inventory without checking Cargo.toml."
+    },
+    {
+      "finding": "enforce_permission_layer's doc-comment describes a removed toggle",
+      "evidence": "The doc-comment on api-server's enforce_permission_layer still describes the ROSHERA_REQUIRE_AUTH soft/strict toggle; the code no longer reads that variable — scope checks (require_create/modify/export_geometry) are unconditional today.",
+      "implication": "Anyone reading only the comment will believe permission enforcement is configurable when it is not; the doc needs to be corrected to match current unconditional behavior."
+    },
+    {
+      "finding": ".mcp.json carries no ROSHERA_API_KEY",
+      "evidence": "Repo-root .mcp.json configures the roshera MCP server with env ROSHERA_URL=http://localhost:8081 and no ROSHERA_API_KEY.",
+      "implication": "This configuration only functions against a backend running with ROSHERA_DEV_INSECURE=1 — it is a dev-insecure assumption baked into the checked-in MCP config, not something that works against a Required-posture backend."
+    },
+    {
+      "finding": "assembly-engine is fully standalone (zero workspace deps)",
+      "evidence": "grep-confirmed: assembly-engine's Cargo.toml pulls in only parry3d-f64 + serde, no intra-workspace crate dependencies, even though api-server depends on it.",
+      "implication": "This is an observation, not a defect — assembly-engine is architecturally decoupled from the rest of the kernel/timeline stack and could in principle be extracted or reused independently."
+    },
+    {
+      "finding": "Boot replay mints fresh UUIDs — identity is not preserved across a restart",
+      "evidence": "durability.rs boot_replay rehydrates events with their original ids/sequences into the timeline, but register_id_mapping mints a brand-new UUID per restored solid rather than reusing the pre-restart UUID.",
+      "implication": "Any external reference to a solid's UUID from before a restart (e.g. a client-held object_uuid) is invalidated by a restart. Documented as in-scope for Slice 1 durability, not yet closed."
+    },
+    {
+      "finding": "No durability snapshots — every boot is a full event replay",
+      "evidence": "durability.rs has no snapshot mechanism; boot_replay always replays the entire timeline_events table for DURABILITY_SESSION_ID from scratch.",
+      "implication": "Boot time scales with total history size; this is documented as acceptable for the current alpha stage but will need snapshotting before history grows large."
+    },
+    {
+      "finding": "Chamfer on closed (rim/seam) edges only supports the Plane-Cylinder face pair",
+      "evidence": "geometry-engine/src/operations/chamfer.rs:1118-1123 (chamfer_distances_for_closed_edge): if both adjacent faces are cylinders, or neither is, the function returns OperationError::NotImplemented('Closed-edge chamfer ... currently supports only a Plane-Cylinder pair in this slice'); the open-edge chamfer path is unaffected.",
+      "implication": "Chamfering a closed rim edge between two non-plane-cylinder face kinds (e.g. cone-cylinder, cylinder-cylinder, or a rim entirely between curved faces) is refused today rather than attempted — a scoped gap, not a silent wrong answer."
+    }
+  ],
+  "glossary": {
+    "certificate": "ValidityCertificate — a nine-conjunct, geometry-derived soundness verdict recomputed on demand (never asserted from history) for every solid; is_sound() requires all nine conjuncts to hold, with two further fields (labels_consistent, model_debris_orphan_faces) carried but not gating.",
+    "perception line": "The compact sound/brep_valid/watertight/manifold/oriented/self_intersection_free/verdict/cert summary embedded in every mutating-operation response so an agent gets the certificate inline, without a follow-up call.",
+    "dual-eye reconcile": "A cross-check between the kernel's own geometric Truth, a rendered Scene, and the labeled Semantic feature set, run along four axes (TruthScene, Coverage, TruthSemantic, SceneSemantic); only TruthSemantic (conjunct 7, eyes_consistent) is synchronous and gates the certificate — the other axes drive the 14-viewpoint async reconcile, which is advisory-only.",
+    "typed refusal": "The kernel's discipline of returning a specific, named error (e.g. DisjointDifference, EmptyResult, BlendFailed, Unavailable mass property, Quarantined durability state) rather than a generic failure or a silently-approximated answer, whenever an operation falls outside its verified envelope.",
+    "ratchet / KNOWN_REDS": "KNOWN_REDS.md is a machine-readable allowlist of pre-existing failing tests; entries may only be removed once a test goes green and may never be added without an accompanying diagnosis doc — the allowlist is currently empty.",
+    "red-gate": "roshera-backend/scripts/red-gate.ps1 — the required pre-merge CI gate that runs the geometry-engine test suite and diffs the result against KNOWN_REDS.md, exiting non-zero on any new or ratchet-violating red.",
+    "timeline mould": "The mould mechanism (timeline-engine/src/mould) lets a parameter on a past event be overridden; incremental.rs then does a dirty-subtree rebuild of only the downstream-affected parts of the model rather than replaying the whole timeline from scratch.",
+    "quarantine": "The durability state entered when boot_replay finds a corrupt or broken event row: only the clean prefix of history is served, the break point is named in logs and via /api/durability/status, and the remainder is refused rather than silently dropped or served anyway.",
+    "workbench / bench": "roshera-mcp's mechanism for toggling groups of related MCP tool handles on/off (sketch, assembly, drawing, analysis, labels) to keep the live tool surface within an attention budget (LIVE_SURFACE_CEILING=35); it is never a capability gate because every tool remains reachable through invoke.",
+    "meta-funnel": "The three always-on MCP meta-tools (find_tool, describe_tool, invoke) that let an agent discover and call any tool in the full registry — including ones not currently enabled as direct handles — through the identical validation and dispatch path a direct call would use.",
+    "evidence pack": "GET /api/evidence-pack — a single authenticated response bundling recorded operations with their certificates-as-recorded, final mass properties, and the blackboard notebook, plus a separately-labeled live recompute, so an agent or auditor can see both what was claimed at the time and what re-measurement says now.",
+    "blackboard": "A backend-persisted, scope-partitioned (document / part:<uuid> / assembly:<uuid>) shared notebook of text entries that both humans and agents read and write, with an append-only Add/Edit/Delete event log underneath each scope's current line state.",
+    "readable surface": "geometry-engine/src/readable — the module the mapper reports describe as 'the pillar that makes Roshera an agent runtime for geometry': wire records, dimensioning, feature extraction, and blackboard-claim verification exposed thinly through api-server's /api/agent/* handlers.",
+    "persistent id": "A topological entity identifier intended to survive across operations/rebuilds (not just within a single BRepModel instance) so downstream references (labels, moulds, drawings) keep pointing at 'the same' face/edge across history; landed for some paths, not yet universal (fillet/chamfer/pattern don't mint persistent-id lineage in all cases).",
+    "bounded_exec": "api-server's mechanism (Task #41) for running a heavy kernel operation on a deep-cloned model inside spawn_blocking under a per-operation-class wall-clock time budget, off the write lock, only swapping the mutated clone back under a brief write guard on success."
+  }
+}
