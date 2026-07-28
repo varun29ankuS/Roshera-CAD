@@ -182,5 +182,37 @@ class WSClient {
   }
 }
 
-const WS_URL = import.meta.env.VITE_WS_URL || 'ws://localhost:8081/ws'
+/**
+ * Resolve the WebSocket URL the app connects to.
+ *
+ * `VITE_WS_URL` always wins when set. Otherwise:
+ *  - **dev** (`import.meta.env.DEV`): keep the literal
+ *    `ws://localhost:8081/ws` default. This matches the api-server's
+ *    dev-mode port and `vite.config.ts`'s own `/ws` proxy target, so a
+ *    plain `npm run dev` against a local backend needs no env file.
+ *  - **prod**: a shipped build has no guarantee `localhost:8081` means
+ *    anything on the deploying host, so a missing env var must not
+ *    silently pin every client at a dev host. Derive from the page's
+ *    own origin instead — `wss:` when the page is `https:`, else
+ *    `ws:`, same host as `window.location`, path `/ws`.
+ *
+ * Factored out as a pure function (given the flags + location) so the
+ * derivation logic is exercisable without constructing a real WSClient.
+ */
+export function resolveWsUrl(
+  envUrl: string | undefined,
+  isDev: boolean,
+  location: Pick<Location, 'protocol' | 'host'>,
+): string {
+  if (envUrl) return envUrl
+  if (isDev) return 'ws://localhost:8081/ws'
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
+  return `${proto}//${location.host}/ws`
+}
+
+const WS_URL = resolveWsUrl(
+  import.meta.env.VITE_WS_URL as string | undefined,
+  import.meta.env.DEV,
+  window.location,
+)
 export const wsClient = new WSClient(WS_URL)

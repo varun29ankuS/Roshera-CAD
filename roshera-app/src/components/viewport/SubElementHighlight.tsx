@@ -1,4 +1,4 @@
-import { useMemo } from 'react'
+import { useEffect, useMemo } from 'react'
 import * as THREE from 'three'
 import { Line } from '@react-three/drei'
 import { useSceneStore, type CADObject } from '@/stores/scene-store'
@@ -328,6 +328,16 @@ function FaceMark({ triangles, color, hover }: FaceMarkProps) {
     geom.computeVertexNormals()
     return geom
   }, [triangles])
+
+  // Dispose the merged buffer on replacement/unmount. `triangles` is derived
+  // from the hovered sub-element, which changes on pointermove across faces —
+  // the highest-frequency path in the viewport, so an undisposed geometry per
+  // hover accumulates fast.
+  useEffect(() => {
+    return () => {
+      geometry.dispose()
+    }
+  }, [geometry])
 
   return (
     <mesh geometry={geometry}>

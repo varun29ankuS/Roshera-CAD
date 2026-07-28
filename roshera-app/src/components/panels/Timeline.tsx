@@ -1,7 +1,9 @@
 import { Fragment, useState, useEffect, useLayoutEffect, useCallback, useMemo, useRef } from 'react'
 import { useWSStore } from '@/stores/ws-store'
 import { useSceneStore } from '@/stores/scene-store'
+import { useActionErrorStore } from '@/stores/action-error-store'
 import { cn } from '@/lib/utils'
+import { tryReadJson, refusalMessage } from '@/lib/backend-refusal'
 import {
   type EventSummary,
   normalizeKind,
@@ -978,6 +980,17 @@ export function Timeline() {
       return next
     })
   }, [])
+  // Transient, auto-clearing surface for undo/redo/branch-switch/
+  // checkpoint/truncate refusals (backend 4xx/5xx or a 200
+  // `{ success: false }` body). Backed by the shared
+  // `useActionErrorStore` (not local state) so non-React callers —
+  // `lib/shortcuts.ts`'s keyboard undo/redo — can flash into the same
+  // channel this panel renders. Styled like SketchPanel's inline live-
+  // measurements error row (`text-rose-400`, `font-mono`).
+  const actionError = useActionErrorStore((s) => s.message)
+  const flashActionError = useActionErrorStore((s) => s.flash)
+  const clearActionError = useActionErrorStore((s) => s.clear)
+
   const selectBranch = useCallback(async (branchId: string) => {
     if (branchId === activeBranchId) return
     try {
@@ -987,7 +1000,10 @@ export function Timeline() {
         body: JSON.stringify({ branch_id: branchId }),
       })
       if (!resp.ok) {
-        console.error('[timeline] set-active-branch failed:', resp.status)
+        const body = await tryReadJson(resp)
+        const msg = refusalMessage(body, resp.status)
+        console.error('[timeline] set-active-branch failed:', resp.status, msg)
+        flashActionError(`Branch switch failed: ${msg}`)
         return
       }
       // Clear events immediately so the strip + active lane don't
@@ -997,8 +1013,9 @@ export function Timeline() {
       setActiveBranchId(branchId)
     } catch (err) {
       console.error('[timeline] set-active-branch threw:', err)
+      flashActionError('Backend unreachable — branch not switched')
     }
-  }, [activeBranchId])
+  }, [activeBranchId, flashActionError])
   const [loading, setLoading] = useState(false)
   const [now, setNow] = useState(() => Date.now())
   const [menu, setMenu] = useState<EventContextMenuState | null>(null)
@@ -1162,8 +1179,30 @@ export function Timeline() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ session_id: sessionId }),
       })
-      if (resp.ok) fetchHistory()
-    } catch { /* backend not running */ }
+      const body = await tryReadJson(resp)
+      // Malformed input / kernel failure comes back as a bare non-2xx
+      // status; expected refusals (nothing to undo, session not found)
+      // come back as HTTP 200 with `success: false` — both must surface.
+      if (!resp.ok) {
+        flashActionError(`Undo failed: ${refusalMessage(body, resp.status)}`)
+        return
+      }
+      if (body && body.success === false) {
+        flashActionError(`Undo: ${refusalMessage(body, resp.status)}`)
+        return
+      }
+      // Undo can apply to the timeline but fail to replay into the live
+      // BRepModel (`handlers/timeline.rs::undo_operation` still answers
+      // `success: true`). Left unsurfaced this is the exact "refusal
+      // looks identical to success" defect: the strip updates but the
+      // viewport silently holds stale geometry.
+      if (body && body.model_reconciled === false) {
+        flashActionError('Undo applied, but the 3D model may be stale (reconciliation failed)')
+      }
+      fetchHistory()
+    } catch {
+      flashActionError('Backend unreachable — undo not applied')
+    }
   }
 
   const handleRedo = async () => {
@@ -1175,19 +1214,45 @@ export function Timeline() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ session_id: sessionId }),
       })
-      if (resp.ok) fetchHistory()
-    } catch { /* backend not running */ }
+      const body = await tryReadJson(resp)
+      if (!resp.ok) {
+        flashActionError(`Redo failed: ${refusalMessage(body, resp.status)}`)
+        return
+      }
+      if (body && body.success === false) {
+        flashActionError(`Redo: ${refusalMessage(body, resp.status)}`)
+        return
+      }
+      if (body && body.model_reconciled === false) {
+        flashActionError('Redo applied, but the 3D model may be stale (reconciliation failed)')
+      }
+      fetchHistory()
+    } catch {
+      flashActionError('Backend unreachable — redo not applied')
+    }
   }
 
   const handleCheckpoint = async () => {
     try {
-      await fetch('/api/timeline/checkpoint', {
+      const resp = await fetch('/api/timeline/checkpoint', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name: `Checkpoint ${new Date().toLocaleTimeString()}` }),
       })
+      if (!resp.ok) {
+        // `create_checkpoint` (handlers/timeline.rs) returns a bare
+        // `StatusCode` on both branches — success is 201 with no body,
+        // failure is 500 with no body — so there is no `message`/
+        // `error` field to read; refusalMessage falls back to the
+        // generic "Request failed (HTTP …)" form for this endpoint.
+        const body = await tryReadJson(resp)
+        flashActionError(`Checkpoint failed: ${refusalMessage(body, resp.status)}`)
+        return
+      }
       fetchHistory()
-    } catch { /* backend not running */ }
+    } catch {
+      flashActionError('Backend unreachable — checkpoint not created')
+    }
   }
 
   const handleBranch = async () => {
@@ -1512,6 +1577,24 @@ export function Timeline() {
         </button>
       </div>
 
+      {/* Transient refusal/error surface for undo/redo/branch-switch/
+          checkpoint/truncate. Backed by `useActionErrorStore` (auto-
+          clears via its own timer); styled to match the inline error
+          row in SketchPanel (text-rose-400, font-mono). */}
+      {actionError && (
+        <div className="px-3 pb-1.5 -mt-0.5 text-[11px] font-mono text-rose-400 flex items-center gap-2">
+          <span className="truncate">{actionError}</span>
+          <button
+            type="button"
+            onClick={clearActionError}
+            className="ml-auto text-rose-400/70 hover:text-rose-400 shrink-0"
+            aria-label="Dismiss error"
+          >
+            ✕
+          </button>
+        </div>
+      )}
+
       {/* Event body: per-part swimlanes (default) or the flat by-time strip.
           Collapsible to reclaim viewport space; height-capped with internal
           scroll so it never crowds the 3D view. */}
@@ -1575,9 +1658,19 @@ export function Timeline() {
                     if (activeResp.ok) {
                       setEvents([])
                       setActiveBranchId(MAIN_BRANCH_ID)
+                    } else {
+                      const body = await tryReadJson(activeResp)
+                      const msg = refusalMessage(body, activeResp.status)
+                      console.error(
+                        '[timeline] post-truncate branch switch failed:',
+                        activeResp.status,
+                        msg,
+                      )
+                      flashActionError(`Branch switch failed: ${msg}`)
                     }
-                  } catch {
-                    // Best-effort; the next fetchHistory will refresh.
+                  } catch (err) {
+                    console.error('[timeline] post-truncate branch switch threw:', err)
+                    flashActionError('Backend unreachable — branch not switched')
                   }
                 }
               }
