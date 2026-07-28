@@ -42,11 +42,14 @@ pub use constrainedness::{
 };
 pub use decompose::{DecompositionStats, StructuralDofReport};
 pub use grounding::GroundingReport;
-pub use interference::{InterferencePair, InterferenceReport};
+pub use interference::{
+    ClearanceOutcome, InterferencePair, InterferenceReport, UnverifiedInterferencePair,
+    UnverifiedReason,
+};
 pub use jacobian::JacobianProbe;
 pub use joint::Joint;
 pub use mate_anchor::{MateAnchorReport, UnanchoredFeature};
-pub use mate_contact::{DisconnectedMate, MateContactReport};
+pub use mate_contact::{DisconnectedMate, MateContactReport, UnverifiedMate};
 pub use motion::{
     DragOutcome, DragScope, DriveParam, DriveRefusal, LimitFact, RankTransition, WindingFact,
 };

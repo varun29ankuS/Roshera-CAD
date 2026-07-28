@@ -9,6 +9,7 @@
 //! reaching it. The clearance between every mated pair must be ~0, or the
 //! certificate must say the joint isn't really there.
 
+use crate::interference::{ClearanceOutcome, UnverifiedReason};
 use crate::types::{Assembly, InstanceId};
 use serde::{Deserialize, Serialize};
 
@@ -22,40 +23,71 @@ pub struct DisconnectedMate {
     pub gap: f64,
 }
 
+/// A mate whose clearance could not be computed at all — never folded into
+/// "in contact"; the check simply did not run. See `UnverifiedReason`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UnverifiedMate {
+    pub mate_index: usize,
+    pub a: InstanceId,
+    pub b: InstanceId,
+    pub reason: UnverifiedReason,
+}
+
 /// The contact verdict for an assembly's mates.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MateContactReport {
     pub disconnected: Vec<DisconnectedMate>,
+    /// Mates the checker never actually ran on (mesh missing, or the pair
+    /// unsupported). A non-empty list here means contact has NOT been
+    /// proven — `all_in_contact` reflects that.
+    pub unverified: Vec<UnverifiedMate>,
 }
 
 impl MateContactReport {
-    /// True when every mated pair is actually touching — no paper joints.
+    /// True when every mated pair is VERIFIED touching — no paper joints,
+    /// and no unrun check silently riding along as a pass.
     pub fn all_in_contact(&self) -> bool {
-        self.disconnected.is_empty()
+        self.disconnected.is_empty() && self.unverified.is_empty()
     }
 }
 
 impl Assembly {
     /// For every mate, the clearance between the two parts it joins. A contact
     /// mate should hold them touching, so a gap larger than `tol` means the
-    /// parts are mated only on paper — joined to nothing.
+    /// parts are mated only on paper — joined to nothing. A mate whose
+    /// clearance cannot be computed at all (missing mesh, unsupported pair)
+    /// is reported as UNVERIFIED, never silently folded into a pass.
     pub fn mate_contact_report(&self, tol: f64) -> MateContactReport {
         let mut disconnected = Vec::new();
+        let mut unverified = Vec::new();
         for (idx, mate) in self.mates.iter().enumerate() {
             // `clearance` is 0 when the parts touch or overlap (overlap is the
             // interference check's job); a positive value is a real gap.
-            if let Some(gap) = self.clearance(mate.a, mate.b) {
-                if gap > tol {
-                    disconnected.push(DisconnectedMate {
+            match self.clearance_outcome(mate.a, mate.b) {
+                ClearanceOutcome::Gap(gap) => {
+                    if gap > tol {
+                        disconnected.push(DisconnectedMate {
+                            mate_index: idx,
+                            a: mate.a,
+                            b: mate.b,
+                            gap,
+                        });
+                    }
+                }
+                ClearanceOutcome::Unverified(reason) => {
+                    unverified.push(UnverifiedMate {
                         mate_index: idx,
                         a: mate.a,
                         b: mate.b,
-                        gap,
+                        reason,
                     });
                 }
             }
         }
-        MateContactReport { disconnected }
+        MateContactReport {
+            disconnected,
+            unverified,
+        }
     }
 }
 
@@ -152,5 +184,32 @@ mod tests {
         let mut a = Assembly::new(InstanceId(0));
         a.add_instance(cube_at(0, 0.0));
         assert!(a.mate_contact_report(0.25).all_in_contact());
+    }
+
+    #[test]
+    fn unverifiable_clearance_is_not_folded_into_contact() {
+        // Part 1 has an empty mesh — `clearance()` cannot be computed for it
+        // (interference.rs's `clearance` returns `None`). Today the loop in
+        // `mate_contact_report` silently does nothing on `None`, so this
+        // mate lands in the same bucket as a VERIFIED touching pair. That is
+        // the H8 defect: "unverifiable" folded into "pass".
+        let mut a = Assembly::new(InstanceId(0));
+        a.add_instance(cube_at(0, 0.0));
+        let mut meshless = Instance::new(InstanceId(1), "meshless".to_string(), Mesh::default());
+        meshless.translation = [2.0, 0.0, 0.0];
+        a.add_instance(meshless);
+        a.add_mate(join());
+        let report = a.mate_contact_report(0.25);
+        assert!(
+            !report.all_in_contact(),
+            "an unverifiable mate must not report as in-contact"
+        );
+        assert!(report.disconnected.is_empty(), "not a measured gap");
+        assert_eq!(report.unverified.len(), 1);
+        assert_eq!(report.unverified[0].mate_index, 0);
+        assert_eq!(
+            report.unverified[0].reason,
+            crate::interference::UnverifiedReason::MissingMesh
+        );
     }
 }

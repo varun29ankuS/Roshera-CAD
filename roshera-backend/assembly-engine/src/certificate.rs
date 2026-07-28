@@ -19,7 +19,9 @@ use crate::constrainedness::{
     MateFact, SolverVerdict,
 };
 use crate::decompose::{DecompositionStats, StructuralDofReport};
+use crate::interference::UnverifiedInterferencePair;
 use crate::joint::Joint;
+use crate::mate_contact::UnverifiedMate;
 use crate::solver::Mobility;
 use crate::sweep::SweptFact;
 use crate::types::{Assembly, InstanceId};
@@ -46,7 +48,9 @@ pub struct AssemblyCertificate {
     /// Free degrees of freedom at the solved pose.
     pub dof: usize,
     pub mobility: Mobility,
-    /// No two parts overlap at the solved pose.
+    /// No two parts overlap at the solved pose, AND every pair was actually
+    /// checked — `false` when a pair was skipped (mesh missing/degenerate),
+    /// not just when overlap was found. See `interference_unverified`.
     pub no_static_interference: bool,
     /// Every supplied mechanism stays clear across its full range of motion.
     pub swept_clearance_ok: bool,
@@ -54,7 +58,9 @@ pub struct AssemblyCertificate {
     /// grounded through a constraint declared against an invented coordinate.
     pub mates_anchored: bool,
     /// Every mated pair actually touches — no part is joined to another only on
-    /// paper, sitting coaxial-but-floating with a gap between them.
+    /// paper, sitting coaxial-but-floating with a gap between them. `false`
+    /// also when a mate's clearance could not be computed at all (the check
+    /// never ran); see `contact_unverified`.
     pub mates_in_contact: bool,
     /// Every mate is NUMERICALLY ENFORCED by the solver. A typed-but-
     /// unenforced mate (the honest-refuse set: Cam/Path/Symmetric, feature
@@ -101,6 +107,19 @@ pub struct AssemblyCertificate {
     /// caller has to trust.
     #[serde(default)]
     pub sweeps: Vec<SweptFact>,
+    // ── H8 fix — also ADDITIVE: ────────────────────────────────────────
+    /// Mates whose contact clearance could not be computed at all (mesh
+    /// missing, or the pair unsupported) — the check never ran. Non-empty
+    /// here is why `mates_in_contact` reads `false`: an unverified check is
+    /// never folded into a pass. Serde-defaults so pre-fix payloads parse.
+    #[serde(default)]
+    pub contact_unverified: Vec<UnverifiedMate>,
+    /// Pairs whose static interference could not be checked at all (a
+    /// degenerate / mesh-less instance) — the check never ran. Non-empty
+    /// here is why `no_static_interference` reads `false`, for the same
+    /// reason. Serde-defaults so pre-fix payloads parse.
+    #[serde(default)]
+    pub interference_unverified: Vec<UnverifiedInterferencePair>,
 }
 
 fn default_true() -> bool {
@@ -182,12 +201,12 @@ impl Assembly {
         );
 
         let dof_report = solved.dof_analysis();
-        let no_static_interference = solved.interference_report().no_static_interference();
+        let interference_report = solved.interference_report();
+        let no_static_interference = interference_report.no_static_interference();
         // Contact is judged at the SOLVED pose — the configuration the mates
         // actually produce — so a mate that the solve pulls into contact passes.
-        let mates_in_contact = solved
-            .mate_contact_report(MATE_CONTACT_TOL)
-            .all_in_contact();
+        let contact_report = solved.mate_contact_report(MATE_CONTACT_TOL);
+        let mates_in_contact = contact_report.all_in_contact();
 
         // Slice 5 (spec §3.6): the swept dimension now runs on CONTINUOUS
         // time-of-impact over joints DERIVED from the mates, plus the
@@ -228,6 +247,8 @@ impl Assembly {
             decomposition: Some(analysis.decomposition),
             epsilon: Some(epsilon_fact),
             sweeps,
+            contact_unverified: contact_report.unverified,
+            interference_unverified: interference_report.unverified,
         }
     }
 }
