@@ -1139,8 +1139,19 @@ fn diag_trace_seed() {
 /// unsound (the kernel honestly flags it via the certificate — that is the
 /// separate curved-boolean correctness work), but its audit MUST FINISH. We run
 /// the previously-hanging seeds on a worker thread with a generous wall-clock
-/// budget and fail loudly if any blows it. Release-fast; the budget has wide
-/// headroom over the observed ~10–20s/seed so a slow debug run still passes.
+/// budget and fail loudly if any blows it.
+///
+/// BUDGET BASIS (recalibrated 2026-07-28, see
+/// .superpowers/sdd/burndown-diag-ssi-marcher-unification.md): the original
+/// 90s budget was sized against a boolean-local SSI marcher that CAPPED OUT
+/// and silently DISCARDED long intersection curves — fast because it was
+/// wrong. Since 09fae0b9 (marcher unification, #55) booleans reach the
+/// canonical sagitta-bounded SSI and trace those curves correctly, so the
+/// audit works on genuinely heavier B-Reps: seed 12 measures 111.6s debug on
+/// a quiet machine (bisect-verified slow-creep, NOT a hang — it completes).
+/// 300s = 2.7x the measured worst seed, consistent with the documented 2-4x
+/// machine-load inflation band. If this trips again on a quiet machine,
+/// something actually regressed — diagnose, don't re-raise.
 #[test]
 fn curved_boolean_on_rotated_primitive_terminates() {
     // The seeds the gap-finder reported as hangs (curved booleans on rotated
@@ -1150,7 +1161,7 @@ fn curved_boolean_on_rotated_primitive_terminates() {
         std::env::var("HANG_GATE_BUDGET_SECS")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or(90),
+            .unwrap_or(300),
     );
     for seed in seeds {
         let (tx, rx) = std::sync::mpsc::channel();
