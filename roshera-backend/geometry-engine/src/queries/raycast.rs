@@ -13,7 +13,7 @@
 //! in the B-Rep renders as see-through — the eye cannot report a surface that
 //! is not in the model.
 
-use crate::math::{Point3, Vector3};
+use crate::math::{Point3, Tolerance, Vector3};
 use crate::primitives::face::{Face, FaceId, FaceOrientation};
 use crate::primitives::solid::SolidId;
 use crate::primitives::surface::{Cone, Cylinder, Plane, Sphere, Surface};
@@ -266,20 +266,24 @@ fn surface_ray_ts(surface: &dyn Surface, o: Point3, d: Vector3) -> Vec<f64> {
     vec![]
 }
 
-/// Real roots of `a t² + b t + c = 0`. Handles the linear (a≈0) case.
+/// Real roots of `a t² + b t + c = 0`.
+///
+/// Delegates to the crate's shared, numerically-robust quadratic solver
+/// (`crate::math::utils::solve_quadratic`, citardauq/stable-companion
+/// form over an FMA + Dekker-splitting discriminant) rather than the
+/// bare `b*b - 4*a*c` this file used to compute locally. The bare form
+/// catastrophically cancels for near-tangent rays against large-radius
+/// surfaces (see `solve_quadratic_bare_disc_collapses_near_tangent_root_pair`
+/// in the tests below), silently collapsing a genuine two-hit pair into a
+/// single repeated root.
+///
+/// No query-scoped `Tolerance` is threaded through this call chain
+/// (`surface_ray_ts` only receives the surface and ray, not the model),
+/// so `Tolerance::default()` is used here — it governs only the
+/// discriminant's real-vs-no-real-roots sign test and root
+/// deduplication, not the root values themselves.
 fn solve_quadratic(a: f64, b: f64, c: f64) -> Vec<f64> {
-    if a.abs() < 1e-12 {
-        if b.abs() < 1e-12 {
-            return vec![];
-        }
-        return vec![-c / b];
-    }
-    let disc = b * b - 4.0 * a * c;
-    if disc < 0.0 {
-        return vec![];
-    }
-    let sq = disc.sqrt();
-    vec![(-b - sq) / (2.0 * a), (-b + sq) / (2.0 * a)]
+    crate::math::utils::solve_quadratic(a, b, c, Tolerance::default())
 }
 
 #[cfg(test)]
@@ -292,6 +296,72 @@ mod tests {
             GeometryId::Solid(s) => s,
             o => panic!("expected solid, got {o:?}"),
         }
+    }
+
+    #[test]
+    fn solve_quadratic_naive_formula_loses_small_root_to_cancellation() {
+        // A ray origin far from a sphere relative to its radius (the
+        // Sphere/Cylinder arm's coefficient shape whenever b^2 >> 4ac):
+        // a = 1, b = 1e8, c = 1.0. All three are EXACTLY representable
+        // f64 values, and the discriminant b^2 - 4ac = 1e16 - 4 =
+        // 9999999999999996 is ALSO exactly representable — so this input
+        // isolates the ROOT FORMULA (citardauq vs. naive ±) with zero
+        // caller-side precision loss contaminating the comparison. (A
+        // near-tangent large-sphere setup was tried first; it does not
+        // discriminate here because the ray-origin arithmetic that
+        // produces `c` already rounds away the tangency gap before either
+        // solver runs — see the delta sweep in the executor report.)
+        //
+        // True small root (Newton/citardauq-exact to ~16 digits):
+        // x2 = c / q where q = -0.5*(b + sqrt(disc)) ≈ -1e-8.
+        //
+        // The OLD local formula (naive ±): sq = sqrt(disc) rounds to
+        // 1e8 - 1.4901161193847656e-8 (ULP(1e8) = 2^-26), so
+        // (-b + sq) / 2 loses ~1 significant digit relative to the true
+        // -1e-8 root — the small root computed this way is wrong by
+        // roughly the ULP of the LARGE root, i.e. an O(1) relative error
+        // on the small root itself.
+        let a = 1.0;
+        let b = 1.0e8;
+        let c = 1.0;
+
+        let expected_small = -1e-8;
+
+        let roots = solve_quadratic(a, b, c);
+        assert_eq!(roots.len(), 2, "expected two roots, got {:?}", roots);
+        let small = roots
+            .iter()
+            .find(|r| r.abs() < 1.0)
+            .copied()
+            .expect("no small-magnitude root found");
+        let rel_err = ((small - expected_small) / expected_small).abs();
+        assert!(
+            rel_err < 1e-6,
+            "small root {} not within rel tol 1e-6 of {} (rel_err={}, roots={:?})",
+            small,
+            expected_small,
+            rel_err,
+            roots
+        );
+    }
+
+    #[test]
+    fn solve_quadratic_unit_sphere_center_hit_stays_exact() {
+        // Trivially-known case, kept as a regression guard: a ray through
+        // the center of a sphere of radius r from distance o_dist along
+        // the axis must hit at t = o_dist - r (near side) and
+        // t = o_dist + r (far side), unaffected by the robust-discriminant
+        // delegation since there is no near-cancellation here.
+        let r = 5.0;
+        let o_dist = 20.0;
+        let a = 1.0;
+        let b = -2.0 * o_dist;
+        let c = o_dist * o_dist - r * r;
+
+        let roots = solve_quadratic(a, b, c);
+        assert_eq!(roots.len(), 2, "expected two roots, got {:?}", roots);
+        assert!((roots[0] - (o_dist - r)).abs() < 1e-9);
+        assert!((roots[1] - (o_dist + r)).abs() < 1e-9);
     }
 
     #[test]
