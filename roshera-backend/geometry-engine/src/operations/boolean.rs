@@ -18260,6 +18260,91 @@ fn ray_surface_all_intersections(
             }
             Ok(results)
         }
+        SurfaceType::Torus => {
+            // Ray-torus is QUARTIC: a ray can pierce the tube up to FOUR
+            // times. The general fallback (`ray_surface_numerical`) scans a
+            // fixed 10×10 (u,v) grid and returns at most ONE hit — for a
+            // torus it returns NONE in practice, so every crossing was
+            // dropped and `ray_cast_classification` counted the surface as
+            // absent entirely, not merely undercounted. Torus is the surface
+            // fillets are built from, so a boolean against any filleted
+            // solid inherited the misclassification. Same defect class the
+            // `SurfaceType::Cone` arm above documents.
+            //
+            // Implicit form, with d = p − center, z = d·axis:
+            //   (|d|² + R² − r²)² − 4R²(|d|² − z²) = 0
+            // Substituting p = origin + t·D̂ yields the quartic below.
+            // `is_point_in_face` bounds each hit to the face's real extent
+            // afterwards, so partial tori (`param_limits`) need no handling
+            // here — same division of labour as the cone arm.
+            use crate::primitives::surface::Torus;
+            let torus = surface.as_any().downcast_ref::<Torus>().ok_or_else(|| {
+                OperationError::InternalError("Failed to downcast torus".to_string())
+            })?;
+
+            // Solve in unit-distance units. The quartic's leading
+            // coefficient is |D|⁴, so a short direction vector would fall
+            // under `solve_quartic`'s degenerate-`a` cutoff and silently
+            // demote the solve to a cubic, losing a root. Normalising keeps
+            // the leading coefficient exactly 1; `t` is converted back to
+            // the caller's parameter units before returning, so this arm
+            // stays consistent with the others for non-unit directions.
+            let dir_len = direction.magnitude();
+            let unit_dir = match direction.normalize() {
+                Ok(u) => u,
+                Err(_) => return Ok(vec![]),
+            };
+            let axis = match torus.axis.normalize() {
+                Ok(a) => a,
+                Err(_) => return Ok(vec![]),
+            };
+
+            let e = *origin - torus.center;
+            let big_r = torus.major_radius;
+            let small_r = torus.minor_radius;
+
+            let e_dot_d = e.dot(&unit_dir);
+            let e_dot_e = e.dot(&e);
+            let d_a = unit_dir.dot(&axis);
+            let e_a = e.dot(&axis);
+
+            // |d|²      = t² + 2(e·D̂)t + |e|²
+            // |d|² − z² = (1 − (D̂·a)²)t² + 2[(e·D̂) − (e·a)(D̂·a)]t
+            //             + (|e|² − (e·a)²)
+            let g0 = e_dot_e + big_r * big_r - small_r * small_r;
+            let g1 = 2.0 * e_dot_d;
+
+            let p2 = 1.0 - d_a * d_a;
+            let p1 = 2.0 * (e_dot_d - e_a * d_a);
+            let p0 = e_dot_e - e_a * e_a;
+
+            let four_r2 = 4.0 * big_r * big_r;
+
+            // (t² + g1·t + g0)² − 4R²(p2·t² + p1·t + p0)
+            let c4 = 1.0;
+            let c3 = 2.0 * g1;
+            let c2 = g1 * g1 + 2.0 * g0 - four_r2 * p2;
+            let c1 = 2.0 * g1 * g0 - four_r2 * p1;
+            let c0 = g0 * g0 - four_r2 * p0;
+
+            let roots = crate::math::utils::solve_quartic(c4, c3, c2, c1, c0, *tolerance);
+
+            // Forward along the ray, deduplicating tangent roots — mirrors
+            // the cone arm's `push_if_valid` policy.
+            let mut results: Vec<f64> = Vec::new();
+            for t_dist in roots {
+                let t = t_dist / dir_len;
+                if t > tolerance.distance()
+                    && !results
+                        .iter()
+                        .any(|&r| (r - t).abs() <= tolerance.distance())
+                {
+                    results.push(t);
+                }
+            }
+            results.sort_by(|a, b| a.total_cmp(b));
+            Ok(results)
+        }
         _ => {
             // Fall back to single intersection for other types
             match ray_surface_intersection(origin, direction, surface, tolerance)? {
@@ -22024,6 +22109,75 @@ must be dropped; a 1·tol band rejects it and lets it double the rim"
         assert!(
             (hits[1] - 13.0).abs() < 1e-6,
             "Second hit expected at t=13, got {}",
+            hits[1]
+        );
+    }
+
+    /// A ray through the middle of a torus pierces the tube FOUR times.
+    ///
+    /// This is the same defect class the `Cone` arm documents at the
+    /// `SurfaceType::Cone` match arm: the general fallback
+    /// (`ray_surface_numerical`) returns at most ONE hit, so every extra
+    /// crossing is dropped and `ray_cast_classification`'s odd/even parity
+    /// flips. Torus is the surface fillets are built from, so a boolean
+    /// against any filleted solid inherits the misclassification.
+    #[test]
+    fn test_ray_torus_all_intersections_returns_four() {
+        use crate::primitives::surface::Torus;
+
+        // Tube spans radius 4..6 in the z=0 plane.
+        let torus = Torus::new(Point3::ORIGIN, Vector3::Z, 5.0, 1.0).unwrap();
+        let tol = Tolerance::default();
+
+        // Along +X through the centre: crosses x = -6, -4, +4, +6.
+        let origin = Point3::new(-10.0, 0.0, 0.0);
+        let direction = Vector3::X;
+        let hits = ray_surface_all_intersections(&origin, &direction, &torus, &tol).unwrap();
+
+        assert_eq!(
+            hits.len(),
+            4,
+            "Ray through torus centre should hit four times, got {}: {hits:?}",
+            hits.len()
+        );
+        for (i, expected) in [4.0_f64, 6.0, 14.0, 16.0].iter().enumerate() {
+            assert!(
+                (hits[i] - expected).abs() < 1e-6,
+                "Hit {i} expected at t={expected}, got {}",
+                hits[i]
+            );
+        }
+    }
+
+    /// Parity guard: a ray starting in the torus's central hole (outside the
+    /// solid) crosses one side of the tube exactly twice, so the even count
+    /// must classify the start point as OUTSIDE. Returning a single hit here
+    /// is what flips the classification to Inside.
+    #[test]
+    fn test_ray_torus_from_hole_returns_two() {
+        use crate::primitives::surface::Torus;
+
+        let torus = Torus::new(Point3::ORIGIN, Vector3::Z, 5.0, 1.0).unwrap();
+        let tol = Tolerance::default();
+
+        let origin = Point3::ORIGIN;
+        let direction = Vector3::X;
+        let hits = ray_surface_all_intersections(&origin, &direction, &torus, &tol).unwrap();
+
+        assert_eq!(
+            hits.len(),
+            2,
+            "Ray from torus hole should hit twice (even ⇒ outside), got {}: {hits:?}",
+            hits.len()
+        );
+        assert!(
+            (hits[0] - 4.0).abs() < 1e-6,
+            "Enter expected t=4, got {}",
+            hits[0]
+        );
+        assert!(
+            (hits[1] - 6.0).abs() < 1e-6,
+            "Exit expected t=6, got {}",
             hits[1]
         );
     }
