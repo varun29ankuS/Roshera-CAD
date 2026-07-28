@@ -763,6 +763,29 @@ impl<W: Write> StepWriter<W> {
                 )?;
                 Ok(id)
             }
+            // STEP has no "this is an approximation" marker to attach to a
+            // B_SPLINE_SURFACE entity; the honesty fix for this surface
+            // kind lives in the .ros `SurfaceData` schema (the
+            // `source_type` tag), which a reader of the raw surfaces list
+            // can inspect. The written STEP geometry is the same sampled
+            // grid a bare `BSpline` would have produced.
+            SurfaceData::Approximated {
+                control_points,
+                knots_u,
+                knots_v,
+                degree_u,
+                degree_v,
+                ..
+            } => self.write_b_spline_surface(
+                *degree_u,
+                *degree_v,
+                control_points,
+                knots_u,
+                knots_v,
+                None,
+                closed_u,
+                closed_v,
+            ),
         }
     }
 
@@ -1786,7 +1809,7 @@ pub async fn export_brep_to_step(model: &BRepModel, path: &Path) -> Result<(), E
     })?;
 
     // Convert to snapshot for easier iteration.
-    let snapshot = BRepSnapshot::from_model(model);
+    let snapshot = BRepSnapshot::from_model(model)?;
 
     // Compute parameter-space curves (pcurves) + periodicity metadata for
     // every edge bounding a non-planar parametric face FROM THE LIVE MODEL —
@@ -1869,7 +1892,7 @@ pub async fn export_assembly_to_step(
     // model (geometry + topology + solids + product structure).
     for (idx, component) in assembly.components().enumerate() {
         if !component.properties.suppressed {
-            let snapshot = BRepSnapshot::from_model(&component.part);
+            let snapshot = BRepSnapshot::from_model(&component.part)?;
             let pcurve_export = crate::formats::step::pcurve::build_pcurve_export(&component.part);
             let comp_name = snapshot
                 .solids
