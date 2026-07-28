@@ -6,7 +6,7 @@
 /// - **Performance**: < 1ms translation time
 /// - **Business Value**: Easy to add new command types
 use crate::commands::VoiceCommand;
-use shared_types::{AICommand, ObjectId, PrimitiveType, ShapeParameters, TransformType, Vector3D};
+use shared_types::{AICommand, ObjectId, TransformType, Vector3D};
 use uuid::Uuid;
 
 /// Translate voice command to AI command
@@ -66,14 +66,11 @@ pub fn voice_to_ai_command(voice_cmd: VoiceCommand) -> Result<AICommand, Transla
             })
         }
         VoiceCommand::Extrude { .. } => {
-            // For extrude, we need to pass it through as a geometry command
-            // This is a simplified implementation - in reality, we'd validate the target exists
-            Ok(AICommand::CreatePrimitive {
-                shape_type: PrimitiveType::Box,                         // Placeholder
-                parameters: ShapeParameters::box_params(1.0, 1.0, 1.0), // Placeholder
-                position: [0.0, 0.0, 0.0],
-                material: None,
-            })
+            // Extrude has no `AICommand` equivalent (`CreatePrimitive` cannot
+            // express "extrude an existing face" and fabricating a 1x1x1 box
+            // in its place would silently discard the caller's real intent).
+            // Honest refusal until a dedicated extrude command variant exists.
+            Err(TranslationError::UnsupportedCommand("Extrude".to_string()))
         }
         VoiceCommand::Query { question, target } => {
             // Simple query analysis
@@ -120,6 +117,9 @@ pub enum TranslationError {
 
     #[error("Invalid parameter: {0}")]
     InvalidParameter(String),
+
+    #[error("Unsupported voice command: {0}")]
+    UnsupportedCommand(String),
 }
 
 #[cfg(test)]
@@ -141,6 +141,31 @@ mod tests {
                 assert_eq!(shape_type, PrimitiveType::Sphere);
             }
             _ => panic!("Wrong command type"),
+        }
+    }
+
+    /// H1 RED: translating a voice Extrude must be an honest refusal, not a
+    /// fabricated 1x1x1 box. Extrude has no CreatePrimitive semantics, so
+    /// `voice_to_ai_command` must return `Err` here, never
+    /// `Ok(AICommand::CreatePrimitive { .. })`.
+    #[test]
+    fn test_extrude_translation_is_not_implemented() {
+        let voice_cmd = VoiceCommand::Extrude {
+            target: None,
+            face_index: Some(0),
+            direction: None,
+            distance: Some(5.0),
+            natural_text: "extrude this face by 5".to_string(),
+        };
+
+        let result = voice_to_ai_command(voice_cmd);
+
+        match result {
+            Ok(AICommand::CreatePrimitive { .. }) => {
+                panic!("Extrude must not be translated into a fabricated CreatePrimitive")
+            }
+            Ok(_) => panic!("Extrude must not silently succeed as any other command"),
+            Err(_) => {} // honest refusal — expected
         }
     }
 }

@@ -56,11 +56,18 @@ impl Default for SmartRouterConfig {
     fn default() -> Self {
         Self {
             mode: ProcessingMode::Unified,
+            // Policy: API-only, no local inference runtimes (see
+            // ai-integration/src/providers/mod.rs). The default must point
+            // at the Claude API rather than a local Ollama server — with no
+            // API key configured, callers that reach the vision pipeline
+            // fail loudly via `ProviderError::ProviderUnavailable`
+            // (`providers/claude.rs`) instead of silently talking to
+            // localhost.
             vision_config: VisionConfig {
-                provider: shared_types::vision::VisionProviderType::CustomAPI,
-                url: "http://localhost:11434/api/generate".to_string(),
+                provider: shared_types::vision::VisionProviderType::Anthropic,
+                url: "https://api.anthropic.com/v1/messages".to_string(),
                 api_key: None,
-                model_name: "llava:latest".to_string(),
+                model_name: "claude-sonnet-5".to_string(),
             },
             reasoning_config: None,
             enable_cache: true,
@@ -173,5 +180,37 @@ impl SmartRouter {
     /// Get the current processing mode
     pub fn mode(&self) -> &ProcessingMode {
         &self.config.mode
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// P1 RED: the default vision config must never point at a local
+    /// inference runtime (Ollama et al.) — API-only per project policy
+    /// (CLAUDE.md, enforced at `providers/mod.rs`).
+    #[test]
+    fn test_default_config_has_no_local_runtime() {
+        let config = SmartRouterConfig::default();
+
+        let url_lower = config.vision_config.url.to_lowercase();
+        let model_lower = config.vision_config.model_name.to_lowercase();
+
+        assert!(
+            !url_lower.contains("11434"),
+            "default vision_config.url must not point at an Ollama port, got: {}",
+            config.vision_config.url
+        );
+        assert!(
+            !url_lower.contains("localhost") && !url_lower.contains("127.0.0.1"),
+            "default vision_config.url must not point at a local runtime, got: {}",
+            config.vision_config.url
+        );
+        assert!(
+            !model_lower.contains("llava"),
+            "default vision_config.model_name must not name a local Ollama model, got: {}",
+            config.vision_config.model_name
+        );
     }
 }
