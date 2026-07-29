@@ -140,7 +140,7 @@ pub enum OrientationOutcome {
 /// whether an edge's angular contribution is trusted at all, so a
 /// borderline case should refuse rather than silently accept a
 /// near-miss.
-const RIM_PERPENDICULAR_TOL: f64 = 1e-9;
+pub(crate) const RIM_PERPENDICULAR_TOL: f64 = 1e-9;
 
 /// Below this, `A·cos(t) + B·sin(t)`'s amplitude is treated as exactly
 /// zero (a direction-independent constant field) rather than searching
@@ -300,7 +300,7 @@ fn angular_intervals_for_face(
     Ok(ranges)
 }
 
-fn to_surface_kind(surface_type: SurfaceType) -> SurfaceKind {
+pub(crate) fn to_surface_kind(surface_type: SurfaceType) -> SurfaceKind {
     match surface_type {
         SurfaceType::Plane => SurfaceKind::Plane,
         SurfaceType::Cylinder => SurfaceKind::Cylinder,

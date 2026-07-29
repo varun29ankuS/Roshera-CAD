@@ -315,11 +315,14 @@ mod tests {
     }
 
     /// Refusal flow-through: a solid whose only face is NURBS (which
-    /// `face_orientation_field` refuses unconditionally, spec §3.1) must
-    /// read `Inconclusive` — NEVER `Pass` — through the FULL path: the
-    /// analyzer's refusal → the pack's per-rule aggregation → the
-    /// committed `DfmReport::new` honesty fold. Exercises the fold
-    /// end-to-end through this slice's own code, per the executor brief.
+    /// `face_orientation_field` AND `pair_thickness` both refuse
+    /// unconditionally, spec §3.1) must read `Inconclusive` — NEVER
+    /// `Pass` — through the FULL path: both analyzers' refusals → each
+    /// rule's own aggregation → the committed `DfmReport::new` honesty
+    /// fold. Exercises the fold end-to-end through this slice's own code,
+    /// per the executor brief. Since S3 the FDM pack runs TWO rules
+    /// (`fdm.overhang`, `fdm.min_wall`) against the same lone NURBS face,
+    /// so BOTH read `Unverifiable` — `unverifiable: 2`, not 1.
     #[test]
     fn nurbs_only_solid_is_inconclusive_never_pass_through_full_report_path() {
         let (surfaces, faces, loops, edges, curves, face_id) = nurbs_face();
@@ -341,7 +344,7 @@ mod tests {
 
         assert_eq!(
             report.summary(),
-            DfmSummary::Inconclusive { unverifiable: 1 }
+            DfmSummary::Inconclusive { unverifiable: 2 }
         );
         assert_ne!(
             report.summary(),
@@ -350,7 +353,11 @@ mod tests {
         );
         match &report.verdicts()[0].verdict {
             Verdict::Unverifiable { regions, .. } => assert_eq!(regions, &[face_id]),
-            other => panic!("expected Unverifiable, got {other:?}"),
+            other => panic!("expected Unverifiable (fdm.overhang), got {other:?}"),
+        }
+        match &report.verdicts()[1].verdict {
+            Verdict::Unverifiable { regions, .. } => assert_eq!(regions, &[face_id]),
+            other => panic!("expected Unverifiable (fdm.min_wall), got {other:?}"),
         }
     }
 

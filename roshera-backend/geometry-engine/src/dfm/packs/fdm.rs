@@ -1,12 +1,15 @@
 //! FDM (fused deposition modeling) rule pack v1 (spec §3.2).
 //!
-//! Ships ONE rule this slice: [`evaluate_overhang`] (`fdm.overhang`). The
-//! remaining v1 rules (`fdm.min_wall`, `fdm.min_bore`,
+//! Ships TWO rules: [`evaluate_overhang`] (`fdm.overhang`, S2) and
+//! [`evaluate_min_wall`] (`fdm.min_wall`, S3 — this addition, riding
+//! [`pair_thickness`]). The remaining v1 rules (`fdm.min_bore`,
 //! `fdm.trapped_volume`, `fdm.support_volume`) need analyzers that do not
-//! exist yet (`pair_thickness`, `bore_metrics`, `internal_voids` — spec S3
-//! - S5) and are out of scope here.
+//! exist yet (`bore_metrics`, `internal_voids` — spec S4/S5) and are out
+//! of scope here.
 
-use crate::dfm::analyzers::{face_orientation_field, OrientationOutcome};
+use std::collections::BTreeSet;
+
+use crate::dfm::analyzers::{face_orientation_field, pair_thickness, OrientationOutcome};
 use crate::dfm::packs::{Rule, RulePack};
 use crate::dfm::provenance::RuleProvenance;
 use crate::dfm::report::{
@@ -37,16 +40,39 @@ pub fn overhang_provenance() -> RuleProvenance {
     }
 }
 
+/// Stable rule id for `fdm.min_wall` (spec §3.2), matches eval-16/17's
+/// "wall thickness" criterion verbatim.
+pub const MIN_WALL_RULE_ID: &str = "fdm.min_wall";
+
+/// Practice-derived provenance for `fdm.min_wall` (spec §3.2.1 "known
+/// landscape": the additive/DfAM governing lineage — ISO/ASTM 52900
+/// series — covers design *guidelines*, not a specific numeric wall-
+/// thickness-vs-nozzle-diameter multiplier; "2× nozzle diameter" is a
+/// widely-used slicer/shop convention, not a cited clause of any edition.
+/// Per the module's non-negotiable discipline, this stays `ShopPractice`.
+pub fn min_wall_provenance() -> RuleProvenance {
+    RuleProvenance::ShopPractice {
+        note: "wall thickness >= 2x nozzle diameter; practice-derived, no governing standard"
+            .to_string(),
+    }
+}
+
 /// The FDM pack's declared rule list (spec §3.2) tied to `params` the same
 /// way [`DfmReport`] ties itself to its own params (see
 /// [`crate::dfm::packs::RulePack`]).
 pub fn rule_pack(params: PackParams) -> RulePack {
     RulePack {
         params,
-        rules: vec![Rule {
-            id: OVERHANG_RULE_ID,
-            provenance: overhang_provenance(),
-        }],
+        rules: vec![
+            Rule {
+                id: OVERHANG_RULE_ID,
+                provenance: overhang_provenance(),
+            },
+            Rule {
+                id: MIN_WALL_RULE_ID,
+                provenance: min_wall_provenance(),
+            },
+        ],
     }
 }
 
@@ -283,11 +309,153 @@ pub fn evaluate_overhang(
     })
 }
 
+/// A sentinel "wall thickness" used ONLY for the vacuous case — the
+/// candidate face list contains no proven wall pair AND no unverifiable
+/// region at all (e.g. an empty face list, or a solid with no analytic
+/// wall-forming faces). Mirrors [`evaluate_overhang`]'s own `-90.0`
+/// "no candidate faces" fallback: a Pass with a deliberately huge (but
+/// finite — `serde_json` cannot round-trip `f64::INFINITY`) margin, never
+/// a fabricated real measurement. Named, not a magic number: 1e300 is far
+/// beyond any real-world dimension, so the resulting margin can never be
+/// mistaken for an actual measured wall.
+const NO_PAIR_SENTINEL_THICKNESS: f64 = 1.0e300;
+
+/// Evaluate `fdm.min_wall` (spec §3.2: wall thickness ≥ 2× nozzle
+/// diameter) over `faces`, riding [`pair_thickness`] (spec S3).
+///
+/// ## Aggregation policy (mirrors [`evaluate_overhang`]'s own multi-face
+/// policy, applied here across PAIRS rather than single faces)
+///
+/// A proven [`Verdict::Violation`] on any pair dominates: `measured` is
+/// the single THINNEST violating pair's thickness (the worst case);
+/// `witnesses` is the UNION of every face implicated across every
+/// violating pair (ascending `FaceId` order, deduplicated — `report.rs`'s
+/// own doc on [`Verdict::Violation::witnesses`] states "names every face
+/// implicated", not just the worst pair's two). Only when there are ZERO
+/// violating pairs does an [`crate::dfm::report::UnverifiableReason`]
+/// region force the rule to read `Unverifiable` (never `Pass` — the same
+/// honesty theorem [`evaluate_overhang`] and `report.rs` both apply).
+pub fn evaluate_min_wall(
+    faces: &[FaceId],
+    nozzle_diameter: f64,
+    face_store: &FaceStore,
+    loop_store: &LoopStore,
+    edge_store: &EdgeStore,
+    curve_store: &CurveStore,
+    surface_store: &SurfaceStore,
+) -> Result<RuleVerdict, DfmError> {
+    let outcome = pair_thickness(
+        faces,
+        face_store,
+        loop_store,
+        edge_store,
+        curve_store,
+        surface_store,
+    )?;
+    let threshold = 2.0 * nozzle_diameter;
+
+    let mut violations: Vec<(FaceId, FaceId, f64, Derivation)> = Vec::new();
+    let mut best_safe: Option<(f64, Derivation)> = None;
+
+    for pair in &outcome.pairs {
+        if pair.thickness.value < threshold {
+            violations.push((
+                pair.face_a,
+                pair.face_b,
+                pair.thickness.value,
+                pair.thickness.derivation.clone(),
+            ));
+        } else {
+            // Mutation-proof target (see task report): this is the ONE
+            // comparison deciding min_wall violation. Worst-case SAFE pair
+            // is the THINNEST one (closest to the threshold from above),
+            // mirroring `evaluate_overhang`'s "closest to violating"
+            // worst-safe policy.
+            let replace = match &best_safe {
+                Some((current, _)) => pair.thickness.value < *current,
+                None => true,
+            };
+            if replace {
+                best_safe = Some((pair.thickness.value, pair.thickness.derivation.clone()));
+            }
+        }
+    }
+
+    if !violations.is_empty() {
+        let (_, _, worst_thickness, worst_derivation) = violations
+            .iter()
+            .min_by(|a, b| a.2.total_cmp(&b.2))
+            .map(|(a, b, t, d)| (*a, *b, *t, d.clone()))
+            .unwrap_or((
+                0,
+                0,
+                threshold,
+                constant_derivation("unreachable: violations checked non-empty above"),
+            ));
+        let mut witness_set: BTreeSet<FaceId> = BTreeSet::new();
+        for (a, b, _, _) in &violations {
+            witness_set.insert(*a);
+            witness_set.insert(*b);
+        }
+        let witnesses: Vec<FaceRef> = witness_set.into_iter().collect();
+        return Ok(RuleVerdict {
+            rule: MIN_WALL_RULE_ID.to_string(),
+            verdict: Verdict::Violation {
+                witnesses,
+                measured: DfmValue::new(worst_thickness, worst_derivation),
+                limit: DfmValue::new(
+                    threshold,
+                    constant_derivation(
+                        "fdm.min_wall threshold: 2x nozzle diameter (shop practice)",
+                    ),
+                ),
+            },
+            provenance: min_wall_provenance(),
+        });
+    }
+
+    if !outcome.unverifiable.is_empty() {
+        let mut regions: Vec<FaceRef> = outcome.unverifiable.iter().map(|u| u.face).collect();
+        regions.sort_unstable();
+        // Deterministic choice of ONE reason (see `evaluate_overhang`'s
+        // identical convention): the lowest-FaceId region's reason. The
+        // pair_thickness analyzer already returns `unverifiable` sorted
+        // ascending by face (it folds a `BTreeMap`), so `[0]` is already
+        // the lowest — re-deriving via `regions[0]` after the explicit
+        // sort above keeps this independent of that internal ordering
+        // detail.
+        let reason = outcome
+            .unverifiable
+            .iter()
+            .find(|u| u.face == regions[0])
+            .map(|u| u.reason.clone())
+            .unwrap_or_else(|| UnverifiableReason::UnsupportedTopology {
+                detail: "unreachable: regions derived from outcome.unverifiable above".to_string(),
+            });
+        return Ok(RuleVerdict {
+            rule: MIN_WALL_RULE_ID.to_string(),
+            verdict: Verdict::Unverifiable { regions, reason },
+            provenance: min_wall_provenance(),
+        });
+    }
+
+    let (safe_thickness, safe_derivation) = best_safe.unwrap_or((
+        NO_PAIR_SENTINEL_THICKNESS,
+        constant_derivation("fdm.min_wall: no wall pairs found among candidate faces"),
+    ));
+    Ok(RuleVerdict {
+        rule: MIN_WALL_RULE_ID.to_string(),
+        verdict: Verdict::Pass {
+            margin: DfmValue::new(safe_thickness - threshold, safe_derivation),
+        },
+        provenance: min_wall_provenance(),
+    })
+}
+
 /// The FDM pack's `evaluate()` arm (spec §3.2 params: `nozzle_diameter`,
-/// `build_direction`; defaults 0.4 mm, +Z). `nozzle_diameter` is echoed on
-/// the report's [`PackParams`] but not otherwise used — `fdm.min_wall` is
-/// the rule that consumes it, and it is out of scope for this slice
-/// (needs `pair_thickness`, spec S3).
+/// `build_direction`; defaults 0.4 mm, +Z). Runs BOTH FDM rules —
+/// `fdm.overhang` (S2) and `fdm.min_wall` (S3) — and folds across them via
+/// [`DfmReport::new`]'s honesty fold.
 pub fn evaluate(
     faces: &[FaceId],
     nozzle_diameter: f64,
@@ -308,12 +476,21 @@ pub fn evaluate(
         curve_store,
         surface_store,
     )?;
+    let min_wall = evaluate_min_wall(
+        faces,
+        nozzle_diameter,
+        face_store,
+        loop_store,
+        edge_store,
+        curve_store,
+        surface_store,
+    )?;
     Ok(DfmReport::new(
         PackParams::Fdm {
             nozzle_diameter,
             build_direction,
         },
-        vec![overhang],
+        vec![overhang, min_wall],
     ))
 }
 
@@ -477,5 +654,231 @@ mod tests {
             }
             other => panic!("expected Violation, got {other:?}"),
         }
+    }
+
+    // ----- fdm.min_wall (S3) -----
+
+    /// Two opposing unit-square rectangle faces separated by `width` along
+    /// Z, fully overlapping footprints — the simplest possible exact wall
+    /// pair. Built directly (not via boolean/extrude), same convention as
+    /// `two_plane_faces_at` above and `thickness.rs`'s own test module.
+    fn rectangle_wall_pair(
+        width: f64,
+    ) -> (
+        crate::primitives::surface::SurfaceStore,
+        FaceStore,
+        LoopStore,
+        EdgeStore,
+        CurveStore,
+        FaceId,
+        FaceId,
+    ) {
+        use crate::math::Point3;
+        use crate::primitives::curve::{Line, ParameterRange};
+        use crate::primitives::edge::{Edge, EdgeOrientation};
+        use crate::primitives::face::{Face, FaceOrientation};
+        use crate::primitives::r#loop::{Loop, LoopType};
+        use crate::primitives::surface::{Plane, SurfaceStore};
+
+        let mut surfaces = SurfaceStore::new();
+        let mut faces = FaceStore::new();
+        let mut loops = LoopStore::new();
+        let mut edges = EdgeStore::new();
+        let mut curves = CurveStore::new();
+
+        fn add_face(
+            surfaces: &mut SurfaceStore,
+            faces: &mut FaceStore,
+            loops: &mut LoopStore,
+            edges: &mut EdgeStore,
+            curves: &mut CurveStore,
+            z: f64,
+            normal: Vector3,
+        ) -> FaceId {
+            let plane = Plane::from_point_normal(Point3::new(0.0, 0.0, z), normal)
+                .unwrap_or_else(|e| panic!("valid plane fixture: {e}"));
+            let surface_id = surfaces.add(Box::new(plane));
+
+            let corners = [
+                Point3::new(0.0, 0.0, z),
+                Point3::new(1.0, 0.0, z),
+                Point3::new(1.0, 1.0, z),
+                Point3::new(0.0, 1.0, z),
+            ];
+            let mut loop_ = Loop::new(0, LoopType::Outer);
+            for i in 0..4 {
+                let (start, end) = (corners[i], corners[(i + 1) % 4]);
+                let curve_id = curves.add(Box::new(Line::new(start, end)));
+                let edge = Edge::new(
+                    0,
+                    0,
+                    1,
+                    curve_id,
+                    EdgeOrientation::Forward,
+                    ParameterRange::unit(),
+                );
+                let edge_id = edges.add(edge);
+                loop_.add_edge(edge_id, true);
+            }
+            let outer_loop = loops.add(loop_);
+            let face = Face::new(0, surface_id, outer_loop, FaceOrientation::Forward);
+            faces.add(face)
+        }
+
+        let face_a = add_face(
+            &mut surfaces,
+            &mut faces,
+            &mut loops,
+            &mut edges,
+            &mut curves,
+            0.0,
+            Vector3::new(0.0, 0.0, -1.0),
+        );
+        let face_b = add_face(
+            &mut surfaces,
+            &mut faces,
+            &mut loops,
+            &mut edges,
+            &mut curves,
+            width,
+            Vector3::new(0.0, 0.0, 1.0),
+        );
+
+        (surfaces, faces, loops, edges, curves, face_a, face_b)
+    }
+
+    /// Hand-computed VIOLATION: a 0.5 mm wall against a 0.4 mm nozzle
+    /// (threshold 0.8 mm) — thinner than the floor, flagged with the
+    /// EXACT measured thickness, witnesses naming both faces of the pair.
+    #[test]
+    fn thin_wall_below_2x_nozzle_is_exact_violation() {
+        let (surfaces, faces, loops, edges, curves, face_a, face_b) = rectangle_wall_pair(0.5);
+        let verdict = evaluate_min_wall(
+            &[face_a, face_b],
+            0.4,
+            &faces,
+            &loops,
+            &edges,
+            &curves,
+            &surfaces,
+        )
+        .unwrap_or_else(|e| panic!("malformed-input free fixture: {e}"));
+
+        match verdict.verdict {
+            Verdict::Violation {
+                mut witnesses,
+                measured,
+                limit,
+            } => {
+                witnesses.sort_unstable();
+                let mut expected = vec![face_a, face_b];
+                expected.sort_unstable();
+                assert_eq!(witnesses, expected);
+                assert!(
+                    (measured.value - 0.5).abs() < 1e-9,
+                    "measured = {}",
+                    measured.value
+                );
+                assert!((limit.value - 0.8).abs() < 1e-9, "limit = {}", limit.value);
+            }
+            other => panic!("expected Violation, got {other:?}"),
+        }
+    }
+
+    /// Hand-computed PASS: a 5.0 mm wall against the same 0.8 mm
+    /// threshold — margin asserted exactly: `5.0 - 0.8 = 4.2`.
+    #[test]
+    fn thick_wall_above_2x_nozzle_passes_with_exact_margin() {
+        let (surfaces, faces, loops, edges, curves, face_a, face_b) = rectangle_wall_pair(5.0);
+        let verdict = evaluate_min_wall(
+            &[face_a, face_b],
+            0.4,
+            &faces,
+            &loops,
+            &edges,
+            &curves,
+            &surfaces,
+        )
+        .unwrap_or_else(|e| panic!("malformed-input free fixture: {e}"));
+
+        match verdict.verdict {
+            Verdict::Pass { margin } => {
+                assert!(
+                    (margin.value - 4.2).abs() < 1e-9,
+                    "margin = {}",
+                    margin.value
+                );
+            }
+            other => panic!("expected Pass, got {other:?}"),
+        }
+    }
+
+    /// Refusal flow-through: a lone NURBS face (no possible partner, and
+    /// itself an unsupported surface kind) must read `Unverifiable` for
+    /// `fdm.min_wall`, never `Pass`.
+    #[test]
+    fn nurbs_face_min_wall_is_unverifiable_never_pass() {
+        use crate::dfm::packs::fixtures::nurbs_face;
+        let (surfaces, faces, loops, edges, curves, face_id) = nurbs_face();
+
+        let verdict =
+            evaluate_min_wall(&[face_id], 0.4, &faces, &loops, &edges, &curves, &surfaces)
+                .unwrap_or_else(|e| panic!("malformed-input free fixture: {e}"));
+
+        match verdict.verdict {
+            Verdict::Unverifiable { regions, .. } => assert_eq!(regions, vec![face_id]),
+            other => panic!("expected Unverifiable, got {other:?}"),
+        }
+    }
+
+    /// Full-pack integration (spec §3.2): `evaluate()` now runs BOTH
+    /// `fdm.overhang` and `fdm.min_wall` on one candidate face set — a
+    /// thin wall pair (violates min_wall) plus a steep overhang face
+    /// (violates overhang) — and the report folds across BOTH rules.
+    #[test]
+    fn full_pack_evaluate_runs_both_rules_and_folds() {
+        use crate::dfm::report::DfmSummary;
+        use crate::math::Point3;
+        use crate::primitives::face::{Face, FaceOrientation};
+        use crate::primitives::r#loop::{Loop, LoopType};
+        use crate::primitives::surface::Plane;
+
+        let (mut surfaces, mut faces, mut loops, edges, curves, wall_a, wall_b) =
+            rectangle_wall_pair(0.5);
+
+        // Add one more face (steep overhang) to the SAME stores so a
+        // single evaluate() call sees both the wall pair and the
+        // overhang candidate.
+        let theta = 150f64.to_radians();
+        let normal = Vector3::new(theta.sin(), 0.0, theta.cos());
+        let plane = Plane::from_point_normal(Point3::new(5.0, 5.0, 5.0), normal)
+            .unwrap_or_else(|e| panic!("valid plane fixture: {e}"));
+        let surface_id = surfaces.add(Box::new(plane));
+        let outer_loop = loops.add(Loop::new(2, LoopType::Outer));
+        let face = Face::new(2, surface_id, outer_loop, FaceOrientation::Forward);
+        let overhang_face_id = faces.add(face);
+
+        let report = evaluate(
+            &[wall_a, wall_b, overhang_face_id],
+            0.4,
+            [0.0, 0.0, 1.0],
+            &faces,
+            &loops,
+            &edges,
+            &curves,
+            &surfaces,
+        )
+        .unwrap_or_else(|e| panic!("malformed-input free fixture: {e}"));
+
+        assert_eq!(report.verdicts().len(), 2, "both fdm rules must be present");
+        assert!(matches!(
+            report.verdicts()[0].verdict,
+            Verdict::Violation { .. }
+        ));
+        assert!(matches!(
+            report.verdicts()[1].verdict,
+            Verdict::Violation { .. }
+        ));
+        assert_eq!(report.summary(), DfmSummary::Violations { count: 2 });
     }
 }

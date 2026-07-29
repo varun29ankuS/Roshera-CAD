@@ -23,7 +23,7 @@
 //! reference direction, exact-or-refuse over the face's TRIMMED parameter
 //! domain (spec §3.1).
 //!
-//! ## Slice S2 (rule packs, this addition)
+//! ## Slice S2 (rule packs)
 //!
 //! `packs::fdm::evaluate_overhang` (`fdm.overhang`) and
 //! `packs::molding::evaluate_draft` (`mold.draft`) — the first two rules,
@@ -33,12 +33,21 @@
 //! proper (a generic engine over every pack) is separate, independently-
 //! tracked work; see `packs/mod.rs` module docs for why.
 //!
+//! ## Slice S3 (this addition)
+//!
+//! `analyzers::pair_thickness` — wall thickness between provably opposing
+//! face pairs (parallel planes / coaxial cylinders), exact-or-refuse, and
+//! `packs::fdm::evaluate_min_wall` (`fdm.min_wall`: wall thickness ≥ 2×
+//! nozzle diameter) riding it. `packs::fdm::evaluate` now runs BOTH FDM
+//! rules (`fdm.overhang`, `fdm.min_wall`) and folds across them.
+//!
 //! Planned layout (spec §3), populated incrementally:
 //! ```text
 //! dfm/
 //!   mod.rs        — public surface: analyze(...) -> DfmReport      (later)
-//!   analyzers/    — face_orientation_field (S2); 4 more analyzers  (later)
-//!   packs/        — fdm.rs, molding.rs (S2, here); cnc.rs, sheet.rs (later)
+//!   analyzers/    — face_orientation_field (S2), pair_thickness (S3);
+//!                   3 more analyzers                               (later)
+//!   packs/        — fdm.rs, molding.rs (S2/S3, here); cnc.rs, sheet.rs (later)
 //!   report.rs     — DfmReport, RuleVerdict, DfmValue, DfmSummary,
 //!                   DfmFact                                         (S1)
 //! ```
@@ -48,7 +57,10 @@ pub mod packs;
 pub mod provenance;
 pub mod report;
 
-pub use analyzers::{face_orientation_field, OrientationOutcome};
+pub use analyzers::{
+    face_orientation_field, pair_thickness, FacePair, OrientationOutcome, PairThicknessOutcome,
+    UnpairedRegion,
+};
 pub use packs::{Rule, RulePack};
 pub use provenance::{RuleProvenance, StandardBody};
 pub use report::{
