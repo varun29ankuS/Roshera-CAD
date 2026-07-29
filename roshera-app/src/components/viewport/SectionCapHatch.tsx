@@ -1,4 +1,4 @@
-import { useMemo } from 'react'
+import { useEffect, useMemo } from 'react'
 import * as THREE from 'three'
 import type { SectionCapMesh } from '@/lib/section-api'
 
@@ -50,6 +50,16 @@ interface SectionCapHatchProps {
  */
 export function SectionCapHatch({ cap }: SectionCapHatchProps) {
   const geometry = useMemo(() => buildHatchGeometry(cap), [cap])
+
+  // Dispose the line buffer on replacement/unmount. `cap` changes on every
+  // tick of the section offset/axis drag, and one hatch mesh exists per cap,
+  // so the leak here compounds with SectionCap's. Declared before the
+  // early return below — hooks must run unconditionally.
+  useEffect(() => {
+    return () => {
+      geometry?.dispose()
+    }
+  }, [geometry])
 
   // No geometry if the cap is degenerate / empty.
   if (geometry === null) {

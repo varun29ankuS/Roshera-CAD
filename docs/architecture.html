@@ -1,0 +1,970 @@
+<title>Roshera Architecture Atlas</title>
+<meta name="description" content="Verified architecture map of the Roshera workspace: star topology, self-certifying kernel, API/MCP surfaces, flows, and known gaps.">
+<style>
+  :root {
+    --paper: #fbfaf7;
+    --ink: #1a1a18;
+    --ink-soft: #4a4844;
+    --hair: #d8d5cc;
+    --hair-strong: #b8b4a8;
+    --accent: #0F4C81;
+    --accent-soft: #e8eef4;
+    --amber: #a6690a;
+    --amber-bg: #fbf3e6;
+    --mono: ui-monospace, "SF Mono", "Cascadia Code", Consolas, monospace;
+    --sans: -apple-system, "Segoe UI", Inter, Helvetica, Arial, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --paper: #17181a;
+      --ink: #e8e6e0;
+      --ink-soft: #a8a49a;
+      --hair: #34322e;
+      --hair-strong: #4a473f;
+      --accent: #6ea3d8;
+      --accent-soft: #1c2933;
+      --amber: #d99a3d;
+      --amber-bg: #2a2318;
+    }
+  }
+  :root[data-theme="dark"] {
+    --paper: #17181a; --ink: #e8e6e0; --ink-soft: #a8a49a; --hair: #34322e;
+    --hair-strong: #4a473f; --accent: #6ea3d8; --accent-soft: #1c2933;
+    --amber: #d99a3d; --amber-bg: #2a2318;
+  }
+  :root[data-theme="light"] {
+    --paper: #fbfaf7; --ink: #1a1a18; --ink-soft: #4a4844; --hair: #d8d5cc;
+    --hair-strong: #b8b4a8; --accent: #0F4C81; --accent-soft: #e8eef4;
+    --amber: #a6690a; --amber-bg: #fbf3e6;
+  }
+  * { box-sizing: border-box; }
+  html { background: var(--paper); }
+  body {
+    background: var(--paper);
+    color: var(--ink);
+    font-family: var(--sans);
+    font-size: 15px;
+    line-height: 1.55;
+    max-width: 980px;
+    margin: 0 auto;
+    padding: 0 24px 80px;
+  }
+  h1, h2, h3, h4 { font-weight: 600; letter-spacing: -0.01em; }
+  h1 { font-size: 1.9rem; margin: 0 0 4px; }
+  h2 { font-size: 1.25rem; margin: 0 0 14px; padding-top: 10px; border-top: 1px solid var(--hair); }
+  h3 { font-size: 1.02rem; margin: 22px 0 8px; color: var(--ink); }
+  h4 { font-size: 0.92rem; margin: 14px 0 6px; color: var(--ink-soft); text-transform: uppercase; letter-spacing: 0.04em; }
+  p { margin: 8px 0; }
+  a { color: var(--accent); }
+  code, .mono { font-family: var(--mono); font-size: 0.86em; }
+  .rev { font-family: var(--mono); font-size: 0.85rem; color: var(--ink-soft); }
+  header.doc-head {
+    padding: 36px 0 20px;
+    border-bottom: 2px solid var(--ink);
+    margin-bottom: 10px;
+  }
+  .doc-head .meta { display: flex; gap: 18px; flex-wrap: wrap; margin-top: 8px; font-size: 0.85rem; color: var(--ink-soft); }
+  .doc-head .thesis { margin-top: 14px; max-width: 74ch; color: var(--ink-soft); font-size: 0.95rem; }
+
+  nav.minibar {
+    position: sticky; top: 0; z-index: 50;
+    background: color-mix(in srgb, var(--paper) 92%, transparent);
+    backdrop-filter: blur(6px);
+    border-bottom: 1px solid var(--hair);
+    padding: 8px 0;
+    margin: 0 -24px 28px;
+    padding-left: 24px; padding-right: 24px;
+    overflow-x: auto;
+    white-space: nowrap;
+  }
+  nav.minibar a {
+    display: inline-block;
+    margin-right: 4px;
+    padding: 5px 10px;
+    font-size: 0.78rem;
+    text-decoration: none;
+    color: var(--ink-soft);
+    border: 1px solid transparent;
+    border-radius: 3px;
+    letter-spacing: 0.01em;
+  }
+  nav.minibar a:hover { border-color: var(--hair-strong); color: var(--ink); }
+
+  section { margin-bottom: 46px; scroll-margin-top: 54px; }
+  .lede { color: var(--ink-soft); font-size: 0.92rem; max-width: 76ch; }
+
+  /* topology */
+  .topo-wrap { border: 1px solid var(--hair); background: color-mix(in srgb, var(--paper) 97%, var(--ink) 3%); padding: 10px; overflow-x: auto; }
+  .topo-wrap svg { display: block; margin: 0 auto; max-width: 100%; height: auto; }
+  .topo-legend { display: flex; gap: 22px; flex-wrap: wrap; font-size: 0.78rem; color: var(--ink-soft); margin-top: 10px; }
+  .topo-legend span.sw { display: inline-block; width: 12px; height: 12px; border-radius: 50%; margin-right: 5px; vertical-align: -2px; }
+
+  /* component cards */
+  details.card {
+    border: 1px solid var(--hair);
+    margin-bottom: 8px;
+    background: color-mix(in srgb, var(--paper) 98%, var(--ink) 2%);
+  }
+  details.card > summary {
+    cursor: pointer;
+    list-style: none;
+    padding: 10px 14px;
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    font-weight: 600;
+  }
+  details.card > summary::-webkit-details-marker { display: none; }
+  details.card > summary::before {
+    content: "+";
+    color: var(--accent);
+    font-weight: 700;
+    width: 1em;
+  }
+  details.card[open] > summary::before { content: "\2212"; }
+  details.card > summary .kind {
+    font-weight: 400; font-size: 0.72rem; color: var(--ink-soft);
+    font-family: var(--mono); text-transform: uppercase; letter-spacing: 0.03em;
+    border: 1px solid var(--hair-strong); padding: 1px 6px; border-radius: 2px;
+  }
+  details.card > summary .path { font-weight: 400; font-size: 0.8rem; color: var(--ink-soft); font-family: var(--mono); }
+  .card-body { padding: 4px 14px 16px 30px; }
+  .card-body table { width: 100%; }
+
+  table { border-collapse: collapse; width: 100%; margin: 6px 0 14px; font-size: 0.86rem; }
+  th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--hair); vertical-align: top; }
+  th { font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.03em; color: var(--ink-soft); border-bottom: 1px solid var(--hair-strong); }
+  td.mono, th.mono { font-family: var(--mono); font-size: 0.82em; }
+  ul.tight { margin: 4px 0; padding-left: 20px; }
+  ul.tight li { margin: 3px 0; }
+
+  .cert-item { border-left: 2px solid var(--accent); padding: 4px 0 4px 12px; margin: 8px 0; }
+  .cert-item b { color: var(--accent); }
+  .panel { border: 1px solid var(--hair); padding: 14px 16px; background: color-mix(in srgb, var(--paper) 98%, var(--ink) 2%); margin-bottom: 14px; }
+  .panel h4:first-child { margin-top: 0; }
+
+  details.flow { border: 1px solid var(--hair); margin-bottom: 8px; }
+  details.flow > summary { cursor: pointer; padding: 9px 14px; font-weight: 600; list-style: none; }
+  details.flow > summary::-webkit-details-marker { display: none; }
+  details.flow > summary::before { content: "\25B8  "; color: var(--accent); }
+  details.flow[open] > summary::before { content: "\25BE  "; }
+  ol.steps { margin: 4px 14px 14px 44px; padding: 0; }
+  ol.steps li { margin: 6px 0; font-size: 0.88rem; }
+  ol.steps .where { color: var(--accent); font-weight: 600; font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.02em; }
+  ol.steps .file { display: block; color: var(--ink-soft); font-size: 0.78rem; margin-top: 2px; }
+
+  .gap { border-left: 3px solid var(--amber); background: var(--amber-bg); padding: 10px 14px; margin-bottom: 10px; }
+  .gap b { display: block; margin-bottom: 3px; }
+  .gap .ev, .gap .imp { font-size: 0.85rem; margin-top: 4px; }
+  .gap .ev b, .gap .imp b { display: inline; font-weight: 600; margin: 0; }
+
+  dl.glossary { display: grid; grid-template-columns: max-content 1fr; gap: 6px 18px; }
+  dl.glossary dt { font-weight: 600; font-family: var(--mono); font-size: 0.86rem; white-space: nowrap; padding-top: 2px; }
+  dl.glossary dd { margin: 0 0 10px; font-size: 0.88rem; color: var(--ink-soft); }
+
+  footer { margin-top: 60px; padding-top: 16px; border-top: 1px solid var(--hair); font-size: 0.78rem; color: var(--ink-soft); }
+</style>
+
+<header class="doc-head">
+  <h1>Roshera Architecture Atlas</h1>
+  <div class="meta">
+    <span class="rev">git rev <code>0857ca85</code></span>
+    <span>generated 2026-07-27</span>
+    <span>assembled from five verified mapper reports (backend, kernel, frontend, agent-layers, flows)</span>
+  </div>
+  <p class="thesis">Roshera is an agent runtime for geometry, not a CAD tool in the traditional sense: the backend/SDK is the product and the React viewport is one thin client, with agents as the primary orchestrated actor and humans directing at a higher level. The system is built star-topology around a self-certifying B-Rep kernel that cannot lie &mdash; every mutating operation is checked against a nine-conjunct validity certificate computed fresh from geometry, never asserted. The governing discipline is <strong>honest refusal over silent wrong answers</strong>: operations outside a verified envelope return typed errors rather than approximations mislabeled as exact. Code is the ultimate truth; this document describes one revision and decays from there.</p>
+</header>
+
+<nav class="minibar">
+  <a href="#topology">Topology</a>
+  <a href="#components">Components</a>
+  <a href="#certificate">Certificate</a>
+  <a href="#flows">Flows</a>
+  <a href="#surface">API / MCP</a>
+  <a href="#persistence">Persistence</a>
+  <a href="#auth">Auth</a>
+  <a href="#gaps">Gaps &amp; stale docs</a>
+  <a href="#eval">Eval corpus</a>
+  <a href="#glossary">Glossary</a>
+</nav>
+
+<section id="topology">
+  <h2>Star topology</h2>
+  <p class="lede">geometry-engine is the sink every non-leaf crate reaches. api-server is the sole binary at the top, orchestrating everything with &ldquo;no geometric logic&rdquo; of its own. Arrows are verified dependency edges (crate&rarr;crate <code>Cargo.toml</code> deps, plus the three external clients calling api-server over HTTP/WS). shared-types, ros-format, and assembly-engine are leaves &mdash; zero intra-workspace dependencies of their own.</p>
+  <div class="topo-wrap">
+    <svg viewBox="0 0 900 700" width="900" height="700" role="img" aria-label="Star topology dependency diagram">
+      <defs>
+        <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+          <path d="M0,0 L10,5 L0,10 z" fill="var(--accent)" opacity="0.55"/>
+        </marker>
+      </defs>
+      <style>
+        .edge { stroke: var(--accent); stroke-width: 1; opacity: 0.32; fill: none; marker-end: url(#arrow); }
+        .node circle, .node rect { stroke: var(--ink); stroke-width: 1.1; }
+        .node text { font-family: var(--sans); fill: var(--ink); text-anchor: middle; }
+        .node .name { font-size: 12.5px; font-weight: 600; }
+        .node .tag { font-size: 9px; fill: var(--ink-soft); }
+        .n-sink circle { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 2; }
+        .n-orch rect { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 1.6; }
+        .n-crate circle { fill: var(--paper); }
+        .n-leaf circle { fill: var(--paper); stroke-dasharray: 3 2; }
+        .n-client rect { fill: var(--paper); stroke-dasharray: 2 2; }
+      </style>
+
+      <!-- edges: crate deps -->
+      <g class="edges">
+        <path class="edge" d="M450,420 L450,660"/>
+        <path class="edge" d="M200,300 L450,660"/>
+        <path class="edge" d="M200,300 L700,300"/>
+        <path class="edge" d="M700,300 L450,660"/>
+        <path class="edge" d="M700,300 L450,420"/>
+        <path class="edge" d="M790,470 L450,660"/>
+        <path class="edge" d="M790,470 L450,420"/>
+        <path class="edge" d="M790,470 L700,300"/>
+        <path class="edge" d="M790,470 L790,600"/>
+        <path class="edge" d="M110,470 L450,660"/>
+        <path class="edge" d="M110,470 L450,420"/>
+        <path class="edge" d="M110,470 L200,300"/>
+        <path class="edge" d="M110,470 L700,300"/>
+        <path class="edge" d="M110,470 L790,470"/>
+        <path class="edge" d="M600,610 L450,660"/>
+        <path class="edge" d="M600,610 L700,300"/>
+        <path class="edge" d="M450,190 L450,660"/>
+        <path class="edge" d="M450,190 L450,420"/>
+        <path class="edge" d="M450,190 L200,300"/>
+        <path class="edge" d="M450,190 L700,300"/>
+        <path class="edge" d="M450,190 L110,470"/>
+        <path class="edge" d="M450,190 L790,470"/>
+        <path class="edge" d="M450,190 L110,600"/>
+        <path class="edge" d="M170,60 L450,190"/>
+        <path class="edge" d="M730,60 L450,190"/>
+        <path class="edge" d="M450,50 L450,190"/>
+      </g>
+
+      <!-- external clients -->
+      <g class="node n-client" transform="translate(170,60)">
+        <rect x="-62" y="-16" width="124" height="32" rx="3"/>
+        <text class="name" y="-1">roshera-app</text>
+        <text class="tag" y="12">react client</text>
+      </g>
+      <g class="node n-client" transform="translate(730,60)">
+        <rect x="-62" y="-16" width="124" height="32" rx="3"/>
+        <text class="name" y="-1">roshera-mcp</text>
+        <text class="tag" y="12">mcp server</text>
+      </g>
+      <g class="node n-client" transform="translate(450,50)">
+        <rect x="-58" y="-14" width="116" height="28" rx="3"/>
+        <text class="name" y="1">roshera-eval</text>
+      </g>
+
+      <!-- orchestrator -->
+      <g class="node n-orch" transform="translate(450,190)">
+        <rect x="-72" y="-20" width="144" height="40" rx="3"/>
+        <text class="name" y="-2">api-server</text>
+        <text class="tag" y="13">orchestrator</text>
+      </g>
+
+      <!-- mid-ring crates -->
+      <g class="node n-crate" transform="translate(200,300)">
+        <circle r="46"/>
+        <text class="name" y="-3">session-</text>
+        <text class="name" y="10">manager</text>
+      </g>
+      <g class="node n-crate" transform="translate(700,300)">
+        <circle r="46"/>
+        <text class="name" y="-3">timeline-</text>
+        <text class="name" y="10">engine</text>
+      </g>
+      <g class="node n-crate" transform="translate(110,470)">
+        <circle r="46"/>
+        <text class="name" y="-3">ai-</text>
+        <text class="name" y="10">integration</text>
+      </g>
+      <g class="node n-crate" transform="translate(790,470)">
+        <circle r="46"/>
+        <text class="name" y="-3">export-</text>
+        <text class="name" y="10">engine</text>
+      </g>
+      <g class="node n-crate" transform="translate(600,610)">
+        <circle r="42"/>
+        <text class="name" y="-3">verdict-</text>
+        <text class="name" y="10">harness</text>
+      </g>
+
+      <!-- leaves -->
+      <g class="node n-leaf" transform="translate(790,600)">
+        <circle r="40"/>
+        <text class="name" y="-3">ros-</text>
+        <text class="name" y="9">format</text>
+        <text class="tag" y="24">leaf</text>
+      </g>
+      <g class="node n-leaf" transform="translate(110,600)">
+        <circle r="44"/>
+        <text class="name" y="-6">assembly-</text>
+        <text class="name" y="7">engine</text>
+        <text class="tag" y="22">leaf</text>
+      </g>
+
+      <!-- sink -->
+      <g class="node n-sink" transform="translate(450,420)">
+        <circle r="58"/>
+        <text class="name" y="-4">geometry-</text>
+        <text class="name" y="12">engine</text>
+        <text class="tag" y="27">the kernel (sink)</text>
+      </g>
+
+      <g class="node n-leaf" transform="translate(450,660)">
+        <rect x="0" y="0" width="0" height="0" opacity="0"/>
+        <circle r="34"/>
+        <text class="name" y="-3">shared-</text>
+        <text class="name" y="9">types</text>
+        <text class="tag" y="22">leaf</text>
+      </g>
+    </svg>
+  </div>
+  <div class="topo-legend">
+    <div><span class="sw" style="background:var(--accent-soft); border:2px solid var(--accent); border-radius:50%;"></span>kernel (sink) &amp; orchestrator</div>
+    <div><span class="sw" style="background:var(--paper); border:1px solid var(--ink);"></span>ordinary crate</div>
+    <div><span class="sw" style="background:var(--paper); border:1px dashed var(--hair-strong);"></span>leaf (zero workspace deps)</div>
+    <div><span class="sw" style="background:var(--paper); border:1px dashed var(--hair-strong); border-radius:2px;"></span>external client (calls api-server over REST/WS)</div>
+  </div>
+</section>
+
+<section id="components">
+  <h2>Components</h2>
+  <p class="lede">One entry per workspace crate plus the three agent/human-facing layers and the docs site / red-gate script. Expand for modules, interfaces, invariants, and notes.</p>
+
+  <details class="card">
+    <summary>shared-types <span class="kind">rust-crate</span> <span class="path">roshera-backend/shared-types</span></summary>
+    <div class="card-body">
+      <p>Core DTOs shared across the entire workspace: geometry representations, commands, materials, session, and error types. No geometric logic.</p>
+      <table><tr><th>Module</th><th>Role</th></tr>
+        <tr><td class="mono">src/api</td><td>API-facing DTO shapes</td></tr>
+        <tr><td class="mono">src/commands</td><td>Command/CommandResult types</td></tr>
+        <tr><td class="mono">src/geometry</td><td>geometry reps (CADObject, MeshData, AnalyticalGeometry, Transform3D)</td></tr>
+        <tr><td class="mono">src/geometry_commands</td><td>geometry command payloads, ExportFormat enum</td></tr>
+        <tr><td class="mono">src/timeline_types</td><td>timeline/event DTOs</td></tr>
+        <tr><td class="mono">src/vision</td><td>ViewportCapture/CameraInfo/SceneObject DTOs</td></tr>
+      </table>
+      <p><b>Interfaces:</b> lib &mdash; consumed by every non-leaf crate in the workspace.</p>
+      <p><b>Depends on:</b> none.</p>
+      <ul class="tight"><li>Leaf crate: zero intra-workspace dependencies.</li></ul>
+    </div>
+  </details>
+
+  <details class="card">
+    <summary>geometry-engine <span class="kind">rust-crate</span> <span class="path">roshera-backend/geometry-engine</span></summary>
+    <div class="card-body">
+      <p>The B-Rep kernel &mdash; &ldquo;high-performance boundary representation engine&rdquo;. The sink every non-leaf crate reaches. Hosts the self-certifying invariant, exact predicates, booleans/blends/sketch solver/tessellation, and the readable/ surface that makes Roshera an agent runtime for geometry.</p>
+      <table><tr><th>Module</th><th>Role</th></tr>
+        <tr><td class="mono">primitives/topology_builder.rs</td><td>BRepModel host; certify_solid / compute_certificate / certificate; record_operation funnel</td></tr>
+        <tr><td class="mono">primitives/mass_properties.rs</td><td>exact analytic mass props via per-face Gauss quadrature</td></tr>
+        <tr><td class="mono">operations/</td><td>every kernel verb: boolean, extrude, revolve, sweep, loft, fillet, chamfer, offset/shell, transform, pattern, mould, section, trim, blend infra</td></tr>
+        <tr><td class="mono">math/exact_predicates.rs</td><td>adaptive-precision exact predicates</td></tr>
+        <tr><td class="mono">sketch2d/</td><td>2D sketch primitives + constraint solver (Newton-Raphson, DR-plan decomposition)</td></tr>
+        <tr><td class="mono">tessellation/</td><td>mesh/curve/surface tessellation, curved CDT, LRU content-hashed cache</td></tr>
+        <tr><td class="mono">perception/reconcile.rs</td><td>dual-eye truth/scene/semantic cross-check</td></tr>
+        <tr><td class="mono">readable/</td><td>agent-facing wire records, dimensioning, feature extraction, blackboard claim verification</td></tr>
+        <tr><td class="mono">queries/</td><td>spatial query core &mdash; &ldquo;queries never mutate the model&rdquo;</td></tr>
+        <tr><td class="mono">drawing/</td><td>DXF/PDF/SVG generation, layout, GD&amp;T, section views</td></tr>
+        <tr><td class="mono">harness/</td><td>kernel measurement + ablation harness</td></tr>
+      </table>
+      <p><b>Interfaces:</b> lib &mdash; no direct network surface, reached only through api-server.</p>
+      <p><b>Depends on:</b> shared-types.</p>
+      <h4>Invariants</h4>
+      <ul class="tight">
+        <li>Nine-conjunct ValidityCertificate::is_sound() re-derived from geometry on every certify_solid call, never asserted from history.</li>
+        <li>Workspace lints deny unwrap_used/expect_used/panic in production code.</li>
+        <li>record_operation funnel invalidates the certificate cache for every input/output solid on every mutating op, even with no recorder attached.</li>
+        <li>Mass properties never fabricated: per-quantity Exactness enum (Exact / Approximate{method,bound} / Unavailable).</li>
+        <li>Generalized Euler&ndash;Poincar&eacute; check, not naive V-E+F=2.</li>
+      </ul>
+      <p><b>Notes:</b> 208 top-level integration test files + 5 Criterion benches; KNOWN_REDS.md currently empty (30 pre-existing reds fixed 2026-07-07, ratchet permanent).</p>
+    </div>
+  </details>
+
+  <details class="card">
+    <summary>session-manager <span class="kind">rust-crate</span> <span class="path">roshera-backend/session-manager</span></summary>
+    <div class="card-body">
+      <p>Session state, persistence, RBAC, and real-time collaboration support.</p>
+      <table><tr><th>Module</th><th>Role</th></tr>
+        <tr><td class="mono">src/auth</td><td>JWT + API-key AuthManager</td></tr>
+        <tr><td class="mono">src/database</td><td>DatabasePersistence trait + Postgres/SQLite impls</td></tr>
+        <tr><td class="mono">src/permissions</td><td>RBAC permission checks</td></tr>
+        <tr><td class="mono">src/collaboration</td><td>multi-user session collaboration</td></tr>
+        <tr><td class="mono">src/timeline_integration</td><td>bridges session state to timeline-engine</td></tr>
+      </table>
+      <p><b>Interfaces:</b> lib, consumed by api-server and ai-integration.</p>
+      <p><b>Depends on:</b> shared-types, timeline-engine.</p>
+      <ul class="tight"><li>session-manager is the sole AuthManager owner in AppState.</li></ul>
+    </div>
+  </details>
+
+  <details class="card">
+    <summary>timeline-engine <span class="kind">rust-crate</span> <span class="path">roshera-backend/timeline-engine</span></summary>
+    <div class="card-body">
+      <p>Event-sourced design history and replay &mdash; the timeline is a mould, not a parametric feature tree.</p>
+      <table><tr><th>Module</th><th>Role</th></tr>
+        <tr><td class="mono">src/timeline.rs</td><td>core Timeline / timeline_impl</td></tr>
+        <tr><td class="mono">src/branch</td><td>BranchManager, merge</td></tr>
+        <tr><td class="mono">src/replay</td><td>rebuild BRepModel from events</td></tr>
+        <tr><td class="mono">src/incremental</td><td>dirty-subtree parametric-DAG rebuild (#64)</td></tr>
+        <tr><td class="mono">src/mould</td><td>parameter override events (#16)</td></tr>
+        <tr><td class="mono">src/rebuild_certificate.rs</td><td>soundness re-measured on rebuild, never asserted</td></tr>
+        <tr><td class="mono">src/recorder_bridge.rs</td><td>TimelineRecorder &mdash; sync-kernel to async MPSC bridge</td></tr>
+        <tr><td class="mono">src/storage</td><td><b>DEAD CODE</b> &mdash; file-based StorageEngine defined but never referenced outside its own mod.rs</td></tr>
+        <tr><td class="mono">src/event_certificate.rs</td><td>EventCertificate type &mdash; defined, no production producer</td></tr>
+      </table>
+      <p><b>Interfaces:</b> lib, consumed by session-manager, export-engine, ai-integration, verdict-harness, api-server.</p>
+      <p><b>Depends on:</b> shared-types, geometry-engine.</p>
+      <h4>Invariants</h4>
+      <ul class="tight"><li>RecordedOperation kind/params/typed-inputs-outputs only via with_input_*/with_output_* builders &mdash; never hand-assembled.</li></ul>
+      <p><b>Notes:</b> storage/StorageEngine is dead code &mdash; live persistence is api-server/src/durability.rs + session-manager::database.</p>
+    </div>
+  </details>
+
+  <details class="card">
+    <summary>api-server <span class="kind">rust-crate</span> <span class="path">roshera-backend/api-server</span></summary>
+    <div class="card-body">
+      <p>Axum HTTP/WebSocket/SSE server; the star-topology orchestrator binary &mdash; &ldquo;contains no geometric logic&rdquo; itself.</p>
+      <table><tr><th>Module</th><th>Role</th></tr>
+        <tr><td class="mono">src/main.rs</td><td>9745-line entry point: build_router, AppState, boot sequence</td></tr>
+        <tr><td class="mono">src/durability.rs</td><td>event-log durability: DatabaseEventSink::persist, boot_replay, quarantine</td></tr>
+        <tr><td class="mono">src/reconcile_task.rs</td><td>async 14-viewpoint dual-eye reconcile driver (VIEWPOINTS=14, line 51)</td></tr>
+        <tr><td class="mono">src/auth_middleware.rs</td><td>AuthPosture, path_is_exempt, scoped permission gates</td></tr>
+        <tr><td class="mono">src/blackboard.rs</td><td>BlackboardManager &mdash; per-scope notebooks, append-only event log</td></tr>
+        <tr><td class="mono">src/handlers/agent.rs</td><td>48 handler fns &mdash; thin REST projection of kernel readable/</td></tr>
+        <tr><td class="mono">src/handlers/timeline.rs</td><td>evidence-pack, timeline CRUD, branch management</td></tr>
+      </table>
+      <p><b>Interfaces:</b> rest (full surface, see API/MCP section); ws (GET /ws); sse (/api/logs/stream, /api/ai/command/stream).</p>
+      <p><b>Depends on:</b> shared-types, geometry-engine, session-manager, timeline-engine, ai-integration, export-engine, assembly-engine.</p>
+      <h4>Invariants</h4>
+      <ul class="tight">
+        <li>AppState.model: Arc&lt;RwLock&lt;BRepModel&gt;&gt; is the single process-wide kernel instance.</li>
+        <li>certified_response computes the certificate synchronously under the model write lock before any response leaves the process.</li>
+        <li>Dual-eye 14-viewpoint reconcile always runs off the write lock, fire-and-forget.</li>
+      </ul>
+      <p><b>Notes:</b> Auth-exempt paths are exactly /, /health, /api/auth/login|register|refresh, and /ws + /ws/* (upgrade only).</p>
+    </div>
+  </details>
+
+  <details class="card">
+    <summary>ai-integration <span class="kind">rust-crate</span> <span class="path">roshera-backend/ai-integration</span></summary>
+    <div class="card-body">
+      <p>Natural-language processing that translates/delegates to the kernel &mdash; never builds geometry itself. API-only AI; local runtimes explicitly not permitted.</p>
+      <table><tr><th>Module</th><th>Role</th></tr>
+        <tr><td class="mono">src/providers</td><td>claude.rs, mock.rs, native_factory.rs, universal_endpoint.rs</td></tr>
+        <tr><td class="mono">src/executor.rs</td><td>parsed AI commands to kernel boolean/offset/transform + primitives</td></tr>
+        <tr><td class="mono">src/full_integration_executor.rs</td><td>broader executor: export, timeline, session, fillet/chamfer/revolve/extrude</td></tr>
+        <tr><td class="mono">src/smart_router.rs</td><td>top-level command routing</td></tr>
+        <tr><td class="mono">src/pipeline</td><td>vision pipeline routing ViewportCapture</td></tr>
+      </table>
+      <p><b>Interfaces:</b> lib, wired into api-server behind ai_configured (set iff ANTHROPIC_API_KEY present at boot).</p>
+      <p><b>Depends on:</b> shared-types, geometry-engine, session-manager, timeline-engine, export-engine.</p>
+      <h4>Invariants</h4>
+      <ul class="tight"><li>ProviderUnavailable pattern: every entry point errors when the API key is absent &mdash; no offline fallback or mock outside cfg(test)/mock-providers.</li></ul>
+      <p><b>Notes:</b> Only ClaudeProvider is actually compiled/implemented; other provider profiles listed in config are not wired.</p>
+    </div>
+  </details>
+
+  <details class="card">
+    <summary>export-engine <span class="kind">rust-crate</span> <span class="path">roshera-backend/export-engine</span></summary>
+    <div class="card-body">
+      <p>Export to CAD interchange formats: STL, OBJ, STEP, ROS (DXF/PDF drawing export lives in geometry-engine/drawing, not here).</p>
+      <table><tr><th>Module</th><th>Role</th></tr>
+        <tr><td class="mono">src/formats.rs</td><td>validate_mesh_for_export gate (AUDIT-H12: counts, normals, caps 15M verts/5M tris)</td></tr>
+        <tr><td class="mono">src/formats/step</td><td>three-tier handler-dispatch STEP importer + writer.rs exporter</td></tr>
+        <tr><td class="mono">src/formats/ros.rs</td><td>.ros v3.1 writer: header + mandatory HIST + mandatory PROV + optional GEOM/SIGN</td></tr>
+        <tr><td class="mono">src/formats/timeline_chunk.rs</td><td>HIST chunk carrying TimelineEvent</td></tr>
+      </table>
+      <p><b>Interfaces:</b> lib, consumed by api-server and ai-integration.</p>
+      <p><b>Depends on:</b> shared-types, geometry-engine, timeline-engine, ros-format.</p>
+      <h4>Invariants</h4>
+      <ul class="tight"><li>STEP import pipeline is honest: no silent fallback &mdash; ImportReport names what happened.</li></ul>
+    </div>
+  </details>
+
+  <details class="card">
+    <summary>ros-format <span class="kind">rust-crate</span> <span class="path">roshera-backend/ros-format</span></summary>
+    <div class="card-body">
+      <p>Geometry-free building blocks for the .ros v3.1 format, split out so bridge/SDK consumers can read/write .ros without pulling in the kernel.</p>
+      <table><tr><th>Module</th><th>Role</th></tr>
+        <tr><td class="mono">src/header.rs</td><td>128-byte format header</td></tr>
+        <tr><td class="mono">src/aipr</td><td>AI-provenance PROV chunk</td></tr>
+        <tr><td class="mono">src/signature.rs</td><td>Ed25519 signing</td></tr>
+        <tr><td class="mono">src/access</td><td>RBAC/ABAC access control</td></tr>
+        <tr><td class="mono">src/merkle.rs</td><td>merkle integrity structures</td></tr>
+      </table>
+      <p><b>Interfaces:</b> lib.</p>
+      <p><b>Depends on:</b> none.</p>
+      <p><b>Notes:</b> Leaf crate. HIST chunk (needs TimelineEvent) intentionally stays in export-engine, not here.</p>
+    </div>
+  </details>
+
+  <details class="card">
+    <summary>verdict-harness <span class="kind">rust-crate</span> <span class="path">roshera-backend/verdict-harness</span></summary>
+    <div class="card-body">
+      <p>Research harness for multi-agent coordination atop timeline-engine &mdash; resolves conflicting branch mutations via a simulated room. Explicitly not wired into production.</p>
+      <table><tr><th>Module</th><th>Role</th></tr>
+        <tr><td class="mono">src/resolver.rs</td><td>VerdictResolver: Deterministic/Quorum/Veto/Authority</td></tr>
+        <tr><td class="mono">src/room.rs</td><td>RoomSimulator &mdash; drains proposals per tick, commits as verdict.commit</td></tr>
+        <tr><td class="mono">src/types.rs</td><td>Proposal/Vote/VerdictOutcome</td></tr>
+      </table>
+      <p><b>Interfaces:</b> lib; exploratory, not consumed by api-server.</p>
+      <p><b>Depends on:</b> shared-types, timeline-engine.</p>
+      <p><b>Notes:</b> Explicitly exploratory / research-only per source comments.</p>
+    </div>
+  </details>
+
+  <details class="card">
+    <summary>assembly-engine <span class="kind">rust-crate</span> <span class="path">roshera-backend/assembly-engine</span></summary>
+    <div class="card-body">
+      <p>Kinematic assembly: instance + mate model, SE(3) mate solve, interference and swept-clearance checks (Parry3D-f64 backed). Sound assembly means interference-free across every reachable DOF configuration, not just the current pose.</p>
+      <table><tr><th>Module</th><th>Role</th></tr>
+        <tr><td class="mono">src/solver.rs</td><td>SE(3) mate solve &mdash; analytic screw-calculus Jacobian, gauss_newton &mdash; &ldquo;the moat&rdquo;</td></tr>
+        <tr><td class="mono">src/interference.rs</td><td>static interference &mdash; Parry TriMesh, exact EPA penetration depth</td></tr>
+        <tr><td class="mono">src/sweep.rs</td><td>swept CCD &mdash; mate-derived joints, Parry nonlinear TOI (Rapier CCD)</td></tr>
+        <tr><td class="mono">src/grounding.rs</td><td>&ldquo;no-float&rdquo; grounding checks</td></tr>
+        <tr><td class="mono">src/certificate.rs</td><td>AssemblyCertificate</td></tr>
+      </table>
+      <p><b>Interfaces:</b> lib, depended on only by api-server.</p>
+      <p><b>Depends on:</b> none.</p>
+      <p><b>Notes:</b> Fully standalone &mdash; zero intra-workspace dependencies (only parry3d-f64 + serde, grep-confirmed). An observation, not a defect.</p>
+    </div>
+  </details>
+
+  <details class="card">
+    <summary>roshera-app <span class="kind">react-app</span> <span class="path">roshera-app</span></summary>
+    <div class="card-body">
+      <p>Thin display layer &mdash; React 19 / Vite / TypeScript / Three.js viewport. Renders backend-tessellated mesh buffers only; no client-side geometry kernel or mesh generation.</p>
+      <table><tr><th>Module</th><th>Role</th></tr>
+        <tr><td class="mono">src/App.tsx</td><td>top-level composition: TopBar, ViewportBridge, CommandPalette, LoginDialog + mode-conditional workspaces</td></tr>
+        <tr><td class="mono">src/components/viewport</td><td>~30 files: CADViewport, CADMesh (server mesh + sub-element pick), AgentEyePanel</td></tr>
+        <tr><td class="mono">src/lib/ws-client.ts</td><td>reconnect exp backoff cap 10s unlimited, 30s heartbeat, in-band Authenticate</td></tr>
+        <tr><td class="mono">src/lib/ws-bridge.ts</td><td>routes ServerMessages into zustand stores; full-scene resync on reconnect</td></tr>
+        <tr><td class="mono">src/lib/ws-schemas.ts</td><td>zod discriminated-union validation of every inbound WS frame</td></tr>
+        <tr><td class="mono">src/stores</td><td>9 zustand stores: scene, blackboard, chat, command-palette, doc-mode, assembly, theme, units, ws</td></tr>
+      </table>
+      <p><b>Interfaces:</b> rest (domain REST clients: assembly, csketch, drawings, export, labels, measure, parts, section, sketch, timeline-events, units); ws (/ws + dev-only /ws/viewport-bridge).</p>
+      <p><b>Depends on:</b> api-server.</p>
+      <h4>Invariants</h4>
+      <ul class="tight"><li>No client-side mesh generation; sub-element picks are server-resolved.</li></ul>
+      <p><b>Notes:</b> Drawings are fully server-rendered SVG injected via dangerouslySetInnerHTML (backend escape_xml-sanitized).</p>
+    </div>
+  </details>
+
+  <details class="card">
+    <summary>roshera-mcp <span class="kind">mcp-server</span> <span class="path">roshera-mcp</span></summary>
+    <div class="card-body">
+      <p>MCP server exposing the kernel to agents. One ToolTable feeds both the direct MCP surface and the meta-funnel &mdash; no dual schema/handler maintenance.</p>
+      <table><tr><th>Module</th><th>Role</th></tr>
+        <tr><td class="mono">src/surface.ts</td><td>CORE_SURFACE (18) + META_SURFACE (3) = MINIMAL_SURFACE (21, default)</td></tr>
+        <tr><td class="mono">src/metatools.ts</td><td>find_tool (ranked search), describe_tool (schema), invoke (same validator + handler)</td></tr>
+        <tr><td class="mono">src/workbench.ts</td><td>SWITCHABLE_BENCHES; LIVE_SURFACE_CEILING=35</td></tr>
+        <tr><td class="mono">src/core.ts</td><td>BASE=ROSHERA_URL; ApiKey auth; X-Roshera-Agent: Claude; ambient perception</td></tr>
+        <tr><td class="mono">src/index.ts</td><td>consumeRegistry() drift-hash check against kernel-served tool-registry</td></tr>
+      </table>
+      <p><b>Interfaces:</b> mcp (stdio server, node roshera-mcp/dist/index.js); talks REST to api-server.</p>
+      <p><b>Depends on:</b> api-server.</p>
+      <h4>Invariants</h4>
+      <ul class="tight"><li>invoke validates via the identical SDK normalizer as direct calls, then dispatches to the same handler &mdash; &ldquo;a meta-path call is never less checked.&rdquo;</li></ul>
+      <p><b>Notes:</b> Requires npm run build (dist/) + MCP reconnect after any tool change.</p>
+    </div>
+  </details>
+
+  <details class="card">
+    <summary>roshera-eval <span class="kind">eval-harness</span> <span class="path">roshera-eval</span></summary>
+    <div class="card-body">
+      <p>Certificate-scored agent evaluation scenarios (AGENT-EVAL-&alpha;) &mdash; the harness measures the whole system, not just the model.</p>
+      <table><tr><th>Module</th><th>Role</th></tr>
+        <tr><td class="mono">lib/harness.mjs</td><td>DIMS=[correctness,soundness,honesty,performance]; CERT_DIMS; runScenario/runSuite/scorecard</td></tr>
+        <tr><td class="mono">scenarios/</td><td>17 scenarios, each {id,title,dims,budgetMs,run} + pure oracle()</td></tr>
+        <tr><td class="mono">lib/client.mjs</td><td>thin HTTP client, X-Roshera-Agent: AgentEvalAlpha, mirrors roshera-mcp's REST shapes</td></tr>
+        <tr><td class="mono">run.mjs</td><td>preflights /health, runs suite, writes report.json, exit code = failed count</td></tr>
+      </table>
+      <p><b>Interfaces:</b> cli (npm run eval suite / npm run test:oracle offline).</p>
+      <p><b>Depends on:</b> api-server.</p>
+      <h4>Invariants</h4>
+      <ul class="tight"><li>request() never throws on 4xx/5xx &mdash; scenarios assert on honest refusals themselves.</li></ul>
+    </div>
+  </details>
+
+  <details class="card">
+    <summary>docs (GitHub Pages) <span class="kind">docs-site</span> <span class="path">docs</span></summary>
+    <div class="card-body">
+      <p>Public GitHub-Pages technical sheets describing the product claim, certificate, casebook, and envelope.</p>
+      <table><tr><th>Module</th><th>Role</th></tr>
+        <tr><td class="mono">docs/index.html</td><td>The Claim</td></tr>
+        <tr><td class="mono">docs/certificate.html</td><td>certificate explainer</td></tr>
+        <tr><td class="mono">docs/casebook.html</td><td>case studies</td></tr>
+        <tr><td class="mono">docs/envelope.html</td><td>verified-envelope explainer</td></tr>
+        <tr><td class="mono">docs/DEPLOYMENT.md</td><td>partner-instance runbook (Docker Compose)</td></tr>
+      </table>
+      <p><b>Interfaces:</b> lib &mdash; static site, no runtime dependency on the backend.</p>
+      <p><b>Depends on:</b> none.</p>
+    </div>
+  </details>
+
+  <details class="card">
+    <summary>red-gate.ps1 <span class="kind">script</span> <span class="path">roshera-backend/scripts/red-gate.ps1</span></summary>
+    <div class="card-body">
+      <p>Required pre-merge CI gate: runs cargo test -p geometry-engine --no-fail-fast, diffs the result against KNOWN_REDS.md.</p>
+      <table><tr><th>Module</th><th>Role</th></tr>
+        <tr><td class="mono">red-gate.ps1</td><td>exit 0 allowlist-match / 1 NEW_RED / 2 RATCHET_VIOLATION / 3 both</td></tr>
+      </table>
+      <p><b>Interfaces:</b> cli &mdash; invoked pre-merge; --lib green alone is explicitly insufficient.</p>
+      <p><b>Depends on:</b> geometry-engine.</p>
+      <h4>Invariants</h4>
+      <ul class="tight"><li>Ratchet: KNOWN_REDS entries only removed on green, never added without a diagnosis doc.</li></ul>
+      <p><b>Notes:</b> KNOWN_REDS.md currently empty (30 pre-existing reds fixed 2026-07-07).</p>
+    </div>
+  </details>
+</section>
+
+<section id="certificate">
+  <h2>The certificate</h2>
+  <p class="lede">ValidityCertificate &mdash; a nine-conjunct, geometry-derived soundness verdict recomputed on demand (never asserted from history) for every solid. Computed at <span class="mono">geometry-engine/src/primitives/topology_builder.rs</span> &mdash; <span class="mono">BRepModel::certificate</span> (~2642, hot path clones cache) / <span class="mono">compute_certificate</span> (~2687, private, always recomputes) / <span class="mono">certify_solid</span> (~2899, public wrapper).</p>
+
+  <h3>Nine conjuncts &mdash; all required for is_sound()</h3>
+  <div class="cert-item"><b>1. brep_valid</b> &mdash; validate_solid_scoped passes: Euler&ndash;Poincar&eacute;, manifold edges, pcurve references, orientation consistency, no degenerate/self-overlap faces.</div>
+  <div class="cert-item"><b>2. watertight</b> &mdash; tessellated mesh has zero boundary edges (manifold_report, chord 0.1, weld 1e-6).</div>
+  <div class="cert-item"><b>3. manifold</b> &mdash; every mesh edge borders exactly 2 faces.</div>
+  <div class="cert-item"><b>4. oriented</b> &mdash; every directed mesh edge traversed at most once &mdash; catches flipped-normal defects invisible to watertight+manifold alone.</div>
+  <div class="cert-item"><b>5. self_intersection_free</b> &mdash; coarse-chord (0.5) mesh self-intersection scan.</div>
+  <div class="cert-item"><b>6. construction_consistent</b> &mdash; linked source-sketch construction geometry stays co-located within a tolerance-band-expanded bbox (tri-state; only Inconsistent blocks soundness).</div>
+  <div class="cert-item"><b>7. eyes_consistent</b> &mdash; dual-eye render-free Truth&harr;Semantic cross-check: every RecognizedFeature must reference a live face and sit on the surface type its label implies; fails closed.</div>
+  <div class="cert-item"><b>8. tessellation.clean</b> &mdash; display-tessellation quality: no degenerate facets, normal agreement &ge;0.98, analytic agreement &ge;0.999, zero off-surface facets.</div>
+  <div class="cert-item"><b>9. mesh_quality.clean</b> &mdash; zero boundary-crossing facets, max normal deviation &le;40&deg; (aspect-ratio and min-angle are reported, not gated).</div>
+
+  <div class="panel">
+    <h4>Carried but excluded from is_sound()</h4>
+    <ul class="tight">
+      <li><b>labels_consistent</b> &mdash; tri-state annotation-defect signal; annotation defects are not geometric defects.</li>
+      <li><b>model_debris_orphan_faces</b> &mdash; a model-level fact (not this solid's fault), re-scanned on every certificate() call regardless of cache.</li>
+    </ul>
+  </div>
+
+  <div class="panel">
+    <h4>Memoization</h4>
+    <p><span class="mono">Solid.cached_certificate: RwLock&lt;Option&lt;ValidityCertificate&gt;&gt;</span> (solid.rs ~534). Lock is never held across the heavy compute: short read to check cache, compute lock-free, short write to store; last-write-wins, idempotent recompute.</p>
+    <h4>Invalidation seams</h4>
+    <ol class="tight" style="padding-left:20px; margin:4px 0;">
+      <li><b>record_operation funnel</b> (topology_builder.rs ~2472) &mdash; fires for every RecordedOperation input/output solid, even with no recorder attached (e.g. during timeline replay).</li>
+      <li><b>SolidStore::get_mut backstop</b> (~1840) &mdash; invalidates on any mutable borrow of a solid, regardless of call site.</li>
+      <li><b>Sidecar self-invalidation</b> &mdash; e.g. set_solid_construction (~2529).</li>
+    </ol>
+  </div>
+
+  <div class="panel">
+    <h4>Advisory 14-viewpoint dual-eye reconcile &mdash; separate from the gating certificate</h4>
+    <p>The 14-viewpoint reconcile (<span class="mono">api-server/src/reconcile_task.rs</span>, <span class="mono">VIEWPOINTS=14</span> at line 51) is advisory-severity and explicitly documented to <b>never</b> affect is_sound(). It runs off the write lock on an owned ModelSnapshot, fire-and-forget, capped at <span class="mono">MAX_CONCURRENT_RECONCILES=2</span>. It is distinct from conjunct 7 (eyes_consistent / TruthSemantic), which is synchronous, render-free, and is the one dual-eye axis that actually gates the certificate. <span class="mono">render/viewpoint.rs</span> (EYE-6, viewpoint-entropy best-view) is a separate on-demand selector, unrelated to the fixed 14.</p>
+  </div>
+
+  <div class="panel">
+    <h4>Mass-properties provenance</h4>
+    <p>MassPropertiesMethod is Analytical (exact divergence-theorem, planar solids) or Tessellated{rel_tolerance} (Tonon 2004, &asymp;5e-3 at fine tessellation). Each quantity (volume, center_of_mass, inertia) carries its own Exactness &mdash; Exact / Approximate{method, rel_error_bound} / Unavailable &mdash; independently, so volume can be exact while inertia is mesh-estimated. &ldquo;The kernel never serves a mass-property number without it.&rdquo;</p>
+  </div>
+</section>
+
+<section id="flows">
+  <h2>Flows</h2>
+  <p class="lede">Nine end-to-end paths traced from code, compressed to their essential hops. Expand for the numbered step list.</p>
+
+  <details class="flow">
+    <summary>1. Mutating operation (e.g. create_cylinder / boolean)</summary>
+    <ol class="steps">
+      <li><span class="where">roshera-mcp</span> &mdash; tool call goes through shared api() in core.ts.<span class="file">roshera-mcp/src/tools/create.ts, modify.ts, core.ts</span></li>
+      <li><span class="where">mcp&rarr;api-server</span> &mdash; fetch with X-Roshera-Agent: Claude + Authorization: ApiKey &lt;key&gt; (or none under dev-insecure).<span class="file">roshera-mcp/src/core.ts</span></li>
+      <li><span class="where">routing</span> &mdash; POST /api/geometry/cylinder &rarr; create_cylinder_primitive; POST /api/geometry/boolean runs on a deep clone in spawn_blocking under a per-class time budget off the write lock (Task #41), then swaps back under a brief write guard.<span class="file">api-server/src/main.rs:3650, main.rs:1448, bounded_exec.rs</span></li>
+      <li><span class="where">geometry-engine</span> &mdash; kernel op executes; every entry point ends with model.record_operation(...) which invalidates the certificate cache for all input/output solids and forwards to the OperationRecorder.<span class="file">geometry-engine/src/primitives/topology_builder.rs:2472</span></li>
+      <li><span class="where">api-server, under write lock</span> &mdash; certified_response tessellates then synchronously certifies (memoized) and embeds the perception line in the JSON response &mdash; the chokepoint.<span class="file">api-server/src/main.rs:1171</span></li>
+      <li><span class="where">timeline-engine</span> &mdash; record_operation forwards to TimelineRecorder::record, a non-blocking try_send into a bounded 16,384-slot MPSC channel; a worker drains FIFO, mints a sequence_number, appends a TimelineEvent.<span class="file">timeline-engine/src/recorder_bridge.rs</span></li>
+      <li><span class="where">api-server durability</span> &mdash; the same drain worker calls DatabaseEventSink::persist off the kernel's sync path.<span class="file">api-server/src/durability.rs</span></li>
+      <li><span class="where">response</span> &mdash; {success, solid_id, perception, object, stats}; MCP tool returns {object_uuid, part_id, placement}.<span class="file">api-server/src/main.rs</span></li>
+      <li><span class="where">api-server&rarr;app</span> &mdash; broadcast_object_created sends ObjectCreated to every /ws client; ws-bridge queues the upsert into the scene store (reconcile fires separately, async, never blocking).<span class="file">api-server/src/main.rs:7426, roshera-app/src/lib/ws-bridge.ts</span></li>
+    </ol>
+  </details>
+
+  <details class="flow">
+    <summary>2. Certificate lifecycle</summary>
+    <ol class="steps">
+      <li><span class="where">geometry-engine</span> &mdash; certify_solid wraps certificate(): hot path clones the RwLock-cached certificate; cold path calls compute_certificate and stores (last-write-wins).<span class="file">geometry-engine/src/primitives/topology_builder.rs:2899</span></li>
+      <li><span class="where">geometry-engine</span> &mdash; invalidation fires from three seams: record_operation funnel, set_solid_construction, and the SolidStore::get_mut backstop.<span class="file">topology_builder.rs:2472-2490, 2529</span></li>
+      <li><span class="where">api-server, async/advisory</span> &mdash; certified_response spawns reconcile_task::spawn_reconcile fire-and-forget: brief read lock takes a ModelSnapshot, drops the guard, renders 14 Fibonacci-sphere viewpoints, runs reconcile_full, caches by (solid_id, perception_fingerprint) under a 2-way semaphore &mdash; never blocks the mutation response.<span class="file">api-server/src/reconcile_task.rs</span></li>
+      <li><span class="where">timeline-engine</span> &mdash; rebuild_certificate::certify_rebuild produces a RebuildCertificate with per-feature FeatureStatus (Rebuilt/Unaffected/Failed/Dangling/Blocked/Stale) and a re-measured, never-asserted global is_sound.<span class="file">timeline-engine/src/rebuild_certificate.rs</span></li>
+      <li><span class="where">timeline-engine</span> &mdash; EventCertificate is defined but has no production producer: store_in is called exactly once, from the module's own #[cfg(test)]; the only production consumer always reads None &mdash; every real evidence-pack event carries a null certificate.<span class="file">timeline-engine/src/event_certificate.rs:407</span></li>
+    </ol>
+  </details>
+
+  <details class="flow">
+    <summary>3. Durability &amp; boot</summary>
+    <ol class="steps">
+      <li><span class="where">api-server main()</span> &mdash; builds a fresh BRepModel, constructs DatabaseConfig{PostgreSQL, run_migrations:true}, connects.<span class="file">api-server/src/main.rs</span></li>
+      <li><span class="where">session-manager</span> &mdash; &ldquo;migrations&rdquo; means inline CREATE TABLE IF NOT EXISTS, not sqlx::migrate!.<span class="file">session-manager/src/database.rs:297,330</span></li>
+      <li><span class="where">api-server durability</span> &mdash; boot_replay: ROSHERA_DURABILITY=off &rarr; Disabled (blank boot); else restore branch metadata, load all timeline events, empty &rarr; Empty; certify_rebuild finds the first replay break.<span class="file">api-server/src/durability.rs:212</span></li>
+      <li><span class="where">api-server durability</span> &mdash; quarantine boundary = min(first replay break, first corrupt row); clean prefix served as Quarantined{...}, logged, never hidden; else Active{events_replayed}. Recorder detached during replay; fresh UUID minted per restored solid.<span class="file">api-server/src/durability.rs</span></li>
+      <li><span class="where">api-server</span> &mdash; GET /api/durability/status reports {session_id, durability_enabled, quarantined, status}.<span class="file">api-server/src/main.rs:7646</span></li>
+      <li><span class="where">api-server</span> &mdash; API key rehydration (gated on durability_enabled) restores real active/revoked flags.<span class="file">api-server/src/main.rs:8463</span></li>
+    </ol>
+  </details>
+
+  <details class="flow">
+    <summary>4. Auth</summary>
+    <ol class="steps">
+      <li><span class="where">api-server</span> &mdash; register: username validated, user_id = user_{'{'}username{'}'}, Argon2 hash_password + complexity check.<span class="file">api-server/src/handlers/auth.rs</span></li>
+      <li><span class="where">api-server</span> &mdash; login: is_active check, Argon2 verify_password, create_token returns {token, refresh_token, expires_in, permissions}.<span class="file">api-server/src/handlers/auth.rs</span></li>
+      <li><span class="where">api-server</span> &mdash; path_is_exempt gates exactly /, /health, /api/auth/login|register|refresh, /ws and /ws/*. Required posture: Bearer&rarr;validate_jwt | ApiKey&rarr;verify_api_key, else 401. InsecureDevBypass injects dev_auth_info with a loud warning.<span class="file">api-server/src/auth_middleware.rs:187</span></li>
+      <li><span class="where">api-server</span> &mdash; key lifecycle: provision_api_key_handler / list / revoke; keys survive restart.<span class="file">api-server/src/handlers/auth.rs:471,570,605</span></li>
+      <li><span class="where">roshera-mcp</span> &mdash; sends ApiKey scheme only (stdio server credential model) &mdash; no Bearer/JWT flow in MCP itself.<span class="file">roshera-mcp/src/core.ts</span></li>
+    </ol>
+  </details>
+
+  <details class="flow">
+    <summary>5. Blackboard</summary>
+    <ol class="steps">
+      <li><span class="where">roshera-mcp / app</span> &mdash; blackboard_add_entry &rarr; POST /api/blackboard/entries {text, author, part_id?, scope?}.<span class="file">roshera-mcp/src/tools/blackboard.ts</span></li>
+      <li><span class="where">api-server</span> &mdash; BlackboardScope is Part{id}/Assembly{id}/Document; BlackboardManager keeps per-scope notebooks (lines + append-only event log of Add/Edit/Delete).<span class="file">api-server/src/blackboard.rs:321,538</span></li>
+      <li><span class="where">roshera-app</span> &mdash; polls every 2500ms, re-hydrates on scope change, applies remote snapshot only when the fetched scope is active; save() diffs the append-only log into a single POST/PATCH/DELETE.<span class="file">roshera-app/src/lib/blackboard-api.ts</span></li>
+      <li><span class="where">roshera-app</span> &mdash; Blackboard.tsx reads the store; activeScope is driven by viewport selection.<span class="file">roshera-app/src/components/panels/Blackboard.tsx</span></li>
+    </ol>
+  </details>
+
+  <details class="flow">
+    <summary>6. Evidence pack</summary>
+    <ol class="steps">
+      <li><span class="where">api-server</span> &mdash; GET /api/evidence-pack (authenticated) dispatches to get_evidence_pack.<span class="file">api-server/src/main.rs:9453, handlers/timeline.rs:1870</span></li>
+      <li><span class="where">api-server</span> &mdash; resolves ?branch=/?notebook=, first calls timeline_recorder.flush() to drain in-flight events, reads branch events sorted by sequence.<span class="file">api-server/src/handlers/timeline.rs</span></li>
+      <li><span class="where">api-server</span> &mdash; builds operations[] (with certificate = EventCertificate::from_metadata), final_state.parts[], notebook, recomputed (separately labeled from certify_rebuild), and a manifest.<span class="file">api-server/src/handlers/timeline.rs:1904-1911</span></li>
+      <li><span class="where">api-server</span> &mdash; honesty rules enforced in code: absent cert &rarr; null + reason; degenerate solid &rarr; null mass_properties + reason; recompute note literally reads &ldquo;Re-measured NOW ... NOT recorded history&rdquo;; quarantine always surfaced via manifest.durability.<span class="file">api-server/src/handlers/timeline.rs</span></li>
+    </ol>
+  </details>
+
+  <details class="flow">
+    <summary>7. Eval</summary>
+    <ol class="steps">
+      <li><span class="where">roshera-eval</span> &mdash; run.mjs preflights /health, loads the 17-scenario index, runs the suite, prints a scorecard, writes report.json; exit code = failed count.<span class="file">roshera-eval/run.mjs</span></li>
+      <li><span class="where">roshera-eval</span> &mdash; lib/client.mjs is a thin HTTP client (X-Roshera-Agent: AgentEvalAlpha) over the same REST surface roshera-mcp uses &mdash; straight REST, not through MCP protocol.<span class="file">roshera-eval/lib/client.mjs</span></li>
+      <li><span class="where">roshera-eval</span> &mdash; each scenario exports {id, title, dims, budgetMs, run(ctx, t)}.<span class="file">roshera-eval/scenarios</span></li>
+      <li><span class="where">roshera-eval</span> &mdash; four scoring dimensions: correctness, soundness (t.sound asserts perception.sound===true), honesty (t.unsound asserts a correct refusal), performance (budgetMs wall-clock).<span class="file">roshera-eval/lib/harness.mjs</span></li>
+    </ol>
+  </details>
+
+  <details class="flow">
+    <summary>8. Drawing</summary>
+    <ol class="steps">
+      <li><span class="where">roshera-mcp</span> &mdash; make_drawing &rarr; POST /api/parts/{'{'}part_id{'}'}/drawing?name=.<span class="file">roshera-mcp/src/tools/io.ts</span></li>
+      <li><span class="where">api-server</span> &mdash; create_part_drawing(_by_uuid) &rarr; create_part_drawing_inner &rarr; build_standard_drawing_off_lock: brief read lock takes a ModelSnapshot, drops the guard, heavy build runs on spawn_blocking off the lock.<span class="file">api-server/src/main.rs:9007, drawing_mgr.rs:664,589</span></li>
+      <li><span class="where">geometry-engine</span> &mdash; standard_drawing_auto: pass 1 unit-scale extents + layout, pass 2 per-projection HLR/dimensions/centerlines, dedups dimensions globally, attaches hole table, SECTION A-A when bore sites exist, GD&amp;T annotations, ISO-286-style tolerances, pictorial isometric last.<span class="file">geometry-engine/src/drawing/dimensioning.rs:909,564</span></li>
+      <li><span class="where">api-server</span> &mdash; verify_drawing quality check, insert into state.drawings, records drawing.create_from_part timeline event with the source solid as input (mould marks it dirty and re-derives).<span class="file">api-server/src/drawing_mgr.rs</span></li>
+      <li><span class="where">mcp/api-server</span> &mdash; drawing_export_sheet &rarr; GET /api/drawings/{'{'}id{'}'}/pdf &rarr; export_pdf &rarr; render_drawing_pdf; dxf/svg symmetric.<span class="file">api-server/src/drawing_mgr.rs:859, geometry-engine/src/drawing/pdf.rs</span></li>
+      <li><span class="where">roshera-mcp</span> &mdash; separate certified-readback surface (drawing_read_semantics/drawing_query) re-certifies against the LIVE model and honestly refuses render_only or unprovenanced content.<span class="file">roshera-mcp/src/tools/drawing.ts</span></li>
+    </ol>
+  </details>
+
+  <details class="flow">
+    <summary>9. Assembly</summary>
+    <ol class="steps">
+      <li><span class="where">roshera-mcp</span> &mdash; create, add_instance, list_instances, transform_instance, mate, solve, certify, dof, drag, interference, view, plus one-shot assembly_verify.<span class="file">roshera-mcp/src/tools/assembly.ts</span></li>
+      <li><span class="where">api-server</span> &mdash; create_assembly / add_instance write true-assembly instances referencing shared kernel geometry by part_id/transform &mdash; no boolean merge.<span class="file">api-server/src/assembly_instances.rs:389,441</span></li>
+      <li><span class="where">api-server</span> &mdash; create_mate writes the assembly doc under model+doc write lock, records op_mate_add after dropping locks.<span class="file">api-server/src/assembly_mates.rs:1374</span></li>
+      <li><span class="where">assembly-engine</span> &mdash; solve &rarr; Assembly::solve(): rigid-body blocks + mate/driven-joint index set, analytic screw-calculus Jacobian, gauss_newton iterates g&rarr;0.<span class="file">api-server/src/assembly_mates.rs:1449, assembly-engine/src/solver.rs, jacobian.rs</span></li>
+      <li><span class="where">api-server + assembly-engine</span> &mdash; certify: connectors resolved and tessellated under locks, heavy certificate (mates-consistent, fully-grounded, DOF/mobility, static interference, swept clearance) runs off the locks on an owned snapshot.<span class="file">api-server/src/assembly_mates.rs:1477</span></li>
+      <li><span class="where">assembly-engine</span> &mdash; static interference: Parry TriMesh + exact EPA penetration depth; swept interference: mate-derived joints, continuous clearance via Parry nonlinear TOI, producing first_contact + min_certified_clearance.<span class="file">assembly-engine/src/interference.rs, sweep.rs</span></li>
+      <li><span class="where">api-server</span> &mdash; view_assembly composes one PNG per instance via render::render_instances_dir &mdash; geometry referenced per-instance, never merged.<span class="file">api-server/src/assembly_instances.rs:531</span></li>
+    </ol>
+  </details>
+</section>
+
+<section id="surface">
+  <h2>API &amp; MCP surface</h2>
+
+  <h3>REST route groups</h3>
+  <table>
+    <tr><th>Prefix</th><th>Sample routes</th><th>Auth</th></tr>
+    <tr><td class="mono">/api/geometry</td><td>create, boolean, extrude/box/cylinder/cone/revolve/nurbs_loft, fillet/chamfer/shell/mirror/transform/pattern, import_step, properties</td><td>required; create/modify scoped</td></tr>
+    <tr><td class="mono">/api/sketch, /api/csketch</td><td>point/plane/tool, extrude/extrude_cut/revolve, constraint/solve/drag, dof/certify, trim/extend/offset/mirror/pattern</td><td>required</td></tr>
+    <tr><td class="mono">/api/assembly, /api/assemblies</td><td>instance CRUD, connector/mate/solve/certify/dof/drag/interference, view</td><td>required &mdash; three parallel surfaces</td></tr>
+    <tr><td class="mono">/api/drawings, /api/parts</td><td>svg/pdf/dxf, quality/semantic/certificate, query, drawing.svg</td><td>required</td></tr>
+    <tr><td class="mono">/api/blackboard</td><td>entries CRUD, clear</td><td>GET open-read; mutations gated</td></tr>
+    <tr><td class="mono">/api/agent</td><td>parts/mass/profile/obb/render/dimensioned/features/perception/section/best-view/orbit, verify-claim, tool-registry, GD&amp;T, measure/point-query/ray-query/region-query, faces/edges/hover, pointer, select-face/edge/color</td><td>required &mdash; 48 handler fns</td></tr>
+    <tr><td class="mono">/api/evidence-pack, /api/timeline, /api/branches</td><td>init/record/history/dependency-graph/mould/rebuild-certificate/undo/redo/replay/scrub, branch create/switch/merge</td><td>required (not exempt)</td></tr>
+    <tr><td class="mono">/api/export, /api/download</td><td>export, download/{'{'}filename{'}'}</td><td>required, export-scoped</td></tr>
+    <tr><td class="mono">/api/sessions</td><td>CRUD, join/leave</td><td>required</td></tr>
+    <tr><td class="mono">/api/auth</td><td>login/register/refresh (exempt), logout (not exempt), keys CRUD</td><td>mixed &mdash; see Auth panel</td></tr>
+    <tr><td class="mono">/api/admin</td><td>users/{'{'}id{'}'}/permissions, roles</td><td>required, admin-scoped</td></tr>
+    <tr><td class="mono">/api/tx</td><td>atomic multi-step plans via X-Roshera-Tx-Id</td><td>required</td></tr>
+    <tr><td class="mono">/api/kernel, /api/frame, /api/hierarchy, /api/datums</td><td>state, server-rendered PNG for VLM agents, hierarchy, datums</td><td>required</td></tr>
+    <tr><td class="mono">/api/logs, /ws/viewport-bridge</td><td>logs/stream (SSE), viewport-bridge (dev-only, ROSHERA_DEV_BRIDGE=1)</td><td>required except where noted</td></tr>
+  </table>
+
+  <h3>WebSocket &amp; SSE</h3>
+  <table>
+    <tr><th>Endpoint</th><th>Detail</th></tr>
+    <tr><td class="mono">GET /ws</td><td>ClientMessage: Authenticate, GeometryCommand, TimelineCommand, AICommand, SessionCommand, ExportCommand, Subscribe, Unsubscribe, Query, Ping. ServerMessage: Welcome, Authenticated/AuthenticationFailed, Success/Error, GeometryUpdate, TimelineUpdate, SessionUpdate, ExportComplete, AIResponse, SystemEvent, Progress, Pong. Auth is an in-band Authenticate frame (browsers cannot set upgrade headers).</td></tr>
+    <tr><td class="mono">GET /api/logs/stream</td><td>SSE, main.rs:7610</td></tr>
+    <tr><td class="mono">POST /api/ai/command/stream</td><td>SSE token streaming, main.rs:6599</td></tr>
+  </table>
+  <p><b>Auth-exempt paths:</b> exactly <code>/</code>, <code>/health</code>, <code>/api/auth/login</code>, <code>/api/auth/register</code>, <code>/api/auth/refresh</code>, <code>/ws</code>, <code>/ws/*</code> (upgrade only).</p>
+
+  <h3>MCP surface</h3>
+  <p>Default (minimal) surface = 21 tools: 18 core + 3 meta. Full mode exposes the whole table (&asymp;95 tools measured; a stale source comment at index.ts:22 says &ldquo;~90-tool&rdquo;) minus the meta-tools.</p>
+  <table>
+    <tr><th>Set</th><th>Tools</th></tr>
+    <tr><td>Core (18)</td><td class="mono">create_box, create_cylinder, create_sphere, create_cone, boolean, revolve, get_part, list_parts, render_part, scene_view, section_view, verify_part, mass_properties, delete_part, clear_parts, workbench, cad_program, blackboard_add_entry</td></tr>
+    <tr><td>Meta (3)</td><td class="mono">find_tool, describe_tool, invoke</td></tr>
+  </table>
+  <p>find_tool does deterministic ranked search (name-token IDF + curated synonym groups, no LLM/embeddings). describe_tool returns the full JSON schema. invoke validates with the identical SDK normalizer as a direct call and dispatches to the same handler.</p>
+  <table>
+    <tr><th>Bench</th><th>Tools</th></tr>
+    <tr><td>sketch</td><td class="mono">create_sketch, sketch_add_shape, sketch_points, sketch_extrude, plane_from_face, psketch_begin/add_entity/constrain/solve/certify/dof/op/extrude/revolve</td></tr>
+    <tr><td>assembly</td><td class="mono">assembly_verify/create/add_instance/list_instances/transform_instance/view/mate/solve/certify/dof/drag/interference</td></tr>
+    <tr><td>drawing</td><td class="mono">make_drawing, drawing_read_semantics, drawing_query, drawing_export_sheet, dimension_part, gdt_datum, gdt_fcf, gdt_report</td></tr>
+    <tr><td>analysis</td><td class="mono">point_query, ray_query, region_query, occupancy_view, part_coverage, part_distance, part_features, ground_truth, measure_faces, verify_claim, get_face, get_revolve_profile</td></tr>
+    <tr><td>labels</td><td class="mono">label_create/list/resolve/rename/delete, propose_labels, blackboard_add_entry/edit_entry/list/clear</td></tr>
+  </table>
+  <p><b>Notes:</b> SWITCHABLE_BENCHES = [sketch, assembly, drawing, analysis, labels]; core+meta always on. LIVE_SURFACE_CEILING=35 tool handles active at once &mdash; bench switching is an attention optimizer, never a capability gate, since the long tail is always reachable via invoke. EXPERIMENTAL stability set includes nurbs_loft, drill_pattern, timeline_mould, bind_parameter_name, rebuild_certificate, timeline_scrub, psketch_op, all assembly kinematic tools, drawing_read_semantics, drawing_query. Layer 0 drift check: consumeRegistry() fetches /api/agent/tool-registry post-connect and recomputes an FNV-1a-64 hash identical to the kernel's own hash &mdash; mismatch logs a &ldquo;hash SKEW&rdquo; warning.</p>
+</section>
+
+<section id="persistence">
+  <h2>Persistence</h2>
+  <div class="panel">
+    <h4>Tables</h4>
+    <p><span class="mono">users, sessions, objects</span> (per-session cache, PK (id, session_id)), <span class="mono">permissions, tokens, api_keys</span> (FK-free user_id by design &mdash; agent keys have no users row), <span class="mono">timeline_events</span> (durability log; FK-free; data JSONB = whole serialized TimelineEvent; sequence_number BIGINT is the replay key; indexed on (session_id, sequence_number)), <span class="mono">durable_branches</span> (branch metadata surviving restart).</p>
+    <h4>Durability model</h4>
+    <p>Append-only event log via <span class="mono">api-server/src/durability.rs DatabaseEventSink::persist</span> (one transactional row per TimelineEvent, written by TimelineRecorder's drain worker off the kernel's synchronous path). Boot replay loads all rows for a fixed single-tenant <span class="mono">DURABILITY_SESSION_ID = "roshera-durability-main"</span>, ordered by sequence_number, then rebuilds the BRepModel by replaying events (recorder detached during replay). Quarantine: certify_rebuild re-measures soundness from a full trial replay; if a break or corrupt row is found, only the clean prefix is served, the break is named in logs and via GET /api/durability/status, and the tail is refused rather than silently served.</p>
+    <h4>In-memory only</h4>
+    <ul class="tight">
+      <li>uuid_to_local / local_to_uuid ID maps (fresh UUIDs minted every boot)</li>
+      <li>consumed_uuids (undo tombstones)</li>
+      <li>solid_colors / solid_profiles (re-derived from the durable log at boot; the map itself is volatile)</li>
+      <li>reconcile caches, metrics, viewport_bridge state, transaction manager state, sketch/csketch sessions</li>
+      <li>the BRepModel itself &mdash; only durability path is a full event replay at boot, there is no snapshot</li>
+    </ul>
+    <h4>ROSHERA_DURABILITY=off behavior</h4>
+    <p>Case-insensitive match on &ldquo;off&rdquo; yields a fully volatile scratch server: blank boot (no replay), all persist calls become no-ops, API-key rehydration is skipped entirely.</p>
+  </div>
+</section>
+
+<section id="auth">
+  <h2>Auth model</h2>
+  <div class="panel">
+    <h4>Posture</h4>
+    <p><span class="mono">AuthPosture::Required</span> is the default &mdash; an empty environment enforces auth and returns 401 before any handler runs. <span class="mono">AuthPosture::InsecureDevBypass</span> activates only via <span class="mono">ROSHERA_DEV_INSECURE=1|true</span>, logs a loud warning every boot, injects a permissive sentinel AuthInfo (also bypasses the 100 req/min rate limit).</p>
+    <h4>Schemes</h4>
+    <p><span class="mono">Bearer &lt;jwt&gt;</span> &rarr; validate_jwt; <span class="mono">ApiKey &lt;key&gt;</span> &rarr; validate_api_key. Both validated through the single session-manager AuthManager.</p>
+    <h4>Key lifecycle</h4>
+    <p>provision_api_key_handler (auth.rs:471) writes through AuthManager::provision_api_key; list (570) and revoke (605) are separate handlers. Keys are rehydrated from the durable api_keys table at boot (gated on durability_enabled), so keys and their revoked state survive a restart. No provisioning HTTP route beyond these handlers and no self-service revocation endpoint documented for agents.</p>
+    <h4>Exempt paths</h4>
+    <p class="mono">/, /health, /api/auth/login, /api/auth/register, /api/auth/refresh, /ws, /ws/*</p>
+    <h4>WS auth</h4>
+    <p>In-band Authenticate frame &mdash; the WS upgrade itself is exempt (browsers cannot set upgrade headers), so the client sends {'{'}type:'Authenticate', token{'}'} as its first message after onopen; the command surface is gated per-connection on that frame.</p>
+  </div>
+</section>
+
+<section id="gaps">
+  <h2>Known gaps &amp; stale docs</h2>
+  <p class="lede">The honesty section &mdash; every item below was directly verified against the tree at this revision, not inferred.</p>
+
+  <div class="gap">
+    <b>EventCertificate has no production producer</b>
+    <div class="ev"><b>Evidence:</b> timeline-engine/src/event_certificate.rs defines store_in(metadata); grepping the whole workspace shows store_in( is called exactly once, from the module's own #[cfg(test)] (event_certificate.rs:407). The only production consumer is the read-side from_metadata.</div>
+    <div class="imp"><b>Implication:</b> every real evidence-pack event's certificate field reads None and is served as null plus a certificate_absent_reason &mdash; evidence packs today carry no per-operation certificates for real activity.</div>
+  </div>
+
+  <div class="gap">
+    <b>timeline-engine's storage/ StorageEngine is dead code</b>
+    <div class="ev"><b>Evidence:</b> a file-based StorageEngine (event_log/index/snapshot) is defined in timeline-engine/src/storage but grep-confirmed never referenced outside its own mod.rs.</div>
+    <div class="imp"><b>Implication:</b> live persistence is entirely api-server/src/durability.rs (DatabaseEventSink) + session-manager::database &mdash; the storage/ module is inert.</div>
+  </div>
+
+  <div class="gap">
+    <b>Backend CLAUDE.md says 7 crates; the tree has 10</b>
+    <div class="ev"><b>Evidence:</b> roshera-backend/Cargo.toml workspace members list 10 crates including ros-format, verdict-harness, and assembly-engine, which the backend-local CLAUDE.md does not mention.</div>
+    <div class="imp"><b>Implication:</b> the backend-local documentation is stale relative to the actual workspace shape.</div>
+  </div>
+
+  <div class="gap">
+    <b>enforce_permission_layer's doc-comment describes a removed toggle</b>
+    <div class="ev"><b>Evidence:</b> the doc-comment on api-server's enforce_permission_layer still describes the ROSHERA_REQUIRE_AUTH soft/strict toggle; the code no longer reads that variable &mdash; scope checks are unconditional today.</div>
+    <div class="imp"><b>Implication:</b> anyone reading only the comment will believe permission enforcement is configurable when it is not.</div>
+  </div>
+
+  <div class="gap">
+    <b>.mcp.json carries no ROSHERA_API_KEY</b>
+    <div class="ev"><b>Evidence:</b> repo-root .mcp.json configures the roshera MCP server with env ROSHERA_URL=http://localhost:8081 and no ROSHERA_API_KEY.</div>
+    <div class="imp"><b>Implication:</b> this configuration only functions against a backend running with ROSHERA_DEV_INSECURE=1 &mdash; a dev-insecure assumption baked into the checked-in MCP config.</div>
+  </div>
+
+  <div class="gap">
+    <b>assembly-engine is fully standalone (zero workspace deps)</b>
+    <div class="ev"><b>Evidence:</b> grep-confirmed: assembly-engine's Cargo.toml pulls in only parry3d-f64 + serde, no intra-workspace crate dependencies, even though api-server depends on it.</div>
+    <div class="imp"><b>Implication:</b> an observation, not a defect &mdash; assembly-engine is architecturally decoupled and could in principle be extracted or reused independently.</div>
+  </div>
+
+  <div class="gap">
+    <b>Boot replay mints fresh UUIDs &mdash; identity is not preserved across a restart</b>
+    <div class="ev"><b>Evidence:</b> durability.rs boot_replay rehydrates events with their original ids/sequences into the timeline, but register_id_mapping mints a brand-new UUID per restored solid rather than reusing the pre-restart UUID.</div>
+    <div class="imp"><b>Implication:</b> any external reference to a solid's UUID from before a restart is invalidated by a restart. Documented as in-scope for Slice 1 durability, not yet closed.</div>
+  </div>
+
+  <div class="gap">
+    <b>No durability snapshots &mdash; every boot is a full event replay</b>
+    <div class="ev"><b>Evidence:</b> durability.rs has no snapshot mechanism; boot_replay always replays the entire timeline_events table for the durability session from scratch.</div>
+    <div class="imp"><b>Implication:</b> boot time scales with total history size; documented as acceptable for the current alpha stage.</div>
+  </div>
+
+  <div class="gap">
+    <b>Chamfer on closed (rim/seam) edges only supports the Plane&ndash;Cylinder face pair</b>
+    <div class="ev"><b>Evidence:</b> geometry-engine/src/operations/chamfer.rs:1118-1123 (chamfer_distances_for_closed_edge): if both adjacent faces are cylinders, or neither is, the function returns OperationError::NotImplemented(&ldquo;...currently supports only a Plane-Cylinder pair in this slice&rdquo;); the open-edge chamfer path is unaffected.</div>
+    <div class="imp"><b>Implication:</b> chamfering a closed rim edge between two non-plane-cylinder face kinds is refused today rather than attempted &mdash; a scoped gap, not a silent wrong answer.</div>
+  </div>
+</section>
+
+<section id="eval">
+  <h2>Eval corpus &mdash; AGENT-EVAL-&alpha;</h2>
+  <table>
+    <tr><th>#</th><th>Title</th><th>What it checks</th></tr>
+    <tr><td>01</td><td>Spur gear m=2 z=16 + keyed bore</td><td>&chi;=0, 293 faces, volume &asymp;5555.8 shoelace-checked, mass &asymp;0.0436kg</td></tr>
+    <tr><td>02</td><td>Rao-bell nozzle</td><td>revolve+wall2; &chi;=0; volume &asymp;16309.7; meridian 320mm&sup2;</td></tr>
+    <tr><td>03</td><td>Injector plate, 36 bores</td><td>&chi;=-70, genus 36; volume must equal the analytic value</td></tr>
+    <tr><td>04</td><td>Bulkhead, 4 pockets + fillet-all</td><td>pre-fillet volume 51200 exact; result must be graceful and sound</td></tr>
+    <tr><td>05</td><td>Pocketed + bored block</td><td>56000 exact volume; &chi;=-6</td></tr>
+    <tr><td>06</td><td>Hub flange GD&amp;T + drawing</td><td>flatness/perpendicularity/position in spec; drawing quality check passed</td></tr>
+    <tr><td>07</td><td>STEP round-trip blended flange</td><td>re-imported solid must still be sound</td></tr>
+    <tr><td>08</td><td>Cross-bore saddle (#35 guard)</td><td>Steinmetz oracle; former honesty canary is now a soundness tripwire</td></tr>
+    <tr><td>09</td><td>Gear four-view drawing</td><td>under 90 seconds; /health stays live under load</td></tr>
+    <tr><td>10</td><td>Kinematic hinge + slider</td><td>floating part is named, conflict is witnessed, unbounded sweep refuses</td></tr>
+    <tr><td>11</td><td>Certified sketch to bore (#45)</td><td>0 DOF case; over-constrained case reports Conflicting with a witness</td></tr>
+    <tr><td>12</td><td>Mass-properties provenance</td><td>closed-form result matches; mesh-derived result labeled Approximate, never Exact</td></tr>
+    <tr><td>13</td><td>&epsilon;=1e-6 coincident-face union</td><td>&chi;=2; a sound verdict may never mask open or non-manifold edges</td></tr>
+    <tr><td>14</td><td>Quadric SSI cylinder-sphere bite + near-tangency</td><td>an unsound result must name the defect; near-tangency refuses rather than guesses</td></tr>
+    <tr><td>15</td><td>Certified drawing comprehension</td><td>hatch ink refuses render_only; unprovenanced content refuses</td></tr>
+    <tr><td>16</td><td>Shelf bracket, FDM PLA</td><td>sound at every step; stress/deflection/orientation/wall/overhang declared unscored</td></tr>
+    <tr><td>17</td><td>NEMA17 motor mount, PETG</td><td>f&#8321;&ge;120Hz modal + stress declared unscored, never fake-scored</td></tr>
+  </table>
+</section>
+
+<section id="glossary">
+  <h2>Glossary</h2>
+  <dl class="glossary">
+    <dt>certificate</dt><dd>ValidityCertificate &mdash; a nine-conjunct, geometry-derived soundness verdict recomputed on demand for every solid; is_sound() requires all nine, with two further fields carried but not gating.</dd>
+    <dt>perception line</dt><dd>The compact sound/brep_valid/watertight/manifold/oriented/self_intersection_free/verdict/cert summary embedded in every mutating-operation response.</dd>
+    <dt>dual-eye reconcile</dt><dd>A cross-check between the kernel's own geometric Truth, a rendered Scene, and the labeled Semantic feature set along four axes; only TruthSemantic (conjunct 7) is synchronous and gates the certificate &mdash; the rest drive the async, advisory 14-viewpoint reconcile.</dd>
+    <dt>typed refusal</dt><dd>Returning a specific, named error rather than a generic failure or a silently-approximated answer, whenever an operation falls outside its verified envelope.</dd>
+    <dt>ratchet / KNOWN_REDS</dt><dd>A machine-readable allowlist of pre-existing failing tests; entries may only be removed once green and never added without a diagnosis doc. Currently empty.</dd>
+    <dt>red-gate</dt><dd>roshera-backend/scripts/red-gate.ps1 &mdash; the required pre-merge CI gate diffing the geometry-engine test suite against KNOWN_REDS.md.</dd>
+    <dt>timeline mould</dt><dd>Lets a parameter on a past event be overridden; incremental.rs then rebuilds only the downstream-affected dirty subtree rather than replaying the whole timeline.</dd>
+    <dt>quarantine</dt><dd>The durability state entered when boot_replay finds a corrupt/broken event row: only the clean prefix is served, the break is named, the remainder is refused.</dd>
+    <dt>workbench / bench</dt><dd>roshera-mcp's mechanism for toggling groups of MCP tool handles on/off to keep the live surface within an attention budget; never a capability gate since every tool remains reachable via invoke.</dd>
+    <dt>meta-funnel</dt><dd>The three always-on MCP meta-tools (find_tool, describe_tool, invoke) that let an agent discover and call any tool in the full registry through the identical validation/dispatch path a direct call uses.</dd>
+    <dt>evidence pack</dt><dd>GET /api/evidence-pack &mdash; bundles recorded operations with certificates-as-recorded, final mass properties, and the blackboard notebook, plus a separately-labeled live recompute.</dd>
+    <dt>blackboard</dt><dd>A backend-persisted, scope-partitioned shared notebook that both humans and agents read/write, backed by an append-only Add/Edit/Delete event log.</dd>
+    <dt>readable surface</dt><dd>geometry-engine/src/readable &mdash; described as the pillar that makes Roshera an agent runtime for geometry: wire records, dimensioning, feature extraction, and blackboard-claim verification exposed via /api/agent/*.</dd>
+    <dt>persistent id</dt><dd>A topological entity identifier intended to survive across operations/rebuilds so downstream references keep pointing at &ldquo;the same&rdquo; face/edge; landed for some paths, not yet universal.</dd>
+    <dt>bounded_exec</dt><dd>api-server's mechanism (Task #41) for running a heavy kernel op on a deep-cloned model in spawn_blocking under a per-op-class wall-clock budget, off the write lock.</dd>
+  </dl>
+</section>
+
+<footer>
+  Roshera Architecture Atlas &middot; git rev 0857ca85 &middot; generated 2026-07-27 &middot; assembled from five verified mapper reports. Code is the ultimate truth &mdash; re-verify before relying on this for a consequential decision.
+</footer>

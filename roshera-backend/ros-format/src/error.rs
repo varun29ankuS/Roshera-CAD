@@ -567,12 +567,6 @@ impl Error for KeyManagementError {}
 /// Audit log errors
 #[derive(Debug, Clone)]
 pub enum AuditError {
-    /// Audit chain broken
-    ChainBroken {
-        break_index: usize,
-        expected_hash: String,
-    },
-
     /// Suspicious activity detected
     SuspiciousActivity {
         user: String,
@@ -591,22 +585,19 @@ pub enum AuditError {
 
     /// Log export failed
     ExportFailed { format: String, reason: String },
+
+    /// An audit entry could not be canonically serialized to compute its
+    /// hash (e.g. a non-finite float in an event payload). Hashing must
+    /// never degrade to hashing an empty/constant buffer on failure —
+    /// that makes two differently-corrupt entries hash equal and lets
+    /// chain verification pass vacuously.
+    HashComputationFailed { reason: String },
 }
 
 impl fmt::Display for AuditError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         use AuditError::*;
         match self {
-            ChainBroken {
-                break_index,
-                expected_hash,
-            } => {
-                write!(
-                    f,
-                    "Audit chain broken at index {}: expected hash {}",
-                    break_index, expected_hash
-                )
-            }
             SuspiciousActivity {
                 user,
                 action,
@@ -640,6 +631,9 @@ impl fmt::Display for AuditError {
                     "Audit log export failed (format: {}): {}",
                     format, reason
                 )
+            }
+            HashComputationFailed { reason } => {
+                write!(f, "Audit entry hash computation failed: {}", reason)
             }
         }
     }

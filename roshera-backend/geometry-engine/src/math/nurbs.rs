@@ -414,6 +414,23 @@ impl NurbsCurve {
         let sum_z = result_z.as_array_ref().iter().sum::<f64>();
         let sum_w = weight_sum.as_array_ref().iter().sum::<f64>();
 
+        // Guard against a degenerate weight sum, mirroring the scalar
+        // `evaluate_derivatives`. A malformed knot vector, a boundary
+        // evaluation, or legal-but-subnormal weights can underflow `sum_w`
+        // to exactly zero, and `1.0 / 0.0` would hand back an Inf/NaN point
+        // through a public API. The scalar path falls back to the span's
+        // control point; this path must agree, or the same curve evaluates
+        // differently depending on which entry point the caller picked.
+        if sum_w.abs() < f64::EPSILON {
+            return NurbsPoint {
+                point: self.control_points[span],
+                derivative1: None,
+                derivative2: None,
+                derivative3: None,
+                parameter: u,
+            };
+        }
+
         // Rational curve: divide by weight
         let inv_w = 1.0 / sum_w;
         let point = Point3::new(sum_x * inv_w, sum_y * inv_w, sum_z * inv_w);
@@ -542,6 +559,21 @@ impl NurbsCurve {
         let sum_y = pos_y.as_array_ref().iter().sum::<f64>();
         let sum_z = pos_z.as_array_ref().iter().sum::<f64>();
         let sum_w = pos_w.as_array_ref().iter().sum::<f64>();
+
+        // Guard against a degenerate weight sum before it propagates into
+        // the position AND every derivative below (the quotient rule reuses
+        // `inv_w` three times, so an Inf here poisons the whole result).
+        // Mirrors the scalar `evaluate_derivatives` early return, including
+        // leaving the derivatives as `None` rather than inventing values.
+        if sum_w.abs() < f64::EPSILON {
+            return NurbsPoint {
+                point: self.control_points[span],
+                derivative1: None,
+                derivative2: None,
+                derivative3: None,
+                parameter: u,
+            };
+        }
 
         // Compute position (rational curve: divide by weight)
         let inv_w = 1.0 / sum_w;
@@ -3294,6 +3326,75 @@ pub fn skin_surface_periodic_u(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The scalar evaluator guards a degenerate weight sum and falls back to
+    /// the span's control point; the SIMD evaluators computed `1.0 / sum_w`
+    /// unconditionally and emitted Inf/NaN for the same input. Two public
+    /// APIs for the same computation must not disagree on degenerate input —
+    /// and neither may hand back a non-finite point silently.
+    ///
+    /// Subnormal-but-legal weights (`NurbsCurve::new` only requires `w > 0`)
+    /// make the weighted basis sum underflow to exactly 0.0.
+    #[test]
+    fn simd_and_scalar_agree_on_degenerate_weight_sum() {
+        let control_points = vec![
+            Point3::new(0.0, 0.0, 0.0),
+            Point3::new(1.0, 2.0, 0.0),
+            Point3::new(2.0, 0.0, 0.0),
+        ];
+        // Smallest positive subnormal: legal (> 0) but w·basis flushes to zero.
+        let weights = vec![5e-324_f64; 3];
+        let knots = vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0];
+        let curve = NurbsCurve::new(control_points, weights, knots, 2)
+            .expect("degree-2 curve with 3 control points and a clamped knot vector is valid");
+
+        let scalar = curve.evaluate(0.5);
+        let simd = curve.evaluate_simd(0.5);
+
+        assert!(
+            scalar.point.x.is_finite() && scalar.point.y.is_finite() && scalar.point.z.is_finite(),
+            "scalar evaluator returned a non-finite point: {:?}",
+            scalar.point
+        );
+        assert!(
+            simd.point.x.is_finite() && simd.point.y.is_finite() && simd.point.z.is_finite(),
+            "SIMD evaluator returned a non-finite point: {:?} (scalar gave {:?})",
+            simd.point,
+            scalar.point
+        );
+        assert!(
+            (simd.point.x - scalar.point.x).abs() < 1e-9
+                && (simd.point.y - scalar.point.y).abs() < 1e-9
+                && (simd.point.z - scalar.point.z).abs() < 1e-9,
+            "SIMD {:?} disagrees with scalar {:?} on degenerate weights",
+            simd.point,
+            scalar.point
+        );
+    }
+
+    /// Same invariant for the derivative-bearing SIMD path.
+    #[test]
+    fn simd_derivatives_agree_with_scalar_on_degenerate_weight_sum() {
+        let control_points = vec![
+            Point3::new(0.0, 0.0, 0.0),
+            Point3::new(1.0, 2.0, 0.0),
+            Point3::new(2.0, 0.0, 0.0),
+        ];
+        let weights = vec![5e-324_f64; 3];
+        let knots = vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0];
+        let curve = NurbsCurve::new(control_points, weights, knots, 2)
+            .expect("degree-2 curve with 3 control points and a clamped knot vector is valid");
+
+        let scalar = curve.evaluate_derivatives(0.5, 1);
+        let simd = curve.evaluate_derivatives_simd(0.5, 1);
+
+        assert!(
+            simd.point.x.is_finite() && simd.point.y.is_finite() && simd.point.z.is_finite(),
+            "SIMD derivative evaluator returned a non-finite point: {:?} (scalar gave {:?})",
+            simd.point,
+            scalar.point
+        );
+    }
 
     /// Parity: a periodic-U skin of CLOSED circular sections is smooth-closed
     /// around U (no seam kink) and interpolates each section. Stack of growing

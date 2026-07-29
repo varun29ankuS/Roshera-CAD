@@ -1,4 +1,4 @@
-import { useMemo } from 'react'
+import { useEffect, useMemo } from 'react'
 import * as THREE from 'three'
 import { useSceneStore } from '@/stores/scene-store'
 import type { SectionCapMesh } from '@/lib/section-api'
@@ -109,6 +109,23 @@ export function SectionCap({ cap }: SectionCapProps) {
     m.polygonOffsetUnits = -8
     return m
   }, [color])
+
+  // Dispose GPU resources on replacement/unmount — matching the discipline
+  // in GdtAnnotations and ExtrudeGizmo. `cap` is rebuilt on every tick of
+  // the section offset/axis drag, so without this each drag frame orphans a
+  // BufferGeometry (and each colour change a material) on the GPU for the
+  // lifetime of the page.
+  useEffect(() => {
+    return () => {
+      geometry.dispose()
+    }
+  }, [geometry])
+
+  useEffect(() => {
+    return () => {
+      material.dispose()
+    }
+  }, [material])
 
   return (
     <mesh

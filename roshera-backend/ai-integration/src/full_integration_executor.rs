@@ -510,11 +510,53 @@ impl FullIntegrationExecutor {
             }
             q if q.contains("history") || q.contains("timeline") => {
                 let timeline = self.timeline.read().await;
-                serde_json::json!({
-                    "current_branch": "main", // Placeholder for now
-                    "event_count": 0, // Placeholder for now
-                    "branches": ["main"], // Placeholder for now
-                })
+
+                let branches: Vec<String> = timeline
+                    .get_all_branches()
+                    .into_iter()
+                    .map(|b| b.name)
+                    .collect();
+
+                let session_uuid = Uuid::parse_str(session_id).ok();
+                let current_branch_id = session_uuid.and_then(|id| timeline.get_session_branch(id));
+
+                match current_branch_id {
+                    Some(branch_id) => {
+                        // We know which branch this session is positioned
+                        // on — report its real name and its real event
+                        // count.
+                        let current_branch = timeline
+                            .get_branch(&branch_id)
+                            .map(|b| b.name)
+                            .unwrap_or_else(|| branch_id.to_string());
+                        let event_count = timeline
+                            .get_branch_events(&branch_id, None, None)
+                            .map(|events| events.len())
+                            .unwrap_or(0);
+
+                        serde_json::json!({
+                            "current_branch": current_branch,
+                            "event_count": event_count,
+                            "branches": branches,
+                        })
+                    }
+                    None => {
+                        // Honest gap: `get_session_branch` has no mapping
+                        // for this session id (that mapping is populated by
+                        // the websocket connect path in api-server, which
+                        // this executor does not go through), so we cannot
+                        // truthfully name which branch the session is
+                        // "on". Report only what is genuinely derivable
+                        // from the timeline as a whole — real branch list,
+                        // real aggregate event count — and omit
+                        // `current_branch` rather than fabricate "main".
+                        let stats = timeline.get_stats();
+                        serde_json::json!({
+                            "event_count": stats.total_events,
+                            "branches": branches,
+                        })
+                    }
+                }
             }
             _ => {
                 // Generic query response
@@ -1002,5 +1044,67 @@ mod tests {
     #[tokio::test]
     async fn test_full_integration() {
         // Test implementation
+    }
+
+    /// H10 RED: the history/timeline query must reflect the real timeline
+    /// state (a recorded event, the actual branch list) rather than the
+    /// hardcoded `{"current_branch":"main","event_count":0,"branches":["main"]}`
+    /// the handler previously returned unconditionally.
+    #[tokio::test]
+    async fn test_history_query_reflects_real_timeline_state() {
+        let timeline = Arc::new(RwLock::new(Timeline::new(
+            timeline_engine::TimelineConfig::default(),
+        )));
+
+        // Record one real event on main before the query runs.
+        {
+            let tl = timeline.read().await;
+            tl.add_operation(
+                timeline_engine::Operation::CreatePrimitive {
+                    primitive_type: timeline_engine::PrimitiveType::Box,
+                    parameters: serde_json::json!({}),
+                },
+                timeline_engine::Author::System,
+                timeline_engine::BranchId::main(),
+            )
+            .await
+            .expect("appending to a fresh main branch must succeed");
+        }
+
+        let broadcast_manager = session_manager::BroadcastManager::new();
+        let session_manager = Arc::new(SessionManager::new(broadcast_manager));
+        let session_id = session_manager.create_session("tester".to_string()).await;
+
+        let executor = FullIntegrationExecutor::new(
+            Arc::new(RwLock::new(BRepModel::new())),
+            Arc::new(ExportEngine::new()),
+            session_manager,
+            timeline,
+            FullIntegrationConfig::default(),
+        );
+
+        let result = executor
+            .handle_query(
+                &session_id,
+                "tester",
+                "show me the timeline history",
+                &serde_json::json!({}),
+            )
+            .await
+            .expect("history query must succeed");
+
+        let data = result.data.expect("history query must return data");
+        let event_count = data["event_count"]
+            .as_u64()
+            .expect("event_count must be a number");
+
+        // The hardcoded placeholder always returned 0 regardless of what
+        // was actually recorded on the timeline — this is the assertion
+        // that must fail against that placeholder and pass once the
+        // handler derives the count from the real Timeline.
+        assert!(
+            event_count >= 1,
+            "event_count must reflect the recorded event, got: {data}"
+        );
     }
 }

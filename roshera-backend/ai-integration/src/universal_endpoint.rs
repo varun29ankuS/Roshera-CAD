@@ -34,7 +34,7 @@ impl Default for UniversalEndpointConfig {
             provider: VisionProviderType::Anthropic,
             url: "https://api.anthropic.com/v1/messages".to_string(),
             api_key: None,
-            model_name: "claude-3-5-sonnet-20241022".to_string(),
+            model_name: "claude-sonnet-5".to_string(),
             timeout_secs: 30,
             max_tokens: 1000,
             temperature: 0.7,
@@ -88,5 +88,27 @@ impl UniversalEndpoint {
     /// Get the provider type
     pub fn provider(&self) -> &VisionProviderType {
         &self.config.provider
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// P3a: the default model must be the current, live Anthropic model
+    /// ID — never a retired/deprecated one. `claude-3-5-sonnet-20241022`
+    /// is retired and 404s.
+    #[test]
+    fn default_model_is_not_a_retired_id() {
+        let model = UniversalEndpointConfig::default().model_name;
+        assert_ne!(
+            model, "claude-3-5-sonnet-20241022",
+            "default model_name must not be the retired ID"
+        );
+        assert_ne!(
+            model, "claude-sonnet-4-20250514",
+            "default model_name must not be the deprecated ID"
+        );
+        assert_eq!(model, "claude-sonnet-5");
     }
 }

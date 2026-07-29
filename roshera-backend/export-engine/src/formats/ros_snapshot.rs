@@ -5,12 +5,13 @@
 
 use geometry_engine::math::{Point3, Vector3};
 use geometry_engine::primitives::{
+    blending_surfaces::{CubicG2Blend, G2BlendingSurface, QuarticG2Blend},
     curve::{
         Arc as GeoArc, Circle as GeoCircle, Curve, Line as GeoLine, NurbsCurve as GeoNurbsCurve,
     },
     edge::{Edge, EdgeOrientation},
     face::{Face, FaceOrientation},
-    fillet_surfaces::CylindricalFillet,
+    fillet_surfaces::{CylindricalFillet, SphericalFillet, ToroidalFillet, VariableRadiusFillet},
     r#loop::{Loop, LoopType},
     shell::{Shell, ShellType as GeoShellType},
     solid::Solid,
@@ -22,6 +23,7 @@ use geometry_engine::primitives::{
     topology_builder::BRepModel,
 };
 use serde::{Deserialize, Serialize};
+use shared_types::ExportError;
 use std::collections::HashMap;
 use uuid::Uuid;
 
@@ -172,6 +174,25 @@ pub enum SurfaceData {
         profile: CurveData,
         angle: f64,
     },
+    /// A surface the exporter could not represent as any exact analytic
+    /// or swept form it recognizes (e.g. a `SphericalFillet`/
+    /// `ToroidalFillet`/`VariableRadiusFillet` blend, a G2 blending
+    /// surface, or a non-swept `RuledSurface`). The geometry is a
+    /// bilinear (degree 1x1) sampling of the ORIGINAL surface over its
+    /// parameter domain — a lossy approximation, not an authored
+    /// control net. `source_type` names the kernel `Surface`
+    /// implementor that produced it so a reader can tell approximated
+    /// faces from authored `BSpline`/`Nurbs` geometry instead of
+    /// silently trusting a sampled grid as if it were exact design
+    /// intent.
+    Approximated {
+        source_type: String,
+        control_points: Vec<Vec<[f64; 3]>>,
+        knots_u: Vec<f64>,
+        knots_v: Vec<f64>,
+        degree_u: u32,
+        degree_v: u32,
+    },
 }
 
 /// Serializable shell data
@@ -238,8 +259,15 @@ impl BRepSnapshot {
         }
     }
 
-    /// Convert from BRepModel to snapshot — extracts all topology and geometry
-    pub fn from_model(model: &BRepModel) -> Self {
+    /// Convert from BRepModel to snapshot — extracts all topology and geometry.
+    ///
+    /// Fails with a typed [`ExportError`] naming the offending face's
+    /// surface when a face's surface cannot be sampled at all (a
+    /// `point_at` failure at some parameter — a genuinely unrepresentable
+    /// surface, not merely one lacking an exact analytic/swept form: those
+    /// still export via the tagged `SurfaceData::Approximated` sampling
+    /// fallback).
+    pub fn from_model(model: &BRepModel) -> Result<Self, ExportError> {
         let mut snapshot = Self::new();
 
         // ── Vertices ──
@@ -297,7 +325,7 @@ impl BRepSnapshot {
         for sid in 0..model.surfaces.len() as u32 {
             if let Some(surface) = model.surfaces.get(sid) {
                 let uuid = id_to_uuid(sid as u64);
-                let surface_data = extract_surface_data(surface);
+                let surface_data = extract_surface_data(surface)?;
                 snapshot.surfaces.push((uuid, surface_data));
             }
         }
@@ -357,7 +385,7 @@ impl BRepSnapshot {
             ));
         }
 
-        snapshot
+        Ok(snapshot)
     }
 
     /// Convert from snapshot to BRepModel (import path)
@@ -494,6 +522,38 @@ impl BRepSnapshot {
                         .ok()
                         .map(|s| Box::new(s) as Box<dyn Surface>)
                 }),
+                // The kernel has no "this is a sampled approximation"
+                // surface type to reconstruct into — `source_type` is
+                // preserved in the FILE FORMAT so a reader of the raw
+                // .ros/.step surfaces list can tell this face was
+                // approximated, but a live in-memory model necessarily
+                // represents it as the sampled grid geometry it is (the
+                // same reconstruction `BSpline` already used above).
+                SurfaceData::Approximated {
+                    control_points,
+                    knots_u,
+                    knots_v,
+                    degree_u,
+                    degree_v,
+                    ..
+                } => {
+                    let cps: Vec<Vec<Point3>> = control_points
+                        .iter()
+                        .map(|row| row.iter().map(|p| pt(*p)).collect())
+                        .collect();
+                    let weights: Vec<Vec<f64>> =
+                        cps.iter().map(|row| vec![1.0; row.len()]).collect();
+                    geometry_engine::math::nurbs::NurbsSurface::new(
+                        cps,
+                        weights,
+                        knots_u.clone(),
+                        knots_v.clone(),
+                        *degree_u as usize,
+                        *degree_v as usize,
+                    )
+                    .ok()
+                    .map(|nurbs| Box::new(GeneralNurbsSurface { nurbs }) as Box<dyn Surface>)
+                }
             };
             if let Some(surface) = surface {
                 let id = model.surfaces.add(surface);
@@ -990,22 +1050,67 @@ fn exact_swept_ruled_surface(ruled: &RuledSurface) -> Option<SurfaceData> {
     }
 }
 
-fn extract_surface_data(surface: &dyn Surface) -> SurfaceData {
+/// Identify the kernel `Surface` implementor behind a trait object for
+/// error/approximation-marker reporting. Tries every concrete type known
+/// to fall through to the sampled fallback below (fillets whose blend
+/// shape isn't one of the tightly-gated exact cases, and the G2 blending
+/// family) before falling back to the `Debug` struct-name prefix, so a
+/// future `Surface` implementor no one has enumerated here still gets a
+/// usable (if less precise) name instead of a blank one.
+fn surface_type_name(surface: &dyn Surface) -> String {
+    let any = surface.as_any();
+    if any.downcast_ref::<SphericalFillet>().is_some() {
+        return "SphericalFillet".to_string();
+    }
+    if any.downcast_ref::<ToroidalFillet>().is_some() {
+        return "ToroidalFillet".to_string();
+    }
+    if any.downcast_ref::<VariableRadiusFillet>().is_some() {
+        return "VariableRadiusFillet".to_string();
+    }
+    if any.downcast_ref::<CylindricalFillet>().is_some() {
+        return "CylindricalFillet (curved spine)".to_string();
+    }
+    if any.downcast_ref::<G2BlendingSurface>().is_some() {
+        return "G2BlendingSurface".to_string();
+    }
+    if any.downcast_ref::<CubicG2Blend>().is_some() {
+        return "CubicG2Blend".to_string();
+    }
+    if any.downcast_ref::<QuarticG2Blend>().is_some() {
+        return "QuarticG2Blend".to_string();
+    }
+    if any.downcast_ref::<RuledSurface>().is_some() {
+        return "RuledSurface (non-swept)".to_string();
+    }
+    // Unknown to this function: fall back to the leading identifier in
+    // the Debug representation (every `#[derive(Debug)]` struct/tuple
+    // starts with its type name before the first `{`/`(`).
+    let debug = format!("{:?}", surface);
+    debug
+        .split(['{', '('])
+        .next()
+        .unwrap_or("<unknown surface type>")
+        .trim()
+        .to_string()
+}
+
+fn extract_surface_data(surface: &dyn Surface) -> Result<SurfaceData, ExportError> {
     let any = surface.as_any();
 
     if let Some(plane) = any.downcast_ref::<GeoPlane>() {
-        return SurfaceData::Plane {
+        return Ok(SurfaceData::Plane {
             origin: [plane.origin.x, plane.origin.y, plane.origin.z],
             normal: [plane.normal.x, plane.normal.y, plane.normal.z],
-        };
+        });
     }
 
     if let Some(cyl) = any.downcast_ref::<GeoCylinder>() {
-        return SurfaceData::Cylinder {
+        return Ok(SurfaceData::Cylinder {
             origin: [cyl.origin.x, cyl.origin.y, cyl.origin.z],
             axis: [cyl.axis.x, cyl.axis.y, cyl.axis.z],
             radius: cyl.radius,
-        };
+        });
     }
 
     // A fillet on a STRAIGHT edge (e.g. a box edge) is an exact circular
@@ -1026,36 +1131,36 @@ fn extract_surface_data(surface: &dyn Surface) -> SurfaceData {
     // sampled B-spline path, so it is not misdeclared as an infinite cylinder.
     if let Some(fillet) = any.downcast_ref::<CylindricalFillet>() {
         if let Some((origin, axis)) = straight_fillet_cylinder_axis(fillet) {
-            return SurfaceData::Cylinder {
+            return Ok(SurfaceData::Cylinder {
                 origin,
                 axis,
                 radius: fillet.radius,
-            };
+            });
         }
     }
 
     if let Some(sph) = any.downcast_ref::<GeoSphere>() {
-        return SurfaceData::Sphere {
+        return Ok(SurfaceData::Sphere {
             center: [sph.center.x, sph.center.y, sph.center.z],
             radius: sph.radius,
-        };
+        });
     }
 
     if let Some(cone) = any.downcast_ref::<GeoCone>() {
-        return SurfaceData::Cone {
+        return Ok(SurfaceData::Cone {
             apex: [cone.apex.x, cone.apex.y, cone.apex.z],
             axis: [cone.axis.x, cone.axis.y, cone.axis.z],
             half_angle: cone.half_angle,
-        };
+        });
     }
 
     if let Some(torus) = any.downcast_ref::<GeoTorus>() {
-        return SurfaceData::Torus {
+        return Ok(SurfaceData::Torus {
             center: [torus.center.x, torus.center.y, torus.center.z],
             axis: [torus.axis.x, torus.axis.y, torus.axis.z],
             major_radius: torus.major_radius,
             minor_radius: torus.minor_radius,
-        };
+        });
     }
 
     if let Some(nurbs_surf) = any.downcast_ref::<GeneralNurbsSurface>() {
@@ -1071,22 +1176,22 @@ fn extract_surface_data(surface: &dyn Surface) -> SurfaceData {
             .all(|row| row.iter().all(|&w| (w - 1.0).abs() < 1e-12));
 
         if all_unit {
-            return SurfaceData::BSpline {
+            return Ok(SurfaceData::BSpline {
                 control_points: cps,
                 knots_u: nurbs_surf.nurbs.knots_u.values().to_vec(),
                 knots_v: nurbs_surf.nurbs.knots_v.values().to_vec(),
                 degree_u: nurbs_surf.nurbs.degree_u as u32,
                 degree_v: nurbs_surf.nurbs.degree_v as u32,
-            };
+            });
         }
-        return SurfaceData::Nurbs {
+        return Ok(SurfaceData::Nurbs {
             control_points: cps,
             weights,
             knots_u: nurbs_surf.nurbs.knots_u.values().to_vec(),
             knots_v: nurbs_surf.nurbs.knots_v.values().to_vec(),
             degree_u: nurbs_surf.nurbs.degree_u as u32,
             degree_v: nurbs_surf.nurbs.degree_v as u32,
-        };
+        });
     }
 
     // An EXACTLY-SWEPT ruled lateral (SKETCH-DCM #45 follow-ups C item 2):
@@ -1101,7 +1206,7 @@ fn extract_surface_data(surface: &dyn Surface) -> SurfaceData {
     // fall through to the sampled fallback unchanged.
     if let Some(ruled) = any.downcast_ref::<RuledSurface>() {
         if let Some(exact) = exact_swept_ruled_surface(ruled) {
-            return exact;
+            return Ok(exact);
         }
     }
 
@@ -1110,7 +1215,7 @@ fn extract_surface_data(surface: &dyn Surface) -> SurfaceData {
         // The profile reuses the analytic curve paths (Line/Circle/Arc/NURBS), so a
         // revolved nozzle/vessel exports smooth instead of the degree-1 grid below
         // (the FreeCAD faceted-nozzle bug).
-        return SurfaceData::SurfaceOfRevolution {
+        return Ok(SurfaceData::SurfaceOfRevolution {
             axis_origin: [sor.axis_origin.x, sor.axis_origin.y, sor.axis_origin.z],
             axis_direction: [
                 sor.axis_direction.x,
@@ -1119,19 +1224,31 @@ fn extract_surface_data(surface: &dyn Surface) -> SurfaceData {
             ],
             profile: extract_curve_data(&*sor.profile_curve),
             angle: sor.angle,
-        };
+        });
     }
 
     // Fallback: sample the surface on a grid and store as a degree-1
-    // B-spline. As with the curve fallback, the knot vectors MUST be
-    // valid clamped vectors sized to the control-point grid
-    // (`n + degree + 1` per direction), NOT empty — an empty knot
-    // vector serializes to `B_SPLINE_SURFACE_WITH_KNOTS(…,(),(),(),())`,
-    // which the importer rejects ("knot vector is empty"), dropping the
-    // face and tearing topology gaps in every adjacent edge. This was
-    // the root cause of Roshera-exported solids failing to re-import as
-    // watertight: boolean-split faces whose surface type the analytic
-    // downcasts above didn't recognise fell here and lost their knots.
+    // approximation, TAGGED as such (`SurfaceData::Approximated`, not
+    // `BSpline` — a bare `BSpline` claims an authored exact control net,
+    // which this sampled grid is not; see the H7 defect report). As with
+    // the curve fallback, the knot vectors MUST be valid clamped vectors
+    // sized to the control-point grid (`n + degree + 1` per direction),
+    // NOT empty — an empty knot vector serializes to
+    // `B_SPLINE_SURFACE_WITH_KNOTS(…,(),(),(),())`, which the importer
+    // rejects ("knot vector is empty"), dropping the face and tearing
+    // topology gaps in every adjacent edge. This was the root cause of
+    // Roshera-exported solids failing to re-import as watertight:
+    // boolean-split faces whose surface type the analytic downcasts
+    // above didn't recognise fell here and lost their knots — so this
+    // sampled path is a load-bearing part of the main export flow for
+    // filleted/blended/boolean-split geometry and MUST keep producing
+    // usable geometry; it must simply stop claiming to be exact.
+    //
+    // A `point_at` failure at any sampled (u, v) is refused with a typed
+    // error rather than fabricated as `[0, 0, 0]` — a silent fabricated
+    // coordinate is strictly worse than a failed export, and the caller
+    // can act on a named, located failure.
+    let source_type = surface_type_name(surface);
     let n = 10;
     let ((u_min, u_max), (v_min, v_max)) = surface.parameter_bounds();
     let mut cps: Vec<Vec<[f64; 3]>> = Vec::with_capacity(n + 1);
@@ -1140,24 +1257,29 @@ fn extract_surface_data(surface: &dyn Surface) -> SurfaceData {
         let mut row = Vec::with_capacity(n + 1);
         for j in 0..=n {
             let v = v_min + (v_max - v_min) * j as f64 / n as f64;
-            if let Ok(pt) = surface.point_at(u, v) {
-                row.push([pt.x, pt.y, pt.z]);
-            } else {
-                row.push([0.0, 0.0, 0.0]);
-            }
+            let pt = surface
+                .point_at(u, v)
+                .map_err(|e| ExportError::ExportFailed {
+                    reason: format!(
+                        "surface sampling failed for {} at (u={:.6}, v={:.6}): {}",
+                        source_type, u, v, e
+                    ),
+                })?;
+            row.push([pt.x, pt.y, pt.z]);
         }
         cps.push(row);
     }
     let (degree_u, degree_v) = (1usize, 1usize);
     let knots_u = clamped_uniform_knots(cps.len(), degree_u);
     let knots_v = clamped_uniform_knots(cps.first().map(|r| r.len()).unwrap_or(0), degree_v);
-    SurfaceData::BSpline {
+    Ok(SurfaceData::Approximated {
+        source_type,
         control_points: cps,
         knots_u,
         knots_v,
         degree_u: degree_u as u32,
         degree_v: degree_v as u32,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -1226,7 +1348,7 @@ mod surface_of_revolution_export_tests {
         )
         .expect("surface of revolution constructs");
 
-        match extract_surface_data(&sor) {
+        match extract_surface_data(&sor).expect("a well-formed SurfaceOfRevolution samples fine") {
             SurfaceData::SurfaceOfRevolution {
                 angle,
                 profile,
@@ -1244,6 +1366,120 @@ mod surface_of_revolution_export_tests {
                 assert!((axis_direction[2] - 1.0).abs() < 1e-9, "axis is +Z");
             }
             other => panic!("SurfaceOfRevolution faceted to the fallback: {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod fallback_refusal_tests {
+    // H7: the sampled-grid fallback must not silently masquerade an
+    // unsupported surface as an authored exact `BSpline`, and must not
+    // fabricate `[0, 0, 0]` when a sampled point genuinely fails.
+    use super::{extract_surface_data, BRepSnapshot, SurfaceData};
+    use geometry_engine::math::Point3;
+    use geometry_engine::primitives::fillet_surfaces::SphericalFillet;
+    use geometry_engine::primitives::topology_builder::BRepModel;
+
+    /// `SphericalFillet` is a real, production-reachable `Surface`
+    /// implementor (minted by `operations/fillet.rs` for vertex blends)
+    /// that has NO analytic downcast in `extract_surface_data` — it used
+    /// to fall to the sampled grid and come back as a bare
+    /// `SurfaceData::BSpline`, indistinguishable from an authored exact
+    /// control net. It must now come back tagged as an approximation,
+    /// naming the surface type it approximates.
+    #[test]
+    fn spherical_fillet_extracts_as_a_tagged_approximation_not_bare_bspline() {
+        let fillet = SphericalFillet::new(Point3::new(0.0, 0.0, 0.0), 1.0, Vec::new())
+            .expect("spherical fillet constructs with no adjacent edges (default octant bounds)");
+
+        match extract_surface_data(&fillet).expect("a well-formed fillet samples fine") {
+            SurfaceData::Approximated { source_type, .. } => {
+                assert_eq!(source_type, "SphericalFillet");
+            }
+            other => panic!(
+                "SphericalFillet exported as {other:?} — indistinguishable from authored \
+                 exact geometry"
+            ),
+        }
+    }
+
+    /// A `point_at` failure while sampling the fallback grid must refuse
+    /// with a typed, located error — not silently write `[0, 0, 0]` as a
+    /// fabricated coordinate. Forcing `radius = 0.0` post-construction
+    /// (the field is `pub`) makes every sampled point coincide with the
+    /// fillet's center, so the surface's own normal computation divides
+    /// by zero at every (u, v).
+    #[test]
+    fn point_at_failure_refuses_instead_of_fabricating_origin() {
+        let mut fillet = SphericalFillet::new(Point3::new(1.0, 2.0, 3.0), 1.0, Vec::new())
+            .expect("spherical fillet constructs");
+        fillet.radius = 0.0;
+
+        let err = extract_surface_data(&fillet)
+            .expect_err("a degenerate surface must refuse, not fabricate [0, 0, 0] points");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("SphericalFillet"),
+            "error should name the offending surface type: {msg}"
+        );
+    }
+
+    /// KNOWN SCOPE BOUNDARY — documented, not silently glossed over.
+    ///
+    /// The `Approximated` marker survives ordinary `BRepSnapshot`
+    /// (de)serialization (msgpack on disk, or any direct
+    /// serialize/deserialize of the snapshot) perfectly: it is just
+    /// another serde variant, so a .ros GEOM chunk that stored it reads
+    /// it back unchanged. It does NOT survive a full model-level
+    /// round-trip — `to_model()` into a live kernel `BRepModel`, then
+    /// `from_model()` again — because:
+    ///
+    /// 1. The kernel's `Surface` trait has no "this is a sampled
+    ///    approximation" bit, and `geometry-engine` is out of scope for
+    ///    this fix (per the task brief: "never touch geometry-engine
+    ///    source"). `to_model()` can only reconstruct the sampled grid
+    ///    as a bona fide `GeneralNurbsSurface` — structurally identical
+    ///    to an authored one.
+    /// 2. The production import path that actually exercises this
+    ///    (`ros.rs::import_ros_to_brep`) returns a bare `BRepModel`,
+    ///    discarding `BRepSnapshot::metadata` entirely — so even a
+    ///    metadata-side-channel (e.g. recording approximated surface
+    ///    UUIDs in `BRepMetadata.properties`) would need that function's
+    ///    public return type changed and its callers (api-server, out of
+    ///    this task's assigned crates) updated to carry it through.
+    ///
+    /// Closing this fully needs a kernel-level provenance field, or
+    /// threading snapshot metadata through the live-model lifecycle
+    /// (session storage, timeline) end to end — both out of scope here.
+    /// This test PINS the current, documented behavior (the marker is
+    /// single-hop) so a future fix has a red to turn green instead of an
+    /// undiscovered gap; if this now preserves `Approximated`, update or
+    /// remove this test and the comment above it.
+    #[test]
+    fn approximated_marker_is_single_hop_a_bare_model_round_trip_launders_it() {
+        let mut model = BRepModel::new();
+        let fillet = SphericalFillet::new(Point3::new(0.0, 0.0, 0.0), 1.0, Vec::new())
+            .expect("spherical fillet constructs");
+        model.surfaces.add(Box::new(fillet));
+
+        let snapshot1 = BRepSnapshot::from_model(&model).expect("first export succeeds");
+        assert!(
+            matches!(snapshot1.surfaces[0].1, SurfaceData::Approximated { .. }),
+            "sanity: first export should be tagged Approximated"
+        );
+
+        let model2 = snapshot1.to_model();
+        let snapshot2 = BRepSnapshot::from_model(&model2).expect("second export succeeds");
+
+        match &snapshot2.surfaces[0].1 {
+            SurfaceData::BSpline { .. } => {
+                // Documented current behavior — see the doc comment above.
+            }
+            other => panic!(
+                "expected the documented laundering behavior (a bare BSpline) — got \
+                 {other:?} instead. If the marker now survives, the scope-boundary \
+                 comment above is stale and should be updated."
+            ),
         }
     }
 }

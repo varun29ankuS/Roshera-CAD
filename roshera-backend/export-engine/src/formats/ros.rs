@@ -235,7 +235,7 @@ pub async fn export_brep_to_ros(
 
     // GEOM chunk (optional cache) -------------------------------------
     if options.include_snapshot {
-        let snapshot = BRepSnapshot::from_model(payload.model);
+        let snapshot = BRepSnapshot::from_model(payload.model)?;
         let geom_bytes =
             rmp_serde::to_vec_named(&snapshot).map_err(|e| ExportError::ExportFailed {
                 reason: format!("Failed to serialize geometry: {}", e),

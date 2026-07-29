@@ -2,6 +2,8 @@ import { useEffect } from 'react'
 import { useSceneStore } from '@/stores/scene-store'
 import { useWSStore } from '@/stores/ws-store'
 import { useCommandPaletteStore } from '@/stores/command-palette-store'
+import { useActionErrorStore } from '@/stores/action-error-store'
+import { tryReadJson, refusalMessage } from '@/lib/backend-refusal'
 import * as THREE from 'three'
 
 const API_BASE = import.meta.env.VITE_API_URL || ''
@@ -13,14 +15,36 @@ async function timelineAction(action: 'undo' | 'redo') {
   // (populated by `Welcome` / `SessionUpdate` frames) and POST it.
   const sessionId = useWSStore.getState().sessionId
   if (!sessionId) return
+  const label = action === 'undo' ? 'Undo' : 'Redo'
+  // This runs outside any component tree (a document keydown handler),
+  // so the plain vanilla-store accessor (mirroring `useWSStore.getState()`
+  // above) is used instead of the `useActionErrorStore()` hook. Mirrors
+  // the exact refusal semantics of the Timeline.tsx toolbar buttons:
+  // undo/redo answer expected refusals ("nothing to undo") as HTTP 200
+  // with `{ success: false, message }` — see
+  // `handlers/timeline.rs::undo_operation` / `redo_operation` — while
+  // malformed input comes back as a bare non-2xx with no body.
+  const flashActionError = useActionErrorStore.getState().flash
   try {
-    await fetch(`${API_BASE}/api/timeline/${action}`, {
+    const resp = await fetch(`${API_BASE}/api/timeline/${action}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ session_id: sessionId }),
     })
+    const body = await tryReadJson(resp)
+    if (!resp.ok) {
+      flashActionError(`${label} failed: ${refusalMessage(body, resp.status)}`)
+      return
+    }
+    if (body && body.success === false) {
+      flashActionError(`${label}: ${refusalMessage(body, resp.status)}`)
+      return
+    }
+    if (body && body.model_reconciled === false) {
+      flashActionError(`${label} applied, but the 3D model may be stale (reconciliation failed)`)
+    }
   } catch {
-    // backend not running
+    flashActionError(`Backend unreachable — ${action} not applied`)
   }
 }
 

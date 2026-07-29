@@ -19,6 +19,7 @@ use futures::stream::StreamExt;
 use geometry_engine::primitives::tool_schema_generator::ToolTier;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::time::Duration;
 
 /// Configuration for the Claude provider.
 ///
@@ -33,7 +34,7 @@ pub struct ClaudeConfig {
     /// Anthropic API key. When `None` (or empty) every method returns
     /// `ProviderError::ProviderUnavailable` — there is no offline fallback.
     pub api_key: Option<String>,
-    /// Model ID (e.g., "claude-sonnet-4-20250514")
+    /// Model ID (e.g., "claude-sonnet-5")
     pub model: String,
     /// Maximum tokens for the response
     pub max_tokens: usize,
@@ -41,6 +42,10 @@ pub struct ClaudeConfig {
     pub tool_tier: ToolTier,
     /// API base URL (for proxies or self-hosted)
     pub api_base: String,
+    /// Request timeout, in seconds, applied to every HTTP call this
+    /// provider makes (P5: an unbounded client can hang a request
+    /// forever on a stalled connection).
+    pub request_timeout_secs: u64,
 }
 
 impl std::fmt::Debug for ClaudeConfig {
@@ -55,6 +60,7 @@ impl std::fmt::Debug for ClaudeConfig {
             .field("max_tokens", &self.max_tokens)
             .field("tool_tier", &self.tool_tier)
             .field("api_base", &self.api_base)
+            .field("request_timeout_secs", &self.request_timeout_secs)
             .finish()
     }
 }
@@ -63,10 +69,11 @@ impl Default for ClaudeConfig {
     fn default() -> Self {
         Self {
             api_key: None,
-            model: "claude-sonnet-4-20250514".to_string(),
+            model: "claude-sonnet-5".to_string(),
             max_tokens: 1024,
             tool_tier: ToolTier::Tier1,
             api_base: "https://api.anthropic.com".to_string(),
+            request_timeout_secs: 120,
         }
     }
 }
@@ -75,6 +82,11 @@ impl Default for ClaudeConfig {
 #[derive(Debug, Clone)]
 pub struct ClaudeProvider {
     config: ClaudeConfig,
+    /// Built once (per `ClaudeProvider` construction) with
+    /// `config.request_timeout_secs` applied, so every HTTP call this
+    /// provider makes shares one bounded-timeout client rather than
+    /// constructing a fresh unbounded one per call.
+    client: reqwest::Client,
 }
 
 impl ClaudeProvider {
@@ -85,19 +97,26 @@ impl ClaudeProvider {
     /// via `with_config(...)` or the `ANTHROPIC_API_KEY` env var is
     /// honored by a wrapper that builds the config.
     pub fn new() -> Self {
-        Self {
-            config: ClaudeConfig::default(),
-        }
+        Self::with_config(ClaudeConfig::default())
     }
 
     /// Create a Claude provider with explicit configuration.
     pub fn with_config(config: ClaudeConfig) -> Self {
-        Self { config }
+        let client = build_http_client(&config);
+        Self { config, client }
     }
 
     /// Set the tool tier (controls how many tools are exposed to the LLM).
     pub fn set_tool_tier(&mut self, tier: ToolTier) {
         self.config.tool_tier = tier;
+    }
+
+    /// Read-only access to the provider's configuration — lets callers
+    /// (and tests) confirm which model/tool-tier/timeout a constructed
+    /// provider actually carries, e.g. after `NativeProviderFactory::
+    /// create_claude_provider` builds one from a `NativeProviderConfig`.
+    pub fn config(&self) -> &ClaudeConfig {
+        &self.config
     }
 
     /// Send a text prompt alongside a PNG image to Claude and return the plain-text reply.
@@ -137,8 +156,8 @@ impl ClaudeProvider {
             png_bytes,
         );
 
-        let client = reqwest::Client::new();
-        let response = client
+        let response = self
+            .client
             .post(format!("{}/v1/messages", self.config.api_base))
             .header("x-api-key", key)
             .header("anthropic-version", "2023-06-01")
@@ -204,8 +223,8 @@ impl ClaudeProvider {
             "messages": messages
         });
 
-        let client = reqwest::Client::new();
-        let response = client
+        let response = self
+            .client
             .post(format!("{}/v1/messages", self.config.api_base))
             .header("x-api-key", api_key)
             .header("anthropic-version", "2023-06-01")
@@ -276,8 +295,8 @@ impl LLMProvider for ClaudeProvider {
             }
         };
 
-        let client = reqwest::Client::new();
-        let response = client
+        let response = self
+            .client
             .post(format!("{}/v1/messages", self.config.api_base))
             .header("x-api-key", key)
             .header("anthropic-version", "2023-06-01")
@@ -290,6 +309,20 @@ impl LLMProvider for ClaudeProvider {
             .send()
             .await
             .map_err(|e| ProviderError::InferenceError(format!("API request failed: {}", e)))?;
+
+        // P4: mirror the status check every sibling entry point performs
+        // (process_via_api, generate_with_image, generate_stream). Without
+        // it, a 401/429/529 JSON error envelope parses "successfully" as a
+        // `Value` and `extract_text_from_response` surfaces a misleading
+        // "no text blocks" error instead of the real HTTP failure.
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(ProviderError::InferenceError(format!(
+                "Anthropic API returned {}: {}",
+                status, body
+            )));
+        }
 
         let body: Value = response.json().await.map_err(|e| {
             ProviderError::InferenceError(format!("Failed to parse response: {}", e))
@@ -327,8 +360,8 @@ impl LLMProvider for ClaudeProvider {
             "messages": [{"role": "user", "content": prompt}],
         });
 
-        let client = reqwest::Client::new();
-        let response = client
+        let response = self
+            .client
             .post(format!("{}/v1/messages", self.config.api_base))
             .header("x-api-key", key)
             .header("anthropic-version", "2023-06-01")
@@ -374,6 +407,21 @@ impl LLMProvider for ClaudeProvider {
 }
 
 // --- Internal helpers ---
+
+/// Build the shared HTTP client for a `ClaudeProvider`, applying
+/// `config.request_timeout_secs` (P5: an unbounded `reqwest::Client` can
+/// hang a request against a stalled connection indefinitely). Mirrors the
+/// `Client::builder().timeout(...).build()` pattern used by
+/// `UniversalEndpoint::new` elsewhere in this crate. Falls back to an
+/// unconfigured default client on the (practically unreachable) builder
+/// error path, rather than propagating a fallible result out of
+/// constructors that are not themselves fallible.
+fn build_http_client(config: &ClaudeConfig) -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(config.request_timeout_secs))
+        .build()
+        .unwrap_or_default()
+}
 
 /// Build a system prompt that includes scene context for the LLM.
 fn build_system_prompt(context: Option<&super::ConversationContext>) -> String {
@@ -893,5 +941,130 @@ mod tests {
             "expected ProviderUnavailable when no key is configured, got {:?}",
             result
         );
+    }
+
+    /// P3a: the default model must be the current, live Anthropic model
+    /// ID — never a retired/deprecated one. `claude-sonnet-4-20250514` is
+    /// deprecated and `claude-3-5-sonnet-20241022` is retired/404s.
+    #[test]
+    fn default_model_is_not_a_retired_id() {
+        let model = ClaudeConfig::default().model;
+        assert_ne!(
+            model, "claude-sonnet-4-20250514",
+            "default model must not be the deprecated ID"
+        );
+        assert_ne!(
+            model, "claude-3-5-sonnet-20241022",
+            "default model must not be the retired ID"
+        );
+        assert_eq!(model, "claude-sonnet-5");
+    }
+
+    /// P4: `generate()` must surface a non-success HTTP status as a typed
+    /// `InferenceError` naming the real status code, exactly like its three
+    /// siblings (`process_via_api`, `generate_with_image`,
+    /// `generate_stream`). Without the status check, a 401 JSON error
+    /// envelope (which has no `content` array) parses "successfully" and
+    /// falls through to `extract_text_from_response`, which reports the
+    /// unrelated "missing 'content' array" error instead of the real 401.
+    /// This spins up a local (non-network, 127.0.0.1-only) mock server —
+    /// not a live external API call.
+    #[tokio::test]
+    async fn generate_surfaces_non_success_status_as_typed_error() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("binding a local test listener must succeed");
+        let addr = listener.local_addr().expect("local listener has an addr");
+
+        let server = tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = socket.read(&mut buf).await;
+                let body = r#"{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}"#;
+                let response = format!(
+                    "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        let config = ClaudeConfig {
+            api_key: Some("test-key".to_string()),
+            api_base: format!("http://{}", addr),
+            ..ClaudeConfig::default()
+        };
+        let provider = ClaudeProvider::with_config(config);
+
+        let result = provider.generate("hello", 100).await;
+        let _ = server.await;
+
+        match result {
+            Err(ProviderError::InferenceError(msg)) => {
+                assert!(
+                    msg.contains("401"),
+                    "expected the status check to surface the real HTTP status (401), got: {msg}"
+                );
+            }
+            other => panic!(
+                "expected an InferenceError naming the 401 status, got: {:?}",
+                other
+            ),
+        }
+    }
+
+    /// P5: `generate()` must not hang forever against a stalled connection —
+    /// the shared client must apply `config.request_timeout_secs`. This
+    /// binds a local listener that accepts the connection and then never
+    /// responds, and asserts `generate()` errors out well inside an outer
+    /// 5s bound rather than hanging past it.
+    #[tokio::test]
+    async fn generate_respects_configured_request_timeout() {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("binding a local test listener must succeed");
+        let addr = listener.local_addr().expect("local listener has an addr");
+
+        let _server = tokio::spawn(async move {
+            if let Ok((socket, _)) = listener.accept().await {
+                // Hold the connection open and never write a response,
+                // simulating a stalled upstream.
+                std::mem::forget(socket);
+            }
+        });
+
+        let config = ClaudeConfig {
+            api_key: Some("test-key".to_string()),
+            api_base: format!("http://{}", addr),
+            request_timeout_secs: 1,
+            ..ClaudeConfig::default()
+        };
+        let provider = ClaudeProvider::with_config(config);
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            provider.generate("hello", 100),
+        )
+        .await;
+
+        match outcome {
+            Ok(Err(ProviderError::InferenceError(_))) => {} // client-level timeout fired — expected
+            Ok(Ok(_)) => panic!("a stalled connection must not succeed"),
+            Ok(Err(other)) => panic!(
+                "expected an InferenceError from the stalled connection, got: {:?}",
+                other
+            ),
+            Err(_) => panic!(
+                "generate() did not return within the outer 5s bound — \
+                 request_timeout_secs is not being applied to the client (P5 regression)"
+            ),
+        }
     }
 }

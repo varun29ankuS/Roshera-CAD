@@ -16,52 +16,65 @@ use std::ops::Range;
 /// Solve quadratic equation ax² + bx + c = 0
 /// Returns 0, 1, or 2 real roots in ascending order
 ///
-/// Uses numerically stable formula to avoid catastrophic cancellation
+/// `a`, `b`, `c` are dimensionless polynomial coefficients, not lengths —
+/// the linear-degenerate branch below fires ONLY for an exact zero `a`
+/// (and, within it, an exact zero `b`). A length-scaled `tolerance` gate
+/// on `a` is dimensionally wrong: a tiny-but-nonzero `a` (e.g. 1e-7) still
+/// has a real, representable large root that a tolerance gate would
+/// silently discard by misrouting into the linear branch. `tolerance`
+/// keeps its honest uses below: the discriminant sign test (real vs. no
+/// real roots) and root deduplication.
+///
+/// Uses the stable "citardauq"/companion-matrix form (Numerical Recipes
+/// §5.6; Kahan, "Mathematics Written in Sand") to avoid the catastrophic
+/// cancellation that bare `(-b ± √disc) / 2a` suffers when `b` and `√disc`
+/// share a sign and nearly cancel: `q = -0.5·(b + sign(b)·√disc)`,
+/// `x1 = q/a`, `x2 = c/q`. This is stable for any nonzero `a`, however
+/// small, since it never requires normalizing by `a` before taking the
+/// square root.
 #[inline]
 pub fn solve_quadratic(a: f64, b: f64, c: f64, tolerance: Tolerance) -> Vec<f64> {
     let tol = tolerance.distance();
 
-    // Handle degenerate cases
-    if a.abs() < tol {
-        // Linear equation bx + c = 0
-        if b.abs() < tol {
-            return vec![]; // No solution or infinite solutions
+    // Linear branch only for an EXACTLY zero leading coefficient.
+    if a == 0.0 {
+        // Linear equation bx + c = 0. Same reasoning: `b` is dimensionless,
+        // so this stays an exact test rather than a tolerance gate.
+        if b == 0.0 {
+            // 0 = c: no solution (c != 0) or infinite solutions (c == 0) —
+            // both are honestly refused as "no distinct finite roots".
+            return vec![];
         }
         return vec![-c / b];
     }
 
-    // Normalize coefficients for better numerical stability
-    let inv_a = 1.0 / a;
-    let b = b * inv_a;
-    let c = c * inv_a;
-
-    // Use improved discriminant calculation
-    let discriminant = robust_discriminant(1.0, b, c);
+    // Robust discriminant (handles the b² ≈ 4ac cancellation internally).
+    let discriminant = robust_discriminant(a, b, c);
 
     if discriminant < -tol {
-        // No real roots
-        vec![]
-    } else if discriminant.abs() < tol {
-        // One repeated root (use higher precision)
-        vec![-b * 0.5]
-    } else {
-        // Two distinct roots - use Citardauq formula to avoid cancellation
-        let sqrt_disc = discriminant.sqrt();
-        let q = -0.5 * (b + b.signum() * sqrt_disc);
-        let mut roots = vec![q, c / q];
-        // NaN-safe: drop non-finite roots (possible from degenerate
-        // discriminants or cancellation) before sorting. total_cmp gives a
-        // total order on the remaining finite values so dedup_roots works
-        // correctly.
-        roots.retain(|r| r.is_finite());
-        roots.sort_by(|a, b| a.total_cmp(b));
-
-        // Remove near-duplicates
-        if roots.len() == 2 && (roots[1] - roots[0]).abs() < tol {
-            roots.pop();
-        }
-        roots
+        // No real roots.
+        return vec![];
     }
+
+    // Citardauq (stable companion) form — avoids cancellation for any
+    // nonzero `a`, including very small ones where naive normalization
+    // by `a` would otherwise be the failure point.
+    let sqrt_disc = discriminant.max(0.0).sqrt();
+    let q = -0.5 * (b + b.signum() * sqrt_disc);
+    let x1 = q / a;
+    // q == 0 ⇔ b == 0 ∧ disc == 0 ⇔ double root at 0 when c == 0; c/q
+    // would be 0/0 = NaN there, so fall back to x1 (== 0) in that case.
+    let x2 = if q != 0.0 { c / q } else { x1 };
+
+    let mut roots = vec![x1, x2];
+    // NaN-safe: drop non-finite roots (possible from degenerate
+    // discriminants or cancellation) before sorting. total_cmp gives a
+    // total order on the remaining finite values so dedup_roots works
+    // correctly.
+    roots.retain(|r| r.is_finite());
+    roots.sort_by(|a, b| a.total_cmp(b));
+    dedup_roots(&mut roots, tol);
+    roots
 }
 
 /// Robust discriminant calculation for a quadratic `a x² + b x + c`.
@@ -1410,6 +1423,77 @@ mod tests {
 
         // Perfect square: (x - 1)² = 0
         let roots = solve_quadratic(1.0, -2.0, 1.0, NORMAL_TOLERANCE);
+        assert_eq!(roots.len(), 1);
+        assert!((roots[0] - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_solve_quadratic_small_leading_coefficient_keeps_both_roots() {
+        // Defect: `a.abs() < tol` gates on a LENGTH tolerance (default
+        // 1e-6) but `a` is a dimensionless polynomial coefficient. With
+        // a = 1e-7 the old code took the "linear" branch and silently
+        // dropped the huge root. True roots of 1e-7 x^2 + x - 1 = 0:
+        // x ≈ 0.99999990 and x ≈ -1.0000001e7 (citardauq form).
+        let roots = solve_quadratic(1e-7, 1.0, -1.0, Tolerance::default());
+        assert_eq!(roots.len(), 2, "expected both roots, got {:?}", roots);
+        let small = roots.iter().find(|r| r.abs() < 10.0).copied();
+        let large = roots.iter().find(|r| r.abs() > 10.0).copied();
+        let small = small.expect("no small-magnitude root found");
+        let large = large.expect("no large-magnitude root found");
+        assert!(
+            ((small - 1.0) / 1.0).abs() < 1e-6,
+            "small root {} not within rel err 1e-6 of 1.0",
+            small
+        );
+        assert!(
+            ((large - (-1.0000001e7)) / -1.0000001e7).abs() < 1e-6,
+            "large root {} not within rel err 1e-6 of -1.0000001e7",
+            large
+        );
+    }
+
+    #[test]
+    fn test_solve_quadratic_cancellation_small_root_precision() {
+        // x = 1e8, b^2 >> 4ac: naive (-b + sqrt(disc)) / 2a cancels to
+        // garbage for the small root. Citardauq computes q from the
+        // large root's stable branch, then x2 = c/q — exact here.
+        // Roots of x^2 + 1e8 x + 1 = 0: large ≈ -1e8, small ≈ -1e-8.
+        let roots = solve_quadratic(1.0, 1e8, 1.0, Tolerance::default());
+        assert_eq!(roots.len(), 2, "expected two roots, got {:?}", roots);
+        let small = roots
+            .iter()
+            .find(|r| r.abs() < 1.0)
+            .copied()
+            .expect("no small-magnitude root found");
+        let expected_small = -1e-8;
+        let rel_err = ((small - expected_small) / expected_small).abs();
+        assert!(
+            rel_err < 1e-9,
+            "small root {} not within rel err 1e-9 of {} (rel_err={})",
+            small,
+            expected_small,
+            rel_err
+        );
+    }
+
+    #[test]
+    fn test_solve_quadratic_preserved_behavior() {
+        // Linear branch (a == 0 exactly): 2x - 4 = 0 -> x = 2.
+        let roots = solve_quadratic(0.0, 2.0, -4.0, Tolerance::default());
+        assert_eq!(roots, vec![2.0]);
+
+        // x^2 - 4 = 0 -> {-2, 2}.
+        let roots = solve_quadratic(1.0, 0.0, -4.0, Tolerance::default());
+        assert_eq!(roots.len(), 2);
+        assert!((roots[0] - (-2.0)).abs() < 1e-10);
+        assert!((roots[1] - 2.0).abs() < 1e-10);
+
+        // x^2 + 4 = 0 -> no real roots.
+        let roots = solve_quadratic(1.0, 0.0, 4.0, Tolerance::default());
+        assert_eq!(roots, Vec::<f64>::new());
+
+        // (x - 1)^2 = 0 -> double root, deduped to a single 1.0.
+        let roots = solve_quadratic(1.0, -2.0, 1.0, Tolerance::default());
         assert_eq!(roots.len(), 1);
         assert!((roots[0] - 1.0).abs() < 1e-10);
     }

@@ -10,7 +10,7 @@ use super::*;
 /// Configuration for AI providers
 #[derive(Debug, Clone)]
 pub struct NativeProviderConfig {
-    /// Claude API model to use (e.g. "claude-sonnet-4-20250514")
+    /// Claude API model to use (e.g. "claude-sonnet-5")
     pub claude_model: String,
     /// Maximum tokens for LLM responses
     pub max_tokens: usize,
@@ -19,7 +19,7 @@ pub struct NativeProviderConfig {
 impl Default for NativeProviderConfig {
     fn default() -> Self {
         Self {
-            claude_model: "claude-sonnet-4-20250514".to_string(),
+            claude_model: "claude-sonnet-5".to_string(),
             max_tokens: 4096,
         }
     }
@@ -30,11 +30,33 @@ pub struct NativeProviderFactory;
 
 impl NativeProviderFactory {
     /// Create a Claude API LLM provider
+    ///
+    /// Honors `config.claude_model` / `config.max_tokens` (P6: this
+    /// previously ignored its argument entirely and always built
+    /// `ClaudeProvider::new()`, silently dropping any custom model and
+    /// making it impossible for the provider to ever carry an API key).
+    /// The key itself comes from `ANTHROPIC_API_KEY` — `NativeProviderConfig`
+    /// carries no credential field.
     pub async fn create_claude_provider(
-        _config: &NativeProviderConfig,
+        config: &NativeProviderConfig,
     ) -> Result<ClaudeProvider, ProviderError> {
-        tracing::info!("Creating Claude API LLM provider");
-        Ok(ClaudeProvider::new())
+        tracing::info!(
+            "Creating Claude API LLM provider (model: {})",
+            config.claude_model
+        );
+
+        let api_key = std::env::var("ANTHROPIC_API_KEY")
+            .ok()
+            .filter(|key| !key.is_empty());
+
+        let claude_config = claude::ClaudeConfig {
+            api_key,
+            model: config.claude_model.clone(),
+            max_tokens: config.max_tokens,
+            ..claude::ClaudeConfig::default()
+        };
+
+        Ok(ClaudeProvider::with_config(claude_config))
     }
 
     /// Create a complete provider manager with API-based providers.
@@ -167,5 +189,45 @@ mod tests {
         let config = NativeProviderConfig::default();
         let manager = NativeProviderFactory::create_provider_manager(&config).await;
         assert!(manager.is_ok());
+    }
+
+    /// P6 RED: `create_claude_provider` previously ignored its `_config`
+    /// argument entirely and always built `ClaudeProvider::new()` — a
+    /// custom model in `NativeProviderConfig` was silently dropped, and
+    /// the provider could never carry an API key even when
+    /// `ANTHROPIC_API_KEY` was set. The provider it returns must carry
+    /// the configured model.
+    #[tokio::test]
+    async fn test_create_claude_provider_honors_custom_model() {
+        let config = NativeProviderConfig {
+            claude_model: "claude-custom-test-model".to_string(),
+            max_tokens: 2048,
+        };
+
+        let provider = NativeProviderFactory::create_claude_provider(&config)
+            .await
+            .expect("provider construction must succeed");
+
+        assert_eq!(
+            provider.config().model,
+            "claude-custom-test-model",
+            "provider must carry the model from NativeProviderConfig, not always the hardcoded default"
+        );
+    }
+
+    /// P3a: the default model must be the current, live Anthropic model
+    /// ID — never a retired/deprecated one.
+    #[test]
+    fn default_claude_model_is_not_a_retired_id() {
+        let model = NativeProviderConfig::default().claude_model;
+        assert_ne!(
+            model, "claude-sonnet-4-20250514",
+            "default claude_model must not be the deprecated ID"
+        );
+        assert_ne!(
+            model, "claude-3-5-sonnet-20241022",
+            "default claude_model must not be the retired ID"
+        );
+        assert_eq!(model, "claude-sonnet-5");
     }
 }

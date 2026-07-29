@@ -11,6 +11,9 @@
       1  -- NEW_RED: at least one failure not in the allowlist
       2  -- RATCHET_VIOLATION: at least one allowlist entry is now passing
       3  -- Both NEW_RED and RATCHET_VIOLATION
+      4  -- PARSER_MISMATCH: stdout test blocks could not be reliably paired
+            with runner headers; the gate refuses to judge on guessed
+            attribution. Inspect the capture files and re-run.
 
     RATCHET RULE: when a test goes green, remove its line from KNOWN_REDS.md.
     Never add lines without a diagnosis doc.
@@ -133,12 +136,27 @@ if ($stderrLines) { Write-Host ($stderrLines -join [Environment]::NewLine) }
 if ($stdoutLines) { Write-Host ($stdoutLines -join [Environment]::NewLine) }
 Write-Host "capture files: $stdoutFile · $stderrFile"
 
-# Extract the ordered list of binaries from stderr.
-# Cargo prints "Running tests/foo.rs (...)" to stderr, one per binary, in order.
+# Extract the ordered list of test RUNNERS from stderr. Cargo emits one
+# header per runner, in execution order — and there are THREE header
+# shapes, not one:
+#   "Running unittests src/lib.rs (...)"  -> the lib unit-test binary
+#   "Running tests/foo.rs (...)"          -> integration binary "foo"
+#   "Doc-tests geometry_engine"           -> the doctest runner
+# The original regex matched only the tests/ shape, so the lib and
+# doctest runners produced stdout blocks with NO name entry — and every
+# block after them paired with the WRONG binary by index. Observed
+# 2026-07-28: a lib failure reported under `adversarial_predicate_census`
+# and a `gap_finder_fuzz` failure reported under
+# `knot_validator_complexity_55`, costing a mis-directed diagnosis. The
+# `__lib__` skip below existed but nothing ever inserted the sentinel.
 $orderedBinaries = [System.Collections.Generic.List[string]]::new()
 foreach ($line in $stderrLines) {
-    if ($line -match "Running tests[/\\]([^./\\]+)\.rs\b") {
+    if ($line -match "Running unittests\s") {
+        $orderedBinaries.Add("__lib__") | Out-Null
+    } elseif ($line -match "Running tests[/\\]([^./\\]+)\.rs\b") {
         $orderedBinaries.Add($Matches[1]) | Out-Null
+    } elseif ($line -match "^\s*Doc-tests\s") {
+        $orderedBinaries.Add("__doctest__") | Out-Null
     }
 }
 
@@ -188,10 +206,27 @@ if ($currentBlock.Count -gt 0) { $blocks.Add($currentBlock.ToArray()) }
 
 $observedFails = @{}   # key = "binary::test", value = $true
 
-# Parse each stdout block paired with its binary name.
+# HONEST-REFUSAL GUARD: block↔binary pairing is positional, so a count
+# mismatch means attribution would be a guess. The gate must never judge
+# on guessed attribution (it mislabels which test broke and sends the
+# diagnosis to the wrong binary) — refuse loudly instead. Exit 4.
+if ($blocks.Count -ne $orderedBinaries.Count) {
+    Write-Host ""
+    Write-Host ("PARSER_MISMATCH -- {0} stdout test block(s) vs {1} runner header(s); " -f $blocks.Count, $orderedBinaries.Count) -ForegroundColor Red
+    Write-Host "cannot attribute failures to binaries reliably. A runner may have" -ForegroundColor Red
+    Write-Host "crashed before printing, or cargo's output shape changed." -ForegroundColor Red
+    Write-Host "Inspect the capture files above and re-run." -ForegroundColor Red
+    exit 4
+}
+
+# Parse each stdout block paired with its binary name. Lib unit tests and
+# doctests are OUT OF SCOPE for this gate by design (they are exercised by
+# the ordinary `cargo test --lib` developer/CI flow); recognizing their
+# blocks here exists to keep the positional pairing aligned, not to judge
+# them.
 for ($bi = 0; $bi -lt $blocks.Count; $bi++) {
-    $binary = if ($bi -lt $orderedBinaries.Count) { $orderedBinaries[$bi] } else { "__unknown__" }
-    if ($binary -eq "__lib__") { continue }
+    $binary = $orderedBinaries[$bi]
+    if ($binary -eq "__lib__" -or $binary -eq "__doctest__") { continue }
 
     $inFailuresList = $false
 
