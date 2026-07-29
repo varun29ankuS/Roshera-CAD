@@ -35,6 +35,12 @@ pub mod bspline;
 pub mod continuity_analysis;
 pub mod nurbs;
 pub mod surface_intersection;
+// Manual Oslo-insertion diagnostic (println-based, no assertions). Kept OUT
+// of the release surface: only test builds and the opt-in `dev-diagnostics`
+// feature (which the `test_oslo` bin target requires) compile it. It was
+// previously unconditional — a debug stub in the public API, violating the
+// no-stubs-in-production rule.
+#[cfg(any(test, feature = "dev-diagnostics"))]
 pub mod test_oslo;
 pub mod trimmed_nurbs;
 
