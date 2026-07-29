@@ -17,28 +17,39 @@
 //! now — one that always passes, or always refuses — would itself be the
 //! "kernel can lie" defect this subsystem is meant to remove.
 //!
-//! ## Slice S2 (this addition): the first analyzer
+//! ## Slice S2: the first analyzer
 //!
 //! `analyzers::face_orientation_field` — per-face angle range vs a
 //! reference direction, exact-or-refuse over the face's TRIMMED parameter
-//! domain (spec §3.1). Rule packs and `analyze()` are separate,
-//! independently-tracked work; this slice ships the analyzer only.
+//! domain (spec §3.1).
+//!
+//! ## Slice S2 (rule packs, this addition)
+//!
+//! `packs::fdm::evaluate_overhang` (`fdm.overhang`) and
+//! `packs::molding::evaluate_draft` (`mold.draft`) — the first two rules,
+//! both riding `face_orientation_field` against a different reference
+//! direction with a different threshold and violation sense, proving the
+//! "one analyzer, many rules/packs" architecture (spec §3.2). `analyze()`
+//! proper (a generic engine over every pack) is separate, independently-
+//! tracked work; see `packs/mod.rs` module docs for why.
 //!
 //! Planned layout (spec §3), populated incrementally:
 //! ```text
 //! dfm/
 //!   mod.rs        — public surface: analyze(...) -> DfmReport      (later)
 //!   analyzers/    — face_orientation_field (S2); 4 more analyzers  (later)
-//!   packs/        — rule-pack definitions (fdm.rs, molding.rs, ...) (later)
+//!   packs/        — fdm.rs, molding.rs (S2, here); cnc.rs, sheet.rs (later)
 //!   report.rs     — DfmReport, RuleVerdict, DfmValue, DfmSummary,
-//!                   DfmFact                                         (S1, here)
+//!                   DfmFact                                         (S1)
 //! ```
 
 pub mod analyzers;
+pub mod packs;
 pub mod provenance;
 pub mod report;
 
 pub use analyzers::{face_orientation_field, OrientationOutcome};
+pub use packs::{Rule, RulePack};
 pub use provenance::{RuleProvenance, StandardBody};
 pub use report::{
     Derivation, DfmError, DfmFact, DfmReport, DfmSummary, DfmValue, FaceRef, PackParams,
