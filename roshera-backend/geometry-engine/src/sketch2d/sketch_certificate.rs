@@ -51,7 +51,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 
 use super::constraints::{Constraint, ConstraintId, ConstraintType, EntityRef};
-use super::sketch_solver::DofStatus;
+use super::sketch_solver::{ComponentDof, DofStatus};
 use super::sketch_topology::{ProfileType, SketchTopology};
 use super::sketch_validation::{SketchValidator, ValidationIssue};
 use super::Sketch;
@@ -299,14 +299,26 @@ pub struct ContinuityFact {
 }
 
 /// Structural DOF tallies backing the constrainedness verdict.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DofSnapshot {
-    /// Total free DOFs across all entities.
+    /// Total free DOFs across all entities (global sum across every
+    /// component — see `components` and `status`'s own docs, slice
+    /// H4: no longer what directly determines `status`).
     pub total_free_dofs: usize,
-    /// Sum of DOFs removed by analysable constraints.
+    /// Sum of DOFs removed by analysable constraints (global sum,
+    /// same caveat as `total_free_dofs`).
     pub constraint_dofs_removed: usize,
-    /// Structural verdict over those tallies.
+    /// Structural verdict — a PRECEDENCE FOLD over `components`
+    /// (SKETCH-DCM #45 slice H4), copied straight from
+    /// [`super::sketch_solver::analyze_dofs`]'s own fold. See
+    /// [`DofStatus`] and `components` for the full rationale.
     pub status: DofStatus,
+    /// Per-component DOF accounting, copied verbatim from
+    /// [`super::sketch_solver::DofReport::components`] — same fold,
+    /// same source, no independent re-derivation. Additive
+    /// (`#[serde(default)]`) — empty on pre-H4 payloads.
+    #[serde(default)]
+    pub components: Vec<ComponentDof>,
 }
 
 /// How the solver's decomposition layers saw the sketch
@@ -611,6 +623,7 @@ pub fn certify_sketch(sketch: &Sketch) -> SketchValidityCertificate {
             total_free_dofs: dof.total_free_dofs,
             constraint_dofs_removed: dof.constraint_dofs_removed,
             status: dof.status,
+            components: dof.components,
         },
         decomposition: system.decomposition,
         constraint_facts: system.constraint_facts,

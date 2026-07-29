@@ -1448,18 +1448,72 @@ impl ConstraintSolver {
         super::decompose::connected_components(&nodes, &shared_ref_edges, &constraint_entities)
     }
 
-    /// Check if system is properly constrained
+    /// Check if system is properly constrained — folded PER COMPONENT
+    /// (SKETCH-DCM #45 slice H4).
+    ///
+    /// Pre-H4 this compared the two GLOBAL tallies
+    /// (`count_degrees_of_freedom` / `count_constraint_dof`) directly.
+    /// That comparison can cancel: a component +1 over-constrained and
+    /// a disjoint component -1 under-constrained sum to a balanced
+    /// global count, so this returned `None` — which lets `solve()`
+    /// fall through to Newton's `Converged`/`NotConverged` outcome
+    /// even though a component is genuinely, structurally broken. The
+    /// fold instead asks each connected component of the constraint
+    /// graph (`split_components`) for its own uncancelled verdict:
+    /// any component over-constrained wins (excess summed over just
+    /// the over components — a conflict is a soundness problem); else
+    /// any component under-constrained (deficit summed over just the
+    /// under components — slack is an incompleteness problem); else
+    /// `None`, unchanged from before, so a perfectly balanced system
+    /// still lets Newton's own outcome show through.
+    ///
+    /// Called BEFORE `solve()` sorts `self.constraints` by priority
+    /// (see `solve`'s call site) and does not mutate `self` — this is
+    /// a second, independent `split_components()` call, not a reuse of
+    /// one computed elsewhere, so it is unaffected by that ordering
+    /// either way. The split itself is O(entities + constraints)
+    /// union-find, negligible next to the Newton iterations it gates.
     fn check_constraint_count(&self) -> Option<SolverStatus> {
-        let total_dof = self.count_degrees_of_freedom();
-        let constraints_dof = self.count_constraint_dof();
+        use std::cmp::Ordering;
 
-        if constraints_dof > total_dof {
+        let components = self.split_components();
+        let mut any_over = false;
+        let mut any_under = false;
+        let mut over_excess: usize = 0;
+        let mut under_deficit: usize = 0;
+        for component in &components {
+            let total_dof: usize = component
+                .entities
+                .iter()
+                .filter_map(|e| self.entity_state.get(e))
+                .map(|state| state.free_param_count())
+                .sum();
+            let constraints_dof: usize = component
+                .constraint_indices
+                .iter()
+                .filter_map(|&i| self.constraints.get(i))
+                .map(|c| c.degrees_of_freedom_removed())
+                .sum();
+            match constraints_dof.cmp(&total_dof) {
+                Ordering::Greater => {
+                    any_over = true;
+                    over_excess += constraints_dof - total_dof;
+                }
+                Ordering::Less => {
+                    any_under = true;
+                    under_deficit += total_dof - constraints_dof;
+                }
+                Ordering::Equal => {}
+            }
+        }
+
+        if any_over {
             Some(SolverStatus::OverConstrained {
-                conflicting_constraints: constraints_dof - total_dof,
+                conflicting_constraints: over_excess,
             })
-        } else if constraints_dof < total_dof {
+        } else if any_under {
             Some(SolverStatus::UnderConstrained {
-                degrees_of_freedom: total_dof - constraints_dof,
+                degrees_of_freedom: under_deficit,
             })
         } else {
             None

@@ -378,6 +378,38 @@ pub enum DofStatus {
     OverConstrained { conflicting_constraints: usize },
 }
 
+/// Per-component DOF accounting (SKETCH-DCM #45 slice H4).
+///
+/// One entry per connected component of the constraint graph — the
+/// same partition [`decompose::connected_components`](super::decompose::connected_components)
+/// produces from the entity set and the shared-ref / constraint edges
+/// [`ConstraintSolver::split_components`](super::constraint_solver::ConstraintSolver)
+/// uses internally. `component` is the 0-based index of the entry,
+/// ascending by the component's smallest entity — the same
+/// deterministic ordering `ConstraintSolver::component_probes` uses
+/// for `EntityStatus::component`, so the two can be cross-referenced
+/// by index for the overwhelming majority of sketches (the one
+/// documented divergence is a legacy line whose `endpoints` is `Some`
+/// but whose geometry is not `LineGeometry::Segment` — an existing,
+/// pre-H4 edge case in the derived-segment classifier, out of scope
+/// here).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComponentDof {
+    /// 0-based index of this component, ascending by smallest entity.
+    pub component: usize,
+    /// Number of entities in this component.
+    pub entities: usize,
+    /// Number of (supported) constraints assigned to this component.
+    pub constraints: usize,
+    /// This component's OWN, uncancelled DOF verdict — computed the
+    /// same way the whole-sketch verdict used to be (before slice
+    /// H4), just scoped to this component's entities/constraints
+    /// alone. Two components can never coincidentally cancel each
+    /// other's imbalance here — that is exactly the defect this slice
+    /// fixes.
+    pub status: DofStatus,
+}
+
 /// Output of [`analyze_dofs`].
 ///
 /// Carries the raw DOF tallies for diagnostics on top of the
@@ -404,6 +436,9 @@ pub struct DofReport {
     /// structural metadata, so only CP coordinates are free DOFs.
     /// Entities listed in `entities_skipped` contribute 0 — slice
     /// C-5 lifts this for polylines.
+    ///
+    /// GLOBAL tally (sum across every component). Does NOT by itself
+    /// determine `status` as of slice H4 — see `status`'s own doc.
     pub total_free_dofs: usize,
     /// Sum of `degrees_of_freedom_removed()` across constraints
     /// whose entire entity set is supported by the current bridge
@@ -412,9 +447,40 @@ pub struct DofReport {
     /// counting them while excluding the unsupported entity's own
     /// free DOFs would produce a phantom over-constrained verdict.
     /// See `constraints_skipped` for the count of such constraints.
+    ///
+    /// GLOBAL tally (sum across every component). Does NOT by itself
+    /// determine `status` as of slice H4 — see `status`'s own doc.
     pub constraint_dofs_removed: usize,
     /// Derived verdict over the supported subset.
+    ///
+    /// SKETCH-DCM #45 slice H4: this is a PRECEDENCE FOLD over
+    /// `components`, not a comparison of the two GLOBAL tallies above.
+    /// A naive `constraint_dofs_removed.cmp(&total_free_dofs)` can
+    /// cancel — one component +1 over-constrained and a disjoint
+    /// component -1 under-constrained sum to a balanced global count,
+    /// which used to report `FullyConstrained` while an entity still
+    /// slides freely. The fold instead asks each component for its
+    /// OWN uncancelled verdict and never reports `FullyConstrained`
+    /// unless every component is: any component over-constrained wins
+    /// (`OverConstrained { conflicting_constraints }` sums only the
+    /// over-constrained components' excess — a conflict is a
+    /// soundness problem); else any component under-constrained
+    /// reports `UnderConstrained { dofs }` (sum of the under
+    /// components' deficits — slack is an incompleteness problem, but
+    /// still real freedom the fold must not hide); else
+    /// `FullyConstrained`. See `components` for the per-component
+    /// breakdown this is folded from.
     pub status: DofStatus,
+    /// Per-component DOF accounting (slice H4). Additive — empty on
+    /// pre-H4 payloads (there is no pre-H4 payload in this codebase;
+    /// the empty case is the honest answer for a sketch with zero
+    /// entities). The scalar `status` above is a PRECEDENCE FOLD of
+    /// these entries: when components disagree (one over, one under)
+    /// the scalar reports the over-constraint and THIS field carries
+    /// the complete picture. A consumer that needs the whole truth
+    /// reads this, not the scalar.
+    #[serde(default)]
+    pub components: Vec<ComponentDof>,
     /// Count of entities the analysis registered (points + lines +
     /// circles + arcs, fixed or free).
     pub entities_analysed: usize,
@@ -627,16 +693,45 @@ pub fn solve_drag_with_options(
 /// additions in real time. Does not mutate the sketch.
 pub fn analyze_dofs(sketch: &Sketch) -> DofReport {
     use std::cmp::Ordering;
+    use std::collections::HashMap;
 
     let mut total_free_dofs: usize = 0;
     let mut entities_analysed: usize = 0;
 
+    // SKETCH-DCM #45 slice H4: alongside the per-kind DOF tally below,
+    // build the connected-component graph directly — every analysed
+    // entity is a node, `free_dofs_by_entity` remembers its own
+    // per-kind count, and `shared_ref_edges` carries the SAME
+    // shared-variable pairs `ConstraintSolver::split_components` uses
+    // (derived segment/arc endpoints, shared circle/arc centers,
+    // shared spline control points), read from the SAME classifiers
+    // (`circle_shared_center`, `arc_solver_mode`,
+    // `spline_shared_control_points`) this function already calls.
+    //
+    // This function is deliberately NOT routed through
+    // `ConstraintSolver::component_probes()` (which is available,
+    // `pub(crate)`, and already used by `sketch_certificate.rs`):
+    // `component_probes` runs `dr_plan::plan_component` +
+    // `analyze_constrainment` — a Fudos-Hoffmann discovery loop — per
+    // component, which would break this function's own documented
+    // contract ("computed in O(entities + constraints) so the UI can
+    // react to constraint additions in real time", backing
+    // `GET /api/csketch/{id}/dof`). `decompose::connected_components`
+    // is the pure O(entities + constraints) union-find that gives
+    // exactly the partition needed without paying for placement
+    // discovery this endpoint never asked for.
+    let mut nodes: Vec<EntityRef> = Vec::new();
+    let mut shared_ref_edges: Vec<(EntityRef, EntityRef)> = Vec::new();
+    let mut free_dofs_by_entity: HashMap<EntityRef, usize> = HashMap::new();
+
     // Points: 2 DOFs (x, y); 0 when fixed.
     for entry in sketch.points().iter() {
         entities_analysed += 1;
-        if !entry.value().is_fixed {
-            total_free_dofs += 2;
-        }
+        let id = EntityRef::Point(*entry.key());
+        nodes.push(id);
+        let dofs = if entry.value().is_fixed { 0 } else { 2 };
+        total_free_dofs += dofs;
+        free_dofs_by_entity.insert(id, dofs);
     }
     // Lines: 4 DOFs (px, py, dx, dy) for an INDEPENDENT line. A segment
     // derived from two endpoint points (the shared-variable model,
@@ -648,8 +743,18 @@ pub fn analyze_dofs(sketch: &Sketch) -> DofReport {
     // free, so this aligns the DOF count with what Newton-Raphson iterates.
     for entry in sketch.lines().iter() {
         entities_analysed += 1;
-        if entry.value().endpoints.is_none() {
-            total_free_dofs += 4;
+        let id = EntityRef::Line(*entry.key());
+        nodes.push(id);
+        let dofs = if entry.value().endpoints.is_none() {
+            4
+        } else {
+            0
+        };
+        total_free_dofs += dofs;
+        free_dofs_by_entity.insert(id, dofs);
+        if let Some((start, end)) = entry.value().endpoints {
+            shared_ref_edges.push((id, EntityRef::Point(start)));
+            shared_ref_edges.push((id, EntityRef::Point(end)));
         }
     }
     // Circles: 3 DOFs (cx, cy, r) for an INDEPENDENT circle. A circle
@@ -661,11 +766,16 @@ pub fn analyze_dofs(sketch: &Sketch) -> DofReport {
     // count matches the solver's parameter vector exactly.
     for entry in sketch.circles().iter() {
         entities_analysed += 1;
-        total_free_dofs += if circle_shared_center(sketch, entry.value()).is_some() {
+        let id = EntityRef::Circle(*entry.key());
+        nodes.push(id);
+        let dofs = if let Some(center) = circle_shared_center(sketch, entry.value()) {
+            shared_ref_edges.push((id, EntityRef::Point(center)));
             1
         } else {
             3
         };
+        total_free_dofs += dofs;
+        free_dofs_by_entity.insert(id, dofs);
     }
     // Arcs: 5 DOFs (cx, cy, r, start_angle, end_angle) for an
     // INDEPENDENT arc. Shared-variable arcs (SKETCH-DCM #45 Slice 1)
@@ -684,20 +794,34 @@ pub fn analyze_dofs(sketch: &Sketch) -> DofReport {
     // solver DOF — orientation is a discrete bit.
     for entry in sketch.arcs().iter() {
         entities_analysed += 1;
-        total_free_dofs += match arc_solver_mode(sketch, entry.value()) {
-            ArcSolverMode::SharedEndpoints { .. } => 1,
-            ArcSolverMode::SharedCenter { .. } => 3,
+        let id = EntityRef::Arc(*entry.key());
+        nodes.push(id);
+        let dofs = match arc_solver_mode(sketch, entry.value()) {
+            ArcSolverMode::SharedEndpoints { start, end, .. } => {
+                shared_ref_edges.push((id, EntityRef::Point(start)));
+                shared_ref_edges.push((id, EntityRef::Point(end)));
+                1
+            }
+            ArcSolverMode::SharedCenter { center } => {
+                shared_ref_edges.push((id, EntityRef::Point(center)));
+                3
+            }
             ArcSolverMode::Legacy => 5,
         };
+        total_free_dofs += dofs;
+        free_dofs_by_entity.insert(id, dofs);
     }
     // Rectangles: 5 DOFs (cx, cy, width, height, rotation). Matches
     // the solver-side `EntityState::rectangle` parameter layout
     // introduced in slice C-2. `ParametricRectangle2d` carries no
     // per-DOF fix flag today; the four corners are derived from
     // (center, width, height, rotation) on every read.
-    for _entry in sketch.rectangles().iter() {
+    for entry in sketch.rectangles().iter() {
         entities_analysed += 1;
+        let id = EntityRef::Rectangle(*entry.key());
+        nodes.push(id);
         total_free_dofs += 5;
+        free_dofs_by_entity.insert(id, 5);
     }
     // Ellipses: 5 DOFs (cx, cy, semi_major, semi_minor, rotation).
     // Matches the solver-side `EntityState::ellipse` parameter
@@ -709,9 +833,12 @@ pub fn analyze_dofs(sketch: &Sketch) -> DofReport {
     // alternative — branching on a near-zero rotation — would
     // produce a flicker in the DOF badge as the rotation drifts
     // across the tolerance boundary during solving.
-    for _entry in sketch.ellipses().iter() {
+    for entry in sketch.ellipses().iter() {
         entities_analysed += 1;
+        let id = EntityRef::Ellipse(*entry.key());
+        nodes.push(id);
         total_free_dofs += 5;
+        free_dofs_by_entity.insert(id, 5);
     }
     // Splines (B-Spline and NURBS): 2 DOFs per control point for a
     // LEGACY (parameter-carrying) spline. A shared-CP spline
@@ -727,14 +854,22 @@ pub fn analyze_dofs(sketch: &Sketch) -> DofReport {
     // weights are pinned in `SplineMetadata` either way.
     for entry in sketch.splines().iter() {
         entities_analysed += 1;
-        if spline_shared_control_points(sketch, entry.value()).is_some() {
+        let id = EntityRef::Spline(*entry.key());
+        nodes.push(id);
+        if let Some(cps) = spline_shared_control_points(sketch, entry.value()) {
+            for cp in cps {
+                shared_ref_edges.push((id, EntityRef::Point(cp)));
+            }
+            free_dofs_by_entity.insert(id, 0);
             continue;
         }
         let cp_count = match &entry.value().spline {
             Spline2d::BSpline(bs) => bs.control_points.len(),
             Spline2d::Nurbs(nurbs) => nurbs.control_points.len(),
         };
-        total_free_dofs += 2 * cp_count;
+        let dofs = 2 * cp_count;
+        total_free_dofs += dofs;
+        free_dofs_by_entity.insert(id, dofs);
     }
     // Polylines: 2 DOFs per vertex.
     // Mirrors the solver-side `EntityState::polyline` parameter pack
@@ -744,7 +879,11 @@ pub fn analyze_dofs(sketch: &Sketch) -> DofReport {
     // `ParametricPolyline2d::degrees_of_freedom`.
     for entry in sketch.polylines().iter() {
         entities_analysed += 1;
-        total_free_dofs += 2 * entry.value().polyline.vertices.len();
+        let id = EntityRef::Polyline(*entry.key());
+        nodes.push(id);
+        let dofs = 2 * entry.value().polyline.vertices.len();
+        total_free_dofs += dofs;
+        free_dofs_by_entity.insert(id, dofs);
     }
 
     let entities_skipped = collect_unsupported(sketch);
@@ -752,10 +891,12 @@ pub fn analyze_dofs(sketch: &Sketch) -> DofReport {
     let skipped_set: std::collections::HashSet<EntityRef> =
         entities_skipped.iter().copied().collect();
 
+    let all_constraints = sketch.all_constraints();
     let mut constraint_dofs_removed: usize = 0;
     let mut constraints_analysed: usize = 0;
     let mut constraints_skipped: usize = 0;
-    for c in sketch.all_constraints().iter() {
+    let mut supported_constraints: Vec<&super::constraints::Constraint> = Vec::new();
+    for c in &all_constraints {
         if c.entities.iter().any(|e| skipped_set.contains(e)) {
             // Constraint references at least one kind we can't yet
             // analyse — excluding it keeps the DOF arithmetic
@@ -766,25 +907,105 @@ pub fn analyze_dofs(sketch: &Sketch) -> DofReport {
         }
         constraint_dofs_removed += c.degrees_of_freedom_removed();
         constraints_analysed += 1;
+        supported_constraints.push(c);
     }
 
-    let status = match constraint_dofs_removed.cmp(&total_free_dofs) {
-        Ordering::Equal => DofStatus::FullyConstrained,
-        Ordering::Less => DofStatus::UnderConstrained {
-            dofs: total_free_dofs - constraint_dofs_removed,
-        },
-        Ordering::Greater => DofStatus::OverConstrained {
-            conflicting_constraints: constraint_dofs_removed - total_free_dofs,
-        },
+    // SKETCH-DCM #45 slice H4: split into connected components and
+    // fold PER COMPONENT — see `DofReport::status`'s doc for the full
+    // rationale. `total_free_dofs` / `constraint_dofs_removed` above
+    // are GLOBAL sums (kept for diagnostics/back-compat); they
+    // partition exactly onto the components below (every node and
+    // every supported constraint lands in exactly one component), so
+    // summing the per-component tallies reproduces them — but `status`
+    // is no longer derived by comparing those two globals directly.
+    let constraint_entities: Vec<&[EntityRef]> = supported_constraints
+        .iter()
+        .map(|c| c.entities.as_slice())
+        .collect();
+    let graph_components =
+        super::decompose::connected_components(&nodes, &shared_ref_edges, &constraint_entities);
+
+    let mut components: Vec<ComponentDof> = Vec::with_capacity(graph_components.len());
+    let mut any_over = false;
+    let mut any_under = false;
+    let mut over_excess: usize = 0;
+    let mut under_deficit: usize = 0;
+    for (index, component) in graph_components.iter().enumerate() {
+        let comp_free_dofs: usize = component
+            .entities
+            .iter()
+            .map(|e| free_dofs_by_entity.get(e).copied().unwrap_or(0))
+            .sum();
+        let comp_dofs_removed: usize = component
+            .constraint_indices
+            .iter()
+            .filter_map(|&i| supported_constraints.get(i))
+            .map(|c| c.degrees_of_freedom_removed())
+            .sum();
+        let comp_status = match comp_dofs_removed.cmp(&comp_free_dofs) {
+            Ordering::Equal => DofStatus::FullyConstrained,
+            Ordering::Less => DofStatus::UnderConstrained {
+                dofs: comp_free_dofs - comp_dofs_removed,
+            },
+            Ordering::Greater => DofStatus::OverConstrained {
+                conflicting_constraints: comp_dofs_removed - comp_free_dofs,
+            },
+        };
+        match comp_status {
+            DofStatus::OverConstrained {
+                conflicting_constraints,
+            } => {
+                any_over = true;
+                over_excess += conflicting_constraints;
+            }
+            DofStatus::UnderConstrained { dofs } => {
+                any_under = true;
+                under_deficit += dofs;
+            }
+            DofStatus::FullyConstrained => {}
+        }
+        components.push(ComponentDof {
+            component: index,
+            entities: component.entities.len(),
+            constraints: component.constraint_indices.len(),
+            status: comp_status,
+        });
+    }
+
+    // Precedence fold (spec: over ranks under — a conflict is a
+    // soundness problem, slack is an incompleteness problem). Can
+    // NEVER report `FullyConstrained` while any component is broken —
+    // that is the property that kills the cancellation lie.
+    let status = if any_over {
+        DofStatus::OverConstrained {
+            conflicting_constraints: over_excess,
+        }
+    } else if any_under {
+        DofStatus::UnderConstrained {
+            dofs: under_deficit,
+        }
+    } else {
+        DofStatus::FullyConstrained
     };
 
-    // Numerical diagnostic pass: when the structural count says the
-    // sketch is anything other than `FullyConstrained`, classify each
+    // Numerical diagnostic pass: when a component's OWN verdict says
+    // it is anything other than `FullyConstrained`, classify each
     // constraint as essential / redundant / conflicting using the
-    // Jacobian's rank profile. The pass is skipped for fully
-    // constrained sketches because by construction `constraint_dofs
-    // _removed == total_free_dofs` precludes both redundancy and
-    // conflict.
+    // Jacobian's rank profile. The pass is skipped only when EVERY
+    // component is `FullyConstrained` — SKETCH-DCM #45 slice H4.
+    //
+    // Pre-H4 this checked the GLOBAL `status` alone, reasoning that a
+    // balanced global count "precludes both redundancy and conflict".
+    // That reasoning is FALSE across components: two disjoint
+    // components — one +1 over-constrained, one -1 under-constrained —
+    // sum to a balanced global count while the over-constrained one
+    // still has a real conflict to diagnose. Checking every
+    // component's own verdict is what closes that gap; the fold above
+    // already prevents `status` itself from hiding it, but the
+    // diagnostic skip must not regress to checking the folded scalar
+    // alone (which today, post-fold, happens to imply the same
+    // condition — but the per-component check is the one that stays
+    // correct if that implication ever stops holding).
     //
     // The diagnostic builds an isolated `ConstraintSolver` populated
     // from the sketch's *current* entity state (which may or may not
@@ -804,18 +1025,23 @@ pub fn analyze_dofs(sketch: &Sketch) -> DofReport {
     // so the verdict never hides behind a balanced DOF count. This
     // subsumes the previous `is_numerically_enforced` check (every
     // refuse kind removes zero DOF).
-    let has_invisible = sketch.all_constraints().iter().any(|c| {
+    let has_invisible = all_constraints.iter().any(|c| {
         c.degrees_of_freedom_removed() == 0 && !c.entities.iter().any(|e| skipped_set.contains(e))
     });
-    let (redundant, conflicts) = match status {
-        DofStatus::FullyConstrained if !has_invisible => (Vec::new(), Vec::new()),
-        _ => diagnose_constraints(sketch, &skipped_set),
+    let all_components_fully_constrained = components
+        .iter()
+        .all(|c| matches!(c.status, DofStatus::FullyConstrained));
+    let (redundant, conflicts) = if all_components_fully_constrained && !has_invisible {
+        (Vec::new(), Vec::new())
+    } else {
+        diagnose_constraints(sketch, &skipped_set)
     };
 
     DofReport {
         total_free_dofs,
         constraint_dofs_removed,
         status,
+        components,
         entities_analysed,
         constraints_analysed,
         constraints_skipped,
@@ -2948,6 +3174,255 @@ mod tests {
         assert!(report.is_under_constrained());
         assert!(report.redundant.is_empty());
         assert!(report.conflicts.is_empty());
+    }
+
+    // ── H4: per-component DOF fold ──────────────────────────────────
+    //
+    // Fixture shared by the headline RED and the mixed-visibility
+    // test: two DISCONNECTED components (no shared entity, no
+    // constraint spans both).
+    //
+    //   Component A: points a, b + Distance(5.0) + X(a)=1 + Y(a)=2 +
+    //   X(b)=6 + Y(b)=2. Free DOFs = 4 (two points). Removed = 5
+    //   (Distance + 4 coordinate pins). Over-constrained by 1 — and
+    //   CONSISTENT (a=(1,2), b=(6,2) really is 5.0 apart), so the
+    //   surplus constraint is redundant, not a numeric conflict; the
+    //   structural fold reports it regardless.
+    //
+    //   Component B: lone point c with only Y(c)=0. Free DOFs = 2,
+    //   removed = 1. Under-constrained by 1.
+    //
+    // Global (pre-H4) tallies: free 4+2=6, removed 5+1=6 → cancel to
+    // `Equal` → the lie (`FullyConstrained`) the whole slice exists to
+    // kill.
+    fn two_component_cancellation_fixture() -> Sketch {
+        let sketch = fresh_sketch();
+        let a = sketch.add_point(Point2d::new(1.0, 2.0));
+        let b = sketch.add_point(Point2d::new(6.0, 2.0));
+        sketch.add_constraint(Constraint::new_dimensional(
+            DimensionalConstraint::Distance(5.0),
+            vec![EntityRef::Point(a), EntityRef::Point(b)],
+            ConstraintPriority::Required,
+        ));
+        sketch.add_constraint(Constraint::new_dimensional(
+            DimensionalConstraint::XCoordinate(1.0),
+            vec![EntityRef::Point(a)],
+            ConstraintPriority::Required,
+        ));
+        sketch.add_constraint(Constraint::new_dimensional(
+            DimensionalConstraint::YCoordinate(2.0),
+            vec![EntityRef::Point(a)],
+            ConstraintPriority::Required,
+        ));
+        sketch.add_constraint(Constraint::new_dimensional(
+            DimensionalConstraint::XCoordinate(6.0),
+            vec![EntityRef::Point(b)],
+            ConstraintPriority::Required,
+        ));
+        sketch.add_constraint(Constraint::new_dimensional(
+            DimensionalConstraint::YCoordinate(2.0),
+            vec![EntityRef::Point(b)],
+            ConstraintPriority::Required,
+        ));
+
+        let c = sketch.add_point(Point2d::new(3.0, 0.0));
+        sketch.add_constraint(Constraint::new_dimensional(
+            DimensionalConstraint::YCoordinate(0.0),
+            vec![EntityRef::Point(c)],
+            ConstraintPriority::Required,
+        ));
+        sketch
+    }
+
+    #[test]
+    fn analyze_dofs_headline_cancellation_is_not_hidden_as_fully_constrained() {
+        // THE RED this slice exists to fix: pre-H4, the two
+        // components' opposite imbalances cancel in the global sum
+        // (6 free == 6 removed) and `analyze_dofs` reports
+        // `FullyConstrained` — the lie — even though component A has
+        // a real (if redundant) surplus and component B still has a
+        // free point. Post-fix the per-component fold must report
+        // `OverConstrained{1}` (over outranks under) and must NEVER
+        // report `FullyConstrained` here.
+        let sketch = two_component_cancellation_fixture();
+        let report = analyze_dofs(&sketch);
+        assert!(
+            !report.is_fully_constrained(),
+            "cancellation must never present as FullyConstrained, got {:?}",
+            report.status
+        );
+        assert_eq!(
+            report.status,
+            DofStatus::OverConstrained {
+                conflicting_constraints: 1
+            },
+            "over-constrained component must outrank the under-constrained one, got {:?}",
+            report.status
+        );
+    }
+
+    #[test]
+    fn analyze_dofs_mixed_visibility_shows_both_components_in_the_additive_field() {
+        // The scalar folds away which component is under; `components`
+        // must not — it is the field a consumer reads for the whole
+        // truth.
+        let sketch = two_component_cancellation_fixture();
+        let report = analyze_dofs(&sketch);
+        assert_eq!(
+            report.components.len(),
+            2,
+            "expected 2 disconnected components, got {:?}",
+            report.components
+        );
+        let over_count = report
+            .components
+            .iter()
+            .filter(|c| matches!(c.status, DofStatus::OverConstrained { .. }))
+            .count();
+        let under_count = report
+            .components
+            .iter()
+            .filter(|c| matches!(c.status, DofStatus::UnderConstrained { .. }))
+            .count();
+        assert_eq!(
+            over_count, 1,
+            "exactly one component must report over-constrained, got {:?}",
+            report.components
+        );
+        assert_eq!(
+            under_count, 1,
+            "exactly one component must report under-constrained, got {:?}",
+            report.components
+        );
+        let over_component = report
+            .components
+            .iter()
+            .find(|c| matches!(c.status, DofStatus::OverConstrained { .. }))
+            .expect("over component");
+        assert_eq!(over_component.entities, 2, "component A has 2 points");
+        assert_eq!(
+            over_component.status,
+            DofStatus::OverConstrained {
+                conflicting_constraints: 1
+            }
+        );
+        let under_component = report
+            .components
+            .iter()
+            .find(|c| matches!(c.status, DofStatus::UnderConstrained { .. }))
+            .expect("under component");
+        assert_eq!(under_component.entities, 1, "component B has 1 point");
+        assert_eq!(
+            under_component.status,
+            DofStatus::UnderConstrained { dofs: 1 }
+        );
+    }
+
+    #[test]
+    fn analyze_dofs_fold_canary_all_components_fully_constrained() {
+        // Mutation-proof canary: no component is broken → the fold
+        // must report `FullyConstrained` AND every entry in
+        // `components` must itself be `FullyConstrained`. Two
+        // disconnected, individually-balanced components (a pinned
+        // point + a fully dimensioned 2-point pair).
+        let sketch = fresh_sketch();
+        let p = sketch.add_point(Point2d::new(3.0, 4.0));
+        sketch.add_constraint(Constraint::new_dimensional(
+            DimensionalConstraint::XCoordinate(3.0),
+            vec![EntityRef::Point(p)],
+            ConstraintPriority::Required,
+        ));
+        sketch.add_constraint(Constraint::new_dimensional(
+            DimensionalConstraint::YCoordinate(4.0),
+            vec![EntityRef::Point(p)],
+            ConstraintPriority::Required,
+        ));
+
+        let a = sketch.add_point(Point2d::new(1.0, 2.0));
+        let b = sketch.add_point(Point2d::new(6.0, 2.0));
+        sketch.add_constraint(Constraint::new_dimensional(
+            DimensionalConstraint::Distance(5.0),
+            vec![EntityRef::Point(a), EntityRef::Point(b)],
+            ConstraintPriority::Required,
+        ));
+        sketch.add_constraint(Constraint::new_dimensional(
+            DimensionalConstraint::XCoordinate(1.0),
+            vec![EntityRef::Point(a)],
+            ConstraintPriority::Required,
+        ));
+        sketch.add_constraint(Constraint::new_dimensional(
+            DimensionalConstraint::YCoordinate(2.0),
+            vec![EntityRef::Point(a)],
+            ConstraintPriority::Required,
+        ));
+        sketch.add_constraint(Constraint::new_dimensional(
+            DimensionalConstraint::XCoordinate(6.0),
+            vec![EntityRef::Point(b)],
+            ConstraintPriority::Required,
+        ));
+
+        let report = analyze_dofs(&sketch);
+        assert!(report.is_fully_constrained(), "got {:?}", report.status);
+        assert_eq!(report.components.len(), 2, "got {:?}", report.components);
+        for c in &report.components {
+            assert_eq!(
+                c.status,
+                DofStatus::FullyConstrained,
+                "every component must itself be fully constrained, got {:?}",
+                report.components
+            );
+        }
+    }
+
+    #[test]
+    fn analyze_dofs_fold_canary_two_under_constrained_components_sum() {
+        // Mutation-proof canary: two components under-constrained by
+        // 2 and 3 respectively (no over-constrained component at
+        // all) must fold to `UnderConstrained{5}` — same-sign sums
+        // are not where the H4 defect lives (that requires opposite
+        // signs to cancel), but this pins the fold's arithmetic and
+        // is exactly the shape a "swap the precedence" mutation must
+        // NOT be able to flip (there is no over-constrained component
+        // for a swapped precedence to wrongly promote).
+        let sketch = fresh_sketch();
+        // Component A: 2 free points, 0 constraints → under by 4...
+        // trim to under-by-2 with one Distance constraint.
+        let a = sketch.add_point(Point2d::new(0.0, 0.0));
+        let b = sketch.add_point(Point2d::new(1.0, 0.0));
+        sketch.add_constraint(Constraint::new_dimensional(
+            DimensionalConstraint::Distance(1.0),
+            vec![EntityRef::Point(a), EntityRef::Point(b)],
+            ConstraintPriority::Required,
+        ));
+        sketch.add_constraint(Constraint::new_dimensional(
+            DimensionalConstraint::XCoordinate(0.0),
+            vec![EntityRef::Point(a)],
+            ConstraintPriority::Required,
+        ));
+        // Component A: free 4, removed 2 → under by 2.
+
+        // Component B: lone free point → under by 2; add one
+        // dimensional pin so it is under by exactly 1... instead use
+        // TWO disconnected lone points for a clean under-by-3
+        // (free 4, removed 1).
+        let c = sketch.add_point(Point2d::new(5.0, 5.0));
+        let d = sketch.add_point(Point2d::new(6.0, 6.0));
+        sketch.add_constraint(Constraint::new_dimensional(
+            DimensionalConstraint::Distance(2.0),
+            vec![EntityRef::Point(c), EntityRef::Point(d)],
+            ConstraintPriority::Required,
+        ));
+        // Component B: free 4, removed 1 → under by 3.
+
+        let report = analyze_dofs(&sketch);
+        assert!(!report.is_over_constrained(), "got {:?}", report.status);
+        assert_eq!(
+            report.status,
+            DofStatus::UnderConstrained { dofs: 5 },
+            "2 + 3 under-constrained components must sum, got {:?}",
+            report.status
+        );
+        assert_eq!(report.components.len(), 2, "got {:?}", report.components);
     }
 
     // ── B-2 hardening: dragging a fixed point is rejected ──────────
