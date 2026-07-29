@@ -115,21 +115,39 @@ impl TimelineIntegration {
     }
 
     /// Replay timeline for a session from a specific point
+    ///
+    /// `session_branches` is populated only by `process_command`/
+    /// `get_or_create_branch` on this same struct — a path production
+    /// traffic never takes (real command execution runs through
+    /// `CommandProcessor` straight to `Timeline::record_operation`, and the
+    /// api-server's checkpoint route talks to `Timeline` directly). A
+    /// session with no entry here simply never routed through *this*
+    /// subsystem: that is not a failure, it means there is nothing to
+    /// replay from this subsystem, so we return an empty replay list
+    /// rather than failing the caller's whole replay request. Any error
+    /// that occurs once a branch mapping IS found (bad branch, execution
+    /// failure) still propagates as `Err`, so a genuine failure remains
+    /// distinguishable from "nothing to do here".
     pub async fn replay_from(
         &self,
         session_id: SessionId,
         from_event: Option<EventId>,
     ) -> TimelineResult<Vec<EventId>> {
-        let branch_id = self
+        let branch_id = match self
             .session_branches
             .get(&session_id)
             .map(|entry| *entry.value())
-            .ok_or_else(|| {
-                TimelineError::ValidationError(format!(
-                    "No branch found for session {}",
+        {
+            Some(branch_id) => branch_id,
+            None => {
+                info!(
+                    "No TimelineIntegration branch mapping for session {} — \
+                     nothing to replay from this subsystem",
                     session_id.0
-                ))
-            })?;
+                );
+                return Ok(Vec::new());
+            }
+        };
 
         let timeline = self.timeline.read().await;
         let events = timeline.get_branch_events(&branch_id, None, None)?;
@@ -390,6 +408,45 @@ pub struct SessionTimelineStats {
     pub total_events: usize,
     pub branch_id: BranchId,
     pub checkpoints: usize,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::broadcast::BroadcastManager;
+    use crate::SessionManager;
+
+    /// RED (before fix): `POST /api/timeline/replay` 500s on every call
+    /// because `SessionManager::replay_session` always errs with "No
+    /// branch found for session ...". `TimelineIntegration::session_branches`
+    /// is populated only by `process_command`/`get_or_create_branch` — a
+    /// path production traffic never takes (real command execution goes
+    /// through `CommandProcessor` straight to `Timeline::record_operation`,
+    /// and the api-server's checkpoint route talks to `Timeline` directly
+    /// too). A session that was never routed through this particular
+    /// subsystem has nothing to replay *from this subsystem* — that is not
+    /// a failure condition, so `replay_session` must succeed with zero
+    /// events instead of failing the whole two-phase replay request before
+    /// the real (kernel-side) replay phase ever runs.
+    #[tokio::test]
+    async fn replay_session_without_recorded_branch_is_not_an_error() {
+        let manager = SessionManager::new(BroadcastManager::new());
+        let session_id = SessionId::new(uuid::Uuid::new_v4().to_string());
+
+        let result = manager.replay_session(session_id, None).await;
+
+        assert!(
+            result.is_ok(),
+            "replay_session must not error for a session with no \
+             TimelineIntegration branch mapping; got {:?}",
+            result.err()
+        );
+        assert!(
+            result.expect("checked is_ok above").is_empty(),
+            "no branch was ever recorded for this session, so nothing \
+             should have been replayed"
+        );
+    }
 }
 
 /// Extension trait for SessionManager to add timeline operations
