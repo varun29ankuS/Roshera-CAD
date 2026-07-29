@@ -1,15 +1,17 @@
 //! FDM (fused deposition modeling) rule pack v1 (spec §3.2).
 //!
-//! Ships TWO rules: [`evaluate_overhang`] (`fdm.overhang`, S2) and
-//! [`evaluate_min_wall`] (`fdm.min_wall`, S3 — this addition, riding
-//! [`pair_thickness`]). The remaining v1 rules (`fdm.min_bore`,
-//! `fdm.trapped_volume`, `fdm.support_volume`) need analyzers that do not
-//! exist yet (`bore_metrics`, `internal_voids` — spec S4/S5) and are out
-//! of scope here.
+//! Ships THREE rules: [`evaluate_overhang`] (`fdm.overhang`, S2),
+//! [`evaluate_min_wall`] (`fdm.min_wall`, S3, riding [`pair_thickness`]),
+//! and [`evaluate_min_bore`] (`fdm.min_bore`, S4 — this addition, riding
+//! [`bore_metrics`]). The remaining v1 rules (`fdm.trapped_volume`,
+//! `fdm.support_volume`) need `internal_voids` (spec S5) and are out of
+//! scope here.
 
 use std::collections::BTreeSet;
 
-use crate::dfm::analyzers::{face_orientation_field, pair_thickness, OrientationOutcome};
+use crate::dfm::analyzers::{
+    bore_metrics, face_orientation_field, pair_thickness, OrientationOutcome,
+};
 use crate::dfm::packs::{Rule, RulePack};
 use crate::dfm::provenance::RuleProvenance;
 use crate::dfm::report::{
@@ -21,7 +23,9 @@ use crate::primitives::curve::CurveStore;
 use crate::primitives::edge::EdgeStore;
 use crate::primitives::face::{FaceId, FaceStore};
 use crate::primitives::r#loop::LoopStore;
+use crate::primitives::solid::SolidId;
 use crate::primitives::surface::SurfaceStore;
+use crate::primitives::topology_builder::BRepModel;
 
 /// Stable rule id, matches [`crate::dfm::report::RuleVerdict::rule`] and
 /// eval-16/17's criterion name verbatim.
@@ -57,6 +61,22 @@ pub fn min_wall_provenance() -> RuleProvenance {
     }
 }
 
+/// Stable rule id for `fdm.min_bore` (spec §3.2 "printable hole floor").
+pub const MIN_BORE_RULE_ID: &str = "fdm.min_bore";
+
+/// Practice-derived provenance for `fdm.min_bore` (spec §3.2.1 "known
+/// landscape": same additive/DfAM lineage as `fdm.min_wall`/`fdm.overhang`
+/// — ISO/ASTM 52900 series covers design *guidelines*, not a specific
+/// bore-diameter-vs-nozzle-diameter multiplier; "2x nozzle diameter" is a
+/// widely-used slicer/shop convention, not a cited clause of any edition.
+/// Per the module's non-negotiable discipline, this stays `ShopPractice`.
+pub fn min_bore_provenance() -> RuleProvenance {
+    RuleProvenance::ShopPractice {
+        note: "bore diameter >= 2x nozzle diameter; practice-derived, no governing standard"
+            .to_string(),
+    }
+}
+
 /// The FDM pack's declared rule list (spec §3.2) tied to `params` the same
 /// way [`DfmReport`] ties itself to its own params (see
 /// [`crate::dfm::packs::RulePack`]).
@@ -71,6 +91,10 @@ pub fn rule_pack(params: PackParams) -> RulePack {
             Rule {
                 id: MIN_WALL_RULE_ID,
                 provenance: min_wall_provenance(),
+            },
+            Rule {
+                id: MIN_BORE_RULE_ID,
+                provenance: min_bore_provenance(),
             },
         ],
     }
@@ -452,45 +476,168 @@ pub fn evaluate_min_wall(
     })
 }
 
+/// A sentinel diameter used ONLY for the vacuous case — `solid_id` has no
+/// proven bore at all (spec's `bore_face_ids` candidate set is empty, or
+/// every candidate refused). Mirrors [`NO_PAIR_SENTINEL_THICKNESS`]'s
+/// documented precedent: a Pass with a deliberately huge (but finite —
+/// `serde_json` cannot round-trip `f64::INFINITY`) margin, never a
+/// fabricated real measurement. A part with no holes trivially satisfies
+/// "every bore >= 2x nozzle diameter" — there being no bore is not an
+/// unverified check.
+const NO_BORE_SENTINEL_DIAMETER: f64 = 1.0e300;
+
+/// Evaluate `fdm.min_bore` (spec §3.2: bore diameter >= 2x nozzle
+/// diameter) over `solid_id`, riding [`bore_metrics`] (spec S4).
+///
+/// ## Aggregation policy (mirrors [`evaluate_min_wall`]'s own policy,
+/// applied here across BORES rather than wall pairs)
+///
+/// A proven [`Verdict::Violation`] on any bore dominates: `measured` is
+/// the single NARROWEST violating bore's diameter (the worst case);
+/// `witnesses` names every violating bore's face (ascending `FaceId`
+/// order). Only when there are ZERO violating bores does an
+/// [`UnverifiableReason`] region force the rule to read `Unverifiable`
+/// (never `Pass` — the same honesty theorem `evaluate_overhang`/
+/// `evaluate_min_wall` and `report.rs` all apply). See
+/// [`NO_BORE_SENTINEL_DIAMETER`] for the vacuous (no bores at all) case.
+pub fn evaluate_min_bore(
+    model: &BRepModel,
+    solid_id: SolidId,
+    nozzle_diameter: f64,
+) -> Result<RuleVerdict, DfmError> {
+    let outcome = bore_metrics(model, solid_id)?;
+    let threshold = 2.0 * nozzle_diameter;
+
+    let mut violations: Vec<(FaceId, f64, Derivation)> = Vec::new();
+    let mut best_safe: Option<(f64, Derivation)> = None;
+
+    for bore in &outcome.bores {
+        if bore.diameter.value < threshold {
+            violations.push((
+                bore.face,
+                bore.diameter.value,
+                bore.diameter.derivation.clone(),
+            ));
+        } else {
+            // Mutation-proof target: this is the ONE comparison deciding
+            // min_bore violation. Worst-case SAFE bore is the NARROWEST
+            // one (closest to the threshold from above), mirroring
+            // `evaluate_min_wall`'s "closest to violating" worst-safe
+            // policy.
+            let replace = match &best_safe {
+                Some((current, _)) => bore.diameter.value < *current,
+                None => true,
+            };
+            if replace {
+                best_safe = Some((bore.diameter.value, bore.diameter.derivation.clone()));
+            }
+        }
+    }
+
+    if !violations.is_empty() {
+        violations.sort_by_key(|(id, _, _)| *id);
+        // Non-empty by construction (the `if` above); `unwrap_or` supplies
+        // a total, panic-free fallback rather than an `.expect()` on a
+        // branch that cannot actually miss.
+        let (worst_dia, worst_derivation) = violations
+            .iter()
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(_, dia, derivation)| (*dia, derivation.clone()))
+            .unwrap_or((
+                threshold,
+                constant_derivation("unreachable: violations checked non-empty above"),
+            ));
+        let witnesses: Vec<FaceRef> = violations.into_iter().map(|(id, _, _)| id).collect();
+        return Ok(RuleVerdict {
+            rule: MIN_BORE_RULE_ID.to_string(),
+            verdict: Verdict::Violation {
+                witnesses,
+                measured: DfmValue::new(worst_dia, worst_derivation),
+                limit: DfmValue::new(
+                    threshold,
+                    constant_derivation(
+                        "fdm.min_bore threshold: 2x nozzle diameter (shop practice)",
+                    ),
+                ),
+            },
+            provenance: min_bore_provenance(),
+        });
+    }
+
+    if !outcome.unverifiable.is_empty() {
+        let mut regions: Vec<FaceRef> = outcome.unverifiable.iter().map(|u| u.face).collect();
+        regions.sort_unstable();
+        let reason = outcome
+            .unverifiable
+            .iter()
+            .find(|u| u.face == regions[0])
+            .map(|u| u.reason.clone())
+            .unwrap_or_else(|| UnverifiableReason::UnsupportedTopology {
+                detail: "unreachable: regions derived from outcome.unverifiable above".to_string(),
+            });
+        return Ok(RuleVerdict {
+            rule: MIN_BORE_RULE_ID.to_string(),
+            verdict: Verdict::Unverifiable { regions, reason },
+            provenance: min_bore_provenance(),
+        });
+    }
+
+    let (safe_dia, safe_derivation) = best_safe.unwrap_or((
+        NO_BORE_SENTINEL_DIAMETER,
+        constant_derivation("fdm.min_bore: no bores found on this solid"),
+    ));
+    Ok(RuleVerdict {
+        rule: MIN_BORE_RULE_ID.to_string(),
+        verdict: Verdict::Pass {
+            margin: DfmValue::new(safe_dia - threshold, safe_derivation),
+        },
+        provenance: min_bore_provenance(),
+    })
+}
+
 /// The FDM pack's `evaluate()` arm (spec §3.2 params: `nozzle_diameter`,
-/// `build_direction`; defaults 0.4 mm, +Z). Runs BOTH FDM rules —
-/// `fdm.overhang` (S2) and `fdm.min_wall` (S3) — and folds across them via
-/// [`DfmReport::new`]'s honesty fold.
+/// `build_direction`; defaults 0.4 mm, +Z). Runs all THREE FDM rules —
+/// `fdm.overhang` (S2), `fdm.min_wall` (S3), `fdm.min_bore` (S4) — and
+/// folds across them via [`DfmReport::new`]'s honesty fold.
+///
+/// `model`/`solid_id` are required since S4 (`fdm.min_bore` rides
+/// [`bore_metrics`], whose contract is `(model, solid_id)` — see
+/// `analyzers/bore.rs`'s module docs); `faces` is still the
+/// caller-enumerated candidate list `evaluate_overhang`/`evaluate_min_wall`
+/// use directly from the model's own stores.
 pub fn evaluate(
+    model: &BRepModel,
+    solid_id: SolidId,
     faces: &[FaceId],
     nozzle_diameter: f64,
     build_direction: [f64; 3],
-    face_store: &FaceStore,
-    loop_store: &LoopStore,
-    edge_store: &EdgeStore,
-    curve_store: &CurveStore,
-    surface_store: &SurfaceStore,
 ) -> Result<DfmReport, DfmError> {
     let dir = Vector3::new(build_direction[0], build_direction[1], build_direction[2]);
     let overhang = evaluate_overhang(
         faces,
         dir,
-        face_store,
-        loop_store,
-        edge_store,
-        curve_store,
-        surface_store,
+        &model.faces,
+        &model.loops,
+        &model.edges,
+        &model.curves,
+        &model.surfaces,
     )?;
     let min_wall = evaluate_min_wall(
         faces,
         nozzle_diameter,
-        face_store,
-        loop_store,
-        edge_store,
-        curve_store,
-        surface_store,
+        &model.faces,
+        &model.loops,
+        &model.edges,
+        &model.curves,
+        &model.surfaces,
     )?;
+    let min_bore = evaluate_min_bore(model, solid_id, nozzle_diameter)?;
     Ok(DfmReport::new(
         PackParams::Fdm {
             nozzle_diameter,
             build_direction,
         },
-        vec![overhang, min_wall],
+        vec![overhang, min_wall, min_bore],
     ))
 }
 
@@ -831,24 +978,102 @@ mod tests {
         }
     }
 
-    /// Full-pack integration (spec §3.2): `evaluate()` now runs BOTH
-    /// `fdm.overhang` and `fdm.min_wall` on one candidate face set — a
-    /// thin wall pair (violates min_wall) plus a steep overhang face
-    /// (violates overhang) — and the report folds across BOTH rules.
+    // ----- fdm.min_bore (S4) -----
+
+    /// Hand-computed VIOLATION: a Ø0.2mm bore (radius 0.1) against a
+    /// 0.4mm nozzle (threshold 0.8mm) — narrower than the floor, flagged
+    /// with the EXACT measured diameter, witnesses naming the bore face.
     #[test]
-    fn full_pack_evaluate_runs_both_rules_and_folds() {
+    fn thin_bore_below_2x_nozzle_is_exact_violation() {
+        use crate::dfm::analyzers::bore::fixtures::plate_with_through_bore;
+        let (model, solid_id, bore_face) = plate_with_through_bore(20.0, 20.0, 10.0, 0.1);
+
+        let verdict = evaluate_min_bore(&model, solid_id, 0.4)
+            .unwrap_or_else(|e| panic!("malformed-input free fixture: {e}"));
+
+        match verdict.verdict {
+            Verdict::Violation {
+                witnesses,
+                measured,
+                limit,
+            } => {
+                assert_eq!(witnesses, vec![bore_face]);
+                assert!(
+                    (measured.value - 0.2).abs() < 1e-9,
+                    "measured = {}",
+                    measured.value
+                );
+                assert!((limit.value - 0.8).abs() < 1e-9, "limit = {}", limit.value);
+            }
+            other => panic!("expected Violation, got {other:?}"),
+        }
+    }
+
+    /// Hand-computed PASS: a Ø10mm bore (radius 5.0) against the same
+    /// 0.8mm threshold — margin asserted exactly: `10.0 - 0.8 = 9.2`.
+    #[test]
+    fn ample_bore_above_2x_nozzle_passes_with_exact_margin() {
+        use crate::dfm::analyzers::bore::fixtures::plate_with_through_bore;
+        let (model, solid_id, _bore_face) = plate_with_through_bore(30.0, 30.0, 10.0, 5.0);
+
+        let verdict = evaluate_min_bore(&model, solid_id, 0.4)
+            .unwrap_or_else(|e| panic!("malformed-input free fixture: {e}"));
+
+        match verdict.verdict {
+            Verdict::Pass { margin } => {
+                assert!(
+                    (margin.value - 9.2).abs() < 1e-9,
+                    "margin = {}",
+                    margin.value
+                );
+            }
+            other => panic!("expected Pass, got {other:?}"),
+        }
+    }
+
+    /// Vacuous case: a solid with zero bore candidates (its only face is
+    /// NURBS, invisible to `bore_face_ids`) must read `fdm.min_bore` as
+    /// `Pass` — "no bores found" is a legitimate Pass, not an
+    /// `Unverifiable` (there is nothing to refuse).
+    #[test]
+    fn no_bores_on_solid_passes_vacuously_never_unverifiable() {
+        use crate::dfm::packs::fixtures::{model_with_solid, nurbs_face};
+        let (surfaces, faces, loops, edges, curves, face_id) = nurbs_face();
+        let face_ids = [face_id];
+        let (model, solid_id) = model_with_solid(surfaces, faces, loops, edges, curves, &face_ids);
+
+        let verdict = evaluate_min_bore(&model, solid_id, 0.4)
+            .unwrap_or_else(|e| panic!("malformed-input free fixture: {e}"));
+
+        assert!(
+            matches!(verdict.verdict, Verdict::Pass { .. }),
+            "expected vacuous Pass, got {:?}",
+            verdict.verdict
+        );
+    }
+
+    /// Full-pack integration (spec §3.2): `evaluate()` now runs all THREE
+    /// FDM rules on one candidate face set — a thin wall pair (violates
+    /// min_wall), a steep overhang face (violates overhang), and a
+    /// sub-threshold bore (violates min_bore) — and the report folds
+    /// across all three rules.
+    #[test]
+    fn full_pack_evaluate_runs_all_three_rules_and_folds() {
+        use crate::dfm::packs::fixtures::model_with_solid;
         use crate::dfm::report::DfmSummary;
         use crate::math::Point3;
+        use crate::primitives::curve::{Arc, ParameterRange};
+        use crate::primitives::edge::{Edge, EdgeOrientation};
         use crate::primitives::face::{Face, FaceOrientation};
         use crate::primitives::r#loop::{Loop, LoopType};
-        use crate::primitives::surface::Plane;
+        use crate::primitives::surface::{Cylinder, Plane};
 
-        let (mut surfaces, mut faces, mut loops, edges, curves, wall_a, wall_b) =
+        let (mut surfaces, mut faces, mut loops, mut edges, mut curves, wall_a, wall_b) =
             rectangle_wall_pair(0.5);
 
         // Add one more face (steep overhang) to the SAME stores so a
-        // single evaluate() call sees both the wall pair and the
-        // overhang candidate.
+        // single evaluate() call sees the wall pair, the overhang
+        // candidate, AND (below) a bore candidate.
         let theta = 150f64.to_radians();
         let normal = Vector3::new(theta.sin(), 0.0, theta.cos());
         let plane = Plane::from_point_normal(Point3::new(5.0, 5.0, 5.0), normal)
@@ -858,19 +1083,58 @@ mod tests {
         let face = Face::new(2, surface_id, outer_loop, FaceOrientation::Forward);
         let overhang_face_id = faces.add(face);
 
-        let report = evaluate(
-            &[wall_a, wall_b, overhang_face_id],
-            0.4,
-            [0.0, 0.0, 1.0],
-            &faces,
-            &loops,
-            &edges,
-            &curves,
-            &surfaces,
-        )
-        .unwrap_or_else(|e| panic!("malformed-input free fixture: {e}"));
+        // A sub-threshold bore (radius 0.1 -> diameter 0.2mm, well under
+        // the 0.8mm floor at nozzle=0.4mm): a concave (Backward) cylinder
+        // wall with two axis-perpendicular rims, so both `axial_extent`
+        // (its own trim) and `solid_axial_extent` (the walk over every
+        // face in these combined stores) succeed.
+        let bore_origin = Point3::new(20.0, 20.0, 0.0);
+        let bore_axis = Vector3::Z;
+        let bore_radius = 0.1;
+        let cylinder =
+            Cylinder::new(bore_origin, bore_axis, bore_radius).unwrap_or_else(|e| panic!("{e}"));
+        let bore_surface_id = surfaces.add(Box::new(cylinder));
+        let bottom_rim = Arc::circle(bore_origin, bore_axis, bore_radius)
+            .unwrap_or_else(|e| panic!("valid rim arc fixture: {e}"));
+        let top_rim = Arc::circle(bore_origin + bore_axis * 5.0, bore_axis, bore_radius)
+            .unwrap_or_else(|e| panic!("valid rim arc fixture: {e}"));
+        let mut bore_loop = Loop::new(3, LoopType::Outer);
+        for curve in [
+            Box::new(bottom_rim) as Box<dyn crate::primitives::curve::Curve>,
+            Box::new(top_rim),
+        ] {
+            let curve_id = curves.add(curve);
+            let edge = Edge::new(
+                0,
+                0,
+                1,
+                curve_id,
+                EdgeOrientation::Forward,
+                ParameterRange::unit(),
+            );
+            let edge_id = edges.add(edge);
+            bore_loop.add_edge(edge_id, true);
+        }
+        let bore_outer_loop = loops.add(bore_loop);
+        let bore_face = Face::new(
+            3,
+            bore_surface_id,
+            bore_outer_loop,
+            FaceOrientation::Backward,
+        );
+        let bore_face_id = faces.add(bore_face);
 
-        assert_eq!(report.verdicts().len(), 2, "both fdm rules must be present");
+        let face_ids = [wall_a, wall_b, overhang_face_id, bore_face_id];
+        let (model, solid_id) = model_with_solid(surfaces, faces, loops, edges, curves, &face_ids);
+
+        let report = evaluate(&model, solid_id, &face_ids, 0.4, [0.0, 0.0, 1.0])
+            .unwrap_or_else(|e| panic!("malformed-input free fixture: {e}"));
+
+        assert_eq!(
+            report.verdicts().len(),
+            3,
+            "all three fdm rules must be present"
+        );
         assert!(matches!(
             report.verdicts()[0].verdict,
             Verdict::Violation { .. }
@@ -879,6 +1143,10 @@ mod tests {
             report.verdicts()[1].verdict,
             Verdict::Violation { .. }
         ));
-        assert_eq!(report.summary(), DfmSummary::Violations { count: 2 });
+        assert!(matches!(
+            report.verdicts()[2].verdict,
+            Verdict::Violation { .. }
+        ));
+        assert_eq!(report.summary(), DfmSummary::Violations { count: 3 });
     }
 }

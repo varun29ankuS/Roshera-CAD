@@ -33,21 +33,35 @@
 //! proper (a generic engine over every pack) is separate, independently-
 //! tracked work; see `packs/mod.rs` module docs for why.
 //!
-//! ## Slice S3 (this addition)
+//! ## Slice S3
 //!
 //! `analyzers::pair_thickness` — wall thickness between provably opposing
 //! face pairs (parallel planes / coaxial cylinders), exact-or-refuse, and
 //! `packs::fdm::evaluate_min_wall` (`fdm.min_wall`: wall thickness ≥ 2×
-//! nozzle diameter) riding it. `packs::fdm::evaluate` now runs BOTH FDM
-//! rules (`fdm.overhang`, `fdm.min_wall`) and folds across them.
+//! nozzle diameter) riding it.
+//!
+//! ## Slice S4 (this addition)
+//!
+//! `analyzers::bore_metrics` — per-bore diameter, trimmed axial depth,
+//! through-vs-blind, and aspect ratio, reusing
+//! `crate::readable::bore_face_ids` verbatim as its concave-cylinder
+//! candidate filter (never a second, divergent bore-detection rule), and
+//! `packs::fdm::evaluate_min_bore` (`fdm.min_bore`: bore diameter ≥ 2×
+//! nozzle diameter) riding it. `packs::fdm::evaluate` now runs all THREE
+//! FDM rules (`fdm.overhang`, `fdm.min_wall`, `fdm.min_bore`) and folds
+//! across them. Because through-vs-blind needs the SOLID's own extent
+//! along the bore axis (not just one face's trim), `bore_metrics` — and
+//! therefore `packs::fdm::evaluate`/`packs::evaluate` for the `Fdm` arm —
+//! takes `(model, solid_id)` rather than `faces: &[FaceId]` + bare stores;
+//! see `analyzers/bore.rs`'s module docs for the full reasoning.
 //!
 //! Planned layout (spec §3), populated incrementally:
 //! ```text
 //! dfm/
 //!   mod.rs        — public surface: analyze(...) -> DfmReport      (later)
-//!   analyzers/    — face_orientation_field (S2), pair_thickness (S3);
-//!                   3 more analyzers                               (later)
-//!   packs/        — fdm.rs, molding.rs (S2/S3, here); cnc.rs, sheet.rs (later)
+//!   analyzers/    — face_orientation_field (S2), pair_thickness (S3),
+//!                   bore_metrics (S4); 2 more analyzers             (later)
+//!   packs/        — fdm.rs, molding.rs (S2-S4, here); cnc.rs, sheet.rs (later)
 //!   report.rs     — DfmReport, RuleVerdict, DfmValue, DfmSummary,
 //!                   DfmFact                                         (S1)
 //! ```
@@ -58,8 +72,8 @@ pub mod provenance;
 pub mod report;
 
 pub use analyzers::{
-    face_orientation_field, pair_thickness, FacePair, OrientationOutcome, PairThicknessOutcome,
-    UnpairedRegion,
+    bore_metrics, face_orientation_field, pair_thickness, BoreMetricsOutcome, BoreRecord, FacePair,
+    OrientationOutcome, PairThicknessOutcome, UnpairedRegion, UnverifiableBore,
 };
 pub use packs::{Rule, RulePack};
 pub use provenance::{RuleProvenance, StandardBody};

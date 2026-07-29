@@ -384,6 +384,18 @@ pub enum DfmError {
     /// outcome.
     #[error("face {face} does not exist in the solid DFM analysis was requested against")]
     DanglingFaceRef { face: FaceRef },
+    /// A solid reference does not resolve against the model DFM analysis
+    /// was requested against — malformed input, never a legitimate
+    /// analyzer outcome. Introduced by [`crate::dfm::analyzers::bore`]
+    /// (spec S4), the first analyzer whose contract is `(model, solid_id)`
+    /// rather than a caller-enumerated `faces: &[FaceId]` — see that
+    /// module's docs for why `bore_metrics` needs solid-level scope
+    /// (through-vs-blind requires the SOLID's own extent along the bore
+    /// axis, not just one face's trim).
+    #[error("solid {solid} does not exist in the model DFM analysis was requested against")]
+    DanglingSolidRef {
+        solid: crate::primitives::solid::SolidId,
+    },
     /// The solid fails the soundness precondition an analyzer requires
     /// before it can even attempt a measurement (spec §4: e.g.
     /// `internal_voids` needs a sound shell/solid structure to walk).

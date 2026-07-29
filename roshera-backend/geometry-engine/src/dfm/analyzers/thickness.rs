@@ -593,7 +593,18 @@ fn try_plane_pair(
 /// proven colinear) so the two faces' `v` values are directly comparable.
 /// Returns `None` when the boundary is not a straight generatrix / axis-
 /// perpendicular rim, has an inner loop, or is empty.
-fn axial_extent(
+///
+/// `pub(super)` (not private): [`crate::dfm::analyzers::bore::bore_metrics`]
+/// (spec S4) reuses this EXACT function for a bore wall face's own trimmed
+/// axial extent, rather than re-deriving the same Line/rim-Arc walk a
+/// second time — the no-copies discipline applies to this helper as much
+/// as to any production entry point. `bore_metrics` needs a SEPARATE,
+/// laxer helper for the SOLID's own extent along the same axis (which must
+/// walk every face's inner loops too, since a plate's flat faces carry the
+/// bore's rim as an inner loop) — that is a different question (the
+/// solid's envelope, not one face's trim) and lives in `bore.rs` itself,
+/// not here.
+pub(super) fn axial_extent(
     face: &Face,
     axis_point: Point3,
     axis_dir: Vector3,

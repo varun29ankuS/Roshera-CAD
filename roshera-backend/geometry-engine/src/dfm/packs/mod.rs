@@ -24,7 +24,7 @@
 //! always passes or always refuses (which would itself be the "kernel can
 //! lie" defect this subsystem exists to remove).
 //!
-//! ## Why `faces: &[FaceId]`, not `model`/`solid`
+//! ## Why `faces: &[FaceId]`, not `model`/`solid` (S2/S3 rules)
 //!
 //! [`face_orientation_field`] is itself a per-face, store-driven function
 //! with no `Solid`/`BRepModel` in its signature, and its own test module
@@ -37,17 +37,29 @@
 //! module now would add a `Solid`/`ShellStore` dependency this slice's
 //! rules do not otherwise need, for a convenience a caller can already
 //! express in one line.
+//!
+//! ## S4: why [`evaluate`]'s `Fdm` arm now takes `model`/`solid_id` too
+//!
+//! `fdm.min_bore` rides [`crate::dfm::analyzers::bore_metrics`], whose
+//! contract is `(model, solid_id)` rather than `faces: &[FaceId]` + bare
+//! stores — through-vs-blind is not face-local, it needs the SOLID's own
+//! extent along the bore axis (see `analyzers/bore.rs`'s module docs for
+//! the full reasoning). Rather than thread yet another
+//! caller-supplied-and-possibly-mismatched parameter alongside `faces`,
+//! [`evaluate`] now takes the model directly for every pack; the
+//! `InjectionMolding` arm is UNCHANGED in substance — it still calls
+//! [`molding::evaluate`] with bare stores, just borrowed off the model
+//! (`&model.faces`, `&model.loops`, …) instead of accepted as separate
+//! parameters.
 
 pub mod fdm;
 pub mod molding;
 
 use crate::dfm::provenance::RuleProvenance;
 use crate::dfm::report::{DfmError, DfmReport, PackParams, RulePackId};
-use crate::primitives::curve::CurveStore;
-use crate::primitives::edge::EdgeStore;
-use crate::primitives::face::{FaceId, FaceStore};
-use crate::primitives::r#loop::LoopStore;
-use crate::primitives::surface::SurfaceStore;
+use crate::primitives::face::FaceId;
+use crate::primitives::solid::SolidId;
+use crate::primitives::topology_builder::BRepModel;
 
 /// One rule's static identity (spec §3.2, adapted to the committed
 /// reality): `id` is `&'static str` since every pack definition here is a
@@ -85,42 +97,36 @@ impl RulePack {
 }
 
 /// The slice's minimal `analyze()`-shaped entry point (spec §3's
-/// `analyze(model, solid, pack) -> DfmReport`, adapted: see module docs
-/// for why `faces: &[FaceId]` replaces `model, solid` here). Dispatches on
-/// `params`'s variant to the one pack that owns it and evaluates every
-/// rule that pack implements in this slice, folding the resulting
+/// `analyze(model, solid, pack) -> DfmReport`). Dispatches on `params`'s
+/// variant to the one pack that owns it and evaluates every rule that
+/// pack implements in this slice, folding the resulting
 /// [`crate::dfm::report::RuleVerdict`]s into a [`DfmReport`] via
 /// [`DfmReport::new`] — the honesty fold itself is untouched, owned
 /// entirely by `report.rs`.
 ///
-/// Returns `Err` only when [`face_orientation_field`] does (spec §4: a
-/// dangling face reference is malformed input, never an honest refusal) —
-/// propagated straight through from whichever pack's evaluator hit it.
+/// `faces` is still the caller-enumerated candidate list (module docs:
+/// "why `faces: &[FaceId]`" for the face-local S2/S3 rules) — `model`/
+/// `solid_id` are ADDITIONALLY required since S4 so the `Fdm` arm can
+/// run `fdm.min_bore` (see "S4" module docs above).
+///
+/// Returns `Err` when [`face_orientation_field`] does (a dangling face
+/// reference), or when [`crate::dfm::analyzers::bore_metrics`] does (a
+/// dangling `solid_id`) — spec §4: both are malformed input, never an
+/// honest refusal — propagated straight through from whichever pack's
+/// evaluator hit it.
 ///
 /// [`face_orientation_field`]: crate::dfm::analyzers::face_orientation_field
 pub fn evaluate(
     params: PackParams,
+    model: &BRepModel,
+    solid_id: SolidId,
     faces: &[FaceId],
-    face_store: &FaceStore,
-    loop_store: &LoopStore,
-    edge_store: &EdgeStore,
-    curve_store: &CurveStore,
-    surface_store: &SurfaceStore,
 ) -> Result<DfmReport, DfmError> {
     match params {
         PackParams::Fdm {
             nozzle_diameter,
             build_direction,
-        } => fdm::evaluate(
-            faces,
-            nozzle_diameter,
-            build_direction,
-            face_store,
-            loop_store,
-            edge_store,
-            curve_store,
-            surface_store,
-        ),
+        } => fdm::evaluate(model, solid_id, faces, nozzle_diameter, build_direction),
         PackParams::InjectionMolding {
             pull_direction,
             min_draft_deg,
@@ -128,11 +134,11 @@ pub fn evaluate(
             faces,
             pull_direction,
             min_draft_deg,
-            face_store,
-            loop_store,
-            edge_store,
-            curve_store,
-            surface_store,
+            &model.faces,
+            &model.loops,
+            &model.edges,
+            &model.curves,
+            &model.surfaces,
         ),
     }
 }
@@ -232,11 +238,49 @@ pub(crate) mod fixtures {
 
         (surfaces, faces, loops, edges, curves, face_id)
     }
+
+    /// Wrap already-built bare stores + a face list into a fresh
+    /// [`crate::primitives::topology_builder::BRepModel`] with ONE solid
+    /// (a single closed shell containing every given face) — the
+    /// model-level plumbing S4's `evaluate` (and
+    /// [`crate::dfm::analyzers::bore_metrics`]) needs on top of geometry
+    /// built the same bare-store way this module's fixtures already
+    /// build it. `pub(crate)` so `packs::mod`'s own tests AND
+    /// `packs::fdm`'s can wrap a `plane_face_at_theta_deg`/`nurbs_face`
+    /// fixture into a model without re-deriving this plumbing per file.
+    pub(crate) fn model_with_solid(
+        surfaces: SurfaceStore,
+        faces: FaceStore,
+        loops: LoopStore,
+        edges: EdgeStore,
+        curves: CurveStore,
+        face_ids: &[FaceId],
+    ) -> (
+        crate::primitives::topology_builder::BRepModel,
+        crate::primitives::solid::SolidId,
+    ) {
+        use crate::primitives::shell::{Shell, ShellType};
+        use crate::primitives::solid::Solid;
+
+        let mut model = crate::primitives::topology_builder::BRepModel::new();
+        model.surfaces = surfaces;
+        model.faces = faces;
+        model.loops = loops;
+        model.edges = edges;
+        model.curves = curves;
+
+        let mut shell = Shell::new(0, ShellType::Closed);
+        shell.add_faces(face_ids);
+        let shell_id = model.shells.add(shell);
+        let solid = Solid::new(0, shell_id);
+        let solid_id = model.solids.add(solid);
+        (model, solid_id)
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::fixtures::{nurbs_face, plane_face_at_theta_deg};
+    use super::fixtures::{model_with_solid, nurbs_face, plane_face_at_theta_deg};
     use super::*;
     use crate::dfm::report::{DfmSummary, Verdict};
 
@@ -263,18 +307,16 @@ mod tests {
     fn one_analyzer_two_packs_yield_distinct_verdicts() {
         let (surfaces, faces, loops, edges, curves, face_id) = plane_face_at_theta_deg(150.0);
         let face_ids = [face_id];
+        let (model, solid_id) = model_with_solid(surfaces, faces, loops, edges, curves, &face_ids);
 
         let fdm_report = evaluate(
             PackParams::Fdm {
                 nozzle_diameter: 0.4,
                 build_direction: [0.0, 0.0, 1.0],
             },
+            &model,
+            solid_id,
             &face_ids,
-            &faces,
-            &loops,
-            &edges,
-            &curves,
-            &surfaces,
         )
         .unwrap_or_else(|e| panic!("malformed-input free fixture: {e}"));
         assert_eq!(fdm_report.summary(), DfmSummary::Violations { count: 1 });
@@ -293,12 +335,9 @@ mod tests {
                 pull_direction: [0.0, 0.0, 1.0],
                 min_draft_deg: 1.0,
             },
+            &model,
+            solid_id,
             &face_ids,
-            &faces,
-            &loops,
-            &edges,
-            &curves,
-            &surfaces,
         )
         .unwrap_or_else(|e| panic!("malformed-input free fixture: {e}"));
         assert_eq!(molding_report.summary(), DfmSummary::Pass);
@@ -320,28 +359,33 @@ mod tests {
     /// `Pass` — through the FULL path: both analyzers' refusals → each
     /// rule's own aggregation → the committed `DfmReport::new` honesty
     /// fold. Exercises the fold end-to-end through this slice's own code,
-    /// per the executor brief. Since S3 the FDM pack runs TWO rules
-    /// (`fdm.overhang`, `fdm.min_wall`) against the same lone NURBS face,
-    /// so BOTH read `Unverifiable` — `unverifiable: 2`, not 1.
+    /// per the executor brief. Since S4 the FDM pack runs THREE rules
+    /// (`fdm.overhang`, `fdm.min_wall`, `fdm.min_bore`) against the same
+    /// lone NURBS face. `fdm.overhang`/`fdm.min_wall` still read
+    /// `Unverifiable` (a NURBS face is unsupported for both), so
+    /// `unverifiable` stays 2 — but `fdm.min_bore` reads `Pass`
+    /// (vacuously: a NURBS face is not even a candidate for
+    /// `bore_face_ids`'s concave-cylinder filter, so `bore_metrics`
+    /// reports zero bores AND zero refusals for it — "no bores found" is
+    /// a legitimate, unverified-nothing Pass, not a missed check).
     #[test]
     fn nurbs_only_solid_is_inconclusive_never_pass_through_full_report_path() {
         let (surfaces, faces, loops, edges, curves, face_id) = nurbs_face();
         let face_ids = [face_id];
+        let (model, solid_id) = model_with_solid(surfaces, faces, loops, edges, curves, &face_ids);
 
         let report = evaluate(
             PackParams::Fdm {
                 nozzle_diameter: 0.4,
                 build_direction: [0.0, 0.0, 1.0],
             },
+            &model,
+            solid_id,
             &face_ids,
-            &faces,
-            &loops,
-            &edges,
-            &curves,
-            &surfaces,
         )
         .unwrap_or_else(|e| panic!("malformed-input free fixture: {e}"));
 
+        assert_eq!(report.verdicts().len(), 3, "all three FDM rules present");
         assert_eq!(
             report.summary(),
             DfmSummary::Inconclusive { unverifiable: 2 }
@@ -359,6 +403,10 @@ mod tests {
             Verdict::Unverifiable { regions, .. } => assert_eq!(regions, &[face_id]),
             other => panic!("expected Unverifiable (fdm.min_wall), got {other:?}"),
         }
+        match &report.verdicts()[2].verdict {
+            Verdict::Pass { .. } => {}
+            other => panic!("expected Pass (fdm.min_bore, vacuous), got {other:?}"),
+        }
     }
 
     /// Provenance presence: EVERY rule verdict this slice produces — FDM
@@ -368,63 +416,62 @@ mod tests {
     /// honestly `ShopPractice`, never dressed up as `Standard`).
     #[test]
     fn every_verdict_carries_shop_practice_provenance() {
-        let safe = plane_face_at_theta_deg(90.0); // vertical wall: safe for both packs
-        let steep = plane_face_at_theta_deg(150.0); // steep overhang: fdm violates
-        let nurbs = nurbs_face();
+        // Each case builds its OWN fresh fixture (rather than sharing one
+        // set of stores across cases by reference, the old convention):
+        // `model_with_solid` takes ownership of the bare stores to wrap
+        // them into a `BRepModel`, so a shared instance could not be
+        // wrapped twice.
+        let fdm_params = || PackParams::Fdm {
+            nozzle_diameter: 0.4,
+            build_direction: [0.0, 0.0, 1.0],
+        };
 
-        let cases = vec![
-            (
-                PackParams::Fdm {
-                    nozzle_diameter: 0.4,
-                    build_direction: [0.0, 0.0, 1.0],
-                },
-                [safe.5],
-                &safe.0,
-                &safe.1,
-                &safe.2,
-                &safe.3,
-                &safe.4,
-            ),
-            (
-                PackParams::Fdm {
-                    nozzle_diameter: 0.4,
-                    build_direction: [0.0, 0.0, 1.0],
-                },
-                [steep.5],
-                &steep.0,
-                &steep.1,
-                &steep.2,
-                &steep.3,
-                &steep.4,
-            ),
-            (
-                PackParams::Fdm {
-                    nozzle_diameter: 0.4,
-                    build_direction: [0.0, 0.0, 1.0],
-                },
-                [nurbs.5],
-                &nurbs.0,
-                &nurbs.1,
-                &nurbs.2,
-                &nurbs.3,
-                &nurbs.4,
-            ),
-            (
-                PackParams::InjectionMolding {
-                    pull_direction: [0.0, 0.0, 1.0],
-                    min_draft_deg: 1.0,
-                },
-                [safe.5],
-                &safe.0,
-                &safe.1,
-                &safe.2,
-                &safe.3,
-                &safe.4,
-            ),
+        let cases: Vec<(PackParams, _, _, Vec<FaceId>)> = vec![
+            {
+                // vertical wall: safe for both packs
+                let (surfaces, faces, loops, edges, curves, face_id) =
+                    plane_face_at_theta_deg(90.0);
+                let face_ids = vec![face_id];
+                let (model, solid_id) =
+                    model_with_solid(surfaces, faces, loops, edges, curves, &face_ids);
+                (fdm_params(), model, solid_id, face_ids)
+            },
+            {
+                // steep overhang: fdm violates
+                let (surfaces, faces, loops, edges, curves, face_id) =
+                    plane_face_at_theta_deg(150.0);
+                let face_ids = vec![face_id];
+                let (model, solid_id) =
+                    model_with_solid(surfaces, faces, loops, edges, curves, &face_ids);
+                (fdm_params(), model, solid_id, face_ids)
+            },
+            {
+                let (surfaces, faces, loops, edges, curves, face_id) = nurbs_face();
+                let face_ids = vec![face_id];
+                let (model, solid_id) =
+                    model_with_solid(surfaces, faces, loops, edges, curves, &face_ids);
+                (fdm_params(), model, solid_id, face_ids)
+            },
+            {
+                let (surfaces, faces, loops, edges, curves, face_id) =
+                    plane_face_at_theta_deg(90.0);
+                let face_ids = vec![face_id];
+                let (model, solid_id) =
+                    model_with_solid(surfaces, faces, loops, edges, curves, &face_ids);
+                (
+                    PackParams::InjectionMolding {
+                        pull_direction: [0.0, 0.0, 1.0],
+                        min_draft_deg: 1.0,
+                    },
+                    model,
+                    solid_id,
+                    face_ids,
+                )
+            },
         ];
 
-        for (params, face_ids, surfaces, faces, loops, edges, curves) in cases {
-            let report = evaluate(params, &face_ids, faces, loops, edges, curves, surfaces)
+        for (params, model, solid_id, face_ids) in cases {
+            let report = evaluate(params, &model, solid_id, &face_ids)
                 .unwrap_or_else(|e| panic!("malformed-input free fixture: {e}"));
             for rv in report.verdicts() {
                 assert!(
