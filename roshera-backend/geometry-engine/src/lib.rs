@@ -10,6 +10,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 pub mod assembly;
+pub mod dfm;
 pub mod drawing;
 pub mod gdt;
 pub mod harness;
