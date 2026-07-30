@@ -33,6 +33,12 @@ pub mod winding_number;
 // Advanced curve/surface mathematics
 pub mod bspline;
 pub mod continuity_analysis;
+// Proven interval/normal-cone enclosures for B-spline patches (freeform
+// coverage F2). NOTE: `enclosure::Interval` is deliberately NOT re-exported
+// at the `math` root — `utils::Interval` (a plain min/max pair) already
+// occupies that name; the proven-enclosure type is addressed as
+// `math::enclosure::Interval` so the two can never be confused.
+pub mod enclosure;
 pub mod nurbs;
 pub mod surface_intersection;
 // Manual Oslo-insertion diagnostic (println-based, no assertions). Kept OUT

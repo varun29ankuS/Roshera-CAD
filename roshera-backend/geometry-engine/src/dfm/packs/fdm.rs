@@ -175,13 +175,25 @@ fn as_overhang_derivation(inner: Derivation) -> Derivation {
             surface_type,
             method: format!("{method}; fdm.overhang reads degrees-from-vertical = θ − 90°"),
         },
+        // Freeform F1: a bounded derivation re-tags the same way — the
+        // linear conversion preserves the enclosure's provenance fields.
+        Derivation::BoundedAnalytic {
+            method,
+            refinement_depth,
+            converged,
+        } => Derivation::BoundedAnalytic {
+            method: format!("{method}; fdm.overhang reads degrees-from-vertical = θ − 90°"),
+            refinement_depth,
+            converged,
+        },
     }
 }
 
 /// Derivation for a fixed pack-configured constant (the 45° threshold
 /// itself, or a "no candidate faces" fallback) rather than a value
-/// measured off a specific face. `Derivation` has only the `Analytic`
-/// variant (no analyzer has needed a second one yet), so this follows the
+/// measured off a specific face. `Derivation::Analytic` is the variant
+/// for closed-form/constant values (`BoundedAnalytic`, added by freeform
+/// F1, is reserved for enclosure-derived numbers), so this follows the
 /// existing in-tree precedent for tagging a non-geometric constant:
 /// `report.rs`'s own test fixtures tag a fixed rule threshold (e.g. "2x
 /// nozzle diameter") as `Analytic { surface_type: Plane, method: .. } —

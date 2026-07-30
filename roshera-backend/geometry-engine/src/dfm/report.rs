@@ -132,6 +132,33 @@ pub enum Derivation {
         surface_type: SurfaceKind,
         method: String,
     },
+    /// Derived from a PROVEN interval enclosure rather than a single
+    /// closed-form number (freeform coverage spec F1/F2:
+    /// [`crate::math::enclosure`]). The value this derivation rides on is
+    /// a conservative endpoint of an enclosure computed via the
+    /// convex-hull property — a theorem about the surface, never a
+    /// sampled extreme. `refinement_depth` is the number of subdivision
+    /// sweeps performed; `converged` reports whether the requested
+    /// tightness was reached within the budget (`false` is an honest
+    /// outcome — the bound is still proven, just wider than asked for).
+    BoundedAnalytic {
+        method: String,
+        refinement_depth: usize,
+        converged: bool,
+    },
+}
+
+/// The wire echo of a proven enclosure `[lo, hi]` riding a [`DfmValue`]
+/// (freeform spec F1: the "bounded form"). Inert data: the honesty
+/// constraint (a straddling bound can NEVER fold to Pass) lives in
+/// [`Verdict::from_bounded_max`]/[`Verdict::from_bounded_min`], which take
+/// the math layer's honest-by-construction
+/// [`crate::math::enclosure::Interval`] — this struct only reports what
+/// was proven, it cannot influence the fold.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct DfmBound {
+    pub lo: f64,
+    pub hi: f64,
 }
 
 /// A measured (or derived-threshold) quantity that carries its own
@@ -139,15 +166,76 @@ pub enum Derivation {
 /// provenance" at the type level: there is no constructor and no field
 /// that produces a `DfmValue` without a [`Derivation`] attached, so a
 /// [`Verdict`] can never carry a bare, unaccountable `f64`.
+///
+/// A BOUNDED value (freeform spec F1) additionally carries the proven
+/// enclosure it was folded from in `bound`, and its `value` is always one
+/// of the enclosure's two conservative endpoints — see
+/// [`DfmValue::bounded_lower`]/[`DfmValue::bounded_upper`], the only
+/// constructors that populate `bound`. `bound` is `None` for classic
+/// closed-form values, and the field is skipped on the wire when absent,
+/// so every pre-F1 report round-trips byte-identically.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DfmValue {
     pub value: f64,
     pub derivation: Derivation,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bound: Option<DfmBound>,
 }
 
 impl DfmValue {
     pub fn new(value: f64, derivation: Derivation) -> Self {
-        Self { value, derivation }
+        Self {
+            value,
+            derivation,
+            bound: None,
+        }
+    }
+
+    /// Bounded value reporting the enclosure's LOWER endpoint (the number
+    /// proven to be a floor of the true quantity) — e.g. the `measured`
+    /// of a proven max-rule violation ("the value is at least `lo`"), or
+    /// a proven margin ("the headroom is at least `lo`").
+    pub fn bounded_lower(
+        enclosure: &crate::math::enclosure::Interval,
+        method: &str,
+        refinement_depth: usize,
+        converged: bool,
+    ) -> Self {
+        Self {
+            value: enclosure.lo(),
+            derivation: Derivation::BoundedAnalytic {
+                method: method.to_string(),
+                refinement_depth,
+                converged,
+            },
+            bound: Some(DfmBound {
+                lo: enclosure.lo(),
+                hi: enclosure.hi(),
+            }),
+        }
+    }
+
+    /// Bounded value reporting the enclosure's UPPER endpoint (the number
+    /// proven to be a ceiling of the true quantity) — e.g. the `measured`
+    /// of a proven min-rule violation ("the value is at most `hi`").
+    pub fn bounded_upper(
+        enclosure: &crate::math::enclosure::Interval,
+        method: &str,
+        refinement_depth: usize,
+        converged: bool,
+    ) -> Self {
+        Self {
+            value: enclosure.hi(),
+            derivation: Derivation::BoundedAnalytic {
+                method: method.to_string(),
+                refinement_depth,
+                converged,
+            },
+            bound: Some(DfmBound {
+                lo: enclosure.lo(),
+                hi: enclosure.hi(),
+            }),
+        }
     }
 }
 
@@ -185,6 +273,21 @@ pub enum UnverifiableReason {
     /// boundary on a surface kind that requires a real one. `detail`
     /// names the specific defect.
     UnsupportedTopology { detail: String },
+    /// The value's PROVEN enclosure `[lo, hi]` straddles the rule's
+    /// `limit` after the refinement budget (freeform spec F1, verdict
+    /// table row 3): the kernel cannot separate them, and says so WITH
+    /// THE BOUND — strictly more useful than a blanket refusal (an agent
+    /// can tighten the design, move the threshold, or accept the risk
+    /// explicitly), and strictly more honest than picking a side.
+    /// `converged: false` means the budget ran out before the requested
+    /// tightness; the bound reported is still a theorem.
+    BoundNotSeparating {
+        lo: f64,
+        hi: f64,
+        limit: f64,
+        refinement_depth: usize,
+        converged: bool,
+    },
 }
 
 /// The kernel's per-rule answer: proven safe margin, a proven defect, or an
@@ -212,6 +315,133 @@ pub enum Verdict {
         regions: Vec<FaceRef>,
         reason: UnverifiableReason,
     },
+}
+
+impl Verdict {
+    /// THE BOUNDED HONESTY FOLD (freeform spec F1, §3's verdict table) —
+    /// the three-way verdict for a MAX-style rule ("the value must stay
+    /// below `limit`") decided from a PROVEN enclosure `[lo, hi]`:
+    ///
+    /// | condition            | verdict                                  |
+    /// |----------------------|------------------------------------------|
+    /// | `hi < limit`         | provable `Pass`, margin ≥ `limit − hi`   |
+    /// | `lo > limit`         | provable `Violation`, value ≥ `lo`       |
+    /// | enclosure straddles  | `Unverifiable` REPORTING THE BOUND       |
+    ///
+    /// The load-bearing rule mirrors S1's [`DfmReport::summarize`] fold: a
+    /// straddling enclosure can NEVER produce `Pass` — deciding from any
+    /// interior point (a midpoint, a sampled extreme) is exactly the
+    /// silent-wrong-answer defect this subsystem exists to delete, and
+    /// the mutation-proof test below demonstrates the divergence with raw
+    /// numbers. Comparisons are strict: an enclosure touching the limit
+    /// (`hi == limit` or `lo == limit`) cannot prove either side and
+    /// falls to the reporting refusal. A NaN limit compares false on both
+    /// sides and lands in the refusal row — a broken threshold can never
+    /// fabricate a Pass.
+    ///
+    /// `faces` become the `witnesses` of a violation / the `regions` of a
+    /// refusal (the same face set is implicated either way); the Pass
+    /// margin is computed with outward-rounded interval arithmetic
+    /// (`limit − enclosure`, lower endpoint), so the reported margin is
+    /// itself proven, never optimistic. If `limit.value` is non-finite,
+    /// no margin can be proven and the fold refuses with the bound.
+    pub fn from_bounded_max(
+        enclosure: crate::math::enclosure::Interval,
+        limit: DfmValue,
+        faces: Vec<FaceRef>,
+        method: &str,
+        refinement_depth: usize,
+        converged: bool,
+    ) -> Verdict {
+        let t = limit.value;
+        let not_separating = |faces: Vec<FaceRef>| Verdict::Unverifiable {
+            regions: faces,
+            reason: UnverifiableReason::BoundNotSeparating {
+                lo: enclosure.lo(),
+                hi: enclosure.hi(),
+                limit: t,
+                refinement_depth,
+                converged,
+            },
+        };
+        if enclosure.hi() < t {
+            match crate::math::enclosure::Interval::point(t) {
+                Ok(limit_point) => {
+                    let margin = limit_point.sub(&enclosure);
+                    Verdict::Pass {
+                        margin: DfmValue::bounded_lower(
+                            &margin,
+                            method,
+                            refinement_depth,
+                            converged,
+                        ),
+                    }
+                }
+                // Non-finite limit: `hi < +∞` proves nothing about a real
+                // threshold — refuse with the bound, never fabricate.
+                Err(_) => not_separating(faces),
+            }
+        } else if enclosure.lo() > t {
+            Verdict::Violation {
+                witnesses: faces,
+                measured: DfmValue::bounded_lower(&enclosure, method, refinement_depth, converged),
+                limit,
+            }
+        } else {
+            not_separating(faces)
+        }
+    }
+
+    /// Dual of [`Verdict::from_bounded_max`] for a MIN-style rule ("the
+    /// value must stay above `limit`", e.g. a wall thickness floor):
+    /// `lo > limit` is the provable Pass (margin ≥ `lo − limit`),
+    /// `hi < limit` the provable Violation (value proven ≤ `hi`), and a
+    /// straddling enclosure is `Unverifiable` reporting the bound — the
+    /// same never-Pass-on-straddle rule, mirrored.
+    pub fn from_bounded_min(
+        enclosure: crate::math::enclosure::Interval,
+        limit: DfmValue,
+        faces: Vec<FaceRef>,
+        method: &str,
+        refinement_depth: usize,
+        converged: bool,
+    ) -> Verdict {
+        let t = limit.value;
+        let not_separating = |faces: Vec<FaceRef>| Verdict::Unverifiable {
+            regions: faces,
+            reason: UnverifiableReason::BoundNotSeparating {
+                lo: enclosure.lo(),
+                hi: enclosure.hi(),
+                limit: t,
+                refinement_depth,
+                converged,
+            },
+        };
+        if enclosure.lo() > t {
+            match crate::math::enclosure::Interval::point(t) {
+                Ok(limit_point) => {
+                    let margin = enclosure.sub(&limit_point);
+                    Verdict::Pass {
+                        margin: DfmValue::bounded_lower(
+                            &margin,
+                            method,
+                            refinement_depth,
+                            converged,
+                        ),
+                    }
+                }
+                Err(_) => not_separating(faces),
+            }
+        } else if enclosure.hi() < t {
+            Verdict::Violation {
+                witnesses: faces,
+                measured: DfmValue::bounded_upper(&enclosure, method, refinement_depth, converged),
+                limit,
+            }
+        } else {
+            not_separating(faces)
+        }
+    }
 }
 
 /// One rule's certified outcome (spec §3.2 `Rule` / §3.3 `RuleVerdict`).
@@ -905,6 +1135,364 @@ mod tests {
         assert_ne!(
             json, standard_json,
             "ShopPractice and Standard provenance must not collapse to the same wire shape"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // F1: the bounded honesty fold (freeform coverage spec §3 / F1)
+    // ------------------------------------------------------------------
+
+    use crate::math::enclosure::Interval;
+
+    fn limit_at(t: f64) -> DfmValue {
+        DfmValue::new(t, analytic("test fixture limit"))
+    }
+
+    fn interval(lo: f64, hi: f64) -> Interval {
+        Interval::enclosing(lo, hi).expect("test fixture interval")
+    }
+
+    #[test]
+    fn bounded_max_whole_interval_below_limit_is_provable_pass_with_margin() {
+        let v = Verdict::from_bounded_max(
+            interval(40.0, 44.0),
+            limit_at(45.0),
+            vec![3],
+            "normal-cone overhang enclosure",
+            7,
+            true,
+        );
+        match v {
+            Verdict::Pass { margin } => {
+                // Proven margin: limit − hi = 1.0, outward-rounded DOWN —
+                // never optimistic.
+                assert!(margin.value <= 1.0 && margin.value >= 1.0 - 1e-9);
+                let bound = margin.bound.expect("bounded margin carries its enclosure");
+                assert!(bound.lo <= 1.0 && bound.hi >= 5.0 - 1e-9);
+                match margin.derivation {
+                    Derivation::BoundedAnalytic {
+                        refinement_depth,
+                        converged,
+                        ..
+                    } => {
+                        assert_eq!(refinement_depth, 7);
+                        assert!(converged);
+                    }
+                    other => panic!("expected BoundedAnalytic, got {other:?}"),
+                }
+            }
+            other => panic!("expected Pass, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bounded_max_whole_interval_above_limit_is_provable_violation() {
+        let v = Verdict::from_bounded_max(
+            interval(46.0, 48.0),
+            limit_at(45.0),
+            vec![3, 9],
+            "normal-cone overhang enclosure",
+            12,
+            false,
+        );
+        match v {
+            Verdict::Violation {
+                witnesses,
+                measured,
+                limit,
+            } => {
+                assert_eq!(witnesses, vec![3, 9]);
+                // Reported value is the PROVEN floor: at least lo = 46.
+                assert_eq!(measured.value, 46.0);
+                assert_eq!(measured.bound, Some(DfmBound { lo: 46.0, hi: 48.0 }));
+                assert_eq!(limit.value, 45.0);
+            }
+            other => panic!("expected Violation, got {other:?}"),
+        }
+    }
+
+    /// THE HEADLINE F1 TEST — the spec's own worked example: the value is
+    /// in [44.6°, 45.9°], the limit is 45°, the budget refined to depth 12
+    /// and could not separate them. The only honest verdict is
+    /// `Unverifiable` REPORTING THE BOUND.
+    #[test]
+    fn bounded_max_straddling_interval_is_unverifiable_reporting_the_bound() {
+        let v = Verdict::from_bounded_max(
+            interval(44.6, 45.9),
+            limit_at(45.0),
+            vec![5],
+            "normal-cone overhang enclosure",
+            12,
+            false,
+        );
+        match v {
+            Verdict::Unverifiable { regions, reason } => {
+                assert_eq!(regions, vec![5]);
+                match reason {
+                    UnverifiableReason::BoundNotSeparating {
+                        lo,
+                        hi,
+                        limit,
+                        refinement_depth,
+                        converged,
+                    } => {
+                        assert_eq!((lo, hi, limit), (44.6, 45.9, 45.0));
+                        assert_eq!(refinement_depth, 12);
+                        assert!(!converged);
+                    }
+                    other => panic!("expected BoundNotSeparating, got {other:?}"),
+                }
+            }
+            other => panic!("expected Unverifiable, got {other:?}"),
+        }
+    }
+
+    /// Wrong-on-purpose mutants of the fold, mirroring `orientation.rs`'s
+    /// mutation-proof idiom: deciding the pass check from the enclosure's
+    /// LOWER endpoint (a "sampled extreme" — the exact grid-sampling
+    /// defect class) or from the MIDPOINT. Both are shown, with raw
+    /// numbers, to fabricate a Pass on a straddling enclosure where the
+    /// real fold refuses — so the never-Pass-on-straddle rule is
+    /// falsifiable, not just asserted in prose.
+    fn mutant_pass_check_from_lower_endpoint(enclosure: &Interval, t: f64) -> bool {
+        enclosure.lo() < t // BUG: a lower bound proves nothing about the max
+    }
+
+    fn mutant_pass_check_from_midpoint(enclosure: &Interval, t: f64) -> bool {
+        0.5 * (enclosure.lo() + enclosure.hi()) < t // BUG: the spec's forbidden fallback
+    }
+
+    #[test]
+    fn mutation_proof_straddling_interval_can_never_pass() {
+        let straddling = [
+            interval(44.0, 46.0), // limit strictly inside
+            interval(44.6, 45.9), // the spec's worked example
+            interval(45.0, 45.5), // lo touches the limit
+            interval(44.0, 45.0), // hi touches the limit
+            interval(45.0, 45.0), // degenerate exact hit
+        ];
+        for e in &straddling {
+            // BEFORE (mutants): both wrong folds claim Pass for at least
+            // the interior-straddle cases.
+            if e.lo() < 45.0 {
+                assert!(
+                    mutant_pass_check_from_lower_endpoint(e, 45.0),
+                    "the lower-endpoint mutant fabricates a Pass on [{}, {}]",
+                    e.lo(),
+                    e.hi()
+                );
+            }
+            // AFTER (production): the real fold NEVER passes a straddler.
+            let v = Verdict::from_bounded_max(
+                *e,
+                limit_at(45.0),
+                vec![1],
+                "mutation-proof fixture",
+                3,
+                false,
+            );
+            assert!(
+                !matches!(v, Verdict::Pass { .. }),
+                "a straddling enclosure [{}, {}] must never fold to Pass, got {v:?}",
+                e.lo(),
+                e.hi()
+            );
+            assert!(
+                matches!(
+                    v,
+                    Verdict::Unverifiable {
+                        reason: UnverifiableReason::BoundNotSeparating { .. },
+                        ..
+                    }
+                ),
+                "a straddling enclosure must refuse REPORTING THE BOUND, got {v:?}"
+            );
+        }
+        // Raw divergence, lower-endpoint mutant: [44, 46] vs 45 — the
+        // sampled "extreme" 44 reads as passing while the true max may be
+        // anywhere up to 46.
+        let e = interval(44.0, 46.0);
+        assert!(mutant_pass_check_from_lower_endpoint(&e, 45.0));
+        // Raw divergence, midpoint mutant: [43, 46] vs 45 — midpoint 44.5
+        // reads as passing while the enclosure straddles the limit.
+        let e_mid = interval(43.0, 46.0);
+        assert!(mutant_pass_check_from_midpoint(&e_mid, 45.0));
+        for straddler in [e, e_mid] {
+            let real = Verdict::from_bounded_max(
+                straddler,
+                limit_at(45.0),
+                vec![1],
+                "mutation-proof fixture",
+                3,
+                false,
+            );
+            assert!(
+                matches!(real, Verdict::Unverifiable { .. }),
+                "a mutant says Pass where the sound fold refuses — the honesty rule is \
+                 load-bearing, not decorative"
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_min_fold_mirrors_the_same_honesty_rule() {
+        // Pass: whole interval above the floor.
+        let pass = Verdict::from_bounded_min(
+            interval(1.0, 1.4),
+            limit_at(0.8),
+            vec![2],
+            "pair-thickness enclosure",
+            4,
+            true,
+        );
+        match pass {
+            Verdict::Pass { margin } => {
+                // Proven margin: lo − limit = 0.2, outward-rounded down.
+                assert!(margin.value <= 0.2 && margin.value >= 0.2 - 1e-9);
+            }
+            other => panic!("expected Pass, got {other:?}"),
+        }
+        // Violation: whole interval below the floor; measured is the
+        // proven CEILING (value at most hi).
+        let violation = Verdict::from_bounded_min(
+            interval(0.3, 0.5),
+            limit_at(0.8),
+            vec![2],
+            "pair-thickness enclosure",
+            4,
+            true,
+        );
+        match violation {
+            Verdict::Violation { measured, .. } => {
+                assert_eq!(measured.value, 0.5);
+                assert_eq!(measured.bound, Some(DfmBound { lo: 0.3, hi: 0.5 }));
+            }
+            other => panic!("expected Violation, got {other:?}"),
+        }
+        // Straddle (including boundary touches): never Pass.
+        for e in [interval(0.5, 1.0), interval(0.8, 0.9), interval(0.7, 0.8)] {
+            let v = Verdict::from_bounded_min(
+                e,
+                limit_at(0.8),
+                vec![2],
+                "pair-thickness enclosure",
+                4,
+                false,
+            );
+            assert!(
+                matches!(
+                    v,
+                    Verdict::Unverifiable {
+                        reason: UnverifiableReason::BoundNotSeparating { .. },
+                        ..
+                    }
+                ),
+                "min-fold straddle [{}, {}] must refuse reporting the bound, got {v:?}",
+                e.lo(),
+                e.hi()
+            );
+        }
+    }
+
+    /// A straddling bounded rule feeds the S1 pack fold exactly like any
+    /// other refusal: the report reads `Inconclusive`, never `Pass` — F1's
+    /// three-way semantics compose with the existing honesty theorem
+    /// instead of bypassing it.
+    #[test]
+    fn bounded_straddle_forces_inconclusive_through_the_s1_fold() {
+        let straddle_verdict = RuleVerdict {
+            rule: "fdm.overhang".to_string(),
+            verdict: Verdict::from_bounded_max(
+                interval(44.6, 45.9),
+                limit_at(45.0),
+                vec![5],
+                "normal-cone overhang enclosure",
+                12,
+                false,
+            ),
+            provenance: shop_practice("test fixture"),
+        };
+        let report = DfmReport::new(fdm_params(), vec![pass("fdm.min_wall"), straddle_verdict]);
+        assert_eq!(
+            report.summary(),
+            DfmSummary::Inconclusive { unverifiable: 1 }
+        );
+        assert_ne!(report.summary(), DfmSummary::Pass);
+    }
+
+    #[test]
+    fn bounded_value_and_reason_serde_round_trip_with_wire_tags() {
+        let verdict = Verdict::from_bounded_max(
+            interval(44.6, 45.9),
+            limit_at(45.0),
+            vec![5],
+            "normal-cone overhang enclosure",
+            12,
+            false,
+        );
+        let json = serde_json::to_string(&verdict).expect("serialize");
+        assert!(
+            json.contains("\"kind\":\"bound_not_separating\""),
+            "wire tag for the bound-reporting refusal: {json}"
+        );
+        let back: Verdict = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(verdict, back);
+
+        let pass = Verdict::from_bounded_max(
+            interval(40.0, 44.0),
+            limit_at(45.0),
+            vec![3],
+            "normal-cone overhang enclosure",
+            7,
+            true,
+        );
+        let pass_json = serde_json::to_string(&pass).expect("serialize");
+        assert!(
+            pass_json.contains("\"kind\":\"bounded_analytic\""),
+            "wire tag for the bounded derivation: {pass_json}"
+        );
+        assert!(
+            pass_json.contains("\"bound\":"),
+            "a bounded value carries its enclosure on the wire: {pass_json}"
+        );
+        // serde_json WITHOUT the `float_roundtrip` feature (the workspace
+        // default) uses a fast, up-to-1-ulp-lossy float parser: the
+        // outward-rounded margin lo `0.9999999999999999` re-parses as
+        // `1.0`. Exact equality would therefore test the JSON library,
+        // not this module — assert structure exactly and floats to 1 ulp.
+        // The DFM wire contract treats these as measurements, and a 1-ulp
+        // perturbation of an already-outward-rounded endpoint stays within
+        // the reported provenance.
+        let pass_back: Verdict = serde_json::from_str(&pass_json).expect("deserialize");
+        match (&pass, &pass_back) {
+            (Verdict::Pass { margin: a }, Verdict::Pass { margin: b }) => {
+                assert_eq!(a.derivation, b.derivation);
+                assert!((a.value - b.value).abs() <= f64::EPSILON * 2.0);
+                let (ab, bb) = (
+                    a.bound.expect("bounded margin"),
+                    b.bound.expect("bounded margin"),
+                );
+                assert!((ab.lo - bb.lo).abs() <= f64::EPSILON * 2.0);
+                assert!((ab.hi - bb.hi).abs() <= f64::EPSILON * 16.0);
+            }
+            other => panic!("expected Pass on both sides of the round trip, got {other:?}"),
+        }
+    }
+
+    /// Pre-F1 wire compatibility: a legacy `DfmValue` JSON without the
+    /// `bound` field still deserializes (`bound: None`), and classic
+    /// values serialize without the field at all — no existing consumer
+    /// sees a shape change.
+    #[test]
+    fn legacy_dfm_value_wire_shape_is_unchanged() {
+        let legacy = "{\"value\":1.5,\"derivation\":{\"kind\":\"analytic\",\
+                      \"surface_type\":\"plane\",\"method\":\"m\"}}";
+        let v: DfmValue = serde_json::from_str(legacy).expect("legacy deserializes");
+        assert_eq!(v.bound, None);
+        let json = serde_json::to_string(&DfmValue::new(1.5, analytic("m"))).expect("serialize");
+        assert!(
+            !json.contains("bound"),
+            "classic values must not grow a wire field: {json}"
         );
     }
 }

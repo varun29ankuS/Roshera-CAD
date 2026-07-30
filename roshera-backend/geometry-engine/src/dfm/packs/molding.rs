@@ -90,14 +90,26 @@ fn as_draft_derivation(inner: Derivation) -> Derivation {
             surface_type,
             method: format!("{method}; mold.draft reads draft angle = |θ − 90°|"),
         },
+        // Freeform F1: a bounded derivation re-tags the same way — the
+        // linear conversion preserves the enclosure's provenance fields.
+        Derivation::BoundedAnalytic {
+            method,
+            refinement_depth,
+            converged,
+        } => Derivation::BoundedAnalytic {
+            method: format!("{method}; mold.draft reads draft angle = |θ − 90°|"),
+            refinement_depth,
+            converged,
+        },
     }
 }
 
 /// See [`crate::dfm::packs::fdm::evaluate_overhang`]'s twin for why a
 /// fixed pack-configured constant (here, `min_draft_deg` itself) is still
 /// wrapped in `Derivation::Analytic` — the existing in-tree precedent
-/// (`report.rs` test fixtures) for tagging a non-geometric constant, since
-/// `Derivation` has no other variant yet.
+/// (`report.rs` test fixtures) for tagging a non-geometric constant
+/// (`Derivation::BoundedAnalytic`, added by freeform F1, is reserved for
+/// enclosure-derived numbers, which a fixed constant is not).
 fn constant_derivation(method: &str) -> Derivation {
     Derivation::Analytic {
         surface_type: SurfaceKind::Plane,
