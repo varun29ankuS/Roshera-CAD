@@ -13,16 +13,27 @@
  *
  * The kernel certifies soundness, measures the bounding box, reads analytic
  * feature dimensions, integrates volume, and counts parts — so those are scored
- * here, exactly and only. The spec's headline requirement — first natural
+ * here, exactly and only. As of DFM spec S1-S6 it can ALSO run exact-or-refuse
+ * printability rules off the analytic B-Rep: overhang (`fdm.overhang`, > 45°
+ * from vertical — matches this spec's own figure exactly) and wall thickness
+ * (`fdm.min_wall`, ≥ 2× nozzle diameter — the kernel's generic DFM floor, 0.8 mm
+ * at the documented 0.4 mm default) are now scored, off a REAL `DfmReport`,
+ * the same way scenario 16 scores them. `fdm.min_wall`'s threshold is a FIXED
+ * shop-practice constant, not a per-part parameter, so it verifies only the
+ * generic floor — NOT this spec's stricter, use-case-specific figure ("walls ≥
+ * 1.6 mm / 4 perimeters", chosen for vibration robustness). That stricter
+ * figure is a genuinely DIFFERENT, unscored question and stays declared as
+ * such (see `unscored_criteria`); the generic floor is never silently
+ * substituted for it. The spec's headline requirement — first natural
  * frequency f₁ ≥ 120 Hz with the 350 g motor attached — is a MODAL analysis the
- * kernel does not perform; so are the static-stress, deflection, wall-thickness,
- * overhang/support, orientation, and thermal gates. None is silently dropped and
- * none is fake-scored: each is declared in `unscored_criteria` below with the
- * reason it is out of scope. The scored subset is exactly the honestly
- * verifiable subset. Scoring the frozen INTERFACES (the 4×M3 + 22 mm boss motor
- * register and the 2×M5 frame provision) is precisely what a geometry kernel CAN
- * ground truth — and getting the interface wrong is the failure that makes a
- * mount unbuildable regardless of how well it would have simulated.
+ * kernel does not perform; so are the static-stress, deflection, support-
+ * volume, orientation, and thermal gates. None is silently dropped and none is
+ * fake-scored: each is declared in `unscored_criteria` below with the reason
+ * it is out of scope. The scored subset is exactly the honestly verifiable
+ * subset. Scoring the frozen INTERFACES (the 4×M3 + 22 mm boss motor register
+ * and the 2×M5 frame provision) is precisely what a geometry kernel CAN ground
+ * truth — and getting the interface wrong is the failure that makes a mount
+ * unbuildable regardless of how well it would have simulated.
  *
  * # Why the oracle is a separate pure function
  *
@@ -100,11 +111,24 @@ function fitsEnvelope(dims, envelope) {
   return d.every((x, i) => x <= e[i] + 1e-6);
 }
 
+/** Look up one rule's verdict inside a `DfmReport` by its stable rule id
+ *  (e.g. "fdm.min_wall"). Returns `null` when the report is missing or the
+ *  rule is absent — the caller must treat that as "not verified", never as a
+ *  silent pass (mirrors `DfmReport`'s own honesty fold; scenario 16 uses the
+ *  identical helper). */
+function dfmVerdict(dfm, ruleId) {
+  const verdicts = Array.isArray(dfm?.verdicts) ? dfm.verdicts : [];
+  const rv = verdicts.find((v) => v?.rule === ruleId);
+  return rv?.verdict ?? null;
+}
+
 /**
  * The PURE scoring oracle. No I/O, no client — so it can be validated dry.
  *
  * @param t  the harness `Checks` collector
- * @param d  the transcript: { steps:[{name,per}], final, features, partCount }
+ * @param d  the transcript: { steps:[{name,per}], final, features, partCount, dfm }
+ *           `dfm` is the kernel's `DfmReport` (JSON, verbatim) for the FDM
+ *           pack run against the final part.
  */
 export function oracle(t, d) {
   const steps = Array.isArray(d.steps) ? d.steps : [];
@@ -182,10 +206,31 @@ export function oracle(t, d) {
     { dim: "correctness", detail: `diameters=${m5.map((b) => (b.radius * 2).toFixed(2)).join(",")}` },
   );
 
-  // ── 8. Single-piece topology: exactly one solid remains ──────────────
+  // ── 8. DFM wall thickness: fdm.min_wall (generic floor, ≥ 2× nozzle) ──
+  //      Kernel-computed, exact-or-refuse (dfm/ subsystem spec S3/S6). Scores
+  //      the kernel's generic printability floor only — NOT the spec's
+  //      stricter 1.6 mm / 4-perimeter figure, which stays declared unscored
+  //      (see `unscored_criteria`; module docs explain why they differ). A
+  //      rule that came back "unverifiable" is NOT a pass.
+  const minWall = dfmVerdict(d.dfm, "fdm.min_wall");
+  t.ok(
+    "wall thickness is >= 2x nozzle diameter everywhere (fdm.min_wall, DFM-verified)",
+    minWall?.kind === "pass",
+    { dim: "correctness", detail: `fdm.min_wall verdict=${minWall?.kind ?? "missing"}` },
+  );
+
+  // ── 9. DFM overhang: fdm.overhang (no unsupported face > 45° from vertical) ──
+  const overhang = dfmVerdict(d.dfm, "fdm.overhang");
+  t.ok(
+    "no overhang exceeds 45 degrees from vertical (fdm.overhang, DFM-verified)",
+    overhang?.kind === "pass",
+    { dim: "correctness", detail: `fdm.overhang verdict=${overhang?.kind ?? "missing"}` },
+  );
+
+  // ── 10. Single-piece topology: exactly one solid remains ─────────────
   t.eq("the mount is a single piece (one solid part)", d.partCount, 1, { dim: "correctness" });
 
-  // ── 9. Mass — the PRIMARY ranking metric (recorded, not a pass/fail) ──
+  // ── 11. Mass — the PRIMARY ranking metric (recorded, not a pass/fail) ──
   const volMm3 = Number(final.volume);
   const massG = volMm3 * PETG_DENSITY_G_PER_MM3;
   t.ok(
@@ -225,8 +270,8 @@ export default {
     { criterion: "first natural frequency (with 350 g motor attached) ≥ 120 Hz", spec_ref: "Part 2 §C/§D.8", reason: "pending external physics (modal / frequency-extraction) scoring bridge — the kernel performs no modal analysis; a lumped-mass eigen-solve is out of scope" },
     { criterion: "max von Mises stress ≤ 20 MPa (0.4 × printed-PETG ultimate) under the combined static load", spec_ref: "Part 2 §C/§D.2", reason: "pending external physics (FEA static) scoring bridge" },
     { criterion: "max deflection at the pulley plane ≤ 0.3 mm under the 40 N dynamic belt load", spec_ref: "Part 2 §C/§D.9", reason: "pending external physics (FEA static) scoring bridge" },
-    { criterion: "walls ≥ 1.6 mm (4 perimeters) everywhere", spec_ref: "Part 2 §D.3", reason: "pending printability analyzer — minimum-wall / thin-region extraction not implemented" },
-    { criterion: "unsupported overhangs > 45° require justification; support volume reported", spec_ref: "Part 2 §D.3", reason: "pending printability/slicer bridge — overhang and support estimation not implemented" },
+    { criterion: "walls ≥ 1.6 mm (4 perimeters) everywhere — stricter than the kernel's generic printability floor", spec_ref: "Part 2 §D.3", reason: "fdm.min_wall's threshold is a fixed shop-practice constant (2x nozzle diameter, 0.8 mm default) — DFM v1 has no per-part stricter-multiplier parameter, so it verifies only the generic floor (scored: 'wall thickness is >= 2x nozzle diameter everywhere'), not this part-specific 1.6 mm figure" },
+    { criterion: "support volume reported for any unsupported overhang", spec_ref: "Part 2 §D.3", reason: "fdm.support_volume needs the shadow-volume boolean sweep (DFM roadmap §7) — declared Unverifiable-by-design in DFM v1, not a callable rule; never fabricated" },
     { criterion: "print-orientation rule — no primary load path (belt/torque reaction) crossing layer interfaces in peel", spec_ref: "Part 2 §D.4", reason: "pending printability/anisotropy analyzer — layer direction vs load path is not modeled" },
     { criterion: "thermal: motor face at up to 60 °C sustained; contact geometry stated", spec_ref: "Part 2 §D.10", reason: "pending thermal-structural scoring bridge — no thermal model in the kernel" },
     { criterion: "assembly access — T-nut and M3 tool paths reachable in the assembled orientation", spec_ref: "Part 2 §D.6", reason: "pending assembly/reachability analyzer — tool-access swept volume not modeled" },
@@ -325,6 +370,20 @@ export default {
     const features = (await c.get(`/api/agent/parts/${id}/features`)).features ?? [];
     const partCount = (await c.listParts()).length;
 
-    oracle(t, { steps, final, features, partCount });
+    // ── DFM: fdm.min_wall + fdm.overhang, kernel-computed (dfm/ subsystem) ──
+    // `c.raw` (not `c.post`), which does NOT throw on a non-2xx: a 422 is a
+    // legitimate kernel refusal (DfmError), not a transport failure. Throwing
+    // here would crash the WHOLE scenario run and lose every other check
+    // (envelope, bores, mass) over a refusal that only concerns two of many
+    // criteria. `dfm` stays `null` on refusal; `dfmVerdict` already treats a
+    // missing report as "not verified", never a silent pass.
+    const dfmResp = await ctx.time("dfm check (fdm pack, 0.4mm nozzle, +Z build)", () =>
+      c.raw("POST", `/api/agent/parts/${id}/dfm`, {
+        pack: "fdm", nozzle_diameter: 0.4, build_direction: [0, 0, 1],
+      }),
+    );
+    const dfm = dfmResp.ok ? dfmResp.data : null;
+
+    oracle(t, { steps, final, features, partCount, dfm });
   },
 };

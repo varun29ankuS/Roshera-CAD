@@ -1406,6 +1406,25 @@ fn raw_tools() -> Vec<ToolSpec> {
             }),
         ),
         t(
+            "dfm_check",
+            Analysis,
+            Experimental,
+            Curated,
+            "Run a DFM (design-for-manufacturability) rule pack against a part: exact-or-refuse printability rules (fdm.min_wall >= 2x nozzle diameter, fdm.overhang > 45 deg from vertical) off the analytic B-Rep. Returns the kernel's own DfmReport verbatim -- never a fabricated pass; a rule that could not be checked reports 'unverifiable', never 'pass'.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "part_id": {"type": "integer", "description": "kernel part id from list_parts"},
+                    "pack": {"type": "string", "enum": ["fdm", "injection_molding"], "description": "which rule pack to evaluate"},
+                    "nozzle_diameter": {"type": "number", "description": "fdm pack only; mm, default 0.4"},
+                    "build_direction": {"type": "array", "items": {"type": "number"}, "minItems": 3, "maxItems": 3, "description": "fdm pack only; unit build-up direction, default [0,0,1]"},
+                    "pull_direction": {"type": "array", "items": {"type": "number"}, "minItems": 3, "maxItems": 3, "description": "injection_molding pack only; unit mold-pull direction, default [0,0,1]"},
+                    "min_draft_deg": {"type": "number", "description": "injection_molding pack only; minimum draft angle in degrees, default 1.0"}
+                },
+                "required": ["part_id", "pack"]
+            }),
+        ),
+        t(
             "ground_truth",
             Analysis,
             Stable,
@@ -1799,7 +1818,11 @@ mod tests {
                 spec.name
             );
         }
-        assert_eq!(tools.len(), 90, "expected 90 tools, got {}", tools.len());
+        // 91: DFM S6/S7 added "dfm_check" (Analysis / Experimental / Curated) —
+        // the kernel-served registry entry mirroring roshera-mcp's new
+        // `dfm_check` tool (src/tools/inspect.ts) and REST route
+        // POST /api/agent/parts/{id}/dfm.
+        assert_eq!(tools.len(), 91, "expected 91 tools, got {}", tools.len());
     }
 
     /// The kernel-sourced rows correspond to operations actually registered in

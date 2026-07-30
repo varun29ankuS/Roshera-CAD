@@ -9207,6 +9207,13 @@ pub(crate) fn build_router(state: AppState) -> Router {
             "/api/agent/parts/{id}/features",
             get(handlers::agent::part_features),
         )
+        // DFM (design-for-manufacturability) — spec S6/S7: runs a rule pack
+        // (`fdm` | `injection_molding`) against a solid and returns the
+        // kernel's own `DfmReport` verbatim (dfm/ subsystem module docs).
+        .route(
+            "/api/agent/parts/{id}/dfm",
+            post(handlers::agent::part_dfm_check),
+        )
         .route(
             "/api/agent/parts/{id}/perception",
             get(handlers::agent::part_perception),

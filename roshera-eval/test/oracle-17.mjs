@@ -5,9 +5,12 @@
  * Runs NO backend. Feeds the pure oracle an honest transcript and
  * single-mutation lies, proving it tells them apart. Also asserts the
  * HONESTY-BY-OMISSION contract: the spec's unscoreable criteria — headlined by
- * the f₁ ≥ 120 Hz modal requirement, plus stress, deflection, wall thickness,
- * overhang, orientation, thermal — are DECLARED in `unscored_criteria`, never
- * silently scored.
+ * the f₁ ≥ 120 Hz modal requirement, plus stress, deflection, the stricter
+ * 1.6 mm / 4-perimeter wall figure, support volume, orientation, thermal —
+ * are DECLARED in `unscored_criteria`, never silently scored. Wall thickness
+ * (generic 2x-nozzle floor) and overhang (> 45°) moved to the SCORED subset
+ * in DFM S6/S7 (fdm.min_wall / fdm.overhang, checks 8-9 below) — this test
+ * also proves those two catch a real violation and a missing DFM report.
  *
  * Usage: node test/oracle-17.mjs   (exit 0 = the oracle discriminates)
  */
@@ -22,6 +25,37 @@ const sound = (over = {}) => ({
 
 const SQ = 15.5; // half the 31 mm bolt square
 const CZ = 31; // motor pattern center Z
+
+/** A minimal, honest DfmReport-shaped fixture — mirrors `test/oracle-16.mjs`'s
+ *  own fixture exactly (same wire shape, same rule ids this oracle reads). */
+function dfmPass(rule) {
+  return {
+    rule,
+    verdict: {
+      kind: "pass",
+      margin: { value: 4.2, derivation: { kind: "analytic", surface_type: "plane", method: "test fixture" } },
+    },
+    provenance: { kind: "shop_practice", note: "test fixture" },
+  };
+}
+function dfmReport() {
+  return {
+    pack: "fdm",
+    params: { pack: "fdm", nozzle_diameter: 0.4, build_direction: [0, 0, 1] },
+    verdicts: [dfmPass("fdm.min_wall"), dfmPass("fdm.overhang")],
+    summary: { kind: "pass" },
+  };
+}
+const dfmViolation = (rule, measured, limit) => ({
+  rule,
+  verdict: {
+    kind: "violation",
+    witnesses: [1, 2],
+    measured: { value: measured, derivation: { kind: "analytic", surface_type: "plane", method: "test fixture" } },
+    limit: { value: limit, derivation: { kind: "analytic", surface_type: "plane", method: "test fixture" } },
+  },
+  provenance: { kind: "shop_practice", note: "test fixture" },
+});
 
 /** An honestly-built reference mount: 4×M3 square + Ø22 boss + 2×M5 frame. */
 function honest() {
@@ -53,6 +87,7 @@ function honest() {
       { face_id: 8, surface_kind: "cylinder", radius: 2.5, diameter: 5, axis: [0, 0, 1], origin: [45, 0, 4] },
     ],
     partCount: 1,
+    dfm: dfmReport(),
   };
 }
 
@@ -97,14 +132,40 @@ const LIES = [
     mutate: (d) => { d.partCount = 2; },
   },
   {
+    name: "wall thickness is below the 2x-nozzle floor (fdm.min_wall violates)",
+    mutate: (d) => {
+      d.dfm.verdicts = d.dfm.verdicts.map((v) =>
+        v.rule === "fdm.min_wall" ? dfmViolation("fdm.min_wall", 0.3, 0.8) : v,
+      );
+    },
+  },
+  {
+    name: "an overhang exceeds 45 degrees from vertical (fdm.overhang violates)",
+    mutate: (d) => {
+      d.dfm.verdicts = d.dfm.verdicts.map((v) =>
+        v.rule === "fdm.overhang" ? dfmViolation("fdm.overhang", 60, 45) : v,
+      );
+    },
+  },
+  {
+    name: "the DFM report is missing entirely (must NOT be silently treated as a pass)",
+    mutate: (d) => { d.dfm = null; },
+  },
+  {
     name: "a broken build reports zero volume (mass metric non-physical)",
     mutate: (d) => { d.final.volume = 0; },
   },
 ];
 
 /** The spec criteria this kernel cannot score — must be DECLARED, not scored.
- *  f₁ (modal) is the headline requirement and the first thing that must appear. */
-const MUST_DECLARE = [/natural frequency|f₁|modal|120 hz/i, /von mises|stress/i, /deflection/i, /wall/i, /overhang|support/i, /orientation/i, /thermal|60 ?°?c/i];
+ *  f₁ (modal) is the headline requirement and the first thing that must appear.
+ *  `overhang` is DELIBERATELY excluded: DFM S6 moved it to the scored subset
+ *  (fdm.overhang, check 9 above), same as scenario 16. `wall` is narrowed to
+ *  the 1.6 mm / 4-perimeter DELTA only — the kernel's generic 2x-nozzle floor
+ *  IS scored (fdm.min_wall, check 8), but the spec's stricter part-specific
+ *  figure genuinely is not (module docs explain why they differ); a bare
+ *  `/wall/i` would wrongly flag the scored check's own name below as a leak. */
+const MUST_DECLARE = [/natural frequency|f₁|modal|120 hz/i, /von mises|stress/i, /deflection/i, /1\.6 ?mm|4 perimeters/i, /support volume/i, /orientation/i, /thermal|60 ?°?c/i];
 
 function main() {
   let failures = 0;

@@ -785,6 +785,58 @@ mod tests {
         assert_eq!(report, back);
     }
 
+    /// Pins the EXACT wire substrings `roshera-eval`'s scenario 16/17 oracles
+    /// depend on (`scenarios/16-shelf-bracket.mjs` / `17-nema17-motor-mount.mjs`,
+    /// via each file's `dfmVerdict(dfm, ruleId)` helper reading
+    /// `dfm.verdicts[].rule` and `.verdict.kind`, and the top-level `summary`
+    /// field). Those oracles are hand-authored JS fixtures that infer this
+    /// shape from `#[serde(...)]` attributes read at review time — never
+    /// exercised against a live serialize until this test. If a future
+    /// refactor renames the `rule` field, the `kind` tag, or the `verdicts`/
+    /// `summary` keys, THIS test fails loudly in the crate the rename
+    /// happened in, instead of the eval harness silently reporting every
+    /// DFM-scored criterion as "missing" (`dfmVerdict` returns `null` on any
+    /// lookup miss, which reads as a geometry regression, not a wiring
+    /// break — see `dfm/mod.rs`'s S6/S7 module docs).
+    #[test]
+    fn dfm_report_wire_shape_matches_eval_oracle_expectations() {
+        let report = DfmReport::new(
+            fdm_params(),
+            vec![pass("fdm.min_wall"), pass("fdm.overhang")],
+        );
+        let json = serde_json::to_string(&report).expect("serialize DfmReport");
+
+        assert!(
+            json.contains("\"rule\":\"fdm.min_wall\""),
+            "eval oracle reads verdicts[].rule == \"fdm.min_wall\" verbatim: {json}"
+        );
+        assert!(
+            json.contains("\"rule\":\"fdm.overhang\""),
+            "eval oracle reads verdicts[].rule == \"fdm.overhang\" verbatim: {json}"
+        );
+        assert!(
+            json.contains("\"kind\":\"pass\""),
+            "eval oracle reads verdict.kind == \"pass\" | \"violation\" | \"unverifiable\": {json}"
+        );
+        assert!(
+            json.contains("\"verdicts\":["),
+            "eval oracle reads the top-level `verdicts` array verbatim: {json}"
+        );
+        assert!(
+            json.contains("\"summary\":"),
+            "eval oracle's dfm field carries `summary` alongside `verdicts` (DfmReport::new's honesty fold): {json}"
+        );
+
+        // And the violation/unverifiable tags an eval LIE mutates to prove
+        // the oracle catches a real defect (test/oracle-16.mjs, test/oracle-17.mjs).
+        let violating = DfmReport::new(fdm_params(), vec![violation("fdm.min_wall")]);
+        let violating_json = serde_json::to_string(&violating).expect("serialize DfmReport");
+        assert!(
+            violating_json.contains("\"kind\":\"violation\""),
+            "eval LIE fixtures construct a violation verdict with this exact tag: {violating_json}"
+        );
+    }
+
     #[test]
     fn dfm_fact_serde_round_trip() {
         let report = DfmReport::new(

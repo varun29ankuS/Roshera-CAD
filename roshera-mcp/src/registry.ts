@@ -145,6 +145,7 @@ const EXPERIMENTAL = new Set<string>([
   "assembly_interference",
   "drawing_read_semantics",
   "drawing_query",
+  "dfm_check",
 ]);
 
 const BENCH_OF: Record<string, Bench> = {
@@ -230,6 +231,7 @@ const BENCH_OF: Record<string, Bench> = {
   part_coverage: "analysis",
   part_distance: "analysis",
   part_features: "analysis",
+  dfm_check: "analysis",
   ground_truth: "analysis",
   measure_faces: "analysis",
   verify_claim: "analysis",

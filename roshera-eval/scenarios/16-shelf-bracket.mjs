@@ -12,14 +12,22 @@
  *
  * The kernel is a geometry kernel. It can certify a solid's soundness, measure
  * its bounding box, read its analytic feature dimensions, integrate its volume,
- * and count its parts — so those are scored here, exactly and only. The spec's
- * PHYSICS gates (von Mises ≤ 20 MPa, deflection ≤ 2.0 mm), its PRINTABILITY
- * gates (wall thickness ≥ 2× nozzle, overhang > 45° justification, support
- * volume), and its ORIENTATION rule (root bending tension in the layer plane)
- * are NOT things this kernel can compute today. They are NOT silently dropped
- * and NOT fake-scored: every one is declared in `unscored_criteria` below with
- * the reason it is out of scope. The scored subset is exactly the honestly
- * verifiable subset — that discipline is the product's whole point.
+ * and count its parts — so those are scored here, exactly and only. As of DFM
+ * spec S1-S6 (`geometry-engine/src/dfm`), it can ALSO run exact-or-refuse
+ * printability rules straight off the analytic B-Rep: wall thickness
+ * (`fdm.min_wall`, ≥ 2× nozzle diameter) and overhang (`fdm.overhang`, > 45°
+ * from vertical). Those two PRINTABILITY gates are scored here now, off a REAL
+ * `DfmReport` returned by the kernel — never a fabricated pass, and never
+ * silently `Pass` when a rule comes back `Unverifiable` (the DFM honesty fold,
+ * `dfm::report` module docs). The spec's PHYSICS gates (von Mises ≤ 20 MPa,
+ * deflection ≤ 2.0 mm), support-volume estimation (needs the shadow-volume
+ * boolean sweep, DFM roadmap §7 — `fdm.support_volume` ships declared
+ * Unverifiable-by-design in v1, not a callable rule), and the ORIENTATION rule
+ * (root bending tension in the layer plane) are NOT things this kernel can
+ * compute today. They are NOT silently dropped and NOT fake-scored: every one
+ * is declared in `unscored_criteria` below with the reason it is out of scope.
+ * The scored subset is exactly the honestly verifiable subset — that
+ * discipline is the product's whole point.
  *
  * # Why the oracle is a separate pure function
  *
@@ -97,12 +105,25 @@ function fitsEnvelope(dims, envelope) {
   return d.every((x, i) => x <= e[i] + 1e-6);
 }
 
+/** Look up one rule's verdict inside a `DfmReport` by its stable rule id
+ *  (e.g. "fdm.min_wall"). Returns `null` when the report is missing or the
+ *  rule is absent — the caller must treat that as "not verified", never as a
+ *  silent pass (same honesty discipline `DfmReport`'s own fold applies). */
+function dfmVerdict(dfm, ruleId) {
+  const verdicts = Array.isArray(dfm?.verdicts) ? dfm.verdicts : [];
+  const rv = verdicts.find((v) => v?.rule === ruleId);
+  return rv?.verdict ?? null;
+}
+
 /**
  * The PURE scoring oracle. No I/O, no client — so it can be validated dry.
  *
  * @param t  the harness `Checks` collector
  * @param d  the transcript (see `run`, and `test/oracle-16.mjs` fixtures):
- *           { steps:[{name,per}], final, features, partCount }
+ *           { steps:[{name,per}], final, features, partCount, dfm }
+ *           `dfm` is the kernel's `DfmReport` (JSON, verbatim) for the FDM
+ *           pack run against the final part — `{ pack, params, verdicts, summary }`,
+ *           `verdicts[].verdict.kind` one of "pass" | "violation" | "unverifiable".
  */
 export function oracle(t, d) {
   const steps = Array.isArray(d.steps) ? d.steps : [];
@@ -162,10 +183,29 @@ export function oracle(t, d) {
     { dim: "correctness", detail: `z=${JSON.stringify(zs)} spacing=${(zs[1] - zs[0]).toFixed(2)}` },
   );
 
-  // ── 6. Single-piece topology: exactly one solid remains ──────────────
+  // ── 6. DFM wall thickness: fdm.min_wall (≥ 2× nozzle diameter) ────────
+  //      Kernel-computed, exact-or-refuse (dfm/ subsystem spec S3/S6). A rule
+  //      that came back "unverifiable" is NOT a pass — the same honesty fold
+  //      DfmReport itself applies (see dfmVerdict's own doc comment).
+  const minWall = dfmVerdict(d.dfm, "fdm.min_wall");
+  t.ok(
+    "wall thickness is >= 2x nozzle diameter everywhere (fdm.min_wall, DFM-verified)",
+    minWall?.kind === "pass",
+    { dim: "correctness", detail: `fdm.min_wall verdict=${minWall?.kind ?? "missing"}` },
+  );
+
+  // ── 7. DFM overhang: fdm.overhang (no unsupported face > 45° from vertical) ──
+  const overhang = dfmVerdict(d.dfm, "fdm.overhang");
+  t.ok(
+    "no overhang exceeds 45 degrees from vertical (fdm.overhang, DFM-verified)",
+    overhang?.kind === "pass",
+    { dim: "correctness", detail: `fdm.overhang verdict=${overhang?.kind ?? "missing"}` },
+  );
+
+  // ── 8. Single-piece topology: exactly one solid remains ──────────────
   t.eq("the bracket is a single piece (one solid part)", d.partCount, 1, { dim: "correctness" });
 
-  // ── 7. Mass — the PRIMARY ranking metric (recorded, not a pass/fail) ──
+  // ── 9. Mass — the PRIMARY ranking metric (recorded, not a pass/fail) ──
   //      Printed PLA mass from the kernel's ground-truth volume × documented
   //      density. Reported so the leaderboard can rank submissions; the value
   //      must be finite and positive (a zero/NaN volume is a broken build).
@@ -208,8 +248,7 @@ export default {
     { criterion: "max von Mises stress ≤ 20 MPa (0.4 × printed-PLA ultimate)", spec_ref: "Part 1 §C", reason: "pending external physics (FEA static) scoring bridge — the kernel does not run structural analysis" },
     { criterion: "max deflection at the load point ≤ 2.0 mm", spec_ref: "Part 1 §C", reason: "pending external physics (FEA static) scoring bridge" },
     { criterion: "print-orientation rule — root bending tension in the layer plane, no primary load path in peel", spec_ref: "Part 1 §B", reason: "pending printability/anisotropy analyzer — layer direction vs load path is not modeled by the kernel" },
-    { criterion: "wall thickness ≥ 2× nozzle (≥ 0.8 mm at 0.4 mm nozzle) everywhere", spec_ref: "Part 1 §C", reason: "pending printability analyzer — minimum-wall / thin-region extraction not implemented" },
-    { criterion: "overhangs > 45° only with stated justification; support volume reported", spec_ref: "Part 1 §C", reason: "pending printability/slicer bridge — overhang and support estimation not implemented" },
+    { criterion: "support volume reported for any unsupported overhang", spec_ref: "Part 1 §C", reason: "fdm.support_volume needs the shadow-volume boolean sweep (DFM roadmap §7) — declared Unverifiable-by-design in DFM v1, not a callable rule; never fabricated" },
     { criterion: "static simulation runtime ≤ 10 min on a laptop-class machine", spec_ref: "Part 1 §C", reason: "pending external physics scoring bridge — no simulation is run by the kernel" },
     { criterion: "fillets/chamfers present as load-dissipation features (no single point of failure)", spec_ref: "Part 1 §B/F", reason: "pending stress-concentration analyzer — geometric presence is detectable but its load-dissipation role requires FEA to score" },
   ],
@@ -277,6 +316,21 @@ export default {
     const features = (await c.get(`/api/agent/parts/${id}/features`)).features ?? [];
     const partCount = (await c.listParts()).length;
 
-    oracle(t, { steps, final, features, partCount });
+    // ── DFM: fdm.min_wall + fdm.overhang, kernel-computed (dfm/ subsystem) ──
+    // `c.raw` (not `c.post`), which does NOT throw on a non-2xx: a 422 is a
+    // legitimate kernel refusal (DfmError — e.g. an analyzer's soundness
+    // precondition failed), not a transport failure. Throwing here would
+    // crash the WHOLE scenario run and lose every other check (envelope,
+    // bores, mass) over a refusal that only concerns two of many criteria.
+    // `dfm` stays `null` on refusal; `dfmVerdict` already treats a missing
+    // report as "not verified", never a silent pass.
+    const dfmResp = await ctx.time("dfm check (fdm pack, 0.4mm nozzle, +Z build)", () =>
+      c.raw("POST", `/api/agent/parts/${id}/dfm`, {
+        pack: "fdm", nozzle_diameter: 0.4, build_direction: [0, 0, 1],
+      }),
+    );
+    const dfm = dfmResp.ok ? dfmResp.data : null;
+
+    oracle(t, { steps, final, features, partCount, dfm });
   },
 };
