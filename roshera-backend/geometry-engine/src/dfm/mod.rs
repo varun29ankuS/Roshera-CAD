@@ -2,11 +2,13 @@
 //! answer "can this exist?" with the same self-certifying honesty as "is
 //! this sound?" (spec: `Roshera-vault/Research/2026-07-28-dfm-subsystem-spec.md`).
 //!
-//! Today `ValidationResult::manufacturing_valid` is a hardcoded `bool`
-//! (`primitives/validation.rs`) — the exact "kernel can lie" shape this
-//! subsystem exists to kill. DFM turns the question into honest capability:
-//! every reported number carries its derivation, and every refusal is a
-//! typed value in the report, never a fabricated pass.
+//! `ValidationResult::manufacturing_valid` (`primitives/validation.rs`) was
+//! a hardcoded `bool` — the exact "kernel can lie" shape this subsystem
+//! exists to kill. Spec S6 (audit id H5) closed that: the field is now
+//! `Option<DfmSummary>`, `None` until a real DFM pack has actually run
+//! against the solid. DFM turns the question into honest capability: every
+//! reported number carries its derivation, and every refusal is a typed
+//! value in the report, never a fabricated pass.
 //!
 //! ## Slice S1: types only
 //!
@@ -55,7 +57,22 @@
 //! takes `(model, solid_id)` rather than `faces: &[FaceId]` + bare stores;
 //! see `analyzers/bore.rs`'s module docs for the full reasoning.
 //!
-//! Planned layout (spec §3), populated incrementally:
+//! ## Slice S6: `manufacturing_valid` Option swap (kills H5)
+//!
+//! `ValidationResult::manufacturing_valid: bool` → `Option<DfmSummary>`
+//! (spec §3.3/§6, audit id H5). Both construction sites in
+//! `primitives/validation.rs` (`validate_topology_parallel`'s per-solid
+//! loop and `combine_results`) now set `None`: `validate_model_enhanced`
+//! does not run DFM analysis, so `None` means NOT ASSESSED, never a
+//! fabricated pass. A caller that wants a real verdict runs a
+//! [`report::DfmReport`]-producing pack and attaches the resulting
+//! [`report::DfmSummary`] itself. [`report::DfmSummary`] now derives
+//! `Hash` so `Option<DfmSummary>` can be folded into
+//! `generate_signature`'s hand-rolled per-field hash the same way the
+//! `bool` it replaced was — `ValidationResult` itself derives only
+//! `Debug` and has no derived `Hash` impl. The certificate-riding
+//! [`report::DfmFact`] wiring (spec §6 step 4) is separate, later work; this
+//! slice is the Option swap only.
 //! ```text
 //! dfm/
 //!   mod.rs        — public surface: analyze(...) -> DfmReport      (later)

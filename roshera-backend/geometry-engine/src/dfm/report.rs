@@ -242,7 +242,15 @@ pub struct RuleVerdict {
 /// [`Verdict`] (see the module docs for the theorem). Never constructed
 /// directly by callers; only [`DfmReport::new`] produces one, from the
 /// verdicts it is given.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Derives `Hash` (on top of the `Eq` it already carries) so that
+/// `Option<DfmSummary>` — the type `ValidationResult::manufacturing_valid`
+/// became in spec S6 (kills H5, the hardcoded-`true` "kernel can lie" bug
+/// sibling to `geometry_valid`'s) — can itself be hashed by
+/// `validation.rs`'s `generate_signature`, which hashes every
+/// `ValidationResult` field by value rather than deriving `Hash` on the
+/// struct itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum DfmSummary {
     /// Every rule in the pack reported `Pass`.

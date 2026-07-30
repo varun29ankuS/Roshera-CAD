@@ -15,6 +15,7 @@
 //! used in nurbs.rs and other Rust numerical kernels.
 #![allow(clippy::indexing_slicing)]
 
+use crate::dfm::DfmSummary;
 use crate::math::{MathError, MathResult, Point3, Tolerance, Vector3};
 use crate::primitives::{
     edge::EdgeId,
@@ -70,10 +71,17 @@ pub struct ValidationResult {
     pub is_valid: bool,
     /// Topological validity
     pub topology_valid: bool,
-    /// Geometric validity  
+    /// Geometric validity
     pub geometry_valid: bool,
-    /// Manufacturing validity
-    pub manufacturing_valid: bool,
+    /// Manufacturing-for-a-process verdict. `None` means DFM was NOT
+    /// ASSESSED — validation does not run DFM analysis; a caller that wants
+    /// a real verdict invokes a DFM pack (`crate::dfm`) explicitly and gets
+    /// back a genuine [`DfmSummary`]. This was `bool`, hardcoded `true` at
+    /// every construction site — the same "kernel can lie" shape
+    /// `geometry_valid` used to have (see the B1 SCOPED PROMOTION comment
+    /// on `combine_results` below) — until spec S6 (audit id H5) replaced
+    /// the fabricated pass with an honest absence.
+    pub manufacturing_valid: Option<DfmSummary>,
     /// Detailed error messages
     pub errors: Vec<ValidationError>,
     /// Warning messages
@@ -497,7 +505,7 @@ impl ParallelValidator {
                         is_valid: errors.is_empty(),
                         topology_valid: errors.is_empty(),
                         geometry_valid: true,
-                        manufacturing_valid: true,
+                        manufacturing_valid: None,
                         errors,
                         warnings,
                         repairs: Vec::new(),
@@ -1065,7 +1073,7 @@ impl ParallelValidator {
             is_valid,
             topology_valid,
             geometry_valid,
-            manufacturing_valid: true,
+            manufacturing_valid: None,
             errors: all_errors,
             warnings: all_warnings,
             repairs: Vec::new(),
@@ -2986,6 +2994,66 @@ mod guard_wiring_gate {
         assert!(
             !result.is_valid,
             "a genuinely reversed face normal must fail the main validation sweep"
+        );
+    }
+}
+
+/// Spec S6 (audit id H5): `ValidationResult::manufacturing_valid` was a
+/// `bool` hardcoded `true` at both construction sites — the same "kernel can
+/// lie" shape `geometry_valid` used to have. It is now `Option<DfmSummary>`:
+/// `None` means DFM was never run (validation does not invoke DFM; a caller
+/// wanting a real verdict runs a pack explicitly via `crate::dfm`).
+#[cfg(test)]
+mod manufacturing_valid_option_gate {
+    use super::*;
+    use crate::dfm::DfmSummary;
+    use crate::primitives::topology_builder::{BRepModel, GeometryId, TopologyBuilder};
+
+    fn box_model() -> BRepModel {
+        let mut model = BRepModel::new();
+        let _ = TopologyBuilder::new(&mut model)
+            .create_box_3d(20.0, 14.0, 10.0)
+            .expect("box");
+        model
+    }
+
+    /// THE HEADLINE TEST for this slice: a freshly-validated solid — DFM was
+    /// never invoked — must report `manufacturing_valid == None`, never a
+    /// fabricated pass. Before this slice the field was `bool`, hardcoded
+    /// `true`; comparing that `bool` against `None` does not even type-check
+    /// (see the commit report for the verbatim compiler error this test
+    /// produced before the type swap), which is itself the honest RED: the
+    /// old shape could not even EXPRESS "not assessed", let alone report it.
+    #[test]
+    fn fresh_validation_reports_manufacturing_valid_not_assessed() {
+        let model = box_model();
+        let result =
+            validate_model_enhanced(&model, Tolerance::default(), ValidationLevel::Standard);
+        assert_eq!(
+            result.manufacturing_valid, None,
+            "a validation run that never invoked DFM must report None \
+             (not assessed), never a fabricated pass or fail"
+        );
+    }
+
+    /// Proves the field is now CAPABLE of carrying a genuine DFM verdict —
+    /// not just capable of being `None`. A caller that ran a real DFM pack
+    /// and got back a `DfmSummary` can attach it and read the exact value
+    /// back out, round-tripping through `PartialEq`.
+    #[test]
+    fn manufacturing_valid_can_carry_a_real_dfm_summary() {
+        let model = box_model();
+        let mut result =
+            validate_model_enhanced(&model, Tolerance::default(), ValidationLevel::Standard);
+        assert_eq!(result.manufacturing_valid, None);
+
+        let real_verdict = DfmSummary::Violations { count: 2 };
+        result.manufacturing_valid = Some(real_verdict);
+        assert_eq!(
+            result.manufacturing_valid,
+            Some(DfmSummary::Violations { count: 2 }),
+            "a genuine DfmSummary attached by a caller must read back exactly, \
+             proving the field can carry a real verdict, not just an absence"
         );
     }
 }
