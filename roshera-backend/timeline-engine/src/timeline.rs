@@ -37,7 +37,10 @@
 //! If a future invariant cannot be expressed with the above linearization
 //! points, revisit this comment first.
 
-use crate::branch::{MergeResult, MergeStatistics, MergeStrategy};
+use crate::branch::{
+    get_affected_subjects, operations_identical, AffectedSubjects, ConflictSubject, ConflictType,
+    MergeConflict, MergeResult, MergeStatistics, MergeStrategy,
+};
 use crate::error::{TimelineError, TimelineResult};
 use crate::types::{
     Author, Branch, BranchId, BranchState, Checkpoint, CheckpointId, EntityId, EntityReference,
@@ -46,7 +49,7 @@ use crate::types::{
 };
 use chrono::Utc;
 use dashmap::DashMap;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
@@ -1016,8 +1019,6 @@ impl Timeline {
 
     /// Merge `source_branch` into `target_branch`.
     ///
-    /// Real implementation (replaces the prior empty stub):
-    ///
     /// * **Existence + state checks.** Both branches must exist and be
     ///   distinct. Source must be `Active` (merging an already-merged
     ///   or abandoned branch is a no-op at best, a corruption at
@@ -1028,27 +1029,42 @@ impl Timeline {
     ///   that case we copy the source-only suffix into target's
     ///   `branch_events` (preserving global sequence numbers — they're
     ///   still valid IDs in `events`) and report success with zero
-    ///   conflicts.
+    ///   conflicts. This applies regardless of `strategy` — a clean
+    ///   fast-forward never needs conflict resolution, exactly as
+    ///   `git merge` fast-forwards even without `--ff-only`.
     ///
-    /// * **Divergent detection.** If both branches have events that the
-    ///   other doesn't, a real three-way merge would need conflict
-    ///   resolution which depends on operation semantics the timeline
-    ///   layer doesn't own. We conservatively reject divergent merges
-    ///   with a `BranchConflict` error rather than silently dropping
-    ///   events. Callers (the api-server) can then surface that to the
-    ///   user, who can reconcile manually (cherry-pick, abandon, etc.).
+    /// * **Divergent detection + `strategy` dispatch.** If both branches
+    ///   have events the other doesn't:
+    ///   - `MergeStrategy::FastForward` refuses with `BranchConflict`
+    ///     naming the divergence shape — this is git's `merge --ff-only`
+    ///     contract, and `tests/git_semantics.rs` pins it byte-for-byte.
+    ///   - Every other strategy attempts a real three-way merge: each
+    ///     side's post-fork events are classified into
+    ///     [`crate::branch::ConflictSubject`]s via
+    ///     [`get_affected_subjects`], and subjects touched by both sides
+    ///     are run through the taxonomy in
+    ///     `Roshera-vault/Research/2026-07-29-timeline-beyond-git.md`
+    ///     §3.1 (`classify_subject_conflict`, below). If any conflicts
+    ///     are found, they are returned in `MergeResult` (`success:
+    ///     false`, populated `conflicts`) — **not** an `Err` — because
+    ///     an agent needs the witnesses to resolve them, not just a
+    ///     failure. `ConflictStrategy` (nested inside `ThreeWay`) is
+    ///     not consulted for auto-resolution in this slice: detection
+    ///     and reporting are implemented; resolution is not, and
+    ///     `conflict.resolution` is always `None` on the way out.
+    ///   - If no conflicts are found, the merge proceeds: source-only
+    ///     events are appended into target's `branch_events` (their
+    ///     global sequence numbers are preserved, so replay interleaves
+    ///     both sides' events by the order they were originally
+    ///     created — there is no synthetic "merge commit" event).
     ///
     /// * **State transition.** On success, source is marked
     ///   `BranchState::Merged { into: target_branch, at: now }`.
-    ///
-    /// Strategy is reserved for future expansion (squash / rebase /
-    /// cherry-pick); FastForward is the only behavior currently
-    /// implemented.
     pub async fn merge_branches(
         &self,
         source_branch: BranchId,
         target_branch: BranchId,
-        _strategy: MergeStrategy,
+        strategy: MergeStrategy,
     ) -> TimelineResult<MergeResult> {
         let started = std::time::Instant::now();
 
@@ -1198,22 +1214,169 @@ impl Timeline {
             });
         }
 
-        // Divergent — neither prefix nor identical. We don't auto-merge;
-        // surface as a conflict so the user can resolve.
+        // Divergent — neither prefix nor identical.
         let common_prefix_len = source_seq
             .iter()
             .zip(target_seq.iter())
             .take_while(|(s, t)| s == t)
             .count();
-        Err(TimelineError::BranchConflict(format!(
-            "branches {} and {} have diverged: common prefix = {} events, source-only = {}, target-only = {}; \
-             three-way merge requires explicit conflict resolution which is not yet wired",
-            source_branch,
-            target_branch,
-            common_prefix_len,
-            source_seq.len() - common_prefix_len,
-            target_seq.len() - common_prefix_len,
-        )))
+
+        // Strategy dispatch on divergence. `FastForward` is git's
+        // `merge --ff-only`: it refuses rather than fabricating a merge
+        // (`tests/git_semantics.rs` pins this exact error shape).
+        // `ThreeWay` runs the real taxonomy below. `Squash` / `Rebase` /
+        // `CherryPick` are declared strategy variants with no divergent-
+        // merge implementation in this slice — dispatching them into the
+        // `ThreeWay` taxonomy would silently give a caller who asked for
+        // "squash the branch into one commit" or "rebase onto target"
+        // plain three-way semantics instead, with nothing telling it.
+        // Refuse loudly by name instead, the same contract AUDIT-M3 set
+        // for `ConflictStrategy::AI` below.
+        match &strategy {
+            MergeStrategy::FastForward => {
+                return Err(TimelineError::BranchConflict(format!(
+                    "branches {} and {} have diverged: common prefix = {} events, source-only = {}, target-only = {}; \
+                     fast-forward-only merge cannot resolve divergence — retry with \
+                     MergeStrategy::ThreeWay for a real three-way merge",
+                    source_branch,
+                    target_branch,
+                    common_prefix_len,
+                    source_seq.len() - common_prefix_len,
+                    target_seq.len() - common_prefix_len,
+                )));
+            }
+            MergeStrategy::ThreeWay { conflict_strategy } => {
+                // AUDIT-M3 (carried forward from the deleted `BranchMerger`):
+                // a caller that explicitly asks for AI-resolved conflicts
+                // must be told no model dispatcher is wired, not silently
+                // downgraded to a strategy it didn't choose.
+                if let crate::branch::ConflictStrategy::AI { model, .. } = conflict_strategy {
+                    return Err(TimelineError::NotImplemented(format!(
+                        "ConflictStrategy::AI requested model '{model}' but no model dispatcher \
+                         is wired into Timeline::merge_branches; use PreferSource / PreferTarget \
+                         / PreferNewest / Manual instead, or resolve the reported conflicts \
+                         yourself and retry",
+                    )));
+                }
+                // Every other ConflictStrategy (PreferSource / PreferTarget
+                // / PreferNewest / Manual) is accepted but, in this slice,
+                // not consulted for auto-resolution — conflicts are
+                // detected and reported (see below), never silently
+                // resolved. `conflict.resolution` stays `None`.
+            }
+            MergeStrategy::Squash { .. }
+            | MergeStrategy::Rebase
+            | MergeStrategy::CherryPick { .. } => {
+                return Err(TimelineError::NotImplemented(format!(
+                    "MergeStrategy::{:?} has no divergent-merge implementation; \
+                     branches {} and {} have diverged (common prefix = {} events, \
+                     source-only = {}, target-only = {}) — use MergeStrategy::ThreeWay to \
+                     detect and report conflicts",
+                    strategy,
+                    source_branch,
+                    target_branch,
+                    common_prefix_len,
+                    source_seq.len() - common_prefix_len,
+                    target_seq.len() - common_prefix_len,
+                )));
+            }
+        }
+
+        // Real three-way merge (spec: 2026-07-29-timeline-beyond-git.md
+        // §3.1, §5 step 3). Resolve each side's post-common-prefix events.
+        let source_only: Vec<TimelineEvent> = source_seq[common_prefix_len..]
+            .iter()
+            .filter_map(|(_, eid)| self.events.get(eid).map(|e| e.clone()))
+            .collect();
+        let target_only: Vec<TimelineEvent> = target_seq[common_prefix_len..]
+            .iter()
+            .filter_map(|(_, eid)| self.events.get(eid).map(|e| e.clone()))
+            .collect();
+
+        let source_index = index_subjects_by_role(&source_only);
+        let target_index = index_subjects_by_role(&target_only);
+
+        let mut conflicts: Vec<MergeConflict> = Vec::new();
+        for (subject, s_role) in &source_index {
+            if let Some(t_role) = target_index.get(subject) {
+                if let Some((conflict_type, source_event, target_event)) =
+                    classify_subject_conflict(s_role, t_role)
+                {
+                    conflicts.push(MergeConflict {
+                        subject: subject.clone(),
+                        conflict_type,
+                        source_event: Some(source_event),
+                        target_event: Some(target_event),
+                        resolution: None,
+                    });
+                }
+            }
+        }
+
+        if !conflicts.is_empty() {
+            let conflicts_count = conflicts.len();
+            // A conflicted merge is reported, not erred: an agent needs
+            // the typed witnesses (subject, conflict_type, both events)
+            // to decide how to resolve, not just that resolution failed.
+            return Ok(MergeResult {
+                success: false,
+                merged_events: Vec::new(),
+                conflicts,
+                modified_entities: HashSet::new(),
+                statistics: MergeStatistics {
+                    events_merged: 0,
+                    conflicts_count,
+                    auto_resolved: 0,
+                    entities_affected: 0,
+                    duration_ms: started.elapsed().as_millis() as u64,
+                },
+            });
+        }
+
+        // No conflicts: source-only events are independently mergeable.
+        // Append them into target's branch_events, preserving their
+        // global sequence numbers (same mechanism as the fast-forward
+        // path above). Target-only events are already present.
+        let merged_events: Vec<TimelineEvent> = {
+            let target_events = self
+                .branch_events
+                .get(&target_branch)
+                .ok_or(TimelineError::BranchNotFound(target_branch))?;
+            for ev in &source_only {
+                target_events.insert(ev.sequence_number, ev.id);
+            }
+            source_only.clone()
+        };
+
+        let mut affected: HashSet<EntityId> = HashSet::new();
+        for ev in &merged_events {
+            affected.extend(ev.outputs.created.iter().map(|c| c.id));
+            affected.extend(ev.outputs.modified.iter().copied());
+            affected.extend(ev.outputs.deleted.iter().copied());
+        }
+
+        if let Some(mut branch) = self.branches.get_mut(&source_branch) {
+            branch.state = BranchState::Merged {
+                into: target_branch,
+                at: Utc::now(),
+            };
+        }
+
+        let n = merged_events.len();
+        let affected_count = affected.len();
+        Ok(MergeResult {
+            success: true,
+            merged_events,
+            conflicts: Vec::new(),
+            modified_entities: affected,
+            statistics: MergeStatistics {
+                events_merged: n,
+                conflicts_count: 0,
+                auto_resolved: 0,
+                entities_affected: affected_count,
+                duration_ms: started.elapsed().as_millis() as u64,
+            },
+        })
     }
 
     /// Create a new branch with purpose (simplified interface)
@@ -1828,6 +1991,116 @@ impl Timeline {
     }
 }
 
+/// One side's last-write-wins view of a subject, used by
+/// [`classify_subject_conflict`]. A subject can be reachable through
+/// more than one event on the same side (e.g. required by an early
+/// event, then touched by a later one); this struct keeps only the
+/// most recent event per role, which is what actually matters for
+/// deciding whether the two sides' *current* results collide.
+#[derive(Debug, Clone, Default)]
+struct SubjectRole {
+    /// Most recent event on this side that deleted the subject.
+    deleted_by: Option<TimelineEvent>,
+    /// Most recent event on this side that created/mutated the subject.
+    touched_by: Option<TimelineEvent>,
+    /// Most recent event on this side that merely required the subject.
+    required_by: Option<TimelineEvent>,
+}
+
+/// Build a per-subject, last-write-wins index of one side's post-fork
+/// events. `events` must already be in ascending sequence order (as
+/// `source_only` / `target_only` are, since they're sliced from a
+/// sorted `(EventIndex, EventId)` sequence) so "last" means
+/// "chronologically most recent on this branch".
+fn index_subjects_by_role(events: &[TimelineEvent]) -> HashMap<ConflictSubject, SubjectRole> {
+    let mut index: HashMap<ConflictSubject, SubjectRole> = HashMap::new();
+    for event in events {
+        let subjects: AffectedSubjects = get_affected_subjects(&event.operation);
+        for s in subjects.deleted {
+            index.entry(s).or_default().deleted_by = Some(event.clone());
+        }
+        for s in subjects.touched {
+            index.entry(s).or_default().touched_by = Some(event.clone());
+        }
+        for s in subjects.required {
+            index.entry(s).or_default().required_by = Some(event.clone());
+        }
+    }
+    index
+}
+
+/// Classify how a subject touched by *both* sides actually collides,
+/// per the taxonomy in
+/// `Roshera-vault/Research/2026-07-29-timeline-beyond-git.md` §3.1.
+/// Returns `None` when the two sides' touches don't actually conflict
+/// (identical operation, both merely reading, both deleting the same
+/// thing). `TopologicalConflict` is deliberately never returned here —
+/// it requires replaying the merge and certifying the result, which is
+/// out of scope for this slice (see the doc comment on
+/// [`crate::branch::ConflictType::TopologicalConflict`]).
+fn classify_subject_conflict(
+    source: &SubjectRole,
+    target: &SubjectRole,
+) -> Option<(ConflictType, TimelineEvent, TimelineEvent)> {
+    // Neither side actually writes (creates/mutates/deletes) the
+    // subject — both merely require it to exist. Two reads never
+    // conflict.
+    if source.deleted_by.is_none()
+        && source.touched_by.is_none()
+        && target.deleted_by.is_none()
+        && target.touched_by.is_none()
+    {
+        return None;
+    }
+
+    // Both sides deleted it and neither also touched it afterward —
+    // same outcome either way, idempotent.
+    if source.deleted_by.is_some()
+        && target.deleted_by.is_some()
+        && source.touched_by.is_none()
+        && target.touched_by.is_none()
+    {
+        return None;
+    }
+
+    // Delete-vs-modify, in either direction. Checked before
+    // touched-vs-touched so a side that both touched and later deleted
+    // the subject (final state: deleted) is judged by its final state.
+    if let Some(sd) = &source.deleted_by {
+        if let Some(tt) = &target.touched_by {
+            return Some((ConflictType::DeleteModify, sd.clone(), tt.clone()));
+        }
+        if let Some(tr) = &target.required_by {
+            // Target's op depends on a subject source deleted, without
+            // itself modifying that subject — a dependency conflict,
+            // not a same-subject edit collision.
+            return Some((ConflictType::DependencyConflict, sd.clone(), tr.clone()));
+        }
+    }
+    if let Some(td) = &target.deleted_by {
+        if let Some(st) = &source.touched_by {
+            return Some((ConflictType::DeleteModify, st.clone(), td.clone()));
+        }
+        if let Some(sr) = &source.required_by {
+            return Some((ConflictType::DependencyConflict, sr.clone(), td.clone()));
+        }
+    }
+
+    // Both sides touched (created/mutated) it.
+    if let (Some(st), Some(tt)) = (&source.touched_by, &target.touched_by) {
+        if operations_identical(&st.operation, &tt.operation) {
+            return None; // idempotent — same operation replayed on both sides
+        }
+        return Some((ConflictType::ConcurrentModification, st.clone(), tt.clone()));
+    }
+
+    // One side touches, the other only requires (no delete anywhere):
+    // the reader coexists with the writer. Not flagged — the taxonomy
+    // table does not list this as a conflict, and fabricating one here
+    // would be a false positive the spec explicitly warns against.
+    None
+}
+
 /// Timeline statistics
 #[derive(Debug, Clone)]
 pub struct TimelineStats {
@@ -2377,6 +2650,472 @@ mod tests {
             .await
             .expect_err("self-merge must error");
         assert!(matches!(err, TimelineError::InvalidOperation(_)));
+    }
+
+    // ---------------------------------------------------------------
+    // Real three-way merge (spec: 2026-07-29-timeline-beyond-git.md
+    // §3.1, §5 step 3). Every case below uses a non-FastForward
+    // strategy so it exercises the new taxonomy path, not the
+    // git-faithful FF-only refusal pinned by `merge_branches_rejects_divergent`.
+    // ---------------------------------------------------------------
+
+    /// A `Generic` operation carrying `inputs`/`outputs`, matching the
+    /// shape `recorder_bridge::to_timeline_operation` produces for real
+    /// kernel operations.
+    fn generic_op(kind: &str, inputs: &[&str], outputs: &[&str]) -> Operation {
+        Operation::Generic {
+            command_type: kind.to_string(),
+            parameters: serde_json::json!({
+                "params": {},
+                "inputs": inputs,
+                "outputs": outputs,
+            }),
+        }
+    }
+
+    fn three_way() -> MergeStrategy {
+        MergeStrategy::ThreeWay {
+            conflict_strategy: crate::branch::ConflictStrategy::Manual,
+        }
+    }
+
+    /// Two branches that touch different kernel refs after diverging
+    /// must merge cleanly — disjoint subject sets are independently
+    /// mergeable, never a false conflict (spec §3.1 table, row 2).
+    #[tokio::test]
+    async fn three_way_merge_disjoint_kernel_refs_merges_cleanly() {
+        let timeline = Timeline::new(TimelineConfig::default());
+
+        timeline
+            .add_operation(dummy_create_op(), Author::System, BranchId::main())
+            .await
+            .unwrap();
+        let child = timeline
+            .create_branch(
+                "child".to_string(),
+                BranchId::main(),
+                None,
+                Author::System,
+                crate::BranchPurpose::UserExploration {
+                    description: "disjoint".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        timeline
+            .add_operation(
+                generic_op("extrude_face", &[], &["face:3"]),
+                Author::System,
+                BranchId::main(),
+            )
+            .await
+            .unwrap();
+        timeline
+            .add_operation(
+                generic_op("extrude_face", &[], &["face:2"]),
+                Author::System,
+                child,
+            )
+            .await
+            .unwrap();
+
+        let result = timeline
+            .merge_branches(child, BranchId::main(), three_way())
+            .await
+            .expect("disjoint-subject merge must not error");
+
+        assert!(
+            result.success,
+            "disjoint kernel refs must not be reported as conflicting: {:?}",
+            result.conflicts
+        );
+        assert!(result.conflicts.is_empty());
+        assert_eq!(result.statistics.events_merged, 1);
+        timeline
+            .validate()
+            .expect("clean three-way merge must not corrupt state");
+
+        // child is now folded into main.
+        assert!(!timeline.is_branch_active(&child));
+    }
+
+    /// Two branches that touch the SAME kernel ref with different
+    /// operations must conflict as `ConcurrentModification`, with both
+    /// the source and target event attached — an agent cannot resolve
+    /// a conflict it cannot see (spec §3.1 table, row 4).
+    #[tokio::test]
+    async fn three_way_merge_same_kernel_ref_conflicts_with_both_events_attached() {
+        let timeline = Timeline::new(TimelineConfig::default());
+
+        timeline
+            .add_operation(dummy_create_op(), Author::System, BranchId::main())
+            .await
+            .unwrap();
+        let child = timeline
+            .create_branch(
+                "child".to_string(),
+                BranchId::main(),
+                None,
+                Author::System,
+                crate::BranchPurpose::UserExploration {
+                    description: "same-ref".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        timeline
+            .add_operation(
+                generic_op("fillet_edge", &["edge:7"], &["solid:9"]),
+                Author::System,
+                BranchId::main(),
+            )
+            .await
+            .unwrap();
+        timeline
+            .add_operation(
+                generic_op("chamfer_edge", &["edge:7"], &["solid:9"]),
+                Author::System,
+                child,
+            )
+            .await
+            .unwrap();
+
+        let result = timeline
+            .merge_branches(child, BranchId::main(), three_way())
+            .await
+            .expect("a conflicted merge is reported, not erred");
+
+        assert!(!result.success);
+        assert_eq!(result.conflicts.len(), 1);
+        let conflict = &result.conflicts[0];
+        assert_eq!(
+            conflict.subject,
+            crate::branch::ConflictSubject::KernelRef("solid:9".to_string())
+        );
+        assert_eq!(conflict.conflict_type, ConflictType::ConcurrentModification);
+        assert!(
+            conflict.source_event.is_some() && conflict.target_event.is_some(),
+            "both witnesses must be attached — an agent cannot resolve a conflict it cannot see"
+        );
+        assert_eq!(result.statistics.conflicts_count, 1);
+        // A reported (not erred) conflict must not flip source's state.
+        assert!(timeline.is_branch_active(&child));
+        timeline
+            .validate()
+            .expect("a reported conflict must not corrupt state");
+    }
+
+    /// One branch deletes an entity, the other modifies it — this is
+    /// `DeleteModify`, distinct from `ConcurrentModification` (spec
+    /// §3.1 table, row 3). Uses typed `Operation::Delete`/`Modify`
+    /// since only the typed `Delete` variant unambiguously signals
+    /// deletion (see `AffectedSubjects` doc comment on why `Generic`
+    /// never populates the `deleted` bucket).
+    #[tokio::test]
+    async fn three_way_merge_delete_vs_modify_yields_delete_modify() {
+        let timeline = Timeline::new(TimelineConfig::default());
+        let entity = EntityId::new();
+
+        // Seed the entity into the common prefix so both sides start
+        // from a shared reference to it.
+        timeline
+            .add_operation(
+                Operation::Modify {
+                    entity,
+                    modifications: vec![],
+                },
+                Author::System,
+                BranchId::main(),
+            )
+            .await
+            .unwrap();
+        let child = timeline
+            .create_branch(
+                "child".to_string(),
+                BranchId::main(),
+                None,
+                Author::System,
+                crate::BranchPurpose::UserExploration {
+                    description: "delete-vs-modify".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        timeline
+            .add_operation(
+                Operation::Delete {
+                    entities: vec![entity],
+                },
+                Author::System,
+                BranchId::main(),
+            )
+            .await
+            .unwrap();
+        timeline
+            .add_operation(
+                Operation::Modify {
+                    entity,
+                    modifications: vec![crate::types::Modification::SetName("x".to_string())],
+                },
+                Author::System,
+                child,
+            )
+            .await
+            .unwrap();
+
+        let result = timeline
+            .merge_branches(child, BranchId::main(), three_way())
+            .await
+            .expect("a conflicted merge is reported, not erred");
+
+        assert!(!result.success);
+        assert_eq!(result.conflicts.len(), 1);
+        assert_eq!(
+            result.conflicts[0].conflict_type,
+            ConflictType::DeleteModify
+        );
+        assert_eq!(
+            result.conflicts[0].subject,
+            crate::branch::ConflictSubject::Entity(entity)
+        );
+    }
+
+    /// The identical operation replayed on both sides (idempotent) must
+    /// not be reported as a conflict, even though both sides touch the
+    /// same subject (spec §3.1 table, row 1).
+    #[tokio::test]
+    async fn three_way_merge_identical_operation_both_sides_is_not_a_conflict() {
+        let timeline = Timeline::new(TimelineConfig::default());
+
+        timeline
+            .add_operation(dummy_create_op(), Author::System, BranchId::main())
+            .await
+            .unwrap();
+        let child = timeline
+            .create_branch(
+                "child".to_string(),
+                BranchId::main(),
+                None,
+                Author::System,
+                crate::BranchPurpose::UserExploration {
+                    description: "idempotent".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let op = generic_op("extrude_face", &["face:1"], &["solid:5"]);
+        timeline
+            .add_operation(op.clone(), Author::System, BranchId::main())
+            .await
+            .unwrap();
+        timeline
+            .add_operation(op, Author::System, child)
+            .await
+            .unwrap();
+
+        let result = timeline
+            .merge_branches(child, BranchId::main(), three_way())
+            .await
+            .expect("identical-operation merge must not error");
+
+        assert!(
+            result.success,
+            "identical operation on both sides is idempotent, not a conflict: {:?}",
+            result.conflicts
+        );
+        assert!(result.conflicts.is_empty());
+        timeline
+            .validate()
+            .expect("clean three-way merge must not corrupt state");
+    }
+
+    /// One branch deletes a sketch, the other extrudes it — the extrude
+    /// depends on (requires) the sketch without itself touching it, so
+    /// this is `DependencyConflict`, distinct from `DeleteModify` (spec
+    /// §3.1 table, row 5).
+    #[tokio::test]
+    async fn three_way_merge_edit_depending_on_deleted_subject_yields_dependency_conflict() {
+        let timeline = Timeline::new(TimelineConfig::default());
+        let sketch = EntityId::new();
+
+        // Seed the sketch into the common prefix.
+        timeline
+            .add_operation(
+                Operation::Modify {
+                    entity: sketch,
+                    modifications: vec![],
+                },
+                Author::System,
+                BranchId::main(),
+            )
+            .await
+            .unwrap();
+        let child = timeline
+            .create_branch(
+                "child".to_string(),
+                BranchId::main(),
+                None,
+                Author::System,
+                crate::BranchPurpose::UserExploration {
+                    description: "dependency-conflict".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        timeline
+            .add_operation(
+                Operation::Delete {
+                    entities: vec![sketch],
+                },
+                Author::System,
+                BranchId::main(),
+            )
+            .await
+            .unwrap();
+        timeline
+            .add_operation(
+                Operation::Extrude {
+                    sketch_id: sketch,
+                    distance: 5.0,
+                    direction: None,
+                },
+                Author::System,
+                child,
+            )
+            .await
+            .unwrap();
+
+        let result = timeline
+            .merge_branches(child, BranchId::main(), three_way())
+            .await
+            .expect("a conflicted merge is reported, not erred");
+
+        assert!(!result.success);
+        assert_eq!(result.conflicts.len(), 1);
+        assert_eq!(
+            result.conflicts[0].conflict_type,
+            ConflictType::DependencyConflict,
+            "an edit depending on a deleted subject must be DependencyConflict, not DeleteModify \
+             (the extrude never touches the sketch, it only requires it)"
+        );
+        assert_eq!(
+            result.conflicts[0].subject,
+            crate::branch::ConflictSubject::Entity(sketch)
+        );
+    }
+
+    /// `Squash` / `Rebase` / `CherryPick` have no divergent-merge
+    /// implementation in this slice. Dispatching a divergent merge
+    /// under one of them must refuse loudly by name, never silently
+    /// fall through to plain three-way semantics the caller didn't ask
+    /// for (CLAUDE.md: "honest refusal over silent wrong answers").
+    #[tokio::test]
+    async fn divergent_merge_with_unimplemented_strategy_refuses_by_name() {
+        let timeline = Timeline::new(TimelineConfig::default());
+        timeline
+            .add_operation(dummy_create_op(), Author::System, BranchId::main())
+            .await
+            .unwrap();
+        let child = timeline
+            .create_branch(
+                "child".to_string(),
+                BranchId::main(),
+                None,
+                Author::System,
+                crate::BranchPurpose::UserExploration {
+                    description: "unimplemented-strategy".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        timeline
+            .add_operation(dummy_create_op(), Author::System, BranchId::main())
+            .await
+            .unwrap();
+        timeline
+            .add_operation(dummy_create_op(), Author::System, child)
+            .await
+            .unwrap();
+
+        for strategy in [
+            MergeStrategy::Squash {
+                message: "squash it".to_string(),
+            },
+            MergeStrategy::Rebase,
+            MergeStrategy::CherryPick { events: vec![] },
+        ] {
+            let err = timeline
+                .merge_branches(child, BranchId::main(), strategy)
+                .await
+                .expect_err("unimplemented divergent-merge strategy must refuse, not fall through");
+            assert!(
+                matches!(err, TimelineError::NotImplemented(_)),
+                "expected NotImplemented, got {:?}",
+                err
+            );
+        }
+        assert!(timeline.is_branch_active(&child));
+    }
+
+    /// AUDIT-M3, enforced live: `ThreeWay { conflict_strategy: AI }` on a
+    /// divergent merge must refuse by name (naming the requested model),
+    /// never silently downgrade to `PreferSource` and report
+    /// `auto_resolved` without having consulted anything.
+    #[tokio::test]
+    async fn divergent_merge_with_ai_conflict_strategy_refuses_by_name() {
+        let timeline = Timeline::new(TimelineConfig::default());
+        timeline
+            .add_operation(dummy_create_op(), Author::System, BranchId::main())
+            .await
+            .unwrap();
+        let child = timeline
+            .create_branch(
+                "child".to_string(),
+                BranchId::main(),
+                None,
+                Author::System,
+                crate::BranchPurpose::UserExploration {
+                    description: "ai-strategy".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        timeline
+            .add_operation(dummy_create_op(), Author::System, BranchId::main())
+            .await
+            .unwrap();
+        timeline
+            .add_operation(dummy_create_op(), Author::System, child)
+            .await
+            .unwrap();
+
+        let err = timeline
+            .merge_branches(
+                child,
+                BranchId::main(),
+                MergeStrategy::ThreeWay {
+                    conflict_strategy: crate::branch::ConflictStrategy::AI {
+                        model: "claude-opus-4-6".to_string(),
+                        criteria: vec![],
+                    },
+                },
+            )
+            .await
+            .expect_err("AI conflict strategy must refuse, not silently downgrade");
+        match err {
+            TimelineError::NotImplemented(msg) => {
+                assert!(
+                    msg.contains("claude-opus-4-6"),
+                    "must name the requested model: {msg}"
+                );
+            }
+            other => panic!("expected NotImplemented, got {:?}", other),
+        }
     }
 
     /// `is_branch_active` is the source of truth for "may receive

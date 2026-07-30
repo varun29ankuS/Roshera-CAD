@@ -19,7 +19,8 @@ mod strategy;
 
 pub use conflict::ConflictResolver;
 pub use merge::{
-    ConflictResolution, ConflictStrategy, MergeConflict, MergeResult, MergeStatistics,
+    get_affected_subjects, operations_identical, AffectedSubjects, ConflictResolution,
+    ConflictStrategy, ConflictSubject, ConflictType, MergeConflict, MergeResult, MergeStatistics,
     MergeStrategy,
 };
 pub use name_pool::{suggest_branch_names, BRANCH_NAME_POOL};
