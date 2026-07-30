@@ -20,6 +20,30 @@ use uuid::Uuid;
 
 type HmacSha256 = Hmac<Sha256>;
 
+/// The kind of principal a credential was minted for.
+///
+/// This is the claim `author_from_auth_info`
+/// (`api-server/src/handlers/timeline.rs`) needed and did not have: a
+/// human/agent distinction that is minted once, at credential-issue
+/// time, by whoever authorizes the credential — never inferred later
+/// from transport shape (`is_api_key`, bearer vs. header, …), which
+/// tells you nothing about who is holding the credential.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PrincipalKind {
+    /// No principal-kind claim was present on the credential.
+    /// Credentials minted before this claim existed deserialize here.
+    /// Callers MUST treat this as "unknown", never as "human".
+    #[default]
+    Unspecified,
+    /// A human operator.
+    Human,
+    /// An autonomous agent. `model` is REQUIRED because
+    /// `Author::AIAgent` carries a model and inventing one would be
+    /// exactly the fabrication this type exists to prevent.
+    Agent { model: String },
+}
+
 /// Authentication token claims
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenClaims {
@@ -43,6 +67,13 @@ pub struct TokenClaims {
     pub roles: Vec<String>,
     /// Custom claims
     pub custom: serde_json::Value,
+    /// The principal-kind claim (see [`PrincipalKind`]). `serde(default)`
+    /// is load-bearing: a JWT signed before this claim existed must
+    /// still verify — it lands on `PrincipalKind::Unspecified` rather
+    /// than failing deserialization, which would silently invalidate
+    /// every live token the moment this field shipped.
+    #[serde(default)]
+    pub principal: PrincipalKind,
 }
 
 /// API key information
@@ -70,6 +101,13 @@ pub struct ApiKey {
     pub expires_at: Option<DateTime<Utc>>,
     /// Is active
     pub active: bool,
+    /// The principal-kind claim (see [`PrincipalKind`]), minted once at
+    /// provisioning time. `serde(default)` matters for the same reason
+    /// it matters on [`TokenClaims`]: a row persisted before this field
+    /// existed must still deserialize, landing on
+    /// `PrincipalKind::Unspecified` rather than failing to load.
+    #[serde(default)]
+    pub principal: PrincipalKind,
 }
 
 /// Rate limiting configuration
@@ -517,11 +555,21 @@ impl AuthManager {
     }
 
     /// Create JWT token
+    ///
+    /// `principal` is minted once, here, by the caller that authorizes
+    /// the credential (the login handler for a human, a future agent-
+    /// provisioning path for an agent) — never inferred later from the
+    /// token's shape. It is stamped on BOTH the access-token claims and
+    /// the refresh-token claims: a refreshed credential that lost its
+    /// principal would silently decay an agent's credential back to
+    /// `Unspecified` on every renewal, which is the same fabrication-by-
+    /// omission this type exists to prevent.
     pub fn create_token(
         &self,
         user_id: &str,
         email: Option<String>,
         roles: Vec<String>,
+        principal: PrincipalKind,
     ) -> Result<SessionToken, SessionError> {
         let now = Utc::now();
         let token_id = Uuid::new_v4().to_string();
@@ -537,6 +585,7 @@ impl AuthManager {
             email,
             roles,
             custom: serde_json::Value::Object(serde_json::Map::new()),
+            principal: principal.clone(),
         };
 
         let token = claims.sign_with_key(&*self.jwt_secret).map_err(|e| {
@@ -545,7 +594,11 @@ impl AuthManager {
             }
         })?;
 
-        // Create refresh token
+        // Create refresh token. Carries the SAME principal as the access
+        // token (see the doc comment above) — the refresh path in
+        // `api-server/src/handlers/auth.rs` reads it back off the
+        // verified refresh claims and forwards it, rather than
+        // hardcoding `Human`.
         let refresh_claims = TokenClaims {
             sub: user_id.to_string(),
             jti: Uuid::new_v4().to_string(),
@@ -557,6 +610,7 @@ impl AuthManager {
             email: None,
             roles: vec![],
             custom: serde_json::json!({ "parent_jti": token_id }),
+            principal,
         };
 
         let refresh_token = refresh_claims
@@ -669,12 +723,21 @@ impl AuthManager {
     }
 
     /// Create API key
+    ///
+    /// `principal` is minted at provisioning time by the caller that
+    /// authorizes the key (e.g. the self-service provisioning route
+    /// forwards the requesting credential's own `PrincipalKind`) — never
+    /// guessed here from the fact that this is an API key. Both
+    /// `is_api_key` (transport) and `principal` (identity) can vary
+    /// independently: an agent may authenticate with a JWT, and a human
+    /// may authenticate with an API key.
     pub fn create_api_key(
         &self,
         user_id: &str,
         name: &str,
         permissions: Vec<String>,
         expires_in_days: Option<i64>,
+        principal: PrincipalKind,
     ) -> Result<(String, ApiKey), SessionError> {
         let key_id = Uuid::new_v4().to_string();
         let raw_key = format!("{}{}", self.config.api_key_prefix, Uuid::new_v4());
@@ -702,6 +765,7 @@ impl AuthManager {
             last_used: None,
             expires_at,
             active: true,
+            principal,
         };
 
         self.api_keys.insert(key_id.clone(), api_key.clone());
@@ -753,9 +817,10 @@ impl AuthManager {
         name: &str,
         permissions: Vec<String>,
         expires_in_days: Option<i64>,
+        principal: PrincipalKind,
     ) -> Result<(String, ApiKey), SessionError> {
         let (raw_key, api_key) =
-            self.create_api_key(user_id, name, permissions, expires_in_days)?;
+            self.create_api_key(user_id, name, permissions, expires_in_days, principal)?;
 
         if let Some(store) = self.api_key_store.get() {
             if let Err(e) = store.save_api_key(&api_key).await {
@@ -1223,6 +1288,7 @@ mod tests {
                 "user123",
                 Some("user@example.com".to_string()),
                 vec!["user".to_string()],
+                PrincipalKind::Human,
             )
             .unwrap();
 
@@ -1247,6 +1313,7 @@ mod tests {
                 "Test Key",
                 vec!["read".to_string(), "write".to_string()],
                 Some(30),
+                PrincipalKind::Human,
             )
             .unwrap();
 
@@ -1267,7 +1334,12 @@ mod tests {
         let auth = AuthManager::new(config, "test-secret").unwrap();
 
         let session_token = auth
-            .create_token("user-idle", None, vec!["user".to_string()])
+            .create_token(
+                "user-idle",
+                None,
+                vec!["user".to_string()],
+                PrincipalKind::Human,
+            )
             .unwrap();
 
         // Sanity: a fresh token verifies.
@@ -1304,7 +1376,12 @@ mod tests {
         config.idle_timeout_seconds = 0;
         let auth = AuthManager::new(config, "test-secret").unwrap();
         let session_token = auth
-            .create_token("user-noidle", None, vec!["user".to_string()])
+            .create_token(
+                "user-noidle",
+                None,
+                vec!["user".to_string()],
+                PrincipalKind::Human,
+            )
             .unwrap();
 
         // Push last_activity far into the past; opt-out must still accept.
@@ -1332,7 +1409,13 @@ mod tests {
     fn verify_api_key_enforces_rate_limit_when_window_exhausted() {
         let auth = AuthManager::new(AuthConfig::default(), "test-secret").unwrap();
         let (raw_key, api_key) = auth
-            .create_api_key("user-rate", "rate-test", vec!["read".to_string()], None)
+            .create_api_key(
+                "user-rate",
+                "rate-test",
+                vec!["read".to_string()],
+                None,
+                PrincipalKind::Human,
+            )
             .unwrap();
 
         // Shrink the budget to 3 requests per hour so the test can
@@ -1370,7 +1453,13 @@ mod tests {
     fn verify_api_key_rate_limit_rejection_does_not_record_request() {
         let auth = AuthManager::new(AuthConfig::default(), "test-secret").unwrap();
         let (raw_key, api_key) = auth
-            .create_api_key("user-rate-2", "rate-test", vec!["read".to_string()], None)
+            .create_api_key(
+                "user-rate-2",
+                "rate-test",
+                vec!["read".to_string()],
+                None,
+                PrincipalKind::Human,
+            )
             .unwrap();
         {
             let mut entry = auth.api_keys.get_mut(&api_key.id).unwrap();
@@ -1409,7 +1498,13 @@ mod tests {
     fn verify_api_key_no_limit_when_rate_limit_none() {
         let auth = AuthManager::new(AuthConfig::default(), "test-secret").unwrap();
         let (raw_key, api_key) = auth
-            .create_api_key("user-rate-3", "rate-test", vec!["read".to_string()], None)
+            .create_api_key(
+                "user-rate-3",
+                "rate-test",
+                vec!["read".to_string()],
+                None,
+                PrincipalKind::Human,
+            )
             .unwrap();
         {
             let mut entry = auth.api_keys.get_mut(&api_key.id).unwrap();
@@ -1582,5 +1677,98 @@ mod tests {
         env.insert("ROSHERA_AUTH_AUDIENCE", "  one  ,,  two  ");
         let cfg = AuthConfig::from_env_with(|k| env.get(k).map(|s| s.to_string()));
         assert_eq!(cfg.audience, vec!["one", "two"]);
+    }
+
+    /// A legacy claims payload with no `principal` field at all — the
+    /// exact shape a JWT signed before `PrincipalKind` existed would
+    /// have — must still verify successfully and land on
+    /// `PrincipalKind::Unspecified`. This is the backward-compatibility
+    /// guarantee `#[serde(default)]` on `TokenClaims::principal` exists
+    /// to provide; without it every live token in the field would fail
+    /// to deserialize the moment this claim shipped.
+    #[test]
+    fn legacy_jwt_without_principal_claim_still_verifies() {
+        use serde::Serialize;
+
+        /// Mirrors `TokenClaims` field-for-field MINUS `principal`, so
+        /// signing it produces exactly the JSON shape a pre-AUTHORSHIP-A2
+        /// token would carry.
+        #[derive(Serialize)]
+        struct LegacyClaimsNoPrincipal {
+            sub: String,
+            jti: String,
+            iat: i64,
+            exp: i64,
+            nbf: i64,
+            iss: String,
+            aud: Vec<String>,
+            email: Option<String>,
+            roles: Vec<String>,
+            custom: serde_json::Value,
+        }
+
+        let auth = AuthManager::new(AuthConfig::default(), "legacy-secret").unwrap();
+        let now = Utc::now();
+        let legacy = LegacyClaimsNoPrincipal {
+            sub: "legacy-user".to_string(),
+            jti: Uuid::new_v4().to_string(),
+            iat: now.timestamp(),
+            exp: (now + Duration::seconds(3600)).timestamp(),
+            nbf: now.timestamp(),
+            iss: AuthConfig::default().issuer,
+            aud: AuthConfig::default().audience,
+            email: None,
+            roles: vec!["user".to_string()],
+            custom: serde_json::Value::Object(serde_json::Map::new()),
+        };
+
+        let token = legacy
+            .sign_with_key(&*auth.jwt_secret)
+            .expect("legacy claims must sign");
+
+        let claims = auth
+            .verify_token(&token)
+            .expect("a JWT with no principal claim must still verify");
+        assert_eq!(
+            claims.principal,
+            PrincipalKind::Unspecified,
+            "a credential with no principal claim must land on Unspecified, never a guess"
+        );
+    }
+
+    /// AUTHORSHIP-A2 step-3 subtlety: the refresh token minted alongside
+    /// an agent access token must carry the SAME `PrincipalKind::Agent`,
+    /// not `Unspecified`. If the refresh claims silently dropped the
+    /// principal, an agent's credential would decay to an unknown
+    /// principal on every renewal — invisible until the next author is
+    /// minted from it.
+    #[test]
+    fn refresh_preserves_agent_principal() {
+        let auth = AuthManager::new(AuthConfig::default(), "test-secret").unwrap();
+        let principal = PrincipalKind::Agent {
+            model: "claude-opus-5".to_string(),
+        };
+
+        let session_token = auth
+            .create_token(
+                "agent-refresh-user",
+                None,
+                vec!["agent".to_string()],
+                principal.clone(),
+            )
+            .unwrap();
+
+        let refresh_token = session_token
+            .refresh_token
+            .expect("create_token must always mint a refresh token");
+
+        let refresh_claims = auth
+            .verify_token(&refresh_token)
+            .expect("the freshly minted refresh token must verify");
+
+        assert_eq!(
+            refresh_claims.principal, principal,
+            "the refresh token must carry the SAME Agent principal as the access token"
+        );
     }
 }

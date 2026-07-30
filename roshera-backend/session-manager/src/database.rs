@@ -3,7 +3,7 @@
 //! Provides PostgreSQL and SQLite support for persistent storage of sessions,
 //! users, permissions, and timeline data.
 
-use crate::auth::{ApiKey, SessionToken};
+use crate::auth::{ApiKey, PrincipalKind, SessionToken};
 use crate::permissions::{Permission, Role, UserPermissions};
 
 /// Parse a role string (the Debug representation of `Role`) back into the enum.
@@ -462,7 +462,8 @@ impl PostgresDatabase {
                 created_at TIMESTAMPTZ NOT NULL,
                 last_used TIMESTAMPTZ,
                 expires_at TIMESTAMPTZ,
-                active BOOLEAN NOT NULL DEFAULT true
+                active BOOLEAN NOT NULL DEFAULT true,
+                principal TEXT
             )
             "#,
         )
@@ -481,6 +482,18 @@ impl PostgresDatabase {
             .await
             .map_err(|e| SessionError::PersistenceError {
                 reason: format!("Failed to drop api_keys user_id FK: {}", e),
+            })?;
+
+        // AUTHORSHIP-A2: idempotent migration for a pre-existing silo whose
+        // api_keys table predates the `principal` claim. Nullable TEXT
+        // (not a NOT NULL default) so a row written before this column
+        // existed reads back `NULL` → `PrincipalKind::Unspecified` in
+        // `row_to_api_key_pg`, never a fabricated `Human` default.
+        sqlx::query("ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS principal TEXT")
+            .execute(&self.pool)
+            .await
+            .map_err(|e| SessionError::PersistenceError {
+                reason: format!("Failed to add api_keys.principal column: {}", e),
             })?;
 
         // Create timeline_events table (without INDEX inside CREATE TABLE).
@@ -1265,11 +1278,21 @@ impl DatabasePersistence for PostgresDatabase {
                 reason: format!("Failed to serialize rate limit: {}", e),
             }
         })?;
+        // AUTHORSHIP-A2: stored as a plain JSON-string TEXT column, not
+        // JSONB — this table already mixes JSONB (`rate_limit`) with a
+        // TEXT column of serialized JSON here to keep the migration a
+        // single additive `ADD COLUMN`, matching the design's nullable-
+        // TEXT contract exactly (see `row_to_api_key_pg`'s read side).
+        let principal = serde_json::to_string(&api_key.principal).map_err(|e| {
+            SessionError::PersistenceError {
+                reason: format!("Failed to serialize principal: {}", e),
+            }
+        })?;
 
         sqlx::query(
             r#"
-            INSERT INTO api_keys (id, name, key_hash, prefix, user_id, permissions, rate_limit, created_at, last_used, expires_at, active)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            INSERT INTO api_keys (id, name, key_hash, prefix, user_id, permissions, rate_limit, created_at, last_used, expires_at, active, principal)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
             ON CONFLICT (id) DO UPDATE SET
                 name = EXCLUDED.name,
                 key_hash = EXCLUDED.key_hash,
@@ -1280,7 +1303,8 @@ impl DatabasePersistence for PostgresDatabase {
                 created_at = EXCLUDED.created_at,
                 last_used = EXCLUDED.last_used,
                 expires_at = EXCLUDED.expires_at,
-                active = EXCLUDED.active
+                active = EXCLUDED.active,
+                principal = EXCLUDED.principal
             "#
         )
         .bind(&api_key.id)
@@ -1294,6 +1318,7 @@ impl DatabasePersistence for PostgresDatabase {
         .bind(api_key.last_used)
         .bind(api_key.expires_at)
         .bind(api_key.active)
+        .bind(principal)
         .execute(&self.pool)
         .await
         .map_err(|e| SessionError::PersistenceError {
@@ -1487,6 +1512,14 @@ fn row_to_api_key_pg(row: sqlx::postgres::PgRow) -> ApiKey {
     let permissions: Vec<String> = row.get("permissions");
     let rate_limit_json: serde_json::Value = row.get("rate_limit");
     let rate_limit = serde_json::from_value(rate_limit_json).ok();
+    // AUTHORSHIP-A2: a NULL column (row written before `principal`
+    // existed) or an unparseable value both map to `Unspecified` — NEVER
+    // to `Human`. Defaulting an unknown principal to human would be
+    // exactly the fabrication this claim exists to prevent.
+    let principal = row
+        .get::<Option<String>, _>("principal")
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or(PrincipalKind::Unspecified);
     ApiKey {
         id: row.get("id"),
         name: row.get("name"),
@@ -1499,6 +1532,7 @@ fn row_to_api_key_pg(row: sqlx::postgres::PgRow) -> ApiKey {
         last_used: row.get("last_used"),
         expires_at: row.get("expires_at"),
         active: row.get("active"),
+        principal,
     }
 }
 
@@ -1667,7 +1701,8 @@ impl SqliteDatabase {
                 created_at DATETIME NOT NULL,
                 expires_at DATETIME,
                 last_used DATETIME,
-                active BOOLEAN NOT NULL DEFAULT 1
+                active BOOLEAN NOT NULL DEFAULT 1,
+                principal TEXT
             )
             "#,
         )
@@ -1676,6 +1711,22 @@ impl SqliteDatabase {
         .map_err(|e| SessionError::PersistenceError {
             reason: format!("Failed to create api_keys table: {}", e),
         })?;
+
+        // AUTHORSHIP-A2: idempotent additive migration for a pre-existing
+        // SQLite file whose api_keys table predates the `principal`
+        // column. SQLite has no `ADD COLUMN IF NOT EXISTS`; this file's
+        // established precedent (see the `timeline_events.sequence_number`
+        // migration below) is to issue the bare `ALTER TABLE ADD COLUMN`
+        // and swallow the error via `.ok()` — a duplicate-column error is
+        // the only failure mode on a column that already exists, so
+        // tolerating it is equivalent to a existence check without a
+        // second round-trip through `PRAGMA table_info`. Nullable, not a
+        // NOT NULL default, so a pre-existing row reads back `NULL` →
+        // `PrincipalKind::Unspecified`, never a fabricated `Human`.
+        sqlx::query("ALTER TABLE api_keys ADD COLUMN principal TEXT")
+            .execute(&self.pool)
+            .await
+            .ok();
 
         // Create timeline_events table. FK-free by design (see the PostgreSQL
         // arm's note): durability persists a kernel event the instant it is
@@ -2317,10 +2368,17 @@ impl DatabasePersistence for SqliteDatabase {
                 reason: format!("Failed to serialize rate limit: {}", e),
             })?;
 
+        // AUTHORSHIP-A2: nullable TEXT holding the serialized PrincipalKind
+        // (see the CREATE TABLE / migration comment above).
+        let principal =
+            serde_json::to_string(&key.principal).map_err(|e| SessionError::PersistenceError {
+                reason: format!("Failed to serialize principal: {}", e),
+            })?;
+
         sqlx::query(
             r#"
-            INSERT INTO api_keys (id, key_hash, prefix, user_id, name, permissions, rate_limit, created_at, expires_at, last_used, active)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+            INSERT INTO api_keys (id, key_hash, prefix, user_id, name, permissions, rate_limit, created_at, expires_at, last_used, active, principal)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
             ON CONFLICT(id) DO UPDATE SET
                 key_hash = excluded.key_hash,
                 prefix = excluded.prefix,
@@ -2331,7 +2389,8 @@ impl DatabasePersistence for SqliteDatabase {
                 created_at = excluded.created_at,
                 expires_at = excluded.expires_at,
                 last_used = excluded.last_used,
-                active = excluded.active
+                active = excluded.active,
+                principal = excluded.principal
             "#
         )
         .bind(&key.id)
@@ -2345,6 +2404,7 @@ impl DatabasePersistence for SqliteDatabase {
         .bind(key.expires_at)
         .bind(key.last_used)
         .bind(key.active)
+        .bind(principal)
         .execute(&self.pool)
         .await
         .map_err(|e| SessionError::PersistenceError {
@@ -2365,6 +2425,11 @@ impl DatabasePersistence for SqliteDatabase {
 
         let permissions_json: serde_json::Value = row.get("permissions");
         let permissions = serde_json::from_value(permissions_json).unwrap_or_else(|_| vec![]);
+        // AUTHORSHIP-A2: NULL or unparseable → Unspecified, never Human.
+        let principal = row
+            .get::<Option<String>, _>("principal")
+            .and_then(|raw| serde_json::from_str(&raw).ok())
+            .unwrap_or(PrincipalKind::Unspecified);
 
         Ok(ApiKey {
             id: row.get("id"),
@@ -2378,6 +2443,7 @@ impl DatabasePersistence for SqliteDatabase {
             last_used: row.get("last_used"),
             expires_at: row.get("expires_at"),
             active: true, // Default to active
+            principal,
         })
     }
 
@@ -2559,6 +2625,12 @@ fn row_to_api_key_sqlite(row: sqlx::sqlite::SqliteRow) -> ApiKey {
     let permissions = serde_json::from_value(permissions_json).unwrap_or_default();
     let rate_limit_json: serde_json::Value = row.get("rate_limit");
     let rate_limit = serde_json::from_value(rate_limit_json).ok().flatten();
+    // AUTHORSHIP-A2: NULL (pre-existing row) or unparseable → Unspecified,
+    // never Human — see the CREATE TABLE / migration comment above.
+    let principal = row
+        .get::<Option<String>, _>("principal")
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or(PrincipalKind::Unspecified);
     ApiKey {
         id: row.get("id"),
         name: row.get("name"),
@@ -2571,6 +2643,7 @@ fn row_to_api_key_sqlite(row: sqlx::sqlite::SqliteRow) -> ApiKey {
         last_used: row.get("last_used"),
         expires_at: row.get("expires_at"),
         active: row.get("active"),
+        principal,
     }
 }
 

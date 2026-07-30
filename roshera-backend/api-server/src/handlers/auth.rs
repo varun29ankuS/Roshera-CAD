@@ -10,7 +10,7 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use session_manager::SessionError;
+use session_manager::{PrincipalKind, SessionError};
 use tracing::{error, info, warn};
 
 /// Response payload for the logout endpoint.
@@ -139,11 +139,15 @@ pub async fn login(
 
     info!("Login successful for user: {}", user_id);
 
+    // Login is a human credential exchange: the caller supplied a
+    // username/password pair, which is the human-operator flow. There is
+    // no agent-model to honestly attach here.
     let token = auth_manager
         .create_token(
             &user_id,
             Some(user_data.email.clone()),
             vec!["user".to_string()],
+            PrincipalKind::Human,
         )
         .map_err(|e| {
             error!("Failed to create token: {:?}", e);
@@ -313,8 +317,13 @@ pub async fn refresh_token(
 
     let user_id = claims.sub;
 
+    // The refresh token already carries the original credential's
+    // principal (`AuthManager::create_token` stamps it on both the
+    // access and refresh claims) — forward it verbatim. Hardcoding
+    // `Human` here would silently decay an agent's credential to a
+    // human one on every refresh.
     let new_token = auth_manager
-        .create_token(&user_id, claims.email, claims.roles)
+        .create_token(&user_id, claims.email, claims.roles, claims.principal)
         .map_err(|e| {
             error!("Failed to create new token during refresh: {:?}", e);
             (StatusCode::INTERNAL_SERVER_ERROR, "Token creation failed")
@@ -417,6 +426,22 @@ pub struct ProvisionKeyRequest {
     /// string outside the baseline is refused (never silently clamped).
     pub permissions: Option<Vec<String>>,
     pub expires_in_days: Option<i64>,
+    /// What kind of principal this key will belong to (AUTHORSHIP-A2).
+    ///
+    /// This is a *declaration by the provisioner*, and that is the whole
+    /// point: it is the only attestation that exists. Omitted ⇒
+    /// [`PrincipalKind::Unspecified`], which maps to `Author::User` — the
+    /// minimal-commitment authorship, carrying only the verified id.
+    ///
+    /// Declaring `Agent { model }` is what lets an agent's operations be
+    /// recorded as `Author::AIAgent` at all. Note the residual: a human
+    /// may declare an agent key and have their own manual actions
+    /// recorded as an agent's. That is a *recorded, explicit* claim by an
+    /// authenticated caller about a credential they own, which is a
+    /// strictly smaller problem than silently inferring the value — and
+    /// it is the same open residual tracked for timeline authorship.
+    #[serde(default)]
+    pub principal: Option<PrincipalKind>,
 }
 
 #[derive(Debug, Serialize)]
@@ -515,12 +540,29 @@ pub async fn provision_api_key_handler(
     }
 
     let auth_manager = state.session_manager.auth_manager();
+    // AUTHORSHIP-A2: the new key's principal is DECLARED by the request,
+    // defaulting to `Unspecified` — it is deliberately NOT inherited from
+    // the requesting credential (`auth_info.principal`).
+    //
+    // Inheritance looks conservative and is in fact a fabrication in both
+    // directions. A human operator provisioning a key *for their agent*
+    // would stamp it `Human`, so every operation that agent later performs
+    // records as `Author::User` — agent work laundered as human work in an
+    // append-only log, which is exactly the impersonation class
+    // AUTHORSHIP-A1 closed. And an agent provisioning a key would stamp it
+    // `Agent { model: <its own model> }` even though the key may be minted
+    // for a different agent running a different model.
+    //
+    // Who provisions a credential simply does not determine whose
+    // credential it is. Unknown-until-declared is the only honest default.
+    let principal = payload.principal.clone().unwrap_or_default();
     match auth_manager
         .provision_api_key(
             &auth_info.user_id,
             name,
             permissions,
             payload.expires_in_days,
+            principal,
         )
         .await
     {

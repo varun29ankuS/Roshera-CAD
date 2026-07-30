@@ -11,7 +11,7 @@ use axum::{
     Json,
 };
 use serde::Serialize;
-use session_manager::{AuthManager, Permission};
+use session_manager::{AuthManager, Permission, PrincipalKind};
 use std::sync::Arc;
 use tracing::{info, warn};
 
@@ -41,6 +41,13 @@ pub struct AuthInfo {
     pub permissions: Vec<Permission>,
     pub roles: Vec<String>, // Added roles field for production compatibility
     pub is_api_key: bool,
+    /// The principal-kind claim minted at credential-issue time (see
+    /// `session_manager::PrincipalKind`). This is the honest human/agent
+    /// signal `is_api_key` was never able to provide — `is_api_key` stays
+    /// a legitimate transport fact (JWT vs. API key), while `principal`
+    /// is the identity fact `author_from_auth_info`
+    /// (`handlers/timeline.rs`) derives `Author::AIAgent` from.
+    pub principal: PrincipalKind,
 }
 
 /// The api-server's authentication posture, resolved once at startup
@@ -159,6 +166,7 @@ fn dev_auth_info() -> AuthInfo {
         ],
         roles: vec!["dev".to_string()],
         is_api_key: false,
+        principal: PrincipalKind::Human,
     }
 }
 
@@ -458,6 +466,7 @@ async fn validate_jwt(auth_manager: &AuthManager, token: &str) -> Result<AuthInf
                 permissions,
                 roles: vec!["user".to_string()], // Default role
                 is_api_key: false,
+                principal: claims.principal.clone(),
             })
         }
         Err(e) => {
@@ -501,6 +510,7 @@ async fn validate_api_key(
                 permissions,
                 roles: vec!["api_user".to_string()], // API key role
                 is_api_key: true,
+                principal: key_info.principal,
             })
         }
         Err(e) => {
@@ -655,6 +665,7 @@ mod tests {
             permissions: vec![Permission::ModifyGeometry],
             roles: vec![],
             is_api_key: false,
+            principal: PrincipalKind::Human,
         };
         let anon = AuthInfo {
             user_id: "anonymous".into(),
@@ -662,6 +673,7 @@ mod tests {
             permissions: vec![],
             roles: vec![],
             is_api_key: false,
+            principal: PrincipalKind::Human,
         };
 
         // Holding the required scope permits.

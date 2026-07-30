@@ -9,7 +9,7 @@ use axum::{
 use geometry_engine::operations::recorder::OperationRecorder;
 use geometry_engine::primitives::topology_builder::BRepModel;
 use serde::{Deserialize, Serialize};
-use session_manager::BroadcastMessage;
+use session_manager::{BroadcastMessage, PrincipalKind};
 use shared_types::{CADObject, ObjectId};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -2271,31 +2271,43 @@ pub struct CreateCheckpointRequest {
 /// that cannot be healed after the fact. Authorship must instead be
 /// *derived* from the principal the auth layer already validated.
 ///
-/// # Honest gap: no principal-type signal exists yet
+/// # The principal-kind claim (AUTHORSHIP-A2)
 ///
-/// `AuthInfo` (`auth_middleware.rs`) carries `is_api_key`, which
-/// distinguishes a JWT session from an API-key credential — but that
-/// is a transport distinction, not a human/agent one: an agent can
-/// hold either a JWT or an API key, and so can a human running a
-/// script. Neither `TokenClaims` (session-manager `auth.rs`) nor
-/// `ApiKey` carries a principal-kind field. There is therefore no
-/// honest signal in `AuthInfo` today that says "this credential
-/// belongs to an agent" — guessing from `is_api_key` would fabricate
-/// exactly the kind of unearned certainty this kernel refuses to
-/// produce elsewhere. Every authenticated principal is mapped to
-/// `Author::User` until a real principal-type claim (a JWT custom
-/// claim, or an `ApiKey.principal_kind` field) exists to derive
-/// `Author::AIAgent` from — that wiring is the next slice, not a
-/// guess made here.
+/// `AuthInfo.principal` (`session_manager::PrincipalKind`) is the honest
+/// human/agent signal `is_api_key` was never able to provide —
+/// `is_api_key` is a transport fact (JWT vs. API key) that an agent and
+/// a human can both hold either side of, whereas `principal` is minted
+/// once, at credential-issue time, by whoever authorized the credential
+/// (the login handler for a human; a provisioning caller forwarding its
+/// own principal for an API key) and carried verbatim through JWT
+/// verification / API-key lookup. It is never inferred from the
+/// request here — inferring it would reintroduce exactly the fabricated
+/// certainty this function used to warn against.
+///
+/// `PrincipalKind::Agent { model }` mints `Author::AIAgent` with that
+/// same model — never a guessed or hardcoded one, because
+/// `Author::AIAgent` carries a model and inventing one would be the
+/// fabrication in a new place. `PrincipalKind::Unspecified` (no claim
+/// present — a credential minted before this claim existed) and
+/// `PrincipalKind::Human` both map to `Author::User`: `Unspecified`
+/// must NOT be upgraded to `Author::AIAgent`, because `Author::User {
+/// id }` commits only to the *verified* id, while minting `AIAgent`
+/// would require a model nobody supplied.
 ///
 /// `name` is set equal to `user_id`: `AuthInfo` carries no separate
 /// display name (no email/username field survives JWT verification or
 /// API-key lookup today), so inventing one would itself be a
 /// fabrication this function exists to avoid.
 fn author_from_auth_info(auth: &AuthInfo) -> Author {
-    Author::User {
-        id: auth.user_id.clone(),
-        name: auth.user_id.clone(),
+    match &auth.principal {
+        PrincipalKind::Agent { model } => Author::AIAgent {
+            id: auth.user_id.clone(),
+            model: model.clone(),
+        },
+        PrincipalKind::Human | PrincipalKind::Unspecified => Author::User {
+            id: auth.user_id.clone(),
+            name: auth.user_id.clone(),
+        },
     }
 }
 
@@ -3145,12 +3157,21 @@ mod author_from_auth_info_tests {
     use super::*;
 
     fn auth_info(user_id: &str, is_api_key: bool) -> AuthInfo {
+        // No principal claim supplied — this models a credential that
+        // predates AUTHORSHIP-A2 (or simply never asserted a kind).
+        // `PrincipalKind::Unspecified` is the honest value here, never
+        // `Human`: see `unspecified_principal_never_mints_aiagent` below.
+        auth_info_with(user_id, is_api_key, PrincipalKind::Unspecified)
+    }
+
+    fn auth_info_with(user_id: &str, is_api_key: bool, principal: PrincipalKind) -> AuthInfo {
         AuthInfo {
             user_id: user_id.to_string(),
             session_id: None,
             permissions: vec![],
             roles: vec![],
             is_api_key,
+            principal,
         }
     }
 
@@ -3200,6 +3221,51 @@ mod author_from_auth_info_tests {
             alice, bob,
             "distinct authenticated principals must never be recorded as the \
              same author"
+        );
+    }
+
+    /// AUTHORSHIP-A2: the payoff. A credential minted with
+    /// `PrincipalKind::Agent { model }` — the honest signal that did not
+    /// exist before this slice — mints `Author::AIAgent` carrying that
+    /// SAME model, never a guessed or hardcoded one.
+    #[test]
+    fn agent_principal_mints_author_aiagent() {
+        let auth = auth_info_with(
+            "svc-integration",
+            true,
+            PrincipalKind::Agent {
+                model: "claude-opus-5".to_string(),
+            },
+        );
+        assert_eq!(
+            author_from_auth_info(&auth),
+            Author::AIAgent {
+                id: "svc-integration".to_string(),
+                model: "claude-opus-5".to_string(),
+            }
+        );
+    }
+
+    /// The mutation-proof for the honesty rule: an `Unspecified`
+    /// principal (no claim present — a credential minted before
+    /// AUTHORSHIP-A2, or one that simply never asserted a kind) must
+    /// NEVER mint `Author::AIAgent`. A "helpful" default of unknown →
+    /// agent would fabricate exactly the certainty this type exists to
+    /// prevent — this test must fail if that default is ever introduced.
+    #[test]
+    fn unspecified_principal_never_mints_aiagent() {
+        let auth = auth_info_with("legacy-caller", true, PrincipalKind::Unspecified);
+        let author = author_from_auth_info(&auth);
+        assert!(
+            !matches!(author, Author::AIAgent { .. }),
+            "an Unspecified principal must never mint Author::AIAgent, got {author:?}"
+        );
+        assert_eq!(
+            author,
+            Author::User {
+                id: "legacy-caller".to_string(),
+                name: "legacy-caller".to_string(),
+            }
         );
     }
 }

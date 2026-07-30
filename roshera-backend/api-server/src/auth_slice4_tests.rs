@@ -221,7 +221,12 @@ async fn websocket_session_command_after_authenticate_executes() {
     let token = state
         .session_manager
         .auth_manager()
-        .create_token("user_ws_session", None, vec!["user".to_string()])
+        .create_token(
+            "user_ws_session",
+            None,
+            vec!["user".to_string()],
+            session_manager::PrincipalKind::Human,
+        )
         .expect("token minting must succeed")
         .token;
 

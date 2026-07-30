@@ -22,7 +22,7 @@
 use chrono::Utc;
 use session_manager::{
     ApiKey, AuthConfig, AuthManager, DatabaseConfig, DatabasePersistence, DatabaseType,
-    SqliteDatabase,
+    PrincipalKind, SqliteDatabase,
 };
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
@@ -74,6 +74,7 @@ async fn provisioned_api_key_survives_simulated_restart() {
                 "ci key",
                 vec!["read".to_string(), "write".to_string()],
                 None,
+                PrincipalKind::Human,
             )
             .await
             .expect("provision must succeed and persist");
@@ -127,7 +128,13 @@ async fn api_key_is_lost_without_persistence_store() {
     // above is not actually exercising persistence.
     let auth1 = AuthManager::new(AuthConfig::default(), "s1").expect("auth mgr");
     let (raw, _key) = auth1
-        .provision_api_key("agent-x", "volatile", vec!["read".to_string()], None)
+        .provision_api_key(
+            "agent-x",
+            "volatile",
+            vec!["read".to_string()],
+            None,
+            PrincipalKind::Human,
+        )
         .await
         .expect("provision with no store behaves like create_api_key");
     assert!(
@@ -172,6 +179,7 @@ async fn inactive_persisted_key_stays_denied_after_restart() {
         last_used: None,
         expires_at: None,
         active: false,
+        principal: PrincipalKind::Unspecified,
     };
     {
         let db = open_db(&path).await;
@@ -197,5 +205,68 @@ async fn inactive_persisted_key_stays_denied_after_restart() {
     assert!(
         auth.verify_api_key(raw).is_err(),
         "an inactive (revoked) key must stay DENIED after a restart"
+    );
+}
+
+/// AUTHORSHIP-A2: the capability this whole slice exists to deliver is
+/// only real if it survives the SAME restart model the rest of this file
+/// exercises. Mint an API key with an explicit `Agent { model }`
+/// principal, persist it, reload it in a brand-new `AuthManager` over
+/// the same durable store, and assert the principal — INCLUDING the
+/// model string — comes back exactly. A `PrincipalKind::Unspecified`, a
+/// dropped model, or a silently-substituted `Human` would all mean the
+/// production agent path (the MCP server's `ROSHERA_API_KEY`) cannot
+/// honestly mint `Author::AIAgent` after any restart.
+#[tokio::test]
+async fn api_key_principal_round_trips_through_persistence() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir
+        .path()
+        .join("auth.db")
+        .to_string_lossy()
+        .replace('\\', "/");
+
+    let agent_principal = PrincipalKind::Agent {
+        model: "claude-opus-5".to_string(),
+    };
+
+    // ---- Boot 1: provision an agent-principal key against a durable store. ----
+    let key_id = {
+        let db = open_db(&path).await;
+        let auth = AuthManager::new(AuthConfig::default(), "boot-1-secret").expect("auth mgr");
+        auth.attach_api_key_store(db.clone());
+
+        let (_raw, key) = auth
+            .provision_api_key(
+                "agent-mcp",
+                "mcp key",
+                vec!["read".to_string(), "write".to_string()],
+                None,
+                agent_principal.clone(),
+            )
+            .await
+            .expect("provision must succeed and persist");
+        assert_eq!(
+            key.principal, agent_principal,
+            "the in-memory key must carry the requested Agent principal before any restart"
+        );
+        key.id
+    };
+
+    // ---- Boot 2: reload via load_all_api_keys, exactly as boot restore does. ----
+    let db2 = open_db(&path).await;
+    let restored_keys = db2
+        .load_all_api_keys()
+        .await
+        .expect("boot restore must query the store");
+    let restored = restored_keys
+        .into_iter()
+        .find(|k| k.id == key_id)
+        .expect("the provisioned key must come back from load_all_api_keys");
+
+    assert_eq!(
+        restored.principal, agent_principal,
+        "the Agent principal, including its model string, must survive a restart — \
+         never silently decaying to Unspecified or Human"
     );
 }
