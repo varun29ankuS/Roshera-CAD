@@ -7,9 +7,9 @@
  * and pinned-measurement hook re-fires its fetch in the new unit.
  *
  * On a 400 or network error the selection is REVERTED to the last known
- * good value and the backend reason is surfaced verbatim via the chat
- * panel (the house warn pattern — the same surface export/delete failures
- * use; no toast utility exists in this codebase).
+ * good value and the backend reason is surfaced verbatim via the
+ * Blackboard (the house warn pattern — the same surface export/delete
+ * failures use; no toast utility exists in this codebase).
  *
  * ## Why a native select rather than Menubar/Menubar-style dropdown
  * The workspace switcher in TopBar uses `Menubar` which is styled as a
@@ -27,7 +27,7 @@
 
 import { useState } from 'react'
 import { useUnitsStore } from '@/stores/units-store'
-import { useChatStore } from '@/stores/chat-store'
+import { useBlackboardStore } from '@/stores/blackboard-store'
 import {
   setDocumentUnit,
   UnitSetError,
@@ -38,7 +38,7 @@ import {
 export function UnitSelector() {
   const documentUnit = useUnitsStore((s) => s.documentUnit)
   const setDocumentUnitState = useUnitsStore((s) => s.setDocumentUnitState)
-  const addMessage = useChatStore((s) => s.addMessage)
+  const addLine = useBlackboardStore((s) => s.addLine)
 
   // Optimistic local state: update immediately on change, revert on error.
   const [pending, setPending] = useState(false)
@@ -62,11 +62,7 @@ export function UnitSelector() {
             : err instanceof Error
               ? err.message
               : String(err)
-        addMessage({
-          role: 'assistant',
-          content: `Unit change failed: ${reason}`,
-          isError: true,
-        })
+        addLine(`Unit change failed: ${reason}`, 'system')
       })
       .finally(() => {
         setPending(false)

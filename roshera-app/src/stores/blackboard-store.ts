@@ -6,8 +6,16 @@ import { create } from 'zustand'
  * The Blackboard supersedes the chat-transcript UX. Instead of a conversation
  * log of message bubbles, the panel is an editable *document of lines*. Every
  * line is independently editable in place; the agent appends its responses as
- * editable lines (not bubbles), and the user can edit any line — agent- or
- * user-authored.
+ * editable lines (not bubbles), and the user can edit any line — agent-,
+ * user-, or system-authored.
+ *
+ * `chat-store.ts` (the old toolbar-feedback channel — ~30 call sites, not a
+ * parallel chat lane) was folded in here rather than kept as a separate
+ * notification channel: the timeline already records both human and agent
+ * actions, and one log matching that is more coherent. Its feedback lands as
+ * `'system'` lines — the app reporting what it did (a toolbar operation's
+ * result), as distinct from `'user'` (someone typed it) or `'agent'` (the AI
+ * said it).
  *
  * Two things are kept in lock-step (Varun's "logged = both" choice):
  *   1. `lines`  — the ordered *current state* of the document.
@@ -19,7 +27,7 @@ import { create } from 'zustand'
  * then asks the persistence adapter to save. State and log never drift.
  */
 
-export type LineAuthor = 'user' | 'agent'
+export type LineAuthor = 'user' | 'agent' | 'system'
 
 /**
  * SCOPE

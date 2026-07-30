@@ -1,6 +1,6 @@
 import { useEffect, useRef } from 'react'
 import { useSceneStore } from '@/stores/scene-store'
-import { useChatStore } from '@/stores/chat-store'
+import { useBlackboardStore } from '@/stores/blackboard-store'
 import { useUnitsStore } from '@/stores/units-store'
 import { measureFaces, MeasureRefusalError } from '@/lib/measure-api'
 
@@ -25,7 +25,7 @@ import { measureFaces, MeasureRefusalError } from '@/lib/measure-api'
  *   - 2xx → `updatePinnedMeasurement` swaps the row in place (fresh
  *     value + anchor, same pin identity).
  *   - 4xx (kernel refusal / face no longer resolves) → the pin is
- *     dismissed and a chat note reports "measurement removed: <reason>"
+ *     dismissed and a Blackboard line reports "measurement removed: <reason>"
  *     with the backend's reason verbatim.
  *   - 5xx / network errors → the pin is KEPT and the failure logged;
  *     transient backend trouble must not eat the user's pins.
@@ -85,11 +85,12 @@ export function usePinnedMeasurementsRevalidation(): void {
           // The object survives but no longer resolves to a kernel solid
           // (e.g. replaced by a frame without analytical_geometry).
           state.dismissMeasurement(pin.id)
-          useChatStore.getState().addMessage({
-            role: 'assistant',
-            content:
-              'measurement removed: a measured object no longer resolves to a kernel solid',
-          })
+          useBlackboardStore
+            .getState()
+            .addLine(
+              'Measurement removed — the measured object no longer resolves to a kernel solid.',
+              'system',
+            )
           continue
         }
 
@@ -106,11 +107,10 @@ export function usePinnedMeasurementsRevalidation(): void {
           if (cancelled) return
           if (err instanceof MeasureRefusalError) {
             useSceneStore.getState().dismissMeasurement(pin.id)
-            useChatStore.getState().addMessage({
-              role: 'assistant',
-              // Backend reason verbatim — no paraphrase.
-              content: `measurement removed: ${err.reason}`,
-            })
+            // Backend reason verbatim — no paraphrase.
+            useBlackboardStore
+              .getState()
+              .addLine(`Measurement removed — ${err.reason}`, 'system')
           } else {
             // Transient (5xx / network): keep the pin, log, move on.
             console.warn(

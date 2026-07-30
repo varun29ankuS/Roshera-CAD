@@ -27,7 +27,7 @@ import { useDocModeStore, type DocumentMode } from '@/stores/doc-mode-store'
 import { useSceneStore, CAMERA_PRESETS } from '@/stores/scene-store'
 import { useWSStore } from '@/stores/ws-store'
 import { useThemeStore } from '@/stores/theme-store'
-import { useChatStore } from '@/stores/chat-store'
+import { useBlackboardStore } from '@/stores/blackboard-store'
 import { wsClient } from '@/lib/ws-client'
 import { exportSceneAs } from '@/lib/export-api'
 
@@ -112,17 +112,17 @@ async function timelineAction(action: 'undo' | 'redo'): Promise<void> {
 }
 
 async function runExport(format: string): Promise<void> {
-  const { addMessage } = useChatStore.getState()
-  addMessage({ role: 'user', content: `Export scene as ${format}` })
+  const { addLine } = useBlackboardStore.getState()
+  addLine(`Exporting the scene as ${format}.`, 'system')
   const result = await exportSceneAs(format)
-  addMessage({
-    role: 'assistant',
-    content: result.ok
+  addLine(
+    result.ok
       ? result.filename
         ? `Exported as ${result.filename}.`
         : 'Export ready.'
       : `Export failed: ${result.error ?? 'unknown error'}`,
-  })
+    'system',
+  )
 }
 
 function deleteSelected(): void {

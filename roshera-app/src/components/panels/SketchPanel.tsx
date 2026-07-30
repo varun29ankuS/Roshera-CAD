@@ -42,7 +42,7 @@ import {
   type SketchTool,
   type StandardPlane,
 } from '@/stores/scene-store'
-import { useChatStore } from '@/stores/chat-store'
+import { useBlackboardStore } from '@/stores/blackboard-store'
 import {
   buildProfile2D,
   perimeter,
@@ -260,8 +260,7 @@ export function SketchPanel() {
       // the same profile. Without this, the backend deletes the
       // session (default behaviour) and re-edit silently fails because
       // there's nothing to load.
-      const { addMessage } = useChatStore.getState()
-      let affectedId: string
+      const { addLine } = useBlackboardStore.getState()
 
       if (finishOp === 'extrude_cut') {
         if (!cutTargetId) {
@@ -269,17 +268,15 @@ export function SketchPanel() {
           setError('Select a body to cut from (click it in the viewport), then retry.')
           return
         }
-        const result = await sketchApi.extrudeCut(serverId, {
+        await sketchApi.extrudeCut(serverId, {
           distance: sketch.thickness,
           target_id: cutTargetId,
           consume: false,
         })
-        affectedId = result.target_id
-        addMessage({
-          role: 'assistant',
-          content: `Cut ${sketch.tool} (t=${sketch.thickness}) from body ${cutTargetId.slice(0, 8)} on ${planeLabel(sketch.plane)} plane.`,
-          objectsAffected: [affectedId],
-        })
+        addLine(
+          `Cut the ${sketch.tool} profile (depth ${sketch.thickness}) from body ${cutTargetId.slice(0, 8)} on the ${planeLabel(sketch.plane)} plane.`,
+          'system',
+        )
       } else if (finishOp === 'revolve') {
         const dirMag = Math.hypot(...revolveAxisDir)
         if (!Number.isFinite(dirMag) || dirMag < 1e-9) {
@@ -296,36 +293,32 @@ export function SketchPanel() {
           name: `${sketch.tool}-revolve`,
           consume: false,
         })
-        affectedId = result.object.id
         const stats =
           result.stats?.vertex_count && result.stats?.triangle_count
             ? ` (${result.stats.vertex_count} verts, ${result.stats.triangle_count} tris${
                 result.stats.tessellation_ms ? `, ${result.stats.tessellation_ms} ms` : ''
               })`
             : ''
-        addMessage({
-          role: 'assistant',
-          content: `Revolved ${sketch.tool} on ${planeLabel(sketch.plane)} plane (${revolveAngleDeg}°)${stats}.`,
-          objectsAffected: [affectedId],
-        })
+        addLine(
+          `Revolved the ${sketch.tool} profile on the ${planeLabel(sketch.plane)} plane through ${revolveAngleDeg}°${stats}.`,
+          'system',
+        )
       } else {
         const result = await sketchApi.extrude(serverId, {
           distance: sketch.thickness,
           name: `${sketch.tool}-extrude`,
           consume: false,
         })
-        affectedId = result.object.id
         const stats =
           result.stats?.vertex_count && result.stats?.triangle_count
             ? ` (${result.stats.vertex_count} verts, ${result.stats.triangle_count} tris${
                 result.stats.tessellation_ms ? `, ${result.stats.tessellation_ms} ms` : ''
               })`
             : ''
-        addMessage({
-          role: 'assistant',
-          content: `Extruded ${sketch.tool} on ${planeLabel(sketch.plane)} plane (t=${sketch.thickness})${stats}.`,
-          objectsAffected: [affectedId],
-        })
+        addLine(
+          `Extruded the ${sketch.tool} profile ${sketch.thickness} mm on the ${planeLabel(sketch.plane)} plane${stats}.`,
+          'system',
+        )
       }
       // We pass `consume: false` above, so the backend keeps the
       // session alive — but the user is done with this editing pass,

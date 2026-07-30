@@ -44,8 +44,8 @@ import {
   type LucideIcon,
 } from 'lucide-react'
 import { useSceneStore, type TransformTool } from '@/stores/scene-store'
-import { useChatStore } from '@/stores/chat-store'
-import { processUserMessage } from '@/lib/ai-client'
+import { useBlackboardStore } from '@/stores/blackboard-store'
+import { processBlackboardMessage } from '@/lib/ai-client'
 import { exportSceneAs } from '@/lib/export-api'
 import { measureFaces, MeasureRefusalError } from '@/lib/measure-api'
 import { cn } from '@/lib/utils'
@@ -100,11 +100,11 @@ async function sendDirectGeometry(
   shapeType: string,
   parameters: Record<string, number>,
 ) {
-  const { addMessage, setProcessing } = useChatStore.getState()
-  const label = `${shapeType} (${Object.entries(parameters).map(([k, v]) => `${k}=${v}`).join(', ')})`
-   
+  const { addLine, setProcessing } = useBlackboardStore.getState()
+  const label = `${shapeType} (${Object.entries(parameters).map(([k, v]) => `${k} ${v}`).join(', ')})`
+
   console.log('[toolbar] sendDirectGeometry click', { shapeType, parameters, url: `${API_BASE}/geometry` })
-  addMessage({ role: 'user', content: `Create ${label}` })
+  addLine(`Creating ${label}.`, 'system')
   setProcessing(true)
 
   try {
@@ -140,22 +140,17 @@ async function sendDirectGeometry(
       throw new Error(data?.error || 'malformed response')
     }
 
-    const objectId = String(data.object.id)
     const stats = data.stats
       ? ` (${data.stats.vertex_count} verts, ${data.stats.triangle_count} tris, ${data.stats.tessellation_ms} ms)`
       : ''
-    addMessage({
-      role: 'assistant',
-      content: `Created ${shapeType}${stats}.`,
-      objectsAffected: [objectId],
-    })
+    addLine(`Created ${shapeType}${stats}.`, 'system')
   } catch (err) {
     // Direct API unavailable — fall back to NLP pipeline
-     
+
     console.warn('[toolbar] direct geometry failed, falling back to NLP', err)
-    await processUserMessage(`create a ${shapeType} ${Object.entries(parameters).map(([k, v]) => `${k} ${v}`).join(' ')}`)
+    await processBlackboardMessage(`create a ${shapeType} ${Object.entries(parameters).map(([k, v]) => `${k} ${v}`).join(' ')}`)
   } finally {
-    useChatStore.getState().setProcessing(false)
+    useBlackboardStore.getState().setProcessing(false)
   }
 }
 
@@ -171,19 +166,17 @@ async function sendDirectGeometry(
 async function sendDirectBoolean(
   operation: 'union' | 'intersection' | 'difference',
 ) {
-  const { addMessage, setProcessing } = useChatStore.getState()
+  const { addLine, setProcessing } = useBlackboardStore.getState()
   const selectedIds = Array.from(useSceneStore.getState().selectedIds)
+  const opLabel = operation[0].toUpperCase() + operation.slice(1)
 
   if (selectedIds.length < 2) {
-    addMessage({
-      role: 'assistant',
-      content: `Select two objects before running ${operation}.`,
-    })
+    addLine(`Select two objects before running ${operation}.`, 'system')
     return
   }
 
   const [a, b] = selectedIds
-  addMessage({ role: 'user', content: `${operation} (${a.slice(0, 6)} ↔ ${b.slice(0, 6)})` })
+  addLine(`${opLabel} of ${a.slice(0, 6)} and ${b.slice(0, 6)}.`, 'system')
   setProcessing(true)
 
   try {
@@ -203,23 +196,15 @@ async function sendDirectBoolean(
       throw new Error(data?.error || 'malformed response')
     }
 
-    const objectId = String(data.object.id)
     const stats = data.stats
       ? ` (${data.stats.vertex_count} verts, ${data.stats.triangle_count} tris, ${data.stats.tessellation_ms} ms)`
       : ''
-    addMessage({
-      role: 'assistant',
-      content: `${operation}${stats}.`,
-      objectsAffected: [objectId],
-    })
+    addLine(`${opLabel} complete${stats}.`, 'system')
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
-    addMessage({
-      role: 'assistant',
-      content: `${operation} failed: ${msg}`,
-    })
+    addLine(`${opLabel} failed: ${msg}`, 'system')
   } finally {
-    useChatStore.getState().setProcessing(false)
+    useBlackboardStore.getState().setProcessing(false)
   }
 }
 
@@ -232,26 +217,20 @@ async function sendDirectBoolean(
  * frontend's WS bridge reconciles the scene store.
  */
 async function sendDirectShell(thickness: number) {
-  const { addMessage, setProcessing } = useChatStore.getState()
+  const { addLine, setProcessing } = useBlackboardStore.getState()
   const selectedIds = Array.from(useSceneStore.getState().selectedIds)
 
   if (selectedIds.length !== 1) {
-    addMessage({
-      role: 'assistant',
-      content: 'Select exactly one solid before running Shell.',
-    })
+    addLine('Select exactly one solid before running Shell.', 'system')
     return
   }
   if (!Number.isFinite(thickness) || thickness <= 0) {
-    addMessage({
-      role: 'assistant',
-      content: `Shell thickness must be a positive number, got ${thickness}.`,
-    })
+    addLine(`Shell thickness must be a positive number — got ${thickness}.`, 'system')
     return
   }
 
   const [object] = selectedIds
-  addMessage({ role: 'user', content: `Shell ${object.slice(0, 6)} thickness ${thickness}` })
+  addLine(`Shelling ${object.slice(0, 6)} to a wall thickness of ${thickness}.`, 'system')
   setProcessing(true)
 
   try {
@@ -268,14 +247,10 @@ async function sendDirectShell(thickness: number) {
     if (data?.success !== true || !data.object) {
       throw new Error(data?.error || 'malformed response')
     }
-    addMessage({
-      role: 'assistant',
-      content: `Shelled ${object.slice(0, 6)} (thickness ${thickness}).`,
-      objectsAffected: [String(data.object.id)],
-    })
+    addLine(`Shelled ${object.slice(0, 6)} to a wall thickness of ${thickness}.`, 'system')
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
-    addMessage({ role: 'assistant', content: `Shell failed: ${msg}` })
+    addLine(`Shell failed: ${msg}`, 'system')
   } finally {
     setProcessing(false)
   }
@@ -289,14 +264,11 @@ async function sendDirectShell(thickness: number) {
  * the world Z=0 plane).
  */
 async function sendDirectMirror(plane: 'xy' | 'yz' | 'xz' = 'xy') {
-  const { addMessage, setProcessing } = useChatStore.getState()
+  const { addLine, setProcessing } = useBlackboardStore.getState()
   const selectedIds = Array.from(useSceneStore.getState().selectedIds)
 
   if (selectedIds.length !== 1) {
-    addMessage({
-      role: 'assistant',
-      content: 'Select exactly one solid before running Mirror.',
-    })
+    addLine('Select exactly one solid before running Mirror.', 'system')
     return
   }
 
@@ -304,7 +276,7 @@ async function sendDirectMirror(plane: 'xy' | 'yz' | 'xz' = 'xy') {
   const plane_normal: [number, number, number] =
     plane === 'xy' ? [0, 0, 1] : plane === 'yz' ? [1, 0, 0] : [0, 1, 0]
 
-  addMessage({ role: 'user', content: `Mirror ${object.slice(0, 6)} across ${plane.toUpperCase()} plane` })
+  addLine(`Mirroring ${object.slice(0, 6)} across the ${plane.toUpperCase()} plane.`, 'system')
   setProcessing(true)
 
   try {
@@ -325,14 +297,10 @@ async function sendDirectMirror(plane: 'xy' | 'yz' | 'xz' = 'xy') {
     if (data?.success !== true || !data.object) {
       throw new Error(data?.error || 'malformed response')
     }
-    addMessage({
-      role: 'assistant',
-      content: `Mirrored ${object.slice(0, 6)} across ${plane.toUpperCase()}.`,
-      objectsAffected: [String(data.object.id)],
-    })
+    addLine(`Mirrored ${object.slice(0, 6)} across the ${plane.toUpperCase()} plane.`, 'system')
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
-    addMessage({ role: 'assistant', content: `Mirror failed: ${msg}` })
+    addLine(`Mirror failed: ${msg}`, 'system')
   } finally {
     setProcessing(false)
   }
@@ -347,22 +315,16 @@ async function sendDirectMirror(plane: 'xy' | 'yz' | 'xz' = 'xy') {
  * edges are picked instead of routing through the NLP pipeline.
  */
 async function sendDirectFillet(radius: number) {
-  const { addMessage, setProcessing } = useChatStore.getState()
+  const { addLine, setProcessing } = useBlackboardStore.getState()
   const sceneState = useSceneStore.getState()
   const selectedIds = Array.from(sceneState.selectedIds)
 
   if (selectedIds.length !== 1) {
-    addMessage({
-      role: 'assistant',
-      content: 'Select exactly one solid before running Fillet.',
-    })
+    addLine('Select exactly one solid before running Fillet.', 'system')
     return
   }
   if (!Number.isFinite(radius) || radius <= 0) {
-    addMessage({
-      role: 'assistant',
-      content: 'Fillet radius must be a positive number.',
-    })
+    addLine('Fillet radius must be a positive number.', 'system')
     return
   }
 
@@ -372,18 +334,17 @@ async function sendDirectFillet(radius: number) {
     .map((s) => s.index)
 
   if (edges.length === 0) {
-    addMessage({
-      role: 'assistant',
-      content:
-        'Pick one or more edges (Edge selection mode → click edges) before running Fillet.',
-    })
+    addLine(
+      'Pick one or more edges (Edge selection mode → click edges) before running Fillet.',
+      'system',
+    )
     return
   }
 
-  addMessage({
-    role: 'user',
-    content: `Fillet ${edges.length} edge${edges.length === 1 ? '' : 's'} of ${object.slice(0, 6)} (radius ${radius})`,
-  })
+  addLine(
+    `Filleting ${edges.length} edge${edges.length === 1 ? '' : 's'} of ${object.slice(0, 6)} at radius ${radius}.`,
+    'system',
+  )
   setProcessing(true)
 
   try {
@@ -400,14 +361,13 @@ async function sendDirectFillet(radius: number) {
     if (data?.success !== true || !data.object) {
       throw new Error(data?.error || 'malformed response')
     }
-    addMessage({
-      role: 'assistant',
-      content: `Filleted ${edges.length} edge${edges.length === 1 ? '' : 's'} of ${object.slice(0, 6)} at radius ${radius}.`,
-      objectsAffected: [String(data.object.id)],
-    })
+    addLine(
+      `Filleted ${edges.length} edge${edges.length === 1 ? '' : 's'} of ${object.slice(0, 6)} at radius ${radius}.`,
+      'system',
+    )
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
-    addMessage({ role: 'assistant', content: `Fillet failed: ${msg}` })
+    addLine(`Fillet failed: ${msg}`, 'system')
   } finally {
     setProcessing(false)
   }
@@ -425,15 +385,12 @@ async function sendDirectFillet(radius: number) {
  * dispatching a mis-aligned payload.
  */
 async function sendDirectFilletVariable(radii: number[]) {
-  const { addMessage, setProcessing } = useChatStore.getState()
+  const { addLine, setProcessing } = useBlackboardStore.getState()
   const sceneState = useSceneStore.getState()
   const selectedIds = Array.from(sceneState.selectedIds)
 
   if (selectedIds.length !== 1) {
-    addMessage({
-      role: 'assistant',
-      content: 'Select exactly one solid before running Fillet.',
-    })
+    addLine('Select exactly one solid before running Fillet.', 'system')
     return
   }
 
@@ -443,32 +400,28 @@ async function sendDirectFilletVariable(radii: number[]) {
     .map((s) => s.index)
 
   if (edges.length === 0) {
-    addMessage({
-      role: 'assistant',
-      content:
-        'Pick one or more edges (Edge selection mode → click edges) before running Fillet.',
-    })
+    addLine(
+      'Pick one or more edges (Edge selection mode → click edges) before running Fillet.',
+      'system',
+    )
     return
   }
   if (radii.length !== edges.length) {
-    addMessage({
-      role: 'assistant',
-      content: `Per-edge fillet payload mismatch: ${radii.length} radii for ${edges.length} picked edges. Reopen the dialog and retry.`,
-    })
+    addLine(
+      `Picked ${edges.length} edges but got ${radii.length} radii — reopen the dialog and try again.`,
+      'system',
+    )
     return
   }
   if (!radii.every((r) => Number.isFinite(r) && r > 0)) {
-    addMessage({
-      role: 'assistant',
-      content: 'Every per-edge radius must be a positive finite number.',
-    })
+    addLine('Every per-edge radius must be a positive finite number.', 'system')
     return
   }
 
-  addMessage({
-    role: 'user',
-    content: `Fillet ${edges.length} edge${edges.length === 1 ? '' : 's'} of ${object.slice(0, 6)} (per-edge radii [${radii.join(', ')}])`,
-  })
+  addLine(
+    `Filleting ${edges.length} edge${edges.length === 1 ? '' : 's'} of ${object.slice(0, 6)} with per-edge radii ${radii.join(', ')}.`,
+    'system',
+  )
   setProcessing(true)
 
   try {
@@ -485,14 +438,13 @@ async function sendDirectFilletVariable(radii: number[]) {
     if (data?.success !== true || !data.object) {
       throw new Error(data?.error || 'malformed response')
     }
-    addMessage({
-      role: 'assistant',
-      content: `Filleted ${edges.length} edge${edges.length === 1 ? '' : 's'} of ${object.slice(0, 6)} with per-edge radii [${radii.join(', ')}].`,
-      objectsAffected: [String(data.object.id)],
-    })
+    addLine(
+      `Filleted ${edges.length} edge${edges.length === 1 ? '' : 's'} of ${object.slice(0, 6)} with per-edge radii ${radii.join(', ')}.`,
+      'system',
+    )
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
-    addMessage({ role: 'assistant', content: `Fillet failed: ${msg}` })
+    addLine(`Fillet failed: ${msg}`, 'system')
   } finally {
     setProcessing(false)
   }
@@ -507,22 +459,16 @@ async function sendDirectFilletVariable(radii: number[]) {
  * Wire shape: `{ object, edges, radius: { kind: "linear", start, end } }`.
  */
 async function sendDirectFilletLinear(start: number, end: number) {
-  const { addMessage, setProcessing } = useChatStore.getState()
+  const { addLine, setProcessing } = useBlackboardStore.getState()
   const sceneState = useSceneStore.getState()
   const selectedIds = Array.from(sceneState.selectedIds)
 
   if (selectedIds.length !== 1) {
-    addMessage({
-      role: 'assistant',
-      content: 'Select exactly one solid before running Fillet.',
-    })
+    addLine('Select exactly one solid before running Fillet.', 'system')
     return
   }
   if (!Number.isFinite(start) || start <= 0 || !Number.isFinite(end) || end <= 0) {
-    addMessage({
-      role: 'assistant',
-      content: 'Linear fillet endpoints must be positive finite numbers.',
-    })
+    addLine('Linear fillet endpoints must be positive finite numbers.', 'system')
     return
   }
 
@@ -532,18 +478,17 @@ async function sendDirectFilletLinear(start: number, end: number) {
     .map((s) => s.index)
 
   if (edges.length === 0) {
-    addMessage({
-      role: 'assistant',
-      content:
-        'Pick one or more edges (Edge selection mode → click edges) before running Fillet.',
-    })
+    addLine(
+      'Pick one or more edges (Edge selection mode → click edges) before running Fillet.',
+      'system',
+    )
     return
   }
 
-  addMessage({
-    role: 'user',
-    content: `Fillet ${edges.length} edge${edges.length === 1 ? '' : 's'} of ${object.slice(0, 6)} (linear ${start} → ${end})`,
-  })
+  addLine(
+    `Filleting ${edges.length} edge${edges.length === 1 ? '' : 's'} of ${object.slice(0, 6)} with a linear profile from ${start} to ${end}.`,
+    'system',
+  )
   setProcessing(true)
 
   try {
@@ -564,14 +509,13 @@ async function sendDirectFilletLinear(start: number, end: number) {
     if (data?.success !== true || !data.object) {
       throw new Error(data?.error || 'malformed response')
     }
-    addMessage({
-      role: 'assistant',
-      content: `Filleted ${edges.length} edge${edges.length === 1 ? '' : 's'} of ${object.slice(0, 6)} with linear profile ${start} → ${end}.`,
-      objectsAffected: [String(data.object.id)],
-    })
+    addLine(
+      `Filleted ${edges.length} edge${edges.length === 1 ? '' : 's'} of ${object.slice(0, 6)} with a linear profile from ${start} to ${end}.`,
+      'system',
+    )
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
-    addMessage({ role: 'assistant', content: `Fillet failed: ${msg}` })
+    addLine(`Fillet failed: ${msg}`, 'system')
   } finally {
     setProcessing(false)
   }
@@ -592,22 +536,16 @@ async function sendDirectFilletLinear(start: number, end: number) {
  * same predicate and the api-server re-validates at the wire edge.
  */
 async function sendDirectFilletStations(samples: Array<[number, number]>) {
-  const { addMessage, setProcessing } = useChatStore.getState()
+  const { addLine, setProcessing } = useBlackboardStore.getState()
   const sceneState = useSceneStore.getState()
   const selectedIds = Array.from(sceneState.selectedIds)
 
   if (selectedIds.length !== 1) {
-    addMessage({
-      role: 'assistant',
-      content: 'Select exactly one solid before running Fillet.',
-    })
+    addLine('Select exactly one solid before running Fillet.', 'system')
     return
   }
   if (samples.length === 0) {
-    addMessage({
-      role: 'assistant',
-      content: 'Add at least one (station, radius) row before running Fillet.',
-    })
+    addLine('Add at least one station/radius row before running Fillet.', 'system')
     return
   }
   const bad = samples.find(
@@ -619,10 +557,7 @@ async function sendDirectFilletStations(samples: Array<[number, number]>) {
       r <= 0,
   )
   if (bad) {
-    addMessage({
-      role: 'assistant',
-      content: 'Every station must be in [0, 1] with a positive radius.',
-    })
+    addLine('Every station must be in [0, 1] with a positive radius.', 'system')
     return
   }
 
@@ -632,11 +567,10 @@ async function sendDirectFilletStations(samples: Array<[number, number]>) {
     .map((s) => s.index)
 
   if (edges.length === 0) {
-    addMessage({
-      role: 'assistant',
-      content:
-        'Pick one or more edges (Edge selection mode → click edges) before running Fillet.',
-    })
+    addLine(
+      'Pick one or more edges (Edge selection mode → click edges) before running Fillet.',
+      'system',
+    )
     return
   }
 
@@ -644,10 +578,10 @@ async function sendDirectFilletStations(samples: Array<[number, number]>) {
     .map(([s, r]) => `(${s}, ${r})`)
     .join(', ')
 
-  addMessage({
-    role: 'user',
-    content: `Fillet ${edges.length} edge${edges.length === 1 ? '' : 's'} of ${object.slice(0, 6)} with ${samples.length} station${samples.length === 1 ? '' : 's'}: ${summary}`,
-  })
+  addLine(
+    `Filleting ${edges.length} edge${edges.length === 1 ? '' : 's'} of ${object.slice(0, 6)} with ${samples.length} station${samples.length === 1 ? '' : 's'}: ${summary}.`,
+    'system',
+  )
   setProcessing(true)
 
   try {
@@ -668,14 +602,13 @@ async function sendDirectFilletStations(samples: Array<[number, number]>) {
     if (data?.success !== true || !data.object) {
       throw new Error(data?.error || 'malformed response')
     }
-    addMessage({
-      role: 'assistant',
-      content: `Filleted ${edges.length} edge${edges.length === 1 ? '' : 's'} of ${object.slice(0, 6)} with ${samples.length} station${samples.length === 1 ? '' : 's'}.`,
-      objectsAffected: [String(data.object.id)],
-    })
+    addLine(
+      `Filleted ${edges.length} edge${edges.length === 1 ? '' : 's'} of ${object.slice(0, 6)} with ${samples.length} station${samples.length === 1 ? '' : 's'}.`,
+      'system',
+    )
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
-    addMessage({ role: 'assistant', content: `Fillet failed: ${msg}` })
+    addLine(`Fillet failed: ${msg}`, 'system')
   } finally {
     setProcessing(false)
   }
@@ -686,22 +619,16 @@ async function sendDirectFilletStations(samples: Array<[number, number]>) {
  * chamfer (distance1 == distance2 == distance) — most common case.
  */
 async function sendDirectChamfer(distance: number) {
-  const { addMessage, setProcessing } = useChatStore.getState()
+  const { addLine, setProcessing } = useBlackboardStore.getState()
   const sceneState = useSceneStore.getState()
   const selectedIds = Array.from(sceneState.selectedIds)
 
   if (selectedIds.length !== 1) {
-    addMessage({
-      role: 'assistant',
-      content: 'Select exactly one solid before running Chamfer.',
-    })
+    addLine('Select exactly one solid before running Chamfer.', 'system')
     return
   }
   if (!Number.isFinite(distance) || distance <= 0) {
-    addMessage({
-      role: 'assistant',
-      content: 'Chamfer distance must be a positive number.',
-    })
+    addLine('Chamfer distance must be a positive number.', 'system')
     return
   }
 
@@ -711,18 +638,17 @@ async function sendDirectChamfer(distance: number) {
     .map((s) => s.index)
 
   if (edges.length === 0) {
-    addMessage({
-      role: 'assistant',
-      content:
-        'Pick one or more edges (Edge selection mode → click edges) before running Chamfer.',
-    })
+    addLine(
+      'Pick one or more edges (Edge selection mode → click edges) before running Chamfer.',
+      'system',
+    )
     return
   }
 
-  addMessage({
-    role: 'user',
-    content: `Chamfer ${edges.length} edge${edges.length === 1 ? '' : 's'} of ${object.slice(0, 6)} (distance ${distance})`,
-  })
+  addLine(
+    `Chamfering ${edges.length} edge${edges.length === 1 ? '' : 's'} of ${object.slice(0, 6)} at distance ${distance}.`,
+    'system',
+  )
   setProcessing(true)
 
   try {
@@ -739,14 +665,13 @@ async function sendDirectChamfer(distance: number) {
     if (data?.success !== true || !data.object) {
       throw new Error(data?.error || 'malformed response')
     }
-    addMessage({
-      role: 'assistant',
-      content: `Chamfered ${edges.length} edge${edges.length === 1 ? '' : 's'} of ${object.slice(0, 6)} at distance ${distance}.`,
-      objectsAffected: [String(data.object.id)],
-    })
+    addLine(
+      `Chamfered ${edges.length} edge${edges.length === 1 ? '' : 's'} of ${object.slice(0, 6)} at distance ${distance}.`,
+      'system',
+    )
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
-    addMessage({ role: 'assistant', content: `Chamfer failed: ${msg}` })
+    addLine(`Chamfer failed: ${msg}`, 'system')
   } finally {
     setProcessing(false)
   }
@@ -763,24 +688,21 @@ async function sendDirectLinearPattern(
   spacing: number = 15,
   count: number = 3,
 ) {
-  const { addMessage, setProcessing } = useChatStore.getState()
+  const { addLine, setProcessing } = useBlackboardStore.getState()
   const selectedIds = Array.from(useSceneStore.getState().selectedIds)
 
   if (selectedIds.length !== 1) {
-    addMessage({
-      role: 'assistant',
-      content: 'Select exactly one solid before running Linear Pattern.',
-    })
+    addLine('Select exactly one solid before running Linear Pattern.', 'system')
     return
   }
   const [object] = selectedIds
   const direction: [number, number, number] =
     axis === 'x' ? [1, 0, 0] : axis === 'y' ? [0, 1, 0] : [0, 0, 1]
 
-  addMessage({
-    role: 'user',
-    content: `Linear pattern ${object.slice(0, 6)} × ${count} along ${axis.toUpperCase()} (spacing ${spacing})`,
-  })
+  addLine(
+    `Patterning ${object.slice(0, 6)} × ${count} along ${axis.toUpperCase()} (spacing ${spacing}).`,
+    'system',
+  )
   setProcessing(true)
 
   try {
@@ -797,14 +719,10 @@ async function sendDirectLinearPattern(
     if (data?.success !== true) {
       throw new Error(data?.error || 'malformed response')
     }
-    addMessage({
-      role: 'assistant',
-      content: `Linear pattern: created ${data.count} copies of ${object.slice(0, 6)}.`,
-      objectsAffected: Array.isArray(data.ids) ? data.ids.map(String) : [],
-    })
+    addLine(`Linear pattern: created ${data.count} copies of ${object.slice(0, 6)}.`, 'system')
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
-    addMessage({ role: 'assistant', content: `Linear pattern failed: ${msg}` })
+    addLine(`Linear pattern failed: ${msg}`, 'system')
   } finally {
     setProcessing(false)
   }
@@ -820,24 +738,21 @@ async function sendDirectCircularPattern(
   count: number = 6,
   totalAngleRad: number = Math.PI * 2,
 ) {
-  const { addMessage, setProcessing } = useChatStore.getState()
+  const { addLine, setProcessing } = useBlackboardStore.getState()
   const selectedIds = Array.from(useSceneStore.getState().selectedIds)
 
   if (selectedIds.length !== 1) {
-    addMessage({
-      role: 'assistant',
-      content: 'Select exactly one solid before running Circular Pattern.',
-    })
+    addLine('Select exactly one solid before running Circular Pattern.', 'system')
     return
   }
   const [object] = selectedIds
   const axisVec: [number, number, number] =
     axis === 'x' ? [1, 0, 0] : axis === 'y' ? [0, 1, 0] : [0, 0, 1]
 
-  addMessage({
-    role: 'user',
-    content: `Circular pattern ${object.slice(0, 6)} × ${count} around ${axis.toUpperCase()}-axis`,
-  })
+  addLine(
+    `Patterning ${object.slice(0, 6)} × ${count} around the ${axis.toUpperCase()}-axis.`,
+    'system',
+  )
   setProcessing(true)
 
   try {
@@ -860,14 +775,10 @@ async function sendDirectCircularPattern(
     if (data?.success !== true) {
       throw new Error(data?.error || 'malformed response')
     }
-    addMessage({
-      role: 'assistant',
-      content: `Circular pattern: created ${data.count} copies of ${object.slice(0, 6)}.`,
-      objectsAffected: Array.isArray(data.ids) ? data.ids.map(String) : [],
-    })
+    addLine(`Circular pattern: created ${data.count} copies of ${object.slice(0, 6)}.`, 'system')
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
-    addMessage({ role: 'assistant', content: `Circular pattern failed: ${msg}` })
+    addLine(`Circular pattern failed: ${msg}`, 'system')
   } finally {
     setProcessing(false)
   }
@@ -889,16 +800,15 @@ async function sendDirectCircularPattern(
  * number.
  */
 async function sendDirectMeasureFaces() {
-  const { addMessage, setProcessing } = useChatStore.getState()
+  const { addLine, setProcessing } = useBlackboardStore.getState()
   const scene = useSceneStore.getState()
   const faces = scene.subElementSelections.filter((s) => s.type === 'face')
 
   if (faces.length !== 2) {
-    addMessage({
-      role: 'assistant',
-      content:
-        'Pick exactly two faces (Face selection mode → click two faces) before running Measure.',
-    })
+    addLine(
+      'Pick exactly two faces (Face selection mode → click two faces) before running Measure.',
+      'system',
+    )
     return
   }
 
@@ -906,18 +816,17 @@ async function sendDirectMeasureFaces() {
   const solidA = scene.objects.get(fa.objectId)?.analyticalGeometry?.solidId
   const solidB = scene.objects.get(fb.objectId)?.analyticalGeometry?.solidId
   if (solidA === undefined || solidB === undefined) {
-    addMessage({
-      role: 'assistant',
-      content:
-        'Measure needs kernel-backed solids — one of the picked faces belongs to an object without a kernel solid id.',
-    })
+    addLine(
+      'Measure needs kernel-backed solids — one of the picked faces belongs to an object without a kernel solid id.',
+      'system',
+    )
     return
   }
 
-  addMessage({
-    role: 'user',
-    content: `Measure face ${fa.index} of ${fa.objectId.slice(0, 6)} ↔ face ${fb.index} of ${fb.objectId.slice(0, 6)}`,
-  })
+  addLine(
+    `Measuring face ${fa.index} of ${fa.objectId.slice(0, 6)} against face ${fb.index} of ${fb.objectId.slice(0, 6)}.`,
+    'system',
+  )
   setProcessing(true)
 
   try {
@@ -931,18 +840,14 @@ async function sendDirectMeasureFaces() {
       b: { objectId: fb.objectId, faceId: fb.index },
       row,
     })
-    addMessage({
-      role: 'assistant',
-      content: `Measured: ${row.label} — pinned in the viewport.`,
-      objectsAffected: [fa.objectId, fb.objectId],
-    })
+    addLine(`Measured: ${row.label} — pinned in the viewport.`, 'system')
   } catch (err) {
     if (err instanceof MeasureRefusalError) {
       // The kernel's refusal reason, verbatim — no paraphrase.
-      addMessage({ role: 'assistant', content: err.reason })
+      addLine(err.reason, 'system')
     } else {
       const msg = err instanceof Error ? err.message : String(err)
-      addMessage({ role: 'assistant', content: `Measure failed: ${msg}` })
+      addLine(`Measure failed: ${msg}`, 'system')
     }
   } finally {
     setProcessing(false)
@@ -960,22 +865,16 @@ async function sendDirectMeasureFaces() {
  * inline in the chat panel.
  */
 async function sendDirectMeasureDistance() {
-  const { addMessage, setProcessing } = useChatStore.getState()
+  const { addLine, setProcessing } = useBlackboardStore.getState()
   const selectedIds = Array.from(useSceneStore.getState().selectedIds)
 
   if (selectedIds.length !== 2) {
-    addMessage({
-      role: 'assistant',
-      content: 'Select exactly two solids before running Measure Distance.',
-    })
+    addLine('Select exactly two solids before running Measure Distance.', 'system')
     return
   }
 
   const [a, b] = selectedIds
-  addMessage({
-    role: 'user',
-    content: `Measure distance ${a.slice(0, 6)} ↔ ${b.slice(0, 6)}`,
-  })
+  addLine(`Measuring the distance between ${a.slice(0, 6)} and ${b.slice(0, 6)}.`, 'system')
   setProcessing(true)
 
   try {
@@ -997,19 +896,17 @@ async function sendDirectMeasureDistance() {
     const dirStr = data.direction
       ? `(${data.direction.map((c) => fmt(c, 3)).join(', ')})`
       : 'coincident'
-    addMessage({
-      role: 'assistant',
-      content:
-        `Distance ${a.slice(0, 6)} ↔ ${b.slice(0, 6)}:\n` +
+    addLine(
+      `Distance ${a.slice(0, 6)} ↔ ${b.slice(0, 6)}:\n` +
         `• centre-to-centre: ${fmt(data.center_to_center)} mm\n` +
         `• AABB gap (surface lower bound): ${fmt(data.surface_to_surface)} mm\n` +
         `• bbox overlap: ${data.bbox_overlap ? 'yes' : 'no'}\n` +
         `• direction a→b: ${dirStr}`,
-      objectsAffected: [a, b],
-    })
+      'system',
+    )
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
-    addMessage({ role: 'assistant', content: `Measure distance failed: ${msg}` })
+    addLine(`Measure distance failed: ${msg}`, 'system')
   } finally {
     setProcessing(false)
   }
@@ -1027,19 +924,16 @@ async function sendDirectMeasureDistance() {
  * inline next to the model. No state mutation — pure read.
  */
 async function sendDirectMassProperties() {
-  const { addMessage, setProcessing } = useChatStore.getState()
+  const { addLine, setProcessing } = useBlackboardStore.getState()
   const selectedIds = Array.from(useSceneStore.getState().selectedIds)
 
   if (selectedIds.length !== 1) {
-    addMessage({
-      role: 'assistant',
-      content: 'Select exactly one solid before running Mass Properties.',
-    })
+    addLine('Select exactly one solid before running Mass Properties.', 'system')
     return
   }
 
   const [object] = selectedIds
-  addMessage({ role: 'user', content: `Mass properties of ${object.slice(0, 6)}` })
+  addLine(`Computing mass properties of ${object.slice(0, 6)}.`, 'system')
   setProcessing(true)
 
   try {
@@ -1063,20 +957,18 @@ async function sendDirectMassProperties() {
     const fmt = (n: number, p = 4) => Number.isFinite(n) ? n.toPrecision(p) : 'n/a'
     const com = data.center_of_mass.map((c) => fmt(c, 4)).join(', ')
     const pm = data.principal_moments.map((c) => fmt(c, 4)).join(', ')
-    addMessage({
-      role: 'assistant',
-      content:
-        `Mass properties of ${object.slice(0, 6)}:\n` +
+    addLine(
+      `Mass properties of ${object.slice(0, 6)}:\n` +
         `• volume: ${fmt(data.volume)} mm³\n` +
         `• surface area: ${fmt(data.surface_area)} mm²\n` +
         `• mass: ${fmt(data.mass)} g (${data.material.name}, ρ=${fmt(data.material.density)} g/cm³)\n` +
         `• centre of mass: (${com})\n` +
         `• principal moments: (${pm})`,
-      objectsAffected: [object],
-    })
+      'system',
+    )
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
-    addMessage({ role: 'assistant', content: `Mass properties failed: ${msg}` })
+    addLine(`Mass properties failed: ${msg}`, 'system')
   } finally {
     setProcessing(false)
   }
@@ -1096,21 +988,15 @@ async function sendDirectMassProperties() {
  * signal — and it's already shipped by the existing distance endpoint.
  */
 async function sendDirectInterference() {
-  const { addMessage, setProcessing } = useChatStore.getState()
+  const { addLine, setProcessing } = useBlackboardStore.getState()
   const selectedIds = Array.from(useSceneStore.getState().selectedIds)
 
   if (selectedIds.length < 2) {
-    addMessage({
-      role: 'assistant',
-      content: 'Select two or more solids before running Interference.',
-    })
+    addLine('Select two or more solids before running Interference.', 'system')
     return
   }
 
-  addMessage({
-    role: 'user',
-    content: `Interference check across ${selectedIds.length} parts`,
-  })
+  addLine(`Checking interference across ${selectedIds.length} parts.`, 'system')
   setProcessing(true)
 
   // Build the unordered-pair list once; n*(n-1)/2 fetches in parallel.
@@ -1154,33 +1040,31 @@ async function sendDirectInterference() {
     const fmt = (n: number, p = 3) => Number.isFinite(n) ? n.toPrecision(p) : 'n/a'
 
     if (errors.length > 0) {
-      addMessage({
-        role: 'assistant',
-        content: `Interference check: ${errors.length} pair(s) failed to resolve.`,
-      })
+      addLine(
+        `Interference check: ${errors.length} pair${errors.length === 1 ? '' : 's'} could not be resolved.`,
+        'system',
+      )
     }
 
     if (overlapping.length === 0) {
-      addMessage({
-        role: 'assistant',
-        content: `No bounding-box interference across ${pairs.length} pair${pairs.length === 1 ? '' : 's'}.`,
-      })
+      addLine(
+        `No bounding-box interference across ${pairs.length} pair${pairs.length === 1 ? '' : 's'}.`,
+        'system',
+      )
     } else {
       const lines = overlapping.map(
         (r) => `• ${r.a.slice(0, 6)} ↔ ${r.b.slice(0, 6)} — centres ${fmt(r.centerDist)} mm apart`,
       )
-      addMessage({
-        role: 'assistant',
-        content:
-          `Possible interference (bbox overlap) on ${overlapping.length}/${pairs.length} pair${pairs.length === 1 ? '' : 's'}:\n` +
+      addLine(
+        `Possible interference (bounding-box overlap) on ${overlapping.length}/${pairs.length} pair${pairs.length === 1 ? '' : 's'}:\n` +
           lines.join('\n') +
-          `\n(bbox overlap is conservative — true surface-to-surface intersection still pending kernel work.)`,
-        objectsAffected: Array.from(new Set(overlapping.flatMap((r) => [r.a, r.b]))),
-      })
+          `\n(Bounding-box overlap is conservative — true surface-to-surface intersection is still pending kernel work.)`,
+        'system',
+      )
     }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
-    addMessage({ role: 'assistant', content: `Interference check failed: ${msg}` })
+    addLine(`Interference check failed: ${msg}`, 'system')
   } finally {
     setProcessing(false)
   }
@@ -1199,20 +1083,19 @@ async function sendDirectInterference() {
  * model already straddles that plane.
  */
 function toggleSectionViewWithFeedback() {
-  const { addMessage } = useChatStore.getState()
+  const { addLine } = useBlackboardStore.getState()
   const scene = useSceneStore.getState()
   const wasEnabled = scene.sectionView.enabled
   scene.toggleSectionView()
   const next = useSceneStore.getState().sectionView
   if (wasEnabled) {
-    addMessage({ role: 'assistant', content: 'Section View off.' })
+    addLine('Section View off.', 'system')
   } else {
-    addMessage({
-      role: 'assistant',
-      content:
-        `Section View on (${next.axis.toUpperCase()}-axis, offset ${next.offset}). ` +
+    addLine(
+      `Section View on (${next.axis.toUpperCase()}-axis, offset ${next.offset}). ` +
         `Adjust from the panel above the viewport readout.`,
-    })
+      'system',
+    )
   }
 }
 
@@ -1223,12 +1106,9 @@ function toggleSectionViewWithFeedback() {
  * and surfacing a confusing "Failed to reach backend" error.
  */
 function notYetWired(feature: string, reason?: string) {
-  const { addMessage } = useChatStore.getState()
-  const tail = reason ? ` (${reason})` : ''
-  addMessage({
-    role: 'assistant',
-    content: `${feature} is not yet wired to a direct backend endpoint${tail}. Coming in a follow-up slice.`,
-  })
+  const { addLine } = useBlackboardStore.getState()
+  const tail = reason ? ` — ${reason}` : ''
+  addLine(`${feature} isn't wired up yet${tail}. Coming in a later update.`, 'system')
 }
 
 /**
@@ -1236,26 +1116,18 @@ function notYetWired(feature: string, reason?: string) {
  * directly via `POST /api/export`. Bypasses the NLP pipeline so a
  * missing `ANTHROPIC_API_KEY` (which 5xxs the AI command path) can't
  * block deterministic export operations. Reports success / failure to
- * the chat panel so the user gets visible feedback either way.
+ * the Blackboard so the user gets visible feedback either way.
  */
 async function sendDirectExport(format: string) {
-  const { addMessage, setProcessing } = useChatStore.getState()
-  addMessage({ role: 'user', content: `Export selected as ${format}` })
+  const { addLine, setProcessing } = useBlackboardStore.getState()
+  addLine(`Exporting the selection as ${format}.`, 'system')
   setProcessing(true)
   try {
     const result = await exportSceneAs(format)
     if (result.ok) {
-      addMessage({
-        role: 'assistant',
-        content: result.filename
-          ? `Exported as ${result.filename}.`
-          : `Export ready.`,
-      })
+      addLine(result.filename ? `Exported as ${result.filename}.` : 'Export ready.', 'system')
     } else {
-      addMessage({
-        role: 'assistant',
-        content: `Export failed: ${result.error ?? 'unknown error'}`,
-      })
+      addLine(`Export failed: ${result.error ?? 'unknown error'}`, 'system')
     }
   } finally {
     setProcessing(false)
@@ -1582,11 +1454,9 @@ export function ToolBar() {
               action: () => {
                 const ids = Array.from(useSceneStore.getState().selectedIds)
                 if (ids.length !== 1) {
-                  const { addMessage } = useChatStore.getState()
-                  addMessage({
-                    role: 'assistant',
-                    content: 'Select exactly one object before toggling Dimensions.',
-                  })
+                  useBlackboardStore
+                    .getState()
+                    .addLine('Select exactly one object before toggling Dimensions.', 'system')
                   return
                 }
                 toggleDimensions(ids[0])

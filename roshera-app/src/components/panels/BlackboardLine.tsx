@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, useCallback } from 'react'
 import { cn } from '@/lib/utils'
 import type { BlackboardLine as Line } from '@/stores/blackboard-store'
 import { MessageMarkdown } from './MessageMarkdown'
-import { Bot, User, Trash2 } from 'lucide-react'
+import { Bot, User, Wrench, Trash2 } from 'lucide-react'
 
 interface Props {
   line: Line
@@ -14,8 +14,9 @@ interface Props {
  * One Blackboard line. A committed line renders through `MessageMarkdown`
  * (markdown + KaTeX math). Clicking the line enters edit mode: a textarea
  * shows the raw source; Enter (without Shift) or blur commits, Escape cancels.
- * Both agent- and user-authored lines are editable; origin is shown by a
- * subtle leading marker.
+ * Agent-, user-, and system-authored lines are all editable; origin is shown
+ * by a subtle leading marker (agent → bot icon, user → person icon, system →
+ * wrench icon for app-generated toolbar/operation feedback).
  */
 export function BlackboardLine({ line, onCommit, onDelete }: Props) {
   const [editing, setEditing] = useState(false)
@@ -69,19 +70,22 @@ export function BlackboardLine({ line, onCommit, onDelete }: Props) {
   )
 
   const isAgent = line.author === 'agent'
+  const isSystem = line.author === 'system'
 
   return (
     <div className="group/line flex items-start gap-2 px-3 py-1.5 hover:bg-white/[0.03] rounded-md">
-      {/* Origin marker — subtle, distinguishes agent vs user authorship. */}
+      {/* Origin marker — subtle, distinguishes agent vs user vs system authorship. */}
       <div
         className={cn(
           'mt-1 flex h-4 w-4 shrink-0 items-center justify-center rounded-full',
-          isAgent ? 'bg-accent' : 'bg-primary/20',
+          isAgent ? 'bg-accent' : isSystem ? 'bg-muted-foreground/20' : 'bg-primary/20',
         )}
-        title={isAgent ? 'Agent-authored' : 'You'}
+        title={isAgent ? 'Agent-authored' : isSystem ? 'App-generated' : 'You'}
       >
         {isAgent ? (
           <Bot size={10} className="text-foreground" />
+        ) : isSystem ? (
+          <Wrench size={9} className="text-muted-foreground" />
         ) : (
           <User size={10} className="text-primary" />
         )}
