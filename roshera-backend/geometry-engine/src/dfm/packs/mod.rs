@@ -197,12 +197,17 @@ pub(crate) mod fixtures {
         (surfaces, faces, loops, edges, curves, face_id)
     }
 
-    /// A single trivial flat NURBS-patch face — refused unconditionally
-    /// by `face_orientation_field` (spec §3.1's support table), the fixed
-    /// point for every "refusal flows through, never silently becomes
-    /// Pass" test in this module and its siblings. Mirrors
-    /// `orientation.rs`'s own `nurbs_face_is_unverifiable_naming_the_kind`
-    /// fixture.
+    /// A single RATIONAL flat NURBS-patch face — refused by name by
+    /// `face_orientation_field` (freeform F3 proves bounds only for
+    /// non-rational patches; a varying-weight patch refuses as
+    /// `RationalUnsupported` inside the enclosure, surfaced as
+    /// `UnsupportedSurface`), the fixed point for every "refusal flows
+    /// through, never silently becomes Pass" test in this module and its
+    /// siblings. Before F3 this fixture had unit weights and was refused
+    /// by the blanket arm; the blanket arm no longer exists, so the
+    /// refusal fixture must be one the enclosure itself honestly refuses.
+    /// Mirrors `orientation.rs`'s own
+    /// `rational_nurbs_face_is_unverifiable_naming_the_kind` fixture.
     pub(crate) fn nurbs_face() -> (
         SurfaceStore,
         FaceStore,
@@ -217,13 +222,13 @@ pub(crate) mod fixtures {
                 vec![Point3::new(0.0, 0.0, 0.0), Point3::new(0.0, 1.0, 0.0)],
                 vec![Point3::new(1.0, 0.0, 0.0), Point3::new(1.0, 1.0, 0.0)],
             ],
-            vec![vec![1.0, 1.0], vec![1.0, 1.0]],
+            vec![vec![1.0, 1.0], vec![1.0, 2.0]],
             vec![0.0, 0.0, 1.0, 1.0],
             vec![0.0, 0.0, 1.0, 1.0],
             1,
             1,
         )
-        .unwrap_or_else(|e| panic!("trivial flat NURBS patch fixture: {e}"));
+        .unwrap_or_else(|e| panic!("rational flat NURBS patch fixture: {e}"));
         let surface = GeneralNurbsSurface { nurbs };
         let surface_id = surfaces.add(Box::new(surface));
 

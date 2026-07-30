@@ -86,17 +86,37 @@
 //! analyzer), so none of them exercise a REAL `operations::fillet`-produced
 //! blend; this gap is stated, not measured, against that real path.
 //!
-//! ## Freeform blends refuse, named (spec §3.1)
+//! ## Freeform blends: PROVEN radius intervals where provable, named
+//! refusals everywhere else (spec §3.1, freeform F5)
 //!
 //! A CURVED face whose surface kind is none of `{Cylinder, Torus}` but
 //! which STILL passes the same tangency gate (evidence it is acting as a
 //! blend transition, not an unrelated face elsewhere on the part) is
-//! `Unverifiable{UnsupportedSurface}`, naming the kind — this covers
-//! `SurfaceOfRevolution`/`BSpline`/`Nurbs`/`Offset`/`Ruled` (freeform G2
-//! blends) and `Cone`/`Sphere` (analytic, but not in spec §3.1's
-//! exact-support list for THIS analyzer). A non-tangent face of any of
-//! these kinds is simply not a candidate (silently excluded, same
-//! reasoning as the Cylinder/Torus case above).
+//! handled in two tiers:
+//!
+//! - **Non-rational NURBS, concave (`Backward`, the same convention the
+//!   Cylinder/Torus arms derive), trim PROVEN to cover the full carrier
+//!   domain**: the regional curvature enclosure
+//!   ([`crate::math::enclosure::regional_max_abs_curvature`], T2 applied
+//!   twice for second-derivative nets) yields a proven interval for the
+//!   patch's maximum absolute normal curvature, hence a proven interval
+//!   `[1/κ_hi, 1/κ_lo]` for its MINIMUM radius of curvature — reported as
+//!   a [`crate::dfm::report::Derivation::BoundedAnalytic`] value whose
+//!   `value` is the proven radius FLOOR. The full-domain proof is
+//!   load-bearing for the interval's UPPER endpoint (the claim "somewhere
+//!   the radius is at most `1/κ_lo`" could otherwise name a region the
+//!   trim cut away); a curvature not provably bounded away from zero has
+//!   no radius ceiling and refuses rather than shipping a one-sided
+//!   interval as two-sided.
+//! - **Everything else** — rational patches, unprovable trims,
+//!   unboundable curvature, `Forward` (convex) freeform tangents, and the
+//!   remaining kinds (`SurfaceOfRevolution`/`BSpline`/`Offset`/`Ruled`,
+//!   plus `Cone`/`Sphere`, analytic but not in spec §3.1's exact-support
+//!   list for THIS analyzer) — is `Unverifiable`, naming the kind and,
+//!   where the enclosure was consulted, its specific typed refusal. A
+//!   non-tangent face of any of these kinds is simply not a candidate
+//!   (silently excluded, same reasoning as the Cylinder/Torus case
+//!   above).
 //!
 //! **`Plane` is excluded from this arm entirely, unconditionally** — not
 //! merely gated on tangency. Tangency is a property of the shared EDGE,
@@ -116,15 +136,16 @@
 //! `Derivation::Analytic` — this is the exact answer, not a placeholder.
 
 use crate::dfm::analyzers::bore::solid_faces;
-use crate::dfm::analyzers::orientation::to_surface_kind;
+use crate::dfm::analyzers::orientation::{freeform_trim_covers_full_patch, to_surface_kind};
 use crate::dfm::report::{
     Derivation, DfmError, DfmValue, FaceRef, SurfaceKind, UnverifiableReason,
 };
+use crate::math::enclosure::{regional_max_abs_curvature, RegionalBudget};
 use crate::operations::edge_classification::{classify_edge, DihedralClass};
 use crate::primitives::edge::EdgeId;
-use crate::primitives::face::{FaceId, FaceOrientation};
+use crate::primitives::face::{Face, FaceId, FaceOrientation};
 use crate::primitives::solid::SolidId;
-use crate::primitives::surface::{Cylinder, SurfaceType, Torus};
+use crate::primitives::surface::{Cylinder, GeneralNurbsSurface, SurfaceType, Torus};
 use crate::primitives::topology_builder::BRepModel;
 use std::collections::BTreeSet;
 
@@ -195,6 +216,61 @@ fn face_has_tangent_boundary_edge(model: &BRepModel, face_id: FaceId) -> bool {
             Some(DihedralClass::G1Smooth)
         )
     })
+}
+
+/// Freeform F5 arm (module docs, "Freeform blends"): a PROVEN
+/// minimum-radius interval for a concave, tangent, non-rational NURBS
+/// blend face — the trim proven to cover the full carrier domain, the
+/// patch's maximum absolute curvature enclosed regionally, and the radius
+/// interval derived as `[1/κ_hi, 1/κ_lo]`. Every failure is a typed,
+/// named refusal, never an approximation:
+///
+/// - unprovable trim → `UnsupportedTopology` (the interval's ceiling
+///   would otherwise be a fabrication for the face);
+/// - enclosure refusals (rational weights, unboundable normals,
+///   degenerate parameterization, budget-exhausted region) →
+///   `UnsupportedSurface` naming the inner typed error;
+/// - curvature not provably bounded away from zero → `UnsupportedSurface`
+///   reporting the proven radius FLOOR in the refusal text (a one-sided
+///   bound is stated as one-sided, never shipped as an interval).
+fn freeform_blend_radius(
+    model: &BRepModel,
+    face: &Face,
+    nurbs: &crate::math::nurbs::NurbsSurface,
+) -> Result<DfmValue, UnverifiableReason> {
+    if let Err(detail) =
+        freeform_trim_covers_full_patch(face, nurbs, &model.loops, &model.edges, &model.curves)
+    {
+        return Err(UnverifiableReason::UnsupportedTopology {
+            detail: format!("blend_radius freeform arm: {detail}"),
+        });
+    }
+    let enclosure =
+        regional_max_abs_curvature(nurbs, RegionalBudget::STANDARD_CURVATURE).map_err(|e| {
+            UnverifiableReason::UnsupportedSurface {
+                surface_type: SurfaceKind::Nurbs,
+                analyzer: format!("blend_radius (freeform curvature enclosure refused: {e})"),
+            }
+        })?;
+    let radius = enclosure.max_value.recip_positive().map_err(|_| {
+        UnverifiableReason::UnsupportedSurface {
+            surface_type: SurfaceKind::Nurbs,
+            analyzer: format!(
+                "blend_radius (curvature not provably nonzero: max|κ| ∈ [{}, {}]; the \
+                 proven radius floor is {} but no ceiling exists — refusing rather than \
+                 shipping a one-sided bound as a two-sided interval)",
+                enclosure.max_value.lo(),
+                enclosure.max_value.hi(),
+                1.0 / enclosure.max_value.hi()
+            ),
+        }
+    })?;
+    Ok(DfmValue::bounded_lower(
+        &radius,
+        "regional curvature enclosure: min radius = 1/max|κ| over proven-full domain",
+        enclosure.splits,
+        enclosure.converged,
+    ))
 }
 
 /// `blend_radius` (spec §3.1, S5): every proven internal blend and sharp
@@ -276,19 +352,42 @@ pub fn blend_radius(model: &BRepModel, solid_id: SolidId) -> Result<BlendRadiusO
             }
             other => {
                 // Any other CURVED surface kind acting as a tangent blend
-                // transition (module docs: the freeform-refuses arm).
-                // Silently excluded (no entry at all) when there is no
-                // tangency evidence -- an ordinary, unrelated face
-                // elsewhere on the part must not read as a refused blend.
-                if face_has_tangent_boundary_edge(model, face_id) {
-                    unverifiable.push(UnverifiableBlend {
-                        face: face_id,
-                        reason: UnverifiableReason::UnsupportedSurface {
-                            surface_type: to_surface_kind(other),
-                            analyzer: "blend_radius".to_string(),
-                        },
-                    });
+                // transition (module docs: the freeform arm). Silently
+                // excluded (no entry at all) when there is no tangency
+                // evidence -- an ordinary, unrelated face elsewhere on the
+                // part must not read as a refused blend.
+                if !face_has_tangent_boundary_edge(model, face_id) {
+                    continue;
                 }
+                // Freeform F5: a concave (Backward -- the same convention
+                // the Cylinder/Torus arms derive) non-rational NURBS blend
+                // with a proven-full trim gets a PROVEN radius interval;
+                // every other case refuses by name inside the helper or
+                // falls to the generic named refusal below.
+                if matches!(other, SurfaceType::NURBS)
+                    && face.orientation == FaceOrientation::Backward
+                {
+                    if let Some(general) = surface.as_any().downcast_ref::<GeneralNurbsSurface>() {
+                        match freeform_blend_radius(model, face, &general.nurbs) {
+                            Ok(radius) => blends.push(BlendRecord {
+                                face: face_id,
+                                radius,
+                            }),
+                            Err(reason) => unverifiable.push(UnverifiableBlend {
+                                face: face_id,
+                                reason,
+                            }),
+                        }
+                        continue;
+                    }
+                }
+                unverifiable.push(UnverifiableBlend {
+                    face: face_id,
+                    reason: UnverifiableReason::UnsupportedSurface {
+                        surface_type: to_surface_kind(other),
+                        analyzer: "blend_radius".to_string(),
+                    },
+                });
             }
         }
     }
@@ -990,6 +1089,139 @@ mod tests {
         assert!(
             outcome.unverifiable.iter().all(|u| u.face != bore_face),
             "a bore wall is simply not a candidate here: {:?}",
+            outcome.unverifiable
+        );
+    }
+
+    /// Quarter-bend freeform blend fixture (freeform F5): a degree (2,1)
+    /// non-rational patch whose (x, z) profile is the quadratic Bézier
+    /// (0,1) → (0,0) → (1,0), ruled in y — tangent to the wall plane
+    /// `x = 0` at its u=0 boundary (profile tangent there is vertical) and
+    /// flattening to horizontal at u=1. Profile curvature is exactly
+    /// κ(u) = 0.5 / (u² + (1−u)²)^{3/2} ∈ [0.5, √2] (hand-derived from
+    /// B′ = 2((1−u)(0,−1) + u(1,0)), B″ = 2(1,1) up to sign), the ruling
+    /// direction contributes κ₂ = 0, so the TRUE minimum radius of
+    /// curvature over the patch is 1/√2 ≈ 0.70711.
+    ///
+    /// The v-columns are ordered y = 3 then y = 0 so the geometric normal
+    /// at the shared u=0 boundary is −X, and `Backward` flips it to +X —
+    /// exactly matching the wall's outward +X, an exact tangency for the
+    /// `classify_edge` G1Smooth gate (same construction discipline as
+    /// `concave_cylinder_fillet_fixture`).
+    fn freeform_quarter_bend_fixture() -> (BRepModel, SolidId, FaceId) {
+        let mut s = Stores::new();
+
+        // Wall: plane x = 0, outward +X, spanning z in [1, 5], y in [0, 3].
+        let wall_plane = Plane::from_point_normal(Point3::new(0.0, 0.0, 1.0), Vector3::X)
+            .unwrap_or_else(|e| panic!("plane: {e}"));
+        let wall_surface = s.surfaces.add(Box::new(wall_plane));
+        // Shared tangent edge FIRST: the patch's u=0 boundary isoline, the
+        // line from (0, 3, 1) to (0, 0, 1) (v-column order below).
+        let shared = s.add_line_edge(Point3::new(0.0, 3.0, 1.0), Point3::new(0.0, 0.0, 1.0));
+        let w1 = s.add_line_edge(Point3::new(0.0, 0.0, 1.0), Point3::new(0.0, 0.0, 5.0));
+        let w2 = s.add_line_edge(Point3::new(0.0, 0.0, 5.0), Point3::new(0.0, 3.0, 5.0));
+        let w3 = s.add_line_edge(Point3::new(0.0, 3.0, 5.0), Point3::new(0.0, 3.0, 1.0));
+        let mut wall_loop = Loop::new(0, LoopType::Outer);
+        for e in [shared, w1, w2, w3] {
+            wall_loop.add_edge(e, true);
+        }
+        let wall_outer = s.loops.add(wall_loop);
+        let wall_face = s.faces.add(Face::new(
+            0,
+            wall_surface,
+            wall_outer,
+            FaceOrientation::Forward,
+        ));
+
+        // Blend patch: rows are the profile control points, columns the
+        // ruling (y = 3 first, then y = 0 — the normal-direction choice
+        // derived in the doc comment).
+        let nurbs = crate::math::nurbs::NurbsSurface::new(
+            vec![
+                vec![Point3::new(0.0, 3.0, 1.0), Point3::new(0.0, 0.0, 1.0)],
+                vec![Point3::new(0.0, 3.0, 0.0), Point3::new(0.0, 0.0, 0.0)],
+                vec![Point3::new(1.0, 3.0, 0.0), Point3::new(1.0, 0.0, 0.0)],
+            ],
+            vec![vec![1.0; 2]; 3],
+            vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            vec![0.0, 0.0, 1.0, 1.0],
+            2,
+            1,
+        )
+        .unwrap_or_else(|e| panic!("valid quarter-bend patch: {e}"));
+        let blend_surface =
+            s.surfaces
+                .add(Box::new(crate::primitives::surface::GeneralNurbsSurface {
+                    nurbs,
+                }));
+        let mut blend_loop = Loop::new(1, LoopType::Outer);
+        blend_loop.add_edge(shared, true);
+        let blend_outer = s.loops.add(blend_loop);
+        let blend_face = s.faces.add(Face::new(
+            1,
+            blend_surface,
+            blend_outer,
+            FaceOrientation::Backward,
+        ));
+
+        let face_ids = [wall_face, blend_face];
+        let (model, solid_id) =
+            model_with_solid(s.surfaces, s.faces, s.loops, s.edges, s.curves, &face_ids);
+        (model, solid_id, blend_face)
+    }
+
+    /// RED-FIRST HEADLINE for freeform F5 (freeform-coverage spec §5): a
+    /// concave, tangent, non-rational freeform blend must report a PROVEN
+    /// radius interval — not the blanket `UnsupportedSurface` refusal.
+    /// This test failed (the face landed in `unverifiable`) before the
+    /// freeform arm existed — the RED evidence for this slice.
+    #[test]
+    fn tangent_concave_freeform_blend_reports_a_proven_radius() {
+        let (model, solid_id, blend_face) = freeform_quarter_bend_fixture();
+        let outcome = blend_radius(&model, solid_id)
+            .unwrap_or_else(|e| panic!("malformed-input free fixture: {e}"));
+
+        assert_eq!(
+            outcome.blends.len(),
+            1,
+            "a tangent concave freeform blend must report a proven radius interval \
+             (freeform F5), got blends {:?} / unverifiable {:?}",
+            outcome.blends,
+            outcome.unverifiable
+        );
+        assert_eq!(outcome.blends[0].face, blend_face);
+        // The reported value is a proven FLOOR of the minimum radius of
+        // curvature; the true minimum is 1/√2 ≈ 0.70711, so the floor must
+        // sit at or below it (and not absurdly below).
+        let floor = outcome.blends[0].radius.value;
+        assert!(
+            floor <= 1.0 / 2.0_f64.sqrt() + 1e-9 && floor >= 0.3,
+            "radius floor should be at/just under 1/sqrt(2): {floor}"
+        );
+        // The value must carry its PROVEN enclosure and bounded provenance
+        // — and the enclosure must contain the true minimum radius 1/√2.
+        let bound = outcome.blends[0]
+            .radius
+            .bound
+            .unwrap_or_else(|| panic!("bounded radius must carry its enclosure"));
+        let true_min_radius = 1.0 / 2.0_f64.sqrt();
+        assert!(
+            bound.lo <= true_min_radius + 1e-9 && bound.hi >= true_min_radius - 1e-9,
+            "radius enclosure [{}, {}] must contain 1/sqrt(2)",
+            bound.lo,
+            bound.hi
+        );
+        assert!(
+            matches!(
+                outcome.blends[0].radius.derivation,
+                Derivation::BoundedAnalytic { .. }
+            ),
+            "freeform radius must carry BoundedAnalytic provenance: {:?}",
+            outcome.blends[0].radius.derivation
+        );
+        assert!(
+            outcome.unverifiable.is_empty(),
+            "nothing to refuse in this fixture: {:?}",
             outcome.unverifiable
         );
     }

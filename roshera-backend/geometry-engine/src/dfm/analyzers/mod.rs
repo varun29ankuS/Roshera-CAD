@@ -11,15 +11,19 @@
 //!
 //! [`orientation::face_orientation_field`] — per-face angle range against a
 //! caller-supplied reference direction, exact on `Plane`/`Cylinder`/`Cone`,
-//! exact-if-untrimmed on `Sphere`, and an honest refusal on `Torus` and
-//! every non-analytic surface kind (spec §3.1's support table).
+//! exact-if-untrimmed on `Sphere`, PROVEN-bounded on non-rational NURBS
+//! (freeform F3: regional normal-cone enclosure over a proven-full
+//! trimmed domain), and an honest refusal on `Torus` and every remaining
+//! kind (spec §3.1's support table + freeform-coverage spec §5).
 //!
 //! ## Slice S3
 //!
 //! [`thickness::pair_thickness`] — wall thickness between provably
-//! opposing face pairs (parallel planes / coaxial cylinders), exact-or-
-//! refuse over each pair's TRIMMED domain, never a nearest-face guess
-//! (spec §3.1).
+//! opposing face pairs (parallel planes / coaxial cylinders, exact; plus
+//! freeform F4: proven bounded pairs of non-rational NURBS walls via
+//! opposing normal cones, projection-hull separation intervals, and
+//! winding-proven footprint overlap), exact-or-refuse over each pair's
+//! TRIMMED domain, never a nearest-face guess (spec §3.1).
 //!
 //! ## Slice S4
 //!
@@ -35,7 +39,9 @@
 //!
 //! [`blend_radius::blend_radius`] — internal (concave) corner radii:
 //! toroidal blend minor radius, cylindrical fillet radius on a concave
-//! edge, and explicit sharp-edge (radius 0) detection. Concavity reuses the
+//! edge, explicit sharp-edge (radius 0) detection, and (freeform F5) a
+//! PROVEN minimum-radius interval for concave tangent non-rational NURBS
+//! blends via the regional curvature enclosure. Concavity reuses the
 //! kernel's own `face.orientation == FaceOrientation::Backward` convention
 //! (`readable::bore_face_ids`, `thickness.rs`'s `Classified::Cylinder`
 //! doc); a genuine blend is additionally gated on

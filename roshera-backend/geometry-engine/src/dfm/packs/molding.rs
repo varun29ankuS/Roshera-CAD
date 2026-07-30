@@ -16,6 +16,7 @@ use crate::dfm::report::{
     Derivation, DfmError, DfmReport, DfmValue, FaceRef, PackParams, RuleVerdict, SurfaceKind,
     UnverifiableReason, Verdict,
 };
+use crate::math::enclosure::Interval;
 use crate::math::Vector3;
 use crate::primitives::curve::CurveStore;
 use crate::primitives::edge::EdgeStore;
@@ -119,7 +120,49 @@ fn constant_derivation(method: &str) -> Derivation {
 
 enum FaceOutcome {
     Measured(f64, Derivation),
+    /// Freeform F3: a PROVEN enclosure of the face's MINIMUM draft angle,
+    /// decided per face by the mutation-proofed
+    /// [`Verdict::from_bounded_min`] fold in [`evaluate_draft`].
+    Bounded {
+        draft_deg: Interval,
+        method: String,
+        refinement_depth: usize,
+        converged: bool,
+    },
     Unverifiable(UnverifiableReason),
+}
+
+/// Enclosure of the face's MINIMUM draft angle `|θ − 90°|` from proven
+/// enclosures of the face's minimum/maximum θ. The V-shape hazard the
+/// exact arm documents (the minimum of `|θ − 90°|` over an interval is
+/// NOT generally at an endpoint) becomes three PROVEN cases plus an
+/// honest wide fallback:
+///
+/// - the θ-range PROVABLY contains 90° (`min θ ≤ 90` proven via
+///   `min_enc.hi ≤ 90`, and `max θ ≥ 90` proven via `max_enc.lo ≥ 90`):
+///   by continuity some point of the face has θ = 90° exactly, so the
+///   minimum draft is exactly 0;
+/// - the range provably sits entirely at/above 90° (`min_enc.lo ≥ 90`):
+///   `|θ − 90°|` is increasing there, so min draft = (min θ) − 90°;
+/// - entirely at/below 90° (`max_enc.hi ≤ 90`): min draft = 90° − max θ;
+/// - otherwise the crossing cannot be decided from the enclosures: the
+///   sound answer is `[0, hi]` — 0 cannot be excluded, and the true
+///   minimum is ≤ the draft at either true extremum, each of which is
+///   bounded by its enclosure's `|· − 90|` ceiling.
+fn draft_enclosure(min_enc: &Interval, max_enc: &Interval) -> Option<Interval> {
+    let ninety = Interval::point(90.0).ok()?;
+    if min_enc.hi() <= 90.0 && max_enc.lo() >= 90.0 {
+        return Interval::point(0.0).ok();
+    }
+    if min_enc.lo() >= 90.0 {
+        return Some(min_enc.sub(&ninety));
+    }
+    if max_enc.hi() <= 90.0 {
+        return Some(ninety.sub(max_enc));
+    }
+    let ceil_a = min_enc.sub(&ninety).abs().hi();
+    let ceil_b = max_enc.sub(&ninety).abs().hi();
+    Interval::enclosing(0.0, ceil_a.min(ceil_b).max(0.0)).ok()
 }
 
 fn face_outcome(
@@ -169,6 +212,29 @@ fn face_outcome(
             };
             FaceOutcome::Measured(worst, derivation)
         }
+        // Freeform F3: the bounded extremum enclosures map through the
+        // V-shape-aware [`draft_enclosure`] — see its doc for the four
+        // proven cases.
+        OrientationOutcome::BoundedRange {
+            min_deg,
+            max_deg,
+            method,
+            refinement_depth,
+            converged,
+        } => match draft_enclosure(&min_deg, &max_deg) {
+            Some(draft_deg) => FaceOutcome::Bounded {
+                draft_deg,
+                method,
+                refinement_depth,
+                converged,
+            },
+            // Interval construction over finite literals cannot fail;
+            // refuse honestly rather than panic if it ever did.
+            None => FaceOutcome::Unverifiable(UnverifiableReason::UnsupportedSurface {
+                surface_type: SurfaceKind::Nurbs,
+                analyzer: "mold.draft (internal interval construction failed)".to_string(),
+            }),
+        },
         OrientationOutcome::Unverifiable { reason } => FaceOutcome::Unverifiable(reason),
     })
 }
@@ -200,11 +266,28 @@ pub fn evaluate_draft(
     curve_store: &CurveStore,
     surface_store: &SurfaceStore,
 ) -> Result<RuleVerdict, DfmError> {
-    let mut violations: Vec<(FaceId, f64, Derivation)> = Vec::new();
+    let mut violations: Vec<(FaceId, DfmValue)> = Vec::new();
     let mut unverifiable: Vec<(FaceId, UnverifiableReason)> = Vec::new();
-    // Worst (smallest) PASSING draft angle seen so far — the face closest
-    // to violating, i.e. the binding constraint for `margin`.
-    let mut worst_safe: Option<(f64, Derivation)> = None;
+    // The SMALLEST proven margin among passing faces — the binding
+    // constraint (identical to the previous worst-safe-degree tracking:
+    // margin = deg − min_draft_deg is monotone in deg).
+    let mut best_margin: Option<DfmValue> = None;
+
+    let limit_value = || {
+        DfmValue::new(
+            min_draft_deg,
+            constant_derivation("mold.draft threshold: min_draft_deg (pack params)"),
+        )
+    };
+    let offer_margin = |candidate: DfmValue, best: &mut Option<DfmValue>| {
+        let replace = match best {
+            Some(current) => candidate.value < current.value,
+            None => true,
+        };
+        if replace {
+            *best = Some(candidate);
+        }
+    };
 
     for &face_id in faces {
         match face_outcome(
@@ -218,14 +301,40 @@ pub fn evaluate_draft(
         )? {
             FaceOutcome::Measured(deg, derivation) => {
                 if deg < min_draft_deg {
-                    violations.push((face_id, deg, derivation));
+                    violations.push((face_id, DfmValue::new(deg, as_draft_derivation(derivation))));
                 } else {
-                    let replace = match &worst_safe {
-                        Some((current, _)) => deg < *current,
-                        None => true,
-                    };
-                    if replace {
-                        worst_safe = Some((deg, derivation));
+                    let margin =
+                        DfmValue::new(deg - min_draft_deg, as_draft_derivation(derivation));
+                    offer_margin(margin, &mut best_margin);
+                }
+            }
+            FaceOutcome::Bounded {
+                draft_deg,
+                method,
+                refinement_depth,
+                converged,
+            } => {
+                // Freeform F3: decided by the mutation-proofed bounded
+                // MIN fold (report.rs F1) — a straddling enclosure can
+                // NEVER fold to a passing face.
+                match Verdict::from_bounded_min(
+                    draft_deg,
+                    limit_value(),
+                    vec![face_id],
+                    &method,
+                    refinement_depth,
+                    converged,
+                ) {
+                    Verdict::Pass { mut margin } => {
+                        margin.derivation = as_draft_derivation(margin.derivation);
+                        offer_margin(margin, &mut best_margin);
+                    }
+                    Verdict::Violation { mut measured, .. } => {
+                        measured.derivation = as_draft_derivation(measured.derivation);
+                        violations.push((face_id, measured));
+                    }
+                    Verdict::Unverifiable { reason, .. } => {
+                        unverifiable.push((face_id, reason));
                     }
                 }
             }
@@ -234,25 +343,27 @@ pub fn evaluate_draft(
     }
 
     if !violations.is_empty() {
-        violations.sort_by_key(|(id, _, _)| *id);
-        let (worst_deg, worst_derivation) = violations
+        violations.sort_by_key(|(id, _)| *id);
+        // For a bounded face the value is the enclosure's PROVEN CEILING
+        // (`from_bounded_min`'s violation arm), so the min-fold stays a
+        // proven upper bound on the worst face's true draft.
+        let worst = violations
             .iter()
-            .min_by(|a, b| a.1.total_cmp(&b.1))
-            .map(|(_, deg, derivation)| (*deg, derivation.clone()))
-            .unwrap_or((
-                min_draft_deg,
-                constant_derivation("unreachable: violations checked non-empty above"),
-            ));
-        let witnesses: Vec<FaceRef> = violations.into_iter().map(|(id, _, _)| id).collect();
+            .min_by(|a, b| a.1.value.total_cmp(&b.1.value))
+            .map(|(_, v)| v.clone())
+            .unwrap_or_else(|| {
+                DfmValue::new(
+                    min_draft_deg,
+                    constant_derivation("unreachable: violations checked non-empty above"),
+                )
+            });
+        let witnesses: Vec<FaceRef> = violations.into_iter().map(|(id, _)| id).collect();
         return Ok(RuleVerdict {
             rule: DRAFT_RULE_ID.to_string(),
             verdict: Verdict::Violation {
                 witnesses,
-                measured: DfmValue::new(worst_deg, as_draft_derivation(worst_derivation)),
-                limit: DfmValue::new(
-                    min_draft_deg,
-                    constant_derivation("mold.draft threshold: min_draft_deg (pack params)"),
-                ),
+                measured: worst,
+                limit: limit_value(),
             },
             provenance: draft_provenance(),
         });
@@ -269,18 +380,15 @@ pub fn evaluate_draft(
         });
     }
 
-    let (worst_safe_deg, worst_safe_derivation) = worst_safe.unwrap_or((
-        90.0,
-        constant_derivation("mold.draft: no candidate faces supplied"),
-    ));
+    let margin = best_margin.unwrap_or_else(|| {
+        DfmValue::new(
+            90.0 - min_draft_deg,
+            constant_derivation("mold.draft: no candidate faces supplied"),
+        )
+    });
     Ok(RuleVerdict {
         rule: DRAFT_RULE_ID.to_string(),
-        verdict: Verdict::Pass {
-            margin: DfmValue::new(
-                worst_safe_deg - min_draft_deg,
-                as_draft_derivation(worst_safe_derivation),
-            ),
-        },
+        verdict: Verdict::Pass { margin },
         provenance: draft_provenance(),
     })
 }
@@ -502,6 +610,88 @@ mod tests {
                 "expected Violation at 0° draft (straddle-90 fix) — got {other:?}; \
                  an endpoint-only (unfixed) implementation would wrongly report Pass here"
             ),
+        }
+    }
+
+    // ----- Freeform F3: bounded draft through the pack fold -----
+
+    /// A near-vertical freeform ramp (slope tan(89.5°) as a bilinear
+    /// NURBS plane, Forward): the outward normal sits 89.5° from pull, so
+    /// the true draft is exactly 0.5° — a PROVEN bounded violation of the
+    /// 1° floor, with the measured value the enclosure's proven CEILING
+    /// (`from_bounded_min`'s violation arm) and the wire bound attached.
+    #[test]
+    fn freeform_near_vertical_wall_is_a_proven_bounded_draft_violation() {
+        let mut surfaces = crate::primitives::surface::SurfaceStore::new();
+        let slope = 89.5f64.to_radians().tan();
+        let nurbs = crate::math::nurbs::NurbsSurface::new(
+            vec![
+                vec![Point3::new(0.0, 0.0, 0.0), Point3::new(0.0, 1.0, 0.0)],
+                vec![Point3::new(1.0, 0.0, slope), Point3::new(1.0, 1.0, slope)],
+            ],
+            vec![vec![1.0, 1.0], vec![1.0, 1.0]],
+            vec![0.0, 0.0, 1.0, 1.0],
+            vec![0.0, 0.0, 1.0, 1.0],
+            1,
+            1,
+        )
+        .unwrap_or_else(|e| panic!("valid near-vertical ramp patch: {e}"));
+        let surface_id = surfaces.add(Box::new(crate::primitives::surface::GeneralNurbsSurface {
+            nurbs,
+        }));
+        let mut loops = crate::primitives::r#loop::LoopStore::new();
+        let outer_loop = loops.add(Loop::new(0, LoopType::Outer));
+        let mut faces = crate::primitives::face::FaceStore::new();
+        let face_id = faces.add(Face::new(
+            0,
+            surface_id,
+            outer_loop,
+            FaceOrientation::Forward,
+        ));
+        let edges = crate::primitives::edge::EdgeStore::new();
+        let curves = crate::primitives::curve::CurveStore::new();
+
+        let verdict = evaluate_draft(
+            &[face_id],
+            Vector3::Z,
+            1.0,
+            &faces,
+            &loops,
+            &edges,
+            &curves,
+            &surfaces,
+        )
+        .unwrap_or_else(|e| panic!("malformed-input free fixture: {e}"));
+
+        match verdict.verdict {
+            Verdict::Violation {
+                witnesses,
+                measured,
+                limit,
+            } => {
+                assert_eq!(witnesses, vec![face_id]);
+                // Proven ceiling: at least the true 0.5°, below the 1° floor.
+                assert!(
+                    measured.value >= 0.5 - 1e-6 && measured.value < 1.0,
+                    "measured must be a proven ceiling in [0.5, 1.0): {}",
+                    measured.value
+                );
+                let bound = measured
+                    .bound
+                    .unwrap_or_else(|| panic!("bounded violation must carry its enclosure"));
+                assert!(
+                    bound.lo <= 0.5 + 1e-6 && bound.hi >= 0.5 - 1e-6,
+                    "bound [{}, {}] must contain the true 0.5°",
+                    bound.lo,
+                    bound.hi
+                );
+                assert!(matches!(
+                    measured.derivation,
+                    Derivation::BoundedAnalytic { .. }
+                ));
+                assert!((limit.value - 1.0).abs() < 1e-12);
+            }
+            other => panic!("expected a proven bounded draft Violation, got {other:?}"),
         }
     }
 }

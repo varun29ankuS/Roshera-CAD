@@ -19,6 +19,7 @@ use crate::dfm::report::{
     Derivation, DfmError, DfmReport, DfmValue, FaceRef, PackParams, RuleVerdict, SurfaceKind,
     UnverifiableReason, Verdict,
 };
+use crate::math::enclosure::Interval;
 use crate::math::Vector3;
 use crate::primitives::curve::CurveStore;
 use crate::primitives::edge::EdgeStore;
@@ -210,6 +211,16 @@ fn constant_derivation(method: &str) -> Derivation {
 /// provenance) or the refusal.
 enum FaceOutcome {
     Measured(f64, Derivation),
+    /// Freeform F3: a PROVEN enclosure of the face's worst-case
+    /// degrees-from-vertical (the linear `θ − 90°` image of the max-angle
+    /// enclosure), decided per face by the mutation-proofed
+    /// [`Verdict::from_bounded_max`] fold in [`evaluate_overhang`].
+    Bounded {
+        degrees_from_vertical: Interval,
+        method: String,
+        refinement_depth: usize,
+        converged: bool,
+    },
     Unverifiable(UnverifiableReason),
 }
 
@@ -240,6 +251,30 @@ fn face_outcome(
             derivation,
             ..
         } => FaceOutcome::Measured(degrees_from_vertical(max_deg), derivation),
+        // Freeform F3: the bounded max-angle enclosure maps through the
+        // same linear conversion with outward-rounded interval
+        // subtraction — the enclosure of the face's TRUE maximum angle
+        // becomes the enclosure of its true worst degrees-from-vertical.
+        OrientationOutcome::BoundedRange {
+            max_deg,
+            method,
+            refinement_depth,
+            converged,
+            ..
+        } => match Interval::point(90.0) {
+            Ok(ninety) => FaceOutcome::Bounded {
+                degrees_from_vertical: max_deg.sub(&ninety),
+                method,
+                refinement_depth,
+                converged,
+            },
+            // Interval::point(90.0) cannot fail; refuse honestly rather
+            // than panic if it ever did.
+            Err(_) => FaceOutcome::Unverifiable(UnverifiableReason::UnsupportedSurface {
+                surface_type: SurfaceKind::Nurbs,
+                analyzer: "fdm.overhang (internal interval construction failed)".to_string(),
+            }),
+        },
         OrientationOutcome::Unverifiable { reason } => FaceOutcome::Unverifiable(reason),
     })
 }
@@ -273,9 +308,28 @@ pub fn evaluate_overhang(
     curve_store: &CurveStore,
     surface_store: &SurfaceStore,
 ) -> Result<RuleVerdict, DfmError> {
-    let mut violations: Vec<(FaceId, f64, Derivation)> = Vec::new();
+    let mut violations: Vec<(FaceId, DfmValue)> = Vec::new();
     let mut unverifiable: Vec<(FaceId, UnverifiableReason)> = Vec::new();
-    let mut best_safe: Option<(f64, Derivation)> = None;
+    // The SMALLEST proven margin among passing faces — the binding
+    // constraint (identical to the previous worst-safe-degree tracking:
+    // margin = threshold − deg is monotone in deg).
+    let mut best_margin: Option<DfmValue> = None;
+
+    let limit_value = || {
+        DfmValue::new(
+            OVERHANG_THRESHOLD_DEG,
+            constant_derivation("fdm.overhang threshold: 45° from vertical (shop practice)"),
+        )
+    };
+    let offer_margin = |candidate: DfmValue, best: &mut Option<DfmValue>| {
+        let replace = match best {
+            Some(current) => candidate.value < current.value,
+            None => true,
+        };
+        if replace {
+            *best = Some(candidate);
+        }
+    };
 
     for &face_id in faces {
         match face_outcome(
@@ -294,14 +348,45 @@ pub fn evaluate_overhang(
                 // violation and vice versa — the thesis test is built to
                 // catch exactly that flip.
                 if deg > OVERHANG_THRESHOLD_DEG {
-                    violations.push((face_id, deg, derivation));
+                    violations.push((
+                        face_id,
+                        DfmValue::new(deg, as_overhang_derivation(derivation)),
+                    ));
                 } else {
-                    let replace = match &best_safe {
-                        Some((current, _)) => deg > *current,
-                        None => true,
-                    };
-                    if replace {
-                        best_safe = Some((deg, derivation));
+                    let margin = DfmValue::new(
+                        OVERHANG_THRESHOLD_DEG - deg,
+                        as_overhang_derivation(derivation),
+                    );
+                    offer_margin(margin, &mut best_margin);
+                }
+            }
+            FaceOutcome::Bounded {
+                degrees_from_vertical,
+                method,
+                refinement_depth,
+                converged,
+            } => {
+                // Freeform F3: the face is decided by the mutation-proofed
+                // bounded honesty fold (report.rs F1) — a straddling
+                // enclosure can NEVER fold to a passing face here.
+                match Verdict::from_bounded_max(
+                    degrees_from_vertical,
+                    limit_value(),
+                    vec![face_id],
+                    &method,
+                    refinement_depth,
+                    converged,
+                ) {
+                    Verdict::Pass { mut margin } => {
+                        margin.derivation = as_overhang_derivation(margin.derivation);
+                        offer_margin(margin, &mut best_margin);
+                    }
+                    Verdict::Violation { mut measured, .. } => {
+                        measured.derivation = as_overhang_derivation(measured.derivation);
+                        violations.push((face_id, measured));
+                    }
+                    Verdict::Unverifiable { reason, .. } => {
+                        unverifiable.push((face_id, reason));
                     }
                 }
             }
@@ -310,30 +395,29 @@ pub fn evaluate_overhang(
     }
 
     if !violations.is_empty() {
-        violations.sort_by_key(|(id, _, _)| *id);
-        // Non-empty by construction (the `if` above); `unwrap_or` supplies
-        // a total, panic-free fallback rather than an `.expect()` on a
-        // branch that cannot actually miss.
-        let (worst_deg, worst_derivation) = violations
+        violations.sort_by_key(|(id, _)| *id);
+        // Non-empty by construction (the `if` above); `unwrap_or_else`
+        // supplies a total, panic-free fallback rather than an `.expect()`
+        // on a branch that cannot actually miss. For a bounded face the
+        // value is the enclosure's PROVEN FLOOR, so the max-fold stays a
+        // proven lower bound on the worst face's true overhang.
+        let worst = violations
             .iter()
-            .max_by(|a, b| a.1.total_cmp(&b.1))
-            .map(|(_, deg, derivation)| (*deg, derivation.clone()))
-            .unwrap_or((
-                OVERHANG_THRESHOLD_DEG,
-                constant_derivation("unreachable: violations checked non-empty above"),
-            ));
-        let witnesses: Vec<FaceRef> = violations.into_iter().map(|(id, _, _)| id).collect();
+            .max_by(|a, b| a.1.value.total_cmp(&b.1.value))
+            .map(|(_, v)| v.clone())
+            .unwrap_or_else(|| {
+                DfmValue::new(
+                    OVERHANG_THRESHOLD_DEG,
+                    constant_derivation("unreachable: violations checked non-empty above"),
+                )
+            });
+        let witnesses: Vec<FaceRef> = violations.into_iter().map(|(id, _)| id).collect();
         return Ok(RuleVerdict {
             rule: OVERHANG_RULE_ID.to_string(),
             verdict: Verdict::Violation {
                 witnesses,
-                measured: DfmValue::new(worst_deg, as_overhang_derivation(worst_derivation)),
-                limit: DfmValue::new(
-                    OVERHANG_THRESHOLD_DEG,
-                    constant_derivation(
-                        "fdm.overhang threshold: 45° from vertical (shop practice)",
-                    ),
-                ),
+                measured: worst,
+                limit: limit_value(),
             },
             provenance: overhang_provenance(),
         });
@@ -354,18 +438,15 @@ pub fn evaluate_overhang(
         });
     }
 
-    let (worst_safe_deg, worst_safe_derivation) = best_safe.unwrap_or((
-        -90.0,
-        constant_derivation("fdm.overhang: no candidate faces supplied"),
-    ));
+    let margin = best_margin.unwrap_or_else(|| {
+        DfmValue::new(
+            OVERHANG_THRESHOLD_DEG - (-90.0),
+            constant_derivation("fdm.overhang: no candidate faces supplied"),
+        )
+    });
     Ok(RuleVerdict {
         rule: OVERHANG_RULE_ID.to_string(),
-        verdict: Verdict::Pass {
-            margin: DfmValue::new(
-                OVERHANG_THRESHOLD_DEG - worst_safe_deg,
-                as_overhang_derivation(worst_safe_derivation),
-            ),
-        },
+        verdict: Verdict::Pass { margin },
         provenance: overhang_provenance(),
     })
 }
@@ -1337,5 +1418,157 @@ mod tests {
             "expected vacuous Pass, got {:?}",
             verdict.verdict
         );
+    }
+
+    // ----- Freeform F3: bounded verdicts through the pack fold -----
+
+    /// Untrimmed freeform face (empty outer loop) whose surface is the
+    /// PLANE z = slope·x expressed as a bilinear NURBS patch — its normal
+    /// is constant, so the bounded enclosure is razor-thin around a known
+    /// angle, letting the pack-fold arms be pinned exactly.
+    fn nurbs_ramp_face(
+        slope: f64,
+        orientation: crate::primitives::face::FaceOrientation,
+    ) -> (
+        crate::primitives::surface::SurfaceStore,
+        FaceStore,
+        LoopStore,
+        EdgeStore,
+        CurveStore,
+        FaceId,
+    ) {
+        use crate::math::Point3;
+        use crate::primitives::face::Face;
+        use crate::primitives::r#loop::{Loop, LoopType};
+
+        let mut surfaces = crate::primitives::surface::SurfaceStore::new();
+        let nurbs = crate::math::nurbs::NurbsSurface::new(
+            vec![
+                vec![Point3::new(0.0, 0.0, 0.0), Point3::new(0.0, 1.0, 0.0)],
+                vec![Point3::new(1.0, 0.0, slope), Point3::new(1.0, 1.0, slope)],
+            ],
+            vec![vec![1.0, 1.0], vec![1.0, 1.0]],
+            vec![0.0, 0.0, 1.0, 1.0],
+            vec![0.0, 0.0, 1.0, 1.0],
+            1,
+            1,
+        )
+        .unwrap_or_else(|e| panic!("valid ramp patch: {e}"));
+        let surface_id = surfaces.add(Box::new(crate::primitives::surface::GeneralNurbsSurface {
+            nurbs,
+        }));
+        let mut loops = LoopStore::new();
+        let outer_loop = loops.add(Loop::new(0, LoopType::Outer));
+        let mut faces = FaceStore::new();
+        let face_id = faces.add(Face::new(0, surface_id, outer_loop, orientation));
+        (
+            surfaces,
+            faces,
+            loops,
+            EdgeStore::new(),
+            CurveStore::new(),
+            face_id,
+        )
+    }
+
+    /// THE F3 PACK HEADLINE — the spec's verdict-table row 3, live: a
+    /// freeform ramp whose worst degrees-from-vertical is EXACTLY 45°
+    /// (slope 1, Backward → outward normal 135° from +Z). The enclosure
+    /// provably straddles the 45° threshold at any tightness, so the ONLY
+    /// honest rule verdict is `Unverifiable{BoundNotSeparating}` carrying
+    /// the bound — never Pass, never Violation.
+    #[test]
+    fn freeform_ramp_at_exactly_45_degrees_is_bound_not_separating() {
+        let (surfaces, faces, loops, edges, curves, face_id) =
+            nurbs_ramp_face(1.0, crate::primitives::face::FaceOrientation::Backward);
+        let verdict = evaluate_overhang(
+            &[face_id],
+            Vector3::Z,
+            &faces,
+            &loops,
+            &edges,
+            &curves,
+            &surfaces,
+        )
+        .unwrap_or_else(|e| panic!("malformed-input free fixture: {e}"));
+
+        match verdict.verdict {
+            Verdict::Unverifiable { regions, reason } => {
+                assert_eq!(regions, vec![face_id]);
+                match reason {
+                    UnverifiableReason::BoundNotSeparating { lo, hi, limit, .. } => {
+                        assert!(
+                            lo <= 45.0 && hi >= 45.0,
+                            "bound [{lo}, {hi}] must straddle the 45° limit"
+                        );
+                        assert!(
+                            hi - lo < 0.5,
+                            "the reported bound should be tight, got [{lo}, {hi}]"
+                        );
+                        assert!((limit - 45.0).abs() < 1e-12);
+                    }
+                    other => panic!("expected BoundNotSeparating, got {other:?}"),
+                }
+            }
+            other => panic!(
+                "an enclosure straddling the threshold must refuse REPORTING THE BOUND, \
+                 got {other:?}"
+            ),
+        }
+    }
+
+    /// Bounded PROVEN VIOLATION through the pack fold: slope 0.5
+    /// (Backward) — the underside of a nearly-horizontal shelf. The
+    /// outward normal sits 180° − atan(0.5) ≈ 153.4° from +Z, so
+    /// degrees-from-vertical is 90° − atan(0.5) ≈ 63.4°, provably past
+    /// 45°. (The SHALLOW downward ramp is the steep overhang — a slope-2
+    /// underside reads only ~26.6° and passes.) The measured value must
+    /// be the enclosure's proven FLOOR with `BoundedAnalytic` provenance
+    /// and the wire bound attached.
+    #[test]
+    fn freeform_steep_ramp_is_a_proven_bounded_violation() {
+        let (surfaces, faces, loops, edges, curves, face_id) =
+            nurbs_ramp_face(0.5, crate::primitives::face::FaceOrientation::Backward);
+        let verdict = evaluate_overhang(
+            &[face_id],
+            Vector3::Z,
+            &faces,
+            &loops,
+            &edges,
+            &curves,
+            &surfaces,
+        )
+        .unwrap_or_else(|e| panic!("malformed-input free fixture: {e}"));
+
+        let true_dfv = 90.0 - 0.5f64.atan().to_degrees(); // ≈ 63.435°
+        match verdict.verdict {
+            Verdict::Violation {
+                witnesses,
+                measured,
+                limit,
+            } => {
+                assert_eq!(witnesses, vec![face_id]);
+                assert!(
+                    measured.value > 45.0 && measured.value <= true_dfv + 1e-6,
+                    "measured must be a proven floor ≤ the true {true_dfv}: {}",
+                    measured.value
+                );
+                let bound = measured
+                    .bound
+                    .unwrap_or_else(|| panic!("bounded violation must carry its enclosure"));
+                assert!(
+                    bound.lo <= true_dfv + 1e-6 && bound.hi >= true_dfv - 1e-6,
+                    "bound [{}, {}] must contain the true {true_dfv}",
+                    bound.lo,
+                    bound.hi
+                );
+                assert!(matches!(
+                    measured.derivation,
+                    Derivation::BoundedAnalytic { .. }
+                ));
+                assert!((limit.value - 45.0).abs() < 1e-12);
+            }
+            other => panic!("expected a proven bounded Violation, got {other:?}"),
+        }
     }
 }

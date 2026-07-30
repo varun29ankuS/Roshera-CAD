@@ -105,16 +105,28 @@
 //!   not reduce to the single-parameter form above, and S2 does not
 //!   attempt a 2-parameter exact bound (spec §3.1: an honest refusal here
 //!   is a correct v1 outcome, not a gap to paper over).
-//! - Everything else (`SurfaceOfRevolution`, `BSpline`, `NURBS`, `Offset`,
+//! - **NURBS (non-rational)** — freeform F3: a PROVEN bounded range
+//!   ([`OrientationOutcome::BoundedRange`]) from the regional normal-cone
+//!   enclosure ([`crate::math::enclosure::regional_angle_enclosure`]),
+//!   gated on [`freeform_trim_covers_full_patch`]'s exact proof that the
+//!   trim covers the full carrier domain. Rational patches, unprovable
+//!   trims, and unboundable normal fields refuse by name inside the arm.
+//! - Everything else (`SurfaceOfRevolution`, `BSpline`, `Offset`,
 //!   `Ruled`) refuses immediately, naming the kind.
 
+use std::collections::BTreeMap;
+
 use crate::dfm::report::{Derivation, DfmError, SurfaceKind, UnverifiableReason};
+use crate::math::enclosure::{regional_angle_enclosure, Interval, RegionalBudget};
+use crate::math::nurbs::NurbsSurface;
 use crate::math::{consts, Point3, Tolerance, Vector3};
-use crate::primitives::curve::{Arc, CurveStore, Line};
-use crate::primitives::edge::{EdgeId, EdgeStore};
+use crate::primitives::curve::{Arc, Curve, CurveStore, Line, NurbsCurve};
+use crate::primitives::edge::{Edge, EdgeId, EdgeStore};
 use crate::primitives::face::{Face, FaceId, FaceStore};
 use crate::primitives::r#loop::LoopStore;
-use crate::primitives::surface::{Cone, Cylinder, Plane, Surface, SurfaceStore, SurfaceType};
+use crate::primitives::surface::{
+    Cone, Cylinder, GeneralNurbsSurface, Plane, Surface, SurfaceStore, SurfaceType,
+};
 
 /// One face's exact answer from [`face_orientation_field`]: either the
 /// closed-form angle range, or an honest refusal naming why. Not itself a
@@ -130,6 +142,23 @@ pub enum OrientationOutcome {
         min_deg: f64,
         max_deg: f64,
         derivation: Derivation,
+    },
+    /// Freeform F3: PROVEN enclosures of the face's minimum and maximum
+    /// angle (degrees, same convention as [`OrientationOutcome::Range`])
+    /// over its trimmed domain — which was first PROVEN to cover the
+    /// carrier patch's full active domain (see
+    /// [`freeform_trim_covers_full_patch`]; without that proof the
+    /// regional extremum fold could fabricate a violation, so unprovable
+    /// trims refuse instead). Carried as math-layer [`Interval`]s — this
+    /// enum is not a wire type; rule packs fold these through
+    /// [`crate::dfm::report::Verdict::from_bounded_max`] /
+    /// [`crate::dfm::report::Verdict::from_bounded_min`].
+    BoundedRange {
+        min_deg: Interval,
+        max_deg: Interval,
+        method: String,
+        refinement_depth: usize,
+        converged: bool,
     },
     /// The face's angular envelope could not be derived in closed form.
     Unverifiable { reason: UnverifiableReason },
@@ -298,6 +327,274 @@ fn angular_intervals_for_face(
     }
 
     Ok(ranges)
+}
+
+/// Bitwise point equality — exact identity, the only equality that PROVES
+/// two stored geometric entities are the same one (the same discipline as
+/// the enclosure module's exact constant-weight check: values merely
+/// close together prove nothing).
+fn points_identical(a: &Point3, b: &Point3) -> bool {
+    a.x == b.x && a.y == b.y && a.z == b.z
+}
+
+/// One of the carrier patch's four boundary isolines, as an exact curve
+/// descriptor: `(degree, knot vector, control points)`.
+type IsolineDescriptor<'a> = (usize, &'a [f64], Vec<Point3>);
+
+/// Whether one boundary edge is PROVEN to lie along a full boundary
+/// isoline of the carrier patch: a [`Line`] whose endpoints bitwise-match
+/// a degree-1 boundary row/column (either direction), or a [`NurbsCurve`]
+/// bitwise-matching an isoline's degree/knots/control points (forward, or
+/// reversed with an exactly-mirrored knot vector), with constant weights
+/// and with the edge spanning the curve's own full natural domain. All
+/// comparisons are EXACT — a near-miss proves nothing and returns
+/// `false` (the caller refuses).
+fn boundary_edge_matches_an_isoline(
+    edge: &Edge,
+    curve: &dyn Curve,
+    candidates: &[IsolineDescriptor<'_>],
+) -> bool {
+    if let Some(line) = curve.as_any().downcast_ref::<Line>() {
+        if edge.param_range.start != line.range.start || edge.param_range.end != line.range.end {
+            return false;
+        }
+        return candidates.iter().any(|(deg, _knots, pts)| {
+            *deg == 1
+                && pts.len() == 2
+                && ((points_identical(&line.start, &pts[0])
+                    && points_identical(&line.end, &pts[1]))
+                    || (points_identical(&line.start, &pts[1])
+                        && points_identical(&line.end, &pts[0])))
+        });
+    }
+    if let Some(nc) = curve.as_any().downcast_ref::<NurbsCurve>() {
+        // Constant weights: the same exact-cancellation proof the patch
+        // itself gets in `enclosure::net_from_surface`.
+        let Some(&w0) = nc.weights.first() else {
+            return false;
+        };
+        if nc.weights.iter().any(|&w| w != w0) {
+            return false;
+        }
+        // The edge must span the curve's own FULL natural domain
+        // `[knots[degree], knots[n]]` — a sub-range edge trims the
+        // isoline and proves nothing about full-domain coverage.
+        let n = nc.knots.len();
+        if n < nc.degree + 2 {
+            return false;
+        }
+        let full_start = nc.knots[nc.degree];
+        let full_end = nc.knots[n - nc.degree - 1];
+        if nc.range.start != full_start || nc.range.end != full_end {
+            return false;
+        }
+        if edge.param_range.start != nc.range.start || edge.param_range.end != nc.range.end {
+            return false;
+        }
+        return candidates.iter().any(|(deg, knots, pts)| {
+            if *deg != nc.degree
+                || knots.len() != nc.knots.len()
+                || pts.len() != nc.control_points.len()
+            {
+                return false;
+            }
+            let forward = nc.knots.iter().zip(knots.iter()).all(|(a, b)| a == b)
+                && nc
+                    .control_points
+                    .iter()
+                    .zip(pts.iter())
+                    .all(|(a, b)| points_identical(a, b));
+            if forward {
+                return true;
+            }
+            // Reversed traversal: control points reversed, knot vector
+            // exactly mirrored about the domain (`k0 + k1 − k`, exact).
+            let k0 = knots[0];
+            let k1 = knots[knots.len() - 1];
+            nc.knots
+                .iter()
+                .rev()
+                .zip(knots.iter())
+                .all(|(a, b)| k0 + k1 - *a == *b)
+                && nc
+                    .control_points
+                    .iter()
+                    .rev()
+                    .zip(pts.iter())
+                    .all(|(a, b)| points_identical(a, b))
+        });
+    }
+    false
+}
+
+/// PROOF that a freeform face's trimmed domain covers its carrier patch's
+/// FULL active domain — the load-bearing precondition for the regional
+/// extremum fold (`math::enclosure`'s T6): every subdivision region must
+/// contain actual face points, else the fold's `max_i lo_i` could exceed
+/// the face's true maximum and FABRICATE a violation on correct geometry
+/// (the same carrier-domain bug class this module's docs already name for
+/// `Cylinder`/`Cone`, now on the freeform arm).
+///
+/// Accepted evidence, all EXACT (never tolerance-matched):
+///
+/// - an EMPTY outer loop — the untrimmed full-patch convention the Sphere
+///   arm and the primitive constructors already use;
+/// - otherwise every boundary edge must be one of:
+///   - an edge appearing ≥ 2 times in the loop (the seam of a closed
+///     patch, or a slit): its parameter-space preimage bounds no positive
+///     area, and a continuous field's extrema over the face's closure
+///     equal those over the full domain;
+///   - a curve proven to BE a full boundary isoline
+///     ([`boundary_edge_matches_an_isoline`]).
+///
+/// Boundary isolines equal the boundary control rows/columns only for
+/// CLAMPED knot vectors, so an unclamped patch with a non-empty boundary
+/// refuses. If every once-traversed boundary curve lies on the carrier's
+/// domain boundary, the trim's parameter-space boundary is contained in
+/// the domain rectangle's boundary — and the only nonempty region a
+/// rectangle's own boundary can bound is the full rectangle. (Like the
+/// arc-inversion mechanism above, this trusts the standard B-Rep loop
+/// convention: a face's outer-loop curves are the image of its trim
+/// boundary.)
+pub(super) fn freeform_trim_covers_full_patch(
+    face: &Face,
+    nurbs: &NurbsSurface,
+    loop_store: &LoopStore,
+    edge_store: &EdgeStore,
+    curve_store: &CurveStore,
+) -> Result<(), String> {
+    if !face.inner_loops.is_empty() {
+        return Err(
+            "inner-loop trimming: the trimmed domain provably differs from the full patch \
+             domain, and this slice does not bound partial freeform domains"
+                .to_string(),
+        );
+    }
+    let outer = loop_store
+        .get(face.outer_loop)
+        .ok_or_else(|| "outer loop does not resolve".to_string())?;
+    if outer.edges.is_empty() {
+        return Ok(());
+    }
+
+    let ku = nurbs.knots_u.values();
+    let kv = nurbs.knots_v.values();
+    let pu = nurbs.degree_u;
+    let pv = nurbs.degree_v;
+    let clamped = |k: &[f64], p: usize| -> bool {
+        k.len() > 2 * p
+            && k[..=p].iter().all(|&x| x == k[0])
+            && k[k.len() - p - 1..].iter().all(|&x| x == k[k.len() - 1])
+    };
+    if !clamped(ku, pu) || !clamped(kv, pv) {
+        return Err(
+            "unclamped knot vector: the boundary isolines are not the boundary control \
+             rows, so a non-empty boundary cannot be matched exactly"
+                .to_string(),
+        );
+    }
+
+    let n_u = nurbs.control_points.len();
+    if n_u == 0 || nurbs.control_points[0].is_empty() {
+        return Err("empty control grid".to_string());
+    }
+    let n_v = nurbs.control_points[0].len();
+    let col = |j: usize| -> Vec<Point3> { (0..n_u).map(|i| nurbs.control_points[i][j]).collect() };
+    let candidates: [IsolineDescriptor<'_>; 4] = [
+        (pv, kv, nurbs.control_points[0].clone()),
+        (pv, kv, nurbs.control_points[n_u - 1].clone()),
+        (pu, ku, col(0)),
+        (pu, ku, col(n_v - 1)),
+    ];
+
+    let mut counts: BTreeMap<EdgeId, usize> = BTreeMap::new();
+    for &e in &outer.edges {
+        *counts.entry(e).or_insert(0) += 1;
+    }
+    for (&edge_id, &count) in &counts {
+        if count >= 2 {
+            continue; // seam/slit — bounds no positive area (doc above)
+        }
+        let edge = edge_store
+            .get(edge_id)
+            .ok_or_else(|| format!("boundary edge {edge_id} does not resolve"))?;
+        let curve = curve_store
+            .get(edge.curve_id)
+            .ok_or_else(|| format!("boundary edge {edge_id}'s curve does not resolve"))?;
+        if !boundary_edge_matches_an_isoline(edge, curve, &candidates) {
+            return Err(format!(
+                "boundary edge {edge_id} is not proven to lie on the carrier patch's \
+                 domain boundary (no exact boundary-isoline match); the trimmed domain \
+                 cannot be certified as the full patch domain"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The freeform (non-rational NURBS/B-spline) arm of
+/// [`face_orientation_field`] (freeform spec F3): prove the trim covers
+/// the full carrier domain, run the regional normal-cone enclosure, and
+/// map the geometric-normal angle enclosures to the face's OUTWARD
+/// normal. The outward flip `θ_out = π − θ_geo` swaps the roles of the
+/// two extremum enclosures: `sup θ_out = π − inf θ_geo`, so
+/// `max_out = π ⊖ min_geo` and `min_out = π ⊖ max_geo` (outward-rounded
+/// interval subtraction — never an endpoint re-pairing by hand).
+fn freeform_orientation_outcome(
+    face: &Face,
+    nurbs: &NurbsSurface,
+    dir: Vector3,
+    sign: f64,
+    loop_store: &LoopStore,
+    edge_store: &EdgeStore,
+    curve_store: &CurveStore,
+) -> OrientationOutcome {
+    if let Err(detail) =
+        freeform_trim_covers_full_patch(face, nurbs, loop_store, edge_store, curve_store)
+    {
+        return OrientationOutcome::Unverifiable {
+            reason: UnverifiableReason::UnsupportedTopology {
+                detail: format!("face_orientation_field freeform arm: {detail}"),
+            },
+        };
+    }
+    let enclosure = match regional_angle_enclosure(nurbs, &dir, RegionalBudget::STANDARD_ANGLE) {
+        Ok(e) => e,
+        Err(err) => {
+            return OrientationOutcome::Unverifiable {
+                reason: UnverifiableReason::UnsupportedSurface {
+                    surface_type: SurfaceKind::Nurbs,
+                    analyzer: format!("face_orientation_field (freeform enclosure refused: {err})"),
+                },
+            }
+        }
+    };
+    // Interval::point of finite literals cannot fail; the fallback refusal
+    // keeps this arm panic-free without an `expect`.
+    let (Ok(pi), Ok(to_deg)) = (
+        Interval::point(std::f64::consts::PI),
+        Interval::point(180.0 / std::f64::consts::PI),
+    ) else {
+        return OrientationOutcome::Unverifiable {
+            reason: UnverifiableReason::UnsupportedSurface {
+                surface_type: SurfaceKind::Nurbs,
+                analyzer: "face_orientation_field (internal interval construction failed)"
+                    .to_string(),
+            },
+        };
+    };
+    let (min_out, max_out) = if sign >= 0.0 {
+        (enclosure.min_value, enclosure.max_value)
+    } else {
+        (pi.sub(&enclosure.max_value), pi.sub(&enclosure.min_value))
+    };
+    OrientationOutcome::BoundedRange {
+        min_deg: min_out.mul(&to_deg),
+        max_deg: max_out.mul(&to_deg),
+        method: "regional normal-cone enclosure over proven-full trimmed domain".to_string(),
+        refinement_depth: enclosure.splits,
+        converged: enclosure.converged,
+    }
 }
 
 pub(crate) fn to_surface_kind(surface_type: SurfaceType) -> SurfaceKind {
@@ -513,6 +810,32 @@ pub fn face_orientation_field(
                     .to_string(),
             },
         }),
+
+        // Freeform F3: non-rational NURBS patches get a PROVEN bounded
+        // range via the regional normal-cone enclosure; rational patches,
+        // unprovable trims, and unboundable normals refuse by name inside
+        // the arm. A `SurfaceType::NURBS` carrier that is not a
+        // `GeneralNurbsSurface` (no such impl exists today) refuses
+        // honestly instead of assuming the downcast.
+        SurfaceType::NURBS => match surface.as_any().downcast_ref::<GeneralNurbsSurface>() {
+            Some(general) => Ok(freeform_orientation_outcome(
+                face,
+                &general.nurbs,
+                dir,
+                sign,
+                loop_store,
+                edge_store,
+                curve_store,
+            )),
+            None => Ok(OrientationOutcome::Unverifiable {
+                reason: UnverifiableReason::UnsupportedSurface {
+                    surface_type: SurfaceKind::Nurbs,
+                    analyzer: "face_orientation_field (NURBS carrier is not a \
+                               GeneralNurbsSurface)"
+                        .to_string(),
+                },
+            }),
+        },
 
         other => Ok(OrientationOutcome::Unverifiable {
             reason: UnverifiableReason::UnsupportedSurface {
@@ -913,21 +1236,27 @@ mod tests {
 
     // ----- Honesty: refusal tests ---------------------------------------
 
+    /// A genuinely RATIONAL patch (weights not all equal) still refuses by
+    /// name — the freeform F3 arm proves bounds only for the non-rational
+    /// case (`enclosure.rs`, "Rational NURBS are refused by name"). Before
+    /// F3 this fixture was a unit-weight flat patch refused by the blanket
+    /// arm; the blanket arm no longer exists, so the refusal fixture must
+    /// be one the enclosure itself honestly refuses.
     #[test]
-    fn nurbs_face_is_unverifiable_naming_the_kind() {
+    fn rational_nurbs_face_is_unverifiable_naming_the_kind() {
         let mut surfaces = SurfaceStore::new();
         let nurbs = crate::math::nurbs::NurbsSurface::new(
             vec![
                 vec![Point3::new(0.0, 0.0, 0.0), Point3::new(0.0, 1.0, 0.0)],
                 vec![Point3::new(1.0, 0.0, 0.0), Point3::new(1.0, 1.0, 0.0)],
             ],
-            vec![vec![1.0, 1.0], vec![1.0, 1.0]],
+            vec![vec![1.0, 1.0], vec![1.0, 2.0]],
             vec![0.0, 0.0, 1.0, 1.0],
             vec![0.0, 0.0, 1.0, 1.0],
             1,
             1,
         )
-        .expect("trivial flat NURBS patch");
+        .expect("rational flat NURBS patch");
         let surface = crate::primitives::surface::GeneralNurbsSurface { nurbs };
         let surface_id = surfaces.add(Box::new(surface));
 
@@ -1033,6 +1362,255 @@ mod tests {
                 assert!((max_deg - 180.0).abs() < 1e-9);
             }
             other => panic!("expected an exact Range, got {other:?}"),
+        }
+    }
+
+    /// RED-FIRST HEADLINE for freeform F3 (freeform-coverage spec §5):
+    /// an UNTRIMMED (empty outer loop — the same full-patch convention the
+    /// Sphere arm already uses) non-rational freeform bump patch must
+    /// produce a PROVEN bounded angle range, not the blanket
+    /// `UnsupportedSurface` refusal. This test failed (outcome was
+    /// `Unverifiable`) before the freeform arm existed — that failure is
+    /// the RED evidence for this slice.
+    #[test]
+    fn freeform_untrimmed_bump_is_not_a_blanket_refusal() {
+        let mut surfaces = SurfaceStore::new();
+        // Degree (2,1) bump S(u,v) = (u, v, u(1−u)) — z-control (0, 0.5, 0)
+        // gives z = 0.5·B1(u) = u(1−u); slope z' = 1−2u ∈ [−1, 1], so the
+        // geometric normal's true angle to +Z sweeps exactly [0°, 45°].
+        let nurbs = crate::math::nurbs::NurbsSurface::new(
+            vec![
+                vec![Point3::new(0.0, 0.0, 0.0), Point3::new(0.0, 1.0, 0.0)],
+                vec![Point3::new(0.5, 0.0, 0.5), Point3::new(0.5, 1.0, 0.5)],
+                vec![Point3::new(1.0, 0.0, 0.0), Point3::new(1.0, 1.0, 0.0)],
+            ],
+            vec![vec![1.0; 2]; 3],
+            vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            vec![0.0, 0.0, 1.0, 1.0],
+            2,
+            1,
+        )
+        .expect("valid bump patch");
+        let surface = crate::primitives::surface::GeneralNurbsSurface { nurbs };
+        let surface_id = surfaces.add(Box::new(surface));
+
+        let mut loops = LoopStore::new();
+        let outer_loop = loops.add(Loop::new(0, LoopType::Outer));
+        let curves = CurveStore::new();
+        let edges = EdgeStore::new();
+        let mut faces = FaceStore::new();
+        let face = Face::new(0, surface_id, outer_loop, FaceOrientation::Forward);
+        let face_id = faces.add(face);
+
+        let outcome = face_orientation_field(
+            face_id,
+            Vector3::Z,
+            &faces,
+            &loops,
+            &edges,
+            &curves,
+            &surfaces,
+        )
+        .expect("malformed-input free fixture");
+
+        assert!(
+            !matches!(outcome, OrientationOutcome::Unverifiable { .. }),
+            "an untrimmed non-rational freeform patch must get a PROVEN bounded angle \
+             range (freeform F3), not a blanket refusal: {outcome:?}"
+        );
+
+        // GREEN-phase hand-computed assertions: the true angle range is
+        // exactly [0°, 45°] (slope 1−2u sweeps [−1, 1]; the normal's tilt
+        // from +Z is atan(|1−2u|)). The enclosures of both extrema must
+        // CONTAIN the true values and be tight to the standard budget.
+        match outcome {
+            OrientationOutcome::BoundedRange {
+                min_deg,
+                max_deg,
+                converged,
+                ..
+            } => {
+                assert!(
+                    min_deg.contains(0.0),
+                    "min-angle enclosure must contain the true 0°: [{}, {}]",
+                    min_deg.lo(),
+                    min_deg.hi()
+                );
+                assert!(
+                    max_deg.contains(45.0),
+                    "max-angle enclosure must contain the true 45°: [{}, {}]",
+                    max_deg.lo(),
+                    max_deg.hi()
+                );
+                assert!(converged, "the standard budget must converge on this patch");
+                assert!(
+                    max_deg.width() <= 0.3,
+                    "converged max enclosure should be tight to ~0.25°: width {}",
+                    max_deg.width()
+                );
+                assert!(
+                    min_deg.width() <= 0.3,
+                    "converged min enclosure should be tight to ~0.25°: width {}",
+                    min_deg.width()
+                );
+            }
+            other => panic!("expected BoundedRange, got {other:?}"),
+        }
+    }
+
+    /// The Backward-oriented twin: the outward normal is the flipped
+    /// geometric normal, so the true range reflects to [135°, 180°]. A
+    /// SIGN error here silently flags the wrong faces (worse than
+    /// refusing) — this pins the reflection arithmetic
+    /// (`max_out = π ⊖ min_geo`).
+    #[test]
+    fn freeform_backward_face_reflects_the_angle_range() {
+        let mut surfaces = SurfaceStore::new();
+        let nurbs = crate::math::nurbs::NurbsSurface::new(
+            vec![
+                vec![Point3::new(0.0, 0.0, 0.0), Point3::new(0.0, 1.0, 0.0)],
+                vec![Point3::new(0.5, 0.0, 0.5), Point3::new(0.5, 1.0, 0.5)],
+                vec![Point3::new(1.0, 0.0, 0.0), Point3::new(1.0, 1.0, 0.0)],
+            ],
+            vec![vec![1.0; 2]; 3],
+            vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            vec![0.0, 0.0, 1.0, 1.0],
+            2,
+            1,
+        )
+        .expect("valid bump patch");
+        let surface = crate::primitives::surface::GeneralNurbsSurface { nurbs };
+        let surface_id = surfaces.add(Box::new(surface));
+        let mut loops = LoopStore::new();
+        let outer_loop = loops.add(Loop::new(0, LoopType::Outer));
+        let curves = CurveStore::new();
+        let edges = EdgeStore::new();
+        let mut faces = FaceStore::new();
+        let face = Face::new(0, surface_id, outer_loop, FaceOrientation::Backward);
+        let face_id = faces.add(face);
+
+        let outcome = face_orientation_field(
+            face_id,
+            Vector3::Z,
+            &faces,
+            &loops,
+            &edges,
+            &curves,
+            &surfaces,
+        )
+        .expect("malformed-input free fixture");
+
+        match outcome {
+            OrientationOutcome::BoundedRange {
+                min_deg, max_deg, ..
+            } => {
+                assert!(
+                    min_deg.contains(135.0),
+                    "Backward min-angle enclosure must contain 135°: [{}, {}]",
+                    min_deg.lo(),
+                    min_deg.hi()
+                );
+                assert!(
+                    max_deg.contains(180.0),
+                    "Backward max-angle enclosure must contain 180°: [{}, {}]",
+                    max_deg.lo(),
+                    max_deg.hi()
+                );
+            }
+            other => panic!("expected BoundedRange, got {other:?}"),
+        }
+    }
+
+    /// MUTATION-PROOF: carrier-domain vs trimmed-domain, the freeform
+    /// edition of `mutation_proof_carrier_domain_would_fabricate_a_violation`.
+    /// A face whose outer loop is a genuine SUB-curve of a boundary
+    /// isoline (a trimmed freeform face) must REFUSE — while the
+    /// wrong-on-purpose carrier-domain enclosure (calling the regional
+    /// engine on the raw carrier, exactly what the arm would do if it
+    /// skipped the trim proof) reports the full patch's 45° maximum. A
+    /// 30°-limit rule would read a fabricated violation under the mutant:
+    /// the trimmed region `u ∈ [0.4, 0.6]` only reaches
+    /// atan(0.2) ≈ 11.3°.
+    #[test]
+    fn mutation_proof_freeform_carrier_domain_would_fabricate_a_violation() {
+        let bump = crate::math::nurbs::NurbsSurface::new(
+            vec![
+                vec![Point3::new(0.0, 0.0, 0.0), Point3::new(0.0, 1.0, 0.0)],
+                vec![Point3::new(0.5, 0.0, 0.5), Point3::new(0.5, 1.0, 0.5)],
+                vec![Point3::new(1.0, 0.0, 0.0), Point3::new(1.0, 1.0, 0.0)],
+            ],
+            vec![vec![1.0; 2]; 3],
+            vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            vec![0.0, 0.0, 1.0, 1.0],
+            2,
+            1,
+        )
+        .expect("valid bump patch");
+
+        // BEFORE (mutant): enclosing over the raw carrier domain reports
+        // a max angle containing the full 45° — the fabrication.
+        let carrier = crate::math::enclosure::regional_angle_enclosure(
+            &bump,
+            &Vector3::Z,
+            crate::math::enclosure::RegionalBudget::STANDARD_ANGLE,
+        )
+        .expect("carrier patch is boundable");
+        let carrier_max_deg = carrier.max_value.hi().to_degrees();
+        assert!(
+            carrier_max_deg > 44.0,
+            "sanity: the carrier-domain enclosure reaches ~45°, got {carrier_max_deg}"
+        );
+
+        // AFTER (production): a face carrying a NON-full-isoline boundary
+        // edge (a straight chord across the patch interior — a genuinely
+        // trimmed face) must refuse, naming the topology, rather than
+        // report the carrier's range.
+        let mut surfaces = SurfaceStore::new();
+        let surface = crate::primitives::surface::GeneralNurbsSurface { nurbs: bump };
+        let surface_id = surfaces.add(Box::new(surface));
+        let mut curves = CurveStore::new();
+        let mut edges = EdgeStore::new();
+        let mut loops = LoopStore::new();
+        let chord = Line::new(Point3::new(0.4, 0.0, 0.24), Point3::new(0.6, 1.0, 0.24));
+        let curve_id = curves.add(Box::new(chord));
+        let edge = crate::primitives::edge::Edge::new(
+            0,
+            0,
+            1,
+            curve_id,
+            crate::primitives::edge::EdgeOrientation::Forward,
+            crate::primitives::curve::ParameterRange::unit(),
+        );
+        let edge_id = edges.add(edge);
+        let mut loop_ = Loop::new(0, LoopType::Outer);
+        loop_.add_edge(edge_id, true);
+        let outer_loop = loops.add(loop_);
+        let mut faces = FaceStore::new();
+        let face = Face::new(0, surface_id, outer_loop, FaceOrientation::Forward);
+        let face_id = faces.add(face);
+
+        let outcome = face_orientation_field(
+            face_id,
+            Vector3::Z,
+            &faces,
+            &loops,
+            &edges,
+            &curves,
+            &surfaces,
+        )
+        .expect("malformed-input free fixture");
+
+        match outcome {
+            OrientationOutcome::Unverifiable {
+                reason: UnverifiableReason::UnsupportedTopology { detail },
+            } => assert!(
+                detail.contains("not proven to lie on the carrier patch's domain boundary"),
+                "refusal must name the unprovable trim: {detail}"
+            ),
+            other => panic!(
+                "a trimmed freeform face must refuse (the carrier-domain mutant would \
+                 fabricate a ~45° violation against a 30° rule), got {other:?}"
+            ),
         }
     }
 

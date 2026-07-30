@@ -224,6 +224,13 @@ const SWEEP_ROUND_ULPS: f64 = 8.0;
 /// of radius `r` around a vector of length `L` (module docs).
 const MAX_BALL_RATIO: f64 = 0.5;
 
+/// Absolute convergence floor for the regional engine's RELATIVE mode: an
+/// enclosure narrower than this is accepted as converged regardless of
+/// its relative width (an interval like `[0, 1e−15]` has relative width
+/// ~1 forever — its width is rounding noise, and splitting further only
+/// inflates the per-region error balls).
+const RELATIVE_MODE_ABS_FLOOR: f64 = 1e-9;
+
 const EPS: f64 = f64::EPSILON;
 
 /// Parametric direction of a tensor-product patch, for refusal messages.
@@ -547,6 +554,112 @@ impl Interval {
         Self {
             lo: next_down(self.lo - r),
             hi: next_up(self.hi + r),
+        }
+    }
+
+    /// Exact absolute-value enclosure: encloses `|x|` for every
+    /// `x ∈ self`. Endpoint negation and comparison only — no rounding.
+    pub fn abs(&self) -> Self {
+        if self.lo >= 0.0 {
+            *self
+        } else if self.hi <= 0.0 {
+            self.neg()
+        } else {
+            Self {
+                lo: 0.0,
+                hi: self.hi.max(-self.lo),
+            }
+        }
+    }
+
+    /// Outward enclosure of `sqrt(max(x, 0))` over the interval. The
+    /// clamp-to-nonnegative is sound exactly when the TRUE value set is
+    /// nonnegative and only the outward-rounded enclosure dips below zero
+    /// (the curvature discriminant `(κ₁−κ₂)²/4 = H² − K ≥ 0` is the
+    /// intended caller); the clamp then discards only impossible values.
+    pub fn sqrt_nonneg(&self) -> Self {
+        let lo = self.lo.max(0.0);
+        let hi = self.hi.max(0.0);
+        Self {
+            lo: next_down(lo.sqrt()).max(0.0),
+            hi: next_up(hi.sqrt()),
+        }
+    }
+
+    /// Outward-rounded quotient, defined only when the divisor PROVABLY
+    /// excludes zero — a divisor interval containing zero cannot bound a
+    /// quotient and is refused, never widened to ±∞ silently. With a
+    /// sign-definite divisor the quotient is monotone in each endpoint, so
+    /// the four endpoint quotients cover the extreme cases (same argument
+    /// as [`Interval::mul`]); a NaN candidate (only possible from a
+    /// saturated ±∞ endpoint over a ±∞ divisor endpoint) widens to the
+    /// whole line — honest, never narrow.
+    pub fn div(&self, other: &Self) -> Result<Self, EnclosureError> {
+        if other.lo <= 0.0 && other.hi >= 0.0 {
+            return Err(EnclosureError::InvalidInterval {
+                detail: format!(
+                    "division by an interval containing zero: [{}, {}]",
+                    other.lo, other.hi
+                ),
+            });
+        }
+        let candidates = [
+            self.lo / other.lo,
+            self.lo / other.hi,
+            self.hi / other.lo,
+            self.hi / other.hi,
+        ];
+        let mut lo = f64::INFINITY;
+        let mut hi = f64::NEG_INFINITY;
+        for c in candidates {
+            if c.is_nan() {
+                return Ok(Self {
+                    lo: f64::NEG_INFINITY,
+                    hi: f64::INFINITY,
+                });
+            }
+            lo = lo.min(c);
+            hi = hi.max(c);
+        }
+        Ok(Self {
+            lo: next_down(lo),
+            hi: next_up(hi),
+        })
+    }
+
+    /// Outward-rounded reciprocal of a PROVABLY POSITIVE interval — the
+    /// radius-from-curvature conversion (`r = 1/κ`). A lower endpoint at
+    /// or below zero means the value is not proven bounded away from zero
+    /// and no finite reciprocal enclosure exists: refused by name, never
+    /// approximated.
+    pub fn recip_positive(&self) -> Result<Self, EnclosureError> {
+        if self.lo <= 0.0 {
+            return Err(EnclosureError::InvalidInterval {
+                detail: format!(
+                    "reciprocal of an interval not provably positive: [{}, {}]",
+                    self.lo, self.hi
+                ),
+            });
+        }
+        Ok(Self {
+            lo: next_down(1.0 / self.hi),
+            hi: next_up(1.0 / self.lo),
+        })
+    }
+
+    /// Enclosure of `cos` over an ANGLE interval whose true values lie in
+    /// `[0, π]` (angles between directions — every caller in this module).
+    /// Endpoints are clamped into `[0, π]` first (sound: the true angle
+    /// set lies there, so clamping discards only impossible values), where
+    /// `cos` is monotone decreasing: the enclosure is `[cos hi, cos lo]`,
+    /// padded outward by one ulp step plus [`ANGLE_SLACK_RAD`]-scale
+    /// transcendental slack, then clamped to `[−1, 1]`.
+    fn cos_on_0_pi(&self) -> Self {
+        let a = self.lo.clamp(0.0, std::f64::consts::PI);
+        let b = self.hi.clamp(0.0, std::f64::consts::PI);
+        Self {
+            lo: (next_down(b.cos()) - ANGLE_SLACK_RAD).max(-1.0),
+            hi: (next_up(a.cos()) + ANGLE_SLACK_RAD).min(1.0),
         }
     }
 }
@@ -1202,6 +1315,1168 @@ where
     })
 }
 
+// ---------------------------------------------------------------------------
+// Regional subdivision (freeform spec F3–F5) — the gap the F2 report named:
+// [`refine`] tightens WHOLE-patch bounds and can therefore never bound a
+// patch whose normals genuinely spread past [`MAX_HALF_ANGLE_RAD`]. The
+// machinery below subdivides the parameter DOMAIN into regions with
+// per-region enclosures, and folds them with a proven extremum theorem:
+//
+// **T5 — masked-support restriction.** Over a parameter sub-rectangle
+// `R = [a,b]×[c,d]`, a tensor-product spline (or any of its derivative
+// splines) is a convex combination of ONLY those control coefficients
+// whose basis support meets `R` (`N_{i,p}` over `U` lives on
+// `[u_i, u_{i+p+1}]`; the k-th derivative basis on `[u_{i+k}, u_{i+p+1}]`);
+// the excluded coefficients carry weight exactly 0 on `R` while the
+// remaining weights still sum to 1. Every T1–T4 hull/cone argument
+// therefore holds verbatim on the masked index set — no sub-net
+// extraction, no new rounding. Knot insertion (the same Boehm machinery
+// [`refine`] uses) shrinks supports, so masks tighten as knots are added.
+//
+// **T6 — regional extremum fold.** Let regions `R_1..R_n` PARTITION the
+// active domain, each with nonempty interior, and let `[lo_i, hi_i]`
+// enclose a continuous quantity `q` over `R_i`. Then
+// `sup q ∈ [max_i lo_i, max_i hi_i]` and `inf q ∈ [min_i lo_i, min_i hi_i]`:
+// the true per-region suprema `s_i` each lie in `[lo_i, hi_i]` (regions
+// are nonempty, so each supremum is attained over actual surface points),
+// and `sup q = max_i s_i` — a max of values each confined to its own
+// interval. This is how a proven TWO-SIDED enclosure of an extremum is
+// obtained WITHOUT sampling: the lower end of the sup-enclosure comes
+// from a region's own proven lower bound, never from an evaluated point.
+// (The fold is what the F3/F5 analyzers consume; it REQUIRES the face's
+// trimmed domain to equal the full active domain — the analyzer proves
+// that before calling, else a region might contain no face points and
+// `max_i lo_i` would fabricate a violation.)
+// ---------------------------------------------------------------------------
+
+/// A closed parameter sub-rectangle of a patch's active domain.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SubRegion {
+    pub u0: f64,
+    pub u1: f64,
+    pub v0: f64,
+    pub v1: f64,
+}
+
+/// One coefficient of a derivative control grid.
+#[derive(Debug, Clone, Copy)]
+enum DerivCell {
+    /// The knot denominator is exactly zero: the coefficient's basis has
+    /// empty support and contributes nothing anywhere (T2's exclusion).
+    VanishingSupport,
+    /// A finite coefficient vector with its proven error-ball radius.
+    Value { vec: Vector3, ball: f64 },
+}
+
+/// A derivative control grid (first or second order, either direction).
+#[derive(Debug, Clone)]
+struct DerivGrid {
+    /// `cells[i][j]` — `i` indexes u, `j` indexes v, in the coefficient
+    /// numbering of the corresponding derivative spline.
+    cells: Vec<Vec<DerivCell>>,
+}
+
+impl DerivGrid {
+    fn rows(&self) -> usize {
+        self.cells.len()
+    }
+    fn cols(&self) -> usize {
+        if self.cells.is_empty() {
+            0
+        } else {
+            self.cells[0].len()
+        }
+    }
+}
+
+/// First-derivative grid in u (T2): `Q_ij = pu·(P_{i+1,j} − P_{i,j})/h_i`,
+/// `h_i = ku[i+pu+1] − ku[i+1]`, with the same error-ball accounting as
+/// the F2 `derivative_net` (module docs, "Directions carry error balls").
+fn grid_first_u(net: &Net, coord_err: f64) -> Result<DerivGrid, EnclosureError> {
+    let p = net.pu;
+    let pf = p as f64;
+    let (n_u, n_v) = (net.n_u(), net.n_v());
+    let mut cells = Vec::with_capacity(n_u - 1);
+    for i in 0..(n_u - 1) {
+        let h = net.ku[i + p + 1] - net.ku[i + 1];
+        if h == 0.0 {
+            cells.push(vec![DerivCell::VanishingSupport; n_v]);
+            continue;
+        }
+        if !(h > 0.0) || !h.is_finite() {
+            return Err(EnclosureError::DegeneratePatch {
+                detail: format!("invalid knot span width {h} in u derivative"),
+            });
+        }
+        let mut row = Vec::with_capacity(n_v);
+        for j in 0..n_v {
+            let a = net.pts[i][j];
+            let b = net.pts[i + 1][j];
+            let q = Vector3::new(
+                pf * (b.x - a.x) / h,
+                pf * (b.y - a.y) / h,
+                pf * (b.z - a.z) / h,
+            );
+            let r = 2.0 * pf * coord_err / h + 4.0 * EPS * q.magnitude();
+            row.push(DerivCell::Value { vec: q, ball: r });
+        }
+        cells.push(row);
+    }
+    Ok(DerivGrid { cells })
+}
+
+/// First-derivative grid in v — the exact mirror of [`grid_first_u`].
+fn grid_first_v(net: &Net, coord_err: f64) -> Result<DerivGrid, EnclosureError> {
+    let p = net.pv;
+    let pf = p as f64;
+    let (n_u, n_v) = (net.n_u(), net.n_v());
+    let mut cells = Vec::with_capacity(n_u);
+    for i in 0..n_u {
+        let mut row = Vec::with_capacity(n_v - 1);
+        for j in 0..(n_v - 1) {
+            let h = net.kv[j + p + 1] - net.kv[j + 1];
+            if h == 0.0 {
+                row.push(DerivCell::VanishingSupport);
+                continue;
+            }
+            if !(h > 0.0) || !h.is_finite() {
+                return Err(EnclosureError::DegeneratePatch {
+                    detail: format!("invalid knot span width {h} in v derivative"),
+                });
+            }
+            let a = net.pts[i][j];
+            let b = net.pts[i][j + 1];
+            let q = Vector3::new(
+                pf * (b.x - a.x) / h,
+                pf * (b.y - a.y) / h,
+                pf * (b.z - a.z) / h,
+            );
+            let r = 2.0 * pf * coord_err / h + 4.0 * EPS * q.magnitude();
+            row.push(DerivCell::Value { vec: q, ball: r });
+        }
+        cells.push(row);
+    }
+    Ok(DerivGrid { cells })
+}
+
+/// Difference an existing derivative grid ONCE MORE along u (T2 applied a
+/// second time): coefficient `c·(G_{i+1,j} − G_{i,j})/h`, `c` the current
+/// u-degree of `grid`'s spline, `h = ku[i+pu+1] − ku[i+2]` (the degree-
+/// `pu−1` spline's own T2 denominator over the once-shortened knot
+/// vector). A zero `h` implies (by knot monotonicity) that any vanishing
+/// neighbour rows are unreachable, so reaching a `VanishingSupport`
+/// neighbour with `h > 0` is a defensive impossibility, refused loudly.
+fn grid_second_from_u(grid: &DerivGrid, net: &Net) -> Result<DerivGrid, EnclosureError> {
+    let p = net.pu;
+    let c = (p - 1) as f64;
+    let rows = grid.rows();
+    let cols = grid.cols();
+    let mut cells = Vec::with_capacity(rows - 1);
+    for i in 0..(rows - 1) {
+        let h = net.ku[i + p + 1] - net.ku[i + 2];
+        if h == 0.0 {
+            cells.push(vec![DerivCell::VanishingSupport; cols]);
+            continue;
+        }
+        let mut row = Vec::with_capacity(cols);
+        for j in 0..cols {
+            match (grid.cells[i][j], grid.cells[i + 1][j]) {
+                (DerivCell::Value { vec: a, ball: ra }, DerivCell::Value { vec: b, ball: rb }) => {
+                    let q = Vector3::new(
+                        c * (b.x - a.x) / h,
+                        c * (b.y - a.y) / h,
+                        c * (b.z - a.z) / h,
+                    );
+                    let r = c * (ra + rb) / h + 4.0 * EPS * q.magnitude();
+                    row.push(DerivCell::Value { vec: q, ball: r });
+                }
+                _ => {
+                    return Err(EnclosureError::DegeneratePatch {
+                        detail: "second-derivative differencing reached a vanishing-support \
+                                 first-derivative row with a nonzero span — knot vector \
+                                 inconsistency"
+                            .to_string(),
+                    })
+                }
+            }
+        }
+        cells.push(row);
+    }
+    Ok(DerivGrid { cells })
+}
+
+/// Difference an existing derivative grid along v with v-degree
+/// coefficient `pv` — used for the mixed `S_uv` (differencing the u-grid,
+/// whose v-structure is still the ORIGINAL degree-`pv` spline) and for
+/// `S_vv` (differencing the v-grid once more, coefficient `pv−1`,
+/// `h = kv[j+pv+1] − kv[j+2]`). `coeff`/`lead` select between the two.
+fn grid_difference_v(
+    grid: &DerivGrid,
+    net: &Net,
+    coeff: f64,
+    lead: usize,
+) -> Result<DerivGrid, EnclosureError> {
+    let p = net.pv;
+    let rows = grid.rows();
+    let cols = grid.cols();
+    let mut cells = Vec::with_capacity(rows);
+    for i in 0..rows {
+        let mut row = Vec::with_capacity(cols - 1);
+        for j in 0..(cols - 1) {
+            let h = net.kv[j + p + 1] - net.kv[j + lead];
+            if h == 0.0 {
+                row.push(DerivCell::VanishingSupport);
+                continue;
+            }
+            match (grid.cells[i][j], grid.cells[i][j + 1]) {
+                (DerivCell::Value { vec: a, ball: ra }, DerivCell::Value { vec: b, ball: rb }) => {
+                    let q = Vector3::new(
+                        coeff * (b.x - a.x) / h,
+                        coeff * (b.y - a.y) / h,
+                        coeff * (b.z - a.z) / h,
+                    );
+                    let r = coeff * (ra + rb) / h + 4.0 * EPS * q.magnitude();
+                    row.push(DerivCell::Value { vec: q, ball: r });
+                }
+                (DerivCell::VanishingSupport, DerivCell::VanishingSupport) => {
+                    // The whole u-row vanished (a vanishing u-support row
+                    // of the source grid): its v-difference vanishes too.
+                    row.push(DerivCell::VanishingSupport);
+                }
+                _ => {
+                    return Err(EnclosureError::DegeneratePatch {
+                        detail: "v-differencing mixed a vanishing-support cell with a live \
+                                 one under a nonzero span — knot vector inconsistency"
+                            .to_string(),
+                    })
+                }
+            }
+        }
+        cells.push(row);
+    }
+    Ok(DerivGrid { cells })
+}
+
+/// Contiguous index range whose degree-`p` basis (derivative order
+/// `order`: support `[knots[i+order], knots[i+p+1]]`) meets the OPEN
+/// interval `(a, b)` — T5's mask. Monotone knots make the qualifying set
+/// contiguous; `None` when it is empty.
+fn support_mask(
+    knots: &[f64],
+    n_items: usize,
+    p: usize,
+    order: usize,
+    a: f64,
+    b: f64,
+) -> Option<(usize, usize)> {
+    let mut first = None;
+    let mut last = None;
+    for i in 0..n_items {
+        if knots[i + order] < b && knots[i + p + 1] > a {
+            if first.is_none() {
+                first = Some(i);
+            }
+            last = Some(i);
+        }
+    }
+    match (first, last) {
+        (Some(f), Some(l)) => Some((f, l)),
+        _ => None,
+    }
+}
+
+/// Collect the live (non-vanishing) coefficients of `grid` inside the
+/// row/column masks.
+fn collect_masked(
+    grid: &DerivGrid,
+    rows: Option<(usize, usize)>,
+    cols: Option<(usize, usize)>,
+) -> Vec<(Vector3, f64)> {
+    let mut out = Vec::new();
+    let (Some((r0, r1)), Some((c0, c1))) = (rows, cols) else {
+        return out;
+    };
+    for i in r0..=r1 {
+        for j in c0..=c1 {
+            if let DerivCell::Value { vec, ball } = grid.cells[i][j] {
+                out.push((vec, ball));
+            }
+        }
+    }
+    out
+}
+
+/// Proven direction cone of a SINGLE coefficient set (the tangent-cone
+/// analogue of [`pairwise_normal_cone`]'s two-pass construction, without
+/// the cross products): axis = normalized sum of unit directions,
+/// half-angle = max padded angle to that axis. Same refusal lines: an
+/// exactly-zero vector, an oversized error-ball ratio, cancelling
+/// directions, or a spread beyond [`MAX_HALF_ANGLE_RAD`].
+fn direction_cone(values: &[(Vector3, f64)], what: &str) -> Result<NormalCone, EnclosureError> {
+    if values.is_empty() {
+        return Err(EnclosureError::DegeneratePatch {
+            detail: format!("{what}: empty coefficient set — no direction to bound"),
+        });
+    }
+    let unit_dir = |(v, r): &(Vector3, f64)| -> Result<(Vector3, f64), EnclosureError> {
+        let mag = v.magnitude();
+        if mag == 0.0 {
+            return Err(EnclosureError::IllConditionedTangent {
+                detail: format!(
+                    "{what}: exactly-zero coefficient vector — the hull touches the origin, \
+                     so the direction cannot be proven nonvanishing"
+                ),
+            });
+        }
+        let ratio = r / mag;
+        if ratio > MAX_BALL_RATIO {
+            return Err(EnclosureError::IllConditionedTangent {
+                detail: format!(
+                    "{what}: coefficient of magnitude {mag} carries error ball {r} \
+                     (ratio > {MAX_BALL_RATIO})"
+                ),
+            });
+        }
+        let inv = 1.0 / mag;
+        Ok((Vector3::new(v.x * inv, v.y * inv, v.z * inv), 2.0 * ratio))
+    };
+
+    let mut sum = Vector3::new(0.0, 0.0, 0.0);
+    for value in values {
+        let (dir, _) = unit_dir(value)?;
+        sum = sum + dir;
+    }
+    let axis = sum
+        .normalize()
+        .map_err(|_| EnclosureError::NormalUnbounded {
+            detail: format!(
+                "{what}: coefficient directions cancel — the direction set spans \
+                             opposing directions"
+            ),
+        })?;
+
+    let mut half_angle = 0.0f64;
+    for value in values {
+        let (dir, pad) = unit_dir(value)?;
+        let ang = dir.dot(&axis).clamp(-1.0, 1.0).acos() + pad + ANGLE_SLACK_RAD;
+        half_angle = half_angle.max(ang);
+    }
+    if half_angle >= MAX_HALF_ANGLE_RAD {
+        return Err(EnclosureError::NormalUnbounded {
+            detail: format!(
+                "{what}: direction spread requires half-angle {half_angle} rad, beyond the \
+                 documented conservative-refusal line {MAX_HALF_ANGLE_RAD} rad"
+            ),
+        });
+    }
+    Ok(NormalCone { axis, half_angle })
+}
+
+/// Proven enclosure of `|Σ λ_k V_k|` for convex weights λ over the true
+/// (ball-inflated) coefficient set, given a proven direction cone:
+/// UPPER `max_k(|v_k| + r_k)` (triangle inequality on a convex
+/// combination); LOWER `(min_k(|v_k| − r_k)) · cos t` since
+/// `|S| ≥ S·axis = Σ λ_k |V_k| cos ∠(V_k, axis) ≥ min_k |V_k| · cos t`
+/// (every true vector lies in the cone by its construction, and
+/// `r/|v| ≤ 1/2` was enforced there so `|v|−r > 0`). Outward-rounded.
+fn magnitude_interval(values: &[(Vector3, f64)], cone: &NormalCone) -> Interval {
+    let mut min_m = f64::INFINITY;
+    let mut max_m = 0.0f64;
+    for (v, r) in values {
+        let m = v.magnitude();
+        min_m = min_m.min(m - r);
+        max_m = max_m.max(m + r);
+    }
+    let cos_t = next_down(cone.half_angle.cos());
+    Interval {
+        lo: next_down(min_m * cos_t).max(0.0),
+        hi: next_up(max_m),
+    }
+}
+
+/// Snapshot of the derivative grids for the CURRENT net state, shared by
+/// every region evaluation until the next knot insertion.
+struct EvalCtx {
+    ku: Vec<f64>,
+    kv: Vec<f64>,
+    pu: usize,
+    pv: usize,
+    qu: DerivGrid,
+    qv: DerivGrid,
+    /// `None` unless the engine was asked for second derivatives. Inner
+    /// `Option`s are `None` when the corresponding degree is 1 (the second
+    /// derivative is identically zero — exact, not approximated).
+    second: Option<(Option<DerivGrid>, DerivGrid, Option<DerivGrid>)>,
+}
+
+impl EvalCtx {
+    fn build(net: &Net, err_net: f64, need_second: bool) -> Result<Self, EnclosureError> {
+        let coord_err = err_net + EPS * net.max_abs_coord();
+        let qu = grid_first_u(net, coord_err)?;
+        let qv = grid_first_v(net, coord_err)?;
+        let second = if need_second {
+            let quu = if net.pu >= 2 {
+                Some(grid_second_from_u(&qu, net)?)
+            } else {
+                None
+            };
+            let quv = grid_difference_v(&qu, net, net.pv as f64, 1)?;
+            let qvv = if net.pv >= 2 {
+                Some(grid_difference_v(&qv, net, (net.pv - 1) as f64, 2)?)
+            } else {
+                None
+            };
+            Some((quu, quv, qvv))
+        } else {
+            None
+        };
+        Ok(Self {
+            ku: net.ku.clone(),
+            kv: net.kv.clone(),
+            pu: net.pu,
+            pv: net.pv,
+            qu,
+            qv,
+            second,
+        })
+    }
+
+    /// Masked first-derivative coefficients in u over `region` (u-mask at
+    /// derivative order 1, v-mask at order 0).
+    fn masked_first_u(&self, region: &SubRegion) -> Result<Vec<(Vector3, f64)>, EnclosureError> {
+        let rows = support_mask(&self.ku, self.qu.rows(), self.pu, 1, region.u0, region.u1);
+        let cols = support_mask(&self.kv, self.qu.cols(), self.pv, 0, region.v0, region.v1);
+        let out = collect_masked(&self.qu, rows, cols);
+        if out.is_empty() {
+            return Err(EnclosureError::IllConditionedTangent {
+                detail: format!(
+                    "no nonvanishing u-derivative support on region u∈[{}, {}], v∈[{}, {}] — \
+                     the u-tangent is identically degenerate there",
+                    region.u0, region.u1, region.v0, region.v1
+                ),
+            });
+        }
+        Ok(out)
+    }
+
+    /// Masked first-derivative coefficients in v over `region`.
+    fn masked_first_v(&self, region: &SubRegion) -> Result<Vec<(Vector3, f64)>, EnclosureError> {
+        let rows = support_mask(&self.ku, self.qv.rows(), self.pu, 0, region.u0, region.u1);
+        let cols = support_mask(&self.kv, self.qv.cols(), self.pv, 1, region.v0, region.v1);
+        let out = collect_masked(&self.qv, rows, cols);
+        if out.is_empty() {
+            return Err(EnclosureError::IllConditionedTangent {
+                detail: format!(
+                    "no nonvanishing v-derivative support on region u∈[{}, {}], v∈[{}, {}] — \
+                     the v-tangent is identically degenerate there",
+                    region.u0, region.u1, region.v0, region.v1
+                ),
+            });
+        }
+        Ok(out)
+    }
+
+    /// Proven enclosure of one second-fundamental-form coefficient
+    /// (`L = S_uu·n̂`, `M = S_uv·n̂`, or `N = S_vv·n̂`) over `region`, with
+    /// the unit normal ranging over `ncone`. The second-derivative spline
+    /// is a convex combination of its masked coefficients (T5), and each
+    /// coefficient's dot with any cone direction lies in
+    /// `|Q|·cos([α − t, α + t] ∩ [0, π])` padded by the coefficient's
+    /// error ball — so the hull of the per-coefficient intervals encloses
+    /// the form. An empty mask (or a degree below 2) means the derivative
+    /// is identically zero on the region: the exact `[0, 0]`.
+    fn second_form_interval(
+        &self,
+        which: SecondForm,
+        region: &SubRegion,
+        ncone: &NormalCone,
+    ) -> Result<Interval, EnclosureError> {
+        let Some((quu, quv, qvv)) = &self.second else {
+            return Err(EnclosureError::DegeneratePatch {
+                detail: "second-derivative grids were not built for this engine run".to_string(),
+            });
+        };
+        let zero = Interval { lo: 0.0, hi: 0.0 };
+        let (grid, u_order, v_order) = match which {
+            SecondForm::Uu => match quu {
+                None => return Ok(zero),
+                Some(g) => (g, 2usize, 0usize),
+            },
+            SecondForm::Uv => (quv, 1, 1),
+            SecondForm::Vv => match qvv {
+                None => return Ok(zero),
+                Some(g) => (g, 0, 2),
+            },
+        };
+        let rows = support_mask(
+            &self.ku,
+            grid.rows(),
+            self.pu,
+            u_order,
+            region.u0,
+            region.u1,
+        );
+        let cols = support_mask(
+            &self.kv,
+            grid.cols(),
+            self.pv,
+            v_order,
+            region.v0,
+            region.v1,
+        );
+        let values = collect_masked(grid, rows, cols);
+        if values.is_empty() {
+            return Ok(zero);
+        }
+        let t = ncone.half_angle;
+        let mut lo = f64::INFINITY;
+        let mut hi = f64::NEG_INFINITY;
+        for (v, r) in values {
+            let mag = v.magnitude();
+            if mag == 0.0 {
+                lo = lo.min(-r);
+                hi = hi.max(r);
+                continue;
+            }
+            let alpha = (v.dot(&ncone.axis) / mag).clamp(-1.0, 1.0).acos();
+            let ang = Interval {
+                lo: (alpha - t - ANGLE_SLACK_RAD).max(0.0),
+                hi: (alpha + t + ANGLE_SLACK_RAD).min(std::f64::consts::PI),
+            };
+            let d = Interval { lo: mag, hi: mag }
+                .mul(&ang.cos_on_0_pi())
+                .padded(r);
+            lo = lo.min(d.lo);
+            hi = hi.max(d.hi);
+        }
+        Ok(Interval { lo, hi })
+    }
+}
+
+/// Which second-fundamental-form coefficient to enclose.
+#[derive(Debug, Clone, Copy)]
+enum SecondForm {
+    Uu,
+    Uv,
+    Vv,
+}
+
+/// Budget for the regional engine. Exhaustion is an honest outcome
+/// (`converged: false` with the achieved fold) when every region is
+/// bounded, and a typed refusal when one is not.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RegionalBudget {
+    /// Maximum number of leaf regions the adaptive subdivision may reach.
+    pub max_regions: usize,
+    /// Maximum control points the refined net may reach (each split may
+    /// insert one knot row/column to tighten T5 masks).
+    pub max_control_points: usize,
+    /// Convergence target on the fold widths — absolute in the measured
+    /// quantity's unit, or a fraction of the fold magnitude when
+    /// `relative` is set.
+    pub target_width: f64,
+    /// Interpret `target_width` relative to the fold's magnitude.
+    pub relative: bool,
+}
+
+impl RegionalBudget {
+    /// Documented standard budget for angle enclosures: fold widths to
+    /// 0.25° absolute, ≤ 192 regions, ≤ 4096 control points.
+    pub const STANDARD_ANGLE: RegionalBudget = RegionalBudget {
+        max_regions: 192,
+        max_control_points: 4096,
+        target_width: 0.25 * std::f64::consts::PI / 180.0,
+        relative: false,
+    };
+    /// Documented standard budget for curvature enclosures: fold widths
+    /// to 5% relative, ≤ 192 regions, ≤ 4096 control points.
+    pub const STANDARD_CURVATURE: RegionalBudget = RegionalBudget {
+        max_regions: 192,
+        max_control_points: 4096,
+        target_width: 0.05,
+        relative: true,
+    };
+}
+
+/// The regional engine's result: proven enclosures of the quantity's true
+/// infimum and supremum over the whole active domain (T6), with the
+/// budget actually spent. `converged: false` reports the achieved fold —
+/// never a fallback value.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RegionalEnclosure {
+    /// Enclosure of the true infimum over the domain.
+    pub min_value: Interval,
+    /// Enclosure of the true supremum over the domain.
+    pub max_value: Interval,
+    /// Leaf regions at termination.
+    pub regions: usize,
+    /// Splits performed (the analyzer-facing refinement depth).
+    pub splits: usize,
+    /// Whether the fold widths met the budget's target.
+    pub converged: bool,
+}
+
+/// One leaf of the adaptive subdivision.
+struct Leaf {
+    region: SubRegion,
+    state: Result<Interval, EnclosureError>,
+    splittable: bool,
+}
+
+/// The adaptive regional engine (T5 + T6): maintains a partition of the
+/// active domain, evaluates `eval` per region against the current
+/// derivative grids, splits the BINDING region (a refused one first, else
+/// the one whose own bound pins the unconverged fold endpoint — splitting
+/// any other region provably cannot tighten that endpoint), and inserts a
+/// knot at each split point so T5 masks genuinely shrink. Refinement is
+/// therefore REGIONAL: a patch whose normals spread past
+/// [`MAX_HALF_ANGLE_RAD`] as a whole (which [`refine`] refuses at ANY
+/// depth) is bounded piecewise. Termination: every iteration either
+/// returns or grows the leaf count toward `max_regions`.
+fn regional_enclosure_engine<F>(
+    surface: &NurbsSurface,
+    budget: RegionalBudget,
+    need_second: bool,
+    eval: F,
+) -> Result<RegionalEnclosure, EnclosureError>
+where
+    F: Fn(&EvalCtx, &SubRegion) -> Result<Interval, EnclosureError>,
+{
+    let mut net = net_from_surface(surface)?;
+    let mut err_net = 0.0f64;
+    let mut ctx = EvalCtx::build(&net, err_net, need_second)?;
+    let domain = SubRegion {
+        u0: net.ku[net.pu],
+        u1: net.ku[net.ku.len() - net.pu - 1],
+        v0: net.kv[net.pv],
+        v1: net.kv[net.kv.len() - net.pv - 1],
+    };
+    let first_state = eval(&ctx, &domain);
+    let mut leaves = vec![Leaf {
+        region: domain,
+        state: first_state,
+        splittable: true,
+    }];
+    let mut splits = 0usize;
+
+    // Refusal for a region that can be neither bounded nor split further.
+    let stuck = |leaf: &Leaf, splits: usize| -> EnclosureError {
+        let inner = match &leaf.state {
+            Err(e) => e.to_string(),
+            Ok(_) => "internal: stuck leaf with a bound".to_string(),
+        };
+        EnclosureError::NormalUnbounded {
+            detail: format!(
+                "regional refinement exhausted on parameter region u∈[{}, {}], v∈[{}, {}] \
+                 after {} splits: {}",
+                leaf.region.u0, leaf.region.u1, leaf.region.v0, leaf.region.v1, splits, inner
+            ),
+        }
+    };
+
+    loop {
+        // ---- fold over the current partition ----
+        let mut blocked_splittable: Option<usize> = None;
+        let mut blocked_stuck: Option<usize> = None;
+        let mut min_lo = f64::INFINITY;
+        let mut min_hi = f64::INFINITY;
+        let mut max_lo = f64::NEG_INFINITY;
+        let mut max_hi = f64::NEG_INFINITY;
+        let mut idx_min_lo = usize::MAX;
+        let mut idx_max_hi = usize::MAX;
+        for (i, leaf) in leaves.iter().enumerate() {
+            match &leaf.state {
+                Ok(iv) => {
+                    if iv.lo < min_lo {
+                        min_lo = iv.lo;
+                        idx_min_lo = i;
+                    }
+                    min_hi = min_hi.min(iv.hi);
+                    max_lo = max_lo.max(iv.lo);
+                    if iv.hi > max_hi {
+                        max_hi = iv.hi;
+                        idx_max_hi = i;
+                    }
+                }
+                Err(_) => {
+                    if leaf.splittable {
+                        if blocked_splittable.is_none() {
+                            blocked_splittable = Some(i);
+                        }
+                    } else if blocked_stuck.is_none() {
+                        blocked_stuck = Some(i);
+                    }
+                }
+            }
+        }
+        if let Some(i) = blocked_stuck {
+            return Err(stuck(&leaves[i], splits));
+        }
+        let all_ok = blocked_splittable.is_none();
+
+        let fold = |min_lo: f64, min_hi: f64, max_lo: f64, max_hi: f64| {
+            (
+                Interval {
+                    lo: min_lo,
+                    hi: min_hi,
+                },
+                Interval {
+                    lo: max_lo,
+                    hi: max_hi,
+                },
+            )
+        };
+
+        let mut needed: Option<usize> = None;
+        if all_ok {
+            let (min_fold, max_fold) = fold(min_lo, min_hi, max_lo, max_hi);
+            // Relative mode carries an ABSOLUTE noise floor: an interval
+            // like `[0, 1e−15]` has relative width ~1 no matter how far
+            // it is refined (the flat-patch curvature case) — its width is
+            // already rounding noise, and further splitting only inflates
+            // the per-region error balls. Below the floor, the enclosure
+            // is accepted as converged; the floor is far below any
+            // physically meaningful curvature/quantity this engine serves.
+            let tol = if budget.relative {
+                let scale = max_fold
+                    .hi
+                    .abs()
+                    .max(min_fold.lo.abs())
+                    .max(f64::MIN_POSITIVE);
+                (budget.target_width * scale).max(RELATIVE_MODE_ABS_FLOOR)
+            } else {
+                budget.target_width
+            };
+            let max_wide = max_fold.width() > tol;
+            let min_wide = min_fold.width() > tol;
+            if !max_wide && !min_wide {
+                return Ok(RegionalEnclosure {
+                    min_value: min_fold,
+                    max_value: max_fold,
+                    regions: leaves.len(),
+                    splits,
+                    converged: true,
+                });
+            }
+            // Splitting only the BINDING leaf can tighten a fold endpoint:
+            // the max-fold's width is bounded by the width of the leaf
+            // attaining max hi (its lo is ≤ the fold's max-lo), and dually.
+            needed = if max_wide && leaves[idx_max_hi].splittable {
+                Some(idx_max_hi)
+            } else if min_wide && leaves[idx_min_lo].splittable {
+                Some(idx_min_lo)
+            } else {
+                // Binding leaves cannot be split further — honest,
+                // unconverged fold.
+                return Ok(RegionalEnclosure {
+                    min_value: min_fold,
+                    max_value: max_fold,
+                    regions: leaves.len(),
+                    splits,
+                    converged: false,
+                });
+            };
+        }
+
+        let target_idx = match blocked_splittable.or(needed) {
+            Some(i) => i,
+            None => {
+                // Unreachable by construction (all_ok picked or returned);
+                // refuse loudly rather than loop.
+                return Err(EnclosureError::DegeneratePatch {
+                    detail: "regional engine reached an inconsistent scheduling state".to_string(),
+                });
+            }
+        };
+
+        if leaves.len() >= budget.max_regions {
+            if let Some(i) = blocked_splittable {
+                return Err(stuck(&leaves[i], splits));
+            }
+            let (min_fold, max_fold) = fold(min_lo, min_hi, max_lo, max_hi);
+            return Ok(RegionalEnclosure {
+                min_value: min_fold,
+                max_value: max_fold,
+                regions: leaves.len(),
+                splits,
+                converged: false,
+            });
+        }
+
+        // ---- split the target region ----
+        let region = leaves[target_idx].region;
+        let interior_knots = |knots: &[f64], a: f64, b: f64| -> usize {
+            knots.iter().filter(|&&k| k > a && k < b).count()
+        };
+        let su = interior_knots(&ctx.ku, region.u0, region.u1);
+        let sv = interior_knots(&ctx.kv, region.v0, region.v1);
+        let mid_u = 0.5 * (region.u0 + region.u1);
+        let mid_v = 0.5 * (region.v0 + region.v1);
+        let u_ok = mid_u > region.u0 && mid_u < region.u1;
+        let v_ok = mid_v > region.v0 && mid_v < region.v1;
+        // Split-direction viability: fp-representable midpoint AND either
+        // the net can grow (insertion tightens masks) or existing interior
+        // knots already separate the children's masks.
+        let can_insert_u = (net.n_u() + 1) * net.n_v() <= budget.max_control_points;
+        let can_insert_v = net.n_u() * (net.n_v() + 1) <= budget.max_control_points;
+        let u_viable = u_ok && (can_insert_u || su > 0);
+        let v_viable = v_ok && (can_insert_v || sv > 0);
+        let split_u = if u_viable && v_viable {
+            // Prefer the direction with more knot structure to shrink;
+            // tie-break on wider parameter extent.
+            if su != sv {
+                su > sv
+            } else {
+                (region.u1 - region.u0) >= (region.v1 - region.v0)
+            }
+        } else if u_viable {
+            true
+        } else if v_viable {
+            false
+        } else {
+            leaves[target_idx].splittable = false;
+            continue;
+        };
+
+        let (mid, along_u) = if split_u {
+            (mid_u, true)
+        } else {
+            (mid_v, false)
+        };
+        let already_knot = if along_u {
+            ctx.ku.contains(&mid)
+        } else {
+            ctx.kv.contains(&mid)
+        };
+        let can_insert = if along_u { can_insert_u } else { can_insert_v };
+        if !already_knot && can_insert {
+            if along_u {
+                net.insert_knot_u(mid);
+            } else {
+                net.transpose();
+                net.insert_knot_u(mid);
+                net.transpose();
+            }
+            err_net += SWEEP_ROUND_ULPS * EPS * net.max_abs_coord();
+            ctx = EvalCtx::build(&net, err_net, need_second)?;
+        }
+
+        let (r1, r2) = if along_u {
+            (
+                SubRegion { u1: mid, ..region },
+                SubRegion { u0: mid, ..region },
+            )
+        } else {
+            (
+                SubRegion { v1: mid, ..region },
+                SubRegion { v0: mid, ..region },
+            )
+        };
+        splits += 1;
+        let s1 = eval(&ctx, &r1);
+        let s2 = eval(&ctx, &r2);
+        leaves[target_idx] = Leaf {
+            region: r1,
+            state: s1,
+            splittable: true,
+        };
+        leaves.push(Leaf {
+            region: r2,
+            state: s2,
+            splittable: true,
+        });
+    }
+}
+
+/// Proven regional enclosure of the angle between the patch's PARAMETRIC
+/// normal direction (`S_u × S_v` order — mapping to a face's OUTWARD
+/// normal is the analyzer's job, as with [`ControlNetBounds::normal`])
+/// and the fixed `direction`, over the patch's full active domain:
+/// `min_value`/`max_value` enclose the true infimum/supremum of the angle
+/// (T6). This is the F3 entry point, and the fix for the F2 gap: each
+/// region gets its OWN normal cone, so wide-normal-spread patches are
+/// bounded piecewise instead of refused forever.
+pub fn regional_angle_enclosure(
+    surface: &NurbsSurface,
+    direction: &Vector3,
+    budget: RegionalBudget,
+) -> Result<RegionalEnclosure, EnclosureError> {
+    let unit = direction
+        .normalize()
+        .map_err(|_| EnclosureError::InvalidReference {
+            detail: "direction has zero length".to_string(),
+        })?;
+    regional_enclosure_engine(surface, budget, false, |ctx, region| {
+        let qu = ctx.masked_first_u(region)?;
+        let qv = ctx.masked_first_v(region)?;
+        let cone = pairwise_normal_cone(&qu, &qv)?;
+        cone.angle_to(&unit)
+    })
+}
+
+/// Proven regional enclosure of the patch's maximum absolute normal
+/// curvature `max(|κ₁|, |κ₂|)` over the full active domain (F5). Per
+/// region: first-derivative cones and magnitude intervals bound the first
+/// fundamental form `E, F, G`; T2-applied-twice second-derivative nets
+/// with the region's normal cone bound `L, M, N` (each form coefficient
+/// is a convex combination of masked net coefficients — T5); then the
+/// closed-form principal-curvature eigenvalues
+/// `κ = H ± √(H² − K)`, `H = (EN − 2FM + GL)/(2(EG − F²))`,
+/// `K = (LN − M²)/(EG − F²)` are evaluated in outward-rounded interval
+/// arithmetic, giving `max|κ| ∈ |H| + √(max(H² − K, 0))`. A region whose
+/// `EG − F²` cannot be proven positive refuses (near-degenerate
+/// parameterization) and is subdivided; consume `max_value` for the
+/// minimum-radius question (`r_min = 1/κ_max`).
+pub fn regional_max_abs_curvature(
+    surface: &NurbsSurface,
+    budget: RegionalBudget,
+) -> Result<RegionalEnclosure, EnclosureError> {
+    regional_enclosure_engine(surface, budget, true, |ctx, region| {
+        let qu = ctx.masked_first_u(region)?;
+        let qv = ctx.masked_first_v(region)?;
+        let cone_u = direction_cone(&qu, "u-tangent")?;
+        let cone_v = direction_cone(&qv, "v-tangent")?;
+        let ncone = pairwise_normal_cone(&qu, &qv)?;
+        let mu = magnitude_interval(&qu, &cone_u);
+        let mv = magnitude_interval(&qv, &cone_v);
+        let e = mu.mul(&mu);
+        let g = mv.mul(&mv);
+        let gamma = cone_u.axis.dot(&cone_v.axis).clamp(-1.0, 1.0).acos();
+        let ang = Interval {
+            lo: (gamma - cone_u.half_angle - cone_v.half_angle - ANGLE_SLACK_RAD).max(0.0),
+            hi: (gamma + cone_u.half_angle + cone_v.half_angle + ANGLE_SLACK_RAD)
+                .min(std::f64::consts::PI),
+        };
+        let f = mu.mul(&mv).mul(&ang.cos_on_0_pi());
+        let l = ctx.second_form_interval(SecondForm::Uu, region, &ncone)?;
+        let m = ctx.second_form_interval(SecondForm::Uv, region, &ncone)?;
+        let n = ctx.second_form_interval(SecondForm::Vv, region, &ncone)?;
+        let w = e.mul(&g).sub(&f.mul(&f));
+        if w.lo <= 0.0 {
+            return Err(EnclosureError::IllConditionedTangent {
+                detail: format!(
+                    "first fundamental form not provably nondegenerate on region \
+                     u∈[{}, {}], v∈[{}, {}] (EG−F² ∈ [{}, {}])",
+                    region.u0, region.u1, region.v0, region.v1, w.lo, w.hi
+                ),
+            });
+        }
+        let two = Interval { lo: 2.0, hi: 2.0 };
+        let h_num = e.mul(&n).sub(&two.mul(&f).mul(&m)).add(&g.mul(&l));
+        let h = h_num.div(&two.mul(&w))?;
+        let k = l.mul(&n).sub(&m.mul(&m)).div(&w)?;
+        let disc = h.mul(&h).sub(&k);
+        let kappa = h.abs().add(&disc.sqrt_nonneg());
+        // The true max|κ| is nonnegative; clamping the outward-rounded
+        // lower endpoint discards only impossible values.
+        Ok(Interval {
+            lo: kappa.lo.max(0.0),
+            hi: kappa.hi,
+        })
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Footprint bounds (freeform spec F4) — projections of a patch onto a
+// wall frame, with a PROVEN inner rectangle:
+//
+// **T7 — winding footprint theorem.** Let `F = π ∘ S` be the patch
+// composed with the orthogonal projection onto a plane spanned by
+// orthonormal `(e1, e2)`. Suppose both knot vectors are CLAMPED (so the
+// four boundary isolines are the boundary control rows/columns and the
+// patch interpolates its corner control points), and the four projected
+// boundary-row hulls ("bands") satisfy: one opposite pair is strictly
+// separated along `e1`, the other pair strictly separated along `e2`.
+// Let `R` be the open rectangle between them. Then every `p ∈ R` lies in
+// the projected footprint `F([0,1]²)`:
+//
+// - `p` is not in the projected boundary (each boundary curve lies in its
+//   band by the hull property, and every band avoids `R`);
+// - the ray from `p` along `+e1` crosses only the right band's curve,
+//   whose endpoints are the two right-side corner points (interpolated,
+//   hence inside the bottom/top bands, i.e. strictly below/above `p`), so
+//   its crossing parity — and hence the boundary loop's winding parity
+//   around `p` — is odd;
+// - if `p` were NOT in `F([0,1]²)`, `F` restricted to shrinking boundary
+//   loops would null-homotope `F|∂` inside `R² \ {p}`, forcing winding 0 —
+//   contradiction. Hence `p ∈ F([0,1]²)`.
+//
+// The theorem is stated for the FULL patch domain: a caller pairing
+// trimmed faces must first prove the face's trim covers the full domain.
+// ---------------------------------------------------------------------------
+
+/// Conservative fp padding factor for projection hulls (documented
+/// generous over-count of the dot-product rounding, scaled by the point
+/// magnitudes involved).
+const PROJECTION_PAD_ULPS: f64 = 16.0;
+
+/// Outward-rounded enclosure of `(S(u,v) − origin) · axis` over the WHOLE
+/// patch (T1 + linearity of projection): the control-point projections'
+/// hull, padded by the documented fp budget. `axis` is normalized here;
+/// a zero axis refuses.
+pub fn patch_projection_interval(
+    surface: &NurbsSurface,
+    origin: &Point3,
+    axis: &Vector3,
+) -> Result<Interval, EnclosureError> {
+    let unit = axis
+        .normalize()
+        .map_err(|_| EnclosureError::InvalidReference {
+            detail: "projection axis has zero length".to_string(),
+        })?;
+    let net = net_from_surface(surface)?;
+    let mut lo = f64::INFINITY;
+    let mut hi = f64::NEG_INFINITY;
+    let mut scale = 1.0f64;
+    for row in &net.pts {
+        for p in row {
+            let rel = *p - *origin;
+            let d = rel.dot(&unit);
+            lo = lo.min(d);
+            hi = hi.max(d);
+            scale = scale.max(rel.magnitude());
+        }
+    }
+    Ok(Interval { lo, hi }.padded(PROJECTION_PAD_ULPS * EPS * scale))
+}
+
+/// The projected OUTER hull rectangle of the patch on the `(e1, e2)`
+/// frame — a NECESSARY bound (footprint ⊆ rectangle): can prove absence
+/// of overlap, never presence. Returned as `(s, t)` enclosures.
+pub fn footprint_outer_rectangle(
+    surface: &NurbsSurface,
+    origin: &Point3,
+    e1: &Vector3,
+    e2: &Vector3,
+) -> Result<(Interval, Interval), EnclosureError> {
+    Ok((
+        patch_projection_interval(surface, origin, e1)?,
+        patch_projection_interval(surface, origin, e2)?,
+    ))
+}
+
+/// A PROVEN inner rectangle of the patch's projected footprint (T7):
+/// `Some([s_lo, s_hi, t_lo, t_hi])` is an OPEN rectangle in the
+/// `(e1, e2)` frame every interior point of which provably lies in the
+/// projection of the FULL patch. `None` is an honest "not provable by
+/// this construction" (unclamped knots, or bands that do not separate) —
+/// never a guess. Requires the caller to have proven the face's trim
+/// covers the full patch domain before treating footprint membership as
+/// face membership.
+pub fn footprint_inner_rectangle(
+    surface: &NurbsSurface,
+    origin: &Point3,
+    e1: &Vector3,
+    e2: &Vector3,
+) -> Result<Option<[f64; 4]>, EnclosureError> {
+    let u1 = e1
+        .normalize()
+        .map_err(|_| EnclosureError::InvalidReference {
+            detail: "frame axis e1 has zero length".to_string(),
+        })?;
+    let u2 = e2
+        .normalize()
+        .map_err(|_| EnclosureError::InvalidReference {
+            detail: "frame axis e2 has zero length".to_string(),
+        })?;
+    let net = net_from_surface(surface)?;
+
+    // Clamped knot vectors: boundary isolines are the boundary control
+    // rows/columns and corners are interpolated — both load-bearing for
+    // T7. Exact equality, as with the constant-weight proof.
+    let clamped = |knots: &[f64], p: usize| -> bool {
+        let n = knots.len();
+        knots[..=p].iter().all(|&k| k == knots[0])
+            && knots[n - p - 1..].iter().all(|&k| k == knots[n - 1])
+    };
+    if !clamped(&net.ku, net.pu) || !clamped(&net.kv, net.pv) {
+        return Ok(None);
+    }
+
+    // Projected hull rectangle of one boundary band, padded outward.
+    let band = |pts: Vec<Point3>| -> [f64; 4] {
+        let mut s_lo = f64::INFINITY;
+        let mut s_hi = f64::NEG_INFINITY;
+        let mut t_lo = f64::INFINITY;
+        let mut t_hi = f64::NEG_INFINITY;
+        let mut scale = 1.0f64;
+        for p in &pts {
+            let rel = *p - *origin;
+            let s = rel.dot(&u1);
+            let t = rel.dot(&u2);
+            s_lo = s_lo.min(s);
+            s_hi = s_hi.max(s);
+            t_lo = t_lo.min(t);
+            t_hi = t_hi.max(t);
+            scale = scale.max(rel.magnitude());
+        }
+        let pad = PROJECTION_PAD_ULPS * EPS * scale;
+        [s_lo - pad, s_hi + pad, t_lo - pad, t_hi + pad]
+    };
+
+    let n_u = net.n_u();
+    let n_v = net.n_v();
+    let row_first = band(net.pts[0].clone());
+    let row_last = band(net.pts[n_u - 1].clone());
+    let col_first = band((0..n_u).map(|i| net.pts[i][0]).collect());
+    let col_last = band((0..n_u).map(|i| net.pts[i][n_v - 1]).collect());
+
+    // Try both axis assignments: (row pair along s, col pair along t) and
+    // the transpose. Band rect layout: [s_lo, s_hi, t_lo, t_hi].
+    let try_axes = |x_pair: (&[f64; 4], &[f64; 4]),
+                    y_pair: (&[f64; 4], &[f64; 4]),
+                    x_idx: (usize, usize),
+                    y_idx: (usize, usize)|
+     -> Option<[f64; 4]> {
+        // Order each pair along its axis; require strict separation.
+        let (x_low, x_high) = if x_pair.0[x_idx.1] < x_pair.1[x_idx.0] {
+            (x_pair.0, x_pair.1)
+        } else if x_pair.1[x_idx.1] < x_pair.0[x_idx.0] {
+            (x_pair.1, x_pair.0)
+        } else {
+            return None;
+        };
+        let (y_low, y_high) = if y_pair.0[y_idx.1] < y_pair.1[y_idx.0] {
+            (y_pair.0, y_pair.1)
+        } else if y_pair.1[y_idx.1] < y_pair.0[y_idx.0] {
+            (y_pair.1, y_pair.0)
+        } else {
+            return None;
+        };
+        let s_lo = x_low[x_idx.1];
+        let s_hi = x_high[x_idx.0];
+        let t_lo = y_low[y_idx.1];
+        let t_hi = y_high[y_idx.0];
+        if s_lo < s_hi && t_lo < t_hi {
+            Some([s_lo, s_hi, t_lo, t_hi])
+        } else {
+            None
+        }
+    };
+
+    // Assignment 1: u-boundary rows separated along s (indices 0/1),
+    // v-boundary columns along t (indices 2/3).
+    if let Some(r) = try_axes(
+        (&row_first, &row_last),
+        (&col_first, &col_last),
+        (0, 1),
+        (2, 3),
+    ) {
+        return Ok(Some(r));
+    }
+    // Assignment 2: rows along t, columns along s — returned in the SAME
+    // [s_lo, s_hi, t_lo, t_hi] layout.
+    if let Some(r) = try_axes(
+        (&col_first, &col_last),
+        (&row_first, &row_last),
+        (0, 1),
+        (2, 3),
+    ) {
+        return Ok(Some(r));
+    }
+    Ok(None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1779,5 +3054,340 @@ mod tests {
             b.normal.angle_to(&Vector3::new(0.0, 0.0, 0.0)),
             Err(EnclosureError::InvalidReference { .. })
         ));
+    }
+
+    // -------------------------------------------------------------------
+    // F3–F5 machinery: new Interval ops
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn interval_abs_sqrt_div_recip_hand_cases() {
+        let neg = Interval::enclosing(-3.0, -1.0).expect("neg");
+        let cross = Interval::enclosing(-2.0, 5.0).expect("cross");
+        let pos = Interval::enclosing(4.0, 9.0).expect("pos");
+
+        assert_eq!((neg.abs().lo(), neg.abs().hi()), (1.0, 3.0));
+        assert_eq!((cross.abs().lo(), cross.abs().hi()), (0.0, 5.0));
+        assert_eq!((pos.abs().lo(), pos.abs().hi()), (4.0, 9.0));
+
+        let r = pos.sqrt_nonneg();
+        assert!(r.contains(2.0) && r.contains(3.0));
+        assert!(r.lo() <= 2.0 && r.hi() >= 3.0);
+        // Clamp arm: an outward-dipped negative lower endpoint roots to 0.
+        let dipped = Interval::enclosing(-1e-12, 4.0).expect("dipped");
+        assert_eq!(dipped.sqrt_nonneg().lo(), 0.0);
+
+        // Division by a zero-containing interval is a refusal, never ±∞.
+        assert!(pos.div(&cross).is_err());
+        let q = Interval::enclosing(2.0, 6.0)
+            .expect("num")
+            .div(&Interval::enclosing(1.0, 2.0).expect("den"))
+            .expect("sign-definite divisor");
+        assert!(q.contains(1.0) && q.contains(6.0));
+        assert!(q.lo() <= 1.0 && q.hi() >= 6.0);
+
+        // Reciprocal requires PROVEN positivity.
+        assert!(cross.recip_positive().is_err());
+        assert!(Interval::enclosing(0.0, 1.0)
+            .expect("touching zero")
+            .recip_positive()
+            .is_err());
+        let rp = pos.recip_positive().expect("positive");
+        assert!(rp.contains(1.0 / 4.0) && rp.contains(1.0 / 9.0));
+    }
+
+    // -------------------------------------------------------------------
+    // Regional subdivision (T5/T6): THE GAP — global refine refuses
+    // forever on a wide-normal-spread patch; regional bounds it.
+    // -------------------------------------------------------------------
+
+    /// Degree (2,1) steep bump S(u,v) = (u, v, 40u(1−u)) (z-control
+    /// (0, 20, 0)): slope z′ = 40(1−2u) sweeps [−40, 40], so the normal's
+    /// angle to +Z sweeps exactly [0°, atan(40) ≈ 88.568°] — a total
+    /// spread ≈ 177°, far beyond a single proper cone.
+    fn steep_bump() -> NurbsSurface {
+        NurbsSurface::new(
+            vec![
+                vec![Point3::new(0.0, 0.0, 0.0), Point3::new(0.0, 1.0, 0.0)],
+                vec![Point3::new(0.5, 0.0, 20.0), Point3::new(0.5, 1.0, 20.0)],
+                vec![Point3::new(1.0, 0.0, 0.0), Point3::new(1.0, 1.0, 0.0)],
+            ],
+            vec![vec![1.0; 2]; 3],
+            vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            vec![0.0, 0.0, 1.0, 1.0],
+            2,
+            1,
+        )
+        .expect("valid steep bump")
+    }
+
+    #[test]
+    fn regional_engine_bounds_what_global_refine_refuses_forever() {
+        let s = steep_bump();
+
+        // BEFORE (the F2 gap, demonstrated live): the WHOLE-patch cone
+        // refuses, and global refinement can never help — the whole-patch
+        // normal spread does not shrink under knot insertion.
+        assert!(
+            matches!(
+                control_net_bounds(&s),
+                Err(EnclosureError::NormalUnbounded { .. })
+            ),
+            "whole-patch cone must refuse on a ~177° normal spread"
+        );
+        assert!(
+            matches!(
+                refine(&s, RefineBudget::STANDARD, |_| false),
+                Err(EnclosureError::NormalUnbounded { .. })
+            ),
+            "global refine must refuse at any depth — this is the gap regional \
+             subdivision exists to close"
+        );
+
+        // AFTER: the regional engine bounds it, tightly.
+        let re = regional_angle_enclosure(&s, &Vector3::Z, RegionalBudget::STANDARD_ANGLE)
+            .expect("regional enclosure succeeds where global refuses");
+        let true_max = 40.0f64.atan(); // ≈ 1.5458 rad ≈ 88.568°
+        assert!(
+            re.min_value.contains(0.0),
+            "min-angle enclosure must contain the true 0: [{}, {}]",
+            re.min_value.lo(),
+            re.min_value.hi()
+        );
+        assert!(
+            re.max_value.contains(true_max),
+            "max-angle enclosure must contain atan(40): [{}, {}]",
+            re.max_value.lo(),
+            re.max_value.hi()
+        );
+        assert!(re.converged, "standard budget should converge: {re:?}");
+
+        // T6's load-bearing endpoint (the mutation target): the sup
+        // enclosure's LOWER end is a proven lower bound on the true
+        // maximum — the thing a sampler can only guess at and a
+        // whole-patch bound (lo = 0) could never prove. A rule with an
+        // 80° threshold is PROVABLY violated from this alone.
+        assert!(
+            re.max_value.lo() > 80.0f64.to_radians(),
+            "sup-fold lower endpoint must prove the >80° violation, got {} rad",
+            re.max_value.lo()
+        );
+
+        // TEST ORACLE (sampling is legitimate here and only here): every
+        // densely-sampled true angle lies inside the union of the fold
+        // envelopes, the sampled max is inside the sup enclosure, and the
+        // sampled min inside the inf enclosure.
+        let mut sampled_min = f64::INFINITY;
+        let mut sampled_max = f64::NEG_INFINITY;
+        for iu in 0..=400 {
+            let u = iu as f64 / 400.0;
+            // True normal of (u, v, z(u)): (−z′(u), 0, 1).
+            let zp = 40.0 * (1.0 - 2.0 * u);
+            let n = Vector3::new(-zp, 0.0, 1.0);
+            let ang = (n.dot(&Vector3::Z) / n.magnitude()).clamp(-1.0, 1.0).acos();
+            assert!(
+                ang >= re.min_value.lo() - 1e-9 && ang <= re.max_value.hi() + 1e-9,
+                "sampled angle {ang} at u={u} escapes the fold envelope"
+            );
+            sampled_min = sampled_min.min(ang);
+            sampled_max = sampled_max.max(ang);
+        }
+        assert!(
+            re.max_value.contains(sampled_max) || sampled_max <= re.max_value.hi(),
+            "sampled max must not exceed the sup enclosure"
+        );
+        assert!(sampled_max >= re.max_value.lo() - 1e-9);
+        assert!(sampled_min <= re.min_value.hi() + 1e-9);
+    }
+
+    // -------------------------------------------------------------------
+    // F5: curvature enclosure
+    // -------------------------------------------------------------------
+
+    /// Degree (2,1) parabolic cylinder S(u,v) = (u, v, u²) — principal
+    /// curvatures are κ₁(u) = 2/(1+4u²)^{3/2} (max 2 at u = 0) and
+    /// κ₂ = 0, so the true max|κ| over the patch is exactly 2.
+    fn parabolic_cylinder() -> NurbsSurface {
+        NurbsSurface::new(
+            vec![
+                vec![Point3::new(0.0, 0.0, 0.0), Point3::new(0.0, 1.0, 0.0)],
+                vec![Point3::new(0.5, 0.0, 0.0), Point3::new(0.5, 1.0, 0.0)],
+                vec![Point3::new(1.0, 0.0, 1.0), Point3::new(1.0, 1.0, 1.0)],
+            ],
+            vec![vec![1.0; 2]; 3],
+            vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            vec![0.0, 0.0, 1.0, 1.0],
+            2,
+            1,
+        )
+        .expect("valid parabolic cylinder")
+    }
+
+    #[test]
+    fn regional_curvature_encloses_parabolic_cylinder_max() {
+        let s = parabolic_cylinder();
+        let re = regional_max_abs_curvature(&s, RegionalBudget::STANDARD_CURVATURE)
+            .expect("curvature enclosure");
+        assert!(
+            re.max_value.contains(2.0),
+            "max|κ| enclosure must contain the true 2.0: [{}, {}]",
+            re.max_value.lo(),
+            re.max_value.hi()
+        );
+        assert!(
+            re.max_value.lo() > 0.0,
+            "curvature must be proven bounded away from zero here"
+        );
+
+        // TEST ORACLE: κ(u) = 2/(1+4u²)^{3/2} sampled densely — every
+        // value must sit at/below the sup enclosure's ceiling, and the
+        // sampled max at/above its floor.
+        let mut sampled_max = 0.0f64;
+        for iu in 0..=400 {
+            let u = iu as f64 / 400.0;
+            let kappa = 2.0 / (1.0 + 4.0 * u * u).powf(1.5);
+            assert!(
+                kappa <= re.max_value.hi() + 1e-9,
+                "sampled κ {kappa} at u={u} exceeds the ceiling {}",
+                re.max_value.hi()
+            );
+            sampled_max = sampled_max.max(kappa);
+        }
+        assert!(
+            sampled_max >= re.max_value.lo() - 1e-9,
+            "sup-fold floor {} must not exceed the sampled max {sampled_max}",
+            re.max_value.lo()
+        );
+        // The radius view: min radius over the patch is 1/2.
+        let radius = re.max_value.recip_positive().expect("κ proven positive");
+        assert!(
+            radius.contains(0.5),
+            "min-radius enclosure must contain 0.5: [{}, {}]",
+            radius.lo(),
+            radius.hi()
+        );
+    }
+
+    /// A flat patch's curvature enclosure must include 0 and REFUSE the
+    /// reciprocal — the honest "no radius ceiling" outcome, never a
+    /// fabricated finite radius.
+    #[test]
+    fn flat_patch_curvature_contains_zero_and_radius_refuses() {
+        let s = NurbsSurface::new(
+            vec![
+                vec![Point3::new(0.0, 0.0, 0.0), Point3::new(0.0, 1.0, 0.0)],
+                vec![Point3::new(1.0, 0.0, 0.0), Point3::new(1.0, 1.0, 0.0)],
+            ],
+            vec![vec![1.0, 1.0], vec![1.0, 1.0]],
+            vec![0.0, 0.0, 1.0, 1.0],
+            vec![0.0, 0.0, 1.0, 1.0],
+            1,
+            1,
+        )
+        .expect("flat patch");
+        let re = regional_max_abs_curvature(&s, RegionalBudget::STANDARD_CURVATURE)
+            .expect("flat patch bounds");
+        assert!(
+            re.max_value.contains(0.0),
+            "flat patch max|κ| must contain 0: [{}, {}]",
+            re.max_value.lo(),
+            re.max_value.hi()
+        );
+        assert!(
+            re.max_value.recip_positive().is_err(),
+            "a curvature not proven nonzero must refuse the radius reciprocal"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // F4: projection + footprint (T7)
+    // -------------------------------------------------------------------
+
+    /// Wavy wall over x ∈ [0,3], y ∈ [0,3] at height ~z0: x = 3u exactly
+    /// (control (0, 1.5, 3) is linear), y = 3v, z-control
+    /// (z0, z0 + amp, z0) so the true z sweeps [z0, z0 + amp/2].
+    fn wavy_wall_patch(z0: f64, amp: f64) -> NurbsSurface {
+        NurbsSurface::new(
+            vec![
+                vec![Point3::new(0.0, 0.0, z0), Point3::new(0.0, 3.0, z0)],
+                vec![
+                    Point3::new(1.5, 0.0, z0 + amp),
+                    Point3::new(1.5, 3.0, z0 + amp),
+                ],
+                vec![Point3::new(3.0, 0.0, z0), Point3::new(3.0, 3.0, z0)],
+            ],
+            vec![vec![1.0; 2]; 3],
+            vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            vec![0.0, 0.0, 1.0, 1.0],
+            2,
+            1,
+        )
+        .expect("valid wavy wall")
+    }
+
+    #[test]
+    fn projection_interval_encloses_true_range_via_hull() {
+        let s = wavy_wall_patch(1.0, 0.1);
+        let proj = patch_projection_interval(&s, &Point3::new(0.0, 0.0, 0.0), &Vector3::Z)
+            .expect("projection");
+        // True z-range is [1.0, 1.05]; the control hull proves [1.0, 1.1].
+        assert!(proj.contains(1.0) && proj.contains(1.05));
+        assert!(proj.lo() <= 1.0 && proj.hi() >= 1.05 && proj.hi() <= 1.11);
+        // Zero axis refuses.
+        assert!(patch_projection_interval(
+            &s,
+            &Point3::new(0.0, 0.0, 0.0),
+            &Vector3::new(0.0, 0.0, 0.0)
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn footprint_inner_rectangle_proves_central_region() {
+        let s = wavy_wall_patch(0.0, 0.1);
+        let origin = Point3::new(0.0, 0.0, 0.0);
+        let inner = footprint_inner_rectangle(&s, &origin, &Vector3::X, &Vector3::Y)
+            .expect("well-formed patch")
+            .expect("bands separate — inner rectangle must be provable");
+        let [s_lo, s_hi, t_lo, t_hi] = inner;
+        // The true footprint is exactly [0,3]²; the proven inner rectangle
+        // must be a (near-full) subset of it.
+        assert!(s_lo >= -1e-9 && s_lo < 0.1, "s_lo = {s_lo}");
+        assert!(s_hi <= 3.0 + 1e-9 && s_hi > 2.9, "s_hi = {s_hi}");
+        assert!(t_lo >= -1e-9 && t_lo < 0.1, "t_lo = {t_lo}");
+        assert!(t_hi <= 3.0 + 1e-9 && t_hi > 2.9, "t_hi = {t_hi}");
+
+        // Inner ⊆ outer (sanity between the two bounds).
+        let (os, ot) =
+            footprint_outer_rectangle(&s, &origin, &Vector3::X, &Vector3::Y).expect("outer");
+        assert!(os.lo() <= s_lo && os.hi() >= s_hi);
+        assert!(ot.lo() <= t_lo && ot.hi() >= t_hi);
+    }
+
+    /// A patch folded back on itself in u (first and last control rows
+    /// coincide) has no separated band pair — the inner rectangle is
+    /// honestly unprovable, never guessed.
+    #[test]
+    fn folded_patch_footprint_inner_rectangle_is_unprovable() {
+        let s = NurbsSurface::new(
+            vec![
+                vec![Point3::new(0.0, 0.0, 0.0), Point3::new(0.0, 3.0, 0.0)],
+                vec![Point3::new(3.0, 0.0, 1.0), Point3::new(3.0, 3.0, 1.0)],
+                vec![Point3::new(0.0, 0.0, 2.0), Point3::new(0.0, 3.0, 2.0)],
+            ],
+            vec![vec![1.0; 2]; 3],
+            vec![0.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            vec![0.0, 0.0, 1.0, 1.0],
+            2,
+            1,
+        )
+        .expect("folded patch");
+        let inner =
+            footprint_inner_rectangle(&s, &Point3::new(0.0, 0.0, 0.0), &Vector3::X, &Vector3::Y)
+                .expect("well-formed patch");
+        assert!(
+            inner.is_none(),
+            "coincident opposite bands must make the inner rectangle unprovable"
+        );
     }
 }
