@@ -312,10 +312,21 @@ fn refuse_constraint_in_one_component_still_surfaces_globally() {
 }
 
 #[test]
-fn under_constrained_verdict_is_aggregated_globally() {
-    // Two disjoint clusters: one fully constrained, one with 2 free
-    // DOFs. The global DOF verdict (UnderConstrained{2}) must be
-    // identical to the whole-system path's counting.
+fn under_constrained_components_sum_under_the_precedence_fold() {
+    // Two disjoint clusters, NEITHER over-constrained: one fully
+    // constrained, one with 2 free DOFs. SKETCH-DCM #45 slice H4
+    // replaced the naive global-sum DOF comparison with a
+    // per-component precedence fold (any component over-constrained
+    // outranks any component under-constrained; see
+    // `ConstraintSolver::check_constraint_count`). This fixture has no
+    // over-constrained component, so the fold reports `UnderConstrained`
+    // with the sum of the per-component deficits (0 + 2 = 2) — the
+    // SAME number the old global-sum comparison happened to produce
+    // for this particular fixture, because nothing here cancels. This
+    // test does NOT exercise the cancellation defect itself (see
+    // `over_and_under_components_never_cancel_to_fully_constrained`
+    // below for that); it pins that the fold's arithmetic still
+    // matches the pre-slice number in the non-cancelling case.
     let sketch = fresh();
 
     let pinned = sketch.add_point(Point2d::new(1.0, 2.0));
@@ -347,8 +358,8 @@ fn under_constrained_verdict_is_aggregated_globally() {
     assert_eq!(
         report.degrees_of_freedom(),
         Some(2),
-        "global DOF verdict must aggregate across components exactly \
-         like the whole-system count, got {:?}",
+        "no component here is over-constrained, so the fold reports \
+         UnderConstrained with the summed per-component deficit, got {:?}",
         report.status
     );
     // …and the residuals were still all driven under tolerance.
@@ -356,6 +367,86 @@ fn under_constrained_verdict_is_aggregated_globally() {
         report.violations.is_empty(),
         "under-constrained but satisfiable: {:?}",
         report.violations
+    );
+}
+
+#[test]
+fn over_and_under_components_never_cancel_to_fully_constrained() {
+    // THE H4 headline defect, exercised through `Sketch::solve_constraints`
+    // (site 2: `ConstraintSolver::check_constraint_count`, the
+    // `SolverResult.status` / `SketchSolveReport.status` path — the
+    // analogous cancellation to `analyze_dofs`'s own fold, fixed the
+    // same way).
+    //
+    // Component A: points a=(1,2), b=(6,2) + Distance(5.0) [consistent:
+    // they really are 5.0 apart] + X(a)=1 + Y(a)=2 + X(b)=6 + Y(b)=2.
+    // Free DOFs = 4, removed = 5 → over-constrained by 1 (a REDUNDANT,
+    // fully satisfiable surplus — Newton converges this component to
+    // zero residual).
+    //
+    // Component B: lone point c=(3,0) with only Y(c)=0. Free DOFs = 2,
+    // removed = 1 → under-constrained by 1.
+    //
+    // Global tallies: free 4+2=6, removed 5+1=6 — the pre-H4 global
+    // comparison cancels to `Equal`, so `check_constraint_count`
+    // returned `None` and `solve()` fell through to Newton's own
+    // outcome. Because both components are individually SATISFIABLE
+    // (component A's surplus is redundant, not conflicting; component
+    // B has no constraint contradicting its free coordinate), Newton
+    // actually converges — so the pre-fix report was `Converged`, not
+    // even the "balanced" `FullyConstrained`-flavoured lie `analyze_dofs`
+    // told, but still wrong: a genuinely over-constrained component
+    // must be reported as such regardless of whether its surplus
+    // happens to be consistent.
+    let sketch = fresh();
+    let a = sketch.add_point(Point2d::new(1.0, 2.0));
+    let b = sketch.add_point(Point2d::new(6.0, 2.0));
+    sketch.add_constraint(Constraint::new_dimensional(
+        DimensionalConstraint::Distance(5.0),
+        vec![EntityRef::Point(a), EntityRef::Point(b)],
+        ConstraintPriority::Required,
+    ));
+    sketch.add_constraint(Constraint::new_dimensional(
+        DimensionalConstraint::XCoordinate(1.0),
+        vec![EntityRef::Point(a)],
+        ConstraintPriority::Required,
+    ));
+    sketch.add_constraint(Constraint::new_dimensional(
+        DimensionalConstraint::YCoordinate(2.0),
+        vec![EntityRef::Point(a)],
+        ConstraintPriority::Required,
+    ));
+    sketch.add_constraint(Constraint::new_dimensional(
+        DimensionalConstraint::XCoordinate(6.0),
+        vec![EntityRef::Point(b)],
+        ConstraintPriority::Required,
+    ));
+    sketch.add_constraint(Constraint::new_dimensional(
+        DimensionalConstraint::YCoordinate(2.0),
+        vec![EntityRef::Point(b)],
+        ConstraintPriority::Required,
+    ));
+
+    let c = sketch.add_point(Point2d::new(3.0, 0.0));
+    sketch.add_constraint(Constraint::new_dimensional(
+        DimensionalConstraint::YCoordinate(0.0),
+        vec![EntityRef::Point(c)],
+        ConstraintPriority::Required,
+    ));
+
+    let report = sketch.solve_constraints().expect("solve");
+    assert_eq!(
+        report.conflicting_constraints(),
+        Some(1),
+        "the over-constrained component must outrank the \
+         under-constrained one under the precedence fold, got status {:?}",
+        report.status
+    );
+    assert!(
+        !report.is_fully_constrained(),
+        "must never present the cancellation as fully constrained \
+         (Converged with 0 remaining DOF), got {:?}",
+        report.status
     );
 }
 

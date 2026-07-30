@@ -6,7 +6,7 @@
 import { wsClient, setResyncHook } from './ws-client'
 import { useWSStore } from '@/stores/ws-store'
 import { useSceneStore, type CADObject, type CADMesh, type CADMaterial, type AnalyticalGeometry } from '@/stores/scene-store'
-import { useChatStore } from '@/stores/chat-store'
+import { useBlackboardStore } from '@/stores/blackboard-store'
 import { sketchApi } from './sketch-api'
 import type {
   CADObject as ProtocolCADObject,
@@ -273,11 +273,7 @@ function flushPendingOps() {
       if (!op.announceAsNew) continue
       scene.setPendingFrameObject(op.obj.id)
       if (op.echoMessage) {
-        useChatStore.getState().addMessage({
-          role: 'system',
-          content: op.echoMessage,
-          objectsAffected: [op.obj.id],
-        })
+        useBlackboardStore.getState().addLine(op.echoMessage, 'system')
       }
     }
   }

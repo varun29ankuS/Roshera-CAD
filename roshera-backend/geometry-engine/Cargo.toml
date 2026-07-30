@@ -115,6 +115,10 @@ export = []
 profile = []
 lookup_tables = []
 gpu = []
+# Opt-in println-style manual diagnostics (math::test_oslo and its bin).
+# Off by default so release builds carry no debug scaffolding in the
+# public surface.
+dev-diagnostics = []
 ml = []
 
 # All tests are now in src/math/test_math/
@@ -149,6 +153,11 @@ harness = false
 [[bin]]
 name = "bench_runner"
 path = "src/bin/bench_runner.rs"
+
+[[bin]]
+name = "test_oslo"
+path = "src/bin/test_oslo.rs"
+required-features = ["dev-diagnostics"]
 
 [lints]
 workspace = true

@@ -2399,6 +2399,84 @@ pub async fn part_features(
     }))
 }
 
+// ───────────────────── DFM (design-for-manufacturability) ───────────
+
+/// `POST /api/agent/parts/{id}/dfm` — run a DFM rule pack against a solid
+/// (kernel `dfm/` subsystem: `geometry_engine::dfm::packs::evaluate`).
+///
+/// Body is a [`geometry_engine::dfm::PackParams`] verbatim — tagged by
+/// `pack` (`"fdm"` or `"injection_molding"`), the SAME type
+/// [`geometry_engine::dfm::DfmReport::params`] echoes back. No DTO
+/// translation layer, matching this module's own stated convention (see
+/// module docs): the agent supplies and receives the kernel's own report
+/// type, so backend/agent drift is impossible.
+///
+/// Every face of the solid (outer shell + every inner shell) is the
+/// candidate set handed to the pack — enumerating "every face of a solid"
+/// is the caller's one-line job per `dfm::packs` module docs ("why
+/// `faces: &[FaceId]`, not `model`/`solid`"). Read lock only: DFM analysis
+/// warms no per-entity cache, unlike `/mass` or `/obb`.
+///
+/// 404 — solid not found in the active model.
+/// 422 — the kernel refuses the analysis outright (a dangling face/solid
+///       reference, or a solid that fails an analyzer's soundness
+///       precondition) — [`geometry_engine::dfm::DfmError`]'s reason is
+///       surfaced verbatim. This is distinct from a rule reading
+///       `Unverifiable` inside a 200 response: that is an honest per-rule
+///       refusal, a VALUE in the report, never an HTTP error (spec §4).
+pub async fn part_dfm_check(
+    State(_state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
+    Path(id): Path<u32>,
+    Json(params): Json<geometry_engine::dfm::PackParams>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    use geometry_engine::dfm::packs::evaluate as dfm_evaluate;
+
+    let model = model_handle.read().await;
+    let solid_id = id as SolidId;
+    let solid = match model.solids.get(solid_id) {
+        Some(s) => s,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": "not_found",
+                    "reason": format!(
+                        "solid {solid_id} is not part of the active model"
+                    ),
+                })),
+            );
+        }
+    };
+
+    let mut faces = Vec::new();
+    for shell_id in solid.all_shells() {
+        if let Some(shell) = model.shells.get(shell_id) {
+            faces.extend(shell.faces.iter().copied());
+        }
+    }
+
+    match dfm_evaluate(params, &model, solid_id, &faces) {
+        Ok(report) => {
+            // `DfmReport` is Serde-derived over f64/String/enum fields only —
+            // serialization to `serde_json::Value` cannot fail here; the
+            // `unwrap_or_else` fallback mirrors `measure`'s own convention
+            // above rather than an `.expect()` on a branch that cannot miss.
+            let body = serde_json::to_value(&report).unwrap_or_else(
+                |e| serde_json::json!({ "error": "serialization_failed", "reason": e.to_string() }),
+            );
+            (StatusCode::OK, Json(body))
+        }
+        Err(e) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "error": "dfm_unverifiable_input",
+                "reason": e.to_string(),
+            })),
+        ),
+    }
+}
+
 // ───────────────────── dimensioned multi-view (EYE-1) ───────────────
 
 /// A world-space 3-vector on the wire.

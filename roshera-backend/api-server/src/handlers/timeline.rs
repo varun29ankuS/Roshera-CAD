@@ -9,7 +9,7 @@ use axum::{
 use geometry_engine::operations::recorder::OperationRecorder;
 use geometry_engine::primitives::topology_builder::BRepModel;
 use serde::{Deserialize, Serialize};
-use session_manager::BroadcastMessage;
+use session_manager::{BroadcastMessage, PrincipalKind};
 use shared_types::{CADObject, ObjectId};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -22,17 +22,28 @@ use timeline_engine::{
 use tracing::{error, info};
 use uuid::Uuid;
 
+use crate::auth_middleware::AuthInfo;
 use crate::blackboard::{BlackboardLine, BlackboardScope};
 use crate::durability::DurabilityStatus;
 use geometry_engine::readable::MassPropertiesReport;
 use timeline_engine::event_certificate::EventCertificate;
 
 /// Request to record an operation
+///
+/// AUTHORSHIP-A1: this DTO used to carry an `author: AuthorDto` field
+/// that the client filled in directly — any authenticated caller could
+/// claim to be any user or any AI agent, and that claim would be
+/// written verbatim into the append-only event log. The field is
+/// removed rather than accepted-and-ignored: authorship is now always
+/// derived from the request's authenticated `AuthInfo` (see
+/// [`author_from_auth_info`]), so a caller who used to send `author`
+/// gets a clear rejection (unknown field) instead of a silently
+/// discarded one.
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RecordOperationRequest {
     pub session_id: String,
     pub operation: OperationDto,
-    pub author: AuthorDto,
     pub branch_id: Option<String>,
 }
 
@@ -58,15 +69,6 @@ pub enum OperationDto {
     },
 }
 
-/// Author DTO
-#[derive(Serialize, Deserialize)]
-#[serde(tag = "type")]
-pub enum AuthorDto {
-    User { id: String, name: String },
-    AI { agent_id: String, model: String },
-    System,
-}
-
 /// Response for operation recording
 #[derive(Serialize, Deserialize)]
 pub struct RecordOperationResponse {
@@ -77,12 +79,16 @@ pub struct RecordOperationResponse {
 }
 
 /// Create branch request
+///
+/// AUTHORSHIP-A1: `author` used to be client-supplied (`AuthorDto`);
+/// removed for the same reason as [`RecordOperationRequest`] — a
+/// caller cannot declare its own authorship in an audit trail.
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateBranchRequest {
     pub name: String,
     pub parent_branch: Option<String>,
     pub purpose: BranchPurposeDto,
-    pub author: AuthorDto,
 }
 
 /// Branch purpose DTO
@@ -577,8 +583,13 @@ pub async fn initialize_timeline(
 }
 
 /// Record an operation (replaces commit_changes)
+///
+/// AUTHORSHIP-A1: `author` is derived from the request's authenticated
+/// `AuthInfo` (see [`author_from_auth_info`]), never from the request
+/// body — the client can no longer declare who made this change.
 pub async fn record_operation(
     State(state): State<AppState>,
+    auth_info: AuthInfo,
     Json(request): Json<RecordOperationRequest>,
 ) -> Result<Json<RecordOperationResponse>, StatusCode> {
     let mut timeline = state.timeline.write().await;
@@ -587,7 +598,7 @@ pub async fn record_operation(
     let operation =
         convert_operation_dto(request.operation).map_err(|_| StatusCode::BAD_REQUEST)?;
 
-    let author = convert_author_dto(request.author);
+    let author = author_from_auth_info(&auth_info);
 
     let branch_id = match request.branch_id {
         Some(id) => resolve_branch_ref(&id)?,
@@ -599,7 +610,7 @@ pub async fn record_operation(
 
     // Record the operation
     let event_id = timeline
-        .record_operation(session_uuid, operation)
+        .record_operation(session_uuid, operation, author)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
@@ -614,8 +625,13 @@ pub async fn record_operation(
 }
 
 /// Create a new branch
+///
+/// AUTHORSHIP-A1: `author` is derived from the request's authenticated
+/// `AuthInfo` (see [`author_from_auth_info`]), never from the request
+/// body.
 pub async fn create_branch(
     State(state): State<AppState>,
+    auth_info: AuthInfo,
     Json(request): Json<CreateBranchRequest>,
 ) -> Result<Json<BranchInfo>, StatusCode> {
     let branch_manager = &state.branch_manager;
@@ -626,7 +642,7 @@ pub async fn create_branch(
     };
 
     let purpose = convert_purpose_dto(request.purpose);
-    let author = convert_author_dto(request.author);
+    let author = author_from_auth_info(&auth_info);
 
     let branch_id = branch_manager
         .create_branch(
@@ -2198,8 +2214,17 @@ pub async fn bind_parameter_name(
 }
 
 /// Checkpoint/tag a specific state
+///
+/// AUTHORSHIP-A1: this handler previously required `author_id` +
+/// `author_name` in the request body — fields the frontend never sent
+/// (`Timeline.tsx`'s `handleCheckpoint` posts only `{name}`), so every
+/// checkpoint request was rejected by the `Json` extractor before this
+/// handler ever ran. Deriving authorship from `AuthInfo` removes the
+/// need for those fields entirely, which incidentally makes
+/// checkpointing work for the first time.
 pub async fn create_checkpoint(
     State(state): State<AppState>,
+    auth_info: AuthInfo,
     Json(request): Json<CreateCheckpointRequest>,
 ) -> Result<StatusCode, StatusCode> {
     let mut timeline = state.timeline.write().await;
@@ -2207,12 +2232,9 @@ pub async fn create_checkpoint(
     timeline
         .create_checkpoint(
             request.name,
-            request.description,
+            request.description.unwrap_or_default(),
             BranchId::main(), // Use main branch
-            Author::User {
-                id: request.author_id,
-                name: request.author_name,
-            },
+            author_from_auth_info(&auth_info),
             Vec::new(), // No tags for now
         )
         .await
@@ -2221,16 +2243,73 @@ pub async fn create_checkpoint(
     Ok(StatusCode::CREATED)
 }
 
-/// Checkpoint request
+/// Checkpoint request.
+///
+/// AUTHORSHIP-A1: `author_id`/`author_name` are gone — authorship is
+/// derived from `AuthInfo` (see [`create_checkpoint`]). `description`
+/// is now optional: the frontend (`Timeline.tsx`'s `handleCheckpoint`)
+/// only ever sent `{name}`, and the previous all-required shape meant
+/// Axum rejected every real checkpoint request before this handler ran.
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateCheckpointRequest {
     pub name: String,
-    pub description: String,
-    pub author_id: String,
-    pub author_name: String,
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 // Helper functions to convert DTOs
+
+/// Derive the timeline [`Author`] for a request from its authenticated
+/// [`AuthInfo`], never from client-supplied data (AUTHORSHIP-A1).
+///
+/// `record_operation`, `create_branch`, and `create_checkpoint` used to
+/// take the `Author` straight out of the request body (`AuthorDto`),
+/// so any authenticated caller could write arbitrary authorship —
+/// including `Author::AIAgent` for an agent it never was — into an
+/// append-only, event-sourced log. That is impersonation in a trail
+/// that cannot be healed after the fact. Authorship must instead be
+/// *derived* from the principal the auth layer already validated.
+///
+/// # The principal-kind claim (AUTHORSHIP-A2)
+///
+/// `AuthInfo.principal` (`session_manager::PrincipalKind`) is the honest
+/// human/agent signal `is_api_key` was never able to provide —
+/// `is_api_key` is a transport fact (JWT vs. API key) that an agent and
+/// a human can both hold either side of, whereas `principal` is minted
+/// once, at credential-issue time, by whoever authorized the credential
+/// (the login handler for a human; a provisioning caller forwarding its
+/// own principal for an API key) and carried verbatim through JWT
+/// verification / API-key lookup. It is never inferred from the
+/// request here — inferring it would reintroduce exactly the fabricated
+/// certainty this function used to warn against.
+///
+/// `PrincipalKind::Agent { model }` mints `Author::AIAgent` with that
+/// same model — never a guessed or hardcoded one, because
+/// `Author::AIAgent` carries a model and inventing one would be the
+/// fabrication in a new place. `PrincipalKind::Unspecified` (no claim
+/// present — a credential minted before this claim existed) and
+/// `PrincipalKind::Human` both map to `Author::User`: `Unspecified`
+/// must NOT be upgraded to `Author::AIAgent`, because `Author::User {
+/// id }` commits only to the *verified* id, while minting `AIAgent`
+/// would require a model nobody supplied.
+///
+/// `name` is set equal to `user_id`: `AuthInfo` carries no separate
+/// display name (no email/username field survives JWT verification or
+/// API-key lookup today), so inventing one would itself be a
+/// fabrication this function exists to avoid.
+fn author_from_auth_info(auth: &AuthInfo) -> Author {
+    match &auth.principal {
+        PrincipalKind::Agent { model } => Author::AIAgent {
+            id: auth.user_id.clone(),
+            model: model.clone(),
+        },
+        PrincipalKind::Human | PrincipalKind::Unspecified => Author::User {
+            id: auth.user_id.clone(),
+            name: auth.user_id.clone(),
+        },
+    }
+}
 
 fn convert_operation_dto(dto: OperationDto) -> Result<Operation, ()> {
     match dto {
@@ -2280,17 +2359,6 @@ fn convert_operation_dto(dto: OperationDto) -> Result<Operation, ()> {
         OperationDto::Delete { entity_id } => Ok(Operation::Delete {
             entities: vec![EntityId(Uuid::parse_str(&entity_id).map_err(|_| ())?)],
         }),
-    }
-}
-
-fn convert_author_dto(dto: AuthorDto) -> Author {
-    match dto {
-        AuthorDto::User { id, name } => Author::User { id, name },
-        AuthorDto::AI { agent_id, model } => Author::AIAgent {
-            id: agent_id,
-            model,
-        },
-        AuthorDto::System => Author::System,
     }
 }
 
@@ -3075,6 +3143,129 @@ mod affected_parts_tests {
         assert_eq!(
             affected_solids(&op),
             vec!["solid:3".to_string(), "solid:4".to_string()]
+        );
+    }
+}
+
+/// AUTHORSHIP-A1: direct unit tests of the pure `author_from_auth_info`
+/// mapping, independent of any router/handler plumbing. This is the
+/// mapping every one of `record_operation`, `create_branch`, and
+/// `create_checkpoint` now uses instead of trusting a client-supplied
+/// `AuthorDto`.
+#[cfg(test)]
+mod author_from_auth_info_tests {
+    use super::*;
+
+    fn auth_info(user_id: &str, is_api_key: bool) -> AuthInfo {
+        // No principal claim supplied — this models a credential that
+        // predates AUTHORSHIP-A2 (or simply never asserted a kind).
+        // `PrincipalKind::Unspecified` is the honest value here, never
+        // `Human`: see `unspecified_principal_never_mints_aiagent` below.
+        auth_info_with(user_id, is_api_key, PrincipalKind::Unspecified)
+    }
+
+    fn auth_info_with(user_id: &str, is_api_key: bool, principal: PrincipalKind) -> AuthInfo {
+        AuthInfo {
+            user_id: user_id.to_string(),
+            session_id: None,
+            permissions: vec![],
+            roles: vec![],
+            is_api_key,
+            principal,
+        }
+    }
+
+    /// A JWT-session principal maps to `Author::User` keyed on its
+    /// `user_id` — never `Author::System` and never a client-suppliable
+    /// value.
+    #[test]
+    fn jwt_session_principal_maps_to_author_user() {
+        let auth = auth_info("alice", false);
+        assert_eq!(
+            author_from_auth_info(&auth),
+            Author::User {
+                id: "alice".to_string(),
+                name: "alice".to_string(),
+            }
+        );
+    }
+
+    /// An API-key principal maps to the SAME `Author::User` shape.
+    /// `is_api_key` is a transport distinction (JWT session vs. API-key
+    /// credential), not an honest human/agent signal — see the doc
+    /// comment on `author_from_auth_info` for why guessing
+    /// `Author::AIAgent` from it would be a fabrication this function
+    /// deliberately avoids.
+    #[test]
+    fn api_key_principal_also_maps_to_author_user_not_agent() {
+        let auth = auth_info("svc-integration", true);
+        assert_eq!(
+            author_from_auth_info(&auth),
+            Author::User {
+                id: "svc-integration".to_string(),
+                name: "svc-integration".to_string(),
+            },
+            "an API-key principal must map to Author::User, exactly like a JWT \
+             principal — is_api_key must not be used to guess Author::AIAgent"
+        );
+    }
+
+    /// The mapping is keyed on the real principal id, not a constant:
+    /// two different authenticated users must never collapse to the
+    /// same recorded author.
+    #[test]
+    fn different_principals_yield_different_authors() {
+        let alice = author_from_auth_info(&auth_info("alice", false));
+        let bob = author_from_auth_info(&auth_info("bob", false));
+        assert_ne!(
+            alice, bob,
+            "distinct authenticated principals must never be recorded as the \
+             same author"
+        );
+    }
+
+    /// AUTHORSHIP-A2: the payoff. A credential minted with
+    /// `PrincipalKind::Agent { model }` — the honest signal that did not
+    /// exist before this slice — mints `Author::AIAgent` carrying that
+    /// SAME model, never a guessed or hardcoded one.
+    #[test]
+    fn agent_principal_mints_author_aiagent() {
+        let auth = auth_info_with(
+            "svc-integration",
+            true,
+            PrincipalKind::Agent {
+                model: "claude-opus-5".to_string(),
+            },
+        );
+        assert_eq!(
+            author_from_auth_info(&auth),
+            Author::AIAgent {
+                id: "svc-integration".to_string(),
+                model: "claude-opus-5".to_string(),
+            }
+        );
+    }
+
+    /// The mutation-proof for the honesty rule: an `Unspecified`
+    /// principal (no claim present — a credential minted before
+    /// AUTHORSHIP-A2, or one that simply never asserted a kind) must
+    /// NEVER mint `Author::AIAgent`. A "helpful" default of unknown →
+    /// agent would fabricate exactly the certainty this type exists to
+    /// prevent — this test must fail if that default is ever introduced.
+    #[test]
+    fn unspecified_principal_never_mints_aiagent() {
+        let auth = auth_info_with("legacy-caller", true, PrincipalKind::Unspecified);
+        let author = author_from_auth_info(&auth);
+        assert!(
+            !matches!(author, Author::AIAgent { .. }),
+            "an Unspecified principal must never mint Author::AIAgent, got {author:?}"
+        );
+        assert_eq!(
+            author,
+            Author::User {
+                id: "legacy-caller".to_string(),
+                name: "legacy-caller".to_string(),
+            }
         );
     }
 }

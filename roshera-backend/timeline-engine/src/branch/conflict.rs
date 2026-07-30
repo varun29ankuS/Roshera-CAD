@@ -1,6 +1,8 @@
 //! Conflict resolution for branch merging
 
-use super::merge::{ConflictResolution, ConflictStrategy, ConflictType, MergeConflict};
+use super::merge::{
+    ConflictResolution, ConflictStrategy, ConflictSubject, ConflictType, MergeConflict,
+};
 use crate::{EntityId, Operation, TimelineError, TimelineResult};
 use std::collections::{HashMap, HashSet};
 
@@ -209,8 +211,8 @@ impl ConflictResolver {
         context: &ResolutionContext,
     ) -> String {
         let mut prompt = format!(
-            "Resolve merge conflict for entity {}:\n\n",
-            conflict.entity_id
+            "Resolve merge conflict for subject {}:\n\n",
+            conflict.subject
         );
 
         prompt.push_str(&format!("Conflict Type: {:?}\n", conflict.conflict_type));
@@ -533,7 +535,7 @@ mod tests {
     async fn test_prefer_source_resolution() {
         let resolver = ConflictResolver::new();
         let mut conflict = MergeConflict {
-            entity_id: EntityId::new(),
+            subject: ConflictSubject::Entity(EntityId::new()),
             conflict_type: ConflictType::ConcurrentModification,
             source_event: Some(TimelineEvent {
                 id: EventId::new(),

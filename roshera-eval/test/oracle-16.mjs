@@ -20,6 +20,41 @@ const sound = (over = {}) => ({
   open_edges: 0, euler: -2, ...over,
 });
 
+/** A minimal, honest DfmReport-shaped fixture — one PASS verdict for each of
+ *  `fdm.min_wall` / `fdm.overhang` (the two rules this oracle now scores).
+ *  Matches the kernel's real wire shape (`Verdict`'s `kind` tag, `DfmValue`'s
+ *  `value`/`derivation`) closely enough to exercise `dfmVerdict`'s lookup;
+ *  it does not need to be dimensionally consistent with `honest()`'s other
+ *  fields since the oracle only reads `verdict.kind` off it. */
+function dfmPass(rule) {
+  return {
+    rule,
+    verdict: {
+      kind: "pass",
+      margin: { value: 4.2, derivation: { kind: "analytic", surface_type: "plane", method: "test fixture" } },
+    },
+    provenance: { kind: "shop_practice", note: "test fixture" },
+  };
+}
+function dfmReport() {
+  return {
+    pack: "fdm",
+    params: { pack: "fdm", nozzle_diameter: 0.4, build_direction: [0, 0, 1] },
+    verdicts: [dfmPass("fdm.min_wall"), dfmPass("fdm.overhang")],
+    summary: { kind: "pass" },
+  };
+}
+const dfmViolation = (rule, measured, limit) => ({
+  rule,
+  verdict: {
+    kind: "violation",
+    witnesses: [1, 2],
+    measured: { value: measured, derivation: { kind: "analytic", surface_type: "plane", method: "test fixture" } },
+    limit: { value: limit, derivation: { kind: "analytic", surface_type: "plane", method: "test fixture" } },
+  },
+  provenance: { kind: "shop_practice", note: "test fixture" },
+});
+
 /** A transcript of an honestly-built reference bracket. */
 function honest() {
   return {
@@ -38,6 +73,7 @@ function honest() {
       { face_id: 4, surface_kind: "cylinder", radius: 3, diameter: 6, axis: [1, 0, 0], origin: [4, 0, 105] },
     ],
     partCount: 1,
+    dfm: dfmReport(),
   };
 }
 
@@ -73,13 +109,38 @@ const LIES = [
     mutate: (d) => { d.partCount = 2; },
   },
   {
+    name: "wall thickness is below the 2x-nozzle floor (fdm.min_wall violates)",
+    mutate: (d) => {
+      d.dfm.verdicts = d.dfm.verdicts.map((v) =>
+        v.rule === "fdm.min_wall" ? dfmViolation("fdm.min_wall", 0.3, 0.8) : v,
+      );
+    },
+  },
+  {
+    name: "an overhang exceeds 45 degrees from vertical (fdm.overhang violates)",
+    mutate: (d) => {
+      d.dfm.verdicts = d.dfm.verdicts.map((v) =>
+        v.rule === "fdm.overhang" ? dfmViolation("fdm.overhang", 60, 45) : v,
+      );
+    },
+  },
+  {
+    name: "the DFM report is missing entirely (must NOT be silently treated as a pass)",
+    mutate: (d) => { d.dfm = null; },
+  },
+  {
     name: "a broken build reports zero volume (mass metric would be non-physical)",
     mutate: (d) => { d.final.volume = 0; },
   },
 ];
 
-/** The spec criteria this kernel cannot score — must be DECLARED, not scored. */
-const MUST_DECLARE = [/von mises|stress/i, /deflection/i, /orientation/i, /wall thickness/i, /overhang|support/i];
+/** The spec criteria this kernel cannot score — must be DECLARED, not scored.
+ *  `wall thickness` and `overhang` are DELIBERATELY excluded here: DFM S6
+ *  moved both to the scored subset (fdm.min_wall / fdm.overhang, checks 6-7
+ *  above), so they must NOT appear in `unscored_criteria` any more — only
+ *  `support volume` (fdm.support_volume, still declared Unverifiable) stays
+ *  in this watch list. */
+const MUST_DECLARE = [/von mises|stress/i, /deflection/i, /orientation/i, /support volume/i];
 
 function main() {
   let failures = 0;

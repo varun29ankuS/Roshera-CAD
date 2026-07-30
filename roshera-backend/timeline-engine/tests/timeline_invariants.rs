@@ -113,7 +113,7 @@ async fn record_operation_rejects_unknown_session() {
     let unknown = uuid::Uuid::new_v4();
     let err = h
         .timeline()
-        .record_operation(unknown, box_op())
+        .record_operation(unknown, box_op(), Author::System)
         .await
         .expect_err("unknown session must error");
     assert!(matches!(err, TimelineError::SessionNotFound));

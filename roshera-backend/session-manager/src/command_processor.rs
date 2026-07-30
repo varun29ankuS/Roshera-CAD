@@ -10,7 +10,7 @@ use shared_types::{
     SessionAction, SessionError, ShapeParameters, TransformType,
 };
 use std::sync::Arc;
-use timeline_engine::{Operation, Timeline};
+use timeline_engine::{Author, Operation, Timeline};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
@@ -46,11 +46,23 @@ impl CommandProcessor {
     }
 
     /// Process a command and record it in the timeline
+    ///
+    /// AUTHORSHIP-A1: `user_id` (previously accepted and discarded —
+    /// `_user_id`) is now threaded into the recorded event's
+    /// `Author::User`. `Timeline::record_operation` used to hardcode
+    /// `Author::System` for every caller regardless of who issued the
+    /// command; every one of this method's callers (`ai-integration`'s
+    /// executors) already carries a real authenticated principal id
+    /// (`AIAuthContext::user_id` or equivalent), so passing it through
+    /// is strictly more honest than the System default it replaces. As
+    /// with `api-server`'s `author_from_auth_info`, there is no
+    /// separate display name available here, so `name` is set equal to
+    /// `id` rather than fabricated.
     pub async fn process_command(
         &self,
         session_id: &str,
         command: AICommand,
-        _user_id: &str,
+        user_id: &str,
     ) -> Result<CommandResult, SessionError> {
         info!(
             "Processing command for session {}: {:?}",
@@ -62,12 +74,17 @@ impl CommandProcessor {
 
         // Record in timeline
         let timeline = self.timeline.write().await;
+        let author = Author::User {
+            id: user_id.to_string(),
+            name: user_id.to_string(),
+        };
         let _event_id = timeline
             .record_operation(
                 session_id.parse().map_err(|_| SessionError::InvalidInput {
                     field: "session_id".to_string(),
                 })?,
                 operation.clone(),
+                author,
             )
             .await
             .map_err(|e| SessionError::PersistenceError {

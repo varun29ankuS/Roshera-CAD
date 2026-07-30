@@ -10,9 +10,9 @@
 use super::adaptive::compute_plane_axes;
 use super::edge_cache::{compute_curve_sample_count, EdgeSampleCache};
 use super::{AdaptiveTessellator, MeshVertex, TessellationParams, TriangleMesh};
-use crate::math::{Point3, Tolerance, Vector3};
+use crate::math::{MathError, MathResult, Point3, Tolerance, Vector3};
 use crate::primitives::face::Face;
-use crate::primitives::surface::Surface;
+use crate::primitives::surface::{Surface, SurfaceStore};
 use crate::primitives::topology_builder::BRepModel;
 use std::collections::HashMap;
 use tracing;
@@ -539,6 +539,45 @@ pub(crate) fn newell_normal(samples: &[Point3]) -> Option<Vector3> {
     }
 }
 
+/// G10 — decide the tessellation normal when Newell's best-fit-plane
+/// normal degenerates (collinear / coincident outer-loop samples).
+/// Falls back to the face's analytic normal at the surface's
+/// parametric midpoint; returns a typed degeneracy error instead of
+/// fabricating an arbitrary axis when that analytic fallback ALSO
+/// fails.
+///
+/// Previously the caller substituted `Vector3::Z` here — an axis with
+/// no relationship to the face's actual geometry that nonetheless
+/// steers the whole face's triangulation winding (the projection
+/// plane the ear-clipper measures signed area against). Factored out
+/// of [`tessellate_planar_face`] so the decision is unit-testable
+/// without constructing a face whose outer loop simultaneously
+/// defeats Newell (collinear/coincident 3D samples) AND makes
+/// `Surface::normal_at` fail at the midpoint — a real double-failure
+/// is a narrow adversarial target (e.g. a cone face's slant normal is
+/// well-defined even at the apex per `Cone::evaluate_full`'s `t_theta`
+/// treatment), so the test below drives the `face.normal_at` failure
+/// via an unresolvable `surface_id` instead — a real, if different,
+/// way for that call to fail.
+fn planar_face_normal_fallback(
+    face: &Face,
+    surface: &dyn Surface,
+    surfaces: &SurfaceStore,
+) -> MathResult<Vector3> {
+    let (u_range, v_range) = surface.parameter_bounds();
+    let u_mid = (u_range.0 + u_range.1) / 2.0;
+    let v_mid = (v_range.0 + v_range.1) / 2.0;
+    face.normal_at(u_mid, v_mid, surfaces).map_err(|e| {
+        MathError::DegenerateGeometry(format!(
+            "tessellation normal for face {:?}: Newell's method failed (collinear/coincident \
+             outer-loop samples) AND the analytic normal at the surface midpoint ({u_mid}, \
+             {v_mid}) also failed ({e:?}); refusing to fabricate Vector3::Z, which would \
+             silently steer the face's triangulation winding",
+            face.id
+        ))
+    })
+}
+
 /// Tessellate a planar face using constrained Delaunay triangulation
 fn tessellate_planar_face(
     face: &Face,
@@ -622,6 +661,17 @@ fn tessellate_planar_face(
     // sample sequence), reach for `face.normal_at` at the surface
     // midpoint — at that point the loop is degenerate so any normal
     // is acceptable; the ear-clipper will reject the polygon anyway.
+    //
+    // G10 — if THAT analytic fallback also fails, refuse typed
+    // (`planar_face_normal_fallback`) instead of fabricating
+    // `Vector3::Z`: an arbitrary axis would steer the whole face's
+    // triangulation winding on a face we already know is degenerate
+    // in two independent ways. `tessellate_planar_face` keeps its
+    // established `()` / empty-mesh-on-error contract (matches the
+    // Cylinder / SurfaceOfRevolution dispatch arms above, which log a
+    // `tracing::warn!` and fall through rather than propagating a
+    // `Result` up the call chain) — the face simply emits zero
+    // triangles, an honest refusal instead of a silently wrong mesh.
     let newell_n = newell_normal(&all_vertices[outer_start..outer_end]);
     let normal = if let Some(mut n) = newell_n {
         // Newell's normal flips with the outer loop's stored CCW/CW winding.
@@ -641,11 +691,17 @@ fn tessellate_planar_face(
         }
         n * face.orientation.sign()
     } else {
-        let (u_range, v_range) = surface.parameter_bounds();
-        let u_mid = (u_range.0 + u_range.1) / 2.0;
-        let v_mid = (v_range.0 + v_range.1) / 2.0;
-        face.normal_at(u_mid, v_mid, &model.surfaces)
-            .unwrap_or(Vector3::Z)
+        match planar_face_normal_fallback(face, surface, &model.surfaces) {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::warn!(
+                    "tessellate_planar_face: face {:?} degenerate normal: {}",
+                    face.id,
+                    e
+                );
+                return;
+            }
+        }
     };
 
     // ANNULUS FAST PATH. A planar face bounded by an outer circle and a single
@@ -9462,6 +9518,66 @@ mod tests {
         let (verts, loops) = build_planar_loops(&[(0.0, 0.0), (1.0, 0.0)], &[]);
         let tris = triangulate_planar_polygon(&verts, &loops, &Vector3::Z);
         assert!(tris.is_empty());
+    }
+
+    /// G10 — when BOTH the Newell normal and the analytic
+    /// `face.normal_at` fallback fail, `planar_face_normal_fallback`
+    /// must return a typed `MathError`, not fabricate `Vector3::Z`.
+    /// The `face.normal_at` failure is driven by an unresolvable
+    /// `surface_id` (an empty `SurfaceStore`) — a real way for that
+    /// call to fail, distinct from the geometric degeneracy Newell
+    /// guards against, but exercising the exact fallback branch this
+    /// helper is responsible for. See the helper's doc comment for
+    /// why a genuinely double-degenerate face (Newell AND the
+    /// analytic normal both failing on real geometry) is not a
+    /// reliable target through public construction ops.
+    #[test]
+    fn planar_face_normal_fallback_refuses_when_both_sources_fail() {
+        use crate::primitives::face::FaceOrientation;
+        // A real, well-conditioned surface for `parameter_bounds()` —
+        // the failure under test is `face.normal_at`'s surface_id
+        // lookup, not this call.
+        let plane = crate::primitives::surface::Plane::from_point_normal(Point3::ZERO, Vector3::Z)
+            .expect("plane");
+        // `surface_id = 999` resolves in nothing: the store is empty.
+        let face = Face::new(42, 999, 0, FaceOrientation::Forward);
+        let empty_surfaces = SurfaceStore::new();
+
+        let result = planar_face_normal_fallback(&face, &plane, &empty_surfaces);
+
+        match result {
+            Err(MathError::DegenerateGeometry(msg)) => {
+                assert!(
+                    msg.contains("42"),
+                    "error should name the offending face, got: {msg}"
+                );
+            }
+            other => panic!(
+                "expected DegenerateGeometry refusing to fabricate Vector3::Z, got {other:?}"
+            ),
+        }
+    }
+
+    /// Mutation-proof companion: when `face.normal_at` DOES resolve
+    /// (a well-conditioned face/surface pair), the fallback must
+    /// return that real normal, not refuse. Widening the failure
+    /// branch (e.g. always erroring, or erroring whenever `surfaces`
+    /// is non-empty) would make this false-refuse.
+    #[test]
+    fn planar_face_normal_fallback_accepts_well_conditioned_face() {
+        use crate::primitives::face::FaceOrientation;
+        let mut surfaces = SurfaceStore::new();
+        let plane = crate::primitives::surface::Plane::from_point_normal(Point3::ZERO, Vector3::Z)
+            .expect("plane");
+        let surface_id = surfaces.add(Box::new(plane.clone()));
+        let face = Face::new(1, surface_id, 0, FaceOrientation::Forward);
+
+        let n = planar_face_normal_fallback(&face, &plane, &surfaces)
+            .expect("well-conditioned face/surface must resolve, not refuse");
+        assert!(
+            (n.z - 1.0).abs() < 1e-9,
+            "expected the plane's +Z normal, got {n:?}"
+        );
     }
 
     // === T-1: arc_steps_for_quality / linear_steps_for_quality tests ===

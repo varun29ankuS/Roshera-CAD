@@ -484,4 +484,97 @@ mod tests {
             }
         }
     }
+
+    /// Owed regression pin (commit 0aba6949): an ordinary ray through a
+    /// cone's lateral surface must keep BOTH roots. Exercises
+    /// `surface_ray_ts` directly against the analytic `Cone`, matching
+    /// the `solve_quadratic_*` tests' low-level style (rather than
+    /// `raycast_solid`, which would additionally clip to a solid's
+    /// finite trim loop and complicate the hand-computed values below).
+    ///
+    /// Cone: apex at the origin, axis = +Z, half_angle = 45° (so the
+    /// radius at height `v` along the axis is `r(v) = v·tan(45°) = v`).
+    /// Ray: origin (-10, 0, 5), direction (+1, 0, 0) — a horizontal ray
+    /// at height z = 5, where the cone's cross-section is the circle
+    /// x² + y² = 5² = 25. At y = 0 that circle crosses x = ±5, so the
+    /// ray (moving in +X from x = -10) hits x = -5 first (t = 5) and
+    /// x = +5 second (t = 15). Cross-checked against the quadratic
+    /// coefficients directly: with `a = o - apex = (-10, 0, 5)`,
+    /// `d = (1, 0, 0)`, `cos²(45°) = 0.5`: `qa = -0.5`, `qb = 10`,
+    /// `qc = -37.5`, giving `t² - 20t + 75 = 0` ⇒ `t = 5, 15`. Both
+    /// hits are on the +axis nappe (z = 5 ≥ 0 throughout), so neither
+    /// is filtered.
+    #[test]
+    fn cone_lateral_ray_ordinary_two_hit_matches_hand_computed_roots() {
+        let cone = Cone::new(Point3::ZERO, Vector3::Z, std::f64::consts::FRAC_PI_4)
+            .expect("45\u{b0} half-angle cone");
+        let o = Point3::new(-10.0, 0.0, 5.0);
+        let d = Vector3::new(1.0, 0.0, 0.0);
+        let ts = surface_ray_ts(&cone, o, d);
+        assert_eq!(ts.len(), 2, "expected two roots, got {:?}", ts);
+        let mut sorted = ts.clone();
+        sorted.sort_by(|a, b| a.total_cmp(b));
+        assert!(
+            (sorted[0] - 5.0).abs() < 1e-9,
+            "near root should be t=5 (x=-5), got {:?}",
+            sorted
+        );
+        assert!(
+            (sorted[1] - 15.0).abs() < 1e-9,
+            "far root should be t=15 (x=+5), got {:?}",
+            sorted
+        );
+    }
+
+    /// Owed regression pin (commit 0aba6949): a ray near-parallel to a
+    /// cone's nappe (its direction close to a generator line) must keep
+    /// its far root. The old local quadratic solver in this file
+    /// discarded it via an `a.abs() < tolerance` fiat that compared a
+    /// dimensionless coefficient against a length; `solve_quadratic`
+    /// (math/utils.rs) now uses the stable citardauq form, valid for
+    /// any nonzero leading coefficient however small.
+    ///
+    /// Cone: same 45° half-angle cone as above. A generator line from
+    /// the apex has direction `(sin45°, 0, cos45°)`. `direction` here
+    /// is that generator rotated by a small `eps` — close enough to
+    /// parallel that the ray ∩ cone quadratic's leading coefficient
+    /// `qa = cos²(θ) - cos²(45°)` is small (`θ = 45° + eps`), but not
+    /// exactly zero (exactly parallel would degenerate to a single
+    /// root or none, not the near/far pair this test pins). The ray
+    /// origin (-1, 0, 0) is off that generator line (not through the
+    /// apex) and outside the cone at z=0, so the near-tangent geometry
+    /// produces one small positive root (entering the nappe near the
+    /// apex region, t ≈ 0.55) and one very large positive root (the
+    /// ray stays close to the cone surface for a long distance before
+    /// diverging enough to exit, t ≈ 7070 — hand-derived from the
+    /// quadratic `qa·t² + qb·t + qc = 0` with `qa ≈ -eps`,
+    /// `qb = sin45° ≈ 0.7071`, `qc = -0.5`) — exactly the near-
+    /// cancellation shape the old fiat threshold misclassified as "no
+    /// quadratic term, keep only the linear root", discarding the far
+    /// one.
+    #[test]
+    fn cone_lateral_ray_near_parallel_to_nappe_keeps_far_root() {
+        let cone = Cone::new(Point3::ZERO, Vector3::Z, std::f64::consts::FRAC_PI_4)
+            .expect("45\u{b0} half-angle cone");
+        let eps = 1e-4_f64;
+        let theta = std::f64::consts::FRAC_PI_4 + eps;
+        let d = Vector3::new(theta.sin(), 0.0, theta.cos());
+        let o = Point3::new(-1.0, 0.0, 0.0);
+        let ts = surface_ray_ts(&cone, o, d);
+        assert_eq!(
+            ts.len(),
+            2,
+            "near-parallel ray must keep both roots (near + far), got {:?}",
+            ts
+        );
+        let mut sorted = ts.clone();
+        sorted.sort_by(|a, b| a.total_cmp(b));
+        let (near, far) = (sorted[0], sorted[1]);
+        assert!(
+            far.abs() > 100.0 * near.abs().max(1.0),
+            "far root should be orders of magnitude past the near root \
+             (near={near}, far={far}) — a discarded far root is exactly the \
+             pre-0aba6949 regression",
+        );
+    }
 }

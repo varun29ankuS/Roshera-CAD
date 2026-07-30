@@ -1,17 +1,37 @@
-//! Branch merging functionality
+//! Branch merging types and the semantic conflict taxonomy.
+//!
+//! The merge itself lives in `Timeline::merge_branches`
+//! (`crate::timeline`) — that is the one lane per
+//! `Roshera-vault/Research/2026-07-29-timeline-beyond-git.md` ("pick one
+//! lane, don't keep copies, 1 way only"). This module supplies the
+//! shared vocabulary that lane uses: the strategy/result/conflict types,
+//! and [`get_affected_subjects`], which is the load-bearing fix from
+//! that spec's §5 step 2 — without it, conflict detection is blind on
+//! every real kernel operation (see the doc comment on
+//! [`get_affected_subjects`] for why).
+//!
+//! A prior `BranchMerger` struct lived here with its own
+//! fast-forward/three-way/rebase/squash/cherry-pick implementations.
+//! It was constructed only by its own `#[cfg(test)]` module (verified
+//! by grep before deletion) — a second, unreachable merge lane sitting
+//! next to the live one in `Timeline::merge_branches`. It has been
+//! deleted; nothing in it was salvageable beyond the taxonomy skeleton
+//! (`ConflictType`, `MergeConflict`, …) already promoted to real types
+//! below, and the `AUDIT-M3` `ConflictStrategy::AI` contract, which is
+//! preserved as a comment on [`ConflictStrategy::AI`] for whoever wires
+//! auto-resolution next.
 
-use crate::{
-    Author, BranchId, EntityId, EventId, EventIndex, EventMetadata, Operation, OperationInputs,
-    OperationOutputs, TimelineError, TimelineEvent, TimelineResult,
-};
-use chrono::{DateTime, Utc};
-use dashmap::DashMap;
-use std::collections::{HashMap, HashSet};
+use crate::{EntityId, Operation, TimelineEvent};
+use std::collections::HashSet;
 
 /// Strategy for merging branches
 #[derive(Debug, Clone)]
 pub enum MergeStrategy {
-    /// Fast-forward merge (no conflicts possible)
+    /// Fast-forward merge (no conflicts possible). `Timeline::merge_branches`
+    /// treats this strategy specially: on divergence it refuses with
+    /// `TimelineError::BranchConflict` rather than attempting a real
+    /// three-way merge — this is git's `merge --ff-only` contract, and
+    /// `tests/git_semantics.rs` pins it.
     FastForward,
 
     /// Three-way merge with automatic conflict resolution
@@ -32,7 +52,7 @@ pub enum MergeStrategy {
     /// Cherry-pick specific events
     CherryPick {
         /// Events to cherry-pick
-        events: Vec<EventId>,
+        events: Vec<crate::EventId>,
     },
 }
 
@@ -51,7 +71,15 @@ pub enum ConflictStrategy {
     /// Manual resolution required
     Manual,
 
-    /// Use AI to resolve conflicts
+    /// Use AI to resolve conflicts.
+    ///
+    /// AUDIT-M3 (contract preserved from the deleted `BranchMerger`,
+    /// enforced today in `Timeline::merge_branches`'s strategy dispatch):
+    /// no model dispatcher is wired in. A caller that requests this
+    /// variant gets a typed refusal (`TimelineError::NotImplemented`)
+    /// naming the requested model, never a silent downgrade to
+    /// `PreferSource` that reports `auto_resolved` without having
+    /// consulted anything.
     AI {
         /// Model to use for resolution
         model: String,
@@ -79,41 +107,88 @@ pub struct MergeResult {
     pub statistics: MergeStatistics,
 }
 
+/// What a merge conflict is actually about.
+///
+/// Typed operations (`Operation::Extrude`, `Operation::Fillet`, …) name
+/// their entities as `EntityId` (a `Uuid`). But every real kernel
+/// operation arrives through `recorder_bridge::to_timeline_operation` as
+/// `Operation::Generic { parameters: {"inputs": [...], "outputs": [...]}, .. }`,
+/// where the refs are canonical kernel-store strings (`"face:7"`,
+/// `"solid:2"`) — **not** UUIDs. Hashing those strings into synthetic
+/// `EntityId`s would let a conflict report name something that never
+/// existed; `KernelRef` names what actually collided instead.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ConflictSubject {
+    /// A timeline entity, as used by the typed `Operation` variants.
+    Entity(EntityId),
+    /// A kernel-store reference in canonical `"<kind>:<id>"` wire form,
+    /// as carried by `Operation::Generic`'s `inputs`/`outputs`.
+    KernelRef(String),
+}
+
+impl std::fmt::Display for ConflictSubject {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConflictSubject::Entity(id) => write!(f, "entity:{id}"),
+            ConflictSubject::KernelRef(r) => write!(f, "{r}"),
+        }
+    }
+}
+
 /// A merge conflict
 #[derive(Debug, Clone)]
 pub struct MergeConflict {
-    /// Entity involved in conflict
-    pub entity_id: EntityId,
+    /// What the conflict is about — a timeline entity or a kernel ref.
+    pub subject: ConflictSubject,
 
     /// Type of conflict
     pub conflict_type: ConflictType,
 
-    /// Event from source branch
+    /// Event from source branch. `None` only when the taxonomy
+    /// determined a conflict without a single representative event
+    /// (not currently reachable — every path that constructs a
+    /// `MergeConflict` today attaches both witnesses; an agent cannot
+    /// resolve a conflict it cannot see).
     pub source_event: Option<TimelineEvent>,
 
-    /// Event from target branch
+    /// Event from target branch. Same `None` contract as `source_event`.
     pub target_event: Option<TimelineEvent>,
 
-    /// Resolution applied
+    /// Resolution applied. Always `None` from `Timeline::merge_branches`
+    /// today — this slice detects and reports conflicts; it does not
+    /// auto-resolve them via `ConflictStrategy`. The field exists so a
+    /// future resolution pass (or an agent calling back in) has
+    /// somewhere to record its answer without a type change.
     pub resolution: Option<ConflictResolution>,
 }
 
 /// Type of merge conflict
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConflictType {
-    /// Both branches modified the same entity
+    /// Both branches modified the same subject differently.
     ConcurrentModification,
 
-    /// Entity deleted in one branch, modified in another
+    /// Subject deleted in one branch, modified in another.
     DeleteModify,
 
-    /// Different operations on same entity
+    /// Different operations on same subject (reserved — not currently
+    /// distinguished from `ConcurrentModification` by the taxonomy in
+    /// `Timeline::merge_branches`; kept because `branch::conflict::ConflictResolver`
+    /// exhaustively matches every `ConflictType` variant, so removing
+    /// it would break that (dead but still-compiling) module rather
+    /// than simplify anything live).
     OperationConflict,
 
-    /// Dependency conflict
+    /// An edit on one side depends on (reads/requires) a subject the
+    /// other side deleted.
     DependencyConflict,
 
-    /// Topological conflict (incompatible geometry)
+    /// Merged replay would produce unsound geometry (non-manifold,
+    /// non-watertight, Euler-inconsistent, …). **Not implemented in
+    /// this slice** — spec §3.2/§3.3 requires replaying the merge and
+    /// running the invariant/certificate set, which is a separate
+    /// piece of wiring. The variant is kept so the taxonomy's shape is
+    /// complete; nothing in this crate constructs it yet.
     TopologicalConflict,
 }
 
@@ -161,709 +236,277 @@ pub struct MergeStatistics {
     pub duration_ms: u64,
 }
 
-/// Branch merger
-pub struct BranchMerger {
-    /// Conflict detection threshold
-    tolerance: f64,
+/// The roles a subject can play in a single operation, used to derive
+/// the conflict taxonomy (spec §3.1). A subject lands in exactly one
+/// bucket per operation:
+///
+/// - `deleted` — the operation removes it. Only `Operation::Delete`
+///   unambiguously signals deletion. `Operation::Generic` (i.e. every
+///   real kernel operation) never populates `deleted`: `RecordedOperation`
+///   only records what an op *consumed* (`inputs`) and *produced*
+///   (`outputs`); the kernel's op-recorder wire form does not currently
+///   distinguish "produced a fresh ref" from "replaced a consumed one",
+///   so there is no honest way to say a Generic op deleted something.
+///   This is a scope limit, not an oversight.
+/// - `touched` — the operation creates or mutates it in place.
+/// - `required` — the operation reads/depends on it without creating,
+///   mutating, or deleting it.
+#[derive(Debug, Clone, Default)]
+pub struct AffectedSubjects {
+    /// Subjects this operation removes.
+    pub deleted: Vec<ConflictSubject>,
+    /// Subjects this operation creates or mutates in place.
+    pub touched: Vec<ConflictSubject>,
+    /// Subjects this operation reads/requires but does not itself
+    /// create, mutate, or delete.
+    pub required: Vec<ConflictSubject>,
 }
 
-impl BranchMerger {
-    /// Create a new merger
-    pub fn new() -> Self {
-        Self { tolerance: 1e-10 }
-    }
-
-    /// Merge source branch into target branch
-    pub async fn merge(
-        &self,
-        source_events: &DashMap<EventIndex, TimelineEvent>,
-        target_events: &DashMap<EventIndex, TimelineEvent>,
-        common_ancestor: EventIndex,
-        strategy: MergeStrategy,
-    ) -> TimelineResult<MergeResult> {
-        let _start_time = std::time::Instant::now();
-
-        match strategy {
-            MergeStrategy::FastForward => {
-                self.fast_forward_merge(source_events, target_events, common_ancestor)
-                    .await
-            }
-
-            MergeStrategy::ThreeWay { conflict_strategy } => {
-                self.three_way_merge(
-                    source_events,
-                    target_events,
-                    common_ancestor,
-                    conflict_strategy,
-                )
-                .await
-            }
-
-            MergeStrategy::Rebase => {
-                self.rebase_merge(source_events, target_events, common_ancestor)
-                    .await
-            }
-
-            MergeStrategy::Squash { message } => {
-                self.squash_merge(source_events, target_events, common_ancestor, message)
-                    .await
-            }
-
-            MergeStrategy::CherryPick { events } => {
-                self.cherry_pick_merge(source_events, events).await
-            }
-        }
-    }
-
-    /// Fast-forward merge (no conflicts)
-    async fn fast_forward_merge(
-        &self,
-        source_events: &DashMap<EventIndex, TimelineEvent>,
-        target_events: &DashMap<EventIndex, TimelineEvent>,
-        common_ancestor: EventIndex,
-    ) -> TimelineResult<MergeResult> {
-        let mut merged_events = Vec::new();
-        let mut modified_entities = HashSet::new();
-
-        // Check if fast-forward is possible
-        let target_max = target_events
-            .iter()
-            .map(|entry| *entry.key())
-            .max()
-            .unwrap_or(0);
-
-        if target_max > common_ancestor {
-            return Err(TimelineError::MergeError(
-                "Cannot fast-forward: target has diverged".to_string(),
-            ));
-        }
-
-        // Copy all source events after common ancestor
-        let source_new_events: Vec<_> = source_events
-            .iter()
-            .filter(|entry| entry.key() > &common_ancestor)
-            .map(|entry| entry.value().clone())
-            .collect();
-
-        for event in source_new_events {
-            // Track modified entities
-            self.track_modified_entities(&event.operation, &mut modified_entities);
-            merged_events.push(event);
-        }
-
-        let events_count = merged_events.len();
-        let entities_count = modified_entities.len();
-
-        Ok(MergeResult {
-            success: true,
-            merged_events,
-            conflicts: vec![],
-            modified_entities,
-            statistics: MergeStatistics {
-                events_merged: events_count,
-                conflicts_count: 0,
-                auto_resolved: 0,
-                entities_affected: entities_count,
-                duration_ms: 0,
-            },
-        })
-    }
-
-    /// Three-way merge with conflict resolution
-    async fn three_way_merge(
-        &self,
-        source_events: &DashMap<EventIndex, TimelineEvent>,
-        target_events: &DashMap<EventIndex, TimelineEvent>,
-        common_ancestor: EventIndex,
-        conflict_strategy: ConflictStrategy,
-    ) -> TimelineResult<MergeResult> {
-        let mut merged_events = Vec::new();
-        let mut conflicts = Vec::new();
-        let mut modified_entities = HashSet::new();
-
-        // Build entity modification history
-        let source_changes = self.build_change_set(source_events, common_ancestor);
-        let target_changes = self.build_change_set(target_events, common_ancestor);
-
-        // Detect conflicts
-        for (entity_id, source_ops) in &source_changes {
-            if let Some(target_ops) = target_changes.get(entity_id) {
-                // Both branches modified same entity - potential conflict
-                let conflict = self.detect_conflict(*entity_id, source_ops, target_ops);
-
-                if let Some(conflict) = conflict {
-                    conflicts.push(conflict);
-                }
-            }
-        }
-
-        // Apply non-conflicting changes from source
-        for event in source_events.iter() {
-            if event.key() > &common_ancestor {
-                let event_val = event.value();
-
-                // Check if this event is involved in a conflict
-                let is_conflicted = conflicts.iter().any(|c| {
-                    c.source_event
-                        .as_ref()
-                        .map(|e| e.id == event_val.id)
-                        .unwrap_or(false)
-                });
-
-                if !is_conflicted {
-                    self.track_modified_entities(&event_val.operation, &mut modified_entities);
-                    merged_events.push(event_val.clone());
-                }
-            }
-        }
-
-        // Apply non-conflicting changes from target
-        for event in target_events.iter() {
-            if event.key() > &common_ancestor {
-                let event_val = event.value();
-
-                // Check if entity was already modified by source
-                let entities = self.get_affected_entities(&event_val.operation);
-                let already_modified = entities.iter().any(|e| modified_entities.contains(e));
-
-                if !already_modified {
-                    self.track_modified_entities(&event_val.operation, &mut modified_entities);
-                    merged_events.push(event_val.clone());
-                }
-            }
-        }
-
-        // Resolve conflicts
-        let mut auto_resolved = 0;
-        for conflict in &mut conflicts {
-            match &conflict_strategy {
-                ConflictStrategy::PreferSource => {
-                    conflict.resolution = Some(ConflictResolution::UseSource);
-                    if let Some(event) = &conflict.source_event {
-                        merged_events.push(event.clone());
-                        auto_resolved += 1;
-                    }
-                }
-
-                ConflictStrategy::PreferTarget => {
-                    conflict.resolution = Some(ConflictResolution::UseTarget);
-                    if let Some(event) = &conflict.target_event {
-                        merged_events.push(event.clone());
-                        auto_resolved += 1;
-                    }
-                }
-
-                ConflictStrategy::PreferNewest => {
-                    let use_source = conflict
-                        .source_event
-                        .as_ref()
-                        .map(|e| e.timestamp)
-                        .unwrap_or(DateTime::<Utc>::MIN_UTC)
-                        > conflict
-                            .target_event
-                            .as_ref()
-                            .map(|e| e.timestamp)
-                            .unwrap_or(DateTime::<Utc>::MIN_UTC);
-
-                    if use_source {
-                        conflict.resolution = Some(ConflictResolution::UseSource);
-                        if let Some(event) = &conflict.source_event {
-                            merged_events.push(event.clone());
-                        }
-                    } else {
-                        conflict.resolution = Some(ConflictResolution::UseTarget);
-                        if let Some(event) = &conflict.target_event {
-                            merged_events.push(event.clone());
-                        }
-                    }
-                    auto_resolved += 1;
-                }
-
-                ConflictStrategy::Manual => {
-                    // Leave unresolved for manual resolution
-                }
-
-                ConflictStrategy::AI { model, .. } => {
-                    // AUDIT-M3: the AI conflict-resolution path was
-                    // previously a silent fallback to `PreferSource`,
-                    // which lied to the caller: a `ConflictStrategy::AI`
-                    // request would `auto_resolved += 1` without ever
-                    // consulting a model. Fail loud instead — callers
-                    // who explicitly opt into AI must be told that the
-                    // model dispatcher isn't wired so they can either
-                    // retry with `PreferSource`/`PreferTarget`/`Manual`
-                    // or wait until the AI bridge ships.
-                    return Err(TimelineError::NotImplemented(format!(
-                        "ConflictStrategy::AI requested model '{model}' but no \
-                         model dispatcher is wired into the merger; use \
-                         PreferSource / PreferTarget / PreferNewest / Manual \
-                         instead",
-                    )));
-                }
-            }
-        }
-
-        // Sort merged events by timestamp
-        merged_events.sort_by_key(|e| e.timestamp);
-
-        let events_count = merged_events.len();
-        let conflicts_count = conflicts.len();
-        let entities_count = modified_entities.len();
-
-        Ok(MergeResult {
-            success: conflicts.is_empty() || auto_resolved == conflicts_count,
-            merged_events,
-            conflicts,
-            modified_entities,
-            statistics: MergeStatistics {
-                events_merged: events_count,
-                conflicts_count,
-                auto_resolved,
-                entities_affected: entities_count,
-                duration_ms: 0,
-            },
-        })
-    }
-
-    /// Rebase merge
-    async fn rebase_merge(
-        &self,
-        source_events: &DashMap<EventIndex, TimelineEvent>,
-        target_events: &DashMap<EventIndex, TimelineEvent>,
-        common_ancestor: EventIndex,
-    ) -> TimelineResult<MergeResult> {
-        let mut merged_events = Vec::new();
-        let mut modified_entities = HashSet::new();
-
-        // First, apply all target events
-        for event in target_events.iter() {
-            let event_val = event.value();
-            self.track_modified_entities(&event_val.operation, &mut modified_entities);
-            merged_events.push(event_val.clone());
-        }
-
-        // Then, replay source events on top
-        let source_new_events: Vec<_> = source_events
-            .iter()
-            .filter(|entry| entry.key() > &common_ancestor)
-            .map(|entry| entry.value().clone())
-            .collect();
-
-        for mut event in source_new_events {
-            // Update event index to come after target events
-            let new_index = merged_events.len() as u64;
-            event.sequence_number = new_index;
-
-            self.track_modified_entities(&event.operation, &mut modified_entities);
-            merged_events.push(event);
-        }
-
-        let events_count = merged_events.len();
-        let entities_count = modified_entities.len();
-
-        Ok(MergeResult {
-            success: true,
-            merged_events,
-            conflicts: vec![],
-            modified_entities,
-            statistics: MergeStatistics {
-                events_merged: events_count,
-                conflicts_count: 0,
-                auto_resolved: 0,
-                entities_affected: entities_count,
-                duration_ms: 0,
-            },
-        })
-    }
-
-    /// Squash merge
-    async fn squash_merge(
-        &self,
-        source_events: &DashMap<EventIndex, TimelineEvent>,
-        target_events: &DashMap<EventIndex, TimelineEvent>,
-        common_ancestor: EventIndex,
-        message: String,
-    ) -> TimelineResult<MergeResult> {
-        let mut modified_entities = HashSet::new();
-
-        // Collect all operations from source
-        let source_ops: Vec<Operation> = source_events
-            .iter()
-            .filter(|entry| entry.key() > &common_ancestor)
-            .map(|entry| {
-                let event = entry.value();
-                self.track_modified_entities(&event.operation, &mut modified_entities);
-                event.operation.clone()
-            })
-            .collect();
-
-        if source_ops.is_empty() {
-            return Ok(MergeResult {
-                success: true,
-                merged_events: vec![],
-                conflicts: vec![],
-                modified_entities,
-                statistics: MergeStatistics {
-                    events_merged: 0,
-                    conflicts_count: 0,
-                    auto_resolved: 0,
-                    entities_affected: 0,
-                    duration_ms: 0,
-                },
-            });
-        }
-
-        // Create a single squashed event
-        let squashed_event = TimelineEvent {
-            id: EventId::new(),
-            sequence_number: target_events.len() as u64,
-            timestamp: Utc::now(),
-            author: Author::System,
-            operation: Operation::Batch {
-                operations: source_ops,
-                description: message.clone(),
-            },
-            inputs: OperationInputs {
-                required_entities: vec![],
-                optional_entities: vec![],
-                parameters: serde_json::Value::Null,
-            },
-            outputs: OperationOutputs::default(),
-            metadata: EventMetadata {
-                description: Some(message.clone()),
-                branch_id: BranchId::main(), // Will be updated by caller
-                tags: vec!["squashed".to_string()],
-                properties: HashMap::new(),
-            },
-        };
-
-        let entities_count = modified_entities.len();
-
-        Ok(MergeResult {
-            success: true,
-            merged_events: vec![squashed_event],
-            conflicts: vec![],
-            modified_entities,
-            statistics: MergeStatistics {
-                events_merged: 1,
-                conflicts_count: 0,
-                auto_resolved: 0,
-                entities_affected: entities_count,
-                duration_ms: 0,
-            },
-        })
-    }
-
-    /// Cherry-pick specific events
-    async fn cherry_pick_merge(
-        &self,
-        source_events: &DashMap<EventIndex, TimelineEvent>,
-        event_ids: Vec<EventId>,
-    ) -> TimelineResult<MergeResult> {
-        let mut merged_events = Vec::new();
-        let mut modified_entities = HashSet::new();
-
-        for event_id in event_ids {
-            // Find the event in source
-            let event = source_events
-                .iter()
-                .find(|entry| entry.value().id == event_id)
-                .map(|entry| entry.value().clone());
-
-            if let Some(event) = event {
-                self.track_modified_entities(&event.operation, &mut modified_entities);
-                merged_events.push(event);
-            }
-        }
-
-        let statistics = MergeStatistics {
-            events_merged: merged_events.len(),
-            conflicts_count: 0,
-            auto_resolved: 0,
-            entities_affected: modified_entities.len(),
-            duration_ms: 0,
-        };
-
-        Ok(MergeResult {
-            success: true,
-            merged_events,
-            conflicts: vec![],
-            modified_entities,
-            statistics,
-        })
-    }
-
-    /// Build change set for a branch
-    fn build_change_set(
-        &self,
-        events: &DashMap<EventIndex, TimelineEvent>,
-        after: EventIndex,
-    ) -> HashMap<EntityId, Vec<Operation>> {
-        let mut changes = HashMap::new();
-
-        for entry in events.iter() {
-            if entry.key() > &after {
-                let event = entry.value();
-                let entities = self.get_affected_entities(&event.operation);
-
-                for entity_id in entities {
-                    changes
-                        .entry(entity_id)
-                        .or_insert_with(Vec::new)
-                        .push(event.operation.clone());
-                }
-            }
-        }
-
-        changes
-    }
-
-    /// Detect conflict between operations
-    fn detect_conflict(
-        &self,
-        entity_id: EntityId,
-        source_ops: &[Operation],
-        target_ops: &[Operation],
-    ) -> Option<MergeConflict> {
-        // Simple conflict detection - both modified same entity
-        if !source_ops.is_empty() && !target_ops.is_empty() {
-            Some(MergeConflict {
-                entity_id,
-                conflict_type: ConflictType::ConcurrentModification,
-                source_event: None, // Would be populated with actual events
-                target_event: None,
-                resolution: None,
-            })
-        } else {
-            None
-        }
-    }
-
-    /// Get entities affected by an operation
-    fn get_affected_entities(&self, operation: &Operation) -> Vec<EntityId> {
-        match operation {
-            Operation::CreatePrimitive { .. } => vec![],
-            Operation::CreateSketch { .. } => vec![],
-            Operation::Transform { entities, .. } => entities.clone(),
-            Operation::Delete { entities } => entities.clone(),
-            Operation::Modify { entity, .. } => vec![*entity],
-            Operation::Extrude { sketch_id, .. } => vec![*sketch_id],
-            Operation::Revolve { sketch_id, .. } => vec![*sketch_id],
-            Operation::Loft { profiles, .. } => profiles.clone(),
-            Operation::Sweep { profile, path, .. } => vec![*profile, *path],
-            Operation::BooleanUnion { operands } => operands.clone(),
-            Operation::BooleanIntersection { operands } => operands.clone(),
-            Operation::BooleanDifference { target, tools } => {
-                let mut entities = vec![*target];
-                entities.extend(tools.iter().copied());
-                entities
-            }
-            Operation::Fillet { edges, .. } => edges.clone(),
-            Operation::Chamfer { edges, .. } => edges.clone(),
-            Operation::Pattern { features, .. } => features.clone(),
-            Operation::Batch { operations, .. } => operations
-                .iter()
-                .flat_map(|op| self.get_affected_entities(op))
-                .collect(),
-            Operation::CreateCheckpoint { .. } => vec![], // Checkpoints don't affect entities
-            Operation::Boolean {
-                operand_a,
-                operand_b,
-                ..
-            } => vec![*operand_a, *operand_b],
-            Operation::Generic { .. } => vec![], // Generic operations don't have known entities
-        }
-    }
-
-    /// Track modified entities
-    fn track_modified_entities(&self, operation: &Operation, modified: &mut HashSet<EntityId>) {
-        let entities = self.get_affected_entities(operation);
-        for entity in entities {
-            modified.insert(entity);
-        }
+impl AffectedSubjects {
+    /// True when this operation references no subject at all (e.g. a
+    /// bare `CreatePrimitive`, which needs nothing to exist yet).
+    pub fn is_empty(&self) -> bool {
+        self.deleted.is_empty() && self.touched.is_empty() && self.required.is_empty()
     }
 }
 
-impl Default for BranchMerger {
-    fn default() -> Self {
-        Self::new()
+/// Categorize the subjects an operation touches.
+///
+/// This is the fix for the blocker named in
+/// `Roshera-vault/Research/2026-07-29-timeline-beyond-git.md` §3.1/§5
+/// step 2: the deleted `BranchMerger::get_affected_entities` returned
+/// `vec![]` for `Operation::Generic` — which is what
+/// `recorder_bridge::to_timeline_operation` produces for *every* real
+/// kernel operation. Conflict detection built on that function was
+/// blind on all real history. This function reads
+/// `parameters["inputs"]` / `parameters["outputs"]` (both canonical
+/// `"<kind>:<id>"` string arrays, per `RecordedOperation`) instead of
+/// discarding them.
+pub fn get_affected_subjects(operation: &Operation) -> AffectedSubjects {
+    let mut out = AffectedSubjects::default();
+    match operation {
+        Operation::CreatePrimitive { .. }
+        | Operation::CreateSketch { .. }
+        | Operation::CreateCheckpoint { .. } => {}
+
+        Operation::Extrude { sketch_id, .. } => {
+            out.required.push(ConflictSubject::Entity(*sketch_id));
+        }
+        Operation::Revolve { sketch_id, .. } => {
+            out.required.push(ConflictSubject::Entity(*sketch_id));
+        }
+        Operation::Loft { profiles, .. } => {
+            out.required
+                .extend(profiles.iter().copied().map(ConflictSubject::Entity));
+        }
+        Operation::Sweep { profile, path } => {
+            out.required.push(ConflictSubject::Entity(*profile));
+            out.required.push(ConflictSubject::Entity(*path));
+        }
+
+        Operation::BooleanUnion { operands } | Operation::BooleanIntersection { operands } => {
+            out.touched
+                .extend(operands.iter().copied().map(ConflictSubject::Entity));
+        }
+        Operation::BooleanDifference { target, tools } => {
+            out.touched.push(ConflictSubject::Entity(*target));
+            out.touched
+                .extend(tools.iter().copied().map(ConflictSubject::Entity));
+        }
+        Operation::Boolean {
+            operand_a,
+            operand_b,
+            ..
+        } => {
+            out.touched.push(ConflictSubject::Entity(*operand_a));
+            out.touched.push(ConflictSubject::Entity(*operand_b));
+        }
+
+        Operation::Fillet { edges, .. } | Operation::Chamfer { edges, .. } => {
+            out.touched
+                .extend(edges.iter().copied().map(ConflictSubject::Entity));
+        }
+        Operation::Pattern { features, .. } => {
+            out.touched
+                .extend(features.iter().copied().map(ConflictSubject::Entity));
+        }
+        Operation::Transform { entities, .. } => {
+            out.touched
+                .extend(entities.iter().copied().map(ConflictSubject::Entity));
+        }
+        Operation::Delete { entities } => {
+            out.deleted
+                .extend(entities.iter().copied().map(ConflictSubject::Entity));
+        }
+        Operation::Modify { entity, .. } => {
+            out.touched.push(ConflictSubject::Entity(*entity));
+        }
+
+        Operation::Batch { operations, .. } => {
+            for op in operations {
+                let sub = get_affected_subjects(op);
+                out.deleted.extend(sub.deleted);
+                out.touched.extend(sub.touched);
+                out.required.extend(sub.required);
+            }
+        }
+
+        Operation::Generic { parameters, .. } => {
+            out.touched.extend(
+                parse_ref_array(parameters, "outputs")
+                    .into_iter()
+                    .map(ConflictSubject::KernelRef),
+            );
+            out.required.extend(
+                parse_ref_array(parameters, "inputs")
+                    .into_iter()
+                    .map(ConflictSubject::KernelRef),
+            );
+        }
+    }
+    out
+}
+
+/// Read `parameters[key]` as a JSON array of strings, per the shape
+/// `recorder_bridge::to_timeline_operation` writes:
+/// `{"params": …, "inputs": [<canonical refs>], "outputs": [<canonical refs>]}`.
+/// Anything that isn't an array of strings yields an empty result
+/// rather than panicking — a malformed or hand-built `Generic` event
+/// must not crash conflict detection.
+fn parse_ref_array(parameters: &serde_json::Value, key: &str) -> Vec<String> {
+    parameters
+        .get(key)
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// True when two operations are byte-for-byte the same event (same
+/// variant, same fields) — the "identical operation both sides" row of
+/// the taxonomy, which is idempotent rather than conflicting. Compares
+/// via the operation's own `Serialize` impl (its canonical wire form)
+/// rather than requiring `PartialEq` on `Operation` and every type it
+/// nests (`BlendRadiusDto`, `SketchElement`, …), which would ripple far
+/// beyond this module.
+pub fn operations_identical(a: &Operation, b: &Operation) -> bool {
+    match (serde_json::to_value(a), serde_json::to_value(b)) {
+        (Ok(av), Ok(bv)) => av == bv,
+        _ => false,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::PrimitiveType;
 
-    #[tokio::test]
-    async fn test_fast_forward_merge() {
-        let merger = BranchMerger::new();
-        let source_events = DashMap::new();
-        let target_events = DashMap::new();
-
-        // Add events to source after common ancestor
-        let event1 = TimelineEvent {
-            id: EventId::new(),
-            sequence_number: 10,
-            timestamp: Utc::now(),
-            author: Author::System,
-            operation: Operation::CreatePrimitive {
-                primitive_type: crate::PrimitiveType::Box,
-                parameters: serde_json::json!({}),
-            },
-            inputs: OperationInputs {
-                required_entities: vec![],
-                optional_entities: vec![],
-                parameters: serde_json::json!({}),
-            },
-            outputs: OperationOutputs::default(),
-            metadata: EventMetadata {
-                description: None,
-                branch_id: BranchId::new(),
-                tags: vec![],
-                properties: HashMap::new(),
-            },
+    /// RED (pre-fix) / GREEN (post-fix) pin for the §5 step 2 blocker:
+    /// a `Generic` operation — what every real kernel op arrives as —
+    /// must yield non-empty affected subjects when its `parameters`
+    /// carry `inputs`/`outputs`, parsed as `ConflictSubject::KernelRef`.
+    #[test]
+    fn generic_operation_subjects_are_parsed_from_inputs_and_outputs() {
+        let op = Operation::Generic {
+            command_type: "extrude_face".to_string(),
+            parameters: serde_json::json!({
+                "params": {"distance": 5.0},
+                "inputs": ["face:1", "edge:2"],
+                "outputs": ["solid:42"],
+            }),
         };
 
-        source_events.insert(10, event1);
+        let subjects = get_affected_subjects(&op);
 
-        // Fast-forward should succeed
-        let result = merger
-            .fast_forward_merge(&source_events, &target_events, 5)
-            .await
-            .unwrap();
-
-        assert!(result.success);
-        assert_eq!(result.merged_events.len(), 1);
-        assert_eq!(result.conflicts.len(), 0);
-    }
-
-    /// AUDIT-M3 contract: a `ConflictStrategy::AI` request surfaces a
-    /// typed `NotImplemented` error instead of silently downgrading
-    /// to `PreferSource`. The previous behaviour lied to callers — a
-    /// merge requested as AI-resolved would report
-    /// `auto_resolved = N` without consulting any model.
-    ///
-    /// This test exercises the path indirectly through `merge` with
-    /// a real conflict: source and target both modify the same
-    /// entity after the common ancestor.
-    #[tokio::test]
-    async fn three_way_with_ai_strategy_returns_not_implemented() {
-        let merger = BranchMerger::new();
-        let entity = EntityId::new();
-        let mk_event = |seq: u64| TimelineEvent {
-            id: EventId::new(),
-            sequence_number: seq,
-            timestamp: Utc::now(),
-            author: Author::System,
-            operation: Operation::Modify {
-                entity,
-                modifications: vec![],
-            },
-            inputs: OperationInputs {
-                required_entities: vec![],
-                optional_entities: vec![],
-                parameters: serde_json::json!({}),
-            },
-            outputs: OperationOutputs::default(),
-            metadata: EventMetadata {
-                description: None,
-                branch_id: BranchId::new(),
-                tags: vec![],
-                properties: HashMap::new(),
-            },
-        };
-
-        let source_events = DashMap::new();
-        source_events.insert(10, mk_event(10));
-        let target_events = DashMap::new();
-        target_events.insert(11, mk_event(11));
-
-        let err = merger
-            .merge(
-                &source_events,
-                &target_events,
-                5,
-                MergeStrategy::ThreeWay {
-                    conflict_strategy: ConflictStrategy::AI {
-                        model: "claude-opus-4-6".to_string(),
-                        criteria: vec!["minimize-volume-delta".to_string()],
-                    },
-                },
-            )
-            .await
-            .expect_err("AI conflict strategy must surface NotImplemented, not silently fall back");
-
-        match err {
-            TimelineError::NotImplemented(msg) => {
-                assert!(
-                    msg.contains("ConflictStrategy::AI"),
-                    "error message should name the strategy; got: {msg}"
-                );
-                assert!(
-                    msg.contains("claude-opus-4-6"),
-                    "error message should echo the requested model; got: {msg}"
-                );
-            }
-            other => panic!("expected NotImplemented, got {other:?}"),
-        }
-    }
-
-    /// AUDIT-M3: the documented fallback strategies must keep working
-    /// after the AI-path tightening — a regression here would mean we
-    /// accidentally broke a real merge path. Drive `PreferSource`
-    /// through the same conflicting fixture and assert success.
-    #[tokio::test]
-    async fn three_way_with_prefer_source_still_resolves_conflicts() {
-        let merger = BranchMerger::new();
-        let entity = EntityId::new();
-        let mk_event = |seq: u64| TimelineEvent {
-            id: EventId::new(),
-            sequence_number: seq,
-            timestamp: Utc::now(),
-            author: Author::System,
-            operation: Operation::Modify {
-                entity,
-                modifications: vec![],
-            },
-            inputs: OperationInputs {
-                required_entities: vec![],
-                optional_entities: vec![],
-                parameters: serde_json::json!({}),
-            },
-            outputs: OperationOutputs::default(),
-            metadata: EventMetadata {
-                description: None,
-                branch_id: BranchId::new(),
-                tags: vec![],
-                properties: HashMap::new(),
-            },
-        };
-
-        let source_events = DashMap::new();
-        source_events.insert(10, mk_event(10));
-        let target_events = DashMap::new();
-        target_events.insert(11, mk_event(11));
-
-        let result = merger
-            .merge(
-                &source_events,
-                &target_events,
-                5,
-                MergeStrategy::ThreeWay {
-                    conflict_strategy: ConflictStrategy::PreferSource,
-                },
-            )
-            .await
-            .expect("PreferSource must continue to succeed on a routine conflict");
-
-        // The resolver should have recorded the conflict and assigned
-        // a `UseSource` resolution to it.
         assert!(
-            result
-                .conflicts
-                .iter()
-                .all(|c| matches!(c.resolution, Some(ConflictResolution::UseSource))),
-            "every conflict should be resolved as UseSource"
+            !subjects.is_empty(),
+            "a Generic op with inputs/outputs must not report empty affected subjects \
+             (this is the blind-on-real-history bug the deleted BranchMerger had)"
         );
+        assert_eq!(
+            subjects.touched,
+            vec![ConflictSubject::KernelRef("solid:42".to_string())],
+            "Generic outputs are the subjects this op produces/touches"
+        );
+        assert_eq!(
+            subjects.required,
+            vec![
+                ConflictSubject::KernelRef("face:1".to_string()),
+                ConflictSubject::KernelRef("edge:2".to_string()),
+            ],
+            "Generic inputs are dependency subjects, not touched subjects"
+        );
+        assert!(subjects.deleted.is_empty());
+    }
+
+    /// A `Generic` op with no `inputs`/`outputs` keys at all (e.g. a
+    /// hand-built event, or a future command kind that legitimately
+    /// touches nothing) must not panic and must report empty — the
+    /// parser degrades to the old (blind) behavior gracefully rather
+    /// than crashing on a missing key.
+    #[test]
+    fn generic_operation_without_ref_arrays_is_empty_not_panicking() {
+        let op = Operation::Generic {
+            command_type: "noop".to_string(),
+            parameters: serde_json::json!({ "params": {} }),
+        };
+        assert!(get_affected_subjects(&op).is_empty());
+    }
+
+    #[test]
+    fn typed_delete_lands_in_deleted_bucket() {
+        let e = EntityId::new();
+        let op = Operation::Delete { entities: vec![e] };
+        let subjects = get_affected_subjects(&op);
+        assert_eq!(subjects.deleted, vec![ConflictSubject::Entity(e)]);
+        assert!(subjects.touched.is_empty());
+        assert!(subjects.required.is_empty());
+    }
+
+    #[test]
+    fn typed_extrude_sketch_is_required_not_touched() {
+        let sketch = EntityId::new();
+        let op = Operation::Extrude {
+            sketch_id: sketch,
+            distance: 10.0,
+            direction: None,
+        };
+        let subjects = get_affected_subjects(&op);
+        assert_eq!(subjects.required, vec![ConflictSubject::Entity(sketch)]);
+        assert!(subjects.touched.is_empty());
+    }
+
+    #[test]
+    fn identical_generic_operations_compare_equal() {
+        let mk = || Operation::Generic {
+            command_type: "fillet_edge".to_string(),
+            parameters: serde_json::json!({"params": {"radius": 0.5}, "inputs": ["edge:7"], "outputs": ["solid:9"]}),
+        };
+        assert!(operations_identical(&mk(), &mk()));
+    }
+
+    #[test]
+    fn differing_generic_operations_compare_unequal() {
+        let a = Operation::Generic {
+            command_type: "fillet_edge".to_string(),
+            parameters: serde_json::json!({"inputs": ["edge:7"], "outputs": ["solid:9"], "params": {"radius": 0.5}}),
+        };
+        let b = Operation::Generic {
+            command_type: "fillet_edge".to_string(),
+            parameters: serde_json::json!({"inputs": ["edge:7"], "outputs": ["solid:9"], "params": {"radius": 0.9}}),
+        };
+        assert!(!operations_identical(&a, &b));
+    }
+
+    #[test]
+    fn create_primitive_has_no_dependencies() {
+        let op = Operation::CreatePrimitive {
+            primitive_type: PrimitiveType::Box,
+            parameters: serde_json::json!({}),
+        };
+        assert!(get_affected_subjects(&op).is_empty());
     }
 }

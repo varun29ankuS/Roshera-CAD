@@ -167,6 +167,59 @@ export function registerInspectTools(server: ToolHost) {
   );
 
   server.tool(
+    "dfm_check",
+    "DFM (design-for-manufacturability): run a rule pack against a part's REAL " +
+      "B-Rep, exact-or-refuse — never a fabricated pass. 'fdm' pack checks " +
+      "fdm.min_wall (wall thickness >= 2x nozzle diameter) and fdm.overhang " +
+      "(no face > 45 deg from vertical); 'injection_molding' checks mold.draft. " +
+      "Returns the kernel's DfmReport verbatim: per-rule verdicts (pass | " +
+      "violation | unverifiable, each with measured/limit values and their " +
+      "derivation) plus a pack-level summary that is Pass ONLY if every rule " +
+      "passed -- one unverifiable rule forces Inconclusive, never a silent Pass.",
+    {
+      part_id: z.number().int().describe("part id (list_parts)"),
+      pack: z
+        .enum(["fdm", "injection_molding"])
+        .describe("which rule pack to evaluate"),
+      nozzle_diameter: z
+        .number()
+        .optional()
+        .describe("fdm pack only; mm, default 0.4"),
+      build_direction: z
+        .array(z.number()).length(3)
+        .optional()
+        .describe("fdm pack only; unit build-up direction, default [0,0,1]"),
+      pull_direction: z
+        .array(z.number()).length(3)
+        .optional()
+        .describe("injection_molding pack only; unit mold-pull direction, default [0,0,1]"),
+      min_draft_deg: z
+        .number()
+        .optional()
+        .describe("injection_molding pack only; minimum draft angle in degrees, default 1.0"),
+    },
+    async ({ part_id, pack, nozzle_diameter, build_direction, pull_direction, min_draft_deg }) => {
+      try {
+        const body =
+          pack === "fdm"
+            ? {
+                pack,
+                nozzle_diameter: nozzle_diameter ?? 0.4,
+                build_direction: build_direction ?? [0, 0, 1],
+              }
+            : {
+                pack,
+                pull_direction: pull_direction ?? [0, 0, 1],
+                min_draft_deg: min_draft_deg ?? 1.0,
+              };
+        return ok(await api("POST", `/api/agent/parts/${part_id}/dfm`, body));
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  server.tool(
     "select_face",
     "Address a face by DESCRIPTION — resolves it or REFUSES (never picks among " +
       "equal matches). Returns face_id + persistent_id, or ambiguous / not_found.",

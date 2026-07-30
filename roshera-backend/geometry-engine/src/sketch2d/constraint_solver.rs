@@ -1448,18 +1448,72 @@ impl ConstraintSolver {
         super::decompose::connected_components(&nodes, &shared_ref_edges, &constraint_entities)
     }
 
-    /// Check if system is properly constrained
+    /// Check if system is properly constrained — folded PER COMPONENT
+    /// (SKETCH-DCM #45 slice H4).
+    ///
+    /// Pre-H4 this compared the two GLOBAL tallies
+    /// (`count_degrees_of_freedom` / `count_constraint_dof`) directly.
+    /// That comparison can cancel: a component +1 over-constrained and
+    /// a disjoint component -1 under-constrained sum to a balanced
+    /// global count, so this returned `None` — which lets `solve()`
+    /// fall through to Newton's `Converged`/`NotConverged` outcome
+    /// even though a component is genuinely, structurally broken. The
+    /// fold instead asks each connected component of the constraint
+    /// graph (`split_components`) for its own uncancelled verdict:
+    /// any component over-constrained wins (excess summed over just
+    /// the over components — a conflict is a soundness problem); else
+    /// any component under-constrained (deficit summed over just the
+    /// under components — slack is an incompleteness problem); else
+    /// `None`, unchanged from before, so a perfectly balanced system
+    /// still lets Newton's own outcome show through.
+    ///
+    /// Called BEFORE `solve()` sorts `self.constraints` by priority
+    /// (see `solve`'s call site) and does not mutate `self` — this is
+    /// a second, independent `split_components()` call, not a reuse of
+    /// one computed elsewhere, so it is unaffected by that ordering
+    /// either way. The split itself is O(entities + constraints)
+    /// union-find, negligible next to the Newton iterations it gates.
     fn check_constraint_count(&self) -> Option<SolverStatus> {
-        let total_dof = self.count_degrees_of_freedom();
-        let constraints_dof = self.count_constraint_dof();
+        use std::cmp::Ordering;
 
-        if constraints_dof > total_dof {
+        let components = self.split_components();
+        let mut any_over = false;
+        let mut any_under = false;
+        let mut over_excess: usize = 0;
+        let mut under_deficit: usize = 0;
+        for component in &components {
+            let total_dof: usize = component
+                .entities
+                .iter()
+                .filter_map(|e| self.entity_state.get(e))
+                .map(|state| state.free_param_count())
+                .sum();
+            let constraints_dof: usize = component
+                .constraint_indices
+                .iter()
+                .filter_map(|&i| self.constraints.get(i))
+                .map(|c| c.degrees_of_freedom_removed())
+                .sum();
+            match constraints_dof.cmp(&total_dof) {
+                Ordering::Greater => {
+                    any_over = true;
+                    over_excess += constraints_dof - total_dof;
+                }
+                Ordering::Less => {
+                    any_under = true;
+                    under_deficit += total_dof - constraints_dof;
+                }
+                Ordering::Equal => {}
+            }
+        }
+
+        if any_over {
             Some(SolverStatus::OverConstrained {
-                conflicting_constraints: constraints_dof - total_dof,
+                conflicting_constraints: over_excess,
             })
-        } else if constraints_dof < total_dof {
+        } else if any_under {
             Some(SolverStatus::UnderConstrained {
-                degrees_of_freedom: total_dof - constraints_dof,
+                degrees_of_freedom: under_deficit,
             })
         } else {
             None
@@ -4208,6 +4262,42 @@ fn distance_sq(a: &Point2d, b: &Point2d) -> f64 {
 /// INSENSITIVE to foot error), κ at the foot is first-order sensitive,
 /// so a ~1e-3-loose foot would turn the solver's 1e-8
 /// finite-difference Jacobian into noise.
+///
+/// G7 — the loop above exits on EITHER a converged step (`done`) or a
+/// vanishing derivative (`fp.abs() < 1e-18`) or simply running out of
+/// iterations, and previously returned `Some` identically in all three
+/// cases: a non-converged `u` fed downstream curvature residuals
+/// (`spline_curvature_derivative`) and certificate `ContinuityFact`s
+/// as if it were exact. This tail re-evaluates the stationarity
+/// residual `f(u) = (C(u) − P) · C'(u)` at the FINAL `u` (not the
+/// stale `f` from the iteration that produced it) and refuses
+/// (`None`) when it exceeds a scale-aware bound — every caller already
+/// handles `None` honestly (`unsupported_residual` in the
+/// G1/G2/CurvatureExtremum evaluators).
+///
+/// The check applies ONLY when `u` lands strictly inside `(u0, u1)`.
+/// At a clamped parameter-range endpoint the true constrained optimum
+/// legitimately has a large, nonzero `f` (the unconstrained Newton
+/// step points outside the curve's domain and gets clamped back) —
+/// that is the CORRECT answer for a foot pinned to a curve end, not a
+/// convergence failure, and gating on interior-only avoids turning
+/// every such endpoint foot into a false refusal (pinned empirically:
+/// `red_g1_with_spline_is_never_a_silent_zero`-style fixtures produce
+/// exactly this boundary shape).
+///
+/// Bound: `STRICT_TOLERANCE.distance() * max(|C'(u)|², 1) *
+/// max(|C(u) − P|, 1)`. `f` is a dot product of a vector with
+/// magnitude `|C(u) − P|` against one with magnitude `|C'(u)|`, so its
+/// achievable floating-point/algorithmic noise floor scales with that
+/// product — matching the file's existing scale-aware pattern (e.g.
+/// `ConstraintDiagnosis`'s rank test: `norm > STRICT_TOLERANCE.distance()
+/// * row_norm.max(1.0)`). Calibrated empirically against every
+/// existing interior `spline_foot` consumer fixture (SKETCH-DCM #45
+/// Slice 7 continuity/extremum suites): converged residuals there sit
+/// at `|f| ≈ 1e-13..1e-17` against bounds of `≈ 1e-7..1e-5` for the
+/// observed `|C'|²` (≈2..950) and `|C(u)−P|` (≈1e-16..6) ranges — a
+/// ≥10⁶× margin, so no currently-passing consumer is pushed into a
+/// refuse row by this gate.
 fn spline_foot(geometry: &Spline2d, p: &Point2d) -> Option<(Point2d, f64)> {
     let (u0, u1) = geometry.parameter_range();
     let (_, seed) = geometry.closest_point(p, &Tolerance2d::default()).ok()?;
@@ -4227,6 +4317,20 @@ fn spline_foot(geometry: &Spline2d, p: &Point2d) -> Option<(Point2d, f64)> {
         u = next;
         if done {
             break;
+        }
+    }
+    let (c, d1, _) = geometry.derivatives2(u).ok()?;
+    let rx = c.x - p.x;
+    let ry = c.y - p.y;
+    let range = u1 - u0;
+    let interior = range > 0.0 && (u - u0) > range * 1e-9 && (u1 - u) > range * 1e-9;
+    if interior {
+        let f = rx * d1.x + ry * d1.y;
+        let speed_sq = d1.x * d1.x + d1.y * d1.y;
+        let r_mag = (rx * rx + ry * ry).sqrt();
+        let bound = STRICT_TOLERANCE.distance() * speed_sq.max(1.0) * r_mag.max(1.0);
+        if f.abs() > bound {
+            return None;
         }
     }
     Some((geometry.evaluate(u).ok()?, u))
@@ -5955,6 +6059,147 @@ mod tests {
             errs[0].abs() > 1.0,
             "expected large off-curve residual, got {}",
             errs[0]
+        );
+    }
+
+    /// G7 — mutation-proof regression pin for the stationarity gate,
+    /// using a genuinely hard fixture (a tight 270°-ish "C" curl —
+    /// degree-3, control points at (10,0), (10,10), (-10,10),
+    /// (-10,0) — high curvature enough that the coarse-scan seed
+    /// lands well outside a single Newton step's basin).
+    ///
+    /// Verified empirically (executor RED-first pass, raw output in
+    /// the task report): forcing the loop's iteration cap from 30
+    /// down to 1 makes `spline_foot(&geometry, (2.0, -1.0))`
+    /// genuinely non-converge — `u=0.25`, residual `f=-10.3125`
+    /// against a bound of `6.01e-6` at that station (a ~1.7-million×
+    /// violation). Pre-gate code (no stationarity check at all, the
+    /// historical bug) returned that as `Some((6.875, 5.625), 0.25)`
+    /// — a foot nowhere near the true closest point, presented as
+    /// exact. With the gate present (this fn, unmodified) the SAME
+    /// cap=1 input correctly refuses (`None`). Restoring the real
+    /// cap=30 converges the SAME point to a materially different,
+    /// legitimate foot: `Some((4.999, 6.596), u=0.326)` — proving the
+    /// cap, not the point, was the non-convergence cause.
+    ///
+    /// This test pins the cap=30 (real, shipped) side of that
+    /// story: a point whose seed needs genuine Newton refinement
+    /// must still resolve to `Some` with a real stationarity residual
+    /// once enough iterations run.
+    #[test]
+    fn spline_foot_hard_curl_converges_with_full_iteration_budget() {
+        let geometry = Spline2d::BSpline(
+            BSpline2d::new(
+                3,
+                vec![
+                    Point2d::new(10.0, 0.0),
+                    Point2d::new(10.0, 10.0),
+                    Point2d::new(-10.0, 10.0),
+                    Point2d::new(-10.0, 0.0),
+                ],
+                vec![0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0],
+            )
+            .expect("bspline"),
+        );
+        let p = Point2d::new(2.0, -1.0);
+        let (foot, u) = spline_foot(&geometry, &p)
+            .expect("the full 30-iteration budget must converge this hard fixture, not refuse");
+        // Cross-check: the returned foot really is stationary — verify
+        // f = (C(u) - p)·C'(u) is tiny against the same scale-aware
+        // bound spline_foot itself applies, using the geometry's own
+        // derivatives rather than trusting the internal computation.
+        let (_, d1, _) = geometry.derivatives2(u).expect("derivatives");
+        let rx = foot.x - p.x;
+        let ry = foot.y - p.y;
+        let f = rx * d1.x + ry * d1.y;
+        let speed_sq = d1.x * d1.x + d1.y * d1.y;
+        let r_mag = (rx * rx + ry * ry).sqrt();
+        let bound = STRICT_TOLERANCE.distance() * speed_sq.max(1.0) * r_mag.max(1.0);
+        assert!(
+            f.abs() <= bound,
+            "returned foot must be genuinely stationary: |f|={} > bound={} (u={u}, foot={foot:?})",
+            f.abs(),
+            bound
+        );
+    }
+
+    /// G7 — an ordinary interior foot (well-conditioned: the point is
+    /// off-curve but its true foot sits strictly inside the parameter
+    /// range) must still resolve to `Some`, not refuse. Mutation-proof
+    /// companion to the stationarity gate: over-tightening the bound
+    /// (or applying it unconditionally, including at endpoints) would
+    /// make this — and every currently-passing `PointOnCurve` /
+    /// continuity spline fixture — a false refusal.
+    #[test]
+    fn spline_foot_accepts_well_conditioned_interior_point() {
+        let geometry = Spline2d::BSpline(
+            BSpline2d::new(
+                2,
+                vec![
+                    Point2d::new(0.0, 0.0),
+                    Point2d::new(1.0, 2.0),
+                    Point2d::new(2.0, 0.0),
+                    Point2d::new(3.0, 2.0),
+                ],
+                vec![0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0],
+            )
+            .expect("bspline"),
+        );
+        let p = Point2d::new(1.5, 1.0);
+        let result = spline_foot(&geometry, &p);
+        assert!(
+            result.is_some(),
+            "a well-conditioned interior foot must resolve, not refuse"
+        );
+        let (_, u) = result.expect("checked Some above");
+        assert!(
+            u > 1e-6 && u < 1.0 - 1e-6,
+            "expected the foot to land in the curve interior, got u={u}"
+        );
+    }
+
+    /// G7 — the stationarity check applies ONLY to interior feet. A
+    /// point positioned past the curve's start (its true unconstrained
+    /// closest point is an EXTRAPOLATION beyond `u0`) legitimately has
+    /// a large, nonzero `f(u0) = (C(u0) − P) · C'(u0)` once Newton
+    /// clamps to the boundary — that is the correct constrained
+    /// optimum, not a convergence failure. This is the false-refuse
+    /// shape the interior gate exists to avoid (empirically observed
+    /// via `ROSHERA_SPLINE_FOOT_TRACE` against the SKETCH-DCM #45
+    /// Slice 6/7 fixtures: a real boundary foot with `|f| = 18`
+    /// against `|C'|² = 80` — clearing no reasonable UNGATED bound).
+    ///
+    /// Uses a straight-line-equivalent cubic (collinear control
+    /// points, so the curve is exactly the segment `(0,0)..(10,0)`)
+    /// for a hand-verifiable boundary case: `p = (-5, 0)` is 5 units
+    /// before the segment start, so the true closest point is the
+    /// clamped endpoint `u = 0`, `C(0) = (0, 0)`, with
+    /// `r = C(0) − p = (5, 0)` manifestly NOT perpendicular to the
+    /// curve's rightward tangent there (`f = r·C'(0) > 0`).
+    #[test]
+    fn spline_foot_accepts_large_residual_at_clamped_boundary() {
+        let geometry = Spline2d::BSpline(
+            BSpline2d::new(
+                3,
+                vec![
+                    Point2d::new(0.0, 0.0),
+                    Point2d::new(3.0, 0.0),
+                    Point2d::new(7.0, 0.0),
+                    Point2d::new(10.0, 0.0),
+                ],
+                vec![0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0],
+            )
+            .expect("bspline"),
+        );
+        let p = Point2d::new(-5.0, 0.0);
+        let result = spline_foot(&geometry, &p);
+        let (foot, u) = result.expect(
+            "a clamped-boundary foot with a legitimately large residual must still resolve",
+        );
+        assert!(u < 1e-6, "expected the foot clamped to u=0, got u={u}");
+        assert!(
+            (foot.x - 0.0).abs() < 1e-6 && (foot.y - 0.0).abs() < 1e-6,
+            "expected the foot at the segment start (0,0), got {foot:?}"
         );
     }
 

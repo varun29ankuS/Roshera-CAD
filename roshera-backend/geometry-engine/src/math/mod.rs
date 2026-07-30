@@ -33,8 +33,20 @@ pub mod winding_number;
 // Advanced curve/surface mathematics
 pub mod bspline;
 pub mod continuity_analysis;
+// Proven interval/normal-cone enclosures for B-spline patches (freeform
+// coverage F2). NOTE: `enclosure::Interval` is deliberately NOT re-exported
+// at the `math` root — `utils::Interval` (a plain min/max pair) already
+// occupies that name; the proven-enclosure type is addressed as
+// `math::enclosure::Interval` so the two can never be confused.
+pub mod enclosure;
 pub mod nurbs;
 pub mod surface_intersection;
+// Manual Oslo-insertion diagnostic (println-based, no assertions). Kept OUT
+// of the release surface: only test builds and the opt-in `dev-diagnostics`
+// feature (which the `test_oslo` bin target requires) compile it. It was
+// previously unconditional — a debug stub in the public API, violating the
+// no-stubs-in-production rule.
+#[cfg(any(test, feature = "dev-diagnostics"))]
 pub mod test_oslo;
 pub mod trimmed_nurbs;
 

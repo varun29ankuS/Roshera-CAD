@@ -2050,6 +2050,61 @@ fn create_ruled_chamfer_surface(
     Ok(Box::new(RuledSurface::new(curve1, curve2)))
 }
 
+/// G5 — decide the chamfer face's [`FaceOrientation`] from the two
+/// adjacent faces' outward normals at the edge midpoint (`n1`, `n2`).
+/// `n1`/`n2` are `None` when [`get_face_oriented_normal`] failed to
+/// resolve that face's normal (e.g. a missing vertex, or a surface
+/// evaluation failure at the sample point).
+///
+/// Every degenerate path returns the operation's typed error, naming
+/// the offending edge/faces, instead of guessing
+/// `FaceOrientation::Forward`:
+///
+/// - either adjacent normal is unavailable (`n1`/`n2` is `None`);
+/// - the outward target `n1 + n2` cancels (near-180° dihedral, where
+///   the two faces' outward normals are anti-parallel);
+/// - [`orient_face_for_outward`] itself fails (e.g. the chamfer's own
+///   ruled surface has a degenerate normal at its parametric
+///   midpoint).
+///
+/// Pre-G5 all three cases silently fell back to `Forward` — the exact
+/// default that produced CHAMFER-MULTIEDGE-VOLUME (a non-right
+/// dihedral's bevel normal pointing inward, over-reporting removed
+/// volume ~22× once mass properties started routing through the
+/// mesh). Factored out of [`create_chamfer_face`] so the decision is
+/// unit-testable without constructing a real degenerate B-Rep edge —
+/// the `1e-20` magnitude gate demands `n1`/`n2` be anti-parallel to
+/// within ~1e-10 rad, which is not reliably reachable through public
+/// construction ops without also tripping other tolerance guards
+/// (minimum feature size, vertex welding) first.
+fn chamfer_face_orientation(
+    surface: &dyn Surface,
+    n1: Option<Vector3>,
+    n2: Option<Vector3>,
+    edge_id: EdgeId,
+    face1_id: FaceId,
+    face2_id: FaceId,
+) -> OperationResult<FaceOrientation> {
+    let target = match (n1, n2) {
+        (Some(n1), Some(n2)) => n1 + n2,
+        _ => {
+            return Err(OperationError::NumericalError(format!(
+                "chamfer face orientation at edge {edge_id}: outward normal unavailable for \
+                 face {face1_id} or face {face2_id}; refusing to default to Forward orientation"
+            )));
+        }
+    };
+    if target.magnitude_squared() <= 1e-20 {
+        return Err(OperationError::NumericalError(format!(
+            "chamfer face orientation at edge {edge_id} (faces {face1_id}, {face2_id}) is \
+             degenerate: adjacent outward normals cancel (near-180\u{b0} dihedral); refusing \
+             to default to Forward orientation, which previously caused \
+             CHAMFER-MULTIEDGE-VOLUME (~22x volume misreport)"
+        )));
+    }
+    orient_face_for_outward(surface, target)
+}
+
 /// Create chamfer face with boundaries.
 ///
 /// Returns `(face_id, surgery)` — the surgery captures every new
@@ -2198,36 +2253,36 @@ fn create_chamfer_face(
     // construction, like every other blend face, fixes the mesh volume;
     // reflex behaviour is preserved because n1 + n2 already flips into the
     // notch there.
-    let orientation = {
-        let target = match (
-            model.vertices.get(original_v0).map(|v| v.position),
-            model.vertices.get(original_v1).map(|v| v.position),
-        ) {
-            (Some(a), Some(b)) => {
-                let mid = Point3::new(
-                    0.5 * (a[0] + b[0]),
-                    0.5 * (a[1] + b[1]),
-                    0.5 * (a[2] + b[2]),
-                );
-                match (
-                    get_face_oriented_normal(model, face1_id, &mid).ok(),
-                    get_face_oriented_normal(model, face2_id, &mid).ok(),
-                ) {
-                    (Some(n1), Some(n2)) => Some(n1 + n2),
-                    _ => None,
-                }
-            }
-            _ => None,
-        };
-        match target {
-            Some(t) if t.magnitude_squared() > 1e-20 => model
-                .surfaces
-                .get(surface_id)
-                .and_then(|s| orient_face_for_outward(s, t).ok())
-                .unwrap_or(FaceOrientation::Forward),
-            _ => FaceOrientation::Forward,
+    //
+    // G5 — every degenerate path here (missing vertex/normal, n1 + n2
+    // cancelling near a 180° dihedral, or `orient_face_for_outward` itself
+    // failing) used to fall back to `FaceOrientation::Forward` silently —
+    // the exact default that produced CHAMFER-MULTIEDGE-VOLUME. None of
+    // them guess anymore: `chamfer_face_orientation` returns the typed
+    // error, naming the edge/faces, instead.
+    let (n1, n2) = match (
+        model.vertices.get(original_v0).map(|v| v.position),
+        model.vertices.get(original_v1).map(|v| v.position),
+    ) {
+        (Some(a), Some(b)) => {
+            let mid = Point3::new(
+                0.5 * (a[0] + b[0]),
+                0.5 * (a[1] + b[1]),
+                0.5 * (a[2] + b[2]),
+            );
+            (
+                get_face_oriented_normal(model, face1_id, &mid).ok(),
+                get_face_oriented_normal(model, face2_id, &mid).ok(),
+            )
         }
+        _ => (None, None),
     };
+    let surface_ref = model.surfaces.get(surface_id).ok_or_else(|| {
+        OperationError::InvalidGeometry(format!(
+            "chamfer surface {surface_id} missing while orienting the face at edge {edge_id}"
+        ))
+    })?;
+    let orientation = chamfer_face_orientation(surface_ref, n1, n2, edge_id, face1_id, face2_id)?;
     let face = Face::new(0, surface_id, loop_id, orientation);
     let face_id = model.faces.add(face);
 
@@ -4132,6 +4187,77 @@ mod tests {
             })
             .map(|(id, _)| id)
             .expect("vertex at requested position")
+    }
+
+    /// G5 — a near-180° dihedral (the two adjacent faces' outward
+    /// normals anti-parallel, so `n1 + n2` cancels) must refuse typed
+    /// instead of silently building a `Forward`-oriented bevel. This
+    /// is the exact degenerate input that pre-G5 defaulted to
+    /// `FaceOrientation::Forward` and produced
+    /// CHAMFER-MULTIEDGE-VOLUME. Exercises `chamfer_face_orientation`
+    /// directly with synthetic normals — see the function's doc
+    /// comment for why constructing a real B-Rep edge whose adjacent
+    /// normals cancel to within the `1e-20` magnitude-squared gate
+    /// (~1e-10 rad of exact anti-parallel) is not a reliable path
+    /// through public construction ops.
+    #[test]
+    fn chamfer_face_orientation_refuses_when_normals_cancel() {
+        let plane = crate::primitives::surface::Plane::from_point_normal(
+            Point3::ZERO,
+            Vector3::new(0.0, 0.0, 1.0),
+        )
+        .expect("plane");
+        let n1 = Vector3::new(1.0, 0.0, 0.0);
+        let n2 = Vector3::new(-1.0, 0.0, 0.0);
+        let result = chamfer_face_orientation(&plane, Some(n1), Some(n2), 7, 1, 2);
+        match result {
+            Err(OperationError::NumericalError(msg)) => {
+                assert!(
+                    msg.contains('7') && msg.contains('1') && msg.contains('2'),
+                    "error should name the edge/faces, got: {msg}"
+                );
+            }
+            other => panic!("expected NumericalError refusing to guess, got {other:?}"),
+        }
+    }
+
+    /// G5 — when either adjacent face's outward normal could not be
+    /// resolved at all (`get_face_oriented_normal` failed), the
+    /// orientation decision must also refuse rather than silently
+    /// defaulting to `Forward`.
+    #[test]
+    fn chamfer_face_orientation_refuses_when_a_normal_is_missing() {
+        let plane = crate::primitives::surface::Plane::from_point_normal(
+            Point3::ZERO,
+            Vector3::new(0.0, 0.0, 1.0),
+        )
+        .expect("plane");
+        let n2 = Vector3::new(0.0, 1.0, 0.0);
+        let result = chamfer_face_orientation(&plane, None, Some(n2), 9, 3, 4);
+        assert!(
+            matches!(result, Err(OperationError::NumericalError(_))),
+            "expected NumericalError, got {result:?}"
+        );
+    }
+
+    /// Mutation-proof companion to the two refusal tests above: a
+    /// genuinely non-degenerate target (`n1 + n2` well away from
+    /// zero) must still resolve to a real orientation, not refuse.
+    /// Flipping the `<=` in the magnitude gate to `<` (or otherwise
+    /// widening the degenerate branch) would make this false-refuse;
+    /// this test is the canary for that mutation.
+    #[test]
+    fn chamfer_face_orientation_accepts_well_conditioned_target() {
+        let plane = crate::primitives::surface::Plane::from_point_normal(
+            Point3::ZERO,
+            Vector3::new(0.0, 0.0, 1.0),
+        )
+        .expect("plane");
+        let n1 = Vector3::new(0.0, 0.0, 1.0);
+        let n2 = Vector3::new(0.0, 0.0, 1.0);
+        let result = chamfer_face_orientation(&plane, Some(n1), Some(n2), 1, 1, 2)
+            .expect("well-conditioned target must resolve, not refuse");
+        assert_eq!(result, FaceOrientation::Forward);
     }
 
     /// Task #82 Slice 1 — `classify_planar_corner_kind` must return the corner's

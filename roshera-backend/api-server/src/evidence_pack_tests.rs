@@ -72,7 +72,12 @@ fn bearer_for(state: &AppState, user_id: &str) -> String {
     let token = state
         .session_manager
         .auth_manager()
-        .create_token(user_id, None, vec!["user".to_string()])
+        .create_token(
+            user_id,
+            None,
+            vec!["user".to_string()],
+            session_manager::PrincipalKind::Human,
+        )
         .expect("test token must mint");
     format!("Bearer {}", token.token)
 }

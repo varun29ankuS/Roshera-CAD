@@ -95,8 +95,8 @@ pub use constraints::{
     DimensionalConstraint, DimensionalUpdateError, EntityRef, GeometricConstraint,
 };
 pub use sketch_solver::{
-    analyze_dofs, DofReport, DofStatus, DragTarget, SketchSolveError, SketchSolveReport,
-    SolveOptions,
+    analyze_dofs, ComponentDof, DofReport, DofStatus, DragTarget, SketchSolveError,
+    SketchSolveReport, SolveOptions,
 };
 
 pub use inference::{

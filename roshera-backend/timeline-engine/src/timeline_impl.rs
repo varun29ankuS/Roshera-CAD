@@ -415,67 +415,6 @@ impl Timeline {
     }
 
     /// Merge two branches (alternative implementation for WebSocket handlers)
-    pub fn merge_branches_alt(&self, source: &str, target: &str) -> TimelineResult<MergeResult> {
-        let source_id = BranchId(uuid::Uuid::parse_str(source).map_err(|_| {
-            TimelineError::InvalidOperation("Invalid source branch ID".to_string())
-        })?);
-        let target_id = BranchId(uuid::Uuid::parse_str(target).map_err(|_| {
-            TimelineError::InvalidOperation("Invalid target branch ID".to_string())
-        })?);
-
-        // Get both branches
-        let _source_branch = self
-            .branches
-            .get(&source_id)
-            .ok_or_else(|| TimelineError::BranchNotFound(source_id.clone()))?;
-        let _target_branch = self
-            .branches
-            .get(&target_id)
-            .ok_or_else(|| TimelineError::BranchNotFound(target_id.clone()))?;
-
-        // Collect source events
-        let mut source_event_list = Vec::new();
-        if let Some(source_events) = self.branch_events.get(&source_id) {
-            for entry in source_events.iter() {
-                source_event_list.push((*entry.key(), *entry.value()));
-            }
-        } else {
-            return Err(TimelineError::BranchNotFound(source_id));
-        }
-
-        // Get the target branch events and determine next index
-        let next_index = if let Some(target_events) = self.branch_events.get(&target_id) {
-            target_events.len() as u64
-        } else {
-            return Err(TimelineError::BranchNotFound(target_id));
-        };
-
-        // Now merge by directly accessing the target branch's event map
-        let mut events_merged = 0;
-        if let Some(target_events) = self.branch_events.get(&target_id) {
-            let mut current_index = next_index;
-            for (_source_idx, event_id) in source_event_list {
-                target_events.insert(current_index, event_id);
-                current_index += 1;
-                events_merged += 1;
-            }
-        }
-
-        Ok(MergeResult {
-            success: true,
-            merged_events: Vec::new(),
-            conflicts: Vec::new(),
-            modified_entities: std::collections::HashSet::new(),
-            statistics: MergeStatistics {
-                events_merged,
-                conflicts_count: 0,
-                auto_resolved: 0,
-                entities_affected: 0,
-                duration_ms: 0,
-            },
-        })
-    }
-
     /// List all branches (alternative implementation)
     pub fn list_branches_alt(&self) -> TimelineResult<Vec<BranchInfo>> {
         let mut branches = Vec::new();
