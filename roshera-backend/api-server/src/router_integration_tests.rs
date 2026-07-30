@@ -5451,3 +5451,282 @@ async fn boolean_within_budget_succeeds_and_consumes_operand() {
          1000 volume; got {vresult}"
     );
 }
+
+// =====================================================================
+// AUTHORSHIP-A1 — timeline authorship must come from the authenticated
+// principal, never from client-supplied request-body fields.
+//
+// Before this slice, `record_operation`, `create_branch`, and
+// `create_checkpoint` (handlers/timeline.rs) took the `Author` straight
+// out of the request body: any authenticated caller could claim to be
+// any user or any AI agent, and that claim landed verbatim in the
+// append-only event log. The fix removes the client-supplied author
+// fields from every DTO (rather than accepting-and-silently-ignoring
+// them) and derives authorship from `AuthInfo` instead.
+//
+// These tests run under `make_test_state()`'s `AuthPosture::
+// InsecureDevBypass`, so every request's `AuthInfo` is the fixed
+// sentinel identity `dev_auth_info()` (`user_id = "dev-insecure"`,
+// `auth_middleware.rs`). That sentinel is exactly what
+// `author_from_auth_info` must produce as the recorded `Author::User`
+// — proving the value came from the authenticated principal and not
+// from anything in the request body.
+// =====================================================================
+
+/// GREEN: `POST /api/timeline/record` derives its recorded author from
+/// the authenticated principal. The request body carries no author
+/// field at all (the DTO no longer has one); the event that lands in
+/// `GET /api/timeline/history/main` must nonetheless be attributed to
+/// the test harness's authenticated dev-bypass identity
+/// ("dev-insecure"), not to `Author::System` or anything unattributed.
+#[tokio::test]
+async fn record_operation_derives_author_from_authenticated_principal() {
+    let state = make_test_state().await;
+
+    // Seed a session position directly against the timeline (bypassing
+    // HTTP) so `Timeline::record_operation` has a pinned branch to
+    // append to — mirrors what `ensure_session_position_at_head` does
+    // for the undo/redo/mould handlers, without those handlers' side
+    // effects of also mutating existing history.
+    let session_uuid = Uuid::new_v4();
+    state
+        .timeline
+        .write()
+        .await
+        .update_session_position(
+            timeline_engine::SessionId::new(session_uuid.to_string()),
+            timeline_engine::BranchId::main(),
+            0,
+        )
+        .expect("seeding a fresh session position at branch head must succeed");
+
+    let (status, body) = dispatch(
+        &state,
+        json_post(
+            "/api/timeline/record",
+            json!({
+                "session_id": session_uuid.to_string(),
+                "operation": {
+                    "type": "CreatePrimitive",
+                    "primitive_type": "box",
+                    "parameters": {"width": 1.0, "depth": 1.0, "height": 1.0},
+                },
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "recording an operation with no author field must succeed; body = {body}"
+    );
+    let event_id = body["event_id"]
+        .as_str()
+        .expect("response must carry the recorded event_id")
+        .to_string();
+
+    let (hs, hbody) = dispatch(&state, json_get("/api/timeline/history/main")).await;
+    assert_eq!(
+        hs,
+        StatusCode::OK,
+        "history fetch must succeed; body = {hbody}"
+    );
+    let events = hbody.as_array().expect("history body must be an array");
+    let recorded = events
+        .iter()
+        .find(|e| e["id"].as_str() == Some(event_id.as_str()))
+        .unwrap_or_else(|| {
+            panic!("recorded event {event_id} must appear in history; body = {hbody}")
+        });
+
+    assert_eq!(
+        recorded["author_kind"].as_str(),
+        Some("user"),
+        "author must be derived as Author::User (the authenticated principal), \
+         never left as System or anything else; event = {recorded}"
+    );
+    assert_eq!(
+        recorded["author"].as_str(),
+        Some("dev-insecure"),
+        "author must match the AuthInfo the auth layer actually validated \
+         (the dev-bypass sentinel identity), proving it was derived — not \
+         taken from a request body that no longer even has an author field; \
+         event = {recorded}"
+    );
+}
+
+/// RED, characterised honestly: a client that still sends the OLD wire
+/// shape — a nested `author` object, forging a different identity — no
+/// longer reaches the handler at all. `RecordOperationRequest` now
+/// derives `#[serde(deny_unknown_fields)]`, so Axum's `Json` extractor
+/// rejects the request during deserialization, before
+/// `record_operation` runs, with a PLAIN-TEXT (not JSON) body —
+/// `dispatch_raw` is used rather than `dispatch` because the rejection
+/// body is not valid JSON and `dispatch` would panic trying to parse
+/// it. Pinned here exactly as it manifests: a client-error status with
+/// a body naming the rejected field, never a 200 with the forged
+/// author silently dropped.
+#[tokio::test]
+async fn record_operation_rejects_request_carrying_a_forged_author_field() {
+    let state = make_test_state().await;
+    let session_uuid = Uuid::new_v4();
+    state
+        .timeline
+        .write()
+        .await
+        .update_session_position(
+            timeline_engine::SessionId::new(session_uuid.to_string()),
+            timeline_engine::BranchId::main(),
+            0,
+        )
+        .expect("seeding a fresh session position at branch head must succeed");
+
+    let (status, body) = dispatch_raw(
+        &state,
+        json_post(
+            "/api/timeline/record",
+            json!({
+                "session_id": session_uuid.to_string(),
+                "operation": {
+                    "type": "CreatePrimitive",
+                    "primitive_type": "box",
+                    "parameters": {"width": 1.0, "depth": 1.0, "height": 1.0},
+                },
+                // The pre-fix wire shape: a caller declaring its own
+                // authorship. `deny_unknown_fields` must reject this
+                // outright rather than silently drop the field.
+                "author": {"type": "User", "id": "forged-attacker", "name": "Forged Attacker"},
+            }),
+        ),
+    )
+    .await;
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        status.is_client_error(),
+        "a request carrying a client-supplied 'author' field must be rejected \
+         at the wire-shape boundary (unknown field), not silently accepted; \
+         got status = {status}, body = {text}"
+    );
+    assert!(
+        text.contains("unknown field") && text.contains("author"),
+        "the rejection must name 'author' as the unknown field, so the caller \
+         gets a legible signal rather than an opaque failure; body = {text}"
+    );
+}
+
+/// `POST /api/timeline/branch/create` derives the new branch's
+/// `created_by` from `author_from_auth_info`, the same helper
+/// `record_operation` and `create_checkpoint` use — verified above
+/// end-to-end for `record_operation` (its GREEN test reads the
+/// recorded author back out of `GET /api/timeline/history/main`).
+///
+/// This route's own end-to-end GREEN path is blocked by an UNRELATED
+/// pre-existing defect discovered while writing this test: the
+/// `state.branch_manager` this handler calls (`BranchManager::new()`,
+/// timeline-engine `branch/mod.rs`) never seeds `BranchId::main()`, so
+/// `create_branch` with a default (`main`) parent fails
+/// `BranchNotFound` → 500 before authorship is ever assigned — for ANY
+/// caller, regardless of this slice. (The frontend never hits this
+/// route for a related but distinct reason — see the comment in
+/// `Timeline.tsx`'s `submitBranchCreate` — and uses `POST /api/branches`
+/// / `branches.rs`, which goes through `Timeline::create_branch`
+/// instead, whose own `branches` map DOES seed `main`.) Fixing the
+/// orphaned `BranchManager` wiring is out of scope for authorship
+/// derivation and is not touched here.
+///
+/// `author_from_auth_info`'s mapping logic itself is covered directly
+/// by `author_from_auth_info_tests` in `handlers/timeline.rs`, and this
+/// test still proves the wire-shape half of the AUTHORSHIP-A1 fix for
+/// this route: a client-supplied `author` field is rejected before the
+/// (separately broken) handler body ever runs.
+#[tokio::test]
+async fn create_branch_rejects_request_carrying_a_forged_author_field() {
+    let state = make_test_state().await;
+
+    let (status, body) = dispatch_raw(
+        &state,
+        json_post(
+            "/api/timeline/branch/create",
+            json!({
+                "name": "authorship-a1-forged-branch",
+                "purpose": {"type": "Experiment", "hypothesis": "authorship test"},
+                "author": {"type": "AI", "agent_id": "forged-agent", "model": "forged-model"},
+            }),
+        ),
+    )
+    .await;
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        status.is_client_error(),
+        "a branch-create request carrying a client-supplied 'author' field must \
+         be rejected at the wire-shape boundary, not silently accepted; \
+         got status = {status}, body = {text}"
+    );
+    assert!(
+        text.contains("unknown field") && text.contains("author"),
+        "the rejection must name 'author' as the unknown field; body = {text}"
+    );
+}
+
+/// GREEN: `POST /api/timeline/checkpoint` with ONLY `{name}` — exactly
+/// what the frontend (`Timeline.tsx`'s `handleCheckpoint`) has always
+/// sent — now succeeds. Before this slice `CreateCheckpointRequest`
+/// required `description`, `author_id`, and `author_name` with no
+/// serde defaults, so Axum rejected every real checkpoint request
+/// before `create_checkpoint` ever ran: checkpointing had never worked
+/// through the UI. Removing the client-supplied author fields and
+/// defaulting `description` closes that gap.
+#[tokio::test]
+async fn create_checkpoint_with_frontends_minimal_body_now_succeeds() {
+    let state = make_test_state().await;
+
+    let (status, body) = dispatch(
+        &state,
+        json_post(
+            "/api/timeline/checkpoint",
+            json!({ "name": "Checkpoint from minimal body" }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "a checkpoint request carrying only {{name}} — the frontend's actual \
+         wire shape — must now succeed; body = {body}"
+    );
+}
+
+/// RED, characterised honestly: the old wire shape's `author_id` /
+/// `author_name` fields are now unknown fields on
+/// `CreateCheckpointRequest` (`#[serde(deny_unknown_fields)]`) and must
+/// be rejected by the deserializer, not silently accepted-and-ignored.
+/// `dispatch_raw` is used because the rejection body is plain text.
+#[tokio::test]
+async fn create_checkpoint_rejects_request_carrying_forged_author_fields() {
+    let state = make_test_state().await;
+
+    let (status, body) = dispatch_raw(
+        &state,
+        json_post(
+            "/api/timeline/checkpoint",
+            json!({
+                "name": "forged checkpoint",
+                "description": "attempted impersonation",
+                "author_id": "forged-attacker",
+                "author_name": "Forged Attacker",
+            }),
+        ),
+    )
+    .await;
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        status.is_client_error(),
+        "a checkpoint request carrying client-supplied author_id/author_name \
+         must be rejected at the wire-shape boundary, not silently accepted; \
+         got status = {status}, body = {text}"
+    );
+    assert!(
+        text.contains("unknown field") && text.contains("author_id"),
+        "the rejection must name 'author_id' as the unknown field; body = {text}"
+    );
+}

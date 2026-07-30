@@ -177,7 +177,7 @@ pub struct Checkpoint {
 }
 
 /// Author of an event
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Author {
     /// Human user
     User { id: String, name: String },

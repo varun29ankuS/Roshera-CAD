@@ -829,10 +829,19 @@ impl Timeline {
     /// the api-server seeds every session's position at connect time
     /// (see `handlers/timeline.rs::ensure_session_position_at_head`), so
     /// a missing entry is genuinely a programmer error.
+    ///
+    /// AUTHORSHIP-A1: `author` is a required parameter, not an internal
+    /// default. This function used to hardcode `Author::System` for
+    /// every call regardless of who made the request, which silently
+    /// discarded whatever authorship the caller intended to record.
+    /// Callers must derive `author` from an authenticated principal
+    /// (see `api-server`'s `author_from_auth_info`) rather than trusting
+    /// client-supplied data.
     pub async fn record_operation(
         &self,
         session_id: uuid::Uuid,
         operation: Operation,
+        author: Author,
     ) -> TimelineResult<EventId> {
         let session = SessionId::new(session_id.to_string());
         let position = self
@@ -841,7 +850,7 @@ impl Timeline {
             .map(|p| p.clone())
             .ok_or(TimelineError::SessionNotFound)?;
 
-        self.add_operation(operation, Author::System, position.branch_id)
+        self.add_operation(operation, author, position.branch_id)
             .await
     }
 
@@ -2364,7 +2373,7 @@ mod tests {
         let timeline = Timeline::new(TimelineConfig::default());
         let unknown = uuid::Uuid::new_v4();
         let err = timeline
-            .record_operation(unknown, dummy_create_op())
+            .record_operation(unknown, dummy_create_op(), Author::System)
             .await
             .expect_err("unknown session must error");
         assert!(matches!(err, TimelineError::SessionNotFound));
