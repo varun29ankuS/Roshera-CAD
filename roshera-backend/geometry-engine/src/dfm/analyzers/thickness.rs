@@ -214,12 +214,12 @@ enum Classified {
 /// that corner; the rectangle occupies `[0, s_len] × [0, t_len]` in that
 /// local frame.
 #[derive(Debug, Clone, Copy)]
-struct RectangleShape {
-    origin: Point3,
-    u_dir: Vector3,
-    v_dir: Vector3,
-    s_len: f64,
-    t_len: f64,
+pub(super) struct RectangleShape {
+    pub(super) origin: Point3,
+    pub(super) u_dir: Vector3,
+    pub(super) v_dir: Vector3,
+    pub(super) s_len: f64,
+    pub(super) t_len: f64,
 }
 
 // ---- Tolerances (each documented at its use site in the module docs
@@ -274,7 +274,14 @@ fn canonical_in_plane_basis(normal: Vector3) -> (Vector3, Vector3) {
 /// when the loop is not exactly 4 straight edges forming a closed
 /// rectangle, when it has an inner loop, or when any referenced
 /// edge/curve/vertex fails to resolve.
-fn rectangle_from_outer_loop(
+///
+/// `pub(super)` (not private) since S5:
+/// [`crate::dfm::analyzers::internal_voids`] reuses this EXACT
+/// classification for its own all-planar-rectangular-faces exact-volume
+/// path, rather than re-deriving the same 4-edge/right-angle walk a
+/// second time (the no-copies discipline — same promotion precedent as
+/// [`axial_extent`]'s S4 reuse by `bore.rs`).
+pub(super) fn rectangle_from_outer_loop(
     face: &Face,
     loop_store: &LoopStore,
     edge_store: &EdgeStore,

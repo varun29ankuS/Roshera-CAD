@@ -1,16 +1,17 @@
 //! FDM (fused deposition modeling) rule pack v1 (spec §3.2).
 //!
-//! Ships THREE rules: [`evaluate_overhang`] (`fdm.overhang`, S2),
+//! Ships FOUR rules: [`evaluate_overhang`] (`fdm.overhang`, S2),
 //! [`evaluate_min_wall`] (`fdm.min_wall`, S3, riding [`pair_thickness`]),
-//! and [`evaluate_min_bore`] (`fdm.min_bore`, S4 — this addition, riding
-//! [`bore_metrics`]). The remaining v1 rules (`fdm.trapped_volume`,
-//! `fdm.support_volume`) need `internal_voids` (spec S5) and are out of
-//! scope here.
+//! [`evaluate_min_bore`] (`fdm.min_bore`, S4, riding [`bore_metrics`]), and
+//! [`evaluate_trapped_volume`] (`fdm.trapped_volume`, S5 — this addition,
+//! riding [`internal_voids`]). `fdm.support_volume` stays declared
+//! Unverifiable-by-design per spec §3.2 (needs the shadow-volume boolean
+//! sweep, roadmap §7) and is not implemented as a callable rule here.
 
 use std::collections::BTreeSet;
 
 use crate::dfm::analyzers::{
-    bore_metrics, face_orientation_field, pair_thickness, OrientationOutcome,
+    bore_metrics, face_orientation_field, internal_voids, pair_thickness, OrientationOutcome,
 };
 use crate::dfm::packs::{Rule, RulePack};
 use crate::dfm::provenance::RuleProvenance;
@@ -77,6 +78,26 @@ pub fn min_bore_provenance() -> RuleProvenance {
     }
 }
 
+/// Stable rule id for `fdm.trapped_volume` (spec §3.2: enclosed cavities
+/// trap unremovable support/material for FDM).
+pub const TRAPPED_VOLUME_RULE_ID: &str = "fdm.trapped_volume";
+
+/// Practice-derived provenance for `fdm.trapped_volume` (spec §3.2.1
+/// "known landscape": the additive/DfAM governing lineage — ISO/ASTM 52900
+/// series — covers design *guidelines*, not a specific rule that a fully
+/// enclosed internal void is unprintable; "no enclosed voids" is a
+/// widely-used shop/slicer convention (support material and, for resin/
+/// powder processes, the medium itself cannot be removed from a sealed
+/// cavity), not a cited clause of any edition. Per the module's
+/// non-negotiable discipline, this stays `ShopPractice`.
+pub fn trapped_volume_provenance() -> RuleProvenance {
+    RuleProvenance::ShopPractice {
+        note: "fully enclosed internal voids trap unremovable support material in FDM; \
+               practice-derived, no governing standard"
+            .to_string(),
+    }
+}
+
 /// The FDM pack's declared rule list (spec §3.2) tied to `params` the same
 /// way [`DfmReport`] ties itself to its own params (see
 /// [`crate::dfm::packs::RulePack`]).
@@ -95,6 +116,10 @@ pub fn rule_pack(params: PackParams) -> RulePack {
             Rule {
                 id: MIN_BORE_RULE_ID,
                 provenance: min_bore_provenance(),
+            },
+            Rule {
+                id: TRAPPED_VOLUME_RULE_ID,
+                provenance: trapped_volume_provenance(),
             },
         ],
     }
@@ -595,14 +620,110 @@ pub fn evaluate_min_bore(
     })
 }
 
+/// Evaluate `fdm.trapped_volume` (spec §3.2: any proven fully-enclosed
+/// internal void is a violation for FDM — unremovable support/material)
+/// over `solid_id`, riding [`internal_voids`] (spec S5).
+///
+/// ## Aggregation policy (mirrors [`evaluate_min_bore`]'s own policy,
+/// applied here to a COUNT rather than a magnitude)
+///
+/// Unlike `min_wall`/`min_bore`/`overhang` (threshold comparators on a
+/// measured magnitude), this rule counts proven voids directly: ANY proven
+/// void is a violation (spec's rule, verbatim), so `measured` is the void
+/// COUNT and `limit` is the fixed constant `0.0` — never the void's
+/// `volume` (which is `Option` and whose absence must not silently become
+/// `0.0`, a fabricated "no volume" reading). `witnesses` is the union of
+/// every proven void's shell's OWN faces (a [`crate::dfm::report::Verdict`]
+/// witness is a `FaceRef`, not a `ShellId` — there is no other way to name
+/// a shell-level witness on the wire). Only when there are ZERO proven
+/// voids does an [`UnverifiableReason`] region force the rule to read
+/// `Unverifiable` (never `Pass` — the same honesty theorem every other rule
+/// in this pack applies); a solid with no inner shells at all passes
+/// vacuously (mirrors [`evaluate_min_bore`]'s "no bores found" vacuous
+/// Pass) with an exact, non-fabricated `0.0` margin — no sentinel is
+/// needed here (unlike [`NO_BORE_SENTINEL_DIAMETER`]/[`NO_PAIR_SENTINEL_THICKNESS`]),
+/// since a void COUNT of `0` is already the true, exact vacuous answer, not
+/// a stand-in for a missing real measurement.
+pub fn evaluate_trapped_volume(
+    model: &BRepModel,
+    solid_id: SolidId,
+) -> Result<RuleVerdict, DfmError> {
+    let outcome = internal_voids(model, solid_id)?;
+
+    if !outcome.voids.is_empty() {
+        let mut witness_set: BTreeSet<FaceId> = BTreeSet::new();
+        for void in &outcome.voids {
+            if let Some(shell) = model.shells.get(void.shell) {
+                witness_set.extend(shell.faces.iter().copied());
+            }
+        }
+        let witnesses: Vec<FaceRef> = witness_set.into_iter().collect();
+        return Ok(RuleVerdict {
+            rule: TRAPPED_VOLUME_RULE_ID.to_string(),
+            verdict: Verdict::Violation {
+                witnesses,
+                measured: DfmValue::new(
+                    outcome.voids.len() as f64,
+                    constant_derivation(
+                        "fdm.trapped_volume: count of proven fully-enclosed internal voids",
+                    ),
+                ),
+                limit: DfmValue::new(
+                    0.0,
+                    constant_derivation(
+                        "fdm.trapped_volume threshold: zero enclosed voids permitted (shop \
+                         practice)",
+                    ),
+                ),
+            },
+            provenance: trapped_volume_provenance(),
+        });
+    }
+
+    if !outcome.unverifiable.is_empty() {
+        let mut regions: Vec<FaceRef> = Vec::new();
+        for u in &outcome.unverifiable {
+            if let Some(shell) = model.shells.get(u.shell) {
+                regions.extend(shell.faces.iter().copied());
+            }
+        }
+        regions.sort_unstable();
+        regions.dedup();
+        // Deterministic choice of ONE reason (mirrors every other rule in
+        // this pack): `outcome.unverifiable` is already sorted ascending
+        // by shell id (`internal_voids`'s own contract), so `[0]` is the
+        // lowest-shell-id region's reason.
+        let reason = outcome.unverifiable[0].reason.clone();
+        return Ok(RuleVerdict {
+            rule: TRAPPED_VOLUME_RULE_ID.to_string(),
+            verdict: Verdict::Unverifiable { regions, reason },
+            provenance: trapped_volume_provenance(),
+        });
+    }
+
+    Ok(RuleVerdict {
+        rule: TRAPPED_VOLUME_RULE_ID.to_string(),
+        verdict: Verdict::Pass {
+            margin: DfmValue::new(
+                0.0,
+                constant_derivation("fdm.trapped_volume: no enclosed voids found"),
+            ),
+        },
+        provenance: trapped_volume_provenance(),
+    })
+}
+
 /// The FDM pack's `evaluate()` arm (spec §3.2 params: `nozzle_diameter`,
-/// `build_direction`; defaults 0.4 mm, +Z). Runs all THREE FDM rules —
-/// `fdm.overhang` (S2), `fdm.min_wall` (S3), `fdm.min_bore` (S4) — and
-/// folds across them via [`DfmReport::new`]'s honesty fold.
+/// `build_direction`; defaults 0.4 mm, +Z). Runs all FOUR FDM rules —
+/// `fdm.overhang` (S2), `fdm.min_wall` (S3), `fdm.min_bore` (S4),
+/// `fdm.trapped_volume` (S5) — and folds across them via
+/// [`DfmReport::new`]'s honesty fold. `fdm.trapped_volume` is appended
+/// LAST so existing indexed reads of the first three verdicts stay valid.
 ///
 /// `model`/`solid_id` are required since S4 (`fdm.min_bore` rides
 /// [`bore_metrics`], whose contract is `(model, solid_id)` — see
-/// `analyzers/bore.rs`'s module docs); `faces` is still the
+/// `analyzers/bore.rs`'s module docs; `fdm.trapped_volume` rides
+/// [`internal_voids`], same contract shape); `faces` is still the
 /// caller-enumerated candidate list `evaluate_overhang`/`evaluate_min_wall`
 /// use directly from the model's own stores.
 pub fn evaluate(
@@ -632,12 +753,13 @@ pub fn evaluate(
         &model.surfaces,
     )?;
     let min_bore = evaluate_min_bore(model, solid_id, nozzle_diameter)?;
+    let trapped_volume = evaluate_trapped_volume(model, solid_id)?;
     Ok(DfmReport::new(
         PackParams::Fdm {
             nozzle_diameter,
             build_direction,
         },
-        vec![overhang, min_wall, min_bore],
+        vec![overhang, min_wall, min_bore, trapped_volume],
     ))
 }
 
@@ -1052,13 +1174,16 @@ mod tests {
         );
     }
 
-    /// Full-pack integration (spec §3.2): `evaluate()` now runs all THREE
+    /// Full-pack integration (spec §3.2): `evaluate()` now runs all FOUR
     /// FDM rules on one candidate face set — a thin wall pair (violates
     /// min_wall), a steep overhang face (violates overhang), and a
     /// sub-threshold bore (violates min_bore) — and the report folds
-    /// across all three rules.
+    /// across all four rules. This fixture's solid has NO inner shells
+    /// (built directly from bare stores, one shell), so `fdm.trapped_volume`
+    /// reads a vacuous `Pass` (mirrors `fdm.min_bore`'s own "no bores
+    /// found" vacuous Pass) — the total violation count stays 3, not 4.
     #[test]
-    fn full_pack_evaluate_runs_all_three_rules_and_folds() {
+    fn full_pack_evaluate_runs_all_four_rules_and_folds() {
         use crate::dfm::packs::fixtures::model_with_solid;
         use crate::dfm::report::DfmSummary;
         use crate::math::Point3;
@@ -1132,8 +1257,8 @@ mod tests {
 
         assert_eq!(
             report.verdicts().len(),
-            3,
-            "all three fdm rules must be present"
+            4,
+            "all four fdm rules must be present"
         );
         assert!(matches!(
             report.verdicts()[0].verdict,
@@ -1147,6 +1272,58 @@ mod tests {
             report.verdicts()[2].verdict,
             Verdict::Violation { .. }
         ));
+        assert!(
+            matches!(report.verdicts()[3].verdict, Verdict::Pass { .. }),
+            "fdm.trapped_volume: no inner shells on this fixture -- vacuous Pass, got {:?}",
+            report.verdicts()[3].verdict
+        );
         assert_eq!(report.summary(), DfmSummary::Violations { count: 3 });
+    }
+
+    // ----- fdm.trapped_volume (S5) -----
+
+    /// Hand-computed VIOLATION: a solid with one proven fully-enclosed
+    /// inner shell reads `fdm.trapped_volume` as `Violation`, `measured` =
+    /// exact void count `1.0`, `limit` = `0.0`.
+    #[test]
+    fn enclosed_void_is_exact_violation() {
+        use crate::dfm::analyzers::internal_voids::fixtures::solid_with_enclosed_box_void;
+        let (model, solid_id) = solid_with_enclosed_box_void();
+
+        let verdict = evaluate_trapped_volume(&model, solid_id)
+            .unwrap_or_else(|e| panic!("malformed-input free fixture: {e}"));
+
+        match verdict.verdict {
+            Verdict::Violation {
+                measured, limit, ..
+            } => {
+                assert!(
+                    (measured.value - 1.0).abs() < 1e-9,
+                    "measured = {}",
+                    measured.value
+                );
+                assert!((limit.value - 0.0).abs() < 1e-9, "limit = {}", limit.value);
+            }
+            other => panic!("expected Violation, got {other:?}"),
+        }
+    }
+
+    /// Hand-computed PASS: a through-hole (no inner shells at all, spec's
+    /// own anti-fabrication headline for `internal_voids`) reads
+    /// `fdm.trapped_volume` as a vacuous `Pass` -- a through-hole never
+    /// makes the rule think there is trapped volume to remove.
+    #[test]
+    fn through_hole_passes_trapped_volume_vacuously() {
+        use crate::dfm::analyzers::bore::fixtures::plate_with_through_bore;
+        let (model, solid_id, _bore_face) = plate_with_through_bore(20.0, 20.0, 10.0, 3.0);
+
+        let verdict = evaluate_trapped_volume(&model, solid_id)
+            .unwrap_or_else(|e| panic!("malformed-input free fixture: {e}"));
+
+        assert!(
+            matches!(verdict.verdict, Verdict::Pass { .. }),
+            "expected vacuous Pass, got {:?}",
+            verdict.verdict
+        );
     }
 }

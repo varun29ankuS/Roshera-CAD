@@ -359,15 +359,16 @@ mod tests {
     /// `Pass` — through the FULL path: both analyzers' refusals → each
     /// rule's own aggregation → the committed `DfmReport::new` honesty
     /// fold. Exercises the fold end-to-end through this slice's own code,
-    /// per the executor brief. Since S4 the FDM pack runs THREE rules
-    /// (`fdm.overhang`, `fdm.min_wall`, `fdm.min_bore`) against the same
-    /// lone NURBS face. `fdm.overhang`/`fdm.min_wall` still read
-    /// `Unverifiable` (a NURBS face is unsupported for both), so
-    /// `unverifiable` stays 2 — but `fdm.min_bore` reads `Pass`
-    /// (vacuously: a NURBS face is not even a candidate for
-    /// `bore_face_ids`'s concave-cylinder filter, so `bore_metrics`
-    /// reports zero bores AND zero refusals for it — "no bores found" is
-    /// a legitimate, unverified-nothing Pass, not a missed check).
+    /// per the executor brief. Since S5 the FDM pack runs FOUR rules
+    /// (`fdm.overhang`, `fdm.min_wall`, `fdm.min_bore`, `fdm.trapped_volume`)
+    /// against the same lone NURBS face. `fdm.overhang`/`fdm.min_wall`
+    /// still read `Unverifiable` (a NURBS face is unsupported for both), so
+    /// `unverifiable` stays 2 — `fdm.min_bore` reads `Pass` (vacuously: a
+    /// NURBS face is not even a candidate for `bore_face_ids`'s
+    /// concave-cylinder filter, so `bore_metrics` reports zero bores AND
+    /// zero refusals for it) and `fdm.trapped_volume` ALSO reads `Pass`
+    /// (vacuously: this fixture's solid has no inner shells at all, the
+    /// same shape as `fdm.min_bore`'s own vacuous Pass).
     #[test]
     fn nurbs_only_solid_is_inconclusive_never_pass_through_full_report_path() {
         let (surfaces, faces, loops, edges, curves, face_id) = nurbs_face();
@@ -385,7 +386,7 @@ mod tests {
         )
         .unwrap_or_else(|e| panic!("malformed-input free fixture: {e}"));
 
-        assert_eq!(report.verdicts().len(), 3, "all three FDM rules present");
+        assert_eq!(report.verdicts().len(), 4, "all four FDM rules present");
         assert_eq!(
             report.summary(),
             DfmSummary::Inconclusive { unverifiable: 2 }
@@ -406,6 +407,10 @@ mod tests {
         match &report.verdicts()[2].verdict {
             Verdict::Pass { .. } => {}
             other => panic!("expected Pass (fdm.min_bore, vacuous), got {other:?}"),
+        }
+        match &report.verdicts()[3].verdict {
+            Verdict::Pass { .. } => {}
+            other => panic!("expected Pass (fdm.trapped_volume, vacuous), got {other:?}"),
         }
     }
 

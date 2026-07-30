@@ -149,7 +149,14 @@ pub struct BoreMetricsOutcome {
 /// material-side rule — the same pattern
 /// `readable::dimensions::world_aabb` and `Solid::compute_stats` already
 /// use elsewhere in the tree.
-fn solid_faces(model: &BRepModel, solid_id: SolidId) -> Option<Vec<FaceId>> {
+///
+/// `pub(super)` (not private) since S5: [`crate::dfm::analyzers::blend_radius`]
+/// (`blend_radius`/sharp-corner walk) reuses this EXACT enumeration rather
+/// than re-deriving the same solid→shell→face walk a second time — the
+/// no-copies discipline applies to this helper the same way it applied to
+/// [`axial_extent`](crate::dfm::analyzers::thickness::axial_extent)'s
+/// promotion for S4.
+pub(super) fn solid_faces(model: &BRepModel, solid_id: SolidId) -> Option<Vec<FaceId>> {
     let solid = model.solids.get(solid_id)?;
     let mut shells = vec![solid.outer_shell];
     shells.extend_from_slice(&solid.inner_shells);
