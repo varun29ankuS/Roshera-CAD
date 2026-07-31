@@ -30,11 +30,12 @@ use axum::http::{Method, Request, StatusCode};
 use serde_json::Value;
 use tower::ServiceExt;
 
-/// The five benches + core (spec §Layer 1; open-Q1 resolution: GD&T lives
-/// inside the drawing bench). The registry MUST classify every tool into
+/// The six benches + core (spec §Layer 1; open-Q1 resolution: GD&T lives
+/// inside the drawing bench; `timeline` added 2026-07-31 for history/
+/// branching/certification). The registry MUST classify every tool into
 /// exactly one of these.
 const ALLOWED_BENCHES: &[&str] = &[
-    "core", "sketch", "assembly", "drawing", "analysis", "labels",
+    "core", "sketch", "assembly", "drawing", "analysis", "labels", "timeline",
 ];
 
 /// The complete set of tool names the MCP server exposes today (101 tools).

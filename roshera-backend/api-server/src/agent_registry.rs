@@ -34,11 +34,22 @@ use axum::Json;
 use geometry_engine::operations::ai_operations_registry::OperationsRegistry;
 use serde_json::{json, Value};
 
-/// The five benches + core (spec §Layer 1). Open-Q1 resolution: GD&T lives
+/// The six benches + core (spec §Layer 1). Open-Q1 resolution: GD&T lives
 /// inside the `drawing` bench rather than its own. Progressive-disclosure
 /// category tag; benches optimise attention, they never gate capability
 /// (§3.1) — that contract is enforced in the MCP layer (Slices 2–3), the
 /// registry only carries the classification.
+///
+/// `Timeline` (2026-07-31) covers history/branching/certification — a
+/// distinct concern from geometry creation, and arguably the most distinct
+/// one in this system, since it is the layer that makes everything else
+/// auditable. All 15 tools with that character live here: the ten
+/// 2026-07-31 timeline verbs, the pre-existing `timeline_mould` /
+/// `timeline_scrub`, `rebuild_certificate` (a mould's certificate, not a
+/// shape), `clear_timeline` (resets a timeline branch), and
+/// `bind_parameter_name` (names a mould target — same #64 family as
+/// `rebuild_certificate`). Carved out of `Core`, which the timeline
+/// agent-surface slice had filed everything under by precedent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Bench {
     Core,
@@ -47,6 +58,7 @@ pub enum Bench {
     Drawing,
     Analysis,
     Labels,
+    Timeline,
 }
 
 impl Bench {
@@ -58,6 +70,7 @@ impl Bench {
             Bench::Drawing => "drawing",
             Bench::Analysis => "analysis",
             Bench::Labels => "labels",
+            Bench::Timeline => "timeline",
         }
     }
 }
@@ -683,7 +696,7 @@ fn raw_tools() -> Vec<ToolSpec> {
         ),
         t(
             "timeline_mould",
-            Core,
+            Timeline,
             Experimental,
             Curated,
             "Edit a recorded parameter and re-derive the model (#64 parametric DAG); the edit is appended as a param.mould override event.",
@@ -701,7 +714,7 @@ fn raw_tools() -> Vec<ToolSpec> {
         ),
         t(
             "bind_parameter_name",
-            Core,
+            Timeline,
             Experimental,
             Curated,
             "Bind a stable name to a recorded (event, parameter) so a mould can target it by name (#64 Slice 3).",
@@ -718,7 +731,7 @@ fn raw_tools() -> Vec<ToolSpec> {
         ),
         t(
             "rebuild_certificate",
-            Core,
+            Timeline,
             Experimental,
             Curated,
             "The honest per-feature rebuild certificate for a branch's current state (#64 Slice 5): Rebuilt/Unaffected/Failed/Dangling/Blocked.",
@@ -730,7 +743,7 @@ fn raw_tools() -> Vec<ToolSpec> {
         ),
         t(
             "timeline_scrub",
-            Core,
+            Timeline,
             Experimental,
             Curated,
             "Look at the scene as of a past event — non-destructive; returns object count + mesh stats at that moment.",
@@ -745,7 +758,7 @@ fn raw_tools() -> Vec<ToolSpec> {
         ),
         t(
             "clear_timeline",
-            Core,
+            Timeline,
             Stable,
             Curated,
             "Reset a timeline branch to zero events and wipe the live model to match — destructive and irreversible.",
@@ -760,7 +773,7 @@ fn raw_tools() -> Vec<ToolSpec> {
         // parallel-work substrate (branch/merge/conflicts). ──
         t(
             "timeline_history",
-            Core,
+            Timeline,
             Experimental,
             Curated,
             "Read a branch's recorded design history in sequence order (id, kind, author, affected parts); page with start/limit.",
@@ -777,7 +790,7 @@ fn raw_tools() -> Vec<ToolSpec> {
         ),
         t(
             "timeline_branch",
-            Core,
+            Timeline,
             Experimental,
             Curated,
             "Fork a timeline branch before speculative work (isolated event-log lane; live scene stays shared); authorship records the agent.",
@@ -795,7 +808,7 @@ fn raw_tools() -> Vec<ToolSpec> {
         ),
         t(
             "timeline_branches",
-            Core,
+            Timeline,
             Experimental,
             Curated,
             "List timeline branches (state, author, agent_id, event counts, fork point); filter by state or agent_id.",
@@ -810,7 +823,7 @@ fn raw_tools() -> Vec<ToolSpec> {
         ),
         t(
             "timeline_switch",
-            Core,
+            Timeline,
             Experimental,
             Curated,
             "Switch the kernel's recording branch: subsequent geometry ops append their events to this branch (process-global).",
@@ -824,7 +837,7 @@ fn raw_tools() -> Vec<ToolSpec> {
         ),
         t(
             "timeline_merge",
-            Core,
+            Timeline,
             Experimental,
             Curated,
             "Merge a branch into a target: typed conflict witnesses on refusal, statistics + the target's rebuild certificate on success.",
@@ -842,7 +855,7 @@ fn raw_tools() -> Vec<ToolSpec> {
         ),
         t(
             "timeline_conflicts",
-            Core,
+            Timeline,
             Experimental,
             Curated,
             "Read-only merge preview: branch relationship (up_to_date/fast_forward/divergent) + the exact typed conflicts a three-way merge would report.",
@@ -857,7 +870,7 @@ fn raw_tools() -> Vec<ToolSpec> {
         ),
         t(
             "timeline_checkpoint",
-            Core,
+            Timeline,
             Experimental,
             Curated,
             "Record a named checkpoint capturing a branch's event range — a stable landmark to scrub back to or cite in review.",
@@ -873,7 +886,7 @@ fn raw_tools() -> Vec<ToolSpec> {
         ),
         t(
             "timeline_checkpoints",
-            Core,
+            Timeline,
             Experimental,
             Curated,
             "List named design states (checkpoints): id, name, description, captured event range, author, timestamp.",
@@ -881,7 +894,7 @@ fn raw_tools() -> Vec<ToolSpec> {
         ),
         t(
             "timeline_undo",
-            Core,
+            Timeline,
             Experimental,
             Curated,
             "Step the agent's timeline cursor back one operation and re-derive the live model; honest {can_undo:false} at the beginning.",
@@ -889,7 +902,7 @@ fn raw_tools() -> Vec<ToolSpec> {
         ),
         t(
             "timeline_redo",
-            Core,
+            Timeline,
             Experimental,
             Curated,
             "Step the agent's timeline cursor forward one operation (after undo) and re-derive the live model.",
@@ -1904,6 +1917,7 @@ fn build_registry() -> Value {
         Bench::Drawing,
         Bench::Analysis,
         Bench::Labels,
+        Bench::Timeline,
     ] {
         let n = tools
             .iter()
@@ -1941,7 +1955,7 @@ mod tests {
     #[test]
     fn every_tool_has_an_allowed_bench_and_unique_name() {
         let allowed = [
-            "core", "sketch", "assembly", "drawing", "analysis", "labels",
+            "core", "sketch", "assembly", "drawing", "analysis", "labels", "timeline",
         ];
         let tools = raw_tools();
         let mut seen = std::collections::HashSet::new();
@@ -1962,10 +1976,15 @@ mod tests {
         // the kernel-served registry entry mirroring roshera-mcp's new
         // `dfm_check` tool (src/tools/inspect.ts) and REST route
         // POST /api/agent/parts/{id}/dfm.
-        // 101: the timeline agent-surface slice (2026-07-31) added 10 Core /
+        // 101: the timeline agent-surface slice (2026-07-31) added 10
         // Experimental timeline verbs (history, branch, branches, switch,
         // merge, conflicts, checkpoint, checkpoints, undo, redo) mirroring
-        // roshera-mcp src/tools/timeline.ts.
+        // roshera-mcp src/tools/timeline.ts. Filed under Core at first by
+        // precedent (timeline_mould/timeline_scrub already were); reclassified
+        // to the dedicated Timeline bench in the same-day bench-hygiene pass,
+        // along with the rest of the history/branching/certification family
+        // (rebuild_certificate, clear_timeline, bind_parameter_name) — 15
+        // tools total in Timeline, none left in Core.
         assert_eq!(tools.len(), 101, "expected 101 tools, got {}", tools.len());
     }
 

@@ -4,9 +4,13 @@
 // compiled dist/ directly (build first: `npm run build`).
 //
 //   S3 WORKBENCH
-//     (w1) status shape        — {active_bench, exposed_count, token_bill, benches}
+//     (w1) status shape        — {active_bench, exposed_count, token_bill, benches};
+//                                 pinned per-bench tool counts (surface drift)
+//     (w1b) timeline switchable— 'timeline' (2026-07-31) is a real bench, not just
+//                                 a classification: SWITCHABLE_BENCHES, pre-mount,
+//                                 enter()/exit() all cover it
 //     (w2) switch changes set  — entering a bench exposes it, retires the previous
-//     (w3) ≤35 in every bench  — live surface ceiling holds for all 5 + core_only
+//     (w3) ≤36 in every bench  — live surface ceiling holds for all 6 + core_only
 //     (w4) transition mechanics— apply(enable,disable) fires the right tool sets
 //     (w5) invoke reaches      — a bench tool invokes while its bench is INACTIVE
 //   S4 cad_program
@@ -66,12 +70,71 @@ console.log("(w1) WORKBENCH status shape");
 
   // benches map carries a count for every switchable bench.
   const missing = SWITCHABLE_BENCHES.filter((b) => typeof st.benches[b] !== "number");
-  if (missing.length === 0) pass(`benches map counts all 5 benches: ${SWITCHABLE_BENCHES.map((b) => `${b}:${st.benches[b]}`).join(" ")}`);
+  if (missing.length === 0) pass(`benches map counts all ${SWITCHABLE_BENCHES.length} benches: ${SWITCHABLE_BENCHES.map((b) => `${b}:${st.benches[b]}`).join(" ")}`);
   else fail(`benches map missing counts for: ${missing.join(", ")}`);
+
+  // Exact per-bench tool-count pins — a tool added/removed/reclassified must
+  // fail loudly here, not just leave "some number present". `timeline`
+  // (2026-07-31 bench-hygiene pass) carries all 15 history/branching/
+  // certification tools: the 12 timeline_* verbs + rebuild_certificate +
+  // clear_timeline + bind_parameter_name.
+  const EXPECTED_BENCH_COUNTS = {
+    sketch: 14,
+    assembly: 12,
+    drawing: 8,
+    analysis: 13,
+    labels: 10,
+    timeline: 15,
+  };
+  for (const [bench, expected] of Object.entries(EXPECTED_BENCH_COUNTS)) {
+    const got = st.benches[bench];
+    if (got === expected) pass(`bench '${bench}' pinned count: ${got}`);
+    else fail(`bench '${bench}' count ${got}, expected pinned ${expected}`);
+  }
 
   if (st.exposed_count === MINIMAL_SURFACE.length)
     pass(`core_only exposed_count = ${st.exposed_count} = MINIMAL_SURFACE (${MINIMAL_SURFACE.length})`);
   else fail(`core_only exposed_count ${st.exposed_count} ≠ MINIMAL_SURFACE ${MINIMAL_SURFACE.length}`);
+}
+
+console.log("(w1b) WORKBENCH: 'timeline' is switchable (history/branching/certification bench)");
+{
+  const { workbench } = buildTableWithControls();
+
+  if (SWITCHABLE_BENCHES.includes("timeline"))
+    pass("SWITCHABLE_BENCHES includes 'timeline'");
+  else fail(`SWITCHABLE_BENCHES missing 'timeline': ${SWITCHABLE_BENCHES.join(",")}`);
+
+  const timelineTools = workbench.benchToolNames("timeline");
+  if (timelineTools.length === 15)
+    pass(`timeline bench holds exactly 15 tools: ${timelineTools.join(",")}`);
+  else fail(`timeline bench holds ${timelineTools.length} tools, expected 15: ${timelineTools.join(",")}`);
+
+  // index.ts pre-mounts every switchable-bench tool (disabled) at startup so a
+  // later enable() has a real handle to flip — a tool missing from this set
+  // would report switched=true while nothing actually becomes live.
+  const preMounted = new Set(workbench.allSwitchableBenchTools());
+  const allPreMounted = timelineTools.every((n) => preMounted.has(n));
+  if (allPreMounted) pass("all 15 timeline tools are in allSwitchableBenchTools() (pre-mount set)");
+  else fail(`timeline tools missing from allSwitchableBenchTools(): ${timelineTools.filter((n) => !preMounted.has(n)).join(",")}`);
+
+  const r = workbench.enter("timeline");
+  const exposed = new Set(workbench.exposedNames());
+  const timelineExposed = timelineTools.every((n) => exposed.has(n));
+  const coreStill = MINIMAL_SURFACE.every((n) => exposed.has(n));
+  if (timelineExposed && coreStill && r.switched)
+    pass(`enter('timeline') exposes ${timelineTools.length} timeline tools on top of core+meta (switched=true)`);
+  else fail(`enter('timeline') did not expose timeline tools on top of core: switched=${r.switched}`);
+
+  if (r.exposed_count === MINIMAL_SURFACE.length + 15)
+    pass(`timeline exposed_count = ${r.exposed_count} = MINIMAL_SURFACE(${MINIMAL_SURFACE.length}) + 15`);
+  else fail(`timeline exposed_count ${r.exposed_count} ≠ ${MINIMAL_SURFACE.length + 15}`);
+
+  const back = workbench.enter("core_only");
+  const afterCore = new Set(workbench.exposedNames());
+  if (setEq([...afterCore], MINIMAL_SURFACE) && back.active_bench === "core_only")
+    pass("core_only retires the timeline bench back to exactly core+meta");
+  else fail(`core_only did not retire timeline: ${[...afterCore].length} tools`);
 }
 
 console.log("(w2) WORKBENCH switch changes the exposed set");
@@ -109,7 +172,7 @@ console.log("(w2) WORKBENCH switch changes the exposed set");
   else fail(`switch notice missing honesty caveat: ${sketchRes.notice}`);
 }
 
-console.log("(w3) WORKBENCH ≤35 live-surface ceiling in every bench");
+console.log("(w3) WORKBENCH ≤36 live-surface ceiling in every bench");
 {
   const { workbench } = buildTableWithControls();
   for (const bench of [...SWITCHABLE_BENCHES, "core_only"]) {
