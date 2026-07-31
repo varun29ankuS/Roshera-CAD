@@ -258,6 +258,26 @@ const SOUNDNESS_FULL = card('soundness', {
   volume: 12406.9,
 })
 
+const SOUNDNESS_UNSOUND = card('soundness', {
+  part: 'bore fitting',
+  sound: false,
+  brep_valid: true,
+  watertight: false,
+  manifold: true,
+  self_intersection_free: true,
+  construction_consistent: true,
+  labels_consistent: true,
+  tessellation_clean: true,
+  mesh_quality_clean: true,
+  eyes_consistent: false,
+  euler_characteristic: 1,
+  open_edges: 6,
+  nonmanifold_edges: 0,
+  face_count: 14,
+  volume: 8021.4,
+  errors: ['6 open edges on face 9 — boundary loop does not close after the last fillet'],
+})
+
 const SOUNDNESS_PARTIAL = card('soundness', {
   part: 'flanged nozzle',
   sound: null,
@@ -340,6 +360,11 @@ const CARD_FIXTURES: Array<{ title: string; note: string; source: string }> = [
     title: 'Soundness — full certificate',
     note: 'Every invariant proven; χ = 2, no open edges.',
     source: SOUNDNESS_FULL,
+  },
+  {
+    title: 'Soundness — unsound (proven violations)',
+    note: 'watertight and dual-eye consistency FAIL — the red cross, not just the green tick and the dashed not-run.',
+    source: SOUNDNESS_UNSOUND,
   },
   {
     title: 'Soundness — partial (tri-state)',

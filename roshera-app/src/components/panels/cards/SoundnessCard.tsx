@@ -1,7 +1,7 @@
 import { ShieldCheck } from 'lucide-react'
 import type { SoundnessCard as SoundnessCardData } from '@/lib/blackboard-cards'
-import { CardShell, Chip, KV, TriState, type CardAccent } from './card-chrome'
-import { fmtNum } from './format'
+import { CardShell, Chip, Claim, KV, type CardAccent } from './card-chrome'
+import { eulerGenus, fmtNum } from './format'
 
 /**
  * SOUNDNESS CERTIFICATE CARD
@@ -30,6 +30,7 @@ export function SoundnessCard({ card }: { card: SoundnessCardData }) {
   const sound = card.sound ?? null
   const accent: CardAccent = sound === true ? 'pass' : sound === false ? 'fail' : 'neutral'
   const notRun = INVARIANTS.filter(([k]) => (card[k] ?? null) === null).length
+  const genus = card.euler_characteristic != null ? eulerGenus(card.euler_characteristic) : null
 
   return (
     <CardShell
@@ -50,10 +51,20 @@ export function SoundnessCard({ card }: { card: SoundnessCardData }) {
         )
       }
     >
-      <div className="mt-1.5 flex flex-wrap gap-1">
-        {INVARIANTS.map(([key, label]) => (
-          <TriState key={key} label={label} value={(card[key] ?? null) as boolean | null} />
-        ))}
+      <div className="mt-1.5 flex flex-col gap-0.5">
+        {INVARIANTS.map(([key, label]) => {
+          const value = (card[key] ?? null) as boolean | null
+          return (
+            <Claim
+              key={key}
+              status={value}
+              title={value === null ? `${label}: not run — not-run is not a pass` : `${label}: ${value ? 'proven' : 'FAILED'}`}
+            >
+              {label}
+              {value === null && <span className="text-muted-foreground/70"> — not run</span>}
+            </Claim>
+          )
+        })}
       </div>
 
       <div className="mt-1.5 grid grid-cols-2 gap-x-4 gap-y-0.5">
@@ -67,11 +78,21 @@ export function SoundnessCard({ card }: { card: SoundnessCardData }) {
         {card.face_count != null && <KV label="faces">{fmtNum(card.face_count)}</KV>}
         {card.volume != null && <KV label="volume">{fmtNum(card.volume)} mm³</KV>}
       </div>
+      {card.euler_characteristic != null &&
+        card.watertight === true &&
+        card.manifold === true &&
+        genus !== null && (
+          <div className="mt-0.5 text-[10px] text-muted-foreground/80">
+            genus {genus} — closed orientable surface, g = (2 − χ) / 2
+          </div>
+        )}
 
       {card.errors != null && card.errors.length > 0 && (
-        <div className="mt-1.5 space-y-0.5 text-[11px] text-red-400/90">
+        <div className="mt-1.5 flex flex-col gap-0.5">
           {card.errors.map((e, i) => (
-            <div key={i}>{e}</div>
+            <Claim key={i} status={false}>
+              {e}
+            </Claim>
           ))}
         </div>
       )}

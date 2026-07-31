@@ -1,5 +1,5 @@
 import katex from 'katex'
-import { PenLine, ShieldCheck } from 'lucide-react'
+import { Check, CircleSlash, PenLine, ShieldCheck, X } from 'lucide-react'
 import type { FcfCard as FcfCardData } from '@/lib/blackboard-cards'
 import {
   characteristicSymbol,
@@ -162,35 +162,44 @@ export function FcfCard({ card }: { card: FcfCardData }) {
       {verdict !== undefined && (
         <div className="mt-1.5 space-y-0.5 text-[11px]">
           {conforms === 'in_spec' && (
-            <div className="text-emerald-400">
-              IN SPEC
-              {measured !== null && (
-                <span className="text-foreground/80">
-                  {' '}
-                  — measured <span className="cad-readout">{measured}</span>
-                  {residual !== null && <> , fit residual {residual}</>}
-                </span>
-              )}
+            <div className="flex items-baseline gap-1.5 text-emerald-600 dark:text-emerald-400">
+              <Check size={11} className="shrink-0 translate-y-px" />
+              <span>
+                IN SPEC
+                {measured !== null && (
+                  <span className="text-foreground/80">
+                    {' '}
+                    — measured <span className="cad-readout">{measured}</span>
+                    {residual !== null && <> , fit residual {residual}</>}
+                  </span>
+                )}
+              </span>
             </div>
           )}
           {conforms === 'out_of_spec' && (
-            <div className="text-red-400">
-              OUT OF SPEC
-              {measured !== null && (
-                <span className="text-foreground/80">
-                  {' '}
-                  — measured <span className="cad-readout">{measured}</span>
-                  {residual !== null && <> , fit residual {residual}</>}
-                </span>
-              )}
+            <div className="flex items-baseline gap-1.5 text-red-600 dark:text-red-400">
+              <X size={11} className="shrink-0 translate-y-px" />
+              <span>
+                OUT OF SPEC
+                {measured !== null && (
+                  <span className="text-foreground/80">
+                    {' '}
+                    — measured <span className="cad-readout">{measured}</span>
+                    {residual !== null && <> , fit residual {residual}</>}
+                  </span>
+                )}
+              </span>
             </div>
           )}
           {conforms === 'not_evaluable' && (
-            <div className="text-amber-400">
-              NOT EVALUABLE
-              {verdict.reason && (
-                <span className="text-foreground/80"> — {verdict.reason}</span>
-              )}
+            <div className="flex items-baseline gap-1.5 text-amber-600 dark:text-amber-400">
+              <CircleSlash size={11} className="shrink-0 translate-y-px" />
+              <span>
+                NOT EVALUABLE
+                {verdict.reason && (
+                  <span className="text-foreground/80"> — {verdict.reason}</span>
+                )}
+              </span>
             </div>
           )}
           {danglingDatums.length > 0 && (

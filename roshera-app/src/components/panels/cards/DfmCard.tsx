@@ -1,4 +1,4 @@
-import { FlaskConical } from 'lucide-react'
+import { Check, CircleSlash, FlaskConical, X } from 'lucide-react'
 import type {
   DfmCard as DfmCardData,
   DfmCardValue,
@@ -119,12 +119,16 @@ export function DfmCard({ card }: { card: DfmCardData }) {
       title={<span className="cad-readout">{card.rule}</span>}
       chip={
         v.kind === 'pass' ? (
-          <Chip accent="pass">pass — proven</Chip>
+          <Chip accent="pass">
+            <Check size={9} /> pass — proven
+          </Chip>
         ) : v.kind === 'violation' ? (
-          <Chip accent="fail">violation — proven</Chip>
+          <Chip accent="fail">
+            <X size={9} /> violation — proven
+          </Chip>
         ) : (
           <Chip accent="warn" title="An honest refusal to decide — not an error, and never folded to a pass">
-            unverifiable
+            <CircleSlash size={9} /> unverifiable
           </Chip>
         )
       }

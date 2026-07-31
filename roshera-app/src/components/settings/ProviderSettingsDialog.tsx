@@ -9,8 +9,8 @@ import {
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
-import { Badge } from '@/components/ui/badge'
 import { cn } from '@/lib/utils'
+import { VendorMark } from '@/components/settings/vendor-marks'
 import {
   deleteProvider,
   getProviderStatus,
@@ -38,6 +38,18 @@ const CLI_KEY_FOR_PROVIDER: Record<string, 'claude' | 'codex'> = {
  * (`ai-integration/src/providers/allowlist.rs`, mirrored verbatim in
  * `lib/provider-api.ts`) and lets the user select and configure a mode.
  *
+ * ## Layout (2026-07-31 redesign)
+ * A row of vendor marks is the primary control — you recognise a logo
+ * faster than you read a heading. Selecting one swaps a SINGLE options
+ * panel underneath for that vendor only (no accordion, no second list of
+ * every mode across every vendor). Each mode is one scannable line: a
+ * label plus a short status (`✓ signed in`, `needs a key`, `not yet
+ * wired`); the old paragraph-length reasons live in `title` tooltips, not
+ * as standing prose. There is exactly one model control in the whole
+ * dialog — it lives inside this one panel, never duplicated in a second
+ * "connected" card, so there is never more than one model input mounted
+ * at a time.
+ *
  * The fetch-and-reset-on-open logic runs from the trigger button's
  * `onClick` (a real event handler), not a `useEffect` keyed on `open` —
  * `react-hooks/set-state-in-effect` (this project's eslint config)
@@ -46,14 +58,20 @@ const CLI_KEY_FOR_PROVIDER: Record<string, 'claude' | 'codex'> = {
  * the fetch belongs there.
  *
  * Honesty rules this component enforces (never relaxed for a nicer demo):
- *   - A `seam_only` mode renders visibly disabled with its stated reason —
- *     never selectable as if it served inference.
- *   - `subscription_cli` NEVER gets a credential field. It's a status row
- *     (signed in / not signed in / unknown) plus an explicit note that
- *     saving it spawns a local process on this machine, gated on consent.
+ *   - A `seam_only` mode renders visibly disabled with its stated reason
+ *     on hover — never selectable as if it served inference, and a vendor
+ *     logo never implies partnership/endorsement, only identification.
+ *   - `subscription_cli` NEVER gets a credential field. It's a status
+ *     line (signed in / not signed in / unknown) plus an explicit consent
+ *     checkbox — saving it spawns a local process on this machine.
  *   - An `api_key` mode cannot be saved until `POST /api/ai/provider/test`
  *     has returned `ok: true` for the key currently in the box — editing
  *     the key after a successful test invalidates that test.
+ *   - The model field is a dropdown of common aliases (`default`, `opus`,
+ *     `sonnet`, `haiku`) plus `Custom…` for anything else, always paired
+ *     with a line saying these are suggestions, not a verified menu — an
+ *     API key and a Max subscription do not necessarily serve the same
+ *     models, and the exact name is only confirmed server-side.
  *   - If the backend hasn't shipped this endpoint yet (404/405/network),
  *     the dialog says so plainly. It never renders fabricated allowlist
  *     data to look like a working settings page.
@@ -67,28 +85,58 @@ type LoadState =
 
 const MODE_LABELS: Record<CredentialMode, string> = {
   api_key: 'API key',
-  oauth_profile: 'OAuth profile (CLI login)',
+  oauth_profile: 'OAuth profile',
   workload_identity: 'Workload identity',
-  subscription_cli: 'Subscription (local CLI)',
+  subscription_cli: 'Max/Pro subscription',
 }
 
-function wiringBadge(entry: ModeEntry) {
-  if (entry.wiring.status === 'wired') {
-    return (
-      <Badge className="h-4 border-emerald-500/40 bg-emerald-500/10 px-1.5 text-[10px] text-emerald-400">
-        wired
-      </Badge>
-    )
+// Short form for the one-line "connected" readout at the top of the dialog.
+const MODE_SHORT_LABELS: Record<CredentialMode, string> = {
+  api_key: 'API key',
+  oauth_profile: 'CLI profile',
+  workload_identity: 'workload identity',
+  subscription_cli: 'Max/Pro subscription',
+}
+
+// The model field: a dropdown of common Claude aliases plus a free-text
+// escape hatch. NOT presented as a verified availability list — which
+// models a credential can actually serve isn't knowable in advance (an API
+// key and a Max subscription don't necessarily serve the same set), so the
+// caption under the control says so explicitly and every value still goes
+// through the backend's live validation before it is treated as active.
+const CUSTOM_MODEL = '__custom__'
+const MODEL_PRESETS: { value: string; label: string }[] = [
+  { value: '', label: "default (provider's choice)" },
+  { value: 'opus', label: 'opus' },
+  { value: 'sonnet', label: 'sonnet' },
+  { value: 'haiku', label: 'haiku' },
+]
+
+/** One scannable line per mode: a label plus a short, honest status — the
+ *  paragraph-length reasons this used to render standing move to `title`
+ *  tooltips at the call site instead. */
+function modeStatus(
+  info: ProviderStatusResponse,
+  entry: ModeEntry,
+  provider: AllowlistedProvider,
+): { text: string; className: string } {
+  if (entry.wiring.status !== 'wired') {
+    return { text: 'not yet wired', className: 'text-muted-foreground' }
   }
-  return (
-    <Badge
-      variant="secondary"
-      className="h-4 border-dashed border-border px-1.5 text-[10px] text-muted-foreground"
-      title={entry.wiring.reason}
-    >
-      not yet wired
-    </Badge>
-  )
+  const isActiveMode =
+    info.active?.provider === provider.id && info.active?.mode === entry.mode
+  if (entry.mode === 'subscription_cli') {
+    const cli = info.cli[CLI_KEY_FOR_PROVIDER[provider.id]]
+    if (!cli) return { text: 'status unknown', className: 'text-muted-foreground' }
+    if (!cli.installed) return { text: 'CLI not detected', className: 'text-amber-400/90' }
+    return cli.signed_in
+      ? { text: '✓ signed in', className: 'text-emerald-400' }
+      : { text: 'not signed in', className: 'text-amber-400/90' }
+  }
+  if (isActiveMode) return { text: '✓ configured', className: 'text-emerald-400' }
+  if (entry.mode === 'api_key') return { text: 'needs a key', className: 'text-muted-foreground' }
+  if (entry.mode === 'oauth_profile') return { text: 'CLI login', className: 'text-muted-foreground' }
+  return { text: 'from environment', className: 'text-muted-foreground' }
 }
 
 export function ProviderSettingsButton() {
@@ -98,6 +146,11 @@ export function ProviderSettingsButton() {
   const [selectedMode, setSelectedMode] = useState<CredentialMode | null>(null)
   const [apiKey, setApiKey] = useState('')
   const [model, setModel] = useState('')
+  // Whether the model field is in "Custom…" mode. Tracked separately from
+  // `model` itself: selecting "Custom…" with an empty box must keep showing
+  // the free-text field, which a derivation from `model === ''` alone can't
+  // tell apart from the `default` preset also being empty.
+  const [modelCustom, setModelCustom] = useState(false)
   const [testedFor, setTestedFor] = useState<{ apiKey: string; model: string } | null>(null)
   const [testResult, setTestResult] = useState<{ ok: boolean; message?: string } | null>(null)
   const [testing, setTesting] = useState(false)
@@ -105,15 +158,28 @@ export function ProviderSettingsButton() {
   const [saving, setSaving] = useState(false)
   const [saveError, setSaveError] = useState<string | null>(null)
   const [clearing, setClearing] = useState(false)
-  const [showChooser, setShowChooser] = useState(false)
-  // Inline model editor on the Connected card — the discoverable seam for
-  // "there is no way to select a model" (the field existed, buried inside
-  // the full reconfigure-a-provider panel below, which reads as "connect
-  // something new" rather than "tweak what's already connected"). Reuses
-  // the SAME `model`/`apiKey`/`consent`/`canSave`/`save` state and
-  // validate-then-save rules as that panel — this is a second entry point
-  // onto the identical mechanism, never a shortcut around it.
-  const [modelEditing, setModelEditing] = useState(false)
+
+  /** Sets `model` and derives `modelCustom` from whether it matches a
+   *  known preset — the single place external data (load, provider switch)
+   *  is allowed to set the model field, so the dropdown and the free-text
+   *  box never fall out of sync with each other. */
+  function applyModel(next: string) {
+    setModel(next)
+    setModelCustom(!MODEL_PRESETS.some((p) => p.value === next))
+    setTestResult(null)
+  }
+
+  /** Selects a vendor logo: swaps the options panel to that provider's
+   *  modes, defaulting to its first wired mode (falling back to its first
+   *  mode at all, so a seam-only-only provider still shows something). */
+  function selectProvider(provider: AllowlistedProvider) {
+    setSelectedProviderId(provider.id)
+    const wired = provider.modes.find((m) => m.wiring.status === 'wired')
+    setSelectedMode((wired ?? provider.modes[0])?.mode ?? null)
+    setTestResult(null)
+    setTestedFor(null)
+    setSaveError(null)
+  }
 
   const load = () => {
     setState({ phase: 'loading' })
@@ -130,7 +196,9 @@ export function ProviderSettingsButton() {
       if (res.data.active) {
         setSelectedProviderId(res.data.active.provider)
         setSelectedMode(res.data.active.mode as CredentialMode)
-        setModel(res.data.active.model ?? '')
+        applyModel(res.data.active.model ?? '')
+      } else if (res.data.allowlist.length > 0) {
+        selectProvider(res.data.allowlist[0])
       }
     })
   }
@@ -154,12 +222,11 @@ export function ProviderSettingsButton() {
     setOpen(true)
     setApiKey('')
     setModel('')
+    setModelCustom(false)
     setTestedFor(null)
     setTestResult(null)
     setConsent(false)
     setSaveError(null)
-    setShowChooser(false)
-    setModelEditing(false)
     load()
   }
 
@@ -172,6 +239,9 @@ export function ProviderSettingsButton() {
   )
   const cliDetection: CliDetection | undefined =
     selectedProviderId && data ? data.cli[CLI_KEY_FOR_PROVIDER[selectedProviderId]] : undefined
+  const activeProviderMeta: AllowlistedProvider | undefined = data?.allowlist.find(
+    (p) => p.id === data.active?.provider,
+  )
   const isConfigured =
     data?.active?.provider === selectedProviderId &&
     data?.active?.mode === selectedMode &&
@@ -237,8 +307,6 @@ export function ProviderSettingsButton() {
       setSaveError(res.kind === 'unavailable' ? 'Clear endpoint not available yet.' : res.message)
       return
     }
-    setSelectedProviderId(null)
-    setSelectedMode(null)
     load()
   }
 
@@ -280,6 +348,16 @@ export function ProviderSettingsButton() {
   const providerServing =
     state.phase === 'ready' && (state.data.active !== null || state.data.ai_configured)
 
+  const modelSelectValue = modelCustom ? CUSTOM_MODEL : model
+  // Green is reserved for the model that is ACTIVE — currently saved and in
+  // use for this exact provider+mode — never for whatever is merely
+  // highlighted while browsing. `null` when the panel open right now isn't
+  // the active config at all, so nothing in it reads as active.
+  const activeModelValue: string | null =
+    data?.active?.provider === selectedProviderId && data?.active?.mode === selectedMode
+      ? (data.active.model ?? '')
+      : null
+
   return (
     <>
       <button
@@ -317,14 +395,14 @@ export function ProviderSettingsButton() {
         </span>
       </button>
       <Dialog open={open} onOpenChange={setOpen}>
-      <DialogContent className="sm:max-w-lg">
+      <DialogContent className="sm:max-w-xl">
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
             AI provider
           </DialogTitle>
           <DialogDescription>
-            Choose which LLM provider Roshera talks to. Only server-allowlisted providers and
-            modes are ever offered here.
+            Pick a provider by its mark, then choose how Roshera authenticates. Only
+            server-allowlisted providers and modes are ever offered here.
           </DialogDescription>
         </DialogHeader>
 
@@ -349,379 +427,299 @@ export function ProviderSettingsButton() {
         )}
 
         {data && (
-          <div className="flex max-h-[60vh] flex-col gap-4 overflow-y-auto pr-1">
+          <div className="flex max-h-[60vh] flex-col gap-3 overflow-y-auto pr-1">
+            {/* Connected readout — one line, never a card of transport
+                prose. The interactive controls for changing any of this
+                live in the panel below, never duplicated up here. */}
             {data.active && (
-              <div className="rounded-md border border-emerald-500/40 bg-emerald-500/5 px-3 py-3">
-                <div className="flex items-center gap-2 text-sm font-medium text-emerald-600 dark:text-emerald-400">
-                  <CheckCircle2 size={15} />
-                  Connected
-                </div>
-                <div className="mt-1 text-xs text-foreground/90">
-                  {data.active.provider} ·{' '}
-                  {MODE_LABELS[data.active.mode as CredentialMode] ?? data.active.mode}
-                </div>
-                {/* Model — always visible and inline-editable right here on
-                    the Connected card (not buried in the reconfigure panel
-                    below). `null`/absent reads as the provider's own default
-                    choice, never a fabricated name. `model_verified: false`
-                    (subscription_cli only) is shown as an explicit caveat —
-                    it was accepted, never checked against the live CLI. */}
-                <div className="mt-1 flex flex-wrap items-center gap-1.5 text-[11px] text-muted-foreground">
-                  <span>Model:</span>
-                  {!modelEditing ? (
-                    <>
-                      <span className="text-foreground/90">
-                        {data.active.model ? data.active.model : 'provider default'}
-                      </span>
-                      {data.active.model && data.active.model_verified === false && (
-                        <span
-                          className="text-amber-400/90"
-                          title="Accepted but not checked against the live provider at save time"
-                        >
-                          (unverified)
-                        </span>
-                      )}
-                      {data.active.model && data.active.model_verified === true && (
-                        <span className="text-emerald-400/90">(verified)</span>
-                      )}
-                      <button
-                        type="button"
-                        className="text-[10px] text-primary underline underline-offset-2 hover:text-primary/80"
-                        onClick={() => {
-                          setModelEditing(true)
-                          setModel(data.active?.model ?? '')
-                          setApiKey('')
-                          setTestResult(null)
-                          setTestedFor(null)
-                          setConsent(false)
-                          setSaveError(null)
-                        }}
-                      >
-                        change
-                      </button>
-                    </>
-                  ) : (
-                    <>
-                      <Input
-                        value={model}
-                        onChange={(e) => {
-                          setModel(e.target.value)
-                          setTestResult(null)
-                        }}
-                        placeholder="default (provider's own choice)"
-                        className="h-6 w-36 text-[11px]"
-                        autoComplete="off"
-                      />
-                      {selectedMode === 'api_key' && (
-                        <>
-                          <Input
-                            type="password"
-                            value={apiKey}
-                            onChange={(e) => {
-                              setApiKey(e.target.value)
-                              setTestResult(null)
-                            }}
-                            placeholder="API key (re-enter to verify)"
-                            className="h-6 w-36 text-[11px]"
-                            autoComplete="off"
-                          />
-                          <Button
-                            variant="outline"
-                            size="sm"
-                            className="h-6 px-1.5 text-[10px]"
-                            disabled={!apiKey || testing}
-                            onClick={() => void runTest()}
-                          >
-                            {testing ? 'Testing…' : 'Test'}
-                          </Button>
-                        </>
-                      )}
-                      {selectedEntry?.spawns_local_process && (
-                        <label className="flex items-center gap-1 text-[10px]">
-                          <input
-                            type="checkbox"
-                            checked={consent}
-                            onChange={(e) => setConsent(e.target.checked)}
-                          />
-                          consent
-                        </label>
-                      )}
-                      <Button
-                        size="sm"
-                        className="h-6 px-1.5 text-[10px]"
-                        disabled={!canSave || saving}
-                        onClick={() => void save().then(() => setModelEditing(false))}
-                      >
-                        {saving ? 'Saving…' : 'Save'}
-                      </Button>
-                      <button
-                        type="button"
-                        className="text-[10px] text-muted-foreground underline underline-offset-2"
-                        onClick={() => {
-                          setModelEditing(false)
-                          setModel(data.active?.model ?? '')
-                          setTestResult(null)
-                          setSaveError(null)
-                        }}
-                      >
-                        cancel
-                      </button>
-                    </>
-                  )}
-                </div>
-                {modelEditing && testResult && (
-                  <p
-                    className={cn(
-                      'mt-0.5 text-[10px]',
-                      testResult.ok ? 'text-emerald-400' : 'text-red-400',
-                    )}
-                  >
-                    {testResult.message ?? (testResult.ok ? 'Key works.' : 'Key failed.')}
-                  </p>
-                )}
-                {modelEditing && saveError && (
-                  <p className="mt-0.5 text-[10px] text-red-400">{saveError}</p>
-                )}
-                {/* What it actually serves. `ai_configured` covers the /api/ai
-                    REST routes only, which the CLI transport deliberately does
-                    not carry — saying "not serving" there would be false. */}
-                <div className="mt-0.5 text-[11px] text-muted-foreground">
-                  Serves the agent surface
-                  {data.ai_configured ? ' and the AI REST routes.' : '. AI REST routes need an API key.'}
-                </div>
-                <div className="mt-2.5 flex gap-2">
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    className="h-7 px-2.5 text-[11px]"
-                    disabled={clearing}
-                    onClick={() => void clear()}
-                  >
-                    {clearing ? 'Disconnecting…' : 'Disconnect'}
-                  </Button>
-                  {!showChooser && (
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      className="h-7 px-2.5 text-[11px]"
-                      onClick={() => {
-                        setShowChooser(true)
-                        setModelEditing(false)
-                      }}
-                    >
-                      Change provider
-                    </Button>
-                  )}
-                </div>
+              <div className="flex items-center justify-between gap-2 rounded-md border border-emerald-500/40 bg-emerald-500/5 px-3 py-1.5">
+                <span className="flex flex-wrap items-center gap-1 text-[11px] text-foreground/90">
+                  <VendorMark
+                    providerId={data.active.provider}
+                    displayName={activeProviderMeta?.display_name ?? data.active.provider}
+                    className="h-3.5 w-3.5"
+                  />
+                  <CheckCircle2 size={12} className="text-emerald-500" />
+                  <span className="font-medium">
+                    {activeProviderMeta?.display_name ?? data.active.provider}
+                  </span>
+                  <span className="text-muted-foreground">
+                    · {MODE_SHORT_LABELS[data.active.mode as CredentialMode] ?? data.active.mode}
+                    {' · model: '}
+                    {data.active.model ? data.active.model : 'default'}
+                    {data.active.model && data.active.model_verified === false && ' (unverified)'}
+                    {data.active.model && data.active.model_verified === true && ' (verified)'}
+                  </span>
+                </span>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-6 shrink-0 px-2 text-[11px]"
+                  disabled={clearing}
+                  onClick={() => void clear()}
+                >
+                  {clearing ? 'Disconnecting…' : 'Disconnect'}
+                </Button>
               </div>
             )}
 
-            {/* Once connected the list stays folded away: the common case is
-                checking or disconnecting, not re-reading every mode. */}
-            {(showChooser || !data.active) &&
-              data.allowlist.map((provider) => (
-              <div key={provider.id}>
-                <div className="mb-1 text-xs font-medium text-foreground/90">
-                  {provider.display_name}
-                </div>
-                <div className="space-y-1">
-                  {provider.modes.map((entry) => {
-                    const active =
-                      selectedProviderId === provider.id && selectedMode === entry.mode
+            {/* Vendor marks — the primary control, sized to say so: the
+                clearly largest thing in the dialog, in their own brand
+                colours (vendor-marks.tsx), with real clear-space so a
+                12-vendor allowlist just wraps to a second row rather than
+                cramming. Recognise the logo, not a heading: the selected
+                one lifts and rings at full strength; unselected ones are
+                dimmed, never so faint they read as unavailable — only
+                `seam_only` (below) gets that treatment. The currently
+                active vendor carries a small dot regardless of selection. */}
+            <div className="flex flex-wrap items-start gap-2.5">
+              {data.allowlist.map((provider) => {
+                const isSelected = provider.id === selectedProviderId
+                const isActive = provider.id === data.active?.provider
+                return (
+                  <button
+                    key={provider.id}
+                    type="button"
+                    onClick={() => selectProvider(provider)}
+                    title={provider.display_name}
+                    aria-label={provider.display_name}
+                    aria-pressed={isSelected}
+                    className={cn(
+                      'relative flex h-14 w-14 shrink-0 items-center justify-center rounded-xl border-2 transition-all',
+                      isSelected
+                        ? '-translate-y-0.5 border-primary/70 bg-primary/10 opacity-100 shadow-md'
+                        : 'border-border/50 opacity-70 hover:opacity-100 hover:bg-accent/30',
+                    )}
+                  >
+                    <VendorMark
+                      providerId={provider.id}
+                      displayName={provider.display_name}
+                      className="h-7 w-7"
+                    />
+                    {isActive && (
+                      <span className="absolute -right-1 -top-1 h-2.5 w-2.5 rounded-full bg-emerald-500 ring-2 ring-background" />
+                    )}
+                  </button>
+                )
+              })}
+            </div>
+
+            {/* Selected vendor's options — one vendor at a time, no
+                accordion. Each mode is one scannable line. */}
+            {selectedProvider && (
+              <div className="rounded-md border border-border/60 bg-background/40 p-3">
+                <div className="mb-2 space-y-1">
+                  {selectedProvider.modes.map((entry) => {
+                    const active = selectedMode === entry.mode
                     const disabled = entry.wiring.status !== 'wired'
+                    const status = modeStatus(data, entry, selectedProvider)
                     return (
                       <button
                         key={entry.mode}
                         type="button"
                         disabled={disabled}
                         onClick={() => {
-                          setSelectedProviderId(provider.id)
                           setSelectedMode(entry.mode)
                           setTestResult(null)
                           setTestedFor(null)
                           setSaveError(null)
                         }}
+                        title={entry.wiring.status !== 'wired' ? entry.wiring.reason : entry.reason}
                         className={cn(
-                          'flex w-full flex-col gap-0.5 rounded border px-2 py-1.5 text-left text-xs transition-colors',
+                          'flex w-full items-center justify-between gap-2 rounded border px-2 py-1.5 text-left text-xs transition-colors',
                           disabled
-                            ? 'cursor-not-allowed border-border/40 opacity-60'
+                            ? 'cursor-not-allowed border-dashed border-border/40 opacity-60'
                             : active
                               ? 'border-primary/60 bg-primary/10'
                               : 'border-border hover:bg-accent/30',
                         )}
                       >
-                        <span className="flex items-center gap-1.5">
-                          <span className="font-medium">{MODE_LABELS[entry.mode]}</span>
-                          {wiringBadge(entry)}
+                        <span className="flex items-center gap-1.5 font-medium">
+                          {MODE_LABELS[entry.mode]}
                           {entry.spawns_local_process && (
-                            <span
-                              className="flex items-center gap-0.5 text-[10px] text-amber-400/90"
-                              title="Spawns a local process on this machine"
-                            >
-                              <Terminal size={10} /> local process
-                            </span>
+                            <Terminal
+                              size={10}
+                              className="text-amber-400/90"
+                              aria-label="Spawns a local process on this machine"
+                            />
                           )}
                         </span>
-                        <span className="text-[10px] text-muted-foreground">
-                          {entry.wiring.status === 'seam_only' ? entry.wiring.reason : entry.reason}
-                        </span>
+                        <span className={cn('shrink-0', status.className)}>{status.text}</span>
                       </button>
                     )
                   })}
                 </div>
-              </div>
-            ))}
 
-            {/* Full reconfigure panel (mode pick, credential/CLI/consent
-                inputs, its own Model field): shown for a fresh connection
-                or an explicit "Change provider". While already connected
-                and not reconfiguring, the Connected card's own inline
-                model editor above is the single place to touch the model —
-                this panel staying hidden then is what keeps the dialog
-                from re-growing back to "too wordy". */}
-            {(!data.active || showChooser) &&
-              selectedProvider &&
-              selectedEntry &&
-              selectedEntry.wiring.status === 'wired' && (
-              <div className="rounded-md border border-border/60 bg-background/40 p-3">
-                {isConfigured && (
-                  <p className="mb-2 text-[11px] text-emerald-400">
-                    This is the active configuration.
-                  </p>
-                )}
-
-                {/* Model — shared across every mode. Free text, not a
-                    hardcoded menu: which models a credential can actually
-                    serve isn't knowable in advance (an API key and a Max
-                    subscription don't necessarily serve the same set), so
-                    Roshera asks the live provider to confirm rather than
-                    presenting a guessed list as "available". */}
-                <div className="mb-3 flex flex-col gap-1">
-                  <label className="text-[10px] font-medium text-muted-foreground">
-                    Model
-                  </label>
-                  <Input
-                    placeholder="default (provider's own choice)"
-                    value={model}
-                    onChange={(e) => {
-                      setModel(e.target.value)
-                      setTestResult(null)
-                    }}
-                    className="h-7 text-[11px]"
-                    autoComplete="off"
-                  />
-                  <p className="text-[10px] text-muted-foreground">
-                    Leave blank to use the provider&apos;s own default.{' '}
-                    {selectedMode === 'subscription_cli'
-                      ? 'A custom value here is applied when the session starts and is not checked before then — the Claude Code CLI has no side-effect-free way to verify a model at save time, so an unrecognized model surfaces as a refusal on the session’s first turn, not here.'
-                      : 'A custom value is tested against the live provider before it can be saved — never presented as available without that check.'}
-                  </p>
-                </div>
-
-                {selectedMode === 'api_key' && (
-                  <div className="flex flex-col gap-2">
-                    <Input
-                      type="password"
-                      placeholder="API key"
-                      value={apiKey}
-                      onChange={(e) => {
-                        setApiKey(e.target.value)
-                        setTestResult(null)
-                      }}
-                      autoComplete="off"
-                    />
-                    <div className="flex items-center gap-2">
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        className="h-7 px-2 text-[11px]"
-                        disabled={!apiKey || testing}
-                        onClick={() => void runTest()}
-                      >
-                        {testing ? 'Testing…' : 'Test'}
-                      </Button>
-                      {testResult && (
-                        <span
-                          className={cn(
-                            'flex items-center gap-1 text-[11px]',
-                            testResult.ok ? 'text-emerald-400' : 'text-red-400',
+                {selectedEntry && selectedEntry.wiring.status === 'wired' && (
+                  <div className="flex flex-col gap-2 border-t border-border/40 pt-2">
+                    {selectedMode === 'api_key' && (
+                      <div className="flex flex-col gap-2">
+                        <Input
+                          type="password"
+                          placeholder="API key"
+                          value={apiKey}
+                          onChange={(e) => {
+                            setApiKey(e.target.value)
+                            setTestResult(null)
+                          }}
+                          autoComplete="off"
+                          className="h-7 text-[11px]"
+                        />
+                        <div className="flex items-center gap-2">
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            className="h-7 px-2 text-[11px]"
+                            disabled={!apiKey || testing}
+                            onClick={() => void runTest()}
+                          >
+                            {testing ? 'Testing…' : 'Test'}
+                          </Button>
+                          {testResult && (
+                            <span
+                              className={cn(
+                                'flex items-center gap-1 text-[11px]',
+                                testResult.ok ? 'text-emerald-400' : 'text-red-400',
+                              )}
+                            >
+                              {testResult.ok ? <CheckCircle2 size={12} /> : <XCircle size={12} />}
+                              {testResult.message ?? (testResult.ok ? 'Key works.' : 'Key failed.')}
+                            </span>
                           )}
+                        </div>
+                        <p
+                          className="text-[10px] text-muted-foreground"
+                          title="Roshera never claims a key works without checking it live first."
                         >
-                          {testResult.ok ? <CheckCircle2 size={12} /> : <XCircle size={12} />}
-                          {testResult.message ?? (testResult.ok ? 'Key works.' : 'Key failed.')}
-                        </span>
+                          Validated live before it can be saved.
+                        </p>
+                      </div>
+                    )}
+
+                    {selectedMode === 'subscription_cli' && (
+                      <label
+                        className="flex items-start gap-2 text-[11px] text-muted-foreground"
+                        title="Spawns a local CLI process on this machine and uses your own subscription login — only coherent when the backend and this browser share a machine."
+                      >
+                        <input
+                          type="checkbox"
+                          className="mt-0.5"
+                          checked={consent}
+                          onChange={(e) => setConsent(e.target.checked)}
+                        />
+                        I understand this spawns a local CLI process on this machine
+                      </label>
+                    )}
+
+                    {selectedMode === 'oauth_profile' && (
+                      <p className="text-[11px] text-muted-foreground">
+                        Uses an existing CLI login profile on the backend&apos;s machine — no
+                        credential entered here.
+                      </p>
+                    )}
+
+                    {selectedMode === 'workload_identity' && (
+                      <p className="text-[11px] text-muted-foreground">
+                        Detected from environment variables on the backend&apos;s deployment —
+                        nothing to enter here.
+                      </p>
+                    )}
+
+                    {/* Model — the ONE model control in this dialog, and a
+                        plain, unambiguous picker: no colour, no inline
+                        per-option styling, nothing that could read as
+                        "locked" or already-decided. CHOOSING a model
+                        (this dropdown) and what is actually ACTIVE (the
+                        green line below) are two different facts — until
+                        Save is pressed they can legitimately differ, and
+                        the honest UI shows that instead of collapsing them
+                        into one. Suggestions, not a verified menu: an API
+                        key and a Max subscription don't necessarily serve
+                        the same models, so a chosen value is still checked
+                        live (except subscription_cli, which has no
+                        side-effect-free way to check before session start
+                        — the caption below says so plainly). */}
+                    <div className="flex flex-col gap-1">
+                      <label
+                        htmlFor="provider-model-select"
+                        className="text-[10px] font-medium text-muted-foreground"
+                      >
+                        Model
+                      </label>
+                      <select
+                        id="provider-model-select"
+                        value={modelSelectValue}
+                        onChange={(e) => {
+                          const v = e.target.value
+                          if (v === CUSTOM_MODEL) {
+                            setModelCustom(true)
+                            setTestResult(null)
+                            return
+                          }
+                          setModelCustom(false)
+                          setModel(v)
+                          setTestResult(null)
+                        }}
+                        className="cad-focus h-7 rounded border border-border/60 bg-background/40 px-1.5 text-[11px] text-foreground/90 hover:bg-accent/30"
+                      >
+                        {MODEL_PRESETS.map((p) => (
+                          <option key={p.value || 'default'} value={p.value}>
+                            {p.label}
+                          </option>
+                        ))}
+                        <option value={CUSTOM_MODEL}>Custom…</option>
+                      </select>
+                      {/* What is actually saved and in use for THIS
+                          provider+mode — independent of whatever the
+                          dropdown above currently shows. Absent entirely
+                          when this panel isn't the active configuration at
+                          all (nothing here is running, so no green claim
+                          to make). */}
+                      {activeModelValue !== null && (
+                        <p className="text-[11px] font-medium text-emerald-500">
+                          Active: {activeModelValue ? activeModelValue : "provider's default"}
+                          {activeModelValue &&
+                            selectedMode === 'subscription_cli' &&
+                            data.active?.model_verified === false && (
+                              <span className="ml-1 font-normal text-emerald-500/80">
+                                (unverified — not checked without spawning the CLI)
+                              </span>
+                            )}
+                        </p>
                       )}
+                      {modelCustom && (
+                        <Input
+                          value={model}
+                          onChange={(e) => {
+                            setModel(e.target.value)
+                            setTestResult(null)
+                          }}
+                          placeholder="exact model id"
+                          className="h-7 text-[11px]"
+                          autoComplete="off"
+                        />
+                      )}
+                      <p className="text-[10px] text-muted-foreground">
+                        {selectedMode === 'subscription_cli'
+                          ? 'Suggestions — availability depends on your plan; applied at session start, not checked here.'
+                          : 'Suggestions — availability depends on your plan; the exact name is validated on save.'}
+                      </p>
                     </div>
-                    <p className="text-[10px] text-muted-foreground">
-                      A key must pass a live test before it can be saved — Roshera never claims a
-                      key works without checking.
-                    </p>
+
+                    {saveError && <p className="text-[11px] text-red-400">{saveError}</p>}
+
+                    <div className="flex justify-end">
+                      <Button
+                        size="sm"
+                        className="h-7 px-3 text-[11px]"
+                        disabled={!canSave || saving}
+                        onClick={() => void save()}
+                      >
+                        {saving ? 'Saving…' : isConfigured ? 'Saved' : 'Save'}
+                      </Button>
+                    </div>
                   </div>
                 )}
-
-                {selectedMode === 'subscription_cli' && (
-                  <div className="flex flex-col gap-2">
-                    <div className="flex items-center gap-1.5 text-xs">
-                      {cliDetection == null ? (
-                        <span className="text-muted-foreground">
-                          Sign-in status unknown until connected to the backend.
-                        </span>
-                      ) : !cliDetection.installed ? (
-                        <span className="flex items-center gap-1 text-amber-400">
-                          <XCircle size={12} /> CLI not detected on this machine.
-                        </span>
-                      ) : cliDetection.signed_in ? (
-                        <span className="flex items-center gap-1 text-emerald-400">
-                          <CheckCircle2 size={12} /> {selectedProvider.display_name} (Max/Pro
-                          subscription) — signed in
-                        </span>
-                      ) : (
-                        <span className="flex items-center gap-1 text-amber-400">
-                          <XCircle size={12} /> CLI installed, not signed in — sign in with the CLI
-                          first.
-                        </span>
-                      )}
-                    </div>
-                    <label className="flex items-start gap-2 text-[11px] text-muted-foreground">
-                      <input
-                        type="checkbox"
-                        className="mt-0.5"
-                        checked={consent}
-                        onChange={(e) => setConsent(e.target.checked)}
-                      />
-                      I understand selecting this spawns a local CLI process on this machine and
-                      uses my own subscription login — this is only coherent when the backend and
-                      this browser share a machine.
-                    </label>
-                  </div>
-                )}
-
-                {selectedMode === 'oauth_profile' && (
-                  <p className="text-[11px] text-muted-foreground">
-                    Uses a short-lived OAuth token from a CLI login profile already on the
-                    backend&apos;s machine. No credential is entered here.
-                  </p>
-                )}
-
-                {selectedMode === 'workload_identity' && (
-                  <p className="text-[11px] text-muted-foreground">
-                    Detected from environment variables on the backend&apos;s deployment. Nothing
-                    to enter here.
-                  </p>
-                )}
-
-                {saveError && <p className="mt-2 text-[11px] text-red-400">{saveError}</p>}
-
-                <div className="mt-3 flex justify-end">
-                  <Button
-                    size="sm"
-                    className="h-7 px-3 text-[11px]"
-                    disabled={!canSave || saving}
-                    onClick={() => void save()}
-                  >
-                    {saving ? 'Saving…' : isConfigured ? 'Saved' : 'Save'}
-                  </Button>
-                </div>
               </div>
             )}
           </div>

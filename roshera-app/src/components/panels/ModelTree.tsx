@@ -4,6 +4,7 @@ import { Eye, EyeOff, Trash2, Pencil, Plus, FileText } from 'lucide-react'
 import { useSceneStore, isStandardPlane, type CADObject, type SketchPlane } from '@/stores/scene-store'
 import { useDocModeStore } from '@/stores/doc-mode-store'
 import { useWSStore } from '@/stores/ws-store'
+import { useDocumentStore } from '@/stores/document-store'
 import { sketchApi, type ServerSketchSession } from '@/lib/sketch-api'
 import { createPartDrawing } from '@/lib/drawings-api'
 import { ScrollArea } from '@/components/ui/scroll-area'
@@ -644,13 +645,19 @@ export function ModelTree({
     }
   }, [])
 
+  // `documentEpoch` bumps AFTER an in-place document switch is confirmed
+  // (`stores/document-store.ts`) — treated exactly like a fresh WS connect:
+  // the hierarchy/datums this panel shows belong to whichever document is
+  // now active, and waiting out the 5s poll below would leave the previous
+  // document's parts on screen for up to 5 seconds after switching.
+  const documentEpoch = useDocumentStore((s) => s.epoch)
   useEffect(() => {
     if (wsStatus === 'connected') {
       // Fetch on connect — async to avoid synchronous setState in effect
       void Promise.resolve().then(fetchHierarchy)
       void Promise.resolve().then(fetchDatums)
     }
-  }, [wsStatus, fetchHierarchy, fetchDatums])
+  }, [wsStatus, fetchHierarchy, fetchDatums, documentEpoch])
 
   // Poll for hierarchy updates (pause when tab is hidden)
   useEffect(() => {

@@ -288,12 +288,19 @@ function applyRemoteSnapshot(scope: BlackboardScope, snapshot: BlackboardSnapsho
 let pollTimer: ReturnType<typeof setInterval> | null = null
 let unsubScope: (() => void) | null = null
 
-/** Fetch + reconcile the currently-active scope's notebook. */
-function syncActiveScope(): void {
+/**
+ * Fetch + reconcile the currently-active scope's notebook. Exported so a
+ * document switch can force an immediate re-hydration instead of waiting
+ * up to `POLL_INTERVAL_MS` for the ambient poll to notice the backend's
+ * `active_document` changed underneath it (see `stores/document-store.ts`).
+ * The scope key itself doesn't change on a document switch — the backend
+ * resolves "document" scope against its own global `active_document` — so
+ * this is a plain re-fetch, not a scope swap.
+ */
+export async function syncActiveScope(): Promise<void> {
   const scope = useBlackboardStore.getState().activeScope
-  void fetchSnapshot(scope).then((snap) => {
-    if (snap) applyRemoteSnapshot(scope, snap)
-  })
+  const snap = await fetchSnapshot(scope)
+  if (snap) applyRemoteSnapshot(scope, snap)
 }
 
 /**
@@ -312,14 +319,14 @@ export function installBackendBlackboard(intervalMs: number = POLL_INTERVAL_MS):
 
   // Initial hydration — authoritative document for whatever scope is active
   // at boot (the Document notebook).
-  syncActiveScope()
+  void syncActiveScope()
 
   // Re-hydrate immediately when the active scope changes (the user selected a
   // different part). The store has already painted that scope's local cache;
   // this fetches the authoritative backend document for it.
   if (unsubScope === null) {
     unsubScope = useBlackboardStore.subscribe((state, prev) => {
-      if (state.activeScope !== prev.activeScope) syncActiveScope()
+      if (state.activeScope !== prev.activeScope) void syncActiveScope()
     })
   }
 
