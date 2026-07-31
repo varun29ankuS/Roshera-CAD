@@ -27,6 +27,7 @@
 //!   subscription login. See [`scrub_anthropic_env_for_subscription_mode`].
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::path::{Path, PathBuf};
 
 // ── Env snapshot (captured once, at boot, before any scrub) ───────────
@@ -124,16 +125,34 @@ pub struct StoredProviderConfig {
     /// unverified — see `model_verified`) model ID.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-    /// Whether `model` was proven against the live provider before being
-    /// saved. `None` when `model` is `None` (verification is moot — there
-    /// is no override to distrust). `Some(false)` happens only for
-    /// `subscription_cli`: the Claude Code CLI has no side-effect-free
-    /// synchronous model-listing endpoint this server calls at save time,
-    /// so an explicit model there is accepted but flagged unverified —
-    /// never silently presented as confirmed. See
-    /// `handlers/ai_provider.rs::resolve_requested_model`.
+    /// Whether `model` was proven against the live provider. `None` when
+    /// `model` is `None` (verification is moot — there is no override to
+    /// distrust). For `api_key`/`oauth_profile` this is proven
+    /// synchronously before save (`handlers/ai_provider.rs::resolve_requested_model`)
+    /// and never changes afterward. For `subscription_cli` the Claude
+    /// Code CLI has no side-effect-free synchronous model-listing
+    /// endpoint this server can call from the request path, so save
+    /// starts as `Some(false)` and a bounded background check
+    /// (`verify_subscription_cli_model`) may later flip it to
+    /// `Some(true)` — never silently presented as confirmed before that
+    /// check actually ran. See `model_verification` for the full
+    /// three(-plus-pending)-state detail this boolean can't carry
+    /// (a named rejection reason, or why a check came back
+    /// inconclusive).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_verified: Option<bool>,
+    /// The richer three(-plus-pending)-state outcome for `subscription_cli`
+    /// model verification (see `ModelVerificationState` below this
+    /// struct). `None` when `model` is `None`, or for `api_key`/
+    /// `oauth_profile` (those verify synchronously against the live
+    /// provider before save, and `model_verified` alone already tells
+    /// the whole story for them). This field is what `model_verified`
+    /// can't express on its own: `rejected` names the model and the
+    /// CLI's own reason, `unknown` names why the check itself failed,
+    /// and `pending` says a bounded background check is still running —
+    /// never conflated with a pass or a fail.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_verification: Option<ModelVerificationState>,
     pub saved_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -271,14 +290,154 @@ fn load_stored(path: &Path) -> Option<StoredProviderConfig> {
 // ── CLI detection (read-only; never spawns an interactive login) ──────
 
 /// What we can tell about a vendor CLI without running it: whether the
-/// npm shim exists on disk, and whether its own sign-in marker file is
-/// present. Neither check spawns a process.
+/// npm shim exists on disk, whether a real `CreateProcess`-spawnable
+/// executable could be resolved from it, and whether its own sign-in
+/// marker file is present. Neither check spawns a process.
+///
+/// `path` is NEVER a `.cmd`/`.ps1` shim — Windows' `CreateProcess` cannot
+/// execute a batch/PowerShell wrapper directly (this was the live BLOCKER:
+/// goose spawned `CLAUDE_CODE_COMMAND` verbatim via `CreateProcess`, and a
+/// `.cmd` path there fails with "Failed to spawn"). `path` is `Some` only
+/// when [`resolve_cli_exe`] confirmed a real, present executable; the shim
+/// itself is kept separately in `shim_path` for diagnostics only, never as
+/// a spawn target.
 #[derive(Debug, Clone, Serialize)]
 pub struct CliStatus {
     pub installed: bool,
+    /// The real, directly-spawnable executable — never the npm shim.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    /// The npm shim's own path (`.cmd`), kept for diagnostics/troubleshooting.
+    /// Never a valid `CreateProcess` target — never write this into
+    /// `CLAUDE_CODE_COMMAND` or any other spawn config.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shim_path: Option<String>,
+    /// Set only when `installed` is true and `path` is `None`: names what
+    /// was checked and why no directly-spawnable executable could be
+    /// resolved, so a refusal built from this can cite specifics instead
+    /// of a bare "not found".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolution_note: Option<String>,
     pub signed_in: bool,
+}
+
+/// Outcome of resolving a shim's real, `CreateProcess`-spawnable target.
+struct ExeResolution {
+    exe_path: Option<PathBuf>,
+    unresolved_reason: Option<String>,
+}
+
+/// Resolve the shim's real, directly-spawnable executable.
+///
+/// Two strategies, tried in order:
+///
+/// 1. **Known relative layout** (`known_relative_exe`, when the caller has
+///    one): join it onto the npm prefix and accept it if the file is
+///    actually present. This is the verified Claude Code shape —
+///    `claude.cmd` is only a batch wrapper around
+///    `node_modules\@anthropic-ai\claude-code\bin\claude.exe`, a real ~250
+///    MB native binary (confirmed live 2026-07-31).
+/// 2. **Shim parsing** ([`parse_cmd_shim_for_direct_exe`]): read the `.cmd`
+///    itself and look for a single, unconditionally-invoked `.exe` target.
+///    This is the fallback for a layout that differs from what's hardcoded
+///    above (a future Claude Code repackaging, or any other CLI whose shim
+///    happens to be a direct-binary wrapper the same way).
+///
+/// Neither strategy resolving is a legitimate outcome, not a bug: Codex's
+/// own shim (`codex.cmd`) dispatches through `node.exe` to a `.js` entry
+/// point — there is no single native executable this process can spawn
+/// directly, and guessing at a platform-specific binary name (e.g.
+/// `codex-x86_64-pc-windows-msvc.exe`) would be exactly the kind of
+/// unverified assumption this module's CLI detection exists to avoid. That
+/// case reports `unresolved_reason` honestly instead.
+fn resolve_cli_exe(
+    npm_prefix: &Path,
+    shim_path: &Path,
+    known_relative_exe: Option<&[&str]>,
+) -> ExeResolution {
+    if let Some(segments) = known_relative_exe {
+        let mut candidate = npm_prefix.to_path_buf();
+        for segment in segments {
+            candidate.push(segment);
+        }
+        if candidate.is_file() {
+            return ExeResolution {
+                exe_path: Some(candidate),
+                unresolved_reason: None,
+            };
+        }
+    }
+
+    if let Some(exe) = parse_cmd_shim_for_direct_exe(shim_path) {
+        return ExeResolution {
+            exe_path: Some(exe),
+            unresolved_reason: None,
+        };
+    }
+
+    ExeResolution {
+        exe_path: None,
+        unresolved_reason: Some(format!(
+            "the npm shim at {} does not directly invoke a native executable \
+             this process can spawn (CreateProcess cannot execute a .cmd/.ps1 \
+             shim itself, no known real-binary layout matched, and no \
+             unconditional .exe target could be parsed out of the shim)",
+            shim_path.display()
+        )),
+    }
+}
+
+/// Parse an npm-generated `.cmd` shim for a directly spawnable executable
+/// it unconditionally invokes.
+///
+/// npm's shim generator (`cmd-shim`) emits one of two shapes:
+/// - A **direct-binary shim** (verified live for Claude Code): the body
+///   invokes a single quoted `"%dp0%\...\<name>.exe"` path unconditionally
+///   — this is what this parser resolves.
+/// - A **node-dispatch shim** (most JS-only CLIs, including Codex): the
+///   body branches on whether a local `node.exe` exists (an `IF EXIST`
+///   block) before invoking a `.js` entry point through whichever `node`
+///   it found. `CreateProcess` cannot spawn a `.js` file directly, and
+///   there are two candidate interpreter paths (local vs. `PATH`-resolved
+///   `node`) with no single honest answer — this parser deliberately skips
+///   any line inside a conditional rather than guessing which branch a
+///   real invocation would take.
+///
+/// Read-only: never executes the shim. Returns `None` (not a fabricated
+/// guess) when no unconditional `.exe` target is found, or the resolved
+/// candidate does not actually exist on disk.
+fn parse_cmd_shim_for_direct_exe(cmd_path: &Path) -> Option<PathBuf> {
+    let contents = std::fs::read_to_string(cmd_path).ok()?;
+    let dp0 = cmd_path.parent()?;
+
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        let upper = trimmed.to_ascii_uppercase();
+        // Skip conditional branches entirely — only a line that cannot be
+        // part of an IF/ELSE decision counts as "unconditionally invoked".
+        if upper.starts_with("IF ") || upper.starts_with("ELSE") || upper.contains("EXIST") {
+            continue;
+        }
+        let Some(start) = trimmed.find("\"%dp0%") else {
+            continue;
+        };
+        let rest = &trimmed[start + 1..];
+        let Some(end) = rest.find('"') else {
+            continue;
+        };
+        let quoted = &rest[..end];
+        if !quoted.to_ascii_lowercase().ends_with(".exe") {
+            continue;
+        }
+        let relative = quoted
+            .trim_start_matches("%dp0%")
+            .trim_start_matches(['\\', '/']);
+        let candidate = dp0.join(relative);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 fn detect_cli_at(
@@ -286,9 +445,11 @@ fn detect_cli_at(
     userprofile: Option<&str>,
     shim_name: &str,
     credentials_rel_path: &[&str],
+    known_relative_exe: Option<&[&str]>,
 ) -> CliStatus {
-    let path = appdata.map(|a| Path::new(a).join("npm").join(shim_name));
-    let installed = path.as_deref().map(Path::exists).unwrap_or(false);
+    let npm_prefix = appdata.map(|a| Path::new(a).join("npm"));
+    let shim_path = npm_prefix.as_ref().map(|p| p.join(shim_name));
+    let installed = shim_path.as_deref().map(Path::exists).unwrap_or(false);
 
     let signed_in = userprofile
         .map(|home| {
@@ -300,36 +461,75 @@ fn detect_cli_at(
         })
         .unwrap_or(false);
 
-    CliStatus {
-        installed,
-        path: if installed {
-            path.map(|p| p.display().to_string())
-        } else {
-            None
+    if !installed {
+        return CliStatus {
+            installed: false,
+            path: None,
+            shim_path: None,
+            resolution_note: None,
+            signed_in,
+        };
+    }
+
+    let resolution = match (&npm_prefix, &shim_path) {
+        (Some(prefix), Some(shim)) => resolve_cli_exe(prefix, shim, known_relative_exe),
+        _ => ExeResolution {
+            exe_path: None,
+            unresolved_reason: Some(
+                "APPDATA was unavailable, so no npm prefix could be resolved".to_string(),
+            ),
         },
+    };
+
+    CliStatus {
+        installed: true,
+        path: resolution.exe_path.map(|p| p.display().to_string()),
+        shim_path: shim_path.map(|p| p.display().to_string()),
+        resolution_note: resolution.unresolved_reason,
         signed_in,
     }
 }
 
+/// The relative path, from the npm prefix, to Claude Code's real,
+/// directly-spawnable native binary. Verified live 2026-07-31: `claude.cmd`
+/// is only a batch wrapper (`"%dp0%\node_modules\@anthropic-ai\claude-code\bin\claude.exe" %*`)
+/// around this ~250 MB native executable.
+const CLAUDE_CODE_EXE_RELATIVE: &[&str] = &[
+    "node_modules",
+    "@anthropic-ai",
+    "claude-code",
+    "bin",
+    "claude.exe",
+];
+
 /// Detect the Claude Code CLI: shim at `%APPDATA%\npm\claude.cmd`,
-/// signed-in marker at `~/.claude/.credentials.json`.
+/// signed-in marker at `~/.claude/.credentials.json`. `path` (when
+/// present) is the real `claude.exe`, never the `.cmd` shim — see
+/// [`CliStatus`]'s doc for why that distinction is load-bearing.
 pub fn detect_claude_cli() -> CliStatus {
     detect_cli_at(
         std::env::var("APPDATA").ok().as_deref(),
         std::env::var("USERPROFILE").ok().as_deref(),
         "claude.cmd",
         &[".claude", ".credentials.json"],
+        Some(CLAUDE_CODE_EXE_RELATIVE),
     )
 }
 
 /// Detect the Codex CLI: shim at `%APPDATA%\npm\codex.cmd`, signed-in
-/// marker at `~/.codex/auth.json`.
+/// marker at `~/.codex/auth.json`. No known direct-binary layout is
+/// hardcoded for Codex (verified live: its shim dispatches through
+/// `node.exe` to a `.js` entry point, not a single native executable) — a
+/// present shim whose target `parse_cmd_shim_for_direct_exe` cannot
+/// resolve reports `resolution_note` honestly rather than guessing at a
+/// platform-specific binary name.
 pub fn detect_codex_cli() -> CliStatus {
     detect_cli_at(
         std::env::var("APPDATA").ok().as_deref(),
         std::env::var("USERPROFILE").ok().as_deref(),
         "codex.cmd",
         &[".codex", "auth.json"],
+        None,
     )
 }
 
@@ -464,21 +664,381 @@ fn build_chain(
 
 /// Pin goose's active provider to `claude-code` (NOT `claude-acp`, which
 /// needs an npm adapter this deployment does not install) and point it
-/// at the resolved `claude.cmd` shim. Config reads are live in goose —
-/// no restart needed.
+/// at the resolved, directly-spawnable `claude.exe` — NEVER the `.cmd`
+/// npm shim. Config reads are live in goose — no restart needed.
 ///
 /// Called from the PUT handler only after: (1) the allowlist confirmed
 /// `subscription_cli` is `Wired` for this provider, (2) explicit consent
 /// was supplied in the request body, and (3) CLI detection found the
 /// shim installed and signed in. This function itself performs no
-/// consent or detection checks — it is the mechanical config write.
+/// consent or detection checks beyond the one below — it is otherwise the
+/// mechanical config write.
+///
+/// **Structural enforcement of the CLI-detection invariant.** goose spawns
+/// `CLAUDE_CODE_COMMAND` via `CreateProcess`, which cannot execute a
+/// `.cmd`/`.ps1`/`.bat` wrapper directly — this was the live BLOCKER
+/// ("Failed to spawn Claude CLI command '"...\npm...'"). `detect_claude_cli`
+/// / [`resolve_boot_provider_pin`] already resolve to the real executable,
+/// but this write site is the one place `CLAUDE_CODE_COMMAND` is ever set,
+/// so the extension check belongs HERE too: a caller that (today or after
+/// a future edit) hands this a shim path must be refused by name rather
+/// than silently writing a command Windows cannot spawn.
 pub fn repin_goose_to_claude_code(claude_cli_path: &Path) -> Result<(), String> {
+    if let Some(ext) = claude_cli_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+    {
+        if matches!(ext.as_str(), "cmd" | "ps1" | "bat") {
+            return Err(format!(
+                "refusing to pin CLAUDE_CODE_COMMAND to '{}' — it is a .{ext} \
+                 shim, which Windows' CreateProcess cannot execute directly \
+                 (goose spawns this path as-is); resolve the real executable \
+                 first (see detect_claude_cli / resolve_cli_exe)",
+                claude_cli_path.display()
+            ));
+        }
+    }
     let config = goose::config::Config::global();
     goose::config::set_active_provider(config, "claude-code", "default")
         .map_err(|e| format!("failed to pin goose's active_provider to claude-code: {e}"))?;
     config
         .set_param("CLAUDE_CODE_COMMAND", claude_cli_path.display().to_string())
         .map_err(|e| format!("failed to set CLAUDE_CODE_COMMAND: {e}"))?;
+    Ok(())
+}
+
+// ── Subscription-CLI model verification (bounded, off the request path) ──
+//
+// `subscription_cli` model overrides used to be persisted with
+// `model_verified: false` permanently — the API never actually asked the
+// CLI whether the model exists. That was a reasonable scoping call (it
+// means spawning a subprocess) but not an acceptable permanent answer:
+// the CLI itself is the authority on whether a model name is real
+// (`claude --model <bad-name> -p ... --output-format json` replies with
+// `is_error: true` and a named reason in well under a second — verified
+// live on this machine), so the check belongs here, just not on the PUT
+// request path. `PUT` kicks off this bounded check in the background
+// after the save already returned; `GET` reports whatever the most
+// recent outcome is.
+//
+// No cheaper signal exists: `claude --help` was checked live for a
+// models-list/validate subcommand (none — `agents`, `auth`, `auto-mode`,
+// `doctor`, `gateway`, `install`, `mcp`, `plugin`, `project`,
+// `setup-token`, `ultrareview`, `update` are the only subcommands, none
+// of them enumerate or validate a model name without starting a session).
+// A live `-p`/`--output-format json` round trip is the cheapest available
+// probe, and the rejection path returns fast (the CLI checks the model
+// name before spending any inference budget — observed ~1.9s for a bad
+// name versus ~19s for an accepted one).
+
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::time::Duration;
+
+/// Hard ceiling on the background verification round trip. On timeout
+/// the child is killed (never left orphaned — see [`spawn_and_check`]'s
+/// use of `kill_on_drop`) and the outcome is [`ProbeOutcome::Unknown`],
+/// never a guessed pass or fail.
+const MODEL_VERIFICATION_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// What a single CLI probe produced. Three states, matching the module
+/// doc's honesty requirement: `Verified` only when the CLI actually
+/// accepted the model, `Rejected` only when the CLI explicitly said so
+/// (reason carried verbatim from its own `result` field), `Unknown` for
+/// anything that did not run to a conclusion — a timeout, a spawn
+/// failure, or output this process could not parse. `Unknown` must never
+/// be read as either a pass or a fail by a caller. `pub` (not just
+/// crate-visible) so a test in `handlers::ai_provider` can construct a
+/// fake [`ModelProbe`] without spawning the real CLI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProbeOutcome {
+    Verified,
+    Rejected(String),
+    Unknown(String),
+}
+
+/// Persisted, reportable form of [`ProbeOutcome`] plus the one state a
+/// single probe can never represent on its own: `Pending`, for the
+/// window between "the background check was kicked off" and "it
+/// finished" — `GET` must be able to say that honestly instead of
+/// defaulting to `unknown` (which is reserved for a check that could NOT
+/// run to a conclusion, not one still running) or silently omitting the
+/// field.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum ModelVerificationState {
+    /// The check was kicked off after save and has not completed yet.
+    Pending,
+    /// A live `claude --model <model> -p ... --output-format json` call
+    /// completed with `is_error: false` — the CLI actually accepted this
+    /// model.
+    Verified,
+    /// The CLI explicitly rejected the model. `model` is named so a
+    /// caller never has to cross-reference `active.model` to know what
+    /// failed; `reason` is the CLI's own explanation.
+    Rejected { model: String, reason: String },
+    /// The check could not run to a conclusion — timeout, spawn failure,
+    /// or unparsable CLI output. Never a proxy for `verified` or
+    /// `rejected`.
+    Unknown { reason: String },
+}
+
+/// A CLI probe, abstracted so tests can substitute a fake instead of
+/// spawning the real ~250 MB `claude.exe` binary. Takes the resolved,
+/// directly-spawnable executable path (never a `.cmd`/`.ps1` shim — see
+/// [`resolve_cli_exe`]) and the model name; returns the probe outcome.
+pub type ModelProbe = Arc<
+    dyn Fn(PathBuf, String) -> Pin<Box<dyn Future<Output = ProbeOutcome> + Send>> + Send + Sync,
+>;
+
+/// Parse the CLI's `--output-format json` stdout into a [`ProbeOutcome`].
+/// `is_error: false` → accepted; `is_error: true` → rejected, reason
+/// taken from the CLI's own `result` field (observed live: "There's an
+/// issue with the selected model (<name>). It may not exist or you may
+/// not have access to it. Run --model to pick a different model.");
+/// anything that doesn't parse as JSON, or parses but has no boolean
+/// `is_error`, is `Unknown` — an unrecognized shape is not evidence of
+/// either outcome.
+fn parse_cli_output(stdout: &[u8], stderr: &[u8], exit_code: Option<i32>) -> ProbeOutcome {
+    if stdout.is_empty() {
+        return ProbeOutcome::Unknown(format!(
+            "CLI produced no stdout to verify the model against (exit {:?}): {}",
+            exit_code,
+            String::from_utf8_lossy(stderr).trim()
+        ));
+    }
+    let parsed: serde_json::Value = match serde_json::from_slice(stdout) {
+        Ok(v) => v,
+        Err(e) => {
+            return ProbeOutcome::Unknown(format!(
+                "could not parse the CLI's --output-format json stdout: {e}"
+            ))
+        }
+    };
+    match parsed.get("is_error").and_then(Value::as_bool) {
+        Some(false) => ProbeOutcome::Verified,
+        Some(true) => {
+            let reason = parsed
+                .get("result")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| {
+                    "the CLI reported an error for this model but named no reason".to_string()
+                });
+            ProbeOutcome::Rejected(reason)
+        }
+        None => ProbeOutcome::Unknown(
+            "CLI output parsed as JSON but had no boolean 'is_error' field".to_string(),
+        ),
+    }
+}
+
+/// Spawn the resolved `claude.exe` (never a `.cmd`/`.ps1` shim — the
+/// caller is responsible for that guarantee, exactly as
+/// [`repin_goose_to_claude_code`] requires) with the chosen model and a
+/// trivial prompt, and parse its `--output-format json` reply.
+///
+/// `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` are scrubbed from the
+/// child's environment — same rule as
+/// [`scrub_anthropic_env_for_subscription_mode`]: a spawned CLI must
+/// never silently authenticate with a leftover API key instead of the
+/// user's subscription login. `kill_on_drop(true)` is the orphan
+/// guarantee: if the caller wraps this future in a timeout and the
+/// timeout fires, dropping this future drops the still-owned `Child`
+/// handle, and tokio kills the OS process on that drop — no separate
+/// `.kill()` call is reachable once `wait_with_output` has taken
+/// ownership of `child`, so this is the only mechanism available and it
+/// is unconditional.
+async fn spawn_and_check(cli_path: PathBuf, model: String) -> ProbeOutcome {
+    let mut command = tokio::process::Command::new(&cli_path);
+    command
+        .arg("--model")
+        .arg(&model)
+        .arg("-p")
+        .arg("Reply with exactly: OK")
+        .arg("--output-format")
+        .arg("json")
+        .env_remove("ANTHROPIC_API_KEY")
+        .env_remove("ANTHROPIC_AUTH_TOKEN")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+
+    let child = match command.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            return ProbeOutcome::Unknown(format!(
+                "failed to spawn {} to verify the model: {e}",
+                cli_path.display()
+            ))
+        }
+    };
+
+    match child.wait_with_output().await {
+        Ok(output) => parse_cli_output(&output.stdout, &output.stderr, output.status.code()),
+        Err(e) => ProbeOutcome::Unknown(format!("failed while waiting for the CLI: {e}")),
+    }
+}
+
+/// Apply [`MODEL_VERIFICATION_TIMEOUT`] to a probe future. Split out from
+/// [`spawn_and_check`] so the timeout duration is injectable in tests
+/// (a real `claude.exe` round trip cannot be made to time out on demand
+/// without actually waiting 45s) without needing to fake the process
+/// spawn itself.
+async fn run_probe_with_timeout(
+    probe: impl Future<Output = ProbeOutcome>,
+    timeout: Duration,
+) -> ProbeOutcome {
+    match tokio::time::timeout(timeout, probe).await {
+        Ok(outcome) => outcome,
+        Err(_) => ProbeOutcome::Unknown(format!(
+            "model verification timed out after {}s",
+            timeout.as_secs()
+        )),
+    }
+}
+
+/// The production [`ModelProbe`]: a live, timeout-bounded
+/// `claude.exe` round trip. The only untested-by-necessity piece of this
+/// feature (mirrors [`boot_provider_pin_for`]'s relationship to
+/// [`resolve_boot_provider_pin`]) — everything it calls
+/// ([`parse_cli_output`], [`run_probe_with_timeout`]) is unit-tested on
+/// its own.
+pub fn default_model_probe() -> ModelProbe {
+    Arc::new(|cli_path, model| {
+        Box::pin(run_probe_with_timeout(
+            spawn_and_check(cli_path, model),
+            MODEL_VERIFICATION_TIMEOUT,
+        ))
+    })
+}
+
+/// Run one bounded verification and persist the outcome — the whole
+/// point of doing this off the request path. Called via `tokio::spawn`
+/// from `PUT /api/ai/provider`'s `subscription_cli` branch, strictly
+/// after the save that already returned to the caller; never awaited by
+/// a request handler.
+///
+/// Stale-result guard lives in [`AiProviderManager::update_model_verification`]:
+/// if the model was changed again (a second PUT landed) before this
+/// probe finished, the outcome is discarded rather than clobbering a
+/// newer save with a result for a model that is no longer active.
+pub async fn verify_subscription_cli_model(
+    probe: ModelProbe,
+    cli_path: PathBuf,
+    model: String,
+    manager: Arc<AiProviderManager>,
+) {
+    let outcome: ProbeOutcome = probe(cli_path, model.clone()).await;
+    let state = match outcome {
+        ProbeOutcome::Verified => ModelVerificationState::Verified,
+        ProbeOutcome::Rejected(reason) => ModelVerificationState::Rejected {
+            model: model.clone(),
+            reason,
+        },
+        ProbeOutcome::Unknown(reason) => ModelVerificationState::Unknown { reason },
+    };
+    if let Err(e) = manager.update_model_verification(&model, state).await {
+        tracing::warn!(
+            target: "api_server.ai_provider",
+            error = %e,
+            model = %model,
+            "failed to persist the background model-verification outcome"
+        );
+    }
+}
+
+// ── goose repin, generalized (declarative-provider API-key vendors) ────
+//
+// `repin_goose_to_claude_code` above stays special-cased: it resolves a
+// real spawnable executable and writes `CLAUDE_CODE_COMMAND`, neither of
+// which any other entry needs. The four vendors goose already registers
+// through its declarative-provider system (`crates/goose/src/config/
+// declarative_providers.rs`, wired at `providers/init.rs:220`, bundled
+// JSON at `crates/goose-providers/src/declarative/definitions/
+// {mistral,zhipu,moonshot}.json`) — plus `xai`, a hand-written native
+// provider registered the same way in `providers/init.rs` — only need
+// two things: the API key available where each provider's own
+// credential resolution looks for it, and `active_provider` pinned to
+// its name. Verified against goose's own source (not guessed): every
+// one of these constructs its credential via
+// `Config::get_secret(<KEY>)`, and `Config::get_secret` checks
+// `env::var(&key.to_uppercase())` BEFORE its keyring
+// (`crates/goose/src/config/base.rs::get_secret`) — the exact mechanism
+// that already makes a bare `ANTHROPIC_API_KEY` env var work for goose's
+// built-in `anthropic` provider with no repin at all. Setting the env
+// var here is that same mechanism, generalized — not a new one.
+
+/// Map a Roshera allowlist provider id to the goose provider name it
+/// should be repinned to, and the API-key env var goose's own credential
+/// resolution reads for it. `None` for anything with no goose repin
+/// target: `"anthropic"` needs none (its `api_key`/`oauth_profile` modes
+/// already work via goose's hardcoded default, unchanged by this
+/// module), and `"baseten"` has no goose provider to repin to at all —
+/// see `ai-integration`'s allowlist entry for why.
+fn goose_declarative_provider_for(
+    roshera_provider_id: &str,
+) -> Option<(&'static str, &'static str)> {
+    match roshera_provider_id {
+        "xai" => Some(("xai", "XAI_API_KEY")),
+        "mistral" => Some(("mistral", "MISTRAL_API_KEY")),
+        // Roshera's allowlist id is "glm" (the model family users type);
+        // goose's own declarative-provider name for the same vendor is
+        // "zhipu" (`zhipu.json`'s `"name"` field) — these are
+        // deliberately different strings, not a typo.
+        "glm" => Some(("zhipu", "ZHIPU_API_KEY")),
+        // Roshera's "kimi" is goose's "moonshot"
+        // (`moonshot.json`) — distinct from `kimi_code`, an unrelated
+        // OAuth-device-flow CLI product goose separately supports that
+        // this module does not touch.
+        "kimi" => Some(("moonshot", "MOONSHOT_API_KEY")),
+        _ => None,
+    }
+}
+
+/// Pin goose's `active_provider` to the declarative/native provider
+/// backing `roshera_provider_id`, supplying its API key via the exact
+/// env var that provider's own credential resolution reads (see the
+/// section doc above for why setting the env var — not writing to
+/// goose's keyring — is sufficient and correct).
+///
+/// Called from `PUT /api/ai/provider`'s `api_key`-mode branch, for any
+/// allowlisted provider other than `"anthropic"` (which needs no repin —
+/// see [`goose_declarative_provider_for`]). Refuses by name, never
+/// silently no-ops, when the provider has no known goose repin target —
+/// structurally the same guard `repin_goose_to_claude_code` applies for
+/// a `.cmd` shim: a caller must not be able to mark a provider `Wired`
+/// in the allowlist without this function actually being able to serve
+/// it.
+pub fn repin_goose_to_declarative_provider(
+    roshera_provider_id: &str,
+    api_key: &str,
+    model: Option<&str>,
+) -> Result<(), String> {
+    let (goose_provider_name, api_key_env_var) =
+        goose_declarative_provider_for(roshera_provider_id).ok_or_else(|| {
+            format!(
+                "'{roshera_provider_id}' has no known goose provider to repin to — \
+                 refusing rather than silently leaving goose's active_provider \
+                 unchanged"
+            )
+        })?;
+
+    // Same mechanism already documented for ANTHROPIC_API_KEY: goose's
+    // own `Config::get_secret` checks this process's environment first.
+    // `edition = "2021"` (`api-server/Cargo.toml:4`), so `set_var` needs
+    // no `unsafe` block — that requirement is edition 2024+, same note
+    // already on `scrub_anthropic_env_for_subscription_mode`.
+    std::env::set_var(api_key_env_var, api_key);
+
+    let config = goose::config::Config::global();
+    goose::config::set_active_provider(config, goose_provider_name, model.unwrap_or_default())
+        .map_err(|e| {
+            format!("failed to pin goose's active_provider to {goose_provider_name}: {e}")
+        })?;
     Ok(())
 }
 
@@ -598,6 +1158,37 @@ impl AiProviderManager {
         Ok(acl)
     }
 
+    /// Apply a completed background model-verification outcome —
+    /// [`verify_subscription_cli_model`]'s only write site. Mirrors
+    /// [`Self::save`]'s lock discipline: the blocking file write happens
+    /// with no lock held, then a fresh write-lock acquisition installs
+    /// the result in memory.
+    ///
+    /// Stale-result guard: if `stored.model` no longer equals
+    /// `model_at_request_time` — a newer PUT changed or cleared the
+    /// config while this probe was in flight — the outcome is discarded.
+    /// Applying it anyway would let a slow check for an old model
+    /// silently overwrite the state of whatever is configured now.
+    pub async fn update_model_verification(
+        &self,
+        model_at_request_time: &str,
+        outcome: ModelVerificationState,
+    ) -> Result<(), ProviderConfigError> {
+        let Some(mut cfg) = self.inner.read().await.stored.clone() else {
+            return Ok(());
+        };
+        if cfg.model.as_deref() != Some(model_at_request_time) {
+            return Ok(());
+        }
+        cfg.model_verification = Some(outcome.clone());
+        if outcome == ModelVerificationState::Verified {
+            cfg.model_verified = Some(true);
+        }
+        write_state_file(&self.state_path, &cfg)?;
+        self.inner.write().await.stored = Some(cfg);
+        Ok(())
+    }
+
     /// Remove the persisted config (idempotent — no error if absent).
     pub async fn delete(&self) -> Result<(), ProviderConfigError> {
         if self.state_path.exists() {
@@ -637,6 +1228,7 @@ mod tests {
             profile_name: None,
             model: None,
             model_verified: None,
+            model_verification: None,
             saved_at: chrono::Utc::now(),
         }
     }
@@ -840,9 +1432,12 @@ mod tests {
             Some("C:\\definitely\\does\\not\\exist"),
             "claude.cmd",
             &[".claude", ".credentials.json"],
+            Some(CLAUDE_CODE_EXE_RELATIVE),
         );
         assert!(!status.installed);
         assert!(status.path.is_none());
+        assert!(status.shim_path.is_none());
+        assert!(status.resolution_note.is_none());
         assert!(!status.signed_in);
     }
 
@@ -893,6 +1488,8 @@ mod tests {
         CliStatus {
             installed,
             path: path.map(str::to_string),
+            shim_path: None,
+            resolution_note: None,
             signed_in: true,
         }
     }
@@ -938,14 +1535,20 @@ mod tests {
         // THE proving case: a persisted subscription_cli config must
         // survive a restart — never silently clobbered back to `anthropic`.
         let cfg = stored("subscription_cli", None);
+        // `path` is always the resolved real executable, never the `.cmd`
+        // shim — see `CliStatus`'s doc and `detect_claude_cli`.
         let cli = cli_status(
             true,
-            Some("C:\\Users\\x\\AppData\\Roaming\\npm\\claude.cmd"),
+            Some(
+                "C:\\Users\\x\\AppData\\Roaming\\npm\\node_modules\\@anthropic-ai\\claude-code\\bin\\claude.exe",
+            ),
         );
         assert_eq!(
             resolve_boot_provider_pin(Some(&cfg), &cli),
             BootProviderPin::ClaudeCode {
-                cli_path: PathBuf::from("C:\\Users\\x\\AppData\\Roaming\\npm\\claude.cmd"),
+                cli_path: PathBuf::from(
+                    "C:\\Users\\x\\AppData\\Roaming\\npm\\node_modules\\@anthropic-ai\\claude-code\\bin\\claude.exe",
+                ),
             }
         );
     }
@@ -975,5 +1578,511 @@ mod tests {
             resolve_boot_provider_pin(Some(&cfg), &cli),
             BootProviderPin::Default
         );
+    }
+
+    // --- resolve_cli_exe / parse_cmd_shim_for_direct_exe: the BLOCKER fix ---
+    //
+    // RED before this fix: `detect_cli_at` reported the `.cmd` shim itself
+    // as `path`, and `repin_goose_to_claude_code` wrote that straight into
+    // `CLAUDE_CODE_COMMAND` — goose spawns it via `CreateProcess`, which
+    // cannot execute a `.cmd`, so every agent turn failed with "Failed to
+    // spawn Claude CLI command". These tests pin the resolution logic that
+    // replaces it.
+
+    /// A fresh temp dir standing in for an npm prefix (`%APPDATA%\npm`),
+    /// auto-removed on drop so parallel test runs never collide.
+    struct TempNpmPrefix(PathBuf);
+
+    impl TempNpmPrefix {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "roshera-cli-resolve-{tag}-{}",
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir_all(&dir).expect("temp npm prefix must create");
+            Self(dir)
+        }
+    }
+
+    impl Drop for TempNpmPrefix {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Write a file (and its parent dirs) under `prefix`, relative segments
+    /// joined the same way `resolve_cli_exe` joins `known_relative_exe`.
+    fn write_under(prefix: &Path, segments: &[&str], contents: &str) -> PathBuf {
+        let mut p = prefix.to_path_buf();
+        for s in segments {
+            p.push(s);
+        }
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent).expect("parent dirs must create");
+        }
+        std::fs::write(&p, contents).expect("file must write");
+        p
+    }
+
+    /// The exact verified Claude Code shim body: a single unconditional
+    /// quoted `.exe` invocation.
+    const CLAUDE_CMD_BODY: &str = "@ECHO off\r\nGOTO start\r\n:find_dp0\r\nSET dp0=%~dp0\r\nEXIT /b\r\n:start\r\nSETLOCAL\r\nCALL :find_dp0\r\n\"%dp0%\\node_modules\\@anthropic-ai\\claude-code\\bin\\claude.exe\"   %*\r\n";
+
+    /// The exact verified Codex shim body: an `IF EXIST` node-dispatch,
+    /// never a single unconditional `.exe` target.
+    const CODEX_CMD_BODY: &str = "@ECHO off\r\nGOTO start\r\n:find_dp0\r\nSET dp0=%~dp0\r\nEXIT /b\r\n:start\r\nSETLOCAL\r\nCALL :find_dp0\r\n\r\nIF EXIST \"%dp0%\\node.exe\" (\r\n  SET \"_prog=%dp0%\\node.exe\"\r\n) ELSE (\r\n  SET \"_prog=node\"\r\n  SET PATHEXT=%PATHEXT:;.JS;=;%\r\n)\r\n\r\nendLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & \"%_prog%\"  \"%dp0%\\node_modules\\@openai\\codex\\bin\\codex.js\" %*\r\n";
+
+    #[test]
+    fn resolve_cli_exe_prefers_the_known_relative_layout_when_present() {
+        let prefix = TempNpmPrefix::new("known-layout");
+        let shim = write_under(&prefix.0, &["claude.cmd"], CLAUDE_CMD_BODY);
+        let real_exe = write_under(&prefix.0, CLAUDE_CODE_EXE_RELATIVE, "fake-native-binary");
+
+        let resolution = resolve_cli_exe(&prefix.0, &shim, Some(CLAUDE_CODE_EXE_RELATIVE));
+        assert_eq!(resolution.exe_path, Some(real_exe));
+        assert!(resolution.unresolved_reason.is_none());
+    }
+
+    #[test]
+    fn parse_cmd_shim_for_direct_exe_resolves_an_unconditional_target() {
+        let prefix = TempNpmPrefix::new("cmd-parse");
+        let shim = write_under(&prefix.0, &["claude.cmd"], CLAUDE_CMD_BODY);
+        let real_exe = write_under(&prefix.0, CLAUDE_CODE_EXE_RELATIVE, "fake-native-binary");
+
+        // No known-relative hint — must fall back to parsing the shim body
+        // itself and still land on the real executable.
+        let resolution = resolve_cli_exe(&prefix.0, &shim, None);
+        assert_eq!(resolution.exe_path, Some(real_exe));
+    }
+
+    #[test]
+    fn parse_cmd_shim_for_direct_exe_skips_a_conditional_node_dispatch_shim() {
+        let prefix = TempNpmPrefix::new("node-dispatch");
+        let shim = write_under(&prefix.0, &["codex.cmd"], CODEX_CMD_BODY);
+        // Even with a real node.exe present at the IF-EXIST-checked path,
+        // the parser must not treat a line inside a conditional as an
+        // unconditional invocation.
+        write_under(&prefix.0, &["node.exe"], "fake-node-binary");
+
+        assert_eq!(parse_cmd_shim_for_direct_exe(&shim), None);
+    }
+
+    #[test]
+    fn resolve_cli_exe_reports_an_honest_reason_when_nothing_resolves() {
+        let prefix = TempNpmPrefix::new("unresolved");
+        let shim = write_under(&prefix.0, &["codex.cmd"], CODEX_CMD_BODY);
+
+        // No known-relative layout for Codex (see `detect_codex_cli`'s
+        // doc) — this must never guess a platform-specific binary name.
+        let resolution = resolve_cli_exe(&prefix.0, &shim, None);
+        assert!(resolution.exe_path.is_none());
+        let reason = resolution
+            .unresolved_reason
+            .expect("a shim that resolves to nothing must explain why");
+        assert!(
+            reason.contains("CreateProcess"),
+            "the refusal must name the actual mechanism, not just say 'not found': {reason}"
+        );
+    }
+
+    #[test]
+    fn detect_cli_at_reports_unresolved_reason_on_the_public_cli_status_when_shim_unresolvable() {
+        // End-to-end through the public `detect_cli_at` entry point (not
+        // just the private `resolve_cli_exe` helper): a present shim that
+        // resolves to nothing must surface `installed: true`, `path: None`,
+        // and a populated `resolution_note` — never a silently-empty status
+        // that looks identical to "not installed at all". `detect_cli_at`
+        // joins `appdata.join("npm")` itself, so the shim must live under
+        // an `npm` subdirectory of whatever "appdata" we hand in.
+        let appdata_dir = std::env::temp_dir().join(format!(
+            "roshera-cli-resolve-detect-cli-at-appdata-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let npm_dir = appdata_dir.join("npm");
+        write_under(&npm_dir, &["codex.cmd"], CODEX_CMD_BODY);
+
+        let status = detect_cli_at(
+            appdata_dir.to_str(),
+            Some("C:\\definitely\\does\\not\\exist"),
+            "codex.cmd",
+            &[".codex", "auth.json"],
+            None,
+        );
+        assert!(status.installed);
+        assert!(status.path.is_none());
+        assert!(status.shim_path.is_some());
+        assert!(
+            status.resolution_note.is_some(),
+            "a present-but-unresolvable shim must explain itself, not just \
+             report a missing path with no context"
+        );
+
+        let _ = std::fs::remove_dir_all(&appdata_dir);
+    }
+
+    // --- repin_goose_to_claude_code: the structural write-site guard ---
+    //
+    // Both cases return before touching `goose::config::Config::global()`
+    // (the extension check is the very first thing the function does), so
+    // these are safe to run alongside every other test in this binary —
+    // they never become a second owner of that process-global `OnceCell`
+    // (see `goose_acp`'s own test-module doc on why that singleton
+    // ownership matters).
+
+    #[test]
+    fn repin_goose_to_claude_code_refuses_a_cmd_shim_path() {
+        let err = repin_goose_to_claude_code(Path::new("C:\\fake\\npm\\claude.cmd"))
+            .expect_err("a .cmd path must be refused, never written to CLAUDE_CODE_COMMAND");
+        assert!(
+            err.contains("CreateProcess"),
+            "refusal must name why a .cmd can't be spawned: {err}"
+        );
+        assert!(
+            err.contains("claude.cmd"),
+            "refusal must name what it found: {err}"
+        );
+    }
+
+    #[test]
+    fn repin_goose_to_claude_code_refuses_a_ps1_shim_path() {
+        let err = repin_goose_to_claude_code(Path::new("C:\\fake\\npm\\claude.ps1"))
+            .expect_err("a .ps1 path must be refused the same way as .cmd");
+        assert!(err.contains("CreateProcess"));
+    }
+
+    // --- live, this-machine proof: the hand-patch becomes redundant ---
+
+    #[test]
+    fn detect_claude_cli_on_this_machine_resolves_the_real_exe_never_the_cmd_shim() {
+        // Live (not mocked): proves a FRESH `detect_claude_cli()` call on
+        // this dev machine produces the real, directly-spawnable
+        // `claude.exe` — the exact value Varun's hand-patch of
+        // `state/goose-root/config/config.yaml` was standing in for. If
+        // this passes, the hand-patch is redundant, not load-bearing: the
+        // next boot (or PUT /api/ai/provider) reproduces it on its own.
+        // Skips (rather than fails) when the CLI isn't installed on
+        // whatever machine runs this suite — CI or a fresh checkout.
+        let status = detect_claude_cli();
+        if !status.installed {
+            return;
+        }
+        let path = status
+            .path
+            .as_deref()
+            .expect("installed Claude Code CLI must resolve a real executable on this machine");
+        assert!(
+            path.ends_with("claude-code\\bin\\claude.exe")
+                || path.ends_with("claude-code/bin/claude.exe"),
+            "resolved path must be the real native binary, got: {path}"
+        );
+        assert!(
+            !path.to_ascii_lowercase().ends_with(".cmd"),
+            "must never resolve to the .cmd shim: {path}"
+        );
+    }
+
+    // --- goose_declarative_provider_for / repin_goose_to_declarative_provider:
+    //     the generalized-repin mapping. Only the pure mapping and the
+    //     before-any-Config::global()-touch refusal path are tested here —
+    //     same discipline as `repin_goose_to_claude_code`'s tests, which
+    //     never become a second owner of goose's process-global
+    //     `Config` `OnceCell` (see `goose_acp`'s test-module doc).
+
+    #[test]
+    fn goose_declarative_provider_for_maps_all_four_new_vendors() {
+        assert_eq!(
+            goose_declarative_provider_for("xai"),
+            Some(("xai", "XAI_API_KEY"))
+        );
+        assert_eq!(
+            goose_declarative_provider_for("mistral"),
+            Some(("mistral", "MISTRAL_API_KEY"))
+        );
+        assert_eq!(
+            goose_declarative_provider_for("glm"),
+            Some(("zhipu", "ZHIPU_API_KEY")),
+            "Roshera's 'glm' id must map to goose's own 'zhipu' provider name"
+        );
+        assert_eq!(
+            goose_declarative_provider_for("kimi"),
+            Some(("moonshot", "MOONSHOT_API_KEY")),
+            "Roshera's 'kimi' id must map to goose's own 'moonshot' provider name"
+        );
+    }
+
+    #[test]
+    fn goose_declarative_provider_for_has_no_target_for_anthropic_or_baseten() {
+        assert_eq!(
+            goose_declarative_provider_for("anthropic"),
+            None,
+            "anthropic needs no repin — goose's hardcoded default already reads \
+             ANTHROPIC_API_KEY/ANTHROPIC_AUTH_TOKEN"
+        );
+        assert_eq!(
+            goose_declarative_provider_for("baseten"),
+            None,
+            "baseten has no goose provider to repin to"
+        );
+    }
+
+    #[test]
+    fn repin_goose_to_declarative_provider_refuses_an_unmapped_provider_by_name() {
+        let err = repin_goose_to_declarative_provider("baseten", "fake-key", None)
+            .expect_err("a provider with no goose repin target must be refused");
+        assert!(
+            err.contains("baseten"),
+            "refusal must name the provider it can't repin: {err}"
+        );
+    }
+
+    // --- subscription_cli model verification: parsing, timeout, and the
+    //     end-to-end injectable-probe path — none of these spawn the real
+    //     ~250 MB claude.exe. ---
+
+    #[test]
+    fn parse_cli_output_accepts_is_error_false_as_verified() {
+        let stdout = br#"{"is_error":false,"stop_reason":"end_turn"}"#;
+        assert_eq!(
+            parse_cli_output(stdout, b"", Some(0)),
+            ProbeOutcome::Verified
+        );
+    }
+
+    #[test]
+    fn parse_cli_output_names_the_reason_on_is_error_true() {
+        // The exact shape observed live for `claude --model
+        // this-model-does-not-exist-xyz -p ... --output-format json`.
+        let stdout = br#"{"is_error":true,"api_error_status":404,"result":"There's an issue with the selected model (this-model-does-not-exist-xyz). It may not exist or you may not have access to it. Run --model to pick a different model.","type":"result"}"#;
+        match parse_cli_output(stdout, b"", Some(1)) {
+            ProbeOutcome::Rejected(reason) => {
+                assert!(
+                    reason.contains("issue with the selected model"),
+                    "rejection reason must carry the CLI's own explanation, got: {reason}"
+                );
+            }
+            other => panic!("expected Rejected, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_cli_output_empty_stdout_is_unknown_not_rejected() {
+        match parse_cli_output(b"", b"some crash trace", Some(1)) {
+            ProbeOutcome::Unknown(reason) => {
+                assert!(reason.contains("no stdout"), "got: {reason}");
+            }
+            other => panic!("empty stdout must be Unknown, not {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_cli_output_unparsable_json_is_unknown() {
+        match parse_cli_output(b"not json at all", b"", Some(0)) {
+            ProbeOutcome::Unknown(_) => {}
+            other => panic!("garbage stdout must be Unknown, not {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_cli_output_missing_is_error_field_is_unknown() {
+        match parse_cli_output(br#"{"type":"result"}"#, b"", Some(0)) {
+            ProbeOutcome::Unknown(_) => {}
+            other => panic!("a shape with no is_error field must be Unknown, not {other:?}"),
+        }
+    }
+
+    /// RED before the timeout wrapper existed: a probe future that never
+    /// resolves must produce `Unknown`, never hang the caller forever and
+    /// never be silently read as a pass. `std::future::pending()` stands
+    /// in for a hung CLI process without needing to actually wait out a
+    /// real 45s timeout.
+    #[tokio::test]
+    async fn run_probe_with_timeout_produces_unknown_never_verified_or_rejected() {
+        let outcome = run_probe_with_timeout(
+            std::future::pending::<ProbeOutcome>(),
+            Duration::from_millis(20),
+        )
+        .await;
+        match outcome {
+            ProbeOutcome::Unknown(reason) => {
+                assert!(reason.contains("timed out"), "got: {reason}");
+            }
+            other => panic!("a hung probe must surface as Unknown, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn run_probe_with_timeout_passes_through_a_probe_that_finishes_in_time() {
+        let outcome =
+            run_probe_with_timeout(async { ProbeOutcome::Verified }, Duration::from_secs(5)).await;
+        assert_eq!(outcome, ProbeOutcome::Verified);
+    }
+
+    /// Build a fake [`ModelProbe`] that returns a fixed outcome — the
+    /// injection seam that lets the rest of these tests avoid spawning
+    /// the real CLI binary entirely.
+    fn fake_probe(outcome: ProbeOutcome) -> ModelProbe {
+        Arc::new(move |_cli_path, _model| {
+            let outcome = outcome.clone();
+            Box::pin(async move { outcome })
+        })
+    }
+
+    #[tokio::test]
+    async fn verify_subscription_cli_model_persists_rejected_naming_the_model() {
+        let dir = std::env::temp_dir().join(format!(
+            "roshera-model-verify-rejected-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mgr = Arc::new(AiProviderManager::boot_at(dir.join("ai-provider.json")));
+        let mut cfg = stored("subscription_cli", None);
+        cfg.model = Some("bogus-model-xyz".to_string());
+        cfg.model_verified = Some(false);
+        cfg.model_verification = Some(ModelVerificationState::Pending);
+        mgr.save(cfg).await.expect("save must succeed");
+
+        let probe = fake_probe(ProbeOutcome::Rejected(
+            "There's an issue with the selected model (bogus-model-xyz).".to_string(),
+        ));
+        verify_subscription_cli_model(
+            probe,
+            PathBuf::from("C:\\fake\\claude.exe"),
+            "bogus-model-xyz".to_string(),
+            mgr.clone(),
+        )
+        .await;
+
+        let stored_cfg = mgr.stored().await.expect("config must still be present");
+        match stored_cfg.model_verification {
+            Some(ModelVerificationState::Rejected { model, reason }) => {
+                assert_eq!(model, "bogus-model-xyz");
+                assert!(reason.contains("issue with the selected model"));
+            }
+            other => panic!("expected Rejected naming the model, got {other:?}"),
+        }
+        assert_eq!(
+            stored_cfg.model_verified,
+            Some(false),
+            "a rejection must never flip model_verified to true"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn verify_subscription_cli_model_persists_unknown_on_timeout_never_verified_or_rejected()
+    {
+        let dir = std::env::temp_dir().join(format!(
+            "roshera-model-verify-unknown-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mgr = Arc::new(AiProviderManager::boot_at(dir.join("ai-provider.json")));
+        let mut cfg = stored("subscription_cli", None);
+        cfg.model = Some("opus".to_string());
+        cfg.model_verified = Some(false);
+        cfg.model_verification = Some(ModelVerificationState::Pending);
+        mgr.save(cfg).await.expect("save must succeed");
+
+        // A probe wired straight to the real timeout wrapper with a probe
+        // future that never resolves — proves the whole pipeline
+        // (probe -> verify_subscription_cli_model -> persisted state)
+        // produces Unknown on a timeout, not just the isolated wrapper.
+        let probe: ModelProbe = Arc::new(|_cli_path, _model| {
+            Box::pin(run_probe_with_timeout(
+                std::future::pending::<ProbeOutcome>(),
+                Duration::from_millis(20),
+            ))
+        });
+        verify_subscription_cli_model(
+            probe,
+            PathBuf::from("C:\\fake\\claude.exe"),
+            "opus".to_string(),
+            mgr.clone(),
+        )
+        .await;
+
+        let stored_cfg = mgr.stored().await.expect("config must still be present");
+        match &stored_cfg.model_verification {
+            Some(ModelVerificationState::Unknown { reason }) => {
+                assert!(reason.contains("timed out"), "got: {reason}");
+            }
+            other => panic!("a timed-out probe must persist as Unknown, got {other:?}"),
+        }
+        assert_ne!(
+            stored_cfg.model_verification,
+            Some(ModelVerificationState::Verified)
+        );
+        assert_eq!(
+            stored_cfg.model_verified,
+            Some(false),
+            "unknown must never flip model_verified to true"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn verify_subscription_cli_model_persists_verified_and_flips_model_verified_true() {
+        let dir = std::env::temp_dir().join(format!(
+            "roshera-model-verify-verified-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mgr = Arc::new(AiProviderManager::boot_at(dir.join("ai-provider.json")));
+        let mut cfg = stored("subscription_cli", None);
+        cfg.model = Some("sonnet".to_string());
+        cfg.model_verified = Some(false);
+        cfg.model_verification = Some(ModelVerificationState::Pending);
+        mgr.save(cfg).await.expect("save must succeed");
+
+        verify_subscription_cli_model(
+            fake_probe(ProbeOutcome::Verified),
+            PathBuf::from("C:\\fake\\claude.exe"),
+            "sonnet".to_string(),
+            mgr.clone(),
+        )
+        .await;
+
+        let stored_cfg = mgr.stored().await.expect("config must still be present");
+        assert_eq!(
+            stored_cfg.model_verification,
+            Some(ModelVerificationState::Verified)
+        );
+        assert_eq!(stored_cfg.model_verified, Some(true));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn update_model_verification_discards_a_stale_result_for_a_superseded_model() {
+        // The model changed (a second PUT landed) before the first
+        // probe's background check finished — the stale result must be
+        // discarded, never overwrite the newer save.
+        let dir = std::env::temp_dir().join(format!(
+            "roshera-model-verify-stale-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let mgr = AiProviderManager::boot_at(dir.join("ai-provider.json"));
+        let mut cfg = stored("subscription_cli", None);
+        cfg.model = Some("opus".to_string());
+        mgr.save(cfg.clone()).await.expect("save must succeed");
+
+        // Simulate the newer PUT: model changed to "sonnet" before the
+        // stale "opus" probe reports back.
+        cfg.model = Some("sonnet".to_string());
+        cfg.model_verification = Some(ModelVerificationState::Pending);
+        mgr.save(cfg).await.expect("second save must succeed");
+
+        mgr.update_model_verification("opus", ModelVerificationState::Verified)
+            .await
+            .expect("update must not error even when discarded");
+
+        let stored_cfg = mgr.stored().await.expect("config must still be present");
+        assert_eq!(stored_cfg.model.as_deref(), Some("sonnet"));
+        assert_eq!(
+            stored_cfg.model_verification,
+            Some(ModelVerificationState::Pending),
+            "a stale result for a superseded model must never overwrite the current state"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

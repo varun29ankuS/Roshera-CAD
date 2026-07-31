@@ -82,6 +82,39 @@ fn internal_db_error(action: &str, e: impl std::fmt::Display) -> ApiError {
     ApiError::new(ErrorCode::Internal, format!("failed to {action}: {e}"))
 }
 
+/// Upper bound on a document name — matches the tab/tooltip display
+/// budget. Anything longer is almost certainly a paste accident, not
+/// intent, so it is rejected rather than silently truncated (truncation
+/// would surprise a caller who never sees what got cut).
+const MAX_NAME_LEN: usize = 200;
+
+/// Validate a caller-supplied document name: non-empty after trimming,
+/// under the length cap, and free of control characters (names are shown
+/// verbatim in tabs and tooltips — a literal newline or NUL would corrupt
+/// that rendering). Returns the trimmed name on success.
+fn validate_name(name: &str) -> Result<String, ApiError> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            "document name must not be empty",
+        ));
+    }
+    if trimmed.chars().count() > MAX_NAME_LEN {
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            format!("document name exceeds the {MAX_NAME_LEN}-character limit"),
+        ));
+    }
+    if trimmed.chars().any(|c| c.is_control()) {
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            "document name must not contain control characters",
+        ));
+    }
+    Ok(trimmed.to_string())
+}
+
 /// `POST /api/documents` — register a new, empty document. Does not
 /// activate it; call `POST /api/documents/{id}/open` to make it live.
 pub async fn create_document(
@@ -148,17 +181,95 @@ pub async fn open_document(
         .into_iter()
         .any(|r| r.id == id);
     if !known {
-        return Err(ApiError::new(
-            ErrorCode::DocumentNotFound,
-            format!("document '{id}' is not registered"),
-        )
-        .with_hint(
-            "Call POST /api/documents to create it first, or GET /api/documents \
-             to list known ids.",
-        ));
+        return Err(ApiError::document_not_found(&id));
     }
     let status = activate(&state, &id).await;
     Ok(Json(status))
+}
+
+/// Wire shape for `PATCH /api/documents/{id}`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RenameDocumentRequest {
+    pub name: String,
+}
+
+/// `PATCH /api/documents/{id}` — rename. Validated (non-empty, trimmed,
+/// length-capped, no control characters); 404s on an unknown id, matching
+/// every other document route's refusal for a stale/typo'd id.
+pub async fn rename_document(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<RenameDocumentRequest>,
+) -> Result<Json<DocumentView>, ApiError> {
+    let name = validate_name(&req.name)?;
+    let mut record = state
+        .database
+        .load_documents()
+        .await
+        .map_err(|e| internal_db_error("load documents", e))?
+        .into_iter()
+        .find(|r| r.id == id)
+        .ok_or_else(|| ApiError::document_not_found(&id))?;
+    record.name = name;
+    state
+        .database
+        .save_document(&record)
+        .await
+        .map_err(|e| internal_db_error("save document", e))?;
+    let active_id = state.active_document.read().await.clone();
+    Ok(Json(to_view(record, &active_id)))
+}
+
+/// `DELETE /api/documents/{id}` — the only destructive route in the API.
+/// Genuinely deletes the document's registry row and every row scoped
+/// under its id (`timeline_events`, `durable_branches`), plus its
+/// in-memory Blackboard notebooks (which have no separate durability log,
+/// so purging them here IS their deletion). Refuses:
+///   - an unknown id (404 `DocumentNotFound`)
+///   - the currently active document (409 `DocumentDeleteRefusedActive`)
+///     — deleting what is currently loaded is a foot-gun; switch first.
+///   - the default document (409 `DocumentDeleteRefusedDefault`) — it
+///     carries the pre-existing legacy event ledger; removing it is a
+///     deliberate admin act, not a UI affordance.
+///   - the last remaining document (409 `DocumentDeleteRefusedLast`) —
+///     the app must never be left with zero documents.
+///
+/// The database-layer delete is transactional (one `sqlx` transaction
+/// covering `documents` + `timeline_events` + `durable_branches`): either
+/// every scoped row goes, or none does. Order matters: every refusal is
+/// checked, and the delete only proceeds, BEFORE anything is removed —
+/// there is no partial state to unwind.
+pub async fn delete_document(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let records = state
+        .database
+        .load_documents()
+        .await
+        .map_err(|e| internal_db_error("load documents", e))?;
+    if !records.iter().any(|r| r.id == id) {
+        return Err(ApiError::document_not_found(&id));
+    }
+    if id == durability::DURABILITY_SESSION_ID {
+        return Err(ApiError::document_delete_refused_default(&id));
+    }
+    let active_id = state.active_document.read().await.clone();
+    if id == active_id {
+        return Err(ApiError::document_delete_refused_active(&id));
+    }
+    if records.len() <= 1 {
+        return Err(ApiError::document_delete_refused_last(&id));
+    }
+
+    state
+        .database
+        .delete_document(&id)
+        .await
+        .map_err(|e| internal_db_error("delete document", e))?;
+    state.blackboard.purge_document(&id);
+
+    Ok(Json(serde_json::json!({ "success": true, "id": id })))
 }
 
 /// Make `document_id` the live document: reset every piece of in-memory

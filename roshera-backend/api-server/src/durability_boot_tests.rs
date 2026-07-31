@@ -118,11 +118,22 @@ pub(crate) fn get(uri: &str) -> Request<Body> {
         .expect("request must build")
 }
 
-fn del(uri: &str) -> Request<Body> {
+pub(crate) fn del(uri: &str) -> Request<Body> {
     Request::builder()
         .method(Method::DELETE)
         .uri(uri)
         .body(Body::empty())
+        .expect("request must build")
+}
+
+/// `documents_tests.rs` also needs a PATCH builder (rename) — sibling of
+/// `post`/`get`/`del` above.
+pub(crate) fn patch(uri: &str, payload: Value) -> Request<Body> {
+    Request::builder()
+        .method(Method::PATCH)
+        .uri(uri)
+        .header("content-type", "application/json")
+        .body(Body::from(payload.to_string()))
         .expect("request must build")
 }
 

@@ -409,6 +409,28 @@ impl BlackboardManager {
         self.notebook(document_id, scope).write().await.clear();
     }
 
+    /// Drop every notebook belonging to one document, across every scope
+    /// (`Document`, every `Part`, every `Assembly`). Called by `DELETE
+    /// /api/documents/{id}` after the durable delete commits. The
+    /// Blackboard has no separate durability log — this in-memory removal
+    /// IS the deletion for it, so there is nothing here that can partially
+    /// fail or need rollback.
+    pub fn purge_document(&self, document_id: &str) {
+        let prefix = format!("{document_id}{DOC_SEP}");
+        self.notebooks.retain(|k, _| !k.starts_with(&prefix));
+    }
+
+    /// Whether a (document, scope) notebook currently has an entry in the
+    /// manager. Unlike [`Self::snapshot`] this never lazily creates one —
+    /// it exists purely so tests can distinguish "purged" from "never
+    /// written", which an empty snapshot cannot do (a fresh notebook is
+    /// also empty).
+    #[cfg(test)]
+    pub(crate) fn has_notebook(&self, document_id: &str, scope: &BlackboardScope) -> bool {
+        self.notebooks
+            .contains_key(&Self::storage_key(document_id, scope))
+    }
+
     /// Notebook handles belonging to one document, regardless of scope.
     /// Snapshots the handles first so callers never hold a DashMap shard
     /// guard across an `.await` on the per-notebook `RwLock`.

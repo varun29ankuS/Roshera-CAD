@@ -150,6 +150,12 @@ pub(crate) enum GooseAcpError {
     McpEntryMissing(String),
     #[error("failed to pin goose to the persisted subscription_cli provider at boot: {0}")]
     ProviderPin(String),
+    #[error("failed to write the Sarvam AI custom-provider definition to '{path}': {source}")]
+    CustomProviderWrite {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 /// Resolve `roshera-mcp/dist/index.js`'s absolute path.
@@ -180,6 +186,107 @@ fn resolve_mcp_entry_path() -> Result<PathBuf, GooseAcpError> {
         return Err(GooseAcpError::McpEntryMissing(path.display().to_string()));
     }
     Ok(path)
+}
+
+/// Sarvam AI's confirmed OpenAI-compatible endpoint and credential env var,
+/// taken verbatim from goose's OWN bundled provider catalog —
+/// `goose-provider-types/src/canonical/data/provider_metadata.json`:
+/// `{"id": "sarvam", "display_name": "Sarvam AI", "npm":
+/// "@ai-sdk/openai-compatible", "api": "https://api.sarvam.ai/v1", "env":
+/// ["SARVAM_API_KEY"], ...}`. Not invented: goose does not bundle a
+/// `sarvam.json` *declarative-provider* definition the way it does for
+/// xai/mistral/zhipu/moonshot (`declarative/definitions/`), only this
+/// separate model/endpoint catalog, so the value is otherwise unreachable
+/// without writing it ourselves.
+const SARVAM_BASE_URL: &str = "https://api.sarvam.ai/v1";
+const SARVAM_API_KEY_ENV: &str = "SARVAM_API_KEY";
+
+/// Register Sarvam AI as a goose declarative provider by writing a
+/// definition into `<goose root>/config/custom_providers/sarvam.json` —
+/// the SAME directory goose's own `declarative_providers::load_provider`
+/// and `register_declarative_providers` read (goose crate,
+/// `config/declarative_providers.rs`: `custom_providers_dir()` is
+/// `Paths::config_dir().join("custom_providers")`, checked BEFORE the
+/// bundled `fixed_provider_configs()` set — a custom file with the same
+/// id shadows a bundled one). This is the general, non-code path goose
+/// exposes for any OpenAI-compatible vendor it does not bundle: write one
+/// JSON file into a directory goose already scans, no goose-side patch
+/// required. Must run after [`initialize`] has set `GOOSE_PATH_ROOT` —
+/// `custom_providers_dir()` reads it fresh on every call, so ordering
+/// relative to the `Config::global()` `OnceCell` touch does not matter
+/// here the way it does for the provider pin.
+///
+/// Written unconditionally on every boot (not "only if missing") so the
+/// definition never drifts from what this function declares — the same
+/// convention [`initialize`] already uses for the provider pin below.
+///
+/// This does NOT make Sarvam AI a live inference path by itself: writing
+/// the definition only lets goose's provider registry *construct* a
+/// `sarvam` provider by id when asked. Nothing yet *asks* — Roshera's own
+/// provider repin/selection logic (`ai_provider_config.rs`) only ever
+/// pins `anthropic` or repins to `claude-code`. That is the same
+/// selection gap the allowlist documents for xai/mistral/glm/kimi, whose
+/// goose-bundled definitions are equally unselected today; see the
+/// `sarvam` entry in `ai-integration/src/providers/allowlist.rs`.
+fn write_sarvam_custom_provider_definition() -> Result<(), GooseAcpError> {
+    let dir = goose::config::declarative_providers::custom_providers_dir();
+    std::fs::create_dir_all(&dir).map_err(|source| GooseAcpError::CustomProviderWrite {
+        path: dir.display().to_string(),
+        source,
+    })?;
+
+    let config = goose::config::DeclarativeProviderConfig {
+        name: "sarvam".to_string(),
+        engine: goose::config::declarative_providers::ProviderEngine::OpenAI,
+        display_name: "Sarvam AI".to_string(),
+        description: Some(
+            "Sarvam AI — Indian LLM vendor, OpenAI-compatible Chat \
+             Completions API."
+                .to_string(),
+        ),
+        api_key_env: SARVAM_API_KEY_ENV.to_string(),
+        base_url: SARVAM_BASE_URL.to_string(),
+        // Sarvam's two chat models per goose's canonical model catalog
+        // (`canonical_models.json`, ids `sarvam/sarvam-105b` and
+        // `sarvam/sarvam-30b`, with `limit.context` 131072 and 65536
+        // respectively) — dynamic_models is deliberately `Some(false)`
+        // so construction serves this static list rather than probing
+        // an unconfirmed `/v1/models` shape on an endpoint this build
+        // has never called.
+        models: vec![
+            goose::providers::base::ModelInfo::new("sarvam-105b", 131_072),
+            goose::providers::base::ModelInfo::new("sarvam-30b", 65_536),
+        ],
+        headers: None,
+        timeout_seconds: None,
+        supports_streaming: Some(true),
+        requires_auth: true,
+        catalog_provider_id: None,
+        base_path: None,
+        env_vars: None,
+        dynamic_models: Some(false),
+        skip_canonical_filtering: false,
+        model_doc_link: Some(
+            "https://docs.sarvam.ai/api-reference-docs/getting-started/models".to_string(),
+        ),
+        setup_steps: Vec::new(),
+        fast_model: None,
+        preserves_thinking: true,
+    };
+
+    let file_path = dir.join("sarvam.json");
+    let json = serde_json::to_string_pretty(&config).map_err(|source| {
+        GooseAcpError::CustomProviderWrite {
+            path: file_path.display().to_string(),
+            source: std::io::Error::new(std::io::ErrorKind::InvalidData, source),
+        }
+    })?;
+    std::fs::write(&file_path, json).map_err(|source| GooseAcpError::CustomProviderWrite {
+        path: file_path.display().to_string(),
+        source,
+    })?;
+
+    Ok(())
 }
 
 /// Disable one platform extension by config key, failing closed:
@@ -270,6 +377,13 @@ pub(crate) fn initialize(
     // Extra config layers would merge underneath ours and could carry
     // extension entries we never audited.
     std::env::remove_var("GOOSE_ADDITIONAL_CONFIG_FILES");
+
+    // Stage the Sarvam AI declarative-provider definition into this root's
+    // custom_providers directory now that GOOSE_PATH_ROOT points at it —
+    // see write_sarvam_custom_provider_definition's doc comment for what
+    // this does and does not achieve (construction becomes possible;
+    // selection is a separate, not-yet-generalized gap).
+    write_sarvam_custom_provider_definition()?;
 
     let config = goose::config::Config::global();
     match provider_pin {
@@ -451,15 +565,28 @@ const DEFAULT_ROSHERA_URL: &str = "http://localhost:8081";
 /// `describe_tool` / `invoke` reach the long tail), cheapest on tokens.
 const DEFAULT_MCP_SURFACE: &str = "minimal";
 
-/// Permissions granted to a per-session agent key. Mirrors the human
-/// baseline (`get_user_permission_strings`, `handlers/auth.rs`) exactly
-/// — an agent acting on a human's behalf gets no more than that human
-/// already has, never an escalation.
-const AGENT_SESSION_KEY_PERMISSIONS: &[&str] = &[
-    "ViewGeometry",
-    "CreateGeometry",
-    "ModifyGeometry",
-    "ExportGeometry",
+/// Permissions withheld from a per-session agent key even when the
+/// initiating human holds them. Deliberately small, and every entry
+/// justified on its own line — this is a policy decision, not a place
+/// to dump uncertainty. Everything NOT listed here that the human holds
+/// passes straight through to the agent key (see [`mint_agent_session_key`]):
+/// no artificial narrowing to a hardcoded subset, only this intersection.
+const AGENT_SESSION_KEY_DENY_LIST: &[session_manager::Permission] = &[
+    // Ending someone else's session is not a decision a design-agent
+    // turn should ever get to make on the initiating human's behalf.
+    session_manager::Permission::DeleteSession,
+    // Adding or removing collaborators is account administration, not
+    // geometry or timeline work.
+    session_manager::Permission::InviteUsers,
+    session_manager::Permission::RemoveUsers,
+    // Reassigning another user's role is the same category as
+    // inviting/removing them.
+    session_manager::Permission::ChangeRoles,
+    // Gates the AI-provider connection dialog (`/api/ai/provider*`) —
+    // reconfiguring which model/provider backs a session is a human
+    // decision; an agent turn must never be able to make it about
+    // itself mid-conversation.
+    session_manager::Permission::ModifySettings,
 ];
 
 /// A per-session key lives only as long as one ACP conversation
@@ -562,8 +689,7 @@ async fn inject_roshera_mcp_server(
         .into_response();
     };
 
-    let (raw_key, _api_key) = match mint_agent_session_key(&auth_manager, &auth_info.user_id).await
-    {
+    let (raw_key, _api_key) = match mint_agent_session_key(&auth_manager, &auth_info).await {
         Ok(minted) => minted,
         Err(error) => {
             return ApiError::new(
@@ -643,21 +769,36 @@ fn goose_agent_model_label() -> String {
 
 /// Mint the per-session agent key: scoped to `user_id` (the
 /// authenticated human's own id, never inherited from anywhere else),
-/// permissioned to the human baseline, stamped `PrincipalKind::Agent`
-/// with the model [`goose_agent_model_label`] resolved.
+/// permissioned to exactly what `auth_info` — the already-authenticated
+/// principal making this `session/new`/`session/load` call — carries,
+/// minus [`AGENT_SESSION_KEY_DENY_LIST`], and stamped
+/// `PrincipalKind::Agent` with the model [`goose_agent_model_label`]
+/// resolved.
+///
+/// This is resolved from the principal at mint time, deliberately NOT a
+/// fixed list: an agent acting on a human's behalf gets no more than
+/// that human already has (no escalation) and no less than what the
+/// human's own role actually grants (no artificial narrowing) — both
+/// directions are equally a bug, and a hardcoded list can only ever get
+/// one of them right by coincidence. Binding the grant to
+/// `auth_info.permissions` means it stays correct as the human's own
+/// permissions change, with nothing here to revisit.
 async fn mint_agent_session_key(
     auth_manager: &session_manager::AuthManager,
-    user_id: &str,
+    auth_info: &AuthInfo,
 ) -> Result<(String, session_manager::ApiKey), shared_types::SessionError> {
     let model = goose_agent_model_label();
+    let permissions: Vec<String> = auth_info
+        .permissions
+        .iter()
+        .filter(|p| !AGENT_SESSION_KEY_DENY_LIST.contains(p))
+        .map(|p| p.as_str().to_string())
+        .collect();
     auth_manager
         .provision_api_key(
-            user_id,
+            &auth_info.user_id,
             "goose-acp-session",
-            AGENT_SESSION_KEY_PERMISSIONS
-                .iter()
-                .map(|p| p.to_string())
-                .collect(),
+            permissions,
             Some(AGENT_SESSION_KEY_EXPIRES_IN_DAYS),
             session_manager::PrincipalKind::Agent { model },
         )
@@ -827,7 +968,15 @@ mod tests {
             std::env::temp_dir().join(format!("roshera-goose-lockdown-{}", uuid::Uuid::new_v4()));
         std::env::set_var("ROSHERA_GOOSE_ROOT", &root);
 
-        let fake_claude_cli_path = "C:\\fake\\npm\\claude.cmd";
+        // A real executable path, never a `.cmd`/`.ps1` shim:
+        // `repin_goose_to_claude_code` (called by `initialize()`'s
+        // `ClaudeCode` branch below) now REFUSES a shim extension by name —
+        // the structural fix for the live BLOCKER where goose's
+        // `CreateProcess` spawn of a `.cmd` path failed outright. A `.cmd`
+        // fixture here would make this test assert the bug back into
+        // existence instead of proving the fix.
+        let fake_claude_cli_path =
+            "C:\\fake\\npm\\node_modules\\@anthropic-ai\\claude-code\\bin\\claude.exe";
         let provider_pin = crate::ai_provider_config::BootProviderPin::ClaudeCode {
             cli_path: std::path::PathBuf::from(fake_claude_cli_path),
         };
@@ -1170,6 +1319,182 @@ mod tests {
         assert!(
             api_key_entry["value"].as_str().unwrap_or("").len() > 10,
             "a real per-session key must be minted, not an empty/placeholder value"
+        );
+    }
+
+    /// THE proving test that the fixed four is gone: an initiating human
+    /// holding `AddComments`, the timeline permissions, and
+    /// `BooleanOperations`/`MeasureGeometry` — every scope `.goosehints`
+    /// tells the agent to use and the old `AGENT_SESSION_KEY_PERMISSIONS`
+    /// constant never carried — must see all of them land on the minted
+    /// agent key.
+    #[tokio::test]
+    async fn mint_agent_session_key_carries_the_initiating_users_permissions() {
+        let auth_manager = test_auth_manager();
+        let auth_info = AuthInfo {
+            user_id: "principal-user".to_string(),
+            session_id: None,
+            permissions: vec![
+                session_manager::Permission::ViewGeometry,
+                session_manager::Permission::CreateGeometry,
+                session_manager::Permission::ModifyGeometry,
+                session_manager::Permission::ExportGeometry,
+                session_manager::Permission::AddComments,
+                session_manager::Permission::UndoRedo,
+                session_manager::Permission::CreateBranches,
+                session_manager::Permission::MergeBranches,
+                session_manager::Permission::ViewHistory,
+                session_manager::Permission::BooleanOperations,
+                session_manager::Permission::MeasureGeometry,
+            ],
+            roles: vec![],
+            is_api_key: false,
+            principal: session_manager::PrincipalKind::Human,
+        };
+
+        let (_raw_key, api_key) = mint_agent_session_key(&auth_manager, &auth_info)
+            .await
+            .expect("minting for a fully-permissioned principal must succeed");
+
+        let minted: HashSet<&str> = api_key.permissions.iter().map(String::as_str).collect();
+        for expected in [
+            "AddComments",
+            "UndoRedo",
+            "CreateBranches",
+            "MergeBranches",
+            "ViewHistory",
+            "BooleanOperations",
+            "MeasureGeometry",
+        ] {
+            assert!(
+                minted.contains(expected),
+                "minted agent key must carry '{expected}' — it is in the \
+                 initiating human's own permission set and not on the \
+                 deny-list, but the old hardcoded four could never have \
+                 carried it; got {minted:?}"
+            );
+        }
+    }
+
+    /// The no-escalation invariant, asserted rather than assumed: a
+    /// principal holding a narrow permission set must mint a key that
+    /// holds exactly that set — nothing manufactured, nothing widened.
+    #[tokio::test]
+    async fn mint_agent_session_key_never_grants_a_permission_the_user_lacks() {
+        let auth_manager = test_auth_manager();
+        let auth_info = AuthInfo {
+            user_id: "narrow-user".to_string(),
+            session_id: None,
+            permissions: vec![session_manager::Permission::ViewGeometry],
+            roles: vec![],
+            is_api_key: false,
+            principal: session_manager::PrincipalKind::Human,
+        };
+
+        let (_raw_key, api_key) = mint_agent_session_key(&auth_manager, &auth_info)
+            .await
+            .expect("minting for a narrowly-permissioned principal must succeed");
+
+        assert_eq!(
+            api_key.permissions,
+            vec!["ViewGeometry".to_string()],
+            "a user holding only ViewGeometry must mint a key carrying only \
+             ViewGeometry — no permission the user does not hold may ever \
+             appear on the agent key: got {:?}",
+            api_key.permissions
+        );
+    }
+
+    /// The deny-list actually withholds administrative permissions even
+    /// when the initiating human holds them — the one deliberate,
+    /// justified narrowing this module still performs.
+    #[tokio::test]
+    async fn mint_agent_session_key_withholds_deny_listed_permissions() {
+        let auth_manager = test_auth_manager();
+        let auth_info = AuthInfo {
+            user_id: "admin-user".to_string(),
+            session_id: None,
+            permissions: vec![
+                session_manager::Permission::CreateGeometry,
+                session_manager::Permission::ModifySettings,
+                session_manager::Permission::DeleteSession,
+                session_manager::Permission::InviteUsers,
+                session_manager::Permission::RemoveUsers,
+                session_manager::Permission::ChangeRoles,
+            ],
+            roles: vec![],
+            is_api_key: false,
+            principal: session_manager::PrincipalKind::Human,
+        };
+
+        let (_raw_key, api_key) = mint_agent_session_key(&auth_manager, &auth_info)
+            .await
+            .expect(
+                "minting must succeed even when the deny-list strips every \
+                     permission but one",
+            );
+
+        assert_eq!(
+            api_key.permissions,
+            vec!["CreateGeometry".to_string()],
+            "every deny-listed permission the human holds (ModifySettings, \
+             DeleteSession, InviteUsers, RemoveUsers, ChangeRoles) must be \
+             stripped from the minted agent key: got {:?}",
+            api_key.permissions
+        );
+    }
+
+    /// The test that closes the loop end-to-end, mirroring the live
+    /// defect exactly: mint an agent key for a principal holding a
+    /// realistic permission set, then decode it back the way
+    /// `auth_middleware::validate_api_key` does on every subsequent MCP
+    /// tool call the agent makes. A decoder speaking a different string
+    /// alphabet than the minter would pass every assertion above (all of
+    /// them inspect the *minted* strings) while still handing the agent
+    /// an empty permission set at *validation* time — which is exactly
+    /// what happened live tonight.
+    #[tokio::test]
+    async fn minted_agent_key_permissions_survive_the_full_auth_round_trip() {
+        let auth_manager = test_auth_manager();
+        let granted = vec![
+            session_manager::Permission::ViewGeometry,
+            session_manager::Permission::CreateGeometry,
+            session_manager::Permission::ModifyGeometry,
+            session_manager::Permission::ExportGeometry,
+            session_manager::Permission::AddComments,
+        ];
+        let auth_info = AuthInfo {
+            user_id: "roundtrip-user".to_string(),
+            session_id: None,
+            permissions: granted.clone(),
+            roles: vec![],
+            is_api_key: false,
+            principal: session_manager::PrincipalKind::Human,
+        };
+
+        let (raw_key, _api_key) = mint_agent_session_key(&auth_manager, &auth_info)
+            .await
+            .expect("mint must succeed");
+
+        // The exact decode `validate_api_key` performs on every MCP tool
+        // call the injected agent makes.
+        let verified = auth_manager
+            .verify_api_key(&raw_key)
+            .expect("the freshly minted key must verify");
+        let decoded: HashSet<session_manager::Permission> = verified
+            .permissions
+            .iter()
+            .filter_map(|p| session_manager::Permission::from_str(p))
+            .collect();
+        let expected: HashSet<session_manager::Permission> = granted.into_iter().collect();
+
+        assert_eq!(
+            decoded, expected,
+            "every permission minted onto the agent key must decode back out \
+             through the same string alphabet the minter wrote — a mismatch \
+             here silently empties the agent's permission set on the very \
+             first tool call, independent of anything `mint_agent_session_key` \
+             itself does right"
         );
     }
 }

@@ -14,7 +14,7 @@
 //! effects, sharing one code path with `PUT` so the two can never
 //! diverge on what counts as a valid credential.
 
-use crate::ai_provider_config::{self, StoredProviderConfig};
+use crate::ai_provider_config::{self, ModelVerificationState, StoredProviderConfig};
 use crate::error_catalog::{ApiError, ErrorCode};
 use crate::AppState;
 use ai_integration::providers::allowlist::{
@@ -61,6 +61,13 @@ pub struct ProviderConfigRequest {
 #[derive(Debug)]
 enum Validated {
     ApiKey {
+        /// The allowlisted provider this key was validated for
+        /// ("anthropic", "xai", "mistral", "glm", "kimi", ...) — needed
+        /// because, unlike every other `Validated` variant, `api_key`
+        /// mode is now wired for more than one provider and `put_provider`
+        /// must persist and repin the one actually requested, never a
+        /// hardcoded "anthropic".
+        provider: String,
         key: String,
         model: Option<String>,
         model_verified: Option<bool>,
@@ -79,19 +86,30 @@ enum Validated {
     },
 }
 
+/// `None` / `"default"` (case-sensitive — the literal sentinel
+/// `claude-code`'s own `CLAUDE_CODE_DEFAULT_MODEL` uses) / whitespace-only
+/// all normalize to `None`, meaning "the provider's own choice" — shared
+/// by every mode's model handling so none of them can drift on what
+/// counts as "no override requested".
+fn normalize_model_request(requested: Option<&str>) -> Option<String> {
+    requested
+        .map(str::trim)
+        .filter(|m| !m.is_empty() && *m != "default")
+        .map(str::to_string)
+}
+
 /// Normalize + validate `payload.model` against the credential that just
-/// proved live. `None` / `"default"` (case-sensitive — the literal
-/// sentinel `claude-code`'s own `CLAUDE_CODE_DEFAULT_MODEL` uses) means
-/// "the provider's own choice" and is always accepted without a network
+/// proved live. `None` (see [`normalize_model_request`]) means "the
+/// provider's own choice" and is always accepted without a network
 /// round-trip — this function must never invent a concrete model name
 /// for that case, and must never claim it validated something it did not
 /// check.
 ///
-/// For `api_key` / `oauth_profile`, an explicit model is checked against
-/// Anthropic's own model-listing endpoint (`ClaudeProvider::validate_model`)
-/// — the authoritative source, not a hardcoded menu — and the save is
-/// refused by name (typed `AiModelRejected`) if the provider does not
-/// recognize it.
+/// For `anthropic`'s `api_key` / `oauth_profile`, an explicit model is
+/// checked against Anthropic's own model-listing endpoint
+/// (`ClaudeProvider::validate_model`) — the authoritative source, not a
+/// hardcoded menu — and the save is refused by name (typed
+/// `AiModelRejected`) if the provider does not recognize it.
 ///
 /// For `subscription_cli`, no side-effect-free synchronous enumeration
 /// exists on this server (the Claude Code CLI's own model listing
@@ -99,8 +117,10 @@ enum Validated {
 /// in goose's `claude_code.rs`, not something this handler calls per
 /// save). The string is accepted, but persisted with `model_verified:
 /// false` — surfaced honestly in both the `PUT` and `GET` responses —
-/// rather than presented as a confirmed model. An invalid model there
-/// surfaces at first use instead: `goose_acp::apply_configured_model`
+/// rather than presented as a confirmed model; `PUT`'s `subscription_cli`
+/// branch kicks off a bounded background check that can later flip this
+/// (see `ai_provider_config::verify_subscription_cli_model`). An invalid
+/// model also surfaces at first use regardless: `goose_acp::apply_configured_model`
 /// applies it at `session/new`, and the Claude Code CLI itself rejects
 /// an unrecognized model on that session's first turn.
 async fn resolve_requested_model(
@@ -108,16 +128,14 @@ async fn resolve_requested_model(
     credential: Option<&ClaudeCredential>,
     is_subscription_cli: bool,
 ) -> Result<(Option<String>, Option<bool>), ApiError> {
-    let Some(model) = requested
-        .map(str::trim)
-        .filter(|m| !m.is_empty() && *m != "default")
-    else {
+    let Some(model) = normalize_model_request(requested) else {
         return Ok((None, None));
     };
 
     if is_subscription_cli {
-        return Ok((Some(model.to_string()), Some(false)));
+        return Ok((Some(model), Some(false)));
     }
+    let model = model.as_str();
 
     let Some(credential) = credential else {
         return Err(ApiError::ai_model_rejected(
@@ -158,6 +176,14 @@ pub async fn get_provider(State(state): State<AppState>) -> Json<Value> {
             // caveat, not as a confirmed-active model.
             "model": s.model,
             "model_verified": s.model_verified,
+            // The full three(-plus-pending)-state detail behind
+            // `model_verified` for subscription_cli: `pending` while the
+            // bounded background check is still running, `rejected`
+            // naming the model and the CLI's own reason, `unknown` when
+            // the check itself couldn't run to a conclusion (never a
+            // stand-in for verified or rejected). `None` for api_key/
+            // oauth_profile or when no model override was requested.
+            "model_verification": s.model_verification,
         })
     });
 
@@ -199,17 +225,19 @@ pub async fn put_provider(
 
     match validated {
         Validated::ApiKey {
+            provider,
             key,
             model,
             model_verified,
         } => {
             let stored = StoredProviderConfig {
-                provider: "anthropic".to_string(),
+                provider: provider.clone(),
                 mode: CredentialMode::ApiKey.as_str().to_string(),
                 api_key: Some(key.clone()),
                 profile_name: None,
                 model: model.clone(),
                 model_verified,
+                model_verification: None,
                 saved_at: chrono::Utc::now(),
             };
             let acl = state
@@ -218,16 +246,42 @@ pub async fn put_provider(
                 .await
                 .map_err(|e| ApiError::new(ErrorCode::Internal, e.to_string()))?;
 
-            register_claude_credential(&state, ClaudeCredential::ApiKey(key)).await;
-            state.ai_configured.store(true, Ordering::SeqCst);
+            let repin_note = if provider == "anthropic" {
+                // Roshera's own native ClaudeProvider serves BOTH the
+                // REST `/api/ai/command` surface and (via the same
+                // ANTHROPIC_API_KEY goose's hardcoded default already
+                // reads) the /acp agent surface — no explicit goose
+                // repin needed, exactly as before this change.
+                register_claude_credential(&state, ClaudeCredential::ApiKey(key)).await;
+                state.ai_configured.store(true, Ordering::SeqCst);
+                None
+            } else {
+                // No Roshera-native LLMProvider exists for these vendors
+                // — /api/ai/command stays unavailable through this key.
+                // Only the /acp agent surface is wired, via goose's own
+                // provider for this vendor.
+                ai_provider_config::repin_goose_to_declarative_provider(
+                    &provider,
+                    &key,
+                    model.as_deref(),
+                )
+                .map_err(|e| ApiError::new(ErrorCode::Internal, e))?;
+                Some(format!(
+                    "this wires the agent (/acp) surface only, via goose's own \
+                     provider for '{provider}'. REST routes (/api/ai/command) \
+                     have no native Roshera provider for this vendor and remain \
+                     unavailable through this key."
+                ))
+            };
 
             Ok(Json(json!({
                 "success": true,
-                "provider": "anthropic",
+                "provider": provider,
                 "mode": "api_key",
                 "model": model,
                 "model_verified": model_verified,
                 "acl": acl,
+                "note": repin_note,
             })))
         }
         Validated::OauthToken {
@@ -243,6 +297,7 @@ pub async fn put_provider(
                 profile_name: Some(profile_name.clone()),
                 model: model.clone(),
                 model_verified,
+                model_verification: None,
                 saved_at: chrono::Utc::now(),
             };
             let acl = state
@@ -268,8 +323,43 @@ pub async fn put_provider(
             cli_path,
             profile_name,
             model,
-            model_verified,
+            model_verified: _,
         } => {
+            // Decide whether this model was already proven (or
+            // disproven) by a previous save's background check, or needs
+            // a fresh one kicked off after this save returns. Re-verify
+            // only when the model actually changed (or nothing
+            // conclusive was ever recorded) — never on every PUT of the
+            // same model, and never on a GET (GET only ever reads
+            // whatever is already stored).
+            let previous = state.ai_provider_manager.stored().await;
+            let model_verification: Option<ModelVerificationState> = model.as_deref().map(|m| {
+                let cached = previous
+                    .as_ref()
+                    .filter(|p| p.model.as_deref() == Some(m))
+                    .and_then(|p| p.model_verification.clone());
+                match cached {
+                    Some(state @ ModelVerificationState::Verified) => state,
+                    Some(state @ ModelVerificationState::Rejected { .. }) => state,
+                    // No cache, the model changed, or the last attempt
+                    // was itself inconclusive (`Unknown`/`Pending`) —
+                    // none of those are a terminal answer worth reusing.
+                    _ => ModelVerificationState::Pending,
+                }
+            });
+            let should_spawn_check =
+                matches!(model_verification, Some(ModelVerificationState::Pending));
+            // Derived from the (possibly reused) verification state, not
+            // from `resolve_requested_model`'s always-`Some(false)`
+            // subscription_cli default — a reused `Verified` outcome
+            // must be reported as verified immediately, not lag a GET
+            // behind what's already known.
+            let model_verified = match &model_verification {
+                Some(ModelVerificationState::Verified) => Some(true),
+                Some(_) => Some(false),
+                None => None,
+            };
+
             let stored = StoredProviderConfig {
                 provider: "anthropic".to_string(),
                 mode: CredentialMode::SubscriptionCli.as_str().to_string(),
@@ -277,6 +367,7 @@ pub async fn put_provider(
                 profile_name: Some(profile_name.clone()),
                 model: model.clone(),
                 model_verified,
+                model_verification: model_verification.clone(),
                 saved_at: chrono::Utc::now(),
             };
             let acl = state
@@ -298,6 +389,25 @@ pub async fn put_provider(
             // inherits ANTHROPIC_API_KEY/ANTHROPIC_AUTH_TOKEN otherwise.
             ai_provider_config::scrub_anthropic_env_for_subscription_mode();
 
+            // Off the request path: the PUT above already returned a
+            // fast, saved response. This spawns a bounded (~45s),
+            // killed-on-timeout probe of the live CLI and persists
+            // whatever it finds via `AiProviderManager::update_model_verification`
+            // — never awaited here, never blocking this handler.
+            if should_spawn_check {
+                if let Some(m) = model.clone() {
+                    let manager = state.ai_provider_manager.clone();
+                    let cli_path_buf = std::path::PathBuf::from(&cli_path);
+                    let probe = ai_provider_config::default_model_probe();
+                    tokio::spawn(ai_provider_config::verify_subscription_cli_model(
+                        probe,
+                        cli_path_buf,
+                        m,
+                        manager,
+                    ));
+                }
+            }
+
             Ok(Json(json!({
                 "success": true,
                 "provider": "anthropic",
@@ -305,13 +415,16 @@ pub async fn put_provider(
                 "profile_name": profile_name,
                 "model": model,
                 "model_verified": model_verified,
-                "model_verification_note": if model.is_some() {
-                    Some("not verified against the live CLI at save time — the \
-                          Claude Code CLI has no side-effect-free synchronous \
-                          model-listing check this server calls per save; the \
-                          model is applied when this session starts, and an \
-                          unrecognized model surfaces as a refusal on that \
-                          session's first turn, not here.")
+                "model_verification": model_verification,
+                "model_verification_note": if should_spawn_check {
+                    Some("a bounded (~45s) background check against the live \
+                          CLI was just kicked off — GET /api/ai/provider \
+                          reports the outcome once it lands (verified / \
+                          rejected, naming the model / unknown, if the check \
+                          itself couldn't run to a conclusion). The model is \
+                          also applied when an agent session starts; an \
+                          unrecognized model surfaces there too, independent \
+                          of this check.")
                 } else {
                     None
                 },
@@ -387,12 +500,13 @@ pub async fn test_provider(
     let validated = validate_request(&payload).await?;
     let (mode, detail) = match validated {
         Validated::ApiKey {
+            provider,
             model,
             model_verified,
             ..
         } => (
             "api_key",
-            json!({ "model": model, "model_verified": model_verified }),
+            json!({ "provider": provider, "model": model, "model_verified": model_verified }),
         ),
         Validated::OauthToken {
             profile_name,
@@ -503,12 +617,39 @@ async fn validate_request(payload: &ProviderConfigRequest) -> Result<Validated, 
     }
 }
 
+/// `anthropic`'s `api_key` mode is checked live against Anthropic's own
+/// `/v1/models` before it is ever persisted (`ClaudeProvider::validate_credential`).
+/// The other allowlisted `api_key` vendors (`xai`, `mistral`, `glm`,
+/// `kimi`) have no vetted synchronous credential-check client in this
+/// build — `ai-integration` has no native HTTP client for any of them,
+/// and building an unverified one here (this server has no real key or
+/// network access to prove it against) would risk exactly the "silent
+/// wrong answer" this codebase's honesty rules forbid. So the same
+/// precedent already established for `subscription_cli`'s model check
+/// applies: the key is accepted and stored, flagged unverified
+/// (`model_verified: Some(false)` when a model was requested, `None`
+/// otherwise — there is no equivalent "credential_verified" flag because
+/// unlike the model check there is no later background check that could
+/// ever prove it either), never silently presented as confirmed. An
+/// invalid key surfaces at first use instead, when goose's own
+/// declarative provider actually calls the vendor's API.
 async fn validate_api_key(payload: &ProviderConfigRequest) -> Result<Validated, ApiError> {
     let key = payload
         .api_key
         .clone()
         .filter(|k| !k.is_empty())
         .ok_or_else(|| ApiError::missing_parameter("api_key"))?;
+
+    if payload.provider != "anthropic" {
+        let model = normalize_model_request(payload.model.as_deref());
+        let model_verified = model.as_ref().map(|_| false);
+        return Ok(Validated::ApiKey {
+            provider: payload.provider.clone(),
+            key,
+            model,
+            model_verified,
+        });
+    }
 
     let credential = ClaudeCredential::ApiKey(key.clone());
     let probe = ClaudeProvider::with_config(ClaudeConfig {
@@ -524,6 +665,7 @@ async fn validate_api_key(payload: &ProviderConfigRequest) -> Result<Validated, 
         resolve_requested_model(payload.model.as_deref(), Some(&credential), false).await?;
 
     Ok(Validated::ApiKey {
+        provider: payload.provider.clone(),
         key,
         model,
         model_verified,
@@ -583,15 +725,24 @@ async fn validate_subscription_cli(payload: &ProviderConfigRequest) -> Result<Va
              first; Roshera does not spawn an interactive login",
         ));
     }
-    // `installed` is only ever true when `detect_claude_cli` also
-    // populated `path` — a defensive typed refusal (not
-    // expect/unwrap, which the workspace lints deny) rather than an
-    // assumption.
+    // The npm shim (`claude.cmd`) is installed, but `detect_claude_cli`
+    // could not resolve a real, directly-spawnable executable from it —
+    // neither the known Claude Code binary layout nor a parse of the shim
+    // itself found one. This is a legitimate, nameable refusal (not an
+    // internal bug): a `.cmd`/`.ps1` path must never reach
+    // `CLAUDE_CODE_COMMAND` (Windows' `CreateProcess` cannot spawn it —
+    // see `ai_provider_config`'s CLI-detection doc), so this refuses by
+    // name, citing `resolution_note`, rather than silently falling back to
+    // the unspawnable shim path.
     let cli_path = cli.path.ok_or_else(|| {
-        ApiError::new(
-            ErrorCode::Internal,
-            "CLI reported installed with no resolved path".to_string(),
-        )
+        ApiError::ai_credential_invalid(format!(
+            "Claude Code CLI is installed and signed in, but no directly \
+             spawnable executable could be resolved from its npm shim{}",
+            cli.resolution_note
+                .as_deref()
+                .map(|note| format!(" — {note}"))
+                .unwrap_or_default()
+        ))
     })?;
 
     // No credential to probe a model against here — `is_subscription_cli:
@@ -639,6 +790,73 @@ mod tests {
             profile_name: None,
             model: None,
             consent_spawn_local_process: false,
+        }
+    }
+
+    // --- validate_api_key: the generalized-provider path — xai/mistral/
+    //     glm/kimi accept an api_key without a network probe (no vetted
+    //     synchronous credential-check client exists for them), anthropic
+    //     is unaffected. Network-free: these never reach ClaudeProvider. ---
+
+    #[tokio::test]
+    async fn validate_request_accepts_xai_api_key_without_a_network_probe() {
+        let mut payload = request("xai", "api_key");
+        payload.api_key = Some("fake-xai-key".to_string());
+        let validated = validate_request(&payload)
+            .await
+            .expect("xai/api_key must validate without hitting Anthropic's API");
+        match validated {
+            Validated::ApiKey {
+                provider,
+                key,
+                model,
+                model_verified,
+            } => {
+                assert_eq!(provider, "xai");
+                assert_eq!(key, "fake-xai-key");
+                assert_eq!(model, None, "no model requested must stay None");
+                assert_eq!(
+                    model_verified, None,
+                    "no credential-check client exists, so there is nothing to \
+                     report a verification state for when no model was requested"
+                );
+            }
+            other => panic!("expected Validated::ApiKey, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn validate_request_accepts_mistral_glm_kimi_api_key_flagging_an_explicit_model_unverified(
+    ) {
+        for (id, model_name) in [
+            ("mistral", "mistral-medium-latest"),
+            ("glm", "glm-4.6"),
+            ("kimi", "kimi-k2-turbo-preview"),
+        ] {
+            let mut payload = request(id, "api_key");
+            payload.api_key = Some(format!("fake-{id}-key"));
+            payload.model = Some(model_name.to_string());
+            let validated = validate_request(&payload)
+                .await
+                .unwrap_or_else(|e| panic!("{id}/api_key must validate: {e:?}"));
+            match validated {
+                Validated::ApiKey {
+                    provider,
+                    model,
+                    model_verified,
+                    ..
+                } => {
+                    assert_eq!(provider, id);
+                    assert_eq!(model.as_deref(), Some(model_name));
+                    assert_eq!(
+                        model_verified,
+                        Some(false),
+                        "{id}: an explicit model must be flagged unverified, \
+                         never silently confirmed with no check having run"
+                    );
+                }
+                other => panic!("{id}: expected Validated::ApiKey, got {other:?}"),
+            }
         }
     }
 
@@ -806,5 +1024,120 @@ mod tests {
             .await
             .expect("second delete must succeed");
         assert_eq!(second["ai_configured"], json!(false));
+    }
+
+    // --- subscription_cli model verification surfaced through GET,
+    //     end to end via the real orchestration function
+    //     (`verify_subscription_cli_model`) with an injected fake probe —
+    //     never spawns the real ~250 MB claude.exe. ---
+
+    fn subscription_cli_config_with_model(
+        model: &str,
+        model_verification: Option<ModelVerificationState>,
+    ) -> ai_provider_config::StoredProviderConfig {
+        ai_provider_config::StoredProviderConfig {
+            provider: "anthropic".to_string(),
+            mode: "subscription_cli".to_string(),
+            api_key: None,
+            profile_name: Some("default".to_string()),
+            model: Some(model.to_string()),
+            model_verified: Some(false),
+            model_verification,
+            saved_at: chrono::Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn get_provider_reports_rejected_model_naming_it() {
+        let state = make_test_state().await;
+        state
+            .ai_provider_manager
+            .save(subscription_cli_config_with_model("bogus-model", None))
+            .await
+            .expect("save must succeed");
+
+        let probe: ai_provider_config::ModelProbe = std::sync::Arc::new(|_cli_path, _model| {
+            Box::pin(async {
+                ai_provider_config::ProbeOutcome::Rejected(
+                    "There's an issue with the selected model (bogus-model).".to_string(),
+                )
+            })
+        });
+        ai_provider_config::verify_subscription_cli_model(
+            probe,
+            std::path::PathBuf::from("C:\\fake\\claude.exe"),
+            "bogus-model".to_string(),
+            state.ai_provider_manager.clone(),
+        )
+        .await;
+
+        let Json(body) = get_provider(State(state)).await;
+        assert_eq!(body["active"]["model_verification"]["state"], "rejected");
+        assert_eq!(body["active"]["model_verification"]["model"], "bogus-model");
+        assert!(body["active"]["model_verification"]["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("issue with the selected model"));
+        assert_eq!(body["active"]["model_verified"], json!(false));
+    }
+
+    #[tokio::test]
+    async fn get_provider_reports_unknown_on_timeout_never_verified_or_rejected() {
+        let state = make_test_state().await;
+        state
+            .ai_provider_manager
+            .save(subscription_cli_config_with_model(
+                "opus",
+                Some(ModelVerificationState::Pending),
+            ))
+            .await
+            .expect("save must succeed");
+
+        // A fake probe standing in for a hung/timed-out CLI round trip —
+        // the timeout-wrapper mechanics themselves (kill-on-drop,
+        // `Unknown` on elapsed) are unit-tested directly in
+        // `ai_provider_config`; this proves the observable GET-facing
+        // outcome of that path is `unknown`, never a guessed pass or fail.
+        let probe: ai_provider_config::ModelProbe = std::sync::Arc::new(|_cli_path, _model| {
+            Box::pin(async {
+                ai_provider_config::ProbeOutcome::Unknown(
+                    "model verification timed out after 45s".to_string(),
+                )
+            })
+        });
+        ai_provider_config::verify_subscription_cli_model(
+            probe,
+            std::path::PathBuf::from("C:\\fake\\claude.exe"),
+            "opus".to_string(),
+            state.ai_provider_manager.clone(),
+        )
+        .await;
+
+        let Json(body) = get_provider(State(state)).await;
+        assert_eq!(body["active"]["model_verification"]["state"], "unknown");
+        assert_ne!(body["active"]["model_verification"]["state"], "verified");
+        assert_ne!(body["active"]["model_verification"]["state"], "rejected");
+        assert_eq!(body["active"]["model_verified"], json!(false));
+    }
+
+    #[tokio::test]
+    async fn get_provider_reports_pending_before_the_background_check_lands() {
+        let state = make_test_state().await;
+        state
+            .ai_provider_manager
+            .save(subscription_cli_config_with_model(
+                "opus",
+                Some(ModelVerificationState::Pending),
+            ))
+            .await
+            .expect("save must succeed");
+
+        let Json(body) = get_provider(State(state)).await;
+        assert_eq!(body["active"]["model_verification"]["state"], "pending");
+        assert_eq!(
+            body["active"]["model_verified"],
+            json!(false),
+            "pending must never read as verified"
+        );
     }
 }

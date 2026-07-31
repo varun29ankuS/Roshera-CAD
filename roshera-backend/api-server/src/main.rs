@@ -9279,6 +9279,15 @@ pub(crate) fn build_router(state: AppState) -> Router {
             get(documents::list_documents).post(documents::create_document),
         )
         .route("/api/documents/{id}/open", post(documents::open_document))
+        // PATCH renames; DELETE is the only destructive route in the API —
+        // it refuses the active / last-remaining / default document (see
+        // documents.rs) and is transactional across the registry row and
+        // every scoped timeline/branch row. Same "authenticated is
+        // sufficient" gate as the routes above.
+        .route(
+            "/api/documents/{id}",
+            axum::routing::patch(documents::rename_document).delete(documents::delete_document),
+        )
         // Sandbox branches per agent. Each agent claims a branch via
         // POST /api/branches; mutations land on that branch in the
         // event log; a human approves via POST /api/branches/{id}/merge

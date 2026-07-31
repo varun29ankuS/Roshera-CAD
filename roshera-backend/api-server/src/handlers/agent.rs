@@ -2159,6 +2159,7 @@ pub async fn part_perception(
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     use geometry_engine::harness::watertight::manifold_report;
     use geometry_engine::math::Tolerance;
+    use geometry_engine::primitives::provenance::SoundnessReading;
     use geometry_engine::primitives::validation::{validate_solid_scoped, ValidationLevel};
 
     let sid = id as SolidId;
@@ -2186,6 +2187,13 @@ pub async fn part_perception(
             "OK — valid B-Rep; export mesh has tessellation artifacts only (not a defect)"
                 .to_string()
         };
+        // P1 (never-recomputing) staleness read — the read lock held here
+        // is enough; `soundness_reading` takes `&self`. `valid`/`watertight`
+        // above are live B-Rep/mesh facts, not the P1-gated certificate, so
+        // they are reported regardless of `verified`.
+        let reading = model
+            .soundness_reading(sid)
+            .unwrap_or(SoundnessReading::Stale { solid_id: sid });
         // Reconcile: always pending on the fast path — no write lock means no
         // `calculate_solid_volume`, so the write-path fingerprint cannot be
         // reproduced without upgrading the lock. Use the default (full) path to
@@ -2206,12 +2214,35 @@ pub async fn part_perception(
                 "reconcile".to_string(),
                 serde_json::json!({ "status": "pending" }),
             );
+            // Additive: `verified`/`status` never replace the existing
+            // `sound` field's meaning (B-Rep validity, on this fast path) —
+            // they name whether that reading has a fresh full certificate
+            // behind it at all.
+            map.insert(
+                "verified".to_string(),
+                serde_json::json!(!reading.is_stale()),
+            );
+            map.insert(
+                "status".to_string(),
+                serde_json::json!(reading.status_label()),
+            );
         }
         return Ok(Json(perception_val));
     }
 
     // DEFAULT (and `?full=1` no-op alias): the FULL certificate. Write lock —
-    // `certify_solid` warms a per-face centroid cache; geometry is never mutated.
+    // `certify_solid` warms a per-face centroid cache; geometry is never
+    // mutated. This IS the explicit-verification mechanism `verify_part`
+    // (roshera-mcp's `tools/perception.ts`) relies on — it calls this exact
+    // path via `?full=1` — and MCP's ambient `perceive()` calls it after
+    // every tool by design ("feedback-as-default"; see
+    // `part_perception_endpoint_full_by_default_lightweight_with_fast` and
+    // `export_succeeds_after_explicit_verification` in
+    // `router_integration_tests.rs`). That contract is deliberately left
+    // untouched here — this only ADDS the same honest `status`/`verified`
+    // fields the `?fast=1` path above now reports, read via
+    // `soundness_reading` AFTER the recompute so they describe the
+    // just-established state rather than asserting one.
     let mut model = model_handle.write().await;
     if model.solids.get(sid).is_none() {
         return Err(StatusCode::NOT_FOUND);
@@ -2242,9 +2273,18 @@ pub async fn part_perception(
             .unwrap_or_else(|_| serde_json::json!({ "status": "pending" })),
         None => serde_json::json!({ "status": "pending" }),
     };
+    // Post-recompute freshness read (never itself recomputes): reports the
+    // state `certify_solid` just established. Additive, uniform with the
+    // `?fast=1` path's own `status`/`verified` fields.
+    let status = model
+        .soundness_reading(sid)
+        .map(|r| r.status_label())
+        .unwrap_or("stale");
     Ok(Json(serde_json::json!({
         "solid_id":          id,
         "sound":             sound,
+        "status":            status,
+        "verified":          status != "stale",
         "verdict":           verdict,
         // B-Rep + export-mesh facts (kept for backward compatibility).
         "valid":             valid,

@@ -17,7 +17,9 @@
 
 #![cfg(test)]
 
-use crate::durability_boot_tests::{build_state, dispatch, get, open_db, post, temp_db_path};
+use crate::durability_boot_tests::{
+    build_state, del, dispatch, get, open_db, patch, post, temp_db_path,
+};
 use crate::{blackboard::BlackboardScope, documents, durability};
 
 use axum::http::StatusCode;
@@ -244,4 +246,334 @@ async fn pre_existing_default_document_still_served_and_gets_registered() {
         default_doc["active"], true,
         "the default document is the one live on a fresh boot"
     );
+}
+
+// ── DELETE /api/documents/{id} ────────────────────────────────────────
+
+/// Refusal 1: deleting the currently ACTIVE document is refused — deleting
+/// what is loaded right now is a foot-gun. The document must still open
+/// (i.e. it was NOT removed) after the refusal.
+#[tokio::test]
+async fn deleting_active_document_is_refused() {
+    let db = open_db(&temp_db_path()).await;
+    let state = build_state(db, true).await;
+
+    let (_, body) = dispatch(&state, post("/api/documents", json!({ "name": "A" }))).await;
+    let id_a = body["id"].as_str().expect("id").to_string();
+    let (_, body) = dispatch(&state, post("/api/documents", json!({ "name": "B" }))).await;
+    let id_b = body["id"].as_str().expect("id").to_string();
+
+    // Make A active.
+    let (status, _) = dispatch(
+        &state,
+        post(&format!("/api/documents/{id_a}/open"), json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "open A");
+
+    let (status, body) = dispatch(&state, del(&format!("/api/documents/{id_a}"))).await;
+    assert_eq!(status, StatusCode::CONFLICT, "body = {body}");
+    assert_eq!(body["error_code"], "document_delete_refused_active");
+
+    // A must still be openable — nothing was removed.
+    let (status, _) = dispatch(
+        &state,
+        post(&format!("/api/documents/{id_a}/open"), json!({})),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "A must still open after the refused delete"
+    );
+
+    // Registry still lists both.
+    let (_, body) = dispatch(&state, get("/api/documents")).await;
+    let docs = body.as_array().expect("array");
+    assert!(docs.iter().any(|d| d["id"] == id_a));
+    assert!(docs.iter().any(|d| d["id"] == id_b));
+}
+
+/// Refusal 2: deleting the LAST remaining document is refused — the app
+/// must never be left with zero documents.
+#[tokio::test]
+async fn deleting_last_document_is_refused() {
+    let db = open_db(&temp_db_path()).await;
+    let state = build_state(db, true).await; // no default-document self-heal
+
+    let (_, body) = dispatch(&state, post("/api/documents", json!({ "name": "Solo" }))).await;
+    let id = body["id"].as_str().expect("id").to_string();
+    // Never opened — the live `active_document` stays at the (unregistered)
+    // durability default, so this document is neither active nor default,
+    // isolating the "last remaining" refusal from the other two.
+
+    let (_, body) = dispatch(&state, get("/api/documents")).await;
+    assert_eq!(
+        body.as_array().expect("array").len(),
+        1,
+        "exactly one registered document going in"
+    );
+
+    let (status, body) = dispatch(&state, del(&format!("/api/documents/{id}"))).await;
+    assert_eq!(status, StatusCode::CONFLICT, "body = {body}");
+    assert_eq!(body["error_code"], "document_delete_refused_last");
+
+    let (status, _) = dispatch(
+        &state,
+        post(&format!("/api/documents/{id}/open"), json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "the sole document must still open");
+}
+
+/// Refusal 3: deleting the DEFAULT document is refused — it carries the
+/// pre-existing legacy event ledger; removing it must be a deliberate
+/// admin act, never reachable via this route.
+#[tokio::test]
+async fn deleting_default_document_is_refused() {
+    let db = open_db(&temp_db_path()).await;
+    let state = build_state(db, true).await;
+    documents::ensure_default_document_registered(&state).await;
+
+    // A second document so the default isn't ALSO the last remaining one —
+    // isolates this refusal from the "last" refusal — and open it so the
+    // default isn't ALSO the active one either.
+    let (_, body) = dispatch(&state, post("/api/documents", json!({ "name": "Other" }))).await;
+    let id_other = body["id"].as_str().expect("id").to_string();
+    let (status, _) = dispatch(
+        &state,
+        post(&format!("/api/documents/{id_other}/open"), json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "open Other");
+
+    let default_id = durability::DURABILITY_SESSION_ID;
+    let (status, body) = dispatch(&state, del(&format!("/api/documents/{default_id}"))).await;
+    assert_eq!(status, StatusCode::CONFLICT, "body = {body}");
+    assert_eq!(body["error_code"], "document_delete_refused_default");
+
+    let (status, _) = dispatch(
+        &state,
+        post(&format!("/api/documents/{default_id}/open"), json!({})),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the default document must still open"
+    );
+}
+
+/// DELETE on an unknown id 404s exactly like every other document route.
+#[tokio::test]
+async fn deleting_an_unknown_document_id_404s() {
+    let db = open_db(&temp_db_path()).await;
+    let state = build_state(db, true).await;
+    let (status, body) = dispatch(&state, del("/api/documents/not-a-real-document")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "body = {body}");
+    assert_eq!(body["error_code"], "document_not_found");
+}
+
+/// THE positive proof: a successful delete removes the registry row AND
+/// every scoped row — durable timeline events, a durable (non-main)
+/// branch record, and the in-memory Blackboard notebook — not just the
+/// catalog entry. Also proves the deletion is genuinely transactional in
+/// spirit: every scoped store that had data before the delete has NONE
+/// after, checked directly against the database/manager, never through
+/// the registry wrapper alone.
+#[tokio::test]
+async fn deleting_a_document_removes_registry_and_every_scoped_row() {
+    let db = open_db(&temp_db_path()).await;
+    let state = build_state(db, true).await;
+
+    let (_, body) = dispatch(&state, post("/api/documents", json!({ "name": "Doomed" }))).await;
+    let id_doomed = body["id"].as_str().expect("id").to_string();
+    let (_, body) = dispatch(
+        &state,
+        post("/api/documents", json!({ "name": "Survivor" })),
+    )
+    .await;
+    let id_survivor = body["id"].as_str().expect("id").to_string();
+
+    // Open Doomed and give it real scoped data: a timeline event, a
+    // non-main branch, and a Blackboard note.
+    let (status, _) = dispatch(
+        &state,
+        post(&format!("/api/documents/{id_doomed}/open"), json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "open Doomed");
+
+    create_a_box(&state).await;
+    let (status, body) = dispatch(
+        &state,
+        post("/api/branches", json!({ "name": "doomed-sandbox" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "create branch; body = {body}");
+    let (status, _) = dispatch(
+        &state,
+        post(
+            "/api/blackboard/entries",
+            json!({ "text": "note in Doomed" }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "add note to Doomed");
+
+    // Sanity: the scoped data really is there before the delete.
+    let events_before = state
+        .database
+        .get_event_count(&id_doomed)
+        .await
+        .expect("count events");
+    assert!(events_before >= 1, "box must be durably persisted");
+    let branches_before = state
+        .database
+        .load_branches(&id_doomed)
+        .await
+        .expect("load branches");
+    assert!(
+        !branches_before.is_empty(),
+        "the sandbox branch must be durably persisted"
+    );
+    assert!(
+        state
+            .blackboard
+            .has_notebook(&id_doomed, &BlackboardScope::Document),
+        "the Blackboard note must have created a notebook"
+    );
+
+    // Switch away so Doomed is no longer active, then delete it.
+    let (status, _) = dispatch(
+        &state,
+        post(&format!("/api/documents/{id_survivor}/open"), json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "open Survivor");
+
+    let (status, body) = dispatch(&state, del(&format!("/api/documents/{id_doomed}"))).await;
+    assert_eq!(status, StatusCode::OK, "delete Doomed; body = {body}");
+    assert_eq!(body["success"], true);
+
+    // Registry row gone.
+    let (_, body) = dispatch(&state, get("/api/documents")).await;
+    let docs = body.as_array().expect("array");
+    assert!(
+        !docs.iter().any(|d| d["id"] == id_doomed),
+        "Doomed must no longer be registered"
+    );
+    assert!(
+        docs.iter().any(|d| d["id"] == id_survivor),
+        "Survivor must be untouched"
+    );
+
+    // Scoped rows gone — checked directly, not via the registry.
+    let events_after = state
+        .database
+        .get_event_count(&id_doomed)
+        .await
+        .expect("count events after delete");
+    assert_eq!(events_after, 0, "timeline_events for Doomed must be gone");
+    let branches_after = state
+        .database
+        .load_branches(&id_doomed)
+        .await
+        .expect("load branches after delete");
+    assert!(
+        branches_after.is_empty(),
+        "durable_branches for Doomed must be gone"
+    );
+    assert!(
+        !state
+            .blackboard
+            .has_notebook(&id_doomed, &BlackboardScope::Document),
+        "Doomed's Blackboard notebook must be purged"
+    );
+
+    // Deleting Doomed again 404s — it is genuinely gone, not just hidden.
+    let (status, body) = dispatch(&state, del(&format!("/api/documents/{id_doomed}"))).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "body = {body}");
+    assert_eq!(body["error_code"], "document_not_found");
+}
+
+// ── PATCH /api/documents/{id} (rename) ────────────────────────────────
+
+/// A rename round-trips through `GET /api/documents`.
+#[tokio::test]
+async fn rename_round_trips_through_list() {
+    let db = open_db(&temp_db_path()).await;
+    let state = build_state(db, true).await;
+
+    let (_, body) = dispatch(
+        &state,
+        post("/api/documents", json!({ "name": "Old Name" })),
+    )
+    .await;
+    let id = body["id"].as_str().expect("id").to_string();
+
+    let (status, body) = dispatch(
+        &state,
+        patch(
+            &format!("/api/documents/{id}"),
+            json!({ "name": "  New Name  " }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body = {body}");
+    assert_eq!(body["name"], "New Name", "the name is trimmed");
+
+    let (_, body) = dispatch(&state, get("/api/documents")).await;
+    let docs = body.as_array().expect("array");
+    let renamed = docs
+        .iter()
+        .find(|d| d["id"] == id)
+        .expect("renamed document must still be listed");
+    assert_eq!(renamed["name"], "New Name");
+}
+
+/// Rename validation: empty (after trim), too long, and control characters
+/// are all rejected as `invalid_parameter`, and none of them mutate the
+/// stored name.
+#[tokio::test]
+async fn rename_rejects_invalid_names() {
+    let db = open_db(&temp_db_path()).await;
+    let state = build_state(db, true).await;
+    let (_, body) = dispatch(&state, post("/api/documents", json!({ "name": "Keep Me" }))).await;
+    let id = body["id"].as_str().expect("id").to_string();
+
+    for bad in [
+        json!(""),
+        json!("   "),
+        json!("a\u{0007}b"),
+        json!("x".repeat(500)),
+    ] {
+        let (status, body) = dispatch(
+            &state,
+            patch(&format!("/api/documents/{id}"), json!({ "name": bad })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body = {body}");
+        assert_eq!(body["error_code"], "invalid_parameter");
+    }
+
+    // The name must be untouched by the rejected attempts.
+    let (_, body) = dispatch(&state, get("/api/documents")).await;
+    let docs = body.as_array().expect("array");
+    let doc = docs.iter().find(|d| d["id"] == id).expect("must be listed");
+    assert_eq!(doc["name"], "Keep Me");
+}
+
+/// Rename on an unknown id 404s.
+#[tokio::test]
+async fn rename_unknown_document_404s() {
+    let db = open_db(&temp_db_path()).await;
+    let state = build_state(db, true).await;
+    let (status, body) = dispatch(
+        &state,
+        patch("/api/documents/not-a-real-document", json!({ "name": "X" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "body = {body}");
+    assert_eq!(body["error_code"], "document_not_found");
 }

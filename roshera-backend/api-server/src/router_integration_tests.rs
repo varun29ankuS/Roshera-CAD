@@ -4351,6 +4351,86 @@ async fn export_succeeds_after_explicit_verification() {
     );
 }
 
+/// GATE (the polling-surface fix): a solid that has NEVER been verified
+/// reads back an honest `status: "stale"` / `verified: false` from `GET
+/// .../perception?fast=1` — the cheap, read-lock-only path a status/
+/// perception poller (e.g. the Agent Eye panel) can call every tick
+/// without ever provoking a 422. This is additive: `sound` on the fast
+/// path keeps its existing (B-Rep-validity) meaning, and `status`/
+/// `verified` are new fields describing whether a fresh full certificate
+/// backs that reading at all. `?fast=1` never recomputes — `verify_part`
+/// (default/`?full=1`) is unaffected and still the only call that clears
+/// the gate (see `export_succeeds_after_explicit_verification` above).
+#[tokio::test]
+async fn fast_perception_reports_never_verified_as_an_honest_state_not_a_refusal() {
+    let state = make_test_state().await;
+    let (_uuid, solid_id, _edges) = seed_box(&state, 10.0).await;
+
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri(format!("/api/agent/parts/{solid_id}/perception?fast=1"))
+        .body(Body::empty())
+        .expect("static request must build");
+    let (status, body) = dispatch(&state, request).await;
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a status/perception poll must never itself refuse — an unverified \
+         part is a readable state, not an HTTP error; body = {body}"
+    );
+    assert_eq!(
+        body["status"].as_str(),
+        Some("stale"),
+        "a never-verified solid must read back status:\"stale\"; body = {body}"
+    );
+    assert_eq!(
+        body["verified"].as_bool(),
+        Some(false),
+        "a never-verified solid must read back verified:false; body = {body}"
+    );
+    // The fast path's `sound` keeps its existing B-Rep-validity meaning —
+    // a fresh box IS a valid B-Rep even though no full certificate has run.
+    assert_eq!(
+        body["sound"].as_bool(),
+        Some(true),
+        "fast-path `sound` must not be repurposed by the staleness fields; \
+         body = {body}"
+    );
+
+    // After the explicit full verification (`?full=1` / default, what
+    // `verify_part` calls), the SAME fast-path read must flip to
+    // status:"sound", verified:true — proving the two fields track the
+    // real kernel cache, not a fixed/mocked value.
+    let verify_req = Request::builder()
+        .method(Method::GET)
+        .uri(format!("/api/agent/parts/{solid_id}/perception"))
+        .body(Body::empty())
+        .expect("static request must build");
+    let (verify_status, verify_body) = dispatch(&state, verify_req).await;
+    assert_eq!(
+        verify_status,
+        StatusCode::OK,
+        "verify must succeed; body = {verify_body}"
+    );
+    assert_eq!(verify_body["status"].as_str(), Some("sound"));
+    assert_eq!(verify_body["verified"].as_bool(), Some(true));
+
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri(format!("/api/agent/parts/{solid_id}/perception?fast=1"))
+        .body(Body::empty())
+        .expect("static request must build");
+    let (status, body) = dispatch(&state, request).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["status"].as_str(),
+        Some("sound"),
+        "after an explicit verify, the fast path must reflect it; body = {body}"
+    );
+    assert_eq!(body["verified"].as_bool(), Some(true));
+}
+
 /// `POST .../dfm` on a never-verified solid is refused pre-flight (422) —
 /// no rule ever runs against unverified geometry, so a DFM `pass` can never
 /// be laundering a guess as authority.

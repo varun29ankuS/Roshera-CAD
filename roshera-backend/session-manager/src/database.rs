@@ -32,34 +32,13 @@ fn role_from_str(s: &str) -> Role {
     }
 }
 
-/// Parse a permission string (Debug repr of `Permission`) back into the enum.
-/// Returns `None` for unknown variants so callers can `filter_map` cleanly.
+/// Parse a permission string (the canonical PascalCase wire form) back
+/// into the enum. Returns `None` for unknown variants so callers can
+/// `filter_map` cleanly. A thin wrapper over [`Permission::from_str`] —
+/// the single canonical codec — so this module never carries its own
+/// copy of the variant list to drift out of sync with it.
 fn permission_from_str(s: &str) -> Option<Permission> {
-    Some(match s {
-        "DeleteSession" => Permission::DeleteSession,
-        "InviteUsers" => Permission::InviteUsers,
-        "RemoveUsers" => Permission::RemoveUsers,
-        "ChangeRoles" => Permission::ChangeRoles,
-        "ModifySettings" => Permission::ModifySettings,
-        "CreateGeometry" => Permission::CreateGeometry,
-        "ModifyGeometry" => Permission::ModifyGeometry,
-        "DeleteGeometry" => Permission::DeleteGeometry,
-        "BooleanOperations" => Permission::BooleanOperations,
-        "AdvancedFeatures" => Permission::AdvancedFeatures,
-        "ViewGeometry" => Permission::ViewGeometry,
-        "MeasureGeometry" => Permission::MeasureGeometry,
-        "ExportGeometry" => Permission::ExportGeometry,
-        "TakeScreenshots" => Permission::TakeScreenshots,
-        "UndoRedo" => Permission::UndoRedo,
-        "CreateBranches" => Permission::CreateBranches,
-        "MergeBranches" => Permission::MergeBranches,
-        "ViewHistory" => Permission::ViewHistory,
-        "AddComments" => Permission::AddComments,
-        "VoiceChat" => Permission::VoiceChat,
-        "ScreenShare" => Permission::ScreenShare,
-        "RecordSession" => Permission::RecordSession,
-        _ => return None,
-    })
+    Permission::from_str(s)
 }
 
 use async_trait::async_trait;
@@ -226,6 +205,15 @@ pub trait DatabasePersistence: Send + Sync {
     async fn save_document(&self, document: &DocumentRecord) -> Result<(), SessionError>;
     /// All registered documents, oldest first.
     async fn load_documents(&self) -> Result<Vec<DocumentRecord>, SessionError>;
+    /// Delete a document's registry row AND every row scoped under its id
+    /// (`timeline_events`, `durable_branches`) in ONE transaction — the
+    /// registry row and its data are removed together, or neither is; a
+    /// document that lists but cannot open (or vice versa) is worse than
+    /// one that stays. This is the unconditional data-layer primitive —
+    /// the active/last/default refusals live at the HTTP handler, not
+    /// here, so this method has no opinion about which document it is
+    /// asked to delete.
+    async fn delete_document(&self, id: &str) -> Result<(), SessionError>;
 }
 
 /// Session metadata
@@ -1069,16 +1057,21 @@ impl DatabasePersistence for PostgresDatabase {
         session_id: &str,
         permissions: &UserPermissions,
     ) -> Result<(), SessionError> {
+        // Written via the canonical codec (`Permission::as_str`), not
+        // `format!("{:?}", p)` — the reader (`permission_from_str`,
+        // just above) decodes through the same codec's `from_str`, so
+        // writer and reader can never drift out of sync with each other
+        // the way a hand-maintained Debug-vs-match pair could.
         let explicit_perms: Vec<String> = permissions
             .explicit_permissions
             .iter()
-            .map(|p| format!("{:?}", p))
+            .map(|p| p.as_str().to_string())
             .collect();
 
         let denied_perms: Vec<String> = permissions
             .denied_permissions
             .iter()
-            .map(|p| format!("{:?}", p))
+            .map(|p| p.as_str().to_string())
             .collect();
 
         sqlx::query(
@@ -1180,60 +1173,12 @@ impl DatabasePersistence for PostgresDatabase {
 
                 let explicit_permissions = explicit_perms
                     .into_iter()
-                    .filter_map(|p| match p.as_str() {
-                        "DeleteSession" => Some(Permission::DeleteSession),
-                        "InviteUsers" => Some(Permission::InviteUsers),
-                        "RemoveUsers" => Some(Permission::RemoveUsers),
-                        "ChangeRoles" => Some(Permission::ChangeRoles),
-                        "ModifySettings" => Some(Permission::ModifySettings),
-                        "CreateGeometry" => Some(Permission::CreateGeometry),
-                        "ModifyGeometry" => Some(Permission::ModifyGeometry),
-                        "DeleteGeometry" => Some(Permission::DeleteGeometry),
-                        "BooleanOperations" => Some(Permission::BooleanOperations),
-                        "AdvancedFeatures" => Some(Permission::AdvancedFeatures),
-                        "ViewGeometry" => Some(Permission::ViewGeometry),
-                        "MeasureGeometry" => Some(Permission::MeasureGeometry),
-                        "ExportGeometry" => Some(Permission::ExportGeometry),
-                        "TakeScreenshots" => Some(Permission::TakeScreenshots),
-                        "UndoRedo" => Some(Permission::UndoRedo),
-                        "CreateBranches" => Some(Permission::CreateBranches),
-                        "MergeBranches" => Some(Permission::MergeBranches),
-                        "ViewHistory" => Some(Permission::ViewHistory),
-                        "AddComments" => Some(Permission::AddComments),
-                        "VoiceChat" => Some(Permission::VoiceChat),
-                        "ScreenShare" => Some(Permission::ScreenShare),
-                        "RecordSession" => Some(Permission::RecordSession),
-                        _ => None,
-                    })
+                    .filter_map(|p| permission_from_str(&p))
                     .collect();
 
                 let denied_permissions = denied_perms
                     .into_iter()
-                    .filter_map(|p| match p.as_str() {
-                        "DeleteSession" => Some(Permission::DeleteSession),
-                        "InviteUsers" => Some(Permission::InviteUsers),
-                        "RemoveUsers" => Some(Permission::RemoveUsers),
-                        "ChangeRoles" => Some(Permission::ChangeRoles),
-                        "ModifySettings" => Some(Permission::ModifySettings),
-                        "CreateGeometry" => Some(Permission::CreateGeometry),
-                        "ModifyGeometry" => Some(Permission::ModifyGeometry),
-                        "DeleteGeometry" => Some(Permission::DeleteGeometry),
-                        "BooleanOperations" => Some(Permission::BooleanOperations),
-                        "AdvancedFeatures" => Some(Permission::AdvancedFeatures),
-                        "ViewGeometry" => Some(Permission::ViewGeometry),
-                        "MeasureGeometry" => Some(Permission::MeasureGeometry),
-                        "ExportGeometry" => Some(Permission::ExportGeometry),
-                        "TakeScreenshots" => Some(Permission::TakeScreenshots),
-                        "UndoRedo" => Some(Permission::UndoRedo),
-                        "CreateBranches" => Some(Permission::CreateBranches),
-                        "MergeBranches" => Some(Permission::MergeBranches),
-                        "ViewHistory" => Some(Permission::ViewHistory),
-                        "AddComments" => Some(Permission::AddComments),
-                        "VoiceChat" => Some(Permission::VoiceChat),
-                        "ScreenShare" => Some(Permission::ScreenShare),
-                        "RecordSession" => Some(Permission::RecordSession),
-                        _ => None,
-                    })
+                    .filter_map(|p| permission_from_str(&p))
                     .collect();
 
                 UserPermissions {
@@ -1567,6 +1512,53 @@ impl DatabasePersistence for PostgresDatabase {
                 reason: format!("Failed to load documents: {}", e),
             })?;
         Ok(rows.into_iter().map(row_to_document_record_pg).collect())
+    }
+
+    async fn delete_document(&self, id: &str) -> Result<(), SessionError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| SessionError::PersistenceError {
+                reason: format!("Failed to begin document delete transaction: {}", e),
+            })?;
+
+        sqlx::query("DELETE FROM timeline_events WHERE session_id = $1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| SessionError::PersistenceError {
+                reason: format!(
+                    "Failed to delete timeline_events for document '{id}': {}",
+                    e
+                ),
+            })?;
+
+        sqlx::query("DELETE FROM durable_branches WHERE session_id = $1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| SessionError::PersistenceError {
+                reason: format!(
+                    "Failed to delete durable_branches for document '{id}': {}",
+                    e
+                ),
+            })?;
+
+        sqlx::query("DELETE FROM documents WHERE id = $1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| SessionError::PersistenceError {
+                reason: format!("Failed to delete document row '{id}': {}", e),
+            })?;
+
+        tx.commit()
+            .await
+            .map_err(|e| SessionError::PersistenceError {
+                reason: format!("Failed to commit document delete transaction: {}", e),
+            })?;
+        Ok(())
     }
 }
 
@@ -2742,6 +2734,53 @@ impl DatabasePersistence for SqliteDatabase {
             .into_iter()
             .map(row_to_document_record_sqlite)
             .collect())
+    }
+
+    async fn delete_document(&self, id: &str) -> Result<(), SessionError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| SessionError::PersistenceError {
+                reason: format!("Failed to begin document delete transaction: {}", e),
+            })?;
+
+        sqlx::query("DELETE FROM timeline_events WHERE session_id = ?1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| SessionError::PersistenceError {
+                reason: format!(
+                    "Failed to delete timeline_events for document '{id}': {}",
+                    e
+                ),
+            })?;
+
+        sqlx::query("DELETE FROM durable_branches WHERE session_id = ?1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| SessionError::PersistenceError {
+                reason: format!(
+                    "Failed to delete durable_branches for document '{id}': {}",
+                    e
+                ),
+            })?;
+
+        sqlx::query("DELETE FROM documents WHERE id = ?1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| SessionError::PersistenceError {
+                reason: format!("Failed to delete document row '{id}': {}", e),
+            })?;
+
+        tx.commit()
+            .await
+            .map_err(|e| SessionError::PersistenceError {
+                reason: format!("Failed to commit document delete transaction: {}", e),
+            })?;
+        Ok(())
     }
 }
 

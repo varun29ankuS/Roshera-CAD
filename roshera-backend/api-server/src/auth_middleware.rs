@@ -500,20 +500,22 @@ async fn validate_api_key(
         Ok(key_info) => {
             info!("API key validated for user: {}", key_info.user_id);
 
-            // Convert string permissions to Permission enum
+            // Decode the stored permission strings back into `Permission`
+            // via the one canonical codec (`Permission::from_str`,
+            // `session-manager/src/permissions.rs`). This used to match
+            // a hand-written snake_case alphabet ("create_geometry", …)
+            // that no writer in the codebase ever produced — every key's
+            // permissions are minted and persisted in the PascalCase
+            // form (`get_user_permission_strings`, `provision_api_key`,
+            // the SQL persistence path in `database.rs`), so every
+            // string here silently fell through to `None` and any
+            // API-key-authenticated request — including a goose ACP
+            // session's minted agent key — carried an EMPTY permission
+            // set no matter what it was provisioned with.
             let permissions: Vec<Permission> = key_info
                 .permissions
                 .iter()
-                .filter_map(|p| match p.as_str() {
-                    "create_geometry" => Some(Permission::CreateGeometry),
-                    "modify_geometry" => Some(Permission::ModifyGeometry),
-                    "delete_geometry" => Some(Permission::DeleteGeometry),
-                    "view_geometry" => Some(Permission::ViewGeometry),
-                    "export_geometry" => Some(Permission::ExportGeometry),
-                    "record_session" => Some(Permission::RecordSession),
-                    "modify_settings" => Some(Permission::ModifySettings),
-                    _ => None,
-                })
+                .filter_map(|p| Permission::from_str(p))
                 .collect();
 
             Ok(AuthInfo {
@@ -813,6 +815,64 @@ mod tests {
     #[tokio::test]
     async fn test_auth_middleware() {
         // Test implementation
+    }
+
+    /// THE discriminating regression test for `validate_api_key`'s
+    /// decode alphabet. Every writer in this codebase mints/persists
+    /// permission strings in PascalCase (`get_user_permission_strings`,
+    /// `provision_api_key_handler`, the goose ACP agent-key mint in
+    /// `goose_acp.rs`, the SQL round-trip in `session-manager`'s
+    /// `database.rs`), but this function's decoder used to match a
+    /// snake_case alphabet ("create_geometry", …) that no writer ever
+    /// produced — so `filter_map` fell through to `None` on every
+    /// string and any API-key-authenticated request carried an EMPTY
+    /// permission set no matter what it was provisioned with. This
+    /// mints a key exactly the way production does and decodes it
+    /// exactly the way `auth_middleware` does on every request.
+    #[tokio::test]
+    async fn api_key_permissions_survive_the_mint_and_validate_round_trip() {
+        let auth_manager = AuthManager::new(
+            session_manager::AuthConfig::default(),
+            "test-secret-not-a-real-jwt-key",
+        )
+        .expect("AuthManager::new with a default config and no DB must succeed");
+
+        let granted = vec![
+            Permission::ViewGeometry,
+            Permission::CreateGeometry,
+            Permission::ModifyGeometry,
+            Permission::ExportGeometry,
+            Permission::AddComments,
+            Permission::UndoRedo,
+        ];
+        let (raw_key, _minted) = auth_manager
+            .provision_api_key(
+                "round-trip-user",
+                "test-key",
+                granted.iter().map(|p| p.as_str().to_string()).collect(),
+                Some(1),
+                PrincipalKind::Agent {
+                    model: "test:model".to_string(),
+                },
+            )
+            .await
+            .expect("provisioning must succeed");
+
+        let decoded = validate_api_key(&auth_manager, &raw_key)
+            .await
+            .expect("a freshly minted, unexpired key must validate");
+
+        let decoded_set: std::collections::HashSet<Permission> =
+            decoded.permissions.into_iter().collect();
+        let expected_set: std::collections::HashSet<Permission> = granted.into_iter().collect();
+        assert_eq!(
+            decoded_set, expected_set,
+            "every permission minted onto an API key must decode back out \
+             through validate_api_key unchanged — a decoder using a \
+             different string alphabet than every writer silently empties \
+             the permission set, which is exactly the live defect this \
+             guards against"
+        );
     }
 
     /// Permission matrix for `enforce_permission`.

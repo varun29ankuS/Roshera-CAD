@@ -157,6 +157,23 @@ pub enum ErrorCode {
     /// route) referenced a document id that is not in the registry —
     /// never created, or a typo. Non-retryable from the same id.
     DocumentNotFound,
+    /// `DELETE /api/documents/{id}` targeted the document currently
+    /// loaded into the live model. Deleting the thing the caller (or
+    /// another client) is actively looking at is a foot-gun — the
+    /// caller must switch to a different document first. Non-retryable
+    /// without that switch.
+    DocumentDeleteRefusedActive,
+    /// `DELETE /api/documents/{id}` targeted the only document left in
+    /// the registry. The app must never be left in a zero-document
+    /// state, so the last document can never be removed. Non-retryable
+    /// — a new document must exist before this one can go.
+    DocumentDeleteRefusedLast,
+    /// `DELETE /api/documents/{id}` targeted the default document
+    /// (`durability::DURABILITY_SESSION_ID`, "Main Document"), which
+    /// carries the pre-existing legacy event ledger. Removing it is a
+    /// deliberate administrative act, never an ordinary UI affordance.
+    /// Non-retryable through this route.
+    DocumentDeleteRefusedDefault,
 
     // ── Sketch / constraint solver ────────────────────────────────
     /// A constraint mutation (e.g. PATCH on a dimensional value)
@@ -255,7 +272,10 @@ impl ErrorCode {
             | ErrorCode::TransactionNotActive
             | ErrorCode::BranchInvalidState
             | ErrorCode::BranchMergeConflict
-            | ErrorCode::SketchConstraintConflict => StatusCode::CONFLICT,
+            | ErrorCode::SketchConstraintConflict
+            | ErrorCode::DocumentDeleteRefusedActive
+            | ErrorCode::DocumentDeleteRefusedLast
+            | ErrorCode::DocumentDeleteRefusedDefault => StatusCode::CONFLICT,
             ErrorCode::IdempotencyBodyTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
 
             ErrorCode::SolidNotFound
@@ -316,6 +336,9 @@ impl ErrorCode {
             | ErrorCode::BranchInvalidState
             | ErrorCode::BranchMergeConflict
             | ErrorCode::DocumentNotFound
+            | ErrorCode::DocumentDeleteRefusedActive
+            | ErrorCode::DocumentDeleteRefusedLast
+            | ErrorCode::DocumentDeleteRefusedDefault
             | ErrorCode::SketchConstraintConflict
             | ErrorCode::AiNotConfigured
             | ErrorCode::AiProviderRefused
@@ -374,6 +397,9 @@ impl ErrorCode {
             ErrorCode::BranchInvalidState => "branch_invalid_state",
             ErrorCode::BranchMergeConflict => "branch_merge_conflict",
             ErrorCode::DocumentNotFound => "document_not_found",
+            ErrorCode::DocumentDeleteRefusedActive => "document_delete_refused_active",
+            ErrorCode::DocumentDeleteRefusedLast => "document_delete_refused_last",
+            ErrorCode::DocumentDeleteRefusedDefault => "document_delete_refused_default",
             ErrorCode::SketchConstraintConflict => "sketch_constraint_conflict",
             ErrorCode::AiNotConfigured => "ai_not_configured",
             ErrorCode::AiProviderRefused => "ai_provider_refused",
@@ -417,6 +443,9 @@ impl ErrorCode {
             ErrorCode::BranchInvalidState,
             ErrorCode::BranchMergeConflict,
             ErrorCode::DocumentNotFound,
+            ErrorCode::DocumentDeleteRefusedActive,
+            ErrorCode::DocumentDeleteRefusedLast,
+            ErrorCode::DocumentDeleteRefusedDefault,
             ErrorCode::SketchConstraintConflict,
             ErrorCode::AiNotConfigured,
             ErrorCode::AiProviderRefused,
@@ -644,6 +673,62 @@ impl ApiError {
              id in the X-Roshera-Part-Id header.",
             )
             .with_details(serde_json::json!({ "part_id": part_id }))
+    }
+
+    /// A document-scoped route referenced an id that is not in the
+    /// registry — never created, or a typo.
+    pub fn document_not_found(id: &str) -> Self {
+        Self::new(
+            ErrorCode::DocumentNotFound,
+            format!("document '{id}' is not registered"),
+        )
+        .with_hint(
+            "Call POST /api/documents to create it first, or GET /api/documents \
+             to list known ids.",
+        )
+        .with_details(serde_json::json!({ "document_id": id }))
+    }
+
+    /// `DELETE /api/documents/{id}` targeted the document currently
+    /// loaded into the live model.
+    pub fn document_delete_refused_active(id: &str) -> Self {
+        Self::new(
+            ErrorCode::DocumentDeleteRefusedActive,
+            format!("document '{id}' is the active document and cannot be deleted"),
+        )
+        .with_hint(
+            "Switch to a different document first with POST /api/documents/{id}/open, \
+             then retry the delete.",
+        )
+        .with_details(serde_json::json!({ "document_id": id }))
+    }
+
+    /// `DELETE /api/documents/{id}` targeted the only document left in
+    /// the registry.
+    pub fn document_delete_refused_last(id: &str) -> Self {
+        Self::new(
+            ErrorCode::DocumentDeleteRefusedLast,
+            format!("document '{id}' is the last remaining document and cannot be deleted"),
+        )
+        .with_hint(
+            "Create another document with POST /api/documents before deleting this one \
+             — the app must always have at least one document.",
+        )
+        .with_details(serde_json::json!({ "document_id": id }))
+    }
+
+    /// `DELETE /api/documents/{id}` targeted the default document
+    /// (`durability::DURABILITY_SESSION_ID`).
+    pub fn document_delete_refused_default(id: &str) -> Self {
+        Self::new(
+            ErrorCode::DocumentDeleteRefusedDefault,
+            format!("document '{id}' is the default document and cannot be deleted"),
+        )
+        .with_hint(
+            "The default document holds the pre-existing event ledger and cannot be \
+             removed through this route. This is a deliberate restriction, not a bug.",
+        )
+        .with_details(serde_json::json!({ "document_id": id }))
     }
 
     /// Caller is authenticated but lacks the required permission for
