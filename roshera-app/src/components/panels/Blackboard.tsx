@@ -14,6 +14,7 @@ import {
   Send,
   Loader2,
   ChevronDown,
+  GripHorizontal,
   Plus,
   Trash2,
 } from 'lucide-react'
@@ -42,6 +43,8 @@ export function Blackboard() {
   const addLine = useBlackboardStore((s) => s.addLine)
   const activeScope = useBlackboardStore((s) => s.activeScope)
   const setActiveScope = useBlackboardStore((s) => s.setActiveScope)
+  const agentAttention = useBlackboardStore((s) => s.agentAttention)
+  const streamingLineId = useBlackboardStore((s) => s.streamingLineId)
 
   // Drive the notebook scope from the viewport selection: the active part's
   // notebook is shown, so each part has its OWN blackboard. The primary
@@ -73,12 +76,72 @@ export function Blackboard() {
   const scrollRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLInputElement>(null)
 
-  // Auto-scroll to the newest line as the document grows.
+  /**
+   * ATTENTION-FOLLOWING SPLIT
+   * -------------------------
+   * The body's height follows what the agent is doing: expand while it
+   * writes/reasons, collapse to a strip (last line visible) the moment it is
+   * executing geometry so the viewport takes the space. A user drag on the
+   * top grip OVERRIDES the attention state and sticks until released
+   * (double-click the grip, or the "auto" chip). Pure presentation — the
+   * viewport is driven by ws-bridge/scene-store and updates when the kernel
+   * confirms, never gated by anything this panel does.
+   */
+  const [overrideHeight, setOverrideHeight] = useState<number | null>(null)
+  const [dragging, setDragging] = useState(false)
+  const dragRef = useRef<{ pointerId: number; startY: number; startHeight: number } | null>(null)
+
+  const attentionMaxHeight =
+    agentAttention === 'writing'
+      ? '62vh'
+      : agentAttention === 'geometry'
+        ? '5.25rem'
+        : '42vh'
+
+  const startDrag = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
+    const body = scrollRef.current
+    if (!body) return
+    e.preventDefault()
+    e.currentTarget.setPointerCapture(e.pointerId)
+    dragRef.current = {
+      pointerId: e.pointerId,
+      startY: e.clientY,
+      startHeight: body.getBoundingClientRect().height,
+    }
+    setDragging(true)
+  }, [])
+
+  const moveDrag = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
+    const drag = dragRef.current
+    if (!drag || drag.pointerId !== e.pointerId) return
+    // Panel is bottom-anchored: dragging the top edge up grows the body.
+    const next = drag.startHeight + (drag.startY - e.clientY)
+    const max = Math.round(window.innerHeight * 0.8)
+    setOverrideHeight(Math.min(Math.max(next, 72), max))
+  }, [])
+
+  const endDrag = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
+    if (dragRef.current?.pointerId !== e.pointerId) return
+    dragRef.current = null
+    // The override STICKS after the pointer lifts — attention-following
+    // resumes only when the user releases it explicitly.
+    setDragging(false)
+  }, [])
+
+  const releaseOverride = useCallback(() => {
+    dragRef.current = null
+    setDragging(false)
+    setOverrideHeight(null)
+  }, [])
+
+  // Auto-scroll to the newest content: new lines, streamed text growing the
+  // last line, and height changes (the geometry strip must show the latest
+  // line, not the top of the document).
   useEffect(() => {
     if (scrollRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight
     }
-  }, [lines.length])
+  }, [lines, agentAttention, overrideHeight])
 
   useEffect(() => {
     if (isPanelOpen) {
@@ -124,9 +187,22 @@ export function Blackboard() {
   }
 
   return (
-    <div className="absolute bottom-8 left-3 z-20 w-[50rem] max-w-[calc(100vw-1.5rem)] max-h-[60vh] flex flex-col rounded-xl overflow-hidden bg-background/35 backdrop-blur-md border border-border/60">
+    <div className="absolute bottom-8 left-3 z-20 w-[50rem] max-w-[calc(100vw-1.5rem)] flex flex-col rounded-xl overflow-hidden bg-background/35 backdrop-blur-md border border-border/60">
+      {/* Resize grip — a drag here overrides the attention-following split
+          and STICKS until released (double-click, or the "auto" chip). */}
+      <div
+        className="flex h-2.5 shrink-0 cursor-ns-resize items-center justify-center touch-none hover:bg-white/5"
+        onPointerDown={startDrag}
+        onPointerMove={moveDrag}
+        onPointerUp={endDrag}
+        onPointerCancel={endDrag}
+        onDoubleClick={releaseOverride}
+        title="Drag to size the board; it otherwise follows the agent's attention. Double-click to release."
+      >
+        <GripHorizontal size={11} className="text-muted-foreground/40" />
+      </div>
       {/* Header */}
-      <div className="flex items-center justify-between px-3 py-2 border-b border-white/5">
+      <div className="flex items-center justify-between px-3 py-1.5 border-b border-white/5">
         <div className="flex items-center gap-2 min-w-0">
           <NotebookPen size={14} className="text-primary shrink-0" />
           <span className="text-xs font-medium shrink-0">Blackboard</span>
@@ -137,8 +213,31 @@ export function Blackboard() {
           >
             · {scopeLabel}
           </span>
+          {/* Attention state, legible without reading the board. */}
+          {agentAttention === 'writing' && (
+            <span className="flex shrink-0 items-center gap-1 text-[10px] text-primary/90">
+              <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-primary" />
+              writing
+            </span>
+          )}
+          {agentAttention === 'geometry' && (
+            <span className="flex shrink-0 items-center gap-1 text-[10px] text-amber-400/90">
+              <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-amber-400" />
+              executing — viewport has focus
+            </span>
+          )}
         </div>
         <div className="flex items-center gap-0.5">
+          {overrideHeight !== null && (
+            <button
+              onClick={releaseOverride}
+              className="cad-icon-btn h-6 px-1.5 font-mono text-[10px] uppercase tracking-wide"
+              title="Release the manual size — follow the agent's attention again"
+              aria-label="Release manual size"
+            >
+              auto
+            </button>
+          )}
           <button
             onClick={() => addLine('', 'user')}
             className="cad-icon-btn h-6 w-6"
@@ -166,8 +265,23 @@ export function Blackboard() {
         </div>
       </div>
 
-      {/* Document of editable lines */}
-      <div ref={scrollRef} className="flex-1 overflow-y-auto min-h-0 max-h-[45vh]">
+      {/* Document of editable lines. Height follows the agent's attention
+          (or the user's sticky drag override); the transition is suppressed
+          while dragging so the grip tracks the pointer exactly. */}
+      <div
+        ref={scrollRef}
+        className="flex-1 overflow-y-auto min-h-0 scrollbar-thin"
+        style={
+          overrideHeight !== null
+            ? { height: `${overrideHeight}px`, maxHeight: '80vh' }
+            : {
+                maxHeight: attentionMaxHeight,
+                transition: dragging
+                  ? undefined
+                  : 'max-height 380ms cubic-bezier(0.4, 0, 0.2, 1)',
+              }
+        }
+      >
         <div className="py-2">
           {lines.map((line) => (
             <BlackboardLine
@@ -175,9 +289,12 @@ export function Blackboard() {
               line={line}
               onCommit={editLine}
               onDelete={deleteLine}
+              streaming={line.id === streamingLineId}
             />
           ))}
-          {isProcessing && (
+          {/* Shown only until the reply line exists — once streaming, the
+              line's own chalk cursor is the progress signal. */}
+          {isProcessing && streamingLineId === null && (
             <div className="flex items-center gap-2 px-3 py-2">
               <Loader2 size={14} className="animate-spin text-primary" />
               <span className="text-xs text-muted-foreground">Thinking...</span>

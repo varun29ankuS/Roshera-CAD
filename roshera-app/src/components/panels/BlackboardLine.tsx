@@ -2,12 +2,17 @@ import { useEffect, useRef, useState, useCallback } from 'react'
 import { cn } from '@/lib/utils'
 import type { BlackboardLine as Line } from '@/stores/blackboard-store'
 import { MessageMarkdown } from './MessageMarkdown'
+import { StreamingLineText } from './StreamingLineText'
+import { RevealContext } from './cards/reveal-context'
 import { Bot, User, Wrench, Trash2 } from 'lucide-react'
 
 interface Props {
   line: Line
   onCommit: (id: string, text: string) => void
   onDelete: (id: string) => void
+  /** True while this line is receiving streamed agent text — routes display
+   *  through the buffered renderer (math/cards typeset only when complete). */
+  streaming?: boolean
 }
 
 /**
@@ -18,10 +23,17 @@ interface Props {
  * by a subtle leading marker (agent → bot icon, user → person icon, system →
  * wrench icon for app-generated toolbar/operation feedback).
  */
-export function BlackboardLine({ line, onCommit, onDelete }: Props) {
+export function BlackboardLine({ line, onCommit, onDelete, streaming = false }: Props) {
   const [editing, setEditing] = useState(false)
   const [draft, setDraft] = useState(line.text)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
+
+  // Chalk-reveal gate, decided ONCE at mount: only agent content that just
+  // arrived animates (actively streaming, or created moments ago). Persisted
+  // history re-renders instantly — the reveal is for arrival, not reload.
+  const [reveal] = useState(() => ({
+    animate: line.author === 'agent' && (streaming || Date.now() - line.createdAt < 4000),
+  }))
 
   // Keep the draft in sync when the line text changes underneath us (e.g. an
   // agent line streaming in) — but only while we're NOT actively editing it.
@@ -110,12 +122,24 @@ export function BlackboardLine({ line, onCommit, onDelete }: Props) {
         ) : (
           <button
             type="button"
-            onClick={() => setEditing(true)}
+            onClick={streaming ? undefined : () => setEditing(true)}
             className="block w-full cursor-text select-text text-left text-sm leading-relaxed text-foreground/90"
-            title="Click to edit"
+            title={streaming ? undefined : 'Click to edit'}
           >
-            {line.text.trim() ? (
-              <MessageMarkdown content={line.text} />
+            {streaming ? (
+              line.text.trim() ? (
+                <RevealContext.Provider value={reveal}>
+                  <StreamingLineText text={line.text} />
+                </RevealContext.Provider>
+              ) : (
+                <span className="mt-0.5 inline-flex items-center">
+                  <span className="chalk-cursor" />
+                </span>
+              )
+            ) : line.text.trim() ? (
+              <RevealContext.Provider value={reveal}>
+                <MessageMarkdown content={line.text} />
+              </RevealContext.Provider>
             ) : (
               <span className="text-white/30 italic">Empty line — click to edit</span>
             )}

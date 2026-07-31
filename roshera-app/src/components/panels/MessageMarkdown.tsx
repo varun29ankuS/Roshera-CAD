@@ -1,9 +1,11 @@
-import { memo } from 'react'
+import { Children, isValidElement, memo, type ReactNode } from 'react'
 import ReactMarkdown from 'react-markdown'
 import type { Components } from 'react-markdown'
 import remarkMath from 'remark-math'
 import rehypeKatex from 'rehype-katex'
 import { cn } from '@/lib/utils'
+import { cardKindFromLanguage } from '@/lib/blackboard-cards'
+import { CardRenderer } from './cards/CardRenderer'
 
 /**
  * Renders agent prose with embedded LaTeX math. Inline `$...$` and block
@@ -24,6 +26,23 @@ interface Props {
   className?: string
 }
 
+/** True when a <pre> wraps a `roshera:*` typed-card code block — the card
+ *  renderer replaces the whole block, so the pre must not add code chrome. */
+function containsCardBlock(children: ReactNode): boolean {
+  return Children.toArray(children).some(
+    (child) =>
+      isValidElement(child) &&
+      cardKindFromLanguage((child.props as { className?: string }).className) !== null,
+  )
+}
+
+/** Flatten a code element's children to the raw fenced source. */
+function codeText(children: ReactNode): string {
+  return Children.toArray(children)
+    .map((c) => (typeof c === 'string' || typeof c === 'number' ? String(c) : ''))
+    .join('')
+}
+
 // Tighten the default markdown element spacing so equations and prose sit
 // comfortably inside the compact chat bubble rather than the browser defaults.
 const markdownComponents: Components = {
@@ -35,21 +54,36 @@ const markdownComponents: Components = {
     <ol className="my-1 ml-4 list-decimal space-y-0.5">{children}</ol>
   ),
   li: ({ children }) => <li className="leading-snug">{children}</li>,
-  code: ({ children, className: codeClass }) => (
-    <code
-      className={cn(
-        'rounded bg-foreground/10 px-1 py-0.5 font-mono text-[0.85em]',
-        codeClass,
-      )}
-    >
-      {children}
-    </code>
-  ),
-  pre: ({ children }) => (
-    <pre className="my-1 overflow-x-auto rounded bg-foreground/10 p-2 text-[0.85em]">
-      {children}
-    </pre>
-  ),
+  code: ({ children, className: codeClass }) => {
+    // A ```roshera:<kind> fence is a TYPED CARD, not a code sample: the
+    // payload (validated against the real wire shapes) renders as a
+    // structured result block. See lib/blackboard-cards.ts.
+    const cardKind = cardKindFromLanguage(codeClass)
+    if (cardKind !== null) {
+      return <CardRenderer kind={cardKind} source={codeText(children)} />
+    }
+    return (
+      <code
+        className={cn(
+          'rounded bg-foreground/10 px-1 py-0.5 font-mono text-[0.85em]',
+          codeClass,
+        )}
+      >
+        {children}
+      </code>
+    )
+  },
+  pre: ({ children }) => {
+    // Unwrap typed-card blocks — the card carries its own chrome.
+    if (containsCardBlock(children)) {
+      return <>{children}</>
+    }
+    return (
+      <pre className="my-1 overflow-x-auto rounded bg-foreground/10 p-2 text-[0.85em]">
+        {children}
+      </pre>
+    )
+  },
   a: ({ children, href }) => (
     <a
       href={href}
