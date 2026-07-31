@@ -49,6 +49,7 @@ import { processBlackboardMessage } from '@/lib/ai-client'
 import { exportSceneAs } from '@/lib/export-api'
 import { measureFaces, MeasureRefusalError } from '@/lib/measure-api'
 import { cn } from '@/lib/utils'
+import { ProviderSettingsButton } from '@/components/settings/ProviderSettingsDialog'
 import {
   ModifyDialog,
   type ModifyMode,
@@ -1510,6 +1511,11 @@ export function ToolBar() {
         {groups.map((group) => (
           <FlyoutGroup key={group.id} group={group} openId={openId} onToggle={handleToggle} />
         ))}
+        {/* The agent surface sits at the foot of the rail, separated: it
+            configures who Roshera talks to rather than acting on geometry. */}
+        <div className="mt-auto pt-2 w-full flex justify-center border-t border-border/60">
+          <ProviderSettingsButton />
+        </div>
       </div>
       <ModifyDialog
         open={modifyMode !== null}

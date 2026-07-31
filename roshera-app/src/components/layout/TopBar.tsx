@@ -345,6 +345,13 @@ export function TopBar() {
           </MenubarMenu>
         </Menubar>
 
+        {/* AI provider settings. Opens the modal that renders the
+            server-owned provider allowlist (allowlist.rs) and lets the
+            user select/configure a mode — never fabricates a working
+            provider for a build that hasn't shipped the endpoint yet.
+            Lives at the foot of the left tool rail, not here: it is a
+            standing surface, not a per-document control. */}
+
         <button
           onClick={useThemeStore.getState().toggleTheme}
           className="cad-icon-btn h-6 w-6"

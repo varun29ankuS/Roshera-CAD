@@ -1,0 +1,252 @@
+/**
+ * ACP ↔ BLACKBOARD WIRING
+ * =======================
+ * Drives the Blackboard's real presentation seams (`agentAttention`,
+ * `streamingLineId`, `setLineText`, `editLine` — all in
+ * `stores/blackboard-store.ts`) from a live `AcpClient` (`acp-client.ts`)
+ * instead of the legacy `/api/ai/command/stream` SSE path. Nothing here
+ * invents a new persistence path: every `addLine`/`editLine`/`setLineText`
+ * call goes through the same store reducers the legacy path used, so the
+ * installed adapter (`blackboard-api.ts`) auto-persists exactly as before.
+ *
+ * # Session lifecycle
+ * One shared `AcpClient` per browser tab, lazily created on first use and
+ * kept alive across turns (a fresh `session/new` per message would throw
+ * away the agent's conversational context). A dropped SSE stream cannot
+ * resume (protocol contract — see `acp-client.ts`), so a dead client is
+ * discarded and the next call transparently creates + connects a new one.
+ *
+ * # Card mapping — never weaken the renderer, always validate first
+ * `blackboard-cards.ts`'s `parseCard` is the single source of truth for
+ * what a `roshera:<kind>` fence may contain; this module never invents a
+ * looser acceptance path. A tool call's output is only ever rendered as a
+ * typed card when it VALIDATES against one of the existing schemas
+ * (dfm / fcf / refusal / merge / soundness) — tried in an order that
+ * favors the more specific shapes first so an ambiguous payload doesn't
+ * get mis-typed. Anything that doesn't validate stays a plain system
+ * line describing the tool call, never a fabricated card.
+ */
+
+import { useBlackboardStore } from '@/stores/blackboard-store'
+import { parseCard, type CardKind } from '@/lib/blackboard-cards'
+import {
+  AcpClient,
+  AcpConnectionDeadError,
+  type AcpSessionUpdate,
+  type AcpStopReason,
+} from '@/lib/acp-client'
+
+const FENCE = '```'
+
+// Tried in this order: a refusal is structurally the smallest/most
+// distinctive shape (bare `reason`), so it's checked first to avoid a
+// refusal payload accidentally validating against a looser schema.
+const CARD_KIND_PROBE_ORDER: CardKind[] = ['refusal', 'dfm', 'fcf', 'merge', 'soundness']
+
+/** Wrap `payload` as a `roshera:<kind>` fence IF it validates against that
+ *  kind's schema; otherwise `null`. Never widens what the renderer accepts. */
+function fenceIfValid(kind: CardKind, payload: unknown): string | null {
+  const source = JSON.stringify(payload, null, 2)
+  const parsed = parseCard(kind, source)
+  return parsed.ok ? `${FENCE}roshera:${kind}\n${source}\n${FENCE}` : null
+}
+
+/** Structural sniff across every known card schema — never by tool name
+ *  (a tool's declared name is not proof of its output shape). The first
+ *  schema that validates wins. */
+function cardFenceForPayload(payload: unknown): string | null {
+  if (payload === null || typeof payload !== 'object') return null
+  for (const kind of CARD_KIND_PROBE_ORDER) {
+    const fence = fenceIfValid(kind, payload)
+    if (fence) return fence
+  }
+  return null
+}
+
+/** Best-effort extraction of a tool call's structured result. Checked in
+ *  order of how literal the JSON is likely to be: `rawOutput` (the MCP
+ *  tool result, if the transport threads it through) first, then text
+ *  content blocks that happen to parse as JSON. Anything that doesn't
+ *  parse cleanly is left for `cardFenceForPayload` to reject. */
+function extractToolPayload(update: {
+  rawOutput?: unknown
+  content?: Array<{ type: string; [key: string]: unknown }>
+}): unknown {
+  if (update.rawOutput !== undefined && update.rawOutput !== null) return update.rawOutput
+  if (!Array.isArray(update.content)) return null
+  for (const block of update.content) {
+    const text =
+      typeof block.text === 'string'
+        ? block.text
+        : typeof (block.content as { text?: unknown } | undefined)?.text === 'string'
+          ? ((block.content as { text: string }).text as string)
+          : null
+    if (!text) continue
+    try {
+      return JSON.parse(text)
+    } catch {
+      continue
+    }
+  }
+  return null
+}
+
+function describeStopReason(reason: AcpStopReason): string {
+  switch (reason) {
+    case 'end_turn':
+      return ''
+    case 'cancelled':
+      return 'Cancelled.'
+    case 'refusal':
+      return 'The agent declined this request.'
+    case 'max_tokens':
+      return "Response truncated at the model's output limit."
+    case 'max_turn_requests':
+      return 'Turn stopped after reaching its tool-call budget.'
+    default:
+      return ''
+  }
+}
+
+/**
+ * Drive one prompt turn against a live, already-connected `AcpClient`,
+ * wiring `session/update` notifications into the Blackboard the same way
+ * the legacy streaming path drove it: a single agent line receives
+ * progressive text via `setLineText`, tool activity flips
+ * `agentAttention` to `'geometry'` and appends its own system line (with
+ * a validated card fence when the tool's output matches a known wire
+ * shape), and the turn commits a single `editLine` once `stopReason`
+ * arrives. Rethrows on failure so the caller (`ai-client.ts`) can classify
+ * and decide whether to fall back to the legacy transport.
+ */
+export async function runAcpTurn(client: AcpClient, text: string): Promise<void> {
+  const board = useBlackboardStore.getState()
+  board.setProcessing(true)
+  board.setAgentAttention('writing')
+
+  const lineId = board.addLine('', 'agent')
+  board.setStreamingLine(lineId)
+  let accumulated = ''
+  let sawContent = false
+  const toolLineIds = new Map<string, string>()
+
+  const setAttention = (a: 'idle' | 'writing' | 'geometry') =>
+    useBlackboardStore.getState().setAgentAttention(a)
+
+  const renderToolLine = (
+    toolCallId: string,
+    title: string,
+    status: string,
+    payload: unknown,
+  ) => {
+    const cardFence = payload !== null ? cardFenceForPayload(payload) : null
+    const line = cardFence ? `⚙ ${title} — ${status}\n\n${cardFence}` : `⚙ ${title} — ${status}`
+    const existing = toolLineIds.get(toolCallId)
+    if (existing) {
+      useBlackboardStore.getState().editLine(existing, line)
+    } else {
+      const id = useBlackboardStore.getState().addLine(line, 'system')
+      toolLineIds.set(toolCallId, id)
+    }
+  }
+
+  const unsubscribe = client.onUpdate((update: AcpSessionUpdate) => {
+    switch (update.sessionUpdate) {
+      case 'agent_message_chunk':
+      case 'agent_thought_chunk': {
+        const content = update.content
+        const chunk = content.type === 'text' ? (content as { text: string }).text : ''
+        if (!chunk) return
+        sawContent = true
+        accumulated += chunk
+        useBlackboardStore.getState().setLineText(lineId, accumulated)
+        return
+      }
+      case 'tool_call': {
+        const status = update.status ?? 'pending'
+        if (status === 'pending' || status === 'in_progress') setAttention('geometry')
+        renderToolLine(update.toolCallId, update.title ?? update.kind ?? 'tool call', status, null)
+        return
+      }
+      case 'tool_call_update': {
+        const status = update.status ?? 'in_progress'
+        if (status === 'pending' || status === 'in_progress') {
+          setAttention('geometry')
+        } else {
+          // completed / failed — the agent is back to writing/reasoning
+          // unless the turn has already ended (handled in `finally` below).
+          setAttention('writing')
+        }
+        const payload = extractToolPayload(update)
+        renderToolLine(update.toolCallId, update.title ?? 'tool call', status, payload)
+        return
+      }
+      default:
+        return // plan / forward-compat updates — not yet surfaced
+    }
+  })
+
+  try {
+    const { stopReason } = await client.prompt(text)
+    const trailing = describeStopReason(stopReason)
+    const finalText = sawContent
+      ? trailing
+        ? `${accumulated}\n\n${trailing}`
+        : accumulated
+      : trailing || 'Done.'
+    useBlackboardStore.getState().editLine(lineId, finalText)
+  } finally {
+    unsubscribe()
+    const b = useBlackboardStore.getState()
+    b.setStreamingLine(null)
+    b.setAgentAttention('idle')
+    b.setProcessing(false)
+  }
+}
+
+// ── Shared client lifecycle ─────────────────────────────────────────
+
+let sharedClient: AcpClient | null = null
+let sharedClientPromise: Promise<AcpClient> | null = null
+
+async function createAndConnect(): Promise<AcpClient> {
+  const client = new AcpClient()
+  await client.initialize()
+  await client.newSession()
+  return client
+}
+
+/** Returns a live, connected `AcpClient`, creating (or re-creating, after
+ *  a drop) one as needed. Concurrent callers during connection share the
+ *  same in-flight promise rather than racing two `session/new` calls. */
+export async function getAcpClient(): Promise<AcpClient> {
+  if (sharedClient && !sharedClient.isDead) return sharedClient
+  if (sharedClientPromise) return sharedClientPromise
+  sharedClientPromise = createAndConnect()
+    .then((client) => {
+      sharedClient = client
+      sharedClientPromise = null
+      return client
+    })
+    .catch((err) => {
+      sharedClientPromise = null
+      throw err
+    })
+  return sharedClientPromise
+}
+
+/** Discard the shared client (a dead connection, or a caller-requested
+ *  reset). The next `getAcpClient()` call creates a fresh one. */
+export function resetAcpClient(): void {
+  sharedClient?.close()
+  sharedClient = null
+  sharedClientPromise = null
+}
+
+/** Send a `session/cancel` on the shared client, if one exists and is
+ *  live. Wired to the Blackboard's stop control. */
+export function cancelAcpTurn(): void {
+  if (sharedClient && !sharedClient.isDead) sharedClient.cancel()
+}
+
+export { AcpConnectionDeadError }
