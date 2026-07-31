@@ -50,7 +50,7 @@ use session_manager::{
 };
 use std::collections::HashMap;
 use std::sync::Arc;
-use timeline_engine::{BranchManager, Timeline, TimelineConfig, TimelineRecorder};
+use timeline_engine::{Timeline, TimelineConfig, TimelineRecorder};
 use tokio::sync::{Mutex, RwLock};
 use tower::ServiceExt;
 use uuid::Uuid;
@@ -145,7 +145,6 @@ pub(crate) async fn make_test_state_with_database(
     ));
 
     let timeline = Arc::new(RwLock::new(Timeline::new(TimelineConfig::default())));
-    let branch_manager = Arc::new(BranchManager::new());
 
     let timeline_recorder = Arc::new(match sink {
         Some(s) => TimelineRecorder::new_with_sink(
@@ -202,7 +201,6 @@ pub(crate) async fn make_test_state_with_database(
         cache_manager,
         timeline,
         timeline_recorder: timeline_recorder.clone(),
-        branch_manager,
         hierarchy_manager,
         database,
         durability_status: Arc::new(RwLock::new(crate::durability::DurabilityStatus::Empty)),
@@ -237,6 +235,9 @@ pub(crate) async fn make_test_state_with_database(
         // values; tests that exercise the timeout path overwrite
         // `state.op_budgets` with a tiny budget before dispatching.
         op_budgets: crate::bounded_exec::OpBudgets::default(),
+        // RBAC A4 defaults; WS tests that exercise the pre-auth bounds
+        // overwrite this with tiny values before serving.
+        ws_auth_limits: crate::protocol::message_handlers::WsAuthLimits::default(),
     }
 }
 
@@ -5620,25 +5621,18 @@ async fn record_operation_rejects_request_carrying_a_forged_author_field() {
 /// end-to-end for `record_operation` (its GREEN test reads the
 /// recorded author back out of `GET /api/timeline/history/main`).
 ///
-/// This route's own end-to-end GREEN path is blocked by an UNRELATED
-/// pre-existing defect discovered while writing this test: the
-/// `state.branch_manager` this handler calls (`BranchManager::new()`,
-/// timeline-engine `branch/mod.rs`) never seeds `BranchId::main()`, so
-/// `create_branch` with a default (`main`) parent fails
-/// `BranchNotFound` → 500 before authorship is ever assigned — for ANY
-/// caller, regardless of this slice. (The frontend never hits this
-/// route for a related but distinct reason — see the comment in
-/// `Timeline.tsx`'s `submitBranchCreate` — and uses `POST /api/branches`
-/// / `branches.rs`, which goes through `Timeline::create_branch`
-/// instead, whose own `branches` map DOES seed `main`.) Fixing the
-/// orphaned `BranchManager` wiring is out of scope for authorship
-/// derivation and is not touched here.
-///
-/// `author_from_auth_info`'s mapping logic itself is covered directly
-/// by `author_from_auth_info_tests` in `handlers/timeline.rs`, and this
-/// test still proves the wire-shape half of the AUTHORSHIP-A1 fix for
-/// this route: a client-supplied `author` field is rejected before the
-/// (separately broken) handler body ever runs.
+/// History: when AUTHORSHIP-A1 landed, this test could only assert the
+/// wire-shape half (a forged `author` field is rejected as an unknown
+/// field) because the handler body 500'd unconditionally — it went
+/// through `BranchManager::create_branch`, whose `branches` map never
+/// seeded `BranchId::main()`, so authorship was never assigned for ANY
+/// caller. The 2026-07-31 one-lane collapse retired that path (the
+/// handler now goes through `Timeline::create_branch`, which seeds
+/// `main`), unblocking the end-to-end GREEN half below: create a
+/// branch legitimately, then read the derived author back out of
+/// `GET /api/branches` and assert it is the authenticated principal
+/// (the dev-bypass identity under this fixture), never `system` and
+/// never the author a client tried to forge.
 #[tokio::test]
 async fn create_branch_rejects_request_carrying_a_forged_author_field() {
     let state = make_test_state().await;
@@ -5665,6 +5659,175 @@ async fn create_branch_rejects_request_carrying_a_forged_author_field() {
     assert!(
         text.contains("unknown field") && text.contains("author"),
         "the rejection must name 'author' as the unknown field; body = {text}"
+    );
+
+    // GREEN half (previously blocked, see doc comment): a legitimate
+    // request succeeds and the recorded author is DERIVED from the
+    // authenticated principal. Under `make_test_state`'s
+    // `InsecureDevBypass` posture that principal is the dev identity
+    // (`user_id = "dev-insecure"`, `PrincipalKind::Human`), so the
+    // branch must read back as `user:dev-insecure` — not `system`, and
+    // certainly not the forged agent from the request above.
+    let (status, body) = dispatch(
+        &state,
+        json_post(
+            "/api/timeline/branch/create",
+            json!({
+                "name": "authorship-a1-honest-branch",
+                "purpose": {"type": "Experiment", "hypothesis": "authorship test"},
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a legitimate branch-create must succeed end-to-end; body = {body}"
+    );
+    let new_id = body["id"]
+        .as_str()
+        .expect("branch-create response must carry the new branch id")
+        .to_string();
+
+    let (status, body) = dispatch(&state, json_get("/api/branches")).await;
+    assert_eq!(status, StatusCode::OK, "branch listing; body = {body}");
+    let created = body
+        .as_array()
+        .expect("GET /api/branches must return an array")
+        .iter()
+        .find(|b| b["id"] == new_id.as_str())
+        .unwrap_or_else(|| {
+            panic!("created branch {new_id} must appear in the listing; body = {body}")
+        })
+        .clone();
+    assert_eq!(
+        created["author"], "user:dev-insecure",
+        "the branch's author must be derived from the authenticated principal \
+         (dev-bypass identity under this fixture), never asserted by the client \
+         and never `system`; branch = {created}"
+    );
+}
+
+/// One-lane collapse, direct regression: `POST /api/timeline/branch/create`
+/// with a DEFAULT parent (`main`) returns 200, not 500. Before the
+/// collapse this handler called `BranchManager::create_branch`, whose
+/// `BranchManager::new()` seeds no branches at all — the parent-exists
+/// check failed `BranchNotFound` for every caller and the route 500'd
+/// unconditionally (live wiring: `AppState.branch_manager`).
+#[tokio::test]
+async fn create_branch_with_default_parent_succeeds() {
+    let state = make_test_state().await;
+
+    let (status, body) = dispatch(
+        &state,
+        json_post(
+            "/api/timeline/branch/create",
+            json!({
+                "name": "default-parent-branch",
+                "purpose": {"type": "UserExploration", "description": "one-lane regression"},
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "branch creation with the default parent (`main`) must succeed — this \
+         was a 500 for EVERY caller while the route went through the \
+         never-seeded BranchManager; body = {body}"
+    );
+    assert!(
+        body["id"].as_str().map(|s| Uuid::parse_str(s).is_ok()) == Some(true),
+        "the response must carry the new branch's UUID; body = {body}"
+    );
+}
+
+/// Mutation-proof for the fork-index fix: with no explicit fork point
+/// the new branch must fork from the parent's HEAD, not from event
+/// zero. `Timeline::create_branch` resolves `None` to
+/// `get_branch_head(parent)` while `Some(0)` means literally event 0 —
+/// and the retired lane passed `0` with a comment claiming
+/// "Fork from latest". Record ≥2 events on `main`, branch with no
+/// explicit fork point, and assert the new branch inherited ALL of
+/// main's events. Reinstating `0` (or any fixed index) fails this.
+#[tokio::test]
+async fn create_branch_forks_from_parent_head_not_event_zero() {
+    let state = make_test_state().await;
+
+    // Two kernel ops on `main`, each recording at least one event.
+    for edge in [4.0, 6.0] {
+        let (s, b) = dispatch(
+            &state,
+            json_post(
+                "/api/geometry/box",
+                json!({"width": edge, "depth": edge, "height": edge}),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "box create must succeed; body = {b}");
+    }
+    // Barrier: drain the fire-and-forget recorder so the events are ON
+    // the timeline before the fork point is computed.
+    state
+        .timeline_recorder
+        .flush()
+        .await
+        .expect("recorder flush must succeed");
+
+    let (s, main_history) = dispatch(&state, json_get("/api/timeline/history/main")).await;
+    assert_eq!(s, StatusCode::OK, "main history; body = {main_history}");
+    let main_events = main_history
+        .as_array()
+        .expect("history must be an array")
+        .len();
+    assert!(
+        main_events >= 2,
+        "the seed must land at least two events on main; got {main_events}"
+    );
+
+    let (s, body) = dispatch(
+        &state,
+        json_post(
+            "/api/timeline/branch/create",
+            json!({
+                "name": "fork-from-head-branch",
+                "purpose": {"type": "Experiment", "hypothesis": "fork index"},
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "branch create must succeed; body = {body}"
+    );
+    let new_id = body["id"]
+        .as_str()
+        .expect("branch id in response")
+        .to_string();
+
+    let (s, listing) = dispatch(&state, json_get("/api/branches")).await;
+    assert_eq!(s, StatusCode::OK, "branch listing; body = {listing}");
+    let created = listing
+        .as_array()
+        .expect("array")
+        .iter()
+        .find(|b| b["id"] == new_id.as_str())
+        .unwrap_or_else(|| panic!("branch {new_id} must be listed; body = {listing}"))
+        .clone();
+
+    let inherited = created["event_count"].as_u64().unwrap_or(0) as usize;
+    assert_eq!(
+        inherited, main_events,
+        "a branch forked with no explicit fork point must inherit ALL {main_events} \
+         of main's events (fork at HEAD); {inherited} means it forked from an \
+         earlier index — the `Some(0)` \"fork from latest\" bug; branch = {created}"
+    );
+    let fork_idx = created["fork_point"]["event_index"].as_u64().unwrap_or(0);
+    assert!(
+        fork_idx >= 2,
+        "the fork point must sit at main's head (sequence ≥ 2 after two ops), \
+         not at event zero; branch = {created}"
     );
 }
 
@@ -5858,7 +6021,13 @@ async fn agent_tagged_branch_create_records_agent_author_without_body_assertion(
         "agent_id must surface for per-agent branch grouping; body = {body}"
     );
 
-    // A request with NO agent header keeps the pre-slice behaviour.
+    // A request with NO agent header derives authorship from the
+    // AUTHENTICATED principal (one-lane collapse, 2026-07-31; the
+    // AUTHORSHIP-A2 end state the interim `Author::System` fallback was
+    // explicitly holding a place for). Under this fixture's dev-bypass
+    // posture that principal is `user:dev-insecure` — a mislabel-proof
+    // improvement over `system`, which asserted an author the handler
+    // could not know.
     let (s2, b2) = dispatch(
         &state,
         json_post("/api/branches", json!({"name": "human-lane"})),
@@ -5867,8 +6036,9 @@ async fn agent_tagged_branch_create_records_agent_author_without_body_assertion(
     assert_eq!(s2, StatusCode::OK);
     assert_eq!(
         b2["author"].as_str(),
-        Some("system"),
-        "no agent scope, no agent_id → system author unchanged; body = {b2}"
+        Some("user:dev-insecure"),
+        "no agent scope, no agent_id → author derived from the authenticated \
+         principal, never `system`; body = {b2}"
     );
 }
 

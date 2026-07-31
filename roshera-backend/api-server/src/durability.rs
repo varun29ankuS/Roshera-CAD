@@ -30,7 +30,8 @@ use std::sync::Arc;
 use serde::Serialize;
 use session_manager::{BranchRecord, DatabasePersistence, TimelineEventData};
 use timeline_engine::{
-    certify_rebuild, rebuild_model_from_events, BranchId, EventSink, Operation, TimelineEvent,
+    certify_rebuild, rebuild_model_from_events, Author, BranchId, EventSink, Operation,
+    TimelineEvent,
 };
 use tokio::sync::RwLock;
 use uuid::Uuid;
@@ -168,17 +169,25 @@ impl EventSink for DatabaseEventSink {
     }
 }
 
-/// Persist a branch's metadata (id, parent, fork point, name) so it survives a
-/// restart. Called from the branch-creation handler. The event log already
-/// remembers which branch each event belongs to (`timeline_events.branch_id`);
-/// this persists the branch RECORD so a non-`main` branch is re-established on
-/// boot before its events are rehydrated.
+/// Persist a branch's metadata (id, parent, fork point, name, author) so it
+/// survives a restart. Called from the branch-creation handlers. The event log
+/// already remembers which branch each event belongs to
+/// (`timeline_events.branch_id`); this persists the branch RECORD so a
+/// non-`main` branch is re-established on boot before its events are
+/// rehydrated.
+///
+/// `created_by` is the author the timeline actually recorded for the branch
+/// (read back from the created `Branch`, not re-derived) — carried in the
+/// record's opaque `data` blob so no schema migration is needed, and restored
+/// verbatim by [`restore_branch`] so a reboot does not decay a named
+/// principal's branch to `system`.
 pub async fn persist_branch(
     state: &AppState,
     branch_id: BranchId,
     parent: Option<BranchId>,
     fork_sequence: i64,
     name: String,
+    created_by: Author,
 ) {
     if !durability_enabled() {
         return;
@@ -189,7 +198,7 @@ pub async fn persist_branch(
         parent_branch_id: parent.map(|p| p.to_string()),
         fork_sequence,
         name,
-        data: serde_json::json!({}),
+        data: serde_json::json!({ "created_by": created_by }),
     };
     if let Err(e) = state.database.save_branch(&record).await {
         tracing::error!(
@@ -522,11 +531,20 @@ async fn restore_branch(state: &AppState, record: BranchRecord) {
         .as_deref()
         .and_then(|p| Uuid::parse_str(p).ok())
         .map(BranchId);
+    // The persisted author, restored verbatim. `None` (absent field, or a
+    // blob that fails to deserialize) means the record predates author
+    // persistence — `rehydrate_branch` restores those as `Author::System`,
+    // the value every pre-field record was rehydrated with.
+    let created_by: Option<Author> = record
+        .data
+        .get("created_by")
+        .and_then(|v| serde_json::from_value(v.clone()).ok());
     let timeline = state.timeline.read().await;
     timeline.rehydrate_branch(
         id,
         record.name.clone(),
         parent,
         record.fork_sequence.max(0) as u64,
+        created_by,
     );
 }

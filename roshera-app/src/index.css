@@ -280,4 +280,73 @@
   .scrollbar-thin::-webkit-scrollbar-thumb:hover {
     background-color: var(--muted-foreground);
   }
+
+  /* GD&T glyph spans — pin the Miscellaneous Technical / circled-letter
+     glyphs to Segoe UI Symbol (verified to cover all 25 code points used by
+     lib/gdt-symbols.ts) instead of relying on implicit per-glyph fallback:
+     Geist does not cover these blocks and an implicit fallback can drift. */
+  .gdt-glyph {
+    font-family: 'Segoe UI Symbol', 'Geist Variable', ui-sans-serif, system-ui, sans-serif;
+  }
+}
+
+/* KaTeX renders \text{} through its own font stack (KaTeX_Main → Times New
+   Roman), which lacks the GD&T drafting glyphs (⌖ ⏥ ⌭ …). Splice Segoe UI
+   Symbol into the fallback chain so feature control frames typeset with the
+   correct symbols deterministically; KaTeX_Main still serves letters,
+   digits, and math. */
+.katex {
+  font-family: KaTeX_Main, 'Segoe UI Symbol', 'Times New Roman', serif;
+}
+
+/* Chalk-draw reveal (see components/panels/cards/ChalkReveal.tsx).
+   Presentation only — skippable on any interaction, disabled under
+   prefers-reduced-motion, and never in the path of geometry updates. */
+.chalk-wipe {
+  clip-path: inset(-4% 104% -4% -2%);
+  animation: chalk-wipe-in 520ms cubic-bezier(0.25, 0.1, 0.25, 1) 120ms forwards;
+}
+@keyframes chalk-wipe-in {
+  to {
+    clip-path: inset(-4% -2% -4% -2%);
+  }
+}
+.chalk-stroke rect {
+  stroke-dasharray: 1;
+  stroke-dashoffset: 1;
+  opacity: 0.75;
+  animation: chalk-stroke-draw 620ms ease-in-out forwards;
+}
+@keyframes chalk-stroke-draw {
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+/* Streaming write cursor — marks withheld (incomplete) math/card source. */
+.chalk-cursor {
+  display: inline-block;
+  width: 0.5em;
+  height: 1em;
+  vertical-align: text-bottom;
+  border-radius: 1px;
+  background: currentColor;
+  opacity: 0.6;
+  animation: chalk-cursor-blink 900ms steps(2, start) infinite;
+}
+@keyframes chalk-cursor-blink {
+  50% {
+    opacity: 0.15;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .chalk-wipe {
+    animation: none;
+    clip-path: none;
+  }
+  .chalk-stroke {
+    display: none;
+  }
+  .chalk-cursor {
+    animation: none;
+  }
 }

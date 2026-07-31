@@ -117,10 +117,17 @@ export async function processBlackboardMessage(text: string, sessionId?: string)
 
   board.addLine(text, 'user')
   board.setProcessing(true)
+  // Attention follows the agent: the panel expands while the reply is being
+  // written. (The `geometry` state is driven by the ACP wiring in a later
+  // slice — this path only ever writes.)
+  board.setAgentAttention('writing')
 
   // Placeholder agent line for progressive streaming. Created empty so the
   // `add` event is logged immediately; final text is committed via `editLine`.
   const lineId = board.addLine('', 'agent')
+  // While marked streaming, the line renders through the buffered path that
+  // never feeds KaTeX (or the card parser) an incomplete expression.
+  board.setStreamingLine(lineId)
   let accumulated = ''
 
   const commit = (content: string) => {
@@ -151,6 +158,9 @@ export async function processBlackboardMessage(text: string, sessionId?: string)
       commit(`Failed to reach backend: ${message}`)
     }
   } finally {
-    useBlackboardStore.getState().setProcessing(false)
+    const board = useBlackboardStore.getState()
+    board.setStreamingLine(null)
+    board.setAgentAttention('idle')
+    board.setProcessing(false)
   }
 }

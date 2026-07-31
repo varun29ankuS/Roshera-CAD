@@ -26,7 +26,26 @@ pub use merge::{
 pub use name_pool::{suggest_branch_names, BRANCH_NAME_POOL};
 pub use strategy::{BranchingStrategy, ExplorationStrategy};
 
-/// Branch manager for the timeline system
+/// Branch manager for the timeline system.
+///
+/// # RETIRED from the live surface (one-lane collapse, 2026-07-31)
+///
+/// This type was a second, parallel branch model alongside
+/// [`crate::Timeline`]'s own branch store — and the broken one:
+/// `BranchManager::new()` builds five empty maps and nothing ever
+/// seeded `BranchId::main()`, so [`BranchManager::create_branch`]'s
+/// parent-exists check failed `BranchNotFound` for **every** caller.
+/// It also lacked what the `Timeline` lane has: protected-branch
+/// semantics, fork-point event copying, and a `branch_events` entry at
+/// all. The api-server no longer constructs it (`AppState` dropped its
+/// field; `POST /api/timeline/branch/create` and the WS `CreateBranch`
+/// arm now go through `Timeline::create_branch`), and it is no longer
+/// re-exported from the crate root. Its `ai_branches` grouping needed
+/// no migration: `agent_id` lives on `Branch.metadata`, and per-agent
+/// grouping is a projection served by `GET /api/branches`.
+///
+/// The type is retained (not deleted) pending explicit approval —
+/// deleting a type is a permission-gated action.
 pub struct BranchManager {
     /// All branches indexed by ID
     branches: Arc<DashMap<BranchId, Branch>>,

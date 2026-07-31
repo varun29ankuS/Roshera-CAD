@@ -113,6 +113,15 @@ export class ToolTable implements ToolHost {
 // tool, NOT a second copy of any schema. When the backend registry is reachable
 // and its hash verifies, its classification is preferred (see consumeRegistry).
 
+// `timeline` (2026-07-31) covers history/branching/certification — a distinct
+// concern from geometry creation, and arguably the most distinct one in this
+// system, since it is the layer that makes everything else auditable. All 15
+// tools live here on that criterion: the ten 2026-07-31 timeline verbs, the
+// pre-existing timeline_mould/timeline_scrub, rebuild_certificate (a mould's
+// certificate, not a shape), clear_timeline (resets a timeline branch), and
+// bind_parameter_name (names a mould target — same #64 family as
+// rebuild_certificate). None of the geometry-creation benches (core included)
+// carry a history/branching/certification tool anymore.
 export type Bench =
   | "core"
   | "sketch"
@@ -120,6 +129,7 @@ export type Bench =
   | "drawing"
   | "analysis"
   | "labels"
+  | "timeline"
   | "meta";
 export type Stability = "stable" | "experimental";
 
@@ -191,21 +201,23 @@ const BENCH_OF: Record<string, Bench> = {
   import_step: "core",
   export_part: "core",
   get_pointer: "core",
-  timeline_mould: "core",
-  bind_parameter_name: "core",
-  rebuild_certificate: "core",
-  timeline_scrub: "core",
-  clear_timeline: "core",
-  timeline_history: "core",
-  timeline_branch: "core",
-  timeline_branches: "core",
-  timeline_switch: "core",
-  timeline_merge: "core",
-  timeline_conflicts: "core",
-  timeline_checkpoint: "core",
-  timeline_checkpoints: "core",
-  timeline_undo: "core",
-  timeline_redo: "core",
+  // timeline — history/branching/certification, a distinct concern from
+  // geometry creation (see the Bench doc comment below).
+  timeline_mould: "timeline",
+  bind_parameter_name: "timeline",
+  rebuild_certificate: "timeline",
+  timeline_scrub: "timeline",
+  clear_timeline: "timeline",
+  timeline_history: "timeline",
+  timeline_branch: "timeline",
+  timeline_branches: "timeline",
+  timeline_switch: "timeline",
+  timeline_merge: "timeline",
+  timeline_conflicts: "timeline",
+  timeline_checkpoint: "timeline",
+  timeline_checkpoints: "timeline",
+  timeline_undo: "timeline",
+  timeline_redo: "timeline",
   // sketch
   create_sketch: "sketch",
   sketch_add_shape: "sketch",

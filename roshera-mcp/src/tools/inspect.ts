@@ -170,8 +170,11 @@ export function registerInspectTools(server: ToolHost) {
     "dfm_check",
     "DFM (design-for-manufacturability): run a rule pack against a part's REAL " +
       "B-Rep, exact-or-refuse — never a fabricated pass. 'fdm' pack checks " +
-      "fdm.min_wall (wall thickness >= 2x nozzle diameter) and fdm.overhang " +
-      "(no face > 45 deg from vertical); 'injection_molding' checks mold.draft. " +
+      "fdm.min_wall (wall >= 2x nozzle dia), fdm.overhang (no face > 45 deg " +
+      "from vertical), fdm.min_bore (bore dia >= 2x nozzle dia) and " +
+      "fdm.trapped_volume (enclosed cavity traps unremovable support); " +
+      "'injection_molding' checks mold.draft. FDM limits are shop practice, " +
+      "not a governing standard — each verdict carries its provenance. " +
       "Returns the kernel's DfmReport verbatim: per-rule verdicts (pass | " +
       "violation | unverifiable, each with measured/limit values and their " +
       "derivation) plus a pack-level summary that is Pass ONLY if every rule " +

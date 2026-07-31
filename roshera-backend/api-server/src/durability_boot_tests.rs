@@ -692,6 +692,106 @@ async fn clear_parts_midsession_then_rebuild_survives_reboot() {
     );
 }
 
+/// One-lane collapse §3a — the lane-A durability gap: a branch created
+/// through `POST /api/branches` (the only branch-create route that ever
+/// worked) must survive a restart. Before the collapse, `branches.rs`
+/// never called `durability::persist_branch` — that call lived only in
+/// the unreachable lane (`POST /api/timeline/branch/create`, which
+/// 500'd for every caller) — so every branch created through the
+/// working route existed only in memory and was silently lost on
+/// reboot, even though its EVENTS were persisted (orphaned, with no
+/// branch record to be rehydrated into).
+///
+/// Modeled on the boot-restore tests above: boot 1 creates the branch
+/// over the live router, boot 2 opens a fresh `AppState` over the SAME
+/// db file and must list it, with its identity (id, name), parentage,
+/// and fork point intact.
+#[tokio::test]
+async fn branch_created_via_api_branches_survives_restart() {
+    let path = temp_db_path();
+
+    let (branch_id, fork_idx_before) = {
+        let db = open_db(&path).await;
+        let state = build_state(db, true).await;
+
+        // Put real events on `main` first so the branch has a non-zero
+        // fork point worth checking after the reboot.
+        build_bored_box(&state, 8.0).await;
+        state
+            .timeline_recorder
+            .flush()
+            .await
+            .expect("recorder flush must succeed");
+
+        let (s, body) = dispatch(
+            &state,
+            post("/api/branches", json!({ "name": "restart-sandbox" })),
+        )
+        .await;
+        assert_eq!(
+            s,
+            StatusCode::OK,
+            "branch create must succeed; body = {body}"
+        );
+        let id = body["id"]
+            .as_str()
+            .expect("branch create must return the new id")
+            .to_string();
+        let fork_idx = body["fork_point"]["event_index"]
+            .as_u64()
+            .expect("branch create must return the fork point");
+        assert!(
+            fork_idx > 0,
+            "sanity: with events on main the fork point must be non-zero; body = {body}"
+        );
+        (id, fork_idx)
+    };
+
+    // ---- Reboot: fresh AppState over the SAME db file. ----
+    let db2 = open_db(&path).await;
+    let state2 = build_state(db2, true).await;
+
+    let (s, body) = dispatch(&state2, get("/api/branches")).await;
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "branch listing after reboot; body = {body}"
+    );
+    let restored = body
+        .as_array()
+        .expect("GET /api/branches must return an array")
+        .iter()
+        .find(|b| b["id"] == branch_id.as_str())
+        .cloned();
+    let restored = restored.unwrap_or_else(|| {
+        panic!(
+            "branch {branch_id} (\"restart-sandbox\") must survive the restart — \
+             created through the ONLY working create route, it must not be \
+             memory-only; listing = {body}"
+        )
+    });
+    assert_eq!(
+        restored["name"], "restart-sandbox",
+        "the restored branch must keep its name; branch = {restored}"
+    );
+    assert_eq!(
+        restored["fork_point"]["event_index"].as_u64(),
+        Some(fork_idx_before),
+        "the restored branch must keep its fork point; branch = {restored}"
+    );
+    // Authorship fidelity: the branch's `created_by` must survive the
+    // restart too. The events table preserves each EVENT's author
+    // verbatim across reboots; a branch record that comes back as
+    // `system` after a reboot heals-away exactly the authorship the
+    // one-lane collapse derives from the authenticated principal
+    // (`user:dev-insecure` under this fixture's dev-bypass posture).
+    assert_eq!(
+        restored["author"], "user:dev-insecure",
+        "the restored branch must keep its recorded author, not decay to \
+         `system` on reboot; branch = {restored}"
+    );
+}
+
 /// (b) DELETE SEMANTICS: create A (big) and B (small) → delete A → reboot →
 /// exactly one solid survives, it is B (its volume, not A's), and exactly one
 /// uuid is registered (the deleted A leaves no dangling resolution).

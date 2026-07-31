@@ -41,6 +41,27 @@ fn unix_millis_now() -> u64 {
         .unwrap_or(0)
 }
 
+/// RBAC A3: project the verified claims' string roles onto the session
+/// role enum. Before this, the JoinSession arm hardcoded
+/// `UserRole::Editor` regardless of what the credential actually
+/// carried. The projection is deliberately conservative: `owner`/`admin`
+/// map to `Owner`, a credential carrying ONLY `viewer` maps to
+/// `Viewer`, and everything else — including the standard `user` role
+/// every login mints today — maps to `Editor` (the pre-existing default
+/// for an authenticated participant). Unknown role strings are never
+/// upgraded.
+fn session_role_from_roles(roles: &[String]) -> shared_types::session::UserRole {
+    use shared_types::session::UserRole;
+    let has = |r: &str| roles.iter().any(|x| x.eq_ignore_ascii_case(r));
+    if has("owner") || has("admin") {
+        UserRole::Owner
+    } else if has("viewer") && !has("user") && !has("editor") {
+        UserRole::Viewer
+    } else {
+        UserRole::Editor
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum WebSocketMessage {
@@ -218,6 +239,103 @@ impl Drop for ActiveWebSocketGuard {
     }
 }
 
+// RBAC A4: bounds on the PRE-authentication WebSocket window.
+//
+// The `/ws` upgrade is exempt from the HTTP auth layer (see
+// `auth_middleware::path_is_exempt`), so before A4 a client could open
+// an unbounded number of sockets and hold every one forever without
+// ever presenting a credential — the only pre-auth costs were the
+// 64 KiB frame cap and the per-connection token bucket, neither of
+// which bounds CONNECTION COUNT or CONNECTION LIFETIME. Two coupled
+// mechanisms close that, and both refusals are typed (an in-band
+// `ServerMessage::Error` with a stable `error_code`, then a Close
+// frame), never a silent drop:
+//
+// 1. **A cap on concurrently-unauthenticated sockets**
+//    (`max_unauthenticated`, default 64). Acquired before the Welcome
+//    frame; released the moment `Authenticate` verifies (RAII, so a
+//    dropped/cancelled connection releases too). 64 is an order of
+//    magnitude above any legitimate simultaneous-handshake burst (a
+//    handshake occupies the slot for milliseconds), while keeping the
+//    worst-case anonymous socket population far below OS fd limits.
+//    Refusal: `unauthenticated_connection_limit`.
+// 2. **A handshake deadline** (`handshake_deadline`, default 30 s). A
+//    socket that has not authenticated when it expires is told why and
+//    closed, so a cap slot can never be pinned indefinitely — the two
+//    mechanisms compose into "at most N anonymous sockets, each for at
+//    most D seconds". 30 s is generous for any real client (the token
+//    is minted before the socket opens; the frame is the first thing a
+//    client sends) and short enough that slots recycle under probe
+//    traffic. Refusal: `auth_handshake_timeout`.
+//
+// Under `AuthPosture::InsecureDevBypass` connections START
+// authenticated, so neither mechanism engages — exactly mirroring the
+// REST bypass.
+//
+// The counter lives on the limits struct (per `AppState`) rather than
+// in a process-global static: production has one `AppState`, so the
+// semantics are identical, while tests exercising the cap cannot be
+// perturbed by unrelated connections from concurrently-running tests.
+#[derive(Clone)]
+pub struct WsAuthLimits {
+    /// Maximum number of sockets that may sit in the
+    /// pre-`Authenticate` state at once.
+    pub max_unauthenticated: usize,
+    /// How long a socket may remain unauthenticated before it is
+    /// refused and closed.
+    pub handshake_deadline: std::time::Duration,
+    /// Live count of unauthenticated sockets. Shared by clone so every
+    /// connection handler for one `AppState` sees one counter.
+    unauthenticated_now: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl WsAuthLimits {
+    /// Build limits with explicit bounds (tests use tiny values; the
+    /// production default is [`WsAuthLimits::default`]).
+    pub fn new(max_unauthenticated: usize, handshake_deadline: std::time::Duration) -> Self {
+        Self {
+            max_unauthenticated,
+            handshake_deadline,
+            unauthenticated_now: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+
+    /// Try to claim one unauthenticated-connection slot. `None` means
+    /// the cap is reached and the caller must refuse the connection.
+    fn try_acquire_slot(&self) -> Option<UnauthenticatedWsSlot> {
+        use std::sync::atomic::Ordering;
+        self.unauthenticated_now
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                (n < self.max_unauthenticated).then_some(n + 1)
+            })
+            .ok()
+            .map(|_| UnauthenticatedWsSlot {
+                counter: std::sync::Arc::clone(&self.unauthenticated_now),
+            })
+    }
+}
+
+impl Default for WsAuthLimits {
+    fn default() -> Self {
+        Self::new(64, std::time::Duration::from_secs(30))
+    }
+}
+
+/// RAII slot in the unauthenticated-connection budget. Dropped either
+/// when `Authenticate` verifies (the socket is no longer anonymous) or
+/// when the connection future ends/cancels — cancel-safe by
+/// construction, same rationale as [`ActiveWebSocketGuard`].
+struct UnauthenticatedWsSlot {
+    counter: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Drop for UnauthenticatedWsSlot {
+    fn drop(&mut self) {
+        self.counter
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 // WebSocket upgrade handler
 pub async fn websocket_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> Response {
     info!("🔌 WebSocket upgrade request received");
@@ -230,7 +348,26 @@ async fn handle_websocket_connection(socket: WebSocket, state: AppState) {
     let _ws_guard = ActiveWebSocketGuard::new();
 
     let (mut sender, mut receiver) = socket.split();
-    let user_id = Uuid::new_v4().to_string();
+
+    // The connection id names THIS socket (logs, the Welcome frame). It
+    // is minted fresh per connection and is NOT an identity claim.
+    let connection_id = Uuid::new_v4().to_string();
+
+    // RBAC A3: the connection's OPERATIVE identity. It starts as the
+    // anonymous connection id and becomes the VERIFIED principal
+    // (`claims.sub`) the moment an `Authenticate` frame verifies —
+    // previously it was never revisited, so every operation on an
+    // authenticated socket was attributed to a random UUID that
+    // corresponds to no principal. `ws_principal` / `ws_roles` carry
+    // the verified claims alongside it: `ws_principal` is what
+    // `author_from_principal` derives `Author::AIAgent`/`Author::User`
+    // from (the same honest mapping REST uses via `AuthInfo`), and
+    // `ws_roles` is what the session role is projected from.
+    // `PrincipalKind::Unspecified` is the honest pre-auth value: no
+    // claim has been presented (and under the dev bypass none ever is).
+    let mut user_id = connection_id.clone();
+    let mut ws_principal = session_manager::PrincipalKind::Unspecified;
+    let mut ws_roles: Vec<String> = Vec::new();
     let mut current_session_id: Option<String> = None;
 
     // In-band WebSocket authentication state.
@@ -258,6 +395,41 @@ async fn handle_websocket_connection(socket: WebSocket, state: AppState) {
         crate::auth_middleware::AuthPosture::InsecureDevBypass
     );
 
+    // RBAC A4: claim a pre-auth slot BEFORE any per-connection work
+    // (scene replay, broadcast subscription, the Welcome frame). At the
+    // cap, the refusal is typed and in-band — the client is told which
+    // bound it hit — never a silent drop. Under the dev bypass the
+    // connection starts authenticated and no slot is needed. See
+    // `WsAuthLimits` for the policy rationale.
+    let ws_limits = state.ws_auth_limits.clone();
+    let mut unauth_slot = None;
+    if !ws_authenticated {
+        match ws_limits.try_acquire_slot() {
+            Some(slot) => unauth_slot = Some(slot),
+            None => {
+                warn!(
+                    "WS connection {} refused: unauthenticated-connection cap ({}) reached",
+                    connection_id, ws_limits.max_unauthenticated
+                );
+                let refusal = ServerMessage::Error {
+                    error_code: "unauthenticated_connection_limit".to_string(),
+                    message: format!(
+                        "too many unauthenticated connections (cap {}): authenticate \
+                         existing sockets or retry shortly",
+                        ws_limits.max_unauthenticated
+                    ),
+                    details: None,
+                    request_id: None,
+                };
+                if let Ok(refusal_json) = serde_json::to_string(&refusal) {
+                    let _ = sender.send(Message::Text(refusal_json.into())).await;
+                }
+                let _ = sender.send(Message::Close(None)).await;
+                return;
+            }
+        }
+    }
+
     info!("New WebSocket connection: user={}", user_id);
     crate::broadcast_log(
         "INFO",
@@ -272,7 +444,7 @@ async fn handle_websocket_connection(socket: WebSocket, state: AppState) {
     // version rather than a "1.0.0" literal so the wire surface tracks
     // actual releases instead of bit-rotting against the manifest.
     let welcome = ServerMessage::Welcome {
-        connection_id: user_id.clone(),
+        connection_id: connection_id.clone(),
         server_version: env!("CARGO_PKG_VERSION").to_string(),
         capabilities: vec![
             "geometry".to_string(),
@@ -357,6 +529,16 @@ async fn handle_websocket_connection(socket: WebSocket, state: AppState) {
         };
     }
 
+    // RBAC A4: the handshake deadline. Armed only while the connection
+    // is unauthenticated — the select! precondition (`if
+    // !ws_authenticated`) disarms it permanently once `Authenticate`
+    // verifies, and under the dev bypass it never arms at all. When it
+    // fires, the refusal is typed (`auth_handshake_timeout`) and the
+    // socket is closed, so a pre-auth cap slot can never be pinned
+    // indefinitely.
+    let handshake_deadline = tokio::time::sleep(ws_limits.handshake_deadline);
+    tokio::pin!(handshake_deadline);
+
     // Handle incoming messages
     loop {
         tokio::select! {
@@ -439,6 +621,24 @@ async fn handle_websocket_connection(socket: WebSocket, state: AppState) {
                                         // actually unlocks the command
                                         // surface, not just the reply.
                                         ws_authenticated = true;
+                                        // RBAC A3: adopt the VERIFIED
+                                        // principal as the connection's
+                                        // operative identity. From here
+                                        // on, every operation on this
+                                        // socket is attributed to
+                                        // `claims.sub` with the claims'
+                                        // principal kind and roles —
+                                        // not to the random connection
+                                        // UUID minted at connect time.
+                                        user_id = claims.sub.clone();
+                                        ws_principal = claims.principal.clone();
+                                        ws_roles = claims.roles.clone();
+                                        // RBAC A4: the socket is no
+                                        // longer anonymous — release
+                                        // its pre-auth slot (RAII
+                                        // decrement) so the cap governs
+                                        // only the anonymous window.
+                                        drop(unauth_slot.take());
                                         ServerMessage::Authenticated {
                                             user_id: claims.sub,
                                             permissions: claims.roles,
@@ -961,8 +1161,14 @@ async fn handle_websocket_connection(socket: WebSocket, state: AppState) {
                                             session_id
                                         );
 
-                                        // Use the existing session join logic
-                                        let user_name = format!("User_{}", &user_id[..8]); // Default user name
+                                        // RBAC A3: the display name is the operative
+                                        // identity itself. (The previous
+                                        // `format!("User_{}", &user_id[..8])` sliced 8
+                                        // bytes off a random UUID; now that `user_id` is
+                                        // the verified subject it may be shorter than 8
+                                        // bytes — the slice would panic — and truncating
+                                        // a real principal's id would fabricate a name.)
+                                        let user_name = user_id.clone();
 
                                         // Create or join session
                                         let actual_session_id =
@@ -1010,7 +1216,9 @@ async fn handle_websocket_connection(socket: WebSocket, state: AppState) {
                                                     name: user_name.clone(),
                                                     color: [0.5, 0.5, 0.9, 1.0], // Blue color for new users
                                                     last_activity: now,
-                                                    role: shared_types::session::UserRole::Editor,
+                                                    // RBAC A3: projected from the VERIFIED
+                                                    // claims' roles, not hardcoded Editor.
+                                                    role: session_role_from_roles(&ws_roles),
                                                     cursor_position: None,
                                                     selected_objects: Vec::new(),
                                                 };
@@ -1036,7 +1244,9 @@ async fn handle_websocket_connection(socket: WebSocket, state: AppState) {
                                                     last_activity: chrono::Utc::now()
                                                         .timestamp_millis()
                                                         as u64,
-                                                    role: shared_types::session::UserRole::Editor,
+                                                    // RBAC A3: projected from the VERIFIED
+                                                    // claims' roles, not hardcoded Editor.
+                                                    role: session_role_from_roles(&ws_roles),
                                                     cursor_position: None,
                                                     selected_objects: Vec::new(),
                                                 },
@@ -1311,7 +1521,6 @@ async fn handle_websocket_connection(socket: WebSocket, state: AppState) {
 
                                 // Use the actual timeline engine
                                 let timeline = state.timeline.clone();
-                                let branch_manager = state.branch_manager.clone();
 
                                 let response = match command {
                                     super::protocol::TimelineWSCommand::Undo { steps } => {
@@ -1348,22 +1557,88 @@ async fn handle_websocket_connection(socket: WebSocket, state: AppState) {
                                             name, from_point
                                         );
 
-                                        // Create branch using the branch manager
-                                        let result = branch_manager.create_branch(
-                                            name.clone(),
-                                            timeline_engine::BranchId::main(), // parent branch
-                                            from_point.unwrap_or(0) as u64,    // fork event index
-                                            timeline_engine::Author::System,
-                                            timeline_engine::BranchPurpose::UserExploration {
+                                        // One-lane collapse (2026-07-31): this arm used
+                                        // to call `BranchManager::create_branch`, which
+                                        // failed `BranchNotFound` for EVERY caller (its
+                                        // `new()` seeds no branches, `main` included) —
+                                        // and asserted `Author::System` for a
+                                        // user-initiated action, the class AUTHORSHIP-A1
+                                        // closed for REST. It now goes through
+                                        // `Timeline::create_branch` like the REST lanes:
+                                        // recorder flush → create (fork `None` = the
+                                        // parent's REAL head; the old code passed `0`,
+                                        // which is literally event zero, under a comment
+                                        // claiming "fork from latest") →
+                                        // `durability::persist_branch`. Authorship is
+                                        // derived from the connection's VERIFIED
+                                        // principal (RBAC A3) through the same mapping
+                                        // REST uses.
+                                        let author =
+                                            crate::handlers::timeline::author_from_principal(
+                                                &user_id,
+                                                &ws_principal,
+                                            );
+                                        let purpose = match &ws_principal {
+                                            session_manager::PrincipalKind::Agent { .. } => {
+                                                timeline_engine::BranchPurpose::AIOptimization {
+                                                    objective:
+                                                        timeline_engine::OptimizationObjective::Custom(
+                                                            format!("WS branch '{name}'"),
+                                                        ),
+                                                }
+                                            }
+                                            _ => timeline_engine::BranchPurpose::UserExploration {
                                                 description: format!(
-                                                    "Branch created at {}",
+                                                    "Branch created over WebSocket at {}",
                                                     chrono::Utc::now()
                                                 ),
                                             },
-                                        );
+                                        };
+
+                                        // Drain in-flight kernel events so the fork
+                                        // point is computed against the parent's real
+                                        // head. Non-fatal: the worker may be down, in
+                                        // which case nothing is in flight to drain.
+                                        let _ = state.timeline_recorder.flush().await;
+
+                                        // Smallest write window (guard dropped before
+                                        // the reply is awaited).
+                                        let result = {
+                                            let timeline_guard = timeline.write().await;
+                                            timeline_guard
+                                                .create_branch(
+                                                    name.clone(),
+                                                    timeline_engine::BranchId::main(),
+                                                    from_point.map(|p| p as u64),
+                                                    author.clone(),
+                                                    purpose,
+                                                )
+                                                .await
+                                        };
 
                                         match result {
                                             Ok(branch_id) => {
+                                                // Durability (§3a): persist the branch
+                                                // record — identity, fork point (read
+                                                // back from the created branch itself),
+                                                // and authorship — so it survives a
+                                                // restart.
+                                                let fork_sequence = {
+                                                    let timeline_guard = timeline.read().await;
+                                                    timeline_guard
+                                                        .get_branch(&branch_id)
+                                                        .map(|b| b.fork_point.event_index as i64)
+                                                        .unwrap_or(0)
+                                                };
+                                                crate::durability::persist_branch(
+                                                    &state,
+                                                    branch_id,
+                                                    Some(timeline_engine::BranchId::main()),
+                                                    fork_sequence,
+                                                    name.clone(),
+                                                    author,
+                                                )
+                                                .await;
                                                 info!(
                                                     "Created branch '{}' with ID: {:?}",
                                                     name, branch_id
@@ -1435,15 +1710,27 @@ async fn handle_websocket_connection(socket: WebSocket, state: AppState) {
                                                 .unwrap_or(serde_json::Value::Null),
                                         };
 
-                                        // Timeline is wrapped in Arc<RwLock>, need to write lock it
-                                        let timeline = state.timeline.write().await;
-                                        let result = timeline
-                                            .add_operation(
-                                                timeline_op,
-                                                timeline_engine::Author::System,
-                                                timeline_engine::BranchId::main(),
-                                            )
-                                            .await;
+                                        // Smallest write window (guard dropped before
+                                        // the reply is awaited). RBAC A3: authorship is
+                                        // derived from the connection's VERIFIED
+                                        // principal — this arm used to assert
+                                        // `Author::System` for a client-driven
+                                        // operation, writing "the kernel did this" into
+                                        // the append-only log when a named principal
+                                        // did.
+                                        let result = {
+                                            let timeline_guard = state.timeline.write().await;
+                                            timeline_guard
+                                                .add_operation(
+                                                    timeline_op,
+                                                    crate::handlers::timeline::author_from_principal(
+                                                        &user_id,
+                                                        &ws_principal,
+                                                    ),
+                                                    timeline_engine::BranchId::main(),
+                                                )
+                                                .await
+                                        };
 
                                         match result {
                                             Ok(event_id) => {
@@ -2260,6 +2547,34 @@ async fn handle_websocket_connection(socket: WebSocket, state: AppState) {
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
+            }
+            // RBAC A4: no `Authenticate` frame verified within the
+            // deadline — refuse with a typed error and close. The
+            // precondition keeps this branch (and the completed sleep)
+            // unpolled once the connection authenticates; when it does
+            // fire we break, so the sleep is never re-polled after
+            // completion.
+            _ = handshake_deadline.as_mut(), if !ws_authenticated => {
+                warn!(
+                    "WS connection {} refused: no Authenticate frame within {:?}",
+                    connection_id, ws_limits.handshake_deadline
+                );
+                let refusal = ServerMessage::Error {
+                    error_code: "auth_handshake_timeout".to_string(),
+                    message: format!(
+                        "authentication handshake deadline ({:?}) exceeded: send an \
+                         Authenticate frame with a valid token promptly after \
+                         connecting",
+                        ws_limits.handshake_deadline
+                    ),
+                    details: None,
+                    request_id: None,
+                };
+                if let Ok(refusal_json) = serde_json::to_string(&refusal) {
+                    let _ = sender.send(Message::Text(refusal_json.into())).await;
+                }
+                let _ = sender.send(Message::Close(None)).await;
+                break;
             }
         }
     }

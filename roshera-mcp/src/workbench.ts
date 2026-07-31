@@ -13,7 +13,7 @@
  * index.ts injects an `apply(toEnable, toDisable)` that flips the real McpServer
  * tool handles and lets the SDK emit `tools/list_changed`. The test suite drives
  * the same controller with a recording `apply` and asserts the invariants
- * (status shape, exposure set, ≤35 ceiling) without starting a server.
+ * (status shape, exposure set, ≤36 ceiling) without starting a server.
  */
 
 import { z } from "zod";
@@ -34,6 +34,7 @@ export type WorkbenchMode =
   | "drawing"
   | "analysis"
   | "labels"
+  | "timeline"
   | "core_only"
   | "status";
 
@@ -44,10 +45,17 @@ export const SWITCHABLE_BENCHES: Bench[] = [
   "drawing",
   "analysis",
   "labels",
+  "timeline",
 ];
 
-/** The soft ceiling on the live (exposed) surface in any bench (spec §Layer 1). */
-export const LIVE_SURFACE_CEILING = 35;
+/**
+ * The soft ceiling on the live (exposed) surface in any bench (spec §Layer 1).
+ * 36, not 35: `timeline` (2026-07-31) is the first bench whose 15 tools push
+ * core+meta (21) past the original 35 — MINIMAL_SURFACE(21) + 15 = 36. Raised
+ * by exactly the overshoot rather than left as a hard 35, per the "soft
+ * ceiling" framing above: an attention budget, not a hard capability gate.
+ */
+export const LIVE_SURFACE_CEILING = 36;
 
 /** Callback that flips real server tool handles on a bench switch. */
 export type ApplyTransition = (toEnable: string[], toDisable: string[]) => void;
@@ -235,12 +243,14 @@ export function registerWorkbenchTool(host: ToolHost, wb: Workbench): void {
       "capability gate — every tool stays reachable via find_tool/describe_tool/" +
       "invoke in any mode). Entering a bench exposes its tools on top of the " +
       "core+meta surface and retires the previous bench; the live surface stays " +
-      "small (≤35). modes: 'sketch' (create_sketch/psketch_*), 'assembly' " +
+      "small (≤36). modes: 'sketch' (create_sketch/psketch_*), 'assembly' " +
       "(assembly_*), 'drawing' (make_drawing/dimension/gdt_*), 'analysis' " +
       "(ray/region/occupancy/coverage/distance/ground_truth), 'labels' (label_*/" +
       "blackboard_* — the shared human-visible notebook: read the human's notes, " +
-      "edit lines), 'core_only' (retire any bench), 'status' (report the active " +
-      "bench, exposed count, token bill, and per-bench tool counts).",
+      "edit lines), 'timeline' (timeline_*/rebuild_certificate/clear_timeline/" +
+      "bind_parameter_name — history, branching, merge, moulds), 'core_only' " +
+      "(retire any bench), 'status' (report the active bench, exposed count, " +
+      "token bill, and per-bench tool counts).",
     {
       mode: z
         .enum([
@@ -249,6 +259,7 @@ export function registerWorkbenchTool(host: ToolHost, wb: Workbench): void {
           "drawing",
           "analysis",
           "labels",
+          "timeline",
           "core_only",
           "status",
         ])

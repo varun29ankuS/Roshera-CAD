@@ -30,6 +30,25 @@ import { create } from 'zustand'
 export type LineAuthor = 'user' | 'agent' | 'system'
 
 /**
+ * ATTENTION STATE
+ * ---------------
+ * The agent is always in one of two working modes — writing/reasoning on the
+ * board, or executing a tool that changes geometry — plus idle between turns.
+ * The Blackboard's split against the viewport FOLLOWS this state: expand
+ * while the agent writes, collapse to a strip the moment geometry is being
+ * changed so the viewport takes the space (a user drag overrides either).
+ *
+ * This is deliberately just a value + setter: today it is driven by the
+ * existing streaming path (`processBlackboardMessage` sets `writing`) and by
+ * the dev fixture harness; the ACP wiring that will drive `geometry` for
+ * real is a later slice — no protocol is invented here. The panel resize is
+ * pure presentation and NEVER gates geometry: the viewport is driven by
+ * ws-bridge/scene-store and updates when the kernel confirms, regardless of
+ * this state.
+ */
+export type AgentAttention = 'idle' | 'writing' | 'geometry'
+
+/**
  * SCOPE
  * -----
  * The north star is 100-part assemblies; one global notebook mixing every
@@ -153,6 +172,13 @@ interface BlackboardState {
   events: BlackboardEvent[]
   isProcessing: boolean
   isPanelOpen: boolean
+  /** What the agent is doing right now — drives the attention-following
+   *  Blackboard/viewport split. See `AgentAttention`. */
+  agentAttention: AgentAttention
+  /** The line currently receiving streamed agent text (via `setLineText`),
+   *  or null. While set, that line renders through the streaming path that
+   *  buffers math/cards to completeness instead of typesetting per token. */
+  streamingLineId: string | null
 
   /** Append a line; returns its id. Pushes an `add` event + persists. */
   addLine: (text: string, author: LineAuthor) => string
@@ -173,6 +199,11 @@ interface BlackboardState {
   setActiveScope: (scope: BlackboardScope) => void
 
   setProcessing: (v: boolean) => void
+  /** Simple setter for the attention state — the seam the ACP wiring will
+   *  drive in a later slice. */
+  setAgentAttention: (attention: AgentAttention) => void
+  /** Mark (or clear) the line receiving streamed text. */
+  setStreamingLine: (id: string | null) => void
   togglePanel: () => void
   setPanel: (open: boolean) => void
   clearBoard: () => void
@@ -201,6 +232,8 @@ export const useBlackboardStore = create<BlackboardState>((set, get) => ({
   events: initial.events,
   isProcessing: false,
   isPanelOpen: true,
+  agentAttention: 'idle',
+  streamingLineId: null,
 
   addLine: (text, author) => {
     const id = nextLineId()
@@ -274,6 +307,8 @@ export const useBlackboardStore = create<BlackboardState>((set, get) => ({
     }),
 
   setProcessing: (v) => set({ isProcessing: v }),
+  setAgentAttention: (attention) => set({ agentAttention: attention }),
+  setStreamingLine: (id) => set({ streamingLineId: id }),
   togglePanel: () => set((s) => ({ isPanelOpen: !s.isPanelOpen })),
   setPanel: (open) => set({ isPanelOpen: open }),
 

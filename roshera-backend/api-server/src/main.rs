@@ -51,6 +51,7 @@ mod router_integration_tests;
 mod sketch;
 mod transactions;
 mod viewport_bridge;
+mod ws_identity_tests;
 // Using core geometry-engine directly
 use axum::{
     extract::{DefaultBodyLimit, Extension, Path, Query, State},
@@ -88,7 +89,7 @@ use session_manager::{
 };
 
 // Import timeline
-use timeline_engine::{BranchManager, Timeline};
+use timeline_engine::Timeline;
 
 // Import shared types
 use shared_types::{CommandResult, GeometryId};
@@ -198,7 +199,10 @@ pub struct AppState {
     /// kernel operations are recorded against. The same Arc is also
     /// attached to the `BRepModel` as `Arc<dyn OperationRecorder>`.
     pub timeline_recorder: Arc<timeline_engine::TimelineRecorder>,
-    branch_manager: Arc<BranchManager>,
+    // `branch_manager` (timeline-engine `BranchManager`) was removed in the
+    // one-lane collapse (2026-07-31): it was a parallel, broken branch model
+    // (never seeded `main`, so every create through it 500'd). The one
+    // branch lane is `Timeline::create_branch` on `timeline` above.
     hierarchy_manager: Arc<HierarchyManager>,
 
     // Database
@@ -293,6 +297,13 @@ pub struct AppState {
     /// `504 op_timeout` promptly instead of pinning the model write lock
     /// forever. See `bounded_exec.rs`.
     pub op_budgets: bounded_exec::OpBudgets,
+
+    /// RBAC A4: bounds on the pre-authentication WebSocket window — a
+    /// cap on concurrently-unauthenticated sockets plus an in-band
+    /// handshake deadline. Compiled-in defaults; tests overwrite with
+    /// tiny values (same pattern as `op_budgets`). See
+    /// `protocol::message_handlers::WsAuthLimits`.
+    pub ws_auth_limits: protocol::message_handlers::WsAuthLimits,
 }
 
 impl AppState {
@@ -8298,7 +8309,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize timeline components
     let timeline_config = timeline_engine::TimelineConfig::default();
     let timeline = Arc::new(RwLock::new(Timeline::new(timeline_config)));
-    let branch_manager = Arc::new(BranchManager::new());
 
     // Wire the kernel's OperationRecorder to the timeline. This is what
     // turns every successful kernel mutation (extrude, boolean, fillet,
@@ -8380,7 +8390,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cache_manager,
         timeline,
         timeline_recorder: timeline_recorder.clone(),
-        branch_manager,
         hierarchy_manager,
         database,
         durability_status: Arc::new(RwLock::new(durability::DurabilityStatus::Empty)),
@@ -8438,6 +8447,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Bounded-executor budgets (Task #41): default ON, generous, env-
         // overridable via ROSHERA_OP_TIMEOUT*_SECS. Resolved once here.
         op_budgets: bounded_exec::OpBudgets::from_env(),
+        // RBAC A4: compiled-in defaults (64 pre-auth sockets / 30 s
+        // handshake deadline). See `WsAuthLimits` for the rationale.
+        ws_auth_limits: protocol::message_handlers::WsAuthLimits::default(),
     };
 
     // Durability boot replay (task #39). Load the persisted event log and

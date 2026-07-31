@@ -35,7 +35,9 @@
 //! audit trail + merge approval) and the geometry-routing layer can be
 //! added on top without changing this surface.
 
+use crate::auth_middleware::AuthInfo;
 use crate::error_catalog::{ApiError, ErrorCode};
+use crate::handlers::timeline::author_from_auth_info;
 use crate::AppState;
 use axum::{
     extract::{Path, Query, State},
@@ -509,6 +511,7 @@ pub async fn list_branches(
 /// human-driven `UserExploration`.
 pub async fn create_branch(
     State(state): State<AppState>,
+    auth_info: AuthInfo,
     Json(body): Json<CreateBranchBody>,
 ) -> Result<Json<BranchView>, ApiError> {
     if body.name.trim().is_empty() {
@@ -546,14 +549,17 @@ pub async fn create_branch(
             // (`agent_author_layer` in main.rs). Without this, an
             // agent's fork landed in the append-only log as
             // `Author::System`, an authorship hole that cannot be
-            // healed later. Requests with no agent scope (human/UI)
-            // keep the previous `System` author unchanged.
+            // healed later.
             //
-            // NOTE: like the header itself, this identity is
-            // client-declared. The auth-derived end state is
-            // `PrincipalKind` (session-manager AUTHORSHIP-A2), which
-            // the queued branch-lane collapse adopts; this keeps the
-            // interim honest rather than silently wrong.
+            // When no agent scope is declared either, authorship is
+            // derived from the AUTHENTICATED principal
+            // (`author_from_auth_info`, the AUTHORSHIP-A1/A2 mapping):
+            // a human's fork is recorded as `Author::User { <verified
+            // id> }`, an agent-credentialed caller as `Author::AIAgent`
+            // with the model minted into its credential. The previous
+            // `Author::System` fallback asserted an author this handler
+            // could not know — the exact class A1 closed — and is gone
+            // with the one-lane collapse.
             match timeline_engine::recorder_bridge::AUTHOR_OVERRIDE.try_with(Clone::clone) {
                 Ok(agent_author @ Author::AIAgent { .. }) => {
                     let purpose = BranchPurpose::AIOptimization {
@@ -561,10 +567,16 @@ pub async fn create_branch(
                     };
                     (agent_author, purpose)
                 }
-                _ => (
-                    Author::System,
-                    BranchPurpose::UserExploration { description },
-                ),
+                _ => {
+                    let author = author_from_auth_info(&auth_info);
+                    let purpose = match &author {
+                        Author::AIAgent { .. } => BranchPurpose::AIOptimization {
+                            objective: OptimizationObjective::Custom(description.clone()),
+                        },
+                        _ => BranchPurpose::UserExploration { description },
+                    };
+                    (author, purpose)
+                }
             }
         }
     };
@@ -593,16 +605,40 @@ pub async fn create_branch(
             .map_err(map_timeline_err)?
     };
 
-    let timeline = state.timeline.read().await;
-    let branch = timeline
-        .get_branch(&new_id)
-        .ok_or_else(|| ApiError::new(ErrorCode::Internal, "branch vanished after creation"))?;
-    let count = timeline
-        .get_branch_events(&new_id, None, None)
-        .map(|v| v.len())
-        .unwrap_or(0);
-    let since_fork = count_events_since_fork(&timeline, &branch, count);
-    Ok(Json(render_branch(&branch, count, since_fork)))
+    let (view, fork_sequence, created_by) = {
+        let timeline = state.timeline.read().await;
+        let branch = timeline
+            .get_branch(&new_id)
+            .ok_or_else(|| ApiError::new(ErrorCode::Internal, "branch vanished after creation"))?;
+        let count = timeline
+            .get_branch_events(&new_id, None, None)
+            .map(|v| v.len())
+            .unwrap_or(0);
+        let since_fork = count_events_since_fork(&timeline, &branch, count);
+        (
+            render_branch(&branch, count, since_fork),
+            branch.fork_point.event_index as i64,
+            branch.metadata.created_by.clone(),
+        )
+    };
+
+    // Durability (one-lane collapse §3a): persist the branch record so it is
+    // re-established on boot. This lane — the only one that ever worked —
+    // previously never called `persist_branch`, so every branch created here
+    // was memory-only and silently lost on restart even though its EVENTS
+    // were persisted (orphaned, with no branch record to rehydrate into).
+    // The author is the one the timeline RECORDED, read back from the branch.
+    crate::durability::persist_branch(
+        &state,
+        new_id,
+        Some(parent),
+        fork_sequence,
+        body.name,
+        created_by,
+    )
+    .await;
+
+    Ok(Json(view))
 }
 
 /// `GET /api/branches/{id}` — single-branch detail.

@@ -12,6 +12,7 @@ import { Timeline } from '@/components/panels/Timeline'
 import { DrawingsWorkspace } from '@/components/panels/DrawingsWorkspace'
 import { AssemblyWorkspace } from '@/components/panels/AssemblyWorkspace'
 import { DemoGallery } from '@/components/demo-gallery/DemoGallery'
+import { BlackboardFixtures } from '@/components/dev/BlackboardFixtures'
 import { CommandPalette } from '@/components/CommandPalette'
 import { LoginDialog } from '@/components/LoginDialog'
 import { useKeyboardShortcuts } from '@/lib/shortcuts'
@@ -22,9 +23,18 @@ import { installBackendBlackboard } from '@/lib/blackboard-api'
 import { ViewportBridge } from '@/lib/viewport-bridge'
 
 const DEMOS_HASH = '#/demos'
+// Dev harness: every Blackboard state (streaming, typed cards, attention
+// layout, GD&T symbol table) in one place for visual verification without
+// staging them by hand. See components/dev/BlackboardFixtures.tsx.
+const BLACKBOARD_FIXTURES_HASH = '#/blackboard-fixtures'
 
-function isDemosRoute(): boolean {
-  return typeof window !== 'undefined' && window.location.hash === DEMOS_HASH
+type Route = 'workspace' | 'demos' | 'blackboard-fixtures'
+
+function routeFromHash(): Route {
+  if (typeof window === 'undefined') return 'workspace'
+  if (window.location.hash === DEMOS_HASH) return 'demos'
+  if (window.location.hash === BLACKBOARD_FIXTURES_HASH) return 'blackboard-fixtures'
+  return 'workspace'
 }
 
 export function App() {
@@ -35,12 +45,10 @@ export function App() {
   // can switch freely.
   const docMode = useDocModeStore((s) => s.mode) ?? 'part'
   const [browserOpen, setBrowserOpen] = useState(true)
-  const [route, setRoute] = useState<'workspace' | 'demos'>(
-    isDemosRoute() ? 'demos' : 'workspace',
-  )
+  const [route, setRoute] = useState<Route>(routeFromHash)
 
   useEffect(() => {
-    const onHashChange = () => setRoute(isDemosRoute() ? 'demos' : 'workspace')
+    const onHashChange = () => setRoute(routeFromHash())
     window.addEventListener('hashchange', onHashChange)
     return () => window.removeEventListener('hashchange', onHashChange)
   }, [])
@@ -71,6 +79,10 @@ export function App() {
 
   if (route === 'demos') {
     return <DemoGallery onExit={exitGallery} />
+  }
+
+  if (route === 'blackboard-fixtures') {
+    return <BlackboardFixtures onExit={exitGallery} />
   }
 
   return (
