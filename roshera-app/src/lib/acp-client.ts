@@ -135,12 +135,18 @@ export type AcpSessionUpdate =
   | { sessionUpdate: 'config_option_update'; configOptions?: AcpSessionConfigOption[] }
   | { sessionUpdate: 'session_info_update'; title?: string | null; updatedAt?: string | null }
   | {
-      /** Context-window usage for the CURRENT session only — resets
-       *  whenever the ACP stream drops (a fresh session starts from
-       *  zero). `used`/`size` are token COUNTS; `cost` (present when
-       *  goose can compute one) is deliberately never read anywhere in
-       *  this client — goose cannot know subscription-vs-API billing,
-       *  so a dollar figure would be fiction on a Max/Pro session. */
+      /** Token usage for the CURRENT session only — resets whenever the
+       *  ACP stream drops (a fresh session starts from zero). `used` is a
+       *  CUMULATIVE count of tokens consumed so far this session; `size`
+       *  is the static context window. They are NOT directly comparable —
+       *  `used` legitimately exceeds `size` once a session runs long
+       *  (measured live: `{"used":359346,"size":128000}`), so used/size is
+       *  not a valid occupancy percentage. No field observed on this wire
+       *  reports current context occupancy; callers must render `used`
+       *  alone, never a fabricated ratio. `cost` (present when goose can
+       *  compute one) is deliberately never read anywhere in this client —
+       *  goose cannot know subscription-vs-API billing, so a dollar figure
+       *  would be fiction on a Max/Pro session. */
       sessionUpdate: 'usage_update'
       used: number
       size: number

@@ -39,8 +39,12 @@ interface AcpSessionStats {
 
   /** A prompt was just sent on the current session. */
   incrementTurns: () => void
-  /** Latest `usage_update` — replaces, never accumulates (goose already
-   *  reports the running context size, not a delta). */
+  /** Latest `usage_update` — replaces, never accumulates. `used` is itself
+   *  a CUMULATIVE token count across the whole session (not a per-update
+   *  delta) and `size` is the static context window; the two are not
+   *  comparable and `used` legitimately exceeds `size` on a long session
+   *  (measured live: used=359346, size=128000). Never derive a percentage
+   *  from them — see `Blackboard.tsx`'s `formatContextUsage` doc. */
   setUsage: (used: number, size: number) => void
   /** A late-resolving `config_option_update` corrected the model. */
   setModel: (model: string | null) => void

@@ -108,24 +108,43 @@ async function fetchSnapshot(scope: BlackboardScope): Promise<BlackboardSnapshot
   }
 }
 
+/** The backend's `author` enum accepts only `user`/`agent` (verified live:
+ *  `POST /api/blackboard/entries` with `author:"system"` → 422 "unknown
+ *  variant `system`, expected `user` or `agent`"). The frontend's third
+ *  `'system'` value (toolbar feedback, ACP failure lines — see
+ *  `stores/blackboard-store.ts`'s `LineAuthor` doc) has no backend
+ *  counterpart to preserve, so it rides as `'agent'` on the wire — the
+ *  closest honest fit (the app/kernel said it, not the human) — rather than
+ *  422ing silently. Without this mapping `postEntry` "succeeds" (fetch
+ *  only rejects on network failure, never on a non-2xx status, so the
+ *  caller's try/catch never sees the 422) while the line never actually
+ *  lands server-side; the next poll's `applyRemoteSnapshot` then repaints
+ *  from the backend's truth — which never had the line — and it silently
+ *  vanishes from the board. That is exactly the failure mode the honesty
+ *  contract (never a blank/disappearing line) forbids. */
+function wireAuthor(author: BlackboardLine['author']): 'user' | 'agent' {
+  return author === 'user' ? 'user' : 'agent'
+}
+
 async function postEntry(scope: BlackboardScope, line: BlackboardLine): Promise<void> {
   // The frontend owns line ids; the backend keeps `id` verbatim so edit /
   // delete address the same row. We send id + scope alongside text/author so
   // the line lands in the active part's notebook.
-  await fetch(`${API_BASE}/blackboard/entries`, {
+  const res = await fetch(`${API_BASE}/blackboard/entries`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       id: line.id,
       text: line.text,
-      author: line.author,
+      author: wireAuthor(line.author),
       ...(scope === DOCUMENT_SCOPE ? {} : { scope }),
     }),
   })
+  if (!res.ok) throw new Error(`POST /blackboard/entries failed: ${res.status}`)
 }
 
 async function patchEntry(scope: BlackboardScope, id: string, text: string): Promise<void> {
-  await fetch(
+  const res = await fetch(
     `${API_BASE}/blackboard/entries/${encodeURIComponent(id)}${scopeQuery(scope)}`,
     {
       method: 'PATCH',
@@ -133,17 +152,20 @@ async function patchEntry(scope: BlackboardScope, id: string, text: string): Pro
       body: JSON.stringify({ text }),
     },
   )
+  if (!res.ok) throw new Error(`PATCH /blackboard/entries/${id} failed: ${res.status}`)
 }
 
 async function deleteEntry(scope: BlackboardScope, id: string): Promise<void> {
-  await fetch(
+  const res = await fetch(
     `${API_BASE}/blackboard/entries/${encodeURIComponent(id)}${scopeQuery(scope)}`,
     { method: 'DELETE' },
   )
+  if (!res.ok) throw new Error(`DELETE /blackboard/entries/${id} failed: ${res.status}`)
 }
 
 async function clearBackend(scope: BlackboardScope): Promise<void> {
-  await fetch(`${API_BASE}/blackboard/clear${scopeQuery(scope)}`, { method: 'POST' })
+  const res = await fetch(`${API_BASE}/blackboard/clear${scopeQuery(scope)}`, { method: 'POST' })
+  if (!res.ok) throw new Error(`POST /blackboard/clear failed: ${res.status}`)
 }
 
 // ─── Delta detection ─────────────────────────────────────────────────

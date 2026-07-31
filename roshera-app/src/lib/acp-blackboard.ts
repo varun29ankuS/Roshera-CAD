@@ -214,6 +214,14 @@ export async function runAcpTurn(client: AcpClient, text: string): Promise<void>
         useBlackboardStore.getState().setLineText(lineId, accumulated)
         return
       }
+      // NOTE: `tool_call`/`tool_call_update` are the only frames that can
+      // honestly drive `agentAttention = 'geometry'` (see `AgentAttention`'s
+      // doc in `stores/blackboard-store.ts` for the full rejection of
+      // `activeRunId` as a substitute). On the current default provider —
+      // goose's `claude-code` ACP bridge — these two cases never fire:
+      // verified live across two full turns, `toolCalls: 0`, because tools
+      // execute inside the CLI subprocess and are never surfaced over ACP.
+      // The handlers stay wired for a provider path that DOES emit them.
       case 'tool_call': {
         const status = update.status ?? 'pending'
         if (status === 'pending' || status === 'in_progress') setAttention('geometry')

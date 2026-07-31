@@ -36,17 +36,20 @@ import {
  */
 const compactCount = new Intl.NumberFormat('en-US', { notation: 'compact', maximumFractionDigits: 1 })
 
-/** Render `usage_update`'s `used`/`size` as "used / size · pct%" — both
- *  numbers come straight from goose (`AcpSessionStats.tokensUsed` /
- *  `.contextSize`, `stores/acp-session-store.ts`); nothing here computes,
- *  estimates, or extrapolates either one. `size` absent or zero (no
- *  `usage_update` yet, or a provider that never reports a window) falls
- *  back to the bare used count — dividing by a denominator goose never
- *  gave us would be a fabricated percentage. */
-function formatContextUsage(used: number, size: number | null): string {
-  if (!size || size <= 0) return `${compactCount.format(used)} tok`
-  const pct = (used / size) * 100
-  return `${compactCount.format(used)} / ${compactCount.format(size)} · ${pct.toFixed(1)}%`
+/** Render `usage_update`'s `used` (`AcpSessionStats.tokensUsed`,
+ *  `stores/acp-session-store.ts`) as a running token total. Measured live
+ *  (2026-07-31): a real turn reported
+ *  `{"sessionUpdate":"usage_update","used":359346,"size":128000}` — `used`
+ *  is CUMULATIVE tokens consumed across the whole session, `size` is the
+ *  static context window; they are not comparable, and `used` legitimately
+ *  exceeds `size` once a session runs long (359346/128000 → a meaningless
+ *  280%). No `usage_update` field observed on the wire reports current
+ *  context OCCUPANCY (how full the window is right now), so there is no
+ *  honest percentage to compute — this renders the total alone, never a
+ *  used/size ratio, and never clamps to 100% (that would hide the truth
+ *  rather than tell it). */
+function formatContextUsage(used: number): string {
+  return `${compactCount.format(used)} tokens`
 }
 
 export function Blackboard() {
@@ -70,7 +73,6 @@ export function Blackboard() {
   const acpModel = useAcpSessionStore((s) => s.model)
   const acpTurns = useAcpSessionStore((s) => s.turns)
   const acpTokens = useAcpSessionStore((s) => s.tokensUsed)
-  const acpContextSize = useAcpSessionStore((s) => s.contextSize)
   const acpLive = useAcpSessionStore((s) => s.live)
 
   // Drive the notebook scope from the viewport selection: the active part's
@@ -276,7 +278,7 @@ export function Blackboard() {
                   {acpTurns} turn{acpTurns === 1 ? '' : 's'}
                 </span>
                 <span className="text-muted-foreground/40">·</span>
-                <span>{formatContextUsage(acpTokens ?? 0, acpContextSize)}</span>
+                <span>{formatContextUsage(acpTokens ?? 0)}</span>
                 <span className="text-muted-foreground/50">(session)</span>
               </>
             )}

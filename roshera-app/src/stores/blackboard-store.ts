@@ -38,13 +38,27 @@ export type LineAuthor = 'user' | 'agent' | 'system'
  * while the agent writes, collapse to a strip the moment geometry is being
  * changed so the viewport takes the space (a user drag overrides either).
  *
- * This is deliberately just a value + setter: today it is driven by the
- * existing streaming path (`processBlackboardMessage` sets `writing`) and by
- * the dev fixture harness; the ACP wiring that will drive `geometry` for
- * real is a later slice — no protocol is invented here. The panel resize is
- * pure presentation and NEVER gates geometry: the viewport is driven by
- * ws-bridge/scene-store and updates when the kernel confirms, regardless of
- * this state.
+ * This is deliberately just a value + setter: it is driven by the legacy
+ * streaming path and by the dev fixture harness (both set only `writing`/
+ * `idle`), and by `lib/acp-blackboard.ts`'s ACP `tool_call`/`tool_call_update`
+ * handlers, which DO set `geometry` — for a provider that actually emits
+ * those frames. Measured live (2026-07-31, two full turns) on the current
+ * default provider path — goose's `claude-code` ACP bridge, a subscription
+ * CLI where tools execute inside the CLI process itself — ZERO `tool_call`
+ * frames arrive; only `usage_update` / `available_commands_update` /
+ * `session_info_update` / `agent_message_chunk` do. So `geometry` is
+ * unreachable on that live path today, even though the agent genuinely
+ * calls tools and builds geometry. `session_info_update`'s `activeRunId`
+ * (non-null while a turn runs) was considered as a substitute signal and
+ * rejected: it toggles once per turn at the same boundaries `runAcpTurn`
+ * already uses for `writing`/`idle`, so it adds no information and cannot
+ * distinguish tool execution from text generation — using it to fake
+ * `geometry` would be exactly the prose-heuristic dishonesty this state is
+ * supposed to avoid. Do NOT build progressive-build pacing on `geometry`
+ * until a provider path is confirmed to emit real `tool_call` frames. The
+ * panel resize is pure presentation and NEVER gates geometry: the viewport
+ * is driven by ws-bridge/scene-store and updates when the kernel confirms,
+ * regardless of this state.
  */
 export type AgentAttention = 'idle' | 'writing' | 'geometry'
 
@@ -257,7 +271,24 @@ export const useBlackboardStore = create<BlackboardState>((set, get) => ({
   editLine: (id, text) =>
     set((state) => {
       const existing = state.lines.find((l) => l.id === id)
-      if (!existing || existing.text === text) return state
+      if (!existing) return state
+      // NOTE: this used to also bail out when `existing.text === text` (a
+      // pure no-op optimization). That is UNSOUND for the streaming path:
+      // `setLineText` (below) mutates `lines` in place WITHOUT persisting,
+      // by design, so the in-memory text can already equal the final
+      // streamed value by the time `runAcpTurn` (`lib/acp-blackboard.ts`)
+      // calls `editLine(lineId, finalText)` to commit it. The equality
+      // check then saw "nothing changed" and skipped BOTH the event log
+      // entry and `persist()` — so the agent's whole reply rendered live
+      // but was never written to the backend. The next poll's
+      // `applyRemoteSnapshot` (`lib/blackboard-api.ts`) then repainted the
+      // panel from the (still-empty) backend truth, silently blanking a
+      // reply that had just streamed in correctly — verified live
+      // (2026-07-31/08-01): the line read "I'll create a 30 mm cube…"
+      // immediately after the turn, then "Empty line — click to edit"
+      // after a reload. A redundant PATCH for a genuinely no-op manual
+      // edit is a harmless idempotent write; a silently dropped agent
+      // reply is not.
       const now = Date.now()
       const lines = state.lines.map((l) =>
         l.id === id ? { ...l, text, updatedAt: now } : l,
