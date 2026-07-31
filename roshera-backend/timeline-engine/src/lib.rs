@@ -37,7 +37,8 @@ pub mod storage;
 
 // Re-export commonly used types
 pub use branch::{
-    suggest_branch_names, BranchManager, MergeResult, MergeStrategy, BRANCH_NAME_POOL,
+    suggest_branch_names, BranchManager, BranchRelationship, MergePreview, MergeResult,
+    MergeStrategy, BRANCH_NAME_POOL,
 };
 pub use cache::{CacheConfig, CacheManager};
 pub use dependency_graph::DependencyGraph;

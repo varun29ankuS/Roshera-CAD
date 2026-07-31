@@ -9140,6 +9140,14 @@ pub(crate) fn build_router(state: AppState) -> Router {
             get(branches::get_branch).delete(branches::delete_branch),
         )
         .route("/api/branches/{id}/merge", post(branches::merge_branch))
+        // Read-only merge preview: typed relationship + the exact
+        // conflict witnesses a three-way merge would report, with
+        // nothing merged and no state flipped. Backs the agent's
+        // `timeline_conflicts` verb.
+        .route(
+            "/api/branches/{id}/conflicts",
+            get(branches::preview_conflicts),
+        )
         // Datum endpoints (Origin, reference planes, reference axes).
         // Slice 1 surfaced read + visibility; slice 4a adds CRUD for
         // user-authored datums (defaults remain unrenameable /

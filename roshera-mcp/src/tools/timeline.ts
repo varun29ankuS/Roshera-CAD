@@ -1,9 +1,19 @@
-/** Timeline tools — event-sourced history: scrub, clear. */
+/** Timeline tools — event-sourced history: the agent's memory (history,
+ * checkpoints, undo/redo) and its parallel-work substrate (branch,
+ * merge, conflicts), plus scrub, mould, clear. */
 
 import type { ToolHost } from "../registry.js";
 import { z } from "zod";
 import { randomUUID } from "node:crypto";
 import { api, ok, fail, ApiError } from "../core.js";
+
+/**
+ * One stable session id per MCP process: the backend's undo/redo walk a
+ * per-session cursor (seeded at the current head on first use), so the
+ * id must persist across calls or every undo would target the same last
+ * event. Reconnecting the MCP starts a fresh cursor at the new head.
+ */
+const AGENT_SESSION_ID = randomUUID();
 
 /**
  * A mould / bind endpoint returns a TYPED refusal (409/422/404) when the edit
@@ -135,6 +145,276 @@ export function registerTimelineTools(server: ToolHost) {
             triangles: (o.mesh?.indices?.length ?? 0) / 3,
           })),
         });
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  server.tool(
+    "timeline_history",
+    "Read a branch's recorded design history — the timeline is the agent's " +
+      "queryable memory. Events in sequence order (id, kind, author, affected " +
+      "parts); page with start/limit. include_operations adds each event's " +
+      "full recorded parameters.",
+    {
+      branch: z.string().default("main").describe("timeline branch id ('main' = trunk)"),
+      start: z.number().int().min(0).default(0).describe("first event sequence number to return"),
+      limit: z.number().int().min(1).max(1000).default(100).describe("max events to return"),
+      include_operations: z
+        .boolean()
+        .default(false)
+        .describe("include each event's full recorded operation payload"),
+    },
+    async ({ branch, start, limit, include_operations }) => {
+      try {
+        const r = await api(
+          "GET",
+          `/api/timeline/history/${encodeURIComponent(branch)}?start=${start}&limit=${limit}`,
+        );
+        const events = (Array.isArray(r) ? r : []).map((e: any) => ({
+          id: e.id,
+          sequence: e.sequence_number,
+          timestamp: e.timestamp,
+          operation_type: e.operation_type,
+          author: e.author,
+          author_kind: e.author_kind,
+          affected_parts: e.affected_parts,
+          ...(include_operations ? { operation: e.operation } : {}),
+        }));
+        return ok({ branch, start, count: events.length, events });
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  server.tool(
+    "timeline_branch",
+    "Fork a timeline branch before speculative work. The fork is an isolated " +
+      "EVENT-LOG lane (authorship, audit, merge approval) — the live kernel " +
+      "scene stays shared. Authorship records this agent automatically; pass " +
+      "agent_id only to label a different logical agent. Set activate:true to " +
+      "also record subsequent ops onto the new branch.",
+    {
+      name: z.string().min(1).describe("branch name, e.g. 'explore-rib-variants'"),
+      parent: z.string().default("main").describe("parent branch id ('main' or a branch UUID)"),
+      agent_id: z
+        .string()
+        .optional()
+        .describe("logical agent identity recorded as branch author; omit = this agent"),
+      description: z.string().optional().describe("what this branch explores"),
+      activate: z
+        .boolean()
+        .default(false)
+        .describe("also switch kernel recording to the new branch"),
+    },
+    async ({ name, parent, agent_id, description, activate }) => {
+      try {
+        const branch = await api("POST", "/api/branches", {
+          name,
+          parent,
+          agent_id,
+          description,
+        });
+        let recording_on_branch = false;
+        if (activate && branch?.id) {
+          await api("POST", "/api/branches/active", { branch_id: branch.id });
+          recording_on_branch = true;
+        }
+        return ok({ branch, recording_on_branch });
+      } catch (e) {
+        return refusalOrFail(e);
+      }
+    },
+  );
+
+  server.tool(
+    "timeline_branches",
+    "List timeline branches: id, name, state, author, agent_id, event counts, " +
+      "fork point. Filter by state or agent_id (per-agent grouping is a " +
+      "projection over recorded branch authorship).",
+    {
+      state: z
+        .enum(["active", "merged", "abandoned", "completed"])
+        .optional()
+        .describe("keep only branches in this state"),
+      agent_id: z.string().optional().describe("keep only branches authored by this agent id"),
+    },
+    async ({ state, agent_id }) => {
+      try {
+        const r = await api("GET", "/api/branches");
+        let branches: any[] = Array.isArray(r) ? r : [];
+        if (state) branches = branches.filter((b) => b.state === state);
+        if (agent_id) branches = branches.filter((b) => b.agent_id === agent_id);
+        return ok({ count: branches.length, branches });
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  server.tool(
+    "timeline_switch",
+    "Switch the kernel's RECORDING branch: subsequent geometry ops append " +
+      "their events to this branch. Process-global (one live model, one " +
+      "recording head) — switch back to 'main' when the exploration is done.",
+    {
+      branch: z.string().describe("branch id to record onto ('main' or a branch UUID)"),
+    },
+    async ({ branch }) => {
+      try {
+        const r = await api("POST", "/api/branches/active", { branch_id: branch });
+        return ok(r);
+      } catch (e) {
+        return refusalOrFail(e);
+      }
+    },
+  );
+
+  server.tool(
+    "timeline_merge",
+    "Merge a branch into a target and get the merge's EVIDENCE, not a bool: " +
+      "typed conflict witnesses (subject, taxonomy verdict, both colliding " +
+      "events) when it refuses; statistics plus the target's per-feature " +
+      "rebuild certificate when it lands. 'fast-forward' on diverged branches " +
+      "returns a typed refusal carrying the divergence shape.",
+    {
+      source: z.string().describe("branch id to merge FROM"),
+      target: z.string().default("main").describe("branch id to merge INTO"),
+      strategy: z
+        .enum(["three-way", "fast-forward", "squash"])
+        .default("three-way")
+        .describe("'three-way' detects + reports typed conflicts; 'fast-forward' refuses on divergence"),
+      message: z.string().optional().describe("squash commit message (squash strategy only)"),
+      certify: z
+        .boolean()
+        .default(true)
+        .describe("on success, attach the target branch's rebuild certificate"),
+    },
+    async ({ source, target, strategy, message, certify }) => {
+      try {
+        const r = await api(
+          "POST",
+          `/api/branches/${encodeURIComponent(source)}/merge`,
+          { target, strategy, message },
+        );
+        if (r?.success && certify) {
+          // The certificate is the proof the merged state still derives
+          // (#64 rebuild certificate) — fetched, never fabricated; on
+          // failure the reason is surfaced instead of a fake verdict.
+          try {
+            r.certificate = await api(
+              "GET",
+              `/api/timeline/rebuild-certificate/${encodeURIComponent(target)}`,
+            );
+          } catch (e) {
+            r.certificate = null;
+            r.certificate_unavailable =
+              e instanceof Error ? e.message : String(e);
+          }
+        }
+        return ok(r);
+      } catch (e) {
+        return refusalOrFail(e);
+      }
+    },
+  );
+
+  server.tool(
+    "timeline_conflicts",
+    "Read-only merge preview: how source relates to target (up_to_date / " +
+      "fast_forward / divergent with event counts) plus the exact typed " +
+      "conflict witnesses a three-way merge would report. Nothing is merged; " +
+      "no branch state flips. Decide HOW to resolve before committing.",
+    {
+      source: z.string().describe("branch id to preview merging FROM"),
+      target: z.string().default("main").describe("branch id to preview merging INTO"),
+    },
+    async ({ source, target }) => {
+      try {
+        const r = await api(
+          "GET",
+          `/api/branches/${encodeURIComponent(source)}/conflicts?target=${encodeURIComponent(target)}`,
+        );
+        return ok(r);
+      } catch (e) {
+        return refusalOrFail(e);
+      }
+    },
+  );
+
+  server.tool(
+    "timeline_checkpoint",
+    "Name the current design state: record a checkpoint capturing the " +
+      "branch's event range — a stable landmark to scrub back to or cite in " +
+      "review. Returns the checkpoint id.",
+    {
+      name: z.string().min(1).describe("checkpoint name, e.g. 'bracket-before-lightening'"),
+      description: z.string().optional().describe("what this state is"),
+      branch: z.string().default("main").describe("branch whose event range to capture"),
+    },
+    async ({ name, description, branch }) => {
+      try {
+        const r = await api("POST", "/api/timeline/checkpoint", {
+          name,
+          description,
+          branch,
+        });
+        return ok(r);
+      } catch (e) {
+        return refusalOrFail(e);
+      }
+    },
+  );
+
+  server.tool(
+    "timeline_checkpoints",
+    "List named design states (checkpoints): id, name, description, captured " +
+      "event range, author, timestamp — newest first.",
+    {},
+    async () => {
+      try {
+        const r = await api("GET", "/api/timeline/checkpoints");
+        const checkpoints = Array.isArray(r) ? r : [];
+        return ok({ count: checkpoints.length, checkpoints });
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  server.tool(
+    "timeline_undo",
+    "Step this agent's timeline cursor back one operation and re-derive the " +
+      "live model to match. The cursor is per-MCP-session, seeded at the " +
+      "current head on first use; at the beginning it answers " +
+      "{success:false, can_undo:false} — an honest bottom, not an error.",
+    {},
+    async () => {
+      try {
+        const r = await api("POST", "/api/timeline/undo", {
+          session_id: AGENT_SESSION_ID,
+        });
+        return ok(r);
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  server.tool(
+    "timeline_redo",
+    "Step this agent's timeline cursor forward one operation (after " +
+      "timeline_undo) and re-derive the live model to match. At the head it " +
+      "answers {success:false} honestly.",
+    {},
+    async () => {
+      try {
+        const r = await api("POST", "/api/timeline/redo", {
+          session_id: AGENT_SESSION_ID,
+        });
+        return ok(r);
       } catch (e) {
         return fail(e);
       }

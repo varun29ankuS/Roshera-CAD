@@ -37,7 +37,7 @@ const ALLOWED_BENCHES: &[&str] = &[
     "core", "sketch", "assembly", "drawing", "analysis", "labels",
 ];
 
-/// The complete set of tool names the MCP server exposes today (91 tools).
+/// The complete set of tool names the MCP server exposes today (101 tools).
 ///
 /// Extracted verbatim from `roshera-mcp/src/tools/*.ts` +
 /// `roshera-mcp/src/core.ts` `server.tool(…)` / `server.registerTool(…)`
@@ -62,8 +62,18 @@ const MCP_TOOL_NAMES: &[&str] = &[
     "bind_parameter_name",
     "clear_timeline",
     "rebuild_certificate",
+    "timeline_branch",
+    "timeline_branches",
+    "timeline_checkpoint",
+    "timeline_checkpoints",
+    "timeline_conflicts",
+    "timeline_history",
+    "timeline_merge",
     "timeline_mould",
+    "timeline_redo",
     "timeline_scrub",
+    "timeline_switch",
+    "timeline_undo",
     // blackboard.ts
     "blackboard_add_entry",
     "blackboard_clear",

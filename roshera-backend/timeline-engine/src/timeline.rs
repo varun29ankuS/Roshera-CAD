@@ -38,8 +38,9 @@
 //! points, revisit this comment first.
 
 use crate::branch::{
-    get_affected_subjects, operations_identical, AffectedSubjects, ConflictSubject, ConflictType,
-    MergeConflict, MergeResult, MergeStatistics, MergeStrategy,
+    get_affected_subjects, operations_identical, AffectedSubjects, BranchRelationship,
+    ConflictSubject, ConflictType, MergeConflict, MergePreview, MergeResult, MergeStatistics,
+    MergeStrategy,
 };
 use crate::error::{TimelineError, TimelineResult};
 use crate::types::{
@@ -530,22 +531,30 @@ impl Timeline {
         let start_idx = start.unwrap_or(0);
         let limit = limit.unwrap_or(usize::MAX);
 
-        let mut events = Vec::new();
-        let mut collected = 0;
+        // Snapshot and ORDER the (index, id) pairs BEFORE applying the
+        // limit. DashMap iteration is hash-ordered, so the previous
+        // take-then-sort collected an ARBITRARY `limit`-sized subset and
+        // only then sorted it — a limited query could return e.g. events
+        // {3, 17, 90} instead of the first `limit` events at/after
+        // `start`. For an agent paging history that is a silent wrong
+        // answer, not a truncation.
+        let mut keyed: Vec<(EventIndex, EventId)> = branch_events
+            .iter()
+            .map(|entry| (*entry.key(), *entry.value()))
+            .collect();
+        drop(branch_events);
+        keyed.sort_unstable_by_key(|(idx, _)| *idx);
 
-        // Collect events in order
-        for entry in branch_events.iter() {
-            let idx = *entry.key();
-            let event_id = *entry.value();
-            if idx >= start_idx && collected < limit {
-                if let Some(event) = self.events.get(&event_id) {
-                    events.push(event.clone());
-                    collected += 1;
-                }
-            }
-        }
+        let mut events: Vec<TimelineEvent> = keyed
+            .into_iter()
+            .filter(|(idx, _)| *idx >= start_idx)
+            .take(limit)
+            .filter_map(|(_, event_id)| self.events.get(&event_id).map(|e| e.clone()))
+            .collect();
 
-        // Sort by sequence number
+        // Branch index order and burned sequence order coincide today;
+        // keep the explicit sort so the contract ("ascending sequence
+        // numbers") holds even if a future path lets them diverge.
         events.sort_by_key(|e| e.sequence_number);
 
         Ok(events)
@@ -1110,27 +1119,11 @@ impl Timeline {
         }
 
         // Snapshot both branches' (key, event_id) sequences in sorted
-        // order. This is the basis for FF detection.
-        let source_seq: Vec<(EventIndex, EventId)> = {
-            let m = self
-                .branch_events
-                .get(&source_branch)
-                .ok_or(TimelineError::BranchNotFound(source_branch))?;
-            let mut v: Vec<(EventIndex, EventId)> =
-                m.iter().map(|e| (*e.key(), *e.value())).collect();
-            v.sort_unstable_by_key(|(k, _)| *k);
-            v
-        };
-        let target_seq: Vec<(EventIndex, EventId)> = {
-            let m = self
-                .branch_events
-                .get(&target_branch)
-                .ok_or(TimelineError::BranchNotFound(target_branch))?;
-            let mut v: Vec<(EventIndex, EventId)> =
-                m.iter().map(|e| (*e.key(), *e.value())).collect();
-            v.sort_unstable_by_key(|(k, _)| *k);
-            v
-        };
+        // order. This is the basis for FF detection. Shared with
+        // `preview_merge` so the preview and the merge read the exact
+        // same sequence shape (one lane).
+        let source_seq = self.branch_sequence(&source_branch)?;
+        let target_seq = self.branch_sequence(&target_branch)?;
 
         // Already up-to-date: target already contains every event source has.
         // The event-sequence prefix IS the git commit-DAG ancestry test: if
@@ -1293,34 +1286,10 @@ impl Timeline {
 
         // Real three-way merge (spec: 2026-07-29-timeline-beyond-git.md
         // §3.1, §5 step 3). Resolve each side's post-common-prefix events.
-        let source_only: Vec<TimelineEvent> = source_seq[common_prefix_len..]
-            .iter()
-            .filter_map(|(_, eid)| self.events.get(eid).map(|e| e.clone()))
-            .collect();
-        let target_only: Vec<TimelineEvent> = target_seq[common_prefix_len..]
-            .iter()
-            .filter_map(|(_, eid)| self.events.get(eid).map(|e| e.clone()))
-            .collect();
+        let source_only = self.events_for(&source_seq[common_prefix_len..]);
+        let target_only = self.events_for(&target_seq[common_prefix_len..]);
 
-        let source_index = index_subjects_by_role(&source_only);
-        let target_index = index_subjects_by_role(&target_only);
-
-        let mut conflicts: Vec<MergeConflict> = Vec::new();
-        for (subject, s_role) in &source_index {
-            if let Some(t_role) = target_index.get(subject) {
-                if let Some((conflict_type, source_event, target_event)) =
-                    classify_subject_conflict(s_role, t_role)
-                {
-                    conflicts.push(MergeConflict {
-                        subject: subject.clone(),
-                        conflict_type,
-                        source_event: Some(source_event),
-                        target_event: Some(target_event),
-                        resolution: None,
-                    });
-                }
-            }
-        }
+        let conflicts = classify_divergence_conflicts(&source_only, &target_only);
 
         if !conflicts.is_empty() {
             let conflicts_count = conflicts.len();
@@ -1385,6 +1354,130 @@ impl Timeline {
                 entities_affected: affected_count,
                 duration_ms: started.elapsed().as_millis() as u64,
             },
+        })
+    }
+
+    /// One branch's `(EventIndex, EventId)` sequence in ascending index
+    /// order — the shape both `merge_branches` and [`preview_merge`]
+    /// reason over. Private: the sorted-pair form is a merge-lane
+    /// implementation detail, not a public read model.
+    fn branch_sequence(&self, branch: &BranchId) -> TimelineResult<Vec<(EventIndex, EventId)>> {
+        let m = self
+            .branch_events
+            .get(branch)
+            .ok_or(TimelineError::BranchNotFound(*branch))?;
+        let mut v: Vec<(EventIndex, EventId)> = m.iter().map(|e| (*e.key(), *e.value())).collect();
+        drop(m);
+        v.sort_unstable_by_key(|(k, _)| *k);
+        Ok(v)
+    }
+
+    /// Materialize the events behind a `(EventIndex, EventId)` slice, in
+    /// slice order. Ids whose event has been garbage-collected are
+    /// skipped (mirrors the long-standing `filter_map` behaviour).
+    fn events_for(&self, seq: &[(EventIndex, EventId)]) -> Vec<TimelineEvent> {
+        seq.iter()
+            .filter_map(|(_, eid)| self.events.get(eid).map(|e| e.clone()))
+            .collect()
+    }
+
+    /// Read-only merge preview: how `source` relates to `target` and the
+    /// exact typed conflict set a three-way merge would report — WITHOUT
+    /// merging anything or flipping any branch state.
+    ///
+    /// This is the `timeline_conflicts` agent verb (spec
+    /// `2026-07-29-timeline-beyond-git.md` §6): an agent decides *how*
+    /// to resolve before committing to a merge, instead of learning the
+    /// shape only from a failed attempt.
+    ///
+    /// Gate parity: the same self-merge / existence / `Active`-state
+    /// checks as [`merge_branches`](Self::merge_branches), so a
+    /// successful preview implies the merge gate will admit the same
+    /// branch pair. The sequencing (`branch_sequence`) and taxonomy
+    /// (`classify_divergence_conflicts`) are the shared single-lane
+    /// helpers `merge_branches` itself uses — the preview cannot drift
+    /// from the merge because they run the same code.
+    pub fn preview_merge(
+        &self,
+        source_branch: BranchId,
+        target_branch: BranchId,
+    ) -> TimelineResult<MergePreview> {
+        if source_branch == target_branch {
+            return Err(TimelineError::InvalidOperation(
+                "cannot merge a branch into itself".to_string(),
+            ));
+        }
+        let source_state = self
+            .branches
+            .get(&source_branch)
+            .ok_or(TimelineError::BranchNotFound(source_branch))?
+            .state
+            .clone();
+        let target_state = self
+            .branches
+            .get(&target_branch)
+            .ok_or(TimelineError::BranchNotFound(target_branch))?
+            .state
+            .clone();
+        if !matches!(source_state, BranchState::Active) {
+            return Err(TimelineError::InvalidOperation(format!(
+                "source branch {} is not active (state={:?})",
+                source_branch, source_state
+            )));
+        }
+        if !matches!(target_state, BranchState::Active) {
+            return Err(TimelineError::InvalidOperation(format!(
+                "target branch {} is not active (state={:?})",
+                target_branch, target_state
+            )));
+        }
+
+        let source_seq = self.branch_sequence(&source_branch)?;
+        let target_seq = self.branch_sequence(&target_branch)?;
+
+        // Already up-to-date: source's sequence is a prefix of target's.
+        if source_seq.len() <= target_seq.len()
+            && source_seq
+                .iter()
+                .zip(target_seq.iter())
+                .all(|(s, t)| s == t)
+        {
+            return Ok(MergePreview {
+                relationship: BranchRelationship::UpToDate,
+                conflicts: Vec::new(),
+            });
+        }
+
+        // Fast-forward: target's sequence is a strict prefix of source's.
+        if target_seq.len() < source_seq.len() && source_seq[..target_seq.len()] == target_seq[..] {
+            return Ok(MergePreview {
+                relationship: BranchRelationship::FastForward {
+                    events_ahead: source_seq.len() - target_seq.len(),
+                },
+                conflicts: Vec::new(),
+            });
+        }
+
+        // Divergent: classify with the same taxonomy the merge runs.
+        let common_prefix_len = source_seq
+            .iter()
+            .zip(target_seq.iter())
+            .take_while(|(s, t)| s == t)
+            .count();
+        let source_only = self.events_for(&source_seq[common_prefix_len..]);
+        let target_only = self.events_for(&target_seq[common_prefix_len..]);
+        let conflicts = classify_divergence_conflicts(&source_only, &target_only);
+
+        Ok(MergePreview {
+            relationship: BranchRelationship::Divergent {
+                // Counted from the sequences (not the materialized
+                // events) so these numbers match the divergence shape
+                // `merge_branches`'s ff-only refusal reports.
+                common_prefix: common_prefix_len,
+                source_only: source_seq.len() - common_prefix_len,
+                target_only: target_seq.len() - common_prefix_len,
+            },
+            conflicts,
         })
     }
 
@@ -2021,6 +2114,43 @@ struct SubjectRole {
 /// `source_only` / `target_only` are, since they're sliced from a
 /// sorted `(EventIndex, EventId)` sequence) so "last" means
 /// "chronologically most recent on this branch".
+/// The single conflict-classification lane: index each side's post-fork
+/// events by subject role and run every subject touched by both sides
+/// through [`classify_subject_conflict`]. Used verbatim by BOTH
+/// `Timeline::merge_branches` and `Timeline::preview_merge`, so a
+/// preview reports exactly the conflicts the merge would.
+///
+/// Conflicts are returned in a deterministic order (sorted by subject
+/// display form) — `index_subjects_by_role` returns a `HashMap`, and an
+/// agent diffing two previews must never see phantom churn from map
+/// iteration order.
+fn classify_divergence_conflicts(
+    source_only: &[TimelineEvent],
+    target_only: &[TimelineEvent],
+) -> Vec<MergeConflict> {
+    let source_index = index_subjects_by_role(source_only);
+    let target_index = index_subjects_by_role(target_only);
+
+    let mut conflicts: Vec<MergeConflict> = Vec::new();
+    for (subject, s_role) in &source_index {
+        if let Some(t_role) = target_index.get(subject) {
+            if let Some((conflict_type, source_event, target_event)) =
+                classify_subject_conflict(s_role, t_role)
+            {
+                conflicts.push(MergeConflict {
+                    subject: subject.clone(),
+                    conflict_type,
+                    source_event: Some(source_event),
+                    target_event: Some(target_event),
+                    resolution: None,
+                });
+            }
+        }
+    }
+    conflicts.sort_by_key(|c| c.subject.to_string());
+    conflicts
+}
+
 fn index_subjects_by_role(events: &[TimelineEvent]) -> HashMap<ConflictSubject, SubjectRole> {
     let mut index: HashMap<ConflictSubject, SubjectRole> = HashMap::new();
     for event in events {
@@ -2814,6 +2944,299 @@ mod tests {
         timeline
             .validate()
             .expect("a reported conflict must not corrupt state");
+    }
+
+    /// `preview_merge` on a conflicting divergence reports the SAME
+    /// typed witnesses `merge_branches` would — and mutates NOTHING:
+    /// both branches stay `Active`, both event sets keep their exact
+    /// lengths. This is the read-only half of the `timeline_conflicts`
+    /// agent verb; if a future change routes the preview through the
+    /// mutating merge path, the state assertions here go red.
+    #[tokio::test]
+    async fn preview_merge_reports_typed_conflicts_without_mutating() {
+        let timeline = Timeline::new(TimelineConfig::default());
+
+        timeline
+            .add_operation(dummy_create_op(), Author::System, BranchId::main())
+            .await
+            .unwrap();
+        let child = timeline
+            .create_branch(
+                "child".to_string(),
+                BranchId::main(),
+                None,
+                Author::System,
+                crate::BranchPurpose::UserExploration {
+                    description: "preview".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        timeline
+            .add_operation(
+                generic_op("fillet_edge", &["edge:7"], &["solid:9"]),
+                Author::System,
+                BranchId::main(),
+            )
+            .await
+            .unwrap();
+        timeline
+            .add_operation(
+                generic_op("chamfer_edge", &["edge:7"], &["solid:9"]),
+                Author::System,
+                child,
+            )
+            .await
+            .unwrap();
+
+        let preview = timeline
+            .preview_merge(child, BranchId::main())
+            .expect("preview of a divergent pair must succeed");
+
+        assert_eq!(
+            preview.relationship,
+            crate::branch::BranchRelationship::Divergent {
+                common_prefix: 1,
+                source_only: 1,
+                target_only: 1,
+            },
+            "preview must report the typed divergence shape"
+        );
+        assert_eq!(preview.conflicts.len(), 1);
+        let conflict = &preview.conflicts[0];
+        assert_eq!(
+            conflict.subject,
+            crate::branch::ConflictSubject::KernelRef("solid:9".to_string())
+        );
+        assert_eq!(conflict.conflict_type, ConflictType::ConcurrentModification);
+        // Witness ORIENTATION is load-bearing: `source_event` must be
+        // the source branch's op (child's chamfer), `target_event` the
+        // target branch's (main's fillet). A swap would send an agent
+        // to resolve the wrong side.
+        let witness_kind = |ev: &Option<TimelineEvent>| -> String {
+            match &ev.as_ref().expect("witness must be attached").operation {
+                Operation::Generic { command_type, .. } => command_type.clone(),
+                other => panic!("witness must be the recorded Generic op, got {other:?}"),
+            }
+        };
+        assert_eq!(
+            witness_kind(&conflict.source_event),
+            "chamfer_edge",
+            "source witness must come from the source (child) branch"
+        );
+        assert_eq!(
+            witness_kind(&conflict.target_event),
+            "fillet_edge",
+            "target witness must come from the target (main) branch"
+        );
+
+        // READ-ONLY: no state flip, no event copied anywhere.
+        assert!(timeline.is_branch_active(&child), "source must stay Active");
+        assert!(
+            timeline.is_branch_active(&BranchId::main()),
+            "target must stay Active"
+        );
+        assert_eq!(
+            timeline
+                .get_branch_events(&BranchId::main(), None, None)
+                .unwrap()
+                .len(),
+            2,
+            "preview must not append anything to the target"
+        );
+        assert_eq!(
+            timeline
+                .get_branch_events(&child, None, None)
+                .unwrap()
+                .len(),
+            2,
+            "preview must not touch the source's events"
+        );
+
+        // The real merge afterwards reports the identical conflict —
+        // preview and merge run the same classification lane.
+        let merged = timeline
+            .merge_branches(child, BranchId::main(), three_way())
+            .await
+            .expect("conflicted merge is reported, not erred");
+        assert!(!merged.success);
+        assert_eq!(merged.conflicts.len(), 1);
+        assert_eq!(merged.conflicts[0].subject, preview.conflicts[0].subject);
+        assert_eq!(
+            merged.conflicts[0].conflict_type,
+            preview.conflicts[0].conflict_type
+        );
+        timeline
+            .validate()
+            .expect("preview + reported conflict must not corrupt state");
+    }
+
+    /// Multiple conflicting subjects come back in a DETERMINISTIC order
+    /// (sorted by subject display form). `index_subjects_by_role` is a
+    /// `HashMap`; without the explicit sort, an agent diffing two
+    /// previews of the same divergence would see phantom churn.
+    #[tokio::test]
+    async fn preview_merge_conflict_order_is_deterministic() {
+        let timeline = Timeline::new(TimelineConfig::default());
+
+        timeline
+            .add_operation(dummy_create_op(), Author::System, BranchId::main())
+            .await
+            .unwrap();
+        let child = timeline
+            .create_branch(
+                "child".to_string(),
+                BranchId::main(),
+                None,
+                Author::System,
+                crate::BranchPurpose::UserExploration {
+                    description: "ordering".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        // Both sides touch the same THREE subjects with different ops.
+        for (branch, kind) in [(BranchId::main(), "op_main"), (child, "op_child")] {
+            for subject in ["solid:2", "solid:10", "face:1"] {
+                timeline
+                    .add_operation(
+                        generic_op(&format!("{kind}_{subject}"), &[], &[subject]),
+                        Author::System,
+                        branch,
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+
+        let a = timeline.preview_merge(child, BranchId::main()).unwrap();
+        let b = timeline.preview_merge(child, BranchId::main()).unwrap();
+        let subjects = |p: &crate::branch::MergePreview| -> Vec<String> {
+            p.conflicts.iter().map(|c| c.subject.to_string()).collect()
+        };
+        assert_eq!(a.conflicts.len(), 3, "all three collisions must surface");
+        assert_eq!(
+            subjects(&a),
+            vec!["face:1", "solid:10", "solid:2"],
+            "conflicts must be sorted by subject display form"
+        );
+        assert_eq!(
+            subjects(&a),
+            subjects(&b),
+            "two previews of the same divergence must agree exactly"
+        );
+    }
+
+    /// `preview_merge` reports `FastForward`/`UpToDate` relationships
+    /// typed — and, unlike the real merge's up-to-date path (which
+    /// marks the source `Merged`), flips no state at all.
+    #[tokio::test]
+    async fn preview_merge_reports_fast_forward_and_up_to_date_without_state_flip() {
+        let timeline = Timeline::new(TimelineConfig::default());
+
+        timeline
+            .add_operation(dummy_create_op(), Author::System, BranchId::main())
+            .await
+            .unwrap();
+        let child = timeline
+            .create_branch(
+                "child".to_string(),
+                BranchId::main(),
+                None,
+                Author::System,
+                crate::BranchPurpose::UserExploration {
+                    description: "ff-preview".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        timeline
+            .add_operation(dummy_create_op(), Author::System, child)
+            .await
+            .unwrap();
+
+        // child is ahead of main by 1 → merging child INTO main is a
+        // fast-forward of exactly that 1 event.
+        let ff = timeline.preview_merge(child, BranchId::main()).unwrap();
+        assert_eq!(
+            ff.relationship,
+            crate::branch::BranchRelationship::FastForward { events_ahead: 1 }
+        );
+        assert!(ff.conflicts.is_empty());
+
+        // main is a prefix of child → merging main INTO child is a no-op.
+        let utd = timeline.preview_merge(BranchId::main(), child).unwrap();
+        assert_eq!(
+            utd.relationship,
+            crate::branch::BranchRelationship::UpToDate
+        );
+        assert!(utd.conflicts.is_empty());
+
+        // The merge's own up-to-date path marks source Merged; the
+        // preview must NOT have — both branches still active, both
+        // sequences untouched.
+        assert!(timeline.is_branch_active(&child));
+        assert!(timeline.is_branch_active(&BranchId::main()));
+        assert_eq!(
+            timeline
+                .get_branch_events(&BranchId::main(), None, None)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            timeline
+                .get_branch_events(&child, None, None)
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    /// A LIMITED history page must be the earliest events at/after
+    /// `start`, in ascending order — not an arbitrary hash-ordered
+    /// subset. 150 events with `limit=100` make a hash-order coincidence
+    /// astronomically unlikely, so the pre-fix take-then-sort
+    /// implementation fails this deterministically in practice.
+    #[tokio::test]
+    async fn get_branch_events_limited_page_is_the_earliest_contiguous_run() {
+        let timeline = Timeline::new(TimelineConfig::default());
+        for _ in 0..150 {
+            timeline
+                .add_operation(dummy_create_op(), Author::System, BranchId::main())
+                .await
+                .unwrap();
+        }
+
+        let first_page = timeline
+            .get_branch_events(&BranchId::main(), Some(0), Some(100))
+            .unwrap();
+        let seqs: Vec<u64> = first_page.iter().map(|e| e.sequence_number).collect();
+        assert_eq!(
+            seqs,
+            (0u64..100).collect::<Vec<_>>(),
+            "limit=100 must return sequences 0..=99 in order, not an arbitrary subset"
+        );
+
+        let mid_page = timeline
+            .get_branch_events(&BranchId::main(), Some(120), Some(10))
+            .unwrap();
+        let mid_seqs: Vec<u64> = mid_page.iter().map(|e| e.sequence_number).collect();
+        assert_eq!(
+            mid_seqs,
+            (120u64..130).collect::<Vec<_>>(),
+            "start=120 limit=10 must return sequences 120..=129 in order"
+        );
+
+        // Paging past the end is an honest empty page, not an error.
+        let past_end = timeline
+            .get_branch_events(&BranchId::main(), Some(150), Some(10))
+            .unwrap();
+        assert!(
+            past_end.is_empty(),
+            "start beyond the head must return an empty page"
+        );
     }
 
     /// One branch deletes an entity, the other modifies it — this is

@@ -755,6 +755,146 @@ fn raw_tools() -> Vec<ToolSpec> {
                 "required": []
             }),
         ),
+        // ── Timeline agent surface (2026-07-31 slice): the timeline as the
+        // agent's memory (history/checkpoints/undo/redo) and its
+        // parallel-work substrate (branch/merge/conflicts). ──
+        t(
+            "timeline_history",
+            Core,
+            Experimental,
+            Curated,
+            "Read a branch's recorded design history in sequence order (id, kind, author, affected parts); page with start/limit.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "branch": {"type": "string", "default": "main", "description": "timeline branch id ('main' = trunk)"},
+                    "start": {"type": "integer", "minimum": 0, "default": 0, "description": "first event sequence number to return"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 1000, "default": 100, "description": "max events to return"},
+                    "include_operations": {"type": "boolean", "default": false, "description": "include each event's full recorded operation payload"}
+                },
+                "required": []
+            }),
+        ),
+        t(
+            "timeline_branch",
+            Core,
+            Experimental,
+            Curated,
+            "Fork a timeline branch before speculative work (isolated event-log lane; live scene stays shared); authorship records the agent.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "minLength": 1, "description": "branch name"},
+                    "parent": {"type": "string", "default": "main", "description": "parent branch id"},
+                    "agent_id": {"type": "string", "description": "logical agent identity recorded as branch author; omit = this agent"},
+                    "description": {"type": "string", "description": "what this branch explores"},
+                    "activate": {"type": "boolean", "default": false, "description": "also switch kernel recording to the new branch"}
+                },
+                "required": ["name"]
+            }),
+        ),
+        t(
+            "timeline_branches",
+            Core,
+            Experimental,
+            Curated,
+            "List timeline branches (state, author, agent_id, event counts, fork point); filter by state or agent_id.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "state": {"type": "string", "enum": ["active", "merged", "abandoned", "completed"], "description": "keep only branches in this state"},
+                    "agent_id": {"type": "string", "description": "keep only branches authored by this agent id"}
+                },
+                "required": []
+            }),
+        ),
+        t(
+            "timeline_switch",
+            Core,
+            Experimental,
+            Curated,
+            "Switch the kernel's recording branch: subsequent geometry ops append their events to this branch (process-global).",
+            json!({
+                "type": "object",
+                "properties": {
+                    "branch": {"type": "string", "description": "branch id to record onto ('main' or a branch UUID)"}
+                },
+                "required": ["branch"]
+            }),
+        ),
+        t(
+            "timeline_merge",
+            Core,
+            Experimental,
+            Curated,
+            "Merge a branch into a target: typed conflict witnesses on refusal, statistics + the target's rebuild certificate on success.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "source": {"type": "string", "description": "branch id to merge FROM"},
+                    "target": {"type": "string", "default": "main", "description": "branch id to merge INTO"},
+                    "strategy": {"type": "string", "enum": ["three-way", "fast-forward", "squash"], "default": "three-way", "description": "'three-way' detects + reports typed conflicts; 'fast-forward' refuses on divergence"},
+                    "message": {"type": "string", "description": "squash commit message (squash strategy only)"},
+                    "certify": {"type": "boolean", "default": true, "description": "on success, attach the target branch's rebuild certificate"}
+                },
+                "required": ["source"]
+            }),
+        ),
+        t(
+            "timeline_conflicts",
+            Core,
+            Experimental,
+            Curated,
+            "Read-only merge preview: branch relationship (up_to_date/fast_forward/divergent) + the exact typed conflicts a three-way merge would report.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "source": {"type": "string", "description": "branch id to preview merging FROM"},
+                    "target": {"type": "string", "default": "main", "description": "branch id to preview merging INTO"}
+                },
+                "required": ["source"]
+            }),
+        ),
+        t(
+            "timeline_checkpoint",
+            Core,
+            Experimental,
+            Curated,
+            "Record a named checkpoint capturing a branch's event range — a stable landmark to scrub back to or cite in review.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "minLength": 1, "description": "checkpoint name"},
+                    "description": {"type": "string", "description": "what this state is"},
+                    "branch": {"type": "string", "default": "main", "description": "branch whose event range to capture"}
+                },
+                "required": ["name"]
+            }),
+        ),
+        t(
+            "timeline_checkpoints",
+            Core,
+            Experimental,
+            Curated,
+            "List named design states (checkpoints): id, name, description, captured event range, author, timestamp.",
+            json!({"type": "object", "properties": {}, "required": []}),
+        ),
+        t(
+            "timeline_undo",
+            Core,
+            Experimental,
+            Curated,
+            "Step the agent's timeline cursor back one operation and re-derive the live model; honest {can_undo:false} at the beginning.",
+            json!({"type": "object", "properties": {}, "required": []}),
+        ),
+        t(
+            "timeline_redo",
+            Core,
+            Experimental,
+            Curated,
+            "Step the agent's timeline cursor forward one operation (after undo) and re-derive the live model.",
+            json!({"type": "object", "properties": {}, "required": []}),
+        ),
         // ═══════════════════ SKETCH ═══════════════════
         t(
             "create_sketch",
@@ -1822,7 +1962,11 @@ mod tests {
         // the kernel-served registry entry mirroring roshera-mcp's new
         // `dfm_check` tool (src/tools/inspect.ts) and REST route
         // POST /api/agent/parts/{id}/dfm.
-        assert_eq!(tools.len(), 91, "expected 91 tools, got {}", tools.len());
+        // 101: the timeline agent-surface slice (2026-07-31) added 10 Core /
+        // Experimental timeline verbs (history, branch, branches, switch,
+        // merge, conflicts, checkpoint, checkpoints, undo, redo) mirroring
+        // roshera-mcp src/tools/timeline.ts.
+        assert_eq!(tools.len(), 101, "expected 101 tools, got {}", tools.len());
     }
 
     /// The kernel-sourced rows correspond to operations actually registered in

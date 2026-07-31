@@ -719,10 +719,28 @@ fn resolve_branch_ref(reference: &str) -> Result<BranchId, StatusCode> {
     }
 }
 
+/// `GET /api/timeline/history/{branch}?start=&limit=` query parameters.
+///
+/// Paging controls for an agent reading its own memory: `start` is the
+/// first event sequence number to return (default 0), `limit` the page
+/// size (default 100, the pre-paging behaviour). `get_branch_events`
+/// orders BEFORE limiting, so a page is always the earliest contiguous
+/// run at/after `start` — never an arbitrary subset.
+#[derive(Debug, Deserialize)]
+pub struct HistoryQuery {
+    /// First event sequence number to include (default 0).
+    #[serde(default)]
+    pub start: Option<u64>,
+    /// Maximum events to return (default 100).
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
 /// Get timeline history
 pub async fn get_history(
     State(state): State<AppState>,
     Path(branch_id): Path<String>,
+    axum::extract::Query(page): axum::extract::Query<HistoryQuery>,
 ) -> Result<Json<Vec<EventSummary>>, StatusCode> {
     // Drain in-flight recorder ops so the response reflects every
     // kernel operation the client has issued, not just the ones the
@@ -734,7 +752,11 @@ pub async fn get_history(
     let branch_id = resolve_branch_ref(&branch_id)?;
 
     let events = timeline
-        .get_branch_events(&branch_id, Some(0), Some(100))
+        .get_branch_events(
+            &branch_id,
+            Some(page.start.unwrap_or(0)),
+            Some(page.limit.unwrap_or(100)),
+        )
         .map_err(|_| StatusCode::NOT_FOUND)?;
 
     let summaries: Vec<EventSummary> = events
@@ -766,7 +788,7 @@ pub async fn get_history(
 /// the kernel kind verbatim — `"create_box_3d"`, `"extrude_face"`, …
 /// For other variants we surface the serde tag (`"BooleanUnion"`,
 /// `"CreateSketch"`, …) which is stable across releases.
-fn operation_kind(op: &Operation) -> String {
+pub(crate) fn operation_kind(op: &Operation) -> String {
     if let Operation::Generic { command_type, .. } = op {
         return command_type.clone();
     }
@@ -2226,21 +2248,41 @@ pub async fn create_checkpoint(
     State(state): State<AppState>,
     auth_info: AuthInfo,
     Json(request): Json<CreateCheckpointRequest>,
-) -> Result<StatusCode, StatusCode> {
-    let mut timeline = state.timeline.write().await;
+) -> Result<(StatusCode, Json<CheckpointCreatedView>), StatusCode> {
+    // Resolve the target branch first — an unknown branch is a typed
+    // 404, never a silent checkpoint of `main` in its place.
+    let branch = match request.branch.as_deref() {
+        Some(b) => resolve_branch_ref(b)?,
+        None => BranchId::main(),
+    };
 
-    timeline
+    // Drain in-flight recorder ops so the captured event range covers
+    // every operation the caller has already issued.
+    let _ = state.timeline_recorder.flush().await;
+
+    let timeline = state.timeline.write().await;
+    let checkpoint_id = timeline
         .create_checkpoint(
-            request.name,
-            request.description.unwrap_or_default(),
-            BranchId::main(), // Use main branch
+            request.name.clone(),
+            request.description.clone().unwrap_or_default(),
+            branch,
             author_from_auth_info(&auth_info),
             Vec::new(), // No tags for now
         )
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|e| match e {
+            timeline_engine::TimelineError::BranchNotFound(_) => StatusCode::NOT_FOUND,
+            _ => StatusCode::INTERNAL_SERVER_ERROR,
+        })?;
 
-    Ok(StatusCode::CREATED)
+    Ok((
+        StatusCode::CREATED,
+        Json(CheckpointCreatedView {
+            id: checkpoint_id.to_string(),
+            name: request.name,
+            branch: branch.to_string(),
+        }),
+    ))
 }
 
 /// Checkpoint request.
@@ -2250,12 +2292,31 @@ pub async fn create_checkpoint(
 /// is now optional: the frontend (`Timeline.tsx`'s `handleCheckpoint`)
 /// only ever sent `{name}`, and the previous all-required shape meant
 /// Axum rejected every real checkpoint request before this handler ran.
+/// `branch` (agent surface slice) selects the branch whose event range
+/// the checkpoint captures; omitted = `main`, the pre-slice behaviour.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CreateCheckpointRequest {
     pub name: String,
     #[serde(default)]
     pub description: Option<String>,
+    /// `"main"` (default) or a branch UUIDv4 — must already exist.
+    #[serde(default)]
+    pub branch: Option<String>,
+}
+
+/// `POST /api/timeline/checkpoint` response: the created checkpoint's
+/// identity, so the caller can find it again in
+/// `GET /api/timeline/checkpoints` (the 201 used to carry an empty
+/// body — the checkpoint was unaddressable by its creator).
+#[derive(Debug, Serialize)]
+pub struct CheckpointCreatedView {
+    /// Checkpoint UUID.
+    pub id: String,
+    /// Echo of the requested name.
+    pub name: String,
+    /// Branch whose event range was captured.
+    pub branch: String,
 }
 
 // Helper functions to convert DTOs
