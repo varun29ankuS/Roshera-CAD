@@ -38,6 +38,7 @@ mod fillet_payload;
 #[cfg(test)]
 mod fillet_radius_harness;
 mod frame;
+mod goose_acp;
 mod handlers;
 mod idempotency;
 mod kernel_state;
@@ -8164,6 +8165,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_env_filter(filter)
         .init();
 
+    // Goose ACP hard lockdown. MUST stay ahead of anything that could
+    // touch a goose code path: goose's `Config::global()` is a
+    // process-lifetime `OnceCell` that captures `GOOSE_PATH_ROOT` on
+    // first use, so this is the only point in the program where the
+    // override is guaranteed to land. A failure here is a refusal to
+    // boot — an api-server that cannot prove goose's built-in tool
+    // surface is disabled must not serve `/acp` (and `build_router`
+    // will not mount it: see `goose_acp::acp_router`).
+    let goose_root = goose_acp::initialize()?;
+    tracing::info!(
+        target: "goose_acp",
+        root = %goose_root.display(),
+        "goose lockdown complete — platform extensions disabled, provider pinned"
+    );
+
     // Initialize geometry model
     let model = Arc::new(RwLock::new(
         geometry_engine::primitives::topology_builder::BRepModel::with_estimated_capacity(
@@ -9583,8 +9599,32 @@ pub(crate) fn build_router(state: AppState) -> Router {
     // identity), then the rate limiter throttles admitted requests
     // keyed on that identity, then idempotency intercepts mutating
     // verbs, then the inner router dispatches to the handler.
-    app.with_state(state)
-        .layer(axum::middleware::from_fn(agent_author_layer))
+    let app = app.with_state(state);
+
+    // Goose ACP surface (slice 1). Merged — not nested — because goose's
+    // `create_acp_router` binds the `/acp` path internally (nesting under
+    // "/acp" would yield /acp/acp). Merged HERE, between `.with_state`
+    // and the middleware stack, for two reasons that are both
+    // load-bearing:
+    //   1. Type: before `.with_state(state)` the chain is
+    //      `Router<AppState>`; goose returns a state-erased `Router`,
+    //      and the two only unify after the state is applied.
+    //   2. Security: layers applied below cover only routes already
+    //      present, so merging here places `/acp` behind the same
+    //      auth/rate-limit stack as every geometry route (`/acp` is not
+    //      in `auth_middleware::path_is_exempt`, so even the WebSocket
+    //      upgrade requires a credential).
+    // `acp_router()` is `None` unless `goose_acp::initialize()` ran and
+    // passed — the surface structurally cannot be mounted un-locked-down
+    // (test-built routers never call `initialize`, so they carry no
+    // `/acp`). The `session/update_provider` bypass documented on
+    // `goose_acp::acp_router` remains OPEN behind that auth gate.
+    let app = match goose_acp::acp_router() {
+        Some(acp) => app.merge(acp),
+        None => app,
+    };
+
+    app.layer(axum::middleware::from_fn(agent_author_layer))
         .layer(axum::middleware::from_fn_with_state(
             idempotency_store,
             idempotency::idempotency_layer,
