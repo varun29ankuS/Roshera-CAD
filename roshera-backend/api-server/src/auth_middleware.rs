@@ -163,6 +163,7 @@ fn dev_auth_info() -> AuthInfo {
             Permission::ViewGeometry,
             Permission::ExportGeometry,
             Permission::RecordSession,
+            Permission::ModifySettings,
         ],
         roles: vec!["dev".to_string()],
         is_api_key: false,
@@ -451,6 +452,16 @@ pub async fn require_export_geometry(request: Request, next: Next) -> Response {
     enforce_permission_layer(Permission::ExportGeometry, "export_geometry", request, next).await
 }
 
+/// Route layer for the AI provider connection dialog: `GET/PUT/DELETE
+/// /api/ai/provider`, `POST /api/ai/provider/test`. Applied to the read
+/// as well as the writes — the response surfaces CLI sign-in state and
+/// the credential resolution/shadow report, which is configuration
+/// surface a Viewer-role caller has no business probing even though
+/// none of it is a raw secret.
+pub async fn require_modify_settings(request: Request, next: Next) -> Response {
+    enforce_permission_layer(Permission::ModifySettings, "modify_settings", request, next).await
+}
+
 /// Validate JWT token
 async fn validate_jwt(auth_manager: &AuthManager, token: &str) -> Result<AuthInfo, AuthError> {
     match auth_manager.verify_token(token) {
@@ -500,6 +511,7 @@ async fn validate_api_key(
                     "view_geometry" => Some(Permission::ViewGeometry),
                     "export_geometry" => Some(Permission::ExportGeometry),
                     "record_session" => Some(Permission::RecordSession),
+                    "modify_settings" => Some(Permission::ModifySettings),
                     _ => None,
                 })
                 .collect();
@@ -541,6 +553,13 @@ fn get_default_user_permissions() -> Vec<Permission> {
         Permission::ViewGeometry,
         Permission::ExportGeometry,
         Permission::RecordSession,
+        // Lets an authenticated JWT session use the AI provider
+        // connection dialog (`GET/PUT/DELETE /api/ai/provider`, `POST
+        // /api/ai/provider/test`). Without this, every logged-in human
+        // frontend user gets 403'd on the dialog under
+        // `AuthPosture::Required` — `Permission::ModifySettings` existed
+        // in the enum but was granted to nobody until this line.
+        Permission::ModifySettings,
     ]
 }
 

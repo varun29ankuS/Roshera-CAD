@@ -39,7 +39,11 @@ use serde_json::{json, Value};
 /// this once per session and memoise the catalog portion; the runtime
 /// flags are cheap to re-read if they want fresh state.
 pub async fn capabilities(State(state): State<AppState>) -> Json<Value> {
-    Json(build_capabilities(state.ai_configured))
+    Json(build_capabilities(
+        state
+            .ai_configured
+            .load(std::sync::atomic::Ordering::SeqCst),
+    ))
 }
 
 fn build_capabilities(ai_configured: bool) -> Value {
@@ -138,20 +142,28 @@ fn build_capabilities(ai_configured: bool) -> Value {
                 request to the LLM is dropped immediately so no \
                 further tokens are billed.",
             "ai_configuration": "AI routes (`/api/ai/command`, \
-                `/api/ai/command/stream`) require an LLM provider key \
-                set in the server environment at startup — currently \
-                `ANTHROPIC_API_KEY`. When unset, both routes refuse \
-                with `503 ai_not_configured` (the streaming route \
-                emits a single `event: error` frame carrying the same \
-                JSON body and closes). There is no silent mock \
-                fallback: a server with no key returns the structured \
-                error every time so misconfiguration is visible to \
-                agents and operators. The live state is published as \
-                `runtime.ai_configured` on this same document, so \
-                agents can branch their behaviour off the same GET \
-                they use for capability discovery without provoking a \
-                503. `GET /api/ai/status` exposes the same flag plus \
-                the active provider name and remediation hint."
+                `/api/ai/command/stream`) require a REST-usable LLM \
+                credential (api_key or oauth_profile) to be active — \
+                either `ANTHROPIC_API_KEY` set in the server \
+                environment at startup, or a provider connected via \
+                `PUT /api/ai/provider` (no restart required, takes \
+                effect immediately). When neither is active, both \
+                routes refuse with `503 ai_not_configured` (the \
+                streaming route emits a single `event: error` frame \
+                carrying the same JSON body and closes). There is no \
+                silent mock fallback: a server with no credential \
+                returns the structured error every time so \
+                misconfiguration is visible to agents and operators. \
+                The live state is published as `runtime.ai_configured` \
+                on this same document, so agents can branch their \
+                behaviour off the same GET they use for capability \
+                discovery without provoking a 503. `GET /api/ai/status` \
+                exposes the same flag plus the active provider name and \
+                remediation hint. `GET /api/ai/provider` exposes the \
+                full picture: the server-owned provider/mode allowlist, \
+                the credential resolution chain with shadow reporting, \
+                and local CLI sign-in detection — all gated on the \
+                `modify_settings` permission."
         },
         "primitives": primitives(),
         "operations": operations(),
@@ -342,7 +354,9 @@ fn endpoints() -> Value {
         "ai": {
             "command": "POST /api/ai/command",
             "command_stream": "POST /api/ai/command/stream",
-            "status": "GET /api/ai/status"
+            "status": "GET /api/ai/status",
+            "provider": "GET /api/ai/provider, PUT /api/ai/provider, DELETE /api/ai/provider",
+            "provider_test": "POST /api/ai/provider/test"
         },
         "session": {
             "list": "GET /api/sessions",

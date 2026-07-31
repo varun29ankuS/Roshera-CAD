@@ -1873,6 +1873,18 @@ pub struct EvidencePart {
     /// Why `mass_properties` is `null`, present only when it is.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mass_properties_absent_reason: Option<String>,
+    /// **P1 enforcement.** Freshness-gated soundness status read through
+    /// [`BRepModel::soundness_reading`](geometry_engine::primitives::topology_builder::BRepModel::soundness_reading)
+    /// (never recomputed): `"sound"`, `"unsound"`, or `"stale"` when the
+    /// part was mutated (or never certified) since its last full
+    /// verification. An evidence pack that folded a stale reading into
+    /// `sound: true` would be exactly the "laundering a guess as authority"
+    /// failure this field exists to prevent.
+    pub soundness_status: &'static str,
+    /// `Some(bool)` only when `soundness_status` is `"sound"`/`"unsound"`;
+    /// `None` (→ JSON `null`) when `"stale"` — a stale reading never reports
+    /// a `sound` boolean, fabricated or otherwise.
+    pub sound: Option<bool>,
 }
 
 /// The document's final geometry state.
@@ -2020,12 +2032,21 @@ pub async fn get_evidence_pack(
                         ),
                     ),
                 };
+            // P1 enforcement: read-only, never recomputes — a stale part
+            // reports `"stale"` / `sound: null`, never a fabricated verdict.
+            let reading = model.soundness_reading(solid_id);
+            let soundness_status = reading.as_ref().map_or("stale", |r| r.status_label());
+            let sound = reading
+                .as_ref()
+                .and_then(|r| (!r.is_stale()).then(|| r.is_sound()));
             parts.push(EvidencePart {
                 solid_id,
                 uuid,
                 name,
                 mass_properties,
                 mass_properties_absent_reason,
+                soundness_status,
+                sound,
             });
         }
         parts.sort_by_key(|p| p.solid_id);

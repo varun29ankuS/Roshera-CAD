@@ -45,12 +45,13 @@ impl NativeProviderFactory {
             config.claude_model
         );
 
-        let api_key = std::env::var("ANTHROPIC_API_KEY")
+        let credential = std::env::var("ANTHROPIC_API_KEY")
             .ok()
-            .filter(|key| !key.is_empty());
+            .filter(|key| !key.is_empty())
+            .map(claude::ClaudeCredential::ApiKey);
 
         let claude_config = claude::ClaudeConfig {
-            api_key,
+            credential,
             model: config.claude_model.clone(),
             max_tokens: config.max_tokens,
             ..claude::ClaudeConfig::default()

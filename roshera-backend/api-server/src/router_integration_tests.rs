@@ -168,6 +168,15 @@ pub(crate) async fn make_test_state_with_database(
 
     let export_engine = Arc::new(export_engine::ExportEngine::new());
 
+    // Isolated to a private temp path per fixture call — never the real
+    // `state/ai-provider.json` — so parallel test threads can't collide
+    // on the same file.
+    let ai_provider_state_path =
+        std::env::temp_dir().join(format!("roshera-test-ai-provider-{}.json", Uuid::new_v4()));
+    let ai_provider_manager = Arc::new(crate::ai_provider_config::AiProviderManager::boot_at(
+        ai_provider_state_path,
+    ));
+
     let full_integration_executor = Arc::new(FullIntegrationExecutor::new(
         model.clone(),
         export_engine.clone(),
@@ -189,7 +198,8 @@ pub(crate) async fn make_test_state_with_database(
         full_integration_executor,
         command_executor,
         provider_manager,
-        ai_configured: false,
+        ai_configured: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        ai_provider_manager,
         session_manager,
         permission_manager,
         // Router integration tests exercise the enforced posture by
@@ -4217,7 +4227,24 @@ async fn export_step_empty_model_returns_nonempty_error_body() {
 #[tokio::test]
 async fn export_unsupported_format_returns_nonempty_error_body() {
     let state = make_test_state().await;
-    let (uuid, _solid, _rim) = seed_cylinder(&state, 5.0, 10.0).await;
+    let (uuid, solid_id, _rim) = seed_cylinder(&state, 5.0, 10.0).await;
+    // P1: `seed_cylinder` bypasses every mutating endpoint's ambient full
+    // cert, so the solid starts unverified — the export handler's staleness
+    // gate (checked before the format match) would refuse it first and mask
+    // the unsupported-format assertion this test actually cares about.
+    // Verify explicitly so ONLY the format-support path is under test here.
+    let verify_req = Request::builder()
+        .method(Method::GET)
+        .uri(format!("/api/agent/parts/{solid_id}/perception"))
+        .body(Body::empty())
+        .expect("static request must build");
+    let (verify_status, _verify_body) = dispatch(&state, verify_req).await;
+    assert_eq!(
+        verify_status,
+        StatusCode::OK,
+        "precondition: verify must succeed"
+    );
+
     let request = export_post(json!({
         "format": "IGES",
         "objects": [uuid.to_string()],
@@ -4233,6 +4260,152 @@ async fn export_unsupported_format_returns_nonempty_error_body() {
     assert!(
         text.contains("IGES") || text.to_lowercase().contains("not supported"),
         "F2(a): unsupported-format 501 must name the format/reason; got {text:?}"
+    );
+}
+
+// =====================================================================
+// Tests — P1 enforcement: stale verification refuses export/DFM at the
+// router layer, `GET .../truth` reads it honestly, and the explicit
+// verify (what `verify_part` calls) clears the gate.
+// =====================================================================
+
+/// A solid seeded directly via `TopologyBuilder` (bypassing every mutating
+/// endpoint's ambient full-cert, exactly like a kernel-side replay or a
+/// `fast:true` build chain) has NEVER been verified — its certificate cache
+/// is empty. `POST /api/export` must refuse it (422), naming the solid and
+/// `verify_part` as the remedy, rather than silently shipping an unverified
+/// STL a shop would machine from.
+#[tokio::test]
+async fn export_refuses_a_never_verified_solid() {
+    let state = make_test_state().await;
+    let (uuid, solid_id, _edges) = seed_box(&state, 10.0).await;
+
+    let request = export_post(json!({
+        "format": "STL",
+        "objects": [uuid.to_string()],
+    }));
+    let (status, body) = dispatch_raw(&state, request).await;
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "export of a never-verified solid must be refused with 422; body = {:?}",
+        String::from_utf8_lossy(&body)
+    );
+    let text = String::from_utf8_lossy(&body);
+    assert!(
+        text.contains(&solid_id.to_string()) && text.to_lowercase().contains("verify_part"),
+        "refusal must name the stale solid and the remedy (verify_part); got {text:?}"
+    );
+}
+
+/// The same solid, after an explicit full verification (`GET
+/// .../perception`, default path — what `verify_part` calls), must export
+/// successfully: the remedy actually clears the gate rather than being a
+/// dead-end refusal.
+#[tokio::test]
+async fn export_succeeds_after_explicit_verification() {
+    let state = make_test_state().await;
+    let (uuid, solid_id, _edges) = seed_box(&state, 10.0).await;
+
+    let verify_req = Request::builder()
+        .method(Method::GET)
+        .uri(format!("/api/agent/parts/{solid_id}/perception"))
+        .body(Body::empty())
+        .expect("static request must build");
+    let (verify_status, verify_body) = dispatch(&state, verify_req).await;
+    assert_eq!(
+        verify_status,
+        StatusCode::OK,
+        "verify must succeed; body = {verify_body}"
+    );
+    assert_eq!(
+        verify_body["sound"].as_bool(),
+        Some(true),
+        "a fresh box must verify sound; body = {verify_body}"
+    );
+
+    let request = export_post(json!({
+        "format": "STL",
+        "objects": [uuid.to_string()],
+    }));
+    let (status, body) = dispatch_raw(&state, request).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "export after explicit verification must succeed; body = {:?}",
+        String::from_utf8_lossy(&body)
+    );
+}
+
+/// `POST .../dfm` on a never-verified solid is refused pre-flight (422) —
+/// no rule ever runs against unverified geometry, so a DFM `pass` can never
+/// be laundering a guess as authority.
+#[tokio::test]
+async fn dfm_check_refuses_a_never_verified_solid() {
+    let state = make_test_state().await;
+    let (_uuid, solid_id, _edges) = seed_box(&state, 10.0).await;
+
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/api/agent/parts/{solid_id}/dfm"))
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({ "pack": "fdm", "nozzle_diameter": 0.4, "build_direction": [0.0, 0.0, 1.0] })
+                .to_string(),
+        ))
+        .expect("static request must build");
+    let (status, body) = dispatch(&state, request).await;
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "DFM on a never-verified solid must be refused with 422; body = {body}"
+    );
+    assert_eq!(
+        body["error"].as_str(),
+        Some("dfm_stale_solid"),
+        "body = {body}"
+    );
+    let reason = body["reason"].as_str().unwrap_or_default();
+    assert!(
+        reason.contains("verify_part"),
+        "refusal reason must name the remedy; body = {body}"
+    );
+}
+
+/// `GET .../truth` on a never-verified solid reads back `status: "stale"`
+/// and `sound: false` — never a silently-recomputed passing verdict. This is
+/// the core P1 change: the OLD path (`BRepModel::ground_truth`) would have
+/// recomputed here and returned `sound: true` for this same fresh box.
+#[tokio::test]
+async fn ground_truth_reports_stale_for_a_never_verified_solid() {
+    let state = make_test_state().await;
+    let (_uuid, solid_id, _edges) = seed_box(&state, 10.0).await;
+
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri(format!("/api/agent/parts/{solid_id}/truth"))
+        .body(Body::empty())
+        .expect("static request must build");
+    let (status, body) = dispatch(&state, request).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "truth GET must return 200; body = {body}"
+    );
+    assert_eq!(
+        body["status"].as_str(),
+        Some("stale"),
+        "a never-verified solid must read as stale; body = {body}"
+    );
+    assert_eq!(
+        body["sound"].as_bool(),
+        Some(false),
+        "a stale reading must never report sound:true; body = {body}"
+    );
+    assert_eq!(
+        body["remedy"].as_str(),
+        Some("verify_part"),
+        "body = {body}"
     );
 }
 

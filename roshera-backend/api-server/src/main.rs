@@ -12,9 +12,11 @@
 // test framework's failure mechanism.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
+mod acp_gate;
 mod agent_registry;
 #[cfg(test)]
 mod agent_registry_tests;
+mod ai_provider_config;
 mod assembly_instances;
 mod assembly_mates;
 mod assembly_mgr;
@@ -64,6 +66,7 @@ use axum::{
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
@@ -157,14 +160,32 @@ pub struct AppState {
     command_executor: Arc<Mutex<CommandExecutor>>,
     provider_manager: Arc<Mutex<ProviderManager>>,
 
-    /// True iff a real LLM provider key was found at server start.
-    /// AI handlers (`/api/ai/command`, `/api/ai/command/stream`) refuse
-    /// to serve traffic with `503 ai_not_configured` when this is
-    /// false. There is no mock fallback in production — silent mock
-    /// responses would make the system look like it works while
-    /// quietly returning placeholder text, which is worse than failing
-    /// loudly.
-    ai_configured: bool,
+    /// True iff a real, REST-usable LLM credential (api_key or
+    /// oauth_profile) is currently active — from server start OR from a
+    /// later `PUT /api/ai/provider` / `DELETE /api/ai/provider`. AI
+    /// handlers (`/api/ai/command`, `/api/ai/command/stream`) refuse to
+    /// serve traffic with `503 ai_not_configured` when this is false.
+    /// There is no mock fallback in production — silent mock responses
+    /// would make the system look like it works while quietly returning
+    /// placeholder text, which is worse than failing loudly.
+    ///
+    /// `Arc<AtomicBool>` (not `bool`) so `PUT`/`DELETE
+    /// /api/ai/provider` can flip it live — configuring a provider from
+    /// the dialog takes effect immediately, no restart. Deliberately
+    /// NEVER flipped true for `subscription_cli` mode: that mode wires
+    /// the `/acp` agent surface via a spawned CLI, not the REST
+    /// tool_use protocol these routes speak (see
+    /// `allowlist.rs`'s `SubscriptionCli` doc comment) — flipping this
+    /// for it would make `/api/ai/command` stop 503-ing and instead
+    /// fail deep inside the provider, a silent wrong answer.
+    ai_configured: Arc<AtomicBool>,
+
+    /// Persistence + resolution for the AI provider connection dialog
+    /// (`GET/PUT/DELETE /api/ai/provider`, `POST
+    /// /api/ai/provider/test`). Captures the boot-time env snapshot
+    /// used for shadow reporting before anything can scrub the
+    /// credential env vars. See `ai_provider_config.rs`.
+    ai_provider_manager: Arc<ai_provider_config::AiProviderManager>,
 
     // Vision pipeline (not yet implemented)
     // smart_router: Option<Arc<SmartRouter>>,
@@ -6468,7 +6489,7 @@ async fn process_enhanced_ai_command(
     // Refuse loudly if no LLM key was configured at startup. Returning
     // a structured 503 (vs. silently invoking a mock) makes the
     // misconfiguration visible to operators and to agents.
-    if !state.ai_configured {
+    if !state.ai_configured.load(Ordering::SeqCst) {
         return Err(crate::error_catalog::ApiError::ai_not_configured().into_response());
     }
 
@@ -6625,7 +6646,7 @@ async fn process_ai_command_stream(
     // single terminal `event: error` frame and close. Agents already
     // pattern-match on `error_code`; the wire shape matches what
     // POST /api/ai/command would have returned as a 503.
-    if !state.ai_configured {
+    if !state.ai_configured.load(Ordering::SeqCst) {
         let payload = serde_json::to_value(&crate::error_catalog::ApiError::ai_not_configured())
             .unwrap_or_else(|_| {
                 serde_json::json!({
@@ -7110,7 +7131,7 @@ async fn root() -> axum::response::Html<String> {
 // Global metrics tracking
 use axum::response::sse::Event as SseEvent;
 use futures::stream::Stream;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize; // `Ordering` already imported at the top of this file
 use tokio::sync::broadcast;
 
 static TOTAL_REQUESTS: AtomicUsize = AtomicUsize::new(0);
@@ -7738,15 +7759,17 @@ async fn enhanced_health(State(state): State<AppState>) -> Json<serde_json::Valu
 /// agents can branch their behaviour off this single GET without
 /// having to first issue a failing POST.
 async fn get_ai_status(State(state): State<AppState>) -> Json<serde_json::Value> {
-    if !state.ai_configured {
+    if !state.ai_configured.load(Ordering::SeqCst) {
         return Json(serde_json::json!({
             "status": "not_configured",
             "error_code": "ai_not_configured",
             "providers": {
                 "llm": "unavailable",
             },
-            "hint": "Set ANTHROPIC_API_KEY (or another supported provider key) \
-                     in the server environment and restart.",
+            "hint": "Connect a provider from the UI (Settings → AI Provider) \
+                     or via PUT /api/ai/provider — no restart required. \
+                     Alternatively set ANTHROPIC_API_KEY in the server \
+                     environment before start.",
             "missing_env": ["ANTHROPIC_API_KEY"],
         }));
     }
@@ -8262,11 +8285,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // with `503 ai_not_configured`. The mock provider stays available
     // in the codebase for in-process tests that construct their own
     // `ProviderManager` directly.
+    // Boot-time construction of the provider-config manager. This MUST
+    // happen before anything reads/scrubs ANTHROPIC_API_KEY /
+    // ANTHROPIC_AUTH_TOKEN below, because `AiProviderManager::boot`
+    // captures the env-var-presence snapshot the resolution chain's
+    // shadow reporting depends on (see `ai_provider_config.rs`).
+    let ai_provider_manager = Arc::new(ai_provider_config::AiProviderManager::boot());
+
     let mut provider_manager = ProviderManager::new();
-    let ai_configured = if let Ok(anthropic_key) = std::env::var("ANTHROPIC_API_KEY") {
+    // Resolution priority mirrors `GET /api/ai/provider`'s chain:
+    // a persisted runtime config (saved via a previous PUT) outranks
+    // the ANTHROPIC_API_KEY env var, so a key saved through the dialog
+    // survives a restart and keeps winning over a stale env var.
+    let persisted_api_key = ai_provider_manager
+        .stored()
+        .await
+        .filter(|s| s.mode == "api_key")
+        .and_then(|s| s.api_key)
+        .filter(|k| !k.is_empty());
+
+    let ai_configured = if let Some(key) = persisted_api_key {
+        tracing::info!(
+            "Persisted AI provider config found (state/ai-provider.json); \
+             registering Claude provider from the saved runtime key"
+        );
+        let claude_config = ai_integration::providers::claude::ClaudeConfig {
+            credential: Some(ai_integration::providers::claude::ClaudeCredential::ApiKey(
+                key,
+            )),
+            ..Default::default()
+        };
+        provider_manager.register_llm(
+            "claude".to_string(),
+            Box::new(ai_integration::providers::ClaudeProvider::with_config(
+                claude_config,
+            )),
+        );
+        provider_manager.set_active(String::new(), "claude".to_string(), None);
+        true
+    } else if let Ok(anthropic_key) = std::env::var("ANTHROPIC_API_KEY") {
         tracing::info!("Anthropic API key detected, registering Claude provider");
         let claude_config = ai_integration::providers::claude::ClaudeConfig {
-            api_key: Some(anthropic_key),
+            credential: Some(ai_integration::providers::claude::ClaudeCredential::ApiKey(
+                anthropic_key,
+            )),
             ..Default::default()
         };
         provider_manager.register_llm(
@@ -8279,12 +8341,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         true
     } else {
         tracing::warn!(
-            "No LLM API key configured (ANTHROPIC_API_KEY unset). \
-             AI routes will return 503 ai_not_configured until a key is \
-             set and the server is restarted."
+            "No LLM API key configured (ANTHROPIC_API_KEY unset, no \
+             persisted state/ai-provider.json). AI routes will return \
+             503 ai_not_configured until a provider is connected — via \
+             PUT /api/ai/provider (no restart needed) or by setting \
+             ANTHROPIC_API_KEY and restarting."
         );
         false
     };
+    let ai_configured = Arc::new(AtomicBool::new(ai_configured));
 
     // Bind the AI command executor to the same kernel `model` that REST and
     // WebSocket handlers mutate. Previously each `CommandExecutor::new()`
@@ -8383,6 +8448,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         command_executor,
         provider_manager: provider_manager_arc.clone(),
         ai_configured,
+        ai_provider_manager,
         // smart_router: not yet implemented,
         session_manager,
         permission_manager,
@@ -8597,6 +8663,26 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route("/api/ai/status", get(get_ai_status))
         .route("/api/ai/command", post(process_enhanced_ai_command))
         .route("/api/ai/command/stream", post(process_ai_command_stream))
+        // AI provider connection dialog. Gated end-to-end (including the
+        // GET) on `Permission::ModifySettings` — the response surfaces
+        // CLI sign-in state and the resolution/shadow chain, which is
+        // configuration surface a Viewer-role caller has no business
+        // probing even though none of it is a raw secret.
+        .route(
+            "/api/ai/provider",
+            get(handlers::ai_provider::get_provider)
+                .put(handlers::ai_provider::put_provider)
+                .delete(handlers::ai_provider::delete_provider)
+                .route_layer(axum::middleware::from_fn(
+                    auth_middleware::require_modify_settings,
+                )),
+        )
+        .route(
+            "/api/ai/provider/test",
+            post(handlers::ai_provider::test_provider).route_layer(axum::middleware::from_fn(
+                auth_middleware::require_modify_settings,
+            )),
+        )
         // Metrics endpoint
         .route("/api/metrics", get(metrics::get_metrics))
         // Geometry endpoints
@@ -9637,10 +9723,27 @@ pub(crate) fn build_router(state: AppState) -> Router {
     // `acp_router()` is `None` unless `goose_acp::initialize()` ran and
     // passed — the surface structurally cannot be mounted un-locked-down
     // (test-built routers never call `initialize`, so they carry no
-    // `/acp`). The `session/update_provider` bypass documented on
-    // `goose_acp::acp_router` remains OPEN behind that auth gate.
-    let app = match goose_acp::acp_router() {
-        Some(acp) => app.merge(acp),
+    // `/acp`).
+    //
+    // `acp_method_gate` wraps the goose router BEFORE the merge, so it
+    // covers `/acp` and nothing else: a default-deny method allowlist
+    // over the JSON-RPC body, plus body-level `_meta` inspection on
+    // `session/new`/`session/load` (see `acp_gate`'s module doc) and the
+    // `_goose/*` config RPCs that could otherwise re-enable the
+    // extensions `initialize()` disabled. Layering here rather than
+    // below `.with_state` keeps the gate inside Roshera's auth stack: a
+    // caller must authenticate first, then clear the allowlist.
+    //
+    // `acp_router` needs the process `AuthManager` to mint the per-
+    // session agent key its own inner middleware injects alongside
+    // Roshera's MCP server (slice 2) — `auth_layer_state.auth_manager`
+    // is the same `Arc<AuthManager>` the auth middleware layer below is
+    // about to be built from, cloned here (still owned, not yet moved:
+    // that happens at the final `.layer(from_fn_with_state(auth_layer_state, ...))`
+    // below) rather than threading a second `Arc<SessionManager>` through
+    // for a call site that only ever needs the auth manager.
+    let app = match goose_acp::acp_router(auth_layer_state.auth_manager.clone()) {
+        Some(acp) => app.merge(acp.layer(axum::middleware::from_fn(acp_gate::acp_method_gate))),
         None => app,
     };
 

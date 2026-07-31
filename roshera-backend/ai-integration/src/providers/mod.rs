@@ -32,6 +32,7 @@ pub type LLMTokenStream = Pin<Box<dyn Stream<Item = Result<String, ProviderError
 // stub. Production code paths (e.g. `NativeProviderFactory`) must
 // surface a real `ProviderUnavailable` error instead of silently
 // swapping in a mock.
+pub mod allowlist; // Server-owned provider allowlist (single source of truth)
 pub mod claude; // Claude API integration
 #[cfg(any(test, feature = "mock-providers"))]
 pub mod mock; // Mock providers for testing only

@@ -168,6 +168,41 @@ pub enum ErrorCode {
     /// deployment-time misconfiguration, not a transient failure —
     /// retrying without changing server config will fail identically.
     AiNotConfigured,
+    /// A provider (or credential mode) outside the server-owned
+    /// allowlist was requested through the provider-configuration
+    /// surface. Providers are operator/user-configured server-side
+    /// only; anything that would resolve by spawning an arbitrary
+    /// local binary is excluded by construction. `details` carries the
+    /// requested id and the allowlist. Non-retryable.
+    AiProviderRefused,
+    /// A provider credential failed its live validation round-trip
+    /// (e.g. the vendor API returned 401/403 for the supplied key, or
+    /// the subscription CLI probe failed). The caller must supply a
+    /// different credential — retrying the same one fails identically.
+    AiCredentialInvalid,
+
+    // ── ACP (goose agent) transport gate ──────────────────────────
+    /// A JSON-RPC method outside the ACP method allowlist was posted
+    /// to `/acp`. Provider switching, config mutation, extension
+    /// management and similar RPCs are server-configured surfaces —
+    /// a client cannot invoke them, by policy. `details` carries the
+    /// refused method and the allowed set. Non-retryable.
+    AcpMethodNotAllowed,
+    /// A WebSocket upgrade was attempted on `/acp`. The WebSocket
+    /// transport is disabled wholesale: goose owns the frame loop, so
+    /// frames could not be method-filtered — instead of a filter that
+    /// cannot be enforced, the upgrade itself is refused and clients
+    /// use the POST + SSE transport (which is filtered). Non-retryable.
+    AcpWebsocketDisabled,
+    /// A `session/new` or `session/load` body carried a `_meta` key
+    /// (`provider`, `enabledExtensions`, `recipeDeeplink`, `recipeId`)
+    /// that pre-empts or overrides the `mcpServers` entry Roshera
+    /// injects into every session — each is an arbitrary-command
+    /// surface in its own right (`enabledExtensions` in particular
+    /// routes goose around `mcpServers` entirely). `details` carries
+    /// the refused method and key. Non-retryable — the caller must
+    /// drop the key from the request, not retry with it.
+    AcpForbiddenSessionMeta,
 
     // ── Authorization / routing ───────────────────────────────────
     /// Caller authenticated but lacks the permission needed for this
@@ -224,6 +259,12 @@ impl ErrorCode {
 
             ErrorCode::AiNotConfigured => StatusCode::SERVICE_UNAVAILABLE,
 
+            ErrorCode::AiCredentialInvalid => StatusCode::BAD_REQUEST,
+            ErrorCode::AiProviderRefused
+            | ErrorCode::AcpMethodNotAllowed
+            | ErrorCode::AcpWebsocketDisabled
+            | ErrorCode::AcpForbiddenSessionMeta => StatusCode::FORBIDDEN,
+
             // A bounded op that blew its budget is a server-side time
             // limit, surfaced as 504 Gateway Timeout — the request was
             // accepted and computed, but the computation did not finish
@@ -262,6 +303,11 @@ impl ErrorCode {
             | ErrorCode::BranchMergeConflict
             | ErrorCode::SketchConstraintConflict
             | ErrorCode::AiNotConfigured
+            | ErrorCode::AiProviderRefused
+            | ErrorCode::AiCredentialInvalid
+            | ErrorCode::AcpMethodNotAllowed
+            | ErrorCode::AcpWebsocketDisabled
+            | ErrorCode::AcpForbiddenSessionMeta
             // A budget overrun is deterministic in its inputs: retrying
             // the identical request re-runs the identical corefinement
             // and blows the identical budget. The caller must change the
@@ -313,6 +359,11 @@ impl ErrorCode {
             ErrorCode::BranchMergeConflict => "branch_merge_conflict",
             ErrorCode::SketchConstraintConflict => "sketch_constraint_conflict",
             ErrorCode::AiNotConfigured => "ai_not_configured",
+            ErrorCode::AiProviderRefused => "ai_provider_refused",
+            ErrorCode::AiCredentialInvalid => "ai_credential_invalid",
+            ErrorCode::AcpMethodNotAllowed => "acp_method_not_allowed",
+            ErrorCode::AcpWebsocketDisabled => "acp_websocket_disabled",
+            ErrorCode::AcpForbiddenSessionMeta => "acp_forbidden_session_meta",
             ErrorCode::PermissionDenied => "permission_denied",
             ErrorCode::MethodNotAllowed => "method_not_allowed",
             ErrorCode::Internal => "internal_error",
@@ -349,6 +400,11 @@ impl ErrorCode {
             ErrorCode::BranchMergeConflict,
             ErrorCode::SketchConstraintConflict,
             ErrorCode::AiNotConfigured,
+            ErrorCode::AiProviderRefused,
+            ErrorCode::AiCredentialInvalid,
+            ErrorCode::AcpMethodNotAllowed,
+            ErrorCode::AcpWebsocketDisabled,
+            ErrorCode::AcpForbiddenSessionMeta,
             ErrorCode::PermissionDenied,
             ErrorCode::MethodNotAllowed,
             ErrorCode::Internal,
@@ -598,16 +654,99 @@ impl ApiError {
     pub fn ai_not_configured() -> Self {
         Self::new(
             ErrorCode::AiNotConfigured,
-            "AI provider not configured: no LLM API key found at server start".to_string(),
+            "AI provider not configured: no LLM credential is active".to_string(),
         )
         .with_hint(
-            "Set ANTHROPIC_API_KEY (or another supported provider key) in \
-             the server environment and restart. Use GET /api/ai/status \
-             to verify."
+            "Connect a provider from the UI (Settings → AI Provider) or via \
+             PUT /api/ai/provider — no restart required. Alternatively set \
+             ANTHROPIC_API_KEY in the server environment before start. Use \
+             GET /api/ai/status to verify."
                 .to_string(),
         )
         .with_details(serde_json::json!({
-            "missing_env": ["ANTHROPIC_API_KEY"],
+            "configure_endpoint": "/api/ai/provider",
+        }))
+    }
+
+    /// Provider-configuration surface refused a provider or credential
+    /// mode outside the server-owned allowlist. The typed refusal from
+    /// `ai_integration::providers::allowlist` is serialized into
+    /// `details.refusal` so agents can branch without parsing prose.
+    pub fn ai_provider_refused(
+        message: impl Into<String>,
+        refusal_details: serde_json::Value,
+    ) -> Self {
+        Self::new(ErrorCode::AiProviderRefused, message)
+            .with_hint(
+                "Choose a provider/mode from GET /api/ai/provider's `allowlist`. \
+                 Client-side provider switching does not exist by design."
+                    .to_string(),
+            )
+            .with_details(serde_json::json!({ "refusal": refusal_details }))
+    }
+
+    /// A credential failed its live validation round-trip.
+    pub fn ai_credential_invalid(message: impl Into<String>) -> Self {
+        Self::new(ErrorCode::AiCredentialInvalid, message).with_hint(
+            "The credential was tested against the live provider before saving \
+             and was rejected. Check the key/token (or CLI sign-in) and try \
+             again — nothing was stored."
+                .to_string(),
+        )
+    }
+
+    /// `/acp` POST carried a JSON-RPC method outside the allowlist.
+    pub fn acp_method_not_allowed(method: &str, allowed: &[&str]) -> Self {
+        Self::new(
+            ErrorCode::AcpMethodNotAllowed,
+            format!("ACP method '{method}' is not allowed through Roshera's agent surface"),
+        )
+        .with_hint(
+            "Provider selection, config mutation, and extension management are \
+             server-configured through Roshera's own settings surface \
+             (PUT /api/ai/provider), never through the agent transport."
+                .to_string(),
+        )
+        .with_details(serde_json::json!({
+            "method": method,
+            "allowed_methods": allowed,
+        }))
+    }
+
+    /// `/acp` WebSocket upgrade refused (POST + SSE is the supported
+    /// transport, because it is the one whose messages can be filtered).
+    pub fn acp_websocket_disabled() -> Self {
+        Self::new(
+            ErrorCode::AcpWebsocketDisabled,
+            "the /acp WebSocket transport is disabled; use HTTP POST + SSE".to_string(),
+        )
+        .with_hint(
+            "POST JSON-RPC messages to /acp and read responses via the SSE \
+             stream (GET /acp with Accept: text/event-stream). The WebSocket \
+             upgrade is refused because its frames bypass Roshera's method \
+             gate."
+                .to_string(),
+        )
+    }
+
+    /// `/acp` `session/new` / `session/load` carried a forbidden `_meta`
+    /// key — one that pre-empts or overrides the `mcpServers` entry
+    /// Roshera injects into every session.
+    pub fn acp_forbidden_session_meta(method: &str, key: &str) -> Self {
+        Self::new(
+            ErrorCode::AcpForbiddenSessionMeta,
+            format!("ACP '{method}' carried a forbidden _meta key: '{key}'"),
+        )
+        .with_hint(
+            "Provider selection, extension enablement, and recipe loading are \
+             server-configured through Roshera's own settings surface, never \
+             through _meta on session/new or session/load. Drop the key and \
+             retry — Roshera's own MCP server is injected automatically."
+                .to_string(),
+        )
+        .with_details(serde_json::json!({
+            "method": method,
+            "meta_key": key,
         }))
     }
 }

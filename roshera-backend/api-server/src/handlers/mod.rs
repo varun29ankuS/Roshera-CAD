@@ -4,6 +4,7 @@
 //! functionalities of the Roshera CAD system.
 
 pub mod agent;
+pub mod ai_provider;
 pub mod auth;
 pub mod capabilities;
 pub mod datums;
