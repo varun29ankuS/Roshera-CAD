@@ -607,9 +607,12 @@ export function ModelTree({
           setBackendNodes(hierarchyToNodes(data.data.hierarchy))
           return
         }
+      } else {
+        console.error(`[ModelTree] GET /api/hierarchy/${sid} failed: ${resp.status}`)
       }
-    } catch {
+    } catch (err) {
       // Backend not running — fall back to local
+      console.error('[ModelTree] hierarchy fetch threw:', err)
     }
     setBackendNodes(null)
   }, [sessionId])
@@ -618,6 +621,10 @@ export function ModelTree({
   // plus user-authored datums in Slice 3). Same poll cadence as the
   // hierarchy fetch — datums are tens-of-bytes per row, so polling is
   // cheap and we get visibility-flag sync for free.
+  //
+  // Logged, not surfaced in the UI: the viewport's `Datums.tsx` polls the
+  // same endpoint and owns the user-facing failure report (a Blackboard
+  // system line), so this tree doesn't double up on the same root cause.
   const fetchDatums = useCallback(async () => {
     try {
       const resp = await fetch(`${API_BASE}/api/datums`)
@@ -627,10 +634,13 @@ export function ModelTree({
           setDatums(data.datums)
           return
         }
+      } else {
+        console.error(`[ModelTree] GET /api/datums failed: ${resp.status}`)
       }
-    } catch {
+    } catch (err) {
       // Backend not running — leave datums as-is rather than clearing,
       // so the tree doesn't flicker on transient network errors.
+      console.error('[ModelTree] datums fetch threw:', err)
     }
   }, [])
 
@@ -737,7 +747,13 @@ export function ModelTree({
               method: 'PATCH',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ visible: next }),
-            })
+            }).then((resp) => {
+              if (!resp.ok) {
+                console.error(
+                  `[ModelTree] PATCH datum ${d.id} visibility failed: ${resp.status}`,
+                )
+              }
+            }).catch((err) => console.error('[ModelTree] datum visibility PATCH threw:', err))
           }
           // Optimistic local update; the next poll will reconcile.
           setDatums((prev) => prev.map((d) => ({ ...d, visible: next })))
@@ -752,7 +768,13 @@ export function ModelTree({
           method: 'PATCH',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ visible: next }),
-        })
+        }).then((resp) => {
+          if (!resp.ok) {
+            console.error(
+              `[ModelTree] PATCH datum ${numericId} visibility failed: ${resp.status}`,
+            )
+          }
+        }).catch((err) => console.error('[ModelTree] datum visibility PATCH threw:', err))
         setDatums((prev) =>
           prev.map((d) => (d.id === numericId ? { ...d, visible: next } : d)),
         )
