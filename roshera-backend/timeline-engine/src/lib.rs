@@ -35,10 +35,17 @@ pub mod recorder_bridge;
 pub mod replay;
 pub mod storage;
 
-// Re-export commonly used types
+// Re-export commonly used types.
+//
+// `BranchManager` is deliberately NOT re-exported (one-lane collapse,
+// 2026-07-31): it was a second, parallel branch-creation model whose
+// `new()` seeds no branches — every create through it failed
+// `BranchNotFound` — and the api-server no longer constructs it. The
+// one branch lane is `Timeline::create_branch`. The type itself is
+// retained in `branch::` pending explicit deletion approval.
 pub use branch::{
-    suggest_branch_names, BranchManager, BranchRelationship, MergePreview, MergeResult,
-    MergeStrategy, BRANCH_NAME_POOL,
+    suggest_branch_names, BranchRelationship, MergePreview, MergeResult, MergeStrategy,
+    BRANCH_NAME_POOL,
 };
 pub use cache::{CacheConfig, CacheManager};
 pub use dependency_graph::DependencyGraph;

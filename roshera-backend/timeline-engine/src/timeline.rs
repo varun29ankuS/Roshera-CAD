@@ -706,12 +706,19 @@ impl Timeline {
     /// only re-establishes the branch's existence and fork point so those events
     /// have a home. `main` always exists (created by [`Timeline::new`]) and is
     /// never overwritten. A restored branch is reinstated `Active`.
+    ///
+    /// `created_by` is the branch's PERSISTED author, restored verbatim so a
+    /// reboot does not heal-away authorship (events already round-trip their
+    /// authors verbatim; branches must too). `None` means the record predates
+    /// author persistence — those restore as `Author::System`, the value every
+    /// pre-field record was rehydrated with, never an upgraded guess.
     pub fn rehydrate_branch(
         &self,
         id: BranchId,
         name: String,
         parent: Option<BranchId>,
         fork_event_index: EventIndex,
+        created_by: Option<Author>,
     ) {
         if id == BranchId::main() {
             return;
@@ -728,7 +735,7 @@ impl Timeline {
             events: Arc::new(DashMap::new()),
             state: BranchState::Active,
             metadata: crate::BranchMetadata {
-                created_by: Author::System,
+                created_by: created_by.unwrap_or(Author::System),
                 created_at: Utc::now(),
                 purpose: crate::BranchPurpose::UserExploration {
                     description: "restored from durable storage".to_string(),

@@ -15,8 +15,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use timeline_engine::{
     certify_rebuild, certify_rebuild_with_drawings, mould_operation, name_binding_operation,
-    params_have_numeric, rebuild_model_from_events, Author, BranchId, BranchManager, BranchPurpose,
-    EntityId, EventId, EventMetadata, NameBindings, Operation, OperationInputs, RebuildCertificate,
+    params_have_numeric, rebuild_model_from_events, Author, BranchId, BranchPurpose, EntityId,
+    EventId, EventMetadata, NameBindings, Operation, OperationInputs, RebuildCertificate,
     ReplayOutcome, SessionId, Timeline, TimelineError, TimelineEvent,
 };
 use tracing::{error, info};
@@ -629,13 +629,21 @@ pub async fn record_operation(
 /// AUTHORSHIP-A1: `author` is derived from the request's authenticated
 /// `AuthInfo` (see [`author_from_auth_info`]), never from the request
 /// body.
+///
+/// One-lane collapse (2026-07-31): this handler used to go through
+/// `BranchManager::create_branch`, whose `BranchManager::new()` seeds
+/// no branches — the parent-exists check failed `BranchNotFound` for
+/// EVERY caller and this route 500'd unconditionally. It also passed
+/// fork index `0` with a comment claiming "Fork from latest", when `0`
+/// means literally event zero. There is now exactly one branch-creation
+/// lane — `Timeline::create_branch` — shared with `POST /api/branches`:
+/// recorder flush → `create_branch(.., None, ..)` (fork at the parent's
+/// real head) → `durability::persist_branch`.
 pub async fn create_branch(
     State(state): State<AppState>,
     auth_info: AuthInfo,
     Json(request): Json<CreateBranchRequest>,
 ) -> Result<Json<BranchInfo>, StatusCode> {
-    let branch_manager = &state.branch_manager;
-
     let parent = match request.parent_branch {
         Some(id) => resolve_branch_ref(&id)?,
         None => BranchId::main(),
@@ -644,31 +652,54 @@ pub async fn create_branch(
     let purpose = convert_purpose_dto(request.purpose);
     let author = author_from_auth_info(&auth_info);
 
-    let branch_id = branch_manager
-        .create_branch(
-            request.name.clone(),
-            parent,
-            0, // Fork from latest
-            author,
-            purpose,
-        )
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    // Drain in-flight kernel events first. The recorder is sync
+    // fire-and-forget into an MPSC channel; without the drain the fork
+    // point is computed against a stale parent head and the branch
+    // forks off an earlier event. Failure is non-fatal (the worker may
+    // be down, in which case nothing is in flight to drain).
+    let _ = state.timeline_recorder.flush().await;
 
-    // Durability (#39): persist the branch's metadata so its identity + fork
-    // point survive a restart. The event log already tags each event with its
-    // branch_id; this makes the branch itself restorable on boot.
-    let fork_sequence = state
-        .timeline
-        .read()
-        .await
-        .get_branch_head(&parent)
-        .unwrap_or(0) as i64;
+    // Acquire the timeline write lock for the smallest possible window:
+    // create_branch reads parent existence then inserts. Drop before
+    // the read-side render to avoid contending with concurrent reads.
+    // Fork point `None` resolves to the parent's current head.
+    let branch_id = {
+        let timeline = state.timeline.write().await;
+        timeline
+            .create_branch(request.name.clone(), parent, None, author.clone(), purpose)
+            .await
+            .map_err(|e| match e {
+                TimelineError::BranchNotFound(_) => StatusCode::NOT_FOUND,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            })?
+    };
+
+    // Read the created branch's REAL fork point back (rather than
+    // re-deriving it from the parent head, which may have moved).
+    let (fork_sequence, event_count) = {
+        let timeline = state.timeline.read().await;
+        let fork = timeline
+            .get_branch(&branch_id)
+            .map(|b| b.fork_point.event_index)
+            .unwrap_or(0);
+        let count = timeline
+            .get_branch_events(&branch_id, None, None)
+            .map(|v| v.len())
+            .unwrap_or(0);
+        (fork as i64, count)
+    };
+
+    // Durability (#39): persist the branch's metadata so its identity, fork
+    // point, and authorship survive a restart. The event log already tags each
+    // event with its branch_id; this makes the branch itself restorable on
+    // boot.
     crate::durability::persist_branch(
         &state,
         branch_id,
         Some(parent),
         fork_sequence,
         request.name.clone(),
+        author,
     )
     .await;
 
@@ -676,7 +707,7 @@ pub async fn create_branch(
         id: branch_id.to_string(),
         name: request.name,
         parent: Some(parent.to_string()),
-        event_count: 0,
+        event_count,
         state: "active".to_string(),
     }))
 }
@@ -2359,15 +2390,28 @@ pub struct CheckpointCreatedView {
 /// display name (no email/username field survives JWT verification or
 /// API-key lookup today), so inventing one would itself be a
 /// fabrication this function exists to avoid.
-fn author_from_auth_info(auth: &AuthInfo) -> Author {
-    match &auth.principal {
+pub(crate) fn author_from_auth_info(auth: &AuthInfo) -> Author {
+    author_from_principal(&auth.user_id, &auth.principal)
+}
+
+/// The pure `(verified user id, principal-kind claim) → Author` mapping
+/// behind [`author_from_auth_info`], factored out so the WebSocket
+/// surface (which authenticates in-band and carries the verified
+/// `TokenClaims` as connection state rather than an `AuthInfo`
+/// extension — RBAC A3) derives authorship through the SAME logic as
+/// REST rather than a parallel copy. All honesty invariants are
+/// documented on [`author_from_auth_info`]; in particular
+/// `PrincipalKind::Unspecified` maps to `Author::User` and is never
+/// upgraded to `Author::AIAgent`.
+pub(crate) fn author_from_principal(user_id: &str, principal: &PrincipalKind) -> Author {
+    match principal {
         PrincipalKind::Agent { model } => Author::AIAgent {
-            id: auth.user_id.clone(),
+            id: user_id.to_string(),
             model: model.clone(),
         },
         PrincipalKind::Human | PrincipalKind::Unspecified => Author::User {
-            id: auth.user_id.clone(),
-            name: auth.user_id.clone(),
+            id: user_id.to_string(),
+            name: user_id.to_string(),
         },
     }
 }
