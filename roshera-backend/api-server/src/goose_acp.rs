@@ -49,9 +49,17 @@
 //!
 //! 4. **Provider** — pinned to `anthropic` (same `ANTHROPIC_API_KEY` env
 //!    var Roshera's own Claude provider uses) with the model Roshera
-//!    already defaults to. The `GOOSE_PROVIDER` / `GOOSE_MODEL` env vars
-//!    are removed because goose consults them *before* the config file —
-//!    an inherited shell environment must not out-vote the pin. A
+//!    already defaults to, UNLESS the user has connected a Claude Max/Pro
+//!    subscription through the provider dialog (`PUT /api/ai/provider`,
+//!    `subscription_cli` mode) — that choice is persisted
+//!    (`state/ai-provider.json`) and [`initialize`]'s caller resolves it
+//!    via `ai_provider_config::boot_provider_pin_for` *before* calling
+//!    this function, so a restart pins `claude-code` right back instead
+//!    of silently reverting to `anthropic` (which has no API key and
+//!    fails every turn with "Provider not set" — the bug this fixed).
+//!    The `GOOSE_PROVIDER` / `GOOSE_MODEL` env vars are removed because
+//!    goose consults them *before* the config file — an inherited shell
+//!    environment must not out-vote the pin, whichever branch it took. A
 //!    client can still ask goose to switch provider at session-start
 //!    time (`_meta.provider` on `session/new`, or the live
 //!    `session/set_config_option` RPC) — see [`acp_router`] and
@@ -140,6 +148,8 @@ pub(crate) enum GooseAcpError {
          built file; refusing to boot /acp"
     )]
     McpEntryMissing(String),
+    #[error("failed to pin goose to the persisted subscription_cli provider at boot: {0}")]
+    ProviderPin(String),
 }
 
 /// Resolve `roshera-mcp/dist/index.js`'s absolute path.
@@ -191,6 +201,21 @@ fn disable_platform_extension(key: &str) -> Result<(), GooseAcpError> {
 /// `GOOSE_PATH_ROOT` at first use, so a late call silently configures
 /// goose against the wrong directory with no error.
 ///
+/// `provider_pin` is the caller's ALREADY-RESOLVED decision (computed by
+/// `ai_provider_config::boot_provider_pin_for` from whatever is persisted
+/// at `state/ai-provider.json`) of what to pin goose's `active_provider`
+/// to. This function has no opinion beyond that: it never reads the
+/// persisted config or touches a filesystem CLI-detection check itself —
+/// doing so here would mean two different call sites deciding the same
+/// thing. `BootProviderPin::Default` reproduces the historical hardcoded
+/// pin ([`PINNED_PROVIDER`]/[`PINNED_MODEL`]); `BootProviderPin::ClaudeCode`
+/// is what makes a Claude Max/Pro subscription connected through the
+/// dialog (`subscription_cli`, live-repinned by
+/// `ai_provider_config::repin_goose_to_claude_code`) SURVIVE a restart
+/// instead of reverting to `anthropic` (which has no API key) on every
+/// boot — proven live before this fix: a `session/prompt` returned
+/// `"Provider not set"` after a restart with a connected Max account.
+///
 /// Ordering inside this function is load-bearing:
 ///
 /// 1. Env pins (`GOOSE_PATH_ROOT` set; `GOOSE_PROVIDER`/`GOOSE_MODEL`/
@@ -202,8 +227,13 @@ fn disable_platform_extension(key: &str) -> Result<(), GooseAcpError> {
 ///    yet, and `set_extension_enabled` only flips entries that already
 ///    exist. The provider write materializes `config.yaml`; the next
 ///    write-path read then runs the migration that populates every
-///    platform-extension entry, which the disable loop flips off.
-pub(crate) fn initialize() -> Result<PathBuf, GooseAcpError> {
+///    platform-extension entry, which the disable loop flips off. This
+///    holds for EITHER pin branch below — `repin_goose_to_claude_code`
+///    itself calls `set_active_provider` first, so it materializes
+///    `config.yaml` exactly the same way the default branch does.
+pub(crate) fn initialize(
+    provider_pin: &crate::ai_provider_config::BootProviderPin,
+) -> Result<PathBuf, GooseAcpError> {
     // Roshera-owned root. `state/` is gitignored; override for tests and
     // deployments via ROSHERA_GOOSE_ROOT. An externally inherited
     // GOOSE_PATH_ROOT is deliberately ignored and overwritten: it would
@@ -242,12 +272,31 @@ pub(crate) fn initialize() -> Result<PathBuf, GooseAcpError> {
     std::env::remove_var("GOOSE_ADDITIONAL_CONFIG_FILES");
 
     let config = goose::config::Config::global();
-    goose::config::set_active_provider(config, PINNED_PROVIDER, PINNED_MODEL).map_err(
-        |source| GooseAcpError::Config {
-            what: "pinning active_provider",
-            source,
-        },
-    )?;
+    match provider_pin {
+        crate::ai_provider_config::BootProviderPin::Default => {
+            goose::config::set_active_provider(config, PINNED_PROVIDER, PINNED_MODEL).map_err(
+                |source| GooseAcpError::Config {
+                    what: "pinning active_provider",
+                    source,
+                },
+            )?;
+        }
+        crate::ai_provider_config::BootProviderPin::ClaudeCode { cli_path } => {
+            crate::ai_provider_config::repin_goose_to_claude_code(cli_path)
+                .map_err(GooseAcpError::ProviderPin)?;
+            // Mirrors the PUT handler's own ordering
+            // (`handlers/ai_provider.rs::put_provider`'s
+            // `Validated::SubscriptionCli` arm): repin, THEN scrub —
+            // goose's claude-code spawn path does not scrub
+            // ANTHROPIC_API_KEY/ANTHROPIC_AUTH_TOKEN itself, so a stale
+            // value surviving a restart would silently bill the API
+            // key instead of the subscription. Safe here specifically
+            // because `main()` captures `ai_provider_config::EnvSnapshot`
+            // (via `AiProviderManager::boot()`) BEFORE calling this
+            // function — see the ordering note at that call site.
+            crate::ai_provider_config::scrub_anthropic_env_for_subscription_mode();
+        }
+    }
 
     // Disable EVERY entry in goose's platform-extension registry — the
     // registry itself is the source of truth, not a hand-maintained list,
@@ -761,16 +810,54 @@ mod tests {
     /// OnceCell): this must remain the only test in this binary that
     /// touches goose config, and it must set the env var before the first
     /// goose call.
+    ///
+    /// It ALSO doubles as the sole integration proof for the "boot
+    /// clobbers the saved provider" fix: `resolve_boot_provider_pin`'s
+    /// unit tests (`ai_provider_config.rs`) prove the DECISION in
+    /// isolation, but only one test in this binary may ever call
+    /// `initialize()` at all, so this is the one place that can prove the
+    /// decision actually reaches goose's real config. It runs the
+    /// `BootProviderPin::ClaudeCode` branch (a persisted `subscription_cli`
+    /// choice) rather than `Default` precisely because that is the branch
+    /// the fix added — the extension-lockdown assertions below are
+    /// unaffected by which provider is pinned.
     #[tokio::test]
     async fn goose_lockdown_leaves_exactly_roshera_reachable() {
         let root =
             std::env::temp_dir().join(format!("roshera-goose-lockdown-{}", uuid::Uuid::new_v4()));
         std::env::set_var("ROSHERA_GOOSE_ROOT", &root);
 
-        let goose_root = initialize().expect("goose lockdown boot must succeed");
+        let fake_claude_cli_path = "C:\\fake\\npm\\claude.cmd";
+        let provider_pin = crate::ai_provider_config::BootProviderPin::ClaudeCode {
+            cli_path: std::path::PathBuf::from(fake_claude_cli_path),
+        };
+        let goose_root = initialize(&provider_pin).expect("goose lockdown boot must succeed");
         assert!(
             goose_root.join("config").join("config.yaml").exists(),
             "initialize() must materialize the goose config file it locked down"
+        );
+
+        // THE proving assertion for the boot-pin fix: a persisted
+        // subscription_cli choice must land in goose's real config, not
+        // just in the pure decision function.
+        let config = goose::config::Config::global();
+        let active_provider = config
+            .get_goose_provider()
+            .expect("active_provider must be readable after initialize()");
+        assert_eq!(
+            active_provider, "claude-code",
+            "initialize() must pin active_provider to claude-code when the \
+             resolved BootProviderPin says so — a persisted subscription_cli \
+             config must survive this call, never get clobbered back to the \
+             hardcoded anthropic default"
+        );
+        let claude_code_command: String = config
+            .get_param("CLAUDE_CODE_COMMAND")
+            .expect("CLAUDE_CODE_COMMAND must be set by the ClaudeCode pin branch");
+        assert_eq!(
+            claude_code_command, fake_claude_cli_path,
+            "CLAUDE_CODE_COMMAND must be the resolved CLI path from the \
+             BootProviderPin, not left stale or unset"
         );
 
         // (1) Defense-in-depth: the config-enabled path stays empty.

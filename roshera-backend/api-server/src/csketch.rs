@@ -78,6 +78,12 @@ impl CSketchManager {
         Self::default()
     }
 
+    /// Drop every constrained sketch. Used by `documents::activate` when
+    /// switching the live document.
+    pub fn clear(&self) {
+        self.sketches.clear();
+    }
+
     /// Allocate a fresh sketch anchored to the XY plane and return
     /// its id. The anchor matches the click-to-place default; a
     /// future endpoint will accept an explicit anchor request.

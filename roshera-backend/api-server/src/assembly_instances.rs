@@ -76,6 +76,12 @@ impl InstancedAssemblyManager {
         }
     }
 
+    /// Drop every instanced assembly. Used by `documents::activate` when
+    /// switching the live document. The recorder stays attached.
+    pub fn clear(&self) {
+        self.assemblies.clear();
+    }
+
     /// Emit one event through the attached recorder. Failures are logged,
     /// never propagated — the mutation has already succeeded (the same
     /// contract as the kernel recorder and `AssemblyManager`).

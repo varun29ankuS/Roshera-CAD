@@ -116,6 +116,12 @@ impl AssemblyManager {
         }
     }
 
+    /// Drop every assembly. Used by `documents::activate` when switching the
+    /// live document. The recorder stays attached.
+    pub fn clear(&self) {
+        self.assemblies.clear();
+    }
+
     /// Emit one `RecordedOperation` through the attached recorder.
     /// Failures are logged at `warn` level — they never propagate
     /// because the underlying assembly mutation has already

@@ -60,6 +60,15 @@ export interface ActiveProviderConfig {
   profile_name?: string | null
   saved_at?: string | null
   has_api_key: boolean
+  /** `null`/absent means "the provider's own default choice" — never a
+   *  fabricated model name. */
+  model?: string | null
+  /** `true` when tested against the live provider's model-listing
+   *  endpoint at save time; `false` when accepted but unverified
+   *  (`subscription_cli` only — the CLI has no side-effect-free
+   *  synchronous check this server can call per save); `null`/absent
+   *  when `model` itself is unset. */
+  model_verified?: boolean | null
 }
 
 export interface ResolutionChainEntry {
@@ -87,6 +96,13 @@ export interface ProviderConfigRequest {
   mode: CredentialMode
   api_key?: string
   profile_name?: string
+  /** Absent or `"default"` means "the provider's own choice" — the
+   *  backend normalizes both to no override. Do NOT hardcode a menu of
+   *  model names here: which models a mode can serve depends on the
+   *  live credential, so an explicit value is validated server-side
+   *  (`POST /api/ai/provider/test` / `PUT /api/ai/provider`) before it
+   *  is ever treated as active. */
+  model?: string
   /** Must be `true` for any mode the allowlist marks
    *  `spawns_local_process` — refused by name server-side without it. */
   consent_spawn_local_process?: boolean
@@ -97,6 +113,12 @@ export interface PutProviderResponse {
   provider: string
   mode: string
   profile_name?: string
+  model?: string | null
+  model_verified?: boolean | null
+  /** `subscription_cli` only, present when a `model` was requested:
+   *  explains why `model_verified` is `false` rather than pretending the
+   *  save round-tripped through a check it didn't. */
+  model_verification_note?: string
   note?: string
 }
 

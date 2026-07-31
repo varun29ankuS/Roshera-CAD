@@ -97,6 +97,16 @@ export type AcpToolCallStatus = 'pending' | 'in_progress' | 'completed' | 'faile
  *  the discriminant + id) since this is a live-verified transport but an
  *  unverified detailed tool-call schema — callers must not assume a field
  *  is present. */
+/** One entry of `session/new`'s (or `config_option_update`'s) `configOptions`
+ *  array (`agent-client-protocol-schema`'s `SessionConfigOption`, flattened
+ *  `SessionConfigSelect`). Only `id` + `currentValue` are interpreted here;
+ *  everything else (`options`, `category`, …) passes through untouched. */
+export interface AcpSessionConfigOption {
+  id: string
+  currentValue?: string
+  [key: string]: unknown
+}
+
 export type AcpSessionUpdate =
   | { sessionUpdate: 'user_message_chunk'; content: AcpContentBlock }
   | { sessionUpdate: 'agent_message_chunk'; content: AcpContentBlock }
@@ -120,6 +130,35 @@ export type AcpSessionUpdate =
       rawOutput?: unknown
     }
   | { sessionUpdate: 'plan'; entries?: unknown[] }
+  | { sessionUpdate: 'available_commands_update'; availableCommands?: unknown[] }
+  | { sessionUpdate: 'current_mode_update'; currentModeId?: string }
+  | { sessionUpdate: 'config_option_update'; configOptions?: AcpSessionConfigOption[] }
+  | { sessionUpdate: 'session_info_update'; title?: string | null; updatedAt?: string | null }
+  | {
+      /** Context-window usage for the CURRENT session only — resets
+       *  whenever the ACP stream drops (a fresh session starts from
+       *  zero). `used`/`size` are token COUNTS; `cost` (present when
+       *  goose can compute one) is deliberately never read anywhere in
+       *  this client — goose cannot know subscription-vs-API billing,
+       *  so a dollar figure would be fiction on a Max/Pro session. */
+      sessionUpdate: 'usage_update'
+      used: number
+      size: number
+      cost?: unknown
+    }
+
+/** Read a session's currently-resolved model out of a `session/new`
+ *  response or a `config_option_update` notification's `configOptions`
+ *  array. `"default"` is `claude-code`'s own not-yet-resolved sentinel
+ *  (`CLAUDE_CODE_DEFAULT_MODEL`), never a real model name — callers must
+ *  not print it as one, so this returns `null` for it exactly like the
+ *  "no model option present" case. */
+export function resolveModelFromConfigOptions(
+  configOptions: AcpSessionConfigOption[] | undefined,
+): string | null {
+  const current = configOptions?.find((o) => o.id === 'model')?.currentValue
+  return current && current !== 'default' ? current : null
+}
 
 export type AcpStopReason =
   | 'end_turn'
@@ -298,6 +337,7 @@ export class AcpClient {
   private readonly cwd: string
   private connectionId: string | null = null
   private sessionId: string | null = null
+  private _currentModel: string | null = null
   private nextRequestId = 1
   private readonly pending = new Map<JsonRpcId, PendingEntry>()
   private connStream: AcpSseStream | null = null
@@ -317,6 +357,15 @@ export class AcpClient {
 
   get currentSessionId(): string | null {
     return this.sessionId
+  }
+
+  /** The model `session/new` resolved for this session, or `null` when
+   *  none was reported (a real, honest state — `build_session_setup_config`
+   *  on the backend returns no `configOptions` for a provider it has no
+   *  inventory entry for, e.g. `claude-code`) or it is still the
+   *  unresolved `"default"` sentinel. Never a guess. */
+  get currentModel(): string | null {
+    return this._currentModel
   }
 
   /** Subscribe to `session/update` notifications. Returns an unsubscribe fn. */
@@ -391,9 +440,16 @@ export class AcpClient {
   }
 
   private handleNotification(note: JsonRpcNotificationMsg): void {
-    if (note.method !== 'session/update') return // e.g. availableCommands updates — not yet consumed
+    if (note.method !== 'session/update') return
     const params = note.params as { sessionId?: string; update?: AcpSessionUpdate } | undefined
     if (!params?.update) return
+    // A model chosen late (e.g. resolved after the provider inventory
+    // loads) corrects `currentModel` here, ahead of notifying
+    // subscribers — so a subscriber reading `client.currentModel` from
+    // inside its own callback for this same event sees the fresh value.
+    if (params.update.sessionUpdate === 'config_option_update') {
+      this._currentModel = resolveModelFromConfigOptions(params.update.configOptions)
+    }
     for (const cb of this.updateHandlers) cb(params.update)
   }
 
@@ -524,11 +580,12 @@ export class AcpClient {
       'session/new',
       { cwd: this.cwd, mcpServers },
       false,
-    )) as { sessionId?: string } | undefined
+    )) as { sessionId?: string; configOptions?: AcpSessionConfigOption[] } | undefined
     if (!result?.sessionId) {
       throw new AcpProtocolError(-32000, 'session/new response carried no sessionId')
     }
     this.sessionId = result.sessionId
+    this._currentModel = resolveModelFromConfigOptions(result.configOptions)
 
     this.sessStream = new AcpSseStream(
       this.acpPath,

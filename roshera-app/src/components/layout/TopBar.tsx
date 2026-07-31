@@ -1,4 +1,4 @@
-import { useCallback, useEffect } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import {
   Menubar,
   MenubarContent,
@@ -19,10 +19,10 @@ import { useCommandPaletteStore } from '@/stores/command-palette-store'
 import { useUnitsStore } from '@/stores/units-store'
 import { Badge } from '@/components/ui/badge'
 import { Sun, Moon } from 'lucide-react'
-import { wsClient } from '@/lib/ws-client'
 import { exportSceneAs } from '@/lib/export-api'
 import { useBlackboardStore } from '@/stores/blackboard-store'
 import { getDocumentUnit } from '@/lib/units-api'
+import { listDocuments, newDocument, openDocument, type DocumentInfo } from '@/lib/documents-api'
 import { refusalMessage, tryReadJson } from '@/lib/backend-refusal'
 import { UnitSelector } from '@/components/layout/UnitSelector'
 
@@ -110,6 +110,18 @@ export function TopBar() {
   const setDocMode = useDocModeStore((s) => s.setMode)
   const openCommandPalette = useCommandPaletteStore((s) => s.openWith)
   const setDocumentUnitState = useUnitsStore((s) => s.setDocumentUnitState)
+  const [documents, setDocuments] = useState<DocumentInfo[]>([])
+
+  // On mount: list registered documents for the "Open Document" submenu.
+  // Best-effort, same cold-start pattern as the unit fetch above — a
+  // failure just leaves the submenu showing the "no other documents" row.
+  useEffect(() => {
+    listDocuments()
+      .then(setDocuments)
+      .catch(() => {
+        // Leave the list empty; the submenu says so.
+      })
+  }, [])
 
   // On mount: GET the backend's current document unit and seed the store.
   // Best-effort: a failure (backend not yet reachable) silently leaves
@@ -134,10 +146,31 @@ export function TopBar() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
+  // "File → New": creates a fresh, empty document on the backend and opens
+  // it. The old model/timeline/blackboard were client-side-only resets
+  // (`clearScene` + a `NewProject` WS command the backend never handled)
+  // — every user shared one document forever, so "new" never actually
+  // meant new. The current document is durable (nothing here deletes it;
+  // it stays reachable from "Open Document" below), so this only asks for
+  // confirmation because it navigates away from what's on screen.
   const handleNewProject = useCallback(() => {
-    clearScene()
-    wsClient.send({ type: 'Command', payload: { cmd: 'NewProject' } })
-  }, [clearScene])
+    if (!window.confirm('Start a new, empty document? Your current document is saved.')) {
+      return
+    }
+    newDocument().catch((err) => {
+      console.error('[TopBar] newDocument failed:', err)
+      useBlackboardStore.getState().addLine('New document failed: backend unreachable.', 'system')
+    })
+  }, [])
+
+  const handleOpenDocument = useCallback((id: string) => {
+    openDocument(id)
+      .then(() => window.location.reload())
+      .catch((err) => {
+        console.error('[TopBar] openDocument failed:', err)
+        useBlackboardStore.getState().addLine('Switching document failed: backend unreachable.', 'system')
+      })
+  }, [])
 
   const handleDelete = useCallback(() => {
     // Route through the canonical REST endpoint — the same one
@@ -189,6 +222,24 @@ export function TopBar() {
             <MenubarItem onClick={handleNewProject}>
               New Project <MenubarShortcut>Ctrl+N</MenubarShortcut>
             </MenubarItem>
+            <MenubarSub>
+              <MenubarSubTrigger>Open Document</MenubarSubTrigger>
+              <MenubarSubContent>
+                {documents.length === 0 && (
+                  <MenubarItem disabled>No other documents</MenubarItem>
+                )}
+                {documents.map((doc) => (
+                  <MenubarItem
+                    key={doc.id}
+                    disabled={doc.active}
+                    onClick={() => handleOpenDocument(doc.id)}
+                  >
+                    {doc.active ? '● ' : ''}
+                    {doc.name}
+                  </MenubarItem>
+                ))}
+              </MenubarSubContent>
+            </MenubarSub>
             <MenubarSeparator />
             <MenubarSub>
               <MenubarSubTrigger>Export</MenubarSubTrigger>

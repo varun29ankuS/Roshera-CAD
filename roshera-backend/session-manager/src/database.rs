@@ -215,6 +215,17 @@ pub trait DatabasePersistence: Send + Sync {
     // event belongs to; these persist the branch RECORD itself.
     async fn save_branch(&self, branch: &BranchRecord) -> Result<(), SessionError>;
     async fn load_branches(&self, session_id: &str) -> Result<Vec<BranchRecord>, SessionError>;
+
+    // Documents: the registry of scoping keys under which timeline events
+    // and branch records are persisted (task "Roshera has no New"). A
+    // document's actual data (its `timeline_events` / `durable_branches`
+    // rows) is keyed by `DocumentRecord.id` exactly as `session_id` already
+    // is — this registry is only the human-facing catalog (id, name,
+    // created_at) so `GET /api/documents` has something to list. Upsert on
+    // conflict so re-registering the default document at boot is idempotent.
+    async fn save_document(&self, document: &DocumentRecord) -> Result<(), SessionError>;
+    /// All registered documents, oldest first.
+    async fn load_documents(&self) -> Result<Vec<DocumentRecord>, SessionError>;
 }
 
 /// Session metadata
@@ -286,6 +297,24 @@ pub struct BranchRecord {
     pub fork_sequence: i64,
     pub name: String,
     pub data: serde_json::Value,
+}
+
+/// A registered document — the human-facing catalog entry for a scoping key
+/// (`id`) under which `timeline_events` / `durable_branches` rows live. `id`
+/// is opaque to the schema (it is just the `session_id` column value every
+/// other durability table already keys on); this table exists solely so
+/// "New" has something to create and "Open" has something to list.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DocumentRecord {
+    pub id: String,
+    pub name: String,
+    /// Milliseconds since the Unix epoch.
+    pub created_at: i64,
+    /// Display string for the creating principal (human username, agent id,
+    /// or `"system"` for the pre-durability document self-healed into the
+    /// registry at boot). Not parsed back into an `Author` — provenance for
+    /// the document's actual events lives in the events themselves.
+    pub created_by: String,
 }
 
 /// PostgreSQL implementation
@@ -565,6 +594,26 @@ impl PostgresDatabase {
         .await
         .map_err(|e| SessionError::PersistenceError {
             reason: format!("Failed to create durable_branches table: {}", e),
+        })?;
+
+        // Document registry ("Roshera has no New"): the catalog `POST
+        // /api/documents` writes to and `GET /api/documents` lists. FK-free
+        // like `timeline_events`, for the same reason — `id` is a bare
+        // scoping key, not a row in `sessions`.
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS documents (
+                id VARCHAR(255) PRIMARY KEY,
+                name VARCHAR(255) NOT NULL,
+                created_at BIGINT NOT NULL,
+                created_by VARCHAR(255) NOT NULL
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| SessionError::PersistenceError {
+            reason: format!("Failed to create documents table: {}", e),
         })?;
 
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_timeline_session_seq ON timeline_events(session_id, sequence_number)")
@@ -1488,6 +1537,47 @@ impl DatabasePersistence for PostgresDatabase {
         })?;
         Ok(rows.into_iter().map(row_to_branch_record).collect())
     }
+
+    async fn save_document(&self, document: &DocumentRecord) -> Result<(), SessionError> {
+        sqlx::query(
+            r#"
+            INSERT INTO documents (id, name, created_at, created_by)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (id) DO UPDATE
+                SET name = EXCLUDED.name
+            "#,
+        )
+        .bind(&document.id)
+        .bind(&document.name)
+        .bind(document.created_at)
+        .bind(&document.created_by)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| SessionError::PersistenceError {
+            reason: format!("Failed to save document: {}", e),
+        })?;
+        Ok(())
+    }
+
+    async fn load_documents(&self) -> Result<Vec<DocumentRecord>, SessionError> {
+        let rows = sqlx::query("SELECT * FROM documents ORDER BY created_at ASC")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| SessionError::PersistenceError {
+                reason: format!("Failed to load documents: {}", e),
+            })?;
+        Ok(rows.into_iter().map(row_to_document_record_pg).collect())
+    }
+}
+
+/// Map a `documents` row into a [`DocumentRecord`] (PostgreSQL).
+fn row_to_document_record_pg(row: sqlx::postgres::PgRow) -> DocumentRecord {
+    DocumentRecord {
+        id: row.get("id"),
+        name: row.get("name"),
+        created_at: row.get("created_at"),
+        created_by: row.get("created_by"),
+    }
 }
 
 /// Map a `timeline_events` row into a [`TimelineEventData`]. Shared by the
@@ -1782,6 +1872,24 @@ impl SqliteDatabase {
         .await
         .map_err(|e| SessionError::PersistenceError {
             reason: format!("Failed to create durable_branches table: {}", e),
+        })?;
+
+        // Document registry ("Roshera has no New") — SQLite twin of the
+        // PostgreSQL `documents` table above.
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS documents (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                created_by TEXT NOT NULL
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| SessionError::PersistenceError {
+            reason: format!("Failed to create documents table: {}", e),
         })?;
 
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_timeline_events_seq ON timeline_events(session_id, sequence_number)")
@@ -2600,6 +2708,50 @@ impl DatabasePersistence for SqliteDatabase {
             reason: format!("Failed to load branches: {}", e),
         })?;
         Ok(rows.into_iter().map(sqlite_row_to_branch_record).collect())
+    }
+
+    async fn save_document(&self, document: &DocumentRecord) -> Result<(), SessionError> {
+        sqlx::query(
+            r#"
+            INSERT INTO documents (id, name, created_at, created_by)
+            VALUES (?1, ?2, ?3, ?4)
+            ON CONFLICT (id) DO UPDATE
+                SET name = excluded.name
+            "#,
+        )
+        .bind(&document.id)
+        .bind(&document.name)
+        .bind(document.created_at)
+        .bind(&document.created_by)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| SessionError::PersistenceError {
+            reason: format!("Failed to save document: {}", e),
+        })?;
+        Ok(())
+    }
+
+    async fn load_documents(&self) -> Result<Vec<DocumentRecord>, SessionError> {
+        let rows = sqlx::query("SELECT * FROM documents ORDER BY created_at ASC")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| SessionError::PersistenceError {
+                reason: format!("Failed to load documents: {}", e),
+            })?;
+        Ok(rows
+            .into_iter()
+            .map(row_to_document_record_sqlite)
+            .collect())
+    }
+}
+
+/// Map a `documents` row into a [`DocumentRecord`] (SQLite).
+fn row_to_document_record_sqlite(row: sqlx::sqlite::SqliteRow) -> DocumentRecord {
+    DocumentRecord {
+        id: row.get("id"),
+        name: row.get("name"),
+        created_at: row.get("created_at"),
+        created_by: row.get("created_by"),
     }
 }
 

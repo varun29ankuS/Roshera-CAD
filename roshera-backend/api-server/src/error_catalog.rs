@@ -152,6 +152,12 @@ pub enum ErrorCode {
     /// without a strategy change or manual conflict resolution.
     BranchMergeConflict,
 
+    // ── Document layer ──────────────────────────────────────────
+    /// `POST /api/documents/{id}/open` (or any other document-scoped
+    /// route) referenced a document id that is not in the registry —
+    /// never created, or a typo. Non-retryable from the same id.
+    DocumentNotFound,
+
     // ── Sketch / constraint solver ────────────────────────────────
     /// A constraint mutation (e.g. PATCH on a dimensional value)
     /// drove the sketch into an over-constrained or unsolvable
@@ -255,7 +261,8 @@ impl ErrorCode {
             ErrorCode::SolidNotFound
             | ErrorCode::PartNotFound
             | ErrorCode::TransactionNotFound
-            | ErrorCode::BranchNotFound => StatusCode::NOT_FOUND,
+            | ErrorCode::BranchNotFound
+            | ErrorCode::DocumentNotFound => StatusCode::NOT_FOUND,
 
             ErrorCode::KernelError
             | ErrorCode::TessellationEmpty
@@ -308,6 +315,7 @@ impl ErrorCode {
             | ErrorCode::BranchNotFound
             | ErrorCode::BranchInvalidState
             | ErrorCode::BranchMergeConflict
+            | ErrorCode::DocumentNotFound
             | ErrorCode::SketchConstraintConflict
             | ErrorCode::AiNotConfigured
             | ErrorCode::AiProviderRefused
@@ -365,6 +373,7 @@ impl ErrorCode {
             ErrorCode::BranchNotFound => "branch_not_found",
             ErrorCode::BranchInvalidState => "branch_invalid_state",
             ErrorCode::BranchMergeConflict => "branch_merge_conflict",
+            ErrorCode::DocumentNotFound => "document_not_found",
             ErrorCode::SketchConstraintConflict => "sketch_constraint_conflict",
             ErrorCode::AiNotConfigured => "ai_not_configured",
             ErrorCode::AiProviderRefused => "ai_provider_refused",
@@ -407,6 +416,7 @@ impl ErrorCode {
             ErrorCode::BranchNotFound,
             ErrorCode::BranchInvalidState,
             ErrorCode::BranchMergeConflict,
+            ErrorCode::DocumentNotFound,
             ErrorCode::SketchConstraintConflict,
             ErrorCode::AiNotConfigured,
             ErrorCode::AiProviderRefused,

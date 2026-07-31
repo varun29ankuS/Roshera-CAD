@@ -1,6 +1,11 @@
 import { useBlackboardStore } from '@/stores/blackboard-store'
 import { useWSStore } from '@/stores/ws-store'
-import { getAcpClient, resetAcpClient, runAcpTurn } from '@/lib/acp-blackboard'
+import {
+  getAcpClient,
+  isAcpTurnFailureRendered,
+  resetAcpClient,
+  runAcpTurn,
+} from '@/lib/acp-blackboard'
 import {
   AcpConnectionDeadError,
   AcpHttpError,
@@ -177,23 +182,32 @@ async function legacyBlackboardTurn(text: string, sessionId?: string): Promise<v
  */
 function classifyAcpFailure(err: unknown): { fallback: boolean } {
   const board = useBlackboardStore.getState()
+  // `runAcpTurn` (acp-blackboard.ts) already rendered a `client.prompt()`
+  // failure onto the turn's own placeholder line — never a blank one, see
+  // its module doc. Skip re-posting the same failure as a second system
+  // line here; the fallback/reset DECISION below still runs unchanged.
+  const alreadyRendered = isAcpTurnFailureRendered(err)
   if (err instanceof AcpHttpError) {
     if (err.status === 404 || err.status === 405) return { fallback: true }
     if (err.status === 401) {
       // The global fetch interceptor (installFetchAuth) has already
       // flipped the sign-in-required signal and the LoginDialog is
       // opening — this line just makes the Blackboard's own state honest.
-      board.addLine('Sign-in required to continue — see the sign-in prompt.', 'system')
+      if (!alreadyRendered) {
+        board.addLine('Sign-in required to continue — see the sign-in prompt.', 'system')
+      }
       return { fallback: false }
     }
-    board.addLine(`Agent request failed: ${err.message}`, 'system')
+    if (!alreadyRendered) board.addLine(`Agent request failed: ${err.message}`, 'system')
     return { fallback: false }
   }
   if (err instanceof AcpRateLimitError) {
-    board.addLine(
-      `The agent surface is rate-limited right now — retry in about ${Math.ceil(err.retryAfterMs / 1000)}s.`,
-      'system',
-    )
+    if (!alreadyRendered) {
+      board.addLine(
+        `The agent surface is rate-limited right now — retry in about ${Math.ceil(err.retryAfterMs / 1000)}s.`,
+        'system',
+      )
+    }
     return { fallback: false }
   }
   if (err instanceof TypeError) {
@@ -207,14 +221,16 @@ function classifyAcpFailure(err: unknown): { fallback: boolean } {
     // lives in `.data`. Surface that when it's a plain string; never
     // paraphrase, per the same rule the refusal card follows.
     const detail = typeof err.data === 'string' ? err.data : err.message
-    board.addLine(`Agent turn failed: ${detail}`, 'system')
+    if (!alreadyRendered) board.addLine(`Agent turn failed: ${detail}`, 'system')
     return { fallback: false }
   }
   console.error('[ai-client] ACP turn failed:', err)
-  board.addLine(
-    `Agent turn failed: ${err instanceof Error ? err.message : 'unknown error'}`,
-    'system',
-  )
+  if (!alreadyRendered) {
+    board.addLine(
+      `Agent turn failed: ${err instanceof Error ? err.message : 'unknown error'}`,
+      'system',
+    )
+  }
   return { fallback: false }
 }
 

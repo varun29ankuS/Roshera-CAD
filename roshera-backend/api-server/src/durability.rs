@@ -38,10 +38,14 @@ use uuid::Uuid;
 
 use crate::AppState;
 
-/// The fixed document key under which a single-tenant silo's entire event log
-/// is persisted. The partner architecture is one container stack per partner
-/// (`docs/DEPLOYMENT.md`), so one silo = one document space; branches are
-/// distinguished by the `branch_id` column, not by this key.
+/// The default document's id — the literal, byte-identical `session_id`
+/// every event persisted before the documents feature already carries.
+/// Renaming/migrating this value would orphan every pre-existing row; it
+/// MUST stay exactly this string. Multi-document support (`documents.rs`)
+/// layers a scoping key on top of this same column rather than changing it:
+/// `AppState.active_document` starts pointing at this id, so a fresh boot
+/// serves exactly what it always served, and `GET /api/documents` lists it
+/// as an ordinary (if pre-registered) document.
 pub const DURABILITY_SESSION_ID: &str = "roshera-durability-main";
 
 /// The `user_id` column value for durability rows. The authoritative author of
@@ -146,14 +150,23 @@ fn to_event_data(event: &TimelineEvent, session_id: &str) -> Result<TimelineEven
 /// session id and the event's own `sequence_number`.
 pub struct DatabaseEventSink {
     database: Arc<dyn DatabasePersistence + Send + Sync>,
-    session_id: String,
+    /// The document every event is currently persisted under. Shared with
+    /// `AppState.active_document` (same `Arc`) so `documents::activate`
+    /// flips both the live model's target document AND where the next
+    /// recorded event lands with a single write, and every in-flight
+    /// `persist()` call reads whichever document was active the instant it
+    /// looked — never a stale value baked in at construction time.
+    active_document: Arc<RwLock<String>>,
 }
 
 impl DatabaseEventSink {
-    pub fn new(database: Arc<dyn DatabasePersistence + Send + Sync>) -> Self {
+    pub fn new(
+        database: Arc<dyn DatabasePersistence + Send + Sync>,
+        active_document: Arc<RwLock<String>>,
+    ) -> Self {
         Self {
             database,
-            session_id: DURABILITY_SESSION_ID.to_string(),
+            active_document,
         }
     }
 }
@@ -161,9 +174,10 @@ impl DatabaseEventSink {
 #[async_trait::async_trait]
 impl EventSink for DatabaseEventSink {
     async fn persist(&self, event: &TimelineEvent) -> Result<(), String> {
-        let data = to_event_data(event, &self.session_id)?;
+        let document_id = self.active_document.read().await.clone();
+        let data = to_event_data(event, &document_id)?;
         self.database
-            .save_timeline_event(&self.session_id, &data)
+            .save_timeline_event(&document_id, &data)
             .await
             .map_err(|e| format!("save_timeline_event failed: {e}"))
     }
@@ -192,8 +206,9 @@ pub async fn persist_branch(
     if !durability_enabled() {
         return;
     }
+    let document_id = state.active_document.read().await.clone();
     let record = BranchRecord {
-        session_id: DURABILITY_SESSION_ID.to_string(),
+        session_id: document_id,
         branch_id: branch_id.to_string(),
         parent_branch_id: parent.map(|p| p.to_string()),
         fork_sequence,
@@ -230,9 +245,17 @@ async fn boot_replay_inner(state: &AppState) -> DurabilityStatus {
         return DurabilityStatus::Disabled;
     }
 
+    // The document this replay serves: whatever `AppState.active_document`
+    // currently points at. At server boot that's the default (constructed
+    // before this call); `documents::activate` sets it to the target
+    // document immediately before calling back in here, so the same replay
+    // path serves both "boot the server" and "open a document" — a document
+    // switch is not a new code path, just a different value in this cell.
+    let document_id = state.active_document.read().await.clone();
+
     // 1. Restore branch metadata first, so non-`main` events have a home
     //    during rehydration. Failure here is non-fatal (main always exists).
-    match state.database.load_branches(DURABILITY_SESSION_ID).await {
+    match state.database.load_branches(&document_id).await {
         Ok(records) => {
             for record in records {
                 restore_branch(state, record).await;
@@ -244,11 +267,7 @@ async fn boot_replay_inner(state: &AppState) -> DurabilityStatus {
     }
 
     // 2. Load the full event log, ordered by sequence_number.
-    let rows = match state
-        .database
-        .load_all_timeline_events(DURABILITY_SESSION_ID)
-        .await
-    {
+    let rows = match state.database.load_all_timeline_events(&document_id).await {
         Ok(rows) => rows,
         Err(e) => {
             tracing::error!(target: "durability", error = %e, "durability: failed to load event log at boot");
@@ -322,7 +341,7 @@ async fn boot_replay_inner(state: &AppState) -> DurabilityStatus {
                 first_break_kind = %kind,
                 events_served = prefix.len(),
                 events_total = rows.len(),
-                document = DURABILITY_SESSION_ID,
+                document = %document_id,
                 "durability: QUARANTINE — the log contains an event this kernel cannot faithfully \
                  replay; serving the clean prefix and refusing the tail. is_sound={}",
                 cert.is_sound()

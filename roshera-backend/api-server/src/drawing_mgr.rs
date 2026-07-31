@@ -77,6 +77,12 @@ impl DrawingManager {
         }
     }
 
+    /// Drop every drawing. Used by `documents::activate` when switching the
+    /// live document. The recorder stays attached.
+    pub fn clear(&self) {
+        self.drawings.clear();
+    }
+
     /// Emit a recorded event; logs and swallows recorder errors so
     /// the underlying mutation is not unwound.
     pub fn record_event(&self, op: RecordedOperation) {

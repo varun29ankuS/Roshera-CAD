@@ -4,7 +4,9 @@ import {
   DOCUMENT_SCOPE,
   partScope,
 } from '@/stores/blackboard-store'
+import { useAcpSessionStore } from '@/stores/acp-session-store'
 import { useSceneStore } from '@/stores/scene-store'
+import { cn } from '@/lib/utils'
 import { processBlackboardMessage } from '@/lib/ai-client'
 import { BlackboardLine } from './BlackboardLine'
 import { Button } from '@/components/ui/button'
@@ -32,6 +34,21 @@ import {
  * is 2.5× as wide → `w-[50rem]` (50rem / 800px), capped to the viewport so the
  * 3D scene stays usable on narrow screens.
  */
+const compactCount = new Intl.NumberFormat('en-US', { notation: 'compact', maximumFractionDigits: 1 })
+
+/** Render `usage_update`'s `used`/`size` as "used / size · pct%" — both
+ *  numbers come straight from goose (`AcpSessionStats.tokensUsed` /
+ *  `.contextSize`, `stores/acp-session-store.ts`); nothing here computes,
+ *  estimates, or extrapolates either one. `size` absent or zero (no
+ *  `usage_update` yet, or a provider that never reports a window) falls
+ *  back to the bare used count — dividing by a denominator goose never
+ *  gave us would be a fabricated percentage. */
+function formatContextUsage(used: number, size: number | null): string {
+  if (!size || size <= 0) return `${compactCount.format(used)} tok`
+  const pct = (used / size) * 100
+  return `${compactCount.format(used)} / ${compactCount.format(size)} · ${pct.toFixed(1)}%`
+}
+
 export function Blackboard() {
   const lines = useBlackboardStore((s) => s.lines)
   const isProcessing = useBlackboardStore((s) => s.isProcessing)
@@ -45,6 +62,16 @@ export function Blackboard() {
   const setActiveScope = useBlackboardStore((s) => s.setActiveScope)
   const agentAttention = useBlackboardStore((s) => s.agentAttention)
   const streamingLineId = useBlackboardStore((s) => s.streamingLineId)
+
+  // Live ACP session stats (Feature B) — display-only, driven by
+  // `lib/acp-blackboard.ts`'s wiring of the shared `AcpClient`. See
+  // `stores/acp-session-store.ts` for the honesty rules (no cost figure,
+  // session-scoped counts, "default" never printed as a model name).
+  const acpModel = useAcpSessionStore((s) => s.model)
+  const acpTurns = useAcpSessionStore((s) => s.turns)
+  const acpTokens = useAcpSessionStore((s) => s.tokensUsed)
+  const acpContextSize = useAcpSessionStore((s) => s.contextSize)
+  const acpLive = useAcpSessionStore((s) => s.live)
 
   // Drive the notebook scope from the viewport selection: the active part's
   // notebook is shown, so each part has its OWN blackboard. The primary
@@ -226,6 +253,34 @@ export function Blackboard() {
               executing — viewport has focus
             </span>
           )}
+          {/* Live ACP session stats: model · turns · tokens, all
+              session-scoped (reset when the stream drops — never a
+              cumulative total), plus a live/idle dot. No session yet
+              (or a dropped one) reads as "—", never a fabricated model
+              name — see acp-session-store.ts's doc for why. */}
+          <span
+            className="hidden shrink-0 items-center gap-1.5 whitespace-nowrap text-[10px] text-muted-foreground/70 sm:flex"
+            title={acpLive ? 'Agent session live' : 'No agent session'}
+          >
+            <span
+              className={cn(
+                'h-1.5 w-1.5 shrink-0 rounded-full',
+                acpLive ? 'animate-pulse bg-emerald-400' : 'bg-muted-foreground/30',
+              )}
+            />
+            <span className="font-mono">{acpModel ?? '—'}</span>
+            {acpLive && (
+              <>
+                <span className="text-muted-foreground/40">·</span>
+                <span>
+                  {acpTurns} turn{acpTurns === 1 ? '' : 's'}
+                </span>
+                <span className="text-muted-foreground/40">·</span>
+                <span>{formatContextUsage(acpTokens ?? 0, acpContextSize)}</span>
+                <span className="text-muted-foreground/50">(session)</span>
+              </>
+            )}
+          </span>
         </div>
         <div className="flex items-center gap-0.5">
           {overrideHeight !== null && (

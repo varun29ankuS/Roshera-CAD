@@ -482,6 +482,66 @@ pub fn repin_goose_to_claude_code(claude_cli_path: &Path) -> Result<(), String> 
     Ok(())
 }
 
+// ── Boot-time provider pin (the fix for "boot clobbers the saved
+//    provider") ─────────────────────────────────────────────────────────
+
+/// What `goose_acp::initialize()` should pin goose's `active_provider` to
+/// at boot, decided BEFORE any goose config code runs (see that
+/// function's own ordering doc — the provider pin must be the first
+/// config write). Two variants only: either goose's own hardcoded default
+/// (`anthropic`, the same credential `api_key`/`oauth_profile` mode
+/// already back), or the user's persisted `subscription_cli` choice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BootProviderPin {
+    /// No `subscription_cli` config survived the checks below — pin
+    /// goose's hardcoded default (`goose_acp::PINNED_PROVIDER` /
+    /// `PINNED_MODEL`). Covers: nothing persisted, `api_key`/
+    /// `oauth_profile`/`workload_identity` persisted (all backed by the
+    /// same `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN` goose's `anthropic`
+    /// provider already reads), and a persisted `subscription_cli` whose
+    /// CLI shim this boot can no longer detect (repinning to a
+    /// non-existent command would trade one broken pin for another).
+    Default,
+    /// A persisted `subscription_cli` config, with the CLI shim detected
+    /// present on this boot — pin goose to `claude-code` at `cli_path`,
+    /// exactly what `PUT /api/ai/provider` does when the user connects it
+    /// live (see `repin_goose_to_claude_code`), so a restart cannot undo
+    /// that choice.
+    ClaudeCode { cli_path: PathBuf },
+}
+
+/// Pure decision logic — no env/filesystem access, `claude_cli` is
+/// supplied by the caller — so the "which mode wins" rule is
+/// unit-testable without the process-global `goose::config::Config`
+/// `OnceCell` this whole module is otherwise careful never to touch from
+/// more than one test (see `goose_acp`'s test module doc). Mirrors
+/// [`build_chain`]'s pattern: decision logic stays pure and thoroughly
+/// tested; the live wrapper ([`boot_provider_pin_for`]) is the thin,
+/// untested-by-necessity glue that supplies real detection.
+pub fn resolve_boot_provider_pin(
+    stored: Option<&StoredProviderConfig>,
+    claude_cli: &CliStatus,
+) -> BootProviderPin {
+    let is_subscription_cli = matches!(stored, Some(s) if s.mode == "subscription_cli");
+    if is_subscription_cli {
+        if let Some(path) = claude_cli.path.as_deref().filter(|_| claude_cli.installed) {
+            return BootProviderPin::ClaudeCode {
+                cli_path: PathBuf::from(path),
+            };
+        }
+    }
+    BootProviderPin::Default
+}
+
+/// Live wrapper around [`resolve_boot_provider_pin`]: detects the real
+/// `claude` CLI shim on this machine via [`detect_claude_cli`]. Called
+/// exactly once, at boot, before `goose_acp::initialize()` touches
+/// `goose::config::Config::global()` — see that function's doc for why
+/// the ordering matters.
+pub fn boot_provider_pin_for(stored: Option<&StoredProviderConfig>) -> BootProviderPin {
+    resolve_boot_provider_pin(stored, &detect_claude_cli())
+}
+
 // ── The manager ─────────────────────────────────────────────────────────
 
 struct Inner {
@@ -817,5 +877,103 @@ mod tests {
         assert!(std::fs::read(&path).is_ok());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- resolve_boot_provider_pin: the boot-clobbers-the-saved-provider fix ---
+    //
+    // RED before this fix existed: `goose_acp::initialize()` unconditionally
+    // pinned `PINNED_PROVIDER`/`PINNED_MODEL` regardless of what was
+    // persisted, so a Claude Max subscription connected through the dialog
+    // (`subscription_cli`, repinned live via `repin_goose_to_claude_code`)
+    // reverted to `anthropic` on the next restart — proven live: a
+    // `session/prompt` returned `"Provider not set"` after a boot. These
+    // tests pin the decision `initialize()` now acts on.
+
+    fn cli_status(installed: bool, path: Option<&str>) -> CliStatus {
+        CliStatus {
+            installed,
+            path: path.map(str::to_string),
+            signed_in: true,
+        }
+    }
+
+    #[test]
+    fn nothing_persisted_pins_the_hardcoded_default() {
+        let cli = cli_status(
+            true,
+            Some("C:\\Users\\x\\AppData\\Roaming\\npm\\claude.cmd"),
+        );
+        assert_eq!(
+            resolve_boot_provider_pin(None, &cli),
+            BootProviderPin::Default
+        );
+    }
+
+    #[test]
+    fn api_key_mode_pins_the_hardcoded_default_not_claude_code() {
+        // api_key/oauth_profile/workload_identity are all backed by the
+        // same ANTHROPIC_API_KEY/ANTHROPIC_AUTH_TOKEN goose's own
+        // `anthropic` provider already reads — only subscription_cli needs
+        // the claude-code repin.
+        let cfg = stored("api_key", Some("sk-ant-real"));
+        let cli = cli_status(true, Some("C:\\claude.cmd"));
+        assert_eq!(
+            resolve_boot_provider_pin(Some(&cfg), &cli),
+            BootProviderPin::Default
+        );
+    }
+
+    #[test]
+    fn oauth_profile_mode_pins_the_hardcoded_default() {
+        let cfg = stored("oauth_profile", None);
+        let cli = cli_status(true, Some("C:\\claude.cmd"));
+        assert_eq!(
+            resolve_boot_provider_pin(Some(&cfg), &cli),
+            BootProviderPin::Default
+        );
+    }
+
+    #[test]
+    fn persisted_subscription_cli_with_detected_cli_pins_claude_code() {
+        // THE proving case: a persisted subscription_cli config must
+        // survive a restart — never silently clobbered back to `anthropic`.
+        let cfg = stored("subscription_cli", None);
+        let cli = cli_status(
+            true,
+            Some("C:\\Users\\x\\AppData\\Roaming\\npm\\claude.cmd"),
+        );
+        assert_eq!(
+            resolve_boot_provider_pin(Some(&cfg), &cli),
+            BootProviderPin::ClaudeCode {
+                cli_path: PathBuf::from("C:\\Users\\x\\AppData\\Roaming\\npm\\claude.cmd"),
+            }
+        );
+    }
+
+    #[test]
+    fn persisted_subscription_cli_with_cli_no_longer_installed_falls_back_to_default() {
+        // The shim this deployment relied on vanished since the config was
+        // saved (uninstalled, moved machines, ...) — repinning to a
+        // command that doesn't exist would trade one broken pin for
+        // another, so this falls back rather than guessing a path.
+        let cfg = stored("subscription_cli", None);
+        let cli = cli_status(false, None);
+        assert_eq!(
+            resolve_boot_provider_pin(Some(&cfg), &cli),
+            BootProviderPin::Default
+        );
+    }
+
+    #[test]
+    fn persisted_subscription_cli_with_no_detected_path_falls_back_to_default() {
+        // Defensive: `installed: true` with `path: None` should not be
+        // reachable from `detect_cli_at`, but the decision must not panic
+        // or fabricate a path if it ever happens.
+        let cfg = stored("subscription_cli", None);
+        let cli = cli_status(true, None);
+        assert_eq!(
+            resolve_boot_provider_pin(Some(&cfg), &cli),
+            BootProviderPin::Default
+        );
     }
 }

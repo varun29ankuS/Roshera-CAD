@@ -30,6 +30,8 @@ mod blend_failed_harness;
 mod bounded_exec;
 mod branches;
 mod csketch;
+mod documents;
+mod documents_tests;
 mod drawing_mgr;
 mod durability;
 #[cfg(test)]
@@ -233,6 +235,18 @@ pub struct AppState {
     // persisted event log replayed cleanly, was quarantined, or was disabled.
     // Read by `GET /api/durability/status`.
     durability_status: durability::SharedDurabilityStatus,
+
+    /// The document id every new event is durably persisted under and the
+    /// one `durability::boot_replay` (re)loads on the next call — i.e. the
+    /// live server's ONE open document ("Roshera has no New", task doc-1).
+    /// Starts at `durability::DURABILITY_SESSION_ID` (the pre-documents
+    /// default) and is flipped by `documents::activate`, which also resets
+    /// every other piece of in-memory document state before calling
+    /// `boot_replay` again against the new value. The SAME `Arc` is shared
+    /// with the `DatabaseEventSink` the recorder writes through, so a
+    /// switch retargets both "what's live" and "where new events land" in
+    /// one write. See `documents.rs`.
+    pub active_document: Arc<RwLock<String>>,
 
     // Additional fields for handlers
     export_engine: Arc<export_engine::ExportEngine>,
@@ -7679,8 +7693,9 @@ async fn stream_logs() -> Sse<impl Stream<Item = Result<SseEvent, std::convert::
 async fn durability_status_endpoint(State(state): State<AppState>) -> Json<serde_json::Value> {
     let status = state.durability_status.read().await.clone();
     let quarantined = matches!(status, durability::DurabilityStatus::Quarantined { .. });
+    let document_id = state.active_document.read().await.clone();
     Json(serde_json::json!({
-        "session_id": durability::DURABILITY_SESSION_ID,
+        "session_id": document_id,
         "durability_enabled": durability::durability_enabled(),
         "quarantined": quarantined,
         "status": status,
@@ -8199,6 +8214,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_env_filter(filter)
         .init();
 
+    // Boot-time construction of the provider-config manager. Moved ahead
+    // of the goose lockdown below (it used to sit down near the AI
+    // component wiring) because the lockdown now needs to know what the
+    // user last persisted BEFORE it pins goose's provider — see the note
+    // there. This ordering is still the one that matters most:
+    // `AiProviderManager::boot` MUST run before anything reads/scrubs
+    // ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN, because it captures the
+    // env-var-presence snapshot the resolution chain's shadow reporting
+    // depends on (see `ai_provider_config.rs`) — `AiProviderManager::boot`
+    // itself never touches goose's `Config::global()` (it only reads a
+    // JSON file and two env vars), so moving it earlier does not disturb
+    // the goose-lockdown ordering invariant below.
+    let ai_provider_manager = Arc::new(ai_provider_config::AiProviderManager::boot());
+
     // Goose ACP hard lockdown. MUST stay ahead of anything that could
     // touch a goose code path: goose's `Config::global()` is a
     // process-lifetime `OnceCell` that captures `GOOSE_PATH_ROOT` on
@@ -8207,7 +8236,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // boot — an api-server that cannot prove goose's built-in tool
     // surface is disabled must not serve `/acp` (and `build_router`
     // will not mount it: see `goose_acp::acp_router`).
-    let goose_root = goose_acp::initialize()?;
+    //
+    // The provider pin honors whatever the user last persisted through
+    // the connection dialog (`ai_provider_config::boot_provider_pin_for`)
+    // instead of unconditionally overwriting it — a Claude Max/Pro
+    // subscription connected via `subscription_cli` mode used to get
+    // silently clobbered back to the hardcoded `anthropic` default on
+    // every restart (no API key there, so every turn failed with
+    // "Provider not set"); now a restart re-pins `claude-code` right
+    // back. Nothing else about the lockdown's fail-closed ordering
+    // changes — this only decides WHICH provider gets pinned.
+    let provider_pin =
+        ai_provider_config::boot_provider_pin_for(ai_provider_manager.stored().await.as_ref());
+    let goose_root = goose_acp::initialize(&provider_pin)?;
     tracing::info!(
         target: "goose_acp",
         root = %goose_root.display(),
@@ -8220,6 +8261,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             geometry_engine::primitives::topology_builder::EstimatedComplexity::Medium,
         ),
     ));
+
+    // The one open document. Starts at the pre-documents default so a fresh
+    // boot serves exactly what it always served (task doc-1, "Roshera has
+    // no New"); `documents::activate` flips this — and only this Arc, no
+    // rebuild — when the caller switches documents.
+    let active_document = Arc::new(RwLock::new(durability::DURABILITY_SESSION_ID.to_string()));
 
     // Initialize database connection
     let database_url = std::env::var("DATABASE_URL")
@@ -8285,13 +8332,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // with `503 ai_not_configured`. The mock provider stays available
     // in the codebase for in-process tests that construct their own
     // `ProviderManager` directly.
-    // Boot-time construction of the provider-config manager. This MUST
-    // happen before anything reads/scrubs ANTHROPIC_API_KEY /
-    // ANTHROPIC_AUTH_TOKEN below, because `AiProviderManager::boot`
-    // captures the env-var-presence snapshot the resolution chain's
-    // shadow reporting depends on (see `ai_provider_config.rs`).
-    let ai_provider_manager = Arc::new(ai_provider_config::AiProviderManager::boot());
-
+    // `ai_provider_manager` was already constructed above, ahead of the
+    // goose lockdown — see that call site's comment for why the ordering
+    // moved.
     let mut provider_manager = ProviderManager::new();
     // Resolution priority mirrors `GET /api/ai/provider`'s chain:
     // a persisted runtime config (saved via a previous PUT) outranks
@@ -8389,8 +8432,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // off the kernel's synchronous record path. `ROSHERA_DURABILITY=off`
     // disables it and yields the pre-durability in-memory-only recorder.
     let timeline_recorder = if durability::durability_enabled() {
-        let sink: Arc<dyn timeline_engine::EventSink> =
-            Arc::new(durability::DatabaseEventSink::new(database.clone()));
+        let sink: Arc<dyn timeline_engine::EventSink> = Arc::new(
+            durability::DatabaseEventSink::new(database.clone(), active_document.clone()),
+        );
         Arc::new(timeline_engine::TimelineRecorder::new_with_sink(
             Arc::clone(&timeline),
             timeline_engine::Author::System,
@@ -8459,6 +8503,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         hierarchy_manager,
         database,
         durability_status: Arc::new(RwLock::new(durability::DurabilityStatus::Empty)),
+        active_document: active_document.clone(),
         export_engine,
         request_metrics: Arc::new(DashMap::new()),
         command_metrics: Arc::new(Mutex::new(metrics::CommandMetrics::default())),
@@ -8544,6 +8589,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tracing::info!(?other, "durability: boot replay complete");
         }
     }
+
+    // Documents (task doc-1, "Roshera has no New"): register the default
+    // document if this is a pre-documents database — a self-heal so `GET
+    // /api/documents` lists the events just replayed above instead of
+    // reporting an empty catalog for a non-empty document.
+    documents::ensure_default_document_registered(&state).await;
 
     // Auth Slice 3 (task #42): restore persisted API keys. Before this,
     // provisioned keys lived only in the in-memory DashMap and died on
@@ -9216,6 +9267,18 @@ pub(crate) fn build_router(state: AppState) -> Router {
         // Frame readback (exteroception) — server-rendered PNG of the
         // live scene. Multimodal LLMs consume the image directly.
         .route("/api/frame", get(frame::get_frame))
+        // Documents (task doc-1, "Roshera has no New") — the top-level
+        // scope above branches. POST creates an empty, unopened document;
+        // GET lists every registered document (flagged with which one is
+        // live); POST .../open makes one live, resetting the in-memory
+        // model/timeline/blackboard and replaying that document's own
+        // persisted log. No extra permission layer, matching `/api/branches`
+        // below — authenticated is sufficient.
+        .route(
+            "/api/documents",
+            get(documents::list_documents).post(documents::create_document),
+        )
+        .route("/api/documents/{id}/open", post(documents::open_document))
         // Sandbox branches per agent. Each agent claims a branch via
         // POST /api/branches; mutations land on that branch in the
         // event log; a human approves via POST /api/branches/{id}/merge

@@ -2054,7 +2054,12 @@ pub async fn get_evidence_pack(
     };
 
     // The agent's notebook — blackboard lines verbatim (author + timestamps).
-    let notebook = state.blackboard.snapshot(&notebook_scope).await.lines;
+    let evidence_document_id = state.active_document.read().await.clone();
+    let notebook = state
+        .blackboard
+        .snapshot(&evidence_document_id, &notebook_scope)
+        .await
+        .lines;
 
     // A SEPARATE, clearly-labeled re-measured verdict — recomputed NOW from
     // the immutable log via `certify_rebuild`, never conflated with recorded

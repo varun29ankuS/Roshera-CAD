@@ -28,10 +28,12 @@
  */
 
 import { useBlackboardStore } from '@/stores/blackboard-store'
+import { useAcpSessionStore } from '@/stores/acp-session-store'
 import { parseCard, type CardKind } from '@/lib/blackboard-cards'
 import {
   AcpClient,
   AcpConnectionDeadError,
+  AcpProtocolError,
   type AcpSessionUpdate,
   type AcpStopReason,
 } from '@/lib/acp-client'
@@ -108,6 +110,51 @@ function describeStopReason(reason: AcpStopReason): string {
   }
 }
 
+// ── Failed-turn rendering ────────────────────────────────────────────
+//
+// A `session/prompt` failure (the JSON-RPC *error* response, not a
+// `session/update` notification) previously left the placeholder agent
+// line — created blank by `addLine('', 'agent')` below and only ever
+// filled in by the SUCCESS branch — blank forever: verified live, a turn
+// that emitted `usage_update` / `available_commands_update` / two
+// `session_info_update`s and then errored rendered as empty lines with no
+// indication anything had failed. `describeAcpTurnFailure` + the
+// try/catch in `runAcpTurn` below fix that at the source: the SAME line
+// is edited to state what happened, never left blank.
+
+/** Errors already rendered onto the Blackboard by `runAcpTurn`'s own
+ *  catch, keyed by the thrown error object itself (not cloned/wrapped —
+ *  `runAcpTurn` rethrows the identical instance). `ai-client.ts`'s
+ *  `classifyAcpFailure` checks this before posting its own system line
+ *  for the same failure, so a rethrown error is never double-rendered. */
+const renderedTurnFailures = new WeakSet<object>()
+
+/** Whether `err` was already rendered onto the Blackboard by `runAcpTurn`.
+ *  Exported for `ai-client.ts` — see `renderedTurnFailures`'s doc. */
+export function isAcpTurnFailureRendered(err: unknown): boolean {
+  return typeof err === 'object' && err !== null && renderedTurnFailures.has(err)
+}
+
+/** Turn a `client.prompt()` rejection into a visible line. Prefers the
+ *  existing refusal-card path when `AcpProtocolError.data` validates
+ *  against it (a kernel refusal riding the JSON-RPC error payload) —
+ *  never a looser acceptance path than `cardFenceForPayload` already
+ *  allows. Otherwise the concrete detail: `.data` when it's a plain
+ *  string (per `ai-client.ts`'s rule — `.message` alone is often just the
+ *  generic JSON-RPC error class, e.g. "Internal error"), else `.message`. */
+function describeAcpTurnFailure(err: unknown): string {
+  if (err instanceof AcpProtocolError) {
+    if (err.data !== null && typeof err.data === 'object') {
+      const fence = fenceIfValid('refusal', err.data)
+      if (fence) return `⚠ Agent turn failed\n\n${fence}`
+    }
+    const detail = typeof err.data === 'string' ? err.data : err.message
+    return `⚠ Agent turn failed: ${detail}`
+  }
+  if (err instanceof Error) return `⚠ Agent turn failed: ${err.message}`
+  return '⚠ Agent turn failed: unknown error'
+}
+
 /**
  * Drive one prompt turn against a live, already-connected `AcpClient`,
  * wiring `session/update` notifications into the Blackboard the same way
@@ -123,6 +170,11 @@ export async function runAcpTurn(client: AcpClient, text: string): Promise<void>
   const board = useBlackboardStore.getState()
   board.setProcessing(true)
   board.setAgentAttention('writing')
+  // One prompt == one turn, counted client-side (the ACP wire carries no
+  // turn counter) — session-scoped, reset by `startSession`/`endSession`
+  // in `getAcpClient`/`resetAcpClient` below, never cumulative across a
+  // dropped connection.
+  useAcpSessionStore.getState().incrementTurns()
 
   const lineId = board.addLine('', 'agent')
   board.setStreamingLine(lineId)
@@ -181,13 +233,40 @@ export async function runAcpTurn(client: AcpClient, text: string): Promise<void>
         renderToolLine(update.toolCallId, update.title ?? 'tool call', status, payload)
         return
       }
+      case 'usage_update': {
+        // Token COUNT only — `update.cost` is never read here or
+        // anywhere else in this codebase. See acp-session-store.ts's
+        // module doc for why a cost figure would be dishonest on a
+        // Max/Pro subscription session.
+        useAcpSessionStore.getState().setUsage(update.used, update.size)
+        return
+      }
+      case 'config_option_update': {
+        // `client.currentModel` is already up to date by the time this
+        // callback runs — `AcpClient.handleNotification` resolves it
+        // before dispatching to subscribers.
+        useAcpSessionStore.getState().setModel(client.currentModel)
+        return
+      }
       default:
-        return // plan / forward-compat updates — not yet surfaced
+        return // plan / session_info / available_commands — not yet surfaced
     }
   })
 
   try {
-    const { stopReason } = await client.prompt(text)
+    let stopReason: AcpStopReason
+    try {
+      ;({ stopReason } = await client.prompt(text))
+    } catch (err) {
+      // Render onto the SAME line the success path would have filled in
+      // — never leave it at its blank initial text — then rethrow so
+      // `ai-client.ts`'s connection-reset / fallback-classification logic
+      // (unchanged) still runs; `renderedTurnFailures` stops it from
+      // posting a second, duplicate line for this same error.
+      useBlackboardStore.getState().editLine(lineId, describeAcpTurnFailure(err))
+      if (err && typeof err === 'object') renderedTurnFailures.add(err)
+      throw err
+    }
     const trailing = describeStopReason(stopReason)
     const finalText = sawContent
       ? trailing
@@ -213,6 +292,14 @@ async function createAndConnect(): Promise<AcpClient> {
   const client = new AcpClient()
   await client.initialize()
   await client.newSession()
+  // `client.currentModel` is `null` when `session/new` reported no model
+  // (or the unresolved "default" sentinel) — an honest, real state; the
+  // header renders "—" for it rather than fabricating a name.
+  useAcpSessionStore.getState().startSession(client.currentModel)
+  // A stream drop (not just an explicit `resetAcpClient()` call below)
+  // must also end the session in the header — a dead connection showing
+  // live counts would be worse than showing nothing.
+  client.onDisconnect(() => useAcpSessionStore.getState().endSession())
   return client
 }
 
@@ -241,6 +328,9 @@ export function resetAcpClient(): void {
   sharedClient?.close()
   sharedClient = null
   sharedClientPromise = null
+  // `close()` does not fire `onDisconnect` (it's an intentional close,
+  // not a drop) — end the session in the header explicitly here.
+  useAcpSessionStore.getState().endSession()
 }
 
 /** Send a `session/cancel` on the shared client, if one exists and is

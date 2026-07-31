@@ -86,17 +86,30 @@ pub(crate) async fn make_test_state() -> AppState {
         Arc::new(SqliteDatabase::new(&db_config).await.expect(
             "sqlite::memory: must initialise — sqlx + sqlite feature is in session-manager's deps",
         ));
-    make_test_state_with_database(database, None).await
+    make_test_state_with_database(database, None, None).await
 }
 
 /// Build an `AppState` over a caller-supplied database and an optional
 /// durability [`EventSink`]. Used by [`make_test_state`] (in-memory db, no
 /// sink) and by the durability boot tests (a FILE-backed sqlite db + a real
 /// sink, so the persisted state survives a simulated restart).
+///
+/// `active_document`: pass the SAME `Arc` used to construct `sink` (a
+/// [`crate::durability::DatabaseEventSink`] reads it per-event) so the
+/// fixture's "what's live" and "where events land" agree, exactly as
+/// production wires them in `main.rs`. `None` allocates a fresh cell
+/// defaulted to [`crate::durability::DURABILITY_SESSION_ID`] — the common
+/// case for fixtures that don't exercise document switching.
 pub(crate) async fn make_test_state_with_database(
     database: Arc<dyn DatabasePersistence + Send + Sync>,
     sink: Option<Arc<dyn timeline_engine::EventSink>>,
+    active_document: Option<Arc<RwLock<String>>>,
 ) -> AppState {
+    let active_document = active_document.unwrap_or_else(|| {
+        Arc::new(RwLock::new(
+            crate::durability::DURABILITY_SESSION_ID.to_string(),
+        ))
+    });
     let model = Arc::new(RwLock::new(BRepModel::new()));
 
     let broadcast_manager = BroadcastManager::new();
@@ -214,6 +227,7 @@ pub(crate) async fn make_test_state_with_database(
         hierarchy_manager,
         database,
         durability_status: Arc::new(RwLock::new(crate::durability::DurabilityStatus::Empty)),
+        active_document: active_document.clone(),
         export_engine,
         request_metrics: Arc::new(DashMap::new()),
         command_metrics: Arc::new(Mutex::new(metrics::CommandMetrics::default())),
