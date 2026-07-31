@@ -89,16 +89,18 @@ console.log("(d) HASH: TS FNV-1a-64 reproduces canonical reference vectors");
 }
 
 // ── (b) Surface flip (pure) ──────────────────────────────────────────────────
-console.log("(b) SURFACE: minimal exposes 21, full exposes 103");
+console.log("(b) SURFACE: minimal exposes 21, full exposes 104");
 const table = buildTable();
 {
   // S3/S4 added 2 core composition tools (workbench + cad_program): 90 kernel
   // + 2 composition + 3 meta = 95. DFM S7 added 1 more kernel-analysis tool
   // (dfm_check): 91 + 2 + 3 = 96. The timeline agent-surface slice added 10
   // timeline verbs (history/branch/branches/switch/merge/conflicts/checkpoint
-  // /checkpoints/undo/redo): 101 + 2 + 3 = 106.
-  if (table.size === 106) pass("table holds 106 tools (101 kernel + 2 composition + 3 meta)");
-  else fail(`table size ${table.size}, expected 106`);
+  // /checkpoints/undo/redo): 101 + 2 + 3 = 106. The policy KB slice
+  // (2026-07-31) added kb_lookup (FULL table only, never minimal — see
+  // test/kb_lookup.mjs for the zero-marginal-cost pin): 102 + 2 + 3 = 107.
+  if (table.size === 107) pass("table holds 107 tools (102 kernel + 2 composition + 3 meta)");
+  else fail(`table size ${table.size}, expected 107`);
 
   // NOTE: this block's pinned counts (core=18, minimal=21) reflect a PRE-
   // EXISTING drift discovered while rebuilding dist/ for DFM S7, not a count
@@ -121,8 +123,8 @@ const table = buildTable();
   else fail(`meta list is ${META_SURFACE.length}, expected 3`);
 
   const full = exposedNamesFor(table, "full");
-  if (full.length === 103) pass("full surface exposes exactly 103 tools (meta excluded)");
-  else fail(`full surface exposes ${full.length}, expected 103`);
+  if (full.length === 104) pass("full surface exposes exactly 104 tools (meta excluded)");
+  else fail(`full surface exposes ${full.length}, expected 104`);
   if (!full.some((n) => META_SURFACE.includes(n)))
     pass("full surface omits the meta-tools (they are the minimal-surface mechanism)");
   else fail("full surface unexpectedly includes meta-tools");

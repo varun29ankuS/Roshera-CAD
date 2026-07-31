@@ -24,6 +24,7 @@ import { registerLabelTools } from "./tools/labels.js";
 import { registerAssemblyTools } from "./tools/assembly.js";
 import { registerGdtTools } from "./tools/gdt.js";
 import { registerDrawingTools } from "./tools/drawing.js";
+import { registerKbTools } from "./tools/kb.js";
 
 /**
  * The core modeling + perception verbs always in the default surface, plus the
@@ -89,6 +90,10 @@ export function buildTableWithControls(): {
   registerAssemblyTools(table);
   registerGdtTools(table);
   registerDrawingTools(table);
+  // kb_lookup — FULL table only, by design (policy KB §1.1): never added to
+  // CORE_SURFACE / MINIMAL_SURFACE, so the knowledge base costs the resident
+  // minimal surface zero tokens; discovery rides find_tool, dispatch invoke.
+  registerKbTools(table);
   // Composition tools (S3/S4) — registered into the SAME table so find_tool
   // surfaces them and the token bill counts them.
   const workbench = new Workbench(table, MINIMAL_SURFACE, resolveSurfaceMode());

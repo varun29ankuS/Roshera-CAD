@@ -166,6 +166,7 @@ const EXPERIMENTAL = new Set<string>([
   "drawing_read_semantics",
   "drawing_query",
   "dfm_check",
+  "kb_lookup",
 ]);
 
 const BENCH_OF: Record<string, Bench> = {
@@ -264,6 +265,7 @@ const BENCH_OF: Record<string, Bench> = {
   part_distance: "analysis",
   part_features: "analysis",
   dfm_check: "analysis",
+  kb_lookup: "analysis",
   ground_truth: "analysis",
   measure_faces: "analysis",
   verify_claim: "analysis",
