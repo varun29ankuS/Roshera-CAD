@@ -359,7 +359,10 @@ pub(crate) fn initialize() -> Result<PathBuf, GooseAcpError> {
 /// `auth_middleware::path_is_exempt`, so every request — including the
 /// (refused) WebSocket upgrade — needs a valid credential before any of
 /// this runs.
-pub(crate) fn acp_router(auth_manager: Arc<session_manager::AuthManager>) -> Option<axum::Router> {
+pub(crate) fn acp_router(
+    auth_manager: Arc<session_manager::AuthManager>,
+    ai_provider_manager: Arc<crate::ai_provider_config::AiProviderManager>,
+) -> Option<axum::Router> {
     let root = GOOSE_ROOT.get()?;
     let server = std::sync::Arc::new(goose::acp::server_factory::AcpServer::new(
         goose::acp::server_factory::AcpServerFactoryConfig {
@@ -380,7 +383,7 @@ pub(crate) fn acp_router(auth_manager: Arc<session_manager::AuthManager>) -> Opt
     ));
     let router = goose::acp::transport::create_acp_router(server);
     Some(router.layer(axum::middleware::from_fn_with_state(
-        auth_manager,
+        (auth_manager, ai_provider_manager),
         inject_roshera_mcp_server,
     )))
 }
@@ -429,7 +432,10 @@ const UNKNOWN_MODEL_LABEL: &str = "unknown";
 /// own MCP server as the sole `mcpServers` entry. See [`acp_router`]'s
 /// doc for the full contract; this is the mechanism, not the policy.
 async fn inject_roshera_mcp_server(
-    State(auth_manager): State<Arc<session_manager::AuthManager>>,
+    State((auth_manager, ai_provider_manager)): State<(
+        Arc<session_manager::AuthManager>,
+        Arc<crate::ai_provider_config::AiProviderManager>,
+    )>,
     req: Request<Body>,
     next: Next,
 ) -> Response {
@@ -466,6 +472,22 @@ async fn inject_roshera_mcp_server(
         return next
             .run(Request::from_parts(parts, Body::from(bytes)))
             .await;
+    }
+
+    // Apply the user's server-side model selection (`PUT
+    // /api/ai/provider`'s `model` field) before this request reaches
+    // goose. This is the ONLY place a session's model is ever set from
+    // outside goose's own boot-time pin — never from anything on the
+    // wire: `acp_gate` already refuses `_meta.provider` and every other
+    // client-side override on this exact method pair, and this layer
+    // itself discards any client-supplied `mcpServers`. See
+    // `apply_configured_model`'s doc for why a `None` override is a true
+    // no-op that leaves `initialize()` / `repin_goose_to_claude_code`'s
+    // pin untouched, and why this only ever touches the MODEL half of
+    // that pin, never the provider identity.
+    let stored_model = ai_provider_manager.stored().await.and_then(|s| s.model);
+    if let Err(error) = apply_configured_model(stored_model.as_deref()) {
+        return ApiError::new(ErrorCode::Internal, error).into_response();
     }
 
     // A session-establishing RPC always reaches here already
@@ -591,6 +613,45 @@ async fn mint_agent_session_key(
             session_manager::PrincipalKind::Agent { model },
         )
         .await
+}
+
+/// Apply a user-selected model override, in place, to whichever provider
+/// goose currently has active — never the provider identity itself. This
+/// is the mechanism behind Feature A's "server-side config only" model
+/// selection: `PUT /api/ai/provider`'s persisted `model` field, applied
+/// here at `session/new`/`session/load` time, immediately before the
+/// request is forwarded to goose.
+///
+/// `explicit_model: None` (no override persisted, or the caller already
+/// normalized the `"default"` sentinel away — see
+/// `handlers/ai_provider.rs::resolve_requested_model`) is a **true
+/// no-op**: this function returns `Ok(())` before ever calling
+/// `goose::config::Config::global()`. That ordering is load-bearing, not
+/// cosmetic — `goose_acp`'s own test module documents exactly one test
+/// (`goose_lockdown_leaves_exactly_roshera_reachable`) as the sole owner
+/// of that process-global `OnceCell` in this binary; every other test
+/// that exercises this middleware relies on the `None` path never
+/// touching it.
+///
+/// When `explicit_model` is `Some`, this calls goose's own
+/// `Config::set_goose_model`, which resolves the CURRENTLY active
+/// provider (`get_active_provider`) and rewrites only that provider's
+/// `ProviderEntry.model` — confirmed against goose's source
+/// (`crates/goose/src/config/providers.rs`): `get_active_model` (which
+/// `resolve_default_provider_model_config`, the path every Roshera
+/// session/new call takes since `_meta.provider` is refused by
+/// `acp_gate`, calls via `Config::get_goose_model`) reads that exact
+/// per-provider entry ahead of the plain `GOOSE_MODEL` key. So this is
+/// the one write goose's own session-start resolution actually reads —
+/// not a plausible-looking write to an unread key.
+fn apply_configured_model(explicit_model: Option<&str>) -> Result<(), String> {
+    let Some(model) = explicit_model else {
+        return Ok(());
+    };
+    let config = goose::config::Config::global();
+    config
+        .set_goose_model(model)
+        .map_err(|e| format!("failed to apply the configured model override '{model}': {e}"))
 }
 
 /// Build the single `McpServer::Stdio`-shaped JSON entry Roshera
@@ -819,13 +880,49 @@ mod tests {
         )
     }
 
+    /// A fresh, provably-empty `AiProviderManager` pointed at a private
+    /// temp path (`boot_at`, not `boot`) — no stored model, so
+    /// `apply_configured_model`'s `None` early return fires and this
+    /// router never touches `goose::config::Config::global()`. That
+    /// keeps this test binary's single-Config-touching-test invariant
+    /// (see `goose_lockdown_leaves_exactly_roshera_reachable`'s doc)
+    /// intact even though the injection middleware now consults an
+    /// `AiProviderManager` on every call.
+    fn test_ai_provider_manager() -> Arc<crate::ai_provider_config::AiProviderManager> {
+        let dir = std::env::temp_dir().join(format!(
+            "roshera-goose-acp-ai-provider-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        Arc::new(crate::ai_provider_config::AiProviderManager::boot_at(
+            dir.join("ai-provider.json"),
+        ))
+    }
+
     fn injection_stub_router(auth_manager: Arc<session_manager::AuthManager>) -> axum::Router {
         axum::Router::new()
             .route("/acp", axum::routing::post(echo_body))
             .layer(axum::middleware::from_fn_with_state(
-                auth_manager,
+                (auth_manager, test_ai_provider_manager()),
                 inject_roshera_mcp_server,
             ))
+    }
+
+    /// Guards the ordering invariant `apply_configured_model`'s own doc
+    /// comment depends on: with no override persisted (`None`), the
+    /// function must return `Ok(())` via its early return WITHOUT ever
+    /// calling `goose::config::Config::global()`. This is what makes it
+    /// safe for `inject_roshera_mcp_server_strips_hostile_mcp_servers`
+    /// (below) to exercise this middleware without becoming a second
+    /// owner of that process-global `OnceCell` — if a regression made
+    /// this eagerly resolve the active provider even for `None`, this
+    /// test would still pass in isolation but the sibling test would
+    /// start racing `goose_lockdown_leaves_exactly_roshera_reachable`
+    /// under the default parallel test runner. Safe to run alongside
+    /// every other test in this file precisely because it never touches
+    /// `Config::global()`.
+    #[test]
+    fn apply_configured_model_is_a_true_noop_without_touching_goose_config_when_none() {
+        assert!(apply_configured_model(None).is_ok());
     }
 
     /// THE proving test of the injection middleware itself (the other

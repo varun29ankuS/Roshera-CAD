@@ -180,6 +180,13 @@ pub enum ErrorCode {
     /// the subscription CLI probe failed). The caller must supply a
     /// different credential — retrying the same one fails identically.
     AiCredentialInvalid,
+    /// A user-selected model ID was rejected by the live provider (e.g.
+    /// `GET /v1/models/{id}` 404, or the vendor otherwise refused it).
+    /// Distinct from `AiCredentialInvalid`: the credential itself is
+    /// fine, the model name is not one it can serve. `details` carries
+    /// the rejected model. Never surfaced as a silent fallback to a
+    /// default model — the caller must pick a different one or "default".
+    AiModelRejected,
 
     // ── ACP (goose agent) transport gate ──────────────────────────
     /// A JSON-RPC method outside the ACP method allowlist was posted
@@ -259,7 +266,7 @@ impl ErrorCode {
 
             ErrorCode::AiNotConfigured => StatusCode::SERVICE_UNAVAILABLE,
 
-            ErrorCode::AiCredentialInvalid => StatusCode::BAD_REQUEST,
+            ErrorCode::AiCredentialInvalid | ErrorCode::AiModelRejected => StatusCode::BAD_REQUEST,
             ErrorCode::AiProviderRefused
             | ErrorCode::AcpMethodNotAllowed
             | ErrorCode::AcpWebsocketDisabled
@@ -305,6 +312,7 @@ impl ErrorCode {
             | ErrorCode::AiNotConfigured
             | ErrorCode::AiProviderRefused
             | ErrorCode::AiCredentialInvalid
+            | ErrorCode::AiModelRejected
             | ErrorCode::AcpMethodNotAllowed
             | ErrorCode::AcpWebsocketDisabled
             | ErrorCode::AcpForbiddenSessionMeta
@@ -361,6 +369,7 @@ impl ErrorCode {
             ErrorCode::AiNotConfigured => "ai_not_configured",
             ErrorCode::AiProviderRefused => "ai_provider_refused",
             ErrorCode::AiCredentialInvalid => "ai_credential_invalid",
+            ErrorCode::AiModelRejected => "ai_model_rejected",
             ErrorCode::AcpMethodNotAllowed => "acp_method_not_allowed",
             ErrorCode::AcpWebsocketDisabled => "acp_websocket_disabled",
             ErrorCode::AcpForbiddenSessionMeta => "acp_forbidden_session_meta",
@@ -402,6 +411,7 @@ impl ErrorCode {
             ErrorCode::AiNotConfigured,
             ErrorCode::AiProviderRefused,
             ErrorCode::AiCredentialInvalid,
+            ErrorCode::AiModelRejected,
             ErrorCode::AcpMethodNotAllowed,
             ErrorCode::AcpWebsocketDisabled,
             ErrorCode::AcpForbiddenSessionMeta,
@@ -693,6 +703,23 @@ impl ApiError {
              again — nothing was stored."
                 .to_string(),
         )
+    }
+
+    /// A requested model ID was tested against the live provider (via its
+    /// authoritative model-listing endpoint, not a hardcoded menu) and
+    /// rejected. `details.rejected_model` names it explicitly — never a
+    /// generic "invalid model" with no identifying detail.
+    pub fn ai_model_rejected(model: impl Into<String>, message: impl Into<String>) -> Self {
+        let model = model.into();
+        Self::new(ErrorCode::AiModelRejected, message)
+            .with_hint(
+                "The model was tested against the live provider before saving \
+                 and was rejected — it is not one this credential can serve. \
+                 Use \"default\" (the provider's own choice) or a model ID \
+                 the provider actually accepts; nothing was stored."
+                    .to_string(),
+            )
+            .with_details(serde_json::json!({ "rejected_model": model }))
     }
 
     /// `/acp` POST carried a JSON-RPC method outside the allowlist.

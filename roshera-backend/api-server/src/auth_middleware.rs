@@ -563,8 +563,146 @@ fn get_default_user_permissions() -> Vec<Permission> {
     ]
 }
 
-/// Rate limiting middleware (`AuthManager::check_rate_limit`, 100
-/// req/min per client).
+/// A rate-limit bucket class. Each class gets its own independent budget
+/// per identity — see [`rate_limit_middleware`] — so that high-frequency
+/// traffic in one class (the viewport polling `/api/parts`, an agent
+/// turn issuing dozens of MCP tool calls) cannot exhaust the budget a
+/// low-frequency class needs (opening the AI-provider dialog).
+///
+/// # Per-class budgets and the worst-case total
+///
+/// | Class            | Budget       | Why                                                             |
+/// |-------------------|-------------|-------------------------------------------------------------------|
+/// | [`Poll`](Self::Poll)             | 300 req/min | Frequent, non-mutating browser reads (parts/datums/hierarchy/scene/perception/viewport-bridge status), often several panels polling concurrently. |
+/// | [`Agent`](Self::Agent)           | 240 req/min | `/acp` plus any MCP-tagged request; must absorb one full agent turn's burst of tool calls without any single call tripping the limiter. |
+/// | [`Mutation`](Self::Mutation)     | 100 req/min | Everything else: real user/agent actions that change state, plus the auth-exempt `/health` probe. Unchanged from the original single-bucket figure. |
+/// | [`ProviderConfig`](Self::ProviderConfig) | 30 req/min | The AI-provider dialog (`/api/ai/provider`, all methods) — low-frequency human configuration traffic that must never starve behind poll/mutation noise; this is the exact bug this module fixes. |
+/// | [`ProviderTest`](Self::ProviderTest)     | 10 req/min | `/api/ai/provider/test` makes a real outbound vendor round trip, so it is deliberately tighter than `ProviderConfig` rather than sharing its bucket or being exempted outright. |
+///
+/// **Worst-case total per identity per minute is now 300 + 240 + 100 +
+/// 30 + 10 = 680**, up from the original single 100/min bucket.
+/// Splitting one bucket into five necessarily raises the ceiling a
+/// client *may* reach across all classes combined — that is the
+/// intended trade, not an oversight: the goal is that no class can
+/// starve another, not a higher single-class ceiling. Every individual
+/// bucket above is still bounded (none of them is "unlimited", and none
+/// was produced by taking the old 100 and inflating it — `Mutation`
+/// keeps the original figure exactly).
+///
+/// No path in this classifier is unbounded: [`classify_request`] always
+/// returns exactly one of the five classes above, so every request
+/// lands in a bucket with a finite budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RateLimitClass {
+    /// Frequent, non-mutating browser/viewport reads. Matched by
+    /// GET/HEAD on a known read-only prefix (see [`is_poll_prefix`]).
+    Poll,
+    /// `/acp` traffic and any request carrying a non-empty
+    /// `X-Roshera-Agent` header — the same header
+    /// `main::agent_author_layer` reads to attribute kernel ops to the
+    /// requesting agent, sent by the MCP server and any direct agent
+    /// caller. Checked before the poll/mutation split, so an agent's own
+    /// reads (e.g. polling `/api/frame` mid-turn) land here too, not in
+    /// `Poll` or `Mutation`.
+    Agent,
+    /// `GET/PUT/DELETE /api/ai/provider` — the AI-provider connection
+    /// dialog.
+    ProviderConfig,
+    /// `POST /api/ai/provider/test` — same dialog surface as
+    /// `ProviderConfig`, split out because this one call costs a real
+    /// vendor round trip.
+    ProviderTest,
+    /// Everything not matched above: sketch/csketch/boolean/assembly/
+    /// timeline mutations, session and auth-credential routes (including
+    /// `/health`), and any GET that isn't on the poll allowlist.
+    Mutation,
+}
+
+impl RateLimitClass {
+    /// `(bucket label, max requests, window in seconds)`. The label is
+    /// folded into the bucket key (`"{client_id}|{label}"`) so the five
+    /// classes cannot collide inside `AuthManager`'s shared
+    /// `rate_limits` map.
+    const fn budget(self) -> (&'static str, usize, i64) {
+        match self {
+            RateLimitClass::Poll => ("poll", 300, 60),
+            RateLimitClass::Agent => ("agent", 240, 60),
+            RateLimitClass::Mutation => ("mutation", 100, 60),
+            RateLimitClass::ProviderConfig => ("provider-config", 30, 60),
+            RateLimitClass::ProviderTest => ("provider-test", 10, 60),
+        }
+    }
+}
+
+/// Read-only prefixes the frontend/viewport polls continuously (see
+/// `ModelTree.tsx`, `Datums.tsx`, `AgentEyePanel.tsx` in `roshera-app`).
+/// Only GET/HEAD on these prefixes count as [`RateLimitClass::Poll`] —
+/// several of them (`/api/parts`, `/api/datums`, `/api/agent/parts`)
+/// also serve POST/DELETE mutations on the same path (create, clear-all,
+/// rename), which must fall through to [`RateLimitClass::Mutation`]
+/// instead, so the method check in [`classify_request`] is load-bearing,
+/// not incidental.
+const POLL_PREFIXES: &[&str] = &[
+    "/api/parts",
+    "/api/datums",
+    "/api/hierarchy",
+    "/api/scene",
+    "/api/agent",
+    "/api/viewport",
+];
+
+fn is_poll_prefix(path: &str) -> bool {
+    POLL_PREFIXES.iter().any(|prefix| {
+        path.strip_prefix(prefix)
+            .map(|rest| rest.is_empty() || rest.starts_with('/'))
+            .unwrap_or(false)
+    })
+}
+
+/// Classify a request into a [`RateLimitClass`] for [`rate_limit_middleware`].
+///
+/// Order matters: `/api/ai/provider/test` and `/api/ai/provider` are
+/// checked first so they can never fall into `Agent` (an MCP-tagged
+/// probe of the dialog would otherwise share the agent bucket) or `Poll`
+/// (a GET on the dialog would otherwise share the poll bucket) — both of
+/// which would reintroduce a starvation path for the exact surface this
+/// module protects. `Agent` is checked before the poll/mutation split so
+/// an agent's own read traffic is bounded by the agent budget, not the
+/// human poll budget.
+fn classify_request(request: &Request) -> RateLimitClass {
+    let path = request.uri().path();
+
+    if path == "/api/ai/provider/test" {
+        return RateLimitClass::ProviderTest;
+    }
+    if path == "/api/ai/provider" {
+        return RateLimitClass::ProviderConfig;
+    }
+    if path == "/acp" || path.starts_with("/acp/") {
+        return RateLimitClass::Agent;
+    }
+    let is_agent_traffic = request
+        .headers()
+        .get("x-roshera-agent")
+        .and_then(|h| h.to_str().ok())
+        .is_some_and(|v| !v.is_empty());
+    if is_agent_traffic {
+        return RateLimitClass::Agent;
+    }
+    let method = request.method();
+    if (method == axum::http::Method::GET || method == axum::http::Method::HEAD)
+        && is_poll_prefix(path)
+    {
+        return RateLimitClass::Poll;
+    }
+    RateLimitClass::Mutation
+}
+
+/// Rate limiting middleware. Enforces a separate
+/// [`RateLimitClass`] budget per identity via
+/// `AuthManager::check_rate_limit_budget`, keyed as `"{client_id}|{class
+/// label}"` — see [`RateLimitClass`] for the five classes, their
+/// budgets, and the resulting worst-case total per identity.
 ///
 /// Shares [`AuthLayerState`] with [`auth_middleware`] so the layer knows
 /// the process's resolved [`AuthPosture`] as well as its `AuthManager`.
@@ -583,7 +721,7 @@ fn get_default_user_permissions() -> Vec<Permission> {
 ///   degenerates to a *single shared bucket for the entire process*:
 ///   meaningless (it cannot distinguish clients) and actively harmful —
 ///   a local frontend viewport that polls the backend continuously alone
-///   exhausts the 100/min budget and drives the whole API to 429 with no
+///   would exhaust its budget and drive the whole API to 429 with no
 ///   recovery. Bypassing it here is consistent with the dev-insecure
 ///   posture already disabling the auth gates this layer sits beside; the
 ///   posture is loud (warn-on-every-boot in [`AuthPosture::from_env`])
@@ -613,8 +751,16 @@ pub async fn rate_limit_middleware(
             .to_string()
     };
 
-    // Check rate limit
-    match layer.auth_manager.check_rate_limit(&client_id) {
+    let class = classify_request(&request);
+    let (label, max_requests, window_secs) = class.budget();
+    let bucket_key = format!("{client_id}|{label}");
+
+    // Check rate limit against this class's own bucket.
+    match layer.auth_manager.check_rate_limit_budget(
+        &bucket_key,
+        max_requests,
+        chrono::Duration::seconds(window_secs),
+    ) {
         Ok(_) => Ok(next.run(request).await),
         Err(_) => Err(AuthError {
             error: "Rate limit exceeded".to_string(),

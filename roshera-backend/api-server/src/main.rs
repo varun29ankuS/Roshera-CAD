@@ -9684,19 +9684,31 @@ pub(crate) fn build_router(state: AppState) -> Router {
         posture: state.auth_posture,
     };
 
-    // The rate limiter (`AuthManager::check_rate_limit`, 100 req/min per
-    // client) was built but never layered. Wire it here, keyed on the
-    // authenticated identity when present and the peer IP
+    // The rate limiter (`auth_middleware::rate_limit_middleware`) is
+    // keyed on the authenticated identity when present and the peer IP
     // (`x-forwarded-for`) otherwise — so it also throttles the public
     // credential-issuing routes (login/register) by source, which is the
-    // brute-force protection that matters most for them. It shares
-    // `AuthLayerState` with `auth_middleware` because it needs the same
-    // resolved posture: under `AuthPosture::InsecureDevBypass` every
+    // brute-force protection that matters most for them. It runs one
+    // independent budget per `RateLimitClass` (poll / agent / mutation /
+    // provider-config / provider-test — see that enum's doc for the
+    // numbers and the resulting worst-case total) so the viewport's
+    // continuous poll traffic can no longer exhaust the budget a
+    // low-frequency action like opening the AI-provider dialog needs. It
+    // shares `AuthLayerState` with `auth_middleware` because it needs the
+    // same resolved posture: under `AuthPosture::InsecureDevBypass` every
     // request collapses to one sentinel identity, so a per-client limit
     // becomes a single shared bucket that a polling dev frontend alone
     // exhausts — the limiter bypasses in that posture (see
     // `rate_limit_middleware`). In `AuthPosture::Required` it stays on.
     let rate_limit_layer_state = auth_layer_state.clone();
+
+    // Cloned out before `state` moves into `.with_state` below —
+    // `goose_acp::acp_router`'s own inner middleware needs it to read
+    // the user's persisted model selection (`PUT /api/ai/provider`'s
+    // `model` field) at `session/new`/`session/load` time, same reason
+    // `auth_layer_state.auth_manager` is captured the same way just
+    // above.
+    let ai_provider_manager_for_acp = state.ai_provider_manager.clone();
 
     // Add state and the middleware stack. axum applies layers from
     // innermost outward, so on the request path CORS runs first
@@ -9742,7 +9754,10 @@ pub(crate) fn build_router(state: AppState) -> Router {
     // that happens at the final `.layer(from_fn_with_state(auth_layer_state, ...))`
     // below) rather than threading a second `Arc<SessionManager>` through
     // for a call site that only ever needs the auth manager.
-    let app = match goose_acp::acp_router(auth_layer_state.auth_manager.clone()) {
+    let app = match goose_acp::acp_router(
+        auth_layer_state.auth_manager.clone(),
+        ai_provider_manager_for_acp,
+    ) {
         Some(acp) => app.merge(acp.layer(axum::middleware::from_fn(acp_gate::acp_method_gate))),
         None => app,
     };

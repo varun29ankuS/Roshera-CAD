@@ -116,6 +116,24 @@ pub struct StoredProviderConfig {
     pub api_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile_name: Option<String>,
+    /// User-selected model override. `None` means "the provider's own
+    /// default choice" — never a fabricated model name; the dialog's
+    /// `"default"` sentinel is normalized to `None` before this is built
+    /// (`handlers/ai_provider.rs::resolve_requested_model`), so this
+    /// field is either absent or a real, provider-checked (or explicitly
+    /// unverified — see `model_verified`) model ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Whether `model` was proven against the live provider before being
+    /// saved. `None` when `model` is `None` (verification is moot — there
+    /// is no override to distrust). `Some(false)` happens only for
+    /// `subscription_cli`: the Claude Code CLI has no side-effect-free
+    /// synchronous model-listing endpoint this server calls at save time,
+    /// so an explicit model there is accepted but flagged unverified —
+    /// never silently presented as confirmed. See
+    /// `handlers/ai_provider.rs::resolve_requested_model`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_verified: Option<bool>,
     pub saved_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -557,6 +575,8 @@ mod tests {
             mode: mode.to_string(),
             api_key: api_key.map(str::to_string),
             profile_name: None,
+            model: None,
+            model_verified: None,
             saved_at: chrono::Utc::now(),
         }
     }
@@ -671,6 +691,37 @@ mod tests {
         let loaded = load_stored(&path).expect("must load what was just written");
         assert_eq!(loaded.api_key.as_deref(), Some("sk-ant-roundtrip"));
         assert_eq!(loaded.mode, "api_key");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `model: None` (no user override — "the provider's own choice")
+    /// must never serialize a field at all: a stale `null`/absent key on
+    /// disk must not be misread as "the user explicitly asked for
+    /// nothing", and a real override must round-trip verbatim alongside
+    /// its verification flag.
+    #[test]
+    fn model_override_round_trips_and_is_absent_when_unset() {
+        let dir = std::env::temp_dir().join(format!(
+            "roshera-ai-provider-model-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let path = dir.join("ai-provider.json");
+
+        let mut cfg = stored("api_key", Some("sk-ant-model-test"));
+        write_state_file(&path, &cfg).expect("write must succeed");
+        let raw = std::fs::read_to_string(&path).expect("file must exist");
+        assert!(
+            !raw.contains("\"model\""),
+            "an unset model override must not serialize a field: {raw}"
+        );
+
+        cfg.model = Some("claude-opus-4".to_string());
+        cfg.model_verified = Some(true);
+        write_state_file(&path, &cfg).expect("write must succeed");
+        let loaded = load_stored(&path).expect("must load what was just written");
+        assert_eq!(loaded.model.as_deref(), Some("claude-opus-4"));
+        assert_eq!(loaded.model_verified, Some(true));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

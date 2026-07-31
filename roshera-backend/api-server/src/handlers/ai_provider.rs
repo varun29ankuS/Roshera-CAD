@@ -37,6 +37,14 @@ pub struct ProviderConfigRequest {
     pub api_key: Option<String>,
     #[serde(default)]
     pub profile_name: Option<String>,
+    /// User-selected model, or absent/`"default"` for "the provider's own
+    /// choice". Never a client-pushed runtime override — this is the
+    /// authenticated server-side config path (`PUT /api/ai/provider`);
+    /// the `/acp` surface's own `_meta.provider` hole stays closed
+    /// (`acp_gate.rs`). See `resolve_requested_model` for how this is
+    /// normalized and validated before anything is persisted.
+    #[serde(default)]
+    pub model: Option<String>,
     /// Must be `true` for any mode the allowlist marks
     /// `spawns_local_process` (currently `subscription_cli`). A
     /// spawning mode requested without this is refused by name, never
@@ -52,15 +60,80 @@ pub struct ProviderConfigRequest {
 /// own tests — never logged or serialized (it can carry a live token).
 #[derive(Debug)]
 enum Validated {
-    ApiKey(String),
+    ApiKey {
+        key: String,
+        model: Option<String>,
+        model_verified: Option<bool>,
+    },
     OauthToken {
         token: String,
         profile_name: String,
+        model: Option<String>,
+        model_verified: Option<bool>,
     },
     SubscriptionCli {
         cli_path: String,
         profile_name: String,
+        model: Option<String>,
+        model_verified: Option<bool>,
     },
+}
+
+/// Normalize + validate `payload.model` against the credential that just
+/// proved live. `None` / `"default"` (case-sensitive — the literal
+/// sentinel `claude-code`'s own `CLAUDE_CODE_DEFAULT_MODEL` uses) means
+/// "the provider's own choice" and is always accepted without a network
+/// round-trip — this function must never invent a concrete model name
+/// for that case, and must never claim it validated something it did not
+/// check.
+///
+/// For `api_key` / `oauth_profile`, an explicit model is checked against
+/// Anthropic's own model-listing endpoint (`ClaudeProvider::validate_model`)
+/// — the authoritative source, not a hardcoded menu — and the save is
+/// refused by name (typed `AiModelRejected`) if the provider does not
+/// recognize it.
+///
+/// For `subscription_cli`, no side-effect-free synchronous enumeration
+/// exists on this server (the Claude Code CLI's own model listing
+/// requires spawning a subprocess per check — `fetch_supported_models`
+/// in goose's `claude_code.rs`, not something this handler calls per
+/// save). The string is accepted, but persisted with `model_verified:
+/// false` — surfaced honestly in both the `PUT` and `GET` responses —
+/// rather than presented as a confirmed model. An invalid model there
+/// surfaces at first use instead: `goose_acp::apply_configured_model`
+/// applies it at `session/new`, and the Claude Code CLI itself rejects
+/// an unrecognized model on that session's first turn.
+async fn resolve_requested_model(
+    requested: Option<&str>,
+    credential: Option<&ClaudeCredential>,
+    is_subscription_cli: bool,
+) -> Result<(Option<String>, Option<bool>), ApiError> {
+    let Some(model) = requested
+        .map(str::trim)
+        .filter(|m| !m.is_empty() && *m != "default")
+    else {
+        return Ok((None, None));
+    };
+
+    if is_subscription_cli {
+        return Ok((Some(model.to_string()), Some(false)));
+    }
+
+    let Some(credential) = credential else {
+        return Err(ApiError::ai_model_rejected(
+            model,
+            "no credential available to verify this model against",
+        ));
+    };
+    let probe = ClaudeProvider::with_config(ClaudeConfig {
+        credential: Some(credential.clone()),
+        ..Default::default()
+    });
+    probe
+        .validate_model(model)
+        .await
+        .map_err(|e| ApiError::ai_model_rejected(model, e.to_string()))?;
+    Ok((Some(model.to_string()), Some(true)))
 }
 
 /// `GET /api/ai/provider` — active config summary (never the secret),
@@ -79,6 +152,12 @@ pub async fn get_provider(State(state): State<AppState>) -> Json<Value> {
             "profile_name": s.profile_name,
             "saved_at": s.saved_at,
             "has_api_key": s.api_key.is_some(),
+            // `None` means "the provider's own default choice", never a
+            // fabricated model name. `model_verified: false` (only
+            // reachable for subscription_cli) must render as an honest
+            // caveat, not as a confirmed-active model.
+            "model": s.model,
+            "model_verified": s.model_verified,
         })
     });
 
@@ -119,12 +198,18 @@ pub async fn put_provider(
     let validated = validate_request(&payload).await?;
 
     match validated {
-        Validated::ApiKey(key) => {
+        Validated::ApiKey {
+            key,
+            model,
+            model_verified,
+        } => {
             let stored = StoredProviderConfig {
                 provider: "anthropic".to_string(),
                 mode: CredentialMode::ApiKey.as_str().to_string(),
                 api_key: Some(key.clone()),
                 profile_name: None,
+                model: model.clone(),
+                model_verified,
                 saved_at: chrono::Utc::now(),
             };
             let acl = state
@@ -140,18 +225,24 @@ pub async fn put_provider(
                 "success": true,
                 "provider": "anthropic",
                 "mode": "api_key",
+                "model": model,
+                "model_verified": model_verified,
                 "acl": acl,
             })))
         }
         Validated::OauthToken {
             token,
             profile_name,
+            model,
+            model_verified,
         } => {
             let stored = StoredProviderConfig {
                 provider: "anthropic".to_string(),
                 mode: CredentialMode::OauthProfile.as_str().to_string(),
                 api_key: None,
                 profile_name: Some(profile_name.clone()),
+                model: model.clone(),
+                model_verified,
                 saved_at: chrono::Utc::now(),
             };
             let acl = state
@@ -168,18 +259,24 @@ pub async fn put_provider(
                 "provider": "anthropic",
                 "mode": "oauth_profile",
                 "profile_name": profile_name,
+                "model": model,
+                "model_verified": model_verified,
                 "acl": acl,
             })))
         }
         Validated::SubscriptionCli {
             cli_path,
             profile_name,
+            model,
+            model_verified,
         } => {
             let stored = StoredProviderConfig {
                 provider: "anthropic".to_string(),
                 mode: CredentialMode::SubscriptionCli.as_str().to_string(),
                 api_key: None,
                 profile_name: Some(profile_name.clone()),
+                model: model.clone(),
+                model_verified,
                 saved_at: chrono::Utc::now(),
             };
             let acl = state
@@ -206,6 +303,18 @@ pub async fn put_provider(
                 "provider": "anthropic",
                 "mode": "subscription_cli",
                 "profile_name": profile_name,
+                "model": model,
+                "model_verified": model_verified,
+                "model_verification_note": if model.is_some() {
+                    Some("not verified against the live CLI at save time — the \
+                          Claude Code CLI has no side-effect-free synchronous \
+                          model-listing check this server calls per save; the \
+                          model is applied when this session starts, and an \
+                          unrecognized model surfaces as a refusal on that \
+                          session's first turn, not here.")
+                } else {
+                    None
+                },
                 "acl": acl,
                 "note": "this wires the agent (/acp) surface via the Claude \
                          Code CLI. REST routes (/api/ai/command) still need \
@@ -277,16 +386,40 @@ pub async fn test_provider(
 ) -> Result<Json<Value>, ApiError> {
     let validated = validate_request(&payload).await?;
     let (mode, detail) = match validated {
-        Validated::ApiKey(_) => ("api_key", json!({})),
-        Validated::OauthToken { profile_name, .. } => {
-            ("oauth_profile", json!({ "profile_name": profile_name }))
-        }
+        Validated::ApiKey {
+            model,
+            model_verified,
+            ..
+        } => (
+            "api_key",
+            json!({ "model": model, "model_verified": model_verified }),
+        ),
+        Validated::OauthToken {
+            profile_name,
+            model,
+            model_verified,
+            ..
+        } => (
+            "oauth_profile",
+            json!({
+                "profile_name": profile_name,
+                "model": model,
+                "model_verified": model_verified,
+            }),
+        ),
         Validated::SubscriptionCli {
             cli_path,
             profile_name,
+            model,
+            model_verified,
         } => (
             "subscription_cli",
-            json!({ "cli_path": cli_path, "profile_name": profile_name }),
+            json!({
+                "cli_path": cli_path,
+                "profile_name": profile_name,
+                "model": model,
+                "model_verified": model_verified,
+            }),
         ),
     };
     Ok(Json(json!({
@@ -353,7 +486,7 @@ async fn validate_request(payload: &ProviderConfigRequest) -> Result<Validated, 
     match mode {
         CredentialMode::ApiKey => validate_api_key(payload).await,
         CredentialMode::OauthProfile => validate_oauth_profile(payload).await,
-        CredentialMode::SubscriptionCli => validate_subscription_cli(payload),
+        CredentialMode::SubscriptionCli => validate_subscription_cli(payload).await,
         CredentialMode::WorkloadIdentity => {
             // Unreachable today: every allowlisted WorkloadIdentity entry
             // is `SeamOnly` and was already refused above. A typed
@@ -377,8 +510,9 @@ async fn validate_api_key(payload: &ProviderConfigRequest) -> Result<Validated, 
         .filter(|k| !k.is_empty())
         .ok_or_else(|| ApiError::missing_parameter("api_key"))?;
 
+    let credential = ClaudeCredential::ApiKey(key.clone());
     let probe = ClaudeProvider::with_config(ClaudeConfig {
-        credential: Some(ClaudeCredential::ApiKey(key.clone())),
+        credential: Some(credential.clone()),
         ..Default::default()
     });
     probe
@@ -386,7 +520,14 @@ async fn validate_api_key(payload: &ProviderConfigRequest) -> Result<Validated, 
         .await
         .map_err(|e| ApiError::ai_credential_invalid(e.to_string()))?;
 
-    Ok(Validated::ApiKey(key))
+    let (model, model_verified) =
+        resolve_requested_model(payload.model.as_deref(), Some(&credential), false).await?;
+
+    Ok(Validated::ApiKey {
+        key,
+        model,
+        model_verified,
+    })
 }
 
 async fn validate_oauth_profile(payload: &ProviderConfigRequest) -> Result<Validated, ApiError> {
@@ -402,14 +543,18 @@ async fn validate_oauth_profile(payload: &ProviderConfigRequest) -> Result<Valid
             )
         })?;
 
+    let credential = ClaudeCredential::OauthAccessToken(token.clone());
     let probe = ClaudeProvider::with_config(ClaudeConfig {
-        credential: Some(ClaudeCredential::OauthAccessToken(token.clone())),
+        credential: Some(credential.clone()),
         ..Default::default()
     });
     probe
         .validate_credential()
         .await
         .map_err(|e| ApiError::ai_credential_invalid(e.to_string()))?;
+
+    let (model, model_verified) =
+        resolve_requested_model(payload.model.as_deref(), Some(&credential), false).await?;
 
     let profile_name = payload
         .profile_name
@@ -418,10 +563,12 @@ async fn validate_oauth_profile(payload: &ProviderConfigRequest) -> Result<Valid
     Ok(Validated::OauthToken {
         token,
         profile_name,
+        model,
+        model_verified,
     })
 }
 
-fn validate_subscription_cli(payload: &ProviderConfigRequest) -> Result<Validated, ApiError> {
+async fn validate_subscription_cli(payload: &ProviderConfigRequest) -> Result<Validated, ApiError> {
     let cli = ai_provider_config::detect_claude_cli();
     if !cli.installed {
         return Err(ApiError::ai_credential_invalid(
@@ -447,6 +594,12 @@ fn validate_subscription_cli(payload: &ProviderConfigRequest) -> Result<Validate
         )
     })?;
 
+    // No credential to probe a model against here — `is_subscription_cli:
+    // true` short-circuits `resolve_requested_model` before it would ever
+    // need one, so `None` is safe.
+    let (model, model_verified) =
+        resolve_requested_model(payload.model.as_deref(), None, true).await?;
+
     let profile_name = payload
         .profile_name
         .clone()
@@ -454,6 +607,8 @@ fn validate_subscription_cli(payload: &ProviderConfigRequest) -> Result<Validate
     Ok(Validated::SubscriptionCli {
         cli_path,
         profile_name,
+        model,
+        model_verified,
     })
 }
 
@@ -482,8 +637,68 @@ mod tests {
             mode: mode.to_string(),
             api_key: None,
             profile_name: None,
+            model: None,
             consent_spawn_local_process: false,
         }
+    }
+
+    // --- resolve_requested_model: the model-honesty gate, network-free ---
+    // (no test here hits a live network — `credential: None` proves the
+    // `None`/`"default"` branches short-circuit before any probe would be
+    // attempted; the mode-specific network probe itself is covered live
+    // in `ai_integration::providers::claude`'s `validate_model` tests).
+
+    #[tokio::test]
+    async fn resolve_requested_model_none_is_the_providers_own_choice() {
+        let (model, verified) = resolve_requested_model(None, None, false)
+            .await
+            .expect("None must never be treated as a rejection");
+        assert_eq!(model, None);
+        assert_eq!(verified, None);
+    }
+
+    #[tokio::test]
+    async fn resolve_requested_model_default_sentinel_normalizes_to_none() {
+        // "default" must never be persisted as if it were a real model
+        // name — it is claude-code's own CLAUDE_CODE_DEFAULT_MODEL
+        // sentinel and the dialog's own default.
+        let (model, verified) = resolve_requested_model(Some("default"), None, false)
+            .await
+            .expect("the default sentinel must never be treated as a rejection");
+        assert_eq!(model, None);
+        assert_eq!(verified, None);
+    }
+
+    #[tokio::test]
+    async fn resolve_requested_model_blank_string_normalizes_to_none() {
+        let (model, verified) = resolve_requested_model(Some("   "), None, false)
+            .await
+            .expect("whitespace-only must not be treated as a real model request");
+        assert_eq!(model, None);
+        assert_eq!(verified, None);
+    }
+
+    #[tokio::test]
+    async fn resolve_requested_model_subscription_cli_accepts_unverified_never_silently() {
+        // subscription_cli has no side-effect-free synchronous enumeration
+        // available — the model is accepted but must come back flagged
+        // `Some(false)`, never `Some(true)` (that would claim a check that
+        // never happened) and never silently dropped to `None`.
+        let (model, verified) = resolve_requested_model(Some("opus"), None, true)
+            .await
+            .expect("subscription_cli must accept an explicit model string");
+        assert_eq!(model.as_deref(), Some("opus"));
+        assert_eq!(verified, Some(false));
+    }
+
+    #[tokio::test]
+    async fn resolve_requested_model_refuses_by_name_without_a_credential_to_check_against() {
+        let err = resolve_requested_model(Some("claude-opus-4"), None, false)
+            .await
+            .expect_err("api_key/oauth_profile modes must refuse an unverifiable explicit model");
+        assert_eq!(err.code, ErrorCode::AiModelRejected);
+        let details = err.details.expect("refusal must carry details");
+        assert_eq!(details["rejected_model"], "claude-opus-4");
     }
 
     #[tokio::test]

@@ -244,6 +244,63 @@ impl ClaudeProvider {
         }
     }
 
+    /// Prove a requested model ID is one the configured credential can
+    /// actually serve, via Anthropic's Models API (`GET /v1/models/{id}`)
+    /// — the authoritative source: an API key and a Max/Pro OAuth token do
+    /// not necessarily serve the same catalog, so this asks the live
+    /// provider rather than checking a hardcoded list. Zero tokens spent.
+    ///
+    /// `"default"` is never passed here — callers treat it as "the
+    /// provider's own choice" and skip this round-trip entirely (see
+    /// `handlers/ai_provider.rs::resolve_requested_model`).
+    ///
+    /// # Errors
+    /// - `ProviderUnavailable` — no credential configured, or the model ID
+    ///   was rejected (404, or 401/403 on the credential itself). The
+    ///   message names the model and the status so the refusal is
+    ///   specific, not a generic failure.
+    /// - `InferenceError` — transport failure or an unexpected status this
+    ///   provider does not have a specific interpretation for.
+    pub async fn validate_model(&self, model: &str) -> Result<(), ProviderError> {
+        let cred = self.require_credential()?;
+        let response = cred
+            .apply(
+                self.client
+                    .get(format!("{}/v1/models/{}", self.config.api_base, model)),
+            )
+            .header("anthropic-version", "2023-06-01")
+            .send()
+            .await
+            .map_err(|e| {
+                ProviderError::InferenceError(format!("model validation request failed: {e}"))
+            })?;
+
+        let status = response.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        let body = response.text().await.unwrap_or_default();
+        if status.as_u16() == 404 {
+            Err(ProviderError::ProviderUnavailable(format!(
+                "Anthropic does not recognize model '{model}' ({status}) for this \
+                 credential: {body}"
+            )))
+        } else if status.as_u16() == 401 || status.as_u16() == 403 {
+            Err(ProviderError::ProviderUnavailable(format!(
+                "Anthropic rejected the {} while validating model '{}' ({}): {}",
+                cred.kind(),
+                model,
+                status,
+                body
+            )))
+        } else {
+            Err(ProviderError::InferenceError(format!(
+                "model validation for '{}' returned unexpected status {}: {}",
+                model, status, body
+            )))
+        }
+    }
+
     /// Send a text prompt alongside a PNG image to Claude and return the plain-text reply.
     ///
     /// Uses the Anthropic multimodal messages API: the PNG is base64-encoded and
@@ -1267,6 +1324,124 @@ mod tests {
         assert!(
             result.is_ok(),
             "expected Ok(()) on a 200 response, got: {:?}",
+            result
+        );
+    }
+
+    // --- validate_model: the PUT /api/ai/provider model-honesty gate ---
+
+    /// A 200 from `/v1/models/{id}` must validate as `Ok(())` — the model
+    /// the caller asked for is one the credential can actually serve.
+    #[tokio::test]
+    async fn validate_model_succeeds_on_200() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("binding a local test listener must succeed");
+        let addr = listener.local_addr().expect("local listener has an addr");
+
+        let server = tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = socket.read(&mut buf).await;
+                let body = r#"{"id":"claude-sonnet-5","type":"model"}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        let config = ClaudeConfig {
+            credential: Some(ClaudeCredential::ApiKey("good-key".to_string())),
+            api_base: format!("http://{}", addr),
+            ..ClaudeConfig::default()
+        };
+        let provider = ClaudeProvider::with_config(config);
+
+        let result = provider.validate_model("claude-sonnet-5").await;
+        let _ = server.await;
+
+        assert!(
+            result.is_ok(),
+            "expected Ok(()) on a 200 response, got: {:?}",
+            result
+        );
+    }
+
+    /// A 404 from `/v1/models/{id}` must surface as `ProviderUnavailable`
+    /// naming the rejected model — the exact signal the PUT handler
+    /// refuses a save on, and the exact wording the honesty requirement
+    /// (never show a model as active that the provider did not accept)
+    /// depends on.
+    #[tokio::test]
+    async fn validate_model_rejects_404_naming_the_model() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("binding a local test listener must succeed");
+        let addr = listener.local_addr().expect("local listener has an addr");
+
+        let server = tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = socket.read(&mut buf).await;
+                let body = r#"{"type":"error","error":{"type":"not_found_error","message":"model not found"}}"#;
+                let response = format!(
+                    "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        let config = ClaudeConfig {
+            credential: Some(ClaudeCredential::ApiKey("good-key".to_string())),
+            api_base: format!("http://{}", addr),
+            ..ClaudeConfig::default()
+        };
+        let provider = ClaudeProvider::with_config(config);
+
+        let result = provider.validate_model("bogus-model-9000").await;
+        let _ = server.await;
+
+        match result {
+            Err(ProviderError::ProviderUnavailable(msg)) => {
+                assert!(
+                    msg.contains("bogus-model-9000"),
+                    "refusal must name the rejected model, got: {msg}"
+                );
+                assert!(
+                    msg.contains("404"),
+                    "refusal must name the status, got: {msg}"
+                );
+            }
+            other => panic!(
+                "expected ProviderUnavailable naming the rejected model, got: {:?}",
+                other
+            ),
+        }
+    }
+
+    /// With no credential configured, `validate_model` must refuse before
+    /// ever touching the network — matching every other entry point's
+    /// `require_credential` gate.
+    #[tokio::test]
+    async fn validate_model_returns_unavailable_without_key() {
+        let provider = ClaudeProvider::new();
+        let result = provider.validate_model("claude-sonnet-5").await;
+        assert!(
+            matches!(result, Err(ProviderError::ProviderUnavailable(_))),
+            "expected ProviderUnavailable when no credential is configured, got {:?}",
             result
         );
     }
