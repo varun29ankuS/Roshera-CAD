@@ -5730,3 +5730,473 @@ async fn create_checkpoint_rejects_request_carrying_forged_author_fields() {
         "the rejection must name 'author_id' as the unknown field; body = {text}"
     );
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+// Timeline agent surface (MCP verb backing): branch authorship, typed
+// merge conflicts, read-only conflict preview, history paging, per-branch
+// checkpoints. RED-first for the 2026-07-31 "make the timeline reachable
+// by agents" slice.
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Seed a divergence with a REAL cross-branch conflict, purely through
+/// the live REST surface an agent uses: box on `main` → fork (lane A,
+/// `POST /api/branches`) → transform on the branch → a DIFFERENT
+/// transform back on `main`. Both post-fork events output `solid:0`, so
+/// the merge taxonomy must report exactly one `ConcurrentModification`.
+///
+/// The two `GET /api/timeline/history` calls are load-bearing barriers,
+/// not assertions of convenience: the kernel recorder is fire-and-forget
+/// and applies the ACTIVE branch at drain time, so each transform must be
+/// drained before the active branch is switched again or the event would
+/// land on the wrong branch.
+async fn seed_conflicting_divergence(state: &AppState) -> (String, String) {
+    let (bs, bbody) = dispatch(
+        state,
+        json_post(
+            "/api/geometry/box",
+            json!({"width": 10.0, "depth": 10.0, "height": 10.0}),
+        ),
+    )
+    .await;
+    assert_eq!(bs, StatusCode::OK, "box create must 200; body = {bbody}");
+    let box_uuid = bbody["object"]["id"]
+        .as_str()
+        .expect("box response carries object.id")
+        .to_string();
+
+    let (cs, cbody) = dispatch(
+        state,
+        json_post("/api/branches", json!({"name": "agent-probe"})),
+    )
+    .await;
+    assert_eq!(cs, StatusCode::OK, "branch create must 200; body = {cbody}");
+    let branch_id = cbody["id"].as_str().expect("branch id").to_string();
+
+    // One op on the branch.
+    let (s1, b1) = dispatch(
+        state,
+        json_post("/api/branches/active", json!({"branch_id": branch_id})),
+    )
+    .await;
+    assert_eq!(s1, StatusCode::OK, "activate branch must 200; body = {b1}");
+    let (ts1, tb1) = dispatch(
+        state,
+        json_post(
+            "/api/geometry/transform",
+            json!({"object": box_uuid, "translation": [5.0, 0.0, 0.0]}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        ts1,
+        StatusCode::OK,
+        "branch transform must 200; body = {tb1}"
+    );
+    // Drain barrier: the transform's event must be applied to the branch
+    // BEFORE the active branch flips back to main.
+    let (hs1, hb1) = dispatch(
+        state,
+        json_get(&format!("/api/timeline/history/{branch_id}")),
+    )
+    .await;
+    assert_eq!(hs1, StatusCode::OK, "branch history must 200; body = {hb1}");
+
+    // A different op on main.
+    let (s2, b2) = dispatch(
+        state,
+        json_post("/api/branches/active", json!({"branch_id": "main"})),
+    )
+    .await;
+    assert_eq!(s2, StatusCode::OK, "re-activate main must 200; body = {b2}");
+    let (ts2, tb2) = dispatch(
+        state,
+        json_post(
+            "/api/geometry/transform",
+            json!({"object": box_uuid, "translation": [0.0, 7.0, 0.0]}),
+        ),
+    )
+    .await;
+    assert_eq!(ts2, StatusCode::OK, "main transform must 200; body = {tb2}");
+    let (hs2, hb2) = dispatch(state, json_get("/api/timeline/history/main")).await;
+    assert_eq!(hs2, StatusCode::OK, "main history must 200; body = {hb2}");
+
+    (branch_id, box_uuid)
+}
+
+/// A branch created by an agent-tagged request (`X-Roshera-Agent`, the
+/// header every MCP call carries) with NO client-asserted `agent_id`
+/// must record the AGENT as its author — via the same `AUTHOR_OVERRIDE`
+/// scope that already attributes every kernel op on the timeline. Before
+/// this slice the fallback was `Author::System`: the agent's fork showed
+/// up authorless in an append-only log that cannot be healed later.
+#[tokio::test]
+async fn agent_tagged_branch_create_records_agent_author_without_body_assertion() {
+    let state = make_test_state().await;
+
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/api/branches")
+        .header("content-type", "application/json")
+        .header("x-roshera-agent", "probe-agent-7")
+        .body(Body::from(json!({"name": "authored-by-scope"}).to_string()))
+        .expect("static request must build");
+    let (status, body) = dispatch(&state, request).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "branch create must 200; body = {body}"
+    );
+    assert_eq!(
+        body["author"].as_str(),
+        Some("agent:probe-agent-7"),
+        "the branch author must derive from the request's agent scope, \
+         not default to system; body = {body}"
+    );
+    assert_eq!(
+        body["agent_id"].as_str(),
+        Some("probe-agent-7"),
+        "agent_id must surface for per-agent branch grouping; body = {body}"
+    );
+
+    // A request with NO agent header keeps the pre-slice behaviour.
+    let (s2, b2) = dispatch(
+        &state,
+        json_post("/api/branches", json!({"name": "human-lane"})),
+    )
+    .await;
+    assert_eq!(s2, StatusCode::OK);
+    assert_eq!(
+        b2["author"].as_str(),
+        Some("system"),
+        "no agent scope, no agent_id → system author unchanged; body = {b2}"
+    );
+}
+
+/// A fast-forward-only merge of genuinely diverged branches must be a
+/// TYPED 409 (`branch_merge_conflict`) carrying the divergence shape an
+/// agent can branch on — never a bare 500. Before this slice
+/// `map_timeline_err` bucketed `TimelineError::BranchConflict` under
+/// `Internal`.
+#[tokio::test]
+async fn merge_ff_only_on_diverged_branches_is_typed_409_with_divergence_shape() {
+    let state = make_test_state().await;
+    let (branch_id, _) = seed_conflicting_divergence(&state).await;
+
+    let (status, body) = dispatch(
+        &state,
+        json_post(
+            &format!("/api/branches/{branch_id}/merge"),
+            json!({"strategy": "fast-forward"}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "divergence under ff-only must be 409, not 500; body = {body}"
+    );
+    assert_eq!(
+        body["error_code"].as_str(),
+        Some("branch_merge_conflict"),
+        "the refusal must be the typed catalog code; body = {body}"
+    );
+    // The divergence shape is TYPED in details, not only prose.
+    let rel = &body["details"]["relationship"];
+    assert_eq!(
+        rel["kind"].as_str(),
+        Some("divergent"),
+        "details must carry the typed relationship; body = {body}"
+    );
+    // A box create records 3 events (create_box_3d + placement
+    // transform + set_name) — all in the common prefix.
+    assert_eq!(rel["common_prefix"].as_u64(), Some(3), "body = {body}");
+    assert_eq!(rel["source_only"].as_u64(), Some(1), "body = {body}");
+    assert_eq!(rel["target_only"].as_u64(), Some(1), "body = {body}");
+    // The verbatim kernel refusal is preserved, not reinterpreted.
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|m| m.contains("diverged")),
+        "the kernel's own refusal message must surface verbatim; body = {body}"
+    );
+    // A refused merge flips no state.
+    let (gs, gb) = dispatch(&state, json_get(&format!("/api/branches/{branch_id}"))).await;
+    assert_eq!(gs, StatusCode::OK);
+    assert_eq!(
+        gb["state"].as_str(),
+        Some("active"),
+        "a refused merge must leave the source branch active; body = {gb}"
+    );
+}
+
+/// A three-way merge that finds conflicts must return them as TYPED
+/// witnesses (subject, conflict_type, both events) plus statistics —
+/// not `format!("{:?}")` debug strings. This is the certificate-shaped
+/// result the MCP `timeline_merge` verb surfaces verbatim.
+#[tokio::test]
+async fn merge_conflicts_are_typed_witnesses_with_statistics() {
+    let state = make_test_state().await;
+    let (branch_id, _) = seed_conflicting_divergence(&state).await;
+
+    let (status, body) = dispatch(
+        &state,
+        json_post(
+            &format!("/api/branches/{branch_id}/merge"),
+            json!({"strategy": "three-way"}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "attempted merge reports; body = {body}"
+    );
+    assert_eq!(body["success"].as_bool(), Some(false), "body = {body}");
+
+    let conflicts = body["conflicts"]
+        .as_array()
+        .unwrap_or_else(|| panic!("conflicts must be an array; body = {body}"));
+    assert_eq!(conflicts.len(), 1, "exactly one collision; body = {body}");
+    let c = &conflicts[0];
+    assert_eq!(
+        c["subject"].as_str(),
+        Some("solid:0"),
+        "the conflict must name the kernel ref that collided; body = {body}"
+    );
+    assert_eq!(
+        c["conflict_type"].as_str(),
+        Some("concurrent_modification"),
+        "the taxonomy verdict must be typed; body = {body}"
+    );
+    for side in ["source_event", "target_event"] {
+        let ev = &c[side];
+        assert_eq!(
+            ev["operation_type"].as_str(),
+            Some("transform_solid"),
+            "{side} must carry the witness op kind; body = {body}"
+        );
+        assert!(
+            ev["sequence_number"].as_u64().is_some(),
+            "{side} must carry the witness sequence; body = {body}"
+        );
+        assert!(
+            ev["id"].as_str().is_some(),
+            "{side} must carry the witness event id; body = {body}"
+        );
+    }
+    // Witness orientation: source = the branch's event, target = main's.
+    // The branch transform recorded translation [5,0,0]; main's [0,7,0].
+    let src_params = c["source_event"]["operation"]["parameters"]["params"].to_string();
+    let tgt_params = c["target_event"]["operation"]["parameters"]["params"].to_string();
+    assert!(
+        src_params.contains("5.0") && !tgt_params.contains("5.0"),
+        "source witness must be the branch's own transform; \
+         source = {src_params}, target = {tgt_params}"
+    );
+
+    let stats = &body["statistics"];
+    assert_eq!(
+        stats["conflicts_count"].as_u64(),
+        Some(1),
+        "statistics must accompany the verdict; body = {body}"
+    );
+    assert_eq!(body["events_merged"].as_u64(), Some(0), "body = {body}");
+
+    // A conflicted merge mutates nothing.
+    let (gs, gb) = dispatch(&state, json_get(&format!("/api/branches/{branch_id}"))).await;
+    assert_eq!(gs, StatusCode::OK);
+    assert_eq!(gb["state"].as_str(), Some("active"), "body = {gb}");
+}
+
+/// `GET /api/branches/{id}/conflicts` — the read-only preview backing
+/// the MCP `timeline_conflicts` verb: typed relationship + the exact
+/// conflict set a three-way merge would report, with NOTHING merged and
+/// no branch state flipped.
+#[tokio::test]
+async fn branch_conflicts_preview_is_typed_and_read_only() {
+    let state = make_test_state().await;
+    let (branch_id, _) = seed_conflicting_divergence(&state).await;
+
+    let (hs, main_before) = dispatch(&state, json_get("/api/timeline/history/main")).await;
+    assert_eq!(hs, StatusCode::OK);
+    let main_len_before = main_before.as_array().map(|a| a.len()).unwrap_or(0);
+
+    let (status, body) = dispatch(
+        &state,
+        json_get(&format!("/api/branches/{branch_id}/conflicts?target=main")),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the conflicts preview route must exist and 200; body = {body}"
+    );
+    assert_eq!(
+        body["relationship"]["kind"].as_str(),
+        Some("divergent"),
+        "body = {body}"
+    );
+    assert_eq!(
+        body["relationship"]["common_prefix"].as_u64(),
+        Some(3),
+        "body = {body}"
+    );
+    let conflicts = body["conflicts"]
+        .as_array()
+        .unwrap_or_else(|| panic!("conflicts must be an array; body = {body}"));
+    assert_eq!(conflicts.len(), 1, "body = {body}");
+    assert_eq!(conflicts[0]["subject"].as_str(), Some("solid:0"));
+    assert_eq!(
+        conflicts[0]["conflict_type"].as_str(),
+        Some("concurrent_modification")
+    );
+    assert_eq!(
+        body["mergeable"].as_bool(),
+        Some(false),
+        "a conflicted divergence is not mergeable as-is; body = {body}"
+    );
+
+    // READ-ONLY: branch still active, main's history unchanged.
+    let (gs, gb) = dispatch(&state, json_get(&format!("/api/branches/{branch_id}"))).await;
+    assert_eq!(gs, StatusCode::OK);
+    assert_eq!(
+        gb["state"].as_str(),
+        Some("active"),
+        "preview must not flip branch state; body = {gb}"
+    );
+    let (hs2, main_after) = dispatch(&state, json_get("/api/timeline/history/main")).await;
+    assert_eq!(hs2, StatusCode::OK);
+    assert_eq!(
+        main_after.as_array().map(|a| a.len()).unwrap_or(0),
+        main_len_before,
+        "preview must not append anything to the target"
+    );
+}
+
+/// `GET /api/timeline/history/{branch}?start=&limit=` — an agent paging
+/// its own memory must get exactly the requested window, in order.
+/// Before this slice the handler ignored query params and always served
+/// the first 100 events.
+#[tokio::test]
+async fn timeline_history_supports_start_and_limit_paging() {
+    let state = make_test_state().await;
+
+    for i in 0..4 {
+        let (bs, bbody) = dispatch(
+            &state,
+            json_post(
+                "/api/geometry/box",
+                json!({"width": 10.0 + i as f64, "depth": 10.0, "height": 10.0}),
+            ),
+        )
+        .await;
+        assert_eq!(bs, StatusCode::OK, "box {i} must 200; body = {bbody}");
+    }
+
+    let (status, body) = dispatch(
+        &state,
+        json_get("/api/timeline/history/main?start=2&limit=2"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "paged history must 200; body = {body}"
+    );
+    let events = body
+        .as_array()
+        .unwrap_or_else(|| panic!("history must be an array; body = {body}"));
+    let seqs: Vec<u64> = events
+        .iter()
+        .filter_map(|e| e["sequence_number"].as_u64())
+        .collect();
+    assert_eq!(
+        seqs,
+        vec![2, 3],
+        "start=2&limit=2 must return exactly sequences [2, 3]; body = {body}"
+    );
+
+    // Defaults preserved: no params still serves from sequence 0.
+    let (ds, dbody) = dispatch(&state, json_get("/api/timeline/history/main")).await;
+    assert_eq!(ds, StatusCode::OK);
+    // A box create records 3 events (create_box_3d + placement
+    // transform + set_name): 4 boxes = 12 events.
+    let all: Vec<u64> = dbody
+        .as_array()
+        .unwrap_or_else(|| panic!("history must be an array; body = {dbody}"))
+        .iter()
+        .filter_map(|e| e["sequence_number"].as_u64())
+        .collect();
+    assert_eq!(
+        all,
+        (0u64..12).collect::<Vec<_>>(),
+        "unpaged history unchanged; body = {dbody}"
+    );
+}
+
+/// `POST /api/timeline/checkpoint` accepts an optional `branch` and
+/// answers with the created checkpoint's identity — before this slice
+/// the field was rejected (`deny_unknown_fields`), the branch was
+/// hardcoded to `main`, and the 201 carried an empty body, so an agent
+/// could neither checkpoint its own branch nor learn what it created.
+#[tokio::test]
+async fn checkpoint_accepts_branch_and_returns_identity() {
+    let state = make_test_state().await;
+
+    let (cs, cbody) = dispatch(
+        &state,
+        json_post("/api/branches", json!({"name": "checkpoint-lane"})),
+    )
+    .await;
+    assert_eq!(cs, StatusCode::OK, "branch create must 200; body = {cbody}");
+    let branch_id = cbody["id"].as_str().expect("branch id").to_string();
+
+    let (status, body) = dispatch(
+        &state,
+        json_post(
+            "/api/timeline/checkpoint",
+            json!({"name": "cp-on-branch", "branch": branch_id}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "a checkpoint on a named branch must succeed; body = {body}"
+    );
+    assert!(
+        body["id"].as_str().is_some(),
+        "the response must identify the created checkpoint; body = {body}"
+    );
+    assert_eq!(
+        body["branch"].as_str(),
+        Some(branch_id.as_str()),
+        "body = {body}"
+    );
+
+    // And it must be listed.
+    let (ls, lbody) = dispatch(&state, json_get("/api/timeline/checkpoints")).await;
+    assert_eq!(ls, StatusCode::OK);
+    assert!(
+        lbody
+            .as_array()
+            .is_some_and(|a| a.iter().any(|c| c["name"] == "cp-on-branch")),
+        "the checkpoint must appear in the listing; body = {lbody}"
+    );
+
+    // An unknown branch is a typed 404, not a silent main-checkpoint.
+    let missing = uuid::Uuid::new_v4();
+    let (ms, mbody) = dispatch(
+        &state,
+        json_post(
+            "/api/timeline/checkpoint",
+            json!({"name": "cp-nowhere", "branch": missing.to_string()}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        ms,
+        StatusCode::NOT_FOUND,
+        "checkpointing a nonexistent branch must 404; body = {mbody}"
+    );
+}

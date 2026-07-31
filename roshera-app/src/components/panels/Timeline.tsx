@@ -1358,14 +1358,23 @@ export function Timeline() {
         )
         return
       }
+      // Conflicts are TYPED objects from the backend (subject +
+      // taxonomy verdict + both witness events); this panel renders the
+      // derived `summary` line — agents consume the typed fields.
       const result = (await resp.json()) as {
         success: boolean
         merged_into: string
-        conflicts: string[]
+        conflicts: Array<{
+          subject: string
+          conflict_type: string
+          summary: string
+        }>
       }
       if (!result.success) {
         window.alert(
-          `Merge produced conflicts:\n\n${result.conflicts.join('\n') || 'unknown conflict'}`,
+          `Merge produced conflicts:\n\n${
+            result.conflicts.map((c) => c.summary).join('\n') || 'unknown conflict'
+          }`,
         )
         return
       }

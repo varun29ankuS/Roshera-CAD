@@ -236,6 +236,49 @@ pub struct MergeStatistics {
     pub duration_ms: u64,
 }
 
+/// How two branches' event sequences relate, as computed by
+/// [`crate::Timeline::preview_merge`]. This is the typed form of the
+/// divergence shape `merge_branches`'s fast-forward refusal renders as
+/// prose — an agent branches on THIS, not on a message string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BranchRelationship {
+    /// Target already contains every event source has — a merge would
+    /// copy nothing.
+    UpToDate,
+    /// Target's sequence is a strict prefix of source's: a merge
+    /// fast-forwards `events_ahead` events with no conflict possible.
+    FastForward {
+        /// Events on source that target does not yet have.
+        events_ahead: usize,
+    },
+    /// Both branches advanced past their common prefix. A fast-forward
+    /// merge will refuse; a three-way merge applies the conflict
+    /// taxonomy to the two post-prefix event sets.
+    Divergent {
+        /// Events shared by both sequences before they split.
+        common_prefix: usize,
+        /// Post-prefix events only source has.
+        source_only: usize,
+        /// Post-prefix events only target has.
+        target_only: usize,
+    },
+}
+
+/// Read-only merge preview: the branch relationship plus the exact
+/// conflict set a three-way merge would report. Produced by
+/// [`crate::Timeline::preview_merge`], which shares the sequencing +
+/// classification code with `merge_branches` (one taxonomy lane, no
+/// copies) but never mutates a branch.
+#[derive(Debug, Clone)]
+pub struct MergePreview {
+    /// How the two sequences relate.
+    pub relationship: BranchRelationship,
+    /// Typed conflict witnesses a three-way merge would surface. Empty
+    /// for `UpToDate` / `FastForward`, and for cleanly-mergeable
+    /// divergence.
+    pub conflicts: Vec<MergeConflict>,
+}
+
 /// The roles a subject can play in a single operation, used to derive
 /// the conflict taxonomy (spec §3.1). A subject lands in exactly one
 /// bucket per operation:

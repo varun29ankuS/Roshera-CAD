@@ -89,14 +89,16 @@ console.log("(d) HASH: TS FNV-1a-64 reproduces canonical reference vectors");
 }
 
 // ── (b) Surface flip (pure) ──────────────────────────────────────────────────
-console.log("(b) SURFACE: minimal exposes 21, full exposes 93");
+console.log("(b) SURFACE: minimal exposes 21, full exposes 103");
 const table = buildTable();
 {
   // S3/S4 added 2 core composition tools (workbench + cad_program): 90 kernel
   // + 2 composition + 3 meta = 95. DFM S7 added 1 more kernel-analysis tool
-  // (dfm_check): 91 + 2 + 3 = 96.
-  if (table.size === 96) pass("table holds 96 tools (91 kernel + 2 composition + 3 meta)");
-  else fail(`table size ${table.size}, expected 96`);
+  // (dfm_check): 91 + 2 + 3 = 96. The timeline agent-surface slice added 10
+  // timeline verbs (history/branch/branches/switch/merge/conflicts/checkpoint
+  // /checkpoints/undo/redo): 101 + 2 + 3 = 106.
+  if (table.size === 106) pass("table holds 106 tools (101 kernel + 2 composition + 3 meta)");
+  else fail(`table size ${table.size}, expected 106`);
 
   // NOTE: this block's pinned counts (core=18, minimal=21) reflect a PRE-
   // EXISTING drift discovered while rebuilding dist/ for DFM S7, not a count
@@ -119,8 +121,8 @@ const table = buildTable();
   else fail(`meta list is ${META_SURFACE.length}, expected 3`);
 
   const full = exposedNamesFor(table, "full");
-  if (full.length === 93) pass("full surface exposes exactly 93 tools (meta excluded)");
-  else fail(`full surface exposes ${full.length}, expected 93`);
+  if (full.length === 103) pass("full surface exposes exactly 103 tools (meta excluded)");
+  else fail(`full surface exposes ${full.length}, expected 103`);
   if (!full.some((n) => META_SURFACE.includes(n)))
     pass("full surface omits the meta-tools (they are the minimal-surface mechanism)");
   else fail("full surface unexpectedly includes meta-tools");
@@ -149,6 +151,18 @@ console.log("(c) FIND_TOOL: intent queries surface the right tools top-3");
   const hasRender = shot.includes("render_part");
   if (hasScene && hasRender) pass(`'screenshot the scene' top-3 = [${shot}] includes scene_view + render_part`);
   else fail(`'screenshot the scene' top-3 = [${shot}] missing scene_view/render_part`);
+
+  // Timeline agent surface: the branch/merge verbs must be discoverable by
+  // intent — the whole slice rides find_tool, not the minimal surface.
+  const forkQ = top3("fork a branch to explore in parallel");
+  if (forkQ.includes("timeline_branch"))
+    pass(`'fork a branch to explore in parallel' top-3 = [${forkQ}] includes timeline_branch`);
+  else fail(`'fork a branch to explore in parallel' top-3 = [${forkQ}] missing timeline_branch`);
+
+  const mergeQ = top3("merge my branch back with conflict witnesses");
+  if (mergeQ.includes("timeline_merge") || mergeQ.includes("timeline_conflicts"))
+    pass(`'merge my branch back…' top-3 = [${mergeQ}] includes timeline_merge/conflicts`);
+  else fail(`'merge my branch back…' top-3 = [${mergeQ}] missing timeline_merge/timeline_conflicts`);
 
   // Zero-hit honesty: an unmatchable query returns empty, and find_tool says so.
   const none = rankTools(table, "zzqxwv nonsense gibberish", undefined, 5);

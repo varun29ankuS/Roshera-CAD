@@ -38,14 +38,15 @@
 use crate::error_catalog::{ApiError, ErrorCode};
 use crate::AppState;
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::Json,
 };
 use serde::{Deserialize, Serialize};
 use timeline_engine::{
-    branch::ConflictStrategy, Author, BranchId, BranchPurpose, BranchState, MergeStrategy,
-    OptimizationObjective, TimelineError,
+    branch::{BranchRelationship, ConflictStrategy, ConflictType, MergeConflict},
+    Author, BranchId, BranchPurpose, BranchState, MergeStrategy, OptimizationObjective,
+    TimelineError,
 };
 use uuid::Uuid;
 
@@ -171,16 +172,77 @@ pub struct MergeBody {
     pub message: Option<String>,
 }
 
-/// `POST /api/branches/{id}/merge` response.
+/// One typed merge-conflict witness — the colliding event itself, in
+/// the same projection `GET /api/timeline/history` uses, so an agent
+/// can locate and reason about the op without a second query.
+#[derive(Debug, Serialize)]
+pub struct ConflictWitnessView {
+    /// Event UUID.
+    pub id: String,
+    /// Branch-local monotonic sequence number.
+    pub sequence_number: u64,
+    /// RFC 3339 timestamp.
+    pub timestamp: String,
+    /// Clean kernel-level operation kind ("transform_solid", …).
+    pub operation_type: String,
+    /// Display name of the event's author.
+    pub author: String,
+    /// Full structured operation as tagged JSON — the witness payload
+    /// an agent inspects to decide HOW to resolve.
+    pub operation: serde_json::Value,
+}
+
+/// One typed merge conflict: the kernel taxonomy verdict plus both
+/// witnesses, serialized from `timeline_engine::branch::MergeConflict`
+/// WITHOUT reinterpretation (spec 2026-07-29 §3.1 / §6: an agent
+/// branches on the divergence shape, never on prose).
+#[derive(Debug, Serialize)]
+pub struct ConflictView {
+    /// What collided, in canonical display form (`"solid:0"`,
+    /// `"entity:<uuid>"`).
+    pub subject: String,
+    /// Taxonomy verdict: `concurrent_modification` | `delete_modify` |
+    /// `operation_conflict` | `dependency_conflict` |
+    /// `topological_conflict`.
+    pub conflict_type: String,
+    /// The source branch's colliding event.
+    pub source_event: Option<ConflictWitnessView>,
+    /// The target branch's colliding event.
+    pub target_event: Option<ConflictWitnessView>,
+    /// One human-readable line, derived from the typed fields above
+    /// (never the other way around) — for UIs that render a plain list.
+    pub summary: String,
+}
+
+/// Wire form of `timeline_engine::branch::MergeStatistics`.
+#[derive(Debug, Serialize)]
+pub struct MergeStatisticsView {
+    pub events_merged: usize,
+    pub conflicts_count: usize,
+    pub auto_resolved: usize,
+    pub entities_affected: usize,
+    pub duration_ms: u64,
+}
+
+/// `POST /api/branches/{id}/merge` response — the merge's own evidence,
+/// not a bare bool: statistics always, typed conflict witnesses when
+/// the taxonomy found collisions.
 #[derive(Debug, Serialize)]
 pub struct MergeView {
     /// `true` iff the merge applied without conflicts.
     pub success: bool,
     /// UUID string (or `"main"`) of the branch the events were folded into.
     pub merged_into: String,
-    /// Empty when `success = true`. Each entry is a human-readable
-    /// summary of one unresolved conflict.
-    pub conflicts: Vec<String>,
+    /// The strategy actually dispatched ("fast-forward" | "three-way" |
+    /// "squash").
+    pub strategy: String,
+    /// Events copied into the target (0 on a conflicted or up-to-date
+    /// merge).
+    pub events_merged: usize,
+    /// Empty when `success = true`; typed witnesses otherwise.
+    pub conflicts: Vec<ConflictView>,
+    /// The kernel's own merge statistics, verbatim.
+    pub statistics: MergeStatisticsView,
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────
@@ -316,7 +378,86 @@ fn map_timeline_err(e: TimelineError) -> ApiError {
                 .with_details(serde_json::json!({ "branch_id": id.to_string() }))
         }
         TimelineError::InvalidOperation(msg) => ApiError::new(ErrorCode::BranchInvalidState, msg),
+        // The kernel's honest divergence refusal (ff-only merge on
+        // diverged branches). 409 with the message VERBATIM — never the
+        // anonymous 500 this used to fall through to.
+        TimelineError::BranchConflict(msg) => ApiError::new(ErrorCode::BranchMergeConflict, msg),
+        // Typed capability refusal (e.g. squash/rebase on divergence,
+        // ConflictStrategy::AI): the caller must change its request, so
+        // it is a 400-class parameter error, not a server fault.
+        TimelineError::NotImplemented(msg) => ApiError::new(ErrorCode::InvalidParameter, msg),
         other => ApiError::new(ErrorCode::Internal, format!("timeline error: {other}")),
+    }
+}
+
+/// Render one taxonomy verdict as its stable wire label.
+fn conflict_type_label(t: &ConflictType) -> &'static str {
+    match t {
+        ConflictType::ConcurrentModification => "concurrent_modification",
+        ConflictType::DeleteModify => "delete_modify",
+        ConflictType::OperationConflict => "operation_conflict",
+        ConflictType::DependencyConflict => "dependency_conflict",
+        ConflictType::TopologicalConflict => "topological_conflict",
+    }
+}
+
+/// Project a timeline event into its witness wire form.
+fn witness_view(ev: &timeline_engine::TimelineEvent) -> ConflictWitnessView {
+    ConflictWitnessView {
+        id: ev.id.to_string(),
+        sequence_number: ev.sequence_number,
+        timestamp: ev.timestamp.to_rfc3339(),
+        operation_type: crate::handlers::timeline::operation_kind(&ev.operation),
+        author: author_label(&ev.author),
+        operation: serde_json::to_value(&ev.operation).unwrap_or(serde_json::Value::Null),
+    }
+}
+
+/// Project a kernel `MergeConflict` into the typed wire form, verbatim
+/// — the `summary` line is DERIVED from the typed fields, never a
+/// replacement for them.
+fn conflict_view(c: &MergeConflict) -> ConflictView {
+    let source_event = c.source_event.as_ref().map(witness_view);
+    let target_event = c.target_event.as_ref().map(witness_view);
+    let describe = |w: &Option<ConflictWitnessView>| -> String {
+        w.as_ref()
+            .map(|v| format!("seq {} ({})", v.sequence_number, v.operation_type))
+            .unwrap_or_else(|| "<no witness>".to_string())
+    };
+    let summary = format!(
+        "{} on {}: source {} vs target {}",
+        conflict_type_label(&c.conflict_type),
+        c.subject,
+        describe(&source_event),
+        describe(&target_event),
+    );
+    ConflictView {
+        subject: c.subject.to_string(),
+        conflict_type: conflict_type_label(&c.conflict_type).to_string(),
+        source_event,
+        target_event,
+        summary,
+    }
+}
+
+/// Render a `BranchRelationship` as its typed JSON wire form.
+fn relationship_json(rel: &BranchRelationship) -> serde_json::Value {
+    match rel {
+        BranchRelationship::UpToDate => serde_json::json!({ "kind": "up_to_date" }),
+        BranchRelationship::FastForward { events_ahead } => serde_json::json!({
+            "kind": "fast_forward",
+            "events_ahead": events_ahead,
+        }),
+        BranchRelationship::Divergent {
+            common_prefix,
+            source_only,
+            target_only,
+        } => serde_json::json!({
+            "kind": "divergent",
+            "common_prefix": common_prefix,
+            "source_only": source_only,
+            "target_only": target_only,
+        }),
     }
 }
 
@@ -397,10 +538,35 @@ pub async fn create_branch(
             };
             (author, purpose)
         }
-        _ => (
-            Author::System,
-            BranchPurpose::UserExploration { description },
-        ),
+        _ => {
+            // No client-asserted agent_id: derive authorship from the
+            // request's agent-attribution scope — the same
+            // `X-Roshera-Agent` → `AUTHOR_OVERRIDE` task-local that
+            // already attributes every kernel op this request records
+            // (`agent_author_layer` in main.rs). Without this, an
+            // agent's fork landed in the append-only log as
+            // `Author::System`, an authorship hole that cannot be
+            // healed later. Requests with no agent scope (human/UI)
+            // keep the previous `System` author unchanged.
+            //
+            // NOTE: like the header itself, this identity is
+            // client-declared. The auth-derived end state is
+            // `PrincipalKind` (session-manager AUTHORSHIP-A2), which
+            // the queued branch-lane collapse adopts; this keeps the
+            // interim honest rather than silently wrong.
+            match timeline_engine::recorder_bridge::AUTHOR_OVERRIDE.try_with(Clone::clone) {
+                Ok(agent_author @ Author::AIAgent { .. }) => {
+                    let purpose = BranchPurpose::AIOptimization {
+                        objective: OptimizationObjective::Custom(description.clone()),
+                    };
+                    (agent_author, purpose)
+                }
+                _ => (
+                    Author::System,
+                    BranchPurpose::UserExploration { description },
+                ),
+            }
+        }
     };
 
     // Drain in-flight kernel events first. The recorder is sync-fire-
@@ -614,19 +780,151 @@ pub async fn merge_branch(
         }
     };
 
+    let strategy_label = match &strategy {
+        MergeStrategy::FastForward => "fast-forward",
+        MergeStrategy::ThreeWay { .. } => "three-way",
+        MergeStrategy::Squash { .. } => "squash",
+        MergeStrategy::Rebase => "rebase",
+        MergeStrategy::CherryPick { .. } => "cherry-pick",
+    }
+    .to_string();
+
+    // Drain in-flight kernel events first — same barrier POST
+    // /api/branches uses. The recorder is fire-and-forget; without the
+    // flush a merge issued right after a geometry op would compare
+    // stale branch heads. Failure is non-fatal (worker may be down =
+    // nothing in flight).
+    let _ = state.timeline_recorder.flush().await;
+
     let result = {
-        let mut timeline = state.timeline.write().await;
-        timeline
-            .merge_branches(source, target, strategy)
-            .await
-            .map_err(map_timeline_err)?
+        let timeline = state.timeline.write().await;
+        timeline.merge_branches(source, target, strategy).await
     };
 
-    let conflicts: Vec<String> = result.conflicts.iter().map(|c| format!("{c:?}")).collect();
+    let result = match result {
+        Ok(r) => r,
+        // The ff-only divergence refusal: 409 with the kernel's message
+        // VERBATIM plus the TYPED divergence shape + conflict witnesses
+        // (via the read-only preview, which shares the merge's own
+        // sequencing/taxonomy code) — an agent branches on
+        // `details.relationship`, not on prose.
+        Err(TimelineError::BranchConflict(msg)) => {
+            let preview = {
+                let timeline = state.timeline.read().await;
+                timeline.preview_merge(source, target).ok()
+            };
+            let mut details = serde_json::json!({
+                "source": source.to_string(),
+                "target": target.to_string(),
+            });
+            if let Some(p) = preview {
+                details["relationship"] = relationship_json(&p.relationship);
+                details["conflicts"] =
+                    serde_json::to_value(p.conflicts.iter().map(conflict_view).collect::<Vec<_>>())
+                        .unwrap_or(serde_json::Value::Null);
+            }
+            return Err(ApiError::new(ErrorCode::BranchMergeConflict, msg)
+                .with_details(details)
+                .with_hint(
+                    "The branches have diverged. Retry with strategy 'three-way' to get \
+                     typed conflict witnesses (or a clean merge), or inspect \
+                     GET /api/branches/{id}/conflicts first."
+                        .to_string(),
+                ));
+        }
+        Err(other) => return Err(map_timeline_err(other)),
+    };
+
+    let conflicts: Vec<ConflictView> = result.conflicts.iter().map(conflict_view).collect();
     Ok(Json(MergeView {
         success: result.success && conflicts.is_empty(),
         merged_into: target.to_string(),
+        strategy: strategy_label,
+        events_merged: result.statistics.events_merged,
         conflicts,
+        statistics: MergeStatisticsView {
+            events_merged: result.statistics.events_merged,
+            conflicts_count: result.statistics.conflicts_count,
+            auto_resolved: result.statistics.auto_resolved,
+            entities_affected: result.statistics.entities_affected,
+            duration_ms: result.statistics.duration_ms,
+        },
+    }))
+}
+
+// ── Read-only conflict preview ────────────────────────────────────────
+
+/// `GET /api/branches/{id}/conflicts?target=<branch>` query parameters.
+#[derive(Debug, Deserialize)]
+pub struct ConflictsQuery {
+    /// Merge target to preview against — `"main"` (default) or a UUIDv4.
+    #[serde(default)]
+    pub target: Option<String>,
+}
+
+/// `GET /api/branches/{id}/conflicts` response.
+#[derive(Debug, Serialize)]
+pub struct ConflictsPreviewView {
+    /// Source branch (`{id}` from the path).
+    pub source: String,
+    /// Target branch previewed against.
+    pub target: String,
+    /// Typed relationship: `{kind: "up_to_date" | "fast_forward" |
+    /// "divergent", ...counts}`.
+    pub relationship: serde_json::Value,
+    /// Exactly the typed conflicts a three-way merge would report.
+    pub conflicts: Vec<ConflictView>,
+    /// `true` when a merge would apply without conflicts (up-to-date,
+    /// fast-forward, or cleanly-divergent).
+    pub mergeable: bool,
+}
+
+/// `GET /api/branches/{id}/conflicts` — the read-only merge preview
+/// backing the agent's `timeline_conflicts` verb: how would merging
+/// `{id}` into `target` go, WITHOUT merging anything.
+///
+/// Runs `Timeline::preview_merge`, which shares the sequencing and
+/// conflict-classification code with the real merge (one taxonomy
+/// lane), but flips no branch state and copies no events. An agent
+/// calls this to decide HOW to resolve before committing to a merge.
+pub async fn preview_conflicts(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(q): Query<ConflictsQuery>,
+) -> Result<Json<ConflictsPreviewView>, ApiError> {
+    let source = parse_branch_id(&id)?;
+    let target = q
+        .target
+        .as_deref()
+        .map(parse_branch_id)
+        .transpose()?
+        .unwrap_or_else(BranchId::main);
+    if source == target {
+        return Err(ApiError::new(
+            ErrorCode::BranchInvalidState,
+            "conflict preview source and target are the same branch".to_string(),
+        ));
+    }
+
+    // Same drain barrier as the merge itself: the preview must see the
+    // branches' actual heads, not a stale prefix.
+    let _ = state.timeline_recorder.flush().await;
+
+    let preview = {
+        let timeline = state.timeline.read().await;
+        timeline
+            .preview_merge(source, target)
+            .map_err(map_timeline_err)?
+    };
+
+    let conflicts: Vec<ConflictView> = preview.conflicts.iter().map(conflict_view).collect();
+    let mergeable = conflicts.is_empty();
+    Ok(Json(ConflictsPreviewView {
+        source: source.to_string(),
+        target: target.to_string(),
+        relationship: relationship_json(&preview.relationship),
+        conflicts,
+        mergeable,
     }))
 }
 

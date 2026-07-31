@@ -47,6 +47,33 @@ base64 = "0.22"
 # CPU triangle rasterizer in `frame.rs` encodes its framebuffer as a
 # PNG so multimodal LLMs can consume the image directly.
 png = "0.17"
+# Goose agent harness (ACP server), embedded in-process (slice 1).
+#
+# - git dependency: the crates.io name `goose` is an unrelated load-testing
+#   framework (tag1consulting/goose); the Block agent harness is not
+#   published. Pinned to an explicit rev — never a floating branch.
+# - default-features = false, NO feature list: goose's `default` feature set
+#   is empty, but we state it explicitly so a future upstream default cannot
+#   silently widen our build. Deliberately NO TLS feature either
+#   (`native-tls` requires OpenSSL dev libs — absent on the Windows dev
+#   host; `rustls-tls` drags in aws-lc-rs, which wants CMake/NASM). goose's
+#   TLS features gate only (a) TLS termination for its own standalone
+#   server — Roshera terminates its own connections — and (b) the HTTPS
+#   backend of goose's outbound reqwest client. Slice 1 makes no outbound
+#   call; before slice 2 sends live provider traffic through goose, a TLS
+#   feature must be chosen or every https:// request will fail at runtime.
+# - MUST NOT enable: `local-inference` / `cuda` / `vulkan` / `mlx` (local
+#   model runtimes — Roshera is API-only by policy, enforced at
+#   ai-integration/src/providers/mod.rs; keeping them off makes the policy
+#   structural at build level), `code-mode`, `aws-providers`, `otel`,
+#   `portable-default`.
+# - MUST NOT add `goose-mcp`: it is the only crate that registers the
+#   builtin MCP extensions (Developer / ComputerController / Memory) into
+#   goose's BUILTIN_REGISTRY. Omitting it means those extensions cannot
+#   exist in this binary regardless of any config file (the registry lookup
+#   fails closed). See api-server/src/goose_acp.rs for the rest of the
+#   lockdown story.
+goose = { git = "https://github.com/block/goose.git", rev = "022c17c3946b506b031fc828543cb9e6650dbfd5", default-features = false }
 [dev-dependencies]
 tower = { version = "0.5.2", features = ["util"] }
 hyper = "1.0"
