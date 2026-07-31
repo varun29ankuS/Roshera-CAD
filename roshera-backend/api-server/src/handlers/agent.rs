@@ -1005,129 +1005,40 @@ pub async fn scene_orbit(
 
 // ───────────────────── ground truth (PILLAR 1) ──────────────────────
 
-/// The kernel's self-reported ground truth for a solid: provenance (what op made
-/// Per-face display-tessellation defect — the agent's pointer to exactly which
-/// face renders wrong, without rendering a pixel.
-#[derive(Debug, Clone, Serialize)]
-pub struct TessFaceDefectResponse {
-    pub face_id: u64,
-    pub triangles: usize,
-    pub degenerate_triangles: usize,
-    pub normal_agreement: f64,
-    /// Winding-vs-TRUE-surface-normal agreement for this face — the decisive
-    /// scribble signal (a bore whose stored normals are wrong-but-consistent
-    /// drops here while `normal_agreement` stays high).
-    pub analytic_normal_agreement: f64,
-}
-
-/// Display-tessellation quality — the render-mesh analogue of B-Rep soundness.
-/// A watertight + manifold solid can still tessellate to a degenerate /
-/// inverted-normal mesh (the inner-bore scribble); `clean == false` is that
-/// defect, surfaced so the agent can SEE it without a render round-trip.
-#[derive(Debug, Clone, Serialize)]
-pub struct TessQualityResponse {
-    pub clean: bool,
-    pub triangles: usize,
-    pub degenerate_triangles: usize,
-    /// Fraction of facets whose winding normal agrees with their stored
-    /// (analytic-intent) vertex normals. `1.0` = every facet shaded correctly.
-    pub normal_agreement: f64,
-    /// Fraction of facets whose winding normal agrees with the TRUE surface
-    /// normal at the facet centroid — the ground-truth scribble check.
-    pub analytic_normal_agreement: f64,
-    pub inconsistent_facets: usize,
-    /// Facets pointing into the wrong hemisphere of the true surface normal.
-    pub off_surface_facets: usize,
-    pub worst_face: Option<TessFaceDefectResponse>,
-}
-
-/// Per-face mesh-shape defect (the CAD mesh-quality rules).
-#[derive(Debug, Clone, Serialize)]
-pub struct MeshFaceQualityResponse {
-    pub face_id: u64,
-    pub worst_aspect_ratio: f64,
-    pub min_angle_deg: f64,
-    pub max_normal_deviation_deg: f64,
-    pub boundary_crossing_facets: usize,
-}
-
-/// Mesh-quality verdict — the render mesh against the CAD tessellation rules
-/// (boundary conformance, normal deviation, aspect ratio, min angle). Catches a
-/// sliver "wing" / bridging facet that is watertight + correctly oriented.
-#[derive(Debug, Clone, Serialize)]
-pub struct MeshQualityResponse {
-    pub clean: bool,
-    pub triangles: usize,
-    pub worst_aspect_ratio: f64,
-    pub min_angle_deg: f64,
-    pub max_normal_deviation_deg: f64,
-    pub boundary_crossing_facets: usize,
-    pub worst_face: Option<MeshFaceQualityResponse>,
-}
-
-/// it, designed vs bare primitive) + a COMPUTED validity certificate.
-#[derive(Debug, Clone, Serialize)]
-pub struct TruthResponse {
-    pub solid_id: u32,
-    /// Operation that created it, e.g. "nurbs_loft", "primitive:Box", "boolean".
-    pub origin: String,
-    /// A genuine designed feature (not a bare primitive stand-in / unrecorded).
-    pub designed: bool,
-    pub primitive: bool,
-    pub inputs: Vec<u32>,
-    pub brep_valid: bool,
-    pub watertight: bool,
-    pub manifold: bool,
-    pub self_intersection_free: bool,
-    pub euler_characteristic: i64,
-    /// Cross-entity consistency verdict for the solid's linked construction
-    /// geometry: "consistent" / "inconsistent" / "not_applicable".
-    pub construction_consistent: String,
-    /// D4 labels-consistency verdict: are all the part's labels still backed by
-    /// a holding assertion? "consistent" / "inconsistent" / "not_applicable".
-    /// An annotation flag — does NOT affect `sound`.
-    pub labels_consistent: String,
-    /// Display-tessellation quality: `false` ⇒ the render mesh is degenerate or
-    /// has inverted normals (the inner-bore scribble) even if the B-Rep is sound.
-    /// Factored into `sound`.
-    pub tessellation_clean: bool,
-    /// Full tessellation-quality breakdown incl. the worst defective face.
-    pub tessellation: TessQualityResponse,
-    /// Mesh-quality (CAD tessellation-rule) verdict: `false` ⇒ a facet violates a
-    /// shape rule (a sliver "wing", a boundary-crossing/bridging facet, a far-off-
-    /// surface normal) even if the mesh is watertight. Factored into `sound`.
-    pub mesh_quality_clean: bool,
-    /// Full mesh-quality breakdown incl. the worst face + which rule it fails.
-    pub mesh_quality: MeshQualityResponse,
-    /// Real, closed, manufacturable solid (brep_valid ∧ watertight ∧ manifold
-    /// ∧ self-intersection-free ∧ construction-consistent ∧ tessellation-clean
-    /// ∧ mesh-quality-clean).
-    pub sound: bool,
-    pub errors: Vec<String>,
-    /// MODEL-level debris count — faces live in the store but owned by no solid
-    /// (unattributed orphan topology a broken boolean can leave). NOT this
-    /// part's fault and does NOT affect `sound`; surfaced as an honest
-    /// model-health signal so debris stays visible without poisoning this
-    /// part's verdict. `0` on a clean model.
-    pub model_debris_orphan_faces: usize,
-    pub summary: String,
-}
-
 /// `GET /api/agent/parts/{id}/truth` — "what did you actually make, and is it
-/// real?" answered by the KERNEL (provenance + computed certificate), never by
-/// the agent. Read lock only; `404` on unknown id.
+/// real RIGHT NOW?" answered by the KERNEL (provenance + a freshness-gated
+/// certificate reading), never by the agent.
+///
+/// **P1 enforcement.** This handler reads through
+/// [`BRepModel::soundness_reading`](geometry_engine::primitives::topology_builder::BRepModel::soundness_reading),
+/// which NEVER recomputes — unlike the old path through
+/// [`BRepModel::ground_truth`](geometry_engine::primitives::topology_builder::BRepModel::ground_truth)
+/// (still used internally, e.g. by export-engine's STEP writer), which
+/// silently self-heals a dirty certificate cache by recomputing on the spot.
+/// That self-heal is correct for a kernel-internal caller that needs a true
+/// answer right now, but wrong for the surface an agent reads "is this
+/// sound" from: a silent recompute would let a caller who never explicitly
+/// verified get a passing answer anyway, which is exactly the "steering, not
+/// constraint" failure this endpoint exists to close. A solid mutated (or
+/// never certified) since its last full verification reads back
+/// `"status": "stale"` / `"sound": false` — never the previous `Sound`
+/// verdict, never a fabricated fresh one — naming `verify_part` as the
+/// remedy. Read lock only; `404` on unknown id.
 pub async fn part_truth(
     State(_state): State<AppState>,
     ActiveModel(model_handle): ActiveModel,
     Path(id): Path<u32>,
-) -> Result<Json<TruthResponse>, StatusCode> {
-    // Write lock: `ground_truth` re-runs Pillar-3 selectors for the D4 labels
-    // flag, which warm a per-face centroid cache (no geometry is mutated).
-    let mut model = model_handle.write().await;
-    let gt = model
-        .ground_truth(id as SolidId)
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    use geometry_engine::primitives::provenance::SoundnessReading;
+
+    let model = model_handle.read().await;
+    let solid_id = id as SolidId;
+
+    let reading = model
+        .soundness_reading(solid_id)
         .ok_or(StatusCode::NOT_FOUND)?;
-    let (origin, designed, primitive, inputs) = match &gt.provenance {
+
+    let (origin, designed, primitive, inputs) = match model.solid_provenance(solid_id) {
         Some(p) => (
             p.created_by.label(),
             p.created_by.is_designed(),
@@ -1136,66 +1047,60 @@ pub async fn part_truth(
         ),
         None => ("unrecorded".to_string(), false, false, Vec::new()),
     };
-    let c = &gt.certificate;
-    Ok(Json(TruthResponse {
-        solid_id: id,
-        origin,
-        designed,
-        primitive,
-        inputs,
-        brep_valid: c.brep_valid,
-        watertight: c.watertight,
-        manifold: c.manifold,
-        self_intersection_free: c.self_intersection_free,
-        euler_characteristic: c.euler_characteristic,
-        construction_consistent: c.construction_consistent.label().to_string(),
-        labels_consistent: c.labels_consistent.label().to_string(),
-        tessellation_clean: c.tessellation.clean,
-        tessellation: TessQualityResponse {
-            clean: c.tessellation.clean,
-            triangles: c.tessellation.triangles,
-            degenerate_triangles: c.tessellation.degenerate_triangles,
-            normal_agreement: c.tessellation.normal_agreement,
-            analytic_normal_agreement: c.tessellation.analytic_normal_agreement,
-            inconsistent_facets: c.tessellation.inconsistent_facets,
-            off_surface_facets: c.tessellation.off_surface_facets,
-            worst_face: c
-                .tessellation
-                .worst_face
-                .as_ref()
-                .map(|w| TessFaceDefectResponse {
-                    face_id: w.face_id,
-                    triangles: w.triangles,
-                    degenerate_triangles: w.degenerate_triangles,
-                    normal_agreement: w.normal_agreement,
-                    analytic_normal_agreement: w.analytic_normal_agreement,
-                }),
-        },
-        mesh_quality_clean: c.mesh_quality.clean,
-        mesh_quality: MeshQualityResponse {
-            clean: c.mesh_quality.clean,
-            triangles: c.mesh_quality.triangles,
-            worst_aspect_ratio: c.mesh_quality.worst_aspect_ratio,
-            min_angle_deg: c.mesh_quality.min_angle_deg,
-            max_normal_deviation_deg: c.mesh_quality.max_normal_deviation_deg,
-            boundary_crossing_facets: c.mesh_quality.boundary_crossing_facets,
-            worst_face: c
-                .mesh_quality
-                .worst_face
-                .as_ref()
-                .map(|w| MeshFaceQualityResponse {
-                    face_id: w.face_id,
-                    worst_aspect_ratio: w.worst_aspect_ratio,
-                    min_angle_deg: w.min_angle_deg,
-                    max_normal_deviation_deg: w.max_normal_deviation_deg,
-                    boundary_crossing_facets: w.boundary_crossing_facets,
-                }),
-        },
-        sound: c.is_sound(),
-        errors: c.errors.clone(),
-        model_debris_orphan_faces: c.model_debris_orphan_faces,
-        summary: gt.summary(),
-    }))
+
+    let body = match reading {
+        SoundnessReading::Stale { .. } => serde_json::json!({
+            "solid_id": id,
+            "origin": origin,
+            "designed": designed,
+            "primitive": primitive,
+            "inputs": inputs,
+            "status": "stale",
+            "verified": false,
+            // Explicit, never omitted: a `Stale` reading reports `sound` as
+            // `false`, never `true` and never absent-as-if-true.
+            "sound": false,
+            "summary": format!(
+                "solid {id} — origin={origin} designed={designed} — STALE: \
+                 mutated (or never certified) since its last full \
+                 verification; the kernel has no current certificate to \
+                 report, so none is fabricated"
+            ),
+            "remedy": "verify_part",
+            "reason": SoundnessReading::STALE_REMEDY,
+        }),
+        SoundnessReading::Sound(cert) | SoundnessReading::Unsound(cert) => {
+            let status = if cert.is_sound() { "sound" } else { "unsound" };
+            let summary = format!(
+                "solid {id} — origin={origin} designed={designed} sound={} \
+                 (brep_valid={} watertight={} manifold={} oriented={} euler={} \
+                 construction={} labels={} tess_clean={} mesh_clean={})",
+                cert.is_sound(),
+                cert.brep_valid,
+                cert.watertight,
+                cert.manifold,
+                cert.oriented,
+                cert.euler_characteristic,
+                cert.construction_consistent.label(),
+                cert.labels_consistent.label(),
+                cert.tessellation.clean,
+                cert.mesh_quality.clean,
+            );
+            let mut base = crate::certificate_json(&cert);
+            if let serde_json::Value::Object(map) = &mut base {
+                map.insert("solid_id".into(), serde_json::json!(id));
+                map.insert("origin".into(), serde_json::json!(origin));
+                map.insert("designed".into(), serde_json::json!(designed));
+                map.insert("primitive".into(), serde_json::json!(primitive));
+                map.insert("inputs".into(), serde_json::json!(inputs));
+                map.insert("status".into(), serde_json::json!(status));
+                map.insert("verified".into(), serde_json::json!(true));
+                map.insert("summary".into(), serde_json::json!(summary));
+            }
+            base
+        }
+    };
+    Ok(Json(body))
 }
 
 // ───────────────────── occupancy X-ray ──────────────────────────────
@@ -2419,11 +2324,13 @@ pub async fn part_features(
 ///
 /// 404 — solid not found in the active model.
 /// 422 — the kernel refuses the analysis outright (a dangling face/solid
-///       reference, or a solid that fails an analyzer's soundness
-///       precondition) — [`geometry_engine::dfm::DfmError`]'s reason is
-///       surfaced verbatim. This is distinct from a rule reading
-///       `Unverifiable` inside a 200 response: that is an honest per-rule
-///       refusal, a VALUE in the report, never an HTTP error (spec §4).
+///       reference, a solid that fails an analyzer's soundness
+///       precondition, or — P1 enforcement — a solid that has not been
+///       fully verified since its last mutation) —
+///       [`geometry_engine::dfm::DfmError`]'s reason is surfaced verbatim.
+///       This is distinct from a rule reading `Unverifiable` inside a 200
+///       response: that is an honest per-rule refusal, a VALUE in the
+///       report, never an HTTP error (spec §4).
 pub async fn part_dfm_check(
     State(_state): State<AppState>,
     ActiveModel(model_handle): ActiveModel,
@@ -2448,6 +2355,28 @@ pub async fn part_dfm_check(
             );
         }
     };
+
+    // P1 ENFORCEMENT — refuse pre-flight, before any rule runs, when the
+    // solid has been mutated (or never certified) since its last full
+    // verification. A DFM `pass` computed against unverified geometry is
+    // exactly the "laundering a guess as authority" failure this gate
+    // closes. Read-only: `soundness_reading` never recomputes, so this
+    // check cannot silently "fix" the staleness it is here to catch.
+    if model
+        .soundness_reading(solid_id)
+        .map(|r| r.is_stale())
+        .unwrap_or(false)
+    {
+        let err = geometry_engine::dfm::DfmError::UnverifiedSolid { solid: solid_id };
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "error": "dfm_stale_solid",
+                "reason": err.to_string(),
+                "remedy": "verify_part",
+            })),
+        );
+    }
 
     let mut faces = Vec::new();
     for shell_id in solid.all_shells() {

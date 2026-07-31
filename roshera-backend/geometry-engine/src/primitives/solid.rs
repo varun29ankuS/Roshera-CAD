@@ -532,6 +532,26 @@ pub struct Solid {
     /// (identical geometry ⇒ identical certificate) with last-write-wins and
     /// no torn state.
     cached_certificate: RwLock<Option<crate::primitives::provenance::ValidityCertificate>>,
+    /// **P1 enforcement.** The last FULL certificate computed since this
+    /// solid's LAST REAL MUTATION — `None` means mutated (or never
+    /// certified) since then. Deliberately a SEPARATE field from
+    /// `cached_certificate`: that memoization cache is dirtied by
+    /// [`SolidStore::get_mut`]'s conservative backstop on ANY mutable
+    /// touch, including benign cache-warming reads (e.g.
+    /// `compute_solid_mass_properties` installing the mass-props cache) —
+    /// exactly the "harmless spurious recompute" the backstop's own docs
+    /// call out. That's fine for memoization (a wasted recompute costs
+    /// time, never correctness) but wrong for a freshness GATE: a read
+    /// that incidentally warms an unrelated cache must not silently
+    /// revoke a part's just-established "verified" status. This field is
+    /// cleared ONLY by the precise mutation seams — the
+    /// [`crate::primitives::topology_builder::BRepModel::record_operation`]
+    /// funnel and the `set_solid_construction` sidecar — the same seams
+    /// that clear `cached_certificate`, just without the `get_mut`
+    /// backstop's extra conservatism. Set by
+    /// [`crate::primitives::topology_builder::BRepModel::certificate`]'s
+    /// cold path every time it genuinely recomputes.
+    verified_certificate: RwLock<Option<crate::primitives::provenance::ValidityCertificate>>,
     /// Parent assembly (if part of assembly)
     pub parent_assembly: Option<u32>,
     /// Parametric history
@@ -661,6 +681,7 @@ impl Clone for Solid {
             cached_mass_props: self.cached_mass_props.clone(),
             cached_stats: self.cached_stats.clone(),
             cached_certificate: RwLock::new(self.cached_certificate.read().clone()),
+            verified_certificate: RwLock::new(self.verified_certificate.read().clone()),
             parent_assembly: self.parent_assembly,
             history: self.history.clone(),
             collision_tree: self.collision_tree.clone(),
@@ -698,6 +719,7 @@ impl Solid {
             cached_mass_props: None,
             cached_stats: None,
             cached_certificate: RwLock::new(None),
+            verified_certificate: RwLock::new(None),
             parent_assembly: None,
             history: Arc::new(RwLock::new(Vec::new())),
             collision_tree: None,
@@ -748,6 +770,7 @@ impl Solid {
             cached_mass_props: self.cached_mass_props.clone(),
             cached_stats: self.cached_stats.clone(),
             cached_certificate: RwLock::new(self.cached_certificate.read().clone()),
+            verified_certificate: RwLock::new(self.verified_certificate.read().clone()),
             parent_assembly: self.parent_assembly,
             history: Arc::new(RwLock::new(history_snapshot)),
             collision_tree: self.collision_tree.clone(),
@@ -1330,6 +1353,39 @@ impl Solid {
         cert: crate::primitives::provenance::ValidityCertificate,
     ) {
         *self.cached_certificate.write() = Some(cert);
+    }
+
+    /// **P1 enforcement.** Mark this solid as freshly, fully verified —
+    /// called by
+    /// [`crate::primitives::topology_builder::BRepModel::certificate`]'s
+    /// cold path every time it genuinely recomputes (never on a cache
+    /// hit re-return, and never by `get_mut`'s backstop). See
+    /// [`Self::verified_certificate`]'s field docs for why this is a
+    /// separate field from `cached_certificate`.
+    pub(crate) fn mark_verified(&self, cert: crate::primitives::provenance::ValidityCertificate) {
+        *self.verified_certificate.write() = Some(cert);
+    }
+
+    /// **P1 enforcement.** Clear the freshness marker. Called ONLY from
+    /// the precise mutation seams
+    /// ([`crate::primitives::topology_builder::BRepModel::record_operation`]'s
+    /// funnel, `set_solid_construction`'s sidecar) — deliberately NEVER
+    /// from [`SolidStore::get_mut`]'s conservative backstop, so a benign
+    /// cache-warming read cannot silently revoke a just-established
+    /// "verified" status.
+    pub(crate) fn invalidate_verification(&self) {
+        *self.verified_certificate.write() = None;
+    }
+
+    /// **P1 enforcement.** The last FULL certificate computed since this
+    /// solid's last REAL mutation, or `None` when it was mutated (or
+    /// never certified) since then. Read-only — never triggers a
+    /// recompute; that is the entire point (see
+    /// [`crate::primitives::provenance::SoundnessReading`]).
+    pub(crate) fn verified_certificate(
+        &self,
+    ) -> Option<crate::primitives::provenance::ValidityCertificate> {
+        self.verified_certificate.read().clone()
     }
 
     /// Transform solid

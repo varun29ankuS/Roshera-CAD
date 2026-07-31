@@ -86,7 +86,9 @@ export function registerIoTools(server: ToolHost) {
     "export_part",
     "EXPORT parts to a CAD file on disk — STEP (AP242, mm), STL, or OBJ — and " +
       "return the absolute path. `objects` empty = every solid. Saves to " +
-      "`save_path`, else ~/Desktop/<file_name>.",
+      "`save_path`, else ~/Desktop/<file_name>. ENFORCED: refused (422) for any " +
+      "part mutated (or never certified) since its last full verification — " +
+      "call verify_part first. An unverified solid cannot become a file.",
     {
       format: z.enum(["STEP", "STL", "OBJ"]).default("STEP").describe("output file format"),
       objects: z

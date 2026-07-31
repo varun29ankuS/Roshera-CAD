@@ -54,8 +54,12 @@ export function registerPerceptionTools(server: ToolHost) {
     "ground_truth",
     "The kernel's OWN account of a part: PROVENANCE (designed surface vs bare " +
       "primitive), the validity certificate (brep_valid, watertight, manifold, " +
-      "euler, sound), and the display-mesh verdict. `designed:false` or " +
-      "`sound:false` = stop and fix.",
+      "euler, sound), and the display-mesh verdict. ENFORCED FRESHNESS: this " +
+      "never silently recomputes a stale answer — if the part was mutated (or " +
+      "never certified) since its last full verification, `status` reads " +
+      "`\"stale\"` and `sound` is `false` (never the old passing verdict, never " +
+      "a fabricated fresh one); call verify_part to clear it. `designed:false` " +
+      "or `sound:false` (incl. `status:\"stale\"`) = stop and fix.",
     { part_id: z.number().int().describe("part id (list_parts)") },
     async ({ part_id }) => {
       try {
@@ -140,8 +144,12 @@ export function registerPerceptionTools(server: ToolHost) {
     "EXPLICIT FULL CERTIFICATE — the expensive checks the ambient verdict skips: " +
       "brep_valid + watertight + manifold + self-intersection-free + " +
       "construction/tessellation/mesh-quality. The authoritative 'is this a real " +
-      "closed solid' answer. ALWAYS call after a boolean or multi-feature build. " +
-      "Returns a diagnostic image (red=open, magenta=non-manifold).",
+      "closed solid' answer, and the ONLY call that clears staleness. ENFORCED, " +
+      "not just advised: after a boolean/blend/multi-feature build (especially " +
+      "one chained with `fast:true`), ground_truth reads `status:\"stale\"`, " +
+      "dfm_check refuses (422), and export_part refuses (422) until this runs — " +
+      "call it before trusting or shipping the result, not just after. Returns a " +
+      "diagnostic image (red=open, magenta=non-manifold).",
     {
       part_id: z.number().int().describe("part id (list_parts)"),
       view: z.enum(["iso", "front", "top", "right"]).default("iso").describe("camera view for the diagnostic image"),

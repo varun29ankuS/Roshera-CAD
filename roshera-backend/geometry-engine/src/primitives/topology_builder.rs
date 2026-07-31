@@ -2485,6 +2485,11 @@ impl BRepModel {
             if let Some(sid) = crate::operations::recorder::parse_solid_ref(reference) {
                 if let Some(solid) = self.solids.get(sid) {
                     solid.invalidate_certificate();
+                    // P1 enforcement: this is the PRECISE mutation seam (as
+                    // opposed to `get_mut`'s conservative backstop), so it is
+                    // also where the freshness gate clears. See
+                    // `Solid::verified_certificate`'s field docs.
+                    solid.invalidate_verification();
                 }
             }
         }
@@ -2540,6 +2545,9 @@ impl BRepModel {
         // re-linked (or orphaned) sketch.
         if let Some(solid) = self.solids.get(solid_id) {
             solid.invalidate_certificate();
+            // P1 enforcement: a genuine content change, not a benign
+            // cache-warming touch — clears the freshness gate too.
+            solid.invalidate_verification();
         }
     }
 
@@ -2654,6 +2662,12 @@ impl BRepModel {
             let computed = self.compute_certificate(solid_id);
             if let Some(solid) = self.solids.get(solid_id) {
                 solid.store_certificate(computed.clone());
+                // P1 enforcement: every genuine recompute — whether triggered
+                // by a real mutation or by `get_mut`'s backstop dirtying only
+                // `cached_certificate` — reflects the TRUE current geometry,
+                // so it also clears the freshness gate. See
+                // `Solid::verified_certificate`'s field docs.
+                solid.mark_verified(computed.clone());
             }
             cert = Some(computed);
         }
@@ -2667,6 +2681,43 @@ impl BRepModel {
         // model-scan re-runs.
         cert.model_debris_orphan_faces = crate::primitives::validation::count_orphan_faces(self);
         Some(cert)
+    }
+
+    /// **P1 enforcement seam.** The freshness-gated soundness reading for a
+    /// solid — [`Self::certificate`]'s non-computing sibling.
+    ///
+    /// Reads `Solid::verified_certificate` — the freshness marker set only
+    /// by a genuine [`Self::certificate`] recompute and cleared only by a
+    /// PRECISE mutation seam (the `record_operation` funnel,
+    /// `set_solid_construction`'s sidecar). Deliberately NOT
+    /// `cached_certificate` (the memoization cache `SolidStore::get_mut`'s
+    /// conservative backstop dirties on any mutable touch, including
+    /// benign cache-warming reads like mass-properties) — using that field
+    /// here would make the gate flip to `Stale` on the very next incidental
+    /// read after a real verify, which is not a mutation and must not cost
+    /// the agent its just-established "verified" status.
+    ///
+    /// `Some(cert)` becomes [`SoundnessReading::Sound`]/`Unsound`; `None`
+    /// (mutated, or never certified, since the last full verification)
+    /// becomes [`SoundnessReading::Stale`]. Unlike [`Self::certificate`] /
+    /// [`Self::certify_solid`], this method NEVER recomputes — it takes
+    /// `&self`, not `&mut self`, specifically so it cannot silently run the
+    /// expensive full check. Every surface that reports or gates on
+    /// soundness to an agent (`GET …/truth`, DFM, the evidence pack, export)
+    /// must read through here, not through `certify_solid`, or a stale part
+    /// can still be laundered as verified by nothing more than the act of
+    /// asking.
+    ///
+    /// `None` only when `solid_id` is unknown to the model.
+    pub fn soundness_reading(
+        &self,
+        solid_id: SolidId,
+    ) -> Option<crate::primitives::provenance::SoundnessReading> {
+        let solid = self.solids.get(solid_id)?;
+        Some(crate::primitives::provenance::SoundnessReading::from_cache(
+            solid.verified_certificate(),
+            solid_id,
+        ))
     }
 
     /// COMPUTE (never accept) a solid's validity certificate: B-Rep validity

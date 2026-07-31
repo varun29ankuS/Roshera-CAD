@@ -62,6 +62,27 @@ pub async fn export_mesh(
         ));
     }
 
+    // P1 ENFORCEMENT — HARD STOP. Refuse to export any solid that has been
+    // mutated (or never certified) since its last full verification. This is
+    // where the consequences of a stale soundness verdict leave the system:
+    // an unverified solid must not become an STL/OBJ/STEP/ROS file a shop
+    // machines from. `soundness_reading` never recomputes (read-only, no
+    // write lock needed), so this check cannot silently "fix" the staleness
+    // it exists to catch — the agent must call `verify_part` first. The
+    // typed `ExportError::UnverifiedSolid` is propagated verbatim, same
+    // honesty invariant as every other export failure on this path.
+    for &solid_id in &solids_to_export {
+        if model
+            .soundness_reading(solid_id)
+            .map(|r| r.is_stale())
+            .unwrap_or(false)
+        {
+            let err = ExportError::UnverifiedSolid { solid_id };
+            tracing::warn!(solid_id, "export refused: solid is stale (unverified)");
+            return Err((StatusCode::UNPROCESSABLE_ENTITY, err.to_string()));
+        }
+    }
+
     // Tessellate every selected solid and merge into a single
     // `shared_types::Mesh`. We can't use `Mesh::merge_multiple` here —
     // the kernel produces `tessellation::TriangleMesh`, not

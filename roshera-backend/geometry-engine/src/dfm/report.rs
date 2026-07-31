@@ -642,6 +642,23 @@ pub enum DfmError {
     /// soundness certificate once one exists to reference here.
     #[error("solid is not sound enough for DFM analysis: {detail}")]
     UnsoundSolid { detail: String },
+    /// **P1 enforcement.** The solid has been mutated (or never certified)
+    /// since its last full verification —
+    /// [`crate::primitives::provenance::SoundnessReading::Stale`]. Distinct
+    /// from [`Self::UnsoundSolid`]: `UnsoundSolid` means the kernel HAS
+    /// checked and found a real defect; `UnverifiedSolid` means the kernel
+    /// has NOT checked recently enough to say either way. A DFM `pass`
+    /// computed against unverified geometry is exactly the "laundering a
+    /// guess as authority" failure the freshness gate exists to close — so
+    /// this is refused pre-flight, before any rule runs, rather than folded
+    /// into a verdict.
+    #[error(
+        "solid {solid} has not been fully verified since its last mutation \
+         — call verify_part before requesting a DFM analysis"
+    )]
+    UnverifiedSolid {
+        solid: crate::primitives::solid::SolidId,
+    },
 }
 
 /// The full per-rule DFM report for one (model, solid, pack) analysis
