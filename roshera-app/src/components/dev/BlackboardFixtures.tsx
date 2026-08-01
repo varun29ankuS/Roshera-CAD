@@ -759,6 +759,27 @@ export function BlackboardFixtures({ onExit }: BlackboardFixturesProps) {
     addLine(DETECTED_CHOICES_NEGATIVE_FENCED, 'agent')
   }, [addLine])
 
+  // ── Live repro: fixed-left-gutter verdict marker — a mixed column of
+  // real lines (through the real `BlackboardLine` origin marker, not the
+  // static card gallery below, which renders via `MessageMarkdown` and has
+  // no notion of line authorship or the marker at all) so the shape+colour
+  // mapping can be checked by eye: same author shape (Bot) across pass /
+  // fail / inconclusive / neutral colours, and non-agent shapes (Wrench,
+  // User) staying neutral because their lines carry no verdict card.
+  const seedVerdictMarkers = useCallback(() => {
+    addLine('Sizing the bracket root before cutting the bores — no verdict yet.', 'agent')
+    addLine(SOUNDNESS_FULL, 'agent')
+    addLine(SOUNDNESS_UNSOUND, 'agent')
+    addLine(SOUNDNESS_PARTIAL, 'agent')
+    addLine(DFM_VIOLATION, 'agent')
+    addLine(DFM_UNVERIFIABLE_BOUND, 'agent')
+    addLine(REFUSAL, 'agent')
+    addLine(MERGE_CLEAN, 'agent')
+    addLine(MERGE_CONFLICT, 'agent')
+    addLine('Created **DN50 PN16 flange** — 165 × 165 × 18 mm · 792 tris', 'system')
+    addLine('Looks good, thanks — go ahead and cut the bores.', 'user')
+  }, [addLine])
+
   return (
     <div className="h-full w-full overflow-y-auto bg-background text-foreground select-text">
       <div className="mx-auto max-w-4xl px-6 py-6">
@@ -820,6 +841,13 @@ export function BlackboardFixtures({ onExit }: BlackboardFixturesProps) {
               title="Append the verbatim defect line (agent's own unfenced Option A/B/C prose) plus three negatives: a user line, a single-option agent line, and an agent line that already has a roshera:choices fence — only the first should grow detected-option buttons"
             >
               seed detected choices + negatives
+            </button>
+            <button
+              onClick={seedVerdictMarkers}
+              className="cad-icon-btn h-6 px-1.5 text-[11px]"
+              title="Append a mixed column of real lines — plain prose, sound/unsound/partial certificates, a DFM violation and an unverifiable result, a refusal, a clean and a conflicted merge, a build-step echo, and a user reply — to check the origin marker's shape+colour mapping by eye"
+            >
+              seed verdict markers
             </button>
             <span className="text-[10px] text-muted-foreground">
               use the panel's own trash icon to clear

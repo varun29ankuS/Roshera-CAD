@@ -4,6 +4,7 @@ import { cn } from '@/lib/utils'
 import { processBlackboardMessage } from '@/lib/ai-client'
 import { detectEnumeratedChoices } from '@/lib/blackboard-cards'
 import { classifyBlackboardContent } from '@/lib/blackboard-content'
+import { lineVerdict, type LineVerdict } from '@/lib/blackboard-line-state'
 import type { BlackboardLine as Line } from '@/stores/blackboard-store'
 import { MessageMarkdown } from './MessageMarkdown'
 import { StreamingLineText } from './StreamingLineText'
@@ -24,6 +25,43 @@ interface Props {
    *  `streaming` — a user who thinks the turn has hung can end it rather
    *  than reload the page. See `cancelAcpTurn` (`lib/acp-blackboard.ts`). */
   onCancel?: () => void
+}
+
+/**
+ * ORIGIN MARKER — shape says who wrote it, colour says what happened.
+ * ---------------------------------------------------------------------
+ * The leading marker already carries authorship (Bot / User / Wrench,
+ * below). This is its second, colour channel: when the line carries a
+ * verdict (`lineVerdict`, from the line's own fenced `roshera:*` cards —
+ * never invented), the SAME marker's fill and ring pick up that verdict's
+ * colour — emerald pass / red fail / amber inconclusive, the exact
+ * vocabulary `cards/card-chrome.tsx`'s `Claim` already uses for a
+ * certificate's tri-state glyphs. No second column, no new icon: the shape
+ * (which icon sits inside the circle) never changes, only the circle's own
+ * colour does. A line with no verdict keeps today's neutral per-author
+ * fill — most lines have no state and must not acquire a decorative one.
+ */
+const VERDICT_MARKER: Record<LineVerdict, { fill: string; icon: string }> = {
+  pass: { fill: 'bg-emerald-500/20 ring-1 ring-emerald-500/60', icon: 'text-emerald-600 dark:text-emerald-400' },
+  fail: { fill: 'bg-red-500/20 ring-1 ring-red-500/60', icon: 'text-red-600 dark:text-red-400' },
+  inconclusive: {
+    fill: 'bg-amber-500/20 ring-1 ring-amber-500/60',
+    icon: 'text-amber-600 dark:text-amber-400',
+  },
+}
+
+/** Hover/`aria-label` detail — the pass/fail/inconclusive fact is legible
+ *  from the marker's colour alone, but the full sentence is one hover away
+ *  (never the only way to read it, per the "no mouse" rule). */
+function verdictDetail(verdict: LineVerdict): string {
+  switch (verdict) {
+    case 'pass':
+      return 'carries a certified pass'
+    case 'fail':
+      return 'carries a proven failure'
+    case 'inconclusive':
+      return 'carries an inconclusive/unverifiable result — not checked as a pass or a fail'
+  }
 }
 
 /** `12s` under a minute, `1m 05s` at/after — never a fabricated percentage
@@ -323,22 +361,38 @@ export function BlackboardLine({ line, onCommit, onDelete, streaming = false, on
   const isEvidence = contentClass === 'evidence'
   const isControl = contentClass === 'control'
 
+  // Colour channel for the origin marker — derived ONLY from this line's
+  // own fenced verdict cards (never streaming text mid-arrival: an unclosed
+  // fence simply does not match yet, so the marker stays neutral until the
+  // card itself is complete, same as the card renderer).
+  const verdict = useMemo(() => lineVerdict(line.text), [line.text])
+  const authorLabel = isAgent ? 'Agent-authored' : isSystem ? 'App-generated' : 'You'
+  const markerTitle = verdict ? `${authorLabel} — ${verdictDetail(verdict)}` : authorLabel
+
   return (
     <div className="group/line flex items-start gap-2 px-3 py-1.5 hover:bg-white/[0.03] rounded-md">
-      {/* Origin marker — subtle, distinguishes agent vs user vs system authorship. */}
+      {/* Origin marker — shape (icon) says who wrote it; colour says what
+          happened, when this line carries a verdict. */}
       <div
         className={cn(
           'mt-1 flex h-4 w-4 shrink-0 items-center justify-center rounded-full',
-          isAgent ? 'bg-accent' : isSystem ? 'bg-muted-foreground/20' : 'bg-primary/20',
+          verdict
+            ? VERDICT_MARKER[verdict].fill
+            : isAgent
+              ? 'bg-accent'
+              : isSystem
+                ? 'bg-muted-foreground/20'
+                : 'bg-primary/20',
         )}
-        title={isAgent ? 'Agent-authored' : isSystem ? 'App-generated' : 'You'}
+        title={markerTitle}
+        aria-label={markerTitle}
       >
         {isAgent ? (
-          <Bot size={10} className="text-foreground" />
+          <Bot size={10} className={verdict ? VERDICT_MARKER[verdict].icon : 'text-foreground'} />
         ) : isSystem ? (
-          <Wrench size={9} className="text-muted-foreground" />
+          <Wrench size={9} className={verdict ? VERDICT_MARKER[verdict].icon : 'text-muted-foreground'} />
         ) : (
-          <User size={10} className="text-primary" />
+          <User size={10} className={verdict ? VERDICT_MARKER[verdict].icon : 'text-primary'} />
         )}
       </div>
 
