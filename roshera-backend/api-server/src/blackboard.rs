@@ -137,9 +137,14 @@ impl BlackboardScope {
 /// locally as `system` and then downgraded to `agent` on the way out
 /// (the alternative, a 422, made the line vanish silently). The result
 /// was a notebook that recorded the app's words as the agent's: on
-/// 2026-08-01, 36 of 38 persisted lines read `agent` and none read
+/// 2026-08-01, 36 of 38 stored lines read `agent` and none read
 /// `system`, including every line no agent had written. A kernel that
 /// cannot lie about geometry should not lie about who said something.
+///
+/// ⚠ "stored" means in-memory only. `BlackboardManager` holds its
+/// notebooks in a `DashMap` and writes nothing to disk, so every line —
+/// the reasoning record this panel exists to keep — is lost on restart.
+/// That is a separate gap from authorship and is not fixed here.
 ///
 /// Consumers must treat this as a THIRD state, not a flavour of agent:
 /// `System` is the machine talking about itself, `Agent` is a model's
@@ -735,7 +740,7 @@ mod tests {
     /// previously carried only `user`/`agent`, so the client downgraded its
     /// machine-written lines to `agent` before sending them — and the board
     /// came back claiming the agent had written the app's own bookkeeping
-    /// (measured 2026-08-01: 36 of 38 persisted lines `agent`, 0 `system`).
+    /// (measured 2026-08-01: 36 of 38 stored lines `agent`, 0 `system`).
     /// A test that only checked `to_string` would not have caught it: the
     /// loss happened on the way IN, at a decoder that had no third value to
     /// decode to. So both directions are asserted, and the lower-case wire
