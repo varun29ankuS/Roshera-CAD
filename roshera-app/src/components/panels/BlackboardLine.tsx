@@ -44,12 +44,69 @@ function formatElapsed(ms: number): string {
  * a quiet note explains that this is normal, and a Stop control lets a
  * user who thinks it hung end the turn instead of reloading the page.
  */
-function TurnStatus({ elapsedMs, onCancel }: { elapsedMs: number; onCancel?: () => void }) {
+/**
+ * What the agent is doing, in a few words, from state we can actually see.
+ *
+ * ⚠ The honest limit: on the default provider path (goose's `claude-code`
+ * bridge) NO `tool_call` frames reach us — tools execute inside the CLI
+ * subprocess and are never surfaced over ACP (verified live across two
+ * full turns, `toolCalls: 0`; see `lib/acp-blackboard.ts`). So this can
+ * never say "looking up ISO 273" or "cutting the bore", and inventing
+ * such a label would be fabricated activity in the one panel whose job is
+ * to be an honest record.
+ *
+ * What IS observable: whether the prompt has been answered with any text
+ * yet, and how long it has been. Once output starts the agent alternates
+ * between writing and running tools invisibly, so the wording stays
+ * "working" rather than "writing" — claiming it is writing while it is
+ * actually mid-tool would be a small lie told constantly.
+ *
+ * Naming the actual operation is possible, but through the BACKEND: our
+ * own MCP server sees every tool invocation even though the ACP stream
+ * does not. That is the wiring that would let this say something real.
+ */
+function turnActivity(elapsedMs: number, hasOutput: boolean): string {
+  if (!hasOutput) {
+    return elapsedMs < 15_000 ? 'Waiting for the model' : 'Still waiting for the model'
+  }
+  return elapsedMs < 90_000 ? 'Working through the request' : 'Still working, longer than usual'
+}
+
+/** Three dots that actually move, so a stalled turn and a live one do not
+ *  look identical — the complaint that started this ("it stopped here,
+ *  there is no way to know if it's actually working"). */
+function EllipsisDots() {
+  return (
+    <span aria-hidden className="inline-flex">
+      <span className="animate-pulse">.</span>
+      <span className="animate-pulse [animation-delay:200ms]">.</span>
+      <span className="animate-pulse [animation-delay:400ms]">.</span>
+    </span>
+  )
+}
+
+function TurnStatus({
+  elapsedMs,
+  hasOutput,
+  onCancel,
+}: {
+  elapsedMs: number
+  hasOutput: boolean
+  onCancel?: () => void
+}) {
   const [stopping, setStopping] = useState(false)
+  const activity = turnActivity(elapsedMs, hasOutput)
   return (
     <div className="mt-1.5 flex flex-wrap items-center gap-2 text-[10px] text-muted-foreground/70">
-      <span className="flex items-center gap-1.5" title="Turn in progress — elapsed time">
-        <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-primary" />
+      <span
+        className="flex items-center gap-1.5 font-medium text-amber-600 dark:text-amber-400"
+        title="What the agent is doing, from what this client can observe. Tool names are not available on this provider path."
+      >
+        <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-amber-500" />
+        <span>{activity}</span>
+        <EllipsisDots />
+      </span>
+      <span className="flex items-center gap-1.5" title="Elapsed time for this turn">
         <span className="font-mono tabular-nums">{formatElapsed(elapsedMs)}</span>
       </span>
       {elapsedMs >= 30_000 && (
@@ -278,7 +335,11 @@ export function BlackboardLine({ line, onCommit, onDelete, streaming = false, on
                 <span className="chalk-cursor" />
               </span>
             )}
-            <TurnStatus elapsedMs={elapsedMs} onCancel={onCancel} />
+            <TurnStatus
+              elapsedMs={elapsedMs}
+              hasOutput={Boolean(line.text.trim())}
+              onCancel={onCancel}
+            />
           </div>
         ) : (
           <button

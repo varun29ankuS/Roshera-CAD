@@ -353,6 +353,8 @@ export class AcpClient {
   private connectionId: string | null = null
   private sessionId: string | null = null
   private _currentModel: string | null = null
+  /** Provider id the backend reported alongside `cwd`. See {@link activeProvider}. */
+  private activeProvider: string | null = null
   private nextRequestId = 1
   private readonly pending = new Map<JsonRpcId, PendingEntry>()
   private connStream: AcpSseStream | null = null
@@ -381,6 +383,16 @@ export class AcpClient {
    *  unresolved `"default"` sentinel. Never a guess. */
   get currentModel(): string | null {
     return this._currentModel
+  }
+
+  /** The provider id backing this session (`anthropic`, `kimi`, …) as
+   *  reported by `GET /api/acp/config`, or `null` before the first
+   *  `newSession()` resolves it or when the backend named none. Drives the
+   *  header's vendor mark ONLY — a null draws no logo rather than a
+   *  default one, since the mark is a claim about who is serving the
+   *  model and a wrong logo is a worse answer than no logo. */
+  get provider(): string | null {
+    return this.activeProvider
   }
 
   /** Subscribe to `session/update` notifications. Returns an unsubscribe fn. */
@@ -615,7 +627,7 @@ export class AcpClient {
           `could not resolve the ACP working directory and no VITE_ACP_CWD override is set`,
       )
     }
-    const body = (await res.json()) as { cwd?: string }
+    const body = (await res.json()) as { cwd?: string; active?: { provider?: string } }
     if (!body.cwd) {
       throw new AcpProtocolError(
         -32000,
@@ -623,6 +635,11 @@ export class AcpClient {
           'directory to serve and no VITE_ACP_CWD override is set',
       )
     }
+    // The same response already names the active provider, so the header's
+    // vendor mark rides along rather than costing a second request. Left
+    // null when absent: an unknown provider draws NO mark, because a
+    // defaulted logo would assert a vendor the backend never reported.
+    this.activeProvider = body.active?.provider ?? null
     this.cwd = body.cwd
     return this.cwd
   }

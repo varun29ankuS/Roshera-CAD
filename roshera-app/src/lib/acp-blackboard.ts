@@ -312,7 +312,11 @@ async function createAndConnect(): Promise<AcpClient> {
   // `client.currentModel` is `null` when `session/new` reported no model
   // (or the unresolved "default" sentinel) — an honest, real state; the
   // header renders "—" for it rather than fabricating a name.
-  useAcpSessionStore.getState().startSession(client.currentModel)
+  // `client.provider` is resolved by the same `GET /api/acp/config` that
+  // `newSession()` already made for the cwd, so the vendor mark costs no
+  // extra request. Null when the backend named no provider — the header
+  // then draws no logo rather than assuming one.
+  useAcpSessionStore.getState().startSession(client.currentModel, client.provider)
   // A stream drop (not just an explicit `resetAcpClient()` call below)
   // must also end the session in the header — a dead connection showing
   // live counts would be worse than showing nothing.

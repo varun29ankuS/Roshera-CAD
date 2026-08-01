@@ -32,6 +32,11 @@ import { create } from 'zustand'
  */
 interface AcpSessionStats {
   model: string | null
+  /** Provider id serving this session, from `GET /api/acp/config` via
+   *  `AcpClient.provider`. `null` when the backend named none — the header
+   *  then draws NO vendor mark, because a defaulted logo would assert a
+   *  vendor nobody reported. */
+  provider: string | null
   turns: number
   tokensUsed: number | null
   contextSize: number | null
@@ -74,13 +79,14 @@ interface AcpSessionStats {
   /** A late-resolving `config_option_update` corrected the model. */
   setModel: (model: string | null) => void
   /** A new session was created — resets every counter. */
-  startSession: (model: string | null) => void
+  startSession: (model: string | null, provider?: string | null) => void
   /** The session ended (stream dropped, or an explicit reset). */
   endSession: () => void
 }
 
 export const useAcpSessionStore = create<AcpSessionStats>((set) => ({
   model: null,
+  provider: null,
   turns: 0,
   tokensUsed: null,
   contextSize: null,
@@ -114,9 +120,10 @@ export const useAcpSessionStore = create<AcpSessionStats>((set) => ({
     }),
 
   setModel: (model) => set({ model }),
-  startSession: (model) =>
+  startSession: (model, provider = null) =>
     set({
       model,
+      provider,
       turns: 0,
       tokensUsed: null,
       contextSize: null,
@@ -127,6 +134,7 @@ export const useAcpSessionStore = create<AcpSessionStats>((set) => ({
   endSession: () =>
     set({
       model: null,
+      provider: null,
       turns: 0,
       tokensUsed: null,
       contextSize: null,

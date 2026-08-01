@@ -22,7 +22,9 @@ import {
   GripHorizontal,
   Plus,
   Trash2,
+  Zap,
 } from 'lucide-react'
+import { VendorMark } from '@/components/settings/vendor-marks'
 
 /**
  * BLACKBOARD
@@ -74,6 +76,26 @@ const TOKENS_TITLE =
   'round-trip, and re-sent context bills far below fresh input. The ' +
   'session figure accumulates across all turns.'
 
+/** How heavy the last turn was, as a colour on the bolt.
+ *
+ *  Deliberately NOT a percentage of the context window. `used` is
+ *  cumulative and legitimately exceeds `size`, so any ratio against the
+ *  window is meaningless — that is the same trap the header already
+ *  refuses in `formatContextUsage`. These are bands on the TURN's own
+ *  size, calibrated against measured turns: a trivial action that made two
+ *  tool calls still moved ~33k because every round-trip replays the whole
+ *  context, so "light" has to start well above zero or everything would
+ *  read as heavy.
+ *
+ *  The colour says how much moved, never how much it cost, and never
+ *  whether the turn was worth it — a 200k turn that built a certified
+ *  assembly is a good turn. */
+function turnWeight(tokens: number): { className: string; label: string } {
+  if (tokens < 40_000) return { className: 'text-emerald-500', label: 'light turn' }
+  if (tokens < 120_000) return { className: 'text-amber-500', label: 'moderate turn' }
+  return { className: 'text-red-500', label: 'heavy turn' }
+}
+
 export function Blackboard() {
   const lines = useBlackboardStore((s) => s.lines)
   const isProcessing = useBlackboardStore((s) => s.isProcessing)
@@ -94,6 +116,7 @@ export function Blackboard() {
   // session-scoped counts, "default" never printed as a model name).
   const acpModel = useAcpSessionStore((s) => s.model)
   const acpTurns = useAcpSessionStore((s) => s.turns)
+  const acpProvider = useAcpSessionStore((s) => s.provider)
   const acpTokens = useAcpSessionStore((s) => s.tokensUsed)
   const acpLastTurnTokens = useAcpSessionStore((s) => s.lastTurnTokens)
   const acpLive = useAcpSessionStore((s) => s.live)
@@ -299,6 +322,20 @@ export function Blackboard() {
                 acpLive ? 'animate-pulse bg-emerald-400' : 'bg-muted-foreground/30',
               )}
             />
+            {/* Vendor mark, drawn only when the backend actually named a
+                provider — see `acp-session-store.ts`'s `provider` doc for
+                why a defaulted logo is refused. */}
+            {acpProvider && (
+              // `displayName` feeds the initials fallback for vendors with no
+              // genuine published mark. The provider id is what the backend
+              // reported, so it is the honest label here — this header has no
+              // access to the allowlist's prettier `display_name`.
+              <VendorMark
+                providerId={acpProvider}
+                displayName={acpProvider}
+                className="h-3 w-3 shrink-0"
+              />
+            )}
             <span className="font-mono">{acpModel ?? '—'}</span>
             {acpLive && (
               <>
@@ -309,8 +346,26 @@ export function Blackboard() {
                 <span className="text-muted-foreground/40">·</span>
                 {/* Turn figure first — it answers "what did THAT cost me",
                     which is the question the bare session total kept
-                    answering wrongly. Absent until a turn completes. */}
-                <span title={TOKENS_TITLE}>
+                    answering wrongly. Absent until a turn completes. The
+                    bolt colours on the TURN's weight, never on a ratio to
+                    the context window (which `used` legitimately exceeds). */}
+                <span
+                  className="inline-flex items-center gap-1"
+                  title={
+                    acpLastTurnTokens !== null
+                      ? `${turnWeight(acpLastTurnTokens).label} — ${TOKENS_TITLE}`
+                      : TOKENS_TITLE
+                  }
+                >
+                  <Zap
+                    size={10}
+                    className={cn(
+                      'shrink-0',
+                      acpLastTurnTokens !== null
+                        ? turnWeight(acpLastTurnTokens).className
+                        : 'text-muted-foreground/40',
+                    )}
+                  />
                   {acpLastTurnTokens !== null ? (
                     <>
                       {formatContextUsage(acpLastTurnTokens)}
