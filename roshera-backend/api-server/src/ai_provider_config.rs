@@ -1226,6 +1226,19 @@ impl AiProviderManager {
     }
 }
 
+/// Serializes every test in this binary that mutates the process-global
+/// `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` environment variables
+/// (this module's child-env scrub proof and `goose_acp`'s lockdown
+/// test, which pins the boot-path scrub call site). Without it, one
+/// test's sentinel `set_var` can land between another's scrub and its
+/// absence assertion under the default parallel runner. Test-only —
+/// production code never takes this lock.
+#[cfg(test)]
+pub(crate) fn anthropic_env_test_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
@@ -1253,6 +1266,73 @@ mod tests {
             checked_path: "C:\\fake\\Anthropic".to_string(),
             present: false,
         }
+    }
+
+    // --- the API-key scrub, proven on a real child's environment ---
+
+    /// THE billing-hazard pin, asserted on the child environment
+    /// actually constructed — not on a comment. goose's
+    /// `claude_code.rs::build_stream_json_command` (verified at the
+    /// pinned rev `022c17c`, lines 332–336) removes ONLY `CLAUDECODE`
+    /// before spawning the Claude CLI; the child otherwise inherits
+    /// this process's environment verbatim (tokio's `Command` spawns
+    /// with inherited env exactly like `std::process::Command` does
+    /// here). So the ONE thing standing between a stale
+    /// `ANTHROPIC_API_KEY` and a CLI that silently bills the API
+    /// instead of the user's Max subscription is
+    /// [`scrub_anthropic_env_for_subscription_mode`] having removed
+    /// both vars from THIS process before the spawn.
+    ///
+    /// This test sets sentinel values for both vars, runs the scrub,
+    /// then spawns a real child process the same inherit-everything way
+    /// goose does and reads the child's own environment dump. If the
+    /// scrub is removed or loses a variable, the sentinel reaches the
+    /// child and this fails. A control variable proves the dump is
+    /// genuinely the child's environment and not an empty read.
+    ///
+    /// The boot-path CALL SITE of the scrub (`goose_acp::initialize`'s
+    /// `ClaudeCode` branch) is pinned separately by
+    /// `goose_acp::tests::goose_lockdown_leaves_exactly_roshera_reachable`,
+    /// under the same [`anthropic_env_test_lock`].
+    #[test]
+    fn anthropic_credentials_scrubbed_from_the_actual_child_environment() {
+        let _guard = anthropic_env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        std::env::set_var("ANTHROPIC_API_KEY", "sk-ant-SENTINEL-must-not-reach-child");
+        std::env::set_var("ANTHROPIC_AUTH_TOKEN", "tok-SENTINEL-must-not-reach-child");
+        std::env::set_var("ROSHERA_SCRUB_TEST_CONTROL", "control-marker-present");
+
+        scrub_anthropic_env_for_subscription_mode();
+
+        #[cfg(windows)]
+        let output = std::process::Command::new("cmd")
+            .args(["/C", "set"])
+            .output()
+            .expect("spawning `cmd /C set` to dump the child environment must succeed");
+        #[cfg(not(windows))]
+        let output = std::process::Command::new("sh")
+            .args(["-c", "env"])
+            .output()
+            .expect("spawning `sh -c env` to dump the child environment must succeed");
+
+        std::env::remove_var("ROSHERA_SCRUB_TEST_CONTROL");
+
+        let child_env = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            child_env.contains("ROSHERA_SCRUB_TEST_CONTROL"),
+            "the control variable must appear in the child's environment dump — \
+             its absence means the dump did not actually capture the child env, \
+             and the two assertions below would be vacuous"
+        );
+        assert!(
+            !child_env.contains("SENTINEL-must-not-reach-child"),
+            "a scrubbed Anthropic credential reached a spawned child's \
+             environment — goose's claude-code spawn path inherits exactly \
+             this environment and would silently bill the API key instead of \
+             the user's Max/Pro subscription. Child env dump:\n{child_env}"
+        );
     }
 
     // --- build_chain: priority + shadowing ---

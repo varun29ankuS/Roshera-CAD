@@ -13,6 +13,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 mod acp_gate;
+mod agent_activity;
 mod agent_registry;
 #[cfg(test)]
 mod agent_registry_tests;
@@ -8742,6 +8743,14 @@ pub(crate) fn build_router(state: AppState) -> Router {
         // `Authorization` credential every non-exempt route already
         // needs — the path itself carries no secret.
         .route("/api/acp/config", get(goose_acp::get_acp_config))
+        // Observed agent activity for the caller's ACP sessions — what
+        // the agent is doing NOW, reconstructed from this server's own
+        // inbound MCP-driven requests (the claude-code ACP stream
+        // carries zero tool_call frames; see `agent_activity`'s module
+        // doc for the honesty contract and the polled-delivery
+        // rationale). Read-only snapshot; classified into the Poll
+        // rate bucket (`auth_middleware::POLL_PREFIXES`).
+        .route("/api/acp/activity", get(agent_activity::get_acp_activity))
         // Metrics endpoint
         .route("/api/metrics", get(metrics::get_metrics))
         // Geometry endpoints
@@ -9850,6 +9859,17 @@ pub(crate) fn build_router(state: AppState) -> Router {
     };
 
     app.layer(axum::middleware::from_fn(agent_author_layer))
+        // Observed-agent-activity recorder (`agent_activity`): for any
+        // request whose validated credential is a
+        // `PrincipalKind::Agent` API key, records what/when/outcome
+        // against the ACP session that key was minted for — after the
+        // response exists, never speculatively. Sits inside the auth
+        // layer (it needs the extensions auth inserts) alongside
+        // `agent_author_layer`, which solves the same attribution
+        // problem for the timeline.
+        .layer(axum::middleware::from_fn(
+            agent_activity::record_agent_operations,
+        ))
         .layer(axum::middleware::from_fn_with_state(
             idempotency_store,
             idempotency::idempotency_layer,

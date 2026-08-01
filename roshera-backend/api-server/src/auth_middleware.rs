@@ -271,7 +271,14 @@ async fn auth_middleware_inner(
     let auth_info = if let Some(token) = auth_header.strip_prefix("Bearer ") {
         validate_jwt(layer.auth_manager.as_ref(), token).await?
     } else if let Some(api_key) = auth_header.strip_prefix("ApiKey ") {
-        validate_api_key(layer.auth_manager.as_ref(), api_key).await?
+        let (info, key_identity) = validate_api_key(layer.auth_manager.as_ref(), api_key).await?;
+        // The verified key's id, exposed to downstream layers so
+        // `agent_activity::record_agent_operations` can attribute an
+        // agent request to the ACP session whose per-session key this
+        // is — the key id is the one certain link (see that module's
+        // attribution contract).
+        request.extensions_mut().insert(key_identity);
+        info
     } else {
         return Err(AuthError {
             error: "Invalid authorization format".to_string(),
@@ -491,11 +498,14 @@ async fn validate_jwt(auth_manager: &AuthManager, token: &str) -> Result<AuthInf
     }
 }
 
-/// Validate API key
+/// Validate API key. Returns the derived `AuthInfo` together with the
+/// verified key's identity (`agent_activity::ApiKeyIdentity`) so the
+/// caller can expose the key id — never the secret — to downstream
+/// attribution layers.
 async fn validate_api_key(
     auth_manager: &AuthManager,
     api_key: &str,
-) -> Result<AuthInfo, AuthError> {
+) -> Result<(AuthInfo, crate::agent_activity::ApiKeyIdentity), AuthError> {
     match auth_manager.verify_api_key(api_key) {
         Ok(key_info) => {
             info!("API key validated for user: {}", key_info.user_id);
@@ -518,14 +528,17 @@ async fn validate_api_key(
                 .filter_map(|p| Permission::from_str(p))
                 .collect();
 
-            Ok(AuthInfo {
-                user_id: key_info.user_id,
-                session_id: None,
-                permissions,
-                roles: vec!["api_user".to_string()], // API key role
-                is_api_key: true,
-                principal: key_info.principal,
-            })
+            Ok((
+                AuthInfo {
+                    user_id: key_info.user_id,
+                    session_id: None,
+                    permissions,
+                    roles: vec!["api_user".to_string()], // API key role
+                    is_api_key: true,
+                    principal: key_info.principal,
+                },
+                crate::agent_activity::ApiKeyIdentity(key_info.id),
+            ))
         }
         Err(e) => {
             warn!("API key validation failed: {}", e);
@@ -651,6 +664,11 @@ const POLL_PREFIXES: &[&str] = &[
     "/api/scene",
     "/api/agent",
     "/api/viewport",
+    // Read-only observed-agent-activity snapshot (`agent_activity.rs`),
+    // polled ~1 Hz by the Blackboard while a turn runs — it must not
+    // drain the caller's Mutation budget. GET-only route; the method
+    // check in `classify_request` keeps this listing safe regardless.
+    "/api/acp/activity",
 ];
 
 fn is_poll_prefix(path: &str) -> bool {
@@ -858,9 +876,13 @@ mod tests {
             .await
             .expect("provisioning must succeed");
 
-        let decoded = validate_api_key(&auth_manager, &raw_key)
+        let (decoded, key_identity) = validate_api_key(&auth_manager, &raw_key)
             .await
             .expect("a freshly minted, unexpired key must validate");
+        assert!(
+            !key_identity.0.is_empty(),
+            "the verified key's id must ride along for downstream attribution"
+        );
 
         let decoded_set: std::collections::HashSet<Permission> =
             decoded.permissions.into_iter().collect();

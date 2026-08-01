@@ -667,10 +667,24 @@ pub(crate) fn acp_router(
         },
     ));
     let router = goose::acp::transport::create_acp_router(server);
-    Some(router.layer(axum::middleware::from_fn_with_state(
-        (auth_manager, ai_provider_manager),
-        inject_roshera_mcp_server,
-    )))
+    // `observe_acp_transport` (agent_activity) is layered OUTSIDE the
+    // injection middleware (and still inside `acp_gate` + auth, both
+    // applied at the merge site): it watches `session/prompt` /
+    // `session/cancel` POSTs for turn bookkeeping, tees the SSE GET
+    // response (where goose delivers the `session/new` response that
+    // carries the sessionId this surface's minted key must bind to —
+    // the POST itself returns a bare 202), and cleans up on connection
+    // DELETE. Pure observation: every byte is forwarded untouched.
+    Some(
+        router
+            .layer(axum::middleware::from_fn_with_state(
+                (auth_manager, ai_provider_manager),
+                inject_roshera_mcp_server,
+            ))
+            .layer(axum::middleware::from_fn(
+                crate::agent_activity::observe_acp_transport,
+            )),
+    )
 }
 
 /// Extension name Roshera's own MCP server is injected under. Every
@@ -771,6 +785,9 @@ async fn inject_roshera_mcp_server(
             .run(Request::from_parts(parts, Body::from(bytes)))
             .await;
     }
+    // Captured before `message` is mutably borrowed below; consumed by
+    // the attribution hooks just before the request is forwarded.
+    let is_session_load = matches!(method, Some("session/load"));
 
     // Apply the user's server-side model selection (`PUT
     // /api/ai/provider`'s `model` field) before this request reaches
@@ -811,7 +828,7 @@ async fn inject_roshera_mcp_server(
         .into_response();
     };
 
-    let (raw_key, _api_key) = match mint_agent_session_key(&auth_manager, &auth_info).await {
+    let (raw_key, api_key) = match mint_agent_session_key(&auth_manager, &auth_info).await {
         Ok(minted) => minted,
         Err(error) => {
             return ApiError::new(
@@ -821,6 +838,36 @@ async fn inject_roshera_mcp_server(
             .into_response();
         }
     };
+
+    // Attribution material for `agent_activity` (see that module's
+    // doc): the minted key's id is the one certain link between the
+    // MCP server this request injects and the ACP session goose is
+    // about to create/load. The agent label is read back off the
+    // minted key's own `PrincipalKind::Agent { model }` — the exact
+    // string the timeline will record — never re-derived here.
+    let pending_binding = crate::agent_activity::PendingAgentKey {
+        key_id: api_key.id.clone(),
+        user_id: auth_info.user_id.clone(),
+        agent_label: match &api_key.principal {
+            session_manager::PrincipalKind::Agent { model } => model.clone(),
+            _ => UNKNOWN_MODEL_LABEL.to_string(),
+        },
+        created_at: chrono::Utc::now(),
+    };
+    let acp_connection_id = parts
+        .headers
+        .get("acp-connection-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let rpc_id = message
+        .get("id")
+        .filter(|id| !id.is_null())
+        .map(|id| id.to_string());
+    let loaded_session_id = message
+        .get("params")
+        .and_then(|p| p.get("sessionId"))
+        .and_then(|s| s.as_str())
+        .map(str::to_string);
 
     let mcp_server_entry = roshera_mcp_server_json(mcp_entry_path, &raw_key);
 
@@ -865,6 +912,30 @@ async fn inject_roshera_mcp_server(
     // downstream that consults it rather than the Body's own framing.
     if let Ok(value) = HeaderValue::from_str(&new_bytes.len().to_string()) {
         parts.headers.insert(header::CONTENT_LENGTH, value);
+    }
+
+    // Register the attribution binding only now, when the rewritten
+    // request is definitely being forwarded — a mint that failed to
+    // reach goose must not leave a binding claiming it did.
+    //
+    // `session/load` names its session id in the request, so the key
+    // binds immediately and with certainty. `session/new` has no id
+    // yet: the pending entry is keyed by (connection, JSON-RPC id) and
+    // completed by the response `observe_acp_transport`'s SSE tee sees
+    // (the POST response is a bare 202 — the sessionId only ever
+    // travels on the SSE stream). A request missing its connection
+    // header or id is refused by the upstream transport anyway;
+    // nothing is registered for it.
+    if is_session_load {
+        if let Some(session_id) = loaded_session_id.as_deref() {
+            crate::agent_activity::global().bind_loaded_session(
+                session_id,
+                acp_connection_id.as_deref(),
+                pending_binding,
+            );
+        }
+    } else if let (Some(conn), Some(rpc_id)) = (acp_connection_id.as_deref(), rpc_id.as_deref()) {
+        crate::agent_activity::global().note_pending_session_new(conn, rpc_id, pending_binding);
     }
 
     next.run(Request::from_parts(parts, Body::from(new_bytes)))
@@ -1110,7 +1181,40 @@ mod tests {
         let provider_pin = crate::ai_provider_config::BootProviderPin::ClaudeCode {
             cli_path: std::path::PathBuf::from(fake_claude_cli_path),
         };
+
+        // TASK-1 billing-hazard pin, boot-path half: `initialize()`'s
+        // `ClaudeCode` branch MUST scrub ANTHROPIC_API_KEY /
+        // ANTHROPIC_AUTH_TOKEN from the process environment — goose's
+        // claude-code spawn removes only `CLAUDECODE`, so whatever is in
+        // this process's env at spawn time IS the CLI's env, and an
+        // inherited key silently bills the API instead of the user's
+        // Max/Pro subscription. Sentinels are planted before the call
+        // and asserted gone after it; remove the scrub call from
+        // `initialize` and this fails. The env-to-child propagation half
+        // (a real spawned child's environment) is proven by
+        // `ai_provider_config::tests::anthropic_credentials_scrubbed_from_the_actual_child_environment`,
+        // under the same lock — which serializes the two tests' mutation
+        // of these process-global variables.
+        let env_guard = crate::ai_provider_config::anthropic_env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::env::set_var("ANTHROPIC_API_KEY", "sk-ant-BOOT-SENTINEL");
+        std::env::set_var("ANTHROPIC_AUTH_TOKEN", "tok-BOOT-SENTINEL");
+
         let goose_root = initialize(&provider_pin).expect("goose lockdown boot must succeed");
+
+        assert!(
+            std::env::var_os("ANTHROPIC_API_KEY").is_none(),
+            "initialize()'s ClaudeCode branch must scrub ANTHROPIC_API_KEY \
+             from the process env — the spawned Claude CLI inherits it and \
+             silently bills the API instead of the Max subscription"
+        );
+        assert!(
+            std::env::var_os("ANTHROPIC_AUTH_TOKEN").is_none(),
+            "initialize()'s ClaudeCode branch must scrub ANTHROPIC_AUTH_TOKEN \
+             from the process env — same billing hazard as ANTHROPIC_API_KEY"
+        );
+        drop(env_guard);
         assert!(
             goose_root.join("config").join("config.yaml").exists(),
             "initialize() must materialize the goose config file it locked down"
