@@ -11,6 +11,7 @@ import {
   saveBinary,
   defaultSaveDir,
 } from "../core.js";
+import { ACK_UNSOUND } from "./modify.js";
 
 export function registerIoTools(server: ToolHost) {
   server.tool(
@@ -135,10 +136,15 @@ export function registerIoTools(server: ToolHost) {
     "Generate a 2D engineering DRAWING: four-view sheet (Front/Top/Right + iso), " +
       "hidden-line removal, centerlines, ISO-129 deduped dimensions. Returns the " +
       "drawing id + a QUALITY report (label collisions, redundant dims); treat " +
-      "passed:false like a watertightness failure.",
+      "passed:false like a watertightness failure. ENFORCED: refused while the " +
+      "part's live verdict is unsound — a sheet would print the defect as " +
+      "dimensioned truth (acknowledge_unsound for a deliberate inspection sheet).",
     {
       part_id: z.number().int().describe("kernel part/solid id from list_parts"),
       name: z.string().optional().describe("title-block name for the sheet"),
+      // Read by the dispatch gate only (gates.ts); never forwarded to the
+      // backend — the handler below deliberately ignores it.
+      acknowledge_unsound: ACK_UNSOUND,
     },
     async ({ part_id, name }) => {
       try {
@@ -167,7 +173,11 @@ export function registerIoTools(server: ToolHost) {
     "drawing_export_sheet",
     "SAVE the RENDERED sheet from make_drawing to disk as a PDF/DXF/SVG FILE — " +
       "the shop-ready sheet — and return the absolute path. For the queryable " +
-      "semantic data (not a file) use drawing_read_semantics instead.",
+      "semantic data (not a file) use drawing_read_semantics instead. " +
+      "ENFORCED: refused while the sheet's live certificate carries stale/" +
+      "dangling facts (regenerate with make_drawing — no override) or " +
+      "Error-severity layout findings (acknowledge_layout_issues for a " +
+      "draft-for-review export). An uncertified sheet cannot become a file.",
     {
       drawing_id: z.string().uuid().describe("drawing_id from make_drawing"),
       format: z.enum(["pdf", "dxf", "svg"]).default("pdf").describe("output file format"),
@@ -179,6 +189,16 @@ export function registerIoTools(server: ToolHost) {
         .string()
         .optional()
         .describe("absolute destination path; overrides file_name/Desktop"),
+      // Read by the dispatch gate only (gates.ts); never forwarded to the
+      // backend — the handler below deliberately ignores it.
+      acknowledge_layout_issues: z
+        .boolean()
+        .optional()
+        .describe(
+          "draft-for-review override: export although the sheet's layout-" +
+            "quality certificate has Error findings (otherwise refused). " +
+            "Never bypasses stale/dangling facts.",
+        ),
     },
     async ({ drawing_id, format, file_name, save_path }) => {
       try {

@@ -28,7 +28,7 @@ import {
  * a rebuild from a known-good state). The flag is read by the dispatch gate
  * only; it is never forwarded to the backend.
  */
-const ACK_UNSOUND = z
+export const ACK_UNSOUND = z
   .boolean()
   .optional()
   .describe(

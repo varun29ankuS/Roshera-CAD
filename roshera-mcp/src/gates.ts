@@ -42,6 +42,32 @@
  *      op proceeds and its own ambient certificate still tells the truth —
  *      proceeding without a pre-flight fact is not an approximation, because
  *      nothing is asserted; refusing on a transport hiccup would be.
+ *      `make_drawing` rides this gate too: a sheet projected from a defective
+ *      solid prints that defect as dimensioned truth, and the only honest
+ *      exception (an inspection sheet OF the defect) is exactly what
+ *      acknowledge_unsound exists to express.
+ *
+ *   4. SHEET-EXPORT GATE (2026-08-01 drawing-harness pass). Export is the one
+ *      moment a drawing stops being live data and becomes a shop artifact —
+ *      a PDF/DXF on disk carries NO ambient certificate, so unlike a kernel
+ *      op there is no downstream truth-teller after this point. Before
+ *      `drawing_export_sheet` runs, the sheet's LIVE certificate is read:
+ *        - stale or dangling facts (the model moved since projection, or a
+ *          referenced face is gone) → refused, NO bypass — regenerating with
+ *          make_drawing is one cheap call that is never impossible, and a
+ *          sheet whose printed dimensions disagree with the model must never
+ *          reach a shop;
+ *        - layout-quality Errors (label collisions, redundant dims — the
+ *          findings a checker rejects on sight) → refused unless
+ *          acknowledge_layout_issues:true (the draft-for-human-review flow:
+ *          sometimes the defective layout is exactly what a human asked to
+ *          see);
+ *        - certificate unreadable → refused. This inverts gate 3's
+ *          fail-open: gate 3 may proceed because the op's own certificate
+ *          still tells the truth afterwards; an exported file asserts every
+ *          printed dimension and can never re-verify itself, so exporting
+ *          uncertified WOULD be an approximation labeled as exact.
+ *      All three are live facts and are never served from the refusal cache.
  */
 
 import { api, PERCEPTION_TIMEOUT_MS } from "./core.js";
@@ -210,7 +236,24 @@ const BASE_REFS: Record<
   transform: (a) => [{ uuid: a?.object }],
   fillet_edges: (a) => [{ part_id: a?.part_id }],
   chamfer_edges: (a) => [{ part_id: a?.part_id }],
+  // Not a solid mutation, but the same inheritance argument: a sheet projected
+  // from an unsound solid dimensions the defect as truth. acknowledge_unsound
+  // is the deliberate inspection-sheet flow (a drawing OF the defect).
+  make_drawing: (a) => [{ part_id: a?.part_id }],
 };
+
+/**
+ * Gates whose underlying fact is LIVE state (kernel verdicts, sheet
+ * certificates) that another author can change without a call from this
+ * session. Their refusals are never cached — every re-issue re-reads the
+ * live fact, so repair by anyone unblocks the call immediately.
+ */
+const LIVE_FACT_GATES = new Set<string>([
+  "unsound_base",
+  "sheet_unsound",
+  "sheet_quality",
+  "sheet_uncertified",
+]);
 
 /**
  * Checkpoint names that name a sequence position instead of a design intent
@@ -360,6 +403,106 @@ function unsoundBaseGateRefusal(
   });
 }
 
+// ─── Sheet-export gate (gate 4) ─────────────────────────────────────────────
+
+/**
+ * The live sheet certificate for a drawing, or null when it cannot be read.
+ * Uses the DEFAULT api timeout, not the short perception budget: the semantic
+ * endpoint re-measures every fact against the live model, and a spuriously
+ * short budget would refuse honest sheets on slow days — this gate fails
+ * CLOSED, so its pre-flight read deserves the full budget.
+ */
+async function liveSheetCertificate(drawingId: string): Promise<any | null> {
+  try {
+    const r = await api("GET", `/api/drawings/${drawingId}/semantic`);
+    const cert = r?.certificate;
+    return cert && typeof cert === "object" ? cert : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Refusal for drawing_export_sheet, or null to let the export proceed.
+ * Checked in severity order: certificate unreadable, then stale/dangling
+ * facts, then layout-quality Errors (the only one with a bypass).
+ */
+async function sheetExportGate(args: any): Promise<any | null> {
+  const drawingId =
+    typeof args?.drawing_id === "string" ? args.drawing_id : null;
+  if (drawingId === null) return null; // schema validation rejects it loudly
+  const cert = await liveSheetCertificate(drawingId);
+
+  if (cert === null) {
+    return gateRefusal({
+      gate: "sheet_uncertified",
+      reason:
+        `the live certificate for drawing ${drawingId} could not be read, so ` +
+        "nothing certifies its printed dimensions against the current model — " +
+        "and a PDF/DXF/SVG on disk can never re-verify itself. Exporting an " +
+        "uncertified sheet would ship an approximation labeled as exact.",
+      how_to_proceed:
+        "Confirm the drawing_id (make_drawing returned it) and that the " +
+        "backend is reachable, read the certificate with " +
+        "drawing_read_semantics, then re-issue this call. This refusal is " +
+        "re-evaluated live on every attempt.",
+    });
+  }
+
+  const counts = cert.counts ?? {};
+  const stale = Number(counts.stale ?? 0);
+  const dangling = Number(counts.dangling ?? 0);
+  if (cert.sound === false || stale > 0 || dangling > 0) {
+    const facts: any[] = Array.isArray(cert.facts) ? cert.facts : [];
+    const offending = facts
+      .filter(
+        (f) => f?.live?.verdict === "stale" || f?.live?.verdict === "dangling",
+      )
+      .slice(0, 8)
+      .map((f) => `${f.label} [${f.live.verdict}]`);
+    return gateRefusal({
+      gate: "sheet_unsound",
+      reason:
+        `drawing ${drawingId} is UNSOUND against the live model: ${stale} ` +
+        `stale fact(s) (the model moved since this sheet was projected) and ` +
+        `${dangling} dangling fact(s) (a referenced face no longer exists). ` +
+        "A sheet whose printed dimensions disagree with the model would have " +
+        "a shop machine the wrong part.",
+      unsound_facts: offending,
+      how_to_proceed:
+        "Regenerate the sheet from the current model with make_drawing (it " +
+        "returns a new drawing_id) and export that. There is no override: " +
+        "regeneration is one cheap call, and no flow legitimately ships a " +
+        "sheet that disagrees with the model it claims to describe.",
+    });
+  }
+
+  const quality = cert.quality ?? null;
+  if (quality?.passed === false && args?.acknowledge_layout_issues !== true) {
+    const issues: any[] = Array.isArray(quality.issues) ? quality.issues : [];
+    const errors = issues
+      .filter((i) => String(i?.severity ?? "").toLowerCase() === "error")
+      .slice(0, 8)
+      .map((i) => (i?.view ? `${i.view}: ${i.message}` : i?.message));
+    return gateRefusal({
+      gate: "sheet_quality",
+      reason:
+        `drawing ${drawingId} failed its layout-quality certificate — ` +
+        `${errors.length ? errors.length : issues.length} Error-severity ` +
+        "finding(s) (label collisions, redundant dimensions, broken view " +
+        "arrangement): exactly what a drawing checker rejects on sight.",
+      layout_errors: errors,
+      how_to_proceed:
+        "Regenerate with make_drawing after fixing the cause where possible. " +
+        "If a human asked to see the defective layout itself (a draft for " +
+        "review, not a shop release), re-issue this exact call with " +
+        "acknowledge_layout_issues: true.",
+    });
+  }
+
+  return null;
+}
+
 /**
  * Pre-dispatch gate, called by the ToolTable wrapper before the real handler.
  * Returns a refusal result (the call never reaches the kernel) or null (the
@@ -424,6 +567,11 @@ export async function preDispatchGate(
     }
   }
 
+  // 4. Sheet-export gate (live certificate; fails CLOSED — see module doc).
+  if (tool === "drawing_export_sheet") {
+    return sheetExportGate(args);
+  }
+
   return null;
 }
 
@@ -431,8 +579,8 @@ export async function preDispatchGate(
  * Post-dispatch bookkeeping, called by the ToolTable wrapper with whatever
  * the call produced (a gate refusal, a handler result, or a cache replay).
  *  - A typed refusal is cached for the identical-re-issue answer — except
- *    unsound_base refusals, whose underlying fact is live kernel state (see
- *    module doc).
+ *    LIVE_FACT_GATES refusals (unsound bases, sheet certificates), whose
+ *    underlying fact is live state (see module doc).
  *  - A non-refusal outcome from any state-changing tool drops the whole
  *    cache: the world may have changed, so every refusal must be re-earned.
  *  - A successful timeline_checkpoint opens the session's intent; a
@@ -446,7 +594,9 @@ export function recordDispatchOutcome(
 ): void {
   const refusal = typedRefusalOf(result);
   if (refusal) {
-    if (refusal.gate === "unsound_base") return; // live fact — never cached
+    if (refusal.gate !== undefined && LIVE_FACT_GATES.has(refusal.gate)) {
+      return; // live fact — never cached
+    }
     const key = refusalKey(tool, args);
     if (!refusalCache.has(key)) {
       if (refusalCache.size >= REFUSAL_CACHE_MAX) {
