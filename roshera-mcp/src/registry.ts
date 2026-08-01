@@ -17,6 +17,7 @@
 
 import { z } from "zod";
 import { toJsonSchemaCompat } from "@modelcontextprotocol/sdk/server/zod-json-schema-compat.js";
+import { nextTurn } from "./core.js";
 
 // ─── The capture shim ──────────────────────────────────────────────────────
 
@@ -86,7 +87,17 @@ export class ToolTable implements ToolHost {
       // A duplicate name would silently shadow — refuse loudly at load time.
       throw new Error(`duplicate tool registration: ${t.name}`);
     }
-    this.tools.set(t.name, t);
+    // Tick the session turn counter (image-expiry policy, core.ts) exactly once
+    // per handler dispatch, regardless of call path — direct mount (index.ts),
+    // invoke() (metatools.ts), or cad_program()'s batch loop all call
+    // `entry.handler(...)`, so wrapping it HERE is the single choke point that
+    // covers all three without touching any of them.
+    const rawHandler = t.handler;
+    const wrapped: RegisteredTool["handler"] = (args, extra) => {
+      nextTurn();
+      return rawHandler(args, extra);
+    };
+    this.tools.set(t.name, { ...t, handler: wrapped });
   }
 
   get(name: string): RegisteredTool | undefined {

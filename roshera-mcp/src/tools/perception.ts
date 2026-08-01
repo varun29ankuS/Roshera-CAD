@@ -2,7 +2,16 @@
 
 import type { ToolHost } from "../registry.js";
 import { z } from "zod";
-import { api, ok, fail, ApiError } from "../core.js";
+import {
+  api,
+  ok,
+  fail,
+  ApiError,
+  imageFreshness,
+  recordImageSent,
+  lastPartMutationTurn,
+  lastGlobalMutationTurnValue,
+} from "../core.js";
 
 export function registerPerceptionTools(server: ToolHost) {
   server.tool(
@@ -25,9 +34,20 @@ export function registerPerceptionTools(server: ToolHost) {
           "GET",
           `/api/agent/parts/${part_id}/render?mode=${mode}&view=${view}&size=${size}`,
         );
-        const content: any[] = [
-          { type: "image", data: r.png_base64, mimeType: "image/png" },
-        ];
+        // IMAGE EXPIRY (turn-count + mutation, see core.ts): resend real pixels
+        // only when this exact view is new, the part changed since the last
+        // look, or the TTL window elapsed — otherwise withhold pixels and say
+        // so explicitly (never silently drop them).
+        const imgKey = `render_part:${part_id}:${mode}:${view}`;
+        const watermark = lastPartMutationTurn(part_id);
+        const fresh = imageFreshness(imgKey, watermark);
+        const content: any[] = [];
+        if (fresh.send) {
+          content.push({ type: "image", data: r.png_base64, mimeType: "image/png" });
+          recordImageSent(imgKey, watermark, `render_part part_id=${part_id} mode=${mode} view=${view}`);
+        } else {
+          content.push({ type: "text", text: `IMAGE UNCHANGED — ${fresh.note}` });
+        }
         if (mode === "ids") {
           content.push({
             type: "text",
@@ -124,15 +144,24 @@ export function registerPerceptionTools(server: ToolHost) {
           "GET",
           `/api/agent/scene/orbit?az=${az}&el=${el}&mode=${mode}&size=${size}&quality=${quality}`,
         );
-        return {
-          content: [
-            { type: "image" as const, data: r.png_base64, mimeType: "image/png" },
-            {
-              type: "text" as const,
-              text: `scene az=${az}° el=${el}° dir=${JSON.stringify(r.dir)} open=${r.open_edges} nm=${r.nonmanifold_edges}`,
-            },
-          ],
-        };
+        // IMAGE EXPIRY: scene_view composites EVERY part, so its cache watermark
+        // is the GLOBAL mutation turn (any part created/changed/deleted since
+        // the last scene look invalidates it), not any single part's.
+        const imgKey = `scene_view:${mode}:${az}:${el}:${quality}`;
+        const watermark = lastGlobalMutationTurnValue();
+        const fresh = imageFreshness(imgKey, watermark);
+        const content: any[] = [];
+        if (fresh.send) {
+          content.push({ type: "image" as const, data: r.png_base64, mimeType: "image/png" });
+          recordImageSent(imgKey, watermark, `scene_view az=${az} el=${el} mode=${mode}`);
+        } else {
+          content.push({ type: "text" as const, text: `IMAGE UNCHANGED — ${fresh.note}` });
+        }
+        content.push({
+          type: "text" as const,
+          text: `scene az=${az}° el=${el}° dir=${JSON.stringify(r.dir)} open=${r.open_edges} nm=${r.nonmanifold_edges}`,
+        });
+        return { content };
       } catch (e) {
         return fail(e);
       }
@@ -254,15 +283,23 @@ export function registerPerceptionTools(server: ToolHost) {
       try {
         const q = `nx=${normal[0]}&ny=${normal[1]}&nz=${normal[2]}&px=${p[0]}&py=${p[1]}&pz=${p[2]}`;
         const r = await api("GET", `/api/agent/parts/${part_id}/section?${q}`);
-        return {
-          content: [
-            { type: "image" as const, data: r.png_base64, mimeType: "image/png" },
-            {
-              type: "text" as const,
-              text: `section area=${r.section_area?.toFixed?.(2)} extent_u=${r.extent_u?.toFixed?.(2)} extent_v=${r.extent_v?.toFixed?.(2)} units=${r.units}`,
-            },
-          ],
-        };
+        // IMAGE EXPIRY: a section cut of `part_id` depends only on that part's
+        // own geometry, so its cache watermark is that part's mutation turn.
+        const imgKey = `section_view:${part_id}:${p.join(",")}:${normal.join(",")}`;
+        const watermark = lastPartMutationTurn(part_id);
+        const fresh = imageFreshness(imgKey, watermark);
+        const content: any[] = [];
+        if (fresh.send) {
+          content.push({ type: "image" as const, data: r.png_base64, mimeType: "image/png" });
+          recordImageSent(imgKey, watermark, `section_view part_id=${part_id} p=${p.join(",")} normal=${normal.join(",")}`);
+        } else {
+          content.push({ type: "text" as const, text: `IMAGE UNCHANGED — ${fresh.note}` });
+        }
+        content.push({
+          type: "text" as const,
+          text: `section area=${r.section_area?.toFixed?.(2)} extent_u=${r.extent_u?.toFixed?.(2)} extent_v=${r.extent_v?.toFixed?.(2)} units=${r.units}`,
+        });
+        return { content };
       } catch (e) {
         return fail(e);
       }
