@@ -39,6 +39,13 @@ function card(kind: string, payload: unknown): string {
   return `${FENCE}roshera:${kind}\n${JSON.stringify(payload, null, 2)}\n${FENCE}`
 }
 
+/** `roshera:choices` is hand-authored YAML (`.goosehints`), not a JSON echo
+ *  of a wire type — see `lib/blackboard-cards.ts`. Written literally here so
+ *  this fixture is the exact shape an agent emits, not a JSON stand-in. */
+function yamlCard(kind: string, body: string): string {
+  return `${FENCE}roshera:${kind}\n${body}\n${FENCE}`
+}
+
 // ── Fixture payloads (shapes verified; numbers illustrative) ──────────
 
 const FCF_CERTIFIED_IN_SPEC = card('fcf', {
@@ -174,6 +181,46 @@ const DFM_PASS = card('dfm', {
   },
   unit: '°',
 })
+
+const CHOICES_OPEN = yamlCard(
+  'choices',
+  [
+    'question: Which clearance class for the M8 holes?',
+    'options:',
+    '  - value: close',
+    '    label: Close (H12) - 9.0 mm',
+    '    detail: tighter location, less assembly slop',
+    '  - value: medium',
+    '    label: Medium (H13) - 10.0 mm',
+    '    detail: the usual default for bolted joints',
+    '  - value: free',
+    '    label: Free (H14) - 10.5 mm',
+    '    detail: easiest assembly, most lateral play',
+  ].join('\n'),
+)
+
+const CHOICES_ANSWERED = yamlCard(
+  'choices',
+  [
+    'question: Which clearance class for the M8 holes?',
+    'options:',
+    '  - value: close',
+    '    label: Close (H12) - 9.0 mm',
+    '    detail: tighter location, less assembly slop',
+    '  - value: medium',
+    '    label: Medium (H13) - 10.0 mm',
+    '    detail: the usual default for bolted joints',
+    '  - value: free',
+    '    label: Free (H14) - 10.5 mm',
+    '    detail: easiest assembly, most lateral play',
+    'selected: medium',
+  ].join('\n'),
+)
+
+const CHOICES_MALFORMED = yamlCard(
+  'choices',
+  ['question: Which clearance class for the M8 holes?', 'options: []'].join('\n'),
+)
 
 const REFUSAL = card('refusal', {
   reason:
@@ -340,6 +387,21 @@ const CARD_FIXTURES: Array<{ title: string; note: string; source: string }> = [
     title: 'DFM — proven pass',
     note: 'Bounded-analytic margin with its enclosure and handbook provenance.',
     source: DFM_PASS,
+  },
+  {
+    title: 'Choices — open question',
+    note: 'A `roshera:choices` fence (YAML, per .goosehints) renders as clickable option buttons — no retyping. In the static gallery below the buttons are inert (no owning line to answer); in the live panel above, clicking sends the value as the next turn.',
+    source: CHOICES_OPEN,
+  },
+  {
+    title: 'Choices — answered',
+    note: '`selected` is written by the UI once a button is clicked, never by the agent — the record of which option was chosen, with every other option disabled, so the board never looks like an open question after it has been answered.',
+    source: CHOICES_ANSWERED,
+  },
+  {
+    title: 'Choices — malformed (empty option list)',
+    note: 'Schema-invalid input (here: zero options, which the schema requires at least one of) renders as raw text with the validation error, exactly like every other typed card — never a guessed or half-built card.',
+    source: CHOICES_MALFORMED,
   },
   {
     title: 'Typed refusal',

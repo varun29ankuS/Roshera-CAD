@@ -1,6 +1,7 @@
-import { ShieldCheck } from 'lucide-react'
+import type { ComponentType } from 'react'
+import { Droplet, Eye, ShieldCheck } from 'lucide-react'
 import type { SoundnessCard as SoundnessCardData } from '@/lib/blackboard-cards'
-import { CardShell, Chip, Claim, KV, type CardAccent } from './card-chrome'
+import { CardShell, Chip, Claim, ClaimBadge, KV, type CardAccent } from './card-chrome'
 import { eulerGenus, fmtNum } from './format'
 
 /**
@@ -12,24 +13,37 @@ import { eulerGenus, fmtNum } from './format'
  * that did not run is not a check that passed. `sound` is the authoritative
  * conjunction only when the full certificate ran; a partial certificate is
  * shown as partial, never rounded up.
+ *
+ * The nine invariants render as a wrapped row of compact `ClaimBadge`s (not
+ * a vertical list — Varun, 2026-08-01: a sound part should read as one
+ * glance of green, and nine lines all saying "fine" buries the one that
+ * doesn't). A genuinely recognisable pictograph is used where one exists
+ * (a droplet for "watertight", an eye for the dual-eye consistency check —
+ * both common enough that no legend is needed); every other invariant is an
+ * abstract B-Rep/topology term with no real-world icon, so it keeps its
+ * short text label rather than inventing a private glyph. Full detail is on
+ * hover either way.
  */
-
-const INVARIANTS: ReadonlyArray<[keyof SoundnessCardData & string, string]> = [
-  ['brep_valid', 'B-Rep'],
-  ['watertight', 'watertight'],
-  ['manifold', 'manifold'],
-  ['self_intersection_free', 'self-intersection-free'],
-  ['construction_consistent', 'construction'],
-  ['labels_consistent', 'labels'],
-  ['tessellation_clean', 'tessellation'],
-  ['mesh_quality_clean', 'mesh quality'],
-  ['eyes_consistent', 'dual-eye'],
+const INVARIANTS: ReadonlyArray<{
+  key: keyof SoundnessCardData & string
+  label: string
+  glyph?: ComponentType<{ size?: number | string; className?: string }>
+}> = [
+  { key: 'brep_valid', label: 'B-Rep' },
+  { key: 'watertight', label: 'watertight', glyph: Droplet },
+  { key: 'manifold', label: 'manifold' },
+  { key: 'self_intersection_free', label: 'self-int.' },
+  { key: 'construction_consistent', label: 'construction' },
+  { key: 'labels_consistent', label: 'labels' },
+  { key: 'tessellation_clean', label: 'tessellation' },
+  { key: 'mesh_quality_clean', label: 'mesh quality' },
+  { key: 'eyes_consistent', label: 'dual-eye', glyph: Eye },
 ]
 
 export function SoundnessCard({ card }: { card: SoundnessCardData }) {
   const sound = card.sound ?? null
   const accent: CardAccent = sound === true ? 'pass' : sound === false ? 'fail' : 'neutral'
-  const notRun = INVARIANTS.filter(([k]) => (card[k] ?? null) === null).length
+  const notRun = INVARIANTS.filter((inv) => (card[inv.key] ?? null) === null).length
   const genus = card.euler_characteristic != null ? eulerGenus(card.euler_characteristic) : null
 
   return (
@@ -51,18 +65,21 @@ export function SoundnessCard({ card }: { card: SoundnessCardData }) {
         )
       }
     >
-      <div className="mt-1.5 flex flex-col gap-0.5">
-        {INVARIANTS.map(([key, label]) => {
+      <div className="mt-1.5 flex flex-wrap items-center gap-1">
+        {INVARIANTS.map(({ key, label, glyph }) => {
           const value = (card[key] ?? null) as boolean | null
           return (
-            <Claim
+            <ClaimBadge
               key={key}
               status={value}
-              title={value === null ? `${label}: not run — not-run is not a pass` : `${label}: ${value ? 'proven' : 'FAILED'}`}
-            >
-              {label}
-              {value === null && <span className="text-muted-foreground/70"> — not run</span>}
-            </Claim>
+              label={label}
+              glyph={glyph}
+              detail={
+                value === null
+                  ? `${label}: not run — not-run is not a pass`
+                  : `${label}: ${value ? 'proven' : 'FAILED'}`
+              }
+            />
           )
         })}
       </div>

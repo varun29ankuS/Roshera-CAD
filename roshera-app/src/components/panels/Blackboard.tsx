@@ -8,6 +8,7 @@ import { useAcpSessionStore } from '@/stores/acp-session-store'
 import { useSceneStore } from '@/stores/scene-store'
 import { cn } from '@/lib/utils'
 import { processBlackboardMessage } from '@/lib/ai-client'
+import { cancelAcpTurn } from '@/lib/acp-blackboard'
 import { BlackboardLine } from './BlackboardLine'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -347,6 +348,7 @@ export function Blackboard() {
               onCommit={editLine}
               onDelete={deleteLine}
               streaming={line.id === streamingLineId}
+              onCancel={line.id === streamingLineId ? cancelAcpTurn : undefined}
             />
           ))}
           {/* Shown only until the reply line exists — once streaming, the

@@ -272,6 +272,7 @@ export async function runAcpTurn(client: AcpClient, text: string): Promise<void>
       // (unchanged) still runs; `renderedTurnFailures` stops it from
       // posting a second, duplicate line for this same error.
       useBlackboardStore.getState().editLine(lineId, describeAcpTurnFailure(err))
+      useBlackboardStore.getState().setLineTurnStatus(lineId, 'failed')
       if (err && typeof err === 'object') renderedTurnFailures.add(err)
       throw err
     }
@@ -282,6 +283,14 @@ export async function runAcpTurn(client: AcpClient, text: string): Promise<void>
         : accumulated
       : trailing || 'Done.'
     useBlackboardStore.getState().editLine(lineId, finalText)
+    // Cancelled (user pressed Stop) gets the neutral mark, never the same
+    // red cross as an error — see `AgentTurnStatus`'s doc. Every other
+    // stop reason (end_turn / refusal / max_tokens / max_turn_requests)
+    // means the turn concluded without erroring or being stopped, so it
+    // reads as "completed" — a TURN verdict only, never a geometry one.
+    useBlackboardStore
+      .getState()
+      .setLineTurnStatus(lineId, stopReason === 'cancelled' ? 'cancelled' : 'completed')
   } finally {
     unsubscribe()
     const b = useBlackboardStore.getState()

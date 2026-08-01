@@ -82,6 +82,22 @@ export function partScope(partUuid: string): BlackboardScope {
   return `part:${partUuid}`
 }
 
+/**
+ * TURN OUTCOME
+ * ------------
+ * Set once on the agent's own line when its turn concludes — drives the
+ * completed/cancelled/failed glyph in `BlackboardLine.tsx`, using the same
+ * Check/X/CircleSlash vocabulary as `cards/card-chrome.tsx`'s `Claim`
+ * (emerald / red / amber). This is a TURN-lifecycle marker, not a geometry
+ * verdict: `'completed'` means the agent's turn ended without erroring or
+ * being cancelled — it says nothing about whether the resulting geometry is
+ * sound. That verdict belongs to the certificate cards alone; never let this
+ * glyph imply one the kernel did not give. `'cancelled'` (the user pressed
+ * Stop) gets the neutral amber mark, not a red cross — stopping a turn is
+ * not a failure of it.
+ */
+export type AgentTurnStatus = 'completed' | 'cancelled' | 'failed'
+
 export interface BlackboardLine {
   id: string
   /** Raw source (markdown + `$...$` / `$$...$$` math). Rendered via MessageMarkdown. */
@@ -89,6 +105,10 @@ export interface BlackboardLine {
   author: LineAuthor
   createdAt: number
   updatedAt: number
+  /** How the agent turn that produced this line ended. Undefined for
+   *  user/system lines and for an agent line still streaming (no verdict
+   *  yet — see `AgentTurnStatus`'s doc). */
+  turnStatus?: AgentTurnStatus
 }
 
 export type BlackboardEvent =
@@ -203,6 +223,10 @@ interface BlackboardState {
   /** Live progressive update (agent streaming). Same as editLine but does not
    *  spam the event log per chunk — see `processBlackboardMessage`. */
   setLineText: (id: string, text: string) => void
+  /** Mark how a turn concluded on this line (see `AgentTurnStatus`). Presentation
+   *  metadata, persisted alongside the line; not logged as its own event —
+   *  it rides along with the `editLine` call that commits the final text. */
+  setLineTurnStatus: (id: string, status: AgentTurnStatus) => void
 
   /**
    * Switch the active notebook to `scope`. Resets `lines`/`events` to that
@@ -324,6 +348,13 @@ export const useBlackboardStore = create<BlackboardState>((set, get) => ({
       const lines = state.lines.map((l) =>
         l.id === id ? { ...l, text, updatedAt: Date.now() } : l,
       )
+      return { lines }
+    }),
+
+  setLineTurnStatus: (id, status) =>
+    set((state) => {
+      const lines = state.lines.map((l) => (l.id === id ? { ...l, turnStatus: status } : l))
+      persist(state.activeScope, { lines, events: state.events })
       return { lines }
     }),
 

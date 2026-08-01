@@ -29,6 +29,14 @@
  *    this is a plain re-fetch, not a scope swap.
  *  - The document list itself, so every tab's `active` flag is current.
  *
+ * What it DOES reset: the ACP agent session (`resetAcpClient`,
+ * `lib/acp-blackboard.ts`). A session's conversational history belongs to
+ * the document it was opened against — carrying it across a switch would
+ * have the agent answer the next turn about a document it can no longer
+ * see. Unlike the WS connection above, this is genuinely session-scoped, so
+ * it genuinely needs the reset; the next `getAcpClient()` call opens a
+ * fresh session lazily, same as after any other client-discarded reset.
+ *
  * `epoch` is the invalidation signal for everything else that hydrates from
  * server state on its own schedule but has no reason to import this store's
  * internals — Timeline resets its selected branch to `main` (the backend
@@ -46,6 +54,7 @@ import { create } from 'zustand'
 import { createDocument, listDocuments, openDocument, type DocumentInfo } from '@/lib/documents-api'
 import { refreshSceneFromServer } from '@/lib/ws-bridge'
 import { syncActiveScope } from '@/lib/blackboard-api'
+import { resetAcpClient } from '@/lib/acp-blackboard'
 
 export interface DocumentSwitchResult {
   success: boolean
@@ -96,6 +105,13 @@ export const useDocumentStore = create<DocumentStoreState>((set, get) => ({
     try {
       await openDocument(id)
       // Backend confirmed (200) — the new document is live server-side.
+      // The agent's ACP session is scoped to the document it was talking
+      // about (its cwd, its conversational history) — carrying it across a
+      // switch would answer the next turn about the WRONG document. Reset
+      // it here, never optimistically before the backend confirms, so the
+      // next `getAcpClient()` call opens a fresh session against whatever
+      // document is active by the time that call happens.
+      resetAcpClient()
       // Re-hydrate the stores that own server-sourced state. A failure in
       // any one of these is reported by that primitive itself (scene sync
       // already posts a Blackboard line on failure); we still complete the

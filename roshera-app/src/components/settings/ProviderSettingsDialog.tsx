@@ -283,7 +283,14 @@ export function ProviderSettingsButton() {
       provider: selectedProviderId,
       mode: selectedMode,
       model: trimmedModel || undefined,
-      consent_spawn_local_process: consent,
+      // Carry the consent the user already gave for this provider+mode. The
+      // checkbox resets every time the dialog opens, so without this a
+      // model-only change on an ACTIVE subscription posts consent:false and
+      // the backend correctly refuses — the button enables, the save looks
+      // like it worked, and nothing changes. Only ever true when this exact
+      // provider+mode is already the live config; a NEW local-process mode
+      // still requires a fresh, explicit tick.
+      consent_spawn_local_process: consent || alreadyConsentedToThisMode,
       ...(selectedMode === 'api_key' ? { api_key: apiKey } : {}),
     })
     setSaving(false)
@@ -327,6 +334,16 @@ export function ProviderSettingsButton() {
     selectedMode !== 'subscription_cli' ||
     cliDetection == null ||
     (cliDetection.installed && cliDetection.signed_in)
+  // Consent is about spawning a local process on this machine. Once the user
+  // has agreed to that for a provider+mode and it is the ACTIVE config, the
+  // process is already running with their blessing — changing which model it
+  // serves does not re-open that question. Demanding a fresh tick for a
+  // model-only change silently disables Save with no visible reason, which is
+  // exactly how it read: the dropdown moved, the label flipped to "Save", and
+  // the button stayed dead.
+  const alreadyConsentedToThisMode =
+    data?.active?.provider === selectedProviderId && data?.active?.mode === selectedMode
+
   const canSave =
     !!selectedProviderId &&
     !!selectedMode &&
@@ -335,7 +352,7 @@ export function ProviderSettingsButton() {
     (selectedMode === 'api_key'
       ? !!apiKey && keyTested
       : selectedEntry?.spawns_local_process
-        ? consent && cliDetectionOk
+        ? (consent || alreadyConsentedToThisMode) && cliDetectionOk
         : true)
 
   // Drives the chip. `ai_configured` alone is the WRONG signal: it reports

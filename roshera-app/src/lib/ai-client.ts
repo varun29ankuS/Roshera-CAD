@@ -135,8 +135,13 @@ async function legacyBlackboardTurn(text: string, sessionId?: string): Promise<v
   board.setStreamingLine(lineId)
   let accumulated = ''
 
-  const commit = (content: string) => {
+  // `turnStatus` here is a TURN-lifecycle marker (drives the
+  // completed/cancelled/failed glyph in `BlackboardLine.tsx`), never a
+  // geometry verdict — this path has no cancel control, so only
+  // 'completed'/'failed' are reachable.
+  const commit = (content: string, status: 'completed' | 'failed' = 'completed') => {
     useBlackboardStore.getState().editLine(lineId, content)
+    useBlackboardStore.getState().setLineTurnStatus(lineId, status)
   }
 
   try {
@@ -160,7 +165,7 @@ async function legacyBlackboardTurn(text: string, sessionId?: string): Promise<v
       }
     } catch (fallbackErr) {
       const message = fallbackErr instanceof Error ? fallbackErr.message : 'Unknown error'
-      commit(`Failed to reach backend: ${message}`)
+      commit(`Failed to reach backend: ${message}`, 'failed')
     }
   } finally {
     const b = useBlackboardStore.getState()

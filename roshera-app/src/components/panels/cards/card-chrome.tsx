@@ -167,3 +167,67 @@ export function Claim({
   )
 }
 
+/**
+ * Compact tri-state BADGE — the row counterpart to `Claim`, for a set of
+ * invariants that are each a single word or two ("watertight", "manifold")
+ * rather than a sentence. A wrapped row of these reads as one glance: a
+ * sound part is a row of green, and a single failure cannot hide the way it
+ * could inside nine stacked lines that all say "fine" (Varun, 2026-08-01 —
+ * `Claim`'s vertical list was correct to kill the run-on prose it replaced,
+ * but a row of badges is what a certificate with mostly-passing invariants
+ * should look like).
+ *
+ * Same tri-state contract as `Claim`: `status === null` is "not run", kept
+ * visually distinct (dashed amber) from both pass and fail — a check that
+ * did not run is not a check that passed.
+ *
+ * `glyph` is an OPTIONAL, genuinely-recognisable pictograph for the concept
+ * itself (a droplet for "watertight", an eye for the dual-eye consistency
+ * check) — supplied ONLY where the mark is self-evident without a private
+ * convention. Every other invariant renders its short text label instead: a
+ * cryptic icon nobody can decode is worse than the wall of text it replaced.
+ * Either way the full claim — long label, "proven"/"FAILED"/"not run", and
+ * any extra detail — is on hover via `title`, and via `aria-label` so the
+ * concept is never icon-only for assistive tech.
+ */
+export function ClaimBadge({
+  status,
+  label,
+  detail,
+  glyph: Glyph,
+}: {
+  status: boolean | null
+  /** Short text shown when no `glyph` is supplied — also always the
+   *  accessible name, so an icon-only badge is never unlabelled. */
+  label: string
+  /** Full hover text (the long-form claim, e.g. "watertight: FAILED"). */
+  detail: string
+  glyph?: ComponentType<{ size?: number | string; className?: string }>
+}) {
+  return (
+    <span
+      title={detail}
+      aria-label={detail}
+      className={cn(
+        'inline-flex items-center gap-1 rounded border px-1.5 py-[3px] text-[10px] leading-none',
+        status === true && 'border-emerald-500/30 bg-emerald-500/10 text-emerald-800 dark:text-emerald-300',
+        status === false && 'border-red-500/40 bg-red-500/10 text-red-800 dark:text-red-300',
+        status === null &&
+          'border-dashed border-amber-500/40 bg-amber-500/5 text-amber-800 dark:text-amber-300',
+      )}
+    >
+      <span
+        className={cn(
+          'inline-flex shrink-0',
+          status === true && 'text-emerald-600 dark:text-emerald-400',
+          status === false && 'text-red-600 dark:text-red-400',
+          status === null && 'text-amber-600 dark:text-amber-400',
+        )}
+      >
+        {status === true ? <Check size={10} /> : status === false ? <X size={10} /> : <CircleSlash size={10} />}
+      </span>
+      {Glyph ? <Glyph size={10} /> : <span>{label}</span>}
+    </span>
+  )
+}
+

@@ -43,6 +43,15 @@
  *   verbatim `message` from a 409/422 (never paraphrased — gdt.ts surfaces
  *   it as `REFUSED: <msg>`), plus optional next actions. A refusal is a
  *   RESULT, not an error.
+ * - `roshera:choices`  → NOT a kernel wire type — an authoring convention
+ *   (`.goosehints`, "When you need the human to choose between discrete
+ *   options") the agent uses to ask a genuinely closed-set question as
+ *   clickable buttons instead of prose the user has to retype. YAML, not
+ *   JSON (the block is hand-authored by the agent, and YAML is what
+ *   `.goosehints` specifies). `selected` is added by the UI, never by the
+ *   agent, once the user has answered — it makes the board a record rather
+ *   than a still-open question. There is deliberately NO prose-parsing
+ *   fallback: an invalid block renders as raw text, never guessed buttons.
  *
  * Envelope fields beyond the wire payloads (`unit`, `note`, `standard`,
  * `options`, `part`) are authoring annotations — presentation the agent adds,
@@ -50,6 +59,7 @@
  */
 
 import { z } from 'zod'
+import { parse as parseYaml } from 'yaml'
 
 // ── DFM (geometry-engine/src/dfm/report.rs) ───────────────────────────
 
@@ -233,6 +243,35 @@ export const refusalCardSchema = z.object({
 
 export type RefusalCard = z.infer<typeof refusalCardSchema>
 
+// ── Choices (authoring convention — see the top-of-file note) ─────────
+
+const choiceOptionSchema = z.object({
+  /** Sent verbatim as the next turn when this option is clicked. */
+  value: z.string().min(1),
+  /** Button text. */
+  label: z.string().min(1),
+  /** Secondary text beneath the label. */
+  detail: z.string().optional(),
+})
+
+export const choicesCardSchema = z
+  .object({
+    question: z.string().min(1),
+    options: z.array(choiceOptionSchema).min(1),
+    /** UI-authored, never the agent: the value the user clicked. Absent
+     *  means the question is still open. */
+    selected: z.string().optional(),
+  })
+  // A `selected` that names no real option would be a fabricated answer —
+  // refuse the render (falls back to raw text) rather than show it anyway.
+  .refine((c) => c.selected === undefined || c.options.some((o) => o.value === c.selected), {
+    message: 'selected does not match any option value',
+    path: ['selected'],
+  })
+
+export type ChoicesCard = z.infer<typeof choicesCardSchema>
+export type ChoiceOption = z.infer<typeof choiceOptionSchema>
+
 // ── Merge result (api-server/src/branches.rs `MergeView`) ─────────────
 
 const conflictWitnessSchema = z
@@ -322,10 +361,22 @@ export type BlackboardCard =
   | { kind: 'refusal'; card: RefusalCard }
   | { kind: 'merge'; card: MergeCard }
   | { kind: 'soundness'; card: SoundnessCard }
+  | { kind: 'choices'; card: ChoicesCard }
 
 export type CardKind = BlackboardCard['kind']
 
-const CARD_KINDS: readonly CardKind[] = ['dfm', 'fcf', 'refusal', 'merge', 'soundness']
+const CARD_KINDS: readonly CardKind[] = ['dfm', 'fcf', 'refusal', 'merge', 'soundness', 'choices']
+
+/** `choices` is hand-authored YAML per `.goosehints`; every other card is a
+ *  JSON echo of a wire type. Malformed input in either format yields `null`
+ *  here — the caller reports it as a parse error, never a half-card. */
+function parseCardSource(kind: CardKind, source: string): { ok: true; json: unknown } | { ok: false; error: string } {
+  try {
+    return { ok: true, json: kind === 'choices' ? parseYaml(source) : JSON.parse(source) }
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : `invalid ${kind === 'choices' ? 'YAML' : 'JSON'}` }
+  }
+}
 
 /** Extract a card kind from a fence language / markdown code className
  *  (`language-roshera:dfm` or bare `roshera:dfm`). */
@@ -345,12 +396,9 @@ export type CardParseResult =
  *  schema rejects yields a typed error — the caller falls back to rendering
  *  the raw fence (honest, never a half-card). */
 export function parseCard(kind: CardKind, source: string): CardParseResult {
-  let json: unknown
-  try {
-    json = JSON.parse(source)
-  } catch (e) {
-    return { ok: false, error: e instanceof Error ? e.message : 'invalid JSON' }
-  }
+  const parsed = parseCardSource(kind, source)
+  if (!parsed.ok) return { ok: false, error: parsed.error }
+  const json = parsed.json
   const fail = (r: z.SafeParseReturnType<unknown, unknown>): CardParseResult => ({
     ok: false,
     error:
@@ -380,6 +428,10 @@ export function parseCard(kind: CardKind, source: string): CardParseResult {
     }
     case 'soundness': {
       const r = soundnessCardSchema.safeParse(json)
+      return r.success ? { ok: true, card: { kind, card: r.data } } : fail(r)
+    }
+    case 'choices': {
+      const r = choicesCardSchema.safeParse(json)
       return r.success ? { ok: true, card: { kind, card: r.data } } : fail(r)
     }
   }
