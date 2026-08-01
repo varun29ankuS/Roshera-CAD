@@ -6,12 +6,12 @@ import {
 } from '@/stores/blackboard-store'
 import { useAcpSessionStore } from '@/stores/acp-session-store'
 import { useSceneStore } from '@/stores/scene-store'
+import { useWSStore } from '@/stores/ws-store'
 import { cn } from '@/lib/utils'
 import { processBlackboardMessage } from '@/lib/ai-client'
 import { cancelAcpTurn } from '@/lib/acp-blackboard'
-import { groupBlackboardLines } from '@/lib/blackboard-groups'
-import { BlackboardLine } from './BlackboardLine'
-import { BuildStepStrip } from './BuildStepStrip'
+import { groupBlackboardByCheckpoint, type CheckpointMarker } from '@/lib/blackboard-groups'
+import { BlackboardSection } from './BlackboardSection'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import {
@@ -147,11 +147,60 @@ export function Blackboard() {
         ? selectedPart.name
         : 'Part'
 
-  // Consecutive machine-authored "Created …" lines collapse into one
-  // compact step strip (`BuildStepStrip.tsx`) so a bolt circle of bores
-  // reads as one row of marks, not one paragraph per hole. Agent prose and
-  // user lines are never candidates — see `groupBlackboardLines`'s doc.
-  const groups = useMemo(() => groupBlackboardLines(lines), [lines])
+  // ── Checkpoint sections ─────────────────────────────────────────────
+  //
+  // `GET /api/timeline/checkpoints` is the authoritative list of named
+  // design-intent checkpoints (`CheckpointSummary` in
+  // `roshera-backend/api-server/src/handlers/timeline.rs`) — the same
+  // record `timeline_checkpoint(...)` mints and the Timeline strip's ◈
+  // button posts to. The Blackboard fetches it independently (mirroring
+  // `Timeline.tsx`'s own direct-fetch pattern) rather than reading it off
+  // a shared store, since none exists yet for timeline data. Wire
+  // `timestamp` (ISO 8601) is converted to epoch ms once here, at the
+  // fetch boundary, so `blackboard-groups.ts` only ever deals in numbers.
+  const wsStatus = useWSStore((s) => s.status)
+  const [checkpoints, setCheckpoints] = useState<CheckpointMarker[]>([])
+
+  const fetchCheckpoints = useCallback(async () => {
+    try {
+      const resp = await fetch('/api/timeline/checkpoints')
+      if (!resp.ok) return
+      const data = (await resp.json()) as Array<{
+        id: string
+        name: string
+        timestamp: string
+      }>
+      if (!Array.isArray(data)) return
+      const marks: CheckpointMarker[] = data
+        .map((c) => ({ id: c.id, name: c.name, createdAt: new Date(c.timestamp).getTime() }))
+        .filter((c) => !isNaN(c.createdAt))
+      setCheckpoints(marks)
+    } catch {
+      // Backend not running — the board still renders as one unlabelled
+      // section rather than failing to load.
+    }
+  }, [])
+
+  useEffect(() => {
+    if (wsStatus === 'connected') {
+      // Data-sync fetch on (re)connect, mirroring `Timeline.tsx`'s
+      // `fetchHistory` — this project's established pattern for pulling
+      // timeline state into a component on mount/reconnect.
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      fetchCheckpoints()
+    }
+  }, [wsStatus, fetchCheckpoints])
+
+  // Sections group lines under the checkpoint that was open when each was
+  // written; within a section, consecutive machine-authored "Created …"
+  // lines still collapse into one compact step strip (`BuildStepStrip.tsx`)
+  // so a bolt circle of bores reads as one row of marks, not one paragraph
+  // per hole. Agent prose and user lines are never candidates — see
+  // `groupBlackboardLines`'s doc.
+  const sections = useMemo(
+    () => groupBlackboardByCheckpoint(lines, checkpoints),
+    [lines, checkpoints],
+  )
 
   const [input, setInput] = useState('')
   const scrollRef = useRef<HTMLDivElement>(null)
@@ -438,25 +487,16 @@ export function Blackboard() {
         }
       >
         <div className="py-2">
-          {groups.map((g) =>
-            g.kind === 'build-strip' ? (
-              <BuildStepStrip
-                key={g.lines[0].id}
-                lines={g.lines}
-                onCommit={editLine}
-                onDelete={deleteLine}
-              />
-            ) : (
-              <BlackboardLine
-                key={g.line.id}
-                line={g.line}
-                onCommit={editLine}
-                onDelete={deleteLine}
-                streaming={g.line.id === streamingLineId}
-                onCancel={g.line.id === streamingLineId ? cancelAcpTurn : undefined}
-              />
-            ),
-          )}
+          {sections.map((section, i) => (
+            <BlackboardSection
+              key={section.checkpoint?.id ?? `leading-${i}`}
+              section={section}
+              onCommit={editLine}
+              onDelete={deleteLine}
+              streamingLineId={streamingLineId}
+              onCancel={cancelAcpTurn}
+            />
+          ))}
           {/* Shown only until the reply line exists — once streaming, the
               line's own chalk cursor is the progress signal. */}
           {isProcessing && streamingLineId === null && (

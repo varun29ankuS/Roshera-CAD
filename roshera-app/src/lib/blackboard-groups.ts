@@ -155,6 +155,96 @@ export function buildStepBreadcrumb(segments: BuildStepSegment[]): {
  */
 const BUILD_RUN_GAP_MS = 120_000
 
+/**
+ * CHECKPOINT SECTIONS
+ * ===================
+ * The agent is required by policy to declare intent before every feature,
+ * as a named checkpoint (`timeline_checkpoint(name: "…")`,
+ * `POST /api/timeline/checkpoint`). Those names are the notebook's natural
+ * section headers — read from `GET /api/timeline/checkpoints`
+ * (`CheckpointSummary` in `roshera-backend/api-server/src/handlers/
+ * timeline.rs`), which the Blackboard fetches independently of the bottom
+ * Timeline strip. `Blackboard.tsx` converts each checkpoint's wire
+ * `timestamp` (ISO 8601) to epoch ms once, at the fetch boundary, so this
+ * module only ever deals with numbers.
+ *
+ * Bucketing rule: a checkpoint at time T opens its section; a line belongs
+ * to the checkpoint with the LATEST `createdAt <= line.createdAt` (an
+ * exact tie goes to the checkpoint, not the section before it — the
+ * checkpoint is understood to be declared, then the line is written).
+ * A line written before every checkpoint's timestamp goes into an
+ * unlabelled leading section — never an invented name.
+ *
+ * Checkpoints are timeline-global (`list_checkpoints` takes no branch or
+ * document param) while the Blackboard is scoped (document / part /
+ * assembly). A checkpoint minted while working on a different part still
+ * becomes a header in this notebook — there is no scope field on a
+ * checkpoint to filter by, and inventing one would be exactly the kind of
+ * guess this module refuses to make elsewhere. Section boundaries are
+ * purely temporal, same as `groupBlackboardLines`'s own build-run gap.
+ */
+export interface CheckpointMarker {
+  id: string
+  /** Verbatim checkpoint name — never paraphrased or shortened here. */
+  name: string
+  /** Epoch ms — when the checkpoint was created. */
+  createdAt: number
+}
+
+export interface BlackboardSection {
+  /** `null` = the unlabelled leading section (lines before the first
+   *  checkpoint, or every line when there are no checkpoints at all). */
+  checkpoint: CheckpointMarker | null
+  groups: BlackboardGroup[]
+}
+
+/**
+ * Partition `lines` by which checkpoint was open when each was written,
+ * THEN run `groupBlackboardLines` independently within each partition —
+ * partition first, group second. Grouping first and splitting build-strips
+ * across a checkpoint boundary afterward would risk tearing a strip apart
+ * in a way that loses or duplicates a line; partitioning on the immutable
+ * `createdAt` timestamp first makes `total lines in === total lines out`
+ * a trivial invariant of this function, checked by its test coverage.
+ *
+ * A build-step run that already exists is understood to be able to split
+ * into two strips at a checkpoint boundary even within the previous
+ * `BUILD_RUN_GAP_MS` window — a declared new intent is a stronger boundary
+ * than a two-minute pause, and re-merging across it would misattribute
+ * steps from one feature's strip to another's section.
+ */
+export function groupBlackboardByCheckpoint(
+  lines: BlackboardLine[],
+  checkpoints: CheckpointMarker[],
+): BlackboardSection[] {
+  const sorted = [...checkpoints].sort((a, b) => a.createdAt - b.createdAt)
+
+  const leading: BlackboardLine[] = []
+  const buckets: BlackboardLine[][] = sorted.map(() => [])
+
+  for (const line of lines) {
+    // Latest checkpoint whose createdAt <= line.createdAt (ties resolve to
+    // the checkpoint, per the doc above). `sorted` is ascending, so the
+    // last match wins.
+    let idx = -1
+    for (let i = 0; i < sorted.length; i++) {
+      if (sorted[i].createdAt <= line.createdAt) idx = i
+      else break
+    }
+    if (idx === -1) leading.push(line)
+    else buckets[idx].push(line)
+  }
+
+  const sections: BlackboardSection[] = []
+  if (leading.length > 0 || sorted.length === 0) {
+    sections.push({ checkpoint: null, groups: groupBlackboardLines(leading) })
+  }
+  sorted.forEach((cp, i) => {
+    sections.push({ checkpoint: cp, groups: groupBlackboardLines(buckets[i]) })
+  })
+  return sections
+}
+
 export function groupBlackboardLines(lines: BlackboardLine[]): BlackboardGroup[] {
   const groups: BlackboardGroup[] = []
   let run: BlackboardLine[] = []
