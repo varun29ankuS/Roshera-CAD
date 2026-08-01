@@ -29,23 +29,33 @@ import { useThemeStore } from '@/stores/theme-store'
  *     itself is byte-identical to the source.
  *   2026-08-01 (Varun): "you didn't use logo for the providers" — the 8
  *   allowlisted vendors were showing 6 initials fallbacks against 2 real
- *   marks. Went looking for the other 6. Only 3 had a genuine published
- *   vector to inline (above); the rest — xAI/Grok, Zhipu GLM, Baseten —
- *   stay on the initials fallback below, on purpose:
- *     - xAI: no SVG on simple-icons or Wikimedia Commons (only raster
- *       PNG/JPG logo files found there); x.ai itself sits behind a
- *       Cloudflare challenge page, so no site-root favicon/logo SVG either.
- *     - Zhipu GLM: not on simple-icons. open.bigmodel.cn, zhipuai.cn, and
- *       chat.z.ai all serve their SPA's `index.html` for any `.svg` path
- *       (confirmed `Content-Type: text/html`, not `image/svg+xml`), i.e.
- *       no real file at that path. The one Commons upload found
- *       (File:Z.ai (company logo).svg) is a raw Illustrator export with
- *       ~190 unused, unrelated CSS classes left in — not the clean kind of
- *       single-mark file the other five are — so it was treated as
- *       unverified rather than inlined.
- *     - Baseten: no simple-icons entry, no Commons hit, and baseten.co
- *       ships only a raster `/favicon.ico` — no SVG mark published
- *       anywhere found.
+ *   marks. Went looking for the other 6; landed at 3 real, 2 more real,
+ *   1 still honestly unfound:
+ *   - xAI (`XaiMark`): none of simple-icons/jsdelivr, and x.ai itself
+ *     sits behind a Cloudflare challenge page (no site-root favicon/logo
+ *     SVG reachable). Wikimedia Commons has three candidate uploads;
+ *     `File:XAI-Logo.svg` is the one sourced directly from x.ai, CC0
+ *     ("simple geometric shapes... do not meet the threshold for
+ *     copyright protection") — the other two are unlabelled fan uploads
+ *     and were not used. Its four polygons (an angular "X") are inlined
+ *     verbatim below.
+ *   - Zhipu GLM / Z.ai (`ZhipuMark`): not on simple-icons; open.bigmodel.cn,
+ *     zhipuai.cn, and chat.z.ai all serve their SPA's `index.html` for any
+ *     `.svg` path (confirmed `Content-Type: text/html`, not
+ *     `image/svg+xml`), so no site-root favicon/logo SVG exists to fetch.
+ *     Wikimedia Commons' `File:Z.ai (company logo).svg` (sourced from
+ *     chat.z.ai per its own file description) is used as the infobox logo
+ *     across eight Wikipedia language editions' Z.ai/Zhipu AI articles —
+ *     strong enough provenance to inline. Its path data is a two-tone
+ *     badge (near-black rounded-square background, white "Z" glyph); only
+ *     the glyph paths are inlined here (no background chip, matching
+ *     every other mark in this file), recoloured with the source's own
+ *     near-black/white contrast, same pattern as `OpenAIMark`.
+ *   - Baseten: still no genuine published SVG mark found anywhere —
+ *     re-checked simple-icons/jsdelivr (no `baseten.svg`), Wikimedia
+ *     Commons (no hits), and `baseten.co/favicon.svg` (404; the site
+ *     ships only a raster `/favicon.ico`). Stays on the initials fallback
+ *     below, on purpose.
  *   A wrong or unverified logo next to a real company name is a factual
  *   error shipped in the UI; two honest initials is not. See `VendorMark`
  *   below for the fallback itself.
@@ -67,6 +77,13 @@ import { useThemeStore } from '@/stores/theme-store'
  *     (`#000000`), i.e. Kimi itself is a black/white mark, not a colour
  *     accent — same black-on-light/white-on-dark treatment as OpenAI,
  *     reactive to `useThemeStore`.
+ *   - xAI: the source file specifies no fill at all (a bare shape, unlike
+ *     Anthropic's/Mistral's explicit hex) — treated as a monochrome mark,
+ *     same black-on-light/white-on-dark treatment as OpenAI/Kimi,
+ *     reactive to `useThemeStore`.
+ *   - Zhipu GLM (Z.ai): the source badge's own two colours are near-black
+ *     (`#2D2D2D`) and white — already a contrast pair, not an accent hue
+ *     — reproduced as the identical black/white swap.
  *   - Sarvam AI: the source file encodes its own light/dark swap
  *     (`fill:#000` default, `#FFF` under `prefers-color-scheme: dark`) —
  *     that's Sarvam's own published rule, reproduced here against the
@@ -146,6 +163,52 @@ export function KimiMark({ className }: { className?: string }) {
   )
 }
 
+export function XaiMark({ className }: { className?: string }) {
+  // xAI publishes no brand-colour spec (unlike Anthropic/Mistral) — the
+  // mark itself is drawn with no fill override, i.e. it's a monochrome
+  // shape like OpenAI's, so it gets the identical contrast-driven
+  // black/white swap rather than an invented accent colour.
+  const isDark = useThemeStore((s) => s.theme === 'dark')
+  return (
+    <svg
+      viewBox="0 0 466.04 516.93"
+      className={cn(MARK_CLASS, className)}
+      fill={isDark ? '#FFFFFF' : '#000000'}
+      role="img"
+      aria-label="xAI"
+    >
+      <polygon points="0.12 182.71 234.14 516.92 338.15 516.92 104.13 182.71 0.12 182.71" />
+      <polygon points="0 516.92 104.08 516.92 156.08 442.67 104.04 368.34 0 516.92" />
+      <polygon points="466.04 0 361.96 0 182.1 256.86 234.15 331.18 466.04 0" />
+      <polygon points="380.78 516.92 466.04 516.92 466.04 37.16 380.78 158.92 380.78 516.92" />
+    </svg>
+  )
+}
+
+export function ZhipuMark({ className }: { className?: string }) {
+  // Z.ai's own mark (see file header) is a two-tone badge: a near-black
+  // rounded-square background (#2D2D2D) with a white "Z" glyph cut from
+  // it. Reproduced here as the glyph alone — dropping the badge square to
+  // match every other mark in this file (bare glyph, no background chip)
+  // — recoloured with the identical contrast-driven black/white swap the
+  // source file itself already encodes (near-black vs white), not an
+  // invented colour.
+  const isDark = useThemeStore((s) => s.theme === 'dark')
+  return (
+    <svg
+      viewBox="0 0 30 30"
+      className={cn(MARK_CLASS, className)}
+      fill={isDark ? '#FFFFFF' : '#000000'}
+      role="img"
+      aria-label="Zhipu GLM (Z.ai)"
+    >
+      <path d="M15.47,7.1l-1.3,1.85c-0.2,0.29-0.54,0.47-0.9,0.47h-7.1V7.09C6.16,7.1,15.47,7.1,15.47,7.1z" />
+      <path d="M14.53,22.91l1.31-1.86c0.2-0.29,0.54-0.47,0.9-0.47h7.09v2.33H14.53z" />
+      <polygon points="24.3,7.1 13.14,22.91 5.7,22.91 16.86,7.1" />
+    </svg>
+  )
+}
+
 export function SarvamMark({ className }: { className?: string }) {
   // Sarvam's own favicon.svg (fetched from sarvam.ai) encodes this exact
   // swap via `prefers-color-scheme`; reproduced here against the app's
@@ -202,8 +265,10 @@ export function VendorMark({
   if (providerId === 'mistral') return <MistralMark className={className} />
   if (providerId === 'kimi') return <KimiMark className={className} />
   if (providerId === 'sarvam') return <SarvamMark className={className} />
-  // xai (Grok), glm (Zhipu), baseten: no genuine published SVG mark found
-  // (see the file-header comment) — initials fallback below, on purpose.
+  if (providerId === 'xai') return <XaiMark className={className} />
+  if (providerId === 'glm') return <ZhipuMark className={className} />
+  // baseten: no genuine published SVG mark found anywhere (see the
+  // file-header comment) — initials fallback below, on purpose.
   return (
     <span
       className={cn(

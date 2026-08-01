@@ -112,31 +112,92 @@ const MODEL_PRESETS: { value: string; label: string }[] = [
   { value: 'haiku', label: 'haiku' },
 ]
 
+/** The four states Varun asked to make visually distinct — computed only
+ *  from facts the backend actually reports (`wiring.status`, `active`,
+ *  `cli.*.installed/signed_in`), never invented:
+ *    - `active`      — this exact provider+mode is what's currently serving.
+ *    - `ready`       — wired, and a credential is ALREADY present without
+ *                      the user typing anything (a signed-in local CLI).
+ *    - `available`   — wired, but nothing usable has been supplied yet
+ *                      (needs a typed key, or the CLI isn't signed in).
+ *    - `unavailable` — `seam_only`; never selectable, reason always shown.
+ *  `ready` is honestly narrow: this server stores exactly one credential
+ *  at a time (the active one — `ai_provider.rs::get_provider`'s `stored`
+ *  is a single `Option`), so there is no "a key is stored for this OTHER
+ *  mode" fact to report. `ready` only fires for CLI-detected modes, where
+ *  "a credential exists" is a live fact (`cli.installed && cli.signed_in`)
+ *  independent of what Roshera has persisted. */
+type WireState = 'active' | 'ready' | 'available' | 'unavailable'
+
+// Colour is the ONLY thing that varies across these four (Varun's
+// standing rule: colour carries state, nothing else) — the dot shape is
+// identical everywhere, only its fill changes. `active` is reserved for
+// this bucket ONLY; nothing else in the dialog may reuse emerald.
+const STATE_STYLES: Record<WireState, { text: string; dot: string }> = {
+  active: { text: 'text-emerald-400', dot: 'bg-emerald-500' },
+  ready: { text: 'text-sky-400', dot: 'bg-sky-400' },
+  available: { text: 'text-amber-400/90', dot: 'bg-amber-400' },
+  unavailable: { text: 'text-muted-foreground', dot: 'bg-muted-foreground/40' },
+}
+
+const STATE_LABELS: Record<WireState, string> = {
+  active: 'Active',
+  ready: 'Ready',
+  available: 'Available',
+  unavailable: 'Unavailable',
+}
+
+function modeWireState(
+  info: ProviderStatusResponse,
+  entry: ModeEntry,
+  provider: AllowlistedProvider,
+): WireState {
+  if (entry.wiring.status !== 'wired') return 'unavailable'
+  if (info.active?.provider === provider.id && info.active?.mode === entry.mode) return 'active'
+  if (entry.mode === 'subscription_cli' || entry.mode === 'oauth_profile') {
+    const cli = info.cli[CLI_KEY_FOR_PROVIDER[provider.id]]
+    return cli?.installed && cli?.signed_in ? 'ready' : 'available'
+  }
+  return 'available'
+}
+
+/** Aggregate state for the vendor mark itself — one dot has to summarize
+ *  every mode underneath it. `ready` beats `available` beats
+ *  `unavailable` so a vendor with one usable mode never reads as fully
+ *  unavailable. */
+function providerWireState(info: ProviderStatusResponse, provider: AllowlistedProvider): WireState {
+  if (info.active?.provider === provider.id) return 'active'
+  const states = provider.modes.map((m) => modeWireState(info, m, provider))
+  if (states.includes('ready')) return 'ready'
+  if (states.includes('available')) return 'available'
+  return 'unavailable'
+}
+
 /** One scannable line per mode: a label plus a short, honest status — the
  *  paragraph-length reasons this used to render standing move to `title`
- *  tooltips at the call site instead. */
+ *  tooltips (and, for `unavailable`, a visible line under the row) at the
+ *  call site instead. */
 function modeStatus(
   info: ProviderStatusResponse,
   entry: ModeEntry,
   provider: AllowlistedProvider,
-): { text: string; className: string } {
-  if (entry.wiring.status !== 'wired') {
-    return { text: 'not yet wired', className: 'text-muted-foreground' }
-  }
-  const isActiveMode =
-    info.active?.provider === provider.id && info.active?.mode === entry.mode
+): { text: string; state: WireState } {
+  const state = modeWireState(info, entry, provider)
+  if (state === 'unavailable') return { text: 'not yet wired', state }
+  if (state === 'active') return { text: '✓ configured', state }
   if (entry.mode === 'subscription_cli') {
     const cli = info.cli[CLI_KEY_FOR_PROVIDER[provider.id]]
-    if (!cli) return { text: 'status unknown', className: 'text-muted-foreground' }
-    if (!cli.installed) return { text: 'CLI not detected', className: 'text-amber-400/90' }
-    return cli.signed_in
-      ? { text: '✓ signed in', className: 'text-emerald-400' }
-      : { text: 'not signed in', className: 'text-amber-400/90' }
+    if (!cli) return { text: 'status unknown', state: 'available' }
+    if (!cli.installed) return { text: 'CLI not detected', state }
+    return cli.signed_in ? { text: 'signed in — ready', state } : { text: 'not signed in', state }
   }
-  if (isActiveMode) return { text: '✓ configured', className: 'text-emerald-400' }
-  if (entry.mode === 'api_key') return { text: 'needs a key', className: 'text-muted-foreground' }
-  if (entry.mode === 'oauth_profile') return { text: 'CLI login', className: 'text-muted-foreground' }
-  return { text: 'from environment', className: 'text-muted-foreground' }
+  if (entry.mode === 'oauth_profile') {
+    return state === 'ready'
+      ? { text: 'CLI login — ready', state }
+      : { text: 'CLI login required', state }
+  }
+  if (entry.mode === 'api_key') return { text: 'needs a key', state }
+  return { text: 'from environment', state }
 }
 
 export function ProviderSettingsButton() {
@@ -247,6 +308,13 @@ export function ProviderSettingsButton() {
     data?.active?.mode === selectedMode &&
     (data?.active?.model ?? '') === model.trim()
 
+  // No `load()` after this call: `POST /api/ai/provider/test` shares
+  // `PUT`'s validation path but deliberately "stops before any of that"
+  // (`ai_provider.rs`'s own doc comment) — no persist, no repin, no env
+  // scrub. Nothing on the server changed, so there is nothing for a
+  // refetch to pick up; it would only flash `phase: 'loading'` and
+  // unmount this panel for no reason. `setTestResult`/`setTesting` below
+  // are this action's own visible pending/outcome state.
   async function runTest() {
     if (!selectedProviderId || !selectedMode) return
     setTesting(true)
@@ -492,14 +560,14 @@ export function ProviderSettingsButton() {
             <div className="flex flex-wrap items-start gap-2.5">
               {data.allowlist.map((provider) => {
                 const isSelected = provider.id === selectedProviderId
-                const isActive = provider.id === data.active?.provider
+                const wireState = providerWireState(data, provider)
                 return (
                   <button
                     key={provider.id}
                     type="button"
                     onClick={() => selectProvider(provider)}
-                    title={provider.display_name}
-                    aria-label={provider.display_name}
+                    title={`${provider.display_name} — ${STATE_LABELS[wireState]}`}
+                    aria-label={`${provider.display_name} (${STATE_LABELS[wireState]})`}
                     aria-pressed={isSelected}
                     className={cn(
                       'relative flex h-14 w-14 shrink-0 items-center justify-center rounded-xl border-2 transition-all',
@@ -513,12 +581,33 @@ export function ProviderSettingsButton() {
                       displayName={provider.display_name}
                       className="h-7 w-7"
                     />
-                    {isActive && (
-                      <span className="absolute -right-1 -top-1 h-2.5 w-2.5 rounded-full bg-emerald-500 ring-2 ring-background" />
-                    )}
+                    {/* Every mark carries this dot, always — not just the
+                        active one. Colour is the ONLY thing distinguishing
+                        the four states here; "wired but not connected"
+                        (amber/blue) must never look like "connected"
+                        (emerald) at a glance across the row. */}
+                    <span
+                      className={cn(
+                        'absolute -right-1 -top-1 h-2.5 w-2.5 rounded-full ring-2 ring-background',
+                        STATE_STYLES[wireState].dot,
+                      )}
+                      aria-hidden="true"
+                    />
                   </button>
                 )
               })}
+            </div>
+
+            {/* Legend — the colour code only works if it's explained once,
+                in the same dialog, not left for the user to reverse-engineer
+                from four dots. */}
+            <div className="flex flex-wrap items-center gap-x-3 gap-y-1 px-0.5 text-[10px] text-muted-foreground">
+              {(Object.keys(STATE_LABELS) as WireState[]).map((s) => (
+                <span key={s} className="flex items-center gap-1">
+                  <span className={cn('h-1.5 w-1.5 rounded-full', STATE_STYLES[s].dot)} aria-hidden="true" />
+                  {STATE_LABELS[s]}
+                </span>
+              ))}
             </div>
 
             {/* Selected vendor's options — one vendor at a time, no
@@ -528,41 +617,56 @@ export function ProviderSettingsButton() {
                 <div className="mb-2 space-y-1">
                   {selectedProvider.modes.map((entry) => {
                     const active = selectedMode === entry.mode
-                    const disabled = entry.wiring.status !== 'wired'
+                    const state = modeWireState(data, entry, selectedProvider)
+                    const disabled = state === 'unavailable'
                     const status = modeStatus(data, entry, selectedProvider)
+                    // Only present when `wiring.status === 'seam_only'` —
+                    // the backend's own reason, verbatim, rendered as
+                    // standing text (not just a `title` tooltip, which
+                    // browsers are inconsistent about firing on disabled
+                    // buttons) so it can never be missed.
+                    const seamReason = entry.wiring.status === 'seam_only' ? entry.wiring.reason : null
                     return (
-                      <button
-                        key={entry.mode}
-                        type="button"
-                        disabled={disabled}
-                        onClick={() => {
-                          setSelectedMode(entry.mode)
-                          setTestResult(null)
-                          setTestedFor(null)
-                          setSaveError(null)
-                        }}
-                        title={entry.wiring.status !== 'wired' ? entry.wiring.reason : entry.reason}
-                        className={cn(
-                          'flex w-full items-center justify-between gap-2 rounded border px-2 py-1.5 text-left text-xs transition-colors',
-                          disabled
-                            ? 'cursor-not-allowed border-dashed border-border/40 opacity-60'
-                            : active
-                              ? 'border-primary/60 bg-primary/10'
-                              : 'border-border hover:bg-accent/30',
-                        )}
-                      >
-                        <span className="flex items-center gap-1.5 font-medium">
-                          {MODE_LABELS[entry.mode]}
-                          {entry.spawns_local_process && (
-                            <Terminal
-                              size={10}
-                              className="text-amber-400/90"
-                              aria-label="Spawns a local process on this machine"
-                            />
+                      <div key={entry.mode} className="flex flex-col gap-0.5">
+                        <button
+                          type="button"
+                          disabled={disabled}
+                          onClick={() => {
+                            setSelectedMode(entry.mode)
+                            setTestResult(null)
+                            setTestedFor(null)
+                            setSaveError(null)
+                          }}
+                          title={seamReason ?? entry.reason}
+                          className={cn(
+                            'flex w-full items-center justify-between gap-2 rounded border px-2 py-1.5 text-left text-xs transition-colors',
+                            disabled
+                              ? 'cursor-not-allowed border-dashed border-border/40 opacity-60'
+                              : active
+                                ? 'border-primary/60 bg-primary/10'
+                                : 'border-border hover:bg-accent/30',
                           )}
-                        </span>
-                        <span className={cn('shrink-0', status.className)}>{status.text}</span>
-                      </button>
+                        >
+                          <span className="flex items-center gap-1.5 font-medium">
+                            <span
+                              className={cn('h-1.5 w-1.5 shrink-0 rounded-full', STATE_STYLES[state].dot)}
+                              aria-hidden="true"
+                            />
+                            {MODE_LABELS[entry.mode]}
+                            {entry.spawns_local_process && (
+                              <Terminal
+                                size={10}
+                                className="text-amber-400/90"
+                                aria-label="Spawns a local process on this machine"
+                              />
+                            )}
+                          </span>
+                          <span className={cn('shrink-0', STATE_STYLES[state].text)}>{status.text}</span>
+                        </button>
+                        {seamReason && (
+                          <p className="px-2 text-[10px] leading-snug text-muted-foreground">{seamReason}</p>
+                        )}
+                      </div>
                     )
                   })}
                 </div>
