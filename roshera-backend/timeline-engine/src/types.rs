@@ -166,6 +166,18 @@ pub struct Checkpoint {
     /// Events included in this checkpoint
     pub event_range: (EventIndex, EventIndex),
 
+    /// The branch that was active when the checkpoint was created — the
+    /// branch whose event range `event_range` indexes into. Without it a
+    /// consumer can only overlay declared intent on `main`: a child
+    /// branch's sequence numbers are different numbers, so labelling
+    /// them by range alone would attribute one feature's decision to
+    /// another branch's work. `#[serde(default = "BranchId::main")]`
+    /// keeps any checkpoint serialized before this field existed
+    /// deserializable — and `main` is exactly the branch every
+    /// pre-field checkpoint was created against.
+    #[serde(default = "BranchId::main")]
+    pub branch_id: BranchId,
+
     /// Author who created the checkpoint
     pub author: Author,
 

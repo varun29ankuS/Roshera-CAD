@@ -191,7 +191,22 @@ check("kb_lookup refusal cached on identical re-issue; answered args pass", () =
 
 // ─── 2b. checkpoint name quality + auto notebook mirror ─────────────────────
 
-for (const bad of ["step 3", "cp 2", "7", "checkpoint"]) {
+// The last five are clock/date readings dressed as names — the shape the
+// UI button used to mint ("Checkpoint 9:59:36 PM"). They slip the generic
+// regex (its tail only accepts a plain ordinal), so without the dedicated
+// CLOCK_CHECKPOINT_NAME rule these five would reach the backend and this
+// loop would fail on counts.checkpoint staying 0.
+for (const bad of [
+  "step 3",
+  "cp 2",
+  "7",
+  "checkpoint",
+  "Checkpoint 9:59:36 PM",
+  "checkpoint 9:59",
+  "10:05",
+  "2026-08-01",
+  "cp 12/31/26",
+]) {
   const r = await call("timeline_checkpoint", { name: bad, branch: "main" });
   check(`generic checkpoint name '${bad}' is refused`, () => {
     assert.ok(isRefusal(r, "intent"));

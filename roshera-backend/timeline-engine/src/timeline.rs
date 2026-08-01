@@ -492,6 +492,7 @@ impl Timeline {
             name,
             description,
             event_range: (min_seq, max_seq),
+            branch_id,
             author,
             timestamp: Utc::now(),
             tags,
@@ -515,6 +516,36 @@ impl Timeline {
         let mut all: Vec<Checkpoint> = self.checkpoints.iter().map(|e| e.value().clone()).collect();
         all.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
         all
+    }
+
+    /// One checkpoint by id, or `None`. Exists so the api-server can
+    /// read the full record it just created back for durable
+    /// persistence (`create_checkpoint` returns only the id).
+    pub fn get_checkpoint(&self, id: &CheckpointId) -> Option<Checkpoint> {
+        self.checkpoints.get(id).map(|e| e.value().clone())
+    }
+
+    /// Durability boot restore: reinsert a persisted checkpoint
+    /// verbatim — original `id`, `event_range`, `branch_id`, `author`,
+    /// and `timestamp` all preserved, so `GET /api/timeline/checkpoints`
+    /// returns byte-identical rows after a restart. The named-intent
+    /// layer must be at least as durable as the events it labels.
+    ///
+    /// Idempotent: re-inserting an id that is already present replaces
+    /// it with the identical record and does not duplicate the branch
+    /// metadata entry. A checkpoint whose branch no longer exists is
+    /// still restored into the store (the record is a position marker,
+    /// and listing it is honest — its branch reference names history),
+    /// it just cannot be indexed on the missing branch's metadata.
+    pub fn rehydrate_checkpoint(&self, checkpoint: Checkpoint) {
+        let id = checkpoint.id;
+        let branch_id = checkpoint.branch_id;
+        self.checkpoints.insert(id, checkpoint);
+        if let Some(mut branch) = self.branches.get_mut(&branch_id) {
+            if !branch.metadata.checkpoints.contains(&id) {
+                branch.metadata.checkpoints.push(id);
+            }
+        }
     }
 
     pub fn get_branch_events(
@@ -2314,6 +2345,105 @@ mod tests {
 
         assert!(timeline.branches.contains_key(&branch_id));
         assert_eq!(timeline.get_stats().total_branches, 2); // main + new
+    }
+
+    /// A checkpoint must capture the branch it was created against —
+    /// its `event_range` indexes into THAT branch's sequence numbers,
+    /// and a consumer overlaying intent onto history needs to know
+    /// whose numbers they are. Fails without `Checkpoint::branch_id`
+    /// (the field did not exist; every checkpoint could only be read
+    /// as a `main` annotation).
+    #[tokio::test]
+    async fn checkpoint_captures_the_branch_active_at_creation() {
+        let timeline = Timeline::new(TimelineConfig::default());
+        let branch_id = timeline
+            .create_branch(
+                "counterbore exploration".to_string(),
+                BranchId::main(),
+                None,
+                Author::System,
+                crate::BranchPurpose::UserExploration {
+                    description: "checkpoint branch attribution".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let cp_id = timeline
+            .create_checkpoint(
+                "counterbore 4x M8, 14 deep".to_string(),
+                String::new(),
+                branch_id,
+                Author::System,
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+
+        let cp = timeline.get_checkpoint(&cp_id).expect("just created");
+        assert_eq!(
+            cp.branch_id, branch_id,
+            "checkpoint must record the branch whose event range it captured"
+        );
+    }
+
+    /// Durability restore: a rehydrated checkpoint is byte-identical to
+    /// the persisted one (id, range, branch, author, timestamp) and is
+    /// indexed on its branch's metadata exactly once, however many
+    /// times the restore runs. Fails without `rehydrate_checkpoint`
+    /// (checkpoints had NO restore path — they vanished on restart).
+    #[tokio::test]
+    async fn rehydrate_checkpoint_restores_verbatim_and_is_idempotent() {
+        let source = Timeline::new(TimelineConfig::default());
+        let cp_id = source
+            .create_checkpoint(
+                "base plate 120x80x12".to_string(),
+                "datum face established".to_string(),
+                BranchId::main(),
+                Author::System,
+                vec!["intent".to_string()],
+            )
+            .await
+            .unwrap();
+        let persisted = source.get_checkpoint(&cp_id).expect("just created");
+
+        // A fresh timeline — the post-restart world.
+        let restored = Timeline::new(TimelineConfig::default());
+        restored.rehydrate_checkpoint(persisted.clone());
+        restored.rehydrate_checkpoint(persisted.clone()); // restore is re-runnable
+
+        let back = restored.get_checkpoint(&cp_id).expect("survived restart");
+        assert_eq!(back.name, persisted.name);
+        assert_eq!(back.description, persisted.description);
+        assert_eq!(back.event_range, persisted.event_range);
+        assert_eq!(back.branch_id, persisted.branch_id);
+        assert_eq!(back.timestamp, persisted.timestamp);
+        assert_eq!(back.tags, persisted.tags);
+
+        let on_branch = restored.get_branch_checkpoints(&BranchId::main());
+        assert_eq!(
+            on_branch.iter().filter(|id| **id == cp_id).count(),
+            1,
+            "double restore must not double-index the branch metadata"
+        );
+    }
+
+    /// A checkpoint serialized before `branch_id` existed must still
+    /// deserialize — defaulting to `main`, the branch every pre-field
+    /// checkpoint was in fact created against.
+    #[test]
+    fn pre_branch_field_checkpoint_json_deserializes_to_main() {
+        let legacy = serde_json::json!({
+            "id": CheckpointId::new(),
+            "name": "legacy row",
+            "description": "",
+            "event_range": [0, 4],
+            "author": "System",
+            "timestamp": Utc::now(),
+            "tags": [],
+        });
+        let cp: Checkpoint = serde_json::from_value(legacy).unwrap();
+        assert_eq!(cp.branch_id, BranchId::main());
     }
 
     // ---------------------------------------------------------------
