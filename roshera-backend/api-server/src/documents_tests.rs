@@ -170,6 +170,90 @@ async fn document_isolation_and_clean_boot() {
     );
 }
 
+/// In-flight recorder events must land in the document they were recorded
+/// in, never in the one being switched to (the flush-before-switch barrier
+/// in `documents::activate` step 0).
+///
+/// The kernel's `record()` is fire-and-forget into the recorder's MPSC
+/// channel; the drain worker applies + persists asynchronously. This test
+/// enqueues an op and then calls `activate` with NO intervening await: on
+/// the current-thread test runtime the worker cannot run until the current
+/// task hits a genuine yield, and without the flush barrier `activate`'s
+/// first genuine yield is the branch-metadata DB load in `boot_replay` —
+/// AFTER the timeline swap and the `active_document` flip. The queued op
+/// would therefore drain into document B's fresh timeline and persist
+/// under B's id: A's event silently reattributed to B. With the barrier,
+/// `flush()` is `activate`'s first await, the worker drains while A is
+/// still live, and the event lands durably under A.
+#[tokio::test]
+async fn in_flight_events_are_flushed_into_their_own_document_before_a_switch() {
+    use geometry_engine::operations::recorder::{OperationRecorder, RecordedOperation};
+
+    let db = open_db(&temp_db_path()).await;
+    let state = build_state(db, true).await;
+
+    let (status, body) = dispatch(&state, post("/api/documents", json!({ "name": "A" }))).await;
+    assert_eq!(status, StatusCode::OK, "create A; body = {body}");
+    let id_a = body["id"].as_str().expect("id").to_string();
+    let (status, body) = dispatch(&state, post("/api/documents", json!({ "name": "B" }))).await;
+    assert_eq!(status, StatusCode::OK, "create B; body = {body}");
+    let id_b = body["id"].as_str().expect("id").to_string();
+
+    let (status, _) = dispatch(
+        &state,
+        post(&format!("/api/documents/{id_a}/open"), json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "open A");
+
+    // Enqueue an op exactly as the kernel does — and deliberately do NOT
+    // flush. It is now in-flight: queued in the channel, not yet applied,
+    // not yet persisted.
+    state
+        .timeline_recorder
+        .record(
+            RecordedOperation::new("create_box_3d")
+                .with_parameters(json!({ "width": 1.0, "depth": 1.0, "height": 1.0 }))
+                .with_output_solids([1u64]),
+        )
+        .expect("record enqueues while the worker is alive");
+
+    // Switch to B via the trusted inner step, synchronously after the
+    // record. (The HTTP route would await a registry DB read first, which
+    // on this runtime would let the worker drain early and mask the race.)
+    documents::activate(&state, &id_b).await;
+
+    let a_events = state
+        .database
+        .get_event_count(&id_a)
+        .await
+        .expect("count A events");
+    let b_events = state
+        .database
+        .get_event_count(&id_b)
+        .await
+        .expect("count B events");
+    assert_eq!(
+        b_events, 0,
+        "the in-flight op recorded in A must NOT be persisted under B"
+    );
+    assert_eq!(
+        a_events, 1,
+        "the in-flight op must be durably persisted under A, the document it was recorded in"
+    );
+
+    // And B's live in-memory timeline must not have absorbed it either.
+    let timeline = state.timeline.read().await;
+    let events = timeline
+        .get_branch_events(&timeline_engine::BranchId::main(), None, None)
+        .expect("B's main branch events");
+    assert!(
+        events.is_empty(),
+        "B's fresh timeline must not contain A's in-flight op; got {} event(s)",
+        events.len()
+    );
+}
+
 /// `POST /api/documents/{id}/open` on an id that was never registered must
 /// 404, never silently create-or-fall-back.
 #[tokio::test]

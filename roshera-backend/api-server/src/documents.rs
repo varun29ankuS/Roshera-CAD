@@ -278,6 +278,28 @@ pub async fn delete_document(
 /// tests can call it directly without a registry check (the registry check
 /// belongs to the untrusted HTTP boundary, not this trusted inner step).
 pub async fn activate(state: &AppState, document_id: &str) -> durability::DurabilityStatus {
+    // 0. Drain the recorder BEFORE anything is reset or re-pointed. The
+    //    kernel's `record()` is fire-and-forget into a bounded MPSC; ops
+    //    recorded microseconds before this switch may still be sitting in
+    //    that channel. Without this barrier the drain worker would apply
+    //    them to the FRESH timeline assigned in step 2 and persist them
+    //    under the NEW `active_document` flipped in step 4 — the previous
+    //    document's events silently reattributed to (and colliding with)
+    //    the one being opened. `flush()` is the FIFO sentinel the branch
+    //    handlers already use: when it returns, every previously-enqueued
+    //    event has been applied to the OUTGOING document's timeline and
+    //    persisted under the OUTGOING document's id. A flush error means
+    //    the worker is down — in-flight events cannot land anywhere, so
+    //    proceeding is safe; the failure is still named, never swallowed.
+    if let Err(e) = state.timeline_recorder.flush().await {
+        tracing::warn!(
+            target: "documents",
+            error = %e,
+            "documents: recorder flush before document switch failed \
+             (worker down — no in-flight events to misattribute)"
+        );
+    }
+
     // 1. Reset the live kernel model to empty, then reattach the recorder.
     //    `rebuild_model_from_events` (called inside `boot_replay` below)
     //    APPLIES events onto whatever model it is handed — it does not
