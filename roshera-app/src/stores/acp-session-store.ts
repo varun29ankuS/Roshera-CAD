@@ -37,6 +37,31 @@ interface AcpSessionStats {
   contextSize: number | null
   live: boolean
 
+  /** Session total at the moment the current turn's prompt was sent.
+   *  Internal bookkeeping for `lastTurnTokens`; not for display. */
+  turnStartTokens: number | null
+
+  /** Tokens consumed by the MOST RECENT turn alone, derived as
+   *  `tokensUsed - turnStartTokens`.
+   *
+   *  This exists because the session total, shown by itself next to a
+   *  just-completed action, reads as the price of that action. Measured
+   *  2026-08-01: "clear the viewport" made exactly two tool calls and
+   *  answered in 51 characters, while the header showed ~70k — a figure
+   *  accumulated over three prompts, most of it context re-sent on each
+   *  round-trip. Nothing displayed was false; it was unlabelled, which
+   *  was enough to mislead.
+   *
+   *  `null` until a turn completes, and null rather than a negative if
+   *  the total ever moves backwards (a session restart resets it): a
+   *  number we cannot derive honestly is not shown.
+   *
+   *  ⚠ Still a COUNT, not a cost, and still not a breakdown. `used` is one
+   *  scalar mixing fresh input, output and cached context; the wire
+   *  carries no split, and cached reads bill far below fresh input. So
+   *  this says how much moved, never how much it cost. */
+  lastTurnTokens: number | null
+
   /** A prompt was just sent on the current session. */
   incrementTurns: () => void
   /** Latest `usage_update` — replaces, never accumulates. `used` is itself
@@ -60,12 +85,53 @@ export const useAcpSessionStore = create<AcpSessionStats>((set) => ({
   tokensUsed: null,
   contextSize: null,
   live: false,
+  turnStartTokens: null,
+  lastTurnTokens: null,
 
-  incrementTurns: () => set((s) => ({ turns: s.turns + 1 })),
-  setUsage: (used, size) => set({ tokensUsed: used, contextSize: size }),
+  // Sending a prompt opens a new turn: freeze the running total as this
+  // turn's baseline and drop the previous turn's figure, so a stale number
+  // never sits next to work in flight.
+  incrementTurns: () =>
+    set((s) => ({
+      turns: s.turns + 1,
+      turnStartTokens: s.tokensUsed ?? 0,
+      lastTurnTokens: null,
+    })),
+
+  setUsage: (used, size) =>
+    set((s) => {
+      const base = s.turnStartTokens
+      // A backwards total means the counter reset under us (session
+      // restart). There is no honest delta across that discontinuity, so
+      // report none and re-baseline rather than render a negative.
+      const delta = base === null || used < base ? null : used - base
+      return {
+        tokensUsed: used,
+        contextSize: size,
+        turnStartTokens: base !== null && used < base ? used : base,
+        lastTurnTokens: delta,
+      }
+    }),
+
   setModel: (model) => set({ model }),
   startSession: (model) =>
-    set({ model, turns: 0, tokensUsed: null, contextSize: null, live: true }),
+    set({
+      model,
+      turns: 0,
+      tokensUsed: null,
+      contextSize: null,
+      live: true,
+      turnStartTokens: null,
+      lastTurnTokens: null,
+    }),
   endSession: () =>
-    set({ model: null, turns: 0, tokensUsed: null, contextSize: null, live: false }),
+    set({
+      model: null,
+      turns: 0,
+      tokensUsed: null,
+      contextSize: null,
+      live: false,
+      turnStartTokens: null,
+      lastTurnTokens: null,
+    }),
 }))

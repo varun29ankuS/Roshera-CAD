@@ -55,6 +55,25 @@ function formatContextUsage(used: number): string {
   return `${compactCount.format(used)} tokens`
 }
 
+/** What the header says about tokens, and why it says it that way.
+ *
+ *  The session total alone was technically true and practically
+ *  misleading: shown beside a just-finished action it reads as that
+ *  action's price. Measured 2026-08-01 — "clear the viewport" made two
+ *  tool calls and replied in 51 characters while the header read ~70k,
+ *  a total accumulated across three prompts.
+ *
+ *  So the turn's own figure leads and the session total is explicitly
+ *  labelled behind it. Both are counts of tokens MOVED, never cost:
+ *  most of a turn's figure is context re-sent on each round-trip, and
+ *  re-sent context bills far below fresh input. The wire gives one
+ *  scalar with no split, so no breakdown is offered — an invented one
+ *  would be worse than none. */
+const TOKENS_TITLE =
+  'Tokens moved, not cost. Most of a turn is context re-sent on every ' +
+  'round-trip, and re-sent context bills far below fresh input. The ' +
+  'session figure accumulates across all turns.'
+
 export function Blackboard() {
   const lines = useBlackboardStore((s) => s.lines)
   const isProcessing = useBlackboardStore((s) => s.isProcessing)
@@ -76,6 +95,7 @@ export function Blackboard() {
   const acpModel = useAcpSessionStore((s) => s.model)
   const acpTurns = useAcpSessionStore((s) => s.turns)
   const acpTokens = useAcpSessionStore((s) => s.tokensUsed)
+  const acpLastTurnTokens = useAcpSessionStore((s) => s.lastTurnTokens)
   const acpLive = useAcpSessionStore((s) => s.live)
 
   // Drive the notebook scope from the viewport selection: the active part's
@@ -287,8 +307,22 @@ export function Blackboard() {
                   {acpTurns} turn{acpTurns === 1 ? '' : 's'}
                 </span>
                 <span className="text-muted-foreground/40">·</span>
-                <span>{formatContextUsage(acpTokens ?? 0)}</span>
-                <span className="text-muted-foreground/50">(session)</span>
+                {/* Turn figure first — it answers "what did THAT cost me",
+                    which is the question the bare session total kept
+                    answering wrongly. Absent until a turn completes. */}
+                <span title={TOKENS_TITLE}>
+                  {acpLastTurnTokens !== null ? (
+                    <>
+                      {formatContextUsage(acpLastTurnTokens)}
+                      <span className="text-muted-foreground/50"> this turn</span>
+                      <span className="text-muted-foreground/40"> · </span>
+                    </>
+                  ) : null}
+                  <span className={acpLastTurnTokens !== null ? 'text-muted-foreground/60' : ''}>
+                    {formatContextUsage(acpTokens ?? 0)}
+                  </span>
+                  <span className="text-muted-foreground/50"> session</span>
+                </span>
               </>
             )}
           </span>
