@@ -979,22 +979,34 @@ pub async fn verify_subscription_cli_model(
 /// already work via goose's hardcoded default, unchanged by this
 /// module), and `"baseten"` has no goose provider to repin to at all —
 /// see `ai-integration`'s allowlist entry for why.
+/// The third element is a DEFAULT MODEL, and it is `None` unless the
+/// exact identifier has been verified against that vendor's live API.
+///
+/// goose resolves `GOOSE_MODEL` from whatever this repin pins, and a
+/// provider pinned with no model fails at the first turn with
+/// "Configuration value not found: GOOSE_MODEL" — a late, opaque error
+/// for a decision made much earlier. Supplying a *guessed* identifier
+/// would be worse: `sarvam-30b` was carried in this repo's own config
+/// until 2026-08-01, when the live model list showed it does not exist.
+/// A wrong default fails at first use while looking configured, which is
+/// precisely the shape of failure this module exists to refuse. So an
+/// unverified vendor gets `None` and the caller must name the model.
 fn goose_declarative_provider_for(
     roshera_provider_id: &str,
-) -> Option<(&'static str, &'static str)> {
+) -> Option<(&'static str, &'static str, Option<&'static str>)> {
     match roshera_provider_id {
-        "xai" => Some(("xai", "XAI_API_KEY")),
-        "mistral" => Some(("mistral", "MISTRAL_API_KEY")),
+        "xai" => Some(("xai", "XAI_API_KEY", None)),
+        "mistral" => Some(("mistral", "MISTRAL_API_KEY", None)),
         // Roshera's allowlist id is "glm" (the model family users type);
         // goose's own declarative-provider name for the same vendor is
         // "zhipu" (`zhipu.json`'s `"name"` field) — these are
         // deliberately different strings, not a typo.
-        "glm" => Some(("zhipu", "ZHIPU_API_KEY")),
+        "glm" => Some(("zhipu", "ZHIPU_API_KEY", None)),
         // Roshera's "kimi" is goose's "moonshot"
         // (`moonshot.json`) — distinct from `kimi_code`, an unrelated
         // OAuth-device-flow CLI product goose separately supports that
         // this module does not touch.
-        "kimi" => Some(("moonshot", "MOONSHOT_API_KEY")),
+        "kimi" => Some(("moonshot", "MOONSHOT_API_KEY", None)),
         // Unlike xai/mistral/glm/kimi, Sarvam has no goose-bundled
         // declarative provider. Instead its definition is a custom-provider
         // JSON at `state/goose-root/config/custom_providers/sarvam.json`,
@@ -1005,7 +1017,12 @@ fn goose_declarative_provider_for(
         // (`sarvam` -> `sarvam`) — not a rename like glm -> zhipu, just the
         // same string reused because there was never a second name to
         // reconcile.
-        "sarvam" => Some(("sarvam", "SARVAM_API_KEY")),
+        // `sarvam-105b` is the ONLY chat model `GET https://api.sarvam.ai/
+        // v1/models` returned on 2026-08-01 (checked live, not from the
+        // docs — the docs also list `sarvam-30b`, which that endpoint does
+        // not serve). It is a default here because it was verified, not
+        // because it was plausible.
+        "sarvam" => Some(("sarvam", "SARVAM_API_KEY", Some("sarvam-105b"))),
         _ => None,
     }
 }
@@ -1029,12 +1046,35 @@ pub fn repin_goose_to_declarative_provider(
     api_key: &str,
     model: Option<&str>,
 ) -> Result<(), String> {
-    let (goose_provider_name, api_key_env_var) =
+    let (goose_provider_name, api_key_env_var, default_model) =
         goose_declarative_provider_for(roshera_provider_id).ok_or_else(|| {
             format!(
                 "'{roshera_provider_id}' has no known goose provider to repin to — \
                  refusing rather than silently leaving goose's active_provider \
                  unchanged"
+            )
+        })?;
+
+    // A provider pinned with no model is not a pinned provider. goose
+    // resolves GOOSE_MODEL from this write, so an empty one is accepted
+    // here and then fails at the first turn with "Configuration value not
+    // found: GOOSE_MODEL" — an error naming a variable the user never set,
+    // about a decision made minutes earlier, in a provider the dialog is
+    // meanwhile showing as connected. This used to be
+    // `model.unwrap_or_default()`, which turns "no model" into "" without
+    // saying so. Refuse instead, in the same breath as the unmapped-provider
+    // refusal directly above: a caller must not be able to leave goose in a
+    // state that cannot serve a turn.
+    let resolved_model = model
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .or(default_model)
+        .ok_or_else(|| {
+            format!(
+                "no model given for '{roshera_provider_id}' and no verified default \
+                 exists for it — name the model to use. Refusing rather than pinning \
+                 a provider with an empty model, which would fail at the first turn \
+                 with 'Configuration value not found: GOOSE_MODEL'"
             )
         })?;
 
@@ -1046,10 +1086,9 @@ pub fn repin_goose_to_declarative_provider(
     std::env::set_var(api_key_env_var, api_key);
 
     let config = goose::config::Config::global();
-    goose::config::set_active_provider(config, goose_provider_name, model.unwrap_or_default())
-        .map_err(|e| {
-            format!("failed to pin goose's active_provider to {goose_provider_name}: {e}")
-        })?;
+    goose::config::set_active_provider(config, goose_provider_name, resolved_model).map_err(
+        |e| format!("failed to pin goose's active_provider to {goose_provider_name}: {e}"),
+    )?;
     Ok(())
 }
 
@@ -1883,29 +1922,75 @@ mod tests {
     fn goose_declarative_provider_for_maps_all_four_new_vendors() {
         assert_eq!(
             goose_declarative_provider_for("xai"),
-            Some(("xai", "XAI_API_KEY"))
+            Some(("xai", "XAI_API_KEY", None))
         );
         assert_eq!(
             goose_declarative_provider_for("mistral"),
-            Some(("mistral", "MISTRAL_API_KEY"))
+            Some(("mistral", "MISTRAL_API_KEY", None))
         );
         assert_eq!(
             goose_declarative_provider_for("glm"),
-            Some(("zhipu", "ZHIPU_API_KEY")),
+            Some(("zhipu", "ZHIPU_API_KEY", None)),
             "Roshera's 'glm' id must map to goose's own 'zhipu' provider name"
         );
         assert_eq!(
             goose_declarative_provider_for("kimi"),
-            Some(("moonshot", "MOONSHOT_API_KEY")),
+            Some(("moonshot", "MOONSHOT_API_KEY", None)),
             "Roshera's 'kimi' id must map to goose's own 'moonshot' provider name"
         );
+    }
+
+    /// A default model may only be present where the identifier was checked
+    /// against the vendor's live API. This is the ratchet: adding one from
+    /// documentation or memory is how `sarvam-30b` — a model that vendor
+    /// does not serve — sat in this repo's config until a live check
+    /// removed it.
+    #[test]
+    fn only_live_verified_vendors_carry_a_default_model() {
+        for id in ["xai", "mistral", "glm", "kimi"] {
+            let (_, _, default_model) = goose_declarative_provider_for(id)
+                .unwrap_or_else(|| panic!("{id} must still map to a goose provider"));
+            assert_eq!(
+                default_model, None,
+                "{id} has no live-verified default model, so it must carry None — a guessed \
+                 identifier fails at first use while the dialog shows it connected"
+            );
+        }
+
+        let (_, _, sarvam_default) =
+            goose_declarative_provider_for("sarvam").expect("sarvam must map");
+        assert_eq!(
+            sarvam_default,
+            Some("sarvam-105b"),
+            "sarvam-105b is the only chat model GET https://api.sarvam.ai/v1/models served \
+             on 2026-08-01 — verified live, which is the bar for being a default here"
+        );
+    }
+
+    /// The defect Varun hit connecting Sarvam: the repin accepted an empty
+    /// model via `unwrap_or_default()`, pinned the provider anyway, and the
+    /// turn later died on "Configuration value not found: GOOSE_MODEL".
+    /// A provider with no resolvable model must be refused HERE, before any
+    /// goose config is written, and the refusal must say what to supply.
+    #[test]
+    fn repin_refuses_a_provider_with_no_model_and_no_verified_default() {
+        for blank in [None, Some(""), Some("   ")] {
+            let err = repin_goose_to_declarative_provider("xai", "fake-key", blank).expect_err(
+                "a provider with no model and no verified default must be refused, not \
+                 pinned with an empty model",
+            );
+            assert!(
+                err.contains("model"),
+                "the refusal must name what is missing: {err}"
+            );
+        }
     }
 
     #[test]
     fn goose_declarative_provider_for_maps_sarvam_by_identity() {
         assert_eq!(
             goose_declarative_provider_for("sarvam"),
-            Some(("sarvam", "SARVAM_API_KEY")),
+            Some(("sarvam", "SARVAM_API_KEY", Some("sarvam-105b"))),
             "Roshera's 'sarvam' id must map to goose's custom-provider name \
              'sarvam' (identity mapping — there is no goose-bundled provider \
              to rename to, unlike glm -> zhipu)"
