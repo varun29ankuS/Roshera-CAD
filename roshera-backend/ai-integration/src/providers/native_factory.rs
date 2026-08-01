@@ -10,7 +10,7 @@ use super::*;
 /// Configuration for AI providers
 #[derive(Debug, Clone)]
 pub struct NativeProviderConfig {
-    /// Claude API model to use (e.g. "claude-sonnet-5")
+    /// Claude API model to use (defaults to [`shared_types::DEFAULT_CLAUDE_MODEL`])
     pub claude_model: String,
     /// Maximum tokens for LLM responses
     pub max_tokens: usize,
@@ -19,7 +19,7 @@ pub struct NativeProviderConfig {
 impl Default for NativeProviderConfig {
     fn default() -> Self {
         Self {
-            claude_model: "claude-sonnet-5".to_string(),
+            claude_model: shared_types::DEFAULT_CLAUDE_MODEL.to_string(),
             max_tokens: 4096,
         }
     }
@@ -229,6 +229,6 @@ mod tests {
             model, "claude-3-5-sonnet-20241022",
             "default claude_model must not be the retired ID"
         );
-        assert_eq!(model, "claude-sonnet-5");
+        assert_eq!(model, shared_types::DEFAULT_CLAUDE_MODEL);
     }
 }

@@ -99,7 +99,7 @@ pub struct ClaudeConfig {
     /// every method returns `ProviderError::ProviderUnavailable` —
     /// there is no offline fallback.
     pub credential: Option<ClaudeCredential>,
-    /// Model ID (e.g., "claude-sonnet-5")
+    /// Model ID (defaults to [`shared_types::DEFAULT_CLAUDE_MODEL`])
     pub model: String,
     /// Maximum tokens for the response
     pub max_tokens: usize,
@@ -134,7 +134,7 @@ impl Default for ClaudeConfig {
     fn default() -> Self {
         Self {
             credential: None,
-            model: "claude-sonnet-5".to_string(),
+            model: shared_types::DEFAULT_CLAUDE_MODEL.to_string(),
             max_tokens: 1024,
             tool_tier: ToolTier::Tier1,
             api_base: "https://api.anthropic.com".to_string(),
@@ -1152,7 +1152,7 @@ mod tests {
             model, "claude-3-5-sonnet-20241022",
             "default model must not be the retired ID"
         );
-        assert_eq!(model, "claude-sonnet-5");
+        assert_eq!(model, shared_types::DEFAULT_CLAUDE_MODEL);
     }
 
     /// P4: `generate()` must surface a non-success HTTP status as a typed
@@ -1346,7 +1346,10 @@ mod tests {
             if let Ok((mut socket, _)) = listener.accept().await {
                 let mut buf = [0u8; 4096];
                 let _ = socket.read(&mut buf).await;
-                let body = r#"{"id":"claude-sonnet-5","type":"model"}"#;
+                let body = format!(
+                    r#"{{"id":"{}","type":"model"}}"#,
+                    shared_types::DEFAULT_CLAUDE_MODEL
+                );
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     body.len(),
@@ -1364,7 +1367,9 @@ mod tests {
         };
         let provider = ClaudeProvider::with_config(config);
 
-        let result = provider.validate_model("claude-sonnet-5").await;
+        let result = provider
+            .validate_model(shared_types::DEFAULT_CLAUDE_MODEL)
+            .await;
         let _ = server.await;
 
         assert!(
@@ -1438,7 +1443,9 @@ mod tests {
     #[tokio::test]
     async fn validate_model_returns_unavailable_without_key() {
         let provider = ClaudeProvider::new();
-        let result = provider.validate_model("claude-sonnet-5").await;
+        let result = provider
+            .validate_model(shared_types::DEFAULT_CLAUDE_MODEL)
+            .await;
         assert!(
             matches!(result, Err(ProviderError::ProviderUnavailable(_))),
             "expected ProviderUnavailable when no credential is configured, got {:?}",

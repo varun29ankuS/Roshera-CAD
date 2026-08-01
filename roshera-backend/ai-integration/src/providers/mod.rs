@@ -394,4 +394,62 @@ mod tests {
             _ => panic!("Wrong quantization type"),
         }
     }
+
+    /// Guards the defect class fixed alongside `shared_types::DEFAULT_CLAUDE_MODEL`:
+    /// the default Claude model was hand-copied as a string literal into
+    /// five places across `ai-integration` and `api-server` with nothing
+    /// keeping them in sync. Now there is exactly one place allowed to
+    /// spell the literal — `shared_types::DEFAULT_CLAUDE_MODEL`'s own
+    /// definition — and this test scans both crates' `src/` trees for the
+    /// value and fails, naming every offending file and line, if it
+    /// reappears anywhere else. The needle is built from the constant's
+    /// live value (never typed out here as a literal), so this test
+    /// cannot itself trip its own guard, and it survives a future model
+    /// bump without being edited.
+    #[test]
+    fn no_stray_default_model_literal_outside_shared_constant() {
+        let needle = format!("\"{}\"", shared_types::DEFAULT_CLAUDE_MODEL);
+        let ai_integration_src = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+        let api_server_src = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("api-server")
+            .join("src");
+
+        let mut offenders = Vec::new();
+        scan_dir_for_literal(&ai_integration_src, &needle, &mut offenders);
+        scan_dir_for_literal(&api_server_src, &needle, &mut offenders);
+
+        assert!(
+            offenders.is_empty(),
+            "found the default-model literal {needle} outside \
+             shared_types::DEFAULT_CLAUDE_MODEL's own definition — every \
+             call site must reference the shared constant instead:\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    /// Recursively walk `dir` for `.rs` files containing `needle` as raw
+    /// text, recording `path:line: <trimmed line>` for each hit. Silent
+    /// on I/O errors (a missing sibling crate directory is not this
+    /// test's concern; the workspace layout is asserted elsewhere).
+    fn scan_dir_for_literal(dir: &std::path::Path, needle: &str, offenders: &mut Vec<String>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                scan_dir_for_literal(&path, needle, offenders);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                let Ok(content) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                for (i, line) in content.lines().enumerate() {
+                    if line.contains(needle) {
+                        offenders.push(format!("{}:{}: {}", path.display(), i + 1, line.trim()));
+                    }
+                }
+            }
+        }
+    }
 }

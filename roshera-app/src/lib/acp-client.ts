@@ -328,9 +328,14 @@ class AcpSseStream {
 export interface AcpClientOptions {
   /** The `/acp` path. Overridable for tests; defaults to same-origin `/acp`. */
   acpPath?: string
-  /** Absolute working directory for `session/new`. Configurable via
-   *  `VITE_ACP_CWD` — never hardcoded, since it must be a real, absolute
-   *  path on the machine running the backend. */
+  /** Absolute working directory for `session/new`. The backend OWNS this
+   *  path (`goose_acp::agent_workspace_dir` — the same directory it writes
+   *  `.goosehints` into) and serves it over `GET /api/acp/config`;
+   *  `newSession()` fetches it lazily on first use. Pass this option (or
+   *  set `VITE_ACP_CWD`) only to override that for an unusual setup — it
+   *  must never be relied on as the default source of truth, since a
+   *  frontend value and a backend value that can silently drift apart is
+   *  exactly the defect class this client used to carry. */
   cwd?: string
 }
 
@@ -340,7 +345,11 @@ const DEFAULT_ACP_PATH = '/acp'
 
 export class AcpClient {
   private readonly acpPath: string
-  private readonly cwd: string
+  /** Explicit override only (ctor option or `VITE_ACP_CWD`) — empty means
+   *  "ask the backend", resolved and cached lazily by {@link resolveCwd}.
+   *  Not `readonly`: the backend-resolved value is written into this same
+   *  field on first use so every subsequent `newSession()` reuses it. */
+  private cwd: string
   private connectionId: string | null = null
   private sessionId: string | null = null
   private _currentModel: string | null = null
@@ -570,21 +579,65 @@ export class AcpClient {
   }
 
   /**
+   * Resolve the ACP session working directory: an explicit override (the
+   * ctor's `cwd` option, or `VITE_ACP_CWD`) if one was given, otherwise
+   * ask the backend for the ONE path it owns (`GET /api/acp/config` —
+   * `goose_acp::get_acp_config`, the same directory `initialize()` writes
+   * `.goosehints` into). Cached in `this.cwd` after the first successful
+   * resolution so a session's later calls don't re-fetch.
+   *
+   * Fails loudly rather than falling back to a guessed default: a
+   * wrong-but-plausible cwd would mean the agent reads a different
+   * directory and behaves to a policy nobody can see — precisely the
+   * failure this replaces (previously `VITE_ACP_CWD` unset meant a hard
+   * refusal; now an unreachable/empty backend response refuses the same
+   * way, naming what's missing, instead of ever inventing a path).
+   */
+  private async resolveCwd(): Promise<string> {
+    if (this.cwd) return this.cwd
+
+    let res: Response
+    try {
+      res = await rateLimitedFetch('/api/acp/config', { method: 'GET' })
+    } catch (err) {
+      if (err instanceof AcpRateLimitError) throw err
+      throw new AcpProtocolError(
+        -32000,
+        `could not reach the backend to resolve the ACP working directory ` +
+          `(GET /api/acp/config): ${err instanceof Error ? err.message : String(err)} — ` +
+          `set VITE_ACP_CWD to override`,
+      )
+    }
+    if (!res.ok) {
+      throw new AcpProtocolError(
+        -32000,
+        `GET /api/acp/config failed: ${res.status} ${await safeText(res)} — the backend ` +
+          `could not resolve the ACP working directory and no VITE_ACP_CWD override is set`,
+      )
+    }
+    const body = (await res.json()) as { cwd?: string }
+    if (!body.cwd) {
+      throw new AcpProtocolError(
+        -32000,
+        'GET /api/acp/config returned no cwd — the backend has no ACP working ' +
+          'directory to serve and no VITE_ACP_CWD override is set',
+      )
+    }
+    this.cwd = body.cwd
+    return this.cwd
+  }
+
+  /**
    * Step 2. Open a session. Requires `initialize()` to have completed.
    * `mcpServers` is `[]` for this slice — Roshera's own MCP tools are
    * wired in a later slice, not invented here.
    */
   async newSession(mcpServers: unknown[] = []): Promise<string> {
     if (!this.connectionId) throw new AcpProtocolError(-32000, 'newSession() called before initialize()')
-    if (!this.cwd) {
-      throw new AcpProtocolError(
-        -32000,
-        'VITE_ACP_CWD is not configured — session/new requires an absolute cwd',
-      )
-    }
+    const cwd = await this.resolveCwd()
     const result = (await this.requestAsync(
       'session/new',
-      { cwd: this.cwd, mcpServers },
+      { cwd, mcpServers },
       false,
     )) as { sessionId?: string; configOptions?: AcpSessionConfigOption[] } | undefined
     if (!result?.sessionId) {

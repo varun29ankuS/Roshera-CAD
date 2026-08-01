@@ -8734,6 +8734,14 @@ pub(crate) fn build_router(state: AppState) -> Router {
                 auth_middleware::require_modify_settings,
             )),
         )
+        // ACP session config — the working directory `session/new` will
+        // use, so `roshera-app`'s `acp-client.ts` can ask the backend
+        // instead of independently hardcoding a copy (see
+        // `goose_acp::agent_workspace_dir`'s doc for the defect this
+        // closes). No extra permission gate beyond the standard
+        // `Authorization` credential every non-exempt route already
+        // needs — the path itself carries no secret.
+        .route("/api/acp/config", get(goose_acp::get_acp_config))
         // Metrics endpoint
         .route("/api/metrics", get(metrics::get_metrics))
         // Geometry endpoints
