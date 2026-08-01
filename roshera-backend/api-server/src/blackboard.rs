@@ -128,12 +128,28 @@ impl BlackboardScope {
 // ── Line author ─────────────────────────────────────────────────────
 
 /// Origin of a line. Matches the frontend `LineAuthor` union
-/// (`'user' | 'agent'`), serialised lower-case.
+/// (`'user' | 'agent' | 'system'`), serialised lower-case.
+///
+/// `System` exists because the board must not attribute its own
+/// bookkeeping to the agent. Before it was added the wire carried only
+/// `user`/`agent`, so the app's machine-written lines — per-operation
+/// "Created …" echoes, sync failures, toolbar feedback — were minted
+/// locally as `system` and then downgraded to `agent` on the way out
+/// (the alternative, a 422, made the line vanish silently). The result
+/// was a notebook that recorded the app's words as the agent's: on
+/// 2026-08-01, 36 of 38 persisted lines read `agent` and none read
+/// `system`, including every line no agent had written. A kernel that
+/// cannot lie about geometry should not lie about who said something.
+///
+/// Consumers must treat this as a THIRD state, not a flavour of agent:
+/// `System` is the machine talking about itself, `Agent` is a model's
+/// engineering, `User` is the human's. Only the last two are content.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LineAuthor {
     User,
     Agent,
+    System,
 }
 
 // ── Line ────────────────────────────────────────────────────────────
@@ -711,6 +727,55 @@ mod tests {
         BlackboardScope::Part {
             id: Uuid::from_u128(0x1111),
         }
+    }
+
+    /// `System` must survive the wire in BOTH directions as its own value.
+    ///
+    /// This is the regression that made the variant necessary. The wire
+    /// previously carried only `user`/`agent`, so the client downgraded its
+    /// machine-written lines to `agent` before sending them — and the board
+    /// came back claiming the agent had written the app's own bookkeeping
+    /// (measured 2026-08-01: 36 of 38 persisted lines `agent`, 0 `system`).
+    /// A test that only checked `to_string` would not have caught it: the
+    /// loss happened on the way IN, at a decoder that had no third value to
+    /// decode to. So both directions are asserted, and the lower-case wire
+    /// spelling is pinned because the frontend union matches on it verbatim.
+    #[test]
+    fn system_authorship_survives_the_wire_in_both_directions() {
+        for (author, wire) in [
+            (LineAuthor::User, "\"user\""),
+            (LineAuthor::Agent, "\"agent\""),
+            (LineAuthor::System, "\"system\""),
+        ] {
+            let encoded = serde_json::to_string(&author).expect("serialize author");
+            assert_eq!(encoded, wire, "{author:?} must encode as {wire}");
+
+            let decoded: LineAuthor = serde_json::from_str(wire).expect("deserialize author");
+            assert_eq!(decoded, author, "{wire} must decode back to {author:?}");
+        }
+    }
+
+    /// A `System` line must round-trip through the store intact — not be
+    /// coerced to `Agent` by any layer between `add` and `snapshot`.
+    #[tokio::test]
+    async fn stored_system_line_is_not_reattributed_to_the_agent() {
+        let mgr = BlackboardManager::new();
+        mgr.add(
+            D,
+            &DOC,
+            None,
+            "Created **bore 1/4** — 18 × 18 × 20 mm · 792 tris".into(),
+            LineAuthor::System,
+        )
+        .await;
+
+        let snap = mgr.snapshot(D, &DOC).await;
+        let line = snap.lines.first().expect("the line was added");
+        assert_eq!(
+            line.author,
+            LineAuthor::System,
+            "machine bookkeeping must not be recorded as the agent's words",
+        );
     }
 
     #[tokio::test]

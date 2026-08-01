@@ -108,22 +108,22 @@ async function fetchSnapshot(scope: BlackboardScope): Promise<BlackboardSnapshot
   }
 }
 
-/** The backend's `author` enum accepts only `user`/`agent` (verified live:
- *  `POST /api/blackboard/entries` with `author:"system"` → 422 "unknown
- *  variant `system`, expected `user` or `agent`"). The frontend's third
- *  `'system'` value (toolbar feedback, ACP failure lines — see
- *  `stores/blackboard-store.ts`'s `LineAuthor` doc) has no backend
- *  counterpart to preserve, so it rides as `'agent'` on the wire — the
- *  closest honest fit (the app/kernel said it, not the human) — rather than
- *  422ing silently. Without this mapping `postEntry` "succeeds" (fetch
- *  only rejects on network failure, never on a non-2xx status, so the
- *  caller's try/catch never sees the 422) while the line never actually
- *  lands server-side; the next poll's `applyRemoteSnapshot` then repaints
- *  from the backend's truth — which never had the line — and it silently
- *  vanishes from the board. That is exactly the failure mode the honesty
- *  contract (never a blank/disappearing line) forbids. */
-function wireAuthor(author: BlackboardLine['author']): 'user' | 'agent' {
-  return author === 'user' ? 'user' : 'agent'
+/** Authorship now survives the round-trip: `api-server/src/blackboard.rs`'s
+ *  `LineAuthor` carries `System` alongside `User`/`Agent`, so the board no
+ *  longer records its own bookkeeping ("Created …" echoes, sync failures,
+ *  toolbar feedback) as something the agent said. It previously downgraded
+ *  `system` to `agent` on the way out, because the wire had no third value
+ *  and a 422 would make the line vanish silently — a fetch only rejects on
+ *  network failure, so `postEntry` "succeeded" while nothing landed, and
+ *  the next poll's `applyRemoteSnapshot` repainted from a backend that had
+ *  never seen it. The line survived; the truth about who wrote it did not.
+ *
+ *  ⚠ This requires the rebuilt backend. Against a binary predating the
+ *  `System` variant every system line 422s and disappears exactly as
+ *  described above, so the server must be restarted before the app is
+ *  reloaded — not after. */
+function wireAuthor(author: BlackboardLine['author']): 'user' | 'agent' | 'system' {
+  return author
 }
 
 async function postEntry(scope: BlackboardScope, line: BlackboardLine): Promise<void> {
