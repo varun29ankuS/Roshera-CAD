@@ -3,6 +3,7 @@ import { stringify as yamlStringify } from 'yaml'
 import { cn } from '@/lib/utils'
 import { processBlackboardMessage } from '@/lib/ai-client'
 import { detectEnumeratedChoices } from '@/lib/blackboard-cards'
+import { classifyBlackboardContent } from '@/lib/blackboard-content'
 import type { BlackboardLine as Line } from '@/stores/blackboard-store'
 import { MessageMarkdown } from './MessageMarkdown'
 import { StreamingLineText } from './StreamingLineText'
@@ -312,6 +313,16 @@ export function BlackboardLine({ line, onCommit, onDelete, streaming = false, on
   )
   const isSystem = line.author === 'system'
 
+  // Content class decides both editability and shape (see
+  // `lib/blackboard-content.ts`'s module doc). `evidence` is machine-
+  // authored or verbatim-forwarded — the kernel's own testimony — and gets
+  // NO edit path at all, not a disabled one: no `onClick`, no `setEditing`,
+  // no "Click to edit" affordance. `control`/`reasoning` keep today's
+  // editing behaviour exactly.
+  const contentClass = classifyBlackboardContent(line)
+  const isEvidence = contentClass === 'evidence'
+  const isControl = contentClass === 'control'
+
   return (
     <div className="group/line flex items-start gap-2 px-3 py-1.5 hover:bg-white/[0.03] rounded-md">
       {/* Origin marker — subtle, distinguishes agent vs user vs system authorship. */}
@@ -368,11 +379,49 @@ export function BlackboardLine({ line, onCommit, onDelete, streaming = false, on
               onCancel={onCancel}
             />
           </div>
+        ) : isEvidence ? (
+          // Evidence: the kernel's own testimony (a certificate fence, a
+          // "Created …" echo, app bookkeeping). The edit path is ABSENT,
+          // not disabled — no onClick, no setEditing, no "Click to edit"
+          // title. Denser and quieter than prose: this is the record, not
+          // the argument. Text stays selectable; deleting stays allowed
+          // (a deletion is visible, an edit is invisible and looks
+          // authored — that is the whole distinction).
+          <div className="flex w-full items-start gap-1.5 select-text text-left text-xs leading-snug text-foreground/60">
+            {isAgent && line.turnStatus && <TurnStatusGlyph status={line.turnStatus} />}
+            <span className="min-w-0 flex-1">
+              {line.text.trim() ? (
+                <CardActionsContext.Provider value={cardActions}>
+                  <RevealContext.Provider value={reveal}>
+                    <MessageMarkdown content={line.text} />
+                  </RevealContext.Provider>
+                </CardActionsContext.Provider>
+              ) : (
+                <span className="text-white/30 italic">Empty line</span>
+              )}
+              {isSystem && line.repeatCount !== undefined && line.repeatCount > 1 && (
+                <span
+                  className="ml-1 text-[10px] text-muted-foreground/50"
+                  title={`Reposted ${line.repeatCount} times — identical consecutive lines collapse into one`}
+                >
+                  (×{line.repeatCount})
+                </span>
+              )}
+            </span>
+          </div>
         ) : (
           <button
             type="button"
             onClick={() => setEditing(true)}
-            className="flex w-full items-start gap-1.5 cursor-text select-text text-left text-sm leading-relaxed text-foreground/90"
+            className={cn(
+              'flex w-full items-start gap-1.5 cursor-text select-text text-left text-sm leading-relaxed text-foreground/90',
+              // Control: a closed-set question — reads as interactive.
+              // Reuses card-chrome's `info` (sky) accent, the same colour
+              // ChoicesCard/DetectedChoicesCard already use for "awaiting
+              // your choice" — state, not decoration.
+              isControl &&
+                'rounded-sm border-l-2 border-sky-500/40 bg-sky-500/[0.04] pl-1.5 hover:bg-sky-500/[0.08]',
+            )}
             title="Click to edit"
           >
             {isAgent && line.turnStatus && <TurnStatusGlyph status={line.turnStatus} />}
