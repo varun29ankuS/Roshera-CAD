@@ -634,6 +634,38 @@ const EXPECTED_PUBLIC_ROUTES: &[&str] = &[
     "/api/auth/refresh",   // credential rotation
 ];
 
+/// Password rotation must be declared, and must require a credential.
+///
+/// The census above would catch this too, but only as one unnamed entry in
+/// a diff of route sets. This says the thing directly, because the failure
+/// it guards is specific and severe: `/api/auth/password` sits beside four
+/// routes that ARE deliberately open, and the difference is that those
+/// issue a credential to someone who has none while this one changes an
+/// existing credential. Exempt by a careless copy of the line above it, it
+/// becomes unauthenticated account takeover for any known username.
+#[test]
+fn password_change_is_declared_and_requires_a_credential() {
+    const PATH: &str = "/api/auth/password";
+
+    assert!(
+        declared_route_paths().iter().any(|p| p == PATH),
+        "{PATH} is not declared in main.rs — the handler exists but nothing routes to it, \
+         so password rotation is unreachable and this test is guarding nothing."
+    );
+
+    assert!(
+        !crate::auth_middleware::path_is_exempt(PATH),
+        "{PATH} is reachable WITHOUT a credential. Changing a password must only ever run \
+         for an already-identified caller; open, it is account takeover for any known username."
+    );
+
+    assert!(
+        !EXPECTED_PUBLIC_ROUTES.contains(&PATH),
+        "{PATH} was added to the reviewed public allowlist. Rotating a credential is not a \
+         credential-issuing route and does not belong there."
+    );
+}
+
 #[test]
 fn unprotected_route_census_matches_reviewed_allowlist() {
     use std::collections::BTreeSet;

@@ -9575,6 +9575,13 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route("/api/auth/register", post(register))
         .route("/api/auth/logout", post(logout))
         .route("/api/auth/refresh", post(refresh_token))
+        // Password rotation. Deliberately NOT in the auth-middleware
+        // open-path list: unlike login/register/refresh, which exist to
+        // ISSUE a credential to someone who has none, this one CHANGES a
+        // credential and so must only ever run for an already-identified
+        // caller. Left open it would be an unauthenticated account
+        // takeover for any known username.
+        .route("/api/auth/password", post(change_password))
         // API-key lifecycle (Slice 5). Deliberately NOT in the
         // auth-middleware open-path list: every route here requires a
         // validated credential, and provisioning is self-service only.
