@@ -303,6 +303,24 @@ function installBoxMock({ failBoxAt = 0 } = {}) {
 
 const boxOp = (w = 10) => ({ tool: "create_box", args: { width: w, depth: 10, height: 5 } });
 
+// The intent gate (gates.ts, 2026-08-01) refuses solid-mutating ops until a
+// named intent checkpoint is open — session-wide (module state), so opening
+// one here, through the REAL checkpoint path under a canned fetch, covers
+// every cad_program block below.
+{
+  const { table } = buildTableWithControls();
+  const { restore } = installBoxMock();
+  try {
+    const res = await table.get("timeline_checkpoint").handler({
+      name: "S3/S4 fixture: 10x10x5 boxes for ledger + certificate proofs",
+      branch: "main",
+    });
+    if (res?.isError) fail(`intent fixture checkpoint failed: ${res.content?.[0]?.text}`);
+  } finally {
+    restore();
+  }
+}
+
 console.log("(a) cad_program: invalid 3rd op → typed validation report, ZERO executed");
 {
   const { table } = buildTableWithControls();

@@ -94,11 +94,16 @@ console.log("(s) SURFACE: kb_lookup in the FULL table only; minimal bill unmoved
   // same class of issue scale_s2.mjs's own comment documents for the
   // blackboard commit. Not this task's regression; re-pinned so this test
   // still catches a REAL future move.
+  // Pin moved 5139 → 5142 (2026-08-01 dispatch-gate work): +3 tokens net on
+  // the resident surface — boolean gained the acknowledge_unsound repair-flow
+  // field (unsound-base gate) and timeline_checkpoint's description now
+  // states the intent-gate contract; both deliberate, both trimmed to near
+  // token-neutral. kb_lookup itself still costs the minimal surface zero.
   const minimalBill = billFor(table, MINIMAL_SURFACE);
-  if (minimalBill === 5139)
-    pass(`minimal bill ${minimalBill} == re-based pin 5139 (kb_lookup's zero marginal cost holds; 2026-08-01 dimensioning/flange work moved it 0 tokens)`);
+  if (minimalBill === 5142)
+    pass(`minimal bill ${minimalBill} == pin 5142 (kb_lookup's zero marginal cost holds)`);
   else
-    fail(`minimal bill ${minimalBill} != 5139 — something moved the resident surface`);
+    fail(`minimal bill ${minimalBill} != 5142 — something moved the resident surface`);
 }
 
 // ── (p) PROVENANCE ──────────────────────────────────────────────────────────

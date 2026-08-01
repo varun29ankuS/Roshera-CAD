@@ -18,6 +18,7 @@
 import { z } from "zod";
 import { toJsonSchemaCompat } from "@modelcontextprotocol/sdk/server/zod-json-schema-compat.js";
 import { nextTurn } from "./core.js";
+import { preDispatchGate, recordDispatchOutcome } from "./gates.js";
 
 // ─── The capture shim ──────────────────────────────────────────────────────
 
@@ -92,10 +93,23 @@ export class ToolTable implements ToolHost {
     // invoke() (metatools.ts), or cad_program()'s batch loop all call
     // `entry.handler(...)`, so wrapping it HERE is the single choke point that
     // covers all three without touching any of them.
+    //
+    // The same choke point runs the CONSTRAINT gates (gates.ts): the refusal
+    // cache, the intent gate, and the unsound-base gate all fire before the
+    // real handler, and every outcome (gated or handled) is recorded after —
+    // so no call path can retry a refused call, build without a declared
+    // intent, or stack work on an unsound base, without the gate seeing it.
     const rawHandler = t.handler;
-    const wrapped: RegisteredTool["handler"] = (args, extra) => {
-      nextTurn();
-      return rawHandler(args, extra);
+    const wrapped: RegisteredTool["handler"] = async (args, extra) => {
+      const turn = nextTurn();
+      const gated = await preDispatchGate(t.name, args, turn);
+      if (gated) {
+        recordDispatchOutcome(t.name, args, gated, turn);
+        return gated;
+      }
+      const result = await rawHandler(args, extra);
+      recordDispatchOutcome(t.name, args, result, turn);
+      return result;
     };
     this.tools.set(t.name, { ...t, handler: wrapped });
   }

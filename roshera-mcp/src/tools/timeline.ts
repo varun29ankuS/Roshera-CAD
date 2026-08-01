@@ -346,12 +346,17 @@ export function registerTimelineTools(server: ToolHost) {
 
   server.tool(
     "timeline_checkpoint",
-    "Name the current design state: record a checkpoint capturing the " +
-      "branch's event range — a stable landmark to scrub back to or cite in " +
-      "review. Returns the checkpoint id.",
+    "Declare design INTENT, opening the next feature (mutating calls are " +
+      "refused until a checkpoint is open). Name it in engineering language " +
+      "('bolt circle 8 x D18 on D160 B.C.'; 'step 3'-style names are " +
+      "refused); the matching notebook line is written automatically. " +
+      "Captures the branch's event range; returns the checkpoint id.",
     {
-      name: z.string().min(1).describe("checkpoint name, e.g. 'bracket-before-lightening'"),
-      description: z.string().optional().describe("what this state is"),
+      name: z
+        .string()
+        .min(1)
+        .describe("the intent: feature + governing dimensions + where it sits"),
+      description: z.string().optional().describe("reasoning behind the intent (mirrored to the notebook)"),
       branch: z.string().default("main").describe("branch whose event range to capture"),
     },
     async ({ name, description, branch }) => {
@@ -361,7 +366,25 @@ export function registerTimelineTools(server: ToolHost) {
           description,
           branch,
         });
-        return ok(r);
+        // NOTEBOOK MIRROR (audit 2026-08-01 §5): the policy used to ask for a
+        // separate blackboard_add_entry carrying the same intent — a two-call
+        // ritual the model could half-do. The handler writes the line itself,
+        // so "the notebook and the timeline describe one event" is structural.
+        // Best-effort with an honest sidecar: a failed mirror never voids the
+        // recorded checkpoint, and is named rather than silently absent.
+        let notebook_entry: Record<string, unknown>;
+        try {
+          const line = await api("POST", "/api/blackboard/entries", {
+            text: `**Intent** — ${name}${description ? `. ${description}` : ""}`,
+            author: "agent",
+          });
+          notebook_entry = { id: line?.id ?? null };
+        } catch (e) {
+          notebook_entry = {
+            unavailable: e instanceof Error ? e.message : String(e),
+          };
+        }
+        return ok({ checkpoint: r, notebook_entry });
       } catch (e) {
         return refusalOrFail(e);
       }

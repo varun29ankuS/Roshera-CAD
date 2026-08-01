@@ -249,6 +249,13 @@ console.log("(a) INVOKE: validation parity + identical POST body vs direct call"
   };
 
   try {
+    // The intent gate (gates.ts, 2026-08-01) refuses solid-mutating calls
+    // until a named intent checkpoint is open. Open one through the REAL
+    // checkpoint path — the canned fetch answers its POSTs with {}.
+    await table.get("timeline_checkpoint").handler({
+      name: "S2 parity fixture: 10x20x5 box via direct + invoke",
+      branch: "main",
+    });
     // Direct call: SDK parses args through the schema, then calls the handler.
     const obj = normalizeObjectSchema(entry.schema);
     const parsedDirect = (await safeParseAsync(obj ?? entry.schema, goodArgs)).data;
