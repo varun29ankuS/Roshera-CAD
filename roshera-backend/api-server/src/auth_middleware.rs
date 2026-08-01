@@ -163,6 +163,7 @@ fn dev_auth_info() -> AuthInfo {
             Permission::ViewGeometry,
             Permission::ExportGeometry,
             Permission::RecordSession,
+            Permission::ModifySettings,
         ],
         roles: vec!["dev".to_string()],
         is_api_key: false,
@@ -270,7 +271,14 @@ async fn auth_middleware_inner(
     let auth_info = if let Some(token) = auth_header.strip_prefix("Bearer ") {
         validate_jwt(layer.auth_manager.as_ref(), token).await?
     } else if let Some(api_key) = auth_header.strip_prefix("ApiKey ") {
-        validate_api_key(layer.auth_manager.as_ref(), api_key).await?
+        let (info, key_identity) = validate_api_key(layer.auth_manager.as_ref(), api_key).await?;
+        // The verified key's id, exposed to downstream layers so
+        // `agent_activity::record_agent_operations` can attribute an
+        // agent request to the ACP session whose per-session key this
+        // is — the key id is the one certain link (see that module's
+        // attribution contract).
+        request.extensions_mut().insert(key_identity);
+        info
     } else {
         return Err(AuthError {
             error: "Invalid authorization format".to_string(),
@@ -451,6 +459,16 @@ pub async fn require_export_geometry(request: Request, next: Next) -> Response {
     enforce_permission_layer(Permission::ExportGeometry, "export_geometry", request, next).await
 }
 
+/// Route layer for the AI provider connection dialog: `GET/PUT/DELETE
+/// /api/ai/provider`, `POST /api/ai/provider/test`. Applied to the read
+/// as well as the writes — the response surfaces CLI sign-in state and
+/// the credential resolution/shadow report, which is configuration
+/// surface a Viewer-role caller has no business probing even though
+/// none of it is a raw secret.
+pub async fn require_modify_settings(request: Request, next: Next) -> Response {
+    enforce_permission_layer(Permission::ModifySettings, "modify_settings", request, next).await
+}
+
 /// Validate JWT token
 async fn validate_jwt(auth_manager: &AuthManager, token: &str) -> Result<AuthInfo, AuthError> {
     match auth_manager.verify_token(token) {
@@ -480,38 +498,47 @@ async fn validate_jwt(auth_manager: &AuthManager, token: &str) -> Result<AuthInf
     }
 }
 
-/// Validate API key
+/// Validate API key. Returns the derived `AuthInfo` together with the
+/// verified key's identity (`agent_activity::ApiKeyIdentity`) so the
+/// caller can expose the key id — never the secret — to downstream
+/// attribution layers.
 async fn validate_api_key(
     auth_manager: &AuthManager,
     api_key: &str,
-) -> Result<AuthInfo, AuthError> {
+) -> Result<(AuthInfo, crate::agent_activity::ApiKeyIdentity), AuthError> {
     match auth_manager.verify_api_key(api_key) {
         Ok(key_info) => {
             info!("API key validated for user: {}", key_info.user_id);
 
-            // Convert string permissions to Permission enum
+            // Decode the stored permission strings back into `Permission`
+            // via the one canonical codec (`Permission::from_str`,
+            // `session-manager/src/permissions.rs`). This used to match
+            // a hand-written snake_case alphabet ("create_geometry", …)
+            // that no writer in the codebase ever produced — every key's
+            // permissions are minted and persisted in the PascalCase
+            // form (`get_user_permission_strings`, `provision_api_key`,
+            // the SQL persistence path in `database.rs`), so every
+            // string here silently fell through to `None` and any
+            // API-key-authenticated request — including a goose ACP
+            // session's minted agent key — carried an EMPTY permission
+            // set no matter what it was provisioned with.
             let permissions: Vec<Permission> = key_info
                 .permissions
                 .iter()
-                .filter_map(|p| match p.as_str() {
-                    "create_geometry" => Some(Permission::CreateGeometry),
-                    "modify_geometry" => Some(Permission::ModifyGeometry),
-                    "delete_geometry" => Some(Permission::DeleteGeometry),
-                    "view_geometry" => Some(Permission::ViewGeometry),
-                    "export_geometry" => Some(Permission::ExportGeometry),
-                    "record_session" => Some(Permission::RecordSession),
-                    _ => None,
-                })
+                .filter_map(|p| Permission::from_str(p))
                 .collect();
 
-            Ok(AuthInfo {
-                user_id: key_info.user_id,
-                session_id: None,
-                permissions,
-                roles: vec!["api_user".to_string()], // API key role
-                is_api_key: true,
-                principal: key_info.principal,
-            })
+            Ok((
+                AuthInfo {
+                    user_id: key_info.user_id,
+                    session_id: None,
+                    permissions,
+                    roles: vec!["api_user".to_string()], // API key role
+                    is_api_key: true,
+                    principal: key_info.principal,
+                },
+                crate::agent_activity::ApiKeyIdentity(key_info.id),
+            ))
         }
         Err(e) => {
             warn!("API key validation failed: {}", e);
@@ -541,11 +568,161 @@ fn get_default_user_permissions() -> Vec<Permission> {
         Permission::ViewGeometry,
         Permission::ExportGeometry,
         Permission::RecordSession,
+        // Lets an authenticated JWT session use the AI provider
+        // connection dialog (`GET/PUT/DELETE /api/ai/provider`, `POST
+        // /api/ai/provider/test`). Without this, every logged-in human
+        // frontend user gets 403'd on the dialog under
+        // `AuthPosture::Required` — `Permission::ModifySettings` existed
+        // in the enum but was granted to nobody until this line.
+        Permission::ModifySettings,
     ]
 }
 
-/// Rate limiting middleware (`AuthManager::check_rate_limit`, 100
-/// req/min per client).
+/// A rate-limit bucket class. Each class gets its own independent budget
+/// per identity — see [`rate_limit_middleware`] — so that high-frequency
+/// traffic in one class (the viewport polling `/api/parts`, an agent
+/// turn issuing dozens of MCP tool calls) cannot exhaust the budget a
+/// low-frequency class needs (opening the AI-provider dialog).
+///
+/// # Per-class budgets and the worst-case total
+///
+/// | Class            | Budget       | Why                                                             |
+/// |-------------------|-------------|-------------------------------------------------------------------|
+/// | [`Poll`](Self::Poll)             | 300 req/min | Frequent, non-mutating browser reads (parts/datums/hierarchy/scene/perception/viewport-bridge status), often several panels polling concurrently. |
+/// | [`Agent`](Self::Agent)           | 240 req/min | `/acp` plus any MCP-tagged request; must absorb one full agent turn's burst of tool calls without any single call tripping the limiter. |
+/// | [`Mutation`](Self::Mutation)     | 100 req/min | Everything else: real user/agent actions that change state, plus the auth-exempt `/health` probe. Unchanged from the original single-bucket figure. |
+/// | [`ProviderConfig`](Self::ProviderConfig) | 30 req/min | The AI-provider dialog (`/api/ai/provider`, all methods) — low-frequency human configuration traffic that must never starve behind poll/mutation noise; this is the exact bug this module fixes. |
+/// | [`ProviderTest`](Self::ProviderTest)     | 10 req/min | `/api/ai/provider/test` makes a real outbound vendor round trip, so it is deliberately tighter than `ProviderConfig` rather than sharing its bucket or being exempted outright. |
+///
+/// **Worst-case total per identity per minute is now 300 + 240 + 100 +
+/// 30 + 10 = 680**, up from the original single 100/min bucket.
+/// Splitting one bucket into five necessarily raises the ceiling a
+/// client *may* reach across all classes combined — that is the
+/// intended trade, not an oversight: the goal is that no class can
+/// starve another, not a higher single-class ceiling. Every individual
+/// bucket above is still bounded (none of them is "unlimited", and none
+/// was produced by taking the old 100 and inflating it — `Mutation`
+/// keeps the original figure exactly).
+///
+/// No path in this classifier is unbounded: [`classify_request`] always
+/// returns exactly one of the five classes above, so every request
+/// lands in a bucket with a finite budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RateLimitClass {
+    /// Frequent, non-mutating browser/viewport reads. Matched by
+    /// GET/HEAD on a known read-only prefix (see [`is_poll_prefix`]).
+    Poll,
+    /// `/acp` traffic and any request carrying a non-empty
+    /// `X-Roshera-Agent` header — the same header
+    /// `main::agent_author_layer` reads to attribute kernel ops to the
+    /// requesting agent, sent by the MCP server and any direct agent
+    /// caller. Checked before the poll/mutation split, so an agent's own
+    /// reads (e.g. polling `/api/frame` mid-turn) land here too, not in
+    /// `Poll` or `Mutation`.
+    Agent,
+    /// `GET/PUT/DELETE /api/ai/provider` — the AI-provider connection
+    /// dialog.
+    ProviderConfig,
+    /// `POST /api/ai/provider/test` — same dialog surface as
+    /// `ProviderConfig`, split out because this one call costs a real
+    /// vendor round trip.
+    ProviderTest,
+    /// Everything not matched above: sketch/csketch/boolean/assembly/
+    /// timeline mutations, session and auth-credential routes (including
+    /// `/health`), and any GET that isn't on the poll allowlist.
+    Mutation,
+}
+
+impl RateLimitClass {
+    /// `(bucket label, max requests, window in seconds)`. The label is
+    /// folded into the bucket key (`"{client_id}|{label}"`) so the five
+    /// classes cannot collide inside `AuthManager`'s shared
+    /// `rate_limits` map.
+    const fn budget(self) -> (&'static str, usize, i64) {
+        match self {
+            RateLimitClass::Poll => ("poll", 300, 60),
+            RateLimitClass::Agent => ("agent", 240, 60),
+            RateLimitClass::Mutation => ("mutation", 100, 60),
+            RateLimitClass::ProviderConfig => ("provider-config", 30, 60),
+            RateLimitClass::ProviderTest => ("provider-test", 10, 60),
+        }
+    }
+}
+
+/// Read-only prefixes the frontend/viewport polls continuously (see
+/// `ModelTree.tsx`, `Datums.tsx`, `AgentEyePanel.tsx` in `roshera-app`).
+/// Only GET/HEAD on these prefixes count as [`RateLimitClass::Poll`] —
+/// several of them (`/api/parts`, `/api/datums`, `/api/agent/parts`)
+/// also serve POST/DELETE mutations on the same path (create, clear-all,
+/// rename), which must fall through to [`RateLimitClass::Mutation`]
+/// instead, so the method check in [`classify_request`] is load-bearing,
+/// not incidental.
+const POLL_PREFIXES: &[&str] = &[
+    "/api/parts",
+    "/api/datums",
+    "/api/hierarchy",
+    "/api/scene",
+    "/api/agent",
+    "/api/viewport",
+    // Read-only observed-agent-activity snapshot (`agent_activity.rs`),
+    // polled ~1 Hz by the Blackboard while a turn runs — it must not
+    // drain the caller's Mutation budget. GET-only route; the method
+    // check in `classify_request` keeps this listing safe regardless.
+    "/api/acp/activity",
+];
+
+fn is_poll_prefix(path: &str) -> bool {
+    POLL_PREFIXES.iter().any(|prefix| {
+        path.strip_prefix(prefix)
+            .map(|rest| rest.is_empty() || rest.starts_with('/'))
+            .unwrap_or(false)
+    })
+}
+
+/// Classify a request into a [`RateLimitClass`] for [`rate_limit_middleware`].
+///
+/// Order matters: `/api/ai/provider/test` and `/api/ai/provider` are
+/// checked first so they can never fall into `Agent` (an MCP-tagged
+/// probe of the dialog would otherwise share the agent bucket) or `Poll`
+/// (a GET on the dialog would otherwise share the poll bucket) — both of
+/// which would reintroduce a starvation path for the exact surface this
+/// module protects. `Agent` is checked before the poll/mutation split so
+/// an agent's own read traffic is bounded by the agent budget, not the
+/// human poll budget.
+fn classify_request(request: &Request) -> RateLimitClass {
+    let path = request.uri().path();
+
+    if path == "/api/ai/provider/test" {
+        return RateLimitClass::ProviderTest;
+    }
+    if path == "/api/ai/provider" {
+        return RateLimitClass::ProviderConfig;
+    }
+    if path == "/acp" || path.starts_with("/acp/") {
+        return RateLimitClass::Agent;
+    }
+    let is_agent_traffic = request
+        .headers()
+        .get("x-roshera-agent")
+        .and_then(|h| h.to_str().ok())
+        .is_some_and(|v| !v.is_empty());
+    if is_agent_traffic {
+        return RateLimitClass::Agent;
+    }
+    let method = request.method();
+    if (method == axum::http::Method::GET || method == axum::http::Method::HEAD)
+        && is_poll_prefix(path)
+    {
+        return RateLimitClass::Poll;
+    }
+    RateLimitClass::Mutation
+}
+
+/// Rate limiting middleware. Enforces a separate
+/// [`RateLimitClass`] budget per identity via
+/// `AuthManager::check_rate_limit_budget`, keyed as `"{client_id}|{class
+/// label}"` — see [`RateLimitClass`] for the five classes, their
+/// budgets, and the resulting worst-case total per identity.
 ///
 /// Shares [`AuthLayerState`] with [`auth_middleware`] so the layer knows
 /// the process's resolved [`AuthPosture`] as well as its `AuthManager`.
@@ -564,7 +741,7 @@ fn get_default_user_permissions() -> Vec<Permission> {
 ///   degenerates to a *single shared bucket for the entire process*:
 ///   meaningless (it cannot distinguish clients) and actively harmful —
 ///   a local frontend viewport that polls the backend continuously alone
-///   exhausts the 100/min budget and drives the whole API to 429 with no
+///   would exhaust its budget and drive the whole API to 429 with no
 ///   recovery. Bypassing it here is consistent with the dev-insecure
 ///   posture already disabling the auth gates this layer sits beside; the
 ///   posture is loud (warn-on-every-boot in [`AuthPosture::from_env`])
@@ -594,8 +771,16 @@ pub async fn rate_limit_middleware(
             .to_string()
     };
 
-    // Check rate limit
-    match layer.auth_manager.check_rate_limit(&client_id) {
+    let class = classify_request(&request);
+    let (label, max_requests, window_secs) = class.budget();
+    let bucket_key = format!("{client_id}|{label}");
+
+    // Check rate limit against this class's own bucket.
+    match layer.auth_manager.check_rate_limit_budget(
+        &bucket_key,
+        max_requests,
+        chrono::Duration::seconds(window_secs),
+    ) {
         Ok(_) => Ok(next.run(request).await),
         Err(_) => Err(AuthError {
             error: "Rate limit exceeded".to_string(),
@@ -648,6 +833,68 @@ mod tests {
     #[tokio::test]
     async fn test_auth_middleware() {
         // Test implementation
+    }
+
+    /// THE discriminating regression test for `validate_api_key`'s
+    /// decode alphabet. Every writer in this codebase mints/persists
+    /// permission strings in PascalCase (`get_user_permission_strings`,
+    /// `provision_api_key_handler`, the goose ACP agent-key mint in
+    /// `goose_acp.rs`, the SQL round-trip in `session-manager`'s
+    /// `database.rs`), but this function's decoder used to match a
+    /// snake_case alphabet ("create_geometry", …) that no writer ever
+    /// produced — so `filter_map` fell through to `None` on every
+    /// string and any API-key-authenticated request carried an EMPTY
+    /// permission set no matter what it was provisioned with. This
+    /// mints a key exactly the way production does and decodes it
+    /// exactly the way `auth_middleware` does on every request.
+    #[tokio::test]
+    async fn api_key_permissions_survive_the_mint_and_validate_round_trip() {
+        let auth_manager = AuthManager::new(
+            session_manager::AuthConfig::default(),
+            "test-secret-not-a-real-jwt-key",
+        )
+        .expect("AuthManager::new with a default config and no DB must succeed");
+
+        let granted = vec![
+            Permission::ViewGeometry,
+            Permission::CreateGeometry,
+            Permission::ModifyGeometry,
+            Permission::ExportGeometry,
+            Permission::AddComments,
+            Permission::UndoRedo,
+        ];
+        let (raw_key, _minted) = auth_manager
+            .provision_api_key(
+                "round-trip-user",
+                "test-key",
+                granted.iter().map(|p| p.as_str().to_string()).collect(),
+                Some(1),
+                PrincipalKind::Agent {
+                    model: "test:model".to_string(),
+                },
+            )
+            .await
+            .expect("provisioning must succeed");
+
+        let (decoded, key_identity) = validate_api_key(&auth_manager, &raw_key)
+            .await
+            .expect("a freshly minted, unexpired key must validate");
+        assert!(
+            !key_identity.0.is_empty(),
+            "the verified key's id must ride along for downstream attribution"
+        );
+
+        let decoded_set: std::collections::HashSet<Permission> =
+            decoded.permissions.into_iter().collect();
+        let expected_set: std::collections::HashSet<Permission> = granted.into_iter().collect();
+        assert_eq!(
+            decoded_set, expected_set,
+            "every permission minted onto an API key must decode back out \
+             through validate_api_key unchanged — a decoder using a \
+             different string alphabet than every writer silently empties \
+             the permission set, which is exactly the live defect this \
+             guards against"
+        );
     }
 
     /// Permission matrix for `enforce_permission`.

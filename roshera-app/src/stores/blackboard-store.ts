@@ -38,13 +38,27 @@ export type LineAuthor = 'user' | 'agent' | 'system'
  * while the agent writes, collapse to a strip the moment geometry is being
  * changed so the viewport takes the space (a user drag overrides either).
  *
- * This is deliberately just a value + setter: today it is driven by the
- * existing streaming path (`processBlackboardMessage` sets `writing`) and by
- * the dev fixture harness; the ACP wiring that will drive `geometry` for
- * real is a later slice — no protocol is invented here. The panel resize is
- * pure presentation and NEVER gates geometry: the viewport is driven by
- * ws-bridge/scene-store and updates when the kernel confirms, regardless of
- * this state.
+ * This is deliberately just a value + setter: it is driven by the legacy
+ * streaming path and by the dev fixture harness (both set only `writing`/
+ * `idle`), and by `lib/acp-blackboard.ts`'s ACP `tool_call`/`tool_call_update`
+ * handlers, which DO set `geometry` — for a provider that actually emits
+ * those frames. Measured live (2026-07-31, two full turns) on the current
+ * default provider path — goose's `claude-code` ACP bridge, a subscription
+ * CLI where tools execute inside the CLI process itself — ZERO `tool_call`
+ * frames arrive; only `usage_update` / `available_commands_update` /
+ * `session_info_update` / `agent_message_chunk` do. So `geometry` is
+ * unreachable on that live path today, even though the agent genuinely
+ * calls tools and builds geometry. `session_info_update`'s `activeRunId`
+ * (non-null while a turn runs) was considered as a substitute signal and
+ * rejected: it toggles once per turn at the same boundaries `runAcpTurn`
+ * already uses for `writing`/`idle`, so it adds no information and cannot
+ * distinguish tool execution from text generation — using it to fake
+ * `geometry` would be exactly the prose-heuristic dishonesty this state is
+ * supposed to avoid. Do NOT build progressive-build pacing on `geometry`
+ * until a provider path is confirmed to emit real `tool_call` frames. The
+ * panel resize is pure presentation and NEVER gates geometry: the viewport
+ * is driven by ws-bridge/scene-store and updates when the kernel confirms,
+ * regardless of this state.
  */
 export type AgentAttention = 'idle' | 'writing' | 'geometry'
 
@@ -68,6 +82,22 @@ export function partScope(partUuid: string): BlackboardScope {
   return `part:${partUuid}`
 }
 
+/**
+ * TURN OUTCOME
+ * ------------
+ * Set once on the agent's own line when its turn concludes — drives the
+ * completed/cancelled/failed glyph in `BlackboardLine.tsx`, using the same
+ * Check/X/CircleSlash vocabulary as `cards/card-chrome.tsx`'s `Claim`
+ * (emerald / red / amber). This is a TURN-lifecycle marker, not a geometry
+ * verdict: `'completed'` means the agent's turn ended without erroring or
+ * being cancelled — it says nothing about whether the resulting geometry is
+ * sound. That verdict belongs to the certificate cards alone; never let this
+ * glyph imply one the kernel did not give. `'cancelled'` (the user pressed
+ * Stop) gets the neutral amber mark, not a red cross — stopping a turn is
+ * not a failure of it.
+ */
+export type AgentTurnStatus = 'completed' | 'cancelled' | 'failed'
+
 export interface BlackboardLine {
   id: string
   /** Raw source (markdown + `$...$` / `$$...$$` math). Rendered via MessageMarkdown. */
@@ -75,6 +105,18 @@ export interface BlackboardLine {
   author: LineAuthor
   createdAt: number
   updatedAt: number
+  /** How the agent turn that produced this line ended. Undefined for
+   *  user/system lines and for an agent line still streaming (no verdict
+   *  yet — see `AgentTurnStatus`'s doc). */
+  turnStatus?: AgentTurnStatus
+  /** Set (and incremented) only when `addLine` collapses a repeated,
+   *  identical, CONSECUTIVE system line into this one rather than
+   *  appending a new line — e.g. a resync failure that reposts the same
+   *  text on every WS reconnect. Undefined/1 means "posted once."
+   *  `BlackboardLine.tsx` renders it as a trailing `(×N)`. Never set for
+   *  agent/user lines — a person's or the model's repeated words are
+   *  content, not bookkeeping spam. */
+  repeatCount?: number
 }
 
 export type BlackboardEvent =
@@ -189,6 +231,10 @@ interface BlackboardState {
   /** Live progressive update (agent streaming). Same as editLine but does not
    *  spam the event log per chunk — see `processBlackboardMessage`. */
   setLineText: (id: string, text: string) => void
+  /** Mark how a turn concluded on this line (see `AgentTurnStatus`). Presentation
+   *  metadata, persisted alongside the line; not logged as its own event —
+   *  it rides along with the `editLine` call that commits the final text. */
+  setLineTurnStatus: (id: string, status: AgentTurnStatus) => void
 
   /**
    * Switch the active notebook to `scope`. Resets `lines`/`events` to that
@@ -214,6 +260,25 @@ function nextLineId(): string {
   return `bb-${Date.now().toString(36)}-${++lineCounter}`
 }
 
+// ── Repeated system-line collapsing ─────────────────────────────────
+//
+// A resync failure ("Scene sync failed (HTTP 401)…") reposts on every WS
+// reconnect. Verified live: during a reconnect storm those reposts are NOT
+// literally back-to-back — a re-delivered geometry echo ("Created …") from
+// the same reconnect lands BETWEEN them, so requiring strict array
+// adjacency (the first cut of this fix) let duplicates back through and
+// still fragmented the build strip. Tracked instead by exact TEXT within a
+// short recency window, independent of what else was appended in between:
+// the line's POSITION stays where it first appeared (never reordered to
+// the end), only its `repeatCount`/`updatedAt` change. `system`-only, by
+// exact text, per scope — an agent's or a user's repeated words are
+// content, never merged.
+const RECENT_SYSTEM_LINE_WINDOW_MS = 15_000
+const recentSystemLines = new Map<string, { id: string; lastAt: number }>()
+function recentSystemLineKey(scope: BlackboardScope, text: string): string {
+  return `${scope} ${text}`
+}
+
 function persist(scope: BlackboardScope, state: Pick<BlackboardState, 'lines' | 'events'>): void {
   adapter.save(scope, { lines: state.lines, events: state.events })
 }
@@ -236,8 +301,31 @@ export const useBlackboardStore = create<BlackboardState>((set, get) => ({
   streamingLineId: null,
 
   addLine: (text, author) => {
-    const id = nextLineId()
     const now = Date.now()
+    const state0 = get()
+    const key = recentSystemLineKey(state0.activeScope, text)
+    const recent = author === 'system' ? recentSystemLines.get(key) : undefined
+    if (recent && now - recent.lastAt <= RECENT_SYSTEM_LINE_WINDOW_MS) {
+      const stillPresent = state0.lines.some((l) => l.id === recent.id)
+      if (stillPresent) {
+        recentSystemLines.set(key, { id: recent.id, lastAt: now })
+        set((state) => {
+          const lines = state.lines.map((l) =>
+            l.id === recent.id
+              ? { ...l, updatedAt: now, repeatCount: (l.repeatCount ?? 1) + 1 }
+              : l,
+          )
+          persist(state.activeScope, { lines, events: state.events })
+          return { lines }
+        })
+        return recent.id
+      }
+      // The tracked line was deleted (e.g. the user removed it) — fall
+      // through and mint a fresh one below.
+    }
+
+    const id = nextLineId()
+    if (author === 'system') recentSystemLines.set(key, { id, lastAt: now })
     set((state) => {
       const index = state.lines.length
       const lines = [
@@ -257,7 +345,24 @@ export const useBlackboardStore = create<BlackboardState>((set, get) => ({
   editLine: (id, text) =>
     set((state) => {
       const existing = state.lines.find((l) => l.id === id)
-      if (!existing || existing.text === text) return state
+      if (!existing) return state
+      // NOTE: this used to also bail out when `existing.text === text` (a
+      // pure no-op optimization). That is UNSOUND for the streaming path:
+      // `setLineText` (below) mutates `lines` in place WITHOUT persisting,
+      // by design, so the in-memory text can already equal the final
+      // streamed value by the time `runAcpTurn` (`lib/acp-blackboard.ts`)
+      // calls `editLine(lineId, finalText)` to commit it. The equality
+      // check then saw "nothing changed" and skipped BOTH the event log
+      // entry and `persist()` — so the agent's whole reply rendered live
+      // but was never written to the backend. The next poll's
+      // `applyRemoteSnapshot` (`lib/blackboard-api.ts`) then repainted the
+      // panel from the (still-empty) backend truth, silently blanking a
+      // reply that had just streamed in correctly — verified live
+      // (2026-07-31/08-01): the line read "I'll create a 30 mm cube…"
+      // immediately after the turn, then "Empty line — click to edit"
+      // after a reload. A redundant PATCH for a genuinely no-op manual
+      // edit is a harmless idempotent write; a silently dropped agent
+      // reply is not.
       const now = Date.now()
       const lines = state.lines.map((l) =>
         l.id === id ? { ...l, text, updatedAt: now } : l,
@@ -293,6 +398,13 @@ export const useBlackboardStore = create<BlackboardState>((set, get) => ({
       const lines = state.lines.map((l) =>
         l.id === id ? { ...l, text, updatedAt: Date.now() } : l,
       )
+      return { lines }
+    }),
+
+  setLineTurnStatus: (id, status) =>
+    set((state) => {
+      const lines = state.lines.map((l) => (l.id === id ? { ...l, turnStatus: status } : l))
+      persist(state.activeScope, { lines, events: state.events })
       return { lines }
     }),
 

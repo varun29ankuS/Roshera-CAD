@@ -128,12 +128,33 @@ impl BlackboardScope {
 // ── Line author ─────────────────────────────────────────────────────
 
 /// Origin of a line. Matches the frontend `LineAuthor` union
-/// (`'user' | 'agent'`), serialised lower-case.
+/// (`'user' | 'agent' | 'system'`), serialised lower-case.
+///
+/// `System` exists because the board must not attribute its own
+/// bookkeeping to the agent. Before it was added the wire carried only
+/// `user`/`agent`, so the app's machine-written lines — per-operation
+/// "Created …" echoes, sync failures, toolbar feedback — were minted
+/// locally as `system` and then downgraded to `agent` on the way out
+/// (the alternative, a 422, made the line vanish silently). The result
+/// was a notebook that recorded the app's words as the agent's: on
+/// 2026-08-01, 36 of 38 stored lines read `agent` and none read
+/// `system`, including every line no agent had written. A kernel that
+/// cannot lie about geometry should not lie about who said something.
+///
+/// ⚠ "stored" means in-memory only. `BlackboardManager` holds its
+/// notebooks in a `DashMap` and writes nothing to disk, so every line —
+/// the reasoning record this panel exists to keep — is lost on restart.
+/// That is a separate gap from authorship and is not fixed here.
+///
+/// Consumers must treat this as a THIRD state, not a flavour of agent:
+/// `System` is the machine talking about itself, `Agent` is a model's
+/// engineering, `User` is the human's. Only the last two are content.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LineAuthor {
     User,
     Agent,
+    System,
 }
 
 // ── Line ────────────────────────────────────────────────────────────
@@ -322,73 +343,142 @@ pub struct BlackboardManager {
     notebooks: DashMap<String, Arc<RwLock<Notebook>>>,
 }
 
+/// Separator between a document id and a scope's canonical key inside the
+/// manager's storage key. Not a wire format — never parsed back, only ever
+/// compared as a whole-key or as a `starts_with` prefix — so any character is
+/// safe; chosen to be visually obvious in logs/debuggers.
+const DOC_SEP: &str = "\u{1}";
+
 impl BlackboardManager {
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Resolve (or lazily create) the notebook handle for a scope. Keying by
-    /// the scope's canonical string means each part / assembly / document gets
-    /// its own isolated notebook with no new storage shape.
-    fn notebook(&self, scope: &BlackboardScope) -> Arc<RwLock<Notebook>> {
+    /// The storage key for a scope WITHIN a document: every notebook is
+    /// doubly-keyed (document, scope) so switching the active document never
+    /// mixes one document's part notebooks into another's, and switching
+    /// back later finds the original notebook exactly as left — Blackboard
+    /// has no separate durability log, so this in-memory partition IS its
+    /// only isolation between documents.
+    fn storage_key(document_id: &str, scope: &BlackboardScope) -> String {
+        format!("{document_id}{DOC_SEP}{}", scope.key())
+    }
+
+    /// Resolve (or lazily create) the notebook handle for a (document, scope)
+    /// pair.
+    fn notebook(&self, document_id: &str, scope: &BlackboardScope) -> Arc<RwLock<Notebook>> {
         self.notebooks
-            .entry(scope.key())
+            .entry(Self::storage_key(document_id, scope))
             .or_insert_with(|| Arc::new(RwLock::new(Notebook::default())))
             .value()
             .clone()
     }
 
-    /// Full snapshot of one scope's notebook.
-    pub async fn snapshot(&self, scope: &BlackboardScope) -> BlackboardSnapshot {
-        self.notebook(scope).read().await.snapshot()
+    /// Full snapshot of one document's scope notebook.
+    pub async fn snapshot(&self, document_id: &str, scope: &BlackboardScope) -> BlackboardSnapshot {
+        self.notebook(document_id, scope).read().await.snapshot()
     }
 
-    /// Append a line to a scope. `line_id` lets the caller supply a
-    /// pre-allocated id (the frontend); `None` gets a server-generated one.
+    /// Append a line to a document's scope. `line_id` lets the caller supply
+    /// a pre-allocated id (the frontend); `None` gets a server-generated one.
     /// Returns the created (or, on a duplicate id, the existing) line.
     pub async fn add(
         &self,
+        document_id: &str,
         scope: &BlackboardScope,
         line_id: Option<String>,
         text: String,
         author: LineAuthor,
     ) -> BlackboardLine {
-        self.notebook(scope)
+        self.notebook(document_id, scope)
             .write()
             .await
             .add(line_id, text, author)
     }
 
-    /// Edit a line within a scope. `None` if the line id is unknown in it.
+    /// Edit a line within a document's scope. `None` if the line id is
+    /// unknown in it.
     pub async fn edit(
         &self,
+        document_id: &str,
         scope: &BlackboardScope,
         line_id: &str,
         text: String,
     ) -> Option<BlackboardLine> {
-        self.notebook(scope).write().await.edit(line_id, text)
+        self.notebook(document_id, scope)
+            .write()
+            .await
+            .edit(line_id, text)
     }
 
-    /// Delete a line within a scope. `None` if the line id is unknown in it.
-    pub async fn delete(&self, scope: &BlackboardScope, line_id: &str) -> Option<BlackboardLine> {
-        self.notebook(scope).write().await.delete(line_id)
+    /// Delete a line within a document's scope. `None` if the line id is
+    /// unknown in it.
+    pub async fn delete(
+        &self,
+        document_id: &str,
+        scope: &BlackboardScope,
+        line_id: &str,
+    ) -> Option<BlackboardLine> {
+        self.notebook(document_id, scope)
+            .write()
+            .await
+            .delete(line_id)
     }
 
-    /// Clear one scope's notebook (lines + events).
-    pub async fn clear(&self, scope: &BlackboardScope) {
-        self.notebook(scope).write().await.clear();
+    /// Clear one document's scope notebook (lines + events).
+    pub async fn clear(&self, document_id: &str, scope: &BlackboardScope) {
+        self.notebook(document_id, scope).write().await.clear();
     }
 
-    /// Edit a line whose owning scope the caller did not specify, by searching
-    /// every existing notebook for the id. This keeps a bare
-    /// `PATCH /api/blackboard/entries/{id}` (no scope) working for backward
-    /// compatibility — line ids are globally unique, so the first match is the
-    /// correct one. `None` if no scope holds the id.
-    pub async fn edit_any_scope(&self, line_id: &str, text: String) -> Option<BlackboardLine> {
-        // Snapshot the handles first so we never hold a DashMap shard guard
-        // across the `.await` on the per-notebook RwLock.
-        let handles: Vec<_> = self.notebooks.iter().map(|e| e.value().clone()).collect();
-        for nb in handles {
+    /// Drop every notebook belonging to one document, across every scope
+    /// (`Document`, every `Part`, every `Assembly`). Called by `DELETE
+    /// /api/documents/{id}` after the durable delete commits. The
+    /// Blackboard has no separate durability log — this in-memory removal
+    /// IS the deletion for it, so there is nothing here that can partially
+    /// fail or need rollback.
+    pub fn purge_document(&self, document_id: &str) {
+        let prefix = format!("{document_id}{DOC_SEP}");
+        self.notebooks.retain(|k, _| !k.starts_with(&prefix));
+    }
+
+    /// Whether a (document, scope) notebook currently has an entry in the
+    /// manager. Unlike [`Self::snapshot`] this never lazily creates one —
+    /// it exists purely so tests can distinguish "purged" from "never
+    /// written", which an empty snapshot cannot do (a fresh notebook is
+    /// also empty).
+    #[cfg(test)]
+    pub(crate) fn has_notebook(&self, document_id: &str, scope: &BlackboardScope) -> bool {
+        self.notebooks
+            .contains_key(&Self::storage_key(document_id, scope))
+    }
+
+    /// Notebook handles belonging to one document, regardless of scope.
+    /// Snapshots the handles first so callers never hold a DashMap shard
+    /// guard across an `.await` on the per-notebook `RwLock`.
+    fn handles_for_document(&self, document_id: &str) -> Vec<Arc<RwLock<Notebook>>> {
+        let prefix = format!("{document_id}{DOC_SEP}");
+        self.notebooks
+            .iter()
+            .filter(|e| e.key().starts_with(&prefix))
+            .map(|e| e.value().clone())
+            .collect()
+    }
+
+    /// Edit a line whose owning scope the caller did not specify, by
+    /// searching every notebook IN THE GIVEN DOCUMENT for the id. This keeps
+    /// a bare `PATCH /api/blackboard/entries/{id}` (no scope) working for
+    /// backward compatibility — line ids are globally unique within a
+    /// document, so the first match is the correct one. Scoped to
+    /// `document_id` so a line id colliding across documents (unlikely, but
+    /// the id space is not partitioned) can never edit the wrong document's
+    /// line. `None` if no scope in the document holds the id.
+    pub async fn edit_any_scope(
+        &self,
+        document_id: &str,
+        line_id: &str,
+        text: String,
+    ) -> Option<BlackboardLine> {
+        for nb in self.handles_for_document(document_id) {
             if let Some(line) = nb.write().await.edit(line_id, text.clone()) {
                 return Some(line);
             }
@@ -397,11 +487,15 @@ impl BlackboardManager {
     }
 
     /// Delete a line whose owning scope the caller did not specify, by
-    /// searching every notebook for the id. Backward-compat twin of
-    /// [`Self::edit_any_scope`]. `None` if no scope holds the id.
-    pub async fn delete_any_scope(&self, line_id: &str) -> Option<BlackboardLine> {
-        let handles: Vec<_> = self.notebooks.iter().map(|e| e.value().clone()).collect();
-        for nb in handles {
+    /// searching every notebook in the given document for the id.
+    /// Backward-compat, document-scoped twin of [`Self::edit_any_scope`].
+    /// `None` if no scope in the document holds the id.
+    pub async fn delete_any_scope(
+        &self,
+        document_id: &str,
+        line_id: &str,
+    ) -> Option<BlackboardLine> {
+        for nb in self.handles_for_document(document_id) {
             if let Some(line) = nb.write().await.delete(line_id) {
                 return Some(line);
             }
@@ -529,7 +623,8 @@ pub async fn get_blackboard(
     Query(q): Query<ScopeQuery>,
 ) -> Result<Json<BlackboardSnapshot>, ApiError> {
     let scope = resolve_scope(&state, q.scope.as_deref(), q.part_id.as_deref())?;
-    Ok(Json(state.blackboard.snapshot(&scope).await))
+    let document_id = state.active_document.read().await.clone();
+    Ok(Json(state.blackboard.snapshot(&document_id, &scope).await))
 }
 
 /// `POST /api/blackboard/entries` — append a line to a scope (+ `add`
@@ -540,9 +635,10 @@ pub async fn add_entry(
     Json(req): Json<AddEntryRequest>,
 ) -> Result<Json<BlackboardLine>, ApiError> {
     let scope = resolve_scope(&state, req.scope.as_deref(), req.part_id.as_deref())?;
+    let document_id = state.active_document.read().await.clone();
     let line = state
         .blackboard
-        .add(&scope, req.id, req.text, req.author)
+        .add(&document_id, &scope, req.id, req.text, req.author)
         .await;
     Ok(Json(line))
 }
@@ -558,11 +654,20 @@ pub async fn edit_entry(
     Query(q): Query<ScopeQuery>,
     Json(req): Json<EditEntryRequest>,
 ) -> Result<Json<BlackboardLine>, ApiError> {
+    let document_id = state.active_document.read().await.clone();
     let result = match (q.scope.as_deref(), q.part_id.as_deref()) {
-        (None, None) => state.blackboard.edit_any_scope(&id, req.text).await,
+        (None, None) => {
+            state
+                .blackboard
+                .edit_any_scope(&document_id, &id, req.text)
+                .await
+        }
         (s, p) => {
             let scope = resolve_scope(&state, s, p)?;
-            state.blackboard.edit(&scope, &id, req.text).await
+            state
+                .blackboard
+                .edit(&document_id, &scope, &id, req.text)
+                .await
         }
     };
     match result {
@@ -578,11 +683,12 @@ pub async fn delete_entry(
     Path(id): Path<String>,
     Query(q): Query<ScopeQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
+    let document_id = state.active_document.read().await.clone();
     let result = match (q.scope.as_deref(), q.part_id.as_deref()) {
-        (None, None) => state.blackboard.delete_any_scope(&id).await,
+        (None, None) => state.blackboard.delete_any_scope(&document_id, &id).await,
         (s, p) => {
             let scope = resolve_scope(&state, s, p)?;
-            state.blackboard.delete(&scope, &id).await
+            state.blackboard.delete(&document_id, &scope, &id).await
         }
     };
     match result {
@@ -599,7 +705,8 @@ pub async fn clear_blackboard(
     Query(q): Query<ScopeQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let scope = resolve_scope(&state, q.scope.as_deref(), q.part_id.as_deref())?;
-    state.blackboard.clear(&scope).await;
+    let document_id = state.active_document.read().await.clone();
+    state.blackboard.clear(&document_id, &scope).await;
     Ok(Json(
         serde_json::json!({ "success": true, "scope": scope.key() }),
     ))
@@ -615,21 +722,78 @@ mod tests {
     /// store-level tests below that don't care about a specific owner.
     const DOC: BlackboardScope = BlackboardScope::Document;
 
+    /// The document id these store-level tests operate within. Fixed and
+    /// arbitrary — what matters is that every call in a test uses the SAME
+    /// id, not its value. Document-level isolation itself is proven
+    /// separately below (`documents_are_isolated_*`).
+    const D: &str = "doc-under-test";
+
     fn part_scope() -> BlackboardScope {
         BlackboardScope::Part {
             id: Uuid::from_u128(0x1111),
         }
     }
 
+    /// `System` must survive the wire in BOTH directions as its own value.
+    ///
+    /// This is the regression that made the variant necessary. The wire
+    /// previously carried only `user`/`agent`, so the client downgraded its
+    /// machine-written lines to `agent` before sending them — and the board
+    /// came back claiming the agent had written the app's own bookkeeping
+    /// (measured 2026-08-01: 36 of 38 stored lines `agent`, 0 `system`).
+    /// A test that only checked `to_string` would not have caught it: the
+    /// loss happened on the way IN, at a decoder that had no third value to
+    /// decode to. So both directions are asserted, and the lower-case wire
+    /// spelling is pinned because the frontend union matches on it verbatim.
+    #[test]
+    fn system_authorship_survives_the_wire_in_both_directions() {
+        for (author, wire) in [
+            (LineAuthor::User, "\"user\""),
+            (LineAuthor::Agent, "\"agent\""),
+            (LineAuthor::System, "\"system\""),
+        ] {
+            let encoded = serde_json::to_string(&author).expect("serialize author");
+            assert_eq!(encoded, wire, "{author:?} must encode as {wire}");
+
+            let decoded: LineAuthor = serde_json::from_str(wire).expect("deserialize author");
+            assert_eq!(decoded, author, "{wire} must decode back to {author:?}");
+        }
+    }
+
+    /// A `System` line must round-trip through the store intact — not be
+    /// coerced to `Agent` by any layer between `add` and `snapshot`.
+    #[tokio::test]
+    async fn stored_system_line_is_not_reattributed_to_the_agent() {
+        let mgr = BlackboardManager::new();
+        mgr.add(
+            D,
+            &DOC,
+            None,
+            "Created **bore 1/4** — 18 × 18 × 20 mm · 792 tris".into(),
+            LineAuthor::System,
+        )
+        .await;
+
+        let snap = mgr.snapshot(D, &DOC).await;
+        let line = snap.lines.first().expect("the line was added");
+        assert_eq!(
+            line.author,
+            LineAuthor::System,
+            "machine bookkeeping must not be recorded as the agent's words",
+        );
+    }
+
     #[tokio::test]
     async fn add_appends_line_and_logs_add_event() {
         let mgr = BlackboardManager::new();
-        let line = mgr.add(&DOC, None, "hello".into(), LineAuthor::Agent).await;
+        let line = mgr
+            .add(D, &DOC, None, "hello".into(), LineAuthor::Agent)
+            .await;
         assert_eq!(line.text, "hello");
         assert_eq!(line.author, LineAuthor::Agent);
         assert_eq!(line.created_at, line.updated_at);
 
-        let snap = mgr.snapshot(&DOC).await;
+        let snap = mgr.snapshot(D, &DOC).await;
         assert_eq!(snap.lines.len(), 1);
         assert_eq!(snap.events.len(), 1);
         match &snap.events[0] {
@@ -660,15 +824,17 @@ mod tests {
     #[tokio::test]
     async fn edit_replaces_text_and_logs_edit_event() {
         let mgr = BlackboardManager::new();
-        let line = mgr.add(&DOC, None, "before".into(), LineAuthor::User).await;
+        let line = mgr
+            .add(D, &DOC, None, "before".into(), LineAuthor::User)
+            .await;
         let edited = mgr
-            .edit(&DOC, &line.id, "after".into())
+            .edit(D, &DOC, &line.id, "after".into())
             .await
             .expect("edit known id");
         assert_eq!(edited.text, "after");
         assert!(edited.updated_at >= edited.created_at);
 
-        let snap = mgr.snapshot(&DOC).await;
+        let snap = mgr.snapshot(D, &DOC).await;
         assert_eq!(snap.lines.len(), 1);
         assert_eq!(snap.lines[0].text, "after");
         // add + edit
@@ -683,11 +849,13 @@ mod tests {
     #[tokio::test]
     async fn no_op_edit_logs_nothing() {
         let mgr = BlackboardManager::new();
-        let line = mgr.add(&DOC, None, "same".into(), LineAuthor::User).await;
-        mgr.edit(&DOC, &line.id, "same".into())
+        let line = mgr
+            .add(D, &DOC, None, "same".into(), LineAuthor::User)
+            .await;
+        mgr.edit(D, &DOC, &line.id, "same".into())
             .await
             .expect("edit known id");
-        let snap = mgr.snapshot(&DOC).await;
+        let snap = mgr.snapshot(D, &DOC).await;
         // Only the add event — the identical edit is a no-op.
         assert_eq!(snap.events.len(), 1);
     }
@@ -695,18 +863,18 @@ mod tests {
     #[tokio::test]
     async fn edit_unknown_id_returns_none() {
         let mgr = BlackboardManager::new();
-        assert!(mgr.edit(&DOC, "nope", "x".into()).await.is_none());
+        assert!(mgr.edit(D, &DOC, "nope", "x".into()).await.is_none());
     }
 
     #[tokio::test]
     async fn delete_removes_line_and_logs_delete_event() {
         let mgr = BlackboardManager::new();
-        let a = mgr.add(&DOC, None, "a".into(), LineAuthor::User).await;
-        let b = mgr.add(&DOC, None, "b".into(), LineAuthor::Agent).await;
-        let removed = mgr.delete(&DOC, &a.id).await.expect("delete known id");
+        let a = mgr.add(D, &DOC, None, "a".into(), LineAuthor::User).await;
+        let b = mgr.add(D, &DOC, None, "b".into(), LineAuthor::Agent).await;
+        let removed = mgr.delete(D, &DOC, &a.id).await.expect("delete known id");
         assert_eq!(removed.id, a.id);
 
-        let snap = mgr.snapshot(&DOC).await;
+        let snap = mgr.snapshot(D, &DOC).await;
         assert_eq!(snap.lines.len(), 1);
         assert_eq!(snap.lines[0].id, b.id);
         // add, add, delete
@@ -721,16 +889,16 @@ mod tests {
     #[tokio::test]
     async fn delete_unknown_id_returns_none() {
         let mgr = BlackboardManager::new();
-        assert!(mgr.delete(&DOC, "nope").await.is_none());
+        assert!(mgr.delete(D, &DOC, "nope").await.is_none());
     }
 
     #[tokio::test]
     async fn clear_empties_lines_and_events() {
         let mgr = BlackboardManager::new();
-        mgr.add(&DOC, None, "a".into(), LineAuthor::User).await;
-        mgr.add(&DOC, None, "b".into(), LineAuthor::Agent).await;
-        mgr.clear(&DOC).await;
-        let snap = mgr.snapshot(&DOC).await;
+        mgr.add(D, &DOC, None, "a".into(), LineAuthor::User).await;
+        mgr.add(D, &DOC, None, "b".into(), LineAuthor::Agent).await;
+        mgr.clear(D, &DOC).await;
+        let snap = mgr.snapshot(D, &DOC).await;
         assert!(snap.lines.is_empty());
         assert!(snap.events.is_empty());
     }
@@ -738,8 +906,8 @@ mod tests {
     #[tokio::test]
     async fn line_ids_are_unique_within_same_millisecond() {
         let mgr = BlackboardManager::new();
-        let a = mgr.add(&DOC, None, "a".into(), LineAuthor::Agent).await;
-        let b = mgr.add(&DOC, None, "b".into(), LineAuthor::Agent).await;
+        let a = mgr.add(D, &DOC, None, "a".into(), LineAuthor::Agent).await;
+        let b = mgr.add(D, &DOC, None, "b".into(), LineAuthor::Agent).await;
         assert_ne!(a.id, b.id, "monotonic counter must disambiguate ids");
     }
 
@@ -752,8 +920,8 @@ mod tests {
         let b = BlackboardScope::Part {
             id: Uuid::from_u128(0xb),
         };
-        mgr.add(&a, None, "a".into(), LineAuthor::User).await;
-        let snap_b = mgr.snapshot(&b).await;
+        mgr.add(D, &a, None, "a".into(), LineAuthor::User).await;
+        let snap_b = mgr.snapshot(D, &b).await;
         assert!(snap_b.lines.is_empty(), "distinct notebooks share no state");
     }
 
@@ -772,6 +940,7 @@ mod tests {
         };
 
         mgr.add(
+            D,
             &part_a,
             None,
             "stress in A: $\\sigma = F/A$".into(),
@@ -779,6 +948,7 @@ mod tests {
         )
         .await;
         mgr.add(
+            D,
             &part_b,
             None,
             "torque in B: $T = F r$".into(),
@@ -786,8 +956,8 @@ mod tests {
         )
         .await;
 
-        let snap_a = mgr.snapshot(&part_a).await;
-        let snap_b = mgr.snapshot(&part_b).await;
+        let snap_a = mgr.snapshot(D, &part_a).await;
+        let snap_b = mgr.snapshot(D, &part_b).await;
 
         assert_eq!(snap_a.lines.len(), 1, "A holds exactly its own line");
         assert_eq!(snap_b.lines.len(), 1, "B holds exactly its own line");
@@ -806,7 +976,7 @@ mod tests {
 
         // The document scope is a third, independent notebook.
         assert!(
-            mgr.snapshot(&DOC).await.lines.is_empty(),
+            mgr.snapshot(D, &DOC).await.lines.is_empty(),
             "document notebook is untouched by part writes"
         );
     }
@@ -818,14 +988,16 @@ mod tests {
         let part_b = BlackboardScope::Part {
             id: Uuid::from_u128(0x2222),
         };
-        mgr.add(&part_a, None, "a".into(), LineAuthor::Agent).await;
-        mgr.add(&part_b, None, "b".into(), LineAuthor::Agent).await;
+        mgr.add(D, &part_a, None, "a".into(), LineAuthor::Agent)
+            .await;
+        mgr.add(D, &part_b, None, "b".into(), LineAuthor::Agent)
+            .await;
 
-        mgr.clear(&part_a).await;
+        mgr.clear(D, &part_a).await;
 
-        assert!(mgr.snapshot(&part_a).await.lines.is_empty(), "A cleared");
+        assert!(mgr.snapshot(D, &part_a).await.lines.is_empty(), "A cleared");
         assert_eq!(
-            mgr.snapshot(&part_b).await.lines.len(),
+            mgr.snapshot(D, &part_b).await.lines.len(),
             1,
             "B survives A's clear"
         );
@@ -837,21 +1009,45 @@ mod tests {
         // line by its globally-unique id, wherever it lives.
         let mgr = BlackboardManager::new();
         let part = part_scope();
-        let line = mgr.add(&part, None, "v1".into(), LineAuthor::Agent).await;
+        let line = mgr
+            .add(D, &part, None, "v1".into(), LineAuthor::Agent)
+            .await;
 
         let edited = mgr
-            .edit_any_scope(&line.id, "v2".into())
+            .edit_any_scope(D, &line.id, "v2".into())
             .await
             .expect("scope-agnostic edit finds the line");
         assert_eq!(edited.text, "v2");
-        assert_eq!(mgr.snapshot(&part).await.lines[0].text, "v2");
+        assert_eq!(mgr.snapshot(D, &part).await.lines[0].text, "v2");
 
         let removed = mgr
-            .delete_any_scope(&line.id)
+            .delete_any_scope(D, &line.id)
             .await
             .expect("scope-agnostic delete finds the line");
         assert_eq!(removed.id, line.id);
-        assert!(mgr.snapshot(&part).await.lines.is_empty());
+        assert!(mgr.snapshot(D, &part).await.lines.is_empty());
+    }
+
+    #[tokio::test]
+    async fn documents_are_isolated_same_scope_different_document() {
+        // The property `documents::activate` depends on: two documents
+        // using the identical scope (here, both Document) never see each
+        // other's lines, and a later switch back finds the original intact
+        // — Blackboard has no separate durability log, so this in-memory
+        // partition is its ONLY cross-document isolation.
+        let mgr = BlackboardManager::new();
+        mgr.add("doc-a", &DOC, None, "only in A".into(), LineAuthor::Agent)
+            .await;
+
+        let snap_b = mgr.snapshot("doc-b", &DOC).await;
+        assert!(
+            snap_b.lines.is_empty(),
+            "a fresh document's notebook must not inherit another document's lines"
+        );
+
+        let snap_a = mgr.snapshot("doc-a", &DOC).await;
+        assert_eq!(snap_a.lines.len(), 1, "switching away and back preserves A");
+        assert_eq!(snap_a.lines[0].text, "only in A");
     }
 
     #[test]

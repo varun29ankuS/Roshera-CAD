@@ -1,4 +1,5 @@
 import { parseCard, type CardKind } from '@/lib/blackboard-cards'
+import { ChoicesCard } from './ChoicesCard'
 import { DfmCard } from './DfmCard'
 import { FcfCard } from './FcfCard'
 import { MergeCard } from './MergeCard'
@@ -13,7 +14,8 @@ import { SoundnessCard } from './SoundnessCard'
  * edit mode, as with any Blackboard line.)
  */
 export function CardRenderer({ kind, source }: { kind: CardKind; source: string }) {
-  const result = parseCard(kind, source.replace(/\n$/, ''))
+  const trimmedSource = source.replace(/\n$/, '')
+  const result = parseCard(kind, trimmedSource)
 
   if (!result.ok) {
     return (
@@ -38,5 +40,7 @@ export function CardRenderer({ kind, source }: { kind: CardKind; source: string 
       return <MergeCard card={card.card} />
     case 'soundness':
       return <SoundnessCard card={card.card} />
+    case 'choices':
+      return <ChoicesCard card={card.card} source={trimmedSource} />
   }
 }

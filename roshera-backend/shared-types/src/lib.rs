@@ -112,6 +112,26 @@ pub type Vector3D = [f32; 3];
 /// Color as RGBA values [r, g, b, a] in range 0.0-1.0
 pub type Color = [f32; 4];
 
+/// The default Claude model `api-server` (goose ACP boot pin) and
+/// `ai-integration` (native `ClaudeProvider`/vision-endpoint defaults)
+/// fall back to when no explicit model is configured.
+///
+/// Before this constant existed, the same value was hand-copied as a
+/// string literal into five separate places across two crates
+/// (`api-server/src/goose_acp.rs`'s `PINNED_MODEL`,
+/// `ai-integration/src/providers/claude.rs`,
+/// `ai-integration/src/providers/native_factory.rs`,
+/// `ai-integration/src/universal_endpoint.rs`,
+/// `ai-integration/src/smart_router.rs`) with nothing keeping them in
+/// sync — a future model bump landing in only one of them would silently
+/// desync the goose agent surface from the REST surface. `shared-types`
+/// is already a dependency of both crates, so this is the one place both
+/// can see. `ai_integration::no_stray_default_model_literal_outside_shared_constant`
+/// (`ai-integration/src/providers/mod.rs`) scans both crates' source
+/// trees and fails if the literal reappears anywhere outside this
+/// definition.
+pub const DEFAULT_CLAUDE_MODEL: &str = "claude-sonnet-5";
+
 /// Engineering tolerance for comparisons
 pub const TOLERANCE: f32 = 1e-6;
 

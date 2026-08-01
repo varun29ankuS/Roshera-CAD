@@ -1229,15 +1229,43 @@ impl AuthManager {
         Ok(())
     }
 
-    /// Check rate limit for a client
+    /// Check rate limit for a client (legacy 100 req/min single bucket).
+    ///
+    /// Kept for callers that have not been migrated to a per-class
+    /// budget (and to pin `rate_limiter_is_layered_and_throttles_a_flooding_client`,
+    /// which asserts this exact 100/min figure). New call sites — in
+    /// particular `api-server`'s `rate_limit_middleware`, which keys one
+    /// bucket per request class to stop the viewport's poll traffic from
+    /// starving unrelated low-frequency actions — should call
+    /// [`check_rate_limit_budget`](Self::check_rate_limit_budget) with an
+    /// explicit `(bucket_key, max_requests, window)` instead of relying
+    /// on this fixed figure.
     pub fn check_rate_limit(&self, client_id: &str) -> Result<(), SessionError> {
+        self.check_rate_limit_budget(client_id, 100, Duration::minutes(1))
+    }
+
+    /// Sliding-window rate limit over an arbitrary bucket key, with a
+    /// caller-supplied request budget and window.
+    ///
+    /// This is [`check_rate_limit`](Self::check_rate_limit)'s original
+    /// sliding-window logic generalized so callers can run several
+    /// independent buckets — e.g. one per request class — over the same
+    /// `rate_limits` map without colliding, by folding the class into
+    /// `bucket_key` (`"{client_id}|{class}"`). Each distinct `bucket_key`
+    /// gets its own independent window; `max_requests`/`window` are not
+    /// persisted per key, so the caller must pass the same figures for a
+    /// given class on every call (the middleware does, via `const` tables).
+    pub fn check_rate_limit_budget(
+        &self,
+        bucket_key: &str,
+        max_requests: usize,
+        window: Duration,
+    ) -> Result<(), SessionError> {
         let now = Utc::now();
-        let window = Duration::minutes(1);
-        let max_requests = 100; // 100 requests per minute
+        let cutoff = now - window;
 
         let mut request_count = 0;
-        if let Some(requests) = self.rate_limits.get(client_id) {
-            let cutoff = now - window;
+        if let Some(requests) = self.rate_limits.get(bucket_key) {
             request_count = requests
                 .iter()
                 .filter(|&&req_time| req_time > cutoff)
@@ -1250,13 +1278,12 @@ impl AuthManager {
 
         // Record this request
         self.rate_limits
-            .entry(client_id.to_string())
+            .entry(bucket_key.to_string())
             .or_insert_with(Vec::new)
             .push(now);
 
         // Clean up old entries periodically
-        if let Some(mut requests) = self.rate_limits.get_mut(client_id) {
-            let cutoff = now - window;
+        if let Some(mut requests) = self.rate_limits.get_mut(bucket_key) {
             requests.retain(|&req_time| req_time > cutoff);
         }
 

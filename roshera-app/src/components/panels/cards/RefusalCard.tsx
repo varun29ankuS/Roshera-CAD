@@ -1,4 +1,4 @@
-import { ArrowRight, Ban } from 'lucide-react'
+import { ArrowRight, Ban, CircleSlash } from 'lucide-react'
 import type { RefusalCard as RefusalCardData } from '@/lib/blackboard-cards'
 import { CardShell, Chip } from './card-chrome'
 
@@ -23,7 +23,7 @@ export function RefusalCard({ card }: { card: RefusalCardData }) {
           accent="info"
           title="Honest refusal over a silent wrong answer — the operation is outside the verified envelope"
         >
-          typed refusal{card.source ? ` · ${card.source}` : ''}
+          <CircleSlash size={9} /> typed refusal{card.source ? ` · ${card.source}` : ''}
         </Chip>
       }
     >

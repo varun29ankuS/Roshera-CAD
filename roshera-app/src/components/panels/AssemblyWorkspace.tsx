@@ -16,6 +16,7 @@
  */
 
 import { useEffect, useMemo, useRef, useState } from 'react'
+import { Check, CircleSlash, Trash2, X } from 'lucide-react'
 import * as THREE from 'three'
 import {
   deleteAssembly,
@@ -318,8 +319,14 @@ export function AssemblyWorkspace() {
   return (
     <div className="flex flex-col flex-1 min-h-0 bg-background text-foreground">
       {error && (
-        <div className="px-3 py-2 text-xs bg-destructive/10 text-destructive border-b border-destructive/30">
-          {error}
+        <div
+          role="alert"
+          className="flex items-baseline gap-1.5 border-b border-destructive/30 bg-destructive/10 px-3 py-2 text-xs"
+        >
+          <span className="inline-flex shrink-0 translate-y-px text-red-600 dark:text-red-400">
+            <X size={11} />
+          </span>
+          <span className="select-text font-mono text-red-700 dark:text-red-300">{error}</span>
         </div>
       )}
 
@@ -382,9 +389,7 @@ export function AssemblyWorkspace() {
                         onClick={() => void handleDelete(id)}
                         className="cad-focus inline-flex items-center justify-center w-6 h-6 rounded text-destructive hover:bg-destructive/15"
                       >
-                        <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round">
-                          <path d="M4 4l8 8M12 4l-8 8" />
-                        </svg>
+                        <Trash2 size={12} />
                       </button>
                     </div>
                   </div>
@@ -625,9 +630,7 @@ function ComponentRow({
           aria-label="Delete component"
           className="cad-focus inline-flex items-center justify-center w-5 h-5 rounded text-destructive hover:bg-destructive/15"
         >
-          <svg width="10" height="10" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round">
-            <path d="M4 4l8 8M12 4l-8 8" />
-          </svg>
+          <Trash2 size={11} />
         </button>
       </div>
       {expanded && (
@@ -746,16 +749,32 @@ function MateRow({
           <span className="text-[10px] uppercase tracking-wider text-muted-foreground">
             {mateTypeLabel(tag)}
           </span>
+          {/* Tri-state solve status: tick = solved, cross = solver error
+              (message on hover AND truncated inline), dashed-amber = not
+              yet solved. Same glyph vocabulary as cards/card-chrome. */}
           {mate.solved ? (
-            <span className="text-[10px] text-emerald-500/80">solved</span>
+            <span
+              className="inline-flex items-center gap-0.5 text-[10px] text-emerald-600 dark:text-emerald-400"
+              title="Mate solved"
+            >
+              <Check size={10} /> solved
+            </span>
           ) : mate.error ? (
             <span
-              className="text-[10px] text-destructive truncate"
+              className="inline-flex min-w-0 items-center gap-0.5 text-[10px] text-red-600 dark:text-red-400"
               title={mate.error}
             >
-              error
+              <X size={10} className="shrink-0" />
+              <span className="truncate">{mate.error}</span>
             </span>
-          ) : null}
+          ) : (
+            <span
+              className="inline-flex items-center gap-0.5 text-[10px] text-amber-600 dark:text-amber-400"
+              title="Not solved yet — run Solve"
+            >
+              <CircleSlash size={10} /> unsolved
+            </span>
+          )}
         </div>
         <div className="text-[10px] text-muted-foreground truncate">
           {componentName(mate.component1)} · {mate.reference1}
@@ -802,9 +821,7 @@ function MateRow({
         aria-label="Delete mate"
         className="cad-focus inline-flex items-center justify-center w-6 h-6 rounded text-destructive hover:bg-destructive/15"
       >
-        <svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round">
-          <path d="M4 4l8 8M12 4l-8 8" />
-        </svg>
+        <Trash2 size={12} />
       </button>
     </li>
   )

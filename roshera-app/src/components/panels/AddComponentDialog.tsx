@@ -9,9 +9,23 @@
  * solver pin orientation through mates". Components needing an
  * arbitrary initial pose can use the inline transform editor on the
  * component row (`set_component_transform` REST).
+ *
+ * Uses the shared `ui/dialog` primitives (focus trap, Escape, overlay)
+ * and the `dialog-form` vocabulary so it matches every other dialog.
  */
 
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
+import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
+import { DialogError, FormField } from './dialog-form'
 import {
   addComponent,
   translationMatrix,
@@ -65,14 +79,6 @@ export function AddComponentDialog({ assemblyId, defaultName, onClose, onCreated
         return { type: 'Sphere', radius: sphereRadius }
     }
   }
-
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape' && !busy) onClose()
-    }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [onClose, busy])
 
   const submit = async () => {
     const trimmed = name.trim()
@@ -132,42 +138,23 @@ export function AddComponentDialog({ assemblyId, defaultName, onClose, onCreated
   }
 
   return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40"
-      onMouseDown={(e) => {
-        if (e.target === e.currentTarget && !busy) onClose()
+    <Dialog
+      open
+      onOpenChange={(next) => {
+        if (!next && !busy) onClose()
       }}
     >
-      <div
-        className="w-[380px] max-w-[92vw] bg-popover text-popover-foreground border border-border rounded shadow-lg"
-        role="dialog"
-        aria-label="Add component"
-      >
-        <div className="px-4 py-3 border-b border-border/60 flex items-center justify-between">
-          <h2 className="text-sm font-medium">Add Component</h2>
-          <button
-            type="button"
-            onClick={onClose}
-            disabled={busy}
-            aria-label="Close"
-            className="cad-focus text-muted-foreground hover:text-foreground disabled:opacity-50"
-          >
-            <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.75">
-              <path d="M4 4l8 8M12 4l-8 8" />
-            </svg>
-          </button>
-        </div>
+      <DialogContent className="sm:max-w-sm">
+        <DialogHeader>
+          <DialogTitle>Add component</DialogTitle>
+          <DialogDescription>
+            New instance in this assembly, with optional starting geometry.
+          </DialogDescription>
+        </DialogHeader>
 
-        <div className="px-4 py-3 space-y-3 text-xs">
-          {error && (
-            <div className="px-2 py-1 rounded bg-destructive/10 text-destructive border border-destructive/30">
-              {error}
-            </div>
-          )}
-
-          <label className="flex items-center gap-2">
-            <span className="w-24 text-muted-foreground">Name</span>
-            <input
+        <div className="flex flex-col gap-3">
+          <FormField label="Name">
+            <Input
               autoFocus
               type="text"
               value={name}
@@ -178,94 +165,86 @@ export function AddComponentDialog({ assemblyId, defaultName, onClose, onCreated
                   void submit()
                 }
               }}
-              className="cad-focus flex-1 px-2 py-1 rounded border border-border bg-background"
             />
-          </label>
+          </FormField>
 
-          <div className="border-t border-border/40 pt-2">
-            <div className="text-[10px] uppercase tracking-wider text-muted-foreground mb-2">
-              Geometry
-            </div>
-            <label className="flex items-center gap-2">
-              <span className="w-24 text-muted-foreground">Primitive</span>
-              <select
-                value={primitive}
-                onChange={(e) => setPrimitive(e.target.value as PrimitiveChoice)}
-                className="cad-focus flex-1 px-2 py-1 rounded border border-border bg-background"
-              >
-                {PRIMITIVE_CHOICES.map((c) => (
-                  <option key={c} value={c}>
-                    {c === 'None' ? 'None (empty)' : c}
-                  </option>
-                ))}
-              </select>
-            </label>
-            {primitive === 'Box' && (
-              <div className="grid grid-cols-3 gap-2 mt-2">
-                <NumField label="X" value={boxDx} onChange={setBoxDx} />
-                <NumField label="Y" value={boxDy} onChange={setBoxDy} />
-                <NumField label="Z" value={boxDz} onChange={setBoxDz} />
-              </div>
-            )}
-            {primitive === 'Cylinder' && (
-              <div className="grid grid-cols-2 gap-2 mt-2">
-                <NumField label="R" value={cylRadius} onChange={setCylRadius} />
-                <NumField label="H" value={cylHeight} onChange={setCylHeight} />
-              </div>
-            )}
-            {primitive === 'Sphere' && (
-              <div className="grid grid-cols-1 gap-2 mt-2">
-                <NumField label="R" value={sphereRadius} onChange={setSphereRadius} />
-              </div>
-            )}
-            {primitive === 'None' && (
-              <div className="mt-2 text-[10px] text-muted-foreground">
-                Empty BRepModel — useful for placeholder components or
-                later part-binding. Won't be visible in the viewport.
-              </div>
-            )}
-          </div>
+          <FormField label="Primitive">
+            <select
+              value={primitive}
+              onChange={(e) => setPrimitive(e.target.value as PrimitiveChoice)}
+              className="cad-focus h-8 rounded border border-border bg-background px-2 text-xs"
+            >
+              {PRIMITIVE_CHOICES.map((c) => (
+                <option key={c} value={c}>
+                  {c === 'None' ? 'None (empty)' : c}
+                </option>
+              ))}
+            </select>
+          </FormField>
 
-          <div className="border-t border-border/40 pt-2">
-            <div className="text-[10px] uppercase tracking-wider text-muted-foreground mb-2">
-              Starting position (mm)
-            </div>
+          {primitive === 'Box' && (
             <div className="grid grid-cols-3 gap-2">
-              <NumField label="X" value={x} onChange={setX} />
-              <NumField label="Y" value={y} onChange={setY} />
-              <NumField label="Z" value={z} onChange={setZ} />
+              <SizeField label="X" value={boxDx} onChange={setBoxDx} />
+              <SizeField label="Y" value={boxDy} onChange={setBoxDy} />
+              <SizeField label="Z" value={boxDz} onChange={setBoxDz} />
             </div>
-            <div className="mt-2 text-[10px] text-muted-foreground">
-              Rotation defaults to identity. Use the row editor or a mate
-              after creation to orient.
+          )}
+          {primitive === 'Cylinder' && (
+            <div className="grid grid-cols-2 gap-2">
+              <SizeField label="R" value={cylRadius} onChange={setCylRadius} />
+              <SizeField label="H" value={cylHeight} onChange={setCylHeight} />
             </div>
-          </div>
+          )}
+          {primitive === 'Sphere' && (
+            <div className="grid grid-cols-1 gap-2">
+              <SizeField label="R" value={sphereRadius} onChange={setSphereRadius} />
+            </div>
+          )}
+          {primitive === 'None' && (
+            <p className="text-[11px] leading-snug text-muted-foreground">
+              Empty BRepModel — useful for placeholder components or later part-binding.
+              Won't be visible in the viewport.
+            </p>
+          )}
+
+          {/* Placement is deliberately demoted behind a disclosure: an
+              assembly is RELATIONSHIPS, not placements. Mates own the
+              final pose — a typed-in offset is a temporary scaffold the
+              solver overrides, and making it prominent taught the wrong
+              mental model (Varun, 2026-08-01). */}
+          <details className="group">
+            <summary className="cad-focus cursor-pointer list-none font-mono text-[10px] uppercase tracking-wider text-muted-foreground/70 hover:text-foreground">
+              <span className="mr-1 inline-block transition-transform group-open:rotate-90">▸</span>
+              Starting offset (mm) — optional
+            </summary>
+            <div className="mt-2 grid grid-cols-3 gap-2">
+              <SizeField label="X" value={x} onChange={setX} />
+              <SizeField label="Y" value={y} onChange={setY} />
+              <SizeField label="Z" value={z} onChange={setZ} />
+            </div>
+            <p className="mt-1.5 text-[11px] leading-snug text-muted-foreground">
+              A convenience so new components don't stack at the origin. Mates own the
+              final pose — constrain it with Mate mode after creation.
+            </p>
+          </details>
+
+          <DialogError>{error}</DialogError>
         </div>
 
-        <div className="px-4 py-3 border-t border-border/60 flex items-center justify-end gap-2">
-          <button
-            type="button"
-            onClick={onClose}
-            disabled={busy}
-            className="cad-focus px-3 py-1 text-xs rounded border border-border hover:bg-accent/40 disabled:opacity-50"
-          >
+        <DialogFooter>
+          <Button variant="outline" onClick={onClose} disabled={busy}>
             Cancel
-          </button>
-          <button
-            type="button"
-            onClick={() => void submit()}
-            disabled={busy}
-            className="cad-focus px-3 py-1 text-xs font-medium rounded bg-primary text-primary-foreground hover:opacity-90 disabled:opacity-50"
-          >
-            {busy ? 'Adding…' : 'Add Component'}
-          </button>
-        </div>
-      </div>
-    </div>
+          </Button>
+          <Button onClick={() => void submit()} disabled={busy}>
+            {busy ? 'Adding…' : 'Add component'}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   )
 }
 
-function NumField({
+function SizeField({
   label,
   value,
   onChange,
@@ -276,13 +255,14 @@ function NumField({
 }) {
   return (
     <label className="flex items-center gap-1">
-      <span className="w-3 text-muted-foreground">{label}</span>
-      <input
+      <span className="w-3 font-mono text-[10px] uppercase text-muted-foreground">{label}</span>
+      <Input
         type="number"
         value={value}
         step="1"
         onChange={(e) => onChange(Number(e.target.value))}
-        className="cad-focus flex-1 min-w-0 px-2 py-1 rounded border border-border bg-background"
+        aria-label={label}
+        className="cad-readout min-w-0 flex-1 text-[12px]"
       />
     </label>
   )

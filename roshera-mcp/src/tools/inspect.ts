@@ -169,7 +169,10 @@ export function registerInspectTools(server: ToolHost) {
   server.tool(
     "dfm_check",
     "DFM (design-for-manufacturability): run a rule pack against a part's REAL " +
-      "B-Rep, exact-or-refuse — never a fabricated pass. 'fdm' pack checks " +
+      "B-Rep, exact-or-refuse — never a fabricated pass. ENFORCED: refused (422) " +
+      "if the part has been mutated (or never certified) since its last full " +
+      "verification — call verify_part first; a DFM pass on unverified geometry " +
+      "would just be a guess wearing a certificate. 'fdm' pack checks " +
       "fdm.min_wall (wall >= 2x nozzle dia), fdm.overhang (no face > 45 deg " +
       "from vertical), fdm.min_bore (bore dia >= 2x nozzle dia) and " +
       "fdm.trapped_volume (enclosed cavity traps unremovable support); " +

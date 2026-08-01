@@ -1,14 +1,28 @@
-import { useRef, useEffect, useState, useCallback } from 'react'
+import { useRef, useEffect, useState, useCallback, useMemo } from 'react'
 import {
   useBlackboardStore,
   DOCUMENT_SCOPE,
   partScope,
 } from '@/stores/blackboard-store'
+import { useAcpSessionStore } from '@/stores/acp-session-store'
 import { useSceneStore } from '@/stores/scene-store'
+import { useWSStore } from '@/stores/ws-store'
+import { cn } from '@/lib/utils'
 import { processBlackboardMessage } from '@/lib/ai-client'
-import { BlackboardLine } from './BlackboardLine'
+import { cancelAcpTurn } from '@/lib/acp-blackboard'
+import { groupBlackboardByCheckpoint, type CheckpointMarker } from '@/lib/blackboard-groups'
+import {
+  loadDraft,
+  saveDraft,
+  loadPromptHistory,
+  pushPromptHistory,
+  savePromptHistory,
+  sendPrompt,
+  useTurnQueue,
+  waitingTurns,
+} from '@/lib/blackboard-composer'
+import { BlackboardSection } from './BlackboardSection'
 import { Button } from '@/components/ui/button'
-import { Input } from '@/components/ui/input'
 import {
   NotebookPen,
   Send,
@@ -17,7 +31,16 @@ import {
   GripHorizontal,
   Plus,
   Trash2,
+  Zap,
+  Clock,
+  Bot,
+  User,
+  Wrench,
+  Check,
+  X,
+  CircleSlash,
 } from 'lucide-react'
+import { VendorMark } from '@/components/settings/vendor-marks'
 
 /**
  * BLACKBOARD
@@ -32,6 +55,63 @@ import {
  * is 2.5× as wide → `w-[50rem]` (50rem / 800px), capped to the viewport so the
  * 3D scene stays usable on narrow screens.
  */
+const compactCount = new Intl.NumberFormat('en-US', { notation: 'compact', maximumFractionDigits: 1 })
+
+/** Render `usage_update`'s `used` (`AcpSessionStats.tokensUsed`,
+ *  `stores/acp-session-store.ts`) as a running token total. Measured live
+ *  (2026-07-31): a real turn reported
+ *  `{"sessionUpdate":"usage_update","used":359346,"size":128000}` — `used`
+ *  is CUMULATIVE tokens consumed across the whole session, `size` is the
+ *  static context window; they are not comparable, and `used` legitimately
+ *  exceeds `size` once a session runs long (359346/128000 → a meaningless
+ *  280%). No `usage_update` field observed on the wire reports current
+ *  context OCCUPANCY (how full the window is right now), so there is no
+ *  honest percentage to compute — this renders the total alone, never a
+ *  used/size ratio, and never clamps to 100% (that would hide the truth
+ *  rather than tell it). */
+function formatContextUsage(used: number): string {
+  return `${compactCount.format(used)} tokens`
+}
+
+/** What the header says about tokens, and why it says it that way.
+ *
+ *  The session total alone was technically true and practically
+ *  misleading: shown beside a just-finished action it reads as that
+ *  action's price. Measured 2026-08-01 — "clear the viewport" made two
+ *  tool calls and replied in 51 characters while the header read ~70k,
+ *  a total accumulated across three prompts.
+ *
+ *  So the turn's own figure leads and the session total is explicitly
+ *  labelled behind it. Both are counts of tokens MOVED, never cost:
+ *  most of a turn's figure is context re-sent on each round-trip, and
+ *  re-sent context bills far below fresh input. The wire gives one
+ *  scalar with no split, so no breakdown is offered — an invented one
+ *  would be worse than none. */
+const TOKENS_TITLE =
+  'Tokens moved, not cost. Most of a turn is context re-sent on every ' +
+  'round-trip, and re-sent context bills far below fresh input. The ' +
+  'session figure accumulates across all turns.'
+
+/** How heavy the last turn was, as a colour on the bolt.
+ *
+ *  Deliberately NOT a percentage of the context window. `used` is
+ *  cumulative and legitimately exceeds `size`, so any ratio against the
+ *  window is meaningless — that is the same trap the header already
+ *  refuses in `formatContextUsage`. These are bands on the TURN's own
+ *  size, calibrated against measured turns: a trivial action that made two
+ *  tool calls still moved ~33k because every round-trip replays the whole
+ *  context, so "light" has to start well above zero or everything would
+ *  read as heavy.
+ *
+ *  The colour says how much moved, never how much it cost, and never
+ *  whether the turn was worth it — a 200k turn that built a certified
+ *  assembly is a good turn. */
+function turnWeight(tokens: number): { className: string; label: string } {
+  if (tokens < 40_000) return { className: 'text-emerald-500', label: 'light turn' }
+  if (tokens < 120_000) return { className: 'text-amber-500', label: 'moderate turn' }
+  return { className: 'text-red-500', label: 'heavy turn' }
+}
+
 export function Blackboard() {
   const lines = useBlackboardStore((s) => s.lines)
   const isProcessing = useBlackboardStore((s) => s.isProcessing)
@@ -45,6 +125,17 @@ export function Blackboard() {
   const setActiveScope = useBlackboardStore((s) => s.setActiveScope)
   const agentAttention = useBlackboardStore((s) => s.agentAttention)
   const streamingLineId = useBlackboardStore((s) => s.streamingLineId)
+
+  // Live ACP session stats (Feature B) — display-only, driven by
+  // `lib/acp-blackboard.ts`'s wiring of the shared `AcpClient`. See
+  // `stores/acp-session-store.ts` for the honesty rules (no cost figure,
+  // session-scoped counts, "default" never printed as a model name).
+  const acpModel = useAcpSessionStore((s) => s.model)
+  const acpTurns = useAcpSessionStore((s) => s.turns)
+  const acpProvider = useAcpSessionStore((s) => s.provider)
+  const acpTokens = useAcpSessionStore((s) => s.tokensUsed)
+  const acpLastTurnTokens = useAcpSessionStore((s) => s.lastTurnTokens)
+  const acpLive = useAcpSessionStore((s) => s.live)
 
   // Drive the notebook scope from the viewport selection: the active part's
   // notebook is shown, so each part has its OWN blackboard. The primary
@@ -72,9 +163,101 @@ export function Blackboard() {
         ? selectedPart.name
         : 'Part'
 
-  const [input, setInput] = useState('')
+  // ── Checkpoint sections ─────────────────────────────────────────────
+  //
+  // `GET /api/timeline/checkpoints` is the authoritative list of named
+  // design-intent checkpoints (`CheckpointSummary` in
+  // `roshera-backend/api-server/src/handlers/timeline.rs`) — the same
+  // record `timeline_checkpoint(...)` mints and the Timeline strip's ◈
+  // button posts to. The Blackboard fetches it independently (mirroring
+  // `Timeline.tsx`'s own direct-fetch pattern) rather than reading it off
+  // a shared store, since none exists yet for timeline data. Wire
+  // `timestamp` (ISO 8601) is converted to epoch ms once here, at the
+  // fetch boundary, so `blackboard-groups.ts` only ever deals in numbers.
+  const wsStatus = useWSStore((s) => s.status)
+  const [checkpoints, setCheckpoints] = useState<CheckpointMarker[]>([])
+
+  const fetchCheckpoints = useCallback(async () => {
+    try {
+      const resp = await fetch('/api/timeline/checkpoints')
+      if (!resp.ok) return
+      const data = (await resp.json()) as Array<{
+        id: string
+        name: string
+        timestamp: string
+      }>
+      if (!Array.isArray(data)) return
+      const marks: CheckpointMarker[] = data
+        .map((c) => ({ id: c.id, name: c.name, createdAt: new Date(c.timestamp).getTime() }))
+        .filter((c) => !isNaN(c.createdAt))
+      setCheckpoints(marks)
+    } catch {
+      // Backend not running — the board still renders as one unlabelled
+      // section rather than failing to load.
+    }
+  }, [])
+
+  useEffect(() => {
+    if (wsStatus === 'connected') {
+      // Data-sync fetch on (re)connect, mirroring `Timeline.tsx`'s
+      // `fetchHistory` — this project's established pattern for pulling
+      // timeline state into a component on mount/reconnect.
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      fetchCheckpoints()
+    }
+  }, [wsStatus, fetchCheckpoints])
+
+  // Sections group lines under the checkpoint that was open when each was
+  // written; within a section, consecutive machine-authored "Created …"
+  // lines still collapse into one compact step strip (`BuildStepStrip.tsx`)
+  // so a bolt circle of bores reads as one row of marks, not one paragraph
+  // per hole. Agent prose and user lines are never candidates — see
+  // `groupBlackboardLines`'s doc.
+  const sections = useMemo(
+    () => groupBlackboardByCheckpoint(lines, checkpoints),
+    [lines, checkpoints],
+  )
+
+  // ── Composer state ──────────────────────────────────────────────────
+  //
+  // The composer is the ACT of asking; the notebook is the RECORD of having
+  // asked. Its draft lives outside the document (a draft is not a line),
+  // persisted per notebook scope so an accidental blur, panel toggle, or
+  // reload never eats a half-written prompt — see `lib/blackboard-composer.ts`.
+  const [draft, setDraft] = useState(() => loadDraft(activeScope))
+  // History browse position: null = not browsing. ArrowUp from an empty
+  // composer recalls what you last asked; ArrowDown walks back forward.
+  const [histIdx, setHistIdx] = useState<number | null>(null)
+  const historyRef = useRef<string[]>(loadPromptHistory())
   const scrollRef = useRef<HTMLDivElement>(null)
-  const inputRef = useRef<HTMLInputElement>(null)
+  const inputRef = useRef<HTMLTextAreaElement>(null)
+
+  // Scope switch swaps in that scope's own persisted draft. In-render
+  // reconcile (React's "adjusting state on prop change" pattern, same as
+  // BlackboardLine's streaming sync) — no setState-in-effect cascade.
+  const [draftScope, setDraftScope] = useState(activeScope)
+  if (draftScope !== activeScope) {
+    setDraftScope(activeScope)
+    setDraft(loadDraft(activeScope))
+    setHistIdx(null)
+  }
+
+  // Autosize the composer to its content (recall can change the value
+  // without an input event, so this tracks `draft`, not keystrokes). The
+  // cap matches the `max-h-40` on the textarea.
+  useEffect(() => {
+    const el = inputRef.current
+    if (!el) return
+    el.style.height = 'auto'
+    el.style.height = `${Math.min(el.scrollHeight, 160)}px`
+  }, [draft])
+
+  // The dispatch queue, made visible. The transport serializes prompts
+  // (one at a time — `ai-client.ts`'s `turnQueue`); the head entry is the
+  // turn in flight (already signalled on the agent's own line), so only
+  // the WAITING tail renders here. If the system makes you wait, it owes
+  // you the queue.
+  const waiting = waitingTurns(useTurnQueue())
 
   /**
    * ATTENTION-FOLLOWING SPLIT
@@ -152,24 +335,59 @@ export function Blackboard() {
   const handleSubmit = useCallback(
     (e?: React.FormEvent) => {
       e?.preventDefault()
-      const text = input.trim()
-      if (!text || isProcessing) return
-      setInput('')
-      // Routes to the agent via the existing ai-client path; the reply is
-      // appended to the board as an editable line, not a chat bubble.
-      void processBlackboardMessage(text)
+      const text = draft.trim()
+      // No `isProcessing` guard: the transport queues serially and the
+      // queue is VISIBLE (the strip above the composer), so a prompt sent
+      // mid-turn is accepted and shown waiting — never silently refused.
+      if (!text) return
+      const nextHistory = pushPromptHistory(historyRef.current, text)
+      historyRef.current = nextHistory
+      savePromptHistory(nextHistory)
+      setDraft('')
+      saveDraft(activeScope, '')
+      setHistIdx(null)
+      // Routes to the agent via the existing ai-client path (wrapped for
+      // queue visibility); the user's line lands in the notebook
+      // immediately, the reply as an editable line — never a chat bubble.
+      void sendPrompt(text, processBlackboardMessage)
     },
-    [input, isProcessing],
+    [draft, activeScope],
   )
 
   const handleKeyDown = useCallback(
-    (e: React.KeyboardEvent) => {
+    (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
       if (e.key === 'Enter' && !e.shiftKey) {
+        // Enter sends; Shift+Enter falls through to the textarea's native
+        // newline — multi-line input without fighting Enter-to-send.
         e.preventDefault()
         handleSubmit()
+        return
+      }
+      if (e.key === 'ArrowUp') {
+        const h = historyRef.current
+        // Recall only from an empty composer (or while already browsing) —
+        // never clobber text being edited just because the caret moved up.
+        if (h.length === 0 || (histIdx === null && draft.trim() !== '')) return
+        e.preventDefault()
+        const idx = histIdx === null ? h.length - 1 : Math.max(0, histIdx - 1)
+        setHistIdx(idx)
+        setDraft(h[idx])
+        return
+      }
+      if (e.key === 'ArrowDown' && histIdx !== null) {
+        e.preventDefault()
+        const h = historyRef.current
+        const idx = histIdx + 1
+        if (idx >= h.length) {
+          setHistIdx(null)
+          setDraft('')
+        } else {
+          setHistIdx(idx)
+          setDraft(h[idx])
+        }
       }
     },
-    [handleSubmit],
+    [handleSubmit, histIdx, draft],
   )
 
   // Collapsed state — floating button.
@@ -226,6 +444,80 @@ export function Blackboard() {
               executing — viewport has focus
             </span>
           )}
+          {/* Live ACP session stats: model · turns · tokens, all
+              session-scoped (reset when the stream drops — never a
+              cumulative total), plus a live/idle dot. No session yet
+              (or a dropped one) reads as "—", never a fabricated model
+              name — see acp-session-store.ts's doc for why. */}
+          <span
+            className="hidden shrink-0 items-center gap-1.5 whitespace-nowrap text-[10px] text-muted-foreground/70 sm:flex"
+            title={acpLive ? 'Agent session live' : 'No agent session'}
+          >
+            <span
+              className={cn(
+                'h-1.5 w-1.5 shrink-0 rounded-full',
+                acpLive ? 'animate-pulse bg-emerald-400' : 'bg-muted-foreground/30',
+              )}
+            />
+            {/* Vendor mark, drawn only when the backend actually named a
+                provider — see `acp-session-store.ts`'s `provider` doc for
+                why a defaulted logo is refused. */}
+            {acpProvider && (
+              // `displayName` feeds the initials fallback for vendors with no
+              // genuine published mark. The provider id is what the backend
+              // reported, so it is the honest label here — this header has no
+              // access to the allowlist's prettier `display_name`.
+              <VendorMark
+                providerId={acpProvider}
+                displayName={acpProvider}
+                className="h-3 w-3 shrink-0"
+              />
+            )}
+            <span className="font-mono">{acpModel ?? '—'}</span>
+            {acpLive && (
+              <>
+                <span className="text-muted-foreground/40">·</span>
+                <span>
+                  {acpTurns} turn{acpTurns === 1 ? '' : 's'}
+                </span>
+                <span className="text-muted-foreground/40">·</span>
+                {/* Turn figure first — it answers "what did THAT cost me",
+                    which is the question the bare session total kept
+                    answering wrongly. Absent until a turn completes. The
+                    bolt colours on the TURN's weight, never on a ratio to
+                    the context window (which `used` legitimately exceeds). */}
+                <span
+                  className="inline-flex items-center gap-1"
+                  title={
+                    acpLastTurnTokens !== null
+                      ? `${turnWeight(acpLastTurnTokens).label} — ${TOKENS_TITLE}`
+                      : TOKENS_TITLE
+                  }
+                >
+                  <Zap
+                    size={10}
+                    className={cn(
+                      'shrink-0',
+                      acpLastTurnTokens !== null
+                        ? turnWeight(acpLastTurnTokens).className
+                        : 'text-muted-foreground/40',
+                    )}
+                  />
+                  {acpLastTurnTokens !== null ? (
+                    <>
+                      {formatContextUsage(acpLastTurnTokens)}
+                      <span className="text-muted-foreground/50"> this turn</span>
+                      <span className="text-muted-foreground/40"> · </span>
+                    </>
+                  ) : null}
+                  <span className={acpLastTurnTokens !== null ? 'text-muted-foreground/60' : ''}>
+                    {formatContextUsage(acpTokens ?? 0)}
+                  </span>
+                  <span className="text-muted-foreground/50"> session</span>
+                </span>
+              </>
+            )}
+          </span>
         </div>
         <div className="flex items-center gap-0.5">
           {overrideHeight !== null && (
@@ -283,13 +575,72 @@ export function Blackboard() {
         }
       >
         <div className="py-2">
-          {lines.map((line) => (
-            <BlackboardLine
-              key={line.id}
-              line={line}
+          {/* EMPTY NOTEBOOK — the common case today. Instead of a blank
+              region (or one unlabelled section of nothing), say what this
+              panel IS and teach the marker vocabulary the reader is about
+              to meet — shape = author, colour = verdict — so the first
+              real line is legible on sight (time-to-recognition, not a
+              manual). Disappears the moment any line exists. */}
+          {lines.length === 0 && !isProcessing && (
+            <div className="px-4 py-3 text-xs leading-relaxed">
+              <p className="font-medium text-foreground/85">
+                An engineering notebook, not a chat.
+              </p>
+              <p className="mt-0.5 max-w-[60ch] text-muted-foreground/70">
+                Ask below — your question, the agent&apos;s reasoning, and the
+                kernel&apos;s certificates all land here as lines, grouped under
+                named checkpoints.
+              </p>
+              <div className="mt-3 grid gap-1.5 text-[11px] text-muted-foreground/70">
+                <div className="flex items-center gap-2">
+                  <span className="flex h-4 w-4 shrink-0 items-center justify-center rounded-full bg-accent">
+                    <Bot size={10} className="text-foreground" />
+                  </span>
+                  <span>the agent — reasoning, editable</span>
+                </div>
+                {/* Indented like a real user line — the legend teaches the
+                    position channel by using it, not by describing it. */}
+                <div className="ml-6 flex items-center gap-2 font-medium">
+                  <span className="flex h-4 w-4 shrink-0 items-center justify-center rounded-full bg-primary/20">
+                    <User size={10} className="text-primary" />
+                  </span>
+                  <span>you — indented, sent from the composer below</span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <span className="flex h-4 w-4 shrink-0 items-center justify-center rounded-full bg-muted-foreground/20">
+                    <Wrench size={9} className="text-muted-foreground" />
+                  </span>
+                  <span>the kernel — certificates and build steps, never editable</span>
+                </div>
+                <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1">
+                  <span>marker colour is the verdict:</span>
+                  <span className="inline-flex items-center gap-1 text-emerald-600 dark:text-emerald-400">
+                    <Check size={10} /> pass
+                  </span>
+                  <span className="inline-flex items-center gap-1 text-red-600 dark:text-red-400">
+                    <X size={10} /> fail
+                  </span>
+                  <span className="inline-flex items-center gap-1 text-amber-600 dark:text-amber-400">
+                    <CircleSlash size={10} /> inconclusive
+                  </span>
+                </div>
+              </div>
+            </div>
+          )}
+          {sections.map((section, i) => (
+            <BlackboardSection
+              key={section.checkpoint?.id ?? `leading-${i}`}
+              section={section}
               onCommit={editLine}
               onDelete={deleteLine}
-              streaming={line.id === streamingLineId}
+              streamingLineId={streamingLineId}
+              onCancel={cancelAcpTurn}
+              // Earlier checkpoint sections open collapsed so a long
+              // notebook lands the eye on CURRENT work, not on scrollback
+              // — collapse is a click with a named header and a visible
+              // line count, never a hover, so nothing is hidden (reduce
+              // scrolling without hiding anything).
+              defaultCollapsed={section.checkpoint !== null && i < sections.length - 1}
             />
           ))}
           {/* Shown only until the reply line exists — once streaming, the
@@ -303,33 +654,77 @@ export function Blackboard() {
         </div>
       </div>
 
-      {/* Prompt — still routes to the agent */}
-      <form
-        onSubmit={handleSubmit}
-        className="flex items-center gap-1.5 px-2 py-2 border-t border-white/5"
-      >
-        <Input
-          ref={inputRef}
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          onKeyDown={handleKeyDown}
-          placeholder="Ask the agent — its reply lands as an editable line…"
-          disabled={isProcessing}
-          className="h-8 text-xs bg-transparent border-white/10 placeholder:text-white/30"
-        />
-        <Button
-          type="submit"
-          size="sm"
-          disabled={!input.trim() || isProcessing}
-          className="h-8 w-8 p-0 shrink-0"
-        >
-          {isProcessing ? (
-            <Loader2 size={14} className="animate-spin" />
-          ) : (
-            <Send size={14} />
-          )}
-        </Button>
-      </form>
+      {/* COMPOSER — the act, kept apart from the record. Visually its own
+          anchored region (raised tint + border), never a line of the
+          transcript; what it sends still lands in the notebook as a normal
+          line. Never disabled mid-turn: the transport queues serially and
+          the strip below makes that queue visible. */}
+      <div className="shrink-0 border-t border-white/10 bg-white/[0.04]">
+        {/* QUEUE STRIP — prompts received but not yet dispatched. Dashed
+            amber is the app's existing "not run yet" grammar (ClaimBadge's
+            null state in cards/card-chrome.tsx) — waiting is a state, so
+            it may have a colour; the full prompt text is readable in the
+            chip itself, hover only widens truncation. */}
+        {waiting.length > 0 && (
+          <div
+            role="status"
+            className="flex flex-wrap items-center gap-1.5 border-b border-white/5 px-3 py-1.5 text-[10px]"
+          >
+            <Clock size={10} className="shrink-0 text-amber-500" />
+            <span className="shrink-0 font-medium text-amber-600 dark:text-amber-400">
+              {waiting.length} queued
+            </span>
+            <span className="shrink-0 text-muted-foreground/60">
+              — sends after the current turn
+            </span>
+            {waiting.map((w) => (
+              <span
+                key={w.id}
+                title={w.text}
+                className="max-w-[16rem] truncate rounded border border-dashed border-amber-500/40 bg-amber-500/5 px-1.5 py-0.5 text-amber-700 dark:text-amber-300"
+              >
+                {w.text}
+              </span>
+            ))}
+          </div>
+        )}
+        <form onSubmit={handleSubmit} className="flex items-end gap-1.5 px-2 py-2">
+          <textarea
+            ref={inputRef}
+            value={draft}
+            rows={1}
+            onChange={(e) => {
+              setDraft(e.target.value)
+              // Persist per scope on every keystroke — the draft survives
+              // blur, panel toggle, and reload; it is not a line until sent.
+              saveDraft(activeScope, e.target.value)
+              setHistIdx(null)
+            }}
+            onKeyDown={handleKeyDown}
+            placeholder={
+              isProcessing
+                ? 'Turn in flight — a new prompt queues behind it…'
+                : 'Ask the agent — Enter sends, Shift+Enter for a new line…'
+            }
+            spellCheck={false}
+            className="max-h-40 min-h-8 flex-1 resize-none overflow-y-auto rounded-md border border-white/10 bg-background/40 px-2.5 py-[7px] text-xs leading-relaxed text-foreground outline-none placeholder:text-white/30 focus:border-primary/50 scrollbar-thin"
+          />
+          {/* A visible, labelled send control — the verb, not a paragraph
+              keystroke. Disabled only by an empty draft, never by a turn
+              in flight (that case queues, visibly). */}
+          <Button
+            type="submit"
+            size="sm"
+            disabled={!draft.trim()}
+            className="h-8 shrink-0 gap-1 px-2.5"
+            title="Send — Enter sends, Shift+Enter for a new line, ArrowUp recalls your last prompt"
+            aria-label="Send prompt"
+          >
+            <Send size={13} />
+            <span className="text-[11px]">Send</span>
+          </Button>
+        </form>
+      </div>
     </div>
   )
 }

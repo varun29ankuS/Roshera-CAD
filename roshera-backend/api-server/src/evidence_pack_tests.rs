@@ -339,9 +339,11 @@ async fn part_mass_properties_carry_provenance_labels() {
 async fn notebook_lines_appear_verbatim_with_author_and_timestamps() {
     let state = make_test_state().await;
     // The agent writes a derivation into the document notebook.
+    let document_id = state.active_document.read().await.clone();
     let line = state
         .blackboard
         .add(
+            &document_id,
             &BlackboardScope::Document,
             None,
             "wall thickness t = P·r / σ_allow".to_string(),

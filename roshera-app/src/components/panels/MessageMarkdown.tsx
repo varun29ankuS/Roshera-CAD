@@ -54,6 +54,20 @@ const markdownComponents: Components = {
     <ol className="my-1 ml-4 list-decimal space-y-0.5">{children}</ol>
   ),
   li: ({ children }) => <li className="leading-snug">{children}</li>,
+  strong: ({ children }) => <strong className="font-semibold text-foreground">{children}</strong>,
+  em: ({ children }) => <em className="text-foreground/90">{children}</em>,
+  h1: ({ children }) => <h1 className="mt-2 mb-1 text-sm font-semibold text-foreground first:mt-0">{children}</h1>,
+  h2: ({ children }) => <h2 className="mt-2 mb-1 text-[13px] font-semibold text-foreground first:mt-0">{children}</h2>,
+  h3: ({ children }) => (
+    <h3 className="mt-1.5 mb-0.5 text-[12px] font-medium text-foreground/90 first:mt-0">{children}</h3>
+  ),
+  blockquote: ({ children }) => (
+    <blockquote className="my-1 border-l-2 border-border/70 pl-2 text-foreground/75">{children}</blockquote>
+  ),
+  hr: () => <hr className="my-2 border-border/50" />,
+  // No `table` handler: GFM tables need remark-gfm, which isn't a dependency
+  // here — adding one mid-task is out of scope. Bare CommonMark tables
+  // render as literal pipe text, same as before this change.
   code: ({ children, className: codeClass }) => {
     // A ```roshera:<kind> fence is a TYPED CARD, not a code sample: the
     // payload (validated against the real wire shapes) renders as a

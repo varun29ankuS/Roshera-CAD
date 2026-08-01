@@ -9,6 +9,7 @@ import {
 } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
 import { Button } from '@/components/ui/button'
+import { Eye, EyeOff } from 'lucide-react'
 import { isAuthRequired, login, onAuthChange } from '@/lib/auth'
 
 /**
@@ -28,6 +29,7 @@ export function LoginDialog() {
   const [open, setOpen] = useState(isAuthRequired())
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
+  const [showPassword, setShowPassword] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
 
@@ -72,13 +74,31 @@ export function LoginDialog() {
             onChange={(e) => setUsername(e.target.value)}
             autoComplete="username"
           />
-          <Input
-            type="password"
-            placeholder="Password"
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
-            autoComplete="current-password"
-          />
+          {/* A masked field you cannot unmask makes a typo indistinguishable
+              from a wrong password: both come back "Invalid credentials", and
+              the only recourse is to retype blind. The toggle is the standard
+              affordance and costs nothing — it is off by default, and the
+              revealed state is never persisted anywhere. */}
+          <div className="relative">
+            <Input
+              type={showPassword ? 'text' : 'password'}
+              placeholder="Password"
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              autoComplete="current-password"
+              className="pr-9"
+            />
+            <button
+              type="button"
+              onClick={() => setShowPassword((v) => !v)}
+              aria-label={showPassword ? 'Hide password' : 'Show password'}
+              aria-pressed={showPassword}
+              title={showPassword ? 'Hide password' : 'Show password'}
+              className="absolute inset-y-0 right-0 flex w-9 items-center justify-center text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring rounded-r-md"
+            >
+              {showPassword ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
+            </button>
+          </div>
           {error && <p className="text-sm text-red-500">{error}</p>}
           <DialogFooter>
             <Button type="submit" disabled={busy || !username || !password}>

@@ -152,6 +152,29 @@ pub enum ErrorCode {
     /// without a strategy change or manual conflict resolution.
     BranchMergeConflict,
 
+    // ── Document layer ──────────────────────────────────────────
+    /// `POST /api/documents/{id}/open` (or any other document-scoped
+    /// route) referenced a document id that is not in the registry —
+    /// never created, or a typo. Non-retryable from the same id.
+    DocumentNotFound,
+    /// `DELETE /api/documents/{id}` targeted the document currently
+    /// loaded into the live model. Deleting the thing the caller (or
+    /// another client) is actively looking at is a foot-gun — the
+    /// caller must switch to a different document first. Non-retryable
+    /// without that switch.
+    DocumentDeleteRefusedActive,
+    /// `DELETE /api/documents/{id}` targeted the only document left in
+    /// the registry. The app must never be left in a zero-document
+    /// state, so the last document can never be removed. Non-retryable
+    /// — a new document must exist before this one can go.
+    DocumentDeleteRefusedLast,
+    /// `DELETE /api/documents/{id}` targeted the default document
+    /// (`durability::DURABILITY_SESSION_ID`, "Main Document"), which
+    /// carries the pre-existing legacy event ledger. Removing it is a
+    /// deliberate administrative act, never an ordinary UI affordance.
+    /// Non-retryable through this route.
+    DocumentDeleteRefusedDefault,
+
     // ── Sketch / constraint solver ────────────────────────────────
     /// A constraint mutation (e.g. PATCH on a dimensional value)
     /// drove the sketch into an over-constrained or unsolvable
@@ -168,6 +191,63 @@ pub enum ErrorCode {
     /// deployment-time misconfiguration, not a transient failure —
     /// retrying without changing server config will fail identically.
     AiNotConfigured,
+    /// A provider (or credential mode) outside the server-owned
+    /// allowlist was requested through the provider-configuration
+    /// surface. Providers are operator/user-configured server-side
+    /// only; anything that would resolve by spawning an arbitrary
+    /// local binary is excluded by construction. `details` carries the
+    /// requested id and the allowlist. Non-retryable.
+    AiProviderRefused,
+    /// A provider credential failed its live validation round-trip
+    /// (e.g. the vendor API returned 401/403 for the supplied key, or
+    /// the subscription CLI probe failed). The caller must supply a
+    /// different credential — retrying the same one fails identically.
+    /// NOTE: `POST /api/ai/provider/models` (live model discovery)
+    /// reports its own 401/403 under `AiModelDiscoveryFailed` instead,
+    /// so the two codes never collide — this code stays the one the
+    /// PUT/`/test` credential round-trip already used.
+    AiCredentialInvalid,
+    /// `POST /api/ai/provider/models` (live model discovery) could not
+    /// produce the vendor's model list. `details` always carries
+    /// `provider` and an `outcome` discriminator (`no_base_url` |
+    /// `unauthorized` | `not_found` | `unexpected_status` | `timeout` |
+    /// `transport_error`) plus, when the vendor answered at all, its own
+    /// `vendor_status` and `vendor_message` — the caller must be able to
+    /// tell "the key is wrong" (`unauthorized`) from "the resolved URL
+    /// is wrong" (`not_found`) from "nothing could be resolved at all"
+    /// (`no_base_url`) rather than one generic failure. Never a stored
+    /// or guessed model list on any of these outcomes.
+    AiModelDiscoveryFailed,
+    /// A user-selected model ID was rejected by the live provider (e.g.
+    /// `GET /v1/models/{id}` 404, or the vendor otherwise refused it).
+    /// Distinct from `AiCredentialInvalid`: the credential itself is
+    /// fine, the model name is not one it can serve. `details` carries
+    /// the rejected model. Never surfaced as a silent fallback to a
+    /// default model — the caller must pick a different one or "default".
+    AiModelRejected,
+
+    // ── ACP (goose agent) transport gate ──────────────────────────
+    /// A JSON-RPC method outside the ACP method allowlist was posted
+    /// to `/acp`. Provider switching, config mutation, extension
+    /// management and similar RPCs are server-configured surfaces —
+    /// a client cannot invoke them, by policy. `details` carries the
+    /// refused method and the allowed set. Non-retryable.
+    AcpMethodNotAllowed,
+    /// A WebSocket upgrade was attempted on `/acp`. The WebSocket
+    /// transport is disabled wholesale: goose owns the frame loop, so
+    /// frames could not be method-filtered — instead of a filter that
+    /// cannot be enforced, the upgrade itself is refused and clients
+    /// use the POST + SSE transport (which is filtered). Non-retryable.
+    AcpWebsocketDisabled,
+    /// A `session/new` or `session/load` body carried a `_meta` key
+    /// (`provider`, `enabledExtensions`, `recipeDeeplink`, `recipeId`)
+    /// that pre-empts or overrides the `mcpServers` entry Roshera
+    /// injects into every session — each is an arbitrary-command
+    /// surface in its own right (`enabledExtensions` in particular
+    /// routes goose around `mcpServers` entirely). `details` carries
+    /// the refused method and key. Non-retryable — the caller must
+    /// drop the key from the request, not retry with it.
+    AcpForbiddenSessionMeta,
 
     // ── Authorization / routing ───────────────────────────────────
     /// Caller authenticated but lacks the permission needed for this
@@ -207,13 +287,17 @@ impl ErrorCode {
             | ErrorCode::TransactionNotActive
             | ErrorCode::BranchInvalidState
             | ErrorCode::BranchMergeConflict
-            | ErrorCode::SketchConstraintConflict => StatusCode::CONFLICT,
+            | ErrorCode::SketchConstraintConflict
+            | ErrorCode::DocumentDeleteRefusedActive
+            | ErrorCode::DocumentDeleteRefusedLast
+            | ErrorCode::DocumentDeleteRefusedDefault => StatusCode::CONFLICT,
             ErrorCode::IdempotencyBodyTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
 
             ErrorCode::SolidNotFound
             | ErrorCode::PartNotFound
             | ErrorCode::TransactionNotFound
-            | ErrorCode::BranchNotFound => StatusCode::NOT_FOUND,
+            | ErrorCode::BranchNotFound
+            | ErrorCode::DocumentNotFound => StatusCode::NOT_FOUND,
 
             ErrorCode::KernelError
             | ErrorCode::TessellationEmpty
@@ -223,6 +307,14 @@ impl ErrorCode {
             | ErrorCode::Internal => StatusCode::INTERNAL_SERVER_ERROR,
 
             ErrorCode::AiNotConfigured => StatusCode::SERVICE_UNAVAILABLE,
+
+            ErrorCode::AiCredentialInvalid
+            | ErrorCode::AiModelRejected
+            | ErrorCode::AiModelDiscoveryFailed => StatusCode::BAD_REQUEST,
+            ErrorCode::AiProviderRefused
+            | ErrorCode::AcpMethodNotAllowed
+            | ErrorCode::AcpWebsocketDisabled
+            | ErrorCode::AcpForbiddenSessionMeta => StatusCode::FORBIDDEN,
 
             // A bounded op that blew its budget is a server-side time
             // limit, surfaced as 504 Gateway Timeout — the request was
@@ -260,8 +352,26 @@ impl ErrorCode {
             | ErrorCode::BranchNotFound
             | ErrorCode::BranchInvalidState
             | ErrorCode::BranchMergeConflict
+            | ErrorCode::DocumentNotFound
+            | ErrorCode::DocumentDeleteRefusedActive
+            | ErrorCode::DocumentDeleteRefusedLast
+            | ErrorCode::DocumentDeleteRefusedDefault
             | ErrorCode::SketchConstraintConflict
             | ErrorCode::AiNotConfigured
+            | ErrorCode::AiProviderRefused
+            | ErrorCode::AiCredentialInvalid
+            | ErrorCode::AiModelRejected
+            // A timeout outcome is reported under this same code (see
+            // its doc's `outcome` discriminator) — classified
+            // non-retryable at the code level for the same reason
+            // `OpTimeout` is above: the code covers several outcomes and
+            // most of them (bad key, bad/unresolvable URL) are
+            // deterministic. A caller that inspects `details.outcome ==
+            // "timeout"` and wants to retry that specific case may.
+            | ErrorCode::AiModelDiscoveryFailed
+            | ErrorCode::AcpMethodNotAllowed
+            | ErrorCode::AcpWebsocketDisabled
+            | ErrorCode::AcpForbiddenSessionMeta
             // A budget overrun is deterministic in its inputs: retrying
             // the identical request re-runs the identical corefinement
             // and blows the identical budget. The caller must change the
@@ -311,8 +421,19 @@ impl ErrorCode {
             ErrorCode::BranchNotFound => "branch_not_found",
             ErrorCode::BranchInvalidState => "branch_invalid_state",
             ErrorCode::BranchMergeConflict => "branch_merge_conflict",
+            ErrorCode::DocumentNotFound => "document_not_found",
+            ErrorCode::DocumentDeleteRefusedActive => "document_delete_refused_active",
+            ErrorCode::DocumentDeleteRefusedLast => "document_delete_refused_last",
+            ErrorCode::DocumentDeleteRefusedDefault => "document_delete_refused_default",
             ErrorCode::SketchConstraintConflict => "sketch_constraint_conflict",
             ErrorCode::AiNotConfigured => "ai_not_configured",
+            ErrorCode::AiProviderRefused => "ai_provider_refused",
+            ErrorCode::AiCredentialInvalid => "ai_credential_invalid",
+            ErrorCode::AiModelRejected => "ai_model_rejected",
+            ErrorCode::AiModelDiscoveryFailed => "ai_model_discovery_failed",
+            ErrorCode::AcpMethodNotAllowed => "acp_method_not_allowed",
+            ErrorCode::AcpWebsocketDisabled => "acp_websocket_disabled",
+            ErrorCode::AcpForbiddenSessionMeta => "acp_forbidden_session_meta",
             ErrorCode::PermissionDenied => "permission_denied",
             ErrorCode::MethodNotAllowed => "method_not_allowed",
             ErrorCode::Internal => "internal_error",
@@ -347,8 +468,19 @@ impl ErrorCode {
             ErrorCode::BranchNotFound,
             ErrorCode::BranchInvalidState,
             ErrorCode::BranchMergeConflict,
+            ErrorCode::DocumentNotFound,
+            ErrorCode::DocumentDeleteRefusedActive,
+            ErrorCode::DocumentDeleteRefusedLast,
+            ErrorCode::DocumentDeleteRefusedDefault,
             ErrorCode::SketchConstraintConflict,
             ErrorCode::AiNotConfigured,
+            ErrorCode::AiProviderRefused,
+            ErrorCode::AiCredentialInvalid,
+            ErrorCode::AiModelRejected,
+            ErrorCode::AiModelDiscoveryFailed,
+            ErrorCode::AcpMethodNotAllowed,
+            ErrorCode::AcpWebsocketDisabled,
+            ErrorCode::AcpForbiddenSessionMeta,
             ErrorCode::PermissionDenied,
             ErrorCode::MethodNotAllowed,
             ErrorCode::Internal,
@@ -570,6 +702,62 @@ impl ApiError {
             .with_details(serde_json::json!({ "part_id": part_id }))
     }
 
+    /// A document-scoped route referenced an id that is not in the
+    /// registry — never created, or a typo.
+    pub fn document_not_found(id: &str) -> Self {
+        Self::new(
+            ErrorCode::DocumentNotFound,
+            format!("document '{id}' is not registered"),
+        )
+        .with_hint(
+            "Call POST /api/documents to create it first, or GET /api/documents \
+             to list known ids.",
+        )
+        .with_details(serde_json::json!({ "document_id": id }))
+    }
+
+    /// `DELETE /api/documents/{id}` targeted the document currently
+    /// loaded into the live model.
+    pub fn document_delete_refused_active(id: &str) -> Self {
+        Self::new(
+            ErrorCode::DocumentDeleteRefusedActive,
+            format!("document '{id}' is the active document and cannot be deleted"),
+        )
+        .with_hint(
+            "Switch to a different document first with POST /api/documents/{id}/open, \
+             then retry the delete.",
+        )
+        .with_details(serde_json::json!({ "document_id": id }))
+    }
+
+    /// `DELETE /api/documents/{id}` targeted the only document left in
+    /// the registry.
+    pub fn document_delete_refused_last(id: &str) -> Self {
+        Self::new(
+            ErrorCode::DocumentDeleteRefusedLast,
+            format!("document '{id}' is the last remaining document and cannot be deleted"),
+        )
+        .with_hint(
+            "Create another document with POST /api/documents before deleting this one \
+             — the app must always have at least one document.",
+        )
+        .with_details(serde_json::json!({ "document_id": id }))
+    }
+
+    /// `DELETE /api/documents/{id}` targeted the default document
+    /// (`durability::DURABILITY_SESSION_ID`).
+    pub fn document_delete_refused_default(id: &str) -> Self {
+        Self::new(
+            ErrorCode::DocumentDeleteRefusedDefault,
+            format!("document '{id}' is the default document and cannot be deleted"),
+        )
+        .with_hint(
+            "The default document holds the pre-existing event ledger and cannot be \
+             removed through this route. This is a deliberate restriction, not a bug.",
+        )
+        .with_details(serde_json::json!({ "document_id": id }))
+    }
+
     /// Caller is authenticated but lacks the required permission for
     /// this route. The `permission` detail names the missing scope so
     /// agents can request the right grant from a human operator.
@@ -598,16 +786,160 @@ impl ApiError {
     pub fn ai_not_configured() -> Self {
         Self::new(
             ErrorCode::AiNotConfigured,
-            "AI provider not configured: no LLM API key found at server start".to_string(),
+            "AI provider not configured: no LLM credential is active".to_string(),
         )
         .with_hint(
-            "Set ANTHROPIC_API_KEY (or another supported provider key) in \
-             the server environment and restart. Use GET /api/ai/status \
-             to verify."
+            "Connect a provider from the UI (Settings → AI Provider) or via \
+             PUT /api/ai/provider — no restart required. Alternatively set \
+             ANTHROPIC_API_KEY in the server environment before start. Use \
+             GET /api/ai/status to verify."
                 .to_string(),
         )
         .with_details(serde_json::json!({
-            "missing_env": ["ANTHROPIC_API_KEY"],
+            "configure_endpoint": "/api/ai/provider",
+        }))
+    }
+
+    /// Provider-configuration surface refused a provider or credential
+    /// mode outside the server-owned allowlist. The typed refusal from
+    /// `ai_integration::providers::allowlist` is serialized into
+    /// `details.refusal` so agents can branch without parsing prose.
+    pub fn ai_provider_refused(
+        message: impl Into<String>,
+        refusal_details: serde_json::Value,
+    ) -> Self {
+        Self::new(ErrorCode::AiProviderRefused, message)
+            .with_hint(
+                "Choose a provider/mode from GET /api/ai/provider's `allowlist`. \
+                 Client-side provider switching does not exist by design."
+                    .to_string(),
+            )
+            .with_details(serde_json::json!({ "refusal": refusal_details }))
+    }
+
+    /// A credential failed its live validation round-trip.
+    pub fn ai_credential_invalid(message: impl Into<String>) -> Self {
+        Self::new(ErrorCode::AiCredentialInvalid, message).with_hint(
+            "The credential was tested against the live provider before saving \
+             and was rejected. Check the key/token (or CLI sign-in) and try \
+             again — nothing was stored."
+                .to_string(),
+        )
+    }
+
+    /// A requested model ID was tested against the live provider (via its
+    /// authoritative model-listing endpoint, not a hardcoded menu) and
+    /// rejected. `details.rejected_model` names it explicitly — never a
+    /// generic "invalid model" with no identifying detail.
+    pub fn ai_model_rejected(model: impl Into<String>, message: impl Into<String>) -> Self {
+        let model = model.into();
+        Self::new(ErrorCode::AiModelRejected, message)
+            .with_hint(
+                "The model was tested against the live provider before saving \
+                 and was rejected — it is not one this credential can serve. \
+                 Use \"default\" (the provider's own choice) or a model ID \
+                 the provider actually accepts; nothing was stored."
+                    .to_string(),
+            )
+            .with_details(serde_json::json!({ "rejected_model": model }))
+    }
+
+    /// `POST /api/ai/provider/models` refused before or instead of
+    /// reaching a vendor: no base URL could be resolved (`outcome:
+    /// "no_base_url"`), the vendor rejected the credential
+    /// (`"unauthorized"`), the resolved URL doesn't exist on the vendor
+    /// (`"not_found"`), an unrecognized status came back
+    /// (`"unexpected_status"`), the round trip timed out
+    /// (`"timeout"`), or a transport/parse failure occurred
+    /// (`"transport_error"`). `vendor_status`/`vendor_message` are only
+    /// present when the vendor actually answered.
+    pub fn ai_model_discovery_failed(
+        provider: &str,
+        outcome: &str,
+        message: impl Into<String>,
+        vendor_status: Option<u16>,
+        vendor_message: Option<String>,
+    ) -> Self {
+        Self::new(ErrorCode::AiModelDiscoveryFailed, message)
+            .with_hint(
+                "Model discovery never falls back to a stored or guessed model \
+                 list on failure. Fix the credential/provider named in `details` \
+                 and retry POST /api/ai/provider/models directly."
+                    .to_string(),
+            )
+            .with_details(serde_json::json!({
+                "provider": provider,
+                "outcome": outcome,
+                "vendor_status": vendor_status,
+                "vendor_message": vendor_message,
+            }))
+    }
+
+    /// `POST /api/ai/provider/models` refused a key before any network
+    /// call because it cannot plausibly be an API key (multi-line,
+    /// absurd length, leading whitespace/brackets) — see
+    /// `ai_provider_config::reject_implausible_key_shape`'s doc for the
+    /// incident this closes (a 649-char Vite error message reached
+    /// `state/ai-provider.json` as a stored credential).
+    pub fn ai_api_key_implausible(reason: impl Into<String>) -> Self {
+        let reason = reason.into();
+        Self::new(ErrorCode::InvalidParameter, format!("api_key {reason}"))
+            .with_hint("Paste only the vendor's API key — nothing else.".to_string())
+            .with_details(serde_json::json!({ "parameter": "api_key" }))
+    }
+
+    /// `/acp` POST carried a JSON-RPC method outside the allowlist.
+    pub fn acp_method_not_allowed(method: &str, allowed: &[&str]) -> Self {
+        Self::new(
+            ErrorCode::AcpMethodNotAllowed,
+            format!("ACP method '{method}' is not allowed through Roshera's agent surface"),
+        )
+        .with_hint(
+            "Provider selection, config mutation, and extension management are \
+             server-configured through Roshera's own settings surface \
+             (PUT /api/ai/provider), never through the agent transport."
+                .to_string(),
+        )
+        .with_details(serde_json::json!({
+            "method": method,
+            "allowed_methods": allowed,
+        }))
+    }
+
+    /// `/acp` WebSocket upgrade refused (POST + SSE is the supported
+    /// transport, because it is the one whose messages can be filtered).
+    pub fn acp_websocket_disabled() -> Self {
+        Self::new(
+            ErrorCode::AcpWebsocketDisabled,
+            "the /acp WebSocket transport is disabled; use HTTP POST + SSE".to_string(),
+        )
+        .with_hint(
+            "POST JSON-RPC messages to /acp and read responses via the SSE \
+             stream (GET /acp with Accept: text/event-stream). The WebSocket \
+             upgrade is refused because its frames bypass Roshera's method \
+             gate."
+                .to_string(),
+        )
+    }
+
+    /// `/acp` `session/new` / `session/load` carried a forbidden `_meta`
+    /// key — one that pre-empts or overrides the `mcpServers` entry
+    /// Roshera injects into every session.
+    pub fn acp_forbidden_session_meta(method: &str, key: &str) -> Self {
+        Self::new(
+            ErrorCode::AcpForbiddenSessionMeta,
+            format!("ACP '{method}' carried a forbidden _meta key: '{key}'"),
+        )
+        .with_hint(
+            "Provider selection, extension enablement, and recipe loading are \
+             server-configured through Roshera's own settings surface, never \
+             through _meta on session/new or session/load. Drop the key and \
+             retry — Roshera's own MCP server is injected automatically."
+                .to_string(),
+        )
+        .with_details(serde_json::json!({
+            "method": method,
+            "meta_key": key,
         }))
     }
 }

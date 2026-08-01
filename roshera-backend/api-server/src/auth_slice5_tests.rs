@@ -382,7 +382,7 @@ async fn a_revoked_key_stays_revoked_across_a_restart() {
 
     // Simulated restart: a fresh process state over the SAME database,
     // rehydrated exactly as production boot does (Slice 3 path).
-    let mut restarted = make_test_state_with_database(state.database.clone(), None).await;
+    let mut restarted = make_test_state_with_database(state.database.clone(), None, None).await;
     restarted.auth_posture = AuthPosture::Required;
     let auth_manager = restarted.session_manager.auth_manager();
     auth_manager.attach_api_key_store(restarted.database.clone());

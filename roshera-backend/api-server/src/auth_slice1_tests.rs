@@ -634,6 +634,38 @@ const EXPECTED_PUBLIC_ROUTES: &[&str] = &[
     "/api/auth/refresh",   // credential rotation
 ];
 
+/// Password rotation must be declared, and must require a credential.
+///
+/// The census above would catch this too, but only as one unnamed entry in
+/// a diff of route sets. This says the thing directly, because the failure
+/// it guards is specific and severe: `/api/auth/password` sits beside four
+/// routes that ARE deliberately open, and the difference is that those
+/// issue a credential to someone who has none while this one changes an
+/// existing credential. Exempt by a careless copy of the line above it, it
+/// becomes unauthenticated account takeover for any known username.
+#[test]
+fn password_change_is_declared_and_requires_a_credential() {
+    const PATH: &str = "/api/auth/password";
+
+    assert!(
+        declared_route_paths().iter().any(|p| p == PATH),
+        "{PATH} is not declared in main.rs — the handler exists but nothing routes to it, \
+         so password rotation is unreachable and this test is guarding nothing."
+    );
+
+    assert!(
+        !crate::auth_middleware::path_is_exempt(PATH),
+        "{PATH} is reachable WITHOUT a credential. Changing a password must only ever run \
+         for an already-identified caller; open, it is account takeover for any known username."
+    );
+
+    assert!(
+        !EXPECTED_PUBLIC_ROUTES.contains(&PATH),
+        "{PATH} was added to the reviewed public allowlist. Rotating a credential is not a \
+         credential-issuing route and does not belong there."
+    );
+}
+
 #[test]
 fn unprotected_route_census_matches_reviewed_allowlist() {
     use std::collections::BTreeSet;
@@ -831,5 +863,249 @@ async fn rate_limiter_is_bypassed_under_the_dev_insecure_posture() {
         "all requests under the dev bypass must be admitted — only {ok} of {} \
          succeeded",
         statuses.len()
+    );
+}
+
+// =====================================================================
+// RED 9-11 — rate-limit classes: one bucket per class, per identity
+// =====================================================================
+//
+// The single shared 100/min bucket meant the viewport's continuous
+// poll traffic (GET /api/parts, /api/datums, /api/hierarchy, ...) could
+// exhaust the whole per-identity budget, so an unrelated low-frequency
+// action (opening the AI-provider dialog) 429'd even though nothing was
+// actually wrong with the provider connection. Fixed by
+// `auth_middleware::RateLimitClass`: each class gets its own bucket,
+// keyed `"{client_id}|{class label}"` via
+// `AuthManager::check_rate_limit_budget`. These tests saturate one
+// class and assert (a) another class is unaffected — the starvation
+// fix — and (b) the saturated class itself still 429s once its own
+// budget is exhausted — proof this is a partition, not a removal, of
+// the limiter.
+
+/// Register + log in a fresh user on `state` and return a `"Bearer …"`
+/// header value carrying their token. Shared by the rate-limit-class
+/// tests below, which all need a real authenticated identity so the
+/// limiter keys its buckets on `AuthInfo.user_id` rather than falling
+/// back to the IP bucket every anonymous caller shares.
+async fn bearer_header_for_fresh_user(state: &AppState, username: &str) -> String {
+    let email = format!("{username}@example.test");
+    let (status, body) = dispatch(
+        state,
+        anon(
+            Method::POST,
+            "/api/auth/register",
+            Some(json!({
+                "username": username,
+                "email": email,
+                "password": "Correct-Horse-9"
+            })),
+        ),
+    )
+    .await;
+    assert!(
+        status.is_success(),
+        "registration must succeed on a clean store — got {status}: {body}"
+    );
+
+    let (status, body) = dispatch(
+        state,
+        anon(
+            Method::POST,
+            "/api/auth/login",
+            Some(json!({ "username": username, "password": "Correct-Horse-9" })),
+        ),
+    )
+    .await;
+    assert!(
+        status.is_success(),
+        "login must reach the handler — got {status}: {body}"
+    );
+    let token = body["token"]
+        .as_str()
+        .expect("a successful login must carry a token")
+        .to_string();
+    format!("Bearer {token}")
+}
+
+/// Dispatch an authenticated request built from `method`/`path`/`body`
+/// carrying `bearer` in the `authorization` header.
+async fn authed(
+    state: &AppState,
+    method: Method,
+    path: &str,
+    bearer: &str,
+    body: Option<Value>,
+) -> (StatusCode, Value) {
+    let builder = Request::builder()
+        .method(method)
+        .uri(path)
+        .header("authorization", bearer);
+    let request = match body {
+        Some(v) => builder
+            .header("content-type", "application/json")
+            .body(Body::from(v.to_string()))
+            .expect("request must build"),
+        None => builder.body(Body::empty()).expect("request must build"),
+    };
+    dispatch(state, request).await
+}
+
+/// Saturating the `Poll` class (GET `/api/parts`, budget 300/min) must
+/// not starve the `ProviderConfig` class (`/api/ai/provider`) for the
+/// same identity — the exact bug observed live: a genuinely connected
+/// Max account rendering "Rate limit exceeded" because background
+/// viewport polling had exhausted a bucket the provider dialog shared
+/// with it.
+///
+/// **Fails against the single-shared-bucket tree:** with one 100/min
+/// bucket per client, 300+ GETs to `/api/parts` alone exhausts the
+/// budget and the follow-up `GET /api/ai/provider` also 429s.
+///
+/// Also proves the `Poll` bucket is itself bounded (not an unlimited
+/// exemption): the flood includes requests past its 300/min budget and
+/// some of those must 429.
+#[tokio::test]
+async fn poll_saturation_does_not_starve_the_provider_dialog() {
+    let state = secure_state().await;
+    let bearer = bearer_header_for_fresh_user(&state, "pollflood").await;
+
+    // Flood the Poll class past its 300/min budget.
+    let mut statuses = Vec::with_capacity(320);
+    for _ in 0..320 {
+        let (status, _) = authed(&state, Method::GET, "/api/parts", &bearer, None).await;
+        statuses.push(status);
+    }
+    let throttled = statuses
+        .iter()
+        .filter(|s| **s == StatusCode::TOO_MANY_REQUESTS)
+        .count();
+    assert!(
+        throttled > 0,
+        "the Poll bucket must still be bounded — flooding 320 GETs to \
+         /api/parts (budget 300/min) produced no 429s, so this cannot be \
+         distinguished from removing the limiter"
+    );
+    let ok = statuses.iter().filter(|s| !s.is_server_error()).count();
+    assert!(
+        ok >= 300,
+        "requests within the Poll budget must be admitted — expected at least \
+         300 non-error responses, got {ok}"
+    );
+
+    // The provider dialog, same identity, must be unaffected.
+    let (status, body) = authed(&state, Method::GET, "/api/ai/provider", &bearer, None).await;
+    assert_ne!(
+        status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "GET /api/ai/provider must not be starved by Poll-class traffic \
+         exhausting a bucket it does not share — got 429: {body}"
+    );
+}
+
+/// Saturating the `Agent` class (requests carrying `X-Roshera-Agent`,
+/// budget 240/min) must not starve `Poll`-class traffic for the same
+/// identity, and the `Agent` bucket itself must still be bounded. One
+/// agent turn issuing many MCP tool calls in a burst is exactly the
+/// traffic this class exists to absorb without tripping on individual
+/// calls — but "absorb a burst" must not mean "unlimited".
+#[tokio::test]
+async fn agent_class_is_bounded_and_does_not_starve_poll() {
+    let state = secure_state().await;
+    let bearer = bearer_header_for_fresh_user(&state, "agentflood").await;
+
+    let mut statuses = Vec::with_capacity(260);
+    for _ in 0..260 {
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/api/parts")
+            .header("authorization", &bearer)
+            .header("x-roshera-agent", "test-agent")
+            .body(Body::empty())
+            .expect("request must build");
+        let (status, _) = dispatch(&state, request).await;
+        statuses.push(status);
+    }
+    let throttled = statuses
+        .iter()
+        .filter(|s| **s == StatusCode::TOO_MANY_REQUESTS)
+        .count();
+    assert!(
+        throttled > 0,
+        "the Agent bucket must still be bounded — flooding 260 X-Roshera-Agent \
+         requests (budget 240/min) produced no 429s"
+    );
+    let ok = statuses.iter().filter(|s| !s.is_server_error()).count();
+    assert!(
+        ok >= 240,
+        "requests within the Agent budget must be admitted — expected at \
+         least 240 non-error responses, got {ok}"
+    );
+
+    // Plain (non-agent) Poll traffic, same identity, must be unaffected —
+    // the X-Roshera-Agent header routed the flood into a different bucket.
+    let (status, body) = authed(&state, Method::GET, "/api/parts", &bearer, None).await;
+    assert_ne!(
+        status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "plain GET /api/parts must not be starved by Agent-class traffic \
+         exhausting a bucket it does not share — got 429: {body}"
+    );
+}
+
+/// `POST /api/ai/provider/test` gets its own tight budget (10/min)
+/// rather than sharing `ProviderConfig`'s or being exempted outright —
+/// it makes a real outbound vendor round trip, so it must stay bounded
+/// even though it must never be starved by unrelated traffic either.
+/// This also proves `GET /api/ai/provider` (ProviderConfig) is a
+/// genuinely separate bucket from `POST .../test` (ProviderTest): both
+/// share the `/api/ai/provider` path prefix, so if the classifier keyed
+/// on prefix alone instead of exact path they would collide.
+#[tokio::test]
+async fn provider_test_bucket_is_tight_and_independent_of_provider_config() {
+    let state = secure_state().await;
+    let bearer = bearer_header_for_fresh_user(&state, "providertestflood").await;
+
+    // A payload that fails validation cleanly (unknown mode) — reaches
+    // the handler without ever attempting a vendor round trip, so this
+    // flood cannot make a real network call.
+    let bogus_payload = json!({ "provider": "anthropic", "mode": "not-a-real-mode" });
+
+    let mut statuses = Vec::with_capacity(16);
+    for _ in 0..16 {
+        let (status, _) = authed(
+            &state,
+            Method::POST,
+            "/api/ai/provider/test",
+            &bearer,
+            Some(bogus_payload.clone()),
+        )
+        .await;
+        statuses.push(status);
+    }
+    let throttled = statuses
+        .iter()
+        .filter(|s| **s == StatusCode::TOO_MANY_REQUESTS)
+        .count();
+    assert!(
+        throttled > 0,
+        "the ProviderTest bucket must be bounded — flooding 16 POSTs to \
+         /api/ai/provider/test (budget 10/min) produced no 429s"
+    );
+    let admitted = statuses.len() - throttled;
+    assert!(
+        admitted >= 10,
+        "requests within the ProviderTest budget must be admitted — expected \
+         at least 10, got {admitted}"
+    );
+
+    // ProviderConfig (GET /api/ai/provider), same identity, must be
+    // unaffected — it is a different bucket from ProviderTest.
+    let (status, body) = authed(&state, Method::GET, "/api/ai/provider", &bearer, None).await;
+    assert_ne!(
+        status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "GET /api/ai/provider must not be starved by ProviderTest-class \
+         traffic exhausting a bucket it does not share — got 429: {body}"
     );
 }

@@ -17,6 +17,8 @@
 
 import { z } from "zod";
 import { toJsonSchemaCompat } from "@modelcontextprotocol/sdk/server/zod-json-schema-compat.js";
+import { nextTurn } from "./core.js";
+import { preDispatchGate, recordDispatchOutcome } from "./gates.js";
 
 // ─── The capture shim ──────────────────────────────────────────────────────
 
@@ -86,7 +88,30 @@ export class ToolTable implements ToolHost {
       // A duplicate name would silently shadow — refuse loudly at load time.
       throw new Error(`duplicate tool registration: ${t.name}`);
     }
-    this.tools.set(t.name, t);
+    // Tick the session turn counter (image-expiry policy, core.ts) exactly once
+    // per handler dispatch, regardless of call path — direct mount (index.ts),
+    // invoke() (metatools.ts), or cad_program()'s batch loop all call
+    // `entry.handler(...)`, so wrapping it HERE is the single choke point that
+    // covers all three without touching any of them.
+    //
+    // The same choke point runs the CONSTRAINT gates (gates.ts): the refusal
+    // cache, the intent gate, and the unsound-base gate all fire before the
+    // real handler, and every outcome (gated or handled) is recorded after —
+    // so no call path can retry a refused call, build without a declared
+    // intent, or stack work on an unsound base, without the gate seeing it.
+    const rawHandler = t.handler;
+    const wrapped: RegisteredTool["handler"] = async (args, extra) => {
+      const turn = nextTurn();
+      const gated = await preDispatchGate(t.name, args, turn);
+      if (gated) {
+        recordDispatchOutcome(t.name, args, gated, turn);
+        return gated;
+      }
+      const result = await rawHandler(args, extra);
+      recordDispatchOutcome(t.name, args, result, turn);
+      return result;
+    };
+    this.tools.set(t.name, { ...t, handler: wrapped });
   }
 
   get(name: string): RegisteredTool | undefined {
@@ -166,6 +191,7 @@ const EXPERIMENTAL = new Set<string>([
   "drawing_read_semantics",
   "drawing_query",
   "dfm_check",
+  "kb_lookup",
 ]);
 
 const BENCH_OF: Record<string, Bench> = {
@@ -264,6 +290,7 @@ const BENCH_OF: Record<string, Bench> = {
   part_distance: "analysis",
   part_features: "analysis",
   dfm_check: "analysis",
+  kb_lookup: "analysis",
   ground_truth: "analysis",
   measure_faces: "analysis",
   verify_claim: "analysis",

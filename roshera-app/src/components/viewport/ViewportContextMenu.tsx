@@ -1,5 +1,10 @@
-import { useEffect, useRef, useCallback } from 'react'
+import { useCallback } from 'react'
 import { Eye, EyeOff, FileText, PenTool, Trash2 } from 'lucide-react'
+import {
+  ContextMenu,
+  ContextMenuItem,
+  ContextMenuSeparator,
+} from '@/components/ui/context-menu'
 import { useSceneStore } from '@/stores/scene-store'
 import { useDocModeStore } from '@/stores/doc-mode-store'
 import { sketchApi } from '@/lib/sketch-api'
@@ -23,27 +28,6 @@ export function ViewportContextMenu() {
   const menu = useSceneStore((s) => s.contextMenu)
   const close = useSceneStore((s) => s.closeContextMenu)
   const updateObject = useSceneStore((s) => s.updateObject)
-  const ref = useRef<HTMLDivElement>(null)
-
-  // Outside-click + Escape dismiss. Wired only while the menu is open
-  // so the global listeners don't bleed across renders.
-  useEffect(() => {
-    if (!menu) return
-    const onMouseDown = (e: MouseEvent) => {
-      const el = ref.current
-      if (el && e.target instanceof Node && el.contains(e.target)) return
-      close()
-    }
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') close()
-    }
-    window.addEventListener('mousedown', onMouseDown)
-    window.addEventListener('keydown', onKey)
-    return () => {
-      window.removeEventListener('mousedown', onMouseDown)
-      window.removeEventListener('keydown', onKey)
-    }
-  }, [menu, close])
 
   const handleDelete = useCallback(async () => {
     if (!menu) return
@@ -114,58 +98,30 @@ export function ViewportContextMenu() {
   const isVisible = obj?.visible ?? true
 
   return (
-    <div
-      ref={ref}
-      className="fixed z-50 cad-panel min-w-[160px] py-1 text-[12px] shadow-lg select-none"
-      style={{ left: menu.x, top: menu.y }}
-      role="menu"
-    >
-      <MenuItem onClick={handleToggleVisibility}>
+    <ContextMenu x={menu.x} y={menu.y} onClose={close} aria-label="Object actions">
+      <ContextMenuItem onClick={handleToggleVisibility}>
         {isVisible ? <EyeOff size={13} /> : <Eye size={13} />}
         {isVisible ? 'Hide' : 'Show'}
-      </MenuItem>
-      <div className="my-1 border-t border-border/50" />
-      <MenuItem onClick={handleCreateDrawing}>
+      </ContextMenuItem>
+      <ContextMenuSeparator />
+      <ContextMenuItem onClick={() => void handleCreateDrawing()}>
         <FileText size={13} />
         Create Drawing
-      </MenuItem>
+      </ContextMenuItem>
       {menu.faceId !== undefined && (
         <>
-          <div className="my-1 border-t border-border/50" />
-          <MenuItem onClick={handleSketchOnFace}>
+          <ContextMenuSeparator />
+          <ContextMenuItem onClick={() => void handleSketchOnFace()}>
             <PenTool size={13} />
             Sketch on this face
-          </MenuItem>
+          </ContextMenuItem>
         </>
       )}
-      <div className="my-1 border-t border-border/50" />
-      <MenuItem onClick={handleDelete} danger>
+      <ContextMenuSeparator />
+      <ContextMenuItem onClick={() => void handleDelete()} danger>
         <Trash2 size={13} />
         Delete
-      </MenuItem>
-    </div>
-  )
-}
-
-interface MenuItemProps {
-  children: React.ReactNode
-  onClick: () => void
-  danger?: boolean
-}
-
-function MenuItem({ children, onClick, danger }: MenuItemProps) {
-  return (
-    <button
-      type="button"
-      role="menuitem"
-      onClick={onClick}
-      className={[
-        'w-full flex items-center gap-2 px-3 py-1.5 text-left',
-        'hover:bg-accent/40 transition-colors',
-        danger ? 'text-destructive' : 'text-foreground',
-      ].join(' ')}
-    >
-      {children}
-    </button>
+      </ContextMenuItem>
+    </ContextMenu>
   )
 }

@@ -286,6 +286,163 @@ pub async fn register(
     }))
 }
 
+#[derive(Debug, Deserialize)]
+pub struct ChangePasswordRequest {
+    pub current_password: String,
+    pub new_password: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ChangePasswordResponse {
+    pub success: bool,
+    pub message: String,
+    /// Populated only on the unhappy path; mirrors the codes used by the
+    /// other auth handlers in this module.
+    pub error: Option<String>,
+}
+
+/// `POST /api/auth/password` — change the caller's own password.
+///
+/// Until this existed there was no way for anyone to change a password by
+/// any route: the auth surface was login / register / refresh / logout, so
+/// the only remedies were a direct database write or re-registering under a
+/// new name. A credential you cannot rotate is a credential you cannot
+/// contain once it leaks.
+///
+/// The current password is required even though the caller already holds a
+/// valid token. A bearer token proves *possession*, and possession is
+/// exactly what is in doubt when a credential change matters — an
+/// unattended session or a leaked token would otherwise be enough to lock
+/// the owner out of their own account. Re-proving knowledge is what makes
+/// this a change rather than a takeover, so it is checked, not assumed.
+///
+/// The new password goes through `AuthManager::hash_password`, which
+/// applies the configured complexity policy before hashing. A rejection
+/// there is returned verbatim as a typed refusal rather than being softened
+/// or bypassed: the policy is the operator's decision (`ROSHERA_PASSWORD_*`),
+/// not this handler's to negotiate.
+///
+/// ⚠ Known limitation, stated rather than hidden: tokens already issued
+/// stay valid until they expire. `AuthManager` revokes individual tokens
+/// (that is what logout does) but has no per-user bulk revocation, so this
+/// rotates the secret without ending live sessions. Anyone treating a
+/// password change as "kick every other session out" would be wrong today.
+pub async fn change_password(
+    State(state): State<AppState>,
+    Extension(auth_info): Extension<AuthInfo>,
+    Json(payload): Json<ChangePasswordRequest>,
+) -> (StatusCode, Json<ChangePasswordResponse>) {
+    let auth_manager = state.session_manager.auth_manager();
+    let user_id = auth_info.user_id.clone();
+
+    let mut user_data = match state.database.load_user(&user_id).await {
+        Ok(u) => u,
+        Err(e) => {
+            // The token authenticated, so the account should exist. If it
+            // does not, that is a server-side inconsistency, not a client
+            // error — say so instead of reporting bad credentials.
+            error!("Password change: authenticated user {user_id} not loadable: {e:?}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ChangePasswordResponse {
+                    success: false,
+                    message: "Could not load the account for this token".to_string(),
+                    error: Some("USER_NOT_LOADABLE".to_string()),
+                }),
+            );
+        }
+    };
+
+    if !user_data.is_active {
+        warn!("Password change rejected — account inactive: {user_id}");
+        return (
+            StatusCode::FORBIDDEN,
+            Json(ChangePasswordResponse {
+                success: false,
+                message: "Account is inactive".to_string(),
+                error: Some("ACCOUNT_INACTIVE".to_string()),
+            }),
+        );
+    }
+
+    let current_valid = auth_manager
+        .verify_password(&payload.current_password, &user_data.password_hash)
+        .unwrap_or(false);
+
+    if !current_valid {
+        warn!("Password change rejected — wrong current password: {user_id}");
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(ChangePasswordResponse {
+                success: false,
+                message: "Current password is incorrect".to_string(),
+                error: Some("INVALID_CREDENTIALS".to_string()),
+            }),
+        );
+    }
+
+    // Rotating to the same secret is not a rotation. Refusing is honest:
+    // reporting success would tell the caller their credential changed when
+    // nothing about it did.
+    if payload.new_password == payload.current_password {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ChangePasswordResponse {
+                success: false,
+                message: "The new password is the same as the current one".to_string(),
+                error: Some("PASSWORD_UNCHANGED".to_string()),
+            }),
+        );
+    }
+
+    let new_hash = match auth_manager.hash_password(&payload.new_password) {
+        Ok(hash) => hash,
+        Err(e) => {
+            // Forward the policy's own reason — "must contain uppercase
+            // letter" is actionable, "invalid password" is not.
+            let reason = match &e {
+                SessionError::InvalidInput { field } => field.clone(),
+                other => format!("{other:?}"),
+            };
+            warn!("Password change rejected by policy for {user_id}: {reason}");
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(ChangePasswordResponse {
+                    success: false,
+                    message: reason,
+                    error: Some("PASSWORD_POLICY".to_string()),
+                }),
+            );
+        }
+    };
+
+    user_data.password_hash = new_hash;
+
+    if let Err(e) = state.database.update_user(&user_data).await {
+        error!("Password change failed to persist for {user_id}: {e:?}");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ChangePasswordResponse {
+                success: false,
+                message: "Password change failed due to a server error".to_string(),
+                error: Some("STORAGE_ERROR".to_string()),
+            }),
+        );
+    }
+
+    info!("Password changed for user: {user_id}");
+
+    (
+        StatusCode::OK,
+        Json(ChangePasswordResponse {
+            success: true,
+            message: "Password changed. Existing tokens remain valid until they expire."
+                .to_string(),
+            error: None,
+        }),
+    )
+}
+
 /// Handle token refresh
 ///
 /// The supplied refresh token must be a valid, unexpired JWT signed by this server.

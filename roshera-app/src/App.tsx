@@ -1,5 +1,6 @@
 import { useEffect, useState, useCallback } from 'react'
 import { TopBar } from '@/components/layout/TopBar'
+import { DocumentTabs } from '@/components/layout/DocumentTabs'
 import { ToolBar } from '@/components/layout/ToolBar'
 import { StatusBar } from '@/components/layout/StatusBar'
 import { CADViewport } from '@/components/viewport/CADViewport'
@@ -95,6 +96,7 @@ export function App() {
           combines existing parts. Treating them as a top-level tab
           strip implied otherwise. */}
       <TopBar />
+      <DocumentTabs />
       <div className="flex flex-1 min-h-0">
         {/* The Drawing workspace replaces the 3D pipeline entirely:
             no ToolBar (modelling primitives are irrelevant in a 2D

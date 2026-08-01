@@ -32,34 +32,13 @@ fn role_from_str(s: &str) -> Role {
     }
 }
 
-/// Parse a permission string (Debug repr of `Permission`) back into the enum.
-/// Returns `None` for unknown variants so callers can `filter_map` cleanly.
+/// Parse a permission string (the canonical PascalCase wire form) back
+/// into the enum. Returns `None` for unknown variants so callers can
+/// `filter_map` cleanly. A thin wrapper over [`Permission::from_str`] —
+/// the single canonical codec — so this module never carries its own
+/// copy of the variant list to drift out of sync with it.
 fn permission_from_str(s: &str) -> Option<Permission> {
-    Some(match s {
-        "DeleteSession" => Permission::DeleteSession,
-        "InviteUsers" => Permission::InviteUsers,
-        "RemoveUsers" => Permission::RemoveUsers,
-        "ChangeRoles" => Permission::ChangeRoles,
-        "ModifySettings" => Permission::ModifySettings,
-        "CreateGeometry" => Permission::CreateGeometry,
-        "ModifyGeometry" => Permission::ModifyGeometry,
-        "DeleteGeometry" => Permission::DeleteGeometry,
-        "BooleanOperations" => Permission::BooleanOperations,
-        "AdvancedFeatures" => Permission::AdvancedFeatures,
-        "ViewGeometry" => Permission::ViewGeometry,
-        "MeasureGeometry" => Permission::MeasureGeometry,
-        "ExportGeometry" => Permission::ExportGeometry,
-        "TakeScreenshots" => Permission::TakeScreenshots,
-        "UndoRedo" => Permission::UndoRedo,
-        "CreateBranches" => Permission::CreateBranches,
-        "MergeBranches" => Permission::MergeBranches,
-        "ViewHistory" => Permission::ViewHistory,
-        "AddComments" => Permission::AddComments,
-        "VoiceChat" => Permission::VoiceChat,
-        "ScreenShare" => Permission::ScreenShare,
-        "RecordSession" => Permission::RecordSession,
-        _ => return None,
-    })
+    Permission::from_str(s)
 }
 
 use async_trait::async_trait;
@@ -215,6 +194,26 @@ pub trait DatabasePersistence: Send + Sync {
     // event belongs to; these persist the branch RECORD itself.
     async fn save_branch(&self, branch: &BranchRecord) -> Result<(), SessionError>;
     async fn load_branches(&self, session_id: &str) -> Result<Vec<BranchRecord>, SessionError>;
+
+    // Documents: the registry of scoping keys under which timeline events
+    // and branch records are persisted (task "Roshera has no New"). A
+    // document's actual data (its `timeline_events` / `durable_branches`
+    // rows) is keyed by `DocumentRecord.id` exactly as `session_id` already
+    // is — this registry is only the human-facing catalog (id, name,
+    // created_at) so `GET /api/documents` has something to list. Upsert on
+    // conflict so re-registering the default document at boot is idempotent.
+    async fn save_document(&self, document: &DocumentRecord) -> Result<(), SessionError>;
+    /// All registered documents, oldest first.
+    async fn load_documents(&self) -> Result<Vec<DocumentRecord>, SessionError>;
+    /// Delete a document's registry row AND every row scoped under its id
+    /// (`timeline_events`, `durable_branches`) in ONE transaction — the
+    /// registry row and its data are removed together, or neither is; a
+    /// document that lists but cannot open (or vice versa) is worse than
+    /// one that stays. This is the unconditional data-layer primitive —
+    /// the active/last/default refusals live at the HTTP handler, not
+    /// here, so this method has no opinion about which document it is
+    /// asked to delete.
+    async fn delete_document(&self, id: &str) -> Result<(), SessionError>;
 }
 
 /// Session metadata
@@ -286,6 +285,24 @@ pub struct BranchRecord {
     pub fork_sequence: i64,
     pub name: String,
     pub data: serde_json::Value,
+}
+
+/// A registered document — the human-facing catalog entry for a scoping key
+/// (`id`) under which `timeline_events` / `durable_branches` rows live. `id`
+/// is opaque to the schema (it is just the `session_id` column value every
+/// other durability table already keys on); this table exists solely so
+/// "New" has something to create and "Open" has something to list.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DocumentRecord {
+    pub id: String,
+    pub name: String,
+    /// Milliseconds since the Unix epoch.
+    pub created_at: i64,
+    /// Display string for the creating principal (human username, agent id,
+    /// or `"system"` for the pre-durability document self-healed into the
+    /// registry at boot). Not parsed back into an `Author` — provenance for
+    /// the document's actual events lives in the events themselves.
+    pub created_by: String,
 }
 
 /// PostgreSQL implementation
@@ -565,6 +582,26 @@ impl PostgresDatabase {
         .await
         .map_err(|e| SessionError::PersistenceError {
             reason: format!("Failed to create durable_branches table: {}", e),
+        })?;
+
+        // Document registry ("Roshera has no New"): the catalog `POST
+        // /api/documents` writes to and `GET /api/documents` lists. FK-free
+        // like `timeline_events`, for the same reason — `id` is a bare
+        // scoping key, not a row in `sessions`.
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS documents (
+                id VARCHAR(255) PRIMARY KEY,
+                name VARCHAR(255) NOT NULL,
+                created_at BIGINT NOT NULL,
+                created_by VARCHAR(255) NOT NULL
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| SessionError::PersistenceError {
+            reason: format!("Failed to create documents table: {}", e),
         })?;
 
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_timeline_session_seq ON timeline_events(session_id, sequence_number)")
@@ -1020,16 +1057,21 @@ impl DatabasePersistence for PostgresDatabase {
         session_id: &str,
         permissions: &UserPermissions,
     ) -> Result<(), SessionError> {
+        // Written via the canonical codec (`Permission::as_str`), not
+        // `format!("{:?}", p)` — the reader (`permission_from_str`,
+        // just above) decodes through the same codec's `from_str`, so
+        // writer and reader can never drift out of sync with each other
+        // the way a hand-maintained Debug-vs-match pair could.
         let explicit_perms: Vec<String> = permissions
             .explicit_permissions
             .iter()
-            .map(|p| format!("{:?}", p))
+            .map(|p| p.as_str().to_string())
             .collect();
 
         let denied_perms: Vec<String> = permissions
             .denied_permissions
             .iter()
-            .map(|p| format!("{:?}", p))
+            .map(|p| p.as_str().to_string())
             .collect();
 
         sqlx::query(
@@ -1131,60 +1173,12 @@ impl DatabasePersistence for PostgresDatabase {
 
                 let explicit_permissions = explicit_perms
                     .into_iter()
-                    .filter_map(|p| match p.as_str() {
-                        "DeleteSession" => Some(Permission::DeleteSession),
-                        "InviteUsers" => Some(Permission::InviteUsers),
-                        "RemoveUsers" => Some(Permission::RemoveUsers),
-                        "ChangeRoles" => Some(Permission::ChangeRoles),
-                        "ModifySettings" => Some(Permission::ModifySettings),
-                        "CreateGeometry" => Some(Permission::CreateGeometry),
-                        "ModifyGeometry" => Some(Permission::ModifyGeometry),
-                        "DeleteGeometry" => Some(Permission::DeleteGeometry),
-                        "BooleanOperations" => Some(Permission::BooleanOperations),
-                        "AdvancedFeatures" => Some(Permission::AdvancedFeatures),
-                        "ViewGeometry" => Some(Permission::ViewGeometry),
-                        "MeasureGeometry" => Some(Permission::MeasureGeometry),
-                        "ExportGeometry" => Some(Permission::ExportGeometry),
-                        "TakeScreenshots" => Some(Permission::TakeScreenshots),
-                        "UndoRedo" => Some(Permission::UndoRedo),
-                        "CreateBranches" => Some(Permission::CreateBranches),
-                        "MergeBranches" => Some(Permission::MergeBranches),
-                        "ViewHistory" => Some(Permission::ViewHistory),
-                        "AddComments" => Some(Permission::AddComments),
-                        "VoiceChat" => Some(Permission::VoiceChat),
-                        "ScreenShare" => Some(Permission::ScreenShare),
-                        "RecordSession" => Some(Permission::RecordSession),
-                        _ => None,
-                    })
+                    .filter_map(|p| permission_from_str(&p))
                     .collect();
 
                 let denied_permissions = denied_perms
                     .into_iter()
-                    .filter_map(|p| match p.as_str() {
-                        "DeleteSession" => Some(Permission::DeleteSession),
-                        "InviteUsers" => Some(Permission::InviteUsers),
-                        "RemoveUsers" => Some(Permission::RemoveUsers),
-                        "ChangeRoles" => Some(Permission::ChangeRoles),
-                        "ModifySettings" => Some(Permission::ModifySettings),
-                        "CreateGeometry" => Some(Permission::CreateGeometry),
-                        "ModifyGeometry" => Some(Permission::ModifyGeometry),
-                        "DeleteGeometry" => Some(Permission::DeleteGeometry),
-                        "BooleanOperations" => Some(Permission::BooleanOperations),
-                        "AdvancedFeatures" => Some(Permission::AdvancedFeatures),
-                        "ViewGeometry" => Some(Permission::ViewGeometry),
-                        "MeasureGeometry" => Some(Permission::MeasureGeometry),
-                        "ExportGeometry" => Some(Permission::ExportGeometry),
-                        "TakeScreenshots" => Some(Permission::TakeScreenshots),
-                        "UndoRedo" => Some(Permission::UndoRedo),
-                        "CreateBranches" => Some(Permission::CreateBranches),
-                        "MergeBranches" => Some(Permission::MergeBranches),
-                        "ViewHistory" => Some(Permission::ViewHistory),
-                        "AddComments" => Some(Permission::AddComments),
-                        "VoiceChat" => Some(Permission::VoiceChat),
-                        "ScreenShare" => Some(Permission::ScreenShare),
-                        "RecordSession" => Some(Permission::RecordSession),
-                        _ => None,
-                    })
+                    .filter_map(|p| permission_from_str(&p))
                     .collect();
 
                 UserPermissions {
@@ -1488,6 +1482,94 @@ impl DatabasePersistence for PostgresDatabase {
         })?;
         Ok(rows.into_iter().map(row_to_branch_record).collect())
     }
+
+    async fn save_document(&self, document: &DocumentRecord) -> Result<(), SessionError> {
+        sqlx::query(
+            r#"
+            INSERT INTO documents (id, name, created_at, created_by)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (id) DO UPDATE
+                SET name = EXCLUDED.name
+            "#,
+        )
+        .bind(&document.id)
+        .bind(&document.name)
+        .bind(document.created_at)
+        .bind(&document.created_by)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| SessionError::PersistenceError {
+            reason: format!("Failed to save document: {}", e),
+        })?;
+        Ok(())
+    }
+
+    async fn load_documents(&self) -> Result<Vec<DocumentRecord>, SessionError> {
+        let rows = sqlx::query("SELECT * FROM documents ORDER BY created_at ASC")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| SessionError::PersistenceError {
+                reason: format!("Failed to load documents: {}", e),
+            })?;
+        Ok(rows.into_iter().map(row_to_document_record_pg).collect())
+    }
+
+    async fn delete_document(&self, id: &str) -> Result<(), SessionError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| SessionError::PersistenceError {
+                reason: format!("Failed to begin document delete transaction: {}", e),
+            })?;
+
+        sqlx::query("DELETE FROM timeline_events WHERE session_id = $1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| SessionError::PersistenceError {
+                reason: format!(
+                    "Failed to delete timeline_events for document '{id}': {}",
+                    e
+                ),
+            })?;
+
+        sqlx::query("DELETE FROM durable_branches WHERE session_id = $1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| SessionError::PersistenceError {
+                reason: format!(
+                    "Failed to delete durable_branches for document '{id}': {}",
+                    e
+                ),
+            })?;
+
+        sqlx::query("DELETE FROM documents WHERE id = $1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| SessionError::PersistenceError {
+                reason: format!("Failed to delete document row '{id}': {}", e),
+            })?;
+
+        tx.commit()
+            .await
+            .map_err(|e| SessionError::PersistenceError {
+                reason: format!("Failed to commit document delete transaction: {}", e),
+            })?;
+        Ok(())
+    }
+}
+
+/// Map a `documents` row into a [`DocumentRecord`] (PostgreSQL).
+fn row_to_document_record_pg(row: sqlx::postgres::PgRow) -> DocumentRecord {
+    DocumentRecord {
+        id: row.get("id"),
+        name: row.get("name"),
+        created_at: row.get("created_at"),
+        created_by: row.get("created_by"),
+    }
 }
 
 /// Map a `timeline_events` row into a [`TimelineEventData`]. Shared by the
@@ -1782,6 +1864,24 @@ impl SqliteDatabase {
         .await
         .map_err(|e| SessionError::PersistenceError {
             reason: format!("Failed to create durable_branches table: {}", e),
+        })?;
+
+        // Document registry ("Roshera has no New") — SQLite twin of the
+        // PostgreSQL `documents` table above.
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS documents (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                created_by TEXT NOT NULL
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| SessionError::PersistenceError {
+            reason: format!("Failed to create documents table: {}", e),
         })?;
 
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_timeline_events_seq ON timeline_events(session_id, sequence_number)")
@@ -2600,6 +2700,97 @@ impl DatabasePersistence for SqliteDatabase {
             reason: format!("Failed to load branches: {}", e),
         })?;
         Ok(rows.into_iter().map(sqlite_row_to_branch_record).collect())
+    }
+
+    async fn save_document(&self, document: &DocumentRecord) -> Result<(), SessionError> {
+        sqlx::query(
+            r#"
+            INSERT INTO documents (id, name, created_at, created_by)
+            VALUES (?1, ?2, ?3, ?4)
+            ON CONFLICT (id) DO UPDATE
+                SET name = excluded.name
+            "#,
+        )
+        .bind(&document.id)
+        .bind(&document.name)
+        .bind(document.created_at)
+        .bind(&document.created_by)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| SessionError::PersistenceError {
+            reason: format!("Failed to save document: {}", e),
+        })?;
+        Ok(())
+    }
+
+    async fn load_documents(&self) -> Result<Vec<DocumentRecord>, SessionError> {
+        let rows = sqlx::query("SELECT * FROM documents ORDER BY created_at ASC")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| SessionError::PersistenceError {
+                reason: format!("Failed to load documents: {}", e),
+            })?;
+        Ok(rows
+            .into_iter()
+            .map(row_to_document_record_sqlite)
+            .collect())
+    }
+
+    async fn delete_document(&self, id: &str) -> Result<(), SessionError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| SessionError::PersistenceError {
+                reason: format!("Failed to begin document delete transaction: {}", e),
+            })?;
+
+        sqlx::query("DELETE FROM timeline_events WHERE session_id = ?1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| SessionError::PersistenceError {
+                reason: format!(
+                    "Failed to delete timeline_events for document '{id}': {}",
+                    e
+                ),
+            })?;
+
+        sqlx::query("DELETE FROM durable_branches WHERE session_id = ?1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| SessionError::PersistenceError {
+                reason: format!(
+                    "Failed to delete durable_branches for document '{id}': {}",
+                    e
+                ),
+            })?;
+
+        sqlx::query("DELETE FROM documents WHERE id = ?1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| SessionError::PersistenceError {
+                reason: format!("Failed to delete document row '{id}': {}", e),
+            })?;
+
+        tx.commit()
+            .await
+            .map_err(|e| SessionError::PersistenceError {
+                reason: format!("Failed to commit document delete transaction: {}", e),
+            })?;
+        Ok(())
+    }
+}
+
+/// Map a `documents` row into a [`DocumentRecord`] (SQLite).
+fn row_to_document_record_sqlite(row: sqlx::sqlite::SqliteRow) -> DocumentRecord {
+    DocumentRecord {
+        id: row.get("id"),
+        name: row.get("name"),
+        created_at: row.get("created_at"),
+        created_by: row.get("created_by"),
     }
 }
 

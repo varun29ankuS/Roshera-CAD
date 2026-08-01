@@ -1,9 +1,15 @@
-import { useState, useEffect, useLayoutEffect, useCallback, useRef } from 'react'
-import { createPortal } from 'react-dom'
+import { useState, useEffect, useCallback } from 'react'
 import { Eye, EyeOff, Trash2, Pencil, Plus, FileText } from 'lucide-react'
+import {
+  ContextMenu,
+  ContextMenuHeader,
+  ContextMenuItem,
+  ContextMenuSeparator,
+} from '@/components/ui/context-menu'
 import { useSceneStore, isStandardPlane, type CADObject, type SketchPlane } from '@/stores/scene-store'
 import { useDocModeStore } from '@/stores/doc-mode-store'
 import { useWSStore } from '@/stores/ws-store'
+import { useDocumentStore } from '@/stores/document-store'
 import { sketchApi, type ServerSketchSession } from '@/lib/sketch-api'
 import { createPartDrawing } from '@/lib/drawings-api'
 import { ScrollArea } from '@/components/ui/scroll-area'
@@ -607,9 +613,12 @@ export function ModelTree({
           setBackendNodes(hierarchyToNodes(data.data.hierarchy))
           return
         }
+      } else {
+        console.error(`[ModelTree] GET /api/hierarchy/${sid} failed: ${resp.status}`)
       }
-    } catch {
+    } catch (err) {
       // Backend not running — fall back to local
+      console.error('[ModelTree] hierarchy fetch threw:', err)
     }
     setBackendNodes(null)
   }, [sessionId])
@@ -618,6 +627,10 @@ export function ModelTree({
   // plus user-authored datums in Slice 3). Same poll cadence as the
   // hierarchy fetch — datums are tens-of-bytes per row, so polling is
   // cheap and we get visibility-flag sync for free.
+  //
+  // Logged, not surfaced in the UI: the viewport's `Datums.tsx` polls the
+  // same endpoint and owns the user-facing failure report (a Blackboard
+  // system line), so this tree doesn't double up on the same root cause.
   const fetchDatums = useCallback(async () => {
     try {
       const resp = await fetch(`${API_BASE}/api/datums`)
@@ -627,20 +640,29 @@ export function ModelTree({
           setDatums(data.datums)
           return
         }
+      } else {
+        console.error(`[ModelTree] GET /api/datums failed: ${resp.status}`)
       }
-    } catch {
+    } catch (err) {
       // Backend not running — leave datums as-is rather than clearing,
       // so the tree doesn't flicker on transient network errors.
+      console.error('[ModelTree] datums fetch threw:', err)
     }
   }, [])
 
+  // `documentEpoch` bumps AFTER an in-place document switch is confirmed
+  // (`stores/document-store.ts`) — treated exactly like a fresh WS connect:
+  // the hierarchy/datums this panel shows belong to whichever document is
+  // now active, and waiting out the 5s poll below would leave the previous
+  // document's parts on screen for up to 5 seconds after switching.
+  const documentEpoch = useDocumentStore((s) => s.epoch)
   useEffect(() => {
     if (wsStatus === 'connected') {
       // Fetch on connect — async to avoid synchronous setState in effect
       void Promise.resolve().then(fetchHierarchy)
       void Promise.resolve().then(fetchDatums)
     }
-  }, [wsStatus, fetchHierarchy, fetchDatums])
+  }, [wsStatus, fetchHierarchy, fetchDatums, documentEpoch])
 
   // Poll for hierarchy updates (pause when tab is hidden)
   useEffect(() => {
@@ -737,7 +759,13 @@ export function ModelTree({
               method: 'PATCH',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ visible: next }),
-            })
+            }).then((resp) => {
+              if (!resp.ok) {
+                console.error(
+                  `[ModelTree] PATCH datum ${d.id} visibility failed: ${resp.status}`,
+                )
+              }
+            }).catch((err) => console.error('[ModelTree] datum visibility PATCH threw:', err))
           }
           // Optimistic local update; the next poll will reconcile.
           setDatums((prev) => prev.map((d) => ({ ...d, visible: next })))
@@ -752,7 +780,13 @@ export function ModelTree({
           method: 'PATCH',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ visible: next }),
-        })
+        }).then((resp) => {
+          if (!resp.ok) {
+            console.error(
+              `[ModelTree] PATCH datum ${numericId} visibility failed: ${resp.status}`,
+            )
+          }
+        }).catch((err) => console.error('[ModelTree] datum visibility PATCH threw:', err))
         setDatums((prev) =>
           prev.map((d) => (d.id === numericId ? { ...d, visible: next } : d)),
         )
@@ -871,8 +905,9 @@ export function ModelTree({
       {expanded && mode === 'browser' && (
         <ScrollArea id="browser-tree" className="flex-1 min-h-0">
           {treeNodes.length === 0 ? (
-            <div className="p-3 text-[13px] text-muted-foreground/60 text-center font-mono">
-              ∅ no objects in scene
+            <div className="p-3 text-[12px] text-muted-foreground/60 text-center font-mono">
+              ∅ empty document — add a primitive from the toolbar,
+              sketch on a plane, or drop a STEP file
             </div>
           ) : (
             <div className="py-1 px-1">
@@ -946,7 +981,6 @@ function TreeContextMenu({
    */
   onDatumsChanged: () => void
 }) {
-  const ref = useRef<HTMLDivElement>(null)
   const updateObject = useSceneStore((s) => s.updateObject)
   const editServerSketch = useSceneStore((s) => s.editServerSketch)
   const clearServerSketchId = useSceneStore((s) => s.clearServerSketchId)
@@ -973,50 +1007,6 @@ function TreeContextMenu({
       ? datums.find((d) => d.id === datumId)
       : undefined
   const isDefaultDatum = !!datumRecord?.is_default
-
-  // Edge-aware positioning — flip the menu inward whenever the click
-  // landed close enough to a viewport edge that the natural downward /
-  // rightward layout would clip.
-  const [pos, setPos] = useState<{ x: number; y: number; ready: boolean }>({
-    x: menu.x,
-    y: menu.y,
-    ready: false,
-  })
-
-  useLayoutEffect(() => {
-    const el = ref.current
-    if (!el) return
-    const rect = el.getBoundingClientRect()
-    const vw = window.innerWidth
-    const vh = window.innerHeight
-    const margin = 8
-    let x = menu.x
-    let y = menu.y
-    if (x + rect.width > vw - margin) {
-      x = Math.max(margin, menu.x - rect.width)
-    }
-    if (y + rect.height > vh - margin) {
-      y = Math.max(margin, menu.y - rect.height)
-    }
-    setPos({ x, y, ready: true })
-  }, [menu.x, menu.y])
-
-  useEffect(() => {
-    const onMouseDown = (e: MouseEvent) => {
-      const el = ref.current
-      if (el && e.target instanceof Node && el.contains(e.target)) return
-      onClose()
-    }
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') onClose()
-    }
-    window.addEventListener('mousedown', onMouseDown)
-    window.addEventListener('keydown', onKey)
-    return () => {
-      window.removeEventListener('mousedown', onMouseDown)
-      window.removeEventListener('keydown', onKey)
-    }
-  }, [onClose])
 
   const handleRename = useCallback(() => {
     onClose()
@@ -1214,73 +1204,43 @@ function TreeContextMenu({
       ? 'Edit sketch'
       : 'Rename'
 
-  // Render via portal so the menu escapes the model-tree panel's
-  // containing block and clip region. The browser panel uses
-  // `backdrop-blur-sm` (which creates a containing block for fixed
-  // descendants) AND `overflow-hidden` — together they cause a
-  // `position: fixed` menu rendered inline to be positioned relative
-  // to the panel and clipped to its 224px width, making it invisible
-  // for any click that lands more than ~180px from the panel's
-  // top-left. Portaling to `document.body` sidesteps both effects.
-  return createPortal(
-    <div
-      ref={ref}
-      className="fixed z-[1000] cad-panel min-w-[180px] py-1 text-[12px] shadow-lg select-none"
-      style={{ left: pos.x, top: pos.y, visibility: pos.ready ? 'visible' : 'hidden' }}
-      role="menu"
-    >
-      <div className="px-3 py-1 text-[10px] uppercase tracking-wider text-muted-foreground/70 truncate">
-        {menu.node.name}
-      </div>
-      <div className="my-1 border-t border-border/50" />
-      <TreeMenuItem onClick={handleEdit} disabled={!editEnabled}>
+  // The shared primitive portals to `document.body`, which this menu
+  // needs specifically: the browser panel uses `backdrop-blur-sm`
+  // (a containing block for fixed descendants) AND `overflow-hidden`,
+  // so a `position: fixed` menu rendered inline would be clipped to
+  // the panel's width and invisible for most clicks.
+  return (
+    <ContextMenu x={menu.x} y={menu.y} onClose={onClose} aria-label="Tree node actions">
+      <ContextMenuHeader>{menu.node.name}</ContextMenuHeader>
+      <ContextMenuSeparator />
+      <ContextMenuItem
+        onClick={() => void handleEdit()}
+        disabled={!editEnabled}
+        title={!editEnabled && isDefaultDatum ? 'Default datums cannot be renamed' : undefined}
+      >
         <Pencil size={13} />
         {editLabel}
-      </TreeMenuItem>
-      <TreeMenuItem onClick={handleToggleVisibility} disabled={!visibilityEnabled}>
+      </ContextMenuItem>
+      <ContextMenuItem onClick={handleToggleVisibility} disabled={!visibilityEnabled}>
         {isVisible ? <EyeOff size={13} /> : <Eye size={13} />}
         {isVisible ? 'Hide' : 'Show'}
-      </TreeMenuItem>
+      </ContextMenuItem>
       {visibilityEnabled && (
-        <TreeMenuItem onClick={handleCreateDrawing}>
+        <ContextMenuItem onClick={() => void handleCreateDrawing()}>
           <FileText size={13} />
           Create Drawing
-        </TreeMenuItem>
+        </ContextMenuItem>
       )}
-      <div className="my-1 border-t border-border/50" />
-      <TreeMenuItem onClick={handleDelete} danger disabled={!deleteEnabled}>
+      <ContextMenuSeparator />
+      <ContextMenuItem
+        onClick={() => void handleDelete()}
+        danger
+        disabled={!deleteEnabled}
+        title={!deleteEnabled && isDefaultDatum ? 'Default datums cannot be deleted' : undefined}
+      >
         <Trash2 size={13} />
         Delete
-      </TreeMenuItem>
-    </div>,
-    document.body,
-  )
-}
-
-interface TreeMenuItemProps {
-  children: React.ReactNode
-  onClick: () => void
-  danger?: boolean
-  disabled?: boolean
-}
-
-function TreeMenuItem({ children, onClick, danger, disabled }: TreeMenuItemProps) {
-  return (
-    <button
-      type="button"
-      role="menuitem"
-      onClick={onClick}
-      disabled={disabled}
-      className={cn(
-        'w-full flex items-center gap-2 px-3 py-1.5 text-left transition-colors',
-        disabled
-          ? 'text-muted-foreground/40 cursor-not-allowed'
-          : danger
-            ? 'text-destructive hover:bg-accent/40'
-            : 'text-foreground hover:bg-accent/40',
-      )}
-    >
-      {children}
-    </button>
+      </ContextMenuItem>
+    </ContextMenu>
   )
 }

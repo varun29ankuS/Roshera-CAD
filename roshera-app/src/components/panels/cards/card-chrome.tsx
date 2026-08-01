@@ -1,5 +1,5 @@
 import type { ComponentType, ReactNode } from 'react'
-import { Check, Minus, X } from 'lucide-react'
+import { Check, CircleSlash, X } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { ChalkReveal } from './ChalkReveal'
 
@@ -113,25 +113,120 @@ export function KV({ label, children }: { label: string; children: ReactNode }) 
 }
 
 /**
- * Tri-state invariant chip: proven true / proven false / NOT RUN. The third
- * state is rendered distinctly on purpose — a check that did not run is not
- * a check that passed.
+ * A single certified claim, one per line: a status glyph — green tick /
+ * red cross / amber "not checked" — followed by the claim text and an
+ * optional dim secondary detail (a derivation, a witness, a refinement
+ * trail). This is the shape Varun asked for twice: bullet points, each with
+ * its own glyph, not a paragraph the verdict is buried inside.
+ *
+ * `status` is tri-state on purpose: `null` is NEITHER a pass nor a fail —
+ * it means the kernel could not (or did not) check this claim, which is
+ * exactly the "inconclusive/unverifiable" case the DFM policy already
+ * forbids reporting as a pass. Collapsing it into green or red would be the
+ * dishonesty this product exists to prevent, so it gets its own glyph and
+ * its own colour (amber), never reused from pass or fail.
  */
-export function TriState({ label, value }: { label: string; value: boolean | null | undefined }) {
-  const v = value ?? null
+export function Claim({
+  status,
+  children,
+  detail,
+  title,
+}: {
+  status: boolean | null
+  children: ReactNode
+  detail?: ReactNode
+  title?: string
+}) {
   return (
-    <span
-      title={v === null ? `${label}: not run — not-run is not a pass` : `${label}: ${v ? 'proven' : 'FAILED'}`}
+    <div
+      title={title}
       className={cn(
-        'inline-flex items-center gap-1 rounded border px-1.5 py-0.5 text-[10px]',
-        v === true && 'border-emerald-500/30 text-emerald-400',
-        v === false && 'border-red-500/40 text-red-400',
-        v === null && 'border-border text-muted-foreground/70 border-dashed',
+        'flex items-baseline gap-1.5 text-[11px] leading-snug',
+        status === true && 'text-foreground/90',
+        status === false && 'text-foreground/90',
+        status === null && 'text-foreground/70',
       )}
     >
-      {v === true ? <Check size={9} /> : v === false ? <X size={9} /> : <Minus size={9} />}
-      {label}
-      {v === null && <span className="opacity-70">not run</span>}
+      <span
+        className={cn(
+          'inline-flex shrink-0 translate-y-px',
+          status === true && 'text-emerald-600 dark:text-emerald-400',
+          status === false && 'text-red-600 dark:text-red-400',
+          status === null && 'text-amber-600 dark:text-amber-400',
+        )}
+      >
+        {status === true ? <Check size={11} /> : status === false ? <X size={11} /> : <CircleSlash size={11} />}
+      </span>
+      <span>
+        {children}
+        {detail !== undefined && (
+          <span className="ml-1.5 text-[10px] text-muted-foreground/80">{detail}</span>
+        )}
+      </span>
+    </div>
+  )
+}
+
+/**
+ * Compact tri-state BADGE — the row counterpart to `Claim`, for a set of
+ * invariants that are each a single word or two ("watertight", "manifold")
+ * rather than a sentence. A wrapped row of these reads as one glance: a
+ * sound part is a row of green, and a single failure cannot hide the way it
+ * could inside nine stacked lines that all say "fine" (Varun, 2026-08-01 —
+ * `Claim`'s vertical list was correct to kill the run-on prose it replaced,
+ * but a row of badges is what a certificate with mostly-passing invariants
+ * should look like).
+ *
+ * Same tri-state contract as `Claim`: `status === null` is "not run", kept
+ * visually distinct (dashed amber) from both pass and fail — a check that
+ * did not run is not a check that passed.
+ *
+ * `glyph` is an OPTIONAL, genuinely-recognisable pictograph for the concept
+ * itself (a droplet for "watertight", an eye for the dual-eye consistency
+ * check) — supplied ONLY where the mark is self-evident without a private
+ * convention. Every other invariant renders its short text label instead: a
+ * cryptic icon nobody can decode is worse than the wall of text it replaced.
+ * Either way the full claim — long label, "proven"/"FAILED"/"not run", and
+ * any extra detail — is on hover via `title`, and via `aria-label` so the
+ * concept is never icon-only for assistive tech.
+ */
+export function ClaimBadge({
+  status,
+  label,
+  detail,
+  glyph: Glyph,
+}: {
+  status: boolean | null
+  /** Short text shown when no `glyph` is supplied — also always the
+   *  accessible name, so an icon-only badge is never unlabelled. */
+  label: string
+  /** Full hover text (the long-form claim, e.g. "watertight: FAILED"). */
+  detail: string
+  glyph?: ComponentType<{ size?: number | string; className?: string }>
+}) {
+  return (
+    <span
+      title={detail}
+      aria-label={detail}
+      className={cn(
+        'inline-flex items-center gap-1 rounded border px-1.5 py-[3px] text-[10px] leading-none',
+        status === true && 'border-emerald-500/30 bg-emerald-500/10 text-emerald-800 dark:text-emerald-300',
+        status === false && 'border-red-500/40 bg-red-500/10 text-red-800 dark:text-red-300',
+        status === null &&
+          'border-dashed border-amber-500/40 bg-amber-500/5 text-amber-800 dark:text-amber-300',
+      )}
+    >
+      <span
+        className={cn(
+          'inline-flex shrink-0',
+          status === true && 'text-emerald-600 dark:text-emerald-400',
+          status === false && 'text-red-600 dark:text-red-400',
+          status === null && 'text-amber-600 dark:text-amber-400',
+        )}
+      >
+        {status === true ? <Check size={10} /> : status === false ? <X size={10} /> : <CircleSlash size={10} />}
+      </span>
+      {Glyph ? <Glyph size={10} /> : <span>{label}</span>}
     </span>
   )
 }

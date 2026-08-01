@@ -642,6 +642,114 @@ impl GroundTruth {
     }
 }
 
+/// **P1 enforcement (verification cadence promoted from steering to
+/// constraint).** The freshness-gated answer to "is this part sound RIGHT
+/// NOW" — honestly scoped to what has actually been verified since the
+/// part's LAST MUTATION, never to what was true before it.
+///
+/// Built on the SAME precise mutation seams that already invalidate the
+/// kernel's certificate memoization
+/// ([`Solid::invalidate_certificate`](crate::primitives::solid::Solid::invalidate_certificate),
+/// fired by the `record_operation` funnel) — but reads a SEPARATE field,
+/// [`Solid::verified_certificate`](crate::primitives::solid::Solid::verified_certificate),
+/// not the memoization cache itself. The memoization cache
+/// (`cached_certificate`) is ALSO dirtied by `SolidStore::get_mut`'s
+/// conservative backstop on any mutable touch — including a benign
+/// cache-warming read like mass-properties — which is harmless for
+/// memoization (a wasted recompute, never a wrong answer) but would be
+/// actively WRONG here: it would flip a just-verified part back to `Stale`
+/// on the next incidental read, not because anything mutated, but because
+/// an unrelated cache warmed. `verified_certificate` is set only when
+/// [`BRepModel::certificate`](crate::primitives::topology_builder::BRepModel::certificate)
+/// genuinely recomputes and cleared only by the precise seams, so it
+/// answers "mutated since the last full verification", not "is the
+/// memoization cache currently warm".
+///
+/// [`BRepModel::soundness_reading`](crate::primitives::topology_builder::BRepModel::soundness_reading)
+/// reads that field WITHOUT recomputing — unlike [`BRepModel::certificate`],
+/// which self-heals a dirty memoization cache by recomputing on the spot.
+/// That self-heal is correct for the kernel's OWN internal callers (they
+/// need a true answer right now to make a decision), but wrong for a
+/// surface reporting soundness TO an agent: a silent recompute would let a
+/// caller who never asked to re-verify get a "fresh" answer anyway, exactly
+/// reproducing the "steering, not constraint" failure (nothing actually
+/// forces the explicit verify step to happen — it just happens for free
+/// behind every read).
+///
+/// `Stale` is a THIRD variant, not a `bool` and not folded into `Unsound` —
+/// structurally distinct so a caller that pattern-matches `Sound`/`Unsound`
+/// cannot silently coerce a `Stale` reading into a pass, and so no
+/// certificate field (fresh or otherwise) is available to read out of it —
+/// there is nothing to fabricate a `sound: true` from.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SoundnessReading {
+    /// A full certificate was computed since this solid's last mutation and
+    /// it is sound.
+    Sound(ValidityCertificate),
+    /// A full certificate was computed since this solid's last mutation and
+    /// it is NOT sound — a real, CURRENT defect (see the certificate).
+    Unsound(ValidityCertificate),
+    /// This solid was mutated (or never certified) since its last full
+    /// verification. No certificate — fresh or cached — backs this reading.
+    /// The remedy is always the same: call `verify_part` (which runs
+    /// [`BRepModel::certify_solid`]) before trusting or exporting this
+    /// geometry.
+    Stale { solid_id: SolidId },
+}
+
+impl SoundnessReading {
+    /// Build a reading from the solid's cache state alone — NEVER computes.
+    /// `pub(crate)` — the sole caller is
+    /// [`BRepModel::soundness_reading`](crate::primitives::topology_builder::BRepModel::soundness_reading),
+    /// the one seam allowed to read the cache without triggering a compute.
+    pub(crate) fn from_cache(cached: Option<ValidityCertificate>, solid_id: SolidId) -> Self {
+        match cached {
+            Some(cert) if cert.is_sound() => SoundnessReading::Sound(cert),
+            Some(cert) => SoundnessReading::Unsound(cert),
+            None => SoundnessReading::Stale { solid_id },
+        }
+    }
+
+    /// `true` only for a FRESH, verified-sound reading. `false` for both
+    /// `Unsound` and `Stale` — a caller that only checks `is_sound()` still
+    /// gets the honest answer for a stale part (never a false pass).
+    pub fn is_sound(&self) -> bool {
+        matches!(self, SoundnessReading::Sound(_))
+    }
+
+    /// `true` when this solid has not been fully verified since its last
+    /// mutation (or never at all).
+    pub fn is_stale(&self) -> bool {
+        matches!(self, SoundnessReading::Stale { .. })
+    }
+
+    /// The backing certificate, when this reading is `Sound`/`Unsound`.
+    /// `None` for `Stale` — there is no certificate to hand back.
+    pub fn certificate(&self) -> Option<&ValidityCertificate> {
+        match self {
+            SoundnessReading::Sound(c) | SoundnessReading::Unsound(c) => Some(c),
+            SoundnessReading::Stale { .. } => None,
+        }
+    }
+
+    /// One-line honest status label for logs/wire payloads: `"sound"`,
+    /// `"unsound"`, or `"stale"`.
+    pub fn status_label(&self) -> &'static str {
+        match self {
+            SoundnessReading::Sound(_) => "sound",
+            SoundnessReading::Unsound(_) => "unsound",
+            SoundnessReading::Stale { .. } => "stale",
+        }
+    }
+
+    /// The always-actionable remedy for a `Stale` reading. Named once here
+    /// so every surface that reports staleness (truth, DFM, evidence pack,
+    /// export refusal) points the agent at the SAME next step.
+    pub const STALE_REMEDY: &'static str =
+        "call verify_part (or POST …/perception with fast:false) to run a full \
+         verification before trusting or exporting this geometry";
+}
+
 #[cfg(test)]
 impl ValidityCertificate {
     /// Construct a fully-sound certificate for use in unit tests. Every field

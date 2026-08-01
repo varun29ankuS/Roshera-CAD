@@ -21,20 +21,85 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::time::Duration;
 
+/// A credential the Claude provider authenticates with.
+///
+/// Two transport-level auth schemes exist on the Anthropic API and they
+/// are NOT interchangeable headers:
+///
+/// - **API key** → `x-api-key: <key>`
+/// - **OAuth access token** (from an `ant auth login` profile or
+///   `ANTHROPIC_AUTH_TOKEN`) → `Authorization: Bearer <token>` **plus**
+///   `anthropic-beta: oauth-2025-04-20`. The beta header requirement is
+///   endpoint-dependent, so it is always sent — a request that happens
+///   to work without it on one endpoint breaks on another.
+///
+/// `Debug` is implemented manually so secret bytes never reach log
+/// streams; only the credential *kind* is rendered.
+#[derive(Clone, PartialEq, Eq)]
+pub enum ClaudeCredential {
+    /// Static Anthropic API key (`sk-ant-…`).
+    ApiKey(String),
+    /// Short-lived OAuth access token (Claude account sign-in).
+    OauthAccessToken(String),
+}
+
+impl ClaudeCredential {
+    /// True when the underlying secret is the empty string — treated
+    /// everywhere as "not configured", never sent over the wire.
+    pub fn is_empty(&self) -> bool {
+        match self {
+            ClaudeCredential::ApiKey(s) | ClaudeCredential::OauthAccessToken(s) => s.is_empty(),
+        }
+    }
+
+    /// Stable name of the credential kind, for status reporting.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            ClaudeCredential::ApiKey(_) => "api_key",
+            ClaudeCredential::OauthAccessToken(_) => "oauth_access_token",
+        }
+    }
+
+    /// Attach this credential's auth headers to a request.
+    pub fn apply(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match self {
+            ClaudeCredential::ApiKey(key) => req.header("x-api-key", key),
+            ClaudeCredential::OauthAccessToken(token) => req
+                .header("authorization", format!("Bearer {token}"))
+                .header("anthropic-beta", "oauth-2025-04-20"),
+        }
+    }
+}
+
+impl std::fmt::Debug for ClaudeCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Secret bytes are withheld; the kind is triage-relevant.
+        write!(
+            f,
+            "{}(<redacted>)",
+            match self {
+                ClaudeCredential::ApiKey(_) => "ApiKey",
+                ClaudeCredential::OauthAccessToken(_) => "OauthAccessToken",
+            }
+        )
+    }
+}
+
 /// Configuration for the Claude provider.
 ///
-/// `Debug` is implemented manually so that the API key is never
+/// `Debug` is implemented manually so that the credential is never
 /// leaked through log streams, error reports, or the
 /// `{:?}` formatter used by debug-assertion failures. We render the
-/// `api_key` field as `Some("<redacted>")` or `None` — preserving
-/// presence information (often needed when triaging "is the provider
-/// configured at all?") while withholding the secret material itself.
+/// `credential` field as `Some(<kind>(<redacted>))` or `None` —
+/// preserving presence information (often needed when triaging "is the
+/// provider configured at all?") while withholding the secret material.
 #[derive(Clone)]
 pub struct ClaudeConfig {
-    /// Anthropic API key. When `None` (or empty) every method returns
-    /// `ProviderError::ProviderUnavailable` — there is no offline fallback.
-    pub api_key: Option<String>,
-    /// Model ID (e.g., "claude-sonnet-5")
+    /// Credential (API key or OAuth token). When `None` (or empty)
+    /// every method returns `ProviderError::ProviderUnavailable` —
+    /// there is no offline fallback.
+    pub credential: Option<ClaudeCredential>,
+    /// Model ID (defaults to [`shared_types::DEFAULT_CLAUDE_MODEL`])
     pub model: String,
     /// Maximum tokens for the response
     pub max_tokens: usize,
@@ -50,12 +115,12 @@ pub struct ClaudeConfig {
 
 impl std::fmt::Debug for ClaudeConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Redact the API key. Presence is preserved (Some / None) so
+        // Redact the credential. Presence (and kind) is preserved so
         // operators can still tell whether the provider is configured;
-        // the secret itself is replaced with a literal sentinel.
-        let api_key_redacted: Option<&str> = self.api_key.as_deref().map(|_| "<redacted>");
+        // the secret itself never reaches the formatter output
+        // (ClaudeCredential's own Debug impl redacts).
         f.debug_struct("ClaudeConfig")
-            .field("api_key", &api_key_redacted)
+            .field("credential", &self.credential)
             .field("model", &self.model)
             .field("max_tokens", &self.max_tokens)
             .field("tool_tier", &self.tool_tier)
@@ -68,8 +133,8 @@ impl std::fmt::Debug for ClaudeConfig {
 impl Default for ClaudeConfig {
     fn default() -> Self {
         Self {
-            api_key: None,
-            model: "claude-sonnet-5".to_string(),
+            credential: None,
+            model: shared_types::DEFAULT_CLAUDE_MODEL.to_string(),
             max_tokens: 1024,
             tool_tier: ToolTier::Tier1,
             api_base: "https://api.anthropic.com".to_string(),
@@ -92,10 +157,10 @@ pub struct ClaudeProvider {
 impl ClaudeProvider {
     /// Create a new Claude provider with default config.
     ///
-    /// The default config has no API key set; every method will return
-    /// `ProviderError::ProviderUnavailable` until a key is configured
-    /// via `with_config(...)` or the `ANTHROPIC_API_KEY` env var is
-    /// honored by a wrapper that builds the config.
+    /// The default config has no credential set; every method will
+    /// return `ProviderError::ProviderUnavailable` until a credential
+    /// is configured via `with_config(...)` or the `ANTHROPIC_API_KEY`
+    /// env var is honored by a wrapper that builds the config.
     pub fn new() -> Self {
         Self::with_config(ClaudeConfig::default())
     }
@@ -119,6 +184,123 @@ impl ClaudeProvider {
         &self.config
     }
 
+    /// The configured credential, or a typed refusal when absent/empty.
+    /// Every network entry point funnels through this — there is no
+    /// keyword-parser or mock fallback in production.
+    fn require_credential(&self) -> Result<&ClaudeCredential, ProviderError> {
+        match &self.config.credential {
+            Some(cred) if !cred.is_empty() => Ok(cred),
+            _ => Err(ProviderError::ProviderUnavailable(
+                "Claude provider has no credential configured (Anthropic API \
+                 key or OAuth access token); refusing to fabricate a response"
+                    .to_string(),
+            )),
+        }
+    }
+
+    /// Prove the configured credential is accepted by the live Anthropic
+    /// API — a real round-trip, zero tokens spent.
+    ///
+    /// `GET /v1/models?limit=1` requires valid authentication but bills
+    /// nothing, which makes it the honest "test this key before saving
+    /// it" probe: a bad key fails HERE, at configuration time, instead
+    /// of mid-conversation.
+    ///
+    /// # Errors
+    /// - `ProviderUnavailable` — no credential configured, or the API
+    ///   rejected it (401/403). The message carries the upstream status.
+    /// - `InferenceError` — transport failure or unexpected status.
+    pub async fn validate_credential(&self) -> Result<(), ProviderError> {
+        let cred = self.require_credential()?;
+        let response = cred
+            .apply(
+                self.client
+                    .get(format!("{}/v1/models?limit=1", self.config.api_base)),
+            )
+            .header("anthropic-version", "2023-06-01")
+            .send()
+            .await
+            .map_err(|e| {
+                ProviderError::InferenceError(format!("credential validation request failed: {e}"))
+            })?;
+
+        let status = response.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        let body = response.text().await.unwrap_or_default();
+        if status.as_u16() == 401 || status.as_u16() == 403 {
+            Err(ProviderError::ProviderUnavailable(format!(
+                "Anthropic rejected the {} ({}): {}",
+                cred.kind(),
+                status,
+                body
+            )))
+        } else {
+            Err(ProviderError::InferenceError(format!(
+                "credential validation returned unexpected status {}: {}",
+                status, body
+            )))
+        }
+    }
+
+    /// Prove a requested model ID is one the configured credential can
+    /// actually serve, via Anthropic's Models API (`GET /v1/models/{id}`)
+    /// — the authoritative source: an API key and a Max/Pro OAuth token do
+    /// not necessarily serve the same catalog, so this asks the live
+    /// provider rather than checking a hardcoded list. Zero tokens spent.
+    ///
+    /// `"default"` is never passed here — callers treat it as "the
+    /// provider's own choice" and skip this round-trip entirely (see
+    /// `handlers/ai_provider.rs::resolve_requested_model`).
+    ///
+    /// # Errors
+    /// - `ProviderUnavailable` — no credential configured, or the model ID
+    ///   was rejected (404, or 401/403 on the credential itself). The
+    ///   message names the model and the status so the refusal is
+    ///   specific, not a generic failure.
+    /// - `InferenceError` — transport failure or an unexpected status this
+    ///   provider does not have a specific interpretation for.
+    pub async fn validate_model(&self, model: &str) -> Result<(), ProviderError> {
+        let cred = self.require_credential()?;
+        let response = cred
+            .apply(
+                self.client
+                    .get(format!("{}/v1/models/{}", self.config.api_base, model)),
+            )
+            .header("anthropic-version", "2023-06-01")
+            .send()
+            .await
+            .map_err(|e| {
+                ProviderError::InferenceError(format!("model validation request failed: {e}"))
+            })?;
+
+        let status = response.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        let body = response.text().await.unwrap_or_default();
+        if status.as_u16() == 404 {
+            Err(ProviderError::ProviderUnavailable(format!(
+                "Anthropic does not recognize model '{model}' ({status}) for this \
+                 credential: {body}"
+            )))
+        } else if status.as_u16() == 401 || status.as_u16() == 403 {
+            Err(ProviderError::ProviderUnavailable(format!(
+                "Anthropic rejected the {} while validating model '{}' ({}): {}",
+                cred.kind(),
+                model,
+                status,
+                body
+            )))
+        } else {
+            Err(ProviderError::InferenceError(format!(
+                "model validation for '{}' returned unexpected status {}: {}",
+                model, status, body
+            )))
+        }
+    }
+
     /// Send a text prompt alongside a PNG image to Claude and return the plain-text reply.
     ///
     /// Uses the Anthropic multimodal messages API: the PNG is base64-encoded and
@@ -138,16 +320,7 @@ impl ClaudeProvider {
         prompt: &str,
         png_bytes: &[u8],
     ) -> Result<String, ProviderError> {
-        let key = match &self.config.api_key {
-            Some(k) if !k.is_empty() => k,
-            _ => {
-                return Err(ProviderError::ProviderUnavailable(
-                    "Claude provider has no ANTHROPIC_API_KEY configured; \
-                     refusing to send a multimodal request without a key"
-                        .to_string(),
-                ));
-            }
-        };
+        let cred = self.require_credential()?;
 
         let request_body = build_image_message_body(
             &self.config.model,
@@ -156,10 +329,11 @@ impl ClaudeProvider {
             png_bytes,
         );
 
-        let response = self
-            .client
-            .post(format!("{}/v1/messages", self.config.api_base))
-            .header("x-api-key", key)
+        let response = cred
+            .apply(
+                self.client
+                    .post(format!("{}/v1/messages", self.config.api_base)),
+            )
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")
             .json(&request_body)
@@ -190,7 +364,7 @@ impl ClaudeProvider {
         &self,
         input: &str,
         context: Option<&super::ConversationContext>,
-        api_key: &str,
+        credential: &ClaudeCredential,
     ) -> Result<ParsedCommand, ProviderError> {
         let tools = tool_dispatch::tool_definitions_for_tier(self.config.tool_tier);
 
@@ -223,10 +397,11 @@ impl ClaudeProvider {
             "messages": messages
         });
 
-        let response = self
-            .client
-            .post(format!("{}/v1/messages", self.config.api_base))
-            .header("x-api-key", api_key)
+        let response = credential
+            .apply(
+                self.client
+                    .post(format!("{}/v1/messages", self.config.api_base)),
+            )
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")
             .json(&request_body)
@@ -259,14 +434,8 @@ impl LLMProvider for ClaudeProvider {
         input: &str,
         context: Option<&super::ConversationContext>,
     ) -> Result<ParsedCommand, ProviderError> {
-        match &self.config.api_key {
-            Some(key) if !key.is_empty() => self.process_via_api(input, context, key).await,
-            _ => Err(ProviderError::ProviderUnavailable(
-                "Claude provider has no ANTHROPIC_API_KEY configured; \
-                 refusing to fall back to keyword parsing"
-                    .to_string(),
-            )),
-        }
+        let cred = self.require_credential()?.clone();
+        self.process_via_api(input, context, &cred).await
     }
 
     fn capabilities(&self) -> ProviderCapabilities {
@@ -284,21 +453,13 @@ impl LLMProvider for ClaudeProvider {
     }
 
     async fn generate(&self, prompt: &str, _max_tokens: usize) -> Result<String, ProviderError> {
-        let key = match &self.config.api_key {
-            Some(k) if !k.is_empty() => k,
-            _ => {
-                return Err(ProviderError::ProviderUnavailable(
-                    "Claude provider has no ANTHROPIC_API_KEY configured; \
-                     refusing to return a synthetic response"
-                        .to_string(),
-                ));
-            }
-        };
+        let cred = self.require_credential()?;
 
-        let response = self
-            .client
-            .post(format!("{}/v1/messages", self.config.api_base))
-            .header("x-api-key", key)
+        let response = cred
+            .apply(
+                self.client
+                    .post(format!("{}/v1/messages", self.config.api_base)),
+            )
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")
             .json(&serde_json::json!({
@@ -336,16 +497,7 @@ impl LLMProvider for ClaudeProvider {
         prompt: &str,
         max_tokens: usize,
     ) -> Result<LLMTokenStream, ProviderError> {
-        let key = match &self.config.api_key {
-            Some(k) if !k.is_empty() => k.clone(),
-            _ => {
-                return Err(ProviderError::ProviderUnavailable(
-                    "Claude provider has no ANTHROPIC_API_KEY configured; \
-                     refusing to stream a synthetic response"
-                        .to_string(),
-                ));
-            }
-        };
+        let cred = self.require_credential()?.clone();
 
         let effective_max = if max_tokens == 0 {
             self.config.max_tokens
@@ -360,10 +512,11 @@ impl LLMProvider for ClaudeProvider {
             "messages": [{"role": "user", "content": prompt}],
         });
 
-        let response = self
-            .client
-            .post(format!("{}/v1/messages", self.config.api_base))
-            .header("x-api-key", key)
+        let response = cred
+            .apply(
+                self.client
+                    .post(format!("{}/v1/messages", self.config.api_base)),
+            )
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")
             .header("accept", "text/event-stream")
@@ -852,41 +1005,83 @@ mod tests {
     }
 
     /// AUDIT-M1 contract: the secret material must not appear in the
-    /// `Debug` output of `ClaudeConfig`. A regression would expose
-    /// every API key on the first `tracing::error!(?config, …)` line
-    /// the operator types.
+    /// `Debug` output of `ClaudeConfig` — for either credential kind.
+    /// A regression would expose every API key / OAuth token on the
+    /// first `tracing::error!(?config, …)` line the operator types.
     #[test]
-    fn debug_redacts_api_key_when_present() {
-        let cfg = ClaudeConfig {
-            api_key: Some("sk-ant-real-secret-do-not-leak".to_string()),
-            ..ClaudeConfig::default()
-        };
-        let rendered = format!("{:?}", cfg);
-        assert!(
-            !rendered.contains("sk-ant-real-secret-do-not-leak"),
-            "Debug output must not contain the raw API key; got: {rendered}"
-        );
-        assert!(
-            rendered.contains("<redacted>"),
-            "Debug output must mark the field as redacted; got: {rendered}"
-        );
+    fn debug_redacts_credential_when_present() {
+        for cred in [
+            ClaudeCredential::ApiKey("sk-ant-real-secret-do-not-leak".to_string()),
+            ClaudeCredential::OauthAccessToken("oauth-real-secret-do-not-leak".to_string()),
+        ] {
+            let cfg = ClaudeConfig {
+                credential: Some(cred),
+                ..ClaudeConfig::default()
+            };
+            let rendered = format!("{:?}", cfg);
+            assert!(
+                !rendered.contains("real-secret-do-not-leak"),
+                "Debug output must not contain the raw secret; got: {rendered}"
+            );
+            assert!(
+                rendered.contains("<redacted>"),
+                "Debug output must mark the credential as redacted; got: {rendered}"
+            );
+        }
     }
 
-    /// AUDIT-M1: when no key is configured, `Debug` must preserve
-    /// `None` so operators can still see "provider not configured" in
-    /// triage. (Presence/absence is not secret; the key bytes are.)
+    /// AUDIT-M1: when no credential is configured, `Debug` must
+    /// preserve `None` so operators can still see "provider not
+    /// configured" in triage. (Presence is not secret; the bytes are.)
     #[test]
-    fn debug_preserves_none_when_api_key_absent() {
+    fn debug_preserves_none_when_credential_absent() {
         let cfg = ClaudeConfig::default();
         let rendered = format!("{:?}", cfg);
         assert!(
-            rendered.contains("api_key: None"),
+            rendered.contains("credential: None"),
             "Debug output must surface absence as None; got: {rendered}"
         );
         assert!(
             !rendered.contains("<redacted>"),
-            "Absent key must not be labelled redacted; got: {rendered}"
+            "Absent credential must not be labelled redacted; got: {rendered}"
         );
+    }
+
+    /// The two credential kinds must emit their scheme-correct headers:
+    /// an OAuth token on `x-api-key` (or a key on `Authorization`)
+    /// would 401 at the vendor with a misleading message.
+    #[tokio::test]
+    async fn credential_apply_sets_scheme_correct_headers() {
+        let client = reqwest::Client::new();
+
+        let req = ClaudeCredential::ApiKey("k123".to_string())
+            .apply(client.get("http://localhost/never-sent"))
+            .build()
+            .expect("request builds");
+        assert_eq!(
+            req.headers().get("x-api-key").and_then(|v| v.to_str().ok()),
+            Some("k123")
+        );
+        assert!(req.headers().get("authorization").is_none());
+
+        let req = ClaudeCredential::OauthAccessToken("t456".to_string())
+            .apply(client.get("http://localhost/never-sent"))
+            .build()
+            .expect("request builds");
+        assert_eq!(
+            req.headers()
+                .get("authorization")
+                .and_then(|v| v.to_str().ok()),
+            Some("Bearer t456")
+        );
+        assert_eq!(
+            req.headers()
+                .get("anthropic-beta")
+                .and_then(|v| v.to_str().ok()),
+            Some("oauth-2025-04-20"),
+            "OAuth over raw HTTP requires the oauth beta header"
+        );
+        assert!(req.headers().get("x-api-key").is_none());
     }
 
     // --- generate_with_image TDD ---
@@ -957,7 +1152,7 @@ mod tests {
             model, "claude-3-5-sonnet-20241022",
             "default model must not be the retired ID"
         );
-        assert_eq!(model, "claude-sonnet-5");
+        assert_eq!(model, shared_types::DEFAULT_CLAUDE_MODEL);
     }
 
     /// P4: `generate()` must surface a non-success HTTP status as a typed
@@ -995,7 +1190,7 @@ mod tests {
         });
 
         let config = ClaudeConfig {
-            api_key: Some("test-key".to_string()),
+            credential: Some(ClaudeCredential::ApiKey("test-key".to_string())),
             api_base: format!("http://{}", addr),
             ..ClaudeConfig::default()
         };
@@ -1016,6 +1211,246 @@ mod tests {
                 other
             ),
         }
+    }
+
+    // --- validate_credential: the PUT /api/ai/provider test-before-save
+    // primitive. Never exercised before this suite (audit note: "the
+    // latter has NEVER been run"). ---
+
+    /// With no credential configured, `validate_credential` must refuse
+    /// before ever touching the network — matching every other entry
+    /// point's `require_credential` gate.
+    #[tokio::test]
+    async fn validate_credential_returns_unavailable_without_key() {
+        let provider = ClaudeProvider::new();
+        let result = provider.validate_credential().await;
+        assert!(
+            matches!(result, Err(ProviderError::ProviderUnavailable(_))),
+            "expected ProviderUnavailable when no credential is configured, got {:?}",
+            result
+        );
+    }
+
+    /// A 401 from `/v1/models` must surface as `ProviderUnavailable`
+    /// naming the status — the exact signal the AI provider connection
+    /// dialog's PUT handler branches on to refuse saving a bad key.
+    /// Local (127.0.0.1-only) mock server — not a live external call.
+    #[tokio::test]
+    async fn validate_credential_rejects_401_as_provider_unavailable_naming_status() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("binding a local test listener must succeed");
+        let addr = listener.local_addr().expect("local listener has an addr");
+
+        let server = tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = socket.read(&mut buf).await;
+                let body = r#"{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}"#;
+                let response = format!(
+                    "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        let config = ClaudeConfig {
+            credential: Some(ClaudeCredential::ApiKey("bad-key".to_string())),
+            api_base: format!("http://{}", addr),
+            ..ClaudeConfig::default()
+        };
+        let provider = ClaudeProvider::with_config(config);
+
+        let result = provider.validate_credential().await;
+        let _ = server.await;
+
+        match result {
+            Err(ProviderError::ProviderUnavailable(msg)) => {
+                assert!(
+                    msg.contains("401"),
+                    "expected the rejection to name the 401 status, got: {msg}"
+                );
+            }
+            other => panic!(
+                "expected ProviderUnavailable naming the 401 status, got: {:?}",
+                other
+            ),
+        }
+    }
+
+    /// A 200 from `/v1/models` must validate as `Ok(())` — the "credential
+    /// accepted" path the PUT handler saves the config on.
+    #[tokio::test]
+    async fn validate_credential_succeeds_on_200() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("binding a local test listener must succeed");
+        let addr = listener.local_addr().expect("local listener has an addr");
+
+        let server = tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = socket.read(&mut buf).await;
+                let body = r#"{"data":[]}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        let config = ClaudeConfig {
+            credential: Some(ClaudeCredential::ApiKey("good-key".to_string())),
+            api_base: format!("http://{}", addr),
+            ..ClaudeConfig::default()
+        };
+        let provider = ClaudeProvider::with_config(config);
+
+        let result = provider.validate_credential().await;
+        let _ = server.await;
+
+        assert!(
+            result.is_ok(),
+            "expected Ok(()) on a 200 response, got: {:?}",
+            result
+        );
+    }
+
+    // --- validate_model: the PUT /api/ai/provider model-honesty gate ---
+
+    /// A 200 from `/v1/models/{id}` must validate as `Ok(())` — the model
+    /// the caller asked for is one the credential can actually serve.
+    #[tokio::test]
+    async fn validate_model_succeeds_on_200() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("binding a local test listener must succeed");
+        let addr = listener.local_addr().expect("local listener has an addr");
+
+        let server = tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = socket.read(&mut buf).await;
+                let body = format!(
+                    r#"{{"id":"{}","type":"model"}}"#,
+                    shared_types::DEFAULT_CLAUDE_MODEL
+                );
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        let config = ClaudeConfig {
+            credential: Some(ClaudeCredential::ApiKey("good-key".to_string())),
+            api_base: format!("http://{}", addr),
+            ..ClaudeConfig::default()
+        };
+        let provider = ClaudeProvider::with_config(config);
+
+        let result = provider
+            .validate_model(shared_types::DEFAULT_CLAUDE_MODEL)
+            .await;
+        let _ = server.await;
+
+        assert!(
+            result.is_ok(),
+            "expected Ok(()) on a 200 response, got: {:?}",
+            result
+        );
+    }
+
+    /// A 404 from `/v1/models/{id}` must surface as `ProviderUnavailable`
+    /// naming the rejected model — the exact signal the PUT handler
+    /// refuses a save on, and the exact wording the honesty requirement
+    /// (never show a model as active that the provider did not accept)
+    /// depends on.
+    #[tokio::test]
+    async fn validate_model_rejects_404_naming_the_model() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("binding a local test listener must succeed");
+        let addr = listener.local_addr().expect("local listener has an addr");
+
+        let server = tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = socket.read(&mut buf).await;
+                let body = r#"{"type":"error","error":{"type":"not_found_error","message":"model not found"}}"#;
+                let response = format!(
+                    "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+
+        let config = ClaudeConfig {
+            credential: Some(ClaudeCredential::ApiKey("good-key".to_string())),
+            api_base: format!("http://{}", addr),
+            ..ClaudeConfig::default()
+        };
+        let provider = ClaudeProvider::with_config(config);
+
+        let result = provider.validate_model("bogus-model-9000").await;
+        let _ = server.await;
+
+        match result {
+            Err(ProviderError::ProviderUnavailable(msg)) => {
+                assert!(
+                    msg.contains("bogus-model-9000"),
+                    "refusal must name the rejected model, got: {msg}"
+                );
+                assert!(
+                    msg.contains("404"),
+                    "refusal must name the status, got: {msg}"
+                );
+            }
+            other => panic!(
+                "expected ProviderUnavailable naming the rejected model, got: {:?}",
+                other
+            ),
+        }
+    }
+
+    /// With no credential configured, `validate_model` must refuse before
+    /// ever touching the network — matching every other entry point's
+    /// `require_credential` gate.
+    #[tokio::test]
+    async fn validate_model_returns_unavailable_without_key() {
+        let provider = ClaudeProvider::new();
+        let result = provider
+            .validate_model(shared_types::DEFAULT_CLAUDE_MODEL)
+            .await;
+        assert!(
+            matches!(result, Err(ProviderError::ProviderUnavailable(_))),
+            "expected ProviderUnavailable when no credential is configured, got {:?}",
+            result
+        );
     }
 
     /// P5: `generate()` must not hang forever against a stalled connection —
@@ -1041,7 +1476,7 @@ mod tests {
         });
 
         let config = ClaudeConfig {
-            api_key: Some("test-key".to_string()),
+            credential: Some(ClaudeCredential::ApiKey("test-key".to_string())),
             api_base: format!("http://{}", addr),
             request_timeout_secs: 1,
             ..ClaudeConfig::default()

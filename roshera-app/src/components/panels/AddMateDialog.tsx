@@ -12,9 +12,22 @@
  * On submit, calls `addMate(...)` and notifies the caller via
  * `onCreated(newMateId)`. The parent (`AssemblyWorkspace`) is
  * responsible for refreshing the snapshot.
+ *
+ * Uses the shared `ui/dialog` primitives (focus trap, Escape, overlay)
+ * and the `dialog-form` vocabulary so it matches every other dialog.
  */
 
 import { useEffect, useId, useMemo, useState } from 'react'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from '@/components/ui/dialog'
+import { Button } from '@/components/ui/button'
+import { DialogError, FormField } from './dialog-form'
 import {
   addMate,
   makeMateType,
@@ -82,15 +95,6 @@ export function AddMateDialog({ assemblyId, components, onClose, onCreated }: Pr
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [componentB, refsByComponent])
 
-  // Dismiss on Escape, no matter where focus is inside the modal.
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape' && !busy) onClose()
-    }
-    window.addEventListener('keydown', onKey)
-    return () => window.removeEventListener('keydown', onKey)
-  }, [onClose, busy])
-
   const submit = async () => {
     if (!componentA || !componentB) {
       setError('Both components must be selected.')
@@ -123,46 +127,26 @@ export function AddMateDialog({ assemblyId, components, onClose, onCreated }: Pr
   }
 
   return (
-    // Backdrop: clicking outside the panel cancels (mirrors the dialog
-    // UX in Drawing's Add View flow).
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40"
-      onMouseDown={(e) => {
-        if (e.target === e.currentTarget && !busy) onClose()
+    <Dialog
+      open
+      onOpenChange={(next) => {
+        if (!next && !busy) onClose()
       }}
     >
-      <div
-        className="w-[420px] max-w-[92vw] bg-popover text-popover-foreground border border-border rounded shadow-lg"
-        role="dialog"
-        aria-label="Add mate"
-      >
-        <div className="px-4 py-3 border-b border-border/60 flex items-center justify-between">
-          <h2 className="text-sm font-medium">Add Mate</h2>
-          <button
-            type="button"
-            onClick={onClose}
-            disabled={busy}
-            className="cad-focus text-muted-foreground hover:text-foreground disabled:opacity-50"
-            aria-label="Close"
-          >
-            <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.75">
-              <path d="M4 4l8 8M12 4l-8 8" />
-            </svg>
-          </button>
-        </div>
+      <DialogContent className="sm:max-w-md">
+        <DialogHeader>
+          <DialogTitle>Add mate</DialogTitle>
+          <DialogDescription>
+            Constrain two component references; the solver pins the pose.
+          </DialogDescription>
+        </DialogHeader>
 
-        <div className="px-4 py-3 space-y-3 text-xs">
-          {error && (
-            <div className="px-2 py-1 rounded bg-destructive/10 text-destructive border border-destructive/30">
-              {error}
-            </div>
-          )}
-
-          <FieldRow label="Mate type">
+        <div className="flex flex-col gap-3">
+          <FormField label="Mate type">
             <select
               value={tag}
               onChange={(e) => setTag(e.target.value as MateTypeTag)}
-              className="cad-focus flex-1 px-2 py-1 rounded border border-border bg-background"
+              className="cad-focus h-8 rounded border border-border bg-background px-2 text-xs"
             >
               {MATE_TYPE_TAGS.map((t) => (
                 <option key={t} value={t}>
@@ -170,114 +154,64 @@ export function AddMateDialog({ assemblyId, components, onClose, onCreated }: Pr
                 </option>
               ))}
             </select>
-          </FieldRow>
+          </FormField>
 
           {mateTypeNeedsParameter(tag) && (
-            <FieldRow label={mateTypeLabel(tag)}>
+            <FormField label={mateTypeLabel(tag)}>
               <input
                 type="number"
                 value={parameter}
                 onChange={(e) => setParameter(Number(e.target.value))}
                 step="0.1"
-                className="cad-focus flex-1 px-2 py-1 rounded border border-border bg-background"
+                className="cad-focus cad-readout h-8 rounded border border-border bg-background px-2 text-xs"
               />
-            </FieldRow>
+            </FormField>
           )}
 
-          <div className="border-t border-border/40 pt-2 space-y-2">
-            <div className="text-[10px] uppercase tracking-wider text-muted-foreground">
-              Component A
-            </div>
-            <FieldRow label="Component">
-              <ComponentPicker
-                value={componentA}
-                components={components}
-                onChange={setComponentA}
-              />
-            </FieldRow>
-            <FieldRow label="Reference">
-              <ReferenceInput
-                value={referenceA}
-                slots={refsByComponent.get(componentA) ?? []}
-                onChange={setReferenceA}
-              />
-            </FieldRow>
-          </div>
+          {(['A', 'B'] as const).map((side) => {
+            const componentId = side === 'A' ? componentA : componentB
+            const setComponent = side === 'A' ? setComponentA : setComponentB
+            const reference = side === 'A' ? referenceA : referenceB
+            const setReference = side === 'A' ? setReferenceA : setReferenceB
+            return (
+              <div key={side} className="grid grid-cols-2 gap-2">
+                <FormField label={`Component ${side}`}>
+                  <select
+                    value={componentId}
+                    onChange={(e) => setComponent(e.target.value)}
+                    className="cad-focus h-8 w-full rounded border border-border bg-background px-2 text-xs"
+                  >
+                    {components.map((c) => (
+                      <option key={c.id} value={c.id}>
+                        {c.name}
+                      </option>
+                    ))}
+                  </select>
+                </FormField>
+                <FormField label="Reference">
+                  <ReferenceInput
+                    value={reference}
+                    slots={refsByComponent.get(componentId) ?? []}
+                    onChange={setReference}
+                  />
+                </FormField>
+              </div>
+            )
+          })}
 
-          <div className="border-t border-border/40 pt-2 space-y-2">
-            <div className="text-[10px] uppercase tracking-wider text-muted-foreground">
-              Component B
-            </div>
-            <FieldRow label="Component">
-              <ComponentPicker
-                value={componentB}
-                components={components}
-                onChange={setComponentB}
-              />
-            </FieldRow>
-            <FieldRow label="Reference">
-              <ReferenceInput
-                value={referenceB}
-                slots={refsByComponent.get(componentB) ?? []}
-                onChange={setReferenceB}
-              />
-            </FieldRow>
-          </div>
+          <DialogError>{error}</DialogError>
         </div>
 
-        <div className="px-4 py-3 border-t border-border/60 flex items-center justify-end gap-2">
-          <button
-            type="button"
-            onClick={onClose}
-            disabled={busy}
-            className="cad-focus px-3 py-1 text-xs rounded border border-border hover:bg-accent/40 disabled:opacity-50"
-          >
+        <DialogFooter>
+          <Button variant="outline" onClick={onClose} disabled={busy}>
             Cancel
-          </button>
-          <button
-            type="button"
-            onClick={() => void submit()}
-            disabled={busy}
-            className="cad-focus px-3 py-1 text-xs font-medium rounded bg-primary text-primary-foreground hover:opacity-90 disabled:opacity-50"
-          >
-            {busy ? 'Adding…' : 'Add Mate'}
-          </button>
-        </div>
-      </div>
-    </div>
-  )
-}
-
-function FieldRow({ label, children }: { label: string; children: React.ReactNode }) {
-  return (
-    <label className="flex items-center gap-2">
-      <span className="w-24 text-muted-foreground">{label}</span>
-      {children}
-    </label>
-  )
-}
-
-function ComponentPicker({
-  value,
-  components,
-  onChange,
-}: {
-  value: string
-  components: ComponentSummary[]
-  onChange: (id: string) => void
-}) {
-  return (
-    <select
-      value={value}
-      onChange={(e) => onChange(e.target.value)}
-      className="cad-focus flex-1 px-2 py-1 rounded border border-border bg-background"
-    >
-      {components.map((c) => (
-        <option key={c.id} value={c.id}>
-          {c.name}
-        </option>
-      ))}
-    </select>
+          </Button>
+          <Button onClick={() => void submit()} disabled={busy}>
+            {busy ? 'Adding…' : 'Add mate'}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   )
 }
 
@@ -310,7 +244,7 @@ function ReferenceInput({
         onChange={(e) => onChange(e.target.value)}
         list={slots.length > 0 ? listId : undefined}
         placeholder="slot name"
-        className="cad-focus flex-1 px-2 py-1 rounded border border-border bg-background"
+        className="cad-focus h-8 w-full rounded border border-border bg-background px-2 text-xs"
       />
       {slots.length > 0 && (
         <datalist id={listId}>

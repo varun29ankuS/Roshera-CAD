@@ -49,6 +49,7 @@ import { processBlackboardMessage } from '@/lib/ai-client'
 import { exportSceneAs } from '@/lib/export-api'
 import { measureFaces, MeasureRefusalError } from '@/lib/measure-api'
 import { cn } from '@/lib/utils'
+import { ProviderSettingsButton } from '@/components/settings/ProviderSettingsDialog'
 import {
   ModifyDialog,
   type ModifyMode,
@@ -1047,8 +1048,23 @@ async function sendDirectInterference() {
     }
 
     if (overlapping.length === 0) {
+      // Report the verdict WITH its basis: this is an AABB-only rejection,
+      // and the closest measured surface-to-surface gap quantifies how
+      // much margin backs it. A bare "no interference" would claim more
+      // than the kernel evaluated.
+      const resolved = results.filter(
+        (r): r is { a: string; b: string; overlap: boolean; gap: number; centerDist: number } =>
+          'overlap' in r,
+      )
+      const minGap = resolved.reduce(
+        (min, r) => (Number.isFinite(r.gap) && r.gap < min ? r.gap : min),
+        Number.POSITIVE_INFINITY,
+      )
+      const gapNote = Number.isFinite(minGap)
+        ? ` Closest surface-to-surface gap: ${fmt(minGap)} mm.`
+        : ''
       addLine(
-        `No bounding-box interference across ${pairs.length} pair${pairs.length === 1 ? '' : 's'}.`,
+        `No bounding-box overlap across ${resolved.length}/${pairs.length} pair${pairs.length === 1 ? '' : 's'} (AABB check only — surface intersection not evaluated).${gapNote}`,
         'system',
       )
     } else {
@@ -1510,6 +1526,11 @@ export function ToolBar() {
         {groups.map((group) => (
           <FlyoutGroup key={group.id} group={group} openId={openId} onToggle={handleToggle} />
         ))}
+        {/* The agent surface sits at the foot of the rail, separated: it
+            configures who Roshera talks to rather than acting on geometry. */}
+        <div className="mt-auto pt-2 w-full flex justify-center border-t border-border/60">
+          <ProviderSettingsButton />
+        </div>
       </div>
       <ModifyDialog
         open={modifyMode !== null}

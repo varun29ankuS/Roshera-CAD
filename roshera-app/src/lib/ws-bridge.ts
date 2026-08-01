@@ -544,7 +544,20 @@ export async function refreshSceneFromServer(): Promise<void> {
 async function resyncSceneFromServer(): Promise<void> {
   try {
     const res = await fetch(`${API_BASE}/scene/snapshot`)
-    if (!res.ok) return
+    if (!res.ok) {
+      // Silent here used to mean "the whole scene just stays empty with no
+      // explanation" — this is the full-model hydration path, so a failure
+      // is worse than any single panel's. Report it the same way the catch
+      // below reports a thrown exception.
+      console.error(`[ws-bridge] scene resync failed: HTTP ${res.status} (scene preserved)`)
+      useBlackboardStore
+        .getState()
+        .addLine(
+          `Scene sync failed (HTTP ${res.status}) — the model shown may be stale.`,
+          'system',
+        )
+      return
+    }
     const snap = (await res.json()) as { objects?: ProtocolCADObject[] }
     // Convert FIRST, then clear+swap. If a malformed object throws mid-convert,
     // it throws BEFORE we touch the live scene — so a bad snapshot can never
@@ -564,6 +577,9 @@ async function resyncSceneFromServer(): Promise<void> {
     )
   } catch (err) {
     console.warn('[ws-bridge] scene resync failed (scene preserved):', err)
+    useBlackboardStore
+      .getState()
+      .addLine('Scene sync failed — the model shown may be stale.', 'system')
   }
 }
 

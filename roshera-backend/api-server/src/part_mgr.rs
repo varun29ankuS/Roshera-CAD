@@ -117,6 +117,14 @@ impl PartManager {
         }
     }
 
+    /// Drop every part. Used by `documents::activate` when switching the
+    /// live document — a new/reopened document starts with no per-tab parts
+    /// of its own, exactly like a fresh boot. The recorder stays attached.
+    pub fn clear(&self) {
+        self.parts.clear();
+        self.metadata.clear();
+    }
+
     /// Emit one `RecordedOperation` through the attached recorder.
     /// Mirrors `AssemblyManager::record_event`: failures are logged
     /// at `warn` and never propagate — the underlying mutation has

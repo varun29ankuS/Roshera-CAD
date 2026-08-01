@@ -34,7 +34,7 @@ impl Default for UniversalEndpointConfig {
             provider: VisionProviderType::Anthropic,
             url: "https://api.anthropic.com/v1/messages".to_string(),
             api_key: None,
-            model_name: "claude-sonnet-5".to_string(),
+            model_name: shared_types::DEFAULT_CLAUDE_MODEL.to_string(),
             timeout_secs: 30,
             max_tokens: 1000,
             temperature: 0.7,
@@ -109,6 +109,6 @@ mod tests {
             model, "claude-sonnet-4-20250514",
             "default model_name must not be the deprecated ID"
         );
-        assert_eq!(model, "claude-sonnet-5");
+        assert_eq!(model, shared_types::DEFAULT_CLAUDE_MODEL);
     }
 }

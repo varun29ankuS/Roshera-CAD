@@ -203,7 +203,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     };
 
     let provider = ClaudeProvider::with_config(ClaudeConfig {
-        api_key: Some(api_key),
+        credential: Some(ai_integration::providers::claude::ClaudeCredential::ApiKey(
+            api_key,
+        )),
         max_tokens: 256,
         ..ClaudeConfig::default()
     });

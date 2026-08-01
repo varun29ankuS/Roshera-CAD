@@ -1,11 +1,17 @@
-import { Fragment, useState, useEffect, useLayoutEffect, useCallback, useMemo, useRef } from 'react'
+import { Fragment, Suspense, lazy, useState, useEffect, useLayoutEffect, useCallback, useMemo, useRef } from 'react'
 import { useWSStore } from '@/stores/ws-store'
 import { useSceneStore } from '@/stores/scene-store'
 import { useActionErrorStore } from '@/stores/action-error-store'
+import { useDocumentStore } from '@/stores/document-store'
 import { cn } from '@/lib/utils'
 import { tryReadJson, refusalMessage } from '@/lib/backend-refusal'
 import {
   type EventSummary,
+  type CheckpointSummary,
+  type DurabilityStatus,
+  durabilityNotice,
+  parseDurabilityStatus,
+  checkpointNameRefusal,
   normalizeKind,
   symbolForOperation,
   shortLabel,
@@ -16,6 +22,13 @@ import {
   authorGlyph,
   authorTextClass,
 } from '@/lib/timeline-events'
+import { DecisionRail, DurabilityChip } from './TimelineDecisions'
+
+// Graph ("map") view — a second, toggleable view alongside this strip
+// (see vault Research/2026-07-31-ui-pass-spec.md §3). Lazy-loaded: it
+// pulls in `@xyflow/react`, which has no reason to sit in the initial
+// bundle for the ~everyday case of never opening the map.
+const TimelineGraph = lazy(() => import('./TimelineGraph'))
 
 // NOTE: these helpers + types are NOT re-exported from here. Consumers must
 // import them directly from `@/lib/timeline-events` (the source of truth).
@@ -58,6 +71,28 @@ const MOCK_EVENTS: EventSummary[] = (() => {
       author: 'User { id: 1, name: Varun }' },
   ]
 })()
+
+// Preview-only fixtures for the decision layer — the opt-in `?preview`
+// surface is the one place mock data is allowed, and it exists exactly
+// so the states that are rare at runtime (a populated checkpoint rail,
+// a quarantined boot) can be seen and styled without faking them live.
+const MOCK_CHECKPOINTS: CheckpointSummary[] = [
+  { id: 'mc1', name: 'base plate', description: '60×60×10 plate, centred on origin',
+    event_range: [1, 3], author: 'Claude', tags: ['feature'],
+    timestamp: new Date(Date.now() - 200_000).toISOString() },
+  { id: 'mc2', name: 'bolt circle 8×⌀18', description: 'clearance holes, PCD 45',
+    event_range: [4, 7], author: 'Claude', tags: ['feature'],
+    timestamp: new Date(Date.now() - 60_000).toISOString() },
+]
+
+const MOCK_DURABILITY: DurabilityStatus = {
+  state: 'quarantined',
+  first_break_sequence: 73,
+  first_break_kind: 'chamfer_edges',
+  reason: 'replay of this event does not reproduce the recorded result',
+  events_served: 88,
+  events_total: 173,
+}
 
 // Types + kind/symbol/label/author helpers now live in
 // `@/lib/timeline-events` and are imported + re-exported at the top
@@ -121,193 +156,72 @@ function Connector() {
   )
 }
 
-// ─── Per-part swimlanes (Certified Timeline slice 1) ────────────────
+// ─── Recent-ops strip — the ambient surface, not the odometer ───────
 //
-// One canonical event log, grouped into lanes by the part each event
-// touched (`EventSummary.affected_parts`, backend-computed). Consumed
-// operands are NOT here (they're inputs), so a boolean that merges two
-// solids into a third appears only on the third's lane. Events with no
-// solid output (drawings, parameter moulds) collect in a session lane.
+// Redesigned 2026-07-31 (Varun, after the map view shipped): "speedometer
+// vs map — GPS does not make the speedometer redundant." The strip's job
+// is ambient context (where am I, what just happened), not structure —
+// the map owns structure now (grouped by operation kind, branches as
+// lanes). Showing the full 40+ event log here was the odometer again in
+// a thinner band. This shows only the last few operations, most recent
+// nearest the eye (rightmost, at the strip's leading edge); the by-part /
+// by-time grouping toggle is gone with it — one less control, one less
+// decision, and full history is one click away in the map.
+const RECENT_OPS_COUNT = 5
 
-const SESSION_LANE = '·session'
-
-/** Lane label = the SAME name the browser/model tree shows for that solid.
- *  `liveNames` maps a kernel solid id ("solid:2" lane key) to the live scene
- *  object's `name` (custom names from create/rename included) via
- *  `analyticalGeometry.solidId` — the same resolution PartDimensions uses.
- *  Consumed/historical solids have no live object, so they honestly fall back
- *  to the kernel default `solid_N`. The session bucket → "session". */
-function laneLabel(key: string, liveNames: Map<string, string>): string {
-  const live = liveNames.get(key)
-  if (live) return live
-  const m = key.match(/^solid:(.+)$/)
-  if (m) return `solid_${m[1]}`
-  if (key === SESSION_LANE) return 'session'
-  return key
-}
-
-interface Lane {
-  key: string
-  label: string
-  events: EventSummary[]
-}
-
-/** Bucket events into per-part lanes in first-appearance order; the
- *  session lane (non-geometry events) always sorts last. An event that
- *  affects multiple parts appears on each of their lanes. */
-function groupIntoLanes(
-  events: EventSummary[],
-  liveNames: Map<string, string>,
-): Lane[] {
-  const order: string[] = []
-  const buckets = new Map<string, EventSummary[]>()
-  for (const ev of events) {
-    const keys = ev.affected_parts && ev.affected_parts.length > 0
-      ? ev.affected_parts
-      : [SESSION_LANE]
-    for (const k of keys) {
-      const bucket = buckets.get(k)
-      if (bucket) {
-        bucket.push(ev)
-      } else {
-        buckets.set(k, [ev])
-        order.push(k)
-      }
-    }
-  }
-  return order
-    .sort((a, b) => (a === SESSION_LANE ? 1 : b === SESSION_LANE ? -1 : 0))
-    .map((k) => ({
-      key: k,
-      label: laneLabel(k, liveNames),
-      events: buckets.get(k) ?? [],
-    }))
-}
-
-function LaneTrack({
+function RecentOpsStrip({
   events,
-  latestId,
   now,
   onContextMenu,
+  loading,
+  durability,
 }: {
   events: EventSummary[]
-  latestId: string | undefined
   now: number
   onContextMenu: (e: React.MouseEvent, event: EventSummary) => void
+  loading: boolean
+  durability: DurabilityStatus | null
 }) {
+  if (events.length === 0) {
+    // An empty strip must say the TRUE thing, and "no operations yet"
+    // is only true when the log really is empty. A failed boot read or
+    // disabled persistence are different facts with different stakes.
+    const line = loading
+      ? '⋯ loading'
+      : durability?.state === 'failed'
+        ? '∅ event log unreadable at boot — serving a blank model, not an empty document'
+        : durability?.state === 'disabled'
+          ? '∅ persistence off — operations recorded now will not survive a restart'
+          : '∅ no operations yet'
+    return (
+      <div className="text-[12px] text-muted-foreground/60 px-3 py-2">
+        {line}
+      </div>
+    )
+  }
+  const recent = events.slice(-RECENT_OPS_COUNT)
+  const hiddenCount = events.length - recent.length
   return (
-    <div className="flex-1 min-w-0 overflow-x-auto overflow-y-hidden flex items-start gap-0 whitespace-nowrap px-2 py-1">
-      {events.map((event, i) => (
+    <div className="flex items-center gap-0 px-3 py-1.5 overflow-x-auto whitespace-nowrap">
+      {hiddenCount > 0 && (
+        <span
+          className="text-[10px] text-muted-foreground/50 mr-1.5 shrink-0"
+          title={`${hiddenCount} earlier operation${hiddenCount === 1 ? '' : 's'} — see the map for full history`}
+        >
+          ⋯{hiddenCount}
+        </span>
+      )}
+      {recent.map((event, i) => (
         <Fragment key={event.id}>
           {i > 0 && <Connector />}
           <EventNode
             event={event}
-            isLatest={event.id === latestId}
+            isLatest={i === recent.length - 1}
             now={now}
             onContextMenu={onContextMenu}
           />
         </Fragment>
       ))}
-      <span className="text-muted-foreground/40 self-start pt-[1px] ml-1 text-base leading-none">
-        →
-      </span>
-    </div>
-  )
-}
-
-/** Vertical stack of per-part lanes — the by-part view. The globally
- *  latest event pulses on whichever lane it sits in. */
-function Swimlanes({
-  events,
-  liveNames,
-  now,
-  onContextMenu,
-  loading,
-}: {
-  events: EventSummary[]
-  liveNames: Map<string, string>
-  now: number
-  onContextMenu: (e: React.MouseEvent, event: EventSummary) => void
-  loading: boolean
-}) {
-  if (events.length === 0) {
-    return (
-      <div className="text-[12px] text-muted-foreground/60 px-3 py-3">
-        {loading ? '⋯ loading' : '∅ no operations yet'}
-      </div>
-    )
-  }
-  const lanes = groupIntoLanes(events, liveNames)
-  const latestId = events[events.length - 1]?.id
-  // Cap the dock at ~2.5 lanes and scroll the rest, so the panel never
-  // grows tall enough to crowd the 3D viewport no matter how many parts
-  // exist. A subtle scrollbar signals there's more below.
-  return (
-    <div className="max-h-[124px] overflow-y-auto">
-      {lanes.map((lane) => (
-        <div
-          key={lane.key}
-          className="flex items-stretch border-b border-border/40 last:border-b-0 min-h-[46px]"
-        >
-          <div className="w-[92px] shrink-0 flex flex-col justify-center gap-0 px-2.5 border-r border-border/40">
-            <span className="text-[11px] text-foreground/90 truncate leading-tight">
-              {lane.label}
-            </span>
-            <span className="text-[9px] text-muted-foreground/60 leading-tight">
-              {lane.events.length} op{lane.events.length === 1 ? '' : 's'}
-            </span>
-          </div>
-          <LaneTrack
-            events={lane.events}
-            latestId={latestId}
-            now={now}
-            onContextMenu={onContextMenu}
-          />
-        </div>
-      ))}
-    </div>
-  )
-}
-
-/** Flat, time-ordered strip across all parts — the by-time view (the
- *  original layout). Nodes tint their short label by affected part so the
- *  interleave stays legible. */
-function FlatStrip({
-  events,
-  now,
-  onContextMenu,
-  loading,
-}: {
-  events: EventSummary[]
-  now: number
-  onContextMenu: (e: React.MouseEvent, event: EventSummary) => void
-  loading: boolean
-}) {
-  if (events.length === 0) {
-    return (
-      <div className="text-[12px] text-muted-foreground/60 px-3 py-3">
-        {loading ? '⋯ loading' : '∅ no operations yet'}
-      </div>
-    )
-  }
-  return (
-    <div className="overflow-x-auto overflow-y-hidden px-3 py-2">
-      <div className="flex items-start gap-0 whitespace-nowrap">
-        {events.map((event, i) => (
-          <Fragment key={event.id}>
-            {i > 0 && <Connector />}
-            <EventNode
-              event={event}
-              isLatest={i === events.length - 1}
-              now={now}
-              onContextMenu={onContextMenu}
-            />
-          </Fragment>
-        ))}
-        <span className="text-muted-foreground/40 self-start pt-[1px] ml-1 text-base leading-none">
-          →
-        </span>
-      </div>
     </div>
   )
 }
@@ -909,6 +823,20 @@ export function Timeline() {
   const previewMode = isPreviewMode()
   const [events, setEvents] = useState<EventSummary[]>(previewMode ? MOCK_EVENTS : [])
   const [branches, setBranches] = useState<BranchView[]>(previewMode ? MOCK_BRANCHES : [])
+  // Named design states — the decision layer. Usually EMPTY at runtime
+  // (checkpoints are volatile; they do not survive a restart), and that
+  // emptiness renders as an explicit "no declared intents" line, never
+  // a skeleton. Preview mode seeds both so the rare states (populated
+  // rail, quarantined boot) are stylable without faking them live.
+  const [checkpoints, setCheckpoints] = useState<CheckpointSummary[]>(
+    previewMode ? MOCK_CHECKPOINTS : [],
+  )
+  // Durability boot outcome. `quarantined` = the kernel is withholding a
+  // tail it cannot faithfully replay — surfaced as an amber chip in the
+  // controls row (see DurabilityChip); calm states produce no chip.
+  const [durability, setDurability] = useState<DurabilityStatus | null>(
+    previewMode ? MOCK_DURABILITY : null,
+  )
   // Active branch = the one whose events are shown in the strip AND
   // the one the kernel records new operations against. The minimap
   // calls `selectBranch(id)` when the user clicks a node; we POST
@@ -923,29 +851,12 @@ export function Timeline() {
   // visually and adds little when you're focused on a single branch,
   // so it stays out of the way until you ask for it.
   const [overviewExpanded, setOverviewExpanded] = useState(false)
-  // Grouping mode for the strip. `part` = per-part swimlanes (default),
-  // `time` = the flat chronological strip. Remembered across sessions so
-  // the panel opens the way it was left.
-  const [viewMode, setViewMode] = useState<'part' | 'time'>(() => {
-    // try/catch matches the guarded writes below: localStorage ACCESS can
-    // throw at runtime (private-mode Safari, storage-partitioned iframes,
-    // policy-disabled Web Storage), not just be absent under SSR.
-    try {
-      return window.localStorage.getItem('roshera.timeline.view') === 'time'
-        ? 'time'
-        : 'part'
-    } catch {
-      return 'part'
-    }
-  })
-  const setView = useCallback((m: 'part' | 'time') => {
-    setViewMode(m)
-    try {
-      window.localStorage.setItem('roshera.timeline.view', m)
-    } catch {
-      // localStorage unavailable (private mode / SSR) — in-memory only.
-    }
-  }, [])
+  // Map view: a full-panel React Flow graph, independent of the branch
+  // minimap above and the strip below. Closed by default — it is heavier
+  // (lazy chunk + per-branch history fetches) and answers a different
+  // question ("how was this structured") than the strip's "scrub to a
+  // point in time".
+  const [graphOpen, setGraphOpen] = useState(false)
   // Live solid-id → display-name map, from the same scene store the browser
   // tree renders (`obj.name` via `analyticalGeometry.solidId`). Keeps lane
   // labels byte-identical to the tree for live parts — including custom
@@ -1028,6 +939,19 @@ export function Timeline() {
   const [creatingBranch, setCreatingBranch] = useState(false)
   const branchPickerRef = useRef<HTMLDivElement | null>(null)
   const branchInputRef = useRef<HTMLInputElement | null>(null)
+  // Checkpoint (intent) picker: opens when the user clicks ◈. The old
+  // behaviour minted "Checkpoint <system clock>" — a name that LOOKS
+  // like a name while carrying nothing (every row already shows its
+  // time), exactly what the MCP intent gate refuses from agents. The
+  // button now asks for the intent and holds the same line: empty and
+  // sequence-position names are refused client-side, because this POST
+  // bypasses the MCP gate entirely (see checkpointNameRefusal).
+  const [checkpointPickerOpen, setCheckpointPickerOpen] = useState(false)
+  const [checkpointNameInput, setCheckpointNameInput] = useState('')
+  const [creatingCheckpoint, setCreatingCheckpoint] = useState(false)
+  const [checkpointSubmitAttempted, setCheckpointSubmitAttempted] = useState(false)
+  const checkpointPickerRef = useRef<HTMLDivElement | null>(null)
+  const checkpointInputRef = useRef<HTMLInputElement | null>(null)
   const wsStatus = useWSStore((s) => s.status)
 
   const handleEventContextMenu = useCallback(
@@ -1046,6 +970,13 @@ export function Timeline() {
     setNameSuggestions([])
     setNameInput('')
     setCreatingBranch(false)
+  }, [])
+
+  const closeCheckpointPicker = useCallback(() => {
+    setCheckpointPickerOpen(false)
+    setCheckpointNameInput('')
+    setCreatingCheckpoint(false)
+    setCheckpointSubmitAttempted(false)
   }, [])
 
   // Tick relative-time labels every second
@@ -1098,11 +1029,80 @@ export function Timeline() {
     }
   }, [previewMode, activeBranchId])
 
+  // In-place document switch (`stores/document-store.ts`): the backend
+  // resets the active branch to `main` server-side on every switch
+  // (`documents.rs::activate`) — mirror that locally rather than keep
+  // requesting history for a branch id that may not exist in the new
+  // document. `documentEpoch` only bumps AFTER the backend confirms the
+  // switch, so this never fires optimistically. Deliberately NOT
+  // depending on `fetchHistory` (whose identity changes with
+  // `activeBranchId`) — that would re-run this on every ordinary branch
+  // switch and force everyone back to main.
+  const documentEpoch = useDocumentStore((s) => s.epoch)
+  useEffect(() => {
+    if (documentEpoch === 0) return // initial mount, not a switch
+    setEvents([])
+    setActiveBranchId(MAIN_BRANCH_ID)
+    void fetchHistory()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [documentEpoch])
+
   useEffect(() => {
     if (wsStatus === 'connected') {
       fetchHistory()
     }
   }, [wsStatus, fetchHistory])
+
+  // Checkpoints — the decision layer. Deliberately NOT part of the 5s
+  // history poll: the API's read class is rate-limited and the existing
+  // poll already runs 2 GETs per tick per open tab (adding a third
+  // tripped live 429s during this pass, verified 2026-08-01). Declared
+  // intents change rarely, so a 15s cadence + an eager refresh right
+  // after this client creates one keeps the rail honest without
+  // leaning on the limiter.
+  const fetchCheckpoints = useCallback(async () => {
+    if (previewMode) return
+    try {
+      const resp = await fetch('/api/timeline/checkpoints')
+      if (!resp.ok) return
+      const data = await resp.json()
+      if (Array.isArray(data)) setCheckpoints(data as CheckpointSummary[])
+    } catch {
+      // Backend not running — keep the last known list.
+    }
+  }, [previewMode])
+
+  useEffect(() => {
+    if (previewMode || wsStatus !== 'connected') return
+    void fetchCheckpoints()
+    const timer = setInterval(() => {
+      if (document.visibilityState === 'visible') void fetchCheckpoints()
+    }, 15_000)
+    return () => clearInterval(timer)
+  }, [previewMode, wsStatus, documentEpoch, fetchCheckpoints])
+
+  // Durability boot outcome — fetched OUTSIDE the 5s history poll on
+  // purpose: it only changes at boot or on an in-place document switch
+  // (documents.rs::activate re-runs boot_replay), and the API has
+  // per-class rate limits that a fatter poll tick would lean on.
+  // Re-fetched on reconnect and on every confirmed document switch.
+  useEffect(() => {
+    if (previewMode || wsStatus !== 'connected') return
+    let cancelled = false
+    ;(async () => {
+      try {
+        const resp = await fetch('/api/durability/status')
+        if (!resp.ok) return
+        const status = parseDurabilityStatus(await resp.json())
+        if (!cancelled && status) setDurability(status)
+      } catch {
+        // Backend not running — leave the last known status in place.
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [previewMode, wsStatus, documentEpoch])
 
   // Poll for updates (pause when tab is hidden)
   useEffect(() => {
@@ -1165,6 +1165,33 @@ export function Timeline() {
       document.removeEventListener('keydown', onKey)
     }
   }, [branchPickerOpen, closeBranchPicker])
+
+  // Same dismissal contract for the checkpoint (intent) picker.
+  useEffect(() => {
+    if (!checkpointPickerOpen) return
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.stopPropagation()
+        closeCheckpointPicker()
+      }
+    }
+    const onPointer = (e: MouseEvent) => {
+      const root = checkpointPickerRef.current
+      if (root && !root.contains(e.target as Node)) {
+        closeCheckpointPicker()
+      }
+    }
+    const id = window.setTimeout(() => {
+      document.addEventListener('mousedown', onPointer)
+    }, 0)
+    document.addEventListener('keydown', onKey)
+    checkpointInputRef.current?.focus()
+    return () => {
+      window.clearTimeout(id)
+      document.removeEventListener('mousedown', onPointer)
+      document.removeEventListener('keydown', onKey)
+    }
+  }, [checkpointPickerOpen, closeCheckpointPicker])
 
   const handleUndo = async () => {
     // Backend `/api/timeline/undo` requires `session_id` in the body
@@ -1232,12 +1259,35 @@ export function Timeline() {
     }
   }
 
-  const handleCheckpoint = async () => {
+  const handleCheckpoint = () => {
+    // Toggle the intent picker — never mint a name. The previous
+    // implementation POSTed `Checkpoint ${new Date().toLocaleTimeString()}`
+    // here: a clock reading dressed as a name, which filled the decision
+    // rail with rows that said nothing (the range and time are already on
+    // every row). The name is the feature; it has to come from the user.
+    if (checkpointPickerOpen) {
+      closeCheckpointPicker()
+      return
+    }
+    closeBranchPicker()
+    setCheckpointPickerOpen(true)
+  }
+
+  const submitCheckpointCreate = async () => {
+    const name = checkpointNameInput.trim()
+    // Same quality floor the MCP intent gate holds for agents — this
+    // POST bypasses that gate, so the client is where the line is held
+    // for the button today (checkpointNameRefusal mirrors gates.ts).
+    if (checkpointNameRefusal(name)) {
+      setCheckpointSubmitAttempted(true)
+      return
+    }
+    setCreatingCheckpoint(true)
     try {
       const resp = await fetch('/api/timeline/checkpoint', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: `Checkpoint ${new Date().toLocaleTimeString()}` }),
+        body: JSON.stringify({ name }),
       })
       if (!resp.ok) {
         // `create_checkpoint` (handlers/timeline.rs) returns a bare
@@ -1247,11 +1297,17 @@ export function Timeline() {
         // generic "Request failed (HTTP …)" form for this endpoint.
         const body = await tryReadJson(resp)
         flashActionError(`Checkpoint failed: ${refusalMessage(body, resp.status)}`)
+        setCreatingCheckpoint(false)
         return
       }
+      closeCheckpointPicker()
       fetchHistory()
+      // The decision rail refreshes on its own slow cadence; a checkpoint
+      // this client just created should appear immediately, not in ≤15s.
+      void fetchCheckpoints()
     } catch {
       flashActionError('Backend unreachable — checkpoint not created')
+      setCreatingCheckpoint(false)
     }
   }
 
@@ -1263,6 +1319,7 @@ export function Timeline() {
       closeBranchPicker()
       return
     }
+    closeCheckpointPicker()
     setBranchPickerOpen(true)
     setCreatingBranch(false)
     setNameSuggestions([])
@@ -1406,6 +1463,14 @@ export function Timeline() {
   ).length
   const otherBranchCount = Math.max(0, visibleBranchCount - 1)
 
+  // Live checkpoint-name verdict. Shown once the user has typed
+  // something (or tried to submit an empty name) — not before, so the
+  // freshly-opened picker doesn't greet them with red text.
+  const checkpointRefusal = checkpointNameRefusal(checkpointNameInput)
+  const showCheckpointRefusal =
+    checkpointRefusal !== null &&
+    (checkpointSubmitAttempted || checkpointNameInput.trim().length > 0)
+
   return (
     <div className="relative font-mono flex flex-col border-t border-border bg-card shrink-0">
       {branchPickerOpen && (
@@ -1473,6 +1538,66 @@ export function Timeline() {
           </div>
         </div>
       )}
+      {checkpointPickerOpen && (
+        <div
+          ref={checkpointPickerRef}
+          className="absolute left-3 bottom-full mb-1 z-50 flex flex-col gap-2 px-3 py-2 rounded-md border border-border bg-card shadow-lg text-[12px]"
+          style={{ minWidth: 340, maxWidth: 440 }}
+        >
+          <div className="text-foreground/70">
+            declare intent on{' '}
+            <span className="text-foreground/90">{activeBranchLabel}</span>
+            <span className="text-foreground/50">
+              {' '}— name what a drawing would name
+            </span>
+          </div>
+          <div className="flex items-center gap-1.5">
+            <input
+              ref={checkpointInputRef}
+              type="text"
+              value={checkpointNameInput}
+              onChange={(e) => setCheckpointNameInput(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  e.preventDefault()
+                  void submitCheckpointCreate()
+                }
+              }}
+              placeholder="e.g. bolt circle 8 x D18 on D160 B.C."
+              className="flex-1 min-w-0 px-2 py-1 rounded border border-border bg-background text-foreground placeholder:text-foreground/40 outline-none focus:border-[#2ecc71]"
+            />
+            <button
+              type="button"
+              onClick={() => void submitCheckpointCreate()}
+              disabled={creatingCheckpoint || checkpointRefusal !== null}
+              title={
+                checkpointRefusal !== null
+                  ? 'Name the intent first — a sequence position or clock reading is refused'
+                  : 'Record this intent as a checkpoint'
+              }
+              className="px-2 py-1 rounded text-foreground bg-[#2ecc71]/20 hover:bg-[#2ecc71]/30 disabled:opacity-40 disabled:cursor-not-allowed"
+            >
+              {creatingCheckpoint ? 'declaring…' : 'declare'}
+            </button>
+            <button
+              type="button"
+              onClick={closeCheckpointPicker}
+              className="px-2 py-1 rounded text-foreground/60 hover:bg-accent/40"
+            >
+              cancel
+            </button>
+          </div>
+          {/* The refusal, in the same voice as the MCP intent gate: what
+              is wrong AND what a good name looks like. This popover is
+              the only gate on this path — the button's POST bypasses the
+              MCP layer entirely. */}
+          {showCheckpointRefusal && (
+            <div className="text-[11px] leading-snug text-rose-400 max-w-[52ch]">
+              {checkpointRefusal}
+            </div>
+          )}
+        </div>
+      )}
       {/* Expanded panel: full git-style graph. Sits above the strip
           and only renders when the user clicks ▾. Horizontal scroll
           if the SVG is wider than the viewport. */}
@@ -1520,43 +1645,52 @@ export function Timeline() {
 
         <span className="text-muted-foreground/40 shrink-0 text-[13px]">│</span>
 
-        {/* Grouping toggle: per-part swimlanes (default) vs flat by-time */}
-        <div
-          className="inline-flex shrink-0 rounded border border-border overflow-hidden text-[11px]"
-          role="group"
-          aria-label="Timeline grouping"
+        {/* Position: the ambient "where am I" the odometer-strip owed and
+            never gave — branch + total. The map (below) is where
+            structure lives now; this is scale, not detail.
+            ★ Deliberately NOT claiming "at head" / "N back" here: tested
+            live against undo — neither `history`'s event count nor
+            `/api/branches`' `event_count` changes when undo moves the
+            live model backward (verified: both stayed 68 across an
+            undo). There is no passive endpoint exposing replay position,
+            only `can_redo` inside the redo call's OWN response (a
+            side-effecting probe, not a status read) — so this doesn't
+            assert a position it cannot actually observe. */}
+        <span
+          className="shrink-0 text-[11px] text-muted-foreground/80 whitespace-nowrap"
+          title="Active branch and its total recorded operations"
         >
-          <button
-            type="button"
-            onClick={() => setView('part')}
-            aria-pressed={viewMode === 'part'}
-            title="Group operations into per-part lanes"
-            className={cn(
-              'px-2 py-0.5 transition-colors',
-              viewMode === 'part'
-                ? 'bg-accent/40 text-foreground font-medium'
-                : 'text-muted-foreground hover:text-foreground hover:bg-accent/30',
-            )}
-          >
-            by&nbsp;part
-          </button>
-          <button
-            type="button"
-            onClick={() => setView('time')}
-            aria-pressed={viewMode === 'time'}
-            title="Show all parts in one chronological strip"
-            className={cn(
-              'px-2 py-0.5 transition-colors border-l border-border',
-              viewMode === 'time'
-                ? 'bg-accent/40 text-foreground font-medium'
-                : 'text-muted-foreground hover:text-foreground hover:bg-accent/30',
-            )}
-          >
-            by&nbsp;time
-          </button>
-        </div>
+          <span className="text-foreground/70">{activeBranchLabel}</span>
+          {' · '}
+          {events.length} op{events.length === 1 ? '' : 's'}
+        </span>
+
+        {/* Durability disclosure — non-null exactly when the boot
+            outcome withheld or lost history (quarantine/failure) or
+            persistence is off. The short label is readable in place;
+            the full account (break sequence, kind, reason) is on
+            hover. Amber-dashed = withheld-by-design, red = log
+            unreadable — the card-chrome tri-state language. */}
+        {(() => {
+          const notice = durabilityNotice(durability)
+          return notice ? <DurabilityChip notice={notice} /> : null
+        })()}
 
         <div className="flex-1" />
+
+        {/* Map view toggle — a second, independent view of the SAME
+            history as the strip below, grouped by structure instead of
+            scrubbed by time. See TimelineGraph.tsx for what it groups by
+            today and why it doesn't color by certificate yet. */}
+        <button
+          type="button"
+          onClick={() => setGraphOpen(true)}
+          title="Open the timeline as a map — grouped by part, not raw ops"
+          className="shrink-0 flex items-center gap-1 px-2 py-1 rounded text-[12px] text-muted-foreground hover:text-foreground hover:bg-accent/40 transition-colors"
+        >
+          <span aria-hidden>🗺</span>
+          <span>map</span>
+        </button>
 
         {/* Branch chip + expand/collapse toggle for the branch graph. */}
         <button
@@ -1604,27 +1738,25 @@ export function Timeline() {
         </div>
       )}
 
-      {/* Event body: per-part swimlanes (default) or the flat by-time strip.
-          Collapsible to reclaim viewport space; height-capped with internal
-          scroll so it never crowds the 3D view. */}
+      {/* Recent-ops strip: ambient "what just happened", last few ops only.
+          Full history moved to the map — this never grows past a glance.
+          Above it, the DECISION rail: named intents (checkpoints) when any
+          exist, and the honest "N ops without a named decision" line when
+          work happened but nobody declared what it was for. */}
       {!bodyCollapsed && (
         <div className="border-t border-border/40">
-          {viewMode === 'part' ? (
-            <Swimlanes
-              events={events}
-              liveNames={liveNames}
-              now={now}
-              onContextMenu={handleEventContextMenu}
-              loading={loading}
-            />
-          ) : (
-            <FlatStrip
-              events={events}
-              now={now}
-              onContextMenu={handleEventContextMenu}
-              loading={loading}
-            />
-          )}
+          <DecisionRail
+            checkpoints={checkpoints}
+            eventCount={events.length}
+            onOpen={() => setGraphOpen(true)}
+          />
+          <RecentOpsStrip
+            events={events}
+            now={now}
+            onContextMenu={handleEventContextMenu}
+            loading={loading}
+            durability={durability}
+          />
         </div>
       )}
 
@@ -1691,6 +1823,25 @@ export function Timeline() {
             }
           }}
         />
+      )}
+
+      {graphOpen && (
+        <Suspense
+          fallback={
+            <div className="fixed inset-6 z-50 flex items-center justify-center rounded-lg border border-border bg-card shadow-2xl text-[12px] text-muted-foreground/70 font-mono">
+              ⋯ loading map view
+            </div>
+          }
+        >
+          <TimelineGraph
+            branches={branches}
+            activeBranchId={activeBranchId}
+            liveNames={liveNames}
+            checkpoints={checkpoints}
+            durability={durability}
+            onClose={() => setGraphOpen(false)}
+          />
+        </Suspense>
       )}
     </div>
   )

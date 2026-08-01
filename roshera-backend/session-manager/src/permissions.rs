@@ -107,6 +107,96 @@ pub enum Permission {
     JoinSession,
 }
 
+impl Permission {
+    /// Canonical wire string for this permission — the PascalCase
+    /// spelling every writer in this codebase already emits
+    /// (`get_user_permission_strings`/`AGENT_SESSION_KEY_PERMISSIONS` in
+    /// `api-server`, `format!("{:?}", ...)` in `database.rs`'s
+    /// Postgres/SQLite persistence paths). Centralised here so every
+    /// reader decodes exactly the alphabet a writer produces — see
+    /// [`Permission::from_str`] for the inverse and the invariant this
+    /// pair exists to hold: a permission that does not round-trip
+    /// through this pair silently vanishes at the reading end.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Permission::DeleteSession => "DeleteSession",
+            Permission::InviteUsers => "InviteUsers",
+            Permission::RemoveUsers => "RemoveUsers",
+            Permission::ChangeRoles => "ChangeRoles",
+            Permission::ModifySettings => "ModifySettings",
+            Permission::CreateGeometry => "CreateGeometry",
+            Permission::ModifyGeometry => "ModifyGeometry",
+            Permission::DeleteGeometry => "DeleteGeometry",
+            Permission::CreateObjects => "CreateObjects",
+            Permission::EditObjects => "EditObjects",
+            Permission::DeleteObjects => "DeleteObjects",
+            Permission::ViewObjects => "ViewObjects",
+            Permission::BooleanOperations => "BooleanOperations",
+            Permission::AdvancedFeatures => "AdvancedFeatures",
+            Permission::ViewGeometry => "ViewGeometry",
+            Permission::MeasureGeometry => "MeasureGeometry",
+            Permission::ExportGeometry => "ExportGeometry",
+            Permission::ExportSession => "ExportSession",
+            Permission::TakeScreenshots => "TakeScreenshots",
+            Permission::UndoRedo => "UndoRedo",
+            Permission::CreateBranches => "CreateBranches",
+            Permission::MergeBranches => "MergeBranches",
+            Permission::ViewHistory => "ViewHistory",
+            Permission::AddComments => "AddComments",
+            Permission::VoiceChat => "VoiceChat",
+            Permission::ScreenShare => "ScreenShare",
+            Permission::RecordSession => "RecordSession",
+            Permission::ManagePermissions => "ManagePermissions",
+            Permission::ViewAllSessions => "ViewAllSessions",
+            Permission::DeleteAllSessions => "DeleteAllSessions",
+            Permission::CreateSession => "CreateSession",
+            Permission::JoinSession => "JoinSession",
+        }
+    }
+
+    /// Inverse of [`Permission::as_str`]. Returns `None` for any string
+    /// outside the canonical alphabet so callers `filter_map`/refuse
+    /// rather than silently defaulting — an unrecognised permission
+    /// string must be visible, never swallowed.
+    pub fn from_str(s: &str) -> Option<Self> {
+        Some(match s {
+            "DeleteSession" => Permission::DeleteSession,
+            "InviteUsers" => Permission::InviteUsers,
+            "RemoveUsers" => Permission::RemoveUsers,
+            "ChangeRoles" => Permission::ChangeRoles,
+            "ModifySettings" => Permission::ModifySettings,
+            "CreateGeometry" => Permission::CreateGeometry,
+            "ModifyGeometry" => Permission::ModifyGeometry,
+            "DeleteGeometry" => Permission::DeleteGeometry,
+            "CreateObjects" => Permission::CreateObjects,
+            "EditObjects" => Permission::EditObjects,
+            "DeleteObjects" => Permission::DeleteObjects,
+            "ViewObjects" => Permission::ViewObjects,
+            "BooleanOperations" => Permission::BooleanOperations,
+            "AdvancedFeatures" => Permission::AdvancedFeatures,
+            "ViewGeometry" => Permission::ViewGeometry,
+            "MeasureGeometry" => Permission::MeasureGeometry,
+            "ExportGeometry" => Permission::ExportGeometry,
+            "ExportSession" => Permission::ExportSession,
+            "TakeScreenshots" => Permission::TakeScreenshots,
+            "UndoRedo" => Permission::UndoRedo,
+            "CreateBranches" => Permission::CreateBranches,
+            "MergeBranches" => Permission::MergeBranches,
+            "ViewHistory" => Permission::ViewHistory,
+            "AddComments" => Permission::AddComments,
+            "VoiceChat" => Permission::VoiceChat,
+            "ScreenShare" => Permission::ScreenShare,
+            "RecordSession" => Permission::RecordSession,
+            "ManagePermissions" => Permission::ManagePermissions,
+            "ViewAllSessions" => Permission::ViewAllSessions,
+            "DeleteAllSessions" => Permission::DeleteAllSessions,
+            "CreateSession" => Permission::CreateSession,
+            "JoinSession" => Permission::JoinSession,
+            _ => return None,
+        })
+    }
+}
+
 /// User permission profile
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserPermissions {
@@ -519,6 +609,80 @@ impl Default for PermissionManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every `Permission` variant must survive `as_str` -> `from_str`
+    /// as the identity. This is the invariant `database.rs`'s SQL
+    /// persistence and every API-key permission string in `api-server`
+    /// depend on: a variant that does not round-trip here silently
+    /// vanishes wherever it is written and later read back — an
+    /// omission this test would have caught for the 9 variants
+    /// (`CreateObjects`, `EditObjects`, `DeleteObjects`, `ViewObjects`,
+    /// `ManagePermissions`, `ViewAllSessions`, `DeleteAllSessions`,
+    /// `CreateSession`, `JoinSession`) that were missing from the
+    /// hand-written decoder this codec replaced.
+    #[test]
+    fn every_permission_variant_round_trips_through_the_canonical_codec() {
+        let all = [
+            Permission::DeleteSession,
+            Permission::InviteUsers,
+            Permission::RemoveUsers,
+            Permission::ChangeRoles,
+            Permission::ModifySettings,
+            Permission::CreateGeometry,
+            Permission::ModifyGeometry,
+            Permission::DeleteGeometry,
+            Permission::CreateObjects,
+            Permission::EditObjects,
+            Permission::DeleteObjects,
+            Permission::ViewObjects,
+            Permission::BooleanOperations,
+            Permission::AdvancedFeatures,
+            Permission::ViewGeometry,
+            Permission::MeasureGeometry,
+            Permission::ExportGeometry,
+            Permission::ExportSession,
+            Permission::TakeScreenshots,
+            Permission::UndoRedo,
+            Permission::CreateBranches,
+            Permission::MergeBranches,
+            Permission::ViewHistory,
+            Permission::AddComments,
+            Permission::VoiceChat,
+            Permission::ScreenShare,
+            Permission::RecordSession,
+            Permission::ManagePermissions,
+            Permission::ViewAllSessions,
+            Permission::DeleteAllSessions,
+            Permission::CreateSession,
+            Permission::JoinSession,
+        ];
+        for permission in all {
+            let encoded = permission.as_str();
+            let decoded = Permission::from_str(encoded).expect(
+                "every permission this codec can emit must decode back via \
+                 Permission::from_str — a permission that does not round-trip \
+                 silently vanishes wherever it is persisted or transmitted",
+            );
+            assert_eq!(
+                decoded, permission,
+                "round trip must be identity: {permission:?} -> '{encoded}' -> {decoded:?}"
+            );
+            // Some historical write sites (role strings, and formerly the
+            // permission columns in `database.rs`) encode via
+            // `format!("{:?}", ...)` rather than calling `as_str()`
+            // directly. That is only safe if Debug and `as_str()` never
+            // diverge — assert the coupling explicitly so a renamed
+            // variant that updates one and not the other fails HERE,
+            // not as a silent drop three layers away in a SQL round trip.
+            assert_eq!(
+                format!("{permission:?}"),
+                encoded,
+                "Debug repr of {permission:?} must equal as_str() ('{encoded}') — \
+                 any remaining format!(\"{{:?}}\", ...) write site for a \
+                 Permission depends on this equality holding"
+            );
+        }
+    }
 
     #[test]
     fn test_owner_permissions() {

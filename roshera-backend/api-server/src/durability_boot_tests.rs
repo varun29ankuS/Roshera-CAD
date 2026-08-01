@@ -35,11 +35,13 @@ use uuid::Uuid;
 // Fixtures
 // =====================================================================
 
-type Db = Arc<dyn DatabasePersistence + Send + Sync>;
+pub(crate) type Db = Arc<dyn DatabasePersistence + Send + Sync>;
 
 /// A unique temp path for a file-backed SQLite database (survives across the
-/// two `AppState`s that model "before" and "after" a restart).
-fn temp_db_path() -> String {
+/// two `AppState`s that model "before" and "after" a restart). `pub(crate)`
+/// (with the sibling helpers below) so `documents_tests.rs` can drive the
+/// same "simulated restart" fixture instead of duplicating it.
+pub(crate) fn temp_db_path() -> String {
     let mut p = std::env::temp_dir();
     p.push(format!("roshera_durability_{}.db", Uuid::new_v4()));
     // sqlx's SQLite connection string takes the filename verbatim after the
@@ -48,7 +50,7 @@ fn temp_db_path() -> String {
 }
 
 /// Open (creating if absent) a file-backed SQLite database and run migrations.
-async fn open_db(path: &str) -> Db {
+pub(crate) async fn open_db(path: &str) -> Db {
     let cfg = DatabaseConfig {
         db_type: DatabaseType::SQLite,
         url: format!("sqlite://{path}?mode=rwc"),
@@ -66,16 +68,22 @@ async fn open_db(path: &str) -> Db {
 /// Build an `AppState` whose recorder writes through to `db`. When
 /// `run_replay` is true, `boot_replay` restores any persisted document — the
 /// production boot path. When false, the state boots blank (the mutation).
-async fn build_state(db: Db, run_replay: bool) -> AppState {
-    let sink: Arc<dyn EventSink> = Arc::new(durability::DatabaseEventSink::new(db.clone()));
-    let state = make_test_state_with_database(db, Some(sink)).await;
+pub(crate) async fn build_state(db: Db, run_replay: bool) -> AppState {
+    let active_document = Arc::new(tokio::sync::RwLock::new(
+        durability::DURABILITY_SESSION_ID.to_string(),
+    ));
+    let sink: Arc<dyn EventSink> = Arc::new(durability::DatabaseEventSink::new(
+        db.clone(),
+        active_document.clone(),
+    ));
+    let state = make_test_state_with_database(db, Some(sink), Some(active_document)).await;
     if run_replay {
         durability::boot_replay(&state).await;
     }
     state
 }
 
-async fn dispatch(state: &AppState, request: Request<Body>) -> (StatusCode, Value) {
+pub(crate) async fn dispatch(state: &AppState, request: Request<Body>) -> (StatusCode, Value) {
     let router = build_router(state.clone());
     let response = router
         .oneshot(request)
@@ -93,7 +101,7 @@ async fn dispatch(state: &AppState, request: Request<Body>) -> (StatusCode, Valu
     (status, body)
 }
 
-fn post(uri: &str, payload: Value) -> Request<Body> {
+pub(crate) fn post(uri: &str, payload: Value) -> Request<Body> {
     Request::builder()
         .method(Method::POST)
         .uri(uri)
@@ -102,7 +110,7 @@ fn post(uri: &str, payload: Value) -> Request<Body> {
         .expect("request must build")
 }
 
-fn get(uri: &str) -> Request<Body> {
+pub(crate) fn get(uri: &str) -> Request<Body> {
     Request::builder()
         .method(Method::GET)
         .uri(uri)
@@ -110,11 +118,22 @@ fn get(uri: &str) -> Request<Body> {
         .expect("request must build")
 }
 
-fn del(uri: &str) -> Request<Body> {
+pub(crate) fn del(uri: &str) -> Request<Body> {
     Request::builder()
         .method(Method::DELETE)
         .uri(uri)
         .body(Body::empty())
+        .expect("request must build")
+}
+
+/// `documents_tests.rs` also needs a PATCH builder (rename) — sibling of
+/// `post`/`get`/`del` above.
+pub(crate) fn patch(uri: &str, payload: Value) -> Request<Body> {
+    Request::builder()
+        .method(Method::PATCH)
+        .uri(uri)
+        .header("content-type", "application/json")
+        .body(Body::from(payload.to_string()))
         .expect("request must build")
 }
 

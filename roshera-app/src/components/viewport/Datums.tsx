@@ -90,12 +90,24 @@ export function Datums() {
     const fetchDatums = async () => {
       try {
         const res = await fetch(`${API_BASE}/api/datums`)
-        if (!res.ok) return
+        if (!res.ok) {
+          // A 401 here is already surfaced globally: the fetch interceptor
+          // in `lib/auth.ts` flips `isAuthRequired()` on any API 401, which
+          // opens `LoginDialog` ("This instance requires authentication.").
+          // That is the correct UI treatment — this console.error exists so
+          // a non-auth failure (500, a route regression) is still
+          // diagnosable instead of silently leaving the viewport bare.
+          console.error(`[Datums] GET /api/datums failed: ${res.status} ${res.statusText}`)
+          return
+        }
         const data: DatumListResponse = await res.json()
         if (!cancelled) setDatums(data.datums)
-      } catch {
+      } catch (err) {
         // Backend unreachable — leave whatever we already had so the
-        // viewport doesn't flicker between loaded and empty states.
+        // viewport doesn't flicker between loaded and empty states. The
+        // WS connection-status indicator already tells the user the
+        // backend is down; this log makes the specific failure diagnosable.
+        console.error('[Datums] GET /api/datums threw:', err)
       }
     }
 

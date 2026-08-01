@@ -67,7 +67,7 @@ impl Default for SmartRouterConfig {
                 provider: shared_types::vision::VisionProviderType::Anthropic,
                 url: "https://api.anthropic.com/v1/messages".to_string(),
                 api_key: None,
-                model_name: "claude-sonnet-5".to_string(),
+                model_name: shared_types::DEFAULT_CLAUDE_MODEL.to_string(),
             },
             reasoning_config: None,
             enable_cache: true,

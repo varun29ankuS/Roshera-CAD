@@ -19,10 +19,12 @@ import { useCommandPaletteStore } from '@/stores/command-palette-store'
 import { useUnitsStore } from '@/stores/units-store'
 import { Badge } from '@/components/ui/badge'
 import { Sun, Moon } from 'lucide-react'
-import { wsClient } from '@/lib/ws-client'
 import { exportSceneAs } from '@/lib/export-api'
 import { useBlackboardStore } from '@/stores/blackboard-store'
 import { getDocumentUnit } from '@/lib/units-api'
+import { newDocument } from '@/lib/documents-api'
+import { useDocumentStore } from '@/stores/document-store'
+import { refusalMessage, tryReadJson } from '@/lib/backend-refusal'
 import { UnitSelector } from '@/components/layout/UnitSelector'
 
 const API_BASE = import.meta.env.VITE_API_URL || ''
@@ -36,13 +38,33 @@ async function timelineAction(action: 'undo' | 'redo') {
   const sessionId = useWSStore.getState().sessionId
   if (!sessionId) return
   try {
-    await fetch(`${API_BASE}/api/timeline/${action}`, {
+    const resp = await fetch(`${API_BASE}/api/timeline/${action}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ session_id: sessionId }),
     })
-  } catch {
-    // backend not running
+    // Same defect class as `exportGeometry` below: a menubar click that
+    // silently does nothing reads as "the button is broken", not "the
+    // request failed" — post to the Blackboard so it's visible.
+    const body = await tryReadJson(resp)
+    const label = action === 'undo' ? 'Undo' : 'Redo'
+    if (!resp.ok) {
+      console.error(`[TopBar] ${action} failed:`, resp.status, body)
+      useBlackboardStore.getState().addLine(`${label} failed: ${refusalMessage(body, resp.status)}`, 'system')
+      return
+    }
+    // `undo_operation` / `redo_operation` answer HTTP 200 with
+    // `{ success: false, message }` for expected refusals (nothing to
+    // undo, session not found) — see `Timeline.tsx`'s undo/redo handler,
+    // which this mirrors. A bare `!resp.ok` check misses this shape.
+    if (body && body.success === false) {
+      useBlackboardStore.getState().addLine(`${label}: ${refusalMessage(body, resp.status)}`, 'system')
+    }
+  } catch (err) {
+    console.error(`[TopBar] ${action} threw:`, err)
+    useBlackboardStore
+      .getState()
+      .addLine(`${action === 'undo' ? 'Undo' : 'Redo'} failed: backend unreachable.`, 'system')
   }
 }
 
@@ -89,12 +111,18 @@ export function TopBar() {
   const setDocMode = useDocModeStore((s) => s.setMode)
   const openCommandPalette = useCommandPaletteStore((s) => s.openWith)
   const setDocumentUnitState = useUnitsStore((s) => s.setDocumentUnitState)
+  // Bumps after an in-place document switch is confirmed
+  // (`stores/document-store.ts`) — a different document can have a
+  // different display unit, and without this the selector would keep
+  // showing the PREVIOUS document's unit until something else touched it.
+  const documentEpoch = useDocumentStore((s) => s.epoch)
 
-  // On mount: GET the backend's current document unit and seed the store.
-  // Best-effort: a failure (backend not yet reachable) silently leaves
-  // the default "mm" in place — no error surface, no spinner, no retry
-  // loop. The selector PATCH path is authoritative; this is purely a
-  // cold-start sync so the selector shows the right initial value.
+  // On mount, and again on every confirmed document switch: GET the
+  // backend's current document unit and seed the store. Best-effort: a
+  // failure (backend not yet reachable) silently leaves the previous
+  // value in place — no error surface, no spinner, no retry loop. The
+  // selector PATCH path is authoritative; this is purely a sync so the
+  // selector shows the right value for whichever document is live.
   useEffect(() => {
     // Guard against the cold-start race: if the user PATCHes a unit while
     // this GET is in flight, the epoch advances and the stale response must
@@ -107,16 +135,32 @@ export function TopBar() {
         }
       })
       .catch(() => {
-        // Best-effort: leave default "mm" untouched.
+        // Best-effort: leave the previous value untouched.
       })
-  // Run once on mount only.
+  // Deliberately NOT depending on `setDocumentUnitState` (stable zustand
+  // setter) — only mount and `documentEpoch` should retrigger this.
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
+  }, [documentEpoch])
 
+  // "File → New": creates a fresh, empty document on the backend and opens
+  // it. The old model/timeline/blackboard were client-side-only resets
+  // (`clearScene` + a `NewProject` WS command the backend never handled)
+  // — every user shared one document forever, so "new" never actually
+  // meant new. The current document is durable (nothing here deletes it;
+  // it stays reachable from the document tab strip's `+` menu), so this
+  // only asks for confirmation because it navigates away from what's on
+  // screen. Switching between EXISTING documents now lives on the tab
+  // strip (`DocumentTabs.tsx`, rendered below TopBar) — that is the
+  // constant, every-day action; this menu item is for the rare one.
   const handleNewProject = useCallback(() => {
-    clearScene()
-    wsClient.send({ type: 'Command', payload: { cmd: 'NewProject' } })
-  }, [clearScene])
+    if (!window.confirm('Start a new, empty document? Your current document is saved.')) {
+      return
+    }
+    newDocument().catch((err) => {
+      console.error('[TopBar] newDocument failed:', err)
+      useBlackboardStore.getState().addLine('New document failed: backend unreachable.', 'system')
+    })
+  }, [])
 
   const handleDelete = useCallback(() => {
     // Route through the canonical REST endpoint — the same one
@@ -169,6 +213,30 @@ export function TopBar() {
               New Project <MenubarShortcut>Ctrl+N</MenubarShortcut>
             </MenubarItem>
             <MenubarSeparator />
+            {/* Import: STEP is the only format the backend can ingest today
+                (`POST /api/geometry/import_step`). The event opens the
+                dropzone's native file picker — same path as drag-and-drop.
+                The dropzone (and its listener) mounts with the 3D viewport,
+                so switch to Modeling first when in Drawing mode — otherwise
+                the click would silently do nothing. `.ros` files are
+                export-only until an import route exists. */}
+            <MenubarItem
+              onClick={() => {
+                if (useDocModeStore.getState().mode === 'drawing') {
+                  useDocModeStore.getState().setMode('part')
+                }
+                // Give the viewport (and the dropzone's event listener) a
+                // beat to mount before dispatching. 150 ms is well inside
+                // the browser's transient-activation window, so the native
+                // file picker still opens.
+                window.setTimeout(
+                  () => window.dispatchEvent(new Event('roshera:open-step-import')),
+                  150,
+                )
+              }}
+            >
+              Import STEP…
+            </MenubarItem>
             <MenubarSub>
               <MenubarSubTrigger>Export</MenubarSubTrigger>
               <MenubarSubContent>
@@ -323,6 +391,13 @@ export function TopBar() {
             </MenubarContent>
           </MenubarMenu>
         </Menubar>
+
+        {/* AI provider settings. Opens the modal that renders the
+            server-owned provider allowlist (allowlist.rs) and lets the
+            user select/configure a mode — never fabricates a working
+            provider for a build that hasn't shipped the endpoint yet.
+            Lives at the foot of the left tool rail, not here: it is a
+            standing surface, not a per-document control. */}
 
         <button
           onClick={useThemeStore.getState().toggleTheme}

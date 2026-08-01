@@ -24,18 +24,33 @@ import { registerLabelTools } from "./tools/labels.js";
 import { registerAssemblyTools } from "./tools/assembly.js";
 import { registerGdtTools } from "./tools/gdt.js";
 import { registerDrawingTools } from "./tools/drawing.js";
+import { registerKbTools } from "./tools/kb.js";
 
 /**
  * The core modeling + perception verbs always in the default surface, plus the
  * two composition/attention tools (workbench, cad_program) added in S3/S4 — all
  * always exposed in minimal mode so a bench switch and a certified program are
  * one predictable call away.
+ *
+ * MEMBERSHIP CRITERION (2026-08-01): residency is earned by how often a tool is
+ * REACHED FOR, not by how important it is. A non-resident tool costs a
+ * find_tool round-trip to discover — and on the live provider a round-trip
+ * replays ~33k tokens of context regardless of how trivial the lookup was — so
+ * the surface should hold the highest-frequency verbs per token of schema, and
+ * nothing else. The long tail loses no capability: find_tool/describe_tool/
+ * invoke reach every table entry in every mode (the S2 guarantee).
  */
 export const CORE_SURFACE = [
   "create_box",
   "create_cylinder",
   "create_sphere",
-  "create_cone",
+  // create_cone REMOVED from residency (2026-08-01): the least reached-for
+  // creation verb — standalone cones are rare in mechanical parts (conical
+  // features arrive as chamfers/countersinks on existing geometry, or as one
+  // revolve call), and at 245 schema tokens it cost more than boolean or
+  // render_part while being asked for a fraction as often. Still fully
+  // reachable via find_tool/invoke, exactly like shell/fillet_edges/
+  // chamfer_edges, which are also bench:"core" tools without residency.
   "boolean",
   "revolve",
   "get_part",
@@ -52,6 +67,18 @@ export const CORE_SURFACE = [
   // The agent→human notebook write verb stays in the default surface so every
   // agent knows the channel exists; list/edit/clear live in the labels bench.
   "blackboard_add_entry",
+  // timeline_checkpoint ADDED to residency (2026-08-01): policy mandates a
+  // named-intent checkpoint before the FIRST mutating call of every feature,
+  // so it is reached for at least once per feature — more often than most
+  // residents — yet the single most-mandated call was the most expensive to
+  // reach (a discovery round-trip). 157 schema tokens; with create_cone's 245
+  // removed the swap is net −88 and the count stays 21. The rest of the
+  // timeline bench (history/branch/merge/scrub) stays behind workbench
+  // ('timeline') — those are session-shaped, not per-feature. index.ts
+  // already handles a core∩bench member (the blackboard_add_entry precedent):
+  // mounted enabled, excluded from benchHandles so a bench switch never
+  // disables it.
+  "timeline_checkpoint",
 ];
 
 /** The 3 meta-tools — the fixed-cost funnel to the long tail. */
@@ -89,6 +116,10 @@ export function buildTableWithControls(): {
   registerAssemblyTools(table);
   registerGdtTools(table);
   registerDrawingTools(table);
+  // kb_lookup — FULL table only, by design (policy KB §1.1): never added to
+  // CORE_SURFACE / MINIMAL_SURFACE, so the knowledge base costs the resident
+  // minimal surface zero tokens; discovery rides find_tool, dispatch invoke.
+  registerKbTools(table);
   // Composition tools (S3/S4) — registered into the SAME table so find_tool
   // surfaces them and the token bill counts them.
   const workbench = new Workbench(table, MINIMAL_SURFACE, resolveSurfaceMode());

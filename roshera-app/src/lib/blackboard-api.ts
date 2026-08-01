@@ -108,24 +108,43 @@ async function fetchSnapshot(scope: BlackboardScope): Promise<BlackboardSnapshot
   }
 }
 
+/** Authorship now survives the round-trip: `api-server/src/blackboard.rs`'s
+ *  `LineAuthor` carries `System` alongside `User`/`Agent`, so the board no
+ *  longer records its own bookkeeping ("Created …" echoes, sync failures,
+ *  toolbar feedback) as something the agent said. It previously downgraded
+ *  `system` to `agent` on the way out, because the wire had no third value
+ *  and a 422 would make the line vanish silently — a fetch only rejects on
+ *  network failure, so `postEntry` "succeeded" while nothing landed, and
+ *  the next poll's `applyRemoteSnapshot` repainted from a backend that had
+ *  never seen it. The line survived; the truth about who wrote it did not.
+ *
+ *  ⚠ This requires the rebuilt backend. Against a binary predating the
+ *  `System` variant every system line 422s and disappears exactly as
+ *  described above, so the server must be restarted before the app is
+ *  reloaded — not after. */
+function wireAuthor(author: BlackboardLine['author']): 'user' | 'agent' | 'system' {
+  return author
+}
+
 async function postEntry(scope: BlackboardScope, line: BlackboardLine): Promise<void> {
   // The frontend owns line ids; the backend keeps `id` verbatim so edit /
   // delete address the same row. We send id + scope alongside text/author so
   // the line lands in the active part's notebook.
-  await fetch(`${API_BASE}/blackboard/entries`, {
+  const res = await fetch(`${API_BASE}/blackboard/entries`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       id: line.id,
       text: line.text,
-      author: line.author,
+      author: wireAuthor(line.author),
       ...(scope === DOCUMENT_SCOPE ? {} : { scope }),
     }),
   })
+  if (!res.ok) throw new Error(`POST /blackboard/entries failed: ${res.status}`)
 }
 
 async function patchEntry(scope: BlackboardScope, id: string, text: string): Promise<void> {
-  await fetch(
+  const res = await fetch(
     `${API_BASE}/blackboard/entries/${encodeURIComponent(id)}${scopeQuery(scope)}`,
     {
       method: 'PATCH',
@@ -133,17 +152,20 @@ async function patchEntry(scope: BlackboardScope, id: string, text: string): Pro
       body: JSON.stringify({ text }),
     },
   )
+  if (!res.ok) throw new Error(`PATCH /blackboard/entries/${id} failed: ${res.status}`)
 }
 
 async function deleteEntry(scope: BlackboardScope, id: string): Promise<void> {
-  await fetch(
+  const res = await fetch(
     `${API_BASE}/blackboard/entries/${encodeURIComponent(id)}${scopeQuery(scope)}`,
     { method: 'DELETE' },
   )
+  if (!res.ok) throw new Error(`DELETE /blackboard/entries/${id} failed: ${res.status}`)
 }
 
 async function clearBackend(scope: BlackboardScope): Promise<void> {
-  await fetch(`${API_BASE}/blackboard/clear${scopeQuery(scope)}`, { method: 'POST' })
+  const res = await fetch(`${API_BASE}/blackboard/clear${scopeQuery(scope)}`, { method: 'POST' })
+  if (!res.ok) throw new Error(`POST /blackboard/clear failed: ${res.status}`)
 }
 
 // ─── Delta detection ─────────────────────────────────────────────────
@@ -288,12 +310,19 @@ function applyRemoteSnapshot(scope: BlackboardScope, snapshot: BlackboardSnapsho
 let pollTimer: ReturnType<typeof setInterval> | null = null
 let unsubScope: (() => void) | null = null
 
-/** Fetch + reconcile the currently-active scope's notebook. */
-function syncActiveScope(): void {
+/**
+ * Fetch + reconcile the currently-active scope's notebook. Exported so a
+ * document switch can force an immediate re-hydration instead of waiting
+ * up to `POLL_INTERVAL_MS` for the ambient poll to notice the backend's
+ * `active_document` changed underneath it (see `stores/document-store.ts`).
+ * The scope key itself doesn't change on a document switch — the backend
+ * resolves "document" scope against its own global `active_document` — so
+ * this is a plain re-fetch, not a scope swap.
+ */
+export async function syncActiveScope(): Promise<void> {
   const scope = useBlackboardStore.getState().activeScope
-  void fetchSnapshot(scope).then((snap) => {
-    if (snap) applyRemoteSnapshot(scope, snap)
-  })
+  const snap = await fetchSnapshot(scope)
+  if (snap) applyRemoteSnapshot(scope, snap)
 }
 
 /**
@@ -312,14 +341,14 @@ export function installBackendBlackboard(intervalMs: number = POLL_INTERVAL_MS):
 
   // Initial hydration — authoritative document for whatever scope is active
   // at boot (the Document notebook).
-  syncActiveScope()
+  void syncActiveScope()
 
   // Re-hydrate immediately when the active scope changes (the user selected a
   // different part). The store has already painted that scope's local cache;
   // this fetches the authoritative backend document for it.
   if (unsubScope === null) {
     unsubScope = useBlackboardStore.subscribe((state, prev) => {
-      if (state.activeScope !== prev.activeScope) syncActiveScope()
+      if (state.activeScope !== prev.activeScope) void syncActiveScope()
     })
   }
 

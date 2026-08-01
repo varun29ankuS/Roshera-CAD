@@ -177,3 +177,7 @@ BENCHMARKS.md
 EXACT_PREDICATES_CAMPAIGN.md
 # Added by code-review-graph
 .code-review-graph/
+
+# roshera-mcp constraint-gate test fixture: compiled from src by
+# `npx tsc -p tsconfig.json --outDir test/.build`, never shipped.
+roshera-mcp/test/.build/

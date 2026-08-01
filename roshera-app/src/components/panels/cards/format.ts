@@ -8,3 +8,16 @@ export function fmtNum(v: number): string {
   }
   return String(Number(v.toPrecision(5)))
 }
+
+/**
+ * Genus from the Euler characteristic, g = (2 − χ) / 2 — valid ONLY for a
+ * closed, connected, orientable surface. The caller must gate on
+ * `watertight && manifold` (closed + orientable) before showing this; a
+ * non-integer result (odd χ) means the precondition doesn't hold here and
+ * the derivation is withheld rather than shown wrong.
+ */
+export function eulerGenus(chi: number): number | null {
+  if (!Number.isInteger(chi)) return null
+  const g = (2 - chi) / 2
+  return Number.isInteger(g) && g >= 0 ? g : null
+}

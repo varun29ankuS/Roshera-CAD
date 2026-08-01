@@ -12,9 +12,12 @@
 // test framework's failure mechanism.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
+mod acp_gate;
+mod agent_activity;
 mod agent_registry;
 #[cfg(test)]
 mod agent_registry_tests;
+mod ai_provider_config;
 mod assembly_instances;
 mod assembly_mates;
 mod assembly_mgr;
@@ -28,6 +31,8 @@ mod blend_failed_harness;
 mod bounded_exec;
 mod branches;
 mod csketch;
+mod documents;
+mod documents_tests;
 mod drawing_mgr;
 mod durability;
 #[cfg(test)]
@@ -64,6 +69,7 @@ use axum::{
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
@@ -157,14 +163,32 @@ pub struct AppState {
     command_executor: Arc<Mutex<CommandExecutor>>,
     provider_manager: Arc<Mutex<ProviderManager>>,
 
-    /// True iff a real LLM provider key was found at server start.
-    /// AI handlers (`/api/ai/command`, `/api/ai/command/stream`) refuse
-    /// to serve traffic with `503 ai_not_configured` when this is
-    /// false. There is no mock fallback in production — silent mock
-    /// responses would make the system look like it works while
-    /// quietly returning placeholder text, which is worse than failing
-    /// loudly.
-    ai_configured: bool,
+    /// True iff a real, REST-usable LLM credential (api_key or
+    /// oauth_profile) is currently active — from server start OR from a
+    /// later `PUT /api/ai/provider` / `DELETE /api/ai/provider`. AI
+    /// handlers (`/api/ai/command`, `/api/ai/command/stream`) refuse to
+    /// serve traffic with `503 ai_not_configured` when this is false.
+    /// There is no mock fallback in production — silent mock responses
+    /// would make the system look like it works while quietly returning
+    /// placeholder text, which is worse than failing loudly.
+    ///
+    /// `Arc<AtomicBool>` (not `bool`) so `PUT`/`DELETE
+    /// /api/ai/provider` can flip it live — configuring a provider from
+    /// the dialog takes effect immediately, no restart. Deliberately
+    /// NEVER flipped true for `subscription_cli` mode: that mode wires
+    /// the `/acp` agent surface via a spawned CLI, not the REST
+    /// tool_use protocol these routes speak (see
+    /// `allowlist.rs`'s `SubscriptionCli` doc comment) — flipping this
+    /// for it would make `/api/ai/command` stop 503-ing and instead
+    /// fail deep inside the provider, a silent wrong answer.
+    ai_configured: Arc<AtomicBool>,
+
+    /// Persistence + resolution for the AI provider connection dialog
+    /// (`GET/PUT/DELETE /api/ai/provider`, `POST
+    /// /api/ai/provider/test`). Captures the boot-time env snapshot
+    /// used for shadow reporting before anything can scrub the
+    /// credential env vars. See `ai_provider_config.rs`.
+    ai_provider_manager: Arc<ai_provider_config::AiProviderManager>,
 
     // Vision pipeline (not yet implemented)
     // smart_router: Option<Arc<SmartRouter>>,
@@ -212,6 +236,18 @@ pub struct AppState {
     // persisted event log replayed cleanly, was quarantined, or was disabled.
     // Read by `GET /api/durability/status`.
     durability_status: durability::SharedDurabilityStatus,
+
+    /// The document id every new event is durably persisted under and the
+    /// one `durability::boot_replay` (re)loads on the next call — i.e. the
+    /// live server's ONE open document ("Roshera has no New", task doc-1).
+    /// Starts at `durability::DURABILITY_SESSION_ID` (the pre-documents
+    /// default) and is flipped by `documents::activate`, which also resets
+    /// every other piece of in-memory document state before calling
+    /// `boot_replay` again against the new value. The SAME `Arc` is shared
+    /// with the `DatabaseEventSink` the recorder writes through, so a
+    /// switch retargets both "what's live" and "where new events land" in
+    /// one write. See `documents.rs`.
+    pub active_document: Arc<RwLock<String>>,
 
     // Additional fields for handlers
     export_engine: Arc<export_engine::ExportEngine>,
@@ -6468,7 +6504,7 @@ async fn process_enhanced_ai_command(
     // Refuse loudly if no LLM key was configured at startup. Returning
     // a structured 503 (vs. silently invoking a mock) makes the
     // misconfiguration visible to operators and to agents.
-    if !state.ai_configured {
+    if !state.ai_configured.load(Ordering::SeqCst) {
         return Err(crate::error_catalog::ApiError::ai_not_configured().into_response());
     }
 
@@ -6625,7 +6661,7 @@ async fn process_ai_command_stream(
     // single terminal `event: error` frame and close. Agents already
     // pattern-match on `error_code`; the wire shape matches what
     // POST /api/ai/command would have returned as a 503.
-    if !state.ai_configured {
+    if !state.ai_configured.load(Ordering::SeqCst) {
         let payload = serde_json::to_value(&crate::error_catalog::ApiError::ai_not_configured())
             .unwrap_or_else(|_| {
                 serde_json::json!({
@@ -7110,7 +7146,7 @@ async fn root() -> axum::response::Html<String> {
 // Global metrics tracking
 use axum::response::sse::Event as SseEvent;
 use futures::stream::Stream;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize; // `Ordering` already imported at the top of this file
 use tokio::sync::broadcast;
 
 static TOTAL_REQUESTS: AtomicUsize = AtomicUsize::new(0);
@@ -7658,8 +7694,9 @@ async fn stream_logs() -> Sse<impl Stream<Item = Result<SseEvent, std::convert::
 async fn durability_status_endpoint(State(state): State<AppState>) -> Json<serde_json::Value> {
     let status = state.durability_status.read().await.clone();
     let quarantined = matches!(status, durability::DurabilityStatus::Quarantined { .. });
+    let document_id = state.active_document.read().await.clone();
     Json(serde_json::json!({
-        "session_id": durability::DURABILITY_SESSION_ID,
+        "session_id": document_id,
         "durability_enabled": durability::durability_enabled(),
         "quarantined": quarantined,
         "status": status,
@@ -7738,15 +7775,17 @@ async fn enhanced_health(State(state): State<AppState>) -> Json<serde_json::Valu
 /// agents can branch their behaviour off this single GET without
 /// having to first issue a failing POST.
 async fn get_ai_status(State(state): State<AppState>) -> Json<serde_json::Value> {
-    if !state.ai_configured {
+    if !state.ai_configured.load(Ordering::SeqCst) {
         return Json(serde_json::json!({
             "status": "not_configured",
             "error_code": "ai_not_configured",
             "providers": {
                 "llm": "unavailable",
             },
-            "hint": "Set ANTHROPIC_API_KEY (or another supported provider key) \
-                     in the server environment and restart.",
+            "hint": "Connect a provider from the UI (Settings → AI Provider) \
+                     or via PUT /api/ai/provider — no restart required. \
+                     Alternatively set ANTHROPIC_API_KEY in the server \
+                     environment before start.",
             "missing_env": ["ANTHROPIC_API_KEY"],
         }));
     }
@@ -8176,6 +8215,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_env_filter(filter)
         .init();
 
+    // Boot-time construction of the provider-config manager. Moved ahead
+    // of the goose lockdown below (it used to sit down near the AI
+    // component wiring) because the lockdown now needs to know what the
+    // user last persisted BEFORE it pins goose's provider — see the note
+    // there. This ordering is still the one that matters most:
+    // `AiProviderManager::boot` MUST run before anything reads/scrubs
+    // ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN, because it captures the
+    // env-var-presence snapshot the resolution chain's shadow reporting
+    // depends on (see `ai_provider_config.rs`) — `AiProviderManager::boot`
+    // itself never touches goose's `Config::global()` (it only reads a
+    // JSON file and two env vars), so moving it earlier does not disturb
+    // the goose-lockdown ordering invariant below.
+    let ai_provider_manager = Arc::new(ai_provider_config::AiProviderManager::boot());
+
     // Goose ACP hard lockdown. MUST stay ahead of anything that could
     // touch a goose code path: goose's `Config::global()` is a
     // process-lifetime `OnceCell` that captures `GOOSE_PATH_ROOT` on
@@ -8184,7 +8237,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // boot — an api-server that cannot prove goose's built-in tool
     // surface is disabled must not serve `/acp` (and `build_router`
     // will not mount it: see `goose_acp::acp_router`).
-    let goose_root = goose_acp::initialize()?;
+    //
+    // The provider pin honors whatever the user last persisted through
+    // the connection dialog (`ai_provider_config::boot_provider_pin_for`)
+    // instead of unconditionally overwriting it — a Claude Max/Pro
+    // subscription connected via `subscription_cli` mode used to get
+    // silently clobbered back to the hardcoded `anthropic` default on
+    // every restart (no API key there, so every turn failed with
+    // "Provider not set"); now a restart re-pins `claude-code` right
+    // back. Nothing else about the lockdown's fail-closed ordering
+    // changes — this only decides WHICH provider gets pinned.
+    let provider_pin =
+        ai_provider_config::boot_provider_pin_for(ai_provider_manager.stored().await.as_ref());
+    let goose_root = goose_acp::initialize(&provider_pin)?;
     tracing::info!(
         target: "goose_acp",
         root = %goose_root.display(),
@@ -8197,6 +8262,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             geometry_engine::primitives::topology_builder::EstimatedComplexity::Medium,
         ),
     ));
+
+    // The one open document. Starts at the pre-documents default so a fresh
+    // boot serves exactly what it always served (task doc-1, "Roshera has
+    // no New"); `documents::activate` flips this — and only this Arc, no
+    // rebuild — when the caller switches documents.
+    let active_document = Arc::new(RwLock::new(durability::DURABILITY_SESSION_ID.to_string()));
 
     // Initialize database connection
     let database_url = std::env::var("DATABASE_URL")
@@ -8262,11 +8333,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // with `503 ai_not_configured`. The mock provider stays available
     // in the codebase for in-process tests that construct their own
     // `ProviderManager` directly.
+    // `ai_provider_manager` was already constructed above, ahead of the
+    // goose lockdown — see that call site's comment for why the ordering
+    // moved.
     let mut provider_manager = ProviderManager::new();
-    let ai_configured = if let Ok(anthropic_key) = std::env::var("ANTHROPIC_API_KEY") {
+    // Resolution priority mirrors `GET /api/ai/provider`'s chain:
+    // a persisted runtime config (saved via a previous PUT) outranks
+    // the ANTHROPIC_API_KEY env var, so a key saved through the dialog
+    // survives a restart and keeps winning over a stale env var.
+    let persisted_api_key = ai_provider_manager
+        .stored()
+        .await
+        .filter(|s| s.mode == "api_key")
+        .and_then(|s| s.api_key)
+        .filter(|k| !k.is_empty());
+
+    let ai_configured = if let Some(key) = persisted_api_key {
+        tracing::info!(
+            "Persisted AI provider config found (state/ai-provider.json); \
+             registering Claude provider from the saved runtime key"
+        );
+        let claude_config = ai_integration::providers::claude::ClaudeConfig {
+            credential: Some(ai_integration::providers::claude::ClaudeCredential::ApiKey(
+                key,
+            )),
+            ..Default::default()
+        };
+        provider_manager.register_llm(
+            "claude".to_string(),
+            Box::new(ai_integration::providers::ClaudeProvider::with_config(
+                claude_config,
+            )),
+        );
+        provider_manager.set_active(String::new(), "claude".to_string(), None);
+        true
+    } else if let Ok(anthropic_key) = std::env::var("ANTHROPIC_API_KEY") {
         tracing::info!("Anthropic API key detected, registering Claude provider");
         let claude_config = ai_integration::providers::claude::ClaudeConfig {
-            api_key: Some(anthropic_key),
+            credential: Some(ai_integration::providers::claude::ClaudeCredential::ApiKey(
+                anthropic_key,
+            )),
             ..Default::default()
         };
         provider_manager.register_llm(
@@ -8279,12 +8385,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         true
     } else {
         tracing::warn!(
-            "No LLM API key configured (ANTHROPIC_API_KEY unset). \
-             AI routes will return 503 ai_not_configured until a key is \
-             set and the server is restarted."
+            "No LLM API key configured (ANTHROPIC_API_KEY unset, no \
+             persisted state/ai-provider.json). AI routes will return \
+             503 ai_not_configured until a provider is connected — via \
+             PUT /api/ai/provider (no restart needed) or by setting \
+             ANTHROPIC_API_KEY and restarting."
         );
         false
     };
+    let ai_configured = Arc::new(AtomicBool::new(ai_configured));
 
     // Bind the AI command executor to the same kernel `model` that REST and
     // WebSocket handlers mutate. Previously each `CommandExecutor::new()`
@@ -8324,8 +8433,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // off the kernel's synchronous record path. `ROSHERA_DURABILITY=off`
     // disables it and yields the pre-durability in-memory-only recorder.
     let timeline_recorder = if durability::durability_enabled() {
-        let sink: Arc<dyn timeline_engine::EventSink> =
-            Arc::new(durability::DatabaseEventSink::new(database.clone()));
+        let sink: Arc<dyn timeline_engine::EventSink> = Arc::new(
+            durability::DatabaseEventSink::new(database.clone(), active_document.clone()),
+        );
         Arc::new(timeline_engine::TimelineRecorder::new_with_sink(
             Arc::clone(&timeline),
             timeline_engine::Author::System,
@@ -8383,6 +8493,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         command_executor,
         provider_manager: provider_manager_arc.clone(),
         ai_configured,
+        ai_provider_manager,
         // smart_router: not yet implemented,
         session_manager,
         permission_manager,
@@ -8393,6 +8504,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         hierarchy_manager,
         database,
         durability_status: Arc::new(RwLock::new(durability::DurabilityStatus::Empty)),
+        active_document: active_document.clone(),
         export_engine,
         request_metrics: Arc::new(DashMap::new()),
         command_metrics: Arc::new(Mutex::new(metrics::CommandMetrics::default())),
@@ -8478,6 +8590,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tracing::info!(?other, "durability: boot replay complete");
         }
     }
+
+    // Documents (task doc-1, "Roshera has no New"): register the default
+    // document if this is a pre-documents database — a self-heal so `GET
+    // /api/documents` lists the events just replayed above instead of
+    // reporting an empty catalog for a non-empty document.
+    documents::ensure_default_document_registered(&state).await;
 
     // Auth Slice 3 (task #42): restore persisted API keys. Before this,
     // provisioned keys lived only in the in-memory DashMap and died on
@@ -8597,6 +8715,53 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route("/api/ai/status", get(get_ai_status))
         .route("/api/ai/command", post(process_enhanced_ai_command))
         .route("/api/ai/command/stream", post(process_ai_command_stream))
+        // AI provider connection dialog. Gated end-to-end (including the
+        // GET) on `Permission::ModifySettings` — the response surfaces
+        // CLI sign-in state and the resolution/shadow chain, which is
+        // configuration surface a Viewer-role caller has no business
+        // probing even though none of it is a raw secret.
+        .route(
+            "/api/ai/provider",
+            get(handlers::ai_provider::get_provider)
+                .put(handlers::ai_provider::put_provider)
+                .delete(handlers::ai_provider::delete_provider)
+                .route_layer(axum::middleware::from_fn(
+                    auth_middleware::require_modify_settings,
+                )),
+        )
+        .route(
+            "/api/ai/provider/test",
+            post(handlers::ai_provider::test_provider).route_layer(axum::middleware::from_fn(
+                auth_middleware::require_modify_settings,
+            )),
+        )
+        // Live model discovery — `GET {base_url}/models` against the
+        // real vendor instead of trusting a hardcoded default (see
+        // `ai_provider_config`'s "Live model discovery" section doc for
+        // the sarvam-30b drift this closes). Same permission gate as
+        // `/test`: it accepts a raw API key in the body.
+        .route(
+            "/api/ai/provider/models",
+            post(handlers::ai_provider::discover_provider_models).route_layer(
+                axum::middleware::from_fn(auth_middleware::require_modify_settings),
+            ),
+        )
+        // ACP session config — the working directory `session/new` will
+        // use, so `roshera-app`'s `acp-client.ts` can ask the backend
+        // instead of independently hardcoding a copy (see
+        // `goose_acp::agent_workspace_dir`'s doc for the defect this
+        // closes). No extra permission gate beyond the standard
+        // `Authorization` credential every non-exempt route already
+        // needs — the path itself carries no secret.
+        .route("/api/acp/config", get(goose_acp::get_acp_config))
+        // Observed agent activity for the caller's ACP sessions — what
+        // the agent is doing NOW, reconstructed from this server's own
+        // inbound MCP-driven requests (the claude-code ACP stream
+        // carries zero tool_call frames; see `agent_activity`'s module
+        // doc for the honesty contract and the polled-delivery
+        // rationale). Read-only snapshot; classified into the Poll
+        // rate bucket (`auth_middleware::POLL_PREFIXES`).
+        .route("/api/acp/activity", get(agent_activity::get_acp_activity))
         // Metrics endpoint
         .route("/api/metrics", get(metrics::get_metrics))
         // Geometry endpoints
@@ -9130,6 +9295,27 @@ pub(crate) fn build_router(state: AppState) -> Router {
         // Frame readback (exteroception) — server-rendered PNG of the
         // live scene. Multimodal LLMs consume the image directly.
         .route("/api/frame", get(frame::get_frame))
+        // Documents (task doc-1, "Roshera has no New") — the top-level
+        // scope above branches. POST creates an empty, unopened document;
+        // GET lists every registered document (flagged with which one is
+        // live); POST .../open makes one live, resetting the in-memory
+        // model/timeline/blackboard and replaying that document's own
+        // persisted log. No extra permission layer, matching `/api/branches`
+        // below — authenticated is sufficient.
+        .route(
+            "/api/documents",
+            get(documents::list_documents).post(documents::create_document),
+        )
+        .route("/api/documents/{id}/open", post(documents::open_document))
+        // PATCH renames; DELETE is the only destructive route in the API —
+        // it refuses the active / last-remaining / default document (see
+        // documents.rs) and is transactional across the registry row and
+        // every scoped timeline/branch row. Same "authenticated is
+        // sufficient" gate as the routes above.
+        .route(
+            "/api/documents/{id}",
+            axum::routing::patch(documents::rename_document).delete(documents::delete_document),
+        )
         // Sandbox branches per agent. Each agent claims a branch via
         // POST /api/branches; mutations land on that branch in the
         // event log; a human approves via POST /api/branches/{id}/merge
@@ -9409,6 +9595,13 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route("/api/auth/register", post(register))
         .route("/api/auth/logout", post(logout))
         .route("/api/auth/refresh", post(refresh_token))
+        // Password rotation. Deliberately NOT in the auth-middleware
+        // open-path list: unlike login/register/refresh, which exist to
+        // ISSUE a credential to someone who has none, this one CHANGES a
+        // credential and so must only ever run for an already-identified
+        // caller. Left open it would be an unauthenticated account
+        // takeover for any known username.
+        .route("/api/auth/password", post(change_password))
         // API-key lifecycle (Slice 5). Deliberately NOT in the
         // auth-middleware open-path list: every route here requires a
         // validated credential, and provisioning is self-service only.
@@ -9598,19 +9791,31 @@ pub(crate) fn build_router(state: AppState) -> Router {
         posture: state.auth_posture,
     };
 
-    // The rate limiter (`AuthManager::check_rate_limit`, 100 req/min per
-    // client) was built but never layered. Wire it here, keyed on the
-    // authenticated identity when present and the peer IP
+    // The rate limiter (`auth_middleware::rate_limit_middleware`) is
+    // keyed on the authenticated identity when present and the peer IP
     // (`x-forwarded-for`) otherwise — so it also throttles the public
     // credential-issuing routes (login/register) by source, which is the
-    // brute-force protection that matters most for them. It shares
-    // `AuthLayerState` with `auth_middleware` because it needs the same
-    // resolved posture: under `AuthPosture::InsecureDevBypass` every
+    // brute-force protection that matters most for them. It runs one
+    // independent budget per `RateLimitClass` (poll / agent / mutation /
+    // provider-config / provider-test — see that enum's doc for the
+    // numbers and the resulting worst-case total) so the viewport's
+    // continuous poll traffic can no longer exhaust the budget a
+    // low-frequency action like opening the AI-provider dialog needs. It
+    // shares `AuthLayerState` with `auth_middleware` because it needs the
+    // same resolved posture: under `AuthPosture::InsecureDevBypass` every
     // request collapses to one sentinel identity, so a per-client limit
     // becomes a single shared bucket that a polling dev frontend alone
     // exhausts — the limiter bypasses in that posture (see
     // `rate_limit_middleware`). In `AuthPosture::Required` it stays on.
     let rate_limit_layer_state = auth_layer_state.clone();
+
+    // Cloned out before `state` moves into `.with_state` below —
+    // `goose_acp::acp_router`'s own inner middleware needs it to read
+    // the user's persisted model selection (`PUT /api/ai/provider`'s
+    // `model` field) at `session/new`/`session/load` time, same reason
+    // `auth_layer_state.auth_manager` is captured the same way just
+    // above.
+    let ai_provider_manager_for_acp = state.ai_provider_manager.clone();
 
     // Add state and the middleware stack. axum applies layers from
     // innermost outward, so on the request path CORS runs first
@@ -9637,14 +9842,45 @@ pub(crate) fn build_router(state: AppState) -> Router {
     // `acp_router()` is `None` unless `goose_acp::initialize()` ran and
     // passed — the surface structurally cannot be mounted un-locked-down
     // (test-built routers never call `initialize`, so they carry no
-    // `/acp`). The `session/update_provider` bypass documented on
-    // `goose_acp::acp_router` remains OPEN behind that auth gate.
-    let app = match goose_acp::acp_router() {
-        Some(acp) => app.merge(acp),
+    // `/acp`).
+    //
+    // `acp_method_gate` wraps the goose router BEFORE the merge, so it
+    // covers `/acp` and nothing else: a default-deny method allowlist
+    // over the JSON-RPC body, plus body-level `_meta` inspection on
+    // `session/new`/`session/load` (see `acp_gate`'s module doc) and the
+    // `_goose/*` config RPCs that could otherwise re-enable the
+    // extensions `initialize()` disabled. Layering here rather than
+    // below `.with_state` keeps the gate inside Roshera's auth stack: a
+    // caller must authenticate first, then clear the allowlist.
+    //
+    // `acp_router` needs the process `AuthManager` to mint the per-
+    // session agent key its own inner middleware injects alongside
+    // Roshera's MCP server (slice 2) — `auth_layer_state.auth_manager`
+    // is the same `Arc<AuthManager>` the auth middleware layer below is
+    // about to be built from, cloned here (still owned, not yet moved:
+    // that happens at the final `.layer(from_fn_with_state(auth_layer_state, ...))`
+    // below) rather than threading a second `Arc<SessionManager>` through
+    // for a call site that only ever needs the auth manager.
+    let app = match goose_acp::acp_router(
+        auth_layer_state.auth_manager.clone(),
+        ai_provider_manager_for_acp,
+    ) {
+        Some(acp) => app.merge(acp.layer(axum::middleware::from_fn(acp_gate::acp_method_gate))),
         None => app,
     };
 
     app.layer(axum::middleware::from_fn(agent_author_layer))
+        // Observed-agent-activity recorder (`agent_activity`): for any
+        // request whose validated credential is a
+        // `PrincipalKind::Agent` API key, records what/when/outcome
+        // against the ACP session that key was minted for — after the
+        // response exists, never speculatively. Sits inside the auth
+        // layer (it needs the extensions auth inserts) alongside
+        // `agent_author_layer`, which solves the same attribution
+        // problem for the timeline.
+        .layer(axum::middleware::from_fn(
+            agent_activity::record_agent_operations,
+        ))
         .layer(axum::middleware::from_fn_with_state(
             idempotency_store,
             idempotency::idempotency_layer,

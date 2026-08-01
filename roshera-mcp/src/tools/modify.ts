@@ -20,6 +20,22 @@ import {
   unit3,
 } from "../core.js";
 
+/**
+ * Shared schema field for every op that stacks work onto an existing solid.
+ * The unsound-base gate (gates.ts) refuses such an op when the base's live
+ * kernel verdict is sound==false — UNLESS the caller passes this flag, which
+ * exists for deliberate repair flows (a boolean used to heal an open shell,
+ * a rebuild from a known-good state). The flag is read by the dispatch gate
+ * only; it is never forwarded to the backend.
+ */
+export const ACK_UNSOUND = z
+  .boolean()
+  .optional()
+  .describe(
+    "repair-flow override: proceed although the base solid's live kernel " +
+      "verdict is unsound (otherwise refused)",
+  );
+
 export function registerModifyTools(server: ToolHost) {
   server.tool(
     "delete_part",
@@ -64,6 +80,7 @@ export function registerModifyTools(server: ToolHost) {
           "cap face ids to open (from select_face or a render 'ids' legend); " +
             "[] = fully closed void (rarely the intent)",
         ),
+      acknowledge_unsound: ACK_UNSOUND,
     },
     async ({ object, thickness, faces_to_remove }) => {
       try {
@@ -102,6 +119,7 @@ export function registerModifyTools(server: ToolHost) {
         .describe(
           "edges to round (from select_edge or a render 'ids' legend); omit for ALL edges",
         ),
+      acknowledge_unsound: ACK_UNSOUND,
     },
     async ({ part_id, radius, edge_ids }) => {
       try {
@@ -150,6 +168,7 @@ export function registerModifyTools(server: ToolHost) {
         .describe(
           "edges to bevel (from select_edge or a render 'ids' legend); omit for ALL edges",
         ),
+      acknowledge_unsound: ACK_UNSOUND,
     },
     async ({ part_id, distance, edge_ids }) => {
       try {
@@ -190,6 +209,7 @@ export function registerModifyTools(server: ToolHost) {
         .describe("difference cuts object_b out of object_a"),
       object_a: z.string().uuid().describe("object_uuid of the base solid"),
       object_b: z.string().uuid().describe("object_uuid of the tool solid"),
+      acknowledge_unsound: ACK_UNSOUND,
     },
     async ({ op, object_a, object_b }) => {
       try {
@@ -228,6 +248,7 @@ export function registerModifyTools(server: ToolHost) {
         .min(1)
         .max(64)
         .describe("object_uuids applied in order; all consumed"),
+      acknowledge_unsound: ACK_UNSOUND,
     },
     async ({ op, base, tools }) => {
       try {
@@ -299,6 +320,7 @@ export function registerModifyTools(server: ToolHost) {
       depth: z.number().positive().describe("bore length (mm); overshoot the part"),
       z_offset: z.number().default(-1).describe("bore start along normal (mm); −1 = 1mm under plane"),
       start_angle_deg: z.number().default(0).describe("first hole angle about the ring (degrees)"),
+      acknowledge_unsound: ACK_UNSOUND,
     },
     async ({
       object,
@@ -454,6 +476,7 @@ export function registerModifyTools(server: ToolHost) {
         })
         .optional()
         .describe("optional rotation; applied before translation"),
+      acknowledge_unsound: ACK_UNSOUND,
     },
     async ({ object, translation, rotation }) => {
       try {

@@ -123,6 +123,19 @@ export async function api(
       };
     }
   }
+  // IMAGE-FRESHNESS INVALIDATION: any mutating call invalidates the whole-scene
+  // cache (scene_view); one that reports a specific part id also invalidates
+  // that part's own cache (render_part/section_view). See the "Image freshness"
+  // section above core.ts for why this hook lives here (the same mutating-call
+  // branch the embedded-perception stash already uses).
+  if (method !== "GET") {
+    recordGlobalMutation();
+    const mutatedId =
+      parsed && typeof parsed === "object"
+        ? ((parsed as any).solid_id ?? (parsed as any).id)
+        : undefined;
+    if (typeof mutatedId === "number") recordPartMutation(mutatedId);
+  }
   return parsed;
 }
 
@@ -666,6 +679,118 @@ export async function okp(data: Record<string, unknown>, partId: number | null) 
   const image = await ambientRender(partId);
   if (image) base.content.push(image);
   return base;
+}
+
+// ─── Image freshness / turn-count expiry (2026-08-01) ──────────────────
+//
+// WHY THIS EXISTS: the live provider (goose's `claude-code`) spawns one
+// persistent `claude` CLI per session and sets `manages_own_context=true` —
+// the CLI keeps its OWN internal conversation state across turns; goose never
+// resends it (confirmed in providers/claude_code.rs: `last_user_content_blocks`
+// forwards only the latest user turn, and even there it strips images out of
+// tool-response content, extracting Text blocks only). The CLI itself talks to
+// this MCP server directly (`--mcp-config`/`--strict-mcp-config`), so every
+// tool result — including every image — lands straight in the CLI's own
+// history. The CLI has no exposed retention/compaction flag (`claude --help`
+// audited clean). Once an image is sent, THIS PROCESS CANNOT UN-SEND IT — the
+// only lever available anywhere in the stack is deciding whether the NEXT call
+// attaches pixels at all. That is what this section does.
+//
+// POLICY: a view's pixels count as "the live image" for IMAGE_TTL_TURNS turns
+// (a turn = one tool-call dispatch, ticked by ToolTable for every call on
+// every path — direct, invoke(), cad_program()) UNLESS a mutation that could
+// change those pixels happens first, which invalidates immediately regardless
+// of the TTL. Either trigger (mutation or TTL) causes the NEXT call for that
+// view to mint a REAL fresh image — expiry only ever produces MORE pixels,
+// never fewer, so a genuine look is never blocked. Within the window, with no
+// mutation, a repeat call is a no-op for pixels (an identical image is already
+// sitting in the CLI's context) but the TEXT VERDICT is always recomputed
+// fresh from the backend and always included — only pixels are ever withheld,
+// never the verdict — and the response says so explicitly (never silence),
+// naming the turn the standing image was taken and when it refreshes.
+//
+// ONE PLACE the number lives: ROSHERA_MCP_IMAGE_TTL_TURNS env var, default 3.
+export const IMAGE_TTL_TURNS = (() => {
+  const raw = process.env.ROSHERA_MCP_IMAGE_TTL_TURNS;
+  const n = raw !== undefined ? Number(raw) : NaN;
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 3;
+})();
+
+let turnCounter = 0;
+
+/** Advance the session's turn counter by one tool-call dispatch. Called once
+ *  per handler invocation by ToolTable (registry.ts) — the single choke point
+ *  every call path (direct mount, invoke(), cad_program()) runs through. */
+export function nextTurn(): number {
+  turnCounter += 1;
+  return turnCounter;
+}
+
+/** Turn a given kernel part id was last touched by a mutating call. */
+const mutatedAtByPart = new Map<number, number>();
+/** Turn ANY mutating call last touched ANY part — scene_view's cache key,
+ *  since a composite of the whole scene has no single part to watch. */
+let lastGlobalMutationTurn = 0;
+
+/** Record that `partId` was just mutated — invalidates its cached image. */
+export function recordPartMutation(partId: number): void {
+  mutatedAtByPart.set(partId, turnCounter);
+}
+/** Record that some mutating call happened — invalidates scene_view's cache. */
+export function recordGlobalMutation(): void {
+  lastGlobalMutationTurn = turnCounter;
+}
+/** The invalidation watermark for a specific part's cached image. */
+export function lastPartMutationTurn(partId: number): number {
+  return mutatedAtByPart.get(partId) ?? 0;
+}
+/** The invalidation watermark for the whole-scene cached image. */
+export function lastGlobalMutationTurnValue(): number {
+  return lastGlobalMutationTurn;
+}
+
+interface ImageCacheEntry {
+  /** Turn real pixels were last sent for this key. */
+  turn: number;
+  /** The mutation watermark in force at send time. */
+  watermark: number;
+  /** Short description of what was shown, echoed in the expiry note. */
+  note: string;
+}
+const imageCache = new Map<string, ImageCacheEntry>();
+
+/**
+ * Decide whether a call to an image-returning tool should attach real pixels.
+ * `key` names the logical view (tool+part+params); `mutationWatermark` is the
+ * CURRENT invalidation watermark for that view's scope (a specific part via
+ * `lastPartMutationTurn`, or the whole scene via `lastGlobalMutationTurnValue`).
+ */
+export function imageFreshness(
+  key: string,
+  mutationWatermark: number,
+): { send: true } | { send: false; note: string } {
+  const prev = imageCache.get(key);
+  if (!prev) return { send: true };
+  const mutatedSince = mutationWatermark > prev.watermark;
+  const ttlElapsed = turnCounter - prev.turn >= IMAGE_TTL_TURNS;
+  if (mutatedSince || ttlElapsed) return { send: true };
+  return {
+    send: false,
+    note:
+      `a view was taken at turn ${prev.turn} (${prev.note}) and nothing has ` +
+      `changed since — pixels withheld, not resent (still identical, already ` +
+      `in context); refreshes automatically on the next mutation or by turn ` +
+      `${prev.turn + IMAGE_TTL_TURNS}. Verdict below is freshly computed, not cached.`,
+  };
+}
+
+/** Record that real pixels were just sent for `key`. */
+export function recordImageSent(
+  key: string,
+  mutationWatermark: number,
+  note: string,
+): void {
+  imageCache.set(key, { turn: turnCounter, watermark: mutationWatermark, note });
 }
 
 // ─── Geometry / plane helpers ──────────────────────────────────────────

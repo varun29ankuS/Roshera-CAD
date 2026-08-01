@@ -30,13 +30,27 @@ import { cn } from '@/lib/utils'
  *
  * Nothing on this page writes to the Blackboard store's notebook — the
  * embedded live panel shows the real document notebook untouched; fixture
- * lines are rendered locally.
+ * lines are rendered locally. The one exception: the "Live repro" buttons
+ * (below the attention-following panel) are opt-in, one click, clearly
+ * labeled, and DO append real lines to that same live notebook — two
+ * defects (build-line spam collapsing into a step strip, a second
+ * `roshera:choices` card staying answerable while another's turn runs) only
+ * exist in the actual grouping/queueing logic (`groupBlackboardLines`,
+ * `ai-client.ts`'s `turnQueue`), which operates on real store state and
+ * cannot be exercised by the static, locally-rendered gallery below.
  */
 
 const FENCE = '```'
 
 function card(kind: string, payload: unknown): string {
   return `${FENCE}roshera:${kind}\n${JSON.stringify(payload, null, 2)}\n${FENCE}`
+}
+
+/** `roshera:choices` is hand-authored YAML (`.goosehints`), not a JSON echo
+ *  of a wire type — see `lib/blackboard-cards.ts`. Written literally here so
+ *  this fixture is the exact shape an agent emits, not a JSON stand-in. */
+function yamlCard(kind: string, body: string): string {
+  return `${FENCE}roshera:${kind}\n${body}\n${FENCE}`
 }
 
 // ── Fixture payloads (shapes verified; numbers illustrative) ──────────
@@ -175,6 +189,93 @@ const DFM_PASS = card('dfm', {
   unit: '°',
 })
 
+const CHOICES_OPEN = yamlCard(
+  'choices',
+  [
+    'question: Which clearance class for the M8 holes?',
+    'options:',
+    '  - value: close',
+    '    label: Close (H12) - 9.0 mm',
+    '    detail: tighter location, less assembly slop',
+    '  - value: medium',
+    '    label: Medium (H13) - 10.0 mm',
+    '    detail: the usual default for bolted joints',
+    '  - value: free',
+    '    label: Free (H14) - 10.5 mm',
+    '    detail: easiest assembly, most lateral play',
+  ].join('\n'),
+)
+
+const CHOICES_ANSWERED = yamlCard(
+  'choices',
+  [
+    'question: Which clearance class for the M8 holes?',
+    'options:',
+    '  - value: close',
+    '    label: Close (H12) - 9.0 mm',
+    '    detail: tighter location, less assembly slop',
+    '  - value: medium',
+    '    label: Medium (H13) - 10.0 mm',
+    '    detail: the usual default for bolted joints',
+    '  - value: free',
+    '    label: Free (H14) - 10.5 mm',
+    '    detail: easiest assembly, most lateral play',
+    'selected: medium',
+  ].join('\n'),
+)
+
+const CHOICES_MALFORMED = yamlCard(
+  'choices',
+  ['question: Which clearance class for the M8 holes?', 'options: []'].join('\n'),
+)
+
+/** Verbatim from the defect report: a closed three-way question the agent
+ *  wrote as "Option A: / Option B: / Option C:" prose instead of the
+ *  `roshera:choices` fence `.goosehints` mandates. Exercises
+ *  `detectEnumeratedChoices` (`lib/blackboard-cards.ts`) through the real
+ *  `BlackboardLine` pipeline via the live-repro seed button below — the
+ *  static "Typed cards" gallery renders fences directly and has no notion
+ *  of line authorship, so it cannot exercise this detector. */
+const DETECTED_CHOICES_AGENT_TEXT = [
+  'Option A: Monolithic Ceramix bell with structural support ribs/gussets and integral attachment flange (simpler, easier manufacturing, but less efficient for heat transfer)',
+  '',
+  'Option B: Thin-wall Ceramix bell with internal collet-nut threaded attachment and external pressure shell (more complex assembly, better if you plan future regenerative cooling)',
+  '',
+  'Option C: Modular: throat insert (consumable) + Ceramix bell extension (allows testing different bell contours without remaking the throat)',
+].join('\n')
+
+/** Negative — same "Option A:" text, but authored by the USER. Must render
+ *  no buttons: detection is gated to agent authorship only. */
+const DETECTED_CHOICES_NEGATIVE_USER =
+  'Option A: just repeating what you said back at you, ignore this'
+
+/** Negative — an agent line with only ONE labelled option. Must render no
+ *  buttons: detection requires at least two matches to count as a set. */
+const DETECTED_CHOICES_NEGATIVE_SINGLE =
+  'Option A: only one option here, no B or C follows, so this must not render buttons'
+
+/** Negative — an agent line that already carries a `roshera:choices`
+ *  fence alongside "Option A:/B:" prose. Must render no DETECTED buttons
+ *  (the fence path already handles it and must not be double-rendered) —
+ *  the fenced card itself still renders normally. */
+const DETECTED_CHOICES_NEGATIVE_FENCED = [
+  'Option A: Monolithic bell, simpler to manufacture.',
+  '',
+  'Option B: Thin-wall bell, better for future regenerative cooling.',
+  '',
+  yamlCard(
+    'choices',
+    [
+      'question: Which bell design?',
+      'options:',
+      '  - value: monolithic',
+      '    label: Option A — Monolithic',
+      '  - value: thin-wall',
+      '    label: Option B — Thin-wall',
+    ].join('\n'),
+  ),
+].join('\n')
+
 const REFUSAL = card('refusal', {
   reason:
     'face 17 is a freeform blend — datum designation requires a planar face (datum plane) or a cylindrical face (datum axis)',
@@ -258,6 +359,26 @@ const SOUNDNESS_FULL = card('soundness', {
   volume: 12406.9,
 })
 
+const SOUNDNESS_UNSOUND = card('soundness', {
+  part: 'bore fitting',
+  sound: false,
+  brep_valid: true,
+  watertight: false,
+  manifold: true,
+  self_intersection_free: true,
+  construction_consistent: true,
+  labels_consistent: true,
+  tessellation_clean: true,
+  mesh_quality_clean: true,
+  eyes_consistent: false,
+  euler_characteristic: 1,
+  open_edges: 6,
+  nonmanifold_edges: 0,
+  face_count: 14,
+  volume: 8021.4,
+  errors: ['6 open edges on face 9 — boundary loop does not close after the last fillet'],
+})
+
 const SOUNDNESS_PARTIAL = card('soundness', {
   part: 'flanged nozzle',
   sound: null,
@@ -322,6 +443,21 @@ const CARD_FIXTURES: Array<{ title: string; note: string; source: string }> = [
     source: DFM_PASS,
   },
   {
+    title: 'Choices — open question',
+    note: 'A `roshera:choices` fence (YAML, per .goosehints) renders as clickable option buttons — no retyping. In the static gallery below the buttons are inert (no owning line to answer); in the live panel above, clicking sends the value as the next turn.',
+    source: CHOICES_OPEN,
+  },
+  {
+    title: 'Choices — answered',
+    note: '`selected` is written by the UI once a button is clicked, never by the agent — the record of which option was chosen, with every other option disabled, so the board never looks like an open question after it has been answered.',
+    source: CHOICES_ANSWERED,
+  },
+  {
+    title: 'Choices — malformed (empty option list)',
+    note: 'Schema-invalid input (here: zero options, which the schema requires at least one of) renders as raw text with the validation error, exactly like every other typed card — never a guessed or half-built card.',
+    source: CHOICES_MALFORMED,
+  },
+  {
     title: 'Typed refusal',
     note: 'A result, not an error: verbatim reason, calm styling, next actions.',
     source: REFUSAL,
@@ -340,6 +476,11 @@ const CARD_FIXTURES: Array<{ title: string; note: string; source: string }> = [
     title: 'Soundness — full certificate',
     note: 'Every invariant proven; χ = 2, no open edges.',
     source: SOUNDNESS_FULL,
+  },
+  {
+    title: 'Soundness — unsound (proven violations)',
+    note: 'watertight and dual-eye consistency FAIL — the red cross, not just the green tick and the dashed not-run.',
+    source: SOUNDNESS_UNSOUND,
   },
   {
     title: 'Soundness — partial (tri-state)',
@@ -528,6 +669,7 @@ export function BlackboardFixtures({ onExit }: BlackboardFixturesProps) {
   const agentAttention = useBlackboardStore((s) => s.agentAttention)
   const setAgentAttention = useBlackboardStore((s) => s.setAgentAttention)
   const setPanel = useBlackboardStore((s) => s.setPanel)
+  const addLine = useBlackboardStore((s) => s.addLine)
   const [replayKey, setReplayKey] = useState(0)
 
   // The embedded panel must be open to demonstrate the attention split.
@@ -537,6 +679,106 @@ export function BlackboardFixtures({ onExit }: BlackboardFixturesProps) {
   }, [setPanel, setAgentAttention])
 
   const attentions: AgentAttention[] = ['idle', 'writing', 'geometry']
+
+  // ── Live repro: Defect 1 — nine "Created …" lines, verbatim from Varun's
+  // DN50 PN16 flange build (a body + 4 bores + 4 sequential differences).
+  // Same text `lib/ws-bridge.ts`'s `dimensionEchoMessage` produces — this IS
+  // the shape that spammed the board, appended as real 'system' lines so
+  // the real `groupBlackboardLines`/`BuildStepStrip` path in the panel
+  // above runs, not a lookalike.
+  const seedBuildSteps = useCallback(() => {
+    const echoes = [
+      'Created **DN50 PN16 flange** — 165 × 165 × 18 mm · 792 tris',
+      'Created **bore 1/4** — 18 × 18 × 20 mm · 792 tris',
+      'Created **bore 2/4** — 18 × 18 × 20 mm · 792 tris',
+      'Created **bore 3/4** — 18 × 18 × 20 mm · 792 tris',
+      'Created **bore 4/4** — 18 × 18 × 20 mm · 792 tris',
+      'Created **Difference 5** — 165 × 165 × 18 mm · 3192 tris',
+      'Created **Difference 6** — 165 × 165 × 18 mm · 4792 tris',
+      'Created **Difference 7** — 165 × 165 × 18 mm · 6392 tris',
+      'Created **Difference 8** — 165 × 165 × 18 mm · 7992 tris',
+    ]
+    for (const line of echoes) addLine(line, 'system')
+  }, [addLine])
+
+  // ── Live repro: Defect 2 — two independent `roshera:choices` cards, each
+  // its own agent line, exactly the shape that made the second one
+  // unanswerable while the first one's turn was in flight. Click an option
+  // on EITHER card — both must stay independently clickable regardless of
+  // order, and picking one must queue (never block) the other.
+  const seedChoicesCards = useCallback(() => {
+    addLine(
+      yamlCard(
+        'choices',
+        [
+          'question: Which clearance class for the M8 bolt-circle holes?',
+          'options:',
+          '  - value: close',
+          '    label: Close (H12) - 9.0 mm',
+          '    detail: tighter location, less assembly slop',
+          '  - value: medium',
+          '    label: Medium (H13) - 10.0 mm',
+          '    detail: the usual default for bolted joints',
+          '  - value: free',
+          '    label: Free (H14) - 10.5 mm',
+          '    detail: easiest assembly, most lateral play',
+        ].join('\n'),
+      ),
+      'agent',
+    )
+    addLine(
+      yamlCard(
+        'choices',
+        [
+          'question: Gasket face finish for the DN50 flange?',
+          'options:',
+          '  - value: smooth',
+          '    label: Smooth (Ra 3.2)',
+          '    detail: for a soft/elastomeric gasket',
+          '  - value: serrated',
+          '    label: Serrated — concentric grooves',
+          '    detail: for a fiber or spiral-wound gasket',
+        ].join('\n'),
+      ),
+      'agent',
+    )
+  }, [addLine])
+
+  // ── Live repro: Defect 3 — the agent asked a closed question as
+  // "Option A: / Option B: / Option C:" prose instead of the
+  // `roshera:choices` fence, so the human had to retype an answer. The
+  // policy alone (`.goosehints`) is steering and was ignored; the board now
+  // enforces the outcome as a constraint (`detectEnumeratedChoices`). Seeds
+  // the real defect line plus three negatives that must render NO buttons:
+  // user-authored, a single option, and an agent line that already has a
+  // `roshera:choices` fence.
+  const seedDetectedChoices = useCallback(() => {
+    addLine(DETECTED_CHOICES_AGENT_TEXT, 'agent')
+    addLine(DETECTED_CHOICES_NEGATIVE_USER, 'user')
+    addLine(DETECTED_CHOICES_NEGATIVE_SINGLE, 'agent')
+    addLine(DETECTED_CHOICES_NEGATIVE_FENCED, 'agent')
+  }, [addLine])
+
+  // ── Live repro: fixed-left-gutter verdict marker — a mixed column of
+  // real lines (through the real `BlackboardLine` origin marker, not the
+  // static card gallery below, which renders via `MessageMarkdown` and has
+  // no notion of line authorship or the marker at all) so the shape+colour
+  // mapping can be checked by eye: same author shape (Bot) across pass /
+  // fail / inconclusive / neutral colours, and non-agent shapes (Wrench,
+  // User) staying neutral because their lines carry no verdict card.
+  const seedVerdictMarkers = useCallback(() => {
+    addLine('Sizing the bracket root before cutting the bores — no verdict yet.', 'agent')
+    addLine(SOUNDNESS_FULL, 'agent')
+    addLine(SOUNDNESS_UNSOUND, 'agent')
+    addLine(SOUNDNESS_PARTIAL, 'agent')
+    addLine(DFM_VIOLATION, 'agent')
+    addLine(DFM_UNVERIFIABLE_BOUND, 'agent')
+    addLine(REFUSAL, 'agent')
+    addLine(MERGE_CLEAN, 'agent')
+    addLine(MERGE_CONFLICT, 'agent')
+    addLine('Created **DN50 PN16 flange** — 165 × 165 × 18 mm · 792 tris', 'system')
+    addLine('Looks good, thanks — go ahead and cut the bores.', 'user')
+  }, [addLine])
 
   return (
     <div className="h-full w-full overflow-y-auto bg-background text-foreground select-text">
@@ -575,6 +817,40 @@ export function BlackboardFixtures({ onExit }: BlackboardFixturesProps) {
             ))}
             <span className="text-[10px] text-muted-foreground">
               drives the real store setter — the ACP wiring lands in a later slice
+            </span>
+          </div>
+          <div className="mb-2 flex flex-wrap items-center gap-1.5 border-t border-border/40 pt-2">
+            <span className="text-[10px] font-medium text-foreground/80">Live repro (writes real lines below):</span>
+            <button
+              onClick={seedBuildSteps}
+              className="cad-icon-btn h-6 px-1.5 text-[11px]"
+              title="Append the 9 'Created …' lines from Varun's DN50 PN16 flange build — should collapse into one build-step strip"
+            >
+              seed 9 build steps
+            </button>
+            <button
+              onClick={seedChoicesCards}
+              className="cad-icon-btn h-6 px-1.5 text-[11px]"
+              title="Append two independent roshera:choices cards — both must stay answerable regardless of click order"
+            >
+              seed 2 choices cards
+            </button>
+            <button
+              onClick={seedDetectedChoices}
+              className="cad-icon-btn h-6 px-1.5 text-[11px]"
+              title="Append the verbatim defect line (agent's own unfenced Option A/B/C prose) plus three negatives: a user line, a single-option agent line, and an agent line that already has a roshera:choices fence — only the first should grow detected-option buttons"
+            >
+              seed detected choices + negatives
+            </button>
+            <button
+              onClick={seedVerdictMarkers}
+              className="cad-icon-btn h-6 px-1.5 text-[11px]"
+              title="Append a mixed column of real lines — plain prose, sound/unsound/partial certificates, a DFM violation and an unverifiable result, a refusal, a clean and a conflicted merge, a build-step echo, and a user reply — to check the origin marker's shape+colour mapping by eye"
+            >
+              seed verdict markers
+            </button>
+            <span className="text-[10px] text-muted-foreground">
+              use the panel's own trash icon to clear
             </span>
           </div>
           <div className="relative h-[480px] overflow-hidden rounded-lg border border-border bg-gradient-to-b from-[#0a1420] to-[#050a12]">

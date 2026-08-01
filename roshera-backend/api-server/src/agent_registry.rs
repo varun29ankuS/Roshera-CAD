@@ -1563,7 +1563,7 @@ fn raw_tools() -> Vec<ToolSpec> {
             Analysis,
             Experimental,
             Curated,
-            "Run a DFM (design-for-manufacturability) rule pack against a part: exact-or-refuse printability rules (fdm.min_wall >= 2x nozzle diameter, fdm.overhang > 45 deg from vertical) off the analytic B-Rep. Returns the kernel's own DfmReport verbatim -- never a fabricated pass; a rule that could not be checked reports 'unverifiable', never 'pass'.",
+            "Run a DFM (design-for-manufacturability) rule pack against a part off the analytic B-Rep. The 'fdm' pack checks fdm.min_wall (wall >= 2x nozzle diameter), fdm.overhang (no face > 45 deg from vertical), fdm.min_bore (bore diameter >= 2x nozzle diameter) and fdm.trapped_volume (enclosed cavity traps unremovable support); 'injection_molding' checks mold.draft. FDM limits are shop practice, not a governing standard -- each verdict carries its provenance. Returns the kernel's own DfmReport verbatim -- never a fabricated pass; a rule that could not be checked reports 'unverifiable', never 'pass'.",
             json!({
                 "type": "object",
                 "properties": {
@@ -1575,6 +1575,22 @@ fn raw_tools() -> Vec<ToolSpec> {
                     "min_draft_deg": {"type": "number", "description": "injection_molding pack only; minimum draft angle in degrees, default 1.0"}
                 },
                 "required": ["part_id", "pack"]
+            }),
+        ),
+        t(
+            "kb_lookup",
+            Analysis,
+            Experimental,
+            Curated,
+            "Tiered engineering KNOWLEDGE BASE -- retrieve, don't hold. kind 'pack' = one manufacturing process's DFM pack (fdm, sla, sls, injection_molding, cnc_3_axis, cnc_5_axis, sheet_metal, casting): guidance chunk + kernel_certified_rules + the exact dfm_check pack arg, or null with the guidance MARKED uncertified when the kernel cannot check that process. kind 'playbook' = one feature type's build playbook (hole, boss, rib, gusset, bearing_seat, flange, bolt_pattern, snap_fit) with tool_sequence of real MCP tools in order. kind 'reference' = cited engineering data: clearance_hole (ISO 273), tap_drill, general_tolerance (ISO 2768), fit_class (ISO 286, e.g. H7/g6), thread_spec, standard_stock, bend_allowance, drill_size. Every answer carries {value, source} -- NEVER a bare number; open questions and conflicting vendor data REFUSE by name instead of defaulting.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "kind": {"type": "string", "enum": ["pack", "playbook", "reference"], "description": "pack = Tier-1 process pack; playbook = Tier-2 feature playbook; reference = Tier-3 cited data lookup"},
+                    "key": {"type": "string", "minLength": 1, "description": "pack: process name (e.g. 'fdm'); playbook: feature type (e.g. 'hole'); reference: data function (e.g. 'clearance_hole')"},
+                    "args": {"type": "object", "description": "reference kind only: the data function's parameters, e.g. {fastener:'M6', class:'close'} or {nominal_mm:20, fit:'H7/g6'}"}
+                },
+                "required": ["kind", "key"]
             }),
         ),
         t(
@@ -1985,7 +2001,11 @@ mod tests {
         // along with the rest of the history/branching/certification family
         // (rebuild_certificate, clear_timeline, bind_parameter_name) — 15
         // tools total in Timeline, none left in Core.
-        assert_eq!(tools.len(), 101, "expected 101 tools, got {}", tools.len());
+        // 102: the policy knowledge base (2026-07-31) added `kb_lookup`
+        // (Analysis / Experimental / Curated) mirroring roshera-mcp
+        // src/tools/kb.ts. Full-table only — it is deliberately absent from
+        // the minimal surface, whose token bill is unchanged at 5070.
+        assert_eq!(tools.len(), 102, "expected 102 tools, got {}", tools.len());
     }
 
     /// The kernel-sourced rows correspond to operations actually registered in

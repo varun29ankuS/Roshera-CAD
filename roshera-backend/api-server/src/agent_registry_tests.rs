@@ -38,7 +38,7 @@ const ALLOWED_BENCHES: &[&str] = &[
     "core", "sketch", "assembly", "drawing", "analysis", "labels", "timeline",
 ];
 
-/// The complete set of tool names the MCP server exposes today (101 tools).
+/// The complete set of tool names the MCP server exposes today (102 tools).
 ///
 /// Extracted verbatim from `roshera-mcp/src/tools/*.ts` +
 /// `roshera-mcp/src/core.ts` `server.tool(…)` / `server.registerTool(…)`
@@ -116,6 +116,8 @@ const MCP_TOOL_NAMES: &[&str] = &[
     "select_face",
     "set_part_color",
     "verify_claim",
+    // kb.ts
+    "kb_lookup",
     // io.ts
     "drawing_export_sheet",
     "export_part",

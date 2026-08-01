@@ -445,6 +445,12 @@ impl SketchManager {
         Self::default()
     }
 
+    /// Drop every in-progress click-to-place session. Used by
+    /// `documents::activate` when switching the live document.
+    pub fn clear(&self) {
+        self.sessions.clear();
+    }
+
     /// Create a new empty session on the chosen plane + tool. Returns
     /// the freshly-allocated session so the caller can broadcast its
     /// id back to clients.

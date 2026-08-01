@@ -294,6 +294,20 @@ pub enum ExportError {
         /// Configured size limit in megabytes.
         limit_mb: f64,
     },
+
+    /// **P1 enforcement.** The solid has been mutated (or never certified)
+    /// since its last full verification, so the kernel has no CURRENT
+    /// soundness answer for it. An unverified solid must not become an
+    /// STL/OBJ/STEP/ROS file a shop machines from — this is the hard stop
+    /// where the consequences of a stale verdict leave the system.
+    #[error(
+        "solid {solid_id} has not been fully verified since its last mutation \
+         — call verify_part before exporting"
+    )]
+    UnverifiedSolid {
+        /// The kernel solid id that failed the freshness gate.
+        solid_id: u32,
+    },
 }
 
 impl RosheraError {

@@ -21,6 +21,13 @@
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { Pencil, Trash2, X } from 'lucide-react'
+import {
+  ContextMenu,
+  ContextMenuHeader,
+  ContextMenuItem,
+  ContextMenuSeparator,
+} from '@/components/ui/context-menu'
 import {
   type Drawing,
   type DrawingFormat,
@@ -574,36 +581,20 @@ export function DrawingsWorkspace() {
     }
   }, [])
 
-  // Context-menu dismissal: any click outside the menu, Escape, or
-  // window scroll/resize closes it. Registered only while open so we
-  // don't pay listener cost in the common case.
-  useEffect(() => {
-    if (!contextMenu) return
-    const dismiss = () => setContextMenu(null)
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') dismiss()
-    }
-    // mousedown (not click) so we dismiss before the underlying row's
-    // click handler can fire — the user expects "click elsewhere closes
-    // the menu without also activating that elsewhere".
-    window.addEventListener('mousedown', dismiss)
-    window.addEventListener('keydown', onKey)
-    window.addEventListener('resize', dismiss)
-    window.addEventListener('scroll', dismiss, true)
-    return () => {
-      window.removeEventListener('mousedown', dismiss)
-      window.removeEventListener('keydown', onKey)
-      window.removeEventListener('resize', dismiss)
-      window.removeEventListener('scroll', dismiss, true)
-    }
-  }, [contextMenu])
-
   return (
     <div className="flex flex-col flex-1 min-h-0 bg-background text-foreground">
-      {/* Error banner */}
+      {/* Error banner — same failed-action treatment as the other
+          workspaces: cross glyph + mono message, red only because it IS
+          an error state. */}
       {error && (
-        <div className="px-3 py-2 text-xs bg-destructive/10 text-destructive border-b border-destructive/30">
-          {error}
+        <div
+          role="alert"
+          className="flex items-baseline gap-1.5 border-b border-destructive/30 bg-destructive/10 px-3 py-2 text-xs"
+        >
+          <span className="inline-flex shrink-0 translate-y-px text-red-600 dark:text-red-400">
+            <X size={11} />
+          </span>
+          <span className="select-text font-mono text-red-700 dark:text-red-300">{error}</span>
         </div>
       )}
 
@@ -648,7 +639,8 @@ export function DrawingsWorkspace() {
           <div className="flex-1 min-h-0 overflow-y-auto py-1">
             {drawings.length === 0 ? (
               <div className="px-3 py-4 text-xs text-muted-foreground text-center">
-                No drawings yet.
+                No drawings in this document yet — create one above, or
+                right-click a part and choose Create Drawing.
               </div>
             ) : (
               drawings.map((d) => {
@@ -727,19 +719,7 @@ export function DrawingsWorkspace() {
                             onClick={() => beginRename(d.id, d.name)}
                             className="cad-focus inline-flex items-center justify-center w-6 h-6 rounded text-muted-foreground hover:text-foreground hover:bg-accent/40 transition-colors"
                           >
-                            <svg
-                              width="12"
-                              height="12"
-                              viewBox="0 0 16 16"
-                              fill="none"
-                              stroke="currentColor"
-                              strokeWidth="1.5"
-                              strokeLinecap="round"
-                              strokeLinejoin="round"
-                              aria-hidden="true"
-                            >
-                              <path d="M11 2.5l2.5 2.5L5 13.5H2.5V11z" />
-                            </svg>
+                            <Pencil size={12} aria-hidden="true" />
                           </button>
                           <button
                             type="button"
@@ -748,19 +728,7 @@ export function DrawingsWorkspace() {
                             onClick={() => void handleDelete(d.id)}
                             className="cad-focus inline-flex items-center justify-center w-6 h-6 rounded text-destructive hover:text-destructive hover:bg-destructive/15 transition-colors"
                           >
-                            <svg
-                              width="12"
-                              height="12"
-                              viewBox="0 0 16 16"
-                              fill="none"
-                              stroke="currentColor"
-                              strokeWidth="1.75"
-                              strokeLinecap="round"
-                              strokeLinejoin="round"
-                              aria-hidden="true"
-                            >
-                              <path d="M4 4l8 8M12 4l-8 8" />
-                            </svg>
+                            <Trash2 size={12} aria-hidden="true" />
                           </button>
                         </div>
                       </>
@@ -1078,42 +1046,39 @@ export function DrawingsWorkspace() {
           )}
         </main>
       </div>
-      {/* Right-click context menu for sidebar drawing rows. Rendered
-          at the document root via `position: fixed` so it escapes any
-          ancestor `overflow:hidden`. `mousedown` stop-propagation is
-          load-bearing: the global dismiss listener (also `mousedown`)
-          would otherwise close the menu before its `onClick` fires. */}
+      {/* Right-click context menu for sidebar drawing rows — the shared
+          primitive (portal, edge-flip, keyboard, dismissal). */}
       {contextMenu && (
-        <div
-          role="menu"
-          style={{ left: contextMenu.x, top: contextMenu.y }}
-          onMouseDown={(e) => e.stopPropagation()}
-          className="fixed z-50 min-w-[160px] rounded border border-border bg-popover text-popover-foreground shadow-lg py-1 text-xs"
+        <ContextMenu
+          x={contextMenu.x}
+          y={contextMenu.y}
+          onClose={() => setContextMenu(null)}
+          aria-label="Drawing actions"
         >
-          <button
-            type="button"
-            role="menuitem"
+          <ContextMenuHeader>{contextMenu.name}</ContextMenuHeader>
+          <ContextMenuSeparator />
+          <ContextMenuItem
             onClick={() => {
               beginRename(contextMenu.id, contextMenu.name)
               setContextMenu(null)
             }}
-            className="w-full text-left px-3 py-1.5 hover:bg-accent/40"
           >
+            <Pencil size={13} />
             Rename
-          </button>
-          <button
-            type="button"
-            role="menuitem"
+          </ContextMenuItem>
+          <ContextMenuSeparator />
+          <ContextMenuItem
+            danger
             onClick={() => {
               const id = contextMenu.id
               setContextMenu(null)
               void handleDelete(id)
             }}
-            className="w-full text-left px-3 py-1.5 hover:bg-destructive/15 text-destructive"
           >
+            <Trash2 size={13} />
             Delete
-          </button>
-        </div>
+          </ContextMenuItem>
+        </ContextMenu>
       )}
     </div>
   )
