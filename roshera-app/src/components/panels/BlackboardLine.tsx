@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, useCallback, useMemo } from 'react'
 import { stringify as yamlStringify } from 'yaml'
 import { cn } from '@/lib/utils'
 import { processBlackboardMessage } from '@/lib/ai-client'
+import { sendPrompt } from '@/lib/blackboard-composer'
 import { detectEnumeratedChoices } from '@/lib/blackboard-cards'
 import { classifyBlackboardContent } from '@/lib/blackboard-content'
 import { lineVerdict, type LineVerdict } from '@/lib/blackboard-line-state'
@@ -317,7 +318,11 @@ export function BlackboardLine({ line, onCommit, onDelete, streaming = false, on
           line.text.slice(match.index + match[0].length)
         onCommit(line.id, nextText)
       }
-      void processBlackboardMessage(value)
+      // Through the queue-visible wrapper, not the raw transport: a choice
+      // clicked while a turn is in flight is the exact silent-queue case
+      // (Varun, 2026-08-01) — the composer's queue strip now shows it as
+      // received-and-waiting instead of nothing happening for 60–90s.
+      void sendPrompt(value, processBlackboardMessage)
     },
     [line.id, line.text, onCommit],
   )
@@ -329,7 +334,8 @@ export function BlackboardLine({ line, onCommit, onDelete, streaming = false, on
   // option's own text as the next turn, same as `processBlackboardMessage`
   // does for anything the user types.
   const sendDetectedChoice = useCallback((value: string) => {
-    void processBlackboardMessage(value)
+    // Queue-visible for the same reason as `selectChoice` above.
+    void sendPrompt(value, processBlackboardMessage)
   }, [])
   const cardActions = useMemo<CardActions>(
     () => ({ selectChoice, sendDetectedChoice }),
@@ -369,8 +375,28 @@ export function BlackboardLine({ line, onCommit, onDelete, streaming = false, on
   const authorLabel = isAgent ? 'Agent-authored' : isSystem ? 'App-generated' : 'You'
   const markerTitle = verdict ? `${authorLabel} — ${verdictDetail(verdict)}` : authorLabel
 
+  // AUTHORSHIP WITHOUT COLOUR — position + weight.
+  // ------------------------------------------------
+  // "difficult to differentiate between ai and user" (Varun, 2026-08-01):
+  // authorship was carried only by the ~10px marker glyph, which fails the
+  // readable-without-a-mouse bar at a scan. Colour is unavailable — it is
+  // reserved for state, and the marker's colour channel already carries
+  // the line's certificate verdict — so the free channels are position and
+  // weight: the USER's lines are indented (the ask steps in; the agent's
+  // work stays flush as the body of the notebook) and set at medium
+  // weight (a short instruction reads as a heading-like interjection).
+  // A left rule was rejected: `control` lines already use a ruled shape
+  // (sky, "awaiting your choice") and a second ruled family would blur
+  // that; indentation collides with nothing. Evidence stays flush, dim
+  // and dense — still visibly subordinate to both voices.
+  const isUser = !isAgent && !isSystem
   return (
-    <div className="group/line flex items-start gap-2 px-3 py-1.5 hover:bg-white/[0.03] rounded-md">
+    <div
+      className={cn(
+        'group/line flex items-start gap-2 px-3 py-1.5 hover:bg-white/[0.03] rounded-md',
+        isUser && 'ml-6',
+      )}
+    >
       {/* Origin marker — shape (icon) says who wrote it; colour says what
           happened, when this line carries a verdict. */}
       <div
@@ -415,7 +441,11 @@ export function BlackboardLine({ line, onCommit, onDelete, streaming = false, on
         ) : streaming ? (
           // Not a <button> — a turn in flight is not editable, and a stop
           // control lives inside this block (nested <button>s are invalid).
-          <div className="w-full select-text text-left text-sm leading-relaxed text-foreground/90">
+          // Content is measure-capped at 72ch everywhere below (streaming,
+          // evidence, prose): the panel is 50rem wide and full-bleed body
+          // text at that width is unreadable — vault ui-pass-spec §1 sets
+          // the measure at ~68–75ch.
+          <div className="w-full max-w-[72ch] select-text text-left text-sm leading-relaxed text-foreground/90">
             {line.text.trim() ? (
               <CardActionsContext.Provider value={cardActions}>
                 <RevealContext.Provider value={reveal}>
@@ -443,7 +473,7 @@ export function BlackboardLine({ line, onCommit, onDelete, streaming = false, on
           // authored — that is the whole distinction).
           <div className="flex w-full items-start gap-1.5 select-text text-left text-xs leading-snug text-foreground/60">
             {isAgent && line.turnStatus && <TurnStatusGlyph status={line.turnStatus} />}
-            <span className="min-w-0 flex-1">
+            <span className="min-w-0 max-w-[72ch] flex-1">
               {line.text.trim() ? (
                 <CardActionsContext.Provider value={cardActions}>
                   <RevealContext.Provider value={reveal}>
@@ -469,6 +499,10 @@ export function BlackboardLine({ line, onCommit, onDelete, streaming = false, on
             onClick={() => setEditing(true)}
             className={cn(
               'flex w-full items-start gap-1.5 cursor-text select-text text-left text-sm leading-relaxed text-foreground/90',
+              // Weight channel of the authorship split (see the comment on
+              // the row wrapper): the user's ask reads medium against the
+              // agent's regular-weight working prose. Same size, same ramp.
+              isUser && 'font-medium',
               // Control: a closed-set question — reads as interactive.
               // Reuses card-chrome's `info` (sky) accent, the same colour
               // ChoicesCard/DetectedChoicesCard already use for "awaiting
@@ -479,7 +513,7 @@ export function BlackboardLine({ line, onCommit, onDelete, streaming = false, on
             title="Click to edit"
           >
             {isAgent && line.turnStatus && <TurnStatusGlyph status={line.turnStatus} />}
-            <span className="min-w-0 flex-1">
+            <span className="min-w-0 max-w-[72ch] flex-1">
               {line.text.trim() ? (
                 <CardActionsContext.Provider value={cardActions}>
                   <RevealContext.Provider value={reveal}>

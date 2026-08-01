@@ -11,9 +11,18 @@ import { cn } from '@/lib/utils'
 import { processBlackboardMessage } from '@/lib/ai-client'
 import { cancelAcpTurn } from '@/lib/acp-blackboard'
 import { groupBlackboardByCheckpoint, type CheckpointMarker } from '@/lib/blackboard-groups'
+import {
+  loadDraft,
+  saveDraft,
+  loadPromptHistory,
+  pushPromptHistory,
+  savePromptHistory,
+  sendPrompt,
+  useTurnQueue,
+  waitingTurns,
+} from '@/lib/blackboard-composer'
 import { BlackboardSection } from './BlackboardSection'
 import { Button } from '@/components/ui/button'
-import { Input } from '@/components/ui/input'
 import {
   NotebookPen,
   Send,
@@ -23,6 +32,13 @@ import {
   Plus,
   Trash2,
   Zap,
+  Clock,
+  Bot,
+  User,
+  Wrench,
+  Check,
+  X,
+  CircleSlash,
 } from 'lucide-react'
 import { VendorMark } from '@/components/settings/vendor-marks'
 
@@ -202,9 +218,46 @@ export function Blackboard() {
     [lines, checkpoints],
   )
 
-  const [input, setInput] = useState('')
+  // ── Composer state ──────────────────────────────────────────────────
+  //
+  // The composer is the ACT of asking; the notebook is the RECORD of having
+  // asked. Its draft lives outside the document (a draft is not a line),
+  // persisted per notebook scope so an accidental blur, panel toggle, or
+  // reload never eats a half-written prompt — see `lib/blackboard-composer.ts`.
+  const [draft, setDraft] = useState(() => loadDraft(activeScope))
+  // History browse position: null = not browsing. ArrowUp from an empty
+  // composer recalls what you last asked; ArrowDown walks back forward.
+  const [histIdx, setHistIdx] = useState<number | null>(null)
+  const historyRef = useRef<string[]>(loadPromptHistory())
   const scrollRef = useRef<HTMLDivElement>(null)
-  const inputRef = useRef<HTMLInputElement>(null)
+  const inputRef = useRef<HTMLTextAreaElement>(null)
+
+  // Scope switch swaps in that scope's own persisted draft. In-render
+  // reconcile (React's "adjusting state on prop change" pattern, same as
+  // BlackboardLine's streaming sync) — no setState-in-effect cascade.
+  const [draftScope, setDraftScope] = useState(activeScope)
+  if (draftScope !== activeScope) {
+    setDraftScope(activeScope)
+    setDraft(loadDraft(activeScope))
+    setHistIdx(null)
+  }
+
+  // Autosize the composer to its content (recall can change the value
+  // without an input event, so this tracks `draft`, not keystrokes). The
+  // cap matches the `max-h-40` on the textarea.
+  useEffect(() => {
+    const el = inputRef.current
+    if (!el) return
+    el.style.height = 'auto'
+    el.style.height = `${Math.min(el.scrollHeight, 160)}px`
+  }, [draft])
+
+  // The dispatch queue, made visible. The transport serializes prompts
+  // (one at a time — `ai-client.ts`'s `turnQueue`); the head entry is the
+  // turn in flight (already signalled on the agent's own line), so only
+  // the WAITING tail renders here. If the system makes you wait, it owes
+  // you the queue.
+  const waiting = waitingTurns(useTurnQueue())
 
   /**
    * ATTENTION-FOLLOWING SPLIT
@@ -282,24 +335,59 @@ export function Blackboard() {
   const handleSubmit = useCallback(
     (e?: React.FormEvent) => {
       e?.preventDefault()
-      const text = input.trim()
-      if (!text || isProcessing) return
-      setInput('')
-      // Routes to the agent via the existing ai-client path; the reply is
-      // appended to the board as an editable line, not a chat bubble.
-      void processBlackboardMessage(text)
+      const text = draft.trim()
+      // No `isProcessing` guard: the transport queues serially and the
+      // queue is VISIBLE (the strip above the composer), so a prompt sent
+      // mid-turn is accepted and shown waiting — never silently refused.
+      if (!text) return
+      const nextHistory = pushPromptHistory(historyRef.current, text)
+      historyRef.current = nextHistory
+      savePromptHistory(nextHistory)
+      setDraft('')
+      saveDraft(activeScope, '')
+      setHistIdx(null)
+      // Routes to the agent via the existing ai-client path (wrapped for
+      // queue visibility); the user's line lands in the notebook
+      // immediately, the reply as an editable line — never a chat bubble.
+      void sendPrompt(text, processBlackboardMessage)
     },
-    [input, isProcessing],
+    [draft, activeScope],
   )
 
   const handleKeyDown = useCallback(
-    (e: React.KeyboardEvent) => {
+    (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
       if (e.key === 'Enter' && !e.shiftKey) {
+        // Enter sends; Shift+Enter falls through to the textarea's native
+        // newline — multi-line input without fighting Enter-to-send.
         e.preventDefault()
         handleSubmit()
+        return
+      }
+      if (e.key === 'ArrowUp') {
+        const h = historyRef.current
+        // Recall only from an empty composer (or while already browsing) —
+        // never clobber text being edited just because the caret moved up.
+        if (h.length === 0 || (histIdx === null && draft.trim() !== '')) return
+        e.preventDefault()
+        const idx = histIdx === null ? h.length - 1 : Math.max(0, histIdx - 1)
+        setHistIdx(idx)
+        setDraft(h[idx])
+        return
+      }
+      if (e.key === 'ArrowDown' && histIdx !== null) {
+        e.preventDefault()
+        const h = historyRef.current
+        const idx = histIdx + 1
+        if (idx >= h.length) {
+          setHistIdx(null)
+          setDraft('')
+        } else {
+          setHistIdx(idx)
+          setDraft(h[idx])
+        }
       }
     },
-    [handleSubmit],
+    [handleSubmit, histIdx, draft],
   )
 
   // Collapsed state — floating button.
@@ -487,6 +575,58 @@ export function Blackboard() {
         }
       >
         <div className="py-2">
+          {/* EMPTY NOTEBOOK — the common case today. Instead of a blank
+              region (or one unlabelled section of nothing), say what this
+              panel IS and teach the marker vocabulary the reader is about
+              to meet — shape = author, colour = verdict — so the first
+              real line is legible on sight (time-to-recognition, not a
+              manual). Disappears the moment any line exists. */}
+          {lines.length === 0 && !isProcessing && (
+            <div className="px-4 py-3 text-xs leading-relaxed">
+              <p className="font-medium text-foreground/85">
+                An engineering notebook, not a chat.
+              </p>
+              <p className="mt-0.5 max-w-[60ch] text-muted-foreground/70">
+                Ask below — your question, the agent&apos;s reasoning, and the
+                kernel&apos;s certificates all land here as lines, grouped under
+                named checkpoints.
+              </p>
+              <div className="mt-3 grid gap-1.5 text-[11px] text-muted-foreground/70">
+                <div className="flex items-center gap-2">
+                  <span className="flex h-4 w-4 shrink-0 items-center justify-center rounded-full bg-accent">
+                    <Bot size={10} className="text-foreground" />
+                  </span>
+                  <span>the agent — reasoning, editable</span>
+                </div>
+                {/* Indented like a real user line — the legend teaches the
+                    position channel by using it, not by describing it. */}
+                <div className="ml-6 flex items-center gap-2 font-medium">
+                  <span className="flex h-4 w-4 shrink-0 items-center justify-center rounded-full bg-primary/20">
+                    <User size={10} className="text-primary" />
+                  </span>
+                  <span>you — indented, sent from the composer below</span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <span className="flex h-4 w-4 shrink-0 items-center justify-center rounded-full bg-muted-foreground/20">
+                    <Wrench size={9} className="text-muted-foreground" />
+                  </span>
+                  <span>the kernel — certificates and build steps, never editable</span>
+                </div>
+                <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1">
+                  <span>marker colour is the verdict:</span>
+                  <span className="inline-flex items-center gap-1 text-emerald-600 dark:text-emerald-400">
+                    <Check size={10} /> pass
+                  </span>
+                  <span className="inline-flex items-center gap-1 text-red-600 dark:text-red-400">
+                    <X size={10} /> fail
+                  </span>
+                  <span className="inline-flex items-center gap-1 text-amber-600 dark:text-amber-400">
+                    <CircleSlash size={10} /> inconclusive
+                  </span>
+                </div>
+              </div>
+            </div>
+          )}
           {sections.map((section, i) => (
             <BlackboardSection
               key={section.checkpoint?.id ?? `leading-${i}`}
@@ -495,6 +635,12 @@ export function Blackboard() {
               onDelete={deleteLine}
               streamingLineId={streamingLineId}
               onCancel={cancelAcpTurn}
+              // Earlier checkpoint sections open collapsed so a long
+              // notebook lands the eye on CURRENT work, not on scrollback
+              // — collapse is a click with a named header and a visible
+              // line count, never a hover, so nothing is hidden (reduce
+              // scrolling without hiding anything).
+              defaultCollapsed={section.checkpoint !== null && i < sections.length - 1}
             />
           ))}
           {/* Shown only until the reply line exists — once streaming, the
@@ -508,33 +654,77 @@ export function Blackboard() {
         </div>
       </div>
 
-      {/* Prompt — still routes to the agent */}
-      <form
-        onSubmit={handleSubmit}
-        className="flex items-center gap-1.5 px-2 py-2 border-t border-white/5"
-      >
-        <Input
-          ref={inputRef}
-          value={input}
-          onChange={(e) => setInput(e.target.value)}
-          onKeyDown={handleKeyDown}
-          placeholder="Ask the agent — its reply lands as an editable line…"
-          disabled={isProcessing}
-          className="h-8 text-xs bg-transparent border-white/10 placeholder:text-white/30"
-        />
-        <Button
-          type="submit"
-          size="sm"
-          disabled={!input.trim() || isProcessing}
-          className="h-8 w-8 p-0 shrink-0"
-        >
-          {isProcessing ? (
-            <Loader2 size={14} className="animate-spin" />
-          ) : (
-            <Send size={14} />
-          )}
-        </Button>
-      </form>
+      {/* COMPOSER — the act, kept apart from the record. Visually its own
+          anchored region (raised tint + border), never a line of the
+          transcript; what it sends still lands in the notebook as a normal
+          line. Never disabled mid-turn: the transport queues serially and
+          the strip below makes that queue visible. */}
+      <div className="shrink-0 border-t border-white/10 bg-white/[0.04]">
+        {/* QUEUE STRIP — prompts received but not yet dispatched. Dashed
+            amber is the app's existing "not run yet" grammar (ClaimBadge's
+            null state in cards/card-chrome.tsx) — waiting is a state, so
+            it may have a colour; the full prompt text is readable in the
+            chip itself, hover only widens truncation. */}
+        {waiting.length > 0 && (
+          <div
+            role="status"
+            className="flex flex-wrap items-center gap-1.5 border-b border-white/5 px-3 py-1.5 text-[10px]"
+          >
+            <Clock size={10} className="shrink-0 text-amber-500" />
+            <span className="shrink-0 font-medium text-amber-600 dark:text-amber-400">
+              {waiting.length} queued
+            </span>
+            <span className="shrink-0 text-muted-foreground/60">
+              — sends after the current turn
+            </span>
+            {waiting.map((w) => (
+              <span
+                key={w.id}
+                title={w.text}
+                className="max-w-[16rem] truncate rounded border border-dashed border-amber-500/40 bg-amber-500/5 px-1.5 py-0.5 text-amber-700 dark:text-amber-300"
+              >
+                {w.text}
+              </span>
+            ))}
+          </div>
+        )}
+        <form onSubmit={handleSubmit} className="flex items-end gap-1.5 px-2 py-2">
+          <textarea
+            ref={inputRef}
+            value={draft}
+            rows={1}
+            onChange={(e) => {
+              setDraft(e.target.value)
+              // Persist per scope on every keystroke — the draft survives
+              // blur, panel toggle, and reload; it is not a line until sent.
+              saveDraft(activeScope, e.target.value)
+              setHistIdx(null)
+            }}
+            onKeyDown={handleKeyDown}
+            placeholder={
+              isProcessing
+                ? 'Turn in flight — a new prompt queues behind it…'
+                : 'Ask the agent — Enter sends, Shift+Enter for a new line…'
+            }
+            spellCheck={false}
+            className="max-h-40 min-h-8 flex-1 resize-none overflow-y-auto rounded-md border border-white/10 bg-background/40 px-2.5 py-[7px] text-xs leading-relaxed text-foreground outline-none placeholder:text-white/30 focus:border-primary/50 scrollbar-thin"
+          />
+          {/* A visible, labelled send control — the verb, not a paragraph
+              keystroke. Disabled only by an empty draft, never by a turn
+              in flight (that case queues, visibly). */}
+          <Button
+            type="submit"
+            size="sm"
+            disabled={!draft.trim()}
+            className="h-8 shrink-0 gap-1 px-2.5"
+            title="Send — Enter sends, Shift+Enter for a new line, ArrowUp recalls your last prompt"
+            aria-label="Send prompt"
+          >
+            <Send size={13} />
+            <span className="text-[11px]">Send</span>
+          </Button>
+        </form>
+      </div>
     </div>
   )
 }

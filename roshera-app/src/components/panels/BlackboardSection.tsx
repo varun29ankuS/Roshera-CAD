@@ -23,15 +23,31 @@ export function BlackboardSection({
   onDelete,
   streamingLineId,
   onCancel,
+  defaultCollapsed = false,
 }: {
   section: BlackboardSectionData
   onCommit: (id: string, text: string) => void
   onDelete: (id: string) => void
   streamingLineId: string | null
   onCancel?: (() => void) | undefined
+  /** Initial state only (Blackboard.tsx passes true for every checkpoint
+   *  section except the last, so a long notebook opens on CURRENT work).
+   *  The user's toggle always wins afterwards — this never forces a
+   *  section shut on re-render, and the leading unlabelled section (no
+   *  header, no toggle) is never collapsed by the caller. */
+  defaultCollapsed?: boolean
 }) {
-  const [collapsed, setCollapsed] = useState(false)
+  const [collapsed, setCollapsed] = useState(defaultCollapsed)
   const { checkpoint, groups } = section
+
+  // How many real lines this section holds (a build strip stands for each
+  // of its underlying lines). Shown in the header whether open or closed:
+  // a collapsed section must say how much it holds without a hover — the
+  // count is the "nothing is hidden" receipt.
+  const lineCount = groups.reduce(
+    (n, g) => n + (g.kind === 'build-strip' ? g.lines.length : 1),
+    0,
+  )
 
   const body = collapsed ? null : (
     <div>
@@ -83,6 +99,9 @@ export function BlackboardSection({
           <ChevronDown size={11} className="shrink-0 text-muted-foreground/60" />
         )}
         <span className="truncate">{checkpoint.name}</span>
+        <span className="ml-1 shrink-0 font-mono text-[10px] tabular-nums text-muted-foreground/50">
+          {lineCount} {lineCount === 1 ? 'line' : 'lines'}
+        </span>
       </button>
       {body}
     </div>
