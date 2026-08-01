@@ -1,7 +1,6 @@
 import { useContext } from 'react'
 import { Check, CircleHelp } from 'lucide-react'
 import type { ChoicesCard as ChoicesCardData } from '@/lib/blackboard-cards'
-import { useBlackboardStore } from '@/stores/blackboard-store'
 import { cn } from '@/lib/utils'
 import { CardShell, Chip } from './card-chrome'
 import { CardActionsContext } from './card-actions-context'
@@ -25,15 +24,24 @@ import { CardActionsContext } from './card-actions-context'
  * `source` is the exact fence body this card was parsed from, needed only
  * to hand back to `CardActionsContext.selectChoice` so the owning line can
  * locate (and only) rewrite this fence, not guess at one.
+ *
+ * Clickability depends ONLY on this card's own `answered` state — NEVER on
+ * whether some OTHER turn is in flight. Two live choices cards must both
+ * stay independently answerable until each is individually answered
+ * (Varun, 2026-08-01): gating on the store's global `isProcessing` used to
+ * mean answering the first card disabled every other still-open card for
+ * the full 60–90s of the turn that answer triggered. `selectChoice`
+ * (`BlackboardLine.tsx`) now queues the resulting turn instead
+ * (`lib/ai-client.ts`'s `turnQueue`) rather than this card ever refusing
+ * the click.
  */
 export function ChoicesCard({ card, source }: { card: ChoicesCardData; source: string }) {
   const actions = useContext(CardActionsContext)
-  const isProcessing = useBlackboardStore((s) => s.isProcessing)
   const answered = card.selected !== undefined
   // No CardActionsContext (e.g. the fixtures gallery) means there is no
   // line to answer — buttons render for preview but stay inert rather than
   // silently doing nothing that looks like it did something.
-  const clickable = actions !== null && !answered && !isProcessing
+  const clickable = actions !== null && !answered
 
   return (
     <CardShell
@@ -72,10 +80,11 @@ export function ChoicesCard({ card, source }: { card: ChoicesCardData; source: s
                 'flex flex-col items-start gap-0.5 rounded-md border px-2.5 py-1.5 text-left text-[11px] leading-snug transition-colors',
                 'disabled:cursor-not-allowed disabled:hover:border-border/40 disabled:hover:bg-transparent',
                 chosen && 'border-emerald-500/60 bg-emerald-500/10 text-foreground',
-                // Not-clickable covers three cases with one look: another
-                // option was chosen, a turn is already in flight, or (the
-                // fixtures gallery) there is no owning line to answer at
-                // all — none of those should look pressable.
+                // Not-clickable covers two cases with one look: another
+                // option on THIS card was chosen, or (the fixtures gallery)
+                // there is no owning line to answer at all — neither should
+                // look pressable. An in-flight turn elsewhere is NOT one of
+                // these cases — see the module doc above.
                 !chosen && !clickable && 'border-border/40 text-muted-foreground/50 opacity-60',
                 !chosen &&
                   clickable &&

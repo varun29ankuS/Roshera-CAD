@@ -30,7 +30,14 @@ import { cn } from '@/lib/utils'
  *
  * Nothing on this page writes to the Blackboard store's notebook — the
  * embedded live panel shows the real document notebook untouched; fixture
- * lines are rendered locally.
+ * lines are rendered locally. The one exception: the "Live repro" buttons
+ * (below the attention-following panel) are opt-in, one click, clearly
+ * labeled, and DO append real lines to that same live notebook — two
+ * defects (build-line spam collapsing into a step strip, a second
+ * `roshera:choices` card staying answerable while another's turn runs) only
+ * exist in the actual grouping/queueing logic (`groupBlackboardLines`,
+ * `ai-client.ts`'s `turnQueue`), which operates on real store state and
+ * cannot be exercised by the static, locally-rendered gallery below.
  */
 
 const FENCE = '```'
@@ -615,6 +622,7 @@ export function BlackboardFixtures({ onExit }: BlackboardFixturesProps) {
   const agentAttention = useBlackboardStore((s) => s.agentAttention)
   const setAgentAttention = useBlackboardStore((s) => s.setAgentAttention)
   const setPanel = useBlackboardStore((s) => s.setPanel)
+  const addLine = useBlackboardStore((s) => s.addLine)
   const [replayKey, setReplayKey] = useState(0)
 
   // The embedded panel must be open to demonstrate the attention split.
@@ -624,6 +632,70 @@ export function BlackboardFixtures({ onExit }: BlackboardFixturesProps) {
   }, [setPanel, setAgentAttention])
 
   const attentions: AgentAttention[] = ['idle', 'writing', 'geometry']
+
+  // ── Live repro: Defect 1 — nine "Created …" lines, verbatim from Varun's
+  // DN50 PN16 flange build (a body + 4 bores + 4 sequential differences).
+  // Same text `lib/ws-bridge.ts`'s `dimensionEchoMessage` produces — this IS
+  // the shape that spammed the board, appended as real 'system' lines so
+  // the real `groupBlackboardLines`/`BuildStepStrip` path in the panel
+  // above runs, not a lookalike.
+  const seedBuildSteps = useCallback(() => {
+    const echoes = [
+      'Created **DN50 PN16 flange** — 165 × 165 × 18 mm · 792 tris',
+      'Created **bore 1/4** — 18 × 18 × 20 mm · 792 tris',
+      'Created **bore 2/4** — 18 × 18 × 20 mm · 792 tris',
+      'Created **bore 3/4** — 18 × 18 × 20 mm · 792 tris',
+      'Created **bore 4/4** — 18 × 18 × 20 mm · 792 tris',
+      'Created **Difference 5** — 165 × 165 × 18 mm · 3192 tris',
+      'Created **Difference 6** — 165 × 165 × 18 mm · 4792 tris',
+      'Created **Difference 7** — 165 × 165 × 18 mm · 6392 tris',
+      'Created **Difference 8** — 165 × 165 × 18 mm · 7992 tris',
+    ]
+    for (const line of echoes) addLine(line, 'system')
+  }, [addLine])
+
+  // ── Live repro: Defect 2 — two independent `roshera:choices` cards, each
+  // its own agent line, exactly the shape that made the second one
+  // unanswerable while the first one's turn was in flight. Click an option
+  // on EITHER card — both must stay independently clickable regardless of
+  // order, and picking one must queue (never block) the other.
+  const seedChoicesCards = useCallback(() => {
+    addLine(
+      yamlCard(
+        'choices',
+        [
+          'question: Which clearance class for the M8 bolt-circle holes?',
+          'options:',
+          '  - value: close',
+          '    label: Close (H12) - 9.0 mm',
+          '    detail: tighter location, less assembly slop',
+          '  - value: medium',
+          '    label: Medium (H13) - 10.0 mm',
+          '    detail: the usual default for bolted joints',
+          '  - value: free',
+          '    label: Free (H14) - 10.5 mm',
+          '    detail: easiest assembly, most lateral play',
+        ].join('\n'),
+      ),
+      'agent',
+    )
+    addLine(
+      yamlCard(
+        'choices',
+        [
+          'question: Gasket face finish for the DN50 flange?',
+          'options:',
+          '  - value: smooth',
+          '    label: Smooth (Ra 3.2)',
+          '    detail: for a soft/elastomeric gasket',
+          '  - value: serrated',
+          '    label: Serrated — concentric grooves',
+          '    detail: for a fiber or spiral-wound gasket',
+        ].join('\n'),
+      ),
+      'agent',
+    )
+  }, [addLine])
 
   return (
     <div className="h-full w-full overflow-y-auto bg-background text-foreground select-text">
@@ -662,6 +734,26 @@ export function BlackboardFixtures({ onExit }: BlackboardFixturesProps) {
             ))}
             <span className="text-[10px] text-muted-foreground">
               drives the real store setter — the ACP wiring lands in a later slice
+            </span>
+          </div>
+          <div className="mb-2 flex flex-wrap items-center gap-1.5 border-t border-border/40 pt-2">
+            <span className="text-[10px] font-medium text-foreground/80">Live repro (writes real lines below):</span>
+            <button
+              onClick={seedBuildSteps}
+              className="cad-icon-btn h-6 px-1.5 text-[11px]"
+              title="Append the 9 'Created …' lines from Varun's DN50 PN16 flange build — should collapse into one build-step strip"
+            >
+              seed 9 build steps
+            </button>
+            <button
+              onClick={seedChoicesCards}
+              className="cad-icon-btn h-6 px-1.5 text-[11px]"
+              title="Append two independent roshera:choices cards — both must stay answerable regardless of click order"
+            >
+              seed 2 choices cards
+            </button>
+            <span className="text-[10px] text-muted-foreground">
+              use the panel's own trash icon to clear
             </span>
           </div>
           <div className="relative h-[480px] overflow-hidden rounded-lg border border-border bg-gradient-to-b from-[#0a1420] to-[#050a12]">

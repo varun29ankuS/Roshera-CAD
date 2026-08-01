@@ -240,19 +240,13 @@ function classifyAcpFailure(err: unknown): { fallback: boolean } {
 }
 
 /**
- * Send a user prompt, get an agent response. ACP-first: the prompt is
- * driven over the live `/acp` transport (`acp-client.ts` +
- * `acp-blackboard.ts`), which streams the agent's real reasoning/tool
- * activity into the Blackboard's `agentAttention`/streaming seams. Falls
- * back to the legacy `/api/ai/command/stream` transport ONLY when the
- * backend build genuinely has no ACP surface (404/405) or is unreachable
- * — see `classifyAcpFailure`. The user prompt and the agent reply are
- * appended to the Blackboard as *editable lines* rather than chat bubbles.
+ * Actually dispatch one turn over the ACP transport, falling back to the
+ * legacy transport per `classifyAcpFailure`'s narrow rule. Never throws —
+ * every failure path already renders its own line onto the board — so
+ * chaining this behind the serial queue below never needs a `.catch()` to
+ * keep the chain alive; that's belt-and-braces only.
  */
-export async function processBlackboardMessage(text: string, sessionId?: string) {
-  const board = useBlackboardStore.getState()
-  board.addLine(text, 'user')
-
+async function dispatchTurn(text: string, sessionId?: string): Promise<void> {
   try {
     const client = await getAcpClient()
     await runAcpTurn(client, text)
@@ -264,4 +258,48 @@ export async function processBlackboardMessage(text: string, sessionId?: string)
   }
 
   await legacyBlackboardTurn(text, sessionId)
+}
+
+/**
+ * SERIAL TURN QUEUE
+ * -----------------
+ * The ACP session (`acp-client.ts`) is one prompt at a time — `session/prompt`
+ * has no concurrency story on the wire, and firing a second one at the same
+ * session while the first is still running would interleave two turns'
+ * `session/update` streams unpredictably. So a call arriving while a turn is
+ * already in flight must WAIT its turn rather than race the transport —
+ * and, just as important, must never be refused outright.
+ *
+ * This is what makes a second `roshera:choices` card answerable while the
+ * first one's turn is still running (Varun, 2026-08-01: answering one
+ * choices card silently made a second, still-open one unclickable for the
+ * full 60–90s the first turn ran, with no feedback that the click even
+ * registered). `BlackboardLine.tsx`'s `selectChoice` rewrites the card's
+ * OWN line with `selected: <value>` synchronously on click — and this
+ * function appends the user's line to the board synchronously too — so the
+ * answer is recorded and visible immediately regardless of queue position;
+ * only the actual agent dispatch waits here.
+ */
+let turnQueue: Promise<void> = Promise.resolve()
+
+/**
+ * Send a user prompt, get an agent response. ACP-first: the prompt is
+ * driven over the live `/acp` transport (`acp-client.ts` +
+ * `acp-blackboard.ts`), which streams the agent's real reasoning/tool
+ * activity into the Blackboard's `agentAttention`/streaming seams. Falls
+ * back to the legacy `/api/ai/command/stream` transport ONLY when the
+ * backend build genuinely has no ACP surface (404/405) or is unreachable
+ * — see `classifyAcpFailure`. The user prompt and the agent reply are
+ * appended to the Blackboard as *editable lines* rather than chat bubbles.
+ *
+ * The user's line is added IMMEDIATELY, never delayed by a turn already in
+ * flight; only the dispatch itself is serialized — see `turnQueue` above.
+ */
+export function processBlackboardMessage(text: string, sessionId?: string): Promise<void> {
+  const board = useBlackboardStore.getState()
+  board.addLine(text, 'user')
+
+  const run = turnQueue.then(() => dispatchTurn(text, sessionId))
+  turnQueue = run.catch(() => undefined)
+  return run
 }

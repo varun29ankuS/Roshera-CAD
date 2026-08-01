@@ -1,4 +1,4 @@
-import { useRef, useEffect, useState, useCallback } from 'react'
+import { useRef, useEffect, useState, useCallback, useMemo } from 'react'
 import {
   useBlackboardStore,
   DOCUMENT_SCOPE,
@@ -9,7 +9,9 @@ import { useSceneStore } from '@/stores/scene-store'
 import { cn } from '@/lib/utils'
 import { processBlackboardMessage } from '@/lib/ai-client'
 import { cancelAcpTurn } from '@/lib/acp-blackboard'
+import { groupBlackboardLines } from '@/lib/blackboard-groups'
 import { BlackboardLine } from './BlackboardLine'
+import { BuildStepStrip } from './BuildStepStrip'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import {
@@ -101,6 +103,12 @@ export function Blackboard() {
       : selectedPart
         ? selectedPart.name
         : 'Part'
+
+  // Consecutive machine-authored "Created …" lines collapse into one
+  // compact step strip (`BuildStepStrip.tsx`) so a bolt circle of bores
+  // reads as one row of marks, not one paragraph per hole. Agent prose and
+  // user lines are never candidates — see `groupBlackboardLines`'s doc.
+  const groups = useMemo(() => groupBlackboardLines(lines), [lines])
 
   const [input, setInput] = useState('')
   const scrollRef = useRef<HTMLDivElement>(null)
@@ -341,16 +349,25 @@ export function Blackboard() {
         }
       >
         <div className="py-2">
-          {lines.map((line) => (
-            <BlackboardLine
-              key={line.id}
-              line={line}
-              onCommit={editLine}
-              onDelete={deleteLine}
-              streaming={line.id === streamingLineId}
-              onCancel={line.id === streamingLineId ? cancelAcpTurn : undefined}
-            />
-          ))}
+          {groups.map((g) =>
+            g.kind === 'build-strip' ? (
+              <BuildStepStrip
+                key={g.lines[0].id}
+                lines={g.lines}
+                onCommit={editLine}
+                onDelete={deleteLine}
+              />
+            ) : (
+              <BlackboardLine
+                key={g.line.id}
+                line={g.line}
+                onCommit={editLine}
+                onDelete={deleteLine}
+                streaming={g.line.id === streamingLineId}
+                onCancel={g.line.id === streamingLineId ? cancelAcpTurn : undefined}
+              />
+            ),
+          )}
           {/* Shown only until the reply line exists — once streaming, the
               line's own chalk cursor is the progress signal. */}
           {isProcessing && streamingLineId === null && (
