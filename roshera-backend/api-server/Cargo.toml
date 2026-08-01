@@ -39,6 +39,36 @@ time = "0.3"
 tower-cookies = "0.11"
 chrono = "0.4"
 reqwest = { version = "0.12", features = ["json"] }
+# TLS for GOOSE's outbound client — this entry is not used by our code.
+#
+# goose pins `reqwest = { version = "0.13", default-features = false,
+# features = ["multipart", "form"] }` — no TLS backend at all. A reqwest
+# client built without one cannot open an https:// connection; it fails at
+# CONNECT, and goose renders that as `NetworkError("Could not connect to
+# <host> — check your network connection")`. That message sent us hunting a
+# network fault for an hour on 2026-08-01 while the host was reachable from
+# this very process: our own discovery call to api.sarvam.ai returned 200
+# seconds either side of goose's failures.
+#
+# Cargo unifies features PER major version, and ours is 0.12 while goose's
+# is 0.13 — two separate universes, so the `default-tls` our 0.12 gets
+# never reached goose's 0.13. Declaring 0.13 here puts us in ITS universe;
+# the feature then applies to the client goose builds.
+#
+# `native-tls` rather than a rustls feature on purpose: on Windows it is
+# schannel (no OpenSSL, contrary to the note below, which describes the
+# Linux case), and our 0.12 already builds native-tls for its own
+# `default-tls`, so this adds a feature to an existing crate rather than a
+# new build dependency. goose's own `rustls-tls` feature is the wrong tool
+# — it exists to terminate TLS for goose's standalone server (rcgen,
+# axum-server, aws-lc-rs) and Roshera terminates its own connections.
+#
+# The note on the `goose` dependency below called this exactly: "before
+# slice 2 sends live provider traffic through goose, a TLS feature must be
+# chosen or every https:// request will fail at runtime." Slice 2 shipped,
+# Sarvam became the first provider to use goose's HTTP client rather than
+# spawning a CLI, and every turn failed. This is that choice, made.
+reqwest_013_tls_for_goose = { package = "reqwest", version = "0.13", default-features = false, features = ["native-tls"] }
 rmp-serde = "1.1"
 regex = "1.10"
 async-stream = "0.3"
