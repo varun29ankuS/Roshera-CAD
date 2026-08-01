@@ -11,6 +11,7 @@ import {
   type DurabilityStatus,
   durabilityNotice,
   parseDurabilityStatus,
+  checkpointNameRefusal,
   normalizeKind,
   symbolForOperation,
   shortLabel,
@@ -25,8 +26,8 @@ import { DecisionRail, DurabilityChip } from './TimelineDecisions'
 
 // Graph ("map") view — a second, toggleable view alongside this strip
 // (see vault Research/2026-07-31-ui-pass-spec.md §3). Lazy-loaded: it
-// pulls in `@xyflow/react` + `dagre`, which have no reason to sit in
-// the initial bundle for the ~everyday case of never opening the map.
+// pulls in `@xyflow/react`, which has no reason to sit in the initial
+// bundle for the ~everyday case of never opening the map.
 const TimelineGraph = lazy(() => import('./TimelineGraph'))
 
 // NOTE: these helpers + types are NOT re-exported from here. Consumers must
@@ -938,6 +939,19 @@ export function Timeline() {
   const [creatingBranch, setCreatingBranch] = useState(false)
   const branchPickerRef = useRef<HTMLDivElement | null>(null)
   const branchInputRef = useRef<HTMLInputElement | null>(null)
+  // Checkpoint (intent) picker: opens when the user clicks ◈. The old
+  // behaviour minted "Checkpoint <system clock>" — a name that LOOKS
+  // like a name while carrying nothing (every row already shows its
+  // time), exactly what the MCP intent gate refuses from agents. The
+  // button now asks for the intent and holds the same line: empty and
+  // sequence-position names are refused client-side, because this POST
+  // bypasses the MCP gate entirely (see checkpointNameRefusal).
+  const [checkpointPickerOpen, setCheckpointPickerOpen] = useState(false)
+  const [checkpointNameInput, setCheckpointNameInput] = useState('')
+  const [creatingCheckpoint, setCreatingCheckpoint] = useState(false)
+  const [checkpointSubmitAttempted, setCheckpointSubmitAttempted] = useState(false)
+  const checkpointPickerRef = useRef<HTMLDivElement | null>(null)
+  const checkpointInputRef = useRef<HTMLInputElement | null>(null)
   const wsStatus = useWSStore((s) => s.status)
 
   const handleEventContextMenu = useCallback(
@@ -956,6 +970,13 @@ export function Timeline() {
     setNameSuggestions([])
     setNameInput('')
     setCreatingBranch(false)
+  }, [])
+
+  const closeCheckpointPicker = useCallback(() => {
+    setCheckpointPickerOpen(false)
+    setCheckpointNameInput('')
+    setCreatingCheckpoint(false)
+    setCheckpointSubmitAttempted(false)
   }, [])
 
   // Tick relative-time labels every second
@@ -1145,6 +1166,33 @@ export function Timeline() {
     }
   }, [branchPickerOpen, closeBranchPicker])
 
+  // Same dismissal contract for the checkpoint (intent) picker.
+  useEffect(() => {
+    if (!checkpointPickerOpen) return
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        e.stopPropagation()
+        closeCheckpointPicker()
+      }
+    }
+    const onPointer = (e: MouseEvent) => {
+      const root = checkpointPickerRef.current
+      if (root && !root.contains(e.target as Node)) {
+        closeCheckpointPicker()
+      }
+    }
+    const id = window.setTimeout(() => {
+      document.addEventListener('mousedown', onPointer)
+    }, 0)
+    document.addEventListener('keydown', onKey)
+    checkpointInputRef.current?.focus()
+    return () => {
+      window.clearTimeout(id)
+      document.removeEventListener('mousedown', onPointer)
+      document.removeEventListener('keydown', onKey)
+    }
+  }, [checkpointPickerOpen, closeCheckpointPicker])
+
   const handleUndo = async () => {
     // Backend `/api/timeline/undo` requires `session_id` in the body
     // (see handlers/timeline.rs::undo_operation). Without it the call
@@ -1211,12 +1259,35 @@ export function Timeline() {
     }
   }
 
-  const handleCheckpoint = async () => {
+  const handleCheckpoint = () => {
+    // Toggle the intent picker — never mint a name. The previous
+    // implementation POSTed `Checkpoint ${new Date().toLocaleTimeString()}`
+    // here: a clock reading dressed as a name, which filled the decision
+    // rail with rows that said nothing (the range and time are already on
+    // every row). The name is the feature; it has to come from the user.
+    if (checkpointPickerOpen) {
+      closeCheckpointPicker()
+      return
+    }
+    closeBranchPicker()
+    setCheckpointPickerOpen(true)
+  }
+
+  const submitCheckpointCreate = async () => {
+    const name = checkpointNameInput.trim()
+    // Same quality floor the MCP intent gate holds for agents — this
+    // POST bypasses that gate, so the client is where the line is held
+    // for the button today (checkpointNameRefusal mirrors gates.ts).
+    if (checkpointNameRefusal(name)) {
+      setCheckpointSubmitAttempted(true)
+      return
+    }
+    setCreatingCheckpoint(true)
     try {
       const resp = await fetch('/api/timeline/checkpoint', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: `Checkpoint ${new Date().toLocaleTimeString()}` }),
+        body: JSON.stringify({ name }),
       })
       if (!resp.ok) {
         // `create_checkpoint` (handlers/timeline.rs) returns a bare
@@ -1226,14 +1297,17 @@ export function Timeline() {
         // generic "Request failed (HTTP …)" form for this endpoint.
         const body = await tryReadJson(resp)
         flashActionError(`Checkpoint failed: ${refusalMessage(body, resp.status)}`)
+        setCreatingCheckpoint(false)
         return
       }
+      closeCheckpointPicker()
       fetchHistory()
       // The decision rail refreshes on its own slow cadence; a checkpoint
       // this client just created should appear immediately, not in ≤15s.
       void fetchCheckpoints()
     } catch {
       flashActionError('Backend unreachable — checkpoint not created')
+      setCreatingCheckpoint(false)
     }
   }
 
@@ -1245,6 +1319,7 @@ export function Timeline() {
       closeBranchPicker()
       return
     }
+    closeCheckpointPicker()
     setBranchPickerOpen(true)
     setCreatingBranch(false)
     setNameSuggestions([])
@@ -1388,6 +1463,14 @@ export function Timeline() {
   ).length
   const otherBranchCount = Math.max(0, visibleBranchCount - 1)
 
+  // Live checkpoint-name verdict. Shown once the user has typed
+  // something (or tried to submit an empty name) — not before, so the
+  // freshly-opened picker doesn't greet them with red text.
+  const checkpointRefusal = checkpointNameRefusal(checkpointNameInput)
+  const showCheckpointRefusal =
+    checkpointRefusal !== null &&
+    (checkpointSubmitAttempted || checkpointNameInput.trim().length > 0)
+
   return (
     <div className="relative font-mono flex flex-col border-t border-border bg-card shrink-0">
       {branchPickerOpen && (
@@ -1453,6 +1536,66 @@ export function Timeline() {
               cancel
             </button>
           </div>
+        </div>
+      )}
+      {checkpointPickerOpen && (
+        <div
+          ref={checkpointPickerRef}
+          className="absolute left-3 bottom-full mb-1 z-50 flex flex-col gap-2 px-3 py-2 rounded-md border border-border bg-card shadow-lg text-[12px]"
+          style={{ minWidth: 340, maxWidth: 440 }}
+        >
+          <div className="text-foreground/70">
+            declare intent on{' '}
+            <span className="text-foreground/90">{activeBranchLabel}</span>
+            <span className="text-foreground/50">
+              {' '}— name what a drawing would name
+            </span>
+          </div>
+          <div className="flex items-center gap-1.5">
+            <input
+              ref={checkpointInputRef}
+              type="text"
+              value={checkpointNameInput}
+              onChange={(e) => setCheckpointNameInput(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  e.preventDefault()
+                  void submitCheckpointCreate()
+                }
+              }}
+              placeholder="e.g. bolt circle 8 x D18 on D160 B.C."
+              className="flex-1 min-w-0 px-2 py-1 rounded border border-border bg-background text-foreground placeholder:text-foreground/40 outline-none focus:border-[#2ecc71]"
+            />
+            <button
+              type="button"
+              onClick={() => void submitCheckpointCreate()}
+              disabled={creatingCheckpoint || checkpointRefusal !== null}
+              title={
+                checkpointRefusal !== null
+                  ? 'Name the intent first — a sequence position or clock reading is refused'
+                  : 'Record this intent as a checkpoint'
+              }
+              className="px-2 py-1 rounded text-foreground bg-[#2ecc71]/20 hover:bg-[#2ecc71]/30 disabled:opacity-40 disabled:cursor-not-allowed"
+            >
+              {creatingCheckpoint ? 'declaring…' : 'declare'}
+            </button>
+            <button
+              type="button"
+              onClick={closeCheckpointPicker}
+              className="px-2 py-1 rounded text-foreground/60 hover:bg-accent/40"
+            >
+              cancel
+            </button>
+          </div>
+          {/* The refusal, in the same voice as the MCP intent gate: what
+              is wrong AND what a good name looks like. This popover is
+              the only gate on this path — the button's POST bypasses the
+              MCP layer entirely. */}
+          {showCheckpointRefusal && (
+            <div className="text-[11px] leading-snug text-rose-400 max-w-[52ch]">
+              {checkpointRefusal}
+            </div>
+          )}
         </div>
       )}
       {/* Expanded panel: full git-style graph. Sits above the strip

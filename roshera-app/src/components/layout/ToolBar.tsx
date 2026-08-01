@@ -1048,8 +1048,23 @@ async function sendDirectInterference() {
     }
 
     if (overlapping.length === 0) {
+      // Report the verdict WITH its basis: this is an AABB-only rejection,
+      // and the closest measured surface-to-surface gap quantifies how
+      // much margin backs it. A bare "no interference" would claim more
+      // than the kernel evaluated.
+      const resolved = results.filter(
+        (r): r is { a: string; b: string; overlap: boolean; gap: number; centerDist: number } =>
+          'overlap' in r,
+      )
+      const minGap = resolved.reduce(
+        (min, r) => (Number.isFinite(r.gap) && r.gap < min ? r.gap : min),
+        Number.POSITIVE_INFINITY,
+      )
+      const gapNote = Number.isFinite(minGap)
+        ? ` Closest surface-to-surface gap: ${fmt(minGap)} mm.`
+        : ''
       addLine(
-        `No bounding-box interference across ${pairs.length} pair${pairs.length === 1 ? '' : 's'}.`,
+        `No bounding-box overlap across ${resolved.length}/${pairs.length} pair${pairs.length === 1 ? '' : 's'} (AABB check only — surface intersection not evaluated).${gapNote}`,
         'system',
       )
     } else {

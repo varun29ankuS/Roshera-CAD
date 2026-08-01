@@ -57,6 +57,52 @@ export function formatEventRange(range: [number, number]): string {
   return a === b ? `#${a}` : `#${a}–#${b}`
 }
 
+// ─── Checkpoint-name quality floor ──────────────────────────────────
+//
+// The ◈ button posts straight to `POST /api/timeline/checkpoint`, which
+// bypasses the MCP intent gate entirely — so the client is the only
+// place the "no named-nothing checkpoints" line can be held for human-
+// created checkpoints today. This mirrors `GENERIC_CHECKPOINT_NAME` in
+// `roshera-mcp/src/gates.ts` (keep the two in sync BY HAND — they live
+// in different packages): a generic word, an ordinal, or both — "step
+// 3", "cp 2", "checkpoint", "7" — is a sequence position, not an
+// intent. Any real intent phrase ("bolt circle 8 x D18 on D160 B.C.",
+// even the terse "cut cylinders") passes; quality beyond this floor
+// stays judgment, not schema.
+
+const GENERIC_CHECKPOINT_NAME =
+  /^(?:(?:step|op|operation|cut|feature|part|checkpoint|chkpt|cp|test|wip|tmp|temp|misc)[\s\-_#:.]*)?\d*$/i
+
+// Strict SUPERSET of the MCP gate: also refuse a bare clock/date
+// reading (with or without a generic-word prefix) — "Checkpoint
+// 9:59:36 PM", "10:05", "2026-08-01". That is exactly the named-nothing
+// string this UI's own button used to mint from the system clock; it
+// slips the gate's regex while carrying less than "step 3" (every row
+// already shows its time).
+const CLOCK_CHECKPOINT_NAME =
+  /^(?:(?:step|op|operation|checkpoint|chkpt|cp)[\s\-_#:.]*)?\d{1,4}([:\-/.]\d{1,2}){1,2}(\s*(am|pm))?$/i
+
+/**
+ * Why `name` is not an acceptable checkpoint name, or `null` when it
+ * is. The message says what a good name looks like, with a concrete
+ * example — same shape as the MCP gate's refusal.
+ */
+export function checkpointNameRefusal(name: string): string | null {
+  const trimmed = name.trim()
+  if (trimmed.length === 0) {
+    return 'A checkpoint is a declared intent — name the feature you are about to build.'
+  }
+  if (GENERIC_CHECKPOINT_NAME.test(trimmed) || CLOCK_CHECKPOINT_NAME.test(trimmed)) {
+    return (
+      `'${trimmed}' names a sequence position, not a design intent. ` +
+      "Name what a drawing would name — the feature, its governing dimensions, " +
+      "and where it sits: e.g. 'bolt circle 8 x D18 on D160 B.C.' or " +
+      "'M8 clearance holes, close fit, 4x base corners'."
+    )
+  }
+  return null
+}
+
 /**
  * The declared intent covering event `sequence`, or `null` when nobody
  * named this span of history. Ranges may overlap (a later, more specific

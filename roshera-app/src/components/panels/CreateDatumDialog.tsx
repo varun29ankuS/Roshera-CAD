@@ -30,6 +30,7 @@ import {
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import { DialogError, FormField, NumericInput } from './dialog-form'
 import { cn } from '@/lib/utils'
 
 const API_BASE = import.meta.env.VITE_API_URL || ''
@@ -297,9 +298,7 @@ export function CreateDatumDialog({
             </FormField>
           )}
 
-          {error && (
-            <div className="text-[12px] text-destructive font-mono">{error}</div>
-          )}
+          <DialogError>{error}</DialogError>
         </div>
 
         <DialogFooter>
@@ -316,43 +315,5 @@ export function CreateDatumDialog({
         </DialogFooter>
       </DialogContent>
     </Dialog>
-  )
-}
-
-function FormField({
-  label,
-  children,
-}: {
-  label: string
-  children: React.ReactNode
-}) {
-  return (
-    <label className="flex flex-col gap-1">
-      <span className="text-[11px] uppercase tracking-wider text-muted-foreground/70 font-mono">
-        {label}
-      </span>
-      {children}
-    </label>
-  )
-}
-
-function NumericInput({
-  value,
-  onChange,
-  placeholder,
-}: {
-  value: string
-  onChange: (next: string) => void
-  placeholder?: string
-}) {
-  return (
-    <Input
-      type="text"
-      inputMode="decimal"
-      value={value}
-      onChange={(e) => onChange(e.target.value)}
-      placeholder={placeholder}
-      className="font-mono text-[13px]"
-    />
   )
 }

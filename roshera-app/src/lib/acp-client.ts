@@ -360,6 +360,13 @@ export class AcpClient {
   private connStream: AcpSseStream | null = null
   private sessStream: AcpSseStream | null = null
   private dead = false
+  /** True while {@link reestablish} is rebuilding the connection —
+   *  guards against a reconnect attempt triggering another reconnect. */
+  private reconnecting = false
+  /** The `mcpServers` array the caller last passed to {@link newSession},
+   *  so a stale-connection rebuild recreates the session with the same
+   *  wiring rather than silently dropping the MCP servers. */
+  private lastMcpServers: unknown[] = []
   private readonly updateHandlers = new Set<(update: AcpSessionUpdate) => void>()
   private readonly disconnectHandlers = new Set<(reason: string) => void>()
 
@@ -651,6 +658,7 @@ export class AcpClient {
    */
   async newSession(mcpServers: unknown[] = []): Promise<string> {
     if (!this.connectionId) throw new AcpProtocolError(-32000, 'newSession() called before initialize()')
+    this.lastMcpServers = mcpServers
     const cwd = await this.resolveCwd()
     const result = (await this.requestAsync(
       'session/new',
@@ -673,11 +681,68 @@ export class AcpClient {
     return this.sessionId
   }
 
+  /**
+   * Rebuild the connection + session in place after the backend reported
+   * that our `Acp-Connection-Id` no longer exists (`POST /acp` → 404 with
+   * an empty body — the signature of a backend restart while this tab
+   * stayed open). Verified live 2026-08-01: the stale id 404s every call,
+   * and without this the Blackboard silently fell back to the legacy
+   * single-shot path ("Command processed.") while looking connected.
+   *
+   * Any failure here (initialize or session/new) propagates verbatim —
+   * an unreachable agent must surface as an error, never as a healthy-
+   * looking fallback.
+   */
+  private async reestablish(): Promise<void> {
+    this.reconnecting = true
+    try {
+      // Drop the old streams silently — `close()` aborts, and an aborted
+      // stream's onDone early-returns, so `markDead` does not fire here.
+      this.connStream?.close()
+      this.sessStream?.close()
+      this.connStream = null
+      this.sessStream = null
+      this.connectionId = null
+      this.sessionId = null
+      this._currentModel = null
+      // Anything still pending was addressed to the dead connection; its
+      // response can never arrive.
+      for (const entry of this.pending.values()) {
+        entry.reject(
+          new AcpConnectionDeadError('ACP connection no longer exists on the backend (404)'),
+        )
+      }
+      this.pending.clear()
+      this.dead = false
+      await this.initialize()
+      await this.newSession(this.lastMcpServers)
+    } finally {
+      this.reconnecting = false
+    }
+  }
+
   /** Send one user turn on the active session and await its `stopReason`.
    *  Progressive content/tool activity arrives via `onUpdate` while this
-   *  promise is pending. */
+   *  promise is pending.
+   *
+   *  A 404 means the backend no longer knows our connection id (it
+   *  restarted): rebuild via {@link reestablish} and retry the prompt
+   *  exactly once. A 404 on the retried call — or any failure during the
+   *  rebuild itself — propagates; there is deliberately no loop. */
   async prompt(text: string): Promise<{ stopReason: AcpStopReason }> {
     if (!this.sessionId) throw new AcpProtocolError(-32000, 'prompt() called before newSession()')
+    try {
+      return await this.promptRequest(text)
+    } catch (err) {
+      const staleConnection =
+        err instanceof AcpHttpError && err.status === 404 && !this.reconnecting
+      if (!staleConnection) throw err
+      await this.reestablish()
+      return await this.promptRequest(text)
+    }
+  }
+
+  private async promptRequest(text: string): Promise<{ stopReason: AcpStopReason }> {
     const result = (await this.requestAsync(
       'session/prompt',
       { sessionId: this.sessionId, prompt: [{ type: 'text', text }] },

@@ -213,6 +213,30 @@ export function TopBar() {
               New Project <MenubarShortcut>Ctrl+N</MenubarShortcut>
             </MenubarItem>
             <MenubarSeparator />
+            {/* Import: STEP is the only format the backend can ingest today
+                (`POST /api/geometry/import_step`). The event opens the
+                dropzone's native file picker — same path as drag-and-drop.
+                The dropzone (and its listener) mounts with the 3D viewport,
+                so switch to Modeling first when in Drawing mode — otherwise
+                the click would silently do nothing. `.ros` files are
+                export-only until an import route exists. */}
+            <MenubarItem
+              onClick={() => {
+                if (useDocModeStore.getState().mode === 'drawing') {
+                  useDocModeStore.getState().setMode('part')
+                }
+                // Give the viewport (and the dropzone's event listener) a
+                // beat to mount before dispatching. 150 ms is well inside
+                // the browser's transient-activation window, so the native
+                // file picker still opens.
+                window.setTimeout(
+                  () => window.dispatchEvent(new Event('roshera:open-step-import')),
+                  150,
+                )
+              }}
+            >
+              Import STEP…
+            </MenubarItem>
             <MenubarSub>
               <MenubarSubTrigger>Export</MenubarSubTrigger>
               <MenubarSubContent>

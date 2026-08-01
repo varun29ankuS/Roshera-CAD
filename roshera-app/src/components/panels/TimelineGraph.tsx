@@ -4,8 +4,11 @@
  *
  * A SECOND view alongside the existing `Timeline.tsx` strip (scrubbing
  * still lives there; this is for reading structure). Lazy-loaded from
- * `Timeline.tsx` — `@xyflow/react` + `dagre` never enter the initial
- * bundle unless the user actually opens this panel.
+ * `Timeline.tsx` — `@xyflow/react` never enters the initial bundle
+ * unless the user actually opens this panel. Layout is a hand-rolled
+ * wrapped grid (each branch's groups flow left→right and wrap into
+ * rows, like text); dagre was dropped when the one-rank-per-group
+ * chain proved unreadable at real history sizes.
  *
  * ── Honesty constraint (read before touching the grouping logic) ──────
  * The agent does not yet declare intent before executing (that work is
@@ -49,14 +52,12 @@ import {
   MiniMap,
   Handle,
   Position,
-  getNodesBounds,
   type Node,
   type Edge,
   type NodeProps,
   type ReactFlowInstance,
 } from '@xyflow/react'
 import '@xyflow/react/dist/style.css'
-import dagre from 'dagre'
 import { X } from 'lucide-react'
 import { useThemeStore } from '@/stores/theme-store'
 import {
@@ -429,22 +430,21 @@ const nodeTypes = { intent: IntentNode, lane: LaneNode, stub: StubNode }
 
 // ─── Layout: dagre lays out the DAG left-to-right (the "road") ──────
 
-const LANE_PAD_Y = 60
-const LANE_PAD_X = 60
-// dagre's `nodesep` only reserves room for the node HEIGHTS it knows
-// about — it has no idea the lane bands drawn around each row will add
-// `LANE_PAD_Y` of visual padding on top and bottom. Left at dagre's
-// default-ish 30px, two adjacent branch rows measured live only 7px
-// apart center-to-center once the collapsed-card/stub height difference
-// was factored in — the bands overlapped into what looked like one lane.
-// Pushed generous (220, well past the padding's own footprint) for a
-// second reason beyond clearance: a wide-but-short main history plus
-// thin empty branch lanes made `fitView` scale to a sliver at the
-// vertical centre of a tall dialog, mostly empty space above/below
-// (caught by looking, not by DOM inspection — the nodes were correctly
-// positioned and separated the whole time). Taller lanes give `fitView`
-// a less extreme aspect ratio to fit, so the lanes actually occupy the
-// dialog instead of floating in it.
+const LANE_PAD_Y = 40
+const LANE_PAD_X = 48
+// ── Wrapped-grid layout constants ───────────────────────────────────
+// A branch's groups flow left→right and WRAP into rows, like text —
+// not one infinite straight line. The previous dagre chain put every
+// group on its own rank, so a real 99-op history rendered as a single
+// line of boxes running off-screen (Varun, live 2026-08-01: "i only
+// see one straight line.. multiple boxes ... unable to make out what
+// is happening"). A wrapped path needs no layout solver, so dagre is
+// gone from this chunk entirely.
+const WRAP_COLS = 6
+const GAP_X = 64
+const GAP_Y = 44
+/** Vertical clearance between one branch's band and the next. */
+const BAND_GAP = LANE_PAD_Y * 2 + 36
 
 function buildGraph(
   branchGroups: { branch: GraphBranch; groups: EventGroup[] }[],
@@ -453,50 +453,9 @@ function buildGraph(
   liveNames: Map<string, string>,
   onToggle: (id: string) => void,
 ): { nodes: Node<GraphNodeData | LaneNodeData | StubNodeData>[]; edges: Edge[] } {
-  const g = new dagre.graphlib.Graph()
-  g.setGraph({ rankdir: 'LR', nodesep: 340, ranksep: 70 })
-  g.setDefaultEdgeLabel(() => ({}))
-
-  // A non-root branch with ZERO events still gets a node — a real fork
-  // with nothing recorded on it yet is honest structure, not something
-  // to hide (see StubNode's comment).
-  for (const { branch, groups } of branchGroups) {
-    if (groups.length === 0) {
-      if (branch.parent) g.setNode(`${branch.id}:0`, { width: STUB_WIDTH, height: STUB_HEIGHT })
-      continue
-    }
-    groups.forEach((group, i) => {
-      const id = `${branch.id}:${i}`
-      const h = groupHeight(group, expandedIds.has(id))
-      g.setNode(id, { width: NODE_WIDTH, height: h })
-      if (i > 0) g.setEdge(`${branch.id}:${i - 1}`, id)
-    })
-  }
-
-  // Fork edges: parent's group covering the fork point → child's first
-  // group (or its stub, when the child has recorded nothing yet).
-  const forkEdges: { source: string; target: string; branch: GraphBranch }[] = []
-  for (const { branch } of branchGroups) {
-    if (!branch.parent) continue
-    const parentEntry = branchGroups.find((bg) => bg.branch.id === branch.parent)
-    if (!parentEntry || parentEntry.groups.length === 0) continue
-    const forkIdx = branch.fork_point?.event_index ?? 0
-    let sourceGroupIdx = 0
-    parentEntry.groups.forEach((grp, i) => {
-      if (grp.events.some((e) => e.sequence_number <= forkIdx)) sourceGroupIdx = i
-    })
-    const sourceId = `${parentEntry.branch.id}:${sourceGroupIdx}`
-    const targetId = `${branch.id}:0`
-    if (g.hasNode(sourceId) && g.hasNode(targetId)) {
-      g.setEdge(sourceId, targetId)
-      forkEdges.push({ source: sourceId, target: targetId, branch })
-    }
-  }
-
-  dagre.layout(g)
-
-  // ── Intent + stub nodes, and per-branch Y bounds (for the lane bands) ──
+  // ── Wrapped-grid layout + per-branch Y bounds (for the lane bands) ──
   const contentNodes: Node<GraphNodeData | StubNodeData>[] = []
+  const placed = new Set<string>()
   let globalMinX = Infinity
   let globalMaxX = -Infinity
   const laneBounds = new Map<string, { minY: number; maxY: number }>()
@@ -513,29 +472,45 @@ function buildGraph(
     }
   }
 
+  let yCursor = 0
   for (const { branch, groups } of branchGroups) {
+    // A non-root branch with ZERO events still gets a node — a real fork
+    // with nothing recorded on it yet is honest structure, not something
+    // to hide (see StubNode's comment).
     if (groups.length === 0) {
-      const pos = branch.parent ? g.node(`${branch.id}:0`) : undefined
-      if (!pos) continue
-      const left = pos.x - STUB_WIDTH / 2
-      const top = pos.y - STUB_HEIGHT / 2
+      if (!branch.parent) continue
+      const id = `${branch.id}:0`
       contentNodes.push({
-        id: `${branch.id}:0`,
+        id,
         type: 'stub',
-        position: { x: left, y: top },
+        position: { x: 0, y: yCursor },
         draggable: false,
         data: { branch, isActive: branch.id === activeBranchId },
       })
-      noteExtent(branch.id, left, top, STUB_WIDTH, STUB_HEIGHT)
+      placed.add(id)
+      noteExtent(branch.id, 0, yCursor, STUB_WIDTH, STUB_HEIGHT)
+      yCursor += STUB_HEIGHT + BAND_GAP
       continue
     }
+
+    // Row heights first (a row is as tall as its tallest card — an
+    // expanded card grows its whole row, not just itself).
+    const rowHeights: number[] = []
+    groups.forEach((group, i) => {
+      const row = Math.floor(i / WRAP_COLS)
+      const h = groupHeight(group, expandedIds.has(`${branch.id}:${i}`))
+      rowHeights[row] = Math.max(rowHeights[row] ?? 0, h)
+    })
+    const rowTop = (row: number): number =>
+      yCursor + rowHeights.slice(0, row).reduce((a, b) => a + b, 0) + row * GAP_Y
+
     groups.forEach((group, i) => {
       const id = `${branch.id}:${i}`
-      const pos = g.node(id)
-      if (!pos) return
+      const col = i % WRAP_COLS
+      const row = Math.floor(i / WRAP_COLS)
       const h = groupHeight(group, expandedIds.has(id))
-      const left = pos.x - NODE_WIDTH / 2
-      const top = pos.y - h / 2
+      const left = col * (NODE_WIDTH + GAP_X)
+      const top = rowTop(row) + (rowHeights[row] - h) / 2
       contentNodes.push({
         id,
         type: 'intent',
@@ -549,8 +524,31 @@ function buildGraph(
           onToggle,
         },
       })
+      placed.add(id)
       noteExtent(branch.id, left, top, NODE_WIDTH, h)
     })
+
+    const lastRow = rowHeights.length - 1
+    yCursor = rowTop(lastRow) + rowHeights[lastRow] + BAND_GAP
+  }
+
+  // Fork edges: parent's group covering the fork point → child's first
+  // group (or its stub, when the child has recorded nothing yet).
+  const forkEdges: { source: string; target: string; branch: GraphBranch }[] = []
+  for (const { branch } of branchGroups) {
+    if (!branch.parent) continue
+    const parentEntry = branchGroups.find((bg) => bg.branch.id === branch.parent)
+    if (!parentEntry || parentEntry.groups.length === 0) continue
+    const forkIdx = branch.fork_point?.event_index ?? 0
+    let sourceGroupIdx = 0
+    parentEntry.groups.forEach((grp, i) => {
+      if (grp.events.some((e) => e.sequence_number <= forkIdx)) sourceGroupIdx = i
+    })
+    const sourceId = `${parentEntry.branch.id}:${sourceGroupIdx}`
+    const targetId = `${branch.id}:0`
+    if (placed.has(sourceId) && placed.has(targetId)) {
+      forkEdges.push({ source: sourceId, target: targetId, branch })
+    }
   }
 
   const laneNodes: Node<LaneNodeData>[] = []
@@ -581,13 +579,18 @@ function buildGraph(
   for (const { branch, groups } of branchGroups) {
     const color = strokeColorFor(branch.id === activeBranchId, branch.state)
     for (let i = 1; i < groups.length; i++) {
+      // A wrap edge (row end → next row start) travels right-to-left;
+      // smoothstep routes it around the cards instead of through them.
+      const isWrap = i % WRAP_COLS === 0
       edges.push({
         id: `seq:${branch.id}:${i - 1}->${i}`,
         source: `${branch.id}:${i - 1}`,
         target: `${branch.id}:${i}`,
+        type: 'smoothstep',
         style: {
           stroke: color,
           strokeWidth: branch.id === activeBranchId ? 1.6 : 1,
+          strokeOpacity: isWrap ? 0.55 : 1,
           strokeDasharray: branch.state === 'merged' ? '4 3' : undefined,
         },
       })
@@ -598,6 +601,7 @@ function buildGraph(
       id: `fork:${fe.source}->${fe.target}`,
       source: fe.source,
       target: fe.target,
+      type: 'smoothstep',
       label: fe.branch.name || undefined,
       labelStyle: { fontSize: 10, fill: 'var(--foreground)' },
       style: {
@@ -618,20 +622,26 @@ function buildGraph(
 interface FetchedBranch {
   branch: GraphBranch
   events: EventSummary[]
+  /** True when the fetch itself failed (non-2xx or network) — zero
+   *  events from a REFUSED fetch is not the same fact as a genuinely
+   *  empty branch, and the empty state must not conflate them (this
+   *  panel rendered "no operations recorded yet" over a rate-limited
+   *  429 with 100 real ops behind it — caught live 2026-08-01). */
+  failed: boolean
 }
 
 async function fetchBranchEvents(branch: GraphBranch): Promise<FetchedBranch> {
   try {
     const resp = await fetch(`/api/timeline/history/${branch.id}`)
-    if (!resp.ok) return { branch, events: [] }
+    if (!resp.ok) return { branch, events: [], failed: true }
     const data = await resp.json()
     const raw: EventSummary[] = Array.isArray(data) ? data : (data.events ?? [])
     const isRoot = branch.parent == null
     const forkIdx = branch.fork_point?.event_index ?? 0
     const events = isRoot ? raw : raw.filter((e) => e.sequence_number > forkIdx)
-    return { branch, events }
+    return { branch, events, failed: false }
   } catch {
-    return { branch, events: [] }
+    return { branch, events: [], failed: true }
   }
 }
 
@@ -669,10 +679,30 @@ export default function TimelineGraph({
   // default; the ⓘ expands it in place.
   const [detailsOpen, setDetailsOpen] = useState(false)
 
+  // The parent's `branches` state can legitimately be EMPTY when the
+  // map opens (the /api/branches poll may be rate-limited or still in
+  // flight after a remount) — but `main` always exists, so fall back to
+  // it rather than mapping nothing over a document with real history.
+  const effectiveBranches = useMemo<GraphBranch[]>(
+    () =>
+      branches.length > 0
+        ? branches
+        : [{
+            id: MAIN_BRANCH_ID,
+            name: 'main',
+            parent: null,
+            state: 'active',
+            event_count: 0,
+            created_at: '',
+          }],
+    [branches],
+  )
+
+  const [loadEpoch, setLoadEpoch] = useState(0)
   useEffect(() => {
     let cancelled = false
     setLoading(true)
-    Promise.all(branches.map(fetchBranchEvents)).then((results) => {
+    Promise.all(effectiveBranches.map(fetchBranchEvents)).then((results) => {
       if (!cancelled) {
         setFetched(results)
         setLoading(false)
@@ -684,9 +714,10 @@ export default function TimelineGraph({
     // `branches` is refreshed by the parent's 5s poll; re-fetching this
     // panel's per-branch histories on every poll tick would defeat the
     // "only fetch when the map is actually open" point of lazy-loading
-    // it in the first place. Intentionally one-shot per mount.
+    // it in the first place. One-shot per mount, plus explicit retries
+    // via `loadEpoch` (the failed-fetch state's retry button).
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [])
+  }, [loadEpoch])
 
   const toggleExpand = (id: string) => {
     setExpandedIds((prev) => {
@@ -735,33 +766,17 @@ export default function TimelineGraph({
   )
 
   useEffect(() => {
-    if (rfInstance && !loading && nodes.length > 0 && canvasRef.current) {
-      // Plain `fitView()` fits the WHOLE bounding box, and this graph is
-      // wide-and-short (dozens of ops across, at most a handful of thin
-      // branch lanes tall) — width-fitting it left the branch lanes (the
-      // thing this redesign exists to show off) compressed to a sliver
-      // with empty space stacked above and below (caught by looking, not
-      // by DOM inspection — the nodes were correctly positioned and
-      // separated the whole time). Fit by HEIGHT instead, so the lanes
-      // use the dialog's vertical space; width can exceed the viewport —
-      // the rest of history is one pan away, and the point of this pass
-      // is the branch structure, not fitting every op on screen at once.
-      const canvas = canvasRef.current
-      const bounds = getNodesBounds(nodes)
-      const padding = 0.1
-      const zoom = Math.min(
-        1.75,
-        (canvas.clientHeight * (1 - padding)) / Math.max(1, bounds.height),
-      )
-      const x = -bounds.x * zoom + 24
-      const y = (canvas.clientHeight - bounds.height * zoom) / 2 - bounds.y * zoom
-      rfInstance.setViewport({ x, y, zoom }, { duration: 200 })
-      // Read back the zoom actually landed on and use it as the zoom-out
-      // floor — a graph with 4 nodes and one with 400 need different
-      // floors; this measures rather than guesses.
+    if (rfInstance && !loading && nodes.length > 0) {
+      // The wrapped-grid layout keeps the graph's aspect ratio close to
+      // the dialog's, so React Flow's own fitView does the right thing.
+      // (A hand-rolled height-fit used to live here to work around the
+      // one-long-line layout rendering as a sliver — that layout is gone.)
+      void rfInstance.fitView({ padding: 0.08, maxZoom: 1.25, duration: 200 })
+      // Read back the zoom fitView landed on and use it as the zoom-out
+      // floor — "zoom out" must never land on an empty field.
       const t = window.setTimeout(() => {
-        setMinZoom(Math.min(0.5, zoom * 0.75))
-      }, 240)
+        setMinZoom(Math.min(0.4, rfInstance.getViewport().zoom * 0.75))
+      }, 260)
       return () => window.clearTimeout(t)
     }
     // Fit once when data first lands; deliberately not re-fitting on
@@ -846,6 +861,20 @@ export default function TimelineGraph({
             <div className="absolute inset-0 flex items-center justify-center text-[12px] text-muted-foreground/60">
               ⋯ loading branch histories
             </div>
+          ) : totalOps === 0 && fetched.some((f) => f.failed) ? (
+            // A refused fetch is NOT an empty document — say which it
+            // was, and offer the retry in place instead of making the
+            // user close and reopen the dialog.
+            <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 text-[12px] text-amber-800 dark:text-amber-300">
+              <span>history fetch refused (rate-limited or backend error) — the log was not read</span>
+              <button
+                type="button"
+                onClick={() => setLoadEpoch((n) => n + 1)}
+                className="px-2 py-1 rounded border border-amber-500/40 hover:bg-amber-500/10"
+              >
+                retry
+              </button>
+            </div>
           ) : totalOps === 0 ? (
             <div className="absolute inset-0 flex items-center justify-center text-[12px] text-muted-foreground/60">
               {durability?.state === 'failed'
@@ -860,6 +889,15 @@ export default function TimelineGraph({
               onInit={setRfInstance}
               minZoom={minZoom}
               maxZoom={1.75}
+              // Trackpad-first navigation (Varun, live: "unable to
+              // traverse using the mousepad .. double finger swipes to
+              // move left right up down"): React Flow's default treats
+              // wheel/two-finger scroll as ZOOM, so swiping did nothing
+              // useful. panOnScroll makes two-finger swipes pan in all
+              // directions; pinch (ctrl+wheel) still zooms.
+              panOnScroll
+              zoomOnScroll={false}
+              zoomOnPinch
               proOptions={{ hideAttribution: true }}
             >
               {/* xyflow's Controls/MiniMap chrome ships light-theme colors

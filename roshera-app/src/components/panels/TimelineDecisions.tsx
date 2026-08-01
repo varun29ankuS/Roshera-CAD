@@ -92,7 +92,11 @@ function DecisionChip({
       )}
     >
       <span aria-hidden className="text-foreground/60">◈</span>
-      <span className="font-medium max-w-[24ch] truncate">{cp.name}</span>
+      {/* 44ch fits real engineering names ("M8 clearance holes, close
+          fit, 4x base corners" is 44 chars — measured against the first
+          live intent declared through the new picker) without letting a
+          run-on paragraph eat the rail. */}
+      <span className="font-medium max-w-[44ch] truncate">{cp.name}</span>
       <span className="text-muted-foreground/80 font-mono text-[10px]">
         {formatEventRange(cp.event_range)}
       </span>

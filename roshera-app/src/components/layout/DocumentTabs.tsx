@@ -24,6 +24,7 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Plus, X } from 'lucide-react'
+import { ContextMenu, ContextMenuItem } from '@/components/ui/context-menu'
 import { cn } from '@/lib/utils'
 import { type DocumentInfo } from '@/lib/documents-api'
 import { useDocumentStore } from '@/stores/document-store'
@@ -73,7 +74,6 @@ export function DocumentTabs() {
   const [addMenuOpen, setAddMenuOpen] = useState(false)
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null)
   const addMenuRef = useRef<HTMLDivElement | null>(null)
-  const contextMenuRef = useRef<HTMLDivElement | null>(null)
 
   const setClosedIds = useCallback((updater: (prev: Set<string>) => Set<string>) => {
     setClosedIdsState((prev) => {
@@ -104,24 +104,6 @@ export function DocumentTabs() {
       document.removeEventListener('keydown', onKey)
     }
   }, [addMenuOpen])
-
-  useEffect(() => {
-    if (!contextMenu) return
-    const onPointer = (e: MouseEvent) => {
-      if (contextMenuRef.current && !contextMenuRef.current.contains(e.target as Node)) {
-        setContextMenu(null)
-      }
-    }
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') setContextMenu(null)
-    }
-    document.addEventListener('mousedown', onPointer)
-    document.addEventListener('keydown', onKey)
-    return () => {
-      document.removeEventListener('mousedown', onPointer)
-      document.removeEventListener('keydown', onKey)
-    }
-  }, [contextMenu])
 
   // Visible tabs = every document EXCEPT ones the user explicitly closed —
   // and the active document is ALWAYS visible, closed-set or not, so the
@@ -250,18 +232,18 @@ export function DocumentTabs() {
             className={cn(
               'group relative flex items-center gap-1.5 h-6 pl-2.5 pr-1 rounded-t text-[12px] shrink-0 max-w-[180px] cursor-pointer transition-colors border-b-2',
               doc.active
-                ? 'bg-background text-foreground font-medium border-[#2ecc71]'
+                ? 'bg-background text-foreground font-medium border-primary'
                 : 'text-muted-foreground hover:text-foreground hover:bg-accent/30 border-transparent',
               switchingId && !isSwitchingHere && 'pointer-events-none opacity-60',
             )}
           >
             {doc.active && !isSwitchingHere && (
-              <span aria-hidden className="inline-block w-1.5 h-1.5 rounded-full bg-[#2ecc71] shrink-0" />
+              <span aria-hidden className="inline-block w-1.5 h-1.5 rounded-full bg-primary shrink-0" />
             )}
             {isSwitchingHere && (
               <span
                 aria-hidden
-                className="inline-block w-1.5 h-1.5 rounded-full bg-[#2ecc71] shrink-0 animate-pulse"
+                className="inline-block w-1.5 h-1.5 rounded-full bg-primary shrink-0 animate-pulse"
               />
             )}
             <span className="truncate">{doc.name}</span>
@@ -334,40 +316,40 @@ export function DocumentTabs() {
       </div>
 
       {contextMenu && (
-        <div
-          ref={contextMenuRef}
-          role="menu"
-          className="fixed z-[100] min-w-[170px] rounded-md border border-border bg-card shadow-lg py-1 text-[12px]"
-          style={{ left: contextMenu.x, top: contextMenu.y }}
+        <ContextMenu
+          x={contextMenu.x}
+          y={contextMenu.y}
+          onClose={() => setContextMenu(null)}
+          aria-label="Document tab actions"
         >
-          <button
-            type="button"
-            role="menuitem"
+          <ContextMenuItem
             disabled={tabs.length === 1 && contextMenu.doc.active}
+            title={
+              tabs.length === 1 && contextMenu.doc.active
+                ? 'Nothing to switch to — open another document first'
+                : 'Close this tab. The document stays open — reopen it from the + menu'
+            }
             onClick={() => {
               void closeTab(contextMenu.doc)
               setContextMenu(null)
             }}
-            className="w-full text-left px-3 py-1.5 hover:bg-accent/40 text-foreground/90 disabled:opacity-40 disabled:hover:bg-transparent disabled:cursor-not-allowed"
           >
             Close
-          </button>
-          <button
-            type="button"
-            role="menuitem"
+          </ContextMenuItem>
+          <ContextMenuItem
             disabled={tabs.length === 1}
+            title={tabs.length === 1 ? 'No other tabs to close' : undefined}
             onClick={() => {
               void closeOthers(contextMenu.doc)
               setContextMenu(null)
             }}
-            className="w-full text-left px-3 py-1.5 hover:bg-accent/40 text-foreground/90 disabled:opacity-40 disabled:hover:bg-transparent disabled:cursor-not-allowed"
           >
             Close others
-          </button>
+          </ContextMenuItem>
           {/* No Rename: the backend document registry (`documents.rs`) has
               no PATCH/rename route today — an item that can't do anything
               is worse than no item. */}
-        </div>
+        </ContextMenu>
       )}
     </div>
   )
