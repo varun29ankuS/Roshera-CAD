@@ -1493,6 +1493,31 @@ pub enum BootProviderPin {
     /// live (see `repin_goose_to_claude_code`), so a restart cannot undo
     /// that choice.
     ClaudeCode { cli_path: PathBuf },
+    /// A persisted `api_key` config for a vendor goose reaches through a
+    /// DECLARATIVE provider (sarvam, xai, mistral, glm, kimi) — repin to
+    /// it, exactly as `PUT /api/ai/provider` does live.
+    ///
+    /// This variant exists because its absence was a silent regression.
+    /// `Default` was correct while `api_key` could only mean Anthropic,
+    /// whose key goose's built-in provider reads on its own. Once other
+    /// vendors gained `api_key` modes, every one of them fell through to
+    /// `Default` — so a restart repinned goose to `anthropic`, which has
+    /// no credential, and every turn failed with "Provider not set"
+    /// (observed 2026-08-01 with `sarvam` persisted). The user's choice
+    /// survived in the state file and was ignored on the way back up,
+    /// which is the same defect `ClaudeCode` was added to fix, arriving
+    /// again through the vendor family added later.
+    Declarative {
+        /// Roshera's allowlist id, not goose's provider name — the
+        /// translation (e.g. `glm` → `zhipu`) belongs to
+        /// `goose_declarative_provider_for`, not to callers.
+        roshera_provider_id: String,
+        api_key: String,
+        /// `None` means "no explicit choice was persisted"; the repin then
+        /// falls back to that vendor's live-verified default, and refuses
+        /// if it has none rather than pinning an empty model.
+        model: Option<String>,
+    },
 }
 
 /// Pure decision logic — no env/filesystem access, `claude_cli` is
@@ -1515,6 +1540,40 @@ pub fn resolve_boot_provider_pin(
             };
         }
     }
+
+    // A persisted `api_key` config for a vendor goose reaches through a
+    // declarative provider must be repinned, or the choice is lost on every
+    // restart. `anthropic` deliberately does NOT match here:
+    // `goose_declarative_provider_for` returns `None` for it, because
+    // goose's built-in provider already reads `ANTHROPIC_API_KEY` without a
+    // repin — so it still resolves to `Default`, which is correct for it and
+    // was correct for everything back when it was the only vendor.
+    //
+    // A stored config naming such a vendor with NO usable key falls through
+    // to `Default` as well: repinning to a provider with no credential would
+    // trade "Provider not set" for a failure one layer deeper.
+    if let Some(s) = stored {
+        if s.mode == "api_key" && goose_declarative_provider_for(&s.provider).is_some() {
+            if let Some(key) = s
+                .api_key
+                .as_deref()
+                .map(str::trim)
+                .filter(|k| !k.is_empty())
+            {
+                return BootProviderPin::Declarative {
+                    roshera_provider_id: s.provider.clone(),
+                    api_key: key.to_string(),
+                    model: s
+                        .model
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|m| !m.is_empty())
+                        .map(str::to_string),
+                };
+            }
+        }
+    }
+
     BootProviderPin::Default
 }
 
@@ -2009,6 +2068,73 @@ mod tests {
             resolve_boot_provider_pin(None, &cli),
             BootProviderPin::Default
         );
+    }
+
+    /// The regression Varun hit: a persisted declarative-vendor choice was
+    /// discarded on every restart.
+    ///
+    /// `sarvam`/`api_key` fell through to `Default`, which repins goose to
+    /// `anthropic` — a provider holding no credential — so the first turn
+    /// after any restart failed with "Provider not set" while the user's
+    /// actual choice sat unread in `state/ai-provider.json`. Without the
+    /// `Declarative` arm this asserts `Default` and fails.
+    #[test]
+    fn a_persisted_declarative_vendor_is_repinned_at_boot_not_dropped_to_anthropic() {
+        let cfg = StoredProviderConfig {
+            provider: "sarvam".to_string(),
+            mode: "api_key".to_string(),
+            api_key: Some("sk_live_key".to_string()),
+            model: Some("sarvam-105b".to_string()),
+            ..stored("api_key", None)
+        };
+        assert_eq!(
+            resolve_boot_provider_pin(Some(&cfg), &cli_status(false, None)),
+            BootProviderPin::Declarative {
+                roshera_provider_id: "sarvam".to_string(),
+                api_key: "sk_live_key".to_string(),
+                model: Some("sarvam-105b".to_string()),
+            },
+            "a persisted declarative vendor must be repinned at boot — dropping to \
+             Default silently reverts the user's choice to a provider with no key"
+        );
+    }
+
+    /// Anthropic must NOT take the new arm. Its `api_key` mode is served by
+    /// goose's own built-in provider reading `ANTHROPIC_API_KEY`, needing no
+    /// repin — `goose_declarative_provider_for("anthropic")` is `None`, and
+    /// that is what keeps this correct rather than an ordering accident.
+    #[test]
+    fn anthropic_api_key_still_resolves_to_default_not_the_declarative_arm() {
+        let cfg = StoredProviderConfig {
+            provider: "anthropic".to_string(),
+            mode: "api_key".to_string(),
+            api_key: Some("sk-ant-real".to_string()),
+            ..stored("api_key", None)
+        };
+        assert_eq!(
+            resolve_boot_provider_pin(Some(&cfg), &cli_status(false, None)),
+            BootProviderPin::Default
+        );
+    }
+
+    /// A declarative vendor with no usable key stays on `Default`. Repinning
+    /// to a provider that holds no credential would trade "Provider not set"
+    /// for the same failure one layer deeper, and lose the honest signal.
+    #[test]
+    fn a_declarative_vendor_without_a_key_is_not_repinned() {
+        for key in [None, Some(String::new()), Some("   ".to_string())] {
+            let cfg = StoredProviderConfig {
+                provider: "sarvam".to_string(),
+                mode: "api_key".to_string(),
+                api_key: key.clone(),
+                ..stored("api_key", None)
+            };
+            assert_eq!(
+                resolve_boot_provider_pin(Some(&cfg), &cli_status(false, None)),
+                BootProviderPin::Default,
+                "no usable key ({key:?}) must not produce a repin"
+            );
+        }
     }
 
     #[test]

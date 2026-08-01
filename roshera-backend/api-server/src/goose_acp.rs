@@ -568,6 +568,29 @@ pub(crate) fn initialize(
             // function — see the ordering note at that call site.
             crate::ai_provider_config::scrub_anthropic_env_for_subscription_mode();
         }
+        crate::ai_provider_config::BootProviderPin::Declarative {
+            roshera_provider_id,
+            api_key,
+            model,
+        } => {
+            // Same call the PUT handler makes when the user connects one of
+            // these vendors live, so a restart reproduces the choice rather
+            // than discarding it. Without this branch every declarative
+            // vendor fell to `Default` and repinned to `anthropic`, which
+            // holds no credential — "Provider not set" on the first turn
+            // after every restart, with the user's real choice still sitting
+            // in the state file.
+            //
+            // Failing here is fatal on purpose. The alternative is booting
+            // pinned to a provider the user did not choose and cannot use,
+            // which is the silent-wrong-state this whole module refuses.
+            crate::ai_provider_config::repin_goose_to_declarative_provider(
+                roshera_provider_id,
+                api_key,
+                model.as_deref(),
+            )
+            .map_err(GooseAcpError::ProviderPin)?;
+        }
     }
 
     // Disable EVERY entry in goose's platform-extension registry — the
