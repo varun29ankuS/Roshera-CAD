@@ -344,28 +344,34 @@ pub const PROVIDER_ALLOWLIST: &[AllowlistedProvider] = &[
         modes: &[ModeEntry {
             mode: CredentialMode::ApiKey,
             spawns_local_process: false,
-            wiring: WiringStatus::SeamOnly(
-                "Unlike xai/mistral/glm/kimi/baseten, this is not a 'no \
-                 path' gap: goose loads user-supplied declarative-provider \
-                 JSON from `<GOOSE_PATH_ROOT>/config/custom_providers/` \
-                 ahead of its bundled definitions \
-                 (`declarative_providers.rs::load_provider` and \
-                 `register_declarative_providers`, both checking \
-                 `custom_providers_dir()` first), and Roshera already pins \
-                 `GOOSE_PATH_ROOT` to its own `state/goose-root` at startup \
-                 (`goose_acp.rs::initialize`) — so registering Sarvam is a \
-                 config change (write one JSON file into a directory \
-                 Roshera already controls), not a code change on goose's \
-                 side. This entry stays SeamOnly anyway because no JSON was \
-                 written: Sarvam's exact API base URL and API-key env var \
-                 name are not confirmed by anything in this repo or in \
-                 goose's bundled provider definitions (no `sarvam.json` \
-                 exists there), and a guessed endpoint would be a silently \
-                 wrong path presented as working, not an honest gap.",
-            ),
-            reason: "Static Sarvam AI API key over HTTPS Bearer auth, once \
-                     the base URL and key env var are confirmed and a \
-                     custom-provider definition is written server-side.",
+            wiring: WiringStatus::Wired,
+            reason: "Static Sarvam AI API key over HTTPS Bearer auth \
+                     (SARVAM_API_KEY). Unlike xai/mistral/glm/kimi, Sarvam \
+                     has no goose-bundled declarative provider — instead \
+                     the custom-provider JSON lives at \
+                     `state/goose-root/config/custom_providers/sarvam.json`, \
+                     which goose's declarative-provider loader \
+                     (`declarative_providers.rs::load_provider` and \
+                     `register_declarative_providers`) reads ahead of its \
+                     bundled definitions and registers into the same \
+                     `ProviderRegistry` as the bundled vendors, keyed by \
+                     the same `name` field — so `repin_goose_to_declarative_provider` \
+                     maps Roshera's `sarvam` id to goose's provider name \
+                     `sarvam` (an identity mapping, unlike glm's mapping to \
+                     `zhipu`) and it resolves the same way xai/mistral/glm/ \
+                     kimi already do. The base URL \
+                     (`https://api.sarvam.ai/v1`) and the single live \
+                     model `sarvam-105b` were verified against \
+                     `GET https://api.sarvam.ai/v1/models` on 2026-08-01; \
+                     `sarvam-30b`, previously declared in that JSON, was \
+                     removed because the live API does not serve it — \
+                     declaring a model the vendor doesn't serve is the \
+                     exact failure this seam existed to prevent. This \
+                     wires the agent (/acp) surface only: there is no \
+                     native Roshera `LLMProvider` for Sarvam, so REST \
+                     routes (/api/ai/command) stay unavailable through \
+                     this key. The key itself is accepted unverified; an \
+                     invalid key surfaces at first use.",
         }],
     },
 ];
@@ -601,7 +607,7 @@ mod tests {
         // `repin_goose_to_declarative_provider`, generalizing the
         // ANTHROPIC_API_KEY-env-var-first mechanism that already served
         // anthropic to any goose provider that resolves its credential
-        // the same way. These four wire the /acp agent surface only —
+        // the same way. These five wire the /acp agent surface only —
         // REST (/api/ai/command) has no native Roshera LLMProvider for
         // any of them, same split already true of anthropic's
         // subscription_cli entry above.
@@ -609,6 +615,13 @@ mod tests {
         ("mistral", CredentialMode::ApiKey),
         ("glm", CredentialMode::ApiKey),
         ("kimi", CredentialMode::ApiKey),
+        // sarvam has no goose-bundled provider — it resolves through the
+        // custom-provider JSON at
+        // `state/goose-root/config/custom_providers/sarvam.json`, which
+        // `register_declarative_providers` registers into the same
+        // `ProviderRegistry` as the bundled vendors above, so it is
+        // equally resolvable, not a different tier of "wired".
+        ("sarvam", CredentialMode::ApiKey),
     ];
 
     #[test]
@@ -631,15 +644,15 @@ mod tests {
         }
     }
 
-    /// `baseten` and `sarvam` remain `SeamOnly`: `baseten` because its
-    /// "model" is a deployment ID goose has no bundled provider shape for,
-    /// `sarvam` because no API base URL / key env var is confirmed by
-    /// anything in this repo or goose's bundled definitions (see each
-    /// entry's reason text for detail — both are real, evidenced gaps, not
-    /// "should work eventually" placeholders).
+    /// `baseten` remains `SeamOnly`: its "model" is a deployment ID goose
+    /// has no bundled provider shape for (see its entry's reason text for
+    /// detail — a real, evidenced gap, not a "should work eventually"
+    /// placeholder). `sarvam` moved to `Wired` 2026-08-01 (see
+    /// `sarvam_api_key_is_wired` below) once its custom-provider JSON was
+    /// written and verified against the live API.
     #[test]
-    fn baseten_and_sarvam_are_seam_only() {
-        for id in ["baseten", "sarvam"] {
+    fn baseten_is_seam_only() {
+        for id in ["baseten"] {
             let provider =
                 resolve(id).unwrap_or_else(|e| panic!("'{id}' must be allowlisted: {e}"));
             for mode in provider.modes {
@@ -660,11 +673,11 @@ mod tests {
     }
 
     /// The four vendors `api-server`'s `repin_goose_to_declarative_provider`
-    /// can actually serve (2026-08-01): each pins goose's own bundled
-    /// provider for the vendor and supplies its API key via the exact env
-    /// var that provider's credential resolution reads. None spawns a
-    /// local process — these are pure API-key vendors, unlike
-    /// subscription_cli.
+    /// serves via one of goose's own bundled providers (2026-08-01): each
+    /// pins goose's own bundled provider for the vendor and supplies its
+    /// API key via the exact env var that provider's credential resolution
+    /// reads. None spawns a local process — these are pure API-key
+    /// vendors, unlike subscription_cli.
     #[test]
     fn xai_mistral_glm_kimi_api_key_are_wired() {
         for id in ["xai", "mistral", "glm", "kimi"] {
@@ -681,5 +694,28 @@ mod tests {
                  declare it spawns a local process"
             );
         }
+    }
+
+    /// `sarvam` is `Wired` via a different path than the four above: it has
+    /// no goose-bundled provider, so `repin_goose_to_declarative_provider`
+    /// targets the custom-provider JSON at
+    /// `state/goose-root/config/custom_providers/sarvam.json` under an
+    /// identity mapping (`sarvam` -> `sarvam`), verified live against
+    /// `GET https://api.sarvam.ai/v1/models` on 2026-08-01.
+    #[test]
+    fn sarvam_api_key_is_wired() {
+        let (_, entry) = resolve_mode("sarvam", CredentialMode::ApiKey)
+            .unwrap_or_else(|e| panic!("'sarvam'/api_key must be allowlisted: {e}"));
+        assert_eq!(
+            entry.wiring,
+            WiringStatus::Wired,
+            "'sarvam'/api_key must be Wired now that its custom-provider JSON is written \
+             and verified"
+        );
+        assert!(
+            !entry.spawns_local_process,
+            "'sarvam'/api_key is a plain API-key vendor and must not declare it spawns a \
+             local process"
+        );
     }
 }

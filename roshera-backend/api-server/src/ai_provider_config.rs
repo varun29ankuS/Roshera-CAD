@@ -995,6 +995,17 @@ fn goose_declarative_provider_for(
         // OAuth-device-flow CLI product goose separately supports that
         // this module does not touch.
         "kimi" => Some(("moonshot", "MOONSHOT_API_KEY")),
+        // Unlike xai/mistral/glm/kimi, Sarvam has no goose-bundled
+        // declarative provider. Instead its definition is a custom-provider
+        // JSON at `state/goose-root/config/custom_providers/sarvam.json`,
+        // which `declarative_providers.rs::register_declarative_providers`
+        // loads and registers into the same `ProviderRegistry` as the
+        // bundled vendors, keyed by the same `name` field. Roshera's
+        // allowlist id and goose's provider name are therefore identical
+        // (`sarvam` -> `sarvam`) — not a rename like glm -> zhipu, just the
+        // same string reused because there was never a second name to
+        // reconcile.
+        "sarvam" => Some(("sarvam", "SARVAM_API_KEY")),
         _ => None,
     }
 }
@@ -1807,6 +1818,17 @@ mod tests {
             goose_declarative_provider_for("kimi"),
             Some(("moonshot", "MOONSHOT_API_KEY")),
             "Roshera's 'kimi' id must map to goose's own 'moonshot' provider name"
+        );
+    }
+
+    #[test]
+    fn goose_declarative_provider_for_maps_sarvam_by_identity() {
+        assert_eq!(
+            goose_declarative_provider_for("sarvam"),
+            Some(("sarvam", "SARVAM_API_KEY")),
+            "Roshera's 'sarvam' id must map to goose's custom-provider name \
+             'sarvam' (identity mapping — there is no goose-bundled provider \
+             to rename to, unlike glm -> zhipu)"
         );
     }
 
