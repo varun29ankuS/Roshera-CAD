@@ -7,6 +7,10 @@ import { cn } from '@/lib/utils'
 import { tryReadJson, refusalMessage } from '@/lib/backend-refusal'
 import {
   type EventSummary,
+  type CheckpointSummary,
+  type DurabilityStatus,
+  durabilityNotice,
+  parseDurabilityStatus,
   normalizeKind,
   symbolForOperation,
   shortLabel,
@@ -17,6 +21,7 @@ import {
   authorGlyph,
   authorTextClass,
 } from '@/lib/timeline-events'
+import { DecisionRail, DurabilityChip } from './TimelineDecisions'
 
 // Graph ("map") view — a second, toggleable view alongside this strip
 // (see vault Research/2026-07-31-ui-pass-spec.md §3). Lazy-loaded: it
@@ -65,6 +70,28 @@ const MOCK_EVENTS: EventSummary[] = (() => {
       author: 'User { id: 1, name: Varun }' },
   ]
 })()
+
+// Preview-only fixtures for the decision layer — the opt-in `?preview`
+// surface is the one place mock data is allowed, and it exists exactly
+// so the states that are rare at runtime (a populated checkpoint rail,
+// a quarantined boot) can be seen and styled without faking them live.
+const MOCK_CHECKPOINTS: CheckpointSummary[] = [
+  { id: 'mc1', name: 'base plate', description: '60×60×10 plate, centred on origin',
+    event_range: [1, 3], author: 'Claude', tags: ['feature'],
+    timestamp: new Date(Date.now() - 200_000).toISOString() },
+  { id: 'mc2', name: 'bolt circle 8×⌀18', description: 'clearance holes, PCD 45',
+    event_range: [4, 7], author: 'Claude', tags: ['feature'],
+    timestamp: new Date(Date.now() - 60_000).toISOString() },
+]
+
+const MOCK_DURABILITY: DurabilityStatus = {
+  state: 'quarantined',
+  first_break_sequence: 73,
+  first_break_kind: 'chamfer_edges',
+  reason: 'replay of this event does not reproduce the recorded result',
+  events_served: 88,
+  events_total: 173,
+}
 
 // Types + kind/symbol/label/author helpers now live in
 // `@/lib/timeline-events` and are imported + re-exported at the top
@@ -146,16 +173,28 @@ function RecentOpsStrip({
   now,
   onContextMenu,
   loading,
+  durability,
 }: {
   events: EventSummary[]
   now: number
   onContextMenu: (e: React.MouseEvent, event: EventSummary) => void
   loading: boolean
+  durability: DurabilityStatus | null
 }) {
   if (events.length === 0) {
+    // An empty strip must say the TRUE thing, and "no operations yet"
+    // is only true when the log really is empty. A failed boot read or
+    // disabled persistence are different facts with different stakes.
+    const line = loading
+      ? '⋯ loading'
+      : durability?.state === 'failed'
+        ? '∅ event log unreadable at boot — serving a blank model, not an empty document'
+        : durability?.state === 'disabled'
+          ? '∅ persistence off — operations recorded now will not survive a restart'
+          : '∅ no operations yet'
     return (
       <div className="text-[12px] text-muted-foreground/60 px-3 py-2">
-        {loading ? '⋯ loading' : '∅ no operations yet'}
+        {line}
       </div>
     )
   }
@@ -783,6 +822,20 @@ export function Timeline() {
   const previewMode = isPreviewMode()
   const [events, setEvents] = useState<EventSummary[]>(previewMode ? MOCK_EVENTS : [])
   const [branches, setBranches] = useState<BranchView[]>(previewMode ? MOCK_BRANCHES : [])
+  // Named design states — the decision layer. Usually EMPTY at runtime
+  // (checkpoints are volatile; they do not survive a restart), and that
+  // emptiness renders as an explicit "no declared intents" line, never
+  // a skeleton. Preview mode seeds both so the rare states (populated
+  // rail, quarantined boot) are stylable without faking them live.
+  const [checkpoints, setCheckpoints] = useState<CheckpointSummary[]>(
+    previewMode ? MOCK_CHECKPOINTS : [],
+  )
+  // Durability boot outcome. `quarantined` = the kernel is withholding a
+  // tail it cannot faithfully replay — surfaced as an amber chip in the
+  // controls row (see DurabilityChip); calm states produce no chip.
+  const [durability, setDurability] = useState<DurabilityStatus | null>(
+    previewMode ? MOCK_DURABILITY : null,
+  )
   // Active branch = the one whose events are shown in the strip AND
   // the one the kernel records new operations against. The minimap
   // calls `selectBranch(id)` when the user clicks a node; we POST
@@ -979,6 +1032,57 @@ export function Timeline() {
     }
   }, [wsStatus, fetchHistory])
 
+  // Checkpoints — the decision layer. Deliberately NOT part of the 5s
+  // history poll: the API's read class is rate-limited and the existing
+  // poll already runs 2 GETs per tick per open tab (adding a third
+  // tripped live 429s during this pass, verified 2026-08-01). Declared
+  // intents change rarely, so a 15s cadence + an eager refresh right
+  // after this client creates one keeps the rail honest without
+  // leaning on the limiter.
+  const fetchCheckpoints = useCallback(async () => {
+    if (previewMode) return
+    try {
+      const resp = await fetch('/api/timeline/checkpoints')
+      if (!resp.ok) return
+      const data = await resp.json()
+      if (Array.isArray(data)) setCheckpoints(data as CheckpointSummary[])
+    } catch {
+      // Backend not running — keep the last known list.
+    }
+  }, [previewMode])
+
+  useEffect(() => {
+    if (previewMode || wsStatus !== 'connected') return
+    void fetchCheckpoints()
+    const timer = setInterval(() => {
+      if (document.visibilityState === 'visible') void fetchCheckpoints()
+    }, 15_000)
+    return () => clearInterval(timer)
+  }, [previewMode, wsStatus, documentEpoch, fetchCheckpoints])
+
+  // Durability boot outcome — fetched OUTSIDE the 5s history poll on
+  // purpose: it only changes at boot or on an in-place document switch
+  // (documents.rs::activate re-runs boot_replay), and the API has
+  // per-class rate limits that a fatter poll tick would lean on.
+  // Re-fetched on reconnect and on every confirmed document switch.
+  useEffect(() => {
+    if (previewMode || wsStatus !== 'connected') return
+    let cancelled = false
+    ;(async () => {
+      try {
+        const resp = await fetch('/api/durability/status')
+        if (!resp.ok) return
+        const status = parseDurabilityStatus(await resp.json())
+        if (!cancelled && status) setDurability(status)
+      } catch {
+        // Backend not running — leave the last known status in place.
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [previewMode, wsStatus, documentEpoch])
+
   // Poll for updates (pause when tab is hidden)
   useEffect(() => {
     let timer: ReturnType<typeof setInterval> | null = null
@@ -1125,6 +1229,9 @@ export function Timeline() {
         return
       }
       fetchHistory()
+      // The decision rail refreshes on its own slow cadence; a checkpoint
+      // this client just created should appear immediately, not in ≤15s.
+      void fetchCheckpoints()
     } catch {
       flashActionError('Backend unreachable — checkpoint not created')
     }
@@ -1415,6 +1522,17 @@ export function Timeline() {
           {events.length} op{events.length === 1 ? '' : 's'}
         </span>
 
+        {/* Durability disclosure — non-null exactly when the boot
+            outcome withheld or lost history (quarantine/failure) or
+            persistence is off. The short label is readable in place;
+            the full account (break sequence, kind, reason) is on
+            hover. Amber-dashed = withheld-by-design, red = log
+            unreadable — the card-chrome tri-state language. */}
+        {(() => {
+          const notice = durabilityNotice(durability)
+          return notice ? <DurabilityChip notice={notice} /> : null
+        })()}
+
         <div className="flex-1" />
 
         {/* Map view toggle — a second, independent view of the SAME
@@ -1478,14 +1596,23 @@ export function Timeline() {
       )}
 
       {/* Recent-ops strip: ambient "what just happened", last few ops only.
-          Full history moved to the map — this never grows past a glance. */}
+          Full history moved to the map — this never grows past a glance.
+          Above it, the DECISION rail: named intents (checkpoints) when any
+          exist, and the honest "N ops without a named decision" line when
+          work happened but nobody declared what it was for. */}
       {!bodyCollapsed && (
         <div className="border-t border-border/40">
+          <DecisionRail
+            checkpoints={checkpoints}
+            eventCount={events.length}
+            onOpen={() => setGraphOpen(true)}
+          />
           <RecentOpsStrip
             events={events}
             now={now}
             onContextMenu={handleEventContextMenu}
             loading={loading}
+            durability={durability}
           />
         </div>
       )}
@@ -1567,6 +1694,8 @@ export function Timeline() {
             branches={branches}
             activeBranchId={activeBranchId}
             liveNames={liveNames}
+            checkpoints={checkpoints}
+            durability={durability}
             onClose={() => setGraphOpen(false)}
           />
         </Suspense>

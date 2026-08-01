@@ -61,10 +61,15 @@ import { X } from 'lucide-react'
 import { useThemeStore } from '@/stores/theme-store'
 import {
   type EventSummary,
+  type CheckpointSummary,
+  type DurabilityStatus,
+  checkpointCovering,
+  durabilityNotice,
   shortLabel,
   symbolForOperation,
   formatTimestamp,
 } from '@/lib/timeline-events'
+import { DurabilityChip } from './TimelineDecisions'
 
 // ─── Minimal branch shape this view needs (mirrors `BranchView` in
 // Timeline.tsx — duplicated rather than imported so this module stays
@@ -89,6 +94,14 @@ interface EventGroup {
   /** Common `shortLabel` of every event in this run, e.g. "Cyl". */
   key: string
   events: EventSummary[]
+  /** The DECLARED intent covering this run — a checkpoint name, read
+   *  off the real checkpoint list, never inferred. `undefined` when no
+   *  checkpoint covers the run (the common case today: checkpoints are
+   *  volatile and usually absent). Attached only on root-branch runs —
+   *  checkpoint `event_range`s index the main timeline's sequences, so
+   *  applying them to a child branch's post-fork sequences would
+   *  mislabel spans that merely share numbers. */
+  intent?: string
 }
 
 /** Group events into contiguous runs of the same operation kind — a run
@@ -216,6 +229,15 @@ interface GraphNodeData extends Record<string, unknown> {
 const NODE_WIDTH = 190
 const COLLAPSED_HEIGHT = 54
 const EXPANDED_HEIGHT = 188
+/** Extra card height when a declared-intent overline is present, so
+ *  dagre reserves real room for the third line instead of letting the
+ *  card visually overflow its lane slot. */
+const INTENT_LINE_HEIGHT = 15
+
+function groupHeight(group: EventGroup, expanded: boolean): number {
+  const base = expanded ? EXPANDED_HEIGHT : COLLAPSED_HEIGHT
+  return base + (group.intent ? INTENT_LINE_HEIGHT : 0)
+}
 
 /** Everything that used to be printed on the card and now lives in the
  *  hover tooltip instead — branch, time range, ids. Progressive
@@ -225,6 +247,7 @@ function nodeTitle(branch: GraphBranch, group: EventGroup, resultPart: string | 
   const first = group.events[0]
   const last = group.events[group.events.length - 1]
   const lines = [
+    group.intent ? `declared intent: ${group.intent}` : '',
     `${branch.name || 'main'} · ${group.key} ×${group.events.length}`,
     first && last ? `${formatTimestamp(first.timestamp)} – ${formatTimestamp(last.timestamp)}` : '',
     resultPart ? `result: ${resultPart}` : '',
@@ -264,6 +287,17 @@ function IntentNode({ id, data }: NodeProps<Node<GraphNodeData>>) {
     >
       <Handle type="target" position={Position.Left} style={{ background: branchStroke, opacity: 0.6 }} />
       <div className={`${familyExtraPaddingX(family)} py-1.5`}>
+        {/* Line 0 — the DECLARED intent, when a real checkpoint covers
+            this run. This is the "named intent replaces the guessed
+            heading" moment promised in the module comment: the name is
+            read off the checkpoint list, never inferred. Neutral text —
+            colour stays reserved for state. */}
+        {group.intent && (
+          <div className="flex items-center gap-1 text-[10px] leading-tight text-foreground/80 mb-0.5 min-w-0">
+            <span aria-hidden className="shrink-0 text-foreground/60">◈</span>
+            <span className="truncate font-medium">{group.intent}</span>
+          </div>
+        )}
         {/* Line 1 — what it is: glyph + the honest grouping label. */}
         <div className="flex items-center justify-between gap-1 min-w-0">
           <span className="flex items-center gap-1.5 min-w-0 text-[12.5px] font-medium truncate">
@@ -431,9 +465,9 @@ function buildGraph(
       if (branch.parent) g.setNode(`${branch.id}:0`, { width: STUB_WIDTH, height: STUB_HEIGHT })
       continue
     }
-    groups.forEach((_group, i) => {
+    groups.forEach((group, i) => {
       const id = `${branch.id}:${i}`
-      const h = expandedIds.has(id) ? EXPANDED_HEIGHT : COLLAPSED_HEIGHT
+      const h = groupHeight(group, expandedIds.has(id))
       g.setNode(id, { width: NODE_WIDTH, height: h })
       if (i > 0) g.setEdge(`${branch.id}:${i - 1}`, id)
     })
@@ -499,7 +533,7 @@ function buildGraph(
       const id = `${branch.id}:${i}`
       const pos = g.node(id)
       if (!pos) return
-      const h = expandedIds.has(id) ? EXPANDED_HEIGHT : COLLAPSED_HEIGHT
+      const h = groupHeight(group, expandedIds.has(id))
       const left = pos.x - NODE_WIDTH / 2
       const top = pos.y - h / 2
       contentNodes.push({
@@ -605,11 +639,17 @@ export default function TimelineGraph({
   branches,
   activeBranchId,
   liveNames,
+  checkpoints,
+  durability,
   onClose,
 }: {
   branches: GraphBranch[]
   activeBranchId: string
   liveNames: Map<string, string>
+  /** Named design states (real checkpoints; usually empty — volatile). */
+  checkpoints: CheckpointSummary[]
+  /** Durability boot outcome — quarantine is disclosed in the header. */
+  durability: DurabilityStatus | null
   onClose: () => void
 }) {
   const [fetched, setFetched] = useState<FetchedBranch[]>([])
@@ -659,11 +699,34 @@ export default function TimelineGraph({
 
   const branchGroups = useMemo(
     () =>
-      fetched.map(({ branch, events }) => ({
-        branch,
-        groups: groupContiguous(events),
-      })),
-    [fetched],
+      fetched.map(({ branch, events }) => {
+        const groups = groupContiguous(events)
+        // Attach declared intents — root branch only (checkpoint ranges
+        // index main-timeline sequences; a child branch's post-fork
+        // sequence numbers merely coincide with them). A run gets the
+        // name only when EVERY event in it falls inside the covering
+        // checkpoint's range: a straddling run stays unlabeled rather
+        // than borrowing a name that only half-applies.
+        if (branch.parent == null && checkpoints.length > 0) {
+          for (const grp of groups) {
+            const first = grp.events[0]
+            if (!first) continue
+            const cp = checkpointCovering(checkpoints, first.sequence_number)
+            if (
+              cp &&
+              grp.events.every(
+                (e) =>
+                  e.sequence_number >= cp.event_range[0] &&
+                  e.sequence_number <= cp.event_range[1],
+              )
+            ) {
+              grp.intent = cp.name
+            }
+          }
+        }
+        return { branch, groups }
+      }),
+    [fetched, checkpoints],
   )
 
   const { nodes, edges } = useMemo(
@@ -732,8 +795,16 @@ export default function TimelineGraph({
           <div className="min-w-0 flex items-center gap-2">
             <span className="text-[13px] font-medium text-foreground shrink-0">Timeline — map view</span>
             <span className="text-[11px] text-muted-foreground/70 truncate">
-              Grouped by operation kind — named intents attach once the agent declares them.
+              {checkpoints.length > 0
+                ? `Grouped by operation kind — ${checkpoints.length} declared intent${
+                    checkpoints.length === 1 ? '' : 's'
+                  } attached (◈) where a checkpoint covers a run.`
+                : 'Grouped by operation kind — no declared intents on this document right now.'}
             </span>
+            {(() => {
+              const notice = durabilityNotice(durability)
+              return notice ? <DurabilityChip notice={notice} /> : null
+            })()}
             <button
               type="button"
               onClick={() => setDetailsOpen((v) => !v)}
@@ -777,7 +848,9 @@ export default function TimelineGraph({
             </div>
           ) : totalOps === 0 ? (
             <div className="absolute inset-0 flex items-center justify-center text-[12px] text-muted-foreground/60">
-              ∅ no operations recorded yet
+              {durability?.state === 'failed'
+                ? '∅ event log unreadable at boot — nothing to map'
+                : '∅ no operations recorded yet'}
             </div>
           ) : (
             <ReactFlow

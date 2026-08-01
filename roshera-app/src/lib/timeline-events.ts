@@ -30,6 +30,150 @@ export interface EventSummary {
 
 export type AuthorKind = 'user' | 'ai' | 'system'
 
+// ─── Named design states (GET /api/timeline/checkpoints) ───────────
+//
+// A checkpoint is a DECLARED intent — the agent (or user) naming what a
+// span of raw operations was FOR ("bolt circle, 8×⌀18"). This is the
+// layer that turns the event log into a map of decisions. It is also
+// volatile today: checkpoints do not survive a server restart, so the
+// endpoint routinely returns []. Renderers must treat that emptiness as
+// a first-class, true state ("no declared intents"), never hide it and
+// never invent names to fill the gap.
+
+export interface CheckpointSummary {
+  id: string
+  name: string
+  description: string
+  /** `[first, last]` event sequence numbers this decision covers. */
+  event_range: [number, number]
+  author: string
+  timestamp: string // ISO 8601 (RFC 3339) — NOT epoch ms
+  tags: string[]
+}
+
+/** `#4–#17`, collapsing a single-event range to `#4`. */
+export function formatEventRange(range: [number, number]): string {
+  const [a, b] = range
+  return a === b ? `#${a}` : `#${a}–#${b}`
+}
+
+/**
+ * The declared intent covering event `sequence`, or `null` when nobody
+ * named this span of history. Ranges may overlap (a later, more specific
+ * declaration over an earlier broad one) — the LAST covering checkpoint
+ * in list order wins, matching "most recently declared intent".
+ */
+export function checkpointCovering(
+  checkpoints: CheckpointSummary[],
+  sequence: number,
+): CheckpointSummary | null {
+  let found: CheckpointSummary | null = null
+  for (const cp of checkpoints) {
+    const [a, b] = cp.event_range
+    if (sequence >= a && sequence <= b) found = cp
+  }
+  return found
+}
+
+// ─── Durability boot outcome (GET /api/durability/status) ──────────
+//
+// Mirrors `DurabilityStatus` in `api-server/src/durability.rs` (serde
+// tag = "state", snake_case). `quarantined` is the honest-refusal case:
+// the kernel found an event it cannot faithfully replay, serves the
+// clean prefix, and REFUSES the tail rather than approximating it.
+// That withholding is by design and must be visible — a user looking at
+// the timeline has to be able to see that history is being withheld,
+// and why — but it is never an error to "fix" from the client side.
+
+export type DurabilityStatus =
+  | { state: 'disabled' }
+  | { state: 'empty' }
+  | { state: 'active'; events_replayed: number }
+  | {
+      state: 'quarantined'
+      first_break_sequence: number
+      first_break_kind: string
+      reason: string
+      events_served: number
+      events_total: number
+    }
+  | { state: 'failed'; reason: string }
+
+/**
+ * Parse the `GET /api/durability/status` payload. The endpoint wraps the
+ * typed union: `{ session_id, durability_enabled, quarantined,
+ * status: DurabilityStatus }` (main.rs::durability_status_endpoint) —
+ * verified live 2026-08-01; parsing the top level for a `state` tag
+ * silently yields null. A bare union is also accepted so a future
+ * unwrapped emitter keeps working. Anything else (or an unknown tag)
+ * → null, never a guessed status.
+ */
+export function parseDurabilityStatus(payload: unknown): DurabilityStatus | null {
+  const candidate =
+    payload && typeof payload === 'object' && 'state' in payload
+      ? payload
+      : payload && typeof payload === 'object' && 'status' in payload
+        ? (payload as { status: unknown }).status
+        : null
+  if (!candidate || typeof candidate !== 'object' || !('state' in candidate)) return null
+  const state = (candidate as { state: unknown }).state
+  const known = ['disabled', 'empty', 'active', 'quarantined', 'failed']
+  if (typeof state !== 'string' || !known.includes(state)) return null
+  return candidate as DurabilityStatus
+}
+
+export interface DurabilityNotice {
+  /** amber = history withheld · red = log unreadable · neutral = persistence off */
+  tone: 'withheld' | 'failed' | 'off'
+  /** Short enough to sit in the strip and be read without a mouse. */
+  label: string
+  /** The full account, for hover. */
+  detail: string
+}
+
+/**
+ * `null` for the calm cases (full replay, empty log) — the strip stays
+ * quiet when there is nothing to disclose. Non-null exactly when the
+ * boot outcome withheld or lost something the user would otherwise
+ * assume is there.
+ */
+export function durabilityNotice(
+  status: DurabilityStatus | null | undefined,
+): DurabilityNotice | null {
+  if (!status) return null
+  switch (status.state) {
+    case 'quarantined':
+      return {
+        tone: 'withheld',
+        label: `history: ${status.events_served}/${status.events_total} served`,
+        detail:
+          `Tail withheld at boot — by design. Event #${status.first_break_sequence} ` +
+          `(${status.first_break_kind}) cannot be faithfully replayed by this kernel: ` +
+          `${status.reason}. The clean prefix (${status.events_served} of ` +
+          `${status.events_total} events) is served; everything at and after the break ` +
+          `is refused rather than approximated.`,
+      }
+    case 'failed':
+      return {
+        tone: 'failed',
+        label: 'history unreadable',
+        detail:
+          `The event log could not be read at boot: ${status.reason}. ` +
+          `Serving a blank model rather than pretending the document is empty.`,
+      }
+    case 'disabled':
+      return {
+        tone: 'off',
+        label: 'persistence off',
+        detail:
+          'ROSHERA_DURABILITY=off — nothing recorded this session survives a restart.',
+      }
+    case 'active':
+    case 'empty':
+      return null
+  }
+}
+
 // ─── Kernel kind → symbol/label (terminal aesthetic) ────────────────
 //
 // `operation_type` is the clean kernel command name emitted by the
