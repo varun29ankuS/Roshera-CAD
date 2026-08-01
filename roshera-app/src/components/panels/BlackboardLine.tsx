@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, useCallback, useMemo } from 'react'
+import { useEffect, useState, useCallback, useMemo } from 'react'
 import { stringify as yamlStringify } from 'yaml'
 import { cn } from '@/lib/utils'
 import { processBlackboardMessage } from '@/lib/ai-client'
@@ -214,17 +214,27 @@ function TurnStatusGlyph({ status }: { status: AgentTurnStatus }) {
 }
 
 /**
- * One Blackboard line. A committed line renders through `MessageMarkdown`
- * (markdown + KaTeX math). Clicking the line enters edit mode: a textarea
- * shows the raw source; Enter (without Shift) or blur commits, Escape cancels.
- * Agent-, user-, and system-authored lines are all editable; origin is shown
- * by a subtle leading marker (agent → bot icon, user → person icon, system →
- * wrench icon for app-generated toolbar/operation feedback).
+ * One Blackboard line, rendered through `MessageMarkdown` (markdown +
+ * KaTeX math). **Read-only** — no line is editable, whoever wrote it.
+ *
+ * The notebook is a record. Editing let a certificate, a refusal or an
+ * agent's own reasoning be rewritten in place, and the result still looked
+ * like something its author had written; nothing on screen distinguished
+ * an original from an alteration. Deleting survives, because a deletion is
+ * visible: the line is gone and the event log says so. New text comes from
+ * the composer, which is the only thing that produces a line.
+ *
+ * Origin shows in the leading marker — SHAPE says who wrote it (agent →
+ * bot, user → person, system → wrench), COLOUR says what that line's own
+ * certificate concluded.
  */
 export function BlackboardLine({ line, onCommit, onDelete, streaming = false, onCancel }: Props) {
-  const [editing, setEditing] = useState(false)
-  const [draft, setDraft] = useState(line.text)
-  const textareaRef = useRef<HTMLTextAreaElement>(null)
+  // No edit state. The notebook is read-only as of 2026-08-01 — a textarea,
+  // a draft, an autosize effect and commit/cancel/keydown handlers all lived
+  // here to serve `setEditing(true)`, which no longer exists. They are gone
+  // rather than left unreachable: dead UI machinery in a file whose whole
+  // point is now that the record cannot be rewritten is exactly the kind of
+  // thing a later reader reinstates by accident.
 
   // Elapsed-time clock for the in-flight status row. `line.createdAt` is set
   // when the (blank) agent line is minted at turn start, so it IS the turn's
@@ -246,52 +256,6 @@ export function BlackboardLine({ line, onCommit, onDelete, streaming = false, on
   const [reveal] = useState(() => ({
     animate: line.author === 'agent' && (streaming || Date.now() - line.createdAt < 4000),
   }))
-
-  // Keep the draft in sync when the line text changes underneath us (e.g. an
-  // agent line streaming in) — but only while we're NOT actively editing it.
-  // Done as an in-render reconcile (React's "adjusting state on prop change"
-  // pattern) rather than an effect, so streaming updates show without a second
-  // render pass and without a setState-in-effect cascade.
-  const [lastSeenText, setLastSeenText] = useState(line.text)
-  if (!editing && line.text !== lastSeenText) {
-    setLastSeenText(line.text)
-    setDraft(line.text)
-  }
-
-  // Autosize + focus the textarea on entering edit mode.
-  useEffect(() => {
-    if (editing && textareaRef.current) {
-      const el = textareaRef.current
-      el.focus()
-      el.setSelectionRange(el.value.length, el.value.length)
-      el.style.height = 'auto'
-      el.style.height = `${el.scrollHeight}px`
-    }
-  }, [editing])
-
-  const commit = useCallback(() => {
-    setEditing(false)
-    const next = draft.replace(/\s+$/, '')
-    if (next !== line.text) onCommit(line.id, next)
-  }, [draft, line.id, line.text, onCommit])
-
-  const cancel = useCallback(() => {
-    setDraft(line.text)
-    setEditing(false)
-  }, [line.text])
-
-  const handleKeyDown = useCallback(
-    (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-      if (e.key === 'Enter' && !e.shiftKey) {
-        e.preventDefault()
-        commit()
-      } else if (e.key === 'Escape') {
-        e.preventDefault()
-        cancel()
-      }
-    },
-    [commit, cancel],
-  )
 
   // Answering a Choices card (`cards/ChoicesCard.tsx`) does two things: sends
   // the clicked option's value as the next turn, and rewrites THIS line's
@@ -360,9 +324,11 @@ export function BlackboardLine({ line, onCommit, onDelete, streaming = false, on
   // Content class decides both editability and shape (see
   // `lib/blackboard-content.ts`'s module doc). `evidence` is machine-
   // authored or verbatim-forwarded — the kernel's own testimony — and gets
-  // NO edit path at all, not a disabled one: no `onClick`, no `setEditing`,
-  // no "Click to edit" affordance. `control`/`reasoning` keep today's
-  // editing behaviour exactly.
+  // NO edit path at all, not a disabled one. That is now true of EVERY
+  // class, not just evidence — the notebook became read-only on
+  // 2026-08-01. The class still decides how a line READS: `reasoning` gets
+  // the readable lane, `evidence` is quieter and denser, `control` reads
+  // as interactive.
   const contentClass = classifyBlackboardContent(line)
   const isEvidence = contentClass === 'evidence'
   const isControl = contentClass === 'control'
@@ -423,22 +389,7 @@ export function BlackboardLine({ line, onCommit, onDelete, streaming = false, on
       </div>
 
       <div className="min-w-0 flex-1">
-        {editing ? (
-          <textarea
-            ref={textareaRef}
-            value={draft}
-            onChange={(e) => {
-              setDraft(e.target.value)
-              e.target.style.height = 'auto'
-              e.target.style.height = `${e.target.scrollHeight}px`
-            }}
-            onKeyDown={handleKeyDown}
-            onBlur={commit}
-            spellCheck={false}
-            className="w-full resize-none bg-transparent font-mono text-xs leading-relaxed text-foreground outline-none placeholder:text-white/30"
-            placeholder="Empty line — type markdown or $math$…"
-          />
-        ) : streaming ? (
+        {streaming ? (
           // Not a <button> — a turn in flight is not editable, and a stop
           // control lives inside this block (nested <button>s are invalid).
           // Content is measure-capped at 72ch everywhere below (streaming,
@@ -494,11 +445,23 @@ export function BlackboardLine({ line, onCommit, onDelete, streaming = false, on
             </span>
           </div>
         ) : (
-          <button
-            type="button"
-            onClick={() => setEditing(true)}
+          // Not editable, and not a <button>. The notebook is a RECORD:
+          // every line is now read-only, evidence and prose alike (Varun,
+          // 2026-08-01 — "stop the ability to edit the text in blackboard").
+          // Writing happens in the composer, which is the only place that
+          // produces a line; the transcript stops being a scratchpad you can
+          // silently rewrite after the fact.
+          //
+          // Dropping the <button> also fixes a latent invalidity: a `control`
+          // line renders ChoicesCard/DetectedChoicesCard INSIDE this element,
+          // so the old markup nested buttons inside a button.
+          //
+          // `onCommit` survives and is still used — `selectChoice` writes the
+          // chosen option back into the line. That is a programmatic record
+          // of an answer, not a person retyping the kernel.
+          <div
             className={cn(
-              'flex w-full items-start gap-1.5 cursor-text select-text text-left text-sm leading-relaxed text-foreground/90',
+              'flex w-full items-start gap-1.5 select-text text-left text-sm leading-relaxed text-foreground/90',
               // Weight channel of the authorship split (see the comment on
               // the row wrapper): the user's ask reads medium against the
               // agent's regular-weight working prose. Same size, same ramp.
@@ -510,7 +473,6 @@ export function BlackboardLine({ line, onCommit, onDelete, streaming = false, on
               isControl &&
                 'rounded-sm border-l-2 border-sky-500/40 bg-sky-500/[0.04] pl-1.5 hover:bg-sky-500/[0.08]',
             )}
-            title="Click to edit"
           >
             {isAgent && line.turnStatus && <TurnStatusGlyph status={line.turnStatus} />}
             <span className="min-w-0 max-w-[72ch] flex-1">
@@ -522,7 +484,7 @@ export function BlackboardLine({ line, onCommit, onDelete, streaming = false, on
                   </RevealContext.Provider>
                 </CardActionsContext.Provider>
               ) : (
-                <span className="text-white/30 italic">Empty line — click to edit</span>
+                <span className="text-white/30 italic">Empty line</span>
               )}
               {isSystem && line.repeatCount !== undefined && line.repeatCount > 1 && (
                 <span
@@ -533,12 +495,15 @@ export function BlackboardLine({ line, onCommit, onDelete, streaming = false, on
                 </span>
               )}
             </span>
-          </button>
+          </div>
         )}
       </div>
 
-      {/* Delete affordance — appears on hover, never while editing. */}
-      {!editing && (
+      {/* Delete stays. A deletion is VISIBLE — the line is gone and the
+          event log says who removed it. An edit was invisible: the altered
+          text still looked like something its author wrote. That asymmetry
+          is why one survived read-only and the other did not. */}
+      {
         <button
           type="button"
           onClick={() => onDelete(line.id)}
@@ -548,7 +513,7 @@ export function BlackboardLine({ line, onCommit, onDelete, streaming = false, on
         >
           <Trash2 size={11} />
         </button>
-      )}
+      }
     </div>
   )
 }
