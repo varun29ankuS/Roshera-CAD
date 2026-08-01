@@ -991,6 +991,16 @@ pub async fn verify_subscription_cli_model(
 /// A wrong default fails at first use while looking configured, which is
 /// precisely the shape of failure this module exists to refuse. So an
 /// unverified vendor gets `None` and the caller must name the model.
+///
+/// **This hardcoded default is now the FALLBACK, not the primary
+/// source.** Live model discovery (`resolve_provider_base_url` +
+/// `fetch_vendor_models`, below) asks the vendor directly and is
+/// preferred whenever a caller has a key in hand to query with. This
+/// table stays because discovery cannot run at boot from persisted
+/// config alone (`PUT`'s stored `api_key` is available then, but nothing
+/// calls out over the network at boot) — it is the "connect at boot with
+/// no live query" path, kept honest by requiring the identifier to have
+/// been verified at least once, same as before.
 fn goose_declarative_provider_for(
     roshera_provider_id: &str,
 ) -> Option<(&'static str, &'static str, Option<&'static str>)> {
@@ -1090,6 +1100,371 @@ pub fn repin_goose_to_declarative_provider(
         |e| format!("failed to pin goose's active_provider to {goose_provider_name}: {e}"),
     )?;
     Ok(())
+}
+
+// ── Live model discovery (ask the vendor, don't hardcode) ─────────────
+//
+// `goose_declarative_provider_for` above carries a per-vendor DEFAULT
+// model, and the module doc right above it already explains why that
+// default must be verified, never guessed: `sarvam-30b` was carried in
+// this repo's own config until 2026-08-01, when `GET
+// https://api.sarvam.ai/v1/models` showed the live API only ever served
+// `sarvam-105b`. That same endpoint — `GET /v1/models`, the exact probe
+// `ClaudeProvider::validate_credential` already runs against Anthropic —
+// is universal across every OpenAI-compatible vendor this module talks
+// to. This section generalizes it: given a Roshera provider id, resolve
+// the vendor's real base URL from a source that already exists for a
+// different reason (the custom-provider JSON or goose's bundled
+// declarative definitions — see `repin_goose_to_declarative_provider`'s
+// doc for why those are trustworthy), then ask the vendor what it
+// actually serves. `POST /api/ai/provider/models`
+// (`handlers/ai_provider.rs::discover_provider_models`) is the one
+// caller; this module owns the resolution + HTTP + parsing, exactly the
+// existing split between this file and the handler for every other
+// entry point here.
+//
+// NOTE: `state/goose-root/config/custom_providers/sarvam.json` still
+// lists `sarvam-30b` in its own `models` array on disk as of this
+// writing — the exact drift this endpoint exists to catch. That static
+// list is NEVER read by the functions below; only `base_url` is. Live
+// discovery supersedes it rather than reconciling it.
+
+/// Which of the two resolution tiers answered. Surfaced to the caller so
+/// a discovery response can say where its base URL came from, not just
+/// the URL itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BaseUrlSource {
+    /// `state/goose-root/config/custom_providers/<name>.json` — checked
+    /// FIRST because it is this deployment's own override (Sarvam has no
+    /// goose-bundled provider at all, so this is its only source).
+    CustomProviderJson,
+    /// One of goose's own bundled declarative definitions
+    /// (`goose-providers/src/declarative/definitions/*.json`, compiled
+    /// into the pinned goose git rev — `api-server/Cargo.toml`).
+    BundledDeclarative,
+}
+
+/// A resolved (not yet dereferenced) base URL, plus which tier answered.
+#[derive(Debug, Clone)]
+pub struct ResolvedBaseUrl {
+    pub base_url: String,
+    pub source: BaseUrlSource,
+}
+
+/// Typed refusal naming exactly why no base URL could be resolved for a
+/// Roshera provider id — never a guessed fallback. Two independent ways
+/// to land here: the id has no known goose provider name at all
+/// (`goose_declarative_provider_for` returned `None` — `anthropic`
+/// needs no repin, `openai`/`baseten` are seam-only), or it does, but
+/// neither tier has a JSON definition for that name. `xai` is the
+/// concrete example of the second case: goose registers it as a
+/// hand-written native provider whose base URL is a Rust constant
+/// (`goose::providers::xai::XAI_API_HOST`), never a JSON file either
+/// tier here reads — so it is allowlisted and `Wired` for inference, yet
+/// this function still cannot resolve a base URL for it, and says so by
+/// name instead of inventing one.
+#[derive(Debug, Clone)]
+pub struct BaseUrlUnresolved {
+    pub roshera_provider_id: String,
+    pub reason: String,
+}
+
+impl std::fmt::Display for BaseUrlUnresolved {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "no base URL could be resolved for provider '{}': {}",
+            self.roshera_provider_id, self.reason
+        )
+    }
+}
+
+/// Pure resolution over an explicit, already-loaded set of custom +
+/// bundled configs — no filesystem or `goose::config::Config::global()`
+/// access — so the "custom JSON wins" priority rule is unit-testable
+/// with fixture data. Mirrors this module's `build_chain` /
+/// `resolve_boot_provider_pin` pattern: decision logic stays pure;
+/// [`resolve_provider_base_url`] is the thin live wrapper that supplies
+/// the real directory scan and bundled-definition list.
+///
+/// Only expands `${VAR}` placeholders for the BUNDLED tier (`zhipu`/
+/// `moonshot`'s own definitions use them for a region-specific host).
+/// `load_custom_providers` never runs goose's lazy env-var expansion —
+/// harmless for every custom-provider JSON this repo ships today
+/// (Sarvam's `base_url` is a literal string with no `${...}`), but a
+/// future custom JSON that used a placeholder would need that expansion
+/// added here too.
+fn resolve_base_url_from(
+    goose_provider_name: &str,
+    custom: &[goose::config::declarative_providers::DeclarativeProviderConfig],
+    bundled: &[goose::config::declarative_providers::DeclarativeProviderConfig],
+) -> Option<(String, BaseUrlSource)> {
+    if let Some(cfg) = custom.iter().find(|c| c.name == goose_provider_name) {
+        return Some((cfg.base_url.clone(), BaseUrlSource::CustomProviderJson));
+    }
+    let cfg = bundled.iter().find(|c| c.name == goose_provider_name)?;
+    let base_url = match cfg.env_vars.as_deref() {
+        Some(vars) if !vars.is_empty() => {
+            goose::config::declarative_providers::expand_env_vars(&cfg.base_url, vars).ok()?
+        }
+        _ => cfg.base_url.clone(),
+    };
+    Some((base_url, BaseUrlSource::BundledDeclarative))
+}
+
+/// Live wrapper around [`resolve_base_url_from`]: loads the real
+/// custom-provider directory (`GOOSE_PATH_ROOT`-relative, pinned to
+/// `state/goose-root` at boot by `goose_acp::initialize`) and goose's
+/// compiled-in bundled definitions.
+pub fn resolve_provider_base_url(
+    roshera_provider_id: &str,
+) -> Result<ResolvedBaseUrl, BaseUrlUnresolved> {
+    let goose_provider_name = goose_declarative_provider_for(roshera_provider_id)
+        .map(|(name, _, _)| name)
+        .ok_or_else(|| BaseUrlUnresolved {
+            roshera_provider_id: roshera_provider_id.to_string(),
+            reason: "this id has no known goose provider to resolve a base URL for \
+                     (the same gap `repin_goose_to_declarative_provider` refuses by \
+                     name when pinning the agent surface)"
+                .to_string(),
+        })?;
+
+    let dir = goose::config::declarative_providers::custom_providers_dir();
+    let custom =
+        goose::config::declarative_providers::load_custom_providers(&dir).unwrap_or_default();
+    let bundled =
+        goose::config::declarative_providers::fixed_provider_configs().unwrap_or_default();
+
+    resolve_base_url_from(goose_provider_name, &custom, &bundled)
+        .map(|(base_url, source)| ResolvedBaseUrl { base_url, source })
+        .ok_or_else(|| BaseUrlUnresolved {
+            roshera_provider_id: roshera_provider_id.to_string(),
+            reason: format!(
+                "no custom-provider JSON at {} and no bundled declarative \
+                 definition named '{goose_provider_name}' — e.g. xai is a \
+                 hand-written native goose provider (its base URL is a Rust \
+                 constant, not a JSON file), invisible to either tier here",
+                dir.display()
+            ),
+        })
+}
+
+/// Derive the vendor's `/models` listing URL from its raw, declared base
+/// URL. Some declarations are already the API root (Sarvam's
+/// custom-provider JSON: `https://api.sarvam.ai/v1`, appended to
+/// literally); goose's own bundled declarative definitions instead
+/// declare the chat-completions endpoint directly (Mistral:
+/// `https://api.mistral.ai/v1/chat/completions`). Appending `/models`
+/// onto the latter unmodified would hit
+/// `.../v1/chat/completions/models`, a guaranteed 404 — so a trailing
+/// completions/responses segment is stripped first. This mirrors
+/// verified behaviour already in the dependency being resolved against,
+/// not a guessed convention: goose's own `OpenAiProvider` builds its
+/// `/models` request the same way (`map_base_path` in
+/// `goose-providers/src/openai.rs` replaces a `chat/completions` — or
+/// `responses` — tail with `models` before requesting).
+pub fn models_url(raw_base_url: &str) -> String {
+    let trimmed = raw_base_url.trim_end_matches('/');
+    let root = ["/chat/completions", "/responses"]
+        .iter()
+        .find_map(|suffix| trimmed.strip_suffix(suffix))
+        .unwrap_or(trimmed);
+    format!("{root}/models")
+}
+
+/// Reject input that cannot plausibly be an API key before it is ever
+/// sent over the network or held in memory as a credential a moment
+/// longer than necessary. Fixes a real incident: a 649-character
+/// multi-line Vite error message was pasted into the key field and
+/// persisted to `state/ai-provider.json` as a credential. `PUT
+/// /api/ai/provider` does not yet apply this check (out of scope for
+/// this change — see the doc on this function's caller); wiring it there
+/// too is a known residual. Deliberately permissive on the actual
+/// character set (vendors vary widely), strict on the SHAPE a real key
+/// can never have.
+pub fn reject_implausible_key_shape(raw: &str) -> Result<(), String> {
+    if raw.trim().is_empty() {
+        return Err("is empty".to_string());
+    }
+    if raw.contains('\n') || raw.contains('\r') {
+        return Err(
+            "contains a line break — API keys are a single token with no line \
+             breaks; this looks like pasted multi-line text (an error message, a \
+             log, a JSON blob) instead"
+                .to_string(),
+        );
+    }
+    if raw.starts_with(char::is_whitespace) {
+        return Err("has leading whitespace — paste just the key itself".to_string());
+    }
+    if raw.starts_with(['{', '[', '<']) {
+        return Err(
+            "starts with a bracket character — looks like pasted JSON/HTML/error \
+             text, not an API key"
+                .to_string(),
+        );
+    }
+    const MAX_PLAUSIBLE_KEY_LEN: usize = 256;
+    if raw.len() > MAX_PLAUSIBLE_KEY_LEN {
+        return Err(format!(
+            "is {} characters long — no known vendor issues an API key that long; \
+             rejecting anything over {MAX_PLAUSIBLE_KEY_LEN} characters",
+            raw.len()
+        ));
+    }
+    Ok(())
+}
+
+/// Hard ceiling on a live model-discovery round trip — the same
+/// "distinguishable timeout, never a guessed pass/fail" rule already
+/// applied to [`MODEL_VERIFICATION_TIMEOUT`] above, scoped shorter
+/// because this is a single unauthenticated-cost `GET`, on the request
+/// path (unlike that background probe), not a `-p` inference call.
+const MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// One model as the vendor itself named it — never merged, supplemented,
+/// or reordered against any local list.
+#[derive(Debug, Clone, Serialize)]
+pub struct DiscoveredModel {
+    pub id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_limit: Option<u64>,
+}
+
+/// What a live `GET {base}/models` round trip produced, distinguishable
+/// enough that a caller can tell "the key is wrong" from "the URL is
+/// wrong" from "the vendor didn't answer in time" — never collapsed into
+/// one generic failure.
+#[derive(Debug)]
+pub enum VendorModelsError {
+    /// 401/403 — the credential itself was rejected.
+    Unauthorized { status: u16, message: String },
+    /// 404 — the resolved URL does not exist on the vendor.
+    NotFound { status: u16, message: String },
+    /// Any other non-2xx status this function has no specific
+    /// interpretation for.
+    UnexpectedStatus { status: u16, message: String },
+    /// The round trip did not complete within [`MODEL_DISCOVERY_TIMEOUT`].
+    Timeout,
+    /// Connection failure, TLS failure, or a 2xx body that did not parse
+    /// as JSON.
+    Transport(String),
+}
+
+impl std::fmt::Display for VendorModelsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            VendorModelsError::Unauthorized { status, message } => {
+                write!(f, "vendor rejected the credential ({status}): {message}")
+            }
+            VendorModelsError::NotFound { status, message } => {
+                write!(f, "vendor returned {status} for the models URL: {message}")
+            }
+            VendorModelsError::UnexpectedStatus { status, message } => {
+                write!(f, "vendor returned unexpected status {status}: {message}")
+            }
+            VendorModelsError::Timeout => write!(
+                f,
+                "model discovery timed out after {}s",
+                MODEL_DISCOVERY_TIMEOUT.as_secs()
+            ),
+            VendorModelsError::Transport(detail) => write!(f, "{detail}"),
+        }
+    }
+}
+
+/// Live `GET {models_url}` with `Authorization: Bearer <api_key>` —
+/// confirmed live against Sarvam (2026-08-01) to accept Bearer alongside
+/// its native `api-subscription-key` header, and the same auth style
+/// every goose declarative provider here already uses
+/// (`AuthMethod::BearerToken` in `goose-providers`). Never falls back to
+/// a stored or guessed model list on any failure path — an empty/failed
+/// discovery is returned as a typed [`VendorModelsError`], not silently
+/// swallowed.
+pub async fn fetch_vendor_models(
+    models_url: &str,
+    api_key: &str,
+) -> Result<Vec<DiscoveredModel>, VendorModelsError> {
+    let client = reqwest::Client::builder()
+        .timeout(MODEL_DISCOVERY_TIMEOUT)
+        .build()
+        .map_err(|e| VendorModelsError::Transport(format!("failed to build HTTP client: {e}")))?;
+
+    let response = client
+        .get(models_url)
+        .bearer_auth(api_key)
+        .send()
+        .await
+        .map_err(|e| {
+            if e.is_timeout() {
+                VendorModelsError::Timeout
+            } else {
+                VendorModelsError::Transport(format!("request to {models_url} failed: {e}"))
+            }
+        })?;
+
+    let status = response.status();
+    if status.is_success() {
+        let body: Value = response.json().await.map_err(|e| {
+            VendorModelsError::Transport(format!(
+                "vendor responded {status} but the body did not parse as JSON: {e}"
+            ))
+        })?;
+        return Ok(parse_discovered_models(&body));
+    }
+
+    let message = response.text().await.unwrap_or_default();
+    match status.as_u16() {
+        401 | 403 => Err(VendorModelsError::Unauthorized {
+            status: status.as_u16(),
+            message,
+        }),
+        404 => Err(VendorModelsError::NotFound {
+            status: status.as_u16(),
+            message,
+        }),
+        other => Err(VendorModelsError::UnexpectedStatus {
+            status: other,
+            message,
+        }),
+    }
+}
+
+/// Parse an OpenAI-compatible models-listing body. Accepts `{"data": [...]}`
+/// (the standard shape, and what Sarvam returns — verified live
+/// 2026-08-01: `{"object":"list","data":[{"id":"sarvam-105b", ...}]}`,
+/// with no context-limit field at all) or a bare array (some vendors,
+/// mirroring goose's own `parse_model_ids` tolerance for both). Context
+/// limit is read from whichever of a few observed vendor key names is
+/// present; absent on every vendor probed live so far, so this stays a
+/// tolerant best-effort read, never a required field. Order is preserved
+/// exactly as the vendor returned it — this must never sort or reorder,
+/// unlike goose's own internal `fetch_supported_models` (which sorts for
+/// its own UI and is not a contract this function inherits).
+fn parse_discovered_models(json: &Value) -> Vec<DiscoveredModel> {
+    let Some(arr) = json
+        .get("data")
+        .and_then(Value::as_array)
+        .or_else(|| json.as_array())
+    else {
+        return Vec::new();
+    };
+
+    arr.iter()
+        .filter_map(|m| {
+            let id = m.get("id").and_then(Value::as_str)?.to_string();
+            let context_limit = [
+                "context_length",
+                "context_window",
+                "max_context_length",
+                "context_limit",
+            ]
+            .iter()
+            .find_map(|key| m.get(key).and_then(Value::as_u64));
+            Some(DiscoveredModel { id, context_limit })
+        })
+        .collect()
 }
 
 // ── Boot-time provider pin (the fix for "boot clobbers the saved
@@ -2271,5 +2646,247 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- Live model discovery: resolution, URL normalization, key-shape
+    //     rejection, and response parsing — every piece network-free.
+    //     `resolve_base_url_from` is deliberately never exercised with a
+    //     bundled fixture that carries `env_vars` here: that path calls
+    //     `goose::config::declarative_providers::expand_env_vars`, which
+    //     touches the process-lifetime `Config::global()` `OnceCell` —
+    //     see `goose_acp`'s own test module doc for why that must stay
+    //     off this file's test path. The glm/kimi env-var-expansion path
+    //     is exercised live only (see this change's verification report).
+
+    fn fixture_declarative_config(
+        name: &str,
+        base_url: &str,
+    ) -> goose::config::declarative_providers::DeclarativeProviderConfig {
+        let json = serde_json::json!({
+            "name": name,
+            "engine": "openai",
+            "display_name": name,
+            "api_key_env": format!("{}_API_KEY", name.to_uppercase()),
+            "base_url": base_url,
+            "models": [],
+        })
+        .to_string();
+        goose::config::declarative_providers::deserialize_provider_config(&json)
+            .expect("fixture declarative config must parse")
+    }
+
+    #[test]
+    fn resolve_base_url_from_prefers_custom_json_over_bundled() {
+        let custom = vec![fixture_declarative_config(
+            "sarvam",
+            "https://api.sarvam.ai/v1",
+        )];
+        let bundled = vec![fixture_declarative_config(
+            "sarvam",
+            "https://bundled-must-not-win.example/v1",
+        )];
+        let (url, source) = resolve_base_url_from("sarvam", &custom, &bundled)
+            .expect("sarvam must resolve from the custom tier");
+        assert_eq!(url, "https://api.sarvam.ai/v1");
+        assert_eq!(source, BaseUrlSource::CustomProviderJson);
+    }
+
+    #[test]
+    fn resolve_base_url_from_falls_back_to_bundled_when_no_custom_json_matches() {
+        let bundled = vec![fixture_declarative_config(
+            "mistral",
+            "https://api.mistral.ai/v1/chat/completions",
+        )];
+        let (url, source) = resolve_base_url_from("mistral", &[], &bundled)
+            .expect("mistral must resolve from the bundled tier");
+        assert_eq!(url, "https://api.mistral.ai/v1/chat/completions");
+        assert_eq!(source, BaseUrlSource::BundledDeclarative);
+    }
+
+    #[test]
+    fn resolve_base_url_from_refuses_when_neither_tier_has_the_name() {
+        // xai's real-world shape: allowlisted and Wired for inference,
+        // but a hand-written native goose provider with no JSON
+        // definition in either tier — this must be a clean `None`, not
+        // a panic or a guessed URL.
+        assert!(resolve_base_url_from("xai", &[], &[]).is_none());
+    }
+
+    #[test]
+    fn resolve_provider_base_url_refuses_unmapped_provider_by_name() {
+        // anthropic needs no goose repin at all — `goose_declarative_provider_for`
+        // returns `None` for it, so this must fail at that first gate,
+        // never reach the filesystem.
+        let err = resolve_provider_base_url("anthropic")
+            .expect_err("anthropic has no goose provider mapping to resolve");
+        assert_eq!(err.roshera_provider_id, "anthropic");
+        assert!(err.reason.contains("no known goose provider"));
+    }
+
+    // --- models_url: table test across every raw base_url shape actually
+    //     observed (custom-provider JSON root, bundled chat/completions
+    //     endpoints, a bundled root with no completions suffix, and a
+    //     trailing slash) ---
+
+    #[test]
+    fn models_url_appends_directly_onto_an_already_root_shaped_base_url() {
+        assert_eq!(
+            models_url("https://api.sarvam.ai/v1"),
+            "https://api.sarvam.ai/v1/models"
+        );
+    }
+
+    #[test]
+    fn models_url_trims_a_trailing_slash_before_appending() {
+        assert_eq!(
+            models_url("https://api.sarvam.ai/v1/"),
+            "https://api.sarvam.ai/v1/models"
+        );
+    }
+
+    #[test]
+    fn models_url_strips_a_chat_completions_suffix() {
+        assert_eq!(
+            models_url("https://api.mistral.ai/v1/chat/completions"),
+            "https://api.mistral.ai/v1/models"
+        );
+        assert_eq!(
+            models_url("https://api.moonshot.cn/v1/chat/completions"),
+            "https://api.moonshot.cn/v1/models"
+        );
+    }
+
+    #[test]
+    fn models_url_appends_onto_a_bundled_root_with_no_completions_suffix() {
+        // zhipu's default base_url (`ZHIPU_BASE_URL`'s default,
+        // "https://open.bigmodel.cn/api/paas/v4") has no
+        // chat/completions tail to strip.
+        assert_eq!(
+            models_url("https://open.bigmodel.cn/api/paas/v4"),
+            "https://open.bigmodel.cn/api/paas/v4/models"
+        );
+    }
+
+    // --- reject_implausible_key_shape: the fix for the 649-char Vite
+    //     error string that reached state/ai-provider.json as a
+    //     "credential" ---
+
+    #[test]
+    fn reject_implausible_key_shape_accepts_a_plausible_key() {
+        assert!(reject_implausible_key_shape("sk-abc123XYZ-plausible-token").is_ok());
+    }
+
+    #[test]
+    fn reject_implausible_key_shape_rejects_empty() {
+        assert!(reject_implausible_key_shape("").is_err());
+        assert!(reject_implausible_key_shape("   ").is_err());
+    }
+
+    #[test]
+    fn reject_implausible_key_shape_rejects_multiline_input() {
+        let err = reject_implausible_key_shape("first line\nsecond line")
+            .expect_err("multi-line input must be rejected");
+        assert!(err.contains("line break"));
+    }
+
+    #[test]
+    fn reject_implausible_key_shape_rejects_leading_whitespace() {
+        let err = reject_implausible_key_shape(" sk-leading-space")
+            .expect_err("leading whitespace must be rejected");
+        assert!(err.contains("leading whitespace"));
+    }
+
+    #[test]
+    fn reject_implausible_key_shape_rejects_bracket_prefixed_input() {
+        for bad in ["{\"error\": true}", "[1, 2, 3]", "<html>error</html>"] {
+            assert!(
+                reject_implausible_key_shape(bad).is_err(),
+                "'{bad}' must be rejected as an implausible key"
+            );
+        }
+    }
+
+    #[test]
+    fn reject_implausible_key_shape_rejects_the_real_vite_error_that_reached_state_json() {
+        // Verbatim from `state/ai-provider.json` (gitignored, gets
+        // overwritten by whatever is currently configured — captured
+        // 2026-08-01, 577 characters, no literal line breaks): a Vite
+        // build error pasted into the API key field and saved as a
+        // credential. Caught here by the bracket-prefix rule (starts
+        // with `[`) and independently by the length rule (577 > 256) —
+        // either alone would have refused it.
+        let vite_error = "[plugin:vite:oxc] Transform failed with 1 error:  [PARSE_ERROR] Error: Expected `,` or `)` but found `Identifier`      \u{256d}\u{2500}[ src/components/settings/ProviderSettingsDialog.tsx:527:16 ]      \u{2502}  514 \u{2502}         {data && (      \u{2502}                  \u{252c}        \u{2502}                  \u{2570}\u{2500}\u{2500} Opened here      \u{2502}   527 \u{2502}           <div className=\"flex max-h-[60vh] flex-col gap-3 overflow-y-auto pr-1 pt-2\">      \u{2502}                \u{2500}\u{2500}\u{2500}\u{2500}\u{252c}\u{2500}\u{2500}\u{2500}\u{2500}        \u{2502}                    \u{2570}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500} `,` or `)` expected \u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{256f} C:/Users/Varun Sharma/Roshera-CAD/roshera-app/src/components/settings/ProviderSettingsDialog.tsx";
+        // 577 Unicode scalar values (JS `.length`, which is what the
+        // frontend's own length check counts) — more UTF-8 bytes than
+        // that because the box-drawing characters are 3 bytes each, but
+        // `reject_implausible_key_shape` only needs `raw.len() > 256` to
+        // be true, which byte length already guarantees here.
+        assert_eq!(vite_error.chars().count(), 577);
+        let err = reject_implausible_key_shape(vite_error)
+            .expect_err("the real Vite error string must be rejected");
+        assert!(err.contains("bracket character"));
+    }
+
+    #[test]
+    fn reject_implausible_key_shape_rejects_absurd_length() {
+        let too_long = "a".repeat(300);
+        let err = reject_implausible_key_shape(&too_long)
+            .expect_err("a 300-character token must be rejected");
+        assert!(err.contains("300"));
+    }
+
+    // --- parse_discovered_models: verbatim vendor output, never sorted,
+    //     never merged with a local list ---
+
+    #[test]
+    fn parse_discovered_models_reads_the_live_sarvam_shape() {
+        // Verified live 2026-08-01: `GET https://api.sarvam.ai/v1/models`
+        // (no key required) returned exactly this body — one model, no
+        // context-limit field at all, and critically NOT `sarvam-30b`.
+        let body: Value = serde_json::from_str(
+            r#"{"object":"list","data":[{"id":"sarvam-105b","object":"model","created":0,"owned_by":"sarvam"}]}"#,
+        )
+        .expect("fixture body must parse");
+        let models = parse_discovered_models(&body);
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "sarvam-105b");
+        assert_eq!(models[0].context_limit, None);
+        assert!(
+            !models.iter().any(|m| m.id == "sarvam-30b"),
+            "the live vendor response never mentions sarvam-30b — discovery must \
+             not reintroduce it from anywhere"
+        );
+    }
+
+    #[test]
+    fn parse_discovered_models_accepts_a_bare_array() {
+        let body: Value = serde_json::json!([{"id": "model-a"}, {"id": "model-b"}]);
+        let models = parse_discovered_models(&body);
+        assert_eq!(
+            models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec!["model-a", "model-b"],
+            "order must be preserved exactly as returned, never sorted"
+        );
+    }
+
+    #[test]
+    fn parse_discovered_models_reads_a_context_limit_when_present() {
+        let body: Value = serde_json::json!({
+            "data": [{"id": "big-model", "context_length": 131072}]
+        });
+        let models = parse_discovered_models(&body);
+        assert_eq!(models[0].context_limit, Some(131072));
+    }
+
+    #[test]
+    fn parse_discovered_models_never_reorders_vendor_output() {
+        let body: Value = serde_json::json!({
+            "data": [{"id": "zzz-last"}, {"id": "aaa-first"}]
+        });
+        let models = parse_discovered_models(&body);
+        assert_eq!(
+            models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec!["zzz-last", "aaa-first"]
+        );
     }
 }

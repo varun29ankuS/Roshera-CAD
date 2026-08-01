@@ -202,7 +202,22 @@ pub enum ErrorCode {
     /// (e.g. the vendor API returned 401/403 for the supplied key, or
     /// the subscription CLI probe failed). The caller must supply a
     /// different credential — retrying the same one fails identically.
+    /// NOTE: `POST /api/ai/provider/models` (live model discovery)
+    /// reports its own 401/403 under `AiModelDiscoveryFailed` instead,
+    /// so the two codes never collide — this code stays the one the
+    /// PUT/`/test` credential round-trip already used.
     AiCredentialInvalid,
+    /// `POST /api/ai/provider/models` (live model discovery) could not
+    /// produce the vendor's model list. `details` always carries
+    /// `provider` and an `outcome` discriminator (`no_base_url` |
+    /// `unauthorized` | `not_found` | `unexpected_status` | `timeout` |
+    /// `transport_error`) plus, when the vendor answered at all, its own
+    /// `vendor_status` and `vendor_message` — the caller must be able to
+    /// tell "the key is wrong" (`unauthorized`) from "the resolved URL
+    /// is wrong" (`not_found`) from "nothing could be resolved at all"
+    /// (`no_base_url`) rather than one generic failure. Never a stored
+    /// or guessed model list on any of these outcomes.
+    AiModelDiscoveryFailed,
     /// A user-selected model ID was rejected by the live provider (e.g.
     /// `GET /v1/models/{id}` 404, or the vendor otherwise refused it).
     /// Distinct from `AiCredentialInvalid`: the credential itself is
@@ -293,7 +308,9 @@ impl ErrorCode {
 
             ErrorCode::AiNotConfigured => StatusCode::SERVICE_UNAVAILABLE,
 
-            ErrorCode::AiCredentialInvalid | ErrorCode::AiModelRejected => StatusCode::BAD_REQUEST,
+            ErrorCode::AiCredentialInvalid
+            | ErrorCode::AiModelRejected
+            | ErrorCode::AiModelDiscoveryFailed => StatusCode::BAD_REQUEST,
             ErrorCode::AiProviderRefused
             | ErrorCode::AcpMethodNotAllowed
             | ErrorCode::AcpWebsocketDisabled
@@ -344,6 +361,14 @@ impl ErrorCode {
             | ErrorCode::AiProviderRefused
             | ErrorCode::AiCredentialInvalid
             | ErrorCode::AiModelRejected
+            // A timeout outcome is reported under this same code (see
+            // its doc's `outcome` discriminator) — classified
+            // non-retryable at the code level for the same reason
+            // `OpTimeout` is above: the code covers several outcomes and
+            // most of them (bad key, bad/unresolvable URL) are
+            // deterministic. A caller that inspects `details.outcome ==
+            // "timeout"` and wants to retry that specific case may.
+            | ErrorCode::AiModelDiscoveryFailed
             | ErrorCode::AcpMethodNotAllowed
             | ErrorCode::AcpWebsocketDisabled
             | ErrorCode::AcpForbiddenSessionMeta
@@ -405,6 +430,7 @@ impl ErrorCode {
             ErrorCode::AiProviderRefused => "ai_provider_refused",
             ErrorCode::AiCredentialInvalid => "ai_credential_invalid",
             ErrorCode::AiModelRejected => "ai_model_rejected",
+            ErrorCode::AiModelDiscoveryFailed => "ai_model_discovery_failed",
             ErrorCode::AcpMethodNotAllowed => "acp_method_not_allowed",
             ErrorCode::AcpWebsocketDisabled => "acp_websocket_disabled",
             ErrorCode::AcpForbiddenSessionMeta => "acp_forbidden_session_meta",
@@ -451,6 +477,7 @@ impl ErrorCode {
             ErrorCode::AiProviderRefused,
             ErrorCode::AiCredentialInvalid,
             ErrorCode::AiModelRejected,
+            ErrorCode::AiModelDiscoveryFailed,
             ErrorCode::AcpMethodNotAllowed,
             ErrorCode::AcpWebsocketDisabled,
             ErrorCode::AcpForbiddenSessionMeta,
@@ -815,6 +842,50 @@ impl ApiError {
                     .to_string(),
             )
             .with_details(serde_json::json!({ "rejected_model": model }))
+    }
+
+    /// `POST /api/ai/provider/models` refused before or instead of
+    /// reaching a vendor: no base URL could be resolved (`outcome:
+    /// "no_base_url"`), the vendor rejected the credential
+    /// (`"unauthorized"`), the resolved URL doesn't exist on the vendor
+    /// (`"not_found"`), an unrecognized status came back
+    /// (`"unexpected_status"`), the round trip timed out
+    /// (`"timeout"`), or a transport/parse failure occurred
+    /// (`"transport_error"`). `vendor_status`/`vendor_message` are only
+    /// present when the vendor actually answered.
+    pub fn ai_model_discovery_failed(
+        provider: &str,
+        outcome: &str,
+        message: impl Into<String>,
+        vendor_status: Option<u16>,
+        vendor_message: Option<String>,
+    ) -> Self {
+        Self::new(ErrorCode::AiModelDiscoveryFailed, message)
+            .with_hint(
+                "Model discovery never falls back to a stored or guessed model \
+                 list on failure. Fix the credential/provider named in `details` \
+                 and retry POST /api/ai/provider/models directly."
+                    .to_string(),
+            )
+            .with_details(serde_json::json!({
+                "provider": provider,
+                "outcome": outcome,
+                "vendor_status": vendor_status,
+                "vendor_message": vendor_message,
+            }))
+    }
+
+    /// `POST /api/ai/provider/models` refused a key before any network
+    /// call because it cannot plausibly be an API key (multi-line,
+    /// absurd length, leading whitespace/brackets) — see
+    /// `ai_provider_config::reject_implausible_key_shape`'s doc for the
+    /// incident this closes (a 649-char Vite error message reached
+    /// `state/ai-provider.json` as a stored credential).
+    pub fn ai_api_key_implausible(reason: impl Into<String>) -> Self {
+        let reason = reason.into();
+        Self::new(ErrorCode::InvalidParameter, format!("api_key {reason}"))
+            .with_hint("Paste only the vendor's API key — nothing else.".to_string())
+            .with_details(serde_json::json!({ "parameter": "api_key" }))
     }
 
     /// `/acp` POST carried a JSON-RPC method outside the allowlist.

@@ -544,6 +544,91 @@ pub async fn test_provider(
     })))
 }
 
+/// Request body for `POST /api/ai/provider/models`.
+#[derive(Debug, Deserialize)]
+pub struct ModelDiscoveryRequest {
+    pub provider: String,
+    pub api_key: String,
+}
+
+/// `POST /api/ai/provider/models` — ask the vendor what it actually
+/// serves (`GET {base_url}/models`) instead of trusting a hardcoded
+/// default. Generalizes the same live-validation precedent
+/// `ClaudeProvider::validate_credential` already set for Anthropic
+/// (`GET /v1/models`) to any OpenAI-compatible vendor this build knows a
+/// base URL for.
+///
+/// Follows `POST /api/ai/provider/test`'s convention: failure is
+/// signalled via the HTTP status `ApiError`'s `ErrorCode` maps to (400
+/// here — checked against `test_provider`/`validate_request` above,
+/// which do the same for every AI-surface refusal), never a `200` with
+/// `success: false` in the body. Never persists anything — this is a
+/// pure lookup, run before the user commits to saving a key.
+///
+/// Ordered so the caller learns the cheapest, most specific failure
+/// first: (1) key-shape rejection — no network call at all; (2) base-URL
+/// resolution — no network call either, a typed refusal naming the
+/// provider when neither the custom-provider JSON tier nor goose's
+/// bundled declarative tier has one (e.g. `xai`, a hand-written native
+/// goose provider with no JSON definition); (3) the live vendor round
+/// trip, whose failure modes (401/404/timeout/other) stay distinguishable
+/// all the way to the response body.
+pub async fn discover_provider_models(
+    Json(payload): Json<ModelDiscoveryRequest>,
+) -> Result<Json<Value>, ApiError> {
+    ai_provider_config::reject_implausible_key_shape(&payload.api_key)
+        .map_err(|reason| ApiError::ai_api_key_implausible(reason))?;
+
+    let resolved =
+        ai_provider_config::resolve_provider_base_url(&payload.provider).map_err(|unresolved| {
+            ApiError::ai_model_discovery_failed(
+                &payload.provider,
+                "no_base_url",
+                unresolved.to_string(),
+                None,
+                None,
+            )
+        })?;
+
+    let models_url = ai_provider_config::models_url(&resolved.base_url);
+
+    let models = ai_provider_config::fetch_vendor_models(&models_url, &payload.api_key)
+        .await
+        .map_err(|e| {
+            let (outcome, vendor_status, vendor_message) = match &e {
+                ai_provider_config::VendorModelsError::Unauthorized { status, message } => {
+                    ("unauthorized", Some(*status), Some(message.clone()))
+                }
+                ai_provider_config::VendorModelsError::NotFound { status, message } => {
+                    ("not_found", Some(*status), Some(message.clone()))
+                }
+                ai_provider_config::VendorModelsError::UnexpectedStatus { status, message } => {
+                    ("unexpected_status", Some(*status), Some(message.clone()))
+                }
+                ai_provider_config::VendorModelsError::Timeout => ("timeout", None, None),
+                ai_provider_config::VendorModelsError::Transport(_) => {
+                    ("transport_error", None, None)
+                }
+            };
+            ApiError::ai_model_discovery_failed(
+                &payload.provider,
+                outcome,
+                e.to_string(),
+                vendor_status,
+                vendor_message,
+            )
+        })?;
+
+    Ok(Json(json!({
+        "success": true,
+        "provider": payload.provider,
+        "base_url": resolved.base_url,
+        "base_url_source": resolved.source,
+        "models_url": models_url,
+        "models": models,
+    })))
+}
+
 // ── Shared validation ───────────────────────────────────────────────────
 
 /// Resolve the requested (provider, mode) against the server-owned

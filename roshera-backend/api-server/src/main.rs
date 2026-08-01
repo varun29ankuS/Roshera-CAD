@@ -8735,6 +8735,17 @@ pub(crate) fn build_router(state: AppState) -> Router {
                 auth_middleware::require_modify_settings,
             )),
         )
+        // Live model discovery — `GET {base_url}/models` against the
+        // real vendor instead of trusting a hardcoded default (see
+        // `ai_provider_config`'s "Live model discovery" section doc for
+        // the sarvam-30b drift this closes). Same permission gate as
+        // `/test`: it accepts a raw API key in the body.
+        .route(
+            "/api/ai/provider/models",
+            post(handlers::ai_provider::discover_provider_models).route_layer(
+                axum::middleware::from_fn(auth_middleware::require_modify_settings),
+            ),
+        )
         // ACP session config — the working directory `session/new` will
         // use, so `roshera-app`'s `acp-client.ts` can ask the backend
         // instead of independently hardcoding a copy (see

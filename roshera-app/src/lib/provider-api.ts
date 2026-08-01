@@ -135,6 +135,34 @@ export interface TestProviderResponse {
   detail?: unknown
 }
 
+/** `POST /api/ai/provider/models` — live model discovery. Body mirrors
+ *  `ai_provider.rs::ModelDiscoveryRequest` exactly: just enough to ask a
+ *  vendor what it serves, independent of the persisted `mode`/`model`
+ *  shape `ProviderConfigRequest` carries. */
+export interface ModelDiscoveryRequest {
+  provider: string
+  api_key: string
+}
+
+/** One model exactly as the vendor named it — never merged, supplemented,
+ *  or reordered against a local list (`ai_provider_config::DiscoveredModel`). */
+export interface DiscoveredModel {
+  id: string
+  context_limit?: number | null
+}
+
+export interface ModelDiscoveryResponse {
+  success: boolean
+  provider: string
+  base_url: string
+  /** Which resolution tier answered — `custom_provider_json` (this
+   *  deployment's own override, e.g. Sarvam) or `bundled_declarative`
+   *  (goose's compiled-in definitions, e.g. Mistral/GLM/Kimi). */
+  base_url_source: 'custom_provider_json' | 'bundled_declarative'
+  models_url: string
+  models: DiscoveredModel[]
+}
+
 /** `error_catalog.rs::ApiError`'s wire shape. */
 export interface ApiErrorBody {
   error_code: string
@@ -156,8 +184,11 @@ export type ProviderApiResult<T> =
   | { ok: false; kind: 'unavailable' }
   /** The backend was reached and refused/failed the request. `hint`
    *  carries `ApiError.hint` when present — surfaced alongside the
-   *  message rather than dropped. */
-  | { ok: false; kind: 'error'; status: number; message: string; hint?: string }
+   *  message rather than dropped. `details` carries `ApiError.details`
+   *  verbatim (e.g. discovery's `{provider, outcome, vendor_status,
+   *  vendor_message}`) for callers that want to branch on it instead of
+   *  parsing `message`. */
+  | { ok: false; kind: 'error'; status: number; message: string; hint?: string; details?: unknown }
 
 async function call<T>(path: string, init: RequestInit): Promise<ProviderApiResult<T>> {
   let res: Response
@@ -180,6 +211,7 @@ async function call<T>(path: string, init: RequestInit): Promise<ProviderApiResu
       status: res.status,
       message: body?.error ?? `${res.status} ${res.statusText}`,
       hint: body?.hint,
+      details: body?.details,
     }
   }
   try {
@@ -208,4 +240,37 @@ export function testProvider(
   req: ProviderConfigRequest,
 ): Promise<ProviderApiResult<TestProviderResponse>> {
   return call('/ai/provider/test', { method: 'POST', body: JSON.stringify(req) })
+}
+
+export function discoverProviderModels(
+  req: ModelDiscoveryRequest,
+): Promise<ProviderApiResult<ModelDiscoveryResponse>> {
+  return call('/ai/provider/models', { method: 'POST', body: JSON.stringify(req) })
+}
+
+/** Reject input that cannot plausibly be an API key, BEFORE it is ever
+ *  sent over the network — mirrors
+ *  `ai_provider_config::reject_implausible_key_shape` on the backend
+ *  (which is the actual enforcement point for `POST
+ *  /api/ai/provider/models`; this copy is pre-flight UX only, closing
+ *  the gap that let a 649-character multi-line Vite error message reach
+ *  `state/ai-provider.json` as a stored credential). Returns `null` for
+ *  a plausible key (including empty — emptiness is handled separately by
+ *  each action's own disabled state, not as an error message). */
+export function implausibleApiKeyReason(raw: string): string | null {
+  if (raw.trim() === '') return null
+  if (/[\n\r]/.test(raw)) {
+    return 'contains a line break — this looks like pasted multi-line text (an error message, a log, a JSON blob), not an API key.'
+  }
+  if (raw !== raw.trimStart()) {
+    return 'has leading whitespace — paste just the key itself.'
+  }
+  if (/^[{[<]/.test(raw)) {
+    return 'starts with a bracket character — looks like pasted JSON/HTML/error text, not an API key.'
+  }
+  const MAX_PLAUSIBLE_KEY_LEN = 256
+  if (raw.length > MAX_PLAUSIBLE_KEY_LEN) {
+    return `is ${raw.length} characters long — no known vendor issues an API key that long.`
+  }
+  return null
 }

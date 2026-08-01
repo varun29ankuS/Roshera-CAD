@@ -50,7 +50,7 @@ fn build_capabilities(ai_configured: bool) -> Value {
     json!({
         "kernel": "roshera-geometry-engine",
         "kernel_version": env!("CARGO_PKG_VERSION"),
-        "discovery_version": "1.0.0",
+        "discovery_version": "1.0.1",
         "runtime": {
             "ai_configured": ai_configured,
         },

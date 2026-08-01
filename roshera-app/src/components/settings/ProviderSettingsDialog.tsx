@@ -13,12 +13,15 @@ import { cn } from '@/lib/utils'
 import { VendorMark } from '@/components/settings/vendor-marks'
 import {
   deleteProvider,
+  discoverProviderModels,
   getProviderStatus,
+  implausibleApiKeyReason,
   putProvider,
   testProvider,
   type AllowlistedProvider,
   type CliDetection,
   type CredentialMode,
+  type DiscoveredModel,
   type ModeEntry,
   type ProviderStatusResponse,
 } from '@/lib/provider-api'
@@ -72,6 +75,25 @@ const CLI_KEY_FOR_PROVIDER: Record<string, 'claude' | 'codex'> = {
  *     with a line saying these are suggestions, not a verified menu — an
  *     API key and a Max subscription do not necessarily serve the same
  *     models, and the exact name is only confirmed server-side.
+ *   - **Live model discovery** (`POST /api/ai/provider/models`, `api_key`
+ *     mode only): an explicit "Discover models" button — not on-blur,
+ *     which would spam the vendor on every focus change — asks the
+ *     vendor's own `GET {base_url}/models` what it actually serves. A
+ *     successful discovery replaces the preset dropdown with a picker
+ *     over the REAL returned list (never merged with the presets) and is
+ *     the one place this dialog shows a genuinely earned "Verified"
+ *     badge for these vendors — unlike `Test`, which for every non-
+ *     anthropic `api_key` vendor accepts the key without a network
+ *     round-trip (no vetted synchronous credential-check client exists
+ *     for them; see `ai_provider.rs::validate_api_key`'s doc) and so
+ *     cannot honestly claim "verified" on its own. A discovery FAILURE
+ *     is shown with the vendor's own status/message and blocks Save for
+ *     the key currently in the box, even if an earlier `Test` passed.
+ *     Before either action fires, the key is checked against
+ *     `implausibleApiKeyReason` — client-side pre-flight for the same
+ *     shape check the backend enforces, closing the gap that once let a
+ *     649-character multi-line Vite error message get saved as a
+ *     credential.
  *   - If the backend hasn't shipped this endpoint yet (404/405/network),
  *     the dialog says so plainly. It never renders fabricated allowlist
  *     data to look like a working settings page.
@@ -215,6 +237,17 @@ export function ProviderSettingsButton() {
   const [testedFor, setTestedFor] = useState<{ apiKey: string; model: string } | null>(null)
   const [testResult, setTestResult] = useState<{ ok: boolean; message?: string } | null>(null)
   const [testing, setTesting] = useState(false)
+  // Live model discovery (`POST /api/ai/provider/models`) — a separate
+  // action from `Test` above. Keyed to the exact `apiKey` it ran against
+  // (mirrors `testedFor`'s pairing) so editing the key after a discovery
+  // — success OR failure — invalidates it rather than leaving a stale
+  // model list or a stale block on Save.
+  const [discovery, setDiscovery] = useState<
+    | { phase: 'discovering'; apiKey: string }
+    | { phase: 'success'; apiKey: string; models: DiscoveredModel[]; baseUrl: string }
+    | { phase: 'error'; apiKey: string; message: string }
+    | null
+  >(null)
   const [consent, setConsent] = useState(false)
   const [saving, setSaving] = useState(false)
   const [saveError, setSaveError] = useState<string | null>(null)
@@ -239,6 +272,7 @@ export function ProviderSettingsButton() {
     setSelectedMode((wired ?? provider.modes[0])?.mode ?? null)
     setTestResult(null)
     setTestedFor(null)
+    setDiscovery(null)
     setSaveError(null)
   }
 
@@ -286,6 +320,7 @@ export function ProviderSettingsButton() {
     setModelCustom(false)
     setTestedFor(null)
     setTestResult(null)
+    setDiscovery(null)
     setConsent(false)
     setSaveError(null)
     load()
@@ -340,6 +375,53 @@ export function ProviderSettingsButton() {
     }
     setTestResult({ ok: res.data.success, message: res.data.success ? 'Verified.' : undefined })
     if (res.data.success) setTestedFor({ apiKey, model: trimmedModel })
+  }
+
+  // Same "no refetch" reasoning as `runTest` above: discovery is a pure
+  // lookup, nothing on the server changes, so there is nothing for
+  // `load()` to pick up. Guarded by `implausibleApiKeyReason` before the
+  // network call — belt-and-suspenders with the backend's own
+  // `reject_implausible_key_shape`, which is the actual enforcement
+  // point.
+  async function runDiscovery() {
+    if (!selectedProviderId || selectedMode !== 'api_key') return
+    const shapeError = implausibleApiKeyReason(apiKey)
+    if (shapeError) {
+      setDiscovery({ phase: 'error', apiKey, message: `API key ${shapeError}` })
+      return
+    }
+    const keyAtRequestTime = apiKey
+    setDiscovery({ phase: 'discovering', apiKey: keyAtRequestTime })
+    const res = await discoverProviderModels({ provider: selectedProviderId, api_key: apiKey })
+    // The key may have changed while the request was in flight — a
+    // result for a superseded key must never land as if it were current
+    // (same stale-result discipline as the backend's own
+    // `AiProviderManager::update_model_verification`).
+    if (apiKey !== keyAtRequestTime) return
+    if (!res.ok) {
+      setDiscovery({
+        phase: 'error',
+        apiKey: keyAtRequestTime,
+        message:
+          res.kind === 'unavailable'
+            ? 'Model discovery endpoint not available yet.'
+            : [res.message, res.hint].filter(Boolean).join(' — '),
+      })
+      return
+    }
+    setDiscovery({
+      phase: 'success',
+      apiKey: keyAtRequestTime,
+      models: res.data.models,
+      baseUrl: res.data.base_url,
+    })
+    // A successful discovery is real evidence the key works — apply it
+    // to the model field too, exactly the way a preset click does, so
+    // the picker below shows a value that is actually in the returned
+    // list rather than an empty preset.
+    if (res.data.models.length > 0 && !res.data.models.some((m) => m.id === model)) {
+      applyModel(res.data.models[0].id)
+    }
   }
 
   async function save() {
@@ -412,13 +494,33 @@ export function ProviderSettingsButton() {
   const alreadyConsentedToThisMode =
     data?.active?.provider === selectedProviderId && data?.active?.mode === selectedMode
 
+  // A discovery FAILURE for the exact key currently in the box is
+  // known-bad evidence and must block Save outright — independent of
+  // `keyTested`, which for every non-anthropic api_key vendor accepts
+  // the key without a network round-trip and would otherwise still read
+  // "tested" for a key discovery just proved doesn't work.
+  const discoveryFailedForCurrentKey =
+    discovery?.phase === 'error' && discovery.apiKey === apiKey
+  // A discovery SUCCESS is an alternative, stronger gate than `keyTested`
+  // — it is a real vendor round-trip, unlike `Test` for these vendors
+  // (see this component's module doc). Without this, picking a model out
+  // of the very list discovery just returned moves `model` away from
+  // whatever `testedFor.model` recorded and kills `keyTested`, disabling
+  // Save right after the dialog showed a "Verified" badge — the same
+  // dead-button-with-no-visible-reason bug `alreadyConsentedToThisMode`
+  // above exists to prevent for the consent checkbox.
+  const discoveryVerifiedForCurrentKey =
+    discovery?.phase === 'success' && discovery.apiKey === apiKey
+
   const canSave =
     !!selectedProviderId &&
     !!selectedMode &&
     selectedEntry?.wiring.status === 'wired' &&
     !isConfigured &&
     (selectedMode === 'api_key'
-      ? !!apiKey && keyTested
+      ? !!apiKey &&
+        (keyTested || discoveryVerifiedForCurrentKey) &&
+        !discoveryFailedForCurrentKey
       : selectedEntry?.spawns_local_process
         ? (consent || alreadyConsentedToThisMode) && cliDetectionOk
         : true)
@@ -432,6 +534,16 @@ export function ProviderSettingsButton() {
   // leaves both false.
   const providerServing =
     state.phase === 'ready' && (state.data.active !== null || state.data.ai_configured)
+
+  // Non-null only when discovery succeeded for the exact key currently in
+  // the box — the model field becomes a picker over this REAL list
+  // (never merged with `MODEL_PRESETS`) instead of the preset+free-text
+  // control. An empty array (vendor served zero models) is still an
+  // honest "success" and still suppresses the preset/free-text UI —
+  // showing stale presets after a real, empty answer would misrepresent
+  // what was actually discovered.
+  const discoveredModels: DiscoveredModel[] | null =
+    discovery?.phase === 'success' && discovery.apiKey === apiKey ? discovery.models : null
 
   const modelSelectValue = modelCustom ? CUSTOM_MODEL : model
   // Green is reserved for the model that is ACTIVE — currently saved and in
@@ -647,6 +759,13 @@ export function ProviderSettingsButton() {
                             setSelectedMode(entry.mode)
                             setTestResult(null)
                             setTestedFor(null)
+                            // Unreachable today (every discovery-capable
+                            // vendor is api_key-only, so switching modes
+                            // within one vendor can't currently straddle
+                            // a discovery result) — reset anyway for the
+                            // same staleness discipline applied to every
+                            // other per-key/per-mode piece of state here.
+                            setDiscovery(null)
                             setSaveError(null)
                           }}
                           title={seamReason ?? entry.reason}
@@ -694,16 +813,29 @@ export function ProviderSettingsButton() {
                           onChange={(e) => {
                             setApiKey(e.target.value)
                             setTestResult(null)
+                            setDiscovery(null)
                           }}
                           autoComplete="off"
                           className="h-7 text-[11px]"
                         />
+                        {/* Client-side shape pre-flight — mirrors the
+                            backend's `reject_implausible_key_shape`
+                            (the actual enforcement point for
+                            POST /api/ai/provider/models). Catches the
+                            incident this closes — a 649-char multi-line
+                            Vite error pasted in as a "key" — before any
+                            network call, for either action below. */}
+                        {apiKey && implausibleApiKeyReason(apiKey) && (
+                          <p className="text-[10px] text-red-400">
+                            API key {implausibleApiKeyReason(apiKey)}
+                          </p>
+                        )}
                         <div className="flex items-center gap-2">
                           <Button
                             variant="outline"
                             size="sm"
                             className="h-7 px-2 text-[11px]"
-                            disabled={!apiKey || testing}
+                            disabled={!apiKey || testing || !!implausibleApiKeyReason(apiKey)}
                             onClick={() => void runTest()}
                           >
                             {testing ? 'Testing…' : 'Test'}
@@ -725,6 +857,49 @@ export function ProviderSettingsButton() {
                           title="Roshera never claims a key works without checking it live first."
                         >
                           Validated live before it can be saved.
+                        </p>
+                        {/* Live model discovery — its own explicit action,
+                            not fired on blur (which would spam the vendor
+                            on every focus change). Separate from `Test`
+                            above: for every non-anthropic api_key vendor
+                            `Test` accepts the key without a network round
+                            trip (see this component's own module doc), so
+                            THIS is the one action that earns a genuine
+                            "Verified" claim for those vendors. */}
+                        <div className="flex items-center gap-2 border-t border-border/40 pt-2">
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            className="h-7 px-2 text-[11px]"
+                            disabled={
+                              !apiKey ||
+                              discovery?.phase === 'discovering' ||
+                              !!implausibleApiKeyReason(apiKey)
+                            }
+                            onClick={() => void runDiscovery()}
+                          >
+                            {discovery?.phase === 'discovering'
+                              ? 'Discovering…'
+                              : 'Discover models'}
+                          </Button>
+                          {discovery?.phase === 'success' && discovery.apiKey === apiKey && (
+                            <span className="flex items-center gap-1 text-[11px] text-emerald-400">
+                              <CheckCircle2 size={12} />
+                              Verified — {discovery.models.length}{' '}
+                              {discovery.models.length === 1 ? 'model' : 'models'} at{' '}
+                              {discovery.baseUrl}
+                            </span>
+                          )}
+                          {discovery?.phase === 'error' && discovery.apiKey === apiKey && (
+                            <span className="flex items-center gap-1 text-[11px] text-red-400">
+                              <XCircle size={12} />
+                              {discovery.message}
+                            </span>
+                          )}
+                        </div>
+                        <p className="text-[10px] text-muted-foreground">
+                          Asks the vendor&apos;s own model-listing endpoint what it actually
+                          serves — never a stored or guessed list.
                         </p>
                       </div>
                     )}
@@ -779,29 +954,52 @@ export function ProviderSettingsButton() {
                       >
                         Model
                       </label>
-                      <select
-                        id="provider-model-select"
-                        value={modelSelectValue}
-                        onChange={(e) => {
-                          const v = e.target.value
-                          if (v === CUSTOM_MODEL) {
-                            setModelCustom(true)
+                      {discoveredModels ? (
+                        // A real, vendor-returned list is in hand — a
+                        // picker over it, never free text (an id typed by
+                        // hand could silently diverge from what discovery
+                        // just proved this key can serve). Never merged
+                        // with `MODEL_PRESETS`: only ids the vendor itself
+                        // named, plus "default".
+                        <select
+                          id="provider-model-select"
+                          value={model}
+                          onChange={(e) => applyModel(e.target.value)}
+                          className="cad-focus h-7 rounded border border-border/60 bg-background/40 px-1.5 text-[11px] text-foreground/90 hover:bg-accent/30"
+                        >
+                          <option value="">default (provider&apos;s choice)</option>
+                          {discoveredModels.map((m) => (
+                            <option key={m.id} value={m.id}>
+                              {m.id}
+                              {m.context_limit ? ` (${m.context_limit.toLocaleString()} ctx)` : ''}
+                            </option>
+                          ))}
+                        </select>
+                      ) : (
+                        <select
+                          id="provider-model-select"
+                          value={modelSelectValue}
+                          onChange={(e) => {
+                            const v = e.target.value
+                            if (v === CUSTOM_MODEL) {
+                              setModelCustom(true)
+                              setTestResult(null)
+                              return
+                            }
+                            setModelCustom(false)
+                            setModel(v)
                             setTestResult(null)
-                            return
-                          }
-                          setModelCustom(false)
-                          setModel(v)
-                          setTestResult(null)
-                        }}
-                        className="cad-focus h-7 rounded border border-border/60 bg-background/40 px-1.5 text-[11px] text-foreground/90 hover:bg-accent/30"
-                      >
-                        {MODEL_PRESETS.map((p) => (
-                          <option key={p.value || 'default'} value={p.value}>
-                            {p.label}
-                          </option>
-                        ))}
-                        <option value={CUSTOM_MODEL}>Custom…</option>
-                      </select>
+                          }}
+                          className="cad-focus h-7 rounded border border-border/60 bg-background/40 px-1.5 text-[11px] text-foreground/90 hover:bg-accent/30"
+                        >
+                          {MODEL_PRESETS.map((p) => (
+                            <option key={p.value || 'default'} value={p.value}>
+                              {p.label}
+                            </option>
+                          ))}
+                          <option value={CUSTOM_MODEL}>Custom…</option>
+                        </select>
+                      )}
                       {/* What is actually saved and in use for THIS
                           provider+mode — independent of whatever the
                           dropdown above currently shows. Absent entirely
@@ -820,7 +1018,7 @@ export function ProviderSettingsButton() {
                             )}
                         </p>
                       )}
-                      {modelCustom && (
+                      {!discoveredModels && modelCustom && (
                         <Input
                           value={model}
                           onChange={(e) => {
@@ -833,9 +1031,13 @@ export function ProviderSettingsButton() {
                         />
                       )}
                       <p className="text-[10px] text-muted-foreground">
-                        {selectedMode === 'subscription_cli'
-                          ? 'Suggestions — availability depends on your plan; applied at session start, not checked here.'
-                          : 'Suggestions — availability depends on your plan; the exact name is validated on save.'}
+                        {discoveredModels
+                          ? discoveredModels.length > 0
+                            ? "The vendor's own model list — not a suggestion."
+                            : 'The vendor returned zero models for this key.'
+                          : selectedMode === 'subscription_cli'
+                            ? 'Suggestions — availability depends on your plan; applied at session start, not checked here.'
+                            : 'Suggestions — availability depends on your plan; the exact name is validated on save.'}
                       </p>
                     </div>
 
