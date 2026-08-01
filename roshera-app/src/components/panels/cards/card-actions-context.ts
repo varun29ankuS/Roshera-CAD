@@ -20,6 +20,15 @@ export interface CardActions {
    * `value` is the clicked option's `value`, sent verbatim as the next turn.
    */
   selectChoice: (rawSource: string, value: string) => void
+  /**
+   * A DetectedChoicesCard option was clicked — an "Option A: …" enumeration
+   * the agent wrote as prose, not a `roshera:choices` fence (see
+   * `lib/blackboard-cards.ts`'s `detectEnumeratedChoices`). Unlike
+   * `selectChoice`, there is no fence to mark `selected:` on, so this never
+   * rewrites the owning line — it only sends `value` (the option's own
+   * text) as the next turn, exactly as if it had been typed.
+   */
+  sendDetectedChoice: (value: string) => void
 }
 
 export const CardActionsContext = createContext<CardActions | null>(null)

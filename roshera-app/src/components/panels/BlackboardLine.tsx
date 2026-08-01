@@ -2,11 +2,13 @@ import { useEffect, useRef, useState, useCallback, useMemo } from 'react'
 import { stringify as yamlStringify } from 'yaml'
 import { cn } from '@/lib/utils'
 import { processBlackboardMessage } from '@/lib/ai-client'
+import { detectEnumeratedChoices } from '@/lib/blackboard-cards'
 import type { BlackboardLine as Line } from '@/stores/blackboard-store'
 import { MessageMarkdown } from './MessageMarkdown'
 import { StreamingLineText } from './StreamingLineText'
 import { RevealContext } from './cards/reveal-context'
 import { CardActionsContext, type CardActions } from './cards/card-actions-context'
+import { DetectedChoicesCard } from './cards/DetectedChoicesCard'
 import { Bot, User, Wrench, Trash2, Square, Check, X, CircleSlash } from 'lucide-react'
 import type { AgentTurnStatus } from '@/stores/blackboard-store'
 
@@ -280,9 +282,34 @@ export function BlackboardLine({ line, onCommit, onDelete, streaming = false, on
     },
     [line.id, line.text, onCommit],
   )
-  const cardActions = useMemo<CardActions>(() => ({ selectChoice }), [selectChoice])
+  // A DetectedChoicesCard option was clicked (`cards/DetectedChoicesCard.tsx`)
+  // — an "Option A: …" enumeration the agent wrote as prose, not a
+  // `roshera:choices` fence. Unlike `selectChoice`, there is nothing to
+  // rewrite in the line's own text (no fence to mark `selected:` on): the
+  // agent's prose stays exactly as written, and this only sends the
+  // option's own text as the next turn, same as `processBlackboardMessage`
+  // does for anything the user types.
+  const sendDetectedChoice = useCallback((value: string) => {
+    void processBlackboardMessage(value)
+  }, [])
+  const cardActions = useMemo<CardActions>(
+    () => ({ selectChoice, sendDetectedChoice }),
+    [selectChoice, sendDetectedChoice],
+  )
 
   const isAgent = line.author === 'agent'
+  // `.goosehints` tells the agent to ask a closed-set question as a
+  // `roshera:choices` fence; the agent can ignore that instruction (it's
+  // steering), so the board enforces the outcome as a constraint instead —
+  // detect the agent's OWN "Option A: … Option B: …" enumeration and offer
+  // buttons underneath it regardless. Gated to agent authorship here (never
+  // user or system lines) and to the settled render only: mid-stream, a
+  // still-arriving "Option B:" line would flicker buttons in and out and
+  // could be clicked before its text has finished arriving.
+  const detectedChoices = useMemo(
+    () => (isAgent && !streaming ? detectEnumeratedChoices(line.text) : null),
+    [isAgent, streaming, line.text],
+  )
   const isSystem = line.author === 'system'
 
   return (
@@ -354,6 +381,7 @@ export function BlackboardLine({ line, onCommit, onDelete, streaming = false, on
                 <CardActionsContext.Provider value={cardActions}>
                   <RevealContext.Provider value={reveal}>
                     <MessageMarkdown content={line.text} />
+                    {detectedChoices && <DetectedChoicesCard set={detectedChoices} />}
                   </RevealContext.Provider>
                 </CardActionsContext.Provider>
               ) : (

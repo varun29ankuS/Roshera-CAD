@@ -1,9 +1,9 @@
 import { useContext } from 'react'
-import { Check, CircleHelp } from 'lucide-react'
+import { CircleHelp } from 'lucide-react'
 import type { ChoicesCard as ChoicesCardData } from '@/lib/blackboard-cards'
-import { cn } from '@/lib/utils'
 import { CardShell, Chip } from './card-chrome'
 import { CardActionsContext } from './card-actions-context'
+import { ChoiceButtons } from './ChoiceButtons'
 
 /**
  * CHOICES CARD
@@ -60,48 +60,12 @@ export function ChoicesCard({ card, source }: { card: ChoicesCardData; source: s
         )
       }
     >
-      <div className="mt-1.5 flex flex-col gap-1">
-        {card.options.map((opt) => {
-          const chosen = card.selected === opt.value
-          return (
-            <button
-              key={opt.value}
-              type="button"
-              disabled={!clickable}
-              onClick={(e) => {
-                // The committed line renders inside a "click to edit" button
-                // (BlackboardLine.tsx) — without this, clicking an option
-                // would bubble up and drop the line into raw-text edit mode
-                // instead of sending the choice.
-                e.stopPropagation()
-                actions?.selectChoice(source, opt.value)
-              }}
-              className={cn(
-                'flex flex-col items-start gap-0.5 rounded-md border px-2.5 py-1.5 text-left text-[11px] leading-snug transition-colors',
-                'disabled:cursor-not-allowed disabled:hover:border-border/40 disabled:hover:bg-transparent',
-                chosen && 'border-emerald-500/60 bg-emerald-500/10 text-foreground',
-                // Not-clickable covers two cases with one look: another
-                // option on THIS card was chosen, or (the fixtures gallery)
-                // there is no owning line to answer at all — neither should
-                // look pressable. An in-flight turn elsewhere is NOT one of
-                // these cases — see the module doc above.
-                !chosen && !clickable && 'border-border/40 text-muted-foreground/50 opacity-60',
-                !chosen &&
-                  clickable &&
-                  'border-border/70 text-foreground/90 hover:border-primary/50 hover:bg-accent/40 cursor-pointer',
-              )}
-            >
-              <span className="flex items-center gap-1.5 font-medium">
-                {chosen && <Check size={11} className="shrink-0 text-emerald-600 dark:text-emerald-400" />}
-                {opt.label}
-              </span>
-              {opt.detail && (
-                <span className="text-[10px] text-muted-foreground/80">{opt.detail}</span>
-              )}
-            </button>
-          )
-        })}
-      </div>
+      <ChoiceButtons
+        options={card.options}
+        selected={card.selected}
+        clickable={clickable}
+        onSelect={(value) => actions?.selectChoice(source, value)}
+      />
     </CardShell>
   )
 }

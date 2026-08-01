@@ -229,6 +229,53 @@ const CHOICES_MALFORMED = yamlCard(
   ['question: Which clearance class for the M8 holes?', 'options: []'].join('\n'),
 )
 
+/** Verbatim from the defect report: a closed three-way question the agent
+ *  wrote as "Option A: / Option B: / Option C:" prose instead of the
+ *  `roshera:choices` fence `.goosehints` mandates. Exercises
+ *  `detectEnumeratedChoices` (`lib/blackboard-cards.ts`) through the real
+ *  `BlackboardLine` pipeline via the live-repro seed button below — the
+ *  static "Typed cards" gallery renders fences directly and has no notion
+ *  of line authorship, so it cannot exercise this detector. */
+const DETECTED_CHOICES_AGENT_TEXT = [
+  'Option A: Monolithic Ceramix bell with structural support ribs/gussets and integral attachment flange (simpler, easier manufacturing, but less efficient for heat transfer)',
+  '',
+  'Option B: Thin-wall Ceramix bell with internal collet-nut threaded attachment and external pressure shell (more complex assembly, better if you plan future regenerative cooling)',
+  '',
+  'Option C: Modular: throat insert (consumable) + Ceramix bell extension (allows testing different bell contours without remaking the throat)',
+].join('\n')
+
+/** Negative — same "Option A:" text, but authored by the USER. Must render
+ *  no buttons: detection is gated to agent authorship only. */
+const DETECTED_CHOICES_NEGATIVE_USER =
+  'Option A: just repeating what you said back at you, ignore this'
+
+/** Negative — an agent line with only ONE labelled option. Must render no
+ *  buttons: detection requires at least two matches to count as a set. */
+const DETECTED_CHOICES_NEGATIVE_SINGLE =
+  'Option A: only one option here, no B or C follows, so this must not render buttons'
+
+/** Negative — an agent line that already carries a `roshera:choices`
+ *  fence alongside "Option A:/B:" prose. Must render no DETECTED buttons
+ *  (the fence path already handles it and must not be double-rendered) —
+ *  the fenced card itself still renders normally. */
+const DETECTED_CHOICES_NEGATIVE_FENCED = [
+  'Option A: Monolithic bell, simpler to manufacture.',
+  '',
+  'Option B: Thin-wall bell, better for future regenerative cooling.',
+  '',
+  yamlCard(
+    'choices',
+    [
+      'question: Which bell design?',
+      'options:',
+      '  - value: monolithic',
+      '    label: Option A — Monolithic',
+      '  - value: thin-wall',
+      '    label: Option B — Thin-wall',
+    ].join('\n'),
+  ),
+].join('\n')
+
 const REFUSAL = card('refusal', {
   reason:
     'face 17 is a freeform blend — datum designation requires a planar face (datum plane) or a cylindrical face (datum axis)',
@@ -697,6 +744,21 @@ export function BlackboardFixtures({ onExit }: BlackboardFixturesProps) {
     )
   }, [addLine])
 
+  // ── Live repro: Defect 3 — the agent asked a closed question as
+  // "Option A: / Option B: / Option C:" prose instead of the
+  // `roshera:choices` fence, so the human had to retype an answer. The
+  // policy alone (`.goosehints`) is steering and was ignored; the board now
+  // enforces the outcome as a constraint (`detectEnumeratedChoices`). Seeds
+  // the real defect line plus three negatives that must render NO buttons:
+  // user-authored, a single option, and an agent line that already has a
+  // `roshera:choices` fence.
+  const seedDetectedChoices = useCallback(() => {
+    addLine(DETECTED_CHOICES_AGENT_TEXT, 'agent')
+    addLine(DETECTED_CHOICES_NEGATIVE_USER, 'user')
+    addLine(DETECTED_CHOICES_NEGATIVE_SINGLE, 'agent')
+    addLine(DETECTED_CHOICES_NEGATIVE_FENCED, 'agent')
+  }, [addLine])
+
   return (
     <div className="h-full w-full overflow-y-auto bg-background text-foreground select-text">
       <div className="mx-auto max-w-4xl px-6 py-6">
@@ -751,6 +813,13 @@ export function BlackboardFixtures({ onExit }: BlackboardFixturesProps) {
               title="Append two independent roshera:choices cards — both must stay answerable regardless of click order"
             >
               seed 2 choices cards
+            </button>
+            <button
+              onClick={seedDetectedChoices}
+              className="cad-icon-btn h-6 px-1.5 text-[11px]"
+              title="Append the verbatim defect line (agent's own unfenced Option A/B/C prose) plus three negatives: a user line, a single-option agent line, and an agent line that already has a roshera:choices fence — only the first should grow detected-option buttons"
+            >
+              seed detected choices + negatives
             </button>
             <span className="text-[10px] text-muted-foreground">
               use the panel's own trash icon to clear

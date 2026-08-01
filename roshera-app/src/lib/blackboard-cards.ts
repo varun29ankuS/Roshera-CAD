@@ -272,6 +272,53 @@ export const choicesCardSchema = z
 export type ChoicesCard = z.infer<typeof choicesCardSchema>
 export type ChoiceOption = z.infer<typeof choiceOptionSchema>
 
+// ── Detected (unfenced) choices ────────────────────────────────────────
+//
+// `.goosehints` is steering — an instruction the agent can ignore — so the
+// board also enforces the outcome as a constraint: an agent line that asks a
+// closed question as "Option A: … Option B: …" prose, without the
+// `roshera:choices` fence, still gets clickable buttons. Deliberately
+// narrow: this must never INVENT an option, only recognise one the agent
+// itself explicitly labelled.
+
+export interface DetectedChoiceOption {
+  /** The label as written — "A", "B", "1" — display-only. */
+  label: string
+  /** Everything after "Option X:" on that line, the agent's own words,
+   *  verbatim. This is what gets sent as the reply when clicked. */
+  text: string
+}
+
+export interface DetectedChoiceSet {
+  options: DetectedChoiceOption[]
+}
+
+/** "Option A:", "Option B:", "Option 1:" … at the start of a (trimmed)
+ *  line. Deliberately just letters/digits — no bullets, no "Option A -",
+ *  nothing inferred beyond what the agent explicitly labelled. */
+const OPTION_LINE_RE = /^Option\s+([A-Za-z0-9]+):\s*(.+)$/
+
+/**
+ * Scan one agent-authored line's full text for its own "Option A: …" /
+ * "Option B: …" enumeration. Requires at least two matching lines within
+ * the same text to count as a genuine closed set — a single "Option A:" is
+ * not a choice. If the text already contains a `roshera:choices` fence,
+ * that path already renders buttons, so this defers unconditionally
+ * (returns `null`) rather than double-rendering.
+ *
+ * Callers MUST gate this to `line.author === 'agent'` themselves — this
+ * function has no notion of authorship, only text.
+ */
+export function detectEnumeratedChoices(text: string): DetectedChoiceSet | null {
+  if (text.includes('```roshera:choices')) return null
+  const options: DetectedChoiceOption[] = []
+  for (const rawLine of text.split('\n')) {
+    const match = OPTION_LINE_RE.exec(rawLine.trim())
+    if (match) options.push({ label: match[1], text: match[2].trim() })
+  }
+  return options.length >= 2 ? { options } : null
+}
+
 // ── Merge result (api-server/src/branches.rs `MergeView`) ─────────────
 
 const conflictWitnessSchema = z
