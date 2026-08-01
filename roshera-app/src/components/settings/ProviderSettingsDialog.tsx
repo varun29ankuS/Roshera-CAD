@@ -512,7 +512,19 @@ export function ProviderSettingsButton() {
         )}
 
         {data && (
-          <div className="flex max-h-[60vh] flex-col gap-3 overflow-y-auto pr-1">
+          /* `pt-2` is load-bearing, not spacing. Each vendor mark's state
+             dot is positioned `-top-1 -right-1` — deliberately overhanging
+             its button — and this element scrolls, so anything outside the
+             scroll box is clipped at its edge and the top row's dots lose
+             their upper sliver. The right side was already compensated with
+             `pr-1`; the top was missed.
+             The selected mark also carries `-translate-y-0.5`, lifting it a
+             further 2px, so the provider actually picked is the one that
+             clips worst — 4px of offset plus a 2px ring plus 2px of lift is
+             why this is `pt-2` and not `pt-1`. Padding sits INSIDE the
+             scroll box, so it gives the overhang somewhere to live without
+             shifting the content. */
+          <div className="flex max-h-[60vh] flex-col gap-3 overflow-y-auto pr-1 pt-2">
             {/* Connected readout — one line, never a card of transport
                 prose. The interactive controls for changing any of this
                 live in the panel below, never duplicated up here. */}
