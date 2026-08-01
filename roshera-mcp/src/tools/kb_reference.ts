@@ -12,7 +12,7 @@
  * Sourcing honesty (doc §9 / dfm/provenance.rs discipline): the ISO tables
  * below are transcriptions of the published standards' tables, not
  * clause-verified against a purchased edition — every ISO-sourced answer
- * carries that caveat in `source_note`. Items the doc marks [V] needs-Varun
+ * carries that caveat in `source_note`. Items the doc marks [V] needs-house-decision
  * or vendor-conflicting (house clearance class Q6, house tolerance class Q1,
  * K-factor by material, house stock list) REFUSE rather than default.
  */
@@ -101,7 +101,7 @@ function clearanceHole(args: Record<string, unknown>): RefResult {
   const clsRaw = args.class;
   if (clsRaw === undefined || clsRaw === null || String(clsRaw).length === 0) {
     return refuse(
-      "no house-wide clearance class exists — architecture doc §8-Q6 (close vs medium vs free) is OPEN, needs Varun; pass args.class explicitly per task rather than inheriting a silent default",
+      "no house-wide clearance class exists — architecture doc §8-Q6 (close vs medium vs free) is OPEN, needs a house decision; pass args.class explicitly per task rather than inheriting a silent default",
       { open_question: "architecture doc §8-Q6", valid_keys: Object.keys(CLEARANCE_CLASS) },
     );
   }
@@ -262,7 +262,7 @@ function generalTolerance(args: Record<string, unknown>): RefResult {
   const clsRaw = args.class;
   if (clsRaw === undefined || clsRaw === null || String(clsRaw).length === 0) {
     return refuse(
-      "no house-wide ISO 2768 class exists — architecture doc §8-Q1 (f/m/c/v) is OPEN, needs Varun; pass args.class explicitly per task rather than inheriting a silent default",
+      "no house-wide ISO 2768 class exists — architecture doc §8-Q1 (f/m/c/v) is OPEN, needs a house decision; pass args.class explicitly per task rather than inheriting a silent default",
       { open_question: "architecture doc §8-Q1", valid_keys: Object.keys(TOL_CLASS_COL) },
     );
   }
@@ -460,11 +460,11 @@ function threadSpec(args: Record<string, unknown>): RefResult {
   );
 }
 
-// ─── standard_stock: [V] — vendor/region dependent, refuses pending Varun ───
+// ─── standard_stock: [V] — vendor/region dependent, refuses pending a house decision ───
 
 function standardStock(): RefResult {
   return refuse(
-    "standard stock (sheet gauges, bar diameters) is vendor/region dependent and no house supplier list is on file — needs Varun; shipping a generic list would be exactly the invented house default the policy KB forbids (doc §5.2)",
+    "standard stock (sheet gauges, bar diameters) is vendor/region dependent and no house supplier list is on file — needs a house decision; shipping a generic list would be exactly the invented house default the policy KB forbids (doc §5.2)",
     { open_question: "house stock list [V]" },
   );
 }
@@ -490,7 +490,7 @@ function bendAllowance(args: Record<string, unknown>): RefResult {
           k_factor_range: [0.33, 0.5],
           basis: "vendor/published sheet-metal guidance, material- and process-dependent [P]",
         },
-        open_question: "per-material K-factor table [V] — needs a material spec or Varun",
+        open_question: "per-material K-factor table [V] — needs a material spec or a house decision",
       },
     );
   }
@@ -560,6 +560,163 @@ function drillSize(args: Record<string, unknown>): RefResult {
   );
 }
 
+// ─── pipe flanges: ASME B16.5 Class 150 + EN 1092-1 PN16 (weld-neck, RF) ────
+// Added 2026-08-01 (the DN50 refusal that motivated this task). Scope kept
+// deliberately narrow — every row below was cross-checked against a SECOND
+// independent published source before being transcribed (ASME: engineering
+// data matched independently across 12 sizes x 6 fields; EN 1092-1: two
+// independent tables (roymech.co.uk, wermac.org) agree exactly on OD/BCD/
+// bolt-hole-diameter across all 12 DN sizes). Nothing here is interpolated —
+// a size outside the transcribed range REFUSES by name (see pipeFlange
+// below), never extrapolates: an interpolated flange is a part that does not
+// exist, and a wrong bolt circle ships a part that will not bolt up.
+//
+// DN/NPS is a NOMINAL designation, not a bore diameter: e.g. DN50/NPS2 pipe
+// OD is ~60.3mm, not 50mm — both standards' own dimension tables carry the
+// pipe/neck OD next to the nominal label, which is exactly where that
+// mismatch was caught in the turn that started this task.
+
+interface FlangeRow {
+  flange_od_mm: number;
+  thickness_mm: number;
+  bolt_circle_diameter_mm: number;
+  bolt_count: number;
+  bolt_hole_diameter_mm: number;
+  raised_face_diameter_mm: number;
+}
+
+// ASME B16.5-2020, Class 150, welding-neck flange with raised face (RF).
+const ASME_B16_5_150: Record<string, FlangeRow> = {
+  "1/2": { flange_od_mm: 89.0, thickness_mm: 11.2, bolt_circle_diameter_mm: 60.5, bolt_count: 4, bolt_hole_diameter_mm: 15.7, raised_face_diameter_mm: 34.9 },
+  "3/4": { flange_od_mm: 98.5, thickness_mm: 12.7, bolt_circle_diameter_mm: 69.9, bolt_count: 4, bolt_hole_diameter_mm: 15.7, raised_face_diameter_mm: 42.9 },
+  "1": { flange_od_mm: 108.0, thickness_mm: 14.2, bolt_circle_diameter_mm: 79.2, bolt_count: 4, bolt_hole_diameter_mm: 15.7, raised_face_diameter_mm: 50.8 },
+  "1-1/4": { flange_od_mm: 117.5, thickness_mm: 15.7, bolt_circle_diameter_mm: 88.9, bolt_count: 4, bolt_hole_diameter_mm: 15.7, raised_face_diameter_mm: 63.5 },
+  "1-1/2": { flange_od_mm: 127.0, thickness_mm: 17.5, bolt_circle_diameter_mm: 98.6, bolt_count: 4, bolt_hole_diameter_mm: 15.7, raised_face_diameter_mm: 73.2 },
+  "2": { flange_od_mm: 152.4, thickness_mm: 19.1, bolt_circle_diameter_mm: 120.7, bolt_count: 4, bolt_hole_diameter_mm: 19.1, raised_face_diameter_mm: 92.1 },
+  "2-1/2": { flange_od_mm: 177.8, thickness_mm: 22.4, bolt_circle_diameter_mm: 139.7, bolt_count: 4, bolt_hole_diameter_mm: 19.1, raised_face_diameter_mm: 104.6 },
+  "3": { flange_od_mm: 190.5, thickness_mm: 23.9, bolt_circle_diameter_mm: 152.4, bolt_count: 4, bolt_hole_diameter_mm: 19.1, raised_face_diameter_mm: 127.0 },
+  "4": { flange_od_mm: 228.6, thickness_mm: 23.9, bolt_circle_diameter_mm: 190.5, bolt_count: 8, bolt_hole_diameter_mm: 19.1, raised_face_diameter_mm: 157.2 },
+  "5": { flange_od_mm: 254.0, thickness_mm: 23.9, bolt_circle_diameter_mm: 215.9, bolt_count: 8, bolt_hole_diameter_mm: 22.4, raised_face_diameter_mm: 185.7 },
+  "6": { flange_od_mm: 279.4, thickness_mm: 25.4, bolt_circle_diameter_mm: 241.3, bolt_count: 8, bolt_hole_diameter_mm: 22.4, raised_face_diameter_mm: 215.9 },
+  "8": { flange_od_mm: 342.9, thickness_mm: 28.4, bolt_circle_diameter_mm: 298.5, bolt_count: 8, bolt_hole_diameter_mm: 22.4, raised_face_diameter_mm: 269.7 },
+};
+
+// EN 1092-1:2018 Type 11, PN16, welding-neck flange with raised face.
+const EN_1092_1_PN16: Record<string, FlangeRow> = {
+  "15": { flange_od_mm: 95, thickness_mm: 16, bolt_circle_diameter_mm: 65, bolt_count: 4, bolt_hole_diameter_mm: 14, raised_face_diameter_mm: 45 },
+  "20": { flange_od_mm: 105, thickness_mm: 18, bolt_circle_diameter_mm: 75, bolt_count: 4, bolt_hole_diameter_mm: 14, raised_face_diameter_mm: 58 },
+  "25": { flange_od_mm: 115, thickness_mm: 18, bolt_circle_diameter_mm: 85, bolt_count: 4, bolt_hole_diameter_mm: 14, raised_face_diameter_mm: 68 },
+  "32": { flange_od_mm: 140, thickness_mm: 18, bolt_circle_diameter_mm: 100, bolt_count: 4, bolt_hole_diameter_mm: 18, raised_face_diameter_mm: 78 },
+  "40": { flange_od_mm: 150, thickness_mm: 18, bolt_circle_diameter_mm: 110, bolt_count: 4, bolt_hole_diameter_mm: 18, raised_face_diameter_mm: 88 },
+  "50": { flange_od_mm: 165, thickness_mm: 18, bolt_circle_diameter_mm: 125, bolt_count: 4, bolt_hole_diameter_mm: 18, raised_face_diameter_mm: 102 },
+  "65": { flange_od_mm: 185, thickness_mm: 18, bolt_circle_diameter_mm: 145, bolt_count: 8, bolt_hole_diameter_mm: 18, raised_face_diameter_mm: 122 },
+  "80": { flange_od_mm: 200, thickness_mm: 20, bolt_circle_diameter_mm: 160, bolt_count: 8, bolt_hole_diameter_mm: 18, raised_face_diameter_mm: 138 },
+  "100": { flange_od_mm: 220, thickness_mm: 20, bolt_circle_diameter_mm: 180, bolt_count: 8, bolt_hole_diameter_mm: 18, raised_face_diameter_mm: 158 },
+  "125": { flange_od_mm: 250, thickness_mm: 22, bolt_circle_diameter_mm: 210, bolt_count: 8, bolt_hole_diameter_mm: 18, raised_face_diameter_mm: 188 },
+  "150": { flange_od_mm: 285, thickness_mm: 22, bolt_circle_diameter_mm: 240, bolt_count: 8, bolt_hole_diameter_mm: 22, raised_face_diameter_mm: 212 },
+  "200": { flange_od_mm: 340, thickness_mm: 24, bolt_circle_diameter_mm: 295, bolt_count: 12, bolt_hole_diameter_mm: 22, raised_face_diameter_mm: 268 },
+};
+
+const ASME_SIZE_ALIASES: Record<string, string> = {
+  "0.5": "1/2",
+  "0.75": "3/4",
+  "1.25": "1-1/4",
+  "1 1/4": "1-1/4",
+  "1.5": "1-1/2",
+  "1 1/2": "1-1/2",
+  "2.5": "2-1/2",
+  "2 1/2": "2-1/2",
+};
+
+function normalizeFlangeStandard(raw: unknown): "ASME_B16_5" | "EN_1092_1" | null {
+  const s = String(raw ?? "").toLowerCase().replace(/[\s_-]/g, "");
+  if (s.length === 0) return null;
+  if (s.includes("asme") || s.includes("ansi") || s.includes("b16.5") || s.includes("b165")) return "ASME_B16_5";
+  if (s.includes("en1092") || s.includes("din1092")) return "EN_1092_1";
+  return null;
+}
+
+function pipeFlange(args: Record<string, unknown>): RefResult {
+  const std = normalizeFlangeStandard(args.standard);
+  if (std === null) {
+    return refuse(
+      `cannot identify a flange standard from '${String(args.standard ?? "")}' — this KB transcribes exactly two: 'ASME B16.5' (Class 150) and 'EN 1092-1' (PN16); anything else (JIS, GOST, a different pressure class/rating family) is not on file`,
+      { valid_keys: ["ASME B16.5 Class 150", "EN 1092-1 PN16"] },
+    );
+  }
+
+  const classRaw = args.class ?? args.rating ?? args.pn;
+  if (classRaw === undefined || classRaw === null || String(classRaw).trim().length === 0) {
+    return refuse(
+      std === "ASME_B16_5"
+        ? "flange_dims needs args.class — only Class 150 is transcribed for ASME B16.5 in this KB (no 300/600/900/1500/2500 rows exist; a higher class is a different, thicker, more-bolted flange, not a scaled-up 150)"
+        : "flange_dims needs args.class (the PN rating) — only PN16 is transcribed for EN 1092-1 in this KB (no PN6/PN10/PN25/PN40 rows exist)",
+    );
+  }
+  const classDigits = String(classRaw).replace(/\D/g, "");
+  const wantClass = std === "ASME_B16_5" ? "150" : "16";
+  if (classDigits !== wantClass) {
+    return refuse(
+      std === "ASME_B16_5"
+        ? `ASME B16.5 Class ${classDigits || String(classRaw)} is not transcribed — only Class 150 is in this KB, a named gap, not a scaled guess`
+        : `EN 1092-1 PN${classDigits || String(classRaw)} is not transcribed — only PN16 is in this KB, a named gap, not a scaled guess`,
+    );
+  }
+
+  const sizeRaw = String(args.size ?? "").trim();
+  if (sizeRaw.length === 0) {
+    return refuse(
+      std === "ASME_B16_5"
+        ? "flange_dims needs args.size — an NPS designation like '2' or 'NPS 1-1/4' (covered: NPS 1/2 through 8)"
+        : "flange_dims needs args.size — a DN designation like 'DN50' or '50' (covered: DN15 through DN200)",
+    );
+  }
+
+  if (std === "ASME_B16_5") {
+    let key = sizeRaw.toUpperCase().replace(/^NPS\s*/, "").trim();
+    key = ASME_SIZE_ALIASES[key] ?? key;
+    const row = ASME_B16_5_150[key];
+    if (!row) {
+      return refuse(
+        `NPS ${sizeRaw} is not transcribed for ASME B16.5 Class 150 — this KB covers exactly NPS ${Object.keys(ASME_B16_5_150).join(", ")} (1/2 through 8); a size outside that set was never transcribed and this lookup will not interpolate one — an interpolated flange is a part that does not exist`,
+        { valid_keys: Object.keys(ASME_B16_5_150).map((k) => `NPS ${k}`) },
+      );
+    }
+    return answer(
+      {
+        standard: "ASME B16.5 Class 150",
+        size: `NPS ${key}`,
+        ...row,
+        nominal_designation_note:
+          "NPS is a nominal pipe-size designation, not a bore diameter — e.g. NPS 2 pipe OD is 60.3mm (schedule-independent), well above the nominal '2'.",
+      },
+      "ASME B16.5-2020, Table (welding-neck flange with raised face, Class 150)",
+      TRANSCRIPTION_NOTE,
+    );
+  }
+
+  // EN_1092_1
+  const key = sizeRaw.toUpperCase().replace(/^DN\s*/, "").trim();
+  const row = EN_1092_1_PN16[key];
+  if (!row) {
+    return refuse(
+      `DN${key} is not transcribed for EN 1092-1 PN16 — this KB covers exactly DN${Object.keys(EN_1092_1_PN16).join(", DN")} (15 through 200); a size outside that set was never transcribed and this lookup will not interpolate one — an interpolated flange is a part that does not exist`,
+      { valid_keys: Object.keys(EN_1092_1_PN16).map((k) => `DN${k}`) },
+    );
+  }
+  return answer(
+    {
+      standard: "EN 1092-1 PN16",
+      size: `DN${key}`,
+      ...row,
+      nominal_designation_note:
+        "DN is a nominal designation, not a bore diameter — e.g. DN50 pipe OD is ~60.3mm, not 50mm.",
+    },
+    "EN 1092-1:2018 Type 11 (welding-neck flange with raised face, PN16)",
+    TRANSCRIPTION_NOTE,
+  );
+}
+
 // ─── Dispatch ───────────────────────────────────────────────────────────────
 
 const REFERENCE_FNS: Record<string, (args: Record<string, unknown>) => RefResult> = {
@@ -571,6 +728,7 @@ const REFERENCE_FNS: Record<string, (args: Record<string, unknown>) => RefResult
   standard_stock: standardStock,
   bend_allowance: bendAllowance,
   drill_size: drillSize,
+  flange_dims: pipeFlange,
 };
 
 export const REFERENCE_KEYS = Object.keys(REFERENCE_FNS);
@@ -579,7 +737,7 @@ export function referenceLookup(key: string, args: Record<string, unknown>): Ref
   const fn = REFERENCE_FNS[key];
   if (!fn) {
     return refuse(
-      `unknown reference key '${key}' — no such data function; the valid keys are listed (asking for data outside them is a question for Varun, not a guess)`,
+      `unknown reference key '${key}' — no such data function; the valid keys are listed (asking for data outside them is a question for your design authority, not a guess)`,
       { valid_keys: REFERENCE_KEYS },
     );
   }

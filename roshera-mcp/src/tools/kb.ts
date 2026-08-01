@@ -162,6 +162,17 @@ const PLAYBOOK_META: Record<string, PlaybookMeta> = {
     certification:
       "NO kernel/analyzer backing for snap-fit function anywhere in dfm/ — retention force is not kernel-verifiable today; only the generic tool verdicts named in text (dfm_check(fdm) overhang/min_wall, verify_part) are certified",
   },
+  // dimensioning — added 2026-08-01, not vault-doc-sourced (see kb_data.ts comment).
+  dimensioning: {
+    tool_sequence: [
+      "kb_lookup", "psketch_begin", "psketch_add_entity", "psketch_constrain",
+      "psketch_certify", "label_create", "gdt_datum", "gdt_fcf", "gdt_report",
+      "verify_part",
+    ],
+    section: "§4.9",
+    certification:
+      "gdt_fcf verdicts (flatness, perpendicularity, parallelism, position — RFS only, NO MMC/LMC modifier today) are kernel-certified exact B-Rep measurements via gdt_datum + gdt_fcf. psketch_certify's DOF0 gate certifies dimension COMPLETENESS (no under- or over-constraint), not scheme correctness. The choice of datum/baseline vs chain vs ordinate, ISO 2768 general tolerances, and which faces are functional is drafting judgement captured in the model — real, but NOT a kernel verdict.",
+  },
 };
 
 const KB_DOC = "policy KB (vault Research/2026-07-31-policy-knowledge-base.md)";
@@ -176,13 +187,18 @@ export function registerKbTools(server: ToolHost): void {
       "pack arg, or null with the guidance MARKED uncertified when the kernel " +
       "cannot check that process. kind 'playbook' = one feature type's build " +
       "playbook (hole, boss, rib, gusset, bearing_seat, flange, bolt_pattern, " +
-      "snap_fit) with tool_sequence of real MCP tools in order. kind " +
+      "snap_fit, dimensioning — datums vs chains, size vs location, one " +
+      "dimension per DOF, ASME Y14.5/ISO 129 practice) with tool_sequence of " +
+      "real MCP tools in order. kind " +
       "'reference' = cited engineering data: clearance_hole (bolt clearance " +
       "diameter, ISO 273), tap_drill (tap drill size for a thread), " +
       "general_tolerance (ISO 2768 band), fit_class (ISO 286 hole/shaft fit " +
       "e.g. H7/g6 for a bearing_seat), thread_spec (pitch + tap drill + " +
       "clearance in one record), standard_stock, bend_allowance (sheet-metal " +
-      "K-factor), drill_size (nearest standard drill). Every answer carries " +
+      "K-factor), drill_size (nearest standard drill), flange_dims (pipe " +
+      "flange OD/thickness/bolt-circle/bolt-count/bolt-hole/raised-face for " +
+      "ASME B16.5 Class 150 NPS 1/2-8 or EN 1092-1 PN16 DN15-200 — refuses " +
+      "outside that transcribed range). Every answer carries " +
       "{value, source} — NEVER a bare number; open house questions and " +
       "conflicting vendor data REFUSE by name instead of defaulting.",
     {

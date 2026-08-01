@@ -1,5 +1,5 @@
 import type { ComponentType } from 'react'
-import { Droplet, Eye, ShieldCheck } from 'lucide-react'
+import { Droplet, ShieldCheck } from 'lucide-react'
 import type { SoundnessCard as SoundnessCardData } from '@/lib/blackboard-cards'
 import { CardShell, Chip, Claim, ClaimBadge, KV, type CardAccent } from './card-chrome'
 import { eulerGenus, fmtNum } from './format'
@@ -17,27 +17,38 @@ import { eulerGenus, fmtNum } from './format'
  * The nine invariants render as a wrapped row of compact `ClaimBadge`s (not
  * a vertical list — Varun, 2026-08-01: a sound part should read as one
  * glance of green, and nine lines all saying "fine" buries the one that
- * doesn't). A genuinely recognisable pictograph is used where one exists
- * (a droplet for "watertight", an eye for the dual-eye consistency check —
- * both common enough that no legend is needed); every other invariant is an
- * abstract B-Rep/topology term with no real-world icon, so it keeps its
- * short text label rather than inventing a private glyph. Full detail is on
- * hover either way.
+ * doesn't). `label` is the badge's visible short text; `long` is the full
+ * claim, used ONLY for the hover/`aria-label` detail — never abbreviated,
+ * so a badge's tooltip is never shorter than the thing it certifies.
+ *
+ * Only ONE invariant gets a pictograph instead of a label: watertight's
+ * droplet, because waterproof/leak iconography is genuinely universal (IP
+ * ratings, packaging) — no legend needed. `dual-eye` LOOKED like a second
+ * candidate (an eye glyph reads naturally as "vision"), but on reflection
+ * it decodes to the wrong thing: a bare eye in a certificate row reads as
+ * "visible/viewed," not "two independent synthetic viewpoints reconciled
+ * face coverage" — a private mapping this codebase's own rule (never ship
+ * a lookalike a reader has to be taught) forbids. Every other invariant is
+ * an abstract B-Rep/topology term with no real-world icon at all, so all
+ * eight keep short text labels rather than inventing glyphs for them.
  */
 const INVARIANTS: ReadonlyArray<{
   key: keyof SoundnessCardData & string
+  /** Visible badge text (or nothing, if `glyph` is set). */
   label: string
+  /** Full claim name — hover/`aria-label` only, never truncated. */
+  long: string
   glyph?: ComponentType<{ size?: number | string; className?: string }>
 }> = [
-  { key: 'brep_valid', label: 'B-Rep' },
-  { key: 'watertight', label: 'watertight', glyph: Droplet },
-  { key: 'manifold', label: 'manifold' },
-  { key: 'self_intersection_free', label: 'self-int.' },
-  { key: 'construction_consistent', label: 'construction' },
-  { key: 'labels_consistent', label: 'labels' },
-  { key: 'tessellation_clean', label: 'tessellation' },
-  { key: 'mesh_quality_clean', label: 'mesh quality' },
-  { key: 'eyes_consistent', label: 'dual-eye', glyph: Eye },
+  { key: 'brep_valid', label: 'B-Rep', long: 'B-Rep valid' },
+  { key: 'watertight', label: 'watertight', long: 'watertight', glyph: Droplet },
+  { key: 'manifold', label: 'manifold', long: 'manifold' },
+  { key: 'self_intersection_free', label: 'no self-int.', long: 'self-intersection-free' },
+  { key: 'construction_consistent', label: 'construction', long: 'construction consistent' },
+  { key: 'labels_consistent', label: 'labels', long: 'labels consistent' },
+  { key: 'tessellation_clean', label: 'tessellation', long: 'tessellation clean' },
+  { key: 'mesh_quality_clean', label: 'mesh quality', long: 'mesh quality clean' },
+  { key: 'eyes_consistent', label: 'dual-eye', long: 'dual-eye consistency' },
 ]
 
 export function SoundnessCard({ card }: { card: SoundnessCardData }) {
@@ -66,7 +77,7 @@ export function SoundnessCard({ card }: { card: SoundnessCardData }) {
       }
     >
       <div className="mt-1.5 flex flex-wrap items-center gap-1">
-        {INVARIANTS.map(({ key, label, glyph }) => {
+        {INVARIANTS.map(({ key, label, long, glyph }) => {
           const value = (card[key] ?? null) as boolean | null
           return (
             <ClaimBadge
@@ -76,8 +87,8 @@ export function SoundnessCard({ card }: { card: SoundnessCardData }) {
               glyph={glyph}
               detail={
                 value === null
-                  ? `${label}: not run — not-run is not a pass`
-                  : `${label}: ${value ? 'proven' : 'FAILED'}`
+                  ? `${long}: not run — not-run is not a pass`
+                  : `${long}: ${value ? 'proven' : 'FAILED'}`
               }
             />
           )

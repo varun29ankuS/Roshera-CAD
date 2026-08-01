@@ -70,11 +70,15 @@ export function ChoicesCard({ card, source }: { card: ChoicesCardData; source: s
               }}
               className={cn(
                 'flex flex-col items-start gap-0.5 rounded-md border px-2.5 py-1.5 text-left text-[11px] leading-snug transition-colors',
-                chosen &&
-                  'border-emerald-500/60 bg-emerald-500/10 text-foreground',
-                !chosen && answered && 'border-border/40 text-muted-foreground/50 opacity-60',
+                'disabled:cursor-not-allowed disabled:hover:border-border/40 disabled:hover:bg-transparent',
+                chosen && 'border-emerald-500/60 bg-emerald-500/10 text-foreground',
+                // Not-clickable covers three cases with one look: another
+                // option was chosen, a turn is already in flight, or (the
+                // fixtures gallery) there is no owning line to answer at
+                // all — none of those should look pressable.
+                !chosen && !clickable && 'border-border/40 text-muted-foreground/50 opacity-60',
                 !chosen &&
-                  !answered &&
+                  clickable &&
                   'border-border/70 text-foreground/90 hover:border-primary/50 hover:bg-accent/40 cursor-pointer',
               )}
             >

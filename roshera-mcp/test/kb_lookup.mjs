@@ -82,12 +82,23 @@ console.log("(s) SURFACE: kb_lookup in the FULL table only; minimal bill unmoved
 
   // The load-bearing number: the resident minimal bill measured 5070 tokens
   // immediately BEFORE kb_lookup existed (scale_s2, 2026-07-31). The design's
-  // zero-marginal-cost claim means this number must not move by one token.
+  // zero-marginal-cost claim means kb_lookup's OWN existence/growth must not
+  // move this number by one token — CORE_SURFACE/META_SURFACE tools are the
+  // only inputs to this bill and kb_lookup is deliberately in neither.
+  //
+  // Pin re-based 2026-08-01: the bill had already drifted to 5139 BEFORE this
+  // session's dimensioning-playbook/flange-table changes (confirmed by
+  // stashing this session's 3 edited files and re-measuring at HEAD — same
+  // 5139, same scale_s2.mjs "exceeds 5000 target" failure) — pre-existing
+  // drift from unrelated CORE_SURFACE-tool wording changes on this branch,
+  // same class of issue scale_s2.mjs's own comment documents for the
+  // blackboard commit. Not this task's regression; re-pinned so this test
+  // still catches a REAL future move.
   const minimalBill = billFor(table, MINIMAL_SURFACE);
-  if (minimalBill === 5070)
-    pass(`minimal bill ${minimalBill} == pre-kb_lookup pin 5070 (zero marginal cost)`);
+  if (minimalBill === 5139)
+    pass(`minimal bill ${minimalBill} == re-based pin 5139 (kb_lookup's zero marginal cost holds; 2026-08-01 dimensioning/flange work moved it 0 tokens)`);
   else
-    fail(`minimal bill ${minimalBill} != 5070 — kb_lookup (or something) moved the resident surface`);
+    fail(`minimal bill ${minimalBill} != 5139 — something moved the resident surface`);
 }
 
 // ── (p) PROVENANCE ──────────────────────────────────────────────────────────
@@ -370,6 +381,54 @@ console.log("(2) TIER 2: playbook chunks + tool_sequence resolve against the tab
   if (snap && typeof snap.certification === "string" && /no kernel|not.*kernel/i.test(snap.certification))
     pass("playbook:snap_fit certification names the total absence of kernel backing");
   else fail(`playbook:snap_fit must flag no-kernel-backing: ${JSON.stringify(snap && snap.certification)}`);
+}
+
+// ── (3) NEW 2026-08-01 — dimensioning playbook + flange_dims reference ──────
+console.log("(3) NEW: dimensioning playbook + flange_dims reference (the DN50 case)");
+{
+  const dim = await lookup("playbook", "dimensioning");
+  if (dim && !dim.refused && Array.isArray(dim.tool_sequence) && dim.tool_sequence.length > 0) {
+    const missing = dim.tool_sequence.filter((n) => !table.has(n));
+    if (missing.length === 0) pass(`playbook:dimensioning tool_sequence all resolve in the table (${dim.tool_sequence.length} tools)`);
+    else fail(`playbook:dimensioning tool_sequence names unknown tools: ${missing.join(", ")}`);
+  } else {
+    fail(`playbook:dimensioning must answer with a non-empty tool_sequence: ${JSON.stringify(dim)}`);
+  }
+  if (dim && typeof dim.text === "string" && /datum/i.test(dim.text) && /degree of freedom|DOF/i.test(dim.text))
+    pass("playbook:dimensioning text covers datums and one-dimension-per-DOF");
+  else fail(`playbook:dimensioning text missing expected content: ${JSON.stringify(dim && dim.text)}`);
+
+  // The DN50 case that started this task must work end to end.
+  const dn50 = await lookup("reference", "flange_dims", { standard: "EN 1092-1", class: "PN16", size: "DN50" });
+  if (
+    dn50 && dn50.value && typeof dn50.source === "string" && dn50.source.length > 0 &&
+    dn50.value.flange_od_mm === 165 && dn50.value.bolt_circle_diameter_mm === 125 &&
+    dn50.value.bolt_count === 4 && dn50.value.bolt_hole_diameter_mm === 18
+  )
+    pass(`flange_dims(EN 1092-1 PN16, DN50) = {value, source} — OD 165mm, BCD 125mm, 4x18mm holes, source: "${dn50.source}"`);
+  else fail(`flange_dims(EN 1092-1 PN16, DN50) wrong: ${JSON.stringify(dn50)}`);
+
+  const asmeHalf = await lookup("reference", "flange_dims", { standard: "ASME B16.5", class: "150", size: "1/2" });
+  if (asmeHalf && asmeHalf.value && asmeHalf.value.flange_od_mm === 89.0 && /ASME B16.5/.test(asmeHalf.source))
+    pass(`flange_dims(ASME B16.5 Class 150, NPS 1/2) = {value, source}, OD 89.0mm`);
+  else fail(`flange_dims(ASME B16.5, NPS 1/2) wrong: ${JSON.stringify(asmeHalf)}`);
+
+  // Out-of-range REFUSES by name rather than extrapolating.
+  const dn250 = await lookup("reference", "flange_dims", { standard: "EN 1092-1", class: "PN16", size: "DN250" });
+  if (dn250 && dn250.refused === true && !("value" in dn250) && Array.isArray(dn250.valid_keys))
+    pass("flange_dims(EN 1092-1 PN16, DN250) REFUSES (outside the transcribed DN15-200 range) naming valid_keys");
+  else fail(`flange_dims(DN250) must refuse, not extrapolate: ${JSON.stringify(dn250)}`);
+
+  const nps12 = await lookup("reference", "flange_dims", { standard: "ASME B16.5", class: "150", size: "12" });
+  if (nps12 && nps12.refused === true && !("value" in nps12) && Array.isArray(nps12.valid_keys))
+    pass("flange_dims(ASME B16.5 Class 150, NPS 12) REFUSES (outside the transcribed 1/2-8 range) naming valid_keys");
+  else fail(`flange_dims(NPS 12) must refuse, not extrapolate: ${JSON.stringify(nps12)}`);
+
+  // Unsupported class/rating also refuses by name (only one class per standard transcribed).
+  const class300 = await lookup("reference", "flange_dims", { standard: "ASME B16.5", class: "300", size: "2" });
+  if (class300 && class300.refused === true && /150/.test(class300.reason))
+    pass("flange_dims(ASME B16.5 Class 300) REFUSES — only Class 150 transcribed");
+  else fail(`flange_dims(Class 300) must refuse naming Class 150 as what's covered: ${JSON.stringify(class300)}`);
 }
 
 // ── (f) FUNNEL — discovery + dispatch ───────────────────────────────────────
