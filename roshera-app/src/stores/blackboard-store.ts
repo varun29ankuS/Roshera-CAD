@@ -109,6 +109,14 @@ export interface BlackboardLine {
    *  user/system lines and for an agent line still streaming (no verdict
    *  yet — see `AgentTurnStatus`'s doc). */
   turnStatus?: AgentTurnStatus
+  /** Set (and incremented) only when `addLine` collapses a repeated,
+   *  identical, CONSECUTIVE system line into this one rather than
+   *  appending a new line — e.g. a resync failure that reposts the same
+   *  text on every WS reconnect. Undefined/1 means "posted once."
+   *  `BlackboardLine.tsx` renders it as a trailing `(×N)`. Never set for
+   *  agent/user lines — a person's or the model's repeated words are
+   *  content, not bookkeeping spam. */
+  repeatCount?: number
 }
 
 export type BlackboardEvent =
@@ -252,6 +260,25 @@ function nextLineId(): string {
   return `bb-${Date.now().toString(36)}-${++lineCounter}`
 }
 
+// ── Repeated system-line collapsing ─────────────────────────────────
+//
+// A resync failure ("Scene sync failed (HTTP 401)…") reposts on every WS
+// reconnect. Verified live: during a reconnect storm those reposts are NOT
+// literally back-to-back — a re-delivered geometry echo ("Created …") from
+// the same reconnect lands BETWEEN them, so requiring strict array
+// adjacency (the first cut of this fix) let duplicates back through and
+// still fragmented the build strip. Tracked instead by exact TEXT within a
+// short recency window, independent of what else was appended in between:
+// the line's POSITION stays where it first appeared (never reordered to
+// the end), only its `repeatCount`/`updatedAt` change. `system`-only, by
+// exact text, per scope — an agent's or a user's repeated words are
+// content, never merged.
+const RECENT_SYSTEM_LINE_WINDOW_MS = 15_000
+const recentSystemLines = new Map<string, { id: string; lastAt: number }>()
+function recentSystemLineKey(scope: BlackboardScope, text: string): string {
+  return `${scope} ${text}`
+}
+
 function persist(scope: BlackboardScope, state: Pick<BlackboardState, 'lines' | 'events'>): void {
   adapter.save(scope, { lines: state.lines, events: state.events })
 }
@@ -274,8 +301,31 @@ export const useBlackboardStore = create<BlackboardState>((set, get) => ({
   streamingLineId: null,
 
   addLine: (text, author) => {
-    const id = nextLineId()
     const now = Date.now()
+    const state0 = get()
+    const key = recentSystemLineKey(state0.activeScope, text)
+    const recent = author === 'system' ? recentSystemLines.get(key) : undefined
+    if (recent && now - recent.lastAt <= RECENT_SYSTEM_LINE_WINDOW_MS) {
+      const stillPresent = state0.lines.some((l) => l.id === recent.id)
+      if (stillPresent) {
+        recentSystemLines.set(key, { id: recent.id, lastAt: now })
+        set((state) => {
+          const lines = state.lines.map((l) =>
+            l.id === recent.id
+              ? { ...l, updatedAt: now, repeatCount: (l.repeatCount ?? 1) + 1 }
+              : l,
+          )
+          persist(state.activeScope, { lines, events: state.events })
+          return { lines }
+        })
+        return recent.id
+      }
+      // The tracked line was deleted (e.g. the user removed it) — fall
+      // through and mint a fresh one below.
+    }
+
+    const id = nextLineId()
+    if (author === 'system') recentSystemLines.set(key, { id, lastAt: now })
     set((state) => {
       const index = state.lines.length
       const lines = [

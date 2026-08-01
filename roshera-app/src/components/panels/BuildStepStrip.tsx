@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { ChevronDown, ChevronRight, Wrench } from 'lucide-react'
 import type { BlackboardLine as Line } from '@/stores/blackboard-store'
-import { ClaimBadge } from './cards/card-chrome'
+import { buildStepBreadcrumb, groupBuildStepsByName } from '@/lib/blackboard-groups'
 import { BlackboardLine } from './BlackboardLine'
 
 /**
@@ -9,15 +9,20 @@ import { BlackboardLine } from './BlackboardLine'
  * ================
  * Consecutive machine-authored "Created …" lines (`lib/blackboard-groups.ts`'s
  * `isBuildStepLine` — the kernel's own per-operation bookkeeping, one line
- * per solid/boolean op) collapse into ONE row: a small numbered `ClaimBadge`
- * per step, in order, reusing the exact glyph vocabulary `cards/card-chrome.tsx`
- * already uses for every certificate in the app — a step reads the same as
- * everything else on the board. The full original line (name, dimensions,
- * triangle count) is that badge's hover text, VERBATIM — never paraphrased
- * or reduced to a count (Varun, 2026-08-01: nine lines of bookkeeping for
- * one bolt circle buried the engineering the agent actually wrote, and "4
- * bores" would be exactly the fabricated summary this product refuses to
- * show — one mark per real operation, always).
+ * per solid/boolean op) collapse into ONE row: a breadcrumb of the operation
+ * NAMES, e.g. `bore ×4 · Difference ×4 — 9 steps`, read straight off each
+ * line's own "Created **name** — …" text
+ * (`lib/blackboard-groups.ts`'s `groupBuildStepsByName`).
+ *
+ * A first cut of this strip (Varun, 2026-08-01) rendered a numbered tick
+ * per step — "✓1 ✓2 … ✓9" — which is strictly worse than the nine lines it
+ * replaced: an ordinal indexes nothing a user can act on, and reading it
+ * required a hover. The fix keeps the same "one mark per real operation,
+ * never summarise" rule but spends the row's width on NAMES instead of
+ * counters: consecutive lines that share an operation name fold to
+ * `name ×N` — the same names with repetition folded, never coerced
+ * together if the names actually differ, and never a fabricated summary
+ * like "4 bores" standing in for text the lines don't literally contain.
  *
  * Collapsed by default. Expanding swaps the strip for the REAL
  * `BlackboardLine`s it stands for — same component, same edit/delete
@@ -35,6 +40,8 @@ export function BuildStepStrip({
   onDelete: (id: string) => void
 }) {
   const [expanded, setExpanded] = useState(false)
+  const segments = groupBuildStepsByName(lines)
+  const { full, display } = buildStepBreadcrumb(segments)
 
   if (expanded) {
     return (
@@ -70,21 +77,14 @@ export function BuildStepStrip({
         <button
           type="button"
           onClick={() => setExpanded(true)}
-          className="flex w-full flex-wrap items-center gap-1 text-left"
-          title={`${lines.length} build steps — click to expand`}
+          className="flex w-full items-center gap-1.5 text-left"
+          title={`${full} — ${lines.length} steps — click to expand`}
+          aria-label={`${full} — ${lines.length} steps — click to expand`}
         >
           <ChevronRight size={11} className="shrink-0 text-muted-foreground/60" />
-          {lines.map((line, i) => (
-            // status=true: each mark records a step that completed — there
-            // is no failure state in this fence (a failed op posts its own,
-            // differently-worded system line and is never grouped here, see
-            // `isBuildStepLine`). `detail` is the line's exact original
-            // text — the ClaimBadge convention already puts it verbatim on
-            // both `title` and `aria-label`.
-            <ClaimBadge key={line.id} status={true} label={String(i + 1)} detail={line.text} />
-          ))}
-          <span className="ml-1 text-[10px] text-muted-foreground/60">
-            {lines.length} build steps
+          <span className="min-w-0 truncate text-[11px] text-foreground/85">{display}</span>
+          <span className="shrink-0 text-[10px] text-muted-foreground/60">
+            — {lines.length} steps
           </span>
         </button>
       </div>

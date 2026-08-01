@@ -298,6 +298,14 @@ export function BlackboardLine({ line, onCommit, onDelete, streaming = false, on
               ) : (
                 <span className="text-white/30 italic">Empty line — click to edit</span>
               )}
+              {isSystem && line.repeatCount !== undefined && line.repeatCount > 1 && (
+                <span
+                  className="ml-1 text-[10px] text-muted-foreground/60"
+                  title={`Reposted ${line.repeatCount} times — identical consecutive lines collapse into one`}
+                >
+                  (×{line.repeatCount})
+                </span>
+              )}
             </span>
           </button>
         )}
