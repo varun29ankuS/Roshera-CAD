@@ -7,12 +7,42 @@ import type { BlackboardLine } from '@/stores/blackboard-store'
  * build-step strip (`components/panels/BuildStepStrip.tsx`) — the kernel's
  * own per-operation "Created …" echo (`lib/ws-bridge.ts`'s
  * `dimensionEchoMessage`, `components/layout/ToolBar.tsx`'s direct-create
- * echo), never agent prose or anything the user wrote. `author === 'system'`
- * is checked first and is load-bearing: agent/user lines are the content —
- * they are NEVER collapsed, even one that happens to start with "Created".
+ * echo), never agent prose or anything the user wrote.
+ *
+ * ── Why authorship CANNOT be the test ──────────────────────────────────
+ * These lines are minted locally as `'system'`, but the backend's author
+ * enum accepts only `user`/`agent` (see `lib/blackboard-api.ts`'s
+ * `wireAuthor`), so every one of them round-trips back as `'agent'`.
+ * Verified against the live store, 2026-08-01: of 38 persisted lines, 36
+ * were `agent` and 0 were `system` — including every "Created …" echo.
+ * An `author === 'system'` test therefore only holds while the
+ * localStorage mirror still carries the local authorship; on a fresh
+ * browser, a cleared cache, or any poll where `applyRemoteSnapshot`
+ * repaints from backend truth, it silently stops matching and the strip
+ * never engages. That is precisely the bug this predicate had.
+ *
+ * So the test is the TEXT SIGNATURE, which survives the round-trip, and
+ * authorship is used only to exclude the human: a user line is content
+ * and is never collapsed, however it happens to be worded. The signature
+ * is deliberately narrow — a trailing triangle count is bookkeeping the
+ * kernel emits and not something an engineer writes in prose, so agent
+ * commentary that merely opens with "Created" does not match.
+ *
+ * The right long-term fix is `System` on the wire enum, so the board
+ * stops attributing its own bookkeeping to the agent; that is a backend
+ * change and an honesty question in its own right, not a prerequisite
+ * for the row being readable.
  */
+
+/** `Created **bore 1/4** — 18 × 18 × 20 mm · 792 tris` (ws-bridge echo). */
+const DIMENSION_ECHO = /^Created \*\*[^*]+\*\*.*·\s*\d+\s*tris\s*$/
+
+/** `Created cube (8 verts, 12 tris, 3 ms).` (ToolBar direct-create echo). */
+const TOOLBAR_ECHO = /^Created \S+ \(\d+ verts, \d+ tris, [\d.]+ ms\)\.\s*$/
+
 export function isBuildStepLine(line: BlackboardLine): boolean {
-  return line.author === 'system' && /^Created\s/.test(line.text)
+  if (line.author === 'user') return false
+  return DIMENSION_ECHO.test(line.text) || TOOLBAR_ECHO.test(line.text)
 }
 
 export type BlackboardGroup =
@@ -111,6 +141,20 @@ export function buildStepBreadcrumb(segments: BuildStepSegment[]): {
   return { full, display: `${labels[0]} · … · ${labels[labels.length - 1]}` }
 }
 
+/**
+ * Longest pause between two steps that still counts as ONE build.
+ *
+ * List adjacency alone is not sameness. A notebook accumulates across
+ * sessions, and once the predicate stopped depending on authorship the
+ * persisted history collapsed into a single 33-step breadcrumb spanning
+ * several unrelated builds (measured against the live store, 2026-08-01) —
+ * which is the same unreadable-row defect in a new costume. Steps the
+ * kernel emits inside one build land milliseconds apart; a genuinely new
+ * build is separated by however long the engineer took to ask for it. Two
+ * minutes sits far above the former and far below the latter.
+ */
+const BUILD_RUN_GAP_MS = 120_000
+
 export function groupBlackboardLines(lines: BlackboardLine[]): BlackboardGroup[] {
   const groups: BlackboardGroup[] = []
   let run: BlackboardLine[] = []
@@ -123,12 +167,16 @@ export function groupBlackboardLines(lines: BlackboardLine[]): BlackboardGroup[]
   }
 
   for (const line of lines) {
-    if (isBuildStepLine(line)) {
-      run.push(line)
-    } else {
+    if (!isBuildStepLine(line)) {
       flushRun()
       groups.push({ kind: 'line', line })
+      continue
     }
+    // A long pause since the previous step means a different build, so the
+    // open run is closed and this line starts a new one.
+    const prev = run[run.length - 1]
+    if (prev && line.createdAt - prev.createdAt > BUILD_RUN_GAP_MS) flushRun()
+    run.push(line)
   }
   flushRun()
 
