@@ -279,17 +279,32 @@ fn write_sarvam_custom_provider_definition() -> Result<(), GooseAcpError> {
         ),
         api_key_env: SARVAM_API_KEY_ENV.to_string(),
         base_url: SARVAM_BASE_URL.to_string(),
-        // Sarvam's two chat models per goose's canonical model catalog
-        // (`canonical_models.json`, ids `sarvam/sarvam-105b` and
-        // `sarvam/sarvam-30b`, with `limit.context` 131072 and 65536
-        // respectively) — dynamic_models is deliberately `Some(false)`
-        // so construction serves this static list rather than probing
-        // an unconfirmed `/v1/models` shape on an endpoint this build
-        // has never called.
-        models: vec![
-            goose::providers::base::ModelInfo::new("sarvam-105b", 131_072),
-            goose::providers::base::ModelInfo::new("sarvam-30b", 65_536),
-        ],
+        // ONE model, because the vendor serves one.
+        //
+        // This list previously carried `sarvam-30b` too, taken from goose's
+        // canonical model catalog. On 2026-08-01 `GET
+        // https://api.sarvam.ai/v1/models` (public, no key needed) was
+        // called for the first time and returned exactly one chat model:
+        // `sarvam-105b`. `sarvam-30b` appears in the catalog and in
+        // Sarvam's own documentation, and the live API does not serve it —
+        // so it was selectable here and would have failed at the first
+        // turn, which is the failure this provider's seam existed to
+        // prevent. The catalog is a plausible source, not an authoritative
+        // one.
+        //
+        // The old comment justified the static list by saying this build
+        // "has never called" that endpoint. It has now, and `POST
+        // /api/ai/provider/models` calls it for every vendor at connect
+        // time. This list remains only for the boot path, which has no key
+        // in hand to query with; discovery is the source of truth wherever
+        // a key exists.
+        //
+        // ⚠ Hand-editing the generated `custom_providers/sarvam.json` does
+        // NOTHING — this function rewrites it on every boot. Change it here.
+        models: vec![goose::providers::base::ModelInfo::new(
+            "sarvam-105b",
+            131_072,
+        )],
         headers: None,
         timeout_seconds: None,
         supports_streaming: Some(true),
@@ -299,8 +314,11 @@ fn write_sarvam_custom_provider_definition() -> Result<(), GooseAcpError> {
         env_vars: None,
         dynamic_models: Some(false),
         skip_canonical_filtering: false,
+        // The previous link 404'd (checked 2026-08-01, along with
+        // `docs.sarvam.ai/llms-full.txt`, which is a navigation stub). This
+        // one resolves.
         model_doc_link: Some(
-            "https://docs.sarvam.ai/api-reference-docs/getting-started/models".to_string(),
+            "https://docs.sarvam.ai/api-reference-docs/chat/chat-completions".to_string(),
         ),
         setup_steps: Vec::new(),
         fast_model: None,
