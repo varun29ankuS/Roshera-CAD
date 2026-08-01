@@ -975,10 +975,9 @@ pub async fn verify_subscription_cli_model(
 /// Map a Roshera allowlist provider id to the goose provider name it
 /// should be repinned to, and the API-key env var goose's own credential
 /// resolution reads for it. `None` for anything with no goose repin
-/// target: `"anthropic"` needs none (its `api_key`/`oauth_profile` modes
-/// already work via goose's hardcoded default, unchanged by this
-/// module), and `"baseten"` has no goose provider to repin to at all —
-/// see `ai-integration`'s allowlist entry for why.
+/// target: `"anthropic"` is the only such case — it needs no repin, since
+/// its `api_key`/`oauth_profile` modes already work via goose's hardcoded
+/// default, unchanged by this module.
 /// The third element is a DEFAULT MODEL, and it is `None` unless the
 /// exact identifier has been verified against that vendor's live API.
 ///
@@ -1033,6 +1032,25 @@ fn goose_declarative_provider_for(
         // not serve). It is a default here because it was verified, not
         // because it was plausible.
         "sarvam" => Some(("sarvam", "SARVAM_API_KEY", Some("sarvam-105b"))),
+        // goose implements OpenAI NATIVELY (`crates/goose/src/providers/
+        // openai_def.rs`), reading OPENAI_API_KEY, provider name "openai".
+        // Like xai, it has no declarative JSON — its base URL is a Rust
+        // constant — so `resolve_provider_base_url` cannot resolve a base
+        // URL for it (see `BaseUrlUnresolved`'s doc); that is expected and
+        // already handled by a typed refusal, not a bug to fix here.
+        "openai" => Some(("openai", "OPENAI_API_KEY", None)),
+        // goose BUNDLES a declarative definition for DeepSeek, but its name
+        // is "custom_deepseek", not "deepseek" — a rename mapping like
+        // glm -> zhipu, not an identity mapping like sarvam -> sarvam.
+        // Because it has a JSON definition (unlike openai/xai's native Rust
+        // providers), model discovery DOES work for it. The bundled JSON
+        // lists models (`deepseek-v4-flash`, `deepseek-v4-pro`), but those
+        // are not copied in as a default here: querying the live list
+        // needs a key this module does not hold at this call site, and
+        // `sarvam-30b` — copied from documentation rather than verified
+        // live — is exactly how a phantom model got into this repo's
+        // config before. So DeepSeek's default model stays `None`.
+        "deepseek" => Some(("custom_deepseek", "DEEPSEEK_API_KEY", None)),
         _ => None,
     }
 }
@@ -1155,15 +1173,15 @@ pub struct ResolvedBaseUrl {
 /// Typed refusal naming exactly why no base URL could be resolved for a
 /// Roshera provider id — never a guessed fallback. Two independent ways
 /// to land here: the id has no known goose provider name at all
-/// (`goose_declarative_provider_for` returned `None` — `anthropic`
-/// needs no repin, `openai`/`baseten` are seam-only), or it does, but
-/// neither tier has a JSON definition for that name. `xai` is the
-/// concrete example of the second case: goose registers it as a
-/// hand-written native provider whose base URL is a Rust constant
-/// (`goose::providers::xai::XAI_API_HOST`), never a JSON file either
-/// tier here reads — so it is allowlisted and `Wired` for inference, yet
-/// this function still cannot resolve a base URL for it, and says so by
-/// name instead of inventing one.
+/// (`goose_declarative_provider_for` returned `None` — `anthropic` is the
+/// only such case, it needs no repin), or it does, but neither tier has a
+/// JSON definition for that name. `xai` and `openai` are the concrete
+/// examples of the second case: goose registers each as a hand-written
+/// native provider whose base URL is a Rust constant
+/// (`goose::providers::xai::XAI_API_HOST`, `openai_def.rs`), never a JSON
+/// file either tier here reads — so both are allowlisted and `Wired` for
+/// inference, yet this function still cannot resolve a base URL for
+/// either, and says so by name instead of inventing one.
 #[derive(Debug, Clone)]
 pub struct BaseUrlUnresolved {
     pub roshera_provider_id: String,
@@ -2448,7 +2466,7 @@ mod tests {
     /// removed it.
     #[test]
     fn only_live_verified_vendors_carry_a_default_model() {
-        for id in ["xai", "mistral", "glm", "kimi"] {
+        for id in ["xai", "mistral", "glm", "kimi", "openai", "deepseek"] {
             let (_, _, default_model) = goose_declarative_provider_for(id)
                 .unwrap_or_else(|| panic!("{id} must still map to a goose provider"));
             assert_eq!(
@@ -2499,26 +2517,26 @@ mod tests {
     }
 
     #[test]
-    fn goose_declarative_provider_for_has_no_target_for_anthropic_or_baseten() {
+    fn goose_declarative_provider_for_has_no_target_for_anthropic() {
+        // anthropic needs no repin at all — unlike openai/xai (a repin
+        // target with no JSON-resolvable base URL) or deepseek (a rename
+        // to a differently-named JSON), goose's built-in provider already
+        // reads ANTHROPIC_API_KEY/ANTHROPIC_AUTH_TOKEN with no pin required.
         assert_eq!(
             goose_declarative_provider_for("anthropic"),
             None,
             "anthropic needs no repin — goose's hardcoded default already reads \
              ANTHROPIC_API_KEY/ANTHROPIC_AUTH_TOKEN"
         );
-        assert_eq!(
-            goose_declarative_provider_for("baseten"),
-            None,
-            "baseten has no goose provider to repin to"
-        );
     }
 
     #[test]
     fn repin_goose_to_declarative_provider_refuses_an_unmapped_provider_by_name() {
-        let err = repin_goose_to_declarative_provider("baseten", "fake-key", None)
-            .expect_err("a provider with no goose repin target must be refused");
+        let err =
+            repin_goose_to_declarative_provider("definitely-fictional-vendor", "fake-key", None)
+                .expect_err("a provider with no goose repin target must be refused");
         assert!(
-            err.contains("baseten"),
+            err.contains("definitely-fictional-vendor"),
             "refusal must name the provider it can't repin: {err}"
         );
     }

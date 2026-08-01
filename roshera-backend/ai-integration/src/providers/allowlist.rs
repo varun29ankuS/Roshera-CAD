@@ -185,13 +185,21 @@ pub const PROVIDER_ALLOWLIST: &[AllowlistedProvider] = &[
             ModeEntry {
                 mode: CredentialMode::ApiKey,
                 spawns_local_process: false,
-                wiring: WiringStatus::SeamOnly(
-                    "The key is stored and validated against the live OpenAI API \
-                     (GET /v1/models), but this build has no production OpenAI \
-                     LLMProvider to serve inference with — activation refuses \
-                     typed instead of silently serving through an unvetted path.",
-                ),
-                reason: "Static OpenAI API key over HTTPS Bearer auth.",
+                wiring: WiringStatus::Wired,
+                reason: "Static OpenAI API key over HTTPS Bearer auth \
+                         (OPENAI_API_KEY). Wires the agent (/acp) surface only, \
+                         via goose's own NATIVE OpenAI provider (a hand-written \
+                         Rust implementation, not a declarative JSON definition \
+                         — `crates/goose/src/providers/openai_def.rs`) — see \
+                         xai's entry for the repin mechanism, identical here. \
+                         REST routes (/api/ai/command) still have no native \
+                         Roshera LLMProvider for OpenAI and stay unavailable \
+                         through this key — that gap is unchanged by this repin. \
+                         The key is accepted unverified; an invalid key surfaces \
+                         at first use. Because goose implements this provider \
+                         natively rather than declaratively, model discovery \
+                         cannot resolve a base URL for it — same structural gap \
+                         as xai, refused typed rather than guessed.",
             },
             ModeEntry {
                 mode: CredentialMode::SubscriptionCli,
@@ -303,36 +311,36 @@ pub const PROVIDER_ALLOWLIST: &[AllowlistedProvider] = &[
         }],
     },
     AllowlistedProvider {
-        id: "baseten",
-        display_name: "Baseten",
-        reason: "Baseten-hosted model inference, OpenAI-compatible Chat \
+        id: "deepseek",
+        display_name: "DeepSeek",
+        reason: "DeepSeek's hosted models, OpenAI-compatible Chat \
                  Completions API. Operator/user-configured only.",
         modes: &[ModeEntry {
             mode: CredentialMode::ApiKey,
             spawns_local_process: false,
-            wiring: WiringStatus::SeamOnly(
-                "goose has no bundled Baseten provider (unlike \
-                 xai/mistral/zhipu/moonshot). It does not need one: goose's \
-                 declarative-provider loader reads \
-                 `<GOOSE_PATH_ROOT>/config/custom_providers/*.json` before \
-                 falling back to its bundled set \
-                 (`declarative_providers.rs::load_provider`,  \
-                 `register_declarative_providers`), and \
-                 `GOOSE_PATH_ROOT` is already pinned to Roshera's own \
-                 `state/goose-root` at startup (`goose_acp.rs::initialize`). \
-                 So any OpenAI-compatible vendor — Baseten included — \
-                 becomes reachable by writing a JSON definition into that \
-                 directory, no goose-side code change required. Still \
-                 SeamOnly here because nothing in this build writes that \
-                 file yet, and Baseten's 'model' is a deployment ID bound \
-                 to a specific inference server rather than a fixed vendor \
-                 model name — the JSON's `models[].name` would need to \
-                 carry that deployment ID, which is a Roshera-side design \
-                 decision, not just a missing file.",
-            ),
-            reason: "Static Baseten API key over HTTPS Bearer auth, scoped \
-                     to a model deployment rather than a fixed model-name \
-                     catalog.",
+            wiring: WiringStatus::Wired,
+            reason: "Static DeepSeek API key over HTTPS Bearer auth \
+                     (DEEPSEEK_API_KEY). Wires the agent (/acp) surface only, \
+                     via goose's bundled `custom_deepseek` declarative \
+                     provider — Roshera's own allowlist id for this vendor is \
+                     `deepseek` (the vendor name users type), which \
+                     `repin_goose_to_declarative_provider` maps to goose's \
+                     `custom_deepseek` provider name (a rename like glm's \
+                     mapping to `zhipu`, because goose's own bundled name for \
+                     this vendor isn't the bare vendor string either); see \
+                     xai's entry for the repin mechanism, identical here. \
+                     Because it has a declarative JSON definition (unlike \
+                     openai/xai's native Rust providers), model discovery CAN \
+                     resolve a base URL for it. REST routes (/api/ai/command) \
+                     have no native Roshera LLMProvider for DeepSeek and stay \
+                     unavailable through this key. The key is accepted \
+                     unverified; an invalid key surfaces at first use. Its \
+                     default model is `None` here: the bundled JSON lists \
+                     `deepseek-v4-flash`/`deepseek-v4-pro`, but querying that \
+                     list live requires a key this build does not hold, and a \
+                     model copied from documentation rather than verified \
+                     live is exactly how `sarvam-30b` — a model that vendor \
+                     does not serve — ended up in this repo's config before.",
         }],
     },
     AllowlistedProvider {
@@ -622,6 +630,14 @@ mod tests {
         // `ProviderRegistry` as the bundled vendors above, so it is
         // equally resolvable, not a different tier of "wired".
         ("sarvam", CredentialMode::ApiKey),
+        // openai resolves through goose's own NATIVE OpenAI provider (Rust,
+        // not a JSON definition) — same repin mechanism, no discovery base
+        // URL (see openai's entry above and BaseUrlUnresolved's doc).
+        ("openai", CredentialMode::ApiKey),
+        // deepseek resolves through goose's bundled `custom_deepseek`
+        // declarative JSON, reached via a rename mapping (deepseek ->
+        // custom_deepseek), same tier as xai/mistral/glm/kimi.
+        ("deepseek", CredentialMode::ApiKey),
     ];
 
     #[test]
@@ -639,34 +655,6 @@ mod tests {
                      a documented resolvable inference path, never an entry \
                      marked wired because it 'should' work",
                     provider.id, mode.mode, mode.wiring, is_known_resolvable
-                );
-            }
-        }
-    }
-
-    /// `baseten` remains `SeamOnly`: its "model" is a deployment ID goose
-    /// has no bundled provider shape for (see its entry's reason text for
-    /// detail — a real, evidenced gap, not a "should work eventually"
-    /// placeholder). `sarvam` moved to `Wired` 2026-08-01 (see
-    /// `sarvam_api_key_is_wired` below) once its custom-provider JSON was
-    /// written and verified against the live API.
-    #[test]
-    fn baseten_is_seam_only() {
-        for id in ["baseten"] {
-            let provider =
-                resolve(id).unwrap_or_else(|e| panic!("'{id}' must be allowlisted: {e}"));
-            for mode in provider.modes {
-                assert!(
-                    matches!(mode.wiring, WiringStatus::SeamOnly(_)),
-                    "'{id}'/{:?} must be SeamOnly in this build, got {:?}",
-                    mode.mode,
-                    mode.wiring
-                );
-                assert!(
-                    !mode.spawns_local_process,
-                    "'{id}'/{:?} is an API-key vendor and must not spawn a \
-                     local process",
-                    mode.mode
                 );
             }
         }
