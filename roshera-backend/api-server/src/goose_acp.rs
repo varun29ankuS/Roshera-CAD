@@ -231,7 +231,25 @@ fn resolve_mcp_entry_path() -> Result<PathBuf, GooseAcpError> {
 /// xai/mistral/zhipu/moonshot (`declarative/definitions/`), only this
 /// separate model/endpoint catalog, so the value is otherwise unreachable
 /// without writing it ourselves.
-const SARVAM_BASE_URL: &str = "https://api.sarvam.ai/v1";
+/// ★ This is the FULL completions endpoint, not the API root, because that
+/// is what goose treats `base_url` as. Its own declarative fixtures use
+/// values like `https://example.invalid/v1/chat/completions`, and it POSTs
+/// to this value directly rather than appending a path.
+///
+/// Measured 2026-08-01, which is how this was found:
+///   POST https://api.sarvam.ai/v1                   -> 404 Not Found
+///   POST https://api.sarvam.ai/v1/chat/completions  -> 403 (endpoint real,
+///                                                      key rejected)
+/// With the root here, every turn 404'd, and goose's retry layer reported
+/// that as `NetworkError("Could not connect to api.sarvam.ai — check your
+/// network connection")`. The host was reachable throughout; a wrong path
+/// was being reported as a dead network, which sent the diagnosis to the
+/// wrong layer entirely.
+///
+/// `POST /api/ai/provider/models` still works against this value: it strips
+/// a trailing `/chat/completions` before appending `/models`, mirroring
+/// goose's own `map_base_path`.
+const SARVAM_BASE_URL: &str = "https://api.sarvam.ai/v1/chat/completions";
 const SARVAM_API_KEY_ENV: &str = "SARVAM_API_KEY";
 
 /// Register Sarvam AI as a goose declarative provider by writing a
