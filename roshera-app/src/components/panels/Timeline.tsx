@@ -823,11 +823,12 @@ export function Timeline() {
   const previewMode = isPreviewMode()
   const [events, setEvents] = useState<EventSummary[]>(previewMode ? MOCK_EVENTS : [])
   const [branches, setBranches] = useState<BranchView[]>(previewMode ? MOCK_BRANCHES : [])
-  // Named design states — the decision layer. Usually EMPTY at runtime
-  // (checkpoints are volatile; they do not survive a restart), and that
-  // emptiness renders as an explicit "no declared intents" line, never
-  // a skeleton. Preview mode seeds both so the rare states (populated
-  // rail, quarantined boot) are stylable without faking them live.
+  // Named design states — the decision layer. Durable: the backend
+  // persists checkpoints and restores them at boot (durability.rs), so
+  // an empty rail means nobody has declared an intent yet — rendered as
+  // an explicit "no declared intents" line, never a skeleton. Preview
+  // mode seeds both so the rarer states (populated rail, quarantined
+  // boot) are stylable without faking them live.
   const [checkpoints, setCheckpoints] = useState<CheckpointSummary[]>(
     previewMode ? MOCK_CHECKPOINTS : [],
   )

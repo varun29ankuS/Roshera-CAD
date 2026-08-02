@@ -123,16 +123,14 @@ function errorTextOf(result: any): string {
 export function registerCadProgram(host: ToolHost, table: ToolTable): void {
   host.tool(
     "cad_program",
-    "Run a sequence of tool ops (max 50) as ONE certified program against the " +
-      "SAME handlers individual calls use. All ops are validated up front — one " +
-      "bad op refuses the whole program with a per-op validation report and runs " +
-      "NOTHING. Otherwise ops run sequentially and STOP on the first failure, " +
-      "returning a LEDGER: {completed, total, ops:[{index, tool, ok, certificate|" +
-      "error}]} — the certificate is the soundness verdict each op already emits. " +
-      "No rollback and no atomicity pretence: the backend state matches the ledger " +
-      "exactly (the completed prefix is applied; undo/truncate is your explicit " +
-      "next call). Ops may not be meta-tools (find_tool/describe_tool/invoke/" +
-      "workbench/cad_program) and may not be clear_parts/delete_part unless " +
+    "Run up to 50 tool ops as ONE certified program through the SAME handlers " +
+      "individual calls use. ALL ops are schema-validated up front — any bad op " +
+      "refuses the WHOLE program (per-op report, nothing runs). Execution is " +
+      "sequential and STOPS at the first failure, returning a LEDGER {completed, " +
+      "total, ops:[{index, tool, ok, certificate|error}]} — the certificate is " +
+      "each op's own soundness verdict. NO rollback: backend state = the " +
+      "completed prefix exactly; undo is your explicit next call. Ops may not be " +
+      "meta/composition tools, nor clear_parts/delete_part unless " +
       "allow_destructive is set.",
     {
       name: z

@@ -121,12 +121,11 @@ const SCOPE_ARGS = {
 export function registerBlackboardTools(server: ToolHost) {
   server.tool(
     "blackboard_add_entry",
-    "Your notebook TO the human: show your working as you design — the given " +
-      "values, the derivation, the result, the design rationale behind a part " +
-      "(markdown + $math$; the human sees each line live and can edit it). " +
-      "Write it UNPROMPTED whenever a dimension, tolerance, or shape came from " +
-      "a calculation or a decision worth defending — an engineer's notebook, " +
-      "not a chat log. Per-part (part_id), document-wide (omit), or assembly " +
+    "Your notebook TO the human: show your working — given values, derivation, " +
+      "result, design rationale (markdown + $math$; the human sees each line " +
+      "live and can edit it). Write it UNPROMPTED whenever a dimension, " +
+      "tolerance, or shape came from a calculation or a decision worth " +
+      "defending. Per-part (part_id), document-wide (omit), or assembly " +
       "(scope). Returns the line id.",
     {
       text: z.string().describe("markdown + $math$ source for the line"),

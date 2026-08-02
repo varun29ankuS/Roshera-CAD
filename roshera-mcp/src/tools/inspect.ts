@@ -7,7 +7,9 @@ import { api, ok, fail, BASE, ApiError, setDocumentUnitCache, AUTH_HEADERS } fro
 export function registerInspectTools(server: ToolHost) {
   server.tool(
     "list_parts",
-    "List every part in the live model (id, name, kind).",
+    "List every live part: integer part_id (what part_id args take), name, kind. " +
+      "boolean/transform/shell take an object_uuid instead — the one returned by " +
+      "the call that made the solid.",
     {},
     async () => {
       try {
@@ -20,8 +22,8 @@ export function registerInspectTools(server: ToolHost) {
 
   server.tool(
     "get_part",
-    "Full report for one part: world placement (center, dimensions, anchor " +
-      "datum), topology fingerprint, name.",
+    "Full report for one part: world placement in mm (center, dimensions, " +
+      "anchor datum), topology fingerprint, name.",
     { part_id: z.number().int().describe("part id (list_parts)") },
     async ({ part_id }) => {
       try {

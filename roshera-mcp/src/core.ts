@@ -320,14 +320,20 @@ function errorHint(msg: string): string | null {
     return "the result would self-intersect — reduce the radius/distance, or apply the blend to fewer edges.";
   if (m.includes("not found in any face") || m.includes("3-valent corner"))
     return "an edge could not be blended at a degenerate corner — try a smaller radius or a subset of edges; if it persists the part topology needs healing.";
+  if (m.includes("disjoint"))
+    return "the two solids do not touch, so the boolean would change nothing — check both placements with get_part (world center + dimensions, mm) and move one with transform before retrying.";
+  if (m.includes("stale") || m.includes("has been mutated"))
+    return "the part changed since its last full verification — run verify_part({part_id}) to re-certify, then retry this call.";
   if (
     m.includes("unsound") ||
     m.includes("non-manifold") ||
     m.includes("not certified")
   )
     return "the kernel produced an unsound result and refused it (the moat held) — inspect with verify_part / ground_truth; do NOT assume the geometry is valid.";
+  if (m.includes("401") || m.includes("unauthorized"))
+    return "the backend refused the credential — set ROSHERA_API_KEY to a valid key and reconnect the MCP (the key is read once at process start).";
   if (m.includes("no live solid") || m.includes("not found"))
-    return "the part_id may be stale or consumed (booleans consume their operands) — call list_parts for the current ids.";
+    return "that id no longer names a live solid: every mutating op (boolean, shell, blend) MINTS a NEW id and CONSUMES its inputs, and its result carries the current object_uuid + part_id. Chain off your most recent op result, or call list_parts for the current integer ids.";
   return null;
 }
 
@@ -371,7 +377,10 @@ export async function uuidForPart(partId: number): Promise<string> {
     }
   }
   throw new Error(
-    `no live solid found for part_id ${partId} (run list_parts to see current ids)`,
+    `no live solid has part_id ${partId} — mutating ops (boolean, shell, blend) ` +
+      `mint a NEW id and consume their inputs, so an id from before such an op ` +
+      `is dead. Use the ids from the op's own result, or list_parts for the ` +
+      `current set.`,
   );
 }
 

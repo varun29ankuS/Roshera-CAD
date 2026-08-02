@@ -1886,6 +1886,124 @@ pub async fn add_polyline(
 
 // ── Phase-A csketch → solid bridge (SKETCH-DCM campaign) ────────────
 
+/// Acceptance tolerance for a wire-supplied custom plane frame.
+///
+/// The wire `SketchPlane::Custom` deserialises straight from agent /
+/// frontend JSON, so nothing upstream guarantees the frame is
+/// orthonormal — and every consumer (`lift`, `normal`) ASSUMES it is.
+/// A skewed or scaled frame would not error anywhere downstream: it
+/// would silently shear and scale the lifted profile, which is exactly
+/// the "plausible approximation" the kernel refuses to produce.
+/// 1e-6 matches the kernel `SketchPlane::new` orthogonality gate.
+const PLANE_FRAME_TOLERANCE: f64 = 1e-6;
+
+/// Refuse a wire `SketchPlane` whose custom frame is not a finite
+/// orthonormal basis. Standard planes (`"xy"`/`"xz"`/`"yz"`) are
+/// orthonormal by construction and always pass.
+///
+/// The refusal names the defective axis and the measured value, and
+/// says what resolves it — never a silent re-normalisation, which
+/// would guess which of the caller's two axes was the intended one.
+fn validate_wire_plane(plane: &crate::sketch::SketchPlane) -> Result<(), ApiError> {
+    let crate::sketch::SketchPlane::Custom(frame) = plane else {
+        return Ok(());
+    };
+    let finite = frame
+        .origin
+        .iter()
+        .chain(frame.u_axis.iter())
+        .chain(frame.v_axis.iter())
+        .all(|c| c.is_finite());
+    if !finite {
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            "custom plane components must all be finite",
+        )
+        .with_details(serde_json::json!({
+            "kind": "plane_frame_not_finite",
+            "origin": frame.origin,
+            "u_axis": frame.u_axis,
+            "v_axis": frame.v_axis,
+        })));
+    }
+    let [ux, uy, uz] = frame.u_axis;
+    let [vx, vy, vz] = frame.v_axis;
+    let u_len = (ux * ux + uy * uy + uz * uz).sqrt();
+    let v_len = (vx * vx + vy * vy + vz * vz).sqrt();
+    for (axis, len) in [("u_axis", u_len), ("v_axis", v_len)] {
+        if (len - 1.0).abs() > PLANE_FRAME_TOLERANCE {
+            return Err(ApiError::new(
+                ErrorCode::InvalidParameter,
+                format!(
+                    "custom plane {axis} must be unit length (|{axis}| = {len}); \
+                     normalise it, or derive the frame with POST /api/sketch/plane-from-face"
+                ),
+            )
+            .with_details(serde_json::json!({
+                "kind": "plane_axis_not_unit",
+                "axis": axis,
+                "magnitude": len,
+                "tolerance": PLANE_FRAME_TOLERANCE,
+            })));
+        }
+    }
+    let dot = ux * vx + uy * vy + uz * vz;
+    if dot.abs() > PLANE_FRAME_TOLERANCE {
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            format!(
+                "custom plane axes must be orthogonal (u_axis · v_axis = {dot}); \
+                 a skewed frame would silently shear the profile — supply \
+                 perpendicular axes, or derive the frame with \
+                 POST /api/sketch/plane-from-face"
+            ),
+        )
+        .with_details(serde_json::json!({
+            "kind": "plane_axes_not_orthogonal",
+            "dot": dot,
+            "tolerance": PLANE_FRAME_TOLERANCE,
+        })));
+    }
+    Ok(())
+}
+
+/// Refuse an extrusion direction that cannot sweep the profile out of
+/// its own plane: zero-magnitude, or lying (numerically) IN the sketch
+/// plane. An in-plane sweep has zero thickness — the kernel would
+/// build degenerate topology from it, so the request is refused typed
+/// instead of producing a broken solid.
+fn validate_extrude_direction(
+    direction: &geometry_engine::math::Vector3,
+    plane_normal: &geometry_engine::math::Vector3,
+) -> Result<(), ApiError> {
+    let mag = direction.magnitude();
+    if mag < 1e-9 {
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            format!("direction must be non-zero (|direction| = {mag})"),
+        )
+        .with_details(serde_json::json!({
+            "kind": "direction_zero",
+            "magnitude": mag,
+        })));
+    }
+    // Validated planes have a unit normal (cross of an orthonormal
+    // pair); dividing by both magnitudes keeps this exact even so.
+    let cosine = direction.dot(plane_normal).abs() / (mag * plane_normal.magnitude());
+    if cosine < 1e-9 {
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            "direction lies in the sketch plane — an in-plane sweep has zero \
+             thickness; give the direction a component along the plane normal",
+        )
+        .with_details(serde_json::json!({
+            "kind": "direction_in_plane",
+            "cosine_with_normal": cosine,
+        })));
+    }
+    Ok(())
+}
+
 /// Request body for `POST /api/csketch/{id}/extrude`.
 ///
 /// `plane` accepts the same wire shape as the click-draft sketch's
@@ -1951,6 +2069,7 @@ pub async fn extrude_csketch(
         ));
     }
     let plane = req.plane.unwrap_or(crate::sketch::SketchPlane::XY);
+    validate_wire_plane(&plane)?;
     let direction = match req.direction {
         Some([x, y, z]) => {
             let v = geometry_engine::math::Vector3::new(x, y, z);
@@ -1964,6 +2083,7 @@ pub async fn extrude_csketch(
         }
         None => plane.normal(),
     };
+    validate_extrude_direction(&direction, &plane.normal())?;
 
     let sketch = require_sketch(&state, id)?;
     let tol2d = Tolerance2d::default();
@@ -2495,6 +2615,7 @@ pub async fn revolve_csketch(
         ));
     }
     let plane = req.plane.unwrap_or(crate::sketch::SketchPlane::XY);
+    validate_wire_plane(&plane)?;
 
     let sketch = require_sketch(&state, id)?;
     let tol2d = Tolerance2d::default();
@@ -2826,6 +2947,103 @@ mod tests {
 
     fn manager() -> CSketchManager {
         CSketchManager::new()
+    }
+
+    // ── Wire-plane / direction validation (arbitrary-plane bridge) ──
+    //
+    // RED-first: before `validate_wire_plane` existed, every one of the
+    // refusal tests below failed — a skewed or scaled custom frame
+    // deserialised fine and flowed straight into `lift()`, silently
+    // shearing the extruded solid. These pin the typed refusals.
+
+    fn custom_plane(
+        origin: [f64; 3],
+        u_axis: [f64; 3],
+        v_axis: [f64; 3],
+    ) -> crate::sketch::SketchPlane {
+        crate::sketch::SketchPlane::Custom(crate::sketch::CustomPlane {
+            origin,
+            u_axis,
+            v_axis,
+        })
+    }
+
+    fn detail_kind(err: &ApiError) -> String {
+        err.details
+            .as_ref()
+            .and_then(|d| d.get("kind"))
+            .and_then(|k| k.as_str())
+            .map(str::to_string)
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn standard_planes_pass_wire_validation() {
+        for plane in [
+            crate::sketch::SketchPlane::XY,
+            crate::sketch::SketchPlane::XZ,
+            crate::sketch::SketchPlane::YZ,
+        ] {
+            assert!(validate_wire_plane(&plane).is_ok());
+        }
+    }
+
+    #[test]
+    fn orthonormal_custom_plane_passes_wire_validation() {
+        // 45-degree tilt about X: u = world X, v in the YZ diagonal.
+        let s = std::f64::consts::FRAC_1_SQRT_2;
+        let plane = custom_plane([10.0, -3.0, 4.0], [1.0, 0.0, 0.0], [0.0, s, s]);
+        assert!(validate_wire_plane(&plane).is_ok());
+    }
+
+    #[test]
+    fn custom_plane_with_non_unit_axis_is_refused() {
+        let plane = custom_plane([0.0; 3], [2.0, 0.0, 0.0], [0.0, 1.0, 0.0]);
+        let err = validate_wire_plane(&plane).expect_err("scaled u_axis must refuse");
+        assert_eq!(detail_kind(&err), "plane_axis_not_unit");
+        let details = err.details.as_ref().expect("refusal carries details");
+        assert_eq!(details["axis"], "u_axis");
+        assert!((details["magnitude"].as_f64().unwrap_or(0.0) - 2.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn custom_plane_with_skewed_axes_is_refused() {
+        // Unit axes, 60 degrees apart — a shear frame, not a rotation.
+        let plane = custom_plane([0.0; 3], [1.0, 0.0, 0.0], [0.5, 3.0_f64.sqrt() / 2.0, 0.0]);
+        let err = validate_wire_plane(&plane).expect_err("skewed frame must refuse");
+        assert_eq!(detail_kind(&err), "plane_axes_not_orthogonal");
+    }
+
+    #[test]
+    fn custom_plane_with_non_finite_component_is_refused() {
+        let plane = custom_plane([0.0, f64::NAN, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]);
+        let err = validate_wire_plane(&plane).expect_err("NaN origin must refuse");
+        assert_eq!(detail_kind(&err), "plane_frame_not_finite");
+    }
+
+    #[test]
+    fn in_plane_extrude_direction_is_refused() {
+        let normal = geometry_engine::math::Vector3::new(0.0, 0.0, 1.0);
+        let in_plane = geometry_engine::math::Vector3::new(1.0, 1.0, 0.0);
+        let err =
+            validate_extrude_direction(&in_plane, &normal).expect_err("in-plane sweep must refuse");
+        assert_eq!(detail_kind(&err), "direction_in_plane");
+    }
+
+    #[test]
+    fn zero_extrude_direction_is_refused() {
+        let normal = geometry_engine::math::Vector3::new(0.0, 0.0, 1.0);
+        let zero = geometry_engine::math::Vector3::new(0.0, 0.0, 0.0);
+        let err =
+            validate_extrude_direction(&zero, &normal).expect_err("zero direction must refuse");
+        assert_eq!(detail_kind(&err), "direction_zero");
+    }
+
+    #[test]
+    fn oblique_extrude_direction_passes() {
+        let normal = geometry_engine::math::Vector3::new(0.0, 0.0, 1.0);
+        let oblique = geometry_engine::math::Vector3::new(1.0, 0.0, 0.25);
+        assert!(validate_extrude_direction(&oblique, &normal).is_ok());
     }
 
     #[test]

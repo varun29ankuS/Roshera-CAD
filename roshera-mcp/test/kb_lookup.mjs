@@ -94,16 +94,21 @@ console.log("(s) SURFACE: kb_lookup in the FULL table only; minimal bill unmoved
   // same class of issue scale_s2.mjs's own comment documents for the
   // blackboard commit. Not this task's regression; re-pinned so this test
   // still catches a REAL future move.
-  // Pin moved 5139 → 5142 (2026-08-01 dispatch-gate work): +3 tokens net on
-  // the resident surface — boolean gained the acknowledge_unsound repair-flow
-  // field (unsound-base gate) and timeline_checkpoint's description now
-  // states the intent-gate contract; both deliberate, both trimmed to near
-  // token-neutral. kb_lookup itself still costs the minimal surface zero.
+  // Pin moved 5142 → 4900 (2026-08-02 surface-diet pass): −242 tokens net,
+  // bringing the resident surface back under scale_s2's 5000 ceiling. Cuts:
+  // the FUNNEL_HINT boilerplate dropped from all three meta-tools (each
+  // description already states the funnel), workbench/cad_program/verify_part/
+  // blackboard_add_entry descriptions tightened, revolve's redundant field
+  // text trimmed, render/scene mode describes de-duplicated. Adds (deliberate,
+  // first-call correctness): boolean now states id provenance + the new-id-
+  // minting contract, create_* name the object_uuid handle, list_parts names
+  // the two id spaces, find_tool's bench enum gained the missing 'timeline'.
+  // kb_lookup itself still costs the minimal surface zero.
   const minimalBill = billFor(table, MINIMAL_SURFACE);
-  if (minimalBill === 5142)
-    pass(`minimal bill ${minimalBill} == pin 5142 (kb_lookup's zero marginal cost holds)`);
+  if (minimalBill === 4900)
+    pass(`minimal bill ${minimalBill} == pin 4900 (kb_lookup's zero marginal cost holds)`);
   else
-    fail(`minimal bill ${minimalBill} != 5142 — something moved the resident surface`);
+    fail(`minimal bill ${minimalBill} != 4900 — something moved the resident surface`);
 }
 
 // ── (p) PROVENANCE ──────────────────────────────────────────────────────────

@@ -200,15 +200,19 @@ export function registerModifyTools(server: ToolHost) {
 
   server.tool(
     "boolean",
-    "Combine two solids by OBJECT UUID. Both operands are CONSUMED; a new solid " +
-      "is born. ALWAYS verify_part after differences (bores/slots can leave open " +
-      "faces). For many tools against one base, use boolean_many.",
+    "Combine two solids. Operands are object_uuid values returned by the calls " +
+      "that made them (create_*/revolve/boolean — NOT integer part_ids). Both " +
+      "inputs are CONSUMED: the result is a NEW solid with a NEW object_uuid + " +
+      "part_id (in this call's result) and the input uuids are dead afterwards " +
+      "— chain later ops off the RESULT's ids. ALWAYS verify_part after " +
+      "differences (bores/slots can leave open faces). For many tools against " +
+      "one base, use boolean_many.",
     {
       op: z
         .enum(["union", "difference", "intersection"])
         .describe("difference cuts object_b out of object_a"),
-      object_a: z.string().uuid().describe("object_uuid of the base solid"),
-      object_b: z.string().uuid().describe("object_uuid of the tool solid"),
+      object_a: z.string().uuid().describe("base solid's object_uuid"),
+      object_b: z.string().uuid().describe("tool solid's object_uuid"),
       acknowledge_unsound: ACK_UNSOUND,
     },
     async ({ op, object_a, object_b }) => {

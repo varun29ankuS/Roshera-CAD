@@ -26,6 +26,7 @@
  */
 
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
 import { dirname, join } from "node:path";
@@ -191,6 +192,60 @@ check("ask_choice is registered (full surface), not minimal-resident", () => {
   assert.ok(
     !exposedNamesFor(table, "minimal").includes("ask_choice"),
     "not in the minimal surface (discovery rides find_tool)",
+  );
+});
+
+// ─── Card-kind parity: one fact, three statements ──────────────────────────
+//
+// The renderable card kinds are stated in three places written by different
+// hands: the frontend's CARD_KINDS (the CONSTRAINT — anything else renders
+// as raw text), the `.goosehints` "Kinds:" paragraph (steering — what the
+// agent is told it may emit), and this package's buildChoicesFence (the one
+// MCP-side emitter, hard-coding `roshera:choices`). They agree today; these
+// checks fail the moment any copy drifts, instead of the drift surfacing as
+// an agent card silently rendering as raw text.
+
+const appCardsSrc = readFileSync(
+  join(HERE, "..", "..", "roshera-app", "src", "lib", "blackboard-cards.ts"),
+  "utf8",
+);
+const goosehints = readFileSync(join(HERE, "..", "..", ".goosehints"), "utf8");
+
+function frontendCardTruth() {
+  const prefixMatch = /const CARD_FENCE_PREFIX\s*=\s*'([^']+)'/.exec(appCardsSrc);
+  const kindsMatch = /const CARD_KINDS[^=]*=\s*\[([^\]]*)\]/.exec(appCardsSrc);
+  assert.ok(prefixMatch, "CARD_FENCE_PREFIX not found in blackboard-cards.ts");
+  assert.ok(kindsMatch, "CARD_KINDS not found in blackboard-cards.ts");
+  const kinds = [...kindsMatch[1].matchAll(/'([a-z_]+)'/g)].map((m) => m[1]);
+  assert.ok(kinds.length > 0, "CARD_KINDS parsed empty");
+  return { prefix: prefixMatch[1], kinds };
+}
+
+check("buildChoicesFence emits the exact kind the frontend renders", () => {
+  const { prefix, kinds } = frontendCardTruth();
+  assert.ok(
+    kinds.includes("choices"),
+    `frontend CARD_KINDS ${JSON.stringify(kinds)} no longer includes 'choices' — ` +
+      "ask_choice's fence would render as raw text",
+  );
+  const fence = buildChoicesFence("Which?", [{ value: "a" }, { value: "b" }]);
+  assert.equal(
+    fence.split("\n")[0],
+    "```" + prefix + "choices",
+    "fence opener must be exactly the frontend's prefix + kind",
+  );
+});
+
+check(".goosehints 'Kinds:' paragraph names exactly the frontend's kinds", () => {
+  const { kinds } = frontendCardTruth();
+  const para = /Kinds:([\s\S]*?)\r?\n\r?\n/.exec(goosehints);
+  assert.ok(para, "'Kinds:' paragraph not found in .goosehints");
+  const stated = [...new Set([...para[1].matchAll(/`([a-z_]+)`/g)].map((m) => m[1]))];
+  assert.deepEqual(
+    stated.sort(),
+    [...kinds].sort(),
+    ".goosehints tells the agent a different kind set than the frontend renders — " +
+      "update the 'Kinds:' paragraph and CARD_KINDS together",
   );
 });
 

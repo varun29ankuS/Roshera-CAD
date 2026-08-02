@@ -1141,11 +1141,13 @@ pub fn repin_goose_to_declarative_provider(
 // existing split between this file and the handler for every other
 // entry point here.
 //
-// NOTE: `state/goose-root/config/custom_providers/sarvam.json` still
-// lists `sarvam-30b` in its own `models` array on disk as of this
-// writing — the exact drift this endpoint exists to catch. That static
-// list is NEVER read by the functions below; only `base_url` is. Live
-// discovery supersedes it rather than reconciling it.
+// NOTE: `state/goose-root/config/custom_providers/sarvam.json` carried
+// `sarvam-30b` in its `models` array until 2026-08-01 — the exact drift
+// this endpoint exists to catch; the entry has since been removed and
+// the JSON now lists only the live-verified `sarvam-105b`. Either way
+// that static list is NEVER read by the functions below; only
+// `base_url` is. Live discovery supersedes it rather than reconciling
+// it.
 
 /// Which of the two resolution tiers answered. Surfaced to the caller so
 /// a discovery response can say where its base URL came from, not just
@@ -2528,6 +2530,44 @@ mod tests {
             "anthropic needs no repin — goose's hardcoded default already reads \
              ANTHROPIC_API_KEY/ANTHROPIC_AUTH_TOKEN"
         );
+    }
+
+    /// One fact, stated in two crates: `ai-integration`'s allowlist marks
+    /// which `(provider, api_key)` paths are `Wired` — a claim the settings
+    /// UI presents to the user as a working path — and THIS module's
+    /// `goose_declarative_provider_for` is the mechanism that actually
+    /// serves every such path except anthropic's (which goose's built-in
+    /// default serves with no repin). The two were written by different
+    /// hands and cannot share a constant across the crate boundary, so
+    /// this test pins their agreement: an allowlist api_key entry marked
+    /// `Wired` without a repin target here would be a documented lie (the
+    /// UI offers a path that cannot serve a turn), and a `SeamOnly` entry
+    /// WITH a repin target would be a working path presented as absent.
+    /// Both directions fail this assert.
+    #[test]
+    fn allowlist_wired_api_key_paths_match_goose_repin_targets() {
+        use ai_integration::providers::allowlist::{
+            CredentialMode, WiringStatus, PROVIDER_ALLOWLIST,
+        };
+        for provider in PROVIDER_ALLOWLIST {
+            for mode in provider.modes {
+                if mode.mode != CredentialMode::ApiKey {
+                    continue;
+                }
+                let wired = matches!(mode.wiring, WiringStatus::Wired);
+                let servable = provider.id == "anthropic"
+                    || goose_declarative_provider_for(provider.id).is_some();
+                assert_eq!(
+                    wired, servable,
+                    "'{}'/api_key: allowlist says wired={wired} but the goose repin \
+                     map says servable={servable} — the two crates disagree about \
+                     the same fact. Update them together: the allowlist entry's \
+                     WiringStatus (ai-integration/src/providers/allowlist.rs) and \
+                     goose_declarative_provider_for (this file)",
+                    provider.id
+                );
+            }
+        }
     }
 
     #[test]

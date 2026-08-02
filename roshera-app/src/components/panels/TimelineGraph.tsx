@@ -97,8 +97,8 @@ interface EventGroup {
   events: EventSummary[]
   /** The DECLARED intent covering this run — a checkpoint name, read
    *  off the real checkpoint list, never inferred. `undefined` when no
-   *  checkpoint covers the run (the common case today: checkpoints are
-   *  volatile and usually absent). Attached only on root-branch runs —
+   *  checkpoint covers the run (UI/direct-API operations and pre-gate
+   *  history carry no declared intent). Attached only on root-branch runs —
    *  checkpoint `event_range`s index the main timeline's sequences, so
    *  applying them to a child branch's post-fork sequences would
    *  mislabel spans that merely share numbers. */
@@ -656,7 +656,8 @@ export default function TimelineGraph({
   branches: GraphBranch[]
   activeBranchId: string
   liveNames: Map<string, string>
-  /** Named design states (real checkpoints; usually empty — volatile). */
+  /** Named design states (real, durable checkpoints; empty until an
+   *  intent is declared). */
   checkpoints: CheckpointSummary[]
   /** Durability boot outcome — quarantine is disclosed in the header. */
   durability: DurabilityStatus | null

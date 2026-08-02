@@ -2300,35 +2300,43 @@ pub async fn bind_parameter_name(
 // `roshera-app/src/lib/timeline-events.ts`) both refuse named-nothing
 // checkpoints — but `POST /api/timeline/checkpoint` is the route both
 // of them ultimately call, and any client that speaks HTTP directly
-// bypasses both. The floor has to live here. Keep the three copies in
-// sync BY HAND — they live in three different packages.
+// bypasses both. The floor has to live here. The three copies live in
+// three different packages (Rust, MCP TypeScript, app TypeScript), so
+// they cannot share one constant — instead
+// `checkpoint_name_gate_tests::regex_copies_agree_across_the_three_packages`
+// embeds both TypeScript sources at compile time and FAILS if any copy's
+// pattern text drifts from the consts below. Edit one, and `cargo test
+// -p api-server` tells you to edit all three.
 
 /// A generic word, an ordinal, or both — "step 3", "op-2",
 /// "checkpoint", "7". A sequence position, not an intent.
-#[allow(clippy::expect_used)]
-// Reason: the pattern is a compile-time literal exercised by the
-// `checkpoint_name_gate_tests` module below — a non-compiling pattern
-// fails the test suite, never a production request.
-static GENERIC_CHECKPOINT_NAME: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(
-    || {
-        regex::Regex::new(
-            r"(?i)^(?:(?:step|op|operation|cut|feature|part|checkpoint|chkpt|cp|test|wip|tmp|temp|misc)[\s\-_#:.]*)?\d*$",
-        )
-        .expect("static checkpoint-name regex must compile")
-    },
-);
+/// Pattern text (after the `(?i)`) is byte-identical to the two
+/// TypeScript copies — enforced by the parity test named above.
+const GENERIC_CHECKPOINT_NAME_PATTERN: &str = r"(?i)^(?:(?:step|op|operation|cut|feature|part|checkpoint|chkpt|cp|test|wip|tmp|temp|misc)[\s\-_#:.]*)?\d*$";
 
 /// A clock or date reading dressed as a name — "Checkpoint 9:59:36 PM",
 /// "10:05", "2026-08-01". Slips the generic regex (its tail accepts
 /// only a plain ordinal) while carrying even less: every timeline row
 /// already shows its own timestamp. This is exactly the shape the UI
 /// button used to mint from the system clock.
+/// Pattern text is byte-identical to the two TypeScript copies —
+/// enforced by the parity test named above.
+const CLOCK_CHECKPOINT_NAME_PATTERN: &str = r"(?i)^(?:(?:step|op|operation|checkpoint|chkpt|cp)[\s\-_#:.]*)?\d{1,4}([:\-/.]\d{1,2}){1,2}(\s*(am|pm))?$";
+
+#[allow(clippy::expect_used)]
+// Reason: the pattern is a compile-time literal exercised by the
+// `checkpoint_name_gate_tests` module below — a non-compiling pattern
+// fails the test suite, never a production request.
+static GENERIC_CHECKPOINT_NAME: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| {
+        regex::Regex::new(GENERIC_CHECKPOINT_NAME_PATTERN)
+            .expect("static checkpoint-name regex must compile")
+    });
+
 #[allow(clippy::expect_used)]
 // Reason: compile-time literal, exercised by the tests below.
 static CLOCK_CHECKPOINT_NAME: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-    regex::Regex::new(
-            r"(?i)^(?:(?:step|op|operation|checkpoint|chkpt|cp)[\s\-_#:.]*)?\d{1,4}([:\-/.]\d{1,2}){1,2}(\s*(am|pm))?$",
-        )
+    regex::Regex::new(CLOCK_CHECKPOINT_NAME_PATTERN)
         .expect("static checkpoint-name regex must compile")
 });
 
@@ -3492,6 +3500,73 @@ mod checkpoint_name_gate_tests {
                 checkpoint_name_refusal(good).is_none(),
                 "'{good}' is a real intent phrase, must pass"
             );
+        }
+    }
+
+    /// The checkpoint-name rule exists in THREE packages — here, the MCP
+    /// gate (`roshera-mcp/src/gates.ts`) and the frontend picker
+    /// (`roshera-app/src/lib/timeline-events.ts`) — because Rust and two
+    /// separately-built TypeScript bundles cannot share one constant. A
+    /// hand-synced copy with no test is a future bug, so this test embeds
+    /// both TypeScript sources at compile time, extracts their regex
+    /// literals, and fails if any copy's pattern text differs from the
+    /// Rust consts. Verified equivalent behaviourally on a 38-name corpus
+    /// across all three engines on 2026-08-02 (0 disagreements).
+    ///
+    /// Known, accepted engine-semantics gap the textual check cannot see:
+    /// Rust's `\d`/`\s` are Unicode-aware while JavaScript's are ASCII, so
+    /// this floor refuses slightly MORE than the TS layers (e.g. a name
+    /// that is a bare Arabic-Indic numeral). The floor being the strictest
+    /// layer is the safe direction; the reverse would be a hole.
+    #[test]
+    fn regex_copies_agree_across_the_three_packages() {
+        // Path anchors: this file is api-server/src/handlers/timeline.rs,
+        // four levels below the repo root.
+        let mcp_src = include_str!("../../../../roshera-mcp/src/gates.ts");
+        let app_src = include_str!("../../../../roshera-app/src/lib/timeline-events.ts");
+
+        /// The `^...$` body of `const <ident> = /^...$/i` in a TS source.
+        /// `None` (a failed assert) means the declaration moved or was
+        /// renamed — which is exactly a sync break, so the test fails.
+        fn ts_regex_literal(source: &str, ident: &str) -> Option<String> {
+            let decl = source.find(&format!("{ident} ="))?;
+            let rest = &source[decl..];
+            let start = rest.find("/^")?;
+            let body = &rest[start + 1..];
+            let end = body.find("$/i")?;
+            Some(body[..end + 1].to_string())
+        }
+
+        for (ident, rust_pattern) in [
+            ("GENERIC_CHECKPOINT_NAME", GENERIC_CHECKPOINT_NAME_PATTERN),
+            ("CLOCK_CHECKPOINT_NAME", CLOCK_CHECKPOINT_NAME_PATTERN),
+        ] {
+            // The Rust pattern carries case-insensitivity inline; the TS
+            // literals carry it as the /i flag.
+            let rust_body = rust_pattern.strip_prefix("(?i)").map(str::to_string);
+            assert!(
+                rust_body.is_some(),
+                "{ident}: Rust pattern must start with (?i) — it mirrors the TS /i flag"
+            );
+            for (package, source) in [
+                ("roshera-mcp/src/gates.ts", mcp_src),
+                ("roshera-app/src/lib/timeline-events.ts", app_src),
+            ] {
+                let ts_body = ts_regex_literal(source, ident);
+                assert!(
+                    ts_body.is_some(),
+                    "{ident}: no `/^...$/i` literal found after `{ident} =` in \
+                     {package} — the declaration moved or was renamed; the three \
+                     packages are out of sync"
+                );
+                assert_eq!(
+                    ts_body, rust_body,
+                    "{ident}: the copy in {package} no longer matches this REST \
+                     floor's pattern. A name one layer accepts and another refuses \
+                     is a live inconsistency — update all three copies together \
+                     (gates.ts, timeline-events.ts, timeline.rs)"
+                );
+            }
         }
     }
 

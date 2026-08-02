@@ -146,7 +146,8 @@ export function registerCreateTools(server: ToolHost) {
       description:
         "ONE-CALL analytic box: `width`×`depth` on the plane, extruded `height` " +
         "along +normal. The box BASE sits at the base-centre; it is NOT centred " +
-        "on the base point. Returns part id + placement.",
+        "on the base point. Returns object_uuid (what boolean/transform take) + " +
+        "part_id + placement.",
       inputSchema: z
         .object({
           plane: PlaneSchema.default("xy").describe("orientation: width→u, depth→v, height→u×v"),
@@ -200,7 +201,8 @@ export function registerCreateTools(server: ToolHost) {
       description:
         "ONE-CALL analytic cylinder with one smooth lateral face. Its BASE-face " +
         "centre sits at `center` (or cx,cy on the plane); it extrudes `height` " +
-        "along +`axis`, NOT centred on the base point. Returns part id + placement.",
+        "along +`axis`, NOT centred on the base point. Returns object_uuid " +
+        "(what boolean/transform take) + part_id + placement.",
       inputSchema: z
         .object({
           plane: PlaneSchema.default("xy").describe("orientation when center/axis omitted"),
@@ -298,7 +300,8 @@ export function registerCreateTools(server: ToolHost) {
     "create_sphere",
     {
       description:
-        "ONE-CALL analytic sphere of `radius` at `center`. Returns part id + placement.",
+        "ONE-CALL analytic sphere of `radius` at `center`. Returns object_uuid " +
+        "(what boolean/transform take) + part_id + placement.",
       inputSchema: z
         .object({
           radius: z.number().positive().describe("sphere radius (mm)"),
@@ -336,18 +339,18 @@ export function registerCreateTools(server: ToolHost) {
 
   server.tool(
     "revolve",
-    "Solid of revolution from a closed [r,z] meridian (mm) about an axis — " +
-      "axisymmetric parts (nozzles, vessels) watertight in one op. Give ONE of " +
-      "`profile` (sampled polyline) or `profile_segments` (typed line/arc/nurbs, " +
-      "each revolved to an EXACT surface — the right mode for nozzles/vessels). " +
-      "Loop must be simple, r≥0, not crossing the axis; hollow = trace the wall " +
-      "section. smooth/bore_radius/wall_thickness apply to `profile` only.",
+    "Solid of revolution from a closed [r,z] meridian (mm; r=distance from " +
+      "axis, must be ≥0 and never cross it; z=along axis) — axisymmetric parts " +
+      "watertight in one op. Give ONE of `profile` (sampled polyline) or " +
+      "`profile_segments` (typed line/arc/nurbs, each revolved to an EXACT " +
+      "surface — the right mode for nozzles/vessels). Hollow = trace the wall " +
+      "section. Returns a NEW part_id + object_uuid.",
     {
       profile: z
         .array(z.array(z.number()).length(2))
         .min(3)
         .optional()
-        .describe("closed [r,z] meridian (mm); r=from axis, z=along axis; auto-closes"),
+        .describe("closed [r,z] polyline (mm); auto-closes"),
       profile_segments: z
         .array(
           z.discriminatedUnion("type", [
@@ -366,22 +369,21 @@ export function registerCreateTools(server: ToolHost) {
             }),
             z.object({
               type: z.literal("nurbs"),
-              degree: z.number().int().min(1).max(7).describe("degree"),
+              degree: z.number().int().min(1).max(7),
               control_points: z
                 .array(z.array(z.number()).length(2))
                 .min(2)
                 .describe("[r,z] CPs mm"),
-              weights: z.array(z.number()).optional().describe("rational weights, one per CP"),
-              knots: z.array(z.number()).describe("knot vector (CPs+degree+1)"),
+              weights: z.array(z.number()).optional().describe("one per CP; omit = non-rational"),
+              knots: z.array(z.number()).describe("knot vector, length = CPs+degree+1"),
             }),
           ]),
         )
         .min(1)
         .optional()
         .describe(
-          "typed [r,z] segments in loop order (auto-closes): line→cylinder/cone/" +
-            "cap, arc→torus/sphere, nurbs→smooth wall. Full-360° ONLY; exclusive " +
-            "with profile/smooth/bore_radius/wall_thickness",
+          "typed [r,z] segments in loop order (auto-closes). Full-360° ONLY; " +
+            "exclusive with profile/smooth/bore_radius/wall_thickness",
         ),
       axis_origin: z
         .array(z.number()).length(3)

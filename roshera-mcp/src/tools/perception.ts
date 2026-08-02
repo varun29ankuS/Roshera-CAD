@@ -24,7 +24,7 @@ export function registerPerceptionTools(server: ToolHost) {
       mode: z
         .enum(["shaded", "ids", "depth", "normals", "diagnostic"])
         .default("shaded")
-        .describe("render channel ('ids' returns a face_id legend; 'diagnostic' highlights defects)"),
+        .describe("render channel"),
       view: z.enum(["iso", "front", "top", "right"]).default("iso").describe("camera view"),
       size: z.number().int().min(64).max(2048).default(512).describe("image size in px"),
     },
@@ -131,7 +131,7 @@ export function registerPerceptionTools(server: ToolHost) {
       mode: z
         .enum(["shaded", "ids", "depth", "normals", "diagnostic"])
         .default("shaded")
-        .describe("render channel ('diagnostic' highlights open/non-manifold edges)"),
+        .describe("render channel"),
       size: z.number().int().min(64).max(2048).default(720).describe("image size in px"),
       quality: z
         .enum(["coarse", "medium", "fine"])
@@ -170,15 +170,13 @@ export function registerPerceptionTools(server: ToolHost) {
 
   server.tool(
     "verify_part",
-    "EXPLICIT FULL CERTIFICATE — the expensive checks the ambient verdict skips: " +
-      "brep_valid + watertight + manifold + self-intersection-free + " +
-      "construction/tessellation/mesh-quality. The authoritative 'is this a real " +
-      "closed solid' answer, and the ONLY call that clears staleness. ENFORCED, " +
-      "not just advised: after a boolean/blend/multi-feature build (especially " +
-      "one chained with `fast:true`), ground_truth reads `status:\"stale\"`, " +
-      "dfm_check refuses (422), and export_part refuses (422) until this runs — " +
-      "call it before trusting or shipping the result, not just after. Returns a " +
-      "diagnostic image (red=open, magenta=non-manifold).",
+    "EXPLICIT FULL CERTIFICATE — the expensive checks the ambient verdict " +
+      "skips (brep_valid, watertight, manifold, self-intersection-free, " +
+      "construction/tessellation/mesh-quality) plus a diagnostic image " +
+      "(red=open, magenta=non-manifold). The ONLY call that clears staleness: " +
+      "after a boolean/blend/multi-feature build, ground_truth reads stale and " +
+      "dfm_check/export_part refuse (422) until this runs — call it before " +
+      "trusting or shipping the result.",
     {
       part_id: z.number().int().describe("part id (list_parts)"),
       view: z.enum(["iso", "front", "top", "right"]).default("iso").describe("camera view for the diagnostic image"),
