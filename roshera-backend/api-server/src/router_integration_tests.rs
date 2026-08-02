@@ -213,6 +213,7 @@ pub(crate) async fn make_test_state_with_database(
         provider_manager,
         ai_configured: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         ai_provider_manager,
+        acp_provider_epoch: Arc::new(crate::acp_provider_epoch::AcpProviderEpoch::new()),
         session_manager,
         permission_manager,
         // Router integration tests exercise the enforced posture by

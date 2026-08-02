@@ -213,6 +213,33 @@ pub async fn get_provider(State(state): State<AppState>) -> Json<Value> {
     }))
 }
 
+/// End every live ACP connection minted under the previous provider, so
+/// the next prompt necessarily starts a fresh session on the new one.
+/// Called by every successful `PUT` branch — subscription CLI,
+/// declarative vendor, and the anthropic default — AFTER its persist +
+/// repin succeeded, never on a refused or failed save.
+///
+/// This is the fundamental fix for the stale-session defect: goose stores
+/// the provider ON THE SESSION and restores it (`Restoring evicted
+/// session … (provider: Some("sarvam"))`, observed live), so repinning
+/// alone changed only future sessions while the open browser tab kept
+/// prompting the old provider indefinitely. The bump makes that state
+/// unreachable — the tab's next request gets the bare-404 reestablish
+/// signature `acp-client.ts` already recovers from (see
+/// `acp_provider_epoch.rs`, including the deliberate choice to let an
+/// in-flight turn finish on the provider that started it).
+fn invalidate_agent_sessions(state: &AppState, provider: &str, mode: &str) {
+    let epoch = state.acp_provider_epoch.invalidate_connections();
+    tracing::info!(
+        target: "goose_acp",
+        provider,
+        mode,
+        epoch,
+        "provider repinned — ACP connections from the previous provider \
+         are ended; the next prompt starts a fresh session on the new one"
+    );
+}
+
 /// `PUT /api/ai/provider` — validate against the live vendor / local CLI
 /// state, then persist + register + (subscription-CLI only) repin goose
 /// and scrub the process env. Nothing is saved unless validation
@@ -274,12 +301,15 @@ pub async fn put_provider(
                 ))
             };
 
+            invalidate_agent_sessions(&state, &provider, "api_key");
+
             Ok(Json(json!({
                 "success": true,
                 "provider": provider,
                 "mode": "api_key",
                 "model": model,
                 "model_verified": model_verified,
+                "agent_sessions_invalidated": true,
                 "acl": acl,
                 "note": repin_note,
             })))
@@ -309,6 +339,8 @@ pub async fn put_provider(
             register_claude_credential(&state, ClaudeCredential::OauthAccessToken(token)).await;
             state.ai_configured.store(true, Ordering::SeqCst);
 
+            invalidate_agent_sessions(&state, "anthropic", "oauth_profile");
+
             Ok(Json(json!({
                 "success": true,
                 "provider": "anthropic",
@@ -316,6 +348,7 @@ pub async fn put_provider(
                 "profile_name": profile_name,
                 "model": model,
                 "model_verified": model_verified,
+                "agent_sessions_invalidated": true,
                 "acl": acl,
             })))
         }
@@ -389,6 +422,8 @@ pub async fn put_provider(
             // inherits ANTHROPIC_API_KEY/ANTHROPIC_AUTH_TOKEN otherwise.
             ai_provider_config::scrub_anthropic_env_for_subscription_mode();
 
+            invalidate_agent_sessions(&state, "anthropic", "subscription_cli");
+
             // Off the request path: the PUT above already returned a
             // fast, saved response. This spawns a bounded (~45s),
             // killed-on-timeout probe of the live CLI and persists
@@ -415,6 +450,7 @@ pub async fn put_provider(
                 "profile_name": profile_name,
                 "model": model,
                 "model_verified": model_verified,
+                "agent_sessions_invalidated": true,
                 "model_verification": model_verification,
                 "model_verification_note": if should_spawn_check {
                     Some("a bounded (~45s) background check against the live \
@@ -1002,6 +1038,40 @@ mod tests {
         assert_eq!(err.code, ErrorCode::AiModelRejected);
         let details = err.details.expect("refusal must carry details");
         assert_eq!(details["rejected_model"], "claude-opus-4");
+    }
+
+    /// The PUT→invalidation seam: every successful repin branch calls
+    /// `invalidate_agent_sessions`, and that call must end (stale-ify)
+    /// every ACP connection minted before it while leaving later ones
+    /// serviceable. The full PUT branches themselves cannot run here —
+    /// they write goose's process-global config, which exactly one test
+    /// in this binary is allowed to touch
+    /// (`goose_acp::tests::goose_lockdown_leaves_exactly_roshera_reachable`)
+    /// — so the branch wiring is proven live (repin, then a turn on the
+    /// new provider) and this pins the helper's contract against the
+    /// SHARED `AppState` instance the `/acp` middleware reads.
+    #[tokio::test]
+    async fn invalidate_agent_sessions_ends_connections_minted_before_the_repin() {
+        let state = make_test_state().await;
+        state.acp_provider_epoch.register("conn-before-repin");
+        assert!(
+            !state.acp_provider_epoch.is_stale("conn-before-repin"),
+            "a connection must serve until a repin actually happens"
+        );
+
+        invalidate_agent_sessions(&state, "anthropic", "subscription_cli");
+
+        assert!(
+            state.acp_provider_epoch.is_stale("conn-before-repin"),
+            "a successful repin must end every ACP connection minted \
+             before it — otherwise the open tab keeps prompting the old \
+             provider (goose restores the provider stored on the session)"
+        );
+        state.acp_provider_epoch.register("conn-after-repin");
+        assert!(
+            !state.acp_provider_epoch.is_stale("conn-after-repin"),
+            "a connection minted after the repin must serve"
+        );
     }
 
     #[tokio::test]

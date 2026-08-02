@@ -348,8 +348,14 @@ export class AcpClient {
   /** Explicit override only (ctor option or `VITE_ACP_CWD`) — empty means
    *  "ask the backend", resolved and cached lazily by {@link resolveCwd}.
    *  Not `readonly`: the backend-resolved value is written into this same
-   *  field on first use so every subsequent `newSession()` reuses it. */
+   *  field on first use so every subsequent `newSession()` reuses it —
+   *  and {@link reestablish} clears it again (backend-resolved case only)
+   *  so a rebuild re-asks the backend and picks up a provider change. */
   private cwd: string
+  /** Whether `cwd` came from the ctor/`VITE_ACP_CWD` (never cleared) or
+   *  from the backend (cleared on {@link reestablish} to force a fresh
+   *  `GET /api/acp/config`, which also re-resolves {@link provider}). */
+  private readonly cwdIsExplicitOverride: boolean
   private connectionId: string | null = null
   private sessionId: string | null = null
   private _currentModel: string | null = null
@@ -369,10 +375,17 @@ export class AcpClient {
   private lastMcpServers: unknown[] = []
   private readonly updateHandlers = new Set<(update: AcpSessionUpdate) => void>()
   private readonly disconnectHandlers = new Set<(reason: string) => void>()
+  /** Fired after every successful {@link newSession} — including the one
+   *  {@link reestablish} makes after the backend invalidated us (restart
+   *  OR provider repin), which is exactly when `currentModel`/`provider`
+   *  change under a subscriber's feet. UI that mirrors those must resync
+   *  here, not only at first connect. */
+  private readonly sessionChangedHandlers = new Set<() => void>()
 
   constructor(opts: AcpClientOptions = {}) {
     this.acpPath = opts.acpPath ?? DEFAULT_ACP_PATH
     this.cwd = opts.cwd ?? (import.meta.env.VITE_ACP_CWD as string | undefined) ?? ''
+    this.cwdIsExplicitOverride = this.cwd !== ''
   }
 
   get isDead(): boolean {
@@ -414,6 +427,15 @@ export class AcpClient {
   onDisconnect(cb: (reason: string) => void): () => void {
     this.disconnectHandlers.add(cb)
     return () => this.disconnectHandlers.delete(cb)
+  }
+
+  /** Subscribe to session (re)creation — fires after every successful
+   *  `newSession()`, first connect and rebuild alike. Read
+   *  `currentModel`/`provider` inside the callback: both are already
+   *  fresh when it fires. Returns an unsubscribe fn. */
+  onSessionChanged(cb: () => void): () => void {
+    this.sessionChangedHandlers.add(cb)
+    return () => this.sessionChangedHandlers.delete(cb)
   }
 
   private markDead(reason: string): void {
@@ -678,16 +700,26 @@ export class AcpClient {
       (err) => this.markDead(err ? `session stream: ${err.message}` : 'session stream ended'),
     )
     void this.sessStream.start()
+    for (const cb of this.sessionChangedHandlers) cb()
     return this.sessionId
   }
 
   /**
    * Rebuild the connection + session in place after the backend reported
    * that our `Acp-Connection-Id` no longer exists (`POST /acp` → 404 with
-   * an empty body — the signature of a backend restart while this tab
-   * stayed open). Verified live 2026-08-01: the stale id 404s every call,
-   * and without this the Blackboard silently fell back to the legacy
-   * single-shot path ("Command processed.") while looking connected.
+   * an empty body). TWO backend causes share that exact signature, on
+   * purpose:
+   *
+   * - a backend restart while this tab stayed open (verified live
+   *   2026-08-01: the stale id 404s every call, and without this the
+   *   Blackboard silently fell back to the legacy single-shot path
+   *   ("Command processed.") while looking connected);
+   * - a provider repin (`PUT /api/ai/provider`): goose stores the
+   *   provider ON THE SESSION and restores it, so the backend now ends
+   *   every connection minted under the old provider
+   *   (`api-server/src/acp_provider_epoch.rs`) precisely so this one
+   *   recovery path starts the next session on the new provider — no
+   *   page reload, no second mechanism.
    *
    * Any failure here (initialize or session/new) propagates verbatim —
    * an unreachable agent must surface as an error, never as a healthy-
@@ -705,6 +737,18 @@ export class AcpClient {
       this.connectionId = null
       this.sessionId = null
       this._currentModel = null
+      // Re-ask the backend (never a cached copy) which provider now backs
+      // the agent surface: in the repin case this rebuild EXISTS because
+      // that answer changed, and serving the old vendor mark from cache
+      // would claim the wrong provider is serving the new session. An
+      // explicit ctor/VITE_ACP_CWD override keeps its cwd, but the
+      // provider is still re-fetched by `resolveCwd` only in the
+      // backend-owned case — under an override there is no config fetch,
+      // and `provider` honestly stays null rather than guessing.
+      if (!this.cwdIsExplicitOverride) {
+        this.cwd = ''
+      }
+      this.activeProvider = null
       // Anything still pending was addressed to the dead connection; its
       // response can never arrive.
       for (const entry of this.pending.values()) {
@@ -725,10 +769,13 @@ export class AcpClient {
    *  Progressive content/tool activity arrives via `onUpdate` while this
    *  promise is pending.
    *
-   *  A 404 means the backend no longer knows our connection id (it
-   *  restarted): rebuild via {@link reestablish} and retry the prompt
-   *  exactly once. A 404 on the retried call — or any failure during the
-   *  rebuild itself — propagates; there is deliberately no loop. */
+   *  A 404 means the backend no longer serves our connection id — it
+   *  restarted, or a provider repin invalidated every connection minted
+   *  under the old provider (see {@link reestablish}): rebuild and retry
+   *  the prompt exactly once, so this same turn is served by a fresh
+   *  session on whatever the backend now pins. A 404 on the retried call
+   *  — or any failure during the rebuild itself — propagates; there is
+   *  deliberately no loop. */
   async prompt(text: string): Promise<{ stopReason: AcpStopReason }> {
     if (!this.sessionId) throw new AcpProtocolError(-32000, 'prompt() called before newSession()')
     try {

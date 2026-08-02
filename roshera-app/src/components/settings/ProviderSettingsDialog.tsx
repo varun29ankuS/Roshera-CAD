@@ -10,6 +10,7 @@ import {
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { cn } from '@/lib/utils'
+import { Claim } from '@/components/panels/cards/card-chrome'
 import { VendorMark } from '@/components/settings/vendor-marks'
 import {
   deleteProvider,
@@ -671,6 +672,45 @@ export function ProviderSettingsButton() {
                 </Button>
               </div>
             )}
+
+            {/* Two surfaces, two facts — never one global verdict.
+                `ai_configured` describes ONLY the REST surface
+                (/api/ai/command needs a native provider with a real
+                credential); the agent surface (/acp) is pinned by the
+                saved config and serves fine without one (subscription_cli
+                deliberately has no API key). Collapsing them into one
+                boolean is exactly how a fully working agent read as "not
+                connected". Each line reports the backend's own fact for
+                that surface: `active` for the agent pin, `ai_configured`
+                for REST. Tri-state per card-chrome's Claim contract:
+                amber "not asserted" for the agent surface when nothing is
+                saved (the boot fallback may or may not hold a credential
+                — the backend hasn't claimed either), never a guessed
+                tick or cross. */}
+            <div className="flex flex-col gap-1 rounded-md border border-border/60 bg-background/40 px-3 py-2">
+              <Claim
+                status={data.active !== null ? true : null}
+                detail={
+                  data.active
+                    ? `pinned to ${data.active.provider} · ${
+                        MODE_SHORT_LABELS[data.active.mode as CredentialMode] ?? data.active.mode
+                      }`
+                    : 'no saved provider — whatever the backend resolved at boot'
+                }
+              >
+                Agent surface (/acp — the Blackboard agent)
+              </Claim>
+              <Claim
+                status={data.ai_configured}
+                detail={
+                  data.ai_configured
+                    ? 'native provider registered'
+                    : 'needs an API key or OAuth credential — tool_use is not carried over the CLI transport'
+                }
+              >
+                REST surface (/api/ai/command)
+              </Claim>
+            </div>
 
             {/* Vendor marks — the primary control, sized to say so: the
                 clearly largest thing in the dialog, in their own brand

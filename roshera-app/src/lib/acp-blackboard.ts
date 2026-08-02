@@ -307,8 +307,14 @@ let sharedClientPromise: Promise<AcpClient> | null = null
 
 async function createAndConnect(): Promise<AcpClient> {
   const client = new AcpClient()
-  await client.initialize()
-  await client.newSession()
+  // Subscribed BEFORE the first newSession() so one code path serves both
+  // session starts: the initial connect below AND every rebuild the
+  // client makes on its own (`reestablish` after a backend restart or a
+  // provider repin invalidated the connection). Without this, the header
+  // kept the OLD provider mark and model after a repin — the rebuild
+  // happened inside `prompt()`, past the one manual startSession call
+  // that used to live here.
+  //
   // `client.currentModel` is `null` when `session/new` reported no model
   // (or the unresolved "default" sentinel) — an honest, real state; the
   // header renders "—" for it rather than fabricating a name.
@@ -316,7 +322,11 @@ async function createAndConnect(): Promise<AcpClient> {
   // `newSession()` already made for the cwd, so the vendor mark costs no
   // extra request. Null when the backend named no provider — the header
   // then draws no logo rather than assuming one.
-  useAcpSessionStore.getState().startSession(client.currentModel, client.provider)
+  client.onSessionChanged(() =>
+    useAcpSessionStore.getState().startSession(client.currentModel, client.provider),
+  )
+  await client.initialize()
+  await client.newSession()
   // A stream drop (not just an explicit `resetAcpClient()` call below)
   // must also end the session in the header — a dead connection showing
   // live counts would be worse than showing nothing.
