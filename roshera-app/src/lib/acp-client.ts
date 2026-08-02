@@ -38,10 +38,10 @@
  * - It never retries a 429 in a loop. The shared 100 req/min budget is
  *   shared with the polling frontend (`blackboard-api.ts`'s poll), so a
  *   naive retry storm would starve it. Instead a single shared cooldown
- *   gate delays the NEXT request until the `Retry-After` window elapses,
- *   and a request that still lands inside an active cooldown throws
- *   `AcpRateLimitError` verbatim for the caller to surface — never a
- *   silently-swallowed retry.
+ *   gate delays the NEXT request until the `Retry-After` window elapses
+ *   (callers can read that pending delay via `acpCooldownRemainingMs()`
+ *   and SHOW it), and the 429 itself throws `AcpRateLimitError` verbatim
+ *   for the caller to surface — never a silently-swallowed retry.
  * - It never approves anything beyond `allow_once` and never answers an
  *   unrecognized server→client method by hanging — session mode is
  *   `auto` (no human approval round-trip is expected), so the one
@@ -227,6 +227,15 @@ export class AcpConnectionDeadError extends Error {
 let cooldownUntilMs = 0
 const DEFAULT_RATE_LIMIT_COOLDOWN_MS = 5000
 
+/** How long the shared 429 cooldown gate will hold the NEXT request, in
+ *  milliseconds (0 when no cooldown is active). Exposed so the Blackboard
+ *  can SHOW the wait — `rateLimitedFetch` sleeps this out silently, and a
+ *  user watching a blank line for the duration cannot tell a deliberate
+ *  wait from a dead turn. */
+export function acpCooldownRemainingMs(): number {
+  return Math.max(0, cooldownUntilMs - Date.now())
+}
+
 async function sleep(ms: number): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, ms))
 }
@@ -261,9 +270,24 @@ async function safeText(res: Response): Promise<string> {
 
 // ── SSE stream reader (fetch + manual parse; EventSource can't carry headers) ──
 
+/** Inactivity watchdog threshold. The backend injects a `: keepalive`
+ *  SSE comment every 10s into an idle `/acp` stream
+ *  (`goose_acp::acp_sse_keepalive`), so a healthy connection is NEVER
+ *  byte-silent for 45s — even while the model thinks. Silence past this
+ *  means the connection is dead in a way the socket never reported:
+ *  verified live 2026-08-02, killing the api-server mid-turn left the
+ *  dev proxy holding this side open, `reader.read()` pending forever,
+ *  and the in-flight turn (plus the serial queue behind it) trapped
+ *  until a page reload. The watchdog turns that into an ordinary
+ *  connection-dead failure the existing recovery already handles. */
+const SSE_INACTIVITY_TIMEOUT_MS = 45_000
+
 class AcpSseStream {
   private readonly controller = new AbortController()
   private started = false
+  /** Set when the watchdog (not `close()`) aborted the fetch, so the
+   *  catch below reports the drop instead of treating it as intentional. */
+  private timedOut = false
   private readonly url: string
   private readonly headers: Record<string, string>
   private readonly onEvent: (data: string) => void
@@ -279,6 +303,36 @@ class AcpSseStream {
     this.headers = headers
     this.onEvent = onEvent
     this.onDone = onDone
+  }
+
+  /** `reader.read()` with the inactivity watchdog: whichever comes first
+   *  wins. On timeout the underlying fetch is aborted (releasing the
+   *  socket) and a descriptive error is thrown; `timedOut` keeps the
+   *  catch in `start()` from mistaking that abort for an intentional
+   *  `close()`. */
+  private async readWithWatchdog(
+    reader: ReadableStreamDefaultReader<Uint8Array>,
+  ): Promise<ReadableStreamReadResult<Uint8Array>> {
+    let timer: ReturnType<typeof setTimeout> | undefined
+    try {
+      return await Promise.race([
+        reader.read(),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => {
+            this.timedOut = true
+            this.controller.abort()
+            reject(
+              new Error(
+                `no traffic (not even a keepalive) for ${SSE_INACTIVITY_TIMEOUT_MS / 1000}s — ` +
+                  `the backend stopped serving this connection`,
+              ),
+            )
+          }, SSE_INACTIVITY_TIMEOUT_MS)
+        }),
+      ])
+    } finally {
+      clearTimeout(timer)
+    }
   }
 
   async start(): Promise<void> {
@@ -297,7 +351,7 @@ class AcpSseStream {
       const decoder = new TextDecoder()
       let buffer = ''
       for (;;) {
-        const { done, value } = await reader.read()
+        const { done, value } = await this.readWithWatchdog(reader)
         if (done) break
         buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n')
         let boundary: number
@@ -313,7 +367,7 @@ class AcpSseStream {
       }
       this.onDone()
     } catch (err) {
-      if (this.controller.signal.aborted) return // intentional close, not a drop
+      if (this.controller.signal.aborted && !this.timedOut) return // intentional close, not a drop
       this.onDone(err instanceof Error ? err : new Error(String(err)))
     }
   }
@@ -542,8 +596,22 @@ export class AcpClient {
       : { jsonrpc: '2.0', id, result }
     try {
       await this.post(body, true)
-    } catch {
-      // Best-effort: a failed reply to a server-initiated request must
+    } catch (err) {
+      if (err instanceof AcpRateLimitError) {
+        // A swallowed 429 here would leave the agent waiting forever for
+        // this reply — the in-flight `prompt()` would then hang with no
+        // failure anywhere. Retry exactly once: `rateLimitedFetch` waits
+        // out the cooldown the 429 just set before re-issuing, so this is
+        // one bounded re-send, never a storm.
+        try {
+          await this.post(body, true)
+        } catch {
+          // Second failure: the connection itself is gone (or still
+          // rate-limited) — the turn's own error path will surface it.
+        }
+        return
+      }
+      // Any other failure: a reply to a server-initiated request must
       // not throw out of an SSE event handler.
     }
   }
@@ -760,6 +828,17 @@ export class AcpClient {
       this.dead = false
       await this.initialize()
       await this.newSession(this.lastMcpServers)
+    } catch (err) {
+      // A failed rebuild must not leave a half-connected zombie: with
+      // `dead === false` but `sessionId === null`, every later `prompt()`
+      // would fail "prompt() called before newSession()" forever — a
+      // state only a page reload used to clear. Marking dead here means
+      // the shared-client layer (`getAcpClient`) discards this instance
+      // and the NEXT prompt builds a fresh one from scratch.
+      this.markDead(
+        `reconnect failed: ${err instanceof Error ? err.message : String(err)}`,
+      )
+      throw err
     } finally {
       this.reconnecting = false
     }

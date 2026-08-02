@@ -78,7 +78,7 @@
 use crate::auth_middleware::AuthInfo;
 use crate::error_catalog::{ApiError, ErrorCode};
 use axum::{
-    body::Body,
+    body::{Body, Bytes},
     extract::{Request, State},
     http::{header, HeaderValue, Method, StatusCode},
     middleware::Next,
@@ -776,8 +776,101 @@ pub(crate) fn acp_router(
             .layer(axum::middleware::from_fn_with_state(
                 acp_provider_epoch,
                 crate::acp_provider_epoch::enforce_provider_epoch,
-            )),
+            ))
+            // Outermost: inject `: keepalive` SSE comments into idle /acp
+            // streams. Applied after (outside) `observe_acp_transport` so
+            // its scanner reads the raw upstream bytes and never sees the
+            // injected comments. See [`acp_sse_keepalive`] for why silence
+            // must be distinguishable from death.
+            .layer(axum::middleware::from_fn(acp_sse_keepalive)),
     )
+}
+
+// ── SSE keepalive ──────────────────────────────────────────────────────
+
+/// Interval between `: keepalive` comment frames injected into an idle
+/// `/acp` SSE stream (comments are valid SSE that carry no event — every
+/// client parser skips them).
+///
+/// Why this exists (verified live 2026-08-02): the browser client cannot
+/// distinguish "the model is thinking" from "the api-server died" — both
+/// are byte-silence on the session stream, and a reverse proxy in front
+/// of this server (Vite's dev proxy, any production proxy) can hold the
+/// client-side socket open after the upstream vanishes, so the death is
+/// never signalled. A prompt turn in flight at that moment hung forever:
+/// its JSON-RPC response can only ever arrive on this stream, and the
+/// Blackboard's serial turn queue stayed blocked behind it until a page
+/// reload. With a keepalive every 10s, the client's inactivity watchdog
+/// (`acp-client.ts`, 45s threshold) can declare a truly-dead connection
+/// dead while never misfiring during long model turns.
+const ACP_SSE_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Middleware wrapping `/acp` GET responses: SSE bodies get keepalive
+/// comments injected whenever the upstream is idle for
+/// [`ACP_SSE_KEEPALIVE_INTERVAL`]; everything else (POST bodies, 404s
+/// from the epoch layer, non-SSE GETs) passes through untouched.
+pub(crate) async fn acp_sse_keepalive(req: Request, next: Next) -> Response {
+    let is_get = req.method() == Method::GET;
+    let response = next.run(req).await;
+    if !is_get {
+        return response;
+    }
+    let is_sse = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.starts_with("text/event-stream"));
+    if !is_sse {
+        return response;
+    }
+    let (parts, body) = response.into_parts();
+    let mut ticker = tokio::time::interval(ACP_SSE_KEEPALIVE_INTERVAL);
+    // Delay, not Burst: after a long stretch of upstream traffic (which
+    // resets the ticker anyway) we want the NEXT keepalive one interval
+    // later, never a catch-up burst of comment frames.
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    Response::from_parts(
+        parts,
+        Body::from_stream(KeepaliveStream {
+            inner: body.into_data_stream(),
+            ticker,
+        }),
+    )
+}
+
+/// Pass-through over an SSE body that yields a `: keepalive\n\n` comment
+/// frame whenever the upstream has been idle for one ticker interval.
+/// Upstream items (data and errors alike) are forwarded byte-identical
+/// and reset the ticker; upstream end ends this stream.
+struct KeepaliveStream {
+    inner: axum::body::BodyDataStream,
+    ticker: tokio::time::Interval,
+}
+
+impl futures::Stream for KeepaliveStream {
+    type Item = Result<Bytes, axum::Error>;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        use std::task::Poll;
+        let this = self.get_mut();
+        match std::pin::Pin::new(&mut this.inner).poll_next(cx) {
+            Poll::Ready(Some(item)) => {
+                this.ticker.reset();
+                Poll::Ready(Some(item))
+            }
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => match this.ticker.poll_tick(cx) {
+                // The first tick of a fresh interval completes immediately,
+                // so a just-opened stream emits one comment up front — which
+                // also flushes response headers through any buffering proxy.
+                Poll::Ready(_) => Poll::Ready(Some(Ok(Bytes::from_static(b": keepalive\n\n")))),
+                Poll::Pending => Poll::Pending,
+            },
+        }
+    }
 }
 
 /// Extension name Roshera's own MCP server is injected under. Every
