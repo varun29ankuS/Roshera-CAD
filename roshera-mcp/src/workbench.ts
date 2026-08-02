@@ -239,18 +239,14 @@ export class Workbench {
 export function registerWorkbenchTool(host: ToolHost, wb: Workbench): void {
   host.tool(
     "workbench",
-    "Switch the LIVE toolset to a CAD workbench (attention optimization, not a " +
-      "capability gate — every tool stays reachable via find_tool/describe_tool/" +
-      "invoke in any mode). Entering a bench exposes its tools on top of the " +
-      "core+meta surface and retires the previous bench; the live surface stays " +
-      "small (≤36). modes: 'sketch' (create_sketch/psketch_*), 'assembly' " +
-      "(assembly_*), 'drawing' (make_drawing/dimension/gdt_*), 'analysis' " +
-      "(ray/region/occupancy/coverage/distance/ground_truth), 'labels' (label_*/" +
-      "blackboard_* — the shared human-visible notebook: read the human's notes, " +
-      "edit lines), 'timeline' (timeline_*/rebuild_certificate/clear_timeline/" +
-      "bind_parameter_name — history, branching, merge, moulds), 'core_only' " +
-      "(retire any bench), 'status' (report the active bench, exposed count, " +
-      "token bill, and per-bench tool counts).",
+    "Switch the LIVE toolset to a CAD workbench — an attention optimization, " +
+      "never a capability gate (find_tool/describe_tool/invoke reach every tool " +
+      "in any mode). Entering a bench adds its tools to the always-on core+meta " +
+      "surface and retires the previous bench. modes: 'sketch' (psketch_*), " +
+      "'assembly', 'drawing' (dimensions/GD&T), 'analysis' (queries/ground_truth), " +
+      "'labels' (labels + the shared human-visible notebook), 'timeline' " +
+      "(history/branch/merge/moulds), 'core_only' (retire the bench), 'status' " +
+      "(active bench, exposed count, token bill).",
     {
       mode: z
         .enum([

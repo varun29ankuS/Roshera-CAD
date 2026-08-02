@@ -309,26 +309,21 @@ export async function validateOp(
 
 // ─── Registration ────────────────────────────────────────────────────────────
 
-const FUNNEL_HINT =
-  "The long tail lives behind three tools: find_tool (search) → describe_tool (schema) → invoke (run). " +
-  "Every registered tool is reachable via invoke at fixed context cost, on any client.";
-
 export function registerMetaTools(host: ToolHost, table: ToolTable): void {
   host.tool(
     "find_tool",
     "FUNNEL STEP 1/3 — deterministic ranked search over the FULL tool inventory " +
-      "(all tools, not just the exposed surface). Give an intent in plain words; " +
-      "get the top matches with name, bench, purpose, token cost. Then describe_tool " +
-      "for the schema and invoke to run it. No LLM, no embeddings — name/synonym/" +
-      "purpose ranking. " +
-      FUNNEL_HINT,
+      "(every registered tool, not just the exposed surface). Give an intent in " +
+      "plain words; get top matches with name, bench, purpose, token cost. Then " +
+      "describe_tool for the schema and invoke to run it — the whole long tail " +
+      "is reachable that way at fixed context cost, on any client.",
     {
       query: z
         .string()
         .min(1)
         .describe("what you want to do, e.g. 'drill a bolt circle' or 'measure two faces'"),
       bench: z
-        .enum(["core", "sketch", "assembly", "drawing", "analysis", "labels", "meta"])
+        .enum(["core", "sketch", "assembly", "drawing", "analysis", "labels", "timeline", "meta"])
         .optional()
         .describe("restrict results to one bench"),
       limit: z
@@ -366,10 +361,9 @@ export function registerMetaTools(host: ToolHost, table: ToolTable): void {
 
   host.tool(
     "describe_tool",
-    "FUNNEL STEP 2/3 — the full input schema + purpose + bench + stability for one " +
-      "tool, by exact name (from find_tool). This is how you learn a long-tail tool's " +
-      "arguments without paying to keep its definition in context. Then invoke to run it. " +
-      FUNNEL_HINT,
+    "FUNNEL STEP 2/3 — full input schema + purpose + bench + stability for one " +
+      "tool, by exact name (from find_tool). Learn a long-tail tool's arguments " +
+      "before first call, without keeping its definition in context; then invoke runs it.",
     {
       name: z.string().min(1).describe("exact tool name, e.g. 'drill_pattern'"),
     },
@@ -403,8 +397,7 @@ export function registerMetaTools(host: ToolHost, table: ToolTable): void {
     "FUNNEL STEP 3/3 — run ANY registered tool by name with its args, whether or " +
       "not it is in the exposed surface. Args are validated by the tool's OWN schema " +
       "first (identical typed error to a direct call on bad args), then dispatched to " +
-      "the identical handler — a meta-path call is never less checked or less capable. " +
-      FUNNEL_HINT,
+      "the identical handler — never less checked or less capable than a direct call.",
     {
       name: z.string().min(1).describe("exact tool name (from find_tool / describe_tool)"),
       args: z
