@@ -195,6 +195,33 @@ pub trait DatabasePersistence: Send + Sync {
     async fn save_branch(&self, branch: &BranchRecord) -> Result<(), SessionError>;
     async fn load_branches(&self, session_id: &str) -> Result<Vec<BranchRecord>, SessionError>;
 
+    // Durability: named checkpoints (declared design intents). The event log
+    // survived a restart while the checkpoints labelling it did not — the
+    // named-intent layer was the LEAST durable part of an event-sourced
+    // system, which is backwards. Upsert on (session_id, checkpoint_id) so a
+    // re-persist of the same checkpoint is idempotent.
+    async fn save_checkpoint(&self, checkpoint: &CheckpointRecord) -> Result<(), SessionError>;
+    /// Every persisted checkpoint for a document, oldest first (by rowid /
+    /// insertion via the `created_at` column) — the boot-restore read path.
+    async fn load_checkpoints(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<CheckpointRecord>, SessionError>;
+
+    // Blackboard notebooks: the reasoning record the Blackboard panel exists
+    // to keep. One row per (document, scope) holding the notebook's full
+    // state (lines + event log + id counter) as an opaque JSON blob — the
+    // write-through worker upserts the latest snapshot, boot hydration reads
+    // them all back. Whole-row upsert keeps ordering trivially correct: the
+    // last write for a scope IS the notebook.
+    async fn save_blackboard_notebook(&self, notebook: &NotebookRecord)
+        -> Result<(), SessionError>;
+    /// Every persisted notebook for a document — the boot-hydration read path.
+    async fn load_blackboard_notebooks(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<NotebookRecord>, SessionError>;
+
     // Documents: the registry of scoping keys under which timeline events
     // and branch records are persisted (task "Roshera has no New"). A
     // document's actual data (its `timeline_events` / `durable_branches`
@@ -284,6 +311,37 @@ pub struct BranchRecord {
     pub parent_branch_id: Option<String>,
     pub fork_sequence: i64,
     pub name: String,
+    pub data: serde_json::Value,
+}
+
+/// A persisted named checkpoint (declared design intent). The full
+/// `timeline_engine::Checkpoint` is stored losslessly in `data` (this crate
+/// does not depend on timeline-engine, so the blob stays opaque here, exactly
+/// as `BranchRecord.data` does); the scalar columns are for scoping
+/// (`session_id`), identity (`checkpoint_id`), and reporting (`branch_id`,
+/// `created_at`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CheckpointRecord {
+    pub session_id: String,
+    pub checkpoint_id: String,
+    pub branch_id: String,
+    /// Milliseconds since the Unix epoch — restore ordering only; the
+    /// authoritative timestamp lives inside `data`.
+    pub created_at: i64,
+    pub data: serde_json::Value,
+}
+
+/// A persisted Blackboard notebook: one (document, scope) pair's full state —
+/// ordered lines, append-only event log, and the id counter — as an opaque
+/// JSON blob owned by the api-server's `blackboard` module. `scope_key` is
+/// the scope's canonical string (`document` / `part:<solid_id>` /
+/// `assembly:<uuid>`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotebookRecord {
+    pub session_id: String,
+    pub scope_key: String,
+    /// Milliseconds since the Unix epoch of the last write.
+    pub updated_at: i64,
     pub data: serde_json::Value,
 }
 
@@ -582,6 +640,45 @@ impl PostgresDatabase {
         .await
         .map_err(|e| SessionError::PersistenceError {
             reason: format!("Failed to create durable_branches table: {}", e),
+        })?;
+
+        // Durability: named checkpoints (declared design intents). Additive,
+        // idempotent, destroys nothing — `IF NOT EXISTS` only.
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS durable_checkpoints (
+                session_id VARCHAR(255) NOT NULL,
+                checkpoint_id VARCHAR(255) NOT NULL,
+                branch_id VARCHAR(255) NOT NULL,
+                created_at BIGINT NOT NULL DEFAULT 0,
+                data JSONB NOT NULL,
+                PRIMARY KEY (session_id, checkpoint_id)
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| SessionError::PersistenceError {
+            reason: format!("Failed to create durable_checkpoints table: {}", e),
+        })?;
+
+        // Blackboard notebooks: one row per (document, scope), whole-notebook
+        // JSON blob. Additive, idempotent, destroys nothing.
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS blackboard_notebooks (
+                session_id VARCHAR(255) NOT NULL,
+                scope_key VARCHAR(512) NOT NULL,
+                updated_at BIGINT NOT NULL DEFAULT 0,
+                data JSONB NOT NULL,
+                PRIMARY KEY (session_id, scope_key)
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| SessionError::PersistenceError {
+            reason: format!("Failed to create blackboard_notebooks table: {}", e),
         })?;
 
         // Document registry ("Roshera has no New"): the catalog `POST
@@ -1483,6 +1580,87 @@ impl DatabasePersistence for PostgresDatabase {
         Ok(rows.into_iter().map(row_to_branch_record).collect())
     }
 
+    async fn save_checkpoint(&self, checkpoint: &CheckpointRecord) -> Result<(), SessionError> {
+        sqlx::query(
+            r#"
+            INSERT INTO durable_checkpoints (session_id, checkpoint_id, branch_id, created_at, data)
+            VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (session_id, checkpoint_id) DO UPDATE
+                SET branch_id = EXCLUDED.branch_id,
+                    created_at = EXCLUDED.created_at,
+                    data = EXCLUDED.data
+            "#,
+        )
+        .bind(&checkpoint.session_id)
+        .bind(&checkpoint.checkpoint_id)
+        .bind(&checkpoint.branch_id)
+        .bind(checkpoint.created_at)
+        .bind(&checkpoint.data)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| SessionError::PersistenceError {
+            reason: format!("Failed to save checkpoint: {}", e),
+        })?;
+        Ok(())
+    }
+
+    async fn load_checkpoints(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<CheckpointRecord>, SessionError> {
+        let rows = sqlx::query(
+            "SELECT * FROM durable_checkpoints WHERE session_id = $1 ORDER BY created_at ASC",
+        )
+        .bind(session_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| SessionError::PersistenceError {
+            reason: format!("Failed to load checkpoints: {}", e),
+        })?;
+        Ok(rows.into_iter().map(row_to_checkpoint_record_pg).collect())
+    }
+
+    async fn save_blackboard_notebook(
+        &self,
+        notebook: &NotebookRecord,
+    ) -> Result<(), SessionError> {
+        sqlx::query(
+            r#"
+            INSERT INTO blackboard_notebooks (session_id, scope_key, updated_at, data)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (session_id, scope_key) DO UPDATE
+                SET updated_at = EXCLUDED.updated_at,
+                    data = EXCLUDED.data
+            "#,
+        )
+        .bind(&notebook.session_id)
+        .bind(&notebook.scope_key)
+        .bind(notebook.updated_at)
+        .bind(&notebook.data)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| SessionError::PersistenceError {
+            reason: format!("Failed to save blackboard notebook: {}", e),
+        })?;
+        Ok(())
+    }
+
+    async fn load_blackboard_notebooks(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<NotebookRecord>, SessionError> {
+        let rows = sqlx::query(
+            "SELECT * FROM blackboard_notebooks WHERE session_id = $1 ORDER BY scope_key ASC",
+        )
+        .bind(session_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| SessionError::PersistenceError {
+            reason: format!("Failed to load blackboard notebooks: {}", e),
+        })?;
+        Ok(rows.into_iter().map(row_to_notebook_record_pg).collect())
+    }
+
     async fn save_document(&self, document: &DocumentRecord) -> Result<(), SessionError> {
         sqlx::query(
             r#"
@@ -1541,6 +1719,28 @@ impl DatabasePersistence for PostgresDatabase {
             .map_err(|e| SessionError::PersistenceError {
                 reason: format!(
                     "Failed to delete durable_branches for document '{id}': {}",
+                    e
+                ),
+            })?;
+
+        sqlx::query("DELETE FROM durable_checkpoints WHERE session_id = $1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| SessionError::PersistenceError {
+                reason: format!(
+                    "Failed to delete durable_checkpoints for document '{id}': {}",
+                    e
+                ),
+            })?;
+
+        sqlx::query("DELETE FROM blackboard_notebooks WHERE session_id = $1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| SessionError::PersistenceError {
+                reason: format!(
+                    "Failed to delete blackboard_notebooks for document '{id}': {}",
                     e
                 ),
             })?;
@@ -1615,6 +1815,27 @@ fn row_to_api_key_pg(row: sqlx::postgres::PgRow) -> ApiKey {
         expires_at: row.get("expires_at"),
         active: row.get("active"),
         principal,
+    }
+}
+
+/// Map a `durable_checkpoints` row into a [`CheckpointRecord`] (PostgreSQL).
+fn row_to_checkpoint_record_pg(row: sqlx::postgres::PgRow) -> CheckpointRecord {
+    CheckpointRecord {
+        session_id: row.get("session_id"),
+        checkpoint_id: row.get("checkpoint_id"),
+        branch_id: row.get("branch_id"),
+        created_at: row.get("created_at"),
+        data: row.get("data"),
+    }
+}
+
+/// Map a `blackboard_notebooks` row into a [`NotebookRecord`] (PostgreSQL).
+fn row_to_notebook_record_pg(row: sqlx::postgres::PgRow) -> NotebookRecord {
+    NotebookRecord {
+        session_id: row.get("session_id"),
+        scope_key: row.get("scope_key"),
+        updated_at: row.get("updated_at"),
+        data: row.get("data"),
     }
 }
 
@@ -1864,6 +2085,45 @@ impl SqliteDatabase {
         .await
         .map_err(|e| SessionError::PersistenceError {
             reason: format!("Failed to create durable_branches table: {}", e),
+        })?;
+
+        // Durability: named checkpoints — SQLite twin of the PostgreSQL
+        // `durable_checkpoints` table above. Additive, idempotent.
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS durable_checkpoints (
+                session_id TEXT NOT NULL,
+                checkpoint_id TEXT NOT NULL,
+                branch_id TEXT NOT NULL,
+                created_at INTEGER NOT NULL DEFAULT 0,
+                data JSON NOT NULL,
+                PRIMARY KEY (session_id, checkpoint_id)
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| SessionError::PersistenceError {
+            reason: format!("Failed to create durable_checkpoints table: {}", e),
+        })?;
+
+        // Blackboard notebooks — SQLite twin of the PostgreSQL
+        // `blackboard_notebooks` table above. Additive, idempotent.
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS blackboard_notebooks (
+                session_id TEXT NOT NULL,
+                scope_key TEXT NOT NULL,
+                updated_at INTEGER NOT NULL DEFAULT 0,
+                data JSON NOT NULL,
+                PRIMARY KEY (session_id, scope_key)
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|e| SessionError::PersistenceError {
+            reason: format!("Failed to create blackboard_notebooks table: {}", e),
         })?;
 
         // Document registry ("Roshera has no New") — SQLite twin of the
@@ -2702,6 +2962,93 @@ impl DatabasePersistence for SqliteDatabase {
         Ok(rows.into_iter().map(sqlite_row_to_branch_record).collect())
     }
 
+    async fn save_checkpoint(&self, checkpoint: &CheckpointRecord) -> Result<(), SessionError> {
+        sqlx::query(
+            r#"
+            INSERT INTO durable_checkpoints (session_id, checkpoint_id, branch_id, created_at, data)
+            VALUES (?1, ?2, ?3, ?4, ?5)
+            ON CONFLICT (session_id, checkpoint_id) DO UPDATE
+                SET branch_id = excluded.branch_id,
+                    created_at = excluded.created_at,
+                    data = excluded.data
+            "#,
+        )
+        .bind(&checkpoint.session_id)
+        .bind(&checkpoint.checkpoint_id)
+        .bind(&checkpoint.branch_id)
+        .bind(checkpoint.created_at)
+        .bind(&checkpoint.data)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| SessionError::PersistenceError {
+            reason: format!("Failed to save checkpoint: {}", e),
+        })?;
+        Ok(())
+    }
+
+    async fn load_checkpoints(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<CheckpointRecord>, SessionError> {
+        let rows = sqlx::query(
+            "SELECT * FROM durable_checkpoints WHERE session_id = ?1 ORDER BY created_at ASC",
+        )
+        .bind(session_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| SessionError::PersistenceError {
+            reason: format!("Failed to load checkpoints: {}", e),
+        })?;
+        Ok(rows
+            .into_iter()
+            .map(sqlite_row_to_checkpoint_record)
+            .collect())
+    }
+
+    async fn save_blackboard_notebook(
+        &self,
+        notebook: &NotebookRecord,
+    ) -> Result<(), SessionError> {
+        sqlx::query(
+            r#"
+            INSERT INTO blackboard_notebooks (session_id, scope_key, updated_at, data)
+            VALUES (?1, ?2, ?3, ?4)
+            ON CONFLICT (session_id, scope_key) DO UPDATE
+                SET updated_at = excluded.updated_at,
+                    data = excluded.data
+            "#,
+        )
+        .bind(&notebook.session_id)
+        .bind(&notebook.scope_key)
+        .bind(notebook.updated_at)
+        .bind(&notebook.data)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| SessionError::PersistenceError {
+            reason: format!("Failed to save blackboard notebook: {}", e),
+        })?;
+        Ok(())
+    }
+
+    async fn load_blackboard_notebooks(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<NotebookRecord>, SessionError> {
+        let rows = sqlx::query(
+            "SELECT * FROM blackboard_notebooks WHERE session_id = ?1 ORDER BY scope_key ASC",
+        )
+        .bind(session_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| SessionError::PersistenceError {
+            reason: format!("Failed to load blackboard notebooks: {}", e),
+        })?;
+        Ok(rows
+            .into_iter()
+            .map(sqlite_row_to_notebook_record)
+            .collect())
+    }
+
     async fn save_document(&self, document: &DocumentRecord) -> Result<(), SessionError> {
         sqlx::query(
             r#"
@@ -2763,6 +3110,28 @@ impl DatabasePersistence for SqliteDatabase {
             .map_err(|e| SessionError::PersistenceError {
                 reason: format!(
                     "Failed to delete durable_branches for document '{id}': {}",
+                    e
+                ),
+            })?;
+
+        sqlx::query("DELETE FROM durable_checkpoints WHERE session_id = ?1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| SessionError::PersistenceError {
+                reason: format!(
+                    "Failed to delete durable_checkpoints for document '{id}': {}",
+                    e
+                ),
+            })?;
+
+        sqlx::query("DELETE FROM blackboard_notebooks WHERE session_id = ?1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| SessionError::PersistenceError {
+                reason: format!(
+                    "Failed to delete blackboard_notebooks for document '{id}': {}",
                     e
                 ),
             })?;
@@ -2846,6 +3215,27 @@ fn sqlite_row_to_branch_record(row: sqlx::sqlite::SqliteRow) -> BranchRecord {
         parent_branch_id: row.get("parent_branch_id"),
         fork_sequence: row.get("fork_sequence"),
         name: row.get("name"),
+        data: row.get("data"),
+    }
+}
+
+/// Map a `durable_checkpoints` row into a [`CheckpointRecord`] (SQLite).
+fn sqlite_row_to_checkpoint_record(row: sqlx::sqlite::SqliteRow) -> CheckpointRecord {
+    CheckpointRecord {
+        session_id: row.get("session_id"),
+        checkpoint_id: row.get("checkpoint_id"),
+        branch_id: row.get("branch_id"),
+        created_at: row.get("created_at"),
+        data: row.get("data"),
+    }
+}
+
+/// Map a `blackboard_notebooks` row into a [`NotebookRecord`] (SQLite).
+fn sqlite_row_to_notebook_record(row: sqlx::sqlite::SqliteRow) -> NotebookRecord {
+    NotebookRecord {
+        session_id: row.get("session_id"),
+        scope_key: row.get("scope_key"),
+        updated_at: row.get("updated_at"),
         data: row.get("data"),
     }
 }

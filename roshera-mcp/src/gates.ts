@@ -266,6 +266,20 @@ const LIVE_FACT_GATES = new Set<string>([
 const GENERIC_CHECKPOINT_NAME =
   /^(?:(?:step|op|operation|cut|feature|part|checkpoint|chkpt|cp|test|wip|tmp|temp|misc)[\s\-_#:.]*)?\d*$/i;
 
+/**
+ * A clock/date reading dressed as a name — "Checkpoint 9:59:36 PM",
+ * "10:05", "2026-08-01". The generic regex above PASSES these (its tail
+ * only accepts a plain ordinal), and the frontend's old ◈ button minted
+ * exactly this shape from the system clock, so this is a hole found in
+ * the field, not a theoretical one. A time or a date carries less than
+ * "step 3" — every timeline row already shows its timestamp. Mirrors
+ * `CLOCK_CHECKPOINT_NAME` in `roshera-app/src/lib/timeline-events.ts`
+ * and `handlers/timeline.rs` (keep the three in sync BY HAND — they
+ * live in different packages).
+ */
+const CLOCK_CHECKPOINT_NAME =
+  /^(?:(?:step|op|operation|checkpoint|chkpt|cp)[\s\-_#:.]*)?\d{1,4}([:\-/.]\d{1,2}){1,2}(\s*(am|pm))?$/i;
+
 // ─── Session state (this process IS the session; a reconnect starts clean) ──
 
 interface CachedRefusal {
@@ -538,7 +552,11 @@ export async function preDispatchGate(
   // 2. Intent gate: checkpoint quality, then checkpoint presence.
   if (tool === "timeline_checkpoint") {
     const name = typeof (args as any)?.name === "string" ? (args as any).name : "";
-    if (GENERIC_CHECKPOINT_NAME.test(name.trim())) {
+    const trimmed = name.trim();
+    if (
+      GENERIC_CHECKPOINT_NAME.test(trimmed) ||
+      CLOCK_CHECKPOINT_NAME.test(trimmed)
+    ) {
       return genericNameRefusal(name);
     }
     return null; // a real intent phrase — let the handler record it

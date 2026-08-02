@@ -78,7 +78,7 @@
 use crate::auth_middleware::AuthInfo;
 use crate::error_catalog::{ApiError, ErrorCode};
 use axum::{
-    body::Body,
+    body::{Body, Bytes},
     extract::{Request, State},
     http::{header, HeaderValue, Method, StatusCode},
     middleware::Next,
@@ -428,14 +428,34 @@ fn write_goosehints_policy_into_workspace(
 /// does not list `/api/acp/config`) — the path itself carries no secret,
 /// and a session against it is unusable without also clearing `/acp`'s own
 /// auth gate.
-pub(crate) async fn get_acp_config() -> Result<Json<serde_json::Value>, ApiError> {
+pub(crate) async fn get_acp_config(
+    axum::extract::State(state): axum::extract::State<crate::AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
     let dir = agent_workspace_dir().map_err(|e| {
         ApiError::new(
             ErrorCode::Internal,
             format!("failed to resolve the ACP workspace directory: {e}"),
         )
     })?;
-    Ok(Json(serde_json::json!({ "cwd": dir.to_string_lossy() })))
+    // The provider actually pinned for the agent surface — the SAME
+    // persisted fact `PUT /api/ai/provider` writes and the boot pin
+    // replays (`boot_provider_pin_for`), never a guess. `null` when
+    // nothing is persisted (boot `Default` pin): the client draws no
+    // vendor mark rather than a defaulted one, and that contract lives
+    // in `acp-client.ts`. Served here, alongside `cwd`, so the client's
+    // post-repin reestablish refreshes the mark from the one authority
+    // in the same round trip it already makes.
+    let active = state.ai_provider_manager.stored().await.map(|s| {
+        serde_json::json!({
+            "provider": s.provider,
+            "mode": s.mode,
+            "model": s.model,
+        })
+    });
+    Ok(Json(serde_json::json!({
+        "cwd": dir.to_string_lossy(),
+        "active": active,
+    })))
 }
 
 /// Disable one platform extension by config key, failing closed:
@@ -706,6 +726,7 @@ pub(crate) fn initialize(
 pub(crate) fn acp_router(
     auth_manager: Arc<session_manager::AuthManager>,
     ai_provider_manager: Arc<crate::ai_provider_config::AiProviderManager>,
+    acp_provider_epoch: Arc<crate::acp_provider_epoch::AcpProviderEpoch>,
 ) -> Option<axum::Router> {
     let root = GOOSE_ROOT.get()?;
     let server = std::sync::Arc::new(goose::acp::server_factory::AcpServer::new(
@@ -742,8 +763,114 @@ pub(crate) fn acp_router(
             ))
             .layer(axum::middleware::from_fn(
                 crate::agent_activity::observe_acp_transport,
-            )),
+            ))
+            // Outermost of the inner layers (still under `acp_gate` + auth
+            // at the merge site): a connection minted under a previous
+            // provider epoch is refused with the bare-404 reestablish
+            // signature BEFORE turn bookkeeping or MCP injection ever see
+            // the request — goose stores the provider on the session and
+            // restores it, so without this a repin left the open browser
+            // tab prompting the OLD provider indefinitely. See
+            // `acp_provider_epoch.rs` for the full contract, including the
+            // deliberate in-flight-turn choice.
+            .layer(axum::middleware::from_fn_with_state(
+                acp_provider_epoch,
+                crate::acp_provider_epoch::enforce_provider_epoch,
+            ))
+            // Outermost: inject `: keepalive` SSE comments into idle /acp
+            // streams. Applied after (outside) `observe_acp_transport` so
+            // its scanner reads the raw upstream bytes and never sees the
+            // injected comments. See [`acp_sse_keepalive`] for why silence
+            // must be distinguishable from death.
+            .layer(axum::middleware::from_fn(acp_sse_keepalive)),
     )
+}
+
+// ── SSE keepalive ──────────────────────────────────────────────────────
+
+/// Interval between `: keepalive` comment frames injected into an idle
+/// `/acp` SSE stream (comments are valid SSE that carry no event — every
+/// client parser skips them).
+///
+/// Why this exists (verified live 2026-08-02): the browser client cannot
+/// distinguish "the model is thinking" from "the api-server died" — both
+/// are byte-silence on the session stream, and a reverse proxy in front
+/// of this server (Vite's dev proxy, any production proxy) can hold the
+/// client-side socket open after the upstream vanishes, so the death is
+/// never signalled. A prompt turn in flight at that moment hung forever:
+/// its JSON-RPC response can only ever arrive on this stream, and the
+/// Blackboard's serial turn queue stayed blocked behind it until a page
+/// reload. With a keepalive every 10s, the client's inactivity watchdog
+/// (`acp-client.ts`, 45s threshold) can declare a truly-dead connection
+/// dead while never misfiring during long model turns.
+const ACP_SSE_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Middleware wrapping `/acp` GET responses: SSE bodies get keepalive
+/// comments injected whenever the upstream is idle for
+/// [`ACP_SSE_KEEPALIVE_INTERVAL`]; everything else (POST bodies, 404s
+/// from the epoch layer, non-SSE GETs) passes through untouched.
+pub(crate) async fn acp_sse_keepalive(req: Request, next: Next) -> Response {
+    let is_get = req.method() == Method::GET;
+    let response = next.run(req).await;
+    if !is_get {
+        return response;
+    }
+    let is_sse = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.starts_with("text/event-stream"));
+    if !is_sse {
+        return response;
+    }
+    let (parts, body) = response.into_parts();
+    let mut ticker = tokio::time::interval(ACP_SSE_KEEPALIVE_INTERVAL);
+    // Delay, not Burst: after a long stretch of upstream traffic (which
+    // resets the ticker anyway) we want the NEXT keepalive one interval
+    // later, never a catch-up burst of comment frames.
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    Response::from_parts(
+        parts,
+        Body::from_stream(KeepaliveStream {
+            inner: body.into_data_stream(),
+            ticker,
+        }),
+    )
+}
+
+/// Pass-through over an SSE body that yields a `: keepalive\n\n` comment
+/// frame whenever the upstream has been idle for one ticker interval.
+/// Upstream items (data and errors alike) are forwarded byte-identical
+/// and reset the ticker; upstream end ends this stream.
+struct KeepaliveStream {
+    inner: axum::body::BodyDataStream,
+    ticker: tokio::time::Interval,
+}
+
+impl futures::Stream for KeepaliveStream {
+    type Item = Result<Bytes, axum::Error>;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        use std::task::Poll;
+        let this = self.get_mut();
+        match std::pin::Pin::new(&mut this.inner).poll_next(cx) {
+            Poll::Ready(Some(item)) => {
+                this.ticker.reset();
+                Poll::Ready(Some(item))
+            }
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => match this.ticker.poll_tick(cx) {
+                // The first tick of a fresh interval completes immediately,
+                // so a just-opened stream emits one comment up front — which
+                // also flushes response headers through any buffering proxy.
+                Poll::Ready(_) => Poll::Ready(Some(Ok(Bytes::from_static(b": keepalive\n\n")))),
+                Poll::Pending => Poll::Pending,
+            },
+        }
+    }
 }
 
 /// Extension name Roshera's own MCP server is injected under. Every
@@ -1857,7 +1984,8 @@ mod tests {
         let expected =
             agent_workspace_dir().expect("agent_workspace_dir must resolve without an override");
 
-        let Json(body) = get_acp_config()
+        let state = crate::router_integration_tests::make_test_state().await;
+        let Json(body) = get_acp_config(axum::extract::State(state))
             .await
             .expect("GET /api/acp/config must succeed");
 
@@ -1868,6 +1996,48 @@ mod tests {
              agent_workspace_dir() (and therefore initialize()'s \
              .goosehints write) resolves — any divergence here means a \
              second, independent computation of this path has crept back in"
+        );
+        assert!(
+            body["active"].is_null(),
+            "no persisted provider config must serve active: null — the \
+             client draws no vendor mark for it, never a defaulted one"
+        );
+    }
+
+    /// `GET /api/acp/config` must serve the persisted provider pin — the
+    /// fact `acp-client.ts` refreshes its vendor mark from after a repin
+    /// forces it to reestablish. Failed before `active` was added to the
+    /// response: the client read `body.active?.provider` against a body
+    /// that only ever carried `cwd`, so the mark could never update (or
+    /// draw at all) without a full page reload.
+    #[tokio::test]
+    async fn acp_config_endpoint_serves_the_persisted_provider_pin() {
+        let state = crate::router_integration_tests::make_test_state().await;
+        state
+            .ai_provider_manager
+            .save(crate::ai_provider_config::StoredProviderConfig {
+                provider: "anthropic".to_string(),
+                mode: "subscription_cli".to_string(),
+                api_key: None,
+                profile_name: Some("default".to_string()),
+                model: Some("sonnet".to_string()),
+                model_verified: Some(false),
+                model_verification: None,
+                saved_at: chrono::Utc::now(),
+            })
+            .await
+            .expect("save must succeed");
+
+        let Json(body) = get_acp_config(axum::extract::State(state))
+            .await
+            .expect("GET /api/acp/config must succeed");
+
+        assert_eq!(body["active"]["provider"], "anthropic");
+        assert_eq!(body["active"]["mode"], "subscription_cli");
+        assert_eq!(body["active"]["model"], "sonnet");
+        assert!(
+            body["active"].get("api_key").is_none() && body["active"]["api_key"].is_null(),
+            "the config endpoint must never serve a credential"
         );
     }
 }

@@ -69,6 +69,19 @@ pub enum ErrorCode {
     UnknownShapeType,
     /// A request body could not be parsed as JSON / matched no schema.
     InvalidJson,
+    /// `POST /api/timeline/checkpoint` was given a name that names a
+    /// sequence position or a clock/date reading instead of a design
+    /// intent — "step 3", "cp 2", "checkpoint", a bare number, or
+    /// "Checkpoint 9:59:36 PM". A checkpoint is a declared intent; a
+    /// name that says only *when* or *where in the sequence* it was
+    /// made says nothing a timeline row doesn't already show. The REST
+    /// route is the floor beneath both the MCP intent gate
+    /// (`GENERIC_CHECKPOINT_NAME` in `roshera-mcp/src/gates.ts`) and
+    /// the frontend picker — all three refuse the same shapes. Mapped
+    /// to HTTP 422 (well-formed request, semantically unacceptable
+    /// value). Non-retryable with the same name; `details` carries the
+    /// rejected name.
+    CheckpointNameRejected,
 
     // ── Kernel surface ────────────────────────────────────────────
     /// The kernel rejected the operation (topology, tolerance, etc.).
@@ -293,6 +306,12 @@ impl ErrorCode {
             | ErrorCode::DocumentDeleteRefusedDefault => StatusCode::CONFLICT,
             ErrorCode::IdempotencyBodyTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
 
+            // Well-formed request, semantically unacceptable value —
+            // the canonical 422. Kept distinct from 400 so a client can
+            // tell "your JSON is malformed" from "your name carries no
+            // intent".
+            ErrorCode::CheckpointNameRejected => StatusCode::UNPROCESSABLE_ENTITY,
+
             ErrorCode::SolidNotFound
             | ErrorCode::PartNotFound
             | ErrorCode::TransactionNotFound
@@ -339,6 +358,7 @@ impl ErrorCode {
             | ErrorCode::InvalidParameter
             | ErrorCode::UnknownShapeType
             | ErrorCode::InvalidJson
+            | ErrorCode::CheckpointNameRejected
             | ErrorCode::BlendFailed
             | ErrorCode::BooleanDisjoint
             | ErrorCode::SolidNotFound
@@ -402,6 +422,7 @@ impl ErrorCode {
             ErrorCode::InvalidParameter => "invalid_parameter",
             ErrorCode::UnknownShapeType => "unknown_shape_type",
             ErrorCode::InvalidJson => "invalid_json",
+            ErrorCode::CheckpointNameRejected => "checkpoint_name_rejected",
             ErrorCode::KernelError => "kernel_error",
             ErrorCode::BlendFailed => "blend_failed",
             ErrorCode::BooleanDisjoint => "boolean_disjoint",
@@ -449,6 +470,7 @@ impl ErrorCode {
             ErrorCode::InvalidParameter,
             ErrorCode::UnknownShapeType,
             ErrorCode::InvalidJson,
+            ErrorCode::CheckpointNameRejected,
             ErrorCode::KernelError,
             ErrorCode::BlendFailed,
             ErrorCode::BooleanDisjoint,
@@ -589,6 +611,29 @@ impl ApiError {
             format!("missing required field '{field}'"),
         )
         .with_details(serde_json::json!({ "field": field }))
+    }
+
+    /// `POST /api/timeline/checkpoint` was given a name that is a
+    /// sequence position or a clock/date reading — named-nothing. The
+    /// message names the standard (a declared design intent), what was
+    /// received, and what a passing name looks like; `details` carries
+    /// the rejected name so clients need not parse prose.
+    pub fn checkpoint_name_rejected(name: &str) -> Self {
+        Self::new(
+            ErrorCode::CheckpointNameRejected,
+            format!(
+                "checkpoint name '{name}' names a sequence position or a \
+                 clock reading, not a design intent — the timeline row \
+                 already shows its own time and sequence, so this name \
+                 would add a row that says nothing"
+            ),
+        )
+        .with_hint(
+            "Name what a drawing would name: the feature, its governing \
+             dimensions, and where it sits — e.g. 'bolt circle 8 x D18 on \
+             D160 B.C.' or 'M8 clearance holes, close fit, 4x base corners'.",
+        )
+        .with_details(serde_json::json!({ "rejected_name": name }))
     }
 
     /// Kernel-side failure with the kernel's own error string attached.
@@ -1032,6 +1077,25 @@ mod tests {
         assert_eq!(v["details"]["operands"][0], 7);
         assert_eq!(v["details"]["operands"][1], 9);
         assert!(v["hint"].is_string());
+    }
+
+    /// Item: generic-checkpoint refusal is a TYPED 422, not a bare
+    /// status. Fails without the `CheckpointNameRejected` variant (the
+    /// constructor would not exist) and pins the wire contract the
+    /// frontend's `refusalMessage` and the MCP layer read: `error_code`,
+    /// `retryable:false`, a hint naming a passing example, and
+    /// `details.rejected_name`.
+    #[test]
+    fn checkpoint_name_rejected_is_typed_422_with_rejected_name() {
+        let e = ApiError::checkpoint_name_rejected("Checkpoint 9:59:36 PM");
+        assert_eq!(e.code, ErrorCode::CheckpointNameRejected);
+        assert_eq!(e.code.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(!e.retryable, "same name refuses identically");
+        let v = serde_json::to_value(&e).unwrap();
+        assert_eq!(v["success"], false);
+        assert_eq!(v["error_code"], "checkpoint_name_rejected");
+        assert_eq!(v["details"]["rejected_name"], "Checkpoint 9:59:36 PM");
+        assert!(v["hint"].as_str().unwrap().contains("bolt circle"));
     }
 
     #[test]

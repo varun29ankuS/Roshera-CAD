@@ -38,10 +38,13 @@
 //!     entries, so nothing written before scoping is lost.
 //!
 //! The store keys notebooks by the scope's canonical string
-//! (`part:<uuid>` / `assembly:<uuid>` / `document`), so the existing
+//! (`part:<solid_id>` / `assembly:<uuid>` / `document`), so the existing
 //! lock-free `DashMap<String, Arc<RwLock<Notebook>>>` concurrency model is
 //! unchanged — a write to one part's notebook never contends with a read of
-//! another's.
+//! another's. `<solid_id>` is the kernel's own integer `SolidId` — the
+//! CANONICAL storage key for a part, so the same notebook is reachable no
+//! matter which of the two id spaces a caller addresses it by (see
+//! [`BlackboardScope::Part`] and `resolve_scope_token`).
 //!
 //! # Concurrency
 //!
@@ -57,9 +60,12 @@ use axum::{
     response::Json,
 };
 use dashmap::DashMap;
+use geometry_engine::primitives::solid::SolidId;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use session_manager::{DatabasePersistence, NotebookRecord};
+use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
@@ -75,9 +81,27 @@ use uuid::Uuid;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum BlackboardScope {
-    /// A single part's notebook, keyed by the part's public UUID.
-    Part { id: Uuid },
-    /// An assembly's notebook (cross-part calcs), keyed by the assembly UUID.
+    /// A single part's notebook, keyed by the kernel's own `SolidId` (a
+    /// `u32`) — the SAME id `GET /api/agent/parts` and every other
+    /// part-addressing endpoint use. This is the CANONICAL storage id; a
+    /// caller may still address a part by its UUID alias (the frontend
+    /// scene/viewport store's id, registered via `register_id_mapping` for
+    /// WS/collab addressing) — `resolve_scope_token` translates that alias
+    /// to this `SolidId` before it ever reaches a `BlackboardScope`, so both
+    /// spellings land on the SAME notebook and this variant only ever holds
+    /// one canonical value per part.
+    ///
+    /// This field used to BE the `Uuid` directly, which is why part-scoped
+    /// notebooks never worked for an agent addressing a part by `SolidId`
+    /// (`part:8` demanded `Uuid::parse_str("8")`, which always failed) —
+    /// see `resolve_scope_token`'s doc for the live-measured proof that the
+    /// frontend's OWN selection uses the UUID alias, not the bare `SolidId`,
+    /// so both forms have to keep working, translated to one canonical key.
+    Part { id: SolidId },
+    /// An assembly's notebook (cross-part calcs), keyed by the assembly UUID
+    /// — assemblies genuinely ARE `Uuid`-keyed (`AssemblyManager::assemblies:
+    /// DashMap<Uuid, ...>` in `assembly_mgr.rs`), so this half of the
+    /// original design was correct and is unchanged.
     Assembly { id: Uuid },
     /// The document / session-wide notebook — the home for entries with no
     /// narrower owner and the migration target for legacy un-scoped entries.
@@ -97,9 +121,12 @@ impl BlackboardScope {
 
     /// Parse a scope from a loose wire token. Accepts, in order:
     ///   - `"document"` (any case) → [`BlackboardScope::Document`]
-    ///   - `"part:<uuid>"` / `"assembly:<uuid>"` (the canonical key form)
-    ///   - a bare `<uuid>` → [`BlackboardScope::Part`] (the common case: a
-    ///     caller that holds a part UUID and wants that part's notebook)
+    ///   - `"part:<solid_id>"` (the canonical key form; `<solid_id>` is the
+    ///     kernel's integer `SolidId`, e.g. `part:8`)
+    ///   - `"assembly:<uuid>"` (the canonical key form; assemblies really are
+    ///     UUID-keyed)
+    ///   - a bare `<solid_id>` → [`BlackboardScope::Part`] (the common case: a
+    ///     caller that holds a kernel part id and wants that part's notebook)
     ///
     /// Returns `None` for an unparseable token so the caller can reject it
     /// loudly rather than silently writing to the wrong notebook.
@@ -109,7 +136,9 @@ impl BlackboardScope {
             return Some(BlackboardScope::Document);
         }
         if let Some(rest) = t.strip_prefix("part:") {
-            return Uuid::parse_str(rest.trim())
+            return rest
+                .trim()
+                .parse::<SolidId>()
                 .ok()
                 .map(|id| BlackboardScope::Part { id });
         }
@@ -118,8 +147,9 @@ impl BlackboardScope {
                 .ok()
                 .map(|id| BlackboardScope::Assembly { id });
         }
-        // Bare UUID → a part scope (the most common caller intent).
-        Uuid::parse_str(t)
+        // Bare integer → a part scope (the most common caller intent: an
+        // agent or the frontend holding a kernel SolidId).
+        t.parse::<SolidId>()
             .ok()
             .map(|id| BlackboardScope::Part { id })
     }
@@ -141,10 +171,9 @@ impl BlackboardScope {
 /// `system`, including every line no agent had written. A kernel that
 /// cannot lie about geometry should not lie about who said something.
 ///
-/// ⚠ "stored" means in-memory only. `BlackboardManager` holds its
-/// notebooks in a `DashMap` and writes nothing to disk, so every line —
-/// the reasoning record this panel exists to keep — is lost on restart.
-/// That is a separate gap from authorship and is not fixed here.
+/// "Stored" was in-memory only when that count was taken; notebooks now
+/// write through to durable storage per (document, scope) and are
+/// hydrated back at boot — see [`BlackboardManager::attach_store`].
 ///
 /// Consumers must treat this as a THIRD state, not a flavour of agent:
 /// `System` is the machine talking about itself, `Agent` is a model's
@@ -213,6 +242,35 @@ pub enum BlackboardEvent {
 pub struct BlackboardSnapshot {
     pub lines: Vec<BlackboardLine>,
     pub events: Vec<BlackboardEvent>,
+}
+
+// ── Persisted form ──────────────────────────────────────────────────
+
+/// The durable form of one notebook: the FULL state — ordered lines,
+/// append-only event log, and the id counter. The counter is part of
+/// the state on purpose: dropping it across a restart would let a
+/// post-restart `add` in the same millisecond mint an id an existing
+/// line already holds. Serialized as one JSON blob into
+/// `blackboard_notebooks.data` (session-manager), whole-row upsert per
+/// write — the last write for a scope IS the notebook, so replay
+/// ordering never matters beyond channel FIFO.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedNotebook {
+    pub lines: Vec<BlackboardLine>,
+    pub events: Vec<BlackboardEvent>,
+    pub counter: u64,
+}
+
+/// One write-through job: the full state of a (document, scope)
+/// notebook at the moment a mutation completed. Sent over an unbounded
+/// channel so the mutating call NEVER blocks on a database write — the
+/// same sync-to-async bridge shape `TimelineRecorder` uses between the
+/// kernel and the timeline.
+#[derive(Debug, Clone)]
+pub struct NotebookWrite {
+    pub document_id: String,
+    pub scope_key: String,
+    pub state: PersistedNotebook,
 }
 
 // ── Notebook (in-memory state) ──────────────────────────────────────
@@ -322,6 +380,15 @@ impl Notebook {
         self.lines.clear();
         self.events.clear();
     }
+
+    /// The durable form of the current state (see [`PersistedNotebook`]).
+    fn persisted(&self) -> PersistedNotebook {
+        PersistedNotebook {
+            lines: self.lines.clone(),
+            events: self.events.clone(),
+            counter: self.counter,
+        }
+    }
 }
 
 /// Milliseconds since the Unix epoch, matching the frontend's `Date.now()`.
@@ -338,9 +405,25 @@ fn now_ms() -> u64 {
 /// each notebook is an `Arc<RwLock<Notebook>>` so a write to one part's
 /// notebook never contends with reads of another's. The map is keyed by
 /// [`BlackboardScope::key`] so every scope is fully isolated.
+///
+/// # Durability (write-through)
+///
+/// The in-memory map is the WORKING SET; every mutation also sends the
+/// notebook's full post-mutation state through `sink` (an unbounded
+/// channel drained by a background worker that upserts into
+/// `blackboard_notebooks` via session-manager — the same Postgres home
+/// the timeline persists to). The send is non-blocking by construction:
+/// a mutating call never waits on a database write, mirroring how
+/// `TimelineRecorder` bridges the kernel to async persistence. With no
+/// sink attached (unit tests, `ROSHERA_DURABILITY=off`) the manager
+/// behaves exactly as before — in-memory only.
 #[derive(Default)]
 pub struct BlackboardManager {
     notebooks: DashMap<String, Arc<RwLock<Notebook>>>,
+    /// Write-through sender, attached once at boot. `OnceLock` so a
+    /// repeat `attach_store` (document switch re-runs `boot_replay`)
+    /// never spawns a second worker.
+    sink: OnceLock<UnboundedSender<NotebookWrite>>,
 }
 
 /// Separator between a document id and a scope's canonical key inside the
@@ -352,6 +435,99 @@ const DOC_SEP: &str = "\u{1}";
 impl BlackboardManager {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Attach the durable store: spawns the write-through worker and
+    /// wires its sender as this manager's sink. Idempotent — the first
+    /// call wins; later calls (a document switch re-running
+    /// `boot_replay`) are no-ops, so exactly one worker ever drains the
+    /// channel.
+    pub fn attach_store(&self, database: Arc<dyn DatabasePersistence + Send + Sync>) {
+        self.sink
+            .get_or_init(|| spawn_notebook_persistence_worker(database));
+    }
+
+    /// Test seam: attach an arbitrary sender as the write-through sink,
+    /// so tests can observe exactly what would be persisted without a
+    /// database. Same first-call-wins semantics as [`Self::attach_store`].
+    pub fn attach_sink(&self, sender: UnboundedSender<NotebookWrite>) {
+        self.sink.get_or_init(|| sender);
+    }
+
+    /// Write-through: send the notebook's full post-mutation state to
+    /// the persistence worker. Non-blocking (unbounded channel). A send
+    /// failure means the worker is gone — named loudly, because from
+    /// that moment on lines survive only in memory.
+    fn write_through(&self, document_id: &str, scope_key: &str, state: PersistedNotebook) {
+        let Some(sink) = self.sink.get() else {
+            return; // no store attached (tests / durability off)
+        };
+        let write = NotebookWrite {
+            document_id: document_id.to_string(),
+            scope_key: scope_key.to_string(),
+            state,
+        };
+        if sink.send(write).is_err() {
+            tracing::error!(
+                target: "blackboard.durability",
+                document = document_id,
+                scope = scope_key,
+                "blackboard persistence worker is gone — this write (and every \
+                 later one) survives only in memory and will be lost on restart"
+            );
+        }
+    }
+
+    /// Rebuild this document's notebooks from persisted rows
+    /// (`(scope_key, data)` pairs). Only ABSENT entries are filled: the
+    /// in-memory working set always wins, because write-through means
+    /// anything already in memory is at least as new as the row. A row
+    /// that fails to deserialize is skipped loudly and LEFT IN PLACE in
+    /// the database — a wrong-shape row is a bug report, not something
+    /// to destroy. Returns how many notebooks were restored.
+    pub fn hydrate(&self, document_id: &str, rows: Vec<(String, serde_json::Value)>) -> usize {
+        let mut restored = 0usize;
+        for (scope_key, data) in rows {
+            let state: PersistedNotebook = match serde_json::from_value(data) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!(
+                        target: "blackboard.durability",
+                        document = document_id,
+                        scope = %scope_key,
+                        error = %e,
+                        "blackboard: persisted notebook row could not be \
+                         deserialized — skipping it (the row is left in place)"
+                    );
+                    continue;
+                }
+            };
+            let key = format!("{document_id}{DOC_SEP}{scope_key}");
+            let lines = state.lines.len();
+            match self.notebooks.entry(key) {
+                dashmap::mapref::entry::Entry::Occupied(_) => {
+                    // The working set already has this notebook — it is
+                    // at least as new as the persisted row (every
+                    // mutation writes through), so keep it.
+                }
+                dashmap::mapref::entry::Entry::Vacant(v) => {
+                    v.insert(Arc::new(RwLock::new(Notebook {
+                        lines: state.lines,
+                        events: state.events,
+                        counter: state.counter,
+                    })));
+                    restored += 1;
+                    tracing::info!(
+                        target: "blackboard.durability",
+                        document = document_id,
+                        scope = %scope_key,
+                        lines,
+                        "blackboard: notebook restored from durable storage"
+                    );
+                }
+            }
+        }
+        restored
     }
 
     /// The storage key for a scope WITHIN a document: every notebook is
@@ -390,10 +566,13 @@ impl BlackboardManager {
         text: String,
         author: LineAuthor,
     ) -> BlackboardLine {
-        self.notebook(document_id, scope)
-            .write()
-            .await
-            .add(line_id, text, author)
+        let handle = self.notebook(document_id, scope);
+        let mut nb = handle.write().await;
+        let line = nb.add(line_id, text, author);
+        let state = nb.persisted();
+        drop(nb);
+        self.write_through(document_id, &scope.key(), state);
+        line
     }
 
     /// Edit a line within a document's scope. `None` if the line id is
@@ -405,10 +584,13 @@ impl BlackboardManager {
         line_id: &str,
         text: String,
     ) -> Option<BlackboardLine> {
-        self.notebook(document_id, scope)
-            .write()
-            .await
-            .edit(line_id, text)
+        let handle = self.notebook(document_id, scope);
+        let mut nb = handle.write().await;
+        let line = nb.edit(line_id, text)?;
+        let state = nb.persisted();
+        drop(nb);
+        self.write_through(document_id, &scope.key(), state);
+        Some(line)
     }
 
     /// Delete a line within a document's scope. `None` if the line id is
@@ -419,23 +601,35 @@ impl BlackboardManager {
         scope: &BlackboardScope,
         line_id: &str,
     ) -> Option<BlackboardLine> {
-        self.notebook(document_id, scope)
-            .write()
-            .await
-            .delete(line_id)
+        let handle = self.notebook(document_id, scope);
+        let mut nb = handle.write().await;
+        let line = nb.delete(line_id)?;
+        let state = nb.persisted();
+        drop(nb);
+        self.write_through(document_id, &scope.key(), state);
+        Some(line)
     }
 
-    /// Clear one document's scope notebook (lines + events).
+    /// Clear one document's scope notebook (lines + events). The empty
+    /// state is written through too — a cleared board that resurrects
+    /// its old lines on restart would be a different kind of data loss.
     pub async fn clear(&self, document_id: &str, scope: &BlackboardScope) {
-        self.notebook(document_id, scope).write().await.clear();
+        let handle = self.notebook(document_id, scope);
+        let mut nb = handle.write().await;
+        nb.clear();
+        let state = nb.persisted();
+        drop(nb);
+        self.write_through(document_id, &scope.key(), state);
     }
 
     /// Drop every notebook belonging to one document, across every scope
     /// (`Document`, every `Part`, every `Assembly`). Called by `DELETE
-    /// /api/documents/{id}` after the durable delete commits. The
-    /// Blackboard has no separate durability log — this in-memory removal
-    /// IS the deletion for it, so there is nothing here that can partially
-    /// fail or need rollback.
+    /// /api/documents/{id}` after the durable delete commits — the
+    /// document's `blackboard_notebooks` rows are removed inside
+    /// `delete_document`'s own transaction (session-manager), so this
+    /// in-memory removal only has to mirror a delete that already
+    /// durably happened; nothing here can partially fail or need
+    /// rollback.
     pub fn purge_document(&self, document_id: &str) {
         let prefix = format!("{document_id}{DOC_SEP}");
         self.notebooks.retain(|k, _| !k.starts_with(&prefix));
@@ -452,15 +646,17 @@ impl BlackboardManager {
             .contains_key(&Self::storage_key(document_id, scope))
     }
 
-    /// Notebook handles belonging to one document, regardless of scope.
-    /// Snapshots the handles first so callers never hold a DashMap shard
-    /// guard across an `.await` on the per-notebook `RwLock`.
-    fn handles_for_document(&self, document_id: &str) -> Vec<Arc<RwLock<Notebook>>> {
+    /// Notebook handles belonging to one document, regardless of scope,
+    /// each paired with its scope's canonical key (the storage key with
+    /// the document prefix stripped). Snapshots the handles first so
+    /// callers never hold a DashMap shard guard across an `.await` on
+    /// the per-notebook `RwLock`.
+    fn handles_for_document(&self, document_id: &str) -> Vec<(String, Arc<RwLock<Notebook>>)> {
         let prefix = format!("{document_id}{DOC_SEP}");
         self.notebooks
             .iter()
             .filter(|e| e.key().starts_with(&prefix))
-            .map(|e| e.value().clone())
+            .map(|e| (e.key()[prefix.len()..].to_string(), e.value().clone()))
             .collect()
     }
 
@@ -478,8 +674,12 @@ impl BlackboardManager {
         line_id: &str,
         text: String,
     ) -> Option<BlackboardLine> {
-        for nb in self.handles_for_document(document_id) {
-            if let Some(line) = nb.write().await.edit(line_id, text.clone()) {
+        for (scope_key, nb) in self.handles_for_document(document_id) {
+            let mut guard = nb.write().await;
+            if let Some(line) = guard.edit(line_id, text.clone()) {
+                let state = guard.persisted();
+                drop(guard);
+                self.write_through(document_id, &scope_key, state);
                 return Some(line);
             }
         }
@@ -495,13 +695,76 @@ impl BlackboardManager {
         document_id: &str,
         line_id: &str,
     ) -> Option<BlackboardLine> {
-        for nb in self.handles_for_document(document_id) {
-            if let Some(line) = nb.write().await.delete(line_id) {
+        for (scope_key, nb) in self.handles_for_document(document_id) {
+            let mut guard = nb.write().await;
+            if let Some(line) = guard.delete(line_id) {
+                let state = guard.persisted();
+                drop(guard);
+                self.write_through(document_id, &scope_key, state);
                 return Some(line);
             }
         }
         None
     }
+}
+
+// ── Persistence worker ──────────────────────────────────────────────
+
+/// Spawn the write-through worker: drains [`NotebookWrite`] jobs in FIFO
+/// order and upserts each into `blackboard_notebooks` through
+/// session-manager — the same durable home the timeline's event log
+/// lives in. One row per (document, scope), whole-state upsert, so the
+/// last processed write for a scope is exactly the notebook. A failed
+/// upsert is named loudly with the document, scope, and consequence;
+/// the worker keeps draining (one bad write must not dam every later
+/// one).
+pub fn spawn_notebook_persistence_worker(
+    database: Arc<dyn DatabasePersistence + Send + Sync>,
+) -> UnboundedSender<NotebookWrite> {
+    let (tx, mut rx) = unbounded_channel::<NotebookWrite>();
+    tokio::spawn(async move {
+        while let Some(write) = rx.recv().await {
+            let data = match serde_json::to_value(&write.state) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::error!(
+                        target: "blackboard.durability",
+                        document = %write.document_id,
+                        scope = %write.scope_key,
+                        error = %e,
+                        "blackboard: notebook state could not be serialized — \
+                         this write is NOT persisted and will not survive a restart"
+                    );
+                    continue;
+                }
+            };
+            let record = NotebookRecord {
+                session_id: write.document_id.clone(),
+                scope_key: write.scope_key.clone(),
+                updated_at: now_ms() as i64,
+                data,
+            };
+            if let Err(e) = database.save_blackboard_notebook(&record).await {
+                tracing::error!(
+                    target: "blackboard.durability",
+                    document = %write.document_id,
+                    scope = %write.scope_key,
+                    lines = write.state.lines.len(),
+                    error = %e,
+                    "blackboard: durable write failed — the notebook's latest \
+                     state ({} lines) survives only in memory until the next \
+                     successful write",
+                    write.state.lines.len()
+                );
+            }
+        }
+        tracing::warn!(
+            target: "blackboard.durability",
+            "blackboard persistence worker stopped: every manager sender was \
+             dropped — no further notebook writes will be persisted"
+        );
+    });
+    tx
 }
 
 // ── Request / response bodies ───────────────────────────────────────
@@ -519,15 +782,18 @@ pub struct AddEntryRequest {
     /// edit / delete. Omitted by agents / raw REST → server-generated id.
     #[serde(default)]
     pub id: Option<String>,
-    /// Owning scope token (see [`BlackboardScope::parse`]). The frontend
-    /// sends the selected part's `part:<uuid>`; an agent sends a part UUID or
-    /// integer kernel `part_id`. Omitted → the [`BlackboardScope::Document`]
-    /// notebook, so an un-scoped POST keeps working (migration default).
+    /// Owning scope token — see [`resolve_scope_token`] for the full
+    /// resolution rules. The frontend sends the selected part's
+    /// `part:<uuid>` (the scene/viewport's id alias); an agent sends the
+    /// kernel's own integer `part_id` — both spellings resolve to the SAME
+    /// notebook. Omitted → the [`BlackboardScope::Document`] notebook, so an
+    /// un-scoped POST keeps working (migration default).
     #[serde(default)]
     pub scope: Option<String>,
     /// Convenience alias for a part scope — `part_id` is the field name the
-    /// MCP tools and `/api/agent/parts/{id}` already speak. Accepts a part
-    /// UUID or an integer kernel `SolidId`. Ignored when `scope` is present.
+    /// MCP tools and `/api/agent/parts/{id}` already speak. Accepts either a
+    /// kernel `SolidId` or a part UUID alias (see [`resolve_scope_token`]).
+    /// Ignored when `scope` is present.
     #[serde(default)]
     pub part_id: Option<String>,
 }
@@ -542,8 +808,9 @@ pub struct EditEntryRequest {
 }
 
 /// Query params for the scope-filtered GET / mutate routes. Either `scope`
-/// (a full token) or `part_id` (a part UUID / integer SolidId convenience)
-/// selects the notebook; both omitted → the Document notebook.
+/// (a full token) or `part_id` (a kernel `SolidId` or part UUID convenience —
+/// see [`resolve_scope_token`]) selects the notebook; both omitted → the
+/// Document notebook.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ScopeQuery {
     #[serde(default)]
@@ -568,30 +835,47 @@ fn bad_scope(token: &str) -> ApiError {
         format!("unrecognised blackboard scope '{token}'"),
     )
     .with_hint(
-        "Use 'document', 'part:<uuid>', 'assembly:<uuid>', a bare part UUID, \
-         or an integer kernel part_id.",
+        "Use 'document', 'part:<solid_id>', 'part:<uuid>', 'assembly:<uuid>', \
+         a bare integer kernel part_id, or a bare part UUID.",
     )
 }
 
-/// Resolve a wire token to a [`BlackboardScope`], translating an integer
-/// kernel `SolidId` to its public part UUID via the id mapping so the agent
-/// (which addresses parts by `SolidId`) and the frontend (which holds the
-/// UUID) land on the SAME notebook. Returns `None` only for a syntactically
-/// valid-but-unknown SolidId; `Err(token)` for an unparseable token.
+/// Resolve a wire token to a [`BlackboardScope`]. A part is addressable by
+/// EITHER of two id spaces that both name the same underlying solid:
+///   - the kernel's own `SolidId` (what `GET /api/agent/parts` and the MCP
+///     tools use) — handled by [`BlackboardScope::parse`] with no lookup.
+///   - a UUID alias (what the frontend's scene/viewport store holds — see
+///     `register_id_mapping` / `create_uuid_for_local` in `main.rs`, used
+///     for WS/collab addressing) — translated here via [`AppState::get_local_id`]
+///     so both spellings land on the SAME notebook, keyed by the canonical
+///     `SolidId`.
+/// Measured live (2026-08-02): the running frontend's part selection sends
+/// exactly this UUID form (`part:dc6e2058-...`), not the numeric id — a
+/// version of this resolver that only accepted `SolidId` parsed the agent's
+/// `part:8` but 400'd on every real browser selection. Returns a 400 for a
+/// token that is neither a valid `SolidId`/`Uuid` shape nor a UUID that
+/// resolves to a live part, rather than silently landing on some other
+/// notebook.
 fn resolve_scope_token(state: &AppState, token: &str) -> Result<BlackboardScope, ApiError> {
     let t = token.trim();
-    // Bare integer → a kernel SolidId the agent holds; map it to the part UUID.
-    if let Ok(solid_id) = t.parse::<u32>() {
-        return match state.get_uuid(solid_id) {
-            Some(uuid) => Ok(BlackboardScope::Part { id: uuid }),
-            None => Err(ApiError::new(
-                ErrorCode::InvalidParameter,
-                format!("no part registered for kernel part_id {solid_id}"),
-            )
-            .with_hint("Call GET /api/agent/parts to list current part ids.")),
-        };
+    if let Some(scope) = BlackboardScope::parse(t) {
+        return Ok(scope);
     }
-    BlackboardScope::parse(t).ok_or_else(|| bad_scope(t))
+    if t.strip_prefix("assembly:").is_some() {
+        // A well-formed assembly token whose uuid failed to parse — an
+        // assembly id space error, not a part-uuid fallback candidate.
+        return Err(bad_scope(t));
+    }
+    let uuid_str = t.strip_prefix("part:").unwrap_or(t).trim();
+    let uuid = Uuid::parse_str(uuid_str).map_err(|_| bad_scope(t))?;
+    match state.get_local_id(&uuid) {
+        Some(id) => Ok(BlackboardScope::Part { id }),
+        None => Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            format!("no part registered for uuid {uuid}"),
+        )
+        .with_hint("Call GET /api/agent/parts to list current part ids.")),
+    }
 }
 
 /// Resolve the scope a request targets from an optional `scope` token, an
@@ -615,9 +899,9 @@ fn resolve_scope(
 
 /// `GET /api/blackboard` — the document for a scope (lines + event log).
 ///
-/// `?scope=part:<uuid>` / `?part_id=<uuid|solid_id>` selects a part's (or
-/// assembly's) notebook; no query → the Document notebook, so an un-scoped
-/// GET keeps returning the document-wide notes (backward compatible).
+/// `?scope=part:<solid_id|uuid>` / `?part_id=<solid_id|uuid>` selects a
+/// part's (or assembly's) notebook; no query → the Document notebook, so an
+/// un-scoped GET keeps returning the document-wide notes (backward compatible).
 pub async fn get_blackboard(
     State(state): State<AppState>,
     Query(q): Query<ScopeQuery>,
@@ -729,9 +1013,7 @@ mod tests {
     const D: &str = "doc-under-test";
 
     fn part_scope() -> BlackboardScope {
-        BlackboardScope::Part {
-            id: Uuid::from_u128(0x1111),
-        }
+        BlackboardScope::Part { id: 0x1111 }
     }
 
     /// `System` must survive the wire in BOTH directions as its own value.
@@ -914,12 +1196,8 @@ mod tests {
     #[tokio::test]
     async fn notebooks_are_independent() {
         let mgr = BlackboardManager::new();
-        let a = BlackboardScope::Part {
-            id: Uuid::from_u128(0xa),
-        };
-        let b = BlackboardScope::Part {
-            id: Uuid::from_u128(0xb),
-        };
+        let a = BlackboardScope::Part { id: 0xa };
+        let b = BlackboardScope::Part { id: 0xb };
         mgr.add(D, &a, None, "a".into(), LineAuthor::User).await;
         let snap_b = mgr.snapshot(D, &b).await;
         assert!(snap_b.lines.is_empty(), "distinct notebooks share no state");
@@ -932,12 +1210,8 @@ mod tests {
         // THE isolation proof at the store level: a calc on part A and a
         // different calc on part B never cross-contaminate.
         let mgr = BlackboardManager::new();
-        let part_a = BlackboardScope::Part {
-            id: Uuid::from_u128(0xAAAA),
-        };
-        let part_b = BlackboardScope::Part {
-            id: Uuid::from_u128(0xBBBB),
-        };
+        let part_a = BlackboardScope::Part { id: 0xAAAA };
+        let part_b = BlackboardScope::Part { id: 0xBBBB };
 
         mgr.add(
             D,
@@ -985,9 +1259,7 @@ mod tests {
     async fn clearing_one_scope_leaves_others_intact() {
         let mgr = BlackboardManager::new();
         let part_a = part_scope();
-        let part_b = BlackboardScope::Part {
-            id: Uuid::from_u128(0x2222),
-        };
+        let part_b = BlackboardScope::Part { id: 0x2222 };
         mgr.add(D, &part_a, None, "a".into(), LineAuthor::Agent)
             .await;
         mgr.add(D, &part_b, None, "b".into(), LineAuthor::Agent)
@@ -1050,32 +1322,146 @@ mod tests {
         assert_eq!(snap_a.lines[0].text, "only in A");
     }
 
+    /// Item 5 (2026-08-01 audit: 38 lines became 0 across a restart).
+    /// Every mutation must write the notebook's full state through the
+    /// sink, and a fresh manager hydrated from the LAST write must
+    /// serve the identical document — lines, event log, and id counter.
+    /// Fails without the write-through (no jobs arrive) and without
+    /// `hydrate` (the restarted manager is empty).
+    #[tokio::test]
+    async fn notebook_survives_a_restart_via_write_through_and_hydrate() {
+        let mgr = BlackboardManager::new();
+        let (tx, mut rx) = unbounded_channel();
+        mgr.attach_sink(tx);
+
+        let a = mgr
+            .add(
+                D,
+                &DOC,
+                None,
+                "σ = F/A = 12.7 MPa".into(),
+                LineAuthor::Agent,
+            )
+            .await;
+        mgr.add(D, &DOC, None, "FoS 3.2 vs yield".into(), LineAuthor::User)
+            .await;
+        mgr.edit(D, &DOC, &a.id, "σ = F/A = 12.9 MPa (corrected area)".into())
+            .await
+            .expect("edit known id");
+        let live = mgr.snapshot(D, &DOC).await;
+
+        // Drain the sink: FIFO, last write per scope IS the notebook.
+        let mut last = None;
+        while let Ok(w) = rx.try_recv() {
+            last = Some(w);
+        }
+        let w = last.expect("mutations must write through to the sink");
+        assert_eq!(w.document_id, D);
+        assert_eq!(w.scope_key, DOC.key());
+        assert_eq!(w.state.counter, 2, "id counter is part of durable state");
+
+        // "Restart": a fresh manager hydrated from the persisted row.
+        let fresh = BlackboardManager::new();
+        let restored = fresh.hydrate(
+            D,
+            vec![(
+                w.scope_key.clone(),
+                serde_json::to_value(&w.state).expect("serializes"),
+            )],
+        );
+        assert_eq!(restored, 1);
+
+        let back = fresh.snapshot(D, &DOC).await;
+        assert_eq!(back.lines.len(), live.lines.len());
+        assert_eq!(back.events.len(), live.events.len());
+        assert_eq!(back.lines[0].text, "σ = F/A = 12.9 MPa (corrected area)");
+        assert_eq!(back.lines[0].author, LineAuthor::Agent);
+        assert_eq!(back.lines[0].id, a.id, "line ids survive the restart");
+    }
+
+    /// Hydration never clobbers the working set: an in-memory notebook
+    /// (necessarily at least as new, because every mutation writes
+    /// through) wins over the persisted row.
+    #[tokio::test]
+    async fn hydrate_fills_absent_notebooks_only() {
+        let mgr = BlackboardManager::new();
+        mgr.add(D, &DOC, None, "live line".into(), LineAuthor::User)
+            .await;
+        let stale = PersistedNotebook {
+            lines: vec![],
+            events: vec![],
+            counter: 0,
+        };
+        let restored = mgr.hydrate(
+            D,
+            vec![(DOC.key(), serde_json::to_value(&stale).expect("serializes"))],
+        );
+        assert_eq!(restored, 0, "occupied entry must not be overwritten");
+        assert_eq!(mgr.snapshot(D, &DOC).await.lines.len(), 1);
+    }
+
     #[test]
     fn scope_key_is_canonical_and_round_trips() {
-        let id = Uuid::from_u128(0x1234);
+        let part_id: SolidId = 1234;
+        let assembly_id = Uuid::from_u128(0x1234);
         assert_eq!(BlackboardScope::Document.key(), "document");
-        assert_eq!(BlackboardScope::Part { id }.key(), format!("part:{id}"));
         assert_eq!(
-            BlackboardScope::Assembly { id }.key(),
-            format!("assembly:{id}")
+            BlackboardScope::Part { id: part_id }.key(),
+            format!("part:{part_id}")
+        );
+        assert_eq!(
+            BlackboardScope::Assembly { id: assembly_id }.key(),
+            format!("assembly:{assembly_id}")
         );
 
-        // parse() accepts the canonical key, a bare uuid (→ part), and
-        // 'document'; the bare-uuid path is the migration-friendly common case.
+        // parse() accepts the canonical key, a bare integer (→ part), and
+        // 'document'; the bare-integer path is the common caller intent (an
+        // agent or the frontend holding a kernel SolidId).
         assert_eq!(
-            BlackboardScope::parse(&format!("part:{id}")),
-            Some(BlackboardScope::Part { id })
+            BlackboardScope::parse(&format!("part:{part_id}")),
+            Some(BlackboardScope::Part { id: part_id })
         );
         assert_eq!(
-            BlackboardScope::parse(&id.to_string()),
-            Some(BlackboardScope::Part { id }),
-            "a bare uuid is a part scope"
+            BlackboardScope::parse(&part_id.to_string()),
+            Some(BlackboardScope::Part { id: part_id }),
+            "a bare integer is a part scope"
+        );
+        assert_eq!(
+            BlackboardScope::parse(&format!("assembly:{assembly_id}")),
+            Some(BlackboardScope::Assembly { id: assembly_id }),
+            "assemblies really are UUID-keyed — unlike Part, this is unchanged"
         );
         assert_eq!(
             BlackboardScope::parse("document"),
             Some(BlackboardScope::Document)
         );
         assert_eq!(BlackboardScope::parse("not-a-scope"), None);
+    }
+
+    /// THE regression this fix closes. Measured live against the running
+    /// server (2026-08-01): `GET /api/agent/parts` returns a real part whose
+    /// id is the numeric kernel `SolidId` `8` — never a UUID — yet
+    /// `GET /api/blackboard?scope=part:8` returned HTTP 400, because `parse`
+    /// used to demand `Uuid::parse_str` after `part:`. Every real part's
+    /// notebook was therefore unaddressable; this is not "lost on switch",
+    /// it never worked. Fails on the old code (`Uuid::parse_str("8")` errors
+    /// → `None` → 400) and passes with the fix.
+    #[test]
+    fn a_real_kernel_part_id_parses_as_a_part_scope() {
+        assert_eq!(
+            BlackboardScope::parse("part:8"),
+            Some(BlackboardScope::Part { id: 8 }),
+            "the kernel's actual SolidId shape must resolve to a notebook"
+        );
+        // A genuinely malformed token must still be refused loudly rather
+        // than silently landing on some other notebook.
+        assert_eq!(BlackboardScope::parse("part:not-an-id"), None);
+        assert_eq!(BlackboardScope::parse("part:"), None);
+        assert_eq!(
+            BlackboardScope::parse("part:-1"),
+            None,
+            "SolidId is unsigned"
+        );
     }
 
     #[test]

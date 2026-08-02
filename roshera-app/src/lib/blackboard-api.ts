@@ -29,12 +29,17 @@
  * verbatim on add, so subsequent edit/delete address the same row on both
  * sides. Polled snapshots are reconciled by id, so ids stay consistent.
  *
- * # Offline fallback
+ * # Failure handling
  *
- * Every backend call falls back to `localStorage` on failure and never throws
- * into a reducer (`save` is fire-and-forget by contract). If the backend is
- * unreachable at install time, hydration is skipped and the store keeps its
- * `localStorage`-seeded state, so the panel still works offline.
+ * `save` is fire-and-forget by contract and never throws into a reducer.
+ * A failed backend write is NOT dropped: it stays in a per-scope outbox,
+ * retried on the next save and on every poll tick, and the poll's
+ * reconciliation re-applies pending writes (and the currently-streaming
+ * line) on top of the server snapshot so a repaint can never erase a line
+ * the backend hasn't confirmed yet. localStorage additionally mirrors every
+ * snapshot; if the backend is unreachable at install time, hydration is
+ * skipped and the store keeps its `localStorage`-seeded state, so the panel
+ * still works offline.
  */
 
 import {
@@ -190,57 +195,128 @@ function findLine(snapshot: BlackboardSnapshot, id: string): BlackboardLine | un
   return snapshot.lines.find((l) => l.id === id)
 }
 
+// ─── Pending-write outbox ────────────────────────────────────────────
+//
+// A backend write can fail transiently — verified live 2026-08-02: with
+// several tabs open, the POST persisting the agent's line 429'd on the
+// shared rate budget. The old code swallowed that (localStorage only) while
+// STILL advancing the baseline, so the write was never retried — and the
+// next poll repainted the store from a backend that had never seen the
+// line. The agent's reply vanished from the board without a trace: a
+// completed turn erased by its own persistence layer.
+//
+// Every failed (or not-yet-attempted) write now lands in a per-scope FIFO
+// outbox, flushed in order on the next save and on every poll tick (a
+// bounded retry cadence, never a loop), and `applyRemoteSnapshot` re-applies
+// whatever is still pending on top of the server snapshot instead of letting
+// the repaint clobber it. Nothing is dropped; nothing needs a reload.
+
+type PendingOp =
+  | { kind: 'add'; lineId: string; line: BlackboardLine }
+  | { kind: 'edit'; lineId: string; after: string }
+  | { kind: 'delete'; lineId: string }
+  | { kind: 'clear' }
+
+const outbox = new Map<BlackboardScope, PendingOp[]>()
+
+function pendingOps(scope: BlackboardScope): PendingOp[] {
+  let ops = outbox.get(scope)
+  if (!ops) {
+    ops = []
+    outbox.set(scope, ops)
+  }
+  return ops
+}
+
+async function sendOp(scope: BlackboardScope, op: PendingOp): Promise<void> {
+  switch (op.kind) {
+    case 'add': {
+      // Prefer the freshest local text — the line may have streamed or been
+      // edited since the failed attempt captured it.
+      const current = useBlackboardStore.getState().lines.find((l) => l.id === op.lineId)
+      await postEntry(scope, current ?? op.line)
+      break
+    }
+    case 'edit':
+      await patchEntry(scope, op.lineId, op.after)
+      break
+    case 'delete':
+      await deleteEntry(scope, op.lineId)
+      break
+    case 'clear':
+      await clearBackend(scope)
+      break
+  }
+}
+
+/** One in-flight flush per scope — a poll tick and a save arriving together
+ *  share it rather than double-sending the head op. */
+const flushInFlight = new Map<BlackboardScope, Promise<void>>()
+
+/** Flush queued ops in FIFO order, stopping at the first failure. The
+ *  remainder stays queued for the next save or poll tick — retry cadence is
+ *  bounded by those triggers, never a spin loop. */
+function flushOutbox(scope: BlackboardScope): Promise<void> {
+  const existing = flushInFlight.get(scope)
+  if (existing) return existing
+  const run = (async () => {
+    const ops = pendingOps(scope)
+    while (ops.length > 0) {
+      try {
+        await sendOp(scope, ops[0])
+      } catch {
+        return
+      }
+      ops.shift()
+    }
+  })().finally(() => {
+    flushInFlight.delete(scope)
+  })
+  flushInFlight.set(scope, run)
+  return run
+}
+
 /**
- * Translate the single delta between `scope`'s baseline and `next` into one
- * REST call against that scope's notebook. Best-effort: any failure falls back
- * to a full-snapshot localStorage save so the session is never lost.
+ * Translate the delta between `scope`'s baseline and `next` into REST ops,
+ * enqueue them, and flush. A failure leaves the tail queued (see the outbox
+ * doc above) — it is never silently dropped, and the caller's localStorage
+ * mirror (written in `save`) still guarantees the session survives offline.
  */
 async function persistDelta(scope: BlackboardScope, next: BlackboardSnapshot): Promise<void> {
   const prev = baseline(scope)
+  const ops = pendingOps(scope)
   // clearBoard resets events to empty (and lines to empty).
   if (next.events.length === 0 && prev.events.length > 0) {
-    try {
-      await clearBackend(scope)
-      return
-    } catch {
-      saveLocal(scope, next)
+    // A clear supersedes every queued write for this scope.
+    ops.length = 0
+    ops.push({ kind: 'clear' })
+  } else {
+    // Append-only log: any new event sits at the tail. We only ever apply one
+    // reducer between saves, so a single new event is the common case; if the
+    // log advanced by more than one (e.g. a streamed sequence), replay the tail.
+    const newEvents: BlackboardEvent[] = next.events.slice(prev.events.length)
+    if (newEvents.length === 0 && ops.length === 0) {
+      // No log change (e.g. `setLineText` streaming chunk, which does not
+      // log) and nothing pending — nothing to send.
       return
     }
-  }
-
-  // Append-only log: any new event sits at the tail. We only ever apply one
-  // reducer between saves, so a single new event is the common case; if the
-  // log advanced by more than one (e.g. a streamed sequence), replay the tail.
-  const newEvents: BlackboardEvent[] = next.events.slice(prev.events.length)
-  if (newEvents.length === 0) {
-    // No log change (e.g. `setLineText` streaming chunk, which does not log) —
-    // mirror to localStorage but don't spam the backend.
-    saveLocal(scope, next)
-    return
-  }
-
-  try {
     for (const ev of newEvents) {
       switch (ev.kind) {
         case 'add': {
           const line = findLine(next, ev.lineId)
-          if (line) await postEntry(scope, line)
+          if (line) ops.push({ kind: 'add', lineId: ev.lineId, line })
           break
         }
         case 'edit':
-          await patchEntry(scope, ev.lineId, ev.after)
+          ops.push({ kind: 'edit', lineId: ev.lineId, after: ev.after })
           break
         case 'delete':
-          await deleteEntry(scope, ev.lineId)
+          ops.push({ kind: 'delete', lineId: ev.lineId })
           break
       }
     }
-  } catch {
-    // Backend unreachable mid-sequence — fall back to a local snapshot so the
-    // user's edits survive the session. The next successful poll/hydrate
-    // reconciles state.
-    saveLocal(scope, next)
   }
+  await flushOutbox(scope)
 }
 
 // ─── The adapter ─────────────────────────────────────────────────────
@@ -251,6 +327,12 @@ async function persistDelta(scope: BlackboardScope, next: BlackboardSnapshot): P
  * cache for that scope for an instant first paint; the authoritative backend
  * snapshot arrives via async hydration in `installBackendBlackboard`.
  */
+/** Per-scope serialization of `persistDelta` runs. Two reducers firing
+ *  back-to-back used to race: both read the same baseline (only updated in
+ *  a `.finally`), so the earlier event tail was diffed — and sent — twice.
+ *  Chaining guarantees each run sees the baseline its predecessor set. */
+const persistChains = new Map<BlackboardScope, Promise<void>>()
+
 export const backendBlackboardAdapter: BlackboardPersistenceAdapter = {
   load(scope) {
     return loadLocal(scope)
@@ -265,9 +347,14 @@ export const backendBlackboardAdapter: BlackboardPersistenceAdapter = {
       lastApplied.set(scope, snapshot)
       return
     }
-    void persistDelta(scope, snapshot).finally(() => {
-      lastApplied.set(scope, snapshot)
-    })
+    const prevChain = persistChains.get(scope) ?? Promise.resolve()
+    const run = prevChain
+      .then(() => persistDelta(scope, snapshot))
+      .catch(() => undefined)
+      .then(() => {
+        lastApplied.set(scope, snapshot)
+      })
+    persistChains.set(scope, run)
   },
 }
 
@@ -281,6 +368,54 @@ export const backendBlackboardAdapter: BlackboardPersistenceAdapter = {
  * since switched parts, the snapshot is cached but not painted (it would clash
  * with the now-active notebook).
  */
+/**
+ * Re-apply everything the backend has not confirmed yet on top of a server
+ * snapshot: queued outbox writes, plus the line currently streaming (its
+ * text lives only in the local store until the turn's final edit). Without
+ * this, a poll landing while a write is pending — or mid-turn — repainted
+ * the board from a backend that hadn't seen the newest lines and they
+ * simply vanished (observed live 2026-08-02, agent reply erased).
+ */
+function mergeUnconfirmedLocal(
+  scope: BlackboardScope,
+  snapshot: BlackboardSnapshot,
+): BlackboardSnapshot {
+  const ops = outbox.get(scope) ?? []
+  const state = useBlackboardStore.getState()
+  const streamingId = state.activeScope === scope ? state.streamingLineId : null
+  if (ops.length === 0 && !streamingId) return snapshot
+
+  let lines = [...snapshot.lines]
+  for (const op of ops) {
+    switch (op.kind) {
+      case 'add':
+        if (!lines.some((l) => l.id === op.lineId)) {
+          const local = state.lines.find((l) => l.id === op.lineId)
+          lines.push(local ?? op.line)
+        }
+        break
+      case 'edit':
+        lines = lines.map((l) => (l.id === op.lineId ? { ...l, text: op.after } : l))
+        break
+      case 'delete':
+        lines = lines.filter((l) => l.id !== op.lineId)
+        break
+      case 'clear':
+        lines = []
+        break
+    }
+  }
+  if (streamingId) {
+    const local = state.lines.find((l) => l.id === streamingId)
+    if (local) {
+      lines = lines.some((l) => l.id === streamingId)
+        ? lines.map((l) => (l.id === streamingId ? local : l))
+        : [...lines, local]
+    }
+  }
+  return { lines, events: snapshot.events }
+}
+
 function applyRemoteSnapshot(scope: BlackboardScope, snapshot: BlackboardSnapshot): void {
   const prev = baseline(scope)
   const same =
@@ -292,13 +427,17 @@ function applyRemoteSnapshot(scope: BlackboardScope, snapshot: BlackboardSnapsho
     })
   if (same) return
 
+  const merged = mergeUnconfirmedLocal(scope, snapshot)
   applyingRemote = true
   try {
+    // The baseline records what the SERVER holds (the raw snapshot), never
+    // the merged view — pending ops must stay diffable/flushable against
+    // the server's actual state.
     lastApplied.set(scope, snapshot)
-    saveLocal(scope, snapshot)
+    saveLocal(scope, merged)
     // Only repaint the panel if this snapshot is for the notebook on screen.
     if (useBlackboardStore.getState().activeScope === scope) {
-      useBlackboardStore.setState({ lines: snapshot.lines, events: snapshot.events })
+      useBlackboardStore.setState({ lines: merged.lines, events: merged.events })
     }
   } finally {
     applyingRemote = false
@@ -321,6 +460,10 @@ let unsubScope: (() => void) | null = null
  */
 export async function syncActiveScope(): Promise<void> {
   const scope = useBlackboardStore.getState().activeScope
+  // Retry anything a failed write left queued BEFORE fetching, so the
+  // snapshot we reconcile against already includes it (and so a transient
+  // failure heals within one poll interval, not never).
+  await flushOutbox(scope)
   const snap = await fetchSnapshot(scope)
   if (snap) applyRemoteSnapshot(scope, snap)
 }

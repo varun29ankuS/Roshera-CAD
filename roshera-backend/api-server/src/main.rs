@@ -13,6 +13,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 mod acp_gate;
+mod acp_provider_epoch;
 mod agent_activity;
 mod agent_registry;
 #[cfg(test)]
@@ -189,6 +190,15 @@ pub struct AppState {
     /// used for shadow reporting before anything can scrub the
     /// credential env vars. See `ai_provider_config.rs`.
     ai_provider_manager: Arc<ai_provider_config::AiProviderManager>,
+
+    /// Provider epoch for the `/acp` agent surface. `PUT
+    /// /api/ai/provider`'s success path bumps it so every ACP connection
+    /// minted under the previous provider is refused (bare 404 — the
+    /// client's existing reestablish signature) and the next prompt
+    /// necessarily starts a fresh session on the new provider. See
+    /// `acp_provider_epoch.rs` for why goose's per-session provider
+    /// restore made this necessary.
+    acp_provider_epoch: Arc<acp_provider_epoch::AcpProviderEpoch>,
 
     // Vision pipeline (not yet implemented)
     // smart_router: Option<Arc<SmartRouter>>,
@@ -8494,6 +8504,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         provider_manager: provider_manager_arc.clone(),
         ai_configured,
         ai_provider_manager,
+        acp_provider_epoch: Arc::new(acp_provider_epoch::AcpProviderEpoch::new()),
         // smart_router: not yet implemented,
         session_manager,
         permission_manager,
@@ -9817,6 +9828,12 @@ pub(crate) fn build_router(state: AppState) -> Router {
     // above.
     let ai_provider_manager_for_acp = state.ai_provider_manager.clone();
 
+    // Same capture pattern, same reason: `goose_acp::acp_router` layers
+    // the provider-epoch middleware around `/acp`, and `PUT
+    // /api/ai/provider` bumps the SAME instance out of `AppState` — one
+    // shared epoch, or the invalidation would be theater.
+    let acp_provider_epoch_for_acp = state.acp_provider_epoch.clone();
+
     // Add state and the middleware stack. axum applies layers from
     // innermost outward, so on the request path CORS runs first
     // (including preflight OPTIONS), then `auth_middleware` enforces
@@ -9864,6 +9881,7 @@ pub(crate) fn build_router(state: AppState) -> Router {
     let app = match goose_acp::acp_router(
         auth_layer_state.auth_manager.clone(),
         ai_provider_manager_for_acp,
+        acp_provider_epoch_for_acp,
     ) {
         Some(acp) => app.merge(acp.layer(axum::middleware::from_fn(acp_gate::acp_method_gate))),
         None => app,

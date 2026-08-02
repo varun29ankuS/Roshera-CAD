@@ -25,6 +25,7 @@ use uuid::Uuid;
 use crate::auth_middleware::AuthInfo;
 use crate::blackboard::{BlackboardLine, BlackboardScope};
 use crate::durability::DurabilityStatus;
+use crate::error_catalog::{ApiError, ErrorCode};
 use geometry_engine::readable::MassPropertiesReport;
 use timeline_engine::event_certificate::EventCertificate;
 
@@ -2292,6 +2293,86 @@ pub async fn bind_parameter_name(
     ))
 }
 
+// ─── Checkpoint-name quality floor (REST is the floor beneath all) ──
+//
+// The MCP tool layer (`GENERIC_CHECKPOINT_NAME` in `roshera-mcp/src/
+// gates.ts`) and the frontend picker (`checkpointNameRefusal` in
+// `roshera-app/src/lib/timeline-events.ts`) both refuse named-nothing
+// checkpoints — but `POST /api/timeline/checkpoint` is the route both
+// of them ultimately call, and any client that speaks HTTP directly
+// bypasses both. The floor has to live here. Keep the three copies in
+// sync BY HAND — they live in three different packages.
+
+/// A generic word, an ordinal, or both — "step 3", "op-2",
+/// "checkpoint", "7". A sequence position, not an intent.
+#[allow(clippy::expect_used)]
+// Reason: the pattern is a compile-time literal exercised by the
+// `checkpoint_name_gate_tests` module below — a non-compiling pattern
+// fails the test suite, never a production request.
+static GENERIC_CHECKPOINT_NAME: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(
+    || {
+        regex::Regex::new(
+            r"(?i)^(?:(?:step|op|operation|cut|feature|part|checkpoint|chkpt|cp|test|wip|tmp|temp|misc)[\s\-_#:.]*)?\d*$",
+        )
+        .expect("static checkpoint-name regex must compile")
+    },
+);
+
+/// A clock or date reading dressed as a name — "Checkpoint 9:59:36 PM",
+/// "10:05", "2026-08-01". Slips the generic regex (its tail accepts
+/// only a plain ordinal) while carrying even less: every timeline row
+/// already shows its own timestamp. This is exactly the shape the UI
+/// button used to mint from the system clock.
+#[allow(clippy::expect_used)]
+// Reason: compile-time literal, exercised by the tests below.
+static CLOCK_CHECKPOINT_NAME: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(
+            r"(?i)^(?:(?:step|op|operation|checkpoint|chkpt|cp)[\s\-_#:.]*)?\d{1,4}([:\-/.]\d{1,2}){1,2}(\s*(am|pm))?$",
+        )
+        .expect("static checkpoint-name regex must compile")
+});
+
+/// Why `name` is not an acceptable checkpoint name, or `None` when it
+/// is. A refusal is a typed 422 [`ApiError`] naming the standard (a
+/// declared design intent), what was received, and what a passing name
+/// looks like — never a bare status code.
+pub(crate) fn checkpoint_name_refusal(name: &str) -> Option<ApiError> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Some(
+            ApiError::new(
+                ErrorCode::CheckpointNameRejected,
+                "checkpoint name is empty — a checkpoint is a declared design \
+                 intent, and an unnamed one labels the timeline with nothing",
+            )
+            .with_hint(
+                "Name what a drawing would name: the feature, its governing \
+                 dimensions, and where it sits — e.g. 'bolt circle 8 x D18 on \
+                 D160 B.C.' or 'M8 clearance holes, close fit, 4x base corners'.",
+            )
+            .with_details(serde_json::json!({ "rejected_name": "" })),
+        );
+    }
+    if GENERIC_CHECKPOINT_NAME.is_match(trimmed) || CLOCK_CHECKPOINT_NAME.is_match(trimmed) {
+        return Some(ApiError::checkpoint_name_rejected(trimmed));
+    }
+    None
+}
+
+/// Typed twin of [`resolve_branch_ref`] for handlers that return
+/// [`ApiError`]: a malformed branch reference names what was received
+/// and what would fix it, instead of a bodiless 400.
+fn resolve_branch_ref_typed(reference: &str) -> Result<BranchId, ApiError> {
+    resolve_branch_ref(reference).map_err(|_| {
+        ApiError::new(
+            ErrorCode::InvalidParameter,
+            format!("branch reference '{reference}' is neither 'main' nor a branch UUID"),
+        )
+        .with_hint("Pass 'main' or a branch id from GET /api/branches.")
+        .with_details(serde_json::json!({ "parameter": "branch", "received": reference }))
+    })
+}
+
 /// Checkpoint/tag a specific state
 ///
 /// AUTHORSHIP-A1: this handler previously required `author_id` +
@@ -2301,15 +2382,32 @@ pub async fn bind_parameter_name(
 /// handler ever ran. Deriving authorship from `AuthInfo` removes the
 /// need for those fields entirely, which incidentally makes
 /// checkpointing work for the first time.
+///
+/// Refusals are typed [`ApiError`]s (`checkpoint_name_rejected` 422,
+/// `invalid_parameter` 400, `branch_not_found` 404, `internal_error`
+/// 500) — this handler used to return bare status codes, so a client
+/// could only report "HTTP 500" with no cause.
+///
+/// On success the created checkpoint is written through to durable
+/// storage (`durability::persist_checkpoint`), so the named-intent
+/// layer survives a restart exactly as the events it labels do.
 pub async fn create_checkpoint(
     State(state): State<AppState>,
     auth_info: AuthInfo,
     Json(request): Json<CreateCheckpointRequest>,
-) -> Result<(StatusCode, Json<CheckpointCreatedView>), StatusCode> {
-    // Resolve the target branch first — an unknown branch is a typed
-    // 404, never a silent checkpoint of `main` in its place.
+) -> Result<(StatusCode, Json<CheckpointCreatedView>), ApiError> {
+    // Name-quality floor first: a named-nothing checkpoint is refused
+    // before any state is read, exactly as the MCP gate and the
+    // frontend picker refuse it.
+    if let Some(refusal) = checkpoint_name_refusal(&request.name) {
+        return Err(refusal);
+    }
+    let name = request.name.trim().to_string();
+
+    // Resolve the target branch — an unknown branch is a typed 404,
+    // never a silent checkpoint of `main` in its place.
     let branch = match request.branch.as_deref() {
-        Some(b) => resolve_branch_ref(b)?,
+        Some(b) => resolve_branch_ref_typed(b)?,
         None => BranchId::main(),
     };
 
@@ -2317,27 +2415,55 @@ pub async fn create_checkpoint(
     // every operation the caller has already issued.
     let _ = state.timeline_recorder.flush().await;
 
-    let timeline = state.timeline.write().await;
-    let checkpoint_id = timeline
-        .create_checkpoint(
-            request.name.clone(),
-            request.description.clone().unwrap_or_default(),
-            branch,
-            author_from_auth_info(&auth_info),
-            Vec::new(), // No tags for now
-        )
-        .await
-        .map_err(|e| match e {
-            timeline_engine::TimelineError::BranchNotFound(_) => StatusCode::NOT_FOUND,
-            _ => StatusCode::INTERNAL_SERVER_ERROR,
-        })?;
+    let created = {
+        let timeline = state.timeline.write().await;
+        let checkpoint_id = timeline
+            .create_checkpoint(
+                name.clone(),
+                request.description.clone().unwrap_or_default(),
+                branch,
+                author_from_auth_info(&auth_info),
+                Vec::new(), // No tags for now
+            )
+            .await
+            .map_err(|e| match e {
+                TimelineError::BranchNotFound(b) => ApiError::new(
+                    ErrorCode::BranchNotFound,
+                    format!("branch '{b}' does not exist in the timeline"),
+                )
+                .with_hint("List live branches with GET /api/branches, or omit `branch` to checkpoint 'main'.")
+                .with_details(serde_json::json!({ "branch_id": b.to_string() })),
+                other => ApiError::new(
+                    ErrorCode::Internal,
+                    format!("checkpoint could not be recorded: {other}"),
+                ),
+            })?;
+        // Read the full record back for durable persistence — the
+        // create call returns only the id.
+        timeline.get_checkpoint(&checkpoint_id)
+    };
+
+    let Some(checkpoint) = created else {
+        // Created a moment ago and already gone — only possible if a
+        // concurrent document switch reset the timeline mid-request.
+        return Err(ApiError::new(
+            ErrorCode::Internal,
+            "checkpoint was created but could not be read back — a concurrent \
+             document switch reset the timeline; retry once the switch settles",
+        ));
+    };
+
+    // Durability: the named-intent layer must be at least as durable as
+    // the events it labels. Write-behind failure is logged loudly by
+    // persist_checkpoint itself; the in-memory create already succeeded.
+    crate::durability::persist_checkpoint(&state, &checkpoint).await;
 
     Ok((
         StatusCode::CREATED,
         Json(CheckpointCreatedView {
-            id: checkpoint_id.to_string(),
-            name: request.name,
-            branch: branch.to_string(),
+            id: checkpoint.id.to_string(),
+            name,
+            branch: branch_ref_string(&branch),
         }),
     ))
 }
@@ -3106,9 +3232,28 @@ pub struct CheckpointSummary {
     pub description: String,
     /// `[first, last]` event indices captured by the checkpoint.
     pub event_range: [u64; 2],
+    /// The branch the checkpoint was created against — `"main"` for the
+    /// trunk, otherwise the branch UUID. `event_range` indexes into
+    /// THIS branch's sequence numbers; without it a consumer could only
+    /// overlay declared intent onto the main lane, mis-attributing a
+    /// child branch's numbers to the trunk's events. ADDITIVE field:
+    /// `Timeline.tsx` / `TimelineDecisions.tsx` predate it and keep
+    /// working untouched (extra JSON fields are ignored).
+    pub branch_id: String,
     pub author: String,
     pub timestamp: String,
     pub tags: Vec<String>,
+}
+
+/// The wire spelling for a branch reference: the well-known label
+/// `"main"` for the trunk (what `resolve_branch_ref` accepts back),
+/// otherwise the branch UUID.
+pub(crate) fn branch_ref_string(branch: &BranchId) -> String {
+    if branch.is_main() {
+        "main".to_string()
+    } else {
+        branch.to_string()
+    }
 }
 
 /// `GET /api/timeline/checkpoints` — list named design states.
@@ -3122,6 +3267,7 @@ pub async fn list_checkpoints(State(state): State<AppState>) -> Json<Vec<Checkpo
             name: c.name,
             description: c.description,
             event_range: [c.event_range.0, c.event_range.1],
+            branch_id: branch_ref_string(&c.branch_id),
             author: author_label(&c.author),
             timestamp: c.timestamp.to_rfc3339(),
             tags: c.tags,
@@ -3275,6 +3421,113 @@ mod affected_parts_tests {
             affected_solids(&op),
             vec!["solid:3".to_string(), "solid:4".to_string()]
         );
+    }
+}
+
+/// Item 1 (2026-08-01 audit): the REST route is the floor beneath the
+/// MCP gate and the frontend picker — these tests pin the floor
+/// itself. Every `refused` case FAILS without `checkpoint_name_refusal`
+/// wired into `create_checkpoint` (the route accepted any string), and
+/// the clock-reading cases fail against a port of the MCP regex alone
+/// (its tail accepts only a plain ordinal — the hole the frontend
+/// found and patched first).
+#[cfg(test)]
+mod checkpoint_name_gate_tests {
+    use super::*;
+    use crate::error_catalog::ErrorCode;
+
+    fn refused(name: &str) -> bool {
+        checkpoint_name_refusal(name).is_some()
+    }
+
+    #[test]
+    fn sequence_position_names_are_refused() {
+        for bad in [
+            "step 3",
+            "cp 2",
+            "7",
+            "checkpoint",
+            "op-2",
+            "Checkpoint #4",
+            "wip",
+            "tmp 12",
+            "",
+            "   ",
+        ] {
+            assert!(refused(bad), "'{bad}' names a position, must be refused");
+        }
+    }
+
+    /// The hole the MCP regex has and the frontend already patched:
+    /// a clock or date reading is named-nothing. All three layers now
+    /// agree.
+    #[test]
+    fn clock_and_date_readings_are_refused() {
+        for bad in [
+            "Checkpoint 9:59:36 PM",
+            "checkpoint 9:59",
+            "10:05",
+            "10:05 am",
+            "2026-08-01",
+            "cp 12/31/26",
+            "op 8.1.26",
+        ] {
+            assert!(
+                refused(bad),
+                "'{bad}' is a clock/date reading, must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn real_intent_phrases_pass() {
+        for good in [
+            "bolt circle 8 x D18 on D160 B.C.",
+            "M8 clearance holes, close fit, 4x base corners",
+            "cut cylinders",
+            "50 mm cube, base square centred on origin, extruded +Z",
+            "counterbore relief before flange blend",
+        ] {
+            assert!(
+                checkpoint_name_refusal(good).is_none(),
+                "'{good}' is a real intent phrase, must pass"
+            );
+        }
+    }
+
+    /// The refusal is the typed 422 from the error catalog, carrying
+    /// the rejected name — never a bare status code (item 2).
+    #[test]
+    fn refusal_is_typed_422_with_rejected_name() {
+        let err = checkpoint_name_refusal("Checkpoint 9:59:36 PM").expect("must refuse");
+        assert_eq!(err.code, ErrorCode::CheckpointNameRejected);
+        assert_eq!(err.code.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let v = serde_json::to_value(&err).expect("serializes");
+        assert_eq!(v["error_code"], "checkpoint_name_rejected");
+        assert_eq!(v["details"]["rejected_name"], "Checkpoint 9:59:36 PM");
+        assert_eq!(v["retryable"], false);
+    }
+
+    /// Item 3: the wire summary carries the branch the checkpoint was
+    /// created against, `"main"` spelled as the label the rest of the
+    /// API accepts back. Fails without `CheckpointSummary::branch_id`.
+    #[test]
+    fn checkpoint_summary_serializes_branch_id() {
+        let summary = CheckpointSummary {
+            id: "cp-1".to_string(),
+            name: "base plate 120x80x12".to_string(),
+            description: String::new(),
+            event_range: [0, 4],
+            branch_id: branch_ref_string(&BranchId::main()),
+            author: "System".to_string(),
+            timestamp: "2026-08-01T00:00:00Z".to_string(),
+            tags: vec![],
+        };
+        let v = serde_json::to_value(&summary).expect("serializes");
+        assert_eq!(v["branch_id"], "main");
+
+        let child = BranchId(Uuid::from_u128(0xBEEF));
+        assert_eq!(branch_ref_string(&child), child.to_string());
     }
 }
 

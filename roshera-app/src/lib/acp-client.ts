@@ -38,10 +38,10 @@
  * - It never retries a 429 in a loop. The shared 100 req/min budget is
  *   shared with the polling frontend (`blackboard-api.ts`'s poll), so a
  *   naive retry storm would starve it. Instead a single shared cooldown
- *   gate delays the NEXT request until the `Retry-After` window elapses,
- *   and a request that still lands inside an active cooldown throws
- *   `AcpRateLimitError` verbatim for the caller to surface — never a
- *   silently-swallowed retry.
+ *   gate delays the NEXT request until the `Retry-After` window elapses
+ *   (callers can read that pending delay via `acpCooldownRemainingMs()`
+ *   and SHOW it), and the 429 itself throws `AcpRateLimitError` verbatim
+ *   for the caller to surface — never a silently-swallowed retry.
  * - It never approves anything beyond `allow_once` and never answers an
  *   unrecognized server→client method by hanging — session mode is
  *   `auto` (no human approval round-trip is expected), so the one
@@ -227,6 +227,15 @@ export class AcpConnectionDeadError extends Error {
 let cooldownUntilMs = 0
 const DEFAULT_RATE_LIMIT_COOLDOWN_MS = 5000
 
+/** How long the shared 429 cooldown gate will hold the NEXT request, in
+ *  milliseconds (0 when no cooldown is active). Exposed so the Blackboard
+ *  can SHOW the wait — `rateLimitedFetch` sleeps this out silently, and a
+ *  user watching a blank line for the duration cannot tell a deliberate
+ *  wait from a dead turn. */
+export function acpCooldownRemainingMs(): number {
+  return Math.max(0, cooldownUntilMs - Date.now())
+}
+
 async function sleep(ms: number): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, ms))
 }
@@ -261,9 +270,24 @@ async function safeText(res: Response): Promise<string> {
 
 // ── SSE stream reader (fetch + manual parse; EventSource can't carry headers) ──
 
+/** Inactivity watchdog threshold. The backend injects a `: keepalive`
+ *  SSE comment every 10s into an idle `/acp` stream
+ *  (`goose_acp::acp_sse_keepalive`), so a healthy connection is NEVER
+ *  byte-silent for 45s — even while the model thinks. Silence past this
+ *  means the connection is dead in a way the socket never reported:
+ *  verified live 2026-08-02, killing the api-server mid-turn left the
+ *  dev proxy holding this side open, `reader.read()` pending forever,
+ *  and the in-flight turn (plus the serial queue behind it) trapped
+ *  until a page reload. The watchdog turns that into an ordinary
+ *  connection-dead failure the existing recovery already handles. */
+const SSE_INACTIVITY_TIMEOUT_MS = 45_000
+
 class AcpSseStream {
   private readonly controller = new AbortController()
   private started = false
+  /** Set when the watchdog (not `close()`) aborted the fetch, so the
+   *  catch below reports the drop instead of treating it as intentional. */
+  private timedOut = false
   private readonly url: string
   private readonly headers: Record<string, string>
   private readonly onEvent: (data: string) => void
@@ -279,6 +303,36 @@ class AcpSseStream {
     this.headers = headers
     this.onEvent = onEvent
     this.onDone = onDone
+  }
+
+  /** `reader.read()` with the inactivity watchdog: whichever comes first
+   *  wins. On timeout the underlying fetch is aborted (releasing the
+   *  socket) and a descriptive error is thrown; `timedOut` keeps the
+   *  catch in `start()` from mistaking that abort for an intentional
+   *  `close()`. */
+  private async readWithWatchdog(
+    reader: ReadableStreamDefaultReader<Uint8Array>,
+  ): Promise<ReadableStreamReadResult<Uint8Array>> {
+    let timer: ReturnType<typeof setTimeout> | undefined
+    try {
+      return await Promise.race([
+        reader.read(),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => {
+            this.timedOut = true
+            this.controller.abort()
+            reject(
+              new Error(
+                `no traffic (not even a keepalive) for ${SSE_INACTIVITY_TIMEOUT_MS / 1000}s — ` +
+                  `the backend stopped serving this connection`,
+              ),
+            )
+          }, SSE_INACTIVITY_TIMEOUT_MS)
+        }),
+      ])
+    } finally {
+      clearTimeout(timer)
+    }
   }
 
   async start(): Promise<void> {
@@ -297,7 +351,7 @@ class AcpSseStream {
       const decoder = new TextDecoder()
       let buffer = ''
       for (;;) {
-        const { done, value } = await reader.read()
+        const { done, value } = await this.readWithWatchdog(reader)
         if (done) break
         buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n')
         let boundary: number
@@ -313,7 +367,7 @@ class AcpSseStream {
       }
       this.onDone()
     } catch (err) {
-      if (this.controller.signal.aborted) return // intentional close, not a drop
+      if (this.controller.signal.aborted && !this.timedOut) return // intentional close, not a drop
       this.onDone(err instanceof Error ? err : new Error(String(err)))
     }
   }
@@ -348,8 +402,14 @@ export class AcpClient {
   /** Explicit override only (ctor option or `VITE_ACP_CWD`) — empty means
    *  "ask the backend", resolved and cached lazily by {@link resolveCwd}.
    *  Not `readonly`: the backend-resolved value is written into this same
-   *  field on first use so every subsequent `newSession()` reuses it. */
+   *  field on first use so every subsequent `newSession()` reuses it —
+   *  and {@link reestablish} clears it again (backend-resolved case only)
+   *  so a rebuild re-asks the backend and picks up a provider change. */
   private cwd: string
+  /** Whether `cwd` came from the ctor/`VITE_ACP_CWD` (never cleared) or
+   *  from the backend (cleared on {@link reestablish} to force a fresh
+   *  `GET /api/acp/config`, which also re-resolves {@link provider}). */
+  private readonly cwdIsExplicitOverride: boolean
   private connectionId: string | null = null
   private sessionId: string | null = null
   private _currentModel: string | null = null
@@ -369,10 +429,17 @@ export class AcpClient {
   private lastMcpServers: unknown[] = []
   private readonly updateHandlers = new Set<(update: AcpSessionUpdate) => void>()
   private readonly disconnectHandlers = new Set<(reason: string) => void>()
+  /** Fired after every successful {@link newSession} — including the one
+   *  {@link reestablish} makes after the backend invalidated us (restart
+   *  OR provider repin), which is exactly when `currentModel`/`provider`
+   *  change under a subscriber's feet. UI that mirrors those must resync
+   *  here, not only at first connect. */
+  private readonly sessionChangedHandlers = new Set<() => void>()
 
   constructor(opts: AcpClientOptions = {}) {
     this.acpPath = opts.acpPath ?? DEFAULT_ACP_PATH
     this.cwd = opts.cwd ?? (import.meta.env.VITE_ACP_CWD as string | undefined) ?? ''
+    this.cwdIsExplicitOverride = this.cwd !== ''
   }
 
   get isDead(): boolean {
@@ -414,6 +481,15 @@ export class AcpClient {
   onDisconnect(cb: (reason: string) => void): () => void {
     this.disconnectHandlers.add(cb)
     return () => this.disconnectHandlers.delete(cb)
+  }
+
+  /** Subscribe to session (re)creation — fires after every successful
+   *  `newSession()`, first connect and rebuild alike. Read
+   *  `currentModel`/`provider` inside the callback: both are already
+   *  fresh when it fires. Returns an unsubscribe fn. */
+  onSessionChanged(cb: () => void): () => void {
+    this.sessionChangedHandlers.add(cb)
+    return () => this.sessionChangedHandlers.delete(cb)
   }
 
   private markDead(reason: string): void {
@@ -520,8 +596,22 @@ export class AcpClient {
       : { jsonrpc: '2.0', id, result }
     try {
       await this.post(body, true)
-    } catch {
-      // Best-effort: a failed reply to a server-initiated request must
+    } catch (err) {
+      if (err instanceof AcpRateLimitError) {
+        // A swallowed 429 here would leave the agent waiting forever for
+        // this reply — the in-flight `prompt()` would then hang with no
+        // failure anywhere. Retry exactly once: `rateLimitedFetch` waits
+        // out the cooldown the 429 just set before re-issuing, so this is
+        // one bounded re-send, never a storm.
+        try {
+          await this.post(body, true)
+        } catch {
+          // Second failure: the connection itself is gone (or still
+          // rate-limited) — the turn's own error path will surface it.
+        }
+        return
+      }
+      // Any other failure: a reply to a server-initiated request must
       // not throw out of an SSE event handler.
     }
   }
@@ -678,16 +768,26 @@ export class AcpClient {
       (err) => this.markDead(err ? `session stream: ${err.message}` : 'session stream ended'),
     )
     void this.sessStream.start()
+    for (const cb of this.sessionChangedHandlers) cb()
     return this.sessionId
   }
 
   /**
    * Rebuild the connection + session in place after the backend reported
    * that our `Acp-Connection-Id` no longer exists (`POST /acp` → 404 with
-   * an empty body — the signature of a backend restart while this tab
-   * stayed open). Verified live 2026-08-01: the stale id 404s every call,
-   * and without this the Blackboard silently fell back to the legacy
-   * single-shot path ("Command processed.") while looking connected.
+   * an empty body). TWO backend causes share that exact signature, on
+   * purpose:
+   *
+   * - a backend restart while this tab stayed open (verified live
+   *   2026-08-01: the stale id 404s every call, and without this the
+   *   Blackboard silently fell back to the legacy single-shot path
+   *   ("Command processed.") while looking connected);
+   * - a provider repin (`PUT /api/ai/provider`): goose stores the
+   *   provider ON THE SESSION and restores it, so the backend now ends
+   *   every connection minted under the old provider
+   *   (`api-server/src/acp_provider_epoch.rs`) precisely so this one
+   *   recovery path starts the next session on the new provider — no
+   *   page reload, no second mechanism.
    *
    * Any failure here (initialize or session/new) propagates verbatim —
    * an unreachable agent must surface as an error, never as a healthy-
@@ -705,6 +805,18 @@ export class AcpClient {
       this.connectionId = null
       this.sessionId = null
       this._currentModel = null
+      // Re-ask the backend (never a cached copy) which provider now backs
+      // the agent surface: in the repin case this rebuild EXISTS because
+      // that answer changed, and serving the old vendor mark from cache
+      // would claim the wrong provider is serving the new session. An
+      // explicit ctor/VITE_ACP_CWD override keeps its cwd, but the
+      // provider is still re-fetched by `resolveCwd` only in the
+      // backend-owned case — under an override there is no config fetch,
+      // and `provider` honestly stays null rather than guessing.
+      if (!this.cwdIsExplicitOverride) {
+        this.cwd = ''
+      }
+      this.activeProvider = null
       // Anything still pending was addressed to the dead connection; its
       // response can never arrive.
       for (const entry of this.pending.values()) {
@@ -716,6 +828,17 @@ export class AcpClient {
       this.dead = false
       await this.initialize()
       await this.newSession(this.lastMcpServers)
+    } catch (err) {
+      // A failed rebuild must not leave a half-connected zombie: with
+      // `dead === false` but `sessionId === null`, every later `prompt()`
+      // would fail "prompt() called before newSession()" forever — a
+      // state only a page reload used to clear. Marking dead here means
+      // the shared-client layer (`getAcpClient`) discards this instance
+      // and the NEXT prompt builds a fresh one from scratch.
+      this.markDead(
+        `reconnect failed: ${err instanceof Error ? err.message : String(err)}`,
+      )
+      throw err
     } finally {
       this.reconnecting = false
     }
@@ -725,10 +848,13 @@ export class AcpClient {
    *  Progressive content/tool activity arrives via `onUpdate` while this
    *  promise is pending.
    *
-   *  A 404 means the backend no longer knows our connection id (it
-   *  restarted): rebuild via {@link reestablish} and retry the prompt
-   *  exactly once. A 404 on the retried call — or any failure during the
-   *  rebuild itself — propagates; there is deliberately no loop. */
+   *  A 404 means the backend no longer serves our connection id — it
+   *  restarted, or a provider repin invalidated every connection minted
+   *  under the old provider (see {@link reestablish}): rebuild and retry
+   *  the prompt exactly once, so this same turn is served by a fresh
+   *  session on whatever the backend now pins. A 404 on the retried call
+   *  — or any failure during the rebuild itself — propagates; there is
+   *  deliberately no loop. */
   async prompt(text: string): Promise<{ stopReason: AcpStopReason }> {
     if (!this.sessionId) throw new AcpProtocolError(-32000, 'prompt() called before newSession()')
     try {

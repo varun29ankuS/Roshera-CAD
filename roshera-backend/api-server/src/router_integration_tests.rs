@@ -213,6 +213,7 @@ pub(crate) async fn make_test_state_with_database(
         provider_manager,
         ai_configured: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         ai_provider_manager,
+        acp_provider_epoch: Arc::new(crate::acp_provider_epoch::AcpProviderEpoch::new()),
         session_manager,
         permission_manager,
         // Router integration tests exercise the enforced posture by
@@ -1722,8 +1723,12 @@ async fn blackboard_honours_client_supplied_id_and_dedupes() {
 #[tokio::test]
 async fn blackboard_part_scopes_are_isolated_through_router() {
     let state = make_test_state().await;
-    let part_a = "11111111-1111-1111-1111-111111111111";
-    let part_b = "22222222-2222-2222-2222-222222222222";
+    // Real parts are addressed by the kernel's integer `SolidId` (e.g. what
+    // `GET /api/agent/parts` returns), never a UUID — `part_a`/`part_b` here
+    // mirror that shape rather than the UUIDs this test used before the
+    // `BlackboardScope::Part` fix, which no real part id could ever match.
+    let part_a = "101";
+    let part_b = "202";
 
     // Post a calc to A's notebook.
     let (status, body) = dispatch(
@@ -1815,6 +1820,102 @@ async fn blackboard_part_scopes_are_isolated_through_router() {
         body["lines"].as_array().map(Vec::len),
         Some(0),
         "document notebook stays empty; body = {body}"
+    );
+}
+
+/// THE live-measured regression: the frontend's OWN part selection
+/// (`stores/scene-store.ts` object id) is the UUID alias registered via
+/// `register_id_mapping` — verified 2026-08-02 by watching the running
+/// browser issue `GET /api/blackboard?scope=part:dc6e2058-...` — not the
+/// bare kernel `SolidId` an agent holds from `GET /api/agent/parts`. A
+/// `BlackboardScope::Part` resolver that only accepted one of the two id
+/// spaces would 400 on either the live frontend or the live agent. This
+/// proves both spellings of the SAME part resolve to the SAME notebook: a
+/// line posted under the UUID alias is visible under the bare `SolidId`,
+/// and vice versa.
+#[tokio::test]
+async fn blackboard_part_scope_accepts_both_the_solid_id_and_its_uuid_alias() {
+    let state = make_test_state().await;
+    let (uuid, solid_id, _corner_edges) = seed_box(&state, 10.0).await;
+
+    // Write under the UUID alias — the shape the live frontend actually
+    // sends (`part:<uuid>`, scene-store's object id).
+    let (status, body) = dispatch(
+        &state,
+        Request::builder()
+            .method(Method::POST)
+            .uri("/api/blackboard/entries")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "text": "written via the frontend's uuid alias",
+                    "scope": format!("part:{uuid}"),
+                })
+                .to_string(),
+            ))
+            .expect("static request must build"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "post via uuid alias must route 200; {body}"
+    );
+
+    // Read back under the bare kernel SolidId — the shape an agent holds
+    // from `GET /api/agent/parts` — and find the SAME line.
+    let (_status, body) = dispatch(
+        &state,
+        Request::builder()
+            .method(Method::GET)
+            .uri(format!("/api/blackboard?scope=part:{solid_id}"))
+            .body(Body::empty())
+            .expect("static request must build"),
+    )
+    .await;
+    assert_eq!(
+        body["lines"].as_array().map(Vec::len),
+        Some(1),
+        "the solid_id-scoped read must see the uuid-scoped write; body = {body}"
+    );
+    assert_eq!(
+        body["lines"][0]["text"], "written via the frontend's uuid alias",
+        "both id spaces must resolve to the SAME notebook; body = {body}"
+    );
+
+    // And a second write under the bare SolidId lands in the SAME notebook
+    // as the uuid-scoped read.
+    let (status, _body) = dispatch(
+        &state,
+        Request::builder()
+            .method(Method::POST)
+            .uri("/api/blackboard/entries")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({
+                    "text": "written via the agent's solid_id",
+                    "part_id": solid_id.to_string(),
+                })
+                .to_string(),
+            ))
+            .expect("static request must build"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (_status, body) = dispatch(
+        &state,
+        Request::builder()
+            .method(Method::GET)
+            .uri(format!("/api/blackboard?scope=part:{uuid}"))
+            .body(Body::empty())
+            .expect("static request must build"),
+    )
+    .await;
+    assert_eq!(
+        body["lines"].as_array().map(Vec::len),
+        Some(2),
+        "the uuid-scoped read must see BOTH writes; body = {body}"
     );
 }
 

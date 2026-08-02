@@ -33,10 +33,33 @@ import { parseCard, type CardKind } from '@/lib/blackboard-cards'
 import {
   AcpClient,
   AcpConnectionDeadError,
+  AcpHttpError,
   AcpProtocolError,
+  AcpRateLimitError,
+  acpCooldownRemainingMs,
   type AcpSessionUpdate,
   type AcpStopReason,
 } from '@/lib/acp-client'
+
+/** "The backend behind this address is not answering." 502/504 is what the
+ *  Vite dev proxy (and any reverse proxy) returns when the api-server is
+ *  down — verified live 2026-08-02 by killing the backend mid-session; a
+ *  raw "ACP session/prompt failed: 502" is jargon, not a diagnosis. 503 is
+ *  the server itself refusing while starting up. */
+export function isBackendDownStatus(status: number): boolean {
+  return status === 502 || status === 503 || status === 504
+}
+
+/** The one sentence both render paths use for a down backend: what failed,
+ *  and that recovery is resend-after-restart — never a reload. */
+export function describeBackendDown(status: number): string {
+  return (
+    `Backend unreachable: the api-server did not answer (HTTP ${status} from the ` +
+    `proxy in front of it). It is down or still starting — start (or wait for) the ` +
+    `backend, then resend this prompt. The connection rebuilds automatically; no ` +
+    `page reload is needed.`
+  )
+}
 
 const FENCE = '```'
 
@@ -125,7 +148,7 @@ function describeStopReason(reason: AcpStopReason): string {
 /** Errors already rendered onto the Blackboard by `runAcpTurn`'s own
  *  catch, keyed by the thrown error object itself (not cloned/wrapped —
  *  `runAcpTurn` rethrows the identical instance). `ai-client.ts`'s
- *  `classifyAcpFailure` checks this before posting its own system line
+ *  `renderAcpFailure` checks this before posting its own system line
  *  for the same failure, so a rethrown error is never double-rendered. */
 const renderedTurnFailures = new WeakSet<object>()
 
@@ -135,20 +158,67 @@ export function isAcpTurnFailureRendered(err: unknown): boolean {
   return typeof err === 'object' && err !== null && renderedTurnFailures.has(err)
 }
 
-/** Turn a `client.prompt()` rejection into a visible line. Prefers the
- *  existing refusal-card path when `AcpProtocolError.data` validates
- *  against it (a kernel refusal riding the JSON-RPC error payload) —
- *  never a looser acceptance path than `cardFenceForPayload` already
- *  allows. Otherwise the concrete detail: `.data` when it's a plain
- *  string (per `ai-client.ts`'s rule — `.message` alone is often just the
- *  generic JSON-RPC error class, e.g. "Internal error"), else `.message`. */
-function describeAcpTurnFailure(err: unknown): string {
+/** Errors from the agent process whose text points at reaching the MODEL
+ *  PROVIDER, not at Roshera. goose reports "network"-flavoured wording for
+ *  a wrong provider base URL AND for a missing TLS backend in its own
+ *  build (both observed live 2026-08-01) — so the framing below never
+ *  says "check your network"; it names the provider and lists the
+ *  non-network causes that produce the same words. */
+const PROVIDER_CONNECTIVITY_RE =
+  /provider|network|connection|connect|dns|tls|certificat|timed?\s?out|unreachable|refused|handshake|proxy|overloaded/i
+
+/** Turn a `client.prompt()` rejection into a visible line, in engineering
+ *  language naming what failed and what would fix it — never an internal
+ *  identifier. Prefers the existing refusal-card path when
+ *  `AcpProtocolError.data` validates against it (a kernel refusal riding
+ *  the JSON-RPC error payload) — never a looser acceptance path than
+ *  `cardFenceForPayload` already allows. Otherwise the concrete detail:
+ *  `.data` when it's a plain string (per `ai-client.ts`'s rule —
+ *  `.message` alone is often just the generic JSON-RPC error class, e.g.
+ *  "Internal error"), else `.message`. */
+function describeAcpTurnFailure(err: unknown, provider: string | null): string {
+  if (err instanceof AcpRateLimitError) {
+    // Only reachable after `runAcpTurn` already waited out one cooldown
+    // and retried once — this is the second consecutive 429.
+    const waitS = Math.ceil(err.retryAfterMs / 1000)
+    return (
+      `⚠ Turn not sent: still rate-limited after one retry. The backend's shared ` +
+      `request budget (100 requests/min — scene polling and every open Roshera tab ` +
+      `count against it) is exhausted. Wait ~${waitS}s and resend; closing extra ` +
+      `tabs frees the budget.`
+    )
+  }
+  if (err instanceof AcpConnectionDeadError) {
+    return (
+      `⚠ Agent connection dropped mid-turn — the backend restarted or the event ` +
+      `stream closed. Everything shown above this line did happen; nothing after ` +
+      `it did. The connection rebuilds itself on the next prompt — resend to continue.`
+    )
+  }
+  if (err instanceof AcpHttpError && isBackendDownStatus(err.status)) {
+    return `⚠ ${describeBackendDown(err.status)}`
+  }
   if (err instanceof AcpProtocolError) {
     if (err.data !== null && typeof err.data === 'object') {
       const fence = fenceIfValid('refusal', err.data)
       if (fence) return `⚠ Agent turn failed\n\n${fence}`
     }
     const detail = typeof err.data === 'string' ? err.data : err.message
+    if (PROVIDER_CONNECTIVITY_RE.test(detail)) {
+      // The JSON-RPC error arrived over a working /acp transport, so the
+      // backend and the agent bridge are alive — the failure is between
+      // the agent and the model provider. Say so, keep the provider's
+      // words verbatim, and name the config causes that masquerade as
+      // network problems.
+      const who = provider ? `the "${provider}" provider` : 'the model provider'
+      return (
+        `⚠ Model provider failure — Roshera's backend and agent bridge are running ` +
+        `(they relayed this error); ${who} did not serve the turn.\n\n` +
+        `Provider error, verbatim: ${detail}\n\n` +
+        `The agent reports "network" wording for a wrong provider base URL and for a ` +
+        `missing TLS backend too — check the provider configuration before the network.`
+      )
+    }
     return `⚠ Agent turn failed: ${detail}`
   }
   if (err instanceof Error) return `⚠ Agent turn failed: ${err.message}`
@@ -163,8 +233,9 @@ function describeAcpTurnFailure(err: unknown): string {
  * `agentAttention` to `'geometry'` and appends its own system line (with
  * a validated card fence when the tool's output matches a known wire
  * shape), and the turn commits a single `editLine` once `stopReason`
- * arrives. Rethrows on failure so the caller (`ai-client.ts`) can classify
- * and decide whether to fall back to the legacy transport.
+ * arrives. Rethrows on failure so the caller (`ai-client.ts`) can reset a
+ * dead client — every failure is already rendered onto this turn's own
+ * line before the rethrow; there is no fallback transport.
  */
 export async function runAcpTurn(client: AcpClient, text: string): Promise<void> {
   const board = useBlackboardStore.getState()
@@ -261,20 +332,62 @@ export async function runAcpTurn(client: AcpClient, text: string): Promise<void>
     }
   })
 
+  // Render a failure onto the SAME line the success path would have
+  // filled in — never leave it at its blank initial text. Callers rethrow
+  // right after, so `ai-client.ts`'s connection-reset logic still runs;
+  // `renderedTurnFailures` stops it from posting a second, duplicate
+  // line for this same error.
+  const renderTurnFailure = (err: unknown): void => {
+    useBlackboardStore.getState().editLine(lineId, describeAcpTurnFailure(err, client.provider))
+    useBlackboardStore.getState().setLineTurnStatus(lineId, 'failed')
+    if (err && typeof err === 'object') renderedTurnFailures.add(err)
+  }
+
   try {
     let stopReason: AcpStopReason
     try {
+      // A previous 429 set a shared cooldown that `rateLimitedFetch`
+      // sleeps out SILENTLY before sending — without this line the user
+      // stares at a blank agent line for the whole wait, indistinguishable
+      // from a dead turn. Sub-second remnants aren't worth a notice.
+      const holdMs = acpCooldownRemainingMs()
+      if (holdMs > 1000) {
+        useBlackboardStore
+          .getState()
+          .setLineText(
+            lineId,
+            `Rate-limit cooldown active — holding this turn ~${Math.ceil(holdMs / 1000)}s ` +
+              `for the shared request budget (100 requests/min), then sending.`,
+          )
+      }
       ;({ stopReason } = await client.prompt(text))
     } catch (err) {
-      // Render onto the SAME line the success path would have filled in
-      // — never leave it at its blank initial text — then rethrow so
-      // `ai-client.ts`'s connection-reset / fallback-classification logic
-      // (unchanged) still runs; `renderedTurnFailures` stops it from
-      // posting a second, duplicate line for this same error.
-      useBlackboardStore.getState().editLine(lineId, describeAcpTurnFailure(err))
-      useBlackboardStore.getState().setLineTurnStatus(lineId, 'failed')
-      if (err && typeof err === 'object') renderedTurnFailures.add(err)
-      throw err
+      if (!(err instanceof AcpRateLimitError)) {
+        renderTurnFailure(err)
+        throw err
+      }
+      // 429 on the send: show the wait, then retry exactly ONCE.
+      // `rateLimitedFetch` itself waits out the cooldown the 429 just set
+      // before re-issuing, so this is one bounded re-send after the
+      // server-mandated delay — never a loop, and a second consecutive
+      // 429 surfaces via `renderTurnFailure` (which names it as
+      // post-retry). The 429 happens on the POST, before the agent has
+      // started the turn, so re-sending cannot double-execute anything.
+      const waitS = Math.ceil(err.retryAfterMs / 1000)
+      useBlackboardStore
+        .getState()
+        .setLineText(
+          lineId,
+          `Rate-limited — the shared request budget (100 requests/min, shared with scene ` +
+            `polling and other open tabs) is exhausted. Waiting ~${waitS}s, then retrying ` +
+            `this turn once.`,
+        )
+      try {
+        ;({ stopReason } = await client.prompt(text))
+      } catch (retryErr) {
+        renderTurnFailure(retryErr)
+        throw retryErr
+      }
     }
     const trailing = describeStopReason(stopReason)
     const finalText = sawContent
@@ -307,8 +420,14 @@ let sharedClientPromise: Promise<AcpClient> | null = null
 
 async function createAndConnect(): Promise<AcpClient> {
   const client = new AcpClient()
-  await client.initialize()
-  await client.newSession()
+  // Subscribed BEFORE the first newSession() so one code path serves both
+  // session starts: the initial connect below AND every rebuild the
+  // client makes on its own (`reestablish` after a backend restart or a
+  // provider repin invalidated the connection). Without this, the header
+  // kept the OLD provider mark and model after a repin — the rebuild
+  // happened inside `prompt()`, past the one manual startSession call
+  // that used to live here.
+  //
   // `client.currentModel` is `null` when `session/new` reported no model
   // (or the unresolved "default" sentinel) — an honest, real state; the
   // header renders "—" for it rather than fabricating a name.
@@ -316,7 +435,19 @@ async function createAndConnect(): Promise<AcpClient> {
   // `newSession()` already made for the cwd, so the vendor mark costs no
   // extra request. Null when the backend named no provider — the header
   // then draws no logo rather than assuming one.
-  useAcpSessionStore.getState().startSession(client.currentModel, client.provider)
+  client.onSessionChanged(() =>
+    useAcpSessionStore.getState().startSession(client.currentModel, client.provider),
+  )
+  try {
+    await client.initialize()
+    await client.newSession()
+  } catch (err) {
+    // A connect that got as far as opening the connection-scoped SSE
+    // stream and then failed at `session/new` must not strand that stream
+    // open on a client nobody holds — close before discarding.
+    client.close()
+    throw err
+  }
   // A stream drop (not just an explicit `resetAcpClient()` call below)
   // must also end the session in the header — a dead connection showing
   // live counts would be worse than showing nothing.
@@ -358,6 +489,14 @@ export function resetAcpClient(): void {
  *  live. Wired to the Blackboard's stop control. */
 export function cancelAcpTurn(): void {
   if (sharedClient && !sharedClient.isDead) sharedClient.cancel()
+}
+
+/** The live ACP session id, or `null` when no live session exists. Used by
+ *  `lib/agent-activity.ts` to pick THIS tab's session out of the
+ *  `GET /api/acp/activity` snapshot — matching by id, never by "most
+ *  recent" (another tab's agent must not narrate this tab's turn). */
+export function getAcpSessionId(): string | null {
+  return sharedClient && !sharedClient.isDead ? sharedClient.currentSessionId : null
 }
 
 export { AcpConnectionDeadError }

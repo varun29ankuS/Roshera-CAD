@@ -702,6 +702,9 @@ fn describe_operation(method: &Method, path: &str, body: Option<&Value>) -> Opti
 
         // ── agent perception / measurement surface ────────────────
         ["agent", "parts"] if get => "list parts",
+        // `clear_parts` (roshera-mcp/src/tools/modify.ts): DELETE on the
+        // collection deletes EVERY part — a mechanical act worth naming.
+        ["agent", "parts"] if delete => "clear parts",
         ["agent", "parts", _] if get => "inspect part",
         ["agent", "parts", _] if delete => "delete part",
         ["agent", "parts", _, "render"] => "render view",
@@ -806,6 +809,12 @@ fn describe_operation(method: &Method, path: &str, body: Option<&Value>) -> Opti
         ["csketch", _, "revolve"] if post => "revolve sketch",
 
         // ── timeline / branches ───────────────────────────────────
+        // `timeline_mould` (roshera-mcp/src/tools/timeline.ts): edit a
+        // recorded dimensional parameter and re-derive the model.
+        ["timeline", "mould"] if post => "edit parameter",
+        // `bind_parameter_name`: bind a stable name to a recorded
+        // (event, parameter) pair so a mould can target it by name.
+        ["timeline", "parameter-name"] if post => "bind parameter name",
         ["timeline", "undo"] if post => "undo",
         ["timeline", "redo"] if post => "redo",
         ["timeline", "checkpoint"] if post => "create checkpoint",
@@ -840,6 +849,7 @@ fn describe_operation(method: &Method, path: &str, body: Option<&Value>) -> Opti
             "export drawing"
         }
         ["drawings", _, "quality"] => "drawing quality check",
+        ["drawings", _, "semantic"] if get => "drawing semantics query",
         ["drawings", _, "certificate"] => "drawing certificate",
         ["assembly"] if post => "create assembly",
         ["assembly", _, "instance"] if post => "add assembly instance",
@@ -863,6 +873,11 @@ fn describe_operation(method: &Method, path: &str, body: Option<&Value>) -> Opti
         ["hierarchy", ..] if get => "hierarchy query",
         ["kernel", "state"] if get => "kernel state query",
         ["capabilities"] if get => "capabilities query",
+        // roshera-mcp consumes the kernel-served tool registry at boot
+        // (roshera-mcp/src/index.ts `consumeRegistry`) with the same
+        // per-session agent key — name it honestly rather than letting
+        // every session open with an "unnamed operation".
+        ["agent", "tool-registry"] if get => "tool registry query",
         ["document", "units"] => "document units",
         ["acp", "activity"] if get => "activity query",
 
@@ -1228,6 +1243,44 @@ mod tests {
         assert_eq!(
             describe_operation(&Method::POST, "/api/geometry/fillet", None),
             Some("fillet edges".to_string())
+        );
+    }
+
+    #[test]
+    fn mcp_surface_routes_name_themselves() {
+        // Routes roshera-mcp genuinely calls (grepped from its tools/)
+        // that used to fall through to `label: null` — a status line
+        // that can only say "unnamed operation" for a parameter edit is
+        // not an honest activity feed, it is an uninformative one.
+        assert_eq!(
+            describe_operation(&Method::DELETE, "/api/agent/parts", None),
+            Some("clear parts".to_string())
+        );
+        assert_eq!(
+            describe_operation(&Method::POST, "/api/timeline/mould", None),
+            Some("edit parameter".to_string())
+        );
+        assert_eq!(
+            describe_operation(&Method::POST, "/api/timeline/parameter-name", None),
+            Some("bind parameter name".to_string())
+        );
+        assert_eq!(
+            describe_operation(&Method::GET, "/api/drawings/d-1/semantic", None),
+            Some("drawing semantics query".to_string())
+        );
+        assert_eq!(
+            describe_operation(&Method::GET, "/api/agent/tool-registry", None),
+            Some("tool registry query".to_string())
+        );
+        // The method gate still holds: naming the DELETE must not have
+        // leaked a label onto other verbs of the same paths.
+        assert_eq!(
+            describe_operation(&Method::PUT, "/api/agent/parts", None),
+            None
+        );
+        assert_eq!(
+            describe_operation(&Method::GET, "/api/timeline/mould", None),
+            None
         );
     }
 
