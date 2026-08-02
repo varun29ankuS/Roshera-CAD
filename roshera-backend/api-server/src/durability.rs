@@ -225,6 +225,109 @@ pub async fn persist_branch(
     }
 }
 
+/// Persist a named checkpoint so the declared-intent layer survives a restart
+/// (the event log already did; the checkpoints labelling it did not — twice
+/// verified on 2026-08-01). Full `Checkpoint` stored losslessly in the `data`
+/// blob, mirroring [`persist_branch`]. Write-behind failure is named loudly
+/// with its consequence; the in-memory create has already succeeded.
+pub async fn persist_checkpoint(state: &AppState, checkpoint: &timeline_engine::Checkpoint) {
+    if !durability_enabled() {
+        return;
+    }
+    let document_id = state.active_document.read().await.clone();
+    let data = match serde_json::to_value(checkpoint) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(
+                target: "durability",
+                checkpoint = %checkpoint.id,
+                error = %e,
+                "durability: checkpoint could not be serialized — it will NOT survive a restart"
+            );
+            return;
+        }
+    };
+    let record = session_manager::CheckpointRecord {
+        session_id: document_id,
+        checkpoint_id: checkpoint.id.to_string(),
+        branch_id: checkpoint.branch_id.to_string(),
+        created_at: checkpoint.timestamp.timestamp_millis(),
+        data,
+    };
+    if let Err(e) = state.database.save_checkpoint(&record).await {
+        tracing::error!(
+            target: "durability",
+            checkpoint = %checkpoint.id,
+            name = %checkpoint.name,
+            error = %e,
+            "durability: checkpoint '{}' was recorded in memory but NOT persisted — \
+             it will not survive a restart",
+            checkpoint.name
+        );
+    }
+}
+
+/// Boot-time restore of the named-intent layer: reload every persisted
+/// checkpoint for `document_id` into the live timeline, verbatim. A row that
+/// cannot be deserialized is skipped loudly and left in place.
+async fn restore_checkpoints(state: &AppState, document_id: &str) {
+    let records = match state.database.load_checkpoints(document_id).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(target: "durability", error = %e, "durability: could not load checkpoints");
+            return;
+        }
+    };
+    if records.is_empty() {
+        return;
+    }
+    let timeline = state.timeline.read().await;
+    let mut restored = 0usize;
+    for record in records {
+        match serde_json::from_value::<timeline_engine::Checkpoint>(record.data.clone()) {
+            Ok(cp) => {
+                timeline.rehydrate_checkpoint(cp);
+                restored += 1;
+            }
+            Err(e) => tracing::error!(
+                target: "durability",
+                checkpoint = %record.checkpoint_id,
+                error = %e,
+                "durability: persisted checkpoint could not be deserialized — \
+                 skipping it (the row is left in place)"
+            ),
+        }
+    }
+    tracing::info!(target: "durability", restored, document = %document_id, "durability: checkpoints restored");
+}
+
+/// Boot-time hydration of the Blackboard: reload every persisted notebook for
+/// `document_id` into the manager's working set (absent entries only — the
+/// in-memory set always wins, since every mutation writes through).
+async fn restore_blackboard(state: &AppState, document_id: &str) {
+    let rows = match state.database.load_blackboard_notebooks(document_id).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(target: "durability", error = %e, "durability: could not load blackboard notebooks");
+            return;
+        }
+    };
+    if rows.is_empty() {
+        return;
+    }
+    let total = rows.len();
+    let pairs: Vec<(String, serde_json::Value)> =
+        rows.into_iter().map(|r| (r.scope_key, r.data)).collect();
+    let restored = state.blackboard.hydrate(document_id, pairs);
+    tracing::info!(
+        target: "durability",
+        restored,
+        total,
+        document = %document_id,
+        "durability: blackboard notebooks restored"
+    );
+}
+
 /// Boot-time restore + replay. Loads the persisted event log, quarantine-checks
 /// it, rehydrates the timeline (preserving event ids/sequences), replays the
 /// clean prefix into the live model, and rebuilds the uuid↔solid mappings.
@@ -265,6 +368,16 @@ async fn boot_replay_inner(state: &AppState) -> DurabilityStatus {
             tracing::warn!(target: "durability", error = %e, "durability: could not load branch metadata");
         }
     }
+
+    // 1b. Named checkpoints + Blackboard notebooks — restored BEFORE the
+    //     event-log early returns below, because both legitimately exist on a
+    //     document whose event log is empty (a checkpoint on an empty branch,
+    //     notes with no geometry yet). Also wire the Blackboard's
+    //     write-through sink; first call wins, so a document switch
+    //     re-running this path never spawns a second worker.
+    state.blackboard.attach_store(state.database.clone());
+    restore_checkpoints(state, &document_id).await;
+    restore_blackboard(state, &document_id).await;
 
     // 2. Load the full event log, ordered by sequence_number.
     let rows = match state.database.load_all_timeline_events(&document_id).await {

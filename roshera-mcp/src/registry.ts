@@ -307,6 +307,12 @@ const BENCH_OF: Record<string, Bench> = {
   blackboard_edit_entry: "labels",
   blackboard_list: "labels",
   blackboard_clear: "labels",
+  // The closed-question card builder lives with the notebook verbs: its
+  // output is a blackboard line. Full table + labels bench, discovery via
+  // find_tool (the kb_lookup precedent) — asking the human a closed
+  // question is per-decision, not per-feature, so it does not earn
+  // minimal-surface residency.
+  ask_choice: "labels",
 };
 
 /** Bench + stability for a tool name. Meta-tools default to the `meta` bench. */
