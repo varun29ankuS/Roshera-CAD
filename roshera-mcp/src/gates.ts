@@ -274,8 +274,12 @@ const GENERIC_CHECKPOINT_NAME =
  * the field, not a theoretical one. A time or a date carries less than
  * "step 3" — every timeline row already shows its timestamp. Mirrors
  * `CLOCK_CHECKPOINT_NAME` in `roshera-app/src/lib/timeline-events.ts`
- * and `handlers/timeline.rs` (keep the three in sync BY HAND — they
- * live in different packages).
+ * and `api-server/src/handlers/timeline.rs`. The three copies cannot
+ * share a constant across packages, but they are NOT hand-synced on
+ * trust: `regex_copies_agree_across_the_three_packages` (in
+ * timeline.rs's `checkpoint_name_gate_tests`) embeds this file's source
+ * and fails `cargo test -p api-server` if this pattern's text drifts
+ * from the other two.
  */
 const CLOCK_CHECKPOINT_NAME =
   /^(?:(?:step|op|operation|checkpoint|chkpt|cp)[\s\-_#:.]*)?\d{1,4}([:\-/.]\d{1,2}){1,2}(\s*(am|pm))?$/i;

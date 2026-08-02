@@ -607,6 +607,13 @@ mod tests {
     /// `LLMProvider`), never a side effect of adding an allowlist entry
     /// for a vendor whose only support lives on goose's side or in
     /// unwired `universal_endpoint.rs` code.
+    ///
+    /// The serving side of this fact lives in a different crate
+    /// (`api-server/src/ai_provider_config.rs`,
+    /// `goose_declarative_provider_for`); its test
+    /// `allowlist_wired_api_key_paths_match_goose_repin_targets` fails
+    /// `cargo test -p api-server` whenever an api_key entry's
+    /// `WiringStatus` here disagrees with that map.
     const KNOWN_WIRED_PATHS: &[(&str, CredentialMode)] = &[
         ("anthropic", CredentialMode::ApiKey),
         ("anthropic", CredentialMode::OauthProfile),

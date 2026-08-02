@@ -11,10 +11,14 @@
  * description and exact timestamp ride on hover.
  *
  * The two honest gaps are rendered as first-class states, not hidden:
- *  - checkpoints are VOLATILE (they do not survive a restart) and the
- *    policy that the agent declares one before every feature is not yet
- *    enforced — so "N ops recorded without a named decision" is usually
- *    the truth, and this row says exactly that;
+ *  - a span of operations can lack a covering checkpoint: the MCP
+ *    dispatch gate refuses an agent's solid-mutating call with no open
+ *    intent (roshera-mcp gates.ts), but UI actions and direct REST
+ *    clients carry no such gate, and history recorded before the gate
+ *    existed has none — so "N ops recorded without a named decision"
+ *    can still be the truth, and this row says exactly that.
+ *    (Checkpoints themselves are durable — persisted on creation and
+ *    restored at boot, api-server durability.rs.);
  *  - a quarantined boot (the kernel refusing to replay a tail it cannot
  *    certify) is disclosed in the strip header via `DurabilityChip` —
  *    amber, dashed, CircleSlash: the same "withheld / not checked"
@@ -134,10 +138,10 @@ export function DecisionRail({
       <div
         className="flex items-center gap-1.5 px-3 py-1 text-[11px] text-muted-foreground/60"
         title={
-          'No checkpoints exist on this document right now. Checkpoints are volatile — ' +
-          'they do not survive a server restart — and the agent policy of declaring one ' +
-          'before each feature is not yet enforced, so raw operations routinely outlive ' +
-          'the decisions that produced them.'
+          'No checkpoints exist on this document right now. Agents must open a named ' +
+          'intent before mutating the model, but operations made from the UI or by ' +
+          'direct API calls — and history recorded before that gate existed — carry no ' +
+          'declared decision, so raw operations can outlive the intent behind them.'
         }
       >
         <span aria-hidden className="text-muted-foreground/50">◈</span>

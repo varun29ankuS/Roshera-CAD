@@ -34,11 +34,13 @@ export type AuthorKind = 'user' | 'ai' | 'system'
 //
 // A checkpoint is a DECLARED intent — the agent (or user) naming what a
 // span of raw operations was FOR ("bolt circle, 8×⌀18"). This is the
-// layer that turns the event log into a map of decisions. It is also
-// volatile today: checkpoints do not survive a server restart, so the
-// endpoint routinely returns []. Renderers must treat that emptiness as
-// a first-class, true state ("no declared intents"), never hide it and
-// never invent names to fill the gap.
+// layer that turns the event log into a map of decisions. Checkpoints
+// are durable: the backend persists each one on creation and restores
+// them at boot (api-server/src/durability.rs, persist_checkpoint /
+// restore_checkpoints), so an [] from the endpoint means nobody has
+// declared an intent on this document — a first-class, true state.
+// Renderers must show that emptiness as such ("no declared intents"),
+// never hide it and never invent names to fill the gap.
 
 export interface CheckpointSummary {
   id: string
@@ -60,25 +62,33 @@ export function formatEventRange(range: [number, number]): string {
 // ─── Checkpoint-name quality floor ──────────────────────────────────
 //
 // The ◈ button posts straight to `POST /api/timeline/checkpoint`, which
-// bypasses the MCP intent gate entirely — so the client is the only
-// place the "no named-nothing checkpoints" line can be held for human-
-// created checkpoints today. This mirrors `GENERIC_CHECKPOINT_NAME` in
-// `roshera-mcp/src/gates.ts` (keep the two in sync BY HAND — they live
-// in different packages): a generic word, an ordinal, or both — "step
-// 3", "cp 2", "checkpoint", "7" — is a sequence position, not an
-// intent. Any real intent phrase ("bolt circle 8 x D18 on D160 B.C.",
-// even the terse "cut cylinders") passes; quality beyond this floor
-// stays judgment, not schema.
+// bypasses the MCP intent gate — but the route itself now holds the
+// floor too (`checkpoint_name_refusal` in api-server/src/handlers/
+// timeline.rs returns a typed 422), so this client copy exists to
+// refuse locally, before a round trip. It mirrors
+// `GENERIC_CHECKPOINT_NAME` in `roshera-mcp/src/gates.ts` and the Rust
+// floor. The three copies cannot share a constant across packages, but
+// they are NOT hand-synced on trust:
+// `regex_copies_agree_across_the_three_packages` (timeline.rs,
+// `checkpoint_name_gate_tests`) embeds this file's source and fails
+// `cargo test -p api-server` if this pattern's text drifts from the
+// other two. The rule: a generic word, an ordinal, or both — "step 3",
+// "cp 2", "checkpoint", "7" — is a sequence position, not an intent.
+// Any real intent phrase ("bolt circle 8 x D18 on D160 B.C.", even the
+// terse "cut cylinders") passes; quality beyond this floor stays
+// judgment, not schema.
 
 const GENERIC_CHECKPOINT_NAME =
   /^(?:(?:step|op|operation|cut|feature|part|checkpoint|chkpt|cp|test|wip|tmp|temp|misc)[\s\-_#:.]*)?\d*$/i
 
-// Strict SUPERSET of the MCP gate: also refuse a bare clock/date
-// reading (with or without a generic-word prefix) — "Checkpoint
-// 9:59:36 PM", "10:05", "2026-08-01". That is exactly the named-nothing
-// string this UI's own button used to mint from the system clock; it
-// slips the gate's regex while carrying less than "step 3" (every row
-// already shows its time).
+// Refuse a bare clock/date reading (with or without a generic-word
+// prefix) — "Checkpoint 9:59:36 PM", "10:05", "2026-08-01". That is
+// exactly the named-nothing string this UI's own button used to mint
+// from the system clock; it slips the generic regex above (whose tail
+// accepts only a plain ordinal) while carrying less than "step 3"
+// (every row already shows its time). This rule was found here first,
+// then adopted by the MCP gate and the REST floor — all three now
+// carry it, kept identical by the parity test named above.
 const CLOCK_CHECKPOINT_NAME =
   /^(?:(?:step|op|operation|checkpoint|chkpt|cp)[\s\-_#:.]*)?\d{1,4}([:\-/.]\d{1,2}){1,2}(\s*(am|pm))?$/i
 
