@@ -1,6 +1,7 @@
 import { useContext, useState } from 'react'
 import { ListChecks } from 'lucide-react'
 import type { DetectedChoiceSet } from '@/lib/blackboard-cards'
+import { useTurnQueue } from '@/lib/blackboard-composer'
 import { CardShell, Chip } from './card-chrome'
 import { CardActionsContext } from './card-actions-context'
 import { ChoiceButtons } from './ChoiceButtons'
@@ -35,6 +36,14 @@ function truncateLabel(text: string, max: number): string {
 export function DetectedChoicesCard({ set }: { set: DetectedChoiceSet }) {
   const actions = useContext(CardActionsContext)
   const [chosen, setChosen] = useState<string | null>(null)
+  const queue = useTurnQueue()
+  // Same chip contract as ChoicesCard (see its module doc): colour moves
+  // with the words through the states that actually exist — detected →
+  // queued (waiting behind the head turn) → sent · in flight → sent
+  // (settled). No "executed": whether the agent then DID the thing is the
+  // turn's outcome, reported by TurnStatusGlyph on the turn's own line.
+  // 0 = in flight, >0 = waiting, -1 = settled.
+  const queueIndex = chosen !== null ? queue.findIndex((q) => q.text === chosen) : -1
   // Same rule as ChoicesCard: no CardActionsContext (the fixtures gallery)
   // means there is no line to answer — buttons render for preview but stay
   // inert.
@@ -42,21 +51,38 @@ export function DetectedChoicesCard({ set }: { set: DetectedChoiceSet }) {
 
   return (
     <CardShell
-      accent={chosen !== null ? 'pass' : 'info'}
+      accent={chosen !== null ? (queueIndex === -1 ? 'pass' : 'warn') : 'info'}
       icon={ListChecks}
       title="Options detected in the text above"
       chip={
-        chosen !== null ? (
-          <Chip accent="pass" title="Sent as your reply">
-            sent
-          </Chip>
-        ) : (
+        chosen === null ? (
           <Chip
             accent="info"
             dashed
             title="Added by the board from the agent's own 'Option A: / Option B: …' enumeration above — not a roshera:choices fence the agent authored"
           >
             detected, not fenced
+          </Chip>
+        ) : queueIndex > 0 ? (
+          <Chip
+            accent="warn"
+            title="Your pick was accepted; its reply waits behind the turn already in flight"
+          >
+            queued
+          </Chip>
+        ) : queueIndex === 0 ? (
+          <Chip
+            accent="warn"
+            title="Sent as your reply — its turn is in flight now; the turn's own status line says what the agent is doing with it"
+          >
+            sent · in flight
+          </Chip>
+        ) : (
+          <Chip
+            accent="pass"
+            title="Sent as your reply; that turn has settled. How it ended is reported on the turn's own line, not here."
+          >
+            sent
           </Chip>
         )
       }

@@ -491,4 +491,12 @@ export function cancelAcpTurn(): void {
   if (sharedClient && !sharedClient.isDead) sharedClient.cancel()
 }
 
+/** The live ACP session id, or `null` when no live session exists. Used by
+ *  `lib/agent-activity.ts` to pick THIS tab's session out of the
+ *  `GET /api/acp/activity` snapshot — matching by id, never by "most
+ *  recent" (another tab's agent must not narrate this tab's turn). */
+export function getAcpSessionId(): string | null {
+  return sharedClient && !sharedClient.isDead ? sharedClient.currentSessionId : null
+}
+
 export { AcpConnectionDeadError }
