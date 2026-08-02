@@ -156,11 +156,17 @@ export function Blackboard() {
     // raw stores keeps the effect honest if selection changes within the set.
   }, [selectedPart, selectedIds, objects, setActiveScope])
 
+  // Names which notebook is on screen, not just what it's currently about —
+  // "Bracket-A" alone reads the same whether you're in that part's own
+  // notebook or the document notebook happens to mention it. A silent swap
+  // between two notebooks that look alike is indistinguishable from data
+  // loss (the switch-away-and-back bug this label exists to prevent), so
+  // the scope kind ('Part' vs 'Document') always leads.
   const scopeLabel =
     activeScope === DOCUMENT_SCOPE
       ? 'Document'
       : selectedPart
-        ? selectedPart.name
+        ? `Part: ${selectedPart.name}`
         : 'Part'
 
   // ── Checkpoint sections ─────────────────────────────────────────────

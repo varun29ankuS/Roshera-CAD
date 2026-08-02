@@ -38,10 +38,13 @@
 //!     entries, so nothing written before scoping is lost.
 //!
 //! The store keys notebooks by the scope's canonical string
-//! (`part:<uuid>` / `assembly:<uuid>` / `document`), so the existing
+//! (`part:<solid_id>` / `assembly:<uuid>` / `document`), so the existing
 //! lock-free `DashMap<String, Arc<RwLock<Notebook>>>` concurrency model is
 //! unchanged — a write to one part's notebook never contends with a read of
-//! another's.
+//! another's. `<solid_id>` is the kernel's own integer `SolidId` — the
+//! CANONICAL storage key for a part, so the same notebook is reachable no
+//! matter which of the two id spaces a caller addresses it by (see
+//! [`BlackboardScope::Part`] and `resolve_scope_token`).
 //!
 //! # Concurrency
 //!
@@ -57,6 +60,7 @@ use axum::{
     response::Json,
 };
 use dashmap::DashMap;
+use geometry_engine::primitives::solid::SolidId;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -75,9 +79,27 @@ use uuid::Uuid;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum BlackboardScope {
-    /// A single part's notebook, keyed by the part's public UUID.
-    Part { id: Uuid },
-    /// An assembly's notebook (cross-part calcs), keyed by the assembly UUID.
+    /// A single part's notebook, keyed by the kernel's own `SolidId` (a
+    /// `u32`) — the SAME id `GET /api/agent/parts` and every other
+    /// part-addressing endpoint use. This is the CANONICAL storage id; a
+    /// caller may still address a part by its UUID alias (the frontend
+    /// scene/viewport store's id, registered via `register_id_mapping` for
+    /// WS/collab addressing) — `resolve_scope_token` translates that alias
+    /// to this `SolidId` before it ever reaches a `BlackboardScope`, so both
+    /// spellings land on the SAME notebook and this variant only ever holds
+    /// one canonical value per part.
+    ///
+    /// This field used to BE the `Uuid` directly, which is why part-scoped
+    /// notebooks never worked for an agent addressing a part by `SolidId`
+    /// (`part:8` demanded `Uuid::parse_str("8")`, which always failed) —
+    /// see `resolve_scope_token`'s doc for the live-measured proof that the
+    /// frontend's OWN selection uses the UUID alias, not the bare `SolidId`,
+    /// so both forms have to keep working, translated to one canonical key.
+    Part { id: SolidId },
+    /// An assembly's notebook (cross-part calcs), keyed by the assembly UUID
+    /// — assemblies genuinely ARE `Uuid`-keyed (`AssemblyManager::assemblies:
+    /// DashMap<Uuid, ...>` in `assembly_mgr.rs`), so this half of the
+    /// original design was correct and is unchanged.
     Assembly { id: Uuid },
     /// The document / session-wide notebook — the home for entries with no
     /// narrower owner and the migration target for legacy un-scoped entries.
@@ -97,9 +119,12 @@ impl BlackboardScope {
 
     /// Parse a scope from a loose wire token. Accepts, in order:
     ///   - `"document"` (any case) → [`BlackboardScope::Document`]
-    ///   - `"part:<uuid>"` / `"assembly:<uuid>"` (the canonical key form)
-    ///   - a bare `<uuid>` → [`BlackboardScope::Part`] (the common case: a
-    ///     caller that holds a part UUID and wants that part's notebook)
+    ///   - `"part:<solid_id>"` (the canonical key form; `<solid_id>` is the
+    ///     kernel's integer `SolidId`, e.g. `part:8`)
+    ///   - `"assembly:<uuid>"` (the canonical key form; assemblies really are
+    ///     UUID-keyed)
+    ///   - a bare `<solid_id>` → [`BlackboardScope::Part`] (the common case: a
+    ///     caller that holds a kernel part id and wants that part's notebook)
     ///
     /// Returns `None` for an unparseable token so the caller can reject it
     /// loudly rather than silently writing to the wrong notebook.
@@ -109,7 +134,9 @@ impl BlackboardScope {
             return Some(BlackboardScope::Document);
         }
         if let Some(rest) = t.strip_prefix("part:") {
-            return Uuid::parse_str(rest.trim())
+            return rest
+                .trim()
+                .parse::<SolidId>()
                 .ok()
                 .map(|id| BlackboardScope::Part { id });
         }
@@ -118,8 +145,9 @@ impl BlackboardScope {
                 .ok()
                 .map(|id| BlackboardScope::Assembly { id });
         }
-        // Bare UUID → a part scope (the most common caller intent).
-        Uuid::parse_str(t)
+        // Bare integer → a part scope (the most common caller intent: an
+        // agent or the frontend holding a kernel SolidId).
+        t.parse::<SolidId>()
             .ok()
             .map(|id| BlackboardScope::Part { id })
     }
@@ -519,15 +547,18 @@ pub struct AddEntryRequest {
     /// edit / delete. Omitted by agents / raw REST → server-generated id.
     #[serde(default)]
     pub id: Option<String>,
-    /// Owning scope token (see [`BlackboardScope::parse`]). The frontend
-    /// sends the selected part's `part:<uuid>`; an agent sends a part UUID or
-    /// integer kernel `part_id`. Omitted → the [`BlackboardScope::Document`]
-    /// notebook, so an un-scoped POST keeps working (migration default).
+    /// Owning scope token — see [`resolve_scope_token`] for the full
+    /// resolution rules. The frontend sends the selected part's
+    /// `part:<uuid>` (the scene/viewport's id alias); an agent sends the
+    /// kernel's own integer `part_id` — both spellings resolve to the SAME
+    /// notebook. Omitted → the [`BlackboardScope::Document`] notebook, so an
+    /// un-scoped POST keeps working (migration default).
     #[serde(default)]
     pub scope: Option<String>,
     /// Convenience alias for a part scope — `part_id` is the field name the
-    /// MCP tools and `/api/agent/parts/{id}` already speak. Accepts a part
-    /// UUID or an integer kernel `SolidId`. Ignored when `scope` is present.
+    /// MCP tools and `/api/agent/parts/{id}` already speak. Accepts either a
+    /// kernel `SolidId` or a part UUID alias (see [`resolve_scope_token`]).
+    /// Ignored when `scope` is present.
     #[serde(default)]
     pub part_id: Option<String>,
 }
@@ -542,8 +573,9 @@ pub struct EditEntryRequest {
 }
 
 /// Query params for the scope-filtered GET / mutate routes. Either `scope`
-/// (a full token) or `part_id` (a part UUID / integer SolidId convenience)
-/// selects the notebook; both omitted → the Document notebook.
+/// (a full token) or `part_id` (a kernel `SolidId` or part UUID convenience —
+/// see [`resolve_scope_token`]) selects the notebook; both omitted → the
+/// Document notebook.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ScopeQuery {
     #[serde(default)]
@@ -568,30 +600,47 @@ fn bad_scope(token: &str) -> ApiError {
         format!("unrecognised blackboard scope '{token}'"),
     )
     .with_hint(
-        "Use 'document', 'part:<uuid>', 'assembly:<uuid>', a bare part UUID, \
-         or an integer kernel part_id.",
+        "Use 'document', 'part:<solid_id>', 'part:<uuid>', 'assembly:<uuid>', \
+         a bare integer kernel part_id, or a bare part UUID.",
     )
 }
 
-/// Resolve a wire token to a [`BlackboardScope`], translating an integer
-/// kernel `SolidId` to its public part UUID via the id mapping so the agent
-/// (which addresses parts by `SolidId`) and the frontend (which holds the
-/// UUID) land on the SAME notebook. Returns `None` only for a syntactically
-/// valid-but-unknown SolidId; `Err(token)` for an unparseable token.
+/// Resolve a wire token to a [`BlackboardScope`]. A part is addressable by
+/// EITHER of two id spaces that both name the same underlying solid:
+///   - the kernel's own `SolidId` (what `GET /api/agent/parts` and the MCP
+///     tools use) — handled by [`BlackboardScope::parse`] with no lookup.
+///   - a UUID alias (what the frontend's scene/viewport store holds — see
+///     `register_id_mapping` / `create_uuid_for_local` in `main.rs`, used
+///     for WS/collab addressing) — translated here via [`AppState::get_local_id`]
+///     so both spellings land on the SAME notebook, keyed by the canonical
+///     `SolidId`.
+/// Measured live (2026-08-02): the running frontend's part selection sends
+/// exactly this UUID form (`part:dc6e2058-...`), not the numeric id — a
+/// version of this resolver that only accepted `SolidId` parsed the agent's
+/// `part:8` but 400'd on every real browser selection. Returns a 400 for a
+/// token that is neither a valid `SolidId`/`Uuid` shape nor a UUID that
+/// resolves to a live part, rather than silently landing on some other
+/// notebook.
 fn resolve_scope_token(state: &AppState, token: &str) -> Result<BlackboardScope, ApiError> {
     let t = token.trim();
-    // Bare integer → a kernel SolidId the agent holds; map it to the part UUID.
-    if let Ok(solid_id) = t.parse::<u32>() {
-        return match state.get_uuid(solid_id) {
-            Some(uuid) => Ok(BlackboardScope::Part { id: uuid }),
-            None => Err(ApiError::new(
-                ErrorCode::InvalidParameter,
-                format!("no part registered for kernel part_id {solid_id}"),
-            )
-            .with_hint("Call GET /api/agent/parts to list current part ids.")),
-        };
+    if let Some(scope) = BlackboardScope::parse(t) {
+        return Ok(scope);
     }
-    BlackboardScope::parse(t).ok_or_else(|| bad_scope(t))
+    if t.strip_prefix("assembly:").is_some() {
+        // A well-formed assembly token whose uuid failed to parse — an
+        // assembly id space error, not a part-uuid fallback candidate.
+        return Err(bad_scope(t));
+    }
+    let uuid_str = t.strip_prefix("part:").unwrap_or(t).trim();
+    let uuid = Uuid::parse_str(uuid_str).map_err(|_| bad_scope(t))?;
+    match state.get_local_id(&uuid) {
+        Some(id) => Ok(BlackboardScope::Part { id }),
+        None => Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            format!("no part registered for uuid {uuid}"),
+        )
+        .with_hint("Call GET /api/agent/parts to list current part ids.")),
+    }
 }
 
 /// Resolve the scope a request targets from an optional `scope` token, an
@@ -615,9 +664,9 @@ fn resolve_scope(
 
 /// `GET /api/blackboard` — the document for a scope (lines + event log).
 ///
-/// `?scope=part:<uuid>` / `?part_id=<uuid|solid_id>` selects a part's (or
-/// assembly's) notebook; no query → the Document notebook, so an un-scoped
-/// GET keeps returning the document-wide notes (backward compatible).
+/// `?scope=part:<solid_id|uuid>` / `?part_id=<solid_id|uuid>` selects a
+/// part's (or assembly's) notebook; no query → the Document notebook, so an
+/// un-scoped GET keeps returning the document-wide notes (backward compatible).
 pub async fn get_blackboard(
     State(state): State<AppState>,
     Query(q): Query<ScopeQuery>,
@@ -729,9 +778,7 @@ mod tests {
     const D: &str = "doc-under-test";
 
     fn part_scope() -> BlackboardScope {
-        BlackboardScope::Part {
-            id: Uuid::from_u128(0x1111),
-        }
+        BlackboardScope::Part { id: 0x1111 }
     }
 
     /// `System` must survive the wire in BOTH directions as its own value.
@@ -914,12 +961,8 @@ mod tests {
     #[tokio::test]
     async fn notebooks_are_independent() {
         let mgr = BlackboardManager::new();
-        let a = BlackboardScope::Part {
-            id: Uuid::from_u128(0xa),
-        };
-        let b = BlackboardScope::Part {
-            id: Uuid::from_u128(0xb),
-        };
+        let a = BlackboardScope::Part { id: 0xa };
+        let b = BlackboardScope::Part { id: 0xb };
         mgr.add(D, &a, None, "a".into(), LineAuthor::User).await;
         let snap_b = mgr.snapshot(D, &b).await;
         assert!(snap_b.lines.is_empty(), "distinct notebooks share no state");
@@ -932,12 +975,8 @@ mod tests {
         // THE isolation proof at the store level: a calc on part A and a
         // different calc on part B never cross-contaminate.
         let mgr = BlackboardManager::new();
-        let part_a = BlackboardScope::Part {
-            id: Uuid::from_u128(0xAAAA),
-        };
-        let part_b = BlackboardScope::Part {
-            id: Uuid::from_u128(0xBBBB),
-        };
+        let part_a = BlackboardScope::Part { id: 0xAAAA };
+        let part_b = BlackboardScope::Part { id: 0xBBBB };
 
         mgr.add(
             D,
@@ -985,9 +1024,7 @@ mod tests {
     async fn clearing_one_scope_leaves_others_intact() {
         let mgr = BlackboardManager::new();
         let part_a = part_scope();
-        let part_b = BlackboardScope::Part {
-            id: Uuid::from_u128(0x2222),
-        };
+        let part_b = BlackboardScope::Part { id: 0x2222 };
         mgr.add(D, &part_a, None, "a".into(), LineAuthor::Agent)
             .await;
         mgr.add(D, &part_b, None, "b".into(), LineAuthor::Agent)
@@ -1052,30 +1089,66 @@ mod tests {
 
     #[test]
     fn scope_key_is_canonical_and_round_trips() {
-        let id = Uuid::from_u128(0x1234);
+        let part_id: SolidId = 1234;
+        let assembly_id = Uuid::from_u128(0x1234);
         assert_eq!(BlackboardScope::Document.key(), "document");
-        assert_eq!(BlackboardScope::Part { id }.key(), format!("part:{id}"));
         assert_eq!(
-            BlackboardScope::Assembly { id }.key(),
-            format!("assembly:{id}")
+            BlackboardScope::Part { id: part_id }.key(),
+            format!("part:{part_id}")
+        );
+        assert_eq!(
+            BlackboardScope::Assembly { id: assembly_id }.key(),
+            format!("assembly:{assembly_id}")
         );
 
-        // parse() accepts the canonical key, a bare uuid (→ part), and
-        // 'document'; the bare-uuid path is the migration-friendly common case.
+        // parse() accepts the canonical key, a bare integer (→ part), and
+        // 'document'; the bare-integer path is the common caller intent (an
+        // agent or the frontend holding a kernel SolidId).
         assert_eq!(
-            BlackboardScope::parse(&format!("part:{id}")),
-            Some(BlackboardScope::Part { id })
+            BlackboardScope::parse(&format!("part:{part_id}")),
+            Some(BlackboardScope::Part { id: part_id })
         );
         assert_eq!(
-            BlackboardScope::parse(&id.to_string()),
-            Some(BlackboardScope::Part { id }),
-            "a bare uuid is a part scope"
+            BlackboardScope::parse(&part_id.to_string()),
+            Some(BlackboardScope::Part { id: part_id }),
+            "a bare integer is a part scope"
+        );
+        assert_eq!(
+            BlackboardScope::parse(&format!("assembly:{assembly_id}")),
+            Some(BlackboardScope::Assembly { id: assembly_id }),
+            "assemblies really are UUID-keyed — unlike Part, this is unchanged"
         );
         assert_eq!(
             BlackboardScope::parse("document"),
             Some(BlackboardScope::Document)
         );
         assert_eq!(BlackboardScope::parse("not-a-scope"), None);
+    }
+
+    /// THE regression this fix closes. Measured live against the running
+    /// server (2026-08-01): `GET /api/agent/parts` returns a real part whose
+    /// id is the numeric kernel `SolidId` `8` — never a UUID — yet
+    /// `GET /api/blackboard?scope=part:8` returned HTTP 400, because `parse`
+    /// used to demand `Uuid::parse_str` after `part:`. Every real part's
+    /// notebook was therefore unaddressable; this is not "lost on switch",
+    /// it never worked. Fails on the old code (`Uuid::parse_str("8")` errors
+    /// → `None` → 400) and passes with the fix.
+    #[test]
+    fn a_real_kernel_part_id_parses_as_a_part_scope() {
+        assert_eq!(
+            BlackboardScope::parse("part:8"),
+            Some(BlackboardScope::Part { id: 8 }),
+            "the kernel's actual SolidId shape must resolve to a notebook"
+        );
+        // A genuinely malformed token must still be refused loudly rather
+        // than silently landing on some other notebook.
+        assert_eq!(BlackboardScope::parse("part:not-an-id"), None);
+        assert_eq!(BlackboardScope::parse("part:"), None);
+        assert_eq!(
+            BlackboardScope::parse("part:-1"),
+            None,
+            "SolidId is unsigned"
+        );
     }
 
     #[test]
