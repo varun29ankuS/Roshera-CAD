@@ -4,13 +4,34 @@ import type { ToolHost } from "../registry.js";
 import { z } from "zod";
 import { api, ok, fail, okp, newestPartId } from "../core.js";
 
+/** Wire shape of a sketch plane: a standard-plane string or a custom
+ * orthonormal frame (as returned by psketch_plane_from_face). The
+ * backend REFUSES non-orthonormal custom frames typed (a skewed frame
+ * would silently shear the profile) — do not hand-build one unless the
+ * axes are unit-length and perpendicular. */
+const planeSchema = z
+  .union([
+    z.enum(["xy", "xz", "yz"]),
+    z.object({
+      origin: z.array(z.number()).length(3).describe("plane-local (0,0) in world mm"),
+      u_axis: z.array(z.number()).length(3).describe("unit sketch-X in world coords"),
+      v_axis: z.array(z.number()).length(3).describe("unit sketch-Y in world coords"),
+    }),
+  ])
+  .describe(
+    "sketch plane: 'xy'|'xz'|'yz' or {origin,u_axis,v_axis} custom frame " +
+      "(use psketch_plane_from_face for a face-anchored frame); default 'xy'",
+  );
+
 export function registerPsketchTools(server: ToolHost) {
   server.tool(
     "psketch_begin",
-    "START a new PARAMETRIC sketch session (constraint-solver backed, XY plane); " +
-      "returns csketch_id. Opens the session only — add geometry with " +
-      "psketch_add_entity, then psketch_constrain/psketch_solve. Prefer over " +
-      "create_sketch for machine-precision solving.",
+    "START a new PARAMETRIC sketch session (constraint-solver backed); " +
+      "returns csketch_id. The sketch is pure 2D — its world placement is " +
+      "chosen at psketch_extrude/psketch_revolve time via their `plane` " +
+      "param (standard or custom/face-anchored frame). Opens the session " +
+      "only — add geometry with psketch_add_entity, then psketch_constrain/" +
+      "psketch_solve. Prefer over create_sketch for machine-precision solving.",
     {},
     async () => {
       try {
@@ -62,10 +83,15 @@ export function registerPsketchTools(server: ToolHost) {
   server.tool(
     "psketch_constrain",
     "Add a constraint to a parametric sketch. GEOMETRIC: Horizontal/Vertical/" +
-      "Parallel/Perpendicular/Coincident/Tangent/Concentric/Equal. CONTINUITY: " +
+      "Parallel/Perpendicular/Coincident/Collinear/Midpoint/PointOnCurve/" +
+      "Tangent/Concentric/Equal/Symmetric (about a line). CONTINUITY: " +
       "SmoothTangent (G1), CurvatureContinuity (G2) between a curve pair; " +
       "CurvatureExtremum holds a spline point at the apex. DIMENSIONAL: " +
-      "{Distance:80.0} mm / {Radius:6.0} mm / {Angle:1.57} rad / {Curvature:k}.",
+      "{Distance:80.0} mm / {Radius:6.0} / {Diameter:12.0} / {Length:40.0} / " +
+      "{XCoordinate:x} / {YCoordinate:y} / {Angle:1.57} rad / {Curvature:k}; " +
+      "inequalities {MinDistance:d} / {MaxDistance:d}. Unsupported kind/entity " +
+      "pairings REFUSE typed (irreducible residual, 0 DOF removed) rather than " +
+      "silently no-op — read psketch_certify after constraining.",
     {
       csketch_id: z.string().uuid().describe("csketch id (psketch_begin)"),
       constraint_type: z
@@ -207,19 +233,59 @@ export function registerPsketchTools(server: ToolHost) {
   );
 
   server.tool(
+    "psketch_plane_from_face",
+    "Derive a CUSTOM sketch plane from a planar face of an existing part " +
+      "(sketch-on-face). Returns {origin,u_axis,v_axis} — pass it as `plane` " +
+      "to psketch_extrude/psketch_revolve to place the profile on that face; " +
+      "the frame's normal points OUT of the part, so a positive extrude " +
+      "distance grows a boss and a negative one cuts inward only via boolean. " +
+      "Refuses typed when the face is not planar or not owned by the part.",
+    {
+      object_uuid: z.string().uuid().describe("part object uuid (e.g. from list_parts)"),
+      face_id: z
+        .number()
+        .int()
+        .nonnegative()
+        .describe("kernel face id on that part (inspect/perception tools list them)"),
+    },
+    async ({ object_uuid, face_id }) => {
+      try {
+        const plane = await api("POST", "/api/sketch/plane-from-face", {
+          object_id: object_uuid,
+          face_id,
+        });
+        return ok({ plane });
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  server.tool(
     "psketch_extrude",
     "Extrude the parametric sketch's closed regions into a solid. Hole-aware " +
-      "(circles inside an outline become bores). On topology errors the response " +
-      "names every gap/dangling endpoint for surgical repair.",
+      "(circles inside an outline become bores). `plane` places the profile in " +
+      "the world (default XY; custom frames must be orthonormal — refused typed " +
+      "otherwise); `direction` (default plane normal) may be oblique but an " +
+      "in-plane direction refuses typed (zero-thickness sweep). On topology " +
+      "errors the response names every gap/dangling endpoint for surgical repair.",
     {
       csketch_id: z.string().uuid().describe("csketch id (psketch_begin)"),
       distance: z.number().describe("extrusion length (mm); sign sets direction"),
+      plane: planeSchema.optional(),
+      direction: z
+        .array(z.number())
+        .length(3)
+        .optional()
+        .describe("world-space extrude direction; default = plane normal; oblique allowed"),
       name: z.string().optional().describe("display name"),
     },
-    async ({ csketch_id, distance, name }) => {
+    async ({ csketch_id, distance, plane, direction, name }) => {
       try {
         const r = await api("POST", `/api/csketch/${csketch_id}/extrude`, {
           distance,
+          plane: plane ?? undefined,
+          direction: direction ?? undefined,
           name: name ?? null,
         });
         const part_id = await newestPartId();
@@ -244,9 +310,12 @@ export function registerPsketchTools(server: ToolHost) {
     "Revolve the parametric sketch's closed regions about an IN-PLANE axis. " +
       "Typed-analytic where honest: lines → exact cylinder/cone bands + planar " +
       "annuli, arcs/splines → exact revolved surfaces; full circles fall back to " +
-      "sampling (stats.sampled_loops). Profiles must not cross the axis.",
+      "sampling (stats.sampled_loops). Profiles must not cross the axis. " +
+      "`plane` places the profile in the world (default XY; custom frames must " +
+      "be orthonormal — refused typed otherwise).",
     {
       csketch_id: z.string().uuid().describe("csketch id (psketch_begin)"),
+      plane: planeSchema.optional(),
       axis_origin: z
         .array(z.number()).length(2)
         .describe("point on the axis, sketch-plane coords [x,y] mm"),
@@ -263,9 +332,10 @@ export function registerPsketchTools(server: ToolHost) {
         .describe("angular tessellation count for sampled loops"),
       name: z.string().optional().describe("display name"),
     },
-    async ({ csketch_id, axis_origin, axis_direction, angle, segments, name }) => {
+    async ({ csketch_id, plane, axis_origin, axis_direction, angle, segments, name }) => {
       try {
         const r = await api("POST", `/api/csketch/${csketch_id}/revolve`, {
+          plane: plane ?? undefined,
           axis_origin,
           axis_direction,
           angle: angle ?? undefined,
