@@ -259,6 +259,11 @@ const BENCH_OF: Record<string, Bench> = {
   psketch_op: "sketch",
   psketch_extrude: "sketch",
   psketch_revolve: "sketch",
+  // Sketch-on-face. Belongs on the sketch bench, not the meta fallback: an
+  // agent that switches to `sketch` to build a profile is exactly the agent
+  // that needs to anchor it to a face, and an unlisted tool is one it will not
+  // reach for. Landing in the fallback is why the surface counts moved.
+  psketch_plane_from_face: "sketch",
   // assembly
   assembly_verify: "assembly",
   assembly_create: "assembly",

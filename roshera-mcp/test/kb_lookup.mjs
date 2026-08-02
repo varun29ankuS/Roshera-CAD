@@ -139,7 +139,7 @@ console.log("(p) PROVENANCE: every value carries a source; oracle mutation-prove
   // Live sweep: every kind/key the tool serves, including refusal paths.
   const sweep = [
     ["reference", "clearance_hole", { fastener: "M6", class: "close" }],
-    ["reference", "clearance_hole", { fastener: "M6" }], // refusal (Q6)
+    ["reference", "clearance_hole", { fastener: "M6" }], // house default (Q6 closed)
     ["reference", "tap_drill", { thread: "M6x1.0" }],
     ["reference", "general_tolerance", { nominal_mm: 50, class: "m" }],
     ["reference", "general_tolerance", { nominal_mm: 50 }], // refusal (Q1)
@@ -227,10 +227,45 @@ console.log("(r) REFERENCE: doc §5.3 worked examples reproduce");
 // ── (h) HONESTY — [V]/conflicting items refuse by name ──────────────────────
 console.log("(h) HONESTY: open questions and vendor conflicts refuse, never default");
 {
-  const noClass = await lookup("reference", "clearance_hole", { fastener: "M6" });
-  if (noClass && noClass.refused === true && /Q6/.test(noClass.reason))
-    pass("clearance_hole without class REFUSES naming open question Q6 (no house default)");
-  else fail(`clearance_hole without class must refuse naming Q6: ${JSON.stringify(noClass)}`);
+  // §8-Q6 CLOSED 2026-08-02 (Varun): the house clearance class is ISO 273
+  // medium. This block used to pin the REFUSAL; the refusal was correct only
+  // while no house answer existed, and it had a price — it blocked a live agent
+  // build, and Haiku rightly escalated rather than invent a diameter.
+  //
+  // Closing it does NOT mean the answer goes quiet. An engineer must still be
+  // able to tell "the house decided this for you" from "you asked for this",
+  // because only one of those is a decision they made. So the default answers,
+  // and it says whose answer it is — `class_source` and the prose source both.
+  const houseClass = await lookup("reference", "clearance_hole", { fastener: "M8" });
+  if (
+    houseClass && houseClass.refused !== true &&
+    houseClass.value && houseClass.value.diameter_mm === 9.0 &&
+    houseClass.value.class === "medium" &&
+    houseClass.value.class_source === "house_default"
+  )
+    pass("clearance_hole(M8) with no class = 9.0 mm via the house default (§8-Q6 closed)");
+  else fail(`clearance_hole(M8) must answer 9.0 from the house default: ${JSON.stringify(houseClass)}`);
+
+  if (houseClass && houseClass.source && /house default/i.test(houseClass.source) && /8-Q6/.test(houseClass.source))
+    pass("house-default answer ATTRIBUTES itself in prose (names the house decision, not just ISO)");
+  else fail(`house-default source must name itself a house default: ${JSON.stringify(houseClass && houseClass.source)}`);
+
+  // Mutation control: an implementation that stamps `house_default` on every
+  // answer would pass the two checks above. An explicitly-requested class must
+  // still read as the caller's choice — otherwise the attribution is decoration.
+  const askedClass = await lookup("reference", "clearance_hole", { fastener: "M8", class: "close" });
+  if (
+    askedClass && askedClass.value && askedClass.value.diameter_mm === 8.4 &&
+    askedClass.value.class_source === "explicit" && !/house default/i.test(askedClass.source)
+  )
+    pass("an explicitly-requested class reads as 'explicit', never as the house default (mutation control)");
+  else fail(`explicit class must not be attributed to the house: ${JSON.stringify(askedClass)}`);
+
+  // Closing the question widens the default; it does not widen the vocabulary.
+  const badClass = await lookup("reference", "clearance_hole", { fastener: "M8", class: "snug" });
+  if (badClass && badClass.refused === true && Array.isArray(badClass.valid_keys))
+    pass("an unknown clearance class still REFUSES and names the valid keys");
+  else fail(`unknown class must still refuse: ${JSON.stringify(badClass)}`);
 
   const noTolClass = await lookup("reference", "general_tolerance", { nominal_mm: 50 });
   if (noTolClass && noTolClass.refused === true && /Q1/.test(noTolClass.reason))

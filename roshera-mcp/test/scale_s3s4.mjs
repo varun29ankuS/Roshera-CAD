@@ -78,12 +78,18 @@ console.log("(w1) WORKBENCH status shape");
   // (2026-07-31 bench-hygiene pass) carries all 15 history/branching/
   // certification tools: the 12 timeline_* verbs + rebuild_certificate +
   // clear_timeline + bind_parameter_name.
+  // 2026-08-02 repin, all three earned:
+  //   sketch 14→15   psketch_plane_from_face. It had fallen through to the
+  //                  `meta` fallback, so sketch-on-face was unreachable from
+  //                  the sketch bench — this pin is what surfaced it.
+  //   analysis 13→14 kb_lookup (policy-KB slice, 07-31).
+  //   labels   10→11 ask_choice (closed-question slice, 08-02).
   const EXPECTED_BENCH_COUNTS = {
-    sketch: 14,
+    sketch: 15,
     assembly: 12,
     drawing: 8,
-    analysis: 13,
-    labels: 10,
+    analysis: 14,
+    labels: 11,
     timeline: 15,
   };
   for (const [bench, expected] of Object.entries(EXPECTED_BENCH_COUNTS)) {
