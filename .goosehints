@@ -15,6 +15,21 @@ tool_sequence and DOF scheme, and kb_lookup(kind:"pack", key:"<process>") once p
 before committing to a manufacturing process. This is your highest-value action -- it is
 why the knowledge base exists.
 
+Once the playbook has given you the sequence, run it as ONE cad_program rather than a call
+per operation. Every separate call is a round-trip that re-sends the whole conversation, so
+a flange built one boolean at a time costs tens of times what the same flange costs
+composed -- measured: 2.9 million tokens for a single flange, almost all of it the same
+context replayed. cad_program dispatches through the same handlers a single call uses and
+returns a per-op certificate ledger, so composing costs you no evidence: every operation
+still carries its own verdict, and you must read them.
+
+Compose the MECHANICAL steps only. A reference lookup, a checkpoint and verify_part stay
+their own calls -- they are how you decide and how you check, and neither belongs inside
+the thing being decided. Ops are validated up front, so one bad argument refuses the whole
+program before anything runs; but a failure MID-run stops there with no rollback, and the
+completed prefix is really applied. Read where the ledger stopped before you build on it --
+the model in front of you is the prefix, not what you asked for.
+
 Declare intent before you build: mutating calls are refused until a feature's
 timeline_checkpoint is open, and the checkpoint writes the matching notebook line itself.
 Name the INTENT in engineering language -- "bolt circle 8 x D18 on D160 B.C.", never
