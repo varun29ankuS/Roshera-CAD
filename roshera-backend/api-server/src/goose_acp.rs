@@ -2032,6 +2032,113 @@ mod tests {
         );
     }
 
+    /// The behavioural guard for the whole class of defect that made
+    /// `acp_config_endpoint_serves_the_same_path_agent_workspace_dir_resolves`
+    /// order-dependent — it failed once in three full-suite runs, with the
+    /// temp lockdown workspace on one side of its assertion and the real
+    /// state path on the other.
+    ///
+    /// The invariant every reader of `ROSHERA_AGENT_WORKSPACE` depends on:
+    /// **two reads taken under one acquisition of [`process_env_test_lock`]
+    /// must agree.** The endpoint test compares `agent_workspace_dir()`
+    /// against the cwd `get_acp_config` resolves — two independent reads of
+    /// that process global — while
+    /// `goose_lockdown_leaves_exactly_roshera_reachable` overrides it. If an
+    /// override lands between the two reads, the comparison fails on a
+    /// mismatch the reader had no way to cause.
+    ///
+    /// That interleaving is not schedulable on demand, so this drives it
+    /// directly rather than waiting for it: a writer thread overrides and
+    /// restores the variable as fast as it can — always under the lock,
+    /// exactly as the lockdown test does — while this test performs the same
+    /// two-read comparison many times over. Under a correctly held lock the
+    /// two reads always agree; drop either acquisition and the writer slips
+    /// between them within a handful of iterations.
+    ///
+    /// This is the test to keep green when changing any of it. It fires if a
+    /// reader stops holding the lock across both of its reads, if the
+    /// lockdown test's acquisition drifts back below its `set_var`s (the
+    /// original defect — the lock was always taken, just three lines too
+    /// late), or if a new test starts overriding this variable without the
+    /// lock at all.
+    ///
+    /// Deliberately not `#[tokio::test]`: nothing here awaits, so the guard
+    /// is never held across an await point.
+    #[test]
+    fn two_reads_of_the_agent_workspace_global_cannot_be_split_by_a_concurrent_override() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        const ITERATIONS: usize = 500;
+        const VAR: &str = "ROSHERA_AGENT_WORKSPACE";
+
+        // Captured once. The writer restores to exactly this between every
+        // override, so the variable is only ever this value or the override
+        // — never a third state left behind by this test.
+        let original = std::env::var_os(VAR);
+        // One fixed path, not a fresh uuid per iteration: `agent_workspace_dir`
+        // calls `create_dir_all`, and a per-iteration path would litter the
+        // temp dir with 500 of them.
+        let override_path = std::env::temp_dir().join("roshera-agent-workspace-race-pin");
+
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let writer_stop = std::sync::Arc::clone(&stop);
+        let writer_original = original.clone();
+        let writer_path = override_path.clone();
+
+        let writer = std::thread::spawn(move || {
+            while !writer_stop.load(Ordering::Relaxed) {
+                let _guard = crate::ai_provider_config::process_env_test_lock()
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                std::env::set_var(VAR, &writer_path);
+                // Widens the window the reader must survive; without this the
+                // override and its restore are close to atomic in practice and
+                // a genuinely unlocked reader could slip past unpunished.
+                std::thread::yield_now();
+                match &writer_original {
+                    Some(previous) => std::env::set_var(VAR, previous),
+                    None => std::env::remove_var(VAR),
+                }
+            }
+        });
+
+        let mut split = None;
+        for _ in 0..ITERATIONS {
+            let _guard = crate::ai_provider_config::process_env_test_lock()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+            let first = agent_workspace_dir().expect("first read must resolve");
+            std::thread::yield_now();
+            let second = agent_workspace_dir().expect("second read must resolve");
+
+            if first != second {
+                split = Some((first, second));
+                break;
+            }
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        writer.join().expect("the override thread must not panic");
+
+        // Restored BEFORE asserting: a failure here must not also leave the
+        // process env dirty for every test that runs after it.
+        match &original {
+            Some(previous) => std::env::set_var(VAR, previous),
+            None => std::env::remove_var(VAR),
+        }
+
+        assert!(
+            split.is_none(),
+            "two reads of {VAR} taken under a single acquisition of \
+             process_env_test_lock disagreed — an override landed between \
+             them, which means the lock is no longer serializing every \
+             writer and reader of this variable. This is exactly the defect \
+             that made acp_config_endpoint_serves_the_same_path_agent_workspace_dir_resolves \
+             fail intermittently. Got: {split:?}"
+        );
+    }
+
     /// `GET /api/acp/config` must serve the persisted provider pin — the
     /// fact `acp-client.ts` refreshes its vendor mark from after a repin
     /// forces it to reestablish. Failed before `active` was added to the
