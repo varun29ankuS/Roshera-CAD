@@ -192,6 +192,16 @@ struct StagingState {
     /// drain time would lose the per-request override). Drained to the
     /// MPSC on commit; cleared on abort.
     buffer: Vec<(RecordedOperation, Author)>,
+    /// Nesting depth for `begin_discard_scope`/`end_discard_scope` — a
+    /// SEPARATE counter from `depth`. A `begin_pending` scope may still
+    /// commit (its buffered events reach the timeline), so records inside
+    /// it legitimately need a certificate; a `begin_discard_scope` scope
+    /// (the api-server's `RecorderSuppressGuard`) never commits, so
+    /// certifying inside it is pure waste. Distinguishing the two is the
+    /// entire point — collapsing them into one counter would make every
+    /// `with_rollback`-staged record skip certification too, silently
+    /// dropping real per-op certificates on their success path.
+    discard_depth: u32,
 }
 
 impl TimelineRecorder {
@@ -514,6 +524,29 @@ impl OperationRecorder for TimelineRecorder {
         if state.depth == 0 {
             state.buffer.clear();
         }
+    }
+
+    fn begin_discard_scope(&self) {
+        // `saturating_add`: same defensive posture as `begin_pending` —
+        // realistic nesting is shallow.
+        let mut state = self.staging.write();
+        state.discard_depth = state.discard_depth.saturating_add(1);
+    }
+
+    fn end_discard_scope(&self) {
+        let mut state = self.staging.write();
+        if state.discard_depth == 0 {
+            tracing::warn!(
+                target: "timeline.recorder_bridge",
+                "end_discard_scope called with discard_depth=0 (no matching begin_discard_scope); ignoring"
+            );
+            return;
+        }
+        state.discard_depth -= 1;
+    }
+
+    fn records_are_discarded(&self) -> bool {
+        self.staging.read().discard_depth > 0
     }
 }
 

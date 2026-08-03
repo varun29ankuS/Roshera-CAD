@@ -6467,15 +6467,25 @@ async fn delete_solid_core(
         // Shells are never part of the wire entity taxonomy (there is no
         // `with_input_shells` / `with_output_shells` either — see
         // `recorder.rs`'s `ENTITY_*` constants), so they are omitted here
-        // too rather than inventing a new kind for one channel only.
+        // too rather than inventing a new kind for one channel only. Loops,
+        // edges, and vertices DO have wire kinds and now show up in `removed`
+        // (the model-wide orphan prune folds them into `delete_solid`'s
+        // return), so they are mapped here too — otherwise they would
+        // silently vanish at this recording site the same way the prune
+        // itself used to silently discard them.
         use geometry_engine::operations::delete::EntityType as DeletedKind;
-        use geometry_engine::operations::recorder::{entity_ref, ENTITY_FACE, ENTITY_SOLID};
+        use geometry_engine::operations::recorder::{
+            entity_ref, ENTITY_EDGE, ENTITY_FACE, ENTITY_LOOP, ENTITY_SOLID, ENTITY_VERTEX,
+        };
         let deleted_refs: Vec<String> = removed
             .iter()
             .filter_map(|(kind, id)| match kind {
                 DeletedKind::Solid => Some(entity_ref(ENTITY_SOLID, *id as u64)),
                 DeletedKind::Face => Some(entity_ref(ENTITY_FACE, *id as u64)),
-                _ => None,
+                DeletedKind::Loop => Some(entity_ref(ENTITY_LOOP, *id as u64)),
+                DeletedKind::Edge => Some(entity_ref(ENTITY_EDGE, *id as u64)),
+                DeletedKind::Vertex => Some(entity_ref(ENTITY_VERTEX, *id as u64)),
+                DeletedKind::Shell => None,
             })
             .collect();
         model.record_operation(
@@ -6545,7 +6555,36 @@ async fn clear_all_geometry(
     // solids does not remove these, and they poison later op validation with
     // phantom connectivity errors. clear_geometry makes "clear" a true reset,
     // matching clear_timeline, without needing a full timeline rewind.
-    model_handle.write().await.clear_geometry();
+    //
+    // Every solid above was already timeline-recorded individually by
+    // `delete_solid_core`, so `swept` here is normally just the true
+    // orphans — but `clear_geometry` also reports any solid it had to wipe
+    // (e.g. one whose `delete_solid_core` call hit the `Err` / rollback
+    // path and was left behind), so this stays honest even off the happy
+    // path. `clear_geometry` itself never records (see its doc comment —
+    // it has test call sites with no recorder attached); this is the one
+    // production caller, and the one place a "clear" is a genuine,
+    // user-visible, once-per-call event, so recording lives here rather
+    // than inside the kernel primitive.
+    let swept = model_handle.write().await.clear_geometry();
+    if !swept.is_empty() {
+        let model = model_handle.read().await;
+        // Both channels declare the SAME refs: `deleted` is the honest
+        // "this stopped existing" fact (the whole point of this fix —
+        // before it, this sweep left zero trace); `inputs` satisfies the
+        // lineage ratchet's real question — an operation that consumed
+        // model entities must name them as inputs, not just as an
+        // allowlisted "constructive root" — which a clear genuinely is
+        // not: it consumes exactly the orphans it destroys. Mirrors
+        // `delete_solid_core`'s `with_input_solids` + `with_deleted_refs`
+        // pairing on the SAME id above.
+        model.record_operation(
+            geometry_engine::operations::recorder::RecordedOperation::new("clear_geometry")
+                .with_parameters(serde_json::json!({ "swept": swept.len() }))
+                .with_input_refs(swept.clone())
+                .with_deleted_refs(swept),
+        );
+    }
 
     Ok(Json(serde_json::json!({
         "success": true,

@@ -712,7 +712,14 @@ pub fn boolean_operation(
         // sidecars are purged for each dropped face. Runs inside this
         // `with_rollback` closure on the success path, so an earlier failure
         // restores everything via the snapshot.
-        crate::operations::delete::prune_boolean_orphan_topology(model)?;
+        //
+        // NOTE: the swept entities are discarded here, same as before this
+        // function started reporting them — the `record_operation` call
+        // above already fired with only `deleted_solids` (the retired
+        // operand `Solid` records), so this husk sweep is not yet declared
+        // on the `deleted` wire channel either. Same defect class as
+        // `delete_solid` had; out of scope for this fix (see delete.rs).
+        let _ = crate::operations::delete::prune_boolean_orphan_topology(model)?;
 
         Ok(result_solid)
     })

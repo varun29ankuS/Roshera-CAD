@@ -1056,14 +1056,33 @@ impl ShellStore {
         self.next_id - 1
     }
 
+    /// The single definition of "does this shell id currently exist". `get`,
+    /// `get_mut` and `iter` all route through this — see the parity comment
+    /// on `EdgeStore::get` (Task #89) for why a second, divergent liveness
+    /// check at each accessor is the bug, not the fix.
+    #[inline(always)]
+    pub fn is_live(&self, id: ShellId) -> bool {
+        self.shells
+            .get(id as usize)
+            .is_some_and(|s| s.id != INVALID_SHELL_ID)
+    }
+
     #[inline(always)]
     pub fn get(&self, id: ShellId) -> Option<&Shell> {
-        self.shells.get(id as usize)
+        if self.is_live(id) {
+            self.shells.get(id as usize)
+        } else {
+            None
+        }
     }
 
     #[inline(always)]
     pub fn get_mut(&mut self, id: ShellId) -> Option<&mut Shell> {
-        self.shells.get_mut(id as usize)
+        if self.is_live(id) {
+            self.shells.get_mut(id as usize)
+        } else {
+            None
+        }
     }
 
     /// Remove a shell from the store
@@ -1099,7 +1118,7 @@ impl ShellStore {
         self.shells
             .iter()
             .enumerate()
-            .filter(|(_, s)| s.id != INVALID_SHELL_ID)
+            .filter(move |(idx, _)| self.is_live(*idx as ShellId))
             .map(|(idx, s)| (idx as ShellId, s))
     }
 

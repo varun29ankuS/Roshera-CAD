@@ -2919,6 +2919,13 @@ fn materialise_revolve_profile_regions(
 /// `begin_pending` would leave the process-wide recorder buffering
 /// every future event into its staging vec forever (silent timeline
 /// loss), which is why this is drop-based rather than a manual pair.
+///
+/// Also opens a `begin_discard_scope` window alongside `begin_pending`:
+/// unlike a `with_rollback` pending scope (which may still `commit_pending`
+/// on success), THIS guard always `abort_pending`s on drop, so anything
+/// staged inside it is guaranteed to never reach the timeline. Flagging
+/// that via `records_are_discarded()` lets `BRepModel::record_operation`
+/// skip certifying those doomed records — see its doc comment.
 pub(crate) struct RecorderSuppressGuard<'a> {
     recorder: &'a timeline_engine::TimelineRecorder,
 }
@@ -2927,6 +2934,7 @@ impl<'a> RecorderSuppressGuard<'a> {
     pub(crate) fn new(recorder: &'a timeline_engine::TimelineRecorder) -> Self {
         use geometry_engine::operations::recorder::OperationRecorder;
         recorder.begin_pending();
+        recorder.begin_discard_scope();
         Self { recorder }
     }
 }
@@ -2935,6 +2943,7 @@ impl Drop for RecorderSuppressGuard<'_> {
     fn drop(&mut self) {
         use geometry_engine::operations::recorder::OperationRecorder;
         self.recorder.abort_pending();
+        self.recorder.end_discard_scope();
     }
 }
 
@@ -2967,6 +2976,51 @@ mod tests {
 
     fn manager() -> CSketchManager {
         CSketchManager::new()
+    }
+
+    // ── RecorderSuppressGuard wiring (BUG 2: sketch_extrude certifying
+    // twice) ──────────────────────────────────────────────────────────
+    //
+    // `record_operation`'s own unit test (`geometry-engine`'s
+    // `record_operation_skips_certification_while_records_are_discarded`)
+    // proves the MECHANISM: certification is skipped while
+    // `records_are_discarded()` is true. It does not prove this guard
+    // actually flips that flag — a spy recorder could pass that test while
+    // this guard silently never called `begin_discard_scope` at all. This
+    // test closes that gap directly against a real `TimelineRecorder`.
+    #[tokio::test]
+    async fn recorder_suppress_guard_marks_records_as_discarded_while_held() {
+        use geometry_engine::operations::recorder::OperationRecorder;
+        use std::sync::Arc;
+        use tokio::sync::RwLock;
+
+        let timeline: timeline_engine::SharedTimeline = Arc::new(RwLock::new(
+            timeline_engine::Timeline::new(timeline_engine::TimelineConfig::default()),
+        ));
+        let recorder = timeline_engine::TimelineRecorder::new(
+            Arc::clone(&timeline),
+            timeline_engine::Author::System,
+            timeline_engine::BranchId::main(),
+        );
+
+        assert!(
+            !recorder.records_are_discarded(),
+            "no RecorderSuppressGuard is open yet"
+        );
+        {
+            let _guard = RecorderSuppressGuard::new(&recorder);
+            assert!(
+                recorder.records_are_discarded(),
+                "RecorderSuppressGuard::new must open a discard scope, or \
+                 record_operation has nothing to skip certification for"
+            );
+        }
+        assert!(
+            !recorder.records_are_discarded(),
+            "dropping the guard must close the discard scope — a leaked \
+             scope would suppress certification for every later op in the \
+             process, not just this one call's kernel-internal records"
+        );
     }
 
     // ── Wire-plane / direction validation (arbitrary-plane bridge) ──

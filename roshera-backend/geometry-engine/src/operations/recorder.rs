@@ -702,6 +702,34 @@ pub trait OperationRecorder: Send + Sync + fmt::Debug {
     /// `with_rollback` when the wrapped operation returned `Err` and
     /// the model snapshot is about to be restored. Default impl: no-op.
     fn abort_pending(&self) {}
+
+    /// Enter a scope whose records are GUARANTEED to be discarded and
+    /// never reach the timeline — as opposed to the
+    /// [`begin_pending`](Self::begin_pending) trio, whose staged events
+    /// may still be forwarded on [`commit_pending`](Self::commit_pending)
+    /// (e.g. `with_rollback`'s success path). The api-server's
+    /// `RecorderSuppressGuard` is the caller: it hides a composite op's
+    /// kernel-internal sub-events behind one consolidated event by
+    /// staging them with `begin_pending` and then UNCONDITIONALLY
+    /// `abort_pending`-ing on drop, win or lose. `BRepModel::record_operation`
+    /// checks [`records_are_discarded`](Self::records_are_discarded) to skip
+    /// the certify-at-record computation while this scope is open — that
+    /// work would otherwise be thrown away with the record itself. Default
+    /// impl: no-op, so only a recorder that needs the distinction overrides
+    /// it (`begin_pending`'s default no-op recorders never call this either).
+    fn begin_discard_scope(&self) {}
+
+    /// Close a scope opened by [`begin_discard_scope`](Self::begin_discard_scope).
+    /// Default impl: no-op.
+    fn end_discard_scope(&self) {}
+
+    /// `true` while inside a [`begin_discard_scope`](Self::begin_discard_scope)
+    /// window (nested scopes count as one, matching `begin_pending`'s depth
+    /// semantics). Default impl: `false`, so a recorder that never overrides
+    /// the discard-scope trio always allows certification to proceed.
+    fn records_are_discarded(&self) -> bool {
+        false
+    }
 }
 
 /// Recorder that drops every event. Useful as a default for tests and

@@ -763,7 +763,64 @@ impl BRepModel {
     /// rolled-back op) linger. Those orphans then surface as phantom
     /// connectivity errors in later validation. `clear_geometry` sweeps them so
     /// "clear" leaves a genuinely empty model, not invisible residue.
-    pub fn clear_geometry(&mut self) {
+    ///
+    /// Returns the canonical wire ref (`"<kind>:<id>"`, see
+    /// `operations::recorder::entity_ref`) of every entity this call actually
+    /// swept — solids, faces, loops, edges, curves, vertices — so a caller
+    /// that wants the destruction on the timeline can build a
+    /// `RecordedOperation` from real data instead of guessing. This method
+    /// itself never records: it is called from cfg(test)-gated fixtures and
+    /// direct unit tests with no recorder attached (see
+    /// `geometry-engine/tests/clear_geometry.rs`,
+    /// `geometry-engine/tests/gdt_oracle.rs`, `labels_gate.rs`,
+    /// `persistent_id_sidecar.rs`, and `gdt/drf.rs`'s own test), and treating
+    /// a bare "reset the stores" primitive as something that can silently
+    /// emit history is the wrong default for a method with that many
+    /// existing callers. The one production caller —
+    /// `DELETE /api/agent/parts` (`api-server::clear_all_geometry`) — is the
+    /// single place a "clear" is a genuine, user-visible, once-per-call
+    /// event, so that is where the returned refs become a `RecordedOperation`
+    /// (mirroring `delete_solid`, which likewise returns removed entities for
+    /// its caller to record rather than recording itself). Shells and
+    /// surfaces have no `ENTITY_*` wire kind (see `recorder.rs`) and are
+    /// omitted, matching `delete_solid_core`'s precedent for the same gap.
+    pub fn clear_geometry(&mut self) -> Vec<String> {
+        use crate::operations::recorder::{
+            entity_ref, ENTITY_CURVE, ENTITY_EDGE, ENTITY_FACE, ENTITY_LOOP, ENTITY_SOLID,
+            ENTITY_VERTEX,
+        };
+        let mut swept: Vec<String> = Vec::new();
+        swept.extend(
+            self.solids
+                .iter()
+                .map(|(id, _)| entity_ref(ENTITY_SOLID, id as u64)),
+        );
+        swept.extend(
+            self.faces
+                .iter()
+                .map(|(id, _)| entity_ref(ENTITY_FACE, id as u64)),
+        );
+        swept.extend(
+            self.loops
+                .iter()
+                .map(|(id, _)| entity_ref(ENTITY_LOOP, id as u64)),
+        );
+        swept.extend(
+            self.edges
+                .iter()
+                .map(|(id, _)| entity_ref(ENTITY_EDGE, id as u64)),
+        );
+        swept.extend(
+            self.curves
+                .iter()
+                .map(|(id, _)| entity_ref(ENTITY_CURVE, id as u64)),
+        );
+        swept.extend(
+            self.vertices
+                .iter()
+                .map(|(id, _)| entity_ref(ENTITY_VERTEX, id as u64)),
+        );
+
         let tol = self.tolerance;
         self.vertices = VertexStore::with_capacity_and_tolerance(64, tol.distance());
         self.curves = CurveStore::new();
@@ -800,6 +857,7 @@ impl BRepModel {
         self.labels.clear();
         // Preserved: datums (+ seeded defaults), datum_graph, recorder, tolerance,
         // current_event_key (caller op-context, set per-op).
+        swept
     }
 
     // --- Persistent-id accessors (#11, slice 40-A) ---
@@ -2507,7 +2565,21 @@ impl BRepModel {
             // Certify-at-record (after the funnel above, before the forward
             // below): the freshly-invalidated output solid is re-certified
             // against its post-op geometry and the proof rides on the record.
-            self.attach_record_time_certificate(&mut operation);
+            //
+            // Skipped while `rec.records_are_discarded()` — a
+            // `RecorderSuppressGuard` scope (api-server) stages this exact
+            // record via `begin_pending` and then UNCONDITIONALLY discards
+            // it via `abort_pending` on drop, whether the wrapped kernel
+            // call succeeded or not. Certifying a record that can never
+            // reach the timeline is pure waste (one full validity
+            // certificate — mass properties included — computed and then
+            // thrown away). The consolidated event a suppressing caller
+            // builds afterward (e.g. `sketch_extrude`'s handler) certifies
+            // separately and remains the sole, authoritative certificate on
+            // the wire.
+            if !rec.records_are_discarded() {
+                self.attach_record_time_certificate(&mut operation);
+            }
             if let Err(e) = rec.record(operation) {
                 tracing::warn!("operation recorder returned error: {}", e);
             }
@@ -2531,8 +2603,20 @@ impl BRepModel {
     ///   `from_validity` projection; it is kept verbatim. (No such record
     ///   currently routes through this funnel — the api-server
     ///   `sketch_extrude` handler forwards its consolidated, pre-certified
-    ///   record straight to the timeline recorder — so nothing is certified
-    ///   twice.)
+    ///   record straight to the timeline recorder, bypassing this funnel
+    ///   entirely, so this branch is dead in practice today; it exists so a
+    ///   future caller that DOES route a pre-certified record through
+    ///   `record_operation` gets the same never-recompute guarantee.)
+    /// * **Suppressed** — `rec.records_are_discarded()` is true (the caller
+    ///   opened a `begin_discard_scope` window). The kernel-internal record
+    ///   this funnel would otherwise certify is guaranteed to be discarded
+    ///   before it ever reaches the timeline — certifying it would compute a
+    ///   full validity certificate purely to throw it away. `sketch_extrude`
+    ///   is exactly this shape: `extrude_profile_regions` runs inside the
+    ///   api-server's `RecorderSuppressGuard`, so its own internal
+    ///   `record_operation` call (from `extrude_face` / `boolean_operation`)
+    ///   is suppressed here, and the handler's own `certify_solid` call
+    ///   afterward is the one and only certificate that reaches the event.
     /// * **Zero output solids** — nothing to certify (datum ops, face/edge
     ///   transforms, deletes).
     /// * **Several distinct output solids** — `solid_certificate` holds ONE
@@ -7695,6 +7779,117 @@ mod anchor_tests {
             .expect("CaptureRecorder mutex poisoned")
             .clone();
         assert!(events.is_empty(), "no event recorded on lookup miss");
+    }
+
+    /// Spy recorder for the certify-at-record suppression fix (BUG 2:
+    /// `sketch_extrude` certifying twice). Unlike `CaptureRecorder` above,
+    /// this one implements the discard-scope trio for real (a depth
+    /// counter, not the trait's no-op default) so a test can prove
+    /// `record_operation` actually consults `records_are_discarded()`
+    /// rather than only exercising `RecorderSuppressGuard`'s own
+    /// book-keeping (that half is covered separately in
+    /// `api-server::csketch::tests`).
+    #[derive(Debug, Default)]
+    struct DiscardAwareCaptureRecorder {
+        events: Mutex<Vec<RecordedOperation>>,
+        discard_depth: Mutex<u32>,
+    }
+
+    impl OperationRecorder for DiscardAwareCaptureRecorder {
+        fn record(&self, operation: RecordedOperation) -> Result<(), RecorderError> {
+            self.events
+                .lock()
+                .expect("DiscardAwareCaptureRecorder mutex poisoned")
+                .push(operation);
+            Ok(())
+        }
+
+        fn begin_discard_scope(&self) {
+            *self
+                .discard_depth
+                .lock()
+                .expect("DiscardAwareCaptureRecorder mutex poisoned") += 1;
+        }
+
+        fn end_discard_scope(&self) {
+            let mut depth = self
+                .discard_depth
+                .lock()
+                .expect("DiscardAwareCaptureRecorder mutex poisoned");
+            if *depth > 0 {
+                *depth -= 1;
+            }
+        }
+
+        fn records_are_discarded(&self) -> bool {
+            *self
+                .discard_depth
+                .lock()
+                .expect("DiscardAwareCaptureRecorder mutex poisoned")
+                > 0
+        }
+    }
+
+    /// RED before the BUG 2 fix: `record_operation` certified every record
+    /// unconditionally, so a kernel-internal record emitted inside a
+    /// `RecorderSuppressGuard` window (which ALWAYS discards, win or lose —
+    /// see `csketch::RecorderSuppressGuard`) still paid for a full validity
+    /// certificate that was thrown away moments later. This pins the fix at
+    /// the mechanism level: certification proceeds normally outside a
+    /// discard scope, and is skipped — not fabricated, not stale, simply
+    /// absent — while one is open.
+    #[test]
+    fn record_operation_skips_certification_while_records_are_discarded() {
+        let mut model = BRepModel::new();
+        // Build the box with NO recorder attached yet — `create_box_3d`
+        // itself records a `create_box`-style event when a recorder IS
+        // attached, which would otherwise land as an unwanted 3rd event
+        // in the spy below. Attaching after creation isolates this test to
+        // exactly the two `record_operation` calls it makes directly.
+        let sid = match TopologyBuilder::new(&mut model)
+            .create_box_3d(10.0, 10.0, 10.0)
+            .expect("box creation succeeds")
+        {
+            GeometryId::Solid(s) => s,
+            other => panic!("expected Solid, got {:?}", other),
+        };
+        let recorder = Arc::new(DiscardAwareCaptureRecorder::default());
+        model.attach_recorder(Some(recorder.clone()));
+
+        // Outside any discard scope: certification proceeds as normal.
+        model.record_operation(
+            RecordedOperation::new("test.normal_scope").with_output_solids([sid as u64]),
+        );
+
+        // Inside a discard scope: `record()` must still fire (the guard's
+        // OWN `begin_pending`/`abort_pending` buffering is what actually
+        // discards it — this recorder is a plain spy, not a staging one),
+        // but certification must be skipped.
+        recorder.begin_discard_scope();
+        model.record_operation(
+            RecordedOperation::new("test.discard_scope").with_output_solids([sid as u64]),
+        );
+        recorder.end_discard_scope();
+
+        let events = recorder
+            .events
+            .lock()
+            .expect("DiscardAwareCaptureRecorder mutex poisoned")
+            .clone();
+        assert_eq!(events.len(), 2, "both records must still reach the spy");
+        assert!(
+            events[0].solid_certificate.is_some(),
+            "outside a discard scope, record_operation must still certify the \
+             output solid — this is unchanged, load-bearing behaviour"
+        );
+        assert!(
+            events[1].solid_certificate.is_none(),
+            "inside a discard scope, certification must be skipped: the \
+             record is guaranteed to be discarded by the caller \
+             (RecorderSuppressGuard aborts unconditionally), so certifying \
+             it would compute a full validity certificate purely to throw \
+             it away"
+        );
     }
 
     /// Default-seeded datums are an invariant of `BRepModel::new()` — they

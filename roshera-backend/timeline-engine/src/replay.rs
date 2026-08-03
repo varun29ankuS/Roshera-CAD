@@ -1411,6 +1411,44 @@ fn dispatch_generic(
             Ok(())
         }
 
+        // `DELETE /api/agent/parts`'s orphan sweep (BUG 1 fix): every solid
+        // is already individually replayed via its own `delete_solid` event
+        // above, so by the time this event replays, `model.solids` should
+        // already be empty on a faithful replay — this call reproduces the
+        // sweep of whatever non-solid orphan topology (vertices/edges/
+        // curves/faces/loops that were never folded into a solid)
+        // accumulated in the LIVE session. Without this arm, the non-dotted
+        // `"clear_geometry"` kind falls through to `fallback_error` →
+        // `ReplayError::UnknownKind`, which `certify_rebuild` treats as a
+        // genuine replay break — quarantining the boot at the FIRST
+        // `clear_geometry` event ever recorded and refusing everything
+        // built after it.
+        //
+        // `BRepModel::clear_geometry` wipes `self.solids` unconditionally —
+        // fine for its one production caller, which always deletes every
+        // solid first — but replay must not inherit that blindly: a
+        // `delete_solid` earlier in THIS log that failed to replay (skipped
+        // with a warning, per `run_replay`'s `Err` arm) would leave a live
+        // solid here, and calling through would silently destroy it with no
+        // diagnostic. Mirrors `delete_solid`'s own guard
+        // (`if model.solids.get(solid).is_some()`): refuse loudly instead of
+        // wiping developed state the live session did not.
+        "clear_geometry" => {
+            if !model.solids.is_empty() {
+                return Err(ReplayError::InvalidParameters {
+                    kind: kind.to_string(),
+                    reason: format!(
+                        "clear_geometry replayed with {} live solid(s) still present — \
+                         this event only ever fires after every solid was already \
+                         deleted individually; refusing to silently destroy them",
+                        model.solids.len()
+                    ),
+                });
+            }
+            let _ = model.clear_geometry();
+            Ok(())
+        }
+
         // DURABILITY Slice 1.2 — a recorded `revolve_face` references the
         // INTERNAL profile face the kernel built inside a revolve (created by
         // `create_face_from_profile*`), which is never emitted as a recorded

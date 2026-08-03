@@ -804,14 +804,33 @@ impl LoopStore {
         self.next_id - 1
     }
 
+    /// The single definition of "does this loop id currently exist".
+    /// `get`, `get_mut` and `iter` all route through this — see the parity
+    /// comment on `EdgeStore::get` (Task #89) for why a second, divergent
+    /// liveness check at each accessor is the bug, not the fix.
+    #[inline(always)]
+    pub fn is_live(&self, id: LoopId) -> bool {
+        self.loops
+            .get(id as usize)
+            .is_some_and(|l| l.id != INVALID_LOOP_ID)
+    }
+
     #[inline(always)]
     pub fn get(&self, id: LoopId) -> Option<&Loop> {
-        self.loops.get(id as usize)
+        if self.is_live(id) {
+            self.loops.get(id as usize)
+        } else {
+            None
+        }
     }
 
     #[inline(always)]
     pub fn get_mut(&mut self, id: LoopId) -> Option<&mut Loop> {
-        self.loops.get_mut(id as usize)
+        if self.is_live(id) {
+            self.loops.get_mut(id as usize)
+        } else {
+            None
+        }
     }
 
     /// Remove a loop from the store
@@ -849,7 +868,7 @@ impl LoopStore {
         self.loops
             .iter()
             .enumerate()
-            .filter(|(_, l)| l.id != INVALID_LOOP_ID)
+            .filter(move |(idx, _)| self.is_live(*idx as LoopId))
             .map(|(idx, l)| (idx as LoopId, l))
     }
 

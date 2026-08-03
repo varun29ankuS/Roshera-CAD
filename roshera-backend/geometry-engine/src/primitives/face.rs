@@ -1378,14 +1378,33 @@ impl FaceStore {
         self.next_id - 1
     }
 
+    /// The single definition of "does this face id currently exist". `get`,
+    /// `get_mut` and `iter` all route through this — see the parity comment
+    /// on `EdgeStore::get` (Task #89) for why a second, divergent liveness
+    /// check at each accessor is the bug, not the fix.
+    #[inline(always)]
+    pub fn is_live(&self, id: FaceId) -> bool {
+        self.faces
+            .get(id as usize)
+            .is_some_and(|f| f.id != INVALID_FACE_ID)
+    }
+
     #[inline(always)]
     pub fn get(&self, id: FaceId) -> Option<&Face> {
-        self.faces.get(id as usize)
+        if self.is_live(id) {
+            self.faces.get(id as usize)
+        } else {
+            None
+        }
     }
 
     #[inline(always)]
     pub fn get_mut(&mut self, id: FaceId) -> Option<&mut Face> {
-        self.faces.get_mut(id as usize)
+        if self.is_live(id) {
+            self.faces.get_mut(id as usize)
+        } else {
+            None
+        }
     }
 
     #[inline]
@@ -1481,7 +1500,7 @@ impl FaceStore {
         self.faces
             .iter()
             .enumerate()
-            .filter(|(_, f)| f.id != INVALID_FACE_ID)
+            .filter(move |(idx, _)| self.is_live(*idx as FaceId))
             .map(|(idx, f)| (idx as FaceId, f))
     }
 
