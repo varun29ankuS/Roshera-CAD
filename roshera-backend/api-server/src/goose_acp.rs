@@ -1343,6 +1343,18 @@ mod tests {
     /// unaffected by which provider is pinned.
     #[tokio::test]
     async fn goose_lockdown_leaves_exactly_roshera_reachable() {
+        // Acquired HERE — above the first `set_var`, not just above the
+        // ANTHROPIC sentinels further down. This test overrides four
+        // process-global variables, and `ROSHERA_AGENT_WORKSPACE` is read
+        // back by `acp_config_endpoint_serves_the_same_path_agent_workspace_dir_resolves`.
+        // While the acquisition sat below these two lines, that reader could
+        // observe the override land BETWEEN its two reads and fail on a path
+        // mismatch it had no way to cause — the lock existed and was correct,
+        // it simply started too late to cover the variables that raced.
+        let env_guard = crate::ai_provider_config::process_env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
         let root =
             std::env::temp_dir().join(format!("roshera-goose-lockdown-{}", uuid::Uuid::new_v4()));
         std::env::set_var("ROSHERA_GOOSE_ROOT", &root);
@@ -1380,10 +1392,8 @@ mod tests {
         // (a real spawned child's environment) is proven by
         // `ai_provider_config::tests::anthropic_credentials_scrubbed_from_the_actual_child_environment`,
         // under the same lock — which serializes the two tests' mutation
-        // of these process-global variables.
-        let env_guard = crate::ai_provider_config::anthropic_env_test_lock()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // of these process-global variables. That lock is already held from
+        // the top of this test.
         std::env::set_var("ANTHROPIC_API_KEY", "sk-ant-BOOT-SENTINEL");
         std::env::set_var("ANTHROPIC_AUTH_TOKEN", "tok-BOOT-SENTINEL");
 
@@ -1973,14 +1983,32 @@ mod tests {
     /// [`initialize`] resolves and writes `.goosehints` into, not some
     /// independently-recomputed value that happens to look similar.
     ///
-    /// Deliberately does not set `ROSHERA_AGENT_WORKSPACE`:
-    /// `goose_lockdown_leaves_exactly_roshera_reachable` already owns
-    /// mutating that process-global env var under this binary's parallel
-    /// test threads (see its own doc comment), and `agent_workspace_dir`
-    /// only ever `create_dir_all`s the resulting path — idempotent and
-    /// side-effect-free to call again here without an override.
+    /// Holds [`process_env_test_lock`] across BOTH reads below, because
+    /// this test compares two independent reads of the process-global
+    /// `ROSHERA_AGENT_WORKSPACE` — `agent_workspace_dir()` directly, and
+    /// again inside `get_acp_config`. `goose_lockdown_leaves_exactly_roshera_reachable`
+    /// owns overriding that variable.
+    ///
+    /// This test used to reason that *not writing* the variable was
+    /// sufficient isolation. It is not: abstaining from `set_var` does
+    /// nothing about a comparison of two reads taken at different times,
+    /// and the override landing between them made the assertion fail with
+    /// the temp lockdown path on one side and the real state path on the
+    /// other. Only the lock makes the comparison sound.
+    ///
+    /// The guard is deliberately held across the `.await`s below, which the
+    /// usual "never hold a lock across await" rule forbids. Reason: the
+    /// second read *is* the awaited call, so releasing first would reopen
+    /// the exact window this closes. It is safe here and only here — this
+    /// is a `std::sync::Mutex` taken solely by `#[cfg(test)]` code, nothing
+    /// reachable from `make_test_state` or `get_acp_config` takes it, so no
+    /// task this runtime drives can be blocked waiting on it.
     #[tokio::test]
     async fn acp_config_endpoint_serves_the_same_path_agent_workspace_dir_resolves() {
+        let _env_guard = crate::ai_provider_config::process_env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
         let expected =
             agent_workspace_dir().expect("agent_workspace_dir must resolve without an override");
 
