@@ -663,6 +663,17 @@ pub fn boolean_operation(
             BooleanOp::Intersection => "boolean_intersection",
             BooleanOp::Difference => "boolean_difference",
         };
+        // The operands genuinely cease to exist below (retired as husk
+        // `Solid` records) — computed here, ahead of the removal, so the
+        // `deleted` channel reflects exactly what is about to happen rather
+        // than assuming the `result_solid`-is-always-fresh invariant holds.
+        let mut deleted_solids: Vec<u64> = Vec::with_capacity(2);
+        if solid_a != result_solid {
+            deleted_solids.push(solid_a as u64);
+        }
+        if solid_b != result_solid {
+            deleted_solids.push(solid_b as u64);
+        }
         model.record_operation(
             crate::operations::recorder::RecordedOperation::new(op_kind)
                 .with_parameters(serde_json::json!({
@@ -671,7 +682,8 @@ pub fn boolean_operation(
                     "operation": format!("{:?}", operation),
                 }))
                 .with_input_solids([solid_a as u64, solid_b as u64])
-                .with_output_solids([result_solid as u64]),
+                .with_output_solids([result_solid as u64])
+                .with_deleted_solids(deleted_solids),
         );
 
         // Retire the consumed operands. `reconstruct_topology` builds the

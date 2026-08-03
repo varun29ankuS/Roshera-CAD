@@ -6444,15 +6444,40 @@ async fn delete_solid_core(
 ) {
     {
         let mut model = model_handle.write().await;
-        if let Err(e) = geometry_engine::operations::delete::delete_solid(
+        // `delete_solid` returns the entities it actually removed (always
+        // including the solid itself; plus its cascaded shells/faces when
+        // `cascade` is set) — that Ok payload is the honest source for the
+        // deletion channel below. On Err the op rolled back via
+        // `with_rollback`'s snapshot restore, so nothing was actually
+        // removed; the record still fires (matching prior behaviour) but
+        // must declare NO deletions in that case.
+        let removed = match geometry_engine::operations::delete::delete_solid(
             &mut model, solid_id, /* cascade */ true,
         ) {
-            tracing::warn!(
-                solid_id = solid_id,
-                error = %e,
-                "delete_solid failed; mapping was dropped but kernel state may retain residue"
-            );
-        }
+            Ok(removed) => removed,
+            Err(e) => {
+                tracing::warn!(
+                    solid_id = solid_id,
+                    error = %e,
+                    "delete_solid failed; mapping was dropped but kernel state may retain residue"
+                );
+                Vec::new()
+            }
+        };
+        // Shells are never part of the wire entity taxonomy (there is no
+        // `with_input_shells` / `with_output_shells` either — see
+        // `recorder.rs`'s `ENTITY_*` constants), so they are omitted here
+        // too rather than inventing a new kind for one channel only.
+        use geometry_engine::operations::delete::EntityType as DeletedKind;
+        use geometry_engine::operations::recorder::{entity_ref, ENTITY_FACE, ENTITY_SOLID};
+        let deleted_refs: Vec<String> = removed
+            .iter()
+            .filter_map(|(kind, id)| match kind {
+                DeletedKind::Solid => Some(entity_ref(ENTITY_SOLID, *id as u64)),
+                DeletedKind::Face => Some(entity_ref(ENTITY_FACE, *id as u64)),
+                _ => None,
+            })
+            .collect();
         model.record_operation(
             geometry_engine::operations::recorder::RecordedOperation::new("delete_solid")
                 .with_parameters(serde_json::json!({
@@ -6460,7 +6485,8 @@ async fn delete_solid_core(
                     "solid_id": solid_id,
                     "cascade":  true,
                 }))
-                .with_input_solids([solid_id as u64]),
+                .with_input_solids([solid_id as u64])
+                .with_deleted_refs(deleted_refs),
         );
     }
 

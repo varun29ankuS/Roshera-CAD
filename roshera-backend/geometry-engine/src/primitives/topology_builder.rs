@@ -3509,7 +3509,8 @@ impl BRepModel {
                     "datum_id": id,
                     "name": removed.name.clone(),
                 }))
-                .with_input_datums([id as u64]),
+                .with_input_datums([id as u64])
+                .with_deleted_datums([id as u64]),
         );
         Ok(removed)
     }
@@ -4969,7 +4970,12 @@ impl BRepModel {
         use crate::operations::recorder::{
             entity_ref, RecordedOperation, ENTITY_EDGE, ENTITY_FACE, ENTITY_LOOP, ENTITY_VERTEX,
         };
-        let outputs: Vec<String> = report
+        // These entities were REMOVED by the cascade, not produced by it —
+        // they belong on the `deleted` channel, never `outputs`. Recording
+        // them as outputs would claim the cascade *created* the very
+        // entities it tore down, the same invisible-deletion defect the
+        // event-facets spec identifies for `delete_solid`.
+        let deleted: Vec<String> = report
             .removed_vertices
             .iter()
             .map(|id| entity_ref(ENTITY_VERTEX, *id as u64))
@@ -4995,7 +5001,7 @@ impl BRepModel {
         self.record_operation(
             RecordedOperation::new(kind)
                 .with_input_refs([entity_ref(root_entity_kind, root_id)])
-                .with_output_refs(outputs)
+                .with_deleted_refs(deleted)
                 .with_parameters(serde_json::json!({
                     "removed_vertices": report.removed_vertices,
                     "removed_edges": report.removed_edges,

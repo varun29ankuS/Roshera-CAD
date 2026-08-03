@@ -8,9 +8,10 @@
 //! [`TimelineEvent`] — it adds no event fields and changes no schema:
 //!
 //! 1. **Wire refs** — kernel ops arrive as `Operation::Generic` whose
-//!    `parameters` object carries `"inputs"` / `"outputs"` arrays of
-//!    canonical `"<kind>:<numeric-id>"` strings (`"solid:1"`, `"face:2"`, …)
-//!    exactly as `recorder_bridge::to_timeline_operation` wrote them.
+//!    `parameters` object carries `"inputs"` / `"outputs"` / `"deleted"`
+//!    arrays of canonical `"<kind>:<numeric-id>"` strings (`"solid:1"`,
+//!    `"face:2"`, …) exactly as `recorder_bridge::to_timeline_operation`
+//!    wrote them (`"deleted"` present only when the op removed something).
 //! 2. **Typed refs** — the event's `inputs.required_entities` /
 //!    `inputs.optional_entities` (each an [`EntityReference`] with a UUID
 //!    `EntityId` plus an expected [`EntityType`]) and `outputs.created` /
@@ -169,8 +170,10 @@ struct EventNode {
     /// Refs this event produced (wire outputs, typed created, typed
     /// modified). Sorted, deduplicated.
     outputs: Vec<EntityRef>,
-    /// Refs this event deleted (typed `outputs.deleted` only — the wire
-    /// envelope has no deletion channel). Sorted, deduplicated.
+    /// Refs this event deleted — the wire `"deleted"` key (what the kernel's
+    /// own recorder path actually emits) plus the typed `outputs.deleted`
+    /// channel (used by synthetic/typed-event producers). Sorted,
+    /// deduplicated.
     deleted: Vec<EntityRef>,
 }
 
@@ -247,6 +250,13 @@ impl LineageGraph {
             if let Operation::Generic { parameters, .. } = &ev.operation {
                 inputs.extend(wire_refs(parameters, "inputs"));
                 outputs.extend(wire_refs(parameters, "outputs"));
+                // The wire deletion channel (`recorder_bridge::to_timeline_operation`
+                // carries `RecordedOperation.deleted` through verbatim, present only
+                // when non-empty). This is what real kernel ops actually produce —
+                // the typed `outputs.deleted` channel below is exercised by
+                // synthetic/typed-event producers, not the kernel's own recorder
+                // path.
+                deleted.extend(wire_refs(parameters, "deleted"));
             }
             for r in ev
                 .inputs
@@ -366,8 +376,9 @@ impl LineageGraph {
     /// "Produced" means listed among an event's outputs (wire outputs, typed
     /// created, or typed modified) — for a slice that starts mid-history the
     /// first modification stands in for the unseen creation. Deletion is
-    /// only visible through typed `outputs.deleted`; the wire envelope
-    /// carries no deletion channel.
+    /// visible through the wire `"deleted"` key (what kernel ops actually
+    /// emit — see `recorder_bridge::to_timeline_operation`) and through the
+    /// typed `outputs.deleted` channel.
     pub fn state_at(&self, seq: EventIndex) -> Vec<EntityRef> {
         let mut live: Vec<(EventIndex, EntityRef)> = self
             .created_at
@@ -617,6 +628,40 @@ mod tests {
         }
     }
 
+    /// A kernel-shaped event carrying the wire `"deleted"` array — the shape
+    /// `recorder_bridge::to_timeline_operation` actually emits for a kernel
+    /// op that removed entities (`RecordedOperation.deleted`, populated by
+    /// e.g. `delete_solid`, `datum_delete`, a boolean retiring its operand
+    /// solids). This is the channel real kernel ops produce; `typed_event`'s
+    /// `OperationOutputs.deleted` below is exercised by synthetic/typed
+    /// producers, not the kernel's own recorder path.
+    fn wire_event_with_deletion(
+        seq: EventIndex,
+        kind: &str,
+        inputs: &[&str],
+        outputs: &[&str],
+        deleted: &[&str],
+    ) -> TimelineEvent {
+        TimelineEvent {
+            id: EventId::new(),
+            sequence_number: seq,
+            timestamp: Utc::now(),
+            author: Author::System,
+            operation: Operation::Generic {
+                command_type: kind.to_string(),
+                parameters: serde_json::json!({
+                    "params": {},
+                    "inputs": inputs,
+                    "outputs": outputs,
+                    "deleted": deleted,
+                }),
+            },
+            inputs: empty_inputs(),
+            outputs: OperationOutputs::default(),
+            metadata: EventMetadata::default(),
+        }
+    }
+
     /// A typed event exercising the OperationOutputs channels directly.
     fn typed_event(
         seq: EventIndex,
@@ -731,7 +776,7 @@ mod tests {
     }
 
     #[test]
-    fn state_at_before_and_after_a_deletion() {
+    fn state_at_before_and_after_a_typed_deletion() {
         let doomed = EntityId::new();
         let events = vec![
             wire_event(1, "create_box", &[], &["solid:1"]),
@@ -780,6 +825,42 @@ mod tests {
             g.state_at(3),
             vec![r("solid:1")],
             "at the deletion sequence the entity has left the frontier"
+        );
+    }
+
+    /// THE test that could not previously be written: `state_at` retiring an
+    /// entity through the WIRE `"deleted"` key — the shape a real kernel op
+    /// actually emits (`recorder_bridge::to_timeline_operation`, populated by
+    /// `RecordedOperation.deleted` from `delete_solid`, `datum_delete`, a
+    /// boolean retiring its operands, …). Before the deletion channel
+    /// existed, a delete recorded its victim as an input with no outputs —
+    /// structurally identical to merely reading it — so nothing could ever
+    /// leave the frontier. An entity created and then wire-deleted must NOT
+    /// appear in `state_at` after the deleting event's sequence, and must
+    /// still appear before it.
+    #[test]
+    fn state_at_before_and_after_a_wire_deletion() {
+        let events = vec![
+            wire_event(1, "create_box", &[], &["solid:1"]),
+            wire_event(2, "create_cylinder", &[], &["solid:2"]),
+            // Mirrors `delete_solid`'s real wire shape: the doomed solid is
+            // both an input (it was consumed) and a deletion (it no longer
+            // exists afterward) — the same entity on both channels, exactly
+            // as `RecordedOperation::with_input_solids` +
+            // `with_deleted_solids` produce it.
+            wire_event_with_deletion(3, "delete_solid", &["solid:2"], &[], &["solid:2"]),
+        ];
+        let g = LineageGraph::build(&events).unwrap();
+
+        assert_eq!(
+            g.state_at(2),
+            vec![r("solid:1"), r("solid:2")],
+            "before the wire deletion both solids are live"
+        );
+        assert_eq!(
+            g.state_at(3),
+            vec![r("solid:1")],
+            "at the wire-deletion sequence the deleted solid has left the frontier"
         );
     }
 
