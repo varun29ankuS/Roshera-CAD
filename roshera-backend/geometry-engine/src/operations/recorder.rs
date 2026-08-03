@@ -674,4 +674,121 @@ mod tests {
         let back: RecordedOperation = serde_json::from_value(v).expect("deserialize");
         assert!(back.solid_certificate.is_none());
     }
+
+    // ───────────────────────── Lineage ratchet ─────────────────────────
+
+    /// Recursively collect every `.rs` file under `dir`.
+    fn collect_rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("read_dir under geometry-engine src") {
+            let path = entry.expect("directory entry").path();
+            if path.is_dir() {
+                collect_rs_files(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// Lineage ratchet: every PRODUCTION `RecordedOperation::new(` site must
+    /// attach at least one `.with_input_*` reference, unless its op kind is a
+    /// genuinely constructive root on the explicit allowlist below.
+    ///
+    /// Why this is load-bearing: the durable event stream is the ONLY thing
+    /// that survives replay. An in-memory graph can know the true parents,
+    /// but if the recorded event carries no inputs, lineage rebuilt from
+    /// events has a hole — the result appears from nowhere. That is a SILENT
+    /// failure mode: nothing errors, the part's history just splits in two.
+    #[test]
+    fn every_production_recorded_operation_declares_inputs_or_is_a_root() {
+        // Constructive roots — operations that genuinely consume no model
+        // entities. Every entry MUST carry a justification; do not add one
+        // to silence the test for a consuming operation.
+        const ALLOWLIST: &[&str] = &[
+            // datum_create (3 sites): plane / axis / point authored from a
+            // user-supplied transform — there is no antecedent model entity
+            // to reference.
+            "datum_create",
+            // nurbs_loft (1 site): the signature is
+            // `sections: Vec<Vec<Point3>>` — raw point rings, not model
+            // entities, so there is nothing to reference.
+            "nurbs_loft",
+        ];
+
+        let src_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        collect_rs_files(&src_root, &mut files);
+        assert!(
+            !files.is_empty(),
+            "found no .rs files under {}",
+            src_root.display()
+        );
+
+        const NEEDLE: &str = "RecordedOperation::new(";
+        let mut sites = 0usize;
+        let mut violations: Vec<String> = Vec::new();
+
+        for path in &files {
+            let text = std::fs::read_to_string(path).expect("read source file");
+            // Repo convention: everything before a file's first
+            // `#[cfg(test)]` is production code; everything after is test
+            // code (and is exempt — tests may build minimal records).
+            let production = match text.find("#[cfg(test)]") {
+                Some(i) => &text[..i],
+                None => text.as_str(),
+            };
+            let mut from = 0usize;
+            while let Some(rel) = production[from..].find(NEEDLE) {
+                let at = from + rel;
+                let after = at + NEEDLE.len();
+                let line = production[..at].matches('\n').count() + 1;
+                // The fluent builder chain runs from the constructor to the
+                // first `;` terminating the statement.
+                let chain_end = production[after..]
+                    .find(';')
+                    .map_or(production.len(), |i| after + i);
+                let chain = &production[at..chain_end];
+                // Op kind: a string-literal argument, or a variable (a
+                // dynamic kind — those sites must still carry inputs, they
+                // just cannot be allowlisted by name).
+                let arg = production[after..chain_end].trim_start();
+                let kind = if let Some(rest) = arg.strip_prefix('"') {
+                    rest.split('"').next().unwrap_or("<unterminated>")
+                } else {
+                    "<dynamic>"
+                };
+                sites += 1;
+                let has_inputs = chain.contains(".with_input_");
+                if !has_inputs && !ALLOWLIST.contains(&kind) {
+                    violations.push(format!(
+                        "{}:{} op kind `{}` records NO `.with_input_*` references. \
+                         A consuming operation that records no inputs is a SILENT \
+                         lineage break: the durable event stream — the only thing \
+                         that survives replay — says its result appeared from \
+                         nowhere, so lineage rebuilt from events splits one part \
+                         into two with nothing failing. Attach the real input \
+                         references. If (and only if) this operation is a genuinely \
+                         constructive root that consumes no model entities, add its \
+                         op kind to the allowlist in this test with a justification.",
+                        path.display(),
+                        line,
+                        kind
+                    ));
+                }
+                from = after;
+            }
+        }
+
+        // Vacuity guard: the kernel has dozens of recording sites. If the
+        // scanner suddenly sees almost none, the scan itself has rotted and
+        // a green result would be meaningless.
+        assert!(
+            sites >= 20,
+            "scanner found only {sites} `RecordedOperation::new(` sites — the scan is broken"
+        );
+        assert!(
+            violations.is_empty(),
+            "lineage ratchet violations:\n{}",
+            violations.join("\n")
+        );
+    }
 }

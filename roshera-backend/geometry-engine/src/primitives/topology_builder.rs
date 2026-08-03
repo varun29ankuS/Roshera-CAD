@@ -3694,6 +3694,11 @@ impl BRepModel {
         // by the source onto this newly-derived datum so subsequent
         // moves of the parents propagate.
         self.datum_graph.register_source(id, &source);
+        // The recorded event carries the same parent edges that
+        // `datum_graph.register_source` just registered — the durable
+        // event stream and the in-memory propagation graph name the
+        // identical inputs, so lineage rebuilt from events cannot
+        // drift from the live graph.
         self.record_operation(
             crate::operations::recorder::RecordedOperation::new("datum_create_derived")
                 .with_parameters(serde_json::json!({
@@ -3702,6 +3707,10 @@ impl BRepModel {
                     "source": source,
                     "transform": matrix4_to_row_major(&transform),
                 }))
+                .with_input_datums(source.referenced_datums())
+                .with_input_vertices(source.referenced_vertices())
+                .with_input_edges(source.referenced_edges())
+                .with_input_faces(source.referenced_faces())
                 .with_output_datums([id as u64]),
         );
         Ok(id)
