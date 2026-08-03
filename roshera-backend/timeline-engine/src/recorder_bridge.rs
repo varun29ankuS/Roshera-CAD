@@ -266,12 +266,25 @@ impl TimelineRecorder {
                 match cmd {
                     RecorderCmd::Op { record, author } => {
                         let op = to_timeline_operation(&record);
+                        // Project the kernel proof the recording handler
+                        // attached at record time into the per-event
+                        // certificate the event will carry. Absent stays
+                        // absent: a record without a `solid_certificate`
+                        // produces an event without one — an honest "not
+                        // certified", never a fabricated verdict.
+                        let certificate = record
+                            .solid_certificate
+                            .as_ref()
+                            .map(crate::event_certificate::EventCertificate::from_recorded_solid);
                         // Snapshot the active branch *per event* so a swap via
                         // `set_branch_id` takes effect on the next op without
                         // restarting the worker.
                         let target = *worker_branch.read();
                         let guard = worker_timeline.read().await;
-                        match guard.add_operation(op, author, target).await {
+                        match guard
+                            .add_operation_certified(op, author, target, certificate)
+                            .await
+                        {
                             Ok(event_id) => {
                                 // Durability write-through. The event now carries
                                 // its burned `sequence_number`; persist it before
@@ -508,7 +521,10 @@ impl OperationRecorder for TimelineRecorder {
 ///
 /// The envelope preserves the original `kind`, the structured parameter
 /// payload, and the input/output entity ID lists so that downstream
-/// consumers (UI, replay, audit) have byte-for-byte fidelity.
+/// consumers (UI, replay, audit) have byte-for-byte fidelity. A
+/// `solid_certificate` attached to the record is NOT part of this replay
+/// envelope — the drain worker projects it into an `EventCertificate` and
+/// stores it on the event's metadata instead.
 fn to_timeline_operation(record: &RecordedOperation) -> Operation {
     Operation::Generic {
         command_type: record.kind.clone(),
@@ -692,6 +708,103 @@ mod tests {
         assert!(
             got_unavailable,
             "256 synchronous sends with capacity=1 and no worker yield must saturate the channel"
+        );
+    }
+
+    /// THE PRODUCER PIN. A `RecordedOperation` carrying a
+    /// `RecordedSolidCertificate` must land on the timeline as an event whose
+    /// metadata carries the projected `EventCertificate`, readable back via
+    /// `EventCertificate::from_metadata` — and an op recorded WITHOUT one
+    /// must stay uncertified. RED before the bridge forwarded certificates:
+    /// `from_metadata` returned `None` for every event.
+    #[tokio::test]
+    async fn solid_certificate_on_record_lands_on_the_event_metadata() {
+        use crate::event_certificate::EventCertificate;
+        use geometry_engine::operations::recorder::RecordedSolidCertificate;
+        use geometry_engine::primitives::topology_builder::{
+            BRepModel, GeometryId, TopologyBuilder,
+        };
+
+        // A REAL kernel certificate for a real box — not a hand-built one —
+        // so the stored proof is exactly what the kernel proved.
+        let mut model = BRepModel::new();
+        let gid = TopologyBuilder::new(&mut model)
+            .create_box_3d(10.0, 10.0, 10.0)
+            .expect("create_box_3d");
+        let solid_id = match gid {
+            GeometryId::Solid(id) => id,
+            other => panic!("expected a solid, got {other:?}"),
+        };
+        let cert = model.certify_solid(solid_id);
+        let volume = model.calculate_solid_volume(solid_id);
+        let face_count = model.solid_outer_face_count(solid_id);
+        let recorded_cert = RecordedSolidCertificate::from_validity(&cert, volume, face_count);
+        let expected = EventCertificate::from_recorded_solid(&recorded_cert);
+
+        let timeline: SharedTimeline =
+            Arc::new(RwLock::new(Timeline::new(TimelineConfig::default())));
+        let recorder =
+            TimelineRecorder::new(Arc::clone(&timeline), Author::System, BranchId::main());
+
+        recorder
+            .record(
+                RecordedOperation::new("sketch_extrude")
+                    .with_output_solids([u64::from(solid_id)])
+                    .with_solid_certificate(recorded_cert),
+            )
+            .expect("record certified op");
+        recorder
+            .record(RecordedOperation::new("uncertified"))
+            .expect("record uncertified op");
+        drop(recorder);
+
+        let main = BranchId::main();
+        for _ in 0..100 {
+            let count = timeline
+                .read()
+                .await
+                .get_branch_events(&main, None, None)
+                .map(|v| v.len())
+                .unwrap_or(0);
+            if count >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let events = timeline
+            .read()
+            .await
+            .get_branch_events(&main, None, None)
+            .expect("branch events");
+        assert_eq!(events.len(), 2, "both records reach the timeline");
+
+        let certified_event = events
+            .iter()
+            .find(|e| {
+                matches!(&e.operation, Operation::Generic { command_type, .. }
+                    if command_type == "sketch_extrude")
+            })
+            .expect("the certified op's event exists");
+        let stored = EventCertificate::from_metadata(&certified_event.metadata)
+            .expect("the recorded certificate must land on the event metadata");
+        assert_eq!(stored, expected);
+        assert_eq!(
+            stored.is_sound,
+            Some(cert.is_sound()),
+            "stored is_sound must be the verdict the kernel actually proved"
+        );
+
+        let uncertified_event = events
+            .iter()
+            .find(|e| {
+                matches!(&e.operation, Operation::Generic { command_type, .. }
+                    if command_type == "uncertified")
+            })
+            .expect("the uncertified op's event exists");
+        assert!(
+            EventCertificate::from_metadata(&uncertified_event.metadata).is_none(),
+            "an op recorded without a certificate must stay uncertified — never fabricated"
         );
     }
 

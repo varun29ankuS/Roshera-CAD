@@ -40,6 +40,13 @@ checkpoints/
 .vscode/
 .idea/
 .claude/
+
+# Per-tool agent/assistant config — local to whoever is driving, same class as .claude/
+.cursor/
+.gemini/
+.qoder/
+.codebuddy/
+opencode.jsonc
 *.swp
 *.swo
 *~

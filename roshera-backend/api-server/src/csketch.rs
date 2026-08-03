@@ -2167,6 +2167,25 @@ pub async fn extrude_csketch(
     drop(suppress);
     let result_solid_id = build_result?;
 
+    // Per-event certificate producer (certified timeline, Move 02 / spec
+    // §5.2(i)): certify the solid this op ACTUALLY produced, under the write
+    // lock, BEFORE the consolidated event below is recorded — the proof then
+    // rides on the `RecordedOperation` itself and the recorder bridge stores
+    // it on the event (`EventMetadata.properties["certificate"]`), so the
+    // evidence pack reads it back verbatim instead of `certificate: null`.
+    // `certify_solid` is the FULL kernel certificate (memoized per solid;
+    // this same pass warms the cache later verify calls hit), and
+    // volume/face_count are the cheap structural facts stored alongside.
+    let solid_certificate = {
+        let mut model = model_handle.write().await;
+        let validity = model.certify_solid(result_solid_id);
+        let volume = model.calculate_solid_volume(result_solid_id);
+        let face_count = model.solid_outer_face_count(result_solid_id);
+        geometry_engine::operations::recorder::RecordedSolidCertificate::from_validity(
+            &validity, volume, face_count,
+        )
+    };
+
     // The replayable record: everything needed to rebuild this solid
     // from an empty model (frame + per-loop payloads), applied by
     // `replay::dispatch_generic("sketch_extrude")` through the same
@@ -2194,7 +2213,8 @@ pub async fn extrude_csketch(
             "distance": req.distance,
             "direction": [direction.x, direction.y, direction.z],
         }))
-        .with_output_solids([result_solid_id as u64]);
+        .with_output_solids([result_solid_id as u64])
+        .with_solid_certificate(solid_certificate);
     if let Err(e) = state.timeline_recorder.record(record) {
         tracing::warn!("sketch_extrude event not recorded: {e}");
     }

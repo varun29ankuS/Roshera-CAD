@@ -4726,6 +4726,154 @@ async fn import_step_path_missing_file_is_typed_error() {
 }
 
 // =====================================================================
+// Tests — native .ros import route (/api/geometry/import_ros)
+// =====================================================================
+
+/// Build a POST `/api/geometry/import_ros` request with the given JSON
+/// payload.
+fn import_ros_post(payload: Value) -> Request<Body> {
+    Request::builder()
+        .method(Method::POST)
+        .uri("/api/geometry/import_ros")
+        .header("content-type", "application/json")
+        .body(Body::from(payload.to_string()))
+        .expect("static request must build")
+}
+
+/// RED-first: before this route existed, the ONLY .ros surface was the
+/// export arm of `/api/export` — `export_engine::formats::ros::import_ros`
+/// was fully implemented but reachable from no HTTP route, so a .ros file
+/// the backend itself wrote could never come back in. On the pre-fix
+/// router this request 404s (no such route); the route added for the
+/// import path is what makes it pass.
+///
+/// Builds a real single-box .ros v3.1 file on disk with the same writer
+/// the export endpoint uses (`export_brep_to_ros`, GEOM snapshot on),
+/// imports it via `path`, and confirms it splices a solid into the live
+/// model exactly like the STEP import route does.
+#[tokio::test]
+async fn import_ros_path_reads_file_serverside() {
+    use export_engine::formats::ros::{export_brep_to_ros, RosExportOptions, RosExportPayload};
+
+    let mut fresh_model = BRepModel::new();
+    {
+        let mut builder = TopologyBuilder::new(&mut fresh_model);
+        builder
+            .create_box_3d(10.0, 10.0, 10.0)
+            .expect("box primitive must build for positive size");
+    }
+
+    let mut tmp_path = std::env::temp_dir();
+    tmp_path.push(format!(
+        "roshera_import_ros_path_test_{}.ros",
+        Uuid::new_v4()
+    ));
+    export_brep_to_ros(
+        RosExportPayload {
+            model: &fresh_model,
+            history: None,
+            aipr: None,
+        },
+        &tmp_path,
+        RosExportOptions::default(),
+    )
+    .await
+    .expect(".ros export of a single box must succeed");
+
+    let state = make_test_state().await;
+    let request = import_ros_post(json!({
+        "path": tmp_path.to_string_lossy().to_string(),
+    }));
+    let (status, body) = dispatch(&state, request).await;
+    let _ = std::fs::remove_file(&tmp_path);
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "path-based import of a real .ros file must succeed; body = {body}"
+    );
+    let objects = body.get("objects").and_then(Value::as_array);
+    assert!(
+        objects.map(|o| !o.is_empty()).unwrap_or(false),
+        "path-based .ros import must splice at least one solid into the \
+         model; body = {body}"
+    );
+    // The route FULL-certifies every spliced solid; a freshly exported box
+    // must come back sound, and `success` must report that verdict.
+    assert_eq!(
+        body.get("success").and_then(Value::as_bool),
+        Some(true),
+        ".ros import of a sound box must report success:true (the per-solid \
+         certificate verdict); body = {body}"
+    );
+}
+
+/// `path` pointing at a file that does not exist must fail with a typed,
+/// actionable `invalid_parameter` error — never a panic, never a silent
+/// no-op. (RED-first: on the pre-fix router this 404s with an EMPTY body,
+/// so the `error_code` assertion fails.)
+#[tokio::test]
+async fn import_ros_path_missing_file_is_typed_error() {
+    let state = make_test_state().await;
+    let mut tmp_path = std::env::temp_dir();
+    tmp_path.push(format!("roshera_import_ros_missing_{}.ros", Uuid::new_v4()));
+    let request = import_ros_post(json!({
+        "path": tmp_path.to_string_lossy().to_string(),
+    }));
+    let (status, body) = dispatch(&state, request).await;
+    assert!(
+        status.is_client_error(),
+        "a missing .ros path must be a 4xx, not a panic/500; got {status}, body = {body}"
+    );
+    assert_eq!(
+        body.get("error_code").and_then(Value::as_str),
+        Some("invalid_parameter"),
+        "missing-file .ros import must carry the invalid_parameter code; body = {body}"
+    );
+}
+
+/// Neither `path` nor `filename` → the typed `missing_field` error that
+/// names both accepted fields, mirroring the STEP route's contract.
+#[tokio::test]
+async fn import_ros_without_path_or_filename_is_missing_field() {
+    let state = make_test_state().await;
+    let request = import_ros_post(json!({}));
+    let (status, body) = dispatch(&state, request).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "an empty .ros import payload must be a 400; body = {body}"
+    );
+    assert_eq!(
+        body.get("error_code").and_then(Value::as_str),
+        Some("missing_field"),
+        "empty .ros import payload must carry the missing_field code; body = {body}"
+    );
+}
+
+/// `filename` is resolved INSIDE the export directory; a traversal
+/// attempt (`..` / path separators) must be refused with a typed error
+/// before any filesystem access — same guard as `/api/download/{file}`.
+#[tokio::test]
+async fn import_ros_filename_traversal_is_refused() {
+    let state = make_test_state().await;
+    for evil in ["../secrets.ros", "a/b.ros", "a\\b.ros"] {
+        let request = import_ros_post(json!({ "filename": evil }));
+        let (status, body) = dispatch(&state, request).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "traversal filename {evil:?} must be a 400; body = {body}"
+        );
+        assert_eq!(
+            body.get("error_code").and_then(Value::as_str),
+            Some("invalid_parameter"),
+            "traversal filename {evil:?} must carry invalid_parameter; body = {body}"
+        );
+    }
+}
+
+// =====================================================================
 // #29 — mould a LIVE-created part end-to-end (diagnostic + gate)
 // =====================================================================
 

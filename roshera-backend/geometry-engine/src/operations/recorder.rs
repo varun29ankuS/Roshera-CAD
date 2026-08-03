@@ -86,6 +86,67 @@ pub fn parse_solid_ref(reference: &str) -> Option<crate::primitives::solid::Soli
     id.parse::<crate::primitives::solid::SolidId>().ok()
 }
 
+/// The kernel proof for the solid a recorded operation produced — the
+/// serialization-friendly projection of a
+/// [`ValidityCertificate`](crate::primitives::provenance::ValidityCertificate)
+/// that a recording handler attaches to a [`RecordedOperation`] so the
+/// timeline can store a per-event certificate at record time.
+///
+/// # Honesty contract
+///
+/// [`RecordedSolidCertificate::from_validity`] is the only sanctioned
+/// construction site: it delegates `is_sound` to the FULL
+/// [`ValidityCertificate::is_sound`](crate::primitives::provenance::ValidityCertificate::is_sound)
+/// — never a subset of cheap checks — and copies the per-check breakdown
+/// verbatim. Volume and face count are the cheap structural facts the
+/// handler already computed alongside certification; `None` when
+/// unavailable, never fabricated.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RecordedSolidCertificate {
+    /// The honest AND verdict — `ValidityCertificate::is_sound()` verbatim.
+    pub is_sound: bool,
+    /// Tessellated-mesh Euler characteristic (V − E + F).
+    pub euler_characteristic: i64,
+    /// `validate_solid_scoped` Standard topology verdict.
+    pub brep_valid: bool,
+    /// Mesh closes (no boundary edges) at the certification chord.
+    pub watertight: bool,
+    /// Every edge bordered by exactly two faces.
+    pub manifold: bool,
+    /// Consistently wound, correctly-oriented closed surface.
+    pub oriented: bool,
+    /// No two non-adjacent faces cross.
+    pub self_intersection_free: bool,
+    /// Signed volume in model units³, when available.
+    pub volume: Option<f64>,
+    /// Outer-shell face count, when available.
+    pub face_count: Option<usize>,
+}
+
+impl RecordedSolidCertificate {
+    /// Project the kernel certificate the operation actually proved, plus
+    /// the cheap structural facts computed alongside it. `is_sound` is the
+    /// full [`ValidityCertificate::is_sound`](crate::primitives::provenance::ValidityCertificate::is_sound)
+    /// — the projection never re-derives its own verdict.
+    pub fn from_validity(
+        cert: &crate::primitives::provenance::ValidityCertificate,
+        volume: Option<f64>,
+        face_count: Option<usize>,
+    ) -> Self {
+        Self {
+            is_sound: cert.is_sound(),
+            euler_characteristic: cert.euler_characteristic,
+            brep_valid: cert.brep_valid,
+            watertight: cert.watertight,
+            manifold: cert.manifold,
+            oriented: cert.oriented,
+            self_intersection_free: cert.self_intersection_free,
+            volume,
+            face_count,
+        }
+    }
+}
+
 /// A structured description of one geometry operation that has just
 /// completed successfully.
 ///
@@ -113,6 +174,15 @@ pub struct RecordedOperation {
     /// `"<kind>:<id>"` wire form (see module docs). Empty when the operation
     /// is purely destructive.
     pub outputs: Vec<String>,
+
+    /// The kernel proof for the solid this operation produced, attached by
+    /// the recording handler AFTER certification and BEFORE `record(...)`.
+    /// `None` means the op was not certified at record time (e.g. a
+    /// fast-path op, or a producer not yet wired) — downstream recorders
+    /// store no per-event certificate for it, an honest absence, never a
+    /// fabricated one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub solid_certificate: Option<RecordedSolidCertificate>,
 }
 
 impl RecordedOperation {
@@ -123,12 +193,22 @@ impl RecordedOperation {
             parameters: serde_json::Value::Null,
             inputs: Vec::new(),
             outputs: Vec::new(),
+            solid_certificate: None,
         }
     }
 
     /// Attach a JSON parameter payload.
     pub fn with_parameters(mut self, parameters: serde_json::Value) -> Self {
         self.parameters = parameters;
+        self
+    }
+
+    /// Attach the kernel proof for the solid this operation produced (see
+    /// [`RecordedSolidCertificate`]). Called by the recording handler after
+    /// it has certified the result, so the certificate rides on the same
+    /// record the timeline turns into the event.
+    pub fn with_solid_certificate(mut self, certificate: RecordedSolidCertificate) -> Self {
+        self.solid_certificate = Some(certificate);
         self
     }
 
@@ -512,5 +592,86 @@ mod tests {
         let pre: Vec<String> = vec!["solid:1".into(), "face:2".into()];
         let op = RecordedOperation::new("custom").with_input_refs(pre.clone());
         assert_eq!(op.inputs, pre);
+    }
+
+    /// An all-sound kernel certificate, hand-built so individual checks can
+    /// be flipped to make `brep_valid` and `is_sound()` diverge.
+    fn sound_validity_certificate() -> crate::primitives::provenance::ValidityCertificate {
+        use crate::primitives::provenance::{
+            ConstructionConsistency, EyesConsistency, LabelsConsistency, MeshQuality,
+            TessellationQuality, ValidityCertificate,
+        };
+        ValidityCertificate {
+            brep_valid: true,
+            watertight: true,
+            manifold: true,
+            euler_characteristic: 2,
+            boundary_edges: 0,
+            nonmanifold_edges: 0,
+            oriented: true,
+            inconsistent_directed_edges: 0,
+            self_intersection_free: true,
+            construction_consistent: ConstructionConsistency::NotApplicable,
+            labels_consistent: LabelsConsistency::NotApplicable,
+            eyes_consistent: EyesConsistency::Consistent,
+            tessellation: TessellationQuality::empty(),
+            mesh_quality: MeshQuality::empty(),
+            errors: vec![],
+            model_debris_orphan_faces: 0,
+        }
+    }
+
+    /// Honesty-contract rule 2 pin: `is_sound` on the recorded projection is
+    /// the FULL `ValidityCertificate::is_sound()`, never a cheap subset. A
+    /// cert that is `brep_valid` yet NOT watertight is UNSOUND; a projection
+    /// that read `brep_valid` into `is_sound` reports `true` here and fails.
+    #[test]
+    fn recorded_solid_certificate_is_sound_is_the_full_and() {
+        let mut cert = sound_validity_certificate();
+        cert.watertight = false;
+        assert!(cert.brep_valid, "guard: brep_valid stays true");
+        assert!(!cert.is_sound(), "guard: the cert is unsound");
+
+        let rec = RecordedSolidCertificate::from_validity(&cert, Some(1.0), Some(6));
+        assert!(
+            !rec.is_sound,
+            "is_sound must be the full AND, not brep_valid"
+        );
+        assert!(!rec.watertight);
+        assert!(rec.brep_valid);
+    }
+
+    /// The projection mirrors the certificate's per-check breakdown and the
+    /// cheap structural facts verbatim — no field is re-derived or invented.
+    #[test]
+    fn recorded_solid_certificate_mirrors_the_validity_certificate() {
+        let cert = sound_validity_certificate();
+        let rec = RecordedSolidCertificate::from_validity(&cert, Some(1000.0), Some(6));
+        assert_eq!(rec.is_sound, cert.is_sound());
+        assert_eq!(rec.euler_characteristic, cert.euler_characteristic);
+        assert_eq!(rec.brep_valid, cert.brep_valid);
+        assert_eq!(rec.watertight, cert.watertight);
+        assert_eq!(rec.manifold, cert.manifold);
+        assert_eq!(rec.oriented, cert.oriented);
+        assert_eq!(rec.self_intersection_free, cert.self_intersection_free);
+        assert_eq!(rec.volume, Some(1000.0));
+        assert_eq!(rec.face_count, Some(6));
+    }
+
+    /// Wire-format honesty: a record without a certificate serializes with
+    /// NO `solid_certificate` key at all (absent, not `null`), and an old
+    /// payload lacking the key deserializes back to `None` — an uncertified
+    /// record can never read back as a certified one.
+    #[test]
+    fn solid_certificate_absent_round_trips_as_absent() {
+        let op = RecordedOperation::new("noop");
+        let v = serde_json::to_value(&op).expect("serialize");
+        assert!(
+            v.as_object()
+                .is_some_and(|o| !o.contains_key("solid_certificate")),
+            "absent certificate must not serialize a key; got {v}"
+        );
+        let back: RecordedOperation = serde_json::from_value(v).expect("deserialize");
+        assert!(back.solid_certificate.is_none());
     }
 }

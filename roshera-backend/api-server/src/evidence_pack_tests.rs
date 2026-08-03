@@ -241,10 +241,12 @@ async fn pack_reports_exactly_the_recorded_operations() {
 
 #[tokio::test]
 async fn absent_certificate_is_null_with_a_reason_never_fabricated() {
-    // The honesty core: today no producer writes a per-op EventCertificate, so
-    // every recorded op reports `certificate: null` WITH an explicit reason —
-    // an honest "not certified", never a fabricated green. If/when producers
-    // begin recording certificates, this reads them back verbatim instead.
+    // The honesty core: kernel-recorded ops (create_box et al.) attach no
+    // per-op EventCertificate at record time — the producer is wired only on
+    // the consolidated handler-recorded paths (sketch_extrude, via
+    // `RecordedOperation::with_solid_certificate`) — so a box-create op
+    // reports `certificate: null` WITH an explicit reason: an honest "not
+    // certified", never a fabricated green. Certified ops read back verbatim.
     let state = make_test_state().await;
     create_box(&state, 10.0, 10.0, 10.0).await;
 
@@ -291,6 +293,113 @@ async fn recomputed_verdict_is_separate_from_recorded_history() {
     assert!(
         pack["operations"][0]["certificate"].is_null(),
         "recorded op certificate must stay null — the recompute is not recorded history"
+    );
+}
+
+#[tokio::test]
+async fn sketch_extrude_records_a_per_op_certificate_read_back_verbatim() {
+    // THE PRODUCER, end-to-end on the wire (certified timeline, Move 02):
+    // the `sketch_extrude` handler certifies the solid it just produced and
+    // attaches the proof to its consolidated `RecordedOperation`; the
+    // recorder bridge stores it on the event; the evidence pack reads it
+    // back AS RECORDED. RED before the producer was wired: every op —
+    // including sketch_extrude — reported `certificate: null`.
+    let state = make_test_state().await;
+
+    // Build a closed profile through the real endpoints: 10×10 rectangle.
+    let (status, body) = dispatch(&state, request(Method::POST, "/api/csketch", None, None)).await;
+    assert_eq!(status, StatusCode::CREATED, "csketch create; body: {body}");
+    let sketch_id = body["id"].as_str().expect("csketch id").to_string();
+
+    let (status, body) = dispatch(
+        &state,
+        request(
+            Method::POST,
+            &format!("/api/csketch/{sketch_id}/rectangle"),
+            None,
+            Some(json!({ "x1": 0.0, "y1": 0.0, "x2": 10.0, "y2": 10.0 })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "add rectangle; body: {body}");
+
+    let (status, body) = dispatch(
+        &state,
+        request(
+            Method::POST,
+            &format!("/api/csketch/{sketch_id}/extrude"),
+            None,
+            Some(json!({ "distance": 5.0 })),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "extrude; body: {body}");
+
+    // The pack must carry the recorded per-op certificate — read from the
+    // event's metadata, not recomputed.
+    let pack = fetch_pack(&state).await;
+    let ops = pack["operations"].as_array().expect("operations array");
+    let extrude_op = ops
+        .iter()
+        .find(|op| op["op_kind"].as_str() == Some("sketch_extrude"))
+        .expect("the sketch_extrude event must be recorded");
+
+    let cert = &extrude_op["certificate"];
+    assert!(
+        cert.is_object(),
+        "a certified sketch_extrude must carry a non-null recorded certificate; op = {extrude_op}"
+    );
+    assert_eq!(
+        cert["is_sound"],
+        json!(true),
+        "a clean 10x10x5 extrusion must record the kernel's sound verdict; cert = {cert}"
+    );
+    assert_eq!(cert["skipped"], json!(false));
+    for check in [
+        "brep_valid",
+        "watertight",
+        "manifold",
+        "oriented",
+        "self_intersection_free",
+    ] {
+        assert!(
+            cert["checks"][check].is_boolean(),
+            "the per-check breakdown must be recorded (missing {check}); cert = {cert}"
+        );
+    }
+    assert!(
+        cert["volume"]
+            .as_f64()
+            .is_some_and(|v| (v - 500.0).abs() < 1e-6),
+        "recorded volume must be the cheap structural fact (10*10*5); cert = {cert}"
+    );
+    // Per-event-type honesty: a solid op never carries sketch/assembly fields.
+    for absent in ["dof", "constrainedness", "conflict", "mates_satisfied"] {
+        assert!(
+            cert.get(absent).is_none(),
+            "a solid op certificate must not carry `{absent}`; cert = {cert}"
+        );
+    }
+    assert!(
+        extrude_op.get("certificate_absent_reason").is_none()
+            || extrude_op["certificate_absent_reason"].is_null(),
+        "a present certificate must not carry an absence reason; op = {extrude_op}"
+    );
+
+    // Fabrication guard unchanged: kernel-recorded ops (the extrude's inner
+    // events are suppressed, but any box-create style op) still report null.
+    create_box(&state, 4.0, 4.0, 4.0).await;
+    let pack = fetch_pack(&state).await;
+    let box_op = pack["operations"]
+        .as_array()
+        .expect("operations array")
+        .iter()
+        .find(|op| op["op_kind"].as_str() == Some("create_box_3d"))
+        .cloned()
+        .expect("the box event must be recorded");
+    assert!(
+        box_op["certificate"].is_null(),
+        "kernel-recorded ops carry no producer yet and must stay honestly null; op = {box_op}"
     );
 }
 

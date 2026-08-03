@@ -4865,7 +4865,6 @@ async fn import_step_geometry(
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, error_catalog::ApiError> {
     use error_catalog::{ApiError, ErrorCode};
-    use geometry_engine::tessellation::{tessellate_solid, TessellationParams};
 
     // Sanity ceiling for a server-local `path` read: generous for any
     // real CAD STEP export, small enough that a caller pointing at the
@@ -4947,6 +4946,44 @@ async fn import_step_geometry(
     };
 
     // Register + broadcast each new solid exactly like a primitive create.
+    let objects = register_imported_solids(
+        &state,
+        &model_handle,
+        &new_solid_ids,
+        base_name.as_deref(),
+        "import_step",
+        "step_import",
+    )
+    .await;
+
+    Ok(Json(serde_json::json!({
+        "success": report.ok,
+        "objects": objects,
+        "report": report,
+    })))
+}
+
+/// Splice-registration shared by the geometry import routes
+/// (`/api/geometry/import_step`, `/api/geometry/import_ros`): tessellate
+/// each freshly merged solid, mint + register an object UUID, persist the
+/// display name, broadcast to viewport clients exactly like a `create_*`
+/// primitive, and FORCE the full certificate (ignore any fast/verify
+/// preference). An imported file is UNTRUSTED external input — the exact
+/// case where the lightweight seed's "valid B-Rep ⟹ watertight" shortcut
+/// lies (a re-imported blend rim can be B-Rep-valid yet tessellate open).
+/// Running `certify_solid` here makes the per-object
+/// `perception.sound`/`watertight`/`brep_valid` the TRUE mesh verdict.
+/// One loop, two callers — the import paths cannot drift.
+async fn register_imported_solids(
+    state: &AppState,
+    model_handle: &reconcile_task::ModelHandle,
+    new_solid_ids: &[u32],
+    base_name: Option<&str>,
+    object_type: &str,
+    source: &str,
+) -> Vec<serde_json::Value> {
+    use geometry_engine::tessellation::{tessellate_solid, TessellationParams};
+
     let mut objects = Vec::with_capacity(new_solid_ids.len());
     for (i, &solid_id) in new_solid_ids.iter().enumerate() {
         let tri_mesh = {
@@ -4962,18 +4999,18 @@ async fn import_step_geometry(
         let id_str = object_uuid.to_string();
         state.register_id_mapping(object_uuid, solid_id);
 
-        let name = match &base_name {
-            Some(b) if new_solid_ids.len() == 1 => b.clone(),
+        let name = match base_name {
+            Some(b) if new_solid_ids.len() == 1 => b.to_string(),
             Some(b) => format!("{b} {}", i + 1),
             None => format!("Imported {solid_id}"),
         };
-        persist_display_name(&state, &model_handle, solid_id, &name).await;
-        let parameters = serde_json::json!({ "source": "step_import", "index": i });
+        persist_display_name(state, model_handle, solid_id, &name).await;
+        let parameters = serde_json::json!({ "source": source, "index": i });
         broadcast_object_created(
             &id_str,
             &name,
             solid_id,
-            "import_step",
+            object_type,
             &parameters,
             &vertices,
             &indices,
@@ -4984,20 +5021,13 @@ async fn import_step_geometry(
 
         let perception = {
             let mut model = model_handle.write().await;
-            // FORCE the full certificate on import (ignore the request's
-            // `fast`/verify flag). A STEP file is UNTRUSTED external input — the
-            // exact case where the lightweight seed's "valid B-Rep ⟹ watertight"
-            // shortcut lies (a re-imported blend rim can be B-Rep-valid yet
-            // tessellate open). Running `certify_solid` here makes the per-object
-            // `perception.sound`/`watertight`/`brep_valid` the TRUE mesh verdict,
-            // matching the honest `report.validation` this endpoint also returns.
-            certified_response(&mut model, &model_handle, &state, solid_id, &tri_mesh, true)
+            certified_response(&mut model, model_handle, state, solid_id, &tri_mesh, true)
         };
         objects.push(serde_json::json!({
             "id":         id_str,
             "name":       name,
             "solid_id":   solid_id,
-            "objectType": "import_step",
+            "objectType": object_type,
             "perception": perception,
             "mesh": {
                 "vertices": vertices,
@@ -5010,11 +5040,150 @@ async fn import_step_geometry(
             "scale":    [1.0_f32, 1.0, 1.0],
         }));
     }
+    objects
+}
+
+/// POST /api/geometry/import_ros — read a native `.ros` v3.1 file and
+/// splice its solids into the live session model.
+///
+/// Request: `{ "path": "C:/…/part.ros", "password"?: "…", "name"?: "label" }`
+/// OR `{ "filename": "part.ros", … }` where `filename` is a file inside the
+/// server's export directory — exactly the `filename` a `/api/export`
+/// `format: "ROS"` response returned, so export → import round-trips
+/// without the caller ever learning the directory layout. `.ros` is a
+/// binary container (chunked, optionally AES-256-GCM encrypted), so there
+/// is no inline `content` variant — the SERVER reads the bytes (same #34
+/// rationale as the STEP route: never buffer a binary file through JSON).
+///
+/// This is the read counterpart of the `/api/export` ROS arm
+/// (`handlers::export::export_mesh`, `ExportFormat::ROS`): the export
+/// engine reads header + chunk table, decrypts when a password is
+/// supplied, and materialises a `BRepModel` from the GEOM snapshot cache
+/// — or, when the file omitted GEOM, by replaying its HIST timeline
+/// events (`export_engine::formats::ros::import_ros_to_brep`). Every
+/// solid is then merged into the live model, registered, tessellated,
+/// broadcast, and FULL-certified exactly like the STEP import path —
+/// same splice (`merge_solids_into`), same `register_imported_solids`
+/// loop.
+async fn import_ros_geometry(
+    State(state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, error_catalog::ApiError> {
+    use error_catalog::{ApiError, ErrorCode};
+
+    // Same sanity ceiling as the STEP route: generous for any real .ros
+    // file, small enough that a caller pointing at the wrong (huge) file
+    // gets a clear error instead of a multi-minute stall reading it.
+    const MAX_ROS_FILE_BYTES: u64 = 512 * 1024 * 1024; // 512MB
+
+    let password = payload.get("password").and_then(|v| v.as_str());
+    let base_name = payload
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let imported = if let Some(p) = payload.get("path").and_then(|v| v.as_str()) {
+        let metadata = tokio::fs::metadata(p).await.map_err(|e| {
+            ApiError::new(
+                ErrorCode::InvalidParameter,
+                format!("cannot read .ros file at path {p:?}: {e}"),
+            )
+        })?;
+        if !metadata.is_file() {
+            return Err(ApiError::new(
+                ErrorCode::InvalidParameter,
+                format!("path {p:?} is not a regular file"),
+            ));
+        }
+        if metadata.len() > MAX_ROS_FILE_BYTES {
+            return Err(ApiError::new(
+                ErrorCode::InvalidParameter,
+                format!(
+                    ".ros file at {p:?} is {} bytes, exceeds the {MAX_ROS_FILE_BYTES}-byte import ceiling",
+                    metadata.len()
+                ),
+            ));
+        }
+        export_engine::formats::ros::import_ros_to_brep(std::path::Path::new(p), password)
+            .await
+            .map_err(|e| {
+                ApiError::new(
+                    ErrorCode::InvalidParameter,
+                    format!(".ros import failed: {e}"),
+                )
+            })?
+    } else if let Some(f) = payload.get("filename").and_then(|v| v.as_str()) {
+        // Same traversal guard as `/api/download/{filename}` — the value
+        // is resolved inside the export directory, never outside it.
+        if f.contains("..") || f.contains('/') || f.contains('\\') {
+            return Err(ApiError::new(
+                ErrorCode::InvalidParameter,
+                format!(
+                    "filename {f:?} must be a bare file name inside the export \
+                     directory (no path separators)"
+                ),
+            ));
+        }
+        state
+            .export_engine
+            .import_ros(f, password)
+            .await
+            .map_err(|e| {
+                ApiError::new(
+                    ErrorCode::InvalidParameter,
+                    format!(".ros import failed: {e}"),
+                )
+            })?
+    } else {
+        return Err(ApiError::missing_field(
+            "path or filename (a server-readable .ros file location, or a file \
+             name a /api/export ROS response returned)",
+        ));
+    };
+
+    if imported.solids.is_empty() {
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            ".ros file materialised no solids (empty GEOM snapshot and no \
+             rebuildable HIST events)"
+                .to_string(),
+        ));
+    }
+
+    // Splice into the live session model, remapping ids so they don't
+    // collide with existing parts. `merge_solids_into` is the generic
+    // BRepModel→BRepModel splice (it lives in `formats::step` because the
+    // STEP route grew it first; nothing about it is STEP-specific).
+    let new_solid_ids: Vec<u32> = {
+        let mut model = model_handle.write().await;
+        export_engine::formats::step::merge_solids_into(&mut model, &imported)
+    };
+
+    let objects = register_imported_solids(
+        &state,
+        &model_handle,
+        &new_solid_ids,
+        base_name.as_deref(),
+        "import_ros",
+        "ros_import",
+    )
+    .await;
+
+    // Honesty: `success` reports the certificates' verdict, not merely
+    // "the file parsed" — a .ros file carries no ImportReport, so the
+    // per-solid full certificate IS the import verdict.
+    let all_sound = objects.iter().all(|o| {
+        o.get("perception")
+            .and_then(|p| p.get("sound"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    });
 
     Ok(Json(serde_json::json!({
-        "success": report.ok,
+        "success": all_sound,
         "objects": objects,
-        "report": report,
+        "imported_solids": objects.len(),
     })))
 }
 
@@ -8857,6 +9026,15 @@ pub(crate) fn build_router(state: AppState) -> Router {
                 // toy-scale for this route specifically. Raised HERE only —
                 // every other route keeps the 2MB default.
                 .route_layer(DefaultBodyLimit::max(256 * 1024 * 1024)),
+        )
+        .route(
+            // Native .ros import: `path`/`filename` only (binary container,
+            // the server reads the bytes), so the 2MB default body limit is
+            // ample for its small JSON payload.
+            "/api/geometry/import_ros",
+            post(import_ros_geometry).route_layer(axum::middleware::from_fn(
+                auth_middleware::require_create_geometry,
+            )),
         )
         .route(
             "/api/geometry/face/extrude",

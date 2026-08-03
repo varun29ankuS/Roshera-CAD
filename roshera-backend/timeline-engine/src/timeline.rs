@@ -229,7 +229,28 @@ impl Timeline {
     ) -> TimelineResult<EventId> {
         // Reserve `None` — the sequence number is burned internally *after*
         // validation, so a rejected append leaves no gap in the sequence space.
-        self.append_internal(operation, author, branch_id, None)
+        self.append_internal(operation, author, branch_id, None, None)
+    }
+
+    /// [`add_operation`](Self::add_operation) plus a per-event certificate —
+    /// the kernel proof for the geometry this operation produced, stored on
+    /// the event's metadata under
+    /// [`EVENT_CERTIFICATE_KEY`](crate::event_certificate::EVENT_CERTIFICATE_KEY)
+    /// at creation time, so it is part of the serialized event from the first
+    /// instant (persistence and replay carry it unchanged; nothing ever
+    /// back-patches an already-visible event).
+    ///
+    /// `None` stores no certificate — an honest "not certified", never a
+    /// fabricated one. This is the append entry the recorder bridge uses for
+    /// records that carry a `RecordedSolidCertificate`.
+    pub async fn add_operation_certified(
+        &self,
+        operation: Operation,
+        author: Author,
+        branch_id: BranchId,
+        certificate: Option<crate::event_certificate::EventCertificate>,
+    ) -> TimelineResult<EventId> {
+        self.append_internal(operation, author, branch_id, None, certificate.as_ref())
     }
 
     /// Atomically reserve the next sequence number (the write-half of the
@@ -271,20 +292,24 @@ impl Timeline {
         branch_id: BranchId,
         sequence_number: u64,
     ) -> TimelineResult<EventId> {
-        self.append_internal(operation, author, branch_id, Some(sequence_number))
+        self.append_internal(operation, author, branch_id, Some(sequence_number), None)
     }
 
     /// Shared validate-then-insert core for the append paths. `reserved`:
     /// `None` burns a fresh sequence after validation (the `add_operation`
     /// contract); `Some(seq)` uses a pre-reserved sequence (the
-    /// `add_operation_reserved` contract). No `.await` occurs — every store is
-    /// interior-mutable — so both async wrappers delegate here synchronously.
+    /// `add_operation_reserved` contract). `certificate`: `Some` stores the
+    /// per-event proof on the event's metadata before the event becomes
+    /// visible (the `add_operation_certified` contract); `None` stores no
+    /// certificate. No `.await` occurs — every store is interior-mutable —
+    /// so the async wrappers delegate here synchronously.
     fn append_internal(
         &self,
         operation: Operation,
         author: Author,
         branch_id: BranchId,
         reserved: Option<u64>,
+        certificate: Option<&crate::event_certificate::EventCertificate>,
     ) -> TimelineResult<EventId> {
         // ---- Validation phase (no mutation) ---------------------------
         let branch_ref = self
@@ -331,7 +356,7 @@ impl Timeline {
             reserved.unwrap_or_else(|| self.event_counter.fetch_add(1, Ordering::SeqCst));
         let event_id = EventId::new();
 
-        let event = TimelineEvent {
+        let mut event = TimelineEvent {
             id: event_id,
             sequence_number,
             timestamp: Utc::now(),
@@ -369,6 +394,23 @@ impl Timeline {
                 properties: std::collections::HashMap::new(),
             },
         };
+
+        // Store the per-event certificate BEFORE the event becomes visible,
+        // so every reader (in-memory, persistence sink, replay) sees the same
+        // event — the proof is part of the event, never a back-patch. A
+        // serialization failure (e.g. a non-finite volume) drops the
+        // certificate, not the event: the op already happened, and an absent
+        // certificate is an honest "not certified", never a fabricated one.
+        if let Some(cert) = certificate {
+            if let Err(err) = cert.store_in(&mut event.metadata) {
+                tracing::warn!(
+                    target: "timeline",
+                    sequence = sequence_number,
+                    error = %err,
+                    "failed to serialize per-event certificate — event stored WITHOUT one"
+                );
+            }
+        }
 
         // Insert into the global event store first; if the per-branch
         // index is missing (race with branch removal), roll back the
