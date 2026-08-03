@@ -328,6 +328,19 @@ export function metaFor(name: string): ToolMeta {
   };
 }
 
+/**
+ * Read-only view of the RAW explicit-classification table — every name that
+ * has ever been given a bench, unfiltered by whether it is still registered.
+ * Deliberately NOT `metaFor`: `metaFor`'s `?? "meta"` fallback is exactly what
+ * makes a stale entry invisible (an unregistered name simply never gets
+ * looked up through it), so a staleness gate must read this map directly, not
+ * go through the fallback. Returns a frozen shallow copy — callers cannot
+ * mutate the module's private table.
+ */
+export function explicitBenchTable(): Readonly<Record<string, Bench>> {
+  return Object.freeze({ ...BENCH_OF });
+}
+
 // ─── Schema → JSON-schema + token estimate ──────────────────────────────────
 
 /**
