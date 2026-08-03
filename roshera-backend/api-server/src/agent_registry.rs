@@ -986,6 +986,29 @@ fn raw_tools() -> Vec<ToolSpec> {
                 "required": ["object_id", "face_id"]
             }),
         ),
+        // Sketch-on-face for the PARAMETRIC path. Classified `sketch` on the
+        // MCP side in 105607ed when it was found sitting in the `meta`
+        // fallback and invisible on the sketch bench — but this curated table
+        // was never updated to match, so the same tool had no backend row at
+        // all until the ontology gate surfaced it. Note `object_uuid` here,
+        // not `object_id` as its non-parametric sibling `plane_from_face`
+        // above uses: transcribed verbatim from the zod contract in
+        // roshera-mcp/src/tools/psketch.ts, which is the wire truth.
+        t(
+            "psketch_plane_from_face",
+            Sketch,
+            Stable,
+            Curated,
+            "Derive a custom sketch plane from a planar face of an existing part (sketch-on-face); returns {origin, u_axis, v_axis} to pass as `plane` to psketch_extrude/psketch_revolve. The frame's normal points OUT of the part. Refuses typed when the face is not planar or not owned by the part.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "object_uuid": {"type": "string", "format": "uuid", "description": "part object uuid (e.g. from list_parts)"},
+                    "face_id": {"type": "integer", "minimum": 0, "description": "kernel face id on that part (inspect/perception tools list them)"}
+                },
+                "required": ["object_uuid", "face_id"]
+            }),
+        ),
         t(
             "psketch_begin",
             Sketch,
@@ -2005,7 +2028,11 @@ mod tests {
         // (Analysis / Experimental / Curated) mirroring roshera-mcp
         // src/tools/kb.ts. Full-table only — it is deliberately absent from
         // the minimal surface, whose token bill is unchanged at 5070.
-        assert_eq!(tools.len(), 102, "expected 102 tools, got {}", tools.len());
+        // 103: `psketch_plane_from_face` (Sketch / Stable / Curated) — it was
+        // classified on the MCP side in 105607ed but never added here, so it
+        // had no backend row at all. Found by the ontology drift gate, which
+        // cross-checks this table against roshera-mcp's BENCH_OF.
+        assert_eq!(tools.len(), 103, "expected 103 tools, got {}", tools.len());
     }
 
     /// The kernel-sourced rows correspond to operations actually registered in

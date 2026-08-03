@@ -201,23 +201,25 @@ console.log("(o4) no stale BENCH_OF: every explicit classification names a live 
 // ─────────────────────────────────────────────────────────────────────────────
 console.log("(o5) MCP↔backend bench parity (parsed from agent_registry.rs, no live server)");
 {
-  // The four MCP-only tools known to have no backend row at all — composition
-  // tools the backend never curates, plus one genuine gap (see the note
-  // below). Each entry needs BOTH directions asserted: it must actually be an
-  // MCP tool with a classification, and it must actually be absent from the
-  // backend parse — an allowlist entry that stops being true (the backend
-  // grows the row) would silently mask that tool's bench from ever being
-  // compared, which is the exact hole this section exists to close.
+  // The MCP-only tools known to have no backend row at all — composition
+  // tools the backend never curates. Each entry needs BOTH directions
+  // asserted: it must actually be an MCP tool with a classification, and it
+  // must actually be absent from the backend parse — an allowlist entry that
+  // stops being true (the backend grows the row) would silently mask that
+  // tool's bench from ever being compared, which is the exact hole this
+  // section exists to close.
+  //
+  // `psketch_plane_from_face` used to sit here as a GENUINE GAP rather than a
+  // design choice: agent_registry.rs's curated table was never updated when
+  // that tool was classified 'sketch' (105607ed), so the same tool whose
+  // missing classification caused the original meta-fallback bug had no
+  // backend row either. Its row was added and this entry removed — and the
+  // both-directions hygiene check is what forced the removal rather than
+  // letting a now-false allowlist entry linger.
   const BACKEND_ABSENT = {
     workbench: "composition tool (bench-switch controller) — MCP-side only, not a kernel op",
     cad_program: "composition tool (batch dispatcher) — MCP-side only, not a kernel op",
     ask_choice: "notebook/choice-card builder — MCP-side only, not a kernel op",
-    // Genuine gap, not a deliberate design choice: agent_registry.rs's curated
-    // table was never updated when psketch_plane_from_face was classified
-    // 'sketch' (105607ed). A live consumeRegistry() run would already report
-    // this as inventory drift ("compiled but not in kernel") because it is
-    // outside META_SURFACE — this just names the same fact statically.
-    psketch_plane_from_face: "sketch-on-face helper — missing from agent_registry.rs's curated table (real gap, not by design)",
   };
 
   const backendPath = path.join(
