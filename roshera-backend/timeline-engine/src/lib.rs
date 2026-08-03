@@ -28,6 +28,7 @@ pub mod entity_mapping;
 pub mod event_certificate;
 pub mod execution;
 pub mod incremental;
+pub mod lineage;
 pub mod mould;
 pub mod operations;
 pub mod rebuild_certificate;
@@ -55,6 +56,7 @@ pub use execution::{ExecutionConfig, ExecutionEngine, OperationImpl};
 pub use incremental::{
     incremental_rebuild, incremental_rebuild_verified, IncrementalStats, ModelDigest, PrefixCache,
 };
+pub use lineage::{EntityRef, EventSummary, LineageEdge, LineageError, LineageGraph};
 pub use mould::{
     is_param_meta, mould_operation, name_binding_operation, params_have_numeric, NameBindings,
     OverrideSet, MOULD_COMMAND, NAME_COMMAND,
