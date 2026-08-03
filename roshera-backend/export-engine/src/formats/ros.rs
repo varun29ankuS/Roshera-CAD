@@ -133,12 +133,58 @@ pub struct RosImport {
     pub snapshot: Option<BRepSnapshot>,
 }
 
+impl RosImport {
+    /// Materialise a `BRepModel` from this import: use the GEOM cache
+    /// when the file carried one, otherwise rebuild by replaying HIST
+    /// events. The single materialisation path shared by
+    /// [`import_ros_to_brep`] and the api-server import route.
+    pub fn into_model(self) -> Result<BRepModel, shared_types::ExportError> {
+        if let Some(snapshot) = self.snapshot {
+            return Ok(snapshot.to_model());
+        }
+        let mut model = BRepModel::new();
+        let outcome = timeline_engine::rebuild_model_from_events(&mut model, &self.timeline);
+        if outcome.events_skipped > 0 {
+            return Err(ExportError::ExportFailed {
+                reason: format!(
+                    "Failed to rebuild geometry from {} HIST events: {} skipped",
+                    self.timeline.len(),
+                    outcome.events_skipped
+                ),
+            });
+        }
+        Ok(model)
+    }
+}
+
+/// What [`export_brep_to_ros`] actually wrote into the file's mandatory
+/// HIST/PROV chunks — returned from the write site itself so an export
+/// response can state the file's contents (event/branch/command counts,
+/// PROV session id) without re-opening the file. A provenance-bearing
+/// file and a bare geometry snapshot must be distinguishable from the
+/// writer's own report, never inferred.
+#[derive(Debug, Clone)]
+pub struct RosWriteSummary {
+    /// Timeline events written into HIST.
+    pub hist_event_count: usize,
+    /// Branch manifests written into HIST.
+    pub hist_branch_count: usize,
+    /// AI commands written into PROV.
+    pub prov_command_count: usize,
+    /// Session id recorded in PROV (freshly opened when no tracker was
+    /// supplied — still a real, file-carried id).
+    pub prov_session_id: u64,
+}
+
 /// Export a B-Rep model + timeline + provenance to .ros v3.1.
+///
+/// Returns a [`RosWriteSummary`] stating what the mandatory HIST/PROV
+/// chunks actually carry.
 pub async fn export_brep_to_ros(
     payload: RosExportPayload<'_>,
     path: &Path,
     options: RosExportOptions,
-) -> Result<(), shared_types::ExportError> {
+) -> Result<RosWriteSummary, shared_types::ExportError> {
     let mut file = File::create(path)
         .await
         .map_err(|_e| ExportError::FileWriteError {
@@ -212,6 +258,8 @@ pub async fn export_brep_to_ros(
         Some(data) => HistChunk::new(data.branches, data.events),
         None => HistChunk::empty(),
     };
+    let hist_event_count = hist_chunk.events.len();
+    let hist_branch_count = hist_chunk.branches.len();
     let hist_bytes = hist_chunk.serialize().map_err(ros_err)?;
     chunks.push(encrypt_if_enabled(
         Chunk::new(ChunkType::HIST, hist_bytes),
@@ -225,6 +273,8 @@ pub async fn export_brep_to_ros(
         Some(tracker) => ProvChunk::from_tracker(tracker),
         None => ProvChunk::empty(options.tracking_level, PrivacySettings::default()),
     };
+    let prov_command_count = prov_chunk.commands.len();
+    let prov_session_id = prov_chunk.session;
     let prov_bytes = prov_chunk.serialize().map_err(ros_err)?;
     chunks.push(encrypt_if_enabled(
         Chunk::new(ChunkType::PROV, prov_bytes),
@@ -291,7 +341,12 @@ pub async fn export_brep_to_ros(
             path: path.to_string_lossy().to_string(),
         })?;
 
-    Ok(())
+    Ok(RosWriteSummary {
+        hist_event_count,
+        hist_branch_count,
+        prov_command_count,
+        prov_session_id,
+    })
 }
 
 /// Encrypt a chunk in place when a key set is supplied.
@@ -426,24 +481,7 @@ pub async fn import_ros_to_brep(
     path: &Path,
     password: Option<&str>,
 ) -> Result<BRepModel, shared_types::ExportError> {
-    let import = import_ros(path, password).await?;
-
-    if let Some(snapshot) = import.snapshot {
-        return Ok(snapshot.to_model());
-    }
-
-    let mut model = BRepModel::new();
-    let outcome = timeline_engine::rebuild_model_from_events(&mut model, &import.timeline);
-    if outcome.events_skipped > 0 {
-        return Err(ExportError::ExportFailed {
-            reason: format!(
-                "Failed to rebuild geometry from {} HIST events: {} skipped",
-                import.timeline.len(),
-                outcome.events_skipped
-            ),
-        });
-    }
-    Ok(model)
+    import_ros(path, password).await?.into_model()
 }
 
 /// Read + decrypt + deserialize a single chunk payload.

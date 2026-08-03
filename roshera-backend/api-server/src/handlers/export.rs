@@ -9,6 +9,8 @@
 
 use crate::AppState;
 use axum::{extract::State, http::StatusCode, response::Json};
+use export_engine::formats::ros::HistData;
+use export_engine::formats::timeline_chunk::BranchManifest;
 use geometry_engine::tessellation::{tessellate_solid, TessellationParams};
 use shared_types::*;
 use std::time::Instant;
@@ -19,6 +21,56 @@ pub async fn export_mesh(
     Json(request): Json<ExportRequest>,
 ) -> Result<Json<ExportResponse>, (StatusCode, String)> {
     let start = Instant::now();
+
+    // .ros v3.1 declares HIST (timeline) as a MANDATORY chunk: a ROS
+    // export must carry the live timeline, not an empty manifest. The
+    // snapshot is taken BEFORE the model read guard below so the two
+    // locks are never held together (every timeline handler releases
+    // the timeline lock before touching the model; this handler holds
+    // the model guard for the whole tessellation pass).
+    let ros_history: Option<HistData> = if matches!(request.format, ExportFormat::ROS) {
+        // Same access pattern as `GET /api/timeline/history`: drain
+        // in-flight recorder ops first so the file reflects every
+        // kernel operation issued so far, then read branch events and
+        // sort by sequence number (DashMap iteration is unordered).
+        let _ = state.timeline_recorder.flush().await;
+        let timeline = state.timeline.read().await;
+        let branches: Vec<BranchManifest> = timeline
+            .get_all_branches()
+            .iter()
+            .map(BranchManifest::from_branch)
+            .collect();
+        let mut events = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for branch in &branches {
+            let branch_events =
+                timeline
+                    .get_branch_events(&branch.id, None, None)
+                    .map_err(|e| {
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!(
+                                "ROS export: failed to read timeline events for branch {}: {e}",
+                                branch.id
+                            ),
+                        )
+                    })?;
+            for event in branch_events {
+                // A branch's event window can include events inherited
+                // from its parent; dedup on event id so HIST carries
+                // each event exactly once.
+                if seen.insert(event.id.0) {
+                    events.push(event);
+                }
+            }
+        }
+        // Global sort preserves per-branch ascending order — readers
+        // group by `metadata.branch_id` (`HistChunk::events_by_branch`).
+        events.sort_by_key(|e| e.sequence_number);
+        Some(HistData::new(branches, events))
+    } else {
+        None
+    };
 
     // Hold a read guard for the duration of the export — both the
     // tessellation pass below and (later) the ROS/STEP exporters need
@@ -177,6 +229,7 @@ pub async fn export_mesh(
     // bounds") is propagated verbatim into the response body so the caller —
     // agent or human — can diagnose the exact failing surface/topology instead
     // of a blank status code. (Dogfood finding F2.)
+    let mut ros_contents: Option<RosFileContents> = None;
     let filename = match request.format {
         ExportFormat::STL => state
             .export_engine
@@ -200,21 +253,48 @@ pub async fn export_mesh(
                     format!("OBJ export failed: {e}"),
                 )
             })?,
-        ExportFormat::ROS => state
-            .export_engine
-            .export_ros(
-                &model,
-                &safe_name,
-                export_engine::formats::ros::RosExportOptions::default(),
-            )
-            .await
-            .map_err(|e| {
-                tracing::error!("ROS export failed: {:?}", e);
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("ROS export failed: {e}"),
+        ExportFormat::ROS => {
+            // PROV is mandatory too, but the api-server holds NO source
+            // of `AICommand`s (no `AICommandTracker` is wired into
+            // `AppState`), so `aipr: None` writes a PROV chunk with a
+            // freshly-opened session id and an EMPTY command list.
+            // That emptiness is made legible in the response
+            // (`ros_contents.prov_commands_absent_reason`) — the same
+            // rule as the evidence-pack route's
+            // `certificate_absent_reason` — and commands are NEVER
+            // synthesised from timeline events: fabricated provenance
+            // is worse than declared absence.
+            let (filename, summary) = state
+                .export_engine
+                .export_ros(
+                    &model,
+                    &safe_name,
+                    ros_history,
+                    None,
+                    export_engine::formats::ros::RosExportOptions::default(),
                 )
-            })?,
+                .await
+                .map_err(|e| {
+                    tracing::error!("ROS export failed: {:?}", e);
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("ROS export failed: {e}"),
+                    )
+                })?;
+            ros_contents = Some(RosFileContents {
+                hist_event_count: summary.hist_event_count,
+                hist_branch_count: summary.hist_branch_count,
+                prov_command_count: summary.prov_command_count,
+                prov_session_id: summary.prov_session_id,
+                prov_commands_absent_reason: (summary.prov_command_count == 0).then(|| {
+                    "no AI command tracker is wired into the server state; PROV carries \
+                     the write-time session id and zero commands — this records the \
+                     absence of a command log, not the absence of AI involvement"
+                        .to_string()
+                }),
+            });
+            filename
+        }
         ExportFormat::STEP => state
             .export_engine
             .export_step(&model, &safe_name)
@@ -268,6 +348,7 @@ pub async fn export_mesh(
         success: true,
         export_time_ms: start.elapsed().as_millis() as u64,
         download_url,
+        ros_contents,
     };
 
     state.record_request("/api/export", start.elapsed().as_millis() as u64);

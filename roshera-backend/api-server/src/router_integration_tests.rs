@@ -4873,6 +4873,249 @@ async fn import_ros_filename_traversal_is_refused() {
     }
 }
 
+/// RED-first: `.ros` v3.1 declares HIST (timeline) as a MANDATORY chunk,
+/// but the `/api/export` ROS arm passed `RosExportPayload { history:
+/// None, .. }` — so a part with a fully recorded live timeline exported
+/// a file whose HIST chunk was EMPTY, silently implying "this model has
+/// no history". This test failed before the fix (0 HIST events in the
+/// file against a live timeline of recorded events) and pins:
+///   1. the exported FILE carries the live branch's events (verified by
+///      re-opening the raw artifact with the format's own reader, not
+///      by trusting the response), and
+///   2. the RESPONSE states what went into the file, including the
+///      legible PROV-emptiness marker (`prov_commands_absent_reason`).
+#[tokio::test]
+async fn export_ros_route_hist_carries_the_live_timeline() {
+    let state = make_test_state().await;
+    let _drill = seed_bored_box_live(&state).await;
+
+    // Ground truth: the live timeline's event count for branch main,
+    // read exactly the way GET /api/timeline/history reads it
+    // (recorder flush barrier, then branch events).
+    let _ = state.timeline_recorder.flush().await;
+    let live_event_count = {
+        let timeline = state.timeline.read().await;
+        timeline
+            .get_branch_events(&timeline_engine::BranchId::main(), None, None)
+            .expect("branch main must exist")
+            .len()
+    };
+    assert!(
+        live_event_count > 0,
+        "precondition: the live-seeded part must have recorded timeline events"
+    );
+
+    // P1: clear the export staleness gate explicitly for every live
+    // solid (what `verify_part` calls), so ONLY the HIST content is
+    // under test here.
+    let solid_ids: Vec<u32> = {
+        let model = state.model.read().await;
+        model.solids.iter().map(|(sid, _)| sid).collect()
+    };
+    for sid in solid_ids {
+        let (vs, vbody) = dispatch(
+            &state,
+            json_get(&format!("/api/agent/parts/{sid}/perception")),
+        )
+        .await;
+        assert_eq!(
+            vs,
+            StatusCode::OK,
+            "precondition: verify of solid {sid} must succeed; body = {vbody}"
+        );
+    }
+
+    let (status, raw) = dispatch_raw(
+        &state,
+        export_post(json!({ "format": "ROS", "objects": [] })),
+    )
+    .await;
+    let text = String::from_utf8_lossy(&raw).to_string();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "ROS export must succeed; body = {text}"
+    );
+    let body: Value = serde_json::from_str(&text).expect("export success body is JSON");
+    let filename = body["filename"]
+        .as_str()
+        .expect("export response carries the filename")
+        .to_string();
+
+    // Verify from the RAW ARTIFACT: re-open the file the route just
+    // wrote with the format's own reader.
+    let path = std::path::PathBuf::from("./exports").join(&filename);
+    let imported = export_engine::formats::ros::import_ros(&path, None)
+        .await
+        .expect("the exported .ros file must re-open with the format's own reader");
+    let _ = std::fs::remove_file(&path);
+
+    assert_eq!(
+        imported.timeline.len(),
+        live_event_count,
+        "HIST is a MANDATORY chunk carrying the timeline: the exported file must \
+         contain the live branch's {live_event_count} events, not an empty manifest"
+    );
+    assert!(
+        !imported.branches.is_empty(),
+        "HIST must carry the branch manifest for the live timeline"
+    );
+    // PROV: the server has no AI-command source, so the file must carry
+    // a real session id and an EMPTY command list — never commands
+    // synthesised from timeline events.
+    assert!(
+        imported.aipr.commands.is_empty(),
+        "PROV must not contain fabricated AI commands"
+    );
+
+    // The response must state what the file carries.
+    let contents = body
+        .get("ros_contents")
+        .cloned()
+        .expect("a ROS export response must report what went into the file");
+    assert_eq!(
+        contents["hist_event_count"].as_u64(),
+        Some(live_event_count as u64),
+        "response must report the HIST event count; contents = {contents}"
+    );
+    assert_eq!(
+        contents["prov_command_count"].as_u64(),
+        Some(0),
+        "response must report the PROV command count; contents = {contents}"
+    );
+    assert!(
+        contents["prov_commands_absent_reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("no AI command tracker"),
+        "an empty PROV must be legible in the response (same rule as \
+         certificate_absent_reason), not silent; contents = {contents}"
+    );
+}
+
+/// RED-first: the import route used `import_ros_to_brep`, which returns a
+/// bare `BRepModel` — the fully-parsed HIST/PROV payload was thrown away
+/// and the response said nothing about it (this test failed before the
+/// fix: no `file_contents` in the body). The route must REPORT the
+/// counts it read; ingesting a foreign timeline stays out of scope.
+#[tokio::test]
+async fn import_ros_route_reports_hist_and_prov_counts() {
+    use export_engine::formats::ros::{
+        export_brep_to_ros, HistData, RosExportOptions, RosExportPayload,
+    };
+    use export_engine::formats::timeline_chunk::BranchManifest;
+
+    fn synth_event(branch: timeline_engine::BranchId, seq: u64) -> timeline_engine::TimelineEvent {
+        timeline_engine::TimelineEvent {
+            id: timeline_engine::EventId::new(),
+            sequence_number: seq,
+            timestamp: chrono::Utc::now(),
+            author: timeline_engine::Author::System,
+            operation: timeline_engine::Operation::CreatePrimitive {
+                primitive_type: timeline_engine::PrimitiveType::Box,
+                parameters: json!({ "size": 1.0 }),
+            },
+            inputs: timeline_engine::OperationInputs::default(),
+            outputs: timeline_engine::OperationOutputs::default(),
+            metadata: timeline_engine::EventMetadata {
+                description: None,
+                branch_id: branch,
+                tags: vec![],
+                properties: Default::default(),
+            },
+        }
+    }
+
+    // A real box model plus a synthetic 2-event / 1-branch HIST payload.
+    let mut fresh_model = BRepModel::new();
+    {
+        let mut builder = TopologyBuilder::new(&mut fresh_model);
+        builder
+            .create_box_3d(10.0, 10.0, 10.0)
+            .expect("box primitive must build for positive size");
+    }
+    let main = timeline_engine::BranchId::main();
+    let manifest = BranchManifest {
+        id: main,
+        name: "main".to_string(),
+        parent: None,
+        fork_point: timeline_engine::ForkPoint {
+            branch_id: main,
+            event_index: 0,
+            timestamp: chrono::Utc::now(),
+        },
+        state: timeline_engine::BranchState::Active,
+        metadata: timeline_engine::BranchMetadata {
+            created_by: timeline_engine::Author::System,
+            created_at: chrono::Utc::now(),
+            purpose: timeline_engine::BranchPurpose::UserExploration {
+                description: "import-count test".to_string(),
+            },
+            ai_context: None,
+            checkpoints: vec![],
+        },
+        protected: true,
+        hidden: false,
+    };
+
+    let mut tmp_path = std::env::temp_dir();
+    tmp_path.push(format!("roshera_import_ros_counts_{}.ros", Uuid::new_v4()));
+    export_brep_to_ros(
+        RosExportPayload {
+            model: &fresh_model,
+            history: Some(HistData::new(
+                vec![manifest],
+                vec![synth_event(main, 0), synth_event(main, 1)],
+            )),
+            aipr: None,
+        },
+        &tmp_path,
+        RosExportOptions::default(),
+    )
+    .await
+    .expect(".ros export with a HIST payload must succeed");
+
+    let state = make_test_state().await;
+    let (status, body) = dispatch(
+        &state,
+        import_ros_post(json!({ "path": tmp_path.to_string_lossy().to_string() })),
+    )
+    .await;
+    let _ = std::fs::remove_file(&tmp_path);
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        ".ros import must succeed; body = {body}"
+    );
+    let contents = body.get("file_contents").cloned().expect(
+        "import response must report what the file carried (the pre-fix route \
+         threw the parsed HIST/PROV away)",
+    );
+    assert_eq!(
+        contents["hist_event_count"].as_u64(),
+        Some(2),
+        "response must report the file's HIST event count; contents = {contents}"
+    );
+    assert_eq!(
+        contents["hist_branch_count"].as_u64(),
+        Some(1),
+        "response must report the file's HIST branch count; contents = {contents}"
+    );
+    assert_eq!(
+        contents["prov_command_count"].as_u64(),
+        Some(0),
+        "response must report the file's PROV command count; contents = {contents}"
+    );
+    assert!(
+        contents
+            .get("prov_session_id")
+            .and_then(Value::as_u64)
+            .is_some(),
+        "response must report the file's PROV session id; contents = {contents}"
+    );
+}
+
 // =====================================================================
 // #29 — mould a LIVE-created part end-to-end (diagnostic + gate)
 // =====================================================================

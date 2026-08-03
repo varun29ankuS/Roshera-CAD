@@ -74,14 +74,18 @@ async fn test_ros_export_basic() {
 
     let model = BRepModel::new();
 
-    // Engine wrapper writes empty HIST + PROV chunks under the hood.
+    // No history/tracker supplied: the file records that emptiness and
+    // the write summary states it (0 events, 0 branches, 0 commands).
     let options = RosExportOptions::default();
-    let filename = export_engine
-        .export_ros(&model, "test_model", options)
+    let (filename, summary) = export_engine
+        .export_ros(&model, "test_model", None, None, options)
         .await
         .expect("Export should succeed");
 
     assert_eq!(filename, "test_model.ros");
+    assert_eq!(summary.hist_event_count, 0);
+    assert_eq!(summary.hist_branch_count, 0);
+    assert_eq!(summary.prov_command_count, 0);
 
     let file_path = temp_dir.path().join(&filename);
     assert!(file_path.exists());
@@ -112,8 +116,8 @@ async fn test_ros_export_with_encryption() {
         ..RosExportOptions::default()
     };
 
-    let filename = export_engine
-        .export_ros(&model, "encrypted_model", options)
+    let (filename, _summary) = export_engine
+        .export_ros(&model, "encrypted_model", None, None, options)
         .await
         .expect("Encrypted export should succeed");
 
@@ -137,8 +141,8 @@ async fn test_ros_export_with_ai_tracking() {
         ..RosExportOptions::default()
     };
 
-    let filename = export_engine
-        .export_ros(&model, "ai_tracked_model", options)
+    let (filename, _summary) = export_engine
+        .export_ros(&model, "ai_tracked_model", None, None, options)
         .await
         .expect("Export with AI tracking should succeed");
 
@@ -156,15 +160,24 @@ async fn test_ros_export_roundtrip() {
     model.vertices.add(1.0, 0.0, 0.0);
     model.vertices.add(0.0, 1.0, 0.0);
 
-    let filename = export_engine
-        .export_ros(&model, "roundtrip_test", RosExportOptions::default())
+    let (filename, _summary) = export_engine
+        .export_ros(
+            &model,
+            "roundtrip_test",
+            None,
+            None,
+            RosExportOptions::default(),
+        )
         .await
         .expect("Export should succeed");
 
-    let imported_model = export_engine
+    let imported = export_engine
         .import_ros(&filename, None)
         .await
         .expect("Import should succeed");
+    let imported_model = imported
+        .into_model()
+        .expect("materialising the imported model should succeed");
 
     assert_eq!(imported_model.vertices.len(), model.vertices.len());
 }

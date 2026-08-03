@@ -5058,13 +5058,15 @@ async fn register_imported_solids(
 /// This is the read counterpart of the `/api/export` ROS arm
 /// (`handlers::export::export_mesh`, `ExportFormat::ROS`): the export
 /// engine reads header + chunk table, decrypts when a password is
-/// supplied, and materialises a `BRepModel` from the GEOM snapshot cache
-/// — or, when the file omitted GEOM, by replaying its HIST timeline
-/// events (`export_engine::formats::ros::import_ros_to_brep`). Every
-/// solid is then merged into the live model, registered, tessellated,
-/// broadcast, and FULL-certified exactly like the STEP import path —
-/// same splice (`merge_solids_into`), same `register_imported_solids`
-/// loop.
+/// supplied, and returns the FULL structured `RosImport` (timeline,
+/// branches, PROV, optional GEOM snapshot). Geometry is materialised
+/// from the GEOM cache — or, when the file omitted GEOM, by replaying
+/// its HIST timeline events (`RosImport::into_model`) — and the
+/// HIST/PROV counts are reported in the response rather than dropped.
+/// Every solid is then merged into the live model, registered,
+/// tessellated, broadcast, and FULL-certified exactly like the STEP
+/// import path — same splice (`merge_solids_into`), same
+/// `register_imported_solids` loop.
 async fn import_ros_geometry(
     State(state): State<AppState>,
     ActiveModel(model_handle): ActiveModel,
@@ -5083,7 +5085,7 @@ async fn import_ros_geometry(
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
-    let imported = if let Some(p) = payload.get("path").and_then(|v| v.as_str()) {
+    let ros = if let Some(p) = payload.get("path").and_then(|v| v.as_str()) {
         let metadata = tokio::fs::metadata(p).await.map_err(|e| {
             ApiError::new(
                 ErrorCode::InvalidParameter,
@@ -5105,7 +5107,7 @@ async fn import_ros_geometry(
                 ),
             ));
         }
-        export_engine::formats::ros::import_ros_to_brep(std::path::Path::new(p), password)
+        export_engine::formats::ros::import_ros(std::path::Path::new(p), password)
             .await
             .map_err(|e| {
                 ApiError::new(
@@ -5141,6 +5143,28 @@ async fn import_ros_geometry(
              name a /api/export ROS response returned)",
         ));
     };
+
+    // What the file's mandatory HIST/PROV chunks carried — surfaced
+    // verbatim in the response below so the caller can tell a
+    // provenance-bearing file from a bare geometry snapshot.
+    //
+    // SCOPE: the HIST/PROV payload is REPORTED, not ingested. Merging a
+    // foreign timeline into the live one (branch identity, sequence
+    // collisions, authorship trust) is a separate design problem and is
+    // deliberately NOT attempted here — this route splices geometry and
+    // tells the caller what else the file contained, instead of silently
+    // throwing the mandatory chunks away.
+    let hist_event_count = ros.timeline.len();
+    let hist_branch_count = ros.branches.len();
+    let prov_command_count = ros.aipr.commands.len();
+    let prov_session_id = ros.aipr.session;
+
+    let imported = ros.into_model().map_err(|e| {
+        ApiError::new(
+            ErrorCode::InvalidParameter,
+            format!(".ros import failed: {e}"),
+        )
+    })?;
 
     if imported.solids.is_empty() {
         return Err(ApiError::new(
@@ -5184,6 +5208,12 @@ async fn import_ros_geometry(
         "success": all_sound,
         "objects": objects,
         "imported_solids": objects.len(),
+        "file_contents": {
+            "hist_event_count": hist_event_count,
+            "hist_branch_count": hist_branch_count,
+            "prov_command_count": prov_command_count,
+            "prov_session_id": prov_session_id,
+        },
     })))
 }
 
