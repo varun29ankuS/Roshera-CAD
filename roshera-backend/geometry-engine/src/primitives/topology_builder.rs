@@ -2469,7 +2469,16 @@ impl BRepModel {
     /// recorder is attached; logs a warning via `tracing` when the recorder
     /// returns an error (the operation has already mutated the model —
     /// recorder failures never become geometry failures).
-    pub fn record_operation(&self, operation: crate::operations::recorder::RecordedOperation) {
+    ///
+    /// When a recorder IS attached, the record is certified at record time:
+    /// see [`Self::attach_record_time_certificate`]. Certification happens
+    /// synchronously, AFTER the invalidation funnel below and BEFORE the
+    /// record is forwarded — the event carries the kernel's verdict for the
+    /// state it created, not a verdict computed later against whatever the
+    /// solid has become (on an append-only timeline a later verdict is the
+    /// wrong answer). With no recorder attached (timeline replay detaches
+    /// it) nothing consumes the record, so no certificate is computed.
+    pub fn record_operation(&self, mut operation: crate::operations::recorder::RecordedOperation) {
         // ── Funnel invalidation seam (the intrinsic guarantee) ──────────────
         // EVERY mutating kernel op records itself here, listing the solids it
         // consumed (`inputs`) and produced (`outputs`) in canonical wire form.
@@ -2495,10 +2504,100 @@ impl BRepModel {
         }
 
         if let Some(rec) = self.recorder.as_ref() {
+            // Certify-at-record (after the funnel above, before the forward
+            // below): the freshly-invalidated output solid is re-certified
+            // against its post-op geometry and the proof rides on the record.
+            self.attach_record_time_certificate(&mut operation);
             if let Err(e) = rec.record(operation) {
                 tracing::warn!("operation recorder returned error: {}", e);
             }
         }
+    }
+
+    /// Certify-at-record seam: compute the FULL validity certificate of the
+    /// solid this operation produced — synchronously, at the moment the
+    /// record is emitted — and attach it to the record via
+    /// [`RecordedSolidCertificate::from_validity`](crate::operations::recorder::RecordedSolidCertificate::from_validity)
+    /// (the single sanctioned projection; no second certificate shape).
+    ///
+    /// Output solids are recovered with the SAME wire-form parse the
+    /// invalidation funnel uses ([`parse_solid_ref`](crate::operations::recorder::parse_solid_ref))
+    /// so there is exactly one notion of "which solids did this op touch".
+    ///
+    /// # Honest-absence rules (the certificate is `None`, never fabricated)
+    ///
+    /// * **Already certified** — a handler that attached a certificate built
+    ///   the record AFTER the kernel op succeeded, from the same
+    ///   `from_validity` projection; it is kept verbatim. (No such record
+    ///   currently routes through this funnel — the api-server
+    ///   `sketch_extrude` handler forwards its consolidated, pre-certified
+    ///   record straight to the timeline recorder — so nothing is certified
+    ///   twice.)
+    /// * **Zero output solids** — nothing to certify (datum ops, face/edge
+    ///   transforms, deletes).
+    /// * **Several distinct output solids** — `solid_certificate` holds ONE
+    ///   certificate; silently attaching the first solid's verdict would
+    ///   ascribe one solid's soundness to an event that produced several.
+    ///   Attach only when there is exactly one distinct output solid.
+    /// * **Output solid no longer exists** — a dangling reference cannot be
+    ///   certified.
+    /// * **The model carries labels** — the full certificate's
+    ///   `labels_consistent` dimension re-runs each label's Pillar-3
+    ///   selector, which needs `&mut self` (selector centroid-cache
+    ///   warming); this funnel is `&self` because kernel ops and external
+    ///   callers record through shared references. A certificate with the
+    ///   labels check silently skipped would be a subset masquerading as
+    ///   the full verdict — forbidden — so a labelled model records an
+    ///   honest absence instead. With no labels, `labels_consistent` is
+    ///   exactly [`LabelsConsistency::NotApplicable`](crate::primitives::provenance::LabelsConsistency)
+    ///   (the same early return `labels_consistency()` takes) and the full
+    ///   certificate is computable from `&self`.
+    ///
+    /// `volume` on the recorded certificate is `None`: computing it goes
+    /// through the `&mut` mass-properties cache. `face_count` is read
+    /// directly. Neither is ever fabricated.
+    ///
+    /// The computed certificate is deliberately NOT stored into the solid's
+    /// certificate cache and the solid is NOT marked verified: the P1
+    /// freshness gate (`soundness_reading`) and the memoization cache keep
+    /// their existing, precisely-tested semantics — this seam certifies the
+    /// EVENT, it does not change what the live model reports.
+    fn attach_record_time_certificate(
+        &self,
+        operation: &mut crate::operations::recorder::RecordedOperation,
+    ) {
+        if operation.solid_certificate.is_some() {
+            return;
+        }
+        let mut output_solids: Vec<SolidId> = Vec::new();
+        for reference in operation.outputs.iter() {
+            if let Some(sid) = crate::operations::recorder::parse_solid_ref(reference) {
+                if !output_solids.contains(&sid) {
+                    output_solids.push(sid);
+                }
+            }
+        }
+        // Exactly-one-output rule (multi-output ops record an honest
+        // absence — see the doc comment above).
+        let [sid] = output_solids[..] else {
+            return;
+        };
+        if self.solids.get(sid).is_none() {
+            return;
+        }
+        if !self.labels.is_empty() {
+            return;
+        }
+        let cert = self.compute_certificate_with_labels(
+            sid,
+            crate::primitives::provenance::LabelsConsistency::NotApplicable,
+        );
+        let face_count = self.solid_outer_face_count(sid);
+        operation.solid_certificate = Some(
+            crate::operations::recorder::RecordedSolidCertificate::from_validity(
+                &cert, None, face_count,
+            ),
+        );
     }
 
     // ───────────────────── PILLAR 1: ground truth ─────────────────────
@@ -2734,10 +2833,34 @@ impl BRepModel {
     /// `&mut self` because computing the D4 `labels_consistent` flag re-runs
     /// each label's Pillar-3 selector, and `queries::select::resolve_*` warms a
     /// per-face centroid cache (the same `&mut` contract the readable query path
-    /// uses). The geometry itself is never mutated.
+    /// uses). The geometry itself is never mutated. Every OTHER dimension is
+    /// computable through `&self`; the split below
+    /// ([`Self::compute_certificate_with_labels`]) exists so the certify-at-record
+    /// seam in [`Self::record_operation`] — which only has `&self` — can compute
+    /// the identical full certificate whenever the labels dimension needs no
+    /// selector re-runs (no labels ⇒ `NotApplicable`, the same early return
+    /// `labels_consistency()` takes).
     fn compute_certificate(
         &mut self,
         solid_id: SolidId,
+    ) -> crate::primitives::provenance::ValidityCertificate {
+        // D4 — labels consistency: re-verify every label's assertion. An
+        // annotation defect, not a geometric one — does NOT touch `is_sound`.
+        // The only dimension needing `&mut`; everything else lives in the
+        // shared `&self` core below.
+        let labels_consistent = self.labels_consistency();
+        self.compute_certificate_with_labels(solid_id, labels_consistent)
+    }
+
+    /// The `&self` core of [`Self::compute_certificate`]: every certificate
+    /// dimension EXCEPT `labels_consistent`, which the caller supplies
+    /// (either freshly computed via `labels_consistency()` — the `&mut`
+    /// path — or `NotApplicable` when the model provably has no labels).
+    /// There is exactly ONE certificate computation; this function is it.
+    fn compute_certificate_with_labels(
+        &self,
+        solid_id: SolidId,
+        labels_consistent: crate::primitives::provenance::LabelsConsistency,
     ) -> crate::primitives::provenance::ValidityCertificate {
         use crate::primitives::provenance::ValidityCertificate;
         use crate::primitives::validation::{validate_solid_scoped, ValidationLevel};
@@ -2769,9 +2892,6 @@ impl BRepModel {
         // geometry (source sketch) still co-located with the solid? Tri-state,
         // and NotApplicable when no sketch is linked (does not block soundness).
         let construction_consistent = self.construction_consistency(solid_id);
-        // D4 — labels consistency: re-verify every label's assertion. An
-        // annotation defect, not a geometric one — does NOT touch `is_sound`.
-        let labels_consistent = self.labels_consistency();
         // Display-tessellation quality: catches a degenerate / inverted-normal
         // render mesh (the inner-bore scribble) that is watertight + manifold yet
         // renders wrong. Same chord as the manifold check above. A solid that

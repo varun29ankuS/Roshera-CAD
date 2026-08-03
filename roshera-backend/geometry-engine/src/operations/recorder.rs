@@ -675,6 +675,165 @@ mod tests {
         assert!(back.solid_certificate.is_none());
     }
 
+    // ──────────── Certify-at-record: runtime coverage ratchet ────────────
+    //
+    // The source-scanner ratchet below proves every production record SITE
+    // declares inputs; these tests prove certificate coverage BEHAVIOURALLY:
+    // real kernel ops against a real `BRepModel`, a capture recorder
+    // attached, and emitted records that carry the kernel's verdict for the
+    // solid they produced (`BRepModel::record_operation` →
+    // `attach_record_time_certificate`). Before that seam existed, every
+    // kernel-side record was emitted with `solid_certificate: None`.
+
+    /// Fresh model with a capture recorder attached and one real box built
+    /// through the recording kernel path (`TopologyBuilder::create_box_3d`).
+    fn box_solid_with_capture() -> (
+        crate::primitives::topology_builder::BRepModel,
+        Arc<CaptureRecorder>,
+        crate::primitives::solid::SolidId,
+    ) {
+        use crate::primitives::topology_builder::{BRepModel, GeometryId, TopologyBuilder};
+        let capture = Arc::new(CaptureRecorder::default());
+        let mut model = BRepModel::new();
+        model.attach_recorder(Some(capture.clone()));
+        let sid = match TopologyBuilder::new(&mut model)
+            .create_box_3d(20.0, 14.0, 10.0)
+            .expect("box creation succeeds")
+        {
+            GeometryId::Solid(s) => s,
+            other => panic!("expected a solid, got {other:?}"),
+        };
+        (model, capture, sid)
+    }
+
+    /// A primitive-creation record must carry the certificate of the solid
+    /// it created, computed at record time — and the contents must reflect
+    /// the REAL box (a default-constructed / fabricated projection cannot
+    /// satisfy soundness, χ = 2, and face_count = 6 at once).
+    #[test]
+    fn primitive_creation_record_carries_the_solids_certificate() {
+        let (_model, capture, sid) = box_solid_with_capture();
+        let events = capture.events.lock().expect("mutex").clone();
+        let solid_ref = entity_ref(ENTITY_SOLID, sid as u64);
+        let record = events
+            .iter()
+            .find(|e| e.outputs.contains(&solid_ref))
+            .expect("a record naming the created solid as an output");
+        let cert = record
+            .solid_certificate
+            .as_ref()
+            .expect("the creation record must carry a record-time certificate");
+        assert!(cert.is_sound, "a clean box certifies sound: {cert:?}");
+        assert!(cert.brep_valid, "box B-Rep is valid: {cert:?}");
+        assert!(cert.watertight && cert.manifold, "{cert:?}");
+        assert!(cert.oriented && cert.self_intersection_free, "{cert:?}");
+        assert_eq!(cert.euler_characteristic, 2, "closed box mesh has χ = 2");
+        assert_eq!(cert.face_count, Some(6), "a box has 6 outer faces");
+    }
+
+    /// A MODIFYING op through the real kernel path (`transform_solid`, which
+    /// runs inside `with_rollback`'s transactional recording scope) must
+    /// also emit its record with a post-op certificate attached.
+    #[test]
+    fn modifying_operation_record_carries_a_post_op_certificate() {
+        let (mut model, capture, sid) = box_solid_with_capture();
+        let translation = crate::math::Matrix4::translation(5.0, -3.0, 2.0);
+        crate::operations::transform::transform_solid(
+            &mut model,
+            sid,
+            translation,
+            crate::operations::transform::TransformOptions::default(),
+        )
+        .expect("transform succeeds");
+        let events = capture.events.lock().expect("mutex").clone();
+        let record = events
+            .iter()
+            .find(|e| e.kind == "transform_solid")
+            .expect("the transform must have recorded");
+        let cert = record
+            .solid_certificate
+            .as_ref()
+            .expect("a modifying op's record must carry a record-time certificate");
+        assert!(cert.is_sound, "a translated box is still sound: {cert:?}");
+        assert_eq!(cert.euler_characteristic, 2, "{cert:?}");
+        assert_eq!(
+            cert.face_count,
+            Some(6),
+            "translation preserves the 6 faces: {cert:?}"
+        );
+    }
+
+    /// Multi-output rule pin: `solid_certificate` holds ONE certificate, so
+    /// a record naming several distinct output solids must stay honestly
+    /// uncertified — silently attaching the first solid's verdict would
+    /// ascribe one solid's soundness to an event that produced several. The
+    /// single-output control on the same model proves the absence is the
+    /// rule firing, not a broken seam.
+    #[test]
+    fn multi_output_record_stays_honestly_uncertified() {
+        use crate::primitives::topology_builder::{BRepModel, GeometryId, TopologyBuilder};
+        let capture = Arc::new(CaptureRecorder::default());
+        let mut model = BRepModel::new();
+        let a = match TopologyBuilder::new(&mut model)
+            .create_box_3d(10.0, 10.0, 10.0)
+            .expect("box a")
+        {
+            GeometryId::Solid(s) => s,
+            other => panic!("expected a solid, got {other:?}"),
+        };
+        let b = match TopologyBuilder::new(&mut model)
+            .create_box_3d(8.0, 8.0, 8.0)
+            .expect("box b")
+        {
+            GeometryId::Solid(s) => s,
+            other => panic!("expected a solid, got {other:?}"),
+        };
+        // Attach AFTER creation so only the two manual records are captured.
+        model.attach_recorder(Some(capture.clone()));
+        model.record_operation(
+            RecordedOperation::new("test.split")
+                .with_input_solids([a as u64])
+                .with_output_solids([a as u64, b as u64]),
+        );
+        model.record_operation(
+            RecordedOperation::new("test.touch")
+                .with_input_solids([a as u64])
+                .with_output_solids([a as u64]),
+        );
+        let events = capture.events.lock().expect("mutex").clone();
+        assert_eq!(events.len(), 2);
+        assert!(
+            events[0].solid_certificate.is_none(),
+            "two distinct output solids must record an honest absence"
+        );
+        let cert = events[1]
+            .solid_certificate
+            .as_ref()
+            .expect("single-output control on the same model must certify");
+        assert!(cert.is_sound, "{cert:?}");
+        assert_eq!(cert.face_count, Some(6), "{cert:?}");
+    }
+
+    /// An output solid that does not exist cannot be certified: honest
+    /// absence, never a fabricated verdict.
+    #[test]
+    fn record_naming_a_missing_output_solid_stays_uncertified() {
+        let capture = Arc::new(CaptureRecorder::default());
+        let mut model = crate::primitives::topology_builder::BRepModel::new();
+        model.attach_recorder(Some(capture.clone()));
+        model.record_operation(
+            RecordedOperation::new("test.ghost")
+                .with_input_solids([99u64])
+                .with_output_solids([99u64]),
+        );
+        let events = capture.events.lock().expect("mutex").clone();
+        assert_eq!(events.len(), 1);
+        assert!(
+            events[0].solid_certificate.is_none(),
+            "a missing output solid cannot be certified — honest absence required"
+        );
+    }
+
     // ───────────────────────── Lineage ratchet ─────────────────────────
 
     /// Recursively collect every `.rs` file under `dir`.
