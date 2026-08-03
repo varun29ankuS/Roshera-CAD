@@ -520,19 +520,39 @@ impl OperationRecorder for TimelineRecorder {
 /// Map a kernel-side `RecordedOperation` to a timeline `Operation`.
 ///
 /// The envelope preserves the original `kind`, the structured parameter
-/// payload, and the input/output entity ID lists so that downstream
-/// consumers (UI, replay, audit) have byte-for-byte fidelity. A
-/// `solid_certificate` attached to the record is NOT part of this replay
-/// envelope — the drain worker projects it into an `EventCertificate` and
-/// stores it on the event's metadata instead.
+/// payload, the input/output entity ID lists, the deletion channel, and
+/// the facet container so that downstream consumers (UI, replay, audit,
+/// the lineage projection) have byte-for-byte fidelity. `deleted` and
+/// `facets` mirror their wire form on `RecordedOperation`: present only
+/// when non-empty, so pre-change events keep their exact envelope shape
+/// and existing consumers of `params` / `inputs` / `outputs` (e.g.
+/// `lineage.rs`) are untouched. A `solid_certificate` attached to the
+/// record is NOT part of this replay envelope — the drain worker projects
+/// it into an `EventCertificate` and stores it on the event's metadata
+/// instead.
 fn to_timeline_operation(record: &RecordedOperation) -> Operation {
+    let mut envelope = serde_json::Map::new();
+    envelope.insert("params".to_string(), record.parameters.clone());
+    envelope.insert(
+        "inputs".to_string(),
+        serde_json::Value::from(record.inputs.clone()),
+    );
+    envelope.insert(
+        "outputs".to_string(),
+        serde_json::Value::from(record.outputs.clone()),
+    );
+    if !record.deleted.is_empty() {
+        envelope.insert(
+            "deleted".to_string(),
+            serde_json::Value::from(record.deleted.clone()),
+        );
+    }
+    if !record.facets.is_empty() {
+        envelope.insert("facets".to_string(), record.facets.to_json());
+    }
     Operation::Generic {
         command_type: record.kind.clone(),
-        parameters: serde_json::json!({
-            "params": record.parameters,
-            "inputs": record.inputs,
-            "outputs": record.outputs,
-        }),
+        parameters: serde_json::Value::Object(envelope),
     }
 }
 
@@ -544,11 +564,23 @@ mod tests {
 
     #[test]
     fn maps_recorded_operation_to_generic() {
-        let rec = RecordedOperation::new("extrude_face")
+        use geometry_engine::operations::recorder::IntentFacet;
+
+        let mut rec = RecordedOperation::new("extrude_face")
             .with_parameters(serde_json::json!({ "distance": 5.0 }))
             .with_input_faces([1u64])
             .with_input_edges([2u64, 3u64])
-            .with_output_solids([42u64]);
+            .with_output_solids([42u64])
+            .with_deleted_faces([7u64, 8u64]);
+        rec.facets
+            .set_intent(&IntentFacet {
+                text: "extrude the base".to_string(),
+                turn_id: None,
+                source: "agent_turn".to_string(),
+            })
+            .expect("set intent facet");
+        rec.facets
+            .set_raw("vendor.unknown", serde_json::json!({ "k": 1 }));
 
         let op = to_timeline_operation(&rec);
         match op {
@@ -563,6 +595,48 @@ mod tests {
                     serde_json::json!(["face:1", "edge:2", "edge:3"])
                 );
                 assert_eq!(parameters["outputs"], serde_json::json!(["solid:42"]));
+                assert_eq!(
+                    parameters["deleted"],
+                    serde_json::json!(["face:7", "face:8"]),
+                    "the deletion channel must survive the bridge"
+                );
+                assert_eq!(
+                    parameters["facets"][IntentFacet::NAME],
+                    serde_json::json!({ "text": "extrude the base", "source": "agent_turn" }),
+                    "a typed facet must survive the bridge"
+                );
+                assert_eq!(
+                    parameters["facets"]["vendor.unknown"],
+                    serde_json::json!({ "k": 1 }),
+                    "an unknown facet must survive the bridge untouched"
+                );
+            }
+            other => panic!("expected Operation::Generic, got {:?}", other),
+        }
+    }
+
+    /// A record with no deletions and no facets maps to the EXACT pre-change
+    /// envelope — `params` / `inputs` / `outputs` only, no `deleted` or
+    /// `facets` keys — so existing consumers (e.g. the lineage projection)
+    /// see byte-identical envelopes for existing producers.
+    #[test]
+    fn envelope_omits_deleted_and_facets_when_empty() {
+        let rec = RecordedOperation::new("extrude_face")
+            .with_parameters(serde_json::json!({ "distance": 5.0 }))
+            .with_input_faces([1u64])
+            .with_output_solids([42u64]);
+
+        let op = to_timeline_operation(&rec);
+        match op {
+            Operation::Generic { parameters, .. } => {
+                let obj = parameters.as_object().expect("envelope is an object");
+                let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+                keys.sort_unstable();
+                assert_eq!(
+                    keys,
+                    vec!["inputs", "outputs", "params"],
+                    "empty deleted/facets must not appear in the envelope"
+                );
             }
             other => panic!("expected Operation::Generic, got {:?}", other),
         }

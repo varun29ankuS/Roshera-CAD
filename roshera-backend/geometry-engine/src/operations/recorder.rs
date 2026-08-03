@@ -21,7 +21,7 @@
 //!
 //! # Lineage ID namespacing
 //!
-//! `inputs` and `outputs` are `Vec<String>` whose entries follow the
+//! `inputs`, `outputs`, and `deleted` are `Vec<String>` whose entries follow the
 //! canonical wire form `"<kind>:<id>"`, where `<kind>` is one of
 //! [`ENTITY_SOLID`], [`ENTITY_FACE`], [`ENTITY_EDGE`], [`ENTITY_VERTEX`],
 //! [`ENTITY_LOOP`], [`ENTITY_CURVE`], [`ENTITY_DATUM`]. Each kernel ID
@@ -29,11 +29,12 @@
 //! integer namespace inside `BRepModel`, so a bare integer is ambiguous
 //! — `face:1` and `solid:1` are distinct entities that previously
 //! collided in the lineage graph and produced incorrect parent-child
-//! edges in the operation tree. The typed `with_input_*` / `with_output_*`
-//! builders below are the only sanctioned construction sites; callers
-//! never assemble the `kind:id` string by hand.
+//! edges in the operation tree. The typed `with_input_*` / `with_output_*` /
+//! `with_deleted_*` builders below are the only sanctioned construction
+//! sites; callers never assemble the `kind:id` string by hand.
 
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fmt;
 
 /// Entity-kind tag for a solid (`BRepModel::solids`).
@@ -147,6 +148,139 @@ impl RecordedSolidCertificate {
     }
 }
 
+/// Namespaced, typed, optional metadata attached to a [`RecordedOperation`]
+/// — the facet envelope (OpenLineage's model). New provenance dimensions
+/// attach as new facet names with **no schema migration**.
+///
+/// Facets are annotations *about* an operation (intent, cost, session, …).
+/// What an operation did to the entity graph — `inputs` / `outputs` /
+/// `deleted` — is the operation's core shape and stays first-class, never
+/// a facet.
+///
+/// # Container contract
+///
+/// 1. **Forward compatible** — an unknown facet name round-trips
+///    byte-identically; a newer producer and an older reader lose nothing.
+/// 2. **Backward compatible** — events serialized before this container
+///    existed deserialize with an empty `Facets` (`serde(default)` on the
+///    field), and an empty container serializes NO key at all.
+/// 3. **Deterministic** — storage is a `BTreeMap`, never a `HashMap`;
+///    the same facets always serialize to identical bytes.
+/// 4. **Absence is honest** — a missing facet means *not recorded*, never
+///    *false* / *empty*. [`facet`](Self::facet) returns `None` for absent
+///    and `Some(...)` for present, so readers can always distinguish.
+/// 5. **Typed at the edges** — storage is `serde_json::Value`; producers
+///    and consumers go through the typed accessors below so each facet's
+///    shape is defined in exactly one place (e.g. [`IntentFacet`]).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Facets(BTreeMap<String, serde_json::Value>);
+
+impl Facets {
+    /// True when no facet is attached. Doubles as the
+    /// `skip_serializing_if` predicate that keeps an empty container off
+    /// the wire entirely (absent key, not `{}`).
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Number of attached facets.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether a facet with this name is present — the raw absence /
+    /// presence signal, independent of whether the payload parses.
+    pub fn contains(&self, name: &str) -> bool {
+        self.0.contains_key(name)
+    }
+
+    /// The raw JSON payload of a facet, untyped. `None` = not recorded.
+    pub fn get_raw(&self, name: &str) -> Option<&serde_json::Value> {
+        self.0.get(name)
+    }
+
+    /// Attach a raw JSON payload under `name`, replacing any previous
+    /// value. Prefer the typed setters ([`set_intent`](Self::set_intent))
+    /// for known facets; this is the escape hatch that keeps unknown /
+    /// pass-through facets representable.
+    pub fn set_raw(&mut self, name: impl Into<String>, value: serde_json::Value) {
+        self.0.insert(name.into(), value);
+    }
+
+    /// Typed read of a facet.
+    ///
+    /// * `None` — the facet is **absent** (not recorded).
+    /// * `Some(Ok(t))` — present and parsed as `T`.
+    /// * `Some(Err(e))` — present but its payload does not match `T`'s
+    ///   shape; surfaced as a typed error, never silently coerced to
+    ///   absence — a malformed facet must not read back as "not recorded".
+    pub fn facet<T: DeserializeOwned>(&self, name: &str) -> Option<Result<T, serde_json::Error>> {
+        self.0.get(name).map(|v| serde_json::from_value(v.clone()))
+    }
+
+    /// Typed write of a facet. Fails only if `T`'s `Serialize` impl fails
+    /// (e.g. a map with non-string keys) — surfaced, never swallowed.
+    pub fn set_facet<T: Serialize>(
+        &mut self,
+        name: impl Into<String>,
+        value: &T,
+    ) -> Result<(), serde_json::Error> {
+        let v = serde_json::to_value(value)?;
+        self.0.insert(name.into(), v);
+        Ok(())
+    }
+
+    /// Typed read of the [`IntentFacet`] (`roshera.intent`). Absence
+    /// semantics identical to [`facet`](Self::facet).
+    pub fn intent(&self) -> Option<Result<IntentFacet, serde_json::Error>> {
+        self.facet(IntentFacet::NAME)
+    }
+
+    /// Typed write of the [`IntentFacet`] (`roshera.intent`).
+    pub fn set_intent(&mut self, intent: &IntentFacet) -> Result<(), serde_json::Error> {
+        self.set_facet(IntentFacet::NAME, intent)
+    }
+
+    /// Iterate facets in deterministic (name-sorted) order.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &serde_json::Value)> {
+        self.0.iter().map(|(k, v)| (k.as_str(), v))
+    }
+
+    /// The whole container as one JSON object value, in deterministic
+    /// (name-sorted) order. Infallible — the storage already is JSON.
+    /// Used by bridges that embed the facets in a larger envelope.
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::Value::Object(self.0.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+    }
+}
+
+/// The `roshera.intent` facet: the natural-language request this operation
+/// was serving — *what was being asked for*, alongside the event's *what
+/// happened* and *who did it*.
+///
+/// This type is the single definition of the facet's shape; producers and
+/// consumers go through [`Facets::set_intent`] / [`Facets::intent`] rather
+/// than assembling JSON at call sites.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IntentFacet {
+    /// The natural-language turn text (Varun 2026-08-03: text, not a
+    /// reference — the corpus carries the intent → action → verdict triple
+    /// directly).
+    pub text: String,
+    /// Foreign key to the conversation turn that produced this op, when
+    /// the caller has one. `None` = not recorded, never an empty string.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    /// Where the text came from, e.g. `"agent_turn"` or `"user_prompt"`.
+    pub source: String,
+}
+
+impl IntentFacet {
+    /// The facet's namespaced wire name.
+    pub const NAME: &'static str = "roshera.intent";
+}
+
 /// A structured description of one geometry operation that has just
 /// completed successfully.
 ///
@@ -175,6 +309,26 @@ pub struct RecordedOperation {
     /// is purely destructive.
     pub outputs: Vec<String>,
 
+    /// Entity references this operation REMOVED from the model, each in the
+    /// canonical `"<kind>:<id>"` wire form (see module docs). A first-class
+    /// third ref channel alongside `inputs` / `outputs` — PROV models
+    /// invalidation as a core relation (`wasInvalidatedBy`), not an
+    /// annotation. Without it a deletion records its victim as an input
+    /// with no outputs, structurally identical to merely *reading* it, and
+    /// nothing can ever leave the lineage frontier. Deletion must be stated
+    /// structurally here, never inferred from the `kind` string.
+    /// Empty when the operation removed nothing. Absent on the wire when
+    /// empty, so pre-change events round-trip unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deleted: Vec<String>,
+
+    /// Namespaced, typed, optional annotations *about* this operation (see
+    /// [`Facets`]). Empty for every producer until a facet is adopted;
+    /// absent on the wire when empty, so pre-facets events round-trip
+    /// unchanged.
+    #[serde(default, skip_serializing_if = "Facets::is_empty")]
+    pub facets: Facets,
+
     /// The kernel proof for the solid this operation produced, attached by
     /// the recording handler AFTER certification and BEFORE `record(...)`.
     /// `None` means the op was not certified at record time (e.g. a
@@ -193,6 +347,8 @@ impl RecordedOperation {
             parameters: serde_json::Value::Null,
             inputs: Vec::new(),
             outputs: Vec::new(),
+            deleted: Vec::new(),
+            facets: Facets::default(),
             solid_certificate: None,
         }
     }
@@ -360,6 +516,80 @@ impl RecordedOperation {
         N: Into<u64>,
     {
         self.with_output_refs(ids.into_iter().map(|i| entity_ref(ENTITY_DATUM, i.into())))
+    }
+
+    /// Append pre-formatted deleted entity references — counterpart of
+    /// [`with_input_refs`](Self::with_input_refs) for the deletion channel.
+    pub fn with_deleted_refs<I, S>(mut self, refs: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.deleted.extend(refs.into_iter().map(Into::into));
+        self
+    }
+
+    /// Append deleted solids (`solid:<id>`).
+    pub fn with_deleted_solids<I, N>(self, ids: I) -> Self
+    where
+        I: IntoIterator<Item = N>,
+        N: Into<u64>,
+    {
+        self.with_deleted_refs(ids.into_iter().map(|i| entity_ref(ENTITY_SOLID, i.into())))
+    }
+
+    /// Append deleted faces (`face:<id>`).
+    pub fn with_deleted_faces<I, N>(self, ids: I) -> Self
+    where
+        I: IntoIterator<Item = N>,
+        N: Into<u64>,
+    {
+        self.with_deleted_refs(ids.into_iter().map(|i| entity_ref(ENTITY_FACE, i.into())))
+    }
+
+    /// Append deleted edges (`edge:<id>`).
+    pub fn with_deleted_edges<I, N>(self, ids: I) -> Self
+    where
+        I: IntoIterator<Item = N>,
+        N: Into<u64>,
+    {
+        self.with_deleted_refs(ids.into_iter().map(|i| entity_ref(ENTITY_EDGE, i.into())))
+    }
+
+    /// Append deleted vertices (`vertex:<id>`).
+    pub fn with_deleted_vertices<I, N>(self, ids: I) -> Self
+    where
+        I: IntoIterator<Item = N>,
+        N: Into<u64>,
+    {
+        self.with_deleted_refs(ids.into_iter().map(|i| entity_ref(ENTITY_VERTEX, i.into())))
+    }
+
+    /// Append deleted loops (`loop:<id>`).
+    pub fn with_deleted_loops<I, N>(self, ids: I) -> Self
+    where
+        I: IntoIterator<Item = N>,
+        N: Into<u64>,
+    {
+        self.with_deleted_refs(ids.into_iter().map(|i| entity_ref(ENTITY_LOOP, i.into())))
+    }
+
+    /// Append deleted curves (`curve:<id>`).
+    pub fn with_deleted_curves<I, N>(self, ids: I) -> Self
+    where
+        I: IntoIterator<Item = N>,
+        N: Into<u64>,
+    {
+        self.with_deleted_refs(ids.into_iter().map(|i| entity_ref(ENTITY_CURVE, i.into())))
+    }
+
+    /// Append deleted datums (`datum:<id>`).
+    pub fn with_deleted_datums<I, N>(self, ids: I) -> Self
+    where
+        I: IntoIterator<Item = N>,
+        N: Into<u64>,
+    {
+        self.with_deleted_refs(ids.into_iter().map(|i| entity_ref(ENTITY_DATUM, i.into())))
     }
 
     /// Append assembly inputs (`assembly:<uuid-as-u128>`). Assembly /
@@ -592,6 +822,208 @@ mod tests {
         let pre: Vec<String> = vec!["solid:1".into(), "face:2".into()];
         let op = RecordedOperation::new("custom").with_input_refs(pre.clone());
         assert_eq!(op.inputs, pre);
+    }
+
+    // ──────────── Deletion channel + facet envelope ────────────
+
+    /// Every `with_deleted_*` builder emits the canonical `<kind>:<id>`
+    /// wire form, exactly mirroring the input/output families.
+    #[test]
+    fn deleted_builders_emit_canonical_wire_form() {
+        let op = RecordedOperation::new("delete_solid")
+            .with_deleted_solids([7u64])
+            .with_deleted_faces([12u64])
+            .with_deleted_edges([3u64])
+            .with_deleted_vertices([4u64])
+            .with_deleted_loops([5u64])
+            .with_deleted_curves([6u64])
+            .with_deleted_datums([8u64])
+            .with_deleted_refs(["mate:550e8400-e29b-41d4-a716-446655440002".to_string()]);
+        assert_eq!(
+            op.deleted,
+            vec![
+                "solid:7",
+                "face:12",
+                "edge:3",
+                "vertex:4",
+                "loop:5",
+                "curve:6",
+                "datum:8",
+                "mate:550e8400-e29b-41d4-a716-446655440002",
+            ]
+        );
+        assert!(
+            op.inputs.is_empty(),
+            "deletion channel must not leak into inputs"
+        );
+        assert!(
+            op.outputs.is_empty(),
+            "deletion channel must not leak into outputs"
+        );
+    }
+
+    /// An operation carrying deletions round-trips through JSON: `deleted`
+    /// survives as its own channel, structurally distinct from an input
+    /// with no outputs — the whole point of the third channel.
+    #[test]
+    fn operation_carrying_deletions_round_trips() {
+        let op = RecordedOperation::new("delete_solid")
+            .with_parameters(serde_json::json!({ "cascade": true }))
+            .with_input_solids([9u64])
+            .with_deleted_solids([9u64])
+            .with_deleted_faces([1u64, 2]);
+        let json = serde_json::to_string(&op).expect("serialize");
+        let back: RecordedOperation = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.kind, op.kind);
+        assert_eq!(back.parameters, op.parameters);
+        assert_eq!(back.inputs, op.inputs);
+        assert_eq!(back.outputs, op.outputs);
+        assert_eq!(back.deleted, vec!["solid:9", "face:1", "face:2"]);
+        assert_eq!(back.facets, op.facets);
+    }
+
+    /// Wire stability: an operation with no deletions and no facets
+    /// serializes with NO `deleted` / `facets` keys at all — the wire
+    /// bytes of pre-change events are reproduced exactly.
+    #[test]
+    fn empty_deleted_and_facets_serialize_no_keys() {
+        let op = RecordedOperation::new("noop");
+        let v = serde_json::to_value(&op).expect("serialize");
+        let obj = v.as_object().expect("an object");
+        assert!(
+            !obj.contains_key("deleted"),
+            "empty deleted must be absent: {v}"
+        );
+        assert!(
+            !obj.contains_key("facets"),
+            "empty facets must be absent: {v}"
+        );
+    }
+
+    /// Backward compatibility, proven against a LITERAL pre-change fixture
+    /// (the exact wire shape emitted before `deleted` / `facets` existed —
+    /// hand-written verbatim, not constructed and re-serialized). It must
+    /// still deserialize, with both new channels honestly empty.
+    #[test]
+    fn pre_change_event_fixture_still_deserialises() {
+        let fixture = r#"{"kind":"extrude_face","parameters":{"distance":5.0},"inputs":["face:1","edge:2"],"outputs":["solid:42"]}"#;
+        let op: RecordedOperation =
+            serde_json::from_str(fixture).expect("a pre-change event must deserialize unchanged");
+        assert_eq!(op.kind, "extrude_face");
+        assert_eq!(op.parameters["distance"], 5.0);
+        assert_eq!(op.inputs, vec!["face:1", "edge:2"]);
+        assert_eq!(op.outputs, vec!["solid:42"]);
+        assert!(op.deleted.is_empty(), "no deleted key reads back as empty");
+        assert!(op.facets.is_empty(), "no facets key reads back as empty");
+        assert!(op.solid_certificate.is_none());
+    }
+
+    /// Forward compatibility: a facet name THIS build knows nothing about
+    /// round-trips byte-identically — an older reader must never drop a
+    /// newer producer's data.
+    #[test]
+    fn unknown_facet_round_trips_byte_identically() {
+        let mut op = RecordedOperation::new("noop");
+        op.facets.set_raw(
+            "vendor.future_dimension",
+            serde_json::json!({ "cost_usd": 0.0125, "nested": { "a": [1, 2, 3] } }),
+        );
+        let first = serde_json::to_string(&op).expect("serialize");
+        let back: RecordedOperation = serde_json::from_str(&first).expect("deserialize");
+        let second = serde_json::to_string(&back).expect("re-serialize");
+        assert_eq!(
+            first, second,
+            "an unknown facet must round-trip byte-identically, never be dropped"
+        );
+        assert!(back.facets.contains("vendor.future_dimension"));
+    }
+
+    /// Determinism: the same facets attached in DIFFERENT insertion orders
+    /// serialize to identical bytes — BTreeMap ordering, the property any
+    /// future content addressing depends on.
+    #[test]
+    fn facet_serialisation_is_deterministic_across_insertion_order() {
+        let mut a = RecordedOperation::new("noop");
+        a.facets.set_raw("z.last", serde_json::json!(1));
+        a.facets.set_raw("a.first", serde_json::json!(2));
+        a.facets.set_raw("m.middle", serde_json::json!(3));
+
+        let mut b = RecordedOperation::new("noop");
+        b.facets.set_raw("m.middle", serde_json::json!(3));
+        b.facets.set_raw("a.first", serde_json::json!(2));
+        b.facets.set_raw("z.last", serde_json::json!(1));
+
+        let bytes_a = serde_json::to_string(&a).expect("serialize a");
+        let bytes_b = serde_json::to_string(&b).expect("serialize b");
+        assert_eq!(
+            bytes_a, bytes_b,
+            "insertion order must not leak into the wire bytes"
+        );
+    }
+
+    /// Absence is honest: a reader can distinguish a facet that was never
+    /// recorded (`None`) from one recorded with an empty payload
+    /// (`Some(...)`). "Missing" must never collapse into "empty".
+    #[test]
+    fn facet_absence_is_distinguishable_from_present_but_empty() {
+        let mut op = RecordedOperation::new("noop");
+        assert!(
+            op.facets.get_raw("roshera.marker").is_none(),
+            "absent = None"
+        );
+        assert!(op
+            .facets
+            .facet::<serde_json::Value>("roshera.marker")
+            .is_none());
+
+        op.facets.set_raw("roshera.marker", serde_json::json!({}));
+        let raw = op.facets.get_raw("roshera.marker");
+        assert!(
+            matches!(raw, Some(v) if v.as_object().is_some_and(|o| o.is_empty())),
+            "present-but-empty = Some(empty object), got {raw:?}"
+        );
+
+        // The distinction survives a wire round-trip.
+        let json = serde_json::to_string(&op).expect("serialize");
+        let back: RecordedOperation = serde_json::from_str(&json).expect("deserialize");
+        assert!(back.facets.get_raw("roshera.marker").is_some());
+        assert!(back.facets.get_raw("roshera.never_recorded").is_none());
+    }
+
+    /// The `roshera.intent` typed facet: written and read through the ONE
+    /// definition of its shape, round-trips intact, and a present-but-
+    /// malformed payload surfaces as `Some(Err(..))` — never coerced to
+    /// absence, never silently defaulted.
+    #[test]
+    fn intent_facet_round_trips_through_typed_accessor() {
+        let mut op = RecordedOperation::new("sketch_extrude");
+        assert!(op.facets.intent().is_none(), "no intent recorded = None");
+
+        let intent = IntentFacet {
+            text: "make the base plate 5mm thicker".to_string(),
+            turn_id: Some("turn-91".to_string()),
+            source: "agent_turn".to_string(),
+        };
+        op.facets.set_intent(&intent).expect("set intent");
+
+        let json = serde_json::to_string(&op).expect("serialize");
+        let back: RecordedOperation = serde_json::from_str(&json).expect("deserialize");
+        let read = back
+            .facets
+            .intent()
+            .expect("intent facet is present")
+            .expect("intent facet parses");
+        assert_eq!(read, intent);
+
+        // A present-but-malformed intent is a typed error, not absence.
+        let mut bad = RecordedOperation::new("noop");
+        bad.facets
+            .set_raw(IntentFacet::NAME, serde_json::json!({ "text": 42 }));
+        let result = bad.facets.intent().expect("facet is present");
+        assert!(
+            result.is_err(),
+            "malformed intent must surface as Err, not vanish"
+        );
     }
 
     /// An all-sound kernel certificate, hand-built so individual checks can
