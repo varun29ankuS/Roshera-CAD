@@ -71,8 +71,14 @@ pub fn raycast_solid(
                     origin.z + dir.z * t,
                 );
                 // Clip to the face's real trim loops (handles caps / height
-                // limits / holes), not just the infinite surface.
-                let (u, v) = match surface.closest_point(&p, model.tolerance()) {
+                // limits / holes), not just the infinite surface. `p` is
+                // already exactly ON the analytic surface (solved from
+                // `surface_ray_ts`), so use `exact_uv` (unclamped) rather
+                // than `closest_point` — the latter clamps height/angle for
+                // surfaces like Cylinder/Cone, which would silently relocate
+                // a point genuinely past the finite rim onto the boundary
+                // and let it falsely pass the trim test (see `Surface::exact_uv`).
+                let (u, v) = match surface.exact_uv(&p) {
                     Ok(uv) => uv,
                     Err(_) => continue,
                 };
@@ -96,19 +102,34 @@ pub fn raycast_solid(
 
 /// Nearest positive ray parameter `t` (`> EPS`) at which the ray from `origin`
 /// along `direction` crosses face `face_id`, clipped to the face's real trim
-/// loops; `None` if the ray misses the trimmed face.
+/// loops via a shared [`crate::tessellation::surface::LoopUvCache`]; `None` if
+/// the ray misses the trimmed face.
 ///
 /// This is the single-face core of [`raycast_solid`] factored out so callers
 /// that already hold a spatially-culled candidate face set (e.g. drawing HLR's
-/// projected-AABB occlusion grid) can test faces one at a time without the
-/// whole-solid face loop. The trim clip and `EPS` gate match `raycast_solid`
-/// exactly, so an occlusion test built on this yields byte-identical
-/// visibility to the brute-force nearest-hit path.
+/// projected-AABB occlusion grid, `OcclusionGrid::occluded`) can test faces one
+/// at a time without the whole-solid face loop. The trim clip and `EPS` gate
+/// match `raycast_solid` exactly, so an occlusion test built on this yields
+/// byte-identical visibility to the brute-force nearest-hit path.
+///
+/// The `cache` parameter is not optional: this function is called thousands of
+/// times per drawing view against the same handful of faces (HLR's broad-phase
+/// occlusion probes each candidate face once per sampled edge midpoint), and
+/// the `exact_uv` trim-membership fix (see `Surface::exact_uv`'s doc) means
+/// many of those probes now correctly run the full winding-number test to
+/// completion — no early-out is possible for a genuinely visible point.
+/// Rebuilding each candidate loop's UV polygon from scratch on every probe was
+/// the dominant cost of that correctness fix (the `drawing_perf` 11x
+/// regression); the cache turns it back into a handful of dot products. A
+/// caller with no natural cache lifetime should build a fresh
+/// `LoopUvCache::new()` immediately before the call — see [`LoopUvCache`] for
+/// why it must never be shared across two different model states.
 pub(crate) fn ray_hit_face_t(
     model: &BRepModel,
     face_id: FaceId,
     origin: Point3,
     dir: Vector3,
+    cache: &crate::tessellation::surface::LoopUvCache,
 ) -> Option<f64> {
     let face = model.faces.get(face_id)?;
     let surface = model.surfaces.get(face.surface_id)?;
@@ -122,11 +143,14 @@ pub(crate) fn ray_hit_face_t(
             origin.y + dir.y * t,
             origin.z + dir.z * t,
         );
-        let (u, v) = match surface.closest_point(&p, model.tolerance()) {
+        // `p` is already exactly ON the analytic surface — use `exact_uv`
+        // (unclamped), not `closest_point`, for the same reason as
+        // `raycast_solid` above.
+        let (u, v) = match surface.exact_uv(&p) {
             Ok(uv) => uv,
             Err(_) => continue,
         };
-        if !crate::tessellation::surface::point_inside_face_uv(u, v, face, model) {
+        if !crate::tessellation::surface::point_inside_face_uv_cached(u, v, face, model, cache) {
             continue;
         }
         if best.map(|b| t < b).unwrap_or(true) {
@@ -179,7 +203,10 @@ pub fn raycast_all(
                     origin.y + dir.y * t,
                     origin.z + dir.z * t,
                 );
-                let (u, v) = match surface.closest_point(&p, model.tolerance()) {
+                // `p` is already exactly ON the analytic surface — use
+                // `exact_uv` (unclamped), not `closest_point`, for the same
+                // reason as `raycast_solid` above.
+                let (u, v) = match surface.exact_uv(&p) {
                     Ok(uv) => uv,
                     Err(_) => continue,
                 };

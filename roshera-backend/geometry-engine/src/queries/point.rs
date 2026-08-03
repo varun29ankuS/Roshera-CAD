@@ -147,8 +147,9 @@ pub fn classify_point(model: &BRepModel, solid_id: SolidId, p: Point3, tol: f64)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::math::Vector3;
+    use crate::math::{Matrix4, Vector3};
     use crate::operations::boolean::{boolean_operation, BooleanOp, BooleanOptions};
+    use crate::operations::{transform_solid, TransformOptions};
     use crate::primitives::topology_builder::{GeometryId, TopologyBuilder};
 
     fn sid(g: GeometryId) -> SolidId {
@@ -248,6 +249,73 @@ mod tests {
             classify_point(&m, part, Point3::new(20.0, 0.0, 0.0), 1e-6),
             PointClass::Inside,
             "a point in the plate material is inside"
+        );
+    }
+
+    /// REGRESSION (found by the independent `boolean_sdf_oracle` falsifier,
+    /// `tests/boolean_sdf_oracle.rs`): a bare, translated, radius-6 cylinder
+    /// with NO boolean involved — `classify_point` alone misclassified two
+    /// off-axis points near its top rim, in BOTH directions (a false
+    /// `Inside` and a false `Outside`).
+    ///
+    /// Cylinder: created at base `(0,0,-15)`, axis `+Z`, radius 6, height 30
+    /// (so local `v = z + 15`, height range `v ∈ [0, 30]`), then translated
+    /// by `(8,0,0)` — axis line is `x=8, y=0`, spanning `z ∈ [-15, 15]`.
+    ///
+    /// Point `(-4, -6, -9)`: radial distance from the axis line is
+    /// `sqrt((-4-8)^2 + (-6-0)^2) = sqrt(144+36) = sqrt(180) = 6*sqrt(5)
+    /// ≈ 13.416`, which exceeds the radius (6) on its own — genuinely
+    /// `Outside`, independent of height, since `z=-9` is comfortably inside
+    /// `[-15, 15]` anyway.
+    ///
+    /// ROOT CAUSE: `classify_point`'s ray-parity (`raycast_all` with the
+    /// fixed `PARITY_DIR`) casts a ray from this point and must cross the
+    /// solid boundary an EVEN number of times. The real crossings are: (1)
+    /// the lateral wall at `t≈12.10` (entering, valid — local `v≈15.48`,
+    /// inside `[0,30]`) and (2) the top cap disk at `t≈30.64` (exiting,
+    /// valid). That is 2 — correctly even/`Outside`. But the SAME ray also
+    /// solves a second root on the lateral surface's quadratic at
+    /// `t≈30.78`, landing at local `v≈30.11` — just PAST the real top rim
+    /// (`v=30`). `Cylinder::closest_point` (designed for NEAREST-POINT
+    /// projection, where clamping to the finite height is correct) clamped
+    /// that `v` back down to exactly `30.0` — precisely on the trimmed
+    /// face's own UV-rectangle boundary — and the winding-number trim test
+    /// accepted it as a genuine hit due to floating-point noise at that
+    /// boundary. That fabricated a 3rd crossing (odd, wrongly `Inside`).
+    /// `(8, -2, 9)` shows the same defect producing the opposite flip (a
+    /// spurious accepted hit turning a true 1-crossing `Inside` into an
+    /// even 2-crossing `Outside`) — both were reproduced directly against
+    /// `raycast_all`'s returned hit list before this fix, one extra
+    /// `RayHit` on face `Cylinder` at local `v` just over 30 in each case.
+    ///
+    /// Fix: `Surface::exact_uv` (new trait method) gives the raycast path
+    /// the TRUE, unclamped `(u, v)` of a point already known to lie exactly
+    /// on the analytic surface, instead of reusing `closest_point`'s
+    /// nearest-projection clamp — so a lateral-surface root past the real
+    /// rim is correctly reported as out-of-trim-range and rejected.
+    #[test]
+    fn translated_cylinder_point_beyond_rim_classifies_correctly() {
+        let mut m = BRepModel::new();
+        let cyl = sid(TopologyBuilder::new(&mut m)
+            .create_cylinder_3d(Point3::new(0.0, 0.0, -15.0), Vector3::Z, 6.0, 30.0)
+            .expect("cylinder"));
+        transform_solid(
+            &mut m,
+            cyl,
+            Matrix4::translation(8.0, 0.0, 0.0),
+            TransformOptions::default(),
+        )
+        .expect("translate cylinder off-axis");
+
+        assert_eq!(
+            classify_point(&m, cyl, Point3::new(-4.0, -6.0, -9.0), 1e-6),
+            PointClass::Outside,
+            "radial distance from axis is 6*sqrt(5) ~= 13.416 > radius 6 -> genuinely outside"
+        );
+        assert_eq!(
+            classify_point(&m, cyl, Point3::new(8.0, -2.0, 9.0), 1e-6),
+            PointClass::Inside,
+            "radial distance from axis is 2 < radius 6, z=9 in [-15,15] -> genuinely inside"
         );
     }
 }
