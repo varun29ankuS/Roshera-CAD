@@ -231,6 +231,12 @@ export function registerPerceptionTools(server: ToolHost) {
                   // {status, discrepancies:[{severity, kind, description}], coverage:{seen,total}}.
                   reconcile: p?.reconcile ?? { status: "pending" },
                   cert: cert ?? undefined,
+                  // DOCUMENT-level context beside this part's own verdict — present ONLY
+                  // when the backend's durability_status reads Quarantined (a slice of
+                  // this document's history could not be replayed and was refused, not
+                  // silently served). `sound`/`verdict` above stay a true statement about
+                  // THIS solid; this never rewrites them. Absent = nothing withheld.
+                  durability: p?.durability ?? undefined,
                 },
                 null,
                 2,

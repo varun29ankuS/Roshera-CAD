@@ -8374,6 +8374,192 @@ mod tests {
         );
     }
 
+    /// `agent_origin_layer` stamps `Mcp` ONLY on the conjunction of both
+    /// headers the MCP client actually sends (`X-Roshera-Agent` +
+    /// decodable, non-empty `X-Roshera-Intent`) — not on either alone —
+    /// and, unlike `agent_intent_layer`, NEVER passes through unscoped:
+    /// every request lands in `ORIGIN_OVERRIDE`, defaulting to `Rest` when
+    /// the conjunction is not met.
+    #[tokio::test]
+    async fn agent_origin_layer_stamps_mcp_only_on_the_conjunction() {
+        use axum::routing::get;
+        use tower::ServiceExt;
+
+        async fn probe() -> String {
+            timeline_engine::recorder_bridge::ORIGIN_OVERRIDE
+                .try_with(|origin| format!("{:?}", origin))
+                .unwrap_or_else(|_| "NO-SCOPE".to_string())
+        }
+        let router = axum::Router::new()
+            .route("/probe", get(probe))
+            .layer(axum::middleware::from_fn(agent_origin_layer));
+
+        async fn probe_with(router: axum::Router, headers: &[(&str, &str)]) -> String {
+            let mut builder = axum::extract::Request::builder().uri("/probe");
+            for (name, value) in headers {
+                builder = builder.header(*name, *value);
+            }
+            let response = router
+                .oneshot(
+                    builder
+                        .body(axum::body::Body::empty())
+                        .expect("request builds"),
+                )
+                .await
+                .expect("router responds");
+            let body = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .expect("body reads");
+            std::str::from_utf8(&body).expect("utf8 body").to_string()
+        }
+
+        // Both headers (the MCP client's actual wire signature) → Mcp.
+        assert_eq!(
+            probe_with(
+                router.clone(),
+                &[
+                    ("X-Roshera-Agent", "Claude"),
+                    ("X-Roshera-Intent", "bolt%20circle"),
+                ],
+            )
+            .await,
+            "Mcp",
+            "both headers together must stamp Mcp"
+        );
+
+        // Intent header alone (no agent header) → Rest, NOT Mcp. This is
+        // the exact case the task called out: a hand-rolled REST caller
+        // could send only this header, and it must not be believed alone.
+        assert_eq!(
+            probe_with(router.clone(), &[("X-Roshera-Intent", "bolt%20circle")]).await,
+            "Rest",
+            "the intent header alone must never be inferred as Mcp"
+        );
+
+        // Agent header alone (no intent header) → Rest, NOT Mcp. Matches
+        // `agent_author_layer`'s own doc: this header is sent by the MCP
+        // server AND any direct agent caller, so it alone cannot mean Mcp.
+        assert_eq!(
+            probe_with(router.clone(), &[("X-Roshera-Agent", "Claude")]).await,
+            "Rest",
+            "the agent header alone must never be inferred as Mcp"
+        );
+
+        // No headers at all → Rest, and — unlike agent_intent_layer — NOT
+        // NO-SCOPE: origin is scoped unconditionally.
+        assert_eq!(
+            probe_with(router.clone(), &[]).await,
+            "Rest",
+            "with no distinguishing headers the request is still scoped, as Rest"
+        );
+    }
+
+    /// End-to-end pin (origin-provenance tests #2 and #3): a plain REST
+    /// call records `roshera.origin.channel = rest`; a call carrying the
+    /// MCP client's actual wire signature (both `X-Roshera-Agent` and a
+    /// decodable `X-Roshera-Intent`) records `roshera.origin.channel = mcp`
+    /// AND its `roshera.intent` facet — proving `agent_intent_layer` and
+    /// `agent_origin_layer` compose correctly when stacked exactly as they
+    /// are in the real router, all the way through a REAL
+    /// `TimelineRecorder` onto a REAL timeline event (not just the
+    /// task-local probe above).
+    #[tokio::test]
+    async fn rest_and_mcp_requests_record_the_right_facets_through_a_real_recorder() {
+        use axum::extract::State;
+        use axum::routing::post;
+        use geometry_engine::operations::recorder::{
+            IntentFacet, OperationRecorder, OriginFacet, RecordedOperation,
+        };
+        use tower::ServiceExt;
+
+        let timeline: timeline_engine::SharedTimeline =
+            std::sync::Arc::new(tokio::sync::RwLock::new(timeline_engine::Timeline::new(
+                timeline_engine::TimelineConfig::default(),
+            )));
+        let recorder = timeline_engine::TimelineRecorder::new(
+            std::sync::Arc::clone(&timeline),
+            timeline_engine::Author::System,
+            timeline_engine::BranchId::main(),
+        );
+
+        async fn probe(State(recorder): State<timeline_engine::TimelineRecorder>) -> &'static str {
+            recorder
+                .record(RecordedOperation::new("probe-op"))
+                .expect("record succeeds");
+            "ok"
+        }
+
+        let router = axum::Router::new()
+            .route("/probe", post(probe))
+            .layer(axum::middleware::from_fn(agent_intent_layer))
+            .layer(axum::middleware::from_fn(agent_origin_layer))
+            .with_state(recorder.clone());
+
+        router
+            .clone()
+            .oneshot(
+                axum::extract::Request::builder()
+                    .method("POST")
+                    .uri("/probe")
+                    .body(axum::body::Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("plain REST call responds");
+
+        router
+            .oneshot(
+                axum::extract::Request::builder()
+                    .method("POST")
+                    .uri("/probe")
+                    .header("X-Roshera-Agent", "Claude")
+                    .header("X-Roshera-Intent", "bolt%20circle%208%20x%20D18")
+                    .header("X-Roshera-Intent-Turn", "3")
+                    .body(axum::body::Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("mcp-signature call responds");
+
+        recorder.flush().await.expect("flush drains both records");
+        let events = timeline
+            .read()
+            .await
+            .get_branch_events(&timeline_engine::BranchId::main(), None, None)
+            .expect("branch events");
+        assert_eq!(events.len(), 2, "both probe calls recorded");
+
+        fn facet<'a>(
+            event: &'a timeline_engine::TimelineEvent,
+            name: &str,
+        ) -> Option<&'a serde_json::Value> {
+            match &event.operation {
+                timeline_engine::Operation::Generic { parameters, .. } => {
+                    parameters.get("facets").and_then(|f| f.get(name))
+                }
+                _ => None,
+            }
+        }
+
+        let rest_event = &events[0];
+        let rest_origin = facet(rest_event, OriginFacet::NAME)
+            .expect("the plain REST call must carry an origin facet");
+        assert_eq!(rest_origin["channel"], "rest");
+        assert!(
+            facet(rest_event, IntentFacet::NAME).is_none(),
+            "the plain REST call opened no intent — none must be recorded"
+        );
+
+        let mcp_event = &events[1];
+        let mcp_origin = facet(mcp_event, OriginFacet::NAME)
+            .expect("the mcp-signature call must carry an origin facet");
+        assert_eq!(mcp_origin["channel"], "mcp");
+        let mcp_intent = facet(mcp_event, IntentFacet::NAME)
+            .expect("the mcp-signature call opened an intent checkpoint — it must be recorded");
+        assert_eq!(mcp_intent["text"], "bolt circle 8 x D18");
+        assert_eq!(mcp_intent["source"], "agent_stated");
+    }
+
     #[tokio::test]
     async fn test_enhanced_server() {
         // Test implementation
@@ -10313,6 +10499,14 @@ pub(crate) fn build_router(state: AppState) -> Router {
         // `agent_author_layer`, for the *why* instead of the *who* — see
         // that middleware's doc. Scoped per request task, never shared.
         .layer(axum::middleware::from_fn(agent_intent_layer))
+        // Origin provenance: which CHANNEL initiated the operation (mcp /
+        // rest / websocket / …), the `roshera.origin` counterpart of
+        // `agent_intent_layer`'s `roshera.intent`. Unlike intent, this
+        // layer NEVER passes through unscoped — every request, HTTP by
+        // definition, has SOME channel to report, even if only the honest
+        // `not_determined`. See `agent_origin_layer`'s doc for how `mcp`
+        // vs `rest` is decided.
+        .layer(axum::middleware::from_fn(agent_origin_layer))
         // Observed-agent-activity recorder (`agent_activity`): for any
         // request whose validated credential is a
         // `PrincipalKind::Agent` API key, records what/when/outcome
@@ -10455,6 +10649,66 @@ fn decode_intent_header(raw: &str) -> Option<String> {
         }
     }
     String::from_utf8(out).ok()
+}
+
+/// Attribute kernel ops to the CHANNEL that initiated them.
+///
+/// Every operation `TimelineRecorder` records now carries a `roshera.origin`
+/// facet (see `geometry_engine::operations::recorder::OriginFacet`) — the
+/// gap this closes is that `agent_intent_layer` only scopes `INTENT_OVERRIDE`
+/// when the MCP gate's checkpoint header is present, and the WebSocket /
+/// viewport-bridge / direct-REST channels never carry it at all, so an
+/// absent intent facet was ambiguous: "an agent that should have declared
+/// intent didn't" and "this channel doesn't declare intent" looked
+/// identical. This layer makes the channel explicit and unconditional —
+/// unlike `agent_intent_layer`'s zero-cost passthrough, it ALWAYS scopes
+/// `ORIGIN_OVERRIDE`, because every HTTP request structurally has some
+/// channel to report.
+///
+/// # Distinguishing `mcp` from `rest`
+///
+/// The MCP client (`roshera-mcp/src/core.ts`) is the only caller this
+/// backend knows of that sends BOTH `X-Roshera-Agent` (unconditionally, on
+/// every call) AND a decodable, non-empty `X-Roshera-Intent` (whenever its
+/// client-side intent gate has an open checkpoint). Neither header alone is
+/// a safe signal: `X-Roshera-Agent` is documented on `agent_author_layer`
+/// as sent "by the MCP server and any direct agent caller", and
+/// `X-Roshera-Intent` alone is exactly the signal this task was told NOT to
+/// trust, because nothing stops a hand-rolled REST client from sending it
+/// too. The CONJUNCTION is at least the MCP client's actual, narrower wire
+/// signature — no other known caller (frontend, viewport bridge, WebSocket)
+/// sends either header. It is still a claim the caller makes, not one the
+/// server verifies cryptographically, which is exactly why `OriginFacet`
+/// carries a `basis` field: `Mcp` records `basis: ClientHeader` so a reader
+/// can see this is a self-reported claim, never presented with the same
+/// confidence as a server-observed channel like `Websocket`. Every request
+/// that does not match the conjunction is `Rest` — including a real MCP
+/// call before its first intent checkpoint opens, which is the honest
+/// answer: at that moment the request carries no MCP-distinguishing signal
+/// at all.
+async fn agent_origin_layer(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let has_agent_header = request
+        .headers()
+        .get("x-roshera-agent")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|s| !s.is_empty());
+    let has_intent_header = request
+        .headers()
+        .get("x-roshera-intent")
+        .and_then(|v| v.to_str().ok())
+        .and_then(decode_intent_header)
+        .is_some_and(|s| !s.is_empty());
+    let origin = if has_agent_header && has_intent_header {
+        geometry_engine::operations::recorder::Origin::Mcp
+    } else {
+        geometry_engine::operations::recorder::Origin::Rest
+    };
+    timeline_engine::recorder_bridge::ORIGIN_OVERRIDE
+        .scope(origin, next.run(request))
+        .await
 }
 
 /// Construct the outermost CORS layer.

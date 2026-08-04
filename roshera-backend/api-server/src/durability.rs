@@ -110,6 +110,24 @@ pub enum DurabilityStatus {
 /// A shared, mutable durability status handle carried in `AppState`.
 pub type SharedDurabilityStatus = Arc<RwLock<DurabilityStatus>>;
 
+/// Document-level durability disclosure for agent-facing reads (the #39
+/// follow-up: an agent asking "what parts exist" / "what happened" got a
+/// clean answer on a QUARANTINED document — `/api/durability/status` and
+/// `manifest.durability` (the evidence pack) reported the break honestly,
+/// but nothing on the agent's own read surfaces did). `None` in the common
+/// case — durability disabled, empty, a full clean replay, or even a boot
+/// `Failed` (a distinct fact, out of scope here: see the caller) — so a
+/// non-quarantined response is byte-for-byte unchanged. `Some` carries the
+/// FULL [`DurabilityStatus::Quarantined`] variant, never a bare bool:
+/// "unquarantined" and "durability disabled" are different facts, and a
+/// consumer that only learns "false" cannot tell them apart.
+pub fn quarantine_disclosure(status: &DurabilityStatus) -> Option<&DurabilityStatus> {
+    match status {
+        DurabilityStatus::Quarantined { .. } => Some(status),
+        _ => None,
+    }
+}
+
 /// The kernel kind of a recorded operation — `create_box_3d`, `boolean_union`,
 /// `loft_profiles`, … For `Operation::Generic` (how the kernel bridge encodes
 /// every recorded kernel call) this is the `command_type` verbatim; otherwise

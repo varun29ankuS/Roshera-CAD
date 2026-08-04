@@ -7441,3 +7441,275 @@ async fn checkpoint_accepts_branch_and_returns_identity() {
         "checkpointing a nonexistent branch must 404; body = {mbody}"
     );
 }
+
+// =====================================================================
+// Durability disclosure on agent-facing reads (#39 follow-up)
+// =====================================================================
+//
+// `/api/durability/status` and `manifest.durability` (the evidence pack)
+// already report a QUARANTINED document honestly — the served model is only
+// the clean prefix of the persisted log, a break named loudly. Neither route
+// an agent actually reads to decide what exists / what happened
+// (`/api/agent/parts/{id}/perception`, `/api/timeline/history/{branch}`)
+// carried that fact. These tests pin the fix, reusing the exact quarantine
+// recipe `durability_boot_tests::unknown_event_quarantines_and_serves_clean_prefix`
+// already proved (real file-backed SQLite across a simulated restart —
+// `sqlite::memory:` cannot model this, it dies with the connection).
+
+use crate::durability_boot_tests::{build_state as boot_durability_state, open_db, temp_db_path};
+
+/// Boots a document with one clean box, injects an event the current kernel
+/// cannot replay, then reboots against the SAME file — the document comes
+/// back QUARANTINED, serving exactly the clean prefix (the box). Returns the
+/// rebooted `AppState` and that box's live kernel solid id.
+async fn quarantined_state_with_one_solid() -> (AppState, u32) {
+    let path = temp_db_path();
+
+    {
+        let db = open_db(&path).await;
+        let state = boot_durability_state(db, true).await;
+        let (s, body) = dispatch(
+            &state,
+            json_post(
+                "/api/geometry/box",
+                json!({ "width": 5.0, "depth": 5.0, "height": 5.0 }),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "box create must succeed; body = {body}");
+        state
+            .timeline_recorder
+            .flush()
+            .await
+            .expect("flush must succeed");
+    }
+
+    {
+        let db = open_db(&path).await;
+        let mut events = db
+            .load_all_timeline_events(crate::durability::DURABILITY_SESSION_ID)
+            .await
+            .expect("load persisted events");
+        let template = events.pop().expect("at least one persisted box event");
+        let max_seq = template.sequence_number;
+
+        let unknown_op = timeline_engine::Operation::Generic {
+            command_type: "quarantine_probe_unknown_op_agent_surface".to_string(),
+            parameters: json!({}),
+        };
+        let new_id = Uuid::new_v4().to_string();
+        let mut blob = template.data.clone();
+        blob["operation"] = serde_json::to_value(&unknown_op).expect("op serializes");
+        blob["sequence_number"] = json!(max_seq + 1);
+        blob["id"] = json!(new_id);
+
+        let injected = session_manager::TimelineEventData {
+            id: new_id,
+            session_id: template.session_id.clone(),
+            event_type: "quarantine_probe_unknown_op_agent_surface".to_string(),
+            user_id: template.user_id.clone(),
+            timestamp: template.timestamp,
+            data: blob,
+            branch_id: template.branch_id.clone(),
+            sequence_number: max_seq + 1,
+        };
+        db.save_timeline_event(crate::durability::DURABILITY_SESSION_ID, &injected)
+            .await
+            .expect("inject unknown event");
+    }
+
+    let db2 = open_db(&path).await;
+    let state2 = boot_durability_state(db2, true).await;
+
+    let status = state2.durability_status.read().await.clone();
+    assert!(
+        matches!(
+            status,
+            crate::durability::DurabilityStatus::Quarantined { .. }
+        ),
+        "fixture must actually quarantine the rebooted document; got {status:?}"
+    );
+
+    let (ps, parts_body) = dispatch(&state2, json_get("/api/agent/parts")).await;
+    assert_eq!(
+        ps,
+        StatusCode::OK,
+        "the clean prefix must still list its parts; body = {parts_body}"
+    );
+    let solid_id = parts_body
+        .as_array()
+        .and_then(|a| a.first())
+        .and_then(|p| p["id"].as_u64())
+        .unwrap_or_else(|| panic!("clean prefix must serve at least one part; body = {parts_body}"))
+        as u32;
+
+    (state2, solid_id)
+}
+
+/// GATE (RED-first, mutation-proven): on a QUARANTINED document,
+/// `GET /api/agent/parts/{id}/perception` (default full-certificate path)
+/// discloses the document-level durability state BESIDE the part's own
+/// verdict — an agent must not be able to read "SOUND" here and have no
+/// reachable way to learn a slice of design history was withheld.
+#[tokio::test]
+async fn part_perception_discloses_quarantine_on_default_path() {
+    let (state, solid_id) = quarantined_state_with_one_solid().await;
+
+    let (status, body) = dispatch(
+        &state,
+        json_get(&format!("/api/agent/parts/{solid_id}/perception")),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "perception on the clean-prefix part must 200; body = {body}"
+    );
+    // The part-level verdict is untouched — still a true statement about
+    // THIS solid (it really is sound; the document it lives in is not whole).
+    assert_eq!(
+        body["sound"].as_bool(),
+        Some(true),
+        "the clean-prefix box is itself a sound solid; body = {body}"
+    );
+    assert_eq!(
+        body["durability"]["state"].as_str(),
+        Some("quarantined"),
+        "perception on a quarantined document must disclose it via the SAME \
+         DurabilityStatus vocabulary /api/durability/status reports \
+         (never a bare bool); body = {body}"
+    );
+    assert_eq!(
+        body["durability"]["first_break_kind"].as_str(),
+        Some("quarantine_probe_unknown_op_agent_surface"),
+        "the disclosure must name the offending event kind, mirroring \
+         /api/durability/status; body = {body}"
+    );
+}
+
+/// GATE: the `?fast=1` opt-out path (lightweight B-Rep-only verdict) also
+/// discloses the quarantine — an agent that never runs the full certificate
+/// must not be the one left uninformed.
+#[tokio::test]
+async fn part_perception_discloses_quarantine_on_fast_path() {
+    let (state, solid_id) = quarantined_state_with_one_solid().await;
+
+    let (status, body) = dispatch(
+        &state,
+        json_get(&format!("/api/agent/parts/{solid_id}/perception?fast=1")),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "fast perception on the clean-prefix part must 200; body = {body}"
+    );
+    assert_eq!(
+        body["durability"]["state"].as_str(),
+        Some("quarantined"),
+        "the fast path must disclose the quarantine too; body = {body}"
+    );
+}
+
+/// GATE (additive pin): on a NON-quarantined document, `perception`'s
+/// payload carries no `durability` key at all — the field is present ONLY
+/// when there is something to disclose, so an unaffected caller's parsed
+/// shape is byte-for-byte what it was before this change.
+#[tokio::test]
+async fn part_perception_omits_durability_when_not_quarantined() {
+    let state = make_test_state().await;
+    let (bs, bbody) = dispatch(
+        &state,
+        json_post(
+            "/api/geometry/box",
+            json!({"width": 4.0, "depth": 4.0, "height": 4.0}),
+        ),
+    )
+    .await;
+    assert_eq!(bs, StatusCode::OK, "box create must 200; body = {bbody}");
+    let solid_id = bbody["solid_id"]
+        .as_u64()
+        .expect("box create must report solid_id");
+
+    let (status, body) = dispatch(
+        &state,
+        json_get(&format!("/api/agent/parts/{solid_id}/perception")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "perception must 200; body = {body}");
+    assert!(
+        body.as_object()
+            .is_some_and(|m| !m.contains_key("durability")),
+        "a non-quarantined document's perception must carry NO `durability` \
+         key (additive, not merely null) — this document is Empty/Active, \
+         durability off; body = {body}"
+    );
+}
+
+/// GATE (RED-first): on a QUARANTINED document, `GET /api/timeline/history`
+/// discloses the durability state. The payload's SHAPE changes from a bare
+/// array to `{"events": [...], "durability": {...}}` — an agent (and every
+/// existing frontend consumer: `Timeline.tsx`, `TimelineGraph.tsx`,
+/// `tool-registry-api.ts::fetchTimelineHistory`) already tolerates both
+/// shapes, so this is additive at the consumer layer even though the JSON
+/// top-level type differs.
+#[tokio::test]
+async fn timeline_history_discloses_quarantine() {
+    let (state, _solid_id) = quarantined_state_with_one_solid().await;
+
+    let (status, body) = dispatch(&state, json_get("/api/timeline/history/main")).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "history on a quarantined document must still 200; body = {body}"
+    );
+    assert!(
+        body.is_object(),
+        "a quarantined document's history must be the {{events, durability}} \
+         object shape, not a bare array; body = {body}"
+    );
+    let events = body["events"]
+        .as_array()
+        .unwrap_or_else(|| panic!("body.events must be an array; body = {body}"));
+    assert!(
+        !events.is_empty(),
+        "the clean prefix's events must still be served; body = {body}"
+    );
+    assert_eq!(
+        body["durability"]["state"].as_str(),
+        Some("quarantined"),
+        "history must disclose the quarantine via the same DurabilityStatus \
+         vocabulary; body = {body}"
+    );
+    assert_eq!(
+        body["durability"]["first_break_kind"].as_str(),
+        Some("quarantine_probe_unknown_op_agent_surface"),
+        "body = {body}"
+    );
+}
+
+/// GATE (additive pin): on a NON-quarantined document, `timeline/history`
+/// stays exactly what it always was — a bare JSON array, no wrapper object,
+/// no `durability` noise. Every pre-existing test in this module that reads
+/// history via `.as_array().expect(...)` already exercises this; this test
+/// names the contract explicitly.
+#[tokio::test]
+async fn timeline_history_stays_bare_array_when_not_quarantined() {
+    let state = make_test_state().await;
+    let (bs, bbody) = dispatch(
+        &state,
+        json_post(
+            "/api/geometry/box",
+            json!({"width": 3.0, "depth": 3.0, "height": 3.0}),
+        ),
+    )
+    .await;
+    assert_eq!(bs, StatusCode::OK, "box create must 200; body = {bbody}");
+
+    let (status, body) = dispatch(&state, json_get("/api/timeline/history/main")).await;
+    assert_eq!(status, StatusCode::OK, "history must 200; body = {body}");
+    assert!(
+        body.is_array(),
+        "a non-quarantined document's history must stay a bare array; body = {body}"
+    );
+}

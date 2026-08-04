@@ -35,7 +35,8 @@
 use std::sync::Arc;
 
 use geometry_engine::operations::recorder::{
-    IntentFacet, OperationRecorder, RecordedOperation, RecorderError,
+    IntentFacet, OperationRecorder, Origin, OriginBasis, OriginFacet, RecordedOperation,
+    RecorderError,
 };
 use parking_lot::RwLock as PlRwLock;
 use tokio::sync::{mpsc, oneshot, RwLock};
@@ -132,6 +133,29 @@ tokio::task_local! {
     /// slot under concurrency would produce provenance that is confidently
     /// wrong, which is worse than absent.
     pub static INTENT_OVERRIDE: IntentContext;
+}
+
+tokio::task_local! {
+    /// Per-task channel override consulted by [`TimelineRecorder::record`].
+    ///
+    /// A SEPARATE task-local from [`INTENT_OVERRIDE`], not a field folded
+    /// into one shared context struct: origin is scoped on EVERY request
+    /// (the axum middleware and the WebSocket handler both always have a
+    /// channel to report), while intent is scoped only when the MCP gate's
+    /// checkpoint header is present — folding them together would force a
+    /// "no intent" request to still construct an `Option<IntentContext>`
+    /// and would make `agent_intent_layer`'s zero-cost passthrough (no
+    /// scope at all when the header is absent) reach into a struct
+    /// half-owned by a different feature. `AUTHOR_OVERRIDE` already
+    /// established the one-task-local-per-attribution-dimension
+    /// convention; `ORIGIN_OVERRIDE` follows it.
+    ///
+    /// Same reasoning as `AUTHOR_OVERRIDE` / `INTENT_OVERRIDE` for why this
+    /// is a task-local and not `AppState` / a `DashMap` / any shared slot:
+    /// an ambient slot under concurrency would cross-attribute one
+    /// request's channel onto another's op, producing provenance that is
+    /// confidently wrong — worse than the honest `Origin::NotDetermined`.
+    pub static ORIGIN_OVERRIDE: Origin;
 }
 
 /// Shared, lock-protected handle to a [`Timeline`].
@@ -565,6 +589,44 @@ impl OperationRecorder for TimelineRecorder {
                         "failed to stamp IntentFacet — recording without it"
                     );
                 }
+            }
+        }
+        // Stamp the request's origin channel NOW, on the recording task, for
+        // the same reason author and intent are resolved here rather than
+        // on the drain worker. Unlike intent, this ALWAYS stamps — a
+        // channel is always structurally determinable to at least the
+        // honest `NotDetermined` level, so leaving the facet off entirely
+        // would make "no channel recorded" indistinguishable from "this
+        // build doesn't track channels yet". A record that already carries
+        // an origin (replay re-applying a stored event whose original
+        // record already has one) is left untouched — replay must never
+        // relabel history with whatever channel happens to be driving the
+        // replay call itself.
+        if operation.facets.origin().is_none() {
+            let channel = ORIGIN_OVERRIDE
+                .try_with(|o| *o)
+                .unwrap_or(Origin::NotDetermined);
+            // `Mcp` is the one variant that is a CLIENT claim (the MCP
+            // client's own headers), never server-verified — see
+            // `OriginFacet`'s doc comment. Every other variant, including
+            // `NotDetermined`, is something the server itself established
+            // (or explicitly failed to).
+            let basis = if channel == Origin::Mcp {
+                OriginBasis::ClientHeader
+            } else {
+                OriginBasis::ServerObserved
+            };
+            let facet = OriginFacet { channel, basis };
+            if let Err(err) = operation.facets.set_origin(&facet) {
+                // A closed enum pair cannot realistically fail to
+                // serialize; if it ever does, record WITHOUT the facet
+                // (honest absence) rather than dropping the op.
+                tracing::warn!(
+                    target: "timeline.recorder_bridge",
+                    kind = %operation.kind,
+                    error = %err,
+                    "failed to stamp OriginFacet — recording without it"
+                );
             }
         }
         // Inside a staging window, divert into the buffer. This is the
@@ -1551,6 +1613,266 @@ mod tests {
                 "{kind} must carry ITS OWN intent, never the concurrent \
                  task's — cross-attribution is confidently-wrong provenance, \
                  worse than absence"
+            );
+        }
+    }
+
+    // ──────────── Origin provenance (`roshera.origin`) ────────────
+
+    /// Extract the `roshera.origin` facet payload from an event's replay
+    /// envelope, or `None` when the event carries no origin at all.
+    fn origin_of(event: &TimelineEvent) -> Option<serde_json::Value> {
+        match &event.operation {
+            Operation::Generic { parameters, .. } => parameters
+                .get("facets")
+                .and_then(|f| f.get(OriginFacet::NAME))
+                .cloned(),
+            other => panic!("expected Operation::Generic, got {:?}", other),
+        }
+    }
+
+    /// THE ALWAYS-STAMPED PIN. Unlike intent (present only when the MCP
+    /// gate's checkpoint is open), origin is attached to EVERY op
+    /// `TimelineRecorder` records. With no `ORIGIN_OVERRIDE` scope live on
+    /// the recording task, the op must still carry the facet — with the
+    /// honest `not_determined` value, never simply absent. RED before the
+    /// producer existed: `origin_of` returned `None` for an unscoped op.
+    #[tokio::test]
+    async fn record_with_no_origin_scope_stamps_not_determined() {
+        let timeline: SharedTimeline =
+            Arc::new(RwLock::new(Timeline::new(TimelineConfig::default())));
+        let recorder =
+            TimelineRecorder::new(Arc::clone(&timeline), Author::System, BranchId::main());
+
+        recorder
+            .record(RecordedOperation::new("no-scope"))
+            .expect("record with no origin scope");
+        drop(recorder);
+
+        let events = drained_events(&timeline, 1).await;
+        let facet = origin_of(&events[0]).expect(
+            "an op recorded with no ORIGIN_OVERRIDE scope must still carry an origin facet",
+        );
+        assert_eq!(facet["channel"], "not_determined");
+        assert_eq!(
+            facet["basis"], "server_observed",
+            "not_determined is something the server itself failed to establish, \
+             never a client claim"
+        );
+    }
+
+    /// A scoped origin stamps its channel verbatim, and `Mcp` specifically
+    /// records `basis: client_header` — the one variant that is a
+    /// self-reported claim, never server-verified (see `OriginFacet`'s doc
+    /// comment).
+    #[tokio::test]
+    async fn origin_scope_stamps_the_scoped_channel_with_the_right_basis() {
+        let timeline: SharedTimeline =
+            Arc::new(RwLock::new(Timeline::new(TimelineConfig::default())));
+        let recorder =
+            TimelineRecorder::new(Arc::clone(&timeline), Author::System, BranchId::main());
+
+        ORIGIN_OVERRIDE
+            .scope(Origin::Mcp, async {
+                recorder
+                    .record(RecordedOperation::new("via-mcp"))
+                    .expect("record inside Mcp scope");
+            })
+            .await;
+        ORIGIN_OVERRIDE
+            .scope(Origin::Rest, async {
+                recorder
+                    .record(RecordedOperation::new("via-rest"))
+                    .expect("record inside Rest scope");
+            })
+            .await;
+        drop(recorder);
+
+        let events = drained_events(&timeline, 2).await;
+        let mcp_event = events
+            .iter()
+            .find(|e| {
+                matches!(&e.operation, Operation::Generic { command_type, .. }
+                    if command_type == "via-mcp")
+            })
+            .expect("the mcp-scoped op's event exists");
+        let mcp_facet = origin_of(mcp_event).expect("origin facet present");
+        assert_eq!(mcp_facet["channel"], "mcp");
+        assert_eq!(
+            mcp_facet["basis"], "client_header",
+            "mcp is a self-reported client claim, never server-verified"
+        );
+
+        let rest_event = events
+            .iter()
+            .find(|e| {
+                matches!(&e.operation, Operation::Generic { command_type, .. }
+                    if command_type == "via-rest")
+            })
+            .expect("the rest-scoped op's event exists");
+        let rest_facet = origin_of(rest_event).expect("origin facet present");
+        assert_eq!(rest_facet["channel"], "rest");
+        assert_eq!(rest_facet["basis"], "server_observed");
+    }
+
+    /// THE ORIGIN CROSS-ATTRIBUTION PIN — the origin counterpart of
+    /// `concurrent_tasks_with_different_intents_never_cross_attribute`.
+    /// Two concurrent recording tasks, each inside its OWN `ORIGIN_OVERRIDE`
+    /// scope with a DIFFERENT channel, both record before the drain worker
+    /// applies either (driven, not hoped for, via the timeline write lock).
+    /// Each event must carry ITS OWN channel. Mutation-proven RED against
+    /// an ambient implementation (see the doc comment above the manual
+    /// mutation instructions in this module's task description — moving the
+    /// read to the drain worker or any shared slot attributes op-alpha to
+    /// op-beta's channel).
+    #[tokio::test(flavor = "current_thread")]
+    async fn concurrent_tasks_with_different_origins_never_cross_attribute() {
+        let timeline: SharedTimeline =
+            Arc::new(RwLock::new(Timeline::new(TimelineConfig::default())));
+        let recorder =
+            TimelineRecorder::new(Arc::clone(&timeline), Author::System, BranchId::main());
+
+        // Pin the drain worker exactly as the intent test does: hold the
+        // write lock so both records are queued before either is applied.
+        let write_guard = timeline.write().await;
+
+        let alpha_recorder = recorder.clone();
+        let alpha = tokio::spawn(ORIGIN_OVERRIDE.scope(Origin::Mcp, async move {
+            alpha_recorder
+                .record(RecordedOperation::new("op-alpha"))
+                .expect("record op-alpha inside alpha's scope");
+        }));
+        let beta_recorder = recorder.clone();
+        let beta = tokio::spawn(ORIGIN_OVERRIDE.scope(Origin::Websocket, async move {
+            beta_recorder
+                .record(RecordedOperation::new("op-beta"))
+                .expect("record op-beta inside beta's scope");
+        }));
+        alpha.await.expect("alpha task completes");
+        beta.await.expect("beta task completes");
+
+        drop(write_guard);
+        drop(recorder);
+
+        let events = drained_events(&timeline, 2).await;
+        assert_eq!(
+            events.len(),
+            2,
+            "both concurrent records reach the timeline"
+        );
+
+        for (kind, expected_channel) in [("op-alpha", "mcp"), ("op-beta", "websocket")] {
+            let event = events
+                .iter()
+                .find(|e| {
+                    matches!(&e.operation, Operation::Generic { command_type, .. }
+                        if command_type == kind)
+                })
+                .unwrap_or_else(|| panic!("{kind}'s event exists"));
+            let facet = origin_of(event).unwrap_or_else(|| {
+                panic!(
+                    "{kind} lost its origin — the facet must be stamped at \
+                     record() time on the requesting task, not read later on \
+                     the drain worker (which has no scope)"
+                )
+            });
+            assert_eq!(
+                facet["channel"], expected_channel,
+                "{kind} must carry ITS OWN channel, never the concurrent \
+                 task's — cross-attribution is confidently-wrong provenance, \
+                 worse than not_determined"
+            );
+        }
+    }
+
+    /// THE REPLAY-NON-RELABELLING PIN. `create_box_3d` is a genuinely
+    /// dispatchable replay kind, recorded through a REAL `TimelineRecorder`
+    /// attached to a REAL `BRepModel` (not a hand-built `RecordedOperation`)
+    /// so this test can actually fail: it replays the stored event into a
+    /// SECOND model that has the SAME recorder attached, under a DIFFERENT
+    /// origin scope than the one the event was originally recorded under.
+    /// `rebuild_model_from_events` detaches the model's recorder for the
+    /// duration of the replay (see that function's doc comment) — if that
+    /// detach ever regressed, replaying `create_box_3d` here would call
+    /// `TimelineRecorder::record()` again, appending a stray event and/or
+    /// relabelling the original with whatever channel is driving the
+    /// replay call. Both must be provably false.
+    #[tokio::test]
+    async fn replay_does_not_relabel_a_stored_events_origin() {
+        use geometry_engine::primitives::topology_builder::{BRepModel, TopologyBuilder};
+
+        let timeline: SharedTimeline =
+            Arc::new(RwLock::new(Timeline::new(TimelineConfig::default())));
+        let recorder =
+            TimelineRecorder::new(Arc::clone(&timeline), Author::System, BranchId::main());
+
+        let mut model = BRepModel::new();
+        model.attach_recorder(Some(
+            Arc::new(recorder.clone()) as Arc<dyn OperationRecorder>
+        ));
+        ORIGIN_OVERRIDE
+            .scope(Origin::Mcp, async {
+                TopologyBuilder::new(&mut model)
+                    .create_box_3d(10.0, 10.0, 10.0)
+                    .expect("create_box_3d succeeds");
+            })
+            .await;
+
+        let main = BranchId::main();
+        let events = drained_events(&timeline, 1).await;
+        let before_count = events.len();
+        assert!(before_count >= 1, "the box creation reaches the timeline");
+        for event in &events {
+            let facet = origin_of(event)
+                .expect("every event recorded through the recorder carries an origin");
+            assert_eq!(
+                facet["channel"], "mcp",
+                "the box creation was recorded inside an Mcp scope"
+            );
+        }
+
+        let mut replay_target = BRepModel::new();
+        replay_target.attach_recorder(Some(
+            Arc::new(recorder.clone()) as Arc<dyn OperationRecorder>
+        ));
+        ORIGIN_OVERRIDE
+            .scope(Origin::Rest, async {
+                let outcome = crate::replay::rebuild_model_from_events(&mut replay_target, &events);
+                assert_eq!(
+                    outcome.events_skipped, 0,
+                    "create_box_3d must genuinely dispatch during replay — a \
+                     skipped event never attempts record() and this test \
+                     would prove nothing"
+                );
+            })
+            .await;
+
+        // Give any (regression-case) replay-driven record a moment to land
+        // before asserting no growth.
+        recorder
+            .flush()
+            .await
+            .expect("flush drains any replay-driven records");
+        drop(recorder);
+
+        let after = timeline
+            .read()
+            .await
+            .get_branch_events(&main, None, None)
+            .expect("branch events");
+        assert_eq!(
+            after.len(),
+            before_count,
+            "replay must not append new events to the timeline — the \
+             recorder-detach in `rebuild_model_from_events` must hold"
+        );
+        for event in &after {
+            let facet = origin_of(event).expect("origin facet still present");
+            assert_eq!(
+                facet["channel"], "mcp",
+                "replay must not relabel a stored event's origin with \
+                 whatever channel happens to be driving the replay call \
+                 itself"
             );
         }
     }

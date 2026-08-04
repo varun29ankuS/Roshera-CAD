@@ -807,18 +807,31 @@ pub struct HistoryQuery {
     pub limit: Option<usize>,
 }
 
-/// Get timeline history
+/// Get timeline history.
+///
+/// Returns a bare JSON array of [`EventSummary`] — UNCHANGED — for every
+/// document whose durability status is not `Quarantined` (off, empty, or a
+/// full clean replay). On a quarantined document (the served events are only
+/// the clean prefix of the persisted log; a break exists further on) the
+/// response instead becomes `{"events": [...], "durability": <DurabilityStatus>}`
+/// so the missing tail is disclosed rather than silently absent — the same
+/// honest boot outcome `/api/durability/status` and `manifest.durability`
+/// (the evidence pack) already report, carried onto this agent-facing read.
+/// Every existing consumer (the frontend panels, `tool-registry-api.ts`,
+/// the MCP `timeline_history` tool) already tolerates both shapes.
 pub async fn get_history(
     State(state): State<AppState>,
     Path(branch_id): Path<String>,
     axum::extract::Query(page): axum::extract::Query<HistoryQuery>,
-) -> Result<Json<Vec<EventSummary>>, StatusCode> {
+) -> Result<Json<serde_json::Value>, StatusCode> {
     // Drain in-flight recorder ops so the response reflects every
     // kernel operation the client has issued, not just the ones the
     // background worker happened to drain by the time the request
     // arrived. Without this the Timeline panel can render empty
     // immediately after creating a primitive.
     let _ = state.timeline_recorder.flush().await;
+    // Read once, guard dropped before any further `.await` below.
+    let durability_status = state.durability_status.read().await.clone();
     let timeline = state.timeline.read().await;
     let branch_id = resolve_branch_ref(&branch_id)?;
 
@@ -849,7 +862,18 @@ pub async fn get_history(
         })
         .collect();
 
-    Ok(Json(summaries))
+    let payload = match crate::durability::quarantine_disclosure(&durability_status) {
+        Some(status) => {
+            let events =
+                serde_json::to_value(&summaries).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            let durability =
+                serde_json::to_value(status).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+            serde_json::json!({ "events": events, "durability": durability })
+        }
+        None => serde_json::to_value(&summaries).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?,
+    };
+
+    Ok(Json(payload))
 }
 
 /// Extract the clean kernel-level kind name from an Operation.

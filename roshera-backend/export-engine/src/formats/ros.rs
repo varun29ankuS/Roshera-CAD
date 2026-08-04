@@ -549,6 +549,35 @@ pub async fn export_brep_to_ros(
             path: path.to_string_lossy().to_string(),
         })?;
 
+    // Flush AND fsync before reporting success. `tokio::fs::File` buffers,
+    // and dropping it does not guarantee the bytes reach the disk — the
+    // drop-time flush is best-effort and its result is discarded. Without
+    // this, `export_brep_to_ros` returns `Ok` on a file that may still be
+    // partially written, so a caller that immediately reads it back (an
+    // agent verifying its own export, a user copying the artifact) can get
+    // a truncated file while having been told the export succeeded.
+    //
+    // Observed, not theorised: `ros_sign_chunk::tampered_hist_byte_flips_
+    // verdict_to_invalid` failed once under parallel load because the
+    // marker it plants inside HIST was absent from the file it read back
+    // immediately after export — the same binary passing 7 subsequent runs.
+    //
+    // `sync_all` rather than `flush` alone: this file is the durable
+    // artifact an IP claim rests on, and a signature over bytes that never
+    // reached the platter is not evidence of anything. One fsync per export
+    // is a trivial cost against silently truncating the thing we just told
+    // the caller we wrote.
+    file.flush()
+        .await
+        .map_err(|_e| ExportError::FileWriteError {
+            path: path.to_string_lossy().to_string(),
+        })?;
+    file.sync_all()
+        .await
+        .map_err(|_e| ExportError::FileWriteError {
+            path: path.to_string_lossy().to_string(),
+        })?;
+
     Ok(RosWriteSummary {
         hist_event_count,
         hist_branch_count,

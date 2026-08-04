@@ -359,7 +359,61 @@ impl Drop for UnauthenticatedWsSlot {
 // WebSocket upgrade handler
 pub async fn websocket_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> Response {
     info!("🔌 WebSocket upgrade request received");
-    ws.on_upgrade(move |socket| handle_websocket_connection(socket, state))
+    // Origin provenance: axum's `on_upgrade` runs this callback on a task
+    // detached from the upgrade request (the request handler returns as
+    // soon as the upgrade response is sent, well before any message is
+    // processed), so `agent_origin_layer`'s `ORIGIN_OVERRIDE` scope — tied
+    // to the upgrade request's task — has already closed by the time any
+    // kernel op happens here. Scope it fresh, around the WHOLE connection,
+    // on the task that will actually call `TimelineRecorder::record()`
+    // synchronously (e.g. via `AICommand` → `TopologyBuilder`).
+    ws.on_upgrade(move |socket| {
+        timeline_engine::recorder_bridge::ORIGIN_OVERRIDE.scope(
+            geometry_engine::operations::recorder::Origin::Websocket,
+            handle_websocket_connection(socket, state),
+        )
+    })
+}
+
+/// Build the `parameters` payload for a WS `TimelineWSCommand::ExecuteOperation`,
+/// including the `roshera.origin` facet.
+///
+/// This path builds `Operation::Generic` directly against the `Timeline`
+/// (see its one call site below) rather than going through the kernel's
+/// `OperationRecorder` — `TimelineRecorder::record`, which stamps
+/// `roshera.origin` on every kernel-driven record, never runs for it.
+/// Attach the SAME typed facet by hand, through the one sanctioned typed
+/// setter (`Facets::set_origin`), so this event is just as interpretable
+/// as every other channel's. Extracted to a free function so the
+/// origin-stamping logic is unit-testable without a live WebSocket
+/// connection.
+fn ws_execute_operation_parameters(
+    operation: &super::protocol::TimelineOperation,
+) -> serde_json::Value {
+    let mut params = match serde_json::to_value(operation) {
+        Ok(serde_json::Value::Object(map)) => map,
+        _ => serde_json::Map::new(),
+    };
+    let mut facets = geometry_engine::operations::recorder::Facets::default();
+    let origin_facet = geometry_engine::operations::recorder::OriginFacet {
+        channel: geometry_engine::operations::recorder::Origin::Websocket,
+        basis: geometry_engine::operations::recorder::OriginBasis::ServerObserved,
+    };
+    match facets.set_origin(&origin_facet) {
+        Ok(()) => {
+            params.insert("facets".to_string(), facets.to_json());
+        }
+        Err(err) => {
+            // A closed enum pair cannot realistically fail to serialize;
+            // if it ever does, record WITHOUT the facet (honest absence)
+            // rather than dropping the op.
+            warn!(
+                "failed to stamp origin facet on WS ExecuteOperation: {}",
+                err
+            );
+        }
+    }
+    serde_json::Value::Object(params)
 }
 
 async fn handle_websocket_connection(socket: WebSocket, state: AppState) {
@@ -1997,8 +2051,7 @@ async fn handle_websocket_connection(socket: WebSocket, state: AppState) {
                                         // Add operation to timeline
                                         let timeline_op = timeline_engine::Operation::Generic {
                                             command_type: "timeline_operation".to_string(),
-                                            parameters: serde_json::to_value(&operation)
-                                                .unwrap_or(serde_json::Value::Null),
+                                            parameters: ws_execute_operation_parameters(&operation),
                                         };
 
                                         // Smallest write window (guard dropped before
@@ -3287,5 +3340,88 @@ mod tests {
         assert_eq!(crate::ACTIVE_WEBSOCKETS.load(Ordering::Relaxed), start + 1);
         drop(g2);
         assert_eq!(crate::ACTIVE_WEBSOCKETS.load(Ordering::Relaxed), start);
+    }
+
+    /// Origin-provenance test #1: an operation recorded through the WS
+    /// `ExecuteOperation` path carries `roshera.origin.channel = websocket`.
+    /// This path never calls `TimelineRecorder::record` (it builds
+    /// `Operation::Generic` directly against the `Timeline`), so the facet
+    /// must come from `ws_execute_operation_parameters` itself — this pins
+    /// exactly that function, the one call site the real handler uses.
+    #[test]
+    fn ws_execute_operation_stamps_websocket_origin() {
+        let operation = super::super::protocol::TimelineOperation::Delete {
+            entities: vec!["solid:1".to_string()],
+        };
+        let params = ws_execute_operation_parameters(&operation);
+        let origin = params
+            .get("facets")
+            .and_then(|f| f.get(geometry_engine::operations::recorder::OriginFacet::NAME))
+            .expect("ExecuteOperation must carry an origin facet");
+        assert_eq!(origin["channel"], "websocket");
+        assert_eq!(origin["basis"], "server_observed");
+        // The operation's own shape must survive untouched alongside the
+        // facet — the facet is an ADDITION, not a replacement.
+        assert_eq!(params["operation_type"], "Delete");
+    }
+
+    /// Origin-provenance wiring check: `websocket_handler` scopes
+    /// `ORIGIN_OVERRIDE` around the WHOLE connection future (not just the
+    /// upgrade request, whose task-local scope closes before the
+    /// detached connection task ever runs — see that function's doc
+    /// comment), so a kernel op recorded synchronously anywhere inside
+    /// `handle_websocket_connection` picks up `Origin::Websocket`. This
+    /// test exercises the exact `.scope(...)` call `websocket_handler`
+    /// makes, standing in for the connection body with a probe that
+    /// records through a REAL `TimelineRecorder` — proving the scope is
+    /// live on the task that would actually call `record()`.
+    #[tokio::test]
+    async fn origin_override_scope_around_connection_future_reaches_record() {
+        use geometry_engine::operations::recorder::OperationRecorder;
+
+        let timeline: timeline_engine::SharedTimeline =
+            std::sync::Arc::new(tokio::sync::RwLock::new(timeline_engine::Timeline::new(
+                timeline_engine::TimelineConfig::default(),
+            )));
+        let recorder = timeline_engine::TimelineRecorder::new(
+            std::sync::Arc::clone(&timeline),
+            timeline_engine::Author::System,
+            timeline_engine::BranchId::main(),
+        );
+
+        // Mirrors `websocket_handler`'s `ws.on_upgrade` callback: scope
+        // ORIGIN_OVERRIDE around a future that runs on ITS OWN (here,
+        // simulated) task, exactly as the real detached connection task
+        // does.
+        let probe_recorder = recorder.clone();
+        let task = tokio::spawn(timeline_engine::recorder_bridge::ORIGIN_OVERRIDE.scope(
+            geometry_engine::operations::recorder::Origin::Websocket,
+            async move {
+                probe_recorder
+                    .record(
+                        geometry_engine::operations::recorder::RecordedOperation::new(
+                            "ws-probe-op",
+                        ),
+                    )
+                    .expect("record succeeds inside the connection-future scope");
+            },
+        ));
+        task.await.expect("connection task completes");
+        recorder.flush().await.expect("flush");
+
+        let events = timeline
+            .read()
+            .await
+            .get_branch_events(&timeline_engine::BranchId::main(), None, None)
+            .expect("branch events");
+        assert_eq!(events.len(), 1);
+        let origin = match &events[0].operation {
+            timeline_engine::Operation::Generic { parameters, .. } => parameters
+                .get("facets")
+                .and_then(|f| f.get(geometry_engine::operations::recorder::OriginFacet::NAME))
+                .expect("kernel op recorded inside the connection future carries an origin"),
+            other => panic!("expected Operation::Generic, got {:?}", other),
+        };
+        assert_eq!(origin["channel"], "websocket");
     }
 }

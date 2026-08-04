@@ -301,6 +301,14 @@ function perceptionFromBody(r: any): any {
     volume: r.volume ?? r.perception?.volume ?? null,
     errors: cert?.errors ?? null,
     cert: cert ?? undefined,
+    // DOCUMENT-level durability disclosure, present ONLY when the backend's
+    // response carried one (a QUARANTINED document — see `/perception`'s
+    // `durability` field). Never fabricated; absent means nothing withheld.
+    // NOTE: a mutating op's OWN embedded response (`certified_response` in
+    // main.rs) does not carry this field yet, so it is not reachable from
+    // THIS function on the embedded-reuse path — only when the raw body `r`
+    // is itself a `/perception` (or perception-shaped) response.
+    durability: r.durability ?? r.perception?.durability ?? undefined,
     verdict:
       (r.verdict ?? r.perception?.verdict) ??
       (sound ? "OK — valid closed solid (cheap verdict; verify_part to certify)" : "UNSOUND — see verify_part"),
@@ -562,6 +570,14 @@ export async function perceive(partId: number | null): Promise<any> {
       // Full certificate breakdown present only on the ?full path (worst-face
       // pointers — the optimisation oracle).
       cert: cert ?? undefined,
+      // DOCUMENT-level durability disclosure straight off this GET /perception
+      // response — present ONLY on a QUARANTINED document. This is the path
+      // that actually carries it in the ambient pipeline today: the FAST
+      // PATH above (reused from a mutating op's own embedded response) does
+      // NOT yet, since `certified_response` (api-server/src/main.rs) has no
+      // durability field — that would need a main.rs change out of this
+      // module's scope.
+      durability: p?.durability ?? undefined,
       verdict:
         p?.verdict ??
         (sound
@@ -663,15 +679,24 @@ export function compactVerdict(p: any): string {
   if (p?.nonmanifold_edges) facts.push(`⚠ ${p.nonmanifold_edges} non-manifold edges`);
   if (p?.eyes_consistent === "inconsistent") failed.push("eyes-consistent");
   const tail = facts.length ? ` | ${facts.join(" | ")}` : "";
+  // DOCUMENT-level context, prefixed loudly and BESIDE the part verdict below
+  // — never softens or replaces it. Present only when the fetch this verdict
+  // was built from carried a `durability` field (a QUARANTINED document: a
+  // slice of this document's recorded history could not be replayed and was
+  // refused, not silently served). See `p.durability` for the full state
+  // (first_break_kind/reason/events_served/events_total).
+  const durabilityNote = p?.durability
+    ? `⚠ DOCUMENT QUARANTINED (${p.durability.reason ?? "history incomplete — see p.durability"}) | `
+    : "";
   if (p?.sound === true && failed.length === 0) {
     const verified = DIMS.filter(([k]) => p?.[k] === true).map(([, n]) => n);
     const suffix = unverified.length
       ? ` (unverified: ${unverified.join(",")} — verify_part to certify)`
       : "";
-    return `SOUND ✓ ${verified.join("·")}${suffix}${tail}`;
+    return `${durabilityNote}SOUND ✓ ${verified.join("·")}${suffix}${tail}`;
   }
   const why = failed.length ? failed.join(", ") : "cheap verdict false";
-  return `UNSOUND ✗ failed: ${why}${tail} — run verify_part for the full certificate + diagnostic render`;
+  return `${durabilityNote}UNSOUND ✗ failed: ${why}${tail} — run verify_part for the full certificate + diagnostic render`;
 }
 
 /**

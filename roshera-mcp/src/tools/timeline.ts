@@ -172,7 +172,15 @@ export function registerTimelineTools(server: ToolHost) {
           "GET",
           `/api/timeline/history/${encodeURIComponent(branch)}?start=${start}&limit=${limit}`,
         );
-        const events = (Array.isArray(r) ? r : []).map((e: any) => ({
+        // The backend serves a bare array for an ordinary document, and
+        // {events, durability} on a QUARANTINED one — the served events are
+        // only the clean prefix of the persisted log; the tail is refused,
+        // never silently dropped. A bare `Array.isArray(r) ? r : []` here
+        // would turn that disclosure into an apparent empty history — the
+        // exact "an agent asks what happened and gets a clean answer" defect
+        // one layer up. Handle both shapes explicitly.
+        const raw: any[] = Array.isArray(r) ? r : Array.isArray(r?.events) ? r.events : [];
+        const events = raw.map((e: any) => ({
           id: e.id,
           sequence: e.sequence_number,
           timestamp: e.timestamp,
@@ -182,7 +190,14 @@ export function registerTimelineTools(server: ToolHost) {
           affected_parts: e.affected_parts,
           ...(include_operations ? { operation: e.operation } : {}),
         }));
-        return ok({ branch, start, count: events.length, events });
+        const durability = !Array.isArray(r) ? (r?.durability ?? null) : null;
+        return ok({
+          branch,
+          start,
+          count: events.length,
+          events,
+          ...(durability ? { durability } : {}),
+        });
       } catch (e) {
         return fail(e);
       }

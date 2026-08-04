@@ -242,6 +242,17 @@ impl Facets {
         self.set_facet(IntentFacet::NAME, intent)
     }
 
+    /// Typed read of the [`OriginFacet`] (`roshera.origin`). Absence
+    /// semantics identical to [`facet`](Self::facet).
+    pub fn origin(&self) -> Option<Result<OriginFacet, serde_json::Error>> {
+        self.facet(OriginFacet::NAME)
+    }
+
+    /// Typed write of the [`OriginFacet`] (`roshera.origin`).
+    pub fn set_origin(&mut self, origin: &OriginFacet) -> Result<(), serde_json::Error> {
+        self.set_facet(OriginFacet::NAME, origin)
+    }
+
     /// Iterate facets in deterministic (name-sorted) order.
     pub fn iter(&self) -> impl Iterator<Item = (&str, &serde_json::Value)> {
         self.0.iter().map(|(k, v)| (k.as_str(), v))
@@ -279,6 +290,95 @@ pub struct IntentFacet {
 impl IntentFacet {
     /// The facet's namespaced wire name.
     pub const NAME: &'static str = "roshera.intent";
+}
+
+/// The closed set of channels an operation can enter the kernel through.
+///
+/// Intent is MCP-only (the MCP intent gate is the only thing that forces a
+/// declaration before a mutating call); origin is universal — every
+/// mutating channel, gated or not, is one of these. A free-form string
+/// would let a producer invent a new, un-auditable category; a closed enum
+/// cannot. `NotDetermined` is a first-class member, not an omission: a
+/// code path that cannot establish its channel must say so explicitly
+/// rather than default to a plausible-looking one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Origin {
+    /// The Roshera MCP server (`roshera-mcp`), whose intent gate forces a
+    /// design-intent declaration before any solid-mutating tool call.
+    Mcp,
+    /// A direct REST call that did not present the MCP client's wire
+    /// signature (see [`OriginFacet`]'s doc comment).
+    Rest,
+    /// The `/ws` WebSocket protocol (`TimelineWSCommand` / `GeometryWSCommand`).
+    Websocket,
+    /// The `/ws/viewport-bridge` connection.
+    ViewportBridge,
+    /// A kernel operation re-executed during replay
+    /// (`timeline_engine::replay::rebuild_model_from_events`). Reserved for
+    /// a future replay path that legitimately re-emits events; today's
+    /// replay detaches the recorder for its entire duration (see that
+    /// module's doc comment), so no live path produces this value yet.
+    Replay,
+    /// The channel could not be established. Honest, not a default: every
+    /// other variant must be earned by an explicit, scoped signal.
+    NotDetermined,
+}
+
+/// How confidently [`OriginFacet::channel`] is known.
+///
+/// [`Origin::Mcp`] is a claim the CLIENT makes on the wire (the MCP client
+/// sends its own identifying headers; nothing server-side cryptographically
+/// verifies that a caller presenting the same headers actually IS the MCP
+/// server — see [`OriginFacet`]'s doc comment) — `ClientHeader`. Every other
+/// channel is something the server itself observed structurally (which
+/// route accepted the request, which task is handling the WebSocket
+/// connection) — `ServerObserved`. Collapsing this distinction into the
+/// channel alone would let a self-reported claim and a server-verified fact
+/// read as equally certain, which is exactly the kind of confidently-wrong
+/// provenance this feature exists to avoid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OriginBasis {
+    /// Self-reported by the caller via request headers, never verified.
+    ClientHeader,
+    /// Established by the server from the transport/route it received the
+    /// call on (or from the explicit absence of any such signal, for
+    /// [`Origin::NotDetermined`]).
+    ServerObserved,
+}
+
+/// The `roshera.origin` facet: which channel initiated this operation.
+///
+/// Unlike [`IntentFacet`] (present only when the MCP gate's checkpoint was
+/// open), this facet is attached to EVERY operation `TimelineRecorder`
+/// records — see that type's `record()` — because a channel is always
+/// structurally determinable to at least the honest "not determined"
+/// level, so leaving it off entirely would make an untracked channel
+/// indistinguishable from one this build simply forgot to stamp.
+///
+/// # Distinguishing `mcp` from `rest`
+///
+/// The MCP client (`roshera-mcp/src/core.ts`) is the only caller that sends
+/// BOTH `X-Roshera-Agent` (unconditionally, every call) AND a decodable
+/// `X-Roshera-Intent` (whenever its intent gate has an open checkpoint) —
+/// no other channel sends either. `main.rs`'s `agent_origin_layer` stamps
+/// `Mcp` only on that conjunction; a request with neither, or only one, is
+/// `Rest`. This is a claim the CLIENT can fabricate (any REST caller could
+/// send the same two headers), which is why it is recorded with
+/// `basis: ClientHeader` rather than silently presented as equally certain
+/// as a server-observed channel like `Websocket`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OriginFacet {
+    /// Which of the closed [`Origin`] set initiated the operation.
+    pub channel: Origin,
+    /// How confidently `channel` is known.
+    pub basis: OriginBasis,
+}
+
+impl OriginFacet {
+    /// The facet's namespaced wire name.
+    pub const NAME: &'static str = "roshera.origin";
 }
 
 /// A structured description of one geometry operation that has just
@@ -1098,6 +1198,48 @@ mod tests {
         assert!(
             result.is_err(),
             "malformed intent must surface as Err, not vanish"
+        );
+    }
+
+    /// The `roshera.origin` typed facet: written and read through the ONE
+    /// definition of its shape, round-trips intact, uses the closed-set
+    /// snake_case wire form, and a present-but-malformed payload surfaces
+    /// as `Some(Err(..))` — never coerced to absence.
+    #[test]
+    fn origin_facet_round_trips_through_typed_accessor() {
+        let mut op = RecordedOperation::new("boolean_union");
+        assert!(op.facets.origin().is_none(), "no origin recorded = None");
+
+        let origin = OriginFacet {
+            channel: Origin::Websocket,
+            basis: OriginBasis::ServerObserved,
+        };
+        op.facets.set_origin(&origin).expect("set origin");
+
+        let json = serde_json::to_string(&op).expect("serialize");
+        assert!(
+            json.contains(r#""channel":"websocket""#)
+                && json.contains(r#""basis":"server_observed""#),
+            "wire form must be closed-set snake_case, got {json}"
+        );
+        let back: RecordedOperation = serde_json::from_str(&json).expect("deserialize");
+        let read = back
+            .facets
+            .origin()
+            .expect("origin facet is present")
+            .expect("origin facet parses");
+        assert_eq!(read, origin);
+
+        // A present-but-malformed origin is a typed error, not absence.
+        let mut bad = RecordedOperation::new("noop");
+        bad.facets.set_raw(
+            OriginFacet::NAME,
+            serde_json::json!({ "channel": "not_a_real_channel" }),
+        );
+        let result = bad.facets.origin().expect("facet is present");
+        assert!(
+            result.is_err(),
+            "malformed/unknown origin must surface as Err, not vanish or coerce to NotDetermined"
         );
     }
 
