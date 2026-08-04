@@ -47,6 +47,22 @@
 //!    takes precedence, and the post-lockdown verification reads the
 //!    *merged* view, so a system-level re-enable is caught at boot.
 //!
+//!    That verification proves the OUTCOME (zero enabled extensions in the
+//!    merged view) but, on its own, never proves the LOCATION: if some
+//!    goose code path touched `Config::global()` before this function could
+//!    set `GOOSE_PATH_ROOT`, the cell is already bound elsewhere (goose
+//!    falls back to the OS default — `%APPDATA%\Block\goose\config\config.yaml`
+//!    on Windows) and every write above still lands there, still succeeds,
+//!    and the merged-view check still reports zero enabled extensions —
+//!    just about the wrong file, with the developer's real machine-wide
+//!    goose config silently overwritten instead. [`initialize`] therefore
+//!    also runs [`verify_config_landed_at_root`] before returning `Ok`:
+//!    goose's own `Config::path()` accessor names the file every write
+//!    above actually went through, compared against `root`'s own config
+//!    file, and a second, independent `Config` instance opened directly on
+//!    that file confirms its on-disk content — not merely its
+//!    existence — is the state this call just established.
+//!
 //! 4. **Provider** — pinned to `anthropic` (same `ANTHROPIC_API_KEY` env
 //!    var Roshera's own Claude provider uses) with the model Roshera
 //!    already defaults to, UNLESS the user has connected a Claude Max/Pro
@@ -84,7 +100,7 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Json, Response},
 };
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 /// Provider pinned as goose's default. Matches Roshera's own provider
@@ -162,6 +178,16 @@ pub(crate) enum GooseAcpError {
          change is re-enabling tool surface; refusing to boot with it live"
     )]
     LockdownIncomplete(Vec<String>),
+    #[error(
+        "the goose config lockdown could not be verified as applied to \
+         Roshera's own root '{root}': {detail}. goose::config::Config::global() \
+         is a process-lifetime OnceCell that binds to whatever GOOSE_PATH_ROOT \
+         resolves to at first touch — if any goose code path ran before this \
+         call could set that var, the pin/lockdown above still reported \
+         success, just written to a DIFFERENT file. Refusing to boot rather \
+         than certify a lockdown applied outside Roshera's own config space"
+    )]
+    ConfigLocationUnverified { root: String, detail: String },
     #[error(
         "roshera-mcp entry point '{0}' does not exist — the /acp surface cannot \
          inject Roshera's own MCP server without a built dist/index.js. Build it \
@@ -472,6 +498,141 @@ fn disable_platform_extension(key: &str) -> Result<(), GooseAcpError> {
     }
 }
 
+/// After the provider pin and extension lockdown, prove the config file
+/// goose ACTUALLY wrote through lives under `root` — not merely that a
+/// file exists at the path we expect there, which a stale leftover from
+/// an earlier boot (or an unrelated developer config) would also satisfy.
+/// See this module's threat-model doc, step 3, for the failure this
+/// closes: the *outcome* check (`LockdownIncomplete`) reads whatever file
+/// `Config::global()` is bound to and would report success even when
+/// that file is the wrong one; this checks the LOCATION and CONTENT of
+/// that file directly, and is complementary to — not a replacement for —
+/// the merged-view outcome check (that one alone also catches a
+/// *system*-layer re-enable underneath the right file, which this check
+/// does not see, since the read-back `Config` below opens only `root`'s
+/// own file with no system layer stacked under it).
+///
+/// `provider_after_pin` is `Config::global().get_goose_provider()`,
+/// captured by the caller immediately after the provider-pin branch runs
+/// (before the extension-disable loop) — passed in rather than re-derived
+/// here so the "what did this call just establish" answer is captured
+/// once, right after the write that establishes it, not re-asked of the
+/// same (possibly-misbound) global instance a second time inside this
+/// function.
+///
+/// Two checks, in order:
+///
+/// 1. **Location, via goose's own accessor.** [`goose::config::Config::path`]
+///    names the exact file every write above (`set_active_provider`,
+///    `disable_platform_extension`) went through. It is compared,
+///    canonicalized, against `root`'s own config file — never the other
+///    way around (a plain `is_file()` at the expected path would be
+///    exactly the existence-only trap this function exists to avoid: a
+///    stale or foreign file could sit there regardless of what
+///    `Config::global()` is actually bound to). Only `root` is
+///    canonicalized on the "expected" side — it was just created by
+///    [`initialize`]'s `create_dir_all` and is guaranteed to exist;
+///    `root/config/config.yaml` deliberately is NOT canonicalized before
+///    the comparison, because in the failure case this function exists to
+///    catch, that file does not exist at all (nothing ever wrote there).
+/// 2. **Content, via independent read-back.** A brand new, throwaway
+///    `Config` instance is opened directly on `root`'s config file —
+///    never touching `Config::global()`'s cell — and its
+///    `active_provider` / enabled-extension set are read straight off
+///    disk through it and compared against `provider_after_pin` and the
+///    empty extension set the lockdown loop just established. This is
+///    what makes "a file happens to exist at the right path" insufficient
+///    on its own: the file must also CONTAIN the state this exact call
+///    produced.
+fn verify_config_landed_at_root(
+    root: &Path,
+    provider_after_pin: Option<&str>,
+) -> Result<(), GooseAcpError> {
+    let root_canon = root
+        .canonicalize()
+        .map_err(|source| GooseAcpError::RootDir {
+            path: root.display().to_string(),
+            source,
+        })?;
+    let expected_path = root_canon
+        .join("config")
+        .join(goose::config::base::CONFIG_YAML_NAME);
+
+    let global = goose::config::Config::global();
+    let actual_path = PathBuf::from(global.path());
+    let actual_canon =
+        actual_path
+            .canonicalize()
+            .map_err(|source| GooseAcpError::ConfigLocationUnverified {
+                root: root.display().to_string(),
+                detail: format!(
+                    "goose's Config::global().path() ('{}') could not be \
+                 canonicalized: {source} — the file every write above just \
+                 went through cannot be located on disk",
+                    actual_path.display(),
+                ),
+            })?;
+
+    if actual_canon != expected_path {
+        return Err(GooseAcpError::ConfigLocationUnverified {
+            root: root.display().to_string(),
+            detail: format!(
+                "goose's Config::global() is writing through '{}', not \
+                 '{}' — the config OnceCell must have been bound by some \
+                 other goose code path before this call could set \
+                 GOOSE_PATH_ROOT",
+                actual_canon.display(),
+                expected_path.display(),
+            ),
+        });
+    }
+
+    // Independent instance: opened directly on the file check 1 just
+    // proved IS the one `Config::global()` is bound to, but this read
+    // never goes through that global cell — a fresh `Config::new` reads
+    // straight off disk.
+    let read_back = goose::config::Config::new(&expected_path, "roshera-lockdown-verify").map_err(
+        |source| GooseAcpError::Config {
+            what: "opening the lockdown's own config file for read-back verification",
+            source,
+        },
+    )?;
+
+    let provider_on_disk = goose::config::get_active_provider(&read_back);
+    let provider_matches =
+        provider_after_pin.is_some_and(|expected| provider_on_disk.as_deref() == Some(expected));
+    if !provider_matches {
+        return Err(GooseAcpError::ConfigLocationUnverified {
+            root: root.display().to_string(),
+            detail: format!(
+                "'{}' read back active_provider={provider_on_disk:?}, which \
+                 does not match what this call just pinned \
+                 ({provider_after_pin:?})",
+                expected_path.display(),
+            ),
+        });
+    }
+
+    let still_enabled_on_disk: Vec<String> =
+        goose::config::extensions::get_enabled_extensions_with_config(&read_back)
+            .iter()
+            .map(|extension| extension.name())
+            .collect();
+    if !still_enabled_on_disk.is_empty() {
+        return Err(GooseAcpError::ConfigLocationUnverified {
+            root: root.display().to_string(),
+            detail: format!(
+                "'{}' read back {still_enabled_on_disk:?} as still enabled — \
+                 the extension lockdown this call just performed is not \
+                 reflected on disk at the verified location",
+                expected_path.display(),
+            ),
+        });
+    }
+
+    Ok(())
+}
+
 /// One-time goose lockdown. Must run before ANY goose code path is
 /// touched: `Config::global()` is a `OnceCell` that captures
 /// `GOOSE_PATH_ROOT` at first use, so a late call silently configures
@@ -507,6 +668,12 @@ fn disable_platform_extension(key: &str) -> Result<(), GooseAcpError> {
 ///    holds for EITHER pin branch below — `repin_goose_to_claude_code`
 ///    itself calls `set_active_provider` first, so it materializes
 ///    `config.yaml` exactly the same way the default branch does.
+/// 3. [`verify_config_landed_at_root`] LAST among config-affecting steps,
+///    after the extension lockdown's own merged-view check has already
+///    passed: it needs the writes above to have already happened (it is
+///    proving where and what they wrote), and it is the gate on this
+///    function's `Ok` return — see its own doc for what it proves and why
+///    a plain existence check at the expected path would not be enough.
 pub(crate) fn initialize(
     provider_pin: &crate::ai_provider_config::BootProviderPin,
 ) -> Result<PathBuf, GooseAcpError> {
@@ -613,6 +780,12 @@ pub(crate) fn initialize(
         }
     }
 
+    // Captured now, right after the write that establishes it, for
+    // `verify_config_landed_at_root` below — the read-back proof must
+    // compare against what THIS call just pinned, not re-derive it a
+    // second time from the same (possibly-misbound) global instance.
+    let provider_after_pin = config.get_goose_provider().ok();
+
     // Disable EVERY entry in goose's platform-extension registry — the
     // registry itself is the source of truth, not a hand-maintained list,
     // so an upstream rev bump that adds an extension (or flips a
@@ -641,6 +814,11 @@ pub(crate) fn initialize(
     if !still_enabled.is_empty() {
         return Err(GooseAcpError::LockdownIncomplete(still_enabled));
     }
+
+    // The outcome is proven closed; now prove it is closed at the right
+    // LOCATION — see verify_config_landed_at_root's doc and this module's
+    // threat-model step 3 for the clobbering failure this closes.
+    verify_config_landed_at_root(&root, provider_after_pin.as_deref())?;
 
     // Resolve the MCP entry point last, after the lockdown itself has
     // proven closed — a build that boots with a live tool surface must
@@ -1135,6 +1313,16 @@ async fn inject_roshera_mcp_server(
 /// so the label can never claim a model Roshera did not itself resolve.
 /// Each half fails independently to [`UNKNOWN_MODEL_LABEL`] rather than
 /// a plausible-looking guess.
+///
+/// ⚠ Test discipline: this is a READ of goose's process-lifetime
+/// `Config::global()` `OnceCell` — any test in this binary whose call
+/// graph reaches it (every `mint_agent_session_key` caller, including
+/// the injection middleware) must call the test module's
+/// `claim_goose_config_cell()` before its first goose touch, or it
+/// claims the cell against an arbitrary root and strands the lockdown
+/// test's config writes. This exact function was the unaccounted-for
+/// claimant behind the deterministic parallel-run failure of
+/// `goose_lockdown_leaves_exactly_roshera_reachable`.
 fn goose_agent_model_label() -> String {
     let config = goose::config::Config::global();
     let provider = config
@@ -1196,11 +1384,11 @@ async fn mint_agent_session_key(
 /// `handlers/ai_provider.rs::resolve_requested_model`) is a **true
 /// no-op**: this function returns `Ok(())` before ever calling
 /// `goose::config::Config::global()`. That ordering is load-bearing, not
-/// cosmetic — `goose_acp`'s own test module documents exactly one test
-/// (`goose_lockdown_leaves_exactly_roshera_reachable`) as the sole owner
-/// of that process-global `OnceCell` in this binary; every other test
-/// that exercises this middleware relies on the `None` path never
-/// touching it.
+/// cosmetic — `goose_lockdown_leaves_exactly_roshera_reachable` is the
+/// only test in this binary allowed to WRITE goose config, and every
+/// other test that exercises this middleware relies on the `None` path
+/// never writing (`set_goose_model`) into the shared root that test
+/// asserts against (see the test module's `claim_goose_config_cell`).
 ///
 /// When `explicit_model` is `Some`, this calls goose's own
 /// `Config::set_goose_model`, which resolves the CURRENTLY active
@@ -1301,6 +1489,100 @@ mod tests {
         }
     }
 
+    /// Claims goose's process-lifetime `Config::global()` `OnceCell` —
+    /// exactly once per test process, against ONE stable root — and
+    /// returns that root. Every test in this binary that reaches ANY
+    /// goose config code path MUST call this before its first goose
+    /// touch. Today that is the lockdown test below plus everything that
+    /// goes through `mint_agent_session_key` → [`goose_agent_model_label`]
+    /// (the four `mint_*` tests and
+    /// `inject_roshera_mcp_server_strips_hostile_mcp_servers` via the
+    /// injection middleware) — the code path the previous
+    /// "only-one-test-touches-goose-config" invariant overlooked while
+    /// guarding `apply_configured_model`'s `None` path.
+    ///
+    /// Why this exists: production has a boot — `main()` calls
+    /// [`initialize`] before anything can touch a goose type, so the cell
+    /// always captures `GOOSE_PATH_ROOT` after the lockdown set it. A
+    /// test binary has no boot: under the default parallel runner,
+    /// whichever test touched goose first claimed the cell for the whole
+    /// process, and `goose_lockdown_leaves_exactly_roshera_reachable`
+    /// then materialized its config file wherever the cell already
+    /// pointed (`GOOSE_PATH_ROOT` unset ⇒ the OS-default goose directory
+    /// — the developer's real config) while asserting against the root
+    /// it intended. `process_env_test_lock` cannot close that: it
+    /// serializes env WRITES, but a `OnceCell` first-touch happens once
+    /// per process and the winner is permanent. The only sound ordering
+    /// is to make the claim itself deterministic — this function —
+    /// rather than accidental.
+    ///
+    /// The lockdown test boots `initialize()` into this SAME root
+    /// (`ROSHERA_GOOSE_ROOT`), so its config writes land exactly where
+    /// the already-claimed cell points and every assertion keeps its full
+    /// strength. It remains the ONLY test permitted to call
+    /// `initialize()` — i.e. to WRITE goose config; this helper only
+    /// claims the cell and leaves reads live. Sibling claimants must stay
+    /// read-only against goose config
+    /// (`apply_configured_model_is_a_true_noop_without_touching_goose_config_when_none`
+    /// guards the one write path they could otherwise reach).
+    ///
+    /// ⚠ Deadlock discipline: this acquires [`process_env_test_lock`]
+    /// internally (the `set_var` is a process-env write like any other),
+    /// so callers must NOT hold that lock while calling it — the
+    /// lockdown test calls this FIRST, before taking its own guard. An
+    /// env-lock holder that never calls this function cannot deadlock
+    /// with it.
+    fn claim_goose_config_cell() -> &'static PathBuf {
+        static CLAIMED_ROOT: OnceLock<PathBuf> = OnceLock::new();
+        CLAIMED_ROOT.get_or_init(|| {
+            let root = std::env::temp_dir()
+                .join(format!("roshera-goose-test-root-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&root).expect("the shared goose test root must be creatable");
+            let _guard = crate::ai_provider_config::process_env_test_lock()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            std::env::set_var("GOOSE_PATH_ROOT", &root);
+            // THE claim: the cell captures GOOSE_PATH_ROOT here and never
+            // again for the life of the process. Config VALUE reads stay
+            // live — only the path is frozen.
+            let _ = goose::config::Config::global();
+            root
+        })
+    }
+
+    /// Serializes the two tests in this binary that are allowed to call
+    /// `initialize()` for real —
+    /// `goose_lockdown_leaves_exactly_roshera_reachable` and
+    /// `initialize_refuses_when_the_config_cell_is_bound_elsewhere` — so
+    /// they never write goose config concurrently.
+    ///
+    /// Why a second lock, distinct from [`process_env_test_lock`]: that
+    /// one guards process-env `set_var`/`remove_var` calls, and the
+    /// lockdown test already drops it right after its env-var assertions
+    /// (deliberately — nothing further mutates env vars). But the
+    /// discriminating location-check test below reproduces the real
+    /// clobbering bug on purpose: it asks `initialize()` for a root the
+    /// config cell is NOT bound to, which means the write still lands in
+    /// the shared root [`claim_goose_config_cell`] hands out — the same
+    /// file `goose_lockdown_leaves_exactly_roshera_reachable` pins
+    /// `active_provider` in and asserts against. Without a lock spanning
+    /// BOTH tests' full bodies (write through to their own assertions,
+    /// not just the env-var window), the two could interleave their
+    /// writes to that one file under the default parallel runner and
+    /// either could observe the other's `active_provider` value.
+    ///
+    /// Safe to leave unheld by every other test in this file: the
+    /// `mint_*` tests and `inject_roshera_mcp_server_strips_hostile_mcp_servers`
+    /// also read through the shared cell (via `goose_agent_model_label`)
+    /// but never assert on the specific provider/model STRING it
+    /// resolves to — only on permission sets and `mcpServers` shape — so
+    /// a transient `active_provider` value from either lock-holder
+    /// passing through does not affect them.
+    fn goose_config_content_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
     /// THE proving test of slices 1+2: after the production boot
     /// sequence (`initialize()`), the reachable extension set on a
     /// session built the way goose's ACP `session/new` actually builds
@@ -1328,8 +1610,13 @@ mod tests {
     ///
     /// Process-global by nature (GOOSE_PATH_ROOT + goose's Config
     /// OnceCell): this must remain the only test in this binary that
-    /// touches goose config, and it must set the env var before the first
-    /// goose call.
+    /// WRITES goose config (the only `initialize()` caller). The cell
+    /// itself is claimed deterministically by [`claim_goose_config_cell`]
+    /// — which this test calls first and whose root it boots into — so
+    /// sibling tests that merely READ goose config
+    /// (`goose_agent_model_label` via `mint_agent_session_key`) can no
+    /// longer race this test for the first touch and strand its config
+    /// writes in the OS-default goose directory.
     ///
     /// It ALSO doubles as the sole integration proof for the "boot
     /// clobbers the saved provider" fix: `resolve_boot_provider_pin`'s
@@ -1343,6 +1630,26 @@ mod tests {
     /// unaffected by which provider is pinned.
     #[tokio::test]
     async fn goose_lockdown_leaves_exactly_roshera_reachable() {
+        // Held for this test's ENTIRE body, through every content
+        // assertion below — see `goose_config_content_lock`'s doc for why
+        // this must span more than just the env-var window
+        // `process_env_test_lock` already covers, now that a second test
+        // in this binary (`initialize_refuses_when_the_config_cell_is_bound_elsewhere`)
+        // also writes through the shared claimed root.
+        let _content_guard = goose_config_content_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        // FIRST — and before the env lock (see the helper's deadlock
+        // note): deterministically claim goose's Config OnceCell against
+        // the shared root this test then boots `initialize()` into.
+        // Without this, any sibling test reaching
+        // `goose_agent_model_label()` could claim the cell first, and
+        // `initialize()`'s config writes would land wherever the cell
+        // already pointed while the assertions below check the root it
+        // intended — the deterministic parallel-run failure this closes.
+        let root = claim_goose_config_cell().clone();
+
         // Acquired HERE — above the first `set_var`, not just above the
         // ANTHROPIC sentinels further down. This test overrides four
         // process-global variables, and `ROSHERA_AGENT_WORKSPACE` is read
@@ -1355,8 +1662,6 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 
-        let root =
-            std::env::temp_dir().join(format!("roshera-goose-lockdown-{}", uuid::Uuid::new_v4()));
         std::env::set_var("ROSHERA_GOOSE_ROOT", &root);
         // Isolated from the real `state/agent-workspace` for the same
         // reason `ROSHERA_GOOSE_ROOT` is isolated above: this test must
@@ -1552,6 +1857,91 @@ mod tests {
         );
     }
 
+    /// THE discriminating test: `initialize()` must refuse — not report
+    /// `Ok` — when goose's config `OnceCell` is already bound to a root
+    /// OTHER than the one this call was asked to use. This is the test
+    /// that would have caught the real-config clobbering described in
+    /// this module's threat-model doc: before `verify_config_landed_at_root`
+    /// existed, this exact scenario made `initialize()` return `Ok` with
+    /// the provider pin and extension lockdown silently written to the
+    /// wrong file while every existing check reported success.
+    ///
+    /// Reuses [`claim_goose_config_cell`]'s shared root as the "already
+    /// bound elsewhere" location. This is the only sound choice:
+    /// `Config::global()`'s `OnceCell` is process-lifetime, so there is no
+    /// way to construct a SECOND independent binding to test against —
+    /// the shared root IS "elsewhere" relative to whatever fresh root
+    /// this test asks `initialize()` for. That means this call's provider
+    /// pin and extension lockdown genuinely write into the shared root's
+    /// real `config.yaml` — the same file `goose_lockdown_leaves_exactly_roshera_reachable`
+    /// depends on — which is exactly why both tests hold
+    /// [`goose_config_content_lock`] across their entire bodies (see that
+    /// helper's doc for the race this closes).
+    ///
+    /// Uses the `Default` provider-pin branch deliberately: it never
+    /// spawns a claude-code CLI and needs no ANTHROPIC_* scrub-timing
+    /// dance, keeping this test's only variable the one under test.
+    ///
+    /// ## Skipped: "a stale config.yaml at the expected path does not
+    /// satisfy the check"
+    ///
+    /// That scenario cannot be constructed against this implementation,
+    /// by design rather than by omission: `verify_config_landed_at_root`
+    /// never asks "does a file exist at the expected path" in the first
+    /// place — it asks goose's own `Config::global().path()` accessor
+    /// WHERE it is currently writing, and only then reads that location's
+    /// content back. A stale/foreign file sitting at `root/config/config.yaml`
+    /// while the cell is bound elsewhere fails the location check (the
+    /// path accessor reports the OTHER location) before that file is
+    /// ever opened — exactly the case this test proves. A stale value at
+    /// `root/config/config.yaml` while the cell IS correctly bound to
+    /// `root` cannot exist at the moment the check runs either: the
+    /// provider-pin write earlier in the SAME `initialize()` call already
+    /// overwrote that exact file through that exact cell. Pre-seeding a
+    /// "stale" file at the expected path in a test would just have its
+    /// content overwritten before the check ever reads it — asserting
+    /// nothing this design does not already guarantee by construction.
+    #[tokio::test]
+    async fn initialize_refuses_when_the_config_cell_is_bound_elsewhere() {
+        // Held for this test's entire body — see the helper's doc.
+        let _content_guard = goose_config_content_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let claimed_root = claim_goose_config_cell().clone();
+
+        let env_guard = crate::ai_provider_config::process_env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        // Deliberately NOT the claimed root: initialize() is asked for a
+        // location the cell was never bound to.
+        let mismatched_root = std::env::temp_dir().join(format!(
+            "roshera-goose-mismatched-root-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::env::set_var("ROSHERA_GOOSE_ROOT", &mismatched_root);
+        let agent_workspace = std::env::temp_dir().join(format!(
+            "roshera-agent-workspace-mismatch-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::env::set_var("ROSHERA_AGENT_WORKSPACE", &agent_workspace);
+
+        let result = initialize(&crate::ai_provider_config::BootProviderPin::Default);
+        drop(env_guard);
+
+        match result {
+            Err(GooseAcpError::ConfigLocationUnverified { .. }) => {}
+            other => panic!(
+                "initialize() must refuse with ConfigLocationUnverified when \
+                 the config cell is already bound to '{}' — a root OTHER \
+                 than the '{}' this call requested — but got {other:?}",
+                claimed_root.display(),
+                mismatched_root.display(),
+            ),
+        }
+    }
+
     async fn echo_body(bytes: axum::body::Bytes) -> Response {
         Response::new(Body::from(bytes))
     }
@@ -1569,11 +1959,13 @@ mod tests {
     /// A fresh, provably-empty `AiProviderManager` pointed at a private
     /// temp path (`boot_at`, not `boot`) — no stored model, so
     /// `apply_configured_model`'s `None` early return fires and this
-    /// router never touches `goose::config::Config::global()`. That
-    /// keeps this test binary's single-Config-touching-test invariant
-    /// (see `goose_lockdown_leaves_exactly_roshera_reachable`'s doc)
-    /// intact even though the injection middleware now consults an
-    /// `AiProviderManager` on every call.
+    /// router never WRITES goose config through that path. (The
+    /// middleware still READS `Config::global()` unconditionally, via
+    /// `mint_agent_session_key` → [`goose_agent_model_label`] — which is
+    /// why every test driving it must call [`claim_goose_config_cell`]
+    /// first. Keeping the model override `None` is what keeps those
+    /// tests read-only against the shared root the lockdown test also
+    /// boots into.)
     fn test_ai_provider_manager() -> Arc<crate::ai_provider_config::AiProviderManager> {
         let dir = std::env::temp_dir().join(format!(
             "roshera-goose-acp-ai-provider-test-{}",
@@ -1596,16 +1988,18 @@ mod tests {
     /// Guards the ordering invariant `apply_configured_model`'s own doc
     /// comment depends on: with no override persisted (`None`), the
     /// function must return `Ok(())` via its early return WITHOUT ever
-    /// calling `goose::config::Config::global()`. This is what makes it
-    /// safe for `inject_roshera_mcp_server_strips_hostile_mcp_servers`
-    /// (below) to exercise this middleware without becoming a second
-    /// owner of that process-global `OnceCell` — if a regression made
-    /// this eagerly resolve the active provider even for `None`, this
-    /// test would still pass in isolation but the sibling test would
-    /// start racing `goose_lockdown_leaves_exactly_roshera_reachable`
-    /// under the default parallel test runner. Safe to run alongside
-    /// every other test in this file precisely because it never touches
-    /// `Config::global()`.
+    /// calling `goose::config::Config::global()`. This is what keeps
+    /// `inject_roshera_mcp_server_strips_hostile_mcp_servers` (below)
+    /// READ-only against goose config: the middleware already reads the
+    /// cell via `goose_agent_model_label` (claimed deterministically by
+    /// [`claim_goose_config_cell`]), but a regression that made this
+    /// eagerly call `set_goose_model` even for `None` would turn that
+    /// sibling into a second WRITER of the shared root — racing the
+    /// provider/model assertions
+    /// `goose_lockdown_leaves_exactly_roshera_reachable` makes against
+    /// the config file under the default parallel test runner. Safe to
+    /// run alongside every other test in this file precisely because it
+    /// never touches `Config::global()`.
     #[test]
     fn apply_configured_model_is_a_true_noop_without_touching_goose_config_when_none() {
         assert!(apply_configured_model(None).is_ok());
@@ -1670,12 +2064,12 @@ mod tests {
     ///
     /// Deliberately does NOT call `with_hints` itself or
     /// `get_context_filenames()`: both touch `goose::config::Config::global()`
-    /// (a process-lifetime `OnceCell`), and this binary has exactly one test
-    /// permitted to touch it (`goose_lockdown_leaves_exactly_roshera_reachable`,
-    /// see its own doc comment on why touching it a second time would race).
-    /// `load_hint_files`/`build_gitignore`/`GOOSE_HINTS_FILENAME` are pure
-    /// filesystem reads with no `Config` dependency, so this test is safe to
-    /// run alongside that one under the default parallel test runner.
+    /// (a process-lifetime `OnceCell`), and any test reaching it must first
+    /// claim it via [`claim_goose_config_cell`] — a dependency this test has
+    /// no reason to take on. `load_hint_files`/`build_gitignore`/
+    /// `GOOSE_HINTS_FILENAME` are pure filesystem reads with no `Config`
+    /// dependency, so this test is safe to run alongside every other test
+    /// in this file under the default parallel test runner, with no claim.
     #[test]
     fn goosehints_policy_reaches_the_system_prompt() {
         let workspace =
@@ -1719,6 +2113,10 @@ mod tests {
 
     #[tokio::test]
     async fn inject_roshera_mcp_server_strips_hostile_mcp_servers() {
+        // The middleware reads goose's Config cell on every session RPC
+        // (`mint_agent_session_key` → `goose_agent_model_label`) — claim
+        // it against the shared root before the first touch.
+        claim_goose_config_cell();
         let _ = MCP_ENTRY_PATH
             .set(resolve_mcp_entry_path().expect("roshera-mcp dist must be built for this proof"));
 
@@ -1805,6 +2203,9 @@ mod tests {
     /// agent key.
     #[tokio::test]
     async fn mint_agent_session_key_carries_the_initiating_users_permissions() {
+        // Minting reads goose's Config cell (`goose_agent_model_label`)
+        // — claim it against the shared root before the first touch.
+        claim_goose_config_cell();
         let auth_manager = test_auth_manager();
         let auth_info = AuthInfo {
             user_id: "principal-user".to_string(),
@@ -1856,6 +2257,8 @@ mod tests {
     /// holds exactly that set — nothing manufactured, nothing widened.
     #[tokio::test]
     async fn mint_agent_session_key_never_grants_a_permission_the_user_lacks() {
+        // Minting reads goose's Config cell — see the claim helper's doc.
+        claim_goose_config_cell();
         let auth_manager = test_auth_manager();
         let auth_info = AuthInfo {
             user_id: "narrow-user".to_string(),
@@ -1885,6 +2288,8 @@ mod tests {
     /// justified narrowing this module still performs.
     #[tokio::test]
     async fn mint_agent_session_key_withholds_deny_listed_permissions() {
+        // Minting reads goose's Config cell — see the claim helper's doc.
+        claim_goose_config_cell();
         let auth_manager = test_auth_manager();
         let auth_info = AuthInfo {
             user_id: "admin-user".to_string(),
@@ -1930,6 +2335,8 @@ mod tests {
     /// what happened live tonight.
     #[tokio::test]
     async fn minted_agent_key_permissions_survive_the_full_auth_round_trip() {
+        // Minting reads goose's Config cell — see the claim helper's doc.
+        claim_goose_config_cell();
         let auth_manager = test_auth_manager();
         let granted = vec![
             session_manager::Permission::ViewGeometry,
