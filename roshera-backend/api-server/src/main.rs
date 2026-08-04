@@ -5159,6 +5159,27 @@ async fn import_ros_geometry(
     let prov_command_count = ros.aipr.commands.len();
     let prov_session_id = ros.aipr.session;
 
+    // Signature verdict — three states, never a bool: "unsigned" and
+    // "signature failed" are different facts and must not collapse.
+    // (A header that CLAIMS a signature over a file with no SIGN chunk
+    // never reaches here — import_ros refuses it with a typed error.)
+    let signature_json = match &ros.signature {
+        export_engine::formats::ros::RosSignatureVerdict::Unsigned => {
+            serde_json::json!({ "status": "unsigned" })
+        }
+        export_engine::formats::ros::RosSignatureVerdict::Verified {
+            signer_id,
+            public_key,
+        } => serde_json::json!({
+            "status": "verified",
+            "signer_id": signer_id,
+            "public_key": public_key,
+        }),
+        export_engine::formats::ros::RosSignatureVerdict::Invalid { reason } => {
+            serde_json::json!({ "status": "invalid", "reason": reason })
+        }
+    };
+
     let imported = ros.into_model().map_err(|e| {
         ApiError::new(
             ErrorCode::InvalidParameter,
@@ -5213,6 +5234,7 @@ async fn import_ros_geometry(
             "hist_branch_count": hist_branch_count,
             "prov_command_count": prov_command_count,
             "prov_session_id": prov_session_id,
+            "signature": signature_json,
         },
     })))
 }

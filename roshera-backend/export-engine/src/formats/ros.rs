@@ -14,12 +14,29 @@
 //! ├── GEOM  (MessagePack)  — BRepSnapshot. OPTIONAL cache.
 //! └── SIGN  (MessagePack)  — Ed25519 signature. OPTIONAL.
 //! ```
+//!
+//! ## Signing
+//!
+//! When `RosExportOptions::sign` is true the writer computes a SHA-256
+//! Merkle root over the ON-DISK bytes of every content chunk (META,
+//! HIST, PROV, GEOM — in chunk-table order), signs that root with the
+//! caller-supplied Ed25519 key, and stores the signature in a SIGN
+//! chunk. The header's signature claim is set in the same function that
+//! writes the chunk, after it is written — no code path can produce a
+//! header that claims a signature the file does not carry. On import
+//! the root is recomputed from the raw file bytes and the signature is
+//! verified; the result is a three-state [`RosSignatureVerdict`], never
+//! a bool, because "unsigned" and "signature failed" are different
+//! facts. A header that claims a signature over a file with no SIGN
+//! chunk is a hard error — that is a forged claim, not a warning.
 
 use crate::formats::ros_snapshot::BRepSnapshot;
 use crate::formats::timeline_chunk::{BranchManifest, HistChunk};
 use geometry_engine::primitives::topology_builder::BRepModel;
 use ros_format::keys::{KeyManager, SoftwareKeyManager};
-use ros_format::util::current_time_ms;
+use ros_format::merkle::{HashAlgorithm, MerkleTree};
+use ros_format::signature::{FileSigner, SignatureAlgorithm, SignatureChunk, SignatureVerifier};
+use ros_format::util::{current_time_ms, sha256, to_hex};
 use ros_format::{
     self, AICommandTracker, Chunk, ChunkType, PrivacySettings, ProvChunk, TrackingLevel,
     CHUNK_INDEX_ENTRY_SIZE,
@@ -85,13 +102,14 @@ pub struct RosExportOptions {
     /// AI provenance tracking level for the PROV chunk header.
     pub tracking_level: TrackingLevel,
 
-    /// Sign the file with Ed25519 (writer must also supply a key — the
-    /// signature itself is currently emitted with a fresh per-file
-    /// key; multi-signer support was removed in slice 1).
+    /// Sign the file with Ed25519. Requires `signing_key`; `sign: true`
+    /// with no key is a typed refusal, not a silently minted throwaway
+    /// key — a signature from a per-file ephemeral key proves nothing
+    /// about who authored the file, and an IP-attribution artifact must
+    /// not carry a meaningless signature dressed up as a real one.
     pub sign: bool,
 
-    /// Optional Ed25519 signing key (32 bytes). When `sign` is true
-    /// and this is `None`, a fresh key is generated for the file.
+    /// Ed25519 signing key (32 bytes). Mandatory when `sign` is true.
     pub signing_key: Option<[u8; 32]>,
 
     /// Encrypt chunks with the given password. `Some(_)` enables
@@ -123,6 +141,43 @@ impl Default for RosExportOptions {
     }
 }
 
+/// Signature verdict for an imported .ros file.
+///
+/// Deliberately an enum, never a bool: "the file carries no signature"
+/// and "the file carries a signature that does not verify" are
+/// different facts and must not collapse into each other.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RosSignatureVerdict {
+    /// The file neither claims nor carries a signature.
+    Unsigned,
+    /// The SIGN chunk's Ed25519 signature verifies against the Merkle
+    /// root of the file's on-disk chunk bytes.
+    ///
+    /// `public_key` (hex) is the authenticated fact: the holder of this
+    /// key signed exactly these bytes. `signer_id` (hex) is metadata
+    /// CARRIED by the signature record, not independently proven.
+    Verified {
+        signer_id: String,
+        public_key: String,
+    },
+    /// A signature is present but does not verify — the file was
+    /// modified after signing, the signature was transplanted, or the
+    /// SIGN chunk is malformed.
+    Invalid { reason: String },
+}
+
+/// What the writer reports about signing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RosWriteSignature {
+    /// `options.sign` was false; no SIGN chunk, no header claim.
+    Unsigned,
+    /// A SIGN chunk was written and the header claims it. Both hex.
+    Signed {
+        signer_id: String,
+        public_key: String,
+    },
+}
+
 /// Reader output. `snapshot` is `None` when the file omitted the
 /// optional GEOM chunk; callers may rebuild geometry by replaying
 /// `timeline` against a fresh `BRepModel`.
@@ -131,6 +186,9 @@ pub struct RosImport {
     pub branches: Vec<BranchManifest>,
     pub aipr: ProvChunk,
     pub snapshot: Option<BRepSnapshot>,
+    /// Signature verdict, computed against the raw on-disk bytes before
+    /// any chunk is decrypted or parsed.
+    pub signature: RosSignatureVerdict,
 }
 
 impl RosImport {
@@ -174,6 +232,10 @@ pub struct RosWriteSummary {
     /// Session id recorded in PROV (freshly opened when no tracker was
     /// supplied — still a real, file-carried id).
     pub prov_session_id: u64,
+    /// Whether a SIGN chunk was written, and with which key. This is
+    /// the writer's own report from the write site — a file whose
+    /// header claims a signature always has the chunk this reports.
+    pub signature: RosWriteSignature,
 }
 
 /// Export a B-Rep model + timeline + provenance to .ros v3.1.
@@ -230,9 +292,9 @@ pub async fn export_brep_to_ros(
     // PROV is always present in v3.1, so the AI-provenance flag is
     // unconditionally set. The tracking level is taken from options.
     header = header.with_ai_tracking(options.tracking_level as u8);
-    if options.sign {
-        header = header.with_signature(1);
-    }
+    // NOTE: the header's signature claim is NOT set here. It is set by
+    // `append_sign_chunk`, in the same statement group that pushes the
+    // SIGN chunk, so the claim cannot exist without the chunk.
     let mut header = header.build();
 
     let mut chunks: Vec<Chunk> = Vec::new();
@@ -298,6 +360,27 @@ pub async fn export_brep_to_ros(
         )?);
     }
 
+    // SIGN chunk (optional) -------------------------------------------
+    let signature = match (options.sign, options.signing_key) {
+        (false, _) => RosWriteSignature::Unsigned,
+        // REFUSAL, not a convenience fallback: minting a fresh per-file
+        // key here (the old behaviour) produces a signature that proves
+        // the bytes are self-consistent and proves NOTHING about who
+        // authored them. For an IP-attribution artifact that is an
+        // approximation labelled as exact, so it is refused outright.
+        (true, None) => {
+            return Err(ExportError::ExportFailed {
+                reason: "REFUSED: sign=true requires a caller-supplied Ed25519 \
+                         signing key (RosExportOptions::signing_key). A freshly \
+                         minted per-file key would prove nothing about \
+                         authorship, so no signature is emitted rather than a \
+                         meaningless one."
+                    .to_string(),
+            })
+        }
+        (true, Some(key_bytes)) => append_sign_chunk(&mut chunks, &mut header, &key_bytes)?,
+    };
+
     // Layout -----------------------------------------------------------
     let mut current_offset: u64 = 128;
     for chunk in &mut chunks {
@@ -346,6 +429,62 @@ pub async fn export_brep_to_ros(
         hist_branch_count,
         prov_command_count,
         prov_session_id,
+        signature,
+    })
+}
+
+/// Sign the content chunks and append the SIGN chunk.
+///
+/// This is the ONLY site that sets the header's signature claim, and it
+/// does so immediately after the chunk is pushed, with no fallible call
+/// in between — so no reachable state has the claim without the chunk.
+///
+/// What is signed: the SHA-256 Merkle root over the ON-DISK bytes of
+/// every chunk already in `chunks` (META, HIST, PROV, GEOM), in
+/// chunk-table order. For encrypted files these are the
+/// POST-ENCRYPTION bytes as they land on disk — chosen deliberately so
+/// a verifier can check the signature against the raw file WITHOUT the
+/// password. The SIGN chunk itself is never encrypted for the same
+/// reason.
+fn append_sign_chunk(
+    chunks: &mut Vec<Chunk>,
+    header: &mut ros_format::FileHeader,
+    key_bytes: &[u8; 32],
+) -> Result<RosWriteSignature, ExportError> {
+    let leaves: Vec<Vec<u8>> = chunks.iter().map(|c| c.data.clone()).collect();
+    let tree = MerkleTree::from_leaves(leaves, HashAlgorithm::Sha256).map_err(ros_err)?;
+    let root = tree
+        .root_hash()
+        .ok_or_else(|| ExportError::ExportFailed {
+            reason: "cannot sign a file with no content chunks (empty Merkle tree)".to_string(),
+        })?
+        .to_vec();
+
+    // The signer id is derived from the public key (first 16 bytes of
+    // SHA-256 of the verifying key) so the same key always names the
+    // same signer, with no separate identity registry to drift.
+    let probe = FileSigner::from_bytes(key_bytes, [0u8; 16]).map_err(ros_err)?;
+    let public_key = probe.verifying_key_bytes();
+    let mut signer_id = [0u8; 16];
+    signer_id.copy_from_slice(&sha256(&public_key)[..16]);
+    let signer = FileSigner::from_bytes(key_bytes, signer_id).map_err(ros_err)?;
+
+    let record = signer.sign_file(&root, header.file_uuid).map_err(ros_err)?;
+    let sign_bytes = SignatureChunk::new(record).serialize();
+    if sign_bytes.is_empty() {
+        return Err(ExportError::ExportFailed {
+            reason: "SIGN chunk serialization produced no bytes".to_string(),
+        });
+    }
+
+    // Chunk first, claim second — adjacent, infallible, same function.
+    chunks.push(Chunk::new(ChunkType::SIGN, sign_bytes));
+    header.signature_algo = SignatureAlgorithm::Ed25519 as u8;
+    header.feature_flags = header.feature_flags.with_signature();
+
+    Ok(RosWriteSignature::Signed {
+        signer_id: to_hex(&signer_id),
+        public_key: to_hex(&public_key),
     })
 }
 
@@ -437,6 +576,12 @@ pub async fn import_ros(
             reason: format!("Chunk table failed v3.1 validation: {}", e),
         })?;
 
+    // Signature verdict — computed against the RAW on-disk bytes before
+    // any chunk is decrypted or parsed, so a tampered file still gets
+    // an honest verdict even if its payloads also fail to parse, and an
+    // encrypted file verifies without the password.
+    let signature = signature_verdict(&cursor, &header, &chunk_table)?;
+
     let hist_chunk = read_chunk_payload::<HistChunk>(
         &mut cursor,
         &chunk_table,
@@ -470,7 +615,111 @@ pub async fn import_ros(
         branches: hist_chunk.branches,
         aipr: prov_chunk,
         snapshot,
+        signature,
     })
+}
+
+/// Compute the signature verdict for a file whose header and chunk
+/// table have been read.
+///
+/// - Header claims nothing, no SIGN chunk → `Unsigned`.
+/// - Header claims a signature, no SIGN chunk → HARD typed error. This
+///   exact state is what every file written by the pre-fix code looks
+///   like (flag set, nothing signed): a forged provenance claim, never
+///   a warning, never a silent pass.
+/// - SIGN chunk present (claimed or not) → recompute the Merkle root
+///   over the on-disk bytes of every non-SIGN chunk in chunk-table
+///   order and verify the Ed25519 signature against it.
+fn signature_verdict(
+    cursor: &Cursor<Vec<u8>>,
+    header: &ros_format::FileHeader,
+    table: &ros_format::chunk::ChunkTable,
+) -> Result<RosSignatureVerdict, ExportError> {
+    let sign_entry = table.find_by_type(ChunkType::SIGN);
+    let header_claims = header.feature_flags.has_signature() || header.signature_algo != 0;
+
+    let entry = match (header_claims, sign_entry) {
+        (false, None) => return Ok(RosSignatureVerdict::Unsigned),
+        (true, None) => {
+            return Err(ExportError::ExportFailed {
+                reason: "header claims an Ed25519 signature but the file \
+                         contains no SIGN chunk — the signature claim is \
+                         forged (or the file was written by a broken signer); \
+                         refusing to import"
+                    .to_string(),
+            })
+        }
+        // A carried signature is verified whether or not the header
+        // remembered to claim it — the chunk is the substantive fact.
+        (_, Some(entry)) => entry,
+    };
+
+    let file = cursor.get_ref();
+    let sign_bytes = raw_chunk_bytes(file, entry)?;
+    let sig_chunk = match SignatureChunk::deserialize(sign_bytes) {
+        Ok(c) => c,
+        Err(e) => {
+            return Ok(RosSignatureVerdict::Invalid {
+                reason: format!("SIGN chunk failed to deserialize: {}", e),
+            })
+        }
+    };
+
+    // Recompute the Merkle root over exactly the bytes the writer
+    // signed: on-disk (post-encryption) chunk bytes, chunk-table order,
+    // SIGN excluded.
+    let mut leaves: Vec<Vec<u8>> = Vec::new();
+    for e in table.iter() {
+        if e.chunk_type == ChunkType::SIGN.as_fourcc() {
+            continue;
+        }
+        leaves.push(raw_chunk_bytes(file, e)?.to_vec());
+    }
+    let tree = MerkleTree::from_leaves(leaves, HashAlgorithm::Sha256).map_err(ros_err)?;
+    let root = match tree.root_hash() {
+        Some(r) => r.to_vec(),
+        None => {
+            return Ok(RosSignatureVerdict::Invalid {
+                reason: "signed file has no content chunks to verify against".to_string(),
+            })
+        }
+    };
+
+    match SignatureVerifier::verify_chunk(&root, &sig_chunk) {
+        Ok(true) => Ok(RosSignatureVerdict::Verified {
+            signer_id: to_hex(&sig_chunk.signer.metadata.signer_id),
+            public_key: to_hex(&sig_chunk.signer.public_key),
+        }),
+        Ok(false) => Ok(RosSignatureVerdict::Invalid {
+            reason: "Ed25519 signature does not match the Merkle root of the \
+                     file's chunk bytes — the file was modified after signing, \
+                     or the signature was transplanted from another file"
+                .to_string(),
+        }),
+        Err(e) => Ok(RosSignatureVerdict::Invalid {
+            reason: format!("signature verification errored: {}", e),
+        }),
+    }
+}
+
+/// Slice a chunk's raw on-disk bytes out of the whole-file buffer.
+fn raw_chunk_bytes<'a>(
+    file: &'a [u8],
+    entry: &ros_format::chunk::ChunkIndexEntry,
+) -> Result<&'a [u8], ExportError> {
+    let start = entry.offset as usize;
+    let len = entry.size_on_disk() as usize;
+    let out_of_bounds = || ExportError::ExportFailed {
+        reason: format!(
+            "{} chunk at offset {} (+{} bytes) lies outside the {}-byte file",
+            ChunkType::from_fourcc(entry.chunk_type).as_str(),
+            entry.offset,
+            len,
+            file.len(),
+        ),
+    };
+    let end = start.checked_add(len).ok_or_else(out_of_bounds)?;
+    file.get(start..end).ok_or_else(out_of_bounds)
 }
 
 /// Convenience wrapper: import and materialise a `BRepModel`.
