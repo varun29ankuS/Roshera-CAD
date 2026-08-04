@@ -128,6 +128,19 @@ pub fn quarantine_disclosure(status: &DurabilityStatus) -> Option<&DurabilitySta
     }
 }
 
+/// Async counterpart of [`quarantine_disclosure`] for the mutating-op path
+/// (`certified_response` in `main.rs`). Reads `state.durability_status`,
+/// clones it, and drops the guard before returning — the read never spans a
+/// caller's own `.await` — then applies the same disclosure rule the
+/// `GET /perception` and `GET /timeline/history` reads already use, so a
+/// `create_box`/`boolean`/`fillet_edges` response on a quarantined document
+/// discloses the same fact those dedicated reads do, not just an agent that
+/// happens to call them separately.
+pub async fn disclosure(state: &AppState) -> Option<DurabilityStatus> {
+    let status = state.durability_status.read().await.clone();
+    quarantine_disclosure(&status).cloned()
+}
+
 /// The kernel kind of a recorded operation — `create_box_3d`, `boolean_union`,
 /// `loft_profiles`, … For `Operation::Generic` (how the kernel bridge encodes
 /// every recorded kernel call) this is the `command_type` verbatim; otherwise

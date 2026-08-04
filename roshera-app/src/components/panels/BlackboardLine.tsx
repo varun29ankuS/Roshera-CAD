@@ -7,6 +7,7 @@ import { detectEnumeratedChoices } from '@/lib/blackboard-cards'
 import { classifyBlackboardContent } from '@/lib/blackboard-content'
 import { lineVerdict, type LineVerdict } from '@/lib/blackboard-line-state'
 import { useObservedTurnActivity, type ObservedTurnActivity } from '@/lib/agent-activity'
+import { useSceneStore } from '@/stores/scene-store'
 import type { BlackboardLine as Line } from '@/stores/blackboard-store'
 import { MessageMarkdown } from './MessageMarkdown'
 import { StreamingLineText } from './StreamingLineText'
@@ -223,6 +224,36 @@ function TurnStatusGlyph({ status }: { status: AgentTurnStatus }) {
       ) : (
         <CircleSlash size={12} />
       )}
+    </span>
+  )
+}
+
+/**
+ * PART TAG — which part a UNIONED legacy line was about.
+ * ---------------------------------------------------------------------
+ * The blackboard became one notebook per document on 2026-08-04; before
+ * that, a line could live in its own part's notebook. Those lines are not
+ * gone — the backend's read-side union surfaces them here too (`partId` /
+ * `partUuid` on the line, set only by that union — see
+ * `stores/blackboard-store.ts`'s doc). This is the one place that
+ * association is still visible: resolve `partUuid` against the live scene
+ * (the same id `scene-store`'s `objects` map is keyed by) to show a name,
+ * falling back to the bare numeric id when the part is no longer
+ * registered (deleted/retired) — `partId` alone still proves the line WAS
+ * about a part, even with nothing left to look up.
+ */
+function PartTag({ line }: { line: Line }) {
+  const name = useSceneStore((s) =>
+    line.partUuid ? s.objects.get(line.partUuid)?.name : undefined,
+  )
+  if (line.partId === undefined) return null
+  const label = name ?? `part ${line.partId}`
+  return (
+    <span
+      className="ml-1 text-[10px] text-muted-foreground/50"
+      title="Written in this part's own notebook before the blackboard became one notebook per document — carried into the document view here."
+    >
+      · {label}
     </span>
   )
 }
@@ -452,6 +483,7 @@ export function BlackboardLine({ line, onCommit, onDelete, streaming = false, on
                   (×{line.repeatCount})
                 </span>
               )}
+              <PartTag line={line} />
             </span>
           </div>
         ) : (
@@ -504,6 +536,7 @@ export function BlackboardLine({ line, onCommit, onDelete, streaming = false, on
                   (×{line.repeatCount})
                 </span>
               )}
+              <PartTag line={line} />
             </span>
           </div>
         )}

@@ -1718,8 +1718,11 @@ async fn blackboard_honours_client_supplied_id_and_dedupes() {
 /// THE per-part isolation proof through the live router: a calc posted to
 /// part A's notebook and a different calc to part B's notebook never
 /// cross-contaminate. A GET scoped to A returns ONLY A's line; B's returns
-/// ONLY B's; the un-scoped (document) notebook is empty. This is the whole
-/// point of scoping the blackboard per part.
+/// ONLY B's. As of the 2026-08-04 "blackboard is per document" decision the
+/// un-scoped (document) GET is no longer expected to be empty — it is the
+/// UNION of the Document notebook and every Part notebook belonging to it
+/// (see `blackboard.rs::BlackboardManager::document_snapshot`), so it must
+/// see BOTH A's and B's lines here.
 #[tokio::test]
 async fn blackboard_part_scopes_are_isolated_through_router() {
     let state = make_test_state().await;
@@ -1806,7 +1809,8 @@ async fn blackboard_part_scopes_are_isolated_through_router() {
         "B sees ONLY B's calc; body = {body}"
     );
 
-    // GET document (un-scoped) → empty: part writes never leak into it.
+    // GET document (un-scoped) → the UNION: both A's and B's lines, each
+    // tagged with the part it came from.
     let (_status, body) = dispatch(
         &state,
         Request::builder()
@@ -1816,10 +1820,117 @@ async fn blackboard_part_scopes_are_isolated_through_router() {
             .expect("static request must build"),
     )
     .await;
+    let lines = body["lines"].as_array().cloned().unwrap_or_default();
     assert_eq!(
-        body["lines"].as_array().map(Vec::len),
-        Some(0),
-        "document notebook stays empty; body = {body}"
+        lines.len(),
+        2,
+        "the document view unions in both part notebooks; body = {body}"
+    );
+    let texts: Vec<&str> = lines.iter().filter_map(|l| l["text"].as_str()).collect();
+    assert!(
+        texts.iter().any(|t| t.contains("sigma")),
+        "A's line is present; body = {body}"
+    );
+    assert!(
+        texts.iter().any(|t| t.contains("T=Fr")),
+        "B's line is present; body = {body}"
+    );
+    for line in &lines {
+        assert!(
+            line["partId"].is_number(),
+            "each unioned line carries the part it came from; body = {body}"
+        );
+    }
+}
+
+/// THE primary RED for the 2026-08-04 "blackboard is per document" decision,
+/// through the live router. Seeds a Part-scoped notebook the way durable
+/// storage actually holds one — a raw JSON `PersistedNotebook` blob fed
+/// straight to `BlackboardManager::hydrate`, deliberately WITHOUT a `partId`
+/// key at all (that field did not exist when this row would have been
+/// written; `#[serde(default)]` is what makes it still deserialize). No REST
+/// write ever touches the part notebook in this test — it proves the READ
+/// side alone recovers pre-existing content, not a round trip through `add`.
+///
+/// Pre-change (`get_blackboard` calling `snapshot` instead of
+/// `document_snapshot`), the un-scoped GET returns 0 lines: the part note is
+/// invisible. That is the exact RED to quote before wiring the union.
+#[tokio::test]
+async fn document_view_includes_pre_existing_part_scoped_lines_through_router() {
+    let state = make_test_state().await;
+    let document_id = state.active_document.read().await.clone();
+
+    let persisted_part_notebook = json!({
+        "lines": [{
+            "id": "bb-legacy-1",
+            "text": "legacy note about finger_L3",
+            "author": "user",
+            "createdAt": 1000,
+            "updatedAt": 1000
+            // NOTE: no "partId" key — this is what a row written before
+            // that field existed looks like on disk.
+        }],
+        "events": [{
+            "kind": "add",
+            "lineId": "bb-legacy-1",
+            "text": "legacy note about finger_L3",
+            "author": "user",
+            "at": 1000,
+            "index": 0
+        }],
+        "counter": 1
+    });
+    let restored = state.blackboard.hydrate(
+        &document_id,
+        vec![("part:4242".to_string(), persisted_part_notebook)],
+    );
+    assert_eq!(
+        restored, 1,
+        "the part notebook must hydrate into the working set"
+    );
+
+    let (_status, body) = dispatch(
+        &state,
+        Request::builder()
+            .method(Method::GET)
+            .uri("/api/blackboard")
+            .body(Body::empty())
+            .expect("static request must build"),
+    )
+    .await;
+    let lines = body["lines"].as_array().cloned().unwrap_or_default();
+    assert_eq!(
+        lines.len(),
+        1,
+        "the un-scoped (document) GET must surface the pre-existing part \
+         line — before the union this returns 0; body = {body}"
+    );
+    assert_eq!(lines[0]["text"], "legacy note about finger_L3");
+    assert_eq!(
+        lines[0]["partId"], 4242,
+        "the line still carries which part it was about; body = {body}"
+    );
+
+    // And the direct, scoped read of that SAME notebook is untouched: same
+    // line, same id, and (because that response is not the union) no
+    // `partId` on it — the scope of the whole response already says which
+    // part it is about.
+    let (_status, body) = dispatch(
+        &state,
+        Request::builder()
+            .method(Method::GET)
+            .uri("/api/blackboard?scope=part:4242")
+            .body(Body::empty())
+            .expect("static request must build"),
+    )
+    .await;
+    let lines = body["lines"].as_array().cloned().unwrap_or_default();
+    assert_eq!(lines.len(), 1, "the row itself is untouched; body = {body}");
+    assert_eq!(lines[0]["id"], "bb-legacy-1");
+    assert_eq!(
+        lines[0].get("partId"),
+        None,
+        "a line read via its own scope is not tagged; body = {body}"
     );
 }
 
@@ -7711,5 +7822,125 @@ async fn timeline_history_stays_bare_array_when_not_quarantined() {
     assert!(
         body.is_array(),
         "a non-quarantined document's history must stay a bare array; body = {body}"
+    );
+}
+
+// =====================================================================
+// Durability disclosure on the MUTATING-op path (`certified_response`,
+// the ambient perception block embedded in create_box/boolean/fillet_edges/
+// etc.'s own response) — the dominant path an agent actually travels. The
+// two reads above (`/perception`, `/timeline/history`) are correct but an
+// agent that only calls mutating endpoints never reaches them; this closes
+// that gap. Reuses `quarantined_state_with_one_solid` — the SAME quarantine
+// recipe as every other test in this section.
+// =====================================================================
+
+/// GATE (RED-first, mutation-proven): on a QUARANTINED document, a mutating
+/// op's own response (`POST /api/geometry/box`, default full-certificate
+/// path) discloses the document-level durability state under
+/// `perception.durability`, in the SAME shape `GET /perception` uses — an
+/// agent that only ever calls mutating endpoints must still learn its
+/// document is incomplete, not just an agent that separately polls
+/// `/perception`.
+#[tokio::test]
+async fn certified_response_discloses_quarantine_on_default_path() {
+    let (state, _existing_solid_id) = quarantined_state_with_one_solid().await;
+
+    let (status, body) = dispatch(
+        &state,
+        json_post(
+            "/api/geometry/box",
+            json!({"width": 2.0, "depth": 2.0, "height": 2.0}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a mutating op on the clean prefix must still 200; body = {body}"
+    );
+    // The new solid's own verdict is untouched — still a true statement about
+    // THIS solid (it really is sound; the document it lives in is not whole).
+    assert_eq!(
+        body["perception"]["sound"].as_bool(),
+        Some(true),
+        "the freshly created box is itself a sound solid; body = {body}"
+    );
+    assert_eq!(
+        body["perception"]["durability"]["state"].as_str(),
+        Some("quarantined"),
+        "a mutating op's OWN response, on a quarantined document, must \
+         disclose the quarantine under `perception.durability` — the SAME \
+         DurabilityStatus vocabulary `/api/durability/status` and \
+         `GET /perception` already report (never a bare bool); body = {body}"
+    );
+    assert_eq!(
+        body["perception"]["durability"]["first_break_kind"].as_str(),
+        Some("quarantine_probe_unknown_op_agent_surface"),
+        "the disclosure must name the offending event kind, mirroring \
+         /api/durability/status; body = {body}"
+    );
+}
+
+/// GATE: the `"fast": true` opt-out (skips the expensive full certificate
+/// block in `certified_response`) also discloses the quarantine — an agent
+/// that opts out of the expensive certificate has not opted out of knowing
+/// its document is incomplete.
+#[tokio::test]
+async fn certified_response_discloses_quarantine_on_fast_path() {
+    let (state, _existing_solid_id) = quarantined_state_with_one_solid().await;
+
+    let (status, body) = dispatch(
+        &state,
+        json_post(
+            "/api/geometry/box",
+            json!({"width": 2.0, "depth": 2.0, "height": 2.0, "fast": true}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a fast mutating op on the clean prefix must still 200; body = {body}"
+    );
+    // The fast path skips the full certificate — `sound`/`cert` are absent —
+    // but the disclosure is NOT part of that skipped block.
+    assert_eq!(
+        body["perception"]["durability"]["state"].as_str(),
+        Some("quarantined"),
+        "the `fast: true` opt-out must disclose the quarantine too; body = {body}"
+    );
+}
+
+/// GATE (additive pin): on a NON-quarantined document, a mutating op's
+/// response carries no `durability` key anywhere — the field is present ONLY
+/// when there is something to disclose, so an unaffected caller's response is
+/// byte-for-byte what it was before this change.
+#[tokio::test]
+async fn certified_response_omits_durability_when_not_quarantined() {
+    let state = make_test_state().await;
+    let (status, body) = dispatch(
+        &state,
+        json_post(
+            "/api/geometry/box",
+            json!({"width": 4.0, "depth": 4.0, "height": 4.0}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "box create must 200; body = {body}");
+    assert!(
+        body["perception"]
+            .as_object()
+            .is_some_and(|m| !m.contains_key("durability")),
+        "a non-quarantined document's mutating-op response must carry NO \
+         `durability` key anywhere in `perception` (additive, not merely \
+         null) — this document is Empty/Active, durability off; body = {body}"
+    );
+    // Belt-and-braces: the raw wire bytes contain the substring nowhere, not
+    // just under the key we happened to check.
+    assert!(
+        !body.to_string().contains("\"durability\""),
+        "a non-quarantined mutating-op response must not contain the \
+         `durability` key ANYWHERE in its JSON; body = {body}"
     );
 }

@@ -30,111 +30,30 @@
 
 import { useBlackboardStore } from '@/stores/blackboard-store'
 import {
-  describeBackendDown,
+  describeAcpConnectFailure,
   getAcpClient,
   isAcpTurnFailureRendered,
-  isBackendDownStatus,
   resetAcpClient,
   runAcpTurn,
 } from '@/lib/acp-blackboard'
-import {
-  AcpConnectionDeadError,
-  AcpHttpError,
-  AcpProtocolError,
-  AcpRateLimitError,
-} from '@/lib/acp-client'
+import { AcpConnectionDeadError, AcpRateLimitError } from '@/lib/acp-client'
 
 /**
  * Render an ACP failure that `runAcpTurn` did NOT already put on the board
  * (connect-phase errors have no placeholder agent line — `initialize`,
  * `session/new`, or the config fetch failed before a turn existed). Always
  * a system line in engineering language: what failed, and what would fix
- * it. Never falls back to another transport, never rethrows — the board
- * line IS the outcome of the turn.
+ * it — copy shared with the provider dialog's connect flow via
+ * `describeAcpConnectFailure` (context `'board'`: the user's prompt is
+ * already on the board, so "resend it" is honest here — see that
+ * function's doc for why the dialog gets different wording for the exact
+ * same failures). Never falls back to another transport, never rethrows —
+ * the board line IS the outcome of the turn.
  */
 function renderAcpFailure(err: unknown): void {
   if (isAcpTurnFailureRendered(err)) return
-  const board = useBlackboardStore.getState()
-  if (err instanceof AcpHttpError) {
-    if (err.status === 404 || err.status === 405) {
-      // The backend answered HTTP but does not serve /acp. Either the
-      // running build predates the agent surface, or it is mid-start and
-      // the router isn't up yet. There is deliberately NO fallback: a
-      // reply from any other path here would be an answer from something
-      // that is not the agent.
-      board.addLine(
-        `Agent surface missing: the backend answered, but /acp returned HTTP ${err.status}. ` +
-          `The api-server build is stale or still starting — restart/update the backend, ` +
-          `then resend this prompt. No reload needed.`,
-        'system',
-      )
-      return
-    }
-    if (err.status === 401) {
-      // The global fetch interceptor (installFetchAuth) has already
-      // flipped the sign-in-required signal and the LoginDialog is
-      // opening — this line just makes the Blackboard's own state honest.
-      board.addLine('Sign-in required to continue — see the sign-in prompt.', 'system')
-      return
-    }
-    if (isBackendDownStatus(err.status)) {
-      // A proxy sits in front of the api-server (Vite in dev, any reverse
-      // proxy in prod); 502/504 is its way of saying the backend is down.
-      board.addLine(describeBackendDown(err.status), 'system')
-      return
-    }
-    board.addLine(`Agent request failed (HTTP ${err.status}): ${err.message}`, 'system')
-    return
-  }
-  if (err instanceof AcpRateLimitError) {
-    // Connect-phase 429 (initialize / session/new) — there is no turn to
-    // retry yet; the cooldown gate will hold the next attempt, and
-    // `runAcpTurn` will show that hold on the next turn's own line.
-    board.addLine(
-      `The agent surface is rate-limited right now (shared 100 requests/min budget — ` +
-        `scene polling and every open Roshera tab count against it). ` +
-        `Retry in about ${Math.ceil(err.retryAfterMs / 1000)}s.`,
-      'system',
-    )
-    return
-  }
-  if (err instanceof AcpConnectionDeadError) {
-    board.addLine(
-      `Agent connection lost — the backend restarted or the event stream closed. ` +
-        `The connection rebuilds itself on the next prompt; resend to continue.`,
-      'system',
-    )
-    return
-  }
-  if (err instanceof TypeError) {
-    // fetch's own failure mode for "could not reach the server at all".
-    // The network stack never connected — the api-server is down or not
-    // listening on this address. Named as a backend outage, NOT as a
-    // vague network hint, and with the recovery stated: resend after the
-    // backend is up; the client rebuilds itself, no reload.
-    board.addLine(
-      `Backend unreachable: the request to the api-server never connected ` +
-        `(${err.message}). Start (or wait for) the backend, then resend this ` +
-        `prompt — the connection rebuilds automatically, no reload needed.`,
-      'system',
-    )
-    return
-  }
-  if (err instanceof AcpProtocolError) {
-    // `.message` alone is often just the generic JSON-RPC error class
-    // (e.g. "Internal error"); the actionable detail — verified live
-    // against a real "Provider not set" failure from the goose agent —
-    // lives in `.data`. Surface that when it's a plain string; never
-    // paraphrase, per the same rule the refusal card follows.
-    const detail = typeof err.data === 'string' ? err.data : err.message
-    board.addLine(`Agent turn failed: ${detail}`, 'system')
-    return
-  }
-  console.error('[ai-client] ACP turn failed:', err)
-  board.addLine(
-    `Agent turn failed: ${err instanceof Error ? err.message : 'unknown error'}`,
-    'system',
-  )
+  console.error('[ai-client] ACP connect-phase failure:', err)
+  useBlackboardStore.getState().addLine(describeAcpConnectFailure(err, 'board'), 'system')
 }
 
 /**

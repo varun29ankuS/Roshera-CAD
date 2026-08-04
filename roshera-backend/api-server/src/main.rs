@@ -44,6 +44,8 @@ mod fillet_payload;
 #[cfg(test)]
 mod fillet_radius_harness;
 mod frame;
+#[cfg(test)]
+mod geometry_routes_coverage_tests;
 mod goose_acp;
 mod handlers;
 mod idempotency;
@@ -827,6 +829,7 @@ async fn create_geometry(
     let shape_type_copy = shape_type.clone();
     // Feedback-as-default: a primitive is sound by construction, but report the
     // SOUND (B-Rep) verdict anyway so EVERY mutating op has a uniform contract.
+    let durability = durability::disclosure(&state).await;
     let perception = {
         let mut model = model_handle.write().await;
         certified_response(
@@ -836,6 +839,7 @@ async fn create_geometry(
             solid_id,
             &tri_mesh,
             body_verify_flag(&payload),
+            durability,
         )
     };
     Ok(Json(serde_json::json!({
@@ -1226,6 +1230,15 @@ pub(crate) fn certificate_json(
 /// the model under a brief read lock — waiting microseconds for THIS caller's
 /// write guard to drop — then renders/certifies lock-free. `model_arc` is the
 /// ACTIVE model handle (may be a branch model, not `state.model`).
+///
+/// `durability` is the document-level disclosure (`durability::disclosure`,
+/// read by the caller BEFORE this sync function runs — `AppState.durability_status`
+/// is a `tokio::sync::RwLock` and this function cannot `.await`). `None` in the
+/// common case (off/empty/active) leaves the response byte-for-byte unchanged;
+/// `Some` carries the full `Quarantined` variant, inserted under the same
+/// `"durability"` key `part_perception`/`get_history` already use, so a
+/// `create_box`/`boolean`/`fillet_edges` response on a quarantined document
+/// discloses the break instead of answering as if the document were whole.
 fn certified_response(
     model: &mut geometry_engine::primitives::topology_builder::BRepModel,
     model_arc: &reconcile_task::ModelHandle,
@@ -1233,6 +1246,7 @@ fn certified_response(
     solid_id: geometry_engine::primitives::solid::SolidId,
     mesh: &geometry_engine::tessellation::TriangleMesh,
     full: bool,
+    durability: Option<durability::DurabilityStatus>,
 ) -> serde_json::Value {
     let mut base = perception_json(model, solid_id, mesh);
 
@@ -1286,6 +1300,41 @@ fn certified_response(
             };
             map.insert("verdict".into(), serde_json::json!(verdict));
             map.insert("cert".into(), certificate_json(&cert));
+        }
+    }
+
+    // Document-level durability disclosure — BESIDE the part-level `sound`/
+    // `verdict` above, never rewriting them (those stay true statements about
+    // THIS solid; a quarantine is a fact about the whole document). Inserted
+    // unconditionally of `full`: the `fast: true` opt-out skips the expensive
+    // certificate block above, not the cheap disclosure — an agent that opts
+    // out of the certificate has not opted out of knowing its document is
+    // incomplete. `None` (the common case) leaves `base` byte-for-byte
+    // unchanged; `Some` serializes the exact `DurabilityStatus::Quarantined`
+    // variant `part_perception` discloses on `GET /perception`.
+    if let Some(status) = durability {
+        if let serde_json::Value::Object(map) = &mut base {
+            // `DurabilityStatus` serializes losslessly (String/u64/usize
+            // fields only — no NaN floats, no non-string map keys), so this
+            // cannot fail for any value `quarantine_disclosure` can produce.
+            // The `Err` arm is unreachable in practice; it is handled (not
+            // `unwrap`ped) and logged rather than silently dropped, so a
+            // future change to `DurabilityStatus` that broke this invariant
+            // would be loud, never a quietly-omitted disclosure.
+            match serde_json::to_value(&status) {
+                Ok(value) => {
+                    map.insert("durability".to_string(), value);
+                }
+                Err(e) => {
+                    tracing::error!(
+                        target: "durability",
+                        error = %e,
+                        "durability: quarantine status failed to serialize — \
+                         disclosure OMITTED from a mutating-op response \
+                         (this should be unreachable for DurabilityStatus)"
+                    );
+                }
+            }
         }
     }
 
@@ -1732,6 +1781,7 @@ async fn boolean_operation(
     // valid + dims — so a caller learns whether the result is sound from the
     // operation itself, no second query. open/nonmanifold are read off the mesh
     // we already tessellated (no extra work); valid + dims from the kernel.
+    let durability = durability::disclosure(&state).await;
     let perception = {
         let mut model = model_handle.write().await;
         certified_response(
@@ -1741,6 +1791,7 @@ async fn boolean_operation(
             result_solid_id,
             &tri_mesh,
             body_verify_flag(&payload),
+            durability,
         )
     };
 
@@ -1942,6 +1993,7 @@ async fn shell_solid(
 
     // Feedback-as-default: shell can leave a self-intersecting or open wall, so
     // it reports its own SOUND (B-Rep) verdict like the boolean.
+    let durability = durability::disclosure(&state).await;
     let perception = {
         let mut model = model_handle.write().await;
         certified_response(
@@ -1951,6 +2003,7 @@ async fn shell_solid(
             result_solid_id,
             &tri_mesh,
             body_verify_flag(&payload),
+            durability,
         )
     };
     Ok(Json(serde_json::json!({
@@ -2136,6 +2189,7 @@ async fn mirror_solid(
     );
 
     // AMBIENT VERIFICATION (outlier closed): mirror previously emitted no verdict.
+    let durability = durability::disclosure(&state).await;
     let perception = {
         let mut model = model_handle.write().await;
         certified_response(
@@ -2145,6 +2199,7 @@ async fn mirror_solid(
             solid_id,
             &tri_mesh,
             body_verify_flag(&payload),
+            durability,
         )
     };
 
@@ -2673,6 +2728,7 @@ async fn fillet_edges_endpoint(
         [0.0, 0.0, 0.0],
     );
 
+    let durability = durability::disclosure(&state).await;
     let perception = {
         let mut model = model_handle.write().await;
         certified_response(
@@ -2682,6 +2738,7 @@ async fn fillet_edges_endpoint(
             solid_id,
             &tri_mesh,
             body_verify_flag(&payload),
+            durability,
         )
     };
 
@@ -2902,6 +2959,7 @@ async fn chamfer_edges_endpoint(
         [0.0, 0.0, 0.0],
     );
 
+    let durability = durability::disclosure(&state).await;
     let perception = {
         let mut model = model_handle.write().await;
         certified_response(
@@ -2911,6 +2969,7 @@ async fn chamfer_edges_endpoint(
             solid_id,
             &tri_mesh,
             body_verify_flag(&payload),
+            durability,
         )
     };
 
@@ -3101,6 +3160,7 @@ async fn transform_geometry_endpoint(
     // its solid (the construction-consistency defect) — so this endpoint, which
     // previously returned a solid with NO verdict, now routes through the same
     // certified response as every other mutating op.
+    let durability = durability::disclosure(&state).await;
     let perception = {
         let mut model = model_handle.write().await;
         certified_response(
@@ -3110,6 +3170,7 @@ async fn transform_geometry_endpoint(
             solid_id,
             &tri_mesh,
             body_verify_flag(&payload),
+            durability,
         )
     };
     Ok(Json(serde_json::json!({
@@ -3658,6 +3719,7 @@ async fn create_extrude(
         [0.0, 0.0, 0.0],
     );
 
+    let durability = durability::disclosure(&state).await;
     let perception = {
         let mut model = model_handle.write().await;
         certified_response(
@@ -3667,6 +3729,7 @@ async fn create_extrude(
             result_solid_id,
             &tri_mesh,
             body_verify_flag(&payload),
+            durability,
         )
     };
 
@@ -3822,6 +3885,7 @@ async fn create_cylinder_primitive(
 
     // AMBIENT VERIFICATION (outlier closed): the dedicated cylinder primitive
     // previously emitted no verdict; it now carries the full certificate.
+    let durability = durability::disclosure(&state).await;
     let perception = {
         let mut model = model_handle.write().await;
         certified_response(
@@ -3831,6 +3895,7 @@ async fn create_cylinder_primitive(
             result_solid_id,
             &tri_mesh,
             body_verify_flag(&payload),
+            durability,
         )
     };
 
@@ -4019,6 +4084,7 @@ async fn create_box_primitive(
         [0.0, 0.0, 0.0],
     );
 
+    let durability = durability::disclosure(&state).await;
     let perception = {
         let mut model = model_handle.write().await;
         certified_response(
@@ -4028,6 +4094,7 @@ async fn create_box_primitive(
             result_solid_id,
             &tri_mesh,
             body_verify_flag(&payload),
+            durability,
         )
     };
 
@@ -4198,6 +4265,7 @@ async fn create_cone_primitive(
         [0.0, 0.0, 0.0],
     );
 
+    let durability = durability::disclosure(&state).await;
     let perception = {
         let mut model = model_handle.write().await;
         certified_response(
@@ -4207,6 +4275,7 @@ async fn create_cone_primitive(
             result_solid_id,
             &tri_mesh,
             body_verify_flag(&payload),
+            durability,
         )
     };
     Ok(Json(serde_json::json!({
@@ -4799,6 +4868,7 @@ async fn create_revolve_primitive(
 
     // Feedback-as-default: a self-intersecting / axis-touching profile can yield
     // an unsound solid, so revolve reports its own SOUND (B-Rep) verdict.
+    let durability = durability::disclosure(&state).await;
     let perception = {
         let mut model = model_handle.write().await;
         certified_response(
@@ -4808,6 +4878,7 @@ async fn create_revolve_primitive(
             result_solid_id,
             &tri_mesh,
             body_verify_flag(&payload),
+            durability,
         )
     };
     Ok(Json(serde_json::json!({
@@ -4984,6 +5055,10 @@ async fn register_imported_solids(
 ) -> Vec<serde_json::Value> {
     use geometry_engine::tessellation::{tessellate_solid, TessellationParams};
 
+    // Read once for the whole splice — the document's durability status
+    // cannot change mid-request — and clone per solid below (`DurabilityStatus`
+    // is cheap: at most a few strings/ints).
+    let durability = durability::disclosure(state).await;
     let mut objects = Vec::with_capacity(new_solid_ids.len());
     for (i, &solid_id) in new_solid_ids.iter().enumerate() {
         let tri_mesh = {
@@ -5021,7 +5096,15 @@ async fn register_imported_solids(
 
         let perception = {
             let mut model = model_handle.write().await;
-            certified_response(&mut model, model_handle, state, solid_id, &tri_mesh, true)
+            certified_response(
+                &mut model,
+                model_handle,
+                state,
+                solid_id,
+                &tri_mesh,
+                true,
+                durability.clone(),
+            )
         };
         objects.push(serde_json::json!({
             "id":         id_str,
@@ -5400,6 +5483,7 @@ async fn create_nurbs_loft_primitive(
         [0.0, 0.0, 0.0],
     );
 
+    let durability = durability::disclosure(&state).await;
     let perception = {
         let mut model = model_handle.write().await;
         certified_response(
@@ -5409,6 +5493,7 @@ async fn create_nurbs_loft_primitive(
             result_solid_id,
             &tri_mesh,
             body_verify_flag(&payload),
+            durability,
         )
     };
     Ok(Json(serde_json::json!({
@@ -5644,6 +5729,7 @@ async fn extrude_face_endpoint(
     // AMBIENT VERIFICATION (outlier closed): face-extrude previously returned a
     // solid with NO verdict; it now carries the full certificate like every
     // other mutating op.
+    let durability = durability::disclosure(&state).await;
     let perception = {
         let mut model = model_handle.write().await;
         certified_response(
@@ -5653,6 +5739,7 @@ async fn extrude_face_endpoint(
             result_solid_id,
             &tri_mesh,
             body_verify_flag(&payload),
+            durability,
         )
     };
 

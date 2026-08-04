@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { CheckCircle2, Loader2, Terminal, XCircle } from 'lucide-react'
 import {
   Dialog,
@@ -9,6 +9,7 @@ import {
 } from '@/components/ui/dialog'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { cn } from '@/lib/utils'
 import { Claim } from '@/components/panels/cards/card-chrome'
 import { VendorMark } from '@/components/settings/vendor-marks'
@@ -26,6 +27,12 @@ import {
   type ModeEntry,
   type ProviderStatusResponse,
 } from '@/lib/provider-api'
+import {
+  describeAcpConnectFailure,
+  establishAcpSession,
+  resetAcpClient,
+} from '@/lib/acp-blackboard'
+import { useAcpSessionStore } from '@/stores/acp-session-store'
 
 /** `GET /api/ai/provider`'s `cli` object is keyed by CLI, not by provider
  *  id (`ai_provider_config::detect_claude_cli` / `detect_codex_cli`). */
@@ -42,17 +49,32 @@ const CLI_KEY_FOR_PROVIDER: Record<string, 'claude' | 'codex'> = {
  * (`ai-integration/src/providers/allowlist.rs`, mirrored verbatim in
  * `lib/provider-api.ts`) and lets the user select and configure a mode.
  *
- * ## Layout (2026-07-31 redesign)
+ * ## Layout (2026-07-31 redesign, decrowded 2026-08-04)
  * A row of vendor marks is the primary control — you recognise a logo
  * faster than you read a heading. Selecting one swaps a SINGLE options
  * panel underneath for that vendor only (no accordion, no second list of
  * every mode across every vendor). Each mode is one scannable line: a
  * label plus a short status (`✓ signed in`, `needs a key`, `not yet
- * wired`); the old paragraph-length reasons live in `title` tooltips, not
- * as standing prose. There is exactly one model control in the whole
- * dialog — it lives inside this one panel, never duplicated in a second
- * "connected" card, so there is never more than one model input mounted
- * at a time.
+ * wired`); the paragraph-length reasons (a `seam_only` mode's explanation,
+ * a vendor mark's Active/Ready/Available/Unavailable state) live in
+ * `@/components/ui/tooltip` (Base UI), never as standing prose — that
+ * primitive opens on hover AND on keyboard focus (`Tooltip.Trigger`'s
+ * `onFocus` handler), unlike a bare `title` attribute, which several rows
+ * here used to rely on despite being unreachable by keyboard. There is
+ * exactly one model control in the whole dialog — it lives inside this one
+ * panel, never duplicated in a second "connected" card, so there is never
+ * more than one model input mounted at a time.
+ *
+ * Two more things Varun asked to stop being permanent (2026-08-04, "pop
+ * feels too crowded"): the connect-flow stage list (`ConnectFlow` below)
+ * unmounts the instant a run reaches `ready` — the header card's own
+ * "agent running" clause already carries that outcome — but stays mounted
+ * on `failed`, because that is exactly when the failing stage and its
+ * reason are needed and a collapse would hide the only diagnostic. And the
+ * agent-surface `Claim` row only renders when `data.active === null`;
+ * once a provider is pinned, the header card above already states the
+ * pinned provider/mode and whether the session is live, so repeating it
+ * in a second row would be pure restatement.
  *
  * The fetch-and-reset-on-open logic runs from the trigger button's
  * `onClick` (a real event handler), not a `useEffect` keyed on `open` —
@@ -63,7 +85,9 @@ const CLI_KEY_FOR_PROVIDER: Record<string, 'claude' | 'codex'> = {
  *
  * Honesty rules this component enforces (never relaxed for a nicer demo):
  *   - A `seam_only` mode renders visibly disabled with its stated reason
- *     on hover — never selectable as if it served inference, and a vendor
+ *     in a tooltip (hover or keyboard focus — `aria-disabled`, not the
+ *     native `disabled` attribute, so the row stays focusable enough to
+ *     open it) — never selectable as if it served inference, and a vendor
  *     logo never implies partnership/endorsement, only identification.
  *   - `subscription_cli` NEVER gets a credential field. It's a status
  *     line (signed in / not signed in / unknown) plus an explicit consent
@@ -105,6 +129,44 @@ type LoadState =
   | { phase: 'unavailable' }
   | { phase: 'error'; message: string }
   | { phase: 'ready'; data: ProviderStatusResponse }
+
+/**
+ * CONNECT FLOW — the real stages between "saved a provider" and "the agent
+ * is actually running", per Varun's words: "setting up and connecting
+ * harness, checking ai provider". Every stage below is a real awaited
+ * operation, never a timed fake:
+ *   - `saving`   — `PUT /api/ai/provider` (only present when this run
+ *                  followed a Save click; a re-establish-only run has no
+ *                  PUT to perform, so it never appears — a stage list must
+ *                  never narrate work it isn't doing).
+ *   - `checking` — `GET /api/ai/provider` re-fetched, and its `active`
+ *                  compared against what was submitted (or, for a
+ *                  re-establish, simply confirmed non-null) — catches a 2xx
+ *                  PUT that didn't actually pin, not just decoration.
+ *   - `starting` — `establishAcpSession()` (`initialize()` + `session/new`
+ *                  over `/acp`, WITHOUT sending a turn) — the step that was
+ *                  missing entirely before this change, leaving a green
+ *                  chip over an agent that only started on the user's first
+ *                  Blackboard message.
+ */
+type ConnectStepId = 'saving' | 'checking' | 'starting'
+
+const CONNECT_STEP_LABELS: Record<ConnectStepId, string> = {
+  saving: 'Saving the provider selection',
+  checking: 'Checking the provider',
+  starting: 'Starting the agent harness',
+}
+
+interface ConnectFlow {
+  /** Fixed at the start of the run — only the stages THIS run performs. */
+  steps: ConnectStepId[]
+  status: 'running' | 'ready' | 'failed'
+  /** Index into `steps` currently in flight. Meaningless once `status` is
+   *  `'ready'` or `'failed'` (the per-step render derives from `status` +
+   *  `failure` instead). */
+  current: number
+  failure?: { step: ConnectStepId; message: string }
+}
 
 const MODE_LABELS: Record<CredentialMode, string> = {
   api_key: 'API key',
@@ -253,6 +315,17 @@ export function ProviderSettingsButton() {
   const [saving, setSaving] = useState(false)
   const [saveError, setSaveError] = useState<string | null>(null)
   const [clearing, setClearing] = useState(false)
+  const [connectFlow, setConnectFlow] = useState<ConnectFlow | null>(null)
+  // Bumped at the start of every `runConnect` call (and on dialog
+  // open/close) so a slow, superseded run's `setConnectFlow` calls are
+  // dropped instead of clobbering a newer run or a closed dialog — the
+  // same stale-result discipline `runDiscovery` already applies via
+  // `keyAtRequestTime`.
+  const flowTokenRef = useRef(0)
+  // The one fact the chip and this dialog now agree on: a genuinely live
+  // `/acp` session, not "a provider is configured" (see `providerServing`'s
+  // doc below for why that used to be wrong).
+  const acpLive = useAcpSessionStore((s) => s.live)
 
   /** Sets `model` and derives `modelCustom` from whether it matches a
    *  known preset — the single place external data (load, provider switch)
@@ -277,7 +350,17 @@ export function ProviderSettingsButton() {
     setSaveError(null)
   }
 
-  const load = () => {
+  /** `autoStart`: after a fresh load shows an already-configured provider
+   *  with no live agent session, kick off the connect flow's `checking` +
+   *  `starting` stages automatically — Varun: "clicking ai should start
+   *  it". Only fires when `active !== null` (nothing to confirm otherwise)
+   *  and only from a real click handler (`openDialog`), never an Effect.
+   *  Not a consent bypass: for an ALREADY-active provider the user already
+   *  ticked the local-process consent box when it was saved (same
+   *  reasoning `alreadyConsentedToThisMode` below encodes) — this only
+   *  resumes a harness for a config the user already approved, it never
+   *  saves a new one. */
+  const load = (opts?: { autoStart?: boolean }) => {
     setState({ phase: 'loading' })
     void getProviderStatus().then((res) => {
       if (!res.ok) {
@@ -296,16 +379,139 @@ export function ProviderSettingsButton() {
       } else if (res.data.allowlist.length > 0) {
         selectProvider(res.data.allowlist[0])
       }
+      if (opts?.autoStart && res.data.active && !useAcpSessionStore.getState().live) {
+        void runConnect({
+          save: false,
+          provider: res.data.active.provider,
+          mode: res.data.active.mode as CredentialMode,
+        })
+      }
     })
   }
 
-  // The rail chip has to tell the truth before anyone opens the dialog, so
-  // status is fetched once on mount. This is the legitimate use of an Effect
-  // — fetching on mount — and the setState lands in the promise callback, not
-  // synchronously in the Effect body, so it is not the cascading-render smell
-  // `react-hooks/set-state-in-effect` exists to catch. A failure stays silent
-  // here: the chip simply reads "not connected", and the dialog reports the
-  // real reason when opened.
+  /**
+   * Runs the real, awaited stage sequence behind the connect flow UI:
+   *   `save` (only when `opts.save`) → `checking` → `starting`.
+   * `opts.provider`/`opts.mode` let a caller target the ALREADY-active
+   * config (the "Start agent" button, and `autoStart` above) without
+   * depending on whatever the vendor panel currently has selected — those
+   * two can legitimately differ. Falls back to the panel's own selection
+   * for the ordinary Save-button path.
+   */
+  async function runConnect(opts: {
+    save: boolean
+    provider?: string
+    mode?: CredentialMode
+  }): Promise<void> {
+    const submittedProvider = opts.provider ?? selectedProviderId
+    const submittedMode = opts.mode ?? selectedMode
+    if (!submittedProvider || !submittedMode) return
+
+    const token = ++flowTokenRef.current
+    const isCurrent = () => flowTokenRef.current === token
+    const steps: ConnectStepId[] = opts.save ? ['saving', 'checking', 'starting'] : ['checking', 'starting']
+    const fail = (step: ConnectStepId, message: string) => {
+      if (!isCurrent()) return
+      setConnectFlow({ steps, status: 'failed', current: steps.indexOf(step), failure: { step, message } })
+    }
+
+    setConnectFlow({ steps, status: 'running', current: 0 })
+
+    if (opts.save) {
+      setSaving(true)
+      setSaveError(null)
+      const trimmedModel = model.trim()
+      const res = await putProvider({
+        provider: submittedProvider,
+        mode: submittedMode,
+        model: trimmedModel || undefined,
+        // See `alreadyConsentedToThisMode`'s doc: only ever true when this
+        // exact provider+mode is already the live config.
+        consent_spawn_local_process: consent || alreadyConsentedToThisMode,
+        ...(submittedMode === 'api_key' ? { api_key: apiKey } : {}),
+      })
+      setSaving(false)
+      if (!isCurrent()) return
+      if (!res.ok) {
+        // Named on the stage row itself (`fail` below) — not duplicated
+        // into `saveError` too, which would print the identical sentence
+        // twice on screen (the row already carries the stage AND the
+        // reason, which is strictly more informative than the bare
+        // message `saveError` would show on its own).
+        fail(
+          'saving',
+          res.kind === 'unavailable'
+            ? 'Save endpoint not available yet.'
+            : [res.message, res.hint].filter(Boolean).join(' — '),
+        )
+        return
+      }
+      // The backend just ended every connection minted under the OLD
+      // provider pin (`acp_provider_epoch.rs` — the same mechanism
+      // `acp-client.ts`'s `reestablish()` documents for a repin). Without
+      // discarding the shared client here, the `starting` stage below
+      // would call `getAcpClient()`, get back the pre-save client (its
+      // `isDead` flag hasn't caught up to the backend yet), and tick
+      // "ready" over a connection the backend has already killed — the
+      // exact defect this task removes, recreated one layer up.
+      resetAcpClient()
+    }
+
+    setConnectFlow({ steps, status: 'running', current: steps.indexOf('checking') })
+    const statusRes = await getProviderStatus()
+    if (!isCurrent()) return
+    if (!statusRes.ok) {
+      fail(
+        'checking',
+        statusRes.kind === 'unavailable'
+          ? 'Provider status endpoint not available yet.'
+          : [statusRes.message, statusRes.hint].filter(Boolean).join(' — '),
+      )
+      return
+    }
+    setState({ phase: 'ready', data: statusRes.data })
+    const active = statusRes.data.active
+    if (!active) {
+      fail('checking', 'No provider is pinned on the backend — pick one and Save before connecting.')
+      return
+    }
+    if (active.provider !== submittedProvider || active.mode !== submittedMode) {
+      fail(
+        'checking',
+        `The backend is pinned to ${active.provider}/${active.mode}, not ` +
+          `${submittedProvider}/${submittedMode} — the save did not take effect as expected.`,
+      )
+      return
+    }
+    // Sync the panel to what the backend actually confirmed — the same
+    // resync `load()` always did after a save, now shared with the
+    // re-establish-only path too.
+    setSelectedProviderId(active.provider)
+    setSelectedMode(active.mode as CredentialMode)
+    applyModel(active.model ?? '')
+
+    setConnectFlow({ steps, status: 'running', current: steps.indexOf('starting') })
+    try {
+      await establishAcpSession()
+    } catch (err) {
+      if (!isCurrent()) return
+      fail('starting', describeAcpConnectFailure(err, 'dialog'))
+      return
+    }
+    if (!isCurrent()) return
+    setConnectFlow({ steps, status: 'ready', current: steps.length })
+  }
+
+  // The chip itself is driven by `acpLive` (the real session store), not by
+  // this fetch — see `providerServing`'s doc below. This mount fetch exists
+  // so the dialog's OWN content (the vendor grid, the "pinned to X" line,
+  // mode statuses) isn't a blank loading spinner for a beat the very first
+  // time the dialog opens. This is the legitimate use of an Effect —
+  // fetching on mount — and the setState lands in the promise callback, not
+  // synchronously in the Effect body, so it is not the cascading-render
+  // smell `react-hooks/set-state-in-effect` exists to catch. A failure
+  // stays silent here: the dialog just shows its own loading/empty state
+  // when actually opened, which fetches again anyway.
   useEffect(() => {
     void getProviderStatus().then((res) => {
       if (res.ok) setState({ phase: 'ready', data: res.data })
@@ -313,7 +519,10 @@ export function ProviderSettingsButton() {
   }, [])
 
   /** Opens the dialog and fetches fresh state — invoked from the trigger
-   *  button's `onClick`, i.e. a real user event, not an Effect. */
+   *  button's `onClick`, i.e. a real user event, not an Effect.
+   *  `autoStart: true` is Varun's "clicking ai should start it": if the
+   *  fresh load shows an already-configured provider with no live agent
+   *  session, `load()` itself kicks off the checking+starting stages. */
   function openDialog() {
     setOpen(true)
     setApiKey('')
@@ -324,7 +533,11 @@ export function ProviderSettingsButton() {
     setDiscovery(null)
     setConsent(false)
     setSaveError(null)
-    load()
+    // Invalidate any in-flight connect flow from a previous open so its
+    // late `setConnectFlow` calls can't land on this fresh dialog state.
+    flowTokenRef.current++
+    setConnectFlow(null)
+    load({ autoStart: true })
   }
 
   const data = state.phase === 'ready' ? state.data : null
@@ -425,46 +638,24 @@ export function ProviderSettingsButton() {
     }
   }
 
-  async function save() {
-    if (!selectedProviderId || !selectedMode) return
-    setSaving(true)
-    setSaveError(null)
-    const trimmedModel = model.trim()
-    const res = await putProvider({
-      provider: selectedProviderId,
-      mode: selectedMode,
-      model: trimmedModel || undefined,
-      // Carry the consent the user already gave for this provider+mode. The
-      // checkbox resets every time the dialog opens, so without this a
-      // model-only change on an ACTIVE subscription posts consent:false and
-      // the backend correctly refuses — the button enables, the save looks
-      // like it worked, and nothing changes. Only ever true when this exact
-      // provider+mode is already the live config; a NEW local-process mode
-      // still requires a fresh, explicit tick.
-      consent_spawn_local_process: consent || alreadyConsentedToThisMode,
-      ...(selectedMode === 'api_key' ? { api_key: apiKey } : {}),
-    })
-    setSaving(false)
-    if (!res.ok) {
-      setSaveError(
-        res.kind === 'unavailable'
-          ? 'Save endpoint not available yet.'
-          : [res.message, res.hint].filter(Boolean).join(' — '),
-      )
-      return
-    }
-    load()
-  }
-
   async function clear() {
     setClearing(true)
     setSaveError(null)
+    // Invalidate any in-flight connect run — the provider it was starting
+    // a harness for is about to stop being the saved config.
+    flowTokenRef.current++
+    setConnectFlow(null)
     const res = await deleteProvider()
     setClearing(false)
     if (!res.ok) {
       setSaveError(res.kind === 'unavailable' ? 'Clear endpoint not available yet.' : res.message)
       return
     }
+    // The saved config this session was pinned to is gone — a harness left
+    // running against it would be a live agent session with no
+    // corresponding "connected" claim anywhere in the UI. Tear it down so
+    // the chip honestly drops to red along with the config.
+    resetAcpClient()
     load()
   }
 
@@ -518,6 +709,7 @@ export function ProviderSettingsButton() {
     !!selectedMode &&
     selectedEntry?.wiring.status === 'wired' &&
     !isConfigured &&
+    connectFlow?.status !== 'running' &&
     (selectedMode === 'api_key'
       ? !!apiKey &&
         (keyTested || discoveryVerifiedForCurrentKey) &&
@@ -526,15 +718,23 @@ export function ProviderSettingsButton() {
         ? (consent || alreadyConsentedToThisMode) && cliDetectionOk
         : true)
 
-  // Drives the chip. `ai_configured` alone is the WRONG signal: it reports
-  // whether the /api/ai REST routes can serve, and the subscription-CLI mode
-  // deliberately does not serve those (tool_use is not carried over the CLI
-  // transport) — so a genuinely connected Max account read as "not connected".
-  // A provider the user has actually configured is `active`; that is what the
-  // chip reports. Still never optimistic: an unreachable or 404 endpoint
-  // leaves both false.
-  const providerServing =
-    state.phase === 'ready' && (state.data.active !== null || state.data.ai_configured)
+  // Drives the chip. Config alone (`active !== null` / `ai_configured`) used
+  // to be the signal — and that was the bug: it reports whether a provider
+  // is SAVED, not whether the agent is RUNNING. goose only actually starts
+  // when `getAcpClient()`/`establishAcpSession()` completes an
+  // `initialize()` + `session/new` round-trip, which used to happen
+  // invisibly on the user's first Blackboard message — so "connect a
+  // provider" lit the chip green over an agent that had not started yet.
+  // `acpLive` (`useAcpSessionStore`) is the one fact that's actually true
+  // only while a live `/acp` session exists: set by `startSession` when
+  // `establishAcpSession()`/the first turn succeeds, cleared by
+  // `endSession` the moment the session drops (`AcpClient.onDisconnect` —
+  // backend restart, SSE inactivity watchdog, an explicit
+  // `resetAcpClient()`) — see `acp-session-store.ts`'s module doc. Because
+  // this is a live store subscription (`useAcpSessionStore((s) => s.live)`
+  // above), the chip re-renders the instant a session drops, never staying
+  // green on a stale success.
+  const providerServing = acpLive
 
   // Non-null only when discovery succeeded for the exact key currently in
   // the box — the model field becomes a picker over this REAL list
@@ -640,16 +840,32 @@ export function ProviderSettingsButton() {
           <div className="flex max-h-[60vh] flex-col gap-3 overflow-y-auto pr-1 pt-2">
             {/* Connected readout — one line, never a card of transport
                 prose. The interactive controls for changing any of this
-                live in the panel below, never duplicated up here. */}
+                live in the panel below, never duplicated up here.
+                Colour + the "agent running"/"agent not started" clause are
+                driven by `acpLive`, NOT by `data.active` alone — a saved
+                provider with no live session is a real, distinct state
+                (amber, not emerald) that needs its own control to resolve:
+                "Start agent" below, not just "Disconnect". */}
             {data.active && (
-              <div className="flex items-center justify-between gap-2 rounded-md border border-emerald-500/40 bg-emerald-500/5 px-3 py-1.5">
+              <div
+                className={cn(
+                  'flex items-center justify-between gap-2 rounded-md border px-3 py-1.5',
+                  acpLive
+                    ? 'border-emerald-500/40 bg-emerald-500/5'
+                    : 'border-amber-500/40 bg-amber-500/5',
+                )}
+              >
                 <span className="flex flex-wrap items-center gap-1 text-[11px] text-foreground/90">
                   <VendorMark
                     providerId={data.active.provider}
                     displayName={activeProviderMeta?.display_name ?? data.active.provider}
                     className="h-3.5 w-3.5"
                   />
-                  <CheckCircle2 size={12} className="text-emerald-500" />
+                  {acpLive ? (
+                    <CheckCircle2 size={12} className="text-emerald-500" />
+                  ) : (
+                    <XCircle size={12} className="text-amber-400" />
+                  )}
                   <span className="font-medium">
                     {activeProviderMeta?.display_name ?? data.active.provider}
                   </span>
@@ -660,46 +876,119 @@ export function ProviderSettingsButton() {
                     {data.active.model && data.active.model_verified === false && ' (unverified)'}
                     {data.active.model && data.active.model_verified === true && ' (verified)'}
                   </span>
+                  <span className={acpLive ? 'text-emerald-500' : 'text-amber-400/90'}>
+                    · {acpLive ? 'agent running' : 'agent not started'}
+                  </span>
                 </span>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  className="h-6 shrink-0 px-2 text-[11px]"
-                  disabled={clearing}
-                  onClick={() => void clear()}
-                >
-                  {clearing ? 'Disconnecting…' : 'Disconnect'}
-                </Button>
+                <div className="flex shrink-0 items-center gap-1.5">
+                  {!acpLive && (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="h-6 px-2 text-[11px]"
+                      disabled={connectFlow?.status === 'running'}
+                      onClick={() =>
+                        void runConnect({
+                          save: false,
+                          provider: data.active!.provider,
+                          mode: data.active!.mode as CredentialMode,
+                        })
+                      }
+                    >
+                      {connectFlow?.status === 'running' ? 'Starting…' : 'Start agent'}
+                    </Button>
+                  )}
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-6 px-2 text-[11px]"
+                    disabled={clearing}
+                    onClick={() => void clear()}
+                  >
+                    {clearing ? 'Disconnecting…' : 'Disconnect'}
+                  </Button>
+                </div>
+              </div>
+            )}
+
+            {/* The connect flow's real stage list — transient by design
+                (Varun: "pop feels too crowded"). It is mounted while a run
+                is in progress, and on FAILURE it stays mounted with the
+                failing stage and its reason fully visible — that is
+                precisely when the detail is needed, and collapsing it would
+                hide the only diagnostic. Once a run reaches `ready`, the
+                stage list unmounts: the header card's `agent
+                running`/`agent not started` clause above already carries
+                that outcome, so a three-second-old stage list would only be
+                a permanent shelf for a transient event. Rows are whatever
+                `runConnect` set as `steps` for THIS run: a re-establish-only
+                run never shows a "saving" row it isn't performing. */}
+            {connectFlow && connectFlow.status !== 'ready' && (
+              <div className="flex flex-col gap-1.5 rounded-md border border-border/60 bg-background/40 px-3 py-2">
+                {connectFlow.steps.map((step, i) => {
+                  const failedHere = connectFlow.status === 'failed' && connectFlow.failure?.step === step
+                  const isCurrent = connectFlow.status === 'running' && connectFlow.current === i
+                  const pastThisStep =
+                    connectFlow.status === 'failed'
+                      ? i < connectFlow.steps.indexOf(connectFlow.failure!.step)
+                      : connectFlow.status === 'ready' || i < connectFlow.current
+                  // The harness-start row is tied to the SAME live fact the
+                  // chip reads, not to "the promise resolved" — if the
+                  // session drops right after connect, this row un-ticks
+                  // instead of leaving a stale check above a red chip.
+                  const done = step === 'starting' && connectFlow.status === 'ready' ? acpLive : pastThisStep
+                  return (
+                    <div key={step} className="flex items-start gap-2 text-[11px]">
+                      {failedHere ? (
+                        <XCircle size={12} className="mt-0.5 shrink-0 text-red-400" />
+                      ) : done ? (
+                        <CheckCircle2 size={12} className="mt-0.5 shrink-0 text-emerald-500" />
+                      ) : isCurrent ? (
+                        <Loader2 size={12} className="mt-0.5 shrink-0 animate-spin text-muted-foreground" />
+                      ) : (
+                        <span className="mt-1 h-1.5 w-1.5 shrink-0 rounded-full bg-muted-foreground/30" />
+                      )}
+                      <span
+                        className={cn(
+                          failedHere ? 'text-red-400' : done ? 'text-foreground/90' : 'text-muted-foreground',
+                        )}
+                      >
+                        {CONNECT_STEP_LABELS[step]}
+                        {failedHere && connectFlow.failure && (
+                          <span className="mt-0.5 block text-red-400/90">{connectFlow.failure.message}</span>
+                        )}
+                      </span>
+                    </div>
+                  )
+                })}
               </div>
             )}
 
             {/* Two surfaces, two facts — never one global verdict.
                 `ai_configured` describes ONLY the REST surface
                 (/api/ai/command needs a native provider with a real
-                credential); the agent surface (/acp) is pinned by the
-                saved config and serves fine without one (subscription_cli
-                deliberately has no API key). Collapsing them into one
-                boolean is exactly how a fully working agent read as "not
-                connected". Each line reports the backend's own fact for
-                that surface: `active` for the agent pin, `ai_configured`
-                for REST. Tri-state per card-chrome's Claim contract:
-                amber "not asserted" for the agent surface when nothing is
-                saved (the boot fallback may or may not hold a credential
-                — the backend hasn't claimed either), never a guessed
-                tick or cross. */}
+                credential); the agent surface (/acp) is the LIVE session
+                fact (`acpLive`), never just "a provider is pinned" — the
+                same distinction the chip and the readout above now make.
+                Collapsing "pinned" and "running" into one boolean here is
+                exactly the bug this whole dialog was rewritten to remove.
+                The agent-surface Claim only renders when nothing is
+                saved: once `data.active` exists, the header card above
+                already carries this exact fact ("agent running"/"agent
+                not started") plus the pinned provider/mode — repeating it
+                here would be the restatement Varun flagged. The one case
+                that fact has nowhere else to live is `data.active ===
+                null`, where no header card renders at all — that case
+                keeps its own line, tri-state per card-chrome's Claim
+                contract: amber "not asserted" (the boot fallback may or
+                may not hold a credential — the backend hasn't claimed
+                either), never a guessed tick or cross. */}
             <div className="flex flex-col gap-1 rounded-md border border-border/60 bg-background/40 px-3 py-2">
-              <Claim
-                status={data.active !== null ? true : null}
-                detail={
-                  data.active
-                    ? `pinned to ${data.active.provider} · ${
-                        MODE_SHORT_LABELS[data.active.mode as CredentialMode] ?? data.active.mode
-                      }`
-                    : 'no saved provider — whatever the backend resolved at boot'
-                }
-              >
-                Agent surface (/acp — the Blackboard agent)
-              </Claim>
+              {data.active === null && (
+                <Claim status={null} detail="whatever the backend resolved at boot">
+                  Agent surface (/acp) — no saved provider
+                </Claim>
+              )}
               <Claim
                 status={data.ai_configured}
                 detail={
@@ -726,52 +1015,54 @@ export function ProviderSettingsButton() {
                 const isSelected = provider.id === selectedProviderId
                 const wireState = providerWireState(data, provider)
                 return (
-                  <button
-                    key={provider.id}
-                    type="button"
-                    onClick={() => selectProvider(provider)}
-                    title={`${provider.display_name} — ${STATE_LABELS[wireState]}`}
-                    aria-label={`${provider.display_name} (${STATE_LABELS[wireState]})`}
-                    aria-pressed={isSelected}
-                    className={cn(
-                      'relative flex h-14 w-14 shrink-0 items-center justify-center rounded-xl border-2 transition-all',
-                      isSelected
-                        ? '-translate-y-0.5 border-primary/70 bg-primary/10 opacity-100 shadow-md'
-                        : 'border-border/50 opacity-70 hover:opacity-100 hover:bg-accent/30',
-                    )}
-                  >
-                    <VendorMark
-                      providerId={provider.id}
-                      displayName={provider.display_name}
-                      className="h-7 w-7"
+                  <Tooltip key={provider.id}>
+                    <TooltipTrigger
+                      render={
+                        <button
+                          type="button"
+                          onClick={() => selectProvider(provider)}
+                          aria-label={`${provider.display_name} (${STATE_LABELS[wireState]})`}
+                          aria-pressed={isSelected}
+                          className={cn(
+                            'relative flex h-14 w-14 shrink-0 items-center justify-center rounded-xl border-2 transition-all',
+                            isSelected
+                              ? '-translate-y-0.5 border-primary/70 bg-primary/10 opacity-100 shadow-md'
+                              : 'border-border/50 opacity-70 hover:opacity-100 hover:bg-accent/30',
+                          )}
+                        >
+                          <VendorMark
+                            providerId={provider.id}
+                            displayName={provider.display_name}
+                            className="h-7 w-7"
+                          />
+                          {/* Every mark carries this dot, always — not just
+                              the active one. Colour is the ONLY thing
+                              distinguishing the four states here; "wired but
+                              not connected" (amber/blue) must never look like
+                              "connected" (emerald) at a glance across the
+                              row. What each colour MEANS used to be spelled
+                              out in a standing legend below this row — that
+                              read as explanation, not recognition, so it
+                              moved into this tooltip (same text, on the dot
+                              itself), reachable by hover AND by keyboard
+                              focus (Base UI's Tooltip.Trigger opens on
+                              `onFocus`, not just `onMouseOver`). */}
+                          <span
+                            className={cn(
+                              'absolute -right-1 -top-1 h-2.5 w-2.5 rounded-full ring-2 ring-background',
+                              STATE_STYLES[wireState].dot,
+                            )}
+                            aria-hidden="true"
+                          />
+                        </button>
+                      }
                     />
-                    {/* Every mark carries this dot, always — not just the
-                        active one. Colour is the ONLY thing distinguishing
-                        the four states here; "wired but not connected"
-                        (amber/blue) must never look like "connected"
-                        (emerald) at a glance across the row. */}
-                    <span
-                      className={cn(
-                        'absolute -right-1 -top-1 h-2.5 w-2.5 rounded-full ring-2 ring-background',
-                        STATE_STYLES[wireState].dot,
-                      )}
-                      aria-hidden="true"
-                    />
-                  </button>
+                    <TooltipContent>
+                      {provider.display_name} — {STATE_LABELS[wireState]}
+                    </TooltipContent>
+                  </Tooltip>
                 )
               })}
-            </div>
-
-            {/* Legend — the colour code only works if it's explained once,
-                in the same dialog, not left for the user to reverse-engineer
-                from four dots. */}
-            <div className="flex flex-wrap items-center gap-x-3 gap-y-1 px-0.5 text-[10px] text-muted-foreground">
-              {(Object.keys(STATE_LABELS) as WireState[]).map((s) => (
-                <span key={s} className="flex items-center gap-1">
-                  <span className={cn('h-1.5 w-1.5 rounded-full', STATE_STYLES[s].dot)} aria-hidden="true" />
-                  {STATE_LABELS[s]}
-                </span>
-              ))}
             </div>
 
             {/* Selected vendor's options — one vendor at a time, no
@@ -785,59 +1076,73 @@ export function ProviderSettingsButton() {
                     const disabled = state === 'unavailable'
                     const status = modeStatus(data, entry, selectedProvider)
                     // Only present when `wiring.status === 'seam_only'` —
-                    // the backend's own reason, verbatim, rendered as
-                    // standing text (not just a `title` tooltip, which
-                    // browsers are inconsistent about firing on disabled
-                    // buttons) so it can never be missed.
+                    // the backend's own reason, verbatim. It used to render
+                    // as a standing paragraph under every seam-only row
+                    // (permanent shelf space for a mode most sessions never
+                    // pick); it now lives in the row's own tooltip below,
+                    // same text, reachable on demand instead of always on
+                    // screen.
                     const seamReason = entry.wiring.status === 'seam_only' ? entry.wiring.reason : null
                     return (
-                      <div key={entry.mode} className="flex flex-col gap-0.5">
-                        <button
-                          type="button"
-                          disabled={disabled}
-                          onClick={() => {
-                            setSelectedMode(entry.mode)
-                            setTestResult(null)
-                            setTestedFor(null)
-                            // Unreachable today (every discovery-capable
-                            // vendor is api_key-only, so switching modes
-                            // within one vendor can't currently straddle
-                            // a discovery result) — reset anyway for the
-                            // same staleness discipline applied to every
-                            // other per-key/per-mode piece of state here.
-                            setDiscovery(null)
-                            setSaveError(null)
-                          }}
-                          title={seamReason ?? entry.reason}
-                          className={cn(
-                            'flex w-full items-center justify-between gap-2 rounded border px-2 py-1.5 text-left text-xs transition-colors',
-                            disabled
-                              ? 'cursor-not-allowed border-dashed border-border/40 opacity-60'
-                              : active
-                                ? 'border-primary/60 bg-primary/10'
-                                : 'border-border hover:bg-accent/30',
-                          )}
-                        >
-                          <span className="flex items-center gap-1.5 font-medium">
-                            <span
-                              className={cn('h-1.5 w-1.5 shrink-0 rounded-full', STATE_STYLES[state].dot)}
-                              aria-hidden="true"
-                            />
-                            {MODE_LABELS[entry.mode]}
-                            {entry.spawns_local_process && (
-                              <Terminal
-                                size={10}
-                                className="text-amber-400/90"
-                                aria-label="Spawns a local process on this machine"
-                              />
-                            )}
-                          </span>
-                          <span className={cn('shrink-0', STATE_STYLES[state].text)}>{status.text}</span>
-                        </button>
-                        {seamReason && (
-                          <p className="px-2 text-[10px] leading-snug text-muted-foreground">{seamReason}</p>
-                        )}
-                      </div>
+                      <Tooltip key={entry.mode}>
+                        <TooltipTrigger
+                          render={
+                            <button
+                              type="button"
+                              // `aria-disabled`, NOT the native `disabled`
+                              // attribute: a natively disabled button can't
+                              // receive focus or hover in most browsers,
+                              // which would make this row's tooltip —
+                              // carrying the ONLY explanation for why a
+                              // seam-only mode isn't selectable — reachable
+                              // by mouse-hover only, breaking Varun's "a row
+                              // readable without a mouse" rule for exactly
+                              // the row that most needs it. The click
+                              // handler below still refuses the action.
+                              aria-disabled={disabled}
+                              onClick={() => {
+                                if (disabled) return
+                                setSelectedMode(entry.mode)
+                                setTestResult(null)
+                                setTestedFor(null)
+                                // Unreachable today (every discovery-capable
+                                // vendor is api_key-only, so switching modes
+                                // within one vendor can't currently straddle
+                                // a discovery result) — reset anyway for the
+                                // same staleness discipline applied to every
+                                // other per-key/per-mode piece of state here.
+                                setDiscovery(null)
+                                setSaveError(null)
+                              }}
+                              className={cn(
+                                'flex w-full items-center justify-between gap-2 rounded border px-2 py-1.5 text-left text-xs transition-colors',
+                                disabled
+                                  ? 'cursor-not-allowed border-dashed border-border/40 opacity-60'
+                                  : active
+                                    ? 'border-primary/60 bg-primary/10'
+                                    : 'border-border hover:bg-accent/30',
+                              )}
+                            >
+                              <span className="flex items-center gap-1.5 font-medium">
+                                <span
+                                  className={cn('h-1.5 w-1.5 shrink-0 rounded-full', STATE_STYLES[state].dot)}
+                                  aria-hidden="true"
+                                />
+                                {MODE_LABELS[entry.mode]}
+                                {entry.spawns_local_process && (
+                                  <Terminal
+                                    size={10}
+                                    className="text-amber-400/90"
+                                    aria-label="Spawns a local process on this machine"
+                                  />
+                                )}
+                              </span>
+                              <span className={cn('shrink-0', STATE_STYLES[state].text)}>{status.text}</span>
+                            </button>
+                          }
+                        />
+                        <TooltipContent>{seamReason ?? entry.reason}</TooltipContent>
+                      </Tooltip>
                     )
                   })}
                 </div>
@@ -966,12 +1271,15 @@ export function ProviderSettingsButton() {
                       </p>
                     )}
 
-                    {selectedMode === 'workload_identity' && (
-                      <p className="text-[11px] text-muted-foreground">
-                        Detected from environment variables on the backend&apos;s deployment —
-                        nothing to enter here.
-                      </p>
-                    )}
+                    {/* No `workload_identity` branch here: this whole panel
+                        is gated on `selectedEntry.wiring.status === 'wired'`
+                        above, and `workload_identity` is `SeamOnly` for
+                        every provider that lists it (`allowlist.rs`) — so
+                        that branch could never render. Its explanation (WIF
+                        env vars are detected but the token exchange isn't
+                        wired yet) lives on the mode row's own tooltip,
+                        alongside the "not yet wired" status text, which is
+                        the state that's actually reachable. */}
 
                     {/* Model — the ONE model control in this dialog, and a
                         plain, unambiguous picker: no colour, no inline
@@ -1088,9 +1396,15 @@ export function ProviderSettingsButton() {
                         size="sm"
                         className="h-7 px-3 text-[11px]"
                         disabled={!canSave || saving}
-                        onClick={() => void save()}
+                        onClick={() => void runConnect({ save: true })}
                       >
-                        {saving ? 'Saving…' : isConfigured ? 'Saved' : 'Save'}
+                        {saving
+                          ? 'Saving…'
+                          : connectFlow?.status === 'running'
+                            ? 'Connecting…'
+                            : isConfigured
+                              ? 'Saved'
+                              : 'Save'}
                       </Button>
                     </div>
                   </div>

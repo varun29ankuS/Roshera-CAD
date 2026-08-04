@@ -304,10 +304,11 @@ function perceptionFromBody(r: any): any {
     // DOCUMENT-level durability disclosure, present ONLY when the backend's
     // response carried one (a QUARANTINED document — see `/perception`'s
     // `durability` field). Never fabricated; absent means nothing withheld.
-    // NOTE: a mutating op's OWN embedded response (`certified_response` in
-    // main.rs) does not carry this field yet, so it is not reachable from
-    // THIS function on the embedded-reuse path — only when the raw body `r`
-    // is itself a `/perception` (or perception-shaped) response.
+    // `r.perception?.durability` is what makes this reachable on the
+    // embedded-reuse path too: a mutating op's OWN response (`certified_response`
+    // in main.rs) now embeds `durability` at `body.perception.durability` on a
+    // quarantined document, so `r` being the raw mutating body (not just a
+    // `/perception`-shaped response) already carries it here.
     durability: r.durability ?? r.perception?.durability ?? undefined,
     verdict:
       (r.verdict ?? r.perception?.verdict) ??
@@ -571,12 +572,12 @@ export async function perceive(partId: number | null): Promise<any> {
       // pointers — the optimisation oracle).
       cert: cert ?? undefined,
       // DOCUMENT-level durability disclosure straight off this GET /perception
-      // response — present ONLY on a QUARANTINED document. This is the path
-      // that actually carries it in the ambient pipeline today: the FAST
-      // PATH above (reused from a mutating op's own embedded response) does
-      // NOT yet, since `certified_response` (api-server/src/main.rs) has no
-      // durability field — that would need a main.rs change out of this
-      // module's scope.
+      // response — present ONLY on a QUARANTINED document. The FAST PATH above
+      // (reused from a mutating op's own embedded response, via
+      // `perceptionFromBody`) carries the same field too: `certified_response`
+      // (api-server/src/main.rs) now embeds `durability` under
+      // `body.perception.durability` on a quarantined document, which
+      // `perceptionFromBody`'s `r.perception?.durability` picks up.
       durability: p?.durability ?? undefined,
       verdict:
         p?.verdict ??
