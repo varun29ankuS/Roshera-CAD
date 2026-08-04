@@ -59,5 +59,23 @@ ruststep = { git = "https://github.com/ricosjp/ruststep", rev = "43931fbaaed2e2a
 tempfile = "3.8"
 tokio-test = "0.4"
 
+# Borrowed PRIMITIVES for the independent oracle
+# (`tests/ros_independent_oracle.rs`) — never the format's own code paths.
+#
+# The oracle re-derives the .ros encrypted chain from `ros-format`'s
+# `keys.rs` read as a SPEC: its own HMAC-SHA256, its own HKDF, its own
+# chunk-IV construction, its own leaf set. What it cannot reasonably
+# rebuild from scratch is the two heavy primitives at the ends of that
+# chain — a memory-hard password hash and an AEAD — so it reaches for the
+# same crates ros-format does, directly, exactly as it already borrows the
+# raw curve25519 operation for Ed25519. The BINDING (which bytes go into
+# which primitive, under which key, with which nonce) is entirely the
+# oracle's own work, and that binding is where the KDF defect lived.
+#
+# Both are already in the lock file via `ros-format`; declaring them here
+# resolves nothing new.
+argon2 = "0.5"
+aes-gcm = "0.10"
+
 [lints]
 workspace = true

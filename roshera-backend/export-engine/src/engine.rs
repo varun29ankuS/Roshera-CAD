@@ -1,7 +1,8 @@
 //! Main export engine implementation
 
 use crate::formats::ros::{
-    export_brep_to_ros, HistData, RosExportOptions, RosExportPayload, RosImport, RosWriteSummary,
+    export_brep_to_ros, HistData, RosExportOptions, RosExportPayload, RosFileVerification,
+    RosImport, RosWriteSummary,
 };
 use crate::formats::step::{
     export_brep_to_step, import_step_text_with_report, import_step_to_brep, ImportReport,
@@ -147,6 +148,21 @@ impl ExportEngine {
         let filepath = self.output_dir.join(filename);
 
         crate::formats::ros::import_ros(&filepath, password).await
+    }
+
+    /// Verify a `.ros` file in the export directory WITHOUT its password.
+    ///
+    /// Returns the signature verdict, the header facts and the chunk
+    /// inventory; never any chunk contents. The v3.2 signature covers
+    /// the post-encryption on-disk bytes and SIGN is never encrypted
+    /// precisely so an encrypted artifact can be checked for integrity
+    /// and authorship by someone who cannot read it — see
+    /// [`crate::formats::ros::verify_ros_file`] for exactly what a caller
+    /// does and does not learn.
+    pub async fn verify_ros(&self, filename: &str) -> Result<RosFileVerification, ExportError> {
+        let filepath = self.output_dir.join(filename);
+
+        crate::formats::ros::verify_ros_file(&filepath).await
     }
 
     /// Export B-Rep model to STEP format

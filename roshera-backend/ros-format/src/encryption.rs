@@ -585,7 +585,7 @@ mod tests {
     fn test_chunk_encryption_roundtrip() {
         let manager = test_key_manager();
         let key_set = manager
-            .generate_key_set("test_password", &random_16())
+            .generate_key_set("test_password", &random_16(), &random_16())
             .unwrap();
         let file_iv = [1, 2, 3, 4, 5, 6, 7, 8];
 
@@ -617,7 +617,7 @@ mod tests {
     fn test_streaming_encryption() {
         let manager = test_key_manager();
         let key_set = manager
-            .generate_key_set("test_password", &random_16())
+            .generate_key_set("test_password", &random_16(), &random_16())
             .unwrap();
         let key = key_set.get_chunk_key(b"GEOM").unwrap().clone();
         let iv = [1u8; 12];
@@ -717,7 +717,7 @@ mod tests {
     fn test_error_handling() {
         let manager = test_key_manager();
         let key_set = manager
-            .generate_key_set("test_password", &random_16())
+            .generate_key_set("test_password", &random_16(), &random_16())
             .unwrap();
         let file_iv = [1, 2, 3, 4, 5, 6, 7, 8];
 

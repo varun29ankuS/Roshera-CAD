@@ -1,3 +1,9 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+// Same header `ros_independent_oracle.rs` and `ros_integrity_coverage.rs`
+// carry; this file predates the convention and was clippy-red at HEAD.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! .ros SIGN chunk — the signature must be real, not decorative.
 //!
 //! RED-first context: before this suite, `sign: true` set the header's
@@ -178,6 +184,16 @@ async fn signed_file_roundtrips_verifies_and_carries_sign_chunk() {
 ///    This is the test that proves the signature is real, not
 ///    decorative — mutation-proven against `verify_signature` returning
 ///    an unconditional Ok(true).
+///
+///    STRENGTHENED for .ros v3.2: the reader now validates every chunk's
+///    declared CRC-32, so a naive byte flip is refused at the CRC gate
+///    before the signature is ever consulted — which would leave this
+///    test passing for the wrong reason. It therefore repairs HIST's
+///    declared CRC after the flip, exactly as a competent tamperer would
+///    (the CRC is unauthenticated on its own; only the signature binds
+///    it). The original assertion is unchanged: the verdict must be
+///    `Invalid` and the reason must state the mismatch. The naive flip is
+///    covered separately by `ros_integrity_coverage.rs`.
 #[tokio::test]
 async fn tampered_hist_byte_flips_verdict_to_invalid() {
     let dir = TempDir::new().expect("tempdir");
@@ -206,6 +222,25 @@ async fn tampered_hist_byte_flips_verdict_to_invalid() {
         hist_span
     );
     bytes[pos] ^= 0x01; // flip one bit inside the signed region
+
+    // Repair HIST's declared CRC-32 so the flip survives the reader's
+    // CRC gate and the SIGNATURE is what has to catch it. The declared
+    // CRC lives at index-entry offset +32 (see `ChunkIndexEntry::
+    // write_to`); HIST's entry is the i-th 96-byte slot in the index.
+    {
+        let (header, table) = read_chunk_table(bytes.clone());
+        let hist_pos = table
+            .iter()
+            .position(|e| e.chunk_type == ChunkType::HIST.as_fourcc())
+            .expect("HIST is in the table");
+        let hist_entry = table.get(hist_pos).expect("HIST entry");
+        let span =
+            hist_entry.offset as usize..(hist_entry.offset + hist_entry.size_on_disk()) as usize;
+        let repaired = ros_format::util::crc32(&bytes[span]);
+        let crc_field =
+            header.index_offset as usize + hist_pos * ros_format::CHUNK_INDEX_ENTRY_SIZE + 32;
+        bytes[crc_field..crc_field + 4].copy_from_slice(&repaired.to_le_bytes());
+    }
     std::fs::write(&path, &bytes).expect("write tampered file");
 
     let imported = import_ros(&path, None)

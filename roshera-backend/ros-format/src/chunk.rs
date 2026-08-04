@@ -249,6 +249,30 @@ impl ChunkIndexEntry {
         Ok(entry)
     }
 
+    /// Serialize this entry to its 96-byte on-disk image.
+    ///
+    /// Same bytes [`write_to`](Self::write_to) emits, materialised so a
+    /// signer can cover the chunk index with the file signature. One
+    /// serializer, so the signed image and the stored image cannot
+    /// drift.
+    pub fn to_bytes(&self) -> Result<Vec<u8>> {
+        let mut buf = Vec::with_capacity(CHUNK_INDEX_ENTRY_SIZE);
+        self.write_to(&mut buf)?;
+        Ok(buf)
+    }
+
+    /// Verify this entry's declared CRC-32 against a chunk's on-disk
+    /// bytes.
+    ///
+    /// THE definition of "this chunk's declared CRC is correct", used by
+    /// both [`Chunk::verify_crc`] (in-memory) and the `.ros` reader
+    /// (which holds raw file bytes and no `Chunk`). Before this existed
+    /// the reader had no way to reach the check at all, so the CRC-32
+    /// field was written on every chunk and validated on none.
+    pub fn verify_crc(&self, data: &[u8]) -> bool {
+        crc32(data) == self.crc32
+    }
+
     /// Write chunk index entry (96 bytes)
     pub fn write_to<W: Write>(&self, writer: &mut W) -> Result<()> {
         writer.write_all(&self.chunk_type)?;
@@ -384,9 +408,10 @@ impl Chunk {
         self.data.len()
     }
 
-    /// Verify CRC32
+    /// Verify CRC32 — delegates to [`ChunkIndexEntry::verify_crc`] so
+    /// there is one rule in one place.
     pub fn verify_crc(&self) -> bool {
-        crc32(&self.data) == self.index.crc32
+        self.index.verify_crc(&self.data)
     }
 
     /// Update CRC32
