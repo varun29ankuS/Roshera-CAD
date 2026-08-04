@@ -8262,6 +8262,92 @@ mod tests {
         );
     }
 
+    /// `decode_intent_header` must reverse exactly what the MCP client's
+    /// `encodeURIComponent` produced — including non-ASCII — and treat
+    /// anything undecodable as ABSENT (`None`), never a guessed string.
+    #[test]
+    fn intent_header_decodes_utf8_and_refuses_malformed() {
+        // encodeURIComponent("Ø160 bolt circle — 8 × M8")
+        assert_eq!(
+            decode_intent_header("%C3%98160%20bolt%20circle%20%E2%80%94%208%20%C3%97%20M8")
+                .as_deref(),
+            Some("Ø160 bolt circle — 8 × M8")
+        );
+        // Plain ASCII passes through untouched; '+' is literal, not a space
+        // (encodeURIComponent never emits '+').
+        assert_eq!(
+            decode_intent_header("8+holes%2C%20close%20fit").as_deref(),
+            Some("8+holes, close fit")
+        );
+        // Truncated escape → absent, not a partial guess.
+        assert_eq!(decode_intent_header("cut%2"), None);
+        // Non-hex escape → absent.
+        assert_eq!(decode_intent_header("cut%zz"), None);
+        // Escapes decoding to invalid UTF-8 → absent, never lossy-replaced.
+        assert_eq!(decode_intent_header("%C3%28"), None);
+    }
+
+    /// `agent_intent_layer` must scope the DECODED phrase (and the turn)
+    /// into `INTENT_OVERRIDE` on the request task, and leave the task
+    /// scope-free when the header is absent — the exact task-local the
+    /// `TimelineRecorder` reads at `record()` time.
+    #[tokio::test]
+    async fn agent_intent_layer_scopes_the_decoded_header_per_request() {
+        use axum::routing::get;
+        use tower::ServiceExt;
+
+        async fn probe() -> String {
+            timeline_engine::recorder_bridge::INTENT_OVERRIDE
+                .try_with(|ctx| format!("{}|{}", ctx.text, ctx.turn_id.as_deref().unwrap_or("-")))
+                .unwrap_or_else(|_| "NO-SCOPE".to_string())
+        }
+        let router = axum::Router::new()
+            .route("/probe", get(probe))
+            .layer(axum::middleware::from_fn(agent_intent_layer));
+
+        let with_intent = router
+            .clone()
+            .oneshot(
+                axum::extract::Request::builder()
+                    .uri("/probe")
+                    .header(
+                        "X-Roshera-Intent",
+                        "%C3%98160%20bolt%20circle%20%E2%80%94%208%20%C3%97%20M8",
+                    )
+                    .header("X-Roshera-Intent-Turn", "14")
+                    .body(axum::body::Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("router responds");
+        let body = axum::body::to_bytes(with_intent.into_body(), 1024)
+            .await
+            .expect("body reads");
+        assert_eq!(
+            std::str::from_utf8(&body).expect("utf8 body"),
+            "Ø160 bolt circle — 8 × M8|14",
+            "the decoded phrase + turn must be live in INTENT_OVERRIDE on the request task"
+        );
+
+        let without_intent = router
+            .oneshot(
+                axum::extract::Request::builder()
+                    .uri("/probe")
+                    .body(axum::body::Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("router responds");
+        let body = axum::body::to_bytes(without_intent.into_body(), 1024)
+            .await
+            .expect("body reads");
+        assert_eq!(
+            std::str::from_utf8(&body).expect("utf8 body"),
+            "NO-SCOPE",
+            "no header → no scope: absence must stay absent, never defaulted"
+        );
+    }
+
     #[tokio::test]
     async fn test_enhanced_server() {
         // Test implementation
@@ -10183,6 +10269,10 @@ pub(crate) fn build_router(state: AppState) -> Router {
     };
 
     app.layer(axum::middleware::from_fn(agent_author_layer))
+        // Intent provenance: the same attribution problem as
+        // `agent_author_layer`, for the *why* instead of the *who* — see
+        // that middleware's doc. Scoped per request task, never shared.
+        .layer(axum::middleware::from_fn(agent_intent_layer))
         // Observed-agent-activity recorder (`agent_activity`): for any
         // request whose validated credential is a
         // `PrincipalKind::Agent` API key, records what/when/outcome
@@ -10245,6 +10335,86 @@ async fn agent_author_layer(
         }
         _ => next.run(request).await,
     }
+}
+
+/// Attribute kernel ops to the design intent the agent already declared.
+///
+/// The MCP intent gate refuses every solid-mutating call until the agent
+/// opens an intent checkpoint with a real engineering phrase; the MCP
+/// client then sends that phrase on every backend call as
+/// `X-Roshera-Intent` (URL-encoded — it is free text and may contain
+/// non-ASCII) plus `X-Roshera-Intent-Turn`. This layer decodes the phrase
+/// and runs the request inside an `INTENT_OVERRIDE` task-local scope;
+/// `TimelineRecorder::record` reads it synchronously on this same task and
+/// stamps an `IntentFacet` onto each recorded op.
+///
+/// A task-local, NOT `AppState` / a `DashMap` / any shared slot: two
+/// concurrent requests carrying different intents would cross-attribute
+/// through an ambient slot, producing provenance that is confidently wrong
+/// — worse than absent. Header absent or undecodable → zero-cost
+/// passthrough; the op records with no facet, and that absence stays
+/// absent and legible (never defaulted, never back-filled).
+async fn agent_intent_layer(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let text = request
+        .headers()
+        .get("x-roshera-intent")
+        .and_then(|v| v.to_str().ok())
+        .and_then(decode_intent_header);
+    match text {
+        Some(text) if !text.is_empty() => {
+            let turn_id = request
+                .headers()
+                .get("x-roshera-intent-turn")
+                .and_then(|v| v.to_str().ok())
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned);
+            timeline_engine::recorder_bridge::INTENT_OVERRIDE
+                .scope(
+                    timeline_engine::recorder_bridge::IntentContext { text, turn_id },
+                    next.run(request),
+                )
+                .await
+        }
+        _ => next.run(request).await,
+    }
+}
+
+/// Percent-decode an `X-Roshera-Intent` header value into UTF-8 text.
+///
+/// The MCP client encodes the checkpoint phrase with `encodeURIComponent`
+/// so the header value stays ASCII; this reverses exactly that encoding
+/// (`%XX` escapes; every other byte is literal — `encodeURIComponent`
+/// never emits `+` for a space, so `+` stays `+`). Returns `None` for a
+/// malformed escape or bytes that are not valid UTF-8: an undecodable
+/// intent is treated as ABSENT, never guessed at — fabricated provenance
+/// is worse than none.
+fn decode_intent_header(raw: &str) -> Option<String> {
+    fn hex_val(b: u8) -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            b'A'..=b'F' => Some(b - b'A' + 10),
+            _ => None,
+        }
+    }
+    let bytes = raw.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hi = bytes.get(i + 1).copied().and_then(hex_val)?;
+            let lo = bytes.get(i + 2).copied().and_then(hex_val)?;
+            out.push(hi * 16 + lo);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
 }
 
 /// Construct the outermost CORS layer.

@@ -34,7 +34,9 @@
 
 use std::sync::Arc;
 
-use geometry_engine::operations::recorder::{OperationRecorder, RecordedOperation, RecorderError};
+use geometry_engine::operations::recorder::{
+    IntentFacet, OperationRecorder, RecordedOperation, RecorderError,
+};
 use parking_lot::RwLock as PlRwLock;
 use tokio::sync::{mpsc, oneshot, RwLock};
 
@@ -99,6 +101,37 @@ tokio::task_local! {
     /// concurrent requests with different authors cannot mislabel each
     /// other — this is why the override is NOT a field on the recorder.
     pub static AUTHOR_OVERRIDE: Author;
+}
+
+/// The agent's open design intent for the ops recorded inside one request.
+///
+/// `text` is the intent-checkpoint phrase the MCP intent gate already forced
+/// the agent to declare before any solid-mutating call; `turn_id` is the
+/// gate's turn counter at the moment that checkpoint opened, when the client
+/// sent one. Carried per request by the api-server's `agent_intent_layer`
+/// (from `X-Roshera-Intent` / `X-Roshera-Intent-Turn`).
+#[derive(Debug, Clone)]
+pub struct IntentContext {
+    /// The checkpoint phrase, decoded to UTF-8 text.
+    pub text: String,
+    /// The client-side turn the checkpoint opened at, as free text.
+    /// `None` = not sent, never an empty string.
+    pub turn_id: Option<String>,
+}
+
+tokio::task_local! {
+    /// Per-task intent consulted by [`TimelineRecorder::record`].
+    ///
+    /// Same shape and same reasoning as [`AUTHOR_OVERRIDE`]: the recorder is
+    /// one process-wide instance, but the intent behind a kernel op belongs
+    /// to the REQUEST that triggered it. A task-local is scoped to the
+    /// request task — the same task that synchronously invokes the kernel
+    /// and therefore `record()` — so two concurrent requests with different
+    /// intents structurally cannot cross-attribute. This is why the intent
+    /// is NOT on `AppState`, a `DashMap`, or any shared slot: an ambient
+    /// slot under concurrency would produce provenance that is confidently
+    /// wrong, which is worse than absent.
+    pub static INTENT_OVERRIDE: IntentContext;
 }
 
 /// Shared, lock-protected handle to a [`Timeline`].
@@ -486,7 +519,7 @@ impl TimelineRecorder {
 }
 
 impl OperationRecorder for TimelineRecorder {
-    fn record(&self, operation: RecordedOperation) -> Result<(), RecorderError> {
+    fn record(&self, mut operation: RecordedOperation) -> Result<(), RecorderError> {
         // Resolve the author NOW, on the recording task: the task-local
         // override (set by the api-server for agent-tagged requests)
         // wins; otherwise fall back to the recorder's default. `record`
@@ -496,6 +529,44 @@ impl OperationRecorder for TimelineRecorder {
         let author = AUTHOR_OVERRIDE
             .try_with(Clone::clone)
             .unwrap_or_else(|_| self.author.clone());
+        // Stamp the request's open intent NOW, on the recording task, for
+        // exactly the reason the author is resolved here and not on the
+        // drain worker: the worker runs on a different task, where the
+        // task-local of whatever request happens to be live would be read —
+        // cross-attributed provenance, confidently wrong. A record that
+        // already carries an intent (a future kernel-side producer) is left
+        // untouched. No scope on this task → no facet: the op records
+        // exactly as before, and the absence stays absent and legible —
+        // never defaulted to a placeholder or back-filled from the op kind.
+        if operation.facets.intent().is_none() {
+            if let Ok(ctx) = INTENT_OVERRIDE.try_with(Clone::clone) {
+                let facet = IntentFacet {
+                    text: ctx.text,
+                    turn_id: ctx.turn_id,
+                    // `agent_stated`, deliberately NOT `human_verbatim`: the
+                    // checkpoint phrase is the AGENT'S OWN wording of what it
+                    // is doing, not text carried verbatim from a human turn
+                    // (no such path exists yet). The distinction is the whole
+                    // reason `source` exists — human-directed output can be
+                    // IP-protectable while purely AI-generated output is not,
+                    // so labelling agent text as human text would corrupt the
+                    // exact claim this field supports.
+                    source: "agent_stated".to_string(),
+                };
+                if let Err(err) = operation.facets.set_intent(&facet) {
+                    // A string-only payload cannot realistically fail to
+                    // serialize; if it ever does, record WITHOUT the facet
+                    // (honest absence) rather than dropping the op or
+                    // fabricating a partial intent.
+                    tracing::warn!(
+                        target: "timeline.recorder_bridge",
+                        kind = %operation.kind,
+                        error = %err,
+                        "failed to stamp IntentFacet — recording without it"
+                    );
+                }
+            }
+        }
         // Inside a staging window, divert into the buffer. This is the
         // H10 bridge contract: a `with_rollback` body that fails must
         // not leave partial events on the timeline. Lock scope kept
@@ -1286,5 +1357,201 @@ mod tests {
             3,
             "all 3 events reach the timeline after outer commit"
         );
+    }
+
+    /// Extract the `roshera.intent` facet payload from an event's replay
+    /// envelope, or `None` when the event carries no intent (which itself
+    /// asserts the whole `facets` key is honest — an op with no facets has
+    /// no `facets` key at all, per `envelope_omits_deleted_and_facets_when_empty`).
+    fn intent_of(event: &TimelineEvent) -> Option<serde_json::Value> {
+        match &event.operation {
+            Operation::Generic { parameters, .. } => parameters
+                .get("facets")
+                .and_then(|f| f.get(geometry_engine::operations::recorder::IntentFacet::NAME))
+                .cloned(),
+            other => panic!("expected Operation::Generic, got {:?}", other),
+        }
+    }
+
+    /// Await until the branch holds at least `n` events, then return them.
+    async fn drained_events(timeline: &SharedTimeline, n: usize) -> Vec<TimelineEvent> {
+        let main = BranchId::main();
+        for _ in 0..100 {
+            let count = timeline
+                .read()
+                .await
+                .get_branch_events(&main, None, None)
+                .map(|v| v.len())
+                .unwrap_or(0);
+            if count >= n {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        timeline
+            .read()
+            .await
+            .get_branch_events(&main, None, None)
+            .expect("branch events")
+    }
+
+    /// THE INTENT PRODUCER PIN. An op recorded while the request task's
+    /// `INTENT_OVERRIDE` scope is live must land on the timeline carrying an
+    /// `IntentFacet` with the scoped text, the scoped turn id, and
+    /// `source: "agent_stated"` (the checkpoint phrase is the agent's own
+    /// wording — never labelled as human text). An op recorded with no scope
+    /// must carry no facet at all: absence stays absent, never defaulted.
+    /// RED before the producer existed: `intent_of` returned `None` for the
+    /// scoped op too — the declaration was thrown away.
+    #[tokio::test]
+    async fn intent_scope_stamps_agent_stated_facet_and_absence_stays_absent() {
+        let timeline: SharedTimeline =
+            Arc::new(RwLock::new(Timeline::new(TimelineConfig::default())));
+        let recorder =
+            TimelineRecorder::new(Arc::clone(&timeline), Author::System, BranchId::main());
+
+        INTENT_OVERRIDE
+            .scope(
+                IntentContext {
+                    text: "bolt circle 8 x D18 on D160 B.C.".to_string(),
+                    turn_id: Some("14".to_string()),
+                },
+                async {
+                    recorder
+                        .record(RecordedOperation::new("with-intent"))
+                        .expect("record inside intent scope");
+                },
+            )
+            .await;
+        recorder
+            .record(RecordedOperation::new("without-intent"))
+            .expect("record outside intent scope");
+        drop(recorder);
+
+        let events = drained_events(&timeline, 2).await;
+        assert_eq!(events.len(), 2, "both records reach the timeline");
+
+        let stamped = events
+            .iter()
+            .find(|e| {
+                matches!(&e.operation, Operation::Generic { command_type, .. }
+                    if command_type == "with-intent")
+            })
+            .expect("the scoped op's event exists");
+        let facet = intent_of(stamped)
+            .expect("an op recorded inside an intent scope must carry the IntentFacet");
+        assert_eq!(facet["text"], "bolt circle 8 x D18 on D160 B.C.");
+        assert_eq!(facet["turn_id"], "14");
+        assert_eq!(
+            facet["source"], "agent_stated",
+            "the checkpoint phrase is the AGENT'S wording — it must be \
+             `agent_stated`, never a label claiming human authorship"
+        );
+
+        let unstamped = events
+            .iter()
+            .find(|e| {
+                matches!(&e.operation, Operation::Generic { command_type, .. }
+                    if command_type == "without-intent")
+            })
+            .expect("the unscoped op's event exists");
+        assert!(
+            intent_of(unstamped).is_none(),
+            "an op recorded with no open intent must carry NO facet — \
+             absence stays absent, never defaulted or back-filled"
+        );
+    }
+
+    /// THE CROSS-ATTRIBUTION PIN — the defect class this feature must never
+    /// have. Two concurrent recording tasks, each inside its OWN
+    /// `INTENT_OVERRIDE` scope with a DIFFERENT intent, both recording
+    /// before the drain worker applies either (the test holds the timeline
+    /// WRITE lock while both records land, pinning the worker at its
+    /// `read().await`, then releases it — the interleaving is DRIVEN, not
+    /// hoped for). Each event must carry ITS OWN intent. This is exactly
+    /// the interleaving where an ambient implementation — the task-local
+    /// read moved to the drain worker, or the intent parked in any shared
+    /// slot — attributes op-alpha to task beta's intent (or loses it
+    /// entirely, since the worker task has no scope). Mutation-proven RED
+    /// against the drain-worker/ambient-slot variant.
+    #[tokio::test(flavor = "current_thread")]
+    async fn concurrent_tasks_with_different_intents_never_cross_attribute() {
+        let timeline: SharedTimeline =
+            Arc::new(RwLock::new(Timeline::new(TimelineConfig::default())));
+        let recorder =
+            TimelineRecorder::new(Arc::clone(&timeline), Author::System, BranchId::main());
+
+        // Pin the drain worker: it needs `timeline.read().await` to apply
+        // an op, so holding the write lock guarantees BOTH records are in
+        // the channel before EITHER is applied — the window an ambient
+        // intent slot gets overwritten in.
+        let write_guard = timeline.write().await;
+
+        let alpha_recorder = recorder.clone();
+        let alpha = tokio::spawn(INTENT_OVERRIDE.scope(
+            IntentContext {
+                text: "alpha: M8 clearance holes, close fit, 4x base corners".to_string(),
+                turn_id: Some("3".to_string()),
+            },
+            async move {
+                alpha_recorder
+                    .record(RecordedOperation::new("op-alpha"))
+                    .expect("record op-alpha inside alpha's scope");
+            },
+        ));
+        let beta_recorder = recorder.clone();
+        let beta = tokio::spawn(INTENT_OVERRIDE.scope(
+            IntentContext {
+                text: "beta: shell 2mm, open top face".to_string(),
+                turn_id: Some("9".to_string()),
+            },
+            async move {
+                beta_recorder
+                    .record(RecordedOperation::new("op-beta"))
+                    .expect("record op-beta inside beta's scope");
+            },
+        ));
+        alpha.await.expect("alpha task completes");
+        beta.await.expect("beta task completes");
+
+        // Both records are now queued. Release the worker and drain.
+        drop(write_guard);
+        drop(recorder);
+
+        let events = drained_events(&timeline, 2).await;
+        assert_eq!(
+            events.len(),
+            2,
+            "both concurrent records reach the timeline"
+        );
+
+        for (kind, own_text) in [
+            (
+                "op-alpha",
+                "alpha: M8 clearance holes, close fit, 4x base corners",
+            ),
+            ("op-beta", "beta: shell 2mm, open top face"),
+        ] {
+            let event = events
+                .iter()
+                .find(|e| {
+                    matches!(&e.operation, Operation::Generic { command_type, .. }
+                        if command_type == kind)
+                })
+                .unwrap_or_else(|| panic!("{kind}'s event exists"));
+            let facet = intent_of(event).unwrap_or_else(|| {
+                panic!(
+                    "{kind} lost its intent — the facet must be stamped at \
+                     record() time on the requesting task, not read later on \
+                     the drain worker (which has no scope)"
+                )
+            });
+            assert_eq!(
+                facet["text"], own_text,
+                "{kind} must carry ITS OWN intent, never the concurrent \
+                 task's — cross-attribution is confidently-wrong provenance, \
+                 worse than absence"
+            );
+        }
     }
 }

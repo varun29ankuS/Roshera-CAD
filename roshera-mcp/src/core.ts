@@ -7,6 +7,10 @@
  */
 
 import { z } from "zod";
+// Import cycle note: gates.ts imports `api` from this module; both imports
+// are only dereferenced at call time (never during module evaluation) and
+// both are hoisted function declarations, so the ESM cycle is benign.
+import { currentOpenIntent } from "./gates.js";
 
 export const BASE = process.env.ROSHERA_URL ?? "http://localhost:8081";
 
@@ -60,6 +64,25 @@ export const PERCEPTION_TIMEOUT_MS = (() => {
   return Number.isFinite(n) && n > 0 ? n : 4000;
 })();
 
+/**
+ * Intent provenance headers for one backend call. When an intent checkpoint
+ * is open (gates.ts — the same state the intent gate enforces), every call
+ * carries it so the backend's agent_intent_layer can scope it onto the
+ * request task and the TimelineRecorder can stamp an IntentFacet onto the
+ * kernel ops this request records. The name is free text (may contain
+ * non-ASCII); HTTP header values must be ASCII, so it is URL-encoded here
+ * and percent-decoded server-side. No open intent → no headers at all: an
+ * absent intent stays absent on the wire, never defaulted.
+ */
+function intentHeaders(): Record<string, string> {
+  const intent = currentOpenIntent();
+  if (intent === null) return {};
+  return {
+    "X-Roshera-Intent": encodeURIComponent(intent.name),
+    "X-Roshera-Intent-Turn": String(intent.turn),
+  };
+}
+
 export async function api(
   method: "GET" | "POST" | "PATCH" | "DELETE",
   path: string,
@@ -75,6 +98,8 @@ export async function api(
         // every kernel op from this request as Author::AIAgent("Claude"),
         // so agent-built features show amber Ⓒ in the Timeline strip.
         "X-Roshera-Agent": "Claude",
+        // Intent provenance: the open checkpoint phrase, when one exists.
+        ...intentHeaders(),
         // Credential (empty object when ROSHERA_API_KEY is unset).
         ...AUTH_HEADERS,
         ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
