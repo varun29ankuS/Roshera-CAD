@@ -295,6 +295,51 @@ impl Timeline {
         self.append_internal(operation, author, branch_id, Some(sequence_number), None)
     }
 
+    /// [`add_operation_reserved`](Self::add_operation_reserved) plus a
+    /// per-event certificate — the write-half counterpart of
+    /// [`add_operation_certified`](Self::add_operation_certified) for a
+    /// pre-reserved sequence.
+    ///
+    /// Added for the recorder bridge's root-pid live/replay parity fix:
+    /// `add_operation_reserved` alone hardcodes `certificate: None`, so a
+    /// caller that switched a certified append over to the reserved path
+    /// would silently lose the event's `EventCertificate` — a regression,
+    /// not a detail, since every op that reserves its sequence (root-pid
+    /// on-demand reservation, `topology_builder::next_root_seed`) still
+    /// certifies at record time. Purely additive: existing callers of
+    /// `add_operation_reserved` / `add_operation_certified` are unaffected
+    /// and keep compiling unchanged.
+    pub async fn add_operation_reserved_certified(
+        &self,
+        operation: Operation,
+        author: Author,
+        branch_id: BranchId,
+        sequence_number: u64,
+        certificate: Option<crate::event_certificate::EventCertificate>,
+    ) -> TimelineResult<EventId> {
+        self.append_internal(
+            operation,
+            author,
+            branch_id,
+            Some(sequence_number),
+            certificate.as_ref(),
+        )
+    }
+
+    /// Clone of the raw sequence-counter handle, for a caller that needs to
+    /// reserve sequence numbers synchronously without acquiring whatever
+    /// lock this `Timeline` happens to be shared behind (e.g. the recorder
+    /// bridge's `reserve_event_key`, which runs on the kernel's synchronous
+    /// operation thread and cannot `.await` a `tokio::sync::RwLock` read
+    /// guard). Reading/incrementing the returned handle is exactly
+    /// equivalent to calling
+    /// [`reserve_sequence_number`](Self::reserve_sequence_number) on
+    /// `self` — both operate on the SAME underlying atomic, so the two can
+    /// never disagree or double-allocate a sequence number.
+    pub fn event_counter_handle(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.event_counter)
+    }
+
     /// Shared validate-then-insert core for the append paths. `reserved`:
     /// `None` burns a fresh sequence after validation (the `add_operation`
     /// contract); `Some(seq)` uses a pre-reserved sequence (the

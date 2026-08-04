@@ -337,6 +337,27 @@ pub struct RecordedOperation {
     /// fabricated one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub solid_certificate: Option<RecordedSolidCertificate>,
+
+    /// A timeline sequence number this operation's root persistent-ids were
+    /// minted under, if any (`BRepModel::next_root_seed`'s on-demand
+    /// reservation via [`OperationRecorder::reserve_event_key`]). Set by
+    /// `BRepModel::record_operation` immediately before forwarding to the
+    /// recorder — never by a caller constructing a `RecordedOperation`
+    /// directly. `None` is the honest default for every operation that did
+    /// not go through an on-demand reservation (no recorder attached, the
+    /// recorder's `reserve_event_key` is the no-op default, or root-pid
+    /// minting was suppressed inside a discard scope).
+    ///
+    /// This is a live-append INSTRUCTION, not replay data: a recorder that
+    /// honours it (the timeline bridge) must append this exact record at
+    /// this exact sequence number rather than burning a fresh one, so the
+    /// key a live operation minted its root pids under (`"evt:{this}"`)
+    /// matches what a later replay of the SAME event re-derives. It is
+    /// deliberately excluded from the replay envelope
+    /// (`recorder_bridge::to_timeline_operation`) — a value meaningful only
+    /// to the live append path, never persisted as event `parameters`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reserved_sequence: Option<u64>,
 }
 
 impl RecordedOperation {
@@ -350,6 +371,7 @@ impl RecordedOperation {
             deleted: Vec::new(),
             facets: Facets::default(),
             solid_certificate: None,
+            reserved_sequence: None,
         }
     }
 
@@ -729,6 +751,31 @@ pub trait OperationRecorder: Send + Sync + fmt::Debug {
     /// the discard-scope trio always allows certification to proceed.
     fn records_are_discarded(&self) -> bool {
         false
+    }
+
+    /// Reserve a stable event key for the operation about to run, so every
+    /// root persistent-id minted during it (`BRepModel::next_root_seed`)
+    /// derives from the SAME key a later replay of this exact event will
+    /// re-derive (`format!("evt:{sequence_number}")`, `replay::apply_event`).
+    ///
+    /// The live-authoring counterpart of that replay seed: without it, a
+    /// live root pid was minted from a process-local fallback
+    /// (`root_counter`) that a subsequent replay could never reproduce,
+    /// because replay always seeds from the event's own burned sequence
+    /// number. A recorder backed by a real, appendable timeline overrides
+    /// this to actually reserve a sequence (see
+    /// `timeline-engine::recorder_bridge::TimelineRecorder`); the returned
+    /// key must correspond to a sequence number the SAME recorder will
+    /// later honour when this operation's record reaches it (see
+    /// [`RecordedOperation::reserved_sequence`]).
+    ///
+    /// Default: `None` — `NullRecorder`, test capture recorders, and any
+    /// recorder not backed by a timeline sequence. `BRepModel::next_root_seed`
+    /// falls back to its process-local `root_counter` seed in that case,
+    /// which is exactly today's (pre-existing) behaviour — this default
+    /// keeps every existing recorder source-compatible and byte-identical.
+    fn reserve_event_key(&self) -> Option<String> {
+        None
     }
 }
 

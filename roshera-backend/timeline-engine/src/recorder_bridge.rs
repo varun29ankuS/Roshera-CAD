@@ -164,6 +164,25 @@ pub struct TimelineRecorder {
     /// event it applies to the timeline. `None` = in-memory-only (the pre-
     /// durability behaviour and every test that does not exercise persistence).
     sink: Option<Arc<dyn EventSink>>,
+    /// Shared handle to the destination timeline, kept ONLY so
+    /// [`reserve_event_key`](OperationRecorder::reserve_event_key) can
+    /// resolve [`event_counter`](Self::event_counter) — see that field.
+    /// Never used for anything requiring the write half of the lock.
+    timeline: SharedTimeline,
+    /// Lazily-resolved, then permanently cached, lock-free handle to the
+    /// timeline's raw sequence counter (`Timeline::event_counter_handle`).
+    ///
+    /// `OperationRecorder::reserve_event_key` is a synchronous, non-blocking
+    /// call made on the kernel's own operation thread — it cannot `.await`
+    /// `timeline`'s `tokio::sync::RwLock`. Resolving the raw `Arc<AtomicU64>`
+    /// ONCE, via a non-blocking `try_read`, and caching it here makes every
+    /// SUBSEQUENT reservation lock-free and infallible (a plain
+    /// `fetch_add`); only a reservation attempted before the first
+    /// successful resolution falls back to the caller's `root_counter`
+    /// default (see `reserve_event_key`'s doc comment). `Arc`-wrapped (not a
+    /// bare `OnceLock`) so cloned `TimelineRecorder` handles share ONE
+    /// resolution, matching `staging` / `branch_id`.
+    event_counter: Arc<std::sync::OnceLock<Arc<std::sync::atomic::AtomicU64>>>,
 }
 
 impl std::fmt::Debug for TimelineRecorder {
@@ -268,6 +287,10 @@ impl TimelineRecorder {
         let (tx, mut rx) = mpsc::channel::<RecorderCmd>(capacity);
         let branch_id = Arc::new(PlRwLock::new(branch_id));
 
+        // Kept on the recorder itself (see the `timeline` / `event_counter`
+        // field docs) BEFORE the handle below is moved into the worker task.
+        let recorder_timeline = Arc::clone(&timeline);
+
         let worker_branch = Arc::clone(&branch_id);
         let worker_timeline = timeline;
         let worker_sink = sink.clone();
@@ -291,10 +314,36 @@ impl TimelineRecorder {
                         // restarting the worker.
                         let target = *worker_branch.read();
                         let guard = worker_timeline.read().await;
-                        match guard
-                            .add_operation_certified(op, author, target, certificate)
-                            .await
-                        {
+                        // Root-pid reservation handoff (see
+                        // `topology_builder::next_root_seed` /
+                        // `reserve_event_key`): a record whose root pids were
+                        // minted under an on-demand reservation carries the
+                        // EXACT sequence number that reservation burned. That
+                        // number must be honoured verbatim — appending via
+                        // the normal (fresh-burn) path here would give this
+                        // event a DIFFERENT sequence than the one its root
+                        // pids were seeded from, reproducing the very defect
+                        // this seam exists to close, just moved one level
+                        // down.
+                        let append_result = match record.reserved_sequence {
+                            Some(seq) => {
+                                guard
+                                    .add_operation_reserved_certified(
+                                        op,
+                                        author,
+                                        target,
+                                        seq,
+                                        certificate,
+                                    )
+                                    .await
+                            }
+                            None => {
+                                guard
+                                    .add_operation_certified(op, author, target, certificate)
+                                    .await
+                            }
+                        };
+                        match append_result {
                             Ok(event_id) => {
                                 // Durability write-through. The event now carries
                                 // its burned `sequence_number`; persist it before
@@ -353,6 +402,8 @@ impl TimelineRecorder {
             branch_id,
             staging: Arc::new(PlRwLock::new(StagingState::default())),
             sink,
+            timeline: recorder_timeline,
+            event_counter: Arc::new(std::sync::OnceLock::new()),
         }
     }
 
@@ -547,6 +598,42 @@ impl OperationRecorder for TimelineRecorder {
 
     fn records_are_discarded(&self) -> bool {
         self.staging.read().discard_depth > 0
+    }
+
+    /// Reserve the timeline's next sequence number synchronously and return
+    /// it as `"evt:{seq}"` — the live-authoring counterpart of the key
+    /// `timeline_engine::replay::apply_event` seeds from
+    /// `event.sequence_number` before re-executing an event. See
+    /// `OperationRecorder::reserve_event_key`'s doc comment for the full
+    /// contract this closes.
+    ///
+    /// Resolves [`event_counter`](Self::event_counter) on first use (a
+    /// non-blocking `try_read` of [`timeline`](Self::timeline), cached
+    /// thereafter) so every reservation after the first is a lock-free
+    /// atomic `fetch_add` — see that field's doc comment. `None` only when
+    /// the very first attempt races a writer holding the timeline's write
+    /// lock (construction-time contention); `next_root_seed` falls back to
+    /// `root_counter` for that one call, exactly as if no recorder were
+    /// attached.
+    fn reserve_event_key(&self) -> Option<String> {
+        let counter = if let Some(c) = self.event_counter.get() {
+            Arc::clone(c)
+        } else {
+            match self.timeline.try_read() {
+                Ok(guard) => {
+                    let resolved = guard.event_counter_handle();
+                    // `set` can lose a race to a concurrent first resolver;
+                    // either winner's handle is the SAME underlying counter
+                    // (both cloned from the same `Timeline`), so losing the
+                    // race is harmless — use whichever ended up cached.
+                    let _ = self.event_counter.set(Arc::clone(&resolved));
+                    self.event_counter.get().map(Arc::clone).unwrap_or(resolved)
+                }
+                Err(_) => return None,
+            }
+        };
+        let seq = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Some(format!("evt:{seq}"))
     }
 }
 
@@ -912,6 +999,108 @@ mod tests {
         assert!(
             EventCertificate::from_metadata(&uncertified_event.metadata).is_none(),
             "an op recorded without a certificate must stay uncertified — never fabricated"
+        );
+    }
+
+    /// Root-pid reservation handoff (#64 / #11): a record carrying BOTH a
+    /// `reserved_sequence` (the on-demand reservation `next_root_seed` made
+    /// so a live root pid matches what replay re-derives) AND a
+    /// `solid_certificate` must land on the timeline at EXACTLY the
+    /// reserved sequence number AND still carry its `EventCertificate` on
+    /// the event's metadata. This pins the specific regression the
+    /// reserved-append switch could silently introduce:
+    /// `add_operation_reserved` (the pre-existing, non-certifying sibling
+    /// of `add_operation_certified`) hardcodes `certificate: None`, so
+    /// routing the reserved path through it would silently stop
+    /// certifying every reservation-carrying event. The drain worker must
+    /// call `add_operation_reserved_certified` instead — this test fails
+    /// if it regresses back to the plain, uncertifying variant.
+    #[tokio::test]
+    async fn reserved_sequence_record_lands_at_the_reservation_and_keeps_its_certificate() {
+        use crate::event_certificate::EventCertificate;
+        use geometry_engine::operations::recorder::RecordedSolidCertificate;
+        use geometry_engine::primitives::topology_builder::{
+            BRepModel, GeometryId, TopologyBuilder,
+        };
+
+        let mut model = BRepModel::new();
+        let gid = TopologyBuilder::new(&mut model)
+            .create_box_3d(6.0, 6.0, 6.0)
+            .expect("create_box_3d");
+        let solid_id = match gid {
+            GeometryId::Solid(id) => id,
+            other => panic!("expected a solid, got {other:?}"),
+        };
+        let cert = model.certify_solid(solid_id);
+        let volume = model.calculate_solid_volume(solid_id);
+        let face_count = model.solid_outer_face_count(solid_id);
+        let recorded_cert = RecordedSolidCertificate::from_validity(&cert, volume, face_count);
+        let expected_cert = EventCertificate::from_recorded_solid(&recorded_cert);
+
+        let timeline: SharedTimeline =
+            Arc::new(RwLock::new(Timeline::new(TimelineConfig::default())));
+        let recorder =
+            TimelineRecorder::new(Arc::clone(&timeline), Author::System, BranchId::main());
+
+        // Burn one ordinary event first so the reservation below is not
+        // simply "whatever the counter happens to start at" — it must be
+        // the SPECIFIC number reserved, not an accidental match with a
+        // fresh burn.
+        recorder
+            .record(RecordedOperation::new("filler"))
+            .expect("record filler op");
+
+        let reserved = timeline.read().await.reserve_sequence_number();
+        let mut op = RecordedOperation::new("chamfer_edges")
+            .with_output_solids([u64::from(solid_id)])
+            .with_solid_certificate(recorded_cert);
+        op.reserved_sequence = Some(reserved);
+        recorder.record(op).expect("record reserved+certified op");
+        drop(recorder);
+
+        let main = BranchId::main();
+        for _ in 0..100 {
+            let count = timeline
+                .read()
+                .await
+                .get_branch_events(&main, None, None)
+                .map(|v| v.len())
+                .unwrap_or(0);
+            if count >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let events = timeline
+            .read()
+            .await
+            .get_branch_events(&main, None, None)
+            .expect("branch events");
+        assert_eq!(events.len(), 2, "both records reach the timeline");
+
+        let reserved_event = events
+            .iter()
+            .find(|e| {
+                matches!(&e.operation, Operation::Generic { command_type, .. }
+                    if command_type == "chamfer_edges")
+            })
+            .expect("the reserved op's event exists");
+        assert_eq!(
+            reserved_event.sequence_number, reserved,
+            "a reservation-carrying record must land at EXACTLY the reserved \
+             sequence, not a fresh burn"
+        );
+        let stored_cert = EventCertificate::from_metadata(&reserved_event.metadata).expect(
+            "a reservation-carrying record must still carry its certificate — \
+             `add_operation_reserved_certified`, not the plain `add_operation_reserved` \
+             (which hardcodes `certificate: None`), must be the append the worker uses",
+        );
+        assert_eq!(stored_cert, expected_cert);
+        assert_eq!(
+            stored_cert.is_sound,
+            Some(cert.is_sound()),
+            "stored is_sound must be the verdict the kernel actually proved"
         );
     }
 

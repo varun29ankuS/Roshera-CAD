@@ -22,6 +22,7 @@ use crate::primitives::{
     vertex::{VertexId, VertexStore},
 };
 use dashmap::DashMap;
+use parking_lot::Mutex as PlMutex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::LazyLock;
@@ -587,7 +588,25 @@ pub struct BRepModel {
     /// from the TIMELINE EVENT ID (identical across replays, robust to event
     /// reordering). `None` for standalone/test creation, where root pids fall
     /// back to `root_counter`. Operation context — like `recorder`, NOT snapshotted.
-    pub current_event_key: Option<String>,
+    ///
+    /// Interior-mutable (`parking_lot::Mutex`, not a bare `Option`) because
+    /// `record_operation` and `abort_pending_record` — both `&self` (the
+    /// funnel every kernel op already calls through a shared reference) —
+    /// must be able to clear an on-demand reservation made by
+    /// `next_root_seed` (see that method and the `current_reserved_sequence`
+    /// field below) once the operation that reserved it has finished, one
+    /// way or another.
+    pub current_event_key: PlMutex<Option<String>>,
+    /// The raw sequence number backing an on-demand `current_event_key`
+    /// reservation, when the key currently cached there was minted by
+    /// `next_root_seed` calling `OperationRecorder::reserve_event_key`
+    /// (rather than set externally via `set_event_key`, e.g. by replay).
+    /// Parsed once out of the `"evt:{seq}"` key `next_root_seed` receives
+    /// and cached alongside it so `record_operation` can hand the exact
+    /// reserved sequence to the recorder
+    /// (`RecordedOperation::reserved_sequence`) without re-parsing. `None`
+    /// whenever `current_event_key` is unset or was set externally.
+    pub current_reserved_sequence: PlMutex<Option<u64>>,
     /// Monotonic fallback for root-pid seeds when `current_event_key` is unset.
     /// Snapshotted so a rolled-back primitive creation re-mints the same seed.
     pub root_counter: u64,
@@ -708,7 +727,8 @@ impl BRepModel {
             pid_to_edge: std::collections::HashMap::new(),
             pid_to_face: std::collections::HashMap::new(),
             pid_to_solid: std::collections::HashMap::new(),
-            current_event_key: None,
+            current_event_key: PlMutex::new(None),
+            current_reserved_sequence: PlMutex::new(None),
             root_counter: 0,
             solid_provenance: std::collections::HashMap::new(),
             solid_construction: std::collections::HashMap::new(),
@@ -2488,21 +2508,64 @@ impl BRepModel {
     /// The orchestration / replay layer sets this before each op and clears it
     /// (`None`) after. No-op for standalone/test creation.
     pub fn set_event_key(&mut self, key: Option<String>) {
-        self.current_event_key = key;
+        *self.current_event_key.lock() = key;
     }
 
     /// Seed bytes for a root persistent-id of a primitive described by
-    /// `kind_params`. Uses `current_event_key` when set (timeline-stable across
-    /// replays), else a monotonic fallback (distinct within this model). `&mut`
-    /// because the fallback path advances `root_counter`.
+    /// `kind_params`. Uses `current_event_key` when set (timeline-stable
+    /// across replays); otherwise, when a recorder is attached and willing
+    /// (see below), reserves one ON DEMAND so the LIVE authoring path gets
+    /// the same timeline-stable seed a replay will later re-derive; else
+    /// falls back to the process-local monotonic `root_counter` (today's
+    /// pre-existing behaviour). `&mut` because the fallback path advances
+    /// `root_counter`.
+    ///
+    /// # On-demand reservation (live/replay persistent-id parity)
+    ///
+    /// Replay always sets `current_event_key` explicitly before dispatching
+    /// an event and detaches the recorder for the whole replay (see
+    /// `timeline_engine::replay::apply_event` / `rebuild_model_from_events`),
+    /// so this branch never fires during replay. On the LIVE path nothing
+    /// sets `current_event_key`, so — before this — every root pid a live
+    /// designed operation minted (fillet, chamfer, …) used `root_counter`'s
+    /// `__local:{n}` fallback, which a subsequent replay could never
+    /// reproduce (replay always seeds from the event's OWN burned sequence
+    /// number). Reserving the SAME key live, via
+    /// [`OperationRecorder::reserve_event_key`], closes that gap.
+    ///
+    /// Skipped while `records_are_discarded()` (an api-server
+    /// `RecorderSuppressGuard` scope, e.g. `sketch_extrude`'s inner
+    /// `extrude_face` / boolean calls): that caller consolidates several
+    /// kernel-internal sub-events into ONE record it builds and forwards
+    /// itself, bypassing `record_operation` — a reservation made here would
+    /// never be attached to that consolidated record and would just burn a
+    /// sequence number for nothing. Falling back to `root_counter` there is
+    /// exactly today's (pre-existing) behaviour — unchanged, not worsened.
+    ///
+    /// The reservation is cached into `current_event_key` /
+    /// `current_reserved_sequence` so every root pid minted for the REST of
+    /// this same operation (one op can mint many) reuses the identical key,
+    /// and is cleared by `record_operation` (success) or
+    /// `abort_pending_record` (the operation was rolled back) so the NEXT
+    /// operation always starts from a clean slate rather than inheriting a
+    /// stale reservation.
     pub fn next_root_seed(&mut self, kind_params: &str) -> Vec<u8> {
-        if let Some(k) = self.current_event_key.clone() {
-            format!("{k}|{kind_params}").into_bytes()
-        } else {
-            let n = self.root_counter;
-            self.root_counter += 1;
-            format!("__local:{n}|{kind_params}").into_bytes()
+        if let Some(k) = self.current_event_key.lock().clone() {
+            return format!("{k}|{kind_params}").into_bytes();
         }
+        if let Some(rec) = self.recorder.as_ref() {
+            if !rec.records_are_discarded() {
+                if let Some(key) = rec.reserve_event_key() {
+                    let seq = key.strip_prefix("evt:").and_then(|s| s.parse::<u64>().ok());
+                    *self.current_reserved_sequence.lock() = seq;
+                    *self.current_event_key.lock() = Some(key.clone());
+                    return format!("{key}|{kind_params}").into_bytes();
+                }
+            }
+        }
+        let n = self.root_counter;
+        self.root_counter += 1;
+        format!("__local:{n}|{kind_params}").into_bytes()
     }
 
     /// Attach a recorder that will receive one event per successful
@@ -2580,6 +2643,46 @@ impl BRepModel {
             if !rec.records_are_discarded() {
                 self.attach_record_time_certificate(&mut operation);
             }
+            // Root-pid reservation handoff (see `next_root_seed`): if this
+            // operation minted its root pids under an on-demand
+            // reservation, hand the reserved sequence to the record so the
+            // bridge appends at EXACTLY that sequence instead of burning a
+            // fresh, unrelated one — the seam that keeps the live-minted
+            // root pid matching what a later replay of this event
+            // re-derives.
+            //
+            // PLUS a synchronous fallback reservation for an operation that
+            // mints NO root pids at all (e.g. `boolean_operation`, which
+            // only derives pids from its existing parents — `next_root_seed`
+            // is never called, so `current_reserved_sequence` is still
+            // `None` here). Without this fallback such an operation's
+            // sequence number is only burned later, ASYNCHRONOUSLY, whenever
+            // the recorder's drain worker gets around to it — which can
+            // lose a race against a LATER operation's synchronous
+            // `next_root_seed` reservation (fast, same calling thread,
+            // already ahead in real time) and end up with a HIGHER sequence
+            // number than an operation that causally follows it, corrupting
+            // replay order (observed: `boolean` landed AFTER `chamfer` in
+            // sequence order despite running first). Reserving HERE,
+            // synchronously, in the same call order `record_operation` is
+            // always invoked in, keeps every operation's sequence number in
+            // true causal order regardless of whether it minted a root pid.
+            // Skipped while discarded for the same reason `next_root_seed`
+            // skips it: a suppressed record is guaranteed to be discarded
+            // before it ever reaches the timeline (see `records_are_discarded`'s
+            // doc comment), so reserving for it would only burn a sequence
+            // number for nothing.
+            let reserved_seq = self.current_reserved_sequence.lock().take();
+            let reserved_seq = reserved_seq.or_else(|| {
+                if rec.records_are_discarded() {
+                    None
+                } else {
+                    rec.reserve_event_key()
+                        .and_then(|k| k.strip_prefix("evt:").and_then(|s| s.parse::<u64>().ok()))
+                }
+            });
+            operation.reserved_sequence = reserved_seq;
+            *self.current_event_key.lock() = None;
             if let Err(e) = rec.record(operation) {
                 tracing::warn!("operation recorder returned error: {}", e);
             }
@@ -3201,10 +3304,23 @@ impl BRepModel {
     /// Called by `with_rollback` on the failure path so the timeline never
     /// holds events for an operation whose model mutations were rolled
     /// back. No-op when no recorder is attached.
+    ///
+    /// Also clears any on-demand root-pid reservation `next_root_seed` made
+    /// during the now-rolled-back body (`current_event_key` /
+    /// `current_reserved_sequence`). Without this, a failed operation that
+    /// had already minted a root pid or two before erroring out would leave
+    /// its reservation cached — `record_operation` never runs for a body
+    /// that returned `Err` (see `with_rollback`), so nothing else would
+    /// clear it — and the NEXT operation's `next_root_seed` would silently
+    /// inherit and reuse a reservation that belonged to the failed op,
+    /// reintroducing the same live/replay mismatch this seam exists to
+    /// close.
     pub fn abort_pending_record(&self) {
         if let Some(rec) = self.recorder.as_ref() {
             rec.abort_pending();
         }
+        *self.current_event_key.lock() = None;
+        *self.current_reserved_sequence.lock() = None;
     }
 
     /// Invalidate the cached `SolidMassProperties` of every solid
