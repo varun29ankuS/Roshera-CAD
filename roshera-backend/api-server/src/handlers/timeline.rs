@@ -751,6 +751,45 @@ fn resolve_branch_ref(reference: &str) -> Result<BranchId, StatusCode> {
     }
 }
 
+/// Resolve a branch reference for the WS `SwitchBranch` command.
+///
+/// Unlike [`resolve_branch_ref`] (used by REST routes, which only ever see
+/// `"main"` or a UUID because the branch lives in the URL path),
+/// `TimelineWSCommand::SwitchBranch { branch_name }` carries the same
+/// free-form string `TimelineWSCommand::CreateBranch`'s `name` field
+/// accepts — a human-readable label, not necessarily a UUID. This tries
+/// the canonical forms first (`"main"` / UUID, verified to exist), then
+/// falls back to a name lookup over the timeline's live branches. Returns
+/// `None` when neither resolves — the caller must report that as a typed
+/// failure, not invent a branch.
+pub async fn resolve_branch_by_ref_or_name(state: &AppState, reference: &str) -> Option<BranchId> {
+    if let Ok(bid) = resolve_branch_ref(reference) {
+        let timeline = state.timeline.read().await;
+        if timeline.get_branch(&bid).is_some() {
+            return Some(bid);
+        }
+        return None;
+    }
+    let timeline = state.timeline.read().await;
+    timeline
+        .get_all_branches()
+        .into_iter()
+        .find(|b| b.name == reference)
+        .map(|b| b.id)
+}
+
+/// Human-friendly label for a branch id — `"main"` for the trunk,
+/// otherwise the UUID string. Mirrors the display convention
+/// [`resolve_branch_ref`] accepts on input, so a `SwitchBranch` reply's
+/// `from`/`to` fields read the same way a caller would address the branch.
+pub fn branch_label(bid: BranchId) -> String {
+    if bid.is_main() {
+        "main".to_string()
+    } else {
+        bid.to_string()
+    }
+}
+
 /// `GET /api/timeline/history/{branch}?start=&limit=` query parameters.
 ///
 /// Paging controls for an agent reading its own memory: `start` is the
@@ -2725,7 +2764,187 @@ pub async fn replay_events(
     }))
 }
 
-/// Undo the last operation
+/// Outcome of a successful undo/redo, shared by the REST `POST
+/// /api/timeline/undo` / `/api/timeline/redo` handlers and the WS
+/// `TimelineWSCommand::Undo` / `Redo` arms.
+///
+/// Both surfaces call the SAME [`perform_undo`] / [`perform_redo`] below —
+/// there is exactly one undo implementation and exactly one redo
+/// implementation in this codebase. A WS-triggered undo performs the
+/// identical state transition (timeline pointer move + kernel model
+/// reconciliation + broadcast) as a REST-triggered one; two independently
+/// maintained undo paths is the exact "two sources of truth" defect class
+/// this fix exists to close.
+pub struct UndoRedoOutcome {
+    pub event_id: EventId,
+    pub entities_affected: Vec<String>,
+    pub operation_type: String,
+    pub model_reconciled: bool,
+    pub events_applied: usize,
+    pub events_skipped: usize,
+}
+
+/// Failure modes for [`perform_undo`] / [`perform_redo`]. Every variant
+/// must be surfaced to the caller as an HONEST failure — never papered
+/// over as a success ack. `Display` gives callers a ready-made message.
+#[derive(Debug)]
+pub enum UndoRedoError {
+    /// The session had no timeline position and one could not be seeded
+    /// (e.g. the timeline write failed).
+    SessionSeed(String),
+    /// The timeline itself refused the undo/redo — nothing to undo/redo,
+    /// unknown session, or a lower-level timeline fault.
+    Timeline(TimelineError),
+    /// An invariant that should never fail did (e.g. the event `undo`/
+    /// `redo` just returned the id of could not be read back).
+    Internal(String),
+}
+
+impl std::fmt::Display for UndoRedoError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UndoRedoError::SessionSeed(e) => write!(f, "failed to seed session position: {e}"),
+            UndoRedoError::Timeline(e) => write!(f, "{e}"),
+            UndoRedoError::Internal(e) => write!(f, "internal error: {e}"),
+        }
+    }
+}
+
+/// Undo the most recently applied operation on `session_uuid`'s current
+/// branch position. Shared core — see [`UndoRedoOutcome`].
+pub async fn perform_undo(
+    state: &AppState,
+    session_uuid: Uuid,
+) -> Result<UndoRedoOutcome, UndoRedoError> {
+    // The recorder bridge appends every kernel op under `Author::System`
+    // and never updates `session_positions`, so a freshly-connected
+    // session has no pointer to undo from. Plant one at the current
+    // head of `main` before delegating; subsequent undo/redo calls then
+    // walk the pointer the way `Timeline::undo` expects.
+    ensure_session_position_at_head(state, session_uuid)
+        .await
+        .map_err(UndoRedoError::SessionSeed)?;
+
+    // `Timeline::undo` takes `&self` and only mutates `Arc<DashMap>` interior
+    // state, so a *read* lock on the outer `RwLock<Timeline>` is sufficient
+    // and keeps the lock-across-await non-blocking for other readers.
+    let event_id = {
+        let timeline = state.timeline.read().await;
+        timeline.undo(session_uuid).await
+    }
+    .map_err(UndoRedoError::Timeline)?;
+
+    finish_undo_redo(state, session_uuid, event_id, "undo").await
+}
+
+/// Redo the most recently undone operation on `session_uuid`'s current
+/// branch position. Shared core — see [`UndoRedoOutcome`].
+pub async fn perform_redo(
+    state: &AppState,
+    session_uuid: Uuid,
+) -> Result<UndoRedoOutcome, UndoRedoError> {
+    // Same first-time seeding as the undo path — without a session
+    // position, redo would always fail with `SessionNotFound`.
+    ensure_session_position_at_head(state, session_uuid)
+        .await
+        .map_err(UndoRedoError::SessionSeed)?;
+
+    // Read lock is sufficient: `Timeline::redo` takes `&self` and mutates
+    // only `Arc<DashMap>` interior state. Mirrors the undo path.
+    let event_id = {
+        let timeline = state.timeline.read().await;
+        timeline.redo(session_uuid).await
+    }
+    .map_err(UndoRedoError::Timeline)?;
+
+    finish_undo_redo(state, session_uuid, event_id, "redo").await
+}
+
+/// Shared tail of [`perform_undo`] / [`perform_redo`]: snapshot the
+/// entities affected by the event now at the session's position,
+/// reconcile the live `BRepModel` with the new timeline position, and
+/// broadcast the change to connected clients.
+async fn finish_undo_redo(
+    state: &AppState,
+    session_uuid: Uuid,
+    event_id: EventId,
+    op_label: &str,
+) -> Result<UndoRedoOutcome, UndoRedoError> {
+    // Snapshot the event details we need for the response under a short
+    // read lock so the timeline lock is released before we reconcile the
+    // model (which acquires its own read lock).
+    let (entities_affected, operation_type_str) = {
+        let timeline = state.timeline.read().await;
+        let event = timeline.get_event(event_id).ok_or_else(|| {
+            UndoRedoError::Internal(format!(
+                "{op_label}: recorded event {event_id} vanished before it could be read back"
+            ))
+        })?;
+        let mut affected: Vec<String> = event
+            .outputs
+            .created
+            .iter()
+            .map(|e| e.id.to_string())
+            .collect();
+        affected.extend(event.outputs.modified.iter().map(|id| id.to_string()));
+        affected.extend(event.outputs.deleted.iter().map(|id| id.to_string()));
+        (affected, operation_kind(&event.operation))
+    };
+
+    // Reconcile the live BRepModel with the new timeline position. Drives
+    // the model back to exactly the state implied by the events up to the
+    // session's new pointer.
+    let replay_outcome = match replay_session_to_model(state, session_uuid).await {
+        Ok(outcome) => Some(outcome),
+        Err(err) => {
+            tracing::error!(
+                target: "timeline.undo_redo",
+                session = %session_uuid,
+                op = op_label,
+                error = %err,
+                "model replay failed; clients may see stale geometry"
+            );
+            None
+        }
+    };
+
+    // Broadcast to connected clients. `session_uuid.to_string()` matches
+    // the pre-extraction call site exactly — the caller there always
+    // passed the same string this UUID was parsed from.
+    let _ = state
+        .session_manager
+        .broadcast_manager()
+        .broadcast_to_session(
+            &session_uuid.to_string(),
+            BroadcastMessage::TimelineUpdate {
+                session_id: session_uuid,
+                event_id: event_id.to_string(),
+                operation: op_label.to_string(),
+                user_id: "system".to_string(),
+            },
+        )
+        .await;
+
+    let (events_applied, events_skipped) = replay_outcome
+        .as_ref()
+        .map(|o| (o.events_applied, o.events_skipped))
+        .unwrap_or((0, 0));
+
+    Ok(UndoRedoOutcome {
+        event_id,
+        entities_affected,
+        operation_type: operation_type_str,
+        model_reconciled: replay_outcome.is_some(),
+        events_applied,
+        events_skipped,
+    })
+}
+
+/// Undo the last operation.
+///
+/// Thin REST wrapper over [`perform_undo`] — the same core the WS
+/// `TimelineWSCommand::Undo` arm calls (`protocol/message_handlers.rs`),
+/// so a WS undo and a REST undo perform the identical state transition.
 pub async fn undo_operation(
     State(state): State<AppState>,
     Json(request): Json<serde_json::Value>,
@@ -2738,115 +2957,54 @@ pub async fn undo_operation(
     // Parse session ID to UUID for timeline operations
     let session_uuid = Uuid::parse_str(session_id).map_err(|_| StatusCode::BAD_REQUEST)?;
 
-    // The recorder bridge appends every kernel op under `Author::System`
-    // and never updates `session_positions`, so a freshly-connected
-    // session has no pointer to undo from. Plant one at the current
-    // head of `main` before delegating; subsequent undo/redo calls then
-    // walk the pointer the way `Timeline::undo` expects.
-    if let Err(err) = ensure_session_position_at_head(&state, session_uuid).await {
-        tracing::error!(
-            target: "timeline.undo",
-            session = %session_uuid,
-            error = %err,
-            "failed to seed session position; undo will fail"
-        );
-        return Err(StatusCode::INTERNAL_SERVER_ERROR);
-    }
-
-    // `Timeline::undo` takes `&self` and only mutates `Arc<DashMap>` interior
-    // state, so a *read* lock on the outer `RwLock<Timeline>` is sufficient
-    // and keeps the lock-across-await non-blocking for other readers.
-    let undo_result = {
-        let timeline = state.timeline.read().await;
-        timeline.undo(session_uuid).await
-    };
-
-    match undo_result {
-        Ok(event_id) => {
-            // Snapshot the event details we need for the response under a
-            // short read lock so the timeline lock is released before we
-            // reconcile the model (which acquires its own read lock).
-            let (entities_affected, operation_type_str) = {
-                let timeline = state.timeline.read().await;
-                let event = timeline
-                    .get_event(event_id)
-                    .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
-                let mut affected: Vec<String> = event
-                    .outputs
-                    .created
-                    .iter()
-                    .map(|e| e.id.to_string())
-                    .collect();
-                affected.extend(event.outputs.modified.iter().map(|id| id.to_string()));
-                affected.extend(event.outputs.deleted.iter().map(|id| id.to_string()));
-                (affected, operation_kind(&event.operation))
-            };
-
-            // Reconcile the live BRepModel with the new (post-undo) timeline
-            // position. Drives the model back to exactly the state implied
-            // by the events up to the session's new pointer — replaces the
-            // previous "does not reconcile" gap.
-            let replay_outcome = match replay_session_to_model(&state, session_uuid).await {
-                Ok(outcome) => Some(outcome),
-                Err(err) => {
-                    tracing::error!(
-                        target: "timeline.undo",
-                        session = %session_uuid,
-                        error = %err,
-                        "model replay after undo failed; clients may see stale geometry"
-                    );
-                    None
-                }
-            };
-
-            // Broadcast the undo to connected clients
-            let _ = state
-                .session_manager
-                .broadcast_manager()
-                .broadcast_to_session(
-                    session_id,
-                    BroadcastMessage::TimelineUpdate {
-                        session_id: session_uuid,
-                        event_id: event_id.to_string(),
-                        operation: "undo".to_string(),
-                        user_id: "system".to_string(),
-                    },
-                )
-                .await;
-
-            let (events_applied, events_skipped) = replay_outcome
-                .as_ref()
-                .map(|o| (o.events_applied, o.events_skipped))
-                .unwrap_or((0, 0));
-
-            Ok(Json(serde_json::json!({
-                "success": true,
-                "message": "Undo operation completed successfully",
-                "event_id": event_id.to_string(),
-                "entities_affected": entities_affected,
-                "operation_type": operation_type_str,
-                "model_reconciled": replay_outcome.is_some(),
-                "events_applied": events_applied,
-                "events_skipped": events_skipped,
-            })))
-        }
-        Err(timeline_engine::TimelineError::NoMoreUndo) => Ok(Json(serde_json::json!({
+    match perform_undo(&state, session_uuid).await {
+        Ok(outcome) => Ok(Json(serde_json::json!({
+            "success": true,
+            "message": "Undo operation completed successfully",
+            "event_id": outcome.event_id.to_string(),
+            "entities_affected": outcome.entities_affected,
+            "operation_type": outcome.operation_type,
+            "model_reconciled": outcome.model_reconciled,
+            "events_applied": outcome.events_applied,
+            "events_skipped": outcome.events_skipped,
+        }))),
+        Err(UndoRedoError::Timeline(TimelineError::NoMoreUndo)) => Ok(Json(serde_json::json!({
             "success": false,
             "message": "Nothing to undo - at beginning of timeline",
             "can_undo": false
         }))),
-        Err(timeline_engine::TimelineError::SessionNotFound) => Ok(Json(serde_json::json!({
-            "success": false,
-            "message": "Session not found in timeline. Initialize session first.",
-            "error_code": "SESSION_NOT_FOUND"
-        }))),
-        Err(e) => {
+        Err(UndoRedoError::Timeline(TimelineError::SessionNotFound)) => {
+            Ok(Json(serde_json::json!({
+                "success": false,
+                "message": "Session not found in timeline. Initialize session first.",
+                "error_code": "SESSION_NOT_FOUND"
+            })))
+        }
+        Err(UndoRedoError::Timeline(e)) => {
             tracing::error!("Undo operation failed: {}", e);
             Ok(Json(serde_json::json!({
                 "success": false,
                 "message": format!("Undo operation failed: {}", e),
                 "error_code": "UNDO_ERROR"
             })))
+        }
+        Err(UndoRedoError::SessionSeed(err)) => {
+            tracing::error!(
+                target: "timeline.undo",
+                session = %session_uuid,
+                error = %err,
+                "failed to seed session position; undo will fail"
+            );
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+        Err(UndoRedoError::Internal(err)) => {
+            tracing::error!(
+                target: "timeline.undo",
+                session = %session_uuid,
+                error = %err,
+                "internal invariant violated during undo"
+            );
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
 }
@@ -3092,7 +3250,11 @@ pub async fn clear_history(
     })))
 }
 
-/// Redo the last undone operation
+/// Redo the last undone operation.
+///
+/// Thin REST wrapper over [`perform_redo`] — the same core the WS
+/// `TimelineWSCommand::Redo` arm calls (`protocol/message_handlers.rs`),
+/// so a WS redo and a REST redo perform the identical state transition.
 pub async fn redo_operation(
     State(state): State<AppState>,
     Json(request): Json<serde_json::Value>,
@@ -3105,110 +3267,54 @@ pub async fn redo_operation(
     // Parse session ID to UUID for timeline operations
     let session_uuid = Uuid::parse_str(session_id).map_err(|_| StatusCode::BAD_REQUEST)?;
 
-    // Same first-time seeding as the undo path — without a session
-    // position, redo would always fail with `SessionNotFound`. Init at
-    // head so a "redo with nothing to redo" gives a clean
-    // `NoMoreRedo`, not an opaque session error.
-    if let Err(err) = ensure_session_position_at_head(&state, session_uuid).await {
-        tracing::error!(
-            target: "timeline.redo",
-            session = %session_uuid,
-            error = %err,
-            "failed to seed session position; redo will fail"
-        );
-        return Err(StatusCode::INTERNAL_SERVER_ERROR);
-    }
-
-    // Read lock is sufficient: `Timeline::redo` takes `&self` and mutates
-    // only `Arc<DashMap>` interior state. Mirrors the undo path.
-    let redo_result = {
-        let timeline = state.timeline.read().await;
-        timeline.redo(session_uuid).await
-    };
-
-    match redo_result {
-        Ok(event_id) => {
-            // Snapshot event details under a short read lock so the timeline
-            // lock is released before we reconcile the live model.
-            let (entities_affected, operation_type_str) = {
-                let timeline = state.timeline.read().await;
-                let event = timeline
-                    .get_event(event_id)
-                    .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
-                let mut affected: Vec<String> = event
-                    .outputs
-                    .created
-                    .iter()
-                    .map(|e| e.id.to_string())
-                    .collect();
-                affected.extend(event.outputs.modified.iter().map(|id| id.to_string()));
-                affected.extend(event.outputs.deleted.iter().map(|id| id.to_string()));
-                (affected, operation_kind(&event.operation))
-            };
-
-            // Re-apply events up through the new (post-redo) position so
-            // the BRepModel matches the timeline. Mirrors the undo path.
-            let replay_outcome = match replay_session_to_model(&state, session_uuid).await {
-                Ok(outcome) => Some(outcome),
-                Err(err) => {
-                    tracing::error!(
-                        target: "timeline.redo",
-                        session = %session_uuid,
-                        error = %err,
-                        "model replay after redo failed; clients may see stale geometry"
-                    );
-                    None
-                }
-            };
-
-            // Broadcast the redo to connected clients
-            let _ = state
-                .session_manager
-                .broadcast_manager()
-                .broadcast_to_session(
-                    session_id,
-                    BroadcastMessage::TimelineUpdate {
-                        session_id: session_uuid,
-                        event_id: event_id.to_string(),
-                        operation: "redo".to_string(),
-                        user_id: "system".to_string(),
-                    },
-                )
-                .await;
-
-            let (events_applied, events_skipped) = replay_outcome
-                .as_ref()
-                .map(|o| (o.events_applied, o.events_skipped))
-                .unwrap_or((0, 0));
-
-            Ok(Json(serde_json::json!({
-                "success": true,
-                "message": "Redo operation completed successfully",
-                "event_id": event_id.to_string(),
-                "entities_affected": entities_affected,
-                "operation_type": operation_type_str,
-                "model_reconciled": replay_outcome.is_some(),
-                "events_applied": events_applied,
-                "events_skipped": events_skipped,
-            })))
-        }
-        Err(timeline_engine::TimelineError::NoMoreRedo) => Ok(Json(serde_json::json!({
+    match perform_redo(&state, session_uuid).await {
+        Ok(outcome) => Ok(Json(serde_json::json!({
+            "success": true,
+            "message": "Redo operation completed successfully",
+            "event_id": outcome.event_id.to_string(),
+            "entities_affected": outcome.entities_affected,
+            "operation_type": outcome.operation_type,
+            "model_reconciled": outcome.model_reconciled,
+            "events_applied": outcome.events_applied,
+            "events_skipped": outcome.events_skipped,
+        }))),
+        Err(UndoRedoError::Timeline(TimelineError::NoMoreRedo)) => Ok(Json(serde_json::json!({
             "success": false,
             "message": "Nothing to redo - at end of timeline",
             "can_redo": false
         }))),
-        Err(timeline_engine::TimelineError::SessionNotFound) => Ok(Json(serde_json::json!({
-            "success": false,
-            "message": "Session not found in timeline. Initialize session first.",
-            "error_code": "SESSION_NOT_FOUND"
-        }))),
-        Err(e) => {
+        Err(UndoRedoError::Timeline(TimelineError::SessionNotFound)) => {
+            Ok(Json(serde_json::json!({
+                "success": false,
+                "message": "Session not found in timeline. Initialize session first.",
+                "error_code": "SESSION_NOT_FOUND"
+            })))
+        }
+        Err(UndoRedoError::Timeline(e)) => {
             tracing::error!("Redo operation failed: {}", e);
             Ok(Json(serde_json::json!({
                 "success": false,
                 "message": format!("Redo operation failed: {}", e),
                 "error_code": "REDO_ERROR"
             })))
+        }
+        Err(UndoRedoError::SessionSeed(err)) => {
+            tracing::error!(
+                target: "timeline.redo",
+                session = %session_uuid,
+                error = %err,
+                "failed to seed session position; redo will fail"
+            );
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+        Err(UndoRedoError::Internal(err)) => {
+            tracing::error!(
+                target: "timeline.redo",
+                session = %session_uuid,
+                error = %err,
+                "internal invariant violated during redo"
+            );
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
         }
     }
 }

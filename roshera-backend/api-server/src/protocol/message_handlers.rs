@@ -41,6 +41,26 @@ fn unix_millis_now() -> u64 {
         .unwrap_or(0)
 }
 
+/// Map an [`UndoRedoError`](crate::handlers::timeline::UndoRedoError) to a
+/// stable WS `error_code`. Mirrors the REST surface's `error_code` values
+/// (`SESSION_NOT_FOUND`, `UNDO_ERROR` / `REDO_ERROR`) where they already
+/// exist so a client that handles the REST error shape recognizes the WS
+/// one too. Used by the `TimelineWSCommand::Undo`/`Redo` arms — see their
+/// module docs on why WS and REST undo/redo share one implementation.
+fn ws_undo_redo_error_code(err: &crate::handlers::timeline::UndoRedoError) -> &'static str {
+    use crate::handlers::timeline::UndoRedoError;
+    match err {
+        UndoRedoError::Timeline(timeline_engine::TimelineError::NoMoreUndo) => "NO_MORE_UNDO",
+        UndoRedoError::Timeline(timeline_engine::TimelineError::NoMoreRedo) => "NO_MORE_REDO",
+        UndoRedoError::Timeline(timeline_engine::TimelineError::SessionNotFound) => {
+            "SESSION_NOT_FOUND"
+        }
+        UndoRedoError::Timeline(_) => "UNDO_REDO_ERROR",
+        UndoRedoError::SessionSeed(_) => "SESSION_SEED_FAILED",
+        UndoRedoError::Internal(_) => "INTERNAL_ERROR",
+    }
+}
+
 /// RBAC A3: project the verified claims' string roles onto the session
 /// role enum. Before this, the JoinSession arm hardcoded
 /// `UserRole::Editor` regardless of what the credential actually
@@ -1524,28 +1544,112 @@ async fn handle_websocket_connection(socket: WebSocket, state: AppState) {
 
                                 let response = match command {
                                     super::protocol::TimelineWSCommand::Undo { steps } => {
-                                        let steps_to_undo = steps.unwrap_or(1);
-                                        info!("Processing undo for {} steps", steps_to_undo);
-
-                                        // Timeline undo/redo would be implemented through event replay
-                                        // For now, acknowledge the operation
-                                        ServerMessage::TimelineUpdate {
-                                            update:
-                                                super::protocol::TimelineUpdate::UndoPerformed {
-                                                    steps: steps_to_undo,
-                                                },
+                                        // `steps` is accepted on the wire for future multi-step
+                                        // undo, but `Timeline::undo` (and its REST wrapper,
+                                        // `handlers::timeline::perform_undo`) only ever steps
+                                        // back ONE event per call. Anything other than the
+                                        // (absent → 1) default would silently perform fewer
+                                        // steps than requested — an honesty gap of the exact
+                                        // kind this fix exists to close — so a request for more
+                                        // than one step is refused rather than partially done.
+                                        let steps_requested = steps.unwrap_or(1);
+                                        if steps_requested != 1 {
+                                            ServerMessage::Error {
+                                                error_code: "UNDO_MULTI_STEP_UNSUPPORTED"
+                                                    .to_string(),
+                                                message: format!(
+                                                    "undo only supports one step per command; \
+                                                     requested {steps_requested}"
+                                                ),
+                                                details: None,
+                                                request_id,
+                                            }
+                                        } else {
+                                            let session_uuid =
+                                                crate::handlers::timeline::live_session_id(
+                                                    &timeline_engine::BranchId::main(),
+                                                );
+                                            match crate::handlers::timeline::perform_undo(
+                                                &state,
+                                                session_uuid,
+                                            )
+                                            .await
+                                            {
+                                                Ok(outcome) => {
+                                                    info!(
+                                                        "WS undo applied event {} ({})",
+                                                        outcome.event_id, outcome.operation_type
+                                                    );
+                                                    ServerMessage::TimelineUpdate {
+                                                        update:
+                                                            super::protocol::TimelineUpdate::UndoPerformed {
+                                                                steps: 1,
+                                                            },
+                                                    }
+                                                }
+                                                Err(err) => {
+                                                    error!("WS undo failed: {}", err);
+                                                    ServerMessage::Error {
+                                                        error_code: ws_undo_redo_error_code(&err)
+                                                            .to_string(),
+                                                        message: err.to_string(),
+                                                        details: None,
+                                                        request_id,
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                     super::protocol::TimelineWSCommand::Redo { steps } => {
-                                        let steps_to_redo = steps.unwrap_or(1);
-                                        info!("Processing redo for {} steps", steps_to_redo);
-
-                                        // Timeline undo/redo would be implemented through event replay
-                                        ServerMessage::TimelineUpdate {
-                                            update:
-                                                super::protocol::TimelineUpdate::RedoPerformed {
-                                                    steps: steps_to_redo,
-                                                },
+                                        // Mirrors the `Undo` arm above — see its comment for
+                                        // why a multi-step request is refused rather than
+                                        // silently truncated to one step.
+                                        let steps_requested = steps.unwrap_or(1);
+                                        if steps_requested != 1 {
+                                            ServerMessage::Error {
+                                                error_code: "REDO_MULTI_STEP_UNSUPPORTED"
+                                                    .to_string(),
+                                                message: format!(
+                                                    "redo only supports one step per command; \
+                                                     requested {steps_requested}"
+                                                ),
+                                                details: None,
+                                                request_id,
+                                            }
+                                        } else {
+                                            let session_uuid =
+                                                crate::handlers::timeline::live_session_id(
+                                                    &timeline_engine::BranchId::main(),
+                                                );
+                                            match crate::handlers::timeline::perform_redo(
+                                                &state,
+                                                session_uuid,
+                                            )
+                                            .await
+                                            {
+                                                Ok(outcome) => {
+                                                    info!(
+                                                        "WS redo applied event {} ({})",
+                                                        outcome.event_id, outcome.operation_type
+                                                    );
+                                                    ServerMessage::TimelineUpdate {
+                                                        update:
+                                                            super::protocol::TimelineUpdate::RedoPerformed {
+                                                                steps: 1,
+                                                            },
+                                                    }
+                                                }
+                                                Err(err) => {
+                                                    error!("WS redo failed: {}", err);
+                                                    ServerMessage::Error {
+                                                        error_code: ws_undo_redo_error_code(&err)
+                                                            .to_string(),
+                                                        message: err.to_string(),
+                                                        details: None,
+                                                        request_id,
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                     super::protocol::TimelineWSCommand::CreateBranch {
@@ -1668,13 +1772,82 @@ async fn handle_websocket_connection(socket: WebSocket, state: AppState) {
                                     } => {
                                         info!("Switching to branch '{}'", branch_name);
 
-                                        // Branch switching would be handled through the timeline
-                                        ServerMessage::TimelineUpdate {
-                                            update:
-                                                super::protocol::TimelineUpdate::BranchSwitched {
-                                                    from: "main".to_string(),
-                                                    to: branch_name.clone(),
-                                                },
+                                        // Delegate to the ONE real active-branch lane
+                                        // (`POST /api/branches/active` /
+                                        // `branches::set_active_branch`) rather than
+                                        // re-implementing the swap here — this is the
+                                        // handle that `TimelineRecorder` and every
+                                        // kernel op consult for "which branch do new
+                                        // events land on". `branch_name` is the same
+                                        // free-form string `CreateBranch`'s `name`
+                                        // accepts, so canonical forms ("main" / UUID)
+                                        // are tried first, then a name lookup — see
+                                        // `resolve_branch_by_ref_or_name`.
+                                        match crate::handlers::timeline::resolve_branch_by_ref_or_name(
+                                            &state,
+                                            &branch_name,
+                                        )
+                                        .await
+                                        {
+                                            Some(target_bid) => {
+                                                // The REAL previous branch, read BEFORE
+                                                // the swap — never the hardcoded "main"
+                                                // the stub used to fabricate regardless
+                                                // of which branch was actually active.
+                                                let from_bid = state.timeline_recorder.branch_id();
+                                                let switch_result = crate::branches::set_active_branch(
+                                                    axum::extract::State(state.clone()),
+                                                    axum::extract::Json(
+                                                        crate::branches::SetActiveBranchBody {
+                                                            branch_id: target_bid.to_string(),
+                                                        },
+                                                    ),
+                                                )
+                                                .await;
+                                                match switch_result {
+                                                    Ok(_) => {
+                                                        let from =
+                                                            crate::handlers::timeline::branch_label(
+                                                                from_bid,
+                                                            );
+                                                        let to =
+                                                            crate::handlers::timeline::branch_label(
+                                                                target_bid,
+                                                            );
+                                                        info!(
+                                                            "Switched active branch: {} -> {}",
+                                                            from, to
+                                                        );
+                                                        ServerMessage::TimelineUpdate {
+                                                            update:
+                                                                super::protocol::TimelineUpdate::BranchSwitched {
+                                                                    from,
+                                                                    to,
+                                                                },
+                                                        }
+                                                    }
+                                                    Err(api_err) => {
+                                                        error!(
+                                                            "Failed to switch active branch: {:?}",
+                                                            api_err
+                                                        );
+                                                        ServerMessage::Error {
+                                                            error_code: api_err.code.as_str().to_string(),
+                                                            message: api_err.error.clone(),
+                                                            details: api_err.details.clone(),
+                                                            request_id,
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            None => ServerMessage::Error {
+                                                error_code: "BRANCH_NOT_FOUND".to_string(),
+                                                message: format!(
+                                                    "branch '{branch_name}' not found"
+                                                ),
+                                                details: None,
+                                                request_id,
+                                            },
                                         }
                                     }
                                     super::protocol::TimelineWSCommand::MergeBranch {
@@ -1687,15 +1860,133 @@ async fn handle_websocket_connection(socket: WebSocket, state: AppState) {
                                             source, target, strategy
                                         );
 
-                                        // Branch merging would be handled through the timeline
-                                        ServerMessage::Success {
-                                            result: Some(serde_json::json!({
-                                                "message": format!("Merged {} into {}", source, target),
-                                                "source": source,
-                                                "target": target,
-                                                "strategy": format!("{:?}", strategy)
-                                            })),
-                                            request_id,
+                                        // Delegate to the ONE real merge lane
+                                        // (`POST /api/branches/{id}/merge` /
+                                        // `branches::perform_merge`, extracted from
+                                        // `branches::merge_branch` the same way
+                                        // `perform_undo`/`perform_redo` were extracted
+                                        // from the REST undo/redo handlers) rather than
+                                        // re-implementing merge here. `source`/`target`
+                                        // are free-form like `SwitchBranch`'s
+                                        // `branch_name`, so both go through
+                                        // `resolve_branch_by_ref_or_name`.
+                                        let source_bid = crate::handlers::timeline::resolve_branch_by_ref_or_name(
+                                            &state, &source,
+                                        )
+                                        .await;
+                                        let target_bid = crate::handlers::timeline::resolve_branch_by_ref_or_name(
+                                            &state, &target,
+                                        )
+                                        .await;
+                                        match (source_bid, target_bid) {
+                                            (Some(source_bid), Some(target_bid)) => {
+                                                // The WS wire `strategy` only ever
+                                                // carries a CONFLICT-resolution
+                                                // preference (PreferSource /
+                                                // PreferTarget / Manual — there is no
+                                                // way to request fast-forward/squash/
+                                                // rebase on this surface), so it maps
+                                                // onto `ConflictStrategy` and the merge
+                                                // always runs as `ThreeWay`. The kernel's
+                                                // `Timeline::merge_branches` still takes
+                                                // the fast-forward / already-merged
+                                                // shortcuts unconditionally before any
+                                                // strategy-specific logic runs, so this
+                                                // is never less capable than the REST
+                                                // default for the cases that matter.
+                                                let conflict_strategy = match strategy {
+                                                    super::protocol::MergeStrategy::PreferSource => {
+                                                        timeline_engine::branch::ConflictStrategy::PreferSource
+                                                    }
+                                                    super::protocol::MergeStrategy::PreferTarget => {
+                                                        timeline_engine::branch::ConflictStrategy::PreferTarget
+                                                    }
+                                                    super::protocol::MergeStrategy::Manual => {
+                                                        timeline_engine::branch::ConflictStrategy::Manual
+                                                    }
+                                                };
+                                                let merge_result = crate::branches::perform_merge(
+                                                    &state,
+                                                    source_bid,
+                                                    target_bid,
+                                                    timeline_engine::MergeStrategy::ThreeWay {
+                                                        conflict_strategy,
+                                                    },
+                                                )
+                                                .await;
+                                                match merge_result {
+                                                    Ok(view) if view.success => {
+                                                        info!(
+                                                            "Merged branch {} into {}: {} event(s)",
+                                                            source, target, view.events_merged
+                                                        );
+                                                        ServerMessage::Success {
+                                                            result: serde_json::to_value(&view).ok(),
+                                                            request_id,
+                                                        }
+                                                    }
+                                                    // The merge RAN but left unresolved
+                                                    // conflicts — a real, expected
+                                                    // outcome. Never `Success`: the
+                                                    // pre-fix stub's crime was exactly
+                                                    // this, claiming "Merged X into Y"
+                                                    // when nothing merged cleanly.
+                                                    Ok(view) => {
+                                                        error!(
+                                                            "WS merge of {} into {} left conflicts: {:?}",
+                                                            source, target, view.conflicts
+                                                        );
+                                                        ServerMessage::Error {
+                                                            error_code: "BRANCH_MERGE_CONFLICT"
+                                                                .to_string(),
+                                                            message: format!(
+                                                                "merge of {source} into {target} left {} \
+                                                                 unresolved conflict(s)",
+                                                                view.conflicts.len()
+                                                            ),
+                                                            details: serde_json::to_value(&view).ok(),
+                                                            request_id,
+                                                        }
+                                                    }
+                                                    Err(api_err) => {
+                                                        error!(
+                                                            "WS merge of {} into {} failed: {:?}",
+                                                            source, target, api_err
+                                                        );
+                                                        ServerMessage::Error {
+                                                            error_code: api_err.code.as_str().to_string(),
+                                                            message: api_err.error.clone(),
+                                                            details: api_err.details.clone(),
+                                                            request_id,
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            (None, None) => ServerMessage::Error {
+                                                error_code: "BRANCH_NOT_FOUND".to_string(),
+                                                message: format!(
+                                                    "branch source '{source}' and target \
+                                                     '{target}' not found"
+                                                ),
+                                                details: None,
+                                                request_id,
+                                            },
+                                            (None, Some(_)) => ServerMessage::Error {
+                                                error_code: "BRANCH_NOT_FOUND".to_string(),
+                                                message: format!(
+                                                    "branch source '{source}' not found"
+                                                ),
+                                                details: None,
+                                                request_id,
+                                            },
+                                            (Some(_), None) => ServerMessage::Error {
+                                                error_code: "BRANCH_NOT_FOUND".to_string(),
+                                                message: format!(
+                                                    "branch target '{target}' not found"
+                                                ),
+                                                details: None,
+                                                request_id,
+                                            },
                                         }
                                     }
                                     super::protocol::TimelineWSCommand::ExecuteOperation {

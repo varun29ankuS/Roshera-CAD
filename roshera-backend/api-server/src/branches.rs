@@ -790,12 +790,7 @@ pub async fn merge_branch(
         .map(parse_branch_id)
         .transpose()?
         .unwrap_or_else(BranchId::main);
-    if source == target {
-        return Err(ApiError::new(
-            ErrorCode::BranchInvalidState,
-            "merge source and target are the same branch".to_string(),
-        ));
-    }
+
     let strategy = match body.strategy.as_deref().unwrap_or("fast-forward") {
         "fast-forward" => MergeStrategy::FastForward,
         "three-way" => MergeStrategy::ThreeWay {
@@ -816,14 +811,41 @@ pub async fn merge_branch(
         }
     };
 
-    let strategy_label = match &strategy {
+    Ok(Json(perform_merge(&state, source, target, strategy).await?))
+}
+
+/// Human-readable strategy label for [`MergeView::strategy`] — the wire
+/// name each `timeline_engine::MergeStrategy` variant renders as.
+fn merge_strategy_label(strategy: &MergeStrategy) -> &'static str {
+    match strategy {
         MergeStrategy::FastForward => "fast-forward",
         MergeStrategy::ThreeWay { .. } => "three-way",
         MergeStrategy::Squash { .. } => "squash",
         MergeStrategy::Rebase => "rebase",
         MergeStrategy::CherryPick { .. } => "cherry-pick",
     }
-    .to_string();
+}
+
+/// Shared merge core, called by both `POST /api/branches/{id}/merge`
+/// (`merge_branch` above) and the WS `TimelineWSCommand::MergeBranch`
+/// arm (`protocol/message_handlers.rs`) — one merge implementation, so
+/// the two surfaces cannot report different outcomes for the same
+/// merge. A conflicted or refused merge returns `Err(ApiError)`, never
+/// a `Success`-shaped payload; the caller must surface that as a
+/// failure, not paper over it.
+pub async fn perform_merge(
+    state: &AppState,
+    source: BranchId,
+    target: BranchId,
+    strategy: MergeStrategy,
+) -> Result<MergeView, ApiError> {
+    if source == target {
+        return Err(ApiError::new(
+            ErrorCode::BranchInvalidState,
+            "merge source and target are the same branch".to_string(),
+        ));
+    }
+    let strategy_label = merge_strategy_label(&strategy).to_string();
 
     // Drain in-flight kernel events first — same barrier POST
     // /api/branches uses. The recorder is fire-and-forget; without the
@@ -871,8 +893,15 @@ pub async fn merge_branch(
         Err(other) => return Err(map_timeline_err(other)),
     };
 
+    // Conflicts are reported through `MergeView.success` / `.conflicts`,
+    // NOT as an `Err` — this is the REST endpoint's existing, deliberate
+    // contract (see the module doc comment on `merge_branch`: "the HTTP
+    // status stays 200 because the merge was *attempted*"). Callers that
+    // need conflicts to hard-fail (the WS arm, per its own honesty
+    // requirement) inspect `.success` on the returned `MergeView`
+    // themselves rather than this core changing REST's wire contract.
     let conflicts: Vec<ConflictView> = result.conflicts.iter().map(conflict_view).collect();
-    Ok(Json(MergeView {
+    Ok(MergeView {
         success: result.success && conflicts.is_empty(),
         merged_into: target.to_string(),
         strategy: strategy_label,
@@ -885,7 +914,7 @@ pub async fn merge_branch(
             entities_affected: result.statistics.entities_affected,
             duration_ms: result.statistics.duration_ms,
         },
-    }))
+    })
 }
 
 // ── Read-only conflict preview ────────────────────────────────────────
