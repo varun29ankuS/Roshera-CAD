@@ -2163,6 +2163,15 @@ pub async fn part_perception(
     use geometry_engine::primitives::validation::{validate_solid_scoped, ValidationLevel};
 
     let sid = id as SolidId;
+    // Document-level durability disclosure (read once, guard dropped before
+    // any further `.await`): `None` for the common case (off/empty/active),
+    // `Some` only when the SERVED document is a clean prefix of the
+    // persisted log, not the whole thing — see `quarantine_disclosure`.
+    let durability_status = state.durability_status.read().await.clone();
+    let durability_disclosure = crate::durability::quarantine_disclosure(&durability_status)
+        .map(|s| serde_json::to_value(s))
+        .transpose()
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     if q.wants_fast() {
         // OPT-OUT (`?fast=1`): lightweight (cheap, read lock): B-Rep validity + coarse mesh counts + dims.
@@ -2226,6 +2235,14 @@ pub async fn part_perception(
                 "status".to_string(),
                 serde_json::json!(reading.status_label()),
             );
+            // Document-level context BESIDE the part-level verdict above —
+            // `sound`/`verdict` stay a true statement about THIS solid;
+            // `durability` (present only on a quarantined document) is the
+            // separate, document-wide fact that a slice of history was
+            // withheld. Never rewrites the part verdict's meaning.
+            if let Some(d) = durability_disclosure.clone() {
+                map.insert("durability".to_string(), d);
+            }
         }
         return Ok(Json(perception_val));
     }
@@ -2256,10 +2273,15 @@ pub async fn part_perception(
     });
     let cert = model.certify_solid(sid);
     let sound = cert.is_sound();
+    // Shared with the write path's ambient perception AND with the
+    // unsound-base gate's refusal (`main.rs::VERDICT_SOUND`/`VERDICT_UNSOUND`).
+    // The MCP client gate reads THIS field and interpolates it into its own
+    // refusal, so the constant is what keeps the client-side and server-side
+    // refusals quoting the kernel identically.
     let verdict = if sound {
-        "SOUND — full kernel certificate clean (closed, manifold, self-intersection-free, mesh-quality-clean)".to_string()
+        crate::VERDICT_SOUND.to_string()
     } else {
-        "UNSOUND — full kernel certificate flags a defect (see cert)".to_string()
+        crate::VERDICT_UNSOUND.to_string()
     };
     // Reconcile cache lookup — mirrors the write path (certified_response in
     // main.rs): same four inputs, same `perception_fingerprint` function.
@@ -2280,7 +2302,7 @@ pub async fn part_perception(
         .soundness_reading(sid)
         .map(|r| r.status_label())
         .unwrap_or("stale");
-    Ok(Json(serde_json::json!({
+    let mut body = serde_json::json!({
         "solid_id":          id,
         "sound":             sound,
         "status":            status,
@@ -2297,7 +2319,16 @@ pub async fn part_perception(
         // Advisory dual-eye reconcile report, or {"status":"pending"} when the
         // async worker has not yet completed a report for the current solid state.
         "reconcile":         reconcile_json,
-    })))
+    });
+    // Document-level context BESIDE the part-level verdict above (never
+    // rewrites it) — present only when `state.durability_status` reads
+    // `Quarantined`, so a non-quarantined document's payload is unchanged.
+    if let Some(d) = durability_disclosure {
+        if let serde_json::Value::Object(ref mut map) = body {
+            map.insert("durability".to_string(), d);
+        }
+    }
+    Ok(Json(body))
 }
 
 // ───────────────────── features + measure (EYE-4) ───────────────────

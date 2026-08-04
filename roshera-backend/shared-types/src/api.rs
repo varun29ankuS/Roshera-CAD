@@ -116,6 +116,36 @@ pub struct ExportResponse {
     pub export_time_ms: u64,
     /// Download URL
     pub download_url: String,
+    /// Present only for `ExportFormat::ROS`: what the written file's
+    /// mandatory HIST/PROV chunks actually carry, so a caller can tell
+    /// a provenance-bearing file from a bare geometry snapshot without
+    /// re-opening the file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ros_contents: Option<RosFileContents>,
+}
+
+/// What a `.ros` export actually wrote into the file's mandatory HIST
+/// (timeline) and PROV (AI provenance) chunks — reported from the write
+/// site itself, never inferred.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RosFileContents {
+    /// Timeline events written into HIST.
+    pub hist_event_count: usize,
+    /// Branch manifests written into HIST.
+    pub hist_branch_count: usize,
+    /// AI commands written into PROV.
+    pub prov_command_count: usize,
+    /// Session id recorded in the PROV chunk (freshly opened at write
+    /// time when the server holds no tracker — still a real, file-carried
+    /// id).
+    pub prov_session_id: u64,
+    /// Honest emptiness marker, same rule as the evidence-pack route's
+    /// `certificate_absent_reason`: when `prov_command_count` is 0
+    /// because the server has no AI-command source wired, this states so
+    /// explicitly instead of letting an empty list imply "no AI was
+    /// involved" with an authority the writer does not have.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prov_commands_absent_reason: Option<String>,
 }
 
 /// Generic error response

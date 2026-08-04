@@ -14,7 +14,9 @@ use crate::math::{MathError, MathResult, Point3, Tolerance, Vector3};
 use crate::primitives::face::Face;
 use crate::primitives::surface::{Surface, SurfaceStore};
 use crate::primitives::topology_builder::BRepModel;
+use dashmap::DashMap;
 use std::collections::HashMap;
+use std::sync::Arc;
 use tracing;
 
 /// Number of subdivisions across an angular `span` on a circle of given
@@ -8683,6 +8685,163 @@ fn is_point_inside_loop(
 
     let winding_number = calculate_winding_number(&(u, v), &polygon);
     winding_number.abs() > 0.5
+}
+
+/// Cache of a loop's projected UV polygon (see [`project_loop_uv_unwrapped`])
+/// and its derived trim-membership data, keyed by [`crate::primitives::r#loop::LoopId`].
+///
+/// `is_point_inside_loop` rebuilds this polygon from scratch on EVERY call — 20
+/// boundary samples per edge, each a `Surface::closest_point` solve — which is
+/// cheap in isolation but ruinous when the same handful of faces are probed
+/// thousands of times per drawing view (HLR's broad-phase occlusion grid,
+/// `drawing::visibility::OcclusionGrid`). That repetition is inherent, not a
+/// bug: a genuinely visible sample point has no occluder, so the occlusion
+/// test cannot early-exit and must run every candidate face's trim-membership
+/// test to completion. Building the polygon once per loop and reusing it
+/// turns the per-test cost back into a handful of dot products instead of a
+/// full re-sample-and-project.
+///
+/// `LoopId` is unique and stable only for the `&BRepModel` snapshot a cache
+/// was built against — never share one `LoopUvCache` instance across two
+/// different model states (a mutating operation can retarget a loop slot).
+pub(crate) struct LoopUvCache {
+    entries: DashMap<crate::primitives::r#loop::LoopId, Arc<CachedLoopUv>>,
+}
+
+pub(crate) struct CachedLoopUv {
+    polygon: Vec<(f64, f64)>,
+    is_outer: bool,
+    degenerate: bool,
+    /// `Some([v_min, v_max, eps])`, present only when the owning surface's `v`
+    /// axis is non-periodic (e.g. a Cylinder/Cone's height, a Plane's
+    /// `v_dir`). Used as an O(1) reject before the O(n) winding-number test:
+    /// a query `v` outside `[v_min - eps, v_max + eps]` cannot be enclosed by
+    /// this polygon regardless of `u`, so the winding computation is skipped
+    /// entirely. This is exactly the class of query `Surface::exact_uv`
+    /// exists to report honestly — a ray hit genuinely past a face's finite
+    /// rim — so it is the dominant rejection path once `exact_uv` stops
+    /// clamping. Gated on non-periodic `v` because a periodic axis' raw
+    /// sample values are not a monotone bbox (`project_loop_uv_unwrapped`
+    /// deliberately unwraps past one period), so a plain range reject would
+    /// be unsound there.
+    v_reject: Option<[f64; 3]>,
+}
+
+impl LoopUvCache {
+    pub(crate) fn new() -> Self {
+        Self {
+            entries: DashMap::new(),
+        }
+    }
+
+    fn get_or_build(
+        &self,
+        loop_id: crate::primitives::r#loop::LoopId,
+        model: &BRepModel,
+        face: &Face,
+    ) -> Option<Arc<CachedLoopUv>> {
+        if let Some(existing) = self.entries.get(&loop_id) {
+            return Some(Arc::clone(existing.value()));
+        }
+        let loop_data = model.loops.get(loop_id)?;
+        let surface = model.surfaces.get(face.surface_id)?;
+        let polygon = get_loop_polygon_2d(loop_data, model, surface);
+        let is_outer = matches!(
+            loop_data.loop_type,
+            crate::primitives::r#loop::LoopType::Outer
+        );
+        const DEGENERATE_AREA_TOL: f64 = 1e-12;
+        let degenerate =
+            polygon.len() < 3 || polygon_signed_area_uv(&polygon).abs() < DEGENERATE_AREA_TOL;
+        let v_reject = if !degenerate && surface.period_v().is_none() {
+            let mut v_min = f64::INFINITY;
+            let mut v_max = f64::NEG_INFINITY;
+            for &(_, v) in &polygon {
+                v_min = v_min.min(v);
+                v_max = v_max.max(v);
+            }
+            // Mirrors the noise-floor reasoning documented on
+            // `DEGENERATE_AREA_TOL` above: ~1e-15 round-off per sample, 20
+            // samples/edge, O(1) edges — padded generously since this is a
+            // reject-only guard (a false "not rejected" just falls through
+            // to the exact winding test, never a false accept).
+            let eps = 1e-9_f64.max(1e-9 * (v_max - v_min).abs());
+            Some([v_min, v_max, eps])
+        } else {
+            None
+        };
+        let built = Arc::new(CachedLoopUv {
+            polygon,
+            is_outer,
+            degenerate,
+            v_reject,
+        });
+        self.entries
+            .entry(loop_id)
+            .or_insert_with(|| Arc::clone(&built));
+        Some(built)
+    }
+}
+
+fn classify_cached(u: f64, v: f64, cached: &CachedLoopUv) -> bool {
+    if cached.degenerate {
+        return cached.is_outer;
+    }
+    if let Some([v_min, v_max, eps]) = cached.v_reject {
+        if v < v_min - eps || v > v_max + eps {
+            return false;
+        }
+    }
+    let winding_number = calculate_winding_number(&(u, v), &cached.polygon);
+    winding_number.abs() > 0.5
+}
+
+/// [`is_point_inside_face`], but consulting `cache` for each loop's UV
+/// polygon instead of rebuilding it on every call. Semantically identical to
+/// `is_point_inside_face` — same winding-number test, same degenerate-loop
+/// fallback, same `v`-range short-circuit any caller could derive by hand
+/// from the polygon `is_point_inside_face` already builds — only the
+/// per-call cost differs. See [`LoopUvCache`] for why this exists and the
+/// `LoopId`-scoped-to-one-model-snapshot caveat.
+pub(crate) fn point_inside_face_uv_cached(
+    u: f64,
+    v: f64,
+    face: &Face,
+    model: &BRepModel,
+    cache: &LoopUvCache,
+) -> bool {
+    if let Some(surface) = model.surfaces.get(face.surface_id) {
+        if let Ok(p) = surface.point_at(u, v) {
+            if let Some(inside) = crate::operations::boolean::spherical_circular_membership(
+                model,
+                face,
+                surface,
+                &p,
+                &crate::math::Tolerance::default(),
+            ) {
+                return inside;
+            }
+        }
+    }
+
+    match cache.get_or_build(face.outer_loop, model, face) {
+        Some(cached) => {
+            if !classify_cached(u, v, &cached) {
+                return false;
+            }
+        }
+        None => return false,
+    }
+
+    for &inner_loop_id in &face.inner_loops {
+        if let Some(cached) = cache.get_or_build(inner_loop_id, model, face) {
+            if classify_cached(u, v, &cached) {
+                return false;
+            }
+        }
+    }
+
+    true
 }
 
 /// Get loop as 2D polygon in parameter space.

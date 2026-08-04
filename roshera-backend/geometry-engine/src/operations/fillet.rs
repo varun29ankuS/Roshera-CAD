@@ -9326,7 +9326,7 @@ fn get_adjacent_faces_safe(
     let mut adjacent_faces = Vec::new();
 
     // Iterate through all faces by index
-    for face_id in 0..model.faces.len() as u32 {
+    for face_id in 0..model.faces.slot_count() as u32 {
         if let Some(face) = model.faces.get(face_id) {
             if face_contains_edge(model, face, edge_id)? {
                 adjacent_faces.push(face_id);

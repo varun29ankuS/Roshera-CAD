@@ -1441,12 +1441,15 @@ mod fallback_refusal_tests {
     ///    as a bona fide `GeneralNurbsSurface` — structurally identical
     ///    to an authored one.
     /// 2. The production import path that actually exercises this
-    ///    (`ros.rs::import_ros_to_brep`) returns a bare `BRepModel`,
+    ///    (`ros.rs::RosImport::into_model`, via the api-server import
+    ///    route) materialises a bare `BRepModel` from the snapshot,
     ///    discarding `BRepSnapshot::metadata` entirely — so even a
     ///    metadata-side-channel (e.g. recording approximated surface
-    ///    UUIDs in `BRepMetadata.properties`) would need that function's
-    ///    public return type changed and its callers (api-server, out of
-    ///    this task's assigned crates) updated to carry it through.
+    ///    UUIDs in `BRepMetadata.properties`) would need that method's
+    ///    return type changed and its callers updated to carry it
+    ///    through. (The route DOES now report HIST/PROV counts from
+    ///    `RosImport`; snapshot metadata is a separate, still-dropped
+    ///    channel.)
     ///
     /// Closing this fully needs a kernel-level provenance field, or
     /// threading snapshot metadata through the live-model lifecycle

@@ -1469,11 +1469,21 @@ async fn fillet_g1_mixed_corner_refuses_typed_g1_not_achievable() {
 
     // Second call: fillet edge[1] + edge[2] with G1 — the finalize.
     // The measured-kink gate refuses G1 on this corner, typed.
+    //
+    // `acknowledge_unsound` is REQUIRED and CORRECT here for the same reason
+    // as `blend_mixed_corner_protocol_reports_honest_certs_per_step`: the
+    // first call deliberately leaves the corner OPEN (that is what
+    // `partial_corner_vertices` opts into), so the base is knowingly unsound
+    // and the unsound-base gate would refuse the finalize before the G1
+    // synthesizer ever ran. The flag restores the path under test — this test
+    // is about the typed `blend_failed` G1 refusal, not about the presence or
+    // absence of the unsound-base gate.
     let second_request = fillet_post(json!({
         "object": uuid.to_string(),
         "edges":  [edges[1], edges[2]],
         "radius": 0.5,
         "seam_continuity": "g1",
+        "acknowledge_unsound": true,
     }));
     let (status, body) = dispatch(&state, second_request).await;
 
@@ -1718,8 +1728,11 @@ async fn blackboard_honours_client_supplied_id_and_dedupes() {
 /// THE per-part isolation proof through the live router: a calc posted to
 /// part A's notebook and a different calc to part B's notebook never
 /// cross-contaminate. A GET scoped to A returns ONLY A's line; B's returns
-/// ONLY B's; the un-scoped (document) notebook is empty. This is the whole
-/// point of scoping the blackboard per part.
+/// ONLY B's. As of the 2026-08-04 "blackboard is per document" decision the
+/// un-scoped (document) GET is no longer expected to be empty — it is the
+/// UNION of the Document notebook and every Part notebook belonging to it
+/// (see `blackboard.rs::BlackboardManager::document_snapshot`), so it must
+/// see BOTH A's and B's lines here.
 #[tokio::test]
 async fn blackboard_part_scopes_are_isolated_through_router() {
     let state = make_test_state().await;
@@ -1806,7 +1819,8 @@ async fn blackboard_part_scopes_are_isolated_through_router() {
         "B sees ONLY B's calc; body = {body}"
     );
 
-    // GET document (un-scoped) → empty: part writes never leak into it.
+    // GET document (un-scoped) → the UNION: both A's and B's lines, each
+    // tagged with the part it came from.
     let (_status, body) = dispatch(
         &state,
         Request::builder()
@@ -1816,10 +1830,117 @@ async fn blackboard_part_scopes_are_isolated_through_router() {
             .expect("static request must build"),
     )
     .await;
+    let lines = body["lines"].as_array().cloned().unwrap_or_default();
     assert_eq!(
-        body["lines"].as_array().map(Vec::len),
-        Some(0),
-        "document notebook stays empty; body = {body}"
+        lines.len(),
+        2,
+        "the document view unions in both part notebooks; body = {body}"
+    );
+    let texts: Vec<&str> = lines.iter().filter_map(|l| l["text"].as_str()).collect();
+    assert!(
+        texts.iter().any(|t| t.contains("sigma")),
+        "A's line is present; body = {body}"
+    );
+    assert!(
+        texts.iter().any(|t| t.contains("T=Fr")),
+        "B's line is present; body = {body}"
+    );
+    for line in &lines {
+        assert!(
+            line["partId"].is_number(),
+            "each unioned line carries the part it came from; body = {body}"
+        );
+    }
+}
+
+/// THE primary RED for the 2026-08-04 "blackboard is per document" decision,
+/// through the live router. Seeds a Part-scoped notebook the way durable
+/// storage actually holds one — a raw JSON `PersistedNotebook` blob fed
+/// straight to `BlackboardManager::hydrate`, deliberately WITHOUT a `partId`
+/// key at all (that field did not exist when this row would have been
+/// written; `#[serde(default)]` is what makes it still deserialize). No REST
+/// write ever touches the part notebook in this test — it proves the READ
+/// side alone recovers pre-existing content, not a round trip through `add`.
+///
+/// Pre-change (`get_blackboard` calling `snapshot` instead of
+/// `document_snapshot`), the un-scoped GET returns 0 lines: the part note is
+/// invisible. That is the exact RED to quote before wiring the union.
+#[tokio::test]
+async fn document_view_includes_pre_existing_part_scoped_lines_through_router() {
+    let state = make_test_state().await;
+    let document_id = state.active_document.read().await.clone();
+
+    let persisted_part_notebook = json!({
+        "lines": [{
+            "id": "bb-legacy-1",
+            "text": "legacy note about finger_L3",
+            "author": "user",
+            "createdAt": 1000,
+            "updatedAt": 1000
+            // NOTE: no "partId" key — this is what a row written before
+            // that field existed looks like on disk.
+        }],
+        "events": [{
+            "kind": "add",
+            "lineId": "bb-legacy-1",
+            "text": "legacy note about finger_L3",
+            "author": "user",
+            "at": 1000,
+            "index": 0
+        }],
+        "counter": 1
+    });
+    let restored = state.blackboard.hydrate(
+        &document_id,
+        vec![("part:4242".to_string(), persisted_part_notebook)],
+    );
+    assert_eq!(
+        restored, 1,
+        "the part notebook must hydrate into the working set"
+    );
+
+    let (_status, body) = dispatch(
+        &state,
+        Request::builder()
+            .method(Method::GET)
+            .uri("/api/blackboard")
+            .body(Body::empty())
+            .expect("static request must build"),
+    )
+    .await;
+    let lines = body["lines"].as_array().cloned().unwrap_or_default();
+    assert_eq!(
+        lines.len(),
+        1,
+        "the un-scoped (document) GET must surface the pre-existing part \
+         line — before the union this returns 0; body = {body}"
+    );
+    assert_eq!(lines[0]["text"], "legacy note about finger_L3");
+    assert_eq!(
+        lines[0]["partId"], 4242,
+        "the line still carries which part it was about; body = {body}"
+    );
+
+    // And the direct, scoped read of that SAME notebook is untouched: same
+    // line, same id, and (because that response is not the union) no
+    // `partId` on it — the scope of the whole response already says which
+    // part it is about.
+    let (_status, body) = dispatch(
+        &state,
+        Request::builder()
+            .method(Method::GET)
+            .uri("/api/blackboard?scope=part:4242")
+            .body(Body::empty())
+            .expect("static request must build"),
+    )
+    .await;
+    let lines = body["lines"].as_array().cloned().unwrap_or_default();
+    assert_eq!(lines.len(), 1, "the row itself is untouched; body = {body}");
+    assert_eq!(lines[0]["id"], "bb-legacy-1");
+    assert_eq!(
+        lines[0].get("partId"),
+        None,
+        "a line read via its own scope is not tagged; body = {body}"
     );
 }
 
@@ -2045,7 +2166,16 @@ async fn create_geometry_fast_flag_returns_only_lightweight_perception() {
 /// full certificate's construction-consistency dimension flags it
 /// `inconsistent → sound=false` — exactly the defect class the shallow
 /// (B-Rep-only) perception cannot see. Returns `(uuid, solid_id)`.
-async fn seed_box_with_drifted_construction(state: &AppState, size: f64) -> (Uuid, SolidId) {
+///
+/// `pub(crate)` because `unsound_base_gate_tests` needs the same fixture:
+/// it is the one reproducible unsound base that is independent of every
+/// operation under active repair, and it is reversible through a public
+/// kernel seam (which is what lets that module prove the gate re-reads the
+/// LIVE verdict).
+pub(crate) async fn seed_box_with_drifted_construction(
+    state: &AppState,
+    size: f64,
+) -> (Uuid, SolidId) {
     use geometry_engine::primitives::provenance::ConstructionGeometry;
     let solid_id;
     {
@@ -2091,7 +2221,19 @@ async fn transform_outlier_reports_unsound_automatically_via_full_cert() {
         .uri("/api/geometry/transform")
         .header("content-type", "application/json")
         .body(Body::from(
-            json!({ "object": uuid.to_string(), "translation": [0.0, 0.0, 1.0] }).to_string(),
+            // `acknowledge_unsound` is REQUIRED here now: the server-side
+            // unsound-base gate (`main.rs::refuse_unsound_base`) refuses a
+            // mutation on a base whose live verdict is unsound, and this
+            // fixture's whole point is that the base IS unsound. The flag is
+            // the documented escape for knowingly proceeding, which is
+            // exactly what this test does — it asserts what the mutation
+            // REPORTS about a defective solid, not that the gate is absent.
+            json!({
+                "object": uuid.to_string(),
+                "translation": [0.0, 0.0, 1.0],
+                "acknowledge_unsound": true
+            })
+            .to_string(),
         ))
         .expect("static request must build");
     let (status, body) = dispatch(&state, request).await;
@@ -4095,10 +4237,22 @@ async fn blend_mixed_corner_protocol_reports_honest_certs_per_step() {
     // Step 2 — the opposite-kind finalize on the vertical corner edge.
     // The corner vertex survived call 1 (opt-in preserved it), so the
     // vertical edge id is still live.
+    //
+    // `acknowledge_unsound` is REQUIRED and CORRECT here. Step 1 above
+    // deliberately leaves the corner open — this test asserts `sound=false`
+    // on it — so the server-side unsound-base gate
+    // (`main.rs::refuse_unsound_base`) would otherwise refuse step 2. But
+    // step 2 IS the repair: it closes the corner (the assertions below
+    // require `watertight=true` afterwards). This is precisely the flow the
+    // escape hatch exists for — a caller who KNOWINGLY continues from a
+    // deliberately-unsound intermediate state. The MCP client gate already
+    // demanded the same flag for this protocol; the Rust gate brings the
+    // plain-REST path into line with it.
     let second = chamfer_post(json!({
         "object": uuid.to_string(),
         "edges":  [vertical],
         "distance": 4.0,
+        "acknowledge_unsound": true,
     }));
     let (status, body) = dispatch(&state, second).await;
     assert_eq!(
@@ -4722,6 +4876,709 @@ async fn import_step_path_missing_file_is_typed_error() {
         body.get("error_code").and_then(Value::as_str),
         Some("invalid_parameter"),
         "#34: missing-file path import must carry the invalid_parameter code; body = {body}"
+    );
+}
+
+// =====================================================================
+// Tests — native .ros import route (/api/geometry/import_ros)
+// =====================================================================
+
+/// Build a POST `/api/geometry/import_ros` request with the given JSON
+/// payload.
+fn import_ros_post(payload: Value) -> Request<Body> {
+    Request::builder()
+        .method(Method::POST)
+        .uri("/api/geometry/import_ros")
+        .header("content-type", "application/json")
+        .body(Body::from(payload.to_string()))
+        .expect("static request must build")
+}
+
+/// RED-first: before this route existed, the ONLY .ros surface was the
+/// export arm of `/api/export` — `export_engine::formats::ros::import_ros`
+/// was fully implemented but reachable from no HTTP route, so a .ros file
+/// the backend itself wrote could never come back in. On the pre-fix
+/// router this request 404s (no such route); the route added for the
+/// import path is what makes it pass.
+///
+/// Builds a real single-box .ros v3.1 file on disk with the same writer
+/// the export endpoint uses (`export_brep_to_ros`, GEOM snapshot on),
+/// imports it via `path`, and confirms it splices a solid into the live
+/// model exactly like the STEP import route does.
+#[tokio::test]
+async fn import_ros_path_reads_file_serverside() {
+    use export_engine::formats::ros::{export_brep_to_ros, RosExportOptions, RosExportPayload};
+
+    let mut fresh_model = BRepModel::new();
+    {
+        let mut builder = TopologyBuilder::new(&mut fresh_model);
+        builder
+            .create_box_3d(10.0, 10.0, 10.0)
+            .expect("box primitive must build for positive size");
+    }
+
+    let mut tmp_path = std::env::temp_dir();
+    tmp_path.push(format!(
+        "roshera_import_ros_path_test_{}.ros",
+        Uuid::new_v4()
+    ));
+    export_brep_to_ros(
+        RosExportPayload {
+            model: &fresh_model,
+            history: None,
+            aipr: None,
+        },
+        &tmp_path,
+        RosExportOptions::default(),
+    )
+    .await
+    .expect(".ros export of a single box must succeed");
+
+    let state = make_test_state().await;
+    let request = import_ros_post(json!({
+        "path": tmp_path.to_string_lossy().to_string(),
+    }));
+    let (status, body) = dispatch(&state, request).await;
+    let _ = std::fs::remove_file(&tmp_path);
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "path-based import of a real .ros file must succeed; body = {body}"
+    );
+    let objects = body.get("objects").and_then(Value::as_array);
+    assert!(
+        objects.map(|o| !o.is_empty()).unwrap_or(false),
+        "path-based .ros import must splice at least one solid into the \
+         model; body = {body}"
+    );
+    // The route FULL-certifies every spliced solid; a freshly exported box
+    // must come back sound, and `success` must report that verdict.
+    assert_eq!(
+        body.get("success").and_then(Value::as_bool),
+        Some(true),
+        ".ros import of a sound box must report success:true (the per-solid \
+         certificate verdict); body = {body}"
+    );
+}
+
+/// `path` pointing at a file that does not exist must fail with a typed,
+/// actionable `invalid_parameter` error — never a panic, never a silent
+/// no-op. (RED-first: on the pre-fix router this 404s with an EMPTY body,
+/// so the `error_code` assertion fails.)
+#[tokio::test]
+async fn import_ros_path_missing_file_is_typed_error() {
+    let state = make_test_state().await;
+    let mut tmp_path = std::env::temp_dir();
+    tmp_path.push(format!("roshera_import_ros_missing_{}.ros", Uuid::new_v4()));
+    let request = import_ros_post(json!({
+        "path": tmp_path.to_string_lossy().to_string(),
+    }));
+    let (status, body) = dispatch(&state, request).await;
+    assert!(
+        status.is_client_error(),
+        "a missing .ros path must be a 4xx, not a panic/500; got {status}, body = {body}"
+    );
+    assert_eq!(
+        body.get("error_code").and_then(Value::as_str),
+        Some("invalid_parameter"),
+        "missing-file .ros import must carry the invalid_parameter code; body = {body}"
+    );
+}
+
+/// Neither `path` nor `filename` → the typed `missing_field` error that
+/// names both accepted fields, mirroring the STEP route's contract.
+#[tokio::test]
+async fn import_ros_without_path_or_filename_is_missing_field() {
+    let state = make_test_state().await;
+    let request = import_ros_post(json!({}));
+    let (status, body) = dispatch(&state, request).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "an empty .ros import payload must be a 400; body = {body}"
+    );
+    assert_eq!(
+        body.get("error_code").and_then(Value::as_str),
+        Some("missing_field"),
+        "empty .ros import payload must carry the missing_field code; body = {body}"
+    );
+}
+
+/// `filename` is resolved INSIDE the export directory; a traversal
+/// attempt (`..` / path separators) must be refused with a typed error
+/// before any filesystem access — same guard as `/api/download/{file}`.
+#[tokio::test]
+async fn import_ros_filename_traversal_is_refused() {
+    let state = make_test_state().await;
+    for evil in ["../secrets.ros", "a/b.ros", "a\\b.ros"] {
+        let request = import_ros_post(json!({ "filename": evil }));
+        let (status, body) = dispatch(&state, request).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "traversal filename {evil:?} must be a 400; body = {body}"
+        );
+        assert_eq!(
+            body.get("error_code").and_then(Value::as_str),
+            Some("invalid_parameter"),
+            "traversal filename {evil:?} must carry invalid_parameter; body = {body}"
+        );
+    }
+}
+
+/// RED-first: `.ros` v3.1 declares HIST (timeline) as a MANDATORY chunk,
+/// but the `/api/export` ROS arm passed `RosExportPayload { history:
+/// None, .. }` — so a part with a fully recorded live timeline exported
+/// a file whose HIST chunk was EMPTY, silently implying "this model has
+/// no history". This test failed before the fix (0 HIST events in the
+/// file against a live timeline of recorded events) and pins:
+///   1. the exported FILE carries the live branch's events (verified by
+///      re-opening the raw artifact with the format's own reader, not
+///      by trusting the response), and
+///   2. the RESPONSE states what went into the file — including, since
+///      the PROV derivation landed, one derived AI command per recorded
+///      operation (prompt only where an intent facet was recorded).
+#[tokio::test]
+async fn export_ros_route_hist_carries_the_live_timeline() {
+    let state = make_test_state().await;
+    let _drill = seed_bored_box_live(&state).await;
+
+    // Ground truth: the live timeline's event count for branch main,
+    // read exactly the way GET /api/timeline/history reads it
+    // (recorder flush barrier, then branch events).
+    let _ = state.timeline_recorder.flush().await;
+    let live_event_count = {
+        let timeline = state.timeline.read().await;
+        timeline
+            .get_branch_events(&timeline_engine::BranchId::main(), None, None)
+            .expect("branch main must exist")
+            .len()
+    };
+    assert!(
+        live_event_count > 0,
+        "precondition: the live-seeded part must have recorded timeline events"
+    );
+
+    // P1: clear the export staleness gate explicitly for every live
+    // solid (what `verify_part` calls), so ONLY the HIST content is
+    // under test here.
+    let solid_ids: Vec<u32> = {
+        let model = state.model.read().await;
+        model.solids.iter().map(|(sid, _)| sid).collect()
+    };
+    for sid in solid_ids {
+        let (vs, vbody) = dispatch(
+            &state,
+            json_get(&format!("/api/agent/parts/{sid}/perception")),
+        )
+        .await;
+        assert_eq!(
+            vs,
+            StatusCode::OK,
+            "precondition: verify of solid {sid} must succeed; body = {vbody}"
+        );
+    }
+
+    let (status, raw) = dispatch_raw(
+        &state,
+        export_post(json!({ "format": "ROS", "objects": [] })),
+    )
+    .await;
+    let text = String::from_utf8_lossy(&raw).to_string();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "ROS export must succeed; body = {text}"
+    );
+    let body: Value = serde_json::from_str(&text).expect("export success body is JSON");
+    let filename = body["filename"]
+        .as_str()
+        .expect("export response carries the filename")
+        .to_string();
+
+    // Verify from the RAW ARTIFACT: re-open the file the route just
+    // wrote with the format's own reader.
+    let path = std::path::PathBuf::from("./exports").join(&filename);
+    let imported = export_engine::formats::ros::import_ros(&path, None)
+        .await
+        .expect("the exported .ros file must re-open with the format's own reader");
+    let _ = std::fs::remove_file(&path);
+
+    assert_eq!(
+        imported.timeline.len(),
+        live_event_count,
+        "HIST is a MANDATORY chunk carrying the timeline: the exported file must \
+         contain the live branch's {live_event_count} events, not an empty manifest"
+    );
+    assert!(
+        !imported.branches.is_empty(),
+        "HIST must carry the branch manifest for the live timeline"
+    );
+    // PROV: commands are DERIVED from the recorded timeline — one
+    // `AICommand` per recorded operation (the intent wave made intent a
+    // recorded fact, so PROV can mirror the history it ships alongside).
+    // A prompt appears ONLY where the operation recorded an intent
+    // facet; it is never synthesised from the op kind.
+    assert_eq!(
+        imported.aipr.commands.len(),
+        live_event_count,
+        "PROV must carry one derived AI command per recorded timeline event"
+    );
+    for cmd in &imported.aipr.commands {
+        if cmd.prompt.is_none() {
+            assert_eq!(
+                cmd.prompt_hash, [0u8; 32],
+                "a command with no recorded intent must carry no prompt \
+                 commitment either — a hash of a prompt that was never \
+                 stated would be fabricated provenance"
+            );
+        }
+    }
+
+    // The response must state what the file carries.
+    let contents = body
+        .get("ros_contents")
+        .cloned()
+        .expect("a ROS export response must report what went into the file");
+    assert_eq!(
+        contents["hist_event_count"].as_u64(),
+        Some(live_event_count as u64),
+        "response must report the HIST event count; contents = {contents}"
+    );
+    assert_eq!(
+        contents["prov_command_count"].as_u64(),
+        Some(live_event_count as u64),
+        "response must report the PROV command count; contents = {contents}"
+    );
+    assert!(
+        contents["prov_commands_absent_reason"].is_null(),
+        "PROV carries derived commands, so no absence marker may appear; \
+         contents = {contents}"
+    );
+}
+
+/// RED-first: the import route used `import_ros_to_brep`, which returns a
+/// bare `BRepModel` — the fully-parsed HIST/PROV payload was thrown away
+/// and the response said nothing about it (this test failed before the
+/// fix: no `file_contents` in the body). The route must REPORT the
+/// counts it read; ingesting a foreign timeline stays out of scope.
+#[tokio::test]
+async fn import_ros_route_reports_hist_and_prov_counts() {
+    use export_engine::formats::ros::{
+        export_brep_to_ros, HistData, RosExportOptions, RosExportPayload,
+    };
+    use export_engine::formats::timeline_chunk::BranchManifest;
+
+    fn synth_event(branch: timeline_engine::BranchId, seq: u64) -> timeline_engine::TimelineEvent {
+        timeline_engine::TimelineEvent {
+            id: timeline_engine::EventId::new(),
+            sequence_number: seq,
+            timestamp: chrono::Utc::now(),
+            author: timeline_engine::Author::System,
+            operation: timeline_engine::Operation::CreatePrimitive {
+                primitive_type: timeline_engine::PrimitiveType::Box,
+                parameters: json!({ "size": 1.0 }),
+            },
+            inputs: timeline_engine::OperationInputs::default(),
+            outputs: timeline_engine::OperationOutputs::default(),
+            metadata: timeline_engine::EventMetadata {
+                description: None,
+                branch_id: branch,
+                tags: vec![],
+                properties: Default::default(),
+            },
+        }
+    }
+
+    // A real box model plus a synthetic 2-event / 1-branch HIST payload.
+    let mut fresh_model = BRepModel::new();
+    {
+        let mut builder = TopologyBuilder::new(&mut fresh_model);
+        builder
+            .create_box_3d(10.0, 10.0, 10.0)
+            .expect("box primitive must build for positive size");
+    }
+    let main = timeline_engine::BranchId::main();
+    let manifest = BranchManifest {
+        id: main,
+        name: "main".to_string(),
+        parent: None,
+        fork_point: timeline_engine::ForkPoint {
+            branch_id: main,
+            event_index: 0,
+            timestamp: chrono::Utc::now(),
+        },
+        state: timeline_engine::BranchState::Active,
+        metadata: timeline_engine::BranchMetadata {
+            created_by: timeline_engine::Author::System,
+            created_at: chrono::Utc::now(),
+            purpose: timeline_engine::BranchPurpose::UserExploration {
+                description: "import-count test".to_string(),
+            },
+            ai_context: None,
+            checkpoints: vec![],
+        },
+        protected: true,
+        hidden: false,
+    };
+
+    let mut tmp_path = std::env::temp_dir();
+    tmp_path.push(format!("roshera_import_ros_counts_{}.ros", Uuid::new_v4()));
+    export_brep_to_ros(
+        RosExportPayload {
+            model: &fresh_model,
+            history: Some(HistData::new(
+                vec![manifest],
+                vec![synth_event(main, 0), synth_event(main, 1)],
+            )),
+            aipr: None,
+        },
+        &tmp_path,
+        RosExportOptions::default(),
+    )
+    .await
+    .expect(".ros export with a HIST payload must succeed");
+
+    let state = make_test_state().await;
+    let (status, body) = dispatch(
+        &state,
+        import_ros_post(json!({ "path": tmp_path.to_string_lossy().to_string() })),
+    )
+    .await;
+    let _ = std::fs::remove_file(&tmp_path);
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        ".ros import must succeed; body = {body}"
+    );
+    let contents = body.get("file_contents").cloned().expect(
+        "import response must report what the file carried (the pre-fix route \
+         threw the parsed HIST/PROV away)",
+    );
+    assert_eq!(
+        contents["hist_event_count"].as_u64(),
+        Some(2),
+        "response must report the file's HIST event count; contents = {contents}"
+    );
+    assert_eq!(
+        contents["hist_branch_count"].as_u64(),
+        Some(1),
+        "response must report the file's HIST branch count; contents = {contents}"
+    );
+    assert_eq!(
+        contents["prov_command_count"].as_u64(),
+        Some(0),
+        "response must report the file's PROV command count; contents = {contents}"
+    );
+    assert!(
+        contents
+            .get("prov_session_id")
+            .and_then(Value::as_u64)
+            .is_some(),
+        "response must report the file's PROV session id; contents = {contents}"
+    );
+}
+
+// =====================================================================
+// Tests — .ros import as a DOCUMENT (/api/documents/import_ros)
+// =====================================================================
+
+/// Build a POST `/api/documents/import_ros` request with the given JSON
+/// payload.
+fn import_ros_document_post(payload: Value) -> Request<Body> {
+    Request::builder()
+        .method(Method::POST)
+        .uri("/api/documents/import_ros")
+        .header("content-type", "application/json")
+        .body(Body::from(payload.to_string()))
+        .expect("static request must build")
+}
+
+/// Round-trip scaffold shared by the document-import tests: seed a bored
+/// box through the LIVE handlers (box − cylinder → 3 recorded events,
+/// the boolean REFERENCING the solids the first two events minted),
+/// clear the export staleness gate, export a `.ros` via `/api/export`,
+/// and return the exported file's path plus the pre-export
+/// `(event id, sequence_number)` pairs of branch `main` — the ground
+/// truth an import must reproduce verbatim.
+async fn export_live_document_to_ros(state: &AppState) -> (std::path::PathBuf, Vec<(String, u64)>) {
+    let _drill = seed_bored_box_live(state).await;
+    let _ = state.timeline_recorder.flush().await;
+    let originals: Vec<(String, u64)> = {
+        let timeline = state.timeline.read().await;
+        timeline
+            .get_branch_events(&timeline_engine::BranchId::main(), None, None)
+            .expect("branch main must exist")
+            .iter()
+            .map(|e| (e.id.to_string(), e.sequence_number))
+            .collect()
+    };
+    assert!(
+        originals.len() >= 3,
+        "precondition: the live-seeded part must have recorded several operations"
+    );
+
+    // Clear the export staleness gate for every live solid (what
+    // `verify_part` calls), exactly as the export HIST test does.
+    let solid_ids: Vec<u32> = {
+        let model = state.model.read().await;
+        model.solids.iter().map(|(sid, _)| sid).collect()
+    };
+    for sid in solid_ids {
+        let (vs, vbody) = dispatch(
+            state,
+            json_get(&format!("/api/agent/parts/{sid}/perception")),
+        )
+        .await;
+        assert_eq!(
+            vs,
+            StatusCode::OK,
+            "precondition: verify of solid {sid} must succeed; body = {vbody}"
+        );
+    }
+
+    let (status, raw) = dispatch_raw(
+        state,
+        export_post(json!({ "format": "ROS", "objects": [] })),
+    )
+    .await;
+    let text = String::from_utf8_lossy(&raw).to_string();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "ROS export must succeed; body = {text}"
+    );
+    let body: Value = serde_json::from_str(&text).expect("export success body is JSON");
+    let filename = body["filename"]
+        .as_str()
+        .expect("export response carries the filename")
+        .to_string();
+    (
+        std::path::PathBuf::from("./exports").join(&filename),
+        originals,
+    )
+}
+
+/// RED-first (document import, test 1): `/api/geometry/import_ros`
+/// reports the HIST payload and then DISCARDS it — a provenance-bearing
+/// file imports as a bare geometry splice. The document-import route
+/// must instead create a fresh document, persist the imported events
+/// under it, and activate it, with every event's `sequence_number`
+/// byte-identical — persistent ids derive from `evt:{sequence_number}`,
+/// so a fresh document with verbatim sequences preserves every pid (no
+/// merge, no resequencing, no id collisions). On the pre-fix router this
+/// route does not exist, so the request 404s.
+#[tokio::test]
+async fn import_ros_document_preserves_event_ids_and_sequences() {
+    let state = make_test_state().await;
+    let (path, originals) = export_live_document_to_ros(&state).await;
+
+    let (status, body) = dispatch(
+        &state,
+        import_ros_document_post(json!({ "path": path.to_string_lossy().to_string() })),
+    )
+    .await;
+    let _ = std::fs::remove_file(&path);
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        ".ros document import must succeed; body = {body}"
+    );
+    let doc_id = body["document"]["id"]
+        .as_str()
+        .expect("document import must return the new document's id")
+        .to_string();
+    assert_ne!(
+        doc_id,
+        crate::durability::DURABILITY_SESSION_ID,
+        "import must mint a NEW document, never merge into the default one"
+    );
+    assert_eq!(
+        body["file_contents"]["hist_event_count"].as_u64(),
+        Some(originals.len() as u64),
+        "response must report the file's HIST event count; body = {body}"
+    );
+
+    // The imported document is now ACTIVE; its timeline must carry the
+    // SAME events — same count, same sequence numbers, same event ids.
+    assert_eq!(
+        state.active_document.read().await.clone(),
+        doc_id,
+        "import must activate the new document through documents::activate"
+    );
+    let rehydrated: Vec<(String, u64)> = {
+        let timeline = state.timeline.read().await;
+        timeline
+            .get_branch_events(&timeline_engine::BranchId::main(), None, None)
+            .expect("branch main must exist in the imported document")
+            .iter()
+            .map(|e| (e.id.to_string(), e.sequence_number))
+            .collect()
+    };
+    assert_eq!(
+        rehydrated, originals,
+        "the imported document's timeline must carry the exported events verbatim \
+         (same count, same sequence numbers, same ids) — persistent ids derive from \
+         evt:{{sequence_number}}, so any resequencing breaks every recorded pid; \
+         body = {body}"
+    );
+}
+
+/// The identity test — the point of the whole design: the seeded boolean
+/// difference REFERENCES the box and cylinder minted by earlier events
+/// (persistent ids derived from their sequence numbers). Because import
+/// rehydrates into a FRESH document with sequences preserved, the
+/// imported document must REPLAY to the same model — the boolean's
+/// operand references resolve and the 3-radius bore re-derives — rather
+/// than to dangling references. The response must say the replay was
+/// clean in the durability vocabulary (`active`, never a silent partial).
+#[tokio::test]
+async fn import_ros_document_replay_resolves_persistent_id_references() {
+    let state = make_test_state().await;
+    let (path, originals) = export_live_document_to_ros(&state).await;
+
+    let (status, body) = dispatch(
+        &state,
+        import_ros_document_post(json!({ "path": path.to_string_lossy().to_string() })),
+    )
+    .await;
+    let _ = std::fs::remove_file(&path);
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        ".ros document import must succeed; body = {body}"
+    );
+    assert_eq!(
+        body["history"]["state"].as_str(),
+        Some("active"),
+        "the imported HIST must replay cleanly and say so in the durability \
+         vocabulary (state=active, not quarantined); body = {body}"
+    );
+    assert_eq!(
+        body["history"]["events_replayed"].as_u64(),
+        Some(originals.len() as u64),
+        "every imported event must replay — a partial replay is a quarantine, \
+         not a success; body = {body}"
+    );
+    assert_eq!(
+        body["success"].as_bool(),
+        Some(true),
+        "a clean full replay must report success:true; body = {body}"
+    );
+
+    // The live model IS the imported document now: exactly one solid
+    // (the boolean consumed both operands) with the drilled bore intact.
+    let solid_count = {
+        let model = state.model.read().await;
+        model.solids.iter().count()
+    };
+    assert_eq!(
+        solid_count, 1,
+        "the imported document must replay to the boolean RESULT (operands \
+         consumed) — operand references resolved, not dangled; body = {body}"
+    );
+    let bore = live_bore_radius(&state)
+        .await
+        .expect("the imported document's model must carry the drilled bore wall");
+    assert!(
+        (bore - 3.0).abs() < 1e-9,
+        "the bore must re-derive at its recorded radius after import; got {bore}"
+    );
+}
+
+/// A file with an EMPTY HIST (bare geometry snapshot) must still import —
+/// as a document with NO history — and say that plainly (`history.state`
+/// = "empty", zero events). It must NOT be refused, and NO events may be
+/// fabricated from the GEOM snapshot; the snapshot's presence is reported
+/// so nothing is silently dropped.
+#[tokio::test]
+async fn import_ros_document_empty_hist_imports_as_empty_document() {
+    use export_engine::formats::ros::{export_brep_to_ros, RosExportOptions, RosExportPayload};
+
+    let mut fresh_model = BRepModel::new();
+    {
+        let mut builder = TopologyBuilder::new(&mut fresh_model);
+        builder
+            .create_box_3d(10.0, 10.0, 10.0)
+            .expect("box primitive must build for positive size");
+    }
+    let mut tmp_path = std::env::temp_dir();
+    tmp_path.push(format!(
+        "roshera_import_ros_doc_empty_{}.ros",
+        Uuid::new_v4()
+    ));
+    export_brep_to_ros(
+        RosExportPayload {
+            model: &fresh_model,
+            history: None,
+            aipr: None,
+        },
+        &tmp_path,
+        RosExportOptions::default(),
+    )
+    .await
+    .expect(".ros export of a bare snapshot must succeed");
+
+    let state = make_test_state().await;
+    let (status, body) = dispatch(
+        &state,
+        import_ros_document_post(json!({ "path": tmp_path.to_string_lossy().to_string() })),
+    )
+    .await;
+    let _ = std::fs::remove_file(&tmp_path);
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an empty-HIST .ros file must still import as a document; body = {body}"
+    );
+    assert_eq!(
+        body["file_contents"]["hist_event_count"].as_u64(),
+        Some(0),
+        "response must report ZERO imported events, never events fabricated \
+         from the GEOM snapshot; body = {body}"
+    );
+    assert_eq!(
+        body["history"]["state"].as_str(),
+        Some("empty"),
+        "an empty HIST must be said plainly in the durability vocabulary; \
+         body = {body}"
+    );
+    assert_eq!(
+        body["success"].as_bool(),
+        Some(true),
+        "an empty-HIST import is a SUCCESSFUL import of an empty document; \
+         body = {body}"
+    );
+    assert_eq!(
+        body["geom_snapshot"]["present"].as_bool(),
+        Some(true),
+        "the file's GEOM snapshot must be reported, not silently dropped; \
+         body = {body}"
+    );
+
+    // The document exists in the registry and is the active one.
+    let doc_id = body["document"]["id"]
+        .as_str()
+        .expect("document import must return the new document's id")
+        .to_string();
+    let (ls, lbody) = dispatch(&state, json_get("/api/documents")).await;
+    assert_eq!(ls, StatusCode::OK, "document list must 200; body = {lbody}");
+    let entry = lbody
+        .as_array()
+        .expect("documents list is an array")
+        .iter()
+        .find(|d| d["id"].as_str() == Some(doc_id.as_str()))
+        .cloned()
+        .expect("the imported document must be listed in the registry");
+    assert_eq!(
+        entry["active"].as_bool(),
+        Some(true),
+        "the imported document must be the active one; list = {lbody}"
     );
 }
 
@@ -6736,5 +7593,397 @@ async fn checkpoint_accepts_branch_and_returns_identity() {
         ms,
         StatusCode::NOT_FOUND,
         "checkpointing a nonexistent branch must 404; body = {mbody}"
+    );
+}
+
+// =====================================================================
+// Durability disclosure on agent-facing reads (#39 follow-up)
+// =====================================================================
+//
+// `/api/durability/status` and `manifest.durability` (the evidence pack)
+// already report a QUARANTINED document honestly — the served model is only
+// the clean prefix of the persisted log, a break named loudly. Neither route
+// an agent actually reads to decide what exists / what happened
+// (`/api/agent/parts/{id}/perception`, `/api/timeline/history/{branch}`)
+// carried that fact. These tests pin the fix, reusing the exact quarantine
+// recipe `durability_boot_tests::unknown_event_quarantines_and_serves_clean_prefix`
+// already proved (real file-backed SQLite across a simulated restart —
+// `sqlite::memory:` cannot model this, it dies with the connection).
+
+use crate::durability_boot_tests::{build_state as boot_durability_state, open_db, temp_db_path};
+
+/// Boots a document with one clean box, injects an event the current kernel
+/// cannot replay, then reboots against the SAME file — the document comes
+/// back QUARANTINED, serving exactly the clean prefix (the box). Returns the
+/// rebooted `AppState` and that box's live kernel solid id.
+async fn quarantined_state_with_one_solid() -> (AppState, u32) {
+    let path = temp_db_path();
+
+    {
+        let db = open_db(&path).await;
+        let state = boot_durability_state(db, true).await;
+        let (s, body) = dispatch(
+            &state,
+            json_post(
+                "/api/geometry/box",
+                json!({ "width": 5.0, "depth": 5.0, "height": 5.0 }),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "box create must succeed; body = {body}");
+        state
+            .timeline_recorder
+            .flush()
+            .await
+            .expect("flush must succeed");
+    }
+
+    {
+        let db = open_db(&path).await;
+        let mut events = db
+            .load_all_timeline_events(crate::durability::DURABILITY_SESSION_ID)
+            .await
+            .expect("load persisted events");
+        let template = events.pop().expect("at least one persisted box event");
+        let max_seq = template.sequence_number;
+
+        let unknown_op = timeline_engine::Operation::Generic {
+            command_type: "quarantine_probe_unknown_op_agent_surface".to_string(),
+            parameters: json!({}),
+        };
+        let new_id = Uuid::new_v4().to_string();
+        let mut blob = template.data.clone();
+        blob["operation"] = serde_json::to_value(&unknown_op).expect("op serializes");
+        blob["sequence_number"] = json!(max_seq + 1);
+        blob["id"] = json!(new_id);
+
+        let injected = session_manager::TimelineEventData {
+            id: new_id,
+            session_id: template.session_id.clone(),
+            event_type: "quarantine_probe_unknown_op_agent_surface".to_string(),
+            user_id: template.user_id.clone(),
+            timestamp: template.timestamp,
+            data: blob,
+            branch_id: template.branch_id.clone(),
+            sequence_number: max_seq + 1,
+        };
+        db.save_timeline_event(crate::durability::DURABILITY_SESSION_ID, &injected)
+            .await
+            .expect("inject unknown event");
+    }
+
+    let db2 = open_db(&path).await;
+    let state2 = boot_durability_state(db2, true).await;
+
+    let status = state2.durability_status.read().await.clone();
+    assert!(
+        matches!(
+            status,
+            crate::durability::DurabilityStatus::Quarantined { .. }
+        ),
+        "fixture must actually quarantine the rebooted document; got {status:?}"
+    );
+
+    let (ps, parts_body) = dispatch(&state2, json_get("/api/agent/parts")).await;
+    assert_eq!(
+        ps,
+        StatusCode::OK,
+        "the clean prefix must still list its parts; body = {parts_body}"
+    );
+    let solid_id = parts_body
+        .as_array()
+        .and_then(|a| a.first())
+        .and_then(|p| p["id"].as_u64())
+        .unwrap_or_else(|| panic!("clean prefix must serve at least one part; body = {parts_body}"))
+        as u32;
+
+    (state2, solid_id)
+}
+
+/// GATE (RED-first, mutation-proven): on a QUARANTINED document,
+/// `GET /api/agent/parts/{id}/perception` (default full-certificate path)
+/// discloses the document-level durability state BESIDE the part's own
+/// verdict — an agent must not be able to read "SOUND" here and have no
+/// reachable way to learn a slice of design history was withheld.
+#[tokio::test]
+async fn part_perception_discloses_quarantine_on_default_path() {
+    let (state, solid_id) = quarantined_state_with_one_solid().await;
+
+    let (status, body) = dispatch(
+        &state,
+        json_get(&format!("/api/agent/parts/{solid_id}/perception")),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "perception on the clean-prefix part must 200; body = {body}"
+    );
+    // The part-level verdict is untouched — still a true statement about
+    // THIS solid (it really is sound; the document it lives in is not whole).
+    assert_eq!(
+        body["sound"].as_bool(),
+        Some(true),
+        "the clean-prefix box is itself a sound solid; body = {body}"
+    );
+    assert_eq!(
+        body["durability"]["state"].as_str(),
+        Some("quarantined"),
+        "perception on a quarantined document must disclose it via the SAME \
+         DurabilityStatus vocabulary /api/durability/status reports \
+         (never a bare bool); body = {body}"
+    );
+    assert_eq!(
+        body["durability"]["first_break_kind"].as_str(),
+        Some("quarantine_probe_unknown_op_agent_surface"),
+        "the disclosure must name the offending event kind, mirroring \
+         /api/durability/status; body = {body}"
+    );
+}
+
+/// GATE: the `?fast=1` opt-out path (lightweight B-Rep-only verdict) also
+/// discloses the quarantine — an agent that never runs the full certificate
+/// must not be the one left uninformed.
+#[tokio::test]
+async fn part_perception_discloses_quarantine_on_fast_path() {
+    let (state, solid_id) = quarantined_state_with_one_solid().await;
+
+    let (status, body) = dispatch(
+        &state,
+        json_get(&format!("/api/agent/parts/{solid_id}/perception?fast=1")),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "fast perception on the clean-prefix part must 200; body = {body}"
+    );
+    assert_eq!(
+        body["durability"]["state"].as_str(),
+        Some("quarantined"),
+        "the fast path must disclose the quarantine too; body = {body}"
+    );
+}
+
+/// GATE (additive pin): on a NON-quarantined document, `perception`'s
+/// payload carries no `durability` key at all — the field is present ONLY
+/// when there is something to disclose, so an unaffected caller's parsed
+/// shape is byte-for-byte what it was before this change.
+#[tokio::test]
+async fn part_perception_omits_durability_when_not_quarantined() {
+    let state = make_test_state().await;
+    let (bs, bbody) = dispatch(
+        &state,
+        json_post(
+            "/api/geometry/box",
+            json!({"width": 4.0, "depth": 4.0, "height": 4.0}),
+        ),
+    )
+    .await;
+    assert_eq!(bs, StatusCode::OK, "box create must 200; body = {bbody}");
+    let solid_id = bbody["solid_id"]
+        .as_u64()
+        .expect("box create must report solid_id");
+
+    let (status, body) = dispatch(
+        &state,
+        json_get(&format!("/api/agent/parts/{solid_id}/perception")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "perception must 200; body = {body}");
+    assert!(
+        body.as_object()
+            .is_some_and(|m| !m.contains_key("durability")),
+        "a non-quarantined document's perception must carry NO `durability` \
+         key (additive, not merely null) — this document is Empty/Active, \
+         durability off; body = {body}"
+    );
+}
+
+/// GATE (RED-first): on a QUARANTINED document, `GET /api/timeline/history`
+/// discloses the durability state. The payload's SHAPE changes from a bare
+/// array to `{"events": [...], "durability": {...}}` — an agent (and every
+/// existing frontend consumer: `Timeline.tsx`, `TimelineGraph.tsx`,
+/// `tool-registry-api.ts::fetchTimelineHistory`) already tolerates both
+/// shapes, so this is additive at the consumer layer even though the JSON
+/// top-level type differs.
+#[tokio::test]
+async fn timeline_history_discloses_quarantine() {
+    let (state, _solid_id) = quarantined_state_with_one_solid().await;
+
+    let (status, body) = dispatch(&state, json_get("/api/timeline/history/main")).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "history on a quarantined document must still 200; body = {body}"
+    );
+    assert!(
+        body.is_object(),
+        "a quarantined document's history must be the {{events, durability}} \
+         object shape, not a bare array; body = {body}"
+    );
+    let events = body["events"]
+        .as_array()
+        .unwrap_or_else(|| panic!("body.events must be an array; body = {body}"));
+    assert!(
+        !events.is_empty(),
+        "the clean prefix's events must still be served; body = {body}"
+    );
+    assert_eq!(
+        body["durability"]["state"].as_str(),
+        Some("quarantined"),
+        "history must disclose the quarantine via the same DurabilityStatus \
+         vocabulary; body = {body}"
+    );
+    assert_eq!(
+        body["durability"]["first_break_kind"].as_str(),
+        Some("quarantine_probe_unknown_op_agent_surface"),
+        "body = {body}"
+    );
+}
+
+/// GATE (additive pin): on a NON-quarantined document, `timeline/history`
+/// stays exactly what it always was — a bare JSON array, no wrapper object,
+/// no `durability` noise. Every pre-existing test in this module that reads
+/// history via `.as_array().expect(...)` already exercises this; this test
+/// names the contract explicitly.
+#[tokio::test]
+async fn timeline_history_stays_bare_array_when_not_quarantined() {
+    let state = make_test_state().await;
+    let (bs, bbody) = dispatch(
+        &state,
+        json_post(
+            "/api/geometry/box",
+            json!({"width": 3.0, "depth": 3.0, "height": 3.0}),
+        ),
+    )
+    .await;
+    assert_eq!(bs, StatusCode::OK, "box create must 200; body = {bbody}");
+
+    let (status, body) = dispatch(&state, json_get("/api/timeline/history/main")).await;
+    assert_eq!(status, StatusCode::OK, "history must 200; body = {body}");
+    assert!(
+        body.is_array(),
+        "a non-quarantined document's history must stay a bare array; body = {body}"
+    );
+}
+
+// =====================================================================
+// Durability disclosure on the MUTATING-op path (`certified_response`,
+// the ambient perception block embedded in create_box/boolean/fillet_edges/
+// etc.'s own response) — the dominant path an agent actually travels. The
+// two reads above (`/perception`, `/timeline/history`) are correct but an
+// agent that only calls mutating endpoints never reaches them; this closes
+// that gap. Reuses `quarantined_state_with_one_solid` — the SAME quarantine
+// recipe as every other test in this section.
+// =====================================================================
+
+/// GATE (RED-first, mutation-proven): on a QUARANTINED document, a mutating
+/// op's own response (`POST /api/geometry/box`, default full-certificate
+/// path) discloses the document-level durability state under
+/// `perception.durability`, in the SAME shape `GET /perception` uses — an
+/// agent that only ever calls mutating endpoints must still learn its
+/// document is incomplete, not just an agent that separately polls
+/// `/perception`.
+#[tokio::test]
+async fn certified_response_discloses_quarantine_on_default_path() {
+    let (state, _existing_solid_id) = quarantined_state_with_one_solid().await;
+
+    let (status, body) = dispatch(
+        &state,
+        json_post(
+            "/api/geometry/box",
+            json!({"width": 2.0, "depth": 2.0, "height": 2.0}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a mutating op on the clean prefix must still 200; body = {body}"
+    );
+    // The new solid's own verdict is untouched — still a true statement about
+    // THIS solid (it really is sound; the document it lives in is not whole).
+    assert_eq!(
+        body["perception"]["sound"].as_bool(),
+        Some(true),
+        "the freshly created box is itself a sound solid; body = {body}"
+    );
+    assert_eq!(
+        body["perception"]["durability"]["state"].as_str(),
+        Some("quarantined"),
+        "a mutating op's OWN response, on a quarantined document, must \
+         disclose the quarantine under `perception.durability` — the SAME \
+         DurabilityStatus vocabulary `/api/durability/status` and \
+         `GET /perception` already report (never a bare bool); body = {body}"
+    );
+    assert_eq!(
+        body["perception"]["durability"]["first_break_kind"].as_str(),
+        Some("quarantine_probe_unknown_op_agent_surface"),
+        "the disclosure must name the offending event kind, mirroring \
+         /api/durability/status; body = {body}"
+    );
+}
+
+/// GATE: the `"fast": true` opt-out (skips the expensive full certificate
+/// block in `certified_response`) also discloses the quarantine — an agent
+/// that opts out of the expensive certificate has not opted out of knowing
+/// its document is incomplete.
+#[tokio::test]
+async fn certified_response_discloses_quarantine_on_fast_path() {
+    let (state, _existing_solid_id) = quarantined_state_with_one_solid().await;
+
+    let (status, body) = dispatch(
+        &state,
+        json_post(
+            "/api/geometry/box",
+            json!({"width": 2.0, "depth": 2.0, "height": 2.0, "fast": true}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a fast mutating op on the clean prefix must still 200; body = {body}"
+    );
+    // The fast path skips the full certificate — `sound`/`cert` are absent —
+    // but the disclosure is NOT part of that skipped block.
+    assert_eq!(
+        body["perception"]["durability"]["state"].as_str(),
+        Some("quarantined"),
+        "the `fast: true` opt-out must disclose the quarantine too; body = {body}"
+    );
+}
+
+/// GATE (additive pin): on a NON-quarantined document, a mutating op's
+/// response carries no `durability` key anywhere — the field is present ONLY
+/// when there is something to disclose, so an unaffected caller's response is
+/// byte-for-byte what it was before this change.
+#[tokio::test]
+async fn certified_response_omits_durability_when_not_quarantined() {
+    let state = make_test_state().await;
+    let (status, body) = dispatch(
+        &state,
+        json_post(
+            "/api/geometry/box",
+            json!({"width": 4.0, "depth": 4.0, "height": 4.0}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "box create must 200; body = {body}");
+    assert!(
+        body["perception"]
+            .as_object()
+            .is_some_and(|m| !m.contains_key("durability")),
+        "a non-quarantined document's mutating-op response must carry NO \
+         `durability` key anywhere in `perception` (additive, not merely \
+         null) — this document is Empty/Active, durability off; body = {body}"
+    );
+    // Belt-and-braces: the raw wire bytes contain the substring nowhere, not
+    // just under the key we happened to check.
+    assert!(
+        !body.to_string().contains("\"durability\""),
+        "a non-quarantined mutating-op response must not contain the \
+         `durability` key ANYWHERE in its JSON; body = {body}"
     );
 }

@@ -406,6 +406,63 @@ fn create_top_face_shared(
     Ok(model.faces.add(face))
 }
 
+/// Post-condition for a CAPPED extrusion: the shell the operation just
+/// built must be closed and manifold — every edge in it used by exactly
+/// two of its faces.
+///
+/// Closure is the invariant THIS operation controls: a merge either
+/// welds the new material to the host or it does not, and an unwelded
+/// seam is what the certificate's connectivity/manifold checks report as
+/// `sound: false`. It is not the whole of `validate_solid_scoped` (which
+/// also runs the Euler characteristic, pcurve references and geometric
+/// consistency) — it is the check that discriminates the defect this
+/// merge path can introduce.
+///
+/// Scoped to the shell this call built, deliberately: a defect the
+/// PARENT already carried is the parent's, and folding it in here would
+/// refuse an operation that did not cause it.
+///
+/// Runs unconditionally (not behind `CommonOptions::validate_result`) —
+/// emitting a solid that fails its own certificate is not something a
+/// caller may opt into. `extrude_face` runs inside
+/// `lifecycle::with_rollback`, so the `Err` returned here restores the
+/// pre-call model: the unsound solid is never observable.
+///
+/// Not applied to uncapped (`cap_ends: false`) extrusions — those build
+/// an intentionally open sheet, where boundary edges are the result, not
+/// a defect.
+fn require_closed_shell(
+    model: &BRepModel,
+    shell_id: crate::primitives::shell::ShellId,
+    path: &str,
+) -> OperationResult<()> {
+    let errors = crate::primitives::validation::validate_shell_closure(model, shell_id);
+    if errors.is_empty() {
+        return Ok(());
+    }
+    let offending: Vec<String> = errors
+        .iter()
+        .filter_map(|e| e.location().and_then(|loc| loc.edge_id))
+        .take(8)
+        .map(|edge_id| edge_id.to_string())
+        .collect();
+    Err(OperationError::InvalidBRep(format!(
+        "extrude_face ({} path) would emit an unsound solid: shell {} has {} edge(s) that are \
+         not shared by exactly two faces (edges: {}{}). The merge left the new material \
+         unwelded to the host. Refusing rather than returning a solid that fails its own \
+         certificate; the model is unchanged.",
+        path,
+        shell_id,
+        errors.len(),
+        offending.join(", "),
+        if errors.len() > offending.len() {
+            ", …"
+        } else {
+            ""
+        }
+    )))
+}
+
 /// Find the solid that contains the given face
 fn find_parent_solid(model: &BRepModel, face_id: FaceId) -> Option<SolidId> {
     // Iterate the store directly — solid ids are STABLE (holes after
@@ -510,28 +567,53 @@ pub fn extrude_face(
             || options.twist_angle.abs() > 1e-10
             || (options.end_scale - 1.0).abs() > 1e-10;
 
-        let unified_solid_id = match (parent_solid_id, has_complex_options) {
-            (Some(parent), true) => {
-                create_complex_unified_extrusion(model, parent, &face, face_id, &options)?
-            }
-            (Some(parent), false) => create_unified_extrusion(
-                model,
-                parent,
-                &face,
-                face_id,
-                direction,
-                options.distance,
-                options.cap_ends,
-            )?,
-            (None, _) => create_fresh_extrusion(
-                model,
-                &face,
-                face_id,
-                direction,
-                options.distance,
-                options.cap_ends,
-            )?,
+        let (unified_solid_id, path_label) = match (parent_solid_id, has_complex_options) {
+            (Some(parent), true) => (
+                create_complex_unified_extrusion(model, parent, &face, face_id, &options)?,
+                "unified/complex",
+            ),
+            (Some(parent), false) => (
+                create_unified_extrusion(
+                    model,
+                    parent,
+                    &face,
+                    face_id,
+                    direction,
+                    options.distance,
+                    options.cap_ends,
+                )?,
+                "unified",
+            ),
+            (None, _) => (
+                create_fresh_extrusion(
+                    model,
+                    &face,
+                    face_id,
+                    direction,
+                    options.distance,
+                    options.cap_ends,
+                )?,
+                "fresh",
+            ),
         };
+
+        // INVARIANT: a capped face-extrude hands back a CLOSED solid or it
+        // hands back a typed error — never a solid that fails its own
+        // certificate. See `require_closed_shell`; the `?` unwinds through
+        // `with_rollback`, restoring the pre-call model.
+        if options.cap_ends {
+            let outer_shell = model
+                .solids
+                .get(unified_solid_id)
+                .map(|s| s.outer_shell)
+                .ok_or_else(|| {
+                    OperationError::InvalidBRep(format!(
+                        "extruded solid {} vanished before its closure check",
+                        unified_solid_id
+                    ))
+                })?;
+            require_closed_shell(model, outer_shell, path_label)?;
+        }
 
         // Validate result if requested
         if options.common.validate_result {
@@ -572,7 +654,16 @@ pub fn extrude_face(
     })
 }
 
-/// Create a unified extrusion that combines the original solid with the extruded volume
+/// Create a unified extrusion that combines the original solid with the
+/// extruded volume, IN PLACE: the parent keeps its `SolidId` and every
+/// face it had except the pulled one.
+///
+/// The merge is topological, not geometric. The new walls are stitched
+/// onto the base face's own loop edges, and the faces around the base
+/// face are retained (not copied), so the seam is welded by edge
+/// IDENTITY. Closure follows by counting rather than by tolerance — see
+/// the comment on step 1 — and `extrude_face` re-checks it on the
+/// finished shell (`require_closed_shell`) before returning.
 fn create_unified_extrusion(
     model: &mut BRepModel,
     parent_solid_id: SolidId,
@@ -595,12 +686,55 @@ fn create_unified_extrusion(
         .ok_or_else(|| OperationError::InvalidGeometry("Parent shell not found".to_string()))?
         .clone();
 
+    // The merge below stitches the new walls onto the base face's OWN
+    // loop edges, so the base face must be a face of the shell whose
+    // faces we retain. `find_parent_solid` also matches faces on a
+    // solid's INNER (void) shells; pulling a void boundary is a
+    // different operation (it removes material, and the retained set
+    // would be the wrong shell), and merging it here would silently
+    // build an open shell. Refuse instead.
+    if !parent_shell.faces.contains(&base_face_id) {
+        return Err(OperationError::NotImplemented(format!(
+            "extrude_face: face {} belongs to solid {}'s inner (void) shell, not its outer \
+             shell; pulling a void boundary is not supported",
+            base_face_id, parent_solid_id
+        )));
+    }
+
     // Create new shell faces for the unified solid
     let mut unified_faces = Vec::new();
 
-    // 1. Deep clone all faces from parent EXCEPT the base face being extruded
-    let cloned_faces = deep_clone_faces(model, &parent_shell.faces, &[base_face_id])?;
-    unified_faces.extend(cloned_faces);
+    // 1. RETAIN the parent's own faces (all but the base face) — do NOT
+    //    clone them.
+    //
+    //    The walls built in step 2 are stitched onto the base face's OWN
+    //    loop edges: `build_loop_side_faces` walks `outer_base_loop.edges`
+    //    and hands each `EdgeId` to the wall it generates as that wall's
+    //    bottom edge. Deep-cloning the retained faces gave them a PRIVATE
+    //    copy of that seam ring, so each new wall welded to the original
+    //    edge while the neighbour below the seam held the clone — one
+    //    boundary edge per wall. The result measured correct (exact volume,
+    //    exact dims, mesh watertight because the duplicated seam vertices
+    //    coincide) yet certified `sound: false`.
+    //
+    //    Retaining the faces makes the weld an IDENTITY rather than a
+    //    tolerance test, and it is closed by counting: in a manifold outer
+    //    shell every base-loop edge is used exactly twice — once by the
+    //    base face, once by its neighbour. Dropping the base face and
+    //    adding exactly one wall per base-loop edge restores the count to
+    //    two, for the outer loop and for every inner loop alike. No
+    //    geometric matching, no shape assumption.
+    //
+    //    Retention also preserves each surviving face's persistent id and
+    //    everything bound to it (GD&T, datums, provenance), all of which
+    //    the clone silently dropped.
+    unified_faces.extend(
+        parent_shell
+            .faces
+            .iter()
+            .copied()
+            .filter(|&face_id| face_id != base_face_id),
+    );
 
     // 2. Build the shared extrusion topology once per loop — top
     //    vertices, vertical edges, and top edges are all created here so
@@ -1279,6 +1413,22 @@ fn validate_inner_loops_inside_outer(model: &BRepModel, base_face: &Face) -> Ope
 /// Replaces the parent solid's shell with a new one that removes the extruded
 /// base face and adds side + top faces computed via the complex transformation
 /// pipeline (draft radial offset, twist rotation, end scale).
+///
+/// **This path does not weld and is currently refused by
+/// `require_closed_shell`.** It builds each ring of walls with
+/// `create_quad_face`, which mints all four of its edges from vertices via
+/// `create_straight_edge` — a function that never reuses an existing edge.
+/// So no wall shares an edge with the host below it, with the ring's own
+/// neighbours, or with the top cap: the shell is a face soup that happens
+/// to close up geometrically. `extrude_face` therefore returns a typed
+/// `InvalidBRep` refusal for draft/twist/taper on a face of an existing
+/// solid rather than handing back a solid that fails its own certificate.
+/// Making it weld means building the rings through
+/// `build_extrusion_loop_topology` / `build_loop_side_faces` (which thread
+/// shared `VertexId`/`EdgeId`s through every seam) once per step, so each
+/// intermediate ring becomes the next step's base loop. That is a rewrite
+/// of the loop body, not a patch. Unreachable from REST — no endpoint sets
+/// draft, twist, or end scale on `face/extrude`.
 fn create_complex_unified_extrusion(
     model: &mut BRepModel,
     parent_solid_id: SolidId,
@@ -3464,6 +3614,248 @@ mod tests {
         };
         let result = extrude_face(&mut model, face_id, opts);
         assert!(result.is_ok(), "extrude_face on box face: {:?}", result);
+    }
+
+    // -------------------------------------------------------------------
+    // Unified (parent-solid) extrusion — THE WELD.
+    //
+    // `create_unified_extrusion` shipped with zero coverage. It used to
+    // deep-clone the retained host faces, which gave them a private copy
+    // of the pulled face's loop edges while the new walls were stitched
+    // onto the ORIGINAL ones: one unwelded boundary edge per wall, an open
+    // shell that measured exactly right and certified `sound: false`.
+    // These tests assert the property that was broken — the merged shell
+    // is CLOSED — on two different seam topologies (polygon loop, single
+    // periodic circle loop). Mutation guard: restore `deep_clone_faces`
+    // for the retained faces and both go red on the closure assertion.
+    // -------------------------------------------------------------------
+
+    /// The face of `solid_id` whose outward normal is most aligned with
+    /// `axis` — i.e. the face a "pull it that way" request targets.
+    fn face_facing(model: &BRepModel, solid_id: SolidId, axis: Vector3) -> FaceId {
+        let solid = model.solids.get(solid_id).expect("solid");
+        let shell = model.shells.get(solid.outer_shell).expect("outer shell");
+        let mut best: Option<(FaceId, f64)> = None;
+        for &fid in &shell.faces {
+            let face = model.faces.get(fid).expect("face");
+            let Ok(n) = face.normal_at(0.5, 0.5, &model.surfaces) else {
+                continue;
+            };
+            let score = n.dot(&axis);
+            let better = match best {
+                None => true,
+                Some((_, b)) => score > b,
+            };
+            if better {
+                best = Some((fid, score));
+            }
+        }
+        best.expect("some face faces the axis").0
+    }
+
+    /// Every edge of `solid_id`'s outer shell is shared by exactly two of
+    /// its faces, and the solid passes the same B-Rep verdict the
+    /// certificate reports as `sound`/`brep_valid`.
+    fn assert_closed_and_sound(model: &BRepModel, solid_id: SolidId, what: &str) {
+        use crate::primitives::validation::{
+            validate_shell_closure, validate_solid_scoped, ValidationLevel,
+        };
+        let shell_id = model.solids.get(solid_id).expect("solid").outer_shell;
+        let closure = validate_shell_closure(model, shell_id);
+        assert!(
+            closure.is_empty(),
+            "{what}: the merged shell must be closed — every edge shared by \
+             exactly two faces. Unwelded/non-manifold edges: {closure:?}"
+        );
+        let verdict = validate_solid_scoped(
+            model,
+            solid_id,
+            crate::math::Tolerance::default(),
+            ValidationLevel::Standard,
+        );
+        assert!(
+            verdict.is_valid,
+            "{what}: the solid must pass the very check its certificate \
+             reports as `sound`. Errors: {:?}",
+            verdict.errors
+        );
+    }
+
+    #[test]
+    fn unified_extrusion_welds_a_box_face_into_a_closed_solid() {
+        let mut model = BRepModel::new();
+        let solid_id = {
+            let mut builder = TopologyBuilder::new(&mut model);
+            match builder.create_box_3d(8.0, 8.0, 8.0).expect("box") {
+                GeometryId::Solid(id) => id,
+                other => panic!("expected solid, got {other:?}"),
+            }
+        };
+        let top = face_facing(&model, solid_id, Vector3::Z);
+        // A face that is NOT the pulled one — it must SURVIVE the merge by
+        // identity. Cloning replaced it with a copy, which is exactly how
+        // the seam ring came to exist twice.
+        let bottom = face_facing(&model, solid_id, -Vector3::Z);
+        let height_before = model
+            .solid_world_bbox(solid_id)
+            .expect("bbox before")
+            .size()
+            .z;
+
+        let result = extrude_face(
+            &mut model,
+            top,
+            ExtrudeOptions {
+                direction: Vector3::Z,
+                distance: 3.0,
+                ..Default::default()
+            },
+        );
+        let out = result.expect("pulling a box's top face must succeed");
+        assert_eq!(out, solid_id, "face-pull is identity-preserving");
+
+        assert_closed_and_sound(&model, solid_id, "box +Z face pulled by 3");
+
+        let shell = model
+            .shells
+            .get(model.solids.get(solid_id).expect("solid").outer_shell)
+            .expect("merged shell");
+        assert!(
+            shell.faces.contains(&bottom),
+            "the host's untouched faces are RETAINED, not copied — face \
+             {bottom} must still be in the merged shell {:?}",
+            shell.faces
+        );
+        assert!(
+            !shell.faces.contains(&top),
+            "the pulled face is consumed by the merge; {top} must be gone \
+             from the shell {:?}",
+            shell.faces
+        );
+        assert_eq!(
+            shell.faces.len(),
+            10,
+            "5 retained + 4 new walls + 1 new cap; got {:?}",
+            shell.faces
+        );
+
+        let height_after = model
+            .solid_world_bbox(solid_id)
+            .expect("bbox after")
+            .size()
+            .z;
+        assert!(
+            (height_after - (height_before + 3.0)).abs() < 1e-9,
+            "the pull must add 3 along Z: {height_before} -> {height_after}"
+        );
+    }
+
+    #[test]
+    fn unified_extrusion_welds_a_cylinder_top_face_into_a_closed_solid() {
+        // Second shape, genuinely different seam topology: the cap's outer
+        // loop is a SINGLE periodic circle edge with one seam vertex, so
+        // the merge produces one wall whose left and right verticals are
+        // the same edge. A weld that only works for polygon seams fails
+        // here.
+        let mut model = BRepModel::new();
+        let solid_id = {
+            let mut builder = TopologyBuilder::new(&mut model);
+            match builder
+                .create_cylinder_3d(Point3::ORIGIN, Vector3::Z, 2.0, 5.0)
+                .expect("cylinder")
+            {
+                GeometryId::Solid(id) => id,
+                other => panic!("expected solid, got {other:?}"),
+            }
+        };
+        let top = face_facing(&model, solid_id, Vector3::Z);
+        let height_before = model
+            .solid_world_bbox(solid_id)
+            .expect("bbox before")
+            .size()
+            .z;
+
+        let out = extrude_face(
+            &mut model,
+            top,
+            ExtrudeOptions {
+                direction: Vector3::Z,
+                distance: 2.0,
+                ..Default::default()
+            },
+        )
+        .expect("pulling a cylinder's top face must succeed");
+        assert_eq!(out, solid_id, "face-pull is identity-preserving");
+
+        assert_closed_and_sound(&model, solid_id, "cylinder top face pulled by 2");
+
+        let height_after = model
+            .solid_world_bbox(solid_id)
+            .expect("bbox after")
+            .size()
+            .z;
+        assert!(
+            (height_after - (height_before + 2.0)).abs() < 1e-9,
+            "the pull must add 2 along Z: {height_before} -> {height_after}"
+        );
+    }
+
+    #[test]
+    fn capped_extrusion_refuses_rather_than_emitting_an_unwelded_solid() {
+        // The draft/twist/taper merge path (`create_complex_unified_extrusion`)
+        // builds its walls with `create_quad_face`, which mints every edge
+        // from scratch — nothing is shared with the host, the neighbouring
+        // walls, or the cap. It cannot be welded without being rebuilt on
+        // the shared-topology helpers, so the post-condition refuses it.
+        // Honest refusal over a solid that fails its own certificate.
+        let mut model = BRepModel::new();
+        let solid_id = {
+            let mut builder = TopologyBuilder::new(&mut model);
+            match builder.create_box_3d(4.0, 4.0, 4.0).expect("box") {
+                GeometryId::Solid(id) => id,
+                other => panic!("expected solid, got {other:?}"),
+            }
+        };
+        let top = face_facing(&model, solid_id, Vector3::Z);
+        let shell_before = model.solids.get(solid_id).expect("solid").outer_shell;
+        let faces_before = model.shells.get(shell_before).expect("shell").faces.clone();
+
+        let result = extrude_face(
+            &mut model,
+            top,
+            ExtrudeOptions {
+                direction: Vector3::Z,
+                distance: 2.0,
+                draft_angle: 0.1,
+                ..Default::default()
+            },
+        );
+        match result {
+            Err(OperationError::InvalidBRep(msg)) => {
+                assert!(
+                    msg.contains("not shared by exactly two faces"),
+                    "the refusal must name the reason; got: {msg}"
+                );
+                assert!(
+                    msg.contains("unsound"),
+                    "the refusal must say what it declined to hand back; got: {msg}"
+                );
+            }
+            other => panic!("expected a typed InvalidBRep refusal, got {other:?}"),
+        }
+
+        // …and the unsound solid was never emitted: the host is untouched.
+        assert_eq!(
+            model.solids.get(solid_id).expect("solid").outer_shell,
+            shell_before,
+            "a refused extrude must leave the host on its original shell"
+        );
+        assert_eq!(
+            model.shells.get(shell_before).expect("shell").faces,
+            faces_before,
+            "a refused extrude must leave the host's faces untouched"
+        );
+        assert_closed_and_sound(&model, solid_id, "host after a refused extrude");
     }
 
     // -------------------------------------------------------------------

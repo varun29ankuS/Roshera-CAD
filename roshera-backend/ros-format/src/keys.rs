@@ -14,12 +14,34 @@ use std::collections::HashMap;
 use std::fmt;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-/// Algorithm IDs for key derivation
+/// Algorithm IDs for key derivation, as stored in
+/// [`crate::header::FileHeader::kdf_algo`].
+///
+/// The id names the whole derivation CHAIN, not just the password hash.
+/// [`Argon2`](KdfAlgo::Argon2) and [`Argon2idFileBound`](KdfAlgo::Argon2idFileBound)
+/// use the same Argon2id password hash and differ only in what the file
+/// key is expanded from — and that difference is the difference between
+/// a file that can be reopened and one that cannot, so it must be
+/// legible on the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum KdfAlgo {
     None = 0,
     PBKDF2 = 1,
+    /// **Superseded, and unreadable by construction.** Argon2id over the
+    /// password, then HKDF-expand of the file key over a `file_id` that
+    /// was freshly randomised on every call to `generate_key_set` and
+    /// never written into the file. A reader therefore invents a
+    /// different `file_id`, derives different chunk keys, and the
+    /// AES-256-GCM tag rejects — for the writer's own password as much
+    /// as for anyone else's. Files carrying this id are refused by name
+    /// on import rather than failing as a generic auth error, because
+    /// their key material does not exist anywhere to be recovered.
     Argon2 = 2,
+    /// Argon2id over the password, then HKDF-expand of the file key over
+    /// the header's `file_uuid` — a value that IS written to disk and,
+    /// on a signed file, covered by the signature. Every key in the set
+    /// is reproducible from bytes the file actually carries.
+    Argon2idFileBound = 3,
 }
 
 impl KdfAlgo {
@@ -28,14 +50,28 @@ impl KdfAlgo {
             0 => Ok(KdfAlgo::None),
             1 => Ok(KdfAlgo::PBKDF2),
             2 => Ok(KdfAlgo::Argon2),
+            3 => Ok(KdfAlgo::Argon2idFileBound),
             _ => Err(KeyManagementError::InvalidKeyFormat {
-                expected: "KDF algorithm 0-2".to_string(),
+                expected: "KDF algorithm 0-3".to_string(),
                 actual: format!("Invalid value: {}", value),
             }
             .into()),
         }
     }
+
+    pub fn as_u8(&self) -> u8 {
+        *self as u8
+    }
 }
+
+/// The `kdf_algo` id every .ros writer emits for an encrypted file: the
+/// file-key derivation is bound to the header's `file_uuid`, so the
+/// importer reproduces the writer's keys exactly.
+pub const KDF_ALGO_ARGON2ID_FILE_BOUND: u8 = KdfAlgo::Argon2idFileBound as u8;
+
+/// The superseded id. An encrypted file declaring this was written with
+/// a random, never-persisted KDF file id; see [`KdfAlgo::Argon2`].
+pub const KDF_ALGO_ARGON2ID_UNBOUND: u8 = KdfAlgo::Argon2 as u8;
 
 /// Key algorithms
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -286,6 +322,23 @@ impl Drop for KeySet {
 }
 
 /// Trait for key management implementations
+///
+/// # The reproducibility rule
+///
+/// Every key this trait produces must be derivable from material the
+/// file itself carries: the password, the header's `kdf_salt`, its
+/// `kdf_iterations`, its `file_uuid`, and the chunk's own FourCC.
+/// Nothing else. A key derived from a value that is minted at write time
+/// and never written down encrypts data that no password can ever
+/// recover — which is precisely what `generate_key_set` did until
+/// 2026-08-04, when it drew `file_id = random_16()` internally.
+///
+/// The `file_id` is therefore a REQUIRED parameter of both
+/// [`generate_key_set`](KeyManager::generate_key_set) and
+/// [`rotate_keys`](KeyManager::rotate_keys) rather than an internal
+/// detail: a caller cannot derive a key set without having decided
+/// where the id is persisted, so the defect is not merely fixed but
+/// inexpressible.
 pub trait KeyManager: Send + Sync {
     /// Derive master key from password
     fn derive_master_key(&self, password: &str, salt: &[u8], iterations: u32) -> Result<SecureKey>;
@@ -296,11 +349,21 @@ pub trait KeyManager: Send + Sync {
     /// Derive chunk key from file key
     fn derive_chunk_key(&self, file_key: &SecureKey, chunk_type: &[u8; 4]) -> Result<SecureKey>;
 
-    /// Generate a complete key set for a file
-    fn generate_key_set(&self, password: &str, salt: &[u8]) -> Result<KeySet>;
+    /// Generate a complete key set for a file.
+    ///
+    /// `file_id` MUST be a value the file persists — for .ros that is
+    /// [`crate::header::FileHeader::file_uuid`]. Given the same
+    /// `(password, salt, file_id)` this is a pure function: identical
+    /// key material every time, on any host.
+    fn generate_key_set(&self, password: &str, salt: &[u8], file_id: &[u8; 16]) -> Result<KeySet>;
 
-    /// Rotate keys in a key set
-    fn rotate_keys(&self, key_set: &mut KeySet) -> Result<()>;
+    /// Rotate every derived key in a key set onto a new file id.
+    ///
+    /// `new_file_id` is supplied by the caller for the same reason it is
+    /// supplied to [`generate_key_set`](KeyManager::generate_key_set):
+    /// the rotated keys are only recoverable if the id they were
+    /// expanded from is written somewhere.
+    fn rotate_keys(&self, key_set: &mut KeySet, new_file_id: [u8; 16]) -> Result<()>;
 }
 
 /// Argon2id memory cost (KiB) — 64 MiB. Paired with [`ROSHERA_KDF_TIME_COST`]
@@ -434,18 +497,24 @@ impl KeyManager for SoftwareKeyManager {
         Ok(SecureKey::new(id, output))
     }
 
-    fn generate_key_set(&self, password: &str, salt: &[u8]) -> Result<KeySet> {
+    /// Derive the complete key set from `(password, salt, file_id)`.
+    ///
+    /// Pure: no randomness enters here. `file_id` is the caller's —
+    /// `.ros` passes the header's `file_uuid`, which is on disk and, on
+    /// a signed file, inside the signed Merkle leaf set. Until
+    /// 2026-08-04 this function drew `file_id = random_16()` itself and
+    /// no writer persisted it, so every encrypted `.ros` file ever
+    /// written was undecryptable — the importer re-derived from a
+    /// different random id and the AES-256-GCM tag rejected.
+    fn generate_key_set(&self, password: &str, salt: &[u8], file_id: &[u8; 16]) -> Result<KeySet> {
         // Derive master key
         let master = self.derive_master_key(password, salt, self.kdf_iterations)?;
 
-        // Generate file ID
-        let file_id = random_16();
-
-        // Derive file key
-        let file_key = self.derive_file_key(&master, &file_id)?;
+        // Derive file key from the file's OWN persisted id
+        let file_key = self.derive_file_key(&master, file_id)?;
 
         // Create key set
-        let mut key_set = KeySet::new(master, file_id);
+        let mut key_set = KeySet::new(master, *file_id);
         key_set.file_key = file_key;
 
         // Derive chunk keys for every standard chunk type.
@@ -457,11 +526,8 @@ impl KeyManager for SoftwareKeyManager {
         Ok(key_set)
     }
 
-    fn rotate_keys(&self, key_set: &mut KeySet) -> Result<()> {
-        // Generate new file ID
-        let new_file_id = random_16();
-
-        // Derive new file key
+    fn rotate_keys(&self, key_set: &mut KeySet, new_file_id: [u8; 16]) -> Result<()> {
+        // Derive new file key from the caller's new (persistable) id
         let new_file_key = self.derive_file_key(&key_set.master, &new_file_id)?;
 
         // Update key set
@@ -625,7 +691,9 @@ mod tests {
         let manager = test_key_manager();
         let salt = random_16();
 
-        let key_set = manager.generate_key_set("test_password", &salt).unwrap();
+        let key_set = manager
+            .generate_key_set("test_password", &salt, &random_16())
+            .unwrap();
 
         assert_eq!(key_set.chunk_keys.len(), STANDARD_CHUNK_FOURCCS.len());
         assert!(key_set.get_chunk_key(b"GEOM").is_some());
@@ -641,15 +709,128 @@ mod tests {
         let manager = test_key_manager();
         let salt = random_16();
 
-        let mut key_set = manager.generate_key_set("test_password", &salt).unwrap();
+        let mut key_set = manager
+            .generate_key_set("test_password", &salt, &random_16())
+            .unwrap();
         let old_file_id = key_set.file_id;
         let old_geom_key = key_set.get_chunk_key(b"GEOM").unwrap().id;
 
-        manager.rotate_keys(&mut key_set).unwrap();
+        let new_file_id = random_16();
+        manager.rotate_keys(&mut key_set, new_file_id).unwrap();
 
+        assert_eq!(key_set.file_id, new_file_id);
         assert_ne!(key_set.file_id, old_file_id);
         assert_ne!(key_set.get_chunk_key(b"GEOM").unwrap().id, old_geom_key);
         assert_eq!(key_set.chunk_keys.len(), STANDARD_CHUNK_FOURCCS.len());
+    }
+
+    /// The whole key set must be a pure function of
+    /// `(password, salt, file_id)` — the property the importer's ability
+    /// to reopen a file rests on entirely.
+    ///
+    /// RED before the 2026-08-04 fix: `generate_key_set` drew its own
+    /// `file_id = random_16()`, so two calls with identical arguments
+    /// produced different file keys and different chunk keys.
+    #[test]
+    fn key_set_is_reproducible_from_password_salt_and_file_id() {
+        let manager = test_key_manager();
+        let salt = random_16();
+        let file_id = random_16();
+
+        let a = manager
+            .generate_key_set("test_password", &salt, &file_id)
+            .unwrap();
+        let b = manager
+            .generate_key_set("test_password", &salt, &file_id)
+            .unwrap();
+
+        assert_eq!(a.file_id, file_id, "the key set must adopt the caller's id");
+        assert_eq!(a.file_key.material, b.file_key.material);
+        for fourcc in STANDARD_CHUNK_FOURCCS.iter() {
+            let ka = a.get_chunk_key(fourcc).unwrap();
+            let kb = b.get_chunk_key(fourcc).unwrap();
+            assert_eq!(
+                ka.material,
+                kb.material,
+                "chunk key {} must reproduce",
+                String::from_utf8_lossy(*fourcc)
+            );
+        }
+    }
+
+    /// Key separation, both ways: neither the salt nor the file id may be
+    /// dropped from the chain. Same password + same salt but a different
+    /// file id must still yield different chunk keys, and so must same
+    /// password + same file id with a different salt.
+    #[test]
+    fn key_separation_holds_across_both_file_id_and_salt() {
+        let manager = test_key_manager();
+        let salt = random_16();
+        let other_salt = random_16();
+        let file_id = random_16();
+        let other_file_id = random_16();
+
+        let base = manager
+            .generate_key_set("test_password", &salt, &file_id)
+            .unwrap();
+        let other_file = manager
+            .generate_key_set("test_password", &salt, &other_file_id)
+            .unwrap();
+        let other_salt_set = manager
+            .generate_key_set("test_password", &other_salt, &file_id)
+            .unwrap();
+
+        assert_ne!(base.file_key.material, other_file.file_key.material);
+        assert_ne!(base.file_key.material, other_salt_set.file_key.material);
+        for fourcc in STANDARD_CHUNK_FOURCCS.iter() {
+            let k = base.get_chunk_key(fourcc).unwrap();
+            assert_ne!(
+                k.material,
+                other_file.get_chunk_key(fourcc).unwrap().material,
+                "file_id must separate chunk key {}",
+                String::from_utf8_lossy(*fourcc)
+            );
+            assert_ne!(
+                k.material,
+                other_salt_set.get_chunk_key(fourcc).unwrap().material,
+                "kdf_salt must separate chunk key {}",
+                String::from_utf8_lossy(*fourcc)
+            );
+        }
+    }
+
+    /// A wrong password must not merely differ "somewhere" — every chunk
+    /// key must differ, so no chunk of a file decrypts under it.
+    #[test]
+    fn a_different_password_changes_every_chunk_key() {
+        let manager = test_key_manager();
+        let salt = random_16();
+        let file_id = random_16();
+
+        let right = manager
+            .generate_key_set("correct-horse-battery-staple", &salt, &file_id)
+            .unwrap();
+        let wrong = manager
+            .generate_key_set("correct-horse-battery-stapl3", &salt, &file_id)
+            .unwrap();
+
+        assert_ne!(right.master.material, wrong.master.material);
+        for fourcc in STANDARD_CHUNK_FOURCCS.iter() {
+            assert_ne!(
+                right.get_chunk_key(fourcc).unwrap().material,
+                wrong.get_chunk_key(fourcc).unwrap().material
+            );
+        }
+    }
+
+    #[test]
+    fn kdf_algo_ids_name_the_binding_not_just_the_hash() {
+        assert_eq!(KdfAlgo::from_u8(2).unwrap(), KdfAlgo::Argon2);
+        assert_eq!(KdfAlgo::from_u8(3).unwrap(), KdfAlgo::Argon2idFileBound);
+        assert!(KdfAlgo::from_u8(4).is_err());
+        assert_eq!(KDF_ALGO_ARGON2ID_FILE_BOUND, 3);
+        assert_eq!(KDF_ALGO_ARGON2ID_UNBOUND, 2);
+        assert_eq!(KdfAlgo::Argon2idFileBound.as_u8(), 3);
     }
 
     #[test]
@@ -683,7 +864,9 @@ mod tests {
 
         let manager = test_key_manager();
         let salt = random_16();
-        let key_set = manager.generate_key_set("test_password", &salt).unwrap();
+        let key_set = manager
+            .generate_key_set("test_password", &salt, &random_16())
+            .unwrap();
 
         // Escrow
         let escrowed = escrow_service.escrow_key_set(&key_set).unwrap();

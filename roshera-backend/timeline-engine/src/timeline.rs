@@ -229,7 +229,28 @@ impl Timeline {
     ) -> TimelineResult<EventId> {
         // Reserve `None` — the sequence number is burned internally *after*
         // validation, so a rejected append leaves no gap in the sequence space.
-        self.append_internal(operation, author, branch_id, None)
+        self.append_internal(operation, author, branch_id, None, None)
+    }
+
+    /// [`add_operation`](Self::add_operation) plus a per-event certificate —
+    /// the kernel proof for the geometry this operation produced, stored on
+    /// the event's metadata under
+    /// [`EVENT_CERTIFICATE_KEY`](crate::event_certificate::EVENT_CERTIFICATE_KEY)
+    /// at creation time, so it is part of the serialized event from the first
+    /// instant (persistence and replay carry it unchanged; nothing ever
+    /// back-patches an already-visible event).
+    ///
+    /// `None` stores no certificate — an honest "not certified", never a
+    /// fabricated one. This is the append entry the recorder bridge uses for
+    /// records that carry a `RecordedSolidCertificate`.
+    pub async fn add_operation_certified(
+        &self,
+        operation: Operation,
+        author: Author,
+        branch_id: BranchId,
+        certificate: Option<crate::event_certificate::EventCertificate>,
+    ) -> TimelineResult<EventId> {
+        self.append_internal(operation, author, branch_id, None, certificate.as_ref())
     }
 
     /// Atomically reserve the next sequence number (the write-half of the
@@ -271,20 +292,69 @@ impl Timeline {
         branch_id: BranchId,
         sequence_number: u64,
     ) -> TimelineResult<EventId> {
-        self.append_internal(operation, author, branch_id, Some(sequence_number))
+        self.append_internal(operation, author, branch_id, Some(sequence_number), None)
+    }
+
+    /// [`add_operation_reserved`](Self::add_operation_reserved) plus a
+    /// per-event certificate — the write-half counterpart of
+    /// [`add_operation_certified`](Self::add_operation_certified) for a
+    /// pre-reserved sequence.
+    ///
+    /// Added for the recorder bridge's root-pid live/replay parity fix:
+    /// `add_operation_reserved` alone hardcodes `certificate: None`, so a
+    /// caller that switched a certified append over to the reserved path
+    /// would silently lose the event's `EventCertificate` — a regression,
+    /// not a detail, since every op that reserves its sequence (root-pid
+    /// on-demand reservation, `topology_builder::next_root_seed`) still
+    /// certifies at record time. Purely additive: existing callers of
+    /// `add_operation_reserved` / `add_operation_certified` are unaffected
+    /// and keep compiling unchanged.
+    pub async fn add_operation_reserved_certified(
+        &self,
+        operation: Operation,
+        author: Author,
+        branch_id: BranchId,
+        sequence_number: u64,
+        certificate: Option<crate::event_certificate::EventCertificate>,
+    ) -> TimelineResult<EventId> {
+        self.append_internal(
+            operation,
+            author,
+            branch_id,
+            Some(sequence_number),
+            certificate.as_ref(),
+        )
+    }
+
+    /// Clone of the raw sequence-counter handle, for a caller that needs to
+    /// reserve sequence numbers synchronously without acquiring whatever
+    /// lock this `Timeline` happens to be shared behind (e.g. the recorder
+    /// bridge's `reserve_event_key`, which runs on the kernel's synchronous
+    /// operation thread and cannot `.await` a `tokio::sync::RwLock` read
+    /// guard). Reading/incrementing the returned handle is exactly
+    /// equivalent to calling
+    /// [`reserve_sequence_number`](Self::reserve_sequence_number) on
+    /// `self` — both operate on the SAME underlying atomic, so the two can
+    /// never disagree or double-allocate a sequence number.
+    pub fn event_counter_handle(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.event_counter)
     }
 
     /// Shared validate-then-insert core for the append paths. `reserved`:
     /// `None` burns a fresh sequence after validation (the `add_operation`
     /// contract); `Some(seq)` uses a pre-reserved sequence (the
-    /// `add_operation_reserved` contract). No `.await` occurs — every store is
-    /// interior-mutable — so both async wrappers delegate here synchronously.
+    /// `add_operation_reserved` contract). `certificate`: `Some` stores the
+    /// per-event proof on the event's metadata before the event becomes
+    /// visible (the `add_operation_certified` contract); `None` stores no
+    /// certificate. No `.await` occurs — every store is interior-mutable —
+    /// so the async wrappers delegate here synchronously.
     fn append_internal(
         &self,
         operation: Operation,
         author: Author,
         branch_id: BranchId,
         reserved: Option<u64>,
+        certificate: Option<&crate::event_certificate::EventCertificate>,
     ) -> TimelineResult<EventId> {
         // ---- Validation phase (no mutation) ---------------------------
         let branch_ref = self
@@ -320,7 +390,7 @@ impl Timeline {
             return Err(TimelineError::BranchNotFound(branch_id));
         }
 
-        let (required_entities, optional_entities) = self.extract_operation_entities(&operation)?;
+        let (inputs, outputs) = self.lineage_channels(&operation)?;
 
         // ---- Mutation phase -------------------------------------------
         // Allocate the sequence number only after validation. This means
@@ -331,37 +401,14 @@ impl Timeline {
             reserved.unwrap_or_else(|| self.event_counter.fetch_add(1, Ordering::SeqCst));
         let event_id = EventId::new();
 
-        let event = TimelineEvent {
+        let mut event = TimelineEvent {
             id: event_id,
             sequence_number,
             timestamp: Utc::now(),
             author,
             operation,
-            inputs: OperationInputs {
-                required_entities: required_entities
-                    .into_iter()
-                    .map(|id| EntityReference {
-                        id,
-                        expected_type: EntityType::Solid,
-                        validation: crate::types::ValidationRequirement::MustExist,
-                    })
-                    .collect(),
-                optional_entities: optional_entities
-                    .into_iter()
-                    .map(|id| EntityReference {
-                        id,
-                        expected_type: EntityType::Solid,
-                        validation: crate::types::ValidationRequirement::MustExist,
-                    })
-                    .collect(),
-                parameters: serde_json::Value::Null,
-            },
-            outputs: OperationOutputs {
-                created: Vec::new(),
-                modified: Vec::new(),
-                deleted: Vec::new(),
-                side_effects: Vec::new(),
-            },
+            inputs,
+            outputs,
             metadata: EventMetadata {
                 description: None,
                 branch_id,
@@ -369,6 +416,23 @@ impl Timeline {
                 properties: std::collections::HashMap::new(),
             },
         };
+
+        // Store the per-event certificate BEFORE the event becomes visible,
+        // so every reader (in-memory, persistence sink, replay) sees the same
+        // event — the proof is part of the event, never a back-patch. A
+        // serialization failure (e.g. a non-finite volume) drops the
+        // certificate, not the event: the op already happened, and an absent
+        // certificate is an honest "not certified", never a fabricated one.
+        if let Some(cert) = certificate {
+            if let Err(err) = cert.store_in(&mut event.metadata) {
+                tracing::warn!(
+                    target: "timeline",
+                    sequence = sequence_number,
+                    error = %err,
+                    "failed to serialize per-event certificate — event stored WITHOUT one"
+                );
+            }
+        }
 
         // Insert into the global event store first; if the per-branch
         // index is missing (race with branch removal), roll back the
@@ -384,73 +448,174 @@ impl Timeline {
             }
         }
 
+        // Index only once the event is durably visible, so a rolled-back
+        // append never leaves a phantom entry behind. Read from the stored
+        // event rather than re-deriving — one rule, one place.
+        if let Some(stored) = self.events.get(&event_id) {
+            self.index_event_entities(event_id, &stored.inputs, &stored.outputs);
+        }
+
         self.active_operations
             .insert(event_id, OperationState::Validating);
 
         Ok(event_id)
     }
 
-    /// Extract entities from an operation
-    fn extract_operation_entities(
+    /// Add one event to the entity→events index.
+    ///
+    /// Both the live append and [`rehydrate_events`](Self::rehydrate_events)
+    /// call this with the event's OWN typed channels, so a restored timeline's
+    /// index is identical to the live one it restores. Every entity the event
+    /// names — consumed, created, modified or deleted — is indexed: the index
+    /// answers "which events mention this entity", and an entity that was
+    /// deleted by an event is very much mentioned by it.
+    fn index_event_entities(
+        &self,
+        event_id: EventId,
+        inputs: &OperationInputs,
+        outputs: &OperationOutputs,
+    ) {
+        let mentioned = inputs
+            .required_entities
+            .iter()
+            .chain(inputs.optional_entities.iter())
+            .map(|r| r.id)
+            .chain(outputs.created.iter().map(|c| c.id))
+            .chain(outputs.modified.iter().copied())
+            .chain(outputs.deleted.iter().copied());
+
+        let mut seen: HashSet<EntityId> = HashSet::new();
+        for entity in mentioned {
+            if !seen.insert(entity) {
+                continue;
+            }
+            let mut events = self.entity_events.entry(entity).or_default();
+            if !events.contains(&event_id) {
+                events.push(event_id);
+            }
+        }
+    }
+
+    /// The event's typed lineage channels, for either of the timeline's two
+    /// event dialects.
+    ///
+    /// # Two dialects, one discriminator
+    ///
+    /// * **Kernel dialect** — [`Operation::Generic`], the only variant the
+    ///   recorder bridge emits and the only one replay dispatches. It is a
+    ///   record of an operation that has **already run**, so the kernel's own
+    ///   `RecordedOperation` inputs / outputs / deleted are carried verbatim in
+    ///   the envelope. The typed channels are READ from that envelope by
+    ///   [`kernel_ref::project_envelope`] — never re-derived from the
+    ///   operation's parameters. If any recorded ref cannot be represented, the
+    ///   typed channels are left EMPTY for the whole event and the reason is
+    ///   logged: the envelope then remains this event's sole lineage channel,
+    ///   which is exactly its status before it could be projected.
+    /// * **DTO dialect** — every typed variant, constructed by the api-server /
+    ///   session-manager command layers from a client request. There is no
+    ///   kernel record to read: the DTO *is* the record, and it names its
+    ///   entities in its own fields. Those fields are therefore the source, and
+    ///   each carries the [`EntityType`] its own field name states — a
+    ///   `Fillet { edges }` yields `Edge`, not `Solid`.
+    ///
+    /// The discriminator is structural and needs no extra field: `Generic` ⇒
+    /// kernel dialect, any typed variant ⇒ DTO dialect. It is reinforced inside
+    /// the ids themselves — a kernel entity id decodes under
+    /// [`kernel_ref::decode`], a DTO id (a viewport `v4` UUID) does not.
+    ///
+    /// # The one asymmetry, stated
+    ///
+    /// A DTO event is appended **before** its operation executes, so its outputs
+    /// are not knowable at append time; [`ExecutionEngine`](crate::ExecutionEngine)
+    /// computes them into its own `ExecutionResult` and nothing writes them back
+    /// onto the event. Its `outputs` therefore stay empty — unchanged by this
+    /// method, and the one place where the dialects still differ. Kernel-dialect
+    /// events, being post-hoc records, always know their outputs.
+    fn lineage_channels(
         &self,
         operation: &Operation,
-    ) -> TimelineResult<(Vec<EntityId>, Vec<EntityId>)> {
-        let (required, optional) = match operation {
-            Operation::CreatePrimitive { .. } | Operation::CreateSketch { .. } => {
-                // Creation operations don't require existing entities
-                (Vec::new(), Vec::new())
+    ) -> TimelineResult<(OperationInputs, OperationOutputs)> {
+        if let Operation::Generic {
+            command_type,
+            parameters,
+        } = operation
+        {
+            return Ok(match crate::kernel_ref::project_envelope(parameters) {
+                Ok(channels) => channels,
+                Err(err) => {
+                    tracing::warn!(
+                        target: "timeline",
+                        command_type = %command_type,
+                        error = %err,
+                        "recorded lineage could not be projected onto the event's typed \
+                         channels; they are left EMPTY and the wire envelope remains this \
+                         event's only lineage channel"
+                    );
+                    (OperationInputs::default(), OperationOutputs::default())
+                }
+            });
+        }
+
+        // DTO dialect: the operation's own fields, each with the kind that field
+        // names. `optional_entities` stays empty — no DTO variant expresses an
+        // input that merely *may* influence the result.
+        let required: Vec<(EntityId, EntityType)> = match operation {
+            // Creation operations don't require existing entities.
+            Operation::CreatePrimitive { .. } | Operation::CreateSketch { .. } => Vec::new(),
+            // A sketch-consuming feature requires a sketch, not a solid.
+            Operation::Extrude { sketch_id, .. } | Operation::Revolve { sketch_id, .. } => {
+                vec![(*sketch_id, EntityType::Sketch)]
             }
-            Operation::Extrude { sketch_id, .. } => {
-                // Extrude requires a sketch
-                (vec![*sketch_id], Vec::new())
+            Operation::Loft { profiles, .. } => profiles
+                .iter()
+                .map(|id| (*id, EntityType::Sketch))
+                .collect(),
+            Operation::Sweep { profile, path, .. } => {
+                vec![(*profile, EntityType::Sketch), (*path, EntityType::Curve)]
             }
-            Operation::Revolve { sketch_id, .. } => {
-                // Revolve requires a sketch
-                (vec![*sketch_id], Vec::new())
-            }
+            // Note: There is no generic Operation::Boolean, only specific
+            // boolean operations. Every operand is a solid.
             Operation::BooleanUnion { operands } | Operation::BooleanIntersection { operands } => {
-                // Boolean operations require all operands
-                (operands.clone(), Vec::new())
+                operands.iter().map(|id| (*id, EntityType::Solid)).collect()
             }
             Operation::BooleanDifference { target, tools } => {
-                // Boolean difference requires target and tools
-                let mut required = vec![*target];
-                required.extend(tools.iter());
-                (required, Vec::new())
+                let mut required = vec![(*target, EntityType::Solid)];
+                required.extend(tools.iter().map(|id| (*id, EntityType::Solid)));
+                required
             }
-            // Note: There is no generic Operation::Boolean, only specific boolean operations
+            // Blends select EDGES. Typing these `Solid` was the DTO path's own
+            // version of the kind-coercion defect.
             Operation::Fillet { edges, .. } | Operation::Chamfer { edges, .. } => {
-                // Fillet/chamfer require edges
-                (edges.clone(), Vec::new())
+                edges.iter().map(|id| (*id, EntityType::Edge)).collect()
             }
+            // The DTO surface addresses parts: `OperationDto::{Transform,
+            // Delete}` and the session-manager's command mapping both parse a
+            // part UUID, and a pattern is seeded from part-level features.
             Operation::Pattern { features, .. } => {
-                // Pattern requires feature entities
-                (features.clone(), Vec::new())
+                features.iter().map(|id| (*id, EntityType::Solid)).collect()
             }
-            Operation::Transform { entities, .. } => {
-                // Transform requires the entities
-                (entities.clone(), Vec::new())
+            Operation::Transform { entities, .. } | Operation::Delete { entities, .. } => {
+                entities.iter().map(|id| (*id, EntityType::Solid)).collect()
             }
-            Operation::Delete { entities, .. } => {
-                // Delete requires the entities
-                (entities.clone(), Vec::new())
-            }
-            Operation::Modify { entity, .. } => {
-                // Modify requires the entity
-                (vec![*entity], Vec::new())
-            }
-            Operation::Loft { profiles, .. } => {
-                // Loft requires all profiles
-                (profiles.clone(), Vec::new())
-            }
-            Operation::Sweep { profile, path, .. } => {
-                // Sweep requires profile and path
-                (vec![*profile, *path], Vec::new())
-            }
-            _ => (Vec::new(), Vec::new()),
+            Operation::Modify { entity, .. } => vec![(*entity, EntityType::Solid)],
+            _ => Vec::new(),
         };
 
-        Ok((required, optional))
+        Ok((
+            OperationInputs {
+                required_entities: required
+                    .into_iter()
+                    .map(|(id, expected_type)| EntityReference {
+                        id,
+                        expected_type,
+                        validation: crate::types::ValidationRequirement::MustExist,
+                    })
+                    .collect(),
+                optional_entities: Vec::new(),
+                parameters: serde_json::Value::Null,
+            },
+            OperationOutputs::default(),
+        ))
     }
 
     /// Create a named checkpoint snapshot of a branch's current state.
@@ -811,12 +976,11 @@ impl Timeline {
 
             // Mirror the entity→event index so entity-scoped queries (and the
             // dependency projection) work on a restored log exactly as on a
-            // live one.
-            if let Ok((required, optional)) = self.extract_operation_entities(&event.operation) {
-                for entity in required.into_iter().chain(optional) {
-                    self.entity_events.entry(entity).or_default().push(event_id);
-                }
-            }
+            // live one. A restored event already CARRIES its typed channels,
+            // so they are read straight off it — re-deriving them from the
+            // operation here would let a restored index disagree with the live
+            // one it is supposed to reproduce.
+            self.index_event_entities(event_id, &event.inputs, &event.outputs);
 
             self.events.insert(event_id, event);
             next_seq = next_seq.max(seq.saturating_add(1));
@@ -2102,9 +2266,25 @@ impl Timeline {
                     }
                 }
 
-                // Process deleted entities
+                // Process deleted entities.
+                //
+                // This store only ever holds entities some earlier event listed
+                // as CREATED, and a real operation routinely deletes
+                // sub-topology it never announced as an output — an
+                // `extrude_face` consumes `face:7` and records it deleted
+                // without any prior event having created `face:7` as a
+                // top-level output. Deleting something this projection never
+                // materialised is therefore normal and means "already absent",
+                // not "the log is inconsistent": propagating
+                // `EntityNotFound` here would fail the whole reconstruction
+                // (and, through `SnapshotManager::create_snapshot_at`, silently
+                // degrade every snapshot to empty). Any other error still
+                // propagates.
                 for deleted_id in &event.outputs.deleted {
-                    entity_store.remove_entity(*deleted_id)?;
+                    match entity_store.remove_entity(*deleted_id) {
+                        Ok(()) | Err(TimelineError::EntityNotFound(_)) => {}
+                        Err(err) => return Err(err),
+                    }
                 }
             }
         }

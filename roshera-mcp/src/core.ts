@@ -7,6 +7,10 @@
  */
 
 import { z } from "zod";
+// Import cycle note: gates.ts imports `api` from this module; both imports
+// are only dereferenced at call time (never during module evaluation) and
+// both are hoisted function declarations, so the ESM cycle is benign.
+import { currentOpenIntent } from "./gates.js";
 
 export const BASE = process.env.ROSHERA_URL ?? "http://localhost:8081";
 
@@ -60,6 +64,25 @@ export const PERCEPTION_TIMEOUT_MS = (() => {
   return Number.isFinite(n) && n > 0 ? n : 4000;
 })();
 
+/**
+ * Intent provenance headers for one backend call. When an intent checkpoint
+ * is open (gates.ts — the same state the intent gate enforces), every call
+ * carries it so the backend's agent_intent_layer can scope it onto the
+ * request task and the TimelineRecorder can stamp an IntentFacet onto the
+ * kernel ops this request records. The name is free text (may contain
+ * non-ASCII); HTTP header values must be ASCII, so it is URL-encoded here
+ * and percent-decoded server-side. No open intent → no headers at all: an
+ * absent intent stays absent on the wire, never defaulted.
+ */
+function intentHeaders(): Record<string, string> {
+  const intent = currentOpenIntent();
+  if (intent === null) return {};
+  return {
+    "X-Roshera-Intent": encodeURIComponent(intent.name),
+    "X-Roshera-Intent-Turn": String(intent.turn),
+  };
+}
+
 export async function api(
   method: "GET" | "POST" | "PATCH" | "DELETE",
   path: string,
@@ -75,6 +98,8 @@ export async function api(
         // every kernel op from this request as Author::AIAgent("Claude"),
         // so agent-built features show amber Ⓒ in the Timeline strip.
         "X-Roshera-Agent": "Claude",
+        // Intent provenance: the open checkpoint phrase, when one exists.
+        ...intentHeaders(),
         // Credential (empty object when ROSHERA_API_KEY is unset).
         ...AUTH_HEADERS,
         ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
@@ -276,6 +301,15 @@ function perceptionFromBody(r: any): any {
     volume: r.volume ?? r.perception?.volume ?? null,
     errors: cert?.errors ?? null,
     cert: cert ?? undefined,
+    // DOCUMENT-level durability disclosure, present ONLY when the backend's
+    // response carried one (a QUARANTINED document — see `/perception`'s
+    // `durability` field). Never fabricated; absent means nothing withheld.
+    // `r.perception?.durability` is what makes this reachable on the
+    // embedded-reuse path too: a mutating op's OWN response (`certified_response`
+    // in main.rs) now embeds `durability` at `body.perception.durability` on a
+    // quarantined document, so `r` being the raw mutating body (not just a
+    // `/perception`-shaped response) already carries it here.
+    durability: r.durability ?? r.perception?.durability ?? undefined,
     verdict:
       (r.verdict ?? r.perception?.verdict) ??
       (sound ? "OK — valid closed solid (cheap verdict; verify_part to certify)" : "UNSOUND — see verify_part"),
@@ -537,6 +571,14 @@ export async function perceive(partId: number | null): Promise<any> {
       // Full certificate breakdown present only on the ?full path (worst-face
       // pointers — the optimisation oracle).
       cert: cert ?? undefined,
+      // DOCUMENT-level durability disclosure straight off this GET /perception
+      // response — present ONLY on a QUARANTINED document. The FAST PATH above
+      // (reused from a mutating op's own embedded response, via
+      // `perceptionFromBody`) carries the same field too: `certified_response`
+      // (api-server/src/main.rs) now embeds `durability` under
+      // `body.perception.durability` on a quarantined document, which
+      // `perceptionFromBody`'s `r.perception?.durability` picks up.
+      durability: p?.durability ?? undefined,
       verdict:
         p?.verdict ??
         (sound
@@ -638,15 +680,24 @@ export function compactVerdict(p: any): string {
   if (p?.nonmanifold_edges) facts.push(`⚠ ${p.nonmanifold_edges} non-manifold edges`);
   if (p?.eyes_consistent === "inconsistent") failed.push("eyes-consistent");
   const tail = facts.length ? ` | ${facts.join(" | ")}` : "";
+  // DOCUMENT-level context, prefixed loudly and BESIDE the part verdict below
+  // — never softens or replaces it. Present only when the fetch this verdict
+  // was built from carried a `durability` field (a QUARANTINED document: a
+  // slice of this document's recorded history could not be replayed and was
+  // refused, not silently served). See `p.durability` for the full state
+  // (first_break_kind/reason/events_served/events_total).
+  const durabilityNote = p?.durability
+    ? `⚠ DOCUMENT QUARANTINED (${p.durability.reason ?? "history incomplete — see p.durability"}) | `
+    : "";
   if (p?.sound === true && failed.length === 0) {
     const verified = DIMS.filter(([k]) => p?.[k] === true).map(([, n]) => n);
     const suffix = unverified.length
       ? ` (unverified: ${unverified.join(",")} — verify_part to certify)`
       : "";
-    return `SOUND ✓ ${verified.join("·")}${suffix}${tail}`;
+    return `${durabilityNote}SOUND ✓ ${verified.join("·")}${suffix}${tail}`;
   }
   const why = failed.length ? failed.join(", ") : "cheap verdict false";
-  return `UNSOUND ✗ failed: ${why}${tail} — run verify_part for the full certificate + diagnostic render`;
+  return `${durabilityNote}UNSOUND ✗ failed: ${why}${tail} — run verify_part for the full certificate + diagnostic render`;
 }
 
 /**

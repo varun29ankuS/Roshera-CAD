@@ -646,6 +646,33 @@ pub trait Surface: fmt::Debug + Send + Sync + Any {
     /// Find closest point on surface to given point
     fn closest_point(&self, point: &Point3, _tolerance: Tolerance) -> MathResult<(f64, f64)>;
 
+    /// Exact `(u, v)` for a point ALREADY known to lie on this surface — an
+    /// analytic ray/surface intersection, for instance — as opposed to
+    /// [`Surface::closest_point`]'s NEAREST-POINT *projection*, which some
+    /// surfaces (`Cylinder`, `Cone`) deliberately CLAMP `v` (and `u`) to a
+    /// finite trim range: for an arbitrary query point that is the correct
+    /// closest point on the *finite* patch, since distance along a bounded
+    /// axis only grows past the boundary.
+    ///
+    /// That clamp is wrong for a point already sitting exactly on the
+    /// infinite analytic surface: clamping silently snaps a genuinely
+    /// out-of-range point onto the trim boundary, and a trim-membership
+    /// (winding-number) test then sees an on-boundary parameter instead of
+    /// an out-of-range one — floating-point noise can tip that ambiguous
+    /// boundary read to "inside", fabricating a face crossing that does not
+    /// exist on the real, finite surface. `queries::raycast` hit this
+    /// exactly: a translated finite cylinder's ray intersection just past
+    /// the top/bottom rim was accepted as a lateral-face hit because
+    /// `closest_point` clamped its height back onto the rim.
+    ///
+    /// Default: delegate to `closest_point` (correct as-is for any surface
+    /// that never clamps a trim parameter — `Plane`, `Sphere`, NURBS, …).
+    /// `Cylinder`/`Cone` override to skip only the height clamp; the returned
+    /// value is otherwise identical.
+    fn exact_uv(&self, point: &Point3) -> MathResult<(f64, f64)> {
+        self.closest_point(point, Tolerance::default())
+    }
+
     /// Gaussian curvature at point
     fn gaussian_curvature_at(&self, u: f64, v: f64) -> MathResult<f64> {
         Ok(self.evaluate_full(u, v)?.gaussian_curvature())
@@ -1908,6 +1935,64 @@ impl Surface for Cylinder {
             } else {
                 u
             }
+        };
+
+        Ok((u, v))
+    }
+
+    /// Same angle computation as `closest_point`, but `v` (the axial/height
+    /// coordinate) is NEVER clamped to `height_limits`. See the trait doc on
+    /// `Surface::exact_uv`: a point handed in here is assumed to already lie
+    /// exactly on the infinite cylindrical surface (e.g. a ray/quadratic
+    /// intersection), so reporting its TRUE height — even past the finite
+    /// rim — is what lets the caller's trim-membership test correctly
+    /// reject it, instead of `closest_point`'s clamp silently relocating it
+    /// onto the rim boundary where winding-number noise can misclassify it
+    /// as a genuine face hit.
+    ///
+    /// NOTE: the `angle_limits` branch below still clamps `u` exactly as
+    /// `closest_point` does — the identical class of bug, left UNFIXED
+    /// here because there is no evidence it is live: `angle_limits` is only
+    /// ever set `Some` by `Cylinder::new_arc`, and nothing in this crate
+    /// calls `new_arc` today (verified by grep; the only hit is a doc
+    /// comment in `dfm/analyzers/orientation.rs` describing a
+    /// hypothetical). Every real construction path
+    /// (`create_cylinder_topology` via `new_finite`, `Cylinder::transform`,
+    /// `offset`) carries `angle_limits: None` through unchanged. If a
+    /// partial-arc cylinder is ever wired up, this branch needs the same
+    /// unclamped treatment `v` got here.
+    fn exact_uv(&self, point: &Point3) -> MathResult<(f64, f64)> {
+        let to_point = *point - self.origin;
+        let v = to_point.dot(&self.axis);
+
+        let axis_point = self.origin + self.axis * v;
+        let radial = *point - axis_point;
+
+        if radial.magnitude() < consts::EPSILON {
+            return Ok((0.0, v));
+        }
+
+        let radial_norm = radial.normalize()?;
+        let x_dir = self.ref_dir;
+        let y_dir = self.axis.cross(&x_dir);
+
+        let cos_u = radial_norm.dot(&x_dir);
+        let sin_u = radial_norm.dot(&y_dir);
+        let u = sin_u.atan2(cos_u);
+
+        let u = if let Some(limits) = self.angle_limits {
+            let mut u = u;
+            while u < limits[0] {
+                u += consts::TWO_PI;
+            }
+            while u > limits[1] {
+                u -= consts::TWO_PI;
+            }
+            u.max(limits[0]).min(limits[1])
+        } else if u < 0.0 {
+            u + consts::TWO_PI
+        } else {
+            u
         };
 
         Ok((u, v))
@@ -3192,6 +3277,37 @@ impl Surface for Cone {
         let u = sin_u.atan2(cos_u);
 
         // Normalize angle
+        let u = if u < 0.0 { u + consts::TWO_PI } else { u };
+
+        Ok((u, v))
+    }
+
+    /// Same computation as `closest_point`, but `v` is never clamped to
+    /// `height_limits` — see `Surface::exact_uv`'s trait doc and the mirror
+    /// override on `Cylinder`. The `.max(0.0)` apex-side floor is kept: it
+    /// is a geometric constraint of the cone equation itself (the nappe
+    /// exists only for `v >= 0`), not a trim, and every `t` this is called
+    /// with already satisfies it (`surface_ray_ts` filters the cone's roots
+    /// to `(p - apex).dot(axis) >= 0` before calling in).
+    fn exact_uv(&self, point: &Point3) -> MathResult<(f64, f64)> {
+        let to_point = *point - self.apex;
+        let v = to_point.dot(&self.axis).max(0.0);
+
+        let axis_point = self.apex + self.axis * v;
+        let radial = *point - axis_point;
+
+        if radial.magnitude() < consts::EPSILON {
+            return Ok((0.0, v));
+        }
+
+        let radial_norm = radial.normalize()?;
+        let x_dir = self.ref_dir;
+        let y_dir = self.axis.cross(&x_dir);
+
+        let cos_u = radial_norm.dot(&x_dir);
+        let sin_u = radial_norm.dot(&y_dir);
+        let u = sin_u.atan2(cos_u);
+
         let u = if u < 0.0 { u + consts::TWO_PI } else { u };
 
         Ok((u, v))

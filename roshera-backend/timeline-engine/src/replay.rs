@@ -320,6 +320,21 @@ pub fn rederive_part_drawing(
     DrawingRederive::Rebuilt(drawing_id, Box::new(drawing))
 }
 
+/// Identity and verbatim error of the first event a replay failed to
+/// re-execute. Captured on [`ReplayOutcome`] so callers (e.g. the `.ros`
+/// exporter's replay-verification pass) can state WHICH event broke
+/// without re-running the replay under a tracing subscriber — the
+/// per-event detail otherwise only reaches `tracing::warn!`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplayFailure {
+    /// The failing event's stable sequence number.
+    pub sequence_number: u64,
+    /// The failing event's id (`EventId`, stringified UUID).
+    pub event_id: String,
+    /// The replay error, verbatim (`ReplayError`'s Display output).
+    pub error: String,
+}
+
 /// Outcome of a [`rebuild_model_from_events`] run.
 #[derive(Debug, Clone, Default)]
 pub struct ReplayOutcome {
@@ -328,6 +343,12 @@ pub struct ReplayOutcome {
     /// Number of events that were skipped (unknown kind, invalid params,
     /// or kernel rejection). See `tracing::warn!` for per-event detail.
     pub events_skipped: usize,
+    /// The FIRST skipped event's identity and error. `Some` whenever
+    /// `events_skipped > 0` on every replay path that dispatches events
+    /// (full replay here, incremental slices in `incremental.rs`) —
+    /// each path records the failure in the same arm that increments
+    /// `events_skipped`, so the counter and the detail cannot drift.
+    pub first_failure: Option<ReplayFailure>,
     /// Final remap from original-recorded entity IDs to current-model
     /// entity IDs. Useful for callers who want to translate event-log
     /// references (e.g. an event's `outputs.created`) into live IDs.
@@ -402,6 +423,13 @@ pub fn rebuild_model_from_events(model: &mut BRepModel, events: &[TimelineEvent]
                     "replay step failed; skipping"
                 );
                 outcome.events_skipped += 1;
+                if outcome.first_failure.is_none() {
+                    outcome.first_failure = Some(ReplayFailure {
+                        sequence_number: event.sequence_number,
+                        event_id: event.id.to_string(),
+                        error: err.to_string(),
+                    });
+                }
             }
         }
     }
@@ -1408,6 +1436,44 @@ fn dispatch_generic(
             // genuine later reference to it then falls through to the kernel's
             // own liveness check and dangles honestly.
             id_remap.retain(|_, v| *v != solid as u64);
+            Ok(())
+        }
+
+        // `DELETE /api/agent/parts`'s orphan sweep (BUG 1 fix): every solid
+        // is already individually replayed via its own `delete_solid` event
+        // above, so by the time this event replays, `model.solids` should
+        // already be empty on a faithful replay — this call reproduces the
+        // sweep of whatever non-solid orphan topology (vertices/edges/
+        // curves/faces/loops that were never folded into a solid)
+        // accumulated in the LIVE session. Without this arm, the non-dotted
+        // `"clear_geometry"` kind falls through to `fallback_error` →
+        // `ReplayError::UnknownKind`, which `certify_rebuild` treats as a
+        // genuine replay break — quarantining the boot at the FIRST
+        // `clear_geometry` event ever recorded and refusing everything
+        // built after it.
+        //
+        // `BRepModel::clear_geometry` wipes `self.solids` unconditionally —
+        // fine for its one production caller, which always deletes every
+        // solid first — but replay must not inherit that blindly: a
+        // `delete_solid` earlier in THIS log that failed to replay (skipped
+        // with a warning, per `run_replay`'s `Err` arm) would leave a live
+        // solid here, and calling through would silently destroy it with no
+        // diagnostic. Mirrors `delete_solid`'s own guard
+        // (`if model.solids.get(solid).is_some()`): refuse loudly instead of
+        // wiping developed state the live session did not.
+        "clear_geometry" => {
+            if !model.solids.is_empty() {
+                return Err(ReplayError::InvalidParameters {
+                    kind: kind.to_string(),
+                    reason: format!(
+                        "clear_geometry replayed with {} live solid(s) still present — \
+                         this event only ever fires after every solid was already \
+                         deleted individually; refusing to silently destroy them",
+                        model.solids.len()
+                    ),
+                });
+            }
+            let _ = model.clear_geometry();
             Ok(())
         }
 

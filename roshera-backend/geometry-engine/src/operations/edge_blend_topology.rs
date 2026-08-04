@@ -1032,7 +1032,7 @@ pub(crate) fn coalesce_smooth_cocurve_chains(
             ek.end_vertex = drop_end_v;
             ek.param_range.end = drop_end_p;
         }
-        for lid in (0..model.loops.len() as u32).map(LoopId::from) {
+        for lid in (0..model.loops.slot_count() as u32).map(LoopId::from) {
             if let Some(lp) = model.loops.get_mut(lid) {
                 if let Some(idx) = lp.edges.iter().position(|&e| e == drop) {
                     lp.remove_edge(idx);

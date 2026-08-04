@@ -44,6 +44,8 @@ mod fillet_payload;
 #[cfg(test)]
 mod fillet_radius_harness;
 mod frame;
+#[cfg(test)]
+mod geometry_routes_coverage_tests;
 mod goose_acp;
 mod handlers;
 mod idempotency;
@@ -56,6 +58,8 @@ mod reconcile_task;
 mod router_integration_tests;
 mod sketch;
 mod transactions;
+#[cfg(test)]
+mod unsound_base_gate_tests;
 mod viewport_bridge;
 mod ws_identity_tests;
 // Using core geometry-engine directly
@@ -827,6 +831,7 @@ async fn create_geometry(
     let shape_type_copy = shape_type.clone();
     // Feedback-as-default: a primitive is sound by construction, but report the
     // SOUND (B-Rep) verdict anyway so EVERY mutating op has a uniform contract.
+    let durability = durability::disclosure(&state).await;
     let perception = {
         let mut model = model_handle.write().await;
         certified_response(
@@ -836,6 +841,7 @@ async fn create_geometry(
             solid_id,
             &tri_mesh,
             body_verify_flag(&payload),
+            durability,
         )
     };
     Ok(Json(serde_json::json!({
@@ -1187,6 +1193,109 @@ pub(crate) fn certificate_json(
     })
 }
 
+/// The kernel's one-line soundness verdicts, in ONE place.
+///
+/// Three surfaces quote these: the ambient perception block every mutating
+/// endpoint embeds (`certified_response` below), the read-side
+/// `GET /api/agent/parts/{id}/perception` (`handlers::agent::part_perception`),
+/// and the unsound-base gate's refusal ([`refuse_unsound_base`]).
+///
+/// They MUST be one string, not three copies, because the MCP client gate
+/// (`roshera-mcp/src/gates.ts::liveVerdict`) reads `verdict` off the
+/// perception endpoint and interpolates it into ITS refusal. Sharing the
+/// constant is what makes the Rust refusal and the TypeScript refusal quote
+/// the kernel identically by construction rather than by hand-syncing prose
+/// across a language boundary.
+pub const VERDICT_SOUND: &str = "SOUND — full kernel certificate clean (closed, manifold, self-intersection-free, mesh-quality-clean)";
+/// See [`VERDICT_SOUND`].
+pub const VERDICT_UNSOUND: &str = "UNSOUND — full kernel certificate flags a defect (see cert)";
+
+/// ★ **THE UNSOUND-BASE GATE.** Refuse a mutating operation whose base solid
+/// is unsound by the kernel's LIVE verdict.
+///
+/// # Why this exists in Rust
+///
+/// Roshera's thesis is that an agent cannot build on a lie. This rule used to
+/// live only in `roshera-mcp/src/gates.ts` — TypeScript, in the MCP client —
+/// which made it a linter rather than a gate: the same kernel operations are
+/// exposed over plain REST, so an agent that spoke REST instead of MCP could
+/// stack a fillet, a shell or a boolean onto a solid the kernel had already
+/// certified `sound: false`, and every downstream certificate would inherit
+/// the defect. By the project's own moat test — *does this survive swapping
+/// the host?* — a client-side gate does not even survive swapping the client.
+///
+/// # Where it sits, and why not a middleware
+///
+/// One helper, called per handler immediately after the base UUID resolves to
+/// a kernel `SolidId` and before any kernel work. A `route_layer` was the
+/// obvious alternative and is the wrong shape here: every route names its base
+/// with a DIFFERENT field (`object_a`/`object_b`, `object`, `object_uuid`), so
+/// a middleware would need body buffering, re-injection, and a per-route field
+/// map — more coupling, further from the resolution site, and unable to reuse
+/// each handler's own `SolidNotFound` 404. The rule itself lives here exactly
+/// once; only the call is per-handler.
+///
+/// # The three properties it must hold
+///
+/// 1. **Live, never memoized.** `certify_solid` is consulted on every call.
+///    Its per-solid cache is invalidated by the kernel's own mutation seams,
+///    so a base repaired by ANY author unblocks the very next request — no
+///    restart, no cache flush. This deliberately mirrors `gates.ts`, which
+///    lists `unsound_base` in `LIVE_FACT_GATES` and never caches its refusal.
+/// 2. **The escape hatch is preserved.** `acknowledge_unsound: true` proceeds.
+///    An agent that KNOWINGLY builds on a defect (a boolean used to heal an
+///    open shell, a rebuild from a known-good state) is behaving correctly —
+///    the defect is doing it unknowingly. Only a literal JSON `true` opens it.
+/// 3. **An unresolvable base is not gated.** A `SolidId` with no solid behind
+///    it is skipped, so the handler still produces its own precise error —
+///    the same call `gates.ts` makes (`partId === null → continue`).
+///
+/// Takes ALREADY-RESOLVED ids so each handler keeps its own 404 for an unknown
+/// UUID. `bases` is every operand the result would inherit from: a boolean
+/// passes BOTH, because an unsound TOOL poisons the result exactly as an
+/// unsound base does (`gates.ts::BASE_REFS` gates both operands too).
+///
+/// The write guard is scoped to its own block and dropped before this returns
+/// (`certify_solid` needs `&mut`, and every caller goes on to take the write
+/// lock again through `bounded_exec`); no guard is ever held across an `.await`.
+pub(crate) async fn refuse_unsound_base(
+    model_handle: &Arc<RwLock<geometry_engine::primitives::topology_builder::BRepModel>>,
+    payload: &serde_json::Value,
+    operation: &str,
+    bases: &[geometry_engine::primitives::solid::SolidId],
+) -> Result<(), error_catalog::ApiError> {
+    // The documented bypass. `as_bool() == Some(true)` and not a truthiness
+    // test: a string "true", a 1, or a missing field must NOT open the gate.
+    if payload.get("acknowledge_unsound").and_then(|v| v.as_bool()) == Some(true) {
+        return Ok(());
+    }
+
+    let offender = {
+        let mut model = model_handle.write().await;
+        let mut found = None;
+        for &solid_id in bases {
+            // Unresolvable → not our refusal to make; the handler fails loudly.
+            if model.solids.get(solid_id).is_none() {
+                continue;
+            }
+            if !model.certify_solid(solid_id).is_sound() {
+                found = Some(solid_id);
+                break;
+            }
+        }
+        found
+    }; // write guard dropped here, before the `.await`-free return below
+
+    match offender {
+        Some(solid_id) => Err(error_catalog::ApiError::unsound_base(
+            operation,
+            solid_id,
+            VERDICT_UNSOUND,
+        )),
+        None => Ok(()),
+    }
+}
+
 /// THE CHOKEPOINT (AMBIENT VERIFICATION). The perception block every mutating
 /// endpoint embeds in its response.
 ///
@@ -1226,6 +1335,15 @@ pub(crate) fn certificate_json(
 /// the model under a brief read lock — waiting microseconds for THIS caller's
 /// write guard to drop — then renders/certifies lock-free. `model_arc` is the
 /// ACTIVE model handle (may be a branch model, not `state.model`).
+///
+/// `durability` is the document-level disclosure (`durability::disclosure`,
+/// read by the caller BEFORE this sync function runs — `AppState.durability_status`
+/// is a `tokio::sync::RwLock` and this function cannot `.await`). `None` in the
+/// common case (off/empty/active) leaves the response byte-for-byte unchanged;
+/// `Some` carries the full `Quarantined` variant, inserted under the same
+/// `"durability"` key `part_perception`/`get_history` already use, so a
+/// `create_box`/`boolean`/`fillet_edges` response on a quarantined document
+/// discloses the break instead of answering as if the document were whole.
 fn certified_response(
     model: &mut geometry_engine::primitives::topology_builder::BRepModel,
     model_arc: &reconcile_task::ModelHandle,
@@ -1233,6 +1351,7 @@ fn certified_response(
     solid_id: geometry_engine::primitives::solid::SolidId,
     mesh: &geometry_engine::tessellation::TriangleMesh,
     full: bool,
+    durability: Option<durability::DurabilityStatus>,
 ) -> serde_json::Value {
     let mut base = perception_json(model, solid_id, mesh);
 
@@ -1280,12 +1399,47 @@ fn certified_response(
                 serde_json::json!(cert.self_intersection_free),
             );
             let verdict = if sound {
-                "SOUND — full kernel certificate clean (closed, manifold, self-intersection-free, mesh-quality-clean)"
+                VERDICT_SOUND
             } else {
-                "UNSOUND — full kernel certificate flags a defect (see cert)"
+                VERDICT_UNSOUND
             };
             map.insert("verdict".into(), serde_json::json!(verdict));
             map.insert("cert".into(), certificate_json(&cert));
+        }
+    }
+
+    // Document-level durability disclosure — BESIDE the part-level `sound`/
+    // `verdict` above, never rewriting them (those stay true statements about
+    // THIS solid; a quarantine is a fact about the whole document). Inserted
+    // unconditionally of `full`: the `fast: true` opt-out skips the expensive
+    // certificate block above, not the cheap disclosure — an agent that opts
+    // out of the certificate has not opted out of knowing its document is
+    // incomplete. `None` (the common case) leaves `base` byte-for-byte
+    // unchanged; `Some` serializes the exact `DurabilityStatus::Quarantined`
+    // variant `part_perception` discloses on `GET /perception`.
+    if let Some(status) = durability {
+        if let serde_json::Value::Object(map) = &mut base {
+            // `DurabilityStatus` serializes losslessly (String/u64/usize
+            // fields only — no NaN floats, no non-string map keys), so this
+            // cannot fail for any value `quarantine_disclosure` can produce.
+            // The `Err` arm is unreachable in practice; it is handled (not
+            // `unwrap`ped) and logged rather than silently dropped, so a
+            // future change to `DurabilityStatus` that broke this invariant
+            // would be loud, never a quietly-omitted disclosure.
+            match serde_json::to_value(&status) {
+                Ok(value) => {
+                    map.insert("durability".to_string(), value);
+                }
+                Err(e) => {
+                    tracing::error!(
+                        target: "durability",
+                        error = %e,
+                        "durability: quarantine status failed to serialize — \
+                         disclosure OMITTED from a mutating-op response \
+                         (this should be unreachable for DurabilityStatus)"
+                    );
+                }
+            }
         }
     }
 
@@ -1575,6 +1729,10 @@ async fn boolean_operation(
         ));
     }
 
+    // ★ UNSOUND-BASE GATE. Both operands: the result inherits from each, so
+    // an unsound TOOL poisons it exactly as an unsound base does.
+    refuse_unsound_base(&model_handle, &payload, "boolean", &[solid_a, solid_b]).await?;
+
     // Task #41 — BOUNDED execution. The kernel boolean runs arbitrary
     // corefinement and has spun >120 s under the write lock on a
     // thin-wall coincident-throat union, pinning the whole instance. Route
@@ -1732,6 +1890,7 @@ async fn boolean_operation(
     // valid + dims — so a caller learns whether the result is sound from the
     // operation itself, no second query. open/nonmanifold are read off the mesh
     // we already tessellated (no extra work); valid + dims from the kernel.
+    let durability = durability::disclosure(&state).await;
     let perception = {
         let mut model = model_handle.write().await;
         certified_response(
@@ -1741,6 +1900,7 @@ async fn boolean_operation(
             result_solid_id,
             &tri_mesh,
             body_verify_flag(&payload),
+            durability,
         )
     };
 
@@ -1861,6 +2021,9 @@ async fn shell_solid(
         )
     })?;
 
+    // ★ UNSOUND-BASE GATE.
+    refuse_unsound_base(&model_handle, &payload, "shell", &[solid_id]).await?;
+
     // Hold the model write lock only for the kernel shell op — same
     // pattern as boolean_operation. Tessellation runs under read.
     let thickness_abs = thickness.abs();
@@ -1942,6 +2105,7 @@ async fn shell_solid(
 
     // Feedback-as-default: shell can leave a self-intersecting or open wall, so
     // it reports its own SOUND (B-Rep) verdict like the boolean.
+    let durability = durability::disclosure(&state).await;
     let perception = {
         let mut model = model_handle.write().await;
         certified_response(
@@ -1951,6 +2115,7 @@ async fn shell_solid(
             result_solid_id,
             &tri_mesh,
             body_verify_flag(&payload),
+            durability,
         )
     };
     Ok(Json(serde_json::json!({
@@ -2076,6 +2241,9 @@ async fn mirror_solid(
         )
     })?;
 
+    // ★ UNSOUND-BASE GATE.
+    refuse_unsound_base(&model_handle, &payload, "mirror", &[solid_id]).await?;
+
     // Hold the model write lock only for the kernel mirror op; tessellation
     // runs under a read lock so concurrent writers aren't blocked. Same
     // pattern as boolean_operation / shell_solid.
@@ -2136,6 +2304,7 @@ async fn mirror_solid(
     );
 
     // AMBIENT VERIFICATION (outlier closed): mirror previously emitted no verdict.
+    let durability = durability::disclosure(&state).await;
     let perception = {
         let mut model = model_handle.write().await;
         certified_response(
@@ -2145,6 +2314,7 @@ async fn mirror_solid(
             solid_id,
             &tri_mesh,
             body_verify_flag(&payload),
+            durability,
         )
     };
 
@@ -2454,6 +2624,9 @@ async fn fillet_edges_endpoint(
         )
     })?;
 
+    // ★ UNSOUND-BASE GATE.
+    refuse_unsound_base(&model_handle, &payload, "fillet", &[solid_id]).await?;
+
     // Hold the model write lock only for the kernel fillet op;
     // tessellation runs under a read lock. Same pattern as boolean /
     // shell / mirror.
@@ -2673,6 +2846,7 @@ async fn fillet_edges_endpoint(
         [0.0, 0.0, 0.0],
     );
 
+    let durability = durability::disclosure(&state).await;
     let perception = {
         let mut model = model_handle.write().await;
         certified_response(
@@ -2682,6 +2856,7 @@ async fn fillet_edges_endpoint(
             solid_id,
             &tri_mesh,
             body_verify_flag(&payload),
+            durability,
         )
     };
 
@@ -2814,6 +2989,9 @@ async fn chamfer_edges_endpoint(
         )
     })?;
 
+    // ★ UNSOUND-BASE GATE.
+    refuse_unsound_base(&model_handle, &payload, "chamfer", &[solid_id]).await?;
+
     {
         let mut model = model_handle.write().await;
         let opts = ChamferOptions {
@@ -2902,6 +3080,7 @@ async fn chamfer_edges_endpoint(
         [0.0, 0.0, 0.0],
     );
 
+    let durability = durability::disclosure(&state).await;
     let perception = {
         let mut model = model_handle.write().await;
         certified_response(
@@ -2911,6 +3090,7 @@ async fn chamfer_edges_endpoint(
             solid_id,
             &tri_mesh,
             body_verify_flag(&payload),
+            durability,
         )
     };
 
@@ -2996,6 +3176,9 @@ async fn transform_geometry_endpoint(
             format!("no kernel solid registered for object={object_uuid}"),
         )
     })?;
+
+    // ★ UNSOUND-BASE GATE.
+    refuse_unsound_base(&model_handle, &payload, "transform", &[solid_id]).await?;
 
     // Build the matrices to apply, in order: rotation (about center) then
     // translation. Each is applied as its own transform_solid call.
@@ -3101,6 +3284,7 @@ async fn transform_geometry_endpoint(
     // its solid (the construction-consistency defect) — so this endpoint, which
     // previously returned a solid with NO verdict, now routes through the same
     // certified response as every other mutating op.
+    let durability = durability::disclosure(&state).await;
     let perception = {
         let mut model = model_handle.write().await;
         certified_response(
@@ -3110,6 +3294,7 @@ async fn transform_geometry_endpoint(
             solid_id,
             &tri_mesh,
             body_verify_flag(&payload),
+            durability,
         )
     };
     Ok(Json(serde_json::json!({
@@ -3199,6 +3384,10 @@ async fn pattern_linear_endpoint(
             format!("no kernel solid registered for object={object_uuid}"),
         )
     })?;
+
+    // ★ UNSOUND-BASE GATE. A pattern REPLICATES the base — an unsound base
+    // would be copied N times, not merely inherited from once.
+    refuse_unsound_base(&model_handle, &payload, "pattern/linear", &[solid_id]).await?;
 
     let mut emitted: Vec<String> = Vec::with_capacity((count as usize) - 1);
 
@@ -3379,6 +3568,9 @@ async fn pattern_circular_endpoint(
             format!("no kernel solid registered for object={object_uuid}"),
         )
     })?;
+
+    // ★ UNSOUND-BASE GATE. See the linear-pattern note above.
+    refuse_unsound_base(&model_handle, &payload, "pattern/circular", &[solid_id]).await?;
 
     let step = total_angle / (count as f64);
     let origin_pt = Point3::new(axis_origin[0], axis_origin[1], axis_origin[2]);
@@ -3658,6 +3850,7 @@ async fn create_extrude(
         [0.0, 0.0, 0.0],
     );
 
+    let durability = durability::disclosure(&state).await;
     let perception = {
         let mut model = model_handle.write().await;
         certified_response(
@@ -3667,6 +3860,7 @@ async fn create_extrude(
             result_solid_id,
             &tri_mesh,
             body_verify_flag(&payload),
+            durability,
         )
     };
 
@@ -3822,6 +4016,7 @@ async fn create_cylinder_primitive(
 
     // AMBIENT VERIFICATION (outlier closed): the dedicated cylinder primitive
     // previously emitted no verdict; it now carries the full certificate.
+    let durability = durability::disclosure(&state).await;
     let perception = {
         let mut model = model_handle.write().await;
         certified_response(
@@ -3831,6 +4026,7 @@ async fn create_cylinder_primitive(
             result_solid_id,
             &tri_mesh,
             body_verify_flag(&payload),
+            durability,
         )
     };
 
@@ -4019,6 +4215,7 @@ async fn create_box_primitive(
         [0.0, 0.0, 0.0],
     );
 
+    let durability = durability::disclosure(&state).await;
     let perception = {
         let mut model = model_handle.write().await;
         certified_response(
@@ -4028,6 +4225,7 @@ async fn create_box_primitive(
             result_solid_id,
             &tri_mesh,
             body_verify_flag(&payload),
+            durability,
         )
     };
 
@@ -4198,6 +4396,7 @@ async fn create_cone_primitive(
         [0.0, 0.0, 0.0],
     );
 
+    let durability = durability::disclosure(&state).await;
     let perception = {
         let mut model = model_handle.write().await;
         certified_response(
@@ -4207,6 +4406,7 @@ async fn create_cone_primitive(
             result_solid_id,
             &tri_mesh,
             body_verify_flag(&payload),
+            durability,
         )
     };
     Ok(Json(serde_json::json!({
@@ -4799,6 +4999,7 @@ async fn create_revolve_primitive(
 
     // Feedback-as-default: a self-intersecting / axis-touching profile can yield
     // an unsound solid, so revolve reports its own SOUND (B-Rep) verdict.
+    let durability = durability::disclosure(&state).await;
     let perception = {
         let mut model = model_handle.write().await;
         certified_response(
@@ -4808,6 +5009,7 @@ async fn create_revolve_primitive(
             result_solid_id,
             &tri_mesh,
             body_verify_flag(&payload),
+            durability,
         )
     };
     Ok(Json(serde_json::json!({
@@ -4865,7 +5067,6 @@ async fn import_step_geometry(
     Json(payload): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, error_catalog::ApiError> {
     use error_catalog::{ApiError, ErrorCode};
-    use geometry_engine::tessellation::{tessellate_solid, TessellationParams};
 
     // Sanity ceiling for a server-local `path` read: generous for any
     // real CAD STEP export, small enough that a caller pointing at the
@@ -4947,6 +5148,48 @@ async fn import_step_geometry(
     };
 
     // Register + broadcast each new solid exactly like a primitive create.
+    let objects = register_imported_solids(
+        &state,
+        &model_handle,
+        &new_solid_ids,
+        base_name.as_deref(),
+        "import_step",
+        "step_import",
+    )
+    .await;
+
+    Ok(Json(serde_json::json!({
+        "success": report.ok,
+        "objects": objects,
+        "report": report,
+    })))
+}
+
+/// Splice-registration shared by the geometry import routes
+/// (`/api/geometry/import_step`, `/api/geometry/import_ros`): tessellate
+/// each freshly merged solid, mint + register an object UUID, persist the
+/// display name, broadcast to viewport clients exactly like a `create_*`
+/// primitive, and FORCE the full certificate (ignore any fast/verify
+/// preference). An imported file is UNTRUSTED external input — the exact
+/// case where the lightweight seed's "valid B-Rep ⟹ watertight" shortcut
+/// lies (a re-imported blend rim can be B-Rep-valid yet tessellate open).
+/// Running `certify_solid` here makes the per-object
+/// `perception.sound`/`watertight`/`brep_valid` the TRUE mesh verdict.
+/// One loop, two callers — the import paths cannot drift.
+async fn register_imported_solids(
+    state: &AppState,
+    model_handle: &reconcile_task::ModelHandle,
+    new_solid_ids: &[u32],
+    base_name: Option<&str>,
+    object_type: &str,
+    source: &str,
+) -> Vec<serde_json::Value> {
+    use geometry_engine::tessellation::{tessellate_solid, TessellationParams};
+
+    // Read once for the whole splice — the document's durability status
+    // cannot change mid-request — and clone per solid below (`DurabilityStatus`
+    // is cheap: at most a few strings/ints).
+    let durability = durability::disclosure(state).await;
     let mut objects = Vec::with_capacity(new_solid_ids.len());
     for (i, &solid_id) in new_solid_ids.iter().enumerate() {
         let tri_mesh = {
@@ -4962,18 +5205,18 @@ async fn import_step_geometry(
         let id_str = object_uuid.to_string();
         state.register_id_mapping(object_uuid, solid_id);
 
-        let name = match &base_name {
-            Some(b) if new_solid_ids.len() == 1 => b.clone(),
+        let name = match base_name {
+            Some(b) if new_solid_ids.len() == 1 => b.to_string(),
             Some(b) => format!("{b} {}", i + 1),
             None => format!("Imported {solid_id}"),
         };
-        persist_display_name(&state, &model_handle, solid_id, &name).await;
-        let parameters = serde_json::json!({ "source": "step_import", "index": i });
+        persist_display_name(state, model_handle, solid_id, &name).await;
+        let parameters = serde_json::json!({ "source": source, "index": i });
         broadcast_object_created(
             &id_str,
             &name,
             solid_id,
-            "import_step",
+            object_type,
             &parameters,
             &vertices,
             &indices,
@@ -4984,20 +5227,21 @@ async fn import_step_geometry(
 
         let perception = {
             let mut model = model_handle.write().await;
-            // FORCE the full certificate on import (ignore the request's
-            // `fast`/verify flag). A STEP file is UNTRUSTED external input — the
-            // exact case where the lightweight seed's "valid B-Rep ⟹ watertight"
-            // shortcut lies (a re-imported blend rim can be B-Rep-valid yet
-            // tessellate open). Running `certify_solid` here makes the per-object
-            // `perception.sound`/`watertight`/`brep_valid` the TRUE mesh verdict,
-            // matching the honest `report.validation` this endpoint also returns.
-            certified_response(&mut model, &model_handle, &state, solid_id, &tri_mesh, true)
+            certified_response(
+                &mut model,
+                model_handle,
+                state,
+                solid_id,
+                &tri_mesh,
+                true,
+                durability.clone(),
+            )
         };
         objects.push(serde_json::json!({
             "id":         id_str,
             "name":       name,
             "solid_id":   solid_id,
-            "objectType": "import_step",
+            "objectType": object_type,
             "perception": perception,
             "mesh": {
                 "vertices": vertices,
@@ -5010,11 +5254,253 @@ async fn import_step_geometry(
             "scale":    [1.0_f32, 1.0, 1.0],
         }));
     }
+    objects
+}
+
+/// POST /api/geometry/import_ros — read a native `.ros` v3.1 file and
+/// splice its solids into the live session model.
+///
+/// Request: `{ "path": "C:/…/part.ros", "password"?: "…", "name"?: "label" }`
+/// OR `{ "filename": "part.ros", … }` where `filename` is a file inside the
+/// server's export directory — exactly the `filename` a `/api/export`
+/// `format: "ROS"` response returned, so export → import round-trips
+/// without the caller ever learning the directory layout. `.ros` is a
+/// binary container (chunked, optionally AES-256-GCM encrypted), so there
+/// is no inline `content` variant — the SERVER reads the bytes (same #34
+/// rationale as the STEP route: never buffer a binary file through JSON).
+///
+/// This is the read counterpart of the `/api/export` ROS arm
+/// (`handlers::export::export_mesh`, `ExportFormat::ROS`): the export
+/// engine reads header + chunk table, decrypts when a password is
+/// supplied, and returns the FULL structured `RosImport` (timeline,
+/// branches, PROV, optional GEOM snapshot). Geometry is materialised
+/// from the GEOM cache — or, when the file omitted GEOM, by replaying
+/// its HIST timeline events (`RosImport::into_model`) — and the
+/// HIST/PROV counts are reported in the response rather than dropped.
+/// Every solid is then merged into the live model, registered,
+/// tessellated, broadcast, and FULL-certified exactly like the STEP
+/// import path — same splice (`merge_solids_into`), same
+/// `register_imported_solids` loop.
+/// Read a full [`export_engine::formats::ros::RosImport`] from an import
+/// request payload (`path` | `filename`, optional `password`). Shared by
+/// the geometry-splice route ([`import_ros_geometry`]) and the
+/// document-import route ([`documents::import_ros_document`]) so the two
+/// can never drift on the traversal guard, the size ceiling, or the
+/// typed-error contract.
+pub(crate) async fn read_ros_import_request(
+    state: &AppState,
+    payload: &serde_json::Value,
+) -> Result<export_engine::formats::ros::RosImport, error_catalog::ApiError> {
+    use error_catalog::{ApiError, ErrorCode};
+
+    // Same sanity ceiling as the STEP route: generous for any real .ros
+    // file, small enough that a caller pointing at the wrong (huge) file
+    // gets a clear error instead of a multi-minute stall reading it.
+    const MAX_ROS_FILE_BYTES: u64 = 512 * 1024 * 1024; // 512MB
+
+    let password = payload.get("password").and_then(|v| v.as_str());
+
+    if let Some(p) = payload.get("path").and_then(|v| v.as_str()) {
+        let metadata = tokio::fs::metadata(p).await.map_err(|e| {
+            ApiError::new(
+                ErrorCode::InvalidParameter,
+                format!("cannot read .ros file at path {p:?}: {e}"),
+            )
+        })?;
+        if !metadata.is_file() {
+            return Err(ApiError::new(
+                ErrorCode::InvalidParameter,
+                format!("path {p:?} is not a regular file"),
+            ));
+        }
+        if metadata.len() > MAX_ROS_FILE_BYTES {
+            return Err(ApiError::new(
+                ErrorCode::InvalidParameter,
+                format!(
+                    ".ros file at {p:?} is {} bytes, exceeds the {MAX_ROS_FILE_BYTES}-byte import ceiling",
+                    metadata.len()
+                ),
+            ));
+        }
+        export_engine::formats::ros::import_ros(std::path::Path::new(p), password)
+            .await
+            .map_err(|e| {
+                ApiError::new(
+                    ErrorCode::InvalidParameter,
+                    format!(".ros import failed: {e}"),
+                )
+            })
+    } else if let Some(f) = payload.get("filename").and_then(|v| v.as_str()) {
+        // Same traversal guard as `/api/download/{filename}` — the value
+        // is resolved inside the export directory, never outside it.
+        if f.contains("..") || f.contains('/') || f.contains('\\') {
+            return Err(ApiError::new(
+                ErrorCode::InvalidParameter,
+                format!(
+                    "filename {f:?} must be a bare file name inside the export \
+                     directory (no path separators)"
+                ),
+            ));
+        }
+        state
+            .export_engine
+            .import_ros(f, password)
+            .await
+            .map_err(|e| {
+                ApiError::new(
+                    ErrorCode::InvalidParameter,
+                    format!(".ros import failed: {e}"),
+                )
+            })
+    } else {
+        Err(ApiError::missing_field(
+            "path or filename (a server-readable .ros file location, or a file \
+             name a /api/export ROS response returned)",
+        ))
+    }
+}
+
+/// Signature verdict as wire JSON — three states, never a bool:
+/// "unsigned" and "signature failed" are different facts and must not
+/// collapse. (A header that CLAIMS a signature over a file with no SIGN
+/// chunk never reaches here — `import_ros` refuses it with a typed
+/// error.) Shared by both .ros import routes.
+pub(crate) fn ros_signature_json(
+    signature: &export_engine::formats::ros::RosSignatureVerdict,
+) -> serde_json::Value {
+    match signature {
+        export_engine::formats::ros::RosSignatureVerdict::Unsigned => {
+            serde_json::json!({ "status": "unsigned" })
+        }
+        export_engine::formats::ros::RosSignatureVerdict::Verified {
+            signer_id,
+            public_key,
+        } => serde_json::json!({
+            "status": "verified",
+            "signer_id": signer_id,
+            "public_key": public_key,
+        }),
+        export_engine::formats::ros::RosSignatureVerdict::Invalid { reason } => {
+            serde_json::json!({ "status": "invalid", "reason": reason })
+        }
+        // The signature is cryptographically genuine but the identity
+        // attached to it is not derivable from its own public key. A
+        // distinct status, never folded into "invalid": the caller must
+        // be able to tell "these bytes are not what was signed" from
+        // "these bytes ARE what was signed, under a forged name".
+        export_engine::formats::ros::RosSignatureVerdict::ForgedSignerId {
+            declared_signer_id,
+            derived_signer_id,
+            public_key,
+        } => serde_json::json!({
+            "status": "forged_signer_id",
+            "declared_signer_id": declared_signer_id,
+            "derived_signer_id": derived_signer_id,
+            "public_key": public_key,
+        }),
+        // Signed under the .ros ≤3.1 scheme, whose coverage excluded the
+        // header and chunk index. Not a failure and not a pass.
+        export_engine::formats::ros::RosSignatureVerdict::SupersededScheme {
+            file_version,
+            reason,
+        } => serde_json::json!({
+            "status": "superseded_scheme",
+            "file_version": file_version,
+            "reason": reason,
+        }),
+    }
+}
+
+async fn import_ros_geometry(
+    State(state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, error_catalog::ApiError> {
+    use error_catalog::{ApiError, ErrorCode};
+
+    let base_name = payload
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let ros = read_ros_import_request(&state, &payload).await?;
+
+    // What the file's mandatory HIST/PROV chunks carried — surfaced
+    // verbatim in the response below so the caller can tell a
+    // provenance-bearing file from a bare geometry snapshot.
+    //
+    // SCOPE: the HIST/PROV payload is REPORTED, not ingested. Merging a
+    // foreign timeline into the live one would rebase sequence numbers
+    // and break every recorded persistent id (pids derive from
+    // `evt:{sequence_number}`), so it stays permanently out of scope for
+    // THIS route — it splices geometry and tells the caller what else
+    // the file contained. To ingest the timeline, use the sibling
+    // `POST /api/documents/import_ros` (`documents::import_ros_document`),
+    // which rehydrates the file into a FRESH document where every
+    // sequence number is preserved verbatim.
+    let hist_event_count = ros.timeline.len();
+    let hist_branch_count = ros.branches.len();
+    let prov_command_count = ros.aipr.commands.len();
+    let prov_session_id = ros.aipr.session;
+
+    let signature_json = ros_signature_json(&ros.signature);
+
+    let imported = ros.into_model().map_err(|e| {
+        ApiError::new(
+            ErrorCode::InvalidParameter,
+            format!(".ros import failed: {e}"),
+        )
+    })?;
+
+    if imported.solids.is_empty() {
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            ".ros file materialised no solids (empty GEOM snapshot and no \
+             rebuildable HIST events)"
+                .to_string(),
+        ));
+    }
+
+    // Splice into the live session model, remapping ids so they don't
+    // collide with existing parts. `merge_solids_into` is the generic
+    // BRepModel→BRepModel splice (it lives in `formats::step` because the
+    // STEP route grew it first; nothing about it is STEP-specific).
+    let new_solid_ids: Vec<u32> = {
+        let mut model = model_handle.write().await;
+        export_engine::formats::step::merge_solids_into(&mut model, &imported)
+    };
+
+    let objects = register_imported_solids(
+        &state,
+        &model_handle,
+        &new_solid_ids,
+        base_name.as_deref(),
+        "import_ros",
+        "ros_import",
+    )
+    .await;
+
+    // Honesty: `success` reports the certificates' verdict, not merely
+    // "the file parsed" — a .ros file carries no ImportReport, so the
+    // per-solid full certificate IS the import verdict.
+    let all_sound = objects.iter().all(|o| {
+        o.get("perception")
+            .and_then(|p| p.get("sound"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    });
 
     Ok(Json(serde_json::json!({
-        "success": report.ok,
+        "success": all_sound,
         "objects": objects,
-        "report": report,
+        "imported_solids": objects.len(),
+        "file_contents": {
+            "hist_event_count": hist_event_count,
+            "hist_branch_count": hist_branch_count,
+            "prov_command_count": prov_command_count,
+            "prov_session_id": prov_session_id,
+            "signature": signature_json,
+        },
     })))
 }
 
@@ -5153,6 +5639,7 @@ async fn create_nurbs_loft_primitive(
         [0.0, 0.0, 0.0],
     );
 
+    let durability = durability::disclosure(&state).await;
     let perception = {
         let mut model = model_handle.write().await;
         certified_response(
@@ -5162,6 +5649,7 @@ async fn create_nurbs_loft_primitive(
             result_solid_id,
             &tri_mesh,
             body_verify_flag(&payload),
+            durability,
         )
     };
     Ok(Json(serde_json::json!({
@@ -5255,6 +5743,12 @@ async fn extrude_face_endpoint(
             format!("no kernel solid registered for {object_uuid}"),
         )
     })?;
+
+    // ★ UNSOUND-BASE GATE. Runs the moment the base resolves — before the
+    // face-ownership check below — so no work is spent validating a
+    // selection on a solid the operation is not allowed to touch.
+    refuse_unsound_base(&model_handle, &payload, "face/extrude", &[host_solid_id]).await?;
+
     {
         let model = model_handle.read().await;
         let solid = model
@@ -5397,6 +5891,7 @@ async fn extrude_face_endpoint(
     // AMBIENT VERIFICATION (outlier closed): face-extrude previously returned a
     // solid with NO verdict; it now carries the full certificate like every
     // other mutating op.
+    let durability = durability::disclosure(&state).await;
     let perception = {
         let mut model = model_handle.write().await;
         certified_response(
@@ -5406,6 +5901,7 @@ async fn extrude_face_endpoint(
             result_solid_id,
             &tri_mesh,
             body_verify_flag(&payload),
+            durability,
         )
     };
 
@@ -6275,15 +6771,50 @@ async fn delete_solid_core(
 ) {
     {
         let mut model = model_handle.write().await;
-        if let Err(e) = geometry_engine::operations::delete::delete_solid(
+        // `delete_solid` returns the entities it actually removed (always
+        // including the solid itself; plus its cascaded shells/faces when
+        // `cascade` is set) — that Ok payload is the honest source for the
+        // deletion channel below. On Err the op rolled back via
+        // `with_rollback`'s snapshot restore, so nothing was actually
+        // removed; the record still fires (matching prior behaviour) but
+        // must declare NO deletions in that case.
+        let removed = match geometry_engine::operations::delete::delete_solid(
             &mut model, solid_id, /* cascade */ true,
         ) {
-            tracing::warn!(
-                solid_id = solid_id,
-                error = %e,
-                "delete_solid failed; mapping was dropped but kernel state may retain residue"
-            );
-        }
+            Ok(removed) => removed,
+            Err(e) => {
+                tracing::warn!(
+                    solid_id = solid_id,
+                    error = %e,
+                    "delete_solid failed; mapping was dropped but kernel state may retain residue"
+                );
+                Vec::new()
+            }
+        };
+        // Shells are never part of the wire entity taxonomy (there is no
+        // `with_input_shells` / `with_output_shells` either — see
+        // `recorder.rs`'s `ENTITY_*` constants), so they are omitted here
+        // too rather than inventing a new kind for one channel only. Loops,
+        // edges, and vertices DO have wire kinds and now show up in `removed`
+        // (the model-wide orphan prune folds them into `delete_solid`'s
+        // return), so they are mapped here too — otherwise they would
+        // silently vanish at this recording site the same way the prune
+        // itself used to silently discard them.
+        use geometry_engine::operations::delete::EntityType as DeletedKind;
+        use geometry_engine::operations::recorder::{
+            entity_ref, ENTITY_EDGE, ENTITY_FACE, ENTITY_LOOP, ENTITY_SOLID, ENTITY_VERTEX,
+        };
+        let deleted_refs: Vec<String> = removed
+            .iter()
+            .filter_map(|(kind, id)| match kind {
+                DeletedKind::Solid => Some(entity_ref(ENTITY_SOLID, *id as u64)),
+                DeletedKind::Face => Some(entity_ref(ENTITY_FACE, *id as u64)),
+                DeletedKind::Loop => Some(entity_ref(ENTITY_LOOP, *id as u64)),
+                DeletedKind::Edge => Some(entity_ref(ENTITY_EDGE, *id as u64)),
+                DeletedKind::Vertex => Some(entity_ref(ENTITY_VERTEX, *id as u64)),
+                DeletedKind::Shell => None,
+            })
+            .collect();
         model.record_operation(
             geometry_engine::operations::recorder::RecordedOperation::new("delete_solid")
                 .with_parameters(serde_json::json!({
@@ -6291,7 +6822,8 @@ async fn delete_solid_core(
                     "solid_id": solid_id,
                     "cascade":  true,
                 }))
-                .with_input_solids([solid_id as u64]),
+                .with_input_solids([solid_id as u64])
+                .with_deleted_refs(deleted_refs),
         );
     }
 
@@ -6350,7 +6882,36 @@ async fn clear_all_geometry(
     // solids does not remove these, and they poison later op validation with
     // phantom connectivity errors. clear_geometry makes "clear" a true reset,
     // matching clear_timeline, without needing a full timeline rewind.
-    model_handle.write().await.clear_geometry();
+    //
+    // Every solid above was already timeline-recorded individually by
+    // `delete_solid_core`, so `swept` here is normally just the true
+    // orphans — but `clear_geometry` also reports any solid it had to wipe
+    // (e.g. one whose `delete_solid_core` call hit the `Err` / rollback
+    // path and was left behind), so this stays honest even off the happy
+    // path. `clear_geometry` itself never records (see its doc comment —
+    // it has test call sites with no recorder attached); this is the one
+    // production caller, and the one place a "clear" is a genuine,
+    // user-visible, once-per-call event, so recording lives here rather
+    // than inside the kernel primitive.
+    let swept = model_handle.write().await.clear_geometry();
+    if !swept.is_empty() {
+        let model = model_handle.read().await;
+        // Both channels declare the SAME refs: `deleted` is the honest
+        // "this stopped existing" fact (the whole point of this fix —
+        // before it, this sweep left zero trace); `inputs` satisfies the
+        // lineage ratchet's real question — an operation that consumed
+        // model entities must name them as inputs, not just as an
+        // allowlisted "constructive root" — which a clear genuinely is
+        // not: it consumes exactly the orphans it destroys. Mirrors
+        // `delete_solid_core`'s `with_input_solids` + `with_deleted_refs`
+        // pairing on the SAME id above.
+        model.record_operation(
+            geometry_engine::operations::recorder::RecordedOperation::new("clear_geometry")
+                .with_parameters(serde_json::json!({ "swept": swept.len() }))
+                .with_input_refs(swept.clone())
+                .with_deleted_refs(swept),
+        );
+    }
 
     Ok(Json(serde_json::json!({
         "success": true,
@@ -7976,6 +8537,278 @@ mod tests {
         );
     }
 
+    /// `decode_intent_header` must reverse exactly what the MCP client's
+    /// `encodeURIComponent` produced — including non-ASCII — and treat
+    /// anything undecodable as ABSENT (`None`), never a guessed string.
+    #[test]
+    fn intent_header_decodes_utf8_and_refuses_malformed() {
+        // encodeURIComponent("Ø160 bolt circle — 8 × M8")
+        assert_eq!(
+            decode_intent_header("%C3%98160%20bolt%20circle%20%E2%80%94%208%20%C3%97%20M8")
+                .as_deref(),
+            Some("Ø160 bolt circle — 8 × M8")
+        );
+        // Plain ASCII passes through untouched; '+' is literal, not a space
+        // (encodeURIComponent never emits '+').
+        assert_eq!(
+            decode_intent_header("8+holes%2C%20close%20fit").as_deref(),
+            Some("8+holes, close fit")
+        );
+        // Truncated escape → absent, not a partial guess.
+        assert_eq!(decode_intent_header("cut%2"), None);
+        // Non-hex escape → absent.
+        assert_eq!(decode_intent_header("cut%zz"), None);
+        // Escapes decoding to invalid UTF-8 → absent, never lossy-replaced.
+        assert_eq!(decode_intent_header("%C3%28"), None);
+    }
+
+    /// `agent_intent_layer` must scope the DECODED phrase (and the turn)
+    /// into `INTENT_OVERRIDE` on the request task, and leave the task
+    /// scope-free when the header is absent — the exact task-local the
+    /// `TimelineRecorder` reads at `record()` time.
+    #[tokio::test]
+    async fn agent_intent_layer_scopes_the_decoded_header_per_request() {
+        use axum::routing::get;
+        use tower::ServiceExt;
+
+        async fn probe() -> String {
+            timeline_engine::recorder_bridge::INTENT_OVERRIDE
+                .try_with(|ctx| format!("{}|{}", ctx.text, ctx.turn_id.as_deref().unwrap_or("-")))
+                .unwrap_or_else(|_| "NO-SCOPE".to_string())
+        }
+        let router = axum::Router::new()
+            .route("/probe", get(probe))
+            .layer(axum::middleware::from_fn(agent_intent_layer));
+
+        let with_intent = router
+            .clone()
+            .oneshot(
+                axum::extract::Request::builder()
+                    .uri("/probe")
+                    .header(
+                        "X-Roshera-Intent",
+                        "%C3%98160%20bolt%20circle%20%E2%80%94%208%20%C3%97%20M8",
+                    )
+                    .header("X-Roshera-Intent-Turn", "14")
+                    .body(axum::body::Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("router responds");
+        let body = axum::body::to_bytes(with_intent.into_body(), 1024)
+            .await
+            .expect("body reads");
+        assert_eq!(
+            std::str::from_utf8(&body).expect("utf8 body"),
+            "Ø160 bolt circle — 8 × M8|14",
+            "the decoded phrase + turn must be live in INTENT_OVERRIDE on the request task"
+        );
+
+        let without_intent = router
+            .oneshot(
+                axum::extract::Request::builder()
+                    .uri("/probe")
+                    .body(axum::body::Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("router responds");
+        let body = axum::body::to_bytes(without_intent.into_body(), 1024)
+            .await
+            .expect("body reads");
+        assert_eq!(
+            std::str::from_utf8(&body).expect("utf8 body"),
+            "NO-SCOPE",
+            "no header → no scope: absence must stay absent, never defaulted"
+        );
+    }
+
+    /// `agent_origin_layer` stamps `Mcp` ONLY on the conjunction of both
+    /// headers the MCP client actually sends (`X-Roshera-Agent` +
+    /// decodable, non-empty `X-Roshera-Intent`) — not on either alone —
+    /// and, unlike `agent_intent_layer`, NEVER passes through unscoped:
+    /// every request lands in `ORIGIN_OVERRIDE`, defaulting to `Rest` when
+    /// the conjunction is not met.
+    #[tokio::test]
+    async fn agent_origin_layer_stamps_mcp_only_on_the_conjunction() {
+        use axum::routing::get;
+        use tower::ServiceExt;
+
+        async fn probe() -> String {
+            timeline_engine::recorder_bridge::ORIGIN_OVERRIDE
+                .try_with(|origin| format!("{:?}", origin))
+                .unwrap_or_else(|_| "NO-SCOPE".to_string())
+        }
+        let router = axum::Router::new()
+            .route("/probe", get(probe))
+            .layer(axum::middleware::from_fn(agent_origin_layer));
+
+        async fn probe_with(router: axum::Router, headers: &[(&str, &str)]) -> String {
+            let mut builder = axum::extract::Request::builder().uri("/probe");
+            for (name, value) in headers {
+                builder = builder.header(*name, *value);
+            }
+            let response = router
+                .oneshot(
+                    builder
+                        .body(axum::body::Body::empty())
+                        .expect("request builds"),
+                )
+                .await
+                .expect("router responds");
+            let body = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .expect("body reads");
+            std::str::from_utf8(&body).expect("utf8 body").to_string()
+        }
+
+        // Both headers (the MCP client's actual wire signature) → Mcp.
+        assert_eq!(
+            probe_with(
+                router.clone(),
+                &[
+                    ("X-Roshera-Agent", "Claude"),
+                    ("X-Roshera-Intent", "bolt%20circle"),
+                ],
+            )
+            .await,
+            "Mcp",
+            "both headers together must stamp Mcp"
+        );
+
+        // Intent header alone (no agent header) → Rest, NOT Mcp. This is
+        // the exact case the task called out: a hand-rolled REST caller
+        // could send only this header, and it must not be believed alone.
+        assert_eq!(
+            probe_with(router.clone(), &[("X-Roshera-Intent", "bolt%20circle")]).await,
+            "Rest",
+            "the intent header alone must never be inferred as Mcp"
+        );
+
+        // Agent header alone (no intent header) → Rest, NOT Mcp. Matches
+        // `agent_author_layer`'s own doc: this header is sent by the MCP
+        // server AND any direct agent caller, so it alone cannot mean Mcp.
+        assert_eq!(
+            probe_with(router.clone(), &[("X-Roshera-Agent", "Claude")]).await,
+            "Rest",
+            "the agent header alone must never be inferred as Mcp"
+        );
+
+        // No headers at all → Rest, and — unlike agent_intent_layer — NOT
+        // NO-SCOPE: origin is scoped unconditionally.
+        assert_eq!(
+            probe_with(router.clone(), &[]).await,
+            "Rest",
+            "with no distinguishing headers the request is still scoped, as Rest"
+        );
+    }
+
+    /// End-to-end pin (origin-provenance tests #2 and #3): a plain REST
+    /// call records `roshera.origin.channel = rest`; a call carrying the
+    /// MCP client's actual wire signature (both `X-Roshera-Agent` and a
+    /// decodable `X-Roshera-Intent`) records `roshera.origin.channel = mcp`
+    /// AND its `roshera.intent` facet — proving `agent_intent_layer` and
+    /// `agent_origin_layer` compose correctly when stacked exactly as they
+    /// are in the real router, all the way through a REAL
+    /// `TimelineRecorder` onto a REAL timeline event (not just the
+    /// task-local probe above).
+    #[tokio::test]
+    async fn rest_and_mcp_requests_record_the_right_facets_through_a_real_recorder() {
+        use axum::extract::State;
+        use axum::routing::post;
+        use geometry_engine::operations::recorder::{
+            IntentFacet, OperationRecorder, OriginFacet, RecordedOperation,
+        };
+        use tower::ServiceExt;
+
+        let timeline: timeline_engine::SharedTimeline =
+            std::sync::Arc::new(tokio::sync::RwLock::new(timeline_engine::Timeline::new(
+                timeline_engine::TimelineConfig::default(),
+            )));
+        let recorder = timeline_engine::TimelineRecorder::new(
+            std::sync::Arc::clone(&timeline),
+            timeline_engine::Author::System,
+            timeline_engine::BranchId::main(),
+        );
+
+        async fn probe(State(recorder): State<timeline_engine::TimelineRecorder>) -> &'static str {
+            recorder
+                .record(RecordedOperation::new("probe-op"))
+                .expect("record succeeds");
+            "ok"
+        }
+
+        let router = axum::Router::new()
+            .route("/probe", post(probe))
+            .layer(axum::middleware::from_fn(agent_intent_layer))
+            .layer(axum::middleware::from_fn(agent_origin_layer))
+            .with_state(recorder.clone());
+
+        router
+            .clone()
+            .oneshot(
+                axum::extract::Request::builder()
+                    .method("POST")
+                    .uri("/probe")
+                    .body(axum::body::Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("plain REST call responds");
+
+        router
+            .oneshot(
+                axum::extract::Request::builder()
+                    .method("POST")
+                    .uri("/probe")
+                    .header("X-Roshera-Agent", "Claude")
+                    .header("X-Roshera-Intent", "bolt%20circle%208%20x%20D18")
+                    .header("X-Roshera-Intent-Turn", "3")
+                    .body(axum::body::Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("mcp-signature call responds");
+
+        recorder.flush().await.expect("flush drains both records");
+        let events = timeline
+            .read()
+            .await
+            .get_branch_events(&timeline_engine::BranchId::main(), None, None)
+            .expect("branch events");
+        assert_eq!(events.len(), 2, "both probe calls recorded");
+
+        fn facet<'a>(
+            event: &'a timeline_engine::TimelineEvent,
+            name: &str,
+        ) -> Option<&'a serde_json::Value> {
+            match &event.operation {
+                timeline_engine::Operation::Generic { parameters, .. } => {
+                    parameters.get("facets").and_then(|f| f.get(name))
+                }
+                _ => None,
+            }
+        }
+
+        let rest_event = &events[0];
+        let rest_origin = facet(rest_event, OriginFacet::NAME)
+            .expect("the plain REST call must carry an origin facet");
+        assert_eq!(rest_origin["channel"], "rest");
+        assert!(
+            facet(rest_event, IntentFacet::NAME).is_none(),
+            "the plain REST call opened no intent — none must be recorded"
+        );
+
+        let mcp_event = &events[1];
+        let mcp_origin = facet(mcp_event, OriginFacet::NAME)
+            .expect("the mcp-signature call must carry an origin facet");
+        assert_eq!(mcp_origin["channel"], "mcp");
+        let mcp_intent = facet(mcp_event, IntentFacet::NAME)
+            .expect("the mcp-signature call opened an intent checkpoint — it must be recorded");
+        assert_eq!(mcp_intent["text"], "bolt circle 8 x D18");
+        assert_eq!(mcp_intent["source"], "agent_stated");
+    }
+
     #[tokio::test]
     async fn test_enhanced_server() {
         // Test implementation
@@ -8859,6 +9692,15 @@ pub(crate) fn build_router(state: AppState) -> Router {
                 .route_layer(DefaultBodyLimit::max(256 * 1024 * 1024)),
         )
         .route(
+            // Native .ros import: `path`/`filename` only (binary container,
+            // the server reads the bytes), so the 2MB default body limit is
+            // ample for its small JSON payload.
+            "/api/geometry/import_ros",
+            post(import_ros_geometry).route_layer(axum::middleware::from_fn(
+                auth_middleware::require_create_geometry,
+            )),
+        )
+        .route(
             "/api/geometry/face/extrude",
             post(extrude_face_endpoint).route_layer(axum::middleware::from_fn(
                 auth_middleware::require_modify_geometry,
@@ -9318,6 +10160,20 @@ pub(crate) fn build_router(state: AppState) -> Router {
             get(documents::list_documents).post(documents::create_document),
         )
         .route("/api/documents/{id}/open", post(documents::open_document))
+        // Import a .ros file AS a document: registers a fresh document,
+        // persists the file's HIST events/branches under it verbatim
+        // (sequence numbers preserved — persistent ids derive from
+        // `evt:{sequence_number}`), and activates it through the same
+        // `documents::activate` path `/open` uses. Static segment, so it
+        // must precede nothing here — axum ranks it above `{id}` routes.
+        // Same create-geometry gate as `/api/geometry/import_ros`: both
+        // routes materialise geometry from an untrusted file.
+        .route(
+            "/api/documents/import_ros",
+            post(documents::import_ros_document).route_layer(axum::middleware::from_fn(
+                auth_middleware::require_create_geometry,
+            )),
+        )
         // PATCH renames; DELETE is the only destructive route in the API —
         // it refuses the active / last-remaining / default document (see
         // documents.rs) and is transactional across the registry row and
@@ -9640,6 +10496,16 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route("/api/timeline/init", post(initialize_timeline))
         .route("/api/timeline/record", post(record_operation))
         .route("/api/timeline/history/{branch_id}", get(get_history))
+        // Lineage DAG of the same branch — the ONE answer to "what
+        // belongs together", projected by `timeline_engine::LineageGraph`
+        // from the refs each operation actually recorded. The timeline
+        // map renders this; it no longer groups by op-kind adjacency,
+        // which was a guess wearing the costume of a fact (an event with
+        // no recorded refs now renders as visibly unlinked instead).
+        .route(
+            "/api/timeline/lineage/{branch_id}",
+            get(crate::handlers::timeline::get_lineage_graph),
+        )
         // Operation-graph view of the same branch — kernel-derived
         // hierarchy (parent = earliest event that produced any of this
         // event's inputs). Consumed by the frontend FeatureTree panel
@@ -9888,6 +10754,18 @@ pub(crate) fn build_router(state: AppState) -> Router {
     };
 
     app.layer(axum::middleware::from_fn(agent_author_layer))
+        // Intent provenance: the same attribution problem as
+        // `agent_author_layer`, for the *why* instead of the *who* — see
+        // that middleware's doc. Scoped per request task, never shared.
+        .layer(axum::middleware::from_fn(agent_intent_layer))
+        // Origin provenance: which CHANNEL initiated the operation (mcp /
+        // rest / websocket / …), the `roshera.origin` counterpart of
+        // `agent_intent_layer`'s `roshera.intent`. Unlike intent, this
+        // layer NEVER passes through unscoped — every request, HTTP by
+        // definition, has SOME channel to report, even if only the honest
+        // `not_determined`. See `agent_origin_layer`'s doc for how `mcp`
+        // vs `rest` is decided.
+        .layer(axum::middleware::from_fn(agent_origin_layer))
         // Observed-agent-activity recorder (`agent_activity`): for any
         // request whose validated credential is a
         // `PrincipalKind::Agent` API key, records what/when/outcome
@@ -9950,6 +10828,146 @@ async fn agent_author_layer(
         }
         _ => next.run(request).await,
     }
+}
+
+/// Attribute kernel ops to the design intent the agent already declared.
+///
+/// The MCP intent gate refuses every solid-mutating call until the agent
+/// opens an intent checkpoint with a real engineering phrase; the MCP
+/// client then sends that phrase on every backend call as
+/// `X-Roshera-Intent` (URL-encoded — it is free text and may contain
+/// non-ASCII) plus `X-Roshera-Intent-Turn`. This layer decodes the phrase
+/// and runs the request inside an `INTENT_OVERRIDE` task-local scope;
+/// `TimelineRecorder::record` reads it synchronously on this same task and
+/// stamps an `IntentFacet` onto each recorded op.
+///
+/// A task-local, NOT `AppState` / a `DashMap` / any shared slot: two
+/// concurrent requests carrying different intents would cross-attribute
+/// through an ambient slot, producing provenance that is confidently wrong
+/// — worse than absent. Header absent or undecodable → zero-cost
+/// passthrough; the op records with no facet, and that absence stays
+/// absent and legible (never defaulted, never back-filled).
+async fn agent_intent_layer(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let text = request
+        .headers()
+        .get("x-roshera-intent")
+        .and_then(|v| v.to_str().ok())
+        .and_then(decode_intent_header);
+    match text {
+        Some(text) if !text.is_empty() => {
+            let turn_id = request
+                .headers()
+                .get("x-roshera-intent-turn")
+                .and_then(|v| v.to_str().ok())
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned);
+            timeline_engine::recorder_bridge::INTENT_OVERRIDE
+                .scope(
+                    timeline_engine::recorder_bridge::IntentContext { text, turn_id },
+                    next.run(request),
+                )
+                .await
+        }
+        _ => next.run(request).await,
+    }
+}
+
+/// Percent-decode an `X-Roshera-Intent` header value into UTF-8 text.
+///
+/// The MCP client encodes the checkpoint phrase with `encodeURIComponent`
+/// so the header value stays ASCII; this reverses exactly that encoding
+/// (`%XX` escapes; every other byte is literal — `encodeURIComponent`
+/// never emits `+` for a space, so `+` stays `+`). Returns `None` for a
+/// malformed escape or bytes that are not valid UTF-8: an undecodable
+/// intent is treated as ABSENT, never guessed at — fabricated provenance
+/// is worse than none.
+fn decode_intent_header(raw: &str) -> Option<String> {
+    fn hex_val(b: u8) -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            b'A'..=b'F' => Some(b - b'A' + 10),
+            _ => None,
+        }
+    }
+    let bytes = raw.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hi = bytes.get(i + 1).copied().and_then(hex_val)?;
+            let lo = bytes.get(i + 2).copied().and_then(hex_val)?;
+            out.push(hi * 16 + lo);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+/// Attribute kernel ops to the CHANNEL that initiated them.
+///
+/// Every operation `TimelineRecorder` records now carries a `roshera.origin`
+/// facet (see `geometry_engine::operations::recorder::OriginFacet`) — the
+/// gap this closes is that `agent_intent_layer` only scopes `INTENT_OVERRIDE`
+/// when the MCP gate's checkpoint header is present, and the WebSocket /
+/// viewport-bridge / direct-REST channels never carry it at all, so an
+/// absent intent facet was ambiguous: "an agent that should have declared
+/// intent didn't" and "this channel doesn't declare intent" looked
+/// identical. This layer makes the channel explicit and unconditional —
+/// unlike `agent_intent_layer`'s zero-cost passthrough, it ALWAYS scopes
+/// `ORIGIN_OVERRIDE`, because every HTTP request structurally has some
+/// channel to report.
+///
+/// # Distinguishing `mcp` from `rest`
+///
+/// The MCP client (`roshera-mcp/src/core.ts`) is the only caller this
+/// backend knows of that sends BOTH `X-Roshera-Agent` (unconditionally, on
+/// every call) AND a decodable, non-empty `X-Roshera-Intent` (whenever its
+/// client-side intent gate has an open checkpoint). Neither header alone is
+/// a safe signal: `X-Roshera-Agent` is documented on `agent_author_layer`
+/// as sent "by the MCP server and any direct agent caller", and
+/// `X-Roshera-Intent` alone is exactly the signal this task was told NOT to
+/// trust, because nothing stops a hand-rolled REST client from sending it
+/// too. The CONJUNCTION is at least the MCP client's actual, narrower wire
+/// signature — no other known caller (frontend, viewport bridge, WebSocket)
+/// sends either header. It is still a claim the caller makes, not one the
+/// server verifies cryptographically, which is exactly why `OriginFacet`
+/// carries a `basis` field: `Mcp` records `basis: ClientHeader` so a reader
+/// can see this is a self-reported claim, never presented with the same
+/// confidence as a server-observed channel like `Websocket`. Every request
+/// that does not match the conjunction is `Rest` — including a real MCP
+/// call before its first intent checkpoint opens, which is the honest
+/// answer: at that moment the request carries no MCP-distinguishing signal
+/// at all.
+async fn agent_origin_layer(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let has_agent_header = request
+        .headers()
+        .get("x-roshera-agent")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|s| !s.is_empty());
+    let has_intent_header = request
+        .headers()
+        .get("x-roshera-intent")
+        .and_then(|v| v.to_str().ok())
+        .and_then(decode_intent_header)
+        .is_some_and(|s| !s.is_empty());
+    let origin = if has_agent_header && has_intent_header {
+        geometry_engine::operations::recorder::Origin::Mcp
+    } else {
+        geometry_engine::operations::recorder::Origin::Rest
+    };
+    timeline_engine::recorder_bridge::ORIGIN_OVERRIDE
+        .scope(origin, next.run(request))
+        .await
 }
 
 /// Construct the outermost CORS layer.

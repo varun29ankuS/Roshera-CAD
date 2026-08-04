@@ -166,15 +166,22 @@ check("different args do NOT collide with the cached refusal", () => {
   assert.equal(r3.content.length, 1, "fresh refusal, no cache note");
 });
 
+// The refusal probe used to be `clearance_hole` M8 with no class — that was a
+// genuine refusal until §8-Q6 was DECIDED (`105607ed`, 2026-08-02): the house
+// now answers ISO 273 medium and says whose answer it is. The cache assertion
+// still needs a live refusal, so it moved to a fastener genuinely outside the
+// transcribed table — a named gap, which is the refusal that is meant to
+// survive. Pinning the decided case is a separate check below, so this file
+// cannot go stale the same way twice.
 const k1 = await call("kb_lookup", {
   kind: "reference",
   key: "clearance_hole",
-  args: { fastener: "M8" },
+  args: { fastener: "M99" },
 });
 const k2 = await call("kb_lookup", {
   kind: "reference",
   key: "clearance_hole",
-  args: { fastener: "M8" },
+  args: { fastener: "M99" },
 });
 const k3 = await call("kb_lookup", {
   kind: "reference",
@@ -187,6 +194,27 @@ check("kb_lookup refusal cached on identical re-issue; answered args pass", () =
   assert.match(k2.content[1].text, /refusal cache/);
   assert.equal(firstJson(k3).refused, undefined);
   assert.equal(firstJson(k3).value.diameter_mm, 8.4);
+  assert.equal(firstJson(k3).value.class_source, "explicit");
+});
+
+// §8-Q6 is decided, and the answer says whose answer it is. An unclassed
+// lookup must ANSWER (not refuse) and must mark the class as the house's
+// choice, never the engineer's — a bare diameter cannot tell those apart.
+const k4 = await call("kb_lookup", {
+  kind: "reference",
+  key: "clearance_hole",
+  args: { fastener: "M8" },
+});
+check("unclassed clearance_hole answers ISO 273 medium and attributes the choice", () => {
+  assert.equal(firstJson(k4).refused, undefined);
+  assert.equal(firstJson(k4).value.diameter_mm, 9.0);
+  assert.equal(firstJson(k4).value.class, "medium");
+  assert.equal(firstJson(k4).value.series, "medium");
+  assert.equal(
+    firstJson(k4).value.class_source,
+    "house_default",
+    "an unrequested class must be attributed to the house, never read as the engineer's decision",
+  );
 });
 
 // ─── 2b. checkpoint name quality + auto notebook mirror ─────────────────────

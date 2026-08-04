@@ -110,6 +110,37 @@ pub enum DurabilityStatus {
 /// A shared, mutable durability status handle carried in `AppState`.
 pub type SharedDurabilityStatus = Arc<RwLock<DurabilityStatus>>;
 
+/// Document-level durability disclosure for agent-facing reads (the #39
+/// follow-up: an agent asking "what parts exist" / "what happened" got a
+/// clean answer on a QUARANTINED document — `/api/durability/status` and
+/// `manifest.durability` (the evidence pack) reported the break honestly,
+/// but nothing on the agent's own read surfaces did). `None` in the common
+/// case — durability disabled, empty, a full clean replay, or even a boot
+/// `Failed` (a distinct fact, out of scope here: see the caller) — so a
+/// non-quarantined response is byte-for-byte unchanged. `Some` carries the
+/// FULL [`DurabilityStatus::Quarantined`] variant, never a bare bool:
+/// "unquarantined" and "durability disabled" are different facts, and a
+/// consumer that only learns "false" cannot tell them apart.
+pub fn quarantine_disclosure(status: &DurabilityStatus) -> Option<&DurabilityStatus> {
+    match status {
+        DurabilityStatus::Quarantined { .. } => Some(status),
+        _ => None,
+    }
+}
+
+/// Async counterpart of [`quarantine_disclosure`] for the mutating-op path
+/// (`certified_response` in `main.rs`). Reads `state.durability_status`,
+/// clones it, and drops the guard before returning — the read never spans a
+/// caller's own `.await` — then applies the same disclosure rule the
+/// `GET /perception` and `GET /timeline/history` reads already use, so a
+/// `create_box`/`boolean`/`fillet_edges` response on a quarantined document
+/// discloses the same fact those dedicated reads do, not just an agent that
+/// happens to call them separately.
+pub async fn disclosure(state: &AppState) -> Option<DurabilityStatus> {
+    let status = state.durability_status.read().await.clone();
+    quarantine_disclosure(&status).cloned()
+}
+
 /// The kernel kind of a recorded operation — `create_box_3d`, `boolean_union`,
 /// `loft_profiles`, … For `Operation::Generic` (how the kernel bridge encodes
 /// every recorded kernel call) this is the `command_type` verbatim; otherwise
@@ -128,7 +159,10 @@ fn operation_kind(op: &Operation) -> String {
 /// The whole event is stored (losslessly) in `data`; the scalar columns are
 /// for ordering (`sequence_number`), indexing (`branch_id`), and honest
 /// reporting (`event_type`).
-fn to_event_data(event: &TimelineEvent, session_id: &str) -> Result<TimelineEventData, String> {
+pub(crate) fn to_event_data(
+    event: &TimelineEvent,
+    session_id: &str,
+) -> Result<TimelineEventData, String> {
     let data = serde_json::to_value(event)
         .map_err(|e| format!("failed to serialize timeline event: {e}"))?;
     Ok(TimelineEventData {

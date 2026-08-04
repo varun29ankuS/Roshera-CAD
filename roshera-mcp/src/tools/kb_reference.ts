@@ -13,8 +13,10 @@
  * below are transcriptions of the published standards' tables, not
  * clause-verified against a purchased edition — every ISO-sourced answer
  * carries that caveat in `source_note`. Items the doc marks [V] needs-house-decision
- * or vendor-conflicting (house clearance class Q6, house tolerance class Q1,
- * K-factor by material, house stock list) REFUSE rather than default.
+ * or vendor-conflicting (house tolerance class Q1, K-factor by material, house
+ * stock list) REFUSE rather than default. §8-Q6 (clearance class) is the one
+ * that has since been DECIDED — it now answers, and attributes the answer to
+ * the house rather than to the caller.
  */
 
 export interface RefAnswer {
@@ -78,6 +80,23 @@ const ISO273: Record<string, [number, number, number]> = {
   M24: [25.0, 26.0, 28.0],
 };
 
+/**
+ * The house clearance class — architecture doc §8-Q6, DECIDED 2026-08-02 (Varun):
+ * ISO 273 medium. M8 → 9.0 mm.
+ *
+ * This was deliberately left open, and refusing was right while it was: an
+ * agent that invents a clearance diameter is worse than one that stops. But an
+ * open question has a running cost, and this one's came due — it blocked a live
+ * agent build, and the agent correctly escalated rather than guess. Medium is
+ * the general-engineering choice: it absorbs real hole-position error and
+ * fixture slop without the sloppy location of the coarse series.
+ *
+ * Closing it moves the honesty from "refuse to answer" to "answer and say whose
+ * answer it is" — see `class_source` below. Do not turn this into a bare
+ * default that reads like the engineer chose it.
+ */
+const HOUSE_CLEARANCE_CLASS = "medium";
+
 // class name → [column index, ISO series name]
 const CLEARANCE_CLASS: Record<string, [number, string]> = {
   close: [0, "fine"],
@@ -99,13 +118,10 @@ function clearanceHole(args: Record<string, unknown>): RefResult {
     );
   }
   const clsRaw = args.class;
-  if (clsRaw === undefined || clsRaw === null || String(clsRaw).length === 0) {
-    return refuse(
-      "no house-wide clearance class exists — architecture doc §8-Q6 (close vs medium vs free) is OPEN, needs a house decision; pass args.class explicitly per task rather than inheriting a silent default",
-      { open_question: "architecture doc §8-Q6", valid_keys: Object.keys(CLEARANCE_CLASS) },
-    );
-  }
-  const cls = CLEARANCE_CLASS[String(clsRaw).toLowerCase()];
+  const asked = !(clsRaw === undefined || clsRaw === null || String(clsRaw).length === 0);
+  const requested = asked ? String(clsRaw).toLowerCase() : HOUSE_CLEARANCE_CLASS;
+
+  const cls = CLEARANCE_CLASS[requested];
   if (!cls) {
     return refuse(`unknown clearance class '${String(clsRaw)}'`, {
       valid_keys: Object.keys(CLEARANCE_CLASS),
@@ -113,8 +129,18 @@ function clearanceHole(args: Record<string, unknown>): RefResult {
   }
   const [idx, series] = cls;
   return answer(
-    { diameter_mm: row[idx], class: String(clsRaw).toLowerCase(), series },
-    `ISO 273 ${series} series (requested as '${String(clsRaw)}'), ${fastener}`,
+    {
+      diameter_mm: row[idx],
+      class: requested,
+      series,
+      // Which of us chose. An engineer reviewing the part needs to know whether
+      // this diameter is a decision they made or one the house made for them;
+      // a bare number cannot tell them apart.
+      class_source: asked ? "explicit" : "house_default",
+    },
+    asked
+      ? `ISO 273 ${series} series (requested as '${String(clsRaw)}'), ${fastener}`
+      : `ISO 273 ${series} series, ${fastener} — no class was requested, so the house default '${HOUSE_CLEARANCE_CLASS}' applied (architecture doc §8-Q6, decided 2026-08-02)`,
     TRANSCRIPTION_NOTE,
   );
 }

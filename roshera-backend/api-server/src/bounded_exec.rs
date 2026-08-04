@@ -372,8 +372,9 @@ mod tests {
 
     #[test]
     fn parse_secs_var_rejects_zero_and_garbage() {
-        // Serialize env access across the whole test to avoid cross-test
-        // interference on the shared process environment.
+        // Isolation comes from the variable NAME, not a lock: this dedicated
+        // key is read and written only by this test, so no other test in the
+        // process can observe or disturb it.
         let name = "ROSHERA_TEST_BOUNDED_SECS_PARSE";
         std::env::set_var(name, "0");
         assert_eq!(parse_secs_var(name), None, "0 disables → treated as unset");
@@ -387,16 +388,35 @@ mod tests {
 
     #[test]
     fn resolve_class_precedence_class_over_global_over_default() {
-        // Class-specific wins over global.
-        assert_eq!(
-            resolve_class(OpClass::Boolean, Some(99)).as_secs(),
-            // No class env set in this process → falls to the global 99.
-            99
-        );
-        // No env at all → compiled default.
-        assert_eq!(
-            resolve_class(OpClass::Other, None),
-            Duration::from_secs(120)
-        );
+        // `resolve_class` reads the production per-class env vars, so this
+        // test ESTABLISHES the state it depends on instead of assuming it:
+        // under the shared process-env lock it snapshots and removes all
+        // three class keys, resolves, restores the snapshot, and only then
+        // asserts — so a red run cannot leave the process env dirty for
+        // tests that run after it.
+        let _guard = crate::ai_provider_config::process_env_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let keys = [
+            OpClass::Boolean.env_key(),
+            OpClass::Blend.env_key(),
+            OpClass::Other.env_key(),
+        ];
+        let snapshot = keys.map(std::env::var_os);
+        for key in keys {
+            std::env::remove_var(key);
+        }
+        let boolean_with_global = resolve_class(OpClass::Boolean, Some(99));
+        let other_no_env = resolve_class(OpClass::Other, None);
+        for (key, saved) in keys.iter().zip(snapshot) {
+            match saved {
+                Some(val) => std::env::set_var(key, val),
+                None => std::env::remove_var(key),
+            }
+        }
+        // Class key removed → class-specific absent, the global 99 wins.
+        assert_eq!(boolean_with_global.as_secs(), 99);
+        // No class key, no global → compiled-in default.
+        assert_eq!(other_no_env, Duration::from_secs(120));
     }
 }

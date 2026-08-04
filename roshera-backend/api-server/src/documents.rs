@@ -26,7 +26,7 @@ use std::sync::Arc;
 use axum::extract::{Path, State};
 use axum::response::Json;
 use serde::{Deserialize, Serialize};
-use session_manager::{DatabasePersistence, DocumentRecord};
+use session_manager::{BranchRecord, DatabasePersistence, DocumentRecord};
 use timeline_engine::{Author, BranchId, Timeline, TimelineConfig};
 use uuid::Uuid;
 
@@ -115,6 +115,29 @@ fn validate_name(name: &str) -> Result<String, ApiError> {
     Ok(trimmed.to_string())
 }
 
+/// Registry write shared by [`create_document`] and
+/// [`import_ros_document`]: mint a fresh id and persist the catalog row.
+/// Pure registration — the live model is untouched and nothing is
+/// activated.
+async fn register(
+    state: &AppState,
+    name: String,
+    author: &Author,
+) -> Result<DocumentRecord, ApiError> {
+    let record = DocumentRecord {
+        id: Uuid::new_v4().to_string(),
+        name,
+        created_at: now_ms(),
+        created_by: author_display(author),
+    };
+    state
+        .database
+        .save_document(&record)
+        .await
+        .map_err(|e| internal_db_error("save document", e))?;
+    Ok(record)
+}
+
 /// `POST /api/documents` — register a new, empty document. Does not
 /// activate it; call `POST /api/documents/{id}/open` to make it live.
 pub async fn create_document(
@@ -123,7 +146,6 @@ pub async fn create_document(
     body: Option<Json<CreateDocumentRequest>>,
 ) -> Result<Json<DocumentView>, ApiError> {
     let body = body.map(|Json(b)| b).unwrap_or_default();
-    let id = Uuid::new_v4().to_string();
     let name = body
         .name
         .as_deref()
@@ -132,17 +154,7 @@ pub async fn create_document(
         .unwrap_or("Untitled")
         .to_string();
     let author = crate::handlers::timeline::author_from_auth_info(&auth_info);
-    let record = DocumentRecord {
-        id,
-        name,
-        created_at: now_ms(),
-        created_by: author_display(&author),
-    };
-    state
-        .database
-        .save_document(&record)
-        .await
-        .map_err(|e| internal_db_error("save document", e))?;
+    let record = register(&state, name, &author).await?;
     let active_id = state.active_document.read().await.clone();
     Ok(Json(to_view(record, &active_id)))
 }
@@ -185,6 +197,206 @@ pub async fn open_document(
     }
     let status = activate(&state, &id).await;
     Ok(Json(status))
+}
+
+/// `POST /api/documents/import_ros` — import a native `.ros` file AS a
+/// new document.
+///
+/// Request: `{ "path" | "filename", "password"?, "name"? }` — the same
+/// file-location contract as `/api/geometry/import_ros` (shared reader:
+/// [`crate::read_ros_import_request`], so the traversal guard, size
+/// ceiling, and error contract cannot drift). Where that route splices
+/// the file's GEOMETRY into the live model and merely REPORTS the
+/// HIST/PROV payload, this one ingests the history itself:
+///
+///   1. the file's branches and events are persisted VERBATIM under a
+///      freshly registered document id — sequence numbers untouched.
+///      Persistent ids derive from `evt:{sequence_number}`, so a FRESH
+///      document is the one place a foreign timeline can land with every
+///      recorded pid preserved: no merge, no resequencing, no
+///      collisions. (Merging into a document that already has events
+///      would rebase sequences and break every pid — permanently out of
+///      scope, by design.)
+///   2. the document is activated through [`activate`] — the ONE path
+///      that already flushes the recorder, resets in-memory state, and
+///      replays a document's persisted log ([`durability::boot_replay`],
+///      which rehydrates branches, then events, via
+///      `Timeline::rehydrate_branch` / `rehydrate_events`) — so an
+///      imported document is indistinguishable from a natively authored
+///      one, restart included.
+///
+/// Honesty: the response's `history` field is the replay's
+/// [`durability::DurabilityStatus`] verbatim — `active` for a clean full
+/// replay; `empty` for a file whose HIST is empty (imported as a
+/// document with no history, never refused, never back-filled from the
+/// GEOM snapshot); `quarantined` (clean prefix served, first break
+/// named) when the file's HIST does not replay cleanly. `success` is
+/// true only for a clean full replay or a genuinely empty history. The
+/// GEOM snapshot's presence is reported (`geom_snapshot`) but the
+/// snapshot itself is not materialised here — a document IS its event
+/// log, and fabricating events from a snapshot would be a lie.
+pub async fn import_ros_document(
+    State(state): State<AppState>,
+    auth_info: AuthInfo,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let ros = crate::read_ros_import_request(&state, &payload).await?;
+
+    // Pre-flight the HIST payload BEFORE anything is registered, so a
+    // corrupt file leaves no half-imported document behind.
+    // `Timeline::rehydrate_events` requires events pre-sorted by
+    // `sequence_number` (done here) and errors loudly on a branch it
+    // does not know — that error is surfaced as a typed refusal up
+    // front, never papered over after rows are written.
+    let mut events = ros.timeline;
+    events.sort_by_key(|e| e.sequence_number);
+    if let Some(dup) = events
+        .windows(2)
+        .find(|w| w[0].sequence_number == w[1].sequence_number)
+    {
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            format!(
+                ".ros HIST carries sequence number {} more than once — refusing \
+                 the import (rehydration keys events by sequence number, so a \
+                 duplicate would silently drop one of the events)",
+                dup[0].sequence_number
+            ),
+        ));
+    }
+    let known_branches: std::collections::HashSet<BranchId> = ros
+        .branches
+        .iter()
+        .map(|m| m.id)
+        .chain(std::iter::once(BranchId::main()))
+        .collect();
+    if let Some(orphan) = events
+        .iter()
+        .find(|e| !known_branches.contains(&e.metadata.branch_id))
+    {
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            format!(
+                ".ros HIST event (sequence {}) belongs to branch {}, which the \
+                 file's branch manifest does not declare — refusing the import \
+                 rather than rehydrating events into a branch that does not exist",
+                orphan.sequence_number, orphan.metadata.branch_id
+            ),
+        ));
+    }
+
+    // Document name: caller-supplied (validated like every other document
+    // name), else the file stem, else a plain default.
+    let name = match payload.get("name").and_then(|v| v.as_str()) {
+        Some(n) => validate_name(n)?,
+        None => payload
+            .get("path")
+            .or_else(|| payload.get("filename"))
+            .and_then(|v| v.as_str())
+            .and_then(|p| std::path::Path::new(p).file_stem())
+            .map(|s| s.to_string_lossy().to_string())
+            .and_then(|s| validate_name(&s).ok())
+            .unwrap_or_else(|| "Imported document".to_string()),
+    };
+
+    let author = crate::handlers::timeline::author_from_auth_info(&auth_info);
+    let record = register(&state, name, &author).await?;
+
+    // Persist the imported branches, then the imported events, under the
+    // new document id — the same rows a natively authored document
+    // writes, so `activate`'s replay (and every future boot) restores
+    // them through the ONE existing path. `main` needs no record: every
+    // timeline is born with it (`rehydrate_branch` skips it by design).
+    let persist_result: Result<(), ApiError> = async {
+        for manifest in &ros.branches {
+            if manifest.id == BranchId::main() {
+                continue;
+            }
+            let branch_record = BranchRecord {
+                session_id: record.id.clone(),
+                branch_id: manifest.id.to_string(),
+                parent_branch_id: manifest.parent.map(|p| p.to_string()),
+                fork_sequence: manifest.fork_point.event_index as i64,
+                name: manifest.name.clone(),
+                data: serde_json::json!({ "created_by": manifest.metadata.created_by }),
+            };
+            state
+                .database
+                .save_branch(&branch_record)
+                .await
+                .map_err(|e| internal_db_error("persist imported branch", e))?;
+        }
+        for event in &events {
+            let data = durability::to_event_data(event, &record.id).map_err(|e| {
+                ApiError::new(
+                    ErrorCode::Internal,
+                    format!("failed to serialize imported event: {e}"),
+                )
+            })?;
+            state
+                .database
+                .save_timeline_event(&record.id, &data)
+                .await
+                .map_err(|e| internal_db_error("persist imported event", e))?;
+        }
+        Ok(())
+    }
+    .await;
+    if let Err(e) = persist_result {
+        // Roll the half-written document back (transactional delete of
+        // the registry row plus every scoped timeline/branch row) so a
+        // failed import leaves nothing behind — not a phantom document
+        // with a truncated history.
+        if let Err(del) = state.database.delete_document(&record.id).await {
+            tracing::error!(
+                target: "documents",
+                document = %record.id,
+                error = %del,
+                "documents: failed to roll back a partially imported document"
+            );
+        }
+        return Err(e);
+    }
+
+    // Activate through the one code path that already gets a document
+    // switch right: recorder flush, in-memory reset, branch-then-event
+    // rehydration (ids and sequences byte-identical), geometry replay,
+    // recorder re-attach.
+    let status = activate(&state, &record.id).await;
+
+    let events_len = events.len();
+    let replayed_clean = match &status {
+        durability::DurabilityStatus::Active { events_replayed } => *events_replayed == events_len,
+        durability::DurabilityStatus::Empty => events_len == 0,
+        _ => false,
+    };
+    let history = serde_json::to_value(&status).map_err(|e| {
+        ApiError::new(
+            ErrorCode::Internal,
+            format!("failed to serialize durability status: {e}"),
+        )
+    })?;
+
+    let active_id = state.active_document.read().await.clone();
+    Ok(Json(serde_json::json!({
+        "success": replayed_clean,
+        "document": to_view(record, &active_id),
+        "history": history,
+        "file_contents": {
+            "hist_event_count": events_len,
+            "hist_branch_count": ros.branches.len(),
+            "prov_command_count": ros.aipr.commands.len(),
+            "prov_session_id": ros.aipr.session,
+            "signature": crate::ros_signature_json(&ros.signature),
+        },
+        "geom_snapshot": {
+            "present": ros.snapshot.is_some(),
+            "materialised": false,
+            "note": "a document is its event log — geometry comes from replaying \
+                     HIST. To splice this file's GEOM snapshot into the live \
+                     model instead, use POST /api/geometry/import_ros.",
+        },
+    })))
 }
 
 /// Wire shape for `PATCH /api/documents/{id}`.

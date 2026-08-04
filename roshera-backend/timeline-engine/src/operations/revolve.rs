@@ -109,7 +109,7 @@ impl OperationImpl for RevolveOp {
             // Find all loops in the sketch
             let mut sketch_loops = Vec::new();
             // LoopStore doesn't implement Iterator, so we need to iterate by ID
-            for loop_id in 0..sketch_brep.loops.len() {
+            for loop_id in 0..sketch_brep.loops.slot_count() {
                 if let Some(_loop) = sketch_brep.loops.get(loop_id as u32) {
                     sketch_loops.push(loop_id as u32);
                 }

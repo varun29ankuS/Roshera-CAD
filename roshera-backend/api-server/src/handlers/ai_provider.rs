@@ -1116,12 +1116,66 @@ mod tests {
         );
     }
 
+    /// `openai`/`api_key` was seam-only when this suite was written; it is
+    /// `WiringStatus::Wired` today, through goose's native OpenAI provider
+    /// (see that entry in `allowlist.rs` and its line in
+    /// `KNOWN_WIRED_PATHS`). So the request no longer stops at a by-name
+    /// refusal — it reaches `validate_api_key`, which makes an absent key a
+    /// missing parameter and a supplied key an unverified acceptance on the
+    /// same precedent as `xai` above.
     #[tokio::test]
-    async fn put_provider_refuses_openai_api_key_seam_only() {
-        let payload = request("openai", "api_key");
+    async fn put_provider_openai_api_key_is_wired_not_refused_by_name() {
+        let missing = request("openai", "api_key");
+        let err = validate_request(&missing).await.unwrap_err();
+        assert_eq!(
+            err.code,
+            ErrorCode::MissingParameter,
+            "openai/api_key is wired, so an absent key must fail as a missing \
+             parameter — a by-name refusal here would mean the allowlist had \
+             silently regressed to seam-only"
+        );
+
+        let mut supplied = request("openai", "api_key");
+        supplied.api_key = Some("fake-openai-key".to_string());
+        match validate_request(&supplied)
+            .await
+            .expect("openai/api_key must validate without a network probe")
+        {
+            Validated::ApiKey {
+                provider,
+                key,
+                model,
+                model_verified,
+            } => {
+                assert_eq!(provider, "openai");
+                assert_eq!(key, "fake-openai-key");
+                assert_eq!(model, None, "no model requested must stay None");
+                assert_eq!(
+                    model_verified, None,
+                    "no credential-check client exists for openai, and no model \
+                     was requested, so there is nothing to report verified for"
+                );
+            }
+            other => panic!("expected Validated::ApiKey, got {other:?}"),
+        }
+    }
+
+    /// The openai seam that does remain: `subscription_cli` (Codex) is
+    /// `SeamOnly` in this build and must still be refused by name. Consent
+    /// is granted here so the refusal proves the seam rather than the
+    /// consent gate — `validate_request` checks seam-only first, and this
+    /// test would still pass if that order ever inverted.
+    #[tokio::test]
+    async fn put_provider_refuses_openai_subscription_cli_seam_only() {
+        let mut payload = request("openai", "subscription_cli");
+        payload.consent_spawn_local_process = true;
         let err = validate_request(&payload).await.unwrap_err();
         assert_eq!(err.code, ErrorCode::AiProviderRefused);
-        assert!(err.error.contains("seam-only"));
+        assert!(
+            err.error.contains("seam-only"),
+            "refusal must name the seam, got: {}",
+            err.error
+        );
     }
 
     #[tokio::test]

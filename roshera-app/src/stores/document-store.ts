@@ -23,10 +23,9 @@
  * What it DOES re-fetch after the backend confirms the switch:
  *  - The scene (`refreshSceneFromServer`, `lib/ws-bridge.ts`) — same primitive
  *    the WS reconnect path uses for a full scene resync.
- *  - The Blackboard's active-scope notebook (`syncActiveScope`,
- *    `lib/blackboard-api.ts`) — the scope KEY doesn't change (the backend
- *    resolves "document" scope against its own global `active_document`), so
- *    this is a plain re-fetch, not a scope swap.
+ *  - The Blackboard's one document notebook (`syncNotebook`,
+ *    `lib/blackboard-api.ts`) — the backend resolves it against its own
+ *    global `active_document`, so this is a plain re-fetch, nothing to swap.
  *  - The document list itself, so every tab's `active` flag is current.
  *
  * What it DOES reset: the ACP agent session (`resetAcpClient`,
@@ -53,7 +52,7 @@
 import { create } from 'zustand'
 import { createDocument, listDocuments, openDocument, type DocumentInfo } from '@/lib/documents-api'
 import { refreshSceneFromServer } from '@/lib/ws-bridge'
-import { syncActiveScope } from '@/lib/blackboard-api'
+import { syncNotebook } from '@/lib/blackboard-api'
 import { resetAcpClient } from '@/lib/acp-blackboard'
 
 export interface DocumentSwitchResult {
@@ -117,7 +116,7 @@ export const useDocumentStore = create<DocumentStoreState>((set, get) => ({
       // already posts a Blackboard line on failure); we still complete the
       // switch rather than leaving the UI half-migrated, since the backend
       // has already committed to the new document regardless.
-      const [docs] = await Promise.all([listDocuments(), refreshSceneFromServer(), syncActiveScope()])
+      const [docs] = await Promise.all([listDocuments(), refreshSceneFromServer(), syncNotebook()])
       set((state) => ({ documents: docs, switchingId: null, epoch: state.epoch + 1 }))
       return { success: true }
     } catch (err) {

@@ -104,7 +104,7 @@ export function useTurnQueue(): readonly QueuedTurn[] {
   return useSyncExternalStore(subscribeTurnQueue, getTurnQueue)
 }
 
-// ── Draft persistence (per notebook scope) ───────────────────────────
+// ── Draft persistence (the one document notebook) ────────────────────
 
 type StorageLike = Pick<Storage, 'getItem' | 'setItem' | 'removeItem'>
 
@@ -112,17 +112,12 @@ function defaultStorage(): StorageLike | null {
   return typeof window === 'undefined' ? null : window.localStorage
 }
 
-const DRAFT_PREFIX = 'roshera.blackboard.composer-draft.v1'
+const DRAFT_KEY = 'roshera.blackboard.composer-draft.v1.document'
 
-/** Pure; exported for the real-module test. */
-export function draftStorageKey(scope: string): string {
-  return `${DRAFT_PREFIX}.${scope}`
-}
-
-export function loadDraft(scope: string, storage: StorageLike | null = defaultStorage()): string {
+export function loadDraft(storage: StorageLike | null = defaultStorage()): string {
   if (!storage) return ''
   try {
-    return storage.getItem(draftStorageKey(scope)) ?? ''
+    return storage.getItem(DRAFT_KEY) ?? ''
   } catch {
     return ''
   }
@@ -130,14 +125,13 @@ export function loadDraft(scope: string, storage: StorageLike | null = defaultSt
 
 /** A blank draft is REMOVED, not stored — an empty key is not a draft. */
 export function saveDraft(
-  scope: string,
   text: string,
   storage: StorageLike | null = defaultStorage(),
 ): void {
   if (!storage) return
   try {
-    if (text === '') storage.removeItem(draftStorageKey(scope))
-    else storage.setItem(draftStorageKey(scope), text)
+    if (text === '') storage.removeItem(DRAFT_KEY)
+    else storage.setItem(DRAFT_KEY, text)
   } catch {
     // Quota/private-mode failure — the in-memory draft still lives in the
     // composer's own state for this session.

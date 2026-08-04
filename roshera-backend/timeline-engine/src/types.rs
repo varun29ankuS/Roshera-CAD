@@ -732,7 +732,15 @@ pub enum ModificationType {
     Custom(String),
 }
 
-/// Types of entities
+/// Types of entities.
+///
+/// This set must cover **every** kind tag the kernel's recorder can emit
+/// (`geometry_engine::operations::recorder::ENTITY_*`), because
+/// [`kernel_ref`](crate::kernel_ref) maps a recorded `"<kind>:<id>"` ref onto
+/// it and refuses — rather than coerces — any kind it cannot express. A kind
+/// missing here is a `face:9` silently filed as a solid, so the two tables in
+/// `kernel_ref` (`wire_tag` / `kind_code`) are kept exhaustive and are pinned
+/// by `kernel_ref::tests::every_entity_type_round_trips`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum EntityType {
     /// 2D sketch
@@ -751,6 +759,16 @@ pub enum EntityType {
     Face,
     /// Vertex
     Vertex,
+    /// Face loop (`BRepModel::loops`)
+    Loop,
+    /// User-authored datum (`BRepModel::datums`)
+    Datum,
+    /// Top-level assembly (`AssemblyManager`-owned)
+    Assembly,
+    /// One occurrence of a solid inside an assembly
+    Component,
+    /// One constraint between two assembly references
+    Mate,
 }
 
 /// Validation requirements

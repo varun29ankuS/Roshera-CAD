@@ -425,10 +425,10 @@ fn find_face_intersections(
 
     // Check all face pairs
     // FaceStore doesn't implement Iterator, so iterate by ID
-    for face_a_idx in 0..brep_a.faces.len() {
+    for face_a_idx in 0..brep_a.faces.slot_count() {
         let face_a_id = face_a_idx as u32;
         if let Some(_face_a) = brep_a.faces.get(face_a_id) {
-            for face_b_idx in 0..brep_b.faces.len() {
+            for face_b_idx in 0..brep_b.faces.slot_count() {
                 let face_b_id = face_b_idx as u32;
                 if let Some(_face_b) = brep_b.faces.get(face_b_id) {
                     if let Some(curves) = intersect_faces(brep_a, face_a_id, brep_b, face_b_id)? {
@@ -516,7 +516,7 @@ fn split_faces_at_intersections(
     let mut split_faces_b = Vec::new();
 
     // For each face in A, split by all intersection curves
-    for face_idx in 0..brep_a.faces.len() {
+    for face_idx in 0..brep_a.faces.slot_count() {
         let face_id = face_idx as u32;
         if let Some(_face) = brep_a.faces.get(face_id) {
             let mut face_intersections = Vec::new();
@@ -545,7 +545,7 @@ fn split_faces_at_intersections(
     }
 
     // Same for faces in B
-    for face_idx in 0..brep_b.faces.len() {
+    for face_idx in 0..brep_b.faces.slot_count() {
         let face_id = face_idx as u32;
         if let Some(_face) = brep_b.faces.get(face_id) {
             let mut face_intersections = Vec::new();
@@ -861,7 +861,7 @@ fn classify_point_wrt_solid(point: Point3, brep: &BRepModel) -> TimelineResult<F
     let mut intersection_count = 0;
 
     // FaceStore doesn't implement Iterator, iterate by index
-    for idx in 0..brep.faces.len() {
+    for idx in 0..brep.faces.slot_count() {
         let face_id = idx as u32;
         if let Some(_face) = brep.faces.get(face_id) {
             let vertices = get_face_vertices(brep, face_id)?;

@@ -130,6 +130,35 @@ pub enum ErrorCode {
     /// The kernel returned a non-solid handle where a solid was
     /// expected (e.g. a primitive constructor returned a Face).
     KernelReturnedWrongType,
+    /// **Honesty gate.** A mutating operation was refused because the
+    /// solid it would stack work onto is UNSOUND by the kernel's LIVE
+    /// verdict (`certify_solid().is_sound() == false`). Every certificate
+    /// downstream of a defective base inherits the defect, so the base
+    /// must be repaired or rolled back first — otherwise an agent builds
+    /// on a lie and the whole self-certifying story collapses.
+    ///
+    /// The rule was previously enforced ONLY in the MCP client
+    /// (`roshera-mcp/src/gates.ts`), which made it a linter rather than a
+    /// gate: an agent that spoke plain REST simply declined to use it.
+    /// This code is the server-side enforcement, applied to every
+    /// base-taking geometry mutation.
+    ///
+    /// **Escape hatch (deliberate, documented):** `acknowledge_unsound:
+    /// true` in the request body proceeds anyway. That is the correct
+    /// call for a repair flow — a boolean used to heal an open shell, a
+    /// rebuild from a known-good state. An agent that knowingly proceeds
+    /// is behaving correctly; one that does so UNKNOWINGLY is the defect
+    /// this code exists to prevent. `hint` always names the flag.
+    ///
+    /// Mapped to HTTP 409 (a state conflict, not a malformed value — the
+    /// request is well-formed and the parameters are fine; the MODEL is in
+    /// a state that forbids the operation). Non-retryable: the identical
+    /// call against the identical state earns the identical refusal. It
+    /// becomes possible again only after the base changes — and because
+    /// the verdict is re-read live on every call, a repair by ANY author
+    /// unblocks the very next request with no restart and no cache flush.
+    /// `details` carries `gate`, `solid_id`, `verdict`, and `operation`.
+    UnsoundBase,
 
     // ── Idempotency layer ─────────────────────────────────────────
     /// `Idempotency-Key` header was sent with an empty value.
@@ -303,7 +332,11 @@ impl ErrorCode {
             | ErrorCode::SketchConstraintConflict
             | ErrorCode::DocumentDeleteRefusedActive
             | ErrorCode::DocumentDeleteRefusedLast
-            | ErrorCode::DocumentDeleteRefusedDefault => StatusCode::CONFLICT,
+            | ErrorCode::DocumentDeleteRefusedDefault
+            // The request is well-formed and its parameters are valid —
+            // the MODEL is in a state that forbids the operation. That is
+            // a conflict, not a bad value, so 409 rather than 422.
+            | ErrorCode::UnsoundBase => StatusCode::CONFLICT,
             ErrorCode::IdempotencyBodyTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
 
             // Well-formed request, semantically unacceptable value —
@@ -399,6 +432,11 @@ impl ErrorCode {
             // non-retryable by the same rule as a caller-supplied
             // infeasibility.
             | ErrorCode::OpTimeout
+            // An intentional refusal, not a transient failure: the same
+            // call against the same model state earns the same answer, so
+            // a blind retry is pure waste. The caller must either repair
+            // the base or re-issue with `acknowledge_unsound: true`.
+            | ErrorCode::UnsoundBase
             | ErrorCode::PermissionDenied
             | ErrorCode::MethodNotAllowed => false,
 
@@ -431,6 +469,7 @@ impl ErrorCode {
             ErrorCode::SolidNotFound => "solid_not_found",
             ErrorCode::PartNotFound => "part_not_found",
             ErrorCode::KernelReturnedWrongType => "kernel_returned_wrong_type",
+            ErrorCode::UnsoundBase => "unsound_base",
             ErrorCode::IdempotencyKeyEmpty => "idempotency_key_empty",
             ErrorCode::IdempotencyKeyTooLong => "idempotency_key_too_long",
             ErrorCode::IdempotencyKeyReused => "idempotency_key_reused",
@@ -479,6 +518,7 @@ impl ErrorCode {
             ErrorCode::SolidNotFound,
             ErrorCode::PartNotFound,
             ErrorCode::KernelReturnedWrongType,
+            ErrorCode::UnsoundBase,
             ErrorCode::IdempotencyKeyEmpty,
             ErrorCode::IdempotencyKeyTooLong,
             ErrorCode::IdempotencyKeyReused,
@@ -733,6 +773,52 @@ impl ApiError {
             format!("solid {solid_id} not found"),
         )
         .with_details(serde_json::json!({ "solid_id": solid_id }))
+    }
+
+    /// **The unsound-base refusal.** A mutating operation would stack
+    /// work onto `solid_id`, whose LIVE kernel verdict is unsound.
+    ///
+    /// Deliberately mirrors `roshera-mcp/src/gates.ts::
+    /// unsoundBaseGateRefusal` field for field, so an agent that hits the
+    /// client gate and an agent that hits this one get ONE account of the
+    /// condition rather than two:
+    ///
+    /// | this refusal        | `gates.ts`                       |
+    /// |---------------------|----------------------------------|
+    /// | `error`             | `reason`                         |
+    /// | `hint`              | `how_to_proceed`                 |
+    /// | `details.gate`      | `gate`                           |
+    /// | `details.solid_id`  | `unsound_base.part_id`           |
+    /// | `details.verdict`   | `unsound_base.verdict`           |
+    ///
+    /// `verdict` MUST be the string `GET /api/agent/parts/{id}/perception`
+    /// reports for this solid — that endpoint is where `gates.ts` reads
+    /// its own copy, so quoting it verbatim is what makes the two
+    /// refusals agree by construction instead of by hand-synced prose.
+    pub fn unsound_base(operation: &str, solid_id: u32, verdict: &str) -> Self {
+        Self::new(
+            ErrorCode::UnsoundBase,
+            format!(
+                "solid {solid_id} is UNSOUND by the kernel's live verdict \
+                 ({verdict}) — '{operation}' would stack new work onto a \
+                 defective solid, and every downstream certificate would \
+                 inherit the defect."
+            ),
+        )
+        .with_hint(format!(
+            "Diagnose with GET /api/agent/parts/{solid_id}/perception (the full \
+             kernel certificate names the failing dimension), then repair or \
+             roll back before continuing. If THIS operation is itself the \
+             deliberate repair (e.g. a boolean used to heal the shell, a \
+             rebuild from a known-good state), re-issue this exact call with \
+             acknowledge_unsound: true."
+        ))
+        .with_details(serde_json::json!({
+            "gate": "unsound_base",
+            "solid_id": solid_id,
+            "verdict": verdict,
+            "operation": operation,
+        }))
     }
 
     /// `X-Roshera-Part-Id` referenced a part UUID that isn't in the

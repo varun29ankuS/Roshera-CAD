@@ -22,9 +22,36 @@ use crate::primitives::solid::SolidId;
 use crate::primitives::topology_builder::BRepModel;
 use crate::queries::raycast::ray_hit_face_t;
 use crate::queries::raycast_solid;
+use crate::tessellation::surface::LoopUvCache;
 
 use super::projection::{view_matrix_for_projection, ProjectionError};
 use super::types::{Polyline2d, ProjectionType};
+
+/// Test-only instrument: total ray↔trimmed-face tests [`OcclusionGrid::occluded`]
+/// actually executed on this thread (i.e. candidates surviving both the spatial
+/// and depth culls), since the last [`reset_ray_face_test_counter`]. Compiled
+/// only under `#[cfg(test)]` — zero cost and zero surface in production builds.
+///
+/// Exists so a regression test can assert on the WORK DONE, not just wall-clock
+/// time: a wall-clock budget alone caught the `drawing_perf` 11x regression only
+/// because it happened to blow a generous 30s budget on THIS fixture — a smaller
+/// regression, or a faster/loaded machine, would pass a time-only gate while a
+/// cull silently degraded. Thread-local (not a shared `static`) so parallel test
+/// threads never see each other's counts.
+#[cfg(test)]
+thread_local! {
+    static RAY_FACE_TEST_COUNTER: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_ray_face_test_counter() {
+    RAY_FACE_TEST_COUNTER.with(|c| c.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn ray_face_test_counter() -> u64 {
+    RAY_FACE_TEST_COUNTER.with(|c| c.get())
+}
 
 /// Broad-phase occlusion accelerator for HLR (#22 perf).
 ///
@@ -67,6 +94,13 @@ struct OcclusionGrid {
     /// bound is deeper than `m`, the whole face is behind `m` and is skipped.
     /// Indexed by `FaceId as usize`; `f64::NEG_INFINITY` = "never cull".
     near_depth: Vec<f64>,
+    /// Per-view cache of each probed face's trim-loop UV polygon (see
+    /// [`LoopUvCache`]) — a face is probed by [`OcclusionGrid::occluded`] once
+    /// per candidate sample point, and the polygon it rebuilds from scratch
+    /// per probe is the dominant per-test cost (task: `drawing_perf` 11x
+    /// regression root-cause). Scoped to this grid's lifetime, i.e. one view
+    /// of one `&BRepModel` snapshot.
+    poly_cache: LoopUvCache,
 }
 
 impl OcclusionGrid {
@@ -140,6 +174,7 @@ impl OcclusionGrid {
                 cells: vec![all_faces.clone()],
                 all_faces,
                 near_depth,
+                poly_cache: LoopUvCache::new(),
             };
         }
 
@@ -185,6 +220,7 @@ impl OcclusionGrid {
             cells,
             all_faces,
             near_depth,
+            poly_cache: LoopUvCache::new(),
         }
     }
 
@@ -223,7 +259,9 @@ impl OcclusionGrid {
             if self.near_depth[fid as usize] > m_depth + self.eps {
                 continue;
             }
-            if let Some(t) = ray_hit_face_t(model, fid, origin, self.w) {
+            #[cfg(test)]
+            RAY_FACE_TEST_COUNTER.with(|c| c.set(c.get() + 1));
+            if let Some(t) = ray_hit_face_t(model, fid, origin, self.w, &self.poly_cache) {
                 if t < self.back - self.eps {
                     return true;
                 }
@@ -1104,5 +1142,95 @@ mod tests {
         ];
         let shaft = revolve_meridian(&mut m, &profile, RevolveOptions::default()).expect("shaft");
         assert_accel_matches_brute(&m, shaft, "stepped shaft");
+    }
+
+    /// Build the same 300-band "bumpy vase" `tests/drawing_perf.rs` uses to
+    /// reproduce the gear-class HLR stress (hundreds of coaxial curved bands,
+    /// hundreds of circular rim edges).
+    fn bumpy_vase_300(m: &mut BRepModel) -> SolidId {
+        use crate::operations::revolve::{revolve_meridian, RevolveOptions};
+        let bands = 300usize;
+        let height = 100.0_f64;
+        let mut profile: Vec<(f64, f64)> = Vec::with_capacity(bands + 2);
+        profile.push((0.0, 0.0));
+        for k in 0..bands {
+            let z = height * (k as f64 + 1.0) / bands as f64;
+            let r = 20.0 + 6.0 * (k as f64 * 0.7).sin();
+            profile.push((r, z));
+        }
+        profile.push((0.0, height));
+        revolve_meridian(m, &profile, RevolveOptions::default()).expect("bumpy vase")
+    }
+
+    /// Mutation-proven guard for the exact defect the `exact_uv` trim-membership
+    /// fix corrected: HEAD's `Surface::closest_point`-based occlusion test
+    /// clamped a ray hit past a coaxial band's finite rim back onto the rim
+    /// boundary, so floating-point noise at that boundary made almost every OTHER
+    /// band spuriously accept the hit as its own occluder — the front view of
+    /// this fixture classified as `visible=0, hidden=599` (every single edge
+    /// hidden, a degenerate, useless drawing). This test fails on that code and
+    /// passes on the fix: a front view of an axisymmetric solid MUST show both a
+    /// non-empty visible set (the camera-facing hemisphere) and a non-empty
+    /// hidden set (the far hemisphere occluded by the near one).
+    #[test]
+    fn front_view_of_coaxial_solid_is_not_degenerately_hidden() {
+        let mut m = BRepModel::new();
+        let part = bumpy_vase_300(&mut m);
+        let res =
+            project_solid_edges_visibility(&m, part, ProjectionType::Front, 8).expect("front view");
+        assert!(
+            !res.visible.is_empty(),
+            "front view of a coaxial solid must have SOME visible edges — \
+             an all-hidden classification is the false-positive-occluder defect \
+             `Surface::exact_uv` fixed, not a legitimate result"
+        );
+        assert!(
+            !res.hidden.is_empty(),
+            "front view of a coaxial solid must have SOME hidden edges (the far \
+             hemisphere occluded by the near one) — an all-visible classification \
+             means occlusion isn't running at all"
+        );
+    }
+
+    /// The broad-phase spatial + depth cull must keep narrowing candidates the
+    /// way its soundness note promises: most of the model's faces must be culled
+    /// before the expensive trimmed ray test runs. This is what a wall-clock
+    /// budget alone cannot catch on a fast or quiet machine — if a future change
+    /// silently defeats a cull (e.g. a broken depth bound, or a cell resolution
+    /// that stops scaling with face count), the *work done* jumps by an order of
+    /// magnitude while still finishing inside a generous time budget. The exact
+    /// count is correctness-determined by the trim-membership fix (visible points
+    /// on a coaxial part cannot early-out — see the test above) — this is a
+    /// ceiling on candidates-tested-per-probe, not a bound on total probes.
+    #[test]
+    fn occlusion_ray_test_count_stays_bounded() {
+        let mut m = BRepModel::new();
+        let part = bumpy_vase_300(&mut m);
+        let solid = m.solids.get(part).expect("solid");
+        let shell = m.shells.get(solid.outer_shell).expect("shell");
+        let face_count = shell.faces.len();
+
+        reset_ray_face_test_counter();
+        let res =
+            project_solid_edges_visibility(&m, part, ProjectionType::Front, 8).expect("front view");
+        let ray_tests = ray_face_test_counter();
+        let probes = res.visible.len() + res.hidden.len();
+
+        // A brute-force (unaccelerated) test would run one ray test per
+        // candidate against EVERY live face, per probe — `probes * face_count`.
+        // Measured on this fixture: ~81.5k tests / 601 probes / 301 faces ≈ 45%
+        // of that bound (visible-point probes on a coaxial part are inherently
+        // expensive — see the test above — so this is nowhere near the ~7%
+        // "1 face/cell" design target). 70% leaves headroom for machine/fixture
+        // jitter while still catching a cull that has silently degraded toward
+        // the full O(probes · faces) brute-force scan (100%).
+        let brute_force_upper_bound = (probes as u64) * (face_count as u64);
+        assert!(
+            (ray_tests as u128) * 100 < (brute_force_upper_bound as u128) * 70,
+            "occlusion broad-phase did {ray_tests} ray-face tests over {probes} probes \
+             / {face_count} faces — expected well under 70% of the brute-force upper \
+             bound ({brute_force_upper_bound}); the spatial/depth cull may have \
+             silently degraded toward brute force"
+        );
     }
 }

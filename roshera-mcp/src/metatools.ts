@@ -62,56 +62,156 @@ function okMeta(data: Record<string, unknown>) {
 //
 // Small curated equivalence groups. A query token expands to its group-mates,
 // which then match tool names (strongly) or purposes (weakly). Bidirectional:
-// every member maps to every other member of its group.
+// every member maps to every other member of its group. Members are STORED
+// STEMMED (see `stem`), so one entry covers its whole inflection family —
+// "print" covers printed/printing/printable.
 
 const SYNONYM_GROUPS: string[][] = [
-  ["hole", "drill", "bore", "drilled", "counterbore"],
-  ["cut", "difference", "subtract", "remove", "carve"],
-  ["screenshot", "render", "view", "picture", "snapshot"],
-  ["measure", "dimension", "distance", "gap", "clearance"],
-  ["boolean", "union", "join", "merge", "combine", "fuse"],
+  ["hole", "drill", "bore", "counterbore"],
+  ["cut", "difference", "subtract", "remove", "carve", "skim"],
+  ["screenshot", "render", "view", "picture", "snapshot", "shot", "image"],
+  ["measure", "dimension", "distance", "gap", "clearance", "size", "extents", "daylight", "envelope", "bounding", "bbox"],
+  ["boolean", "union", "join", "merge", "combine", "fuse", "weld"],
   ["revolve", "lathe", "spin", "turn"],
   ["fillet", "round", "blend"],
-  ["chamfer", "bevel"],
+  ["chamfer", "bevel", "deburr", "break"], // "break the (sharp) edges" — standard drawing-note language
   ["sphere", "ball"],
   ["box", "cube", "block", "cuboid"],
   ["cylinder", "tube", "rod", "shaft"],
   ["cone", "frustum", "taper"],
-  ["assembly", "assemble", "mate", "joint"],
+  ["assembly", "assemble", "mate", "joint", "hinge", "pivot", "revolute"],
   ["sketch", "draft", "profile"],
-  ["mass", "weight", "volume", "inertia", "density"],
-  ["section", "slice", "cutaway", "cross-section"],
-  ["label", "name", "tag", "annotate"],
+  ["mass", "weight", "heavy", "heaviness", "volume", "inertia", "density", "cg", "cog", "centroid", "gravity"],
+  ["section", "slice", "cutaway"],
+  ["label", "name", "tag", "annotate", "call"],
   ["export", "save", "write"],
   ["import", "load", "open"],
   ["shell", "hollow", "wall"],
+  ["move", "translate", "shift", "reposition", "transform", "nudge", "rotate", "rotation", "reorient"],
+  ["collide", "collision", "interference", "clash"],
+  ["tolerance", "flatness", "perpendicularity", "gdt", "fcf", "datum", "callout"],
+  ["perpendicular", "parallel", "constrain", "constraint", "coincident", "tangent"],
+  ["dof", "freedom", "degrees", "underconstrained", "locked", "free"],
+  ["machinable", "machined", "manufacturable", "cnc", "dfm", "manufacturability", "mill", "print", "printability"],
+  // Engineering-shop vocabulary the table simply lacked (each word maps to the
+  // canonical term a tool name/purpose actually uses):
+  ["watertight", "sealed", "leak", "airtight"],
+  ["color", "colour", "paint", "recolor", "tint"],
+  ["ray", "raycast", "beam", "sightline"],
+  ["undo", "revert", "rollback", "unwind"],
+  ["redo", "reapply"],
+  ["history", "log", "audit", "provenance", "who", "when"], // who/when = the history questions
+  ["past", "ago", "earlier"],
+  ["point", "coordinate", "probe"],
+  ["scene", "everything", "entire", "whole"],
+  ["list", "tree", "inventory", "enumerate"],
+  ["claim", "arithmetic", "math", "formula", "equation"],
 ];
+
+// ─── Conservative stemmer ────────────────────────────────────────────────────
+//
+// `tokenize` used to split only — so "dimensions" ≠ "dimension" and
+// "filleting" ≠ "fillet", and every plural had to be hand-listed in the
+// synonym table. This is a deliberately DUMB suffix stripper (plural / -ed /
+// -ing / -ion / trailing-e), applied identically to query tokens, name tokens,
+// purpose words, and the synonym table, so both sides land on the same stem:
+// rotate/rotation → "rotat", crosses/crossings → "cross", move/moved → "mov".
+// It is not Porter and does not try to be — identical treatment of both sides
+// is what makes it safe.
+function stem(t: string): string {
+  let s = t;
+  if (s.length >= 5 && s.endsWith("ies")) s = s.slice(0, -3) + "y";
+  else if (s.length >= 4 && s.endsWith("es") && !s.endsWith("sses")) s = s.slice(0, -2);
+  else if (s.length >= 4 && s.endsWith("s") && !s.endsWith("ss") && !s.endsWith("us")) s = s.slice(0, -1);
+  if (s.length >= 6 && s.endsWith("ing")) s = s.slice(0, -3);
+  else if (s.length >= 5 && s.endsWith("ed")) s = s.slice(0, -2);
+  else if (s.length >= 6 && s.endsWith("ion")) s = s.slice(0, -3);
+  if (s.length >= 4 && s.endsWith("e")) s = s.slice(0, -1);
+  return s;
+}
 
 const SYNONYMS: Map<string, Set<string>> = (() => {
   const m = new Map<string, Set<string>>();
   for (const group of SYNONYM_GROUPS) {
-    for (const word of group) {
+    const stems = [...new Set(group.map(stem))];
+    for (const word of stems) {
       const set = m.get(word) ?? new Set<string>();
-      for (const other of group) if (other !== word) set.add(other);
+      for (const other of stems) if (other !== word) set.add(other);
       m.set(word, set);
     }
   }
   return m;
 })();
 
+// ─── Multi-word phrases (normalised BEFORE tokenizing) ───────────────────────
+//
+// Single-token matching loses phrases whose meaning lives in the combination:
+// "cross section" is a section, "roll back" is an undo, "line of sight" is a
+// ray — none of which the individual words say ("line" alone must NOT pull in
+// timeline tools). Each phrase rewrites to the canonical term before tokenize.
+const PHRASES: Array<[RegExp, string]> = [
+  [/\bcross[\s-]?sections?\b/g, " section "],
+  [/\broll(?:ed|ing)?[\s-]?back\b/g, " undo "],
+  [/\bline[\s-]of[\s-]sight\b/g, " ray "],
+  [/\bcent(?:er|re)[\s-]of[\s-](?:gravity|mass)\b/g, " mass "],
+  [/\bdegrees[\s-]of[\s-]freedom\b/g, " dof "],
+  [/\blead[\s-]?ins?\b/g, " chamfer "],
+  [/\bbill[\s-]of[\s-]materials\b/g, " bom "],
+];
+
 const STOPWORDS = new Set([
   "a", "an", "the", "of", "for", "to", "in", "on", "with", "and", "or",
   "my", "me", "i", "this", "that", "it", "please", "how", "do", "can",
-  "make", "get", "some", "at", "into", "from", "by", "as",
+  "make", "get", "some", "at", "into", "from", "by", "as", "check",
+  // function words that were matching INSIDE unrelated names/purposes
+  // ("over" ⊂ coverage/hover) or adding pure noise:
+  "is", "are", "was", "were", "be", "been", "its", "whats", "what", "which",
+  "we", "you", "your", "our", "us", "will", "would", "should", "yet", "did",
+  "does", "just", "only", "so", "up", "out", "off", "over", "down", "end",
+  "they", "them", "these", "those", "there", "here",
 ]);
 
-/** Lowercase, split on non-alphanumerics, drop stopwords + empties. */
+/** Lowercase, rewrite known phrases, split, drop stopwords, stem. */
 function tokenize(text: string): string[] {
-  return text
-    .toLowerCase()
+  let t = text.toLowerCase();
+  for (const [re, canon] of PHRASES) t = t.replace(re, canon);
+  return t
     .split(/[^a-z0-9]+/)
-    .filter((t) => t.length > 0 && !STOPWORDS.has(t));
+    .filter((w) => w.length >= 2 && !STOPWORDS.has(w)) // 1-char tokens ("w", "x") are pure noise
+    .map(stem);
 }
+
+// ─── Bounded fuzzy match (misspelling tolerance, still deterministic) ────────
+//
+// True iff `a` and `b` are within ONE edit (insert/delete/substitute). Used
+// only for tokens ≥5 chars sharing a first letter, so "asembly" reaches
+// "assembly" and "fillit" reaches "fillet" without short-word false positives.
+function withinOneEdit(a: string, b: string): boolean {
+  if (a === b) return true;
+  const la = a.length;
+  const lb = b.length;
+  if (Math.abs(la - lb) > 1) return false;
+  let i = 0;
+  while (i < la && i < lb && a[i] === b[i]) i += 1;
+  if (la === lb) return a.slice(i + 1) === b.slice(i + 1); // one substitution
+  const [shorter, longer] = la < lb ? [a, b] : [b, a];
+  return shorter.slice(i) === longer.slice(i + 1); // one insert/delete
+}
+
+// ─── Create-vs-mutate intent ─────────────────────────────────────────────────
+//
+// "name this face" wants label_create; "the label should say X" wants
+// label_rename — vocabulary cannot separate them because both queries speak of
+// labels and names. A verb implying FIRST-TIME creation boosts create-family
+// tools; a verb implying change boosts mutate-family tools. Stems, matching
+// `stem`'s output.
+const CREATE_VERB_STEMS = new Set([
+  "creat", "new", "start", "begin", "fresh", "setup", "spawn", "declar",
+  "defin", "designat", "establish", "nam", "tag", "author", "initialis", "initializ",
+]);
+const MUTATE_VERB_STEMS = new Set(["renam", "chang", "edit", "updat", "modify", "adjust", "tweak", "correct"]);
+const CREATE_FAMILY_NAME_STEMS = new Set(["creat", "add", "begin", "new"]);
+const MUTATE_FAMILY_NAME_STEMS = new Set(["renam", "edit", "updat", "chang", "mould"]);
 
 // ─── Ranking (deterministic) ─────────────────────────────────────────────────
 
@@ -124,74 +224,114 @@ interface Scored {
 }
 
 // Weights: an exact name match dominates; a query token (or its synonym) landing
-// on a name token beats a landing in the purpose text. Name-token matches are
-// IDF-scaled — a token unique to one tool (`render`, `drill`, `scene`) carries
-// far more intent than a generic category suffix shared by many (`view`, `part`,
-// `query`), so 'screenshot the scene' resolves to render_part/scene_view rather
-// than every *_view tool. Small tie-breakers prefer the settled core.
+// on a name token beats a landing in the purpose text. Name-token AND purpose-
+// word matches are IDF-scaled — a token unique to one tool (`render`, `drill`,
+// `trim`) carries far more intent than one shared by half the registry (`part`,
+// `face`, `view`), so a rare purpose word like "watertight" now genuinely pulls
+// its tool up instead of drowning under generic name suffixes. Substring
+// matching is PREFIX-anchored on tokens (interior substrings allowed only for
+// long tokens, so "sketch" still reaches "psketch" while "line" can no longer
+// match inside "timeline" and "name" inside "rename" — both measured failure
+// modes). Small tie-breakers prefer the settled core.
 const W_EXACT_NAME = 1000;
-const W_NAME_TOKEN = 12; // × idf
-const W_SYN_NAME = 8; //   × idf
-const W_NAME_SUBSTR = 20;
-const W_PURPOSE_WORD = 12;
-const W_SYN_PURPOSE = 6;
+const W_NAME_TOKEN = 12; //  × name-token idf
+const W_FUZZY_NAME = 9; //   × name-token idf (one-edit misspelling)
+const W_SYN_NAME = 10; //    × name-token idf — a synonym landing on a name token
+//                           is nearly as informative as the token itself
+//                           ("collide" → interference), so it must not lose to
+//                           an accumulation of generic tokens like "part"
+const W_NAME_PREFIX = 10; // × name-token idf
+const W_PURPOSE_WORD = 6; // × purpose-word idf
+const W_SYN_PURPOSE = 3; //  × purpose-word idf
+const W_INTENT = 14; //      create-vs-mutate verb agreement
 const W_BENCH_CORE = 5;
 const W_STABLE = 3;
 
-/** Split a tool name into its lowercase tokens. */
+/** Split a tool name into its lowercase STEMMED tokens. */
 function nameTokensOf(name: string): string[] {
-  return name.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+  return name.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean).map(stem);
 }
 
 /**
- * Inverse document frequency of each name-token across the table — deterministic
- * and computed once per search. A token in `df` of `N` tool names weighs
- * `ln((N+1)/df)`: unique tokens ≈ ln(N), ubiquitous suffixes ≈ small.
+ * Inverse document frequency across the table — deterministic, computed once
+ * per search, over BOTH name tokens and purpose words (stemmed). A token in
+ * `df` of `N` docs weighs `ln((n+1)/df)`: unique ≈ ln(n), ubiquitous ≈ small.
  */
-function nameTokenIdf(table: ToolTable): { idf: Map<string, number>; n: number } {
-  const df = new Map<string, number>();
+function buildIdf(table: ToolTable): { nameIdf: Map<string, number>; purposeIdf: Map<string, number> } {
+  const nameDf = new Map<string, number>();
+  const purposeDf = new Map<string, number>();
   const all = table.all();
   for (const entry of all) {
-    for (const tok of new Set(nameTokensOf(entry.name))) {
-      df.set(tok, (df.get(tok) ?? 0) + 1);
-    }
+    for (const tok of new Set(nameTokensOf(entry.name))) nameDf.set(tok, (nameDf.get(tok) ?? 0) + 1);
+    for (const w of new Set(tokenize(entry.description))) purposeDf.set(w, (purposeDf.get(w) ?? 0) + 1);
   }
   const n = all.length;
-  const idf = new Map<string, number>();
-  for (const [tok, d] of df) idf.set(tok, Math.log((n + 1) / d));
-  return { idf, n };
+  const toIdf = (df: Map<string, number>) => {
+    const idf = new Map<string, number>();
+    for (const [tok, d] of df) idf.set(tok, Math.log((n + 1) / d));
+    return idf;
+  };
+  return { nameIdf: toIdf(nameDf), purposeIdf: toIdf(purposeDf) };
 }
 
 function scoreTool(
   entry: RegisteredTool,
   queryTokens: string[],
-  purposeLower: string,
+  queryCreates: boolean,
+  queryMutates: boolean,
   purposeWords: Set<string>,
-  idf: Map<string, number>,
+  nameIdf: Map<string, number>,
+  purposeIdf: Map<string, number>,
 ): number {
-  const name = entry.name.toLowerCase();
-  const nameTokens = new Set(nameTokensOf(name));
-  const queryJoined = queryTokens.join("_");
+  const nameTokenList = nameTokensOf(entry.name);
+  const nameTokens = new Set(nameTokenList);
   let score = 0;
 
-  if (queryJoined === name) score += W_EXACT_NAME;
+  if (queryTokens.join("_") === nameTokenList.join("_")) score += W_EXACT_NAME;
 
-  const idfOf = (tok: string) => idf.get(tok) ?? Math.log(2);
+  const idfOf = (tok: string) => nameIdf.get(tok) ?? Math.log(2);
+  const pIdfOf = (w: string) => purposeIdf.get(w) ?? Math.log(2);
 
   for (const qt of queryTokens) {
+    // name-token landing: exact stem > one-edit misspelling > prefix.
     if (nameTokens.has(qt)) score += W_NAME_TOKEN * idfOf(qt);
-    else if (qt.length >= 3 && name.includes(qt)) score += W_NAME_SUBSTR;
+    else {
+      let best = 0;
+      for (const nt of nameTokenList) {
+        if (qt.length >= 5 && qt[0] === nt[0] && withinOneEdit(qt, nt))
+          best = Math.max(best, W_FUZZY_NAME * idfOf(nt));
+        else if (qt.length >= 4 && (nt.startsWith(qt) || (qt.length >= 6 && nt.includes(qt))))
+          best = Math.max(best, W_NAME_PREFIX * idfOf(nt));
+      }
+      score += best;
+    }
 
-    if (purposeWords.has(qt)) score += W_PURPOSE_WORD;
-    else if (qt.length >= 4 && purposeLower.includes(qt)) score += W_PURPOSE_WORD;
+    // purpose-word landing: exact stem, or prefix of a longer purpose word.
+    if (purposeWords.has(qt)) score += W_PURPOSE_WORD * pIdfOf(qt);
+    else if (qt.length >= 5) {
+      let best = 0;
+      for (const pw of purposeWords)
+        if (pw.startsWith(qt)) best = Math.max(best, W_PURPOSE_WORD * pIdfOf(pw));
+      score += best;
+    }
 
+    // synonym landing: the BEST group-mate match, not the sum — three group
+    // members hitting one tool's purpose is one signal, not three.
     const syns = SYNONYMS.get(qt);
     if (syns) {
+      let best = 0;
       for (const s of syns) {
-        if (nameTokens.has(s)) score += W_SYN_NAME * idfOf(s);
-        else if (purposeWords.has(s)) score += W_SYN_PURPOSE;
+        if (nameTokens.has(s)) best = Math.max(best, W_SYN_NAME * idfOf(s));
+        else if (purposeWords.has(s)) best = Math.max(best, W_SYN_PURPOSE * pIdfOf(s));
       }
+      score += best;
     }
+  }
+
+  // create-vs-mutate: verb intent agreeing with the tool's family.
+  if (score > 0 && queryCreates !== queryMutates) {
+    const family = queryCreates ? CREATE_FAMILY_NAME_STEMS : MUTATE_FAMILY_NAME_STEMS;
+    if (nameTokenList.some((nt) => family.has(nt))) score += W_INTENT;
   }
 
   const { bench, stability } = metaFor(entry.name);
@@ -210,14 +350,15 @@ export function rankTools(
   limit = 5,
 ): Scored[] {
   const queryTokens = tokenize(query);
-  const { idf } = nameTokenIdf(table);
+  const queryCreates = queryTokens.some((t) => CREATE_VERB_STEMS.has(t));
+  const queryMutates = queryTokens.some((t) => MUTATE_VERB_STEMS.has(t));
+  const { nameIdf, purposeIdf } = buildIdf(table);
   const scored: Scored[] = [];
   for (const entry of table.all()) {
     const { bench } = metaFor(entry.name);
     if (benchFilter && bench !== benchFilter) continue;
-    const purposeLower = entry.description.toLowerCase();
     const purposeWords = new Set(tokenize(entry.description));
-    const score = scoreTool(entry, queryTokens, purposeLower, purposeWords, idf);
+    const score = scoreTool(entry, queryTokens, queryCreates, queryMutates, purposeWords, nameIdf, purposeIdf);
     if (score <= 0) continue;
     scored.push({
       name: entry.name,

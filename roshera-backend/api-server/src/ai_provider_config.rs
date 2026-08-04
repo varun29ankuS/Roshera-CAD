@@ -1719,15 +1719,22 @@ impl AiProviderManager {
     }
 }
 
-/// Serializes every test in this binary that mutates the process-global
-/// `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` environment variables
-/// (this module's child-env scrub proof and `goose_acp`'s lockdown
-/// test, which pins the boot-path scrub call site). Without it, one
-/// test's sentinel `set_var` can land between another's scrub and its
-/// absence assertion under the default parallel runner. Test-only —
-/// production code never takes this lock.
+/// Serializes every test in this binary that mutates **or reads** a
+/// process-global environment variable another test owns:
+/// `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` (this module's child-env
+/// scrub proof and `goose_acp`'s lockdown test, which pins the boot-path
+/// scrub call site) and `ROSHERA_GOOSE_ROOT` / `ROSHERA_AGENT_WORKSPACE`
+/// (that same lockdown test, read back by
+/// `goose_acp::tests::acp_config_endpoint_serves_the_same_path_agent_workspace_dir_resolves`).
+///
+/// Without it, one test's `set_var` can land between another's two reads
+/// — or between a scrub and its absence assertion — under the default
+/// parallel runner. A reader must hold this lock across *every* read it
+/// then compares, not merely avoid writing: abstaining from `set_var`
+/// does not protect a comparison of two separate reads of the same
+/// global. Test-only — production code never takes this lock.
 #[cfg(test)]
-pub(crate) fn anthropic_env_test_lock() -> &'static std::sync::Mutex<()> {
+pub(crate) fn process_env_test_lock() -> &'static std::sync::Mutex<()> {
     static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
     LOCK.get_or_init(|| std::sync::Mutex::new(()))
 }
@@ -1786,10 +1793,10 @@ mod tests {
     /// The boot-path CALL SITE of the scrub (`goose_acp::initialize`'s
     /// `ClaudeCode` branch) is pinned separately by
     /// `goose_acp::tests::goose_lockdown_leaves_exactly_roshera_reachable`,
-    /// under the same [`anthropic_env_test_lock`].
+    /// under the same [`process_env_test_lock`].
     #[test]
     fn anthropic_credentials_scrubbed_from_the_actual_child_environment() {
-        let _guard = anthropic_env_test_lock()
+        let _guard = process_env_test_lock()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
 

@@ -25,6 +25,19 @@ import { create } from 'zustand'
  *
  * Every reducer that mutates `lines` ALSO pushes an event onto `events`, and
  * then asks the persistence adapter to save. State and log never drift.
+ *
+ * ONE NOTEBOOK PER DOCUMENT (2026-08-04)
+ * ---------------------------------------
+ * The board used to be addressable per PART — a per-scope notebook the
+ * viewport's active selection switched between. Varun reversed that: the
+ * agent session is already scoped per document (`document-store.ts` calls
+ * `resetAcpClient()` on every document switch); the notebook a human reads
+ * now matches it 1:1. There is exactly one notebook, always the document's.
+ * Lines written under the old per-part model before this change are not
+ * lost — the backend's read side unions them in (see
+ * `api-server/src/blackboard.rs`'s `BlackboardManager::document_snapshot`),
+ * tagged with `partId`/`partUuid` so the reader can still tell which part a
+ * line was about.
  */
 
 export type LineAuthor = 'user' | 'agent' | 'system'
@@ -63,26 +76,6 @@ export type LineAuthor = 'user' | 'agent' | 'system'
 export type AgentAttention = 'idle' | 'writing' | 'geometry'
 
 /**
- * SCOPE
- * -----
- * The north star is 100-part assemblies; one global notebook mixing every
- * part's calculations is unusable at that scale. So a notebook belongs to an
- * OWNER, addressed by a canonical scope token that mirrors the backend
- * `BlackboardScope`:
- *   - `'document'`        — document / session-wide notes (the default, and
- *                           the migration home for legacy un-scoped entries).
- *   - `'part:<uuid>'`     — a single part's own notebook (the primary case).
- *   - `'assembly:<uuid>'` — cross-part / assembly-level calcs.
- * The panel shows the ACTIVE scope's notebook; selecting a different part
- * switches scope and reloads that part's lines.
- */
-export type BlackboardScope = string
-export const DOCUMENT_SCOPE: BlackboardScope = 'document'
-export function partScope(partUuid: string): BlackboardScope {
-  return `part:${partUuid}`
-}
-
-/**
  * TURN OUTCOME
  * ------------
  * Set once on the agent's own line when its turn concludes — drives the
@@ -117,6 +110,18 @@ export interface BlackboardLine {
    *  agent/user lines — a person's or the model's repeated words are
    *  content, not bookkeeping spam. */
   repeatCount?: number
+  /** Which part this line was originally about, if it was written under the
+   *  old per-part notebook model (retired 2026-08-04 — the blackboard is
+   *  one notebook per document now). Set only by the backend's read-side
+   *  union (`api-server/src/blackboard.rs`'s `document_snapshot`) for a
+   *  legacy line; never set by anything this store itself writes. */
+  partId?: number
+  /** The part's current UUID alias (`AppState::get_uuid`, the id
+   *  `scene-store`'s `objects` map is keyed by), so a legacy line can be
+   *  resolved to a live part's name. Undefined when `partId` is, or when
+   *  that part is no longer registered (deleted/retired) — `partId` alone
+   *  still says the line was about *a* part. */
+  partUuid?: string
 }
 
 export type BlackboardEvent =
@@ -127,10 +132,12 @@ export type BlackboardEvent =
 /**
  * PERSISTENCE SEAM
  * ----------------
- * The store talks to persistence ONLY through this interface. Today the
- * concrete adapter is `localStorageAdapter` (no backend Blackboard endpoint
- * exists yet). When a backend lands, swap in an adapter that POSTs the
- * snapshot (or streams the event log) — nothing else in the store changes.
+ * The store talks to persistence ONLY through this interface, for the one
+ * document notebook (there is nothing else to address any more — see
+ * `stores/document-store.ts`'s per-document session reset, which this
+ * mirrors 1:1). Today the concrete adapter is `localStorageAdapter`;
+ * `installBackendBlackboard` (`lib/blackboard-api.ts`) swaps in the
+ * backend-backed one at app bootstrap.
  *
  * `save` is intentionally fire-and-forget (sync-or-async): the store does not
  * await it, so a slow/absent backend never blocks an edit.
@@ -141,24 +148,19 @@ export interface BlackboardSnapshot {
 }
 
 export interface BlackboardPersistenceAdapter {
-  /** Load the snapshot for a scope (synchronously, e.g. from a local cache). */
-  load(scope: BlackboardScope): BlackboardSnapshot | null
-  /** Persist a scope's snapshot. */
-  save(scope: BlackboardScope, snapshot: BlackboardSnapshot): void
+  /** Load the document notebook (synchronously, e.g. from a local cache). */
+  load(): BlackboardSnapshot | null
+  /** Persist the document notebook. */
+  save(snapshot: BlackboardSnapshot): void
 }
 
-const STORAGE_PREFIX = 'roshera.blackboard.v1'
-
-/** Per-scope localStorage key, so one part's cache never overwrites another. */
-function storageKey(scope: BlackboardScope): string {
-  return `${STORAGE_PREFIX}.${scope}`
-}
+const STORAGE_KEY = 'roshera.blackboard.v1.document'
 
 const localStorageAdapter: BlackboardPersistenceAdapter = {
-  load(scope) {
+  load() {
     if (typeof window === 'undefined') return null
     try {
-      const raw = window.localStorage.getItem(storageKey(scope))
+      const raw = window.localStorage.getItem(STORAGE_KEY)
       if (!raw) return null
       const parsed = JSON.parse(raw) as Partial<BlackboardSnapshot>
       if (!Array.isArray(parsed.lines) || !Array.isArray(parsed.events)) return null
@@ -171,10 +173,10 @@ const localStorageAdapter: BlackboardPersistenceAdapter = {
       return null
     }
   },
-  save(scope, snapshot) {
+  save(snapshot) {
     if (typeof window === 'undefined') return
     try {
-      window.localStorage.setItem(storageKey(scope), JSON.stringify(snapshot))
+      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(snapshot))
     } catch {
       // Quota / private-mode failures are non-fatal; the in-memory store
       // remains the source of truth for the session.
@@ -192,9 +194,9 @@ export function setBlackboardAdapter(next: BlackboardPersistenceAdapter): void {
 
 /**
  * The retired hard-coded demo notebook ("Rao Bell Nozzle") seeded every fresh
- * Document scope with `rao-*` line ids. The Blackboard now starts empty — it
- * shows only what an agent or the user actually wrote — but cached copies of
- * that demo still live in localStorage. This detects one: seed lines only
+ * document notebook with `rao-*` line ids. The Blackboard now starts empty —
+ * it shows only what an agent or the user actually wrote — but cached copies
+ * of that demo still live in localStorage. This detects one: seed lines only
  * (`rao-*` ids) and an empty event log, i.e. the user never touched it. Such
  * a snapshot is discarded on load; an edited one is user content and kept.
  */
@@ -207,9 +209,6 @@ export function isLegacySeedSnapshot(snapshot: BlackboardSnapshot): boolean {
 }
 
 interface BlackboardState {
-  /** The notebook currently shown — `'document'`, `part:<uuid>`, or
-   *  `assembly:<uuid>`. `lines`/`events` always belong to THIS scope. */
-  activeScope: BlackboardScope
   lines: BlackboardLine[]
   events: BlackboardEvent[]
   isProcessing: boolean
@@ -235,14 +234,6 @@ interface BlackboardState {
    *  metadata, persisted alongside the line; not logged as its own event —
    *  it rides along with the `editLine` call that commits the final text. */
   setLineTurnStatus: (id: string, status: AgentTurnStatus) => void
-
-  /**
-   * Switch the active notebook to `scope`. Resets `lines`/`events` to that
-   * scope's local cache immediately (so the panel never shows the previous
-   * part's calcs for a frame); the backend adapter then hydrates the
-   * authoritative document for the scope. No-op if already active.
-   */
-  setActiveScope: (scope: BlackboardScope) => void
 
   setProcessing: (v: boolean) => void
   /** Simple setter for the attention state — the seam the ACP wiring will
@@ -271,28 +262,24 @@ function nextLineId(): string {
 // short recency window, independent of what else was appended in between:
 // the line's POSITION stays where it first appeared (never reordered to
 // the end), only its `repeatCount`/`updatedAt` change. `system`-only, by
-// exact text, per scope — an agent's or a user's repeated words are
-// content, never merged.
+// exact text — an agent's or a user's repeated words are content, never
+// merged.
 const RECENT_SYSTEM_LINE_WINDOW_MS = 15_000
 const recentSystemLines = new Map<string, { id: string; lastAt: number }>()
-function recentSystemLineKey(scope: BlackboardScope, text: string): string {
-  return `${scope} ${text}`
+
+function persist(state: Pick<BlackboardState, 'lines' | 'events'>): void {
+  adapter.save({ lines: state.lines, events: state.events })
 }
 
-function persist(scope: BlackboardScope, state: Pick<BlackboardState, 'lines' | 'events'>): void {
-  adapter.save(scope, { lines: state.lines, events: state.events })
-}
-
-/** Every scope with no cached snapshot starts as an EMPTY notebook — the
- *  Blackboard carries only lines an agent or the user actually wrote. */
+/** No cached snapshot starts as an EMPTY notebook — the Blackboard carries
+ *  only lines an agent or the user actually wrote. */
 function emptyNotebook(): BlackboardSnapshot {
   return { lines: [], events: [] }
 }
 
-const initial = adapter.load(DOCUMENT_SCOPE) ?? emptyNotebook()
+const initial = adapter.load() ?? emptyNotebook()
 
-export const useBlackboardStore = create<BlackboardState>((set, get) => ({
-  activeScope: DOCUMENT_SCOPE,
+export const useBlackboardStore = create<BlackboardState>((set) => ({
   lines: initial.lines,
   events: initial.events,
   isProcessing: false,
@@ -302,22 +289,22 @@ export const useBlackboardStore = create<BlackboardState>((set, get) => ({
 
   addLine: (text, author) => {
     const now = Date.now()
-    const state0 = get()
-    const key = recentSystemLineKey(state0.activeScope, text)
-    const recent = author === 'system' ? recentSystemLines.get(key) : undefined
+    const recent = author === 'system' ? recentSystemLines.get(text) : undefined
     if (recent && now - recent.lastAt <= RECENT_SYSTEM_LINE_WINDOW_MS) {
-      const stillPresent = state0.lines.some((l) => l.id === recent.id)
+      let stillPresent = false
+      set((state) => {
+        stillPresent = state.lines.some((l) => l.id === recent.id)
+        if (!stillPresent) return state
+        const lines = state.lines.map((l) =>
+          l.id === recent.id
+            ? { ...l, updatedAt: now, repeatCount: (l.repeatCount ?? 1) + 1 }
+            : l,
+        )
+        persist({ lines, events: state.events })
+        return { lines }
+      })
       if (stillPresent) {
-        recentSystemLines.set(key, { id: recent.id, lastAt: now })
-        set((state) => {
-          const lines = state.lines.map((l) =>
-            l.id === recent.id
-              ? { ...l, updatedAt: now, repeatCount: (l.repeatCount ?? 1) + 1 }
-              : l,
-          )
-          persist(state.activeScope, { lines, events: state.events })
-          return { lines }
-        })
+        recentSystemLines.set(text, { id: recent.id, lastAt: now })
         return recent.id
       }
       // The tracked line was deleted (e.g. the user removed it) — fall
@@ -325,7 +312,7 @@ export const useBlackboardStore = create<BlackboardState>((set, get) => ({
     }
 
     const id = nextLineId()
-    if (author === 'system') recentSystemLines.set(key, { id, lastAt: now })
+    if (author === 'system') recentSystemLines.set(text, { id, lastAt: now })
     set((state) => {
       const index = state.lines.length
       const lines = [
@@ -336,7 +323,7 @@ export const useBlackboardStore = create<BlackboardState>((set, get) => ({
         ...state.events,
         { kind: 'add', lineId: id, text, author, at: now, index },
       ]
-      persist(state.activeScope, { lines, events })
+      persist({ lines, events })
       return { lines, events }
     })
     return id
@@ -371,7 +358,7 @@ export const useBlackboardStore = create<BlackboardState>((set, get) => ({
         ...state.events,
         { kind: 'edit', lineId: id, before: existing.text, after: text, at: now },
       ]
-      persist(state.activeScope, { lines, events })
+      persist({ lines, events })
       return { lines, events }
     }),
 
@@ -386,7 +373,7 @@ export const useBlackboardStore = create<BlackboardState>((set, get) => ({
         ...state.events,
         { kind: 'delete', lineId: id, text: existing.text, at: now, index },
       ]
-      persist(state.activeScope, { lines, events })
+      persist({ lines, events })
       return { lines, events }
     }),
 
@@ -404,18 +391,8 @@ export const useBlackboardStore = create<BlackboardState>((set, get) => ({
   setLineTurnStatus: (id, status) =>
     set((state) => {
       const lines = state.lines.map((l) => (l.id === id ? { ...l, turnStatus: status } : l))
-      persist(state.activeScope, { lines, events: state.events })
+      persist({ lines, events: state.events })
       return { lines }
-    }),
-
-  setActiveScope: (scope) =>
-    set((state) => {
-      if (scope === state.activeScope) return state
-      // Show the scope's local cache instantly (empty notebook for a fresh
-      // part — never the previous part's lines); the adapter hydrates the
-      // authoritative backend document right after.
-      const cached = adapter.load(scope) ?? emptyNotebook()
-      return { activeScope: scope, lines: cached.lines, events: cached.events }
     }),
 
   setProcessing: (v) => set({ isProcessing: v }),
@@ -424,14 +401,11 @@ export const useBlackboardStore = create<BlackboardState>((set, get) => ({
   togglePanel: () => set((s) => ({ isPanelOpen: !s.isPanelOpen })),
   setPanel: (open) => set({ isPanelOpen: open }),
 
-  clearBoard: () => {
-    void get
-    set((state) => {
-      // Every scope clears to an empty notebook.
+  clearBoard: () =>
+    set(() => {
       const lines: BlackboardLine[] = []
       const events: BlackboardEvent[] = []
-      persist(state.activeScope, { lines, events })
+      persist({ lines, events })
       return { lines, events }
-    })
-  },
+    }),
 }))

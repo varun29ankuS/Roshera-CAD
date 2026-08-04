@@ -259,6 +259,11 @@ const BENCH_OF: Record<string, Bench> = {
   psketch_op: "sketch",
   psketch_extrude: "sketch",
   psketch_revolve: "sketch",
+  // Sketch-on-face. Belongs on the sketch bench, not the meta fallback: an
+  // agent that switches to `sketch` to build a profile is exactly the agent
+  // that needs to anchor it to a face, and an unlisted tool is one it will not
+  // reach for. Landing in the fallback is why the surface counts moved.
+  psketch_plane_from_face: "sketch",
   // assembly
   assembly_verify: "assembly",
   assembly_create: "assembly",
@@ -321,6 +326,19 @@ export function metaFor(name: string): ToolMeta {
     bench: BENCH_OF[name] ?? "meta",
     stability: EXPERIMENTAL.has(name) ? "experimental" : "stable",
   };
+}
+
+/**
+ * Read-only view of the RAW explicit-classification table — every name that
+ * has ever been given a bench, unfiltered by whether it is still registered.
+ * Deliberately NOT `metaFor`: `metaFor`'s `?? "meta"` fallback is exactly what
+ * makes a stale entry invisible (an unregistered name simply never gets
+ * looked up through it), so a staleness gate must read this map directly, not
+ * go through the fallback. Returns a frozen shallow copy — callers cannot
+ * mutate the module's private table.
+ */
+export function explicitBenchTable(): Readonly<Record<string, Bench>> {
+  return Object.freeze({ ...BENCH_OF });
 }
 
 // ─── Schema → JSON-schema + token estimate ──────────────────────────────────

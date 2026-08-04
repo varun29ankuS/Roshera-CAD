@@ -56,7 +56,13 @@ pub struct DeleteFilter {
 }
 
 /// Entity types for deletion
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// `PartialOrd`/`Ord` are derived (in declaration order) so
+/// `(EntityType, u32)` tuples sort deterministically — used to fold the
+/// entities `prune_boolean_orphan_topology` sweeps into a delete's reported
+/// result without a `HashMap`/`HashSet` iteration order silently deciding
+/// what a caller sees.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum EntityType {
     Solid,
     Shell,
@@ -279,7 +285,31 @@ fn delete_solid_body(
     // it; now `delete_part` does too, so an agent can clear a broken manifold's
     // fallout without wiping the whole model. Runs inside this `with_rollback`
     // closure, so a failure restores everything via the snapshot.
-    prune_boolean_orphan_topology(model)?;
+    //
+    // The prune sweeps MODEL-WIDE, not just this solid's own cascade — so
+    // whatever it removes must be folded into this function's own return
+    // value. Without this, entities silently stopped existing with no
+    // record anywhere: `delete_solid_core` (the sole recording site) only
+    // ever sees `deleted`, so anything the prune ate and this function
+    // didn't report was invisible to the event stream forever.
+    let pruned = prune_boolean_orphan_topology(model)?;
+    for entry in pruned {
+        // Defensive de-duplication: `find_orphaned_entities` sources orphans
+        // via each store's `iter()`, which skips tombstoned slots (removed
+        // entities are NOT erased — `remove()` writes an `INVALID_*_ID`
+        // sentinel in place, kept only to preserve other entities' indices —
+        // so `iter()` filtering on `id != INVALID_*_ID` is what keeps an
+        // already-removed id from resurfacing here, not the slot being
+        // gone). An entity must never be declared deleted twice regardless
+        // of why that invariant currently holds, so guard explicitly rather
+        // than lean on it silently.
+        if !deleted.contains(&entry) {
+            deleted.push(entry);
+        }
+    }
+    // Deterministic ordering: sort so no store-iteration-order accident
+    // decides what a caller (and the recorder) sees.
+    deleted.sort_unstable();
 
     Ok(deleted)
 }
@@ -292,7 +322,13 @@ pub fn delete_face(model: &mut BRepModel, face_id: FaceId, heal: bool) -> Operat
 
 #[allow(clippy::expect_used)] // face_id validated non-None at fn entry; not removed since
 fn delete_face_body(model: &mut BRepModel, face_id: FaceId, heal: bool) -> OperationResult<()> {
-    // Validate face exists
+    // Validate face exists. `FaceStore::get` now filters tombstoned slots
+    // (routed through `FaceStore::is_live`), so this genuinely rejects a
+    // `face_id` that was already removed by an earlier call — it used to
+    // return `Some(tombstone)` for that case and fall through to line ~355
+    // with a face whose `outer_loop`/`inner_loops` were the dummy `0` the
+    // tombstone was constructed with, corrupting whatever real loop 0
+    // happened to be.
     if model.faces.get(face_id).is_none() {
         return Err(OperationError::InvalidInput {
             parameter: "face_id".to_string(),
@@ -317,8 +353,10 @@ fn delete_face_body(model: &mut BRepModel, face_id: FaceId, heal: bool) -> Opera
     }
 
     // Get face loops before deletion. `face_id` was validated at the
-    // top of this function via `is_none()` -> early return; the face
-    // store has not been mutated to remove it since.
+    // top of this function via `is_none()` -> early return, and that
+    // check is now a genuine liveness test (see the comment above) — the
+    // face store has not been mutated to remove it since, so this
+    // `.expect()` is sound.
     let face = model
         .faces
         .get(face_id)
@@ -561,7 +599,14 @@ fn find_cascade_targets(
 /// by `PersistentId`/`SolidId`, not `FaceId`, so a face drop does not key them
 /// directly; the face's PID entry (which anchors any such annotation) is
 /// removed with the face.
-pub(crate) fn prune_boolean_orphan_topology(model: &mut BRepModel) -> OperationResult<()> {
+///
+/// Returns every entity actually removed, sorted and de-duplicated, so a
+/// caller (`delete_solid`; `boolean_operation`) can fold this sweep into its
+/// own reported deletions instead of the sweep vanishing with no record.
+pub(crate) fn prune_boolean_orphan_topology(
+    model: &mut BRepModel,
+) -> OperationResult<Vec<(EntityType, u32)>> {
+    let mut swept = Vec::new();
     for _ in 0..6 {
         let orphans = find_orphaned_entities(model);
         if orphans.is_empty() {
@@ -572,9 +617,12 @@ pub(crate) fn prune_boolean_orphan_topology(model: &mut BRepModel) -> OperationR
                 purge_face_sidecars(model, entity_id);
             }
             delete_entity(model, entity_type, entity_id)?;
+            swept.push((entity_type, entity_id));
         }
     }
-    Ok(())
+    swept.sort_unstable();
+    swept.dedup();
+    Ok(swept)
 }
 
 /// Remove every FaceId-keyed sidecar entry for a face being dropped, so no
@@ -901,4 +949,103 @@ fn validate_model_after_deletion(model: &BRepModel) -> OperationResult<()> {
     }
 
     Ok(())
+}
+
+// RED-first regression tests for the tombstone-liveness defect: `LoopStore`,
+// `FaceStore` and `ShellStore` used to write an `INVALID_*_ID` sentinel on
+// `remove` but never filtered it in `get`/`get_mut` (unlike `VertexStore`
+// and `EdgeStore`, which already do — see Task #89 in `edge.rs`). That let
+// `get(id)` on a removed entity return `Some(tombstone)` instead of `None`,
+// which in turn let `validate_model_after_deletion` miss dangling
+// references entirely, since every one of its checks is an `.is_none()`
+// test against exactly those three stores.
+#[cfg(test)]
+mod tombstone_liveness_tests {
+    use super::*;
+    use crate::primitives::topology_builder::{GeometryId, TopologyBuilder};
+
+    fn box_solid(model: &mut BRepModel) -> SolidId {
+        match TopologyBuilder::new(model)
+            .create_box_3d(20.0, 14.0, 10.0)
+            .expect("box")
+        {
+            GeometryId::Solid(s) => s,
+            o => panic!("expected solid, got {o:?}"),
+        }
+    }
+
+    #[test]
+    fn removed_loop_is_not_visible_to_get() {
+        let mut model = BRepModel::new();
+        let sid = box_solid(&mut model);
+        let solid = model.solids.get(sid).expect("solid");
+        let shell = model.shells.get(solid.outer_shell).expect("shell");
+        let face_id = *shell.faces.first().expect("box has faces");
+        let outer_loop = model.faces.get(face_id).expect("face").outer_loop;
+
+        model.loops.remove(outer_loop);
+
+        assert!(
+            model.loops.get(outer_loop).is_none(),
+            "a removed loop must not be visible to get()"
+        );
+    }
+
+    #[test]
+    fn removed_face_is_not_visible_to_get() {
+        let mut model = BRepModel::new();
+        let sid = box_solid(&mut model);
+        let solid = model.solids.get(sid).expect("solid");
+        let shell = model.shells.get(solid.outer_shell).expect("shell");
+        let face_id = *shell.faces.first().expect("box has faces");
+
+        model.faces.remove(face_id);
+
+        assert!(
+            model.faces.get(face_id).is_none(),
+            "a removed face must not be visible to get()"
+        );
+    }
+
+    #[test]
+    fn removed_shell_is_not_visible_to_get() {
+        let mut model = BRepModel::new();
+        let sid = box_solid(&mut model);
+        let shell_id = model.solids.get(sid).expect("solid").outer_shell;
+
+        model.shells.remove(shell_id);
+
+        assert!(
+            model.shells.get(shell_id).is_none(),
+            "a removed shell must not be visible to get()"
+        );
+    }
+
+    /// The test that matters most: a face whose outer loop has been removed
+    /// out from under it is a genuine dangling reference. Before the fix,
+    /// `LoopStore::get` on the removed id returns `Some(tombstone)`, so the
+    /// validator's `model.loops.get(face.outer_loop).is_none()` check can
+    /// never fire — a model with a dangling reference certifies as sound.
+    #[test]
+    fn dangling_loop_reference_is_detected_after_removal() {
+        let mut model = BRepModel::new();
+        let sid = box_solid(&mut model);
+        let solid = model.solids.get(sid).expect("solid");
+        let shell = model.shells.get(solid.outer_shell).expect("shell");
+        let face_id = *shell.faces.first().expect("box has faces");
+        let outer_loop = model.faces.get(face_id).expect("face").outer_loop;
+
+        // Remove the loop directly, bypassing `delete_face` (which would
+        // also clear the face) — this leaves `face_id` pointing at a loop
+        // id that no longer exists, exactly the corruption
+        // `validate_model_after_deletion` exists to catch.
+        model.loops.remove(outer_loop);
+
+        let result = validate_model_after_deletion(&model);
+        assert!(
+            result.is_err(),
+            "a face referencing a removed loop must be reported as a dangling \
+             reference, got {result:?}"
+        );
+    }
 }

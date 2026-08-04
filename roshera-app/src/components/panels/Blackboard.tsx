@@ -1,11 +1,6 @@
 import { useRef, useEffect, useState, useCallback, useMemo } from 'react'
-import {
-  useBlackboardStore,
-  DOCUMENT_SCOPE,
-  partScope,
-} from '@/stores/blackboard-store'
+import { useBlackboardStore } from '@/stores/blackboard-store'
 import { useAcpSessionStore } from '@/stores/acp-session-store'
-import { useSceneStore } from '@/stores/scene-store'
 import { useWSStore } from '@/stores/ws-store'
 import { cn } from '@/lib/utils'
 import { processBlackboardMessage } from '@/lib/ai-client'
@@ -121,8 +116,6 @@ export function Blackboard() {
   const editLine = useBlackboardStore((s) => s.editLine)
   const deleteLine = useBlackboardStore((s) => s.deleteLine)
   const addLine = useBlackboardStore((s) => s.addLine)
-  const activeScope = useBlackboardStore((s) => s.activeScope)
-  const setActiveScope = useBlackboardStore((s) => s.setActiveScope)
   const agentAttention = useBlackboardStore((s) => s.agentAttention)
   const streamingLineId = useBlackboardStore((s) => s.streamingLineId)
 
@@ -136,38 +129,6 @@ export function Blackboard() {
   const acpTokens = useAcpSessionStore((s) => s.tokensUsed)
   const acpLastTurnTokens = useAcpSessionStore((s) => s.lastTurnTokens)
   const acpLive = useAcpSessionStore((s) => s.live)
-
-  // Drive the notebook scope from the viewport selection: the active part's
-  // notebook is shown, so each part has its OWN blackboard. The primary
-  // selected scene object IS a part (its id is the kernel part UUID); when
-  // nothing (or a non-part) is selected, fall back to the document notebook.
-  const selectedIds = useSceneStore((s) => s.selectedIds)
-  const objects = useSceneStore((s) => s.objects)
-  const selectedPart = useSceneStore((s) => {
-    for (const id of s.selectedIds) {
-      const obj = s.objects.get(id)
-      if (obj) return obj
-    }
-    return null
-  })
-  useEffect(() => {
-    setActiveScope(selectedPart ? partScope(selectedPart.id) : DOCUMENT_SCOPE)
-    // `selectedIds`/`objects` are dependencies via `selectedPart`; listing the
-    // raw stores keeps the effect honest if selection changes within the set.
-  }, [selectedPart, selectedIds, objects, setActiveScope])
-
-  // Names which notebook is on screen, not just what it's currently about —
-  // "Bracket-A" alone reads the same whether you're in that part's own
-  // notebook or the document notebook happens to mention it. A silent swap
-  // between two notebooks that look alike is indistinguishable from data
-  // loss (the switch-away-and-back bug this label exists to prevent), so
-  // the scope kind ('Part' vs 'Document') always leads.
-  const scopeLabel =
-    activeScope === DOCUMENT_SCOPE
-      ? 'Document'
-      : selectedPart
-        ? `Part: ${selectedPart.name}`
-        : 'Part'
 
   // ── Checkpoint sections ─────────────────────────────────────────────
   //
@@ -228,25 +189,15 @@ export function Blackboard() {
   //
   // The composer is the ACT of asking; the notebook is the RECORD of having
   // asked. Its draft lives outside the document (a draft is not a line),
-  // persisted per notebook scope so an accidental blur, panel toggle, or
-  // reload never eats a half-written prompt — see `lib/blackboard-composer.ts`.
-  const [draft, setDraft] = useState(() => loadDraft(activeScope))
+  // persisted so an accidental blur, panel toggle, or reload never eats a
+  // half-written prompt — see `lib/blackboard-composer.ts`.
+  const [draft, setDraft] = useState(() => loadDraft())
   // History browse position: null = not browsing. ArrowUp from an empty
   // composer recalls what you last asked; ArrowDown walks back forward.
   const [histIdx, setHistIdx] = useState<number | null>(null)
   const historyRef = useRef<string[]>(loadPromptHistory())
   const scrollRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
-
-  // Scope switch swaps in that scope's own persisted draft. In-render
-  // reconcile (React's "adjusting state on prop change" pattern, same as
-  // BlackboardLine's streaming sync) — no setState-in-effect cascade.
-  const [draftScope, setDraftScope] = useState(activeScope)
-  if (draftScope !== activeScope) {
-    setDraftScope(activeScope)
-    setDraft(loadDraft(activeScope))
-    setHistIdx(null)
-  }
 
   // Autosize the composer to its content (recall can change the value
   // without an input event, so this tracks `draft`, not keystrokes). The
@@ -350,14 +301,14 @@ export function Blackboard() {
       historyRef.current = nextHistory
       savePromptHistory(nextHistory)
       setDraft('')
-      saveDraft(activeScope, '')
+      saveDraft('')
       setHistIdx(null)
       // Routes to the agent via the existing ai-client path (wrapped for
       // queue visibility); the user's line lands in the notebook
       // immediately, the reply as an editable line — never a chat bubble.
       void sendPrompt(text, processBlackboardMessage)
     },
-    [draft, activeScope],
+    [draft],
   )
 
   const handleKeyDown = useCallback(
@@ -430,13 +381,6 @@ export function Blackboard() {
         <div className="flex items-center gap-2 min-w-0">
           <NotebookPen size={14} className="text-primary shrink-0" />
           <span className="text-xs font-medium shrink-0">Blackboard</span>
-          {/* Which part's notebook is on screen — the per-part scope. */}
-          <span
-            className="text-[11px] text-muted-foreground truncate"
-            title={`Notebook scope: ${scopeLabel}`}
-          >
-            · {scopeLabel}
-          </span>
           {/* Attention state, legible without reading the board. */}
           {agentAttention === 'writing' && (
             <span className="flex shrink-0 items-center gap-1 text-[10px] text-primary/90">
@@ -701,9 +645,9 @@ export function Blackboard() {
             rows={1}
             onChange={(e) => {
               setDraft(e.target.value)
-              // Persist per scope on every keystroke — the draft survives
-              // blur, panel toggle, and reload; it is not a line until sent.
-              saveDraft(activeScope, e.target.value)
+              // Persist on every keystroke — the draft survives blur, panel
+              // toggle, and reload; it is not a line until sent.
+              saveDraft(e.target.value)
               setHistIdx(null)
             }}
             onKeyDown={handleKeyDown}

@@ -308,7 +308,7 @@ async fn test_invalid_viewport_handling() {
 
 /// Integration test for the complete vision pipeline
 #[tokio::test]
-#[ignore] // This test requires a running test server
+#[ignore = "requires a running test server"]
 async fn test_complete_vision_pipeline() {
     // Setup
     let config = SmartRouterConfig::default();

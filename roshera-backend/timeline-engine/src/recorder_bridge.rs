@@ -34,7 +34,10 @@
 
 use std::sync::Arc;
 
-use geometry_engine::operations::recorder::{OperationRecorder, RecordedOperation, RecorderError};
+use geometry_engine::operations::recorder::{
+    IntentFacet, OperationRecorder, Origin, OriginBasis, OriginFacet, RecordedOperation,
+    RecorderError,
+};
 use parking_lot::RwLock as PlRwLock;
 use tokio::sync::{mpsc, oneshot, RwLock};
 
@@ -101,6 +104,60 @@ tokio::task_local! {
     pub static AUTHOR_OVERRIDE: Author;
 }
 
+/// The agent's open design intent for the ops recorded inside one request.
+///
+/// `text` is the intent-checkpoint phrase the MCP intent gate already forced
+/// the agent to declare before any solid-mutating call; `turn_id` is the
+/// gate's turn counter at the moment that checkpoint opened, when the client
+/// sent one. Carried per request by the api-server's `agent_intent_layer`
+/// (from `X-Roshera-Intent` / `X-Roshera-Intent-Turn`).
+#[derive(Debug, Clone)]
+pub struct IntentContext {
+    /// The checkpoint phrase, decoded to UTF-8 text.
+    pub text: String,
+    /// The client-side turn the checkpoint opened at, as free text.
+    /// `None` = not sent, never an empty string.
+    pub turn_id: Option<String>,
+}
+
+tokio::task_local! {
+    /// Per-task intent consulted by [`TimelineRecorder::record`].
+    ///
+    /// Same shape and same reasoning as [`AUTHOR_OVERRIDE`]: the recorder is
+    /// one process-wide instance, but the intent behind a kernel op belongs
+    /// to the REQUEST that triggered it. A task-local is scoped to the
+    /// request task — the same task that synchronously invokes the kernel
+    /// and therefore `record()` — so two concurrent requests with different
+    /// intents structurally cannot cross-attribute. This is why the intent
+    /// is NOT on `AppState`, a `DashMap`, or any shared slot: an ambient
+    /// slot under concurrency would produce provenance that is confidently
+    /// wrong, which is worse than absent.
+    pub static INTENT_OVERRIDE: IntentContext;
+}
+
+tokio::task_local! {
+    /// Per-task channel override consulted by [`TimelineRecorder::record`].
+    ///
+    /// A SEPARATE task-local from [`INTENT_OVERRIDE`], not a field folded
+    /// into one shared context struct: origin is scoped on EVERY request
+    /// (the axum middleware and the WebSocket handler both always have a
+    /// channel to report), while intent is scoped only when the MCP gate's
+    /// checkpoint header is present — folding them together would force a
+    /// "no intent" request to still construct an `Option<IntentContext>`
+    /// and would make `agent_intent_layer`'s zero-cost passthrough (no
+    /// scope at all when the header is absent) reach into a struct
+    /// half-owned by a different feature. `AUTHOR_OVERRIDE` already
+    /// established the one-task-local-per-attribution-dimension
+    /// convention; `ORIGIN_OVERRIDE` follows it.
+    ///
+    /// Same reasoning as `AUTHOR_OVERRIDE` / `INTENT_OVERRIDE` for why this
+    /// is a task-local and not `AppState` / a `DashMap` / any shared slot:
+    /// an ambient slot under concurrency would cross-attribute one
+    /// request's channel onto another's op, producing provenance that is
+    /// confidently wrong — worse than the honest `Origin::NotDetermined`.
+    pub static ORIGIN_OVERRIDE: Origin;
+}
+
 /// Shared, lock-protected handle to a [`Timeline`].
 ///
 /// `Timeline::add_operation` only requires `&self` (it uses interior
@@ -164,6 +221,25 @@ pub struct TimelineRecorder {
     /// event it applies to the timeline. `None` = in-memory-only (the pre-
     /// durability behaviour and every test that does not exercise persistence).
     sink: Option<Arc<dyn EventSink>>,
+    /// Shared handle to the destination timeline, kept ONLY so
+    /// [`reserve_event_key`](OperationRecorder::reserve_event_key) can
+    /// resolve [`event_counter`](Self::event_counter) — see that field.
+    /// Never used for anything requiring the write half of the lock.
+    timeline: SharedTimeline,
+    /// Lazily-resolved, then permanently cached, lock-free handle to the
+    /// timeline's raw sequence counter (`Timeline::event_counter_handle`).
+    ///
+    /// `OperationRecorder::reserve_event_key` is a synchronous, non-blocking
+    /// call made on the kernel's own operation thread — it cannot `.await`
+    /// `timeline`'s `tokio::sync::RwLock`. Resolving the raw `Arc<AtomicU64>`
+    /// ONCE, via a non-blocking `try_read`, and caching it here makes every
+    /// SUBSEQUENT reservation lock-free and infallible (a plain
+    /// `fetch_add`); only a reservation attempted before the first
+    /// successful resolution falls back to the caller's `root_counter`
+    /// default (see `reserve_event_key`'s doc comment). `Arc`-wrapped (not a
+    /// bare `OnceLock`) so cloned `TimelineRecorder` handles share ONE
+    /// resolution, matching `staging` / `branch_id`.
+    event_counter: Arc<std::sync::OnceLock<Arc<std::sync::atomic::AtomicU64>>>,
 }
 
 impl std::fmt::Debug for TimelineRecorder {
@@ -192,6 +268,16 @@ struct StagingState {
     /// drain time would lose the per-request override). Drained to the
     /// MPSC on commit; cleared on abort.
     buffer: Vec<(RecordedOperation, Author)>,
+    /// Nesting depth for `begin_discard_scope`/`end_discard_scope` — a
+    /// SEPARATE counter from `depth`. A `begin_pending` scope may still
+    /// commit (its buffered events reach the timeline), so records inside
+    /// it legitimately need a certificate; a `begin_discard_scope` scope
+    /// (the api-server's `RecorderSuppressGuard`) never commits, so
+    /// certifying inside it is pure waste. Distinguishing the two is the
+    /// entire point — collapsing them into one counter would make every
+    /// `with_rollback`-staged record skip certification too, silently
+    /// dropping real per-op certificates on their success path.
+    discard_depth: u32,
 }
 
 impl TimelineRecorder {
@@ -258,6 +344,10 @@ impl TimelineRecorder {
         let (tx, mut rx) = mpsc::channel::<RecorderCmd>(capacity);
         let branch_id = Arc::new(PlRwLock::new(branch_id));
 
+        // Kept on the recorder itself (see the `timeline` / `event_counter`
+        // field docs) BEFORE the handle below is moved into the worker task.
+        let recorder_timeline = Arc::clone(&timeline);
+
         let worker_branch = Arc::clone(&branch_id);
         let worker_timeline = timeline;
         let worker_sink = sink.clone();
@@ -266,12 +356,51 @@ impl TimelineRecorder {
                 match cmd {
                     RecorderCmd::Op { record, author } => {
                         let op = to_timeline_operation(&record);
+                        // Project the kernel proof the recording handler
+                        // attached at record time into the per-event
+                        // certificate the event will carry. Absent stays
+                        // absent: a record without a `solid_certificate`
+                        // produces an event without one — an honest "not
+                        // certified", never a fabricated verdict.
+                        let certificate = record
+                            .solid_certificate
+                            .as_ref()
+                            .map(crate::event_certificate::EventCertificate::from_recorded_solid);
                         // Snapshot the active branch *per event* so a swap via
                         // `set_branch_id` takes effect on the next op without
                         // restarting the worker.
                         let target = *worker_branch.read();
                         let guard = worker_timeline.read().await;
-                        match guard.add_operation(op, author, target).await {
+                        // Root-pid reservation handoff (see
+                        // `topology_builder::next_root_seed` /
+                        // `reserve_event_key`): a record whose root pids were
+                        // minted under an on-demand reservation carries the
+                        // EXACT sequence number that reservation burned. That
+                        // number must be honoured verbatim — appending via
+                        // the normal (fresh-burn) path here would give this
+                        // event a DIFFERENT sequence than the one its root
+                        // pids were seeded from, reproducing the very defect
+                        // this seam exists to close, just moved one level
+                        // down.
+                        let append_result = match record.reserved_sequence {
+                            Some(seq) => {
+                                guard
+                                    .add_operation_reserved_certified(
+                                        op,
+                                        author,
+                                        target,
+                                        seq,
+                                        certificate,
+                                    )
+                                    .await
+                            }
+                            None => {
+                                guard
+                                    .add_operation_certified(op, author, target, certificate)
+                                    .await
+                            }
+                        };
+                        match append_result {
                             Ok(event_id) => {
                                 // Durability write-through. The event now carries
                                 // its burned `sequence_number`; persist it before
@@ -330,6 +459,8 @@ impl TimelineRecorder {
             branch_id,
             staging: Arc::new(PlRwLock::new(StagingState::default())),
             sink,
+            timeline: recorder_timeline,
+            event_counter: Arc::new(std::sync::OnceLock::new()),
         }
     }
 
@@ -412,7 +543,7 @@ impl TimelineRecorder {
 }
 
 impl OperationRecorder for TimelineRecorder {
-    fn record(&self, operation: RecordedOperation) -> Result<(), RecorderError> {
+    fn record(&self, mut operation: RecordedOperation) -> Result<(), RecorderError> {
         // Resolve the author NOW, on the recording task: the task-local
         // override (set by the api-server for agent-tagged requests)
         // wins; otherwise fall back to the recorder's default. `record`
@@ -422,6 +553,82 @@ impl OperationRecorder for TimelineRecorder {
         let author = AUTHOR_OVERRIDE
             .try_with(Clone::clone)
             .unwrap_or_else(|_| self.author.clone());
+        // Stamp the request's open intent NOW, on the recording task, for
+        // exactly the reason the author is resolved here and not on the
+        // drain worker: the worker runs on a different task, where the
+        // task-local of whatever request happens to be live would be read —
+        // cross-attributed provenance, confidently wrong. A record that
+        // already carries an intent (a future kernel-side producer) is left
+        // untouched. No scope on this task → no facet: the op records
+        // exactly as before, and the absence stays absent and legible —
+        // never defaulted to a placeholder or back-filled from the op kind.
+        if operation.facets.intent().is_none() {
+            if let Ok(ctx) = INTENT_OVERRIDE.try_with(Clone::clone) {
+                let facet = IntentFacet {
+                    text: ctx.text,
+                    turn_id: ctx.turn_id,
+                    // `agent_stated`, deliberately NOT `human_verbatim`: the
+                    // checkpoint phrase is the AGENT'S OWN wording of what it
+                    // is doing, not text carried verbatim from a human turn
+                    // (no such path exists yet). The distinction is the whole
+                    // reason `source` exists — human-directed output can be
+                    // IP-protectable while purely AI-generated output is not,
+                    // so labelling agent text as human text would corrupt the
+                    // exact claim this field supports.
+                    source: "agent_stated".to_string(),
+                };
+                if let Err(err) = operation.facets.set_intent(&facet) {
+                    // A string-only payload cannot realistically fail to
+                    // serialize; if it ever does, record WITHOUT the facet
+                    // (honest absence) rather than dropping the op or
+                    // fabricating a partial intent.
+                    tracing::warn!(
+                        target: "timeline.recorder_bridge",
+                        kind = %operation.kind,
+                        error = %err,
+                        "failed to stamp IntentFacet — recording without it"
+                    );
+                }
+            }
+        }
+        // Stamp the request's origin channel NOW, on the recording task, for
+        // the same reason author and intent are resolved here rather than
+        // on the drain worker. Unlike intent, this ALWAYS stamps — a
+        // channel is always structurally determinable to at least the
+        // honest `NotDetermined` level, so leaving the facet off entirely
+        // would make "no channel recorded" indistinguishable from "this
+        // build doesn't track channels yet". A record that already carries
+        // an origin (replay re-applying a stored event whose original
+        // record already has one) is left untouched — replay must never
+        // relabel history with whatever channel happens to be driving the
+        // replay call itself.
+        if operation.facets.origin().is_none() {
+            let channel = ORIGIN_OVERRIDE
+                .try_with(|o| *o)
+                .unwrap_or(Origin::NotDetermined);
+            // `Mcp` is the one variant that is a CLIENT claim (the MCP
+            // client's own headers), never server-verified — see
+            // `OriginFacet`'s doc comment. Every other variant, including
+            // `NotDetermined`, is something the server itself established
+            // (or explicitly failed to).
+            let basis = if channel == Origin::Mcp {
+                OriginBasis::ClientHeader
+            } else {
+                OriginBasis::ServerObserved
+            };
+            let facet = OriginFacet { channel, basis };
+            if let Err(err) = operation.facets.set_origin(&facet) {
+                // A closed enum pair cannot realistically fail to
+                // serialize; if it ever does, record WITHOUT the facet
+                // (honest absence) rather than dropping the op.
+                tracing::warn!(
+                    target: "timeline.recorder_bridge",
+                    kind = %operation.kind,
+                    error = %err,
+                    "failed to stamp OriginFacet — recording without it"
+                );
+            }
+        }
         // Inside a staging window, divert into the buffer. This is the
         // H10 bridge contract: a `with_rollback` body that fails must
         // not leave partial events on the timeline. Lock scope kept
@@ -502,21 +709,103 @@ impl OperationRecorder for TimelineRecorder {
             state.buffer.clear();
         }
     }
+
+    fn begin_discard_scope(&self) {
+        // `saturating_add`: same defensive posture as `begin_pending` —
+        // realistic nesting is shallow.
+        let mut state = self.staging.write();
+        state.discard_depth = state.discard_depth.saturating_add(1);
+    }
+
+    fn end_discard_scope(&self) {
+        let mut state = self.staging.write();
+        if state.discard_depth == 0 {
+            tracing::warn!(
+                target: "timeline.recorder_bridge",
+                "end_discard_scope called with discard_depth=0 (no matching begin_discard_scope); ignoring"
+            );
+            return;
+        }
+        state.discard_depth -= 1;
+    }
+
+    fn records_are_discarded(&self) -> bool {
+        self.staging.read().discard_depth > 0
+    }
+
+    /// Reserve the timeline's next sequence number synchronously and return
+    /// it as `"evt:{seq}"` — the live-authoring counterpart of the key
+    /// `timeline_engine::replay::apply_event` seeds from
+    /// `event.sequence_number` before re-executing an event. See
+    /// `OperationRecorder::reserve_event_key`'s doc comment for the full
+    /// contract this closes.
+    ///
+    /// Resolves [`event_counter`](Self::event_counter) on first use (a
+    /// non-blocking `try_read` of [`timeline`](Self::timeline), cached
+    /// thereafter) so every reservation after the first is a lock-free
+    /// atomic `fetch_add` — see that field's doc comment. `None` only when
+    /// the very first attempt races a writer holding the timeline's write
+    /// lock (construction-time contention); `next_root_seed` falls back to
+    /// `root_counter` for that one call, exactly as if no recorder were
+    /// attached.
+    fn reserve_event_key(&self) -> Option<String> {
+        let counter = if let Some(c) = self.event_counter.get() {
+            Arc::clone(c)
+        } else {
+            match self.timeline.try_read() {
+                Ok(guard) => {
+                    let resolved = guard.event_counter_handle();
+                    // `set` can lose a race to a concurrent first resolver;
+                    // either winner's handle is the SAME underlying counter
+                    // (both cloned from the same `Timeline`), so losing the
+                    // race is harmless — use whichever ended up cached.
+                    let _ = self.event_counter.set(Arc::clone(&resolved));
+                    self.event_counter.get().map(Arc::clone).unwrap_or(resolved)
+                }
+                Err(_) => return None,
+            }
+        };
+        let seq = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Some(format!("evt:{seq}"))
+    }
 }
 
 /// Map a kernel-side `RecordedOperation` to a timeline `Operation`.
 ///
 /// The envelope preserves the original `kind`, the structured parameter
-/// payload, and the input/output entity ID lists so that downstream
-/// consumers (UI, replay, audit) have byte-for-byte fidelity.
+/// payload, the input/output entity ID lists, the deletion channel, and
+/// the facet container so that downstream consumers (UI, replay, audit,
+/// the lineage projection) have byte-for-byte fidelity. `deleted` and
+/// `facets` mirror their wire form on `RecordedOperation`: present only
+/// when non-empty, so pre-change events keep their exact envelope shape
+/// and existing consumers of `params` / `inputs` / `outputs` (e.g.
+/// `lineage.rs`) are untouched. A `solid_certificate` attached to the
+/// record is NOT part of this replay envelope — the drain worker projects
+/// it into an `EventCertificate` and stores it on the event's metadata
+/// instead.
 fn to_timeline_operation(record: &RecordedOperation) -> Operation {
+    let mut envelope = serde_json::Map::new();
+    envelope.insert("params".to_string(), record.parameters.clone());
+    envelope.insert(
+        "inputs".to_string(),
+        serde_json::Value::from(record.inputs.clone()),
+    );
+    envelope.insert(
+        "outputs".to_string(),
+        serde_json::Value::from(record.outputs.clone()),
+    );
+    if !record.deleted.is_empty() {
+        envelope.insert(
+            "deleted".to_string(),
+            serde_json::Value::from(record.deleted.clone()),
+        );
+    }
+    if !record.facets.is_empty() {
+        envelope.insert("facets".to_string(), record.facets.to_json());
+    }
     Operation::Generic {
         command_type: record.kind.clone(),
-        parameters: serde_json::json!({
-            "params": record.parameters,
-            "inputs": record.inputs,
-            "outputs": record.outputs,
-        }),
+        parameters: serde_json::Value::Object(envelope),
     }
 }
 
@@ -526,13 +815,193 @@ mod tests {
     use crate::timeline::Timeline;
     use crate::types::TimelineConfig;
 
+    /// Drive one `RecordedOperation` through the REAL bridge into a real
+    /// `Timeline` and hand back the event that landed. Drops the recorder to
+    /// close the channel and force the drain worker to flush.
+    async fn record_one(record: RecordedOperation) -> crate::types::TimelineEvent {
+        let timeline: SharedTimeline =
+            Arc::new(RwLock::new(Timeline::new(TimelineConfig::default())));
+        let recorder =
+            TimelineRecorder::new(Arc::clone(&timeline), Author::System, BranchId::main());
+        recorder.record(record).expect("record succeeds");
+        drop(recorder);
+
+        let main = BranchId::main();
+        for _ in 0..200 {
+            let events = timeline
+                .read()
+                .await
+                .get_branch_events(&main, None, None)
+                .unwrap_or_default();
+            if let Some(event) = events.into_iter().next() {
+                return event;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("the recorded operation never reached the timeline");
+    }
+
+    /// A kernel-path event must carry the lineage the `RecordedOperation`
+    /// DECLARED in its typed `inputs`/`outputs` — not an empty decoy that ~19
+    /// production consumers read as "this operation affected nothing".
+    ///
+    /// RED before the typed channels were projected from the envelope:
+    /// `outputs` was constructed unconditionally empty at the sole production
+    /// construction site, so `created` was `[]` for every real operation.
+    #[tokio::test]
+    async fn kernel_path_event_carries_its_recorded_inputs_and_outputs() {
+        use crate::kernel_ref::{render_bare, render_ref};
+
+        let event = record_one(
+            RecordedOperation::new("extrude_face")
+                .with_parameters(serde_json::json!({ "distance": 5.0 }))
+                .with_input_solids([1u64])
+                .with_input_faces([9u64])
+                .with_output_solids([1u64])
+                .with_output_edges([4u64])
+                .with_deleted_faces([7u64]),
+        )
+        .await;
+
+        let required: Vec<String> = event
+            .inputs
+            .required_entities
+            .iter()
+            .map(|r| render_ref(r.expected_type, r.id))
+            .collect();
+        assert_eq!(
+            required,
+            vec!["solid:1".to_string(), "face:9".to_string()],
+            "the event must state exactly the inputs the kernel recorded"
+        );
+
+        let created: Vec<String> = event
+            .outputs
+            .created
+            .iter()
+            .map(|c| render_ref(c.entity_type, c.id))
+            .collect();
+        assert_eq!(
+            created,
+            vec!["edge:4".to_string()],
+            "an output the operation did not also consume was created"
+        );
+
+        let modified: Vec<String> = event
+            .outputs
+            .modified
+            .iter()
+            .filter_map(|id| render_bare(*id))
+            .collect();
+        assert_eq!(
+            modified,
+            vec!["solid:1".to_string()],
+            "an entity both consumed and produced was modified"
+        );
+
+        let deleted: Vec<String> = event
+            .outputs
+            .deleted
+            .iter()
+            .filter_map(|id| render_bare(*id))
+            .collect();
+        assert_eq!(
+            deleted,
+            vec!["face:7".to_string()],
+            "the recorded deletion channel must reach the typed outputs"
+        );
+    }
+
+    /// A recorded non-solid ref keeps its kind. `face:9` typed as
+    /// `EntityType::Solid` is the coercion this pins against — and the id
+    /// itself must differ from `solid:9`, since the two are different entities
+    /// in different kernel counter namespaces.
+    #[tokio::test]
+    async fn a_recorded_face_ref_does_not_become_a_solid() {
+        use crate::kernel_ref::{decode, encode};
+        use crate::types::EntityType;
+
+        let event = record_one(
+            RecordedOperation::new("blend_edge")
+                .with_input_faces([9u64])
+                .with_input_edges([3u64])
+                .with_output_solids([2u64]),
+        )
+        .await;
+
+        let kinds: Vec<EntityType> = event
+            .inputs
+            .required_entities
+            .iter()
+            .map(|r| r.expected_type)
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![EntityType::Face, EntityType::Edge],
+            "recorded kinds must survive; every entry typed Solid was the defect"
+        );
+        assert_eq!(
+            event.outputs.created.first().map(|c| c.entity_type),
+            Some(EntityType::Solid)
+        );
+
+        let face_id = event.inputs.required_entities[0].id;
+        assert_eq!(decode(face_id), Some((EntityType::Face, 9)));
+        assert_ne!(
+            face_id,
+            encode(EntityType::Solid, 9),
+            "face:9 and solid:9 are different entities and must not share an id"
+        );
+    }
+
+    /// An operation whose recorded refs cannot all be represented gets NO
+    /// typed lineage rather than a partial set — a consumer reading two of
+    /// three required entities has no way to know one is missing. The
+    /// envelope keeps the full truth either way.
+    #[tokio::test]
+    async fn an_unrepresentable_ref_leaves_the_typed_channels_wholly_empty() {
+        let event = record_one(
+            RecordedOperation::new("vendor_op")
+                .with_input_solids([1u64])
+                .with_input_refs(["gremlin:2"])
+                .with_output_solids([3u64]),
+        )
+        .await;
+
+        assert!(
+            event.inputs.required_entities.is_empty(),
+            "a partially populated input channel is the same lie at smaller scale"
+        );
+        assert!(event.outputs.created.is_empty());
+        match &event.operation {
+            Operation::Generic { parameters, .. } => assert_eq!(
+                parameters["inputs"],
+                serde_json::json!(["solid:1", "gremlin:2"]),
+                "the envelope still carries the full recorded lineage"
+            ),
+            other => panic!("expected Operation::Generic, got {other:?}"),
+        }
+    }
+
     #[test]
     fn maps_recorded_operation_to_generic() {
-        let rec = RecordedOperation::new("extrude_face")
+        use geometry_engine::operations::recorder::IntentFacet;
+
+        let mut rec = RecordedOperation::new("extrude_face")
             .with_parameters(serde_json::json!({ "distance": 5.0 }))
             .with_input_faces([1u64])
             .with_input_edges([2u64, 3u64])
-            .with_output_solids([42u64]);
+            .with_output_solids([42u64])
+            .with_deleted_faces([7u64, 8u64]);
+        rec.facets
+            .set_intent(&IntentFacet {
+                text: "extrude the base".to_string(),
+                turn_id: None,
+                source: "agent_turn".to_string(),
+            })
+            .expect("set intent facet");
+        rec.facets
+            .set_raw("vendor.unknown", serde_json::json!({ "k": 1 }));
 
         let op = to_timeline_operation(&rec);
         match op {
@@ -547,6 +1016,48 @@ mod tests {
                     serde_json::json!(["face:1", "edge:2", "edge:3"])
                 );
                 assert_eq!(parameters["outputs"], serde_json::json!(["solid:42"]));
+                assert_eq!(
+                    parameters["deleted"],
+                    serde_json::json!(["face:7", "face:8"]),
+                    "the deletion channel must survive the bridge"
+                );
+                assert_eq!(
+                    parameters["facets"][IntentFacet::NAME],
+                    serde_json::json!({ "text": "extrude the base", "source": "agent_turn" }),
+                    "a typed facet must survive the bridge"
+                );
+                assert_eq!(
+                    parameters["facets"]["vendor.unknown"],
+                    serde_json::json!({ "k": 1 }),
+                    "an unknown facet must survive the bridge untouched"
+                );
+            }
+            other => panic!("expected Operation::Generic, got {:?}", other),
+        }
+    }
+
+    /// A record with no deletions and no facets maps to the EXACT pre-change
+    /// envelope — `params` / `inputs` / `outputs` only, no `deleted` or
+    /// `facets` keys — so existing consumers (e.g. the lineage projection)
+    /// see byte-identical envelopes for existing producers.
+    #[test]
+    fn envelope_omits_deleted_and_facets_when_empty() {
+        let rec = RecordedOperation::new("extrude_face")
+            .with_parameters(serde_json::json!({ "distance": 5.0 }))
+            .with_input_faces([1u64])
+            .with_output_solids([42u64]);
+
+        let op = to_timeline_operation(&rec);
+        match op {
+            Operation::Generic { parameters, .. } => {
+                let obj = parameters.as_object().expect("envelope is an object");
+                let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+                keys.sort_unstable();
+                assert_eq!(
+                    keys,
+                    vec!["inputs", "outputs", "params"],
+                    "empty deleted/facets must not appear in the envelope"
+                );
             }
             other => panic!("expected Operation::Generic, got {:?}", other),
         }
@@ -692,6 +1203,205 @@ mod tests {
         assert!(
             got_unavailable,
             "256 synchronous sends with capacity=1 and no worker yield must saturate the channel"
+        );
+    }
+
+    /// THE PRODUCER PIN. A `RecordedOperation` carrying a
+    /// `RecordedSolidCertificate` must land on the timeline as an event whose
+    /// metadata carries the projected `EventCertificate`, readable back via
+    /// `EventCertificate::from_metadata` — and an op recorded WITHOUT one
+    /// must stay uncertified. RED before the bridge forwarded certificates:
+    /// `from_metadata` returned `None` for every event.
+    #[tokio::test]
+    async fn solid_certificate_on_record_lands_on_the_event_metadata() {
+        use crate::event_certificate::EventCertificate;
+        use geometry_engine::operations::recorder::RecordedSolidCertificate;
+        use geometry_engine::primitives::topology_builder::{
+            BRepModel, GeometryId, TopologyBuilder,
+        };
+
+        // A REAL kernel certificate for a real box — not a hand-built one —
+        // so the stored proof is exactly what the kernel proved.
+        let mut model = BRepModel::new();
+        let gid = TopologyBuilder::new(&mut model)
+            .create_box_3d(10.0, 10.0, 10.0)
+            .expect("create_box_3d");
+        let solid_id = match gid {
+            GeometryId::Solid(id) => id,
+            other => panic!("expected a solid, got {other:?}"),
+        };
+        let cert = model.certify_solid(solid_id);
+        let volume = model.calculate_solid_volume(solid_id);
+        let face_count = model.solid_outer_face_count(solid_id);
+        let recorded_cert = RecordedSolidCertificate::from_validity(&cert, volume, face_count);
+        let expected = EventCertificate::from_recorded_solid(&recorded_cert);
+
+        let timeline: SharedTimeline =
+            Arc::new(RwLock::new(Timeline::new(TimelineConfig::default())));
+        let recorder =
+            TimelineRecorder::new(Arc::clone(&timeline), Author::System, BranchId::main());
+
+        recorder
+            .record(
+                RecordedOperation::new("sketch_extrude")
+                    .with_output_solids([u64::from(solid_id)])
+                    .with_solid_certificate(recorded_cert),
+            )
+            .expect("record certified op");
+        recorder
+            .record(RecordedOperation::new("uncertified"))
+            .expect("record uncertified op");
+        drop(recorder);
+
+        let main = BranchId::main();
+        for _ in 0..100 {
+            let count = timeline
+                .read()
+                .await
+                .get_branch_events(&main, None, None)
+                .map(|v| v.len())
+                .unwrap_or(0);
+            if count >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let events = timeline
+            .read()
+            .await
+            .get_branch_events(&main, None, None)
+            .expect("branch events");
+        assert_eq!(events.len(), 2, "both records reach the timeline");
+
+        let certified_event = events
+            .iter()
+            .find(|e| {
+                matches!(&e.operation, Operation::Generic { command_type, .. }
+                    if command_type == "sketch_extrude")
+            })
+            .expect("the certified op's event exists");
+        let stored = EventCertificate::from_metadata(&certified_event.metadata)
+            .expect("the recorded certificate must land on the event metadata");
+        assert_eq!(stored, expected);
+        assert_eq!(
+            stored.is_sound,
+            Some(cert.is_sound()),
+            "stored is_sound must be the verdict the kernel actually proved"
+        );
+
+        let uncertified_event = events
+            .iter()
+            .find(|e| {
+                matches!(&e.operation, Operation::Generic { command_type, .. }
+                    if command_type == "uncertified")
+            })
+            .expect("the uncertified op's event exists");
+        assert!(
+            EventCertificate::from_metadata(&uncertified_event.metadata).is_none(),
+            "an op recorded without a certificate must stay uncertified — never fabricated"
+        );
+    }
+
+    /// Root-pid reservation handoff (#64 / #11): a record carrying BOTH a
+    /// `reserved_sequence` (the on-demand reservation `next_root_seed` made
+    /// so a live root pid matches what replay re-derives) AND a
+    /// `solid_certificate` must land on the timeline at EXACTLY the
+    /// reserved sequence number AND still carry its `EventCertificate` on
+    /// the event's metadata. This pins the specific regression the
+    /// reserved-append switch could silently introduce:
+    /// `add_operation_reserved` (the pre-existing, non-certifying sibling
+    /// of `add_operation_certified`) hardcodes `certificate: None`, so
+    /// routing the reserved path through it would silently stop
+    /// certifying every reservation-carrying event. The drain worker must
+    /// call `add_operation_reserved_certified` instead — this test fails
+    /// if it regresses back to the plain, uncertifying variant.
+    #[tokio::test]
+    async fn reserved_sequence_record_lands_at_the_reservation_and_keeps_its_certificate() {
+        use crate::event_certificate::EventCertificate;
+        use geometry_engine::operations::recorder::RecordedSolidCertificate;
+        use geometry_engine::primitives::topology_builder::{
+            BRepModel, GeometryId, TopologyBuilder,
+        };
+
+        let mut model = BRepModel::new();
+        let gid = TopologyBuilder::new(&mut model)
+            .create_box_3d(6.0, 6.0, 6.0)
+            .expect("create_box_3d");
+        let solid_id = match gid {
+            GeometryId::Solid(id) => id,
+            other => panic!("expected a solid, got {other:?}"),
+        };
+        let cert = model.certify_solid(solid_id);
+        let volume = model.calculate_solid_volume(solid_id);
+        let face_count = model.solid_outer_face_count(solid_id);
+        let recorded_cert = RecordedSolidCertificate::from_validity(&cert, volume, face_count);
+        let expected_cert = EventCertificate::from_recorded_solid(&recorded_cert);
+
+        let timeline: SharedTimeline =
+            Arc::new(RwLock::new(Timeline::new(TimelineConfig::default())));
+        let recorder =
+            TimelineRecorder::new(Arc::clone(&timeline), Author::System, BranchId::main());
+
+        // Burn one ordinary event first so the reservation below is not
+        // simply "whatever the counter happens to start at" — it must be
+        // the SPECIFIC number reserved, not an accidental match with a
+        // fresh burn.
+        recorder
+            .record(RecordedOperation::new("filler"))
+            .expect("record filler op");
+
+        let reserved = timeline.read().await.reserve_sequence_number();
+        let mut op = RecordedOperation::new("chamfer_edges")
+            .with_output_solids([u64::from(solid_id)])
+            .with_solid_certificate(recorded_cert);
+        op.reserved_sequence = Some(reserved);
+        recorder.record(op).expect("record reserved+certified op");
+        drop(recorder);
+
+        let main = BranchId::main();
+        for _ in 0..100 {
+            let count = timeline
+                .read()
+                .await
+                .get_branch_events(&main, None, None)
+                .map(|v| v.len())
+                .unwrap_or(0);
+            if count >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let events = timeline
+            .read()
+            .await
+            .get_branch_events(&main, None, None)
+            .expect("branch events");
+        assert_eq!(events.len(), 2, "both records reach the timeline");
+
+        let reserved_event = events
+            .iter()
+            .find(|e| {
+                matches!(&e.operation, Operation::Generic { command_type, .. }
+                    if command_type == "chamfer_edges")
+            })
+            .expect("the reserved op's event exists");
+        assert_eq!(
+            reserved_event.sequence_number, reserved,
+            "a reservation-carrying record must land at EXACTLY the reserved \
+             sequence, not a fresh burn"
+        );
+        let stored_cert = EventCertificate::from_metadata(&reserved_event.metadata).expect(
+            "a reservation-carrying record must still carry its certificate — \
+             `add_operation_reserved_certified`, not the plain `add_operation_reserved` \
+             (which hardcodes `certificate: None`), must be the append the worker uses",
+        );
+        assert_eq!(stored_cert, expected_cert);
+        assert_eq!(
+            stored_cert.is_sound,
+            Some(cert.is_sound()),
+            "stored is_sound must be the verdict the kernel actually proved"
         );
     }
 
@@ -877,5 +1587,461 @@ mod tests {
             3,
             "all 3 events reach the timeline after outer commit"
         );
+    }
+
+    /// Extract the `roshera.intent` facet payload from an event's replay
+    /// envelope, or `None` when the event carries no intent (which itself
+    /// asserts the whole `facets` key is honest — an op with no facets has
+    /// no `facets` key at all, per `envelope_omits_deleted_and_facets_when_empty`).
+    fn intent_of(event: &TimelineEvent) -> Option<serde_json::Value> {
+        match &event.operation {
+            Operation::Generic { parameters, .. } => parameters
+                .get("facets")
+                .and_then(|f| f.get(geometry_engine::operations::recorder::IntentFacet::NAME))
+                .cloned(),
+            other => panic!("expected Operation::Generic, got {:?}", other),
+        }
+    }
+
+    /// Await until the branch holds at least `n` events, then return them.
+    async fn drained_events(timeline: &SharedTimeline, n: usize) -> Vec<TimelineEvent> {
+        let main = BranchId::main();
+        for _ in 0..100 {
+            let count = timeline
+                .read()
+                .await
+                .get_branch_events(&main, None, None)
+                .map(|v| v.len())
+                .unwrap_or(0);
+            if count >= n {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        timeline
+            .read()
+            .await
+            .get_branch_events(&main, None, None)
+            .expect("branch events")
+    }
+
+    /// THE INTENT PRODUCER PIN. An op recorded while the request task's
+    /// `INTENT_OVERRIDE` scope is live must land on the timeline carrying an
+    /// `IntentFacet` with the scoped text, the scoped turn id, and
+    /// `source: "agent_stated"` (the checkpoint phrase is the agent's own
+    /// wording — never labelled as human text). An op recorded with no scope
+    /// must carry no facet at all: absence stays absent, never defaulted.
+    /// RED before the producer existed: `intent_of` returned `None` for the
+    /// scoped op too — the declaration was thrown away.
+    #[tokio::test]
+    async fn intent_scope_stamps_agent_stated_facet_and_absence_stays_absent() {
+        let timeline: SharedTimeline =
+            Arc::new(RwLock::new(Timeline::new(TimelineConfig::default())));
+        let recorder =
+            TimelineRecorder::new(Arc::clone(&timeline), Author::System, BranchId::main());
+
+        INTENT_OVERRIDE
+            .scope(
+                IntentContext {
+                    text: "bolt circle 8 x D18 on D160 B.C.".to_string(),
+                    turn_id: Some("14".to_string()),
+                },
+                async {
+                    recorder
+                        .record(RecordedOperation::new("with-intent"))
+                        .expect("record inside intent scope");
+                },
+            )
+            .await;
+        recorder
+            .record(RecordedOperation::new("without-intent"))
+            .expect("record outside intent scope");
+        drop(recorder);
+
+        let events = drained_events(&timeline, 2).await;
+        assert_eq!(events.len(), 2, "both records reach the timeline");
+
+        let stamped = events
+            .iter()
+            .find(|e| {
+                matches!(&e.operation, Operation::Generic { command_type, .. }
+                    if command_type == "with-intent")
+            })
+            .expect("the scoped op's event exists");
+        let facet = intent_of(stamped)
+            .expect("an op recorded inside an intent scope must carry the IntentFacet");
+        assert_eq!(facet["text"], "bolt circle 8 x D18 on D160 B.C.");
+        assert_eq!(facet["turn_id"], "14");
+        assert_eq!(
+            facet["source"], "agent_stated",
+            "the checkpoint phrase is the AGENT'S wording — it must be \
+             `agent_stated`, never a label claiming human authorship"
+        );
+
+        let unstamped = events
+            .iter()
+            .find(|e| {
+                matches!(&e.operation, Operation::Generic { command_type, .. }
+                    if command_type == "without-intent")
+            })
+            .expect("the unscoped op's event exists");
+        assert!(
+            intent_of(unstamped).is_none(),
+            "an op recorded with no open intent must carry NO facet — \
+             absence stays absent, never defaulted or back-filled"
+        );
+    }
+
+    /// THE CROSS-ATTRIBUTION PIN — the defect class this feature must never
+    /// have. Two concurrent recording tasks, each inside its OWN
+    /// `INTENT_OVERRIDE` scope with a DIFFERENT intent, both recording
+    /// before the drain worker applies either (the test holds the timeline
+    /// WRITE lock while both records land, pinning the worker at its
+    /// `read().await`, then releases it — the interleaving is DRIVEN, not
+    /// hoped for). Each event must carry ITS OWN intent. This is exactly
+    /// the interleaving where an ambient implementation — the task-local
+    /// read moved to the drain worker, or the intent parked in any shared
+    /// slot — attributes op-alpha to task beta's intent (or loses it
+    /// entirely, since the worker task has no scope). Mutation-proven RED
+    /// against the drain-worker/ambient-slot variant.
+    #[tokio::test(flavor = "current_thread")]
+    async fn concurrent_tasks_with_different_intents_never_cross_attribute() {
+        let timeline: SharedTimeline =
+            Arc::new(RwLock::new(Timeline::new(TimelineConfig::default())));
+        let recorder =
+            TimelineRecorder::new(Arc::clone(&timeline), Author::System, BranchId::main());
+
+        // Pin the drain worker: it needs `timeline.read().await` to apply
+        // an op, so holding the write lock guarantees BOTH records are in
+        // the channel before EITHER is applied — the window an ambient
+        // intent slot gets overwritten in.
+        let write_guard = timeline.write().await;
+
+        let alpha_recorder = recorder.clone();
+        let alpha = tokio::spawn(INTENT_OVERRIDE.scope(
+            IntentContext {
+                text: "alpha: M8 clearance holes, close fit, 4x base corners".to_string(),
+                turn_id: Some("3".to_string()),
+            },
+            async move {
+                alpha_recorder
+                    .record(RecordedOperation::new("op-alpha"))
+                    .expect("record op-alpha inside alpha's scope");
+            },
+        ));
+        let beta_recorder = recorder.clone();
+        let beta = tokio::spawn(INTENT_OVERRIDE.scope(
+            IntentContext {
+                text: "beta: shell 2mm, open top face".to_string(),
+                turn_id: Some("9".to_string()),
+            },
+            async move {
+                beta_recorder
+                    .record(RecordedOperation::new("op-beta"))
+                    .expect("record op-beta inside beta's scope");
+            },
+        ));
+        alpha.await.expect("alpha task completes");
+        beta.await.expect("beta task completes");
+
+        // Both records are now queued. Release the worker and drain.
+        drop(write_guard);
+        drop(recorder);
+
+        let events = drained_events(&timeline, 2).await;
+        assert_eq!(
+            events.len(),
+            2,
+            "both concurrent records reach the timeline"
+        );
+
+        for (kind, own_text) in [
+            (
+                "op-alpha",
+                "alpha: M8 clearance holes, close fit, 4x base corners",
+            ),
+            ("op-beta", "beta: shell 2mm, open top face"),
+        ] {
+            let event = events
+                .iter()
+                .find(|e| {
+                    matches!(&e.operation, Operation::Generic { command_type, .. }
+                        if command_type == kind)
+                })
+                .unwrap_or_else(|| panic!("{kind}'s event exists"));
+            let facet = intent_of(event).unwrap_or_else(|| {
+                panic!(
+                    "{kind} lost its intent — the facet must be stamped at \
+                     record() time on the requesting task, not read later on \
+                     the drain worker (which has no scope)"
+                )
+            });
+            assert_eq!(
+                facet["text"], own_text,
+                "{kind} must carry ITS OWN intent, never the concurrent \
+                 task's — cross-attribution is confidently-wrong provenance, \
+                 worse than absence"
+            );
+        }
+    }
+
+    // ──────────── Origin provenance (`roshera.origin`) ────────────
+
+    /// Extract the `roshera.origin` facet payload from an event's replay
+    /// envelope, or `None` when the event carries no origin at all.
+    fn origin_of(event: &TimelineEvent) -> Option<serde_json::Value> {
+        match &event.operation {
+            Operation::Generic { parameters, .. } => parameters
+                .get("facets")
+                .and_then(|f| f.get(OriginFacet::NAME))
+                .cloned(),
+            other => panic!("expected Operation::Generic, got {:?}", other),
+        }
+    }
+
+    /// THE ALWAYS-STAMPED PIN. Unlike intent (present only when the MCP
+    /// gate's checkpoint is open), origin is attached to EVERY op
+    /// `TimelineRecorder` records. With no `ORIGIN_OVERRIDE` scope live on
+    /// the recording task, the op must still carry the facet — with the
+    /// honest `not_determined` value, never simply absent. RED before the
+    /// producer existed: `origin_of` returned `None` for an unscoped op.
+    #[tokio::test]
+    async fn record_with_no_origin_scope_stamps_not_determined() {
+        let timeline: SharedTimeline =
+            Arc::new(RwLock::new(Timeline::new(TimelineConfig::default())));
+        let recorder =
+            TimelineRecorder::new(Arc::clone(&timeline), Author::System, BranchId::main());
+
+        recorder
+            .record(RecordedOperation::new("no-scope"))
+            .expect("record with no origin scope");
+        drop(recorder);
+
+        let events = drained_events(&timeline, 1).await;
+        let facet = origin_of(&events[0]).expect(
+            "an op recorded with no ORIGIN_OVERRIDE scope must still carry an origin facet",
+        );
+        assert_eq!(facet["channel"], "not_determined");
+        assert_eq!(
+            facet["basis"], "server_observed",
+            "not_determined is something the server itself failed to establish, \
+             never a client claim"
+        );
+    }
+
+    /// A scoped origin stamps its channel verbatim, and `Mcp` specifically
+    /// records `basis: client_header` — the one variant that is a
+    /// self-reported claim, never server-verified (see `OriginFacet`'s doc
+    /// comment).
+    #[tokio::test]
+    async fn origin_scope_stamps_the_scoped_channel_with_the_right_basis() {
+        let timeline: SharedTimeline =
+            Arc::new(RwLock::new(Timeline::new(TimelineConfig::default())));
+        let recorder =
+            TimelineRecorder::new(Arc::clone(&timeline), Author::System, BranchId::main());
+
+        ORIGIN_OVERRIDE
+            .scope(Origin::Mcp, async {
+                recorder
+                    .record(RecordedOperation::new("via-mcp"))
+                    .expect("record inside Mcp scope");
+            })
+            .await;
+        ORIGIN_OVERRIDE
+            .scope(Origin::Rest, async {
+                recorder
+                    .record(RecordedOperation::new("via-rest"))
+                    .expect("record inside Rest scope");
+            })
+            .await;
+        drop(recorder);
+
+        let events = drained_events(&timeline, 2).await;
+        let mcp_event = events
+            .iter()
+            .find(|e| {
+                matches!(&e.operation, Operation::Generic { command_type, .. }
+                    if command_type == "via-mcp")
+            })
+            .expect("the mcp-scoped op's event exists");
+        let mcp_facet = origin_of(mcp_event).expect("origin facet present");
+        assert_eq!(mcp_facet["channel"], "mcp");
+        assert_eq!(
+            mcp_facet["basis"], "client_header",
+            "mcp is a self-reported client claim, never server-verified"
+        );
+
+        let rest_event = events
+            .iter()
+            .find(|e| {
+                matches!(&e.operation, Operation::Generic { command_type, .. }
+                    if command_type == "via-rest")
+            })
+            .expect("the rest-scoped op's event exists");
+        let rest_facet = origin_of(rest_event).expect("origin facet present");
+        assert_eq!(rest_facet["channel"], "rest");
+        assert_eq!(rest_facet["basis"], "server_observed");
+    }
+
+    /// THE ORIGIN CROSS-ATTRIBUTION PIN — the origin counterpart of
+    /// `concurrent_tasks_with_different_intents_never_cross_attribute`.
+    /// Two concurrent recording tasks, each inside its OWN `ORIGIN_OVERRIDE`
+    /// scope with a DIFFERENT channel, both record before the drain worker
+    /// applies either (driven, not hoped for, via the timeline write lock).
+    /// Each event must carry ITS OWN channel. Mutation-proven RED against
+    /// an ambient implementation (see the doc comment above the manual
+    /// mutation instructions in this module's task description — moving the
+    /// read to the drain worker or any shared slot attributes op-alpha to
+    /// op-beta's channel).
+    #[tokio::test(flavor = "current_thread")]
+    async fn concurrent_tasks_with_different_origins_never_cross_attribute() {
+        let timeline: SharedTimeline =
+            Arc::new(RwLock::new(Timeline::new(TimelineConfig::default())));
+        let recorder =
+            TimelineRecorder::new(Arc::clone(&timeline), Author::System, BranchId::main());
+
+        // Pin the drain worker exactly as the intent test does: hold the
+        // write lock so both records are queued before either is applied.
+        let write_guard = timeline.write().await;
+
+        let alpha_recorder = recorder.clone();
+        let alpha = tokio::spawn(ORIGIN_OVERRIDE.scope(Origin::Mcp, async move {
+            alpha_recorder
+                .record(RecordedOperation::new("op-alpha"))
+                .expect("record op-alpha inside alpha's scope");
+        }));
+        let beta_recorder = recorder.clone();
+        let beta = tokio::spawn(ORIGIN_OVERRIDE.scope(Origin::Websocket, async move {
+            beta_recorder
+                .record(RecordedOperation::new("op-beta"))
+                .expect("record op-beta inside beta's scope");
+        }));
+        alpha.await.expect("alpha task completes");
+        beta.await.expect("beta task completes");
+
+        drop(write_guard);
+        drop(recorder);
+
+        let events = drained_events(&timeline, 2).await;
+        assert_eq!(
+            events.len(),
+            2,
+            "both concurrent records reach the timeline"
+        );
+
+        for (kind, expected_channel) in [("op-alpha", "mcp"), ("op-beta", "websocket")] {
+            let event = events
+                .iter()
+                .find(|e| {
+                    matches!(&e.operation, Operation::Generic { command_type, .. }
+                        if command_type == kind)
+                })
+                .unwrap_or_else(|| panic!("{kind}'s event exists"));
+            let facet = origin_of(event).unwrap_or_else(|| {
+                panic!(
+                    "{kind} lost its origin — the facet must be stamped at \
+                     record() time on the requesting task, not read later on \
+                     the drain worker (which has no scope)"
+                )
+            });
+            assert_eq!(
+                facet["channel"], expected_channel,
+                "{kind} must carry ITS OWN channel, never the concurrent \
+                 task's — cross-attribution is confidently-wrong provenance, \
+                 worse than not_determined"
+            );
+        }
+    }
+
+    /// THE REPLAY-NON-RELABELLING PIN. `create_box_3d` is a genuinely
+    /// dispatchable replay kind, recorded through a REAL `TimelineRecorder`
+    /// attached to a REAL `BRepModel` (not a hand-built `RecordedOperation`)
+    /// so this test can actually fail: it replays the stored event into a
+    /// SECOND model that has the SAME recorder attached, under a DIFFERENT
+    /// origin scope than the one the event was originally recorded under.
+    /// `rebuild_model_from_events` detaches the model's recorder for the
+    /// duration of the replay (see that function's doc comment) — if that
+    /// detach ever regressed, replaying `create_box_3d` here would call
+    /// `TimelineRecorder::record()` again, appending a stray event and/or
+    /// relabelling the original with whatever channel is driving the
+    /// replay call. Both must be provably false.
+    #[tokio::test]
+    async fn replay_does_not_relabel_a_stored_events_origin() {
+        use geometry_engine::primitives::topology_builder::{BRepModel, TopologyBuilder};
+
+        let timeline: SharedTimeline =
+            Arc::new(RwLock::new(Timeline::new(TimelineConfig::default())));
+        let recorder =
+            TimelineRecorder::new(Arc::clone(&timeline), Author::System, BranchId::main());
+
+        let mut model = BRepModel::new();
+        model.attach_recorder(Some(
+            Arc::new(recorder.clone()) as Arc<dyn OperationRecorder>
+        ));
+        ORIGIN_OVERRIDE
+            .scope(Origin::Mcp, async {
+                TopologyBuilder::new(&mut model)
+                    .create_box_3d(10.0, 10.0, 10.0)
+                    .expect("create_box_3d succeeds");
+            })
+            .await;
+
+        let main = BranchId::main();
+        let events = drained_events(&timeline, 1).await;
+        let before_count = events.len();
+        assert!(before_count >= 1, "the box creation reaches the timeline");
+        for event in &events {
+            let facet = origin_of(event)
+                .expect("every event recorded through the recorder carries an origin");
+            assert_eq!(
+                facet["channel"], "mcp",
+                "the box creation was recorded inside an Mcp scope"
+            );
+        }
+
+        let mut replay_target = BRepModel::new();
+        replay_target.attach_recorder(Some(
+            Arc::new(recorder.clone()) as Arc<dyn OperationRecorder>
+        ));
+        ORIGIN_OVERRIDE
+            .scope(Origin::Rest, async {
+                let outcome = crate::replay::rebuild_model_from_events(&mut replay_target, &events);
+                assert_eq!(
+                    outcome.events_skipped, 0,
+                    "create_box_3d must genuinely dispatch during replay — a \
+                     skipped event never attempts record() and this test \
+                     would prove nothing"
+                );
+            })
+            .await;
+
+        // Give any (regression-case) replay-driven record a moment to land
+        // before asserting no growth.
+        recorder
+            .flush()
+            .await
+            .expect("flush drains any replay-driven records");
+        drop(recorder);
+
+        let after = timeline
+            .read()
+            .await
+            .get_branch_events(&main, None, None)
+            .expect("branch events");
+        assert_eq!(
+            after.len(),
+            before_count,
+            "replay must not append new events to the timeline — the \
+             recorder-detach in `rebuild_model_from_events` must hold"
+        );
+        for event in &after {
+            let facet = origin_of(event).expect("origin facet still present");
+            assert_eq!(
+                facet["channel"], "mcp",
+                "replay must not relabel a stored event's origin with \
+                 whatever channel happens to be driving the replay call \
+                 itself"
+            );
+        }
     }
 }

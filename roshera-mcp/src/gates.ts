@@ -303,6 +303,19 @@ const refusalCache = new Map<string, CachedRefusal>();
  *  clear_timeline (the ledger it lives in is wiped) closes it. */
 let openIntent: { name: string; turn: number } | null = null;
 
+/**
+ * Read-only view of the open intent, for the HTTP client (`api()` in
+ * core.ts) to stamp onto every backend call as `X-Roshera-Intent` /
+ * `X-Roshera-Intent-Turn` — the wire link between the declaration the
+ * intent gate already forced and the kernel ops it describes. The state
+ * itself stays HERE (the gate opens/replaces/closes it); core.ts only
+ * reads. Returns null when no intent is open — the headers are then
+ * omitted entirely, so an absent intent stays absent on the wire.
+ */
+export function currentOpenIntent(): { name: string; turn: number } | null {
+  return openIntent;
+}
+
 /** Hash key for the identical-call test: tool name + canonical (key-sorted,
  *  compact) JSON of the SDK-parsed args — defaults applied, so the direct
  *  path and the invoke path produce the same key for the same call. */

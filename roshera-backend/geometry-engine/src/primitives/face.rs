@@ -1378,14 +1378,33 @@ impl FaceStore {
         self.next_id - 1
     }
 
+    /// The single definition of "does this face id currently exist". `get`,
+    /// `get_mut` and `iter` all route through this — see the parity comment
+    /// on `EdgeStore::get` (Task #89) for why a second, divergent liveness
+    /// check at each accessor is the bug, not the fix.
+    #[inline(always)]
+    pub fn is_live(&self, id: FaceId) -> bool {
+        self.faces
+            .get(id as usize)
+            .is_some_and(|f| f.id != INVALID_FACE_ID)
+    }
+
     #[inline(always)]
     pub fn get(&self, id: FaceId) -> Option<&Face> {
-        self.faces.get(id as usize)
+        if self.is_live(id) {
+            self.faces.get(id as usize)
+        } else {
+            None
+        }
     }
 
     #[inline(always)]
     pub fn get_mut(&mut self, id: FaceId) -> Option<&mut Face> {
-        self.faces.get_mut(id as usize)
+        if self.is_live(id) {
+            self.faces.get_mut(id as usize)
+        } else {
+            None
+        }
     }
 
     #[inline]
@@ -1422,14 +1441,28 @@ impl FaceStore {
         adjacent
     }
 
-    #[inline(always)]
+    /// Number of live faces — agrees with `iter().count()` by
+    /// construction (same `is_live` predicate). O(slot_count); `remove`
+    /// has no double-remove guard, so a cached live counter derived
+    /// from `stats.total_deleted` would silently double-decrement —
+    /// not used for that reason.
+    #[inline]
     pub fn len(&self) -> usize {
-        self.faces.len()
+        self.iter().count()
     }
 
-    #[inline(always)]
+    /// True if there are no live faces.
+    #[inline]
     pub fn is_empty(&self) -> bool {
-        self.faces.is_empty()
+        self.iter().next().is_none()
+    }
+
+    /// Backing-slot extent (includes tombstoned/removed slots). Callers
+    /// that want "how many live faces" must use [`FaceStore::len`], not
+    /// this — it is capacity/allocation-extent, not liveness.
+    #[inline(always)]
+    pub fn slot_count(&self) -> usize {
+        self.faces.len()
     }
 
     /// Remove a face from the store
@@ -1481,7 +1514,7 @@ impl FaceStore {
         self.faces
             .iter()
             .enumerate()
-            .filter(|(_, f)| f.id != INVALID_FACE_ID)
+            .filter(move |(idx, _)| self.is_live(*idx as FaceId))
             .map(|(idx, f)| (idx as FaceId, f))
     }
 
@@ -1989,6 +2022,38 @@ mod tests {
     fn find_adjacent_faces_unknown_face_is_empty() {
         let store = FaceStore::new();
         assert!(store.find_adjacent_faces(99, 50).is_empty());
+    }
+
+    /// Regression lock for BUG 1: `len()`/`is_empty()` must agree with
+    /// `iter().count()` even after removals leave tombstoned slots
+    /// behind. Before the fix, `len()` read `self.faces.len()` (the raw
+    /// backing Vec, tombstones included) while `iter()` filtered them
+    /// out via `is_live` — the two disagreed after any `remove`.
+    #[test]
+    fn len_agrees_with_iter_count_after_removals() {
+        let mut store = FaceStore::new();
+        let ids: Vec<FaceId> = (0..5)
+            .map(|_| store.add(Face::new(999, 0, 0, FaceOrientation::Forward)))
+            .collect();
+        assert_eq!(store.len(), 5);
+        assert_eq!(store.len(), store.iter().count());
+
+        store.remove(ids[1]);
+        store.remove(ids[3]);
+        assert_eq!(
+            store.len(),
+            store.iter().count(),
+            "len() must agree with iter().count() after removals"
+        );
+        assert_eq!(store.len(), 3);
+        assert!(!store.is_empty());
+
+        for &id in &ids {
+            store.remove(id);
+        }
+        assert_eq!(store.len(), 0);
+        assert_eq!(store.len(), store.iter().count());
+        assert!(store.is_empty());
     }
 }
 

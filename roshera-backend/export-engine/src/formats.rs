@@ -2,6 +2,7 @@
 
 pub mod obj;
 pub mod ros;
+pub mod ros_provenance;
 pub mod ros_snapshot;
 pub mod step;
 pub mod stl;

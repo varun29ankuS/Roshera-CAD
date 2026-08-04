@@ -14,6 +14,7 @@ import { DrawingsWorkspace } from '@/components/panels/DrawingsWorkspace'
 import { AssemblyWorkspace } from '@/components/panels/AssemblyWorkspace'
 import { DemoGallery } from '@/components/demo-gallery/DemoGallery'
 import { BlackboardFixtures } from '@/components/dev/BlackboardFixtures'
+import { SemanticsPanel } from '@/components/dev/SemanticsPanel'
 import { CommandPalette } from '@/components/CommandPalette'
 import { LoginDialog } from '@/components/LoginDialog'
 import { useKeyboardShortcuts } from '@/lib/shortcuts'
@@ -28,13 +29,18 @@ const DEMOS_HASH = '#/demos'
 // layout, GD&T symbol table) in one place for visual verification without
 // staging them by hand. See components/dev/BlackboardFixtures.tsx.
 const BLACKBOARD_FIXTURES_HASH = '#/blackboard-fixtures'
+// Dev panel: the agent-facing tool ontology (live from /api/agent/tool-registry)
+// + provenance coverage with the gaps rendered as gaps. See
+// components/dev/SemanticsPanel.tsx.
+const SEMANTICS_HASH = '#/semantics'
 
-type Route = 'workspace' | 'demos' | 'blackboard-fixtures'
+type Route = 'workspace' | 'demos' | 'blackboard-fixtures' | 'semantics'
 
 function routeFromHash(): Route {
   if (typeof window === 'undefined') return 'workspace'
   if (window.location.hash === DEMOS_HASH) return 'demos'
   if (window.location.hash === BLACKBOARD_FIXTURES_HASH) return 'blackboard-fixtures'
+  if (window.location.hash === SEMANTICS_HASH) return 'semantics'
   return 'workspace'
 }
 
@@ -84,6 +90,10 @@ export function App() {
 
   if (route === 'blackboard-fixtures') {
     return <BlackboardFixtures onExit={exitGallery} />
+  }
+
+  if (route === 'semantics') {
+    return <SemanticsPanel onExit={exitGallery} />
   }
 
   return (

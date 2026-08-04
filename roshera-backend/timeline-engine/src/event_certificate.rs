@@ -16,6 +16,10 @@
 //!   fillet/chamfer/shell/extrude/revolve: `is_sound`, `euler_characteristic`,
 //!   `volume`, `face_count`, `checks`. Never `dof`/`constrainedness`/`conflict`/
 //!   `mates_satisfied`.
+//! * [`EventCertificate::from_recorded_solid`] — the same solid projection,
+//!   built from the [`RecordedSolidCertificate`] a recording handler attached
+//!   to its `RecordedOperation` (the record-time producer path; the recorder
+//!   bridge stores the result on the event).
 //! * [`EventCertificate::skipped_solid`] — a `fast: true` op that computed no
 //!   certificate: `skipped = true`, `is_sound = None`, no `checks`. Volume and
 //!   face_count are cheap and true, so they are kept (design §8).
@@ -30,6 +34,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use geometry_engine::operations::recorder::RecordedSolidCertificate;
 use geometry_engine::primitives::provenance::ValidityCertificate;
 
 use crate::types::EventMetadata;
@@ -170,6 +175,34 @@ impl EventCertificate {
                 manifold: cert.manifold,
                 oriented: cert.oriented,
                 self_intersection_free: cert.self_intersection_free,
+            }),
+            ..Self::empty()
+        }
+    }
+
+    /// Project a solid op's proof from the [`RecordedSolidCertificate`] the
+    /// recording handler attached to its `RecordedOperation` — the
+    /// record-time producer path the recorder bridge uses to store the
+    /// certificate on the event as it is created.
+    ///
+    /// Field-for-field the same projection as
+    /// [`from_solid_certificate`](Self::from_solid_certificate): `is_sound`
+    /// is carried verbatim (the recorded value is itself the full
+    /// [`ValidityCertificate::is_sound`] by construction —
+    /// `RecordedSolidCertificate::from_validity` is its only sanctioned
+    /// producer), and no sketch/assembly field is ever set.
+    pub fn from_recorded_solid(rec: &RecordedSolidCertificate) -> Self {
+        Self {
+            is_sound: Some(rec.is_sound),
+            euler_characteristic: Some(rec.euler_characteristic),
+            volume: rec.volume,
+            face_count: rec.face_count,
+            checks: Some(SolidCertChecks {
+                brep_valid: rec.brep_valid,
+                watertight: rec.watertight,
+                manifold: rec.manifold,
+                oriented: rec.oriented,
+                self_intersection_free: rec.self_intersection_free,
             }),
             ..Self::empty()
         }
@@ -361,6 +394,33 @@ mod tests {
         assert_eq!(ec.face_count, None);
         assert!(ec.checks.is_none());
         assert_eq!(ec.is_sound, None);
+        assert!(!ec.skipped);
+    }
+
+    /// The record-time path must project IDENTICALLY to the direct path:
+    /// for the same kernel certificate, `from_recorded_solid ∘ from_validity`
+    /// equals `from_solid_certificate`. A divergence would let the stored
+    /// per-event cert disagree with the cert the op actually proved.
+    #[test]
+    fn recorded_solid_projection_matches_direct_projection() {
+        use geometry_engine::operations::recorder::RecordedSolidCertificate;
+
+        let (cert, volume, face_count) = box_solid_certificate();
+        let direct = EventCertificate::from_solid_certificate(&cert, volume, face_count);
+        let recorded = RecordedSolidCertificate::from_validity(&cert, volume, face_count);
+        let via_record = EventCertificate::from_recorded_solid(&recorded);
+        assert_eq!(via_record, direct);
+
+        // Mutation guard: an unsound cert must project unsound through the
+        // record-time path too — never re-derived from a cheap subset.
+        let mut unsound = sound_cert();
+        unsound.watertight = false;
+        let rec = RecordedSolidCertificate::from_validity(&unsound, Some(1.0), Some(6));
+        let ec = EventCertificate::from_recorded_solid(&rec);
+        assert_eq!(ec.is_sound, Some(false));
+        assert_eq!(ec.dof, None);
+        assert_eq!(ec.constrainedness, None);
+        assert_eq!(ec.mates_satisfied, None);
         assert!(!ec.skipped);
     }
 

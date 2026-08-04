@@ -50,15 +50,99 @@ export function isBackendDownStatus(status: number): boolean {
   return status === 502 || status === 503 || status === 504
 }
 
+/** The diagnosis half of "backend is down" — no recovery clause, because
+ *  the right next step differs by caller (see `describeAcpConnectFailure`'s
+ *  `context` param). Shared so the FACTS never drift between the two. */
+function backendDownDiagnosis(status: number): string {
+  return (
+    `the api-server did not answer (HTTP ${status} from the proxy in front of it). ` +
+    `It is down or still starting`
+  )
+}
+
 /** The one sentence both render paths use for a down backend: what failed,
- *  and that recovery is resend-after-restart — never a reload. */
+ *  and that recovery is resend-after-restart — never a reload. Used where a
+ *  prompt genuinely IS waiting to be resent (the Blackboard, mid-turn). */
 export function describeBackendDown(status: number): string {
   return (
-    `Backend unreachable: the api-server did not answer (HTTP ${status} from the ` +
-    `proxy in front of it). It is down or still starting — start (or wait for) the ` +
+    `Backend unreachable: ${backendDownDiagnosis(status)} — start (or wait for) the ` +
     `backend, then resend this prompt. The connection rebuilds automatically; no ` +
     `page reload is needed.`
   )
+}
+
+/** Which caller is rendering a connect-phase failure — the only thing that
+ *  differs between them is the retry clause: the Blackboard already has the
+ *  user's prompt sitting on the board and can honestly say "resend it"; the
+ *  provider dialog's connect flow (`ProviderSettingsDialog.tsx`) never sent
+ *  a prompt at all, so "resend" would be false there. */
+export type AcpConnectFailureContext = 'board' | 'dialog'
+
+/** Diagnosis + recovery clause for a connect-phase ACP failure — `initialize`,
+ *  `session/new`, or the `GET /api/acp/config` cwd/provider fetch failed
+ *  before any turn (or, for the dialog, any session) existed. ONE place for
+ *  this copy, shared by `ai-client.ts`'s `renderAcpFailure` (the Blackboard's
+ *  connect-phase line) and the provider dialog's "starting the agent
+ *  harness" stage — not two texts that can silently drift apart. */
+export function describeAcpConnectFailure(err: unknown, context: AcpConnectFailureContext): string {
+  const retry = context === 'board' ? 'resend this prompt' : 'try again'
+  if (err instanceof AcpHttpError) {
+    if (err.status === 404 || err.status === 405) {
+      // The backend answered HTTP but does not serve /acp. Either the
+      // running build predates the agent surface, or it is mid-start and
+      // the router isn't up yet. There is deliberately no fallback: an
+      // answer from any other path here would be an answer from something
+      // that is not the agent.
+      return (
+        `Agent surface missing: the backend answered, but /acp returned HTTP ${err.status}. ` +
+        `The api-server build is stale or still starting — restart/update the backend, ` +
+        `then ${retry}. No reload needed.`
+      )
+    }
+    if (err.status === 401) {
+      // The global fetch interceptor (installFetchAuth) has already
+      // flipped the sign-in-required signal and the LoginDialog is
+      // opening — this line just makes the caller's own state honest.
+      return 'Sign-in required to continue — see the sign-in prompt.'
+    }
+    if (isBackendDownStatus(err.status)) {
+      return (
+        `Backend unreachable: ${backendDownDiagnosis(err.status)} — start (or wait for) the ` +
+        `backend, then ${retry}. The connection rebuilds automatically; no page reload is needed.`
+      )
+    }
+    return `Agent request failed (HTTP ${err.status}): ${err.message}`
+  }
+  if (err instanceof AcpRateLimitError) {
+    // Connect-phase 429 (initialize / session/new) — there is no turn to
+    // retry yet; the cooldown gate will hold the next attempt.
+    return (
+      `The agent surface is rate-limited right now (shared 100 requests/min budget — ` +
+      `scene polling and every open Roshera tab count against it). ` +
+      `Retry in about ${Math.ceil(err.retryAfterMs / 1000)}s.`
+    )
+  }
+  if (err instanceof AcpConnectionDeadError) {
+    return (
+      `Agent connection lost — the backend restarted or the event stream closed. ` +
+      `The connection rebuilds itself automatically; ${retry}.`
+    )
+  }
+  if (err instanceof TypeError) {
+    // fetch's own failure mode for "could not reach the server at all".
+    return (
+      `Backend unreachable: the request to the api-server never connected ` +
+      `(${err.message}). Start (or wait for) the backend, then ${retry} — the connection ` +
+      `rebuilds automatically, no reload needed.`
+    )
+  }
+  if (err instanceof AcpProtocolError) {
+    // `.message` alone is often just the generic JSON-RPC error class
+    // (e.g. "Internal error"); the actionable detail lives in `.data`.
+    const detail = typeof err.data === 'string' ? err.data : err.message
+    return `Agent setup failed: ${detail}`
+  }
+  return `Agent setup failed: ${err instanceof Error ? err.message : 'unknown error'}`
 }
 
 const FENCE = '```'
@@ -472,6 +556,20 @@ export async function getAcpClient(): Promise<AcpClient> {
       throw err
     })
   return sharedClientPromise
+}
+
+/** Establish the shared ACP session NOW — `initialize()` + `session/new`,
+ *  same as the lazy path `getAcpClient()` has always taken on a turn's
+ *  first prompt — WITHOUT sending a turn. This is the harness-start step
+ *  the provider dialog's connect flow awaits: connecting a provider used
+ *  to leave the agent unstarted until the user's first blackboard message,
+ *  which is exactly the gap that let the chip read "connected" over a
+ *  harness that was never actually running. Every side effect (the header
+ *  store's `startSession`/`endSession`, the shared-client cache) is the
+ *  same `createAndConnect()`/`getAcpClient()` machinery every other caller
+ *  already goes through — nothing is duplicated here. */
+export async function establishAcpSession(): Promise<void> {
+  await getAcpClient()
 }
 
 /** Discard the shared client (a dead connection, or a caller-requested

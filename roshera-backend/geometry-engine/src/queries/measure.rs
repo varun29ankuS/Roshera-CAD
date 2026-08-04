@@ -1141,10 +1141,14 @@ mod tests {
     // A 20×20×20 cutter centred at the origin is boolean-differenced out of
     // the plate, producing `new_solid` — the result is a notched plate whose
     // original top face was SPLIT by the cut (the old face id no longer
-    // belongs to any shell of new_solid). The old top face persists in the
-    // model arena (the pid lineage tests rely on arena persistence) but it
-    // does NOT belong to `new_solid`. Measuring (new_solid, old_top_fid) must
-    // be a `NotFound` refusal — a confident stale number is worse than none.
+    // belongs to any shell of new_solid). `boolean_operation` runs
+    // `prune_boolean_orphan_topology` on every call, which sweeps faces that
+    // are reachable only from a consumed operand — so the old top face does
+    // NOT persist in the arena; `FaceStore::get` (routed through
+    // `FaceStore::is_live`) correctly reports it gone. Measuring
+    // (new_solid, old_top_fid) must still be a `NotFound` refusal — a
+    // confident stale number is worse than none — whether the id is gone
+    // from the arena entirely or merely unowned by `new_solid`.
     //
     // RED transcript (pre-fix behaviour captured 2026-07-04):
     //   `measure(new_solid, old_top_fid)` returned
@@ -1159,6 +1163,14 @@ mod tests {
     //
     // GREEN: after the membership check in `surface_classify` the same call
     //   returns `Err(MeasureError::NotFound { solid: new_solid, face: old_top_fid })`.
+    //
+    // Kernel-defect note (2026-08-03): before the `FaceStore`/`LoopStore`/
+    // `ShellStore` tombstone-liveness fix, `FaceStore::get` on a removed id
+    // returned `Some(tombstone)` instead of `None` — so the assertion below
+    // used to read `is_some()` and "pass" only because it was observing that
+    // accident, not because the face genuinely persisted. It now asserts
+    // `is_none()`, which is what `prune_boolean_orphan_topology`'s own
+    // documented contract (drop operand-only faces) actually promises.
     #[test]
     fn stale_face_from_consumed_solid_gives_not_found() {
         use crate::operations::{boolean_operation, BooleanOp, BooleanOptions};
@@ -1187,8 +1199,11 @@ mod tests {
         );
 
         // Boolean Difference: plate − cutter → new_solid.
-        // Both `plate` and `cutter` are removed from model.solids; their
-        // faces persist in model.faces (the arena).
+        // Both `plate` and `cutter` are removed from model.solids; the old
+        // top face — reachable only from the now-retired `plate` operand —
+        // is swept by `prune_boolean_orphan_topology`, which
+        // `boolean_operation` runs on every call.
+        let deleted_before = m.faces.stats.total_deleted;
         let new_solid = boolean_operation(
             &mut m,
             plate,
@@ -1198,12 +1213,23 @@ mod tests {
         )
         .expect("boolean difference must succeed — plate notched by cutter");
 
-        // Confirm old_top_fid is still in the arena (this is what makes the
-        // bug possible: the face resolves by id even though new_solid never
-        // owns it).
+        // Primary-source evidence, not inference from reading the prune's
+        // source: `FaceStore::remove` is the only thing that increments
+        // `total_deleted`, so this proves a face was genuinely removed by
+        // the boolean, not merely that some slot's id happens to read dead.
         assert!(
-            m.faces.get(old_top_fid).is_some(),
-            "old top face must persist in the arena after the boolean"
+            m.faces.stats.total_deleted > deleted_before,
+            "boolean_operation's orphan sweep must genuinely remove at least \
+             one face from the arena (the old, now-superseded top face)"
+        );
+
+        // Confirm old_top_fid specifically is gone from the arena — it is
+        // reachable only from the consumed `plate` operand, so the sweep
+        // above must have taken it, and `FaceStore::get` must honestly
+        // report that (routed through `FaceStore::is_live`).
+        assert!(
+            m.faces.get(old_top_fid).is_none(),
+            "old top face is orphaned by the boolean and must not persist in the arena"
         );
 
         // The old top face must NOT belong to new_solid. Measuring

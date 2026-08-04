@@ -23,19 +23,36 @@
 //! `rename`) so the same JSON round-trips through both `BlackboardSnapshot`
 //! (Rust) and `BlackboardSnapshot` (TS) without a translation layer.
 //!
-//! # Scope (per-owner notebooks)
+//! # Scope (per-owner notebooks) — and the 2026-08-04 reversal
 //!
-//! The north star is 100-part assemblies, where ONE global notebook mixing
-//! every part's calculations is unusable. So a notebook is addressed by its
-//! owning [`BlackboardScope`]:
+//! The north star was 100-part assemblies, where one global notebook mixing
+//! every part's calculations is unusable — so a notebook used to be addressed
+//! by its owning [`BlackboardScope`], and the frontend swapped which notebook
+//! it showed as the viewport selection changed.
 //!
-//!   - [`BlackboardScope::Part`]   — the PRIMARY case: a part's own
-//!     derivations (the user-facing ask). Each part has its OWN notebook.
-//!   - [`BlackboardScope::Assembly`] — cross-part, assembly-level calculations
-//!     (e.g. a tolerance stack-up) that belong to no single part.
-//!   - [`BlackboardScope::Document`] — document / session-wide notes with no
-//!     narrower owner. This is also the MIGRATION HOME for legacy un-scoped
-//!     entries, so nothing written before scoping is lost.
+//! Varun reversed that (2026-08-04): **the blackboard is per DOCUMENT, all
+//! the way.** The agent session is already scoped per document
+//! (`resetAcpClient()` on every document switch); the notebook the human
+//! reads now matches it 1:1, so selecting a part never swaps what is on
+//! screen. [`BlackboardScope::Document`] is the only scope the UI and the
+//! MCP surface can address any more — `resolve_scope`'s Document fallback
+//! (unchanged) IS that policy: nothing new ever writes a `Part`/`Assembly`
+//! scope through those paths, because they no longer send one.
+//!
+//! [`BlackboardScope::Part`] and [`BlackboardScope::Assembly`] still exist as
+//! wire-addressable scopes (a direct REST caller can still target one — see
+//! [`resolve_scope_token`]), and — this is the part that matters — **lines
+//! already written under a Part scope before this decision are never
+//! rewritten, deleted, or migrated.** Rewriting persisted user content
+//! inside a refactor is exactly the irreversible step this codebase avoids.
+//! Instead the READ side does the work: [`BlackboardManager::document_snapshot`]
+//! returns the Document notebook's own lines UNIONED with every Part-scoped
+//! notebook belonging to that document, so a note written under the old
+//! per-part model is still there — merged into the one notebook the UI now
+//! shows, each such line still tagged with the part it was about
+//! ([`BlackboardLine::part_id`] / `part_uuid`). `GET /api/blackboard` (no
+//! scope / `scope=document`) calls this union; an explicit `?scope=part:<id>`
+//! still reads that one notebook directly, unchanged.
 //!
 //! The store keys notebooks by the scope's canonical string
 //! (`part:<solid_id>` / `assembly:<uuid>` / `document`), so the existing
@@ -200,6 +217,25 @@ pub struct BlackboardLine {
     pub created_at: u64,
     #[serde(rename = "updatedAt")]
     pub updated_at: u64,
+    /// Which part this line was originally written about, if it lived in a
+    /// [`BlackboardScope::Part`] notebook — set ONLY by
+    /// [`BlackboardManager::document_snapshot`]'s union, never persisted on
+    /// the line itself (a line read via its own scope, e.g.
+    /// `GET ?scope=part:8`, carries `None` here too — that whole response
+    /// already says which part it's about, so tagging every line would be
+    /// redundant). `#[serde(default)]` so a pre-existing persisted row
+    /// (written before this field existed) still deserializes.
+    #[serde(default, rename = "partId", skip_serializing_if = "Option::is_none")]
+    pub part_id: Option<SolidId>,
+    /// The part's current UUID alias (`AppState::get_uuid`), resolved at
+    /// request time by the `GET /api/blackboard` handler — the id
+    /// scene-store's `objects` map is keyed by, so the frontend can show a
+    /// name instead of a bare number. `None` whenever `part_id` is `None`,
+    /// OR when `part_id`'s part is no longer registered (deleted/retired):
+    /// the numeric id still says THAT the line was about a part even when
+    /// there is nothing left to look up.
+    #[serde(default, rename = "partUuid", skip_serializing_if = "Option::is_none")]
+    pub part_uuid: Option<String>,
 }
 
 // ── Event log ───────────────────────────────────────────────────────
@@ -327,6 +363,8 @@ impl Notebook {
             author,
             created_at: now,
             updated_at: now,
+            part_id: None,
+            part_uuid: None,
         };
         self.lines.push(line.clone());
         self.events.push(BlackboardEvent::Add {
@@ -622,6 +660,87 @@ impl BlackboardManager {
         self.write_through(document_id, &scope.key(), state);
     }
 
+    /// The document notebook as the UI now shows it: the Document scope's
+    /// own lines UNIONED with every Part-scoped notebook belonging to this
+    /// document, sorted by `created_at`. Each line pulled from a Part
+    /// notebook is tagged with `part_id` (see [`BlackboardLine::part_id`])
+    /// so the reader can still tell which part it was about.
+    ///
+    /// Deliberately unions ONLY `lines`, never `events` — the returned
+    /// `events` are the Document notebook's own log, untouched. Two
+    /// independent reasons, not one:
+    ///   1. Meaning: the Document's event log narrates what happened
+    ///      directly in the Document notebook; a Part notebook has its own
+    ///      separate history, still reachable by reading that scope
+    ///      directly. Conflating them would blur "what happened where."
+    ///   2. Correctness: the frontend's delta-detection (`blackboard-api.ts`
+    ///      `persistDelta`) replays events past its last-seen baseline as
+    ///      REST writes. If a fresh client's baseline were empty (backend
+    ///      unreachable at boot) and the union included Part-origin `add`
+    ///      events, EVERY legacy part line would replay as a brand-new
+    ///      scope-less POST — duplicating it into the Document notebook,
+    ///      where it would then appear TWICE via this very union. Lines-only
+    ///      makes that impossible: a Part-origin line is never in `events`,
+    ///      so it can never be replayed.
+    ///
+    /// Assembly-scoped notebooks are NOT unioned in — only `Part` and
+    /// `Document` ever fed the per-selection notebook this replaces.
+    ///
+    /// Never mutates a Part notebook and never write-throughs anything —
+    /// this is a pure projection over the working set. A pre-existing Part
+    /// line is returned with the SAME id/text/timestamps it was written
+    /// with; only the returned CLONE carries `part_id`, never the notebook's
+    /// own stored copy.
+    pub async fn document_snapshot(&self, document_id: &str) -> BlackboardSnapshot {
+        let doc_handle = self.notebook(document_id, &BlackboardScope::Document);
+        let (mut lines, events) = {
+            let nb = doc_handle.read().await;
+            (nb.lines.clone(), nb.events.clone())
+        };
+
+        for (scope_key, handle) in self.handles_for_document(document_id) {
+            if let Some(BlackboardScope::Part { id }) = BlackboardScope::parse(&scope_key) {
+                let nb = handle.read().await;
+                lines.extend(nb.lines.iter().cloned().map(|mut line| {
+                    line.part_id = Some(id);
+                    line
+                }));
+            }
+        }
+        // Stable sort: two lines with equal `created_at` (e.g. a millisecond
+        // collision predating scoping) keep the order they were encountered
+        // in rather than being shuffled.
+        lines.sort_by_key(|l| l.created_at);
+
+        BlackboardSnapshot { lines, events }
+    }
+
+    /// Clear the document's FULL notebook as the UI shows it: the Document
+    /// scope AND every Part-scoped notebook belonging to it — the same
+    /// scope set [`Self::document_snapshot`] unions in for reading. Unlike
+    /// the read-side union (which must never destroy anything), `clear` is
+    /// an explicit, already-destructive action a human or agent chose to
+    /// take; leaving legacy Part lines behind would mean the trash icon
+    /// looks like it emptied the board and then those lines silently
+    /// reappear on the next poll — the exact "looks done, isn't" defect
+    /// class this pass exists to remove. Assembly-scoped notebooks are
+    /// untouched — they were never surfaced by the union in the first
+    /// place, so clearing the document view has no claim on them.
+    pub async fn clear_document(&self, document_id: &str) {
+        self.clear(document_id, &BlackboardScope::Document).await;
+        let part_scopes: Vec<BlackboardScope> = self
+            .handles_for_document(document_id)
+            .into_iter()
+            .filter_map(|(scope_key, _)| match BlackboardScope::parse(&scope_key) {
+                Some(scope @ BlackboardScope::Part { .. }) => Some(scope),
+                _ => None,
+            })
+            .collect();
+        for scope in part_scopes {
+            self.clear(document_id, &scope).await;
+        }
+    }
+
     /// Drop every notebook belonging to one document, across every scope
     /// (`Document`, every `Part`, every `Assembly`). Called by `DELETE
     /// /api/documents/{id}` after the durable delete commits — the
@@ -899,16 +1018,34 @@ fn resolve_scope(
 
 /// `GET /api/blackboard` — the document for a scope (lines + event log).
 ///
-/// `?scope=part:<solid_id|uuid>` / `?part_id=<solid_id|uuid>` selects a
-/// part's (or assembly's) notebook; no query → the Document notebook, so an
-/// un-scoped GET keeps returning the document-wide notes (backward compatible).
+/// No query (or `scope=document`) → the UNIFIED document notebook: the
+/// Document scope's own lines plus every Part-scoped line belonging to this
+/// document, merged by timestamp (see [`BlackboardManager::document_snapshot`]).
+/// An explicit `?scope=part:<solid_id|uuid>` / `?part_id=<solid_id|uuid>`
+/// still reads exactly that one part's notebook, unmerged — the UI and the
+/// MCP surface no longer send this (the blackboard is per-document now), but
+/// a direct REST caller still can.
 pub async fn get_blackboard(
     State(state): State<AppState>,
     Query(q): Query<ScopeQuery>,
 ) -> Result<Json<BlackboardSnapshot>, ApiError> {
     let scope = resolve_scope(&state, q.scope.as_deref(), q.part_id.as_deref())?;
     let document_id = state.active_document.read().await.clone();
-    Ok(Json(state.blackboard.snapshot(&document_id, &scope).await))
+    let mut snapshot = if scope == BlackboardScope::Document {
+        state.blackboard.document_snapshot(&document_id).await
+    } else {
+        state.blackboard.snapshot(&document_id, &scope).await
+    };
+    // Resolve each unioned Part-origin line's current UUID alias — the id
+    // scene-store's `objects` map is keyed by — so the frontend can show a
+    // name instead of a bare SolidId. `None` when the part is no longer
+    // registered; the numeric `part_id` still survives on the line.
+    for line in &mut snapshot.lines {
+        if let Some(id) = line.part_id {
+            line.part_uuid = state.get_uuid(id).map(|u| u.to_string());
+        }
+    }
+    Ok(Json(snapshot))
 }
 
 /// `POST /api/blackboard/entries` — append a line to a scope (+ `add`
@@ -981,16 +1118,24 @@ pub async fn delete_entry(
     }
 }
 
-/// `POST /api/blackboard/clear` — clear ONE scope's notebook (lines +
-/// events). Scope comes from `?scope=` / `?part_id=`; omitted → Document, so
-/// clearing one part never wipes another's calculations.
+/// `POST /api/blackboard/clear` — clear a notebook. Scope comes from
+/// `?scope=` / `?part_id=`; omitted → Document, which clears the FULL
+/// document view: the Document scope AND every Part-scoped notebook unioned
+/// into it (see [`BlackboardManager::clear_document`]) — a trash icon that
+/// leaves legacy lines to silently reappear on the next poll would be the
+/// same "looks done, isn't" defect this pass removes elsewhere. An explicit
+/// `?scope=part:<id>` still clears only that one part's notebook.
 pub async fn clear_blackboard(
     State(state): State<AppState>,
     Query(q): Query<ScopeQuery>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let scope = resolve_scope(&state, q.scope.as_deref(), q.part_id.as_deref())?;
     let document_id = state.active_document.read().await.clone();
-    state.blackboard.clear(&document_id, &scope).await;
+    if scope == BlackboardScope::Document {
+        state.blackboard.clear_document(&document_id).await;
+    } else {
+        state.blackboard.clear(&document_id, &scope).await;
+    }
     Ok(Json(
         serde_json::json!({ "success": true, "scope": scope.key() }),
     ))
@@ -1322,6 +1467,174 @@ mod tests {
         assert_eq!(snap_a.lines[0].text, "only in A");
     }
 
+    // ── document_snapshot: the per-document union (2026-08-04) ───────
+
+    /// THE union proof at the store level: `document_snapshot` returns the
+    /// Document notebook's own line plus every Part-scoped line for that
+    /// document, in timestamp order, each Part-origin line tagged with the
+    /// part it came from.
+    #[tokio::test]
+    async fn document_snapshot_unions_document_and_part_lines_in_timestamp_order() {
+        let mgr = BlackboardManager::new();
+        let part_a = BlackboardScope::Part { id: 0xAAAA };
+        let part_b = BlackboardScope::Part { id: 0xBBBB };
+
+        // Seed out of chronological order to prove the sort, not just the
+        // union: B (earliest), then Document, then A (latest).
+        mgr.add(D, &part_b, None, "note about B".into(), LineAuthor::User)
+            .await;
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        mgr.add(D, &DOC, None, "doc-level note".into(), LineAuthor::Agent)
+            .await;
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        mgr.add(D, &part_a, None, "note about A".into(), LineAuthor::User)
+            .await;
+
+        let union = mgr.document_snapshot(D).await;
+        assert_eq!(union.lines.len(), 3, "all three lines present");
+        assert_eq!(union.lines[0].text, "note about B");
+        assert_eq!(union.lines[1].text, "doc-level note");
+        assert_eq!(union.lines[2].text, "note about A");
+
+        assert_eq!(
+            union.lines[0].part_id,
+            Some(0xBBBB),
+            "B's line is tagged with B's part id"
+        );
+        assert_eq!(
+            union.lines[1].part_id, None,
+            "the document's own line carries no part id"
+        );
+        assert_eq!(
+            union.lines[2].part_id,
+            Some(0xAAAA),
+            "A's line is tagged with A's part id"
+        );
+
+        // events is the Document notebook's OWN log only — see
+        // `document_snapshot`'s doc comment for why.
+        assert_eq!(
+            union.events.len(),
+            1,
+            "events is the Document scope's own log, never unioned"
+        );
+    }
+
+    /// MUTATION PROOF companion for the router-level RED
+    /// (`blackboard_part_scopes_are_isolated_through_router` /
+    /// `document_view_includes_pre_existing_part_scoped_lines_through_router`
+    /// in router_integration_tests.rs): dropping the union — i.e. calling
+    /// plain `snapshot(D, &DOC)` instead — must make the seeded part line
+    /// vanish from what this function would otherwise return. Asserted
+    /// directly here so the property is pinned at the unit level too.
+    #[tokio::test]
+    async fn document_snapshot_without_the_union_would_lose_the_part_line() {
+        let mgr = BlackboardManager::new();
+        let part = BlackboardScope::Part { id: 0x99 };
+        mgr.add(
+            D,
+            &part,
+            None,
+            "lost without the union".into(),
+            LineAuthor::User,
+        )
+        .await;
+
+        let plain = mgr.snapshot(D, &DOC).await;
+        assert!(
+            plain.lines.is_empty(),
+            "the PLAIN document notebook (no union) does not see the part line — \
+             this is the exact defect `document_snapshot` exists to close"
+        );
+
+        let unioned = mgr.document_snapshot(D).await;
+        assert_eq!(
+            unioned.lines.len(),
+            1,
+            "the UNIONED read recovers it; body would be lost without document_snapshot"
+        );
+    }
+
+    /// Nothing already written may become unreadable, and the read side
+    /// must never rewrite it either: reading the union must not emit a
+    /// write-through, and the part notebook's own direct snapshot must be
+    /// byte-identical (including `part_id: None` — the tag lives only in
+    /// the projection) before and after a union read.
+    #[tokio::test]
+    async fn document_snapshot_leaves_the_part_notebook_untouched() {
+        let mgr = BlackboardManager::new();
+        let (tx, mut rx) = unbounded_channel();
+        let part = BlackboardScope::Part { id: 0x77 };
+        let line = mgr
+            .add(D, &part, None, "original text".into(), LineAuthor::User)
+            .await;
+        // Attach the sink only AFTER seeding, so only the union READ is
+        // under observation.
+        mgr.attach_sink(tx);
+
+        let before = mgr.snapshot(D, &part).await;
+
+        let _ = mgr.document_snapshot(D).await;
+
+        assert!(
+            rx.try_recv().is_err(),
+            "a pure read must never write through — the union must not \
+             persist anything back into the part notebook"
+        );
+        let after = mgr.snapshot(D, &part).await;
+        assert_eq!(after.lines.len(), before.lines.len());
+        assert_eq!(after.lines[0].id, line.id);
+        assert_eq!(after.lines[0].text, "original text");
+        assert_eq!(after.lines[0].created_at, line.created_at);
+        assert_eq!(after.lines[0].updated_at, line.updated_at);
+        assert_eq!(
+            after.lines[0].part_id, None,
+            "the part tag is a projection artifact — the notebook's own \
+             stored line never carries it"
+        );
+    }
+
+    /// `clear_document` is explicit, agent/user-triggered destruction — NOT
+    /// the read-side union, which must never destroy anything. It clears
+    /// the same scope set the union reads: the Document notebook AND every
+    /// Part notebook belonging to it.
+    #[tokio::test]
+    async fn clear_document_empties_document_and_every_part_scope() {
+        let mgr = BlackboardManager::new();
+        let part_a = BlackboardScope::Part { id: 0x1 };
+        let part_b = BlackboardScope::Part { id: 0x2 };
+        mgr.add(D, &DOC, None, "doc note".into(), LineAuthor::User)
+            .await;
+        mgr.add(D, &part_a, None, "a note".into(), LineAuthor::User)
+            .await;
+        mgr.add(D, &part_b, None, "b note".into(), LineAuthor::User)
+            .await;
+        assert_eq!(
+            mgr.document_snapshot(D).await.lines.len(),
+            3,
+            "sanity: all 3 visible before clear"
+        );
+
+        mgr.clear_document(D).await;
+
+        assert!(
+            mgr.document_snapshot(D).await.lines.is_empty(),
+            "union is empty after clear_document"
+        );
+        assert!(
+            mgr.snapshot(D, &DOC).await.lines.is_empty(),
+            "Document notebook itself is empty"
+        );
+        assert!(
+            mgr.snapshot(D, &part_a).await.lines.is_empty(),
+            "A's notebook is empty"
+        );
+        assert!(
+            mgr.snapshot(D, &part_b).await.lines.is_empty(),
+            "B's notebook is empty"
+        );
+    }
+
     /// Item 5 (2026-08-01 audit: 38 lines became 0 across a restart).
     /// Every mutation must write the notebook's full state through the
     /// sink, and a fresh manager hydrated from the LAST write must
@@ -1483,6 +1796,8 @@ mod tests {
                 author: LineAuthor::Agent,
                 created_at: 10,
                 updated_at: 20,
+                part_id: None,
+                part_uuid: None,
             }],
             events: vec![BlackboardEvent::Add {
                 line_id: "bb-1".into(),
@@ -1499,8 +1814,27 @@ mod tests {
         assert!(json.contains("\"author\":\"agent\""));
         assert!(json.contains("\"kind\":\"add\""));
         assert!(json.contains("\"lineId\":\"bb-1\""));
+        // A line with no part association omits `partId`/`partUuid` entirely
+        // rather than serialising `null` — the common case stays compact.
+        assert!(!json.contains("partId"));
+        assert!(!json.contains("partUuid"));
         let back: BlackboardSnapshot = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(back.lines.len(), 1);
         assert_eq!(back.events.len(), 1);
+    }
+
+    /// A `BlackboardLine` persisted BEFORE `part_id`/`part_uuid` existed
+    /// (no such keys in the JSON at all) must still deserialize — the whole
+    /// point of `#[serde(default)]` on both fields. Without it, every
+    /// pre-existing `blackboard_notebooks` row would fail to hydrate at
+    /// boot (see `BlackboardManager::hydrate`'s "skip on deserialize
+    /// error" path), silently dropping every note ever written before this
+    /// change shipped.
+    #[test]
+    fn a_pre_migration_line_with_no_part_fields_still_deserializes() {
+        let json = r#"{"id":"bb-1","text":"x","author":"agent","createdAt":10,"updatedAt":20}"#;
+        let line: BlackboardLine = serde_json::from_str(json).expect("old-shape line must parse");
+        assert_eq!(line.part_id, None);
+        assert_eq!(line.part_uuid, None);
     }
 }

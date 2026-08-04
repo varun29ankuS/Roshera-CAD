@@ -40,6 +40,22 @@ checkpoints/
 .vscode/
 .idea/
 .claude/
+
+# Per-tool agent/assistant config — local to whoever is driving, same class as .claude/
+.cursor/
+.gemini/
+.qoder/
+.codebuddy/
+opencode.jsonc
+
+# Brand-asset scratch used while sourcing vendor marks (2026-07-31). Neither
+# belongs in the tree: si.json is the 447 KB simple-icons INDEX and carries no
+# path data (title/hex/source/aliases only), so it is a lookup table, not an
+# asset; openai_symbol.svg is redundant because OpenAIMark already inlines that
+# symbol. Marks live inline in roshera-app/src/components/settings/vendor-marks.tsx,
+# with each one's source recorded — that file is the single home for them.
+/si.json
+/openai_symbol.svg
 *.swp
 *.swo
 *~

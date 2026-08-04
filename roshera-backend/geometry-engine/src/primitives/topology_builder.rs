@@ -22,6 +22,7 @@ use crate::primitives::{
     vertex::{VertexId, VertexStore},
 };
 use dashmap::DashMap;
+use parking_lot::Mutex as PlMutex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::LazyLock;
@@ -587,7 +588,25 @@ pub struct BRepModel {
     /// from the TIMELINE EVENT ID (identical across replays, robust to event
     /// reordering). `None` for standalone/test creation, where root pids fall
     /// back to `root_counter`. Operation context — like `recorder`, NOT snapshotted.
-    pub current_event_key: Option<String>,
+    ///
+    /// Interior-mutable (`parking_lot::Mutex`, not a bare `Option`) because
+    /// `record_operation` and `abort_pending_record` — both `&self` (the
+    /// funnel every kernel op already calls through a shared reference) —
+    /// must be able to clear an on-demand reservation made by
+    /// `next_root_seed` (see that method and the `current_reserved_sequence`
+    /// field below) once the operation that reserved it has finished, one
+    /// way or another.
+    pub current_event_key: PlMutex<Option<String>>,
+    /// The raw sequence number backing an on-demand `current_event_key`
+    /// reservation, when the key currently cached there was minted by
+    /// `next_root_seed` calling `OperationRecorder::reserve_event_key`
+    /// (rather than set externally via `set_event_key`, e.g. by replay).
+    /// Parsed once out of the `"evt:{seq}"` key `next_root_seed` receives
+    /// and cached alongside it so `record_operation` can hand the exact
+    /// reserved sequence to the recorder
+    /// (`RecordedOperation::reserved_sequence`) without re-parsing. `None`
+    /// whenever `current_event_key` is unset or was set externally.
+    pub current_reserved_sequence: PlMutex<Option<u64>>,
     /// Monotonic fallback for root-pid seeds when `current_event_key` is unset.
     /// Snapshotted so a rolled-back primitive creation re-mints the same seed.
     pub root_counter: u64,
@@ -708,7 +727,8 @@ impl BRepModel {
             pid_to_edge: std::collections::HashMap::new(),
             pid_to_face: std::collections::HashMap::new(),
             pid_to_solid: std::collections::HashMap::new(),
-            current_event_key: None,
+            current_event_key: PlMutex::new(None),
+            current_reserved_sequence: PlMutex::new(None),
             root_counter: 0,
             solid_provenance: std::collections::HashMap::new(),
             solid_construction: std::collections::HashMap::new(),
@@ -763,7 +783,64 @@ impl BRepModel {
     /// rolled-back op) linger. Those orphans then surface as phantom
     /// connectivity errors in later validation. `clear_geometry` sweeps them so
     /// "clear" leaves a genuinely empty model, not invisible residue.
-    pub fn clear_geometry(&mut self) {
+    ///
+    /// Returns the canonical wire ref (`"<kind>:<id>"`, see
+    /// `operations::recorder::entity_ref`) of every entity this call actually
+    /// swept — solids, faces, loops, edges, curves, vertices — so a caller
+    /// that wants the destruction on the timeline can build a
+    /// `RecordedOperation` from real data instead of guessing. This method
+    /// itself never records: it is called from cfg(test)-gated fixtures and
+    /// direct unit tests with no recorder attached (see
+    /// `geometry-engine/tests/clear_geometry.rs`,
+    /// `geometry-engine/tests/gdt_oracle.rs`, `labels_gate.rs`,
+    /// `persistent_id_sidecar.rs`, and `gdt/drf.rs`'s own test), and treating
+    /// a bare "reset the stores" primitive as something that can silently
+    /// emit history is the wrong default for a method with that many
+    /// existing callers. The one production caller —
+    /// `DELETE /api/agent/parts` (`api-server::clear_all_geometry`) — is the
+    /// single place a "clear" is a genuine, user-visible, once-per-call
+    /// event, so that is where the returned refs become a `RecordedOperation`
+    /// (mirroring `delete_solid`, which likewise returns removed entities for
+    /// its caller to record rather than recording itself). Shells and
+    /// surfaces have no `ENTITY_*` wire kind (see `recorder.rs`) and are
+    /// omitted, matching `delete_solid_core`'s precedent for the same gap.
+    pub fn clear_geometry(&mut self) -> Vec<String> {
+        use crate::operations::recorder::{
+            entity_ref, ENTITY_CURVE, ENTITY_EDGE, ENTITY_FACE, ENTITY_LOOP, ENTITY_SOLID,
+            ENTITY_VERTEX,
+        };
+        let mut swept: Vec<String> = Vec::new();
+        swept.extend(
+            self.solids
+                .iter()
+                .map(|(id, _)| entity_ref(ENTITY_SOLID, id as u64)),
+        );
+        swept.extend(
+            self.faces
+                .iter()
+                .map(|(id, _)| entity_ref(ENTITY_FACE, id as u64)),
+        );
+        swept.extend(
+            self.loops
+                .iter()
+                .map(|(id, _)| entity_ref(ENTITY_LOOP, id as u64)),
+        );
+        swept.extend(
+            self.edges
+                .iter()
+                .map(|(id, _)| entity_ref(ENTITY_EDGE, id as u64)),
+        );
+        swept.extend(
+            self.curves
+                .iter()
+                .map(|(id, _)| entity_ref(ENTITY_CURVE, id as u64)),
+        );
+        swept.extend(
+            self.vertices
+                .iter()
+                .map(|(id, _)| entity_ref(ENTITY_VERTEX, id as u64)),
+        );
+
         let tol = self.tolerance;
         self.vertices = VertexStore::with_capacity_and_tolerance(64, tol.distance());
         self.curves = CurveStore::new();
@@ -800,6 +877,7 @@ impl BRepModel {
         self.labels.clear();
         // Preserved: datums (+ seeded defaults), datum_graph, recorder, tolerance,
         // current_event_key (caller op-context, set per-op).
+        swept
     }
 
     // --- Persistent-id accessors (#11, slice 40-A) ---
@@ -2430,21 +2508,64 @@ impl BRepModel {
     /// The orchestration / replay layer sets this before each op and clears it
     /// (`None`) after. No-op for standalone/test creation.
     pub fn set_event_key(&mut self, key: Option<String>) {
-        self.current_event_key = key;
+        *self.current_event_key.lock() = key;
     }
 
     /// Seed bytes for a root persistent-id of a primitive described by
-    /// `kind_params`. Uses `current_event_key` when set (timeline-stable across
-    /// replays), else a monotonic fallback (distinct within this model). `&mut`
-    /// because the fallback path advances `root_counter`.
+    /// `kind_params`. Uses `current_event_key` when set (timeline-stable
+    /// across replays); otherwise, when a recorder is attached and willing
+    /// (see below), reserves one ON DEMAND so the LIVE authoring path gets
+    /// the same timeline-stable seed a replay will later re-derive; else
+    /// falls back to the process-local monotonic `root_counter` (today's
+    /// pre-existing behaviour). `&mut` because the fallback path advances
+    /// `root_counter`.
+    ///
+    /// # On-demand reservation (live/replay persistent-id parity)
+    ///
+    /// Replay always sets `current_event_key` explicitly before dispatching
+    /// an event and detaches the recorder for the whole replay (see
+    /// `timeline_engine::replay::apply_event` / `rebuild_model_from_events`),
+    /// so this branch never fires during replay. On the LIVE path nothing
+    /// sets `current_event_key`, so — before this — every root pid a live
+    /// designed operation minted (fillet, chamfer, …) used `root_counter`'s
+    /// `__local:{n}` fallback, which a subsequent replay could never
+    /// reproduce (replay always seeds from the event's OWN burned sequence
+    /// number). Reserving the SAME key live, via
+    /// [`OperationRecorder::reserve_event_key`], closes that gap.
+    ///
+    /// Skipped while `records_are_discarded()` (an api-server
+    /// `RecorderSuppressGuard` scope, e.g. `sketch_extrude`'s inner
+    /// `extrude_face` / boolean calls): that caller consolidates several
+    /// kernel-internal sub-events into ONE record it builds and forwards
+    /// itself, bypassing `record_operation` — a reservation made here would
+    /// never be attached to that consolidated record and would just burn a
+    /// sequence number for nothing. Falling back to `root_counter` there is
+    /// exactly today's (pre-existing) behaviour — unchanged, not worsened.
+    ///
+    /// The reservation is cached into `current_event_key` /
+    /// `current_reserved_sequence` so every root pid minted for the REST of
+    /// this same operation (one op can mint many) reuses the identical key,
+    /// and is cleared by `record_operation` (success) or
+    /// `abort_pending_record` (the operation was rolled back) so the NEXT
+    /// operation always starts from a clean slate rather than inheriting a
+    /// stale reservation.
     pub fn next_root_seed(&mut self, kind_params: &str) -> Vec<u8> {
-        if let Some(k) = self.current_event_key.clone() {
-            format!("{k}|{kind_params}").into_bytes()
-        } else {
-            let n = self.root_counter;
-            self.root_counter += 1;
-            format!("__local:{n}|{kind_params}").into_bytes()
+        if let Some(k) = self.current_event_key.lock().clone() {
+            return format!("{k}|{kind_params}").into_bytes();
         }
+        if let Some(rec) = self.recorder.as_ref() {
+            if !rec.records_are_discarded() {
+                if let Some(key) = rec.reserve_event_key() {
+                    let seq = key.strip_prefix("evt:").and_then(|s| s.parse::<u64>().ok());
+                    *self.current_reserved_sequence.lock() = seq;
+                    *self.current_event_key.lock() = Some(key.clone());
+                    return format!("{key}|{kind_params}").into_bytes();
+                }
+            }
+        }
+        let n = self.root_counter;
+        self.root_counter += 1;
+        format!("__local:{n}|{kind_params}").into_bytes()
     }
 
     /// Attach a recorder that will receive one event per successful
@@ -2469,7 +2590,16 @@ impl BRepModel {
     /// recorder is attached; logs a warning via `tracing` when the recorder
     /// returns an error (the operation has already mutated the model —
     /// recorder failures never become geometry failures).
-    pub fn record_operation(&self, operation: crate::operations::recorder::RecordedOperation) {
+    ///
+    /// When a recorder IS attached, the record is certified at record time:
+    /// see [`Self::attach_record_time_certificate`]. Certification happens
+    /// synchronously, AFTER the invalidation funnel below and BEFORE the
+    /// record is forwarded — the event carries the kernel's verdict for the
+    /// state it created, not a verdict computed later against whatever the
+    /// solid has become (on an append-only timeline a later verdict is the
+    /// wrong answer). With no recorder attached (timeline replay detaches
+    /// it) nothing consumes the record, so no certificate is computed.
+    pub fn record_operation(&self, mut operation: crate::operations::recorder::RecordedOperation) {
         // ── Funnel invalidation seam (the intrinsic guarantee) ──────────────
         // EVERY mutating kernel op records itself here, listing the solids it
         // consumed (`inputs`) and produced (`outputs`) in canonical wire form.
@@ -2495,10 +2625,166 @@ impl BRepModel {
         }
 
         if let Some(rec) = self.recorder.as_ref() {
+            // Certify-at-record (after the funnel above, before the forward
+            // below): the freshly-invalidated output solid is re-certified
+            // against its post-op geometry and the proof rides on the record.
+            //
+            // Skipped while `rec.records_are_discarded()` — a
+            // `RecorderSuppressGuard` scope (api-server) stages this exact
+            // record via `begin_pending` and then UNCONDITIONALLY discards
+            // it via `abort_pending` on drop, whether the wrapped kernel
+            // call succeeded or not. Certifying a record that can never
+            // reach the timeline is pure waste (one full validity
+            // certificate — mass properties included — computed and then
+            // thrown away). The consolidated event a suppressing caller
+            // builds afterward (e.g. `sketch_extrude`'s handler) certifies
+            // separately and remains the sole, authoritative certificate on
+            // the wire.
+            if !rec.records_are_discarded() {
+                self.attach_record_time_certificate(&mut operation);
+            }
+            // Root-pid reservation handoff (see `next_root_seed`): if this
+            // operation minted its root pids under an on-demand
+            // reservation, hand the reserved sequence to the record so the
+            // bridge appends at EXACTLY that sequence instead of burning a
+            // fresh, unrelated one — the seam that keeps the live-minted
+            // root pid matching what a later replay of this event
+            // re-derives.
+            //
+            // PLUS a synchronous fallback reservation for an operation that
+            // mints NO root pids at all (e.g. `boolean_operation`, which
+            // only derives pids from its existing parents — `next_root_seed`
+            // is never called, so `current_reserved_sequence` is still
+            // `None` here). Without this fallback such an operation's
+            // sequence number is only burned later, ASYNCHRONOUSLY, whenever
+            // the recorder's drain worker gets around to it — which can
+            // lose a race against a LATER operation's synchronous
+            // `next_root_seed` reservation (fast, same calling thread,
+            // already ahead in real time) and end up with a HIGHER sequence
+            // number than an operation that causally follows it, corrupting
+            // replay order (observed: `boolean` landed AFTER `chamfer` in
+            // sequence order despite running first). Reserving HERE,
+            // synchronously, in the same call order `record_operation` is
+            // always invoked in, keeps every operation's sequence number in
+            // true causal order regardless of whether it minted a root pid.
+            // Skipped while discarded for the same reason `next_root_seed`
+            // skips it: a suppressed record is guaranteed to be discarded
+            // before it ever reaches the timeline (see `records_are_discarded`'s
+            // doc comment), so reserving for it would only burn a sequence
+            // number for nothing.
+            let reserved_seq = self.current_reserved_sequence.lock().take();
+            let reserved_seq = reserved_seq.or_else(|| {
+                if rec.records_are_discarded() {
+                    None
+                } else {
+                    rec.reserve_event_key()
+                        .and_then(|k| k.strip_prefix("evt:").and_then(|s| s.parse::<u64>().ok()))
+                }
+            });
+            operation.reserved_sequence = reserved_seq;
+            *self.current_event_key.lock() = None;
             if let Err(e) = rec.record(operation) {
                 tracing::warn!("operation recorder returned error: {}", e);
             }
         }
+    }
+
+    /// Certify-at-record seam: compute the FULL validity certificate of the
+    /// solid this operation produced — synchronously, at the moment the
+    /// record is emitted — and attach it to the record via
+    /// [`RecordedSolidCertificate::from_validity`](crate::operations::recorder::RecordedSolidCertificate::from_validity)
+    /// (the single sanctioned projection; no second certificate shape).
+    ///
+    /// Output solids are recovered with the SAME wire-form parse the
+    /// invalidation funnel uses ([`parse_solid_ref`](crate::operations::recorder::parse_solid_ref))
+    /// so there is exactly one notion of "which solids did this op touch".
+    ///
+    /// # Honest-absence rules (the certificate is `None`, never fabricated)
+    ///
+    /// * **Already certified** — a handler that attached a certificate built
+    ///   the record AFTER the kernel op succeeded, from the same
+    ///   `from_validity` projection; it is kept verbatim. (No such record
+    ///   currently routes through this funnel — the api-server
+    ///   `sketch_extrude` handler forwards its consolidated, pre-certified
+    ///   record straight to the timeline recorder, bypassing this funnel
+    ///   entirely, so this branch is dead in practice today; it exists so a
+    ///   future caller that DOES route a pre-certified record through
+    ///   `record_operation` gets the same never-recompute guarantee.)
+    /// * **Suppressed** — `rec.records_are_discarded()` is true (the caller
+    ///   opened a `begin_discard_scope` window). The kernel-internal record
+    ///   this funnel would otherwise certify is guaranteed to be discarded
+    ///   before it ever reaches the timeline — certifying it would compute a
+    ///   full validity certificate purely to throw it away. `sketch_extrude`
+    ///   is exactly this shape: `extrude_profile_regions` runs inside the
+    ///   api-server's `RecorderSuppressGuard`, so its own internal
+    ///   `record_operation` call (from `extrude_face` / `boolean_operation`)
+    ///   is suppressed here, and the handler's own `certify_solid` call
+    ///   afterward is the one and only certificate that reaches the event.
+    /// * **Zero output solids** — nothing to certify (datum ops, face/edge
+    ///   transforms, deletes).
+    /// * **Several distinct output solids** — `solid_certificate` holds ONE
+    ///   certificate; silently attaching the first solid's verdict would
+    ///   ascribe one solid's soundness to an event that produced several.
+    ///   Attach only when there is exactly one distinct output solid.
+    /// * **Output solid no longer exists** — a dangling reference cannot be
+    ///   certified.
+    /// * **The model carries labels** — the full certificate's
+    ///   `labels_consistent` dimension re-runs each label's Pillar-3
+    ///   selector, which needs `&mut self` (selector centroid-cache
+    ///   warming); this funnel is `&self` because kernel ops and external
+    ///   callers record through shared references. A certificate with the
+    ///   labels check silently skipped would be a subset masquerading as
+    ///   the full verdict — forbidden — so a labelled model records an
+    ///   honest absence instead. With no labels, `labels_consistent` is
+    ///   exactly [`LabelsConsistency::NotApplicable`](crate::primitives::provenance::LabelsConsistency)
+    ///   (the same early return `labels_consistency()` takes) and the full
+    ///   certificate is computable from `&self`.
+    ///
+    /// `volume` on the recorded certificate is `None`: computing it goes
+    /// through the `&mut` mass-properties cache. `face_count` is read
+    /// directly. Neither is ever fabricated.
+    ///
+    /// The computed certificate is deliberately NOT stored into the solid's
+    /// certificate cache and the solid is NOT marked verified: the P1
+    /// freshness gate (`soundness_reading`) and the memoization cache keep
+    /// their existing, precisely-tested semantics — this seam certifies the
+    /// EVENT, it does not change what the live model reports.
+    fn attach_record_time_certificate(
+        &self,
+        operation: &mut crate::operations::recorder::RecordedOperation,
+    ) {
+        if operation.solid_certificate.is_some() {
+            return;
+        }
+        let mut output_solids: Vec<SolidId> = Vec::new();
+        for reference in operation.outputs.iter() {
+            if let Some(sid) = crate::operations::recorder::parse_solid_ref(reference) {
+                if !output_solids.contains(&sid) {
+                    output_solids.push(sid);
+                }
+            }
+        }
+        // Exactly-one-output rule (multi-output ops record an honest
+        // absence — see the doc comment above).
+        let [sid] = output_solids[..] else {
+            return;
+        };
+        if self.solids.get(sid).is_none() {
+            return;
+        }
+        if !self.labels.is_empty() {
+            return;
+        }
+        let cert = self.compute_certificate_with_labels(
+            sid,
+            crate::primitives::provenance::LabelsConsistency::NotApplicable,
+        );
+        let face_count = self.solid_outer_face_count(sid);
+        operation.solid_certificate = Some(
+            crate::operations::recorder::RecordedSolidCertificate::from_validity(
+                &cert, None, face_count,
+            ),
+        );
     }
 
     // ───────────────────── PILLAR 1: ground truth ─────────────────────
@@ -2734,10 +3020,34 @@ impl BRepModel {
     /// `&mut self` because computing the D4 `labels_consistent` flag re-runs
     /// each label's Pillar-3 selector, and `queries::select::resolve_*` warms a
     /// per-face centroid cache (the same `&mut` contract the readable query path
-    /// uses). The geometry itself is never mutated.
+    /// uses). The geometry itself is never mutated. Every OTHER dimension is
+    /// computable through `&self`; the split below
+    /// ([`Self::compute_certificate_with_labels`]) exists so the certify-at-record
+    /// seam in [`Self::record_operation`] — which only has `&self` — can compute
+    /// the identical full certificate whenever the labels dimension needs no
+    /// selector re-runs (no labels ⇒ `NotApplicable`, the same early return
+    /// `labels_consistency()` takes).
     fn compute_certificate(
         &mut self,
         solid_id: SolidId,
+    ) -> crate::primitives::provenance::ValidityCertificate {
+        // D4 — labels consistency: re-verify every label's assertion. An
+        // annotation defect, not a geometric one — does NOT touch `is_sound`.
+        // The only dimension needing `&mut`; everything else lives in the
+        // shared `&self` core below.
+        let labels_consistent = self.labels_consistency();
+        self.compute_certificate_with_labels(solid_id, labels_consistent)
+    }
+
+    /// The `&self` core of [`Self::compute_certificate`]: every certificate
+    /// dimension EXCEPT `labels_consistent`, which the caller supplies
+    /// (either freshly computed via `labels_consistency()` — the `&mut`
+    /// path — or `NotApplicable` when the model provably has no labels).
+    /// There is exactly ONE certificate computation; this function is it.
+    fn compute_certificate_with_labels(
+        &self,
+        solid_id: SolidId,
+        labels_consistent: crate::primitives::provenance::LabelsConsistency,
     ) -> crate::primitives::provenance::ValidityCertificate {
         use crate::primitives::provenance::ValidityCertificate;
         use crate::primitives::validation::{validate_solid_scoped, ValidationLevel};
@@ -2769,9 +3079,6 @@ impl BRepModel {
         // geometry (source sketch) still co-located with the solid? Tri-state,
         // and NotApplicable when no sketch is linked (does not block soundness).
         let construction_consistent = self.construction_consistency(solid_id);
-        // D4 — labels consistency: re-verify every label's assertion. An
-        // annotation defect, not a geometric one — does NOT touch `is_sound`.
-        let labels_consistent = self.labels_consistency();
         // Display-tessellation quality: catches a degenerate / inverted-normal
         // render mesh (the inner-bore scribble) that is watertight + manifold yet
         // renders wrong. Same chord as the manifold check above. A solid that
@@ -2997,10 +3304,23 @@ impl BRepModel {
     /// Called by `with_rollback` on the failure path so the timeline never
     /// holds events for an operation whose model mutations were rolled
     /// back. No-op when no recorder is attached.
+    ///
+    /// Also clears any on-demand root-pid reservation `next_root_seed` made
+    /// during the now-rolled-back body (`current_event_key` /
+    /// `current_reserved_sequence`). Without this, a failed operation that
+    /// had already minted a root pid or two before erroring out would leave
+    /// its reservation cached — `record_operation` never runs for a body
+    /// that returned `Err` (see `with_rollback`), so nothing else would
+    /// clear it — and the NEXT operation's `next_root_seed` would silently
+    /// inherit and reuse a reservation that belonged to the failed op,
+    /// reintroducing the same live/replay mismatch this seam exists to
+    /// close.
     pub fn abort_pending_record(&self) {
         if let Some(rec) = self.recorder.as_ref() {
             rec.abort_pending();
         }
+        *self.current_event_key.lock() = None;
+        *self.current_reserved_sequence.lock() = None;
     }
 
     /// Invalidate the cached `SolidMassProperties` of every solid
@@ -3389,7 +3709,8 @@ impl BRepModel {
                     "datum_id": id,
                     "name": removed.name.clone(),
                 }))
-                .with_input_datums([id as u64]),
+                .with_input_datums([id as u64])
+                .with_deleted_datums([id as u64]),
         );
         Ok(removed)
     }
@@ -3694,6 +4015,11 @@ impl BRepModel {
         // by the source onto this newly-derived datum so subsequent
         // moves of the parents propagate.
         self.datum_graph.register_source(id, &source);
+        // The recorded event carries the same parent edges that
+        // `datum_graph.register_source` just registered — the durable
+        // event stream and the in-memory propagation graph name the
+        // identical inputs, so lineage rebuilt from events cannot
+        // drift from the live graph.
         self.record_operation(
             crate::operations::recorder::RecordedOperation::new("datum_create_derived")
                 .with_parameters(serde_json::json!({
@@ -3702,6 +4028,10 @@ impl BRepModel {
                     "source": source,
                     "transform": matrix4_to_row_major(&transform),
                 }))
+                .with_input_datums(source.referenced_datums())
+                .with_input_vertices(source.referenced_vertices())
+                .with_input_edges(source.referenced_edges())
+                .with_input_faces(source.referenced_faces())
                 .with_output_datums([id as u64]),
         );
         Ok(id)
@@ -4840,7 +5170,12 @@ impl BRepModel {
         use crate::operations::recorder::{
             entity_ref, RecordedOperation, ENTITY_EDGE, ENTITY_FACE, ENTITY_LOOP, ENTITY_VERTEX,
         };
-        let outputs: Vec<String> = report
+        // These entities were REMOVED by the cascade, not produced by it —
+        // they belong on the `deleted` channel, never `outputs`. Recording
+        // them as outputs would claim the cascade *created* the very
+        // entities it tore down, the same invisible-deletion defect the
+        // event-facets spec identifies for `delete_solid`.
+        let deleted: Vec<String> = report
             .removed_vertices
             .iter()
             .map(|id| entity_ref(ENTITY_VERTEX, *id as u64))
@@ -4866,7 +5201,7 @@ impl BRepModel {
         self.record_operation(
             RecordedOperation::new(kind)
                 .with_input_refs([entity_ref(root_entity_kind, root_id)])
-                .with_output_refs(outputs)
+                .with_deleted_refs(deleted)
                 .with_parameters(serde_json::json!({
                     "removed_vertices": report.removed_vertices,
                     "removed_edges": report.removed_edges,
@@ -7560,6 +7895,117 @@ mod anchor_tests {
             .expect("CaptureRecorder mutex poisoned")
             .clone();
         assert!(events.is_empty(), "no event recorded on lookup miss");
+    }
+
+    /// Spy recorder for the certify-at-record suppression fix (BUG 2:
+    /// `sketch_extrude` certifying twice). Unlike `CaptureRecorder` above,
+    /// this one implements the discard-scope trio for real (a depth
+    /// counter, not the trait's no-op default) so a test can prove
+    /// `record_operation` actually consults `records_are_discarded()`
+    /// rather than only exercising `RecorderSuppressGuard`'s own
+    /// book-keeping (that half is covered separately in
+    /// `api-server::csketch::tests`).
+    #[derive(Debug, Default)]
+    struct DiscardAwareCaptureRecorder {
+        events: Mutex<Vec<RecordedOperation>>,
+        discard_depth: Mutex<u32>,
+    }
+
+    impl OperationRecorder for DiscardAwareCaptureRecorder {
+        fn record(&self, operation: RecordedOperation) -> Result<(), RecorderError> {
+            self.events
+                .lock()
+                .expect("DiscardAwareCaptureRecorder mutex poisoned")
+                .push(operation);
+            Ok(())
+        }
+
+        fn begin_discard_scope(&self) {
+            *self
+                .discard_depth
+                .lock()
+                .expect("DiscardAwareCaptureRecorder mutex poisoned") += 1;
+        }
+
+        fn end_discard_scope(&self) {
+            let mut depth = self
+                .discard_depth
+                .lock()
+                .expect("DiscardAwareCaptureRecorder mutex poisoned");
+            if *depth > 0 {
+                *depth -= 1;
+            }
+        }
+
+        fn records_are_discarded(&self) -> bool {
+            *self
+                .discard_depth
+                .lock()
+                .expect("DiscardAwareCaptureRecorder mutex poisoned")
+                > 0
+        }
+    }
+
+    /// RED before the BUG 2 fix: `record_operation` certified every record
+    /// unconditionally, so a kernel-internal record emitted inside a
+    /// `RecorderSuppressGuard` window (which ALWAYS discards, win or lose —
+    /// see `csketch::RecorderSuppressGuard`) still paid for a full validity
+    /// certificate that was thrown away moments later. This pins the fix at
+    /// the mechanism level: certification proceeds normally outside a
+    /// discard scope, and is skipped — not fabricated, not stale, simply
+    /// absent — while one is open.
+    #[test]
+    fn record_operation_skips_certification_while_records_are_discarded() {
+        let mut model = BRepModel::new();
+        // Build the box with NO recorder attached yet — `create_box_3d`
+        // itself records a `create_box`-style event when a recorder IS
+        // attached, which would otherwise land as an unwanted 3rd event
+        // in the spy below. Attaching after creation isolates this test to
+        // exactly the two `record_operation` calls it makes directly.
+        let sid = match TopologyBuilder::new(&mut model)
+            .create_box_3d(10.0, 10.0, 10.0)
+            .expect("box creation succeeds")
+        {
+            GeometryId::Solid(s) => s,
+            other => panic!("expected Solid, got {:?}", other),
+        };
+        let recorder = Arc::new(DiscardAwareCaptureRecorder::default());
+        model.attach_recorder(Some(recorder.clone()));
+
+        // Outside any discard scope: certification proceeds as normal.
+        model.record_operation(
+            RecordedOperation::new("test.normal_scope").with_output_solids([sid as u64]),
+        );
+
+        // Inside a discard scope: `record()` must still fire (the guard's
+        // OWN `begin_pending`/`abort_pending` buffering is what actually
+        // discards it — this recorder is a plain spy, not a staging one),
+        // but certification must be skipped.
+        recorder.begin_discard_scope();
+        model.record_operation(
+            RecordedOperation::new("test.discard_scope").with_output_solids([sid as u64]),
+        );
+        recorder.end_discard_scope();
+
+        let events = recorder
+            .events
+            .lock()
+            .expect("DiscardAwareCaptureRecorder mutex poisoned")
+            .clone();
+        assert_eq!(events.len(), 2, "both records must still reach the spy");
+        assert!(
+            events[0].solid_certificate.is_some(),
+            "outside a discard scope, record_operation must still certify the \
+             output solid — this is unchanged, load-bearing behaviour"
+        );
+        assert!(
+            events[1].solid_certificate.is_none(),
+            "inside a discard scope, certification must be skipped: the \
+             record is guaranteed to be discarded by the caller \
+             (RecorderSuppressGuard aborts unconditionally), so certifying \
+             it would compute a full validity certificate purely to throw \
+             it away"
+        );
     }
 
     /// Default-seeded datums are an invariant of `BRepModel::new()` — they

@@ -1,7 +1,8 @@
 //! Main export engine implementation
 
 use crate::formats::ros::{
-    export_brep_to_ros, import_ros_to_brep, RosExportOptions, RosExportPayload,
+    export_brep_to_ros, HistData, RosExportOptions, RosExportPayload, RosFileVerification,
+    RosImport, RosWriteSummary,
 };
 use crate::formats::step::{
     export_brep_to_step, import_step_text_with_report, import_step_to_brep, ImportReport,
@@ -91,13 +92,28 @@ impl ExportEngine {
         Ok(filename)
     }
 
-    /// Export B-Rep model to ROS format with encryption and AI tracking
+    /// Export a B-Rep model — plus its timeline history and AI
+    /// provenance — to .ros v3.1.
+    ///
+    /// HIST and PROV are MANDATORY chunks, so this single entry point
+    /// takes them explicitly: a caller that genuinely has no timeline /
+    /// tracker passes `None` and the file records that emptiness
+    /// (`HistChunk::empty()` / `ProvChunk::empty()`) as a statement of
+    /// fact. There is deliberately no history-less convenience wrapper —
+    /// a second path that silently wrote empty mandatory chunks is
+    /// exactly the defect this signature closed.
+    ///
+    /// Returns the written filename plus a [`RosWriteSummary`] stating
+    /// what the mandatory chunks actually carry, so the caller's
+    /// response can report it.
     pub async fn export_ros(
         &self,
         model: &BRepModel,
         name: &str,
+        history: Option<HistData>,
+        aipr: Option<ros_format::AICommandTracker>,
         options: RosExportOptions,
-    ) -> Result<String, ExportError> {
+    ) -> Result<(String, RosWriteSummary), ExportError> {
         // Ensure output directory exists
         fs::create_dir_all(&self.output_dir)
             .await
@@ -108,30 +124,45 @@ impl ExportEngine {
         let filename = format!("{}.ros", name);
         let filepath = self.output_dir.join(&filename);
 
-        // Export to .ros v3.1. The engine-level wrapper writes an empty
-        // HIST + PROV manifest; richer callers that own a Timeline /
-        // AICommandTracker should call `export_brep_to_ros` directly
-        // with a populated `RosExportPayload`.
         let payload = RosExportPayload {
             model,
-            history: None,
-            aipr: None,
+            history,
+            aipr,
         };
-        export_brep_to_ros(payload, &filepath, options).await?;
+        let summary = export_brep_to_ros(payload, &filepath, options).await?;
 
-        Ok(filename)
+        Ok((filename, summary))
     }
 
-    /// Import B-Rep model from ROS format
+    /// Import a `.ros` file from the export directory, returning the
+    /// FULL structured [`RosImport`] — timeline events, branch
+    /// manifests, PROV chunk, optional GEOM snapshot. Callers
+    /// materialise geometry via [`RosImport::into_model`] and are
+    /// expected to REPORT the history/provenance counts to their own
+    /// caller rather than silently dropping the mandatory chunks.
     pub async fn import_ros(
         &self,
         filename: &str,
         password: Option<&str>,
-    ) -> Result<BRepModel, ExportError> {
+    ) -> Result<RosImport, ExportError> {
         let filepath = self.output_dir.join(filename);
 
-        // Import from ROS format
-        import_ros_to_brep(&filepath, password).await
+        crate::formats::ros::import_ros(&filepath, password).await
+    }
+
+    /// Verify a `.ros` file in the export directory WITHOUT its password.
+    ///
+    /// Returns the signature verdict, the header facts and the chunk
+    /// inventory; never any chunk contents. The v3.2 signature covers
+    /// the post-encryption on-disk bytes and SIGN is never encrypted
+    /// precisely so an encrypted artifact can be checked for integrity
+    /// and authorship by someone who cannot read it — see
+    /// [`crate::formats::ros::verify_ros_file`] for exactly what a caller
+    /// does and does not learn.
+    pub async fn verify_ros(&self, filename: &str) -> Result<RosFileVerification, ExportError> {
+        let filepath = self.output_dir.join(filename);
+
+        crate::formats::ros::verify_ros_file(&filepath).await
     }
 
     /// Export B-Rep model to STEP format

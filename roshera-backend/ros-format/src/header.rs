@@ -19,9 +19,69 @@ pub const ROSHERA_MAGIC: &[u8; 8] = b"ROSHERA\0";
 /// first-class chunks; GEOM is now optional cache. Old v3.0 readers
 /// (none in the wild) cannot consume v3.1 files because the required
 /// chunk set changed; this is an additive minor bump on purpose.
+///
+/// **3.2.0** (2026-08-04): the *integrity scheme* changed, which is why
+/// this is a version bump and not a silent fix. Under v3.0/v3.1 the
+/// header CRC-32 covered bytes `0..12` only and the signature's Merkle
+/// leaves were the content chunk payloads alone — so `file_size`,
+/// `index_offset`, `signature_algo`, `feature_flags`, `ai_tracking`,
+/// `kdf_*`, `file_uuid` and the entire 96-byte-per-chunk index were
+/// under no checksum and outside the signature. v3.2:
+///
+/// - widens the header CRC-32 to the whole 128-byte header minus the
+///   CRC field itself (bytes `0..12` ++ `16..128`) — see
+///   [`header_crc_input`];
+/// - adds the normalized header image and every non-SIGN chunk index
+///   entry to the signature's Merkle leaves (see
+///   `export_engine::formats::ros`);
+/// - populates the AI-provenance hint fields truthfully, so they are
+///   signed facts rather than zeros that read as "no provenance".
+///
+/// A v3.1 file still parses (its header CRC is checked over the old
+/// range), but its signature was made under the superseded scheme and
+/// is reported as such rather than as a failure.
 pub const CURRENT_MAJOR_VERSION: u8 = 3;
-pub const CURRENT_MINOR_VERSION: u8 = 1;
+pub const CURRENT_MINOR_VERSION: u8 = 2;
 pub const CURRENT_PATCH_VERSION: u8 = 0;
+
+/// First minor version (within major 3) carrying the v2 integrity
+/// scheme described on [`CURRENT_MINOR_VERSION`].
+pub const INTEGRITY_SCHEME_V2_MIN_MINOR: u8 = 2;
+
+/// Does a file at this version use the v2 integrity scheme (wide header
+/// CRC, header + chunk index inside the signature, populated AI hints)?
+///
+/// The one place that answers the question; readers and writers both
+/// call it so the two can never disagree about which rule applies.
+pub fn uses_integrity_scheme_v2(major_version: u8, minor_version: u8) -> bool {
+    major_version > CURRENT_MAJOR_VERSION
+        || (major_version == CURRENT_MAJOR_VERSION
+            && minor_version >= INTEGRITY_SCHEME_V2_MIN_MINOR)
+}
+
+/// The exact byte range(s) the header CRC-32 is computed over, for a
+/// 128-byte header image at the given version.
+///
+/// The CRC field itself (`12..16`) is necessarily excluded in both
+/// schemes — it cannot cover its own value. Under v3.0/v3.1 that is the
+/// only exclusion *and* the only inclusion: the checksum stopped at byte
+/// 12. Under v3.2 everything else in the header is covered.
+///
+/// Returns `None` when `header_bytes` is not a full header image.
+pub fn header_crc_input(
+    header_bytes: &[u8],
+    major_version: u8,
+    minor_version: u8,
+) -> Option<Vec<u8>> {
+    if header_bytes.len() < HEADER_SIZE {
+        return None;
+    }
+    let mut input = header_bytes.get(0..12)?.to_vec();
+    if uses_integrity_scheme_v2(major_version, minor_version) {
+        input.extend_from_slice(header_bytes.get(16..HEADER_SIZE)?);
+    }
+    Some(input)
+}
 
 /// Header size is always 128 bytes
 pub const HEADER_SIZE: usize = 128;
@@ -231,8 +291,20 @@ impl FileHeader {
             Endianness::Big => Self::parse_with_endianness::<BigEndian>(&mut cursor, magic)?,
         };
 
-        // Verify CRC (exclude the CRC field itself)
-        let computed_crc = crc32(&header_bytes[0..12]);
+        // Verify CRC over the range this file's version defines: bytes
+        // 0..12 for v3.0/v3.1, the whole header minus the CRC field for
+        // v3.2+. `header_crc_input` is the single definition of that
+        // range, shared with `to_bytes` on the write side.
+        let crc_input = header_crc_input(&header_bytes, header_bytes[8], header_bytes[9])
+            .ok_or_else(|| FormatError::InvalidHeader {
+                field: "header_crc32".to_string(),
+                reason: format!(
+                    "header image is {} bytes, shorter than the mandatory {}",
+                    header_bytes.len(),
+                    HEADER_SIZE
+                ),
+            })?;
+        let computed_crc = crc32(&crc_input);
         let stored_crc_bytes = &header_bytes[12..16];
         let stored_crc = match endianness {
             Endianness::Little => LittleEndian::read_u32(stored_crc_bytes),
@@ -315,33 +387,49 @@ impl FileHeader {
         })
     }
 
-    /// Write header to file (seeks to start, writes 128 bytes)
-    pub fn write_to<W: Write + Seek>(&mut self, writer: &mut W) -> Result<()> {
-        // Ensure we're at the start
-        writer.seek(SeekFrom::Start(0))?;
-
-        // Prepare header bytes
+    /// Produce this header's 128-byte on-disk image, computing and
+    /// storing `header_crc32` over the range this header's version
+    /// defines ([`header_crc_input`]).
+    ///
+    /// Split out of [`write_to`](Self::write_to) so a signer can obtain
+    /// the exact bytes that will land on disk — and therefore sign them
+    /// — without writing the file first. `write_to` is this plus a
+    /// write, so the image that is signed and the image that is stored
+    /// are produced by ONE code path and cannot drift.
+    pub fn to_bytes(&mut self) -> Result<Vec<u8>> {
         let mut header_bytes = vec![0u8; HEADER_SIZE];
-        let mut cursor = std::io::Cursor::new(&mut header_bytes);
-
-        // Write based on endianness
-        match self.endianness {
-            Endianness::Little => self.serialize_with_endianness::<LittleEndian>(&mut cursor)?,
-            Endianness::Big => self.serialize_with_endianness::<BigEndian>(&mut cursor)?,
+        {
+            let mut cursor = std::io::Cursor::new(&mut header_bytes);
+            match self.endianness {
+                Endianness::Little => {
+                    self.serialize_with_endianness::<LittleEndian>(&mut cursor)?
+                }
+                Endianness::Big => self.serialize_with_endianness::<BigEndian>(&mut cursor)?,
+            }
         }
 
-        // Calculate and update CRC
-        let crc = crc32(&header_bytes[0..12]);
+        let crc_input = header_crc_input(&header_bytes, self.major_version, self.minor_version)
+            .ok_or_else(|| FormatError::InvalidHeader {
+                field: "header_crc32".to_string(),
+                reason: format!("serialized header is not {} bytes", HEADER_SIZE),
+            })?;
+        let crc = crc32(&crc_input);
         match self.endianness {
             Endianness::Little => LittleEndian::write_u32(&mut header_bytes[12..16], crc),
             Endianness::Big => BigEndian::write_u32(&mut header_bytes[12..16], crc),
         }
         self.header_crc32 = crc;
 
-        // Write to output
+        Ok(header_bytes)
+    }
+
+    /// Write header to file (seeks to start, writes 128 bytes)
+    pub fn write_to<W: Write + Seek>(&mut self, writer: &mut W) -> Result<()> {
+        // Ensure we're at the start
+        writer.seek(SeekFrom::Start(0))?;
+        let header_bytes = self.to_bytes()?;
         writer.write_all(&header_bytes)?;
         writer.flush()?;
-
         Ok(())
     }
 

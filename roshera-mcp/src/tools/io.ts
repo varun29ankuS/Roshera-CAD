@@ -143,7 +143,16 @@ export function registerIoTools(server: ToolHost) {
       part_id: z.number().int().describe("kernel part/solid id from list_parts"),
       name: z.string().optional().describe("title-block name for the sheet"),
       // Read by the dispatch gate only (gates.ts); never forwarded to the
-      // backend — the handler below deliberately ignores it.
+      // backend — the handler below deliberately ignores it. Unlike the 9
+      // mutating geometry routes ACK_UNSOUND's doc comment (modify.ts)
+      // describes, `POST /api/parts/{id}/drawing` (drawing_mgr::
+      // create_part_drawing) has NO `refuse_unsound_base` call of its own
+      // (verified against every call site in api-server/src/main.rs) — the
+      // unsound-base rule for this tool lives ONLY in gates.ts today, so
+      // there is nothing on the wire for this flag to satisfy. Forwarding it
+      // would be a silent no-op (the endpoint takes a query struct with no
+      // such field). If the backend ever grows a drawing-side gate, this
+      // comment and the handler both need to change together.
       acknowledge_unsound: ACK_UNSOUND,
     },
     async ({ part_id, name }) => {
