@@ -4882,8 +4882,9 @@ async fn import_ros_filename_traversal_is_refused() {
 ///   1. the exported FILE carries the live branch's events (verified by
 ///      re-opening the raw artifact with the format's own reader, not
 ///      by trusting the response), and
-///   2. the RESPONSE states what went into the file, including the
-///      legible PROV-emptiness marker (`prov_commands_absent_reason`).
+///   2. the RESPONSE states what went into the file — including, since
+///      the PROV derivation landed, one derived AI command per recorded
+///      operation (prompt only where an intent facet was recorded).
 #[tokio::test]
 async fn export_ros_route_hist_carries_the_live_timeline() {
     let state = make_test_state().await;
@@ -4960,13 +4961,26 @@ async fn export_ros_route_hist_carries_the_live_timeline() {
         !imported.branches.is_empty(),
         "HIST must carry the branch manifest for the live timeline"
     );
-    // PROV: the server has no AI-command source, so the file must carry
-    // a real session id and an EMPTY command list — never commands
-    // synthesised from timeline events.
-    assert!(
-        imported.aipr.commands.is_empty(),
-        "PROV must not contain fabricated AI commands"
+    // PROV: commands are DERIVED from the recorded timeline — one
+    // `AICommand` per recorded operation (the intent wave made intent a
+    // recorded fact, so PROV can mirror the history it ships alongside).
+    // A prompt appears ONLY where the operation recorded an intent
+    // facet; it is never synthesised from the op kind.
+    assert_eq!(
+        imported.aipr.commands.len(),
+        live_event_count,
+        "PROV must carry one derived AI command per recorded timeline event"
     );
+    for cmd in &imported.aipr.commands {
+        if cmd.prompt.is_none() {
+            assert_eq!(
+                cmd.prompt_hash, [0u8; 32],
+                "a command with no recorded intent must carry no prompt \
+                 commitment either — a hash of a prompt that was never \
+                 stated would be fabricated provenance"
+            );
+        }
+    }
 
     // The response must state what the file carries.
     let contents = body
@@ -4980,16 +4994,13 @@ async fn export_ros_route_hist_carries_the_live_timeline() {
     );
     assert_eq!(
         contents["prov_command_count"].as_u64(),
-        Some(0),
+        Some(live_event_count as u64),
         "response must report the PROV command count; contents = {contents}"
     );
     assert!(
-        contents["prov_commands_absent_reason"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("no AI command tracker"),
-        "an empty PROV must be legible in the response (same rule as \
-         certificate_absent_reason), not silent; contents = {contents}"
+        contents["prov_commands_absent_reason"].is_null(),
+        "PROV carries derived commands, so no absence marker may appear; \
+         contents = {contents}"
     );
 }
 
@@ -5113,6 +5124,307 @@ async fn import_ros_route_reports_hist_and_prov_counts() {
             .and_then(Value::as_u64)
             .is_some(),
         "response must report the file's PROV session id; contents = {contents}"
+    );
+}
+
+// =====================================================================
+// Tests — .ros import as a DOCUMENT (/api/documents/import_ros)
+// =====================================================================
+
+/// Build a POST `/api/documents/import_ros` request with the given JSON
+/// payload.
+fn import_ros_document_post(payload: Value) -> Request<Body> {
+    Request::builder()
+        .method(Method::POST)
+        .uri("/api/documents/import_ros")
+        .header("content-type", "application/json")
+        .body(Body::from(payload.to_string()))
+        .expect("static request must build")
+}
+
+/// Round-trip scaffold shared by the document-import tests: seed a bored
+/// box through the LIVE handlers (box − cylinder → 3 recorded events,
+/// the boolean REFERENCING the solids the first two events minted),
+/// clear the export staleness gate, export a `.ros` via `/api/export`,
+/// and return the exported file's path plus the pre-export
+/// `(event id, sequence_number)` pairs of branch `main` — the ground
+/// truth an import must reproduce verbatim.
+async fn export_live_document_to_ros(state: &AppState) -> (std::path::PathBuf, Vec<(String, u64)>) {
+    let _drill = seed_bored_box_live(state).await;
+    let _ = state.timeline_recorder.flush().await;
+    let originals: Vec<(String, u64)> = {
+        let timeline = state.timeline.read().await;
+        timeline
+            .get_branch_events(&timeline_engine::BranchId::main(), None, None)
+            .expect("branch main must exist")
+            .iter()
+            .map(|e| (e.id.to_string(), e.sequence_number))
+            .collect()
+    };
+    assert!(
+        originals.len() >= 3,
+        "precondition: the live-seeded part must have recorded several operations"
+    );
+
+    // Clear the export staleness gate for every live solid (what
+    // `verify_part` calls), exactly as the export HIST test does.
+    let solid_ids: Vec<u32> = {
+        let model = state.model.read().await;
+        model.solids.iter().map(|(sid, _)| sid).collect()
+    };
+    for sid in solid_ids {
+        let (vs, vbody) = dispatch(
+            state,
+            json_get(&format!("/api/agent/parts/{sid}/perception")),
+        )
+        .await;
+        assert_eq!(
+            vs,
+            StatusCode::OK,
+            "precondition: verify of solid {sid} must succeed; body = {vbody}"
+        );
+    }
+
+    let (status, raw) = dispatch_raw(
+        state,
+        export_post(json!({ "format": "ROS", "objects": [] })),
+    )
+    .await;
+    let text = String::from_utf8_lossy(&raw).to_string();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "ROS export must succeed; body = {text}"
+    );
+    let body: Value = serde_json::from_str(&text).expect("export success body is JSON");
+    let filename = body["filename"]
+        .as_str()
+        .expect("export response carries the filename")
+        .to_string();
+    (
+        std::path::PathBuf::from("./exports").join(&filename),
+        originals,
+    )
+}
+
+/// RED-first (document import, test 1): `/api/geometry/import_ros`
+/// reports the HIST payload and then DISCARDS it — a provenance-bearing
+/// file imports as a bare geometry splice. The document-import route
+/// must instead create a fresh document, persist the imported events
+/// under it, and activate it, with every event's `sequence_number`
+/// byte-identical — persistent ids derive from `evt:{sequence_number}`,
+/// so a fresh document with verbatim sequences preserves every pid (no
+/// merge, no resequencing, no id collisions). On the pre-fix router this
+/// route does not exist, so the request 404s.
+#[tokio::test]
+async fn import_ros_document_preserves_event_ids_and_sequences() {
+    let state = make_test_state().await;
+    let (path, originals) = export_live_document_to_ros(&state).await;
+
+    let (status, body) = dispatch(
+        &state,
+        import_ros_document_post(json!({ "path": path.to_string_lossy().to_string() })),
+    )
+    .await;
+    let _ = std::fs::remove_file(&path);
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        ".ros document import must succeed; body = {body}"
+    );
+    let doc_id = body["document"]["id"]
+        .as_str()
+        .expect("document import must return the new document's id")
+        .to_string();
+    assert_ne!(
+        doc_id,
+        crate::durability::DURABILITY_SESSION_ID,
+        "import must mint a NEW document, never merge into the default one"
+    );
+    assert_eq!(
+        body["file_contents"]["hist_event_count"].as_u64(),
+        Some(originals.len() as u64),
+        "response must report the file's HIST event count; body = {body}"
+    );
+
+    // The imported document is now ACTIVE; its timeline must carry the
+    // SAME events — same count, same sequence numbers, same event ids.
+    assert_eq!(
+        state.active_document.read().await.clone(),
+        doc_id,
+        "import must activate the new document through documents::activate"
+    );
+    let rehydrated: Vec<(String, u64)> = {
+        let timeline = state.timeline.read().await;
+        timeline
+            .get_branch_events(&timeline_engine::BranchId::main(), None, None)
+            .expect("branch main must exist in the imported document")
+            .iter()
+            .map(|e| (e.id.to_string(), e.sequence_number))
+            .collect()
+    };
+    assert_eq!(
+        rehydrated, originals,
+        "the imported document's timeline must carry the exported events verbatim \
+         (same count, same sequence numbers, same ids) — persistent ids derive from \
+         evt:{{sequence_number}}, so any resequencing breaks every recorded pid; \
+         body = {body}"
+    );
+}
+
+/// The identity test — the point of the whole design: the seeded boolean
+/// difference REFERENCES the box and cylinder minted by earlier events
+/// (persistent ids derived from their sequence numbers). Because import
+/// rehydrates into a FRESH document with sequences preserved, the
+/// imported document must REPLAY to the same model — the boolean's
+/// operand references resolve and the 3-radius bore re-derives — rather
+/// than to dangling references. The response must say the replay was
+/// clean in the durability vocabulary (`active`, never a silent partial).
+#[tokio::test]
+async fn import_ros_document_replay_resolves_persistent_id_references() {
+    let state = make_test_state().await;
+    let (path, originals) = export_live_document_to_ros(&state).await;
+
+    let (status, body) = dispatch(
+        &state,
+        import_ros_document_post(json!({ "path": path.to_string_lossy().to_string() })),
+    )
+    .await;
+    let _ = std::fs::remove_file(&path);
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        ".ros document import must succeed; body = {body}"
+    );
+    assert_eq!(
+        body["history"]["state"].as_str(),
+        Some("active"),
+        "the imported HIST must replay cleanly and say so in the durability \
+         vocabulary (state=active, not quarantined); body = {body}"
+    );
+    assert_eq!(
+        body["history"]["events_replayed"].as_u64(),
+        Some(originals.len() as u64),
+        "every imported event must replay — a partial replay is a quarantine, \
+         not a success; body = {body}"
+    );
+    assert_eq!(
+        body["success"].as_bool(),
+        Some(true),
+        "a clean full replay must report success:true; body = {body}"
+    );
+
+    // The live model IS the imported document now: exactly one solid
+    // (the boolean consumed both operands) with the drilled bore intact.
+    let solid_count = {
+        let model = state.model.read().await;
+        model.solids.iter().count()
+    };
+    assert_eq!(
+        solid_count, 1,
+        "the imported document must replay to the boolean RESULT (operands \
+         consumed) — operand references resolved, not dangled; body = {body}"
+    );
+    let bore = live_bore_radius(&state)
+        .await
+        .expect("the imported document's model must carry the drilled bore wall");
+    assert!(
+        (bore - 3.0).abs() < 1e-9,
+        "the bore must re-derive at its recorded radius after import; got {bore}"
+    );
+}
+
+/// A file with an EMPTY HIST (bare geometry snapshot) must still import —
+/// as a document with NO history — and say that plainly (`history.state`
+/// = "empty", zero events). It must NOT be refused, and NO events may be
+/// fabricated from the GEOM snapshot; the snapshot's presence is reported
+/// so nothing is silently dropped.
+#[tokio::test]
+async fn import_ros_document_empty_hist_imports_as_empty_document() {
+    use export_engine::formats::ros::{export_brep_to_ros, RosExportOptions, RosExportPayload};
+
+    let mut fresh_model = BRepModel::new();
+    {
+        let mut builder = TopologyBuilder::new(&mut fresh_model);
+        builder
+            .create_box_3d(10.0, 10.0, 10.0)
+            .expect("box primitive must build for positive size");
+    }
+    let mut tmp_path = std::env::temp_dir();
+    tmp_path.push(format!(
+        "roshera_import_ros_doc_empty_{}.ros",
+        Uuid::new_v4()
+    ));
+    export_brep_to_ros(
+        RosExportPayload {
+            model: &fresh_model,
+            history: None,
+            aipr: None,
+        },
+        &tmp_path,
+        RosExportOptions::default(),
+    )
+    .await
+    .expect(".ros export of a bare snapshot must succeed");
+
+    let state = make_test_state().await;
+    let (status, body) = dispatch(
+        &state,
+        import_ros_document_post(json!({ "path": tmp_path.to_string_lossy().to_string() })),
+    )
+    .await;
+    let _ = std::fs::remove_file(&tmp_path);
+
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an empty-HIST .ros file must still import as a document; body = {body}"
+    );
+    assert_eq!(
+        body["file_contents"]["hist_event_count"].as_u64(),
+        Some(0),
+        "response must report ZERO imported events, never events fabricated \
+         from the GEOM snapshot; body = {body}"
+    );
+    assert_eq!(
+        body["history"]["state"].as_str(),
+        Some("empty"),
+        "an empty HIST must be said plainly in the durability vocabulary; \
+         body = {body}"
+    );
+    assert_eq!(
+        body["success"].as_bool(),
+        Some(true),
+        "an empty-HIST import is a SUCCESSFUL import of an empty document; \
+         body = {body}"
+    );
+    assert_eq!(
+        body["geom_snapshot"]["present"].as_bool(),
+        Some(true),
+        "the file's GEOM snapshot must be reported, not silently dropped; \
+         body = {body}"
+    );
+
+    // The document exists in the registry and is the active one.
+    let doc_id = body["document"]["id"]
+        .as_str()
+        .expect("document import must return the new document's id")
+        .to_string();
+    let (ls, lbody) = dispatch(&state, json_get("/api/documents")).await;
+    assert_eq!(ls, StatusCode::OK, "document list must 200; body = {lbody}");
+    let entry = lbody
+        .as_array()
+        .expect("documents list is an array")
+        .iter()
+        .find(|d| d["id"].as_str() == Some(doc_id.as_str()))
+        .cloned()
+        .expect("the imported document must be listed in the registry");
+    assert_eq!(
+        entry["active"].as_bool(),
+        Some(true),
+        "the imported document must be the active one; list = {lbody}"
     );
 }
 

@@ -8,7 +8,10 @@
 //! ## Layout
 //! ```text
 //! Header (128 bytes, v3.1)
-//! ├── META  (JSON)         — author, units, software, vertex/face counts
+//! ├── META  (JSON)         — author, units, software, vertex/face counts,
+//! │                          replay_status (the file's own statement of
+//! │                          whether its HIST events replay — see
+//! │                          [`RosReplayStatus`])
 //! ├── HIST  (MessagePack)  — timeline events + branch manifest. MANDATORY.
 //! ├── PROV  (MessagePack)  — AI command log + privacy. MANDATORY.
 //! ├── GEOM  (MessagePack)  — BRepSnapshot. OPTIONAL cache.
@@ -102,6 +105,13 @@ pub struct RosExportOptions {
     /// AI provenance tracking level for the PROV chunk header.
     pub tracking_level: TrackingLevel,
 
+    /// Verify at export time that the HIST events actually replay into a
+    /// fresh model, and record the honest outcome in META
+    /// (`replay_status`). Default true. When false the file states
+    /// `"unverified"` — the field is never absent and never defaults to
+    /// a pass; see [`RosReplayStatus`].
+    pub verify_replay: bool,
+
     /// Sign the file with Ed25519. Requires `signing_key`; `sign: true`
     /// with no key is a typed refusal, not a silently minted throwaway
     /// key — a signature from a per-file ephemeral key proves nothing
@@ -130,7 +140,17 @@ impl Default for RosExportOptions {
     fn default() -> Self {
         Self {
             include_snapshot: true,
-            tracking_level: TrackingLevel::Basic,
+            // Detailed, not Basic: `Basic.should_track_prompts()` is
+            // false, so a Basic default would strip every recorded
+            // `roshera.intent` text on the way out — the authorship
+            // record an IP claim rests on. Callers wanting redaction opt
+            // into Basic explicitly, and lose nothing provable:
+            // `aipr.rs` (and `ros_provenance::ai_tracker_from_timeline`)
+            // compute the prompt HASH *before* the privacy gate, so a
+            // redacted file still carries a commitment to the text —
+            // redaction and provability are not in tension here.
+            tracking_level: TrackingLevel::Detailed,
+            verify_replay: true,
             sign: false,
             signing_key: None,
             password: None,
@@ -178,6 +198,48 @@ pub enum RosWriteSignature {
     },
 }
 
+/// The failing event of an export-time replay-verification pass —
+/// [`timeline_engine::ReplayFailure`] in its META wire shape.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RosReplayFailure {
+    /// The failing event's stable sequence number.
+    pub sequence_number: u64,
+    /// The failing event's id (stringified UUID).
+    pub event_id: String,
+    /// The replay error, verbatim.
+    pub error: String,
+}
+
+/// The file's own statement about whether its HIST events replay.
+///
+/// Written into META (`replay_status`) at export time so the caveat
+/// travels WITH the file: whoever opens it in two years sees the verdict,
+/// not a conversation that has evaporated. Three states, never two —
+/// same rule as [`RosSignatureVerdict`]: "unverified" and "failed" are
+/// different facts and must not collapse into each other, and the field
+/// is never absent and never defaults to a pass.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "verdict", rename_all = "snake_case")]
+pub enum RosReplayStatus {
+    /// Every HIST event re-applied cleanly into a fresh `BRepModel` at
+    /// export time (`events_applied` of them; 0 for an empty timeline —
+    /// vacuously clean, and the count makes that legible).
+    Verified { events_applied: usize },
+    /// Replay was attempted and could NOT fully re-apply. The file's
+    /// geometry cache (GEOM, if present) is still exact; what this
+    /// records is that the event history alone does not reproduce it.
+    Incomplete {
+        events_applied: usize,
+        events_skipped: usize,
+        first_failure: RosReplayFailure,
+    },
+    /// Replay was not attempted (`RosExportOptions::verify_replay` was
+    /// false). Serialized as `"unverified"` — an explicit statement of
+    /// no claim, distinct from both `verified` and `incomplete`.
+    #[serde(rename = "unverified")]
+    NotAttempted,
+}
+
 /// Reader output. `snapshot` is `None` when the file omitted the
 /// optional GEOM chunk; callers may rebuild geometry by replaying
 /// `timeline` against a fresh `BRepModel`.
@@ -189,6 +251,11 @@ pub struct RosImport {
     /// Signature verdict, computed against the raw on-disk bytes before
     /// any chunk is decrypted or parsed.
     pub signature: RosSignatureVerdict,
+    /// The file's own replay-status claim, read from META. Files written
+    /// before the field existed made no claim, which reads back as
+    /// [`RosReplayStatus::NotAttempted`] — the safe direction (absence
+    /// never becomes a pass).
+    pub replay_status: RosReplayStatus,
 }
 
 impl RosImport {
@@ -236,6 +303,9 @@ pub struct RosWriteSummary {
     /// the writer's own report from the write site — a file whose
     /// header claims a signature always has the chunk this reports.
     pub signature: RosWriteSignature,
+    /// The replay-status verdict written into META — the writer's own
+    /// report of what the file now states about itself.
+    pub replay_status: RosReplayStatus,
 }
 
 /// Export a B-Rep model + timeline + provenance to .ros v3.1.
@@ -299,6 +369,66 @@ pub async fn export_brep_to_ros(
 
     let mut chunks: Vec<Chunk> = Vec::new();
 
+    // HIST payload (built before META: the replay-verification pass and
+    // META's `replay_status` field both need the final event list) -----
+    let hist_chunk = match payload.history {
+        Some(data) => HistChunk::new(data.branches, data.events),
+        None => HistChunk::empty(),
+    };
+    let hist_event_count = hist_chunk.events.len();
+    let hist_branch_count = hist_chunk.branches.len();
+
+    // Replay verification ---------------------------------------------
+    // Attempt the replay the file's own readers would perform: rebuild a
+    // model from the HIST events into a fresh `BRepModel` and record the
+    // honest outcome in META. Opt-out via `options.verify_replay`, in
+    // which case the file says exactly that ("unverified") — the field
+    // is never absent and never defaults to a pass.
+    let replay_status = if options.verify_replay {
+        let mut replica = BRepModel::new();
+        let outcome = timeline_engine::rebuild_model_from_events(&mut replica, &hist_chunk.events);
+        if outcome.events_skipped == 0 {
+            RosReplayStatus::Verified {
+                events_applied: outcome.events_applied,
+            }
+        } else {
+            match outcome.first_failure {
+                Some(failure) => RosReplayStatus::Incomplete {
+                    events_applied: outcome.events_applied,
+                    events_skipped: outcome.events_skipped,
+                    first_failure: RosReplayFailure {
+                        sequence_number: failure.sequence_number,
+                        event_id: failure.event_id,
+                        error: failure.error,
+                    },
+                },
+                // `rebuild_model_from_events` records the failure in the
+                // same arm that increments `events_skipped`; reaching
+                // this state means that invariant broke. Refuse rather
+                // than write an Incomplete verdict with a fabricated
+                // failure detail.
+                None => {
+                    return Err(ExportError::ExportFailed {
+                        reason: format!(
+                            "replay verification skipped {} of {} HIST events but \
+                             ReplayOutcome carried no first-failure detail — \
+                             timeline-engine invariant broken (every skip must \
+                             record its failure); refusing to write a verdict \
+                             with an invented failure",
+                            outcome.events_skipped, hist_event_count
+                        ),
+                    })
+                }
+            }
+        }
+    } else {
+        RosReplayStatus::NotAttempted
+    };
+    let replay_status_json =
+        serde_json::to_value(&replay_status).map_err(|e| ExportError::ExportFailed {
+            reason: format!("Failed to serialize replay_status for META: {}", e),
+        })?;
+
     // META chunk -------------------------------------------------------
     let meta_data = serde_json::json!({
         "name": "Roshera CAD Model",
@@ -311,17 +441,12 @@ pub async fn export_brep_to_ros(
         "faces": payload.model.faces.len(),
         "solids": payload.model.solids.len(),
         "include_snapshot": options.include_snapshot,
+        "replay_status": replay_status_json,
     })
     .to_string();
     chunks.push(Chunk::new(ChunkType::META, meta_data.into_bytes()));
 
     // HIST chunk (mandatory) ------------------------------------------
-    let hist_chunk = match payload.history {
-        Some(data) => HistChunk::new(data.branches, data.events),
-        None => HistChunk::empty(),
-    };
-    let hist_event_count = hist_chunk.events.len();
-    let hist_branch_count = hist_chunk.branches.len();
     let hist_bytes = hist_chunk.serialize().map_err(ros_err)?;
     chunks.push(encrypt_if_enabled(
         Chunk::new(ChunkType::HIST, hist_bytes),
@@ -430,6 +555,7 @@ pub async fn export_brep_to_ros(
         prov_command_count,
         prov_session_id,
         signature,
+        replay_status,
     })
 }
 
@@ -610,13 +736,49 @@ pub async fn import_ros(
         None
     };
 
+    let replay_status = read_meta_replay_status(&cursor, &chunk_table)?;
+
     Ok(RosImport {
         timeline: hist_chunk.events,
         branches: hist_chunk.branches,
         aipr: prov_chunk,
         snapshot,
         signature,
+        replay_status,
     })
+}
+
+/// Read the file's `replay_status` claim out of META.
+///
+/// META is a mandatory, always-plaintext JSON chunk (the writer never
+/// encrypts it), so this needs no key material. A file written before
+/// the field existed made no replay claim; that absence reads back as
+/// [`RosReplayStatus::NotAttempted`] — never a pass. A META that is not
+/// valid JSON, or a `replay_status` that does not parse, is a typed
+/// refusal: a mandatory chunk that cannot be read is a broken file, not
+/// a warning.
+fn read_meta_replay_status(
+    cursor: &Cursor<Vec<u8>>,
+    table: &ros_format::chunk::ChunkTable,
+) -> Result<RosReplayStatus, ExportError> {
+    let entry = table
+        .find_by_type(ChunkType::META)
+        .ok_or_else(|| ExportError::ExportFailed {
+            reason: "Missing chunk: META".to_string(),
+        })?;
+    let meta_bytes = raw_chunk_bytes(cursor.get_ref(), entry)?;
+    let meta: serde_json::Value =
+        serde_json::from_slice(meta_bytes).map_err(|e| ExportError::ExportFailed {
+            reason: format!("META chunk is not valid JSON: {}", e),
+        })?;
+    match meta.get("replay_status") {
+        None => Ok(RosReplayStatus::NotAttempted),
+        Some(value) => {
+            serde_json::from_value(value.clone()).map_err(|e| ExportError::ExportFailed {
+                reason: format!("META.replay_status failed to parse: {}", e),
+            })
+        }
+    }
 }
 
 /// Compute the signature verdict for a file whose header and chunk

@@ -320,6 +320,21 @@ pub fn rederive_part_drawing(
     DrawingRederive::Rebuilt(drawing_id, Box::new(drawing))
 }
 
+/// Identity and verbatim error of the first event a replay failed to
+/// re-execute. Captured on [`ReplayOutcome`] so callers (e.g. the `.ros`
+/// exporter's replay-verification pass) can state WHICH event broke
+/// without re-running the replay under a tracing subscriber — the
+/// per-event detail otherwise only reaches `tracing::warn!`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplayFailure {
+    /// The failing event's stable sequence number.
+    pub sequence_number: u64,
+    /// The failing event's id (`EventId`, stringified UUID).
+    pub event_id: String,
+    /// The replay error, verbatim (`ReplayError`'s Display output).
+    pub error: String,
+}
+
 /// Outcome of a [`rebuild_model_from_events`] run.
 #[derive(Debug, Clone, Default)]
 pub struct ReplayOutcome {
@@ -328,6 +343,12 @@ pub struct ReplayOutcome {
     /// Number of events that were skipped (unknown kind, invalid params,
     /// or kernel rejection). See `tracing::warn!` for per-event detail.
     pub events_skipped: usize,
+    /// The FIRST skipped event's identity and error. `Some` whenever
+    /// `events_skipped > 0` on every replay path that dispatches events
+    /// (full replay here, incremental slices in `incremental.rs`) —
+    /// each path records the failure in the same arm that increments
+    /// `events_skipped`, so the counter and the detail cannot drift.
+    pub first_failure: Option<ReplayFailure>,
     /// Final remap from original-recorded entity IDs to current-model
     /// entity IDs. Useful for callers who want to translate event-log
     /// references (e.g. an event's `outputs.created`) into live IDs.
@@ -402,6 +423,13 @@ pub fn rebuild_model_from_events(model: &mut BRepModel, events: &[TimelineEvent]
                     "replay step failed; skipping"
                 );
                 outcome.events_skipped += 1;
+                if outcome.first_failure.is_none() {
+                    outcome.first_failure = Some(ReplayFailure {
+                        sequence_number: event.sequence_number,
+                        event_id: event.id.to_string(),
+                        error: err.to_string(),
+                    });
+                }
             }
         }
     }

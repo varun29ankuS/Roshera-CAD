@@ -5067,11 +5067,16 @@ async fn register_imported_solids(
 /// tessellated, broadcast, and FULL-certified exactly like the STEP
 /// import path — same splice (`merge_solids_into`), same
 /// `register_imported_solids` loop.
-async fn import_ros_geometry(
-    State(state): State<AppState>,
-    ActiveModel(model_handle): ActiveModel,
-    Json(payload): Json<serde_json::Value>,
-) -> Result<Json<serde_json::Value>, error_catalog::ApiError> {
+/// Read a full [`export_engine::formats::ros::RosImport`] from an import
+/// request payload (`path` | `filename`, optional `password`). Shared by
+/// the geometry-splice route ([`import_ros_geometry`]) and the
+/// document-import route ([`documents::import_ros_document`]) so the two
+/// can never drift on the traversal guard, the size ceiling, or the
+/// typed-error contract.
+pub(crate) async fn read_ros_import_request(
+    state: &AppState,
+    payload: &serde_json::Value,
+) -> Result<export_engine::formats::ros::RosImport, error_catalog::ApiError> {
     use error_catalog::{ApiError, ErrorCode};
 
     // Same sanity ceiling as the STEP route: generous for any real .ros
@@ -5080,12 +5085,8 @@ async fn import_ros_geometry(
     const MAX_ROS_FILE_BYTES: u64 = 512 * 1024 * 1024; // 512MB
 
     let password = payload.get("password").and_then(|v| v.as_str());
-    let base_name = payload
-        .get("name")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
 
-    let ros = if let Some(p) = payload.get("path").and_then(|v| v.as_str()) {
+    if let Some(p) = payload.get("path").and_then(|v| v.as_str()) {
         let metadata = tokio::fs::metadata(p).await.map_err(|e| {
             ApiError::new(
                 ErrorCode::InvalidParameter,
@@ -5114,7 +5115,7 @@ async fn import_ros_geometry(
                     ErrorCode::InvalidParameter,
                     format!(".ros import failed: {e}"),
                 )
-            })?
+            })
     } else if let Some(f) = payload.get("filename").and_then(|v| v.as_str()) {
         // Same traversal guard as `/api/download/{filename}` — the value
         // is resolved inside the export directory, never outside it.
@@ -5136,34 +5137,24 @@ async fn import_ros_geometry(
                     ErrorCode::InvalidParameter,
                     format!(".ros import failed: {e}"),
                 )
-            })?
+            })
     } else {
-        return Err(ApiError::missing_field(
+        Err(ApiError::missing_field(
             "path or filename (a server-readable .ros file location, or a file \
              name a /api/export ROS response returned)",
-        ));
-    };
+        ))
+    }
+}
 
-    // What the file's mandatory HIST/PROV chunks carried — surfaced
-    // verbatim in the response below so the caller can tell a
-    // provenance-bearing file from a bare geometry snapshot.
-    //
-    // SCOPE: the HIST/PROV payload is REPORTED, not ingested. Merging a
-    // foreign timeline into the live one (branch identity, sequence
-    // collisions, authorship trust) is a separate design problem and is
-    // deliberately NOT attempted here — this route splices geometry and
-    // tells the caller what else the file contained, instead of silently
-    // throwing the mandatory chunks away.
-    let hist_event_count = ros.timeline.len();
-    let hist_branch_count = ros.branches.len();
-    let prov_command_count = ros.aipr.commands.len();
-    let prov_session_id = ros.aipr.session;
-
-    // Signature verdict — three states, never a bool: "unsigned" and
-    // "signature failed" are different facts and must not collapse.
-    // (A header that CLAIMS a signature over a file with no SIGN chunk
-    // never reaches here — import_ros refuses it with a typed error.)
-    let signature_json = match &ros.signature {
+/// Signature verdict as wire JSON — three states, never a bool:
+/// "unsigned" and "signature failed" are different facts and must not
+/// collapse. (A header that CLAIMS a signature over a file with no SIGN
+/// chunk never reaches here — `import_ros` refuses it with a typed
+/// error.) Shared by both .ros import routes.
+pub(crate) fn ros_signature_json(
+    signature: &export_engine::formats::ros::RosSignatureVerdict,
+) -> serde_json::Value {
+    match signature {
         export_engine::formats::ros::RosSignatureVerdict::Unsigned => {
             serde_json::json!({ "status": "unsigned" })
         }
@@ -5178,7 +5169,42 @@ async fn import_ros_geometry(
         export_engine::formats::ros::RosSignatureVerdict::Invalid { reason } => {
             serde_json::json!({ "status": "invalid", "reason": reason })
         }
-    };
+    }
+}
+
+async fn import_ros_geometry(
+    State(state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, error_catalog::ApiError> {
+    use error_catalog::{ApiError, ErrorCode};
+
+    let base_name = payload
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let ros = read_ros_import_request(&state, &payload).await?;
+
+    // What the file's mandatory HIST/PROV chunks carried — surfaced
+    // verbatim in the response below so the caller can tell a
+    // provenance-bearing file from a bare geometry snapshot.
+    //
+    // SCOPE: the HIST/PROV payload is REPORTED, not ingested. Merging a
+    // foreign timeline into the live one would rebase sequence numbers
+    // and break every recorded persistent id (pids derive from
+    // `evt:{sequence_number}`), so it stays permanently out of scope for
+    // THIS route — it splices geometry and tells the caller what else
+    // the file contained. To ingest the timeline, use the sibling
+    // `POST /api/documents/import_ros` (`documents::import_ros_document`),
+    // which rehydrates the file into a FRESH document where every
+    // sequence number is preserved verbatim.
+    let hist_event_count = ros.timeline.len();
+    let hist_branch_count = ros.branches.len();
+    let prov_command_count = ros.aipr.commands.len();
+    let prov_session_id = ros.aipr.session;
+
+    let signature_json = ros_signature_json(&ros.signature);
 
     let imported = ros.into_model().map_err(|e| {
         ApiError::new(
@@ -9699,6 +9725,20 @@ pub(crate) fn build_router(state: AppState) -> Router {
             get(documents::list_documents).post(documents::create_document),
         )
         .route("/api/documents/{id}/open", post(documents::open_document))
+        // Import a .ros file AS a document: registers a fresh document,
+        // persists the file's HIST events/branches under it verbatim
+        // (sequence numbers preserved — persistent ids derive from
+        // `evt:{sequence_number}`), and activates it through the same
+        // `documents::activate` path `/open` uses. Static segment, so it
+        // must precede nothing here — axum ranks it above `{id}` routes.
+        // Same create-geometry gate as `/api/geometry/import_ros`: both
+        // routes materialise geometry from an untrusted file.
+        .route(
+            "/api/documents/import_ros",
+            post(documents::import_ros_document).route_layer(axum::middleware::from_fn(
+                auth_middleware::require_create_geometry,
+            )),
+        )
         // PATCH renames; DELETE is the only destructive route in the API —
         // it refuses the active / last-remaining / default document (see
         // documents.rs) and is transactional across the registry row and

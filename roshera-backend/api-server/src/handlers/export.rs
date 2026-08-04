@@ -254,25 +254,25 @@ pub async fn export_mesh(
                 )
             })?,
         ExportFormat::ROS => {
-            // PROV is mandatory too, but the api-server holds NO source
-            // of `AICommand`s (no `AICommandTracker` is wired into
-            // `AppState`), so `aipr: None` writes a PROV chunk with a
-            // freshly-opened session id and an EMPTY command list.
-            // That emptiness is made legible in the response
-            // (`ros_contents.prov_commands_absent_reason`) — the same
-            // rule as the evidence-pack route's
-            // `certificate_absent_reason` — and commands are NEVER
-            // synthesised from timeline events: fabricated provenance
-            // is worse than declared absence.
+            // PROV is mandatory, and since intent became a recorded fact
+            // (the `roshera.intent` facet on recorded operations) it is
+            // DERIVABLE: `ai_tracker_from_timeline` builds one
+            // `AICommand` per recorded operation from the same HIST
+            // events the file carries. The prompt is the operation's
+            // recorded intent text when it has one, and ABSENT when it
+            // does not — a command's prompt is never synthesised from
+            // the op kind or parameters: "this happened and no reason
+            // was stated" is recorded as exactly that.
+            let ros_options = export_engine::formats::ros::RosExportOptions::default();
+            let ros_aipr = ros_history.as_ref().map(|hist| {
+                export_engine::formats::ros_provenance::ai_tracker_from_timeline(
+                    &hist.events,
+                    ros_options.tracking_level,
+                )
+            });
             let (filename, summary) = state
                 .export_engine
-                .export_ros(
-                    &model,
-                    &safe_name,
-                    ros_history,
-                    None,
-                    export_engine::formats::ros::RosExportOptions::default(),
-                )
+                .export_ros(&model, &safe_name, ros_history, ros_aipr, ros_options)
                 .await
                 .map_err(|e| {
                     tracing::error!("ROS export failed: {:?}", e);
@@ -287,9 +287,9 @@ pub async fn export_mesh(
                 prov_command_count: summary.prov_command_count,
                 prov_session_id: summary.prov_session_id,
                 prov_commands_absent_reason: (summary.prov_command_count == 0).then(|| {
-                    "no AI command tracker is wired into the server state; PROV carries \
-                     the write-time session id and zero commands — this records the \
-                     absence of a command log, not the absence of AI involvement"
+                    "the timeline carries no recorded operations, so the derived AI \
+                     command log is empty — PROV records an empty history with a real \
+                     write-time session id, not a missing tracker"
                         .to_string()
                 }),
             });

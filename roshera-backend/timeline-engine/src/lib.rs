@@ -68,7 +68,7 @@ pub use rebuild_certificate::{
 pub use recorder_bridge::{EventSink, SharedTimeline, TimelineRecorder};
 pub use replay::{
     apply_event, rebuild_model_from_events, rederive_part_drawing, DrawingRederive, DrawingStore,
-    ReplayError, ReplayOutcome,
+    ReplayError, ReplayFailure, ReplayOutcome,
 };
 pub use timeline::Timeline;
 pub use types::*;

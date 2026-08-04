@@ -230,6 +230,10 @@ pub struct PrefixCache {
     /// so the incremental `ReplayOutcome` matches the full-replay oracle exactly.
     prefix_applied: usize,
     prefix_skipped: usize,
+    /// First-failure detail from the prefix replay, memoised alongside the
+    /// counts so `first_failure` stays `Some` whenever `events_skipped > 0`
+    /// even on a cache hit (the counter and the detail must not drift).
+    prefix_first_failure: Option<crate::replay::ReplayFailure>,
     /// Identity of the prefix events `(sequence_number, event uuid)`, used to
     /// detect when the base log's prefix changed and the cache must be rebuilt.
     signature: Vec<(u64, uuid::Uuid)>,
@@ -295,6 +299,13 @@ fn replay_slice(
                     "incremental replay step failed; skipping"
                 );
                 outcome.events_skipped += 1;
+                if outcome.first_failure.is_none() {
+                    outcome.first_failure = Some(crate::replay::ReplayFailure {
+                        sequence_number: event.sequence_number,
+                        event_id: event.id.to_string(),
+                        error: err.to_string(),
+                    });
+                }
             }
         }
     }
@@ -364,6 +375,7 @@ pub fn incremental_rebuild(
             assemblies,
             prefix_applied: prefix_outcome.events_applied,
             prefix_skipped: prefix_outcome.events_skipped,
+            prefix_first_failure: prefix_outcome.first_failure.clone(),
             signature: signature.clone(),
         });
     }
@@ -394,6 +406,7 @@ pub fn incremental_rebuild(
     let mut outcome = ReplayOutcome {
         events_applied: prefix_applied,
         events_skipped: prefix_skipped,
+        first_failure: cached.prefix_first_failure.clone(),
         ..ReplayOutcome::default()
     };
     let saved = model.attach_recorder(None);
@@ -415,6 +428,9 @@ pub fn incremental_rebuild(
 
     outcome.events_applied += suffix_outcome.events_applied;
     outcome.events_skipped += suffix_outcome.events_skipped;
+    if outcome.first_failure.is_none() {
+        outcome.first_failure = suffix_outcome.first_failure;
+    }
     outcome.id_remap = id_remap;
     outcome.assemblies = assemblies;
 

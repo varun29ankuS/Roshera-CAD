@@ -128,7 +128,10 @@ fn operation_kind(op: &Operation) -> String {
 /// The whole event is stored (losslessly) in `data`; the scalar columns are
 /// for ordering (`sequence_number`), indexing (`branch_id`), and honest
 /// reporting (`event_type`).
-fn to_event_data(event: &TimelineEvent, session_id: &str) -> Result<TimelineEventData, String> {
+pub(crate) fn to_event_data(
+    event: &TimelineEvent,
+    session_id: &str,
+) -> Result<TimelineEventData, String> {
     let data = serde_json::to_value(event)
         .map_err(|e| format!("failed to serialize timeline event: {e}"))?;
     Ok(TimelineEventData {
