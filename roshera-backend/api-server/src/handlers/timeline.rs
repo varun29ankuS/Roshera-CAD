@@ -13,11 +13,15 @@ use session_manager::{BroadcastMessage, PrincipalKind};
 use shared_types::{CADObject, ObjectId};
 use std::collections::HashMap;
 use std::sync::Arc;
+// NOTE: `timeline_engine` also re-exports `lineage::EventSummary`, which
+// would collide with THIS module's own `EventSummary` (the history wire
+// row). It is deliberately not imported here; the lineage projection is
+// reached through `LineageGraph` / `LineageError` only.
 use timeline_engine::{
     certify_rebuild, certify_rebuild_with_drawings, mould_operation, name_binding_operation,
     params_have_numeric, rebuild_model_from_events, Author, BranchId, BranchPurpose, EntityId,
-    EventId, EventMetadata, NameBindings, Operation, OperationInputs, RebuildCertificate,
-    ReplayOutcome, SessionId, Timeline, TimelineError, TimelineEvent,
+    EventId, EventMetadata, LineageGraph, NameBindings, Operation, OperationInputs,
+    RebuildCertificate, ReplayOutcome, SessionId, Timeline, TimelineError, TimelineEvent,
 };
 use tracing::{error, info};
 use uuid::Uuid;
@@ -846,9 +850,9 @@ pub async fn get_history(
     let summaries: Vec<EventSummary> = events
         .into_iter()
         .map(|event| {
+            let affected_parts = affected_solids(&event);
             let operation =
                 serde_json::to_value(&event.operation).unwrap_or(serde_json::Value::Null);
-            let affected_parts = affected_solids(&operation);
             EventSummary {
                 id: event.id.to_string(),
                 sequence_number: event.sequence_number,
@@ -1005,13 +1009,14 @@ pub async fn get_feature_tree(
         .get_branch_events(&branch_id, Some(0), Some(100))
         .map_err(|_| StatusCode::NOT_FOUND)?;
 
-    let summaries: Vec<EventSummary> = events
+    let paired: Vec<(EventSummary, Lineage)> = events
         .into_iter()
         .map(|event| {
+            let lineage = event_lineage(&event);
+            let affected_parts = affected_solids_from_lineage(&lineage);
             let operation =
                 serde_json::to_value(&event.operation).unwrap_or(serde_json::Value::Null);
-            let affected_parts = affected_solids(&operation);
-            EventSummary {
+            let summary = EventSummary {
                 id: event.id.to_string(),
                 sequence_number: event.sequence_number,
                 timestamp: event.timestamp.to_rfc3339(),
@@ -1020,156 +1025,117 @@ pub async fn get_feature_tree(
                 author: author_label(&event.author),
                 author_kind: author_kind(&event.author),
                 affected_parts,
-            }
+            };
+            (summary, lineage)
         })
         .collect();
 
-    Ok(Json(build_feature_tree(summaries)))
+    Ok(Json(build_feature_tree(paired)))
 }
 
-/// Canonical decimal/string form for an entity identifier. Returns
-/// `None` for everything that isn't a non-empty string or a finite
-/// integer — keeps fillet radii / angle parameters out of the lineage
-/// graph even when they live alongside legitimate id fields.
-fn entity_key(value: &serde_json::Value) -> Option<String> {
-    if let Some(s) = value.as_str() {
-        if !s.is_empty() {
-            return Some(s.to_string());
-        }
-    }
-    if let Some(n) = value.as_u64() {
-        return Some(n.to_string());
-    }
-    if let Some(n) = value.as_i64() {
-        return Some(n.to_string());
-    }
-    None
-}
-
-fn extract_id_list(value: &serde_json::Value) -> Vec<String> {
-    match value.as_array() {
-        Some(arr) => arr.iter().filter_map(entity_key).collect(),
-        None => Vec::new(),
-    }
-}
-
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct Lineage {
     inputs: Vec<String>,
     outputs: Vec<String>,
 }
 
-/// Extract `(inputs, outputs)` entity ids from an operation payload.
+/// The event's own recorded lineage — `inputs`/`outputs` refs, rendered
+/// through `kernel_ref`, in first-seen order, deduplicated.
 ///
-/// `Operation::Generic { parameters: { inputs, outputs, ... } }` (the
-/// path every kernel call takes via `TimelineRecorder`) is the fast
-/// path — we read the two array fields directly. For typed `Operation`
-/// variants that surface through the rebuild path we fall back to a
-/// recursive crawl that only picks up values at keys whose names imply
-/// "entity id" (`inputs`, `outputs`, `source`, `target`, `solid_id`,
-/// `face_id`, `edge_id`, `object_id`, `result_id`, `new_id`, …). This
-/// is the same rule the slice 1 frontend used, lifted verbatim so the
-/// two paths stay byte-equivalent during the migration.
-fn lineage_from_operation(op: &serde_json::Value) -> Lineage {
-    if let Some(params) = op.get("parameters").and_then(|p| p.as_object()) {
-        let inputs = params
-            .get("inputs")
-            .map(extract_id_list)
-            .unwrap_or_default();
-        let outputs = params
-            .get("outputs")
-            .map(extract_id_list)
-            .unwrap_or_default();
-        if !inputs.is_empty() || !outputs.is_empty() {
-            return Lineage { inputs, outputs };
+/// Replaces the JSON crawl `lineage_from_operation` used to perform
+/// (deleted): the crawl re-derived, by walking the serialized operation
+/// for suggestively-named keys (`solid_id`, `target`, `result_id`, …),
+/// exactly what the timeline has already computed onto the event's typed
+/// channels — `kernel_ref::project_envelope` for a kernel-path
+/// (`Operation::Generic`) event, `Timeline::lineage_channels`'s DTO-dialect
+/// branch for a typed `Operation` variant recorded through
+/// `Timeline::record_operation`. Reading those channels means this
+/// projection and `event_refs` (the lineage-map projection) can never
+/// disagree about what to call a kind.
+///
+/// Order is `created` then `modified`, each in the order its typed channel
+/// carries it — NOT `event_refs`' alphabetically-sorted union. `affected_parts`
+/// is documented as first-seen-order-preserving
+/// (`EventSummary::affected_parts`, `multi_solid_output_lands_on_each_lane_
+/// deduped`); a sorted union would silently reorder the timeline strip's
+/// swimlanes the moment a branch produces a `solid:10`.
+///
+/// Verified against the one closed-vocabulary edge case this matters for:
+/// a drawing-producing event's wire refs use the `drawing:*` kind, which
+/// `kernel_ref::entity_type_for_tag` does not recognise, so
+/// `project_envelope` refuses the WHOLE event and `Timeline::lineage_channels`
+/// substitutes empty typed channels for it (logged, never silently). This
+/// function reads exactly what was substituted — an honest empty lineage —
+/// rather than re-deriving one from the refused wire strings.
+fn event_lineage(ev: &TimelineEvent) -> Lineage {
+    use timeline_engine::kernel_ref;
+
+    let mut inputs: Vec<String> = Vec::new();
+    let mut seen_inputs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for r in ev
+        .inputs
+        .required_entities
+        .iter()
+        .chain(ev.inputs.optional_entities.iter())
+    {
+        let s = kernel_ref::render_ref(r.expected_type, r.id);
+        if seen_inputs.insert(s.clone()) {
+            inputs.push(s);
         }
     }
 
-    let mut lineage = Lineage::default();
-    walk_for_lineage(op, &mut lineage);
+    let mut outputs: Vec<String> = Vec::new();
+    let mut seen_outputs: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for c in &ev.outputs.created {
+        let s = kernel_ref::render_ref(c.entity_type, c.id);
+        if seen_outputs.insert(s.clone()) {
+            outputs.push(s);
+        }
+    }
+    for m in &ev.outputs.modified {
+        // `project_envelope` refuses the WHOLE event rather than file a
+        // `modified` ref that cannot recover its kind (see its doc), so
+        // `render_bare` is `Some` on every kernel-path event; the fallback
+        // mirrors `event_refs`' `resolved` closure for the one case (a
+        // future non-kernel producer of `modified`) where it would not be.
+        let s =
+            kernel_ref::render_bare(*m).unwrap_or_else(|| format!("{LINEAGE_KIND_UNKNOWN}:{m}"));
+        // A modified entity depended on its own prior state AND continues
+        // to exist — it participates on both channels, exactly as
+        // `event_refs` treats it (`lineage.rs` then drops the degenerate
+        // self-edge).
+        if seen_inputs.insert(s.clone()) {
+            inputs.push(s.clone());
+        }
+        if seen_outputs.insert(s.clone()) {
+            outputs.push(s);
+        }
+    }
+
+    Lineage { inputs, outputs }
+}
+
+/// The top-level solid parts `lineage.outputs` names — the swimlane
+/// grouping key. See [`event_lineage`] for where `outputs` comes from.
+fn affected_solids_from_lineage(lineage: &Lineage) -> Vec<String> {
     lineage
+        .outputs
+        .iter()
+        .filter(|id| id.starts_with("solid:"))
+        .cloned()
+        .collect()
 }
 
 /// The top-level solid parts an event produced or modified — the swimlane
-/// grouping key on `EventSummary::affected_parts`. Reuses the operation's
-/// `outputs` lineage, keeping only `solid:*` ids so that fillet/chamfer face
+/// grouping key on `EventSummary::affected_parts`. Reuses [`event_lineage`]'s
+/// `outputs`, keeping only `solid:*` ids so that fillet/chamfer face
 /// outputs (`face:*`), drawing outputs (`drawing:*`), and parameter moulds
 /// (no output at all) never invent phantom lanes. Consumed operands stay in
 /// `inputs` and are deliberately excluded: a boolean that consumes `solid:0`
 /// + `solid:1` to produce `solid:2` is one event on `solid:2`'s lane only.
 /// De-duplicated, first-seen order preserved.
-fn affected_solids(op_json: &serde_json::Value) -> Vec<String> {
-    let lineage = lineage_from_operation(op_json);
-    let mut seen = std::collections::HashSet::new();
-    lineage
-        .outputs
-        .into_iter()
-        .filter(|id| id.starts_with("solid:"))
-        .filter(|id| seen.insert(id.clone()))
-        .collect()
-}
-
-fn walk_for_lineage(value: &serde_json::Value, lineage: &mut Lineage) {
-    match value {
-        serde_json::Value::Array(items) => {
-            for item in items {
-                walk_for_lineage(item, lineage);
-            }
-        }
-        serde_json::Value::Object(map) => {
-            for (k, v) in map {
-                let kl = k.to_lowercase();
-                match kl.as_str() {
-                    "inputs" | "sources" | "source_ids" => {
-                        lineage.inputs.extend(extract_id_list(v));
-                    }
-                    "outputs" | "created" | "result_ids" => {
-                        lineage.outputs.extend(extract_id_list(v));
-                    }
-                    "source" | "target" | "target_id" | "object_id" => {
-                        if let Some(key) = entity_key(v) {
-                            lineage.inputs.push(key);
-                        }
-                    }
-                    "solid_id" | "host_solid_id" => {
-                        if let Some(key) = entity_key(v) {
-                            lineage.inputs.push(namespace_bare_id("solid", &key));
-                        }
-                    }
-                    "face_id" => {
-                        if let Some(key) = entity_key(v) {
-                            lineage.inputs.push(namespace_bare_id("face", &key));
-                        }
-                    }
-                    "edge_id" => {
-                        if let Some(key) = entity_key(v) {
-                            lineage.inputs.push(namespace_bare_id("edge", &key));
-                        }
-                    }
-                    "result" | "result_id" | "new_id" => {
-                        if let Some(key) = entity_key(v) {
-                            lineage.outputs.push(key);
-                        }
-                    }
-                    _ => walk_for_lineage(v, lineage),
-                }
-            }
-        }
-        _ => {}
-    }
-}
-
-/// Add the canonical `"<kind>:<id>"` namespace prefix to a bare entity
-/// id sourced from a typed `Operation` field (e.g. `solid_id`,
-/// `face_id`, `edge_id`). If the value already carries a colon — i.e.
-/// it was emitted by the Generic recorder path which always namespaces
-/// — leave it alone so we don't double-prefix.
-fn namespace_bare_id(kind: &str, raw: &str) -> String {
-    if raw.contains(':') {
-        raw.to_string()
-    } else {
-        format!("{}:{}", kind, raw)
-    }
+fn affected_solids(ev: &TimelineEvent) -> Vec<String> {
+    affected_solids_from_lineage(&event_lineage(ev))
 }
 
 /// Build the operation-graph hierarchy from an ascending-sequence list
@@ -1180,15 +1146,14 @@ fn namespace_bare_id(kind: &str, raw: &str) -> String {
 /// matches user expectation for booleans — `box ∪ sphere` is parented
 /// to the box (created first) and the sphere remains a sibling root.
 /// Slice 2 will add a cross-link badge to the unselected operand.
-fn build_feature_tree(mut events: Vec<EventSummary>) -> Vec<FeatureNode> {
-    events.sort_by_key(|e| e.sequence_number);
+fn build_feature_tree(mut paired: Vec<(EventSummary, Lineage)>) -> Vec<FeatureNode> {
+    paired.sort_by_key(|(e, _)| e.sequence_number);
 
-    // Lineage per event, captured up-front so we can reference it by
-    // index without re-extracting on every parent lookup.
-    let lineages: Vec<Lineage> = events
-        .iter()
-        .map(|e| lineage_from_operation(&e.operation))
-        .collect();
+    // Lineage per event, captured alongside its summary by the caller
+    // ([`event_lineage`], read from the event's own typed channels — not
+    // re-extracted here) so we can reference it by index without
+    // re-deriving it on every parent lookup.
+    let (events, lineages): (Vec<EventSummary>, Vec<Lineage>) = paired.into_iter().unzip();
 
     // All producers of each output id, with their sequence number.
     //
@@ -1438,6 +1403,463 @@ pub async fn get_dependency_graph(
         edges,
         rebuild_plan,
     }))
+}
+
+// ── Lineage map (the timeline read as a lineage DAG) ─────────────────
+//
+// `timeline_engine::LineageGraph` is the authority on what derives from
+// what: it projects one branch's ordered event slice into an ENTITY-level
+// DAG (nodes `"solid:1"` / `"face:20"`, edges input→output per event) and
+// refuses a cyclic log with a typed error. The map view needs the same
+// truth expressed over EVENTS — one card per operation, connected by the
+// entities that actually flowed between them — so this projection turns
+// the entity DAG on its side:
+//
+//   * an event's `inputs` / `outputs` / `deleted` are read from the same
+//     two sources `LineageGraph` reads (the `Operation::Generic` wire
+//     envelope written by `recorder_bridge::to_timeline_operation`, and
+//     the typed `OperationInputs`/`OperationOutputs` channels);
+//   * a FLOW edge connects the latest event that produced entity `x`
+//     before event `E` to `E`, when `E` consumed `x` — or when `E`
+//     re-emitted `x` as its own output (identity-preserving fillet /
+//     chamfer / transform keep the same `SolidId`, so the box→fillet→
+//     chamfer chain lives entirely in that continuation edge;
+//     `LineageGraph` deliberately suppresses the degenerate `x → x`
+//     self-edge at the entity level, where it would be a lie);
+//   * a RETIRE edge connects a producer of `x` to the event that deleted
+//     `x`, so a `delete_solid` (inputs, no outputs) is not silently
+//     edgeless.
+//
+// The two ref readers are a duplicated rule, and duplication is how these
+// projections drift apart. `event_refs_reproduce_the_lineage_graph_edges`
+// (below) pins them: it asserts, in BOTH directions, that the cross
+// product of this module's per-event `inputs × outputs` is exactly the
+// edge set `LineageGraph::edges()` attributes to that event. If
+// `lineage.rs` changes what it reads, that test goes red. (Same guard
+// shape as `regex_copies_agree_across_the_three_packages` further down.)
+//
+// What this projection deliberately does NOT do: infer that two events
+// "belong together" because they share an operation kind, a timestamp, or
+// a name. An event that recorded no refs at all is reported `linked:
+// false` and the map draws it unattached — an honest "nothing was
+// recorded here", never adjacency dressed up as lineage.
+
+/// Default number of events the lineage map reads when the caller does
+/// not page explicitly. Deliberately larger than the 100 `get_history` /
+/// `feature-tree` default: a map that silently stops at 100 events turns
+/// every operation whose producer fell outside the window into a false
+/// root. The window is always disclosed on [`LineageWindow`], so a
+/// caller can tell "this is the whole branch" from "this is a page".
+const DEFAULT_LINEAGE_WINDOW: usize = 500;
+
+/// Kind tag for an entity ref whose type the slice never revealed.
+/// Mirrors `lineage::KIND_UNKNOWN` — an honest "we do not know what kind
+/// this is", never a guessed kind.
+const LINEAGE_KIND_UNKNOWN: &str = "entity";
+
+/// How an entity travelled between two events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LineageEdgeKind {
+    /// `to` consumed (or re-emitted) the entity `from` produced — the
+    /// ordinary "this feature stands on that one" link.
+    Flow,
+    /// `to` DELETED the entity `from` produced. Drawn distinctly because
+    /// it ends a lineage rather than continuing one.
+    Retire,
+}
+
+/// One event of the lineage map — the map draws exactly one card per node.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LineageMapNode {
+    /// Event UUID — the node id every edge endpoint refers to.
+    pub id: String,
+    /// Branch-local sequence number.
+    pub sequence_number: u64,
+    /// RFC 3339 timestamp.
+    pub timestamp: String,
+    /// Kernel operation kind (`create_box_3d`, `boolean_operation`, …).
+    pub operation_type: String,
+    /// Display name of the author.
+    pub author: String,
+    /// `"user"` | `"ai"` | `"system"`.
+    pub author_kind: String,
+    /// Canonical `"kind:id"` refs this event consumed. Sorted, deduplicated.
+    pub inputs: Vec<String>,
+    /// Canonical refs this event produced. Sorted, deduplicated.
+    pub outputs: Vec<String>,
+    /// Canonical refs this event deleted. Sorted, deduplicated.
+    pub deleted: Vec<String>,
+    /// `false` exactly when the event recorded NO entity refs at all —
+    /// nothing consumed, nothing produced, nothing deleted (checkpoints,
+    /// parameter binds, session events). Such a node is drawn unattached
+    /// and says so; it is never quietly chained to its neighbour.
+    ///
+    /// Note this is NOT the same as "has no inputs": a `create_box_3d`
+    /// is a constructive ROOT — `linked: true`, `inputs: []` — and the
+    /// map must render the two differently.
+    pub linked: bool,
+}
+
+/// One producer→consumer edge between two events, naming the entity that
+/// actually flowed. `via` is what makes a join readable: a boolean's two
+/// in-edges are labelled with the operand each one carried.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct LineageMapEdge {
+    /// Producer event UUID.
+    pub from: String,
+    /// Consumer (or deleting) event UUID.
+    pub to: String,
+    /// The canonical entity ref that travelled between them.
+    pub via: String,
+    /// Flow or retire.
+    pub kind: LineageEdgeKind,
+}
+
+/// The slice of branch history this map covers — always disclosed, so a
+/// paged read is never mistaken for the whole branch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LineageWindow {
+    /// First sequence number requested.
+    pub start: u64,
+    /// Page size requested.
+    pub limit: usize,
+    /// Events actually returned.
+    pub returned: usize,
+    /// `true` when the page filled up — there may be more history, and
+    /// producers outside the window are NOT represented, so some nodes
+    /// may appear as roots that are not.
+    pub truncated: bool,
+}
+
+/// `GET /api/timeline/lineage/{branch_id}` success body.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LineageMapResponse {
+    /// Branch label (`"main"` or the branch UUID).
+    pub branch: String,
+    /// One node per event in the window, in (sequence, event id) order.
+    pub nodes: Vec<LineageMapNode>,
+    /// Deduplicated edges, in (from, to, via, kind) order.
+    pub edges: Vec<LineageMapEdge>,
+    /// Distinct entities the underlying [`LineageGraph`] saw in this
+    /// window — the size of the entity DAG behind the event view.
+    pub entity_count: usize,
+    /// The history slice this map covers.
+    pub window: LineageWindow,
+}
+
+/// The three ref channels of one event, sorted and deduplicated.
+#[derive(Debug, Default, Clone, PartialEq)]
+struct EventRefs {
+    inputs: Vec<String>,
+    outputs: Vec<String>,
+    deleted: Vec<String>,
+}
+
+/// Canonical wire refs under `key` in a `Operation::Generic` envelope.
+/// Non-arrays and non-string entries are ignored — total over whatever
+/// the envelope actually carries, exactly like `lineage::wire_refs`.
+fn lineage_wire_refs(parameters: &serde_json::Value, key: &str) -> Vec<String> {
+    parameters
+        .get(key)
+        .and_then(serde_json::Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(serde_json::Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Read one event's `(inputs, outputs, deleted)` ref sets from the same
+/// two sources [`LineageGraph`] reads.
+///
+/// Ref RENDERING is not re-implemented here: `timeline_engine::kernel_ref`
+/// owns the kind vocabulary and the `"<kind>:<id>"` form, and this reads
+/// through it (`render_ref` / `render_bare` / `wire_tag`) exactly as
+/// `lineage.rs` does, so a typed ref and the wire ref it came from can
+/// never disagree about what to call a kind.
+///
+/// `kinds` accumulates `uuid → kind` across the slice in sequence order
+/// (first typed sighting wins) so a bare `EntityId` on the untyped
+/// `modified` / `deleted` channels — one whose kind is not recoverable
+/// from the id itself — can still be rendered with the kind an earlier
+/// typed sighting revealed. Call it once per event, in (sequence, event
+/// id) order.
+fn event_refs(ev: &TimelineEvent, kinds: &mut HashMap<EntityId, &'static str>) -> EventRefs {
+    use std::collections::BTreeSet;
+    use timeline_engine::kernel_ref;
+
+    for r in ev
+        .inputs
+        .required_entities
+        .iter()
+        .chain(ev.inputs.optional_entities.iter())
+    {
+        kinds
+            .entry(r.id)
+            .or_insert(kernel_ref::wire_tag(r.expected_type));
+    }
+    for c in &ev.outputs.created {
+        kinds
+            .entry(c.id)
+            .or_insert(kernel_ref::wire_tag(c.entity_type));
+    }
+    let resolved = |id: EntityId, kinds: &HashMap<EntityId, &'static str>| -> String {
+        // A kernel ref carries its own kind inside the id; only when it
+        // does not do we fall back to the learned kind, then to the
+        // honest "entity" tag.
+        kernel_ref::render_bare(id).unwrap_or_else(|| {
+            format!(
+                "{}:{}",
+                kinds.get(&id).copied().unwrap_or(LINEAGE_KIND_UNKNOWN),
+                id
+            )
+        })
+    };
+
+    let mut inputs: BTreeSet<String> = BTreeSet::new();
+    let mut outputs: BTreeSet<String> = BTreeSet::new();
+    let mut deleted: BTreeSet<String> = BTreeSet::new();
+
+    if let Operation::Generic { parameters, .. } = &ev.operation {
+        inputs.extend(lineage_wire_refs(parameters, "inputs"));
+        outputs.extend(lineage_wire_refs(parameters, "outputs"));
+        deleted.extend(lineage_wire_refs(parameters, "deleted"));
+    }
+    for r in ev
+        .inputs
+        .required_entities
+        .iter()
+        .chain(ev.inputs.optional_entities.iter())
+    {
+        inputs.insert(kernel_ref::render_ref(r.expected_type, r.id));
+    }
+    for c in &ev.outputs.created {
+        outputs.insert(kernel_ref::render_ref(c.entity_type, c.id));
+    }
+    // A modified entity depended on its prior state AND continues to
+    // exist: it participates on both channels (`lineage.rs` does the
+    // same, then drops the degenerate self-edge).
+    for m in &ev.outputs.modified {
+        let r = resolved(*m, kinds);
+        inputs.insert(r.clone());
+        outputs.insert(r);
+    }
+    for d in &ev.outputs.deleted {
+        deleted.insert(resolved(*d, kinds));
+    }
+
+    EventRefs {
+        inputs: inputs.into_iter().collect(),
+        outputs: outputs.into_iter().collect(),
+        deleted: deleted.into_iter().collect(),
+    }
+}
+
+/// Project one branch's ordered event slice into the event-level lineage
+/// map. Pure — no state, no I/O — so the projection is unit-testable
+/// without an `AppState`.
+///
+/// Returns [`LineageError::CycleDetected`] when the underlying entity DAG
+/// is cyclic: a refusal, never an empty graph. (A cycle means an entity
+/// id was re-used as both an ancestor and a descendant of itself; the
+/// map would draw an arrow that cannot be true.)
+fn lineage_map(
+    branch: String,
+    events: &[TimelineEvent],
+    window: LineageWindow,
+) -> Result<LineageMapResponse, timeline_engine::LineageError> {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    // The authority runs FIRST: its verdict (acyclic or not) gates the
+    // whole response, and its node set is the entity count reported below.
+    let graph = LineageGraph::build(events)?;
+
+    // Canonical processing order — identical to `LineageGraph::build`'s,
+    // so `kinds` learns types in the same order and the two projections
+    // cannot disagree about a bare `EntityId`'s kind.
+    let mut order: Vec<usize> = (0..events.len()).collect();
+    order.sort_by_key(|&i| (events[i].sequence_number, events[i].id.0.as_u128()));
+
+    let mut kinds: HashMap<EntityId, &'static str> = HashMap::new();
+    let mut nodes: Vec<LineageMapNode> = Vec::with_capacity(events.len());
+    let mut refs: Vec<EventRefs> = Vec::with_capacity(events.len());
+    for &i in &order {
+        let ev = &events[i];
+        let r = event_refs(ev, &mut kinds);
+        nodes.push(LineageMapNode {
+            id: ev.id.to_string(),
+            sequence_number: ev.sequence_number,
+            timestamp: ev.timestamp.to_rfc3339(),
+            operation_type: operation_kind(&ev.operation),
+            author: author_label(&ev.author),
+            author_kind: author_kind(&ev.author),
+            linked: !(r.inputs.is_empty() && r.outputs.is_empty() && r.deleted.is_empty()),
+            inputs: r.inputs.clone(),
+            outputs: r.outputs.clone(),
+            deleted: r.deleted.clone(),
+        });
+        refs.push(r);
+    }
+
+    // entity → positions (ascending) of the events that produced it.
+    let mut producers: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
+    for (i, r) in refs.iter().enumerate() {
+        for o in &r.outputs {
+            producers.entry(o.as_str()).or_default().push(i);
+        }
+    }
+    let latest_producer_before = |entity: &str, before: usize| -> Option<usize> {
+        producers
+            .get(entity)
+            .and_then(|list| list.iter().rev().find(|&&i| i < before).copied())
+    };
+
+    // FLOW — consumption: the entity travelled from its most recent
+    // producer into this event.
+    let mut flow: BTreeSet<(usize, usize, &str)> = BTreeSet::new();
+    for (j, r) in refs.iter().enumerate() {
+        for x in &r.inputs {
+            if let Some(i) = latest_producer_before(x, j) {
+                flow.insert((i, j, x.as_str()));
+            }
+        }
+    }
+    // FLOW — continuation: the same entity re-emitted by a later event.
+    // This is the only place an identity-preserving op (fillet, chamfer,
+    // transform — all `solids.get_mut`, same `SolidId` in and out) shows
+    // as a chain, because the entity-level `x → x` edge is suppressed.
+    for (x, list) in &producers {
+        for pair in list.windows(2) {
+            flow.insert((pair[0], pair[1], x));
+        }
+    }
+    // RETIRE — the entity ended here. Deduplicated against FLOW so a
+    // boolean that both consumes and deletes its operands draws ONE edge
+    // per operand, not two stacked on the same pair.
+    let mut retire: BTreeSet<(usize, usize, &str)> = BTreeSet::new();
+    for (j, r) in refs.iter().enumerate() {
+        for x in &r.deleted {
+            if let Some(i) = latest_producer_before(x, j) {
+                let key = (i, j, x.as_str());
+                if !flow.contains(&key) {
+                    retire.insert(key);
+                }
+            }
+        }
+    }
+
+    let mut wire: BTreeSet<(usize, usize, &str, LineageEdgeKind)> = BTreeSet::new();
+    wire.extend(
+        flow.into_iter()
+            .map(|(i, j, x)| (i, j, x, LineageEdgeKind::Flow)),
+    );
+    wire.extend(
+        retire
+            .into_iter()
+            .map(|(i, j, x)| (i, j, x, LineageEdgeKind::Retire)),
+    );
+    let edges: Vec<LineageMapEdge> = wire
+        .into_iter()
+        .map(|(i, j, x, kind)| LineageMapEdge {
+            from: nodes[i].id.clone(),
+            to: nodes[j].id.clone(),
+            via: x.to_string(),
+            kind,
+        })
+        .collect();
+
+    Ok(LineageMapResponse {
+        branch,
+        nodes,
+        edges,
+        entity_count: graph.nodes().len(),
+        window,
+    })
+}
+
+/// `GET /api/timeline/lineage/{branch_id}?start=&limit=` — the branch's
+/// recorded lineage, projected onto its events.
+///
+/// This is the read behind the timeline MAP view. Nodes are operations,
+/// edges are the entities that actually flowed between them, and an
+/// operation that recorded no lineage is reported as such
+/// (`linked: false`) rather than being chained to whatever happened to
+/// run next.
+///
+/// A cyclic event log is REFUSED with `409 Conflict` and the typed
+/// `{"status":"LineageRefused","kind":"CycleDetected", …}` body naming the
+/// entities — never a silently empty graph. Note this can fire on
+/// geometry a user considers ordinary: a face produced by one operation
+/// and consumed by a later one that re-emits the producing solid makes
+/// `solid → face` and `face → solid` both true, which is a cycle in the
+/// entity DAG. That verdict belongs to `timeline_engine::LineageGraph`;
+/// this route surfaces it verbatim instead of drawing a graph it cannot
+/// stand behind.
+pub async fn get_lineage_graph(
+    State(state): State<AppState>,
+    Path(branch_id): Path<String>,
+    Query(page): Query<HistoryQuery>,
+) -> Result<Json<LineageMapResponse>, (StatusCode, Json<serde_json::Value>)> {
+    // Drain in-flight recorder ops so the map reflects every kernel call
+    // the client has issued (same reason `get_history` flushes).
+    let _ = state.timeline_recorder.flush().await;
+    let timeline = state.timeline.read().await;
+    let resolved = resolve_branch_ref(&branch_id).map_err(|status| {
+        (
+            status,
+            Json(serde_json::json!({
+                "status": "LineageRefused",
+                "kind": "BranchNotFound",
+                "reason": format!("no branch resolves from '{}'", branch_id),
+            })),
+        )
+    })?;
+
+    let start = page.start.unwrap_or(0);
+    let limit = page.limit.unwrap_or(DEFAULT_LINEAGE_WINDOW);
+    let events = timeline
+        .get_branch_events(&resolved, Some(start), Some(limit))
+        .map_err(|e| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "status": "LineageRefused",
+                    "kind": "BranchNotFound",
+                    "reason": e.to_string(),
+                })),
+            )
+        })?;
+
+    let window = LineageWindow {
+        start,
+        limit,
+        returned: events.len(),
+        truncated: events.len() >= limit,
+    };
+
+    let map = lineage_map(branch_label(resolved), &events, window).map_err(|err| {
+        let reason = err.to_string();
+        let entities = match err {
+            timeline_engine::LineageError::CycleDetected { entities } => entities,
+        };
+        (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "status": "LineageRefused",
+                "kind": "CycleDetected",
+                "reason": reason,
+                "entities": entities
+                    .iter()
+                    .map(|e| e.as_str().to_string())
+                    .collect::<Vec<String>>(),
+            })),
+        )
+    })?;
+
+    Ok(Json(map))
 }
 
 // ── Parameter edit ("mould") on the real timeline ─────────────────
@@ -2118,12 +2540,30 @@ pub async fn get_evidence_pack(
     };
 
     // The agent's notebook — blackboard lines verbatim (author + timestamps).
+    //
+    // The default (Document) scope must read through the SAME per-document
+    // union `GET /api/blackboard` uses (`BlackboardManager::document_snapshot`)
+    // rather than the single-scope `snapshot`: the Blackboard panel shows the
+    // Document notebook's own lines UNIONED with every Part-scoped notebook
+    // belonging to the document, and an evidence pack that omitted those
+    // legacy Part-origin lines would disagree with the surface it is meant to
+    // audit. An explicit non-Document scope (`?notebook=part:<id>`) still
+    // reads that one notebook directly, unmerged — `document_snapshot` only
+    // ever unions Document + Part scopes, so there is nothing to reuse for a
+    // scope it was never asked to cover.
     let evidence_document_id = state.active_document.read().await.clone();
-    let notebook = state
-        .blackboard
-        .snapshot(&evidence_document_id, &notebook_scope)
-        .await
-        .lines;
+    let notebook = if notebook_scope == BlackboardScope::Document {
+        state
+            .blackboard
+            .document_snapshot(&evidence_document_id)
+            .await
+    } else {
+        state
+            .blackboard
+            .snapshot(&evidence_document_id, &notebook_scope)
+            .await
+    }
+    .lines;
 
     // A SEPARATE, clearly-labeled re-measured verdict — recomputed NOW from
     // the immutable log via `certify_rebuild`, never conflated with recorded
@@ -2904,14 +3344,24 @@ async fn finish_undo_redo(
                 "{op_label}: recorded event {event_id} vanished before it could be read back"
             ))
         })?;
+        // Rendered through `kernel_ref`, exactly as `event_refs` (the
+        // lineage-map projection) renders the same ids — a kernel-path id
+        // decodes back to `"solid:1"`; the fallback (unreachable on the
+        // kernel path, since `project_envelope` refuses the whole event
+        // rather than file a `modified`/`deleted` ref that cannot recover
+        // its kind) states the id honestly rather than guessing a kind.
+        let render_bare_honest = |id: &EntityId| {
+            timeline_engine::kernel_ref::render_bare(*id)
+                .unwrap_or_else(|| format!("{LINEAGE_KIND_UNKNOWN}:{id}"))
+        };
         let mut affected: Vec<String> = event
             .outputs
             .created
             .iter()
-            .map(|e| e.id.to_string())
+            .map(|e| timeline_engine::kernel_ref::render_ref(e.entity_type, e.id))
             .collect();
-        affected.extend(event.outputs.modified.iter().map(|id| id.to_string()));
-        affected.extend(event.outputs.deleted.iter().map(|id| id.to_string()));
+        affected.extend(event.outputs.modified.iter().map(render_bare_honest));
+        affected.extend(event.outputs.deleted.iter().map(render_bare_honest));
         (affected, operation_kind(&event.operation))
     };
 
@@ -3343,6 +3793,76 @@ pub async fn redo_operation(
     }
 }
 
+#[cfg(test)]
+mod undo_redo_entities_affected_tests {
+    use super::*;
+    use crate::durability_boot_tests::{dispatch, post};
+    use crate::router_integration_tests::make_test_state;
+    use axum::http::StatusCode;
+    use serde_json::json;
+
+    /// `entities_affected` on `POST /api/timeline/undo` must render the
+    /// kernel ref (`"solid:1"`), not `EntityId`'s bare `Display` (a raw
+    /// UUID) — the same rendering `event_refs` already gives the lineage
+    /// map for the identical id, via `kernel_ref::render_ref` /
+    /// `render_bare`. An agent reading the undo response could not
+    /// otherwise recover which entity kind it just undid.
+    #[tokio::test]
+    async fn undo_response_renders_kernel_ref_not_a_bare_uuid() {
+        let state = make_test_state().await;
+        let (status, body) = dispatch(
+            &state,
+            post(
+                "/api/geometry/box",
+                json!({ "width": 10.0, "depth": 10.0, "height": 10.0 }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "box create must 200; body = {body}");
+
+        // Box creation lands more than one event on main (the kernel create
+        // plus follow-on metadata such as `set_name`); walk undo backwards
+        // until an event actually reports something affected — that is the
+        // `create_box_3d` event, and it is what this test pins.
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let mut body = serde_json::Value::Null;
+        for _ in 0..10 {
+            let (status, resp) = dispatch(
+                &state,
+                post(
+                    "/api/timeline/undo",
+                    json!({ "session_id": session_id.clone() }),
+                ),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "undo must 200; body = {resp}");
+            let non_empty = resp["entities_affected"]
+                .as_array()
+                .is_some_and(|a| !a.is_empty());
+            body = resp;
+            if non_empty {
+                break;
+            }
+        }
+        let affected = body["entities_affected"]
+            .as_array()
+            .expect("entities_affected must be an array");
+        assert!(
+            !affected.is_empty(),
+            "undoing back through the box's events must eventually report the \
+             created solid; last response = {body}"
+        );
+        let first = affected[0]
+            .as_str()
+            .expect("entities_affected[0] is a string");
+        assert!(
+            first.starts_with("solid:"),
+            "entities_affected must render the kernel ref (\"solid:<n>\"), not a bare \
+             UUID; got {first:?}"
+        );
+    }
+}
+
 // ── Named design states + non-destructive time scrub ───────────────
 //
 // "Better-than-git" exploration slice 1 (2026-06-13). git can show you
@@ -3496,25 +4016,457 @@ pub async fn scrub_timeline(
 }
 
 #[cfg(test)]
+mod lineage_map_tests {
+    use super::*;
+    use timeline_engine::{
+        CreatedEntity, EntityReference, EntityType, OperationOutputs, ValidationRequirement,
+    };
+
+    fn window() -> LineageWindow {
+        LineageWindow {
+            start: 0,
+            limit: 500,
+            returned: 0,
+            truncated: false,
+        }
+    }
+
+    /// A kernel-shaped event: `Operation::Generic` carrying the wire
+    /// envelope `recorder_bridge::to_timeline_operation` actually writes
+    /// (`"deleted"` present only when the op removed something).
+    fn wire_event(
+        seq: u64,
+        kind: &str,
+        inputs: &[&str],
+        outputs: &[&str],
+        deleted: &[&str],
+    ) -> TimelineEvent {
+        let mut envelope = serde_json::json!({
+            "params": {},
+            "inputs": inputs,
+            "outputs": outputs,
+        });
+        if !deleted.is_empty() {
+            envelope["deleted"] = serde_json::json!(deleted);
+        }
+        TimelineEvent {
+            id: EventId::new(),
+            sequence_number: seq,
+            timestamp: chrono::Utc::now(),
+            author: Author::System,
+            operation: Operation::Generic {
+                command_type: kind.to_string(),
+                parameters: envelope,
+            },
+            inputs: OperationInputs::default(),
+            outputs: OperationOutputs::default(),
+            metadata: EventMetadata::default(),
+        }
+    }
+
+    fn map_of(events: &[TimelineEvent]) -> LineageMapResponse {
+        match lineage_map("main".to_string(), events, window()) {
+            Ok(map) => map,
+            Err(e) => panic!("lineage map must build for an acyclic slice: {e}"),
+        }
+    }
+
+    /// `(from_seq, to_seq, via, kind)` for every edge — sequence numbers
+    /// read far better in a failure message than event UUIDs.
+    fn edge_view(map: &LineageMapResponse) -> Vec<(u64, u64, String, LineageEdgeKind)> {
+        let seq_of = |id: &str| -> u64 {
+            map.nodes
+                .iter()
+                .find(|n| n.id == id)
+                .map(|n| n.sequence_number)
+                .unwrap_or(u64::MAX)
+        };
+        let mut view: Vec<(u64, u64, String, LineageEdgeKind)> = map
+            .edges
+            .iter()
+            .map(|e| (seq_of(&e.from), seq_of(&e.to), e.via.clone(), e.kind))
+            .collect();
+        view.sort();
+        view
+    }
+
+    /// THE document from the brief: box → cylinder → boolean → fillet.
+    /// The edges must be the REAL input→output relationships, and the
+    /// boolean must carry TWO in-edges (one per operand) — the join that
+    /// contiguous-run grouping could never express.
+    #[test]
+    fn box_cylinder_boolean_fillet_produces_the_real_lineage_edges() {
+        // Wire shapes taken from the kernel's own recorders:
+        // `boolean.rs:747` (two input solids, one output, both operands
+        // deleted) and `fillet.rs:1235` (input solid, SAME solid back out
+        // plus the new fillet faces — identity is preserved).
+        let events = vec![
+            wire_event(1, "create_box_3d", &[], &["solid:1"], &[]),
+            wire_event(2, "create_cylinder_3d", &[], &["solid:2"], &[]),
+            wire_event(
+                3,
+                "boolean_operation",
+                &["solid:1", "solid:2"],
+                &["solid:3"],
+                &["solid:1", "solid:2"],
+            ),
+            wire_event(
+                4,
+                "fillet_edges",
+                &["solid:3"],
+                &["solid:3", "face:20"],
+                &[],
+            ),
+        ];
+        let map = map_of(&events);
+
+        assert_eq!(
+            edge_view(&map),
+            vec![
+                (1, 3, "solid:1".to_string(), LineageEdgeKind::Flow),
+                (2, 3, "solid:2".to_string(), LineageEdgeKind::Flow),
+                (3, 4, "solid:3".to_string(), LineageEdgeKind::Flow),
+            ],
+            "edges must be the recorded input→output relationships: both operands \
+             flow into the boolean, and the boolean's result flows into the fillet. \
+             The operand retirements collapse onto the same two pairs — a consumed-\
+             and-deleted operand is ONE edge, not two."
+        );
+
+        // The join, stated directly.
+        let boolean = map
+            .nodes
+            .iter()
+            .find(|n| n.sequence_number == 3)
+            .expect("boolean node");
+        let into_boolean: Vec<&LineageMapEdge> =
+            map.edges.iter().filter(|e| e.to == boolean.id).collect();
+        assert_eq!(
+            into_boolean.len(),
+            2,
+            "the boolean consumes two solids, so its node has two input edges"
+        );
+        let mut via: Vec<&str> = into_boolean.iter().map(|e| e.via.as_str()).collect();
+        via.sort_unstable();
+        assert_eq!(via, vec!["solid:1", "solid:2"]);
+        assert_eq!(boolean.deleted, vec!["solid:1", "solid:2"]);
+
+        // Every event here recorded refs, so nothing is unlinked, and the
+        // two creates are ROOTS (no inputs) — not the same fact.
+        assert!(map.nodes.iter().all(|n| n.linked));
+        assert!(map.nodes[0].inputs.is_empty() && !map.nodes[0].outputs.is_empty());
+    }
+
+    /// The chain the brief names: box → fillet → chamfer on ONE solid.
+    /// fillet/chamfer preserve the `SolidId` (`solids.get_mut`), so the
+    /// entity-level DAG suppresses the `solid:1 → solid:1` self-edge; the
+    /// continuation rule is what keeps the chain connected.
+    #[test]
+    fn identity_preserving_chain_reads_as_one_connected_chain() {
+        let events = vec![
+            wire_event(1, "create_box_3d", &[], &["solid:1"], &[]),
+            wire_event(
+                2,
+                "fillet_edges",
+                &["solid:1"],
+                &["solid:1", "face:20"],
+                &[],
+            ),
+            wire_event(
+                3,
+                "chamfer_edges",
+                &["solid:1"],
+                &["solid:1", "face:30"],
+                &[],
+            ),
+        ];
+        let map = map_of(&events);
+
+        assert_eq!(
+            edge_view(&map),
+            vec![
+                (1, 2, "solid:1".to_string(), LineageEdgeKind::Flow),
+                (2, 3, "solid:1".to_string(), LineageEdgeKind::Flow),
+            ],
+            "box → fillet → chamfer on the same solid is ONE chain of two edges — \
+             not three unconnected cards, and not a chamfer parented to the box"
+        );
+    }
+
+    /// A delete records an input and no output at all — it must still be
+    /// attached to the thing it retired, and drawn as an ending.
+    #[test]
+    fn a_deletion_is_a_retire_edge_not_an_edgeless_node() {
+        let events = vec![
+            wire_event(1, "create_box_3d", &[], &["solid:1"], &[]),
+            // `delete_solid`'s real shape: the doomed solid is both an
+            // input and a deletion.
+            wire_event(2, "delete_solid", &["solid:1"], &[], &["solid:1"]),
+        ];
+        let map = map_of(&events);
+
+        assert_eq!(
+            edge_view(&map),
+            vec![(1, 2, "solid:1".to_string(), LineageEdgeKind::Flow)],
+            "the delete consumed solid:1, so the flow edge already states the link; \
+             the retire edge must not double it"
+        );
+
+        // A delete that never listed its victim as an input still links.
+        let events = vec![
+            wire_event(1, "create_box_3d", &[], &["solid:1"], &[]),
+            wire_event(2, "datum_delete", &[], &[], &["solid:1"]),
+        ];
+        assert_eq!(
+            edge_view(&map_of(&events)),
+            vec![(1, 2, "solid:1".to_string(), LineageEdgeKind::Retire)],
+            "a deletion with no recorded input is still lineage — a RETIRE edge, \
+             visibly an ending rather than a continuation"
+        );
+    }
+
+    /// An event that recorded no refs is reported unlinked — and a
+    /// constructive root is NOT. Conflating the two is the failure mode
+    /// this flag exists to prevent.
+    #[test]
+    fn an_event_with_no_recorded_refs_is_unlinked_but_a_root_is_not() {
+        let events = vec![
+            wire_event(1, "create_box_3d", &[], &["solid:1"], &[]),
+            // A checkpoint / parameter bind: parameters, no entity refs.
+            TimelineEvent {
+                id: EventId::new(),
+                sequence_number: 2,
+                timestamp: chrono::Utc::now(),
+                author: Author::System,
+                operation: Operation::Generic {
+                    command_type: "timeline.checkpoint".to_string(),
+                    parameters: serde_json::json!({ "params": { "name": "bolt circle" } }),
+                },
+                inputs: OperationInputs::default(),
+                outputs: OperationOutputs::default(),
+                metadata: EventMetadata::default(),
+            },
+            wire_event(3, "create_sphere_3d", &[], &["solid:2"], &[]),
+        ];
+        let map = map_of(&events);
+
+        let checkpoint = &map.nodes[1];
+        assert!(
+            !checkpoint.linked,
+            "an event with no recorded refs must report linked:false so the map can \
+             draw it unattached instead of chaining it to its neighbour"
+        );
+        assert!(map.nodes[0].linked && map.nodes[2].linked);
+        assert!(
+            map.edges.is_empty(),
+            "nothing here derives from anything else — adjacency is NOT lineage"
+        );
+    }
+
+    /// A cycle is a typed refusal, never an empty graph.
+    #[test]
+    fn a_cycle_surfaces_as_the_typed_error_not_an_empty_graph() {
+        // Entity-id reuse manufactures solid:1 → solid:2 → solid:1.
+        let events = vec![
+            wire_event(1, "op_a", &["solid:1"], &["solid:2"], &[]),
+            wire_event(2, "op_b", &["solid:2"], &["solid:1"], &[]),
+        ];
+        match lineage_map("main".to_string(), &events, window()) {
+            Err(timeline_engine::LineageError::CycleDetected { entities }) => {
+                let named: Vec<&str> = entities.iter().map(|e| e.as_str()).collect();
+                assert_eq!(named, vec!["solid:1", "solid:2"]);
+            }
+            Ok(map) => panic!(
+                "a cyclic log must REFUSE, not render {} nodes / {} edges",
+                map.nodes.len(),
+                map.edges.len()
+            ),
+        }
+    }
+
+    /// **Consolidation guard.** This module reads the event ref channels a
+    /// second time (`event_refs`) so the map can show what an op consumed
+    /// even when that produced no edge. Two readers drift; this test makes
+    /// drift impossible to land silently by asserting, in BOTH directions,
+    /// that `inputs × outputs` (minus the suppressed self-pair) is exactly
+    /// the edge set `LineageGraph` attributes to the same event.
+    ///
+    /// Same guard shape as `regex_copies_agree_across_the_three_packages`
+    /// below: the copies are not hand-synced on trust.
+    #[test]
+    fn event_refs_reproduce_the_lineage_graph_edges() {
+        use std::collections::BTreeSet;
+
+        let sketch = EntityId::new();
+        let solid = EntityId::new();
+        let events = vec![
+            wire_event(1, "create_box_3d", &[], &["solid:1"], &[]),
+            wire_event(2, "create_cylinder_3d", &[], &["solid:2"], &[]),
+            wire_event(
+                3,
+                "boolean_operation",
+                &["solid:1", "solid:2"],
+                &["solid:3"],
+                &["solid:1", "solid:2"],
+            ),
+            wire_event(
+                4,
+                "fillet_edges",
+                &["solid:3", "edge:7"],
+                &["solid:3", "face:20"],
+                &[],
+            ),
+            wire_event(5, "delete_solid", &["solid:3"], &[], &["solid:3"]),
+            // Typed channels too — created / modified / deleted / required.
+            TimelineEvent {
+                id: EventId::new(),
+                sequence_number: 6,
+                timestamp: chrono::Utc::now(),
+                author: Author::System,
+                operation: Operation::Generic {
+                    command_type: "typed_create".to_string(),
+                    parameters: serde_json::json!({ "params": {} }),
+                },
+                inputs: OperationInputs::default(),
+                outputs: OperationOutputs {
+                    created: vec![CreatedEntity {
+                        id: sketch,
+                        entity_type: EntityType::Sketch,
+                        name: None,
+                    }],
+                    modified: Vec::new(),
+                    deleted: Vec::new(),
+                    side_effects: Vec::new(),
+                },
+                metadata: EventMetadata::default(),
+            },
+            TimelineEvent {
+                id: EventId::new(),
+                sequence_number: 7,
+                timestamp: chrono::Utc::now(),
+                author: Author::System,
+                operation: Operation::Generic {
+                    command_type: "typed_extrude".to_string(),
+                    parameters: serde_json::json!({ "params": {} }),
+                },
+                inputs: OperationInputs {
+                    required_entities: vec![EntityReference {
+                        id: sketch,
+                        expected_type: EntityType::Sketch,
+                        validation: ValidationRequirement::MustExist,
+                    }],
+                    optional_entities: Vec::new(),
+                    parameters: serde_json::Value::Null,
+                },
+                outputs: OperationOutputs {
+                    created: vec![CreatedEntity {
+                        id: solid,
+                        entity_type: EntityType::Solid,
+                        name: None,
+                    }],
+                    modified: Vec::new(),
+                    deleted: Vec::new(),
+                    side_effects: Vec::new(),
+                },
+                metadata: EventMetadata::default(),
+            },
+            TimelineEvent {
+                id: EventId::new(),
+                sequence_number: 8,
+                timestamp: chrono::Utc::now(),
+                author: Author::System,
+                operation: Operation::Generic {
+                    command_type: "typed_modify".to_string(),
+                    parameters: serde_json::json!({ "params": {} }),
+                },
+                inputs: OperationInputs::default(),
+                outputs: OperationOutputs {
+                    created: Vec::new(),
+                    modified: vec![solid],
+                    deleted: Vec::new(),
+                    side_effects: Vec::new(),
+                },
+                metadata: EventMetadata::default(),
+            },
+        ];
+
+        let map = map_of(&events);
+        let graph = match LineageGraph::build(&events) {
+            Ok(g) => g,
+            Err(e) => panic!("fixture must be acyclic: {e}"),
+        };
+
+        for node in &map.nodes {
+            let mut ours: BTreeSet<(String, String)> = BTreeSet::new();
+            for i in &node.inputs {
+                for o in &node.outputs {
+                    if i != o {
+                        ours.insert((i.clone(), o.clone()));
+                    }
+                }
+            }
+            let theirs: BTreeSet<(String, String)> = graph
+                .edges()
+                .iter()
+                .filter(|e| e.event.event_id.to_string() == node.id)
+                .map(|e| (e.from.as_str().to_string(), e.to.as_str().to_string()))
+                .collect();
+            assert_eq!(
+                ours, theirs,
+                "event {} ({}) — this module's inputs×outputs must be EXACTLY the \
+                 edges LineageGraph attributes to it. A mismatch means the two ref \
+                 readers have drifted and the map is showing a different lineage \
+                 than the kernel's own projection.",
+                node.sequence_number, node.operation_type
+            );
+        }
+
+        // And the deletion channel, which produces no entity edge at all:
+        // the graph cannot state it, so the map's own reading is the only
+        // record — pin it explicitly.
+        let deleting = &map.nodes[4];
+        assert_eq!(deleting.deleted, vec!["solid:3"]);
+        assert_eq!(map.entity_count, graph.nodes().len());
+    }
+}
+
+#[cfg(test)]
 mod affected_parts_tests {
     use super::*;
-    use serde_json::json;
 
-    /// The serialized `Operation::Generic` wire shape the history and
-    /// feature-tree mappers actually feed to `affected_solids` — matching a
-    /// live event payload: `{command_type, parameters:{inputs,outputs,params},
-    /// type:"Generic"}`. Verified against `GET /api/timeline/history/main`
-    /// (outputs are namespaced strings like `solid:2`, `face:5`, `drawing:…`).
-    fn generic_op(inputs: &[&str], outputs: &[&str]) -> serde_json::Value {
-        json!({
+    /// A kernel-path `TimelineEvent`, built the SAME way production events
+    /// are: a `Operation::Generic` wire envelope run through
+    /// `kernel_ref::project_envelope` — the exact call `Timeline::
+    /// lineage_channels` makes when the event is recorded. This is what
+    /// makes these fixtures pin `affected_solids` against the real
+    /// projection rather than a hand-built shortcut that proves nothing
+    /// about production. (Pre-refactor, these same four cases were pinned
+    /// against `affected_solids(&op_json)` reading the JSON crawl
+    /// `lineage_from_operation`; the expected values below are unchanged —
+    /// that is the before/after pin gap 3 requires.)
+    fn kernel_event(inputs: &[&str], outputs: &[&str]) -> TimelineEvent {
+        let parameters = serde_json::json!({
             "command_type": "test_op",
-            "parameters": {
-                "inputs": inputs,
-                "outputs": outputs,
-                "params": {}
+            "params": {},
+            "inputs": inputs,
+            "outputs": outputs,
+        });
+        let (typed_inputs, typed_outputs) =
+            timeline_engine::kernel_ref::project_envelope(&parameters)
+                .expect("fixture envelope must project onto the typed channels");
+        TimelineEvent {
+            id: EventId::new(),
+            sequence_number: 1,
+            timestamp: chrono::Utc::now(),
+            author: Author::System,
+            operation: Operation::Generic {
+                command_type: "test_op".to_string(),
+                parameters,
             },
-            "type": "Generic"
-        })
+            inputs: typed_inputs,
+            outputs: typed_outputs,
+            metadata: EventMetadata::default(),
+        }
     }
 
     #[test]
@@ -3523,8 +4475,8 @@ mod affected_parts_tests {
         // belongs on solid:2's lane ONLY — the operands are inputs, not parts
         // this op affected. (Mutation guard: an impl that read `inputs` instead
         // of `outputs` returns [solid:0, solid:1] and fails here.)
-        let op = generic_op(&["solid:0", "solid:1"], &["solid:2"]);
-        let parts = affected_solids(&op);
+        let event = kernel_event(&["solid:0", "solid:1"], &["solid:2"]);
+        let parts = affected_solids(&event);
         assert_eq!(parts, vec!["solid:2".to_string()]);
         assert!(!parts.contains(&"solid:0".to_string()));
         assert!(!parts.contains(&"solid:1".to_string()));
@@ -3535,18 +4487,38 @@ mod affected_parts_tests {
         // fillet/chamfer record outputs [solid, ...new faces]; a face is not a
         // part and must never become a phantom lane. (Mutation guard: an impl
         // without the `solid:` filter returns the faces too and fails.)
-        let op = generic_op(&["solid:0"], &["solid:0", "face:5", "face:6"]);
-        assert_eq!(affected_solids(&op), vec!["solid:0".to_string()]);
+        let event = kernel_event(&["solid:0"], &["solid:0", "face:5", "face:6"]);
+        assert_eq!(affected_solids(&event), vec!["solid:0".to_string()]);
     }
 
     #[test]
     fn drawing_and_mould_have_no_part_lane() {
-        // A drawing outputs `drawing:*`; a parameter-mould has no output at
-        // all — both belong in the session lane (empty affected_parts), never
-        // on a solid lane.
-        let drawing = generic_op(&[], &["drawing:a28f4179-aa3c-4752-b680-b975a6fe3496"]);
+        // A drawing's wire outputs use the `drawing:*` kind, which
+        // `kernel_ref` does not recognise (it is not a kernel entity kind),
+        // so `project_envelope` refuses the whole event and production
+        // (`Timeline::lineage_channels`) substitutes empty typed channels —
+        // reproduced directly here rather than via `kernel_event`, which
+        // would panic on the same refusal. A parameter-mould (no output at
+        // all) is the ordinary empty case. Both belong in the session lane
+        // (empty affected_parts), never on a solid lane.
+        let drawing = TimelineEvent {
+            id: EventId::new(),
+            sequence_number: 1,
+            timestamp: chrono::Utc::now(),
+            author: Author::System,
+            operation: Operation::Generic {
+                command_type: "make_drawing".to_string(),
+                parameters: serde_json::json!({
+                    "outputs": ["drawing:a28f4179-aa3c-4752-b680-b975a6fe3496"],
+                }),
+            },
+            inputs: OperationInputs::default(),
+            outputs: timeline_engine::OperationOutputs::default(),
+            metadata: EventMetadata::default(),
+        };
         assert!(affected_solids(&drawing).is_empty());
-        let mould = generic_op(&[], &[]);
+
+        let mould = kernel_event(&[], &[]);
         assert!(affected_solids(&mould).is_empty());
     }
 
@@ -3554,10 +4526,25 @@ mod affected_parts_tests {
     fn multi_solid_output_lands_on_each_lane_deduped() {
         // A split-style op producing two solids lands on both lanes; a repeated
         // id is de-duplicated, first-seen order preserved.
-        let op = generic_op(&["solid:9"], &["solid:3", "solid:4", "solid:3"]);
+        let event = kernel_event(&["solid:9"], &["solid:3", "solid:4", "solid:3"]);
         assert_eq!(
-            affected_solids(&op),
+            affected_solids(&event),
             vec!["solid:3".to_string(), "solid:4".to_string()]
+        );
+    }
+
+    #[test]
+    fn order_is_first_seen_not_lexicographic() {
+        // "solid:10" sorts BEFORE "solid:2" lexicographically. First-seen
+        // wire order must still put solid:2 first — the swimlane grouping
+        // key is documented as first-seen-order-preserving. (Mutation
+        // guard: an impl that routes through a sorted-set union, e.g.
+        // `event_refs`'s BTreeSet, returns ["solid:10", "solid:2"] and
+        // fails here.)
+        let event = kernel_event(&["solid:9"], &["solid:2", "solid:10"]);
+        assert_eq!(
+            affected_solids(&event),
+            vec!["solid:2".to_string(), "solid:10".to_string()]
         );
     }
 }

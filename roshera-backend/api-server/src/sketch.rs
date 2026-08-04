@@ -1501,6 +1501,14 @@ pub struct ExtrudeCutSketchBody {
     pub target_id: Uuid,
     #[serde(default = "default_consume")]
     pub consume: bool,
+    /// The unsound-base gate's documented escape hatch (`main.rs::
+    /// refuse_unsound_base`). `serde_json::Value`, not `bool`: the nine
+    /// other gated routes read this off a raw JSON body, so `as_bool() ==
+    /// Some(true)` is the sole arbiter there — a typed `bool` field here
+    /// would turn `"acknowledge_unsound": "true"` into a 422 deserialize
+    /// failure instead of the same 409 the other routes give it.
+    #[serde(default)]
+    pub acknowledge_unsound: serde_json::Value,
 }
 
 /// `POST /api/sketch/{id}/revolve` body. The axis is supplied as a
@@ -2293,6 +2301,18 @@ pub async fn extrude_cut_sketch(
             format!("no kernel solid registered for target {}", body.target_id),
         )
     })?;
+
+    // ★ UNSOUND-BASE GATE — same helper, same rule, as the other nine
+    // base-taking geometry routes (`main.rs::refuse_unsound_base`). This
+    // is the one base-taking REST mutation that was left ungated because
+    // it lives outside `main.rs`; there is exactly one rule, called here.
+    crate::refuse_unsound_base(
+        &model_handle,
+        &serde_json::json!({ "acknowledge_unsound": body.acknowledge_unsound.clone() }),
+        "sketch/extrude_cut",
+        &[target_solid_id],
+    )
+    .await?;
 
     let session = state
         .sketches
@@ -4322,6 +4342,170 @@ mod tests {
         assert!(
             !sound,
             "Inconsistent construction geometry MUST fold sound→false"
+        );
+    }
+}
+
+/// The unsound-base gate on `extrude_cut_sketch` — the one base-taking REST
+/// mutation `main.rs`'s 9-route sweep (`unsound_base_gate_tests.rs`) did not
+/// cover, because the handler lives outside `main.rs`. Same fixture
+/// (`seed_box_with_drifted_construction`), same refusal shape, same escape
+/// hatch, same rule — `main.rs::refuse_unsound_base`, called directly, not
+/// re-implemented.
+#[cfg(test)]
+mod extrude_cut_unsound_base_gate_tests {
+    use super::*;
+    use crate::durability_boot_tests::{dispatch, post};
+    use crate::router_integration_tests::{make_test_state, seed_box_with_drifted_construction};
+    use axum::http::StatusCode;
+    use serde_json::json;
+
+    /// Seed a plain, SOUND box through the live `/api/geometry/box` route
+    /// and return its object UUID. `unsound_base_gate_tests::sound_box` does
+    /// the identical thing but is private to its own module — this is a
+    /// second copy of the ten-line fixture, not a second copy of the rule
+    /// under test.
+    async fn sound_box(state: &AppState) -> Uuid {
+        let (status, body) = dispatch(
+            state,
+            post(
+                "/api/geometry/box",
+                json!({ "width": 10.0, "depth": 10.0, "height": 10.0 }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "box create must 200; body = {body}");
+        Uuid::parse_str(body["object"]["id"].as_str().expect("box uuid string"))
+            .expect("box uuid must parse")
+    }
+
+    /// A fresh sketch session with one closed rectangle drawn on it, ready
+    /// to extrude-cut.
+    async fn rectangle_sketch(state: &AppState) -> Uuid {
+        let (status, body) = dispatch(
+            state,
+            post("/api/sketch", json!({ "plane": "xy", "tool": "rectangle" })),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "sketch create must 200; body = {body}"
+        );
+        let sketch_id = Uuid::parse_str(body["id"].as_str().expect("sketch id string"))
+            .expect("sketch id must parse");
+
+        for point in [[-5.0, -5.0], [5.0, 5.0]] {
+            let (status, body) = dispatch(
+                state,
+                post(
+                    &format!("/api/sketch/{sketch_id}/point"),
+                    json!({ "point": point }),
+                ),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "sketch point must 200; body = {body}"
+            );
+        }
+        sketch_id
+    }
+
+    /// THE GATE. `extrude_cut_sketch` on an UNSOUND target is refused with
+    /// the typed 409 — the same refusal `main.rs`'s nine gated routes give.
+    ///
+    /// RED before this handler called `refuse_unsound_base`: the cut
+    /// proceeded and returned 200 regardless of the target's certificate.
+    #[tokio::test]
+    async fn extrude_cut_on_an_unsound_target_is_refused_without_acknowledgement() {
+        let state = make_test_state().await;
+        let (bad_uuid, bad_solid) = seed_box_with_drifted_construction(&state, 20.0).await;
+        let sketch_id = rectangle_sketch(&state).await;
+
+        let (status, body) = dispatch(
+            &state,
+            post(
+                &format!("/api/sketch/{sketch_id}/extrude_cut"),
+                json!({ "distance": 5.0, "target_id": bad_uuid.to_string() }),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "extrude_cut on an unsound target must refuse with 409 CONFLICT; body = {body}"
+        );
+        assert_eq!(
+            body["error_code"].as_str(),
+            Some("unsound_base"),
+            "must refuse with the typed unsound_base code; body = {body}"
+        );
+        assert_eq!(
+            body["details"]["solid_id"].as_u64(),
+            Some(bad_solid as u64),
+            "refusal must name the offending target solid; body = {body}"
+        );
+        assert_eq!(
+            body["details"]["gate"].as_str(),
+            Some("unsound_base"),
+            "refusal must carry the shared gate name; body = {body}"
+        );
+    }
+
+    /// `acknowledge_unsound: true` — the documented escape hatch — lets the
+    /// deliberate repair-flow cut proceed.
+    #[tokio::test]
+    async fn acknowledge_unsound_true_lets_extrude_cut_proceed() {
+        let state = make_test_state().await;
+        let (bad_uuid, _bad_solid) = seed_box_with_drifted_construction(&state, 20.0).await;
+        let sketch_id = rectangle_sketch(&state).await;
+
+        let (status, body) = dispatch(
+            &state,
+            post(
+                &format!("/api/sketch/{sketch_id}/extrude_cut"),
+                json!({
+                    "distance": 5.0,
+                    "target_id": bad_uuid.to_string(),
+                    "acknowledge_unsound": true
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "acknowledge_unsound: true must let the cut proceed; body = {body}"
+        );
+    }
+
+    /// No behaviour change on the happy path: a SOUND target is cut exactly
+    /// as before the gate existed.
+    #[tokio::test]
+    async fn extrude_cut_on_a_sound_target_is_never_refused() {
+        let state = make_test_state().await;
+        let good_uuid = sound_box(&state).await;
+        let sketch_id = rectangle_sketch(&state).await;
+
+        let (status, body) = dispatch(
+            &state,
+            post(
+                &format!("/api/sketch/{sketch_id}/extrude_cut"),
+                json!({ "distance": 5.0, "target_id": good_uuid.to_string() }),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "extrude_cut on a sound target must be unaffected by the gate; body = {body}"
+        );
+        assert_ne!(
+            body["error_code"].as_str(),
+            Some("unsound_base"),
+            "a sound target must never produce an unsound_base refusal; body = {body}"
         );
     }
 }

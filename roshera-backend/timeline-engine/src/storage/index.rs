@@ -526,4 +526,85 @@ mod tests {
         let location = index.get_event_location(event.id).await.unwrap();
         assert_eq!(location.segment, 0); // Default value for now
     }
+
+    /// Append one kernel-path operation to a real `Timeline` and return the
+    /// event it produced — the same path `TimelineRecorder`'s drain worker
+    /// takes, without the async channel.
+    async fn kernel_event(kind: &str, inputs: &[&str], outputs: &[&str]) -> TimelineEvent {
+        use crate::types::TimelineConfig;
+
+        let timeline = crate::Timeline::new(TimelineConfig::default());
+        let event_id = timeline
+            .add_operation(
+                Operation::Generic {
+                    command_type: kind.to_string(),
+                    parameters: serde_json::json!({
+                        "params": {},
+                        "inputs": inputs,
+                        "outputs": outputs,
+                    }),
+                },
+                Author::System,
+                BranchId::main(),
+            )
+            .await
+            .expect("append succeeds");
+        timeline.get_event(event_id).expect("event is readable")
+    }
+
+    /// The consumer-visible consequence of the empty-outputs defect: the
+    /// storage index's `entity_creators` / `entity_modifiers` maps are built
+    /// from `outputs.created` / `outputs.modified`, so before the typed
+    /// channels were projected from the recorded envelope BOTH were empty for
+    /// every real operation — the index could not answer "which event created
+    /// this solid?" for any solid the kernel ever made.
+    ///
+    /// Asserted in both directions, so the created/modified split is pinned
+    /// rather than mere non-emptiness: a creating op indexes a creator and no
+    /// modifier; a modifying op indexes a modifier and no creator.
+    #[tokio::test]
+    async fn kernel_path_events_populate_the_entity_indices() {
+        use crate::kernel_ref::encode;
+        use crate::types::EntityType;
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let config = StorageConfig {
+            base_path: temp_dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        let index = StorageIndex::new(&config).await.unwrap();
+
+        let created = kernel_event("create_box", &[], &["solid:1"]).await;
+        let modified = kernel_event("fillet_edges", &["solid:1", "edge:4"], &["solid:1"]).await;
+        index.index_event(&created).await.unwrap();
+        index.index_event(&modified).await.unwrap();
+
+        let solid = encode(EntityType::Solid, 1);
+        assert_eq!(
+            index.get_entity_creators(solid).await,
+            vec![created.id],
+            "the creating event must be findable through entity_creators"
+        );
+        assert_eq!(
+            index.get_entity_modifiers(solid).await,
+            vec![modified.id],
+            "the modifying event must be findable through entity_modifiers"
+        );
+
+        // The split is a real partition, not a duplication.
+        assert!(
+            index
+                .get_entity_creators(encode(EntityType::Edge, 4))
+                .await
+                .is_empty(),
+            "a consumed edge was never created by these events"
+        );
+        assert!(
+            !index
+                .get_entity_creators(solid)
+                .await
+                .contains(&modified.id),
+            "a fillet modifies its solid; it does not create it"
+        );
+    }
 }

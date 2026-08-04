@@ -131,6 +131,142 @@ export function checkpointCovering(
   return found
 }
 
+// ─── Lineage map (GET /api/timeline/lineage/{branch_id}) ───────────
+//
+// The recorded answer to "what derives from what". Mirrors
+// `LineageMapResponse` in `api-server/src/handlers/timeline.rs`, which
+// projects `timeline_engine::LineageGraph` — the kernel's own entity DAG
+// — onto events: one node per operation, one edge per entity that
+// actually travelled between two operations.
+//
+// This is the ONLY grouping source the map view uses. It deliberately
+// replaced client-side grouping by operation kind: contiguous runs of the
+// same kind are adjacency, not lineage, and eight unrelated cylinder cuts
+// collapsing into one tidy card was a pleasant lie. An event that recorded
+// no refs arrives with `linked: false` and must render unattached — the
+// honest statement — rather than being chained to whatever ran next.
+
+export type LineageEdgeKind = 'flow' | 'retire'
+
+export interface LineageMapNode {
+  /** Event UUID — the id every edge endpoint refers to. */
+  id: string
+  sequence_number: number
+  timestamp: string // ISO 8601 (RFC 3339)
+  operation_type: string
+  author: string
+  author_kind?: AuthorKind
+  /** Canonical `"kind:id"` refs consumed / produced / deleted. */
+  inputs: string[]
+  outputs: string[]
+  deleted: string[]
+  /** `false` exactly when the event recorded NO refs at all. Distinct
+   *  from "no inputs": a `create_box_3d` is a constructive root —
+   *  `linked: true` with an empty `inputs` — and renders differently. */
+  linked: boolean
+}
+
+export interface LineageMapEdge {
+  /** Producer event id. */
+  from: string
+  /** Consumer (or deleting) event id. */
+  to: string
+  /** The entity that travelled — what makes a join readable. */
+  via: string
+  kind: LineageEdgeKind
+}
+
+export interface LineageWindow {
+  start: number
+  limit: number
+  returned: number
+  /** The page filled up: producers outside the window are absent, so
+   *  some nodes may look like roots that aren't. Always disclosed. */
+  truncated: boolean
+}
+
+export interface LineageMap {
+  branch: string
+  nodes: LineageMapNode[]
+  edges: LineageMapEdge[]
+  entity_count: number
+  window: LineageWindow
+}
+
+/** A typed refusal from the endpoint — `CycleDetected` (the recorded log
+ *  contains an entity that is its own ancestor, so no honest graph
+ *  exists) or `BranchNotFound`. Never rendered as an empty graph. */
+export interface LineageRefusal {
+  kind: string
+  reason: string
+  entities: string[]
+}
+
+export type LineageOutcome =
+  | { state: 'graph'; map: LineageMap }
+  | { state: 'refused'; refusal: LineageRefusal }
+  /** The fetch itself never produced an answer (network / non-typed
+   *  error). Zero nodes from a failed request is NOT the same fact as an
+   *  empty branch, and the two must not share an empty state. */
+  | { state: 'unreachable'; reason: string }
+
+function asRefusal(payload: unknown): LineageRefusal | null {
+  if (!payload || typeof payload !== 'object') return null
+  const p = payload as Record<string, unknown>
+  if (p.status !== 'LineageRefused') return null
+  return {
+    kind: typeof p.kind === 'string' ? p.kind : 'Unknown',
+    reason: typeof p.reason === 'string' ? p.reason : 'no reason given',
+    entities: Array.isArray(p.entities) ? p.entities.filter((e): e is string => typeof e === 'string') : [],
+  }
+}
+
+function asMap(payload: unknown): LineageMap | null {
+  if (!payload || typeof payload !== 'object') return null
+  const p = payload as Record<string, unknown>
+  if (!Array.isArray(p.nodes) || !Array.isArray(p.edges)) return null
+  return p as unknown as LineageMap
+}
+
+/**
+ * Read one branch's lineage map. Every outcome is typed: a graph, a
+ * declared refusal, or an honest "could not read". Nothing is invented
+ * to fill a gap.
+ */
+export async function fetchLineageMap(branchId: string, limit = 500): Promise<LineageOutcome> {
+  try {
+    const resp = await fetch(`/api/timeline/lineage/${branchId}?limit=${limit}`)
+    const body: unknown = await resp.json().catch(() => null)
+    if (!resp.ok) {
+      const refusal = asRefusal(body)
+      return refusal
+        ? { state: 'refused', refusal }
+        : { state: 'unreachable', reason: `HTTP ${resp.status}` }
+    }
+    const map = asMap(body)
+    return map
+      ? { state: 'graph', map }
+      : { state: 'unreachable', reason: 'response was not a lineage map' }
+  } catch (err) {
+    return { state: 'unreachable', reason: err instanceof Error ? err.message : 'network error' }
+  }
+}
+
+/**
+ * The entity this operation left behind, preferring a top-level solid
+ * over the sub-entities (fillet faces, edges) that ride along with it.
+ * `null` when the operation produced nothing.
+ */
+export function resultRef(node: LineageMapNode): string | null {
+  const solid = node.outputs.find((r) => r.startsWith('solid:'))
+  return solid ?? node.outputs[0] ?? null
+}
+
+/** A live part name when the viewport knows one, else the canonical ref. */
+export function entityLabel(ref: string, liveNames: Map<string, string>): string {
+  return liveNames.get(ref) ?? ref
+}
+
 // ─── Durability boot outcome (GET /api/durability/status) ──────────
 //
 // Mirrors `DurabilityStatus` in `api-server/src/durability.rs` (serde

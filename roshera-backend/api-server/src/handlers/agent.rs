@@ -2273,10 +2273,15 @@ pub async fn part_perception(
     });
     let cert = model.certify_solid(sid);
     let sound = cert.is_sound();
+    // Shared with the write path's ambient perception AND with the
+    // unsound-base gate's refusal (`main.rs::VERDICT_SOUND`/`VERDICT_UNSOUND`).
+    // The MCP client gate reads THIS field and interpolates it into its own
+    // refusal, so the constant is what keeps the client-side and server-side
+    // refusals quoting the kernel identically.
     let verdict = if sound {
-        "SOUND — full kernel certificate clean (closed, manifold, self-intersection-free, mesh-quality-clean)".to_string()
+        crate::VERDICT_SOUND.to_string()
     } else {
-        "UNSOUND — full kernel certificate flags a defect (see cert)".to_string()
+        crate::VERDICT_UNSOUND.to_string()
     };
     // Reconcile cache lookup — mirrors the write path (certified_response in
     // main.rs): same four inputs, same `perception_fingerprint` function.

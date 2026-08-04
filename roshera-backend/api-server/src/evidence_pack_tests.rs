@@ -678,6 +678,68 @@ async fn notebook_lines_appear_verbatim_with_author_and_timestamps() {
     );
 }
 
+/// RED before the fix: `get_evidence_pack` called `blackboard.snapshot`
+/// (the single-scope read) rather than `document_snapshot` (the per-document
+/// union — see `BlackboardManager::document_snapshot` in `blackboard.rs`),
+/// so a legacy Part-scoped line that `GET /api/blackboard`'s document view
+/// already surfaces (`document_view_includes_pre_existing_part_scoped_lines_through_router`
+/// in `router_integration_tests.rs`) was silently missing from the pack —
+/// two surfaces reporting the same document and disagreeing.
+///
+/// Seeds a Part-scoped notebook the way durable storage actually holds one
+/// — a raw JSON `PersistedNotebook` blob fed straight to
+/// `BlackboardManager::hydrate` — so this proves the READ side (the union
+/// the pack must reuse), not the write path.
+#[tokio::test]
+async fn pack_notebook_includes_pre_existing_part_scoped_lines_through_the_union() {
+    let state = make_test_state().await;
+    let document_id = state.active_document.read().await.clone();
+
+    let persisted_part_notebook = json!({
+        "lines": [{
+            "id": "bb-legacy-1",
+            "text": "legacy note about finger_L3",
+            "author": "user",
+            "createdAt": 1000,
+            "updatedAt": 1000
+        }],
+        "events": [{
+            "kind": "add",
+            "lineId": "bb-legacy-1",
+            "text": "legacy note about finger_L3",
+            "author": "user",
+            "at": 1000,
+            "index": 0
+        }],
+        "counter": 1
+    });
+    let restored = state.blackboard.hydrate(
+        &document_id,
+        vec![("part:4242".to_string(), persisted_part_notebook)],
+    );
+    assert_eq!(
+        restored, 1,
+        "the part notebook must hydrate into the working set"
+    );
+
+    let pack = fetch_pack(&state).await;
+    let notebook = pack["notebook"]
+        .as_array()
+        .expect("notebook must be an array");
+    assert_eq!(
+        notebook.len(),
+        1,
+        "the pack's default (document-scope) notebook must surface the \
+         pre-existing part-scoped line through the same union \
+         `GET /api/blackboard` reads via document_snapshot; pack notebook = {notebook:?}"
+    );
+    assert_eq!(notebook[0]["text"], "legacy note about finger_L3");
+    assert_eq!(
+        notebook[0]["partId"], 4242,
+        "the unioned line must be tagged with the part it came from; notebook = {notebook:?}"
+    );
+}
+
 // =====================================================================
 // Empty session
 // =====================================================================

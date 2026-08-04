@@ -1469,11 +1469,21 @@ async fn fillet_g1_mixed_corner_refuses_typed_g1_not_achievable() {
 
     // Second call: fillet edge[1] + edge[2] with G1 — the finalize.
     // The measured-kink gate refuses G1 on this corner, typed.
+    //
+    // `acknowledge_unsound` is REQUIRED and CORRECT here for the same reason
+    // as `blend_mixed_corner_protocol_reports_honest_certs_per_step`: the
+    // first call deliberately leaves the corner OPEN (that is what
+    // `partial_corner_vertices` opts into), so the base is knowingly unsound
+    // and the unsound-base gate would refuse the finalize before the G1
+    // synthesizer ever ran. The flag restores the path under test — this test
+    // is about the typed `blend_failed` G1 refusal, not about the presence or
+    // absence of the unsound-base gate.
     let second_request = fillet_post(json!({
         "object": uuid.to_string(),
         "edges":  [edges[1], edges[2]],
         "radius": 0.5,
         "seam_continuity": "g1",
+        "acknowledge_unsound": true,
     }));
     let (status, body) = dispatch(&state, second_request).await;
 
@@ -2156,7 +2166,16 @@ async fn create_geometry_fast_flag_returns_only_lightweight_perception() {
 /// full certificate's construction-consistency dimension flags it
 /// `inconsistent → sound=false` — exactly the defect class the shallow
 /// (B-Rep-only) perception cannot see. Returns `(uuid, solid_id)`.
-async fn seed_box_with_drifted_construction(state: &AppState, size: f64) -> (Uuid, SolidId) {
+///
+/// `pub(crate)` because `unsound_base_gate_tests` needs the same fixture:
+/// it is the one reproducible unsound base that is independent of every
+/// operation under active repair, and it is reversible through a public
+/// kernel seam (which is what lets that module prove the gate re-reads the
+/// LIVE verdict).
+pub(crate) async fn seed_box_with_drifted_construction(
+    state: &AppState,
+    size: f64,
+) -> (Uuid, SolidId) {
     use geometry_engine::primitives::provenance::ConstructionGeometry;
     let solid_id;
     {
@@ -2202,7 +2221,19 @@ async fn transform_outlier_reports_unsound_automatically_via_full_cert() {
         .uri("/api/geometry/transform")
         .header("content-type", "application/json")
         .body(Body::from(
-            json!({ "object": uuid.to_string(), "translation": [0.0, 0.0, 1.0] }).to_string(),
+            // `acknowledge_unsound` is REQUIRED here now: the server-side
+            // unsound-base gate (`main.rs::refuse_unsound_base`) refuses a
+            // mutation on a base whose live verdict is unsound, and this
+            // fixture's whole point is that the base IS unsound. The flag is
+            // the documented escape for knowingly proceeding, which is
+            // exactly what this test does — it asserts what the mutation
+            // REPORTS about a defective solid, not that the gate is absent.
+            json!({
+                "object": uuid.to_string(),
+                "translation": [0.0, 0.0, 1.0],
+                "acknowledge_unsound": true
+            })
+            .to_string(),
         ))
         .expect("static request must build");
     let (status, body) = dispatch(&state, request).await;
@@ -4206,10 +4237,22 @@ async fn blend_mixed_corner_protocol_reports_honest_certs_per_step() {
     // Step 2 — the opposite-kind finalize on the vertical corner edge.
     // The corner vertex survived call 1 (opt-in preserved it), so the
     // vertical edge id is still live.
+    //
+    // `acknowledge_unsound` is REQUIRED and CORRECT here. Step 1 above
+    // deliberately leaves the corner open — this test asserts `sound=false`
+    // on it — so the server-side unsound-base gate
+    // (`main.rs::refuse_unsound_base`) would otherwise refuse step 2. But
+    // step 2 IS the repair: it closes the corner (the assertions below
+    // require `watertight=true` afterwards). This is precisely the flow the
+    // escape hatch exists for — a caller who KNOWINGLY continues from a
+    // deliberately-unsound intermediate state. The MCP client gate already
+    // demanded the same flag for this protocol; the Rust gate brings the
+    // plain-REST path into line with it.
     let second = chamfer_post(json!({
         "object": uuid.to_string(),
         "edges":  [vertical],
         "distance": 4.0,
+        "acknowledge_unsound": true,
     }));
     let (status, body) = dispatch(&state, second).await;
     assert_eq!(

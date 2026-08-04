@@ -5,44 +5,55 @@
  * A SECOND view alongside the existing `Timeline.tsx` strip (scrubbing
  * still lives there; this is for reading structure). Lazy-loaded from
  * `Timeline.tsx` — `@xyflow/react` never enters the initial bundle
- * unless the user actually opens this panel. Layout is a hand-rolled
- * wrapped grid (each branch's groups flow left→right and wrap into
- * rows, like text); dagre was dropped when the one-rank-per-group
- * chain proved unreadable at real history sizes.
+ * unless the user actually opens this panel.
  *
- * ── Honesty constraint (read before touching the grouping logic) ──────
- * The agent does not yet declare intent before executing (that work is
- * queued — see the spec). So a node here is NOT "bolt circle, 8×⌀18";
- * it is the real thing the data supports today: a CONTIGUOUS run of
- * operations of the SAME kind. Eight `Cyl` cuts in a row collapse into
- * one "Cyl ×8" card — honest about being a grouping, not a guessed name.
+ * ── What connects two cards ───────────────────────────────────────────
+ * RECORDED LINEAGE, and nothing else. Every node is one operation; every
+ * arrow means the entity named on it actually travelled from the
+ * operation that produced it into the operation that consumed it. The
+ * data comes from `GET /api/timeline/lineage/{branch}`, which projects
+ * `timeline_engine::LineageGraph` — the kernel's own entity DAG — onto
+ * events. A boolean therefore shows a JOIN (its two operands converging),
+ * and `box → fillet → chamfer` on one solid shows as one CHAIN.
  *
- * Grouping by `affected_parts` (the first attempt here) was tried and
- * reverted after checking it against the live durability document: this
- * kernel mints a FRESH solid id on every mutating op — including a
- * boolean's *result* — so "same part" almost never holds across two
- * consecutive events even when a human would call them one continuous
- * piece of work. Grouping by operation kind is the signal that actually
- * collapses a real CSG build (13 `Cyl` creates in a row really do render
- * as one card, verified live). When intents land on the timeline, this
- * is where a real name replaces the `${kind} ×N` heading; nothing below
- * infers one early.
+ * An operation that recorded no entity refs at all arrives with
+ * `linked: false` and is drawn dashed, in its own band, unattached. That
+ * is the honest statement about it. It is NOT chained to whatever
+ * happened to run next.
  *
- * Certificate coloring (spec's "terrain = certificate state") is NOT
- * implemented: `EventCertificate` (timeline-engine/src/event_certificate.rs)
- * has no production call site yet — every event's certificate is
- * `null` with an honest `certificate_absent_reason`. Coloring nodes by
- * a field that is uniformly absent would either paint everything the
- * same non-color (pointless) or invite someone to read meaning into a
- * placeholder. The panel says so explicitly instead of pretending.
+ * ── Why grouping by operation kind is gone (read before re-adding it) ─
+ * This panel used to group contiguous runs of the same `operation_type`
+ * into one "Cyl ×8" card. That is adjacency, not lineage: eight unrelated
+ * cylinder cuts became one tidy card while a genuine feature chain
+ * scattered across cards. It was retired (Varun, 2026-08-03: one source of
+ * truth for "what belongs together"). If eight unrelated cuts now render
+ * as eight separate nodes, that is the correct picture — they were never
+ * one feature.
+ *
+ * The older justification for it — "this kernel mints a FRESH solid id on
+ * every mutating op, including a boolean's result, so 'same part' almost
+ * never holds" — was FALSE and is corrected here for the record: only
+ * `boolean` mints a fresh id (and retires both operands, `boolean.rs:689`);
+ * `fillet`, `chamfer` and `transform` go through `solids.get_mut` and
+ * PRESERVE the id. That preserved id is exactly what makes an
+ * identity-preserving chain a chain, and the backend's continuation edge
+ * is what surfaces it (the entity-level `x → x` self-edge is suppressed
+ * upstream, where it would be a lie).
+ *
+ * ── Certificates ──────────────────────────────────────────────────────
+ * Nodes are NOT coloured by certificate state. Kernel ops do now carry an
+ * `EventCertificate` (recorder_bridge attaches `from_recorded_solid` at
+ * record time), but the lineage endpoint does not serve it, so this view
+ * has no certificate data to colour with and does not imply one. Colour
+ * here means operation family and branch state, nothing more.
  *
  * ── Branches (Varun: "show me branched timeline too") ──────────────────
- * Branches are the centrepiece, not a footnote: each branch renders as its
- * own LANE (a tinted band spanning the full width, with its name + state
- * pinned at the left), fork points drop as elbows from the parent lane,
- * and merged/abandoned lanes read distinctly (dashed, dimmed). Only real
- * `state`/`fork_point` data drives this — an empty branch list renders an
- * honest single `main` lane, never a fabricated fork.
+ * Each branch renders as its own LANE (a tinted band spanning the full
+ * width, name + state pinned at the left), fork points drop as elbows from
+ * the parent lane, and merged/abandoned lanes read distinctly (dashed,
+ * dimmed). Only real `state`/`fork_point` data drives this — an empty
+ * branch list renders an honest single `main` lane, never a fabricated
+ * fork.
  */
 import { useEffect, useMemo, useRef, useState } from 'react'
 import {
@@ -52,6 +63,7 @@ import {
   MiniMap,
   Handle,
   Position,
+  MarkerType,
   type Node,
   type Edge,
   type NodeProps,
@@ -61,11 +73,18 @@ import '@xyflow/react/dist/style.css'
 import { X } from 'lucide-react'
 import { useThemeStore } from '@/stores/theme-store'
 import {
-  type EventSummary,
   type CheckpointSummary,
   type DurabilityStatus,
+  type LineageMap,
+  type LineageMapNode,
+  type LineageMapEdge,
+  type LineageOutcome,
+  type LineageRefusal,
   checkpointCovering,
   durabilityNotice,
+  entityLabel,
+  fetchLineageMap,
+  resultRef,
   shortLabel,
   symbolForOperation,
   formatTimestamp,
@@ -89,53 +108,6 @@ export interface GraphBranch {
 
 const MAIN_BRANCH_ID = '00000000-0000-0000-0000-000000000000'
 
-// ─── Grouping: contiguous same-operation-kind runs (the honest grouping) ──
-
-interface EventGroup {
-  /** Common `shortLabel` of every event in this run, e.g. "Cyl". */
-  key: string
-  events: EventSummary[]
-  /** The DECLARED intent covering this run — a checkpoint name, read
-   *  off the real checkpoint list, never inferred. `undefined` when no
-   *  checkpoint covers the run (UI/direct-API operations and pre-gate
-   *  history carry no declared intent). Attached only on root-branch runs —
-   *  checkpoint `event_range`s index the main timeline's sequences, so
-   *  applying them to a child branch's post-fork sequences would
-   *  mislabel spans that merely share numbers. */
-  intent?: string
-}
-
-/** Group events into contiguous runs of the same operation kind — a run
- *  breaks the moment the kind changes, so 13 `Cyl` creates in a row
- *  become one "Cyl ×13" card and a `Cyl` between two `Bool`s honestly
- *  stays its own single-op card. */
-function groupContiguous(events: EventSummary[]): EventGroup[] {
-  const groups: EventGroup[] = []
-  for (const ev of events) {
-    const key = shortLabel(ev.operation_type)
-    const last = groups[groups.length - 1]
-    if (last && last.key === key) {
-      last.events.push(ev)
-    } else {
-      groups.push({ key, events: [ev] })
-    }
-  }
-  return groups
-}
-
-/** The part this run left behind — read straight off the LAST event's
- *  `affected_parts` (its real, recorded output), never inferred across
- *  the run. `null` for non-geometry events (sketch/drawing/session). */
-function resultPartLabel(ev: EventSummary, liveNames: Map<string, string>): string | null {
-  const parts = ev.affected_parts
-  if (!parts || parts.length === 0) return null
-  const key = parts[0]
-  const live = liveNames.get(key)
-  if (live) return live
-  const m = key.match(/^solid:(.+)$/)
-  return m ? `solid_${m[1]}` : key
-}
-
 // ─── Branch colour (the lane's identity — active / abandoned / merged / other) ──
 
 function strokeColorFor(isActive: boolean, state: string): string {
@@ -152,11 +124,15 @@ function laneFillFor(isActive: boolean, state: string): string {
   return 'rgba(124,138,165,0.07)'
 }
 
+/** A retire edge ends a lineage rather than continuing one — the one
+ *  place a non-branch colour is allowed on an edge. */
+const RETIRE_COLOR = '#dc2626'
+
 // ─── Operation family — the "one look and it's clear" vocabulary ────────
-// Seeded from the existing glyph vocabulary (`symbolForOperation`/
+// Seeded from the existing glyph vocabulary (`symbolForOperation` /
 // `shortLabel` in `lib/timeline-events.ts`) rather than inventing new
-// icons: a boolean is still `⊕`, a cylinder still `⊟`. What's new here is
-// SHAPE + COLOUR per family, so the eye sorts nodes before it reads them.
+// icons: a boolean is still `⊕`, a cylinder still `⊟`. What's added here
+// is SHAPE + COLOUR per family, so the eye sorts nodes before it reads.
 
 type OpFamily = 'create' | 'boolean' | 'blend' | 'sketch' | 'transform' | 'delete' | 'other'
 
@@ -193,7 +169,7 @@ const FAMILY_COLOR: Record<OpFamily, string> = {
   other: '#64748b',
 }
 
-/** Boolean → hexagon (union of shapes); transform → parallelogram (a
+/** Boolean → hexagon (a union of shapes); transform → parallelogram (a
  *  push/shift); blend handled via `borderRadius` instead (a "smoothed"
  *  pill reads better than a clipped hex at this size); everything else
  *  stays a plain rounded card. `clip-path` only changes the outer
@@ -216,131 +192,140 @@ function familyExtraPaddingX(family: OpFamily): string {
   return family === 'boolean' || family === 'transform' ? 'px-4' : 'px-2.5'
 }
 
-// ─── Custom node: a real card, not a dot ─────────────────────────────
+// ─── Node geometry ────────────────────────────────────────────────────
 
-interface GraphNodeData extends Record<string, unknown> {
-  branch: GraphBranch
-  group: EventGroup
-  isActiveBranch: boolean
-  expanded: boolean
-  liveNames: Map<string, string>
-  onToggle: (id: string) => void
-}
-
-const NODE_WIDTH = 190
-const COLLAPSED_HEIGHT = 54
-const EXPANDED_HEIGHT = 188
-/** Extra card height when a declared-intent overline is present, so
- *  dagre reserves real room for the third line instead of letting the
- *  card visually overflow its lane slot. */
+const NODE_WIDTH = 176
+const NODE_HEIGHT = 48
+/** Extra card height when a declared-intent overline is present, so the
+ *  layout reserves real room for the third line instead of letting the
+ *  card visually overflow its rank slot. */
 const INTENT_LINE_HEIGHT = 15
 
-function groupHeight(group: EventGroup, expanded: boolean): number {
-  const base = expanded ? EXPANDED_HEIGHT : COLLAPSED_HEIGHT
-  return base + (group.intent ? INTENT_LINE_HEIGHT : 0)
+// ─── Custom node: one operation, one card ────────────────────────────
+
+interface OpNodeData extends Record<string, unknown> {
+  branch: GraphBranch
+  node: LineageMapNode
+  isActiveBranch: boolean
+  liveNames: Map<string, string>
+  /** The DECLARED intent covering this operation — a checkpoint name read
+   *  off the real checkpoint list, never inferred. `undefined` when no
+   *  checkpoint covers it. Root-branch only: checkpoint `event_range`s
+   *  index the main timeline's sequences, so applying them to a child
+   *  branch's post-fork sequences would mislabel spans that merely share
+   *  numbers. */
+  intent?: string
+  /** In-edges this lane could not draw because the producer sits before
+   *  this branch's fork point (it lives on the parent's lane). Disclosed
+   *  on the card so a node with an off-lane parent is never mistaken for
+   *  a constructive root. */
+  hiddenInputs: number
 }
 
-/** Everything that used to be printed on the card and now lives in the
- *  hover tooltip instead — branch, time range, ids. Progressive
- *  disclosure: the card is for scanning, the title/expansion is for
- *  reading (Varun: "make it polished — maximum 2 lines"). */
-function nodeTitle(branch: GraphBranch, group: EventGroup, resultPart: string | null): string {
-  const first = group.events[0]
-  const last = group.events[group.events.length - 1]
+/** Card height. Every operation is one card, so the only variable is
+ *  whether a declared intent adds an overline. */
+function nodeHeight(intent?: string): number {
+  return NODE_HEIGHT + (intent ? INTENT_LINE_HEIGHT : 0)
+}
+
+/** Everything that would clutter the card and now lives in the hover
+ *  tooltip instead — branch, time, the full ref lists. Progressive
+ *  disclosure: the card is for scanning (Varun: "maximum 2 lines"). */
+function nodeTitle(data: OpNodeData): string {
+  const { branch, node, intent } = data
   const lines = [
-    group.intent ? `declared intent: ${group.intent}` : '',
-    `${branch.name || 'main'} · ${group.key} ×${group.events.length}`,
-    first && last ? `${formatTimestamp(first.timestamp)} – ${formatTimestamp(last.timestamp)}` : '',
-    resultPart ? `result: ${resultPart}` : '',
+    intent ? `declared intent: ${intent}` : '',
+    `${branch.name || 'main'} · #${node.sequence_number} · ${node.operation_type}`,
+    `${formatTimestamp(node.timestamp)} · ${node.author}`,
+    node.inputs.length ? `consumed: ${node.inputs.join(', ')}` : '',
+    node.outputs.length ? `produced: ${node.outputs.join(', ')}` : '',
+    node.deleted.length ? `deleted: ${node.deleted.join(', ')}` : '',
+    node.linked ? '' : 'no entity refs recorded on this event — nothing derives from it and it derives from nothing',
+    data.hiddenInputs > 0
+      ? `${data.hiddenInputs} input${data.hiddenInputs === 1 ? '' : 's'} produced before this branch forked (shown on the parent lane)`
+      : '',
   ]
   return lines.filter(Boolean).join('\n')
 }
 
-function IntentNode({ id, data }: NodeProps<Node<GraphNodeData>>) {
-  const { branch, group, isActiveBranch, expanded, liveNames, onToggle } = data
+function OpNode({ data }: NodeProps<Node<OpNodeData>>) {
+  const { branch, node, isActiveBranch, liveNames, intent, hiddenInputs } = data
   const branchStroke = strokeColorFor(isActiveBranch, branch.state)
-  const family = familyOf(group.key)
+  const key = shortLabel(node.operation_type)
+  const family = familyOf(key)
   const familyColor = FAMILY_COLOR[family]
-  const first = group.events[0]
-  const last = group.events[group.events.length - 1]
-  const resultPart = last ? resultPartLabel(last, liveNames) : null
-  // Line 2: the ONE detail that matters — the result reference when the
-  // op produced one, otherwise the count. Never both.
-  const detailLine = resultPart ?? `${group.events.length} op${group.events.length === 1 ? '' : 's'}`
+  const result = resultRef(node)
+  const unlinked = !node.linked
+
+  // Line 2 — the ONE detail that matters, in priority order: what this
+  // operation left behind, what it retired, or (for an event with no
+  // refs at all) the fact that nothing was recorded.
+  const detail = unlinked
+    ? 'no lineage recorded'
+    : result
+      ? `→ ${entityLabel(result, liveNames)}`
+      : node.deleted.length > 0
+        ? `✕ ${node.deleted.map((r) => entityLabel(r, liveNames)).join(', ')}`
+        : `${node.inputs.length} in`
 
   return (
     <div
-      title={nodeTitle(branch, group, resultPart)}
+      title={nodeTitle(data)}
       className="shadow-sm text-foreground"
       style={{
         width: NODE_WIDTH,
-        minHeight: COLLAPSED_HEIGHT,
+        minHeight: NODE_HEIGHT,
         background: 'var(--card)',
         borderWidth: isActiveBranch ? 1.5 : 1,
-        borderStyle: branch.state === 'merged' ? 'dashed' : 'solid',
-        borderColor: branchStroke,
+        borderStyle: unlinked || branch.state === 'merged' ? 'dashed' : 'solid',
+        borderColor: unlinked ? 'var(--muted-foreground)' : branchStroke,
         borderRadius: 8,
-        opacity: branch.state === 'merged' ? 0.6 : 1,
-        borderLeftWidth: 5,
-        borderLeftColor: familyColor,
-        ...familyShapeStyle(family),
+        opacity: branch.state === 'merged' ? 0.6 : unlinked ? 0.72 : 1,
+        borderLeftWidth: unlinked ? 1 : 5,
+        borderLeftColor: unlinked ? 'var(--muted-foreground)' : familyColor,
+        ...(unlinked ? {} : familyShapeStyle(family)),
       }}
     >
-      <Handle type="target" position={Position.Left} style={{ background: branchStroke, opacity: 0.6 }} />
-      <div className={`${familyExtraPaddingX(family)} py-1.5`}>
-        {/* Line 0 — the DECLARED intent, when a real checkpoint covers
-            this run. This is the "named intent replaces the guessed
-            heading" moment promised in the module comment: the name is
-            read off the checkpoint list, never inferred. Neutral text —
-            colour stays reserved for state. */}
-        {group.intent && (
+      <Handle type="target" position={Position.Left} style={{ background: branchStroke, opacity: unlinked ? 0 : 0.6 }} />
+      <div className={`${unlinked ? 'px-2.5' : familyExtraPaddingX(family)} py-1.5`}>
+        {/* Line 0 — the DECLARED intent, when a real checkpoint covers this
+            operation. Read off the checkpoint list, never inferred.
+            Neutral text — colour stays reserved for state. */}
+        {intent && (
           <div className="flex items-center gap-1 text-[10px] leading-tight text-foreground/80 mb-0.5 min-w-0">
             <span aria-hidden className="shrink-0 text-foreground/60">◈</span>
-            <span className="truncate font-medium">{group.intent}</span>
+            <span className="truncate font-medium">{intent}</span>
           </div>
         )}
-        {/* Line 1 — what it is: glyph + the honest grouping label. */}
+        {/* Line 1 — what it is: glyph + kernel kind. */}
         <div className="flex items-center justify-between gap-1 min-w-0">
           <span className="flex items-center gap-1.5 min-w-0 text-[12.5px] font-medium truncate">
-            <span aria-hidden style={{ color: familyColor }} className="text-[14px] leading-none shrink-0">
-              {symbolForOperation(first?.operation_type ?? '')}
+            <span
+              aria-hidden
+              style={{ color: unlinked ? 'var(--muted-foreground)' : familyColor }}
+              className="text-[14px] leading-none shrink-0"
+            >
+              {symbolForOperation(node.operation_type)}
             </span>
-            <span className="truncate">
-              {group.key}
-              {group.events.length > 1 && (
-                <span className="text-muted-foreground font-normal"> ×{group.events.length}</span>
-              )}
-            </span>
+            <span className="truncate">{key}</span>
           </span>
-          <button
-            type="button"
-            onClick={() => onToggle(id)}
-            className="nodrag shrink-0 text-muted-foreground hover:text-foreground text-[10px] px-1"
-            title={expanded ? 'Fold to summary' : 'Unfold to the raw operations'}
-            aria-label={expanded ? 'Fold group' : 'Unfold group'}
-          >
-            {expanded ? '▾' : '▸'}
-          </button>
+          <span className="shrink-0 text-[9.5px] text-muted-foreground/60">#{node.sequence_number}</span>
         </div>
-        {/* Line 2 — the one detail that matters: result ref OR count. */}
-        <div className="text-[10.5px] text-muted-foreground/80 truncate mt-0.5">
-          {resultPart ? `→ ${detailLine}` : detailLine}
+        {/* Line 2 — result, retirement, or the honest absence. */}
+        <div
+          className={`text-[10.5px] truncate mt-0.5 ${
+            unlinked ? 'italic text-muted-foreground/70' : 'text-muted-foreground/80'
+          }`}
+        >
+          {detail}
         </div>
-        {expanded && (
-          <div className="mt-1.5 pt-1.5 border-t border-border/40 max-h-[128px] overflow-y-auto space-y-0.5 nodrag nowheel">
-            {group.events.map((ev) => (
-              <div key={ev.id} className="flex items-center gap-1.5 text-[10px] leading-tight">
-                <span className="shrink-0">{symbolForOperation(ev.operation_type)}</span>
-                <span className="truncate">{shortLabel(ev.operation_type)}</span>
-                <span className="ml-auto text-muted-foreground/60 shrink-0">
-                  {formatTimestamp(ev.timestamp)}
-                </span>
-              </div>
-            ))}
+        {hiddenInputs > 0 && (
+          <div className="text-[9.5px] text-muted-foreground/60 truncate">
+            ⇠ {hiddenInputs} from before the fork
           </div>
         )}
       </div>
-      <Handle type="source" position={Position.Right} style={{ background: branchStroke, opacity: 0.6 }} />
+      <Handle type="source" position={Position.Right} style={{ background: branchStroke, opacity: unlinked ? 0 : 0.6 }} />
     </div>
   )
 }
@@ -353,6 +338,9 @@ interface LaneNodeData extends Record<string, unknown> {
   isActive: boolean
   width: number
   height: number
+  /** Operations on this lane that recorded no lineage at all. Shown on
+   *  the lane tag so the count is readable without a mouse. */
+  unlinked: number
 }
 
 function LaneNode({ data }: NodeProps<Node<LaneNodeData>>) {
@@ -387,31 +375,42 @@ function LaneNode({ data }: NodeProps<Node<LaneNodeData>>) {
         {data.state === 'abandoned' && (
           <span className="text-[9px] uppercase tracking-wide" style={{ color: stroke }}>abandoned</span>
         )}
+        {data.unlinked > 0 && (
+          <span className="text-[9px] uppercase tracking-wide text-muted-foreground/80">
+            {data.unlinked} unlinked
+          </span>
+        )}
       </div>
     </div>
   )
 }
 
 // ─── Stub node: an honestly-empty branch — a fork with nothing recorded
-// on it yet. `bolt-circle-8x` forked from main and has 0 events right
-// now; that is a real, meaningful state ("a road not yet travelled"),
-// not a placeholder to hide — the honesty constraint cuts both ways: no
-// inventing an op that didn't happen, but also no hiding a branch that
-// genuinely exists just because it's quiet so far.
+// on it yet. A real fork with 0 events is a meaningful state ("a road not
+// yet travelled"), not a placeholder to hide: the honesty constraint cuts
+// both ways — no inventing an op that didn't happen, but also no hiding a
+// branch that genuinely exists just because it's quiet so far.
 const STUB_WIDTH = 168
 const STUB_HEIGHT = 40
 
 interface StubNodeData extends Record<string, unknown> {
   branch: GraphBranch
   isActive: boolean
+  /** Set when the branch's lineage could not be read at all, so an empty
+   *  lane is never passed off as an empty branch. */
+  reason: string | null
 }
 
 function StubNode({ data }: NodeProps<Node<StubNodeData>>) {
-  const stroke = strokeColorFor(data.isActive, data.branch.state)
+  const stroke = data.reason ? 'rgba(251,146,60,0.9)' : strokeColorFor(data.isActive, data.branch.state)
   return (
     <div
-      title={`${data.branch.name} — forked from main, no operations recorded on it yet`}
-      className="flex items-center justify-center text-[10.5px] italic text-muted-foreground/70"
+      title={
+        data.reason
+          ? `${data.branch.name} — lineage not read: ${data.reason}`
+          : `${data.branch.name} — forked, no operations recorded on it yet`
+      }
+      className="flex items-center justify-center px-2 text-[10.5px] italic text-muted-foreground/70"
       style={{
         width: STUB_WIDTH,
         height: STUB_HEIGHT,
@@ -421,229 +420,389 @@ function StubNode({ data }: NodeProps<Node<StubNodeData>>) {
       }}
     >
       <Handle type="target" position={Position.Left} style={{ background: stroke, opacity: 0.6 }} />
-      no ops yet
+      <span className="truncate">{data.reason ? 'lineage not read' : 'no ops yet'}</span>
     </div>
   )
 }
 
-const nodeTypes = { intent: IntentNode, lane: LaneNode, stub: StubNode }
+const nodeTypes = { op: OpNode, lane: LaneNode, stub: StubNode }
 
-// ─── Layout: dagre lays out the DAG left-to-right (the "road") ──────
+// ─── Layout: rank = longest path through the lineage DAG ───────────────
+//
+// X is the node's RANK (its longest path from a root), Y its position
+// within that rank, so every lineage arrow runs left→right and same-rank
+// siblings stack vertically. That is what makes a join legible: a
+// boolean's two operands sit one above the other and converge on it.
+//
+// This is NOT the reverted dagre chain. That failed because one rank per
+// GROUP put a 99-op history on one infinite line (Varun, live 2026-08-01:
+// "i only see one straight line.. unable to make out what is happening").
+// Here a rank holds every node at the same depth — 13 cylinder creates are
+// 13 nodes in ONE column, not 13 columns — so a real CSG build renders a
+// few columns wide. Deep chains additionally WRAP every `RANK_WRAP`
+// columns, like text, so nothing runs off-screen.
 
 const LANE_PAD_Y = 40
 const LANE_PAD_X = 48
-// ── Wrapped-grid layout constants ───────────────────────────────────
-// A branch's groups flow left→right and WRAP into rows, like text —
-// not one infinite straight line. The previous dagre chain put every
-// group on its own rank, so a real 99-op history rendered as a single
-// line of boxes running off-screen (Varun, live 2026-08-01: "i only
-// see one straight line.. multiple boxes ... unable to make out what
-// is happening"). A wrapped path needs no layout solver, so dagre is
-// gone from this chunk entirely.
-const WRAP_COLS = 6
-const GAP_X = 64
-const GAP_Y = 44
+const RANK_WRAP = 7
+const GAP_X = 56
+const GAP_Y = 14
+/** Vertical clearance between wrapped rank blocks of the same branch. */
+const BLOCK_GAP_Y = 40
+/** Clearance before the unlinked band at the foot of a lane. */
+const UNLINKED_GAP = 34
 /** Vertical clearance between one branch's band and the next. */
 const BAND_GAP = LANE_PAD_Y * 2 + 36
 
-function buildGraph(
-  branchGroups: { branch: GraphBranch; groups: EventGroup[] }[],
-  activeBranchId: string,
-  expandedIds: Set<string>,
-  liveNames: Map<string, string>,
-  onToggle: (id: string) => void,
-): { nodes: Node<GraphNodeData | LaneNodeData | StubNodeData>[]; edges: Edge[] } {
-  // ── Wrapped-grid layout + per-branch Y bounds (for the lane bands) ──
-  const contentNodes: Node<GraphNodeData | StubNodeData>[] = []
-  const placed = new Set<string>()
-  let globalMinX = Infinity
-  let globalMaxX = -Infinity
-  const laneBounds = new Map<string, { minY: number; maxY: number }>()
+interface Placement {
+  x: number
+  y: number
+  h: number
+}
 
-  const noteExtent = (branchId: string, left: number, top: number, w: number, h: number) => {
-    globalMinX = Math.min(globalMinX, left)
-    globalMaxX = Math.max(globalMaxX, left + w)
-    const bounds = laneBounds.get(branchId)
-    if (bounds) {
-      bounds.minY = Math.min(bounds.minY, top)
-      bounds.maxY = Math.max(bounds.maxY, top + h)
-    } else {
-      laneBounds.set(branchId, { minY: top, maxY: top + h })
+/**
+ * Place one branch's nodes. Linked nodes are ranked by longest path;
+ * nodes with no recorded lineage go in their own band at the foot of the
+ * lane, so "unlinked" stays readable instead of piling in with the real
+ * constructive roots at rank 0.
+ */
+function layoutBranch(
+  nodes: LineageMapNode[],
+  edges: LineageMapEdge[],
+  heightOf: (n: LineageMapNode) => number,
+): { pos: Map<string, Placement>; width: number; height: number } {
+  const pos = new Map<string, Placement>()
+  const present = new Set(nodes.map((n) => n.id))
+  const linked = nodes.filter((n) => n.linked).sort((a, b) => a.sequence_number - b.sequence_number)
+  const unlinked = nodes.filter((n) => !n.linked).sort((a, b) => a.sequence_number - b.sequence_number)
+
+  const incoming = new Map<string, string[]>()
+  for (const e of edges) {
+    if (!present.has(e.from) || !present.has(e.to)) continue
+    const list = incoming.get(e.to)
+    if (list) list.push(e.from)
+    else incoming.set(e.to, [e.from])
+  }
+
+  // Longest-path rank. Every lineage edge runs from a lower sequence to a
+  // higher one (a producer always precedes its consumer in the log), so
+  // ascending sequence order is a valid topological order and one pass
+  // suffices.
+  const rank = new Map<string, number>()
+  const columns: LineageMapNode[][] = []
+  for (const n of linked) {
+    let r = 0
+    for (const src of incoming.get(n.id) ?? []) r = Math.max(r, (rank.get(src) ?? 0) + 1)
+    rank.set(n.id, r)
+    if (!columns[r]) columns[r] = []
+    columns[r].push(n)
+  }
+
+  const stackHeight = (col: LineageMapNode[]): number =>
+    col.reduce((sum, n) => sum + heightOf(n), 0) + GAP_Y * Math.max(0, col.length - 1)
+
+  let width = 0
+  let y = 0
+  const blocks = Math.ceil(columns.length / RANK_WRAP)
+  for (let b = 0; b < blocks; b++) {
+    const inBlock = columns.slice(b * RANK_WRAP, (b + 1) * RANK_WRAP)
+    const blockH = inBlock.reduce((max, col) => Math.max(max, stackHeight(col ?? [])), 0)
+    inBlock.forEach((col, i) => {
+      if (!col || col.length === 0) return
+      const x = i * (NODE_WIDTH + GAP_X)
+      let cy = y + (blockH - stackHeight(col)) / 2
+      for (const n of col) {
+        const h = heightOf(n)
+        pos.set(n.id, { x, y: cy, h })
+        cy += h + GAP_Y
+      }
+      width = Math.max(width, x + NODE_WIDTH)
+    })
+    y += blockH + BLOCK_GAP_Y
+  }
+  if (blocks > 0) y -= BLOCK_GAP_Y
+
+  if (unlinked.length > 0) {
+    if (blocks > 0) y += UNLINKED_GAP
+    let rowTop = y
+    let rowH = 0
+    unlinked.forEach((n, i) => {
+      const col = i % RANK_WRAP
+      if (col === 0 && i > 0) {
+        rowTop += rowH + GAP_Y
+        rowH = 0
+      }
+      const h = heightOf(n)
+      rowH = Math.max(rowH, h)
+      const x = col * (NODE_WIDTH + GAP_X)
+      pos.set(n.id, { x, y: rowTop, h })
+      width = Math.max(width, x + NODE_WIDTH)
+    })
+    y = rowTop + rowH
+  }
+
+  return { pos, width, height: y }
+}
+
+// ─── Per-branch prepared data ─────────────────────────────────────────
+
+interface BranchLineage {
+  branch: GraphBranch
+  /** Nodes shown on this lane (post-fork only for a child branch). */
+  nodes: LineageMapNode[]
+  /** Edges with both endpoints on this lane. */
+  edges: LineageMapEdge[]
+  /** node id → in-edges dropped because the producer sits before the fork. */
+  hiddenInputs: Map<string, number>
+  /** Declared intent per node id (root branch only). */
+  intents: Map<string, string>
+  /** Non-null when the endpoint refused, or could not be read. */
+  refusal: LineageRefusal | null
+  unreachable: string | null
+  window: LineageMap['window'] | null
+  entityCount: number
+}
+
+function prepare(
+  branch: GraphBranch,
+  outcome: LineageOutcome,
+  checkpoints: CheckpointSummary[],
+): BranchLineage {
+  const empty: BranchLineage = {
+    branch,
+    nodes: [],
+    edges: [],
+    hiddenInputs: new Map(),
+    intents: new Map(),
+    refusal: null,
+    unreachable: null,
+    window: null,
+    entityCount: 0,
+  }
+  if (outcome.state === 'refused') return { ...empty, refusal: outcome.refusal }
+  if (outcome.state === 'unreachable') return { ...empty, unreachable: outcome.reason }
+
+  const { map } = outcome
+  // A child branch's history includes its parent's events; those are
+  // already drawn on the parent's lane, so this lane shows only what was
+  // recorded AFTER the fork.
+  const isRoot = branch.parent == null
+  const forkIdx = branch.fork_point?.event_index ?? 0
+  const nodes = isRoot ? map.nodes : map.nodes.filter((n) => n.sequence_number > forkIdx)
+  const present = new Set(nodes.map((n) => n.id))
+
+  // Edges leaving the lane are dropped EXPLICITLY and counted — React
+  // Flow silently discards a dangling edge, which would make a chain
+  // appear broken with no explanation.
+  const edges: LineageMapEdge[] = []
+  const hiddenInputs = new Map<string, number>()
+  for (const e of map.edges) {
+    const hasFrom = present.has(e.from)
+    const hasTo = present.has(e.to)
+    if (hasFrom && hasTo) edges.push(e)
+    else if (hasTo) hiddenInputs.set(e.to, (hiddenInputs.get(e.to) ?? 0) + 1)
+  }
+
+  const intents = new Map<string, string>()
+  if (isRoot && checkpoints.length > 0) {
+    for (const n of nodes) {
+      const cp = checkpointCovering(checkpoints, n.sequence_number)
+      if (cp) intents.set(n.id, cp.name)
     }
   }
 
+  return {
+    branch,
+    nodes,
+    edges,
+    hiddenInputs,
+    intents,
+    refusal: null,
+    unreachable: null,
+    window: map.window,
+    entityCount: map.entity_count,
+  }
+}
+
+// ─── Graph assembly ───────────────────────────────────────────────────
+
+/** React Flow node id. Event UUIDs are unique per event, but a branch
+ *  whose `fork_point` is absent falls back to showing its inherited
+ *  history, which would put the SAME event on two lanes and collide.
+ *  Scoping the id to the lane makes that impossible rather than unlikely. */
+function nid(branchId: string, eventId: string): string {
+  return `${branchId}:${eventId}`
+}
+
+function buildGraph(
+  lanes: BranchLineage[],
+  activeBranchId: string,
+  liveNames: Map<string, string>,
+): { nodes: Node<OpNodeData | LaneNodeData | StubNodeData>[]; edges: Edge[] } {
+  const contentNodes: Node<OpNodeData | StubNodeData>[] = []
+  const flowEdges: Edge[] = []
+  const placed = new Set<string>()
+  const laneBounds = new Map<string, { minY: number; maxY: number }>()
+  /** First node id on each lane — the fork elbow's landing point. */
+  const laneEntry = new Map<string, string>()
+  let globalMaxX = 0
   let yCursor = 0
-  for (const { branch, groups } of branchGroups) {
-    // A non-root branch with ZERO events still gets a node — a real fork
-    // with nothing recorded on it yet is honest structure, not something
-    // to hide (see StubNode's comment).
-    if (groups.length === 0) {
-      if (!branch.parent) continue
-      const id = `${branch.id}:0`
+
+  for (const lane of lanes) {
+    const { branch } = lane
+    const isActive = branch.id === activeBranchId
+
+    if (lane.nodes.length === 0) {
+      // A root branch with nothing on it renders no lane at all (the
+      // panel-level empty state speaks instead); a FORK with nothing on
+      // it is real structure and gets a stub.
+      if (!branch.parent && !lane.refusal && !lane.unreachable) continue
+      const id = `stub:${branch.id}`
       contentNodes.push({
         id,
         type: 'stub',
         position: { x: 0, y: yCursor },
         draggable: false,
-        data: { branch, isActive: branch.id === activeBranchId },
+        data: {
+          branch,
+          isActive,
+          reason: lane.refusal ? lane.refusal.reason : lane.unreachable,
+        },
       })
       placed.add(id)
-      noteExtent(branch.id, 0, yCursor, STUB_WIDTH, STUB_HEIGHT)
+      laneEntry.set(branch.id, id)
+      laneBounds.set(branch.id, { minY: yCursor, maxY: yCursor + STUB_HEIGHT })
+      globalMaxX = Math.max(globalMaxX, STUB_WIDTH)
       yCursor += STUB_HEIGHT + BAND_GAP
       continue
     }
 
-    // Row heights first (a row is as tall as its tallest card — an
-    // expanded card grows its whole row, not just itself).
-    const rowHeights: number[] = []
-    groups.forEach((group, i) => {
-      const row = Math.floor(i / WRAP_COLS)
-      const h = groupHeight(group, expandedIds.has(`${branch.id}:${i}`))
-      rowHeights[row] = Math.max(rowHeights[row] ?? 0, h)
-    })
-    const rowTop = (row: number): number =>
-      yCursor + rowHeights.slice(0, row).reduce((a, b) => a + b, 0) + row * GAP_Y
+    const heightOf = (n: LineageMapNode) => nodeHeight(lane.intents.get(n.id))
+    const { pos, width, height } = layoutBranch(lane.nodes, lane.edges, heightOf)
 
-    groups.forEach((group, i) => {
-      const id = `${branch.id}:${i}`
-      const col = i % WRAP_COLS
-      const row = Math.floor(i / WRAP_COLS)
-      const h = groupHeight(group, expandedIds.has(id))
-      const left = col * (NODE_WIDTH + GAP_X)
-      const top = rowTop(row) + (rowHeights[row] - h) / 2
+    for (const n of lane.nodes) {
+      const p = pos.get(n.id)
+      if (!p) continue
       contentNodes.push({
-        id,
-        type: 'intent',
-        position: { x: left, y: top },
+        id: nid(branch.id, n.id),
+        type: 'op',
+        position: { x: p.x, y: yCursor + p.y },
         data: {
           branch,
-          group,
-          isActiveBranch: branch.id === activeBranchId,
-          expanded: expandedIds.has(id),
+          node: n,
+          isActiveBranch: isActive,
           liveNames,
-          onToggle,
+          intent: lane.intents.get(n.id),
+          hiddenInputs: lane.hiddenInputs.get(n.id) ?? 0,
         },
       })
-      placed.add(id)
-      noteExtent(branch.id, left, top, NODE_WIDTH, h)
-    })
-
-    const lastRow = rowHeights.length - 1
-    yCursor = rowTop(lastRow) + rowHeights[lastRow] + BAND_GAP
-  }
-
-  // Fork edges: parent's group covering the fork point → child's first
-  // group (or its stub, when the child has recorded nothing yet).
-  const forkEdges: { source: string; target: string; branch: GraphBranch }[] = []
-  for (const { branch } of branchGroups) {
-    if (!branch.parent) continue
-    const parentEntry = branchGroups.find((bg) => bg.branch.id === branch.parent)
-    if (!parentEntry || parentEntry.groups.length === 0) continue
-    const forkIdx = branch.fork_point?.event_index ?? 0
-    let sourceGroupIdx = 0
-    parentEntry.groups.forEach((grp, i) => {
-      if (grp.events.some((e) => e.sequence_number <= forkIdx)) sourceGroupIdx = i
-    })
-    const sourceId = `${parentEntry.branch.id}:${sourceGroupIdx}`
-    const targetId = `${branch.id}:0`
-    if (placed.has(sourceId) && placed.has(targetId)) {
-      forkEdges.push({ source: sourceId, target: targetId, branch })
+      placed.add(nid(branch.id, n.id))
     }
-  }
+    // Lane entry = the earliest node, for the fork elbow.
+    const first = [...lane.nodes].sort((a, b) => a.sequence_number - b.sequence_number)[0]
+    if (first) laneEntry.set(branch.id, nid(branch.id, first.id))
 
-  const laneNodes: Node<LaneNodeData>[] = []
-  if (isFinite(globalMinX)) {
-    for (const { branch } of branchGroups) {
-      const bounds = laneBounds.get(branch.id)
-      if (!bounds) continue
-      laneNodes.push({
-        id: `lane:${branch.id}`,
-        type: 'lane',
-        position: { x: globalMinX - LANE_PAD_X, y: bounds.minY - LANE_PAD_Y },
-        draggable: false,
-        selectable: false,
-        focusable: false,
-        zIndex: -1,
-        data: {
-          label: branch.name || (branch.id === MAIN_BRANCH_ID ? 'main' : branch.id.slice(0, 8)),
-          state: branch.state,
-          isActive: branch.id === activeBranchId,
-          width: globalMaxX - globalMinX + LANE_PAD_X * 2,
-          height: bounds.maxY - bounds.minY + LANE_PAD_Y * 2,
-        },
-      })
-    }
-  }
-
-  const edges: Edge[] = []
-  for (const { branch, groups } of branchGroups) {
-    const color = strokeColorFor(branch.id === activeBranchId, branch.state)
-    for (let i = 1; i < groups.length; i++) {
-      // A wrap edge (row end → next row start) travels right-to-left;
-      // smoothstep routes it around the cards instead of through them.
-      const isWrap = i % WRAP_COLS === 0
-      edges.push({
-        id: `seq:${branch.id}:${i - 1}->${i}`,
-        source: `${branch.id}:${i - 1}`,
-        target: `${branch.id}:${i}`,
+    const color = strokeColorFor(isActive, branch.state)
+    for (const e of lane.edges) {
+      const isRetire = e.kind === 'retire'
+      const stroke = isRetire ? RETIRE_COLOR : color
+      flowEdges.push({
+        id: `${e.kind}:${branch.id}:${e.from}->${e.to}:${e.via}`,
+        source: nid(branch.id, e.from),
+        target: nid(branch.id, e.to),
         type: 'smoothstep',
+        // `via` is the operand's own name — shown where it disambiguates
+        // (retirements always; joins are labelled below once in-degrees
+        // are known) and suppressed on plain chains, where an edge label
+        // per node would be a hairball rather than information.
+        label: isRetire ? `✕ ${e.via}` : undefined,
+        labelStyle: { fontSize: 9, fill: 'var(--foreground)' },
+        labelBgStyle: { fill: 'var(--card)', fillOpacity: 0.85 },
+        data: { via: e.via, kind: e.kind },
+        markerEnd: { type: MarkerType.ArrowClosed, width: 12, height: 12, color: stroke },
         style: {
-          stroke: color,
-          strokeWidth: branch.id === activeBranchId ? 1.6 : 1,
-          strokeOpacity: isWrap ? 0.55 : 1,
-          strokeDasharray: branch.state === 'merged' ? '4 3' : undefined,
+          stroke,
+          strokeWidth: isActive ? 1.6 : 1.1,
+          strokeDasharray: isRetire ? '4 3' : branch.state === 'merged' ? '4 3' : undefined,
         },
       })
     }
+
+    laneBounds.set(branch.id, { minY: yCursor, maxY: yCursor + height })
+    globalMaxX = Math.max(globalMaxX, width)
+    yCursor += height + BAND_GAP
   }
-  for (const fe of forkEdges) {
-    edges.push({
-      id: `fork:${fe.source}->${fe.target}`,
-      source: fe.source,
-      target: fe.target,
+
+  // A JOIN is the structure worth naming: when two or more lineages
+  // converge on one operation, each arrow is labelled with the entity it
+  // carried, so "which operand is which" is readable without a click.
+  const inDegree = new Map<string, number>()
+  for (const e of flowEdges) inDegree.set(e.target, (inDegree.get(e.target) ?? 0) + 1)
+  for (const e of flowEdges) {
+    if (e.label === undefined && (inDegree.get(e.target) ?? 0) > 1) {
+      const via = (e.data as { via?: string } | undefined)?.via
+      if (via) e.label = via
+    }
+  }
+
+  // Fork elbows: the parent lane's node covering the fork point → the
+  // child lane's first node. Real `fork_point` data only.
+  for (const lane of lanes) {
+    const { branch } = lane
+    if (!branch.parent) continue
+    const parent = lanes.find((l) => l.branch.id === branch.parent)
+    const targetId = laneEntry.get(branch.id)
+    if (!parent || !targetId) continue
+    const forkIdx = branch.fork_point?.event_index ?? 0
+    const candidates = parent.nodes.filter((n) => n.sequence_number <= forkIdx)
+    const source = candidates.length > 0 ? candidates[candidates.length - 1] : parent.nodes[0]
+    const sourceId = source ? nid(parent.branch.id, source.id) : null
+    if (!sourceId || !placed.has(sourceId) || !placed.has(targetId)) continue
+    flowEdges.push({
+      id: `fork:${sourceId}->${targetId}`,
+      source: sourceId,
+      target: targetId,
       type: 'smoothstep',
-      label: fe.branch.name || undefined,
+      label: branch.name || undefined,
       labelStyle: { fontSize: 10, fill: 'var(--foreground)' },
       style: {
-        stroke: strokeColorFor(fe.branch.id === activeBranchId, fe.branch.state),
+        stroke: strokeColorFor(branch.id === activeBranchId, branch.state),
         strokeDasharray: '3 3',
         strokeWidth: 1,
       },
     })
   }
 
-  // Lanes FIRST so they paint behind the intent/stub cards (React Flow
+  const laneNodes: Node<LaneNodeData>[] = []
+  for (const lane of lanes) {
+    const bounds = laneBounds.get(lane.branch.id)
+    if (!bounds) continue
+    laneNodes.push({
+      id: `lane:${lane.branch.id}`,
+      type: 'lane',
+      position: { x: -LANE_PAD_X, y: bounds.minY - LANE_PAD_Y },
+      draggable: false,
+      selectable: false,
+      focusable: false,
+      zIndex: -1,
+      data: {
+        label:
+          lane.branch.name || (lane.branch.id === MAIN_BRANCH_ID ? 'main' : lane.branch.id.slice(0, 8)),
+        state: lane.branch.state,
+        isActive: lane.branch.id === activeBranchId,
+        width: globalMaxX + LANE_PAD_X * 2,
+        height: bounds.maxY - bounds.minY + LANE_PAD_Y * 2,
+        unlinked: lane.nodes.filter((n) => !n.linked).length,
+      },
+    })
+  }
+
+  // Lanes FIRST so they paint behind the operation cards (React Flow
   // stacks by array order; `zIndex: -1` above reinforces it).
-  return { nodes: [...laneNodes, ...contentNodes], edges }
+  return { nodes: [...laneNodes, ...contentNodes], edges: flowEdges }
 }
 
 // ─── Panel ────────────────────────────────────────────────────────────
-
-interface FetchedBranch {
-  branch: GraphBranch
-  events: EventSummary[]
-  /** True when the fetch itself failed (non-2xx or network) — zero
-   *  events from a REFUSED fetch is not the same fact as a genuinely
-   *  empty branch, and the empty state must not conflate them (this
-   *  panel rendered "no operations recorded yet" over a rate-limited
-   *  429 with 100 real ops behind it — caught live 2026-08-01). */
-  failed: boolean
-}
-
-async function fetchBranchEvents(branch: GraphBranch): Promise<FetchedBranch> {
-  try {
-    const resp = await fetch(`/api/timeline/history/${branch.id}`)
-    if (!resp.ok) return { branch, events: [], failed: true }
-    const data = await resp.json()
-    const raw: EventSummary[] = Array.isArray(data) ? data : (data.events ?? [])
-    const isRoot = branch.parent == null
-    const forkIdx = branch.fork_point?.event_index ?? 0
-    const events = isRoot ? raw : raw.filter((e) => e.sequence_number > forkIdx)
-    return { branch, events, failed: false }
-  } catch {
-    return { branch, events: [], failed: true }
-  }
-}
 
 export default function TimelineGraph({
   branches,
@@ -663,9 +822,8 @@ export default function TimelineGraph({
   durability: DurabilityStatus | null
   onClose: () => void
 }) {
-  const [fetched, setFetched] = useState<FetchedBranch[]>([])
+  const [fetched, setFetched] = useState<{ branch: GraphBranch; outcome: LineageOutcome }[]>([])
   const [loading, setLoading] = useState(true)
-  const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set())
   const [rfInstance, setRfInstance] = useState<ReactFlowInstance | null>(null)
   const canvasRef = useRef<HTMLDivElement | null>(null)
   // Floor for how far the user can zoom out — set from the fitted zoom
@@ -676,14 +834,13 @@ export default function TimelineGraph({
   const theme = useThemeStore((s) => s.theme)
   // The honesty paragraph is real and stays, but not as seven lines above
   // the thing the user came to look at (Varun: "it takes 10 secs to read
-  // what it does" — the same defect as the provider dialog). Collapsed by
-  // default; the ⓘ expands it in place.
+  // what it does"). Collapsed by default; the ⓘ expands it in place.
   const [detailsOpen, setDetailsOpen] = useState(false)
 
-  // The parent's `branches` state can legitimately be EMPTY when the
-  // map opens (the /api/branches poll may be rate-limited or still in
-  // flight after a remount) — but `main` always exists, so fall back to
-  // it rather than mapping nothing over a document with real history.
+  // The parent's `branches` state can legitimately be EMPTY when the map
+  // opens (the /api/branches poll may be rate-limited or still in flight
+  // after a remount) — but `main` always exists, so fall back to it
+  // rather than mapping nothing over a document with real history.
   const effectiveBranches = useMemo<GraphBranch[]>(
     () =>
       branches.length > 0
@@ -703,7 +860,12 @@ export default function TimelineGraph({
   useEffect(() => {
     let cancelled = false
     setLoading(true)
-    Promise.all(effectiveBranches.map(fetchBranchEvents)).then((results) => {
+    Promise.all(
+      effectiveBranches.map(async (branch) => ({
+        branch,
+        outcome: await fetchLineageMap(branch.id),
+      })),
+    ).then((results) => {
       if (!cancelled) {
         setFetched(results)
         setLoading(false)
@@ -713,65 +875,25 @@ export default function TimelineGraph({
       cancelled = true
     }
     // `branches` is refreshed by the parent's 5s poll; re-fetching this
-    // panel's per-branch histories on every poll tick would defeat the
-    // "only fetch when the map is actually open" point of lazy-loading
-    // it in the first place. One-shot per mount, plus explicit retries
-    // via `loadEpoch` (the failed-fetch state's retry button).
+    // panel's per-branch lineage on every poll tick would defeat the
+    // "only fetch when the map is actually open" point of lazy-loading it
+    // in the first place. One-shot per mount, plus explicit retries via
+    // `loadEpoch` (the failed-fetch state's retry button).
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [loadEpoch])
 
-  const toggleExpand = (id: string) => {
-    setExpandedIds((prev) => {
-      const next = new Set(prev)
-      if (next.has(id)) next.delete(id)
-      else next.add(id)
-      return next
-    })
-  }
-
-  const branchGroups = useMemo(
-    () =>
-      fetched.map(({ branch, events }) => {
-        const groups = groupContiguous(events)
-        // Attach declared intents — root branch only (checkpoint ranges
-        // index main-timeline sequences; a child branch's post-fork
-        // sequence numbers merely coincide with them). A run gets the
-        // name only when EVERY event in it falls inside the covering
-        // checkpoint's range: a straddling run stays unlabeled rather
-        // than borrowing a name that only half-applies.
-        if (branch.parent == null && checkpoints.length > 0) {
-          for (const grp of groups) {
-            const first = grp.events[0]
-            if (!first) continue
-            const cp = checkpointCovering(checkpoints, first.sequence_number)
-            if (
-              cp &&
-              grp.events.every(
-                (e) =>
-                  e.sequence_number >= cp.event_range[0] &&
-                  e.sequence_number <= cp.event_range[1],
-              )
-            ) {
-              grp.intent = cp.name
-            }
-          }
-        }
-        return { branch, groups }
-      }),
+  const lanes = useMemo(
+    () => fetched.map(({ branch, outcome }) => prepare(branch, outcome, checkpoints)),
     [fetched, checkpoints],
   )
 
   const { nodes, edges } = useMemo(
-    () => buildGraph(branchGroups, activeBranchId, expandedIds, liveNames, toggleExpand),
-    [branchGroups, activeBranchId, expandedIds, liveNames],
+    () => buildGraph(lanes, activeBranchId, liveNames),
+    [lanes, activeBranchId, liveNames],
   )
 
   useEffect(() => {
     if (rfInstance && !loading && nodes.length > 0) {
-      // The wrapped-grid layout keeps the graph's aspect ratio close to
-      // the dialog's, so React Flow's own fitView does the right thing.
-      // (A hand-rolled height-fit used to live here to work around the
-      // one-long-line layout rendering as a sliver — that layout is gone.)
       void rfInstance.fitView({ padding: 0.08, maxZoom: 1.25, duration: 200 })
       // Read back the zoom fitView landed on and use it as the zoom-out
       // floor — "zoom out" must never land on an empty field.
@@ -780,9 +902,8 @@ export default function TimelineGraph({
       }, 260)
       return () => window.clearTimeout(t)
     }
-    // Fit once when data first lands; deliberately not re-fitting on
-    // every expand/collapse (that would yank the view under the user's
-    // cursor mid-interaction).
+    // Fit once when data first lands; deliberately not re-fitting on every
+    // interaction (that would yank the view under the user's cursor).
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [rfInstance, loading])
 
@@ -794,8 +915,15 @@ export default function TimelineGraph({
     return () => document.removeEventListener('keydown', onKey)
   }, [onClose])
 
-  const totalOps = fetched.reduce((sum, f) => sum + f.events.length, 0)
-  const branchCount = branchGroups.length
+  const totalOps = lanes.reduce((sum, l) => sum + l.nodes.length, 0)
+  const totalLinks = lanes.reduce((sum, l) => sum + l.edges.length, 0)
+  const totalUnlinked = lanes.reduce((sum, l) => sum + l.nodes.filter((n) => !n.linked).length, 0)
+  // Distinct entities the kernel's own DAG saw — the size of the graph
+  // BEHIND this event view (a solid, its faces, its edges).
+  const totalEntities = lanes.reduce((sum, l) => sum + l.entityCount, 0)
+  const refusals = lanes.filter((l) => l.refusal !== null)
+  const unreachable = lanes.filter((l) => l.unreachable !== null)
+  const truncated = lanes.some((l) => l.window?.truncated)
   const bgColor = theme === 'dark' ? '#0b0d12' : '#eef1f6'
   const dotColor = theme === 'dark' ? '#2a2f3d' : '#c7cede'
 
@@ -811,12 +939,21 @@ export default function TimelineGraph({
           <div className="min-w-0 flex items-center gap-2">
             <span className="text-[13px] font-medium text-foreground shrink-0">Timeline — map view</span>
             <span className="text-[11px] text-muted-foreground/70 truncate">
-              {checkpoints.length > 0
-                ? `Grouped by operation kind — ${checkpoints.length} declared intent${
-                    checkpoints.length === 1 ? '' : 's'
-                  } attached (◈) where a checkpoint covers a run.`
-                : 'Grouped by operation kind — no declared intents on this document right now.'}
+              {totalOps === 0
+                ? 'Linked by recorded lineage.'
+                : `Linked by recorded lineage — ${totalOps} op${totalOps === 1 ? '' : 's'}, ` +
+                  `${totalLinks} link${totalLinks === 1 ? '' : 's'}, ` +
+                  `${totalEntities} entit${totalEntities === 1 ? 'y' : 'ies'}` +
+                  (totalUnlinked > 0 ? `, ${totalUnlinked} unlinked` : '')}
             </span>
+            {truncated && (
+              <span
+                title="The lineage window filled up — producers outside it are not represented, so some nodes may look like roots that are not."
+                className="shrink-0 px-1.5 py-0.5 rounded text-[9.5px] uppercase tracking-wide border border-amber-500/40 text-amber-700 dark:text-amber-300"
+              >
+                partial window
+              </span>
+            )}
             {(() => {
               const notice = durabilityNotice(durability)
               return notice ? <DurabilityChip notice={notice} /> : null
@@ -824,8 +961,8 @@ export default function TimelineGraph({
             <button
               type="button"
               onClick={() => setDetailsOpen((v) => !v)}
-              title="What this grouping is and isn't (click to expand)"
-              aria-label="More about this grouping"
+              title="What connects two cards here (click to expand)"
+              aria-label="More about this map"
               aria-expanded={detailsOpen}
               className="shrink-0 w-4 h-4 rounded-full text-[10px] leading-none flex items-center justify-center border border-muted-foreground/40 text-muted-foreground/70 hover:text-foreground hover:border-foreground/60"
             >
@@ -844,30 +981,47 @@ export default function TimelineGraph({
         </div>
         {detailsOpen && (
           <div className="px-4 py-2 border-b border-border shrink-0 bg-accent/10 text-[11px] text-muted-foreground/80 max-w-[85ch]">
-            Grouped by contiguous runs of the same operation kind (e.g. 13 cylinder cuts in a
-            row become one "Cyl ×13" card) — the real structure the event log supports today.
-            Named intents (e.g. "bolt circle") will attach here once the agent declares them
-            before executing, instead of being guessed after the fact.
-            {' '}Certificates aren't attached to any operation yet (no producer wired), so
-            nodes don't claim a proven/provisional/refused color — that would imply a
-            distinction the data doesn't have.
-            {' '}Each branch renders as its own lane — {branchCount === 0
+            Every node is one operation. An arrow means the entity named on it actually flowed
+            from one operation into the next — the input→output lineage the kernel recorded,
+            projected by <code>timeline_engine::LineageGraph</code>. A boolean shows its two
+            operands converging; a fillet and chamfer on the same solid stay one chain, because
+            the kernel preserves that solid's id.
+            {' '}An operation that recorded no entity refs at all is drawn dashed in the band at
+            the foot of its lane and says “no lineage recorded”. It is never chained to its
+            neighbour: sharing an operation kind, or a moment in time, is adjacency, not lineage.
+            {' '}Nodes carry no certificate colour — kernel ops do record certificates now, but
+            this endpoint does not serve them, and colouring by data this view hasn't read would
+            imply a distinction it cannot back.
+            {' '}Each branch renders as its own lane — {lanes.length === 0
               ? 'none exist on this document yet.'
-              : `${branchCount} lane${branchCount === 1 ? '' : 's'} shown, real fork points only.`}
+              : `${lanes.length} lane${lanes.length === 1 ? '' : 's'} shown, real fork points only.`}
+          </div>
+        )}
+        {refusals.length > 0 && (
+          <div className="px-4 py-2 border-b border-border shrink-0 bg-amber-500/10 text-[11px] text-amber-800 dark:text-amber-300">
+            {refusals.map((l) => (
+              <div key={l.branch.id} className="truncate">
+                <span className="font-semibold">{l.branch.name || 'main'}: lineage refused</span>
+                {' — '}
+                {l.refusal?.reason}
+                {l.refusal && l.refusal.entities.length > 0 && (
+                  <span> ({l.refusal.entities.join(', ')})</span>
+                )}
+              </div>
+            ))}
           </div>
         )}
 
         <div ref={canvasRef} className="flex-1 min-h-0 relative" style={{ background: bgColor }}>
           {loading ? (
             <div className="absolute inset-0 flex items-center justify-center text-[12px] text-muted-foreground/60">
-              ⋯ loading branch histories
+              ⋯ reading recorded lineage
             </div>
-          ) : totalOps === 0 && fetched.some((f) => f.failed) ? (
-            // A refused fetch is NOT an empty document — say which it
-            // was, and offer the retry in place instead of making the
-            // user close and reopen the dialog.
+          ) : totalOps === 0 && unreachable.length > 0 ? (
+            // A failed read is NOT an empty document — say which it was,
+            // and offer the retry in place.
             <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 text-[12px] text-amber-800 dark:text-amber-300">
-              <span>history fetch refused (rate-limited or backend error) — the log was not read</span>
+              <span>lineage not read ({unreachable[0].unreachable}) — the log was not consulted</span>
               <button
                 type="button"
                 onClick={() => setLoadEpoch((n) => n + 1)}
@@ -875,6 +1029,11 @@ export default function TimelineGraph({
               >
                 retry
               </button>
+            </div>
+          ) : totalOps === 0 && refusals.length > 0 ? (
+            <div className="absolute inset-0 flex items-center justify-center px-8 text-center text-[12px] text-amber-800 dark:text-amber-300">
+              no graph is drawn: the recorded lineage was refused (see above) — an empty map would
+              be a false answer
             </div>
           ) : totalOps === 0 ? (
             <div className="absolute inset-0 flex items-center justify-center text-[12px] text-muted-foreground/60">
@@ -929,8 +1088,9 @@ export default function TimelineGraph({
                 style={{ opacity: 0.9 }}
                 maskColor={theme === 'dark' ? 'rgba(11,13,18,0.7)' : 'rgba(238,241,246,0.7)'}
                 nodeColor={(n) => {
-                  const d = n.data as Partial<GraphNodeData & LaneNodeData>
+                  const d = n.data as Partial<OpNodeData & LaneNodeData>
                   if (n.type === 'lane') return laneFillFor(!!d.isActive, String(d.state ?? ''))
+                  if (d.node && !d.node.linked) return '#94a3b8'
                   if (d.branch) return strokeColorFor(!!d.isActiveBranch, d.branch.state)
                   return '#64748b'
                 }}
@@ -946,11 +1106,23 @@ export default function TimelineGraph({
           <span className="flex items-center gap-1">
             <span className="inline-block w-2 h-2 rounded-full" style={{ backgroundColor: '#7c8aa5' }} /> other branch
           </span>
-          <span className="flex items-center gap-1">
-            <span className="inline-block w-2 h-2 rounded-full" style={{ backgroundColor: 'rgba(251,146,60,0.9)' }} /> abandoned
-          </span>
           <span className="flex items-center gap-1 opacity-70">
             <span className="inline-block w-2 h-2 rounded-full" style={{ backgroundColor: '#94a3b8' }} /> merged
+          </span>
+          <span className="mx-1 text-muted-foreground/30">│</span>
+          <span className="flex items-center gap-1">
+            <span
+              className="inline-block w-4 h-0"
+              style={{ borderTop: `1.5px solid ${RETIRE_COLOR}` }}
+            />
+            retires (✕)
+          </span>
+          <span className="flex items-center gap-1">
+            <span
+              className="inline-block w-3 h-2 rounded-[2px]"
+              style={{ border: '1px dashed var(--muted-foreground)' }}
+            />
+            no lineage recorded
           </span>
           <span className="mx-1 text-muted-foreground/30">│</span>
           {(Object.keys(FAMILY_COLOR) as OpFamily[])
@@ -964,7 +1136,7 @@ export default function TimelineGraph({
                 {f}
               </span>
             ))}
-          <span className="ml-auto">click ▸ to unfold a group's raw operations</span>
+          <span className="ml-auto">left → right is derivation; an arrow's label is the entity that flowed</span>
         </div>
       </div>
     </>

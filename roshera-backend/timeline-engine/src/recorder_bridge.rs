@@ -815,6 +815,174 @@ mod tests {
     use crate::timeline::Timeline;
     use crate::types::TimelineConfig;
 
+    /// Drive one `RecordedOperation` through the REAL bridge into a real
+    /// `Timeline` and hand back the event that landed. Drops the recorder to
+    /// close the channel and force the drain worker to flush.
+    async fn record_one(record: RecordedOperation) -> crate::types::TimelineEvent {
+        let timeline: SharedTimeline =
+            Arc::new(RwLock::new(Timeline::new(TimelineConfig::default())));
+        let recorder =
+            TimelineRecorder::new(Arc::clone(&timeline), Author::System, BranchId::main());
+        recorder.record(record).expect("record succeeds");
+        drop(recorder);
+
+        let main = BranchId::main();
+        for _ in 0..200 {
+            let events = timeline
+                .read()
+                .await
+                .get_branch_events(&main, None, None)
+                .unwrap_or_default();
+            if let Some(event) = events.into_iter().next() {
+                return event;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("the recorded operation never reached the timeline");
+    }
+
+    /// A kernel-path event must carry the lineage the `RecordedOperation`
+    /// DECLARED in its typed `inputs`/`outputs` — not an empty decoy that ~19
+    /// production consumers read as "this operation affected nothing".
+    ///
+    /// RED before the typed channels were projected from the envelope:
+    /// `outputs` was constructed unconditionally empty at the sole production
+    /// construction site, so `created` was `[]` for every real operation.
+    #[tokio::test]
+    async fn kernel_path_event_carries_its_recorded_inputs_and_outputs() {
+        use crate::kernel_ref::{render_bare, render_ref};
+
+        let event = record_one(
+            RecordedOperation::new("extrude_face")
+                .with_parameters(serde_json::json!({ "distance": 5.0 }))
+                .with_input_solids([1u64])
+                .with_input_faces([9u64])
+                .with_output_solids([1u64])
+                .with_output_edges([4u64])
+                .with_deleted_faces([7u64]),
+        )
+        .await;
+
+        let required: Vec<String> = event
+            .inputs
+            .required_entities
+            .iter()
+            .map(|r| render_ref(r.expected_type, r.id))
+            .collect();
+        assert_eq!(
+            required,
+            vec!["solid:1".to_string(), "face:9".to_string()],
+            "the event must state exactly the inputs the kernel recorded"
+        );
+
+        let created: Vec<String> = event
+            .outputs
+            .created
+            .iter()
+            .map(|c| render_ref(c.entity_type, c.id))
+            .collect();
+        assert_eq!(
+            created,
+            vec!["edge:4".to_string()],
+            "an output the operation did not also consume was created"
+        );
+
+        let modified: Vec<String> = event
+            .outputs
+            .modified
+            .iter()
+            .filter_map(|id| render_bare(*id))
+            .collect();
+        assert_eq!(
+            modified,
+            vec!["solid:1".to_string()],
+            "an entity both consumed and produced was modified"
+        );
+
+        let deleted: Vec<String> = event
+            .outputs
+            .deleted
+            .iter()
+            .filter_map(|id| render_bare(*id))
+            .collect();
+        assert_eq!(
+            deleted,
+            vec!["face:7".to_string()],
+            "the recorded deletion channel must reach the typed outputs"
+        );
+    }
+
+    /// A recorded non-solid ref keeps its kind. `face:9` typed as
+    /// `EntityType::Solid` is the coercion this pins against — and the id
+    /// itself must differ from `solid:9`, since the two are different entities
+    /// in different kernel counter namespaces.
+    #[tokio::test]
+    async fn a_recorded_face_ref_does_not_become_a_solid() {
+        use crate::kernel_ref::{decode, encode};
+        use crate::types::EntityType;
+
+        let event = record_one(
+            RecordedOperation::new("blend_edge")
+                .with_input_faces([9u64])
+                .with_input_edges([3u64])
+                .with_output_solids([2u64]),
+        )
+        .await;
+
+        let kinds: Vec<EntityType> = event
+            .inputs
+            .required_entities
+            .iter()
+            .map(|r| r.expected_type)
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![EntityType::Face, EntityType::Edge],
+            "recorded kinds must survive; every entry typed Solid was the defect"
+        );
+        assert_eq!(
+            event.outputs.created.first().map(|c| c.entity_type),
+            Some(EntityType::Solid)
+        );
+
+        let face_id = event.inputs.required_entities[0].id;
+        assert_eq!(decode(face_id), Some((EntityType::Face, 9)));
+        assert_ne!(
+            face_id,
+            encode(EntityType::Solid, 9),
+            "face:9 and solid:9 are different entities and must not share an id"
+        );
+    }
+
+    /// An operation whose recorded refs cannot all be represented gets NO
+    /// typed lineage rather than a partial set — a consumer reading two of
+    /// three required entities has no way to know one is missing. The
+    /// envelope keeps the full truth either way.
+    #[tokio::test]
+    async fn an_unrepresentable_ref_leaves_the_typed_channels_wholly_empty() {
+        let event = record_one(
+            RecordedOperation::new("vendor_op")
+                .with_input_solids([1u64])
+                .with_input_refs(["gremlin:2"])
+                .with_output_solids([3u64]),
+        )
+        .await;
+
+        assert!(
+            event.inputs.required_entities.is_empty(),
+            "a partially populated input channel is the same lie at smaller scale"
+        );
+        assert!(event.outputs.created.is_empty());
+        match &event.operation {
+            Operation::Generic { parameters, .. } => assert_eq!(
+                parameters["inputs"],
+                serde_json::json!(["solid:1", "gremlin:2"]),
+                "the envelope still carries the full recorded lineage"
+            ),
+            other => panic!("expected Operation::Generic, got {other:?}"),
+        }
+    }
+
     #[test]
     fn maps_recorded_operation_to_generic() {
         use geometry_engine::operations::recorder::IntentFacet;

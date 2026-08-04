@@ -26,7 +26,12 @@ import {
  * kernel verdict is sound==false — UNLESS the caller passes this flag, which
  * exists for deliberate repair flows (a boolean used to heal an open shell,
  * a rebuild from a known-good state). The flag is read by the dispatch gate
- * only; it is never forwarded to the backend.
+ * AND forwarded to the backend: the same rule now also lives in Rust
+ * (`api-server/src/main.rs::refuse_unsound_base`, the same 9 mutating
+ * routes), enforced independently of this MCP client, so an acknowledged
+ * repair must carry the flag across the wire or the server-side gate refuses
+ * it right back. Each handler below forwards it only when the caller
+ * actually passed `true` — never defaulted onto a call that omitted it.
  */
 export const ACK_UNSOUND = z
   .boolean()
@@ -82,12 +87,13 @@ export function registerModifyTools(server: ToolHost) {
         ),
       acknowledge_unsound: ACK_UNSOUND,
     },
-    async ({ object, thickness, faces_to_remove }) => {
+    async ({ object, thickness, faces_to_remove, acknowledge_unsound }) => {
       try {
         const r = await api("POST", "/api/geometry/shell", {
           object,
           thickness,
           faces_to_remove,
+          ...(acknowledge_unsound ? { acknowledge_unsound: true } : {}),
         });
         const part_id = r.solid_id ?? (await newestPartId());
         return await okp(
@@ -121,7 +127,7 @@ export function registerModifyTools(server: ToolHost) {
         ),
       acknowledge_unsound: ACK_UNSOUND,
     },
-    async ({ part_id, radius, edge_ids }) => {
+    async ({ part_id, radius, edge_ids, acknowledge_unsound }) => {
       try {
         const object = await uuidForPart(part_id);
         const allEdges = !(edge_ids && edge_ids.length > 0);
@@ -135,6 +141,7 @@ export function registerModifyTools(server: ToolHost) {
           edges,
           radius,
           all_edges: allEdges,
+          ...(acknowledge_unsound ? { acknowledge_unsound: true } : {}),
         });
         const id = r.solid_id ?? part_id;
         return await okp(
@@ -170,7 +177,7 @@ export function registerModifyTools(server: ToolHost) {
         ),
       acknowledge_unsound: ACK_UNSOUND,
     },
-    async ({ part_id, distance, edge_ids }) => {
+    async ({ part_id, distance, edge_ids, acknowledge_unsound }) => {
       try {
         const object = await uuidForPart(part_id);
         const edges =
@@ -179,6 +186,7 @@ export function registerModifyTools(server: ToolHost) {
           object,
           edges,
           distance,
+          ...(acknowledge_unsound ? { acknowledge_unsound: true } : {}),
         });
         const id = r.solid_id ?? part_id;
         return await okp(
@@ -215,12 +223,13 @@ export function registerModifyTools(server: ToolHost) {
       object_b: z.string().uuid().describe("tool solid's object_uuid"),
       acknowledge_unsound: ACK_UNSOUND,
     },
-    async ({ op, object_a, object_b }) => {
+    async ({ op, object_a, object_b, acknowledge_unsound }) => {
       try {
         const r = await api("POST", "/api/geometry/boolean", {
           operation: op,
           object_a,
           object_b,
+          ...(acknowledge_unsound ? { acknowledge_unsound: true } : {}),
         });
         const part_id = await newestPartId();
         return await okp(
@@ -254,17 +263,22 @@ export function registerModifyTools(server: ToolHost) {
         .describe("object_uuids applied in order; all consumed"),
       acknowledge_unsound: ACK_UNSOUND,
     },
-    async ({ op, base, tools }) => {
+    async ({ op, base, tools, acknowledge_unsound }) => {
       try {
         let lastId: number | null = null;
         for (let i = 0; i < tools.length; i++) {
           // fast:true skips the endpoint's own full cert — the perceive() below
           // is the single certification gate per step (was 2× cert work/step).
+          // acknowledge_unsound is forwarded on EVERY step: the backend gate
+          // runs per-call on /api/geometry/boolean and gates BOTH operands, so
+          // an acknowledged repair must carry the flag on each step, not just
+          // the first.
           await api("POST", "/api/geometry/boolean", {
             operation: op,
             object_a: base,
             object_b: tools[i],
             fast: true,
+            ...(acknowledge_unsound ? { acknowledge_unsound: true } : {}),
           });
           lastId = await newestPartId();
           const p = await perceive(lastId);
@@ -339,6 +353,7 @@ export function registerModifyTools(server: ToolHost) {
       depth,
       z_offset,
       start_angle_deg,
+      acknowledge_unsound,
     }) => {
       try {
         // The same guard the kernel's exploration recipe uses: adjacent holes
@@ -417,6 +432,7 @@ export function registerModifyTools(server: ToolHost) {
               object_a: object,
               object_b: bores[k],
               fast: true,
+              ...(acknowledge_unsound ? { acknowledge_unsound: true } : {}),
             });
           } catch (e) {
             const msg = e instanceof Error ? e.message : String(e);
@@ -482,7 +498,7 @@ export function registerModifyTools(server: ToolHost) {
         .describe("optional rotation; applied before translation"),
       acknowledge_unsound: ACK_UNSOUND,
     },
-    async ({ object, translation, rotation }) => {
+    async ({ object, translation, rotation, acknowledge_unsound }) => {
       try {
         if (!translation && !rotation) {
           return fail(new Error("provide translation and/or rotation"));
@@ -496,6 +512,7 @@ export function registerModifyTools(server: ToolHost) {
             ...(rotation.center ? { center: rotation.center } : {}),
           };
         }
+        if (acknowledge_unsound) body.acknowledge_unsound = true;
         const r = await api("POST", "/api/geometry/transform", body);
         return ok({
           object_uuid: r.object ?? object,

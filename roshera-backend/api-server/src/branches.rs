@@ -222,6 +222,12 @@ pub struct MergeStatisticsView {
     pub events_merged: usize,
     pub conflicts_count: usize,
     pub auto_resolved: usize,
+    /// Distinct entities (`created ∪ modified ∪ deleted`, kernel refs
+    /// included) touched by the merged events — verbatim from
+    /// `timeline_engine::branch::MergeStatistics::entities_affected`,
+    /// which now derives it from the events' own typed `outputs` channels
+    /// (`timeline.rs`'s merge path) rather than the always-`0` placeholder
+    /// it used to report.
     pub entities_affected: usize,
     pub duration_ms: u64,
 }

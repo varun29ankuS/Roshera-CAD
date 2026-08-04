@@ -13,16 +13,26 @@
 //!    `"face:2"`, …) exactly as `recorder_bridge::to_timeline_operation`
 //!    wrote them (`"deleted"` present only when the op removed something).
 //! 2. **Typed refs** — the event's `inputs.required_entities` /
-//!    `inputs.optional_entities` (each an [`EntityReference`] with a UUID
+//!    `inputs.optional_entities` (each an [`EntityReference`] with an
 //!    `EntityId` plus an expected [`EntityType`]) and `outputs.created` /
-//!    `modified` / `deleted`. These are rendered as `"<kind>:<uuid>"`.
+//!    `modified` / `deleted`.
 //!
-//! The two id spaces are **disjoint by construction** (numeric kernel
-//! counters vs UUIDs) and this module deliberately does NOT try to correlate
-//! them, and does NOT merge nodes, collapse chains, or decide that a boolean
-//! result "is" one of its operands. Part identity is an open product
-//! decision; this layer exposes the raw graph only. A future identity layer
-//! sits on top of it.
+//! For a kernel event these two sources are now the SAME lineage, because the
+//! typed channels are projected from the wire envelope at append time
+//! ([`kernel_ref::project_envelope`](crate::kernel_ref::project_envelope)) and
+//! a kernel ref's id encodes the ref losslessly — so
+//! [`kernel_ref::render_ref`](crate::kernel_ref::render_ref) renders it back to
+//! the byte-identical `"solid:1"` string the wire channel produces. The union
+//! below is therefore a no-op for kernel events rather than a reconciliation of
+//! two dialects. It still matters for DTO-layer events, whose typed refs carry
+//! viewport UUIDs and render as `"<kind>:<uuid>"`.
+//!
+//! The two id spaces stay **disjoint by construction** (an encoded kernel ref
+//! never collides with a generated UUID — see the `kernel_ref` module docs) and
+//! this module deliberately does NOT try to correlate them, and does NOT merge
+//! nodes, collapse chains, or decide that a boolean result "is" one of its
+//! operands. Part identity is an open product decision; this layer exposes the
+//! raw graph only. A future identity layer sits on top of it.
 //!
 //! # Semantics
 //!
@@ -252,10 +262,10 @@ impl LineageGraph {
                 outputs.extend(wire_refs(parameters, "outputs"));
                 // The wire deletion channel (`recorder_bridge::to_timeline_operation`
                 // carries `RecordedOperation.deleted` through verbatim, present only
-                // when non-empty). This is what real kernel ops actually produce —
-                // the typed `outputs.deleted` channel below is exercised by
-                // synthetic/typed-event producers, not the kernel's own recorder
-                // path.
+                // when non-empty). For a kernel event the typed `outputs.deleted`
+                // channel below is projected from this very key and renders to the
+                // same strings, so the two extends are idempotent; the typed channel
+                // still stands alone for DTO-layer producers.
                 deleted.extend(wire_refs(parameters, "deleted"));
             }
             for r in ev
@@ -264,10 +274,10 @@ impl LineageGraph {
                 .iter()
                 .chain(ev.inputs.optional_entities.iter())
             {
-                inputs.insert(typed_ref(kind_tag(&r.expected_type), r.id));
+                inputs.insert(typed_ref(r.expected_type, r.id));
             }
             for c in &ev.outputs.created {
-                outputs.insert(typed_ref(kind_tag(&c.entity_type), c.id));
+                outputs.insert(typed_ref(c.entity_type, c.id));
             }
             for m in &ev.outputs.modified {
                 let r = resolved_ref(*m, &kind_by_uuid);
@@ -544,32 +554,32 @@ fn wire_refs(parameters: &serde_json::Value, key: &str) -> Vec<EntityRef> {
 }
 
 /// Render a typed ref as `"<kind>:<uuid>"`.
-fn typed_ref(kind: &str, id: EntityId) -> EntityRef {
+fn typed_ref(entity_type: EntityType, id: EntityId) -> EntityRef {
+    EntityRef(crate::kernel_ref::render_ref(entity_type, id))
+}
+
+/// Render a bare `EntityId` (modified/deleted lists carry no type).
+///
+/// A kernel ref carries its own kind inside the id, so it is decoded directly
+/// and renders identically to the wire channel. Otherwise the kind comes from
+/// an earlier typed sighting of the same UUID in this slice, falling back to
+/// the honest `"entity"` tag when the slice never revealed it. This is NOT
+/// identity inference — the same `EntityId` is the same entity by definition;
+/// only the display kind is being recovered.
+fn resolved_ref(id: EntityId, kinds: &HashMap<EntityId, &'static str>) -> EntityRef {
+    if let Some(rendered) = crate::kernel_ref::render_bare(id) {
+        return EntityRef(rendered);
+    }
+    let kind = kinds.get(&id).copied().unwrap_or(KIND_UNKNOWN);
     EntityRef(format!("{}:{}", kind, id))
 }
 
-/// Render a bare `EntityId` (modified/deleted lists carry no type) using the
-/// kind learned from an earlier typed sighting of the same UUID, or the
-/// honest `"entity"` fallback when the slice never revealed its type. This
-/// is NOT identity inference — the same `EntityId` is the same entity by
-/// definition; only the display kind is being recovered.
-fn resolved_ref(id: EntityId, kinds: &HashMap<EntityId, &'static str>) -> EntityRef {
-    let kind = kinds.get(&id).copied().unwrap_or(KIND_UNKNOWN);
-    typed_ref(kind, id)
-}
-
-/// Lowercase wire-style kind tag for a typed [`EntityType`].
+/// Lowercase wire-style kind tag for a typed [`EntityType`] — the kernel's own
+/// tag vocabulary, kept in ONE place
+/// ([`kernel_ref::wire_tag`](crate::kernel_ref::wire_tag)) so a typed ref and
+/// the wire ref it came from can never disagree about what to call a kind.
 fn kind_tag(entity_type: &EntityType) -> &'static str {
-    match entity_type {
-        EntityType::Sketch => "sketch",
-        EntityType::Solid => "solid",
-        EntityType::Surface => "surface",
-        EntityType::Curve => "curve",
-        EntityType::Point => "point",
-        EntityType::Edge => "edge",
-        EntityType::Face => "face",
-        EntityType::Vertex => "vertex",
-    }
+    crate::kernel_ref::wire_tag(*entity_type)
 }
 
 /// The stable command-type string for an operation: the kernel's kind for
@@ -1004,5 +1014,85 @@ mod tests {
             "an in-place modification must not make an entity its own ancestor"
         );
         assert!(g.descendants(&solid_ref).is_empty());
+    }
+
+    /// Events appended through the REAL production path now carry populated
+    /// typed channels as well as the wire envelope. The projection must be
+    /// UNCHANGED by that: a kernel ref renders identically from either
+    /// channel, so the union is a no-op — not a second set of nodes for the
+    /// same entities.
+    ///
+    /// Without the reversible encoding this is exactly where a hashed id
+    /// would show up: `solid:1` would gain a twin `solid:<uuid>`, doubling
+    /// every node and quadrupling every edge.
+    #[tokio::test]
+    async fn typed_channels_do_not_duplicate_the_wire_nodes() {
+        use crate::types::TimelineConfig;
+
+        let ops: [(&str, Vec<&str>, Vec<&str>); 3] = [
+            ("create_box", vec![], vec!["solid:1"]),
+            ("create_cylinder", vec![], vec!["solid:2"]),
+            (
+                "boolean_difference",
+                vec!["solid:1", "solid:2"],
+                vec!["solid:3"],
+            ),
+        ];
+
+        // The same three operations, appended for real…
+        let timeline = crate::Timeline::new(TimelineConfig::default());
+        for (kind, inputs, outputs) in &ops {
+            timeline
+                .add_operation(
+                    Operation::Generic {
+                        command_type: (*kind).to_string(),
+                        parameters: serde_json::json!({
+                            "params": {},
+                            "inputs": inputs,
+                            "outputs": outputs,
+                        }),
+                    },
+                    Author::System,
+                    crate::BranchId::main(),
+                )
+                .await
+                .expect("append succeeds");
+        }
+        let appended = timeline
+            .get_branch_events(&crate::BranchId::main(), None, None)
+            .expect("branch events");
+        assert!(
+            appended
+                .iter()
+                .any(|e| !e.outputs.created.is_empty() || !e.inputs.required_entities.is_empty()),
+            "these events must actually exercise the typed channels"
+        );
+
+        // …and the same three as wire-only events, the shape this projection
+        // has always seen.
+        let wire_only: Vec<TimelineEvent> = ops
+            .iter()
+            .enumerate()
+            .map(|(i, (kind, inputs, outputs))| wire_event(i as u64, kind, inputs, outputs))
+            .collect();
+
+        let from_appended = LineageGraph::build(&appended).expect("appended graph");
+        let from_wire = LineageGraph::build(&wire_only).expect("wire graph");
+
+        assert_eq!(
+            from_appended.nodes(),
+            from_wire.nodes(),
+            "populating the typed channels must not add nodes to the lineage DAG"
+        );
+        assert_eq!(
+            from_appended.ancestors(&r("solid:3")),
+            from_wire.ancestors(&r("solid:3")),
+            "ancestry must be identical whichever channel it is read from"
+        );
+        assert_eq!(
+            from_appended.state_at(EventIndex::MAX),
+            from_wire.state_at(EventIndex::MAX),
+            "the live frontier must be identical"
+        );
     }
 }

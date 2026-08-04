@@ -58,6 +58,8 @@ mod reconcile_task;
 mod router_integration_tests;
 mod sketch;
 mod transactions;
+#[cfg(test)]
+mod unsound_base_gate_tests;
 mod viewport_bridge;
 mod ws_identity_tests;
 // Using core geometry-engine directly
@@ -1191,6 +1193,109 @@ pub(crate) fn certificate_json(
     })
 }
 
+/// The kernel's one-line soundness verdicts, in ONE place.
+///
+/// Three surfaces quote these: the ambient perception block every mutating
+/// endpoint embeds (`certified_response` below), the read-side
+/// `GET /api/agent/parts/{id}/perception` (`handlers::agent::part_perception`),
+/// and the unsound-base gate's refusal ([`refuse_unsound_base`]).
+///
+/// They MUST be one string, not three copies, because the MCP client gate
+/// (`roshera-mcp/src/gates.ts::liveVerdict`) reads `verdict` off the
+/// perception endpoint and interpolates it into ITS refusal. Sharing the
+/// constant is what makes the Rust refusal and the TypeScript refusal quote
+/// the kernel identically by construction rather than by hand-syncing prose
+/// across a language boundary.
+pub const VERDICT_SOUND: &str = "SOUND — full kernel certificate clean (closed, manifold, self-intersection-free, mesh-quality-clean)";
+/// See [`VERDICT_SOUND`].
+pub const VERDICT_UNSOUND: &str = "UNSOUND — full kernel certificate flags a defect (see cert)";
+
+/// ★ **THE UNSOUND-BASE GATE.** Refuse a mutating operation whose base solid
+/// is unsound by the kernel's LIVE verdict.
+///
+/// # Why this exists in Rust
+///
+/// Roshera's thesis is that an agent cannot build on a lie. This rule used to
+/// live only in `roshera-mcp/src/gates.ts` — TypeScript, in the MCP client —
+/// which made it a linter rather than a gate: the same kernel operations are
+/// exposed over plain REST, so an agent that spoke REST instead of MCP could
+/// stack a fillet, a shell or a boolean onto a solid the kernel had already
+/// certified `sound: false`, and every downstream certificate would inherit
+/// the defect. By the project's own moat test — *does this survive swapping
+/// the host?* — a client-side gate does not even survive swapping the client.
+///
+/// # Where it sits, and why not a middleware
+///
+/// One helper, called per handler immediately after the base UUID resolves to
+/// a kernel `SolidId` and before any kernel work. A `route_layer` was the
+/// obvious alternative and is the wrong shape here: every route names its base
+/// with a DIFFERENT field (`object_a`/`object_b`, `object`, `object_uuid`), so
+/// a middleware would need body buffering, re-injection, and a per-route field
+/// map — more coupling, further from the resolution site, and unable to reuse
+/// each handler's own `SolidNotFound` 404. The rule itself lives here exactly
+/// once; only the call is per-handler.
+///
+/// # The three properties it must hold
+///
+/// 1. **Live, never memoized.** `certify_solid` is consulted on every call.
+///    Its per-solid cache is invalidated by the kernel's own mutation seams,
+///    so a base repaired by ANY author unblocks the very next request — no
+///    restart, no cache flush. This deliberately mirrors `gates.ts`, which
+///    lists `unsound_base` in `LIVE_FACT_GATES` and never caches its refusal.
+/// 2. **The escape hatch is preserved.** `acknowledge_unsound: true` proceeds.
+///    An agent that KNOWINGLY builds on a defect (a boolean used to heal an
+///    open shell, a rebuild from a known-good state) is behaving correctly —
+///    the defect is doing it unknowingly. Only a literal JSON `true` opens it.
+/// 3. **An unresolvable base is not gated.** A `SolidId` with no solid behind
+///    it is skipped, so the handler still produces its own precise error —
+///    the same call `gates.ts` makes (`partId === null → continue`).
+///
+/// Takes ALREADY-RESOLVED ids so each handler keeps its own 404 for an unknown
+/// UUID. `bases` is every operand the result would inherit from: a boolean
+/// passes BOTH, because an unsound TOOL poisons the result exactly as an
+/// unsound base does (`gates.ts::BASE_REFS` gates both operands too).
+///
+/// The write guard is scoped to its own block and dropped before this returns
+/// (`certify_solid` needs `&mut`, and every caller goes on to take the write
+/// lock again through `bounded_exec`); no guard is ever held across an `.await`.
+pub(crate) async fn refuse_unsound_base(
+    model_handle: &Arc<RwLock<geometry_engine::primitives::topology_builder::BRepModel>>,
+    payload: &serde_json::Value,
+    operation: &str,
+    bases: &[geometry_engine::primitives::solid::SolidId],
+) -> Result<(), error_catalog::ApiError> {
+    // The documented bypass. `as_bool() == Some(true)` and not a truthiness
+    // test: a string "true", a 1, or a missing field must NOT open the gate.
+    if payload.get("acknowledge_unsound").and_then(|v| v.as_bool()) == Some(true) {
+        return Ok(());
+    }
+
+    let offender = {
+        let mut model = model_handle.write().await;
+        let mut found = None;
+        for &solid_id in bases {
+            // Unresolvable → not our refusal to make; the handler fails loudly.
+            if model.solids.get(solid_id).is_none() {
+                continue;
+            }
+            if !model.certify_solid(solid_id).is_sound() {
+                found = Some(solid_id);
+                break;
+            }
+        }
+        found
+    }; // write guard dropped here, before the `.await`-free return below
+
+    match offender {
+        Some(solid_id) => Err(error_catalog::ApiError::unsound_base(
+            operation,
+            solid_id,
+            VERDICT_UNSOUND,
+        )),
+        None => Ok(()),
+    }
+}
+
 /// THE CHOKEPOINT (AMBIENT VERIFICATION). The perception block every mutating
 /// endpoint embeds in its response.
 ///
@@ -1294,9 +1399,9 @@ fn certified_response(
                 serde_json::json!(cert.self_intersection_free),
             );
             let verdict = if sound {
-                "SOUND — full kernel certificate clean (closed, manifold, self-intersection-free, mesh-quality-clean)"
+                VERDICT_SOUND
             } else {
-                "UNSOUND — full kernel certificate flags a defect (see cert)"
+                VERDICT_UNSOUND
             };
             map.insert("verdict".into(), serde_json::json!(verdict));
             map.insert("cert".into(), certificate_json(&cert));
@@ -1624,6 +1729,10 @@ async fn boolean_operation(
         ));
     }
 
+    // ★ UNSOUND-BASE GATE. Both operands: the result inherits from each, so
+    // an unsound TOOL poisons it exactly as an unsound base does.
+    refuse_unsound_base(&model_handle, &payload, "boolean", &[solid_a, solid_b]).await?;
+
     // Task #41 — BOUNDED execution. The kernel boolean runs arbitrary
     // corefinement and has spun >120 s under the write lock on a
     // thin-wall coincident-throat union, pinning the whole instance. Route
@@ -1912,6 +2021,9 @@ async fn shell_solid(
         )
     })?;
 
+    // ★ UNSOUND-BASE GATE.
+    refuse_unsound_base(&model_handle, &payload, "shell", &[solid_id]).await?;
+
     // Hold the model write lock only for the kernel shell op — same
     // pattern as boolean_operation. Tessellation runs under read.
     let thickness_abs = thickness.abs();
@@ -2128,6 +2240,9 @@ async fn mirror_solid(
             format!("no kernel solid registered for object={object_uuid}"),
         )
     })?;
+
+    // ★ UNSOUND-BASE GATE.
+    refuse_unsound_base(&model_handle, &payload, "mirror", &[solid_id]).await?;
 
     // Hold the model write lock only for the kernel mirror op; tessellation
     // runs under a read lock so concurrent writers aren't blocked. Same
@@ -2509,6 +2624,9 @@ async fn fillet_edges_endpoint(
         )
     })?;
 
+    // ★ UNSOUND-BASE GATE.
+    refuse_unsound_base(&model_handle, &payload, "fillet", &[solid_id]).await?;
+
     // Hold the model write lock only for the kernel fillet op;
     // tessellation runs under a read lock. Same pattern as boolean /
     // shell / mirror.
@@ -2871,6 +2989,9 @@ async fn chamfer_edges_endpoint(
         )
     })?;
 
+    // ★ UNSOUND-BASE GATE.
+    refuse_unsound_base(&model_handle, &payload, "chamfer", &[solid_id]).await?;
+
     {
         let mut model = model_handle.write().await;
         let opts = ChamferOptions {
@@ -3055,6 +3176,9 @@ async fn transform_geometry_endpoint(
             format!("no kernel solid registered for object={object_uuid}"),
         )
     })?;
+
+    // ★ UNSOUND-BASE GATE.
+    refuse_unsound_base(&model_handle, &payload, "transform", &[solid_id]).await?;
 
     // Build the matrices to apply, in order: rotation (about center) then
     // translation. Each is applied as its own transform_solid call.
@@ -3261,6 +3385,10 @@ async fn pattern_linear_endpoint(
         )
     })?;
 
+    // ★ UNSOUND-BASE GATE. A pattern REPLICATES the base — an unsound base
+    // would be copied N times, not merely inherited from once.
+    refuse_unsound_base(&model_handle, &payload, "pattern/linear", &[solid_id]).await?;
+
     let mut emitted: Vec<String> = Vec::with_capacity((count as usize) - 1);
 
     for i in 1..count {
@@ -3440,6 +3568,9 @@ async fn pattern_circular_endpoint(
             format!("no kernel solid registered for object={object_uuid}"),
         )
     })?;
+
+    // ★ UNSOUND-BASE GATE. See the linear-pattern note above.
+    refuse_unsound_base(&model_handle, &payload, "pattern/circular", &[solid_id]).await?;
 
     let step = total_angle / (count as f64);
     let origin_pt = Point3::new(axis_origin[0], axis_origin[1], axis_origin[2]);
@@ -5252,6 +5383,31 @@ pub(crate) fn ros_signature_json(
         export_engine::formats::ros::RosSignatureVerdict::Invalid { reason } => {
             serde_json::json!({ "status": "invalid", "reason": reason })
         }
+        // The signature is cryptographically genuine but the identity
+        // attached to it is not derivable from its own public key. A
+        // distinct status, never folded into "invalid": the caller must
+        // be able to tell "these bytes are not what was signed" from
+        // "these bytes ARE what was signed, under a forged name".
+        export_engine::formats::ros::RosSignatureVerdict::ForgedSignerId {
+            declared_signer_id,
+            derived_signer_id,
+            public_key,
+        } => serde_json::json!({
+            "status": "forged_signer_id",
+            "declared_signer_id": declared_signer_id,
+            "derived_signer_id": derived_signer_id,
+            "public_key": public_key,
+        }),
+        // Signed under the .ros ≤3.1 scheme, whose coverage excluded the
+        // header and chunk index. Not a failure and not a pass.
+        export_engine::formats::ros::RosSignatureVerdict::SupersededScheme {
+            file_version,
+            reason,
+        } => serde_json::json!({
+            "status": "superseded_scheme",
+            "file_version": file_version,
+            "reason": reason,
+        }),
     }
 }
 
@@ -5587,6 +5743,12 @@ async fn extrude_face_endpoint(
             format!("no kernel solid registered for {object_uuid}"),
         )
     })?;
+
+    // ★ UNSOUND-BASE GATE. Runs the moment the base resolves — before the
+    // face-ownership check below — so no work is spent validating a
+    // selection on a solid the operation is not allowed to touch.
+    refuse_unsound_base(&model_handle, &payload, "face/extrude", &[host_solid_id]).await?;
+
     {
         let model = model_handle.read().await;
         let solid = model
@@ -10334,6 +10496,16 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route("/api/timeline/init", post(initialize_timeline))
         .route("/api/timeline/record", post(record_operation))
         .route("/api/timeline/history/{branch_id}", get(get_history))
+        // Lineage DAG of the same branch — the ONE answer to "what
+        // belongs together", projected by `timeline_engine::LineageGraph`
+        // from the refs each operation actually recorded. The timeline
+        // map renders this; it no longer groups by op-kind adjacency,
+        // which was a guess wearing the costume of a fact (an event with
+        // no recorded refs now renders as visibly unlinked instead).
+        .route(
+            "/api/timeline/lineage/{branch_id}",
+            get(crate::handlers::timeline::get_lineage_graph),
+        )
         // Operation-graph view of the same branch — kernel-derived
         // hierarchy (parent = earliest event that produced any of this
         // event's inputs). Consumed by the frontend FeatureTree panel
