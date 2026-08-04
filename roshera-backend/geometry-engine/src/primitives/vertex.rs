@@ -1244,4 +1244,39 @@ mod tests {
         // tolerances Vec is also truncated, not just the coordinate arrays.
         assert_eq!(s.tolerances.len(), 2);
     }
+
+    /// Regression lock for the tombstone/liveness split (BUG 1): `len()`
+    /// must always agree with `iter().count()`, including after removals
+    /// that leave tombstoned slots behind. `VertexStore::len()` already
+    /// subtracted `deleted_count()` before this task; this test pins that
+    /// behavior so a future change cannot silently reintroduce the split
+    /// that `EdgeStore`/`LoopStore`/`FaceStore`/`ShellStore` had.
+    #[test]
+    fn len_agrees_with_iter_count_after_removals() {
+        let mut s = VertexStore::with_capacity_no_dedup(8);
+        let ids: Vec<VertexId> = (0..6)
+            .map(|i| s.add_unchecked(i as f64, 0.0, 0.0))
+            .collect();
+        assert_eq!(s.len(), 6);
+        assert_eq!(s.len(), s.iter().count());
+
+        // Remove a couple of vertices, leaving tombstoned slots behind.
+        assert!(s.remove(ids[1]));
+        assert!(s.remove(ids[4]));
+        assert_eq!(s.len(), 4);
+        assert_eq!(
+            s.len(),
+            s.iter().count(),
+            "len() must agree with iter().count() after removals"
+        );
+        assert!(!s.is_empty());
+
+        // Remove the rest; len/is_empty/iter must all agree on empty too.
+        for &id in &ids {
+            s.remove(id);
+        }
+        assert_eq!(s.len(), 0);
+        assert_eq!(s.len(), s.iter().count());
+        assert!(s.is_empty());
+    }
 }

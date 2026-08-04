@@ -880,19 +880,70 @@ impl LoopStore {
             .unwrap_or(&[])
     }
 
-    #[inline(always)]
+    /// Number of live loops — agrees with `iter().count()` by
+    /// construction (same `is_live` predicate). O(slot_count); `remove`
+    /// has no double-remove guard, so a cached live counter derived
+    /// from `stats.total_deleted` would silently double-decrement —
+    /// not used for that reason.
+    #[inline]
     pub fn len(&self) -> usize {
-        self.loops.len()
+        self.iter().count()
     }
 
-    #[inline(always)]
+    /// True if there are no live loops.
+    #[inline]
     pub fn is_empty(&self) -> bool {
-        self.loops.is_empty()
+        self.iter().next().is_none()
+    }
+
+    /// Backing-slot extent (includes tombstoned/removed slots). Callers
+    /// that want "how many live loops" must use [`LoopStore::len`], not
+    /// this — it is capacity/allocation-extent, not liveness.
+    #[inline(always)]
+    pub fn slot_count(&self) -> usize {
+        self.loops.len()
     }
 }
 
 impl Default for LoopStore {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod loop_store_liveness_tests {
+    use super::*;
+
+    /// Regression lock for BUG 1: `len()`/`is_empty()` must agree with
+    /// `iter().count()` even after removals leave tombstoned slots
+    /// behind. Before the fix, `len()` read `self.loops.len()` (the
+    /// raw backing Vec, tombstones included) while `iter()` filtered
+    /// them out via `is_live` — the two disagreed after any `remove`.
+    #[test]
+    fn len_agrees_with_iter_count_after_removals() {
+        let mut store = LoopStore::new();
+        let ids: Vec<LoopId> = (0..5)
+            .map(|_| store.add(Loop::new(0, LoopType::Outer)))
+            .collect();
+        assert_eq!(store.len(), 5);
+        assert_eq!(store.len(), store.iter().count());
+
+        store.remove(ids[1]);
+        store.remove(ids[3]);
+        assert_eq!(store.len(), 3);
+        assert_eq!(
+            store.len(),
+            store.iter().count(),
+            "len() must agree with iter().count() after removals"
+        );
+        assert!(!store.is_empty());
+
+        for &id in &ids {
+            store.remove(id);
+        }
+        assert_eq!(store.len(), 0);
+        assert_eq!(store.len(), store.iter().count());
+        assert!(store.is_empty());
     }
 }

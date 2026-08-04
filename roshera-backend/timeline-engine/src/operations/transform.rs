@@ -207,7 +207,7 @@ fn apply_transform_to_brep(brep: &mut BRepModel, transform: &Matrix4) -> Timelin
 
     // Update surface geometry if present
     // FaceStore doesn't implement Iterator, iterate by index
-    for idx in 0..brep.faces.len() {
+    for idx in 0..brep.faces.slot_count() {
         let face_id = idx as u32;
         if let Some(_face) = brep.faces.get_mut(face_id) {
             // In a full implementation, would transform surface parameters
@@ -218,7 +218,7 @@ fn apply_transform_to_brep(brep: &mut BRepModel, transform: &Matrix4) -> Timelin
 
     // Update curve geometry if present
     // EdgeStore doesn't implement Iterator, iterate by index
-    for idx in 0..brep.edges.len() {
+    for idx in 0..brep.edges.slot_count() {
         let edge_id = idx as u32;
         if let Some(_edge) = brep.edges.get_mut(edge_id) {
             // In a full implementation, would transform curve parameters

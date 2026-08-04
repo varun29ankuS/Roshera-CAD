@@ -295,7 +295,7 @@ impl<'a> TopologyEditor<'a> {
         // These are *planned* IDs: the caller must actually allocate entities
         // with these IDs when applying the edit to mutable stores.
         let new_vertex_id = ctx.vertices.len() as VertexId;
-        let new_edge_a = ctx.edges.len() as EdgeId;
+        let new_edge_a = ctx.edges.slot_count() as EdgeId;
         let new_edge_b = new_edge_a + 1;
 
         let edit = TopologyEdit::SplitEdge {
@@ -439,7 +439,7 @@ pub fn build_adjacency_parallel(ctx: &TopologyContext) -> MathResult<AdjacencyIn
     };
 
     // Build vertex-edge relationships in parallel
-    let vertex_edge_data: Vec<_> = (0..ctx.edges.len() as u32)
+    let vertex_edge_data: Vec<_> = (0..ctx.edges.slot_count() as u32)
         .into_par_iter()
         .filter_map(|edge_id| {
             ctx.edges
@@ -467,7 +467,7 @@ pub fn build_adjacency_parallel(ctx: &TopologyContext) -> MathResult<AdjacencyIn
     }
 
     // Build face relationships in parallel
-    let face_data: Vec<_> = (0..ctx.faces.len() as u32)
+    let face_data: Vec<_> = (0..ctx.faces.slot_count() as u32)
         .into_par_iter()
         .filter_map(|face_id| {
             ctx.faces.get(face_id).map(|face| {
@@ -541,7 +541,7 @@ pub fn build_adjacency_parallel(ctx: &TopologyContext) -> MathResult<AdjacencyIn
     }
 
     // Build face-shell relationships
-    for shell_id in 0..ctx.shells.len() as u32 {
+    for shell_id in 0..ctx.shells.slot_count() as u32 {
         if let Some(shell) = ctx.shells.get(shell_id) {
             for &face_id in &shell.faces {
                 info.face_shells
@@ -860,7 +860,7 @@ pub fn compute_fingerprint(ctx: &TopologyContext) -> MathResult<TopologyFingerpr
 
     // Compute genus for each shell
     let mut genus_signature = Vec::new();
-    for shell_id in 0..ctx.shells.len() as u32 {
+    for shell_id in 0..ctx.shells.slot_count() as u32 {
         if let Some(shell) = ctx.shells.get(shell_id) {
             if let Ok(euler) = shell_euler_characteristic(shell, ctx) {
                 let genus = (2 - euler) / 2;
@@ -1096,7 +1096,7 @@ pub fn simplify_topology(
     if options.remove_small_edges {
         let mut small_edge_count: usize = 0;
 
-        for edge_id in 0..ctx.edges.len() as EdgeId {
+        for edge_id in 0..ctx.edges.slot_count() as EdgeId {
             if let Some(edge) = ctx.edges.get(edge_id) {
                 let sv = ctx.vertices.get(edge.start_vertex);
                 let ev = ctx.vertices.get(edge.end_vertex);
@@ -1438,7 +1438,7 @@ impl MultiResolutionTopology {
         // vertices are the least important and simplify first.
         let mut edge_importance: Vec<(EdgeId, f64)> = Vec::new();
 
-        for edge_id in 0..ctx.edges.len() as EdgeId {
+        for edge_id in 0..ctx.edges.slot_count() as EdgeId {
             if let Some(edge) = ctx.edges.get(edge_id) {
                 let length = match (
                     ctx.vertices.get(edge.start_vertex),
@@ -1587,7 +1587,7 @@ pub fn build_adjacency(ctx: &TopologyContext) -> AdjacencyInfo {
 
 /// Find all edges between two vertices
 pub fn edges_between_vertices(v1: VertexId, v2: VertexId, edges: &EdgeStore) -> Vec<EdgeId> {
-    (0..edges.len() as u32)
+    (0..edges.slot_count() as u32)
         .into_par_iter()
         .filter_map(|edge_id| {
             edges.get(edge_id).and_then(|edge| {
@@ -1659,7 +1659,7 @@ pub fn face_components(faces: &FaceStore, adjacency: &AdjacencyInfo) -> Vec<Vec<
     let mut visited = HashSet::new();
     let mut components = Vec::new();
 
-    for face_id in 0..faces.len() as u32 {
+    for face_id in 0..faces.slot_count() as u32 {
         if !visited.contains(&face_id) && faces.get(face_id).is_some() {
             let mut component = Vec::new();
             let mut queue = VecDeque::new();
@@ -1884,7 +1884,7 @@ pub fn is_shell_orientable(shell: &Shell, ctx: &TopologyContext) -> bool {
 /// silently dropped so downstream consumers don't dereference invalid
 /// ids.
 pub fn find_face_holes(faces: &FaceStore, loops: &LoopStore) -> HashMap<FaceId, Vec<LoopId>> {
-    (0..faces.len() as u32)
+    (0..faces.slot_count() as u32)
         .into_par_iter()
         .filter_map(|face_id| {
             faces.get(face_id).and_then(|face| {

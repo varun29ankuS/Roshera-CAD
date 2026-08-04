@@ -657,7 +657,6 @@ pub fn boolean_operation(
             vec![solid_a, solid_b],
         );
 
-        // Record the successful operation for attached recorders.
         let op_kind = match operation {
             BooleanOp::Union => "boolean_union",
             BooleanOp::Intersection => "boolean_intersection",
@@ -674,17 +673,6 @@ pub fn boolean_operation(
         if solid_b != result_solid {
             deleted_solids.push(solid_b as u64);
         }
-        model.record_operation(
-            crate::operations::recorder::RecordedOperation::new(op_kind)
-                .with_parameters(serde_json::json!({
-                    "solid_a": solid_a,
-                    "solid_b": solid_b,
-                    "operation": format!("{:?}", operation),
-                }))
-                .with_input_solids([solid_a as u64, solid_b as u64])
-                .with_output_solids([result_solid as u64])
-                .with_deleted_solids(deleted_solids),
-        );
 
         // Retire the consumed operands. `reconstruct_topology` builds the
         // result as a brand-new `Solid` (`model.solids.add`) whose faces
@@ -713,13 +701,54 @@ pub fn boolean_operation(
         // `with_rollback` closure on the success path, so an earlier failure
         // restores everything via the snapshot.
         //
-        // NOTE: the swept entities are discarded here, same as before this
-        // function started reporting them — the `record_operation` call
-        // above already fired with only `deleted_solids` (the retired
-        // operand `Solid` records), so this husk sweep is not yet declared
-        // on the `deleted` wire channel either. Same defect class as
-        // `delete_solid` had; out of scope for this fix (see delete.rs).
-        let _ = crate::operations::delete::prune_boolean_orphan_topology(model)?;
+        // Recording happens AFTER this sweep (not before it, as it used to)
+        // so the `deleted` channel can fold in exactly what the prune
+        // removed — the same silent-deletion shape `delete_solid` had until
+        // its `deleted` channel was extended to report its own orphan-prune
+        // sweep (commit 83b0b176). `prune_boolean_orphan_topology` returns
+        // every entity it actually removed for precisely this reason; using
+        // that return value here (rather than discarding it as `let _ =`)
+        // is the fix.
+        let pruned = crate::operations::delete::prune_boolean_orphan_topology(model)?;
+
+        // Shells are not part of the wire entity taxonomy (no `ENTITY_SHELL`,
+        // no `with_deleted_shells` — see `recorder.rs`'s `ENTITY_*`
+        // constants and the identical precedent in
+        // `api-server/src/main.rs::delete_solid_core`), so they are omitted
+        // here too rather than inventing a new kind for one channel only.
+        // Faces, loops, edges, and vertices DO have wire kinds and are
+        // mapped through so the sweep no longer vanishes with no record.
+        use crate::operations::delete::EntityType as PrunedKind;
+        use crate::operations::recorder::{
+            entity_ref, ENTITY_EDGE, ENTITY_FACE, ENTITY_LOOP, ENTITY_VERTEX,
+        };
+        let pruned_refs: Vec<String> = pruned
+            .into_iter()
+            .filter_map(|(kind, id)| match kind {
+                PrunedKind::Face => Some(entity_ref(ENTITY_FACE, id as u64)),
+                PrunedKind::Loop => Some(entity_ref(ENTITY_LOOP, id as u64)),
+                PrunedKind::Edge => Some(entity_ref(ENTITY_EDGE, id as u64)),
+                PrunedKind::Vertex => Some(entity_ref(ENTITY_VERTEX, id as u64)),
+                PrunedKind::Shell | PrunedKind::Solid => None,
+            })
+            .collect();
+
+        // Record the successful operation for attached recorders, now that
+        // both the operand retirement and the orphan-prune sweep have
+        // happened — `deleted` reflects everything this call actually
+        // removed, not just the operand solids.
+        model.record_operation(
+            crate::operations::recorder::RecordedOperation::new(op_kind)
+                .with_parameters(serde_json::json!({
+                    "solid_a": solid_a,
+                    "solid_b": solid_b,
+                    "operation": format!("{:?}", operation),
+                }))
+                .with_input_solids([solid_a as u64, solid_b as u64])
+                .with_output_solids([result_solid as u64])
+                .with_deleted_solids(deleted_solids)
+                .with_deleted_refs(pruned_refs),
+        );
 
         Ok(result_solid)
     })
@@ -28521,6 +28550,176 @@ must be dropped; a 1·tol band rejects it and lets it double the rim"
             v.is_valid,
             "divergent-frustum throat union must be orientation-valid, got errors: {:?}",
             v.errors
+        );
+    }
+
+    /// BUG 2 regression: `record_operation` for a boolean fires with only
+    /// `deleted_solids` (the two retired operand `Solid` records) BEFORE
+    /// `prune_boolean_orphan_topology` runs. The prune sweeps the operand
+    /// husk shells' faces/loops/edges/vertices that the fresh result
+    /// topology never re-references (see the doc comment on
+    /// `prune_boolean_orphan_topology`: the result is "brand-new
+    /// faces/loops/shells"). Whatever the prune removes must show up in
+    /// the same `RecordedOperation.deleted` channel, or those entities
+    /// vanish from the store with no record anywhere — the same defect
+    /// `delete_solid` had before commit 83b0b176 added the `deleted`
+    /// channel and folded its own orphan-prune sweep into it.
+    ///
+    /// Method: snapshot every live Face/Loop/Edge/Vertex id before the
+    /// union, run it with a capturing recorder attached, then diff the
+    /// live ids after against what the `boolean_union` event actually
+    /// declared in `deleted`. Any id that disappeared from the store but
+    /// is not declared is the silent deletion this test catches. Shells
+    /// are excluded from the expectation: they are not part of the wire
+    /// entity taxonomy at all (no `ENTITY_SHELL`, no `with_deleted_shells`
+    /// — see `recorder.rs` and the identical precedent in
+    /// `api-server/src/main.rs::delete_solid_core`), so their omission is
+    /// correct, not the bug.
+    #[test]
+    fn boolean_union_records_prune_swept_entities_in_deleted_channel() {
+        use crate::math::Matrix4;
+        use crate::operations::recorder::{OperationRecorder, RecordedOperation, RecorderError};
+        use crate::operations::transform::{transform_solid, TransformOptions};
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Debug, Default)]
+        struct CaptureRecorder {
+            events: Mutex<Vec<RecordedOperation>>,
+        }
+        impl OperationRecorder for CaptureRecorder {
+            fn record(&self, op: RecordedOperation) -> Result<(), RecorderError> {
+                self.events
+                    .lock()
+                    .expect("CaptureRecorder mutex poisoned")
+                    .push(op);
+                Ok(())
+            }
+        }
+
+        let mut model = BRepModel::new();
+        let a = make_box(&mut model, (10.0, 10.0, 10.0));
+        let b = make_box(&mut model, (10.0, 10.0, 10.0));
+        // Overlap by half so the union genuinely reconstructs topology
+        // (rather than degenerating to a disjoint-union passthrough).
+        transform_solid(
+            &mut model,
+            b,
+            Matrix4::from_translation(&Vector3::new(5.0, 0.0, 0.0)),
+            TransformOptions::default(),
+        )
+        .expect("translate B");
+
+        let faces_before: HashSet<FaceId> = model.faces.iter().map(|(id, _)| id).collect();
+        let loops_before: HashSet<u32> = model.loops.iter().map(|(id, _)| id).collect();
+        let edges_before: HashSet<EdgeId> = model.edges.iter().map(|(id, _)| id).collect();
+        let vertices_before: HashSet<VertexId> = model.vertices.iter().map(|(id, _)| id).collect();
+
+        let rec = Arc::new(CaptureRecorder::default());
+        model.attach_recorder(Some(rec.clone()));
+
+        let _result = boolean_operation(
+            &mut model,
+            a,
+            b,
+            BooleanOp::Union,
+            BooleanOptions::default(),
+        )
+        .expect("union of overlapping boxes must succeed");
+
+        let faces_after: HashSet<FaceId> = model.faces.iter().map(|(id, _)| id).collect();
+        let loops_after: HashSet<u32> = model.loops.iter().map(|(id, _)| id).collect();
+        let edges_after: HashSet<EdgeId> = model.edges.iter().map(|(id, _)| id).collect();
+        let vertices_after: HashSet<VertexId> = model.vertices.iter().map(|(id, _)| id).collect();
+
+        let removed_faces: Vec<FaceId> = faces_before.difference(&faces_after).copied().collect();
+        let removed_loops: Vec<u32> = loops_before.difference(&loops_after).copied().collect();
+        let removed_edges: Vec<EdgeId> = edges_before.difference(&edges_after).copied().collect();
+        let removed_vertices: Vec<VertexId> = vertices_before
+            .difference(&vertices_after)
+            .copied()
+            .collect();
+
+        // Test-setup sanity: this scenario must actually orphan topology,
+        // or the assertions below would pass vacuously and prove nothing.
+        assert!(
+            !removed_faces.is_empty(),
+            "test setup: overlapping-box union must orphan at least one operand \
+             face for this test to be meaningful"
+        );
+
+        let events = rec.events.lock().expect("mutex");
+        let boolean_event = events
+            .iter()
+            .find(|e| e.kind == "boolean_union")
+            .expect("boolean_union operation must be recorded");
+        let declared: HashSet<String> = boolean_event.deleted.iter().cloned().collect();
+
+        for fid in &removed_faces {
+            let want = crate::operations::recorder::entity_ref(
+                crate::operations::recorder::ENTITY_FACE,
+                *fid as u64,
+            );
+            assert!(
+                declared.contains(&want),
+                "face {fid} was pruned as orphan topology but never declared in the \
+                 `deleted` channel (declared={:?})",
+                boolean_event.deleted
+            );
+        }
+        for lid in &removed_loops {
+            let want = crate::operations::recorder::entity_ref(
+                crate::operations::recorder::ENTITY_LOOP,
+                *lid as u64,
+            );
+            assert!(
+                declared.contains(&want),
+                "loop {lid} was pruned as orphan topology but never declared in the \
+                 `deleted` channel (declared={:?})",
+                boolean_event.deleted
+            );
+        }
+        for eid in &removed_edges {
+            let want = crate::operations::recorder::entity_ref(
+                crate::operations::recorder::ENTITY_EDGE,
+                *eid as u64,
+            );
+            assert!(
+                declared.contains(&want),
+                "edge {eid} was pruned as orphan topology but never declared in the \
+                 `deleted` channel (declared={:?})",
+                boolean_event.deleted
+            );
+        }
+        for vid in &removed_vertices {
+            let want = crate::operations::recorder::entity_ref(
+                crate::operations::recorder::ENTITY_VERTEX,
+                *vid as u64,
+            );
+            assert!(
+                declared.contains(&want),
+                "vertex {vid} was pruned as orphan topology but never declared in the \
+                 `deleted` channel (declared={:?})",
+                boolean_event.deleted
+            );
+        }
+
+        // Both operand solids must still be declared too (the pre-existing
+        // half of the channel this fix must not regress).
+        let solid_a_ref = crate::operations::recorder::entity_ref(
+            crate::operations::recorder::ENTITY_SOLID,
+            a as u64,
+        );
+        let solid_b_ref = crate::operations::recorder::entity_ref(
+            crate::operations::recorder::ENTITY_SOLID,
+            b as u64,
+        );
+        assert!(
+            declared.contains(&solid_a_ref),
+            "operand solid a must be declared deleted"
+        );
+        assert!(
+            declared.contains(&solid_b_ref),
+            "operand solid b must be declared deleted"
         );
     }
 }

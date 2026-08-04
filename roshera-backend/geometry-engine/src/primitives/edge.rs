@@ -899,34 +899,38 @@ impl EdgeStore {
         id
     }
 
+    /// The single definition of "does this edge id currently exist".
+    /// `get`, `get_mut`, `iter` and `len` all route through this — see
+    /// the parity comment that used to live on `get` (Task #89) for why
+    /// a second, divergent liveness check at each accessor is the bug,
+    /// not the fix. Edges removed via `remove` write INVALID_EDGE_ID
+    /// into the slot rather than truly deleting it — IDs are stable and
+    /// slots are not reused.
+    #[inline(always)]
+    pub fn is_live(&self, id: EdgeId) -> bool {
+        self.edges
+            .get(id as usize)
+            .is_some_and(|e| e.id != INVALID_EDGE_ID)
+    }
+
     /// Get edge by ID
     #[inline(always)]
     pub fn get(&self, id: EdgeId) -> Option<&Edge> {
-        // Filter sentinels (edges removed via `remove`, which writes
-        // INVALID_EDGE_ID into the slot rather than truly deleting it
-        // — IDs are stable and slots are not reused). Without this
-        // filter `iter()` and `get()` disagree: callers that walk
-        // `iter` correctly skip removed edges, while callers that
-        // `.get(id)` after a remove get back a sentinel `Edge` with
-        // INVALID_VERTEX_ID/INVALID_EDGE_ID — silently corrupting any
-        // downstream logic that proceeds on the assumption that
-        // `Some(&Edge)` means "live edge". See Task #89: this caused
-        // the cylinder-rim fillet to leave the retired rim edge
-        // visible to topology queries even though `remove` had been
-        // called.
-        self.edges
-            .get(id as usize)
-            .filter(|e| e.id != INVALID_EDGE_ID)
+        if self.is_live(id) {
+            self.edges.get(id as usize)
+        } else {
+            None
+        }
     }
 
     /// Get mutable edge by ID
     #[inline(always)]
     pub fn get_mut(&mut self, id: EdgeId) -> Option<&mut Edge> {
-        // Sentinel-filter parity with `get`. See the comment there for
-        // why removed slots must not surface through the lookup API.
-        self.edges
-            .get_mut(id as usize)
-            .filter(|e| e.id != INVALID_EDGE_ID)
+        if self.is_live(id) {
+            self.edges.get_mut(id as usize)
+        } else {
+            None
+        }
     }
 
     /// Remove an edge from the store
@@ -981,7 +985,7 @@ impl EdgeStore {
         self.edges
             .iter()
             .enumerate()
-            .filter(|(_, e)| e.id != INVALID_EDGE_ID)
+            .filter(move |(idx, _)| self.is_live(*idx as EdgeId))
             .map(|(idx, e)| (idx as EdgeId, e))
     }
 
@@ -1140,16 +1144,29 @@ impl EdgeStore {
         }
     }
 
-    /// Number of edges
-    #[inline(always)]
+    /// Number of live edges — agrees with `iter().count()` by
+    /// construction (same `is_live` predicate). O(slot_count); this
+    /// store keeps no separate live counter because `remove` has no
+    /// double-remove guard (see `LoopStore`/`FaceStore`/`ShellStore`
+    /// for the same constraint) and a cached counter would silently
+    /// double-decrement.
+    #[inline]
     pub fn len(&self) -> usize {
-        self.edges.len()
+        self.iter().count()
     }
 
-    /// Check if empty
-    #[inline(always)]
+    /// True if there are no live edges.
+    #[inline]
     pub fn is_empty(&self) -> bool {
-        self.edges.is_empty()
+        self.iter().next().is_none()
+    }
+
+    /// Backing-slot extent (includes tombstoned/removed slots). Callers
+    /// that want "how many live edges" must use [`EdgeStore::len`], not
+    /// this — it is capacity/allocation-extent, not liveness.
+    #[inline(always)]
+    pub fn slot_count(&self) -> usize {
+        self.edges.len()
     }
 }
 
@@ -2207,5 +2224,47 @@ mod tests {
         assert!(s.attach_pcurve(id, 1));
         assert!(s.clear_pcurves(id));
         assert!(s.get(id).expect("edge").pcurves.is_empty());
+    }
+
+    /// Regression lock for BUG 1: `len()`/`is_empty()` must agree with
+    /// `iter().count()` even after removals leave tombstoned slots
+    /// behind. Before the fix, `len()` read `self.edges.len()` (the
+    /// raw backing Vec, tombstones included) while `iter()` filtered
+    /// them out via the `id != INVALID_EDGE_ID` sentinel check — the
+    /// two disagreed after any `remove`.
+    #[test]
+    fn len_agrees_with_iter_count_after_removals() {
+        let mut s = EdgeStore::new();
+        let ids: Vec<EdgeId> = (0..5)
+            .map(|i| {
+                s.add(Edge::new(
+                    0,
+                    i,
+                    i + 1,
+                    0,
+                    EdgeOrientation::Forward,
+                    ParameterRange::unit(),
+                ))
+            })
+            .collect();
+        assert_eq!(s.len(), 5);
+        assert_eq!(s.len(), s.iter().count());
+
+        s.remove(ids[1]);
+        s.remove(ids[3]);
+        assert_eq!(s.len(), 3);
+        assert_eq!(
+            s.len(),
+            s.iter().count(),
+            "len() must agree with iter().count() after removals"
+        );
+        assert!(!s.is_empty());
+
+        for &id in &ids {
+            s.remove(id);
+        }
+        assert_eq!(s.len(), 0);
+        assert_eq!(s.len(), s.iter().count());
+        assert!(s.is_empty());
     }
 }

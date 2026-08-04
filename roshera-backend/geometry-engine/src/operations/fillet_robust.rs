@@ -236,7 +236,7 @@ pub fn compute_safe_fillet_radius(
         .get(edge.end_vertex)
         .ok_or_else(|| MathError::InvalidParameter("Edge end vertex not found in model".into()))?;
 
-    for edge_idx in 0..model.edges.len() {
+    for edge_idx in 0..model.edges.slot_count() {
         let other_edge_id = edge_idx as u32;
         if other_edge_id == edge.id {
             continue;

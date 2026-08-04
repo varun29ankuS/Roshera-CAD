@@ -662,7 +662,7 @@ impl ParallelValidator {
         // validates its output returns `Err`). Only 1b (the conservative
         // curved-surface (u,v)-grid upper bound, an APPROXIMATION) stays a
         // non-blocking `ValidationWarning` — it must never hard-fail a valid op.
-        let face_ids: Vec<FaceId> = (0..model.faces.len() as u32).collect();
+        let face_ids: Vec<FaceId> = (0..model.faces.slot_count() as u32).collect();
         let face_findings: Vec<(Vec<ValidationError>, Vec<ValidationWarning>)> = face_ids
             .par_iter()
             .map(|&face_id| {
@@ -985,7 +985,7 @@ impl ParallelValidator {
 
         // Analyze each face in parallel
         // Note: FaceStore doesn't have par_iter, so we need to collect face IDs first
-        let face_ids: Vec<FaceId> = (0..model.faces.len() as u32).collect();
+        let face_ids: Vec<FaceId> = (0..model.faces.slot_count() as u32).collect();
 
         face_ids.par_iter().for_each(|&face_id| {
             if let Some(face) = model.faces.get(face_id) {
