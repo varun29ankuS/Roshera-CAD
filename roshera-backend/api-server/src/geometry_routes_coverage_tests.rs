@@ -500,19 +500,25 @@ async fn nurbs_loft_closes_sound_and_spans_requested_height() {
 /// volume on top of the source box's volume, and must preserve the host's
 /// UUID (identity-preserving modify, not a replacement).
 ///
-/// KNOWN RED -- production defect, not a test defect: the volume, dims, and
-/// identity assertions all pass (the mesh is a clean, closed 8x8x11 box:
-/// `cert.watertight: true`, `cert.boundary_edges: 0`, exact volume
-/// 704.0000000000003 = 512 + 192). But `perception.sound` comes back
-/// `false` -- `validate_solid_scoped` finds 4 real boundary edges (one on
-/// each of the 4 original side walls, faces 7/8/9/10) where the new upper
-/// wall failed to weld to the original wall at the z=8 seam. This is the
-/// "unified extrusion" merge path (`create_unified_extrusion`, the branch
-/// `extrude_face` takes when the target face already belongs to a parent
-/// solid) -- a path with ZERO other test coverage anywhere in the
-/// geometry-engine suite (grep for `create_unified_extrusion` in `tests/`).
-/// Do not "fix" this test to stop asserting `sound`; that would document a
-/// real defect as correct. See the task report for the full finding.
+/// WAS RED -- and the `sound` assertion is the reason it existed. The
+/// volume, dims, and identity assertions passed from the start (clean,
+/// closed 8x8x11 mesh: `cert.watertight: true`, `cert.boundary_edges: 0`,
+/// exact volume 704.0000000000003 = 512 + 192), but `perception.sound`
+/// came back `false`: `validate_solid_scoped` found 4 real boundary edges
+/// (one per original side wall) where the new upper wall failed to weld to
+/// the original wall at the z=8 seam.
+///
+/// Root cause, fixed in `create_unified_extrusion` (`operations/extrude.rs`,
+/// the branch `extrude_face` takes when the target face already belongs to
+/// a parent solid, and a path that had ZERO coverage anywhere): it
+/// DEEP-CLONED the host faces it retained, so the retained walls got a
+/// private copy of the pulled face's loop edges while the new walls were
+/// stitched onto the ORIGINAL ones -- the z=8 seam ring existed twice and
+/// nothing welded them. The retained faces are now reused by identity, so
+/// the seam is shared by construction. Never weaken the `sound` assertion
+/// here: it is the only assertion that could see the defect at all --
+/// volume, dims, identity, and even mesh watertightness all read correct on
+/// the broken solid.
 #[tokio::test]
 async fn face_extrude_adds_footprint_times_distance_volume() {
     let state = make_test_state().await;

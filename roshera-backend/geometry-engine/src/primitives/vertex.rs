@@ -1263,12 +1263,12 @@ mod tests {
         // Remove a couple of vertices, leaving tombstoned slots behind.
         assert!(s.remove(ids[1]));
         assert!(s.remove(ids[4]));
-        assert_eq!(s.len(), 4);
         assert_eq!(
             s.len(),
             s.iter().count(),
             "len() must agree with iter().count() after removals"
         );
+        assert_eq!(s.len(), 4);
         assert!(!s.is_empty());
 
         // Remove the rest; len/is_empty/iter must all agree on empty too.

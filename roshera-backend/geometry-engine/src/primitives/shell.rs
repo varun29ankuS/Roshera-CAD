@@ -1448,12 +1448,12 @@ mod shell_store_liveness_tests {
 
         store.remove(ids[1]);
         store.remove(ids[3]);
-        assert_eq!(store.len(), 3);
         assert_eq!(
             store.len(),
             store.iter().count(),
             "len() must agree with iter().count() after removals"
         );
+        assert_eq!(store.len(), 3);
         assert!(!store.is_empty());
 
         for &id in &ids {

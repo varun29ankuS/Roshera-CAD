@@ -2252,12 +2252,12 @@ mod tests {
 
         s.remove(ids[1]);
         s.remove(ids[3]);
-        assert_eq!(s.len(), 3);
         assert_eq!(
             s.len(),
             s.iter().count(),
             "len() must agree with iter().count() after removals"
         );
+        assert_eq!(s.len(), 3);
         assert!(!s.is_empty());
 
         for &id in &ids {
