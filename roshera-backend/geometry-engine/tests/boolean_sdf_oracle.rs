@@ -342,7 +342,7 @@ fn sphere_box_near_points() -> Vec<Point3> {
 }
 
 /// FINDING (this oracle, first run): fails with 9/124 compared points
-/// disagreeing. Localized to the QUERY layer, not the boolean:
+/// disagreeing. NOT the boolean:
 ///   * The result's volume is 2094.3245 vs the analytic hemisphere
 ///     `(2/3)*pi*r^3` = 2094.3951 (0.003% error) — `reconstruct_topology`
 ///     built the right shape.
@@ -352,31 +352,118 @@ fn sphere_box_near_points() -> Vec<Point3> {
 ///     independently checked against the closed-form sphere/box distance
 ///     and are correct (e.g. `(2,-2,-2)`: distance to sphere centre
 ///     `(10,0,0)` is `sqrt(72)=8.485 < 10` → genuinely inside the sphere).
-///   * At `(2,-2,-2)`, `nearest_on_solid` on the RESULT returns face 7
-///     (a flat box-derived face) at distance 8, when the analytic nearest
-///     distance is to the spherical cap at `10 - sqrt(72) ~= 1.5147` — the
-///     curved trimmed face is not being found as the nearest candidate at
-///     that point. That is consistent with `raycast_all`'s ray-parity also
-///     going wrong nearby, which is what actually flips the Inside/Outside
-///     answer this test checks.
+///
+/// ## Root cause — measured, and NOT where this comment used to say
+///
+/// This comment previously recorded the diagnosis "a curved trimmed face is
+/// never even tried as a nearest candidate" in `nearest_on_solid`. That is
+/// DISPROVED. Instrumenting the intersection result directly (probe point
+/// `(2,-2,-2)`, the two-face shell `[7, 8]`):
+///
+///   * face 8 IS the spherical cap, and `nearest_on_solid`'s face pass DOES
+///     generate its candidate correctly. `Sphere::closest_point` returns
+///     `(u,v) = (3.3865713167166573, 1.808737451625105)`, `point_at` gives
+///     `(0.571909584179366, -2.3570226039551576, -2.3570226039551585)`, and
+///     the distance is `1.5147186257614298` — exactly the analytic
+///     `|p - centre| - r = 10 - sqrt(72)`. The candidate is right.
+///   * It is then THROWN AWAY by the trim test at `queries/point.rs:79-81`.
+///     `point_inside_face_uv` → `tessellation::surface::is_point_inside_face`
+///     short-circuits (that fn's first block) through
+///     `operations::boolean::spherical_circular_membership`, which returns
+///     `Some(false)` for this point.
+///   * WHY it returns `Some(false)`: the `on_kept_side` closure
+///     (`operations/boolean.rs`, in `spherical_circular_membership`) decides
+///     which cap an outer circular trim loop keeps by comparing the query
+///     point's side of the trim plane against THE SPHERE CENTRE's side. This
+///     fixture translates the sphere so its centre lands exactly ON the box's
+///     +X face plane (`x = 10`) — the trim is a GREAT circle. So
+///     `point_plane_sidedness(n, c, centre)` is `Ordering::Equal`, `on_far` is
+///     `false` for EVERY query point, and an outer loop (`keep_far = true`)
+///     rejects the ENTIRE face. That closure's own comment already states the
+///     behaviour ("an exactly-on-plane centre (a true great circle) has NO far
+///     cap and reports `on_far = false` for every point") — it is documented,
+///     but it is wrong for a face that genuinely IS a hemisphere.
+///
+/// ONE predicate, TWO symptoms — which is why a `nearest_on_solid`-only fix
+/// could not turn this test green:
+///   * `nearest_on_solid` skips the cap and returns face 7 (the flat
+///     box-derived disk) at distance `8.0` instead of face 8 at `1.5147`;
+///   * `raycast_all` gates every hit through the SAME predicate
+///     (`queries/raycast.rs:213`), so every crossing of the cap is dropped,
+///     the parity count loses crossings, and Inside/Outside flips. The parity
+///     flip is what this test's mismatches actually measure — at `(2,-2,-2)`
+///     `raycast_all` returns ZERO hits (even ⇒ `Outside`) where the truth is
+///     `Inside`.
+///
+/// ## Why the obvious minimal fix is NOT taken
+///
+/// "Decline (`None`) when the trim plane contains the sphere centre, and let
+/// the legacy winding test decide" works HERE and only here. Measured, same
+/// instrumentation:
+///   * this pose (cut plane `x=10`, sphere north_dir `+Z`): the cut is a
+///     MERIDIAN great circle, so its UV footprint is a genuine rectangle
+///     `u in [pi/2, 3pi/2] x v in [0, pi]`, signed area `-9.540618`, winding
+///     `-1.0` at the query `(u,v)` → the winding test would answer CORRECTLY.
+///   * the symmetric pose (sphere translated `(0,0,10)` instead, cut plane
+///     `z=10` PERPENDICULAR to north_dir): the cut is an EQUATORIAL great
+///     circle, iso-`v`, UV signed area `1.776357e-15`. That is below
+///     `is_point_inside_loop`'s `DEGENERATE_AREA_TOL`, so it returns
+///     `is_outer` = `true` and accepts the WHOLE sphere.
+/// So the minimal fix swaps "rejects everything" for "accepts everything" on a
+/// pose a user reaches simply by seating the sphere on the box's +Z face
+/// instead of its +X face. That is a special case that passes this fixture and
+/// breaks its mirror image, so it is deliberately not shipped.
+///
+/// ## The fix this needs (not in the query layer)
+///
+/// Replace the sphere-CENTRE reference in `on_kept_side` with a reference
+/// derived from the trim curve's own traversal: at a sample point on the loop
+/// take the co-edge tangent `T` (loop orientation flag and `face.orientation`
+/// applied) and the face's outward normal `N`; the in-face direction is
+/// `D = N x T`, and the kept side is `sign((p - c).n) == sign(D.n)`. It never
+/// mentions the surface type, so it generalises to `conical_band_membership`
+/// and to any planar-trimmed surface, and it is well-conditioned exactly where
+/// the centre reference dies: measured `D.n = -1.0` — the correct kept side —
+/// in BOTH great-circle poses, including the equatorial one where the winding
+/// fallback degenerates.
+///
+/// BLOCKER, and why this is filed rather than fixed: that construction needs
+/// co-edge orientation to be trustworthy in `reconstruct_topology` output, and
+/// it is not. In the OFF-CENTRE pose (sphere translated `(14,0,0)`, an
+/// ordinary small cap, which the current centre heuristic happens to get
+/// right) the two faces of the two-face shell traverse the shared rim
+/// IDENTICALLY — face 7 walks edges `[13,14,15]` as `v 8->9, 9->10, 10->8`
+/// with flags `[true, true, true]`, and face 8 walks the SAME edges with the
+/// SAME vertices and the SAME flags — which a closed 2-manifold forbids (the
+/// two faces adjacent to an edge must traverse it oppositely). The two
+/// great-circle poses DO get this right (face 7 `[15,16,17]` forward, face 8
+/// `[17,16,15]` with `[false,false,false]`). So co-edge integrity in boolean
+/// output must be established first, with its own red test, before a
+/// co-edge-derived membership predicate can be trusted.
+///
 /// `spatial_query_core.rs`'s own cylinder/sphere probes do not cover this:
 /// they deliberately avoid axis/seam-adjacent points (see that file's
 /// comments), so this is a real gap this independent oracle closes.
-/// Pinned #[ignore] (fails today) — flip on when the query-layer trimmed-
-/// curved-face nearest/parity defect is fixed.
 ///
-/// CONFIRMED STILL A SEPARATE DEFECT after the `cylinder_box_straddle`
-/// fix below (`Surface::exact_uv`, the `Cylinder`/`Cone` height-clamp
-/// bug in raycast trim-checking): re-run unmodified, this case still
-/// fails at exactly 9/124 — that fix does not touch `Sphere` (its
-/// `closest_point` never clamps `u`/`v` to `param_limits` in the first
-/// place) nor `nearest_on_solid`'s face-CANDIDATE selection, which is
-/// what this case actually needs (a curved trimmed face is never even
-/// tried as a nearest candidate, not a boundary mis-clamp). Still
-/// pinned #[ignore] for that reason, root cause not yet fixed.
+/// CONFIRMED A SEPARATE DEFECT from the `cylinder_box_straddle` fix below
+/// (`Surface::exact_uv`, the `Cylinder`/`Cone` height-clamp bug in raycast
+/// trim-checking): re-run unmodified, this case still fails at exactly 9/124.
+/// That fix does not touch `Sphere` (its `closest_point` never clamps `u`/`v`
+/// to `param_limits` in the first place) and, per the measurements above, this
+/// case is not a boundary mis-clamp at all.
+///
+/// ⚠ SERVED LIVE: `signed_distance` (`queries/field.rs`) returns
+/// `nearest_on_solid`'s magnitude and face id unchanged, so the agent-facing
+/// `signed_distance` endpoint reports `8.0` on face 7 where the truth is
+/// `1.5147` on face 8. That is wrong in the equatorial pose too, where
+/// `classify_point` happens to come out right by luck — so the live harm is
+/// broader than the Inside/Outside flip this test pins.
 #[test]
-#[ignore = "query-layer (nearest_on_solid/raycast_all) misses the curved \
-            trimmed face on a sphere-cap boolean result — see doc comment"]
+#[ignore = "spherical_circular_membership's sphere-centre reference degenerates \
+            on a GREAT-circle trim and rejects the whole cap face, poisoning \
+            both nearest_on_solid and raycast_all parity; fix belongs in \
+            operations/boolean.rs and is blocked on co-edge integrity — see \
+            doc comment"]
 fn sphere_box_face_straddle_intersection_matches_set_membership() {
     let stats = run_oracle(
         sphere_box_face_straddle,
