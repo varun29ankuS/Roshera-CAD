@@ -178,11 +178,29 @@ pub fn nurbs_loft(
             ParameterRange::new(0.0, 1.0),
         ));
 
-        // ---- loops (edge directions identical to create_cylinder_topology so
-        //      every shared edge is used once forward + once backward ⇒
-        //      2-manifold ⇒ watertight). ----
+        // ---- loops. The kernel's stored-walk convention is CCW about the
+        //      SURFACE normal (`FaceOrientation` then maps surface normal to
+        //      outward), which is what makes two manifold-adjacent faces
+        //      traverse a shared edge in opposite EFFECTIVE senses — the
+        //      co-edge opposition a closed 2-manifold requires.
+        //
+        //      * Caps: each cap plane's stored normal IS the Newell normal of
+        //        its section ring (`fit_section_plane`), and Newell's normal
+        //        is by definition the one the ring winds CCW about — so the
+        //        ring edge traversed FORWARD is the conforming stored sense
+        //        for BOTH caps, for every section winding. (The previous
+        //        `bottom_edge, false` opposed the lateral's RAW sense but
+        //        collided with it in the EFFECTIVE convention on every
+        //        winding — measured 2026-08-05, and whole-loop reversal of
+        //        the cap was verified weld-safe: every mesh oracle and the
+        //        volume were unchanged. See
+        //        `tests/coedge_orientation_invariant.rs`.)
+        //      * Lateral (below): bottom ring forward at v=0, top ring
+        //        backward at v=1 — the UV rectangle boundary traversed CCW in
+        //        (u, v), i.e. CCW about du×dv, the intrinsic normal, for any
+        //        section data.
         let mut bottom_loop = Loop::new(0, LoopType::Outer);
-        bottom_loop.add_edge(bottom_edge, false);
+        bottom_loop.add_edge(bottom_edge, true);
         let bottom_loop_id = model.loops.add(bottom_loop);
 
         let mut top_loop = Loop::new(0, LoopType::Outer);

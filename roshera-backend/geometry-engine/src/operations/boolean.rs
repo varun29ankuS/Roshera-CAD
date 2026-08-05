@@ -19158,6 +19158,222 @@ fn reconstruct_topology(
     Ok(solid_id)
 }
 
+/// Number of polyline samples used per (possibly curved) edge when measuring a
+/// minted walk's rotational sense in [`orient_minted_walk_material_left`].
+/// Enough to resolve the sense of a full circle stored as a single closed
+/// edge; the measure is a whole-loop aggregate, not a per-sample verdict, so
+/// modest sampling is sufficient.
+const WALK_SENSE_SAMPLES_PER_EDGE: usize = 12;
+
+/// Deterministically orient a freshly-minted boundary walk so the face's
+/// material lies on the LEFT of the walk in the frame of the face's SURFACE
+/// normal.
+///
+/// This is the loop convention every primitive/extrude builder emits: the
+/// stored walk is CCW about the surface's intrinsic normal, and
+/// `FaceOrientation` maps the surface normal to the outward normal. Together
+/// they are exactly what makes two manifold-adjacent faces traverse a shared
+/// edge in opposite EFFECTIVE senses (stored sense XOR `FaceOrientation::
+/// Backward`) — the co-edge opposition a closed 2-manifold requires. Note the
+/// rule reads only the SURFACE normal, never `FaceOrientation`: a Difference
+/// flips B-origin face orientations at the minting seam, and that flip alone
+/// must carry the walk reversal, exactly as it does for passthrough faces.
+///
+/// Why this exists: the split pipeline's cycle walks (`order_loop`, the DCEL
+/// `extract_regions`, the cap builders) produce a CONNECTED walk whose
+/// rotational sense is an artifact of which edge happened to come first. Two
+/// faces sharing a cut circle each run their own endpoint-chaining walk over
+/// the SAME edge list, so both sides can mint IDENTICAL senses — observed on
+/// the off-centre sphere ∩ box cap, where the spherical cap and the planar
+/// disc both walked `v8 → v9 → v10 → v8` with flags `[true, true, true]`, a
+/// pairing a closed 2-manifold forbids. The walk's sense is a per-loop binary
+/// degree of freedom; this function is the generator's single,
+/// surface-agnostic rule for choosing it.
+///
+/// Decision: sample the walk into a 3D polyline (respecting each pair's
+/// vertex-level direction) and accumulate `(N_s × T) · (ref − mid)` over its
+/// segments — `N_s` the surface normal at the segment midpoint's projection,
+/// `T` the walk tangent, `ref` a reference point whose choice depends on the
+/// loop kind:
+///
+/// * **Outer loop** — `ref` is a point of face MATERIAL (the split face's
+///   interior sample); the sum is positive iff material sits on the left.
+///   For a PLANAR face the sum is exactly twice the loop's signed area about
+///   `N_s` (the shoelace identity `(N × T) · (ref − mid) = N · ((p₁−ref) ×
+///   (p₂−ref))`, ref-independent and convexity-independent — so a planar
+///   outer loop may fall back to the sample centroid even when that centroid
+///   lands inside a hole). On a sphere cap the per-segment term keeps the
+///   sign `sin θ > 0` for the correct sense regardless of cap size — in
+///   particular it is NON-degenerate for a great-circle cut, where both a UV
+///   shoelace and a Newell-normal test vanish identically. A CURVED outer
+///   loop without an interior sample is declined: on a sphere the centroid
+///   reference mis-signs a larger-than-hemisphere cap, and a guess is worse
+///   than the upstream order.
+///
+/// * **Hole loop** — the reference must be a LOCAL anti-reference, not a
+///   global material point: on a plane the shoelace identity makes any fixed
+///   material `ref` reduce to the enclosed signed area, which for a hole has
+///   the OPPOSITE sign the local material-side argument suggests. Using the
+///   hole's own sample centroid `c_h` and accumulating `(N_s × T) ·
+///   (mid − c_h)` (away-from-hole = material side) is sign-correct on both
+///   the plane (`= −2 ×` enclosed area: a correct CW hole scores positive)
+///   and the sphere (a correct far-cap hole rim scores `|h| · r > 0` from
+///   either pole). A great-circle hole (`h = 0`) is indecisive and declines.
+///
+/// Honesty: when the measure is not decisive (aggregate below the angular
+/// tolerance, degenerate geometry, or an unresolved projection) the walk is
+/// left exactly as produced — this function only applies a whole-loop
+/// reversal it can justify geometrically; it never fabricates an
+/// orientation. It is applied ONLY to walks the boolean itself minted
+/// (`SplitFace::was_split`): passthrough faces keep their producer's stored
+/// senses verbatim, because the blend/loft builders deliberately decouple
+/// loop sense from orientation (see `check_face_orientations` in
+/// `primitives/validation.rs`) and re-winding them would tear their welded
+/// tessellation seams.
+fn orient_minted_walk_material_left(
+    model: &BRepModel,
+    surface_id: SurfaceId,
+    walk: &mut [(EdgeId, bool)],
+    material_ref: Option<Point3>,
+    tolerance: &Tolerance,
+    is_hole: bool,
+) {
+    if walk.is_empty() {
+        return;
+    }
+
+    // --- Sample the walk into an ordered 3D polyline. ---
+    let mut pts: Vec<Point3> = Vec::new();
+    for &(eid, fwd) in walk.iter() {
+        let Some(edge) = model.edges.get(eid) else {
+            return; // dangling reference: decline, leave the walk untouched
+        };
+        let Some(curve) = model.curves.get(edge.curve_id) else {
+            return;
+        };
+        let Ok(sub) = curve.subcurve(edge.param_range.start, edge.param_range.end) else {
+            return;
+        };
+        let mut seg: Vec<Point3> = Vec::with_capacity(WALK_SENSE_SAMPLES_PER_EDGE + 1);
+        for k in 0..=WALK_SENSE_SAMPLES_PER_EDGE {
+            let t = k as f64 / WALK_SENSE_SAMPLES_PER_EDGE as f64;
+            match sub.point_at(t) {
+                Ok(p) => seg.push(p),
+                Err(_) => return,
+            }
+        }
+        if seg.len() < 2 {
+            return;
+        }
+        // Orient the samples along the WALK direction. The walk sense is
+        // vertex-level (`true` = start_vertex first), so anchor on the tail
+        // vertex when the two subcurve ends are geometrically distinct; a
+        // closed edge (full circle: both ends coincide) falls back to the
+        // sense flag on the parameter direction — the same convention
+        // `face_outer_polyline_2d` uses.
+        let tail_vid = if fwd {
+            edge.start_vertex
+        } else {
+            edge.end_vertex
+        };
+        let anchored = model.vertices.get(tail_vid).and_then(|tv| {
+            let tp = Point3::new(tv.position[0], tv.position[1], tv.position[2]);
+            let d_first = (seg[0] - tp).magnitude();
+            let d_last = (seg[seg.len() - 1] - tp).magnitude();
+            ((d_first - d_last).abs() > tolerance.distance()).then_some(d_last < d_first)
+        });
+        let reverse_samples = match anchored {
+            Some(last_is_tail) => last_is_tail,
+            None => !fwd,
+        };
+        if reverse_samples {
+            seg.reverse();
+        }
+        pts.extend(seg);
+    }
+    if pts.len() < 3 {
+        return;
+    }
+
+    let Some(surface) = model.surfaces.get(surface_id) else {
+        return;
+    };
+
+    // --- Reference point, per the loop-kind rules in the doc above. ---
+    let sample_centroid = || -> Point3 {
+        let inv = 1.0 / pts.len() as f64;
+        let mut c = Vector3::new(0.0, 0.0, 0.0);
+        for p in &pts {
+            c = c + Vector3::new(p.x, p.y, p.z);
+        }
+        Point3::new(c.x * inv, c.y * inv, c.z * inv)
+    };
+    let refp = if is_hole {
+        // Anti-reference: the hole's own centroid; the accumulation below
+        // negates the term so "away from the hole" counts as material.
+        sample_centroid()
+    } else {
+        match material_ref {
+            Some(p) => p,
+            None => {
+                // Ref-independent for a plane (shoelace identity); a guess
+                // for a curved outer loop — decline those.
+                if surface.surface_type() != SurfaceType::Plane {
+                    return;
+                }
+                sample_centroid()
+            }
+        }
+    };
+
+    // --- Aggregate the material-side measure over the polyline. ---
+    let mut score = 0.0_f64;
+    let mut weight = 0.0_f64;
+    for w in pts.windows(2) {
+        let t_vec = w[1] - w[0];
+        let len = t_vec.magnitude();
+        if len <= tolerance.distance() {
+            continue;
+        }
+        let mid = w[0] + t_vec * 0.5;
+        let Ok((u, v)) = surface.closest_point(&mid, *tolerance) else {
+            continue;
+        };
+        let Ok(ns) = surface.normal_at(u, v) else {
+            continue;
+        };
+        let Ok(ns) = ns.normalize() else {
+            continue;
+        };
+        let toward_ref = refp - mid;
+        let ref_len = toward_ref.magnitude();
+        if ref_len <= tolerance.distance() {
+            continue;
+        }
+        // Material direction: toward the interior sample for an outer loop,
+        // AWAY from the hole centroid for a hole loop.
+        let material_dir = if is_hole {
+            toward_ref * -1.0
+        } else {
+            toward_ref
+        };
+        score += ns.cross(&t_vec).dot(&material_dir);
+        weight += len * ref_len;
+    }
+    if weight <= 0.0 {
+        return;
+    }
+
+    // Reverse only on a DECISIVE clockwise verdict; an aggregate within the
+    // angular tolerance of zero is not evidence.
+    if score < -(tolerance.angle() * weight) {
+        walk.reverse();
+        for pair in walk.iter_mut() {
+            pair.1 = !pair.1;
+        }
+    }
+}
+
 /// Build shells from selected faces.
 ///
 /// Creates proper B-Rep topology: for each face, create a Loop from its boundary edges,
@@ -20145,22 +20361,42 @@ fn build_shells_from_faces(
             // cycle traversed an edge end→start: downstream loop
             // walkers (`Loop::vertices`, classification, sweep, offset)
             // then read vertices in the wrong order.
-            let mut face_loop =
-                crate::primitives::r#loop::Loop::new(0, crate::primitives::r#loop::LoopType::Outer);
-            for &(edge_id, fwd) in &split_face.boundary_edges {
-                face_loop.add_edge(edge_id, fwd);
-            }
+            let mut outer_walk: Vec<(EdgeId, bool)> = split_face.boundary_edges.clone();
 
             // If the split face has no boundary edges, copy from original face
-            if split_face.boundary_edges.is_empty() {
+            if outer_walk.is_empty() {
                 if let Some(orig_face) = model.faces.get(split_face.original_face) {
                     if let Some(orig_loop) = model.loops.get(orig_face.outer_loop) {
                         for (i, &eid) in orig_loop.edges.iter().enumerate() {
                             let fwd = orig_loop.orientations.get(i).copied().unwrap_or(true);
-                            face_loop.add_edge(eid, fwd);
+                            outer_walk.push((eid, fwd));
                         }
                     }
                 }
+            }
+
+            // Co-edge opposition (the closed-2-manifold invariant): a walk the
+            // boolean itself minted has an ARBITRARY rotational sense (an
+            // artifact of the cycle walk's starting edge), so calibrate it to
+            // the kernel's loop convention — material on the left about the
+            // SURFACE normal. Passthrough faces (`was_split == false`) keep
+            // their producer's stored senses verbatim; see
+            // `orient_minted_walk_material_left` for why.
+            if split_face.was_split {
+                orient_minted_walk_material_left(
+                    model,
+                    split_face.surface,
+                    &mut outer_walk,
+                    split_face.interior_point,
+                    &options.common.tolerance,
+                    false,
+                );
+            }
+
+            let mut face_loop =
+                crate::primitives::r#loop::Loop::new(0, crate::primitives::r#loop::LoopType::Outer);
+            for &(edge_id, fwd) in &outer_walk {
+                face_loop.add_edge(edge_id, fwd);
             }
 
             let loop_id = model.loops.add(face_loop);
@@ -20182,11 +20418,27 @@ fn build_shells_from_faces(
                 if hole.is_empty() {
                     continue;
                 }
+                // Same calibration as the outer walk, hole flavour: the
+                // material side of a hole edge is AWAY from the hole, so the
+                // measure runs against the hole's own centroid as an
+                // anti-reference (see `orient_minted_walk_material_left` for
+                // why a global material point mis-signs a planar hole).
+                let mut hole_walk: Vec<(EdgeId, bool)> = hole.clone();
+                if split_face.was_split {
+                    orient_minted_walk_material_left(
+                        model,
+                        split_face.surface,
+                        &mut hole_walk,
+                        None,
+                        &options.common.tolerance,
+                        true,
+                    );
+                }
                 let mut hole_loop = crate::primitives::r#loop::Loop::new(
                     0,
                     crate::primitives::r#loop::LoopType::Inner,
                 );
-                for &(edge_id, fwd) in hole {
+                for &(edge_id, fwd) in &hole_walk {
                     hole_loop.add_edge(edge_id, fwd);
                 }
                 inner_loop_ids.push(model.loops.add(hole_loop));
