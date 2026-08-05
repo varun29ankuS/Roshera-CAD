@@ -48,6 +48,29 @@ export interface CheckpointSummary {
   description: string
   /** `[first, last]` event sequence numbers this decision covers. */
   event_range: [number, number]
+  /**
+   * The branch this checkpoint was created against — `"main"` for the
+   * trunk, otherwise the branch UUID (`CheckpointSummary::branch_id`,
+   * populated via `branch_ref_string` in `handlers/timeline.rs`).
+   * `event_range` indexes into THIS branch's sequence numbers:
+   * sequence numbers are per DOCUMENT, not per branch, so a branch
+   * that forked from a shared prefix genuinely carries the same
+   * numbers a sibling branch (or the trunk) does. `checkpointCovering`
+   * below is the only reader and requires this field to avoid
+   * attributing one branch's declared decision to another branch's
+   * identically-numbered event.
+   *
+   * Optional here only because the wire type can't force it: the
+   * current backend always sends it (pre-field persisted checkpoints
+   * default to `"main"` at deserialize time —
+   * `timeline-engine/src/types.rs:174-179` — so even old rows arrive
+   * populated). An absent value here means this response came from a
+   * backend build that predates the field entirely (frontend/backend
+   * version skew), not stale data. See `checkpointCovering` for how
+   * that case is handled — it is NOT treated as "matches every
+   * branch".
+   */
+  branch_id?: string
   author: string
   timestamp: string // ISO 8601 (RFC 3339) — NOT epoch ms
   tags: string[]
@@ -113,18 +136,62 @@ export function checkpointNameRefusal(name: string): string | null {
   return null
 }
 
+// The all-zero UUID (`Uuid::nil()`) every branch-listing endpoint
+// (`GET /api/branches`, `BranchView::id`) spells the trunk as. A
+// checkpoint spells the SAME branch differently — the literal string
+// `"main"` — because `branch_id` round-trips through endpoints
+// (`POST /api/branches/select`, …) that accept `"main"` as the
+// well-known label. The two spellings must be reconciled before any
+// equality check; `canonicalBranchId` is that reconciliation, kept
+// private because `checkpointCovering` is the only caller that needs
+// it. (`Timeline.tsx` and `TimelineGraph.tsx` each independently
+// define this same literal for their own branch bookkeeping — see
+// their `MAIN_BRANCH_ID` — this module stays consistent with both by
+// construction, not by importing across them.)
+const MAIN_BRANCH_ID = '00000000-0000-0000-0000-000000000000'
+
+function canonicalBranchId(id: string): string {
+  return id === 'main' ? MAIN_BRANCH_ID : id
+}
+
 /**
- * The declared intent covering event `sequence`, or `null` when nobody
- * named this span of history. Ranges may overlap (a later, more specific
- * declaration over an earlier broad one) — the LAST covering checkpoint
- * in list order wins, matching "most recently declared intent".
+ * The declared intent covering event `sequence` **on `branchId`**, or
+ * `null` when nobody named this span of history on that branch.
+ *
+ * `branchId` is required, not optional. Sequence numbers are per
+ * DOCUMENT, not per branch — a branch that forked from a shared prefix
+ * genuinely carries the same numbers a sibling branch (or the trunk)
+ * does. Matching by `event_range` alone — this function's original
+ * behaviour — would therefore attribute one branch's declared decision
+ * to another branch's identically-numbered event: exactly the failure
+ * `timeline_engine::Checkpoint`'s own doc comment
+ * (`timeline-engine/src/types.rs:169-179`) names. Every checkpoint is
+ * filtered to `branchId` FIRST; only among the survivors does the
+ * range comparison run.
+ *
+ * The one assumption this function still makes: a checkpoint whose
+ * `branch_id` the payload omitted is treated as belonging to `"main"`,
+ * mirroring the backend's own default for pre-field persisted rows
+ * (`BranchId::main`) — chosen deliberately over "matches every branch",
+ * which would silently resurrect range-only matching for exactly the
+ * payloads most likely to be old and cross-branch. Every OTHER match is
+ * a real checkpoint, on its recorded branch, covering the recorded
+ * sequence — nothing else here is guessed.
+ *
+ * Ranges may overlap within a branch (a later, more specific
+ * declaration over an earlier broad one) — the LAST covering
+ * checkpoint in list order wins, matching "most recently declared
+ * intent".
  */
 export function checkpointCovering(
   checkpoints: CheckpointSummary[],
   sequence: number,
+  branchId: string,
 ): CheckpointSummary | null {
+  const target = canonicalBranchId(branchId)
   let found: CheckpointSummary | null = null
   for (const cp of checkpoints) {
+    if (canonicalBranchId(cp.branch_id ?? 'main') !== target) continue
     const [a, b] = cp.event_range
     if (sequence >= a && sequence <= b) found = cp
   }

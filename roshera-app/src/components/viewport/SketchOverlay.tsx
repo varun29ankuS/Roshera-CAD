@@ -364,6 +364,9 @@ export function SketchOverlay() {
   const addCSketchLine = useSceneStore((s) => s.addCSketchLine)
   const addCSketchCircle = useSceneStore((s) => s.addCSketchCircle)
   const addCSketchConstraint = useSceneStore((s) => s.addCSketchConstraint)
+  const recordInferenceFilterResult = useSceneStore(
+    (s) => s.recordInferenceFilterResult,
+  )
   // `pid` is set when the first click of a line gesture landed on
   // an existing csketch point (via D-2-c snap reuse). Carrying it
   // through to the second-click commit lets us skip the redundant
@@ -611,8 +614,11 @@ export function SketchOverlay() {
               // D-2-d: auto-apply inference proposals against the
               // just-committed point. Coincident /
               // PointOnCurve / Midpoint are the common picks; all
-              // arrive via `point_self`.
-              await applyInferredConstraints(
+              // arrive via `point_self`. The result is folded into the
+              // store's running disclosure so the viewport HUD can show
+              // anything the confidence threshold dropped — see the
+              // module doc on `AUTO_APPLY_CONFIDENCE_THRESHOLD`.
+              const inferResult = await applyInferredConstraints(
                 id,
                 {
                   kind: 'point',
@@ -621,6 +627,7 @@ export function SketchOverlay() {
                 { point_self: pid },
                 addCSketchConstraint,
               )
+              recordInferenceFilterResult(inferResult)
             })()
             return
           }
@@ -667,8 +674,9 @@ export function SketchOverlay() {
               // dedupes against constraints already applied via
               // snap-driven point reuse, so calling this even
               // when both endpoints came from existing points
-              // (`first.pid` + `reusePid`) stays cheap.
-              await applyInferredConstraints(
+              // (`first.pid` + `reusePid`) stays cheap. Same
+              // disclosure hand-off as the point case above.
+              const inferResult = await applyInferredConstraints(
                 id,
                 {
                   kind: 'line',
@@ -682,6 +690,7 @@ export function SketchOverlay() {
                 },
                 addCSketchConstraint,
               )
+              recordInferenceFilterResult(inferResult)
             })()
             return
           }
@@ -713,8 +722,9 @@ export function SketchOverlay() {
               // Concentric / Equal proposals against existing
               // circles, both arriving via `circle_self`.
               // `circle_center` proposals are dropped inside the
-              // helper — see csketch-inference.ts module doc.
-              await applyInferredConstraints(
+              // helper — see csketch-inference.ts module doc. Same
+              // disclosure hand-off as the point case above.
+              const inferResult = await applyInferredConstraints(
                 id,
                 {
                   kind: 'circle',
@@ -724,6 +734,7 @@ export function SketchOverlay() {
                 { circle_self: cid },
                 addCSketchConstraint,
               )
+              recordInferenceFilterResult(inferResult)
             })()
             return
           }
@@ -796,6 +807,7 @@ export function SketchOverlay() {
       addCSketchLine,
       addCSketchCircle,
       addCSketchConstraint,
+      recordInferenceFilterResult,
     ],
   )
 

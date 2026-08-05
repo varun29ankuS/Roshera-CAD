@@ -209,11 +209,11 @@ interface OpNodeData extends Record<string, unknown> {
   isActiveBranch: boolean
   liveNames: Map<string, string>
   /** The DECLARED intent covering this operation — a checkpoint name read
-   *  off the real checkpoint list, never inferred. `undefined` when no
-   *  checkpoint covers it. Root-branch only: checkpoint `event_range`s
-   *  index the main timeline's sequences, so applying them to a child
-   *  branch's post-fork sequences would mislabel spans that merely share
-   *  numbers. */
+   *  off the real checkpoint list, filtered to THIS card's own branch
+   *  before the sequence-range match runs, never inferred from adjacency
+   *  or guessed from a range overlap alone (`checkpointCovering` in
+   *  `lib/timeline-events.ts`). `undefined` when no checkpoint on this
+   *  branch covers it. */
   intent?: string
   /** In-edges this lane could not draw because the producer sits before
    *  this branch's fork point (it lives on the parent's lane). Disclosed
@@ -288,9 +288,12 @@ function OpNode({ data }: NodeProps<Node<OpNodeData>>) {
     >
       <Handle type="target" position={Position.Left} style={{ background: branchStroke, opacity: unlinked ? 0 : 0.6 }} />
       <div className={`${unlinked ? 'px-2.5' : familyExtraPaddingX(family)} py-1.5`}>
-        {/* Line 0 — the DECLARED intent, when a real checkpoint covers this
-            operation. Read off the checkpoint list, never inferred.
-            Neutral text — colour stays reserved for state. */}
+        {/* Line 0 — the DECLARED intent, when a real checkpoint on THIS
+            CARD'S OWN BRANCH covers this operation. Read off the
+            checkpoint list, filtered to this branch before the sequence
+            match runs (`checkpointCovering`) — never inferred, and never
+            a range match against a checkpoint declared on some other
+            branch. Neutral text — colour stays reserved for state. */}
         {intent && (
           <div className="flex items-center gap-1 text-[10px] leading-tight text-foreground/80 mb-0.5 min-w-0">
             <span aria-hidden className="shrink-0 text-foreground/60">◈</span>
@@ -603,10 +606,27 @@ function prepare(
     else if (hasTo) hiddenInputs.set(e.to, (hiddenInputs.get(e.to) ?? 0) + 1)
   }
 
+  // Branch-filtered per lane (`checkpointCovering`'s third argument) —
+  // NOT restricted to the root lane anymore. It used to be: sequence
+  // numbers are per document, not per branch, so a checkpoint's range
+  // could land on a node from a different branch that merely shares
+  // the same numbers, and skipping every non-root lane was the only
+  // way to avoid that without a `branch_id` to check against. The
+  // backend now sends one, so every lane checks its OWN branch first
+  // and the range second — see the doc comment on `checkpointCovering`
+  // in `lib/timeline-events.ts`.
+  //
+  // Extending this to child lanes is sound, not just permitted, because
+  // `n.sequence_number` (this endpoint, `ev.sequence_number` in
+  // `lineage_map`) and a checkpoint's `event_range` (`create_checkpoint`
+  // in `timeline-engine/src/timeline.rs:642-652`, `(min_seq, max_seq)`
+  // over that SAME branch's `branch_events` keys) are both the identical
+  // `EventIndex` (`types.rs:124`) space — verified in the backend
+  // source, not assumed.
   const intents = new Map<string, string>()
-  if (isRoot && checkpoints.length > 0) {
+  if (checkpoints.length > 0) {
     for (const n of nodes) {
-      const cp = checkpointCovering(checkpoints, n.sequence_number)
+      const cp = checkpointCovering(checkpoints, n.sequence_number, branch.id)
       if (cp) intents.set(n.id, cp.name)
     }
   }

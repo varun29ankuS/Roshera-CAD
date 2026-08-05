@@ -21,6 +21,11 @@ import {
 } from '@/lib/csketch-api'
 import type { SectionCapMesh } from '@/lib/section-api'
 import type { DimensionRow } from '@/lib/measure-api'
+import {
+  AUTO_APPLY_CONFIDENCE_THRESHOLD,
+  type FilteredProposal,
+  type InferenceApplyResult,
+} from '@/lib/csketch-inference'
 
 // Re-exported so consumers (panels, overlays) can import the
 // SketchShape wire type from the same module they import the rest
@@ -496,6 +501,24 @@ export interface CSketchState {
    */
   lastDofReport: DofReport | null
   /**
+   * Cumulative auto-constrain disclosure for the ACTIVE csketch session
+   * (`applyInferredConstraints` in `lib/csketch-inference.ts`), or
+   * `null` before the first entity commit. Exists so the viewport HUD
+   * can disclose what the client's confidence threshold silently
+   * dropped instead of letting a kernel-proposed constraint vanish
+   * without a trace — see the module doc on
+   * `AUTO_APPLY_CONFIDENCE_THRESHOLD`.
+   *
+   * Deliberately cumulative, not last-pass-only: every point / line /
+   * circle commit runs its own inference pass, and a per-pass summary
+   * would let a dropped proposal flash for one commit and then
+   * disappear the moment the user drew the next entity — the opposite
+   * of "does not vanish without a trace". `recordInferenceFilterResult`
+   * appends; cleared alongside `lastDofReport` because both belong to
+   * whichever csketch was active when they were produced.
+   */
+  lastInferenceFilter: InferenceFilterSummary | null
+  /**
    * Active draw tool for the csketch editor, or `null` when no
    * tool is selected (the legacy capture-plane handler then
    * processes clicks normally). Set by the SketchPanel tool row
@@ -505,6 +528,21 @@ export interface CSketchState {
    * sketch handler.
    */
   activeTool: CSketchTool | null
+}
+
+/**
+ * What the client's confidence-threshold filter has done across every
+ * auto-constrain pass run so far THIS csketch session: total proposals
+ * applied, the exact threshold applied against (so the disclosure names
+ * a number, not just "some"), and every proposal dropped, oldest first.
+ * `dropped` is `[]` when every pass so far cleared the bar — a true,
+ * disclosable "nothing withheld yet", not the same state as `null`
+ * ("no pass has run yet").
+ */
+export interface InferenceFilterSummary {
+  appliedCount: number
+  threshold: number
+  dropped: FilteredProposal[]
 }
 
 // ─── Pinned measurements ─────────────────────────────────────────────
@@ -947,6 +985,16 @@ interface SceneState {
    */
   refreshCSketch: (id: string) => Promise<void>
   /**
+   * Fold one `applyInferredConstraints` pass (`lib/csketch-inference.ts`)
+   * into the running `lastInferenceFilter` disclosure for the active
+   * session — appends, never replaces (see `InferenceFilterSummary`).
+   * The overlay calls this itself after awaiting
+   * `applyInferredConstraints`, since that helper dispatches through
+   * `addCSketchConstraint` directly rather than through a store action
+   * this slice can hook.
+   */
+  recordInferenceFilterResult: (result: InferenceApplyResult) => void
+  /**
    * Add a point to the csketch identified by `id`. Returns the new
    * point's UUID once the round-trip resolves; the summary is
    * refreshed before this resolves so observers reading state see
@@ -1097,6 +1145,7 @@ const sceneCreator: StateCreator<
       activeConstraints: [],
       lastReport: null,
       lastDofReport: null,
+      lastInferenceFilter: null,
       activeTool: null,
     },
     sceneRef: null,
@@ -2071,6 +2120,7 @@ const sceneCreator: StateCreator<
             activeConstraints: [],
             lastReport: null,
             lastDofReport: null,
+            lastInferenceFilter: null,
           },
         }
       })
@@ -2096,6 +2146,7 @@ const sceneCreator: StateCreator<
             activeConstraints: constraints,
             lastReport: null,
             lastDofReport: null,
+            lastInferenceFilter: null,
             // Opening a fresh csketch always lands in read-only /
             // drag-only mode; the user picks a tool from the panel.
             activeTool: null,
@@ -2112,6 +2163,7 @@ const sceneCreator: StateCreator<
           activeConstraints: [],
           lastReport: null,
           lastDofReport: null,
+          lastInferenceFilter: null,
           activeTool: null,
         },
       }))
@@ -2131,7 +2183,29 @@ const sceneCreator: StateCreator<
             activeConstraints: wasActive ? [] : state.csketch.activeConstraints,
             lastReport: wasActive ? null : state.csketch.lastReport,
             lastDofReport: wasActive ? null : state.csketch.lastDofReport,
+            lastInferenceFilter: wasActive
+              ? null
+              : state.csketch.lastInferenceFilter,
             activeTool: wasActive ? null : state.csketch.activeTool,
+          },
+        }
+      })
+    },
+
+    recordInferenceFilterResult: (result) => {
+      // No-op fast path: neither the applied count nor the disclosure
+      // list changes, so skip the `set` and the re-render it triggers.
+      if (result.applied === 0 && result.filtered.length === 0) return
+      set((state) => {
+        const prior = state.csketch.lastInferenceFilter
+        return {
+          csketch: {
+            ...state.csketch,
+            lastInferenceFilter: {
+              appliedCount: (prior?.appliedCount ?? 0) + result.applied,
+              threshold: AUTO_APPLY_CONFIDENCE_THRESHOLD,
+              dropped: [...(prior?.dropped ?? []), ...result.filtered],
+            },
           },
         }
       })

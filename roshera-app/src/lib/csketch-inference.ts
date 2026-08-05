@@ -47,8 +47,25 @@ import {
  *
  * Mirrors the mainstream parametric-CAD default of "apply confident
  * proposals silently, never the marginal ones".
+ *
+ * This threshold exists ONLY on this client. An agent driving the same
+ * sketch through MCP/REST calls `infer-constraints` directly and sees
+ * every proposal the kernel returns, unfiltered — same kernel, same
+ * sketch, two different constraint sets depending on who is driving.
+ * Whether the backend should own this number (so both clients agree)
+ * or each client should keep its own is a product decision that has
+ * not been made; moving it would need backend changes this module
+ * cannot make unilaterally. Until that is decided, `applyInferredConstraints`
+ * reports what it drops (see `FilteredProposal`) so the gap is visible
+ * in the UI instead of silent — never applied without the human able
+ * to see the kernel proposed more.
+ *
+ * Exported (not module-private) so `stores/scene-store.ts` — which
+ * stamps this number onto every `InferenceFilterSummary` it records —
+ * reads the real constant instead of a second hard-coded `0.5` the two
+ * files could quietly drift apart on.
  */
-const AUTO_APPLY_CONFIDENCE_THRESHOLD = 0.5
+export const AUTO_APPLY_CONFIDENCE_THRESHOLD = 0.5
 
 /**
  * Entity-id mapping for the slots a `DraftEntity` may carry.
@@ -130,31 +147,68 @@ function draftSlotToRef(
 }
 
 /**
+ * A kernel-proposed constraint this client did NOT apply because its
+ * confidence fell below {@link AUTO_APPLY_CONFIDENCE_THRESHOLD}. `reason`
+ * is the kernel's own short tag (`ProposedConstraint.reason`); `kind`
+ * names which `GeometricConstraint` variant was proposed (`Horizontal`,
+ * `Parallel`, …) so the disclosure UI can say WHAT was dropped, not just
+ * how many. This is the record of the divergence described on
+ * {@link AUTO_APPLY_CONFIDENCE_THRESHOLD} — a proposal the kernel made
+ * and an agent driving the same sketch would have kept.
+ */
+export interface FilteredProposal {
+  kind: string
+  reason: string
+  confidence: number
+}
+
+/**
+ * What one `applyInferredConstraints` call did: how many proposals were
+ * applied, and — the disclosure this function exists to make possible —
+ * exactly which ones were dropped on confidence and why.
+ */
+export interface InferenceApplyResult {
+  applied: number
+  filtered: FilteredProposal[]
+}
+
+/**
  * Run inference for `draft`, filter by confidence, apply each
- * surviving proposal via `addConstraint`. Returns the number of
- * constraints actually added so callers can surface it in a toast
- * if they want — the overlay currently doesn't.
+ * surviving proposal via `addConstraint`. Returns both the count
+ * applied and the full list of proposals dropped on confidence, so
+ * the caller can render the disclosure instead of letting a
+ * kernel-proposed constraint vanish without a trace.
  *
  * Failures are logged and swallowed: the entity commit that
  * triggered this call has already succeeded, so an inference
- * failure must not surface to the user as a draw-error.
+ * failure must not surface to the user as a draw-error. A dropped-on-
+ * confidence proposal is not a failure — it is reported in `filtered`,
+ * not the console.
  */
 export async function applyInferredConstraints(
   id: string,
   draft: DraftEntity,
   refs: InferenceRefs,
   addConstraint: (sketchId: string, constraint: Constraint) => Promise<string>,
-): Promise<number> {
+): Promise<InferenceApplyResult> {
   let proposals: ProposedConstraint[]
   try {
     proposals = await csketchApi.inferConstraints(id, { draft })
   } catch (err) {
     console.error('[csketch-inference] infer-constraints failed:', err)
-    return 0
+    return { applied: 0, filtered: [] }
   }
   let applied = 0
+  const filtered: FilteredProposal[] = []
   for (const p of proposals) {
-    if (p.confidence < AUTO_APPLY_CONFIDENCE_THRESHOLD) continue
+    if (p.confidence < AUTO_APPLY_CONFIDENCE_THRESHOLD) {
+      filtered.push({
+        kind: proposalKind(p),
+        reason: p.reason,
+        confidence: p.confidence,
+      })
+      continue
+    }
     const constraint = proposalToConstraint(p, refs)
     if (constraint === null) continue
     try {
@@ -174,5 +228,15 @@ export async function applyInferredConstraints(
       )
     }
   }
-  return applied
+  return { applied, filtered }
+}
+
+/** Human-readable constraint variant name for the disclosure UI.
+ *  `GeometricConstraint` is a string for every variant except
+ *  `IntersectionAngle`, which wraps a scalar in an object — the only
+ *  case that needs unwrapping here. */
+function proposalKind(p: ProposedConstraint): string {
+  return typeof p.constraint === 'string'
+    ? p.constraint
+    : Object.keys(p.constraint)[0]
 }

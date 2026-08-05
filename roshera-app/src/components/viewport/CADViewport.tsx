@@ -375,14 +375,15 @@ function SketchCoordReadout() {
 /**
  * Floating HUD that reports the constraint-solver verdict for the
  * **active csketch** (`csketch.activeId`). Hidden when there is no
- * active csketch or no `lastDofReport` has been pulled yet.
+ * active csketch and neither `lastDofReport` nor `lastInferenceFilter`
+ * has anything to show yet.
  *
  * The DOF report is refreshed in `refreshCSketch` (in the scene
  * store), which is called after every mutation that touches
  * entities or constraints, so the HUD stays in lock-step with the
  * user's edits without needing its own polling loop.
  *
- * Three pieces of state are surfaced:
+ * Four pieces of state are surfaced:
  *
  *   1. **Structural verdict** — `fully_constrained` / `under_…` /
  *      `over_…`. Determines the pill colour (positive / neutral /
@@ -394,34 +395,61 @@ function SketchCoordReadout() {
  *      because they touched unsupported entity kinds (rectangles
  *      pending C-2 etc.). Surfaced so the user knows the verdict
  *      is partial.
+ *   4. **Filtered** — proposals the kernel's auto-constrain pass has
+ *      offered THIS SESSION that this client dropped on confidence,
+ *      accumulated across every entity commit
+ *      (`csketch.lastInferenceFilter`, folded in by `SketchOverlay`
+ *      after every `applyInferredConstraints` call via
+ *      `recordInferenceFilterResult` — see that action's doc for why
+ *      it accumulates instead of showing only the latest commit). An
+ *      agent driving the same sketch via MCP/REST sees the unfiltered
+ *      set — see the module doc on `AUTO_APPLY_CONFIDENCE_THRESHOLD`
+ *      in `lib/csketch-inference.ts` for why that gap exists and who
+ *      would need to close it. Rendered as plain text, not a hover
+ *      tooltip — this HUD is `pointer-events-none` by design (the
+ *      viewport must stay click-through underneath it), and Varun's
+ *      rule is a row readable without a mouse.
  *
- * Slice D-3a, added 2026-05-12.
+ * Slice D-3a, added 2026-05-12. Filtered-proposal disclosure added
+ * as part of the architectural-audit pass on the confidence
+ * threshold divergence.
  */
+/** Most recent dropped-proposal rows named in the HUD before the tail
+ *  collapses into an "+N earlier" count — keeps the panel a fixed,
+ *  glanceable size across a long sketch session. */
+const FILTERED_DETAIL_LIMIT = 4
+
 function CSketchDofHud() {
   const activeId = useSceneStore((s) => s.csketch.activeId)
   const report = useSceneStore((s) => s.csketch.lastDofReport)
+  const filter = useSceneStore((s) => s.csketch.lastInferenceFilter)
 
-  if (!activeId || !report) return null
+  if (!activeId || (!report && !filter)) return null
 
   // Headline pill: derived from the structural status. Colours match
   // the rest of the viewport HUD vocabulary — foreground/background
   // accents drive the eye toward the over-constrained case which is
-  // the only one that needs the user to act.
-  let statusLabel: string
-  let statusTone: 'positive' | 'neutral' | 'negative'
-  switch (report.status.kind) {
-    case 'fully_constrained':
-      statusLabel = 'FULLY CONSTRAINED'
-      statusTone = 'positive'
-      break
-    case 'under_constrained':
-      statusLabel = `FREE DOFs: ${report.status.dofs}`
-      statusTone = 'neutral'
-      break
-    case 'over_constrained':
-      statusLabel = `EXCESS: ${report.status.conflicting_constraints}`
-      statusTone = 'negative'
-      break
+  // the only one that needs the user to act. `report` can be null
+  // here (a fresh csketch whose first `applyInferredConstraints` call
+  // resolved before its own DOF refresh raced it) — the headline row
+  // is skipped rather than fabricated in that case.
+  let statusLabel: string | null = null
+  let statusTone: 'positive' | 'neutral' | 'negative' = 'neutral'
+  if (report) {
+    switch (report.status.kind) {
+      case 'fully_constrained':
+        statusLabel = 'FULLY CONSTRAINED'
+        statusTone = 'positive'
+        break
+      case 'under_constrained':
+        statusLabel = `FREE DOFs: ${report.status.dofs}`
+        statusTone = 'neutral'
+        break
+      case 'over_constrained':
+        statusLabel = `EXCESS: ${report.status.conflicting_constraints}`
+        statusTone = 'negative'
+        break
+    }
   }
   const statusClass =
     statusTone === 'positive'
@@ -430,16 +458,19 @@ function CSketchDofHud() {
         ? 'text-rose-400'
         : 'text-amber-300'
 
-  const conflictCount = report.conflicts.length
-  const redundantCount = report.redundant.length
-  const skippedCount = report.constraints_skipped
+  const conflictCount = report?.conflicts.length ?? 0
+  const redundantCount = report?.redundant.length ?? 0
+  const skippedCount = report?.constraints_skipped ?? 0
+  const filteredCount = filter?.dropped.length ?? 0
 
   return (
     <div className="absolute top-3 right-3 pointer-events-none cad-panel cad-readout px-2.5 py-1.5 text-[10px] uppercase tracking-wider min-w-[180px]">
-      <div className="flex items-center justify-between gap-3">
-        <span className="text-muted-foreground">DOF</span>
-        <span className={`${statusClass} font-semibold`}>{statusLabel}</span>
-      </div>
+      {statusLabel && (
+        <div className="flex items-center justify-between gap-3">
+          <span className="text-muted-foreground">DOF</span>
+          <span className={`${statusClass} font-semibold`}>{statusLabel}</span>
+        </div>
+      )}
       {(conflictCount > 0 || redundantCount > 0 || skippedCount > 0) && (
         <div className="mt-1 pt-1 border-t border-border/40 space-y-0.5">
           {conflictCount > 0 && (
@@ -466,6 +497,33 @@ function CSketchDofHud() {
               </span>
             </div>
           )}
+        </div>
+      )}
+      {filteredCount > 0 && filter && (
+        <div className="mt-1 pt-1 border-t border-border/40 space-y-0.5">
+          <div className="flex items-center justify-between gap-3">
+            <span className="text-muted-foreground/70">
+              Filtered this sketch (&lt;{filter.threshold.toFixed(2)})
+            </span>
+            <span className="text-amber-300 font-semibold tabular-nums">
+              {filteredCount}
+            </span>
+          </div>
+          {/* Named, not just counted — the whole point is that a
+              dropped proposal should not vanish without a trace.
+              Plain text (no hover) so it reads without a mouse.
+              Cumulative for the whole csketch session (see
+              `recordInferenceFilterResult`), so this is capped to the
+              most recent few rather than growing without bound across
+              a long sketch. */}
+          <div className="normal-case tracking-normal text-muted-foreground/60 leading-snug">
+            {filter.dropped
+              .slice(-FILTERED_DETAIL_LIMIT)
+              .map((d) => `${d.kind} ${d.confidence.toFixed(2)}`)
+              .join(', ')}
+            {filteredCount > FILTERED_DETAIL_LIMIT &&
+              ` (+${filteredCount - FILTERED_DETAIL_LIMIT} earlier)`}
+          </div>
         </div>
       )}
     </div>
