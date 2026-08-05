@@ -31,6 +31,7 @@
 //! still need `&mut`, so the lock cost is paid once per entity per
 //! process lifetime.
 
+use crate::error_catalog::{ApiError, ErrorCode};
 use crate::part_mgr::ActiveModel;
 use crate::AppState;
 use axum::{
@@ -92,9 +93,12 @@ pub async fn query_part(
     State(_state): State<AppState>,
     ActiveModel(model_handle): ActiveModel,
     Path(id): Path<SolidId>,
-) -> Result<Json<PartReport>, StatusCode> {
+) -> Result<Json<PartReport>, ApiError> {
     let mut model = model_handle.write().await;
-    model.query_part(id).map(Json).ok_or(StatusCode::NOT_FOUND)
+    model
+        .query_part(id)
+        .map(Json)
+        .ok_or_else(|| ApiError::solid_not_found(id))
 }
 
 /// `GET /api/agent/parts/{id}/mass` — mass properties (volume, mass,
@@ -106,12 +110,12 @@ pub async fn part_mass_properties(
     State(_state): State<AppState>,
     ActiveModel(model_handle): ActiveModel,
     Path(id): Path<SolidId>,
-) -> Result<Json<MassPropertiesReport>, StatusCode> {
+) -> Result<Json<MassPropertiesReport>, ApiError> {
     let mut model = model_handle.write().await;
     model
         .mass_properties_for(id)
         .map(Json)
-        .ok_or(StatusCode::NOT_FOUND)
+        .ok_or_else(|| ApiError::solid_not_found(id))
 }
 
 /// `GET /api/agent/parts/uuid/{uuid}/mass` — UUID-keyed wrapper around
@@ -123,13 +127,15 @@ pub async fn part_mass_properties_by_uuid(
     State(state): State<AppState>,
     ActiveModel(model_handle): ActiveModel,
     Path(uuid): Path<uuid::Uuid>,
-) -> Result<Json<MassPropertiesReport>, StatusCode> {
-    let solid_id = state.get_local_id(&uuid).ok_or(StatusCode::NOT_FOUND)?;
+) -> Result<Json<MassPropertiesReport>, ApiError> {
+    let solid_id = state
+        .get_local_id(&uuid)
+        .ok_or_else(|| ApiError::part_not_found(uuid))?;
     let mut model = model_handle.write().await;
     model
         .mass_properties_for(solid_id)
         .map(Json)
-        .ok_or(StatusCode::NOT_FOUND)
+        .ok_or_else(|| ApiError::solid_not_found(solid_id))
 }
 
 /// One variable→measurement binding in a verify-claim request. Parts are
@@ -266,12 +272,12 @@ pub async fn part_oriented_bbox(
     State(_state): State<AppState>,
     ActiveModel(model_handle): ActiveModel,
     Path(id): Path<SolidId>,
-) -> Result<Json<OrientedBBox>, StatusCode> {
+) -> Result<Json<OrientedBBox>, ApiError> {
     let mut model = model_handle.write().await;
     model
         .oriented_bbox_for(id)
         .map(Json)
-        .ok_or(StatusCode::NOT_FOUND)
+        .ok_or_else(|| ApiError::solid_not_found(id))
 }
 
 /// `GET /api/agent/parts/distance/{a}/{b}` — bbox-center, AABB-gap,
@@ -280,12 +286,18 @@ pub async fn part_distance(
     State(_state): State<AppState>,
     ActiveModel(model_handle): ActiveModel,
     Path((a, b)): Path<(SolidId, SolidId)>,
-) -> Result<Json<DistanceReport>, StatusCode> {
+) -> Result<Json<DistanceReport>, ApiError> {
     let model = model_handle.read().await;
-    model
-        .part_distance(a, b)
-        .map(Json)
-        .ok_or(StatusCode::NOT_FOUND)
+    model.part_distance(a, b).map(Json).ok_or_else(|| {
+        // Either `a` or `b` (or both) is unknown — `part_distance` doesn't
+        // report which, so both candidate ids are surfaced rather than
+        // guessing one.
+        ApiError::new(
+            ErrorCode::SolidNotFound,
+            format!("solid {a} and/or {b} not found"),
+        )
+        .with_details(serde_json::json!({ "solid_a": a, "solid_b": b }))
+    })
 }
 
 /// `GET /api/agent/parts/distance/uuid/{a}/{b}` — UUID-keyed wrapper
@@ -297,14 +309,21 @@ pub async fn part_distance_by_uuid(
     State(state): State<AppState>,
     ActiveModel(model_handle): ActiveModel,
     Path((a_uuid, b_uuid)): Path<(uuid::Uuid, uuid::Uuid)>,
-) -> Result<Json<DistanceReport>, StatusCode> {
-    let a = state.get_local_id(&a_uuid).ok_or(StatusCode::NOT_FOUND)?;
-    let b = state.get_local_id(&b_uuid).ok_or(StatusCode::NOT_FOUND)?;
+) -> Result<Json<DistanceReport>, ApiError> {
+    let a = state
+        .get_local_id(&a_uuid)
+        .ok_or_else(|| ApiError::part_not_found(a_uuid))?;
+    let b = state
+        .get_local_id(&b_uuid)
+        .ok_or_else(|| ApiError::part_not_found(b_uuid))?;
     let model = model_handle.read().await;
-    model
-        .part_distance(a, b)
-        .map(Json)
-        .ok_or(StatusCode::NOT_FOUND)
+    model.part_distance(a, b).map(Json).ok_or_else(|| {
+        ApiError::new(
+            ErrorCode::SolidNotFound,
+            format!("solid {a} and/or {b} not found"),
+        )
+        .with_details(serde_json::json!({ "solid_a": a, "solid_b": b }))
+    })
 }
 
 /// Request body for `POST /api/agent/parts/{id}/reanchor`.
@@ -338,7 +357,7 @@ pub async fn reanchor_part(
     ActiveModel(model_handle): ActiveModel,
     Path(id): Path<SolidId>,
     Json(req): Json<ReanchorPartRequest>,
-) -> Result<Json<ReanchorPartResponse>, StatusCode> {
+) -> Result<Json<ReanchorPartResponse>, (StatusCode, Json<serde_json::Value>)> {
     use geometry_engine::readable::query::ReanchorError;
 
     let mut model = model_handle.write().await;
@@ -348,12 +367,36 @@ pub async fn reanchor_part(
             solid_id: id,
             datum_id: req.new_datum_id,
         })),
-        Err(ReanchorError::UnknownSolid(_)) | Err(ReanchorError::UnknownDatum(_)) => {
-            Err(StatusCode::NOT_FOUND)
-        }
+        Err(ReanchorError::UnknownSolid(_)) => Err(ApiError::solid_not_found(id).into()),
+        // No catalog code names an unknown DATUM (only `SolidNotFound` /
+        // `PartNotFound` / `TransactionNotFound` / `BranchNotFound` /
+        // `DocumentNotFound` exist for 404s) — reusing `SolidNotFound` would
+        // misreport which id was wrong, so this stays a manually-built 404
+        // body rather than a mislabeled typed error.
+        Err(ReanchorError::UnknownDatum(datum_id)) => Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "success": false,
+                "error": format!("datum {datum_id} not found"),
+                "details": { "datum_id": datum_id },
+            })),
+        )),
+        // The kernel's own diagnosis, previously logged and dropped —
+        // carried to the agent now. No catalog code covers a generic
+        // kernel-mediator refusal at 422 (the catalog's only 422 is
+        // `CheckpointNameRejected`), so this is a manually-built body
+        // rather than a mislabeled typed error; see the module-level
+        // report on this gap.
         Err(ReanchorError::Internal(msg)) => {
             tracing::warn!("reanchor_part failed: {}", msg);
-            Err(StatusCode::UNPROCESSABLE_ENTITY)
+            Err((
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({
+                    "success": false,
+                    "error": format!("reanchor failed: {msg}"),
+                    "details": { "solid_id": id, "kernel_message": msg },
+                })),
+            ))
         }
     }
 }
@@ -501,7 +544,7 @@ pub async fn render_part(
     ActiveModel(model_handle): ActiveModel,
     Path(id): Path<u32>,
     Query(q): Query<RenderQuery>,
-) -> Result<Json<RenderResponse>, StatusCode> {
+) -> Result<Json<RenderResponse>, ApiError> {
     use base64::Engine as _;
     use geometry_engine::render::{
         render_solid, render_solid_with_label_marks, CanonicalView, LabelMark, RenderMode,
@@ -514,7 +557,13 @@ pub async fn render_part(
         "front" => CanonicalView::Front,
         "top" => CanonicalView::Top,
         "right" => CanonicalView::Right,
-        _ => return Err(StatusCode::BAD_REQUEST),
+        _ => {
+            return Err(ApiError::new(
+                ErrorCode::InvalidParameter,
+                format!("unknown view '{view_name}': expected iso|front|top|right"),
+            )
+            .with_details(serde_json::json!({ "parameter": "view", "received": view_name })))
+        }
     };
     let mode_name = q.mode.as_deref().unwrap_or("shaded");
     let mode = match mode_name {
@@ -523,7 +572,13 @@ pub async fn render_part(
         "depth" => RenderMode::Depth,
         "normals" => RenderMode::Normals,
         "diagnostic" => RenderMode::Diagnostic,
-        _ => return Err(StatusCode::BAD_REQUEST),
+        _ => {
+            return Err(ApiError::new(
+                ErrorCode::InvalidParameter,
+                format!("unknown mode '{mode_name}': expected shaded|ids|depth|normals|diagnostic"),
+            )
+            .with_details(serde_json::json!({ "parameter": "mode", "received": mode_name })))
+        }
     };
     let size = q.size.unwrap_or(512).clamp(64, 2048);
     let opts = RenderOptions {
@@ -565,14 +620,14 @@ pub async fn render_part(
             });
         }
         render_solid_with_label_marks(&model, id as SolidId, &marks, &opts)
-            .ok_or(StatusCode::NOT_FOUND)?
+            .ok_or_else(|| ApiError::solid_not_found(id))?
     } else {
         let model = model_handle.read().await;
-        render_solid(&model, id as SolidId, &opts).ok_or(StatusCode::NOT_FOUND)?
+        render_solid(&model, id as SolidId, &opts).ok_or_else(|| ApiError::solid_not_found(id))?
     };
     let png = frame
         .to_png()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|e| ApiError::new(ErrorCode::Internal, format!("PNG encoding failed: {e}")))?;
 
     Ok(Json(RenderResponse {
         png_base64: base64::engine::general_purpose::STANDARD.encode(&png),
@@ -640,7 +695,7 @@ pub async fn part_section(
     ActiveModel(model_handle): ActiveModel,
     Path(id): Path<u32>,
     Query(q): Query<SectionQuery>,
-) -> Result<Json<SectionResponse>, StatusCode> {
+) -> Result<Json<SectionResponse>, ApiError> {
     use base64::Engine as _;
     use geometry_engine::math::{Point3, Tolerance, Vector3};
     use geometry_engine::render::dimensioned::render_section;
@@ -658,8 +713,10 @@ pub async fn part_section(
 
     let model = model_handle.read().await;
     let f = render_section(&model, id as SolidId, origin, normal, Tolerance::default())
-        .ok_or(StatusCode::NOT_FOUND)?;
-    let png = f.to_png().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .ok_or_else(|| ApiError::solid_not_found(id))?;
+    let png = f
+        .to_png()
+        .map_err(|e| ApiError::new(ErrorCode::Internal, format!("PNG encoding failed: {e}")))?;
 
     Ok(Json(SectionResponse {
         png_base64: base64::engine::general_purpose::STANDARD.encode(&png),
@@ -739,7 +796,7 @@ pub async fn part_profile(
     ActiveModel(model_handle): ActiveModel,
     Path(id): Path<u32>,
     Query(q): Query<ProfileQuery>,
-) -> Result<Json<ProfileResponse>, StatusCode> {
+) -> Result<Json<ProfileResponse>, ApiError> {
     use base64::Engine as _;
     use geometry_engine::math::{Point3, Tolerance, Vector3};
     use geometry_engine::render::profile::render_axial_profile;
@@ -755,10 +812,10 @@ pub async fn part_profile(
 
     let model = model_handle.read().await;
     let frame = render_axial_profile(&model, id as SolidId, axis_override, Tolerance::default())
-        .ok_or(StatusCode::NOT_FOUND)?;
+        .ok_or_else(|| ApiError::solid_not_found(id))?;
     let png = frame
         .to_png()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|e| ApiError::new(ErrorCode::Internal, format!("PNG encoding failed: {e}")))?;
 
     Ok(Json(ProfileResponse {
         png_base64: base64::engine::general_purpose::STANDARD.encode(&png),
@@ -800,7 +857,7 @@ pub async fn part_best_view(
     ActiveModel(model_handle): ActiveModel,
     Path(id): Path<u32>,
     Query(q): Query<BestViewQuery>,
-) -> Result<Json<geometry_engine::render::viewpoint::ViewpointReport>, StatusCode> {
+) -> Result<Json<geometry_engine::render::viewpoint::ViewpointReport>, ApiError> {
     use geometry_engine::render::viewpoint::analyze_viewpoints;
     use geometry_engine::tessellation::TessellationParams;
 
@@ -808,7 +865,7 @@ pub async fn part_best_view(
     let model = model_handle.read().await;
     analyze_viewpoints(&model, id as SolidId, n, &TessellationParams::default())
         .map(Json)
-        .ok_or(StatusCode::NOT_FOUND)
+        .ok_or_else(|| ApiError::solid_not_found(id))
 }
 
 /// Query for `GET /api/agent/parts/{id}/orbit` — render from an arbitrary
@@ -846,7 +903,7 @@ pub async fn part_orbit(
     ActiveModel(model_handle): ActiveModel,
     Path(id): Path<u32>,
     Query(q): Query<OrbitQuery>,
-) -> Result<Json<OrbitResponse>, StatusCode> {
+) -> Result<Json<OrbitResponse>, ApiError> {
     use base64::Engine as _;
     use geometry_engine::math::Vector3;
     use geometry_engine::render::{render_solids_dir, CanonicalView, RenderMode, RenderOptions};
@@ -868,7 +925,13 @@ pub async fn part_orbit(
         "depth" => RenderMode::Depth,
         "normals" => RenderMode::Normals,
         "diagnostic" => RenderMode::Diagnostic,
-        _ => return Err(StatusCode::BAD_REQUEST),
+        _ => {
+            return Err(ApiError::new(
+                ErrorCode::InvalidParameter,
+                format!("unknown mode '{mode_name}': expected shaded|ids|depth|normals|diagnostic"),
+            )
+            .with_details(serde_json::json!({ "parameter": "mode", "received": mode_name })))
+        }
     };
     let size = q.size.unwrap_or(512).clamp(64, 2048);
 
@@ -896,10 +959,10 @@ pub async fn part_orbit(
             ..Default::default()
         },
     )
-    .ok_or(StatusCode::NOT_FOUND)?;
+    .ok_or_else(|| ApiError::solid_not_found(id))?;
     let png = frame
         .to_png()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|e| ApiError::new(ErrorCode::Internal, format!("PNG encoding failed: {e}")))?;
 
     Ok(Json(OrbitResponse {
         png_base64: base64::engine::general_purpose::STANDARD.encode(&png),
@@ -924,7 +987,8 @@ pub async fn scene_orbit(
     State(state): State<AppState>,
     ActiveModel(model_handle): ActiveModel,
     Query(q): Query<OrbitQuery>,
-) -> Result<Json<OrbitResponse>, StatusCode> {
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
     use base64::Engine as _;
     use geometry_engine::math::Vector3;
     use geometry_engine::render::{render_solids_dir, CanonicalView, RenderMode, RenderOptions};
@@ -946,14 +1010,25 @@ pub async fn scene_orbit(
         "depth" => RenderMode::Depth,
         "normals" => RenderMode::Normals,
         "diagnostic" => RenderMode::Diagnostic,
-        _ => return Err(StatusCode::BAD_REQUEST),
+        _ => {
+            return ApiError::new(
+                ErrorCode::InvalidParameter,
+                format!("unknown mode '{mode_name}': expected shaded|ids|depth|normals|diagnostic"),
+            )
+            .with_details(serde_json::json!({ "parameter": "mode", "received": mode_name }))
+            .into_response()
+        }
     };
     let size = q.size.unwrap_or(640).clamp(64, 2048);
 
     let model = model_handle.read().await;
     let ids: Vec<SolidId> = model.solids.iter().map(|(id, _)| id).collect();
     if ids.is_empty() {
-        return Err(StatusCode::NOT_FOUND);
+        // No catalog code names "the scene has no solids at all" — there is no
+        // single id to attach to `SolidNotFound`, and reusing it here would
+        // invent a reference that does not exist. An honest bare 404 (no
+        // body) beats a fabricated one; see the module-level report.
+        return StatusCode::NOT_FOUND.into_response();
     }
     // Per-solid colours from the registry (set via .../color); default light grey.
     let colors: Vec<[u8; 3]> = ids
@@ -984,13 +1059,25 @@ pub async fn scene_orbit(
             },
             ..Default::default()
         },
-    )
-    .ok_or(StatusCode::NOT_FOUND)?;
-    let png = frame
-        .to_png()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    );
+    let frame = match frame {
+        Some(f) => f,
+        None => {
+            // "tessellates to nothing" — every id was found, so `SolidNotFound`
+            // would misreport a known-good id as missing; no catalog code
+            // covers "the composite render came back empty". Honest bare 404.
+            return StatusCode::NOT_FOUND.into_response();
+        }
+    };
+    let png = match frame.to_png() {
+        Ok(p) => p,
+        Err(e) => {
+            return ApiError::new(ErrorCode::Internal, format!("PNG encoding failed: {e}"))
+                .into_response()
+        }
+    };
 
-    Ok(Json(OrbitResponse {
+    Json(OrbitResponse {
         png_base64: base64::engine::general_purpose::STANDARD.encode(&png),
         width: frame.width,
         height: frame.height,
@@ -1000,7 +1087,8 @@ pub async fn scene_orbit(
         mode: mode_name.to_string(),
         open_edges: frame.open_edges,
         nonmanifold_edges: frame.nonmanifold_edges,
-    }))
+    })
+    .into_response()
 }
 
 // ───────────────────── ground truth (PILLAR 1) ──────────────────────
@@ -1028,7 +1116,7 @@ pub async fn part_truth(
     State(_state): State<AppState>,
     ActiveModel(model_handle): ActiveModel,
     Path(id): Path<u32>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     use geometry_engine::primitives::provenance::SoundnessReading;
 
     let model = model_handle.read().await;
@@ -1036,7 +1124,7 @@ pub async fn part_truth(
 
     let reading = model
         .soundness_reading(solid_id)
-        .ok_or(StatusCode::NOT_FOUND)?;
+        .ok_or_else(|| ApiError::solid_not_found(id))?;
 
     let (origin, designed, primitive, inputs) = match model.solid_provenance(solid_id) {
         Some(p) => (
@@ -1145,7 +1233,7 @@ pub async fn part_occupancy(
     ActiveModel(model_handle): ActiveModel,
     Path(id): Path<u32>,
     Query(q): Query<OccupancyQuery>,
-) -> Result<Json<OccupancyResponse>, StatusCode> {
+) -> Result<Json<OccupancyResponse>, ApiError> {
     use geometry_engine::queries::occupancy::{occupancy_grid, to_slice_stack};
 
     // Clamp to the supported range: below 4 the X-ray is too coarse to read,
@@ -1156,7 +1244,7 @@ pub async fn part_occupancy(
     // Unknown id (or a solid with no boundary face) → 404 rather than an
     // all-empty grid, so the agent fails loudly on a bad reference.
     if model.solids.get(id as SolidId).is_none() {
-        return Err(StatusCode::NOT_FOUND);
+        return Err(ApiError::solid_not_found(id));
     }
     let grid = occupancy_grid(&model, id as SolidId, n, 0.1);
     let slices = to_slice_stack(&grid);
@@ -1999,10 +2087,7 @@ pub async fn propose_labels(
     use geometry_engine::labels::{LabelAssertion, SelectorSpec};
     let mut model = model_handle.write().await;
     if model.solids.get(id as SolidId).is_none() {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": "unknown_part", "part_id": id })),
-        );
+        return ApiError::solid_not_found(id).into();
     }
     let proposals = model.propose_labels(id as SolidId);
     // Render each proposal's assertion as the exact `selector` body the agent
@@ -2077,14 +2162,14 @@ pub async fn part_coverage(
     State(_state): State<AppState>,
     ActiveModel(model_handle): ActiveModel,
     Path(id): Path<u32>,
-) -> Result<Json<geometry_engine::render::dimensioned::CoverageReport>, StatusCode> {
+) -> Result<Json<geometry_engine::render::dimensioned::CoverageReport>, ApiError> {
     use geometry_engine::render::dimensioned::coverage_report;
     use geometry_engine::tessellation::TessellationParams;
 
     let model = model_handle.read().await;
     coverage_report(&model, id as SolidId, &TessellationParams::default())
         .map(Json)
-        .ok_or(StatusCode::NOT_FOUND)
+        .ok_or_else(|| ApiError::solid_not_found(id))
 }
 
 // ───────────────────── perception (feedback-as-default) ─────────────
@@ -2156,7 +2241,7 @@ pub async fn part_perception(
     ActiveModel(model_handle): ActiveModel,
     Path(id): Path<u32>,
     Query(q): Query<PerceptionQuery>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> Result<Json<serde_json::Value>, ApiError> {
     use geometry_engine::harness::watertight::manifold_report;
     use geometry_engine::math::Tolerance;
     use geometry_engine::primitives::provenance::SoundnessReading;
@@ -2171,15 +2256,26 @@ pub async fn part_perception(
     let durability_disclosure = crate::durability::quarantine_disclosure(&durability_status)
         .map(|s| serde_json::to_value(s))
         .transpose()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|e| {
+            ApiError::new(
+                ErrorCode::Internal,
+                format!("durability status serialization failed: {e}"),
+            )
+        })?;
 
     if q.wants_fast() {
         // OPT-OUT (`?fast=1`): lightweight (cheap, read lock): B-Rep validity + coarse mesh counts + dims.
         let model = model_handle.read().await;
         if model.solids.get(sid).is_none() {
-            return Err(StatusCode::NOT_FOUND);
+            return Err(ApiError::solid_not_found(id));
         }
-        let report = manifold_report(&model, sid, 0.5, 1e-6).ok_or(StatusCode::NOT_FOUND)?;
+        // `manifold_report` returning `None` here means the solid exists but
+        // produced no mesh (degenerate), not that the id is unknown — the
+        // catalog has no code for that distinction, so this reuses
+        // `solid_not_found` as the closest honest fit (imprecise but still
+        // names the right solid); see the module-level report.
+        let report =
+            manifold_report(&model, sid, 0.5, 1e-6).ok_or_else(|| ApiError::solid_not_found(id))?;
         let valid =
             validate_solid_scoped(&model, sid, Tolerance::default(), ValidationLevel::Standard)
                 .is_valid;
@@ -2262,9 +2358,10 @@ pub async fn part_perception(
     // just-established state rather than asserting one.
     let mut model = model_handle.write().await;
     if model.solids.get(sid).is_none() {
-        return Err(StatusCode::NOT_FOUND);
+        return Err(ApiError::solid_not_found(id));
     }
-    let report = manifold_report(&model, sid, 0.5, 1e-6).ok_or(StatusCode::NOT_FOUND)?;
+    let report =
+        manifold_report(&model, sid, 0.5, 1e-6).ok_or_else(|| ApiError::solid_not_found(id))?;
     let valid = validate_solid_scoped(&model, sid, Tolerance::default(), ValidationLevel::Standard)
         .is_valid;
     let dims = model.solid_world_bbox(sid).map(|b| {
@@ -2357,12 +2454,12 @@ pub async fn part_features(
     State(_state): State<AppState>,
     ActiveModel(model_handle): ActiveModel,
     Path(id): Path<u32>,
-) -> Result<Json<FeaturesResponse>, StatusCode> {
+) -> Result<Json<FeaturesResponse>, ApiError> {
     use geometry_engine::readable::{cylindrical_diameters, extract_features};
 
     let model = model_handle.read().await;
     if model.solids.get(id as SolidId).is_none() {
-        return Err(StatusCode::NOT_FOUND);
+        return Err(ApiError::solid_not_found(id));
     }
     let features = extract_features(&model, id as SolidId);
     let diameters = cylindrical_diameters(&model, id as SolidId)
@@ -2414,17 +2511,7 @@ pub async fn part_dfm_check(
     let solid_id = id as SolidId;
     let solid = match model.solids.get(solid_id) {
         Some(s) => s,
-        None => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({
-                    "error": "not_found",
-                    "reason": format!(
-                        "solid {solid_id} is not part of the active model"
-                    ),
-                })),
-            );
-        }
+        None => return ApiError::solid_not_found(id).into(),
     };
 
     // P1 ENFORCEMENT — refuse pre-flight, before any rule runs, when the
@@ -2554,7 +2641,7 @@ pub async fn render_dimensioned(
     State(_state): State<AppState>,
     ActiveModel(model_handle): ActiveModel,
     Path(id): Path<u32>,
-) -> Result<Json<DimensionedResponse>, StatusCode> {
+) -> Result<Json<DimensionedResponse>, ApiError> {
     use base64::Engine as _;
     use geometry_engine::render::dimensioned::render_dimensioned_multiview;
     use geometry_engine::render::CanonicalView;
@@ -2562,10 +2649,10 @@ pub async fn render_dimensioned(
 
     let model = model_handle.read().await;
     let frame = render_dimensioned_multiview(&model, id as SolidId, &TessellationParams::default())
-        .ok_or(StatusCode::NOT_FOUND)?;
+        .ok_or_else(|| ApiError::solid_not_found(id))?;
     let png = frame
         .to_png()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|e| ApiError::new(ErrorCode::Internal, format!("PNG encoding failed: {e}")))?;
 
     let view_name = |v: CanonicalView| -> String {
         match v {
@@ -2657,7 +2744,7 @@ pub async fn part_dimensions(
     State(_state): State<AppState>,
     ActiveModel(model_handle): ActiveModel,
     Path(id): Path<u32>,
-) -> Result<Json<PartDimensionsResponse>, StatusCode> {
+) -> Result<Json<PartDimensionsResponse>, ApiError> {
     use base64::Engine as _;
     use geometry_engine::readable::extract_dimensions;
     use geometry_engine::render::dimensioned::{
@@ -2669,7 +2756,7 @@ pub async fn part_dimensions(
     let model = model_handle.read().await;
     let mut frame =
         render_dimensioned_multiview(&model, id as SolidId, &TessellationParams::default())
-            .ok_or(StatusCode::NOT_FOUND)?;
+            .ok_or_else(|| ApiError::solid_not_found(id))?;
 
     let dims = extract_dimensions(&model, id as SolidId);
     // The 5×7 overlay font has no Ø/∠/° glyphs — render ASCII, keep the pretty
@@ -2694,7 +2781,7 @@ pub async fn part_dimensions(
 
     let png = frame
         .to_png()
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(|e| ApiError::new(ErrorCode::Internal, format!("PNG encoding failed: {e}")))?;
 
     let view_name = |v: CanonicalView| -> String {
         match v {
@@ -2960,7 +3047,7 @@ pub async fn point_query(
     ActiveModel(model_handle): ActiveModel,
     Path(id): Path<u32>,
     Json(req): Json<PointQueryRequest>,
-) -> Result<Json<PointQueryResponse>, StatusCode> {
+) -> Result<Json<PointQueryResponse>, ApiError> {
     use geometry_engine::math::{Point3, Tolerance};
     use geometry_engine::queries::{classify_point, nearest_on_solid, signed_distance, PointClass};
 
@@ -2969,12 +3056,17 @@ pub async fn point_query(
 
     let model = model_handle.read().await;
     if model.solids.get(sid).is_none() {
-        return Err(StatusCode::NOT_FOUND);
+        return Err(ApiError::solid_not_found(id));
     }
     // Nearest boundary point + face (the recoverable handle) and the signed
-    // distance share the same analytic nearest; compute both honestly.
-    let (face_id, near_pt, dist) = nearest_on_solid(&model, sid, p).ok_or(StatusCode::NOT_FOUND)?;
-    let (sd, _) = signed_distance(&model, sid, p).ok_or(StatusCode::NOT_FOUND)?;
+    // distance share the same analytic nearest; compute both honestly. A
+    // `None` here means the (confirmed-existing) solid has no reachable
+    // boundary face — degenerate, not an unknown id — but the catalog has no
+    // separate code for that; `solid_not_found` is reused as the closest
+    // honest fit (see the module-level report).
+    let (face_id, near_pt, dist) =
+        nearest_on_solid(&model, sid, p).ok_or_else(|| ApiError::solid_not_found(id))?;
+    let (sd, _) = signed_distance(&model, sid, p).ok_or_else(|| ApiError::solid_not_found(id))?;
     let class = classify_point(&model, sid, p, Tolerance::default().distance());
     let classification = match class {
         PointClass::Inside => "inside",
@@ -3044,7 +3136,7 @@ pub async fn ray_query(
     ActiveModel(model_handle): ActiveModel,
     Path(id): Path<u32>,
     Json(req): Json<RayQueryRequest>,
-) -> Result<Json<RayQueryResponse>, StatusCode> {
+) -> Result<Json<RayQueryResponse>, ApiError> {
     use geometry_engine::math::{Point3, Vector3};
     use geometry_engine::queries::raycast_all;
 
@@ -3054,7 +3146,7 @@ pub async fn ray_query(
 
     let model = model_handle.read().await;
     if model.solids.get(sid).is_none() {
-        return Err(StatusCode::NOT_FOUND);
+        return Err(ApiError::solid_not_found(id));
     }
     let hits: Vec<RayHitWire> = raycast_all(&model, sid, origin, direction)
         .into_iter()
@@ -3139,7 +3231,7 @@ pub async fn region_query(
     State(_state): State<AppState>,
     ActiveModel(model_handle): ActiveModel,
     Json(req): Json<RegionQueryRequest>,
-) -> Result<Json<RegionQueryResponse>, StatusCode> {
+) -> Result<Json<RegionQueryResponse>, ApiError> {
     use geometry_engine::math::Point3;
     use geometry_engine::queries::{faces_in_box, faces_in_sphere, WorldBox};
 
@@ -3150,7 +3242,7 @@ pub async fn region_query(
         Some(pid) => {
             let sid = pid as SolidId;
             if model.solids.get(sid).is_none() {
-                return Err(StatusCode::NOT_FOUND);
+                return Err(ApiError::solid_not_found(sid));
             }
             vec![sid]
         }
@@ -3160,27 +3252,34 @@ pub async fn region_query(
     // Resolve the query volume. A box needs both centre + half-extents; a sphere
     // needs centre + radius. Box wins when both are fully specified.
     let center = req.center;
-    let (region_kind, eval): (&str, Box<dyn Fn(SolidId) -> Vec<u32>>) =
-        match (center, req.half_extents, req.radius) {
-            (Some(c), Some(h), _) => {
-                let bx = WorldBox::from_center_half(
-                    Point3::new(c[0], c[1], c[2]),
-                    Point3::new(h[0].abs(), h[1].abs(), h[2].abs()),
-                );
-                let model_ref = &model;
-                ("box", Box::new(move |sid| faces_in_box(model_ref, sid, bx)))
-            }
-            (Some(c), None, Some(r)) => {
-                let centre = Point3::new(c[0], c[1], c[2]);
-                let radius = r.abs();
-                let model_ref = &model;
-                (
-                    "sphere",
-                    Box::new(move |sid| faces_in_sphere(model_ref, sid, centre, radius)),
-                )
-            }
-            _ => return Err(StatusCode::BAD_REQUEST),
-        };
+    let (region_kind, eval): (&str, Box<dyn Fn(SolidId) -> Vec<u32>>) = match (
+        center,
+        req.half_extents,
+        req.radius,
+    ) {
+        (Some(c), Some(h), _) => {
+            let bx = WorldBox::from_center_half(
+                Point3::new(c[0], c[1], c[2]),
+                Point3::new(h[0].abs(), h[1].abs(), h[2].abs()),
+            );
+            let model_ref = &model;
+            ("box", Box::new(move |sid| faces_in_box(model_ref, sid, bx)))
+        }
+        (Some(c), None, Some(r)) => {
+            let centre = Point3::new(c[0], c[1], c[2]);
+            let radius = r.abs();
+            let model_ref = &model;
+            (
+                "sphere",
+                Box::new(move |sid| faces_in_sphere(model_ref, sid, centre, radius)),
+            )
+        }
+        _ => return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            "region under-specified: supply center+half_extents (box) or center+radius (sphere)",
+        )
+        .with_details(serde_json::json!({ "parameter": "region" }))),
+    };
 
     let mut parts = Vec::new();
     for sid in ids {

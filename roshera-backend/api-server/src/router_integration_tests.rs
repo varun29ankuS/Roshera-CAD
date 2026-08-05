@@ -745,6 +745,36 @@ async fn fillet_unknown_uuid_routes_to_solid_not_found() {
     );
 }
 
+/// `handlers/agent.rs` catalog-adoption gate: an unknown solid id on the
+/// agent-facing `GET /api/agent/parts/{id}` route must surface the SAME
+/// typed `solid_not_found` vocabulary the geometry handlers already use
+/// (see `fillet_unknown_uuid_routes_to_solid_not_found` above), not a bare
+/// 404 with no body. Before the catalog-adoption fix this handler returned
+/// `Err(StatusCode::NOT_FOUND)` with an empty body — `body["error_code"]`
+/// deserialized as `Value::Null`, failing this assertion (confirmed RED
+/// against the pre-fix handler). The status itself is UNCHANGED (still
+/// 404) — only the vocabulary is typed.
+#[tokio::test]
+async fn agent_query_part_unknown_id_routes_to_solid_not_found() {
+    let state = make_test_state().await;
+    let request = json_get("/api/agent/parts/999999");
+    let (status, body) = dispatch(&state, request).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "unknown solid id must still 404 (status unchanged); body = {body}"
+    );
+    assert_eq!(
+        body["error_code"], "solid_not_found",
+        "wire payload must carry the solid_not_found error_code, not an empty body; body = {body}"
+    );
+    assert_eq!(body["success"], false, "body = {body}");
+    assert_eq!(
+        body["retryable"], false,
+        "an unknown id will not resolve on retry; body = {body}"
+    );
+}
+
 // =====================================================================
 // Tests — F5-β.5.3 per-edge-radii dispatch through the router
 //

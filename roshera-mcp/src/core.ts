@@ -323,10 +323,109 @@ export function ok(data: unknown) {
   return { content };
 }
 
+/**
+ * Parsed shape of the backend's structured error catalog wire body
+ * (`api-server/src/error_catalog.rs` — `ApiError`'s `Serialize` impl):
+ * `{ success: false, error_code, error, retryable, hint?, details? }`.
+ * `error_code` is the field this parser treats as load-bearing: the
+ * catalog's own module doc says the prose `error` field is "free to
+ * evolve" but changing/removing a variant is a versioned break, so
+ * `error_code` is the stable thing to branch on, not substrings of `error`.
+ */
+interface CatalogError {
+  error_code: string;
+  retryable: boolean;
+  details?: unknown;
+  hint?: string;
+}
+
+/**
+ * Parse `ApiError.body` as the backend's typed error catalog wire shape.
+ * Returns `null` for anything that isn't catalog-shaped: a non-JSON body
+ * (a plain-text 500, a stub test backend that answers with raw text), a
+ * JSON body with no `error_code`, or a client-constructed `ApiError` that
+ * never reached the backend at all (the timeout/network branches in
+ * `api()` above always pass `body: ""`). Never throws — a parse failure
+ * degrades to "no structured error" rather than breaking error handling
+ * itself, which would be the one place a crash is least affordable.
+ */
+function parseCatalogError(body: string): CatalogError | null {
+  if (!body) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== "object") return null;
+  const o = parsed as Record<string, unknown>;
+  if (typeof o.error_code !== "string") return null;
+  return {
+    error_code: o.error_code,
+    retryable: o.retryable === true,
+    details: "details" in o ? o.details : undefined,
+    hint: typeof o.hint === "string" ? o.hint : undefined,
+  };
+}
+
+/**
+ * Compute a legible, structured-data-driven retry hint for the one catalog
+ * code whose backend constructor deliberately carries NO `hint`:
+ * `ApiError::blend_failed` (error_catalog.rs) is the only named constructor
+ * that never calls `.with_hint(...)` — because the useful remediation is
+ * arithmetic over `details.failure`, not prose the server could usefully
+ * phrase once for every `BlendFailure` variant. So this MCP client computes
+ * it instead of guessing from message text.
+ *
+ * Only `RadiusExceedsCurvature` (geometry-engine's `BlendFailure`,
+ * `operations/diagnostics.rs`) carries an `r_max` an agent can act on
+ * directly with one arithmetic step. `type` is documented there as part of
+ * the wire contract ("changing it is a breaking change to the agent
+ * surface"), so branching on it is as stable as branching on `error_code`
+ * itself. Every other variant (`SetbackTooLong`, `DihedralInflection`,
+ * `VertexBlendUnsupported`, `TopologyViolation`, …) returns `null` here and
+ * falls through to the raw message / `errorHint` path below rather than
+ * fabricate a radius that was never computed for it.
+ */
+function blendFailureHint(details: unknown): string | null {
+  if (!details || typeof details !== "object") return null;
+  const failure = (details as Record<string, unknown>).failure;
+  if (!failure || typeof failure !== "object") return null;
+  const f = failure as Record<string, unknown>;
+  if (f.type !== "RadiusExceedsCurvature") return null;
+  const rMax = f.r_max;
+  if (typeof rMax !== "number") return null;
+  const rReq = typeof f.r_requested === "number" ? f.r_requested : null;
+  const edge = typeof f.edge === "number" ? ` at edge ${f.edge}` : "";
+  const station =
+    typeof f.station === "number" ? ` (station ${f.station.toFixed(3)})` : "";
+  const requested = rReq !== null ? `requested radius ${rReq}mm exceeds` : "the requested radius exceeds";
+  return (
+    `${requested} the local curvature limit${edge}${station} — retry with ` +
+    `radius ≤ ${rMax}mm (r_max), or pass edge_ids to blend only the ` +
+    `edges that fit at the larger radius.`
+  );
+}
+
 export function fail(e: unknown) {
   const msg = e instanceof Error ? e.message : String(e);
-  const hint = errorHint(msg);
-  return {
+  const catalog = e instanceof ApiError ? parseCatalogError(e.body) : null;
+  // Hint precedence: a computed structured hint (exact, derived from typed
+  // `details` — today only blend_failed/RadiusExceedsCurvature) beats the
+  // backend's own `hint` (still prose, but STABLE prose the server authored
+  // specifically for this code) beats `errorHint`'s substring match below
+  // (the only tier still coupled to `error` text the catalog's own doc says
+  // is free to evolve).
+  const structuredHint =
+    catalog?.error_code === "blend_failed"
+      ? blendFailureHint(catalog.details)
+      : null;
+  const hint = structuredHint ?? catalog?.hint ?? errorHint(msg);
+  const result: {
+    content: { type: "text"; text: string }[];
+    isError: true;
+    structuredContent?: Record<string, unknown>;
+  } = {
     content: [
       {
         type: "text" as const,
@@ -335,6 +434,23 @@ export function fail(e: unknown) {
     ],
     isError: true as const,
   };
+  if (catalog) {
+    // MCP's own structured-output carrier (`CallToolResult.structuredContent`
+    // in the SDK's types.js). It survives with no `outputSchema` declared on
+    // these tools — `McpServer.validateToolOutput` returns immediately when
+    // `tool.outputSchema` is absent, and skips validation entirely on
+    // `isError` results regardless — and is returned to the wire verbatim
+    // (the CallToolRequestSchema handler does `return result;` with no
+    // stripping), so an agent can read `error_code` / `retryable` / `details`
+    // as typed fields instead of re-parsing `content[0].text` prose the way
+    // every caller of this function had to before.
+    result.structuredContent = {
+      error_code: catalog.error_code,
+      retryable: catalog.retryable,
+      ...(catalog.details !== undefined ? { details: catalog.details } : {}),
+    };
+  }
+  return result;
 }
 
 /**
@@ -342,6 +458,15 @@ export function fail(e: unknown) {
  * refuses rather than ship bad geometry (the moat); this turns its terse,
  * correct error into guidance the agent can act on. Returns null when the raw
  * message is already clear.
+ *
+ * FALLBACK TIER ONLY (see `fail()` above): reached when the response body
+ * carried no `error_code` at all (a client-constructed timeout/network
+ * `ApiError`, whose `body` is always `""`; or a raw non-catalog 500) or a
+ * catalog `error_code` this module does not yet special-case. Every branch
+ * below is matched against `error` prose the catalog's own doc (`error_catalog.rs`
+ * lines 10-11) declares free to evolve — `test/structured_errors.test.mjs`
+ * pins the still-live producer phrases so a backend rename breaks loudly here
+ * instead of silently degrading hint quality.
  */
 function errorHint(msg: string): string | null {
   const m = msg.toLowerCase();
