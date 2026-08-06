@@ -18447,24 +18447,60 @@ fn ray_surface_numerical(
 /// (a sphere cut by box-face planes — the curved-Boolean poke-through case).
 ///
 /// Returns `Some(inside)` when the test applies, or `None` when the surface is
-/// not a sphere or any trim loop is not a single coplanar circle — in which
-/// case the caller falls back to the legacy `(u, v)` polygon test.
+/// not a sphere, any trim loop is not a single coplanar circle, or a loop's
+/// kept side is not decisive — in which case the caller falls back to the
+/// legacy `(u, v)` polygon test.
 ///
 /// Why this is needed: a cut circle on a sphere sits at constant surface
 /// parameter, so its `(u, v)` footprint is a zero-area line and the winding /
 /// shoelace tests degenerate (a cap renders as the whole sphere; a multi-hole
 /// central region can't be expressed at all). We test each circle's PLANE
-/// half-space instead. Each cutting plane splits the sphere into two caps; the
-/// face keeps a definite side per loop:
-///
-/// * an **outer** circle loop keeps the cap FAR from the sphere centre (the
-///   smaller cap the surface bulges away into — the part that pokes out), and
-/// * an **inner** circle loop (a hole) keeps the NEAR side (the hole is the far
-///   cap, so the face is everything on the centre side of it).
+/// half-space instead: each cutting plane splits the sphere into two caps, and
+/// the face keeps a definite one of them per loop. Which one is derived from
+/// the loop's traversal — see below.
 ///
 /// This is exact for planar circular trims and handles caps (one outer loop)
-/// and central regions (N inner-loop holes) uniformly. The sphere centre gives
-/// an orientation-free reference, so there is no winding sign to mis-calibrate.
+/// and central regions (N inner-loop holes) uniformly, by ONE rule rather than
+/// a rule per loop kind.
+///
+/// ## Which side each loop keeps is DERIVED, not assumed
+///
+/// The "outer keeps far / inner keeps near" phrasing above describes what the
+/// poke-through case happens to look like; it is not the rule. The rule is the
+/// loop's own traversal. At a point `q` on a trim loop, with `N_s` the SURFACE
+/// normal and `T` the walk-directed tangent, `D = N_s x T` points into the
+/// face's own patch — the material-left convention every boolean-minted walk is
+/// put into by `orient_minted_walk_material_left`. The kept half-space is
+/// therefore the one `D` points into: `sign((p - c).n) == sign(D.n)`.
+///
+/// For a trim circle of radius `rho` on a sphere of radius `r` this evaluates
+/// to `D.n = tau * rho / r`, where `tau = +-1` is the walk's rotational sense
+/// about the circle's axis. Note what is absent: `h`, the plane's offset from
+/// the sphere centre. The measure is **independent of how the plane sits
+/// relative to the centre**, which is exactly the degeneracy that broke the
+/// previous rule.
+///
+/// ★ What this replaced, and why. The reference used to be the SPHERE CENTRE:
+/// an outer loop kept the cap on the opposite side of the plane from the
+/// centre. For a GREAT circle the centre lies exactly ON the trim plane, so its
+/// sidedness is `Equal`, no side is "opposite" to it, and an outer loop
+/// rejected EVERY point in space — the whole hemisphere face vanished from
+/// `nearest_on_solid`, `raycast_all` parity and the agent-facing
+/// `signed_distance`. That behaviour was DOCUMENTED in the code as intended,
+/// which is why it survived review: for an ordinary small cap the centre
+/// reference gives the right answer, and a documented behaviour reads as a
+/// decided one. It was still wrong for a face that genuinely IS a hemisphere.
+/// The centre rule also silently encoded "the kept cap is the smaller one",
+/// which is not true in general; the traversal rule encodes nothing.
+///
+/// ⚠ This makes the predicate depend on loop orientation, which it previously
+/// did not. That dependency is the point — orientation is the B-Rep's own
+/// record of which side is material — but it means a producer that mints a
+/// spherical circular trim with an arbitrary walk sense would now get a
+/// confidently flipped face rather than a lucky-right one. `None` is returned
+/// (falling back to the legacy `(u, v)` path) when the measure is not
+/// decisive; it is NOT returned for a walk that is decisively wrong, because
+/// nothing here can tell that from a decisively right one.
 pub(crate) fn spherical_circular_membership(
     model: &BRepModel,
     face: &crate::primitives::face::Face,
@@ -18505,69 +18541,130 @@ pub(crate) fn spherical_circular_membership(
         plane
     };
 
-    // `keep_far` = true for an outer cap loop, false for an inner hole loop.
+    // Which half-space of a trim loop's plane the face occupies, as the sign of
+    // `D.n = (N_s x T).n` accumulated along the loop's own walk (see the
+    // "DERIVED, not assumed" section of this function's doc). Returns the sign
+    // NORMALISED by the sampled walk length, so the magnitude is the scale-free
+    // `rho / r` in [0, 1] and the decisiveness threshold is an angle rather
+    // than a length.
+    //
+    // `N_s` is read at an on-curve sample and is analytic for a sphere
+    // (`(q - centre) / r`) — no `closest_point` inversion is needed or wanted
+    // here, since this runs per query point. `T` is the CHORD direction, which
+    // costs a `cos(delta/2)` factor in the magnitude and nothing at all in the
+    // sign; the sign is the entire answer.
+    //
+    // The walk sense is vertex-level (`true` = start_vertex first), so the
+    // samples are anchored on the tail vertex when the subcurve's two ends are
+    // geometrically distinct, and fall back to the sense flag on the parameter
+    // direction for a closed edge (a full circle, where both ends coincide).
+    // This is the same convention `orient_minted_walk_material_left` and
+    // `face_outer_polyline_2d` use — the three must agree or the material-left
+    // guarantee the minting seam establishes does not reach this predicate.
+    const KEPT_SIGN_SAMPLES_PER_EDGE: usize = 8;
+    let loop_kept_sign = |lid: crate::primitives::r#loop::LoopId, n: Vector3| -> Option<f64> {
+        let lp = model.loops.get(lid)?;
+        let mut score = 0.0_f64;
+        let mut length = 0.0_f64;
+        for (i, &eid) in lp.edges.iter().enumerate() {
+            let fwd = lp.orientations.get(i).copied().unwrap_or(true);
+            let edge = model.edges.get(eid)?;
+            let curve = model.curves.get(edge.curve_id)?;
+            let sub = curve
+                .subcurve(edge.param_range.start, edge.param_range.end)
+                .ok()?;
+            let mut pts: Vec<Point3> = Vec::with_capacity(KEPT_SIGN_SAMPLES_PER_EDGE + 1);
+            for k in 0..=KEPT_SIGN_SAMPLES_PER_EDGE {
+                pts.push(
+                    sub.point_at(k as f64 / KEPT_SIGN_SAMPLES_PER_EDGE as f64)
+                        .ok()?,
+                );
+            }
+            let tail_vid = if fwd {
+                edge.start_vertex
+            } else {
+                edge.end_vertex
+            };
+            let anchored = model.vertices.get(tail_vid).and_then(|tv| {
+                let tp = Point3::new(tv.position[0], tv.position[1], tv.position[2]);
+                let d_first = (pts[0] - tp).magnitude();
+                let d_last = (pts[pts.len() - 1] - tp).magnitude();
+                ((d_first - d_last).abs() > tol).then_some(d_last < d_first)
+            });
+            if anchored.unwrap_or(!fwd) {
+                pts.reverse();
+            }
+            for w in pts.windows(2) {
+                let t_vec = w[1] - w[0];
+                let len = t_vec.magnitude();
+                if len <= tol {
+                    continue;
+                }
+                let Ok(t_hat) = t_vec.normalize() else {
+                    continue;
+                };
+                let Ok(ns) = (w[0] - center).normalize() else {
+                    continue;
+                };
+                score += ns.cross(&t_hat).dot(&n) * len;
+                length += len;
+            }
+        }
+        if length <= tol {
+            return None;
+        }
+        let normalised = score / length;
+        // Indecisive: a trim circle whose angular radius is below the angular
+        // tolerance is not a resolvable boundary (`rho / r` IS the sine of
+        // that angle). Decline rather than commit to a sign that is noise.
+        (normalised.abs() > tolerance.angle()).then_some(normalised)
+    };
+
     // The point must lie on the kept side of the circle's plane (on-plane
     // counts as inside / boundary).
     //
     // DECOMPOSED per the EXACT PREDICATES boundary contract (Slice 4): the
     // on-plane band is a Regime-T gate (applied first, unchanged); OUTSIDE
-    // it, which side of the trim circle's stored plane the query point and
-    // the sphere centre occupy is a Regime-E SIGN question, decided exactly
+    // it, which side of the trim circle's stored plane the query point
+    // occupies is a Regime-E SIGN question, decided exactly
     // (`math::point_plane_sidedness`, expansion-exact in the stored
     // (centre, axis) carrier — the circle's own plane is authoritative, spec
-    // §3.2). The former `p * o < 0.0` float product could mis-sign `o` for a
-    // near-great-circle trim (plane almost through the sphere centre), where
-    // `(center − c)·n` is pure cancellation — flipping which CAP the whole
-    // face claims. The centre's projection carries no tolerance band: its
-    // sign is a calibration, not a coincidence question; an exactly-on-plane
-    // centre (a true great circle) has NO far cap and reports `on_far =
-    // false` for every point, matching the former product semantics.
-    let on_kept_side = |c: Point3, n: Vector3, keep_far: bool| -> bool {
+    // §3.2). Only the QUERY point's side needs that exactness: `kept` is a
+    // property of the face, computed once per loop from geometry that is not
+    // near-cancelling (see `loop_kept_sign`), so it carries no tolerance band.
+    let on_kept_side = |c: Point3, n: Vector3, kept: f64| -> bool {
         let p = (*point - c).dot(&n);
         if p.abs() <= tol {
             return true; // Regime-T band: on the cutting plane → boundary
         }
-        let side_point = crate::math::point_plane_sidedness(&n, &c, point);
-        let side_centre = crate::math::point_plane_sidedness(&n, &c, &center);
-        // Far side = strictly opposite sign to the centre's projection.
-        let on_far = matches!(
-            (side_point, side_centre),
-            (std::cmp::Ordering::Greater, std::cmp::Ordering::Less)
-                | (std::cmp::Ordering::Less, std::cmp::Ordering::Greater)
-        );
-        if keep_far {
-            on_far
-        } else {
-            !on_far
+        match crate::math::point_plane_sidedness(&n, &c, point) {
+            std::cmp::Ordering::Greater => kept > 0.0,
+            std::cmp::Ordering::Less => kept < 0.0,
+            // Unreachable in practice: the Regime-T band above already
+            // returned for everything the exact predicate can call `Equal`.
+            std::cmp::Ordering::Equal => true,
         }
     };
 
-    // Outer loop (if it is a circle): keep the far cap. A non-circular or empty
-    // outer loop is allowed only when the surface is otherwise circle-trimmed
-    // (the central region has an empty outer loop) — but if the outer loop has
-    // edges that are NOT a circle, bail to the legacy path.
+    // Outer loop, then inner loops (holes) — ONE rule for both, because
+    // `D = N_s x T` points into the face's patch from either loop kind. A
+    // non-circular or empty outer loop is allowed only when the surface is
+    // otherwise circle-trimmed (the central region has an empty outer loop) —
+    // but if the outer loop has edges that are NOT a circle, bail to the
+    // legacy path.
+    let mut lids: Vec<crate::primitives::r#loop::LoopId> = Vec::new();
     if let Some(l) = model.loops.get(face.outer_loop) {
         if !l.edges.is_empty() {
-            match loop_circle(face.outer_loop) {
-                Some((c, n)) => {
-                    if !on_kept_side(c, n, true) {
-                        return Some(false);
-                    }
-                }
-                None => return None,
-            }
+            lids.push(face.outer_loop);
         }
     }
+    lids.extend(face.inner_loops.iter().copied());
 
-    // Inner loops (holes): keep the near side of each.
-    for &il in &face.inner_loops {
-        match loop_circle(il) {
-            Some((c, n)) => {
-                if !on_kept_side(c, n, false) {
-                    return Some(false);
-                }
-            }
-            None => return None,
+    for lid in lids {
+        let (c, n) = loop_circle(lid)?;
+        let kept = loop_kept_sign(lid, n)?;
+        if !on_kept_side(c, n, kept) {
+            return Some(false);
         }
     }
 
@@ -21655,6 +21752,16 @@ must be dropped; a 1·tol band rejects it and lets it double the rim"
     /// sphere (centre origin, r=2.5) cut by the plane z=2 (circle r=1.5). The
     /// CAP face (outer = that circle) keeps the far cap z>2; the CENTRAL face
     /// (inner-loop hole = that circle) keeps the near side z<2.
+    ///
+    /// ★ The two faces traverse the shared rim in OPPOSITE senses. That is not
+    /// a detail of this fixture, it is what a closed 2-manifold requires of any
+    /// two faces adjacent along an edge, and since the predicate now derives
+    /// the kept half-space from the traversal (`D = N_s x T`) the fixture has
+    /// to satisfy it to mean anything. It previously did NOT — both loops were
+    /// built with `add_edge(eid, true)` — and the old sphere-centre rule could
+    /// not tell, because it never read the walk. So the fixture asserted a
+    /// topologically impossible pair and passed. Getting the same two answers
+    /// out of a now-valid pair is the actual calibration.
     #[test]
     fn spherical_circular_membership_calibration() {
         use crate::primitives::curve::{Circle, ParameterRange};
@@ -21688,7 +21795,9 @@ must be dropped; a 1·tol band rejects it and lets it double the rim"
 
         let empty_loop_id = m.loops.add(Loop::new(0, LoopType::Outer));
         let mut inner = Loop::new(0, LoopType::Inner);
-        inner.add_edge(eid, true);
+        // Opposite sense to `cap_loop` above — the co-edge opposition, see the
+        // doc comment. `false` is what makes this face keep z<2.
+        inner.add_edge(eid, false);
         let inner_id = m.loops.add(inner);
         let mut central = Face::new(0, sid, empty_loop_id, FaceOrientation::Forward);
         central.inner_loops.push(inner_id);
@@ -21734,20 +21843,33 @@ must be dropped; a 1·tol band rejects it and lets it double the rim"
         );
     }
 
-    /// EXACT PREDICATES Slice 4 RED (spherical membership, census row #2/#3
-    /// family): a trim circle whose plane passes ALMOST exactly through the
-    /// sphere centre (a near-great-circle cut). The cap-vs-hole calibration
-    /// in `on_kept_side` reads which side of the circle plane the sphere
-    /// CENTRE lies on — a pure cancellation `(center − c)·n` whose f64 sign
-    /// can be wrong, flipping which spherical cap the whole face claims. The
-    /// adversarial (centre, plane) pair is SEARCHED deterministically: the
-    /// raw f64 dot reports one sign while the exact sidedness
-    /// (`math::point_plane_sidedness`, BigRational-oracle-gated in the
-    /// census) reports the opposite.
+    /// EXACT PREDICATES Slice 4, census row #2/#3 family — REPURPOSED, and the
+    /// reason is the point of the test.
     ///
-    /// RED evidence (2026-07-16): with `on_kept_side` hand-reverted to the
-    /// float `p * o < 0.0` product, this test FAILS (the cap face claims the
-    /// wrong side — mutation proof); with the exact signs it passes.
+    /// It used to search for a trim circle whose plane passes ALMOST exactly
+    /// through the sphere centre, such that the f64 sign of `(centre − c)·n`
+    /// disagrees with the exact sidedness, and then assert the predicate still
+    /// picked the exact-far cap. That guarded a real hazard: the cap-vs-hole
+    /// calibration read the CENTRE's side of the trim plane, a pure
+    /// cancellation on a near-great-circle cut, and getting it wrong flipped
+    /// which cap the whole face claimed.
+    ///
+    /// ★ That quantity is no longer computed. The kept side is now derived from
+    /// the loop's own traversal (`D = N_s x T`), whose magnitude is `rho / r` —
+    /// a quantity that does not cancel, and does not involve the centre's
+    /// offset from the plane at all. So the hazard is closed **by construction
+    /// rather than by exact arithmetic**, and the old assertion is not merely
+    /// redundant, it is FALSE: the cap keeps whichever side its walk says,
+    /// which for a near-great-circle cut has no reason to be the exact-far one.
+    ///
+    /// So the search is kept — it still produces a configuration where the old
+    /// reference was demonstrably a lie — and the assertion is replaced by the
+    /// property that now has to hold on exactly that configuration:
+    /// **the answer is decided by the walk sense and is independent of the
+    /// sphere centre's side.** Reversing the loop reverses the kept half-space;
+    /// nothing about the (lying) centre projection changes either answer.
+    /// Re-introducing any centre term breaks this, which is what makes it a
+    /// gate and not a restatement.
     #[test]
     fn spherical_membership_near_great_circle_exact_side() {
         use crate::primitives::curve::{Circle, ParameterRange};
@@ -21838,35 +21960,56 @@ must be dropped; a 1·tol band rejects it and lets it double the rim"
             EdgeOrientation::Forward,
             ParameterRange::new(0.0, 1.0),
         ));
-        let mut cap_loop = Loop::new(0, LoopType::Outer);
-        cap_loop.add_edge(eid, true);
-        let cap_loop_id = m.loops.add(cap_loop);
-        let cap_fid = m
+        // The SAME face geometry built twice, differing only in the walk sense
+        // of its single rim edge — the one input the answer may depend on.
+        let mut fwd_loop = Loop::new(0, LoopType::Outer);
+        fwd_loop.add_edge(eid, true);
+        let fwd_loop_id = m.loops.add(fwd_loop);
+        let fwd_fid = m
             .faces
-            .add(Face::new(0, sid, cap_loop_id, FaceOrientation::Forward));
+            .add(Face::new(0, sid, fwd_loop_id, FaceOrientation::Forward));
+
+        let mut rev_loop = Loop::new(0, LoopType::Outer);
+        rev_loop.add_edge(eid, false);
+        let rev_loop_id = m.loops.add(rev_loop);
+        let rev_fid = m
+            .faces
+            .add(Face::new(0, sid, rev_loop_id, FaceOrientation::Forward));
 
         let tol = Tolerance::default();
         let surf = m.surfaces.get(sid).expect("surface stored");
-        let cap_face = m.faces.get(cap_fid).expect("face stored");
+        let fwd_face = m.faces.get(fwd_fid).expect("face stored");
+        let rev_face = m.faces.get(rev_fid).expect("face stored");
 
-        // Probe far along the normal on the EXACT-far side of the plane
-        // from the centre: for a cap loop (keep_far = true) it must be kept.
-        let far_dir = if o_exact == O::Less {
-            n_stored
-        } else {
-            n_stored * -1.0
-        };
-        let probe = s + far_dir * radius;
-        // Sanity: the probe is unambiguously off the plane (T gate passes).
-        assert!(((probe - c).dot(&n_stored)).abs() > tol.distance() * 10.0);
+        // Two probes, one per side of the trim plane, both unambiguously off
+        // it so the Regime-T boundary band cannot answer for us.
+        let plus = s + n_stored * radius;
+        let minus = s - n_stored * radius;
+        for p in [plus, minus] {
+            assert!(
+                ((p - c).dot(&n_stored)).abs() > tol.distance() * 10.0,
+                "probe must clear the on-plane band"
+            );
+        }
 
-        let got = spherical_circular_membership(&m, cap_face, surf, &probe, &tol);
+        let f_plus = spherical_circular_membership(&m, fwd_face, surf, &plus, &tol);
+        let f_minus = spherical_circular_membership(&m, fwd_face, surf, &minus, &tol);
+        let r_plus = spherical_circular_membership(&m, rev_face, surf, &plus, &tol);
+        let r_minus = spherical_circular_membership(&m, rev_face, surf, &minus, &tol);
+
+        // Decisive: each face keeps exactly one of the two sides.
         assert_eq!(
-            got,
-            Some(true),
-            "the cap must keep the exact-far side of a near-great-circle cut \
-             (c={c:?}, n={n_stored:?}, s={s:?}): the f64 centre-projection \
-             sign points at the WRONG cap"
+            (f_plus, f_minus),
+            (Some(true), Some(false)),
+            "a CCW-about-n rim must keep the +n cap on a near-great-circle cut \
+             (c={c:?}, n={n_stored:?}, s={s:?}, exact centre side {o_exact:?} \
+             — a side the answer must NOT depend on)"
+        );
+        assert_eq!(
+            (r_plus, r_minus),
+            (Some(false), Some(true)),
+            "reversing the rim walk must reverse the kept cap, on the same \
+             geometry — the kept side is the traversal's, not the centre's"
         );
     }
 

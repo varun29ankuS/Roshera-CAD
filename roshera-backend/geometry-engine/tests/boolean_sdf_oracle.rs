@@ -341,8 +341,40 @@ fn sphere_box_near_points() -> Vec<Point3> {
     ]
 }
 
-/// FINDING (this oracle, first run): fails with 9/124 compared points
-/// disagreeing. NOT the boolean:
+/// ## FIXED 2026-08-05 — this case is now a live gate (124 compared, 0
+/// disagreements). The history below is kept because the defect was
+/// documented-as-intended for two days and the reasoning is what stops it
+/// coming back.
+///
+/// The fix, in `operations::boolean::spherical_circular_membership`: the kept
+/// half-space of a circular trim loop is derived from the loop's OWN traversal
+/// (`D = N_s x T`, the material-left convention the boolean's minting seam
+/// establishes) instead of from the sphere centre's side of the trim plane.
+/// For a trim circle of radius `rho` on a sphere of radius `r` the measure is
+/// `D.n = tau * rho / r` — the plane's offset from the centre, the quantity
+/// that vanishes on a great circle, does not appear at all.
+///
+/// Two corrections to the plan recorded below, both measured rather than
+/// reasoned:
+///   * the rule must read the SURFACE normal only, NOT `face.orientation` as
+///     the "fix this needs" note below suggested. Under a Difference the
+///     B-origin sphere face flips to `Backward` while its stored walk is
+///     unchanged (`[17,16,15]`, senses `[false,false,false]`, score `-62.81`
+///     — identical to the Intersection pose), so applying the orientation
+///     flip would invert the answer on exactly the operation that flips.
+///   * the BLOCKER below is genuinely lifted, not assumed lifted. Re-measured
+///     in the off-centre pose the note names: the rim is now walked
+///     `[15,14,13]` with senses `[false,false,false]` against the disc's
+///     forward walk — opposite, as a closed 2-manifold requires — where it
+///     used to be `[13,14,15]` `[true,true,true]`, identical to the disc.
+///
+/// Verified RED->GREEN on this same binary: with the predicate reverted, 9 of
+/// 124 disagree; with it, 0 of 124.
+///
+/// ---
+///
+/// ORIGINAL FINDING (this oracle, first run): failed with 9/124 compared
+/// points disagreeing. NOT the boolean:
 ///   * The result's volume is 2094.3245 vs the analytic hemisphere
 ///     `(2/3)*pi*r^3` = 2094.3951 (0.003% error) — `reconstruct_topology`
 ///     built the right shape.
@@ -459,11 +491,6 @@ fn sphere_box_near_points() -> Vec<Point3> {
 /// `classify_point` happens to come out right by luck — so the live harm is
 /// broader than the Inside/Outside flip this test pins.
 #[test]
-#[ignore = "spherical_circular_membership's sphere-centre reference degenerates \
-            on a GREAT-circle trim and rejects the whole cap face, poisoning \
-            both nearest_on_solid and raycast_all parity; fix belongs in \
-            operations/boolean.rs and is blocked on co-edge integrity — see \
-            doc comment"]
 fn sphere_box_face_straddle_intersection_matches_set_membership() {
     let stats = run_oracle(
         sphere_box_face_straddle,
