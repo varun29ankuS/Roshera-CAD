@@ -430,6 +430,24 @@ function handleServerMessage(msg: ServerMessage) {
       // `ws-client.ts::startHeartbeat`, payload is not consumed here.
       break
 
+    case 'Authenticated':
+      // Socket auth acknowledged. Inert by design: authorization for
+      // everything the bridge does rides the REST token, so there is no
+      // state to update here. Matched only so the closed union does not
+      // report a routine ack as a malformed frame.
+      break
+
+    case 'AuthenticationFailed':
+      // NOT inert. The socket is up but unauthenticated, so every frame
+      // that would follow is one the backend will refuse — surfacing it
+      // is the difference between "the viewport looks frozen" and a
+      // stated reason.
+      console.error(
+        '[WS] socket authentication refused:',
+        msg.data?.reason ?? '(no reason given)',
+      )
+      break
+
     case 'SubElementResult': {
       // Backend resolved a sub-element pick to authoritative topology
       // indices. Replace the optimistic local selection with the

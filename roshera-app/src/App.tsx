@@ -22,6 +22,7 @@ import { useSceneStore } from '@/stores/scene-store'
 import { useDocModeStore } from '@/stores/doc-mode-store'
 import { initWebSocket, teardownWebSocket } from '@/lib/ws-bridge'
 import { installBackendBlackboard } from '@/lib/blackboard-api'
+import { establishAcpSession } from '@/lib/acp-blackboard'
 import { ViewportBridge } from '@/lib/viewport-bridge'
 
 const DEMOS_HASH = '#/demos'
@@ -77,6 +78,45 @@ export function App() {
     if (route === 'workspace') {
       initWebSocket()
       return () => teardownWebSocket()
+    }
+  }, [route])
+
+  // Start the agent session when the workspace mounts, rather than
+  // waiting for the user's first blackboard message.
+  //
+  // `acpLive` — the one fact the AI chip is allowed to render (see
+  // `ProviderSettingsDialog`'s note that driving the chip off config
+  // "was the bug") — is CLIENT-side state with no rehydration: a page
+  // reload resets it to `false` while goose's session keeps running on
+  // the backend. So the chip read RED over a genuinely live harness,
+  // and only went green once something happened to call
+  // `getAcpClient()`. That is the mirror image of the bug the `acpLive`
+  // switch fixed: green over a dead agent became red over a live one.
+  // Both are honest about what the client knows and wrong about what is
+  // true.
+  //
+  // `establishAcpSession()` already existed for exactly this ("...not to
+  // leave the agent unstarted until the user's first blackboard
+  // message") but its only caller was the settings dialog's connect
+  // button. This is the missing call site, not new machinery.
+  //
+  // Failures are swallowed deliberately: the agent not starting must
+  // never block the CAD workspace from rendering. The chip stays red,
+  // which is then TRUE, and the dialog reports why.
+  useEffect(() => {
+    if (route !== 'workspace') return
+    let cancelled = false
+    void (async () => {
+      try {
+        await establishAcpSession()
+      } catch (err) {
+        if (!cancelled) {
+          console.warn('[App] agent session did not start on load:', err)
+        }
+      }
+    })()
+    return () => {
+      cancelled = true
     }
   }, [route])
 

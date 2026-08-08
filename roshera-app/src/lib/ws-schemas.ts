@@ -284,6 +284,45 @@ export const serverMessageSchema = z.discriminatedUnion('type', [
       tool: z.enum(['polyline', 'rectangle', 'circle']),
     }),
   }),
+  // The acknowledgement the backend sends after a successful WebSocket
+  // authentication (`ServerMessage::Authenticated`,
+  // `protocol/protocol.rs:333`). The enum is `#[serde(tag = "type",
+  // content = "data")]`, so the wire frame is:
+  //   { "type": "Authenticated",
+  //     "data": { "user_id": "...", "permissions": [...] } }
+  // `request_id` is `skip_serializing_if = "Option::is_none"` on the
+  // backend, so it is genuinely absent rather than null when unset.
+  //
+  // The bridge does not act on this frame — auth already succeeded by
+  // the time it arrives, and the REST token is what authorizes
+  // everything else. It is listed here because the union is
+  // CLOSED: an unlisted variant is not ignored, it fails the
+  // discriminator and the bridge logs "Dropping unrecognised or
+  // malformed ServerMessage frame" as a console ERROR on every
+  // connect. A routine ack was being reported as a protocol fault.
+  z.object({
+    type: z.literal('Authenticated'),
+    data: z
+      .object({
+        user_id: z.string(),
+        permissions: z.array(z.string()),
+        request_id: z.string().optional(),
+      })
+      .optional(),
+  }),
+  // Its counterpart (`protocol/protocol.rs:338`). Listed for the same
+  // reason, but this one is NOT inert: a rejected socket auth is a real
+  // failure the user should see rather than a dropped frame. Handled in
+  // `ws-bridge.ts`.
+  z.object({
+    type: z.literal('AuthenticationFailed'),
+    data: z
+      .object({
+        reason: z.string(),
+        request_id: z.string().optional(),
+      })
+      .optional(),
+  }),
 ])
 
 /** The sole `ServerMessage` type the frontend is allowed to consume. */
