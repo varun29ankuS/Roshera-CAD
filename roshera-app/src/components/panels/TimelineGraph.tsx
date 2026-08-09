@@ -2,6 +2,20 @@
  * Timeline map view — the timeline as a route, not an odometer (see vault
  * `Research/2026-07-31-ui-pass-spec.md` §3).
  *
+ * ── Two tabs, DECISIONS first (2026-08-09) ────────────────────────────
+ * This panel used to open straight onto the lineage graph. On a real
+ * document that is a field of `create_box_3d` / `transform_solid` /
+ * `set_name` cards — Varun, looking at one: "its just a wall of cards ...
+ * who can zoom in and look at it in detail .. nobody". The graph answers
+ * "what derives from what", which is a real question but not the FIRST
+ * one; the first one is "what was decided, and why".
+ *
+ * So the panel opens on DECISIONS (`DecisionList`, in TimelineDecisions.tsx):
+ * one row per declared intent on the ACTIVE branch, each expanding to its
+ * rationale and the operations it covers. The graph below is unchanged and
+ * one click away. Nothing is dropped by the reordering — every operation no
+ * decision covers lands in the decisions tab's trailing "unattributed" row.
+ *
  * A SECOND view alongside the existing `Timeline.tsx` strip (scrubbing
  * still lives there; this is for reading structure). Lazy-loaded from
  * `Timeline.tsx` — `@xyflow/react` never enters the initial bundle
@@ -71,6 +85,7 @@ import {
 } from '@xyflow/react'
 import '@xyflow/react/dist/style.css'
 import { X } from 'lucide-react'
+import { cn } from '@/lib/utils'
 import { useThemeStore } from '@/stores/theme-store'
 import {
   type CheckpointSummary,
@@ -89,7 +104,7 @@ import {
   symbolForOperation,
   formatTimestamp,
 } from '@/lib/timeline-events'
-import { DurabilityChip } from './TimelineDecisions'
+import { DecisionList, DurabilityChip, type DecisionOpsState } from './TimelineDecisions'
 
 // ─── Minimal branch shape this view needs (mirrors `BranchView` in
 // Timeline.tsx — duplicated rather than imported so this module stays
@@ -844,6 +859,10 @@ export default function TimelineGraph({
 }) {
   const [fetched, setFetched] = useState<{ branch: GraphBranch; outcome: LineageOutcome }[]>([])
   const [loading, setLoading] = useState(true)
+  // DECISIONS is the default — see this file's header. The graph is not
+  // removed, it is one click away, and its state (fetched lineage) is
+  // shared, so switching tabs costs no request.
+  const [tab, setTab] = useState<'decisions' | 'graph'>('decisions')
   const [rfInstance, setRfInstance] = useState<ReactFlowInstance | null>(null)
   const canvasRef = useRef<HTMLDivElement | null>(null)
   // Floor for how far the user can zoom out — set from the fitted zoom
@@ -912,6 +931,39 @@ export default function TimelineGraph({
     [lanes, activeBranchId, liveNames],
   )
 
+  // ── The decisions tab reads ONE branch: the one being recorded to.
+  // A checkpoint spells the trunk `"main"`, `/api/branches` spells it as
+  // the nil UUID, so both sides are canonicalised before the match. No
+  // fallback to "some other lane": crediting one branch's operations to
+  // another branch's decisions is the exact failure `checkpointCovering`
+  // was hardened against, so an unmatched active branch is reported as
+  // an unread operation list, not quietly filled from a neighbour.
+  const activeLane = useMemo(() => {
+    const canon = (id: string) => (id === 'main' ? MAIN_BRANCH_ID : id)
+    const target = canon(activeBranchId)
+    return lanes.find((l) => canon(l.branch.id) === target) ?? null
+  }, [lanes, activeBranchId])
+
+  const opsState: DecisionOpsState = loading
+    ? { state: 'loading' }
+    : activeLane === null
+      ? { state: 'unreachable', reason: 'no lineage lane for the active branch' }
+      : activeLane.refusal
+        ? { state: 'refused', reason: activeLane.refusal.reason }
+        : activeLane.unreachable
+          ? { state: 'unreachable', reason: activeLane.unreachable }
+          : {
+              state: 'ready',
+              ops: activeLane.nodes,
+              truncated: activeLane.window?.truncated === true,
+            }
+
+  const activeBranchLabel =
+    activeLane?.branch.name ||
+    (activeBranchId === MAIN_BRANCH_ID || activeBranchId === 'main'
+      ? 'main'
+      : activeBranchId.slice(0, 8))
+
   useEffect(() => {
     if (rfInstance && !loading && nodes.length > 0) {
       void rfInstance.fitView({ padding: 0.08, maxZoom: 1.25, duration: 200 })
@@ -958,15 +1010,42 @@ export default function TimelineGraph({
         <div className="flex items-start justify-between gap-3 px-4 py-2 border-b border-border shrink-0">
           <div className="min-w-0 flex items-center gap-2">
             <span className="text-[13px] font-medium text-foreground shrink-0">Timeline — map view</span>
-            <span className="text-[11px] text-muted-foreground/70 truncate">
-              {totalOps === 0
-                ? 'Linked by recorded lineage.'
-                : `Linked by recorded lineage — ${totalOps} op${totalOps === 1 ? '' : 's'}, ` +
-                  `${totalLinks} link${totalLinks === 1 ? '' : 's'}, ` +
-                  `${totalEntities} entit${totalEntities === 1 ? 'y' : 'ies'}` +
-                  (totalUnlinked > 0 ? `, ${totalUnlinked} unlinked` : '')}
+            {/* Decisions | Graph. Decisions is the default view; the graph
+                keeps every capability it had, behind one click. */}
+            <span className="shrink-0 inline-flex items-center rounded border border-border/70 p-[2px] text-[11px]">
+              {(['decisions', 'graph'] as const).map((t) => (
+                <button
+                  key={t}
+                  type="button"
+                  onClick={() => setTab(t)}
+                  aria-pressed={tab === t}
+                  className={cn(
+                    'rounded px-2 py-[1px] capitalize',
+                    tab === t
+                      ? 'bg-accent text-foreground font-medium'
+                      : 'text-muted-foreground hover:text-foreground',
+                  )}
+                >
+                  {t}
+                </button>
+              ))}
             </span>
-            {truncated && (
+            <span className="text-[11px] text-muted-foreground/70 truncate">
+              {tab === 'decisions'
+                ? 'What was decided — expand a row for its rationale and the operations it covers.'
+                : totalOps === 0
+                  ? 'Linked by recorded lineage.'
+                  : `Linked by recorded lineage — ${totalOps} op${totalOps === 1 ? '' : 's'}, ` +
+                    `${totalLinks} link${totalLinks === 1 ? '' : 's'}, ` +
+                    `${totalEntities} entit${totalEntities === 1 ? 'y' : 'ies'}` +
+                    (totalUnlinked > 0 ? `, ${totalUnlinked} unlinked` : '')}
+            </span>
+            {/* Cross-branch (`lanes.some`), so it belongs to the graph, which
+                draws every lane. The decisions tab reads ONE branch and makes
+                its own, branch-scoped truncation disclosure — showing both
+                would put two disagreeing statements about the same concept in
+                one panel. */}
+            {truncated && tab === 'graph' && (
               <span
                 title="The lineage window filled up — producers outside it are not represented, so some nodes may look like roots that are not."
                 className="shrink-0 px-1.5 py-0.5 rounded text-[9.5px] uppercase tracking-wide border border-amber-500/40 text-amber-700 dark:text-amber-300"
@@ -978,16 +1057,20 @@ export default function TimelineGraph({
               const notice = durabilityNotice(durability)
               return notice ? <DurabilityChip notice={notice} /> : null
             })()}
-            <button
-              type="button"
-              onClick={() => setDetailsOpen((v) => !v)}
-              title="What connects two cards here (click to expand)"
-              aria-label="More about this map"
-              aria-expanded={detailsOpen}
-              className="shrink-0 w-4 h-4 rounded-full text-[10px] leading-none flex items-center justify-center border border-muted-foreground/40 text-muted-foreground/70 hover:text-foreground hover:border-foreground/60"
-            >
-              i
-            </button>
+            {/* The honesty paragraph describes what an ARROW means, so it
+                belongs to the graph tab only. */}
+            {tab === 'graph' && (
+              <button
+                type="button"
+                onClick={() => setDetailsOpen((v) => !v)}
+                title="What connects two cards here (click to expand)"
+                aria-label="More about this map"
+                aria-expanded={detailsOpen}
+                className="shrink-0 w-4 h-4 rounded-full text-[10px] leading-none flex items-center justify-center border border-muted-foreground/40 text-muted-foreground/70 hover:text-foreground hover:border-foreground/60"
+              >
+                i
+              </button>
+            )}
           </div>
           <button
             type="button"
@@ -999,7 +1082,7 @@ export default function TimelineGraph({
             <X size={16} />
           </button>
         </div>
-        {detailsOpen && (
+        {detailsOpen && tab === 'graph' && (
           <div className="px-4 py-2 border-b border-border shrink-0 bg-accent/10 text-[11px] text-muted-foreground/80 max-w-[85ch]">
             Every node is one operation. An arrow means the entity named on it actually flowed
             from one operation into the next — the input→output lineage the kernel recorded,
@@ -1032,6 +1115,23 @@ export default function TimelineGraph({
           </div>
         )}
 
+        {tab === 'decisions' ? (
+          <div className="flex-1 min-h-0">
+            {/* Keyed by branch: expansion state belongs to the branch it
+                was opened on. Without this the list stays mounted across a
+                branch switch and the "unattributed" row — the one key that
+                is not a checkpoint id — would stay open over a different
+                branch's operations. */}
+            <DecisionList
+              key={activeBranchId}
+              checkpoints={checkpoints}
+              branchId={activeBranchId}
+              branchLabel={activeBranchLabel}
+              opsState={opsState}
+              onRetry={() => setLoadEpoch((n) => n + 1)}
+            />
+          </div>
+        ) : (
         <div ref={canvasRef} className="flex-1 min-h-0 relative" style={{ background: bgColor }}>
           {loading ? (
             <div className="absolute inset-0 flex items-center justify-center text-[12px] text-muted-foreground/60">
@@ -1118,7 +1218,31 @@ export default function TimelineGraph({
             </ReactFlow>
           )}
         </div>
+        )}
 
+        {tab === 'decisions' ? (
+        <div className="flex items-center gap-3 px-4 py-1.5 border-t border-border text-[10px] text-muted-foreground/70 shrink-0 flex-wrap">
+          <span className="flex items-center gap-1">
+            <span
+              className="inline-block w-2 h-3 rounded-[1px]"
+              style={{ backgroundColor: 'var(--primary)' }}
+            />
+            declared decision
+          </span>
+          <span className="flex items-center gap-1">
+            <span
+              className="inline-block w-3 h-2 rounded-[2px]"
+              style={{ border: '1px dashed var(--muted-foreground)' }}
+            />
+            no decision covers it
+          </span>
+          <span className="mx-1 text-muted-foreground/30">│</span>
+          <span>ruler chip = a standard cited in the decision's own words</span>
+          <span className="mx-1 text-muted-foreground/30">│</span>
+          <span>counts are the operations listed inside the row, not the span's width</span>
+          <span className="ml-auto">rows read top → bottom in build order</span>
+        </div>
+        ) : (
         <div className="flex items-center gap-3 px-4 py-1.5 border-t border-border text-[10px] text-muted-foreground/70 shrink-0 flex-wrap">
           <span className="flex items-center gap-1">
             <span className="inline-block w-2 h-2 rounded-full" style={{ backgroundColor: '#2ecc71' }} /> active branch
@@ -1158,6 +1282,7 @@ export default function TimelineGraph({
             ))}
           <span className="ml-auto">left → right is derivation; an arrow's label is the entity that flowed</span>
         </div>
+        )}
       </div>
     </>
   )

@@ -57,6 +57,26 @@ function reportFailure(action: string, error?: string) {
   useBlackboardStore.getState().addLine(`${action} failed: ${error ?? 'backend unreachable'}`, 'system')
 }
 
+const SHORT_MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+
+/** "Aug 8, 09:12" — the row's date discriminator. Rows sharing a name
+ *  (four "Untitled" documents on this server today) are otherwise
+ *  indistinguishable; this is the human-legible tiebreaker, with the id
+ *  fragment below it as the last-resort one. */
+function formatShortDate(epochMs: number): string {
+  const d = new Date(epochMs)
+  const hh = String(d.getHours()).padStart(2, '0')
+  const mm = String(d.getMinutes()).padStart(2, '0')
+  return `${SHORT_MONTHS[d.getMonth()]} ${d.getDate()}, ${hh}:${mm}`
+}
+
+/** First 8 chars of the document id, monospaced — the last-resort
+ *  discriminator when two documents share both a name and a created-date
+ *  display value. */
+function idFragment(id: string): string {
+  return id.slice(0, 8)
+}
+
 interface ContextMenuState {
   doc: DocumentInfo
   x: number
@@ -206,12 +226,12 @@ export function DocumentTabs() {
   if (documents.length === 0) return null
 
   return (
-    <div className="flex items-center gap-0.5 h-8 px-1.5 border-b border-border bg-card/60 shrink-0">
+    <div className="flex items-center gap-0.5 h-11 px-1.5 border-b border-border bg-card/60 shrink-0">
       {/* Scrollable region for the tabs ONLY. `overflow-x-auto` on this
           element implicitly computes `overflow-y: auto` too (a CSS
           coupling gotcha — you cannot set only one axis to non-visible),
           which CLIPS any `position: absolute` popover anchored inside it
-          the instant it extends below this row's 32px height — the `+`
+          the instant it extends below this row's height — the `+`
           menu was silently invisible for exactly this reason (confirmed
           live: correct DOM, z-index, computed styles, but
           `elementFromPoint` hit the panel behind it). The `+` button and
@@ -228,25 +248,34 @@ export function DocumentTabs() {
             aria-selected={doc.active}
             onClick={() => void handleSwitch(doc)}
             onContextMenu={(e) => handleContextMenu(e, doc)}
-            title={`${doc.name} — its own Blackboard notes, timeline, and model. Switching loads that document's notebook, not this one's.`}
+            title={`${doc.name} — created ${formatShortDate(doc.createdAt)} · ${doc.id} — its own Blackboard notes, timeline, and model. Switching loads that document's notebook, not this one's.`}
             className={cn(
-              'group relative flex items-center gap-1.5 h-6 pl-2.5 pr-1 rounded-t text-[12px] shrink-0 max-w-[180px] cursor-pointer transition-colors border-b-2',
+              'group relative flex items-center gap-1.5 py-1 pl-2.5 pr-1 rounded-t text-[12px] shrink-0 max-w-[180px] cursor-pointer transition-colors border-b-2',
               doc.active
-                ? 'bg-background text-foreground font-medium border-primary'
+                ? 'bg-primary/10 text-foreground font-semibold border-primary'
                 : 'text-muted-foreground hover:text-foreground hover:bg-accent/30 border-transparent',
               switchingId && !isSwitchingHere && 'pointer-events-none opacity-60',
             )}
           >
             {doc.active && !isSwitchingHere && (
-              <span aria-hidden className="inline-block w-1.5 h-1.5 rounded-full bg-primary shrink-0" />
+              <span
+                aria-hidden
+                className="inline-block w-2 h-2 rounded-full bg-primary ring-2 ring-primary/25 shrink-0"
+              />
             )}
             {isSwitchingHere && (
               <span
                 aria-hidden
-                className="inline-block w-1.5 h-1.5 rounded-full bg-primary shrink-0 animate-pulse"
+                className="inline-block w-2 h-2 rounded-full bg-primary shrink-0 animate-pulse"
               />
             )}
-            <span className="truncate">{doc.name}</span>
+            <span className="min-w-0 flex flex-col justify-center leading-tight">
+              <span className="truncate">{doc.name}</span>
+              <span className="truncate text-[9px] font-normal text-muted-foreground/60 tabular-nums">
+                {formatShortDate(doc.createdAt)}
+                <span className="font-mono"> · {idFragment(doc.id)}</span>
+              </span>
+            </span>
             <button
               type="button"
               onClick={(e) => handleCloseClick(e, doc)}
@@ -304,9 +333,14 @@ export function DocumentTabs() {
                     key={doc.id}
                     type="button"
                     onClick={() => void handleOpenExisting(doc)}
-                    className="w-full text-left px-3 py-1.5 hover:bg-accent/40 text-foreground/90 truncate block"
+                    title={`${doc.name} — created ${formatShortDate(doc.createdAt)} · ${doc.id}`}
+                    className="w-full flex flex-col min-w-0 text-left px-3 py-1.5 hover:bg-accent/40"
                   >
-                    {doc.name}
+                    <span className="truncate text-foreground/90">{doc.name}</span>
+                    <span className="truncate text-[10px] text-muted-foreground/60 tabular-nums">
+                      {formatShortDate(doc.createdAt)}
+                      <span className="font-mono"> · {idFragment(doc.id)}</span>
+                    </span>
                   </button>
                 ))}
               </>

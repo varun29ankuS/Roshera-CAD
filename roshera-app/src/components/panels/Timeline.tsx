@@ -175,12 +175,14 @@ function RecentOpsStrip({
   onContextMenu,
   loading,
   durability,
+  onOpenMap,
 }: {
   events: EventSummary[]
   now: number
   onContextMenu: (e: React.MouseEvent, event: EventSummary) => void
   loading: boolean
   durability: DurabilityStatus | null
+  onOpenMap?: () => void
 }) {
   if (events.length === 0) {
     // An empty strip must say the TRUE thing, and "no operations yet"
@@ -204,12 +206,26 @@ function RecentOpsStrip({
   return (
     <div className="flex items-center gap-0 px-3 py-1.5 overflow-x-auto whitespace-nowrap">
       {hiddenCount > 0 && (
-        <span
-          className="text-[10px] text-muted-foreground/50 mr-1.5 shrink-0"
-          title={`${hiddenCount} earlier operation${hiddenCount === 1 ? '' : 's'} — see the map for full history`}
-        >
-          ⋯{hiddenCount}
-        </span>
+        <Fragment>
+          {onOpenMap ? (
+            <button
+              type="button"
+              onClick={onOpenMap}
+              title={`${hiddenCount} earlier operation${hiddenCount === 1 ? '' : 's'} — open the map for full history`}
+              className="shrink-0 px-1.5 py-0.5 rounded-full border border-border/60 text-[11px] leading-none text-foreground/80 hover:text-foreground hover:border-border hover:bg-accent/40 transition-colors"
+            >
+              +{hiddenCount} earlier
+            </button>
+          ) : (
+            <span
+              className="shrink-0 px-1.5 py-0.5 rounded-full border border-border/60 text-[11px] leading-none text-foreground/80"
+              title={`${hiddenCount} earlier operation${hiddenCount === 1 ? '' : 's'} — see the map for full history`}
+            >
+              +{hiddenCount} earlier
+            </span>
+          )}
+          <Connector />
+        </Fragment>
       )}
       {recent.map((event, i) => (
         <Fragment key={event.id}>
@@ -1757,6 +1773,7 @@ export function Timeline() {
             onContextMenu={handleEventContextMenu}
             loading={loading}
             durability={durability}
+            onOpenMap={() => setGraphOpen(true)}
           />
         </div>
       )}
