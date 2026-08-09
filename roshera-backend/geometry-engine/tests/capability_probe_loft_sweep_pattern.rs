@@ -32,7 +32,7 @@ use geometry_engine::operations::{
 use geometry_engine::primitives::curve::{Circle, Line, ParameterRange};
 use geometry_engine::primitives::edge::{Edge, EdgeId, EdgeOrientation};
 use geometry_engine::primitives::face::FaceId;
-use geometry_engine::primitives::shell::{Shell, ShellType};
+use geometry_engine::primitives::shell::{Shell, ShellId, ShellType};
 use geometry_engine::primitives::solid::{Solid, SolidId};
 use geometry_engine::primitives::topology_builder::{BRepModel, GeometryId, TopologyBuilder};
 use geometry_engine::tessellation::{tessellate_solid, TessellationParams, TriangleMesh};
@@ -348,69 +348,96 @@ fn sweep_cylinder_r2_len30_matches_closed_form_within_2pct() {
 // Vec<FaceId>, pattern_type, options) -> OperationResult<Vec<Vec<FaceId>>>`.
 // It patterns a FACE SET, not a `SolidId`, and returns `N` groups of
 // transformed FACE copies -- it never constructs new `SolidId`s and never
-// booleans the copies together. `PatternOptions::merge_results` is declared
-// but dead: `grep -rn merge_results src/` shows it is written in every
-// constructor and read NOWHERE in `create_pattern_body`. So "4 bodies-worth
+// booleans the copies together. (`PatternOptions::merge_results` used to
+// suggest otherwise; it was declared, written by every constructor, and read
+// NOWHERE, so it has been DELETED rather than left as a lie the option list
+// tells. Honestly implementing it would mean `create_pattern` minting solids,
+// which its `Vec<Vec<FaceId>>` return type cannot express.) So "4 bodies-worth
 // of volume" is not something the API hands back directly; each instance's
 // face GROUP has to be wrapped into a `Shell`/`Solid` by the caller (exactly
 // as `boolean_multibody.rs`'s `make_box` wraps `TopologyBuilder` output) to
 // even ask the question. That wrapping is done here, explicitly, as
-// measurement scaffolding -- not something `create_pattern` provides.
+// measurement scaffolding -- not something `create_pattern` provides. What
+// `create_pattern` DOES now guarantee is that such a wrap succeeds: an
+// instance's copied faces are internally edge-welded, so they close.
 // ===========================================================================
 
-/// Wrap a face group (assumed to already form a closed 2-manifold, e.g. every
-/// face of a patterned box instance) into a fresh `Solid` so its volume /
-/// certificate can be queried. This is test-only scaffolding: `create_pattern`
-/// itself never does this.
-fn solid_from_face_group(m: &mut BRepModel, faces: &[FaceId]) -> SolidId {
+/// Wrap a face group (e.g. every face of a patterned box instance) into a fresh
+/// `Shell`/`Solid` so its volume / certificate / shell closure can be queried.
+/// Returns both ids -- the `ShellId` is what `validate_shell_closure` takes.
+/// This is test-only scaffolding: `create_pattern` itself never does this.
+fn solid_from_face_group(m: &mut BRepModel, faces: &[FaceId]) -> (SolidId, ShellId) {
     let mut shell = Shell::new(0, ShellType::Closed);
     for &f in faces {
         shell.add_face(f);
     }
     let shell_id = m.shells.add(shell);
-    m.solids.add(Solid::new(0, shell_id))
+    (m.solids.add(Solid::new(0, shell_id)), shell_id)
 }
 
-/// MEASURED RED. `create_pattern_instance` calls `transform_face` once PER
-/// FACE, independently; `transform_face` -> `transform_loop` builds a fresh
-/// `vmap: HashMap<VertexId, VertexId>` LOCAL to that one call, so it dedups
-/// corners WITHIN a face's own loop but never ACROSS two different faces --
-/// two box faces meeting at a physical edge each mint their OWN private copy
-/// of that edge (a different `EdgeId`, coincidentally equal endpoints).
-/// `merge_pattern_geometry` (run because `PatternOptions::default()` sets
-/// `merge_geometry: true`) then does a vertex-coincidence pass, but its own
-/// doc comment says it plainly: "Edges and faces themselves are not
-/// deduplicated here." So after merge, the two faces' private edges share
-/// canonical VERTEX ids but remain two distinct `EdgeId`s, each referenced by
-/// only ONE face's loop -- exactly what a whole-model B-Rep connectivity
-/// check reports as an open boundary.
+/// The multiset of `EdgeId`s referenced by a face group's loops (outer +
+/// inner), as `edge_id -> number of distinct faces using it`. This is the
+/// direct, mesh-independent read of the defect: welded topology puts every
+/// edge on exactly two faces.
+fn edge_face_counts(m: &BRepModel, faces: &[FaceId]) -> std::collections::BTreeMap<EdgeId, usize> {
+    let mut counts: std::collections::BTreeMap<EdgeId, usize> = std::collections::BTreeMap::new();
+    for &f in faces {
+        let face = m.faces.get(f).expect("group face exists");
+        let mut seen: std::collections::BTreeSet<EdgeId> = std::collections::BTreeSet::new();
+        for lid in std::iter::once(face.outer_loop).chain(face.inner_loops.iter().copied()) {
+            if let Some(lp) = m.loops.get(lid) {
+                seen.extend(lp.edges.iter().copied());
+            }
+        }
+        for e in seen {
+            *counts.entry(e).or_insert(0) += 1;
+        }
+    }
+    counts
+}
+
+/// WAS A MEASURED RED — NOW GREEN (fixed in `operations/pattern.rs`; the
+/// `#[ignore]` is removed, every original assertion intact and three added).
 ///
-/// Actual run: instance 0 (the untouched seed) certifies sound. Instance 1 (a
-/// transformed copy, wrapped in a fresh `Shell`/`Solid` by this test since
-/// `create_pattern` itself never does that -- see the CASE 3 header) does
-/// NOT: `ValidityCertificate { brep_valid: false, watertight: true,
-/// manifold: true, euler_characteristic: 2, boundary_edges: 0, ... errors:
-/// [24 x ConnectivityError "Boundary edge N detected - potential gap in
-/// topology"] }` -- 24 errors = the box's 12 physical edges, each flagged
-/// from BOTH adjacent faces' private copy. Volume is exactly right (96.0,
-/// matching the seed) and the MESH-level watertight/manifold flags are both
-/// true -- only the strict B-Rep half-edge accounting catches it. This
-/// confirms the CASE 3 header's contract reading: `create_pattern` hands back
-/// face copies, not a welded solid, and a caller assembling one downstream
-/// needs an edge-welding pass the API does not provide.
+/// The defect: `create_pattern_instance` called `transform_face` once PER FACE,
+/// independently, and `transform_face` -> `transform_loop` built a fresh
+/// `vmap: HashMap<VertexId, VertexId>` LOCAL to that one call. It therefore
+/// deduped corners WITHIN a face's own loop but never ACROSS two faces, and it
+/// deduped EDGES nowhere at all -- two box faces meeting at a physical edge each
+/// minted their OWN private copy of it (a different `EdgeId` on coincidentally
+/// equal endpoints). `merge_pattern_geometry` (run because
+/// `PatternOptions::default()` sets `merge_geometry: true`) then did a
+/// vertex-coincidence pass, but it said so plainly: "Edges and faces themselves
+/// are not deduplicated here." So after the merge the two private edges shared
+/// canonical VERTEX ids and remained two distinct `EdgeId`s, each referenced by
+/// exactly ONE face's loop -- which is what strict B-Rep connectivity reports as
+/// an open boundary.
+///
+/// The RED run, verbatim: instance 0 (the untouched seed) certified sound;
+/// instance 1 (a transformed copy, wrapped in a fresh `Shell`/`Solid` by this
+/// test since `create_pattern` never does that -- see the CASE 3 header) did
+/// NOT: `ValidityCertificate { brep_valid: false, watertight: true, manifold:
+/// true, euler_characteristic: 2, boundary_edges: 0, nonmanifold_edges: 0,
+/// oriented: true, ... errors: [24 x ConnectivityError "Boundary edge N
+/// detected - potential gap in topology"] }`. Those 24 errors carried edge ids
+/// 12..=35 and face ids 6..=11 -- i.e. **24 DISTINCT edges, each flagged once**:
+/// 6 faces x 4 private edges apiece, where a welded box has 12 edges shared
+/// two-apiece. (An earlier reading of this failure as "12 edges flagged twice"
+/// was wrong; the ids in the payload settle it.) Volume was exactly right (96.0,
+/// matching the seed) and the MESH-level flags -- watertight, manifold,
+/// euler=2, boundary_edges=0 -- were ALL clean, because coincident private edges
+/// position-weld away in tessellation. Only strict B-Rep half-edge accounting
+/// could see it.
+///
+/// The fix (`pattern::InstanceRemap`) gives one copied instance a single
+/// identity-keyed remap, `source EdgeId -> copy EdgeId` (and likewise for
+/// vertices), threaded through every face of that instance -- the
+/// `deep_clone::CloneContext` idiom rather than sweep's coincidence search. Two
+/// source faces sharing an edge resolve it under the same key, so the copy is
+/// welded exactly where the seed was and nowhere else. The 24->12 edge collapse
+/// is asserted below directly, so a regression that drops the edge map fails on
+/// the count even if certification were to stop noticing.
 #[test]
-#[ignore = "MEASURED: create_pattern's per-face transform_loop mints private, \
-            un-shared edges at every face boundary (merge_pattern_geometry \
-            merges VERTEX coincidence only -- its own doc comment says so). \
-            Wrapping a patterned box instance's 6 copied faces in a fresh \
-            Shell/Solid (test-only scaffolding; create_pattern never does \
-            this) certifies UNSOUND: brep_valid=false with 24 \
-            ConnectivityError 'Boundary edge N' entries (the box's 12 \
-            physical edges, each flagged twice, once per adjacent face's \
-            private copy), even though volume=96.0 (exact) and the mesh-level \
-            watertight/manifold flags are both true. Instance 0 (untouched \
-            seed) is unaffected and certifies sound. Pinned per \
-            boolean_multibody.rs precedent; assertions intact."]
 fn linear_pattern_box_x4_contract_is_four_disjoint_face_groups() {
     let (w, h, d) = (4.0_f64, 4.0_f64, 6.0_f64);
     let spacing = 10.0_f64; // > w: instances cannot touch along the pattern axis.
@@ -453,21 +480,37 @@ fn linear_pattern_box_x4_contract_is_four_disjoint_face_groups() {
             6,
             "instance {i}: every copy carries the full 6-face box, not a subset",
         );
-        let sid = if i == 0 {
-            seed_solid
+        // The B-Rep read of the weld, taken BEFORE any certificate so it stands
+        // on its own: a welded 6-face box references 12 distinct edges, each
+        // used by exactly 2 faces. Un-welded it was 24 edges x 1 face.
+        let counts = edge_face_counts(&m, group);
+        let per_face: Vec<usize> = counts.values().copied().collect();
+
+        let (sid, shell_id) = if i == 0 {
+            let mut shell = None;
+            if let Some(solid) = m.solids.get(seed_solid) {
+                shell = Some(solid.outer_shell);
+            }
+            (seed_solid, shell.expect("seed solid has an outer shell"))
         } else {
             solid_from_face_group(&mut m, group)
         };
+        let closure = geometry_engine::primitives::validation::validate_shell_closure(&m, shell_id);
         let cert = m.certify_solid(sid);
         let vol = m
             .calculate_solid_volume(sid)
             .unwrap_or_else(|| panic!("instance {i}: no volume computed"));
         eprintln!(
             "[pattern instance {i}] volume={vol:.6} cert_sound={} brep_valid={} \
-             watertight={}",
+             watertight={} distinct_edges={} faces_per_edge={:?} cert_errors={} \
+             shell_closure_errors={}",
             cert.is_sound(),
             cert.brep_valid,
             cert.watertight,
+            counts.len(),
+            per_face.iter().collect::<std::collections::BTreeSet<_>>(),
+            cert.errors.len(),
+            closure.len(),
         );
         assert!(
             cert.is_sound(),
@@ -478,6 +521,45 @@ fn linear_pattern_box_x4_contract_is_four_disjoint_face_groups() {
             "instance {i}: volume {vol} should equal the seed box volume {box_volume} \
              (pure translation, no deformation)",
         );
+
+        // --- the three numbers the old `#[ignore]` reason recorded as broken ---
+        //
+        // (a) `brep_valid` was the ONE false flag on the copy; `watertight`,
+        //     `manifold`, `euler=2` and `boundary_edges=0` were all true and
+        //     lying, so pin the B-Rep half, not the mesh half.
+        assert!(
+            cert.brep_valid,
+            "instance {i}: B-Rep accounting must be valid (it was false on every \
+             copy while the mesh flags all read clean): {:?}",
+            cert.errors,
+        );
+        assert!(
+            cert.errors.is_empty(),
+            "instance {i}: certificate must carry NO errors (24 ConnectivityError \
+             'Boundary edge N' entries before the weld): {:?}",
+            cert.errors,
+        );
+        // (b) The named contract: one instance's faces form a CLOSED shell.
+        assert!(
+            closure.is_empty(),
+            "instance {i}: validate_shell_closure must report nothing -- a copied \
+             instance's faces have to close on their own: {closure:?}",
+        );
+        // (c) The mesh-independent witness. 12 vs 24 is the whole defect: if the
+        //     identity edge map is ever dropped, this fails on the count alone.
+        assert_eq!(
+            counts.len(),
+            12,
+            "instance {i}: a box instance must reference exactly 12 distinct edges \
+             (it referenced 24 private ones before the weld), got {:?}",
+            counts.keys().collect::<Vec<_>>(),
+        );
+        assert!(
+            per_face.iter().all(|&c| c == 2),
+            "instance {i}: every edge must be used by exactly 2 faces (each was \
+             used by exactly 1 before the weld), got {counts:?}",
+        );
+
         total_volume += vol;
     }
 

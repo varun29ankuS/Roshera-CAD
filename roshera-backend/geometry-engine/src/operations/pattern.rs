@@ -132,9 +132,6 @@ pub struct PatternOptions {
     /// Whether to merge coincident geometry
     pub merge_geometry: bool,
 
-    /// Whether to merge pattern results into single solid
-    pub merge_results: bool,
-
     /// Whether to create associative pattern (linked copies)
     pub associative: bool,
 
@@ -153,7 +150,6 @@ impl Default for PatternOptions {
             },
             pattern_target: PatternTarget::Features,
             merge_geometry: true,
-            merge_results: true,
             associative: false,
             skip_interferences: false,
         }
@@ -536,8 +532,13 @@ fn create_pattern_instance(
 ) -> OperationResult<Vec<FaceId>> {
     let mut instance_faces = Vec::with_capacity(source_features.len());
 
+    // ONE remap for the WHOLE instance, so the copy is welded exactly where the
+    // seed was: two source faces that meet at a physical edge resolve that
+    // edge's copy through the same map entry and therefore reference a single
+    // copied EdgeId. See `InstanceRemap`.
+    let mut remap = InstanceRemap::default();
     for &face_id in source_features {
-        let transformed_face = transform_face(model, face_id, transform)?;
+        let transformed_face = transform_face_with_remap(model, face_id, transform, &mut remap)?;
         instance_faces.push(transformed_face);
     }
 
@@ -561,11 +562,57 @@ fn create_pattern_instance(
     Ok(instance_faces)
 }
 
-/// Transform a face
+/// Identity-keyed remap for ONE copied instance: original entity id → the
+/// copy's entity id.
+///
+/// This is the `deep_clone::CloneContext` idiom (map by the SOURCE id) rather
+/// than sweep's `create_or_find_edge` idiom (search the store for a coincident
+/// vertex pair). Keying on the original id is what makes the copy structurally
+/// congruent to the seed *by construction*: two source faces that share an edge
+/// look that edge up under the same key and get the same copied `EdgeId`, so
+/// the copy is welded wherever the seed was and nowhere else. It is also O(1)
+/// per lookup, cannot accidentally recover a SIBLING instance's edge (a
+/// coincidence search over the whole store can), and — because the copied edge
+/// keeps the original's intrinsic start→end direction — a loop's stored
+/// per-edge `forward` flag carries over unchanged, with no re-derivation.
+///
+/// Scope is deliberately ONE instance. Distinct instances sit at distinct
+/// poses, so they must NOT share topology; any genuine coincidence BETWEEN
+/// instances (a circular pattern closing back onto the seed) is the separate,
+/// position-based concern of `merge_pattern_geometry`.
+#[derive(Debug, Default)]
+struct InstanceRemap {
+    /// Source `VertexId` → the transformed copy's `VertexId`.
+    vertices: std::collections::HashMap<VertexId, VertexId>,
+    /// Source `EdgeId` → the transformed copy's `EdgeId`. The entry that welds
+    /// the two faces adjacent to a physical edge.
+    edges: std::collections::HashMap<EdgeId, EdgeId>,
+}
+
+/// Transform a face, standalone.
+///
+/// Each call gets a private [`InstanceRemap`], so the copy shares topology
+/// within its own loops and with nothing else — the right contract for a
+/// single-face caller such as sweep's `transform_face_full`, which welds its
+/// section faces to the lateral ring itself. Callers copying a face SET that
+/// has to stay mutually welded must use `transform_face_with_remap` with one
+/// remap spanning the whole set.
 pub fn transform_face(
     model: &mut BRepModel,
     face_id: FaceId,
     transform: &Matrix4,
+) -> OperationResult<FaceId> {
+    let mut remap = InstanceRemap::default();
+    transform_face_with_remap(model, face_id, transform, &mut remap)
+}
+
+/// Transform a face, resolving its vertices and edges through `remap` so every
+/// face copied under the same remap shares the seed's seams.
+fn transform_face_with_remap(
+    model: &mut BRepModel,
+    face_id: FaceId,
+    transform: &Matrix4,
+    remap: &mut InstanceRemap,
 ) -> OperationResult<FaceId> {
     let face = model
         .faces
@@ -582,13 +629,13 @@ pub fn transform_face(
     let new_surface_id = model.surfaces.add(transformed_surface);
 
     // Transform loop
-    let transformed_loop = transform_loop(model, face.outer_loop, transform)?;
+    let transformed_loop = transform_loop(model, face.outer_loop, transform, remap)?;
     let new_loop_id = model.loops.add(transformed_loop);
 
     // Transform inner loops
     let mut new_inner_loops = Vec::new();
     for &inner_loop_id in &face.inner_loops {
-        let transformed_inner = transform_loop(model, inner_loop_id, transform)?;
+        let transformed_inner = transform_loop(model, inner_loop_id, transform, remap)?;
         let new_inner_id = model.loops.add(transformed_inner);
         new_inner_loops.push(new_inner_id);
     }
@@ -607,11 +654,34 @@ pub fn transform_face(
     Ok(model.faces.add(new_face))
 }
 
-/// Transform a loop
+/// Transform a loop, resolving its vertices and edges through `remap`.
+///
+/// Both the vertex and the edge copy are memoised on the SOURCE id:
+///
+/// * **Vertices** — a corner shared by two consecutive edges stays a single
+///   transformed `VertexId`. (A per-edge mint made every shared corner two
+///   coincident-but-distinct vertices, so the transformed loop was a non-closed
+///   chain: sweep's open cap loops + duplicate cap vertices,
+///   SWEEP-BREP-UNSTITCHED #64.)
+/// * **Edges** — a physical edge shared by two faces stays a single transformed
+///   `EdgeId`. Minting one privately per loop is what left a patterned box's six
+///   copied faces holding 24 private edges instead of 12 shared ones: every edge
+///   used by exactly ONE face's loop, which strict B-Rep accounting reports as a
+///   boundary edge per face (PATTERN-COPY-UNWELDED). The mesh could not see it —
+///   the private edges are coincident, so position-welded tessellation still
+///   reported watertight, manifold, euler=2 with the right volume.
+///
+/// A reused edge is reused with its stored direction intact (the copy inherits
+/// the original's `start_vertex`/`end_vertex` mapping), so `loop_data
+/// .orientations[i]` — which already encodes THIS loop's traversal sense
+/// relative to that direction — is carried over verbatim. Nothing has to be
+/// re-derived from the recovered edge, unlike the coincidence-keyed lookups in
+/// `sweep::create_or_find_edge`.
 fn transform_loop(
     model: &mut BRepModel,
     loop_id: u32,
     transform: &Matrix4,
+    remap: &mut InstanceRemap,
 ) -> OperationResult<Loop> {
     let loop_data = model
         .loops
@@ -619,15 +689,6 @@ fn transform_loop(
         .ok_or_else(|| OperationError::InvalidGeometry("Loop not found".to_string()))?
         .clone();
 
-    // Transform each UNIQUE original vertex once and SHARE it across the loop's
-    // edges, so a corner shared by two consecutive edges stays a single
-    // transformed VertexId. The previous per-edge `transform_edge` minted a
-    // fresh vertex for every endpoint, so every shared corner became two
-    // coincident-but-distinct vertices and the transformed loop was a non-closed
-    // chain — the source of sweep's open cap loops + duplicate cap vertices
-    // (SWEEP-BREP-UNSTITCHED #64), and a latent malformation in every pattern
-    // copy's faces.
-    let mut vmap: std::collections::HashMap<VertexId, VertexId> = std::collections::HashMap::new();
     let mut new_loop = Loop::new(
         0, // Will be assigned by store
         loop_data.loop_type,
@@ -635,45 +696,63 @@ fn transform_loop(
 
     for (i, &edge_id) in loop_data.edges.iter().enumerate() {
         let forward = loop_data.orientations[i];
-        let edge = model
-            .edges
-            .get(edge_id)
-            .ok_or_else(|| OperationError::InvalidGeometry("Edge not found".to_string()))?
-            .clone();
-
-        let new_start = transform_vertex_shared(model, &mut vmap, edge.start_vertex, transform)?;
-        let new_end = transform_vertex_shared(model, &mut vmap, edge.end_vertex, transform)?;
-
-        let curve = model
-            .curves
-            .get(edge.curve_id)
-            .ok_or_else(|| OperationError::InvalidGeometry("Curve not found".to_string()))?;
-        let new_curve_id = model.curves.add(curve.transform(transform));
-
-        let new_edge = Edge::new(
-            0,
-            new_start,
-            new_end,
-            new_curve_id,
-            edge.orientation,
-            edge.param_range,
-        );
-        new_loop.add_edge(model.edges.add(new_edge), forward);
+        let new_edge_id = transform_edge_shared(model, remap, edge_id, transform)?;
+        new_loop.add_edge(new_edge_id, forward);
     }
 
     Ok(new_loop)
 }
 
+/// Transform one edge through `transform`, reusing the result for any later loop
+/// that references the same original edge (so a physical edge shared by two
+/// faces stays a single transformed `EdgeId` — the weld).
+fn transform_edge_shared(
+    model: &mut BRepModel,
+    remap: &mut InstanceRemap,
+    eid: EdgeId,
+    transform: &Matrix4,
+) -> OperationResult<EdgeId> {
+    if let Some(&ne) = remap.edges.get(&eid) {
+        return Ok(ne);
+    }
+    let edge = model
+        .edges
+        .get(eid)
+        .ok_or_else(|| OperationError::InvalidGeometry("Edge not found".to_string()))?
+        .clone();
+
+    let new_start = transform_vertex_shared(model, remap, edge.start_vertex, transform)?;
+    let new_end = transform_vertex_shared(model, remap, edge.end_vertex, transform)?;
+
+    let curve = model
+        .curves
+        .get(edge.curve_id)
+        .ok_or_else(|| OperationError::InvalidGeometry("Curve not found".to_string()))?;
+    let new_curve_id = model.curves.add(curve.transform(transform));
+
+    let new_edge = Edge::new(
+        0,
+        new_start,
+        new_end,
+        new_curve_id,
+        edge.orientation,
+        edge.param_range,
+    );
+    let ne = model.edges.add(new_edge);
+    remap.edges.insert(eid, ne);
+    Ok(ne)
+}
+
 /// Transform one vertex through `transform`, reusing the result for any later
-/// edge that shares the same original vertex (so a loop's shared corners stay a
-/// single transformed VertexId).
+/// edge that shares the same original vertex (so shared corners stay a single
+/// transformed `VertexId`).
 fn transform_vertex_shared(
     model: &mut BRepModel,
-    vmap: &mut std::collections::HashMap<VertexId, VertexId>,
+    remap: &mut InstanceRemap,
     vid: VertexId,
     transform: &Matrix4,
 ) -> OperationResult<VertexId> {
-    if let Some(&nv) = vmap.get(&vid) {
+    if let Some(&nv) = remap.vertices.get(&vid) {
         return Ok(nv);
     }
     let pos = model
@@ -683,11 +762,9 @@ fn transform_vertex_shared(
         .position;
     let np = transform.transform_point(&Point3::from(pos));
     let nv = model.vertices.add(np.x, np.y, np.z);
-    vmap.insert(vid, nv);
+    remap.vertices.insert(vid, nv);
     Ok(nv)
 }
-
-/// Transform an edge
 
 /// Check for interference between instances using face vertex bounding-box
 /// overlap.
@@ -758,20 +835,26 @@ fn aabbs_overlap(a: &[f64; 6], b: &[f64; 6]) -> bool {
     a[0] <= b[3] && a[3] >= b[0] && a[1] <= b[4] && a[4] >= b[1] && a[2] <= b[5] && a[5] >= b[2]
 }
 
-/// Merge coincident vertices created by pattern instancing.
+/// Merge coincident vertices BETWEEN pattern instances.
 ///
-/// `transform_edge` always pushes a fresh vertex for every endpoint, so
-/// pattern instances that meet at shared positions (e.g. circular patterns
-/// closing back on the seed) end up with duplicate vertices. This pass
-/// detects vertex pairs that lie within `options.common.tolerance.distance()`
-/// of each other in 3-space and rewrites edge endpoints to point at the
-/// canonical (lowest-id) vertex of each cluster.
+/// Sharing WITHIN one instance is settled upstream, by identity, in
+/// `InstanceRemap`: an instance's copied faces already reference exactly the
+/// vertices and edges its seed shared, no more and no fewer. What this pass
+/// handles is the strictly cross-instance case — two instances that come to
+/// rest at the same place (a circular pattern closing back onto the seed, a
+/// linear pattern spaced exactly one feature width apart) each hold their own
+/// copy of the meeting geometry, and no identity relates them because they were
+/// copied under different remaps and different transforms. Position is the only
+/// evidence available. This pass detects vertex pairs within
+/// `options.common.tolerance.distance()` of each other in 3-space and rewrites
+/// edge endpoints to point at the canonical (lowest-id) vertex of each cluster.
 ///
-/// Edges and faces themselves are not deduplicated here — that requires
-/// curve/surface geometric equality, which the boolean pass handles when
-/// the pattern is later combined with adjacent solids. Vertex merge is
-/// the prerequisite for downstream booleans and the only step necessary
-/// for a watertight intermediate B-Rep.
+/// Edges and faces are NOT deduplicated across instances here — that requires
+/// curve/surface geometric equality, which the boolean pass handles when the
+/// pattern is later combined with adjacent solids. So a shared cross-instance
+/// vertex leaves two coincident edges standing; a caller that wraps a face set
+/// spanning MORE THAN ONE instance into a single shell must expect that, whereas
+/// one instance's faces are welded and close on their own.
 fn merge_pattern_geometry(
     model: &mut BRepModel,
     instances: &mut Vec<Vec<FaceId>>,

@@ -1041,7 +1041,6 @@ impl OperationsRegistry {
 
         let options = PatternOptions {
             pattern_type: pattern_type.clone(),
-            merge_results: false,
             common: crate::operations::CommonOptions::default(),
             pattern_target: crate::operations::pattern::PatternTarget::Features,
             merge_geometry: true,
