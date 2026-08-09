@@ -15,6 +15,16 @@ export class HttpError extends Error {
   }
 }
 
+// The live backend now requires auth on the mutating endpoints this suite
+// drives (clear_parts, geometry create/boolean, ...) — every scenario in
+// this corpus predates that gate. `setAuthToken` lets run.mjs log in once
+// (POST /api/auth/login) and have every subsequent request carry the
+// bearer token, same as a real agent client would.
+let authToken = process.env.ROSHERA_TOKEN ?? null;
+export function setAuthToken(token) {
+  authToken = token;
+}
+
 /** Core request. Returns { status, ok, data } — never throws on 4xx/5xx so
  *  scenarios can assert on honest kernel refusals (404/409/422). Throws only on
  *  transport failure / timeout. */
@@ -26,6 +36,7 @@ export async function request(method, path, body, timeoutMs = 120000) {
       method,
       headers: {
         "X-Roshera-Agent": "AgentEvalAlpha",
+        ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
         ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
       },
       body: body !== undefined ? JSON.stringify(body) : undefined,

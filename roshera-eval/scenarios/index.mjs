@@ -16,6 +16,7 @@ import quadricSsiHonesty from "./14-quadric-ssi-honesty.mjs";
 import drawingComprehension from "./15-drawing-comprehension.mjs";
 import shelfBracket from "./16-shelf-bracket.mjs";
 import nema17MotorMount from "./17-nema17-motor-mount.mjs";
+import multibodyHonesty from "./18-multibody-honesty.mjs";
 
 export const scenarios = [
   gear,
@@ -35,4 +36,5 @@ export const scenarios = [
   drawingComprehension,
   shelfBracket,
   nema17MotorMount,
+  multibodyHonesty,
 ];

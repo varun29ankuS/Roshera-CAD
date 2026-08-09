@@ -15,7 +15,7 @@
  * PASSES when the kernel honestly flags it unsound.
  */
 import { writeFile } from "node:fs/promises";
-import { makeClient, BASE } from "./lib/client.mjs";
+import { makeClient, BASE, setAuthToken, request } from "./lib/client.mjs";
 import * as geom from "./lib/geom.mjs";
 import { scenarios as ALL } from "./scenarios/index.mjs";
 import { runSuite, summarize, scorecard } from "./lib/harness.mjs";
@@ -47,6 +47,27 @@ async function main() {
     process.exit(2);
   }
 
+  // Auth: the live backend now gates mutating endpoints (clear_parts,
+  // geometry create/boolean, ...) behind a bearer token. Log in once and
+  // let every subsequent request (through this same `client` and any raw
+  // `request()` a scenario makes) carry it. Override with
+  // ROSHERA_USERNAME/ROSHERA_PASSWORD or skip entirely with ROSHERA_TOKEN.
+  if (!process.env.ROSHERA_TOKEN) {
+    const username = process.env.ROSHERA_USERNAME ?? "varun";
+    const password = process.env.ROSHERA_PASSWORD ?? "Roshera321!";
+    try {
+      const auth = await request("POST", "/api/auth/login", { username, password }, 10000);
+      if (!auth.ok || !auth.data?.token) {
+        throw new Error(`login -> ${auth.status}: ${JSON.stringify(auth.data)?.slice(0, 200)}`);
+      }
+      setAuthToken(auth.data.token);
+      process.stdout.write(`Authenticated as ${username}\n`);
+    } catch (e) {
+      console.error(`\nFATAL: auth login failed — ${e.message}\n`);
+      process.exit(2);
+    }
+  }
+
   const results = await runSuite(scenarios, client, geom);
   const summary = summarize(results);
   process.stdout.write(scorecard(results, summary));
@@ -69,7 +90,19 @@ async function main() {
   await writeFile(jsonOut, JSON.stringify(report, null, 2));
   process.stdout.write(`JSON report written to ${jsonOut}\n`);
 
-  const failed = results.filter((r) => !r.passed).length;
+  // `knownRed: true` scenarios document a live, already-reported kernel
+  // defect (see scenarios/18-multibody-honesty.mjs) — they are SUPPOSED to
+  // fail today, so they do not count against the suite's exit code. If one
+  // ever passes, that is the signal its defect got fixed; say so loudly and
+  // tell the human to delete the flag rather than silently going green.
+  for (const r of results) {
+    if (r.knownRed && r.passed) {
+      process.stdout.write(
+        `\n⚠ ${r.id} is flagged knownRed but PASSED — its defect looks fixed. Remove \`knownRed: true\` from the scenario.\n`,
+      );
+    }
+  }
+  const failed = results.filter((r) => !r.passed && !r.knownRed).length;
   process.exit(failed);
 }
 

@@ -143,6 +143,14 @@ export async function runScenario(scenario, client, geom) {
     id: scenario.id,
     title: scenario.title,
     passed: t.passed,
+    // A scenario may set `knownRed: true` to declare "this is EXPECTED to
+    // fail today — it documents a live kernel defect, not a broken test."
+    // The harness still scores and prints it honestly (nothing here
+    // suppresses a failing check); only run.mjs's exit code and the
+    // scorecard's PASS/FAIL mark treat it specially. See
+    // scenarios/18-multibody-honesty.mjs for the convention writeup — no
+    // such mechanism existed before that scenario needed one.
+    knownRed: !!scenario.knownRed,
     wallMs,
     checks: t.items,
     timings,
@@ -150,14 +158,24 @@ export async function runScenario(scenario, client, geom) {
   };
 }
 
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
 /** Run the whole suite in order. */
 export async function runSuite(scenarios, client, geom) {
   const results = [];
   for (const s of scenarios) {
+    // A full 17-18 scenario sweep run back-to-back trips the live backend's
+    // per-window rate limiter (measured 2026-08-08: every scenario after the
+    // first got a 429 on its very first request). This is NOT concurrency —
+    // runSuite is a strict sequential loop, one scenario at a time — it is
+    // simply request VOLUME. A short pause between scenarios (not between
+    // requests within one) keeps the suite under the limiter without
+    // materially lengthening a sweep that already runs one scenario at a time.
+    if (results.length > 0) await sleep(1500);
     process.stdout.write(`\n▶ ${s.id} — ${s.title}\n`);
     const r = await runScenario(s, client, geom);
     results.push(r);
-    const mark = r.passed ? "PASS" : "FAIL";
+    const mark = r.passed ? "PASS" : r.knownRed ? "FAIL (known-red)" : "FAIL";
     process.stdout.write(`  ${mark}  (${r.wallMs}ms, ${r.checks.filter((c) => c.passed).length}/${r.checks.length} checks)\n`);
     for (const c of r.checks.filter((c) => !c.passed)) {
       process.stdout.write(`     ✗ [${c.dim}] ${c.name} — ${c.detail}\n`);
@@ -201,7 +219,7 @@ export function scorecard(results, summary) {
   for (const r of results) {
     const cp = r.checks.filter((c) => c.passed).length;
     const ct = r.checks.length;
-    const mark = r.passed ? "PASS ✓" : "FAIL ✗";
+    const mark = r.passed ? "PASS ✓" : r.knownRed ? "FAIL(kr)" : "FAIL ✗";
     L.push(
       "  " +
         r.id.padEnd(34) +
