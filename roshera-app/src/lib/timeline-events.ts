@@ -71,6 +71,27 @@ export interface CheckpointSummary {
    * branch".
    */
   branch_id?: string
+  /**
+   * `[first, last]` events this decision actually AUTHORED, as opposed to
+   * `event_range`, which is a RESTORE MARKER covering everything on the
+   * branch up to this point (`Timeline::create_checkpoint`'s documented
+   * contract: replaying `[0, last]` reproduces the state).
+   *
+   * Because the restore marker always starts at 0 on a branch that starts
+   * at 0, successive checkpoints NEST rather than partition — the real
+   * flange document reports `[0,8] [0,17] [0,36] [0,45] [0,47] [0,72]`.
+   * Matching on that, last-covering-wins, credits every early operation to
+   * the most RECENT decision: the bolt-circle work gets labelled with the
+   * raised-face declaration. A confidently wrong intent label is worse
+   * than none, so `covers` is preferred wherever the backend sends it.
+   *
+   * Optional only because the wire type cannot force it — a response
+   * without it came from a backend build predating the field, not from
+   * stale data. `checkpointCovering` falls back to `event_range` in that
+   * case, which is the pre-existing (wrong-but-familiar) behaviour rather
+   * than a silent blank.
+   */
+  covers?: [number, number]
   author: string
   timestamp: string // ISO 8601 (RFC 3339) — NOT epoch ms
   tags: string[]
@@ -192,7 +213,14 @@ export function checkpointCovering(
   let found: CheckpointSummary | null = null
   for (const cp of checkpoints) {
     if (canonicalBranchId(cp.branch_id ?? 'main') !== target) continue
-    const [a, b] = cp.event_range
+    // `covers` is the authored span and PARTITIONS the branch, so at most
+    // one checkpoint matches and "last wins" never has to arbitrate. The
+    // `event_range` fallback is the restore marker, which nests — there
+    // last-wins picks the most RECENT decision, which is the miscrediting
+    // this field exists to end. See the doc on `covers`.
+    const [a, b] = cp.covers ?? cp.event_range
+    // An empty span (a > b, a decision that authored nothing) matches
+    // nothing, which is the intended reading.
     if (sequence >= a && sequence <= b) found = cp
   }
   return found

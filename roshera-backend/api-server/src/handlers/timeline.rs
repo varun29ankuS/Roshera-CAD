@@ -3889,7 +3889,32 @@ pub struct CheckpointSummary {
     pub name: String,
     pub description: String,
     /// `[first, last]` event indices captured by the checkpoint.
+    ///
+    /// ★ This is a RESTORE MARKER, not an authorship span. Per
+    /// `Timeline::create_checkpoint`'s contract it is
+    /// `(min_sequence, max_sequence)` over every event on the branch, so
+    /// replaying `[0, last]` reproduces the state. On a branch that starts
+    /// at 0 that makes `first` always 0, and successive checkpoints NEST
+    /// rather than partition: `[0,8] [0,17] [0,36] [0,45] [0,47] [0,72]`.
+    /// Correct for restoring; useless for "which decision produced this
+    /// operation". Use `covers` for that.
     pub event_range: [u64; 2],
+    /// `[first, last]` events this decision actually AUTHORED — the span
+    /// since the previous checkpoint on the same branch, so consecutive
+    /// checkpoints partition the branch instead of nesting.
+    ///
+    /// Derived at read time from the ordered checkpoint list rather than
+    /// stored: it is a pure function of `event_range` plus ordering, so
+    /// deriving it cannot drift from the stored data, needs no migration,
+    /// and leaves the restore contract above untouched. The first
+    /// checkpoint on a branch keeps `event_range.0` as its start.
+    ///
+    /// Why it matters: attributing intent by `event_range` alone credits
+    /// an operation to whichever checkpoint sorts last among those whose
+    /// range covers it — which, since they all start at 0, is the most
+    /// RECENT one. The bolt-circle operations get labelled with the
+    /// raised-face decision. A confidently wrong label is worse than none.
+    pub covers: [u64; 2],
     /// The branch the checkpoint was created against — `"main"` for the
     /// trunk, otherwise the branch UUID. `event_range` indexes into
     /// THIS branch's sequence numbers; without it a consumer could only
@@ -3914,10 +3939,46 @@ pub(crate) fn branch_ref_string(branch: &BranchId) -> String {
     }
 }
 
+/// Fill each summary's `covers` span: per BRANCH, order the checkpoints by
+/// the end of their restore marker and hand each one the events since the
+/// previous checkpoint ended. Per branch and not globally, because
+/// `event_range` indexes into its own branch's sequence numbers — mixing
+/// branches would let a sibling's numbers truncate this one's span.
+///
+/// Ties (two checkpoints ending on the same event, i.e. a decision that
+/// authored nothing new) yield an EMPTY span `[end + 1, end]` where first >
+/// last. That is deliberate: it is the honest representation of "this
+/// declaration covers no operations of its own", and it makes the reader's
+/// `first <= seq <= last` test naturally match nothing rather than silently
+/// claiming its predecessor's work.
+fn fill_covers(summaries: &mut [CheckpointSummary]) {
+    use std::collections::HashMap;
+    let mut by_branch: HashMap<String, Vec<usize>> = HashMap::new();
+    for (i, s) in summaries.iter().enumerate() {
+        by_branch.entry(s.branch_id.clone()).or_default().push(i);
+    }
+    for idxs in by_branch.values_mut() {
+        idxs.sort_by_key(|&i| summaries[i].event_range[1]);
+        let mut prev_end: Option<u64> = None;
+        for &i in idxs.iter() {
+            let end = summaries[i].event_range[1];
+            let start = match prev_end {
+                // Saturating: a checkpoint ending at u64::MAX cannot
+                // produce a start beyond it, and an empty span is the
+                // correct answer there too.
+                Some(p) => p.saturating_add(1),
+                None => summaries[i].event_range[0],
+            };
+            summaries[i].covers = [start, end];
+            prev_end = Some(end);
+        }
+    }
+}
+
 /// `GET /api/timeline/checkpoints` — list named design states.
 pub async fn list_checkpoints(State(state): State<AppState>) -> Json<Vec<CheckpointSummary>> {
     let timeline = state.timeline.read().await;
-    let out = timeline
+    let mut out: Vec<CheckpointSummary> = timeline
         .list_checkpoints()
         .into_iter()
         .map(|c| CheckpointSummary {
@@ -3925,12 +3986,15 @@ pub async fn list_checkpoints(State(state): State<AppState>) -> Json<Vec<Checkpo
             name: c.name,
             description: c.description,
             event_range: [c.event_range.0, c.event_range.1],
+            // Placeholder; `fill_covers` below is the only writer.
+            covers: [c.event_range.0, c.event_range.1],
             branch_id: branch_ref_string(&c.branch_id),
             author: author_label(&c.author),
             timestamp: c.timestamp.to_rfc3339(),
             tags: c.tags,
         })
         .collect();
+    fill_covers(&mut out);
     Json(out)
 }
 
@@ -4710,6 +4774,7 @@ mod checkpoint_name_gate_tests {
             name: "base plate 120x80x12".to_string(),
             description: String::new(),
             event_range: [0, 4],
+            covers: [0, 4],
             branch_id: branch_ref_string(&BranchId::main()),
             author: "System".to_string(),
             timestamp: "2026-08-01T00:00:00Z".to_string(),
@@ -4720,6 +4785,112 @@ mod checkpoint_name_gate_tests {
 
         let child = BranchId(Uuid::from_u128(0xBEEF));
         assert_eq!(branch_ref_string(&child), child.to_string());
+    }
+
+    fn cp(id: &str, branch: &str, range: [u64; 2]) -> CheckpointSummary {
+        CheckpointSummary {
+            id: id.to_string(),
+            name: id.to_string(),
+            description: String::new(),
+            event_range: range,
+            covers: range,
+            branch_id: branch.to_string(),
+            author: "user".to_string(),
+            timestamp: "2026-08-08T00:00:00Z".to_string(),
+            tags: vec![],
+        }
+    }
+
+    /// The real flange ranges, read off the running server: every
+    /// checkpoint's restore marker starts at 0, so they NEST. Attributing
+    /// intent by `event_range` credits an operation to whichever
+    /// checkpoint sorts last among those covering it — the most RECENT
+    /// decision — so the bolt-circle operations (seq 9..17) get labelled
+    /// with the raised-face decision. `covers` must partition instead.
+    #[test]
+    fn covers_partitions_nested_restore_markers() {
+        let mut cps = vec![
+            cp("body", "main", [0, 8]),
+            cp("bolt-circle", "main", [0, 17]),
+            cp("restate-EN", "main", [0, 36]),
+            cp("bore", "main", [0, 45]),
+            cp("raised-face", "main", [0, 47]),
+            cp("back-to-ASME", "main", [0, 72]),
+        ];
+        fill_covers(&mut cps);
+
+        let spans: Vec<[u64; 2]> = cps.iter().map(|c| c.covers).collect();
+        assert_eq!(
+            spans,
+            vec![[0, 8], [9, 17], [18, 36], [37, 45], [46, 47], [48, 72]],
+            "consecutive decisions must partition the branch, not nest"
+        );
+
+        // Restore markers are untouched — replaying [0, last] must still
+        // reproduce the state, which is what that field is FOR.
+        assert!(
+            cps.iter().all(|c| c.event_range[0] == 0),
+            "event_range is a restore marker and must not be rewritten"
+        );
+
+        // The defect this fixes, stated as the reader would hit it:
+        // operation 12 belongs to the bolt circle, not the raised face.
+        let owner = cps
+            .iter()
+            .find(|c| c.covers[0] <= 12 && 12 <= c.covers[1])
+            .map(|c| c.name.as_str());
+        assert_eq!(owner, Some("bolt-circle"));
+        let last_by_event_range = cps
+            .iter()
+            .filter(|c| c.event_range[0] <= 12 && 12 <= c.event_range[1])
+            .next_back()
+            .map(|c| c.name.as_str());
+        assert_eq!(
+            last_by_event_range,
+            Some("back-to-ASME"),
+            "documents the WRONG answer the old rule gives, so this test \
+             fails loudly if someone points the reader back at event_range"
+        );
+    }
+
+    /// Branches are independent number spaces: a sibling's checkpoints
+    /// must not truncate this branch's spans.
+    #[test]
+    fn covers_is_computed_per_branch() {
+        let mut cps = vec![
+            cp("main-a", "main", [0, 10]),
+            cp("child-a", "b-1", [0, 40]),
+            cp("main-b", "main", [0, 20]),
+            cp("child-b", "b-1", [0, 50]),
+        ];
+        fill_covers(&mut cps);
+        let get = |n: &str| cps.iter().find(|c| c.name == n).expect("present").covers;
+        assert_eq!(get("main-a"), [0, 10]);
+        assert_eq!(
+            get("main-b"),
+            [11, 20],
+            "must follow main's own predecessor"
+        );
+        assert_eq!(get("child-a"), [0, 40]);
+        assert_eq!(
+            get("child-b"),
+            [41, 50],
+            "must follow b-1's own predecessor"
+        );
+    }
+
+    /// A declaration that authored nothing new reports an EMPTY span
+    /// (first > last) rather than claiming its predecessor's work.
+    #[test]
+    fn covers_is_empty_when_a_decision_added_no_events() {
+        let mut cps = vec![cp("first", "main", [0, 12]), cp("second", "main", [0, 12])];
+        fill_covers(&mut cps);
+        assert_eq!(cps[0].covers, [0, 12]);
+        assert_eq!(cps[1].covers, [13, 12], "empty span: first > last");
+        assert!(
+            !(cps[1].covers[0] <= 12 && 12 <= cps[1].covers[1]),
+            "an empty span must match no operation"
+        );
     }
 }
 
