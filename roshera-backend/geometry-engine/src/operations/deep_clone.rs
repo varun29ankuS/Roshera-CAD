@@ -426,6 +426,37 @@ pub fn deep_clone_solid(
     }
 
     let new_solid_id = model.solids.add(new_solid);
+
+    // Record the operation for timeline / event-sourcing consumers.
+    //
+    // A clone MINTS a solid, so it is a producer: every later event that names
+    // the clone (the pattern endpoints immediately `transform_solid` it) can
+    // only replay if the clone itself is in the log. Without this, the
+    // `pattern/linear` and `pattern/circular` REST handlers recorded a
+    // `transform_solid` against a solid no replay could produce, and boot
+    // quarantined the whole post-pattern tail with "Solid not found" (measured
+    // live 2026-08-09: five documents in one evening). The matching replay arm
+    // is `"deep_clone_solid"` in `timeline-engine/src/replay.rs`; it stamps the
+    // new id into the replay remap so the following transform resolves.
+    //
+    // `vertex_offset` is recorded even though the pattern handlers pass `None`
+    // — the offset translates vertices, curves and surfaces, so omitting it
+    // would replay a geometrically different clone.
+    //
+    // No `set_solid_provenance` here: `provenance::OperationKind` has no clone
+    // variant, and minting `Other("deep_clone")` would flip `is_designed` /
+    // `is_primitive` for every cloned solid. That classification is a product
+    // decision, deliberately out of scope for this replay fix.
+    model.record_operation(
+        crate::operations::recorder::RecordedOperation::new("deep_clone_solid")
+            .with_parameters(serde_json::json!({
+                "source_solid_id": solid_id,
+                "vertex_offset": vertex_offset.map(|v| [v.x, v.y, v.z]),
+            }))
+            .with_input_solids([solid_id as u64])
+            .with_output_solids([new_solid_id as u64]),
+    );
+
     Ok(new_solid_id)
 }
 

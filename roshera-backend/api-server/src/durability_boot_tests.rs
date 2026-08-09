@@ -1524,3 +1524,243 @@ async fn revolve_meridian_profile_survives_reboot() {
         "restored profiles must be keyed to live solids; keyed = {keyed:?}, live = {live_ids:?}"
     );
 }
+
+// =====================================================================
+// The unrecorded-clone gap: `pattern/circular` and `pattern/linear`.
+//
+// Measured live 2026-08-09: five documents quarantined in one evening.
+// Both pattern endpoints mint each instance with `deep_clone_solid`
+// (`main.rs` — linear at the `pattern/linear` handler, circular at
+// `pattern/circular`) and then call `transform_solid` on the CLONE.
+// `transform_solid` records itself faithfully (`transform.rs`), naming the
+// clone as its `solid_id` — but `deep_clone_solid` recorded NOTHING, so the
+// solid that event references is not producible by replaying the prior
+// recorded events. On boot the `transform_solid` replay arm
+// (`timeline-engine/src/replay.rs`) finds no remap entry, falls back to the
+// raw recorded id, and the kernel refuses with "Solid not found" → the whole
+// post-pattern tail is QUARANTINED (live: 7 of 14 events served).
+//
+// The fix follows the existing seam rather than inventing a parallel one:
+// `deep_clone_solid` now records itself like every other mutating kernel
+// entry point, and `dispatch_generic` gained a `deep_clone_solid` arm that
+// re-executes the clone and stamps the new id into the replay remap — so the
+// subsequent `transform_solid` resolves. No api-server-level composite
+// "pattern" event exists; the pattern is just the ops it is made of.
+// =====================================================================
+
+/// Seed ONE box through the router and return its public uuid.
+async fn seed_pattern_base(state: &AppState) -> String {
+    let (s, body) = dispatch(
+        state,
+        post(
+            "/api/geometry/box",
+            json!({ "width": 4.0, "depth": 4.0, "height": 4.0 }),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "box create must succeed; body = {body}");
+    body["object"]["id"]
+        .as_str()
+        .expect("box response must carry object.id")
+        .to_string()
+}
+
+/// Assert a rebooted state replayed its WHOLE log and rebuilt `expected_solids`
+/// solids with geometry identical to `fp_before`. Names the offending kind on
+/// failure so a regression reads as a diagnosis rather than a bare count
+/// mismatch.
+///
+/// The fingerprint comparison is what makes this a test of FAITHFUL replay
+/// rather than merely NON-QUARANTINED replay: a clone arm that produced the
+/// right number of solids but replayed the following transform against the
+/// wrong one would still report `active` with the right count.
+async fn assert_full_replay(
+    state2: &AppState,
+    total_events: i64,
+    expected_solids: usize,
+    fp_before: (usize, usize, usize),
+) {
+    let (s, body) = dispatch(state2, get("/api/durability/status")).await;
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "status endpoint must return 200; body = {body}"
+    );
+    assert_eq!(
+        body["quarantined"], false,
+        "the pattern log must replay cleanly, NOT quarantine; first_break_kind = {}; body = {body}",
+        body["status"]["first_break_kind"]
+    );
+    assert_eq!(
+        body["status"]["state"], "active",
+        "durability status must be `active` after a clean full replay; body = {body}"
+    );
+    assert_eq!(
+        body["status"]["events_replayed"],
+        json!(total_events),
+        "every persisted event must be replayed (the clone included), not just the clean prefix; \
+         body = {body}"
+    );
+
+    let live = {
+        let model = state2.model.read().await;
+        model.solids.len()
+    };
+    assert_eq!(
+        live, expected_solids,
+        "the rebuilt document must carry the base plus every patterned instance; \
+         expected {expected_solids}, got {live}"
+    );
+
+    let fp_after = geom_fingerprint(state2).await;
+    assert_eq!(
+        fp_after, fp_before,
+        "the patterned geometry (solid count + tessellation) must be identical after reboot; \
+         before = {fp_before:?}, after = {fp_after:?}"
+    );
+}
+
+/// THE LIVE SEQUENCE (circular): create a box → `POST
+/// /api/geometry/pattern/circular` with `count: 4` → reboot. The document must
+/// replay in FULL and come back with 4 solids (the base plus 3 rotated clones).
+///
+/// RED against HEAD before the fix: boot reports `quarantined = true` with
+/// `first_break_kind = "transform_solid"` — the transform of the first
+/// unrecorded clone — and only the pre-pattern prefix is served.
+///
+/// Mutation proof (RUN 2026-08-10, both tests): renaming the `deep_clone_solid`
+/// arm in `dispatch_generic` (`timeline-engine/src/replay.rs`) so the clone
+/// falls through to the unknown-kind fallback regressed BOTH tests to
+/// `quarantined = true`, `first_break_kind = "deep_clone_solid"`, reason
+/// `unknown operation kind: deep_clone_solid`, 2 of 12 events served.
+///
+/// Not separately run: dropping the `record_operation` call from
+/// `deep_clone.rs::deep_clone_solid` — that is the HEAD state these tests were
+/// written RED against, and it produced `first_break_kind = "transform_solid"`
+/// / `Solid not found`, 2 of 9 events served.
+#[tokio::test]
+async fn circular_pattern_document_replays_without_quarantine() {
+    let path = temp_db_path();
+
+    let (total_events, fp_before) = {
+        let db = open_db(&path).await;
+        let state = build_state(db, true).await;
+        let base = seed_pattern_base(&state).await;
+
+        let (s, body) = dispatch(
+            &state,
+            post(
+                "/api/geometry/pattern/circular",
+                json!({
+                    "object": base,
+                    "axis_origin": [0.0, 0.0, 0.0],
+                    "axis": [0.0, 0.0, 1.0],
+                    "count": 4,
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(
+            s,
+            StatusCode::OK,
+            "circular pattern must succeed; body = {body}"
+        );
+        assert_eq!(
+            body["count"], 3,
+            "count = 4 must emit 3 clones (the original is instance 0); body = {body}"
+        );
+
+        {
+            let model = state.model.read().await;
+            assert_eq!(
+                model.solids.len(),
+                4,
+                "live: the base plus 3 rotated clones must exist before the reboot"
+            );
+        }
+
+        state
+            .timeline_recorder
+            .flush()
+            .await
+            .expect("recorder flush must succeed");
+
+        let total = state
+            .database
+            .get_event_count(durability::DURABILITY_SESSION_ID)
+            .await
+            .expect("event count must query");
+        (total, geom_fingerprint(&state).await)
+    };
+
+    // ---- Reboot over the SAME db file. ----
+    let db2 = open_db(&path).await;
+    let state2 = build_state(db2, true).await;
+    assert_full_replay(&state2, total_events, 4, fp_before).await;
+}
+
+/// The linear pattern shares the defect by construction — the same
+/// `deep_clone_solid` + `transform_solid` pair — so it gets its own test
+/// rather than being covered by symmetry with the circular case.
+///
+/// RED against HEAD before the fix: identical `quarantined = true` /
+/// `first_break_kind = "transform_solid"`.
+#[tokio::test]
+async fn linear_pattern_document_replays_without_quarantine() {
+    let path = temp_db_path();
+
+    let (total_events, fp_before) = {
+        let db = open_db(&path).await;
+        let state = build_state(db, true).await;
+        let base = seed_pattern_base(&state).await;
+
+        let (s, body) = dispatch(
+            &state,
+            post(
+                "/api/geometry/pattern/linear",
+                json!({
+                    "object": base,
+                    "direction": [1.0, 0.0, 0.0],
+                    "spacing": 10.0,
+                    "count": 3,
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(
+            s,
+            StatusCode::OK,
+            "linear pattern must succeed; body = {body}"
+        );
+        assert_eq!(
+            body["count"], 2,
+            "count = 3 must emit 2 clones (the original is instance 0); body = {body}"
+        );
+
+        {
+            let model = state.model.read().await;
+            assert_eq!(
+                model.solids.len(),
+                3,
+                "live: the base plus 2 translated clones must exist before the reboot"
+            );
+        }
+
+        state
+            .timeline_recorder
+            .flush()
+            .await
+            .expect("recorder flush must succeed");
+
+        let total = state
+            .database
+            .get_event_count(durability::DURABILITY_SESSION_ID)
+            .await
+            .expect("event count must query");
+        (total, geom_fingerprint(&state).await)
+    };
+
+    let db2 = open_db(&path).await;
+    let state2 = build_state(db2, true).await;
+    assert_full_replay(&state2, total_events, 3, fp_before).await;
+}

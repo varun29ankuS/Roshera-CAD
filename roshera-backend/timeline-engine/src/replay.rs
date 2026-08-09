@@ -69,6 +69,7 @@ use geometry_engine::math::{Matrix4, Point3, Vector3};
 use geometry_engine::operations::{
     boolean::{boolean_operation, BooleanOp, BooleanOptions},
     chamfer::{chamfer_edges, ChamferOptions, ChamferType},
+    deep_clone::deep_clone_solid,
     extrude::{extrude_face, ExtrudeOptions},
     fillet::{fillet_edges, FilletOptions, FilletType},
     loft::{loft_profiles, LoftOptions, LoftType},
@@ -1354,6 +1355,29 @@ fn dispatch_generic(
             };
             let _faces =
                 chamfer_edges(model, solid, edge_ids, options).map_err(|e| kernel_err(kind, &e))?;
+            Ok(())
+        }
+
+        // ----------------------------------------------------------------
+        // Solid cloning. `deep_clone_solid` MINTS a solid, so it is a producer
+        // and must stamp the replay remap — every later event naming the clone
+        // depends on it. The live gap this closes: `POST
+        // /api/geometry/pattern/circular` (and `/linear`) build each instance
+        // as clone + `transform_solid`; only the transform recorded, so boot
+        // hit "Solid not found" on the transform and QUARANTINED the whole
+        // post-pattern tail (measured 2026-08-09: 7 of 14 events served).
+        //
+        // A clone whose SOURCE no longer resolves is NOT idempotent the way
+        // `delete_solid` is — there is no "intended end state already holds"
+        // reading for a copy of something absent — so it breaks honestly
+        // through the kernel's own liveness check.
+        "deep_clone_solid" => {
+            let source_raw = num_field(inner, "source_solid_id", kind)? as u64;
+            let source = remap_id(source_raw, id_remap) as SolidId;
+            let offset = vec3_field(inner, "vertex_offset");
+            let new_solid =
+                deep_clone_solid(model, source, offset).map_err(|e| kernel_err(kind, &e))?;
+            stamp_outputs(new_solid as u64, &recorded_outputs, id_remap);
             Ok(())
         }
 
