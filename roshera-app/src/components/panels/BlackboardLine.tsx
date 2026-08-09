@@ -11,6 +11,13 @@ import { useSceneStore } from '@/stores/scene-store'
 import type { BlackboardLine as Line } from '@/stores/blackboard-store'
 import { MessageMarkdown } from './MessageMarkdown'
 import { StreamingLineText } from './StreamingLineText'
+import {
+  ExpandableProse,
+  FailedTurnBlock,
+  ToolCallRow,
+  type ParsedToolCall,
+  type ToolCallStatus,
+} from './BlackboardMessageParts'
 import { RevealContext } from './cards/reveal-context'
 import { CardActionsContext, type CardActions } from './cards/card-actions-context'
 import { DetectedChoicesCard } from './cards/DetectedChoicesCard'
@@ -65,6 +72,40 @@ function verdictDetail(verdict: LineVerdict): string {
     case 'inconclusive':
       return 'carries an inconclusive/unverifiable result — not checked as a pass or a fail'
   }
+}
+
+/** The ACP statuses `lib/acp-blackboard.ts` forwards verbatim. Closed set:
+ *  anything else makes `parseToolCallLine` decline the line entirely. */
+const TOOL_STATUSES: readonly ToolCallStatus[] = [
+  'pending',
+  'in_progress',
+  'completed',
+  'failed',
+]
+
+/**
+ * `⚙ <title> — <status>` — the one line shape `lib/acp-blackboard.ts`'s
+ * `renderToolLine` writes for a tool call, optionally followed by a blank
+ * line and a validated `roshera:*` card fence.
+ *
+ * Recognising a format produced in `lib/` from the component that renders
+ * it is the pattern this panel already uses for `isBuildStepLine`
+ * ("Created **…**") and `detectEnumeratedChoices` ("Option A: …"): narrow,
+ * anchored at both ends, and DECLINING rather than guessing. The `—`
+ * separator also occurs inside tool titles, so the status is matched
+ * against the closed set above at the END of the header, never by
+ * splitting on the first dash.
+ */
+function parseToolCallLine(text: string): ParsedToolCall | null {
+  const newline = text.indexOf('\n')
+  const head = (newline === -1 ? text : text.slice(0, newline)).trim()
+  if (!head.startsWith('⚙')) return null
+  const match = /^⚙\s+(.+?)\s+—\s+([a-z_]+)$/.exec(head)
+  if (!match) return null
+  const status = TOOL_STATUSES.find((s) => s === match[2])
+  if (!status) return null
+  const body = newline === -1 ? '' : text.slice(newline).trim()
+  return { title: match[1].trim(), status, body: body.length > 0 ? body : null }
 }
 
 /** `12s` under a minute, `1m 05s` at/after — never a fabricated percentage
@@ -378,6 +419,30 @@ export function BlackboardLine({ line, onCommit, onDelete, streaming = false, on
   const isEvidence = contentClass === 'evidence'
   const isControl = contentClass === 'control'
 
+  // A tool call the agent transport reported (`lib/acp-blackboard.ts`'s
+  // `renderToolLine`) — its own shape, a chip row, rather than a sentence
+  // in the evidence lane. System authorship is required: the `⚙ … — status`
+  // header is a format only that writer produces, and a person or the model
+  // typing the same characters must not be re-rendered as machinery.
+  const toolCall = useMemo(
+    () => (isSystem && !streaming ? parseToolCallLine(line.text) : null),
+    [isSystem, streaming, line.text],
+  )
+
+  // A turn that ended in failure gets a designed block instead of a
+  // paragraph — keyed on the store's typed `turnStatus`, never on the word
+  // "failed" appearing in prose. The one exception is a failure that
+  // already carries a fenced `roshera:*` card (a kernel refusal riding the
+  // JSON-RPC error payload — see `describeAcpTurnFailure`): that card is
+  // the better rendering of itself, so the line stays on the normal path
+  // and keeps its terminal glyph rather than nesting a card inside a block.
+  const failedTurn =
+    isAgent &&
+    !streaming &&
+    line.turnStatus === 'failed' &&
+    !line.text.includes('```roshera:') &&
+    line.text.trim().length > 0
+
   // Colour channel for the origin marker — derived ONLY from this line's
   // own fenced verdict cards (never streaming text mid-arrival: an unclosed
   // fence simply does not match yet, so the marker stays neutral until the
@@ -386,20 +451,24 @@ export function BlackboardLine({ line, onCommit, onDelete, streaming = false, on
   const authorLabel = isAgent ? 'Agent-authored' : isSystem ? 'App-generated' : 'You'
   const markerTitle = verdict ? `${authorLabel} — ${verdictDetail(verdict)}` : authorLabel
 
-  // AUTHORSHIP WITHOUT COLOUR — position + weight.
-  // ------------------------------------------------
+  // AUTHORSHIP WITHOUT COLOUR — position, weight, SURFACE.
+  // -------------------------------------------------------
   // "difficult to differentiate between ai and user" (Varun, 2026-08-01):
   // authorship was carried only by the ~10px marker glyph, which fails the
-  // readable-without-a-mouse bar at a scan. Colour is unavailable — it is
-  // reserved for state, and the marker's colour channel already carries
-  // the line's certificate verdict — so the free channels are position and
-  // weight: the USER's lines are indented (the ask steps in; the agent's
-  // work stays flush as the body of the notebook) and set at medium
-  // weight (a short instruction reads as a heading-like interjection).
-  // A left rule was rejected: `control` lines already use a ruled shape
-  // (sky, "awaiting your choice") and a second ruled family would blur
-  // that; indentation collides with nothing. Evidence stays flush, dim
-  // and dense — still visibly subordinate to both voices.
+  // readable-without-a-mouse bar at a scan. Verdict colour is unavailable —
+  // the marker's fill already spends it on the line's certificate — so the
+  // free channels are position, weight and shape: the USER's lines are
+  // indented (the ask steps in; the agent's work stays flush as the body of
+  // the notebook), set at medium weight, and — since 2026-08-09 — drawn
+  // inside a shrink-wrapped, faintly-tinted container while every other
+  // voice runs the full lane unboxed. Indent and weight alone were still
+  // too quiet at arm's length; a container is the largest difference
+  // available that costs no colour the verdict channel needs (the tint is
+  // the app's primary, never emerald/red/amber/sky).
+  // A left rule was rejected for this job: `control` lines already use a
+  // ruled shape (sky, "awaiting your choice") and a second ruled family
+  // would blur that. Evidence stays flush, dim and dense — still visibly
+  // subordinate to both voices.
   const isUser = !isAgent && !isSystem
   return (
     <div
@@ -441,7 +510,15 @@ export function BlackboardLine({ line, onCommit, onDelete, streaming = false, on
           // evidence, prose): the panel is 50rem wide and full-bleed body
           // text at that width is unreadable — vault ui-pass-spec §1 sets
           // the measure at ~68–75ch.
-          <div className="w-full max-w-[72ch] select-text text-left text-sm leading-relaxed text-foreground/90">
+          // The in-flight message is the one line on the board that is
+          // still changing, so it gets a surface of its own: a live primary
+          // rule and a faint wash, matching the header's own primary
+          // "writing" pulse. Both vanish the moment the turn settles — the
+          // message drops back into the flush notebook body — so "live" is
+          // never a state a finished line can be mistaken for. Deliberately
+          // NOT height-capped: clamping the text currently arriving would
+          // fight the board's scroll-to-newest.
+          <div className="w-full max-w-[72ch] select-text rounded-sm border-l-2 border-primary/50 bg-primary/[0.03] pl-2 text-left text-sm leading-relaxed text-foreground/90">
             {line.text.trim() ? (
               <CardActionsContext.Provider value={cardActions}>
                 <RevealContext.Provider value={reveal}>
@@ -454,6 +531,13 @@ export function BlackboardLine({ line, onCommit, onDelete, streaming = false, on
               </span>
             )}
             <TurnStatus elapsedMs={elapsedMs} onCancel={onCancel} />
+          </div>
+        ) : toolCall ? (
+          // A tool call reads as a chip row — mono name, status glyph +
+          // word, payload behind a visible button. See `ToolCallRow` for
+          // why there is no duration and no argument summary.
+          <div className="select-text text-left">
+            <ToolCallRow call={toolCall} />
           </div>
         ) : isEvidence ? (
           // Evidence: the kernel's own testimony (a certificate fence, a
@@ -503,11 +587,26 @@ export function BlackboardLine({ line, onCommit, onDelete, streaming = false, on
           // of an answer, not a person retyping the kernel.
           <div
             className={cn(
-              'flex w-full items-start gap-1.5 select-text text-left text-sm leading-relaxed text-foreground/90',
+              'flex items-start gap-1.5 select-text text-left text-sm leading-relaxed text-foreground/90',
+              // The user's container shrink-wraps its own words; every
+              // other voice runs the full lane. A one-line ask therefore
+              // reads as a small object against a full-bleed paragraph —
+              // the difference is visible before a single word is read.
+              isUser ? 'w-fit max-w-full' : 'w-full',
               // Weight channel of the authorship split (see the comment on
               // the row wrapper): the user's ask reads medium against the
               // agent's regular-weight working prose. Same size, same ramp.
+              //
+              // Plus a SURFACE channel, added 2026-08-09: the user's line
+              // sits in a real container — rounded, faintly filled, hairline
+              // bordered — while the agent's prose stays flush and unboxed
+              // as the body of the notebook. Indent and weight alone were
+              // too quiet to read at arm's length, and colour was already
+              // spoken for (the marker's fill carries the line's verdict),
+              // so shape is the free channel. The tint is the app's own
+              // primary, never one of the verdict hues.
               isUser && 'font-medium',
+              isUser && 'rounded-lg border border-primary/25 bg-primary/[0.06] px-2.5 py-1.5',
               // Control: a closed-set question — reads as interactive.
               // Reuses card-chrome's `info` (sky) accent, the same colour
               // ChoicesCard/DetectedChoicesCard already use for "awaiting
@@ -516,12 +615,24 @@ export function BlackboardLine({ line, onCommit, onDelete, streaming = false, on
                 'rounded-sm border-l-2 border-sky-500/40 bg-sky-500/[0.04] pl-1.5 hover:bg-sky-500/[0.08]',
             )}
           >
-            {isAgent && line.turnStatus && <TurnStatusGlyph status={line.turnStatus} />}
+            {/* The terminal glyph is suppressed for a failed turn: the
+                block below carries its own cross and the word, so a second
+                mark in the gutter would say the same thing twice. */}
+            {isAgent && line.turnStatus && !failedTurn && (
+              <TurnStatusGlyph status={line.turnStatus} />
+            )}
             <span className="min-w-0 max-w-[72ch] flex-1">
-              {line.text.trim() ? (
+              {failedTurn ? (
+                <FailedTurnBlock text={line.text} />
+              ) : line.text.trim() ? (
                 <CardActionsContext.Provider value={cardActions}>
                   <RevealContext.Provider value={reveal}>
-                    <MessageMarkdown content={line.text} />
+                    {/* Only the prose is height-capped; the choice buttons
+                        below it are a control and must never sit behind a
+                        "show more". */}
+                    <ExpandableProse source={line.text}>
+                      <MessageMarkdown content={line.text} />
+                    </ExpandableProse>
                     {detectedChoices && <DetectedChoicesCard set={detectedChoices} />}
                   </RevealContext.Provider>
                 </CardActionsContext.Provider>

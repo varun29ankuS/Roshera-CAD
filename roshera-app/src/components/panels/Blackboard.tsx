@@ -548,19 +548,37 @@ export function Blackboard() {
                   </span>
                   <span>the agent — reasoning, editable</span>
                 </div>
-                {/* Indented like a real user line — the legend teaches the
-                    position channel by using it, not by describing it. */}
+                {/* Drawn exactly like a real user line — indented, medium
+                    weight, in its own shrink-wrapped container. The legend
+                    teaches the position and surface channels by USING them,
+                    not by describing them (see `BlackboardLine.tsx`'s
+                    authorship comment). */}
                 <div className="ml-6 flex items-center gap-2 font-medium">
                   <span className="flex h-4 w-4 shrink-0 items-center justify-center rounded-full bg-primary/20">
                     <User size={10} className="text-primary" />
                   </span>
-                  <span>you — indented, sent from the composer below</span>
+                  <span className="w-fit max-w-full rounded-lg border border-primary/25 bg-primary/[0.06] px-2.5 py-1.5">
+                    you — boxed and indented, sent from the composer below
+                  </span>
                 </div>
                 <div className="flex items-center gap-2">
                   <span className="flex h-4 w-4 shrink-0 items-center justify-center rounded-full bg-muted-foreground/20">
                     <Wrench size={9} className="text-muted-foreground" />
                   </span>
                   <span>the kernel — certificates and build steps, never editable</span>
+                </div>
+                {/* A tool call, drawn as the chip row it really renders as. */}
+                <div className="flex items-center gap-2">
+                  <span className="flex h-4 w-4 shrink-0 items-center justify-center rounded-full bg-muted-foreground/20">
+                    <Wrench size={9} className="text-muted-foreground" />
+                  </span>
+                  <span className="flex flex-wrap items-center gap-1.5">
+                    <span className="font-mono text-[11px] text-foreground/85">tool calls</span>
+                    <span className="inline-flex items-center gap-1 rounded border border-emerald-500/30 bg-emerald-500/10 px-1.5 py-[2px] text-[10px] leading-none text-emerald-800 dark:text-emerald-300">
+                      <Check size={10} /> done
+                    </span>
+                    <span>— one row each, result on a click</span>
+                  </span>
                 </div>
                 <div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1">
                   <span>marker colour is the verdict:</span>
