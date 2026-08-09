@@ -3559,6 +3559,82 @@ mod tests {
         assert!(model.solids.get(solid_id).is_some());
     }
 
+    /// TRIPWIRE — what `create_helical_sweep` actually produces, MEASURED,
+    /// so the api-server's typed refusal of `pitch`/`turns` on
+    /// `POST /api/geometry/revolve` rests on evidence and not on a reading
+    /// of the code. Two independent defects:
+    ///
+    ///   1. Every quad mints FRESH vertices (`model.vertices.add`) and four
+    ///      fresh edges, so adjacent angular steps and adjacent profile
+    ///      slots share NOTHING — each edge belongs to exactly one face.
+    ///      That is a face soup, not a shell.
+    ///   2. No start/end cap is ever built, and for a helix the two end
+    ///      profiles are axially displaced, so the tube cannot close on
+    ///      itself the way a 360° pure revolution does.
+    ///
+    /// Consequently `validate_result: true` REFUSES the output. If this
+    /// test ever goes red because the sweep started producing a watertight
+    /// welded solid, that is the signal to replace the api-server refusal
+    /// with a real helical route — not to weaken this assertion.
+    #[test]
+    fn helical_sweep_is_not_a_watertight_solid() {
+        // (1) Validation refuses the helical output.
+        let mut model = BRepModel::new();
+        let edges = make_offset_rectangle(&mut model);
+        let opts = RevolveOptions {
+            angle: std::f64::consts::TAU,
+            pitch: 1.0,
+            segments: 8,
+            cap_ends: true,
+            ..Default::default() // common.validate_result defaults to true
+        };
+        let err = revolve_profile(&mut model, edges, opts)
+            .expect_err("a helical sweep must NOT pass solid validation");
+        assert!(
+            matches!(err, OperationError::InvalidBRep(_)),
+            "helical sweep must fail B-Rep validation, got {err:?}"
+        );
+
+        // (2) The unvalidated shell is a face soup: no edge is shared.
+        let mut model = BRepModel::new();
+        let edges = make_offset_rectangle(&mut model);
+        let segments = 8_u32;
+        let opts = RevolveOptions {
+            angle: std::f64::consts::TAU,
+            pitch: 1.0,
+            segments,
+            cap_ends: true,
+            common: CommonOptions {
+                validate_result: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let solid_id = revolve_profile(&mut model, edges, opts).expect("unvalidated helical build");
+        let solid = model.solids.get(solid_id).expect("solid");
+        let shell = model.shells.get(solid.outer_shell).expect("shell");
+        assert_eq!(
+            shell.faces.len(),
+            (segments as usize) * 4,
+            "one free quad per profile slot per angular step, and no caps"
+        );
+        let mut edge_uses: std::collections::HashMap<EdgeId, usize> =
+            std::collections::HashMap::new();
+        for &fid in &shell.faces {
+            let f = model.faces.get(fid).expect("face");
+            let l = model.loops.get(f.outer_loop).expect("loop");
+            for &eid in &l.edges {
+                *edge_uses.entry(eid).or_insert(0) += 1;
+            }
+        }
+        assert!(
+            edge_uses.values().all(|&n| n == 1),
+            "a closed shell needs every edge used TWICE; the helical sweep \
+             uses each of its {} edges exactly once (nothing is welded)",
+            edge_uses.len()
+        );
+    }
+
     #[test]
     fn revolve_profile_with_x_axis_creates_solid() {
         // Profile in YZ-plane offset along +Y, revolved around X axis.

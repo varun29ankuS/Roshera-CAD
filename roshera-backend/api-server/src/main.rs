@@ -4746,6 +4746,12 @@ fn parse_revolve_profile_segments(
 /// auto-closes (last→first); give ≥3 points, all with r ≥ 0, non-self-
 /// intersecting. A hollow part is one profile whose outline traces the wall
 /// cross-section (outer contour out, inner contour back).
+///
+/// Unknown keys are REFUSED (`refuse_unknown_keys`), and so are the helical
+/// keys `pitch` / `turns`: there is no honest helical path behind this
+/// endpoint (the refusal below carries the measurement), and until
+/// 2026-08-09 both were accepted, ignored, and answered with a plain
+/// revolution carrying a SOUND certificate.
 async fn create_revolve_primitive(
     State(state): State<AppState>,
     ActiveModel(model_handle): ActiveModel,
@@ -4776,6 +4782,71 @@ async fn create_revolve_primitive(
             None => Ok(default),
         }
     };
+
+    // Unknown-key guard (see `refuse_unknown_keys`). Revolve shipped
+    // without one, so every plausible misspelling — `pitch_mm`, `axis`,
+    // `profile_points` — was accepted and silently defaulted. `pitch`
+    // and `turns` are listed here NOT because they are honoured but so
+    // that the dedicated refusal below can name the capability gap
+    // instead of the generic "unknown parameter" message.
+    refuse_unknown_keys(
+        &payload,
+        &[
+            "profile",
+            "profile_segments",
+            "axis_origin",
+            "axis_direction",
+            "angle_deg",
+            "segments",
+            "smooth",
+            "bore_radius",
+            "wall_thickness",
+            "pitch",
+            "turns",
+            "name",
+            "fast",
+        ],
+    )?;
+
+    // HELICAL REFUSAL — the accepted-but-ignored class, measured
+    // 2026-08-09: a V-thread profile with `"pitch": 2.0, "turns": 6`
+    // returned HTTP 200 with a SOUND certificate and the volume of the
+    // PLAIN revolution (177.994 against a 178.024 pure-revolution
+    // oracle). Neither key was read by anything: `pitch`/`turns` existed
+    // nowhere in this crate, and the sampled arm reaches
+    // `revolve_meridian`, which never consults `RevolveOptions::pitch`.
+    //
+    // The kernel's `create_helical_sweep` is NOT a usable substitute
+    // here, and that is measured rather than assumed
+    // (`helical_sweep_is_not_a_watertight_solid`, geometry-engine
+    // `operations/revolve.rs`): it emits one free-standing quad per
+    // profile edge per angular step with freshly-minted vertices, so
+    // adjacent steps share no vertex and no edge, and it never builds
+    // start/end caps — a face soup whose "volume" no certificate can
+    // honestly sign. Routing to it would swap one lie for a louder one.
+    //
+    // So: refuse, and NAME the gap. Refused on PRESENCE — `turns: 6`
+    // redefines the total sweep to 2160°, contradicting `angle_deg`, and
+    // honouring `turns: 1` merely because it coincides with the default
+    // would be this same bug in miniature.
+    let helical_keys: Vec<&str> = ["pitch", "turns"]
+        .into_iter()
+        .filter(|k| payload.get(*k).is_some_and(|v| !v.is_null()))
+        .collect();
+    if !helical_keys.is_empty() {
+        return Err(ApiError::new(
+            ErrorCode::InvalidParameter,
+            format!(
+                "helical revolve is not exposed on this endpoint: {helical_keys:?} \
+                 would sweep the profile along the axis (a thread), but the only \
+                 kernel helical path builds an uncapped, unwelded quad shell whose \
+                 volume cannot be certified. Refused rather than silently returning \
+                 the PLAIN revolution certified sound (which is what a 'pitch' \
+                 sent here used to produce). Drop 'pitch'/'turns' for the \
+                 axisymmetric solid of revolution."
+            ),
+        ));
+    }
 
     // Typed piecewise-analytic profile (spec 2026-07-19 Slice B): each
     // segment revolves to its EXACT surface (line → cylinder/cone/plane,

@@ -6178,6 +6178,189 @@ async fn revolve_typed_segments_with_smooth_refuses_400() {
 }
 
 // =====================================================================
+// Tests — revolve accepted-but-ignored parameters (the helical lie)
+// =====================================================================
+
+/// A V-thread meridian: a solid shaft of core radius 4 whose flank
+/// rises to a crest radius of 5 once per 2 mm of height, six teeth
+/// tall. Sent WITH `pitch`/`turns` this is what an agent means by
+/// "cut me a thread"; sent without, it is a plain axisymmetric
+/// sawtooth ring — which is exactly what the endpoint used to build
+/// while reporting success.
+fn v_thread_meridian() -> Value {
+    let mut profile = vec![json!([0.0, 0.0]), json!([4.0, 0.0])];
+    for tooth in 0..6 {
+        let z0 = 2.0 * tooth as f64;
+        profile.push(json!([5.0, z0 + 1.0]));
+        profile.push(json!([4.0, z0 + 2.0]));
+    }
+    profile.push(json!([0.0, 12.0]));
+    Value::Array(profile)
+}
+
+/// THE CERTIFIED THREAD LIE (measured 2026-08-09). `POST
+/// /api/geometry/revolve` with a V-thread profile and
+/// `"pitch": 2.0, "turns": 6` returned HTTP 200 with a SOUND
+/// certificate and volume 177.994 — the volume of the PLAIN
+/// revolution ring (oracle 178.024). Both helical parameters were
+/// parsed by nobody: `pitch`/`turns` appear nowhere in `api-server`,
+/// and the sampled arm reaches `revolve_meridian`, which never reads
+/// `RevolveOptions::pitch`. The caller asked for a thread, got a ring,
+/// and was told the ring was sound.
+///
+/// The kernel's `create_helical_sweep` cannot honestly serve this yet
+/// (it emits an uncapped, unwelded quad soup — pinned by
+/// `helical_sweep_is_not_a_watertight_solid` in
+/// `geometry-engine/src/operations/revolve.rs`), so the contract is a
+/// TYPED REFUSAL that NAMES the gap. Silence is the one forbidden
+/// outcome.
+#[tokio::test]
+async fn revolve_pitch_refuses_instead_of_silently_plain_revolving() {
+    let state = make_test_state().await;
+    let (status, body) = dispatch(
+        &state,
+        json_post(
+            "/api/geometry/revolve",
+            json!({
+                "profile": v_thread_meridian(),
+                "pitch": 2.0,
+                "turns": 6,
+                "segments": 48,
+                "name": "M10 thread",
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a pitch/turns revolve must REFUSE, never return a plain revolution \
+         certified sound; body = {body}"
+    );
+    let err = body["error"].as_str().unwrap_or_default();
+    assert!(
+        err.contains("helical"),
+        "refusal must name the helical capability gap; error = {err:?}"
+    );
+    assert!(
+        err.contains("pitch"),
+        "refusal must name the parameter it refused; error = {err:?}"
+    );
+    // No partial mutation: the refusal lands before any kernel write.
+    let model = state.model.read().await;
+    assert_eq!(
+        model.solids.len(),
+        0,
+        "a refused revolve must not leave a solid behind"
+    );
+}
+
+/// `turns` alone is just as much a lie as `pitch`: `"turns": 6` means
+/// a 2160° sweep, which silently contradicts `angle_deg`'s 360°
+/// default. Refused on PRESENCE — there is no value of `turns` this
+/// endpoint honours, so accepting `turns: 1` because it happens to
+/// coincide with the default would be the same bug in miniature.
+#[tokio::test]
+async fn revolve_turns_alone_refuses() {
+    let state = make_test_state().await;
+    let (status, body) = dispatch(
+        &state,
+        json_post(
+            "/api/geometry/revolve",
+            json!({
+                "profile": v_thread_meridian(),
+                "turns": 6,
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "'turns' with no 'pitch' must still refuse; body = {body}"
+    );
+    let err = body["error"].as_str().unwrap_or_default();
+    assert!(
+        err.contains("turns"),
+        "refusal must name 'turns'; error = {err:?}"
+    );
+}
+
+/// The generic floor beneath the helical refusal: revolve had NO
+/// `refuse_unknown_keys` guard, so any plausible misspelling
+/// (`pitch_mm`, `profile_points`, `axis`) was accepted and silently
+/// defaulted. Same honesty class as `"position"` → every solid at the
+/// origin (2026-08-08).
+#[tokio::test]
+async fn revolve_refuses_unknown_keys() {
+    let state = make_test_state().await;
+    let (status, body) = dispatch(
+        &state,
+        json_post(
+            "/api/geometry/revolve",
+            json!({
+                "profile": v_thread_meridian(),
+                "pitch_mm": 2.0,
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "an unrecognized key must refuse, not default silently; body = {body}"
+    );
+    let err = body["error"].as_str().unwrap_or_default();
+    assert!(
+        err.contains("pitch_mm") && err.contains("unknown parameter"),
+        "refusal must name the unknown key; error = {err:?}"
+    );
+}
+
+/// Regression pin for the UNCHANGED path: a plain sampled revolve with
+/// no helical keys still builds, still certifies, and still hits its
+/// ANALYTIC volume. The oracle is closed-form, not a photograph of
+/// HEAD: an annular meridian r ∈ [1, 4] over height 5 revolved 360°
+/// has volume π(4² − 1²)·5 = 235.6194490192345. A 48-segment faceted
+/// approximation lands strictly inside 1% of it; a regression that
+/// routed this to the helical path (or dropped the bore) would miss by
+/// orders of magnitude, not by a facet.
+#[tokio::test]
+async fn revolve_without_pitch_matches_analytic_annulus_volume() {
+    let state = make_test_state().await;
+    let (status, body) = dispatch(
+        &state,
+        json_post(
+            "/api/geometry/revolve",
+            json!({
+                "profile": [[1.0, 0.0], [4.0, 0.0], [4.0, 5.0], [1.0, 5.0]],
+                "axis_origin": [0.0, 0.0, 0.0],
+                "axis_direction": [0.0, 0.0, 1.0],
+                "segments": 48,
+                "name": "plain tube",
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a revolve with no helical keys must be untouched by the guard; body = {body}"
+    );
+    assert_eq!(body["success"], true, "body = {body}");
+    let volume = body["perception"]["volume"]
+        .as_f64()
+        .expect("perception must carry a volume");
+    let oracle = std::f64::consts::PI * (4.0_f64.powi(2) - 1.0_f64.powi(2)) * 5.0;
+    let rel = (volume - oracle).abs() / oracle;
+    assert!(
+        rel < 0.01,
+        "plain revolve volume {volume} must match the analytic annulus \
+         oracle {oracle} within 1% (relative error {rel})"
+    );
+}
+
+// =====================================================================
 // Tests — display-name durability (certified-timeline follow-up)
 // =====================================================================
 
