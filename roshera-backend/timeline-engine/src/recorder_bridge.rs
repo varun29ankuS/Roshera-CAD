@@ -278,6 +278,22 @@ struct StagingState {
     /// `with_rollback`-staged record skip certification too, silently
     /// dropping real per-op certificates on their success path.
     discard_depth: u32,
+    /// The ONE sequence number reserved for the CONSOLIDATED event a discard
+    /// scope produces (task #4). Reserved lazily on the first
+    /// [`OperationRecorder::reserve_event_key`] call inside the scope and
+    /// returned unchanged for every later call in the same scope, so every
+    /// root persistent-id minted while the build is suppressed is seeded from
+    /// the SAME `evt:{seq}` key — the key the consolidated event will carry.
+    /// `None` outside a scope, and for a scope that minted no root pid.
+    discard_scope_sequence: Option<u64>,
+    /// The reservation a just-closed discard scope left behind, waiting to be
+    /// stamped onto the consolidated record the handler emits next. Consumed
+    /// by the very next [`OperationRecorder::record`] — stamped when that
+    /// record carries no reservation of its own, dropped otherwise — so a
+    /// suppressed build that failed before recording leaves at most a HOLE in
+    /// the sequence, never a stale reservation that could later land an event
+    /// out of causal order.
+    pending_consolidated_sequence: Option<u64>,
 }
 
 impl TimelineRecorder {
@@ -636,6 +652,19 @@ impl OperationRecorder for TimelineRecorder {
         // hitting the channel.
         {
             let mut state = self.staging.write();
+            // Consolidated-event handoff (task #4): a discard scope that just
+            // closed may have reserved the sequence its root persistent-ids
+            // were seeded from. THIS record is the consolidated event that
+            // scope produced, so it must land at exactly that sequence or the
+            // pids a replay re-derives will not match the live ones. Consumed
+            // unconditionally — a record that already carries its own
+            // reservation keeps it and the scope's number becomes a hole —
+            // so the handoff can never leak past one record.
+            if let Some(seq) = state.pending_consolidated_sequence.take() {
+                if operation.reserved_sequence.is_none() {
+                    operation.reserved_sequence = Some(seq);
+                }
+            }
             if state.depth > 0 {
                 state.buffer.push((operation, author));
                 return Ok(());
@@ -714,6 +743,16 @@ impl OperationRecorder for TimelineRecorder {
         // `saturating_add`: same defensive posture as `begin_pending` —
         // realistic nesting is shallow.
         let mut state = self.staging.write();
+        if state.discard_depth == 0 {
+            // A fresh outermost scope owns its own reservation. Any handoff
+            // still pending here belongs to an EARLIER suppressed build that
+            // failed before it recorded its consolidated event; drop it (its
+            // sequence becomes a hole) rather than let it land on this
+            // scope's event, which would seed pids from one number and append
+            // at another.
+            state.discard_scope_sequence = None;
+            state.pending_consolidated_sequence = None;
+        }
         state.discard_depth = state.discard_depth.saturating_add(1);
     }
 
@@ -727,6 +766,11 @@ impl OperationRecorder for TimelineRecorder {
             return;
         }
         state.discard_depth -= 1;
+        if state.discard_depth == 0 {
+            // Hand the scope's reservation (if any root pid was minted) to the
+            // consolidated record the handler emits next — see `record`.
+            state.pending_consolidated_sequence = state.discard_scope_sequence.take();
+        }
     }
 
     fn records_are_discarded(&self) -> bool {
@@ -748,7 +792,41 @@ impl OperationRecorder for TimelineRecorder {
     /// lock (construction-time contention); `next_root_seed` falls back to
     /// `root_counter` for that one call, exactly as if no recorder were
     /// attached.
+    ///
+    /// # Inside a discard scope the reservation is STICKY (task #4)
+    ///
+    /// A `RecorderSuppressGuard` scope (the api-server's `/api/geometry/revolve`
+    /// and csketch build handlers) discards every record the kernel emits
+    /// inside it, and the handler then emits ONE consolidated, self-contained
+    /// event for the whole build. Every root persistent-id minted during that
+    /// build must therefore be seeded from the key of THAT event — not from a
+    /// fresh reservation per inner op (which would burn a sequence per op and
+    /// seed pids from numbers no event ever carries), and not from
+    /// `next_root_seed`'s `__local:{root_counter}` fallback, a process-local
+    /// name replay can never re-derive. That fallback is the measured defect:
+    /// a fillet naming a boolean-minted edge PID on a revolve-built flange
+    /// quarantined on reopen with `dangling reference in fillet_edges`,
+    /// because the revolve's root pid — and every face/edge pid derived from
+    /// it — differed between the live build and the replay.
+    ///
+    /// So inside a scope this reserves ONE sequence on first use and returns
+    /// that same key for the rest of the scope; [`Self::end_discard_scope`]
+    /// hands it to the consolidated record, which appends at exactly that
+    /// sequence. Replay then seeds `evt:{sequence}` and re-derives byte-
+    /// identical pids.
     fn reserve_event_key(&self) -> Option<String> {
+        // Sticky: reuse the scope's reservation when it already has one.
+        let sticky = {
+            let state = self.staging.read();
+            if state.discard_depth > 0 {
+                state.discard_scope_sequence
+            } else {
+                None
+            }
+        };
+        if let Some(seq) = sticky {
+            return Some(format!("evt:{seq}"));
+        }
         let counter = if let Some(c) = self.event_counter.get() {
             Arc::clone(c)
         } else {
@@ -766,6 +844,20 @@ impl OperationRecorder for TimelineRecorder {
             }
         };
         let seq = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // First reservation inside a discard scope becomes the scope's sticky
+        // key. Double-checked under the write lock: if a concurrent first
+        // reserver won the race, its number is authoritative and the one just
+        // burned here becomes a hole (never a second identity for the same
+        // build).
+        {
+            let mut state = self.staging.write();
+            if state.discard_depth > 0 {
+                match state.discard_scope_sequence {
+                    Some(existing) => return Some(format!("evt:{existing}")),
+                    None => state.discard_scope_sequence = Some(seq),
+                }
+            }
+        }
         Some(format!("evt:{seq}"))
     }
 }

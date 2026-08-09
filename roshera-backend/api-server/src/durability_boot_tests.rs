@@ -1764,3 +1764,280 @@ async fn linear_pattern_document_replays_without_quarantine() {
     let state2 = build_state(db2, true).await;
     assert_full_replay(&state2, total_events, 3, fp_before).await;
 }
+
+// =====================================================================
+// (i) SUPPRESSED-BUILD ROOT-PID PARITY (task #4, measured live 2026-08-09)
+//
+// THE LIVE SEQUENCE: a lap-joint flange — typed `profile_segments` revolve
+// (a disc) → four bolt-hole boolean differences → a single-edge fillet on the
+// rim, named by the numeric `EdgeId` the kernel resolved. On reopen the
+// document QUARANTINED with `dangling reference in fillet_edges: edge-pid:…
+// no longer resolves`, 14 of 15 events served.
+//
+// Why the revolve is load-bearing (a box/cylinder chain replays clean): the
+// `/api/geometry/revolve` handler builds inside a `RecorderSuppressGuard` and
+// emits ONE self-contained `revolve_typed` event afterwards. Inside that
+// window `records_are_discarded()` is true, so `BRepModel::next_root_seed`
+// skipped the event-key reservation and minted the revolve's ROOT solid PID
+// from the process-local `__local:{root_counter}` counter — a name replay
+// cannot reproduce (replay always seeds `evt:{sequence}`). Every boolean
+// result FACE pid derives from that solid pid, and every canonical EDGE pid
+// derives from its two neighbour face pids, so the fillet's recorded
+// `edge_pids` entry names an identity the replayed model never mints.
+//
+// Why the booleans are load-bearing: a revolve alone leaves its rim edges
+// without PIDs, so the fillet would record `null` and replay would fall back
+// to the transient remap. `assign_canonical_edge_pids` (the boolean's
+// edge-pid close-out) is what puts a PID on the rim — and therefore what
+// makes the divergence reachable.
+// =====================================================================
+
+/// The flange meridian: a solid disc, r 0→20, z 0→4, revolved about world Z.
+/// Typed analytic segments, so the outer wall is one exact cylinder band.
+fn flange_disc_segments() -> Value {
+    json!([
+        {"type": "line", "start": [0.0, 0.0], "end": [20.0, 0.0]},
+        {"type": "line", "start": [20.0, 0.0], "end": [20.0, 4.0]},
+        {"type": "line", "start": [20.0, 4.0], "end": [0.0, 4.0]}
+    ])
+}
+
+/// Typed revolve (the disc) + four through bolt holes cut by boolean
+/// difference. Returns the flange's public uuid (operand A's uuid re-points at
+/// each boolean result, so it stays valid across all four cuts).
+async fn seed_flange_with_bolt_holes(state: &AppState) -> String {
+    let (s, body) = dispatch(
+        state,
+        post(
+            "/api/geometry/revolve",
+            json!({
+                "profile_segments": flange_disc_segments(),
+                "axis_origin": [0.0, 0.0, 0.0],
+                "segments": 48,
+                "name": "lap joint flange",
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "flange revolve must succeed; body = {body}"
+    );
+    let flange = body["object"]["id"]
+        .as_str()
+        .expect("revolve response must carry object.id")
+        .to_string();
+
+    for (i, [cx, cy]) in [[12.0, 0.0], [-12.0, 0.0], [0.0, 12.0], [0.0, -12.0]]
+        .iter()
+        .enumerate()
+    {
+        let (s, body) = dispatch(
+            state,
+            post(
+                "/api/geometry/cylinder",
+                json!({
+                    "center": [cx, cy, -1.0],
+                    "axis": [0.0, 0.0, 1.0],
+                    "radius": 2.0,
+                    "height": 6.0,
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(
+            s,
+            StatusCode::OK,
+            "bolt-hole tool {i} must create; body = {body}"
+        );
+        let tool = body["object"]["id"]
+            .as_str()
+            .expect("cylinder response must carry object.id")
+            .to_string();
+
+        let (s, body) = dispatch(
+            state,
+            post(
+                "/api/geometry/boolean",
+                json!({ "operation": "difference", "object_a": flange, "object_b": tool }),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "bolt hole {i} must cut; body = {body}");
+    }
+
+    flange
+}
+
+/// Every live edge whose BOTH endpoints sit on the flange's top rim
+/// (z ≈ 4, r ≈ 20), paired with its persistent id. Returned sorted by edge id
+/// so the pick is deterministic.
+async fn top_rim_edges(state: &AppState) -> Vec<(u32, Option<String>)> {
+    let model = state.model.read().await;
+    let mut rim: Vec<(u32, Option<String>)> = Vec::new();
+    for (eid, edge) in model.edges.iter() {
+        let on_rim = |v| match model.vertices.get_position(v) {
+            Some(p) => {
+                let r = (p[0] * p[0] + p[1] * p[1]).sqrt();
+                (r - 20.0).abs() < 1e-6 && (p[2] - 4.0).abs() < 1e-6
+            }
+            None => false,
+        };
+        if on_rim(edge.start_vertex) && on_rim(edge.end_vertex) {
+            rim.push((eid, model.edge_pid(eid).map(|p| p.as_u128().to_string())));
+        }
+    }
+    rim.sort_by_key(|&(eid, _)| eid);
+    rim
+}
+
+/// THE DEFECT: a fillet that names a boolean-minted edge PID, on a document
+/// whose base solid was built inside a recorder-suppression window, must still
+/// resolve after a reboot.
+///
+/// RED against HEAD (measured 2026-08-10): `quarantined = true`,
+/// `first_break_sequence = 14`, `first_break_kind = "fillet_edges"`, reason
+/// `Dangling { entity: "edge-pid:257431992866368497960801706702953204912" }`,
+/// `events_served = 14` of `events_total = 15` — the live 2026-08-09 signature,
+/// count for count.
+///
+/// Not vacuous: it asserts the rim actually carries a persistent id before the
+/// fillet (without one the fillet records `null` and replay falls back to the
+/// transient remap, which cannot dangle), it asserts the PID resolves in the
+/// replayed model independently of the quarantine verdict, and it asserts the
+/// rebuilt document is geometrically identical, not merely un-quarantined.
+///
+/// # Mutation proofs (RUN 2026-08-10, separately, one line each)
+///
+/// * Restore the `!rec.records_are_discarded()` condition in
+///   `BRepModel::next_root_seed` (`geometry-engine`, leaving the recorder-bridge
+///   sticky reservation in place) → regresses to `Dangling { entity:
+///   "edge-pid:257431992866368497960801706702953204912" }`, 14 of 15 served,
+///   and the `pid_resolves` assert is the one that fires.
+/// * Revert `fillet_edges`' recorded `radius` to `options.radius`
+///   (`geometry-engine/src/operations/fillet.rs`) → `pid_resolves` stays TRUE
+///   and the break moves to `Failed { reason: "kernel rejected operation
+///   fillet_edges: Invalid radius: 5" }` — the recorded radius (the untouched
+///   `FilletOptions` default) instead of the 0.5 the call applied.
+///
+/// Control arm used to isolate the seam (run, then deleted — it duplicated
+/// existing bored-box coverage once green): the identical chain with a
+/// NON-suppressed base (`/api/geometry/cylinder` instead of the typed revolve)
+/// did NOT dangle against HEAD — it bound its edge PID fine and broke only on
+/// the radius. Same four bounded-executor boolean clone-swaps in both arms, so
+/// the divergence is the suppression window, not transient-id drift.
+#[tokio::test]
+async fn suppressed_build_fillet_edge_pid_survives_reboot() {
+    let path = temp_db_path();
+
+    let (total_events, fp_before, filleted_pid) = {
+        let db = open_db(&path).await;
+        let state = build_state(db, true).await;
+        let flange = seed_flange_with_bolt_holes(&state).await;
+
+        // The rim after four bolt-hole booleans — measured, not assumed.
+        let rim = top_rim_edges(&state).await;
+        println!("[task#4] top-rim edges after 4 bolt-hole booleans: {rim:?}");
+        assert!(
+            !rim.is_empty(),
+            "the flange must expose at least one top-rim edge to fillet"
+        );
+        let (rim_edge, rim_pid) = rim[0].clone();
+        let rim_pid = rim_pid.expect(
+            "the boolean must have minted a canonical PID on the rim edge — without one \
+             the fillet records `edge_pids: [null]` and this test cannot exercise \
+             PID-binding at all",
+        );
+
+        let (s, body) = dispatch(
+            &state,
+            post(
+                "/api/geometry/fillet",
+                json!({ "object": flange, "edges": [rim_edge], "radius": 0.5 }),
+            ),
+        )
+        .await;
+        assert_eq!(
+            s,
+            StatusCode::OK,
+            "the rim fillet must succeed live; edge = {rim_edge}, body = {body}"
+        );
+
+        state
+            .timeline_recorder
+            .flush()
+            .await
+            .expect("recorder flush must succeed");
+
+        let total = state
+            .database
+            .get_event_count(durability::DURABILITY_SESSION_ID)
+            .await
+            .expect("event count must query");
+        (total, geom_fingerprint(&state).await, rim_pid)
+    };
+
+    // ---- Reboot over the SAME db file. ----
+    let db2 = open_db(&path).await;
+    let state2 = build_state(db2, true).await;
+
+    let (s, body) = dispatch(&state2, get("/api/durability/status")).await;
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "status endpoint must return 200; body = {body}"
+    );
+
+    // Diagnosis on failure: does the replayed model know the identity the live
+    // fillet recorded? `false` IS the defect — replay minted a different PID
+    // for the same edge.
+    let pid_resolves = {
+        let model = state2.model.read().await;
+        filleted_pid
+            .parse::<u128>()
+            .ok()
+            .map(|raw| {
+                model
+                    .edge_by_pid(geometry_engine::primitives::persistent_id::PersistentId(
+                        raw,
+                    ))
+                    .is_some()
+            })
+            .unwrap_or(false)
+    };
+
+    // The defect's direct oracle, independent of the quarantine verdict: the
+    // identity the live fillet recorded must be an identity the replayed model
+    // actually minted. Asserted separately so a future regression names WHICH
+    // half broke — the PID binding or the rest of the fillet event.
+    assert!(
+        pid_resolves,
+        "the edge PID the live fillet recorded ({filleted_pid}) must resolve in the \
+         replayed model — a `false` here is the live/replay root-pid divergence; \
+         body = {body}"
+    );
+
+    assert_eq!(
+        body["quarantined"], false,
+        "the flange log must replay cleanly, NOT quarantine at the fillet; \
+         recorded edge-pid = {filleted_pid}, resolves after replay = {pid_resolves}; \
+         body = {body}"
+    );
+    assert_eq!(
+        body["status"]["state"], "active",
+        "durability status must be `active` after a clean replay; body = {body}"
+    );
+    assert_eq!(
+        body["status"]["events_replayed"],
+        json!(total_events),
+        "every persisted event must be replayed, the fillet included; body = {body}"
+    );
+
+    let fp_after = geom_fingerprint(&state2).await;
+    assert_eq!(
+        fp_after, fp_before,
+        "the rebuilt flange (solid count + tessellation) must be identical after reboot; \
+         before = {fp_before:?}, after = {fp_after:?}"
+    );
+}

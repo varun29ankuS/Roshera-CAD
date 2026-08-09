@@ -1219,12 +1219,30 @@ pub fn fillet_edges(
             crate::primitives::provenance::OperationKind::Fillet,
             Vec::new(),
         );
+        // The radius the call ACTUALLY applied. `validate_fillet_inputs` and
+        // the blend surgery both read the radius out of `options.fillet_type`;
+        // `options.radius` is a secondary field callers routinely leave at the
+        // `FilletOptions::default()` value of 5.0 while passing the real radius
+        // in `fillet_type` (every `/api/geometry/fillet` uniform-constant
+        // request does exactly that). Recording the untouched field made the
+        // event LIE about the operation it describes, and replay — which reads
+        // `radius` — rebuilt a 5.0 fillet: on the measured flange that is
+        // geometrically infeasible, so the event broke with `Invalid radius: 5`
+        // and quarantined the document; on a part where 5.0 happens to fit it
+        // would have silently rebuilt a wrong-sized blend. Non-constant profile
+        // types keep `options.radius` (their per-station radii are not one
+        // number; replay's constant-only reconstruction of those is a separate,
+        // pre-existing lossiness documented on `parse_fillet_constant_radius`).
+        let applied_radius = match &options.fillet_type {
+            FilletType::Constant(r) => *r,
+            _ => options.radius,
+        };
         model.record_operation(
             crate::operations::recorder::RecordedOperation::new("fillet_edges")
                 .with_parameters(serde_json::json!({
                     "solid_id": solid_id,
                     "fillet_type": format!("{:?}", options.fillet_type),
-                    "radius": options.radius,
+                    "radius": applied_radius,
                     "propagation": format!("{:?}", options.propagation),
                     "preserve_edges": options.preserve_edges,
                     "quality": format!("{:?}", options.quality),

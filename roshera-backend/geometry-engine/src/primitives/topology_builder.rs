@@ -2533,14 +2533,22 @@ impl BRepModel {
     /// number). Reserving the SAME key live, via
     /// [`OperationRecorder::reserve_event_key`], closes that gap.
     ///
-    /// Skipped while `records_are_discarded()` (an api-server
-    /// `RecorderSuppressGuard` scope, e.g. `sketch_extrude`'s inner
-    /// `extrude_face` / boolean calls): that caller consolidates several
-    /// kernel-internal sub-events into ONE record it builds and forwards
-    /// itself, bypassing `record_operation` — a reservation made here would
-    /// never be attached to that consolidated record and would just burn a
-    /// sequence number for nothing. Falling back to `root_counter` there is
-    /// exactly today's (pre-existing) behaviour — unchanged, not worsened.
+    /// Reserving is NOT skipped inside an api-server `RecorderSuppressGuard`
+    /// scope (`records_are_discarded()`), and that is the point (task #4).
+    /// Such a caller — `/api/geometry/revolve`, csketch `sketch_extrude` /
+    /// `sketch_revolve` — discards the kernel's inner records and forwards ONE
+    /// consolidated record itself. Skipping the reservation there sent every
+    /// root pid the build minted down the `__local:{root_counter}` path, a
+    /// process-local name replay can never re-derive: measured 2026-08-09, a
+    /// flange built by typed revolve, bored by four booleans and filleted on
+    /// the rim quarantined on reopen with `dangling reference in fillet_edges:
+    /// edge-pid:… no longer resolves` (14 of 15 events served), because the
+    /// revolve's root pid — and every face pid derived from it, and every
+    /// canonical edge pid derived from those — differed between live and
+    /// replay. The recorder makes the reservation STICKY for the whole scope
+    /// and hands it to the consolidated record
+    /// (`TimelineRecorder::reserve_event_key` / `end_discard_scope`), so the
+    /// scope burns exactly ONE sequence and the event lands on it.
     ///
     /// The reservation is cached into `current_event_key` /
     /// `current_reserved_sequence` so every root pid minted for the REST of
@@ -2554,13 +2562,11 @@ impl BRepModel {
             return format!("{k}|{kind_params}").into_bytes();
         }
         if let Some(rec) = self.recorder.as_ref() {
-            if !rec.records_are_discarded() {
-                if let Some(key) = rec.reserve_event_key() {
-                    let seq = key.strip_prefix("evt:").and_then(|s| s.parse::<u64>().ok());
-                    *self.current_reserved_sequence.lock() = seq;
-                    *self.current_event_key.lock() = Some(key.clone());
-                    return format!("{key}|{kind_params}").into_bytes();
-                }
+            if let Some(key) = rec.reserve_event_key() {
+                let seq = key.strip_prefix("evt:").and_then(|s| s.parse::<u64>().ok());
+                *self.current_reserved_sequence.lock() = seq;
+                *self.current_event_key.lock() = Some(key.clone());
+                return format!("{key}|{kind_params}").into_bytes();
             }
         }
         let n = self.root_counter;
