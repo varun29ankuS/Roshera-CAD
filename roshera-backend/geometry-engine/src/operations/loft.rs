@@ -129,10 +129,16 @@ fn loft_profiles_body(
         Some(ref corr) => corr.clone(),
         None => establish_correspondence(model, &face_profiles)?,
     };
-    // Densify any profile that returned fewer points than the maximum
+    // Densify any profile that returned fewer points than the ring target
     // (single self-closing edges yield only 1 vertex; mixing those with
-    // polygonal profiles would otherwise fail IncompatibleProfiles).
-    let correspondence = densify_correspondence(model, &face_profiles, correspondence)?;
+    // polygonal profiles would otherwise fail IncompatibleProfiles). The
+    // target is chord-sag driven — see `densify_correspondence`.
+    let correspondence = densify_correspondence(
+        model,
+        &face_profiles,
+        correspondence,
+        options.common.tolerance,
+    )?;
 
     // Create lofted solid based on type
     let solid_id = match options.loft_type {
@@ -1510,27 +1516,199 @@ fn face_centroid(model: &BRepModel, face_id: FaceId) -> OperationResult<Vector3>
     ring_centroid(model, &vertices)
 }
 
+/// Absolute floor on the correspondence ring size.
+///
+/// Pre-dates the chord-sag rule below and is retained deliberately: it is what
+/// makes a straight-edged profile (rectangle, square, any polygon with ≤ 8
+/// corners) densify to EXACTLY the ring it densified to before — the
+/// oblique-prism harness, the loft determinism test and the persistent-id
+/// lineage all key off that ring, and a straight edge has no curvature for the
+/// sagitta rule to bite on.
+const RING_MIN_VERTICES: usize = 8;
+
+/// Chord-height (sagitta) budget for a loft correspondence ring.
+///
+/// The ring is an APPROXIMATION of the profile — a chord polygon inscribed in
+/// it — so it is budgeted at the kernel's approximation grade, not its identity
+/// grade. The operation tolerance itself (τ_weld = 1e-6 at the default
+/// `NORMAL_TOLERANCE`) answers "are these the same point"; used as a sagitta it
+/// would demand ~1900 chords for a Ø14 circle and therefore pin every profile
+/// of radius above ~0.02 at the ceiling — a constant wearing a formula, which
+/// is precisely the defect this rule replaces. `LOOSE_TOLERANCE` is documented
+/// as the "visualization and approximation" grade; taken through the same
+/// `to_extended().chordal` derivation every other chordal reach in the kernel
+/// uses (×10) it yields 1e-2, independently anchored by
+/// `TessellationParams::coarse().chord_tolerance`.
+///
+/// A caller running COARSER than that still gets its own budget honoured (the
+/// `max`), so the ring never claims fidelity the caller did not ask for.
+fn ring_chord_budget(op_tolerance: crate::math::Tolerance) -> f64 {
+    use crate::math::tolerance::LOOSE_TOLERANCE;
+    op_tolerance
+        .to_extended()
+        .chordal
+        .max(LOOSE_TOLERANCE.to_extended().chordal)
+}
+
+/// Number of chords needed to carry one profile edge within `chord_budget`.
+///
+/// Same sagitta rule as `tessellation::surface::arc_steps_for_quality` — the
+/// kernel's standard convention for how many segments a curved boundary needs:
+///
+/// ```text
+/// cos(θ/2) = 1 − h/r   ⇒   n = ceil(span / θ)
+/// ```
+///
+/// with `h` the chord-height budget, `r` the radius of curvature and `span` the
+/// total turning angle across the edge (`arc_length · κ`, exact for arcs and
+/// circles whose curvature is constant, conservative elsewhere). Curvature is
+/// read from the curve itself (`Curve::curvature_at`), so the count is
+/// parameterisation-independent and grows as √r — a Ø50 circle gets more
+/// chords than a Ø2 one, which is the whole point. A straight edge (κ = 0)
+/// needs exactly one chord: the chord IS the edge.
+fn edge_chord_samples(
+    curve: &dyn crate::primitives::curve::Curve,
+    lo: f64,
+    hi: f64,
+    chord_budget: f64,
+    op_tolerance: crate::math::Tolerance,
+    params: &crate::tessellation::TessellationParams,
+) -> usize {
+    // Peak curvature across the span. Constant (and exact) for Line / Arc /
+    // Circle; for a freeform curve the peak is the binding one, so sampling
+    // it is the conservative choice.
+    const CURVATURE_SAMPLES: usize = 8;
+    let mut kappa = 0.0f64;
+    for i in 0..=CURVATURE_SAMPLES {
+        let t = lo + (hi - lo) * (i as f64 / CURVATURE_SAMPLES as f64);
+        if let Ok(k) = curve.curvature_at(t) {
+            if k.is_finite() && k > kappa {
+                kappa = k;
+            }
+        }
+    }
+
+    let arc_len = curve
+        .arc_length_between(lo, hi, op_tolerance)
+        .unwrap_or(0.0);
+    if kappa <= 0.0 || !arc_len.is_finite() || arc_len <= 0.0 {
+        // Straight (or degenerate) edge — one chord reproduces it exactly.
+        return 1;
+    }
+
+    let radius = 1.0 / kappa;
+    if chord_budget >= radius {
+        // Budget looser than the feature itself: nothing to resolve.
+        return params.min_segments;
+    }
+    let span = arc_len * kappa;
+    let theta = 2.0 * (1.0 - chord_budget / radius).acos();
+    if !(theta > 0.0) || !theta.is_finite() {
+        return params.min_segments;
+    }
+    ((span / theta).ceil() as usize).clamp(params.min_segments, params.max_segments)
+}
+
+/// Chord-sag ring size a single profile needs: the sum over its outer-loop
+/// edges, capped at the kernel's standard curve-sampling ceiling
+/// (`TessellationParams::default().max_segments`). The ceiling is what keeps a
+/// loft's lateral-face count proportionate — every ring vertex mints a ruled
+/// face per profile pair (× `sections` on the Cubic path).
+fn profile_chord_samples(
+    model: &BRepModel,
+    face_id: FaceId,
+    chord_budget: f64,
+    op_tolerance: crate::math::Tolerance,
+    params: &crate::tessellation::TessellationParams,
+) -> OperationResult<usize> {
+    let face = model
+        .faces
+        .get(face_id)
+        .ok_or_else(|| OperationError::InvalidGeometry("Face not found".to_string()))?;
+    let loop_data = model
+        .loops
+        .get(face.outer_loop)
+        .ok_or_else(|| OperationError::InvalidGeometry("Loop not found".to_string()))?;
+
+    let mut total = 0usize;
+    for &edge_id in &loop_data.edges {
+        let edge = model
+            .edges
+            .get(edge_id)
+            .ok_or_else(|| OperationError::InvalidGeometry("Edge not found".to_string()))?;
+        let curve = model
+            .curves
+            .get(edge.curve_id)
+            .ok_or_else(|| OperationError::InvalidGeometry("Curve not found".to_string()))?;
+        total = total.saturating_add(edge_chord_samples(
+            curve,
+            edge.param_range.start,
+            edge.param_range.end,
+            chord_budget,
+            op_tolerance,
+            params,
+        ));
+    }
+    Ok(total.min(params.max_segments))
+}
+
 /// Establish vertex correspondence between profiles
 /// Resample profiles so all share a common vertex count. Required when the
 /// input profiles include both polygonal faces (n vertices) and self-closing
 /// curve faces (1 vertex per edge — typical for circles/ellipses).
 ///
-/// Algorithm: target = max(profile counts, 8). For each profile that already
-/// matches the target, keep it. Otherwise walk its outer loop, distribute
-/// `target` parameter-uniform samples across the edges (rounding up so the
-/// per-edge counts cover the target), evaluate the curves at those params,
-/// and emit fresh vertices into the model.
+/// # Ring density is a FIDELITY parameter, not bookkeeping
+///
+/// The lateral surface is ruled between corresponding ring vertices, so the
+/// solid the loft actually builds is the one spanned by those chords — a
+/// circular profile sampled at `n` points lofts an `n`-gon prismatoid, short of
+/// the true body by the exact polygon/circle area ratio `(n/2π)·sin(2π/n)`.
+/// This target used to be `max(profile counts, 8)`: two circles, ANY radii,
+/// lofted an OCTAGON, 9.9684% under the conical closed form (`2√2/π`) while
+/// certifying perfectly sound — a valid closed manifold of the wrong shape.
+///
+/// The target is therefore derived, not assumed:
+///
+/// ```text
+/// target = max( max(profile vertex counts),                 // never lose a corner
+///               max over profiles of Σ_edges chord samples,  // sagitta rule
+///               RING_MIN_VERTICES )                          // straight-edge floor
+/// ```
+///
+/// where the per-edge chord count comes from the sagitta rule against the
+/// operation's chord budget (see [`edge_chord_samples`] / [`ring_chord_budget`]),
+/// clamped to `TessellationParams::default()`'s segment bounds. Straight-edged
+/// profiles are unaffected: their edges contribute one chord each, so a
+/// rectangle still densifies to exactly `RING_MIN_VERTICES`.
+///
+/// For each profile that already matches the target, keep it. Otherwise walk
+/// its outer loop, distribute `target` parameter-uniform samples across the
+/// edges (rounding up so the per-edge counts cover the target), evaluate the
+/// curves at those params, and emit fresh vertices into the model.
 fn densify_correspondence(
     model: &mut BRepModel,
     profiles: &[FaceId],
     correspondence: Vec<Vec<VertexId>>,
+    op_tolerance: crate::math::Tolerance,
 ) -> OperationResult<Vec<Vec<VertexId>>> {
-    let target = correspondence
+    let params = crate::tessellation::TessellationParams::default();
+    let chord_budget = ring_chord_budget(op_tolerance);
+
+    let mut target = correspondence
         .iter()
         .map(|v| v.len())
         .max()
         .unwrap_or(1)
-        .max(8);
+        .max(RING_MIN_VERTICES);
+    for &face_id in profiles {
+        target = target.max(profile_chord_samples(
+            model,
+            face_id,
+            chord_budget,
+            op_tolerance,
+            &params,
+        )?);
+    }
 
     if correspondence.iter().all(|v| v.len() == target) {
         return Ok(correspondence);
@@ -2089,11 +2267,87 @@ mod tests {
         let p2 = make_square_at_z(&mut model, 1.0);
         let faces = create_face_profiles(&mut model, vec![p1, p2]).expect("faces");
         let corr = establish_correspondence(&model, &faces).expect("correspondence");
-        // 4 vs 4: max=4 but min target is 8; will densify both to 8.
-        let densified = densify_correspondence(&mut model, &faces, corr).expect("densified");
+        // 4 vs 4: max=4 but the straight-edge floor is RING_MIN_VERTICES; a
+        // square's four line edges contribute one chord each, so the sagitta
+        // rule never raises the target above the floor. Both densify to 8.
+        let densified =
+            densify_correspondence(&mut model, &faces, corr, crate::math::Tolerance::default())
+                .expect("densified");
         assert_eq!(densified.len(), 2);
-        assert_eq!(densified[0].len(), 8);
-        assert_eq!(densified[1].len(), 8);
+        assert_eq!(densified[0].len(), RING_MIN_VERTICES);
+        assert_eq!(densified[1].len(), RING_MIN_VERTICES);
+    }
+
+    // -------------------------------------------------------------------
+    // chord-sag ring density (the octagonal-prismatoid fix)
+    // -------------------------------------------------------------------
+
+    /// Build the circular profile idiom the kernel actually receives from a
+    /// circular sketch: ONE self-closing `Circle` edge over the unit range.
+    fn circle_profile_face(model: &mut BRepModel, radius: f64) -> FaceId {
+        use crate::primitives::curve::{Circle, ParameterRange};
+        let seam = model.vertices.add_or_find(radius, 0.0, 0.0, 1e-6);
+        let cid = model.curves.add(Box::new(
+            Circle::new(Point3::new(0.0, 0.0, 0.0), Vector3::Z, radius).expect("circle"),
+        ));
+        let eid = model.edges.add(Edge::new(
+            0,
+            seam,
+            seam,
+            cid,
+            EdgeOrientation::Forward,
+            ParameterRange::unit(),
+        ));
+        create_planar_face_from_edges(model, vec![eid]).expect("circle face")
+    }
+
+    fn circle_ring_target(radius: f64) -> usize {
+        let mut model = BRepModel::new();
+        let face = circle_profile_face(&mut model, radius);
+        let params = crate::tessellation::TessellationParams::default();
+        let tol = crate::math::Tolerance::default();
+        profile_chord_samples(&model, face, ring_chord_budget(tol), tol, &params)
+            .expect("chord samples")
+    }
+
+    /// The estimator must READ the circle: a bigger circle needs more chords.
+    /// The pre-fix rule returned 8 for every radius, which is exactly why two
+    /// circles lofted an octagon whatever their size.
+    #[test]
+    fn circular_profile_chord_density_grows_with_radius() {
+        let (n1, n7, n25) = (
+            circle_ring_target(1.0),
+            circle_ring_target(7.0),
+            circle_ring_target(25.0),
+        );
+        assert!(
+            n1 < n7 && n7 <= n25,
+            "chord density must be radius-driven: r=1 -> {n1}, r=7 -> {n7}, r=25 -> {n25}"
+        );
+        assert!(
+            n1 > RING_MIN_VERTICES,
+            "even a r=1 circle needs more than the straight-edge floor: {n1}"
+        );
+    }
+
+    /// The sagitta rule, evaluated on the exact profile the capability probe
+    /// feeds loft (r=7 → r=4.5). Guards the units: `Circle` carries a
+    /// NORMALISED parameter range, so a rule that confused parameter span with
+    /// swept angle would silently collapse to the floor.
+    #[test]
+    fn circular_profile_chord_density_holds_the_2pct_volume_band() {
+        let n = circle_ring_target(7.0).max(circle_ring_target(4.5));
+        // Volume of a loft between two n-gons inscribed in circles is the
+        // conical closed form scaled by (n/2π)·sin(2π/n).
+        let ratio = (n as f64 / std::f64::consts::TAU) * (std::f64::consts::TAU / n as f64).sin();
+        let deviation = 1.0 - ratio;
+        assert!(
+            deviation <= 0.02,
+            "ring of {n} chords deviates {:.4}% from the circular body — over the 2% band",
+            deviation * 100.0
+        );
+        // The octagon floor is what the fix removed; assert we are past it.
+        assert!(n > 8, "r=7 circle must sample more than the old 8-gon: {n}");
     }
 
     // -------------------------------------------------------------------

@@ -8017,3 +8017,149 @@ async fn certified_response_omits_durability_when_not_quarantined() {
          `durability` key ANYWHERE in its JSON; body = {body}"
     );
 }
+
+// ─── Unknown-key refusal on the primitive endpoints ─────────────────────
+//
+// The primitive creators take `Json<serde_json::Value>` and probe keys by
+// name, so before `refuse_unknown_keys` an unrecognized key was silently
+// ignored and its parameter silently DEFAULTED. Measured 2026-08-08: a
+// caller sending `"position": {x,y,z}` (a plausible spelling the schema
+// never had — the real key is `center`, an [x,y,z] ARRAY) got
+// `success: true` with every solid placed at the origin. A day of kernel
+// capability probing was poisoned: every "bore 30mm away" was a coincident
+// re-cut of the first bore, and the resulting honest-unsound results were
+// initially filed as a kernel defect. These tests pin the refusal so the
+// wrong call stays inexpressible.
+
+/// The exact payload that poisoned the probes: `position` instead of
+/// `center`. Must be a typed 400 that names the bogus key, lists the
+/// accepted set, and carries the position→center hint — not a silent
+/// origin-placed success.
+#[tokio::test]
+async fn cylinder_with_position_key_is_refused_not_silently_defaulted() {
+    let state = make_test_state().await;
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/api/geometry/cylinder")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({
+                "radius": 2.0,
+                "height": 30.0,
+                "position": {"x": -30.0, "y": 15.0, "z": 5.0},
+            })
+            .to_string(),
+        ))
+        .expect("static request must build");
+    let (status, body) = dispatch(&state, request).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "an unknown key must refuse, not silently default; body = {body}"
+    );
+    assert_eq!(body["error_code"], "invalid_parameter");
+    let msg = body["error"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("position") && msg.contains("center"),
+        "the refusal must name the bogus key and point at the real one; \
+         error = {msg}"
+    );
+    assert!(
+        msg.to_ascii_lowercase().contains("array"),
+        "the shape difference (array vs object) is half the trap and must \
+         be stated; error = {msg}"
+    );
+}
+
+/// The box endpoint refuses too — same guard, its own accepted set.
+#[tokio::test]
+async fn box_with_unknown_key_is_refused() {
+    let state = make_test_state().await;
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/api/geometry/box")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({
+                "width": 10.0, "depth": 10.0, "height": 10.0,
+                "postion": [1.0, 2.0, 3.0],
+            })
+            .to_string(),
+        ))
+        .expect("static request must build");
+    let (status, body) = dispatch(&state, request).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "body = {body}");
+    assert_eq!(body["error_code"], "invalid_parameter");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("postion"),
+        "the misspelled key itself must appear in the message; body = {body}"
+    );
+}
+
+/// The guard must NOT break the documented contract: a fully-valid
+/// cylinder request with center+axis still succeeds, and the center is
+/// honored (this is the assertion the probes were missing — the part
+/// must NOT be at the origin).
+#[tokio::test]
+async fn cylinder_with_valid_center_still_succeeds_and_is_placed_there() {
+    let state = make_test_state().await;
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/api/geometry/cylinder")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({
+                "radius": 2.0,
+                "height": 30.0,
+                "center": [-30.0, 15.0, 5.0],
+                "axis": [0.0, 0.0, 1.0],
+            })
+            .to_string(),
+        ))
+        .expect("static request must build");
+    let (status, body) = dispatch(&state, request).await;
+    assert_eq!(status, StatusCode::OK, "body = {body}");
+    assert_eq!(body["success"], true);
+    // The kernel's own bbox proves placement: centred on (-30, 15) and
+    // starting at z=5 — not the origin.
+    // Placement oracle: the TESSELLATED mesh the endpoint itself returns.
+    // Deliberately NOT `Solid::bounding_box` — that computes from stored
+    // vertices only, and an analytic cylinder's only vertices sit on its
+    // seam, so its box degenerates to a line at x = center + r (measured:
+    // [-28, -28] for this very cylinder — a real latent bug wherever that
+    // bbox is displayed, e.g. kernel_state; filed, not fixed here). The
+    // mesh samples the whole lateral surface, so its extent reflects the
+    // solid's true placement.
+    let verts = body["object"]["mesh"]["vertices"]
+        .as_array()
+        .expect("mesh vertices present");
+    assert!(verts.len() >= 9, "expected a real tessellation");
+    let coord = |i: usize| verts[i].as_f64().expect("numeric coord");
+    let (mut min, mut max) = ([f64::MAX; 3], [f64::MIN; 3]);
+    for v in 0..verts.len() / 3 {
+        for a in 0..3 {
+            let c = coord(v * 3 + a);
+            min[a] = min[a].min(c);
+            max[a] = max[a].max(c);
+        }
+    }
+    // Chordal tessellation inscribes the circle, so the radial extent is
+    // within a chord-sag of the analytic ±2 around (-30, 15) — 0.1 is
+    // generous for any default tessellation density. Z is exact: planar
+    // caps at 5 and 35.
+    assert!(
+        (min[0] - (-32.0)).abs() < 0.1 && (max[0] - (-28.0)).abs() < 0.1,
+        "x extent must straddle -30, not the origin; got [{}, {}]",
+        min[0],
+        max[0]
+    );
+    assert!(
+        (min[2] - 5.0).abs() < 1e-6 && (max[2] - 35.0).abs() < 1e-6,
+        "z extent must start at the requested center, not the origin; got [{}, {}]",
+        min[2],
+        max[2]
+    );
+}

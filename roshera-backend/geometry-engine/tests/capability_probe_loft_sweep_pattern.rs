@@ -153,34 +153,37 @@ fn loft_two_circles(r0: f64, r1: f64, h: f64) -> (BRepModel, SolidId) {
     (m, sid)
 }
 
-/// MEASURED RED. `loft_profiles` densifies a profile's vertex correspondence
-/// to `max(profile_vertex_counts).max(8)` (`loft.rs::densify_correspondence`).
-/// A circular profile expressed as a single self-closing edge starts with
-/// exactly ONE correspondence vertex (the seam), so BOTH rings densify to the
-/// hard floor of 8 — an octagon inscribed in the circle — REGARDLESS of the
-/// circle's radius. The two octagons are similar (same 8 angular positions,
-/// scaled by r1/r0), so the lofted body is an exact octagonal-pyramid frustum,
-/// not an approximation of the circular one: its volume is the circular
-/// closed form scaled by the exact area ratio of a regular inscribed octagon
-/// to its circle, `(8/2)·sin(2π/8) / π = 2√2/π ≈ 0.900316` — a ~10% shortfall
-/// that no amount of loft-side smoothing (`LoftType::Cubic`/`Guided` reuse the
-/// same 8-point correspondence) fixes. `operations::nurbs_loft::nurbs_loft`
-/// (not re-exported from `operations::mod`, so not "the" loft entry point)
-/// takes explicit point-sampled rings and does not hit this floor — see
-/// `tests/nurbs_loft.rs`.
+/// WAS A MEASURED RED — NOW GREEN. `loft_profiles` used to densify a profile's
+/// vertex correspondence to `max(profile_vertex_counts).max(8)`
+/// (`loft.rs::densify_correspondence`). A circular profile expressed as a
+/// single self-closing edge starts with exactly ONE correspondence vertex (the
+/// seam), so BOTH rings densified to the hard floor of 8 — an octagon inscribed
+/// in the circle — REGARDLESS of the circle's radius. The two octagons were
+/// similar (same 8 angular positions, scaled by r1/r0), so the lofted body was
+/// an exact octagonal-pyramid frustum, not an approximation of the circular
+/// one: its volume was the circular closed form scaled by the exact area ratio
+/// of a regular inscribed octagon to its circle,
+/// `(8/2)·sin(2π/8) / π = 2√2/π ≈ 0.900316` — a ~10% shortfall that no amount
+/// of loft-side smoothing (`LoftType::Cubic`/`Guided` reuse the same
+/// correspondence) fixed. Measured then: tess_vol=2469.6883 vs
+/// closed_form=2743.1340 → deviation=9.9684%, with cert_sound=true throughout:
+/// a genuinely closed manifold of the wrong shape, which is exactly why the
+/// certificate could not see it.
 ///
-/// The measured numbers below are printed via `eprintln!` so a future re-run
-/// after a fix documents the new deviation without editing this comment.
+/// FIXED by making the ring density chord-sag driven instead of a constant:
+/// `densify_correspondence` now takes the max over profiles of the per-edge
+/// sagitta count (`cos(θ/2) = 1 − h/r`, the same rule as
+/// `tessellation::surface::arc_steps_for_quality`) against the operation's
+/// chord budget, floored at the historical 8 for straight-edged profiles and
+/// capped at `TessellationParams::default().max_segments`. r=7 → 59 chords,
+/// r=4.5 → 48, so this loft rings at 59: tess_vol=2737.9519
+/// mass_vol=2737.9519 closed_form=2743.1340 → deviation=0.1889%, matching the
+/// 59-gon/circle area ratio. Straight-edged profiles are byte-identical to
+/// before (a line edge needs exactly one chord).
+///
+/// The measured numbers are printed via `eprintln!` so a future re-run
+/// documents the then-current deviation without editing this comment.
 #[test]
-#[ignore = "MEASURED: loft_profiles circular-profile correspondence floors at 8 \
-            vertices (densify_correspondence's `.max(8)`), so two circles loft \
-            into an OCTAGONAL frustum, not a circular one. Actual run: \
-            tess_vol=2469.6883 mass_vol=2469.6883 (mesh and mass-props AGREE, \
-            watertight) closed_form=2743.1340 (r0=7, r1=4.5, h=26) -> \
-            deviation=9.9684%, matching the exact regular-octagon/circle area \
-            ratio 2√2/π=0.900316 to 4 decimals. cert_sound=true -- the solid IS \
-            a valid closed manifold, this is a fidelity gap, not a topology \
-            defect. Pinned per boolean_multibody.rs precedent; assertions intact."]
 fn loft_frustum_r7_to_r45_h26_matches_closed_form_within_2pct() {
     let (mut m, sid) = loft_two_circles(7.0, 4.5, 26.0);
 
@@ -248,37 +251,43 @@ fn swept_cylinder(r: f64, length: f64) -> (BRepModel, SolidId) {
     (m, sid)
 }
 
-/// MEASURED RED (on soundness, not volume). `sweep_profile`'s cap face is the
-/// ANALYTIC transformed profile face (its outer loop is still the ONE closed
-/// `Circle` edge -- see `pattern::transform_face`/`transform_loop`, which
-/// transforms a loop's EXISTING edges rather than resampling them). The first
-/// lateral ring, however, comes from `get_section_vertex_ring`, which
-/// explicitly discretizes a closed-curve edge into `samples_per_closed_edge`
-/// (= 32, hard-coded in `create_sweep_section`) BRAND NEW vertices
-/// (`model.vertices.add`, not `add_or_find`) that never coincide by `VertexId`
-/// with the cap loop's seam vertex -- an unstitched cap/lateral seam.
+/// WAS RED, NOW GREEN (fixed in `operations/sweep.rs`; this case was pinned
+/// `#[ignore]` and the ignore is now removed, assertions intact + strengthened).
 ///
-/// Actual run: volume is FINE -- tess_vol=375.2863 mass_vol=375.3487
-/// closed_form=376.9911 (r=2, length=30) -> deviation=0.4522%, well inside the
-/// 2% budget. But the certificate is NOT sound: brep_valid=false,
-/// watertight=false, manifold_report=(264 boundary edges, 0 non-manifold,
-/// closed=false, euler=-6) at coarse-chord tessellation. The seam gap is
-/// invisible to a volume oracle (the sampled ring sits exactly ON the circle,
-/// so it contributes ~0 leaked/missing volume) and only shows up as an open
-/// boundary in the certificate/mesh topology -- exactly the kind of silent-
-/// looking defect a REST-layer volume-only probe would miss entirely.
+/// The defect: `sweep_profile`'s cap face was the ANALYTIC transformed profile
+/// face (its outer loop still the ONE closed `Circle` edge -- see
+/// `pattern::transform_face`/`transform_loop`, which transform a loop's
+/// EXISTING edges rather than resampling them), while the lateral rings came
+/// from `get_section_vertex_ring`, which discretizes a closed-curve edge into
+/// `samples_per_closed_edge` (= 32, hard-coded in `create_sweep_section`) BRAND
+/// NEW vertices (`model.vertices.add`, not `add_or_find`). For a closed profile
+/// the caps and the lateral panels therefore shared NO topology at all: an
+/// unstitched cap/lateral seam all the way round both ends. It measured as
+/// cert_sound=false (brep_valid=false, watertight=false, manifold_report 264
+/// boundary edges, closed=false, euler=-6) while the VOLUME looked fine
+/// (tess=375.2863 vs closed-form=376.9911, 0.4522% dev) -- the sampled ring
+/// sits exactly ON the circle, so the gap leaks ~0 volume. A volume-only probe
+/// would have called this GREEN; the certificate did not.
+///
+/// The fix (`sweep::weld_section_face_to_ring`) rebuilds the cap face's outer
+/// loop as the polygon through that same 32-vertex ring, taking each segment
+/// from `create_or_find_edge` so the cap's edges ARE the adjacent lateral
+/// quads' edges; the scratch sections that never reach the shell are dropped,
+/// and `require_closed_sweep_shell` now refuses (typed, with rollback) rather
+/// than emitting an open shell. The cap is a 32-gon afterwards, matching the
+/// bilinear lateral facets it has to weld to -- so the residual deviation is
+/// faceting fidelity, not a topology defect, and it stays well inside the 2%
+/// budget asserted below. The runtime numbers are printed by the `eprintln!`
+/// so a re-run documents them without editing this comment; the run that
+/// flipped this case green measured tess_vol=374.5586 mass_vol=374.5586 (mesh
+/// and mass-props now agree to every printed digit — they disagreed before)
+/// vs closed_form=376.9911 -> deviation=0.6452%, which is the exact inscribed-
+/// 32-gon/circle area ratio 16·sin(π/16)/π = 0.993570 (predicting 0.6430%) to
+/// within 2.2e-5 relative — i.e. the whole residual IS the 32-facet cap and
+/// lateral discretization, nothing else is leaking. Certificate on that run:
+/// cert_sound=true brep_valid=true watertight=true, manifold_report
+/// (boundary_edges=0, nonmanifold=0, closed=true, manifold=true).
 #[test]
-#[ignore = "MEASURED: sweep_profile leaves an unstitched cap/lateral seam for \
-            CLOSED-CURVE (e.g. circular) profiles -- get_section_vertex_ring \
-            mints brand-new vertices for the first/last ring instead of \
-            reusing the cap loop's seam vertex (root: pattern::transform_face \
-            path). Actual run (r=2, length=30 straight sweep): volume is fine \
-            (tess=375.2863 vs closed-form=376.9911, 0.4522% dev, well inside \
-            2%) but cert_sound=false: brep_valid=false, watertight=false, \
-            manifold_report boundary_edges=264 nonmanifold=0 closed=false \
-            euler=-6. A volume-only probe would have called this GREEN; the \
-            certificate does not. Pinned per boolean_multibody.rs precedent; \
-            assertions intact."]
 fn sweep_cylinder_r2_len30_matches_closed_form_within_2pct() {
     let (mut m, sid) = swept_cylinder(2.0, 30.0);
 
@@ -314,6 +323,21 @@ fn sweep_cylinder_r2_len30_matches_closed_form_within_2pct() {
          {:.4}% exceeds the 2% tolerance",
         deviation * 100.0,
     );
+
+    // The three numbers the old `#[ignore]` reason recorded as broken, pinned
+    // directly so a regression cannot hide behind an aggregate `is_sound()`:
+    // the cap/lateral seam either exists in the mesh or it does not.
+    let mr = mr.expect("a swept solid must tessellate to a non-empty mesh");
+    assert_eq!(
+        mr.boundary_edges, 0,
+        "welded sweep must leave NO open mesh boundary (was 264 before the \
+         cap/lateral weld): {mr:?}",
+    );
+    assert!(
+        mr.closed,
+        "welded sweep mesh must be closed (was closed=false, euler=-6): {mr:?}",
+    );
+    assert!(mr.manifold, "welded sweep mesh must be manifold: {mr:?}",);
 }
 
 // ===========================================================================

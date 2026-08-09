@@ -3891,6 +3891,60 @@ async fn create_extrude(
     })))
 }
 
+/// Refuse a primitive-creation payload that carries keys the endpoint does
+/// not read.
+///
+/// ★ Why this is a REFUSAL and not a warning: these endpoints take
+/// `Json<serde_json::Value>` and probe keys by name, so an unrecognized key
+/// was silently ignored and its parameter silently DEFAULTED. Measured
+/// consequence (2026-08-08): a caller sending `"position": {x,y,z}` — a
+/// plausible spelling the schema never had — got `success: true` with every
+/// solid placed at the ORIGIN. A full day of kernel capability probing was
+/// poisoned by it: every "bore 30mm away" was a coincident re-cut of the
+/// first bore at (0,0,0), and the resulting unsound solids were initially
+/// filed as a kernel defect. An accepted-but-ignored parameter is the API
+/// lying about what it did — same honesty class as a header flag with no
+/// chunk behind it. Constraint beats steering: the wrong call becomes
+/// inexpressible instead of documented-against.
+///
+/// The error names every unknown key AND the accepted set, and the common
+/// misspelling gets a targeted hint (`position` → `center`, with the shape
+/// difference called out: this API takes `[x,y,z]` arrays, not `{x,y,z}`
+/// objects).
+fn refuse_unknown_keys(
+    payload: &serde_json::Value,
+    accepted: &'static [&'static str],
+) -> Result<(), error_catalog::ApiError> {
+    use error_catalog::{ApiError, ErrorCode};
+    let Some(obj) = payload.as_object() else {
+        // Non-object payloads (null from an empty body included) are the
+        // per-field parsers' problem; nothing to check here.
+        return Ok(());
+    };
+    let unknown: Vec<&str> = obj
+        .keys()
+        .map(String::as_str)
+        .filter(|k| !accepted.contains(k))
+        .collect();
+    if unknown.is_empty() {
+        return Ok(());
+    }
+    let hint = if unknown.contains(&"position") {
+        " ('position' is not a parameter here — the placement parameter is \
+         'center', an [x,y,z] ARRAY, not a {x,y,z} object)"
+    } else {
+        ""
+    };
+    Err(ApiError::new(
+        ErrorCode::InvalidParameter,
+        format!(
+            "unknown parameter(s) {unknown:?} — this endpoint accepts only \
+             {accepted:?}, and an unrecognized key would otherwise be \
+             silently ignored with its parameter defaulted{hint}"
+        ),
+    ))
+}
+
 /// POST /api/geometry/cylinder — create an ANALYTIC cylinder primitive: one
 /// smooth periodic lateral face, NOT a faceted N-gon prism. This is the
 /// round-bore / round-boss primitive. Because the wall is a true cylinder
@@ -3898,7 +3952,8 @@ async fn create_extrude(
 /// boolean against a prismatic block uses the analytic plane∩cylinder path.
 ///
 /// Request: `{ "center":[x,y,z], "axis":[x,y,z], "radius":r, "height":h, "name"?:s }`
-/// (center defaults to origin, axis to +Z).
+/// (center defaults to origin, axis to +Z). Unknown keys are REFUSED — see
+/// `refuse_unknown_keys`.
 async fn create_cylinder_primitive(
     State(state): State<AppState>,
     ActiveModel(model_handle): ActiveModel,
@@ -3927,6 +3982,10 @@ async fn create_cylinder_primitive(
             None => default.ok_or_else(|| ApiError::missing_field(key)),
         }
     };
+    refuse_unknown_keys(
+        &payload,
+        &["center", "axis", "radius", "height", "name", "fast"],
+    )?;
     let c = arr3("center", Some([0.0, 0.0, 0.0]))?;
     let ax = arr3("axis", Some([0.0, 0.0, 1.0]))?;
     let radius = payload
@@ -4098,6 +4157,12 @@ async fn create_box_primitive(
             None => default.ok_or_else(|| ApiError::missing_field(key)),
         }
     };
+    refuse_unknown_keys(
+        &payload,
+        &[
+            "center", "u_axis", "v_axis", "width", "depth", "height", "name", "fast",
+        ],
+    )?;
     let center = arr3("center", Some([0.0, 0.0, 0.0]))?;
     let u = arr3("u_axis", Some([1.0, 0.0, 0.0]))?;
     let v = arr3("v_axis", Some([0.0, 1.0, 0.0]))?;
@@ -4297,6 +4362,18 @@ async fn create_cone_primitive(
             None => default.ok_or_else(|| ApiError::missing_field(key)),
         }
     };
+    refuse_unknown_keys(
+        &payload,
+        &[
+            "center",
+            "axis",
+            "base_radius",
+            "top_radius",
+            "height",
+            "name",
+            "fast",
+        ],
+    )?;
     let c = arr3("center", Some([0.0, 0.0, 0.0]))?;
     let ax = arr3("axis", Some([0.0, 0.0, 1.0]))?;
     let base_radius = payload

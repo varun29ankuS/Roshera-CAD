@@ -282,6 +282,14 @@ fn create_path_sweep(
     // Generate sweep sections along path
     let sections = generate_sweep_sections(model, profile_face, path_edge, num_sections, options)?;
 
+    // Weld the cap boundaries onto the lateral vertex rings BEFORE any cap face
+    // is taken from a section — `create_reversed_face` CLONES the last section's
+    // face and SHARES its `outer_loop` id, so rewiring after the clone would
+    // leave the end cap sitting on the discarded analytic loop.
+    if options.create_solid {
+        weld_cap_faces_to_rings(model, &sections)?;
+    }
+
     // Create faces between sections
     let mut shell_faces = Vec::new();
 
@@ -320,6 +328,12 @@ fn create_path_sweep(
 
     let solid = Solid::new(0, shell_id); // ID will be assigned by store
     let solid_id = model.solids.add(solid);
+
+    discard_scratch_section_faces(model, &sections, solid_id);
+
+    if options.create_solid {
+        require_closed_sweep_shell(model, shell_id, "path")?;
+    }
 
     Ok(solid_id)
 }
@@ -393,6 +407,12 @@ fn create_frame_driven_sweep(
         ));
     }
 
+    // Same cap/lateral weld as the path sweep, for the same reason, and in the
+    // same position (before `create_reversed_face` clones the last cap).
+    if options.create_solid {
+        weld_cap_faces_to_rings(model, &sections)?;
+    }
+
     if options.create_solid {
         shell_faces.push(sections[0].face_id);
     }
@@ -424,6 +444,12 @@ fn create_frame_driven_sweep(
 
     let solid = Solid::new(0, shell_id);
     let solid_id = model.solids.add(solid);
+
+    discard_scratch_section_faces(model, &sections, solid_id);
+
+    if options.create_solid {
+        require_closed_sweep_shell(model, shell_id, "frame-driven")?;
+    }
 
     Ok(solid_id)
 }
@@ -796,6 +822,261 @@ fn get_section_vertex_ring(
     }
 
     Ok(ring)
+}
+
+/// Weld the two CAP faces of a sweep onto the vertex rings the lateral panels
+/// are stitched from.
+///
+/// Only the first and last sections ever become caps (`create_path_sweep`
+/// pushes `sections[0]` and a reversed clone of `sections.last()`); the
+/// sections in between are scaffolding and are discarded by
+/// [`discard_scratch_section_faces`], so rewiring them would only create a
+/// third face on every ring edge.
+fn weld_cap_faces_to_rings(
+    model: &mut BRepModel,
+    sections: &[SweepSection],
+) -> OperationResult<()> {
+    let Some(first) = sections.first() else {
+        return Ok(());
+    };
+    weld_section_face_to_ring(model, first.face_id, &first.vertices)?;
+
+    // `sections.last()` is `first` itself for a single-section sweep; welding
+    // the same face twice would rebuild a loop that is already correct and then
+    // delete the edges it is standing on.
+    if let Some(last) = sections.last() {
+        if last.face_id != first.face_id {
+            weld_section_face_to_ring(model, last.face_id, &last.vertices)?;
+        }
+    }
+    Ok(())
+}
+
+/// Rebuild a section face's outer loop as the polygon through `ring`, so the
+/// cap and the lateral panels SHARE their seam instead of each carrying a
+/// private copy of it.
+///
+/// `create_sweep_section` derives two independent things from one profile: the
+/// section FACE, an analytic transformed copy of the profile (for a circular
+/// profile its outer loop is still ONE self-closing `Circle` edge on a single
+/// seam vertex), and, separately, the ordered vertex RING the lateral quads are
+/// built from — `get_section_vertex_ring` discretizes that closed-curve edge
+/// into `samples_per_closed_edge` BRAND-NEW vertices. For a closed profile the
+/// two then have no topology in common at all: the caps reference the circle
+/// edge, the lateral panels reference 32 vertices the caps have never heard of,
+/// and the cap/lateral seam is never stitched. The volume still comes out right
+/// (the sampled ring sits exactly on the circle) which is precisely what makes
+/// the defect quiet — it surfaces only as an open boundary in the certificate
+/// and in the tessellated mesh (SWEEP-CAP-UNWELDED).
+///
+/// Each segment is obtained through [`create_or_find_edge`], the same helper
+/// `create_quad_face` uses, so the polygon's edges ARE the edges the adjacent
+/// lateral quads reference. The old loop is removed, together with any of its
+/// edges the new loop does not reuse, so nothing is left referencing the
+/// discarded analytic edge (an edge in no loop is what the model validator
+/// reports as an unused-edge gap). The face keeps its transformed surface and
+/// its orientation: the polygon is inscribed in the same curve and traversed in
+/// the same direction, so the oriented outward normal is unchanged.
+///
+/// The cap becomes an N-gon rather than a true disc. That is not fidelity lost
+/// here — the lateral panels are already bilinear facets on those same N
+/// points, so an N-gon cap is the only boundary that MATCHES them. Keeping the
+/// cap analytic would require an analytic swept surface on the lateral side,
+/// which this operation does not build. For a profile that is already
+/// polygonal (the common rectangle case) the rebuilt loop recovers the very
+/// same edges and the call is a no-op in everything but the loop id.
+fn weld_section_face_to_ring(
+    model: &mut BRepModel,
+    face_id: FaceId,
+    ring: &[VertexId],
+) -> OperationResult<()> {
+    use std::collections::HashSet;
+
+    if ring.len() < 3 {
+        return Err(OperationError::InvalidGeometry(
+            "Sweep cap ring needs at least 3 distinct points to weld".to_string(),
+        ));
+    }
+
+    let old_loop_id = model
+        .faces
+        .get(face_id)
+        .ok_or_else(|| OperationError::InvalidGeometry("Section face not found".to_string()))?
+        .outer_loop;
+    let old_edges: Vec<EdgeId> = model
+        .loops
+        .get(old_loop_id)
+        .map(|lp| lp.edges.clone())
+        .unwrap_or_default();
+
+    let mut cap_loop = Loop::new(0, crate::primitives::r#loop::LoopType::Outer);
+    let mut new_edges: HashSet<EdgeId> = HashSet::with_capacity(ring.len());
+    for i in 0..ring.len() {
+        let from = ring[i];
+        let to = ring[(i + 1) % ring.len()];
+        let edge_id = create_or_find_edge(model, from, to)?;
+        // A recovered SHARED edge may be stored in either direction; the loop's
+        // per-edge forward flag has to follow the edge's actual `start_vertex`
+        // (same rule as `create_quad_face`).
+        let forward = model
+            .edges
+            .get(edge_id)
+            .map(|e| e.start_vertex == from)
+            .unwrap_or(true);
+        cap_loop.add_edge(edge_id, forward);
+        new_edges.insert(edge_id);
+    }
+    let new_loop_id = model.loops.add(cap_loop);
+
+    // The face is freshly minted by `transform_face` and nothing has computed
+    // its cached stats yet, so swapping the loop id in place cannot leave a
+    // stale cache behind.
+    model
+        .faces
+        .get_mut(face_id)
+        .ok_or_else(|| OperationError::InvalidGeometry("Section face not found".to_string()))?
+        .outer_loop = new_loop_id;
+
+    if old_loop_id != new_loop_id {
+        model.loops.remove(old_loop_id);
+        for e in old_edges {
+            if !new_edges.contains(&e) {
+                model.edges.remove(e);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Remove the sweep sections that never reach the result shell.
+///
+/// Only two of the generated sections become faces of the solid: the first
+/// (start cap) and a reversed CLONE of the last (end cap). Every section in
+/// between is scaffolding whose face, loop and — for a closed profile — private
+/// analytic edge would otherwise stay live in the stores, unattached to any
+/// solid: orphan debris that inflates `model_debris_orphan_faces` and, for the
+/// interior rings, would put a THIRD face on edges the lateral panels already
+/// share. Directly mirrors [`remove_scratch_profile_face`] and loft's
+/// `remove_scratch_profile_faces`.
+///
+/// Loops and edges the result shell references are kept unconditionally — the
+/// end cap SHARES the last section's `outer_loop` id (`create_reversed_face`
+/// clones the face verbatim), and for a polygonal profile the interior sections'
+/// loop edges are the very ring edges the lateral quads are built on.
+fn discard_scratch_section_faces(
+    model: &mut BRepModel,
+    sections: &[SweepSection],
+    solid_id: SolidId,
+) {
+    use std::collections::HashSet;
+
+    let mut shell_faces: HashSet<FaceId> = HashSet::new();
+    let mut shell_loops: HashSet<crate::primitives::r#loop::LoopId> = HashSet::new();
+    let mut shell_edges: HashSet<EdgeId> = HashSet::new();
+
+    if let Some(solid) = model.solids.get(solid_id) {
+        let shell_ids: Vec<_> = std::iter::once(solid.outer_shell)
+            .chain(solid.inner_shells.iter().copied())
+            .collect();
+        for shid in shell_ids {
+            let faces: Vec<FaceId> = model
+                .shells
+                .get(shid)
+                .map(|s| s.faces.clone())
+                .unwrap_or_default();
+            for fid in faces {
+                shell_faces.insert(fid);
+                if let Some(face) = model.faces.get(fid) {
+                    for lid in face.all_loops() {
+                        shell_loops.insert(lid);
+                    }
+                }
+            }
+        }
+    }
+    for &lid in &shell_loops {
+        if let Some(lp) = model.loops.get(lid) {
+            for &e in &lp.edges {
+                shell_edges.insert(e);
+            }
+        }
+    }
+
+    for section in sections {
+        if shell_faces.contains(&section.face_id) {
+            continue;
+        }
+        let loops = match model.faces.get(section.face_id) {
+            Some(f) => f.all_loops(),
+            None => continue,
+        };
+        for lid in loops {
+            if shell_loops.contains(&lid) {
+                continue;
+            }
+            if let Some(lp) = model.loops.get(lid).cloned() {
+                for e in lp.edges {
+                    if !shell_edges.contains(&e) {
+                        model.edges.remove(e);
+                    }
+                }
+            }
+            model.loops.remove(lid);
+        }
+        model.faces.remove(section.face_id);
+    }
+}
+
+/// Post-condition for a SOLID sweep: the shell this operation just built must
+/// be closed and manifold — every edge in it used by exactly two of its faces.
+///
+/// A closed profile swept along a path is a closed body or it is nothing; an
+/// open shell here means a seam the operation failed to stitch, which is
+/// exactly what the certificate's connectivity check reports as `sound: false`.
+/// Emitting that silently is the failure mode this gate exists to make
+/// impossible — the swept-cylinder case shipped the RIGHT volume over an
+/// unstitched cap seam for exactly as long as nothing checked.
+///
+/// Scoped to the shell this call built, and run unconditionally rather than
+/// behind `CommonOptions::validate_result`: returning a solid that fails its
+/// own certificate is not something a caller may opt into. `sweep_profile` runs
+/// inside `lifecycle::with_rollback`, so the `Err` returned here restores the
+/// pre-call model and the unsound solid is never observable. Mirrors extrude's
+/// `require_closed_shell`.
+///
+/// Not applied when `create_solid` is false — that path builds an intentionally
+/// open sheet, where boundary edges are the result, not a defect.
+fn require_closed_sweep_shell(
+    model: &BRepModel,
+    shell_id: crate::primitives::shell::ShellId,
+    path: &str,
+) -> OperationResult<()> {
+    let errors = crate::primitives::validation::validate_shell_closure(model, shell_id);
+    if errors.is_empty() {
+        return Ok(());
+    }
+    let offending: Vec<String> = errors
+        .iter()
+        .filter_map(|e| e.location().and_then(|loc| loc.edge_id))
+        .take(8)
+        .map(|edge_id| edge_id.to_string())
+        .collect();
+    Err(OperationError::InvalidBRep(format!(
+        "sweep_profile ({} path) would emit an unsound solid: shell {} has {} edge(s) that are \
+         not shared by exactly two faces (edges: {}{}). A closed profile swept along a path must \
+         yield a closed shell — the cap/lateral seam was left unstitched. Refusing rather than \
+         returning a solid that fails its own certificate; the model is unchanged.",
+        path,
+        shell_id,
+        errors.len(),
+        offending.join(", "),
+        if errors.len() > offending.len() {
+            ", …"
+        } else {
+            ""
+        }
+    )))
 }
 
 /// Create lateral faces between sections.
@@ -1743,5 +2024,36 @@ mod tests {
         };
         let solid_id = sweep_profile(&mut model, profile, path, opts).expect("sweep");
         assert!(model.solids.get(solid_id).is_some());
+    }
+
+    /// The frame-driven path (`Rail` / `BiRail` / `MultiGuide`) shares the cap
+    /// weld and the unconditional closed-shell post-condition with the path
+    /// sweep, and nothing else in the workspace constructs those sweep types —
+    /// `timeline-engine`'s replay maps the strings, no test drives them. So
+    /// this is the only place the gate is exercised on that branch: the
+    /// assertion is that a rectangle swept along a straight rail genuinely
+    /// CLOSES, not merely that the call does not crash. If it ever stops
+    /// closing the gate turns a silently-open shell into a loud typed refusal
+    /// here rather than in a caller's model.
+    #[test]
+    fn frame_driven_rail_sweep_of_rectangle_closes() {
+        let mut model = BRepModel::new();
+        let profile = make_unit_square(&mut model);
+        let v_a = model.vertices.add(0.0, 0.0, 0.0);
+        let v_b = model.vertices.add(0.0, 0.0, 5.0);
+        let path = add_line_edge(&mut model, v_a, v_b);
+        let opts = SweepOptions {
+            sweep_type: SweepType::Rail,
+            quality: SweepQuality::Draft,
+            ..Default::default()
+        };
+        let solid_id = sweep_profile(&mut model, profile, path, opts)
+            .expect("rail sweep of a rectangle along a straight path must yield a closed solid");
+        let outer_shell = model.solids.get(solid_id).expect("swept solid").outer_shell;
+        let closure = crate::primitives::validation::validate_shell_closure(&model, outer_shell);
+        assert!(
+            closure.is_empty(),
+            "rail sweep shell is not closed: {closure:?}"
+        );
     }
 }
