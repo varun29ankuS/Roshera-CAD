@@ -25,6 +25,16 @@ export function setAuthToken(token) {
   authToken = token;
 }
 
+/** The bearer header `request()` attaches automatically, exposed for
+ *  scenarios that must bypass `request()` (e.g. a raw binary download via
+ *  `fetch`, where `request()`'s JSON/text body handling would be wrong) but
+ *  still need to carry the same credential — mirrors the pattern
+ *  `roshera-mcp/src/core.ts`'s `AUTH_HEADERS`/`saveBinary` already use
+ *  against the production backend. */
+export function authHeader() {
+  return authToken ? { Authorization: `Bearer ${authToken}` } : {};
+}
+
 /** Core request. Returns { status, ok, data } — never throws on 4xx/5xx so
  *  scenarios can assert on honest kernel refusals (404/409/422). Throws only on
  *  transport failure / timeout. */

@@ -10,7 +10,7 @@
 import os from "node:os";
 import path from "node:path";
 import { writeFile } from "node:fs/promises";
-import { BASE } from "../lib/client.mjs";
+import { BASE, authHeader } from "../lib/client.mjs";
 import { buildHubFlange } from "../lib/builders.mjs";
 
 export default {
@@ -43,7 +43,17 @@ export default {
     // Export AP242 STEP, save to a server-readable temp path.
     const ex = await ctx.time("export STEP", () => c.post("/api/export", { format: "STEP", objects: [uuid], quality: "High" }));
     t.ok("export produced a download url", !!ex?.download_url);
-    const res = await fetch(BASE + ex.download_url);
+    // The download route requires the SAME bearer credential as every other
+    // endpoint (it is not in the auth middleware's exempt-path list) — a
+    // plain unauthenticated `fetch` here gets a 401 whose JSON error body
+    // then gets written to disk as if it were the STEP file, silently
+    // corrupting the round-trip several steps before the failure surfaces
+    // (the STEP tokenizer choking on `{"error":"Missing authorization
+    // header",...}`). Carry the same header `saveBinary` in
+    // `roshera-mcp/src/core.ts` already attaches for this exact request
+    // shape against the production backend.
+    const res = await fetch(BASE + ex.download_url, { headers: { ...authHeader() } });
+    t.ok("download returned 200", res.ok, { detail: `status=${res.status}` });
     const buf = Buffer.from(await res.arrayBuffer());
     const file = path.join(os.tmpdir(), "agent_eval_blended_flange.step");
     await writeFile(file, buf);
