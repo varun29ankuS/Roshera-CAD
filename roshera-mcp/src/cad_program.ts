@@ -131,7 +131,14 @@ export function registerCadProgram(host: ToolHost, table: ToolTable): void {
       "each op's own soundness verdict. NO rollback: backend state = the " +
       "completed prefix exactly; undo is your explicit next call. Ops may not be " +
       "meta/composition tools, nor clear_parts/delete_part unless " +
-      "allow_destructive is set.",
+      "allow_destructive is set. Ops are for DISTINCT steps, never for " +
+      "repeating one step: a many-vertex profile (gear, cam, airfoil) is ONE " +
+      "op — psketch_add_entity {kind:'polyline', params:{points:[[x,y],…], " +
+      "closed:true}} — not one op per vertex. Args are LITERAL: no result of " +
+      "one op reaches a later op's args, so an id-returning call " +
+      "(psketch_begin) runs on its own first and its id is written into the " +
+      "program — e.g. psketch_begin, then ONE 3-op program: polyline (teeth), " +
+      "polyline (bore), psketch_extrude.",
     {
       name: z
         .string()

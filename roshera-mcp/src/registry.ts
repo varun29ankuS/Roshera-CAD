@@ -221,6 +221,7 @@ const BENCH_OF: Record<string, Bench> = {
   verify_part: "core",
   mass_properties: "core",
   document_units: "core",
+  document_rename: "core",
   set_part_color: "core",
   select_face: "core",
   select_edge: "core",

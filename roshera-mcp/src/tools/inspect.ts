@@ -386,4 +386,43 @@ export function registerInspectTools(server: ToolHost) {
       }
     },
   );
+
+  server.tool(
+    "document_rename",
+    "Rename a document's catalog entry — display name only, never geometry, " +
+      "timeline, or id (`api-server/src/documents.rs::rename_document`, " +
+      "`PATCH /api/documents/{id}`). Omit `document_id` to rename the currently " +
+      "active document; pass it to rename any other registered one (see list from " +
+      "the document tab strip or an agent that tracked an id earlier).",
+    {
+      name: z
+        .string()
+        .describe("new display name — trimmed server-side; non-empty; ≤200 chars; no control characters"),
+      document_id: z
+        .string()
+        .optional()
+        .describe("document id to rename; omit to rename the currently active document"),
+    },
+    async ({ name, document_id }) => {
+      try {
+        let id: string;
+        if (document_id !== undefined) {
+          id = document_id;
+        } else {
+          const docs = await api("GET", "/api/documents");
+          const active = Array.isArray(docs)
+            ? docs.find((d: any) => d?.active === true)
+            : undefined;
+          if (!active || typeof active.id !== "string") {
+            return fail(new Error("no active document found — pass document_id explicitly"));
+          }
+          id = active.id;
+        }
+        const r = await api("PATCH", `/api/documents/${encodeURIComponent(id)}`, { name });
+        return ok(r);
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
 }

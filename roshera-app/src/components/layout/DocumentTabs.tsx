@@ -6,7 +6,9 @@
  * Open Document` — right plumbing, wrong shape: a submenu suits rare
  * actions, and switching documents is something an engineer does
  * constantly. This renders documents as tabs: click to switch (in
- * place — see `stores/document-store.ts`), `×` or right-click → Close
+ * place — see `stores/document-store.ts`), double-click a label (or
+ * right-click → Rename) to rename in place (`PATCH /api/documents/{id}`,
+ * `lib/documents-api.ts::renameDocument`), `×` or right-click → Close
  * to close the VIEW, `+` for New or to reopen a hidden document.
  *
  * ★ Source of truth for WHICH DOCUMENTS EXIST is always `GET /api/documents`
@@ -22,7 +24,7 @@
  * the `+` menu's "Open existing" section — nothing here ever deletes
  * anything, and the wording below must never imply otherwise.
  */
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { Plus, X } from 'lucide-react'
 import { ContextMenu, ContextMenuItem } from '@/components/ui/context-menu'
 import { cn } from '@/lib/utils'
@@ -89,11 +91,19 @@ export function DocumentTabs() {
   const refresh = useDocumentStore((s) => s.refresh)
   const switchTo = useDocumentStore((s) => s.switchTo)
   const createAndSwitch = useDocumentStore((s) => s.createAndSwitch)
+  const renameDoc = useDocumentStore((s) => s.rename)
 
   const [closedIds, setClosedIdsState] = useState<Set<string>>(readClosedIds)
   const [addMenuOpen, setAddMenuOpen] = useState(false)
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null)
   const addMenuRef = useRef<HTMLDivElement | null>(null)
+
+  // Rename in place: double-click a tab's label, or the context menu's
+  // Rename item, opens an inline `<input>` over the label. `renamingId` is
+  // the tab being edited; `renameValue` is its live draft text.
+  const [renamingId, setRenamingId] = useState<string | null>(null)
+  const [renameValue, setRenameValue] = useState('')
+  const renameInputRef = useRef<HTMLInputElement | null>(null)
 
   const setClosedIds = useCallback((updater: (prev: Set<string>) => Set<string>) => {
     setClosedIdsState((prev) => {
@@ -221,6 +231,41 @@ export function DocumentTabs() {
     setContextMenu({ doc, x: e.clientX, y: e.clientY })
   }, [])
 
+  /** Open the inline rename input for `doc`, seeded with its current name.
+   *  Never while a switch is in flight — committing a rename against a
+   *  document mid-switch is a race neither side needs to handle. */
+  const startRename = useCallback(
+    (doc: DocumentInfo) => {
+      if (switchingId) return
+      setRenameValue(doc.name)
+      setRenamingId(doc.id)
+    },
+    [switchingId],
+  )
+
+  const cancelRename = useCallback(() => setRenamingId(null), [])
+
+  /** Commit the draft name. No-ops (silently) on an empty/unchanged draft —
+   *  those aren't failures, just nothing to do. */
+  const commitRename = useCallback(async () => {
+    const id = renamingId
+    setRenamingId(null)
+    if (!id) return
+    const doc = documents.find((d) => d.id === id)
+    if (!doc) return
+    const trimmed = renameValue.trim()
+    if (!trimmed || trimmed === doc.name) return
+    const result = await renameDoc(id, trimmed)
+    if (!result.success) reportFailure(`Renaming ${doc.name}`, result.error)
+  }, [renamingId, renameValue, documents, renameDoc])
+
+  // Focus + select the input's text the moment a rename opens.
+  useLayoutEffect(() => {
+    if (!renamingId) return
+    renameInputRef.current?.focus()
+    renameInputRef.current?.select()
+  }, [renamingId])
+
   // Nothing to show before the first successful fetch — a bare `+` with
   // no context reads as broken chrome rather than "loading".
   if (documents.length === 0) return null
@@ -270,7 +315,38 @@ export function DocumentTabs() {
               />
             )}
             <span className="min-w-0 flex flex-col justify-center leading-tight">
-              <span className="truncate">{doc.name}</span>
+              {renamingId === doc.id ? (
+                <input
+                  ref={renameInputRef}
+                  value={renameValue}
+                  onChange={(e) => setRenameValue(e.target.value)}
+                  onClick={(e) => e.stopPropagation()}
+                  onDoubleClick={(e) => e.stopPropagation()}
+                  onBlur={() => void commitRename()}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') {
+                      e.preventDefault()
+                      void commitRename()
+                    } else if (e.key === 'Escape') {
+                      e.preventDefault()
+                      cancelRename()
+                    }
+                  }}
+                  aria-label={`Rename ${doc.name}`}
+                  className="w-full min-w-0 bg-transparent border-b border-primary/60 outline-none truncate"
+                />
+              ) : (
+                <span
+                  className="truncate"
+                  onDoubleClick={(e) => {
+                    e.stopPropagation()
+                    startRename(doc)
+                  }}
+                  title="Double-click to rename"
+                >
+                  {doc.name}
+                </span>
+              )}
               <span className="truncate text-[9px] font-normal text-muted-foreground/60 tabular-nums">
                 {formatShortDate(doc.createdAt)}
                 <span className="font-mono"> · {idFragment(doc.id)}</span>
@@ -357,6 +433,14 @@ export function DocumentTabs() {
           aria-label="Document tab actions"
         >
           <ContextMenuItem
+            onClick={() => {
+              startRename(contextMenu.doc)
+              setContextMenu(null)
+            }}
+          >
+            Rename
+          </ContextMenuItem>
+          <ContextMenuItem
             disabled={tabs.length === 1 && contextMenu.doc.active}
             title={
               tabs.length === 1 && contextMenu.doc.active
@@ -380,9 +464,6 @@ export function DocumentTabs() {
           >
             Close others
           </ContextMenuItem>
-          {/* No Rename: the backend document registry (`documents.rs`) has
-              no PATCH/rename route today — an item that can't do anything
-              is worse than no item. */}
         </ContextMenu>
       )}
     </div>

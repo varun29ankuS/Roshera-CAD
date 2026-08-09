@@ -2,9 +2,10 @@
  * REST client for the document registry — the top-level scope above
  * branches (see `api-server/src/documents.rs`).
  *
- * `POST /api/documents`          → register a new, empty document
- * `GET  /api/documents`          → list every registered document
- * `POST /api/documents/{id}/open` → make one the live document
+ * `POST  /api/documents`          → register a new, empty document
+ * `GET   /api/documents`          → list every registered document
+ * `POST  /api/documents/{id}/open` → make one the live document
+ * `PATCH /api/documents/{id}`      → rename one (display name only)
  *
  * Opening a document resets the ENTIRE live server state (model, timeline,
  * blackboard, id mappings) to that document's own — every frontend store
@@ -69,6 +70,25 @@ export async function createDocument(name?: string): Promise<DocumentInfo> {
   })
   if (!resp.ok) {
     throw new Error(`createDocument: ${resp.status}`)
+  }
+  const data = (await resp.json()) as DocumentWire
+  return fromWire(data)
+}
+
+/** Rename a document's catalog entry — display name only; does not touch
+ *  geometry, timeline, or id, and does not require the document to be active. */
+export async function renameDocument(id: string, name: string): Promise<DocumentInfo> {
+  const resp = await fetch(`${API_BASE}/documents/${encodeURIComponent(id)}`, {
+    method: 'PATCH',
+    headers: {
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+    },
+    body: JSON.stringify({ name }),
+  })
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => '')
+    throw new Error(`renameDocument: ${resp.status}${text ? ` ${text}` : ''}`)
   }
   const data = (await resp.json()) as DocumentWire
   return fromWire(data)

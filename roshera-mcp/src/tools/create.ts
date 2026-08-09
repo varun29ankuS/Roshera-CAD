@@ -20,7 +20,11 @@ export function registerCreateTools(server: ToolHost) {
     "Start a click-draft sketch session on a plane; returns sketch_id for " +
       "sketch_points/sketch_add_shape/sketch_extrude. Prefer create_box / " +
       "create_cylinder when they fit (fewer round trips); prefer psketch_* for " +
-      "constraint-exact geometry.",
+      "constraint-exact geometry. NOT for many-vertex profiles: this surface " +
+      "has no bulk point route (sketch_points costs one backend mutation per " +
+      "point). Any loop over ~10 vertices belongs in psketch_begin + " +
+      "psketch_add_entity {kind:'polyline'} + psketch_extrude, which sends the " +
+      "whole profile in one call.",
     {
       plane: PlaneSchema,
       tool: z
@@ -60,7 +64,15 @@ export function registerCreateTools(server: ToolHost) {
 
   server.tool(
     "sketch_points",
-    "BATCH-add plane-local points to a sketch shape in one call.",
+    "Add plane-local points to a click-draft shape. ONE MCP call, but the " +
+      "click-draft REST surface has no bulk point route, so this issues ONE " +
+      "BACKEND MUTATION PER POINT — 256 points = 256 mutations, which exhausts " +
+      "the per-identity rate budget. Use it only for the 2–8 points of a " +
+      "rectangle, circle or short outline. For PROFILE geometry (gear teeth, " +
+      "cams, airfoils, any loop over ~10 vertices) do NOT use this tool: use " +
+      "psketch_begin + psketch_add_entity {kind:'polyline', params:{points:[…], " +
+      "closed:true}}, which sends EVERY vertex in a SINGLE backend call, then " +
+      "psketch_extrude. Never place profile points one at a time.",
     {
       sketch_id: z.string().describe("sketch_id from create_sketch"),
       points: z

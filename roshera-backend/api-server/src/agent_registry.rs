@@ -596,6 +596,21 @@ fn raw_tools() -> Vec<ToolSpec> {
             }),
         ),
         t(
+            "document_rename",
+            Core,
+            Stable,
+            Curated,
+            "Rename a document's catalog entry — display name only, never geometry, timeline, or id. Omit document_id to rename the active document.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "new display name — trimmed server-side; non-empty; ≤200 chars; no control characters"},
+                    "document_id": {"type": "string", "description": "document id to rename; omit to rename the currently active document"}
+                },
+                "required": ["name"]
+            }),
+        ),
+        t(
             "set_part_color",
             Core,
             Stable,
@@ -2032,7 +2047,12 @@ mod tests {
         // classified on the MCP side in 105607ed but never added here, so it
         // had no backend row at all. Found by the ontology drift gate, which
         // cross-checks this table against roshera-mcp's BENCH_OF.
-        assert_eq!(tools.len(), 103, "expected 103 tools, got {}", tools.len());
+        // 104: `document_rename` (Core / Stable / Curated) — exposes the
+        // long-standing `PATCH /api/documents/{id}` route (documents.rs::
+        // rename_document) that had no agent-facing surface at all; mirrors
+        // roshera-mcp's new src/tools/inspect.ts entry, same non-resident
+        // full-table-only placement as `document_units`.
+        assert_eq!(tools.len(), 104, "expected 104 tools, got {}", tools.len());
     }
 
     /// The kernel-sourced rows correspond to operations actually registered in

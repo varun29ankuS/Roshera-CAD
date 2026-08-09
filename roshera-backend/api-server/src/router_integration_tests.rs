@@ -3222,6 +3222,148 @@ async fn document_units_patch_unknown_token_returns_400() {
     );
 }
 
+// ─── Document registry rename (PATCH /api/documents/{id}) ────────────────────
+//
+// `documents::rename_document` (documents.rs) had a live route
+// (`axum::routing::patch(documents::rename_document)`, main.rs) but no test
+// coverage at all — every other documents.rs handler (create/list/open/
+// delete) is in the same boat except for the incidental list assertion in
+// the .ros-import tests. This closes the gap for rename specifically (the
+// handler this task's MCP + frontend edits both newly expose to callers).
+
+fn json_patch(uri: &str, payload: Value) -> Request<Body> {
+    Request::builder()
+        .method(Method::PATCH)
+        .uri(uri.to_string())
+        .header("content-type", "application/json")
+        .body(Body::from(payload.to_string()))
+        .expect("static request must build")
+}
+
+/// PATCH renames the catalog row and echoes the `DocumentView`; a
+/// follow-up GET /api/documents proves the change actually persisted,
+/// not just that the response claimed it did.
+#[tokio::test]
+async fn document_rename_updates_catalog_name_and_persists() {
+    let state = make_test_state().await;
+
+    let (cstatus, cbody) = dispatch(
+        &state,
+        json_post("/api/documents", json!({ "name": "Alpha" })),
+    )
+    .await;
+    assert_eq!(cstatus, StatusCode::OK, "create must 200; body = {cbody}");
+    let id = cbody["id"]
+        .as_str()
+        .expect("create response carries the new document's id")
+        .to_string();
+    assert_eq!(cbody["name"].as_str(), Some("Alpha"));
+
+    let (status, body) = dispatch(
+        &state,
+        json_patch(&format!("/api/documents/{id}"), json!({ "name": "Beta" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "rename must 200; body = {body}");
+    assert_eq!(
+        body["id"].as_str(),
+        Some(id.as_str()),
+        "rename must echo the SAME id — a rename is not a re-registration; body = {body}"
+    );
+    assert_eq!(
+        body["name"].as_str(),
+        Some("Beta"),
+        "rename response must carry the new name; body = {body}"
+    );
+
+    let (lstatus, lbody) = dispatch(&state, json_get("/api/documents")).await;
+    assert_eq!(lstatus, StatusCode::OK, "list must 200; body = {lbody}");
+    let entry = lbody
+        .as_array()
+        .expect("documents list is an array")
+        .iter()
+        .find(|d| d["id"].as_str() == Some(id.as_str()))
+        .cloned()
+        .expect("the renamed document must still be listed");
+    assert_eq!(
+        entry["name"].as_str(),
+        Some("Beta"),
+        "the rename must have persisted to the registry, not just the response; list = {lbody}"
+    );
+}
+
+/// PATCH on an id that was never registered must refuse with the same
+/// 404 `document_not_found` every other documents.rs route uses — never a
+/// silent 200 that fabricates a rename of nothing.
+#[tokio::test]
+async fn document_rename_unknown_id_returns_404() {
+    let state = make_test_state().await;
+    let (status, body) = dispatch(
+        &state,
+        json_patch("/api/documents/does-not-exist", json!({ "name": "Beta" })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "unknown document id must 404; body = {body}"
+    );
+    assert_eq!(
+        body["error_code"].as_str(),
+        Some("document_not_found"),
+        "404 must carry error_code=document_not_found; body = {body}"
+    );
+}
+
+/// An empty (or whitespace-only) name is refused with a typed 400, not
+/// silently trimmed to an empty display name — `validate_name` in
+/// documents.rs rejects it before the registry write happens.
+#[tokio::test]
+async fn document_rename_empty_name_returns_400() {
+    let state = make_test_state().await;
+    let (cstatus, cbody) = dispatch(
+        &state,
+        json_post("/api/documents", json!({ "name": "Alpha" })),
+    )
+    .await;
+    assert_eq!(cstatus, StatusCode::OK, "create must 200; body = {cbody}");
+    let id = cbody["id"]
+        .as_str()
+        .expect("create returns an id")
+        .to_string();
+
+    let (status, body) = dispatch(
+        &state,
+        json_patch(&format!("/api/documents/{id}"), json!({ "name": "   " })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "whitespace-only name must 400; body = {body}"
+    );
+    assert_eq!(
+        body["error_code"].as_str(),
+        Some("invalid_parameter"),
+        "400 must carry error_code=invalid_parameter; body = {body}"
+    );
+
+    // And the name must NOT have changed.
+    let (_lstatus, lbody) = dispatch(&state, json_get("/api/documents")).await;
+    let entry = lbody
+        .as_array()
+        .expect("documents list is an array")
+        .iter()
+        .find(|d| d["id"].as_str() == Some(id.as_str()))
+        .cloned()
+        .expect("the document must still be listed");
+    assert_eq!(
+        entry["name"].as_str(),
+        Some("Alpha"),
+        "a refused rename must leave the original name untouched; list = {lbody}"
+    );
+}
+
 // ─── Measure formatting in non-default unit ───────────────────────────────────
 
 /// Setting document_unit to Inch then measuring a 10 mm gap should produce

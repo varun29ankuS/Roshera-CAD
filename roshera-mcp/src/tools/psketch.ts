@@ -31,7 +31,9 @@ export function registerPsketchTools(server: ToolHost) {
       "chosen at psketch_extrude/psketch_revolve time via their `plane` " +
       "param (standard or custom/face-anchored frame). Opens the session " +
       "only — add geometry with psketch_add_entity, then psketch_constrain/" +
-      "psketch_solve. Prefer over create_sketch for machine-precision solving.",
+      "psketch_solve. Prefer over create_sketch for machine-precision solving, " +
+      "and for many-vertex profiles: psketch_add_entity {kind:'polyline'} " +
+      "takes a whole gear/cam/airfoil loop in one call.",
     {},
     async () => {
       try {
@@ -45,14 +47,23 @@ export function registerPsketchTools(server: ToolHost) {
 
   server.tool(
     "psketch_add_entity",
-    "ADD ONE entity to an existing parametric sketch (start a session with " +
-      "psketch_begin, not this tool). Returns the entity id. kind→params " +
-      "(sketch-plane mm/radians): point {x,y,fixed?} · line {start,end " +
-      "point-uuids} · circle {cx,cy,radius} · arc {cx,cy,radius,start_angle," +
-      "end_angle} · rectangle {x1,y1,x2,y2} · polyline {points:[[x,y]…],closed} " +
-      "· spline {degree, control_point_ids:[point-uuids]} — SHARED CPs make the " +
-      "spline a solver citizen (clamped, interpolates first/last CP; optional " +
-      "weights[]). Raw {degree, control_points:[[x,y]…], knots[]} also accepted.",
+    "ADD an entity to a parametric sketch (open the session with psketch_begin " +
+      "first). THE BULK PATH FOR PROFILE GEOMETRY: kind:'polyline' with " +
+      "params:{points:[[x,y],…], closed:true} sends an ENTIRE closed loop — " +
+      "hundreds of vertices — in ONE call and ONE backend mutation. A gear " +
+      "outline, cam or airfoil is ONE polyline call; add a second polyline " +
+      "for each interior loop (psketch_extrude classifies them " +
+      "geometrically), then psketch_extrude. NEVER loop this tool with " +
+      "kind:'point' to lay out a profile — one call per vertex burns the rate " +
+      "budget and the context window for geometry one call already expresses. " +
+      "kind:'point' is for a named vertex that constraints will reference. " +
+      "Returns the entity id. kind→params (sketch-plane mm/radians): " +
+      "polyline {points:[[x,y]…],closed} · spline {degree, control_point_ids:" +
+      "[point-uuids]} — SHARED CPs make the spline a solver citizen (clamped, " +
+      "interpolates first/last CP; optional weights[]); raw {degree, " +
+      "control_points:[[x,y]…], knots[]} also accepted · circle {cx,cy,radius} " +
+      "· arc {cx,cy,radius,start_angle,end_angle} · rectangle {x1,y1,x2,y2} · " +
+      "line {start,end point-uuids} · point {x,y,fixed?}.",
     {
       csketch_id: z.string().uuid().describe("csketch id (psketch_begin)"),
       kind: z

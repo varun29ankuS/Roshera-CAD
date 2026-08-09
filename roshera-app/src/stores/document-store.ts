@@ -50,7 +50,7 @@
  * data-loss-shaped mistake this was built to avoid.
  */
 import { create } from 'zustand'
-import { createDocument, listDocuments, openDocument, type DocumentInfo } from '@/lib/documents-api'
+import { createDocument, listDocuments, openDocument, renameDocument, type DocumentInfo } from '@/lib/documents-api'
 import { refreshSceneFromServer } from '@/lib/ws-bridge'
 import { syncNotebook } from '@/lib/blackboard-api'
 import { resetAcpClient } from '@/lib/acp-blackboard'
@@ -74,6 +74,11 @@ interface DocumentStoreState {
   /** Switch to an already-registered document in place. No-ops (success)
    *  if `id` is already active. */
   switchTo: (id: string) => Promise<DocumentSwitchResult>
+  /** Rename a document's catalog entry. Display name only — never touches
+   *  geometry/timeline, and never requires `id` to be the active document.
+   *  Updates `documents` locally from the backend's confirmed response, no
+   *  refetch/reload needed. */
+  rename: (id: string, name: string) => Promise<DocumentSwitchResult>
 }
 
 function errorMessage(err: unknown): string {
@@ -130,6 +135,18 @@ export const useDocumentStore = create<DocumentStoreState>((set, get) => ({
     try {
       const doc = await createDocument(name)
       return await get().switchTo(doc.id)
+    } catch (err) {
+      return { success: false, error: errorMessage(err) }
+    }
+  },
+
+  rename: async (id: string, name: string) => {
+    try {
+      const updated = await renameDocument(id, name)
+      set((state) => ({
+        documents: state.documents.map((d) => (d.id === id ? updated : d)),
+      }))
+      return { success: true }
     } catch (err) {
       return { success: false, error: errorMessage(err) }
     }
