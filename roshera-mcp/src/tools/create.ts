@@ -381,7 +381,12 @@ export function registerCreateTools(server: ToolHost) {
             }),
             z.object({
               type: z.literal("nurbs"),
-              degree: z.number().int().min(1).max(7),
+              degree: z
+                .number()
+                .int()
+                .min(1)
+                .max(7)
+                .describe("NURBS curve degree 1..7; needs ≥ degree+1 control_points"),
               control_points: z
                 .array(z.array(z.number()).length(2))
                 .min(2)

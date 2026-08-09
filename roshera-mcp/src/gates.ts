@@ -68,6 +68,21 @@
  *          printed dimension and can never re-verify itself, so exporting
  *          uncertified WOULD be an approximation labeled as exact.
  *      All three are live facts and are never served from the refusal cache.
+ *
+ *   5. SINGLE-POINT-RUN GATE (2026-08-09 token-burn constraint). Measured
+ *      failure: an agent laid out a 256-point gear profile one
+ *      psketch_add_entity {kind:'point'} call at a time — 1.3M tokens for
+ *      geometry ONE polyline call expresses. The tool descriptions already
+ *      steer against it ("NEVER loop this tool"); steering is ignorable, so
+ *      this gate is the constraint: after SINGLE_POINT_RUN_MAX consecutive
+ *      successful single-point additions to the SAME sketch with no other
+ *      call in between, the next one is refused typed, naming the count and
+ *      the bulk path (psketch_add_entity kind:'polyline' — every vertex in
+ *      ONE call). ANY other tool call resets the counters, so a legitimate
+ *      small sketch (2-8 named vertices for constraints) never meets the
+ *      gate. Purely MCP-side session state — no backend change — and never
+ *      served from the refusal cache: the counter is live state this
+ *      session's own next call can reset, so every re-issue re-reads it.
  */
 
 import { api, PERCEPTION_TIMEOUT_MS } from "./core.js";
@@ -243,16 +258,18 @@ const BASE_REFS: Record<
 };
 
 /**
- * Gates whose underlying fact is LIVE state (kernel verdicts, sheet
- * certificates) that another author can change without a call from this
- * session. Their refusals are never cached — every re-issue re-reads the
- * live fact, so repair by anyone unblocks the call immediately.
+ * Gates whose underlying fact is LIVE state — kernel verdicts and sheet
+ * certificates another author can change without a call from this session,
+ * plus the single-point run counter, which this session's own NEXT call can
+ * reset. Their refusals are never cached — every re-issue re-reads the live
+ * fact, so repair (or a counter reset) unblocks the call immediately.
  */
 const LIVE_FACT_GATES = new Set<string>([
   "unsound_base",
   "sheet_unsound",
   "sheet_quality",
   "sheet_uncertified",
+  "single_point_run",
 ]);
 
 /**
@@ -323,11 +340,54 @@ function refusalKey(tool: string, args: unknown): string {
   return fnv1a64hex(tool + "\0" + canonicalJson(args ?? {}));
 }
 
+// ─── Single-point-run counters (gate 5) ─────────────────────────────────────
+
+/** Consecutive successful single-point additions allowed to one sketch before
+ *  the next is refused. 8 keeps every legitimate hand-placed vertex set (a
+ *  rectangle, a circle's centre+rim, a handful of constraint anchors) under
+ *  the gate; anything longer is profile geometry, which is ONE polyline call. */
+const SINGLE_POINT_RUN_MAX = 8;
+
+/** Per-sketch run lengths of consecutive single-point additions. Cleared by
+ *  ANY dispatch that is not itself a single-point addition (so counters only
+ *  survive an unbroken run), and wholesale at 64 sketches as a hard bound
+ *  against a pathological interleave — clearing early only ever ALLOWS calls. */
+const pointRuns = new Map<string, number>();
+
+/**
+ * The per-sketch counter key when `tool(args)` is a single-point addition,
+ * else null. Two shapes qualify:
+ *  - psketch_add_entity {kind:'point'} — the exact call the 256-point gear
+ *    profile was measured burning 1.3M tokens on, one vertex per call;
+ *  - sketch_points with a ONE-point array — the click-draft surface's version
+ *    of the same loop (its description already says one backend mutation per
+ *    point; a multi-point array is the legitimate use and never counts).
+ */
+function singlePointKey(tool: string, args: any): string | null {
+  if (
+    tool === "psketch_add_entity" &&
+    args?.kind === "point" &&
+    typeof args?.csketch_id === "string"
+  ) {
+    return `psketch_add_entity:${args.csketch_id}`;
+  }
+  if (
+    tool === "sketch_points" &&
+    Array.isArray(args?.points) &&
+    args.points.length === 1 &&
+    typeof args?.sketch_id === "string"
+  ) {
+    return `sketch_points:${args.sketch_id}`;
+  }
+  return null;
+}
+
 /** Test seam: drop all session gate state. Production never calls this — a
  *  fresh MCP process starts clean by construction. */
 export function resetSessionGates(): void {
   refusalCache.clear();
   openIntent = null;
+  pointRuns.clear();
 }
 
 // ─── Live-verdict lookups (pre-flight, short budget, honest on failure) ─────
@@ -409,6 +469,29 @@ function genericNameRefusal(name: string) {
       "'M8 clearance holes, close fit, 4x base corners'. If you cannot yet " +
       "say what you are about to build in one such phrase, work that out " +
       "first.",
+  });
+}
+
+function singlePointRunRefusal(tool: string, count: number) {
+  return gateRefusal({
+    gate: "single_point_run",
+    reason:
+      `${count} consecutive single-point additions to this sketch with no ` +
+      `other call in between — '${tool}' costs one backend mutation and one ` +
+      `round trip PER POINT, so laying a profile out point-by-point burns the ` +
+      `rate budget and the context window for geometry one call already ` +
+      `expresses (measured: a 256-point gear profile placed this way cost ` +
+      `~1.3M tokens).`,
+    points_placed: count,
+    how_to_proceed:
+      "Send the remaining vertices in ONE call: psketch_add_entity " +
+      "{ csketch_id, kind:'polyline', params:{ points:[[x,y],…], closed:true } } " +
+      "carries the entire loop — hundreds of vertices — in a single backend " +
+      "mutation (on the click-draft surface, pass sketch_points the whole " +
+      "points array at once, or better, move the profile to psketch_begin + " +
+      "polyline). The points already placed are live and unaffected. " +
+      "kind:'point' remains available for the few named vertices constraints " +
+      "will reference; any other tool call resets this counter.",
   });
 }
 
@@ -566,6 +649,17 @@ export async function preDispatchGate(
     };
   }
 
+  // 1b. Single-point-run gate (gate 5): a live session-local counter, never
+  // answered from the refusal cache — the count is re-read on every issue, so
+  // the reset any other call performs unblocks the next point immediately.
+  const spKey = singlePointKey(tool, args);
+  if (spKey !== null) {
+    const run = pointRuns.get(spKey) ?? 0;
+    if (run >= SINGLE_POINT_RUN_MAX) {
+      return singlePointRunRefusal(tool, run);
+    }
+  }
+
   // 2. Intent gate: checkpoint quality, then checkpoint presence.
   if (tool === "timeline_checkpoint") {
     const name = typeof (args as any)?.name === "string" ? (args as any).name : "";
@@ -627,6 +721,21 @@ export function recordDispatchOutcome(
   result: any,
   turn: number,
 ): void {
+  // Gate 5 bookkeeping — runs for EVERY dispatch on every path (gated,
+  // handled, or cache replay). A successful single-point addition extends its
+  // sketch's run; ANY dispatch that is not a single-point addition resets all
+  // runs (the "intervening call" that keeps legitimate small sketches
+  // untouched). A refused or failed single-point call neither extends nor
+  // resets — the run stands, so re-issuing a refused point keeps meeting the
+  // gate instead of grinding it down.
+  const spKey = singlePointKey(tool, args);
+  if (spKey === null) {
+    pointRuns.clear();
+  } else if (result?.isError !== true) {
+    if (pointRuns.size >= 64) pointRuns.clear();
+    pointRuns.set(spKey, (pointRuns.get(spKey) ?? 0) + 1);
+  }
+
   const refusal = typedRefusalOf(result);
   if (refusal) {
     if (refusal.gate !== undefined && LIVE_FACT_GATES.has(refusal.gate)) {

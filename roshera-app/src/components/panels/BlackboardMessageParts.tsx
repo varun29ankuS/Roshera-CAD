@@ -173,10 +173,13 @@ export function ToolCallRow({ call }: { call: ParsedToolCall }) {
  *
  * WHAT IS NOT SHOWN, AND WHY: an `error_code` chip and a retryable yes/no.
  * The backend's `ApiError` envelope does carry `error_code` / `retryable` /
- * `hint` (see `lib/provider-api.ts`), but nothing on the Blackboard's own
- * path preserves them: `refusalCardSchema` is `{ reason, subject?, source?,
- * options? }`, and a failed turn reaches this component as a rendered
- * sentence, not as a typed error. Drawing a code chip here would mean
+ * `hint`, and `refusalCardSchema` now carries them too — but a failure that
+ * arrives as that typed payload takes the OTHER path: `BlackboardLine.tsx`
+ * routes any failure carrying a `roshera:*` fence to the card renderer, so
+ * `RefusalCard` draws the code chip / retryable word / hint from fields the
+ * wire genuinely held. What reaches THIS component is only the remainder —
+ * a rendered sentence (`describeAcpTurnFailure`'s prose branches) with no
+ * typed fields behind it, so drawing a code chip here would still mean
  * fabricating one. The chip below instead carries `turnStatus` — a value
  * the store genuinely holds.
  */

@@ -250,9 +250,11 @@ export function registerModifyTools(server: ToolHost) {
   server.tool(
     "boolean_many",
     "BATCH boolean: apply MANY tool solids against one base sequentially in a " +
-      "single call. Every step is certified; the batch HALTS at the first " +
-      "unsound step and names the tool that did it. The base keeps its uuid; " +
-      "consumed tools are gone.",
+      "single MCP call — the backend still runs ONE boolean mutation + ONE " +
+      "certification PER tool (N tools = N backend ops; the saving is MCP " +
+      "turns, not kernel work). The batch HALTS at the first unsound step and " +
+      "names the tool that did it. The base keeps its uuid; consumed tools " +
+      "are gone.",
     {
       op: z.enum(["union", "difference"]).describe("operation applied at each step"),
       base: z.string().uuid().describe("object_uuid of the base solid (kept)"),
@@ -318,7 +320,9 @@ export function registerModifyTools(server: ToolHost) {
       "pass through [0,0,0]), else cx,cy on `plane`; bores run along `axis` " +
       "(default plane normal) — size `depth`/`z_offset` to OVERSHOOT both faces. " +
       "REFUSES overlapping adjacent holes up front (chord spacing must exceed " +
-      "2·hole_r). Certified per hole; halts on the first unsound step.",
+      "2·hole_r). Certified per hole; halts on the first unsound step. ONE MCP " +
+      "call, but the backend runs TWO mutations + a certification PER hole " +
+      "(cylinder then subtract — `count` holes = 2·count backend ops).",
     {
       object: z.string().uuid().describe("object_uuid of the solid to drill"),
       plane: PlaneSchema.default("xy").describe("ring plane when center/axis omitted"),

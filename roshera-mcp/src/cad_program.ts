@@ -20,7 +20,7 @@
 
 import { z } from "zod";
 import { ToolHost, ToolTable } from "./registry.js";
-import { validateOp, UnknownToolError } from "./metatools.js";
+import { validateOp, UnknownToolError, rankTools } from "./metatools.js";
 import { ok } from "./core.js";
 import { McpError } from "@modelcontextprotocol/sdk/types.js";
 
@@ -43,6 +43,128 @@ interface ValidationIssue {
   index: number;
   tool: string;
   reason: string;
+}
+
+// ─── Output→input chaining (2026-08-09) ─────────────────────────────────────
+//
+// Args used to be LITERAL: no result of one op could reach a later op's args,
+// which forced every id-returning call (psketch_begin) OUTSIDE the program and
+// split the canonical begin→polyline→extrude flow across MCP turns. The
+// minimal honest mechanism: a string arg that is EXACTLY `$N.<dot.path>` or
+// `$prev.<dot.path>` (whole string — never interpolated inside a longer one)
+// is replaced, just before the op runs, by that field of op N's (or the
+// immediately preceding op's) parsed JSON result. What stays honest:
+//   - references are validated UP FRONT (forward/self references refuse the
+//     whole program with zero execution, same as any bad op);
+//   - schema validation of a placeholder-carrying op MOVES to execution time,
+//     right after substitution — it cannot run earlier because the value does
+//     not exist yet. The tool description says so; every other op keeps the
+//     up-front guarantee unchanged;
+//   - an unresolvable path (op returned no JSON / key absent) is a typed
+//     ledger error naming the placeholder AND the keys that were available,
+//     and stops the program there — no guessing, no partial substitution;
+//   - `$$` at the start of a string escapes a literal `$` (applied uniformly
+//     to every op's string args, placeholder-carrying or not).
+
+/** Strict whole-string placeholder: `$prev.<path>` or `$<index>.<path>`. */
+const PLACEHOLDER_RE = /^\$(\d+|prev)\.([A-Za-z0-9_][A-Za-z0-9_.]*)$/;
+
+interface PlaceholderRef {
+  /** The verbatim placeholder string, for error messages. */
+  token: string;
+  /** Referenced op index, or "prev" (resolved to i-1 at execution). */
+  target: number | "prev";
+}
+
+/** Collect every placeholder string anywhere in a raw args value. */
+function collectPlaceholders(v: unknown, out: PlaceholderRef[]): void {
+  if (typeof v === "string") {
+    const m = PLACEHOLDER_RE.exec(v);
+    if (m) out.push({ token: v, target: m[1] === "prev" ? "prev" : Number(m[1]) });
+    return;
+  }
+  if (Array.isArray(v)) {
+    for (const x of v) collectPlaceholders(x, out);
+    return;
+  }
+  if (v && typeof v === "object") {
+    for (const x of Object.values(v)) collectPlaceholders(x, out);
+  }
+}
+
+/** Thrown by substitutePlaceholders when a reference cannot be resolved. */
+class ChainResolutionError extends Error {}
+
+/**
+ * Deep-copy `v` with every placeholder string replaced by the referenced
+ * field of an earlier op's result and every `$$`-prefixed string unescaped.
+ * `results[t]` is op t's parsed JSON result (null when it returned no JSON).
+ * Throws ChainResolutionError with an exact, actionable message on any miss.
+ * With no placeholders present (results ignored) this is a pure unescape
+ * pass, which is how phase 1 applies the `$$` rule uniformly.
+ */
+function substitutePlaceholders(
+  v: unknown,
+  opIndex: number,
+  results: (unknown | null)[],
+): unknown {
+  if (typeof v === "string") {
+    if (v.startsWith("$$")) return v.slice(1); // escaped literal `$…`
+    const m = PLACEHOLDER_RE.exec(v);
+    if (!m) return v;
+    const target = m[1] === "prev" ? opIndex - 1 : Number(m[1]);
+    let cur: unknown = results[target];
+    if (cur === null || cur === undefined) {
+      throw new ChainResolutionError(
+        `${v}: op ${target} returned no JSON object to chain from`,
+      );
+    }
+    for (const key of m[2].split(".")) {
+      if (cur === null || typeof cur !== "object" || !(key in (cur as object))) {
+        const keys =
+          cur !== null && typeof cur === "object"
+            ? Object.keys(cur as object)
+            : [];
+        throw new ChainResolutionError(
+          `${v}: op ${target}'s result has no '${key}'` +
+            (keys.length ? ` (available: ${keys.join(", ")})` : ""),
+        );
+      }
+      cur = (cur as Record<string, unknown>)[key];
+    }
+    return cur;
+  }
+  if (Array.isArray(v)) {
+    return v.map((x) => substitutePlaceholders(x, opIndex, results));
+  }
+  if (v && typeof v === "object") {
+    const out: Record<string, unknown> = {};
+    for (const [k, x] of Object.entries(v)) {
+      out[k] = substitutePlaceholders(x, opIndex, results);
+    }
+    return out;
+  }
+  return v;
+}
+
+/**
+ * The parsed JSON of a successful op result's first JSON text block — the
+ * source side of chaining. Null when the op returned no JSON (image-only
+ * results): chaining from such an op fails typed, never silently.
+ */
+function firstJsonOf(result: any): unknown | null {
+  const content: any[] = Array.isArray(result?.content) ? result.content : [];
+  for (const c of content) {
+    if (c?.type === "text" && typeof c.text === "string") {
+      try {
+        const data = JSON.parse(c.text);
+        if (data && typeof data === "object") return data;
+      } catch {
+        // not JSON — keep looking
+      }
+    }
+  }
+  return null;
 }
 
 interface LedgerEntry {
@@ -131,14 +253,13 @@ export function registerCadProgram(host: ToolHost, table: ToolTable): void {
       "each op's own soundness verdict. NO rollback: backend state = the " +
       "completed prefix exactly; undo is your explicit next call. Ops may not be " +
       "meta/composition tools, nor clear_parts/delete_part unless " +
-      "allow_destructive is set. Ops are for DISTINCT steps, never for " +
-      "repeating one step: a many-vertex profile (gear, cam, airfoil) is ONE " +
-      "op — psketch_add_entity {kind:'polyline', params:{points:[[x,y],…], " +
-      "closed:true}} — not one op per vertex. Args are LITERAL: no result of " +
-      "one op reaches a later op's args, so an id-returning call " +
-      "(psketch_begin) runs on its own first and its id is written into the " +
-      "program — e.g. psketch_begin, then ONE 3-op program: polyline (teeth), " +
-      "polyline (bore), psketch_extrude.",
+      "allow_destructive is set. A many-vertex profile is ONE polyline op, " +
+      "never one op per vertex (single-point runs past 8 refuse typed). " +
+      "CHAINING: a string arg exactly '$N.key' or '$prev.key' (dot-path into " +
+      "an earlier op's result) resolves before the op runs — begin, polyline " +
+      "{csketch_id:'$0.csketch_id'}, extrude is ONE program. Placeholder ops " +
+      "validate at run time; an unresolvable path or forward reference is a " +
+      "typed refusal; '$$' escapes a literal '$'.",
     {
       name: z
         .string()
@@ -173,7 +294,13 @@ export function registerCadProgram(host: ToolHost, table: ToolTable): void {
       // validateOp path invoke runs) and apply the meta/destructive guards.
       // Any issue fails the whole program with ZERO execution.
       const issues: ValidationIssue[] = [];
-      const parsedOps: { tool: string; parsed: any }[] = [];
+      const parsedOps: {
+        tool: string;
+        parsed: any;
+        /** Raw args of a placeholder-carrying op — substituted, THEN schema-
+         *  validated, at execution time (the value does not exist earlier). */
+        deferred?: { raw: any };
+      }[] = [];
       for (let i = 0; i < ops.length; i++) {
         const { tool, args } = ops[i];
         if (META_OPS.has(tool)) {
@@ -198,8 +325,51 @@ export function registerCadProgram(host: ToolHost, table: ToolTable): void {
           parsedOps.push({ tool, parsed: undefined });
           continue;
         }
+        // Chaining: an op whose args carry placeholders cannot be schema-
+        // validated before its inputs exist. Its REFERENCES are validated
+        // here (tool must exist; targets must be earlier ops); its schema
+        // validation moves to execution time, right after substitution.
+        const refs: PlaceholderRef[] = [];
+        collectPlaceholders(args ?? {}, refs);
+        if (refs.length > 0) {
+          if (!table.has(tool)) {
+            const near = rankTools(table, tool, undefined, 5).map((r) => r.name);
+            issues.push({
+              index: i,
+              tool,
+              reason:
+                `unknown tool '${tool}'` +
+                (near.length ? ` (did you mean: ${near.join(", ")}?)` : ""),
+            });
+            parsedOps.push({ tool, parsed: undefined });
+            continue;
+          }
+          const bad = refs.find((r) =>
+            r.target === "prev" ? i === 0 : r.target >= i,
+          );
+          if (bad) {
+            issues.push({
+              index: i,
+              tool,
+              reason:
+                `'${bad.token}' references ` +
+                (bad.target === "prev"
+                  ? "the previous op, but this is the first op"
+                  : `op ${bad.target}, which does not run before op ${i}`) +
+                " — a placeholder may only read an EARLIER op's result.",
+            });
+            parsedOps.push({ tool, parsed: undefined });
+            continue;
+          }
+          parsedOps.push({ tool, parsed: undefined, deferred: { raw: args ?? {} } });
+          continue;
+        }
         try {
-          const { parsed } = await validateOp(table, tool, args ?? {});
+          // No placeholders: full up-front schema validation, on the args
+          // with the uniform `$$`→`$` unescape applied (a pure transform —
+          // with no placeholders present, results are never consulted).
+          const literal = substitutePlaceholders(args ?? {}, i, []);
+          const { parsed } = await validateOp(table, tool, literal);
           parsedOps.push({ tool, parsed });
         } catch (e) {
           const reason =
@@ -235,11 +405,49 @@ export function registerCadProgram(host: ToolHost, table: ToolTable): void {
 
       // ── PHASE 2: execute sequentially, STOP on the first failure ───────────
       const ledger: LedgerEntry[] = [];
+      /** Parsed JSON result of each completed op — the chaining source. */
+      const chainResults: (unknown | null)[] = [];
       let completed = 0;
       let stoppedAt: number | null = null;
       for (let i = 0; i < parsedOps.length; i++) {
-        const { tool, parsed } = parsedOps[i];
-        const entry = table.get(tool)!; // present — validateOp resolved it in phase 1
+        const { tool, deferred } = parsedOps[i];
+        // present — phase 1 resolved it (validateOp, or table.has for deferred)
+        const entry = table.get(tool)!;
+        let parsed = parsedOps[i].parsed;
+        if (deferred) {
+          // Resolve placeholders against the completed prefix, then run the
+          // SAME validateOp a direct call runs — deferred, not skipped.
+          let substituted: unknown;
+          try {
+            substituted = substitutePlaceholders(deferred.raw, i, chainResults);
+          } catch (e) {
+            ledger.push({
+              index: i,
+              tool,
+              ok: false,
+              error:
+                `placeholder resolution failed: ` +
+                (e instanceof Error ? e.message : String(e)) +
+                `. The ${i} op(s) before this ran and their state is live.`,
+            });
+            stoppedAt = i;
+            break;
+          }
+          try {
+            parsed = (await validateOp(table, tool, substituted)).parsed;
+          } catch (e) {
+            ledger.push({
+              index: i,
+              tool,
+              ok: false,
+              error:
+                (e instanceof Error ? e.message : String(e)) +
+                " (schema-validated at execution time, after placeholder resolution)",
+            });
+            stoppedAt = i;
+            break;
+          }
+        }
         let result: any;
         try {
           // DISPATCH PARITY: the same handler a direct/invoke call runs.
@@ -265,6 +473,7 @@ export function registerCadProgram(host: ToolHost, table: ToolTable): void {
         }
         const cert = extractCertificate(result);
         ledger.push({ index: i, tool, ok: true, ...cert });
+        chainResults[i] = firstJsonOf(result);
         completed += 1;
       }
 

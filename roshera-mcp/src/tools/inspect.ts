@@ -51,10 +51,15 @@ export function registerInspectTools(server: ToolHost) {
 
   server.tool(
     "verify_claim",
-    "VERIFY a math claim against kernel GROUND TRUTH. Bind each variable in " +
-      "`expr` to an exact measurement, assert `expected`; evaluated " +
-      "deterministically (NOT an LLM). Verdict: verified | false (with " +
-      "abs_error) | refused (a binding didn't resolve — never a silent pass).",
+    "VERIFY a math claim against kernel GROUND TRUTH. SPEC-FIRST pattern: " +
+      "declare the checkable invariants a build must satisfy (an area ratio, " +
+      "a volume, a wall relation) BEFORE building, then check each one here " +
+      "after — the kernel measures; never self-grade from your own numbers. " +
+      "Bind each variable in `expr` to an exact measurement, assert " +
+      "`expected`; evaluated deterministically (NOT an LLM). Verdict: " +
+      "verified | false (with abs_error) | refused (a binding didn't resolve " +
+      "— never a silent pass). Pairs with verify_part: that certifies the " +
+      "topology is sound; this certifies the numbers you promised.",
     {
       expr: z
         .string()

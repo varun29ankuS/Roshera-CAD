@@ -445,8 +445,16 @@ export function fail(e: unknown) {
     // as typed fields instead of re-parsing `content[0].text` prose the way
     // every caller of this function had to before.
     result.structuredContent = {
+      // The refusal-card wire shape (roshera-app/src/lib/blackboard-cards.ts
+      // `refusalCardSchema`): `reason` is the backend message VERBATIM, so
+      // this object validates as a `roshera:refusal` payload — the agent
+      // (per .goosehints "payload EXACTLY as returned") or the app's
+      // cardFenceForPayload can fence it unchanged, carrying error_code /
+      // retryable / hint all the way to the rendered card.
+      reason: msg,
       error_code: catalog.error_code,
       retryable: catalog.retryable,
+      ...(hint !== null ? { hint } : {}),
       ...(catalog.details !== undefined ? { details: catalog.details } : {}),
     };
   }

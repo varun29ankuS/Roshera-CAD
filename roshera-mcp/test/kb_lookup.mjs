@@ -104,11 +104,23 @@ console.log("(s) SURFACE: kb_lookup in the FULL table only; minimal bill unmoved
   // minting contract, create_* name the object_uuid handle, list_parts names
   // the two id spaces, find_tool's bench enum gained the missing 'timeline'.
   // kb_lookup itself still costs the minimal surface zero.
+  // Pin moved 4900 → 4978 (2026-08-09 constraint pass). Provenance measured,
+  // not assumed: HEAD alone (all working-tree edits stashed, dist rebuilt)
+  // already billed 4958 — the 4900 pin had gone stale on commits landed since
+  // 2026-08-02 without this suite re-run. On top of that, +20: verify_part's
+  // spec-first wording (earlier this session), revolve's profile_segments
+  // nurbs `degree` gaining the description the budget gate's hygiene rule
+  // requires, and cad_program's "args are LITERAL" paragraph becoming the
+  // output→input CHAINING contract ('$N.key'/'$prev.key' placeholders) while
+  // its per-vertex steering sentence shrank — the single-point-run GATE
+  // (gates.ts gate 5) now enforces what those words used to ask. kb_lookup's
+  // own zero-marginal-cost claim is untouched — it remains in neither
+  // CORE_SURFACE nor META_SURFACE.
   const minimalBill = billFor(table, MINIMAL_SURFACE);
-  if (minimalBill === 4900)
-    pass(`minimal bill ${minimalBill} == pin 4900 (kb_lookup's zero marginal cost holds)`);
+  if (minimalBill === 4978)
+    pass(`minimal bill ${minimalBill} == pin 4978 (kb_lookup's zero marginal cost holds)`);
   else
-    fail(`minimal bill ${minimalBill} != 4900 — something moved the resident surface`);
+    fail(`minimal bill ${minimalBill} != 4978 — something moved the resident surface`);
 }
 
 // ── (p) PROVENANCE ──────────────────────────────────────────────────────────

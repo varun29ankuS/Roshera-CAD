@@ -287,6 +287,25 @@ const REFUSAL = card('refusal', {
   ],
 })
 
+/** The same refusal wire WITH the backend error catalog's typed fields
+ *  (`error_code` / `retryable` / `hint` — `refusalCardSchema`'s optional
+ *  extension, mirroring `error_catalog.rs` via mcp `core.ts`'s `fail()`).
+ *  The hint text is the real computed `blend_failed` guidance shape
+ *  (`blendFailureHint` — `r_max` arithmetic, not invented prose). */
+const REFUSAL_TYPED = card('refusal', {
+  reason:
+    'blend failed: requested radius 6 mm exceeds the local curvature limit at edge 23 (r_max = 4.2 mm)',
+  subject: 'blend on the bore rim',
+  source: 'kernel',
+  error_code: 'blend_failed',
+  retryable: false,
+  hint: 'requested radius 6mm exceeds the local curvature limit at edge 23 — retry with radius ≤ 4.2mm (r_max), or pass edge_ids to blend only the edges that fit at the larger radius.',
+  options: [
+    'Re-issue with radius ≤ 4.2 mm',
+    'Pass edge_ids to blend only the edges that fit at 6 mm',
+  ],
+})
+
 const MERGE_CONFLICT = card('merge', {
   success: false,
   merged_into: 'main',
@@ -461,6 +480,11 @@ const CARD_FIXTURES: Array<{ title: string; note: string; source: string }> = [
     title: 'Typed refusal',
     note: 'A result, not an error: verbatim reason, calm styling, next actions.',
     source: REFUSAL,
+  },
+  {
+    title: 'Typed refusal — with catalog fields',
+    note: 'The same refusal carrying the error catalog\'s typed fields: mono error_code chip, retryable as icon + word (absent renders nothing, never a guessed "no"), and the producer-authored hint — all visible text, nothing hover-only.',
+    source: REFUSAL_TYPED,
   },
   {
     title: 'Merge — blocked with typed witnesses',
@@ -759,6 +783,48 @@ export function BlackboardFixtures({ onExit }: BlackboardFixturesProps) {
     addLine(DETECTED_CHOICES_NEGATIVE_FENCED, 'agent')
   }, [addLine])
 
+  // ── Live repro: one full agent turn, every message kind. The tool-call
+  // chips are UNREACHABLE live today — goose's `claude-code` bridge emits
+  // ZERO `tool_call` frames (verified live; see `stores/blackboard-store.ts`'s
+  // `AgentAttention` doc) — so this is the only place a human can see them
+  // at all. Everything goes through the real store (`addLine` /
+  // `setLineTurnStatus` / `setStreamingLine`), so the real
+  // `parseToolCallLine` → `ToolCallRow`, `FailedTurnBlock` and streaming
+  // paths render, not lookalikes. The last line is left GENUINELY streaming
+  // (real `streamingLineId`, live elapsed clock + activity poll) — clear the
+  // board with its own trash icon, or send a real turn, to settle it.
+  const seedAgentTurn = useCallback(() => {
+    const store = useBlackboardStore.getState()
+    addLine('Building the DN50 flange: body, bolt circle, then the full certificate.', 'agent')
+    // One tool-call chip per status in `ToolCallRow`'s closed set — the
+    // completed one carries a certificate payload, the failed one a typed
+    // refusal, so the "result" expander shows a card, exactly what
+    // `renderToolLine` (`lib/acp-blackboard.ts`) writes for a validated
+    // wire payload.
+    addLine('⚙ create_cylinder — pending', 'system')
+    addLine('⚙ boolean difference — in_progress', 'system')
+    addLine(`⚙ verify_part — completed\n\n${SOUNDNESS_FULL}`, 'system')
+    addLine(`⚙ blend — failed\n\n${REFUSAL_TYPED}`, 'system')
+    // The typed refusal card with the catalog fields, as the agent's own
+    // verbatim-forwarded line (the `.goosehints` fence contract).
+    addLine(REFUSAL_TYPED, 'agent')
+    // A certificate card on its own agent line.
+    addLine(SOUNDNESS_FULL, 'agent')
+    // A failed turn — prose only (no fence), so it takes the
+    // `FailedTurnBlock` path, keyed on the store's typed `turnStatus`.
+    const failedId = addLine(
+      '⚠ Agent turn failed: the model provider did not serve the turn. Provider error, verbatim: connection reset by peer — check the provider configuration before the network.',
+      'agent',
+    )
+    store.setLineTurnStatus(failedId, 'failed')
+    // A line still streaming, last, like a live turn at the board's foot.
+    const streamingId = addLine(
+      'Retrying the blend at 4 mm, then re-running the full certificate',
+      'agent',
+    )
+    store.setStreamingLine(streamingId)
+  }, [addLine])
+
   // ── Live repro: fixed-left-gutter verdict marker — a mixed column of
   // real lines (through the real `BlackboardLine` origin marker, not the
   // static card gallery below, which renders via `MessageMarkdown` and has
@@ -841,6 +907,13 @@ export function BlackboardFixtures({ onExit }: BlackboardFixturesProps) {
               title="Append the verbatim defect line (agent's own unfenced Option A/B/C prose) plus three negatives: a user line, a single-option agent line, and an agent line that already has a roshera:choices fence — only the first should grow detected-option buttons"
             >
               seed detected choices + negatives
+            </button>
+            <button
+              onClick={seedAgentTurn}
+              className="cad-icon-btn h-6 px-1.5 text-[11px]"
+              title="Append one full agent turn — a tool-call chip in every status (unreachable live: goose emits zero tool_call frames), a typed refusal with error_code/retryable/hint, a certificate, a failed turn, and a line left genuinely streaming (clear the board to settle it)"
+            >
+              seed agent turn
             </button>
             <button
               onClick={seedVerdictMarkers}

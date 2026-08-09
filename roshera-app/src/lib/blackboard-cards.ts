@@ -42,7 +42,11 @@
  * - `roshera:refusal`  → the refusal wire the backend already speaks: a
  *   verbatim `message` from a 409/422 (never paraphrased — gdt.ts surfaces
  *   it as `REFUSED: <msg>`), plus optional next actions. A refusal is a
- *   RESULT, not an error.
+ *   RESULT, not an error. When the refusal rode the backend's structured
+ *   error catalog (`api-server/src/error_catalog.rs` — `{ error_code,
+ *   retryable, hint? }`, the same fields the MCP layer's `fail()` already
+ *   forwards as `structuredContent`), those typed fields are carried too —
+ *   optional, so a hand-authored refusal without them still validates.
  * - `roshera:choices`  → NOT a kernel wire type — an authoring convention
  *   (`.goosehints`, "When you need the human to choose between discrete
  *   options") the agent uses to ask a genuinely closed-set question as
@@ -239,6 +243,18 @@ export const refusalCardSchema = z.object({
   source: z.string().optional(),
   /** Next actions — a refusal is a result with options, not a dead end. */
   options: z.array(z.string()).optional(),
+  /** The error catalog's STABLE code (`error_catalog.rs` — its own doc says
+   *  the prose `error` is free to evolve; the code is the thing to branch
+   *  on). Optional: a hand-authored refusal has no code, and every card
+   *  written before this field existed must keep validating. */
+  error_code: z.string().optional(),
+  /** Whether the SAME call can succeed on retry, verbatim from the catalog
+   *  wire. Absent means the wire did not say — never guessed to false. */
+  retryable: z.boolean().optional(),
+  /** The one actionable next step — the backend's own `hint`, or the MCP
+   *  layer's computed one (e.g. blend `r_max` arithmetic). Prose, but prose
+   *  the producer authored for this specific code. */
+  hint: z.string().optional(),
 })
 
 export type RefusalCard = z.infer<typeof refusalCardSchema>

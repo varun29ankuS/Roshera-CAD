@@ -176,7 +176,8 @@ export function registerPerceptionTools(server: ToolHost) {
       "(red=open, magenta=non-manifold). The ONLY call that clears staleness: " +
       "after a boolean/blend/multi-feature build, ground_truth reads stale and " +
       "dfm_check/export_part refuse (422) until this runs — call it before " +
-      "trusting or shipping the result.",
+      "trusting or shipping the result. Then verify_claim the invariants you " +
+      "declared up front.",
     {
       part_id: z.number().int().describe("part id (list_parts)"),
       view: z.enum(["iso", "front", "top", "right"]).default("iso").describe("camera view for the diagnostic image"),
