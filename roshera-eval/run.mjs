@@ -9,10 +9,25 @@
  *   node run.mjs 01-gear 02-nozzle   # run named scenarios only
  *   ROSHERA_URL=http://host:8081 node run.mjs
  *   node run.mjs --json out.json     # write the machine report here
+ *   node run.mjs --identity          # log in as the eval account (see below)
  *
  * Prerequisite: a live backend (default http://127.0.0.1:8081). Exit code =
  * number of FAILED scenarios (0 = suite green). The saddle honesty canary
  * PASSES when the kernel honestly flags it unsound.
+ *
+ * --identity: log in with ROSHERA_EVAL_USERNAME/ROSHERA_EVAL_PASSWORD instead
+ * of ROSHERA_USERNAME/ROSHERA_PASSWORD (or the varun/Roshera321! default).
+ * Pair this with a backend that has ROSHERA_EVAL_IDENTITIES set to that
+ * account's minted user_id (`user_<username>` — see
+ * api-server/src/auth_middleware.rs's EvalHarness rate class) to get the
+ * wide eval rate-limit budget instead of the ordinary 100/min Mutation cap.
+ * If the eval env vars are not set, --identity falls back to the ordinary
+ * account with a loud warning. The 1.5s inter-scenario pacing
+ * (lib/harness.mjs's runSuite) is NEVER skipped based on this flag: it is
+ * the fallback that keeps a sweep under budget on any backend where the
+ * exemption is not live (e.g. a stale binary that predates it), and
+ * dropping it on the strength of a login alone would 429 the exact sweep
+ * this flag exists to unblock.
  */
 import { writeFile } from "node:fs/promises";
 import { makeClient, BASE, setAuthToken, request } from "./lib/client.mjs";
@@ -23,9 +38,11 @@ import { runSuite, summarize, scorecard } from "./lib/harness.mjs";
 async function main() {
   const args = process.argv.slice(2);
   let jsonOut = "report.json";
+  let useEvalIdentity = false;
   const names = [];
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "--json") jsonOut = args[++i];
+    else if (args[i] === "--identity") useEvalIdentity = true;
     else names.push(args[i]);
   }
   const scenarios = names.length ? ALL.filter((s) => names.includes(s.id)) : ALL;
@@ -52,16 +69,38 @@ async function main() {
   // let every subsequent request (through this same `client` and any raw
   // `request()` a scenario makes) carry it. Override with
   // ROSHERA_USERNAME/ROSHERA_PASSWORD or skip entirely with ROSHERA_TOKEN.
+  //
+  // --identity switches to ROSHERA_EVAL_USERNAME/ROSHERA_EVAL_PASSWORD, the
+  // account the backend's ROSHERA_EVAL_IDENTITIES allowlist is expected to
+  // name (see the module doc above). Falls back to the ordinary account —
+  // loudly — if those eval env vars are not set, so a caller cannot silently
+  // believe they got the wide budget when they did not.
   if (!process.env.ROSHERA_TOKEN) {
-    const username = process.env.ROSHERA_USERNAME ?? "varun";
-    const password = process.env.ROSHERA_PASSWORD ?? "Roshera321!";
+    let username, password;
+    if (useEvalIdentity) {
+      if (process.env.ROSHERA_EVAL_USERNAME && process.env.ROSHERA_EVAL_PASSWORD) {
+        username = process.env.ROSHERA_EVAL_USERNAME;
+        password = process.env.ROSHERA_EVAL_PASSWORD;
+      } else {
+        username = process.env.ROSHERA_USERNAME ?? "varun";
+        password = process.env.ROSHERA_PASSWORD ?? "Roshera321!";
+        process.stdout.write(
+          `--identity requested but ROSHERA_EVAL_USERNAME/ROSHERA_EVAL_PASSWORD are not set — ` +
+          `falling back to the ordinary account (${username}). The sweep will run under the ` +
+          `standard rate-limit budget; pacing stays on regardless.\n`,
+        );
+      }
+    } else {
+      username = process.env.ROSHERA_USERNAME ?? "varun";
+      password = process.env.ROSHERA_PASSWORD ?? "Roshera321!";
+    }
     try {
       const auth = await request("POST", "/api/auth/login", { username, password }, 10000);
       if (!auth.ok || !auth.data?.token) {
         throw new Error(`login -> ${auth.status}: ${JSON.stringify(auth.data)?.slice(0, 200)}`);
       }
       setAuthToken(auth.data.token);
-      process.stdout.write(`Authenticated as ${username}\n`);
+      process.stdout.write(`Authenticated as ${username}${useEvalIdentity ? " (--identity)" : ""}\n`);
     } catch (e) {
       console.error(`\nFATAL: auth login failed — ${e.message}\n`);
       process.exit(2);

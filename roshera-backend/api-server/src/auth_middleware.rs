@@ -12,7 +12,7 @@ use axum::{
 };
 use serde::Serialize;
 use session_manager::{AuthManager, Permission, PrincipalKind};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tracing::{info, warn};
 
 /// Authentication error response
@@ -593,20 +593,24 @@ fn get_default_user_permissions() -> Vec<Permission> {
 /// | [`Mutation`](Self::Mutation)     | 100 req/min | Everything else: real user/agent actions that change state, plus the auth-exempt `/health` probe. Unchanged from the original single-bucket figure. |
 /// | [`ProviderConfig`](Self::ProviderConfig) | 30 req/min | The AI-provider dialog (`/api/ai/provider`, all methods) — low-frequency human configuration traffic that must never starve behind poll/mutation noise; this is the exact bug this module fixes. |
 /// | [`ProviderTest`](Self::ProviderTest)     | 10 req/min | `/api/ai/provider/test` makes a real outbound vendor round trip, so it is deliberately tighter than `ProviderConfig` rather than sharing its bucket or being exempted outright. |
+/// | [`EvalHarness`](Self::EvalHarness) | 6000 req/min | Opt-in, server-side-allowlisted only (see [`is_eval_identity`]) — the nightly `roshera-eval` sweep, which posts hundreds of mutations per scenario across 18 scenarios and cannot fit inside `Mutation`'s 100/min. Nobody lands here by default; see that function's doc for why this cannot be acquired by a spoofed header. |
 ///
 /// **Worst-case total per identity per minute is now 300 + 240 + 100 +
-/// 30 + 10 = 680**, up from the original single 100/min bucket.
-/// Splitting one bucket into five necessarily raises the ceiling a
-/// client *may* reach across all classes combined — that is the
-/// intended trade, not an oversight: the goal is that no class can
-/// starve another, not a higher single-class ceiling. Every individual
-/// bucket above is still bounded (none of them is "unlimited", and none
-/// was produced by taking the old 100 and inflating it — `Mutation`
-/// keeps the original figure exactly).
+/// 30 + 10 + 6000 = 6680** for an identity on the `EvalHarness`
+/// allowlist, 680 for everyone else. Splitting one bucket into six
+/// necessarily raises the ceiling a client *may* reach across all
+/// classes combined — that is the intended trade, not an oversight: the
+/// goal is that no class can starve another, not a higher single-class
+/// ceiling. `EvalHarness` is wide but still bounded — it is a dedicated
+/// rate class, not a bypass — and it is reachable only by an identity
+/// `auth_middleware` has already validated and that a server-side env
+/// allowlist names explicitly; every individual bucket above is finite
+/// (none of them is "unlimited", and `Mutation` keeps the original
+/// figure exactly for everyone not on that allowlist).
 ///
 /// No path in this classifier is unbounded: [`classify_request`] always
-/// returns exactly one of the five classes above, so every request
-/// lands in a bucket with a finite budget.
+/// returns exactly one of the six classes above, so every request lands
+/// in a bucket with a finite budget.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RateLimitClass {
     /// Frequent, non-mutating browser/viewport reads. Matched by
@@ -627,6 +631,11 @@ enum RateLimitClass {
     /// `ProviderConfig`, split out because this one call costs a real
     /// vendor round trip.
     ProviderTest,
+    /// The nightly `roshera-eval` sweep. Granted ONLY when the request's
+    /// already-validated `AuthInfo.user_id` (never a client-supplied
+    /// header) appears on the server-side `ROSHERA_EVAL_IDENTITIES`
+    /// allowlist — see [`is_eval_identity`] for the full contract.
+    EvalHarness,
     /// Everything not matched above: sketch/csketch/boolean/assembly/
     /// timeline mutations, session and auth-credential routes (including
     /// `/health`), and any GET that isn't on the poll allowlist.
@@ -635,7 +644,7 @@ enum RateLimitClass {
 
 impl RateLimitClass {
     /// `(bucket label, max requests, window in seconds)`. The label is
-    /// folded into the bucket key (`"{client_id}|{label}"`) so the five
+    /// folded into the bucket key (`"{client_id}|{label}"`) so the six
     /// classes cannot collide inside `AuthManager`'s shared
     /// `rate_limits` map.
     const fn budget(self) -> (&'static str, usize, i64) {
@@ -645,8 +654,64 @@ impl RateLimitClass {
             RateLimitClass::Mutation => ("mutation", 100, 60),
             RateLimitClass::ProviderConfig => ("provider-config", 30, 60),
             RateLimitClass::ProviderTest => ("provider-test", 10, 60),
+            RateLimitClass::EvalHarness => ("eval-harness", 6000, 60),
         }
     }
+}
+
+/// Parse the `ROSHERA_EVAL_IDENTITIES` allowlist: a comma-separated list
+/// of `AuthInfo.user_id` values — **not usernames**. `handlers::auth::login`
+/// mints `user_id = format!("user_{username}")`, so an operator who lists
+/// the bare username (e.g. `eval-account`) instead of the minted id
+/// (`user_eval-account`) would list an allowlist entry that never
+/// matches any real request. Empty entries produced by stray/trailing
+/// commas or whitespace are dropped. Environment-getter seam mirrors
+/// [`AuthPosture::from_env_with`]: callers (and tests) supply the lookup
+/// closure so resolution is deterministic and tests never touch the
+/// process environment or the cached production reader below.
+fn eval_identities_from_env_with<F>(get: F) -> Vec<String>
+where
+    F: Fn(&str) -> Option<String>,
+{
+    get("ROSHERA_EVAL_IDENTITIES")
+        .map(|raw| {
+            raw.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Cached resolution of the `ROSHERA_EVAL_IDENTITIES` env allowlist —
+/// read once per process, the same discipline [`AuthPosture::from_env`]
+/// uses, rather than re-parsing the environment on every request. Tests
+/// MUST NOT call this: it is a process-global `OnceLock`, so the first
+/// value observed by any test in the binary would pin every later test.
+/// Tests call [`eval_identities_from_env_with`] (or [`is_eval_identity`]
+/// directly with an explicit slice) instead.
+fn eval_identities_from_env() -> &'static [String] {
+    static ALLOWLIST: OnceLock<Vec<String>> = OnceLock::new();
+    ALLOWLIST.get_or_init(|| eval_identities_from_env_with(|k| std::env::var(k).ok()))
+}
+
+/// The ONLY gate for [`RateLimitClass::EvalHarness`]: true when
+/// `user_id` — which callers MUST source from `request.extensions().get::<AuthInfo>()`,
+/// i.e. an identity `auth_middleware` has already cryptographically
+/// validated (a verified JWT or API key) — appears verbatim in
+/// `allowlist`.
+///
+/// This is deliberately a pure function with no header, IP, or
+/// `client_id`-fallback input: [`rate_limit_middleware`]'s own `client_id`
+/// falls back to the client-supplied `X-Forwarded-For` header for
+/// unauthenticated requests, and keying the eval exemption off that value
+/// would let ANY caller mint the eval budget for free by sending
+/// `X-Forwarded-For: <allowlisted-id>` with no credential at all — exactly
+/// the header-spoofing pattern this exemption must never become. Being
+/// pure also makes it fully testable with an explicit slice, independent
+/// of [`eval_identities_from_env`]'s process-global cache.
+fn is_eval_identity(user_id: &str, allowlist: &[String]) -> bool {
+    allowlist.iter().any(|id| id == user_id)
 }
 
 /// Read-only prefixes the frontend/viewport polls continuously (see
@@ -680,16 +745,29 @@ fn is_poll_prefix(path: &str) -> bool {
 }
 
 /// Classify a request into a [`RateLimitClass`] for [`rate_limit_middleware`].
-///
+/// Thin wrapper over [`classify_request_with_allowlist`] using the
+/// process's cached [`eval_identities_from_env`]; see that function for
+/// why tests drive the `_with_allowlist` core directly instead.
+fn classify_request(request: &Request) -> RateLimitClass {
+    classify_request_with_allowlist(request, eval_identities_from_env())
+}
+
 /// Order matters: `/api/ai/provider/test` and `/api/ai/provider` are
 /// checked first so they can never fall into `Agent` (an MCP-tagged
 /// probe of the dialog would otherwise share the agent bucket) or `Poll`
 /// (a GET on the dialog would otherwise share the poll bucket) — both of
 /// which would reintroduce a starvation path for the exact surface this
-/// module protects. `Agent` is checked before the poll/mutation split so
-/// an agent's own read traffic is bounded by the agent budget, not the
-/// human poll budget.
-fn classify_request(request: &Request) -> RateLimitClass {
+/// module protects. `EvalHarness` is checked next, ahead of `/acp` and
+/// the `X-Roshera-Agent` header split: the `roshera-eval` client sends
+/// that same header on every request (it mirrors the production MCP
+/// client), so if the eval check ran after the agent-header check an
+/// allowlisted eval identity's traffic would be silently classified as
+/// `Agent` (240/min) instead of `EvalHarness` (6000/min) and the
+/// exemption would be dead code for the exact traffic it exists to
+/// serve. `Agent` is checked before the poll/mutation split so a
+/// non-exempt agent's own read traffic is bounded by the agent budget,
+/// not the human poll budget.
+fn classify_request_with_allowlist(request: &Request, eval_allowlist: &[String]) -> RateLimitClass {
     let path = request.uri().path();
 
     if path == "/api/ai/provider/test" {
@@ -697,6 +775,13 @@ fn classify_request(request: &Request) -> RateLimitClass {
     }
     if path == "/api/ai/provider" {
         return RateLimitClass::ProviderConfig;
+    }
+    // See `is_eval_identity`'s doc: gated on the AuthInfo `auth_middleware`
+    // already validated, never on a client-supplied header.
+    if let Some(auth_info) = request.extensions().get::<AuthInfo>() {
+        if is_eval_identity(&auth_info.user_id, eval_allowlist) {
+            return RateLimitClass::EvalHarness;
+        }
     }
     if path == "/acp" || path.starts_with("/acp/") {
         return RateLimitClass::Agent;
@@ -982,6 +1067,226 @@ mod tests {
             AuthPosture::from_env_with(|k| (k == "ROSHERA_DEV_BRIDGE").then(|| "1".to_string())),
             AuthPosture::Required,
             "ROSHERA_DEV_BRIDGE must not disable authentication"
+        );
+    }
+
+    // =================================================================
+    // TASK #11 — EvalHarness rate-limit exemption (nightly `roshera-eval`
+    // sweep). See `RateLimitClass::EvalHarness`, `is_eval_identity`, and
+    // `classify_request_with_allowlist` for the production code these
+    // tests pin.
+    // =================================================================
+
+    /// `ROSHERA_EVAL_IDENTITIES` parses a comma-separated allowlist of
+    /// `AuthInfo.user_id` values (mirrors `AuthPosture::from_env_with`'s
+    /// env-getter-seam pattern), dropping empty entries from stray or
+    /// trailing commas/whitespace, and is empty when unset.
+    #[test]
+    fn eval_identities_parses_comma_separated_user_ids() {
+        assert_eq!(
+            eval_identities_from_env_with(|k| (k == "ROSHERA_EVAL_IDENTITIES")
+                .then(|| " user_varun-eval , user_ci-nightly ,,".to_string())),
+            vec!["user_varun-eval".to_string(), "user_ci-nightly".to_string()],
+            "entries are trimmed and empty entries from stray commas are dropped"
+        );
+        assert!(
+            eval_identities_from_env_with(|_| None).is_empty(),
+            "an unset ROSHERA_EVAL_IDENTITIES must yield an empty allowlist, not panic or default-allow"
+        );
+    }
+
+    /// `is_eval_identity` is an exact-match membership test — no
+    /// prefix/substring matching that could let
+    /// `user_varun-eval-imposter` ride on `user_varun-eval`'s entry, and
+    /// an empty allowlist (the out-of-the-box default) admits nobody.
+    #[test]
+    fn is_eval_identity_is_exact_match_membership() {
+        let allowlist = vec!["user_varun-eval".to_string()];
+        assert!(is_eval_identity("user_varun-eval", &allowlist));
+        assert!(
+            !is_eval_identity("user_varun-eval-imposter", &allowlist),
+            "membership must be exact, not a prefix match"
+        );
+        assert!(!is_eval_identity("user_ordinary", &allowlist));
+        assert!(
+            !is_eval_identity("user_varun-eval", &[]),
+            "an empty (unconfigured) allowlist must exempt nobody"
+        );
+    }
+
+    /// Builds a request the way `auth_middleware` would have left it by
+    /// the time `rate_limit_middleware`/`classify_request` runs: headers
+    /// as sent by the client, plus (when `auth` is `Some`) the `AuthInfo`
+    /// extension the global auth layer already validated and inserted.
+    fn mk_request(
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        auth: Option<AuthInfo>,
+    ) -> Request {
+        let mut builder = Request::builder().method(method).uri(path);
+        for (k, v) in headers {
+            builder = builder.header(*k, *v);
+        }
+        let mut req = builder
+            .body(axum::body::Body::empty())
+            .expect("request must build");
+        if let Some(info) = auth {
+            req.extensions_mut().insert(info);
+        }
+        req
+    }
+
+    fn eval_auth(user_id: &str) -> AuthInfo {
+        AuthInfo {
+            user_id: user_id.to_string(),
+            session_id: None,
+            permissions: vec![
+                Permission::CreateGeometry,
+                Permission::ModifyGeometry,
+                Permission::ViewGeometry,
+            ],
+            roles: vec![],
+            is_api_key: false,
+            principal: PrincipalKind::Human,
+        }
+    }
+
+    /// THE ordering-regression test. `roshera-eval`'s client
+    /// (`lib/client.mjs`) sends `X-Roshera-Agent` on every request — the
+    /// same header the production MCP server sends. If the `EvalHarness`
+    /// check ran AFTER the `X-Roshera-Agent` check in
+    /// `classify_request_with_allowlist`, an allowlisted eval identity's
+    /// traffic would silently classify as `Agent` (240 req/min) instead
+    /// of `EvalHarness` (6000 req/min) — the exemption would be dead
+    /// code for the exact traffic it exists to serve. This is the
+    /// scenario the task's rate-exemption requirement is FOR.
+    #[test]
+    fn eval_identity_with_agent_header_classifies_as_eval_harness_not_agent() {
+        let allowlist = vec!["user_varun-eval".to_string()];
+        let req = mk_request(
+            "GET",
+            "/api/agent/parts",
+            &[("x-roshera-agent", "AgentEvalAlpha")],
+            Some(eval_auth("user_varun-eval")),
+        );
+        assert_eq!(
+            classify_request_with_allowlist(&req, &allowlist),
+            RateLimitClass::EvalHarness,
+            "an allowlisted eval identity's agent-tagged traffic must land in EvalHarness, not Agent"
+        );
+    }
+
+    /// A non-allowlisted identity sending the same agent-tagged traffic
+    /// is unaffected — still `Agent`, exactly as before this exemption
+    /// existed. Guards against a broken `is_eval_identity` that admits
+    /// everyone.
+    #[test]
+    fn non_allowlisted_identity_with_agent_header_still_classifies_as_agent() {
+        let allowlist = vec!["user_varun-eval".to_string()];
+        let req = mk_request(
+            "GET",
+            "/api/agent/parts",
+            &[("x-roshera-agent", "AgentEvalAlpha")],
+            Some(eval_auth("user_ordinary")),
+        );
+        assert_eq!(
+            classify_request_with_allowlist(&req, &allowlist),
+            RateLimitClass::Agent,
+        );
+    }
+
+    /// THE header-spoofing-regression test. `rate_limit_middleware`'s own
+    /// `client_id` falls back to the client-supplied `X-Forwarded-For`
+    /// header for unauthenticated requests. `is_eval_identity` and the
+    /// classifier calling it must NEVER read that (or any other
+    /// client-supplied) header — only the `AuthInfo` extension
+    /// `auth_middleware` already cryptographically validated — or any
+    /// caller with no credential at all could mint the eval budget for
+    /// free by sending `X-Forwarded-For: <allowlisted-id>`. This is
+    /// exactly the pattern the task requires refusing.
+    #[test]
+    fn unauthenticated_request_with_spoofed_forwarded_for_is_not_eval_harness() {
+        let allowlist = vec!["user_varun-eval".to_string()];
+        let req = mk_request(
+            "POST",
+            "/api/geometry",
+            &[("x-forwarded-for", "user_varun-eval")],
+            None, // no validated AuthInfo -- the unauthenticated case
+        );
+        assert_eq!(
+            classify_request_with_allowlist(&req, &allowlist),
+            RateLimitClass::Mutation,
+            "a client-supplied X-Forwarded-For matching the allowlist must NOT grant the eval budget"
+        );
+    }
+
+    /// Pins the literal task requirement end-to-end through the real
+    /// `AuthManager` rate limiter and the real `RateLimitClass::budget()`
+    /// table: an eval-allowlisted identity sustains far more than 100
+    /// mutations inside the 1-minute window, while an ordinary identity
+    /// on the exact same `Mutation` bucket is still capped at exactly
+    /// 100 — unchanged from before this exemption existed.
+    ///
+    /// This drives `AuthManager::check_rate_limit_budget` directly with
+    /// each class's own `(label, max, window)` rather than routing
+    /// through `classify_request`'s cached `eval_identities_from_env()`:
+    /// that reader is a process-global `OnceLock` (see its doc) and
+    /// setting `ROSHERA_EVAL_IDENTITIES` here would leak into every other
+    /// test in this binary depending on execution order. The
+    /// classification tests above already cover "which class an
+    /// identity's request maps to"; this one covers "does that class's
+    /// budget actually hold up under load." 150 sequential in-process
+    /// calls complete in milliseconds, well inside the 60s window, so
+    /// this is a budget-capacity assertion, not a timing-flaky one.
+    #[test]
+    fn eval_harness_budget_sustains_far_more_than_ordinary_mutation_cap() {
+        let auth_manager = AuthManager::new(
+            session_manager::AuthConfig::default(),
+            "test-secret-not-a-real-jwt-key",
+        )
+        .expect("AuthManager::new with a default config and no DB must succeed");
+
+        let (eval_label, eval_max, eval_window) = RateLimitClass::EvalHarness.budget();
+        let (mut_label, mut_max, mut_window) = RateLimitClass::Mutation.budget();
+        assert!(
+            eval_max > 100,
+            "EvalHarness's budget must exceed the 100/min the task requires sustaining"
+        );
+        assert_eq!(
+            mut_max, 100,
+            "Mutation's budget must stay exactly what every non-exempt caller already gets"
+        );
+
+        let eval_key = format!("user_varun-eval|{eval_label}");
+        let ordinary_key = format!("user_ordinary|{mut_label}");
+
+        for i in 0..150 {
+            assert!(
+                auth_manager
+                    .check_rate_limit_budget(&eval_key, eval_max, chrono::Duration::seconds(eval_window))
+                    .is_ok(),
+                "eval-allowlisted identity request {i} (> 100/min) must succeed under the EvalHarness budget"
+            );
+        }
+
+        for i in 0..100 {
+            assert!(
+                auth_manager
+                    .check_rate_limit_budget(
+                        &ordinary_key,
+                        mut_max,
+                        chrono::Duration::seconds(mut_window)
+                    )
+                    .is_ok(),
+                "ordinary identity request {i}, within the 100/min cap, must succeed"
+            );
+        }
+        assert!(
+            auth_manager
+                .check_rate_limit_budget(&ordinary_key, mut_max, chrono::Duration::seconds(mut_window))
+                .is_err(),
+            "ordinary identity's 101st request in the same window must be rejected -- Mutation's cap is unchanged"
         );
     }
 }

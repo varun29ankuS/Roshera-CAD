@@ -261,6 +261,16 @@ pub struct AppState {
     /// with the `DatabaseEventSink` the recorder writes through, so a
     /// switch retargets both "what's live" and "where new events land" in
     /// one write. See `documents.rs`.
+    ///
+    /// AMBIENT BY NATURE — read it directly ONLY where the process-global
+    /// fact is the one you actually mean (what the viewport is showing, what
+    /// the recorder persists under, what boot replayed). A handler serving
+    /// per-document state must instead call
+    /// `documents::resolve_document(&state, &headers)`, which honours the
+    /// caller's own `X-Roshera-Document` binding and falls back to this cell
+    /// only when the request declares none. Reading this cell ambiently is
+    /// what let a second client's `/open` silently retarget a first client's
+    /// notebook (demonstrated 2026-08-09).
     pub active_document: Arc<RwLock<String>>,
 
     // Additional fields for handlers

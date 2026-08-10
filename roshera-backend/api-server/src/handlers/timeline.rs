@@ -2437,6 +2437,7 @@ fn branch_id_label(branch: &BranchId) -> String {
 pub async fn get_evidence_pack(
     State(state): State<AppState>,
     Query(query): Query<EvidencePackQuery>,
+    headers: axum::http::HeaderMap,
 ) -> Result<Json<EvidencePack>, StatusCode> {
     let branch_id = match query.branch.as_deref() {
         Some(b) => resolve_branch_ref(b)?,
@@ -2551,7 +2552,20 @@ pub async fn get_evidence_pack(
     // reads that one notebook directly, unmerged — `document_snapshot` only
     // ever unions Document + Part scopes, so there is nothing to reuse for a
     // scope it was never asked to cover.
-    let evidence_document_id = state.active_document.read().await.clone();
+    // The notebook half of the pack is per-document state, so it honours the
+    // request's own document binding (`X-Roshera-Document`) rather than the
+    // process-global cell — otherwise an agent bound to its own document
+    // would be handed ANOTHER client's notes as its evidence.
+    //
+    // Signature note: this handler refuses with a bare `StatusCode`, not the
+    // typed `ApiError` every other converted seam returns, so an unknown or
+    // undecodable binding collapses to a 404 here. That narrowing is a
+    // pre-existing artifact of this one handler's return type; widening it
+    // ripples through `evidence_pack_tests` and is deliberately out of
+    // scope for this change.
+    let evidence_document_id = crate::documents::resolve_document(&state, &headers)
+        .await
+        .map_err(|_| StatusCode::NOT_FOUND)?;
     let notebook = if notebook_scope == BlackboardScope::Document {
         state
             .blackboard

@@ -1,0 +1,185 @@
+name: Nightly AGENT-EVAL-α Sweep
+
+# Runs the roshera-eval 18-scenario certified-CAD benchmark against a
+# freshly-built api-server every night, plus on demand. This is a
+# DIAGNOSTIC sweep, not a merge gate — it runs on a schedule against
+# `main`, not per-PR, and its job status reflects the scorecard honestly
+# (some scenarios are known to fail today; see roshera-eval/README.md).
+# Nobody's PR depends on this workflow passing.
+#
+# Infra this needs, and how this workflow satisfies it (see task #11):
+#   - Postgres: api-server's main.rs hard-requires a reachable Postgres at
+#     boot (`PostgresDatabase::new(&db_config).await?`, no sqlite/in-memory
+#     fallback) — provided here as a GH Actions `services:` container,
+#     available to ubuntu-latest runners out of the box, no self-hosted
+#     runner or docker-compose needed.
+#   - A built api-server binary — built from source here with the same
+#     mold-linker + no-debuginfo discipline as ci.yml's `test` job.
+#   - An eval account the backend's ROSHERA_EVAL_IDENTITIES allowlist
+#     names, so the sweep exercises the EvalHarness rate-limit exemption
+#     (auth_middleware.rs) instead of the 100/min Mutation cap that made a
+#     full 18-scenario sweep 429 on earlier runs. Registered fresh each run
+#     via POST /api/auth/register — no persisted credentials, no secrets
+#     required.
+#
+# What this workflow deliberately does NOT do: gate any PR, publish results
+# anywhere but the run's own artifacts/summary, or depend on repo secrets
+# (JWT signing key and DB password are generated per-run; ANTHROPIC_API_KEY
+# is never set because no eval scenario touches an AI route).
+
+on:
+  schedule:
+    # 09:00 UTC nightly.
+    - cron: '0 9 * * *'
+  workflow_dispatch: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  CARGO_PROFILE_DEV_DEBUG: "false"
+  CARGO_PROFILE_TEST_DEBUG: "false"
+
+jobs:
+  nightly-eval:
+    name: Build backend + run AGENT-EVAL-α sweep
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: roshera
+          POSTGRES_PASSWORD: roshera_nightly_ci
+          POSTGRES_DB: roshera
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U roshera -d roshera"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        # Same rationale as ci.yml's test job: the full workspace + every
+        # dependency can overrun the runner's root disk on a cold cache.
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+            /usr/local/lib/node_modules 2>/dev/null || true
+          sudo docker image prune -af 2>/dev/null || true
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config mold postgresql-client
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo dependencies
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-nightly-eval-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build api-server
+        env:
+          RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+        run: cargo build --bin api-server -j 4
+        working-directory: ./roshera-backend
+
+      - name: Boot api-server against the postgres service
+        id: boot
+        env:
+          DATABASE_URL: postgresql://roshera:roshera_nightly_ci@localhost:5432/roshera
+          # Ephemeral, per-run secret — this process is the only one that
+          # ever signs or verifies with it, and it dies with the job.
+          ROSHERA_JWT_SECRET: ${{ github.run_id }}-${{ github.run_attempt }}-nightly-eval-not-a-real-secret
+          # The eval account registered in the next step mints
+          # user_id = "user_varun-eval" (handlers::auth::login's
+          # `format!("user_{username}")`) — this MUST be the user_id, not
+          # the bare username; see auth_middleware.rs's EvalHarness doc.
+          ROSHERA_EVAL_IDENTITIES: user_varun-eval
+          RUST_LOG: info
+        run: |
+          set -e
+          ./target/debug/api-server > /tmp/api-server.log 2>&1 &
+          echo "pid=$!" >> "$GITHUB_OUTPUT"
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:8081/health > /dev/null; then
+              echo "api-server is live"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::api-server did not become healthy within 60s"
+          cat /tmp/api-server.log
+          exit 1
+        working-directory: ./roshera-backend
+
+      - name: Register the eval account
+        run: |
+          set -e
+          resp=$(curl -sf -X POST http://127.0.0.1:8081/api/auth/register \
+            -H 'Content-Type: application/json' \
+            -d '{"username":"varun-eval","email":"varun-eval@nightly.roshera.local","password":"NightlyEval#2026","full_name":"Nightly Eval Harness"}')
+          echo "$resp"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Run AGENT-EVAL-α sweep (--identity)
+        # No dependencies (README.md: "no dependencies, no build step"), so
+        # no npm ci. continue-on-error: the sweep's exit code is the count
+        # of failed scenarios, which is EXPECTED to be nonzero today (see
+        # the module doc above) — this step's own failure must not hide the
+        # report-upload/summary steps below.
+        id: sweep
+        continue-on-error: true
+        env:
+          ROSHERA_EVAL_USERNAME: varun-eval
+          ROSHERA_EVAL_PASSWORD: "NightlyEval#2026"
+        run: node run.mjs --identity --json nightly-report.json
+        working-directory: ./roshera-eval
+
+      - name: Publish scorecard to job summary
+        if: always()
+        run: |
+          {
+            echo "## AGENT-EVAL-α nightly sweep"
+            echo '```'
+            node -e "
+              const r = require('./nightly-report.json');
+              console.log(JSON.stringify(r.summary, null, 2));
+              for (const s of r.scenarios) console.log(s.id.padEnd(28), s.passed ? 'PASS' : (s.knownRed ? 'FAIL(known-red)' : 'FAIL'), s.wallMs + 'ms');
+            " 2>/dev/null || echo "no report.json produced — see the sweep step log"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+        working-directory: ./roshera-eval
+
+      - name: Upload sweep report + backend log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-eval-report
+          path: |
+            roshera-eval/nightly-report.json
+            /tmp/api-server.log
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Stop api-server
+        if: always()
+        run: |
+          if [ -n "${{ steps.boot.outputs.pid }}" ]; then
+            kill "${{ steps.boot.outputs.pid }}" 2>/dev/null || true
+          fi

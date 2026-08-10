@@ -34,6 +34,98 @@ use crate::auth_middleware::AuthInfo;
 use crate::error_catalog::{ApiError, ErrorCode};
 use crate::{durability, AppState};
 
+/// The header a client sends to bind ONE request to ONE document, instead
+/// of inheriting whichever document happens to be process-globally active.
+///
+/// Lowercase per HTTP/2 convention; axum's `HeaderMap` lookup is
+/// case-insensitive, so client casing does not matter (same convention as
+/// [`crate::transactions::TX_ID_HEADER`]).
+pub const DOCUMENT_HEADER: &str = "x-roshera-document";
+
+/// Resolve the document ONE request operates on.
+///
+/// # Why this exists
+///
+/// `AppState.active_document` is a single process-global cell with a single
+/// writer ([`activate`], backing `POST /api/documents/{id}/open`). Every
+/// per-document read used to consult that cell ambiently, which means a
+/// SECOND client opening a document silently retargeted the FIRST client's
+/// reads and writes: two agents on one server could not hold two documents,
+/// and neither one was told. Demonstrated live 2026-08-09.
+///
+/// The remedy follows the `X-Roshera-Intent` precedent in `main.rs`
+/// (`agent_intent_layer`): carry the fact THROUGH the request rather than
+/// parking it in ambient state, because ambient state cross-attributes
+/// under concurrency and produces answers that are confidently wrong.
+///
+/// # Contract
+///
+/// * **Header absent (or empty)** → the process-global `active_document`,
+///   byte-for-byte the previous behaviour. The viewport, the WebSocket
+///   surface and every existing REST client send no such header, so the
+///   overwhelming majority of live traffic still takes this path. The
+///   fallback is deliberately NOT validated against the catalog: the
+///   pre-documents default (`durability::DURABILITY_SESSION_ID`) legitimately
+///   has no registry row until `ensure_default_document_registered` runs, and
+///   404-ing it would break the entire legacy surface to enforce a
+///   bookkeeping detail.
+/// * **Header present and registered** → that document.
+/// * **Header present, unknown id** → typed 404 `DocumentNotFound`, matching
+///   `/open`, `PATCH` and `DELETE`. A stale binding is exactly what this
+///   feature exists to catch; quietly serving a DIFFERENT document would
+///   reproduce the defect with extra steps.
+/// * **Header present but not ASCII** → typed 400. This is the one place the
+///   intent precedent deliberately does NOT apply: `agent_intent_layer`
+///   treats an undecodable intent as absent (a missing provenance facet is
+///   honest), but answering from the global document when the caller
+///   demonstrably TRIED to bind elsewhere is precisely the silent wrong
+///   answer this work removes.
+///
+/// # Cost
+///
+/// Zero extra I/O when the header is absent, and zero when it names the
+/// document that is already live (the common MCP case — an agent bound to
+/// the document it opened). Only a genuine cross-document binding pays the
+/// catalog round-trip.
+pub async fn resolve_document(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+) -> Result<String, ApiError> {
+    let Some(raw) = headers.get(DOCUMENT_HEADER) else {
+        return Ok(state.active_document.read().await.clone());
+    };
+    let requested = raw
+        .to_str()
+        .map_err(|_| {
+            ApiError::new(
+                ErrorCode::InvalidParameter,
+                format!(
+                    "{DOCUMENT_HEADER} must be an ASCII document id; the value sent \
+                     is not decodable, and this request will NOT be silently served \
+                     from the globally active document"
+                ),
+            )
+        })?
+        .trim();
+    if requested.is_empty() {
+        return Ok(state.active_document.read().await.clone());
+    }
+    if state.active_document.read().await.as_str() == requested {
+        return Ok(requested.to_string());
+    }
+    let known = state
+        .database
+        .load_documents()
+        .await
+        .map_err(|e| internal_db_error("load documents", e))?
+        .into_iter()
+        .any(|r| r.id == requested);
+    if !known {
+        return Err(ApiError::document_not_found(requested));
+    }
+    Ok(requested.to_string())
+}
+
 /// Wire shape for both the create response and each entry of the list.
 #[derive(Debug, Clone, Serialize)]
 pub struct DocumentView {
@@ -489,6 +581,21 @@ pub async fn delete_document(
 /// log. Exposed separately from the HTTP handler so boot-time self-heal and
 /// tests can call it directly without a registry check (the registry check
 /// belongs to the untrusted HTTP boundary, not this trusted inner step).
+///
+/// # This is the VIEWPORT's selection switch, not a per-client binding
+///
+/// This remains the ONE writer of `active_document`, and that is deliberate.
+/// It swaps what the single live `BRepModel` + `Timeline` hold — a
+/// process-wide act with a process-wide effect, which is exactly right for
+/// the viewport's document tabs ("show me that document now") and exactly
+/// wrong as a per-client notion of "which document am I in".
+///
+/// Clients that need the latter — chiefly an agent over MCP, which must not
+/// have its document changed underneath it because a human clicked a tab —
+/// state it per request via [`DOCUMENT_HEADER`] and are served by
+/// [`resolve_document`]. The two are complementary: this function moves the
+/// live model; the header scopes a request against per-document state
+/// WITHOUT moving anything.
 pub async fn activate(state: &AppState, document_id: &str) -> durability::DurabilityStatus {
     // 0. Drain the recorder BEFORE anything is reset or re-pointed. The
     //    kernel's `record()` is fire-and-forget into a bounded MPSC; ops

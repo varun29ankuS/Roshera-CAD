@@ -1028,9 +1028,10 @@ fn resolve_scope(
 pub async fn get_blackboard(
     State(state): State<AppState>,
     Query(q): Query<ScopeQuery>,
+    headers: axum::http::HeaderMap,
 ) -> Result<Json<BlackboardSnapshot>, ApiError> {
     let scope = resolve_scope(&state, q.scope.as_deref(), q.part_id.as_deref())?;
-    let document_id = state.active_document.read().await.clone();
+    let document_id = crate::documents::resolve_document(&state, &headers).await?;
     let mut snapshot = if scope == BlackboardScope::Document {
         state.blackboard.document_snapshot(&document_id).await
     } else {
@@ -1053,10 +1054,11 @@ pub async fn get_blackboard(
 /// Document. Returns the created line.
 pub async fn add_entry(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<AddEntryRequest>,
 ) -> Result<Json<BlackboardLine>, ApiError> {
     let scope = resolve_scope(&state, req.scope.as_deref(), req.part_id.as_deref())?;
-    let document_id = state.active_document.read().await.clone();
+    let document_id = crate::documents::resolve_document(&state, &headers).await?;
     let line = state
         .blackboard
         .add(&document_id, &scope, req.id, req.text, req.author)
@@ -1073,9 +1075,10 @@ pub async fn edit_entry(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Query(q): Query<ScopeQuery>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<EditEntryRequest>,
 ) -> Result<Json<BlackboardLine>, ApiError> {
-    let document_id = state.active_document.read().await.clone();
+    let document_id = crate::documents::resolve_document(&state, &headers).await?;
     let result = match (q.scope.as_deref(), q.part_id.as_deref()) {
         (None, None) => {
             state
@@ -1103,8 +1106,9 @@ pub async fn delete_entry(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Query(q): Query<ScopeQuery>,
+    headers: axum::http::HeaderMap,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let document_id = state.active_document.read().await.clone();
+    let document_id = crate::documents::resolve_document(&state, &headers).await?;
     let result = match (q.scope.as_deref(), q.part_id.as_deref()) {
         (None, None) => state.blackboard.delete_any_scope(&document_id, &id).await,
         (s, p) => {
@@ -1128,9 +1132,10 @@ pub async fn delete_entry(
 pub async fn clear_blackboard(
     State(state): State<AppState>,
     Query(q): Query<ScopeQuery>,
+    headers: axum::http::HeaderMap,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     let scope = resolve_scope(&state, q.scope.as_deref(), q.part_id.as_deref())?;
-    let document_id = state.active_document.read().await.clone();
+    let document_id = crate::documents::resolve_document(&state, &headers).await?;
     if scope == BlackboardScope::Document {
         state.blackboard.clear_document(&document_id).await;
     } else {

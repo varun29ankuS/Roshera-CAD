@@ -2071,6 +2071,268 @@ async fn blackboard_part_scope_accepts_both_the_solid_id_and_its_uuid_alias() {
 }
 
 // =====================================================================
+// Tests — SESSION↔DOCUMENT BINDING (`X-Roshera-Document`)
+//
+// `AppState.active_document` is ONE process-global cell with ONE writer
+// (`documents::activate`, backing `POST /api/documents/{id}/open`). Every
+// blackboard handler read it ambiently, so a second client opening a
+// document silently retargeted the FIRST client's writes: two agents on
+// one server could not hold two documents, and neither one was told.
+//
+// The fix carries the document THROUGH the request (the `X-Roshera-Intent`
+// precedent) instead of reading ambient state: an optional
+// `X-Roshera-Document` header, resolved per request by
+// `documents::resolve_document`. Absent header → the global, unchanged, so
+// the viewport and every existing client keep working byte-for-byte.
+//
+// These tests assert against the blackboard STORE directly rather than
+// reading back through `GET /api/blackboard`: the read path is converted
+// by the same change, so a round-trip through it would have passed even
+// while both ends landed on the WRONG document — a test that cannot fail
+// for the defect it names is not a test.
+// =====================================================================
+
+/// The binding header's name spelled out on the WIRE, deliberately not
+/// `documents::DOCUMENT_HEADER`: these tests pin the contract a client
+/// actually sends, so renaming the constant cannot quietly rename the
+/// header out from under the MCP client and the viewport.
+const DOCUMENT_HEADER_WIRE: &str = "x-roshera-document";
+
+/// Register a document through the live `POST /api/documents` route (the
+/// catalog row `resolve_document` validates against) and return its id.
+async fn register_document(state: &AppState, name: &str) -> String {
+    let (status, body) = dispatch(
+        state,
+        Request::builder()
+            .method(Method::POST)
+            .uri("/api/documents")
+            .header("content-type", "application/json")
+            .body(Body::from(json!({ "name": name }).to_string()))
+            .expect("static request must build"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "document registration must succeed; body = {body}"
+    );
+    body["id"]
+        .as_str()
+        .expect("a registered document must carry an id")
+        .to_string()
+}
+
+/// Append one blackboard line, optionally bound to a document.
+fn blackboard_post(text: &str, document: Option<&str>) -> Request<Body> {
+    let mut builder = Request::builder()
+        .method(Method::POST)
+        .uri("/api/blackboard/entries")
+        .header("content-type", "application/json");
+    if let Some(doc) = document {
+        builder = builder.header(DOCUMENT_HEADER_WIRE, doc);
+    }
+    builder
+        .body(Body::from(json!({ "text": text }).to_string()))
+        .expect("static request must build")
+}
+
+/// THE RED for the session↔document bug demonstrated 2026-08-09.
+///
+/// Two documents, two clients. The process-global `active_document` points
+/// at B (client B opened it last — the ONE writer did exactly what it is
+/// supposed to do). Client A is still working in A and says so on the
+/// wire. A's line must land in A.
+///
+/// Before the fix this test fails on the FIRST assertion: A's notebook is
+/// empty and the line is sitting in B's, because `add_entry` read the
+/// global cell and never looked at the request.
+#[tokio::test]
+async fn blackboard_write_lands_in_the_request_bound_document_not_the_global() {
+    let state = make_test_state().await;
+    let id_a = register_document(&state, "Doc A").await;
+    let id_b = register_document(&state, "Doc B").await;
+
+    // Client B opened B: the global cell now points at B. Written directly
+    // rather than through `documents::activate` because the in-memory reset
+    // and replay that `activate` also performs are irrelevant here — the
+    // defect is the VALUE of this one cell under a different client.
+    *state.active_document.write().await = id_b.clone();
+
+    let (status, body) = dispatch(&state, blackboard_post("client A is in A", Some(&id_a))).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a bound write must succeed; body = {body}"
+    );
+
+    let in_a = state.blackboard.document_snapshot(&id_a).await;
+    assert_eq!(
+        in_a.lines.len(),
+        1,
+        "the line must land in the document the REQUEST named, not the \
+         process-global one; A's notebook = {:?}",
+        in_a.lines
+    );
+    assert_eq!(in_a.lines[0].text, "client A is in A");
+
+    let in_b = state.blackboard.document_snapshot(&id_b).await;
+    assert!(
+        in_b.lines.is_empty(),
+        "the globally-active document must be UNTOUCHED by a write bound \
+         elsewhere; B's notebook = {:?}",
+        in_b.lines
+    );
+}
+
+/// The read half of the same binding: `GET /api/blackboard` bound to A
+/// serves A's notebook while the global cell points at B. Without this the
+/// write could land correctly and still be unreadable by the client that
+/// wrote it.
+#[tokio::test]
+async fn blackboard_read_serves_the_request_bound_document() {
+    let state = make_test_state().await;
+    let id_a = register_document(&state, "Doc A").await;
+    let id_b = register_document(&state, "Doc B").await;
+
+    // Seed each document's notebook at the store, bypassing the handlers so
+    // the read path is the only thing under test.
+    state
+        .blackboard
+        .add(
+            &id_a,
+            &crate::blackboard::BlackboardScope::Document,
+            None,
+            "line in A".to_string(),
+            crate::blackboard::LineAuthor::Agent,
+        )
+        .await;
+    state
+        .blackboard
+        .add(
+            &id_b,
+            &crate::blackboard::BlackboardScope::Document,
+            None,
+            "line in B".to_string(),
+            crate::blackboard::LineAuthor::Agent,
+        )
+        .await;
+    *state.active_document.write().await = id_b.clone();
+
+    let (status, body) = dispatch(
+        &state,
+        Request::builder()
+            .method(Method::GET)
+            .uri("/api/blackboard")
+            .header(DOCUMENT_HEADER_WIRE, &id_a)
+            .body(Body::empty())
+            .expect("static request must build"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "bound read must 200; body = {body}");
+    assert_eq!(
+        body["lines"].as_array().map(Vec::len),
+        Some(1),
+        "bound read must serve exactly A's notebook; body = {body}"
+    );
+    assert_eq!(
+        body["lines"][0]["text"], "line in A",
+        "bound read served the WRONG document's notebook; body = {body}"
+    );
+}
+
+/// An unknown document id is a typed 404 (`DocumentNotFound`), never a
+/// silent fallback to the global. A stale binding is exactly the condition
+/// this feature exists to catch; quietly serving some OTHER document would
+/// reproduce the defect with extra steps.
+#[tokio::test]
+async fn unknown_bound_document_is_a_typed_404() {
+    let state = make_test_state().await;
+    let (status, body) = dispatch(
+        &state,
+        blackboard_post("into the void", Some("no-such-document")),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "an unknown bound document must 404; body = {body}"
+    );
+    assert_eq!(
+        body["error_code"], "document_not_found",
+        "the refusal must be the typed document error, not a bare status; \
+         body = {body}"
+    );
+    assert_eq!(
+        body["details"]["document_id"], "no-such-document",
+        "the refusal must name the id that was not found; body = {body}"
+    );
+}
+
+/// A present-but-undecodable header value is a typed 400, NOT a fallback.
+/// This is where the `X-Roshera-Intent` precedent deliberately diverges:
+/// an undecodable intent is treated as absent because a missing provenance
+/// facet is honest, but silently answering from the global document when
+/// the client demonstrably TRIED to bind elsewhere is the silent wrong
+/// answer this task removes.
+#[tokio::test]
+async fn undecodable_bound_document_is_refused_not_defaulted() {
+    let state = make_test_state().await;
+    let (status, body) = dispatch(
+        &state,
+        Request::builder()
+            .method(Method::POST)
+            .uri("/api/blackboard/entries")
+            .header("content-type", "application/json")
+            .header(
+                DOCUMENT_HEADER_WIRE,
+                axum::http::HeaderValue::from_bytes(b"doc-\xff\xfe")
+                    .expect("opaque bytes are a legal header value"),
+            )
+            .body(Body::from(json!({ "text": "x" }).to_string()))
+            .expect("static request must build"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a non-ASCII binding must be refused; body = {body}"
+    );
+}
+
+/// BACKWARD COMPATIBILITY, pinned: no header → the process-global document,
+/// exactly as before. The viewport, the WebSocket surface and every
+/// existing REST client send no such header, so this is the path almost all
+/// live traffic still takes. It is also the reason the fallback is NEVER
+/// validated against the catalog: the default `DURABILITY_SESSION_ID` has
+/// no registry row in a fresh fixture (and had none in production before
+/// `ensure_default_document_registered` ran), so validating it would 404
+/// the entire legacy surface.
+#[tokio::test]
+async fn absent_document_header_keeps_the_legacy_global_behaviour() {
+    let state = make_test_state().await;
+    let global = state.active_document.read().await.clone();
+    assert_eq!(
+        global,
+        crate::durability::DURABILITY_SESSION_ID,
+        "fixture must start on the pre-documents default"
+    );
+
+    let (status, body) = dispatch(&state, blackboard_post("legacy client", None)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "an unbound write must behave exactly as before; body = {body}"
+    );
+
+    let snapshot = state.blackboard.document_snapshot(&global).await;
+    assert_eq!(
+        snapshot.lines.len(),
+        1,
+        "an unbound write must land in the process-global document"
+    );
+}
+
+// =====================================================================
 // AMBIENT VERIFICATION — the full soundness certificate is automatic on
 // every mutating endpoint (not an opt-in `ground_truth` call).
 //
