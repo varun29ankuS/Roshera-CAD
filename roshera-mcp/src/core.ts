@@ -83,6 +83,43 @@ function intentHeaders(): Record<string, string> {
   };
 }
 
+// ─── Session→document binding (2026-08-10) ──────────────────────────────
+//
+// Binds the goose session to its BIRTH document — the one active at process
+// start — so a human opening another tab and switching the active document
+// cannot silently retarget an in-flight agent mid-task. Read once at startup
+// (index.ts fires `bindSessionDocument()` right after connect, alongside
+// `consumeRegistry()`); every subsequent `api()` call carries it.
+let boundDocument: string | null = null;
+
+/**
+ * RAW fetch (never `api()` — `api()` itself calls `documentHeaders()` below,
+ * so routing this through `api()` would be a self-referential bootstrap) of
+ * the document list; binds to whichever one is `active` at this moment. Best-
+ * effort: any failure (network, non-OK status, no active document) leaves
+ * `boundDocument` null, which is LEGACY behaviour — every call goes out
+ * unbound, exactly as it did before this existed.
+ */
+export async function bindSessionDocument(): Promise<void> {
+  try {
+    const res = await fetch(`${BASE}/api/documents`, {
+      headers: { ...AUTH_HEADERS },
+      signal: AbortSignal.timeout(PERCEPTION_TIMEOUT_MS),
+    });
+    if (!res.ok) return;
+    const docs = await res.json();
+    if (!Array.isArray(docs)) return;
+    boundDocument = docs.find((d: any) => d?.active)?.id ?? null;
+  } catch {
+    // swallow — unbound is legacy behaviour, never a hard failure.
+  }
+}
+
+/** The bound-document header for one backend call, or `{}` when unbound. */
+function documentHeaders(): Record<string, string> {
+  return boundDocument === null ? {} : { "X-Roshera-Document": boundDocument };
+}
+
 export async function api(
   method: "GET" | "POST" | "PATCH" | "DELETE",
   path: string,
@@ -100,6 +137,8 @@ export async function api(
         "X-Roshera-Agent": "Claude",
         // Intent provenance: the open checkpoint phrase, when one exists.
         ...intentHeaders(),
+        // Session→document binding: the birth-document id, when bound.
+        ...documentHeaders(),
         // Credential (empty object when ROSHERA_API_KEY is unset).
         ...AUTH_HEADERS,
         ...(body !== undefined ? { "Content-Type": "application/json" } : {}),

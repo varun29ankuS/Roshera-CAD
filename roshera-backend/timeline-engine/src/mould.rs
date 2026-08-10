@@ -329,6 +329,10 @@ impl OverrideSet {
             for (param, value) in applicable {
                 if set_numeric_recursive(inner, param, value) {
                     changed = true;
+                    // A moulded event must state ONE value. Where the record
+                    // encodes the same quantity twice, re-state the textual
+                    // sibling too — see `reconcile_redundant_encodings`.
+                    reconcile_redundant_encodings(inner, param, value);
                 }
             }
         }
@@ -371,6 +375,94 @@ fn find_numeric_recursive(value: &Value, key: &str) -> bool {
         Value::Array(arr) => arr.iter().any(|v| find_numeric_recursive(v, key)),
         _ => false,
     }
+}
+
+/// Recorded quantities that some events encode TWICE: `(numeric key, sibling
+/// Debug-string key)`.
+///
+/// `fillet_edges` records both a numeric `radius` and
+/// `format!("{:?}", options.fillet_type)`. The profile is what the kernel
+/// actually applies, so replay reads it FIRST (#14 — pre-155cdff8 recorders
+/// wrote an untouched `FilletOptions::default()` 5.0 into `radius` while
+/// applying the profile's constant, and that stale scalar quarantined live
+/// documents with `Invalid radius: 5`).
+///
+/// `chamfer_edges` also records a `chamfer_type` string beside `distance1`,
+/// but its replay arm reads only the number and never parses the string, so
+/// there is nothing to keep in step; it is deliberately not listed here.
+const REDUNDANT_PROFILE_ENCODINGS: &[(&str, &str)] = &[("radius", "fillet_type")];
+
+/// After a numeric mould rewrites `key`, re-state any sibling textual
+/// encoding of the SAME quantity so the moulded event states one value.
+///
+/// Without this the mould would rewrite `radius` alone — `set_numeric_
+/// recursive` only touches numbers, and the profile is a string — leaving the
+/// moulded event carrying a fresh scalar next to a stale
+/// `fillet_type: "Constant(<old>)"`. That is exactly the two-truths shape #14
+/// exists to end, and because replay prefers the profile the user's edit
+/// would be discarded SILENTLY: the rebuild succeeds and returns the OLD
+/// radius. Measured before this landed — a mould of 1.0 → 0.5 rebuilt the 1.0
+/// blend (volume 63.14 instead of 63.79) with a clean certificate.
+///
+/// Only a `Constant(<x>)` profile is re-stated. `Variable(...)`,
+/// `VariableStations(...)`, `PerEdgeConstant(...)`, `PerEdgeProfile(...)`,
+/// `Chord(...)` and `Function(...)` encode no single constant that one scalar
+/// could replace, so they are left verbatim — replay does not parse them
+/// either, and falls back to the moulded scalar.
+fn reconcile_redundant_encodings(value: &mut Value, key: &str, new_value: f64) -> bool {
+    let Some(profile_key) = REDUNDANT_PROFILE_ENCODINGS
+        .iter()
+        .find(|(numeric, _)| *numeric == key)
+        .map(|(_, profile)| *profile)
+    else {
+        return false;
+    };
+    restate_constant_profile(value, key, profile_key, new_value)
+}
+
+/// Depth-first: in every object that carries BOTH a numeric `numeric_key` and
+/// a `profile_key` string of the form `Constant(<x>)`, re-state the profile at
+/// `new_value` using the kernel's own Debug form (`{:?}` on the `f64`, which is
+/// what `FilletType`'s `Debug` emits and what `parse_fillet_constant_radius`
+/// parses back).
+fn restate_constant_profile(
+    value: &mut Value,
+    numeric_key: &str,
+    profile_key: &str,
+    new_value: f64,
+) -> bool {
+    let mut changed = false;
+    match value {
+        Value::Object(map) => {
+            let carries_pair = map.get(numeric_key).map(Value::is_number).unwrap_or(false)
+                && map
+                    .get(profile_key)
+                    .and_then(Value::as_str)
+                    .map(|s| s.starts_with("Constant(") && s.ends_with(')'))
+                    .unwrap_or(false);
+            if carries_pair {
+                map.insert(
+                    profile_key.to_string(),
+                    json!(format!("Constant({:?})", new_value)),
+                );
+                changed = true;
+            }
+            for (_, v) in map.iter_mut() {
+                if restate_constant_profile(v, numeric_key, profile_key, new_value) {
+                    changed = true;
+                }
+            }
+        }
+        Value::Array(arr) => {
+            for v in arr.iter_mut() {
+                if restate_constant_profile(v, numeric_key, profile_key, new_value) {
+                    changed = true;
+                }
+            }
+        }
+        _ => {}
+    }
+    changed
 }
 
 /// Depth-first set: replace every numeric-valued occurrence of object key `key`

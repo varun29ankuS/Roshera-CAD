@@ -54,8 +54,21 @@ export const SWITCHABLE_BENCHES: Bench[] = [
  * core+meta (21) past the original 35 — MINIMAL_SURFACE(21) + 15 = 36. Raised
  * by exactly the overshoot rather than left as a hard 35, per the "soft
  * ceiling" framing above: an attention budget, not a hard capability gate.
+ *
+ * 36 -> 45 (2026-08-10, task #12): the psketch_* family (10 tools) joined
+ * CORE_SURFACE, so MINIMAL_SURFACE grew 21 -> 31. `exposedNames()` is now
+ * deduped (a core∩bench member — blackboard_add_entry, timeline_checkpoint,
+ * or a psketch_* tool — is never double-counted), so the formula per bench is
+ * MINIMAL_SURFACE(31) + that-bench's-own-count - its-overlap-with-core. Every
+ * bench's live count, measured after dedup: sketch 36 (31+15-10 psketch_*
+ * overlap), timeline 45 (31+15-1 timeline_checkpoint overlap), labels 41
+ * (31+11-1 blackboard_add_entry overlap), analysis 45 (31+14, zero overlap),
+ * assembly 43 (31+12, zero overlap), drawing 39 (31+8, zero overlap),
+ * core_only 31. Max is 45 (analysis and timeline tie). Raised to the new
+ * measured max, same "raised by exactly the overshoot" policy as the
+ * original 35->36 move.
  */
-export const LIVE_SURFACE_CEILING = 36;
+export const LIVE_SURFACE_CEILING = 45;
 
 /** Callback that flips real server tool handles on a bench switch. */
 export type ApplyTransition = (toEnable: string[], toDisable: string[]) => void;
@@ -111,14 +124,23 @@ export class Workbench {
     return this.minimalSurface.filter((n) => this.table.has(n));
   }
 
-  /** The names currently exposed as live MCP tools for the active state. */
+  /**
+   * The names currently exposed as live MCP tools for the active state.
+   * Deduped (2026-08-10): a tool can be BOTH core-resident and bench-
+   * classified (blackboard_add_entry, timeline_checkpoint, and now the whole
+   * psketch_* family — 10 of 'sketch's 15 tools) since index.ts mounts a
+   * core∩bench member once and never disables it on a bench switch. Returning
+   * it twice here would double-count it in `status().exposed_count` AND in
+   * `billFor`'s token sum (billFor sums this array, so a duplicate name pays
+   * its token cost twice) — an over-report, not a real second tool.
+   */
   exposedNames(): string[] {
     if (this.mode === "full") {
       return this.table.names().filter((n) => metaFor(n).bench !== "meta");
     }
     const core = this.minimalPresent();
     const bench = this.active ? this.benchToolNames(this.active) : [];
-    return [...core, ...bench];
+    return [...new Set([...core, ...bench])];
   }
 
   private benchCounts(): Record<string, number> {

@@ -116,11 +116,18 @@ console.log("(s) SURFACE: kb_lookup in the FULL table only; minimal bill unmoved
   // (gates.ts gate 5) now enforces what those words used to ask. kb_lookup's
   // own zero-marginal-cost claim is untouched — it remains in neither
   // CORE_SURFACE nor META_SURFACE.
+  // Pin moved 4978 -> 7797 (2026-08-10, task #12, decided): the psketch_*
+  // family (10 tools) joined CORE_SURFACE (surface.ts) -- +2819 tokens, all
+  // psketch schema weight, none of it kb_lookup's. See test/scale_s2.mjs's
+  // matching bill-target comment for the full provenance of the +2819.
+  // kb_lookup's own zero-marginal-cost claim is untouched by this move either
+  // -- it remains in neither CORE_SURFACE nor META_SURFACE, so the whole delta
+  // is attributable to psketch_* residency, not to kb_lookup.
   const minimalBill = billFor(table, MINIMAL_SURFACE);
-  if (minimalBill === 4978)
-    pass(`minimal bill ${minimalBill} == pin 4978 (kb_lookup's zero marginal cost holds)`);
+  if (minimalBill === 7797)
+    pass(`minimal bill ${minimalBill} == pin 7797 (kb_lookup's zero marginal cost holds)`);
   else
-    fail(`minimal bill ${minimalBill} != 4978 — something moved the resident surface`);
+    fail(`minimal bill ${minimalBill} != 7797 — something moved the resident surface`);
 }
 
 // ── (p) PROVENANCE ──────────────────────────────────────────────────────────

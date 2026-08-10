@@ -27,7 +27,7 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { BASE, AUTH_HEADERS } from "./core.js";
+import { BASE, AUTH_HEADERS, bindSessionDocument } from "./core.js";
 import { RegisteredTool, canonicalJson, fnv1a64hex } from "./registry.js";
 import { setRegistryWarning } from "./metatools.js";
 import {
@@ -237,4 +237,8 @@ await server.connect(transport);
 // Registry consumption is best-effort and must not gate startup; run it after
 // connect so the surface is live immediately even if the backend is slow/down.
 void consumeRegistry();
+// Bind this session to its birth document (core.ts) — so a human opening a
+// tab and switching the active document cannot retarget this agent mid-task.
+// Best-effort, same reasoning: never gate startup on it.
+void bindSessionDocument();
 console.error(`roshera-mcp connected (API: ${BASE})`);

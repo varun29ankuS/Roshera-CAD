@@ -1294,14 +1294,40 @@ fn dispatch_generic(
             // recorded PID fall back to the transient-remap liveness check.
             let recorded_pids = parse_recorded_edge_pids(inner);
             let edge_ids = bind_blend_edges(model, kind, &edge_ids, &recorded_pids)?;
-            // Prefer the structured `radius` field added in 2026-05-10;
-            // fall back to parsing the Debug-formatted `fillet_type`
-            // string for events recorded by older builds. Final fallback
-            // is the FilletOptions default radius.
-            let radius = inner
-                .get("radius")
-                .and_then(|v| v.as_f64())
-                .or_else(|| parse_fillet_constant_radius(inner))
+            // The APPLIED radius, `fillet_type` first (#14).
+            //
+            // `fillet_type` is the profile the kernel actually executes:
+            // `validate_fillet_inputs` and the blend surgery both read the
+            // radius out of it, and `options.radius` is a secondary field
+            // that uniform-constant callers (`/api/geometry/fillet`, the MCP
+            // surface) leave at the `FilletOptions::default()` value of 5.0.
+            // Recorders older than 155cdff8 wrote that untouched field into
+            // `"radius"`, so EVERY such event on disk states two different
+            // radii — and the scalar is the wrong one. Reading it rebuilt a
+            // 5.0 blend: infeasible on the measured flange/lap-joint parts
+            // (`Invalid radius: 5` → the whole document quarantined), and on
+            // a part where 5.0 happened to fit it would have silently
+            // rebuilt a WRONG-SIZED blend.
+            //
+            // Preferring `fillet_type` heals those events without guessing:
+            // the field has carried `format!("{:?}", options.fillet_type)`
+            // continuously since the fillet record block was introduced, so
+            // no on-disk event has the lying scalar WITHOUT the honest
+            // profile beside it. Where both are present and honest (recorder
+            // ≥ 155cdff8) they name the same number, so this is a no-op.
+            //
+            // The `radius` scalar remains the fallback for the two classes
+            // that carry no parsable constant profile:
+            //   * truly-old events recorded before the `radius` key existed
+            //     — there `fillet_type` is the only source anyway; and
+            //   * non-Constant profiles (`Variable(`, `VariableStations(`,
+            //     `PerEdgeConstant(`, `PerEdgeProfile(`, `Function(`,
+            //     `Chord(`), none of which `parse_fillet_constant_radius`
+            //     matches. Those replay as a single constant either way —
+            //     the pre-existing lossiness documented on that parser, not
+            //     something precedence can fix.
+            let radius = parse_fillet_constant_radius(inner)
+                .or_else(|| inner.get("radius").and_then(|v| v.as_f64()))
                 .unwrap_or(1.0);
             let options = FilletOptions {
                 fillet_type: FilletType::Constant(radius),
@@ -3399,6 +3425,380 @@ mod tests {
         assert_eq!(
             outcome.events_skipped, 1,
             "malformed op event must be skipped"
+        );
+    }
+
+    // ==================================================================
+    // Task #14 — HISTORICAL FILLET RADIUS PRECEDENCE.
+    //
+    // Before 155cdff8 the kernel recorded `"radius": options.radius` —
+    // the SECONDARY `FilletOptions` field, which every uniform-constant
+    // caller (`/api/geometry/fillet`, the MCP surface) leaves at the
+    // `FilletOptions::default()` value of 5.0 — while it APPLIED the
+    // constant carried in `options.fillet_type`. Each such event on disk
+    // therefore states two different radii and replay read the wrong one:
+    // on the measured flange/lap-joint parts a 5.0 blend is infeasible,
+    // so the event broke with `Invalid radius: 5` and the document was
+    // quarantined; on a part where 5.0 happened to fit it would have
+    // silently rebuilt a WRONG-SIZED blend.
+    //
+    // The truth is recoverable. Verified from the raw pre-fix blob
+    // (`git show 155cdff8^:roshera-backend/geometry-engine/src/operations/
+    // fillet.rs`): the record has carried
+    // `"fillet_type": format!("{:?}", options.fillet_type)` continuously
+    // since the record block was introduced, and `"radius"` was added
+    // LATER. So there is no on-disk class that has the lying scalar
+    // without the honest `fillet_type` beside it, and the heal is a
+    // precedence change — not a guess.
+    //
+    // Replay therefore reads `fillet_type` FIRST and only falls back to
+    // the `radius` scalar when the event carries no parsable constant
+    // profile — which covers both the truly-old (pre-`radius`) events and
+    // the non-Constant profile kinds, whose Debug forms
+    // (`Variable(`, `VariableStations(`, `PerEdgeConstant(`,
+    // `PerEdgeProfile(`, `Function(`, `Chord(`) are all distinct from
+    // `Constant(` and so never match the parser.
+    // ==================================================================
+
+    /// A 4×4×4 box event. `validate_fillet_parameters` rejects a 5.0
+    /// radius on this box (its edges are 4 mm) and accepts 0.5, so the
+    /// lie and the truth are separated by a hard kernel refusal.
+    ///
+    /// The recorded solid output is deliberately `solid:100` so the
+    /// id-remap entry for the box can never collide with the small live
+    /// edge id the fillet event references.
+    fn task14_box4(seq: u64) -> TimelineEvent {
+        let mut e = mk_event(
+            "create_box_3d",
+            serde_json::json!({
+                "params": { "Create3D": {
+                    "primitive_type": "box",
+                    "parameters": { "width": 4.0, "height": 4.0, "depth": 4.0 },
+                    "timestamp": 0
+                }},
+                "inputs": [], "outputs": ["solid:100"]
+            }),
+        );
+        e.sequence_number = seq;
+        e
+    }
+
+    /// The first open (non-loop) edge of the replayed box — the same
+    /// deterministic id the recorder would have written.
+    fn task14_box_edge() -> EdgeId {
+        let mut m = BRepModel::new();
+        rebuild_model_from_events(&mut m, &[task14_box4(0)]);
+        let edge = m
+            .edges
+            .iter()
+            .find(|(_, e)| !e.is_loop())
+            .map(|(id, _)| id)
+            .expect("a box has open edges");
+        edge
+    }
+
+    fn task14_only_solid(model: &BRepModel) -> SolidId {
+        model
+            .solids
+            .iter()
+            .next()
+            .map(|(id, _)| id)
+            .expect("the replayed model owns exactly one solid")
+    }
+
+    fn task14_volume(model: &mut BRepModel, solid: SolidId) -> f64 {
+        model
+            .calculate_solid_volume(solid)
+            .expect("the filleted box has a computable volume")
+    }
+
+    /// The volume the kernel ACTUALLY produces for a `Constant(r)` fillet
+    /// on the box's first open edge, obtained by calling `fillet_edges`
+    /// directly. Used as the oracle instead of an analytic figure so the
+    /// assertion pins "replay applied r", not "the blend surface matches
+    /// my closed form".
+    fn task14_reference_volume(r: f64) -> f64 {
+        let mut m = BRepModel::new();
+        rebuild_model_from_events(&mut m, &[task14_box4(0)]);
+        let solid = task14_only_solid(&m);
+        let edge = task14_box_edge();
+        fillet_edges(
+            &mut m,
+            solid,
+            vec![edge],
+            FilletOptions {
+                fillet_type: FilletType::Constant(r),
+                radius: r,
+                ..FilletOptions::default()
+            },
+        )
+        .unwrap_or_else(|e| panic!("reference Constant({r}) fillet must construct: {e}"));
+        task14_volume(&mut m, solid)
+    }
+
+    /// Build `[box, fillet_edges]` where the fillet event's `params` are
+    /// exactly `params`, and certify the rebuild.
+    fn task14_replay_fillet(
+        params: serde_json::Value,
+    ) -> (BRepModel, crate::rebuild_certificate::RebuildCertificate) {
+        let edge = task14_box_edge();
+        let mut inner = params;
+        if let Some(obj) = inner.as_object_mut() {
+            obj.insert("solid_id".to_string(), serde_json::json!(100));
+        }
+        let mut fillet = mk_event(
+            "fillet_edges",
+            serde_json::json!({
+                "params": inner,
+                "inputs": ["solid:100", format!("edge:{edge}")],
+                "outputs": ["solid:100"]
+            }),
+        );
+        fillet.sequence_number = 1;
+        crate::rebuild_certificate::certify_rebuild(&[task14_box4(0), fillet], None)
+    }
+
+    /// RED (task #14): an OLD-FORMAT event — the exact shape the pre-
+    /// 155cdff8 recorder wrote for a `/api/geometry/fillet` R0.5 request:
+    /// `fillet_type` = `"Constant(0.5)"` (the applied profile) alongside
+    /// `radius` = 5.0 (the untouched `FilletOptions` default). Replay
+    /// must rebuild the 0.5 blend the kernel actually applied.
+    ///
+    /// Against the pre-fix precedence this fails as
+    /// `Failed { reason: "kernel error in fillet_edges: Invalid radius: 5" }`
+    /// — byte-for-byte the live quarantine signature.
+    ///
+    /// Mutation proof: restore `inner.get("radius")` as the FIRST source
+    /// in the `fillet_edges` arm and this regresses to that exact break.
+    #[test]
+    fn old_format_fillet_event_replays_the_applied_constant_not_the_lying_radius() {
+        let (mut model, cert) = task14_replay_fillet(serde_json::json!({
+            "fillet_type": "Constant(0.5)",
+            "radius": 5.0,
+            "propagation": "Tangent",
+            "preserve_edges": true,
+            "quality": "Standard"
+        }));
+
+        assert!(
+            cert.first_break().is_none(),
+            "an old-format fillet event carries its applied radius in \
+             `fillet_type`; replay must heal it instead of quarantining the \
+             document. Break: {:?}",
+            cert.first_break()
+        );
+
+        let solid = task14_only_solid(&model);
+        let replayed = task14_volume(&mut model, solid);
+        let expected = task14_reference_volume(0.5);
+        assert!(
+            (replayed - expected).abs() < 1e-9,
+            "replay must apply the fillet_type constant 0.5 (volume {expected}), \
+             not the recorded scalar or a default; got {replayed}"
+        );
+        // Discriminator: the 1.0 fallback (`unwrap_or(1.0)`) and the 0.5
+        // truth must not be confusable.
+        assert!(
+            (replayed - task14_reference_volume(1.0)).abs() > 1e-6,
+            "the 0.5 and 1.0 blends must be volumetrically distinguishable, \
+             otherwise this test cannot see a fallback"
+        );
+    }
+
+    /// GUARD: a NEW-format event (recorder ≥ 155cdff8, where `radius`
+    /// already equals the applied constant) replays byte-identically
+    /// under the new precedence — both sources name 0.5.
+    #[test]
+    fn new_format_fillet_event_is_unchanged_by_the_precedence_flip() {
+        let (mut model, cert) = task14_replay_fillet(serde_json::json!({
+            "fillet_type": "Constant(0.5)",
+            "radius": 0.5,
+            "propagation": "Tangent",
+            "preserve_edges": true,
+            "quality": "Standard"
+        }));
+        assert!(
+            cert.first_break().is_none(),
+            "new-format fillet must replay clean: {:?}",
+            cert.first_break()
+        );
+        let solid = task14_only_solid(&model);
+        let replayed = task14_volume(&mut model, solid);
+        assert!(
+            (replayed - task14_reference_volume(0.5)).abs() < 1e-9,
+            "new-format replay must still apply 0.5; got {replayed}"
+        );
+    }
+
+    /// GUARD (the case the flip could actually regress): a NON-Constant
+    /// `fillet_type` must keep falling through to the `radius` scalar.
+    /// `PerEdgeConstant(...)` is the adversarial string — it *ends* in a
+    /// constant-looking payload and contains the substring `Constant(`,
+    /// so a prefix check written as `contains` instead of `strip_prefix`
+    /// would reroute this event onto the per-edge value (2.0) instead of
+    /// the recorded default (0.5). The numbers are deliberately different
+    /// so the test can tell them apart.
+    #[test]
+    fn non_constant_fillet_type_still_falls_back_to_the_radius_scalar() {
+        for fillet_type in [
+            "PerEdgeConstant([(3, 2.0)])",
+            "Variable(2.0, 3.0)",
+            "VariableStations([(0.0, 2.0), (1.0, 3.0)])",
+            "PerEdgeProfile([(3, Radius(Constant(2.0)))])",
+            "Chord(2.0)",
+            "Function(\"<function>\")",
+        ] {
+            let (mut model, cert) = task14_replay_fillet(serde_json::json!({
+                "fillet_type": fillet_type,
+                "radius": 0.5,
+                "propagation": "Tangent",
+                "preserve_edges": true,
+                "quality": "Standard"
+            }));
+            assert!(
+                cert.first_break().is_none(),
+                "a non-Constant `fillet_type` ({fillet_type}) must fall back to \
+                 the recorded radius scalar, not break: {:?}",
+                cert.first_break()
+            );
+            let solid = task14_only_solid(&model);
+            let replayed = task14_volume(&mut model, solid);
+            assert!(
+                (replayed - task14_reference_volume(0.5)).abs() < 1e-9,
+                "`{fillet_type}` carries no parsable constant profile, so replay \
+                 must use the 0.5 scalar — never a number scraped out of the \
+                 Debug string; got {replayed}"
+            );
+        }
+    }
+
+    /// GUARD: a TRULY-old event (recorded before the `radius` key
+    /// existed, i.e. at or before 26ddf33c) carries only `fillet_type`.
+    /// The parse path is the ONLY source and must still work.
+    #[test]
+    fn truly_old_fillet_event_without_radius_key_uses_the_fillet_type_constant() {
+        let (mut model, cert) = task14_replay_fillet(serde_json::json!({
+            "fillet_type": "Constant(0.5)",
+            "propagation": "Tangent"
+        }));
+        assert!(
+            cert.first_break().is_none(),
+            "a pre-`radius` event must replay from `fillet_type`: {:?}",
+            cert.first_break()
+        );
+        let solid = task14_only_solid(&model);
+        let replayed = task14_volume(&mut model, solid);
+        assert!(
+            (replayed - task14_reference_volume(0.5)).abs() < 1e-9,
+            "pre-`radius` replay must apply 0.5; got {replayed}"
+        );
+    }
+
+    /// GUARD (#14 interaction with `param.mould`): a radius mould rewrites
+    /// the NUMERIC `radius` key only — `set_numeric_recursive` cannot touch
+    /// the Debug-formatted `fillet_type` STRING beside it. So a moulded
+    /// fillet event carries a fresh scalar next to a stale profile, and a
+    /// naive "fillet_type always wins" precedence would silently discard
+    /// the user's edit and rebuild the OLD radius. The moulded scalar is
+    /// authored AFTER the record, so it must win.
+    #[test]
+    fn a_radius_mould_beats_the_recorded_fillet_type_profile() {
+        let edge = task14_box_edge();
+        let mut fillet = mk_event(
+            "fillet_edges",
+            serde_json::json!({
+                "params": {
+                    "solid_id": 100,
+                    // What the kernel recorded when the fillet was authored
+                    // at R1.0 — both encodings agree at record time.
+                    "fillet_type": "Constant(1.0)",
+                    "radius": 1.0,
+                    "propagation": "Tangent"
+                },
+                "inputs": ["solid:100", format!("edge:{edge}")],
+                "outputs": ["solid:100"]
+            }),
+        );
+        fillet.sequence_number = 1;
+        let mut mould = mk_event(crate::mould::MOULD_COMMAND, serde_json::json!(null));
+        mould.operation = crate::mould::mould_operation(1, None, "radius", 0.5);
+        mould.sequence_number = 2;
+
+        let (mut model, cert) =
+            crate::rebuild_certificate::certify_rebuild(&[task14_box4(0), fillet, mould], Some(1));
+        assert!(
+            cert.first_break().is_none(),
+            "the moulded fillet must rebuild: {:?}",
+            cert.first_break()
+        );
+        let solid = task14_only_solid(&model);
+        let replayed = task14_volume(&mut model, solid);
+        assert!(
+            (replayed - task14_reference_volume(0.5)).abs() < 1e-9,
+            "a `radius` mould to 0.5 must be APPLIED, not silently overruled by \
+             the stale recorded `fillet_type` Constant(1.0); expected the 0.5 \
+             volume {}, got {replayed}",
+            task14_reference_volume(0.5)
+        );
+    }
+
+    /// GUARD: a radius mould on a NON-Constant `fillet_type` must leave the
+    /// profile string verbatim (there is no single constant a scalar could
+    /// replace) and simply apply the moulded scalar — the pre-existing
+    /// constant-only reconstruction, unchanged by #14.
+    #[test]
+    fn a_radius_mould_on_a_non_constant_profile_applies_the_scalar() {
+        let edge = task14_box_edge();
+        let mut fillet = mk_event(
+            "fillet_edges",
+            serde_json::json!({
+                "params": {
+                    "solid_id": 100,
+                    "fillet_type": "Variable(2.0, 3.0)",
+                    "radius": 1.0,
+                    "propagation": "Tangent"
+                },
+                "inputs": ["solid:100", format!("edge:{edge}")],
+                "outputs": ["solid:100"]
+            }),
+        );
+        fillet.sequence_number = 1;
+        let mut mould = mk_event(crate::mould::MOULD_COMMAND, serde_json::json!(null));
+        mould.operation = crate::mould::mould_operation(1, None, "radius", 0.5);
+        mould.sequence_number = 2;
+
+        let (mut model, cert) =
+            crate::rebuild_certificate::certify_rebuild(&[task14_box4(0), fillet, mould], Some(1));
+        assert!(
+            cert.first_break().is_none(),
+            "the moulded non-Constant fillet must rebuild: {:?}",
+            cert.first_break()
+        );
+        let solid = task14_only_solid(&model);
+        let replayed = task14_volume(&mut model, solid);
+        assert!(
+            (replayed - task14_reference_volume(0.5)).abs() < 1e-9,
+            "a non-Constant profile carries no parsable constant, so the moulded \
+             0.5 scalar must be applied; got {replayed}"
+        );
+    }
+
+    /// GUARD: an event with ONLY the `radius` scalar and no `fillet_type`
+    /// at all — the shape the in-repo `rebuild_certificate` fixtures use
+    /// — must keep replaying off that scalar.
+    #[test]
+    fn fillet_event_with_only_a_radius_scalar_still_replays_from_it() {
+        let (mut model, cert) = task14_replay_fillet(serde_json::json!({ "radius": 0.5 }));
+        assert!(
+            cert.first_break().is_none(),
+            "a radius-only fillet event must replay: {:?}",
+            cert.first_break()
+        );
+        let solid = task14_only_solid(&model);
+        let replayed = task14_volume(&mut model, solid);
+        assert!(
+            (replayed - task14_reference_volume(0.5)).abs() < 1e-9,
+            "radius-only replay must apply 0.5; got {replayed}"
         );
     }
 }

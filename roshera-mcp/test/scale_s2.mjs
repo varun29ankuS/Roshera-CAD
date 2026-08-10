@@ -89,7 +89,7 @@ console.log("(d) HASH: TS FNV-1a-64 reproduces canonical reference vectors");
 }
 
 // ── (b) Surface flip (pure) ──────────────────────────────────────────────────
-console.log("(b) SURFACE: minimal exposes 21, full exposes 107");
+console.log("(b) SURFACE: minimal exposes 31, full exposes 107");
 const table = buildTable();
 {
   // S3/S4 added 2 core composition tools (workbench + cad_program): 90 kernel
@@ -116,18 +116,22 @@ const table = buildTable();
   // dfm_check touches (dfm_check is not in CORE_SURFACE/MINIMAL_SURFACE): the
   // 88e458c9 "blackboard" commit added `blackboard_add_entry` to CORE_SURFACE
   // without updating this test's pinned "17"s. Corrected to match reality.
+  // Pin moved 18/21 -> 28/31 (2026-08-10, task #12, decided): the whole
+  // psketch_* family (10 tools: begin/add_entity/constrain/solve/certify/dof/
+  // op/extrude/revolve/plane_from_face) joined CORE_SURFACE — see surface.ts's
+  // comment on the addition for why.
   const minimal = exposedNamesFor(table, "minimal");
-  if (minimal.length === 21) pass("minimal surface exposes exactly 21 tools");
-  else fail(`minimal surface exposes ${minimal.length}, expected 21`);
+  if (minimal.length === 31) pass("minimal surface exposes exactly 31 tools");
+  else fail(`minimal surface exposes ${minimal.length}, expected 31`);
 
   const minimalSet = new Set(minimal);
   const expectedSet = new Set(MINIMAL_SURFACE);
   if (minimal.length === expectedSet.size && [...expectedSet].every((n) => minimalSet.has(n)))
-    pass("minimal surface = the 18 core + 3 meta names exactly");
+    pass("minimal surface = the 28 core + 3 meta names exactly");
   else fail(`minimal surface names differ: ${minimal.join(",")}`);
 
-  if (CORE_SURFACE.length === 18) pass("core list is 18 tools (16 verbs + workbench + cad_program)");
-  else fail(`core list is ${CORE_SURFACE.length}, expected 18`);
+  if (CORE_SURFACE.length === 28) pass("core list is 28 tools (16 verbs + workbench + cad_program + 10 psketch_*)");
+  else fail(`core list is ${CORE_SURFACE.length}, expected 28`);
   if (META_SURFACE.length === 3) pass("meta list is 3 tools");
   else fail(`meta list is ${META_SURFACE.length}, expected 3`);
 
@@ -138,12 +142,30 @@ const table = buildTable();
     pass("full surface omits the meta-tools (they are the minimal-surface mechanism)");
   else fail("full surface unexpectedly includes meta-tools");
 
-  // The MEASURE — bills. Minimal target <5k tokens; full is the worst-client bill.
+  // The MEASURE — bills. Minimal target <8k tokens; full is the worst-client bill.
+  //
+  // Target moved 5000 -> 8000 (2026-08-10, task #12). Split the provenance:
+  // Varun decided (task #12) to make psketch_* resident and to ACCEPT its
+  // token cost — he did not pick "8000". Making the family resident
+  // (surface.ts) measures minimal at 7797 — +2819 over the prior 4978 pin
+  // (test/kb_lookup.mjs's own minimalBill pin, same table). The 2819 is the
+  // family's real schema weight (psketch_add_entity/extrude/op/constrain/
+  // revolve carry union-typed entity/constraint/op documentation IN the
+  // description, same wire-contract-heavy shape the budget gate
+  // (tools/mcp_budget_gate.py) already allowlists for revolve/assembly_mate/
+  // drill_pattern) — not fat: no redundant wording was found to trim without
+  // deleting the per-kind param docs an agent needs to call these tools
+  // correctly on the first try. The specific new ceiling (8000) is THIS
+  // re-pin's own derivation, not a Varun-picked number: it matches the
+  // CI-authoritative BILL_BUDGET already in mcp_budget_gate.py, so 7797 is
+  // measured to comfortably clear the gate that actually ships, and this test
+  // is raised to match that number rather than invent a second, disagreeing
+  // ceiling.
   const minimalBill = billFor(table, MINIMAL_SURFACE);
   const fullBill = billFor(table, table.names());
   console.log(`      token bill: minimal=${minimalBill}, full=${fullBill}`);
-  if (minimalBill < 5000) pass(`minimal token bill ${minimalBill} < 5000 target`);
-  else fail(`minimal token bill ${minimalBill} exceeds the 5000 target`);
+  if (minimalBill < 8000) pass(`minimal token bill ${minimalBill} < 8000 target`);
+  else fail(`minimal token bill ${minimalBill} exceeds the 8000 target`);
   if (fullBill > minimalBill) pass(`full bill ${fullBill} > minimal ${minimalBill} (the flip pays off)`);
   else fail("full bill is not greater than minimal — measurement broken");
 }

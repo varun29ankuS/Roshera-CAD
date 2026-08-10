@@ -132,9 +132,16 @@ console.log("(w1b) WORKBENCH: 'timeline' is switchable (history/branching/certif
     pass(`enter('timeline') exposes ${timelineTools.length} timeline tools on top of core+meta (switched=true)`);
   else fail(`enter('timeline') did not expose timeline tools on top of core: switched=${r.switched}`);
 
-  if (r.exposed_count === MINIMAL_SURFACE.length + 15)
-    pass(`timeline exposed_count = ${r.exposed_count} = MINIMAL_SURFACE(${MINIMAL_SURFACE.length}) + 15`);
-  else fail(`timeline exposed_count ${r.exposed_count} ≠ ${MINIMAL_SURFACE.length + 15}`);
+  // Pin moved MINIMAL_SURFACE+15 -> MINIMAL_SURFACE+14 (2026-08-10, task #12):
+  // exposedNames() is now deduped (workbench.ts) so a core∩bench member is
+  // never counted twice. timeline_checkpoint is BOTH core-resident (surface.ts
+  // CORE_SURFACE) and bench:'timeline', so entering 'timeline' adds only its
+  // OTHER 14 tools on top of core — the +15 formula here used to pass by
+  // accident (the un-deduped double-count of timeline_checkpoint cancelled
+  // the arithmetic); it is now the honest count.
+  if (r.exposed_count === MINIMAL_SURFACE.length + 14)
+    pass(`timeline exposed_count = ${r.exposed_count} = MINIMAL_SURFACE(${MINIMAL_SURFACE.length}) + 14 (15 timeline tools, 1 already core-resident)`);
+  else fail(`timeline exposed_count ${r.exposed_count} ≠ ${MINIMAL_SURFACE.length + 14}`);
 
   const back = workbench.enter("core_only");
   const afterCore = new Set(workbench.exposedNames());
@@ -159,12 +166,28 @@ console.log("(w2) WORKBENCH switch changes the exposed set");
 
   const asmRes = workbench.enter("assembly");
   const afterAsm = new Set(workbench.exposedNames());
-  const sketchRetired = sketchTools.every((n) => !afterAsm.has(n));
+  // 2026-08-10 (task #12) split this into two invariants: a bench switch
+  // retires only the NON-resident sketch tools (5: create_sketch,
+  // sketch_add_shape, sketch_points, sketch_extrude, plane_from_face) — the
+  // other 10 (the whole psketch_* family) are ALSO core-resident
+  // (CORE_SURFACE, surface.ts) and must survive every bench switch, exactly
+  // like blackboard_add_entry/timeline_checkpoint already do. The old single
+  // "every sketch tool is gone" assertion is now FALSE BY DESIGN for those 10.
+  const nonResidentSketch = sketchTools.filter((n) => !MINIMAL_SURFACE.includes(n));
+  const sketchRetired = nonResidentSketch.every((n) => !afterAsm.has(n));
+  const residentSketch = sketchTools.filter((n) => MINIMAL_SURFACE.includes(n));
+  const residentsSurvive = residentSketch.every((n) => afterAsm.has(n));
   const asmTools = workbench.benchToolNames("assembly");
   const asmExposed = asmTools.every((n) => afterAsm.has(n));
-  if (sketchRetired && asmExposed)
-    pass("switching to 'assembly' retires the sketch bench and exposes assembly tools");
-  else fail(`switch to assembly did not retire sketch / expose assembly (sketchRetired=${sketchRetired}, asmExposed=${asmExposed})`);
+  if (sketchRetired && residentsSurvive && asmExposed)
+    pass(
+      `switching to 'assembly' retires the ${nonResidentSketch.length} non-resident sketch tools, ` +
+        `keeps the ${residentSketch.length} core-resident psketch_* ones live, and exposes assembly tools`,
+    );
+  else
+    fail(
+      `switch to assembly wrong (sketchRetired=${sketchRetired}, residentsSurvive=${residentsSurvive}, asmExposed=${asmExposed})`,
+    );
 
   const coreOnlyRes = workbench.enter("core_only");
   const afterCore = new Set(workbench.exposedNames());

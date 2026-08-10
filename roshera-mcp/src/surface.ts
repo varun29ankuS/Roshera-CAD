@@ -79,6 +79,31 @@ export const CORE_SURFACE = [
   // mounted enabled, excluded from benchHandles so a bench switch never
   // disables it.
   "timeline_checkpoint",
+  // The whole psketch_* family ADDED to residency (2026-08-10, decided):
+  // solver-backed sketching is a per-feature workflow (begin -> add_entity xN
+  // -> constrain -> solve -> certify/dof -> op -> extrude/revolve), so a
+  // sketch touches this family multiple times per feature -- every one of
+  // those calls used to pay a ~33k-token find_tool round-trip (the live
+  // provider replays full context on every meta-tool hop) for a ~700-
+  // token/turn cost, just to reach a tool that was going to be reached for
+  // again a few calls later. Making the family resident kills that round-trip
+  // at the root instead of caching around it. index.ts's core-bench handling
+  // (the blackboard_add_entry precedent above) is generic over any name in
+  // BOTH CORE_SURFACE and a switchable bench, so psketch_* needs no special-
+  // casing there: mounted enabled once, excluded from benchHandles, never
+  // disabled by a workbench switch away from 'sketch'. find_tool/describe_tool
+  // /invoke are unaffected (they rank/serve the FULL table regardless of
+  // residency).
+  "psketch_begin",
+  "psketch_add_entity",
+  "psketch_constrain",
+  "psketch_solve",
+  "psketch_certify",
+  "psketch_dof",
+  "psketch_op",
+  "psketch_extrude",
+  "psketch_revolve",
+  "psketch_plane_from_face",
 ];
 
 /** The 3 meta-tools — the fixed-cost funnel to the long tail. */

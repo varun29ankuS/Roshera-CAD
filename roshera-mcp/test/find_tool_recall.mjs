@@ -75,9 +75,10 @@ const CASES = [
   { query: "show me the design history", expected: "timeline_history" },
   { query: "branch off so I can try an alternative", expected: "timeline_branch" },
   { query: "merge my experiment back into main", expected: "timeline_merge" },
-  // ── sketch constraints (long tail) ──
-  { query: "make these two sketch lines perpendicular", expected: "psketch_constrain" },
-  { query: "how many degrees of freedom are left in the sketch", expected: "psketch_dof" },
+  // ── sketch constraints (2026-08-10: psketch_* joined CORE_SURFACE — task
+  //    #12 — so these are core controls now, not long tail; see surface.ts) ──
+  { query: "make these two sketch lines perpendicular", expected: "psketch_constrain", core: true },
+  { query: "how many degrees of freedom are left in the sketch", expected: "psketch_dof", core: true },
   // ── core controls (already resident — the funnel should at least agree) ──
   { query: "how heavy is this part in aluminium", expected: "mass_properties", core: true },
   { query: "cut a slot through the plate", expected: "boolean", core: true },
