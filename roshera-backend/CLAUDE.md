@@ -77,6 +77,88 @@ The 30 pre-existing reds are documented in `.superpowers/sdd/`:
 
 ---
 
+## Disconnection gate
+
+**Fourteen times in this repo a capability has been BUILT, been CORRECT, and
+been WIRED TO NOTHING.** `EventCertificate` fields written empty; HIST/PROV
+mandatory but empty; a `SIGN` flag with no chunk; `merkle.rs`; intent enforced
+then dropped; chunk CRCs never validated on import; header AI-hints promised in
+prose only; `establishAcpSession` never called on mount; a `rename_document`
+route with zero callers; `twist_angle` never exposed; `create_helical_sweep`
+unreachable; `ThreadSpecification` deserialized by nowhere; the mould verb's
+recipe that cannot reach the fillet seam; `create_pattern` recording nothing.
+Review caught none of them. **Reviewing harder is not the fix.**
+
+### The rule
+
+> **Every new public capability ships with a test asserting a production call
+> site exists.** Not "the function is correct" — *"someone in prod calls
+> this."* A REST route, an MCP tool, a kernel op, an exported TS function
+> driving a UI action: each lands with a test that a route is hit, a tool is
+> invoked, a registry entry resolves, or a handler dispatches — not merely that
+> the value constructs and checks out.
+
+The only accepted escape is an explicit `// gate: allow-ungated because …`
+comment on the declaration, reviewable in the diff.
+
+### The two mechanical halves
+
+The failure class splits, and the split is the whole point:
+
+- **dead-symbol** (3 of 14) — a `pub` item nothing anywhere references.
+  Automated by `scripts/disconnection-gate.ps1` against the
+  `KNOWN_DISCONNECTED.md` ratchet. Note that rustc's `dead_code` lint does
+  **not** cover this: every `pub` item reachable from a **lib** crate's root is
+  a live root to rustc, so the lint is structurally silent on it however
+  unused. Bin crates (`api-server`, ~234 dead-code warnings per "Build status"
+  below — verified 2026-04-30, **not re-measured**) get that coverage free; the
+  lib crates — most of this workspace — do not.
+- **wiring-shape** (8 of 14) — two independently produced pieces of state
+  (claim/artifact, route/consumer, field/registry-entry, type/handler) that
+  each compile, each pass a symbol-reachability check, and only disagree at
+  runtime. **No static tool catches these.** They are what the rule above is
+  for, and what this repo's *ontology drift gate* (`api-server/src/agent_registry.rs`,
+  backend tool table vs. `roshera-mcp`'s `BENCH_OF`) catches by asserting two
+  independently-maintained surfaces equal — a proven catch:
+  `psketch_plane_from_face` was classified MCP-side and never added
+  backend-side. Extend that shape rather than reaching for a linter.
+
+### Running it
+
+```
+powershell -File roshera-backend/scripts/disconnection-gate.ps1
+powershell -File roshera-backend/scripts/disconnection-gate.ps1 -Crates ros-format   # scoped
+powershell -File roshera-backend/scripts/disconnection-gate.ps1 -Seed                # print baseline
+```
+
+`-Seed` prints **Section B lines only**; paste them below the `SECTION B`
+marker, replacing the previous block. **Never redirect `-Seed` over
+`KNOWN_DISCONNECTED.md`** — that wipes the ratchet rule, the scope rationale
+and all fourteen diagnoses, and the gate then passes clean forever with zero
+classified stock. It is a manual pre-merge gate, like `red-gate.ps1`: not in
+`ci.yml` (which runs on `ubuntu-latest`).
+
+Pure text analysis — it never invokes cargo, compiles nothing, installs
+nothing, so it is unaffected by the disk/toolchain constraints that block
+`cargo-udeps` and `ts-prune` today. Exit codes mirror `red-gate.ps1`:
+
+- **0** — disconnected symbols match `KNOWN_DISCONNECTED.md` exactly
+- **1** — NEW_DISCONNECTED: a `pub` item with no production consumer, unlisted
+- **2** — RATCHET_VIOLATION: a listed entry now has a consumer — delete the line
+- **3** — both; **4** — SCAN_REFUSED (the gate will not report all-clear on a
+  scan that did not run)
+
+### `KNOWN_DISCONNECTED.md` ratchet
+
+Same rule as `geometry-engine/KNOWN_REDS.md`: lines are **removed** when a
+capability gains a real consumer, and **never added without a diagnosis** in
+the trailing comment. Burn the baseline down **opportunistically** — when a
+branch touches a file with an entry, that entry gets wired or re-justified.
+Do not open a sprint to clear it: fixing the stock before shipping the gate is
+how review failed fourteen times.
+
+---
+
 ## Workspace layout (verified against `roshera-backend/Cargo.toml`)
 
 Seven crates, resolver = "2":

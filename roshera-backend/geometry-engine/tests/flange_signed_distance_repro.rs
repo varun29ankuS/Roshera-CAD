@@ -53,11 +53,27 @@
 //! [-5, 15].
 //!
 //! DISCRIMINATOR (`flange_on_z_axis_with_offset_origin_matches_closed_form`):
-//! the failing tests below change BOTH the revolve axis direction AND
-//! `axis_origin` at once relative to the canonical (passing) tests above
-//! them. Re-running the SAME non-zero `axis_origin` on the canonical Z axis
-//! PASSES — so the trigger is confirmed to be axis DIRECTION (non-Z), not
-//! the origin offset.
+//! the non-Z tests below change BOTH the revolve axis direction AND
+//! `axis_origin` at once relative to the canonical tests above them.
+//! Re-running the SAME non-zero `axis_origin` on the canonical Z axis
+//! PASSES, so the origin offset is ruled out as the trigger.
+//!
+//! ## RESOLVED (TASK #5). Two defects, both periodic-unwrap, both fixed.
+//!
+//! The axis direction turned out NOT to be the cause either — it only
+//! decided whether each latent defect got asked its question. Neither fix
+//! mentions an axis:
+//!
+//!   1. `tessellation/surface.rs::winding_membership_periodic` — trim
+//!      membership compared a canonical query `(u, v)` against a trim
+//!      polygon living on a different branch of the surface's universal
+//!      cover, rejecting points genuinely on the face. Fixes X and Y.
+//!   2. `operations/face_arrangement.rs::nearest_periodic` — the cycle
+//!      unwrap could only reach `k ∈ {-1, 0, 1}`, so a cut cycle that had
+//!      already wrapped once could not close; the boolean silently dropped
+//!      the whole hole-wall face. Fixes the oblique pose.
+//!
+//! Each test's own doc comment carries its measured numbers.
 
 use geometry_engine::math::{Point3, Vector3};
 use geometry_engine::operations::revolve::{axis_frame, revolve_meridian, RevolveOptions};
@@ -378,68 +394,72 @@ fn flange_on_z_axis_with_offset_origin_matches_closed_form() {
 /// Revolve about world X (still axis-aligned, but NOT the default Z the
 /// canonical tests above exercise) with a non-zero `axis_origin`.
 ///
-/// TASK #5 — REPRODUCES at the kernel layer. Bisected: `nearest_on_solid`'s
-/// DISTANCE MAGNITUDE for the bolt-hole probe is correct (face 10, the
-/// boolean-minted hole-wall `Cylinder`, at exactly d=5.0 — the closed-form
-/// radius); the SIGN is wrong. `signed_distance` (queries/field.rs:33-37)
-/// takes its sign from `raycast_all`'s parity (queries/raycast.rs:165), and
-/// for this probe `raycast_all` returns only ONE crossing (a flange cap
-/// `Plane`) instead of the two-plus a correct ray must have — it never
-/// registers the ray's real intersection with the hole-wall `Cylinder`
-/// (verified directly: the quadratic root exists at t≈5.86 and lands within
-/// the face's own `height_limits`, but `nearest_on_solid` run AT that exact
-/// candidate point picks a different face at distance ≈1.9, meaning the
-/// hole-wall face's own trim-membership test rejects a point that is
-/// genuinely on its trimmed boundary). The rejection traces to the
-/// winding-number trim test over the face's outer loop —
-/// `is_point_inside_face`/`is_point_inside_loop`/`project_loop_uv_unwrapped`
-/// in `geometry-engine/src/tessellation/surface.rs` (~8596-8908) — which is
-/// walking a "bridge" loop (one connecting edge shared between the top and
-/// bottom rim, present with FORWARD/BACKWARD orientation flags so it should
-/// cancel in the winding number) that a boolean difference mints for a
-/// full-circle cylindrical hole face. The SAME edge-id/orientation SHAPE of
-/// loop is minted on the canonical Z-axis flange too (confirmed by directly
-/// dumping both faces' outer-loop edge lists — identical topology, since id
-/// assignment is deterministic and axis-independent), and the DISCRIMINATOR
-/// test above confirms axis DIRECTION (not `axis_origin`) is what flips the
-/// result — so the defect is specific to the surface's `(u, v)`
-/// parameterization / periodicity-unwrap for a non-Z axis, not the bridge
-/// convention itself. (NOTE: the raw `(u, v)` samples taken during
-/// investigation did not honor the loop's per-edge orientation flags, so
-/// they cannot be cited as proof of the exact polygon shape — this is
-/// therefore the strongest defensible claim, not a fully closed proof of
-/// the last step.) Root cause not further isolated tonight — out of reach
-/// for this pass; pinned RED rather than silently skipped.
+/// TASK #5 — WAS RED, now GREEN. Root cause (measured, not inferred):
+/// **period-blind trim membership**, in
+/// `tessellation/surface.rs::is_point_inside_loop` / `classify_cached`.
+///
+/// `signed_distance` (queries/field.rs) takes its sign from `raycast_all`'s
+/// parity; for this probe the ray genuinely crosses the boolean-minted
+/// hole-wall `Cylinder` at `t ≈ 5.859`, `v ≈ 13.05` — squarely inside that
+/// face's trimmed band `v ∈ [5, 15]`. The crossing was discarded because the
+/// face's trim polygon, built by `project_loop_uv_unwrapped`, lives in the
+/// surface's UNIVERSAL COVER at `u ∈ [-2π, 0]` (the boolean's rim circles
+/// run against the cylinder's `u` direction), while the query `u ≈ 1.162`
+/// arrives canonicalised to `[0, 2π)` by `Surface::exact_uv`. The plain
+/// winding-number test compared the two on different branches of the
+/// covering map and rejected a point that is the SAME point on the surface.
+///
+/// The earlier "axis-dependent unwrap math" diagnosis was WRONG, and the
+/// instrumentation says so: the Z-axis flange's hole-wall face carries a
+/// polygon with the IDENTICAL `u ∈ [-2π, 0]` window and its query `u` is
+/// rejected the same way. Z only passes because with a world-Z flange the
+/// fixed world-space parity ray leaves the hole above the rim — its wall
+/// root lands at `v ≈ 16.30`, genuinely past `height_limits`, so the reject
+/// is correct there and the defect never gets asked the question. The bug is
+/// universal to periodic surfaces; the axis only decided whether it showed.
+///
+/// Fix: `winding_membership_periodic` tests every lift `u + k·period` that
+/// can reach the polygon's extent (soundness argument on the function).
 #[test]
-#[ignore = "#5: signed_distance/classify_point flip the sign for a point genuinely \
-            inside a boolean-cut through-hole when the revolve axis is not world Z \
-            (nearest_on_solid's magnitude is right, raycast_all's parity is wrong — \
-            see the file-level doc comment above this test for the bisection)"]
 fn flange_on_x_axis_signed_distance_matches_closed_form() {
     assert_flange_probes_on_axis("X-axis flange", Point3::new(5.0, -3.0, 2.0), Vector3::X);
 }
 
 /// Revolve about world Y with a non-zero `axis_origin`. Same defect as
 /// [`flange_on_x_axis_signed_distance_matches_closed_form`] — see its doc
-/// comment for the bisection.
+/// comment for the root cause. Measured wall crossing here: `t ≈ 5.315`,
+/// `u ≈ 0.587`, `v ≈ 11.80`.
 #[test]
-#[ignore = "#5: same defect as flange_on_x_axis_signed_distance_matches_closed_form"]
 fn flange_on_y_axis_signed_distance_matches_closed_form() {
     assert_flange_probes_on_axis("Y-axis flange", Point3::new(-1.0, 4.0, 7.0), Vector3::Y);
 }
 
 /// Revolve about a fully OBLIQUE axis (not aligned to any world axis) with a
 /// non-zero `axis_origin` — forces `axis_frame`'s `perpendicular()` fallback
-/// branch, the case a real non-XY sketch plane produces. This pose shows a
-/// related but DISTINCT symptom from the X/Y-axis cases: the bolt-hole probe
-/// still classifies `Outside` (right sign) but the magnitude is wrong
-/// (returns `5*sqrt(2)` ≈ 7.071 instead of the closed-form 5.0) — consistent
-/// with `nearest_on_solid` itself missing the hole-wall face for THIS pose
-/// and falling back to an edge/corner candidate.
+/// branch, the case a real non-XY sketch plane produces.
+///
+/// This pose was RED for a SECOND, independent defect, in the same
+/// periodic-unwrap family but a different file: `BooleanOp::Difference` never
+/// minted the hole-wall face at all (the result carried 4 faces where the
+/// X/Y/Z poses carry 5), leaving an OPEN shell. `nearest_on_solid` then had
+/// no wall to find and fell back to the cap's hole rim at
+/// `sqrt(5² + 5²) = 5·sqrt(2) ≈ 7.071` — the wrong magnitude the old
+/// `#[ignore]` reason recorded as a distinct symptom. It was the same class
+/// of bug, not a distinct one.
+///
+/// Root cause: `operations/face_arrangement.rs::nearest_periodic` searched
+/// only `k ∈ {-1, 0, 1}`. `unwrap_cycle_uv` walks a cycle cumulatively, so
+/// after the hole-wall's cut cycle wraps once around the cylinder its anchor
+/// sits near `-5.236` while the closing seam vertex's raw `u` is still
+/// reported canonically as `2π`; closing it needs `k = -2`. The three-way
+/// search returned the nearest of the three instead, the cycle failed to
+/// close, its shoelace area came out `0.0` instead of `2π·10 ≈ 62.83`, and
+/// `extract_regions` dropped the region as degenerate. The X pose survived
+/// only because `atan2` happened to return `+0.0` rather than a tiny
+/// negative at that seam vertex (which `closest_point` folds to `2π`), so
+/// `k = -1` sufficed. `nearest_periodic` now solves `k` by rounding the
+/// quotient, which is correct for any winding count.
 #[test]
-#[ignore = "#5: same family as flange_on_x_axis_signed_distance_matches_closed_form, \
-            but the oblique pose corrupts nearest_on_solid's MAGNITUDE (5*sqrt(2) \
-            instead of 5.0) rather than raycast_all's sign"]
 fn flange_on_oblique_axis_signed_distance_matches_closed_form() {
     assert_flange_probes_on_axis(
         "oblique-axis flange",

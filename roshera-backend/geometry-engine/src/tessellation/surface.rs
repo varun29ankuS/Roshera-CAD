@@ -8683,8 +8683,11 @@ fn is_point_inside_loop(
         return is_outer;
     }
 
-    let winding_number = calculate_winding_number(&(u, v), &polygon);
-    winding_number.abs() > 0.5
+    // The polygon lives in the surface's universal cover (that is what
+    // `project_loop_uv_unwrapped` is for); `u`/`v` arrive canonicalised from
+    // `closest_point`/`exact_uv`. Compare them on every branch that could
+    // reach the polygon — see `winding_membership_periodic`.
+    winding_membership_periodic(u, v, &polygon, surface.period_u(), surface.period_v())
 }
 
 /// Cache of a loop's projected UV polygon (see [`project_loop_uv_unwrapped`])
@@ -8725,6 +8728,13 @@ pub(crate) struct CachedLoopUv {
     /// deliberately unwraps past one period), so a plain range reject would
     /// be unsound there.
     v_reject: Option<[f64; 3]>,
+    /// The owning surface's periods, carried so `classify_cached` can run the
+    /// same universal-cover membership test as the uncached
+    /// `is_point_inside_loop` — see [`winding_membership_periodic`]. Without
+    /// these the cached path would reject canonical query parameters that the
+    /// uncached path accepts, and the two would silently disagree.
+    period_u: Option<f64>,
+    period_v: Option<f64>,
 }
 
 impl LoopUvCache {
@@ -8775,6 +8785,8 @@ impl LoopUvCache {
             is_outer,
             degenerate,
             v_reject,
+            period_u: surface.period_u(),
+            period_v: surface.period_v(),
         });
         self.entries
             .entry(loop_id)
@@ -8792,8 +8804,7 @@ fn classify_cached(u: f64, v: f64, cached: &CachedLoopUv) -> bool {
             return false;
         }
     }
-    let winding_number = calculate_winding_number(&(u, v), &cached.polygon);
-    winding_number.abs() > 0.5
+    winding_membership_periodic(u, v, &cached.polygon, cached.period_u, cached.period_v)
 }
 
 /// [`is_point_inside_face`], but consulting `cache` for each loop's UV
@@ -8993,6 +9004,120 @@ pub(crate) fn polygon_signed_area_uv(polygon: &[(f64, f64)]) -> f64 {
         sum += x0 * y1 - x1 * y0;
     }
     sum * 0.5
+}
+
+/// Largest number of periodic lifts of a query parameter this module will
+/// ever test against one loop polygon. A trim loop that spans more than a
+/// couple of periods in one parameter is not something any construction path
+/// in this kernel mints (a full-circle face spans exactly one), so the cap is
+/// pure defence against a corrupt polygon turning the shift enumeration into
+/// an unbounded loop — it is never reached by real geometry.
+const MAX_PERIODIC_LIFTS: usize = 8;
+
+/// Every lift `q + k * period` of `q` that lands inside `[lo, hi]`, in
+/// increasing `k`.
+///
+/// A non-periodic parameter has exactly one lift — `q` itself — and is
+/// returned unfiltered, so a caller's behaviour on a non-periodic axis is
+/// bit-identical to testing `q` directly.
+///
+/// An empty result means *no* lift of `q` lies within the polygon's extent
+/// in this parameter, i.e. the query is outside the loop for every branch of
+/// the covering map — a sound reject, not an inconclusive one.
+fn periodic_lifts(q: f64, lo: f64, hi: f64, period: Option<f64>) -> Vec<f64> {
+    let period = match period {
+        Some(p) if p.is_finite() && p > 0.0 => p,
+        _ => return vec![q],
+    };
+    if !(lo.is_finite() && hi.is_finite()) || hi < lo {
+        return vec![q];
+    }
+    // Same noise-floor reasoning as `DEGENERATE_AREA_TOL` / `v_reject`:
+    // ~1e-15 round-off per projected sample, padded generously. Widening the
+    // window can only add a lift that the winding test then decides on its
+    // own merits; it can never turn a reject into a false accept by itself.
+    let eps = 1e-9 * (1.0 + (hi - lo).abs());
+    let k_lo = ((lo - eps - q) / period).ceil();
+    let k_hi = ((hi + eps - q) / period).floor();
+    if !k_lo.is_finite() || !k_hi.is_finite() || k_hi < k_lo {
+        return Vec::new();
+    }
+    let mut lifts = Vec::new();
+    let mut k = k_lo;
+    while k <= k_hi && lifts.len() < MAX_PERIODIC_LIFTS {
+        lifts.push(q + k * period);
+        k += 1.0;
+    }
+    lifts
+}
+
+/// Winding-number membership of `(u, v)` in a loop polygon that lives in the
+/// surface's **universal cover**, not in its declared parameter bounds.
+///
+/// # Why this is not just `calculate_winding_number`
+/// [`project_loop_uv_unwrapped`] deliberately lifts a trim loop past the
+/// periodic seam so the trace stays continuous — the whole point of the
+/// unwrap. The lift it produces is only defined up to a whole period, and
+/// *which* branch it lands on is decided by the first sample's canonical
+/// angle and by the direction the loop happens to traverse the seam. A
+/// boolean-minted full-circle cylindrical hole wall, for instance, projects
+/// to `u ∈ [-2π, 0]` because its rim circles run against the cylinder's
+/// `u` direction, while an identically-shaped face built the other way round
+/// projects to `u ∈ [0, 2π]`.
+///
+/// Query parameters, meanwhile, always arrive canonicalised:
+/// `Surface::closest_point` and `Surface::exact_uv` both fold `u` into
+/// `[0, 2π)`. Testing a canonical query against a polygon on a different
+/// branch of the cover rejects points that are genuinely on the face — the
+/// two are the same point on the surface and differ only by a period. That
+/// is a membership bug in the *test*, not in the polygon: the unwrap is
+/// doing exactly what it documents.
+///
+/// So membership must be asked of every lift of the query that could reach
+/// the polygon, and answered `true` if any lift is enclosed. Soundness: when
+/// the polygon spans less than one period there is at most one such lift, so
+/// the answer is unchanged from the plain test; when it spans a full period
+/// (a seam-to-seam face) every lift is equivalent by construction, because
+/// the two `u`-extremes of the polygon are the *same* seam curve in 3D.
+///
+/// Non-periodic parameters pass straight through with a single lift, so
+/// planes, cones-with-limits and NURBS patches behave exactly as before.
+pub(crate) fn winding_membership_periodic(
+    u: f64,
+    v: f64,
+    polygon: &[(f64, f64)],
+    period_u: Option<f64>,
+    period_v: Option<f64>,
+) -> bool {
+    if polygon.len() < 3 {
+        return false;
+    }
+    let mut u_min = f64::INFINITY;
+    let mut u_max = f64::NEG_INFINITY;
+    let mut v_min = f64::INFINITY;
+    let mut v_max = f64::NEG_INFINITY;
+    for &(pu, pv) in polygon {
+        u_min = u_min.min(pu);
+        u_max = u_max.max(pu);
+        v_min = v_min.min(pv);
+        v_max = v_max.max(pv);
+    }
+    let u_lifts = periodic_lifts(u, u_min, u_max, period_u);
+    if u_lifts.is_empty() {
+        return false;
+    }
+    let v_lifts = periodic_lifts(v, v_min, v_max, period_v);
+    if v_lifts.is_empty() {
+        return false;
+    }
+    for &lu in &u_lifts {
+        for &lv in &v_lifts {
+            if calculate_winding_number(&(lu, lv), polygon).abs() > 0.5 {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Calculate winding number for point-in-polygon test
@@ -9972,5 +10097,78 @@ mod tests {
             "tightening chord_tolerance must increase sphere tri count, \
              got coarse={coarse}, fine={fine}"
         );
+    }
+
+    /// TASK #5, defect 1. Trim membership must answer for the query's whole
+    /// periodic orbit, not just the branch `closest_point` happened to
+    /// canonicalise it onto.
+    ///
+    /// The polygon is the REAL one measured on the boolean-minted bolt-hole
+    /// wall of the flange in `tests/flange_signed_distance_repro.rs`: a
+    /// full-circle cylindrical face whose `project_loop_uv_unwrapped` trace
+    /// lands at `u ∈ [-2π, 0]`, `v ∈ [5, 15]` (its rim circles run against
+    /// the cylinder's `u` direction). The query is the real ray/cylinder
+    /// crossing from the X-axis pose: `u = 1.1624`, `v = 13.0541`.
+    ///
+    /// MUTATION PROOF: a plain `calculate_winding_number(&(u, v), &polygon)`
+    /// — the former implementation — returns ~0 here because the query sits
+    /// a full period to the RIGHT of the polygon, and the face rejects a
+    /// point genuinely on its own trimmed boundary. That is what flipped
+    /// `raycast_all`'s parity and made `signed_distance` report a bolt-hole
+    /// interior as Inside material.
+    #[test]
+    fn winding_membership_spans_the_periodic_orbit() {
+        let two_pi = std::f64::consts::TAU;
+        // Rectangle u ∈ [-2π, 0], v ∈ [5, 15], walked CCW.
+        let polygon: Vec<(f64, f64)> =
+            vec![(-two_pi, 5.0), (0.0, 5.0), (0.0, 15.0), (-two_pi, 15.0)];
+        let (u, v) = (1.1624_f64, 13.0541_f64);
+
+        assert!(
+            calculate_winding_number(&(u, v), &polygon).abs() <= 0.5,
+            "precondition: the raw query must sit OFF this polygon's branch, \
+             otherwise the test proves nothing"
+        );
+        assert!(
+            winding_membership_periodic(u, v, &polygon, Some(two_pi), None),
+            "a query one period from the polygon's branch is the SAME surface \
+             point and must be inside"
+        );
+
+        // A `v` past the face's finite rim is still outside — the fix must
+        // not turn the periodic lift into a blanket accept.
+        assert!(
+            !winding_membership_periodic(u, 16.2981, &polygon, Some(two_pi), None),
+            "v beyond the trimmed band must stay outside"
+        );
+
+        // Declared non-periodic in u: unchanged from the plain winding test.
+        assert!(!winding_membership_periodic(u, v, &polygon, None, None));
+
+        // A PARTIAL-arc face (extent < one period) admits at most one lift,
+        // so the periodic path cannot over-accept: a query a period away
+        // from a half-width polygon is still outside.
+        let partial: Vec<(f64, f64)> = vec![(0.5, 5.0), (2.0, 5.0), (2.0, 15.0), (0.5, 15.0)];
+        assert!(winding_membership_periodic(
+            1.0,
+            10.0,
+            &partial,
+            Some(two_pi),
+            None
+        ));
+        assert!(!winding_membership_periodic(
+            1.0 + two_pi,
+            10.0,
+            &partial,
+            None,
+            None
+        ));
+        assert!(!winding_membership_periodic(
+            3.0,
+            10.0,
+            &partial,
+            Some(two_pi),
+            None
+        ));
     }
 }

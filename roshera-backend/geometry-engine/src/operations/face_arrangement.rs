@@ -915,26 +915,46 @@ fn seam_closes_in_v(surface: &dyn Surface, u_min: f64, u_max: f64, v_min: f64, v
     true
 }
 
-/// Return `value + k · period` for the `k ∈ {-1, 0, 1}` that minimises
-/// `|value + k · period - anchor|`. If `period` is `None` (surface is
-/// not periodic on this axis), `value` is returned unchanged.
+/// Return the lift `value + k · period` (over ALL integer `k`) that minimises
+/// `|value + k · period - anchor|`. If `period` is `None` (surface is not
+/// periodic on this axis), `value` is returned unchanged.
+///
+/// # Why `k` is solved, not searched
+/// This used to try only `k ∈ {-1, 0, 1}`, which can reach an anchor at most
+/// 1.5 periods away from `value`. [`unwrap_cycle_uv`] walks a cycle
+/// cumulatively, so its anchor drifts arbitrarily far from the canonical
+/// `[0, period)` window `Surface::closest_point` returns — after a cut cycle
+/// has wrapped once around a cylinder the anchor sits near `−2π` while the
+/// closing vertex's raw `u` is still reported in `[0, 2π)`. Reaching it needs
+/// `k = −2`, which the three-candidate search could not express: it silently
+/// returned the nearest of the three (off by a whole period), the cycle
+/// failed to close where it started, and its shoelace area came out `0`
+/// instead of `2π·h` — so `extract_regions` discarded the region as
+/// degenerate and the boolean dropped the whole face.
+///
+/// That is how a bolt hole cut into an obliquely-revolved flange lost its
+/// wall face while the identical hole on a world-axis flange kept it: the
+/// only difference between the two is whether `atan2` happened to return
+/// `+0.0` or a tiny negative (which `closest_point` folds to `2π`) at the
+/// seam vertex — pure floating-point luck deciding whether the required `k`
+/// was `−1` (in range) or `−2` (out of range).
+///
+/// Rounding the exact quotient is unconditionally correct and no more
+/// expensive: `k = round((anchor − value) / period)` is by construction the
+/// integer minimising `|value + k·period − anchor|`, and agrees with the old
+/// search everywhere the old search was in range.
 #[inline]
 fn nearest_periodic(anchor: f64, value: f64, period: Option<f64>) -> f64 {
     match period {
         None => value,
         Some(p) if !(p > 0.0) => value,
         Some(p) => {
-            let candidates = [value - p, value, value + p];
-            let mut best = candidates[0];
-            let mut best_d = (best - anchor).abs();
-            for &c in &candidates[1..] {
-                let d = (c - anchor).abs();
-                if d < best_d {
-                    best = c;
-                    best_d = d;
-                }
+            let k = ((anchor - value) / p).round();
+            if k.is_finite() {
+                value + k * p
+            } else {
+                value
             }
-            best
         }
     }
 }
@@ -966,6 +986,54 @@ mod tests {
             });
         }
         Arrangement { half_edges }
+    }
+
+    /// TASK #5, defect 2. `nearest_periodic` must reach the correct lift
+    /// however many whole periods separate `value` from `anchor`.
+    ///
+    /// The numbers are the real ones measured on the oblique-axis flange
+    /// (`tests/flange_signed_distance_repro.rs`): a hole-wall cut cycle has
+    /// unwrapped once around the cylinder, so the running anchor sits at
+    /// `-5π/3` while the closing seam vertex's raw `u` is still reported
+    /// canonically as `2π`. The correct lift is `k = -2` → `-2π`, which
+    /// closes the cycle where it started and gives it its true `2π·h` area.
+    ///
+    /// MUTATION PROOF: the former implementation tried only
+    /// `k ∈ {-1, 0, 1}` and returned `≈ 0.0` here — a whole period off. The
+    /// cycle then failed to close, its shoelace area came out `0`,
+    /// `extract_regions` discarded it, and the boolean silently dropped the
+    /// entire bolt-hole wall face. Restoring the three-candidate search
+    /// fails this test on the first assertion.
+    #[test]
+    fn nearest_periodic_reaches_lifts_beyond_one_period() {
+        let two_pi = 2.0 * std::f64::consts::PI;
+        let anchor = -5.0 * std::f64::consts::PI / 3.0; // ≈ -5.236, one wrap in
+        let value = two_pi; // canonical `closest_point` output at the seam
+        let got = nearest_periodic(anchor, value, Some(two_pi));
+        assert!(
+            (got - -two_pi).abs() < 1e-12,
+            "anchor {anchor} needs the k=-2 lift {}, got {got}",
+            -two_pi
+        );
+
+        // Still exact for the in-range cases the old search handled, so this
+        // is a strict generalisation and not a behaviour swap.
+        for (anchor, value, want) in [
+            (0.0, 0.0, 0.0),
+            (0.1, two_pi - 0.1, -0.1),
+            (two_pi - 0.1, 0.1, two_pi + 0.1),
+            (-0.1, 0.1, 0.1),
+        ] {
+            let got = nearest_periodic(anchor, value, Some(two_pi));
+            assert!(
+                (got - want).abs() < 1e-12,
+                "nearest_periodic({anchor}, {value}) want {want}, got {got}"
+            );
+        }
+
+        // A non-periodic axis is untouched.
+        assert_eq!(nearest_periodic(-100.0, 7.0, None), 7.0);
+        assert_eq!(nearest_periodic(-100.0, 7.0, Some(0.0)), 7.0);
     }
 
     #[test]
