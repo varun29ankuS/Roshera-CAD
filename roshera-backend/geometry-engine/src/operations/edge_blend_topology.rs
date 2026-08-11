@@ -966,6 +966,7 @@ pub(crate) fn coalesce_smooth_cocurve_chains(
         if let Some(sol) = model.solids.get(solid_id) {
             let mut shells = vec![sol.outer_shell];
             shells.extend_from_slice(&sol.inner_shells);
+            shells.extend_from_slice(&sol.peer_shells);
             for sh in shells {
                 let Some(shell) = model.shells.get(sh) else {
                     continue;

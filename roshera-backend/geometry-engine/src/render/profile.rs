@@ -596,6 +596,7 @@ fn edge_sample_points(model: &BRepModel, solid_id: SolidId) -> Vec<Point3> {
     };
     let mut shells = vec![solid.outer_shell];
     shells.extend_from_slice(&solid.inner_shells);
+    shells.extend_from_slice(&solid.peer_shells);
     let mut seen_edges = std::collections::HashSet::new();
     for sh in shells {
         let shell = match model.shells.get(sh) {

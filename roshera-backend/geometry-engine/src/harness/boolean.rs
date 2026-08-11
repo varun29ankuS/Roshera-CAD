@@ -92,6 +92,7 @@ fn solid_face_ids(model: &BRepModel, solid_id: SolidId) -> Vec<FaceId> {
     };
     let mut shell_ids = vec![solid.outer_shell];
     shell_ids.extend(solid.inner_shells.iter().copied());
+    shell_ids.extend(solid.peer_shells.iter().copied());
     for sid in shell_ids {
         if let Some(shell) = model.shells.get(sid) {
             out.extend(shell.faces.iter().copied());

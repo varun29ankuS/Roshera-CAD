@@ -41,6 +41,7 @@ pub fn self_overlapping_planar_faces(model: &BRepModel, solid_id: SolidId) -> Ve
     };
     let mut shells = vec![solid.outer_shell];
     shells.extend(solid.inner_shells.iter().copied());
+    shells.extend(solid.peer_shells.iter().copied());
     for sh in shells {
         let Some(shell) = model.shells.get(sh) else {
             continue;

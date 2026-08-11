@@ -45,6 +45,7 @@ pub fn extract_features(model: &BRepModel, solid_id: SolidId) -> Vec<FeatureDim>
     };
     let mut shells = vec![solid.outer_shell];
     shells.extend_from_slice(&solid.inner_shells);
+    shells.extend_from_slice(&solid.peer_shells);
 
     for shell_id in shells {
         let shell = match model.shells.get(shell_id) {

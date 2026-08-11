@@ -474,8 +474,8 @@ fn find_parent_solid(model: &BRepModel, face_id: FaceId) -> Option<SolidId> {
                 return Some(solid_id);
             }
         }
-        // Also check inner shells (for solids with holes)
-        for &inner_shell_id in &solid.inner_shells {
+        // Also check inner shells (for solids with holes) and peer bodies
+        for &inner_shell_id in solid.inner_shells.iter().chain(solid.peer_shells.iter()) {
             if let Some(shell) = model.shells.get(inner_shell_id) {
                 if shell.faces.contains(&face_id) {
                     return Some(solid_id);
@@ -3003,6 +3003,7 @@ fn validate_extruded_solid(model: &BRepModel, solid_id: SolidId) -> OperationRes
 
     let mut shells = vec![solid.outer_shell];
     shells.extend(solid.inner_shells.iter().copied());
+    shells.extend(solid.peer_shells.iter().copied());
 
     for shell_id in shells {
         let shell = model

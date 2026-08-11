@@ -45,6 +45,7 @@ pub fn raycast_solid(
     let solid = model.solids.get(solid_id)?;
     let mut shells = vec![solid.outer_shell];
     shells.extend_from_slice(&solid.inner_shells);
+    shells.extend_from_slice(&solid.peer_shells);
 
     let mut best: Option<RayHit> = None;
     for shell_id in shells {
@@ -178,6 +179,7 @@ pub fn raycast_all(
     };
     let mut shells = vec![solid.outer_shell];
     shells.extend_from_slice(&solid.inner_shells);
+    shells.extend_from_slice(&solid.peer_shells);
 
     let mut hits = Vec::new();
     for shell_id in shells {

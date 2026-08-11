@@ -491,8 +491,43 @@ pub struct Solid {
     pub id: SolidId,
     /// Outer shell (defines exterior boundary)
     pub outer_shell: ShellId,
-    /// Inner shells (voids)
+    /// Inner shells — VOIDS, and only voids. Every entry is a closed shell
+    /// ENCLOSED by [`Self::outer_shell`], oriented so its material side faces
+    /// the cavity: mass properties SUBTRACT it, and a solid that has one is a
+    /// body with a hollow in it.
+    ///
+    /// This field used to mean "every shell that is not the outer one", which
+    /// silently conflated a cavity with a disjoint sibling body and made the
+    /// kernel lie: a union of two disjoint boxes filed body B here, so
+    /// `compute_mass_properties` reported 1000, the mesh path reported 2000
+    /// and `solid_outer_face_count` saw 6 of 12 faces — all under a SOUND
+    /// certificate. Sibling bodies now live in [`Self::peer_shells`].
     pub inner_shells: Vec<ShellId>,
+    /// Peer shells — same-orientation SIBLING BODIES of this solid, disjoint
+    /// from the outer shell rather than enclosed by it.
+    ///
+    /// A boolean can legitimately produce several disjoint lumps: a union of
+    /// operands that never touched, or a difference that severs a plate. Those
+    /// lumps are material, not cavities, so every consumer treats them the
+    /// opposite way to [`Self::inner_shells`]:
+    ///
+    /// * mass / volume / volume-integrals **ADD** them (never subtract),
+    /// * their faces are part of the solid's boundary and must be visible to
+    ///   boundary-face queries ([`crate::primitives::topology_builder::BRepModel::solid_outer_face_count`]),
+    ///   tessellation, validation, ownership maps and export,
+    /// * they are NOT voids: [`Self::has_voids`] stays `false` for a solid
+    ///   whose only extra shells are peers.
+    ///
+    /// The count is disclosed on the solid's certificate
+    /// (`ValidityCertificate::peer_count`) so a multi-body result announces
+    /// itself instead of passing as a single lump.
+    ///
+    /// Written today only by the boolean pipeline's `reconstruct_topology`,
+    /// which PROVES the classification per shell by winding number against the
+    /// outer shell's own tessellation. Every other producer (primitives,
+    /// extrude, revolve, loft, sweep, blends) emits a single lump and leaves
+    /// this empty.
+    pub peer_shells: Vec<ShellId>,
     /// Name/label
     pub name: Option<String>,
     /// Features
@@ -674,6 +709,7 @@ impl Clone for Solid {
             id: self.id,
             outer_shell: self.outer_shell,
             inner_shells: self.inner_shells.clone(),
+            peer_shells: self.peer_shells.clone(),
             name: self.name.clone(),
             features: self.features.clone(),
             attributes: self.attributes.clone(),
@@ -712,6 +748,7 @@ impl Solid {
             id,
             outer_shell,
             inner_shells: Vec::new(),
+            peer_shells: Vec::new(),
             name: None,
             features: Arc::new(RwLock::new(HashMap::new())),
             attributes: SolidAttributes::default(),
@@ -763,6 +800,7 @@ impl Solid {
             id: self.id,
             outer_shell: self.outer_shell,
             inner_shells: self.inner_shells.clone(),
+            peer_shells: self.peer_shells.clone(),
             name: self.name.clone(),
             features: Arc::new(RwLock::new(features_snapshot)),
             attributes: self.attributes.clone(),
@@ -1005,6 +1043,34 @@ impl Solid {
         }
     }
 
+    /// Attach a PEER shell — a same-orientation sibling body, not a void.
+    ///
+    /// The caller must have PROVED the shell is not enclosed by
+    /// [`Self::outer_shell`]; the boolean pipeline's `reconstruct_topology`
+    /// does so by winding number. Filing an enclosed cavity here would make
+    /// mass properties add material that is not there, exactly inverting the
+    /// defect [`Self::peer_shells`] exists to fix.
+    pub fn add_peer_shell(&mut self, shell_id: ShellId) {
+        self.peer_shells.push(shell_id);
+        self.invalidate_cache();
+    }
+
+    // No `remove_peer_shell` counterpart is declared: nothing in production
+    // detaches a shell from a solid (`remove_inner_shell` already has zero
+    // callers), and this repo's disconnection gate exists precisely to stop a
+    // public capability shipping with no call site. Add it with its consumer.
+
+    /// Number of ADDITIONAL disjoint bodies this solid carries beyond the one
+    /// bounded by its outer shell. `0` for an ordinary single-lump solid.
+    ///
+    /// Surfaced on the certificate as `ValidityCertificate::peer_count`, so a
+    /// multi-body result is disclosed by the kernel's own verdict rather than
+    /// only on a pipeline trace.
+    #[inline]
+    pub fn peer_count(&self) -> usize {
+        self.peer_shells.len()
+    }
+
     /// Invalidate cached data
     fn invalidate_cache(&mut self) {
         self.cached_mass_props = None;
@@ -1133,7 +1199,7 @@ impl Solid {
             let features = self.features.read();
 
             self.cached_stats = Some(SolidStats {
-                shell_count: 1 + self.inner_shells.len(),
+                shell_count: 1 + self.inner_shells.len() + self.peer_shells.len(),
                 face_count: total_faces,
                 edge_count: total_edges.len(),
                 vertex_count: total_vertices.len(),
@@ -1218,6 +1284,33 @@ impl Solid {
                     // around voids) — they add to total surface area, not
                     // subtract. A hollow box has more surface area than a
                     // solid box of the same outer dimensions.
+                    surface_area += shell_props.surface_area;
+                }
+            }
+
+            // ADD peer shells. A peer is a disjoint SIBLING BODY, not a
+            // cavity: its material counts POSITIVELY, exactly like the outer
+            // shell's. Subtracting it (which is what happened while peers were
+            // filed as `inner_shells`) reported V(A ∪ B) = V(A) − V(B) for two
+            // disjoint boxes — 1000 instead of 2000 — while the mesh path
+            // reported 2000 for the same solid.
+            for &peer_id in &self.peer_shells {
+                if let Some(shell) = shell_store.get_mut(peer_id) {
+                    let shell_props = shell.compute_mass_properties(
+                        face_store,
+                        loop_store,
+                        vertex_store,
+                        edge_store,
+                        curve_store,
+                        surface_store,
+                        1.0,
+                    )?;
+
+                    if let Some(v) = shell_props.volume {
+                        volume += v;
+                        center += shell_props.center_of_mass.to_vec() * v;
+                        volume_integrals.add_shell_contribution(shell_props, 1.0);
+                    }
                     surface_area += shell_props.surface_area;
                 }
             }
@@ -1483,12 +1576,21 @@ impl Solid {
 
 // Preserve original methods for compatibility
 impl Solid {
+    /// Every shell that belongs to this solid: the outer boundary, its voids,
+    /// and its peer bodies. This is the canonical "walk the whole solid"
+    /// accessor — anything iterating shells to reach FACES (validation,
+    /// ownership maps, tessellation, drawing, export, queries) must go through
+    /// here or otherwise include [`Self::peer_shells`], or a peer body's faces
+    /// become invisible/unowned.
     pub fn all_shells(&self) -> Vec<ShellId> {
-        let mut shells = vec![self.outer_shell];
+        let mut shells = Vec::with_capacity(1 + self.inner_shells.len() + self.peer_shells.len());
+        shells.push(self.outer_shell);
         shells.extend(&self.inner_shells);
+        shells.extend(&self.peer_shells);
         shells
     }
 
+    /// Voids ONLY — peers are material, not cavities, so they are excluded.
     #[inline]
     pub fn has_voids(&self) -> bool {
         !self.inner_shells.is_empty()
@@ -1502,7 +1604,7 @@ impl Solid {
 
     #[inline]
     pub fn shell_count(&self) -> usize {
-        1 + self.inner_shells.len()
+        1 + self.inner_shells.len() + self.peer_shells.len()
     }
 
     pub fn volume(

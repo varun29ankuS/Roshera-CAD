@@ -205,6 +205,91 @@ export function registerTimelineTools(server: ToolHost) {
   );
 
   server.tool(
+    "recipe_get",
+    "RETRIEVE A PROVEN PLAN INSTEAD OF INVENTING ONE. Projects a certified " +
+      "build into a re-parameterizable RECIPE: its ordered op kinds, the " +
+      "parameters AS RECORDED, the intent recorded on each op, the checkpoint " +
+      "declarations covering them, and a roll-up of the certificates AS RECORDED. " +
+      "Addressable by branch ('main') OR by any document id — a document that is " +
+      "not open is read from durable storage and is NOT opened, so retrieving a " +
+      "recipe never disturbs what you are working on. THE PATTERN: for a component you " +
+      "have built before (flange, gear, housing), find the document that built it, pull its " +
+      "recipe, EDIT THE NUMBERS in each op's `reissue.body`, and re-issue the ops " +
+      "in order via cad_program — do not design such a component from scratch. " +
+      "Every op carries `reissue` (the route + body that re-issues it) or an " +
+      "explicit `reissue_absent_reason`; body keys named in `symbolic_operands` " +
+      "hold recipe-local tokens ('solid:0') you bind to the ids YOUR re-issue " +
+      "returned.",
+    {
+      reference: z
+        .string()
+        .default("main")
+        .describe("branch id ('main' = trunk) or a document id (list via document tab / documents API)"),
+      from: z
+        .number()
+        .int()
+        .min(0)
+        .optional()
+        .describe("first event sequence to include — scope the recipe to one decision's span"),
+      to: z
+        .number()
+        .int()
+        .min(0)
+        .optional()
+        .describe("last event sequence to include (inclusive)"),
+      include_params: z
+        .boolean()
+        .default(true)
+        .describe("include each step's verbatim recorded params (set false for a compact plan outline)"),
+    },
+    async ({ reference, from, to, include_params }) => {
+      try {
+        const qs: string[] = [];
+        if (from !== undefined) qs.push(`from=${from}`);
+        if (to !== undefined) qs.push(`to=${to}`);
+        const r = await api(
+          "GET",
+          `/api/timeline/recipe/${encodeURIComponent(reference)}` +
+            (qs.length ? `?${qs.join("&")}` : ""),
+        );
+        const steps = (r.steps ?? []).map((s: any) => ({
+          sequence: s.sequence,
+          op_kind: s.op_kind,
+          ...(include_params ? { params: s.params } : {}),
+          inputs: s.inputs,
+          outputs: s.outputs,
+          intent: s.intent ?? null,
+          checkpoint: s.checkpoint?.name ?? null,
+          ...(s.checkpoint ? {} : { checkpoint_absent_reason: s.checkpoint_absent_reason }),
+          reissue: s.reissue ?? null,
+          ...(s.reissue ? {} : { reissue_absent_reason: s.reissue_absent_reason }),
+        }));
+        return ok({
+          source: r.source,
+          step_count: r.step_count,
+          sequence_range: r.sequence_range,
+          // Disclosed, not smoothed over: a gapped log is not a whole plan.
+          sequence_contiguous: r.sequence_contiguous,
+          undecodable_events: r.undecodable_events,
+          checkpoints: (r.checkpoints ?? []).map((c: any) => ({
+            name: c.name,
+            description: c.description,
+            covers: c.covers,
+            covers_is_empty: c.covers_is_empty,
+          })),
+          certificate_summary: r.certificate_summary,
+          reparameterize: r.reparameterize,
+          steps,
+        });
+      } catch (e) {
+        // An unknown reference is a TYPED 404 (`document_not_found`) — an
+        // honest answer about which recipes exist, not a transport failure.
+        return refusalOrFail(e);
+      }
+    },
+  );
+
+  server.tool(
     "timeline_branch",
     "Fork a timeline branch before speculative work. The fork is an isolated " +
       "EVENT-LOG lane (authorship, audit, merge approval) — the live kernel " +

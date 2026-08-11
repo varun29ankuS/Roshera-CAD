@@ -139,7 +139,7 @@ pub fn find_adjacent_faces(model: &BRepModel, edge_id: EdgeId) -> Vec<FaceId> {
         std::collections::HashSet::new();
     for (_sid, solid) in model.solids.iter() {
         live_shells.insert(solid.outer_shell);
-        for &inner in &solid.inner_shells {
+        for &inner in solid.inner_shells.iter().chain(solid.peer_shells.iter()) {
             live_shells.insert(inner);
         }
     }

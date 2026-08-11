@@ -178,6 +178,10 @@ const READ_ONLY = new Set<string>([
   "measure_faces",
   "verify_claim",
   "timeline_history",
+  // A pure GET projection over a recorded log — it opens no document and
+  // touches no model, so a recipe retrieval can never make a cached refusal
+  // stale.
+  "recipe_get",
   "timeline_branches",
   "timeline_conflicts",
   "timeline_checkpoints",

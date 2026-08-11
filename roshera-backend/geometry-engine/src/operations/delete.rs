@@ -250,7 +250,7 @@ fn delete_solid_body(
     let mut deleted = Vec::new();
 
     // Get the solid and clone necessary data
-    let (outer_shell, inner_shells) = {
+    let (outer_shell, attached_shells) = {
         let solid = model
             .solids
             .get(solid_id)
@@ -259,7 +259,17 @@ fn delete_solid_body(
                 expected: "existing solid".to_string(),
                 received: format!("{}", solid_id),
             })?;
-        (solid.outer_shell, solid.inner_shells.clone())
+        // Voids AND peer bodies — deleting a part must free every shell it
+        // owns, or a multi-body result's peers leak into the stores as debris.
+        (
+            solid.outer_shell,
+            solid
+                .inner_shells
+                .iter()
+                .chain(solid.peer_shells.iter())
+                .copied()
+                .collect::<Vec<_>>(),
+        )
     };
 
     // Delete shells if cascading
@@ -267,8 +277,8 @@ fn delete_solid_body(
         // Delete outer shell
         delete_shell_cascade(model, outer_shell, &mut deleted)?;
 
-        // Delete inner shells
-        for inner_shell in &inner_shells {
+        // Delete the attached shells — voids and peer bodies alike
+        for inner_shell in &attached_shells {
             delete_shell_cascade(model, *inner_shell, &mut deleted)?;
         }
     }
@@ -534,7 +544,7 @@ fn find_cascade_targets(
                 // Cascade to shells
                 if let Some(solid) = model.solids.get(entity_id) {
                     cascade.insert((EntityType::Shell, solid.outer_shell));
-                    for inner in &solid.inner_shells {
+                    for inner in solid.inner_shells.iter().chain(solid.peer_shells.iter()) {
                         cascade.insert((EntityType::Shell, *inner));
                     }
                 }
@@ -858,7 +868,10 @@ fn is_face_used(model: &BRepModel, face_id: FaceId) -> bool {
 
 fn is_shell_used(model: &BRepModel, shell_id: ShellId) -> bool {
     for (_, solid) in model.solids.iter() {
-        if solid.outer_shell == shell_id || solid.inner_shells.contains(&shell_id) {
+        if solid.outer_shell == shell_id
+            || solid.inner_shells.contains(&shell_id)
+            || solid.peer_shells.contains(&shell_id)
+        {
             return true;
         }
     }
@@ -944,6 +957,11 @@ fn validate_model_after_deletion(model: &BRepModel) -> OperationResult<()> {
         for &sid in &solid.inner_shells {
             if model.shells.get(sid).is_none() {
                 return Err(dangling("Solid", solid_id, "inner shell"));
+            }
+        }
+        for &sid in &solid.peer_shells {
+            if model.shells.get(sid).is_none() {
+                return Err(dangling("Solid", solid_id, "peer shell"));
             }
         }
     }

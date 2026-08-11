@@ -160,6 +160,7 @@ pub(super) fn solid_faces(model: &BRepModel, solid_id: SolidId) -> Option<Vec<Fa
     let solid = model.solids.get(solid_id)?;
     let mut shells = vec![solid.outer_shell];
     shells.extend_from_slice(&solid.inner_shells);
+    shells.extend_from_slice(&solid.peer_shells);
     let mut faces = Vec::new();
     for sh in shells {
         if let Some(shell) = model.shells.get(sh) {
@@ -1011,6 +1012,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("fixture solid resolves"));
             let mut shells = vec![solid.outer_shell];
             shells.extend_from_slice(&solid.inner_shells);
+            shells.extend_from_slice(&solid.peer_shells);
             let mut out = Vec::new();
             for sh in shells {
                 if let Some(shell) = model.shells.get(sh) {

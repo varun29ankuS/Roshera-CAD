@@ -3807,6 +3807,749 @@ pub async fn redo_operation(
     }
 }
 
+// ─── Recipes from lineage (task #10) ────────────────────────────────
+//
+// A certified past build is only reusable if it can be RETRIEVED as a
+// plan. `GET /api/timeline/recipe/{branch_or_document}` is that
+// retrieval: a pure PROJECTION of the immutable event log into the
+// ordered op kinds, their RECORDED parameters (the numbers a client
+// edits to re-parameterize), the intent recorded on each event, the
+// checkpoint declarations covering them, and a summary of the
+// certificates AS RECORDED. No new storage, no recompute, no
+// fabricated verdict.
+//
+// Two sources, because a proven build is usually NOT the document you
+// are working in:
+//
+//   * a live branch ref (`main` / a branch UUID) — the in-memory
+//     timeline, exactly what `dependency-graph/{branch}` reads;
+//   * a registered DOCUMENT id — that document's persisted log, read
+//     straight out of durable storage (`load_all_timeline_events` +
+//     `load_checkpoints`, the same two reads `durability::boot_replay`
+//     performs). Deliberately NOT `documents::activate`: retrieving a
+//     recipe must never disturb the caller's live model, and the whole
+//     point is reading a proven plan while working somewhere else.
+//
+// Why the recorded parameters are not enough on their own (measured,
+// not assumed): the recorded `revolve_typed.profile_segments` tags its
+// variants `{"kind":"line"}` while `POST /api/geometry/revolve` parses
+// `{"type":"line"}`; a recorded `create_cylinder_3d` carries scalar
+// `base_x/base_y/base_z` while the creation route takes
+// `center:[x,y,z]`; a recorded boolean names kernel integer operands
+// while the route takes object UUIDs. Verbatim params are therefore a
+// LOG, not a plan. Each step accordingly carries `reissue` — the route
+// and body that actually re-issues it — and an honest
+// `reissue_absent_reason` for every kind with no mapping, so a client
+// is never left guessing which of the two it is holding.
+
+/// `GET /api/timeline/recipe/{branch_or_document}` query string.
+#[derive(Debug, Deserialize)]
+pub struct RecipeQuery {
+    /// First event sequence number to include (inclusive). Omitted = from
+    /// the start of the log.
+    #[serde(default)]
+    pub from: Option<u64>,
+    /// Last event sequence number to include (inclusive). Omitted = to the
+    /// end of the log.
+    #[serde(default)]
+    pub to: Option<u64>,
+}
+
+/// Where a recipe's steps came from — always disclosed, because the two
+/// sources answer at different freshness (a live branch includes ops the
+/// durable writer has not flushed; a durable document is exactly what
+/// survived).
+#[derive(Serialize)]
+pub struct RecipeSource {
+    /// `"live_branch"` or `"durable_document"`.
+    pub kind: &'static str,
+    /// The reference the caller supplied, echoed verbatim.
+    pub reference: String,
+    /// Branch label the steps belong to — `"main"`, a branch UUID, or
+    /// `"*"` when a durable document's log spans several branches.
+    pub branch: String,
+    /// Document id, present when the durable path served the request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub document: Option<String>,
+    /// Plain-language statement of what was read.
+    pub note: &'static str,
+}
+
+/// A checkpoint declaration as a recipe carries it — the same wire shape
+/// `GET /api/timeline/checkpoints` serves, plus the explicit empty-span
+/// flag, so a consumer can see when a declaration authored nothing of its
+/// own rather than inferring it from `first > last`.
+#[derive(Serialize)]
+pub struct RecipeCheckpoint {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub branch_id: String,
+    /// Restore marker `[min_sequence, max_sequence]` (see [`CheckpointSummary`]).
+    pub event_range: [u64; 2],
+    /// The span this declaration actually AUTHORED (see [`fill_covers`]).
+    pub covers: [u64; 2],
+    /// `true` when `covers` is empty (`first > last`) — the honest reading
+    /// of "this declaration covers no operations of its own", which happens
+    /// whenever two checkpoints end on the same event.
+    pub covers_is_empty: bool,
+    pub author: String,
+    pub timestamp: String,
+}
+
+/// The checkpoint a step is attributed to. DERIVED (from `covers`), never
+/// recorded on the event — kept structurally separate from
+/// [`RecipeStep::intent`], which IS recorded truth.
+#[derive(Serialize)]
+pub struct RecipeStepCheckpoint {
+    pub id: String,
+    pub name: String,
+}
+
+/// The call that re-issues one recorded step. Backend-owned contract (a
+/// route this server serves), so it cannot drift against a client's tool
+/// table the way a named agent verb would.
+#[derive(Serialize)]
+pub struct RecipeReissue {
+    pub method: &'static str,
+    pub path: &'static str,
+    /// The request body, with the recorded numbers in the route's own
+    /// spelling — edit these to re-parameterize.
+    pub body: serde_json::Value,
+    /// Body keys whose value is a SYMBOLIC entity token (`"solid:0"`),
+    /// not a literal the route accepts: the caller must bind each to the
+    /// id its own re-issue of the producing step returned. Empty for a
+    /// step whose body is directly issuable.
+    pub symbolic_operands: Vec<String>,
+}
+
+/// One ordered step of a recipe.
+#[derive(Serialize)]
+pub struct RecipeStep {
+    /// Branch-local sequence number — the stable address of this step.
+    pub sequence: u64,
+    /// Event UUID.
+    pub event_id: String,
+    /// Kernel operation kind (`revolve_typed`, `create_cylinder_3d`, …).
+    pub op_kind: String,
+    /// The RECORDED parameter payload, verbatim — the symbolic edit
+    /// surface. Never normalized, never rounded, never re-derived.
+    pub params: serde_json::Value,
+    /// Symbolic entity tokens this step consumed (`"solid:0"`).
+    pub inputs: Vec<String>,
+    /// Symbolic entity tokens this step produced.
+    pub outputs: Vec<String>,
+    /// The intent RECORDED on this event (`facets."roshera.intent".text`).
+    /// Primary, because it is per-operation recorded truth rather than a
+    /// span derived after the fact.
+    pub intent: Option<String>,
+    /// The checkpoint declaration whose `covers` span contains this step.
+    /// Secondary and derived; `null` when no declaration covers it.
+    pub checkpoint: Option<RecipeStepCheckpoint>,
+    /// Why `checkpoint` is `null`, present only when it is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpoint_absent_reason: Option<String>,
+    /// The route + body that re-issues this step, or `null`.
+    pub reissue: Option<RecipeReissue>,
+    /// Why `reissue` is `null`, present only when it is — an honest "this
+    /// kind has no re-issue mapping", never a guessed call.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reissue_absent_reason: Option<String>,
+    /// The certificate AS RECORDED on this event; `null` when none.
+    pub certificate: Option<EventCertificate>,
+    pub author: String,
+    pub author_kind: String,
+    pub timestamp: String,
+}
+
+/// Roll-up of the certificates AS RECORDED across the recipe's steps.
+/// Counted, never recomputed: a recipe reports what the log proves and
+/// points elsewhere for a fresh measurement.
+#[derive(Serialize)]
+pub struct RecipeCertificateSummary {
+    pub steps_total: usize,
+    pub steps_with_recorded_certificate: usize,
+    /// Steps whose recorded certificate says `is_sound == true`.
+    pub sound: usize,
+    /// Steps whose recorded certificate says `is_sound == false`.
+    pub unsound: usize,
+    /// Steps carrying a certificate that states no soundness verdict (a
+    /// `fast:true` op that computed none) — counted, never coerced.
+    pub indeterminate: usize,
+    /// Sequence of the last step carrying a recorded certificate.
+    pub last_certified_sequence: Option<u64>,
+    /// Where to get a RE-MEASURED verdict, since this summary is not one.
+    pub note: &'static str,
+}
+
+/// The full recipe.
+#[derive(Serialize)]
+pub struct RecipeResponse {
+    pub source: RecipeSource,
+    /// Number of steps returned after any `?from=`/`?to=` window.
+    pub step_count: usize,
+    /// `[first, last]` sequence numbers of the returned steps; `null` when
+    /// the recipe is empty.
+    pub sequence_range: Option<[u64; 2]>,
+    /// `false` when the returned sequence numbers have gaps — a log whose
+    /// events were truncated or recorded on another lane. A recipe that
+    /// presented a gapped log as a whole plan would be a silent wrong
+    /// answer, so the gap is stated rather than smoothed over.
+    pub sequence_contiguous: bool,
+    /// Events found in the source that could not be decoded (durable path
+    /// only) — disclosed, never dropped in silence.
+    pub undecodable_events: usize,
+    pub steps: Vec<RecipeStep>,
+    /// Every checkpoint declaration on the source, with its spans.
+    pub checkpoints: Vec<RecipeCheckpoint>,
+    pub certificate_summary: RecipeCertificateSummary,
+    /// How to use this: the contract a re-parameterizing client follows.
+    pub reparameterize: &'static str,
+}
+
+/// The recorded op parameters of a step — `parameters.params` for the
+/// `Operation::Generic` events every live kernel call records, or the full
+/// tagged operation for typed variants.
+fn recipe_params(op: &Operation) -> serde_json::Value {
+    match generic_parameters(op) {
+        Some(params) => params
+            .get("params")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+        None => serde_json::to_value(op).unwrap_or(serde_json::Value::Null),
+    }
+}
+
+/// The intent RECORDED on an event, read from the provenance facet the
+/// recorder bridge writes (`roshera.intent`). Never derived, never
+/// substituted from a checkpoint — an absent facet reads back as `None`.
+fn recipe_intent(op: &Operation) -> Option<String> {
+    generic_parameters(op)?
+        .get("facets")?
+        .get("roshera.intent")?
+        .get("text")?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// Read a `[f64; 3]` out of three recorded scalar keys.
+fn recorded_triple(params: &serde_json::Value, keys: [&str; 3]) -> Option<[f64; 3]> {
+    Some([
+        params.get(keys[0])?.as_f64()?,
+        params.get(keys[1])?.as_f64()?,
+        params.get(keys[2])?.as_f64()?,
+    ])
+}
+
+/// Rewrite one recorded `ProfileEdge` (serde tag `kind`) into the wire
+/// shape `POST /api/geometry/revolve` parses (tag `type`). `None` for a
+/// variant the route does not accept — `circle` is a legal recorded edge
+/// with no counterpart on that route, and inventing one would produce a
+/// call that 400s at the caller.
+fn revolve_segment_for_reissue(seg: &serde_json::Value) -> Option<serde_json::Value> {
+    let obj = seg.as_object()?;
+    let kind = obj.get("kind")?.as_str()?;
+    if !matches!(kind, "line" | "arc" | "nurbs") {
+        return None;
+    }
+    let mut out = serde_json::Map::new();
+    out.insert(
+        "type".to_string(),
+        serde_json::Value::String(kind.to_string()),
+    );
+    for (k, v) in obj {
+        if k != "kind" {
+            out.insert(k.clone(), v.clone());
+        }
+    }
+    Some(serde_json::Value::Object(out))
+}
+
+/// The call that re-issues one recorded step, or the reason there is none.
+///
+/// Mapped kinds are exactly the ones the proven corpus is built from
+/// (revolve + primitives + booleans). Everything else — renames, deletes,
+/// drawing events, sketch sessions — returns a stated reason: a recipe
+/// that guessed a call for an op it does not understand would hand an
+/// agent a request that fails, or worse, one that succeeds differently.
+fn recipe_reissue(
+    op_kind: &str,
+    params: &serde_json::Value,
+    inputs: &[String],
+) -> Result<RecipeReissue, String> {
+    let create3d = |key_path: &serde_json::Value| -> Option<serde_json::Value> {
+        key_path.get("Create3D")?.get("parameters").cloned()
+    };
+    match op_kind {
+        "create_cylinder_3d" => {
+            let p = create3d(params)
+                .ok_or_else(|| "recorded cylinder carries no Create3D parameters".to_string())?;
+            let center = recorded_triple(&p, ["base_x", "base_y", "base_z"])
+                .ok_or_else(|| "recorded cylinder carries no base point".to_string())?;
+            let axis = recorded_triple(&p, ["axis_x", "axis_y", "axis_z"])
+                .ok_or_else(|| "recorded cylinder carries no axis".to_string())?;
+            let radius = p
+                .get("radius")
+                .and_then(serde_json::Value::as_f64)
+                .ok_or_else(|| "recorded cylinder carries no radius".to_string())?;
+            let height = p
+                .get("height")
+                .and_then(serde_json::Value::as_f64)
+                .ok_or_else(|| "recorded cylinder carries no height".to_string())?;
+            Ok(RecipeReissue {
+                method: "POST",
+                path: "/api/geometry/cylinder",
+                body: serde_json::json!({
+                    "center": center,
+                    "axis": axis,
+                    "radius": radius,
+                    "height": height,
+                }),
+                symbolic_operands: Vec::new(),
+            })
+        }
+        "create_box_3d" => {
+            let p = create3d(params)
+                .ok_or_else(|| "recorded box carries no Create3D parameters".to_string())?;
+            let num = |k: &str| p.get(k).and_then(serde_json::Value::as_f64);
+            let (Some(width), Some(height), Some(depth)) =
+                (num("width"), num("height"), num("depth"))
+            else {
+                return Err("recorded box carries no width/height/depth".to_string());
+            };
+            Ok(RecipeReissue {
+                method: "POST",
+                path: "/api/geometry/box",
+                body: serde_json::json!({
+                    "width": width,
+                    "depth": depth,
+                    "height": height,
+                }),
+                symbolic_operands: Vec::new(),
+            })
+        }
+        "revolve_typed" => {
+            let segments = params
+                .get("profile_segments")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| "recorded revolve carries no profile_segments".to_string())?;
+            let mut wire = Vec::with_capacity(segments.len());
+            for (i, seg) in segments.iter().enumerate() {
+                let mapped = revolve_segment_for_reissue(seg).ok_or_else(|| {
+                    format!(
+                        "profile_segments[{i}] is a recorded edge kind that \
+                         POST /api/geometry/revolve does not accept (it takes \
+                         line/arc/nurbs); the recorded params are still exact"
+                    )
+                })?;
+                wire.push(mapped);
+            }
+            let mut body = serde_json::Map::new();
+            body.insert(
+                "profile_segments".to_string(),
+                serde_json::Value::Array(wire),
+            );
+            for key in [
+                "axis_origin",
+                "axis_direction",
+                "angle_deg",
+                "segments",
+                "name",
+            ] {
+                if let Some(v) = params.get(key) {
+                    body.insert(key.to_string(), v.clone());
+                }
+            }
+            Ok(RecipeReissue {
+                method: "POST",
+                path: "/api/geometry/revolve",
+                body: serde_json::Value::Object(body),
+                symbolic_operands: Vec::new(),
+            })
+        }
+        "boolean_union" | "boolean_difference" | "boolean_intersection" => {
+            let operation = match op_kind {
+                "boolean_union" => "union",
+                "boolean_difference" => "difference",
+                _ => "intersection",
+            };
+            // The recorded operands are kernel integer ids, which no client
+            // can re-issue. The event's own lineage refs ARE the symbolic
+            // form: the caller binds each token to the id its re-issue of
+            // the producing step returned.
+            let (Some(a), Some(b)) = (inputs.first(), inputs.get(1)) else {
+                return Err(
+                    "recorded boolean does not name two operands in its lineage refs".to_string(),
+                );
+            };
+            Ok(RecipeReissue {
+                method: "POST",
+                path: "/api/geometry/boolean",
+                body: serde_json::json!({
+                    "operation": operation,
+                    "object_a": a,
+                    "object_b": b,
+                }),
+                symbolic_operands: vec!["object_a".to_string(), "object_b".to_string()],
+            })
+        }
+        other => Err(format!(
+            "no re-issue mapping is defined for `{other}`; the recorded \
+             parameters above are still the verbatim truth — re-issue it \
+             through whichever route records this kind"
+        )),
+    }
+}
+
+/// Map a [`timeline_engine::Checkpoint`] onto the wire summary
+/// `GET /api/timeline/checkpoints` serves. `covers` is a placeholder here;
+/// [`fill_covers`] is the only writer, exactly as in [`list_checkpoints`].
+fn checkpoint_summary(c: timeline_engine::Checkpoint) -> CheckpointSummary {
+    CheckpointSummary {
+        id: c.id.to_string(),
+        name: c.name,
+        description: c.description,
+        event_range: [c.event_range.0, c.event_range.1],
+        covers: [c.event_range.0, c.event_range.1],
+        branch_id: branch_ref_string(&c.branch_id),
+        author: author_label(&c.author),
+        timestamp: c.timestamp.to_rfc3339(),
+        tags: c.tags,
+    }
+}
+
+/// Project an ordered event slice + its checkpoint declarations into a
+/// recipe body. Shared by both sources so the live and durable paths
+/// cannot answer differently about the same log.
+fn build_recipe(
+    source: RecipeSource,
+    mut events: Vec<TimelineEvent>,
+    mut summaries: Vec<CheckpointSummary>,
+    window: &RecipeQuery,
+    undecodable_events: usize,
+) -> RecipeResponse {
+    events.sort_by_key(|e| e.sequence_number);
+    if let Some(from) = window.from {
+        events.retain(|e| e.sequence_number >= from);
+    }
+    if let Some(to) = window.to {
+        events.retain(|e| e.sequence_number <= to);
+    }
+    fill_covers(&mut summaries);
+
+    let checkpoints: Vec<RecipeCheckpoint> = summaries
+        .iter()
+        .map(|s| RecipeCheckpoint {
+            id: s.id.clone(),
+            name: s.name.clone(),
+            description: s.description.clone(),
+            branch_id: s.branch_id.clone(),
+            event_range: s.event_range,
+            covers: s.covers,
+            covers_is_empty: s.covers[0] > s.covers[1],
+            author: s.author.clone(),
+            timestamp: s.timestamp.clone(),
+        })
+        .collect();
+
+    let mut steps: Vec<RecipeStep> = Vec::with_capacity(events.len());
+    let mut sound = 0usize;
+    let mut unsound = 0usize;
+    let mut indeterminate = 0usize;
+    let mut certified = 0usize;
+    let mut last_certified_sequence: Option<u64> = None;
+
+    for event in &events {
+        let lineage = event_lineage(event);
+        let params = recipe_params(&event.operation);
+        let op_kind = operation_kind(&event.operation);
+        let (reissue, reissue_absent_reason) =
+            match recipe_reissue(&op_kind, &params, &lineage.inputs) {
+                Ok(r) => (Some(r), None),
+                Err(reason) => (None, Some(reason)),
+            };
+
+        // Attribution by `covers`, and ONLY by a span that is unambiguous:
+        // consecutive checkpoints that end on the same event produce an
+        // empty span, and more than one non-empty match would mean the
+        // declarations overlap. Either way the honest answer is "no
+        // attribution + the reason", not the most recent declaration —
+        // a confidently wrong label is worse than none.
+        let matching: Vec<&RecipeCheckpoint> = checkpoints
+            .iter()
+            .filter(|c| {
+                !c.covers_is_empty
+                    && c.covers[0] <= event.sequence_number
+                    && event.sequence_number <= c.covers[1]
+            })
+            .collect();
+        let (checkpoint, checkpoint_absent_reason) = match matching.as_slice() {
+            [one] => (
+                Some(RecipeStepCheckpoint {
+                    id: one.id.clone(),
+                    name: one.name.clone(),
+                }),
+                None,
+            ),
+            [] => (
+                None,
+                Some(
+                    "no checkpoint declaration covers this step; its `intent` \
+                     field (recorded on the event itself) is the authority here"
+                        .to_string(),
+                ),
+            ),
+            many => (
+                None,
+                Some(format!(
+                    "{} checkpoint declarations cover this step; the attribution \
+                     is ambiguous and is NOT guessed — read `checkpoints` and decide",
+                    many.len()
+                )),
+            ),
+        };
+
+        let certificate = EventCertificate::from_metadata(&event.metadata);
+        if let Some(cert) = &certificate {
+            certified += 1;
+            last_certified_sequence = Some(event.sequence_number);
+            match cert.is_sound {
+                Some(true) => sound += 1,
+                Some(false) => unsound += 1,
+                None => indeterminate += 1,
+            }
+        }
+
+        steps.push(RecipeStep {
+            sequence: event.sequence_number,
+            event_id: event.id.to_string(),
+            op_kind,
+            params,
+            inputs: lineage.inputs,
+            outputs: lineage.outputs,
+            intent: recipe_intent(&event.operation),
+            checkpoint,
+            checkpoint_absent_reason,
+            reissue,
+            reissue_absent_reason,
+            certificate,
+            author: author_label(&event.author),
+            author_kind: author_kind(&event.author),
+            timestamp: event.timestamp.to_rfc3339(),
+        });
+    }
+
+    let sequence_range = match (steps.first(), steps.last()) {
+        (Some(f), Some(l)) => Some([f.sequence, l.sequence]),
+        _ => None,
+    };
+    let sequence_contiguous = match sequence_range {
+        Some([first, last]) => last.saturating_sub(first) as usize + 1 == steps.len(),
+        None => true,
+    };
+
+    RecipeResponse {
+        source,
+        step_count: steps.len(),
+        sequence_range,
+        sequence_contiguous,
+        undecodable_events,
+        certificate_summary: RecipeCertificateSummary {
+            steps_total: steps.len(),
+            steps_with_recorded_certificate: certified,
+            sound,
+            unsound,
+            indeterminate,
+            last_certified_sequence,
+            note: "counted from the certificates RECORDED on the events; this is \
+                   not a re-measurement. For a fresh verdict call \
+                   GET /api/timeline/rebuild-certificate/{branch}.",
+        },
+        steps,
+        checkpoints,
+        reparameterize: "Re-issue `steps` in order, each through its `reissue.method` \
+                         + `reissue.path`, editing the numbers in `reissue.body`. Any \
+                         body key listed in `reissue.symbolic_operands` holds a recipe-local \
+                         entity token (`solid:0`) naming the step that PRODUCED it — bind \
+                         each to the id your own re-issue of that step returned. A step \
+                         with `reissue: null` states why in `reissue_absent_reason`; its \
+                         `params` remain the verbatim recorded truth.",
+    }
+}
+
+/// `GET /api/timeline/recipe/{branch_or_document}` — project a proven
+/// build into a retrievable, re-parameterizable plan.
+///
+/// Read-only in every sense: no model is touched, no document is
+/// activated, nothing is written. An unknown reference is a TYPED 404
+/// (`ApiError::document_not_found`) — an empty recipe for a document that
+/// does not exist would be exactly the silent wrong answer this kernel
+/// refuses to give.
+pub async fn get_recipe(
+    State(state): State<AppState>,
+    Path(reference): Path<String>,
+    Query(window): Query<RecipeQuery>,
+) -> Result<Json<RecipeResponse>, ApiError> {
+    // Drain in-flight recorder ops so a recipe of the live branch reflects
+    // every operation the client has issued, not just those the background
+    // worker happened to have drained.
+    let _ = state.timeline_recorder.flush().await;
+
+    // 1. A live branch ref that actually exists wins — the freshest truth,
+    //    and the same read `dependency-graph/{branch}` performs.
+    if let Ok(branch_id) = resolve_branch_ref(&reference) {
+        let live = {
+            let timeline = state.timeline.read().await;
+            timeline.get_branch(&branch_id).map(|_| {
+                let events = timeline
+                    .get_branch_events(&branch_id, None, None)
+                    .unwrap_or_default();
+                let label = branch_ref_string(&branch_id);
+                let summaries: Vec<CheckpointSummary> = timeline
+                    .list_checkpoints()
+                    .into_iter()
+                    .map(checkpoint_summary)
+                    .filter(|c| c.branch_id == label)
+                    .collect();
+                (events, summaries, label)
+            })
+        };
+        if let Some((events, summaries, label)) = live {
+            let document = state.active_document.read().await.clone();
+            return Ok(Json(build_recipe(
+                RecipeSource {
+                    kind: "live_branch",
+                    reference: reference.clone(),
+                    branch: label,
+                    document: Some(document),
+                    note: "projected from the LIVE in-memory timeline of the open \
+                           document, after draining the recorder — it includes \
+                           operations the durable writer may not have flushed yet.",
+                },
+                events,
+                summaries,
+                &window,
+                0,
+            )));
+        }
+    }
+
+    // 2. The document currently open answers from the live timeline too:
+    //    same log, and it is strictly fresher than its persisted copy.
+    if *state.active_document.read().await == reference {
+        let (events, summaries) = {
+            let timeline = state.timeline.read().await;
+            let branch = BranchId::main();
+            let events = timeline
+                .get_branch_events(&branch, None, None)
+                .unwrap_or_default();
+            let summaries: Vec<CheckpointSummary> = timeline
+                .list_checkpoints()
+                .into_iter()
+                .map(checkpoint_summary)
+                .collect();
+            (events, summaries)
+        };
+        return Ok(Json(build_recipe(
+            RecipeSource {
+                kind: "live_branch",
+                reference: reference.clone(),
+                branch: "main".to_string(),
+                document: Some(reference.clone()),
+                note: "this document is the one currently open, so its recipe is \
+                       projected from the LIVE in-memory timeline rather than from \
+                       durable storage — the fresher of the two.",
+            },
+            events,
+            summaries,
+            &window,
+            0,
+        )));
+    }
+
+    // 3. Any OTHER registered document is read straight out of durable
+    //    storage. No activation: retrieving a proven plan must never
+    //    disturb the caller's live model.
+    let known = state
+        .database
+        .load_documents()
+        .await
+        .map_err(|e| {
+            ApiError::new(
+                ErrorCode::Internal,
+                format!("could not read the document registry: {e}"),
+            )
+        })?
+        .into_iter()
+        .any(|r| r.id == reference);
+    if !known {
+        return Err(ApiError::document_not_found(&reference));
+    }
+
+    let rows = state
+        .database
+        .load_all_timeline_events(&reference)
+        .await
+        .map_err(|e| {
+            ApiError::new(
+                ErrorCode::Internal,
+                format!("could not read the persisted event log: {e}"),
+            )
+        })?;
+    let mut events: Vec<TimelineEvent> = Vec::with_capacity(rows.len());
+    let mut undecodable = 0usize;
+    for row in &rows {
+        match serde_json::from_value::<TimelineEvent>(row.data.clone()) {
+            Ok(event) => events.push(event),
+            Err(_) => undecodable += 1,
+        }
+    }
+    let branches: std::collections::BTreeSet<String> = rows
+        .iter()
+        .map(|r| r.branch_id.clone().unwrap_or_else(|| "main".to_string()))
+        .collect();
+    let branch = match branches.len() {
+        1 => branches
+            .iter()
+            .next()
+            .cloned()
+            .unwrap_or_else(|| "main".to_string()),
+        _ => "*".to_string(),
+    };
+
+    let summaries: Vec<CheckpointSummary> = state
+        .database
+        .load_checkpoints(&reference)
+        .await
+        .map_err(|e| {
+            ApiError::new(
+                ErrorCode::Internal,
+                format!("could not read the persisted checkpoints: {e}"),
+            )
+        })?
+        .into_iter()
+        .filter_map(|record| {
+            serde_json::from_value::<timeline_engine::Checkpoint>(record.data).ok()
+        })
+        .map(checkpoint_summary)
+        .collect();
+
+    Ok(Json(build_recipe(
+        RecipeSource {
+            kind: "durable_document",
+            reference: reference.clone(),
+            branch,
+            document: Some(reference.clone()),
+            note: "projected from the document's PERSISTED event log; the document \
+                   was NOT opened and the live model was not touched.",
+        },
+        events,
+        summaries,
+        &window,
+        undecodable,
+    )))
+}
+
 #[cfg(test)]
 mod undo_redo_entities_affected_tests {
     use super::*;

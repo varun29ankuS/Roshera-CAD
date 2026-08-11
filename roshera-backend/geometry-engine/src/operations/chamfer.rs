@@ -3784,6 +3784,7 @@ fn get_adjacent_faces(
     // Collect all shell IDs first to avoid borrowing issues
     let mut shell_ids = vec![solid.outer_shell];
     shell_ids.extend_from_slice(&solid.inner_shells);
+    shell_ids.extend_from_slice(&solid.peer_shells);
 
     for shell_id in shell_ids {
         let shell = model

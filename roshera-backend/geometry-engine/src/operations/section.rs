@@ -144,6 +144,7 @@ pub fn section_solid_by_plane(
     let mut shells: Vec<ShellId> = Vec::with_capacity(1 + solid.inner_shells.len());
     shells.push(solid.outer_shell);
     shells.extend_from_slice(&solid.inner_shells);
+    shells.extend_from_slice(&solid.peer_shells);
 
     let mut fragments: Vec<Polyline3D> = Vec::new();
     for shell_id in shells {

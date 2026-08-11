@@ -229,6 +229,7 @@ fn face_in_solid(model: &BRepModel, solid_id: u32, face: FaceId) -> bool {
     };
     let mut shells = vec![solid.outer_shell];
     shells.extend_from_slice(&solid.inner_shells);
+    shells.extend_from_slice(&solid.peer_shells);
     shells.into_iter().any(|sh| {
         model
             .shells
@@ -1919,6 +1920,7 @@ mod tests {
         let s = model.solids.get(solid)?;
         let mut shells = vec![s.outer_shell];
         shells.extend_from_slice(&s.inner_shells);
+        shells.extend_from_slice(&s.peer_shells);
         for sh in shells {
             let shell = model.shells.get(sh)?;
             for &fid in &shell.faces {

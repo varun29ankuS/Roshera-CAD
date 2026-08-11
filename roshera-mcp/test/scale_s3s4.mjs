@@ -90,7 +90,10 @@ console.log("(w1) WORKBENCH status shape");
     drawing: 8,
     analysis: 14,
     labels: 11,
-    timeline: 15,
+    // 15 -> 16 (2026-08-11, task #10): `recipe_get` — retrieval of a
+    // certified past build as a re-parameterizable plan. History/
+    // certification concern, same bench as the rest of the family.
+    timeline: 16,
   };
   for (const [bench, expected] of Object.entries(EXPECTED_BENCH_COUNTS)) {
     const got = st.benches[bench];
@@ -112,16 +115,16 @@ console.log("(w1b) WORKBENCH: 'timeline' is switchable (history/branching/certif
   else fail(`SWITCHABLE_BENCHES missing 'timeline': ${SWITCHABLE_BENCHES.join(",")}`);
 
   const timelineTools = workbench.benchToolNames("timeline");
-  if (timelineTools.length === 15)
-    pass(`timeline bench holds exactly 15 tools: ${timelineTools.join(",")}`);
-  else fail(`timeline bench holds ${timelineTools.length} tools, expected 15: ${timelineTools.join(",")}`);
+  if (timelineTools.length === 16)
+    pass(`timeline bench holds exactly 16 tools: ${timelineTools.join(",")}`);
+  else fail(`timeline bench holds ${timelineTools.length} tools, expected 16: ${timelineTools.join(",")}`);
 
   // index.ts pre-mounts every switchable-bench tool (disabled) at startup so a
   // later enable() has a real handle to flip — a tool missing from this set
   // would report switched=true while nothing actually becomes live.
   const preMounted = new Set(workbench.allSwitchableBenchTools());
   const allPreMounted = timelineTools.every((n) => preMounted.has(n));
-  if (allPreMounted) pass("all 15 timeline tools are in allSwitchableBenchTools() (pre-mount set)");
+  if (allPreMounted) pass("all 16 timeline tools are in allSwitchableBenchTools() (pre-mount set)");
   else fail(`timeline tools missing from allSwitchableBenchTools(): ${timelineTools.filter((n) => !preMounted.has(n)).join(",")}`);
 
   const r = workbench.enter("timeline");
@@ -139,9 +142,11 @@ console.log("(w1b) WORKBENCH: 'timeline' is switchable (history/branching/certif
   // OTHER 14 tools on top of core — the +15 formula here used to pass by
   // accident (the un-deduped double-count of timeline_checkpoint cancelled
   // the arithmetic); it is now the honest count.
-  if (r.exposed_count === MINIMAL_SURFACE.length + 14)
-    pass(`timeline exposed_count = ${r.exposed_count} = MINIMAL_SURFACE(${MINIMAL_SURFACE.length}) + 14 (15 timeline tools, 1 already core-resident)`);
-  else fail(`timeline exposed_count ${r.exposed_count} ≠ ${MINIMAL_SURFACE.length + 14}`);
+  // +14 -> +15 (2026-08-11, task #10): recipe_get is the 16th timeline tool
+  // and is NOT core-resident, so it adds one to the on-top-of-core count.
+  if (r.exposed_count === MINIMAL_SURFACE.length + 15)
+    pass(`timeline exposed_count = ${r.exposed_count} = MINIMAL_SURFACE(${MINIMAL_SURFACE.length}) + 15 (16 timeline tools, 1 already core-resident)`);
+  else fail(`timeline exposed_count ${r.exposed_count} ≠ ${MINIMAL_SURFACE.length + 15}`);
 
   const back = workbench.enter("core_only");
   const afterCore = new Set(workbench.exposedNames());

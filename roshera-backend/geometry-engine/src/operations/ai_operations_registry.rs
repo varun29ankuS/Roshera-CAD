@@ -723,6 +723,7 @@ impl OperationsRegistry {
                     // Check outer shell
                     let mut shells_to_check = vec![solid.outer_shell];
                     shells_to_check.extend(&solid.inner_shells);
+                    shells_to_check.extend(&solid.peer_shells);
 
                     for &shell_id in &shells_to_check {
                         if let Some(shell) = model.shells.get(shell_id) {
@@ -824,6 +825,7 @@ impl OperationsRegistry {
                     // Check outer shell
                     let mut shells_to_check = vec![solid.outer_shell];
                     shells_to_check.extend(&solid.inner_shells);
+                    shells_to_check.extend(&solid.peer_shells);
 
                     for &shell_id in &shells_to_check {
                         if let Some(shell) = model.shells.get(shell_id) {

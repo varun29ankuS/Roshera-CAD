@@ -544,8 +544,9 @@ impl ParallelValidator {
         // edge must traverse it in OPPOSITE senses. Run per shell of every solid so
         // each error is born attributed to its solid.
         for (sid, solid) in model.solids.iter() {
-            let shells =
-                std::iter::once(solid.outer_shell).chain(solid.inner_shells.iter().copied());
+            let shells = std::iter::once(solid.outer_shell)
+                .chain(solid.inner_shells.iter().copied())
+                .chain(solid.peer_shells.iter().copied());
             for shell_id in shells {
                 for mut err in check_face_orientations(model, shell_id) {
                     if let Some(loc) = err.location_mut() {
@@ -581,8 +582,9 @@ impl ParallelValidator {
         let mut edge_owner: std::collections::HashMap<EdgeId, SolidId> =
             std::collections::HashMap::new();
         for (sid, solid) in model.solids.iter() {
-            let shells =
-                std::iter::once(solid.outer_shell).chain(solid.inner_shells.iter().copied());
+            let shells = std::iter::once(solid.outer_shell)
+                .chain(solid.inner_shells.iter().copied())
+                .chain(solid.peer_shells.iter().copied());
             for shell_id in shells {
                 let Some(shell) = model.shells.get(shell_id) else {
                     continue;
@@ -1110,6 +1112,7 @@ impl ParallelValidator {
         // hollow solid with inner shells is handled by the same formula.
         let shells = std::iter::once(solid.outer_shell)
             .chain(solid.inner_shells.iter().copied())
+            .chain(solid.peer_shells.iter().copied())
             .collect::<Vec<_>>();
         let shell_count = shells.len() as i32;
         let shell_id = solid.outer_shell; // diagnostic location anchor
@@ -1433,7 +1436,9 @@ pub fn validate_solid_scoped(
 fn face_owner_map(model: &BRepModel) -> std::collections::HashMap<FaceId, SolidId> {
     let mut map = std::collections::HashMap::new();
     for (sid, solid) in model.solids.iter() {
-        let shells = std::iter::once(solid.outer_shell).chain(solid.inner_shells.iter().copied());
+        let shells = std::iter::once(solid.outer_shell)
+            .chain(solid.inner_shells.iter().copied())
+            .chain(solid.peer_shells.iter().copied());
         for shid in shells {
             if let Some(shell) = model.shells.get(shid) {
                 for &fid in &shell.faces {
@@ -1450,7 +1455,7 @@ fn shell_owner_map(model: &BRepModel) -> std::collections::HashMap<ShellId, Soli
     let mut map = std::collections::HashMap::new();
     for (sid, solid) in model.solids.iter() {
         map.insert(solid.outer_shell, sid);
-        for &shid in &solid.inner_shells {
+        for &shid in solid.inner_shells.iter().chain(solid.peer_shells.iter()) {
             map.insert(shid, sid);
         }
     }
@@ -1523,7 +1528,9 @@ pub fn validate_faces_scoped(
     let face_set: std::collections::HashSet<FaceId> = faces.iter().copied().collect();
     let mut touched_solids: std::collections::HashSet<SolidId> = std::collections::HashSet::new();
     for (sid, solid) in model.solids.iter() {
-        let shells = std::iter::once(solid.outer_shell).chain(solid.inner_shells.iter().copied());
+        let shells = std::iter::once(solid.outer_shell)
+            .chain(solid.inner_shells.iter().copied())
+            .chain(solid.peer_shells.iter().copied());
         for shid in shells {
             let Some(shell) = model.shells.get(shid) else {
                 continue;

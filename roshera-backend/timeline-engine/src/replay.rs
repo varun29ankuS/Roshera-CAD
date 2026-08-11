@@ -2698,7 +2698,10 @@ mod tests {
         use geometry_engine::primitives::surface::Cylinder;
         let s = m.solids.get(solid)?;
         let mut faces: Vec<FaceId> = Vec::new();
-        for shid in std::iter::once(s.outer_shell).chain(s.inner_shells.iter().copied()) {
+        for shid in std::iter::once(s.outer_shell)
+            .chain(s.inner_shells.iter().copied())
+            .chain(s.peer_shells.iter().copied())
+        {
             if let Some(sh) = m.shells.get(shid) {
                 faces.extend(sh.faces.iter().copied());
             }

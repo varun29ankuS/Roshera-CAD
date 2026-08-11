@@ -568,6 +568,18 @@ pub struct ValidityCertificate {
     /// surfaced here instead, so a part's certificate reflects only ITS OWN
     /// topology while the debris stays loudly visible. `0` on a clean model.
     pub model_debris_orphan_faces: usize,
+    /// MULTI-BODY DISCLOSURE — how many ADDITIONAL disjoint bodies this solid
+    /// carries beyond the one bounded by its outer shell
+    /// (`Solid::peer_shells.len()`). `0` for an ordinary single-lump part.
+    ///
+    /// A boolean can legitimately return several lumps: a union of operands
+    /// that never touched, or a difference that severs a plate. The geometry is
+    /// right (the Monte-Carlo and grid oracles measure it so), which is why a
+    /// non-zero count does NOT block [`ValidityCertificate::is_sound`] — but
+    /// "one part" and "two parts" are different answers to a caller who asked
+    /// for a part, so the kernel's own verdict says which it is. Before this
+    /// field, the multi-body fact existed only on an opt-in pipeline trace.
+    pub peer_count: usize,
 }
 
 impl ValidityCertificate {
@@ -629,7 +641,16 @@ impl GroundTruth {
             self.certificate.mesh_quality.min_angle_deg,
             self.certificate.mesh_quality.max_normal_deviation_deg,
             self.certificate.mesh_quality.boundary_crossing_facets,
-        ) + &if self.certificate.model_debris_orphan_faces > 0 {
+        ) + &if self.certificate.peer_count > 0 {
+            // Multi-body disclosure — the result is several disjoint lumps, not
+            // one. Sound, but a different answer than "a part".
+            format!(
+                " | ⚠ multi-body: {} peer body(ies) beyond the outer shell",
+                self.certificate.peer_count
+            )
+        } else {
+            String::new()
+        } + &if self.certificate.model_debris_orphan_faces > 0 {
             // Model-level honesty signal — NOT this part's fault, does not
             // touch `sound`, but kept loudly visible in the ambient verdict.
             format!(
@@ -773,6 +794,8 @@ impl ValidityCertificate {
             inconsistent_directed_edges: 0,
             errors: vec![],
             model_debris_orphan_faces: 0,
+            // A single-lump part: no sibling bodies to disclose.
+            peer_count: 0,
         }
     }
 }

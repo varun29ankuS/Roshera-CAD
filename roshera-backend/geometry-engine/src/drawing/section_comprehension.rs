@@ -161,6 +161,7 @@ fn part_bounds(model: &BRepModel, solid_id: SolidId) -> Option<([f64; 3], [f64; 
     let mut any = false;
     let mut shells = vec![solid.outer_shell];
     shells.extend_from_slice(&solid.inner_shells);
+    shells.extend_from_slice(&solid.peer_shells);
     for sh in shells {
         let Some(shell) = model.shells.get(sh) else {
             continue;
@@ -251,6 +252,7 @@ pub fn section_cut_through(
     };
     let mut shells = vec![solid.outer_shell];
     shells.extend_from_slice(&solid.inner_shells);
+    shells.extend_from_slice(&solid.peer_shells);
 
     let mut cuts: Vec<SectionCut> = Vec::new();
 

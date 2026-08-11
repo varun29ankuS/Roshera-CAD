@@ -613,6 +613,7 @@ mod tests {
                 .map(|s| {
                     std::iter::once(s.outer_shell)
                         .chain(s.inner_shells.iter().copied())
+                        .chain(s.peer_shells.iter().copied())
                         .filter_map(|sh| m.shells.get(sh))
                         .map(|sh| sh.faces.len())
                         .sum::<usize>()

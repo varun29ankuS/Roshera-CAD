@@ -3230,7 +3230,22 @@ impl BRepModel {
         // instead of poisoning every part's `brep_valid` (the mis-attribution
         // fixed in `validate_solid_scoped`).
         let model_debris_orphan_faces = crate::primitives::validation::count_orphan_faces(self);
+        // MULTI-BODY DISCLOSURE. A boolean can legitimately return several
+        // disjoint lumps (a union of operands that never touched, a difference
+        // that severs a plate). That result is not wrong — the MC/grid oracles
+        // measure its geometry as correct — but "one part" and "three parts"
+        // are different answers to a caller who asked for a part, so the
+        // certificate STATES the count rather than letting it pass silently.
+        // It does not block `is_sound()`: refusing would destroy working,
+        // oracle-verified geometry to flag a shape the kernel now models
+        // correctly (see `Solid::peer_shells`).
+        let peer_count = self
+            .solids
+            .get(solid_id)
+            .map(|s| s.peer_count())
+            .unwrap_or(0);
         ValidityCertificate {
+            peer_count,
             brep_valid: v.is_valid,
             watertight,
             manifold,
@@ -4259,14 +4274,28 @@ impl BRepModel {
             .map(|p| p.surface_area)
     }
 
-    /// Number of faces on a solid's outer shell — the cheap O(1) structural
+    /// Number of faces on a solid's OUTER boundary — the cheap O(1) structural
     /// count surfaced in the ambient (per-op) perception block alongside
-    /// `volume`/`dims`. A single shell-length read, no mass-props or
-    /// certificate work. `None` when the solid (or its shell) is unknown.
+    /// `volume`/`dims`. A shell-length read, no mass-props or certificate
+    /// work. `None` when the solid (or its outer shell) is unknown.
+    ///
+    /// Sums the outer shell **and every peer shell**, because a peer is a
+    /// sibling BODY whose faces are exterior boundary just as much as the
+    /// outer shell's. Void (inner) shells are excluded — they bound cavities,
+    /// which this count has never included.
+    ///
+    /// While peer bodies were mis-filed as voids, a union of two disjoint
+    /// boxes answered `6` here for a 12-face result: the agent- and
+    /// perception-facing count could not see half the part.
     pub fn solid_outer_face_count(&self, solid_id: u32) -> Option<usize> {
         let solid = self.solids.get(solid_id)?;
-        let shell = self.shells.get(solid.outer_shell)?;
-        Some(shell.faces.len())
+        let mut count = self.shells.get(solid.outer_shell)?.faces.len();
+        for &peer in &solid.peer_shells {
+            if let Some(shell) = self.shells.get(peer) {
+                count += shell.faces.len();
+            }
+        }
+        Some(count)
     }
 
     /// Unified mass-properties entry point. Returns volume, surface
@@ -4343,7 +4372,11 @@ impl BRepModel {
         mesh: &crate::primitives::solid::SolidMassProperties,
     ) -> Option<crate::primitives::solid::SolidMassProperties> {
         let solid = self.solids.get(solid_id)?;
-        if !solid.inner_shells.is_empty() {
+        // Single lump only: a void makes the integral non-trivial, and a PEER
+        // body means the faces below are not the whole boundary — stamping
+        // `Exactness::Exact` on a partial integration is precisely the class of
+        // lie this kernel refuses.
+        if !solid.inner_shells.is_empty() || !solid.peer_shells.is_empty() {
             return None;
         }
         let shell = self.shells.get(solid.outer_shell)?;
@@ -4899,8 +4932,10 @@ impl BRepModel {
             }
         }
 
-        // Process inner shells with the same vertex sharing approach
-        for &inner_shell_id in &solid.inner_shells {
+        // Process the remaining shells — voids AND peer bodies — with the same
+        // vertex sharing approach. A peer's faces are part of what the viewer
+        // must see; omitting them would draw half a multi-body result.
+        for &inner_shell_id in solid.inner_shells.iter().chain(solid.peer_shells.iter()) {
             let inner_shell = self.shells.get(inner_shell_id)?;
 
             for &face_id in &inner_shell.faces {
@@ -5429,6 +5464,7 @@ impl<'a> TopologyBuilder<'a> {
             if let Some(solid) = self.model.solids.get(solid_id) {
                 let mut shells = vec![solid.outer_shell];
                 shells.extend_from_slice(&solid.inner_shells);
+                shells.extend_from_slice(&solid.peer_shells);
                 for sh in shells {
                     if let Some(shell) = self.model.shells.get(sh) {
                         fs.extend_from_slice(&shell.faces);

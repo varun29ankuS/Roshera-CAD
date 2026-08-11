@@ -118,6 +118,7 @@ impl OcclusionGrid {
         if let Some(solid) = model.solids.get(solid_id) {
             let mut shell_ids = vec![solid.outer_shell];
             shell_ids.extend_from_slice(&solid.inner_shells);
+            shell_ids.extend_from_slice(&solid.peer_shells);
             for sh in shell_ids {
                 if let Some(shell) = model.shells.get(sh) {
                     all_faces.extend_from_slice(&shell.faces);
@@ -481,6 +482,7 @@ fn solid_diagonal(model: &BRepModel, solid_id: SolidId) -> f64 {
     let mut any = false;
     let mut shells = vec![solid.outer_shell];
     shells.extend_from_slice(&solid.inner_shells);
+    shells.extend_from_slice(&solid.peer_shells);
     for sh in shells {
         let shell = match model.shells.get(sh) {
             Some(s) => s,
@@ -658,6 +660,7 @@ pub(crate) fn project_solid_edges_visibility_mode(
     // All shells (outer + inner), so a bore's own walls are classified too.
     let mut shell_ids = vec![solid.outer_shell];
     shell_ids.extend_from_slice(&solid.inner_shells);
+    shell_ids.extend_from_slice(&solid.peer_shells);
     let _ = shell; // outer shell fetched above only to validate existence.
 
     // Edge → adjacent-faces reverse map. The main walk below visits each edge

@@ -205,6 +205,7 @@ pub fn brep_integrity(model: &BRepModel, solid: SolidId, eps: f64) -> BRepIntegr
 
     let mut shells = vec![solid_ref.outer_shell];
     shells.extend(solid_ref.inner_shells.iter().copied());
+    shells.extend(solid_ref.peer_shells.iter().copied());
 
     // edge → list of (face id, type) referencing it, via face loops, plus the
     // per-reference loop-traversal direction (true = start→end) for orientation

@@ -14,7 +14,8 @@
 //!
 //! The response intentionally summarises rather than dumping every field:
 //!
-//! * **solids**: id, outer_shell, inner_shells, face_count
+//! * **solids**: id, outer_shell, inner_shells (voids), peer_shells (sibling
+//!   bodies), face_count
 //! * **faces**: id, surface_id, surface_type, outer_loop, inner_loop_count, orientation
 //! * **edges**: id, curve_id, curve_type, start_vertex, end_vertex
 //! * **surfaces**: id, type_name (Plane / Cylinder / Sphere / Cone / Torus / NURBS / …)
@@ -70,6 +71,9 @@ pub struct SolidSummary {
     pub id: u32,
     pub outer_shell: u32,
     pub inner_shell_count: usize,
+    /// Disjoint SIBLING bodies carried by this solid beyond the outer shell.
+    /// Non-zero means the "part" is several lumps (`Solid::peer_shells`).
+    pub peer_shell_count: usize,
     pub face_count: usize,
 }
 
@@ -134,14 +138,15 @@ pub fn build_snapshot(model: &BRepModel) -> KernelState {
         .iter()
         .take(ENTITY_LIMIT)
         .map(|(id, solid)| {
-            // Face count = sum over outer_shell + inner_shells of shell.faces.len().
-            // If a referenced shell is missing, count what we can find rather
-            // than failing — the diagnostics block flags structural issues.
+            // Face count = sum over outer_shell + inner_shells + peer_shells of
+            // shell.faces.len(). If a referenced shell is missing, count what we
+            // can find rather than failing — the diagnostics block flags
+            // structural issues.
             let mut face_count = 0usize;
             if let Some(shell) = model.shells.get(solid.outer_shell) {
                 face_count += shell.faces.len();
             }
-            for &inner in &solid.inner_shells {
+            for &inner in solid.inner_shells.iter().chain(solid.peer_shells.iter()) {
                 if let Some(shell) = model.shells.get(inner) {
                     face_count += shell.faces.len();
                 }
@@ -150,6 +155,7 @@ pub fn build_snapshot(model: &BRepModel) -> KernelState {
                 id,
                 outer_shell: solid.outer_shell,
                 inner_shell_count: solid.inner_shells.len(),
+                peer_shell_count: solid.peer_shells.len(),
                 face_count,
             }
         })

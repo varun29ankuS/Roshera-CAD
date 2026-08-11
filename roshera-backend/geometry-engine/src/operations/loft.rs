@@ -215,6 +215,7 @@ fn assign_loft_pids(model: &mut BRepModel, solid_id: SolidId) {
         if let Some(solid) = model.solids.get(solid_id) {
             let mut shells = vec![solid.outer_shell];
             shells.extend_from_slice(&solid.inner_shells);
+            shells.extend_from_slice(&solid.peer_shells);
             for sh in shells {
                 if let Some(shell) = model.shells.get(sh) {
                     fs.extend_from_slice(&shell.faces);

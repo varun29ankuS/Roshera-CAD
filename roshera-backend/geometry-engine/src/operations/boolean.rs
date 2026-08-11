@@ -19258,29 +19258,27 @@ fn reconstruct_topology(
     // (generalized winding number over the outer shell's own tessellation — the
     // same classifier `classify_point_gwn` uses for face selection)?
     //
-    // ⚠ KNOWN RESIDUAL — deliberately NOT fixed here. A shell that is NOT
-    // enclosed is a disjoint PEER BODY, not a void, and it is still filed into
-    // `inner_shells` because that is the only slot `Solid` has. Consumers then
-    // disagree about the same result: `Solid::compute_mass_properties`
-    // SUBTRACTS it, `solid_outer_face_count` cannot see its faces, and the
-    // mesh/tessellation path sums it POSITIVELY. A union of two disjoint 10³
-    // boxes therefore reports volume 1000 or 2000 depending on who asks, with
-    // 6 of its 12 faces invisible to the O(1) count — under a SOUND certificate.
+    // A shell that is NOT enclosed is a disjoint PEER BODY, not a void, and it
+    // is filed as one: `Solid::peer_shells`, the same-orientation sibling slot.
+    // That closed the last certified lie in this pipeline. While peers were
+    // filed as `inner_shells`, the consumers disagreed about the same result —
+    // `Solid::compute_mass_properties` SUBTRACTED the peer,
+    // `solid_outer_face_count` could not see its faces, and the
+    // mesh/tessellation path summed it POSITIVELY — so a union of two disjoint
+    // 10³ boxes reported volume 1000 or 2000 depending on who asked, with 6 of
+    // its 12 faces invisible to the O(1) count, under a SOUND certificate.
     //
-    // Closing that needs a peer-lump role on `Solid` that is neither
-    // `outer_shell` nor `inner_shells` — a schema change reaching `snapshot`,
-    // `.ros` serialization and export. It is out of scope for a boolean-local
-    // change, and three independent oracles currently depend on the present
-    // shape: `box_sphere_conquered_band_gate` (#91) pins two explicitly DISJOINT
-    // box∘sphere union cells against a 96³ grid truth, and
-    // `rotated_box_booleans_match_mc_truth` /
+    // Refusal was NOT the fix, and deliberately so: multi-lump results are
+    // legitimate geometry the oracles verify. `box_sphere_conquered_band_gate`
+    // (#91) pins two explicitly DISJOINT box∘sphere union cells against a 96³
+    // grid truth, and `rotated_box_booleans_match_mc_truth` /
     // `tilted_box_booleans_match_mc_truth` pin a four-body Difference against
-    // Monte-Carlo truth. All three pass because the MESH path is the one they
-    // read. Refusing multi-body results would break working, oracle-verified
-    // geometry to hide a bookkeeping defect; the count is DISCLOSED on the
-    // pipeline trace below instead.
-    let (outer_shell, attached_shells, free_bodies) = if shells.len() == 1 {
-        (shells[0], Vec::new(), 1usize)
+    // Monte-Carlo truth. Refusing would destroy working, oracle-verified
+    // geometry to hide a bookkeeping defect. Instead the bookkeeping was fixed
+    // and the multi-body count is DISCLOSED — on the pipeline trace below AND
+    // on the solid's certificate (`ValidityCertificate::peer_count`).
+    let (outer_shell, void_shells, peer_shells) = if shells.len() == 1 {
+        (shells[0], Vec::new(), Vec::new())
     } else {
         // One coarse mesh per shell; every measure below reads it. Measuring
         // through the MESH rather than the loop vertices is load-bearing: a
@@ -19315,52 +19313,57 @@ fn reconstruct_topology(
             .map(|p| p.triangles.as_slice())
             .unwrap_or(&[]);
 
-        // `others` keeps EVERY non-outer shell, enclosed or not. The enclosed
-        // ones are genuine voids; the rest are peer bodies whose retention as
-        // `inner_shells` is the known residual documented above — dropping them
-        // would delete real material (a severed plate would come back as one
-        // half), which is strictly worse than the bookkeeping problem. Only the
-        // COUNT of unenclosed shells changes behaviour, and only for Union.
-        let mut others: Vec<ShellId> = Vec::with_capacity(shells.len() - 1);
-        let mut free_bodies = 1usize; // the outer shell itself
+        // Every non-outer shell is SORTED by its proved status: enclosed by the
+        // outer shell ⇒ a genuine VOID; not enclosed ⇒ a disjoint PEER BODY.
+        // Both are retained — dropping a peer would delete real material (a
+        // severed plate would come back as one half) — but they now go to
+        // different slots on `Solid`, so mass-props, the boundary-face count
+        // and the mesh path finally agree about the same result.
+        let mut voids: Vec<ShellId> = Vec::new();
+        let mut peers: Vec<ShellId> = Vec::new();
         for (shell_id, probe) in probes.iter() {
             if *shell_id == outer_shell {
                 continue;
             }
-            others.push(*shell_id);
             let enclosed = probe
                 .as_ref()
                 .map(|p| point_is_inside_mesh(&p.centroid, outer_tris))
                 .unwrap_or(false);
-            if !enclosed {
-                free_bodies += 1;
+            if enclosed {
+                voids.push(*shell_id);
+            } else {
+                peers.push(*shell_id);
             }
         }
-        (outer_shell, others, free_bodies)
+        (outer_shell, voids, peers)
     };
 
-    if free_bodies > 1 {
-        // Disclosure, not a refusal — see the residual note above. This is the
-        // one place in the pipeline that KNOWS the result is several disjoint
-        // bodies rather than a body with cavities, so it says so.
+    if !peer_shells.is_empty() {
+        // Disclosure, not a refusal: a union of operands that never touched, or
+        // a difference that severs a body, is a legitimate multi-lump result
+        // whose geometry the MC/grid oracles measure as correct. The count also
+        // reaches the agent on the solid's certificate (`peer_count`) — this
+        // trace is the pipeline-local echo of the same fact.
         pipeline_trace(format_args!(
-            "stage=reconstruct_topology MULTI_BODY: result is {free_bodies} disjoint \
-             bodies filed as outer+inner shells (shells={shells:?}, outer={outer_shell}); \
-             mass-props will SUBTRACT the peers, the mesh path will ADD them",
+            "stage=reconstruct_topology MULTI_BODY: result is {} disjoint bodies \
+             (outer={outer_shell}, peers={peer_shells:?}, voids={void_shells:?}); \
+             peers ADD to mass and are visible to boundary-face queries",
+            1 + peer_shells.len(),
         ));
     }
 
     let solid = crate::primitives::solid::Solid::new(0, outer_shell);
     let solid_id = model.solids.add(solid);
 
-    // Attach the remaining shells. Enclosed ⇒ a genuine void. NOT enclosed ⇒ a
-    // peer body, which lands here too because `inner_shells` is the only slot
-    // `Solid` has — the known residual documented above. The binding is named
-    // `attached_shells`, not `voids`, precisely because it carries both: this
-    // whole defect existed because one field silently meant two things.
-    for shell_id in attached_shells {
+    // Attach the remaining shells to the slot their PROVED status earned.
+    for shell_id in void_shells {
         if let Some(solid_mut) = model.solids.get_mut(solid_id) {
             solid_mut.add_inner_shell(shell_id);
+        }
+    }
+    for shell_id in peer_shells {
+        if let Some(solid_mut) = model.solids.get_mut(solid_id) {
+            solid_mut.add_peer_shell(shell_id);
         }
     }
 
@@ -25806,7 +25809,7 @@ must be dropped; a 1·tol band rejects it and lets it double the rim"
                 if let Some(shell) = model.shells.get(solid.outer_shell) {
                     n += shell.face_count();
                 }
-                for &is in solid.inner_shells.iter() {
+                for &is in solid.inner_shells.iter().chain(solid.peer_shells.iter()) {
                     if let Some(sh) = model.shells.get(is) {
                         n += sh.face_count();
                     }
@@ -26778,6 +26781,7 @@ must be dropped; a 1·tol band rejects it and lets it double the rim"
                 .map(|s| {
                     std::iter::once(s.outer_shell)
                         .chain(s.inner_shells.iter().copied())
+                        .chain(s.peer_shells.iter().copied())
                         .filter_map(|sh| m.shells.get(sh))
                         .map(|sh| sh.faces.len())
                         .sum::<usize>()
@@ -27727,7 +27731,9 @@ must be dropped; a 1·tol band rejects it and lets it double the rim"
                     .get(res)
                     .into_iter()
                     .flat_map(|s| {
-                        std::iter::once(s.outer_shell).chain(s.inner_shells.iter().copied())
+                        std::iter::once(s.outer_shell)
+                            .chain(s.inner_shells.iter().copied())
+                            .chain(s.peer_shells.iter().copied())
                     })
                     .filter_map(|sh| m.shells.get(sh))
                     .flat_map(|sh| sh.faces.iter().copied())
@@ -27871,6 +27877,7 @@ must be dropped; a 1·tol band rejects it and lets it double the rim"
         if let Some(solid_ref) = m.solids.get(res) {
             let shells: Vec<_> = std::iter::once(solid_ref.outer_shell)
                 .chain(solid_ref.inner_shells.iter().copied())
+                .chain(solid_ref.peer_shells.iter().copied())
                 .collect();
             for sh in shells {
                 let Some(shell) = m.shells.get(sh) else {
@@ -28003,6 +28010,7 @@ must be dropped; a 1·tol band rejects it and lets it double the rim"
                 .map(|s| {
                     std::iter::once(s.outer_shell)
                         .chain(s.inner_shells.iter().copied())
+                        .chain(s.peer_shells.iter().copied())
                         .filter_map(|sh| m.shells.get(sh))
                         .map(|sh| sh.faces.len())
                         .sum::<usize>()
@@ -28449,6 +28457,7 @@ must be dropped; a 1·tol band rejects it and lets it double the rim"
                 .map(|s| {
                     std::iter::once(s.outer_shell)
                         .chain(s.inner_shells.iter().copied())
+                        .chain(s.peer_shells.iter().copied())
                         .filter_map(|sh| m.shells.get(sh))
                         .map(|sh| sh.faces.len())
                         .sum::<usize>()

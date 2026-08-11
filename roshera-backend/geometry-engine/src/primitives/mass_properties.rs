@@ -340,6 +340,19 @@ pub fn integrate_solid(
             }
         }
     }
+    // Peer shells are sibling BODIES, not cavities — their moments accumulate
+    // with the same sign as the outer shell's.
+    for &peer in &solid.peer_shells {
+        if let Some(sh) = model.shells.get(peer) {
+            for &fid in &sh.faces {
+                if let Some(face) = model.faces.get(fid) {
+                    if let Ok(fm) = integrate_face(face, model, tol) {
+                        acc += fm;
+                    }
+                }
+            }
+        }
+    }
     Some(assemble(acc, density))
 }
 

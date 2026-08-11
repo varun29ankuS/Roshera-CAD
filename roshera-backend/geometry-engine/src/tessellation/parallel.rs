@@ -34,9 +34,15 @@ pub fn tessellate_solid_parallel(
         mesh.merge(&shell_mesh);
     }
 
-    // Tessellate inner shells in parallel
-    let inner_meshes: Vec<ThreeJsMesh> = solid
+    // Tessellate the remaining shells in parallel — voids AND peer bodies.
+    // A peer body's surface is part of what this mesh must show.
+    let attached: Vec<crate::primitives::shell::ShellId> = solid
         .inner_shells
+        .iter()
+        .chain(solid.peer_shells.iter())
+        .copied()
+        .collect();
+    let inner_meshes: Vec<ThreeJsMesh> = attached
         .par_iter()
         .filter_map(|&shell_id| {
             model

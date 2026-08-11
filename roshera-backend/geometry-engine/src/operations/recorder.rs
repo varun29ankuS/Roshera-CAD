@@ -122,6 +122,12 @@ pub struct RecordedSolidCertificate {
     pub volume: Option<f64>,
     /// Outer-shell face count, when available.
     pub face_count: Option<usize>,
+    /// Disjoint SIBLING bodies beyond the outer shell
+    /// (`ValidityCertificate::peer_count`). Carried into the recorded
+    /// projection — and therefore into the timeline and the `.ros` file —
+    /// because "sound" alone does not tell a later reader whether the event
+    /// produced ONE part or several. `0` for an ordinary single-lump result.
+    pub peer_count: usize,
 }
 
 impl RecordedSolidCertificate {
@@ -144,6 +150,7 @@ impl RecordedSolidCertificate {
             self_intersection_free: cert.self_intersection_free,
             volume,
             face_count,
+            peer_count: cert.peer_count,
         }
     }
 }
@@ -1267,6 +1274,7 @@ mod tests {
             mesh_quality: MeshQuality::empty(),
             errors: vec![],
             model_debris_orphan_faces: 0,
+            peer_count: 0,
         }
     }
 

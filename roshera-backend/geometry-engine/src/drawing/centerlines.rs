@@ -114,6 +114,7 @@ pub fn centerlines(
 
     let mut shells = vec![solid.outer_shell];
     shells.extend_from_slice(&solid.inner_shells);
+    shells.extend_from_slice(&solid.peer_shells);
     for sh in shells {
         let shell = match model.shells.get(sh) {
             Some(s) => s,

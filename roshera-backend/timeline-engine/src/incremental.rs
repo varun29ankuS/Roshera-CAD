@@ -66,8 +66,10 @@ pub struct ModelDigest {
     faces: Vec<(u32, u32, u32, Vec<u32>, bool)>,
     /// `(id, faces, is_closed)`.
     shells: Vec<(u32, Vec<u32>, bool)>,
-    /// `(id, outer_shell, inner_shells)`.
-    solids: Vec<(u32, u32, Vec<u32>)>,
+    /// `(id, outer_shell, inner_shells, peer_shells)`. Peers are carried
+    /// separately so a rebuild that reclassifies a sibling body as a void (or
+    /// loses it) DIVERGES here instead of fingerprinting identically.
+    solids: Vec<(u32, u32, Vec<u32>, Vec<u32>)>,
     /// Persistent-id assignments, each sorted by entity id: vertex, edge, face,
     /// solid. A wrong rebuild that keeps the same geometry but re-mints a PID
     /// (the persistent-naming failure #64 exists to catch) diverges here.
@@ -154,10 +156,17 @@ impl ModelDigest {
             .collect();
         shells.sort_by_key(|t| t.0);
 
-        let mut solids: Vec<(u32, u32, Vec<u32>)> = model
+        let mut solids: Vec<(u32, u32, Vec<u32>, Vec<u32>)> = model
             .solids
             .iter()
-            .map(|(id, s)| (id, s.outer_shell, s.inner_shells.clone()))
+            .map(|(id, s)| {
+                (
+                    id,
+                    s.outer_shell,
+                    s.inner_shells.clone(),
+                    s.peer_shells.clone(),
+                )
+            })
             .collect();
         solids.sort_by_key(|t| t.0);
 

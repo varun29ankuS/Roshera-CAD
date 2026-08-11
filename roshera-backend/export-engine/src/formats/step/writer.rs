@@ -1288,18 +1288,29 @@ impl<W: Write> StepWriter<W> {
         Ok(id)
     }
 
-    /// Write the solid B-Rep entity for `solid`, returning its id.
+    /// Write the solid B-Rep entities for `solid`, returning their ids.
     ///
-    /// The first shell is the outer boundary. If the solid carries
-    /// additional (inner) shells they are voids: a `BREP_WITH_VOIDS`
-    /// (with `ORIENTED_CLOSED_SHELL` wrappers) is emitted instead of a
-    /// plain `MANIFOLD_SOLID_BREP`. The solid `name` is carried into the
-    /// entity label.
+    /// `shells[0]` is the outer boundary; the rest are voids, so a solid
+    /// carrying any of them is emitted as a `BREP_WITH_VOIDS` (with
+    /// `ORIENTED_CLOSED_SHELL` wrappers) instead of a plain
+    /// `MANIFOLD_SOLID_BREP`. The solid `name` is carried into the entity
+    /// label.
+    ///
+    /// **Peer bodies get their OWN `MANIFOLD_SOLID_BREP`.** ISO 10303-42 has no
+    /// representation for "several disjoint lumps under one manifold_solid_brep"
+    /// — the honest encoding of a multi-lump kernel solid is several solid
+    /// models listed side by side in the same shape representation, which is
+    /// what the caller does with the returned ids. Writing a peer into the void
+    /// slot would export material as a hollow, and dropping it would export a
+    /// part with missing bodies; both are lies about the geometry, so neither is
+    /// an option. A round-tripped file therefore comes back as N sibling solids
+    /// rather than one N-lump solid — a real, DOCUMENTED loss of the grouping
+    /// (not of the geometry), because STEP cannot express the grouping.
     fn write_solid_brep(
         &mut self,
         solid: &crate::formats::ros_snapshot::SolidData,
         shell_map: &HashMap<&uuid::Uuid, StepId>,
-    ) -> std::io::Result<StepId> {
+    ) -> std::io::Result<Vec<StepId>> {
         let mut shell_ids = solid
             .shells
             .iter()
@@ -1340,7 +1351,22 @@ impl<W: Write> StepWriter<W> {
                 format_id_list(&oriented_voids)
             )?;
         }
-        Ok(id)
+
+        let mut ids = vec![id];
+        for peer in solid
+            .peer_shells
+            .iter()
+            .filter_map(|s| shell_map.get(s).copied())
+        {
+            let peer_id = self.next_id();
+            writeln!(
+                self.writer,
+                "{}=MANIFOLD_SOLID_BREP('{}',{});",
+                peer_id, label, peer
+            )?;
+            ids.push(peer_id);
+        }
+        Ok(ids)
     }
 
     /// Emit the PRODUCT structure chain that lets a STEP importer locate
@@ -1614,8 +1640,9 @@ impl<W: Write> StepWriter<W> {
         // structure. Every solid in the file shares one context.
         let mut solid_ids = Vec::with_capacity(snapshot.solids.len());
         for (_solid_id, solid) in &snapshot.solids {
-            let brep_id = self.write_solid_brep(solid, &shell_map)?;
-            solid_ids.push(brep_id);
+            // One id per LUMP: a multi-body kernel solid contributes several
+            // solid models to the same shape representation.
+            solid_ids.extend(self.write_solid_brep(solid, &shell_map)?);
         }
         let solid_count = solid_ids.len();
 
@@ -2792,6 +2819,7 @@ mod tests {
             SolidData {
                 shells: vec![outer, inner],
                 feature_type: Some("hollow_block".to_string()),
+                peer_shells: vec![],
             },
         ));
 
@@ -2807,6 +2835,62 @@ mod tests {
         );
         assert!(out.contains("ORIENTED_CLOSED_SHELL"), "void wrapper: {out}");
         assert!(out.contains("'hollow_block'"), "solid name carried: {out}");
+    }
+
+    /// A PEER body must NOT be exported as a void.
+    ///
+    /// ISO 10303-42 gives `BREP_WITH_VOIDS` exactly one meaning — the inner
+    /// shells bound EMPTY space — so writing a sibling body there would export
+    /// material as a hollow: a file that lies about the part. The honest
+    /// encoding is a second `MANIFOLD_SOLID_BREP` alongside the first, which is
+    /// what this pins. RED before `write_solid_brep` learned about
+    /// `peer_shells`: the peer was either dropped or wrapped as a void.
+    #[test]
+    fn peer_body_emits_its_own_manifold_solid_brep_never_a_void() {
+        use crate::formats::ros_snapshot::{BRepSnapshot, ShellData, ShellType, SolidData};
+
+        let mut snap = BRepSnapshot::new();
+        let mk_shell = |snap: &mut BRepSnapshot| -> Uuid {
+            let sh = Uuid::new_v4();
+            snap.shells.push((
+                sh,
+                ShellData {
+                    faces: vec![],
+                    is_closed: true,
+                    shell_type: ShellType::Closed,
+                },
+            ));
+            sh
+        };
+        let outer = mk_shell(&mut snap);
+        let peer = mk_shell(&mut snap);
+        snap.solids.push((
+            Uuid::new_v4(),
+            SolidData {
+                shells: vec![outer],
+                feature_type: Some("two_lumps".to_string()),
+                peer_shells: vec![peer],
+            },
+        ));
+
+        let out = write_into(|w| {
+            let ctx = w.write_geometric_context()?;
+            let empty = crate::formats::step::pcurve::PcurveExport::default();
+            w.write_brep_model(&snap, ctx, "two_lumps", &empty)?;
+            Ok(())
+        });
+        assert!(
+            !out.contains("BREP_WITH_VOIDS"),
+            "a sibling body is MATERIAL — exporting it as a cavity is a lie \
+             about the part: {out}"
+        );
+        assert_eq!(
+            out.matches("MANIFOLD_SOLID_BREP").count(),
+            2,
+            "two disjoint lumps → two solid models in the same shape \
+             representation, because STEP has no one-entity encoding for them: \
+             {out}"
+        );
     }
 
     #[test]

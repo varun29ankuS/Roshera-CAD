@@ -474,6 +474,7 @@ mod tests {
             let mut chosen = None;
             let mut shells = vec![solid.outer_shell];
             shells.extend_from_slice(&solid.inner_shells);
+            shells.extend_from_slice(&solid.peer_shells);
             for sh in shells {
                 if let Some(shell) = m.shells.get(sh) {
                     for &fid in &shell.faces {

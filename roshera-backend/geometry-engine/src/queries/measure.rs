@@ -578,13 +578,17 @@ fn surface_classify(
         if in_outer {
             true
         } else {
-            solid_data.inner_shells.iter().any(|&shell_id| {
-                model
-                    .shells
-                    .get(shell_id)
-                    .map(|sh| sh.faces.contains(&face_id))
-                    .unwrap_or(false)
-            })
+            solid_data
+                .inner_shells
+                .iter()
+                .chain(solid_data.peer_shells.iter())
+                .any(|&shell_id| {
+                    model
+                        .shells
+                        .get(shell_id)
+                        .map(|sh| sh.faces.contains(&face_id))
+                        .unwrap_or(false)
+                })
         }
     };
     if !face_in_solid {

@@ -72,6 +72,15 @@ fn merge_one_solid(
             new_solid.add_inner_shell(s);
         }
     }
+    // Peer bodies are MATERIAL, not cavities. This is a model→model copy, so
+    // dropping them would silently delete lumps from the merged result; they
+    // must also land in the peer slot, never in `inner_shells` (which would
+    // invert their sign in mass properties).
+    for peer in &solid.peer_shells {
+        if let Some(s) = remap_shell(dst, src, *peer, remap) {
+            new_solid.add_peer_shell(s);
+        }
+    }
     Some(dst.solids.add(new_solid))
 }
 

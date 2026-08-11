@@ -1371,6 +1371,7 @@ pub(crate) fn attach_gdt_annotations(
         if let Some(solid_data) = model.solids.get(solid_id) {
             let mut shell_ids = vec![solid_data.outer_shell];
             shell_ids.extend(solid_data.inner_shells.iter().copied());
+            shell_ids.extend(solid_data.peer_shells.iter().copied());
             for sid in shell_ids {
                 if let Some(shell) = model.shells.get(sid) {
                     set.extend(shell.faces.iter().copied());
@@ -1536,6 +1537,7 @@ pub(crate) fn attach_tolerances(
         if let Some(solid_data) = model.solids.get(solid_id) {
             let mut shell_ids = vec![solid_data.outer_shell];
             shell_ids.extend(solid_data.inner_shells.iter().copied());
+            shell_ids.extend(solid_data.peer_shells.iter().copied());
             for sid in shell_ids {
                 if let Some(shell) = model.shells.get(sid) {
                     set.extend(shell.faces.iter().copied());

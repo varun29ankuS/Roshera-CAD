@@ -171,6 +171,7 @@ const EXPERIMENTAL = new Set<string>([
   "rebuild_certificate",
   "timeline_scrub",
   "timeline_history",
+  "recipe_get",
   "timeline_branch",
   "timeline_branches",
   "timeline_switch",
@@ -236,6 +237,10 @@ const BENCH_OF: Record<string, Bench> = {
   timeline_scrub: "timeline",
   clear_timeline: "timeline",
   timeline_history: "timeline",
+  // Retrieval of a certified past build as a re-parameterizable plan. Same
+  // history/certification concern as the rest of this bench — it reads the
+  // recorded log and the certificates on it, and creates no geometry.
+  recipe_get: "timeline",
   timeline_branch: "timeline",
   timeline_branches: "timeline",
   timeline_switch: "timeline",

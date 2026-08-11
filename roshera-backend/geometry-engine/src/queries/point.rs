@@ -38,6 +38,7 @@ pub fn nearest_on_solid(
     let solid = model.solids.get(solid_id)?;
     let mut shells = vec![solid.outer_shell];
     shells.extend_from_slice(&solid.inner_shells);
+    shells.extend_from_slice(&solid.peer_shells);
 
     let mut best: Option<(FaceId, Point3, f64)> = None;
     // Edges to try after the face pass, each attributed to the first face that

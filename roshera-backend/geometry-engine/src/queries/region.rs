@@ -131,6 +131,7 @@ fn solid_faces(model: &BRepModel, solid_id: SolidId) -> Vec<FaceId> {
     };
     let mut shells = vec![solid.outer_shell];
     shells.extend_from_slice(&solid.inner_shells);
+    shells.extend_from_slice(&solid.peer_shells);
     for sh in shells {
         if let Some(shell) = model.shells.get(sh) {
             out.extend_from_slice(&shell.faces);

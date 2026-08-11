@@ -183,8 +183,9 @@ mod tests {
     fn all_edge_ids(model: &BRepModel, solid_id: crate::primitives::solid::SolidId) -> Vec<EdgeId> {
         let mut edges = Vec::new();
         let solid = model.solids.get(solid_id).expect("solid present");
-        let shell_ids =
-            std::iter::once(solid.outer_shell).chain(solid.inner_shells.iter().copied());
+        let shell_ids = std::iter::once(solid.outer_shell)
+            .chain(solid.inner_shells.iter().copied())
+            .chain(solid.peer_shells.iter().copied());
         for shell_id in shell_ids {
             let shell = model.shells.get(shell_id).expect("shell present");
             for &face_id in &shell.faces {

@@ -2585,6 +2585,7 @@ async fn handle_websocket_connection(socket: WebSocket, state: AppState) {
                                                                 "id": solid.id,
                                                                 "outer_shell": solid.outer_shell,
                                                                 "inner_shells_count": solid.inner_shells.len(),
+                                                                "peer_shells_count": solid.peer_shells.len(),
                                                                 "name": solid.name.clone()
                                                             }
                                                         })),
@@ -2641,7 +2642,8 @@ async fn handle_websocket_connection(socket: WebSocket, state: AppState) {
                                                     "type": "solid",
                                                     "local_id": solid.id,
                                                     "outer_shell": solid.outer_shell,
-                                                    "inner_shells_count": solid.inner_shells.len()
+                                                    "inner_shells_count": solid.inner_shells.len(),
+                                                    "peer_shells_count": solid.peer_shells.len()
                                                 })
                                             }).collect();
 
@@ -3080,7 +3082,7 @@ async fn handle_subelement_pick(state: &AppState, pick: &serde_json::Value) -> s
     if let Some(outer) = model.shells.get(solid.outer_shell) {
         face_ids.extend(outer.faces.iter().copied());
     }
-    for &shell_id in &solid.inner_shells {
+    for &shell_id in solid.inner_shells.iter().chain(solid.peer_shells.iter()) {
         if let Some(shell) = model.shells.get(shell_id) {
             face_ids.extend(shell.faces.iter().copied());
         }

@@ -9575,6 +9575,7 @@ fn get_adjacent_faces(
     let mut shell_ids = Vec::with_capacity(1 + solid.inner_shells.len());
     shell_ids.push(solid.outer_shell);
     shell_ids.extend_from_slice(&solid.inner_shells);
+    shell_ids.extend_from_slice(&solid.peer_shells);
 
     let mut adjacent_faces = Vec::new();
     for shell_id in shell_ids {

@@ -978,6 +978,7 @@ fn discard_scratch_section_faces(
     if let Some(solid) = model.solids.get(solid_id) {
         let shell_ids: Vec<_> = std::iter::once(solid.outer_shell)
             .chain(solid.inner_shells.iter().copied())
+            .chain(solid.peer_shells.iter().copied())
             .collect();
         for shid in shell_ids {
             let faces: Vec<FaceId> = model
@@ -1554,6 +1555,7 @@ fn remove_scratch_profile_face(model: &mut BRepModel, profile_face: FaceId, soli
     if let Some(solid) = model.solids.get(solid_id) {
         let shell_ids: Vec<_> = std::iter::once(solid.outer_shell)
             .chain(solid.inner_shells.iter().copied())
+            .chain(solid.peer_shells.iter().copied())
             .collect();
         for shid in shell_ids {
             let shell_faces: Vec<FaceId> = model

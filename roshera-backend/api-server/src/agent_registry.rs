@@ -803,6 +803,28 @@ fn raw_tools() -> Vec<ToolSpec> {
                 "required": []
             }),
         ),
+        // Task #10 — retrieval of a certified past build as a plan. Timeline
+        // bench because it reads the recorded log and the certificates on it;
+        // it creates no geometry. Must stay byte-consistent with
+        // `roshera-mcp/src/registry.ts` (`BENCH_OF.recipe_get`) — the ontology
+        // gate (o5) asserts the two independently-maintained tables agree.
+        t(
+            "recipe_get",
+            Timeline,
+            Experimental,
+            Curated,
+            "Retrieve a proven build as a re-parameterizable recipe: ordered op kinds, recorded params, recorded intent, covering checkpoints, and the certificates as recorded. Addressable by branch or by any document id (read from durable storage; the document is NOT opened).",
+            json!({
+                "type": "object",
+                "properties": {
+                    "reference": {"type": "string", "default": "main", "description": "branch id ('main' = trunk) or a document id"},
+                    "from": {"type": "integer", "minimum": 0, "description": "first event sequence to include — scope the recipe to one decision's span"},
+                    "to": {"type": "integer", "minimum": 0, "description": "last event sequence to include (inclusive)"},
+                    "include_params": {"type": "boolean", "default": true, "description": "include each step's verbatim recorded params"}
+                },
+                "required": []
+            }),
+        ),
         t(
             "timeline_branch",
             Timeline,
@@ -2052,7 +2074,13 @@ mod tests {
         // rename_document) that had no agent-facing surface at all; mirrors
         // roshera-mcp's new src/tools/inspect.ts entry, same non-resident
         // full-table-only placement as `document_units`.
-        assert_eq!(tools.len(), 104, "expected 104 tools, got {}", tools.len());
+        // 105: `recipe_get` (Timeline / Experimental / Curated, task #10) —
+        // exposes `GET /api/timeline/recipe/{branch_or_document}`, a proven
+        // build retrieved as a re-parameterizable plan. Mirrors roshera-mcp's
+        // src/tools/timeline.ts entry and its `BENCH_OF.recipe_get` row;
+        // full-table only, the same non-resident placement as the rest of the
+        // Timeline bench.
+        assert_eq!(tools.len(), 105, "expected 105 tools, got {}", tools.len());
     }
 
     /// The kernel-sourced rows correspond to operations actually registered in

@@ -274,6 +274,7 @@ fn solid_edges(model: &BRepModel, solid_id: SolidId) -> Vec<u32> {
     };
     let mut shells = vec![solid.outer_shell];
     shells.extend_from_slice(&solid.inner_shells);
+    shells.extend_from_slice(&solid.peer_shells);
     for sh in shells {
         let shell = match model.shells.get(sh) {
             Some(s) => s,
@@ -327,6 +328,7 @@ fn world_aabb(model: &BRepModel, solid_id: SolidId) -> Option<Aabb> {
     if let Some(solid) = model.solids.get(solid_id) {
         let mut shells = vec![solid.outer_shell];
         shells.extend_from_slice(&solid.inner_shells);
+        shells.extend_from_slice(&solid.peer_shells);
         for sh in shells {
             let shell = match model.shells.get(sh) {
                 Some(s) => s,
@@ -383,6 +385,7 @@ pub fn bore_face_ids(model: &BRepModel, solid_id: SolidId) -> std::collections::
     };
     let mut shells = vec![solid.outer_shell];
     shells.extend_from_slice(&solid.inner_shells);
+    shells.extend_from_slice(&solid.peer_shells);
     for sh in shells {
         let Some(shell) = model.shells.get(sh) else {
             continue;
@@ -592,6 +595,7 @@ pub fn extract_dimensions(model: &BRepModel, solid_id: SolidId) -> Vec<Dimension
     };
     let mut shells = vec![solid.outer_shell];
     shells.extend_from_slice(&solid.inner_shells);
+    shells.extend_from_slice(&solid.peer_shells);
     for sh in shells {
         let shell = match model.shells.get(sh) {
             Some(s) => s,

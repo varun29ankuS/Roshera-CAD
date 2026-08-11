@@ -203,6 +203,7 @@ fn solid_extent(solid: &Solid, model: &BRepModel) -> f64 {
     let mut any = false;
     let mut shells = vec![solid.outer_shell];
     shells.extend_from_slice(&solid.inner_shells);
+    shells.extend_from_slice(&solid.peer_shells);
     for sh in shells {
         let Some(shell) = model.shells.get(sh) else {
             continue;
@@ -284,8 +285,11 @@ pub fn tessellate_solid(
         tessellate_shell(shell, model, params, &cache, &mut mesh);
     }
 
-    // Tessellate inner shells (voids)
-    for &inner_shell_id in &solid.inner_shells {
+    // Tessellate the remaining shells — voids AND peer bodies. A peer is
+    // material, so its surface belongs in the mesh exactly like the outer
+    // shell's; this path already summed peers positively while they were
+    // mis-filed as voids, and that must not change.
+    for &inner_shell_id in solid.inner_shells.iter().chain(solid.peer_shells.iter()) {
         if let Some(shell) = model.shells.get(inner_shell_id) {
             tessellate_shell(shell, model, params, &cache, &mut mesh);
         }

@@ -1057,8 +1057,9 @@ impl PrimitiveRegistry {
         let mut edge_ids: HashSet<EdgeId> = HashSet::new();
         let mut vertex_ids: HashSet<VertexId> = HashSet::new();
 
-        let shell_ids =
-            std::iter::once(solid.outer_shell).chain(solid.inner_shells.iter().copied());
+        let shell_ids = std::iter::once(solid.outer_shell)
+            .chain(solid.inner_shells.iter().copied())
+            .chain(solid.peer_shells.iter().copied());
 
         for shell_id in shell_ids {
             let Some(shell) = model.shells.get(shell_id) else {

@@ -77,6 +77,7 @@ fn solid_world_box(model: &BRepModel, solid_id: SolidId) -> Option<(Point3, Poin
     let solid = model.solids.get(solid_id)?;
     let mut shells = vec![solid.outer_shell];
     shells.extend_from_slice(&solid.inner_shells);
+    shells.extend_from_slice(&solid.peer_shells);
 
     let mut min = [f64::INFINITY; 3];
     let mut max = [f64::NEG_INFINITY; 3];

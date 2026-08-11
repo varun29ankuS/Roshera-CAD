@@ -91,6 +91,7 @@ pub fn nurbs_loft_invariants(
     if let Some(sol) = model.solids.get(solid) {
         let mut shells = vec![sol.outer_shell];
         shells.extend_from_slice(&sol.inner_shells);
+        shells.extend_from_slice(&sol.peer_shells);
         'outer: for sh in shells {
             if let Some(shell) = model.shells.get(sh) {
                 for &fid in &shell.faces {

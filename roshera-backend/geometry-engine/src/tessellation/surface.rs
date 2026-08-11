@@ -9756,6 +9756,7 @@ mod tests {
         let solid = m.solids.get(holed).unwrap();
         let mut shells = vec![solid.outer_shell];
         shells.extend_from_slice(&solid.inner_shells);
+        shells.extend_from_slice(&solid.peer_shells);
         let mut caps = 0;
         for sh in shells {
             let shell = m.shells.get(sh).unwrap();

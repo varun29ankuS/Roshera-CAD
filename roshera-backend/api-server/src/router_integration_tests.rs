@@ -3838,6 +3838,7 @@ fn find_plate_top_face(model: &BRepModel, solid_id: SolidId, z_coord: f64) -> Op
     let solid = model.solids.get(solid_id)?;
     let mut shell_ids = vec![solid.outer_shell];
     shell_ids.extend(solid.inner_shells.iter().copied());
+    shell_ids.extend(solid.peer_shells.iter().copied());
 
     let mut face_ids: Vec<u32> = Vec::new();
     for sid in shell_ids {
@@ -8748,5 +8749,507 @@ async fn cylinder_with_valid_center_still_succeeds_and_is_placed_there() {
         "z extent must start at the requested center, not the origin; got [{}, {}]",
         min[2],
         max[2]
+    );
+}
+
+// =====================================================================
+// TASK #10 — RECIPES FROM LINEAGE
+//
+// `GET /api/timeline/recipe/{branch_or_document}` projects a recorded
+// event log into a re-parameterizable PLAN: ordered op kinds, their
+// recorded parameters verbatim, the per-event recorded intent, the
+// checkpoint declarations that cover them, and a summary of the
+// certificates AS RECORDED. Pure projection — no new storage, no
+// recompute, no fabricated verdict.
+// =====================================================================
+
+/// Build a synthetic two-op plan through the LIVE geometry handlers (the
+/// same path an agent's MCP calls take), then declare an intent over it
+/// with a real checkpoint. Returns the checkpoint name that was declared.
+async fn seed_recipe_document(state: &AppState) -> String {
+    let (bs, bbody) = dispatch(
+        state,
+        json_post(
+            "/api/geometry/cylinder",
+            json!({"center": [0.0, 0.0, 0.0], "axis": [0.0, 0.0, 1.0], "radius": 41.25, "height": 20.0}),
+        ),
+    )
+    .await;
+    assert_eq!(bs, StatusCode::OK, "base cylinder must 200; body = {bbody}");
+    let base_uuid = bbody["object"]["id"]
+        .as_str()
+        .expect("base cylinder uuid")
+        .to_string();
+
+    let (cs, cbody) = dispatch(
+        state,
+        json_post(
+            "/api/geometry/cylinder",
+            json!({"center": [0.0, 0.0, -1.0], "axis": [0.0, 0.0, 1.0], "radius": 9.0, "height": 22.0}),
+        ),
+    )
+    .await;
+    assert_eq!(cs, StatusCode::OK, "cutter must 200; body = {cbody}");
+    let cutter_uuid = cbody["object"]["id"]
+        .as_str()
+        .expect("cutter uuid")
+        .to_string();
+
+    let (os, obody) = dispatch(
+        state,
+        json_post(
+            "/api/geometry/boolean",
+            json!({"operation": "difference", "object_a": base_uuid, "object_b": cutter_uuid}),
+        ),
+    )
+    .await;
+    assert_eq!(os, StatusCode::OK, "difference must 200; body = {obody}");
+
+    let intent = "Slip-on flange DN50 PN16 pattern: D82.5 x 20 disc, 1 x D18 bolt hole";
+    let (ks, kbody) = dispatch(
+        state,
+        json_post(
+            "/api/timeline/checkpoint",
+            json!({"name": intent, "description": "one declared decision covering the whole plan"}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        ks,
+        StatusCode::CREATED,
+        "checkpoint must 201; body = {kbody}"
+    );
+    intent.to_string()
+}
+
+/// #10 RED→GREEN — the recipe of a known synthetic document carries its
+/// ORDERED op kinds, their RECORDED parameters (symbolic — the numbers a
+/// client edits to re-parameterize), and the checkpoint intent covering
+/// them. A projection that dropped any of the three would leave an agent
+/// with a log instead of a plan.
+#[tokio::test]
+async fn recipe_projects_ops_params_and_covering_intent() {
+    let state = make_test_state().await;
+    let intent = seed_recipe_document(&state).await;
+
+    let (s, body) = dispatch(&state, json_get("/api/timeline/recipe/main")).await;
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "#10: GET /api/timeline/recipe/main must be a real route; body = {body}"
+    );
+
+    let steps = body["steps"].as_array().expect("recipe carries steps");
+    let kinds: Vec<&str> = steps
+        .iter()
+        .filter_map(|st| st["op_kind"].as_str())
+        .collect();
+    // ORDER is the whole point of a plan. Asserted over the geometry-bearing
+    // kinds: the creation routes also record their own `set_name` events, and
+    // pinning those positionally would make this a test of naming policy
+    // rather than of the projection's ordering.
+    let geometry: Vec<&str> = kinds.iter().copied().filter(|k| *k != "set_name").collect();
+    assert_eq!(
+        geometry,
+        vec![
+            "create_cylinder_3d",
+            "create_cylinder_3d",
+            "boolean_difference"
+        ],
+        "#10: the recipe must be the ORDERED op kinds of the recorded plan; got {kinds:?}"
+    );
+
+    let by_kind = |kind: &str| -> Vec<&Value> {
+        steps
+            .iter()
+            .filter(|st| st["op_kind"].as_str() == Some(kind))
+            .collect()
+    };
+
+    // Recorded parameters, verbatim — the edit surface. The base disc's
+    // radius must come out as the number that was recorded, not a label.
+    let cylinders = by_kind("create_cylinder_3d");
+    assert_eq!(cylinders.len(), 2, "#10: two cylinders were recorded");
+    let base_radius = cylinders[0]["params"]["Create3D"]["parameters"]["radius"]
+        .as_f64()
+        .unwrap_or_else(|| {
+            panic!(
+                "#10: the base step must carry its recorded params; got {}",
+                cylinders[0]
+            )
+        });
+    assert!(
+        (base_radius - 41.25).abs() < 1e-9,
+        "#10: recorded radius must project verbatim (41.25); got {base_radius}"
+    );
+    let cutter_radius = cylinders[1]["params"]["Create3D"]["parameters"]["radius"]
+        .as_f64()
+        .expect("#10: the cutter step must carry its recorded params");
+    assert!(
+        (cutter_radius - 9.0).abs() < 1e-9,
+        "#10: recorded cutter radius must project verbatim (9.0); got {cutter_radius}"
+    );
+
+    // The boolean's operands must survive as SYMBOLIC entity tokens, so a
+    // re-issuing client can rebind them to the ids its own re-issue mints.
+    let booleans = by_kind("boolean_difference");
+    assert_eq!(booleans.len(), 1, "#10: one difference was recorded");
+    let inputs = booleans[0]["inputs"]
+        .as_array()
+        .expect("#10: a boolean step must disclose its operands");
+    assert_eq!(
+        inputs.len(),
+        2,
+        "#10: a difference consumes exactly two operands; got {inputs:?}"
+    );
+
+    // The declared intent covering the plan.
+    let checkpoints = body["checkpoints"]
+        .as_array()
+        .expect("#10: the recipe must carry the checkpoint declarations");
+    assert!(
+        checkpoints
+            .iter()
+            .any(|c| c["name"].as_str() == Some(intent.as_str())),
+        "#10: the checkpoint intent must appear in the recipe; got {checkpoints:?}"
+    );
+    assert!(
+        steps
+            .iter()
+            .any(|st| st["checkpoint"]["name"].as_str() == Some(intent.as_str())),
+        "#10: at least one step must be attributed to the covering declaration; got {steps:?}"
+    );
+
+    // Completeness disclosure — a recipe that presented a gapped log as a
+    // whole plan would be exactly the lie this endpoint cannot tell.
+    assert!(
+        body["sequence_contiguous"].is_boolean(),
+        "#10: the recipe must disclose whether its sequence span is contiguous; got {body}"
+    );
+    assert_eq!(
+        body["step_count"].as_u64(),
+        Some(steps.len() as u64),
+        "#10: step_count must equal the projected steps; got {body}"
+    );
+
+    // `?from=`/`?to=` scope the recipe to ONE decision's span. This is how a
+    // client retrieves the bolt-circle sub-plan out of a document holding
+    // several builds; an unwindowed projection would hand it every op the
+    // document ever recorded and call that the plan.
+    let last = steps
+        .last()
+        .and_then(|st| st["sequence"].as_u64())
+        .expect("#10: the recipe must address its steps by sequence");
+    let (ws, wbody) = dispatch(
+        &state,
+        json_get(&format!("/api/timeline/recipe/main?from={last}&to={last}")),
+    )
+    .await;
+    assert_eq!(
+        ws,
+        StatusCode::OK,
+        "windowed recipe must 200; body = {wbody}"
+    );
+    assert_eq!(
+        wbody["step_count"].as_u64(),
+        Some(1),
+        "#10: a single-sequence window must project exactly that one step; got {wbody}"
+    );
+    assert_eq!(
+        wbody["sequence_range"].as_array().map(|r| r.len()),
+        Some(2),
+        "#10: the window must state the span it actually covers; got {wbody}"
+    );
+    assert_eq!(
+        wbody["sequence_range"][0].as_u64(),
+        Some(last),
+        "#10: the windowed span must start where the caller asked; got {wbody}"
+    );
+    assert_eq!(
+        wbody["steps"][0]["op_kind"].as_str(),
+        steps[steps.len() - 1]["op_kind"].as_str(),
+        "#10: the windowed step must be the SAME step, not a re-derived one; got {wbody}"
+    );
+}
+
+/// #10 RED→GREEN — a re-issuable plan, not a log. Recorded params alone
+/// do NOT round-trip (the recorded cylinder is `Create3D.parameters` with
+/// scalar `base_x/base_y/base_z`; the creation route takes `center: [x,y,z]`),
+/// so each step must name the route + body that re-issues it.
+#[tokio::test]
+async fn recipe_steps_carry_a_reissue_call() {
+    let state = make_test_state().await;
+    let _intent = seed_recipe_document(&state).await;
+
+    let (s, body) = dispatch(&state, json_get("/api/timeline/recipe/main")).await;
+    assert_eq!(s, StatusCode::OK, "recipe must 200; body = {body}");
+    let steps = body["steps"].as_array().expect("steps");
+    let first = |kind: &str| -> Value {
+        steps
+            .iter()
+            .find(|st| st["op_kind"].as_str() == Some(kind))
+            .unwrap_or_else(|| panic!("#10: the recipe must contain a `{kind}` step"))
+            .clone()
+    };
+
+    let base = first("create_cylinder_3d");
+    assert_eq!(
+        base["reissue"]["path"].as_str(),
+        Some("/api/geometry/cylinder"),
+        "#10: a create_cylinder_3d step must name the route that re-issues it; got {base}"
+    );
+    let center = base["reissue"]["body"]["center"]
+        .as_array()
+        .cloned()
+        .expect(
+            "#10: the re-issue body must translate the recorded scalars into the route's shape",
+        );
+    assert_eq!(
+        center.len(),
+        3,
+        "#10: center must be [x,y,z]; got {center:?}"
+    );
+    assert!(
+        (base["reissue"]["body"]["radius"].as_f64().unwrap_or(0.0) - 41.25).abs() < 1e-9,
+        "#10: the re-issue body must carry the editable radius; got {}",
+        base["reissue"]
+    );
+
+    let boolean = first("boolean_difference");
+    assert_eq!(
+        boolean["reissue"]["body"]["operation"].as_str(),
+        Some("difference"),
+        "#10: a boolean step must re-issue as the route's own operation spelling; got {}",
+        boolean["reissue"]
+    );
+    let symbolic = boolean["reissue"]["symbolic_operands"]
+        .as_array()
+        .expect("#10: a boolean's operands are symbolic and must be declared as such");
+    assert_eq!(
+        symbolic.len(),
+        2,
+        "#10: both boolean operands are recipe-local tokens the caller must bind; got {symbolic:?}"
+    );
+
+    // An op with no re-issue mapping must SAY SO rather than be silently
+    // absent or given a guessed call — the difference between a plan that
+    // can be trusted and one that cannot.
+    let named = first("set_name");
+    assert!(
+        named["reissue"].is_null(),
+        "#10: an unmapped kind must not be handed a guessed call; got {}",
+        named["reissue"]
+    );
+    assert!(
+        named["reissue_absent_reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("set_name")),
+        "#10: the absent re-issue must state WHY, naming the kind; got {named}"
+    );
+}
+
+/// #10 RED→GREEN — an unknown reference is a TYPED 404, never an empty
+/// recipe. An empty plan for a document that does not exist is the silent
+/// wrong answer this kernel refuses to give.
+#[tokio::test]
+async fn recipe_unknown_reference_returns_typed_404() {
+    let state = make_test_state().await;
+    let (s, body) = dispatch(
+        &state,
+        json_get("/api/timeline/recipe/6a1f0e2c-0000-4000-8000-000000000000"),
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::NOT_FOUND,
+        "#10: an unregistered reference must 404; body = {body}"
+    );
+    assert_eq!(
+        body["error_code"].as_str(),
+        Some("document_not_found"),
+        "#10: the refusal must be a TYPED error naming the failure, not a bare status; got {body}"
+    );
+    assert!(
+        body["hint"].as_str().is_some_and(|h| !h.is_empty()),
+        "#10: a typed refusal carries the recovery hint; got {body}"
+    );
+}
+
+/// #10 REHEARSAL (opt-in, `--ignored`) — the recipe projection read against
+/// the REAL recorded corpus, not a fixture.
+///
+/// Why this is `#[ignore]`d rather than part of the sweep: it connects to
+/// the developer Postgres the live server persists into
+/// (`DATABASE_URL`, same default as `main()`), because the proven flange
+/// documents only exist there. It is strictly READ-ONLY — migrations are
+/// disabled, the fixture's recorder has no durability sink, and the
+/// handler under test issues exactly three reads (`load_documents`,
+/// `load_all_timeline_events`, `load_checkpoints`). No document is
+/// opened; the live server's model is untouched.
+///
+/// Run: `cargo test --bin api-server -- --ignored recipe_of_the_slip_on
+///       --nocapture --exact
+///       router_integration_tests::recipe_of_the_slip_on_document_reads_the_real_corpus`
+#[tokio::test]
+#[ignore = "reads the developer Postgres corpus; run explicitly"]
+async fn recipe_of_the_slip_on_document_reads_the_real_corpus() {
+    let document = std::env::var("ROSHERA_RECIPE_DOC")
+        .unwrap_or_else(|_| "654105eb-4185-4ff2-9ea1-651248238926".to_string());
+    let db_config = DatabaseConfig {
+        db_type: DatabaseType::PostgreSQL,
+        url: std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgresql://postgres:postgres@localhost/roshera".to_string()),
+        max_connections: 2,
+        connect_timeout: 5,
+        // READ-ONLY: never touch the schema of a database this test only reads.
+        run_migrations: false,
+    };
+    let database: Arc<dyn DatabasePersistence + Send + Sync> = Arc::new(
+        session_manager::database::PostgresDatabase::new(&db_config)
+            .await
+            .expect("developer Postgres must be reachable for this opt-in rehearsal"),
+    );
+    let state = make_test_state_with_database(database, None, None).await;
+
+    let (s, body) = dispatch(
+        &state,
+        json_get(&format!("/api/timeline/recipe/{document}")),
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "the proven document must project a recipe; body = {body}"
+    );
+
+    let steps = body["steps"].as_array().expect("steps").clone();
+    println!("REHEARSAL source        : {}", body["source"]);
+    println!("REHEARSAL step_count    : {}", body["step_count"]);
+    println!("REHEARSAL sequence_range: {}", body["sequence_range"]);
+    println!("REHEARSAL contiguous    : {}", body["sequence_contiguous"]);
+    println!("REHEARSAL certificates  : {}", body["certificate_summary"]);
+    for c in body["checkpoints"].as_array().unwrap_or(&vec![]) {
+        println!(
+            "REHEARSAL checkpoint    : covers={} empty={} | {}",
+            c["covers"], c["covers_is_empty"], c["name"]
+        );
+    }
+    for st in &steps {
+        println!(
+            "REHEARSAL step {:>4} {:<22} {}",
+            st["sequence"],
+            st["op_kind"].as_str().unwrap_or("?"),
+            serde_json::to_string(&st["params"]).unwrap_or_default()
+        );
+    }
+
+    let revolve = steps
+        .iter()
+        .find(|st| st["op_kind"].as_str() == Some("revolve_typed"))
+        .expect("the proven build must carry its revolve");
+    let meridian = revolve["params"]["profile_segments"]
+        .as_array()
+        .expect("the revolve's meridian must project verbatim");
+    println!(
+        "REHEARSAL meridian      : {} segments = {}",
+        meridian.len(),
+        serde_json::to_string(&revolve["params"]["profile_segments"]).unwrap_or_default()
+    );
+    assert!(
+        meridian.len() >= 4,
+        "a flange meridian is a closed section of at least 4 segments; got {}",
+        meridian.len()
+    );
+    assert_eq!(
+        revolve["reissue"]["path"].as_str(),
+        Some("/api/geometry/revolve"),
+        "the revolve must be re-issuable; got {}",
+        revolve["reissue"]
+    );
+    // The recorded tag is `kind`; the route parses `type`. The re-issue body
+    // must have made that translation, or the recipe is a log, not a plan.
+    assert_eq!(
+        revolve["reissue"]["body"]["profile_segments"][0]["type"].as_str(),
+        Some("line"),
+        "the re-issue body must speak the ROUTE's segment spelling; got {}",
+        revolve["reissue"]["body"]["profile_segments"][0]
+    );
+
+    let cutters: Vec<&Value> = steps
+        .iter()
+        .filter(|st| st["op_kind"].as_str() == Some("create_cylinder_3d"))
+        .collect();
+    let differences = steps
+        .iter()
+        .filter(|st| st["op_kind"].as_str() == Some("boolean_difference"))
+        .count();
+    println!(
+        "REHEARSAL cutters       : {} cylinders, {} differences",
+        cutters.len(),
+        differences
+    );
+    assert!(
+        cutters.len() >= 4 && differences >= 4,
+        "the bolt circle is built as explicitly placed cutters; got {} cyl / {} diff",
+        cutters.len(),
+        differences
+    );
+
+    let intents: Vec<&str> = body["checkpoints"]
+        .as_array()
+        .map(|cs| cs.iter().filter_map(|c| c["name"].as_str()).collect())
+        .unwrap_or_default();
+    assert!(
+        !intents.is_empty(),
+        "a proven build carries its declared intent; got none"
+    );
+
+    // THE SCOPED RECIPE — the retrievable unit. This document holds several
+    // builds, so the whole-log projection is a history, not a plan. The
+    // bolt-circle sub-plan of the DN50 build is the window [265, 272]: four
+    // explicitly-placed cutters, each followed by its difference. THIS is
+    // what a client retrieves and re-parameterizes.
+    let (ws, wbody) = dispatch(
+        &state,
+        json_get(&format!("/api/timeline/recipe/{document}?from=265&to=272")),
+    )
+    .await;
+    assert_eq!(
+        ws,
+        StatusCode::OK,
+        "windowed recipe must 200; body = {wbody}"
+    );
+    println!(
+        "REHEARSAL window        : from=265 to=272 -> step_count={} range={} contiguous={}",
+        wbody["step_count"], wbody["sequence_range"], wbody["sequence_contiguous"]
+    );
+    let wsteps = wbody["steps"].as_array().cloned().unwrap_or_default();
+    for st in &wsteps {
+        println!(
+            "REHEARSAL window step {:>3} {:<20} reissue={} {}",
+            st["sequence"],
+            st["op_kind"].as_str().unwrap_or("?"),
+            st["reissue"]["path"],
+            serde_json::to_string(&st["reissue"]["body"]).unwrap_or_default()
+        );
+    }
+    assert_eq!(
+        wbody["step_count"].as_u64(),
+        Some(8),
+        "the bolt-circle sub-plan is 4 cutters + 4 differences; got {}",
+        wbody["step_count"]
+    );
+    let wcut = wsteps
+        .iter()
+        .filter(|st| st["op_kind"].as_str() == Some("create_cylinder_3d"))
+        .count();
+    let wdiff = wsteps
+        .iter()
+        .filter(|st| st["op_kind"].as_str() == Some("boolean_difference"))
+        .count();
+    assert_eq!(
+        (wcut, wdiff),
+        (4, 4),
+        "the scoped recipe must be exactly 4 cutter ops and their 4 differences; got {wcut}/{wdiff}"
     );
 }

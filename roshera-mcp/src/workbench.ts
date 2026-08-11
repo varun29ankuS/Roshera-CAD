@@ -67,8 +67,15 @@ export const SWITCHABLE_BENCHES: Bench[] = [
  * core_only 31. Max is 45 (analysis and timeline tie). Raised to the new
  * measured max, same "raised by exactly the overshoot" policy as the
  * original 35->36 move.
+ *
+ * 45 -> 46 (2026-08-11, task #10): `recipe_get` joined the timeline bench
+ * (retrieval of a certified past build as a re-parameterizable plan), so
+ * timeline measures 31 + 16 - 1 = 46 and is now the sole max. Raised by
+ * exactly the overshoot again, per the same policy — this is an attention
+ * budget, and one more read-only retrieval verb on the bench an agent enters
+ * precisely to consult history is squarely what that budget is for.
  */
-export const LIVE_SURFACE_CEILING = 45;
+export const LIVE_SURFACE_CEILING = 46;
 
 /** Callback that flips real server tool handles on a bench switch. */
 export type ApplyTransition = (toEnable: string[], toDisable: string[]) => void;

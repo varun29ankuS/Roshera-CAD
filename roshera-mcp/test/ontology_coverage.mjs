@@ -169,7 +169,7 @@ console.log("(o3) ratchet floor (encodes observed reality, never aspiration)");
 // from 109 by document_rename, "core" — PATCH /api/documents/{id}). A shrink
 // below the floor means tools were removed without this gate hearing about it;
 // growth passes and should then RAISE the floor to the new measurement.
-const FLOOR_TOTAL = 110;
+const FLOOR_TOTAL = 111;
 if (names.length >= FLOOR_TOTAL)
   pass(`registry size ${names.length} ≥ floor ${FLOOR_TOTAL}`);
 else

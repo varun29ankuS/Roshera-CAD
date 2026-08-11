@@ -347,8 +347,17 @@ pub fn deep_clone_solid(
     let mut all_loops = Vec::new();
     let mut all_surfaces = Vec::new();
     let mut all_faces = Vec::new();
-    let mut all_shells = vec![solid.outer_shell];
+    // Order is load-bearing: outer, then voids, then peers — `clone_shells`
+    // returns the new ids in the SAME order, and the split below re-derives
+    // each shell's role from the two counts. Splitting positionally at `[1..]`
+    // (what this used to do) would file every clone's peer bodies as voids,
+    // inverting their sign in mass properties.
+    let void_count = solid.inner_shells.len();
+    let peer_count = solid.peer_shells.len();
+    let mut all_shells = Vec::with_capacity(1 + void_count + peer_count);
+    all_shells.push(solid.outer_shell);
     all_shells.extend(&solid.inner_shells);
+    all_shells.extend(&solid.peer_shells);
 
     // Traverse the topology to collect all entities
     for &shell_id in &all_shells {
@@ -417,12 +426,20 @@ pub fn deep_clone_solid(
     let new_shells = clone_shells(model, &all_shells, &mut context)?;
 
     // Create new solid
+    // `clone_shells` pushes exactly one new id per input shell or returns Err
+    // (deep_clone.rs `clone_shells`: no dedup, no skip-on-missing), so on this
+    // Ok path `new_shells.len() == 1 + void_count + peer_count` and neither
+    // slice below can be out of range.
     let new_outer_shell = new_shells[0];
-    let new_inner_shells = &new_shells[1..];
+    let new_inner_shells = &new_shells[1..1 + void_count];
+    let new_peer_shells = &new_shells[1 + void_count..1 + void_count + peer_count];
 
     let mut new_solid = Solid::new(0, new_outer_shell);
     for &inner_shell in new_inner_shells {
         new_solid.add_inner_shell(inner_shell);
+    }
+    for &peer_shell in new_peer_shells {
+        new_solid.add_peer_shell(peer_shell);
     }
 
     let new_solid_id = model.solids.add(new_solid);

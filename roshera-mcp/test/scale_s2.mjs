@@ -4,7 +4,7 @@
 // (build first: `npm run build`). Four groups, matching the S2 spec:
 //   (a) validation parity  — invoke(create_box, bad) === direct-call error;
 //                            invoke(create_box, good) produces the identical POST.
-//   (b) surface flip       — minimal exposes exactly 21; full exposes 93.
+//   (b) surface flip       — minimal exposes exactly 31; full exposes 108.
 //                            (S3/S4 added 2 core tools: workbench + cad_program;
 //                             the "blackboard" commit added blackboard_add_entry;
 //                             DFM S7 added 1 analysis tool: dfm_check.)
@@ -89,7 +89,7 @@ console.log("(d) HASH: TS FNV-1a-64 reproduces canonical reference vectors");
 }
 
 // ── (b) Surface flip (pure) ──────────────────────────────────────────────────
-console.log("(b) SURFACE: minimal exposes 31, full exposes 107");
+console.log("(b) SURFACE: minimal exposes 31, full exposes 108");
 const table = buildTable();
 {
   // S3/S4 added 2 core composition tools (workbench + cad_program): 90 kernel
@@ -107,9 +107,13 @@ const table = buildTable();
   // world plane: 104 + 2 + 3 = 109. document_rename (2026-08-09) exposes the
   // long-standing PATCH /api/documents/{id} route (documents.rs) — full
   // table + core bench, never minimal (same non-resident precedent as
-  // document_units): 105 + 2 + 3 = 110.
-  if (table.size === 110) pass("table holds 110 tools (105 kernel + 2 composition + 3 meta)");
-  else fail(`table size ${table.size}, expected 110`);
+  // document_units): 105 + 2 + 3 = 110. recipe_get (2026-08-11, task #10)
+  // exposes GET /api/timeline/recipe/{branch_or_document} — a proven build
+  // retrieved as a re-parameterizable plan; full table + timeline bench,
+  // never minimal (a recipe is consulted per part CLASS, not per operation,
+  // so it does not earn resident surface): 106 + 2 + 3 = 111.
+  if (table.size === 111) pass("table holds 111 tools (106 kernel + 2 composition + 3 meta)");
+  else fail(`table size ${table.size}, expected 111`);
 
   // NOTE: this block's pinned counts (core=18, minimal=21) reflect a PRE-
   // EXISTING drift discovered while rebuilding dist/ for DFM S7, not a count
@@ -136,8 +140,8 @@ const table = buildTable();
   else fail(`meta list is ${META_SURFACE.length}, expected 3`);
 
   const full = exposedNamesFor(table, "full");
-  if (full.length === 107) pass("full surface exposes exactly 107 tools (meta excluded)");
-  else fail(`full surface exposes ${full.length}, expected 107`);
+  if (full.length === 108) pass("full surface exposes exactly 108 tools (meta excluded)");
+  else fail(`full surface exposes ${full.length}, expected 108`);
   if (!full.some((n) => META_SURFACE.includes(n)))
     pass("full surface omits the meta-tools (they are the minimal-surface mechanism)");
   else fail("full surface unexpectedly includes meta-tools");

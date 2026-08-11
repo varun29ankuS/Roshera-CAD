@@ -102,7 +102,19 @@ pub struct ShellData {
 pub struct SolidData {
     pub id: SolidId,
     pub outer_shell: ShellId,
+    /// Void shells only — cavities enclosed by `outer_shell`.
     pub inner_shells: Vec<ShellId>,
+    /// Peer shells — disjoint SIBLING BODIES of the same solid, which ADD to
+    /// mass instead of subtracting (`Solid::peer_shells`).
+    ///
+    /// `#[serde(default)]` is load-bearing for backward compatibility: every
+    /// `.ros` / snapshot written before this field existed has no `peer_shells`
+    /// key, and must deserialize to an EMPTY peer list rather than failing. It
+    /// is the right default in the strong sense too — those files were written
+    /// by a kernel that could only ever file everything as `inner_shells`, so
+    /// claiming a peer body it never recorded would be a fabrication.
+    #[serde(default)]
+    pub peer_shells: Vec<ShellId>,
 }
 
 /// Serializable curve data (simplified)
@@ -215,6 +227,7 @@ pub fn brep_to_serialized(brep: &BRepModel) -> TimelineResult<SerializedBRep> {
             id: solid.id,
             outer_shell: solid.outer_shell,
             inner_shells: solid.inner_shells.clone(),
+            peer_shells: solid.peer_shells.clone(),
         });
     }
 
@@ -634,6 +647,20 @@ pub fn serialized_to_brep(data: &SerializedBRep) -> TimelineResult<BRepModel> {
             solid.add_inner_shell(mapped_shell_id);
         }
 
+        // Add peer bodies. A peer that survives the round trip must come back
+        // AS a peer — silently migrating it into `inner_shells` would flip the
+        // sign of its material on reload, which is the exact defect this slot
+        // exists to prevent.
+        for &peer_shell_id in &solid_data.peer_shells {
+            let mapped_shell_id = *shell_id_map.get(&peer_shell_id).ok_or_else(|| {
+                TimelineError::DeserializationError(format!(
+                    "Invalid peer shell ID: {}",
+                    peer_shell_id
+                ))
+            })?;
+            solid.add_peer_shell(mapped_shell_id);
+        }
+
         brep.solids.add(solid);
     }
 
@@ -659,6 +686,84 @@ mod tests {
 
         // Check that we got the same number of vertices back
         assert_eq!(brep.vertices.len(), deserialized.vertices.len());
+    }
+
+    /// A PEER body must come back FROM the round trip as a peer.
+    ///
+    /// `Solid::peer_shells` and `Solid::inner_shells` carry opposite physical
+    /// meaning — peers ADD material, voids SUBTRACT it — so a serializer that
+    /// merged the two (or dropped peers) would silently flip a two-body union's
+    /// volume from 2000 to 0 on reload while every structural check still
+    /// passed. This is the RED that catches it: it fails if `peer_shells` is
+    /// not written, not read back, or read back into `inner_shells`.
+    #[test]
+    fn peer_body_survives_roundtrip_as_a_peer_not_a_void() {
+        use geometry_engine::primitives::shell::{Shell, ShellType as GeoShellType};
+        use geometry_engine::primitives::solid::Solid;
+
+        let mut brep = BRepModel::new();
+        // Three face-less closed shells: outer, one void, one peer. Face-less
+        // keeps the curve/surface payload (deliberately unimplemented, and
+        // refused rather than faked) out of the way; the shell↔solid role
+        // bookkeeping under test does not depend on face content.
+        let outer = brep.shells.add(Shell::new(0, GeoShellType::Closed));
+        let void = brep.shells.add(Shell::new(0, GeoShellType::Closed));
+        let peer = brep.shells.add(Shell::new(0, GeoShellType::Closed));
+        let mut solid = Solid::new(0, outer);
+        solid.add_inner_shell(void);
+        solid.add_peer_shell(peer);
+        let solid_id = brep.solids.add(solid);
+
+        let json = serialize_brep(&brep).expect("serialize a three-shell solid");
+        assert!(
+            json.contains("peer_shells"),
+            "the serialized form must carry the peer slot: {json}"
+        );
+
+        let back = deserialize_brep(&json).expect("deserialize a three-shell solid");
+        let rebuilt = back
+            .solids
+            .iter()
+            .next()
+            .map(|(_, s)| s.clone())
+            .expect("one solid survives the round trip");
+
+        assert_eq!(
+            rebuilt.peer_shells.len(),
+            1,
+            "the peer body must come back as a PEER (solid {solid_id} had one)",
+        );
+        assert_eq!(
+            rebuilt.inner_shells.len(),
+            1,
+            "the void must come back as a VOID, and the peer must not join it",
+        );
+        assert_ne!(
+            rebuilt.peer_shells[0], rebuilt.inner_shells[0],
+            "peer and void must remain distinct shells after remapping",
+        );
+        assert_eq!(
+            rebuilt.shell_count(),
+            3,
+            "outer + void + peer — no shell may be lost in transit",
+        );
+    }
+
+    /// `.ros` files written before the peer slot existed have no `peer_shells`
+    /// key. They must load with an EMPTY peer list rather than failing — and
+    /// empty is the honest value, because the kernel that wrote them could only
+    /// ever file everything as `inner_shells`.
+    #[test]
+    fn legacy_solid_without_peer_shells_deserializes_with_no_peers() {
+        let legacy = r#"{"id":7,"outer_shell":3,"inner_shells":[4]}"#;
+        let solid: SolidData =
+            serde_json::from_str(legacy).expect("a pre-peer SolidData must still deserialize");
+        assert_eq!(solid.outer_shell, 3);
+        assert_eq!(solid.inner_shells, vec![4]);
+        assert!(
+            solid.peer_shells.is_empty(),
+            "an old file records no peer bodies; inventing one would be a fabrication",
+        );
     }
 
     /// Pins the fix for the writer/reader curve-type spelling mismatch

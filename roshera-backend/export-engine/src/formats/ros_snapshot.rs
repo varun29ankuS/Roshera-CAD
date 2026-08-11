@@ -214,8 +214,18 @@ pub enum ShellType {
 /// Serializable solid data
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SolidData {
+    /// Outer boundary first, then VOID shells (cavities).
     pub shells: Vec<Uuid>,
     pub feature_type: Option<String>,
+    /// Disjoint SIBLING BODIES of this solid (`Solid::peer_shells`) — material,
+    /// not cavities. Kept in their own list rather than appended to `shells`
+    /// because everything downstream reads `shells[1..]` as voids; a peer
+    /// landing there would be exported as a hollow, i.e. a lie in the file.
+    ///
+    /// `#[serde(default)]` so snapshots written before this field existed load
+    /// with no peers, which is exactly what those files recorded.
+    #[serde(default)]
+    pub peer_shells: Vec<Uuid>,
 }
 
 /// B-Rep metadata
@@ -376,11 +386,18 @@ impl BRepSnapshot {
             for &inner in &solid.inner_shells {
                 shells.push(id_to_uuid(inner as u64));
             }
+            // Peer bodies travel in their own list — see `SolidData::peer_shells`.
+            let peer_shells: Vec<Uuid> = solid
+                .peer_shells
+                .iter()
+                .map(|&p| id_to_uuid(p as u64))
+                .collect();
             snapshot.solids.push((
                 uuid,
                 SolidData {
                     shells,
                     feature_type: solid.name.clone(),
+                    peer_shells,
                 },
             ));
         }
@@ -1367,6 +1384,76 @@ mod surface_of_revolution_export_tests {
             }
             other => panic!("SurfaceOfRevolution faceted to the fallback: {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod multi_body_snapshot_tests {
+    //! A multi-body boolean result must reach the `.ros` snapshot as several
+    //! LUMPS, not as a body with cavities.
+
+    use super::BRepSnapshot;
+    use geometry_engine::math::{Matrix4, Vector3};
+    use geometry_engine::operations::{
+        boolean_operation, transform_solid, BooleanOp, BooleanOptions, TransformOptions,
+    };
+    use geometry_engine::primitives::topology_builder::{BRepModel, GeometryId, TopologyBuilder};
+
+    /// Union of two 10³ boxes 30mm apart — the canonical multi-body case.
+    ///
+    /// `SolidData.shells` is read downstream (the STEP writer, notably) as
+    /// "outer, then VOIDS", so a peer body landing there is exported as a
+    /// hollow. This pins that the snapshot separates them: `shells` carries the
+    /// outer boundary alone and the sibling body travels in `peer_shells`.
+    #[test]
+    fn disjoint_union_snapshots_its_peer_body_outside_the_void_list() {
+        let mut model = BRepModel::new();
+        let mk = |model: &mut BRepModel| match TopologyBuilder::new(model)
+            .create_box_3d(10.0, 10.0, 10.0)
+        {
+            Ok(GeometryId::Solid(id)) => id,
+            other => panic!("expected a solid; got {other:?}"),
+        };
+        let a = mk(&mut model);
+        let b = mk(&mut model);
+        transform_solid(
+            &mut model,
+            b,
+            Matrix4::from_translation(&Vector3::new(30.0, 0.0, 0.0)),
+            TransformOptions::default(),
+        )
+        .expect("translating a valid box must succeed");
+        let united = boolean_operation(
+            &mut model,
+            a,
+            b,
+            BooleanOp::Union,
+            BooleanOptions::default(),
+        )
+        .expect("union of two disjoint boxes must not fail");
+
+        let snapshot = BRepSnapshot::from_model(&model).expect("snapshot a two-body model");
+        let (_, solid) = snapshot
+            .solids
+            .iter()
+            .find(|(_, s)| !s.peer_shells.is_empty())
+            .unwrap_or_else(|| {
+                panic!(
+                    "solid {united} is two disjoint bodies — the snapshot must \
+                     carry its peer, or the `.ros` file loses a lump"
+                )
+            });
+        assert_eq!(
+            solid.peer_shells.len(),
+            1,
+            "one sibling body beyond the outer shell",
+        );
+        assert_eq!(
+            solid.shells.len(),
+            1,
+            "`shells` is outer + VOIDS; a disjoint sibling body must not appear \
+             there, or it exports as a cavity",
+        );
     }
 }
 

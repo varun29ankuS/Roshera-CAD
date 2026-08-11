@@ -2879,7 +2879,10 @@ pub async fn plane_from_face(
         .ok_or_else(|| ApiError::solid_not_found(solid_id))?;
     let mut owns_face = false;
     let outer = std::iter::once(&solid.outer_shell);
-    for &shell_id in outer.chain(solid.inner_shells.iter()) {
+    for &shell_id in outer
+        .chain(solid.inner_shells.iter())
+        .chain(solid.peer_shells.iter())
+    {
         if let Some(shell) = model.shells.get(shell_id) {
             if shell.faces.contains(&body.face_id) {
                 owns_face = true;

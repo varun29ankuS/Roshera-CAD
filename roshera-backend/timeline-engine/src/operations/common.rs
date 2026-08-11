@@ -311,9 +311,11 @@ pub fn validate_edges_same_solid(
                     if edge_found { break; }
                 }
 
-                // Also check inner shells
+                // Also check the attached shells — voids and peer bodies
                 if !edge_found {
-                    for &inner_shell_id in &solid.inner_shells {
+                    for &inner_shell_id in
+                        solid.inner_shells.iter().chain(solid.peer_shells.iter())
+                    {
                         if let Some(shell) = brep.shells.get(inner_shell_id) {
                             for &face_id in &shell.faces {
                                 if let Some(face) = brep.faces.get(face_id) {

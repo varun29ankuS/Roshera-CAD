@@ -772,6 +772,7 @@ async fn create_geometry(
             .ok_or_else(|| error_catalog::ApiError::solid_not_found(solid_id))?;
         let face_count = std::iter::once(solid.outer_shell)
             .chain(solid.inner_shells.iter().copied())
+            .chain(solid.peer_shells.iter().copied())
             .filter_map(|sid| model.shells.get(sid))
             .map(|sh| sh.faces.len())
             .sum::<usize>();
@@ -5920,7 +5921,10 @@ async fn extrude_face_endpoint(
         // this solid?".
         let mut owns_face = false;
         let outer = std::iter::once(&solid.outer_shell);
-        for &shell_id in outer.chain(solid.inner_shells.iter()) {
+        for &shell_id in outer
+            .chain(solid.inner_shells.iter())
+            .chain(solid.peer_shells.iter())
+        {
             if let Some(shell) = model.shells.get(shell_id) {
                 if shell.faces.contains(&face_id) {
                     owns_face = true;
@@ -6166,7 +6170,10 @@ async fn preview_face_extrude(
             .ok_or_else(|| ApiError::solid_not_found(host_solid_id))?;
         let mut owns_face = false;
         let outer = std::iter::once(&solid.outer_shell);
-        for &shell_id in outer.chain(solid.inner_shells.iter()) {
+        for &shell_id in outer
+            .chain(solid.inner_shells.iter())
+            .chain(solid.peer_shells.iter())
+        {
             if let Some(shell) = model.shells.get(shell_id) {
                 if shell.faces.contains(&face_id) {
                     owns_face = true;
@@ -6768,6 +6775,7 @@ async fn get_geometry(
         "name": solid.name.clone().unwrap_or_default(),
         "outer_shell": solid.outer_shell,
         "inner_shells": solid.inner_shells,
+        "peer_shells": solid.peer_shells,
         "parent_assembly": solid.parent_assembly,
     })))
 }
@@ -10679,6 +10687,19 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route(
             "/api/timeline/dependency-graph/{branch_id}",
             get(crate::handlers::timeline::get_dependency_graph),
+        )
+        // Task #10 — RECIPES FROM LINEAGE. Projects a proven build's event
+        // log into a retrievable, re-parameterizable PLAN: ordered op kinds,
+        // their RECORDED parameters, the intent recorded on each event, the
+        // checkpoint declarations covering them, and a roll-up of the
+        // certificates AS RECORDED. Addressable by live branch ref OR by any
+        // registered document id (read from durable storage — the document is
+        // never opened, the live model never touched). A mid-tier model
+        // retrieving a certified plan beats a frontier model planning a known
+        // part class from scratch; this route is that retrieval.
+        .route(
+            "/api/timeline/recipe/{branch_or_document}",
+            get(crate::handlers::timeline::get_recipe),
         )
         // #29: enumerate the addressable timeline sessions — a `live` session
         // per branch that has events (the branch's stable read-model handle,

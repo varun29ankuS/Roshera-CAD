@@ -4,11 +4,11 @@
 
 //! Two reported kernel defects, re-measured against the live kernel.
 //!
-//! 1. **Union of two DISJOINT solids files the second body as a VOID** and
-//!    certifies the result sound. REPRODUCED, root diagnosed, fix blocked on a
-//!    `Solid` schema change — see `disjoint_union_keeps_both_bodies` for the
-//!    full root/blocker note. Held as an `#[ignore]`d real contract rather than
-//!    a weakened assertion.
+//! 1. **Union of two DISJOINT solids filed the second body as a VOID** and
+//!    certified the result sound. REPRODUCED, root diagnosed, FIXED by the
+//!    `Solid::peer_shells` sibling-body slot — see
+//!    `disjoint_union_keeps_both_bodies`, which was held as an `#[ignore]`d
+//!    real contract (never a weakened assertion) until the fix landed.
 //!
 //! 2. **The second through-bore.** The reported input — a bore 30mm from the
 //!    first — is CLEAN (8 faces, analytic volume, sound); see
@@ -228,37 +228,26 @@ fn describe(model: &mut BRepModel, solid_id: SolidId, label: &str) {
 // DEFECT 1 — union of two disjoint solids must not mis-file a body as a void
 // ---------------------------------------------------------------------------
 
-/// MEASURED RED, root diagnosed, fix deliberately out of scope — held in the
-/// same `#[ignore]`-with-a-reason form this suite already uses for
-/// `box_box_difference_bbox_within_minuend_3480` (#34/#80) and
-/// `cyl_minus_sphere_same_radius_7` (#7). Every assertion below is the real
-/// contract and is left intact, so this flips green the day the blocker lands.
+/// WAS RED (held `#[ignore]`d with every assertion intact); now GREEN.
 ///
-/// Root: `reconstruct_topology` (boolean.rs) files EVERY non-outer shell into
-/// `Solid::inner_shells`, which means VOID. For a union of disjoint operands
-/// the second body is a PEER, not a cavity, and the consumers then disagree
-/// about the same solid: `Solid::compute_mass_properties` SUBTRACTS it
-/// (→ the reported volume 1000), `solid_outer_face_count` cannot see its faces
-/// (→ the reported 6, not 12), the mesh/tessellation path ADDS it (→ 2000).
-/// All three under `certify_solid(...).is_sound() == true`.
+/// Root, as measured: `reconstruct_topology` (boolean.rs) filed EVERY non-outer
+/// shell into `Solid::inner_shells`, which means VOID. For a union of disjoint
+/// operands the second body is a PEER, not a cavity, and the consumers then
+/// disagreed about the same solid: `Solid::compute_mass_properties` SUBTRACTED
+/// it (→ 1000), `solid_outer_face_count` could not see its faces (→ 6, not 12),
+/// the mesh/tessellation path ADDED it (→ 2000). All three under
+/// `certify_solid(...).is_sound() == true`.
 ///
-/// Blocker: peer bodies need a role on `Solid` that is neither `outer_shell`
-/// nor `inner_shells` — a schema change reaching `ModelSnapshot`, `.ros`
-/// serialization and export. Three oracles currently READ the present shape and
-/// pass because the mesh path is the one they consult:
-/// `boolean_fuzz_survey::box_sphere_conquered_band_gate` (#91) pins two
-/// explicitly disjoint box∘sphere UNION cells against a 96³ grid truth, and
+/// Fix: `Solid::peer_shells` — a same-orientation sibling-body slot that is
+/// neither `outer_shell` nor `inner_shells`, with each shell's role PROVED by
+/// winding number at the reconstruct seam. Refusal was rejected as the fix
+/// because multi-lump results are legitimate, oracle-verified geometry
+/// (`boolean_fuzz_survey::box_sphere_conquered_band_gate` #91 pins two
+/// explicitly disjoint box∘sphere UNION cells against a 96³ grid truth;
 /// `rotated_box_booleans_match_mc_truth` / `tilted_box_booleans_match_mc_truth`
-/// pin a four-body Difference against Monte-Carlo truth. Refusing multi-body
-/// results — the other honest option — would break all three, i.e. destroy
-/// working, oracle-verified geometry to hide a bookkeeping defect.
-///
-/// What DID land: the outer shell is no longer `shells[0]` by assumption. It is
-/// picked by measured extent and every other shell's void status is proved by
-/// winding number, so the kernel can no longer report a CAVITY as the body.
+/// pin a four-body Difference against Monte-Carlo truth). So the bookkeeping
+/// was fixed and the multi-body fact is DISCLOSED on the certificate instead.
 #[test]
-#[ignore = "peer bodies are filed as voids (boolean.rs reconstruct_topology); \
-            needs a peer-lump role on Solid — flip on when it lands"]
 fn disjoint_union_keeps_both_bodies() {
     let mut model = BRepModel::new();
     let a = make_box(&mut model, 10.0, 10.0, 10.0);
@@ -307,6 +296,31 @@ fn disjoint_union_keeps_both_bodies() {
         topological_open_edges(&model, id),
         0,
         "the two-body union must be a closed 2-manifold",
+    );
+
+    // The result is genuinely correct geometry, so the certificate must call it
+    // sound — AND it must DISCLOSE that this "part" is two disjoint bodies.
+    // Before `peer_count` existed the multi-body fact lived only on an opt-in
+    // pipeline trace: the certificate said "sound" and nothing else, which is
+    // true but not the whole answer to "what did you make?".
+    let cert = model.certify_solid(id);
+    assert!(
+        cert.is_sound(),
+        "the disjoint union is correct geometry (mesh closed, oriented, \
+         analytic volume 2000) — the certificate must not call it unsound: \
+         {:?}",
+        cert.errors,
+    );
+    assert_eq!(
+        cert.peer_count, 1,
+        "the certificate must STATE that this solid carries one peer body \
+         beyond its outer shell; a silent `sound` on a two-lump result is the \
+         disclosure gap this field closes",
+    );
+    assert_eq!(
+        model.solids.get(id).map(|s| s.inner_shells.len()),
+        Some(0),
+        "a disjoint sibling body is not a VOID and must not be filed as one",
     );
 }
 
@@ -517,10 +531,10 @@ fn coincident_recut_of_an_existing_bore_is_never_certified_sound() {
 /// it goes red, forcing the trade-off to be re-argued rather than silently
 /// re-decided.
 ///
-/// KNOWN RESIDUAL (out of scope, deliberately not asserted as correct): the two
-/// halves are filed as outer shell + `inner_shells`, so only the MESH consumer
-/// reports the right volume. `Solid::compute_mass_properties` subtracts the
-/// second half and `solid_outer_face_count` cannot see its faces.
+/// The former residual is CLOSED: the two halves are now outer shell +
+/// `peer_shells`, not outer shell + `inner_shells`, so every consumer agrees —
+/// mass properties ADD the second half, `solid_outer_face_count` sees its
+/// faces, and the certificate discloses `peer_count`.
 #[test]
 fn difference_that_severs_a_body_still_succeeds() {
     let mut model = BRepModel::new();
@@ -549,5 +563,21 @@ fn difference_that_severs_a_body_still_succeeds() {
     assert!(
         (v - expect).abs() < 20.0,
         "severed plate mesh volume {v}, expected {expect}",
+    );
+
+    // The severed halves are PEERS, not voids — and no consumer may disagree.
+    assert!(
+        phantom_void_shells(&model, severed).is_empty(),
+        "a severed half is a sibling body, never a cavity of the other half",
+    );
+    let outer_faces = model
+        .solid_outer_face_count(severed)
+        .expect("a severed plate has boundary faces");
+    assert_eq!(
+        outer_faces,
+        all_faces(&model, severed).len(),
+        "every face of a severed plate is exterior boundary, so the O(1) count \
+         must equal the full face count — it saw only one half before peers \
+         had a slot",
     );
 }
