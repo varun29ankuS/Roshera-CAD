@@ -458,6 +458,21 @@ export function registerTimelineTools(server: ToolHost) {
         .describe("the intent: feature + governing dimensions + where it sits"),
       description: z.string().optional().describe("reasoning behind the intent (mirrored to the notebook)"),
       branch: z.string().default("main").describe("branch whose event range to capture"),
+      // GATE 6 ESCAPE (gates.ts, verification_scope). Opening a checkpoint
+      // CLOSES the previous one; if geometry was built under it and never
+      // checked with verify_part / verify_claim, this call is refused typed.
+      // This flag is the one way through, and it is deliberately an ARGUMENT
+      // rather than an omission: the intent then closes unverified ON THE
+      // RECORD. Read by the gate before dispatch; never forwarded to the
+      // backend, which has no notion of it.
+      skip_verification: z
+        .boolean()
+        .optional()
+        .describe(
+          "close the PREVIOUS intent without verifying what it built (scratch " +
+            "geometry, a cutter about to be subtracted away). Escapes the " +
+            "verification gate explicitly instead of silently",
+        ),
     },
     async ({ name, description, branch }) => {
       try {

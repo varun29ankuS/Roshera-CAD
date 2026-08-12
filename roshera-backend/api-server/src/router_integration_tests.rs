@@ -9253,3 +9253,469 @@ async fn recipe_of_the_slip_on_document_reads_the_real_corpus() {
         "the scoped recipe must be exactly 4 cutter ops and their 4 differences; got {wcut}/{wdiff}"
     );
 }
+
+// =====================================================================
+// Tests — FIDELITY: "is the geometry you asked for the geometry you got?"
+//
+// The certificate measures TOPOLOGY. The loft octagon shipped CERTIFIED
+// SOUND carrying a 9.97% volume shortfall against the circular closed form
+// (`geometry-engine/tests/capability_probe_loft_sweep_pattern.rs`) because
+// nothing anywhere compared the RESULT to the REQUEST. These gates pin that
+// comparison on the wire:
+//
+//   * the analytic primitives are the CALIBRATION — exactly what was asked
+//     for, so the statistic must read ~0 there or it cannot be trusted
+//     anywhere else;
+//   * a coarse loft ring is SOUND and NOT the requested cross-section, and
+//     the two verdicts say so independently;
+//   * a quantity that cannot be measured is a stated gap, never a zero.
+// =====================================================================
+
+/// A ring of `n` points sampled on a circle of `radius` at height `z` —
+/// the wire shape `POST /api/geometry/nurbs_loft` takes for one section.
+fn loft_circle_ring(n: usize, radius: f64, z: f64) -> Value {
+    Value::Array(
+        (0..n)
+            .map(|i| {
+                let t = 2.0 * std::f64::consts::PI * (i as f64) / (n as f64);
+                json!([radius * t.cos(), radius * t.sin(), z])
+            })
+            .collect(),
+    )
+}
+
+/// CALIBRATION GATE. An analytic cylinder IS the geometry that was asked for,
+/// so its fidelity block must read essentially exact — not merely "inside the
+/// band". A non-trivial number here would mean the statistic is wrong, and
+/// every other fidelity number in this file would be unreadable.
+#[tokio::test]
+async fn fidelity_on_a_cylinder_is_exact_the_calibration_case() {
+    let state = make_test_state().await;
+    let (status, body) = dispatch(
+        &state,
+        json_post(
+            "/api/geometry/cylinder",
+            json!({"radius": 7.0, "height": 26.0}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "cylinder must 200; body = {body}");
+
+    let fidelity = &body["perception"]["fidelity"];
+    assert!(
+        fidelity.is_object(),
+        "every op whose REQUEST carries measurable parameters must disclose a \
+         fidelity block beside `sound`; body = {body}"
+    );
+    assert_eq!(fidelity["op"].as_str(), Some("cylinder"), "body = {body}");
+    assert_eq!(
+        fidelity["fidelity_ok"].as_bool(),
+        Some(true),
+        "an analytic cylinder IS what was asked for; body = {body}"
+    );
+    let names: Vec<&str> = fidelity["quantities"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|q| q["name"].as_str()).collect())
+        .unwrap_or_default();
+    assert!(
+        names.contains(&"radius") && names.contains(&"height"),
+        "both requested dimensions must be compared, got {names:?}; body = {body}"
+    );
+    let worst = fidelity["worst"]["relative_deviation"]
+        .as_f64()
+        .unwrap_or(f64::NAN);
+    assert!(
+        worst < 1e-9,
+        "THE CALIBRATION BITE: the analytic primitive must measure EXACT, not \
+         merely inside the band — worst deviation {worst:e}; body = {body}"
+    );
+    // Raw numbers ride along so a caller with a tighter contract can judge for
+    // itself rather than trusting the boolean.
+    let radius_q = fidelity["quantities"]
+        .as_array()
+        .and_then(|a| a.iter().find(|q| q["name"] == "radius"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    assert_eq!(radius_q["requested"].as_f64(), Some(7.0), "body = {body}");
+    assert!(
+        radius_q["method"].as_str().is_some_and(|m| !m.is_empty()),
+        "every measured quantity states HOW it was measured; body = {body}"
+    );
+}
+
+/// The box is measured in its OWN (u, v, u×v) frame, not a world bounding box,
+/// so an arbitrarily-posed box is judged against the dimensions the caller
+/// actually asked for. Second calibration case.
+#[tokio::test]
+async fn fidelity_on_a_posed_box_measures_the_requested_frame() {
+    let state = make_test_state().await;
+    // A frame rotated 45° about +Z: a world bbox would read (w+d)/√2 for the
+    // width and fail; the box's own frame reads the requested numbers.
+    let s = std::f64::consts::FRAC_1_SQRT_2;
+    let (status, body) = dispatch(
+        &state,
+        json_post(
+            "/api/geometry/box",
+            json!({
+                "u_axis": [s, s, 0.0],
+                "v_axis": [-s, s, 0.0],
+                "width": 12.0, "depth": 5.0, "height": 3.0
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "box must 200; body = {body}");
+
+    let fidelity = &body["perception"]["fidelity"];
+    assert_eq!(fidelity["op"].as_str(), Some("box"), "body = {body}");
+    assert_eq!(
+        fidelity["fidelity_ok"].as_bool(),
+        Some(true),
+        "a posed analytic box IS what was asked for; body = {body}"
+    );
+    let worst = fidelity["worst"]["relative_deviation"]
+        .as_f64()
+        .unwrap_or(f64::NAN);
+    assert!(
+        worst < 1e-9,
+        "a 45°-posed box must still measure exact in its own frame (a world-bbox \
+         statistic would be far off here) — worst {worst:e}; body = {body}"
+    );
+}
+
+/// Revolve discloses the requested meridian's extents against the solid of
+/// revolution actually built.
+#[tokio::test]
+async fn fidelity_on_a_revolve_measures_the_requested_meridian_extents() {
+    let state = make_test_state().await;
+    let (status, body) = dispatch(
+        &state,
+        json_post(
+            "/api/geometry/revolve",
+            json!({"profile": [[2.0, 0.0], [6.0, 0.0], [6.0, 10.0], [2.0, 10.0]]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "revolve must 200; body = {body}");
+
+    let fidelity = &body["perception"]["fidelity"];
+    assert_eq!(fidelity["op"].as_str(), Some("revolve"), "body = {body}");
+    let quantities = fidelity["quantities"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let radius = quantities
+        .iter()
+        .find(|q| q["name"] == "meridian_max_radius")
+        .cloned()
+        .unwrap_or(Value::Null);
+    assert_eq!(
+        radius["requested"].as_f64(),
+        Some(6.0),
+        "the requested max meridian radius is read off the [r,z] profile; body = {body}"
+    );
+    let extent = quantities
+        .iter()
+        .find(|q| q["name"] == "meridian_axial_extent")
+        .cloned()
+        .unwrap_or(Value::Null);
+    assert_eq!(extent["requested"].as_f64(), Some(10.0), "body = {body}");
+    assert_eq!(
+        fidelity["fidelity_ok"].as_bool(),
+        Some(true),
+        "a rectangular meridian revolved 360° is a plain tube — it IS what was \
+         asked for; body = {body}"
+    );
+}
+
+/// A gap is never a zero. A typed `profile_segments` revolve carries no
+/// request-side extents that can be read without evaluating each segment (an
+/// arc's extreme radius is not one of its endpoints), so the block states that
+/// reason and reports NO numbers — rather than a fabricated `requested: 0`.
+#[tokio::test]
+async fn fidelity_on_a_typed_segment_revolve_is_a_stated_gap_never_a_zero() {
+    let state = make_test_state().await;
+    let (status, body) = dispatch(
+        &state,
+        json_post(
+            "/api/geometry/revolve",
+            json!({"profile_segments": typed_nozzle_segments()}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "typed-segment revolve must 200; body = {body}"
+    );
+
+    let fidelity = &body["perception"]["fidelity"];
+    assert!(
+        fidelity["quantities"]
+            .as_array()
+            .is_some_and(|a| a.is_empty()),
+        "nothing on this arm is measurable, so NOTHING may be reported as \
+         measured; body = {body}"
+    );
+    let gaps = fidelity["gaps"].as_array().cloned().unwrap_or_default();
+    assert_eq!(gaps.len(), 1, "exactly one stated gap; body = {body}");
+    assert!(
+        gaps.first()
+            .and_then(|g| g["reason"].as_str())
+            .is_some_and(|r| r.contains("profile_segments")),
+        "the gap must NAME why it is absent, not merely be absent; body = {body}"
+    );
+    // AND NO GREEN BOOLEAN EITHER. `fidelity_ok: true` over zero measurements
+    // would be "certified sound at 9.97%" in miniature: a thin client that keys
+    // off the boolean and never reads `quantities` would be handed a pass over
+    // something nobody looked at. The key is ABSENT; `gaps` is the statement.
+    assert!(
+        fidelity
+            .as_object()
+            .is_some_and(|m| !m.contains_key("fidelity_ok")),
+        "with nothing measured there is NO verdict to give — `fidelity_ok` must \
+         be absent, not `true`; body = {body}"
+    );
+    assert!(
+        fidelity["worst"].is_null(),
+        "no worst without a measurement; body = {body}"
+    );
+}
+
+/// The `smooth: true` arm fits a NURBS spline THROUGH the sampled meridian, so
+/// the built wall's extreme radius is not obliged to equal `max(profile r)` —
+/// this instruments an arm whose deviation nobody had looked at. The assertion
+/// is on DISCLOSURE first: whichever way the number falls, the block must carry
+/// it WITH ITS SIGN so a caller can judge a wall that overshoots its control
+/// polyline differently from one that undershoots it.
+#[tokio::test]
+async fn fidelity_on_a_smooth_revolve_discloses_the_fitted_wall_deviation() {
+    let state = make_test_state().await;
+    let (status, body) = dispatch(
+        &state,
+        json_post(
+            "/api/geometry/revolve",
+            json!({
+                "profile": [[6.0, 0.0], [4.0, 5.0], [3.5, 10.0], [5.0, 18.0], [8.0, 26.0]],
+                "smooth": true,
+                "bore_radius": 2.0
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "smooth revolve must 200; body = {body}"
+    );
+
+    let fidelity = &body["perception"]["fidelity"];
+    assert_eq!(fidelity["op"].as_str(), Some("revolve"), "body = {body}");
+    let worst = &fidelity["worst"];
+    assert!(
+        worst["relative_deviation"]
+            .as_f64()
+            .is_some_and(f64::is_finite),
+        "the smooth arm must still carry a real measured deviation — not a gap, \
+         not a silence; body = {body}"
+    );
+    assert!(
+        worst["signed_relative_deviation"]
+            .as_f64()
+            .is_some_and(f64::is_finite)
+            && worst["direction"].as_str().is_some(),
+        "and it must carry the SIGN: a fitted wall running OUTSIDE its control \
+         polyline is a different fact from one falling short of it; body = {body}"
+    );
+    // The verdict is PINNED from a measurement, not asserted by hope. If the
+    // spline fit ever moves this arm across the 2% band this line goes red —
+    // which is the point: the band for a fitted wall then becomes an explicit
+    // decision (widen it, or state a gap for the smooth arm) instead of an
+    // unnoticed drift in what the kernel builds.
+    assert_eq!(
+        fidelity["fidelity_ok"].as_bool(),
+        Some(true),
+        "MEASURED: the spline through this meridian stays inside the 2% band. A \
+         red here is a real change in the smooth fit, not a flake — re-measure \
+         and decide the band deliberately; body = {body}"
+    );
+}
+
+/// GREEN: a well-sampled loft ring is skinned into essentially the ring that
+/// was asked for.
+#[tokio::test]
+async fn fidelity_on_a_well_sampled_loft_stays_inside_the_band() {
+    let state = make_test_state().await;
+    let (status, body) = dispatch(
+        &state,
+        json_post(
+            "/api/geometry/nurbs_loft",
+            json!({"sections": [
+                loft_circle_ring(64, 7.0, 0.0),
+                loft_circle_ring(64, 4.5, 26.0)
+            ]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "loft must 200; body = {body}");
+
+    let fidelity = &body["perception"]["fidelity"];
+    assert_eq!(fidelity["op"].as_str(), Some("loft"), "body = {body}");
+    assert_eq!(
+        fidelity["fidelity_ok"].as_bool(),
+        Some(true),
+        "a 64-point ring is honoured; body = {body}"
+    );
+    let worst = fidelity["worst"]["relative_deviation"]
+        .as_f64()
+        .unwrap_or(f64::NAN);
+    assert!(
+        worst < 0.02,
+        "the normal loft's residual must sit inside the 2% band; got {:.4}%; \
+         body = {body}",
+        worst * 100.0
+    );
+    let names: Vec<&str> = fidelity["quantities"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|q| q["name"].as_str()).collect())
+        .unwrap_or_default();
+    assert!(
+        names.contains(&"cap_area_bottom") && names.contains(&"cap_area_top"),
+        "both end caps are measurable cross-sections, got {names:?}; body = {body}"
+    );
+}
+
+/// THE MOTIVATING GATE (RED-first). A deliberately-degraded ring density —
+/// EIGHT points, the exact density the historical loft defect collapsed every
+/// circular profile to — produces a solid that is genuinely closed, genuinely
+/// manifold, CERTIFIED SOUND, and is NOT the cross-section that was requested.
+///
+/// `sound` stays `true`, because the topology genuinely is sound; saying
+/// otherwise would swap one false statement for another. `fidelity_ok` is
+/// `false` and carries the number. That is the whole point: two independent
+/// verdicts, disagreeing exactly when the geometry warrants it.
+#[tokio::test]
+async fn a_coarse_loft_is_certified_sound_and_fidelity_says_it_is_not_what_was_asked_for() {
+    let state = make_test_state().await;
+    let (status, body) = dispatch(
+        &state,
+        json_post(
+            "/api/geometry/nurbs_loft",
+            json!({"sections": [
+                loft_circle_ring(8, 7.0, 0.0),
+                loft_circle_ring(8, 4.5, 26.0)
+            ]}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "loft must 200; body = {body}");
+
+    assert_eq!(
+        body["perception"]["sound"].as_bool(),
+        Some(true),
+        "THE POINT: the topology certificate is CLEAN. A fidelity deviation must \
+         never flip `sound` — an octagonal frustum really is a closed, manifold, \
+         self-intersection-free solid; body = {body}"
+    );
+
+    let fidelity = &body["perception"]["fidelity"];
+    assert_eq!(
+        fidelity["fidelity_ok"].as_bool(),
+        Some(false),
+        "an 8-point ring is NOT the cross-section that was requested, and the \
+         only verdict that can see it must say so; body = {body}"
+    );
+    let worst = fidelity["worst"]["relative_deviation"]
+        .as_f64()
+        .unwrap_or(f64::NAN);
+    assert!(
+        worst > 0.02,
+        "the deviation must actually EXCEED the band, not merely be reported: \
+         {:.4}%; body = {body}",
+        worst * 100.0
+    );
+    // The numbers, not just the boolean: requested and measured both present
+    // and distinct, so a caller can see the size of the disagreement.
+    let w = &fidelity["worst"];
+    let (req, meas) = (
+        w["requested"].as_f64().unwrap_or(f64::NAN),
+        w["measured"].as_f64().unwrap_or(f64::NAN),
+    );
+    assert!(
+        req.is_finite() && meas.is_finite() && (req - meas).abs() > 1e-6,
+        "the block must carry requested AND measured, visibly different; body = {body}"
+    );
+    // AND THE DIRECTION. The mechanism is symmetric and the two directions are
+    // different diagnoses: negative = the kernel built LESS than asked (the
+    // octagon defect class), positive = it built MORE (nurbs_loft's documented
+    // periodic-cubic interpolation rounding out a coarse request, which is this
+    // case). Without the sign a caller cannot tell a kernel defect from a
+    // sampling report.
+    assert!(
+        w["signed_relative_deviation"].as_f64().unwrap_or(f64::NAN) > 0.0
+            && w["direction"].as_str() == Some("built LARGER than requested"),
+        "the disagreement must be DIRECTED, and this arm is interpolation \
+         overshoot, not the octagon's undershoot; body = {body}"
+    );
+}
+
+/// The `"fast": true` opt-out skips the expensive TOPOLOGY certificate — but a
+/// caller who opted out of that has NOT opted out of learning that what it got
+/// is not what it asked for. Same argument the durability disclosure already
+/// makes one level up.
+#[tokio::test]
+async fn fidelity_survives_the_fast_certificate_opt_out() {
+    let state = make_test_state().await;
+    let (status, body) = dispatch(
+        &state,
+        json_post(
+            "/api/geometry/nurbs_loft",
+            json!({"sections": [
+                loft_circle_ring(8, 7.0, 0.0),
+                loft_circle_ring(8, 4.5, 26.0)
+            ], "fast": true}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "fast loft must 200; body = {body}");
+    // `fast: true` skips the FULL-certificate block — `cert` (the per-check
+    // breakdown `certified_response` inlines) is what disappears. The cheap
+    // perception block's own `sound`/`verdict` are always present, so `cert` is
+    // the honest marker that the expensive path really was skipped.
+    assert!(
+        body["perception"]
+            .as_object()
+            .is_some_and(|m| !m.contains_key("cert")),
+        "`fast: true` really did skip the full-certificate block; body = {body}"
+    );
+    assert_eq!(
+        body["perception"]["fidelity"]["fidelity_ok"].as_bool(),
+        Some(false),
+        "the fidelity disclosure is NOT part of the skipped block; body = {body}"
+    );
+}
+
+/// Additive pin: an op with no measurable requested parameters carries NO
+/// fidelity key at all — the block is present only when there is something to
+/// say, never an empty husk of zeros.
+#[tokio::test]
+async fn fidelity_is_absent_on_an_op_with_no_measurable_request() {
+    let state = make_test_state().await;
+    let (status, body) = dispatch(
+        &state,
+        json_post(
+            "/api/geometry/cone",
+            json!({"base_radius": 4.0, "height": 9.0}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "cone must 200; body = {body}");
+    assert!(
+        body["perception"]
+            .as_object()
+            .is_some_and(|m| !m.contains_key("fidelity")),
+        "the cone is outside this slice; its response must be byte-for-byte \
+         what it was before fidelity existed (absent, not null, not zeros); \
+         body = {body}"
+    );
+}

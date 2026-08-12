@@ -8,6 +8,7 @@ pub mod bvh;
 pub mod cd;
 pub mod erosion;
 pub mod features;
+pub mod fidelity;
 pub mod field;
 pub mod kinematics;
 pub mod lmd;
@@ -22,6 +23,10 @@ pub mod relational;
 pub mod select;
 pub mod trim;
 
+pub use fidelity::{
+    box_fidelity, cylinder_fidelity, loft_fidelity, revolve_fidelity, FidelityQuantity,
+    FidelityReport, DEFAULT_FIDELITY_TOLERANCE,
+};
 pub use field::{sample_field_adaptive, signed_distance, AdaptiveField, FieldCell};
 pub use measure::{measure, MeasureError, MeasureResult, MeasureSubject};
 pub use occupancy::{occupancy_grid, to_slice_stack, OccupancyGrid};

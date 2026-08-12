@@ -1204,6 +1204,137 @@ pub(crate) fn certificate_json(
     })
 }
 
+/// FIDELITY — "is the geometry you asked for the geometry you got?", rendered
+/// for the wire.
+///
+/// The certificate above measures TOPOLOGY. The loft octagon shipped CERTIFIED
+/// SOUND carrying a 9.97% volume shortfall because nothing compared the RESULT
+/// to the REQUEST; `geometry_engine::queries::fidelity` is that comparison and
+/// this is its JSON projection.
+///
+/// Three properties this shape must keep:
+///
+/// 1. **`fidelity_ok` is NOT `sound`.** A deviation beyond the band never flips
+///    `sound`: the topology of an octagonal frustum genuinely IS closed,
+///    manifold and self-intersection-free, and claiming otherwise would swap
+///    one false statement for another. The two verdicts sit side by side and
+///    disagree when the geometry warrants it.
+/// 2. **Numbers travel with the verdict.** `requested` / `measured` /
+///    `relative_deviation` ride on every quantity, plus the `method` that
+///    produced the measurement, so a caller whose contract is tighter (or
+///    looser) than the 2% band can judge for itself instead of re-measuring.
+/// 3. **A gap is never a zero, and never a green boolean either.** A quantity
+///    that could not be measured appears in `gaps` with a stated reason.
+///    Emitting `requested: 7, measured: 0` for "not measured" would read as a
+///    catastrophic defect — a louder lie than the silence it replaced. And when
+///    NOTHING was measured, the `fidelity_ok` KEY IS OMITTED rather than set
+///    `true`: a thin client that keys off the boolean and never reads
+///    `quantities` would otherwise be handed a pass over an unmeasured
+///    quantity, which is the "certified sound at 9.97%" pattern this block
+///    exists to end. Absence forces the reader to meet `gaps`.
+/// 4. **The deviation carries its SIGN.** `signed_relative_deviation` is
+///    negative when the kernel built LESS than was asked for (the octagon
+///    class — an inscribed polygon where a curve was requested) and positive
+///    when it built more (typically a smooth interpolation running outside a
+///    coarsely-sampled request). Same magnitude, different diagnosis; a caller
+///    that only sees the magnitude cannot tell them apart.
+///
+/// `serde_json::to_value` on the plain-`f64`/`String` report cannot fail for any
+/// value the fidelity module can produce; the `Err` arm is handled and logged
+/// (never `unwrap`ped) so a future field that broke that invariant would be
+/// loud rather than a quietly-omitted disclosure — the same discipline the
+/// durability disclosure in `certified_response` uses.
+pub(crate) fn fidelity_json(
+    report: &geometry_engine::queries::fidelity::FidelityReport,
+) -> serde_json::Value {
+    let quantities = match serde_json::to_value(&report.quantities) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(
+                target: "fidelity",
+                error = %e,
+                "fidelity: measured quantities failed to serialize — disclosure DEGRADED \
+                 (this should be unreachable for FidelityQuantity)"
+            );
+            serde_json::Value::Array(vec![])
+        }
+    };
+    let gaps = match serde_json::to_value(&report.gaps) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(
+                target: "fidelity",
+                error = %e,
+                "fidelity: gaps failed to serialize — disclosure DEGRADED \
+                 (this should be unreachable for FidelityGap)"
+            );
+            serde_json::Value::Array(vec![])
+        }
+    };
+    let mut block = serde_json::Map::new();
+    block.insert("op".into(), serde_json::json!(report.op));
+    // OMITTED, not `true`, when nothing was measured — see property 3 above.
+    if let Some(ok) = report.fidelity_ok() {
+        block.insert("fidelity_ok".into(), serde_json::json!(ok));
+    }
+    block.insert("tolerance".into(), serde_json::json!(report.tolerance));
+    block.insert(
+        "worst".into(),
+        match report.worst() {
+            Some(w) => serde_json::json!({
+                "name":                      w.name,
+                "requested":                 w.requested,
+                "measured":                  w.measured,
+                "relative_deviation":        w.relative_deviation,
+                "signed_relative_deviation": w.signed_relative_deviation,
+                "direction": if w.signed_relative_deviation < 0.0 {
+                    "built SMALLER than requested"
+                } else {
+                    "built LARGER than requested"
+                },
+            }),
+            None => serde_json::Value::Null,
+        },
+    );
+    block.insert("quantities".into(), quantities);
+    block.insert("gaps".into(), gaps);
+    block.insert(
+        "note".into(),
+        serde_json::json!(
+            "fidelity compares the REQUEST to the RESULT; `sound` compares the \
+             result to the laws of topology. They are independent verdicts — a \
+             fidelity deviation does NOT make a solid unsound, and a sound solid \
+             is not thereby the shape that was asked for. When nothing could be \
+             measured, `fidelity_ok` is ABSENT and `gaps` says why: there is no \
+             verdict to give, and a green one would be the same silent pass this \
+             block exists to remove."
+        ),
+    );
+    serde_json::Value::Object(block)
+}
+
+/// Insert a fidelity block into a perception object, beside `sound` /
+/// `verdict` / `durability` rather than inside `cert`.
+///
+/// Placed at the same level as the durability disclosure, and for the same
+/// reason that comment gives: the certificate block is skipped by
+/// `"fast": true`, but a caller who opted out of the expensive topology
+/// certificate has NOT opted out of knowing that what it got is not what it
+/// asked for. An EMPTY report (nothing measured and nothing to explain) inserts
+/// nothing at all, so an op with no measurable requested parameters is
+/// byte-for-byte unchanged — absent, never a block of zeros.
+fn attach_fidelity(
+    perception: &mut serde_json::Value,
+    report: &geometry_engine::queries::fidelity::FidelityReport,
+) {
+    if report.is_empty() {
+        return;
+    }
+    if let serde_json::Value::Object(map) = perception {
+        map.insert("fidelity".to_string(), fidelity_json(report));
+    }
+}
+
 /// The kernel's one-line soundness verdicts, in ONE place.
 ///
 /// Three surfaces quote these: the ambient perception block every mutating
@@ -4087,7 +4218,7 @@ async fn create_cylinder_primitive(
     // AMBIENT VERIFICATION (outlier closed): the dedicated cylinder primitive
     // previously emitted no verdict; it now carries the full certificate.
     let durability = durability::disclosure(&state).await;
-    let perception = {
+    let mut perception = {
         let mut model = model_handle.write().await;
         certified_response(
             &mut model,
@@ -4099,6 +4230,20 @@ async fn create_cylinder_primitive(
             durability,
         )
     };
+
+    // FIDELITY — THE CALIBRATION CASE. An analytic cylinder is exactly what was
+    // asked for, so this block reads ~1e-16 and exists here to prove the
+    // statistic is trustworthy before the loft's number is believed.
+    attach_fidelity(
+        &mut perception,
+        &geometry_engine::queries::fidelity::cylinder_fidelity(
+            &tri_mesh,
+            Point3::new(c[0], c[1], c[2]),
+            Vector3::new(ax[0], ax[1], ax[2]),
+            radius,
+            height,
+        ),
+    );
 
     Ok(Json(serde_json::json!({
         "success":  true,
@@ -4292,7 +4437,7 @@ async fn create_box_primitive(
     );
 
     let durability = durability::disclosure(&state).await;
-    let perception = {
+    let mut perception = {
         let mut model = model_handle.write().await;
         certified_response(
             &mut model,
@@ -4304,6 +4449,22 @@ async fn create_box_primitive(
             durability,
         )
     };
+
+    // FIDELITY — measured in the box's OWN (u, v, u×v) frame, not a world bbox,
+    // so an arbitrarily-posed box is judged against the dimensions that were
+    // actually requested. Second calibration case: an analytic box is exact.
+    attach_fidelity(
+        &mut perception,
+        &geometry_engine::queries::fidelity::box_fidelity(
+            &tri_mesh,
+            Point3::new(center[0], center[1], center[2]),
+            Vector3::new(u[0], u[1], u[2]),
+            Vector3::new(v[0], v[1], v[2]),
+            width,
+            depth,
+            height,
+        ),
+    );
 
     Ok(Json(serde_json::json!({
         "success":  true,
@@ -5159,7 +5320,7 @@ async fn create_revolve_primitive(
     // Feedback-as-default: a self-intersecting / axis-touching profile can yield
     // an unsound solid, so revolve reports its own SOUND (B-Rep) verdict.
     let durability = durability::disclosure(&state).await;
-    let perception = {
+    let mut perception = {
         let mut model = model_handle.write().await;
         certified_response(
             &mut model,
@@ -5171,6 +5332,34 @@ async fn create_revolve_primitive(
             durability,
         )
     };
+
+    // FIDELITY — the requested meridian's extents against the solid of
+    // revolution actually built. Only the SAMPLED `[r,z]` profile carries
+    // extents that can be read off the request: a typed `profile_segments`
+    // arc's extreme radius is NOT one of its endpoints, so deriving "requested
+    // r_max" from segment endpoints would be a guess. That arm reports a stated
+    // gap instead — absent with a reason, never a fabricated number.
+    let revolve_report = match profile.as_deref() {
+        Some(points) => geometry_engine::queries::fidelity::revolve_fidelity(
+            &tri_mesh,
+            Point3::new(axis_origin[0], axis_origin[1], axis_origin[2]),
+            Vector3::new(axis_dir[0], axis_dir[1], axis_dir[2]),
+            points,
+        ),
+        None => {
+            let mut report = geometry_engine::queries::fidelity::FidelityReport::new("revolve");
+            report.gap(
+                "meridian_max_radius,meridian_axial_extent",
+                "the profile was given as typed analytic 'profile_segments'; an arc \
+                 segment's extreme radius is not one of its endpoints, so the requested \
+                 extents are not derivable from the request without evaluating each \
+                 segment — not measured in this slice, and not guessed",
+            );
+            report
+        }
+    };
+    attach_fidelity(&mut perception, &revolve_report);
+
     Ok(Json(serde_json::json!({
         "success":  true,
         "solid_id": result_solid_id,
@@ -5737,6 +5926,10 @@ async fn create_nurbs_loft_primitive(
         .map(|s| s.to_string());
     let n_sections = sections.len();
     let ring_points = sections[0].len();
+    // FIDELITY needs the REQUEST after the op has consumed it. `nurbs_loft`
+    // takes `sections` by value, so the requested rings are kept here — the
+    // comparison is meaningless without the side of it the caller supplied.
+    let requested_sections = sections.clone();
 
     let result_solid_id = {
         let mut model = model_handle.write().await;
@@ -5799,7 +5992,7 @@ async fn create_nurbs_loft_primitive(
     );
 
     let durability = durability::disclosure(&state).await;
-    let perception = {
+    let mut perception = {
         let mut model = model_handle.write().await;
         certified_response(
             &mut model,
@@ -5811,6 +6004,27 @@ async fn create_nurbs_loft_primitive(
             durability,
         )
     };
+
+    // FIDELITY — THE MOTIVATING CASE. A loft is where "sound" and "the shape I
+    // asked for" came apart: the octagon defect built a genuinely closed,
+    // genuinely manifold solid 9.97% short of the requested cross-section, and
+    // the certificate could not see it. The two end caps ARE faces of the built
+    // solid, so their cross-section area is a direct reading of what the kernel
+    // produced against the rings the caller supplied. Measured on this path: a
+    // 64-point ring reads 0.0949%; the same ring at the historical 8-vertex
+    // density reads 10.86% and this block says so while `sound` stays true.
+    let fidelity_report = {
+        let model = model_handle.read().await;
+        geometry_engine::queries::fidelity::loft_fidelity(
+            &model,
+            &tri_mesh,
+            result_solid_id,
+            &requested_sections,
+            geometry_engine::math::Tolerance::default().distance(),
+        )
+    };
+    attach_fidelity(&mut perception, &fidelity_report);
+
     Ok(Json(serde_json::json!({
         "success":  true,
         "solid_id": result_solid_id,

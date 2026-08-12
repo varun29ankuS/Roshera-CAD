@@ -83,6 +83,27 @@
  *      gate. Purely MCP-side session state — no backend change — and never
  *      served from the refusal cache: the counter is live state this
  *      session's own next call can reset, so every re-issue re-reads it.
+ *
+ *   6. VERIFICATION-SCOPE GATE (2026-08-11, task #9 half B). Gate 2 forces an
+ *      intent to be DECLARED before geometry is built. Nothing forced anyone
+ *      to look at what came out. Measured elsewhere in this repo: a loft
+ *      shipped CERTIFIED SOUND at a 9.97% shape error, because soundness is a
+ *      statement about topology and says nothing about whether the result is
+ *      the geometry that was asked for — so "check what you built" cannot be
+ *      left to steering either. When a checkpoint CLOSES (a new
+ *      timeline_checkpoint replaces the open one — the only close this surface
+ *      has) and solid-mutating ops ran under it with NO verify_part /
+ *      verify_claim since the last of them, the closing call is refused typed,
+ *      naming exactly what was built and the two verification verbs. ONE
+ *      escape, and it is explicit: `skip_verification: true` on the closing
+ *      checkpoint. The constraint is therefore escapable but NEVER silent —
+ *      the escape is a recorded argument in the call, not an omission.
+ *      `clear_timeline` is deliberately OUT of scope: it wipes the ledger the
+ *      work lives in, so nagging to verify a part whose history is being
+ *      destroyed is noise, not a constraint. Live session state, never cached
+ *      (a verify_part between attempts must unblock the very next re-issue of
+ *      the IDENTICAL checkpoint call — a cached refusal would deadlock exactly
+ *      the caller who complied).
  */
 
 import { api, PERCEPTION_TIMEOUT_MS } from "./core.js";
@@ -274,7 +295,25 @@ const LIVE_FACT_GATES = new Set<string>([
   "sheet_quality",
   "sheet_uncertified",
   "single_point_run",
+  // Gate 6: the unverified-work list is live session state this session's own
+  // next call clears. Caching it would deadlock precisely the caller who
+  // COMPLIED — verify_part, then re-issue the identical checkpoint, and be
+  // handed the stale refusal for a condition that no longer holds.
+  "verification_scope",
 ]);
+
+/**
+ * The two verbs that count as having LOOKED at what was built (gate 6).
+ *
+ * `verify_part` reads the full certificate plus a diagnostic render of one
+ * part; `verify_claim` checks a stated dimensional claim against the live
+ * kernel. Both are read-only and neither can be satisfied by accident — an
+ * agent that calls one has genuinely inspected its own output. `get_part` /
+ * `list_parts` / `mass_properties` deliberately do NOT count: they report
+ * facts without checking them against anything, which is exactly the
+ * "certified sound, wrong shape" hole this gate exists to close.
+ */
+const VERIFIES = new Set<string>(["verify_part", "verify_claim"]);
 
 /**
  * Checkpoint names that name a sequence position instead of a design intent
@@ -323,6 +362,33 @@ const refusalCache = new Map<string, CachedRefusal>();
  *  Opened by a successful timeline_checkpoint; a new checkpoint replaces it;
  *  clear_timeline (the ledger it lives in is wiped) closes it. */
 let openIntent: { name: string; turn: number } | null = null;
+
+/**
+ * Solid-mutating tools that have SUCCEEDED under the currently open intent and
+ * have NOT been looked at since (gate 6).
+ *
+ * Recorded on every successful `MUTATES_SOLIDS` dispatch while an intent is
+ * open; emptied by a successful `verify_part` / `verify_claim`. The "since the
+ * last mutation" scoping is what makes the record honest: a verify that ran
+ * BEFORE the geometry it would have to check does not clear it, so the sequence
+ * `checkpoint → verify_part → create_box → checkpoint` still meets the gate.
+ * The box really was never inspected.
+ *
+ * Distinct verbs plus a count, not a list of every call: the set is bounded by
+ * `MUTATES_SOLIDS` by construction — no growth limit needed, and therefore no
+ * eviction that could make the reported count a lie — and "boolean, fillet_edges
+ * across 40 calls" is the legible fact where forty repetitions of the word
+ * "boolean" is not.
+ */
+let intentUnverified: { tools: Set<string>; count: number } = {
+  tools: new Set(),
+  count: 0,
+};
+
+/** A fresh, empty unverified-work record. */
+function clearUnverified(): void {
+  intentUnverified = { tools: new Set(), count: 0 };
+}
 
 /**
  * Read-only view of the open intent, for the HTTP client (`api()` in
@@ -391,6 +457,7 @@ function singlePointKey(tool: string, args: any): string | null {
 export function resetSessionGates(): void {
   refusalCache.clear();
   openIntent = null;
+  clearUnverified();
   pointRuns.clear();
 }
 
@@ -496,6 +563,39 @@ function singlePointRunRefusal(tool: string, count: number) {
       "polyline). The points already placed are live and unaffected. " +
       "kind:'point' remains available for the few named vertices constraints " +
       "will reference; any other tool call resets this counter.",
+  });
+}
+
+function verificationScopeRefusal(
+  closingIntent: string,
+  distinct: string[],
+  count: number,
+  nextName: string,
+) {
+  return gateRefusal({
+    gate: "verification_scope",
+    reason:
+      `the open intent '${closingIntent}' built geometry that was never ` +
+      `checked: ${count} solid-mutating call(s) (${distinct.join(", ")}) ` +
+      `ran under it and no verify_part / verify_claim followed the last of ` +
+      `them. Opening '${nextName}' would close that intent with its result ` +
+      `unexamined. A SOUND certificate is a statement about topology — closed, ` +
+      `manifold, oriented — and says nothing about whether the geometry is the ` +
+      `geometry you asked for: this kernel has shipped a certified-sound loft ` +
+      `carrying a 9.97% shape error. Nothing downstream re-opens that question ` +
+      `once the feature is closed.`,
+    closing_intent: closingIntent,
+    unverified_operations: distinct,
+    unverified_count: count,
+    how_to_proceed:
+      "Look at what you built, then re-issue this call unchanged: " +
+      "verify_part({ part_id }) returns the full certificate plus a diagnostic " +
+      "render, and verify_claim({ ... }) checks a stated dimension against the " +
+      "live kernel. Either one clears this gate for the work done so far. If " +
+      "the previous feature genuinely does not need checking (scratch geometry, " +
+      "a cutter you are about to subtract away), re-issue this exact call with " +
+      "skip_verification: true — the intent then closes unverified ON THE " +
+      "RECORD rather than by omission.",
   });
 }
 
@@ -674,6 +774,22 @@ export async function preDispatchGate(
     ) {
       return genericNameRefusal(name);
     }
+    // 2b. Verification-scope gate (gate 6). A new checkpoint CLOSES the open
+    // one — the only close this surface has — so this is the last moment the
+    // previous feature's result can be questioned. Refused when work ran under
+    // it unverified, unless the caller says so explicitly.
+    if (
+      openIntent !== null &&
+      intentUnverified.count > 0 &&
+      (args as any)?.skip_verification !== true
+    ) {
+      return verificationScopeRefusal(
+        openIntent.name,
+        [...intentUnverified.tools],
+        intentUnverified.count,
+        trimmed,
+      );
+    }
     return null; // a real intent phrase — let the handler record it
   }
   if (MUTATES_SOLIDS.has(tool) && openIntent === null) {
@@ -761,8 +877,21 @@ export function recordDispatchOutcome(
       const name =
         typeof (args as any)?.name === "string" ? (args as any).name : "";
       openIntent = { name, turn };
+      // A fresh intent starts with a clean record — whatever the previous one
+      // carried was either verified or explicitly waived by `skip_verification`
+      // at the gate above; either way it is settled and must not haunt the next
+      // feature.
+      clearUnverified();
     } else if (tool === "clear_timeline") {
       openIntent = null;
+      clearUnverified();
+    } else if (VERIFIES.has(tool)) {
+      // The caller LOOKED. Everything built so far under this intent has been
+      // examined; only mutations after this point can re-arm the gate.
+      clearUnverified();
+    } else if (MUTATES_SOLIDS.has(tool) && openIntent !== null) {
+      intentUnverified.tools.add(tool);
+      intentUnverified.count += 1;
     }
   }
 }
