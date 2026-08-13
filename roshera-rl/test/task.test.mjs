@@ -29,6 +29,10 @@ check("a valid task freezes and round-trips", () => {
   assert.equal(t.stepBudget, 12);
   assert.throws(() => { t.id = "other"; }, TypeError,
     "a task must be immutable — a mutated spec mid-run silently invalidates its trajectories");
+  assert.throws(() => { t.toolAllowlist.push("boolean"); }, TypeError,
+    "the allowlist container must resist mutation too, not just the top-level scalar fields");
+  assert.throws(() => { t.claims[0].tolerance = 999; }, TypeError,
+    "each claim must resist mutation too, not just the top-level scalar fields");
 });
 
 check("an empty tool allowlist is refused", () => {
@@ -49,6 +53,17 @@ check("a claim without a tolerance is refused", () => {
     () => defineTask({ ...valid, claims: [{ name: "r", quantity: "radius", expected: 25 }] }),
     /tolerance/i,
     "an exact float equality claim can never pass — geometry reproduces to ~4e-8",
+  );
+});
+
+check("a claim with an infinite tolerance is refused", () => {
+  assert.throws(
+    () => defineTask({
+      ...valid,
+      claims: [{ name: "r", quantity: "radius", expected: 25, tolerance: Infinity }],
+    }),
+    /tolerance/i,
+    "an infinite tolerance makes the claim unfalsifiable — it can never fail at scoring time",
   );
 });
 

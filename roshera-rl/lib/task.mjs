@@ -45,10 +45,13 @@ export function defineTask({
     );
   }
   for (const c of claims) {
-    if (typeof c?.tolerance !== "number" || !(c.tolerance > 0)) {
+    if (typeof c?.tolerance !== "number" || !Number.isFinite(c.tolerance) || !(c.tolerance > 0)) {
       throw new Error(
-        `task ${id}: claim ${c?.name} needs a positive tolerance — geometry ` +
-        `reproduces to ~4e-8, so an exact equality claim can never pass`,
+        `task ${id}: claim ${c?.name} needs a finite, positive tolerance — ` +
+        `geometry reproduces to ~4e-8, so an exact equality claim can never ` +
+        `pass, and an infinite tolerance makes the claim unfalsifiable: it ` +
+        `can never fail at scoring time regardless of what the kernel ` +
+        `actually measured`,
       );
     }
   }
