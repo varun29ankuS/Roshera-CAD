@@ -29,7 +29,10 @@ export function rewardFromResult(result) {
   const gaps = [];
 
   if (result?.refused === true) {
-    components.refused = result.gate ?? "unnamed_gate";
+    // `??` alone would let an empty-string gate slip through unlabelled — a
+    // refusal must always carry a non-empty gate name, since `mergeFinal`
+    // trusts this field to be a truthy-or-not-refused string, never "".
+    components.refused = result.gate || "unnamed_gate";
     gaps.push({ name: "sound", reason: GAP_NO_SOUND });
     gaps.push({ name: "fidelity_signed", reason: GAP_NO_SOUND });
     return { components, gaps };
@@ -49,6 +52,10 @@ export function rewardFromResult(result) {
     gaps.push({ name: "fidelity_signed", reason: GAP_NO_FIDELITY });
   }
 
+  // A determinate tri-state, not an unmeasured absence: a call either was or
+  // wasn't refused, and that is always knowable — so `refused` never belongs
+  // in `gaps`, and `null` here (rather than omitting the key) is what lets
+  // `mergeFinal` tell "not refused" apart from "field never reported".
   components.refused = null;
   return { components, gaps };
 }
@@ -68,7 +75,10 @@ export function mergeFinal(rewards) {
   let sawSound = false;
   let worst = null;
   for (const r of rewards) {
-    if (r.components.refused) components.refusals += 1;
+    // Count on a determinate test, not truthiness: `refused` is either a
+    // (non-empty, per rewardFromResult) gate string or `null`, and a
+    // falsy-but-real gate name must never make a genuine refusal vanish.
+    if (typeof r.components.refused === "string") components.refusals += 1;
     if (typeof r.components.sound === "boolean") {
       components.sound = r.components.sound;
       sawSound = true;

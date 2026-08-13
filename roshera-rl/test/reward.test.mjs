@@ -74,5 +74,13 @@ check("mergeFinal counts refusals across the episode", () => {
   assert.equal(merged.components.sound, true);
 });
 
+check("a refusal with an empty-string gate is still counted, not silently dropped", () => {
+  const merged = mergeFinal([
+    rewardFromResult({ refused: true, gate: "" }),
+  ]);
+  assert.equal(merged.components.refusals, 1,
+    "an empty gate name is a falsy string, but the refusal itself is real and must be counted");
+});
+
 for (const [name, fn] of checks) { fn(); process.stdout.write(`  ok - ${name}\n`); }
 process.stdout.write(`\nreward: ${checks.length} checks passed\n`);
