@@ -17,11 +17,32 @@ const arg = (name, fallback) => {
   return i === -1 ? fallback : process.argv[i + 1];
 };
 
+/**
+ * A numeric flag must be a positive integer. `--concurrency` with no value
+ * took the NEXT argv entry (or undefined at the end of the line), so
+ * `Number(undefined)` → NaN → `Math.min(NaN, n)` → NaN workers →
+ * `Array.from({length: NaN})` → zero workers → "0 episodes", an all-zero
+ * tally, and EXIT 0: a silent no-op reported as a successful run.
+ */
+const positiveInt = (name, fallback) => {
+  const raw = arg(name, fallback);
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n <= 0) {
+    process.stderr.write(
+      `--${name} needs a positive integer, got ${JSON.stringify(raw)}. ` +
+      `Refusing to run: a NaN here silently produces zero episodes and an ` +
+      `all-zero tally that reads exactly like a clean run.\n`,
+    );
+    process.exit(2);
+  }
+  return n;
+};
+
 const baseUrl = process.env.ROSHERA_URL ?? "http://127.0.0.1:8081";
 const key = process.env.ROSHERA_API_KEY;
-const concurrency = Number(arg("concurrency", "4"));
+const concurrency = positiveInt("concurrency", "4");
 const outDir = arg("out", "./runs");
-const repeats = Number(arg("repeats", "1"));
+const repeats = positiveInt("repeats", "1");
 
 const tasks = [];
 const seeds = [];
@@ -36,7 +57,7 @@ const testSpawn = process.env.ROSHERA_RL_TEST_SPAWN
   ? globalThis.__roshera_rl_test_spawn
   : undefined;
 
-const { tally, results } = await runBatch({
+const { tally, results, orphans } = await runBatch({
   tasks, seeds, concurrency, baseUrl,
   authHeader: key ? { Authorization: `ApiKey ${key}` } : {},
   outDir, kernelSha: process.env.ROSHERA_KERNEL_SHA ?? "unknown",
@@ -55,7 +76,14 @@ process.stdout.write(`\n${results.length} episodes → ${outDir}\n`);
 for (const [outcome, n] of Object.entries(tally)) {
   process.stdout.write(`  ${outcome.padEnd(17)} ${n}\n`);
 }
+// Stated, never assumed clean: a document the reaper could not drop is still
+// live in PartManager's DashMap, and silence here would be the assertion that
+// it isn't.
+if (orphans.length) {
+  process.stdout.write(`\n⚠ ${orphans.length} document(s) NOT reaped:\n`);
+  for (const o of orphans) process.stdout.write(`  ${o.documentId}  ${o.reason}\n`);
+}
 
 /** What this run produced. Exported so the wiring test can assert the entry
  *  point really drove the runner rather than merely mentioning it. */
-export const lastRun = { results, tally };
+export const lastRun = { results, tally, orphans };

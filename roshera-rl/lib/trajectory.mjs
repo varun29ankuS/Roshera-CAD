@@ -16,10 +16,32 @@
  * fidelity against refusal count is a training choice with no kernel
  * justification, so consumers scalarize and the environment reports.
  *
- * `recipe_ref` points at the timeline lineage entry so the build is
- * RE-ISSUABLE. Geometry reproduces to ~4e-8 and is not bit-stable, so replay
- * is recipe-level, never byte-level. Stating that in the schema stops a
+ * `recipe_ref` carries the build's timeline lineage so it is RE-ISSUABLE.
+ * Geometry reproduces to ~4e-8 and is not bit-stable, so replay is
+ * recipe-level, never byte-level. Stating that in the schema stops a
  * downstream consumer assuming a determinism the kernel never promised.
+ *
+ * It is an OBJECT, and it is never a bare null. `recipe_get` returns
+ * `{source, step_count, sequence_range, sequence_contiguous,
+ * undecodable_events, checkpoints, certificate_summary, steps}`
+ * (roshera-mcp/src/tools/timeline.ts:267-283) — there is no `ref` field on it
+ * and there never was, so a `recipe_ref` string was structurally null in
+ * every trajectory this schema ever produced. Two forms appear here now:
+ *
+ *   - a RECIPE: the fields above, including the `steps` themselves. The steps
+ *     are embedded because the address does not survive the episode — the
+ *     document is deleted at reap and `DELETE /api/documents` purges its
+ *     `timeline_events` (session-manager/src/database.rs:1704) — so a
+ *     descriptor alone would be a dangling pointer and the replay guarantee
+ *     would be vacuous;
+ *   - an ABSENCE: `{absent: "<reason>"}`. Every non-COMPLETED outcome takes
+ *     this branch, because terminal scoring never ran. A bare null would read
+ *     as "there was no recipe", which is a different and false claim.
+ *
+ * `claims` follows the same rule: it is never `[]` for a task that declares
+ * claims (`defineTask` refuses a task with none), so an empty array could
+ * only ever mean "we did not check" — which is stated per claim as
+ * `{name, verified: null, absent: "<reason>"}` instead.
  *
  * `tool_allowlist` is stamped here because a shifting action space makes two
  * trajectories incomparable — `find_tool` ranks by IDF over the tool corpus,

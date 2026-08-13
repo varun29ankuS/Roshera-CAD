@@ -5,7 +5,7 @@
   "type": "module",
   "private": true,
   "scripts": {
-    "test": "node test/trajectory.test.mjs && node test/reward.test.mjs && node test/task.test.mjs && node test/policy.test.mjs && node test/episode.test.mjs && node test/runner.test.mjs && node test/wiring.test.mjs",
+    "test": "node test/trajectory.test.mjs && node test/mcp_session.test.mjs && node test/reward.test.mjs && node test/task.test.mjs && node test/policy.test.mjs && node test/episode.test.mjs && node test/runner.test.mjs && node test/wiring.test.mjs",
     "test:isolation": "node test/runner.test.mjs",
     "batch": "node bin/run-batch.mjs"
   },

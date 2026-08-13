@@ -6,8 +6,9 @@
  * every trajectory produced in parallel is contaminated and worthless as
  * training data, in a way no downstream consumer could detect.
  *
- * The stub records the X-Roshera-Document of every mutating call, so a shared
- * document across two episodes is directly observable.
+ * The stub records the document of every call, so a shared document across
+ * two episodes is directly observable. It also owns the DELETE route, so the
+ * reaper can be driven against a backend that refuses one.
  */
 import assert from "node:assert/strict";
 import http from "node:http";
@@ -18,14 +19,33 @@ import { join } from "node:path";
 import { runBatch } from "../lib/runner.mjs";
 import { scriptedPolicy } from "../lib/policy.mjs";
 import { defineTask } from "../lib/task.mjs";
+import { readToolResult } from "../lib/mcp_session.mjs";
 
 const dir = mkdtempSync(join(tmpdir(), "roshera-run-"));
 let n = 0;
+/** documentId → how many DELETEs to refuse before accepting one. */
+const refuseDeletes = new Map();
+const deleteLog = [];
+
 const stub = http.createServer((req, res) => {
   const url = req.url ?? "";
   if (req.method === "POST" && url === "/api/documents") {
     res.writeHead(200, { "Content-Type": "application/json" });
     return res.end(JSON.stringify({ id: `doc-${n++}`, active: false }));
+  }
+  if (req.method === "DELETE" && url.startsWith("/api/documents/")) {
+    const id = url.split("/").pop();
+    deleteLog.push(id);
+    const left = refuseDeletes.get(id) ?? 0;
+    if (left > 0) {
+      refuseDeletes.set(id, left - 1);
+      // api-server/src/documents.rs:561-564 — the backend refuses to delete
+      // the ACTIVE document with a typed error, not a network failure.
+      res.writeHead(409, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ error_code: "document_delete_refused_active" }));
+    }
+    res.writeHead(200, { "Content-Type": "application/json" });
+    return res.end("{}");
   }
   res.writeHead(200, { "Content-Type": "application/json" });
   res.end("{}");
@@ -34,9 +54,21 @@ stub.listen(0, "127.0.0.1");
 await once(stub, "listening");
 const baseUrl = `http://127.0.0.1:${stub.address().port}`;
 
+/** core.ts:380-385 ok() in `cert` mode → the envelope a real session returns. */
+const CREATED_OK = readToolResult({
+  content: [{ type: "text", text: JSON.stringify({
+    object_uuid: "3f2b8c1e-77aa-4a9f-8b21-9f0f2a6d5e10", part_id: 1,
+    perception: { sound: true, brep_valid: true, watertight: true },
+  }, null, 2) }],
+});
+
 const task = defineTask({
   id: "t", prompt: "p", toolAllowlist: ["create_cylinder"],
-  claims: [{ name: "r", quantity: "radius", expected: 25, tolerance: 0.02 }],
+  claims: [{
+    name: "volume", expr: "v",
+    bindings: [{ var: "v", measure: { kind: "volume", part: "solid:0" } }],
+    expected: 117809.724509617, tolerance: 117.8,
+  }],
   stepBudget: 4, tokenBudget: 1000, split: "train",
 });
 
@@ -46,9 +78,9 @@ const fakeSpawn = async ({ documentId }) => {
   const seen = [];
   pinnedPerSession.push({ documentId, seen });
   return {
-    async call(tool, args) { seen.push({ tool, documentId }); return { perception: { sound: true } }; },
-    async claims() { return []; },
-    async recipeRef() { return null; },
+    async call(tool) { seen.push({ tool, documentId }); return CREATED_OK; },
+    async claims(cs) { return cs.map((c) => ({ name: c.name, verified: true })); },
+    async recipeRef() { return { step_count: 1, steps: [] }; },
     async close() {},
   };
 };
@@ -87,13 +119,13 @@ check("the tally names every outcome, including the zeros", async () => {
 
 check("concurrency is a cap, not a suggestion", async () => {
   let live = 0, peak = 0;
-  const slowSpawn = async (opts) => {
+  const slowSpawn = async () => {
     live += 1; peak = Math.max(peak, live);
     await new Promise((r) => setTimeout(r, 20));
     return {
-      async call() { return { perception: { sound: true } }; },
-      async claims() { return []; },
-      async recipeRef() { return null; },
+      async call() { return CREATED_OK; },
+      async claims(cs) { return cs.map((c) => ({ name: c.name, verified: true })); },
+      async recipeRef() { return { step_count: 1, steps: [] }; },
       async close() { live -= 1; },
     };
   };
@@ -108,15 +140,15 @@ check("concurrency is a cap, not a suggestion", async () => {
 
 check("one episode's crash does not take the batch down", async () => {
   let i = 0;
-  const flakySpawn = async (opts) => {
+  const flakySpawn = async () => {
     const mine = i++;
     return {
       async call() {
         if (mine === 0) throw new Error("EPIPE");
-        return { perception: { sound: true } };
+        return CREATED_OK;
       },
-      async claims() { return []; },
-      async recipeRef() { return null; },
+      async claims(cs) { return cs.map((c) => ({ name: c.name, verified: true })); },
+      async recipeRef() { return { step_count: 1, steps: [] }; },
       async close() {},
     };
   };
@@ -127,6 +159,41 @@ check("one episode's crash does not take the batch down", async () => {
   });
   assert.equal(results.length, 2, "both episodes reported, one of them a crash");
   assert.equal(tally.CRASHED, 1);
+});
+
+check("THE REAPER retries a DELETE the episode could not land", async () => {
+  // episode.mjs names runner.mjs's reaper as the backstop for a failed
+  // DELETE at two call sites. Until now runner.mjs contained no reaping at
+  // all, so a document lost to a blip stayed in PartManager's DashMap
+  // forever, under a comment asserting otherwise.
+  deleteLog.length = 0;
+  const nextDoc = `doc-${n}`;
+  refuseDeletes.set(nextDoc, 1);   // the episode's own attempt is refused once
+  const { results, orphans } = await runBatch({
+    tasks: [task], policyFor: () => scriptedPolicy([{ tool: "create_cylinder", args: {} }]),
+    seeds: [1], concurrency: 1, baseUrl, authHeader: {}, outDir: dir,
+    kernelSha: "abc", spawn: fakeSpawn,
+  });
+  assert.equal(results[0].documentId, nextDoc);
+  assert.equal(deleteLog.filter((d) => d === nextDoc).length, 2,
+    "the episode tried once and the reaper tried again — not once, not never");
+  assert.deepEqual(orphans, [], "the retry landed, so nothing is orphaned");
+  assert.equal(results[0].reap.reaped, true);
+});
+
+check("a document the reaper still cannot drop is REPORTED, not assumed clean", async () => {
+  deleteLog.length = 0;
+  const nextDoc = `doc-${n}`;
+  refuseDeletes.set(nextDoc, 99);  // refuse everything
+  const { results, orphans } = await runBatch({
+    tasks: [task], policyFor: () => scriptedPolicy([{ tool: "create_cylinder", args: {} }]),
+    seeds: [1], concurrency: 1, baseUrl, authHeader: {}, outDir: dir,
+    kernelSha: "abc", spawn: fakeSpawn,
+  });
+  assert.equal(orphans.length, 1, "an un-reaped document must surface, not vanish");
+  assert.equal(orphans[0].documentId, nextDoc);
+  assert.ok(orphans[0].reason.includes("409"), "and the refusal reason is carried, not flattened");
+  assert.equal(results[0].reap.reaped, false);
 });
 
 for (const [name, fn] of checks) { await fn(); process.stdout.write(`  ok - ${name}\n`); }

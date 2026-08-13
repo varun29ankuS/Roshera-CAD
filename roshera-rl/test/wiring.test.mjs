@@ -8,12 +8,14 @@
  */
 import assert from "node:assert/strict";
 import http from "node:http";
+import { spawnSync } from "node:child_process";
 import { once } from "node:events";
 import { readFileSync, existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { OUTCOMES } from "../lib/trajectory.mjs";
+import { readToolResult } from "../lib/mcp_session.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const bin = join(HERE, "..", "bin", "run-batch.mjs");
@@ -44,12 +46,22 @@ check("the entry point actually drives runBatch over the seed tasks", async () =
   const spawned = [];
   process.env.ROSHERA_URL = `http://127.0.0.1:${stub.address().port}`;
   process.env.ROSHERA_RL_TEST_SPAWN = "1";
+  // The injected session speaks the SAME envelope the real one does
+  // (readToolResult over a core.ts:380-385 `ok()` body) — a fake with a
+  // friendlier shape would prove the entry point drives a runner that only
+  // works against fakes.
+  const CREATED_OK = readToolResult({
+    content: [{ type: "text", text: JSON.stringify({
+      object_uuid: "3f2b8c1e-77aa-4a9f-8b21-9f0f2a6d5e10", part_id: 1,
+      perception: { sound: true, brep_valid: true, watertight: true },
+    }, null, 2) }],
+  });
   globalThis.__roshera_rl_test_spawn = async ({ documentId }) => {
     spawned.push(documentId);
     return {
-      async call() { return { perception: { sound: true } }; },
-      async claims() { return []; },
-      async recipeRef() { return null; },
+      async call() { return CREATED_OK; },
+      async claims(cs) { return cs.map((c) => ({ name: c.name, verified: true })); },
+      async recipeRef() { return { step_count: 1, steps: [] }; },
       async close() {},
     };
   };
@@ -62,6 +74,8 @@ check("the entry point actually drives runBatch over the seed tasks", async () =
   assert.equal(spawned.length, mod.lastRun.results.length,
     "every episode spawned a session — the runner was really driven, not imported");
   for (const k of OUTCOMES) assert.ok(k in mod.lastRun.tally);
+  assert.ok(Array.isArray(mod.lastRun.orphans),
+    "and the reaper's verdict reaches the entry point, so an un-reaped document is printable");
 
   stub.close();
   rmSync(outDir, { recursive: true, force: true });
@@ -69,10 +83,26 @@ check("the entry point actually drives runBatch over the seed tasks", async () =
   delete process.env.ROSHERA_RL_TEST_SPAWN;
 });
 
+check("a valueless --concurrency is refused, not silently run as zero episodes", () => {
+  // `--concurrency` with no value took the next argv entry (undefined at the
+  // end of the line) → NaN → zero workers → "0 episodes", an all-zero tally
+  // and EXIT 0: a silent no-op that reads exactly like a clean run. Run as a
+  // child so the refusal's own process.exit cannot end this suite.
+  const r = spawnSync(process.execPath, [bin, "--concurrency"], { encoding: "utf8" });
+  assert.equal(r.status, 2, "a bad flag must fail loudly");
+  assert.match(r.stderr, /positive integer/);
+  assert.ok(!/episodes →/.test(r.stdout ?? ""), "and nothing may have run");
+});
+
 check("package.json exposes it as a script", () => {
   const pkg = JSON.parse(readFileSync(join(HERE, "..", "package.json"), "utf8"));
   assert.ok(pkg.scripts?.batch, "npm run batch must exist");
 });
 
-for (const [name, fn] of checks) { fn(); process.stdout.write(`  ok - ${name}\n`); }
+// AWAITED. The behavioural check above is async: without the await, `ok - …`
+// and the "N checks passed" banner printed while it was still pending, and a
+// failure arrived afterwards as an unhandled rejection — the exit code was
+// right but the green banner preceded the verdict, which is the one place a
+// test suite must not be misread.
+for (const [name, fn] of checks) { await fn(); process.stdout.write(`  ok - ${name}\n`); }
 process.stdout.write(`\nwiring: ${checks.length} checks passed\n`);
