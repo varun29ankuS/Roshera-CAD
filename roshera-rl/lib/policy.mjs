@@ -90,6 +90,84 @@ export function scriptedPolicy(script) {
 }
 
 /**
+ * THE REFERENCE POLICY for the seed cylinder task: declare an intent, build,
+ * then VERIFY THE PART THAT WAS BUILT.
+ *
+ * It exists because `scriptedPolicy` structurally cannot do the last step. A
+ * script is fixed at construction, and `verify_part`'s schema requires
+ * `part_id` — `z.number().int()`, roshera-mcp/src/tools/perception.ts:182 — a
+ * number that does not exist until the create call has returned. The batch
+ * emitted `{tool: "verify_part", args: {}}`, the real tool rejected it with a
+ * schema validation error, and the episode still reported COMPLETED: the
+ * reference batch never once exercised verification. Hardcoding an id would be
+ * worse, not better — ids are minted by the kernel and a boolean re-mints them.
+ *
+ * So this policy is MINIMALLY STATEFUL: it reads the id off the observation it
+ * was handed. `observation` is the previous call's `readToolResult` ENVELOPE
+ * (episode.mjs:240 assigns `observation = result`), and `create_cylinder`
+ * returns `part_id` in its own result body (roshera-mcp/src/tools/create.ts:256
+ * — `part_id: id`, the id `newestPartId()` resolved). Hence
+ * `observation.data.part_id`, and nothing else.
+ *
+ * WHEN THE ID IS ABSENT IT THROWS, and that is the honest branch. `part_id` is
+ * `newestPartId()`'s result, which is legitimately `null` when the backend
+ * reports no parts (core.ts:581-585), so the absence is real and reachable.
+ * Declaring `{done: true}` there would end the episode COMPLETED having
+ * verified nothing — precisely the defect this policy exists to remove — and
+ * the outcome taxonomy is closed (trajectory.mjs:60-67), so there is no
+ * "policy could not proceed" outcome to reach for. A throw is recorded by
+ * `episode.mjs:173-185` as CRASHED with the reason in both the step and the
+ * returned object, which states what happened instead of hiding it under a
+ * green one.
+ *
+ * `args` is frozen for the same reason `scriptedPolicy`'s is: `episode.mjs`
+ * holds the object across `session.call` and then writes it to the trajectory,
+ * so a consumer editing it in flight would make the record differ from what
+ * was sent. These args are flat and hold only primitives, so a single
+ * `Object.freeze` covers them completely.
+ */
+export function referencePolicy({ intent, radius, height }) {
+  let i = 0;
+  return {
+    async act({ observation }) {
+      const step = i;
+      i += 1;
+      if (step === 0) {
+        return Object.freeze({
+          tool: "timeline_checkpoint",
+          args: Object.freeze({ name: intent }),
+        });
+      }
+      if (step === 1) {
+        return Object.freeze({
+          tool: "create_cylinder",
+          args: Object.freeze({ radius, height }),
+        });
+      }
+      if (step === 2) {
+        const partId = observation?.data?.part_id;
+        if (!Number.isInteger(partId)) {
+          throw new Error(
+            `the reference policy cannot call verify_part: the previous result ` +
+            `carried no integer part_id (saw ${JSON.stringify(partId)}). ` +
+            `create_cylinder returns it at result.part_id ` +
+            `(roshera-mcp/src/tools/create.ts:256) and verify_part requires it ` +
+            `(tools/perception.ts:182). Declaring done here would report a ` +
+            `COMPLETED episode that verified nothing`,
+          );
+        }
+        return Object.freeze({
+          tool: "verify_part",
+          args: Object.freeze({ part_id: partId }),
+        });
+      }
+      return { done: true };
+    },
+    tokensUsed() { return 0; },
+  };
+}
+
+/**
  * The action space stamped in the trajectory header and the action space
  * actually permitted must be the SAME set. Checking here, at the point of
  * action, is what keeps that true for every policy implementation rather than

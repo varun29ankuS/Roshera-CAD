@@ -323,6 +323,68 @@ check("the result digest labelled fnv1a64 IS FNV-1a", async () => {
   assert.equal(readTrajectory(path).steps[0].result_digest, `fnv1a64:${h.toString(16)}`);
 });
 
+check("a SETUP_FAILED names WHICH stage failed and carries the underlying error", async () => {
+  // The live run hit this twice — a 401 on document creation, and a spawn that
+  // died on a missing dependency — and both wrote the SAME reason string,
+  // "document creation or spawn failed", with the real error discarded.
+  // Diagnosing it took a hand-run probe. A stated reason that names both
+  // possibilities and commits to neither is not a stated reason.
+  const path = join(dir, "m1.jsonl");
+  failCreate = true; createStatus = 401;
+  const r1 = await runEpisode({
+    task, policy: scriptedPolicy([]), seed: 1, baseUrl, authHeader: {},
+    trajectoryPath: path, kernelSha: "abc", spawn: fakeSpawn(() => CREATED_OK),
+  });
+  failCreate = false; createStatus = 500;
+  assert.equal(r1.outcome, "SETUP_FAILED");
+  const t1 = readTrajectory(path).terminal;
+  assert.match(t1.error, /document creation/i, "the RECORD, not only the return value, names the stage");
+  assert.match(t1.error, /401/, "and carries the underlying error text");
+  for (const c of t1.claims) {
+    assert.match(c.absent, /document creation/i,
+      "the per-claim absence says which stage denied the measurement");
+  }
+
+  const path2 = join(dir, "m2.jsonl");
+  const r2 = await runEpisode({
+    task, policy: scriptedPolicy([]), seed: 1, baseUrl, authHeader: {},
+    trajectoryPath: path2, kernelSha: "abc",
+    spawn: async () => { throw new Error("ECONNREFUSED: cannot find module @modelcontextprotocol/sdk"); },
+  });
+  assert.equal(r2.outcome, "SETUP_FAILED");
+  const t2 = readTrajectory(path2).terminal;
+  assert.match(t2.error, /spawn/i, "a spawn failure is a DIFFERENT stage and says so");
+  assert.match(t2.error, /ECONNREFUSED/, "and carries the real reason, not a disjunction");
+  assert.ok(!/document creation/i.test(t2.error),
+    "the two setup failures must be distinguishable from the record alone");
+  for (const c of t2.claims) assert.match(c.absent, /spawn/i);
+});
+
+check("a crash's reason reaches the trajectory terminal too, not only the return value", async () => {
+  const path = join(dir, "m3.jsonl");
+  const r = await runEpisode({
+    task, policy: scriptedPolicy([{ tool: "create_cylinder", args: {} }]),
+    seed: 1, baseUrl, authHeader: {}, trajectoryPath: path, kernelSha: "abc",
+    spawn: fakeSpawn(() => { throw new Error("EPIPE: MCP process died"); }),
+  });
+  assert.equal(r.outcome, "CRASHED");
+  const { terminal } = readTrajectory(path);
+  assert.match(terminal.error, /EPIPE/,
+    "whoever reads the trajectory afterwards must not have to re-run the batch to learn why");
+});
+
+check("a COMPLETED terminal carries error: null — a determinate absence, not a missing key", async () => {
+  const path = join(dir, "m4.jsonl");
+  await runEpisode({
+    task, policy: scriptedPolicy([{ tool: "create_cylinder", args: { radius: 25 } }]),
+    seed: 1, baseUrl, authHeader: {}, trajectoryPath: path, kernelSha: "abc",
+    spawn: fakeSpawn(() => CREATED_OK),
+  });
+  const { terminal } = readTrajectory(path);
+  assert.ok("error" in terminal, "the field is always present, so its absence is never ambiguous");
+  assert.equal(terminal.error, null);
+});
+
 check("an unwritable trajectory path is SETUP_FAILED, not a throw", async () => {
   // The trajectory header is written synchronously before any other I/O, so
   // this was the one path out of runEpisode that could throw.

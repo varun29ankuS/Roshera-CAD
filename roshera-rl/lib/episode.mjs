@@ -42,8 +42,24 @@ const NO_TERMINAL_SCORING = {
   INVALID_ACTION: "the episode ended on an action outside its own allowlist, so terminal verification never ran",
   CRASHED: "the episode crashed, so terminal verification never ran",
   RATE_LIMITED: "the shared rate class refused this episode's calls, so terminal verification never ran",
-  SETUP_FAILED: "document creation or spawn failed, so there was no session in which to verify anything",
+  // WHICH stage, and WHY, arrive as the `detail` `unscored` appends — see
+  // SETUP_STAGE below. This base string deliberately no longer says "document
+  // creation or spawn": a stated reason that names both possibilities and
+  // commits to neither, while discarding the real error, is not a stated
+  // reason. It cost a hand-run probe to tell a 401 apart from a spawn failure.
+  SETUP_FAILED: "setup failed before the session existed, so there was no session in which to verify anything",
 };
+
+/**
+ * The setup stages, in the order they run. The label is what the trajectory
+ * record and every per-claim absence name, so the two failures the live run hit
+ * — a 401 from `POST /api/documents`, and a spawn that died on a missing
+ * dependency — are distinguishable from the record alone.
+ */
+const SETUP_STAGE = Object.freeze({
+  DOCUMENT: "document creation",
+  SPAWN: "spawning the MCP session",
+});
 
 /**
  * Delete the episode's document, best-effort, REPORTING what happened. Two
@@ -98,17 +114,34 @@ export async function runEpisode({
     };
   }
 
-  /** Claims/recipe for an episode that never reached terminal scoring. */
-  const unscored = (outcome) => ({
-    claims: task.claims.map((c) => ({
-      name: c.name, verified: null, computed: null, absent: NO_TERMINAL_SCORING[outcome],
-    })),
-    recipeRef: { absent: NO_TERMINAL_SCORING[outcome] },
-  });
+  /**
+   * Claims/recipe for an episode that never reached terminal scoring.
+   *
+   * `detail` is the concrete failure — which stage, and the error text it
+   * carried — appended to the outcome's standing reason. Without it a reader
+   * of the trajectory learns only the category, which is what made two
+   * different SETUP_FAILED episodes read identically.
+   */
+  const unscored = (outcome, detail) => {
+    const reason = detail
+      ? `${NO_TERMINAL_SCORING[outcome]} — ${detail}`
+      : NO_TERMINAL_SCORING[outcome];
+    return {
+      claims: task.claims.map((c) => ({
+        name: c.name, verified: null, computed: null, absent: reason,
+      })),
+      recipeRef: { absent: reason },
+    };
+  };
 
   // ── setup ────────────────────────────────────────────────────────────
   let documentId = null;
   let session = null;
+  // Which stage is in flight, so the catch below can NAME it. Setup is two
+  // independent pieces of I/O against two different failure surfaces (an HTTP
+  // API and a child process), and collapsing them into one reason discards the
+  // only fact a diagnosis starts from.
+  let setupStage = SETUP_STAGE.DOCUMENT;
   try {
     const res = await fetch(`${baseUrl}/api/documents`, {
       method: "POST",
@@ -128,6 +161,7 @@ export async function runEpisode({
     }
     documentId = (await res.json())?.id ?? null;
     if (!documentId) throw new Error("document creation returned no id");
+    setupStage = SETUP_STAGE.SPAWN;
     session = await spawn({ documentId, baseUrl, authHeader, mcpEntry });
   } catch (e) {
     // `documentId` is set the moment creation succeeds, before `spawn` is
@@ -135,15 +169,19 @@ export async function runEpisode({
     // orphaned unless reaped here too.
     const reap = await reapDocument(baseUrl, authHeader, documentId);
     const outcome = e?.rateLimited === true ? "RATE_LIMITED" : "SETUP_FAILED";
-    const { claims, recipeRef } = unscored(outcome);
+    // The stage AND the underlying message. The error used to be dropped here
+    // and rebuilt as a disjunction, so a 401 from the API and a child process
+    // that could not start produced byte-identical records.
+    const error = `${setupStage} failed: ${String(e?.message ?? e)}`;
+    const { claims, recipeRef } = unscored(outcome, error);
     traj.close({
       outcome,
       rewardFinal: mergeFinal([]),
-      claims, recipeRef, tokens: 0, wallMs: Date.now() - started,
+      claims, recipeRef, tokens: 0, wallMs: Date.now() - started, error,
     });
     return {
       outcome, rewardFinal: mergeFinal([]), documentId,
-      trajectoryPath, wallMs: Date.now() - started, error: String(e?.message ?? e),
+      trajectoryPath, wallMs: Date.now() - started, error,
       reap,
     };
   }
@@ -275,7 +313,10 @@ export async function runEpisode({
       recipeRef = { absent: why };
     }
   } else {
-    ({ claims, recipeRef } = unscored(outcome));
+    // `episodeError` is null for BUDGET_EXHAUSTED / INVALID_ACTION (nothing
+    // failed — a limit was reached), and a real message for CRASHED /
+    // RATE_LIMITED, which then rides along into every absence.
+    ({ claims, recipeRef } = unscored(outcome, episodeError));
   }
   try { await session.close(); } catch { /* already dead */ }
   const reap = await reapDocument(baseUrl, authHeader, documentId);
@@ -284,7 +325,7 @@ export async function runEpisode({
   const wallMs = Date.now() - started;
   traj.close({
     outcome, rewardFinal, claims, recipeRef,
-    tokens: policy.tokensUsed(), wallMs,
+    tokens: policy.tokensUsed(), wallMs, error: episodeError,
   });
   return {
     outcome, rewardFinal, documentId, trajectoryPath, wallMs,

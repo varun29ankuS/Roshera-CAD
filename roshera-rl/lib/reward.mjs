@@ -32,23 +32,35 @@ const GAP_NEVER_MEASURED =
  * The honest reason `fidelity_signed` is absent on a SUCCESSFUL step.
  *
  * The kernel computes it and the api-server attaches it to a mutating op's
- * response at `body.perception.fidelity` (api-server/src/main.rs:1326-1334
- * `attach_fidelity`, block shape at main.rs:1247-1314). It does not reach
- * this process: the MCP client rebuilds the perception object with a FIXED
- * key set that has no `fidelity` — `perceptionFromBody` (core.ts:329-378) on
- * the embedded-reuse path and `perceive` (core.ts:748-781) on the
- * GET /perception path — and `verify_part` (tools/perception.ts:199-248)
- * builds its own fixed-key body too. So this component is currently
- * UNREACHABLE through the MCP tool surface, and closing that needs a change
- * in roshera-mcp, not here. It is read opportunistically below so that the
- * day the passthrough lands, this module measures it with no further change.
+ * response at `body.perception.fidelity` (api-server/src/main.rs:1326-1336
+ * `attach_fidelity`, block shape at main.rs:1247-1314), and roshera-mcp now
+ * carries it through VERBATIM (`perceptionFromBody`, core.ts — proven at the
+ * production dispatch path by roshera-mcp/test/perception_fidelity.test.mjs).
+ *
+ * So the meaning of this absence CHANGED when that passthrough landed, and the
+ * reason has to change with it or it becomes a confident wrong diagnosis. It
+ * now says: this step's own response carried no block. The three real ways
+ * that happens, none of which is a dropped measurement:
+ *
+ *  - the op had nothing measurable, so an EMPTY report attaches nothing at all
+ *    rather than a block of zeros (main.rs:1330-1332);
+ *  - the op is not one of the four that measure fidelity today (cylinder
+ *    main.rs:4237, box 4456, revolve 5361, loft 6026);
+ *  - the step was a `verify_part`, which builds its OWN fixed-key body
+ *    (tools/perception.ts:199-248) from the read-side `/perception` endpoint —
+ *    and that endpoint has no fidelity producer at all.
+ *
+ * A step whose `perception` arrived as PROSE is a different absence again, and
+ * `soundnessOf` below names that one where it belongs.
  */
 const GAP_NO_FIDELITY =
-  "no fidelity block reached this process: the kernel measures it and the " +
-  "api-server attaches it at body.perception.fidelity (main.rs attach_fidelity), " +
-  "but roshera-mcp rebuilds perception with a fixed key set that drops it " +
-  "(core.ts perceptionFromBody / perceive, tools/perception.ts verify_part). " +
-  "Absent because it was never delivered — NOT because the op had nothing to measure";
+  "this step's perception carried no fidelity block. The kernel measures it, " +
+  "the api-server attaches it at body.perception.fidelity for the ops that have " +
+  "a measurable request (main.rs attach_fidelity: cylinder/box/revolve/loft), and " +
+  "roshera-mcp carries it through verbatim (core.ts perceptionFromBody). So this " +
+  "absence means the op attached none — an op with nothing measurable attaches " +
+  "nothing rather than a block of zeros, and verify_part's own body " +
+  "(tools/perception.ts) never carries one — NOT that a measured deviation was dropped";
 
 /** Both real shapes for the ambient soundness verdict, in one place. */
 function soundnessOf(data) {

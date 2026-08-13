@@ -44,6 +44,7 @@ check("the entry point actually drives runBatch over the seed tasks", async () =
   await once(stub, "listening");
 
   const spawned = [];
+  const calls = [];
   process.env.ROSHERA_URL = `http://127.0.0.1:${stub.address().port}`;
   process.env.ROSHERA_RL_TEST_SPAWN = "1";
   // The injected session speaks the SAME envelope the real one does
@@ -59,7 +60,7 @@ check("the entry point actually drives runBatch over the seed tasks", async () =
   globalThis.__roshera_rl_test_spawn = async ({ documentId }) => {
     spawned.push(documentId);
     return {
-      async call() { return CREATED_OK; },
+      async call(tool, args) { calls.push({ tool, args }); return CREATED_OK; },
       async claims(cs) { return cs.map((c) => ({ name: c.name, verified: true })); },
       async recipeRef() { return { step_count: 1, steps: [] }; },
       async close() {},
@@ -76,6 +77,22 @@ check("the entry point actually drives runBatch over the seed tasks", async () =
   for (const k of OUTCOMES) assert.ok(k in mod.lastRun.tally);
   assert.ok(Array.isArray(mod.lastRun.orphans),
     "and the reaper's verdict reaches the entry point, so an un-reaped document is printable");
+
+  // THE SEED POLICY MUST ACTUALLY VERIFY. The live batch emitted
+  // `{tool:"verify_part", args:{}}`, and `verify_part`'s schema requires
+  // `part_id` (a number — roshera-mcp/src/tools/perception.ts:182), so the real
+  // tool rejected every one of those calls: the reference batch reported
+  // COMPLETED while never once exercising verification. The id it must carry is
+  // the `part_id` the create result itself returns (tools/create.ts:256), read
+  // off the previous observation — never a hardcoded number.
+  const verify = calls.find((c) => c.tool === "verify_part");
+  assert.ok(verify, "the reference batch must actually call verify_part");
+  assert.equal(verify.args?.part_id, CREATED_OK.data.part_id,
+    "verify_part must carry the part_id the create result reported — an empty " +
+    "args object is rejected by the tool's schema and verifies nothing");
+  assert.deepEqual(calls.map((c) => c.tool),
+    ["timeline_checkpoint", "create_cylinder", "verify_part"],
+    "and it declares an intent, builds, then verifies — in that order");
 
   stub.close();
   rmSync(outDir, { recursive: true, force: true });

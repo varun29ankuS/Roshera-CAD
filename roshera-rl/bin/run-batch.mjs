@@ -10,7 +10,15 @@
  */
 import { runBatch } from "../lib/runner.mjs";
 import { TASKS } from "../lib/task.mjs";
-import { scriptedPolicy } from "../lib/policy.mjs";
+import { referencePolicy, scriptedPolicy } from "../lib/policy.mjs";
+
+/**
+ * The dimensions the seed task's claims are written against — r=25, h=60
+ * (lib/task.mjs:165-166, whose `expected` values are πr²h and 2πr(r+h) over
+ * exactly these). Named here rather than inlined so the two numbers the batch
+ * requests and the numbers the claims check stay legible as the same pair.
+ */
+const CYLINDER = Object.freeze({ radius: 25, height: 60 });
 
 const arg = (name, fallback) => {
   const i = process.argv.indexOf(`--${name}`);
@@ -63,12 +71,22 @@ const { tally, results, orphans } = await runBatch({
   outDir, kernelSha: process.env.ROSHERA_KERNEL_SHA ?? "unknown",
   mcpEntry: process.env.ROSHERA_MCP_ENTRY,
   ...(testSpawn ? { spawn: testSpawn } : {}),
-  policyFor: (task) => scriptedPolicy(
+  // The seed task's reference policy. It is NOT `scriptedPolicy` because the
+  // last step cannot be scripted: `verify_part` requires the `part_id` the
+  // create call returns (roshera-mcp/src/tools/perception.ts:182 /
+  // tools/create.ts:256), and a fixed script has no way to read it — the batch
+  // sent `args: {}`, the tool rejected it on its schema, and the episode
+  // reported COMPLETED having verified nothing. `referencePolicy` reads the id
+  // off the observation. A task that cannot build a cylinder gets an empty
+  // script and declares done immediately, as before.
+  policyFor: (task) => (
     task.toolAllowlist.includes("create_cylinder")
-      ? [{ tool: "timeline_checkpoint", args: { name: task.prompt.slice(0, 60) } },
-         { tool: "create_cylinder", args: { radius: 25, height: 60 } },
-         { tool: "verify_part", args: {} }]
-      : [],
+      ? referencePolicy({
+          intent: task.prompt.slice(0, 60),
+          radius: CYLINDER.radius,
+          height: CYLINDER.height,
+        })
+      : scriptedPolicy([])
   ),
 });
 

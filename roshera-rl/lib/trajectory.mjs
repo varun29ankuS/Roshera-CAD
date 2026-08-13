@@ -8,7 +8,7 @@
  *                       mcp_version, tool_allowlist, split, started_at }
  *   line 2+  step     { i, action, result_digest, reward, refusal, ms }
  *   last     terminal { outcome, reward_final, claims, recipe_ref,
- *                       tokens, wall_ms }
+ *                       tokens, wall_ms, error }
  *
  * `reward_final` is the terminal reading of each NAMED component — not a sum
  * and not a scalar. Naming it `total` would imply an aggregation the
@@ -79,7 +79,7 @@ class Trajectory {
     }) + "\n");
   }
 
-  close({ outcome, rewardFinal, claims, recipeRef, tokens, wallMs }) {
+  close({ outcome, rewardFinal, claims, recipeRef, tokens, wallMs, error }) {
     if (this.#closed) throw new Error("trajectory already closed");
     if (!OUTCOMES.includes(outcome)) {
       throw new Error(
@@ -90,6 +90,15 @@ class Trajectory {
     appendFileSync(this.#path, JSON.stringify({
       kind: "terminal", outcome, reward_final: rewardFinal,
       claims, recipe_ref: recipeRef ?? null, tokens, wall_ms: wallMs,
+      // THE UNDERLYING ERROR, in the record and not only in the return value.
+      // A batch is read afterwards from its trajectories, so a failure whose
+      // reason lives only in the returned object is a failure nobody can
+      // diagnose without re-running it — measured: two SETUP_FAILED episodes
+      // (a 401 on document creation, a spawn that died on a missing
+      // dependency) were indistinguishable in their records. ALWAYS PRESENT,
+      // `null` when the episode had no error, so an absent key is never
+      // mistaken for a clean run.
+      error: error ?? null,
     }) + "\n");
     this.#closed = true;
   }

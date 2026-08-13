@@ -371,6 +371,24 @@ function perceptionFromBody(r: any): any {
     // quarantined document, so `r` being the raw mutating body (not just a
     // `/perception`-shaped response) already carries it here.
     durability: r.durability ?? r.perception?.durability ?? undefined,
+    // FIDELITY — "is the geometry you asked for the geometry you got?", carried
+    // through VERBATIM. The kernel measures it and the api-server attaches the
+    // block to the mutating op's OWN response at `body.perception.fidelity`
+    // (`attach_fidelity`, api-server/src/main.rs:1326-1336; block shape
+    // `fidelity_json`, main.rs:1247-1314; call sites: cylinder main.rs:4237,
+    // box 4456, revolve 5361, loft 6026). This fixed-key rebuild used to drop
+    // it, so the one signal that says a CERTIFIED SOUND solid is not the shape
+    // that was requested (the loft that shipped sound at 9.97% short) never
+    // reached an agent at all.
+    //
+    // Passed through UNTOUCHED — never re-derived, never defaulted. `??
+    // undefined` is what preserves ABSENCE: an op with nothing measurable
+    // attaches no block (main.rs:1330-1332 returns early on an empty report)
+    // and `JSON.stringify` then omits the key entirely, which is the honest
+    // report. Inventing an empty block, or a `fidelity_ok: true` over a report
+    // that deliberately omitted it (main.rs:1276-1279), would be the silent
+    // pass this disclosure exists to end.
+    fidelity: r.fidelity ?? r.perception?.fidelity ?? undefined,
     verdict:
       (r.verdict ?? r.perception?.verdict) ??
       (sound ? "OK — valid closed solid (cheap verdict; verify_part to certify)" : "UNSOUND — see verify_part"),
@@ -773,6 +791,17 @@ export async function perceive(partId: number | null): Promise<any> {
       // `body.perception.durability` on a quarantined document, which
       // `perceptionFromBody`'s `r.perception?.durability` picks up.
       durability: p?.durability ?? undefined,
+      // FIDELITY on the FALLBACK channel, for the same reason `durability` is
+      // read on both paths: ONE perception shape, whichever fetch produced it.
+      // Stated honestly — today this can only ever be `undefined` here, because
+      // `GET /api/agent/parts/{id}/perception` has no fidelity producer at all
+      // (the string `fidelity` does not occur anywhere in
+      // api-server/src/handlers/; the block is attached ONLY to a mutating op's
+      // own response, main.rs:4237/4456/5361/6026, which the FAST PATH above
+      // reuses). It is read here so that a read-side disclosure, if one is ever
+      // added, is not silently dropped a second time — never defaulted, so an
+      // absent block stays absent.
+      fidelity: p?.fidelity ?? undefined,
       verdict:
         p?.verdict ??
         (sound

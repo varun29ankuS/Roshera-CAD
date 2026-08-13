@@ -53,16 +53,73 @@ check("no fidelity block is a GAP, never fidelity_signed: 0", () => {
     "an unmeasured component must be ABSENT, not zero");
   const gap = r.gaps.find((g) => g.name === "fidelity_signed");
   assert.ok(gap && gap.reason.length > 0, "and the absence must carry a stated reason");
-  assert.ok(gap.reason.includes("never delivered"),
-    "the reason must be the TRUE one: the api-server attaches fidelity at " +
-    "body.perception.fidelity and roshera-mcp's fixed-key perception drops it");
+  assert.ok(gap.reason.includes("the op attached none"),
+    "the reason must be the TRUE one for TODAY's pipeline: roshera-mcp carries " +
+    "fidelity through now, so an absence means the op attached none — the old " +
+    "reason ('never delivered', the MCP drops it) would be a confident wrong " +
+    "diagnosis pointing at a bug that no longer exists");
+  assert.ok(!gap.reason.includes("never delivered"));
 });
 
-check("fidelity IS read if it ever reaches this process", () => {
-  // main.rs:1281-1298 `fidelity_json` — the block's exact shape, attached to
-  // the perception by attach_fidelity (main.rs:1326-1334). It does not reach
-  // an MCP client today; when the passthrough lands, this must measure it
-  // with no further change.
+check("fidelity_signed is extracted from the perception the REAL pipeline delivers", () => {
+  // THIS IS THE SHAPE THAT NOW ARRIVES. The block is `fidelity_json`'s
+  // (api-server/src/main.rs:1274-1313), attached to the mutating op's own
+  // perception by `attach_fidelity` (main.rs:1326-1336) and carried verbatim
+  // through roshera-mcp's `perceptionFromBody` (core.ts) — proven end-to-end
+  // against the real dispatch table in
+  // roshera-mcp/test/perception_fidelity.test.mjs, which asserts a
+  // deepEqual-identical block on the tool result. Copied here field-for-field
+  // so this module is read against the wire, not against a convenience shape.
+  const r = rewardFromResult(created({
+    sound: true, brep_valid: true, watertight: true,
+    volume: 117790.346542991, face_count: 3,
+    fidelity: {
+      op: "cylinder", fidelity_ok: true, tolerance: 0.02,
+      worst: {
+        name: "radius", requested: 25.0, measured: 24.99924521508539,
+        relative_deviation: 0.0000301913965844,
+        signed_relative_deviation: -0.0000301913965844,
+        direction: "built SMALLER than requested",
+      },
+      quantities: [
+        {
+          name: "radius", requested: 25.0, measured: 24.99924521508539,
+          relative_deviation: 0.0000301913965844,
+          signed_relative_deviation: -0.0000301913965844,
+          method: "largest perpendicular distance of a tessellation vertex from the requested axis",
+        },
+      ],
+      gaps: [],
+      note: "fidelity compares the REQUEST to the RESULT; `sound` compares the result to the laws of topology.",
+    },
+  }));
+  assert.equal(r.components.fidelity_signed, -0.0000301913965844,
+    "the dense signal this environment scores on now reaches it");
+  assert.ok(!r.gaps.some((g) => g.name === "fidelity_signed"));
+  assert.equal(r.components.sound, true, "beside the soundness verdict, not instead of it");
+});
+
+check("a block that measured NOTHING is a gap, not a fidelity_signed of 0", () => {
+  // main.rs:1276-1279 omits `fidelity_ok` and main.rs:1296 nulls `worst` when
+  // nothing was measured. The block still ARRIVES; there is simply no number in
+  // it, and inventing 0 here would read as a perfect build.
+  const r = rewardFromResult(created({
+    sound: true,
+    fidelity: {
+      op: "cylinder", tolerance: 0.02, worst: null, quantities: [],
+      gaps: [{
+        name: "radius,height",
+        reason: "the built solid tessellated to no vertices, or the requested axis is degenerate",
+      }],
+      note: "fidelity compares the REQUEST to the RESULT…",
+    },
+  }));
+  assert.ok(!("fidelity_signed" in r.components));
+  assert.ok(r.gaps.some((g) => g.name === "fidelity_signed"));
+});
+
+check("a loft's 9.97% shortfall is scored with its SIGN", () => {
+  // The case the whole disclosure exists for: certified sound, 9.97% short.
   const r = rewardFromResult(created({
     sound: true,
     fidelity: {
@@ -76,7 +133,8 @@ check("fidelity IS read if it ever reaches this process", () => {
     },
   }));
   assert.equal(r.components.fidelity_signed, -0.0997);
-  assert.ok(!r.gaps.some((g) => g.name === "fidelity_signed"));
+  assert.equal(r.components.sound, true,
+    "sound and fidelity are independent verdicts and must be able to disagree");
 });
 
 check("a gate refusal is recorded, and is not scored as failure", () => {
