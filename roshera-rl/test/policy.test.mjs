@@ -48,5 +48,17 @@ check("a done action is not checked against the allowlist", () => {
   assert.doesNotThrow(() => assertActionAllowed(task, { done: true }));
 });
 
+check("a script mutated after construction does not change what the policy replays", async () => {
+  const script = [{ tool: "create_cylinder", args: { radius: 1 } }];
+  const p = scriptedPolicy(script);
+  script.push({ tool: "boolean", args: {} });   // caller mutates AFTER construction
+  await p.act({ task, observation: null, history: [] });   // first action
+  assert.deepEqual(
+    await p.act({ task, observation: null, history: [] }),
+    { done: true },
+    "a script mutated after construction must not change what the policy replays",
+  );
+});
+
 for (const [name, fn] of checks) { await fn(); process.stdout.write(`  ok - ${name}\n`); }
 process.stdout.write(`\npolicy: ${checks.length} checks passed\n`);
