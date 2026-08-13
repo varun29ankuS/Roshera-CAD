@@ -60,5 +60,14 @@ check("a script mutated after construction does not change what the policy repla
   );
 });
 
+check("a script's args mutated after construction does not change what the policy replays", async () => {
+  const script = [{ tool: "create_cylinder", args: { radius: 1 } }];
+  const p = scriptedPolicy(script);
+  script[0].args.radius = 999;                    // mutate the NESTED object
+  const first = await p.act({ task, observation: null, history: [] });
+  assert.equal(first.args.radius, 1,
+    "a script's args mutated after construction must not change what the policy replays");
+});
+
 for (const [name, fn] of checks) { await fn(); process.stdout.write(`  ok - ${name}\n`); }
 process.stdout.write(`\npolicy: ${checks.length} checks passed\n`);

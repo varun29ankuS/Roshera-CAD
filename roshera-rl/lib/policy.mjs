@@ -23,18 +23,62 @@
  */
 
 /**
+ * Recursively freezes plain objects and arrays, at every level, in place.
+ *
+ * WHAT THIS PROTECTS: a tool call's `args` is JSON-shaped data — plain
+ * objects and arrays nested to arbitrary depth (a polyline's point list, a
+ * nested options object). `deepFreeze` walks that whole shape and freezes
+ * every plain object/array it reaches, so no nested field can be edited
+ * after construction.
+ *
+ * WHAT THIS DOES NOT PROTECT: exotic types — Map, Set, Date, TypedArray,
+ * class instances — are frozen only at the top property level if one is
+ * ever reached; `Object.freeze` locks an object's own property slots, but a
+ * Map's or Set's entries live in internal slots, not own properties, so
+ * `Map#set`/`Set#add`/etc. keep working on a frozen instance. Tool args in
+ * this codebase are plain JSON-shaped data (matching what the kernel's MCP
+ * tools accept), so that gap is not expected to matter here — but it is a
+ * real limit on this helper, stated plainly rather than silently claimed
+ * away.
+ */
+function deepFreeze(value) {
+  if (value === null || typeof value !== "object" || Object.isFrozen(value)) {
+    return value;
+  }
+  Object.freeze(value);
+  for (const key of Object.keys(value)) {
+    deepFreeze(value[key]);
+  }
+  return value;
+}
+
+/**
  * Replays a fixed action script, then declares done.
  *
  * The script is defensively copied and each step is frozen at construction
  * time: a caller that keeps a reference to the original array and later
- * pushes, splices, or edits an element must not change what the policy
- * replays mid-episode. A policy whose own docstring calls it deterministic
- * has to actually be immune to that, or the trajectory it produced is not
- * reproducible — the same drift `assertActionAllowed` refuses when an action
- * space moves out from under a stamped trajectory.
+ * pushes, splices, or edits an element — including editing a field NESTED
+ * inside `args` — must not change what the policy replays mid-episode. A
+ * policy whose own docstring calls it deterministic has to actually be
+ * immune to that, or the trajectory it produced is not reproducible — the
+ * same drift `assertActionAllowed` refuses when an action space moves out
+ * from under a stamped trajectory.
+ *
+ * `args` is deep-cloned with `structuredClone` BEFORE it is deep-frozen: the
+ * frozen value stored inside the policy is a separate object from whatever
+ * the caller retains, so the caller's own copy of `args` stays ordinarily
+ * mutable — freezing never leaks out and makes the caller's assignment
+ * throw. It simply stops being the thing the policy replays. See
+ * `deepFreeze` above for exactly what depth of nesting is covered.
  */
 export function scriptedPolicy(script) {
-  const frozenScript = Object.freeze(script.map((step) => Object.freeze({ ...step })));
+  const frozenScript = Object.freeze(script.map((step) => {
+    const copy = { ...step };
+    if (copy.args !== undefined) {
+      copy.args = deepFreeze(structuredClone(copy.args));
+    }
+    return Object.freeze(copy);
+  }));
   let i = 0;
   return {
     async act() {
