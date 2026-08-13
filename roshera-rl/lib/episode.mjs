@@ -15,7 +15,7 @@
  */
 import { openTrajectory } from "./trajectory.mjs";
 import { rewardFromResult, mergeFinal } from "./reward.mjs";
-import { assertActionAllowed } from "./policy.mjs";
+import { assertActionAllowed, deepFreeze } from "./policy.mjs";
 import { spawnMcpSession } from "./mcp_session.mjs";
 
 const FNV_OFFSET_BASIS = 14695981039346656037n;
@@ -200,11 +200,24 @@ export async function runEpisode({
   for (let i = 0; i < task.stepBudget; i += 1) {
     let action;
     try {
-      // A FROZEN SNAPSHOT of the reward history: `policy.act` is arbitrary
-      // third-party code, and handing it the live array it could push to (or
-      // whose entries it could edit) would let a policy rewrite the record of
-      // its own episode — in the same call that freezes the task and the
-      // script precisely to stop that.
+      // A FROZEN SNAPSHOT of the reward history, FROZEN AT THE ENTRIES.
+      // `policy.act` is arbitrary third-party code, and handing it the live
+      // array it could push to — or whose entries it could edit — would let a
+      // policy rewrite the record of its own episode, in the same call that
+      // freezes the task and the script precisely to stop that.
+      //
+      // EXACTLY WHAT IS PROTECTED, since a shallow guarantee stated as a deep
+      // one is the defect this replaced: `slice()` gives the policy its own
+      // array (pushes and splices cannot reach `rewards`), and every entry was
+      // `deepFreeze`d at the moment it was recorded below — so its
+      // `components` object, its `gaps` array and each gap object inside it
+      // are all frozen too, at every level of plain object/array nesting. See
+      // `deepFreeze` in policy.mjs for the one thing it does NOT cover (the
+      // internal slots of Map/Set/Date), which a reward vector never contains:
+      // components are strings, booleans and numbers, gaps are `{name,
+      // reason}` strings. Freezing happens ONCE per reward at record time, not
+      // per step over the whole history, so the cost stays O(1) per step as
+      // the episode grows.
       action = await policy.act({
         task, observation, history: Object.freeze(rewards.slice()),
       });
@@ -245,7 +258,9 @@ export async function runEpisode({
           { name: "fidelity_signed", reason },
         ],
       };
-      rewards.push(reward);
+      // Frozen at record time — the harness's own refusal is as much a part of
+      // the record as a kernel-issued one, and just as un-editable.
+      rewards.push(deepFreeze(reward));
       traj.step({
         i, action, resultDigest: null, reward,
         refusal: { gate: "harness_allowlist", reason: String(e.message) }, ms: 0,
@@ -274,7 +289,12 @@ export async function runEpisode({
       break;
     }
     const reward = rewardFromResult(result);
-    rewards.push(reward);
+    // FROZEN THE MOMENT IT IS RECORDED, at every level — this is what makes
+    // the frozen history snapshot above a real guarantee rather than a frozen
+    // array of editable objects. `mergeFinal` reads these same objects at the
+    // end of the episode, so an entry a policy could still edit is a terminal
+    // tally a policy could still rewrite.
+    rewards.push(deepFreeze(reward));
     observation = result;
     traj.step({
       i, action, resultDigest: digest(result?.data ?? result?.text ?? null), reward,

@@ -50,6 +50,10 @@ const GAP_NEVER_MEASURED =
  *    (tools/perception.ts:199-248) from the read-side `/perception` endpoint —
  *    and that endpoint has no fidelity producer at all.
  *
+ * This constant is for the NO-BLOCK case ONLY. A block that arrived and simply
+ * had no number in it is a different fact with a different, better reason —
+ * the kernel's own — and `fidelityGapReason` below reports that one instead.
+ *
  * A step whose `perception` arrived as PROSE is a different absence again, and
  * `soundnessOf` below names that one where it belongs.
  */
@@ -61,6 +65,48 @@ const GAP_NO_FIDELITY =
   "absence means the op attached none — an op with nothing measurable attaches " +
   "nothing rather than a block of zeros, and verify_part's own body " +
   "(tools/perception.ts) never carries one — NOT that a measured deviation was dropped";
+
+/**
+ * WHY there is no `fidelity_signed` on this step — distinguishing "no block
+ * arrived" from "a block arrived carrying no number", and in the second case
+ * QUOTING THE KERNEL instead of guessing.
+ *
+ * A gaps-only report is not an absent one: `FidelityReport::is_empty()` is true
+ * only when the quantities list AND the gaps list are both empty
+ * (geometry-engine/src/queries/fidelity.rs:215-217), so a report that measured
+ * nothing but recorded WHY still gets attached (main.rs:1330-1334) — with
+ * `fidelity_ok` omitted (main.rs:1276-1279), `worst: null` (main.rs:1296), and
+ * every unmeasured quantity in `gaps` as `{name, reason}`
+ * (fidelity.rs:137-140). That `reason` is the kernel's own account of why it
+ * could not measure, which is strictly better than anything this module could
+ * infer — and the old text both contradicted it ("the op attached none") and
+ * threw it away.
+ */
+function fidelityGapReason(fid) {
+  if (fid === null || typeof fid !== "object") return GAP_NO_FIDELITY;
+  const op = typeof fid.op === "string" ? fid.op : "unnamed op";
+  const gaps = Array.isArray(fid.gaps) ? fid.gaps : [];
+  const stated = gaps
+    .filter((g) => g && typeof g.name === "string" && typeof g.reason === "string")
+    .map((g) => `${g.name}: ${g.reason}`);
+  if (stated.length > 0) {
+    return (
+      `the ${op} fidelity block arrived and measured nothing comparable — the ` +
+      `KERNEL's own stated reason(s): ${stated.join(" | ")}. Reported verbatim ` +
+      `rather than paraphrased, and never scored as 0`
+    );
+  }
+  // A block with neither a readable `worst` nor any stated gap. Say exactly
+  // that, and hand on what did arrive so the shape can be inspected, rather
+  // than asserting a cause.
+  return (
+    `the ${op} fidelity block arrived but carried no signed deviation to read ` +
+    `(worst=${JSON.stringify(fid.worst ?? null)}, ` +
+    `${Array.isArray(fid.quantities) ? fid.quantities.length : 0} quantities, ` +
+    `${gaps.length} gaps) and stated no reason of its own — this module will ` +
+    `not invent one`
+  );
+}
 
 /** Both real shapes for the ambient soundness verdict, in one place. */
 function soundnessOf(data) {
@@ -132,11 +178,13 @@ export function rewardFromResult(envelope) {
     components.sound = sound;
   }
 
-  const signed = data?.perception?.fidelity?.worst?.signed_relative_deviation;
+  const fid = data?.perception?.fidelity;
+  const signed = fid?.worst?.signed_relative_deviation;
   if (typeof signed === "number" && Number.isFinite(signed)) {
     components.fidelity_signed = signed;
   } else {
-    gaps.push({ name: "fidelity_signed", reason: GAP_NO_FIDELITY });
+    // Two different absences, two different reasons — see `fidelityGapReason`.
+    gaps.push({ name: "fidelity_signed", reason: fidelityGapReason(fid ?? null) });
   }
 
   // A determinate tri-state, not an unmeasured absence: a call either was or

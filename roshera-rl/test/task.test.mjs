@@ -149,9 +149,7 @@ check("the seed set is non-empty and every claim is machine-checkable", () => {
   }
 });
 
-check("the seed task's claims pin BOTH requested dimensions", () => {
-  // πr²h and 2πr(r+h) are independent in (r, h), so a cylinder satisfying
-  // both at these tolerances has the radius and height that were asked for.
+check("the seed task's claims catch a one-parameter error", () => {
   const t = taskById("cylinder-r25-h60");
   const volume = t.claims.find((c) => c.name === "volume");
   const area = t.claims.find((c) => c.name === "surface_area");
@@ -162,6 +160,64 @@ check("the seed task's claims pin BOTH requested dimensions", () => {
   const offBy = Math.PI * 25.1 * 25.1 * 60;
   assert.ok(Math.abs(offBy - volume.expected) > volume.tolerance,
     "a 0.1mm radius error must fail this claim, or the claim proves nothing");
+  // And an error in HEIGHT alone is caught too — volume is monotone in each
+  // parameter with the other fixed.
+  const shortBy = Math.PI * 25 * 25 * 59.9;
+  assert.ok(Math.abs(shortBy - volume.expected) > volume.tolerance);
+});
+
+check("the seed pair does NOT pin (r, h) — the conjugate cylinder is pinned as a known blind spot", () => {
+  // THE FALSE THEOREM THIS REPLACES: the comment here used to assert that
+  // volume and surface area "PIN both parameters". At fixed V,
+  // A(r) = 2πr² + 2V/r has a minimum at r = (V/2π)^(1/3), so every r on the
+  // falling branch has a conjugate on the rising branch with the SAME V and
+  // the SAME A. r = 25 is on the falling branch. This constructs the conjugate
+  // from the task's OWN expected values (2πr³ − A·r + 2V = 0, bisected) rather
+  // than quoting a number, and asserts both claims verify TRUE for it — a
+  // dimensionally wrong part passing the whole claim set.
+  const t = taskById("cylinder-r25-h60");
+  const volume = t.claims.find((c) => c.name === "volume");
+  const area = t.claims.find((c) => c.name === "surface_area");
+  const V = volume.expected;
+  const A = area.expected;
+
+  const rMinArea = Math.cbrt(V / (2 * Math.PI));
+  assert.ok(25 < rMinArea,
+    "the requested radius must sit on the FALLING branch for a conjugate to exist");
+  const f = (r) => 2 * Math.PI * r * r * r - A * r + 2 * V;
+  let lo = rMinArea, hi = 40;
+  assert.ok(f(lo) < 0 && f(hi) > 0, "the root is bracketed above the area minimum");
+  for (let i = 0; i < 200; i += 1) {
+    const mid = (lo + hi) / 2;
+    if (f(mid) > 0) hi = mid; else lo = mid;
+  }
+  const r2 = (lo + hi) / 2;
+  const h2 = V / (Math.PI * r2 * r2);
+
+  assert.ok(Math.abs(r2 - 25) > 3, `the conjugate is a different cylinder (r=${r2}, h=${h2})`);
+  assert.ok(Math.abs(Math.PI * r2 * r2 * h2 - V) <= volume.tolerance,
+    "the conjugate satisfies the VOLUME claim");
+  assert.ok(Math.abs(2 * Math.PI * r2 * (r2 + h2) - A) <= area.tolerance,
+    "and the SURFACE AREA claim — so both verify true for the wrong geometry");
+
+  // And no further claim over {volume, surface_area, constant} can close it:
+  // the conjugate's V and A are equal to the requested ones to ~1e-12, so any
+  // expression over those inputs returns the same value for both cylinders.
+  assert.ok(Math.abs(2 * Math.PI * r2 * (r2 + h2) - A) < 1e-9,
+    "identical inputs ⇒ identical expression value, whatever the expression");
+
+  // The claim set must therefore NOT contain a face_area or edge_length
+  // binding: those are the measurements that would close the gap, and they
+  // take a RAW model-global id (claim.rs:34/36, inspect.ts:86-87) that is
+  // minted mid-episode and is not resolvable from a statically-defined task
+  // (mcp_session.mjs:284-287 passes it verbatim). If one ever appears here,
+  // this test must be rewritten deliberately — with a resolver behind it.
+  for (const c of t.claims) {
+    for (const b of c.bindings) {
+      assert.ok(!["face_area", "edge_length"].includes(b.measure.kind),
+        "a raw face/edge id cannot be known when the task is defined — see task.mjs");
+    }
+  }
 });
 
 check("taskById finds a seed task and misses cleanly", () => {

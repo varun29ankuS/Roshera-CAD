@@ -171,12 +171,59 @@ const H = 60;
  * parametric family derives its claims from the sampled parameters — for a
  * parametric family the REQUEST is the ground truth.
  *
- * WHY VOLUME AND SURFACE AREA rather than "radius" and "height": those two
- * are what `verify_claim` can actually measure (the closed enum above), and
- * together they PIN both parameters — πr²h and 2πr(r+h) are independent in
- * (r, h), so a cylinder that satisfies both at these tolerances has the
- * requested radius and height. Checking a made-up `quantity:"radius"` would
- * have checked nothing at all.
+ * WHY VOLUME AND SURFACE AREA rather than "radius" and "height": those two are
+ * what `verify_claim` can actually measure (the closed enum above). Checking a
+ * made-up `quantity: "radius"` would have checked nothing at all.
+ *
+ * ─── WHAT THIS PAIR DOES AND DOES NOT CONSTRAIN — A KNOWN BLIND SPOT ─────
+ *
+ * It does NOT pin (r, h). An earlier version of this comment claimed it did,
+ * on the grounds that πr²h and 2πr(r+h) are "independent". They are not
+ * independent enough: at FIXED volume, A(r) = 2πr² + 2V/r has a minimum at
+ * r = (V/2π)^(1/3) ≈ 26.5665 mm for this task's V, so every radius on the
+ * falling branch has a CONJUGATE on the rising branch with the same V and the
+ * same A. The requested r = 25 sits on the falling branch, and the conjugate
+ * is
+ *
+ *     r = 28.197051490249287 mm,  h = 47.165438120937125 mm
+ *
+ * which reproduces this task's volume EXACTLY (ΔV = 0) and its surface area to
+ * 3.6e-12 mm² — both far inside the 1e-3 relative bands below. A slice-2 model
+ * policy that built that cylinder would have BOTH claims verified true for a
+ * dimensionally wrong part. `test/task.test.mjs` pins this conjugate so the
+ * false theorem cannot quietly return.
+ *
+ * What the pair DOES constrain, and it is not nothing: any error in r alone,
+ * or in h alone, moves V (monotone in each with the other fixed) and fails —
+ * r = 25.1 moves the volume 0.8%, eight times the band. The blind spot is
+ * exactly the two-parameter conjugate above, not sloppiness in general.
+ *
+ * WHY IT IS NOT FIXED HERE. A cap's `face_area` is πr², which would pin r on
+ * its own, and V would then pin h — the fix is obvious and it is NOT
+ * EXPRESSIBLE in this language today. `face_area` binds a RAW model-global
+ * face id: `Measurement::FaceArea { face: u32 }`
+ * (geometry-engine/src/readable/claim.rs:34), resolved by
+ * `model.query_face(*face)` (claim.rs:86) with no part scoping and no
+ * "the cap of solid:0" selector; the MCP schema is likewise a bare
+ * `face: z.number().int()` (roshera-mcp/src/tools/inspect.ts:86), and
+ * `edge_length` — a cap circle's 2πr would pin r too — has exactly the same
+ * shape (claim.rs:36, inspect.ts:87). A task's claims are frozen HERE, at
+ * module load, while that id is minted by the kernel mid-episode, and
+ * `verifyClaims` resolves only the `solid:N` token, passing `face` / `edge`
+ * verbatim (lib/mcp_session.mjs:284-287). Hardcoding an id would be inventing
+ * a contract, which is the one thing this package refuses to do.
+ *
+ * And no additional claim over {volume, surface_area, constant} can close it:
+ * the conjugate has identical V and A, so every expression over those inputs
+ * returns the identical value for both cylinders. A third INDEPENDENT
+ * measurement is required, not a cleverer expression.
+ *
+ * SLICE 3 POINTER: give a binding a symbolic face/edge token resolved by the
+ * session the way `solid:N` already is (mcp_session.mjs `resolveSolidRef`) —
+ * the session can discover a cap from the built part and bind its real id —
+ * or, for a parametric family, derive the claims from the sampled parameters,
+ * where the REQUEST is the ground truth and the fidelity block already
+ * compares requested against measured.
  *
  * TOLERANCE — 1e-3 relative, a judgement stated rather than hidden. The
  * kernel measures these exactly (mass properties come from a divergence-

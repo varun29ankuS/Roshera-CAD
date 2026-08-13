@@ -25,11 +25,17 @@
 /**
  * Recursively freezes plain objects and arrays, at every level, in place.
  *
- * WHAT THIS PROTECTS: a tool call's `args` is JSON-shaped data — plain
- * objects and arrays nested to arbitrary depth (a polyline's point list, a
- * nested options object). `deepFreeze` walks that whole shape and freezes
- * every plain object/array it reaches, so no nested field can be edited
- * after construction.
+ * TWO CALLERS, one helper. `scriptedPolicy` below freezes a script's `args`;
+ * `episode.mjs` freezes every reward vector as it is recorded, so the frozen
+ * history it hands the policy is frozen at the ENTRIES, not merely at the
+ * array. Both are the same requirement — a record that cannot be edited after
+ * the fact — so they share one implementation rather than two that can drift.
+ *
+ * WHAT THIS PROTECTS: both shapes are JSON-shaped data — plain objects and
+ * arrays nested to arbitrary depth (a polyline's point list, a nested options
+ * object; a reward's `components` object and its `gaps` array of objects).
+ * `deepFreeze` walks that whole shape and freezes every plain object/array it
+ * reaches, so no nested field can be edited after construction.
  *
  * WHAT THIS DOES NOT PROTECT: exotic types — Map, Set, Date, TypedArray,
  * class instances — are frozen only at the top property level if one is
@@ -41,7 +47,7 @@
  * real limit on this helper, stated plainly rather than silently claimed
  * away.
  */
-function deepFreeze(value) {
+export function deepFreeze(value) {
   if (value === null || typeof value !== "object" || Object.isFrozen(value)) {
     return value;
   }

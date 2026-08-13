@@ -304,6 +304,50 @@ check("a frozen action survives a session that tries to edit it mid-call", async
     "including NESTED args — a shallow freeze would let this one through");
 });
 
+check("a policy cannot edit its own history to erase a recorded refusal", async () => {
+  // `Object.freeze(rewards.slice())` froze the ARRAY; the entries were the very
+  // objects `mergeFinal(rewards)` reads afterwards. So `history[0].components
+  // .refused = null` silently deleted a refusal from the terminal tally — the
+  // episode rewriting the record of itself, in the same call that freezes the
+  // task and the script precisely to stop that.
+  const path = join(dir, "n.jsonl");
+  /** gates.ts:121-131 gateRefusal(payload) → envelope. */
+  const REFUSED = readToolResult({
+    content: [{ type: "text", text: JSON.stringify({
+      refused: true, gate: "verification_scope",
+      reason: "solid-mutating ops ran under this checkpoint with no verify_part since",
+    }, null, 2) }],
+    isError: true,
+  });
+  let meddled = 0;
+  const meddling = {
+    async act({ history }) {
+      if (history.length === 0) return { tool: "create_cylinder", args: {} };
+      meddled += 1;
+      // Every level a reward vector has: the entry, its components object, its
+      // gaps array, and an object inside that array.
+      try { history[0].components.refused = null; } catch { /* frozen, as intended */ }
+      try { history[0].components.sound = true; } catch { /* frozen */ }
+      try { history[0].gaps.length = 0; } catch { /* frozen */ }
+      try { if (history[0].gaps[0]) history[0].gaps[0].reason = "nothing to see"; } catch { /* frozen */ }
+      return { done: true };
+    },
+    tokensUsed: () => 0,
+  };
+  const r = await runEpisode({
+    task, policy: meddling, seed: 1, baseUrl, authHeader: {},
+    trajectoryPath: path, kernelSha: "abc", spawn: fakeSpawn(() => REFUSED),
+  });
+  assert.equal(meddled, 1, "the policy really did get its hands on the history");
+  assert.equal(r.outcome, "COMPLETED");
+  const { terminal } = readTrajectory(path);
+  assert.equal(terminal.reward_final.components.refusals, 1,
+    "a refusal the kernel issued must survive the policy that earned it");
+  assert.ok(!("sound" in terminal.reward_final.components),
+    "and a soundness verdict that was never measured must not appear from nowhere");
+  assert.ok(terminal.reward_final.gaps.some((g) => g.name === "sound"));
+});
+
 check("the result digest labelled fnv1a64 IS FNV-1a", async () => {
   // The label and the algorithm have to agree: the old digest computed
   // `h*prime ^ c` from seed 0, which is neither FNV-1a nor FNV-1, in the one

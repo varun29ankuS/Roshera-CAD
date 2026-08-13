@@ -99,10 +99,13 @@ check("fidelity_signed is extracted from the perception the REAL pipeline delive
   assert.equal(r.components.sound, true, "beside the soundness verdict, not instead of it");
 });
 
-check("a block that measured NOTHING is a gap, not a fidelity_signed of 0", () => {
-  // main.rs:1276-1279 omits `fidelity_ok` and main.rs:1296 nulls `worst` when
-  // nothing was measured. The block still ARRIVES; there is simply no number in
-  // it, and inventing 0 here would read as a perfect build.
+check("a gaps-only block quotes the KERNEL's reason, never this module's guess", () => {
+  // `is_empty()` requires BOTH lists empty (fidelity.rs:215-217), so a
+  // gaps-only report DOES attach a block: `fidelity_ok` omitted
+  // (main.rs:1276-1279), `worst: null` (main.rs:1296), and `gaps[]` carrying
+  // the kernel's own stated reason it could not measure. Reporting "the op
+  // attached none" here would be false twice over — a block arrived, and the
+  // true reason was in it and got discarded.
   const r = rewardFromResult(created({
     sound: true,
     fidelity: {
@@ -114,8 +117,14 @@ check("a block that measured NOTHING is a gap, not a fidelity_signed of 0", () =
       note: "fidelity compares the REQUEST to the RESULT…",
     },
   }));
-  assert.ok(!("fidelity_signed" in r.components));
-  assert.ok(r.gaps.some((g) => g.name === "fidelity_signed"));
+  assert.ok(!("fidelity_signed" in r.components), "still absent, never a fabricated 0");
+  const gap = r.gaps.find((g) => g.name === "fidelity_signed");
+  assert.ok(gap);
+  assert.ok(gap.reason.includes("tessellated to no vertices"),
+    "the kernel's own stated reason must survive into the trajectory");
+  assert.ok(gap.reason.includes("radius,height"), "including WHICH quantities went unmeasured");
+  assert.ok(!gap.reason.includes("the op attached none"),
+    "a block DID arrive — claiming otherwise is a confident wrong diagnosis");
 });
 
 check("a loft's 9.97% shortfall is scored with its SIGN", () => {
