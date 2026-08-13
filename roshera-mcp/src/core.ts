@@ -93,14 +93,36 @@ function intentHeaders(): Record<string, string> {
 let boundDocument: string | null = null;
 
 /**
- * RAW fetch (never `api()` — `api()` itself calls `documentHeaders()` below,
- * so routing this through `api()` would be a self-referential bootstrap) of
- * the document list; binds to whichever one is `active` at this moment. Best-
- * effort: any failure (network, non-OK status, no active document) leaves
- * `boundDocument` null, which is LEGACY behaviour — every call goes out
- * unbound, exactly as it did before this existed.
+ * Bind this process to its BIRTH document.
+ *
+ * Two sources, in precedence order:
+ *
+ *   1. `ROSHERA_DOCUMENT` — an EXPLICIT pin. Read at call time (not module
+ *      load) so a caller can set it programmatically before binding. When
+ *      present, NO HTTP call is made: the caller has already told us which
+ *      document this process owns, and asking the server would only invite
+ *      the race this branch exists to remove. This is what makes parallel
+ *      episodes possible — `active` is a single global notion, so N
+ *      processes discovering it concurrently all land on the SAME document.
+ *   2. Active-document discovery — the original behaviour, unchanged. RAW
+ *      fetch (never `api()` — `api()` itself calls `documentHeaders()`, so
+ *      routing this through `api()` would be a self-referential bootstrap)
+ *      of the document list; binds to whichever one is `active` right now.
+ *
+ * Best-effort: any failure (network, non-OK status, no active document)
+ * leaves `boundDocument` null, which is LEGACY behaviour — every call goes
+ * out unbound, exactly as it did before this existed.
  */
 export async function bindSessionDocument(): Promise<void> {
+  // A whitespace-only value is NOT a document id. Treating it as one would
+  // put an empty `X-Roshera-Document` on every request, which the backend
+  // reads as a malformed document reference (typed 400) rather than as the
+  // absence the operator plainly meant.
+  const pinned = process.env.ROSHERA_DOCUMENT?.trim();
+  if (pinned) {
+    boundDocument = pinned;
+    return;
+  }
   try {
     const res = await fetch(`${BASE}/api/documents`, {
       headers: { ...AUTH_HEADERS },
