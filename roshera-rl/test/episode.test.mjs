@@ -123,7 +123,7 @@ check("a failed document creation is SETUP_FAILED — no episode happened", asyn
   assert.equal(r.outcome, "SETUP_FAILED");
 });
 
-check("an out-of-allowlist action ends the episode rather than being run", async () => {
+check("an out-of-allowlist action ends the episode as INVALID_ACTION, not BUDGET_EXHAUSTED", async () => {
   const path = join(dir, "f.jsonl");
   let called = 0;
   const r = await runEpisode({
@@ -132,7 +132,39 @@ check("an out-of-allowlist action ends the episode rather than being run", async
     spawn: fakeSpawn(() => { called += 1; return { perception: { sound: true } }; }),
   });
   assert.equal(called, 0, "the disallowed tool must never reach the session");
-  assert.equal(r.outcome, "BUDGET_EXHAUSTED");
+  assert.equal(r.outcome, "INVALID_ACTION",
+    "zero real steps run must not read the same as a genuinely exhausted budget");
+});
+
+check("a spawn failure after document creation still reaps the document", async () => {
+  const path = join(dir, "g.jsonl");
+  const r = await runEpisode({
+    task, policy: scriptedPolicy([]), seed: 1, baseUrl, authHeader: {},
+    trajectoryPath: path, kernelSha: "abc",
+    spawn: async () => { throw new Error("ECONNREFUSED: MCP process failed to start"); },
+  });
+  assert.equal(r.outcome, "SETUP_FAILED");
+  assert.ok(deleted.includes(r.documentId),
+    "the document must be reaped even when spawn fails after creation, not orphaned in PartManager");
+});
+
+check("a policy that throws leaves a record of why, not silence", async () => {
+  const path = join(dir, "h.jsonl");
+  const throwingPolicy = {
+    async act() { throw new Error("policy blew up: bad state"); },
+    tokensUsed: () => 0,
+  };
+  const r = await runEpisode({
+    task, policy: throwingPolicy, seed: 1, baseUrl, authHeader: {},
+    trajectoryPath: path, kernelSha: "abc",
+    spawn: fakeSpawn(() => ({ perception: { sound: true } })),
+  });
+  assert.equal(r.outcome, "CRASHED");
+  assert.ok(r.error && r.error.includes("policy blew up"),
+    "the returned object must carry the reason, the way SETUP_FAILED does");
+  const { steps, terminal } = readTrajectory(path);
+  assert.equal(steps.length, 1, "the crash is recorded as a step, not dropped silently");
+  assert.equal(terminal.outcome, "CRASHED");
 });
 
 for (const [name, fn] of checks) { await fn(); process.stdout.write(`  ok - ${name}\n`); }

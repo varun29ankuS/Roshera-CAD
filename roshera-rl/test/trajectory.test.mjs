@@ -87,9 +87,10 @@ check("an unknown outcome is refused rather than written", () => {
   );
 });
 
-check("the taxonomy is exactly the five named outcomes", () => {
+check("the taxonomy is exactly the six named outcomes", () => {
   assert.deepEqual([...OUTCOMES].sort(), [
-    "BUDGET_EXHAUSTED", "COMPLETED", "CRASHED", "RATE_LIMITED", "SETUP_FAILED",
+    "BUDGET_EXHAUSTED", "COMPLETED", "CRASHED", "INVALID_ACTION",
+    "RATE_LIMITED", "SETUP_FAILED",
   ]);
 });
 

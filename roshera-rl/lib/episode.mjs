@@ -22,6 +22,24 @@ const digest = (v) => {
   return `fnv1a64:${h.toString(16)}`;
 };
 
+/**
+ * Delete the episode's document, best-effort. Two call sites share this so
+ * they cannot drift apart: the normal end-of-episode reap, and the
+ * SETUP_FAILED path where `spawn` failed AFTER document creation already
+ * succeeded — that document is just as real and must not be orphaned in
+ * PartManager's DashMap. A failed DELETE here must never itself become a
+ * thrown error; `runner.mjs`'s reaper is the backstop for whatever this
+ * best-effort attempt misses.
+ */
+async function reapDocument(baseUrl, authHeader, documentId) {
+  if (!documentId) return;
+  try {
+    await fetch(`${baseUrl}/api/documents/${documentId}`, {
+      method: "DELETE", headers: { ...authHeader },
+    });
+  } catch { /* the reaper in runner.mjs is the backstop */ }
+}
+
 export async function runEpisode({
   task, policy, seed, baseUrl, authHeader, mcpEntry, trajectoryPath,
   kernelSha, mcpVersion = "0.1.0", spawn = spawnMcpSession,
@@ -46,6 +64,10 @@ export async function runEpisode({
     if (!documentId) throw new Error("document creation returned no id");
     session = await spawn({ documentId, baseUrl, authHeader, mcpEntry });
   } catch (e) {
+    // `documentId` is set the moment creation succeeds, before `spawn` is
+    // even called — if spawn is what failed, that document is real and
+    // orphaned unless reaped here too.
+    await reapDocument(baseUrl, authHeader, documentId);
     traj.close({
       outcome: "SETUP_FAILED",
       rewardFinal: mergeFinal([]),
@@ -63,13 +85,26 @@ export async function runEpisode({
   let observation = null;
   let claims = [];
   let recipeRef = null;
+  // Carried out on the returned object the way SETUP_FAILED already does —
+  // a crash with no recorded reason is a dead end for whoever reads the
+  // batch tally afterward.
+  let episodeError = null;
 
   for (let i = 0; i < task.stepBudget; i += 1) {
     let action;
     try {
       action = await policy.act({ task, observation, history: rewards });
     } catch (e) {
+      // The session.call path below already writes a step carrying its
+      // failure reason; a policy crash gets the same treatment so it is not
+      // recorded nowhere — not in a step, not in the returned object.
       outcome = "CRASHED";
+      episodeError = String(e?.message ?? e);
+      traj.step({
+        i, action: null, resultDigest: null,
+        reward: { components: {}, gaps: [{ name: "sound", reason: `policy.act failed: ${episodeError}` }] },
+        refusal: null, ms: 0,
+      });
       break;
     }
     if (action?.done === true) { outcome = "COMPLETED"; break; }
@@ -77,12 +112,17 @@ export async function runEpisode({
       assertActionAllowed(task, action);
     } catch (e) {
       // The stamped action space is the permitted one. An out-of-allowlist
-      // action is recorded as a refusal by the HARNESS and the episode ends
-      // at its budget rather than silently running a tool no trajectory
-      // header claims.
+      // action is recorded as a refusal by the HARNESS, named INVALID_ACTION
+      // explicitly rather than left to fall through to the loop's
+      // BUDGET_EXHAUSTED default — an episode that ran zero real steps must
+      // not read the same as one that genuinely burned its whole budget. The
+      // synthetic refusal reward is pushed into `rewards` so `mergeFinal`
+      // counts it, the same as any kernel-issued refusal.
+      outcome = "INVALID_ACTION";
+      const reward = { components: { refused: "harness_allowlist" }, gaps: [] };
+      rewards.push(reward);
       traj.step({
-        i, action, resultDigest: null,
-        reward: { components: { refused: "harness_allowlist" }, gaps: [] },
+        i, action, resultDigest: null, reward,
         refusal: { gate: "harness_allowlist", reason: String(e.message) }, ms: 0,
       });
       break;
@@ -127,13 +167,7 @@ export async function runEpisode({
     }
   }
   try { await session.close(); } catch { /* already dead */ }
-  if (documentId) {
-    try {
-      await fetch(`${baseUrl}/api/documents/${documentId}`, {
-        method: "DELETE", headers: { ...authHeader },
-      });
-    } catch { /* the reaper in runner.mjs is the backstop */ }
-  }
+  await reapDocument(baseUrl, authHeader, documentId);
 
   const rewardFinal = mergeFinal(rewards);
   const wallMs = Date.now() - started;
@@ -141,5 +175,5 @@ export async function runEpisode({
     outcome, rewardFinal, claims, recipeRef,
     tokens: policy.tokensUsed(), wallMs,
   });
-  return { outcome, rewardFinal, documentId, trajectoryPath, wallMs };
+  return { outcome, rewardFinal, documentId, trajectoryPath, wallMs, error: episodeError };
 }

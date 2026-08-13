@@ -38,6 +38,7 @@ export const SCHEMA_VERSION = "roshera-rl/1";
 export const OUTCOMES = Object.freeze([
   "COMPLETED",        // the policy declared done
   "BUDGET_EXHAUSTED", // step or token cap hit first
+  "INVALID_ACTION",   // the policy named a tool outside its own declared action space
   "CRASHED",          // the MCP process died
   "SETUP_FAILED",     // document creation or spawn failed; no episode happened
   "RATE_LIMITED",     // the shared 6000/min EvalHarness budget refused us
