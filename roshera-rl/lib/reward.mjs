@@ -33,22 +33,28 @@ const GAP_NEVER_MEASURED =
  *
  * The kernel computes it and the api-server attaches it to a mutating op's
  * response at `body.perception.fidelity` (api-server/src/main.rs:1326-1336
- * `attach_fidelity`, block shape at main.rs:1247-1314), and roshera-mcp now
- * carries it through VERBATIM (`perceptionFromBody`, core.ts — proven at the
- * production dispatch path by roshera-mcp/test/perception_fidelity.test.mjs).
+ * `attach_fidelity`, block shape at main.rs:1247-1314), and roshera-mcp carries
+ * it through VERBATIM (`perceptionFromBody`, core.ts — proven at the production
+ * dispatch path by roshera-mcp/test/perception_fidelity.test.mjs).
  *
- * So the meaning of this absence CHANGED when that passthrough landed, and the
- * reason has to change with it or it becomes a confident wrong diagnosis. It
- * now says: this step's own response carried no block. The three real ways
- * that happens, none of which is a dropped measurement:
+ * WHAT THIS REASON MAY AND MAY NOT SAY. It used to end "this absence means the
+ * op attached none". The first CONCURRENT live run (8 episodes, 2026-08-13)
+ * disproved that sentence with its own trajectories: five of the eight built
+ * cylinders — an op that ALWAYS attaches a block (main.rs:4237) — and every one
+ * of those five recorded this gap. The block existed; the client lost it. The
+ * `part_id`s in those records say how: 97,97,97,97,98,101,101,101, four
+ * episodes naming one part, because `GET /api/agent/parts` is served from the
+ * ONE global live model for any request without an `X-Roshera-Part-Id` header
+ * (api-server/src/part_mgr.rs:264,286-312) and the MCP never sends one. The
+ * tool resolved another session's id, `perceive()` missed its
+ * embedded-perception stash (matched BY ID, core.ts) and re-fetched the
+ * read-side `/perception` endpoint, which has no fidelity producer at all.
  *
- *  - the op had nothing measurable, so an EMPTY report attaches nothing at all
- *    rather than a block of zeros (main.rs:1330-1332);
- *  - the op is not one of the four that measure fidelity today (cylinder
- *    main.rs:4237, box 4456, revolve 5361, loft 6026);
- *  - the step was a `verify_part`, which builds its OWN fixed-key body
- *    (tools/perception.ts:199-248) from the read-side `/perception` endpoint —
- *    and that endpoint has no fidelity producer at all.
+ * That client-side cause is designed out — `newestPartId` (core.ts) now returns
+ * the id the op's own response named — but the lesson stands and is why this
+ * text no longer commits to one cause: the trajectory records only that no
+ * block arrived, and a reason cannot see further than the wire it is reading.
+ * So it ENUMERATES the ways, source-cited, and asserts none of them.
  *
  * This constant is for the NO-BLOCK case ONLY. A block that arrived and simply
  * had no number in it is a different fact with a different, better reason —
@@ -58,13 +64,21 @@ const GAP_NEVER_MEASURED =
  * `soundnessOf` below names that one where it belongs.
  */
 const GAP_NO_FIDELITY =
-  "this step's perception carried no fidelity block. The kernel measures it, " +
-  "the api-server attaches it at body.perception.fidelity for the ops that have " +
-  "a measurable request (main.rs attach_fidelity: cylinder/box/revolve/loft), and " +
-  "roshera-mcp carries it through verbatim (core.ts perceptionFromBody). So this " +
-  "absence means the op attached none — an op with nothing measurable attaches " +
-  "nothing rather than a block of zeros, and verify_part's own body " +
-  "(tools/perception.ts) never carries one — NOT that a measured deviation was dropped";
+  "this step's perception carried no fidelity block, and this record cannot " +
+  "tell which of the following put it there. The kernel measures fidelity and " +
+  "the api-server attaches it at body.perception.fidelity (main.rs " +
+  "attach_fidelity) for the four ops with a measurable request — cylinder, box, " +
+  "revolve, loft. So EITHER no block was attached: the op is not one of those " +
+  "four, or its report was empty and an empty report attaches nothing rather " +
+  "than a block of zeros (main.rs:1330-1332), or the step was a verify_part, " +
+  "whose own body (tools/perception.ts) is built from the read-side " +
+  "/perception endpoint and never carries one. OR a block WAS attached and the " +
+  "client did not carry it here: roshera-mcp reuses the op's embedded " +
+  "perception only when it matches the part id the tool resolved, and on a " +
+  "mismatch it re-fetches that same read-side /perception endpoint, which has " +
+  "no fidelity producer — which is what happened to five of the eight " +
+  "concurrent live episodes of 2026-08-13. What is certain is that NO measured " +
+  "deviation was seen and none is being scored as 0";
 
 /**
  * WHY there is no `fidelity_signed` on this step — distinguishing "no block

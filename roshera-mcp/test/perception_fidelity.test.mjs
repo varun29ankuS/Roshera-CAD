@@ -129,6 +129,51 @@ const FIDELITY_UNMEASURED = {
 
 const counts = { checkpoint: 0, cylinder: 0, box: 0, perception: 0 };
 
+// THE CONCURRENT-MODEL RACE, made deterministic. `GET /api/agent/parts` is
+// served from `ActiveModel` (api-server/src/handlers/agent.rs:71-82), which
+// resolves to the ONE global `state.model` whenever the request carries no
+// `X-Roshera-Part-Id` header (part_mgr.rs:264 for the name, 286-312 for the
+// `None => legacy` arm) — and roshera-mcp never sends that header (it sends
+// only X-Roshera-Agent / -Intent / -Intent-Turn / -Document, core.ts:155-166).
+// So N concurrent MCP processes, however distinct their documents, all list
+// the SAME BRepModel and see each other's solids. When this is true, the list
+// max is another process's part. Set it to a part id that is NOT this call's
+// `solid_id` to reproduce that, with no concurrency in the test.
+let foreignPartId = null;
+
+/** When set, the block the cylinder route attaches, overriding the two above. */
+let fidelityOverride = null;
+
+// A block whose verdict is FALSE — the loft that shipped `sound` while 9.97%
+// short, which is why this signal exists. `fidelity_ok` is `false` because a
+// measured `relative_deviation` exceeds `tolerance`
+// (FidelityReport::fidelity_ok, geometry-engine/src/queries/fidelity.rs:202-211).
+const FIDELITY_FAILED = {
+  op: "loft",
+  fidelity_ok: false,
+  tolerance: 0.02,
+  worst: {
+    name: "height",
+    requested: 100.0,
+    measured: 90.03,
+    relative_deviation: 0.0997,
+    signed_relative_deviation: -0.0997,
+    direction: "built SMALLER than requested",
+  },
+  quantities: [
+    {
+      name: "height",
+      requested: 100.0,
+      measured: 90.03,
+      relative_deviation: 0.0997,
+      signed_relative_deviation: -0.0997,
+      method: "span of the tessellation projected onto the requested axis",
+    },
+  ],
+  gaps: [],
+  note: "fidelity compares the REQUEST to the RESULT.",
+};
+
 /** The cheap verdict `certified_response` embeds (main.rs:1058-1145). */
 const basePerception = () => ({
   sound: true,
@@ -157,7 +202,7 @@ const stub = http.createServer((req, res) => {
     }
     if (req.method === "POST" && url === "/api/geometry/cylinder") {
       counts.cylinder++;
-      // Call 1 measured both quantities; call 2 could measure neither.
+      // Calls 1 and 3 measured both quantities; call 2 could measure neither.
       return send({
         success: true,
         solid_id: PART_ID,
@@ -165,7 +210,8 @@ const stub = http.createServer((req, res) => {
         stats: { triangle_count: 96 },
         perception: {
           ...basePerception(),
-          fidelity: counts.cylinder === 1 ? FIDELITY_MEASURED : FIDELITY_UNMEASURED,
+          fidelity:
+            fidelityOverride ?? (counts.cylinder === 2 ? FIDELITY_UNMEASURED : FIDELITY_MEASURED),
         },
       });
     }
@@ -183,9 +229,12 @@ const stub = http.createServer((req, res) => {
       });
     }
     if (req.method === "GET" && url === "/api/agent/parts") {
-      // `newestPartId` reduces over `p.id` (core.ts:599-603) — this id MUST match
-      // the POST's `solid_id` or the embedded-perception stash misses.
-      return send([{ id: PART_ID, part_id: PART_ID, name: "Cylinder 7" }]);
+      // `newestPartId` reduces over `p.id` (core.ts:599-603).
+      const parts = [{ id: PART_ID, part_id: PART_ID, name: "Cylinder 7" }];
+      if (foreignPartId !== null) {
+        parts.push({ id: foreignPartId, part_id: foreignPartId, name: "Cylinder 9" });
+      }
+      return send(parts);
     }
     if (req.method === "GET" && /^\/api\/agent\/parts\/\d+$/.test(url)) {
       return send({
@@ -310,6 +359,154 @@ check("an op with no fidelity block yields no fidelity key — never a fabricate
       "'measured, and nothing was wrong'",
   );
   assert.equal(boxJson.perception.sound, true, "while the verdict itself still arrives");
+});
+
+// ─── THE CONCURRENT-MODEL RACE (2026-08-13, from the live 8-episode batch) ───
+//
+// In the live run, 5 of 8 concurrent episodes lost `fidelity_signed` entirely.
+// The trajectories name the cause: the reported `part_id` was 97,97,97,97,98,
+// 101,101,101 — four episodes claiming the same part. The three episodes whose
+// id was theirs alone (97, 98, 101) are EXACTLY the three that carried
+// fidelity. The chain:
+//
+//   1. the op's own response carries both `solid_id` and
+//      `perception.fidelity` (main.rs:4237-4251);
+//   2. `api()` stashes that perception under `parsed.solid_id ?? parsed.id`
+//      (core.ts:203-211);
+//   3. the create tool resolves its part with `newestPartId()` — the MAX id in
+//      the shared live model — which under concurrency is another process's
+//      solid;
+//   4. `perceive(partId)` then fails its stash-id match (core.ts:718-721) and
+//      re-fetches `GET /api/agent/parts/{id}/perception`, which has NO fidelity
+//      producer at all (the string `fidelity` does not occur anywhere in
+//      api-server/src/handlers/) — so the block the kernel measured and the
+//      server attached is dropped before any agent or any trajectory sees it.
+//
+// The id is the load-bearing half: a tool that reports a part_id it did not
+// create has already told the agent something false, and the lost reward is
+// the second casualty. Both are asserted here.
+foreignPartId = 9;
+const raced = await call("create_cylinder", { plane: "xy", cx: 0, cy: 0, radius: 25, height: 60 });
+const racedJson = firstJson(raced);
+
+check("a concurrent process's higher part id does not become THIS op's part_id", () => {
+  assert.equal(
+    racedJson.part_id,
+    PART_ID,
+    "the tool must report the part its own POST created (`solid_id`), not the " +
+      "newest id in a model it shares with every other concurrent session",
+  );
+});
+
+check("and the fidelity block still reaches the agent under that race", () => {
+  const f = racedJson.perception?.fidelity;
+  assert.ok(
+    f,
+    "the op attached a block; losing it to a re-fetch of a channel that has no " +
+      "fidelity producer is the dense reward dropping out under exactly the " +
+      "load a training run applies",
+  );
+  assert.equal(
+    typeof f.worst?.signed_relative_deviation,
+    "number",
+    "and the signed deviation — the number roshera-rl scores — survives",
+  );
+});
+
+check("the perception describes the part the op built, not the foreign one", () => {
+  assert.equal(
+    racedJson.perception.volume,
+    117790.346542991,
+    "a verdict re-fetched for another session's solid would be a verdict about " +
+      "geometry this episode never built",
+  );
+});
+
+// ─── DEFAULT MODE: the verdict line an ordinary agent session reads ──────────
+//
+// Everything above runs in `cert` mode, which is what roshera-rl pins
+// (mcp_session.mjs:428) — the perception OBJECT, fidelity block and all. A
+// human's agent session does not: `compact` is the default (core.ts okp), and
+// there the agent sees ONE line built by `compactVerdict`. `durability` earned
+// a prefix on that line; fidelity had none, so a DEFAULT-mode agent read
+// `SOUND ✓ ...` over a block whose `fidelity_ok` was FALSE — the loft's
+// 9.97%-short silent pass, surviving on the surface most sessions use.
+//
+// Driven through the real dispatch path, in the real mode, not by calling
+// `compactVerdict` directly: the point is what the TOOL RESULT says.
+process.env.ROSHERA_AMBIENT_PERCEPTION = "compact";
+foreignPartId = null;
+
+const compactLine = async (fid) => {
+  fidelityOverride = fid;
+  const r = await call("create_cylinder", { plane: "xy", cx: 0, cy: 0, radius: 25, height: 60 });
+  fidelityOverride = null;
+  return firstJson(r).perception;
+};
+
+const failedLine = await compactLine(FIDELITY_FAILED);
+
+check("a FALSE fidelity verdict is never hidden behind SOUND ✓", () => {
+  assert.equal(typeof failedLine, "string", "compact mode yields the one-line verdict");
+  assert.match(
+    failedLine,
+    /FIDELITY/,
+    `the line must say the built shape is not the requested one — got ${JSON.stringify(failedLine)}`,
+  );
+  assert.ok(
+    failedLine.includes("height"),
+    "and name the quantity that missed, from `worst.name` — a bare warning is not a diagnosis",
+  );
+  assert.ok(
+    failedLine.includes("9.97"),
+    "and carry the size of the miss, so 9.97% short does not read like 0.003%",
+  );
+  assert.ok(
+    failedLine.includes("SOUND ✓"),
+    "while the SOUNDNESS verdict still stands beside it: fidelity and soundness " +
+      "are independent verdicts (main.rs:1304-1311) and one must not overwrite the other",
+  );
+});
+
+const okLine = await compactLine(FIDELITY_MEASURED);
+
+check("a TRUE fidelity verdict is stated too, not merely implied by silence", () => {
+  assert.match(okLine, /fidelity ✓/, `got ${JSON.stringify(okLine)}`);
+  assert.ok(okLine.includes("SOUND ✓"));
+});
+
+const unmeasuredLine = await compactLine(FIDELITY_UNMEASURED);
+
+check("a block that measured NOTHING claims no verdict either way", () => {
+  assert.ok(
+    unmeasuredLine.includes("fidelity"),
+    `an arrived-but-unmeasured block is not silence — got ${JSON.stringify(unmeasuredLine)}`,
+  );
+  assert.equal(
+    /fidelity ✓/.test(unmeasuredLine),
+    false,
+    "`fidelity_ok` is OMITTED when nothing was measured (main.rs:1276-1279); a ✓ " +
+      "here would be the green boolean over an unmeasured quantity the kernel refuses to give",
+  );
+  assert.equal(
+    /FIDELITY ✗/.test(unmeasuredLine),
+    false,
+    "and a ✗ would assert a defect nobody observed (fidelity.rs:194-201)",
+  );
+});
+
+const boxLine = firstJson(
+  await call("create_box", { plane: "xy", cx: 0, cy: 0, width: 20, depth: 20, height: 10 }),
+).perception;
+
+check("an op with no fidelity block leaves the verdict line untouched", () => {
+  assert.equal(typeof boxLine, "string");
+  assert.equal(
+    /fidelity/i.test(boxLine),
+    false,
+    `no block means nothing to say — got ${JSON.stringify(boxLine)}`,
+  );
+  assert.ok(boxLine.startsWith("SOUND ✓"));
 });
 
 stub.close();

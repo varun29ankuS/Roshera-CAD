@@ -62,6 +62,38 @@ const SETUP_STAGE = Object.freeze({
 });
 
 /**
+ * The MCP server version stamped into every trajectory header. One binding, so
+ * the batch runner's own SETUP_FAILED record (a policy factory that threw
+ * before an episode could start — runner.mjs) cannot stamp a different version
+ * than the episodes beside it in the same batch.
+ */
+export const MCP_VERSION = "0.1.0";
+
+/**
+ * Claims/recipe for an episode that never reached terminal scoring.
+ *
+ * `detail` is the concrete failure — which stage, and the error text it
+ * carried — appended to the outcome's standing reason. Without it a reader of
+ * the trajectory learns only the category, which is what made two different
+ * SETUP_FAILED episodes read identically.
+ *
+ * Exported because `runner.mjs` writes one such record itself, for the episode
+ * that could not begin at all; two hand-written copies of this shape would be
+ * free to drift, and the absence reason is the entire content of that record.
+ */
+export function unscoredFor(task, outcome, detail) {
+  const reason = detail
+    ? `${NO_TERMINAL_SCORING[outcome]} — ${detail}`
+    : NO_TERMINAL_SCORING[outcome];
+  return {
+    claims: task.claims.map((c) => ({
+      name: c.name, verified: null, computed: null, absent: reason,
+    })),
+    recipeRef: { absent: reason },
+  };
+}
+
+/**
  * Delete the episode's document, best-effort, REPORTING what happened. Two
  * call sites share this so they cannot drift apart: the normal end-of-episode
  * reap, and the SETUP_FAILED path where `spawn` failed AFTER document
@@ -92,7 +124,7 @@ export async function reapDocument(baseUrl, authHeader, documentId) {
 
 export async function runEpisode({
   task, policy, seed, baseUrl, authHeader, mcpEntry, trajectoryPath,
-  kernelSha, mcpVersion = "0.1.0", spawn = spawnMcpSession,
+  kernelSha, mcpVersion = MCP_VERSION, spawn = spawnMcpSession,
 }) {
   const started = Date.now();
   // An episode never throws: every failure mode is a named outcome, and that
@@ -114,25 +146,8 @@ export async function runEpisode({
     };
   }
 
-  /**
-   * Claims/recipe for an episode that never reached terminal scoring.
-   *
-   * `detail` is the concrete failure — which stage, and the error text it
-   * carried — appended to the outcome's standing reason. Without it a reader
-   * of the trajectory learns only the category, which is what made two
-   * different SETUP_FAILED episodes read identically.
-   */
-  const unscored = (outcome, detail) => {
-    const reason = detail
-      ? `${NO_TERMINAL_SCORING[outcome]} — ${detail}`
-      : NO_TERMINAL_SCORING[outcome];
-    return {
-      claims: task.claims.map((c) => ({
-        name: c.name, verified: null, computed: null, absent: reason,
-      })),
-      recipeRef: { absent: reason },
-    };
-  };
+  /** This episode's task, bound to the shared `unscoredFor` above. */
+  const unscored = (outcome, detail) => unscoredFor(task, outcome, detail);
 
   // ── setup ────────────────────────────────────────────────────────────
   let documentId = null;

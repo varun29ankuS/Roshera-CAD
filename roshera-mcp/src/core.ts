@@ -209,18 +209,28 @@ export async function api(
       };
     }
   }
-  // IMAGE-FRESHNESS INVALIDATION: any mutating call invalidates the whole-scene
-  // cache (scene_view); one that reports a specific part id also invalidates
-  // that part's own cache (render_part/section_view). See the "Image freshness"
-  // section above core.ts for why this hook lives here (the same mutating-call
-  // branch the embedded-perception stash already uses).
+  // The id this mutating response NAMED, read from the same expression the
+  // stash above uses so the two cannot disagree, and numeric-guarded because a
+  // response whose `id` is a UUID string is not naming a kernel part
+  // (`newestPartId` and `recordPartMutation` both speak the integer SolidId).
+  // Recomputed — not reused from the stash — because the stash exists only when
+  // the body also carried a perception, and these two consumers do not.
   if (method !== "GET") {
-    recordGlobalMutation();
-    const mutatedId =
+    const reportedId =
       parsed && typeof parsed === "object"
         ? ((parsed as any).solid_id ?? (parsed as any).id)
         : undefined;
-    if (typeof mutatedId === "number") recordPartMutation(mutatedId);
+    const numericId = typeof reportedId === "number" ? reportedId : null;
+    // SET ON EVERY MUTATING CALL, including to `null`: a response that names no
+    // part must CLEAR the previous one, or a checkpoint POST would leave the
+    // id of some earlier op standing as "the part the last mutation produced".
+    lastMutatedPartId = numericId;
+    // IMAGE-FRESHNESS INVALIDATION: any mutating call invalidates the
+    // whole-scene cache (scene_view); one that reports a specific part id also
+    // invalidates that part's own cache (render_part/section_view). See the
+    // "Image freshness" section below for why this hook lives here.
+    recordGlobalMutation();
+    if (numericId !== null) recordPartMutation(numericId);
   }
   return parsed;
 }
@@ -596,7 +606,59 @@ export async function placement(partId: number) {
   }
 }
 
+/**
+ * The numeric id the most recent MUTATING call's response named, or `null` when
+ * it named none.
+ *
+ * Set by `api()` above on EVERY non-GET — to `solid_id ?? id` when that is a
+ * number, otherwise to `null` — and consumed (cleared) by `newestPartId()`. So
+ * it answers for the most recent mutating call in THIS PROCESS, which is not
+ * quite the same as "the mutation inside the current tool handler": a call site
+ * written `r.solid_id ?? (await newestPartId())` short-circuits and never
+ * consumes, so the value stands until the next mutating call overwrites it.
+ * Every call site today runs one line after its own POST (listed on
+ * `newestPartId` below), so the difference is not reachable now — it is stated
+ * because it is what the code enforces, not what the call sites happen to do.
+ */
+let lastMutatedPartId: number | null = null;
+
+/**
+ * The part a create/modify tool just built.
+ *
+ * TWO MODES, in this order:
+ *
+ *  1. THE ID THE OP ITSELF REPORTED. Every call site is one line after a
+ *     mutating POST whose response carries `solid_id` (create.ts:125/195/252/
+ *     296/337/453/507, modify.ts:98/234/285/448, psketch.ts:302/356,
+ *     io.ts:49), so the op has already named its own result and this returns
+ *     that, consuming it.
+ *
+ *  2. THE MAX ID IN THE LIVE MODEL — the original behaviour, and still the
+ *     answer whenever the response named no numeric part (an import that
+ *     returns an `objects` array and no top-level `solid_id`, io.ts:43-49).
+ *
+ * WHY MODE 1 EXISTS. `GET /api/agent/parts` is served through `ActiveModel`
+ * (api-server/src/handlers/agent.rs:71-82), which resolves to the ONE global
+ * `state.model` for any request without an `X-Roshera-Part-Id` header
+ * (api-server/src/part_mgr.rs:264, 286-312) — and this client never sends that
+ * header. So concurrent MCP processes, however distinct their documents, all
+ * list the SAME BRepModel: the max id is whatever solid was inserted last by
+ * ANY of them. Measured on 8 concurrent live episodes (2026-08-13): four
+ * reported the same `part_id` 97 and three the same 101, i.e. five of eight
+ * tools named a part they had not built — and, because `perceive()` matches
+ * its embedded-perception stash BY ID (see the fast path below), each of those
+ * five then re-fetched the read-side `/perception` endpoint, which carries no
+ * fidelity block at all. Mode 1 removes both consequences at once: the
+ * reported id is the op's own, and the stash matches by construction.
+ *
+ * Mode 1 does NOT make concurrent sessions independent — they still share one
+ * live model, so `list_parts` still sees every session's solids. It makes each
+ * tool report the part IT built.
+ */
 export async function newestPartId(): Promise<number | null> {
+  const reported = lastMutatedPartId;
+  lastMutatedPartId = null;
+  if (reported !== null) return reported;
   const parts = await api("GET", "/api/agent/parts");
   if (!Array.isArray(parts) || parts.length === 0) return null;
   return parts.reduce((m: number, p: any) => Math.max(m, p.id), 0);
@@ -912,15 +974,95 @@ export function compactVerdict(p: any): string {
   const durabilityNote = p?.durability
     ? `⚠ DOCUMENT QUARANTINED (${p.durability.reason ?? "history incomplete — see p.durability"}) | `
     : "";
+  const fidelityNote = fidelityPrefix(p?.fidelity);
   if (p?.sound === true && failed.length === 0) {
     const verified = DIMS.filter(([k]) => p?.[k] === true).map(([, n]) => n);
     const suffix = unverified.length
       ? ` (unverified: ${unverified.join(",")} — verify_part to certify)`
       : "";
-    return `${durabilityNote}SOUND ✓ ${verified.join("·")}${suffix}${tail}`;
+    return `${durabilityNote}${fidelityNote}SOUND ✓ ${verified.join("·")}${suffix}${tail}`;
   }
   const why = failed.length ? failed.join(", ") : "cheap verdict false";
-  return `${durabilityNote}UNSOUND ✗ failed: ${why}${tail} — run verify_part for the full certificate + diagnostic render`;
+  return `${durabilityNote}${fidelityNote}UNSOUND ✗ failed: ${why}${tail} — run verify_part for the full certificate + diagnostic render`;
+}
+
+/**
+ * The fidelity half of the one-line verdict — "is the geometry you asked for
+ * the geometry you got?" — prefixed BESIDE the soundness verdict for the same
+ * reason `durability` is, and never in place of it: the kernel states plainly
+ * that the two are independent verdicts (main.rs:1304-1311), so a fidelity miss
+ * does not make a solid unsound and a sound solid is not thereby the shape that
+ * was requested.
+ *
+ * Until this existed, only `ROSHERA_AMBIENT_PERCEPTION=cert`/`full` sessions —
+ * which get the whole perception object — could see fidelity at all. The
+ * DEFAULT (`compact`) mode showed `SOUND ✓` over a block whose `fidelity_ok`
+ * was false, which is the loft-shipped-9.97%-short silent pass surviving on the
+ * surface ordinary agent sessions actually read.
+ *
+ * Three cases, mirroring exactly what the block can say and nothing more:
+ *
+ *  - `fidelity_ok === false` — a measured deviation exceeded the tolerance
+ *    (`FidelityReport::fidelity_ok`, geometry-engine/src/queries/fidelity.rs:
+ *    202-211). Loud, and it NAMES the quantity and the size of the miss from
+ *    `worst`, because "fidelity failed" without a number cannot be acted on.
+ *  - `fidelity_ok === true` — every measured quantity is inside the band. Said
+ *    out loud rather than left as silence, so a reader can tell "measured and
+ *    fine" from "not measured at all".
+ *  - the key is ABSENT — the kernel omits it deliberately when NOTHING was
+ *    measured (main.rs:1276-1279), and a green tick there would be exactly the
+ *    unmeasured pass this whole block exists to end. So neither ✓ nor ✗ is
+ *    claimed: the line says unmeasured and points at `gaps`, which carries the
+ *    kernel's own reason.
+ *
+ * A perception with NO fidelity block at all is silent — an op with nothing
+ * measurable attaches nothing (main.rs:1330-1332), and inventing a note for it
+ * would be a statement the kernel never made.
+ */
+function fidelityPrefix(f: any): string {
+  if (!f || typeof f !== "object") return "";
+  const op = typeof f.op === "string" ? f.op : "op";
+  if (f.fidelity_ok === false) {
+    // `fidelity_ok` is `Some(_)` only when at least one quantity was measured,
+    // and `worst()` returns one whenever any was (fidelity.rs:183-211), so the
+    // pointer is present here in practice. The fallback still states the
+    // shortfall rather than inventing numbers for it.
+    const w = f.worst;
+    const detail =
+      w && typeof w === "object"
+        ? `${w.name} ${formatDeviation(w.signed_relative_deviation)} ` +
+          `(requested ${w.requested}, measured ${w.measured})`
+        : "see p.fidelity.quantities for the measurement";
+    return `⚠ FIDELITY ✗ ${op}: ${detail} | `;
+  }
+  if (f.fidelity_ok === true) {
+    const w = f.worst;
+    const worstNote =
+      w && typeof w === "object"
+        ? ` (worst ${w.name} ${formatDeviation(w.signed_relative_deviation)})`
+        : "";
+    return `fidelity ✓ ${op}${worstNote} | `;
+  }
+  const gapCount = Array.isArray(f.gaps) ? f.gaps.length : 0;
+  return (
+    `fidelity — ${op}: NOT MEASURED, no verdict either way ` +
+    `(${gapCount} stated gap${gapCount === 1 ? "" : "s"} — see p.fidelity.gaps) | `
+  );
+}
+
+/**
+ * A signed relative deviation as a percentage, keeping the SIGN (which is the
+ * diagnosis: smaller-than-requested and larger-than-requested are different
+ * defects) and enough precision that a near-exact primitive does not print as
+ * a flat `0.00%`. Non-numeric input yields a stated absence, never a `0`.
+ */
+function formatDeviation(v: unknown): string {
+  if (typeof v !== "number" || !Number.isFinite(v)) return "deviation unreadable";
+  const pct = v * 100;
+  if (pct === 0) return "0%";
+  const magnitude = Math.abs(pct);
+  const text = magnitude >= 0.01 ? pct.toFixed(2) : pct.toExponential(2);
+  return `${pct > 0 ? "+" : ""}${text}%`;
 }
 
 /**

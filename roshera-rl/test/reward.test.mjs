@@ -53,12 +53,33 @@ check("no fidelity block is a GAP, never fidelity_signed: 0", () => {
     "an unmeasured component must be ABSENT, not zero");
   const gap = r.gaps.find((g) => g.name === "fidelity_signed");
   assert.ok(gap && gap.reason.length > 0, "and the absence must carry a stated reason");
-  assert.ok(gap.reason.includes("the op attached none"),
-    "the reason must be the TRUE one for TODAY's pipeline: roshera-mcp carries " +
-    "fidelity through now, so an absence means the op attached none — the old " +
-    "reason ('never delivered', the MCP drops it) would be a confident wrong " +
-    "diagnosis pointing at a bug that no longer exists");
   assert.ok(!gap.reason.includes("never delivered"));
+  // THE REASON MUST NOT COMMIT TO A CAUSE IT CANNOT SEE. It said "this absence
+  // means the op attached none". The 8-episode concurrent live run of
+  // 2026-08-13 disproved that: five episodes built cylinders whose responses
+  // DID carry a block (main.rs:4237 attaches one to every cylinder), and the
+  // MCP client dropped it — it had resolved a part id belonging to another
+  // concurrent session out of the shared live model, so `perceive()` missed
+  // its embedded-perception stash and re-fetched the read-side `/perception`
+  // endpoint, which has no fidelity producer. Those five trajectories carry
+  // this text permanently, misattributing the cause. The client-side cause is
+  // designed out (core.ts `newestPartId` now returns the id the op itself
+  // reported), but a reason that asserts ONE cause is a confident wrong
+  // diagnosis the moment a second one exists.
+  assert.equal(
+    gap.reason.includes("this absence means the op attached none"),
+    false,
+    "the reason must not assert a single cause it cannot distinguish from the wire",
+  );
+  assert.ok(
+    /re-?fetch|read-side|different part/i.test(gap.reason),
+    "and it must name the client-side channel loss as a possibility, since that " +
+      `is what actually happened to five of eight live episodes — got ${JSON.stringify(gap.reason)}`,
+  );
+  assert.ok(
+    gap.reason.includes("attach_fidelity"),
+    "while still naming the producer, so a reader can check the claim at its source",
+  );
 });
 
 check("fidelity_signed is extracted from the perception the REAL pipeline delivers", () => {

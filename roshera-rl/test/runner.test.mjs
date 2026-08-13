@@ -20,6 +20,7 @@ import { runBatch } from "../lib/runner.mjs";
 import { scriptedPolicy } from "../lib/policy.mjs";
 import { defineTask } from "../lib/task.mjs";
 import { readToolResult } from "../lib/mcp_session.mjs";
+import { OUTCOMES, readTrajectory } from "../lib/trajectory.mjs";
 
 const dir = mkdtempSync(join(tmpdir(), "roshera-run-"));
 let n = 0;
@@ -112,9 +113,21 @@ check("the tally names every outcome, including the zeros", async () => {
     concurrency: 1, baseUrl, authHeader: {}, outDir: dir, kernelSha: "abc",
     spawn: fakeSpawn,
   });
-  for (const k of ["COMPLETED", "BUDGET_EXHAUSTED", "CRASHED", "SETUP_FAILED", "RATE_LIMITED"]) {
+  // ITERATE THE TAXONOMY, never a hand-copied list. The copy here named five
+  // of the six: `INVALID_ACTION` was missing, so deleting it from
+  // `runner.mjs`'s tally would have kept this check green — and a batch that
+  // silently stopped counting the outcome for "the policy left its own action
+  // space" would look like a batch in which that never happened.
+  assert.ok(OUTCOMES.length > 0, "the taxonomy is not empty");
+  for (const k of OUTCOMES) {
     assert.ok(k in tally, `${k} must appear even at zero — an absent key reads as "not measured"`);
   }
+  assert.deepEqual(
+    Object.keys(tally).sort(),
+    [...OUTCOMES].sort(),
+    "and the tally names EXACTLY the taxonomy — an extra key is an outcome the " +
+      "closed taxonomy does not define",
+  );
 });
 
 check("concurrency is a cap, not a suggestion", async () => {
@@ -159,6 +172,49 @@ check("one episode's crash does not take the batch down", async () => {
   });
   assert.equal(results.length, 2, "both episodes reported, one of them a crash");
   assert.equal(tally.CRASHED, 1);
+});
+
+check("a throwing policy FACTORY fails ONE episode, not the batch", async () => {
+  // `policyFor(...)` used to be evaluated while building `runEpisode`'s
+  // argument object — outside the `.catch` attached to its promise — so a
+  // factory that threw rejected the worker, then `Promise.all`, then the whole
+  // batch. Every other failure mode in this system is a named per-episode
+  // outcome; this one took every sibling episode down with it, including the
+  // ones that had already finished.
+  let made = 0;
+  const throwingFactory = () => {
+    made += 1;
+    if (made === 2) throw new Error("no policy registered for this task");
+    return scriptedPolicy([{ tool: "create_cylinder", args: {} }]);
+  };
+  const { results, tally } = await runBatch({
+    tasks: [task, task, task], policyFor: throwingFactory, seeds: [1, 2, 3],
+    // Serial, so the throw lands on the SECOND episode and the first is
+    // already recorded — the case where a batch-wide rejection destroys work
+    // that had completed.
+    concurrency: 1, baseUrl, authHeader: {}, outDir: dir, kernelSha: "abc",
+    spawn: fakeSpawn,
+  });
+  assert.equal(results.length, 3, "all three episodes reported — the batch did not die");
+  assert.equal(tally.SETUP_FAILED, 1, "the failing one is SETUP_FAILED: no session ever existed");
+  assert.equal(tally.COMPLETED, 2, "and its siblings kept their outcomes");
+  const failed = results.find((r) => r.outcome === "SETUP_FAILED");
+  assert.match(
+    failed.error,
+    /policy/i,
+    `the reason must name the policy factory, not a generic setup failure — got ${JSON.stringify(failed.error)}`,
+  );
+  assert.ok(
+    failed.error.includes("no policy registered for this task"),
+    "and carry the factory's own message",
+  );
+  assert.equal(failed.documentId, null, "no document was created, so none is claimed");
+  // Every episode has a record: the trajectory is what a batch is read from
+  // afterwards, and a result pointing at a file that was never written is a
+  // failure nobody can diagnose without re-running the batch.
+  const { terminal } = readTrajectory(failed.trajectoryPath);
+  assert.equal(terminal.outcome, "SETUP_FAILED");
+  assert.ok(terminal.error.includes("no policy registered for this task"));
 });
 
 check("THE REAPER retries a DELETE the episode could not land", async () => {

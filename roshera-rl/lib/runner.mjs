@@ -9,9 +9,10 @@
  */
 import { join } from "node:path";
 import { mkdirSync } from "node:fs";
-import { runEpisode, reapDocument } from "./episode.mjs";
-import { OUTCOMES } from "./trajectory.mjs";
+import { runEpisode, reapDocument, unscoredFor, MCP_VERSION } from "./episode.mjs";
+import { OUTCOMES, openTrajectory } from "./trajectory.mjs";
 import { spawnMcpSession } from "./mcp_session.mjs";
+import { mergeFinal } from "./reward.mjs";
 
 /**
  * THE REAPER — the batch-level backstop `episode.mjs` names.
@@ -44,6 +45,56 @@ export async function reapOrphans({ baseUrl, authHeader, results }) {
   return orphans;
 }
 
+/**
+ * The record for an episode whose POLICY FACTORY threw — the one failure that
+ * happens before `runEpisode` is entered, so `runEpisode` cannot record it.
+ *
+ * `SETUP_FAILED`, not `CRASHED`: the taxonomy is closed (trajectory.mjs
+ * OUTCOMES — a new category is a design change, not a typo), and of the six,
+ * SETUP_FAILED is the one that means "no episode happened". `CRASHED` says the
+ * MCP process died, and here no process was ever spawned — no document was
+ * created either, which is why `documentId` is null and nothing is reaped.
+ *
+ * A TRAJECTORY IS STILL WRITTEN. A batch is read afterwards from its
+ * trajectories, so a result carrying a `trajectoryPath` that no file backs is
+ * an episode nobody can diagnose without re-running the batch — the same
+ * defect the `error` field was added to `close()` to fix. The header/terminal
+ * pair here is the same shape every other SETUP_FAILED episode writes, built
+ * from the same `unscoredFor` so the two cannot drift.
+ */
+function policyFactoryFailed({ item, trajectoryPath, kernelSha, error }) {
+  const detail = `the policy factory threw before the episode began: ${error}`;
+  const rewardFinal = mergeFinal([]);
+  const { claims, recipeRef } = unscoredFor(item.task, "SETUP_FAILED", detail);
+  try {
+    const traj = openTrajectory({
+      path: trajectoryPath, taskId: item.task.id, seed: item.seed, kernelSha,
+      mcpVersion: MCP_VERSION, toolAllowlist: [...item.task.toolAllowlist],
+      split: item.task.split,
+    });
+    traj.close({
+      outcome: "SETUP_FAILED", rewardFinal, claims, recipeRef,
+      tokens: 0, wallMs: 0, error: detail,
+    });
+  } catch (e) {
+    // An unwritable outDir must not turn one episode's setup failure into a
+    // dead batch — that is the very defect this function exists to remove. The
+    // returned result still carries the reason, and says the record is missing
+    // rather than leaving a dangling path unexplained.
+    return {
+      outcome: "SETUP_FAILED", rewardFinal, documentId: null,
+      trajectoryPath: null, wallMs: 0,
+      error: `${detail} (and its trajectory could not be written: ${String(e?.message ?? e)})`,
+      reap: { reaped: null, reason: "no document was created" },
+    };
+  }
+  return {
+    outcome: "SETUP_FAILED", rewardFinal, documentId: null, trajectoryPath,
+    wallMs: 0, error: detail,
+    reap: { reaped: null, reason: "no document was created" },
+  };
+}
+
 export async function runBatch({
   tasks, policyFor, seeds, concurrency = 4, baseUrl, authHeader = {},
   outDir, kernelSha, mcpEntry, spawn = spawnMcpSession,
@@ -57,10 +108,28 @@ export async function runBatch({
       const item = queue.shift();
       if (item === undefined) return;
       const trajectoryPath = join(outDir, `${item.task.id}-${item.seed}-${item.i}.jsonl`);
+      // THE POLICY FACTORY IS THIRD-PARTY CODE AND RUNS BEFORE THE EPISODE.
+      // It used to be called while building `runEpisode`'s argument object,
+      // i.e. outside the `.catch` below: a factory that threw rejected this
+      // worker, then `Promise.all`, then the whole batch — taking down every
+      // sibling episode, including ones that had already finished and been
+      // recorded. Every other failure mode here is a named per-episode
+      // outcome, and this one now is too.
+      let policy;
+      try {
+        policy = policyFor(item.task, item.seed);
+      } catch (e) {
+        results.push(
+          policyFactoryFailed({
+            item, trajectoryPath, kernelSha, error: String(e?.message ?? e),
+          }),
+        );
+        continue;
+      }
       // An episode never throws: every failure mode is a named outcome. A
       // worker that could die on one episode would silently shrink the batch.
       const r = await runEpisode({
-        task: item.task, policy: policyFor(item.task, item.seed), seed: item.seed,
+        task: item.task, policy, seed: item.seed,
         baseUrl, authHeader, trajectoryPath, kernelSha, mcpEntry, spawn,
       }).catch((e) => ({
         outcome: "CRASHED", rewardFinal: { components: {}, gaps: [] },
