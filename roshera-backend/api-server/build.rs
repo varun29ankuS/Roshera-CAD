@@ -25,12 +25,20 @@
 //!   exact defect this feature exists to eliminate, reintroduced by its own
 //!   implementation. (This bug shipped once; this comment and the extra
 //!   `rerun-if-changed` lines are the fix.)
-//! - `.git/refs` (directory, watched recursively per cargo's own docs) —
+//! - `.git/refs/heads` (directory, watched recursively per cargo's own docs) —
 //!   `.git/refs/heads/<branch>` is the file an ordinary commit on that branch
 //!   actually updates. Watching the directory catches that update directly,
 //!   independent of whether reflogs are enabled (`core.logAllRefUpdates`),
 //!   and also covers merges/rebases that fast-forward a ref without an
-//!   intervening checkout.
+//!   intervening checkout. Narrowed from the whole of `.git/refs`, which is
+//!   watched recursively and therefore also covers `.git/refs/remotes/*`: a
+//!   routine `git fetch` moves remote-tracking refs that have nothing to do
+//!   with this binary's HEAD and forced a `build.rs` re-run plus a crate
+//!   rebuild every time. `refs/heads` is what the argument above actually
+//!   needs, so nothing stated here is lost by narrowing to it. (Local tags
+//!   under `refs/tags` are equally unwatched now — tagging does not move HEAD
+//!   and does not change what `git rev-parse HEAD` reports, so it is not a
+//!   capture this script has any reason to re-trigger on.)
 //!
 //! KNOWN GAP, stated rather than hidden: if refs get packed by `git gc` /
 //! `git pack-refs`, a *packed* ref lives in `.git/packed-refs`, outside
@@ -60,7 +68,7 @@ fn main() {
     println!("cargo:rerun-if-changed=../../.git/HEAD");
     println!("cargo:rerun-if-changed=../../.git/index");
     println!("cargo:rerun-if-changed=../../.git/logs/HEAD");
-    println!("cargo:rerun-if-changed=../../.git/refs");
+    println!("cargo:rerun-if-changed=../../.git/refs/heads");
 
     let sha = Command::new("git")
         .args(["rev-parse", "--short", "HEAD"])
