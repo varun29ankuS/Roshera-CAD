@@ -51,6 +51,7 @@ const key = process.env.ROSHERA_API_KEY;
 const concurrency = positiveInt("concurrency", "4");
 const outDir = arg("out", "./runs");
 const repeats = positiveInt("repeats", "1");
+const noIngest = process.argv.includes("--no-ingest");
 
 const tasks = [];
 const seeds = [];
@@ -63,6 +64,16 @@ for (let r = 0; r < repeats; r += 1) {
 // production run never reads it, and the default remains the real stdio client.
 const testSpawn = process.env.ROSHERA_RL_TEST_SPAWN
   ? globalThis.__roshera_rl_test_spawn
+  : undefined;
+
+// Same seam, for ingestion. The wiring test drives this real entry point
+// with an injected fake ingester against no database at all, so the
+// override is reachable ONLY through this explicit test env flag; a
+// production run always falls through to the real `runIngest`
+// (bin/ingest.mjs), imported lazily so importing run-batch.mjs never pulls
+// in `pg` for a run that passes `--no-ingest`.
+const testIngest = process.env.ROSHERA_RL_TEST_INGEST
+  ? globalThis.__roshera_rl_test_ingest
   : undefined;
 
 const { tally, results, orphans } = await runBatch({
@@ -134,6 +145,34 @@ if (orphans.length) {
   for (const o of orphans) {
     const what = o.documentId ? `document ${o.documentId}` : `part ${o.partId}`;
     process.stdout.write(`  ${what}  ${o.reason}\n`);
+  }
+}
+
+/**
+ * Ingestion into Postgres, run AFTER the batch and reported but never
+ * allowed to fail it: `results`/`tally`/`orphans` above are already
+ * complete by the time this runs (the runner wrote every episode's JSONL
+ * itself, lib/episode.mjs), so JSONL on disk is already the full, correct
+ * record. A database that is down, unreachable, or rejects a row costs
+ * nobody a trajectory — it costs a line in this run's own output, which is
+ * exactly what `lastIngest` exists to make assertable rather than
+ * swallowed. `--no-ingest` skips the attempt outright (no ROSHERA_RL_PG in
+ * this environment, or a deliberate dry run).
+ */
+export let lastIngest = { ran: false };
+if (!noIngest) {
+  const ingest = testIngest
+    ?? ((dir) => import("./ingest.mjs").then((m) => m.runIngest({ dir })));
+  try {
+    const result = await ingest(outDir);
+    lastIngest = { ran: true, ok: true, result };
+    const n = result?.results?.length ?? 0;
+    process.stdout.write(`\ningest: ${n} file(s) from ${outDir}\n`);
+  } catch (e) {
+    // Surfaced, never silent: stderr says the database step failed, but
+    // nothing above this block changes, and nothing below throws.
+    lastIngest = { ran: true, ok: false, error: e?.message ?? String(e) };
+    process.stderr.write(`\n⚠ ingest failed (batch still succeeded): ${lastIngest.error}\n`);
   }
 }
 

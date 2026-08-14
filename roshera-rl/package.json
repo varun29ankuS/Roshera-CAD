@@ -5,9 +5,11 @@
   "type": "module",
   "private": true,
   "scripts": {
-    "test": "node test/trajectory.test.mjs && node test/mcp_session.test.mjs && node test/reward.test.mjs && node test/task.test.mjs && node test/policy.test.mjs && node test/episode.test.mjs && node test/runner.test.mjs && node test/part_isolation.test.mjs && node test/wiring.test.mjs && node test/provenance.test.mjs && node test/ingest_rows.test.mjs && node test/ingest_store.test.mjs",
+    "test": "node test/trajectory.test.mjs && node test/mcp_session.test.mjs && node test/reward.test.mjs && node test/task.test.mjs && node test/policy.test.mjs && node test/episode.test.mjs && node test/runner.test.mjs && node test/part_isolation.test.mjs && node test/wiring.test.mjs && node test/provenance.test.mjs && node test/ingest_rows.test.mjs && node test/ingest_store.test.mjs && node test/ingest_wiring.test.mjs",
     "test:isolation": "node test/runner.test.mjs && node test/part_isolation.test.mjs",
-    "batch": "node bin/run-batch.mjs"
+    "batch": "node bin/run-batch.mjs",
+    "ingest": "node bin/ingest.mjs",
+    "ingest:verify": "node bin/ingest.mjs --verify"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",

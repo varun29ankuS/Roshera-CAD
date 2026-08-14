@@ -81,7 +81,14 @@ check("the entry point actually drives runBatch over the seed tasks", async () =
     };
   };
   const outDir = mkdtempSync(join(tmpdir(), "roshera-wiring-"));
-  process.argv = [process.argv[0], bin, "--out", outDir, "--concurrency", "1"];
+  // `--no-ingest`: this suite proves the RUNNER is driven, not ingestion (that
+  // is `ingest_wiring.test.mjs`'s job). Without this flag, an unset
+  // ROSHERA_RL_TEST_INGEST falls through to the REAL `runIngest`, and on any
+  // machine where ROSHERA_RL_PG happens to be set (ingest_store.test.mjs's own
+  // documented setup), this stub batch would really ingest episodes from a
+  // directory this test then `rmSync`s — leaving `verify()` reporting those
+  // paths as permanently unreadable in a real, shared database.
+  process.argv = [process.argv[0], bin, "--out", outDir, "--concurrency", "1", "--no-ingest"];
 
   const mod = await import(pathToFileURL(bin).href + `?t=${Date.now()}`);
   assert.ok(Array.isArray(mod.lastRun?.results), "the entry point exported its run result");
