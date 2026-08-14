@@ -59,9 +59,25 @@ use crate::types::{Author, BranchId, Operation, TimelineEvent};
 /// introduced. A `persist` error is logged loudly by the worker and never
 /// crashes it — the in-memory timeline is still correct; only durability of that
 /// one event is at risk (surfaced honestly, never silently).
+///
+/// # Why `document` is a parameter and not something the sink looks up
+///
+/// The document an event belongs to is the sink's SCOPING KEY, and it belongs
+/// to the REQUEST that triggered the operation — not to whatever document
+/// happens to be process-globally active when the drain worker gets around to
+/// the row. The worker runs on a different task from the request, so it cannot
+/// read a request-scoped value itself; [`TimelineRecorder::record`] snapshots
+/// [`DOCUMENT_OVERRIDE`] on the request task and carries the answer here, for
+/// exactly the reason the author is carried on [`RecorderCmd::Op`].
+///
+/// `None` means "this request stated no document" — the honest absence, and the
+/// signal for the sink to fall back to its own ambient notion of the active
+/// document at persist time. Every pre-existing caller (the viewport, the
+/// WebSocket surface, every REST client that sends no binding header) takes
+/// that path and behaves byte-for-byte as before.
 #[async_trait::async_trait]
 pub trait EventSink: Send + Sync {
-    async fn persist(&self, event: &TimelineEvent) -> Result<(), String>;
+    async fn persist(&self, event: &TimelineEvent, document: Option<&str>) -> Result<(), String>;
 }
 
 /// Bounded channel capacity for the recorder MPSC. Sized to absorb the
@@ -84,6 +100,16 @@ enum RecorderCmd {
         /// by the worker so attribution is exact even when ops from
         /// differently-authored request tasks interleave in the channel.
         author: Author,
+        /// Document snapshotted at `record()` time from [`DOCUMENT_OVERRIDE`],
+        /// carried for exactly the reason `author` is: the worker persists on
+        /// a DIFFERENT task, where the task-local of whatever request happens
+        /// to be live would be read — one episode's cylinder filed under
+        /// another episode's document, confidently wrong.
+        ///
+        /// `None` = the request stated no document. The sink then falls back
+        /// to its own ambient active document, at persist time, exactly as it
+        /// always did.
+        document: Option<String>,
     },
     Flush(oneshot::Sender<()>),
 }
@@ -156,6 +182,35 @@ tokio::task_local! {
     /// request's channel onto another's op, producing provenance that is
     /// confidently wrong — worse than the honest `Origin::NotDetermined`.
     pub static ORIGIN_OVERRIDE: Origin;
+}
+
+tokio::task_local! {
+    /// Per-task DOCUMENT override consulted by [`TimelineRecorder::record`] —
+    /// the fourth attribution dimension, and the one that governs WHERE an
+    /// event is persisted rather than how it is labelled.
+    ///
+    /// The api-server's durability sink keys every row by the process-global
+    /// `AppState.active_document`, whose ONE writer is
+    /// `POST /api/documents/{id}/open`. That is right for the viewport's
+    /// document tabs — a process-wide act with a process-wide effect — and
+    /// wrong for a client that states its document per request via
+    /// `X-Roshera-Document`. An agent that registers a document (registration
+    /// deliberately does not activate) and builds into it had every event
+    /// filed under whatever document was globally active, so a read scoped to
+    /// its OWN document honestly returned nothing.
+    ///
+    /// The sink cannot fix this itself: it runs on the drain worker, a
+    /// different task from the request, where no request-scoped value is
+    /// visible. So the api-server's `document_scope_layer` scopes this
+    /// task-local from the header, [`TimelineRecorder::record`] snapshots it
+    /// synchronously on the request task, and the value travels with the op —
+    /// the same shape `AUTHOR_OVERRIDE` uses, for the same reason.
+    ///
+    /// **No scope → no override.** The absence is honest and load-bearing:
+    /// the sink then reads its ambient active document at persist time,
+    /// byte-for-byte the previous behaviour for every client that sends no
+    /// binding header.
+    pub static DOCUMENT_OVERRIDE: String;
 }
 
 /// Shared, lock-protected handle to a [`Timeline`].
@@ -263,11 +318,11 @@ struct StagingState {
     /// flush or discard the buffer.
     depth: u32,
     /// Events recorded while `depth > 0`, each paired with the author
-    /// snapshotted at `record()` time (the commit drain may run on a
-    /// different task than the records, so resolving the author at
-    /// drain time would lose the per-request override). Drained to the
+    /// AND the document snapshotted at `record()` time (the commit drain
+    /// may run on a different task than the records, so resolving either
+    /// at drain time would lose the per-request override). Drained to the
     /// MPSC on commit; cleared on abort.
-    buffer: Vec<(RecordedOperation, Author)>,
+    buffer: Vec<(RecordedOperation, Author, Option<String>)>,
     /// Nesting depth for `begin_discard_scope`/`end_discard_scope` — a
     /// SEPARATE counter from `depth`. A `begin_pending` scope may still
     /// commit (its buffered events reach the timeline), so records inside
@@ -370,7 +425,11 @@ impl TimelineRecorder {
         tokio::spawn(async move {
             while let Some(cmd) = rx.recv().await {
                 match cmd {
-                    RecorderCmd::Op { record, author } => {
+                    RecorderCmd::Op {
+                        record,
+                        author,
+                        document,
+                    } => {
                         let op = to_timeline_operation(&record);
                         // Project the kernel proof the recording handler
                         // attached at record time into the per-event
@@ -427,7 +486,16 @@ impl TimelineRecorder {
                                     let persisted = guard.get_event(event_id);
                                     drop(guard);
                                     if let Some(event) = persisted {
-                                        if let Err(err) = sink.persist(&event).await {
+                                        // The document travels WITH the op
+                                        // (see `RecorderCmd::Op::document`):
+                                        // reading a task-local here would read
+                                        // whatever request is live on this
+                                        // worker task, not the one that
+                                        // recorded. `None` leaves the sink on
+                                        // its ambient fallback, unchanged.
+                                        if let Err(err) =
+                                            sink.persist(&event, document.as_deref()).await
+                                        {
                                             tracing::error!(
                                                 target: "timeline.recorder_bridge",
                                                 kind = %record.kind,
@@ -487,11 +555,13 @@ impl TimelineRecorder {
         &self,
         operation: RecordedOperation,
         author: Author,
+        document: Option<String>,
     ) -> Result<(), RecorderError> {
         self.tx
             .try_send(RecorderCmd::Op {
                 record: operation,
                 author,
+                document,
             })
             .map_err(|e| match e {
                 mpsc::error::TrySendError::Full(_) => RecorderError::Unavailable(format!(
@@ -569,6 +639,14 @@ impl OperationRecorder for TimelineRecorder {
         let author = AUTHOR_OVERRIDE
             .try_with(Clone::clone)
             .unwrap_or_else(|_| self.author.clone());
+        // Snapshot the request's document NOW, on the recording task, for the
+        // same reason: the drain worker that persists this event runs on a
+        // different task and would read whatever request is live THERE. No
+        // scope on this task → `None`, and the sink stays on the ambient
+        // active document it has always used — the fallback is what keeps
+        // this purely additive for the viewport, the WebSocket surface and
+        // every REST client that sends no binding header.
+        let document = DOCUMENT_OVERRIDE.try_with(Clone::clone).ok();
         // Stamp the request's open intent NOW, on the recording task, for
         // exactly the reason the author is resolved here and not on the
         // drain worker: the worker runs on a different task, where the
@@ -666,7 +744,7 @@ impl OperationRecorder for TimelineRecorder {
                 }
             }
             if state.depth > 0 {
-                state.buffer.push((operation, author));
+                state.buffer.push((operation, author, document));
                 return Ok(());
             }
         }
@@ -677,7 +755,7 @@ impl OperationRecorder for TimelineRecorder {
         // behind) and `Closed` if the worker has exited. Both surface
         // as `Unavailable` so the kernel's `record_operation` helper
         // logs loudly and continues; silent event loss is forbidden.
-        self.try_send_op(operation, author)
+        self.try_send_op(operation, author, document)
     }
 
     fn begin_pending(&self) {
@@ -709,8 +787,8 @@ impl OperationRecorder for TimelineRecorder {
                 Vec::new()
             }
         };
-        for (op, author) in drained {
-            if let Err(err) = self.try_send_op(op, author) {
+        for (op, author, document) in drained {
+            if let Err(err) = self.try_send_op(op, author, document) {
                 tracing::warn!(
                     target: "timeline.recorder_bridge",
                     error = %err,
@@ -2045,6 +2123,203 @@ mod tests {
         }
     }
 
+    // =================================================================
+    // DOCUMENT SCOPE — where an event is PERSISTED, not how it is labelled
+    // =================================================================
+
+    /// A capturing [`EventSink`] that remembers the `(kind, document)` pair
+    /// the drain worker handed it. The document never lands on the event
+    /// itself (it is the sink's scoping key, not event content), so this is
+    /// the only place it is observable at this layer.
+    #[derive(Default)]
+    struct CapturingSink {
+        persisted: Arc<PlRwLock<Vec<(String, Option<String>)>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl EventSink for CapturingSink {
+        async fn persist(
+            &self,
+            event: &TimelineEvent,
+            document: Option<&str>,
+        ) -> Result<(), String> {
+            let kind = match &event.operation {
+                Operation::Generic { command_type, .. } => command_type.clone(),
+                other => format!("{other:?}"),
+            };
+            self.persisted
+                .write()
+                .push((kind, document.map(str::to_owned)));
+            Ok(())
+        }
+    }
+
+    /// Poll until the sink has seen `n` events, or give up.
+    async fn persisted_pairs(
+        seen: &Arc<PlRwLock<Vec<(String, Option<String>)>>>,
+        n: usize,
+    ) -> Vec<(String, Option<String>)> {
+        for _ in 0..100 {
+            if seen.read().len() >= n {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        seen.read().clone()
+    }
+
+    /// THE DOCUMENT CROSS-ATTRIBUTION PIN — the reason this is a task-local
+    /// and not `AppState`, a `DashMap`, or the process-global
+    /// `active_document` the sink used to read. Two concurrent recording
+    /// tasks, each inside its OWN `DOCUMENT_OVERRIDE` scope naming a
+    /// DIFFERENT document, both record before the drain worker applies
+    /// either (driven via the timeline write lock, not hoped for). Each
+    /// event must be persisted under ITS OWN document.
+    ///
+    /// This is the concurrency-8 RL episode case: eight episodes building
+    /// simultaneously through one process-wide recorder. An ambient read on
+    /// the drain worker files one episode's cylinder under another episode's
+    /// document — a write that is confidently wrong rather than absent, and
+    /// unrecoverable once the row is on disk.
+    #[tokio::test(flavor = "current_thread")]
+    async fn concurrent_tasks_with_different_documents_never_cross_attribute() {
+        let timeline: SharedTimeline =
+            Arc::new(RwLock::new(Timeline::new(TimelineConfig::default())));
+        let seen: Arc<PlRwLock<Vec<(String, Option<String>)>>> =
+            Arc::new(PlRwLock::new(Vec::new()));
+        let sink: Arc<dyn EventSink> = Arc::new(CapturingSink {
+            persisted: Arc::clone(&seen),
+        });
+        let recorder = TimelineRecorder::new_with_sink(
+            Arc::clone(&timeline),
+            Author::System,
+            BranchId::main(),
+            sink,
+        );
+
+        // Pin the drain worker exactly as the intent/origin tests do: hold
+        // the write lock so both records are queued before either is applied.
+        let write_guard = timeline.write().await;
+
+        let alpha_recorder = recorder.clone();
+        let alpha = tokio::spawn(
+            DOCUMENT_OVERRIDE.scope("doc-alpha".to_string(), async move {
+                alpha_recorder
+                    .record(RecordedOperation::new("op-alpha"))
+                    .expect("record op-alpha inside alpha's document scope");
+            }),
+        );
+        let beta_recorder = recorder.clone();
+        let beta = tokio::spawn(DOCUMENT_OVERRIDE.scope("doc-beta".to_string(), async move {
+            beta_recorder
+                .record(RecordedOperation::new("op-beta"))
+                .expect("record op-beta inside beta's document scope");
+        }));
+        alpha.await.expect("alpha task completes");
+        beta.await.expect("beta task completes");
+
+        drop(write_guard);
+        drop(recorder);
+
+        let pairs = persisted_pairs(&seen, 2).await;
+        assert_eq!(pairs.len(), 2, "both concurrent records reach the sink");
+
+        for (kind, expected) in [("op-alpha", "doc-alpha"), ("op-beta", "doc-beta")] {
+            let (_, document) = pairs
+                .iter()
+                .find(|(k, _)| k == kind)
+                .unwrap_or_else(|| panic!("{kind} must have been persisted"));
+            assert_eq!(
+                document.as_deref(),
+                Some(expected),
+                "{kind} must be persisted under ITS OWN document, never the \
+                 concurrent task's — a mis-keyed durable write is unreadable \
+                 by the client that made it and invisible to the one it \
+                 landed on"
+            );
+        }
+    }
+
+    /// THE ABSENCE PIN, and the whole additive guarantee: an op recorded with
+    /// NO `DOCUMENT_OVERRIDE` scope must reach the sink with `None`, so the
+    /// sink falls back to its own ambient active document at persist time —
+    /// byte-for-byte the pre-change behaviour every unbound client (the
+    /// viewport, the WebSocket surface, the eval harness) depends on. A
+    /// fabricated default here would silently retarget all of them.
+    #[tokio::test]
+    async fn an_unscoped_record_carries_no_document_and_leaves_the_fallback_to_the_sink() {
+        let timeline: SharedTimeline =
+            Arc::new(RwLock::new(Timeline::new(TimelineConfig::default())));
+        let seen: Arc<PlRwLock<Vec<(String, Option<String>)>>> =
+            Arc::new(PlRwLock::new(Vec::new()));
+        let sink: Arc<dyn EventSink> = Arc::new(CapturingSink {
+            persisted: Arc::clone(&seen),
+        });
+        let recorder = TimelineRecorder::new_with_sink(
+            Arc::clone(&timeline),
+            Author::System,
+            BranchId::main(),
+            sink,
+        );
+
+        recorder
+            .record(RecordedOperation::new("op-unbound"))
+            .expect("record outside any document scope");
+        drop(recorder);
+
+        let pairs = persisted_pairs(&seen, 1).await;
+        assert_eq!(pairs.len(), 1, "the unbound record reaches the sink");
+        assert_eq!(
+            pairs[0].1, None,
+            "an op recorded with no document scope must carry NO document — \
+             the honest absence is what routes it to the sink's ambient \
+             active document, exactly as before"
+        );
+    }
+
+    /// A staged (`with_rollback`) record must keep the document it was
+    /// recorded under, even though `commit_pending` drains the buffer later
+    /// and possibly on a different task. Same reason the buffer already
+    /// carries the author: resolving either at drain time loses the
+    /// per-request override, and a composite operation would be filed under
+    /// whatever request happened to be live at commit.
+    #[tokio::test]
+    async fn a_staged_record_keeps_the_document_it_was_recorded_under() {
+        let timeline: SharedTimeline =
+            Arc::new(RwLock::new(Timeline::new(TimelineConfig::default())));
+        let seen: Arc<PlRwLock<Vec<(String, Option<String>)>>> =
+            Arc::new(PlRwLock::new(Vec::new()));
+        let sink: Arc<dyn EventSink> = Arc::new(CapturingSink {
+            persisted: Arc::clone(&seen),
+        });
+        let recorder = TimelineRecorder::new_with_sink(
+            Arc::clone(&timeline),
+            Author::System,
+            BranchId::main(),
+            sink,
+        );
+
+        let staged_recorder = recorder.clone();
+        DOCUMENT_OVERRIDE
+            .scope("doc-staged".to_string(), async move {
+                staged_recorder.begin_pending();
+                staged_recorder
+                    .record(RecordedOperation::new("op-staged"))
+                    .expect("record inside the staging window");
+                staged_recorder.commit_pending();
+            })
+            .await;
+        drop(recorder);
+
+        let pairs = persisted_pairs(&seen, 1).await;
+        assert_eq!(pairs.len(), 1, "the committed record reaches the sink");
+        assert_eq!(
+            pairs[0].1.as_deref(),
+            Some("doc-staged"),
+            "a staged record must be persisted under the document it was \
+             RECORDED under, not one resolved at commit time"
+        );
+    }
     /// THE REPLAY-NON-RELABELLING PIN. `create_box_3d` is a genuinely
     /// dispatchable replay kind, recorded through a REAL `TimelineRecorder`
     /// attached to a REAL `BRepModel` (not a hand-built `RecordedOperation`)

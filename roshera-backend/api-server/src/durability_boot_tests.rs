@@ -2041,3 +2041,270 @@ async fn suppressed_build_fillet_edge_pid_survives_reboot() {
          before = {fp_before:?}, after = {fp_after:?}"
     );
 }
+
+// =====================================================================
+// (j) THE WRITE KEY IS THE REQUEST'S DOCUMENT, NOT THE PROCESS-GLOBAL ONE
+//
+// RED-first for the durability document-scope defect (diagnosed in
+// `.superpowers/sdd/2026-08-13-rl-episode-loop-slice1/durability-seam-diagnosis.md`).
+//
+// The read side of a recipe is scoped to the caller's document id
+// (`handlers::timeline::get_recipe` -> `load_all_timeline_events(&reference)`).
+// The write side was scoped to `AppState.active_document` — a process-global
+// cell whose ONE writer is `POST /api/documents/{id}/open`. An agent that
+// registers a document (`POST /api/documents`, which deliberately does NOT
+// activate) and then states it per request via `X-Roshera-Document` had every
+// event, checkpoint and branch persisted under whatever document happened to
+// be globally active. The read then honestly found zero rows in its OWN
+// document — the RL episode loop's `step_count: 0`.
+//
+// Each test below asserts BOTH directions: the rows land under the bound
+// document AND the globally-active document is untouched. The second half is
+// what makes these mutation-proof — a fix that wrote to both documents would
+// pass the first assertion alone.
+// =====================================================================
+
+/// The binding header spelled out on the WIRE, deliberately not
+/// `documents::DOCUMENT_HEADER`: these pin the contract a client actually
+/// sends, so renaming the constant cannot quietly rename the header out from
+/// under the MCP client.
+const DOCUMENT_HEADER_WIRE: &str = "x-roshera-document";
+
+/// `post`, bound to one document for the life of the request.
+fn post_bound(uri: &str, payload: Value, document: &str) -> Request<Body> {
+    Request::builder()
+        .method(Method::POST)
+        .uri(uri)
+        .header("content-type", "application/json")
+        .header(DOCUMENT_HEADER_WIRE, document)
+        .body(Body::from(payload.to_string()))
+        .expect("request must build")
+}
+
+/// Register a document through the live route WITHOUT opening it — exactly
+/// what an RL episode does, and the reason the two keys never coincide.
+async fn register_unopened_document(state: &AppState, name: &str) -> String {
+    let (status, body) = dispatch(state, post("/api/documents", json!({ "name": name }))).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "document registration must succeed; body = {body}"
+    );
+    let id = body["id"]
+        .as_str()
+        .expect("a registered document must carry an id")
+        .to_string();
+    assert_eq!(
+        *state.active_document.read().await,
+        durability::DURABILITY_SESSION_ID,
+        "registration must NOT activate — the whole defect depends on this \
+         staying the default document"
+    );
+    id
+}
+
+/// THE RED: a kernel op recorded under a request bound to document A must be
+/// persisted under document A, retrievable by the read path that scopes to A.
+#[tokio::test]
+async fn recorded_events_persist_under_the_request_bound_document() {
+    let path = temp_db_path();
+    let db = open_db(&path).await;
+    let state = build_state(db.clone(), true).await;
+    let doc_a = register_unopened_document(&state, "Episode A").await;
+
+    let (s, body) = dispatch(
+        &state,
+        post_bound(
+            "/api/geometry/box",
+            json!({ "width": 10.0, "depth": 10.0, "height": 10.0 }),
+            &doc_a,
+        ),
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "bound box create must succeed; body = {body}"
+    );
+
+    // Durability barrier: the drain worker persists before it dequeues the
+    // Flush sentinel, so every event is on disk once this returns.
+    state
+        .timeline_recorder
+        .flush()
+        .await
+        .expect("recorder flush must succeed");
+
+    let in_a = db
+        .load_all_timeline_events(&doc_a)
+        .await
+        .expect("the bound document's log must be readable");
+    assert!(
+        !in_a.is_empty(),
+        "an op recorded under a request bound to {doc_a} must be persisted \
+         under {doc_a} — that is the read key `get_recipe` uses, and an empty \
+         log here IS the `step_count: 0` defect"
+    );
+
+    let in_global = db
+        .load_all_timeline_events(durability::DURABILITY_SESSION_ID)
+        .await
+        .expect("the default document's log must be readable");
+    assert!(
+        in_global.is_empty(),
+        "the globally-active document must be UNTOUCHED by a write bound \
+         elsewhere; it received {} event(s), which is the mis-keyed write this \
+         test exists to catch",
+        in_global.len()
+    );
+}
+
+/// The same defect, one layer up: a checkpoint created under a bound request
+/// must be persisted under the bound document. Without this, `checkpoints: []`
+/// persists as a subtler version of the same bug — an episode's very first
+/// action is a checkpoint.
+#[tokio::test]
+async fn checkpoints_persist_under_the_request_bound_document() {
+    let path = temp_db_path();
+    let db = open_db(&path).await;
+    let state = build_state(db.clone(), true).await;
+    let doc_a = register_unopened_document(&state, "Episode A").await;
+
+    let (s, body) = dispatch(
+        &state,
+        post_bound(
+            "/api/timeline/checkpoint",
+            json!({ "name": "bore D20 through the 40 mm plate, centred" }),
+            &doc_a,
+        ),
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::CREATED,
+        "bound checkpoint create must succeed; body = {body}"
+    );
+
+    let in_a = db
+        .load_checkpoints(&doc_a)
+        .await
+        .expect("the bound document's checkpoints must be readable");
+    assert_eq!(
+        in_a.len(),
+        1,
+        "a checkpoint declared under a request bound to {doc_a} must be \
+         persisted under {doc_a}"
+    );
+
+    let in_global = db
+        .load_checkpoints(durability::DURABILITY_SESSION_ID)
+        .await
+        .expect("the default document's checkpoints must be readable");
+    assert!(
+        in_global.is_empty(),
+        "the globally-active document must receive NO checkpoint from a \
+         request bound elsewhere; it received {}",
+        in_global.len()
+    );
+}
+
+/// And the third write site: a branch record created under a bound request.
+/// Keyed identically or a bound document's non-`main` branches cannot be
+/// re-established on boot.
+#[tokio::test]
+async fn branch_records_persist_under_the_request_bound_document() {
+    let path = temp_db_path();
+    let db = open_db(&path).await;
+    let state = build_state(db.clone(), true).await;
+    let doc_a = register_unopened_document(&state, "Episode A").await;
+
+    let (s, body) = dispatch(
+        &state,
+        post_bound(
+            "/api/branches",
+            json!({ "name": "thinner web trial" }),
+            &doc_a,
+        ),
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "bound branch create must succeed; body = {body}"
+    );
+
+    let in_a = db
+        .load_branches(&doc_a)
+        .await
+        .expect("the bound document's branches must be readable");
+    assert_eq!(
+        in_a.len(),
+        1,
+        "a branch forked under a request bound to {doc_a} must be persisted \
+         under {doc_a}"
+    );
+
+    let in_global = db
+        .load_branches(durability::DURABILITY_SESSION_ID)
+        .await
+        .expect("the default document's branches must be readable");
+    assert!(
+        in_global.is_empty(),
+        "the globally-active document must receive NO branch record from a \
+         request bound elsewhere; it received {}",
+        in_global.len()
+    );
+}
+
+/// BACKWARD COMPATIBILITY, pinned: no header -> the process-global document,
+/// byte-for-byte the previous behaviour. The viewport, the WebSocket surface,
+/// the eval harness and every existing REST client send no such header, so
+/// this is the path almost all live traffic still takes. This test PASSES
+/// before the fix — it is the additive guarantee, not the RED.
+#[tokio::test]
+async fn unbound_writes_still_land_in_the_globally_active_document() {
+    let path = temp_db_path();
+    let db = open_db(&path).await;
+    let state = build_state(db.clone(), true).await;
+    let doc_a = register_unopened_document(&state, "Episode A").await;
+
+    let (s, body) = dispatch(
+        &state,
+        post(
+            "/api/geometry/box",
+            json!({ "width": 10.0, "depth": 10.0, "height": 10.0 }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "unbound box create must succeed; body = {body}"
+    );
+    state
+        .timeline_recorder
+        .flush()
+        .await
+        .expect("recorder flush must succeed");
+
+    let in_global = db
+        .load_all_timeline_events(durability::DURABILITY_SESSION_ID)
+        .await
+        .expect("the default document's log must be readable");
+    assert!(
+        !in_global.is_empty(),
+        "with NO binding header the event must land in the globally-active \
+         document exactly as it always has"
+    );
+
+    let in_a = db
+        .load_all_timeline_events(&doc_a)
+        .await
+        .expect("the registered document's log must be readable");
+    assert!(
+        in_a.is_empty(),
+        "an unbound write must not leak into a merely-registered document; \
+         {doc_a} received {} event(s)",
+        in_a.len()
+    );
+}

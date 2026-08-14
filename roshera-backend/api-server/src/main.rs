@@ -11159,6 +11159,12 @@ pub(crate) fn build_router(state: AppState) -> Router {
         // `not_determined`. See `agent_origin_layer`'s doc for how `mcp`
         // vs `rest` is decided.
         .layer(axum::middleware::from_fn(agent_origin_layer))
+        // Document scope: WHICH DOCUMENT this request's recorded events,
+        // checkpoints and branches are persisted under. The fourth
+        // task-local in the same family, and the only one that governs
+        // where a row lands rather than how it is labelled — see
+        // `document_scope_layer`.
+        .layer(axum::middleware::from_fn(document_scope_layer))
         // Observed-agent-activity recorder (`agent_activity`): for any
         // request whose validated credential is a
         // `PrincipalKind::Agent` API key, records what/when/outcome
@@ -11361,6 +11367,65 @@ async fn agent_origin_layer(
     timeline_engine::recorder_bridge::ORIGIN_OVERRIDE
         .scope(origin, next.run(request))
         .await
+}
+
+/// Bind a request's durable writes to the document the request NAMED.
+///
+/// # The defect this closes
+///
+/// Everything the recorder persists — events, and (via `persist_checkpoint` /
+/// `persist_branch`) checkpoints and branch records — used to be keyed by the
+/// process-global `AppState.active_document`. That cell has exactly one
+/// writer, `POST /api/documents/{id}/open`, and `POST /api/documents`
+/// deliberately does not activate. So a client that registered a document and
+/// then stated it per request via `X-Roshera-Document` had every row filed
+/// under whatever document happened to be globally active, while every read
+/// scoped to its own document honestly found nothing. Measured as
+/// `recipe_get` returning `step_count: 0` for an agent's own document.
+///
+/// The sink could not fix this itself: it persists on the recorder's drain
+/// worker, a different task from the request, where no request-scoped value
+/// exists. Hence the same shape `agent_author_layer` and `agent_intent_layer`
+/// already use — scope a task-local here, snapshot it synchronously inside
+/// `TimelineRecorder::record` on the request task, carry it to the worker
+/// with the op.
+///
+/// # Contract
+///
+/// * **Header absent, empty, or undecodable → no scope at all**, and the sink
+///   falls back to the ambient active document. Byte-for-byte the previous
+///   behaviour, which every unbound client (the viewport, the WebSocket
+///   surface, the eval harness) depends on.
+/// * **Header present → that document, verbatim, not validated here.** This
+///   layer is a pure carrier: it performs no catalog lookup and can therefore
+///   change no route's status code. `documents::resolve_document` — which
+///   404s an unknown id and 400s an undecodable one — remains the validating
+///   entry point for the handlers that call it. Adding validation HERE would
+///   start refusing requests on routes that ignore the header today, which is
+///   a behaviour change well beyond scoping a write. The consequence is
+///   named rather than hidden: a request that binds to an unregistered id
+///   gets its events filed under that id, and the read path's registry check
+///   surfaces the mistake as the caller's, not as a silently redirected
+///   write.
+async fn document_scope_layer(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let document = request
+        .headers()
+        .get(documents::DOCUMENT_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+    match document {
+        Some(id) => {
+            timeline_engine::recorder_bridge::DOCUMENT_OVERRIDE
+                .scope(id, next.run(request))
+                .await
+        }
+        None => next.run(request).await,
+    }
 }
 
 /// Construct the outermost CORS layer.

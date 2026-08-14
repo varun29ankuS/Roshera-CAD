@@ -184,12 +184,20 @@ pub(crate) fn to_event_data(
 /// session id and the event's own `sequence_number`.
 pub struct DatabaseEventSink {
     database: Arc<dyn DatabasePersistence + Send + Sync>,
-    /// The document every event is currently persisted under. Shared with
-    /// `AppState.active_document` (same `Arc`) so `documents::activate`
-    /// flips both the live model's target document AND where the next
-    /// recorded event lands with a single write, and every in-flight
-    /// `persist()` call reads whichever document was active the instant it
-    /// looked — never a stale value baked in at construction time.
+    /// The document an event is persisted under when the request that
+    /// recorded it stated NONE. Shared with `AppState.active_document` (same
+    /// `Arc`) so `documents::activate` flips both the live model's target
+    /// document AND where the next unbound event lands with a single write,
+    /// and every in-flight `persist()` call reads whichever document was
+    /// active the instant it looked — never a stale value baked in at
+    /// construction time.
+    ///
+    /// This is now the FALLBACK, not the only key: a request that binds
+    /// itself with `X-Roshera-Document` carries its document through
+    /// `DOCUMENT_OVERRIDE` to [`EventSink::persist`], and that wins. The
+    /// ambient read stays exactly where it is — at persist time, not
+    /// snapshotted at record time — so an `/open` between enqueue and drain
+    /// still retargets in-flight unbound events precisely as before.
     active_document: Arc<RwLock<String>>,
 }
 
@@ -207,13 +215,39 @@ impl DatabaseEventSink {
 
 #[async_trait::async_trait]
 impl EventSink for DatabaseEventSink {
-    async fn persist(&self, event: &TimelineEvent) -> Result<(), String> {
-        let document_id = self.active_document.read().await.clone();
+    async fn persist(&self, event: &TimelineEvent, document: Option<&str>) -> Result<(), String> {
+        // The request's own document wins; absent one, the ambient active
+        // document — read HERE, at persist time, exactly as before.
+        let document_id = match document {
+            Some(bound) => bound.to_string(),
+            None => self.active_document.read().await.clone(),
+        };
         let data = to_event_data(event, &document_id)?;
         self.database
             .save_timeline_event(&document_id, &data)
             .await
             .map_err(|e| format!("save_timeline_event failed: {e}"))
+    }
+}
+
+/// The document a write-behind from the REQUEST TASK belongs under.
+///
+/// [`persist_branch`] and [`persist_checkpoint`] are awaited directly inside
+/// their HTTP handlers, so unlike [`EventSink::persist`] — which runs on the
+/// recorder's drain worker — they can read the request's own
+/// `DOCUMENT_OVERRIDE` scope themselves. They must, too: a checkpoint or
+/// branch keyed to the process-global document while its EVENTS are keyed to
+/// the bound one is the same defect wearing a different hat, and it is the
+/// one that shows up as an honest, empty `checkpoints: []`.
+///
+/// No scope (the viewport, the WebSocket surface, every REST client that
+/// sends no binding header, and the WS branch-create path which has no
+/// request task at all) → the process-global `active_document`, byte-for-byte
+/// the previous behaviour.
+async fn write_document(state: &AppState) -> String {
+    match timeline_engine::recorder_bridge::DOCUMENT_OVERRIDE.try_with(Clone::clone) {
+        Ok(bound) => bound,
+        Err(_) => state.active_document.read().await.clone(),
     }
 }
 
@@ -240,7 +274,7 @@ pub async fn persist_branch(
     if !durability_enabled() {
         return;
     }
-    let document_id = state.active_document.read().await.clone();
+    let document_id = write_document(state).await;
     let record = BranchRecord {
         session_id: document_id,
         branch_id: branch_id.to_string(),
@@ -268,7 +302,7 @@ pub async fn persist_checkpoint(state: &AppState, checkpoint: &timeline_engine::
     if !durability_enabled() {
         return;
     }
-    let document_id = state.active_document.read().await.clone();
+    let document_id = write_document(state).await;
     let data = match serde_json::to_value(checkpoint) {
         Ok(v) => v,
         Err(e) => {
