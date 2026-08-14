@@ -15,6 +15,9 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
 import { fileURLToPath } from "node:url";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { resolveKernelIdentity, KernelIdentityConflict, buildProvenance, digestOf } from "../lib/provenance.mjs";
 import { defineTask } from "../lib/task.mjs";
 import { scriptedPolicy } from "../lib/policy.mjs";
@@ -190,6 +193,66 @@ check("the task digest changes when a TOLERANCE changes", () => {
   const b = defineTask({ ...t, claims: [{ ...t.claims[0], tolerance: 0.2 }] });
   assert.notEqual(digestOf(a), digestOf(b),
     "task ids are stable NAMES, not stable MEANINGS — a changed tolerance is a different task");
+});
+
+// ─── review finding 1: the harness-ABSENT path had zero coverage ──────────
+//
+// `shaOf` and `dirtyOf`'s catch branches are real, load-bearing code — the
+// harness this batch runs from is not guaranteed to be a clean git checkout
+// (a fresh clone mid-fetch, a detached worktree, a tarball deploy) — and
+// nothing exercised either failure path. A freshly created temp directory is
+// guaranteed not to be a git repository (mkdtemp never nests inside one on
+// this machine's runners), so BOTH `git rev-parse` and `git status` fail
+// there, giving one check double duty: it proves the harness-absent branch
+// AND (via the "Separately:" assertion) proves review finding 4's fix — that
+// merging two failed git reads keeps BOTH reasons instead of the second
+// silently overwriting the first.
+check("a harnessRoot that is not a git repository is a stated harness absence, not silently sound", async () => {
+  const notARepo = mkdtempSync(join(tmpdir(), "roshera-rl-not-a-repo-"));
+  try {
+    const p = await buildProvenance({
+      kernel: { sha: "abc1234", dirty: false, reported_by: "server" },
+      policy: scriptedPolicy([]), task: t,
+      mcpEntry: fileURLToPath(new URL("../package.json", import.meta.url)),
+      harnessRoot: notARepo,
+    });
+    assert.ok(!("sha" in p.harness), "no commit sha may be invented for a non-git directory");
+    assert.ok(!("dirty" in p.harness), "no dirty reading may be invented either");
+    assert.ok(typeof p.harness.absent === "string" && p.harness.absent.length > 0,
+      "the harness identity must be a STATED absence, not a silent gap");
+    assert.match(p.harness.absent, /harness commit/i,
+      "the sha failure's own reason must survive the merge");
+    assert.match(p.harness.absent, /Separately:/,
+      "review finding 4: BOTH git failures must be recorded, not just the second one to run");
+    assert.match(p.harness.absent, /dirty/i,
+      "the dirty failure's own reason must survive the merge too");
+    assert.equal(p.attributable, false,
+      "a harness that cannot identify itself must not be laundered into an attributable row");
+  } finally {
+    rmSync(notARepo, { recursive: true, force: true });
+  }
+});
+
+// ─── review finding 2: digestOf's key-order stability was never DIRECTLY tested ──
+//
+// Only inferred, previously, through the tolerance-changes-the-digest check —
+// which never reorders anything. Both halves matter: an object's KEY order
+// must not move the digest (that is the whole reason `canon` sorts keys), but
+// an array's ELEMENT order MUST move it, because array order is meaningful
+// data (a claim list, a tool allowlist) — an over-eager canonicaliser that
+// also sorted arrays would silently treat two different sequences as one.
+check("digestOf is stable across object KEY insertion order", () => {
+  const a = { z: 1, a: { y: 2, x: 3 }, m: [1, 2, 3] };
+  const b = { a: { x: 3, y: 2 }, m: [1, 2, 3], z: 1 };
+  assert.equal(digestOf(a), digestOf(b),
+    "identical content in a different key order must digest identically — that is the guarantee `canon` exists for");
+});
+
+check("digestOf CHANGES when array ELEMENT order changes — array order is never sorted away", () => {
+  const a = { claims: [1, 2, 3] };
+  const b = { claims: [3, 2, 1] };
+  assert.notEqual(digestOf(a), digestOf(b),
+    "array order is meaningful data; a canonicaliser that sorted arrays would silently equate two different sequences");
 });
 
 for (const [name, fn] of checks) { await fn(); process.stdout.write(`  ok - ${name}\n`); }

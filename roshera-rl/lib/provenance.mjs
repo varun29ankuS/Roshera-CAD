@@ -101,7 +101,32 @@ export async function resolveKernelIdentity({ baseUrl, authHeader = {}, claimed,
   return { sha, dirty: build.dirty === true, reported_by: "server" };
 }
 
-/** Stable digest over canonical JSON — key order must not change the value. */
+/**
+ * Stable digest over canonical JSON — object KEY order must not change the
+ * value; array ELEMENT order always does, because array order is meaningful
+ * data (a claim list, a tool allowlist) and sorting it would silently treat
+ * two different sequences as the same one.
+ *
+ * KNOWN LIMITS, stated rather than silently overclaimed — both fall out of
+ * `JSON.stringify`, which this digest is built on, and neither is reachable
+ * from data this codebase actually digests (tasks pass through `defineTask`'s
+ * strict validation before they ever reach here — mandatory finite numbers,
+ * non-empty strings, a closed measure enum — so neither shape below is ever
+ * produced by this package's own data):
+ *   - a plain-object key whose value is `undefined` is DROPPED, not digested
+ *     — `{a: undefined, b: 1}` and `{b: 1}` digest identically;
+ *   - a `Date` (or any class instance whose own enumerable keys are empty)
+ *     canonicalises to `{}` — `Object.keys(date)` is empty regardless of the
+ *     instant it holds, so every `Date` digests the same as every other and
+ *     the same as a bare `{}`.
+ * Extending `canon` to special-case these is a real option; it was not taken
+ * here because doing so would CHANGE this digest's output for values that
+ * happen to touch either shape, and this digest's whole purpose — four
+ * downstream tasks compare digests for equality — makes a silent output
+ * change exactly the kind of gap this module exists to refuse. Values of
+ * either shape reaching this function would be a bug in the caller, not a
+ * gap to paper over here.
+ */
 export function digestOf(value) {
   const canon = (v) =>
     Array.isArray(v)
@@ -139,13 +164,35 @@ async function shaOf(cwd) {
 }
 
 /**
+ * Combine the sha and dirty readings into one `harness` object. A plain
+ * `{...shaResult, ...dirtyResult}` spread loses `shaResult.absent` whenever
+ * BOTH calls fail, because they share the one key `absent` and the second
+ * spread silently overwrites the first — a corpus reading the surviving
+ * reason would see only "could not report whether the tree was dirty" and
+ * never learn the sha call failed too. This block's contract is that an
+ * absence carries A reason, and losing one of two real reasons to a spread
+ * collision is exactly the kind of silent narrowing that contract exists to
+ * forbid. When only one call fails, its `absent` and the other's real field
+ * (`sha` or `dirty`) sit on different keys and coexist without collision, so
+ * only the both-failed case needs special handling.
+ */
+function mergeHarness(shaResult, dirtyResult) {
+  const shaAbsent = typeof shaResult.absent === "string";
+  const dirtyAbsent = typeof dirtyResult.absent === "string";
+  if (shaAbsent && dirtyAbsent) {
+    return { absent: `${shaResult.absent} Separately: ${dirtyResult.absent}` };
+  }
+  return { ...shaResult, ...dirtyResult };
+}
+
+/**
  * Assemble the block. `attributable` is false whenever ANY identity is absent —
  * it is the single field a consumer filters on, and a corpus that cannot say
  * which rows it can trust is not usable at any size.
  */
 export async function buildProvenance({ kernel, policy, task, mcpEntry, harnessRoot }) {
   const mcp = { version: "0.1.0", ...(await fileDigest(mcpEntry)) };
-  const harness = { ...(await shaOf(harnessRoot)), ...(await dirtyOf(harnessRoot)) };
+  const harness = mergeHarness(await shaOf(harnessRoot), await dirtyOf(harnessRoot));
   const block = {
     kernel,
     mcp,
