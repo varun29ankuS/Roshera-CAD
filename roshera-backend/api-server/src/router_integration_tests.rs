@@ -9719,3 +9719,52 @@ async fn fidelity_is_absent_on_an_op_with_no_measurable_request() {
          body = {body}"
     );
 }
+
+/// PROVENANCE. The harness records what the SERVER says its build is, never what
+/// the operator claimed on a command line — an unverified `kernel_sha` is a field
+/// asserting something nobody checked. So the server must be able to say.
+///
+/// The `absent` arm is deliberate: a build with no git context (a source tarball,
+/// a vendored build) states the absence with a reason rather than reporting a
+/// fabricated sha. Absence is a fact; "unknown" as a value is a lie.
+#[tokio::test]
+async fn health_reports_the_build_identity_or_states_its_absence() {
+    let state = make_test_state().await;
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri("/health")
+        .body(Body::empty())
+        .expect("static request must build");
+    let (status, body) = dispatch(&state, request).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "/health must return 200 through the live router; body = {body}"
+    );
+
+    let build = body
+        .get("build")
+        .unwrap_or_else(|| panic!("health must carry a `build` object; got {body}"));
+
+    if let Some(absent) = build.get("absent") {
+        let reason = absent.as_str().unwrap_or("");
+        assert!(
+            !reason.trim().is_empty(),
+            "an absent build must state WHY, not merely be absent: {build}"
+        );
+    } else {
+        let sha = build
+            .get("sha")
+            .and_then(|v| v.as_str())
+            .unwrap_or_else(|| panic!("build must carry `sha` or `absent`: {build}"));
+        assert!(
+            !sha.trim().is_empty(),
+            "an empty sha is not an identity — use the absent arm: {build}"
+        );
+        assert!(
+            build.get("dirty").and_then(|v| v.as_bool()).is_some(),
+            "build must say whether the tree was dirty; a sha with uncommitted \
+             changes is not that sha: {build}"
+        );
+    }
+}

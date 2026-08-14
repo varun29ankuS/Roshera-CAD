@@ -8678,6 +8678,23 @@ async fn enhanced_health(State(state): State<AppState>) -> Json<serde_json::Valu
         "status": "healthy",
         "timestamp": chrono::Utc::now().to_rfc3339(),
         "version": "0.1.0",
+        // PROVENANCE: what this binary actually is, so a client records what the
+        // SERVER said rather than what its operator claimed. Emitted by build.rs;
+        // empty means the build had no git context, which is stated as an absence
+        // rather than reported as a fabricated sha.
+        "build": ({
+            let sha = env!("ROSHERA_BUILD_SHA");
+            let dirty = env!("ROSHERA_BUILD_DIRTY");
+            if sha.is_empty() || dirty.is_empty() {
+                serde_json::json!({
+                    "absent": "this binary was built without git context, so it \
+                               cannot state its own commit; rebuild inside the \
+                               repository to make the build identifiable"
+                })
+            } else {
+                serde_json::json!({ "sha": sha, "dirty": dirty == "1" })
+            }
+        }),
         "uptime": uptime_str,
         "metrics": {
             "total_requests": TOTAL_REQUESTS.load(Ordering::Relaxed),
