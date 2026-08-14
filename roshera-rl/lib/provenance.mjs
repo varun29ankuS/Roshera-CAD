@@ -235,7 +235,16 @@ function canon(v, path) {
     throw refuse(path, "an object with own symbol keys",
       "JSON.stringify ignores them, so their data would vanish from the identity without a trace");
   }
-  const out = {};
+  // `Object.create(null)`, NOT `{}`: on an ordinary object literal the
+  // assignment `out["__proto__"] = …` invokes `Object.prototype`'s
+  // `__proto__` SETTER instead of creating an own property, so the key —
+  // which `JSON.parse` does produce as a real own property — vanishes from
+  // the digest. Two blocks differing only inside `__proto__` would then
+  // share an identity, which is the one thing this function exists to
+  // prevent. A null-prototype object has no such setter, so the key lands
+  // as data. (Line 230 already accepts a null prototype as input, so this
+  // is also the shape `canon` is willing to be handed.)
+  const out = Object.create(null);
   for (const k of Object.keys(v).sort()) {
     out[k] = canon(v[k], `${path}.${k}`);
   }

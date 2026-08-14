@@ -402,6 +402,34 @@ check("digestOf still digests every shape it CAN represent losslessly", () => {
   assert.equal(digestOf(ok), digestOf(structuredClone(ok)), "the same content still digests the same");
 });
 
+// ─── the refusal's own blind spot: `__proto__` is DATA, not a prototype ───────
+//
+// `JSON.parse` produces `__proto__` as a REAL own property — unlike an object
+// literal, where it is a prototype directive. So any trajectory read off disk
+// can carry it, which is exactly the hand-edited / foreign-file population the
+// ingester's own docstring says it must not trust. Canonicalising with a plain
+// `{}` accumulator loses it: `out["__proto__"] = …` invokes `Object.prototype`'s
+// setter instead of defining an own property, so the key never reaches
+// `JSON.stringify` and two different blocks share one identity. That collides
+// `run_id` and `episode_id`, and `rl_episode` upserts ON CONFLICT DO UPDATE —
+// so the second file would silently overwrite the first.
+check("digestOf treats a `__proto__` key as DATA — it neither vanishes nor collides", () => {
+  const withA = JSON.parse('{"k":1,"__proto__":{"x":1}}');
+  const withB = JSON.parse('{"k":1,"__proto__":{"x":2}}');
+  const without = JSON.parse('{"k":1}');
+
+  assert.deepEqual(Object.keys(withA), ["k", "__proto__"],
+    "precondition: JSON.parse really does make __proto__ an own enumerable key");
+
+  assert.notEqual(digestOf(withA), digestOf(withB),
+    "two blocks differing only INSIDE __proto__ must not share an identity — they would " +
+    "collide run_id and episode_id, and rl_episode's ON CONFLICT DO UPDATE would let the " +
+    "second file silently overwrite the first");
+  assert.notEqual(digestOf(withA), digestOf(without),
+    "a __proto__ key must not vanish from the identity without a trace — the whole point " +
+    "of refusing undefined and Date is that nothing disappears silently");
+});
+
 // The call site that makes this a defect rather than a curiosity: two
 // materially different scripts used to produce ONE `script_digest`.
 check("two scripts that used to COLLIDE on one script_digest are now refused at the policy seam", () => {
