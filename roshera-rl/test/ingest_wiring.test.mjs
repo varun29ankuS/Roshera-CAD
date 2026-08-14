@@ -186,14 +186,47 @@ check("the CLI without ROSHERA_RL_PG refuses with a named reason, never a silent
   delete env.ROSHERA_RL_PG;
   const r = spawnSync(process.execPath, [ingestBin, "./runs"], { encoding: "utf8", env });
   assert.notEqual(r.status, 0, "a missing connection string must not exit clean");
-  assert.match((r.stdout ?? "") + (r.stderr ?? ""), /ROSHERA_RL_PG/,
+  const output = (r.stdout ?? "") + (r.stderr ?? "");
+  assert.match(output, /ROSHERA_RL_PG/,
     "the absence must be STATED with a reason, never a bare crash or a silent pass");
+  // A deliberate refusal, not an uncaught exception Node happened to print
+  // the reason inside: this must never regress into a bare stack trace
+  // just because the message text still matches the regex above.
+  assert.doesNotMatch(output, /\n\s+at .*\(.*:\d+:\d+\)/,
+    "this must be a deliberate refusal (a named reason on stderr, non-zero exit) — " +
+    "not a stack trace that happens to contain the reason text");
 });
 
 check("package.json exposes the ingest CLI and folds this suite into the test chain", () => {
   const pkg = JSON.parse(readFileSync(join(HERE, "..", "package.json"), "utf8"));
   assert.ok(pkg.scripts?.ingest, "npm run ingest must exist");
   assert.ok(pkg.scripts?.["ingest:verify"], "npm run ingest:verify must exist");
+  // The name promises this suite is IN the chain, not merely that the CLI
+  // scripts exist beside it — dropping ingest_wiring.test.mjs from
+  // pkg.scripts.test must fail this check, or the name is a stated reason
+  // the body doesn't actually make true.
+  assert.match(pkg.scripts?.test ?? "", /test\/ingest_wiring\.test\.mjs/,
+    "pkg.scripts.test must actually run ingest_wiring.test.mjs — removing it from the chain " +
+    "must fail this check, not leave it green under a name that says otherwise");
+});
+
+// The real production binding, not the fake injected through
+// ROSHERA_RL_TEST_INGEST. run-batch.mjs:165 reaches the ingester as
+// `m.runIngest` inside `import("./ingest.mjs")` — every other check in this
+// suite substitutes a fake there and so never actually consults this
+// export. A rename here degrades production to a caught "m.runIngest is
+// not a function" at exit 0, with every other check in this file still
+// green. Importing the module directly (no fake, no database) is the only
+// way to prove the name production depends on is really there. Placed
+// LAST so that if this ever regresses, every other check in this file has
+// already printed its own "ok" line first — the contrast (everything else
+// green, only this dark) is visible in a single run's output, not just
+// asserted in prose.
+check("the real module exports a callable under the exact name run-batch.mjs calls", async () => {
+  const real = await import("../bin/ingest.mjs");
+  assert.equal(typeof real.runIngest, "function",
+    "run-batch.mjs:165 reaches the ingester as m.runIngest — a rename here degrades production " +
+    "to a caught 'not a function' at exit 0, with every other check still green");
 });
 
 // AWAITED, same discipline as wiring.test.mjs: the behavioural checks above

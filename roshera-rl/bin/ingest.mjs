@@ -42,8 +42,8 @@ export async function runIngest({ dir, verifyOnly } = {}) {
     );
   }
   const client = new pg.Client({ connectionString });
-  await client.connect();
   try {
+    await client.connect();
     await ensureSchema(client);
     if (verifyOnly) {
       const { checked, drifted } = await verify(client);
@@ -116,5 +116,17 @@ async function main() {
 // and this file's own test import `runIngest` without ever hitting this
 // branch, so importing this module never has a side effect of its own.
 if (import.meta.url === pathToFileURL(process.argv[1] ?? "").href) {
-  await main();
+  // A deliberate refusal, not a stack trace: `runIngest` throws with a
+  // named reason (a missing ROSHERA_RL_PG, a connection refused, a query
+  // error) and this is the one place that decides what an uncaught reason
+  // means for the CLI process — print it on stderr and exit non-zero, the
+  // same shape `usageAndExit` already uses, instead of letting Node's
+  // default uncaught-exception handler print the reason buried inside a
+  // stack trace.
+  try {
+    await main();
+  } catch (e) {
+    process.stderr.write(`ingest failed: ${e?.message ?? String(e)}\n`);
+    process.exit(1);
+  }
 }
