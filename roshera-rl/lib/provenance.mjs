@@ -120,12 +120,17 @@ export async function resolveKernelIdentity({ baseUrl, authHeader = {}, claimed,
  *     instant it holds, so every `Date` digests the same as every other and
  *     the same as a bare `{}`.
  * Extending `canon` to special-case these is a real option; it was not taken
- * here because doing so would CHANGE this digest's output for values that
- * happen to touch either shape, and this digest's whole purpose — four
- * downstream tasks compare digests for equality — makes a silent output
- * change exactly the kind of gap this module exists to refuse. Values of
- * either shape reaching this function would be a bug in the caller, not a
- * gap to paper over here.
+ * here because neither shape is reachable through `defineTask`'s validated
+ * task data today, so there is nothing to fix that is actually broken yet.
+ * Changing the canonicalisation is still FREE right now — this module exists
+ * only on this feature branch, nothing on `main` consumes it, and no digest
+ * has been persisted anywhere in the repo (the untracked `roshera-rl/runs/*`
+ * artifacts predate this header format and carry no `digest` field at all).
+ * That changes the moment a corpus starts depending on this scheme: this
+ * decision must be revisited BEFORE this module merges to `main`, while the
+ * fix is still free, not after — once real digests are on disk, closing this
+ * gap becomes exactly the expensive migration this module exists to avoid
+ * inflicting on a consumer.
  */
 export function digestOf(value) {
   const canon = (v) =>
