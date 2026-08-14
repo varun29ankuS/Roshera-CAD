@@ -1,0 +1,2 @@
+{"kind":"header","schema_version":"roshera-rl/1","task_id":"cylinder-r25-h60","seed":0,"kernel_sha":"3a9375f9","mcp_version":"0.1.0","tool_allowlist":["timeline_checkpoint","create_cylinder","verify_part"],"split":"train","started_at":"2026-08-14T11:35:23.869Z","replay":"recipe-level: re-issue recipe_ref. Geometry reproduces to ~4e-8; byte-identical replay is NOT promised."}
+{"kind":"step","i":0,"action":{"tool":"create_cylinder","args":{"radius":25,"heig
