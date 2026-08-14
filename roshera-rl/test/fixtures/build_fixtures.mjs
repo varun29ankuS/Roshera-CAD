@@ -22,6 +22,23 @@
  *     `reward_final.components.refusals` are bumped the way reward.mjs
  *     actually counts them (mergeFinal, reward.mjs:230).
  *
+ * A third recipe step (`boolean_union`) is also injected into
+ * `complete.jsonl`'s `recipe_ref.steps` — the real two-step recipe has no
+ * step carrying BOTH `inputs` and `outputs` (create_cylinder_3d has only
+ * outputs, set_name only inputs), so lineage-edge derivation had nothing to
+ * exercise. Nothing about this step's shape is invented: `op_kind
+ * "boolean_union"`, `reissue.path "/api/geometry/boolean"`, `reissue.body
+ * {operation, object_a, object_b}` and `symbolic_operands
+ * ["object_a","object_b"]` are copied verbatim from
+ * roshera-backend/api-server/src/handlers/timeline.rs:4170-4194
+ * (`recipe_reissue`'s boolean arm); the `inputs`/`outputs` token convention
+ * (two consumed `solid:N` tokens in, one produced `solid:N` token out) is
+ * copied from that same file's own test,
+ * `box_cylinder_boolean_fillet_produces_the_real_lineage_edges`
+ * (timeline.rs:4919-4941, `wire_event(3, "boolean_operation", ["solid:1",
+ * "solid:2"], ["solid:3"], ...)`), adapted to this fixture's own token
+ * numbering (`solid:0` is what `create_cylinder_3d` here actually produced).
+ *
  * `malformed.jsonl` is a truncated write: a valid header line followed by a
  * line that is not valid JSON — the shape a killed process leaves behind,
  * not an invented schema violation.
@@ -84,11 +101,40 @@ const refusalStep = {
   ms: 88,
 };
 
+// The boolean recipe step — see the module docstring for exactly where each
+// field came from (timeline.rs's recipe_reissue boolean arm + its own
+// lineage test). `solid:1` here is a second operand this fixture's episode
+// never itself built; that is fine — the fixture proves how the derivation
+// reads a recorded recipe step, not that this specific document is
+// replayable end to end.
+const booleanStep = {
+  sequence: 93,
+  op_kind: "boolean_union",
+  params: { Boolean: { operation: "union" } },
+  inputs: ["solid:0", "solid:1"],
+  outputs: ["solid:2"],
+  intent: "Create a single cylinder with radius 25 mm and height 60 mm,",
+  checkpoint: null,
+  checkpoint_absent_reason: "no checkpoint declaration covers this step; its `intent` field (recorded on the event itself) is the authority here",
+  reissue: {
+    method: "POST",
+    path: "/api/geometry/boolean",
+    body: { operation: "union", object_a: "solid:0", object_b: "solid:1" },
+    symbolic_operands: ["object_a", "object_b"],
+  },
+};
+
 const terminal = {
   ...realTerminal,
   reward_final: {
     ...realTerminal.reward_final,
     components: { ...realTerminal.reward_final.components, refusals: 1 },
+  },
+  recipe_ref: {
+    ...realTerminal.recipe_ref,
+    step_count: realTerminal.recipe_ref.step_count + 1,
+    sequence_range: [realTerminal.recipe_ref.sequence_range[0], booleanStep.sequence],
+    steps: [...realTerminal.recipe_ref.steps, booleanStep],
   },
 };
 

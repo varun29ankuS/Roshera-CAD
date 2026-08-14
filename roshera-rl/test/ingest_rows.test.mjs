@@ -119,7 +119,7 @@ check("claim results carry expected, computed and verified", () => {
 // ─── recipe steps: reissue mapping ─────────────────────────────────────────
 check("recipe steps carry their reissue mapping", () => {
   const r = rowsFromTrajectory(completeText, { path: completePath });
-  assert.equal(r.recipeSteps.length, 2);
+  assert.equal(r.recipeSteps.length, 3);
   const create = r.recipeSteps.find((s) => s.op_kind === "create_cylinder_3d");
   assert.ok(create.reissue, "the create step has a real reissue mapping");
   assert.equal(create.reissue.method, "POST");
@@ -131,27 +131,49 @@ check("recipe steps carry their reissue mapping", () => {
   assert.equal(setName.reissue, null,
     "set_name genuinely has no re-issue route in the real recipe");
   assert.match(setName.reissue_absent_reason, /no re-issue mapping is defined for `set_name`/);
+
+  const boolean = r.recipeSteps.find((s) => s.op_kind === "boolean_union");
+  assert.ok(boolean.reissue, "the boolean step has a real reissue mapping");
+  assert.equal(boolean.reissue.method, "POST");
+  assert.equal(boolean.reissue.path, "/api/geometry/boolean");
+  assert.deepEqual(boolean.reissue.symbolic_operands, ["object_a", "object_b"]);
+  assert.equal(boolean.reissue.body.object_a, "solid:0");
+  assert.equal(boolean.reissue.body.object_b, "solid:1");
 });
 
 // ─── recipe row + solids + lineage edges (v1 scope) ────────────────────────
-check("the recipe row and derived solids/lineage rows reflect the real recipe", () => {
+check("the recipe row and derived solids rows reflect the real recipe", () => {
   const r = rowsFromTrajectory(completeText, { path: completePath });
   assert.ok(r.recipe, "a recipe row is produced");
   assert.equal(r.recipe.reference, "61a53497-dbec-48d0-b789-45f4cbe803ee");
-  assert.equal(r.recipe.step_count, 2);
+  assert.equal(r.recipe.step_count, 3);
 
-  assert.equal(r.solids.length, 1, "only create_cylinder_3d produced an output token");
-  assert.equal(r.solids[0].token, "solid:0");
-  assert.equal(r.solids[0].produced_by_sequence, 85);
+  assert.equal(r.solids.length, 2,
+    "create_cylinder_3d produced solid:0, boolean_union produced solid:2");
+  assert.deepEqual(r.solids.map((s) => s.token).sort(), ["solid:0", "solid:2"]);
+  const created = r.solids.find((s) => s.token === "solid:0");
+  assert.equal(created.produced_by_sequence, 85);
+  const merged = r.solids.find((s) => s.token === "solid:2");
+  assert.equal(merged.produced_by_sequence, 93);
+  assert.equal(merged.op_kind, "boolean_union");
+});
 
-  // v1 lineage_edge scope (see the module docstring and the plan's own
-  // ledger): an edge needs BOTH inputs and outputs on the same recipe step.
-  // create_cylinder_3d has no inputs; set_name has no outputs — so this
-  // fixture, built from the only real recipe with embedded steps in the
-  // saved slice, honestly produces ZERO edges. That is a coverage gap in
-  // the available real data, not a defect in the derivation: it is stated
-  // here rather than papered over with an invented boolean step.
-  assert.equal(r.lineageEdges.length, 0);
+// ─── lineage edges (v1 scope): the actual cross product, not just its size ─
+check("lineage edges are the real recipe step's inputs x outputs cross product", () => {
+  const r = rowsFromTrajectory(completeText, { path: completePath });
+  // create_cylinder_3d has no inputs and set_name has no outputs — neither
+  // contributes an edge under the v1 rule (see the module docstring). Only
+  // boolean_union carries both, so it is the sole source of edges here:
+  // two consumed operands x one produced output = 2 edges.
+  assert.equal(r.lineageEdges.length, 2);
+  const byFrom = Object.fromEntries(r.lineageEdges.map((e) => [e.from, e]));
+  assert.equal(byFrom["solid:0"].to, "solid:2");
+  assert.equal(byFrom["solid:1"].to, "solid:2");
+  for (const e of r.lineageEdges) {
+    assert.equal(e.via_sequence, 93);
+    assert.equal(e.op_kind, "boolean_union");
+    assert.equal(e.episode_id, r.episode.episode_id);
+  }
 });
 
 // ─── provenance absent → rows still produced, flagged unattributable ──────
@@ -167,7 +189,37 @@ check("a trajectory whose provenance is absent still produces rows but with attr
   assert.equal(r.steps.length, 4);
   assert.equal(r.refusals.length, 1);
   assert.equal(r.claims.length, 2);
-  assert.equal(r.recipeSteps.length, 2);
+  assert.equal(r.recipeSteps.length, 3);
+  assert.equal(r.lineageEdges.length, 2, "lineage derivation runs the same regardless of attributable");
+});
+
+// ─── recipe_ref stated absence (every non-COMPLETED outcome) ──────────────
+// This is the COMMON case for any episode that never reached terminal
+// scoring, not an edge case: `unscoredFor` (lib/episode.mjs:94-109) is the
+// REAL production code that builds it, for every one of BUDGET_EXHAUSTED /
+// INVALID_ACTION / CRASHED / RATE_LIMITED / SETUP_FAILED, and returns
+// `recipeRef: { absent: reason }` — a bare object with no `steps`, no
+// `reference`, nothing else. The reason string below is copied verbatim
+// from `NO_TERMINAL_SCORING.BUDGET_EXHAUSTED` (episode.mjs:50).
+check("a stated-absence recipe_ref (every non-COMPLETED outcome) degrades to an absent recipe row and no derived rows", () => {
+  const lines = completeText.trim().split("\n");
+  const terminal = JSON.parse(lines[lines.length - 1]);
+  const reason = "the step or token budget ran out before the policy declared done, so terminal verification never ran";
+  terminal.outcome = "BUDGET_EXHAUSTED";
+  terminal.recipe_ref = { absent: reason };
+  lines[lines.length - 1] = JSON.stringify(terminal);
+  const text = lines.join("\n") + "\n";
+
+  const r = rowsFromTrajectory(text, { path: "unscored.jsonl" });
+  assert.equal(r.quarantine, undefined, "a stated absence is not a malformed file");
+  assert.equal(r.episode.outcome, "BUDGET_EXHAUSTED");
+  assert.ok(r.recipe, "a recipe row is still produced, carrying the absence");
+  assert.equal(r.recipe.absent, reason);
+  assert.equal("reference" in r.recipe, false,
+    "a bare {absent} recipe_ref carries no reference — the row must not invent one");
+  assert.deepEqual(r.recipeSteps, []);
+  assert.deepEqual(r.solids, []);
+  assert.deepEqual(r.lineageEdges, []);
 });
 
 // ─── malformed file: quarantine entry naming the reason, never a throw ────
