@@ -61,6 +61,14 @@ The same certificate acts as the referee for autonomous design. A certified expl
 |-----------|------------|
 | ![Dark Mode](roshera-app/docs/screenshots/dark-mode.png) | ![Light Mode](roshera-app/docs/screenshots/light-mode.png) |
 
+## Soundness is not fidelity
+
+The certificate above speaks only to **topology** — closed, manifold, oriented, non-self-intersecting. It is silent on **shape**, and the case that proved the gap lives in this repo: a loft of two circles densified its vertex correspondence to a floor of 8 and produced an octagonal frustum — genuinely closed, genuinely manifold, certified SOUND, and 9.97% short of the requested cross-section. Nothing in the verdict could see it, because nothing in the verdict compared the RESULT to the REQUEST.
+
+`geometry-engine/src/queries/fidelity.rs` is that comparison: requested / measured / signed relative deviation per named quantity, reported **beside** the certificate and never folded into `sound` — the topology of that frustum genuinely is sound, and flipping the verdict would swap one false statement for another. The sign is the diagnosis: negative means the kernel built *less* than was asked for (the octagon class — an inscribed polygon where a curve was requested, the class that costs material and function); positive means *more* (typically a smooth interpolation running outside a coarsely-sampled request). A quantity that cannot be measured is stated **absent with a reason**, never as `0` — "requested 7, got 0" would be a louder lie than silence — and when nothing was measured at all, the `fidelity_ok` key is omitted rather than set `true`, so a client keying off the boolean cannot inherit a silent pass.
+
+The statistic is calibrated against known cases, which is how you know a given number is trustworthy: an analytic cylinder reads ~1e-16, the fixed loft's residual reads 0.19%, the octagon defect reads 9.97%. The default 2% band that separates them is a product decision, not a law of geometry — the raw numbers ride on every quantity so a caller with a tighter contract applies its own band without re-measuring. Today the block is attached by the dedicated endpoints with a measurable request — `/api/geometry/{cylinder,box,revolve,nurbs_loft}` (`attach_fidelity`, `api-server/src/main.rs`); every other op attaches nothing rather than a block of zeros.
+
 ## Architecture
 
 ```
@@ -77,8 +85,10 @@ roshera-backend/       Rust workspace (10 crates)
   shared-types/        Common type definitions
 
 roshera-app/           React + Three.js + TypeScript browser client
-roshera-mcp/           MCP server exposing the kernel to agents
-roshera-eval/          Certificate-scored agent evaluation scenarios (17)
+roshera-mcp/           MCP server exposing the kernel to agents (incl. the six-gate constraint layer)
+roshera-eval/          Certificate-scored agent evaluation scenarios (18)
+roshera-rl/            Certificate-scored episode loop over the MCP surface (JSONL trajectories;
+                       task corpus and model policies not yet built — see below)
 ```
 
 ## Direction
@@ -100,6 +110,25 @@ design notebook into one reviewable artifact. Next is embeddings and
 retrieval over that history so an agent can ask "how did this corner get
 to be 4mm" without re-deriving the model from scratch.
 
+## The constraint layer
+
+Every layer of an agent harness either **asks** (steering — an instruction a model may decline) or **prevents** (constraint — the wrong thing is inexpressible). Measured on this project, constraints held identically across models while steering degraded on weaker ones. So six policies are implemented not as prompt text but as typed refusals in `roshera-mcp/src/gates.ts`, at the single dispatch choke point every call path runs through — direct tool mount, `invoke`, and `cad_program`'s batch loop all call the same wrapped handler, so nothing is gated twice and nothing escapes:
+
+1. **Refusal cache** — a typed refusal is a stable fact, not a retry target. An identical re-issue is answered with the same refusal from cache until some state-changing call succeeds.
+2. **Intent gate** — a solid-mutating call with no open design-intent checkpoint is refused, naming the call that opens one. Generic sequence names ("step 3") are refused too, or the gate would be satisfied by exactly what the policy exists to prevent.
+3. **Unsound-base gate** — mutating a solid whose live kernel verdict is unsound is refused unless the caller passes `acknowledge_unsound: true` (deliberate repair flows). Never cached: the fact is live kernel state someone else can change.
+4. **Sheet-export gate** — an exported PDF/DXF carries no ambient certificate and can never re-verify itself, so a sheet whose live certificate is stale or dangling never reaches disk; there is no bypass for that case.
+5. **Single-point-run gate** — measured failure: an agent burned 1.3M tokens laying out a 256-point gear profile one point per call. After 8 consecutive single-point sketch calls, the 9th is refused, naming the one-call polyline path. Any other call resets the counter, so small sketches never meet the gate.
+6. **Verification-scope gate** — the intent gate forces intent to be declared before building; nothing forced anyone to *look* at what came out (the 9.97% loft above shipped certified sound). Closing a checkpoint after mutations with no `verify_part`/`verify_claim` is refused. One explicit escape — `skip_verification: true` on the closing call — so the constraint is escapable but never silent.
+
+The header comment in `gates.ts` states each gate's reasoning, including where each deliberately fails open or closed and why.
+
+## roshera-rl — the episode loop
+
+`roshera-rl/` runs parallel, isolated, certificate-scored episodes over the real MCP tool surface and writes JSONL trajectory records. It is an **episode loop with certificate-based rewards whose task corpus and model policies are not yet built** — not an RL environment you could train an agent in today, and its own [README](roshera-rl/README.md) carries a "What this does not prove" section holding it to the same standard as this one.
+
+What is live-verified against a running backend: 8 concurrent episodes, each in its own document *and* its own kernel model, each seeing exactly one solid — its own; all 16 dimensional claims (two per episode) verified against real geometry by `verify_claim`; the fidelity block present on all 8 at machine epsilon (signed deviation 1.4e-16 — the calibration case from the fidelity section, measured over the wire). Reward is a **named vector** — soundness, worst signed fidelity deviation, refusal and call-failure counts — never scalarized, because weighting them is a training choice the kernel cannot justify; an unmeasurable component is a stated gap, never a zero. And in the same breath, what is not yet true: the task corpus is **one task** (a cylinder with volume + surface-area claims — a pair that provably cannot discriminate a conjugate cylinder satisfying both, a blind spot the task file documents and pins in its tests); **no language model has ever driven an episode** — every run so far used a scripted reference policy, so this proves the loop, not the agent; **recipe replay has not worked live yet** (every saved live trajectory carries `step_count: 0` with its stated absence — the embedded-steps mechanism has never carried a real step out of a live episode); and nothing outside the repo can consume the output — there is no Gym/verifiers adapter. Reproduce with `node bin/run-batch.mjs --concurrency 8 --repeats 8` against a running backend (see `roshera-rl/README.md` for what a live run requires).
+
 ## Status
 
 What follows is honest about what's tested versus what's implemented but rough. Measured perf numbers are in [Performance](#performance). The kernel carries a red-test ratchet (`geometry-engine/KNOWN_REDS.md`) whose tolerated-failure allowlist is currently empty — no known-failing test is carried as accepted.
@@ -119,8 +148,9 @@ What follows is honest about what's tested versus what's implemented but rough. 
 | | Offset, Sewing | Implemented, lightly tested |
 | | Revolve (full/partial) | Works; piecewise-analytic bands (arc → exact Torus/Sphere) on the typed strict path, 360° profiles without inner loops |
 | | Sweep (single path) | Implemented; multi-guide not done |
-| | Loft (ruled surfaces) | Implemented; smooth NURBS loft not done |
+| | Loft (ruled + NURBS-skinned) | Ruled loft implemented. `nurbs_loft` skins a single G2-continuous (degree-3) NURBS lateral through closed section rings on the proven watertight cylinder topology — the kernel's first freeform NURBS face |
 | **Certificates** | Soundness (per-operation) | Nine-conjunct AND, computed synchronously under the write lock on every mutating-op response, memoized per solid, failing closed |
+| | Fidelity (requested vs measured) | Reported beside the certificate — never folded into `sound` — for the ops with a measurable request: cylinder, box, revolve, loft. Signed deviation per named quantity; unmeasurable quantities stated absent with a reason, never as 0 |
 | | Sketch — DOF, conflict witnesses | Minimal conflicting constraint sets via QuickXplain; honest `minimal: false` rather than a fabricated core |
 | | Rebuild (timeline mould) | Per-feature verdicts; global soundness re-measured from the resulting B-Rep |
 | **Sketch 2D** | Constraint solver (Newton-Raphson) + DR-plan | Works; per-entity constrainment exposed as queryable kernel facts. Parametric sketch (`psketch_*`) drives the same solver over the agent surface |
@@ -128,7 +158,7 @@ What follows is honest about what's tested versus what's implemented but rough. 
 | **Perception** | Spatial-relationship queries | Ordered ray crossings with exact hit points, SDF X-ray occupancy slices (`occupancy_view`, non-deceivable), view-coverage honesty (`part_coverage` — which faces the standard views leave unseen), section cutaways — an agent asks instead of parsing meshes |
 | **Identity** | Persistent IDs + labels | `FacePid` carries durable face identity across re-extrude and timeline replay (fillet/chamfer/pattern lineage not yet minted); labels pin names to faces/edges/planes and resolve-or-refuse (never a wrong entity) |
 | **Durability** | Event-log persistence, replay, quarantine | Works; boot is a full replay (boot-time snapshots not used). Verified live by kill + resurrect. `GET /api/evidence-pack` bundles recorded history + certificates (absent → null with reason, never fabricated) + notebook + provenance-labeled mass properties |
-| **Agent surface** | MCP minimal surface + meta-tool funnel | Works; 21 default tools (18 core verbs + `find_tool`/`describe_tool`/`invoke`), the ~90-tool long tail reachable via `invoke` at fixed cost with identical schema validation. `blackboard_add_entry` (agent→human notebook) is in the default surface |
+| **Agent surface** | MCP minimal surface + meta-tool funnel | Works; 31 default tools (18 core verbs + the 10-tool `psketch_*` sketching family + `find_tool`/`describe_tool`/`invoke`), the ~90-tool long tail reachable via `invoke` at fixed cost with identical schema validation. Six typed dispatch gates at the one choke point every call path crosses (see [The constraint layer](#the-constraint-layer)). `blackboard_add_entry` (agent→human notebook) is in the default surface |
 | **Assembly** | Instances, mates, SE(3) solve, interference | Gauss-Newton SE(3) solver with an analytic Jacobian, DOF/mobility analysis, interactive drag, and a dozen-plus mate/joint kinds (Cam/Path/Symmetric are typed but not numerically enforced). Certified interference: static overlap (EPA-backed, enclosure-aware) plus continuous nonlinear time-of-impact swept clearance via Parry — `min_clearance = raw_min_clearance − ε`, a conservative lower bound, with a typed refusal when a pair's distance is unsupported |
 | **Export** | STL, OBJ, encrypted .ros | Works |
 | | STEP (AP242) | Export and import implemented (tiered writer + parser); primitive and blended-flange round-trips assert topology, validity, and soundness are preserved |
@@ -216,7 +246,7 @@ cargo bench -p geometry-engine \
 ## Getting Started
 
 ```bash
-# Backend
+# Backend (needs a reachable PostgreSQL — see Prerequisites)
 cd roshera-backend
 cargo run --bin api-server
 # API on http://localhost:8081, WebSocket on ws://localhost:8081/ws
@@ -228,26 +258,45 @@ npm run dev
 # UI on http://localhost:5173 (proxies /api and /ws to localhost:8081)
 ```
 
+Auth is on by default — a fresh clone with an empty environment enforces
+authentication, so bare API calls return 401. For a purely local dev run,
+start the backend with `ROSHERA_DEV_INSECURE=1` (the bypass is deliberate and
+loudly logged, never a default); otherwise provision an API key and send
+`Authorization: ApiKey <key>` on every request.
+
 ### Docker
 
-```bash
-cd roshera-backend
-docker compose up
-```
+`roshera-backend/Dockerfile` builds a two-stage release image of the
+api-server (builds with Rust 1.84, exposes 8081, `/health` liveness probe);
+it too needs `DATABASE_URL` pointing at a reachable PostgreSQL. The
+`docker-compose.yml` beside it is currently stale — it publishes ports
+3000/9090, which the server does not listen on, and defines no database —
+so build and run the image directly rather than relying on `docker compose up`.
 
 ### Prerequisites
 
-- Rust 1.75+
+- Rust, recent stable (no MSRV is pinned; the Docker image builds with 1.84)
+- PostgreSQL reachable at `DATABASE_URL` (default
+  `postgresql://postgres:postgres@localhost/roshera`) — the server requires it
+  at boot
 - Node.js 20.19+ (Vite 8 requirement)
 
 ## API
 
 ```bash
-# Create a box (returns the tessellated mesh + its soundness certificate)
+# Create a box (returns the tessellated mesh + its soundness certificate).
+# Assumes a server started with ROSHERA_DEV_INSECURE=1; on a secure run add
+#   -H "Authorization: ApiKey <key>"
 curl -X POST http://localhost:8081/api/geometry \
   -H "Content-Type: application/json" \
   -d '{"shape_type": "box", "parameters": {"width": 10, "height": 10, "depth": 10}, "position": [0, 0, 0]}'
 ```
+
+The dedicated primitive/op endpoints with a measurable request —
+`/api/geometry/cylinder`, `/api/geometry/box`, `/api/geometry/revolve`,
+`/api/geometry/nurbs_loft` — also carry the `fidelity` disclosure described
+above in their perception block, beside the certificate. The generic
+`POST /api/geometry` shown here does not attach one.
 
 ```javascript
 // WebSocket
