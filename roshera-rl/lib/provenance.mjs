@@ -155,27 +155,42 @@ export async function resolveKernelIdentity({ baseUrl, authHeader = {}, claimed,
  *
  * ─── WHAT A REFUSAL COSTS, MEASURED AT EVERY CALL SITE ────────────────────
  *
- * Seven call sites digest data, and only ONE of them sees data validated by
+ * Eight call sites digest data, and only ONE of them sees data validated by
  * `defineTask` — the claim this header used to make, that "neither shape is
- * reachable from this package's own data", was false:
+ * reachable from this package's own data", was false. Line numbers move; the
+ * authoritative list is `grep -rn 'digestOf(' lib/`.
  *
  *   1. `fileDigest` (below)               — a base64 string. Total.
  *   2. `buildProvenance` (below)          — the `defineTask`-validated task.
- *   3. `policy.mjs:97`  scriptedPolicy    — a CALLER-SUPPLIED script, validated
+ *   3. `policy.mjs` scriptedPolicy        — a CALLER-SUPPLIED script, validated
  *      by nothing. This is where all five collisions above are reachable, and
  *      the value it produces (`script_digest`) IS the policy's identity.
- *   4. `policy.mjs:178` referencePolicy   — a constant string. Total.
- *   5. `ingest/rows.mjs:120`              — `run_id`.
- *   6. `ingest/rows.mjs:138`              — `episode_id`.
- *   7. `ingest/store.mjs:108`             — `rl_policy`'s primary key.
+ *   4. `policy.mjs` referencePolicy       — a constant string. Total.
+ *   5. `runner.mjs` provenanceForSetupFailure — the task, on the FAILURE path.
+ *   6. `ingest/rows.mjs` runRowFrom       — `run_id`.
+ *   7. `ingest/rows.mjs` episodeRowFrom   — `episode_id`.
+ *   8. `ingest/store.mjs` upsertPolicy    — `rl_policy`'s primary key.
+ *   (`task.mjs` re-exports this function as `taskDigest`; same guarantees.)
  *
- * Sites 5-7 read data that has already been through `JSON.parse`, which
- * cannot produce `undefined`, a `Date`, a `Map` or a non-finite number, so no
- * refusal is reachable there at all. Sites 3 and 2 are reached only from
- * `policy.describe()` inside `buildProvenance`, which `runner.mjs` already
- * wraps: a throw there is recorded as that ONE episode's `SETUP_FAILED`
- * carrying this message, and its siblings are untouched. A refusal therefore
- * costs one recorded episode, never a batch.
+ * Sites 2 and 3 are reached only from `policy.describe()` inside
+ * `buildProvenance`, which `runner.mjs` already wraps: a throw there is
+ * recorded as that ONE episode's `SETUP_FAILED` carrying this message, and
+ * its siblings are untouched. Site 5 is on the failure path and catches its
+ * own refusal into a stated absence, because a failure record that fails
+ * leaves an episode nobody can diagnose.
+ *
+ * Sites 6-8 read data that has already been through `JSON.parse`. That rules
+ * out `undefined`, `Date` and `Map` — but NOT a non-finite number: `JSON.parse
+ * ('{"x":1e999}').x` is `Infinity`, measured. Nor `__proto__`, which
+ * `JSON.parse` produces as a real own property. So a refusal IS reachable
+ * from a hand-edited or foreign file, and sites 6-7 are inside the ingester's
+ * quarantine `try`, where it becomes a quarantine record naming the reason
+ * rather than a lost directory. Site 8 is not itself guarded, but site 6
+ * digests the same policy object first inside that `try`, so an unrepresentable
+ * policy is quarantined before it can reach the store.
+ *
+ * A refusal therefore costs one recorded episode or one quarantined file,
+ * never a batch and never a directory.
  *
  * ─── LIMITS THAT REMAIN, TRUE ONES ────────────────────────────────────────
  *
