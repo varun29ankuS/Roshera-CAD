@@ -48,6 +48,7 @@ const client = new pg.default.Client({ connectionString });
 await client.connect();
 
 const completeText = readFileSync(completePath, "utf8");
+const malformedText = readFileSync(malformedPath, "utf8");
 const fixtureRows = rowsFromTrajectory(completeText, { path: completePath });
 const fixtureEpisodeId = fixtureRows.episode.episode_id;
 const fixtureRunId = fixtureRows.run.run_id;
@@ -65,8 +66,20 @@ const siblingText = [
 ].join("\n") + "\n";
 const siblingEpisodeId = rowsFromTrajectory(siblingText, { path: "sibling" }).episode.episode_id;
 
+// A second sibling: the file used for the "fixed after quarantine" arc
+// (Finding 1) — starts malformed at this path, then gets overwritten with
+// THIS valid content and re-ingested. Its own distinct episode_id keeps it
+// from interfering with the counts/idempotency checks above.
+const fixArcSeed = 999902;
+const fixArcText = [
+  JSON.stringify({ ...siblingHeader, task_id: "cylinder-r25-h60-quarantine-fix-probe", seed: fixArcSeed }),
+  ...siblingRest,
+].join("\n") + "\n";
+const fixArcEpisodeId = rowsFromTrajectory(fixArcText, { path: "fix-arc" }).episode.episode_id;
+
 const scratchDir = mkdtempSync(join(tmpdir(), "roshera-rl-ingest-store-"));
 const scratchPath = join(scratchDir, "drift-probe.jsonl");
+const fixArcPath = join(scratchDir, "quarantine-fix-probe.jsonl");
 
 async function countWhere(table, whereSql, params) {
   const r = await client.query(`SELECT count(*)::int AS n FROM ${table} WHERE ${whereSql}`, params);
@@ -76,11 +89,11 @@ async function countWhere(table, whereSql, params) {
 async function cleanup() {
   // rl_episode cascades to rl_step/rl_refusal/rl_claim_result/rl_recipe_step/
   // rl_solid/rl_lineage_edge/rl_recipe/rl_certificate (ON DELETE CASCADE) —
-  // deleting the two episode rows is enough to clear their whole subtree.
-  await client.query(`DELETE FROM rl_episode WHERE episode_id = $1 OR episode_id = $2`, [
-    fixtureEpisodeId, siblingEpisodeId,
+  // deleting the episode rows is enough to clear their whole subtree.
+  await client.query(`DELETE FROM rl_episode WHERE episode_id = $1 OR episode_id = $2 OR episode_id = $3`, [
+    fixtureEpisodeId, siblingEpisodeId, fixArcEpisodeId,
   ]);
-  await client.query(`DELETE FROM rl_quarantine WHERE path = $1`, [malformedPath]);
+  await client.query(`DELETE FROM rl_quarantine WHERE path = $1 OR path = $2`, [malformedPath, fixArcPath]);
 }
 
 const checks = [];
@@ -147,6 +160,56 @@ check("a malformed file is quarantined, not dropped, and re-ingesting it is idem
   const second = await ingestFile(client, malformedPath);
   assert.equal(second.status, "quarantined");
   assert.equal(await countWhere("rl_quarantine", "path = $1", [malformedPath]), 1, "still exactly one quarantine row for this path");
+});
+
+check("a path that was quarantined and is then fixed clears its stale quarantine row, and verify() reports no drift", async () => {
+  // Arrives malformed first.
+  writeFileSync(fixArcPath, malformedText, "utf8");
+  const first = await ingestFile(client, fixArcPath);
+  assert.equal(first.status, "quarantined");
+  assert.equal(await countWhere("rl_quarantine", "path = $1", [fixArcPath]), 1,
+    "the malformed arrival is quarantined");
+
+  // Someone fixes it on disk: same path, now valid content.
+  writeFileSync(fixArcPath, fixArcText, "utf8");
+  const second = await ingestFile(client, fixArcPath);
+  assert.equal(second.status, "ingested");
+  assert.equal(second.episode_id, fixArcEpisodeId);
+
+  assert.equal(await countWhere("rl_quarantine", "path = $1", [fixArcPath]), 0,
+    "the stale quarantine row for this path must be gone — it no longer describes this path's state");
+  assert.equal(await countWhere("rl_episode", "episode_id = $1", [fixArcEpisodeId]), 1);
+
+  const result = await verify(client);
+  assert.ok(
+    !result.drifted.some((d) => d.path === fixArcPath),
+    "verify() must not report drift for a path whose quarantine record was correctly cleared — " +
+      "a drift ratchet that cries over its own stale bookkeeping trains its operator to ignore it",
+  );
+});
+
+check("re-ingesting an episode whose certificate_summary has vanished deletes the stale rl_certificate row, leaving rl_recipe intact", async () => {
+  // fixArcPath currently holds fixArcText (ingested by the previous check).
+  // Every other fixture in this suite carries a certificate_summary, so
+  // without this check upsertRecipe's "cert vanished, DELETE it" branch
+  // (store.mjs, Finding-2 rewrite) would be implemented but never actually
+  // run by this suite.
+  const lines = fixArcText.trim().split("\n");
+  const terminal = JSON.parse(lines[lines.length - 1]);
+  assert.ok(terminal.recipe_ref?.certificate_summary, "sanity: the fixture terminal does carry one to remove");
+  delete terminal.recipe_ref.certificate_summary;
+  lines[lines.length - 1] = JSON.stringify(terminal);
+  const noCertText = lines.join("\n") + "\n";
+
+  writeFileSync(fixArcPath, noCertText, "utf8");
+  const res = await ingestFile(client, fixArcPath);
+  assert.equal(res.status, "ingested");
+  assert.equal(res.episode_id, fixArcEpisodeId, "same episode identity — task_id/seed/started_at unchanged");
+
+  assert.equal(await countWhere("rl_certificate", "episode_id = $1", [fixArcEpisodeId]), 0,
+    "the certificate row must not survive a re-ingest whose recipe no longer carries a certificate_summary");
+  assert.equal(await countWhere("rl_recipe", "episode_id = $1", [fixArcEpisodeId]), 1,
+    "the recipe row itself is still present — only its certificate rollup disappeared");
 });
 
 check("ingestDir walks every .jsonl fixture in a directory, ingesting the good one and quarantining the bad one", async () => {

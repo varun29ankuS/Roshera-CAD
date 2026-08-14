@@ -11,7 +11,11 @@
  *     the brief asks for ("Upsert keyed on (run_id, episode_id) with the
  *     source digest"). `episode_id` alone is the conflict target because it
  *     already embeds `run_id` (rows.mjs: `digestOf({run_id, task_id, seed,
- *     started_at})`), so a composite key would be redundant.
+ *     started_at})`), so a composite key would be redundant. `rl_recipe`/
+ *     `rl_certificate` additionally DELETE (never re-INSERT after) when the
+ *     row should stop existing at all — a recipe absent this ingest, or a
+ *     certificate_summary that vanished from an otherwise-present recipe —
+ *     because an upsert alone cannot make a row disappear.
  *
  *   - MANY ROWS PER EPISODE (`rl_step`, `rl_refusal`, `rl_claim_result`,
  *     `rl_recipe_step`, `rl_solid`, `rl_lineage_edge`): `DELETE FROM <table>
@@ -34,7 +38,11 @@
  * were, never half-written.
  *
  * `rl_quarantine` is idempotent the same way as the one-row-per-episode
- * family: `ON CONFLICT (path) DO UPDATE`.
+ * family: `ON CONFLICT (path) DO UPDATE`. And the reverse transition is
+ * handled too: `ingestFile`'s success path DELETEs any existing
+ * `rl_quarantine` row for that path in the SAME transaction as the episode
+ * write, so a path that used to be malformed and now ingests cleanly never
+ * leaves a stale quarantine entry for `verify()` to misreport as drift.
  */
 
 import { createHash } from "node:crypto";
@@ -186,15 +194,44 @@ async function replaceClaims(client, episodeId, claims) {
   }
 }
 
+/**
+ * `rl_recipe` and `rl_certificate` belong to the ONE-ROW-PER-EPISODE family
+ * (see this file's own top docstring and schema.mjs's): the write itself is
+ * `INSERT ... ON CONFLICT (episode_id) DO UPDATE`, exactly like
+ * `upsertEpisode` — not the many-rows delete-then-insert pattern. A DELETE
+ * is still issued, but only to cover the one thing an upsert cannot do:
+ * make a row STOP existing. `recipe` can be `null` on a re-ingest of an
+ * episode_id that was previously COMPLETED (recipe present) if the same
+ * identity now resolves to a non-COMPLETED outcome, and a present recipe's
+ * `certificate_summary` can independently disappear between two ingests —
+ * both are edge cases in practice (episode_id is content-addressed), but a
+ * stale row surviving a state that no longer produces one is exactly the
+ * kind of silent lie this store exists to refuse.
+ */
 async function upsertRecipe(client, episodeId, recipe) {
-  await client.query(`DELETE FROM rl_recipe WHERE episode_id = $1`, [episodeId]);
-  await client.query(`DELETE FROM rl_certificate WHERE episode_id = $1`, [episodeId]);
-  if (!recipe) return;
+  if (!recipe) {
+    await client.query(`DELETE FROM rl_recipe WHERE episode_id = $1`, [episodeId]);
+    await client.query(`DELETE FROM rl_certificate WHERE episode_id = $1`, [episodeId]);
+    return;
+  }
+
   await client.query(
     `INSERT INTO rl_recipe
        (episode_id, retrieved_by, reference, source, step_count, sequence_range,
         sequence_contiguous, undecodable_events, checkpoints, certificate_summary, note, absent)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+     ON CONFLICT (episode_id) DO UPDATE SET
+       retrieved_by = EXCLUDED.retrieved_by,
+       reference = EXCLUDED.reference,
+       source = EXCLUDED.source,
+       step_count = EXCLUDED.step_count,
+       sequence_range = EXCLUDED.sequence_range,
+       sequence_contiguous = EXCLUDED.sequence_contiguous,
+       undecodable_events = EXCLUDED.undecodable_events,
+       checkpoints = EXCLUDED.checkpoints,
+       certificate_summary = EXCLUDED.certificate_summary,
+       note = EXCLUDED.note,
+       absent = EXCLUDED.absent`,
     [
       episodeId, nn(recipe.retrieved_by), nn(recipe.reference), jsonb(recipe.source),
       nn(recipe.step_count), jsonb(recipe.sequence_range), nn(recipe.sequence_contiguous),
@@ -208,12 +245,25 @@ async function upsertRecipe(client, episodeId, recipe) {
     await client.query(
       `INSERT INTO rl_certificate
          (episode_id, steps_total, steps_with_recorded_certificate, sound, unsound, indeterminate, last_certified_sequence, note)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+       ON CONFLICT (episode_id) DO UPDATE SET
+         steps_total = EXCLUDED.steps_total,
+         steps_with_recorded_certificate = EXCLUDED.steps_with_recorded_certificate,
+         sound = EXCLUDED.sound,
+         unsound = EXCLUDED.unsound,
+         indeterminate = EXCLUDED.indeterminate,
+         last_certified_sequence = EXCLUDED.last_certified_sequence,
+         note = EXCLUDED.note`,
       [
         episodeId, nn(cert.steps_total), nn(cert.steps_with_recorded_certificate), nn(cert.sound),
         nn(cert.unsound), nn(cert.indeterminate), nn(cert.last_certified_sequence), nn(cert.note),
       ],
     );
+  } else {
+    // This recipe no longer carries a certificate_summary (or never did) —
+    // a stale one from a prior ingest of this same episode_id must not
+    // survive, or a reader would see a certificate that no longer applies.
+    await client.query(`DELETE FROM rl_certificate WHERE episode_id = $1`, [episodeId]);
   }
 }
 
@@ -288,6 +338,16 @@ export async function ingestFile(client, path) {
       await client.query("COMMIT");
       return { path, status: "quarantined", reason };
     }
+
+    // A path that was ONCE quarantined and is now ingesting successfully
+    // must not leave its stale rl_quarantine row behind: verify() reads
+    // rl_quarantine's own recorded path/source_digest independently of
+    // rl_episode, and a leftover row there would report this now-good file
+    // as drifted against a digest from the OLD, malformed content — a false
+    // alarm that trains an operator to ignore verify() entirely. Cleared in
+    // the SAME transaction as the episode write so the two tables can never
+    // disagree about this path's current state.
+    await client.query(`DELETE FROM rl_quarantine WHERE path = $1`, [path]);
 
     await upsertRun(client, rows.run);
     await upsertDimensions(client, rows.run.provenance);
