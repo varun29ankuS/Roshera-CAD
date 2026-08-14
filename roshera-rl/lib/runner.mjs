@@ -9,10 +9,25 @@
  */
 import { join } from "node:path";
 import { mkdirSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { runEpisode, reapDocument, reapPart, unscoredFor, MCP_VERSION } from "./episode.mjs";
 import { OUTCOMES, openTrajectory } from "./trajectory.mjs";
-import { spawnMcpSession } from "./mcp_session.mjs";
+import { spawnMcpSession, defaultMcpEntry } from "./mcp_session.mjs";
 import { mergeFinal } from "./reward.mjs";
+import { resolveKernelIdentity, buildProvenance } from "./provenance.mjs";
+
+/**
+ * THIS FILE'S OWN LOCATION → the `roshera-rl` package root, the default
+ * `harnessRoot` `buildProvenance` reads the harness's own git identity from.
+ *
+ * `new URL("..", import.meta.url).pathname` would do here what it does at
+ * every other call site on this machine: percent-encode the space in
+ * `C:\Users\Varun Sharma\` and hand `git`/`fs` a path that does not exist —
+ * `fileURLToPath` decodes it back to a real one. Same reasoning as
+ * `defaultMcpEntry` (mcp_session.mjs:194-196), which this module now also
+ * relies on for the same class of bug.
+ */
+const DEFAULT_HARNESS_ROOT = fileURLToPath(new URL("..", import.meta.url));
 
 /**
  * THE REAPER — the batch-level backstop `episode.mjs` names.
@@ -114,9 +129,29 @@ function policyFactoryFailed({ item, trajectoryPath, kernelSha, error }) {
 
 export async function runBatch({
   tasks, policyFor, seeds, concurrency = 4, baseUrl, authHeader = {},
-  outDir, kernelSha, mcpEntry, spawn = spawnMcpSession,
+  outDir, kernelSha, mcpEntry, harnessRoot = DEFAULT_HARNESS_ROOT, spawn = spawnMcpSession,
 }) {
   mkdirSync(outDir, { recursive: true });
+
+  // THE REFUSAL HAPPENS HERE — before the queue exists, before a single
+  // worker is started, before anything is spawned. `kernelSha` here is the
+  // OPERATOR'S CLAIM (e.g. ROSHERA_KERNEL_SHA); it is asked of the server
+  // exactly once for the whole batch, and a genuine disagreement is a
+  // `KernelIdentityConflict` that PROPAGATES OUT OF THIS FUNCTION uncaught.
+  // It must never be caught into a per-episode outcome: that would turn one
+  // honest "this batch cannot say which kernel produced it" into eight
+  // reported failures, each looking like its own defect.
+  const kernel = await resolveKernelIdentity({ baseUrl, authHeader, claimed: kernelSha });
+
+  // Resolved ONCE, not per episode: the MCP entry path is the same child
+  // every episode in this batch spawns, so its digest — and the fact that it
+  // could or could not be read — belongs in every episode's provenance
+  // identically. `defaultMcpEntry()` is the same real filesystem path
+  // `spawnMcpSession` itself falls back to (mcp_session.mjs:504-511); reusing
+  // it here means the digest `buildProvenance` records is a digest of the
+  // file that actually ran, not of some other candidate path.
+  const resolvedMcpEntry = mcpEntry ?? defaultMcpEntry();
+
   const queue = tasks.map((task, i) => ({ task, seed: seeds[i] ?? i, i }));
   const results = [];
 
@@ -143,11 +178,20 @@ export async function runBatch({
         );
         continue;
       }
+      // Built per episode, not once for the batch: `policy.describe()` can
+      // differ episode to episode (a policy factory is free to return a
+      // different policy per task/seed), and the task itself always does —
+      // so the `attributable` verdict has to be recomputed for what THIS
+      // episode actually ran, not copied from its first sibling.
+      const provenance = await buildProvenance({
+        kernel, policy, task: item.task, mcpEntry: resolvedMcpEntry, harnessRoot,
+      });
       // An episode never throws: every failure mode is a named outcome. A
       // worker that could die on one episode would silently shrink the batch.
       const r = await runEpisode({
         task: item.task, policy, seed: item.seed,
-        baseUrl, authHeader, trajectoryPath, kernelSha, mcpEntry, spawn,
+        baseUrl, authHeader, trajectoryPath, kernelSha, mcpEntry: resolvedMcpEntry,
+        spawn, provenance,
       }).catch((e) => ({
         outcome: "CRASHED", rewardFinal: { components: {}, gaps: [] },
         documentId: null, partId: null, trajectoryPath, wallMs: 0,

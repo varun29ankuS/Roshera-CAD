@@ -21,6 +21,7 @@ import { scriptedPolicy } from "../lib/policy.mjs";
 import { defineTask } from "../lib/task.mjs";
 import { readToolResult } from "../lib/mcp_session.mjs";
 import { OUTCOMES, readTrajectory } from "../lib/trajectory.mjs";
+import { KernelIdentityConflict } from "../lib/provenance.mjs";
 
 const dir = mkdtempSync(join(tmpdir(), "roshera-run-"));
 let n = 0;
@@ -30,8 +31,18 @@ const deleteLog = [];
 
 let parts = 0;
 
+// What `/health` reports for `resolveKernelIdentity` to read. Defaults to no
+// `build` object at all — the server-cannot-say branch, which is not a
+// conflict — so every check below that does not care about kernel identity
+// keeps behaving exactly as it did before `runBatch` started resolving one.
+let healthReply = {};
+
 const stub = http.createServer((req, res) => {
   const url = req.url ?? "";
+  if (req.method === "GET" && url === "/health") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify(healthReply));
+  }
   // Each episode allocates its own BRepModel (api-server/src/part_mgr.rs:
   // 340-358) and drops it at reap (:416-427).
   if (req.method === "POST" && url === "/api/parts") {
@@ -280,6 +291,79 @@ check("a document the reaper still cannot drop is REPORTED, not assumed clean", 
   assert.equal(orphans[0].documentId, nextDoc);
   assert.ok(orphans[0].reason.includes("409"), "and the refusal reason is carried, not flattened");
   assert.equal(results[0].reap.reaped, false);
+});
+
+check("a conflicting kernel claim refuses the WHOLE BATCH before any episode runs", async () => {
+  // The server states one build; the operator claims another. `runBatch`
+  // must ask ONCE, up front, and a genuine disagreement is a batch-level
+  // refusal — never a per-episode outcome, and never after work has begun.
+  healthReply = { build: { sha: "aaa", dirty: false } };
+  const spawned = [];
+  const spySpawn = async ({ documentId }) => {
+    spawned.push(documentId);
+    return {
+      async call() { return CREATED_OK; },
+      async claims(cs) { return cs.map((c) => ({ name: c.name, verified: true })); },
+      async recipeRef() { return { step_count: 1, steps: [] }; },
+      async modelScope() { return OWN_MODEL_ONLY; },
+      async close() {},
+    };
+  };
+  try {
+    // Three tasks at concurrency 3: if the resolve happened anywhere other
+    // than before the worker pool starts, all three workers would be free to
+    // spawn immediately and `spawned` would be non-empty by the time the
+    // rejection is observed.
+    await assert.rejects(
+      () => runBatch({
+        tasks: [task, task, task],
+        policyFor: () => scriptedPolicy([{ tool: "create_cylinder", args: {} }]),
+        seeds: [1, 2, 3], concurrency: 3, baseUrl, authHeader: {}, outDir: dir,
+        kernelSha: "bbb", spawn: spySpawn,
+      }),
+      (e) => e instanceof KernelIdentityConflict && /aaa/.test(e.message) && /bbb/.test(e.message),
+      "the rejection must be the named conflict, carrying both builds",
+    );
+  } finally {
+    healthReply = {};
+  }
+  // THE PROPERTY THAT MATTERS MOST: not that the call rejected, but that it
+  // rejected BEFORE any episode ran. A refusal that fires after eight rows
+  // were already written is a complaint, not a refusal.
+  assert.equal(spawned.length, 0,
+    "no session may have been spawned — the refusal happens before any worker starts, not after");
+});
+
+check("a real batch's provenance block is ATTRIBUTABLE — runBatch's OWN DEFAULTS resolve cleanly", async () => {
+  // The one check that would have caught a `new URL(...).pathname` bug: this
+  // machine's account directory is `C:\Users\Varun Sharma\`, and a path built
+  // from a percent-encoded, non-decoded URL does not exist on disk. Neither
+  // `mcpEntry` nor `harnessRoot` is passed here — deliberately, so what is
+  // under test is `runBatch`'s OWN default resolution (`defaultMcpEntry()`
+  // and `DEFAULT_HARNESS_ROOT`), the exact code path every real batch on
+  // this machine actually runs. A test that injected its own already-correct
+  // paths here would stay green even if the defaults regressed to
+  // `.pathname` — which is precisely how that class of bug hides. Every
+  // identity in the block should resolve and `attributable` should read
+  // true; a false negative here means every real batch on this machine
+  // silently produced unattributable rows.
+  healthReply = { build: { sha: "cafefeed", dirty: false } };
+  try {
+    const { results } = await runBatch({
+      tasks: [task], policyFor: () => scriptedPolicy([{ tool: "create_cylinder", args: { radius: 25 } }]),
+      seeds: [1], concurrency: 1, baseUrl, authHeader: {}, outDir: dir,
+      spawn: fakeSpawn,
+    });
+    const { header } = readTrajectory(results[0].trajectoryPath);
+    assert.equal(header.provenance.kernel.sha, "cafefeed");
+    assert.equal(header.provenance.kernel.reported_by, "server");
+    assert.ok("dist_digest" in header.provenance.mcp,
+      "a readable dist/index.js must produce a real digest, not an absence");
+    assert.equal(header.provenance.attributable, true,
+      `expected an attributable block with real paths, got ${JSON.stringify(header.provenance)}`);
+  } finally {
+    healthReply = {};
+  }
 });
 
 for (const [name, fn] of checks) { await fn(); process.stdout.write(`  ok - ${name}\n`); }

@@ -68,7 +68,17 @@ const testSpawn = process.env.ROSHERA_RL_TEST_SPAWN
 const { tally, results, orphans } = await runBatch({
   tasks, seeds, concurrency, baseUrl,
   authHeader: key ? { Authorization: `ApiKey ${key}` } : {},
-  outDir, kernelSha: process.env.ROSHERA_KERNEL_SHA ?? "unknown",
+  outDir,
+  // The OPERATOR'S CLAIM, and nothing else — `runBatch` asks the server what
+  // it actually is and refuses the whole batch if the two disagree
+  // (provenance.mjs `resolveKernelIdentity`). This used to default to the
+  // literal string `"unknown"`, which is exactly the kind of value the claim
+  // check exists to catch: every batch run without the env var set would have
+  // "claimed" a build named unknown, disagreed with whatever the live server
+  // actually reports, and refused before a single episode ran. Leaving it
+  // `undefined` when unset means "no claim was made" — the server's own
+  // answer is recorded either way.
+  kernelSha: process.env.ROSHERA_KERNEL_SHA,
   mcpEntry: process.env.ROSHERA_MCP_ENTRY,
   ...(testSpawn ? { spawn: testSpawn } : {}),
   // The seed task's reference policy. It is NOT `scriptedPolicy` because the

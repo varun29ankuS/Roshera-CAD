@@ -165,7 +165,7 @@ export async function reapDocument(baseUrl, authHeader, documentId) {
 
 export async function runEpisode({
   task, policy, seed, baseUrl, authHeader, mcpEntry, trajectoryPath,
-  kernelSha, mcpVersion = MCP_VERSION, spawn = spawnMcpSession,
+  kernelSha, mcpVersion = MCP_VERSION, spawn = spawnMcpSession, provenance,
 }) {
   const started = Date.now();
   // An episode never throws: every failure mode is a named outcome, and that
@@ -176,7 +176,7 @@ export async function runEpisode({
   try {
     traj = openTrajectory({
       path: trajectoryPath, taskId: task.id, seed, kernelSha, mcpVersion,
-      toolAllowlist: [...task.toolAllowlist], split: task.split,
+      toolAllowlist: [...task.toolAllowlist], split: task.split, provenance,
     });
   } catch (e) {
     return {
