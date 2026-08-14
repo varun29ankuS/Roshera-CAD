@@ -1,0 +1,357 @@
+/**
+ * Store — the IMPURE half of ingestion: takes `rowsFromTrajectory`'s pure
+ * output (Task 5, `lib/ingest/rows.mjs`) and lands it in Postgres.
+ *
+ * IDEMPOTENCY, the load-bearing property here, is split across two table
+ * families on purpose (see schema.mjs's own docstring for the full
+ * rationale):
+ *
+ *   - ONE ROW PER EPISODE (`rl_episode`, `rl_recipe`, `rl_certificate`):
+ *     `INSERT ... ON CONFLICT (episode_id) DO UPDATE` — literally the shape
+ *     the brief asks for ("Upsert keyed on (run_id, episode_id) with the
+ *     source digest"). `episode_id` alone is the conflict target because it
+ *     already embeds `run_id` (rows.mjs: `digestOf({run_id, task_id, seed,
+ *     started_at})`), so a composite key would be redundant.
+ *
+ *   - MANY ROWS PER EPISODE (`rl_step`, `rl_refusal`, `rl_claim_result`,
+ *     `rl_recipe_step`, `rl_solid`, `rl_lineage_edge`): `DELETE FROM <table>
+ *     WHERE episode_id = $1` immediately before the bulk re-insert, inside
+ *     the SAME transaction as the episode upsert. Re-ingesting the same
+ *     file always takes this delete-then-insert path (there is no
+ *     "unchanged, skip" short-circuit) — an offline loader re-reading its
+ *     own fixture is not a hot path worth optimizing away, and skipping it
+ *     would hide exactly the bug this design mutation-proves against: THE
+ *     DELETE IS THE ENTIRE IDEMPOTENCY GUARD for this table family. Comment
+ *     it out and a second `ingestFile` of the same path doubles every one
+ *     of those tables' row counts for that episode — no Postgres error,
+ *     because there is deliberately no uniqueness constraint on the natural
+ *     key for this family (only a surrogate `BIGSERIAL` id) forcing that
+ *     guard to live in application code where it can be mutation-tested.
+ *
+ * Every write for one file happens inside ONE transaction ("one transaction
+ * per episode so a partial ingest leaves whole episodes" — brief, Step 3):
+ * a crash mid-ingest leaves the previous episode's rows exactly as they
+ * were, never half-written.
+ *
+ * `rl_quarantine` is idempotent the same way as the one-row-per-episode
+ * family: `ON CONFLICT (path) DO UPDATE`.
+ */
+
+import { createHash } from "node:crypto";
+import { readFileSync, readdirSync } from "node:fs";
+import { join } from "node:path";
+import { rowsFromTrajectory } from "./rows.mjs";
+import { digestOf } from "../provenance.mjs";
+
+/**
+ * Same algorithm as rows.mjs's private `sha256Hex` (not exported there, and
+ * rows.mjs is deliberately left unmodified — this store is out of that
+ * module's scope). Duplicated rather than imported: three lines, no shared
+ * state, and rows.mjs's own `episode.source_digest` field is already this
+ * exact value for any file that parses, so the two never disagree.
+ */
+function sha256Hex(text) {
+  return "sha256:" + createHash("sha256").update(text).digest("hex");
+}
+
+/** `undefined`/`null` become SQL NULL; everything else is stored as JSON text, which Postgres's jsonb input function parses on the way in. Node's `pg` driver does NOT do this for you — a bare JS array/object passed as a parameter is serialized as a Postgres ARRAY LITERAL, not JSON, and corrupts a jsonb column silently. */
+function jsonb(v) {
+  return v === undefined || v === null ? null : JSON.stringify(v);
+}
+
+function nn(v) {
+  return v === undefined ? null : v;
+}
+
+async function upsertRun(client, run) {
+  await client.query(
+    `INSERT INTO rl_run
+       (run_id, schema_version, kernel_claimed, mcp_version, tool_allowlist, split, provenance, attributable)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+     ON CONFLICT (run_id) DO NOTHING`,
+    [
+      run.run_id, nn(run.schema_version), nn(run.kernel_claimed), nn(run.mcp_version),
+      jsonb(run.tool_allowlist), nn(run.split), jsonb(run.provenance), run.attributable,
+    ],
+  );
+}
+
+/**
+ * Deduplicated analytical rollups of identity fields already carried
+ * (redundantly, as JSONB) inside `rl_run.provenance`. Populated only when
+ * the corresponding identity is a REAL descriptor rather than a stated
+ * absence (`{absent: "..."}`) — an absent kernel/policy/task has nothing to
+ * dimension, and inventing a row for it would be exactly the kind of
+ * default-to-a-guess this project's identity rule forbids.
+ */
+async function upsertDimensions(client, provenance) {
+  const kernel = provenance?.kernel;
+  if (kernel && typeof kernel === "object" && typeof kernel.sha === "string") {
+    await client.query(
+      `INSERT INTO rl_kernel_build (sha, dirty, reported_by)
+       VALUES ($1,$2,$3)
+       ON CONFLICT (sha) DO NOTHING`,
+      [kernel.sha, kernel.dirty === true, nn(kernel.reported_by)],
+    );
+  }
+
+  const policy = provenance?.policy;
+  if (policy && typeof policy === "object" && typeof policy.absent !== "string") {
+    const policyDigest = digestOf(policy);
+    await client.query(
+      `INSERT INTO rl_policy (policy_digest, kind, describe)
+       VALUES ($1,$2,$3)
+       ON CONFLICT (policy_digest) DO NOTHING`,
+      [policyDigest, nn(policy.kind), jsonb(policy)],
+    );
+  }
+
+  const task = provenance?.task;
+  if (task && typeof task === "object" && typeof task.digest === "string") {
+    if (typeof task.family === "string" && task.family !== "") {
+      await client.query(
+        `INSERT INTO rl_task_family (name) VALUES ($1) ON CONFLICT (name) DO NOTHING`,
+        [task.family],
+      );
+    }
+    await client.query(
+      `INSERT INTO rl_task (task_digest, task_id, family)
+       VALUES ($1,$2,$3)
+       ON CONFLICT (task_digest) DO NOTHING`,
+      [task.digest, nn(task.id), nn(task.family)],
+    );
+  }
+}
+
+async function upsertEpisode(client, episode) {
+  await client.query(
+    `INSERT INTO rl_episode
+       (episode_id, run_id, path, task_id, seed, started_at, outcome, attributable,
+        reward_final, tokens, wall_ms, error, model_scope, source_digest, ingested_at)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14, now())
+     ON CONFLICT (episode_id) DO UPDATE SET
+       run_id = EXCLUDED.run_id,
+       path = EXCLUDED.path,
+       task_id = EXCLUDED.task_id,
+       seed = EXCLUDED.seed,
+       started_at = EXCLUDED.started_at,
+       outcome = EXCLUDED.outcome,
+       attributable = EXCLUDED.attributable,
+       reward_final = EXCLUDED.reward_final,
+       tokens = EXCLUDED.tokens,
+       wall_ms = EXCLUDED.wall_ms,
+       error = EXCLUDED.error,
+       model_scope = EXCLUDED.model_scope,
+       source_digest = EXCLUDED.source_digest,
+       ingested_at = now()`,
+    [
+      episode.episode_id, episode.run_id, nn(episode.path), episode.task_id, nn(episode.seed),
+      nn(episode.started_at), episode.outcome, episode.attributable, jsonb(episode.reward_final),
+      nn(episode.tokens), nn(episode.wall_ms), nn(episode.error), jsonb(episode.model_scope),
+      episode.source_digest,
+    ],
+  );
+}
+
+async function replaceSteps(client, episodeId, steps) {
+  await client.query(`DELETE FROM rl_step WHERE episode_id = $1`, [episodeId]);
+  for (const s of steps) {
+    await client.query(
+      `INSERT INTO rl_step (episode_id, step_index, tool, args, result_digest, reward, duration_ms)
+       VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+      [episodeId, s.index, nn(s.tool), jsonb(s.args), nn(s.result_digest), jsonb(s.reward), nn(s.duration_ms)],
+    );
+  }
+}
+
+async function replaceRefusals(client, episodeId, refusals) {
+  await client.query(`DELETE FROM rl_refusal WHERE episode_id = $1`, [episodeId]);
+  for (const r of refusals) {
+    await client.query(
+      `INSERT INTO rl_refusal (episode_id, step_index, gate, reason)
+       VALUES ($1,$2,$3,$4)`,
+      [episodeId, r.step_index, nn(r.gate), nn(r.reason)],
+    );
+  }
+}
+
+async function replaceClaims(client, episodeId, claims) {
+  await client.query(`DELETE FROM rl_claim_result WHERE episode_id = $1`, [episodeId]);
+  for (const c of claims) {
+    await client.query(
+      `INSERT INTO rl_claim_result (episode_id, name, verified, expected, computed, abs_error, tolerance_used, absent)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+      [episodeId, c.name, nn(c.verified), nn(c.expected), nn(c.computed), nn(c.abs_error), nn(c.tolerance_used), nn(c.absent)],
+    );
+  }
+}
+
+async function upsertRecipe(client, episodeId, recipe) {
+  await client.query(`DELETE FROM rl_recipe WHERE episode_id = $1`, [episodeId]);
+  await client.query(`DELETE FROM rl_certificate WHERE episode_id = $1`, [episodeId]);
+  if (!recipe) return;
+  await client.query(
+    `INSERT INTO rl_recipe
+       (episode_id, retrieved_by, reference, source, step_count, sequence_range,
+        sequence_contiguous, undecodable_events, checkpoints, certificate_summary, note, absent)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+    [
+      episodeId, nn(recipe.retrieved_by), nn(recipe.reference), jsonb(recipe.source),
+      nn(recipe.step_count), jsonb(recipe.sequence_range), nn(recipe.sequence_contiguous),
+      nn(recipe.undecodable_events), jsonb(recipe.checkpoints), jsonb(recipe.certificate_summary),
+      nn(recipe.note), nn(recipe.absent),
+    ],
+  );
+
+  const cert = recipe.certificate_summary;
+  if (cert && typeof cert === "object") {
+    await client.query(
+      `INSERT INTO rl_certificate
+         (episode_id, steps_total, steps_with_recorded_certificate, sound, unsound, indeterminate, last_certified_sequence, note)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+      [
+        episodeId, nn(cert.steps_total), nn(cert.steps_with_recorded_certificate), nn(cert.sound),
+        nn(cert.unsound), nn(cert.indeterminate), nn(cert.last_certified_sequence), nn(cert.note),
+      ],
+    );
+  }
+}
+
+async function replaceRecipeSteps(client, episodeId, recipeSteps) {
+  await client.query(`DELETE FROM rl_recipe_step WHERE episode_id = $1`, [episodeId]);
+  for (const st of recipeSteps) {
+    await client.query(
+      `INSERT INTO rl_recipe_step
+         (episode_id, sequence, op_kind, params, inputs, outputs, intent,
+          checkpoint, checkpoint_absent_reason, reissue, reissue_absent_reason)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+      [
+        episodeId, st.sequence, nn(st.op_kind), jsonb(st.params), jsonb(st.inputs), jsonb(st.outputs),
+        nn(st.intent), jsonb(st.checkpoint), nn(st.checkpoint_absent_reason), jsonb(st.reissue),
+        nn(st.reissue_absent_reason),
+      ],
+    );
+  }
+}
+
+async function replaceSolids(client, episodeId, solids) {
+  await client.query(`DELETE FROM rl_solid WHERE episode_id = $1`, [episodeId]);
+  for (const s of solids) {
+    await client.query(
+      `INSERT INTO rl_solid (episode_id, token, produced_by_sequence, op_kind)
+       VALUES ($1,$2,$3,$4)`,
+      [episodeId, s.token, nn(s.produced_by_sequence), nn(s.op_kind)],
+    );
+  }
+}
+
+async function replaceLineageEdges(client, episodeId, edges) {
+  await client.query(`DELETE FROM rl_lineage_edge WHERE episode_id = $1`, [episodeId]);
+  for (const e of edges) {
+    await client.query(
+      `INSERT INTO rl_lineage_edge (episode_id, from_token, to_token, via_sequence, op_kind)
+       VALUES ($1,$2,$3,$4,$5)`,
+      [episodeId, e.from, e.to, nn(e.via_sequence), nn(e.op_kind)],
+    );
+  }
+}
+
+async function upsertQuarantine(client, path, reason, sourceDigest) {
+  await client.query(
+    `INSERT INTO rl_quarantine (path, reason, source_digest, ingested_at)
+     VALUES ($1,$2,$3, now())
+     ON CONFLICT (path) DO UPDATE SET
+       reason = EXCLUDED.reason,
+       source_digest = EXCLUDED.source_digest,
+       ingested_at = now()`,
+    [path, reason, sourceDigest],
+  );
+}
+
+/**
+ * Ingest one JSONL file. JSONL is the source of truth (the run loop never
+ * depends on this): this function only ever reads a file already on disk
+ * and never mutates it. Wrapped in one transaction — a crash mid-write
+ * rolls back to the previous state of this one episode (or quarantine
+ * entry), never a half-written row set.
+ */
+export async function ingestFile(client, path) {
+  const text = readFileSync(path, "utf8");
+  const sourceDigest = sha256Hex(text);
+  const rows = rowsFromTrajectory(text, { path });
+
+  await client.query("BEGIN");
+  try {
+    if (rows.quarantine) {
+      const reason = rows.quarantine[0].reason;
+      await upsertQuarantine(client, path, reason, sourceDigest);
+      await client.query("COMMIT");
+      return { path, status: "quarantined", reason };
+    }
+
+    await upsertRun(client, rows.run);
+    await upsertDimensions(client, rows.run.provenance);
+    await upsertEpisode(client, rows.episode);
+    await replaceSteps(client, rows.episode.episode_id, rows.steps);
+    await replaceRefusals(client, rows.episode.episode_id, rows.refusals);
+    await replaceClaims(client, rows.episode.episode_id, rows.claims);
+    await upsertRecipe(client, rows.episode.episode_id, rows.recipe);
+    await replaceRecipeSteps(client, rows.episode.episode_id, rows.recipeSteps);
+    await replaceSolids(client, rows.episode.episode_id, rows.solids);
+    await replaceLineageEdges(client, rows.episode.episode_id, rows.lineageEdges);
+    await client.query("COMMIT");
+    return { path, status: "ingested", episode_id: rows.episode.episode_id, run_id: rows.run.run_id };
+  } catch (e) {
+    await client.query("ROLLBACK");
+    throw e;
+  }
+}
+
+/** Ingest every `.jsonl` file directly inside `dir`, in name order, one at a time (foreground, no concurrency — this is an offline loader, not a service). */
+export async function ingestDir(client, dir) {
+  const files = readdirSync(dir).filter((f) => f.endsWith(".jsonl")).sort();
+  const results = [];
+  for (const f of files) {
+    results.push(await ingestFile(client, join(dir, f)));
+  }
+  return results;
+}
+
+/**
+ * Re-read every file this store has a recorded path for (episodes and
+ * quarantine entries alike) and compare its current bytes against the
+ * digest recorded at ingest time. JSONL is the source of truth: if a file
+ * changed or vanished on disk since it was ingested, the DATABASE is now
+ * the stale copy, and `verify` exists to say so rather than let a query
+ * silently trust rows nothing revalidated.
+ */
+export async function verify(client) {
+  const episodes = await client.query(
+    `SELECT path, source_digest FROM rl_episode WHERE path IS NOT NULL`,
+  );
+  const quarantined = await client.query(
+    `SELECT path, source_digest FROM rl_quarantine WHERE path IS NOT NULL`,
+  );
+  const rows = [...episodes.rows, ...quarantined.rows];
+
+  let checked = 0;
+  const drifted = [];
+  for (const row of rows) {
+    checked += 1;
+    let text;
+    try {
+      text = readFileSync(row.path, "utf8");
+    } catch (e) {
+      drifted.push({ path: row.path, reason: `the file could not be read at its recorded path: ${e?.message ?? e}` });
+      continue;
+    }
+    const digestNow = sha256Hex(text);
+    if (digestNow !== row.source_digest) {
+      drifted.push({
+        path: row.path,
+        reason: `the file's bytes changed since it was ingested (recorded ${row.source_digest}, now ${digestNow})`,
+      });
+    }
+  }
+  return { checked, drifted };
+}
