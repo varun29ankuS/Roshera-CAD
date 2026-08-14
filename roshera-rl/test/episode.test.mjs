@@ -26,11 +26,24 @@ import { readToolResult } from "../lib/mcp_session.mjs";
 const dir = mkdtempSync(join(tmpdir(), "roshera-ep-"));
 const created = [];
 const deleted = [];
+const parts = [];
 let failCreate = false;
 let createStatus = 500;
 
 const stub = http.createServer((req, res) => {
   const url = req.url ?? "";
+  // The episode allocates its own BRepModel beside its document
+  // (api-server/src/part_mgr.rs:340-358) and drops it at reap (:416-427).
+  if (req.method === "POST" && url === "/api/parts") {
+    const id = `part-${parts.length}`;
+    parts.push(id);
+    res.writeHead(200, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ id }));
+  }
+  if (req.method === "DELETE" && url.startsWith("/api/parts/")) {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ success: true, id: url.split("/").pop() }));
+  }
   if (req.method === "POST" && url === "/api/documents") {
     if (failCreate) { res.writeHead(createStatus); return res.end("{}"); }
     const id = `doc-${created.length}`;
@@ -95,6 +108,13 @@ function fakeSpawn(behaviour) {
       return taskClaims.map((c) => ({ name: c.name, verified: true, computed: c.expected }));
     },
     async recipeRef() { return RECIPE; },
+    // mcp_session.mjs `readModelScope` — one solid, the one this episode built.
+    async modelScope() {
+      return {
+        read_by: "list_parts", visible_parts: [1], visible_count: 1,
+        built_here: 1, shared_model_detected: false,
+      };
+    },
     async close() {},
   });
 }

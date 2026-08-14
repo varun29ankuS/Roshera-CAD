@@ -94,12 +94,37 @@ process.stdout.write(`\n${results.length} episodes → ${outDir}\n`);
 for (const [outcome, n] of Object.entries(tally)) {
   process.stdout.write(`  ${outcome.padEnd(17)} ${n}\n`);
 }
-// Stated, never assumed clean: a document the reaper could not drop is still
-// live in PartManager's DashMap, and silence here would be the assertion that
-// it isn't.
+// MODEL ISOLATION, per episode, from each session's own `list_parts` read
+// (lib/mcp_session.mjs `readModelScope`). Every episode here builds ONE
+// cylinder, so an isolated session sees exactly one solid; a session that sees
+// more is reading another episode's `BRepModel` — which is what eight
+// concurrent episodes did on 2026-08-13, with nothing in the output saying so.
+// Episodes that never scored report an absence and are counted as such, never
+// as isolated.
+const scopes = results.map((r) => r.modelScope ?? { absent: "no reading was returned" });
+const shared = scopes.filter((s) => s.shared_model_detected === true);
+const unread = scopes.filter((s) => typeof s.absent === "string");
+process.stdout.write(
+  `\nmodel isolation: ${scopes.length - shared.length - unread.length}/${results.length} ` +
+  `episodes saw only what they built` +
+  (unread.length ? `, ${unread.length} took no reading` : "") + `\n`,
+);
+for (const s of shared) {
+  process.stdout.write(
+    `  ⚠ SHARED MODEL: ${s.visible_count} solid(s) visible [${s.visible_parts.join(", ")}], ` +
+    `${s.built_here} built here\n`,
+  );
+}
+
+// Stated, never assumed clean: a document or part the reaper could not drop is
+// still live in PartManager's DashMap, and silence here would be the assertion
+// that it isn't.
 if (orphans.length) {
-  process.stdout.write(`\n⚠ ${orphans.length} document(s) NOT reaped:\n`);
-  for (const o of orphans) process.stdout.write(`  ${o.documentId}  ${o.reason}\n`);
+  process.stdout.write(`\n⚠ ${orphans.length} resource(s) NOT reaped:\n`);
+  for (const o of orphans) {
+    const what = o.documentId ? `document ${o.documentId}` : `part ${o.partId}`;
+    process.stdout.write(`  ${what}  ${o.reason}\n`);
+  }
 }
 
 /** What this run produced. Exported so the wiring test can assert the entry

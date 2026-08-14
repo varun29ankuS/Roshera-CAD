@@ -1,10 +1,16 @@
 /**
  * The real MCP session: a stdio client against a `roshera-mcp` process
- * PINNED to one document via ROSHERA_DOCUMENT.
+ * PINNED to one document via ROSHERA_DOCUMENT and to one part document via
+ * ROSHERA_PART.
  *
- * The pin is what makes parallel episodes possible. Without it every process
- * discovers the globally-`active` document and they all land on the same one
- * (roshera-mcp/src/core.ts::bindSessionDocument, core.ts:116-138).
+ * Both pins are what make parallel episodes possible, and they scope different
+ * things. Without the document pin every process discovers the globally-
+ * `active` document and they all land on the same one
+ * (roshera-mcp/src/core.ts::bindSessionDocument, core.ts:116-138). Without the
+ * part pin every process's kernel calls resolve to the ONE global
+ * `AppState.model`, whatever their documents, because `ActiveModel` routes on
+ * `X-Roshera-Part-Id` and falls back when it is absent
+ * (api-server/src/part_mgr.rs:264, 286-312). See `childEnv` below.
  *
  * ─── THE WIRE CONTRACT THIS MODULE SPEAKS ────────────────────────────────
  *
@@ -220,6 +226,95 @@ export function credentialEnv(authHeader) {
 }
 
 /**
+ * The child process's environment: the two pins, the backend URL, the ambient
+ * perception mode, and the credential.
+ *
+ * Exported and pure for the same reason `credentialEnv` is: what the child is
+ * scoped to is the whole isolation claim, and the only thing that could
+ * exercise it inside `spawnMcpSession` is a real MCP process.
+ *
+ * `ROSHERA_PART` names the part document whose `BRepModel` this episode owns
+ * (`POST /api/parts`, api-server/src/part_mgr.rs:340-358). The child turns it
+ * into an `X-Roshera-Part-Id` header on every call (roshera-mcp/src/core.ts
+ * `bindSessionPart`), which is what `ActiveModel` routes on
+ * (part_mgr.rs:264, 286-312). Without it the child sends no header and the
+ * backend resolves every call to the ONE global `AppState.model`
+ * (part_mgr.rs:291-296) — the shared model measured across 8 live episodes.
+ *
+ * When no part is held the KEY IS REMOVED, not left undefined: the child
+ * inherits `process.env`, so a stale `ROSHERA_PART` in the parent would
+ * silently pin an episode to a model it never created.
+ *
+ * `ROSHERA_AMBIENT_PERCEPTION` is pinned to `cert` deliberately. The DEFAULT
+ * is `compact` (roshera-mcp/src/core.ts:916, 923-926), under which
+ * `perception` is a one-line STRING from `compactVerdict` — `perception.sound`
+ * does not exist and soundness is unreadable for every step of every episode.
+ * `cert` (core.ts:930) returns the full perception OBJECT and, unlike
+ * `full`/`xray`, attaches no render image: the boolean this environment scores
+ * on, without paying for pixels no policy here looks at.
+ */
+export function childEnv({ documentId, partId, baseUrl, credential }) {
+  const env = {
+    ...process.env,
+    ROSHERA_DOCUMENT: documentId,
+    ROSHERA_URL: baseUrl,
+    ROSHERA_AMBIENT_PERCEPTION: "cert",
+    ...credential,
+  };
+  if (partId) {
+    env.ROSHERA_PART = partId;
+  } else {
+    delete env.ROSHERA_PART;
+  }
+  return env;
+}
+
+/**
+ * WHAT THIS SESSION'S MODEL ACTUALLY HOLDS — the isolation reading, taken
+ * from inside the episode and recorded in its trajectory.
+ *
+ * `list_parts` is a plain `GET /api/agent/parts` (roshera-mcp/src/tools/
+ * inspect.ts:9-21) served through `ActiveModel`, so it enumerates exactly the
+ * solids in whichever `BRepModel` this session resolves to, returning
+ * `PartSummary` rows — `{id, name, anchor_datum_id, anchor_datum_name,
+ * location_oneliner}` (geometry-engine/src/readable/part.rs:405-416), where
+ * `id` is the kernel integer `SolidId`.
+ *
+ * That makes a shared model DETECTABLE FROM THE RECORD rather than merely
+ * absent from it: an episode that built one cylinder and can see eight solids
+ * is reading seven it never made. `shared_model_detected` states exactly that
+ * comparison — visible solids against `object_uuid`s this episode observed —
+ * and nothing more. It is not a proof of the converse: a tool that mints a
+ * solid without reporting an `object_uuid` would also make the count exceed,
+ * and consuming ops (a boolean takes two solids and mints one) make the count
+ * legitimately smaller.
+ *
+ * Exported and `call`-parameterised like `verifyClaims` / `fetchRecipe`, so
+ * the verdict logic is testable without an SDK or a backend.
+ */
+export async function readModelScope(call, observedSolids) {
+  const env = await call("list_parts", {});
+  const rows = env.data;
+  if (!Array.isArray(rows)) {
+    const why = env.refusal
+      ? `list_parts was refused by gate ${JSON.stringify(env.refusal.gate)}` +
+        (env.text ? `: ${env.text}` : "")
+      : env.is_error
+        ? `list_parts returned an error result: ${env.text}`
+        : `list_parts returned no part list (${env.parse_error ?? "unrecognised body"})`;
+    return { absent: why };
+  }
+  const ids = rows.map((p) => p?.id).filter((id) => Number.isInteger(id));
+  return {
+    read_by: "list_parts",
+    visible_parts: ids,
+    visible_count: rows.length,
+    built_here: observedSolids.length,
+    shared_model_detected: rows.length > observedSolids.length,
+  };
+}
+
+/**
  * Resolve a claim binding's `part` reference to an object UUID.
  *
  * `solid:N` is a recipe-local token naming the Nth solid this episode
@@ -406,7 +501,7 @@ export async function fetchRecipe(call, documentId) {
   };
 }
 
-export async function spawnMcpSession({ documentId, baseUrl, authHeader, mcpEntry }) {
+export async function spawnMcpSession({ documentId, partId, baseUrl, authHeader, mcpEntry }) {
   const credential = credentialEnv(authHeader);
   const { Client } = await import("@modelcontextprotocol/sdk/client/index.js");
   const { StdioClientTransport } = await import("@modelcontextprotocol/sdk/client/stdio.js");
@@ -414,20 +509,7 @@ export async function spawnMcpSession({ documentId, baseUrl, authHeader, mcpEntr
   const transport = new StdioClientTransport({
     command: process.execPath,
     args: [mcpEntry ?? defaultMcpEntry()],
-    env: {
-      ...process.env,
-      ROSHERA_DOCUMENT: documentId,
-      ROSHERA_URL: baseUrl,
-      // AMBIENT PERCEPTION MODE, pinned deliberately. The DEFAULT is
-      // `compact` (core.ts:916, 923-926), under which `perception` is a
-      // one-line STRING from `compactVerdict` — `perception.sound` does not
-      // exist and soundness is unreadable for every step of every episode.
-      // `cert` (core.ts:930) returns the full perception OBJECT and, unlike
-      // `full`/`xray`, attaches no render image: the boolean this environment
-      // scores on, without paying for pixels no policy here looks at.
-      ROSHERA_AMBIENT_PERCEPTION: "cert",
-      ...credential,
-    },
+    env: childEnv({ documentId, partId, baseUrl, credential }),
   });
   const client = new Client({ name: "roshera-rl", version: "0.1.0" }, { capabilities: {} });
   await client.connect(transport);
@@ -472,6 +554,7 @@ export async function spawnMcpSession({ documentId, baseUrl, authHeader, mcpEntr
     observedSolids: () => [...observedSolids],
     claims: (taskClaims) => verifyClaims(call, taskClaims, observedSolids),
     recipeRef: () => fetchRecipe(call, documentId),
+    modelScope: () => readModelScope(call, observedSolids),
     async close() { await client.close(); },
   };
 

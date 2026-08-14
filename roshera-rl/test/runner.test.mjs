@@ -28,8 +28,20 @@ let n = 0;
 const refuseDeletes = new Map();
 const deleteLog = [];
 
+let parts = 0;
+
 const stub = http.createServer((req, res) => {
   const url = req.url ?? "";
+  // Each episode allocates its own BRepModel (api-server/src/part_mgr.rs:
+  // 340-358) and drops it at reap (:416-427).
+  if (req.method === "POST" && url === "/api/parts") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ id: `part-${parts++}` }));
+  }
+  if (req.method === "DELETE" && url.startsWith("/api/parts/")) {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    return res.end(JSON.stringify({ success: true, id: url.split("/").pop() }));
+  }
   if (req.method === "POST" && url === "/api/documents") {
     res.writeHead(200, { "Content-Type": "application/json" });
     return res.end(JSON.stringify({ id: `doc-${n++}`, active: false }));
@@ -73,15 +85,22 @@ const task = defineTask({
   stepBudget: 4, tokenBudget: 1000, split: "train",
 });
 
-/** Each fake session records which document it was pinned to. */
+/** mcp_session.mjs `readModelScope` — one solid, the one this episode built. */
+const OWN_MODEL_ONLY = {
+  read_by: "list_parts", visible_parts: [1], visible_count: 1,
+  built_here: 1, shared_model_detected: false,
+};
+
+/** Each fake session records which document AND part it was pinned to. */
 const pinnedPerSession = [];
-const fakeSpawn = async ({ documentId }) => {
+const fakeSpawn = async ({ documentId, partId }) => {
   const seen = [];
-  pinnedPerSession.push({ documentId, seen });
+  pinnedPerSession.push({ documentId, partId, seen });
   return {
     async call(tool) { seen.push({ tool, documentId }); return CREATED_OK; },
     async claims(cs) { return cs.map((c) => ({ name: c.name, verified: true })); },
     async recipeRef() { return { step_count: 1, steps: [] }; },
+    async modelScope() { return OWN_MODEL_ONLY; },
     async close() {},
   };
 };
@@ -105,6 +124,15 @@ check("concurrent episodes each get their OWN document — none shared", async (
     assert.ok(s.seen.every((c) => c.documentId === s.documentId),
       "no call may cross into another episode's document");
   }
+  // AND ITS OWN MODEL. A distinct document was never enough: `ActiveModel`
+  // routes on `X-Roshera-Part-Id` (api-server/src/part_mgr.rs:264, 286-312),
+  // so four episodes sharing one part id build into one shared `BRepModel`
+  // however distinct their documents — measured live on 2026-08-13.
+  const heldParts = pinnedPerSession.map((s) => s.partId);
+  assert.equal(new Set(heldParts).size, 4,
+    `four concurrent episodes must hold four distinct parts, got ${JSON.stringify(heldParts)}`);
+  assert.ok(heldParts.every((p) => typeof p === "string" && p.length > 0),
+    "and each must actually hold one — an absent pin falls back to the global model");
 });
 
 check("the tally names every outcome, including the zeros", async () => {
@@ -139,6 +167,7 @@ check("concurrency is a cap, not a suggestion", async () => {
       async call() { return CREATED_OK; },
       async claims(cs) { return cs.map((c) => ({ name: c.name, verified: true })); },
       async recipeRef() { return { step_count: 1, steps: [] }; },
+      async modelScope() { return OWN_MODEL_ONLY; },
       async close() { live -= 1; },
     };
   };
@@ -162,6 +191,7 @@ check("one episode's crash does not take the batch down", async () => {
       },
       async claims(cs) { return cs.map((c) => ({ name: c.name, verified: true })); },
       async recipeRef() { return { step_count: 1, steps: [] }; },
+      async modelScope() { return OWN_MODEL_ONLY; },
       async close() {},
     };
   };

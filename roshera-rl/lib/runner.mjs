@@ -9,7 +9,7 @@
  */
 import { join } from "node:path";
 import { mkdirSync } from "node:fs";
-import { runEpisode, reapDocument, unscoredFor, MCP_VERSION } from "./episode.mjs";
+import { runEpisode, reapDocument, reapPart, unscoredFor, MCP_VERSION } from "./episode.mjs";
 import { OUTCOMES, openTrajectory } from "./trajectory.mjs";
 import { spawnMcpSession } from "./mcp_session.mjs";
 import { mergeFinal } from "./reward.mjs";
@@ -17,8 +17,9 @@ import { mergeFinal } from "./reward.mjs";
 /**
  * THE REAPER — the batch-level backstop `episode.mjs` names.
  *
- * Each episode already attempts its own DELETE and REPORTS the outcome
- * (`result.reap`). This retries every document that attempt could not drop —
+ * Each episode already attempts its own DELETEs and REPORTS the outcomes
+ * (`result.reap` for its document, `result.partReap` for its part). This
+ * retries every document and every part that attempt could not drop —
  * a DELETE lost to a network blip, or refused because the document was
  * momentarily the active one (api-server/src/documents.rs:561-564) — and then
  * states plainly which documents are STILL orphaned in PartManager's DashMap.
@@ -32,6 +33,18 @@ import { mergeFinal } from "./reward.mjs";
 export async function reapOrphans({ baseUrl, authHeader, results }) {
   const orphans = [];
   for (const r of results) {
+    // The PART is retried on the same terms as the document: it holds a whole
+    // `BRepModel` in `PartManager`'s DashMap (api-server/src/part_mgr.rs:97)
+    // and nothing on the document's own delete path drops it.
+    if (r?.partId && r.partReap?.reaped !== true) {
+      const retry = await reapPart(baseUrl, authHeader, r.partId);
+      if (retry.reaped === true) {
+        r.partReap = { reaped: true, reason: `reaped by the batch reaper after: ${r.partReap?.reason ?? "no first attempt"}` };
+      } else {
+        r.partReap = { reaped: false, reason: retry.reason };
+        orphans.push({ documentId: null, partId: r.partId, reason: retry.reason });
+      }
+    }
     if (!r?.documentId) continue;
     if (r.reap?.reaped === true) continue;
     const retry = await reapDocument(baseUrl, authHeader, r.documentId);
@@ -40,7 +53,7 @@ export async function reapOrphans({ baseUrl, authHeader, results }) {
       continue;
     }
     r.reap = { reaped: false, reason: retry.reason };
-    orphans.push({ documentId: r.documentId, reason: retry.reason });
+    orphans.push({ documentId: r.documentId, partId: null, reason: retry.reason });
   }
   return orphans;
 }
@@ -65,7 +78,7 @@ export async function reapOrphans({ baseUrl, authHeader, results }) {
 function policyFactoryFailed({ item, trajectoryPath, kernelSha, error }) {
   const detail = `the policy factory threw before the episode began: ${error}`;
   const rewardFinal = mergeFinal([]);
-  const { claims, recipeRef } = unscoredFor(item.task, "SETUP_FAILED", detail);
+  const { claims, recipeRef, modelScope } = unscoredFor(item.task, "SETUP_FAILED", detail);
   try {
     const traj = openTrajectory({
       path: trajectoryPath, taskId: item.task.id, seed: item.seed, kernelSha,
@@ -73,7 +86,7 @@ function policyFactoryFailed({ item, trajectoryPath, kernelSha, error }) {
       split: item.task.split,
     });
     traj.close({
-      outcome: "SETUP_FAILED", rewardFinal, claims, recipeRef,
+      outcome: "SETUP_FAILED", rewardFinal, claims, recipeRef, modelScope,
       tokens: 0, wallMs: 0, error: detail,
     });
   } catch (e) {
@@ -82,16 +95,20 @@ function policyFactoryFailed({ item, trajectoryPath, kernelSha, error }) {
     // returned result still carries the reason, and says the record is missing
     // rather than leaving a dangling path unexplained.
     return {
-      outcome: "SETUP_FAILED", rewardFinal, documentId: null,
+      outcome: "SETUP_FAILED", rewardFinal, documentId: null, partId: null,
       trajectoryPath: null, wallMs: 0,
       error: `${detail} (and its trajectory could not be written: ${String(e?.message ?? e)})`,
       reap: { reaped: null, reason: "no document was created" },
+      partReap: { reaped: null, reason: "no part was created" },
+      modelScope,
     };
   }
   return {
-    outcome: "SETUP_FAILED", rewardFinal, documentId: null, trajectoryPath,
-    wallMs: 0, error: detail,
+    outcome: "SETUP_FAILED", rewardFinal, documentId: null, partId: null,
+    trajectoryPath, wallMs: 0, error: detail,
     reap: { reaped: null, reason: "no document was created" },
+    partReap: { reaped: null, reason: "no part was created" },
+    modelScope,
   };
 }
 
@@ -133,8 +150,11 @@ export async function runBatch({
         baseUrl, authHeader, trajectoryPath, kernelSha, mcpEntry, spawn,
       }).catch((e) => ({
         outcome: "CRASHED", rewardFinal: { components: {}, gaps: [] },
-        documentId: null, trajectoryPath, wallMs: 0, error: String(e?.message ?? e),
+        documentId: null, partId: null, trajectoryPath, wallMs: 0,
+        error: String(e?.message ?? e),
         reap: { reaped: null, reason: "the episode threw before reporting a document" },
+        partReap: { reaped: null, reason: "the episode threw before reporting a part" },
+        modelScope: { absent: "the episode threw before any model could be read" },
       }));
       results.push(r);
     }

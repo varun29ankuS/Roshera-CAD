@@ -8,7 +8,7 @@
  *                       mcp_version, tool_allowlist, split, started_at }
  *   line 2+  step     { i, action, result_digest, reward, refusal, ms }
  *   last     terminal { outcome, reward_final, claims, recipe_ref,
- *                       tokens, wall_ms, error }
+ *                       model_scope, tokens, wall_ms, error }
  *
  * `reward_final` is the terminal reading of each NAMED component — not a sum
  * and not a scalar. Naming it `total` would imply an aggregation the
@@ -79,7 +79,7 @@ class Trajectory {
     }) + "\n");
   }
 
-  close({ outcome, rewardFinal, claims, recipeRef, tokens, wallMs, error }) {
+  close({ outcome, rewardFinal, claims, recipeRef, modelScope, tokens, wallMs, error }) {
     if (this.#closed) throw new Error("trajectory already closed");
     if (!OUTCOMES.includes(outcome)) {
       throw new Error(
@@ -90,6 +90,13 @@ class Trajectory {
     appendFileSync(this.#path, JSON.stringify({
       kind: "terminal", outcome, reward_final: rewardFinal,
       claims, recipe_ref: recipeRef ?? null, tokens, wall_ms: wallMs,
+      // WHAT THIS EPISODE'S OWN MODEL HELD, read by `list_parts` inside the
+      // session (mcp_session.mjs `readModelScope`). Concurrent episodes shared
+      // one `BRepModel` for as long as this environment has existed, and
+      // nothing in the record said so — the evidence was an unexplained
+      // `part_id` in the 70s-90s. An OBJECT, never a bare null: an episode
+      // that took no reading says so with a reason.
+      model_scope: modelScope ?? { absent: "the caller recorded no model-scope reading" },
       // THE UNDERLYING ERROR, in the record and not only in the return value.
       // A batch is read afterwards from its trajectories, so a failure whose
       // reason lives only in the returned object is a failure nobody can

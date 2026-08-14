@@ -1,12 +1,21 @@
 /**
- * One episode: create a document, spawn an MCP process PINNED to it, drive
- * the policy to done, score, reap.
+ * One episode: create a document AND a part, spawn an MCP process PINNED to
+ * both, drive the policy to done, score, reap.
  *
  * The episode is a real MCP session, not a simulation of one — same
- * ToolTable, same gates, same typed refusals. Isolation comes from the
+ * ToolTable, same gates, same typed refusals. SESSION isolation comes from the
  * process boundary: every piece of episode state in gates.ts is a
  * module-level binding, so two episodes cannot contaminate each other
  * because they do not share an address space. Process death is the reset.
+ *
+ * MODEL isolation does not come free with it, and used to be missing outright:
+ * the backend keeps one global `AppState.model` and only routes away from it
+ * for a caller that sends `X-Roshera-Part-Id` (api-server/src/part_mgr.rs:264,
+ * 286-312). Measured on 8 concurrent live episodes (2026-08-13): part ids
+ * 73…93 inside supposedly fresh documents, every session reading every other
+ * session's solids. So the episode creates a PART (`POST /api/parts`,
+ * part_mgr.rs:340-358) beside its document, pins the child to it, and reaps
+ * it — and records what its own model actually held at the end.
  *
  * `spawn` is injectable so the lifecycle can be tested without a backend. An
  * injected session must return `mcp_session.readToolResult` ENVELOPES from
@@ -58,6 +67,7 @@ const NO_TERMINAL_SCORING = {
  */
 const SETUP_STAGE = Object.freeze({
   DOCUMENT: "document creation",
+  PART: "part creation",
   SPAWN: "spawning the MCP session",
 });
 
@@ -90,6 +100,11 @@ export function unscoredFor(task, outcome, detail) {
       name: c.name, verified: null, computed: null, absent: reason,
     })),
     recipeRef: { absent: reason },
+    // The isolation reading is unscored for exactly the same reasons and
+    // travels with them, so an episode that never ran cannot report a model
+    // scope of zero solids — which would read as "its model was empty", a
+    // different and false claim.
+    modelScope: { absent: reason },
   };
 }
 
@@ -106,6 +121,32 @@ export function unscoredFor(task, outcome, detail) {
  * (and reports the ones it still could not, rather than asserting they were
  * cleaned up).
  */
+/**
+ * Delete the episode's PART, best-effort, REPORTING what happened — the same
+ * contract as `reapDocument` below and for the same reason. A part that
+ * survives its episode holds a whole `BRepModel` in `PartManager`'s DashMap
+ * (api-server/src/part_mgr.rs:97, 186-189) for the life of the server.
+ *
+ * Deleting the DOCUMENT does not take the part with it: `documents::activate`
+ * is the only thing that clears the part registry (`state.parts.clear()`,
+ * documents.rs:664) and an episode never activates anything. So the part is
+ * reaped explicitly, next to the document.
+ */
+export async function reapPart(baseUrl, authHeader, partId) {
+  if (!partId) return { reaped: null, reason: "no part was created" };
+  try {
+    const res = await fetch(`${baseUrl}/api/parts/${partId}`, {
+      method: "DELETE", headers: { ...authHeader },
+    });
+    if (res.ok) return { reaped: true, reason: null };
+    // part_mgr.rs:416-427 — an unknown id is a typed PartNotFound (404),
+    // which is as real a report as a network failure and just as unhidden.
+    return { reaped: false, reason: `DELETE returned ${res.status}` };
+  } catch (e) {
+    return { reaped: false, reason: `DELETE failed: ${String(e?.message ?? e)}` };
+  }
+}
+
 export async function reapDocument(baseUrl, authHeader, documentId) {
   if (!documentId) return { reaped: null, reason: "no document was created" };
   try {
@@ -140,9 +181,11 @@ export async function runEpisode({
   } catch (e) {
     return {
       outcome: "SETUP_FAILED", rewardFinal: mergeFinal([]), documentId: null,
-      trajectoryPath, wallMs: Date.now() - started,
+      partId: null, trajectoryPath, wallMs: Date.now() - started,
       error: `the trajectory could not be opened: ${String(e?.message ?? e)}`,
       reap: { reaped: null, reason: "no document was created" },
+      partReap: { reaped: null, reason: "no part was created" },
+      modelScope: { absent: "no session existed, so no model was read" },
     };
   }
 
@@ -151,11 +194,12 @@ export async function runEpisode({
 
   // ── setup ────────────────────────────────────────────────────────────
   let documentId = null;
+  let partId = null;
   let session = null;
-  // Which stage is in flight, so the catch below can NAME it. Setup is two
-  // independent pieces of I/O against two different failure surfaces (an HTTP
-  // API and a child process), and collapsing them into one reason discards the
-  // only fact a diagnosis starts from.
+  // Which stage is in flight, so the catch below can NAME it. Setup is three
+  // independent pieces of I/O against different failure surfaces (two HTTP
+  // routes and a child process), and collapsing them into one reason discards
+  // the only fact a diagnosis starts from.
   let setupStage = SETUP_STAGE.DOCUMENT;
   try {
     const res = await fetch(`${baseUrl}/api/documents`, {
@@ -176,28 +220,49 @@ export async function runEpisode({
     }
     documentId = (await res.json())?.id ?? null;
     if (!documentId) throw new Error("document creation returned no id");
+    setupStage = SETUP_STAGE.PART;
+    // THE EPISODE'S OWN BRepModel. `POST /api/parts` (part_mgr.rs:340-358) is
+    // the only thing in the system that allocates one; until this call existed
+    // nothing anywhere asked for isolation, so every episode's kernel ops
+    // resolved to the one global model.
+    const partRes = await fetch(`${baseUrl}/api/parts`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...authHeader },
+      body: JSON.stringify({ name: `rl:${task.id}:${seed}` }),
+    });
+    if (!partRes.ok) {
+      // Same reasoning as document creation: a 429 here is the shared rate
+      // ceiling N concurrent episodes saturate, not a setup defect
+      // (auth_middleware.rs:870-874).
+      const e = new Error(`part creation returned ${partRes.status}`);
+      e.rateLimited = partRes.status === 429;
+      throw e;
+    }
+    partId = (await partRes.json())?.id ?? null;
+    if (!partId) throw new Error("part creation returned no id");
     setupStage = SETUP_STAGE.SPAWN;
-    session = await spawn({ documentId, baseUrl, authHeader, mcpEntry });
+    session = await spawn({ documentId, partId, baseUrl, authHeader, mcpEntry });
   } catch (e) {
-    // `documentId` is set the moment creation succeeds, before `spawn` is
-    // even called — if spawn is what failed, that document is real and
-    // orphaned unless reaped here too.
+    // `documentId` and `partId` are each set the moment their own creation
+    // succeeds, before the next stage runs — whichever stage failed, what was
+    // already allocated is real and orphaned unless reaped here too.
     const reap = await reapDocument(baseUrl, authHeader, documentId);
+    const partReap = await reapPart(baseUrl, authHeader, partId);
     const outcome = e?.rateLimited === true ? "RATE_LIMITED" : "SETUP_FAILED";
     // The stage AND the underlying message. The error used to be dropped here
     // and rebuilt as a disjunction, so a 401 from the API and a child process
     // that could not start produced byte-identical records.
     const error = `${setupStage} failed: ${String(e?.message ?? e)}`;
-    const { claims, recipeRef } = unscored(outcome, error);
+    const { claims, recipeRef, modelScope } = unscored(outcome, error);
     traj.close({
       outcome,
       rewardFinal: mergeFinal([]),
-      claims, recipeRef, tokens: 0, wallMs: Date.now() - started, error,
+      claims, recipeRef, modelScope, tokens: 0, wallMs: Date.now() - started, error,
     });
     return {
-      outcome, rewardFinal: mergeFinal([]), documentId,
+      outcome, rewardFinal: mergeFinal([]), documentId, partId,
       trajectoryPath, wallMs: Date.now() - started, error,
-      reap,
+      reap, partReap, modelScope,
     };
   }
 
@@ -207,6 +272,7 @@ export async function runEpisode({
   let observation = null;
   let claims = [];
   let recipeRef = null;
+  let modelScope = null;
   // Carried out on the returned object the way SETUP_FAILED already does —
   // a crash with no recorded reason is a dead end for whoever reads the
   // batch tally afterward.
@@ -347,23 +413,37 @@ export async function runEpisode({
       }));
       recipeRef = { absent: why };
     }
+    // THE ISOLATION READING, in its own try: what this session's model holds
+    // is a different question from whether its claims verified, and a
+    // list_parts that fails must not void a claim the kernel already measured.
+    try {
+      modelScope = await session.modelScope();
+    } catch (e) {
+      modelScope = {
+        absent: `the model-scope read did not complete: ${String(e?.message ?? e)}`,
+      };
+    }
   } else {
     // `episodeError` is null for BUDGET_EXHAUSTED / INVALID_ACTION (nothing
     // failed — a limit was reached), and a real message for CRASHED /
     // RATE_LIMITED, which then rides along into every absence.
-    ({ claims, recipeRef } = unscored(outcome, episodeError));
+    ({ claims, recipeRef, modelScope } = unscored(outcome, episodeError));
   }
   try { await session.close(); } catch { /* already dead */ }
   const reap = await reapDocument(baseUrl, authHeader, documentId);
+  const partReap = await reapPart(baseUrl, authHeader, partId);
 
   const rewardFinal = mergeFinal(rewards);
   const wallMs = Date.now() - started;
   traj.close({
-    outcome, rewardFinal, claims, recipeRef,
+    outcome, rewardFinal, claims, recipeRef, modelScope,
     tokens: policy.tokensUsed(), wallMs, error: episodeError,
   });
   return {
-    outcome, rewardFinal, documentId, trajectoryPath, wallMs,
-    error: episodeError, reap,
+    outcome, rewardFinal, documentId, partId, trajectoryPath, wallMs,
+    error: episodeError, reap, partReap,
+    // Returned as well as recorded, so a batch can report model isolation in
+    // its own summary instead of leaving it to whoever reads the JSONL later.
+    modelScope,
   };
 }

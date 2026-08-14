@@ -142,6 +142,59 @@ function documentHeaders(): Record<string, string> {
   return boundDocument === null ? {} : { "X-Roshera-Document": boundDocument };
 }
 
+// ─── Session→part binding (2026-08-14) ──────────────────────────────────
+//
+// The document pin above scopes the TIMELINE. It does not scope the live
+// model: `ActiveModel` (api-server/src/part_mgr.rs:264, 276) routes on
+// `X-Roshera-Part-Id` and falls back to the ONE global `AppState.model`
+// whenever that header is absent (part_mgr.rs:291-296). So two processes with
+// two distinct documents still built into, and read from, one shared
+// `BRepModel` — measured on 8 concurrent episodes (2026-08-13): four sessions
+// reported the same `part_id` 97 and three the same 101.
+//
+// `ROSHERA_PART` names the part document (`POST /api/parts`,
+// part_mgr.rs:340-358) this process owns. It is SESSION SCOPING and is
+// deliberately absent from the tool surface: the agent-facing `part_id`
+// argument (`verify_part`, `list_parts`, every `/api/agent/parts/{id}` route)
+// is a kernel integer `SolidId` naming one solid INSIDE the active model — a
+// different type at a different scope. Two id spaces, and the UUID stays on
+// the wire where the routing happens.
+let boundPart: string | null = null;
+let partBindChecked = false;
+
+/**
+ * Bind this process to the part document it owns.
+ *
+ * ONE source: `ROSHERA_PART`, an EXPLICIT pin read at call time (not at module
+ * load) so a caller can set it programmatically before binding. There is no
+ * discovery counterpart to `bindSessionDocument`'s active-document fetch,
+ * because the backend has no notion of an "active part": `POST /api/parts` is
+ * the only thing that mints one, and whoever called it is the only party that
+ * knows which id belongs to this process.
+ *
+ * SYNCHRONOUS, and self-applied by `partHeaders()` on the first call that
+ * needs it — `api()` assembles its headers synchronously, so the pin has to be
+ * readable there without awaiting anything.
+ *
+ * Unpinned is LEGACY behaviour: no header goes out, the backend takes its
+ * absent-header fallback, and every existing client plus the routes that are
+ * not part-aware keep working byte-for-byte as before.
+ */
+export function bindSessionPart(): void {
+  // A whitespace-only value is NOT a part id. An empty `X-Roshera-Part-Id`
+  // is a malformed part reference the backend answers 400 to
+  // (part_mgr.rs:298-308), not the absence the operator plainly meant.
+  const pinned = process.env.ROSHERA_PART?.trim();
+  boundPart = pinned ? pinned : null;
+  partBindChecked = true;
+}
+
+/** The bound-part header for one backend call, or `{}` when unpinned. */
+function partHeaders(): Record<string, string> {
+  if (!partBindChecked) bindSessionPart();
+  return boundPart === null ? {} : { "X-Roshera-Part-Id": boundPart };
+}
+
 export async function api(
   method: "GET" | "POST" | "PATCH" | "DELETE",
   path: string,
@@ -161,6 +214,9 @@ export async function api(
         ...intentHeaders(),
         // Session→document binding: the birth-document id, when bound.
         ...documentHeaders(),
+        // Session→part binding: the part document whose BRepModel this
+        // process owns, when pinned. Absent → the backend's legacy model.
+        ...partHeaders(),
         // Credential (empty object when ROSHERA_API_KEY is unset).
         ...AUTH_HEADERS,
         ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
@@ -701,9 +757,14 @@ export async function uuidForPart(partId: number): Promise<string> {
  * all-edges mode (omitted `edge_ids`).
  */
 export async function allEdgeIds(partId: number): Promise<number[]> {
+  // Raw fetch (the 409 body is the answer, so `api()`'s throw-on-non-2xx is
+  // wrong here) — but `/api/agent/parts/{id}/select-edge` is an `ActiveModel`
+  // route, so it carries the part pin like every `api()` call does. Without
+  // it this one read would resolve against the legacy global model while the
+  // rest of the session works in its own.
   const res = await fetch(`${BASE}/api/agent/parts/${partId}/select-edge`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", ...AUTH_HEADERS },
+    headers: { "Content-Type": "application/json", ...partHeaders(), ...AUTH_HEADERS },
     body: JSON.stringify({ curve_kind: "any", blend: "any", extremal: "none" }),
   });
   const j: any = await res.json().catch(() => null);

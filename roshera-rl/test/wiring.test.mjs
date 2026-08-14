@@ -38,12 +38,18 @@ check("the entry point actually drives runBatch over the seed tasks", async () =
     if (req.method === "POST" && (req.url ?? "") === "/api/documents") {
       return res.end(JSON.stringify({ id: `doc-${Math.random()}`, active: false }));
     }
+    // Each episode allocates its own BRepModel beside its document
+    // (api-server/src/part_mgr.rs:340-358).
+    if (req.method === "POST" && (req.url ?? "") === "/api/parts") {
+      return res.end(JSON.stringify({ id: `part-${Math.random()}` }));
+    }
     res.end("{}");
   });
   stub.listen(0, "127.0.0.1");
   await once(stub, "listening");
 
   const spawned = [];
+  const pinnedParts = [];
   const calls = [];
   process.env.ROSHERA_URL = `http://127.0.0.1:${stub.address().port}`;
   process.env.ROSHERA_RL_TEST_SPAWN = "1";
@@ -57,12 +63,20 @@ check("the entry point actually drives runBatch over the seed tasks", async () =
       perception: { sound: true, brep_valid: true, watertight: true },
     }, null, 2) }],
   });
-  globalThis.__roshera_rl_test_spawn = async ({ documentId }) => {
+  globalThis.__roshera_rl_test_spawn = async ({ documentId, partId }) => {
     spawned.push(documentId);
+    pinnedParts.push(partId);
     return {
       async call(tool, args) { calls.push({ tool, args }); return CREATED_OK; },
       async claims(cs) { return cs.map((c) => ({ name: c.name, verified: true })); },
       async recipeRef() { return { step_count: 1, steps: [] }; },
+      // mcp_session.mjs `readModelScope` — one solid, the one it built.
+      async modelScope() {
+        return {
+          read_by: "list_parts", visible_parts: [1], visible_count: 1,
+          built_here: 1, shared_model_detected: false,
+        };
+      },
       async close() {},
     };
   };
@@ -74,6 +88,9 @@ check("the entry point actually drives runBatch over the seed tasks", async () =
   assert.ok(mod.lastRun.results.length >= 1, "at least one seed task ran");
   assert.equal(spawned.length, mod.lastRun.results.length,
     "every episode spawned a session — the runner was really driven, not imported");
+  assert.ok(pinnedParts.every((p) => typeof p === "string" && p.length > 0),
+    "and every spawned session was pinned to a part it owns — an absent pin " +
+    "puts the episode back on the shared global BRepModel (part_mgr.rs:291-296)");
   for (const k of OUTCOMES) assert.ok(k in mod.lastRun.tally);
   assert.ok(Array.isArray(mod.lastRun.orphans),
     "and the reaper's verdict reaches the entry point, so an un-reaped document is printable");
