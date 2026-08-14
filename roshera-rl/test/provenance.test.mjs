@@ -76,6 +76,49 @@ check("an unreachable server is an absence with a reason, not a throw", async ()
   assert.ok(typeof k.absent === "string" && k.absent.length > 0);
 });
 
+check("a 200 whose body is not JSON states THAT, never 'could not be reached' — it WAS reached", async () => {
+  const badBodyServer = http.createServer((req, res) => {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end("not json{{{");
+  });
+  badBodyServer.listen(0, "127.0.0.1");
+  await once(badBodyServer, "listening");
+  const badBaseUrl = `http://127.0.0.1:${badBodyServer.address().port}`;
+  try {
+    const k = await resolveKernelIdentity({ baseUrl: badBaseUrl, authHeader: {}, claimed: undefined });
+    assert.ok(!("sha" in k), "no sha may be invented from an unparseable body");
+    assert.match(k.absent, /not valid JSON/i, "must name the real fact: reached, body unparseable");
+    assert.doesNotMatch(k.absent, /could not be reached/i, "it WAS reached — a different fact, a different sentence");
+    assert.equal(k.reported_by, "server");
+  } finally {
+    badBodyServer.close();
+  }
+});
+
+check("a server that never answers times out with a reason naming the timeout, not 'could not be reached'", async () => {
+  const slowServer = http.createServer(() => { /* never respond */ });
+  slowServer.listen(0, "127.0.0.1");
+  await once(slowServer, "listening");
+  const slowBaseUrl = `http://127.0.0.1:${slowServer.address().port}`;
+  try {
+    const k = await resolveKernelIdentity({
+      baseUrl: slowBaseUrl, authHeader: {}, claimed: undefined, timeoutMs: 50,
+    });
+    assert.ok(!("sha" in k));
+    assert.match(k.absent, /within 50ms/, "the reason must name the timeout, not a generic unreachability");
+    assert.equal(k.reported_by, "server");
+  } finally {
+    slowServer.close();
+  }
+});
+
+check("an operator claim differing only in case from the server's sha AGREES, and the server's casing is kept", async () => {
+  reply = { build: { sha: "ABC1234", dirty: false } };
+  const k = await resolveKernelIdentity({ baseUrl, authHeader: {}, claimed: "abc1234" });
+  assert.equal(k.sha, "ABC1234", "the RECORDED sha is the server's own casing, never the operator's");
+  assert.equal(k.reported_by, "server");
+});
+
 for (const [name, fn] of checks) { await fn(); process.stdout.write(`  ok - ${name}\n`); }
 stub.close();
 process.stdout.write(`\nprovenance: ${checks.length} checks passed\n`);

@@ -16,28 +16,50 @@ export class KernelIdentityConflict extends Error {}
  * detect disagreement. It is never promoted into the returned identity: the
  * field means "the server said so", and an operator claim is not evidence.
  * A server that cannot say yields a stated absence — including when it is
- * unreachable, because "I could not ask" is a fact about the run, not a crash.
+ * unreachable or times out, because "I could not ask" is a fact about the
+ * run, not a crash. Each way of not-answering states which one it was:
+ * unreachable, timed out, answered with an error status, or answered with a
+ * body that was not JSON are four different facts and get four different
+ * sentences. `timeoutMs` is exposed only so tests can exercise the timeout
+ * path without waiting on the real default.
  */
-export async function resolveKernelIdentity({ baseUrl, authHeader = {}, claimed }) {
-  let build;
+export async function resolveKernelIdentity({ baseUrl, authHeader = {}, claimed, timeoutMs = 10_000 }) {
+  let res;
   try {
-    const res = await fetch(`${baseUrl}/health`, {
+    res = await fetch(`${baseUrl}/health`, {
       headers: { ...authHeader },
-      signal: AbortSignal.timeout(10_000),
+      signal: AbortSignal.timeout(timeoutMs),
     });
-    if (!res.ok) {
+  } catch (e) {
+    if (e?.name === "TimeoutError") {
       return {
         reported_by: "server",
-        absent: `the server answered /health with ${res.status}, so it did not state its build`,
+        absent: `the server did not answer /health within ${timeoutMs}ms, so it did not state its build`,
       };
     }
-    build = (await res.json())?.build;
-  } catch (e) {
     return {
       reported_by: "server",
       absent: `the server could not be reached to state its build: ${e?.message ?? e}`,
     };
   }
+
+  if (!res.ok) {
+    return {
+      reported_by: "server",
+      absent: `the server answered /health with ${res.status}, so it did not state its build`,
+    };
+  }
+
+  let body;
+  try {
+    body = await res.json();
+  } catch (e) {
+    return {
+      reported_by: "server",
+      absent: `the server answered /health but its body was not valid JSON, so it did not state its build: ${e?.message ?? e}`,
+    };
+  }
+  const build = body?.build;
 
   if (!build || typeof build !== "object") {
     return {
@@ -58,7 +80,10 @@ export async function resolveKernelIdentity({ baseUrl, authHeader = {}, claimed 
 
   const sha = build.sha.trim();
   const claim = typeof claimed === "string" ? claimed.trim() : "";
-  if (claim !== "" && claim !== sha) {
+  // Compare case-insensitively (shas are canonically lowercase, but an
+  // operator claim differing only in case still AGREES); the sha recorded
+  // below is always the server's own, exact casing.
+  if (claim !== "" && claim.toLowerCase() !== sha.toLowerCase()) {
     throw new KernelIdentityConflict(
       `build identity conflict: the operator claimed ${claim} but the server reports ${sha}. ` +
         `A batch that cannot say which kernel produced it is not producing training data. ` +
