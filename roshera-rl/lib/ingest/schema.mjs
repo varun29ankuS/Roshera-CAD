@@ -10,6 +10,18 @@
  * onward (`CREATE TABLE IF NOT EXISTS` inside a startup routine) rather than
  * introducing a migration tool for a corpus this package alone owns.
  *
+ * THE LIMIT OF THAT CHOICE, STATED: `CREATE TABLE IF NOT EXISTS` creates, it
+ * never reshapes. A database that already ran an older version of this file
+ * keeps any column since removed here — `rl_run.kernel_claimed`,
+ * `rl_run.mcp_version` and `rl_run.tool_allowlist` are the three, dropped
+ * because they were per-episode facts frozen by the first writer under a
+ * run-level name. Nothing writes or reads them any more, so they simply hold
+ * whatever they last held. This file deliberately does NOT issue a
+ * `DROP COLUMN` to remove them: dropping a column destroys data in a database
+ * this package shares with a human operator's dev work, and that is an
+ * operator's decision to take deliberately, not a side effect of importing a
+ * module. A fresh database never has them at all.
+ *
  * Two families of table, deliberately shaped differently:
  *
  *   - ONE ROW PER EPISODE (`rl_episode`, `rl_recipe`, `rl_certificate`):
@@ -70,12 +82,31 @@ const STATEMENTS = [
     first_seen_at TIMESTAMPTZ NOT NULL DEFAULT now()
   )`,
 
+  // `run_id` is a digest over {schema_version, kernel, mcp, policy, harness,
+  // split} (rows.mjs), so `schema_version`, `split` and `attributable` (which
+  // is derived from those same four identity dimensions) are identical for
+  // every episode of one run by construction — which is what makes
+  // `ON CONFLICT (run_id) DO NOTHING` safe rather than lossy for them.
+  // `kernel_claimed`, `mcp_version` and `tool_allowlist` were here and were
+  // NOT covered: they are per-episode facts, so the first episode ingested
+  // froze them for every later sibling. They now live only where they are
+  // true — in the trajectory file, and (for mcp_version) inside `provenance`.
+  //
+  // ONE COLUMN IS NOT FULLY COVERED, AND IT IS STATED RATHER THAN CLAIMED
+  // AWAY: `provenance` is stored whole, and it carries `provenance.task`,
+  // which `run_id` deliberately EXCLUDES ("that is per-episode by
+  // construction", rows.mjs). So under `DO NOTHING` the first sibling's task
+  // block is the one this JSONB keeps for the whole run — the same
+  // first-writer-wins shape the three dropped columns had, surviving inside
+  // the document. It is left as-is on purpose: every episode's own task
+  // identity is recorded per-episode in `rl_task`/`rl_episode` and in the
+  // trajectory file, so nothing is lost, and changing what `rl_run.provenance`
+  // stores is a design decision about the run document rather than a defect
+  // fix. Anyone querying `rl_run.provenance -> 'task'` must read it as "one
+  // episode's task", never as "this run's task".
   `CREATE TABLE IF NOT EXISTS rl_run (
     run_id TEXT PRIMARY KEY,
     schema_version TEXT,
-    kernel_claimed TEXT,
-    mcp_version TEXT,
-    tool_allowlist JSONB,
     split TEXT,
     provenance JSONB,
     attributable BOOLEAN NOT NULL,

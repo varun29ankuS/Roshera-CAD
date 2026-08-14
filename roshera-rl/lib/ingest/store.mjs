@@ -73,13 +73,21 @@ function nn(v) {
 
 async function upsertRun(client, run) {
   await client.query(
+    // `schema_version`, `split` and `attributable` are covered by `run_id`
+    // itself (rows.mjs), which is why `DO NOTHING` is safe for them: a second
+    // episode of the same run writes identical values.
+    // `kernel_claimed`/`mcp_version`/`tool_allowlist` used to sit here too and
+    // were NOT covered — first-writer-wins froze them for every sibling. See
+    // `runRowFrom`. `provenance` is the one remaining partial: it embeds
+    // `provenance.task`, which `run_id` excludes by design, so this JSONB
+    // keeps the FIRST sibling's task block for the run — stated in
+    // schema.mjs's own comment rather than glossed as full coverage.
     `INSERT INTO rl_run
-       (run_id, schema_version, kernel_claimed, mcp_version, tool_allowlist, split, provenance, attributable)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+       (run_id, schema_version, split, provenance, attributable)
+     VALUES ($1,$2,$3,$4,$5)
      ON CONFLICT (run_id) DO NOTHING`,
     [
-      run.run_id, nn(run.schema_version), nn(run.kernel_claimed), nn(run.mcp_version),
-      jsonb(run.tool_allowlist), nn(run.split), jsonb(run.provenance), run.attributable,
+      run.run_id, nn(run.schema_version), nn(run.split), jsonb(run.provenance), run.attributable,
     ],
   );
 }
@@ -99,7 +107,13 @@ async function upsertDimensions(client, provenance) {
       `INSERT INTO rl_kernel_build (sha, dirty, reported_by)
        VALUES ($1,$2,$3)
        ON CONFLICT (sha) DO NOTHING`,
-      [kernel.sha, kernel.dirty === true, nn(kernel.reported_by)],
+      // `dirty` is NULLABLE for a reason (schema.mjs): a trajectory whose
+      // kernel stated a sha and no dirty reading has no cleanliness verdict to
+      // record, and `kernel.dirty === true` used to write `false` there — a
+      // claim of a clean tree nobody made. The stated reason itself is not
+      // lost: `rl_run.provenance` carries the whole kernel block, including
+      // its `dirty_absent` sentence.
+      [kernel.sha, typeof kernel.dirty === "boolean" ? kernel.dirty : null, nn(kernel.reported_by)],
     );
   }
 

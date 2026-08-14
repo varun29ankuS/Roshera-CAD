@@ -16,6 +16,9 @@ const run = promisify(execFile);
 /** Raised when the operator claims one build and the server reports another. */
 export class KernelIdentityConflict extends Error {}
 
+/** Raised by `digestOf` for a value it cannot represent without colliding. */
+export class UndigestableValue extends Error {}
+
 /**
  * Ask the SERVER what it is.
  *
@@ -98,7 +101,24 @@ export async function resolveKernelIdentity({ baseUrl, authHeader = {}, claimed,
     );
   }
 
-  return { sha, dirty: build.dirty === true, reported_by: "server" };
+  // A MISSING `dirty` IS AN ABSENCE, NOT A CLEAN TREE. `build.dirty === true`
+  // turned a server that stated a sha and nothing else — an older or newer
+  // contract, a proxy that strips fields — into `dirty: false`, a positive
+  // claim of cleanliness nobody made. The build IS identified, so this is not
+  // a kernel-wide absence: the reason rides on its own key, `dirty_absent`,
+  // which `identityDetermined` (below) deliberately does not treat as an
+  // `absent` — a sha with no dirty reading is still an attributable identity.
+  if (typeof build.dirty !== "boolean") {
+    return {
+      sha,
+      reported_by: "server",
+      dirty_absent:
+        build.dirty === undefined
+          ? "the server stated a sha but no dirty reading, so whether its tree was clean is unknown"
+          : `the server's dirty reading was ${JSON.stringify(build.dirty)}, not a boolean, so it states nothing about whether its tree was clean`,
+    };
+  }
+  return { sha, dirty: build.dirty, reported_by: "server" };
 }
 
 /**
@@ -107,39 +127,119 @@ export async function resolveKernelIdentity({ baseUrl, authHeader = {}, claimed,
  * data (a claim list, a tool allowlist) and sorting it would silently treat
  * two different sequences as the same one.
  *
- * KNOWN LIMITS, stated rather than silently overclaimed — both fall out of
- * `JSON.stringify`, which this digest is built on, and neither is reachable
- * from data this codebase actually digests (tasks pass through `defineTask`'s
- * strict validation before they ever reach here — mandatory finite numbers,
- * non-empty strings, a closed measure enum — so neither shape below is ever
- * produced by this package's own data):
- *   - a plain-object key whose value is `undefined` is DROPPED, not digested
- *     — `{a: undefined, b: 1}` and `{b: 1}` digest identically;
- *   - a `Date` (or any class instance whose own enumerable keys are empty)
- *     canonicalises to `{}` — `Object.keys(date)` is empty regardless of the
- *     instant it holds, so every `Date` digests the same as every other and
- *     the same as a bare `{}`.
- * Extending `canon` to special-case these is a real option; it was not taken
- * here because neither shape is reachable through `defineTask`'s validated
- * task data today, so there is nothing to fix that is actually broken yet.
- * Changing the canonicalisation is still FREE right now — this module exists
- * only on this feature branch, nothing on `main` consumes it, and no digest
- * has been persisted anywhere in the repo (the untracked `roshera-rl/runs/*`
- * artifacts predate this header format and carry no `digest` field at all).
- * That changes the moment a corpus starts depending on this scheme: this
- * decision must be revisited BEFORE this module merges to `main`, while the
- * fix is still free, not after — once real digests are on disk, closing this
- * gap becomes exactly the expensive migration this module exists to avoid
- * inflicting on a consumer.
+ * ─── IT REFUSES RATHER THAN COLLIDES ──────────────────────────────────────
+ *
+ * A digest is an IDENTITY CLAIM. `JSON.stringify`, which this is built on,
+ * quietly erases several shapes, and an erased shape is not an approximation
+ * — it is two different values asserting the same identity. Every one of
+ * these was MEASURED against this module before the guard below existed:
+ *
+ *   digestOf({a: undefined, b: 1}) === digestOf({b: 1})     // key DROPPED
+ *   digestOf({t: new Date(0)})     === digestOf({t: {}})    // Date → {}
+ *   digestOf({t: new Date(0)})     === digestOf({t: new Date(99999)})
+ *   digestOf({r: NaN})             === digestOf({r: null})  // non-finite → null
+ *   digestOf({m: new Map([["a",1]])}) === digestOf({m: {}}) // internal slots
+ *
+ * So `canon` accepts ONLY what JSON carries losslessly — plain objects
+ * (`Object.prototype` or a null prototype), arrays, strings, FINITE numbers,
+ * booleans, `null` — and throws `UndigestableValue` for anything else,
+ * naming the offending key path (`$.args.when`) so the caller can find it.
+ *
+ * A SENTINEL ENCODING WAS REJECTED, deliberately. Mapping `undefined` to
+ * `{__undefined__: true}` and a `Date` to its ISO string does narrow the
+ * collision — but it does not close it: the sentinel is itself expressible,
+ * so `{a: undefined}` would then collide with a literal
+ * `{a: {__undefined__: true}}`. That trades a known collision for a rarer one
+ * under a docstring claiming the gap is closed, which is the exact failure
+ * this header used to contain. A refusal cannot be wrong.
+ *
+ * ─── WHAT A REFUSAL COSTS, MEASURED AT EVERY CALL SITE ────────────────────
+ *
+ * Seven call sites digest data, and only ONE of them sees data validated by
+ * `defineTask` — the claim this header used to make, that "neither shape is
+ * reachable from this package's own data", was false:
+ *
+ *   1. `fileDigest` (below)               — a base64 string. Total.
+ *   2. `buildProvenance` (below)          — the `defineTask`-validated task.
+ *   3. `policy.mjs:97`  scriptedPolicy    — a CALLER-SUPPLIED script, validated
+ *      by nothing. This is where all five collisions above are reachable, and
+ *      the value it produces (`script_digest`) IS the policy's identity.
+ *   4. `policy.mjs:178` referencePolicy   — a constant string. Total.
+ *   5. `ingest/rows.mjs:120`              — `run_id`.
+ *   6. `ingest/rows.mjs:138`              — `episode_id`.
+ *   7. `ingest/store.mjs:108`             — `rl_policy`'s primary key.
+ *
+ * Sites 5-7 read data that has already been through `JSON.parse`, which
+ * cannot produce `undefined`, a `Date`, a `Map` or a non-finite number, so no
+ * refusal is reachable there at all. Sites 3 and 2 are reached only from
+ * `policy.describe()` inside `buildProvenance`, which `runner.mjs` already
+ * wraps: a throw there is recorded as that ONE episode's `SETUP_FAILED`
+ * carrying this message, and its siblings are untouched. A refusal therefore
+ * costs one recorded episode, never a batch.
+ *
+ * ─── LIMITS THAT REMAIN, TRUE ONES ────────────────────────────────────────
+ *
+ *   - `-0` digests identically to `0` (`JSON.stringify(-0) === "0"`).
+ *   - Only OWN ENUMERABLE properties are read, so a non-enumerable own
+ *     property is not part of the digest. Own SYMBOL keys are refused rather
+ *     than ignored, because unlike the above they can carry arbitrary data.
  */
 export function digestOf(value) {
-  const canon = (v) =>
-    Array.isArray(v)
-      ? v.map(canon)
-      : v && typeof v === "object"
-        ? Object.fromEntries(Object.keys(v).sort().map((k) => [k, canon(v[k])]))
-        : v;
-  return "sha256:" + createHash("sha256").update(JSON.stringify(canon(value))).digest("hex");
+  return "sha256:" + createHash("sha256").update(JSON.stringify(canon(value, "$"))).digest("hex");
+}
+
+function refuse(path, what, why) {
+  return new UndigestableValue(
+    `digestOf cannot represent ${what} at ${path}: ${why}. A digest is an identity ` +
+      `claim, so this is refused rather than digested to a value it would share with ` +
+      `a different input.`,
+  );
+}
+
+/** JSON-canonical form, or a throw naming the path of the first value that has none. */
+function canon(v, path) {
+  if (v === null) return null;
+  const t = typeof v;
+  if (t === "string" || t === "boolean") return v;
+  if (t === "number") {
+    if (!Number.isFinite(v)) {
+      throw refuse(path, `the non-finite number ${String(v)}`,
+        "JSON renders NaN and ±Infinity alike as null, so it would digest identically to a real null and to every other non-finite number");
+    }
+    return v;
+  }
+  if (t === "undefined") {
+    throw refuse(path, "an `undefined` value",
+      "JSON.stringify DROPS the key entirely, so `{a: undefined, b: 1}` would digest identically to `{b: 1}`");
+  }
+  if (t === "function" || t === "symbol" || t === "bigint") {
+    throw refuse(path, `a ${t}`, "JSON cannot carry one");
+  }
+  if (Array.isArray(v)) {
+    const out = [];
+    for (let i = 0; i < v.length; i += 1) {
+      if (!(i in v)) {
+        throw refuse(`${path}[${i}]`, "a sparse-array hole",
+          "JSON renders a hole as null, so it would digest identically to an explicit null element");
+      }
+      out.push(canon(v[i], `${path}[${i}]`));
+    }
+    return out;
+  }
+  const proto = Object.getPrototypeOf(v);
+  if (proto !== Object.prototype && proto !== null) {
+    throw refuse(path, `a ${v?.constructor?.name ?? "class"} instance`,
+      "its data lives in internal slots, not own enumerable keys — a Date, Map or Set canonicalises to a bare `{}`, so every instant (or every map) would digest the same");
+  }
+  if (Object.getOwnPropertySymbols(v).length > 0) {
+    throw refuse(path, "an object with own symbol keys",
+      "JSON.stringify ignores them, so their data would vanish from the identity without a trace");
+  }
+  const out = {};
+  for (const k of Object.keys(v).sort()) {
+    out[k] = canon(v[k], `${path}.${k}`);
+  }
+  return out;
 }
 
 async function fileDigest(path) {
@@ -232,8 +332,45 @@ export async function buildProvenance({ kernel, policy, task, mcpEntry, harnessR
     harness: resolvedHarness,
     task: { id: task.id, family: task.family, digest: digestOf(task) },
   };
-  const absent = (o) => o && typeof o === "object" && typeof o.absent === "string";
   block.attributable =
-    !absent(kernel) && !absent(resolvedMcp) && !absent(resolvedHarness) && !absent(block.policy);
+    identityDetermined(kernel) && identityDetermined(resolvedMcp) &&
+    identityDetermined(resolvedHarness) && identityDetermined(block.policy);
   return block;
+}
+
+/**
+ * Does this dimension carry an identity that was actually DETERMINED?
+ *
+ * It asserts the POSITIVE SHAPE rather than the absence of an absence. The
+ * predicate this replaced was `!(o && typeof o === "object" && typeof o.absent
+ * === "string")` — the negation of "an object carrying an `absent` string" —
+ * so every other shape passed as "identity determined", `undefined` and a bare
+ * string included. Measured: a policy whose `describe()` returned `undefined`
+ * produced a block asserting FULL attributability with no policy identity in
+ * it at all, and `store.mjs` then wrote no `rl_policy` row either, leaving a
+ * corpus row marked attributable whose policy dimension exists nowhere.
+ *
+ * `policy` is third-party by construction — `runner.mjs` wraps `describe()` in
+ * a try/catch precisely because it is — and slice 2 puts real model adapters
+ * behind that same seam. A THROWING `describe()` was already handled; this is
+ * what handles a LYING one.
+ *
+ * Three conditions, each load-bearing:
+ *   - a non-array OBJECT: a bare string names nothing this block can carry,
+ *     and an array is not an identity descriptor;
+ *   - NO `absent` key at all (not merely no absent *string*): an `absent` key
+ *     of any type is the dimension saying it does not know;
+ *   - AT LEAST ONE own key: `{}` asserts nothing, so it must not assert
+ *     attributability. Note this deliberately accepts a kernel carrying only
+ *     `{sha, reported_by, dirty_absent}` — a sha with no dirty reading is
+ *     still a determined identity, and `dirty_absent` is not `absent`.
+ *
+ * Exported because `ingest/rows.mjs` must recompute the same verdict from a
+ * trajectory file rather than trusting the file's own boolean, and the two
+ * must be the SAME predicate — two copies would drift, and the ingester's
+ * copy is the one a corpus is filtered on.
+ */
+export function identityDetermined(o) {
+  return o !== null && typeof o === "object" && !Array.isArray(o) &&
+    !("absent" in o) && Object.keys(o).length > 0;
 }

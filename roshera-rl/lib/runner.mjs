@@ -14,7 +14,7 @@ import { runEpisode, reapDocument, reapPart, unscoredFor, MCP_VERSION } from "./
 import { OUTCOMES, openTrajectory } from "./trajectory.mjs";
 import { spawnMcpSession, defaultMcpEntry } from "./mcp_session.mjs";
 import { mergeFinal } from "./reward.mjs";
-import { resolveKernelIdentity, buildProvenance, resolveBatchIdentity } from "./provenance.mjs";
+import { resolveKernelIdentity, buildProvenance, resolveBatchIdentity, digestOf } from "./provenance.mjs";
 
 /**
  * THIS FILE'S OWN LOCATION → the `roshera-rl` package root, the default
@@ -98,15 +98,23 @@ export async function reapOrphans({ baseUrl, authHeader, results }) {
  * `detail` is the CALLER'S already-composed reason — which of the two
  * third-party calls threw, and its own message — so the two call sites below
  * cannot produce two subtly different sentences for the same taxonomy entry.
+ *
+ * `provenance` is the block built by `provenanceForSetupFailure` below. It is
+ * REQUIRED here, not optional: both call sites run after the batch has already
+ * resolved kernel/mcp/harness, so falling through to `openTrajectory`'s
+ * last-resort default would write a reason ("the caller passed no provenance
+ * block…") that is false at both of them — and `rows.mjs` persists
+ * `header.provenance` whole into `rl_run.provenance`, so the falsehood would
+ * land in the corpus rather than merely in a file.
  */
-function setupFailedBeforeEpisode({ item, trajectoryPath, kernelSha, detail }) {
+function setupFailedBeforeEpisode({ item, trajectoryPath, kernelSha, detail, provenance }) {
   const rewardFinal = mergeFinal([]);
   const { claims, recipeRef, modelScope } = unscoredFor(item.task, "SETUP_FAILED", detail);
   try {
     const traj = openTrajectory({
       path: trajectoryPath, taskId: item.task.id, seed: item.seed, kernelSha,
       mcpVersion: MCP_VERSION, toolAllowlist: [...item.task.toolAllowlist],
-      split: item.task.split,
+      split: item.task.split, provenance,
     });
     traj.close({
       outcome: "SETUP_FAILED", rewardFinal, claims, recipeRef, modelScope,
@@ -132,6 +140,50 @@ function setupFailedBeforeEpisode({ item, trajectoryPath, kernelSha, detail }) {
     reap: { reaped: null, reason: "no document was created" },
     partReap: { reaped: null, reason: "no part was created" },
     modelScope,
+  };
+}
+
+/**
+ * The provenance block for an episode that failed BEFORE `buildProvenance`
+ * could return one.
+ *
+ * Three of the four identity dimensions are already known at both call sites:
+ * `kernel`, `mcp` and `harness` are resolved ONCE for the whole batch before
+ * the queue exists, and `task` is `defineTask`-validated. Only the POLICY is
+ * genuinely unknown — either its factory threw before a policy existed, or its
+ * own `describe()` threw. So exactly one dimension becomes a stated absence
+ * and the rest are recorded as resolved. Discarding all four (which is what
+ * falling through to `openTrajectory`'s default did) threw away facts the
+ * batch had already established and made the episode's `run_id` a phantom
+ * carrying nothing but a false sentence.
+ *
+ * `attributable: false` is PROVEN, not defaulted: the policy dimension is an
+ * absence, and one absent identity makes the block unattributable — the same
+ * rule `buildProvenance` applies.
+ *
+ * THIS FUNCTION CANNOT THROW. It is the failure path; a failure record that
+ * fails leaves an episode nobody can diagnose. `digestOf` refuses a task shape
+ * it cannot represent faithfully (provenance.mjs), so that refusal is caught
+ * here and becomes a stated absence on the task dimension rather than an
+ * exception escaping the worker.
+ */
+function provenanceForSetupFailure({ kernel, mcp, harness, task, policyAbsent }) {
+  let taskIdentity;
+  try {
+    taskIdentity = { id: task.id, family: task.family, digest: digestOf(task) };
+  } catch (e) {
+    taskIdentity = {
+      id: task.id, family: task.family,
+      absent: `the task could not be digested: ${String(e?.message ?? e)}`,
+    };
+  }
+  return {
+    kernel,
+    mcp,
+    harness,
+    policy: { absent: policyAbsent },
+    task: taskIdentity,
+    attributable: false,
   };
 }
 
@@ -193,10 +245,15 @@ export async function runBatch({
       try {
         policy = policyFor(item.task, item.seed);
       } catch (e) {
+        const detail = `the policy factory threw before the episode began: ${String(e?.message ?? e)}`;
         results.push(
           setupFailedBeforeEpisode({
-            item, trajectoryPath, kernelSha,
-            detail: `the policy factory threw before the episode began: ${String(e?.message ?? e)}`,
+            item, trajectoryPath, kernelSha, detail,
+            provenance: provenanceForSetupFailure({
+              kernel, mcp, harness, task: item.task,
+              policyAbsent: `the policy factory threw before a policy existed to describe ` +
+                `itself, so no policy identity could be obtained: ${String(e?.message ?? e)}`,
+            }),
           }),
         );
         continue;
@@ -227,6 +284,11 @@ export async function runBatch({
             item, trajectoryPath, kernelSha,
             detail: `building the episode's provenance record threw before the episode began ` +
               `(policy.describe() is third-party code): ${String(e?.message ?? e)}`,
+            provenance: provenanceForSetupFailure({
+              kernel, mcp, harness, task: item.task,
+              policyAbsent: `assembling the provenance block threw while calling the policy's ` +
+                `own describe(), so no policy identity could be obtained: ${String(e?.message ?? e)}`,
+            }),
           }),
         );
         continue;

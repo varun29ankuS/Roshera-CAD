@@ -18,7 +18,7 @@ import { fileURLToPath } from "node:url";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { resolveKernelIdentity, KernelIdentityConflict, buildProvenance, digestOf } from "../lib/provenance.mjs";
+import { resolveKernelIdentity, KernelIdentityConflict, buildProvenance, digestOf, UndigestableValue } from "../lib/provenance.mjs";
 import { defineTask } from "../lib/task.mjs";
 import { scriptedPolicy } from "../lib/policy.mjs";
 
@@ -56,6 +56,50 @@ check("an operator claim that DISAGREES refuses the batch", async () => {
     (e) => e instanceof KernelIdentityConflict && /deadbee/.test(e.message) && /abc1234/.test(e.message),
     "the refusal must name BOTH builds so the operator can see which is wrong",
   );
+});
+
+// ─── review finding M3: an absent `dirty` reading was coerced to a fabricated false ──
+//
+// `dirty: build.dirty === true` turned a server that reported a sha and NO
+// dirty reading — an older or newer contract, a proxy that strips fields —
+// into a positive claim of cleanliness nobody made. This branch's own rule,
+// applied everywhere except here.
+check("a sha with no dirty reading states the absence — it never becomes a fabricated `dirty: false`", async () => {
+  reply = { build: { sha: "abc1234" } };
+  const k = await resolveKernelIdentity({ baseUrl, authHeader: {}, claimed: undefined });
+  assert.equal(k.sha, "abc1234", "the sha the server DID state is still recorded");
+  assert.ok(!("dirty" in k),
+    "no dirty reading may be invented — `false` here is a positive claim of cleanliness nobody made");
+  assert.ok(typeof k.dirty_absent === "string" && k.dirty_absent.length > 0,
+    "the absence carries its own reason, on its own key");
+  assert.equal(k.reported_by, "server");
+});
+
+check("a sha with no dirty reading is still an ATTRIBUTABLE kernel identity", async () => {
+  // `dirty_absent` is not `absent`: the build is identified, only its
+  // cleanliness is unknown. Coupling the two would flip whole batches
+  // unattributable for a server that answered perfectly well.
+  const p = await buildProvenance({
+    kernel: { sha: "abc1234", reported_by: "server", dirty_absent: "the server stated no dirty reading" },
+    policy: scriptedPolicy([]), task: t,
+    mcpEntry: fileURLToPath(new URL("../package.json", import.meta.url)),
+    harnessRoot: fileURLToPath(new URL("..", import.meta.url)),
+  });
+  assert.equal(p.attributable, true);
+});
+
+check("a non-boolean dirty reading is an absence too, never coerced", async () => {
+  reply = { build: { sha: "abc1234", dirty: "yes" } };
+  const k = await resolveKernelIdentity({ baseUrl, authHeader: {}, claimed: undefined });
+  assert.ok(!("dirty" in k), "a string is not a dirty reading; `=== true` silently read it as clean");
+  assert.ok(typeof k.dirty_absent === "string");
+});
+
+check("a REAL dirty:true reading still survives unchanged", async () => {
+  reply = { build: { sha: "abc1234", dirty: true } };
+  const k = await resolveKernelIdentity({ baseUrl, authHeader: {}, claimed: undefined });
+  assert.equal(k.dirty, true);
+  assert.ok(!("dirty_absent" in k));
 });
 
 check("a server that cannot say produces a STATED absence, never a value", async () => {
@@ -176,6 +220,54 @@ check("an absent kernel identity makes the whole block UNATTRIBUTABLE", async ()
   assert.ok(!("sha" in p.kernel));
 });
 
+// ─── review finding I3: `attributable` detected only AN ABSENCE, not an IDENTITY ──
+//
+// `absent(o)` was `o && typeof o === "object" && typeof o.absent === "string"`,
+// and `attributable` was the negation of it across the four dimensions — so
+// anything that was not an object-carrying-an-absent-string passed as "identity
+// determined", `undefined` included. `policy` is THIRD-PARTY by construction
+// (runner.mjs wraps `describe()` in a try/catch for exactly that reason): a
+// THROWING describe() was handled, a LYING one was not, and slice 2's model
+// adapters widen that surface. Measured before the fix:
+//
+//   policy= undefined            attributable= true
+//   policy2= "anthropic-sonnet"  attributable2= true
+//
+// Downstream, store.mjs writes no `rl_policy` row for a non-object policy, so
+// the corpus got an episode marked attributable whose policy dimension does
+// not exist anywhere.
+for (const [label, describeReturns] of [
+  ["undefined", undefined],
+  ["null", null],
+  ["a bare string", "anthropic-sonnet"],
+  ["an empty object", {}],
+  ["an array", ["scripted"]],
+]) {
+  check(`a policy whose describe() returns ${label} is NOT attributable`, async () => {
+    const p = await buildProvenance({
+      kernel: { sha: "abc1234", dirty: false, reported_by: "server" },
+      policy: { describe: () => describeReturns },
+      task: t,
+      mcpEntry: fileURLToPath(new URL("../package.json", import.meta.url)),
+      harnessRoot: fileURLToPath(new URL("..", import.meta.url)),
+    });
+    assert.equal(p.attributable, false,
+      `a block with no usable policy identity (${label}) must not claim attributability — ` +
+      "`attributable` has to require a positive identity, not merely the absence of an `absent` key");
+  });
+}
+
+check("a real policy identity still makes the block attributable — the check did not become a blanket refusal", async () => {
+  const p = await buildProvenance({
+    kernel: { sha: "abc1234", dirty: false, reported_by: "server" },
+    policy: scriptedPolicy([{ tool: "create_cylinder", args: { radius: 25 } }]), task: t,
+    mcpEntry: fileURLToPath(new URL("../package.json", import.meta.url)),
+    harnessRoot: fileURLToPath(new URL("..", import.meta.url)),
+  });
+  assert.equal(p.attributable, true);
+  assert.match(p.policy.script_digest, /^sha256:/);
+});
+
 check("an unreadable mcp dist is a stated absence, not a zero digest", async () => {
   const p = await buildProvenance({
     kernel: { sha: "abc1234", dirty: false, reported_by: "server" },
@@ -253,6 +345,75 @@ check("digestOf CHANGES when array ELEMENT order changes — array order is neve
   const b = { claims: [3, 2, 1] };
   assert.notEqual(digestOf(a), digestOf(b),
     "array order is meaningful data; a canonicaliser that sorted arrays would silently equate two different sequences");
+});
+
+// ─── review finding I4: digestOf silently COLLIDED on shapes it cannot represent ──
+//
+// Three collisions were measured against the real module, and all three are
+// reachable from `scriptedPolicy`'s caller-supplied script — which `digestOf`
+// turns into `script_digest`, THE policy's identity, which in turn feeds
+// `run_id` (ingest/rows.mjs) and `rl_policy`'s primary key (ingest/store.mjs):
+//
+//   digestOf({a: undefined, b: 1}) === digestOf({b: 1})        // key DROPPED
+//   digestOf({t: new Date(0)})     === digestOf({t: {}})       // Date → {}
+//   digestOf({r: NaN})             === digestOf({r: null})     // non-finite → null
+//
+// A digest is an IDENTITY CLAIM, so the fix is a refusal, not an approximation:
+// `canon` now accepts only the shapes JSON can carry losslessly and REFUSES
+// everything else, naming the offending key path so the caller can find it.
+check("digestOf REFUSES an `undefined` value instead of silently dropping the key", () => {
+  assert.throws(
+    () => digestOf({ a: undefined, b: 1 }),
+    (e) => e instanceof UndigestableValue && /\$\.a\b/.test(e.message) && /undefined/i.test(e.message),
+    "the refusal must name the offending key path ($.a) — a digest that drops a key is claiming an identity it does not have",
+  );
+});
+
+check("digestOf REFUSES a Date instead of collapsing every instant onto the same digest", () => {
+  assert.throws(
+    () => digestOf({ t: new Date(0) }),
+    (e) => e instanceof UndigestableValue && /\$\.t\b/.test(e.message),
+    "a Date's own enumerable keys are empty, so every Date used to digest as a bare {}",
+  );
+  assert.throws(() => digestOf({ m: new Map([["a", 1]]) }), UndigestableValue);
+  assert.throws(() => digestOf({ s: new Set([1]) }), UndigestableValue);
+});
+
+check("digestOf REFUSES a non-finite number instead of digesting it as null", () => {
+  for (const bad of [NaN, Infinity, -Infinity]) {
+    assert.throws(
+      () => digestOf({ radius: bad }),
+      (e) => e instanceof UndigestableValue && /\$\.radius\b/.test(e.message),
+      `JSON.stringify renders ${String(bad)} as null, so it collided with a real null`,
+    );
+  }
+});
+
+check("digestOf still digests every shape it CAN represent losslessly", () => {
+  // The refusal must not become a refusal of ordinary data: the nesting,
+  // arrays, negative/fractional numbers, booleans, nulls and empty containers
+  // real tasks and scripts carry all still digest.
+  const ok = {
+    id: "cylinder-r25-h60", ratio: -0.5, ok: true, missing: null,
+    steps: [{ tool: "create_cylinder", args: { radius: 25, opts: [] } }, {}],
+    empty: {},
+  };
+  assert.match(digestOf(ok), /^sha256:[0-9a-f]{64}$/);
+  assert.equal(digestOf(ok), digestOf(structuredClone(ok)), "the same content still digests the same");
+});
+
+// The call site that makes this a defect rather than a curiosity: two
+// materially different scripts used to produce ONE `script_digest`.
+check("two scripts that used to COLLIDE on one script_digest are now refused at the policy seam", () => {
+  const dropped = scriptedPolicy([{ tool: "create_cylinder", args: { a: undefined, b: 1 } }]);
+  const stated = scriptedPolicy([{ tool: "create_cylinder", args: { b: 1 } }]);
+  assert.throws(() => dropped.describe(), UndigestableValue,
+    "the script carrying an undefined arg must refuse rather than pass as its neighbour's identity");
+  assert.match(stated.describe().script_digest, /^sha256:/,
+    "and the well-formed neighbour still describes itself normally");
+
+  const dated = scriptedPolicy([{ tool: "create_cylinder", args: { when: new Date(0) } }]);
+  assert.throws(() => dated.describe(), UndigestableValue);
 });
 
 for (const [name, fn] of checks) { await fn(); process.stdout.write(`  ok - ${name}\n`); }

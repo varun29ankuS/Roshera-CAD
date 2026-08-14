@@ -124,12 +124,21 @@ export function openTrajectory({
     // THE FULL PROVENANCE BLOCK — kernel/mcp/policy/harness identity and the
     // single `attributable` flag a consumer filters on. `provenance` is not
     // yet REQUIRED here because not every caller of this constructor has
-    // assembled one (existing call sites predate `buildProvenance`), but an
-    // unassembled block is an ABSENCE, not a null: this is the identity field
-    // the whole plan exists to attach, so a caller that skipped it says why,
-    // the same way `episode.mjs`'s `model_scope` does a few lines below.
+    // assembled one, but an unassembled block is an ABSENCE, not a null: this
+    // is the identity field the whole plan exists to attach, so a caller that
+    // skipped it says why, the same way `episode.mjs`'s `model_scope` does a
+    // few lines below.
+    //
+    // THE REASON STATES ONLY WHAT THIS FUNCTION CAN KNOW. It used to say the
+    // call site "predates buildProvenance" — a guess about the caller, and a
+    // false one at both of `runner.mjs`'s setup-failure paths, one of which is
+    // literally inside the catch block of a `buildProvenance` call. Since
+    // `rows.mjs` persists this block whole into `rl_run.provenance`, that
+    // false reason reached the corpus. All this function observes is that no
+    // block arrived and no reason came with it; WHY is the caller's to state,
+    // and every caller in this package now does.
     provenance: provenance ?? {
-      absent: "the caller assembled no provenance block (call site predates buildProvenance)",
+      absent: "the caller passed no provenance block and stated no reason for its absence",
     },
   }) + "\n");
   return new Trajectory(path);

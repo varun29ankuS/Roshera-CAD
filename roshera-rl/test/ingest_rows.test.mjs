@@ -66,12 +66,70 @@ check("a complete trajectory maps to one episode row with attributable carried t
   assert.equal(r.episode.seed, 0);
   assert.equal(r.episode.outcome, "COMPLETED");
   assert.equal(r.episode.attributable, true,
-    "the fixture's provenance.attributable is true and must be carried through unchanged");
+    "every one of the fixture's four identity dimensions is a real descriptor, so the DERIVED " +
+    "verdict is true — this is recomputed from the block, not read off the file's own boolean");
   assert.equal(r.run.attributable, true);
   // `kernel.reported_by` is always "server" — rows.mjs must pass it through
   // unmodified, never rewrite or launder it.
   assert.equal(r.run.provenance.kernel.reported_by, "server");
   assert.equal(r.run.provenance.kernel.sha, "3a9375f9");
+});
+
+// ─── review finding I2: the verdict is DERIVED, never taken on trust ──────
+//
+// `attributableOf` read `provenance.attributable` straight off the file with
+// nothing cross-checking it against the block it summarises. Measured: a
+// trajectory whose kernel is a stated absence still produced
+// `attributable = true` in BOTH `rl_run` and `rl_episode`, contradicting the
+// JSONB sitting in the same row — and `attributable` is, in this module's own
+// words, "the single field a consumer filters on".
+//
+// `buildProvenance` never emits that combination, so today's WRITER is safe.
+// The reader is not: `ingestDir` ingests every `.jsonl` in a directory —
+// hand-edited files, files copied from another machine, files from a future or
+// regressed writer — which is exactly the population the quarantine mechanism
+// exists for. And `verify()` can never catch it, because it compares bytes
+// since ingest: a file inconsistent AT INGEST TIME verifies clean forever.
+// This same module already refuses to trust an upstream invariant it cannot
+// check, for `recipe_ref`'s shape; it now does so for the field that matters most.
+check("a file CLAIMING attributable: true over an absent kernel is reported as unattributable", () => {
+  const lines = completeText.trim().split("\n");
+  const header = JSON.parse(lines[0]);
+  header.provenance.kernel = { reported_by: "server", absent: "the server could not be reached" };
+  assert.equal(header.provenance.attributable, true,
+    "sanity: the file still CLAIMS attributability — that is the whole point of this check");
+  lines[0] = JSON.stringify(header);
+  const r = rowsFromTrajectory(lines.join("\n") + "\n", { path: "lying.jsonl" });
+
+  assert.equal(r.run.attributable, false,
+    "the verdict must be recomputed from the block, not copied from the file's own boolean");
+  assert.equal(r.episode.attributable, false, "and the episode row must agree with the run row");
+  // The file's own claim is NOT erased — it rides along inside the stored
+  // block, so a reader can see the disagreement rather than only its verdict.
+  assert.equal(r.run.provenance.attributable, true,
+    "the block is stored whole, including the claim that was overruled");
+});
+
+check("each of the four identity dimensions can independently sink the verdict", () => {
+  for (const dimension of ["kernel", "mcp", "policy", "harness"]) {
+    const lines = completeText.trim().split("\n");
+    const header = JSON.parse(lines[0]);
+    header.provenance[dimension] = { absent: `the ${dimension} identity was never obtained` };
+    lines[0] = JSON.stringify(header);
+    const r = rowsFromTrajectory(lines.join("\n") + "\n", { path: `absent-${dimension}.jsonl` });
+    assert.equal(r.run.attributable, false,
+      `an absent ${dimension} must make the row unattributable — a corpus filtered on this flag would otherwise include rows that cannot say what produced them`);
+  }
+});
+
+check("a dimension that is present but EMPTY does not pass as an identity", () => {
+  const lines = completeText.trim().split("\n");
+  const header = JSON.parse(lines[0]);
+  header.provenance.policy = {};
+  lines[0] = JSON.stringify(header);
+  const r = rowsFromTrajectory(lines.join("\n") + "\n", { path: "empty-policy.jsonl" });
+  assert.equal(r.run.attributable, false,
+    "`{}` asserts nothing; the ingester uses the same positive-shape predicate buildProvenance does");
 });
 
 // ─── steps: index, tool, duration ──────────────────────────────────────────
@@ -156,6 +214,31 @@ check("the recipe row and derived solids rows reflect the real recipe", () => {
   const merged = r.solids.find((s) => s.token === "solid:2");
   assert.equal(merged.produced_by_sequence, 93);
   assert.equal(merged.op_kind, "boolean_union");
+});
+
+// ─── review finding M2: the fixture must stay reachable from the REAL emitter ──
+//
+// `certificate_summary.steps_total` and `step_count` are set from the SAME
+// value by the real emitter — `steps.len()`, at
+// api-server/src/handlers/timeline.rs:4353 and :4358 — so a three-step recipe
+// reporting `steps_total: 2` is not merely unusual, it is UNREACHABLE in
+// production. The fixture's entire stated value is fidelity to that emitter,
+// and these two numbers land in `rl_recipe.step_count` and
+// `rl_certificate.steps_total`, where the first analytical query comparing
+// them finds an impossible row and chases a defect that does not exist.
+check("the fixture's recipe reports a step_count its certificate summary agrees with", () => {
+  const r = rowsFromTrajectory(completeText, { path: completePath });
+  assert.equal(r.recipe.step_count, r.recipeSteps.length,
+    "step_count is steps.len() at the emitter (timeline.rs:4353)");
+  assert.equal(r.recipe.certificate_summary.steps_total, r.recipe.step_count,
+    "steps_total is set from the SAME steps.len() (timeline.rs:4358) — these two can never disagree in production");
+  // Only `steps_total` counts every step. The certificate tallies count only
+  // steps that CARRY a recorded certificate (`certified += 1` guards all four
+  // at timeline.rs:4313-4320), so the synthetic step must not have moved them.
+  const c = r.recipe.certificate_summary;
+  assert.equal(c.sound + c.unsound + c.indeterminate, c.steps_with_recorded_certificate,
+    "the three verdict tallies partition the certified steps exactly, never the total");
+  assert.ok(c.steps_with_recorded_certificate <= c.steps_total);
 });
 
 // ─── lineage edges (v1 scope): the actual cross product, not just its size ─
@@ -268,6 +351,47 @@ check("two episodes sharing kernel/mcp/policy/harness/split collapse onto the sa
     "same producer identity (kernel/mcp/policy/harness/split) is one run");
   assert.notEqual(a.episode.episode_id, b.episode.episode_id,
     "different task_id/seed under the same run is a different episode");
+});
+
+// ─── review finding I6: rl_run stored per-task fields under a run identity that excludes them ──
+//
+// `runRowFrom`'s own docstring says `run_id` must never contain
+// `tool_allowlist` ("a task field, not a batch field"); twelve lines later the
+// same function put `tool_allowlist` — and `kernel_claimed`, and
+// `mcp_version` — on the run row. Combined with `ON CONFLICT (run_id) DO
+// NOTHING` in store.mjs, that is first-writer-wins: whichever episode landed
+// first froze those columns for every sibling that ever shared the run, and a
+// later sibling with a different action space changed nothing and said nothing.
+// A stale value under a confident column name is the exact failure this branch
+// is about.
+check("two episodes whose tool_allowlist DIFFERS still share one run_id", () => {
+  const lines = completeText.trim().split("\n");
+  const header = JSON.parse(lines[0]);
+  const wider = { ...header, task_id: "cylinder-wide-allowlist", tool_allowlist: [...header.tool_allowlist, "revolve"] };
+  const rest = lines.slice(1);
+
+  const a = rowsFromTrajectory(completeText, { path: completePath });
+  const b = rowsFromTrajectory([JSON.stringify(wider), ...rest].join("\n") + "\n", { path: "wider.jsonl" });
+  assert.notDeepEqual(header.tool_allowlist, wider.tool_allowlist, "sanity: the two action spaces differ");
+  assert.equal(a.run.run_id, b.run.run_id,
+    "run identity is kernel/mcp/policy/harness/split — the action space is deliberately NOT part of it");
+});
+
+check("the run row carries no per-episode field the run identity excludes", () => {
+  const r = rowsFromTrajectory(completeText, { path: completePath });
+  for (const column of ["tool_allowlist", "kernel_claimed", "mcp_version"]) {
+    assert.equal(column in r.run, false,
+      `rl_run must not carry \`${column}\`: two episodes with different values collapse onto one run_id ` +
+      `(proven directly above), and ON CONFLICT DO NOTHING then freezes whichever landed first — ` +
+      `a stale value under a confident column name, with no absence and no reason`);
+  }
+  // What DOES belong on a run row: the identity itself and what was derived
+  // from it. None of this moves between siblings of one run.
+  assert.equal(typeof r.run.run_id, "string");
+  assert.equal(r.run.split, "train");
+  assert.equal(r.run.schema_version, "roshera-rl/1");
+  assert.equal(r.run.attributable, true);
+  assert.ok(r.run.provenance, "and the whole block, which run_id is a digest of");
 });
 
 for (const [name, fn] of checks) { fn(); process.stdout.write(`  ok - ${name}\n`); }

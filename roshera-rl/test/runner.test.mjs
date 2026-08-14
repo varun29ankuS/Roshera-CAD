@@ -405,6 +405,83 @@ check("a policy whose describe() throws fails its OWN episode, not the whole bat
   assert.equal(terminal.outcome, "SETUP_FAILED");
 });
 
+// ─── review finding I5: both setup-failure paths stated a reason that was FALSE ──
+//
+// Both fell through to `trajectory.mjs`'s last-resort default — "the caller
+// assembled no provenance block (call site predates buildProvenance)" — at two
+// call sites that are NEWER than `buildProvenance`, one of them literally
+// inside the catch block of a `buildProvenance` call. It is not merely a wrong
+// sentence in a file: `rows.mjs` stores `header.provenance` whole into
+// `rl_run.provenance`, so the false reason lands in the corpus.
+//
+// The fix also stops the failure record throwing away what the batch ALREADY
+// KNOWS. `kernel`, `mcp` and `harness` are resolved once per batch before the
+// queue exists (runner.mjs), so a setup failure can and must record the real
+// ones and mark only `policy` absent.
+//
+// NOT asserted here, deliberately: that the failed episode shares its
+// siblings' `run_id`. It cannot — `run_id` digests `policy` too (rows.mjs),
+// and this episode's policy identity is a stated absence, which is the honest
+// answer. What the fix buys is that the phantom run now carries the batch's
+// REAL kernel/mcp/harness and a TRUE reason, instead of a bare falsehood.
+check("a setup failure records the batch's ALREADY-RESOLVED identity and its own TRUE reason", async () => {
+  healthReply = { build: { sha: "cafefeed", dirty: false } };
+  try {
+    // ── path 1: the policy FACTORY threw (runner.mjs, before any policy existed)
+    const a = await runBatch({
+      tasks: [task], policyFor: () => { throw new Error("no policy registered for this task"); },
+      seeds: [1], concurrency: 1, baseUrl, authHeader: {}, outDir: dir, spawn: fakeSpawn,
+    });
+    const failedA = a.results.find((r) => r.outcome === "SETUP_FAILED");
+    assert.ok(failedA, "the factory throw is still one episode's SETUP_FAILED");
+    const provA = readTrajectory(failedA.trajectoryPath).header.provenance;
+
+    assert.doesNotMatch(JSON.stringify(provA), /predates buildProvenance/,
+      "this call site does NOT predate buildProvenance — a present-but-false reason is worse than an absent one");
+    assert.equal(provA.kernel.sha, "cafefeed",
+      "the kernel identity was already resolved for the whole batch before this episode failed — throwing it away invents a second, phantom run");
+    assert.ok("dist_digest" in provA.mcp, "the mcp digest was already resolved too");
+    assert.equal(typeof provA.harness, "object", "and the harness identity");
+    assert.equal(typeof provA.policy.absent, "string",
+      "only the POLICY is genuinely unknown here — it is the one dimension that must be a stated absence");
+    assert.match(provA.policy.absent, /policy factory threw/i,
+      `the reason must name what actually happened, got ${JSON.stringify(provA.policy?.absent)}`);
+    assert.match(provA.policy.absent, /no policy registered for this task/,
+      "and carry the third-party code's own message");
+    assert.equal(provA.task.id, task.id, "the task identity is known and stated");
+    assert.equal(provA.attributable, false,
+      "attributable is FALSE and provably so — the policy dimension is an absence");
+
+    // ── path 2: describe() threw INSIDE buildProvenance
+    const b = await runBatch({
+      tasks: [task], seeds: [1], concurrency: 1, baseUrl, authHeader: {}, outDir: dir,
+      spawn: fakeSpawn,
+      policyFor: () => ({
+        async act() { return { done: true }; },
+        tokensUsed() { return 0; },
+        describe() { throw new Error("describe() exploded"); },
+      }),
+    });
+    const failedB = b.results.find((r) => r.outcome === "SETUP_FAILED");
+    assert.ok(failedB, "a throwing describe() is still one episode's SETUP_FAILED");
+    const provB = readTrajectory(failedB.trajectoryPath).header.provenance;
+
+    assert.doesNotMatch(JSON.stringify(provB), /predates buildProvenance/,
+      "this call site IS the catch block of a buildProvenance call — the default reason is self-evidently false here");
+    assert.equal(provB.kernel.sha, "cafefeed");
+    assert.match(provB.policy.absent, /describe\(\)/,
+      `the reason must name describe(), got ${JSON.stringify(provB.policy?.absent)}`);
+    assert.match(provB.policy.absent, /describe\(\) exploded/, "and carry its own message");
+    assert.equal(provB.attributable, false);
+
+    // The two paths must not tell the same story — they are different facts.
+    assert.notEqual(provA.policy.absent, provB.policy.absent,
+      "a policy factory that threw and a describe() that threw are two different failures, and one shared sentence would erase which");
+  } finally {
+    healthReply = {};
+  }
+});
+
 check("when the server cannot state its build, the batch still RUNS and every header says so honestly", async () => {
   // An ABSENCE is not a CONFLICT: with no `claimed` sha and a server that
   // states nothing (the default stub reply — no `build` key), the batch must

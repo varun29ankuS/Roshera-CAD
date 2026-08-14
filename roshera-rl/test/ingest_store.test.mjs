@@ -77,9 +77,32 @@ const fixArcText = [
 ].join("\n") + "\n";
 const fixArcEpisodeId = rowsFromTrajectory(fixArcText, { path: "fix-arc" }).episode.episode_id;
 
+// A third sibling: a trajectory whose kernel identity states a sha but NO
+// dirty reading (review finding M3 — an older/newer server contract, or a
+// proxy that stripped the field). Its own sha, so it gets its own
+// `rl_kernel_build` row rather than colliding with the fixture's under
+// `ON CONFLICT (sha) DO NOTHING` and silently proving nothing.
+const noDirtySha = "f4nodirtyprobe";
+const noDirtyHeader = {
+  ...siblingHeader,
+  task_id: "cylinder-r25-h60-dirty-absent-probe",
+  seed: 999903,
+  provenance: {
+    ...siblingHeader.provenance,
+    kernel: {
+      sha: noDirtySha, reported_by: "server",
+      dirty_absent: "the server stated a sha but no dirty reading, so whether its tree was clean is unknown",
+    },
+  },
+};
+const noDirtyText = [JSON.stringify(noDirtyHeader), ...siblingRest].join("\n") + "\n";
+const noDirtyRows = rowsFromTrajectory(noDirtyText, { path: "no-dirty" });
+const noDirtyEpisodeId = noDirtyRows.episode.episode_id;
+
 const scratchDir = mkdtempSync(join(tmpdir(), "roshera-rl-ingest-store-"));
 const scratchPath = join(scratchDir, "drift-probe.jsonl");
 const fixArcPath = join(scratchDir, "quarantine-fix-probe.jsonl");
+const noDirtyPath = join(scratchDir, "dirty-absent-probe.jsonl");
 
 async function countWhere(table, whereSql, params) {
   const r = await client.query(`SELECT count(*)::int AS n FROM ${table} WHERE ${whereSql}`, params);
@@ -90,10 +113,13 @@ async function cleanup() {
   // rl_episode cascades to rl_step/rl_refusal/rl_claim_result/rl_recipe_step/
   // rl_solid/rl_lineage_edge/rl_recipe/rl_certificate (ON DELETE CASCADE) —
   // deleting the episode rows is enough to clear their whole subtree.
-  await client.query(`DELETE FROM rl_episode WHERE episode_id = $1 OR episode_id = $2 OR episode_id = $3`, [
-    fixtureEpisodeId, siblingEpisodeId, fixArcEpisodeId,
-  ]);
+  await client.query(`DELETE FROM rl_episode WHERE episode_id = ANY($1)`, [[
+    fixtureEpisodeId, siblingEpisodeId, fixArcEpisodeId, noDirtyEpisodeId,
+  ]]);
   await client.query(`DELETE FROM rl_quarantine WHERE path = $1 OR path = $2`, [malformedPath, fixArcPath]);
+  // This suite MINTS this build identity; nothing else in the corpus uses it,
+  // so it is cleaned up rather than left to accumulate in a shared dev database.
+  await client.query(`DELETE FROM rl_kernel_build WHERE sha = $1`, [noDirtySha]);
 }
 
 const checks = [];
@@ -210,6 +236,28 @@ check("re-ingesting an episode whose certificate_summary has vanished deletes th
     "the certificate row must not survive a re-ingest whose recipe no longer carries a certificate_summary");
   assert.equal(await countWhere("rl_recipe", "episode_id = $1", [fixArcEpisodeId]), 1,
     "the recipe row itself is still present — only its certificate rollup disappeared");
+});
+
+// ─── review finding M3, the STORE half ────────────────────────────────────
+// `rl_kernel_build.dirty` was written as `kernel.dirty === true`, so a
+// trajectory whose kernel stated a sha and no dirty reading landed in Postgres
+// as `dirty = false` — a positive claim of cleanliness nobody made, in a
+// column that is already nullable precisely so it does not have to lie.
+check("a kernel identity with no dirty reading lands as SQL NULL, never a fabricated false", async () => {
+  writeFileSync(noDirtyPath, noDirtyText, "utf8");
+  const res = await ingestFile(client, noDirtyPath);
+  assert.equal(res.status, "ingested");
+  assert.equal(res.episode_id, noDirtyEpisodeId);
+
+  const r = await client.query(`SELECT dirty FROM rl_kernel_build WHERE sha = $1`, [noDirtySha]);
+  assert.equal(r.rows.length, 1, "the build identity is still recorded — the sha WAS stated");
+  assert.equal(r.rows[0].dirty, null,
+    "an absent dirty reading must be NULL: `false` here asserts a clean tree the server never claimed");
+
+  // And the REASON survives, in the JSONB that carries the whole block.
+  const run = await client.query(`SELECT provenance FROM rl_run WHERE run_id = $1`, [noDirtyRows.run.run_id]);
+  assert.match(run.rows[0].provenance.kernel.dirty_absent, /no dirty reading/,
+    "the stated reason must reach Postgres, not just the boolean's absence");
 });
 
 check("ingestDir walks every .jsonl fixture in a directory, ingesting the good one and quarantining the bad one", async () => {

@@ -51,7 +51,7 @@
  */
 
 import { createHash } from "node:crypto";
-import { digestOf } from "../provenance.mjs";
+import { digestOf, identityDetermined } from "../provenance.mjs";
 
 function sha256Hex(text) {
   return "sha256:" + createHash("sha256").update(text).digest("hex");
@@ -97,36 +97,92 @@ function parseLines(text) {
 }
 
 /**
- * The single field a consumer filters on. `provenance?.attributable === true`
- * covers three shapes identically: a full attributable block (`true`), a
- * full block that failed its own check (`false`), and a stated absence
- * object that never carried the key at all (`undefined !== true` → `false`)
- * — so the caller never has to branch on which of the three it received.
+ * The single field a consumer filters on — DERIVED FROM THE BLOCK, never
+ * taken from the file's own boolean.
+ *
+ * This used to be `provenance?.attributable === true`, which trusted an
+ * upstream invariant this function cannot check. Measured: a trajectory whose
+ * kernel is a stated absence still produced `attributable = true` in both
+ * `rl_run` and `rl_episode`, contradicting the JSONB in the same row.
+ *
+ * `buildProvenance` never emits that combination, so today's WRITER is safe —
+ * but the writer is not the population this module reads. `ingestDir` ingests
+ * every `.jsonl` in a directory: hand-edited files, files copied in from
+ * another machine, files written by a future or regressed writer. That is
+ * precisely the population `rl_quarantine` exists for. And `verify()` can
+ * never catch this class of defect, because it compares bytes-since-ingest —
+ * a file that was internally inconsistent when it was ingested verifies clean
+ * forever. Twelve lines below, `recipeRowFrom` already states the rule this
+ * now follows: never trust an upstream invariant it cannot check.
+ *
+ * THE SAME PREDICATE `buildProvenance` USES, imported rather than reimplemented
+ * (`identityDetermined`, provenance.mjs) — two copies of the writer's verdict
+ * and the reader's verdict would drift, and the reader's is the one a corpus
+ * gets filtered on.
+ *
+ * The file's own claim is not erased when it disagrees: the whole block,
+ * including its `attributable`, is stored in `rl_run.provenance`, so a reader
+ * can see both the claim and the recomputed verdict. Only the derived column
+ * is authoritative.
+ *
+ * All four shapes still collapse to one honest verdict without the caller
+ * branching: a full attributable block, a full block that failed its own
+ * check, a stated absence object (`{absent: "..."}` — no dimensions at all),
+ * and a legacy file with no `provenance` key whatsoever.
  */
 function attributableOf(provenance) {
-  return provenance?.attributable === true;
+  return identityDetermined(provenance?.kernel) &&
+    identityDetermined(provenance?.mcp) &&
+    identityDetermined(provenance?.policy) &&
+    identityDetermined(provenance?.harness);
 }
 
 function runRowFrom({ header, provenance, attributable }) {
+  // EVERY FIELD IS STATED, `null` INCLUDED. `digestOf` refuses an `undefined`
+  // value rather than letting `JSON.stringify` drop the key (provenance.mjs) —
+  // a header missing `schema_version` or `split` is an ordinary file, not a
+  // malformed one, so its absence is written as an explicit `null` here rather
+  // than left to vanish from the identity. `?? null` is a no-op for every
+  // header that carries the key, so no existing digest moves.
   const identity = {
-    schema_version: header.schema_version,
+    schema_version: header.schema_version ?? null,
     kernel: provenance?.kernel ?? null,
     mcp: provenance?.mcp ?? null,
     policy: provenance?.policy ?? null,
     harness: provenance?.harness ?? null,
-    split: header.split,
+    split: header.split ?? null,
   };
+  // A RUN ROW CARRIES ONLY WHAT THE RUN IDENTITY COVERS — with one stated
+  // exception, `provenance`, noted at the end of this comment.
+  //
+  // It used to also carry `kernel_claimed` (`header.kernel_sha`), `mcp_version`
+  // and `tool_allowlist` — none of which is part of `run_id`, twelve lines
+  // above, deliberately and correctly. Because `upsertRun` is `ON CONFLICT
+  // (run_id) DO NOTHING`, the first episode ingested under a run FROZE those
+  // three columns for every sibling that ever shared it: edit a task's
+  // allowlist, run again, ingest into the same directory, and the column still
+  // reported the OLD list with no absence and no reason. That is a stale value
+  // under a confident column name — the exact defect this package exists to
+  // refuse — and no query anywhere read the columns.
+  //
+  // Nothing is lost. All three live per episode in the trajectory file, which
+  // is the source of truth, and `mcp_version` additionally already sits inside
+  // `provenance.mcp.version` in the JSONB below. Dropping is also the
+  // REVERSIBLE direction: adding a per-episode column later is a non-
+  // destructive `ALTER ... ADD COLUMN`, whereas removing one after a corpus
+  // depends on it is the expensive migration.
+  //
+  // THE EXCEPTION, FOUND WHILE MAKING THAT CHANGE AND LEFT DELIBERATELY:
+  // `provenance` below is stored whole, and it carries `task`, which the
+  // identity above deliberately excludes. So `rl_run.provenance -> 'task'`
+  // holds whichever sibling was ingested first — the same first-writer-wins
+  // shape, one layer down in the JSONB. Not fixed here because nothing is
+  // lost (every episode's own task identity is recorded per-episode, in
+  // `rl_task` and in its trajectory file) and because changing what the run
+  // document stores is a design decision, not a defect fix. See schema.mjs.
   return {
     run_id: digestOf(identity),
-    schema_version: header.schema_version,
-    // The header's OWN `kernel_sha` field predates `provenance` and is kept
-    // distinct from it deliberately: it is whatever the caller of
-    // `openTrajectory` claimed (an operator env var, on old call sites, or
-    // literally the string "unknown" — see first-live-trajectory.jsonl),
-    // never promoted into `provenance.kernel`, which is server-reported only.
-    kernel_claimed: header.kernel_sha ?? null,
-    mcp_version: header.mcp_version ?? null,
-    tool_allowlist: header.tool_allowlist ?? [],
+    schema_version: header.schema_version ?? null,
     split: header.split ?? null,
     provenance,
     attributable,
@@ -135,7 +191,9 @@ function runRowFrom({ header, provenance, attributable }) {
 
 function episodeRowFrom({ path, header, terminal, runId, attributable, sourceDigest }) {
   return {
-    episode_id: digestOf({ run_id: runId, task_id: header.task_id, seed: header.seed, started_at: header.started_at }),
+    // `started_at ?? null` for the same reason as `runRowFrom`'s identity: a
+    // header without it is stated as null rather than dropped from the digest.
+    episode_id: digestOf({ run_id: runId, task_id: header.task_id, seed: header.seed, started_at: header.started_at ?? null }),
     run_id: runId,
     path: path ?? null,
     task_id: header.task_id,

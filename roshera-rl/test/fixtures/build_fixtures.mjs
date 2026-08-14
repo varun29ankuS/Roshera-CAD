@@ -135,6 +135,21 @@ const terminal = {
     step_count: realTerminal.recipe_ref.step_count + 1,
     sequence_range: [realTerminal.recipe_ref.sequence_range[0], booleanStep.sequence],
     steps: [...realTerminal.recipe_ref.steps, booleanStep],
+    // `steps_total` MOVES WITH `step_count`, because the real emitter sets both
+    // from the same value: `step_count: steps.len()` and
+    // `steps_total: steps.len()` (api-server/src/handlers/timeline.rs:4353 and
+    // :4358). Bumping one and not the other produced a combination the emitter
+    // CANNOT produce — and this fixture's whole stated value is fidelity to it.
+    //
+    // Only `steps_total` moves. `steps_with_recorded_certificate`, `sound`,
+    // `unsound` and `indeterminate` are all incremented inside
+    // `if let Some(cert) = &certificate` (timeline.rs:4313-4320), and the
+    // synthetic `boolean_union` step above carries no certificate — so an
+    // uncertified step raises the total and nothing else, exactly as here.
+    certificate_summary: {
+      ...realTerminal.recipe_ref.certificate_summary,
+      steps_total: realTerminal.recipe_ref.certificate_summary.steps_total + 1,
+    },
   },
 };
 
