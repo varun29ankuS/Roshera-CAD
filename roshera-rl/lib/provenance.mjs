@@ -191,22 +191,49 @@ function mergeHarness(shaResult, dirtyResult) {
 }
 
 /**
+ * The parts of a provenance block that are BATCH-INVARIANT: `mcpEntry` and
+ * `harnessRoot` do not vary per episode, so neither should the work of
+ * reading one and asking git about the other. A caller running N episodes
+ * from the same batch should call this ONCE and pass the result to every
+ * `buildProvenance` call — see its `mcp`/`harness` params below.
+ *
+ * Beyond the wasted file read and two `git` subprocesses per episode,
+ * recomputing this per episode risks two episodes IN THE SAME BATCH
+ * disagreeing about their own harness: if the tree changes mid-run (a
+ * concurrent `git status` catching a checkout in progress), episode 3 could
+ * record a different `dirty` reading than episode 1 did a second earlier —
+ * an internally inconsistent batch reporting on its own provenance.
+ */
+export async function resolveBatchIdentity({ mcpEntry, harnessRoot }) {
+  const mcp = { version: "0.1.0", ...(await fileDigest(mcpEntry)) };
+  const harness = mergeHarness(await shaOf(harnessRoot), await dirtyOf(harnessRoot));
+  return { mcp, harness };
+}
+
+/**
  * Assemble the block. `attributable` is false whenever ANY identity is absent —
  * it is the single field a consumer filters on, and a corpus that cannot say
  * which rows it can trust is not usable at any size.
+ *
+ * `mcp`/`harness` may be pre-resolved (via `resolveBatchIdentity`, above) and
+ * passed straight through — the batch-invariant path. `mcpEntry`/`harnessRoot`
+ * remain accepted directly for a caller building a single, one-off block (this
+ * module's own tests do, and any future caller that never had a batch to
+ * amortize over): when `mcp`/`harness` are omitted, this resolves them itself,
+ * exactly as before.
  */
-export async function buildProvenance({ kernel, policy, task, mcpEntry, harnessRoot }) {
-  const mcp = { version: "0.1.0", ...(await fileDigest(mcpEntry)) };
-  const harness = mergeHarness(await shaOf(harnessRoot), await dirtyOf(harnessRoot));
+export async function buildProvenance({ kernel, policy, task, mcpEntry, harnessRoot, mcp, harness }) {
+  const resolvedMcp = mcp ?? { version: "0.1.0", ...(await fileDigest(mcpEntry)) };
+  const resolvedHarness = harness ?? mergeHarness(await shaOf(harnessRoot), await dirtyOf(harnessRoot));
   const block = {
     kernel,
-    mcp,
+    mcp: resolvedMcp,
     policy: policy.describe(),
-    harness,
+    harness: resolvedHarness,
     task: { id: task.id, family: task.family, digest: digestOf(task) },
   };
   const absent = (o) => o && typeof o === "object" && typeof o.absent === "string";
   block.attributable =
-    !absent(kernel) && !absent(mcp) && !absent(harness) && !absent(block.policy);
+    !absent(kernel) && !absent(resolvedMcp) && !absent(resolvedHarness) && !absent(block.policy);
   return block;
 }

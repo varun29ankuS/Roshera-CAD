@@ -366,6 +366,89 @@ check("a real batch's provenance block is ATTRIBUTABLE — runBatch's OWN DEFAUL
   }
 });
 
+check("a policy whose describe() throws fails its OWN episode, not the whole batch", async () => {
+  // `buildProvenance` calls `policy.describe()` synchronously, and `policy`
+  // is THIRD-PARTY CODE exactly like the policy factory above — a `describe`
+  // that throws must not take the batch down, and must not discard a sibling
+  // episode that already finished. Serial (concurrency 1) so episode 1
+  // completes and is already in `results` before episode 2's factory hands
+  // back the throwing policy, and episode 3 proves the worker kept going
+  // afterward rather than stopping at the failure.
+  let made = 0;
+  const factory = () => {
+    made += 1;
+    if (made === 2) {
+      return {
+        async act() { return { done: true }; },
+        tokensUsed() { return 0; },
+        describe() { throw new Error("describe() exploded — a policy that cannot even describe itself"); },
+      };
+    }
+    return scriptedPolicy([{ tool: "create_cylinder", args: {} }]);
+  };
+  const { results, tally } = await runBatch({
+    tasks: [task, task, task], policyFor: factory, seeds: [1, 2, 3],
+    concurrency: 1, baseUrl, authHeader: {}, outDir: dir, kernelSha: "abc",
+    spawn: fakeSpawn,
+  });
+  assert.equal(results.length, 3,
+    "all three episodes reported — a throwing describe() must not kill the batch");
+  assert.equal(tally.SETUP_FAILED, 1, "the failing one is SETUP_FAILED: no episode ever began");
+  assert.equal(tally.COMPLETED, 2,
+    "and BOTH siblings kept their outcomes — including the one that had already finished");
+  const failed = results.find((r) => r.outcome === "SETUP_FAILED");
+  assert.ok(
+    failed.error.includes("describe() exploded"),
+    `the reason must carry describe()'s own message, got ${JSON.stringify(failed.error)}`,
+  );
+  const { terminal } = readTrajectory(failed.trajectoryPath);
+  assert.equal(terminal.outcome, "SETUP_FAILED");
+});
+
+check("when the server cannot state its build, the batch still RUNS and every header says so honestly", async () => {
+  // An ABSENCE is not a CONFLICT: with no `claimed` sha and a server that
+  // states nothing (the default stub reply — no `build` key), the batch must
+  // still run to completion, and the written provenance must carry the
+  // absence rather than a fabricated identity.
+  healthReply = {};
+  const { results, tally } = await runBatch({
+    tasks: [task], policyFor: () => scriptedPolicy([{ tool: "create_cylinder", args: {} }]),
+    seeds: [1], concurrency: 1, baseUrl, authHeader: {}, outDir: dir,
+    kernelSha: undefined, spawn: fakeSpawn,
+  });
+  assert.equal(tally.COMPLETED, 1,
+    "an absent kernel identity must not stop the episode from running");
+  const { header } = readTrajectory(results[0].trajectoryPath);
+  assert.ok(!("sha" in header.provenance.kernel),
+    "no sha may be invented when the server stated nothing");
+  assert.match(header.provenance.kernel.absent, /build/i);
+  assert.equal(header.provenance.attributable, false,
+    "an absent kernel identity must make the whole block unattributable, not merely omit the sha");
+});
+
+check("batch-invariant provenance (mcp digest, harness identity) is IDENTICAL across episodes in the same batch", async () => {
+  // Not proof of a single computation by itself, but a real regression catch:
+  // if the per-episode call ever again resolved `mcp`/`harness` independently
+  // (the exact defect just fixed), a machine where the tree changes between
+  // two episodes' reads would show it here as a mismatch.
+  healthReply = { build: { sha: "cafefeed", dirty: false } };
+  try {
+    const { results } = await runBatch({
+      tasks: [task, task], policyFor: () => scriptedPolicy([{ tool: "create_cylinder", args: {} }]),
+      seeds: [1, 2], concurrency: 2, baseUrl, authHeader: {}, outDir: dir,
+      spawn: fakeSpawn,
+    });
+    assert.equal(results.length, 2);
+    const provs = results.map((r) => readTrajectory(r.trajectoryPath).header.provenance);
+    assert.deepEqual(provs[0].mcp, provs[1].mcp,
+      "two episodes in the same batch must read the identical mcp digest");
+    assert.deepEqual(provs[0].harness, provs[1].harness,
+      "and the identical harness identity");
+  } finally {
+    healthReply = {};
+  }
+});
+
 for (const [name, fn] of checks) { await fn(); process.stdout.write(`  ok - ${name}\n`); }
 stub.close();
 rmSync(dir, { recursive: true, force: true });

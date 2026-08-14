@@ -14,7 +14,7 @@ import { runEpisode, reapDocument, reapPart, unscoredFor, MCP_VERSION } from "./
 import { OUTCOMES, openTrajectory } from "./trajectory.mjs";
 import { spawnMcpSession, defaultMcpEntry } from "./mcp_session.mjs";
 import { mergeFinal } from "./reward.mjs";
-import { resolveKernelIdentity, buildProvenance } from "./provenance.mjs";
+import { resolveKernelIdentity, buildProvenance, resolveBatchIdentity } from "./provenance.mjs";
 
 /**
  * THIS FILE'S OWN LOCATION → the `roshera-rl` package root, the default
@@ -74,8 +74,13 @@ export async function reapOrphans({ baseUrl, authHeader, results }) {
 }
 
 /**
- * The record for an episode whose POLICY FACTORY threw — the one failure that
- * happens before `runEpisode` is entered, so `runEpisode` cannot record it.
+ * The record for an episode that never reached `runEpisode` — the failure
+ * happened in one of the TWO pieces of THIRD-PARTY CODE the worker loop runs
+ * before handing off: the policy factory (`policyFor`), or `policy.describe()`
+ * called from inside `buildProvenance`. Either way `runEpisode` was never
+ * entered and cannot record it, so this does — one shared record shape for
+ * both, so the two cannot drift into two different "no episode happened"
+ * stories.
  *
  * `SETUP_FAILED`, not `CRASHED`: the taxonomy is closed (trajectory.mjs
  * OUTCOMES — a new category is a design change, not a typo), and of the six,
@@ -89,9 +94,12 @@ export async function reapOrphans({ baseUrl, authHeader, results }) {
  * defect the `error` field was added to `close()` to fix. The header/terminal
  * pair here is the same shape every other SETUP_FAILED episode writes, built
  * from the same `unscoredFor` so the two cannot drift.
+ *
+ * `detail` is the CALLER'S already-composed reason — which of the two
+ * third-party calls threw, and its own message — so the two call sites below
+ * cannot produce two subtly different sentences for the same taxonomy entry.
  */
-function policyFactoryFailed({ item, trajectoryPath, kernelSha, error }) {
-  const detail = `the policy factory threw before the episode began: ${error}`;
+function setupFailedBeforeEpisode({ item, trajectoryPath, kernelSha, detail }) {
   const rewardFinal = mergeFinal([]);
   const { claims, recipeRef, modelScope } = unscoredFor(item.task, "SETUP_FAILED", detail);
   try {
@@ -152,6 +160,20 @@ export async function runBatch({
   // file that actually ran, not of some other candidate path.
   const resolvedMcpEntry = mcpEntry ?? defaultMcpEntry();
 
+  // BATCH-INVARIANT, RESOLVED ONCE: neither the mcp digest nor the harness's
+  // own git identity depends on which task or policy an episode runs, so
+  // recomputing them per episode was pure waste — a file re-read and two
+  // `git` subprocesses spawned again for every episode in the batch — and
+  // worse than waste: two episodes in the SAME batch could disagree about
+  // their own harness if the tree changed mid-run (a `git status` catching a
+  // checkout in progress), making one batch internally inconsistent about
+  // its own provenance. `mcp`/`harness` below are handed unchanged to every
+  // episode's `buildProvenance` call; only `policy`/`task` still vary and are
+  // still recomputed per episode.
+  const { mcp, harness } = await resolveBatchIdentity({
+    mcpEntry: resolvedMcpEntry, harnessRoot,
+  });
+
   const queue = tasks.map((task, i) => ({ task, seed: seeds[i] ?? i, i }));
   const results = [];
 
@@ -172,20 +194,43 @@ export async function runBatch({
         policy = policyFor(item.task, item.seed);
       } catch (e) {
         results.push(
-          policyFactoryFailed({
-            item, trajectoryPath, kernelSha, error: String(e?.message ?? e),
+          setupFailedBeforeEpisode({
+            item, trajectoryPath, kernelSha,
+            detail: `the policy factory threw before the episode began: ${String(e?.message ?? e)}`,
           }),
         );
         continue;
       }
+      // `buildProvenance` calls `policy.describe()` SYNCHRONOUSLY, and
+      // `policy` is exactly as third-party as `policyFor` above — this used
+      // to sit unguarded here, so a policy whose `describe()` threw rejected
+      // this worker, then `Promise.all`, then the WHOLE BATCH, discarding
+      // every sibling episode that had already completed. Same fix, same
+      // shape: caught here, recorded as this one episode's own SETUP_FAILED,
+      // and the worker moves on to the next item instead of taking the batch
+      // down with it.
+      //
       // Built per episode, not once for the batch: `policy.describe()` can
       // differ episode to episode (a policy factory is free to return a
       // different policy per task/seed), and the task itself always does —
       // so the `attributable` verdict has to be recomputed for what THIS
-      // episode actually ran, not copied from its first sibling.
-      const provenance = await buildProvenance({
-        kernel, policy, task: item.task, mcpEntry: resolvedMcpEntry, harnessRoot,
-      });
+      // episode actually ran, not copied from its first sibling. `mcp` and
+      // `harness`, in contrast, ARE copied from the one batch-wide resolution
+      // above — see the comment there for why recomputing those per episode
+      // was itself a defect.
+      let provenance;
+      try {
+        provenance = await buildProvenance({ kernel, policy, task: item.task, mcp, harness });
+      } catch (e) {
+        results.push(
+          setupFailedBeforeEpisode({
+            item, trajectoryPath, kernelSha,
+            detail: `building the episode's provenance record threw before the episode began ` +
+              `(policy.describe() is third-party code): ${String(e?.message ?? e)}`,
+          }),
+        );
+        continue;
+      }
       // An episode never throws: every failure mode is a named outcome. A
       // worker that could die on one episode would silently shrink the batch.
       const r = await runEpisode({
