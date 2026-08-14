@@ -112,7 +112,7 @@ class Trajectory {
 }
 
 export function openTrajectory({
-  path, taskId, seed, kernelSha, mcpVersion, toolAllowlist, split,
+  path, taskId, seed, kernelSha, mcpVersion, toolAllowlist, split, provenance,
 }) {
   writeFileSync(path, JSON.stringify({
     kind: "header", schema_version: SCHEMA_VERSION, task_id: taskId, seed,
@@ -121,6 +121,16 @@ export function openTrajectory({
     started_at: new Date().toISOString(),
     replay: "recipe-level: re-issue recipe_ref. Geometry reproduces to ~4e-8; " +
             "byte-identical replay is NOT promised.",
+    // THE FULL PROVENANCE BLOCK — kernel/mcp/policy/harness identity and the
+    // single `attributable` flag a consumer filters on. `provenance` is not
+    // yet REQUIRED here because not every caller of this constructor has
+    // assembled one (existing call sites predate `buildProvenance`), but an
+    // unassembled block is an ABSENCE, not a null: this is the identity field
+    // the whole plan exists to attach, so a caller that skipped it says why,
+    // the same way `episode.mjs`'s `model_scope` does a few lines below.
+    provenance: provenance ?? {
+      absent: "the caller assembled no provenance block (call site predates buildProvenance)",
+    },
   }) + "\n");
   return new Trajectory(path);
 }

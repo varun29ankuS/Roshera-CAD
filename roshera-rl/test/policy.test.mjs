@@ -149,5 +149,36 @@ check("the reference policy's args are frozen, like the scripted one's", async (
   assert.throws(() => { a.args.name = "something else"; }, TypeError);
 });
 
+// ─── policy identity: `describe()` ──────────────────────────────────────────
+//
+// Slice 2 adds real model policies, at which point a corpus without policy
+// identity becomes worthless — scripted and model trajectories would be
+// indistinguishable, and one model could not be told from another. `describe()`
+// is that identity, stamped into the provenance block by `buildProvenance`.
+
+check("a scripted policy describes itself by a digest of its own script", async () => {
+  const scriptA = [{ tool: "create_cylinder", args: { radius: 1 } }];
+  const scriptB = [{ tool: "create_cylinder", args: { radius: 2 } }];
+  const dA = scriptedPolicy(scriptA).describe();
+  const dB = scriptedPolicy(scriptB).describe();
+  assert.equal(dA.kind, "scripted");
+  assert.match(dA.script_digest, /^sha256:/);
+  assert.notEqual(dA.script_digest, dB.script_digest,
+    "two different scripts are two different policies — their identity must differ");
+  assert.equal(
+    scriptedPolicy(scriptA).describe().script_digest, dA.script_digest,
+    "the same script describes identically across instances — describe() is a pure function of identity",
+  );
+});
+
+check("the reference policy describes itself with a stable digest, independent of its (radius, height, intent)", () => {
+  const d1 = referencePolicy({ intent: "a", radius: 1, height: 2 }).describe();
+  const d2 = referencePolicy({ intent: "b", radius: 99, height: 100 }).describe();
+  assert.equal(d1.kind, "scripted");
+  assert.match(d1.script_digest, /^sha256:/);
+  assert.equal(d1.script_digest, d2.script_digest,
+    "the reference policy is one fixed program — its identity does not vary with the part it is asked to build");
+});
+
 for (const [name, fn] of checks) { await fn(); process.stdout.write(`  ok - ${name}\n`); }
 process.stdout.write(`\npolicy: ${checks.length} checks passed\n`);

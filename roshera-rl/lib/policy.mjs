@@ -21,6 +21,7 @@
  * adapters (anthropic, openai-compatible, acp) arrive in slice 2 behind this
  * same interface.
  */
+import { digestOf } from "./provenance.mjs";
 
 /**
  * Recursively freezes plain objects and arrays, at every level, in place.
@@ -92,6 +93,9 @@ export function scriptedPolicy(script) {
       return frozenScript[i++];
     },
     tokensUsed() { return 0; },
+    describe() {
+      return { kind: "scripted", script_digest: digestOf(frozenScript) };
+    },
   };
 }
 
@@ -170,6 +174,9 @@ export function referencePolicy({ intent, radius, height }) {
       return { done: true };
     },
     tokensUsed() { return 0; },
+    describe() {
+      return { kind: "scripted", script_digest: digestOf("reference-policy/v1") };
+    },
   };
 }
 

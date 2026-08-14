@@ -6,6 +6,13 @@
  * something nobody checked, which is the defect this module exists to remove.
  */
 
+import { createHash } from "node:crypto";
+import { readFile } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+
+const run = promisify(execFile);
+
 /** Raised when the operator claims one build and the server reports another. */
 export class KernelIdentityConflict extends Error {}
 
@@ -92,4 +99,62 @@ export async function resolveKernelIdentity({ baseUrl, authHeader = {}, claimed,
   }
 
   return { sha, dirty: build.dirty === true, reported_by: "server" };
+}
+
+/** Stable digest over canonical JSON — key order must not change the value. */
+export function digestOf(value) {
+  const canon = (v) =>
+    Array.isArray(v)
+      ? v.map(canon)
+      : v && typeof v === "object"
+        ? Object.fromEntries(Object.keys(v).sort().map((k) => [k, canon(v[k])]))
+        : v;
+  return "sha256:" + createHash("sha256").update(JSON.stringify(canon(value))).digest("hex");
+}
+
+async function fileDigest(path) {
+  try {
+    return { dist_digest: digestOf((await readFile(path)).toString("base64")) };
+  } catch (e) {
+    return { absent: `the MCP entry could not be read to digest it (${path}): ${e?.message ?? e}` };
+  }
+}
+
+async function dirtyOf(cwd) {
+  try {
+    const { stdout } = await run("git", ["status", "--porcelain"], { cwd });
+    return { dirty: stdout.trim() !== "" };
+  } catch (e) {
+    return { absent: `git could not report whether the tree was dirty: ${e?.message ?? e}` };
+  }
+}
+
+async function shaOf(cwd) {
+  try {
+    const { stdout } = await run("git", ["rev-parse", "--short", "HEAD"], { cwd });
+    return { sha: stdout.trim() };
+  } catch (e) {
+    return { absent: `git could not report the harness commit: ${e?.message ?? e}` };
+  }
+}
+
+/**
+ * Assemble the block. `attributable` is false whenever ANY identity is absent —
+ * it is the single field a consumer filters on, and a corpus that cannot say
+ * which rows it can trust is not usable at any size.
+ */
+export async function buildProvenance({ kernel, policy, task, mcpEntry, harnessRoot }) {
+  const mcp = { version: "0.1.0", ...(await fileDigest(mcpEntry)) };
+  const harness = { ...(await shaOf(harnessRoot)), ...(await dirtyOf(harnessRoot)) };
+  const block = {
+    kernel,
+    mcp,
+    policy: policy.describe(),
+    harness,
+    task: { id: task.id, family: task.family, digest: digestOf(task) },
+  };
+  const absent = (o) => o && typeof o === "object" && typeof o.absent === "string";
+  block.attributable =
+    !absent(kernel) && !absent(mcp) && !absent(harness) && !absent(block.policy);
+  return block;
 }

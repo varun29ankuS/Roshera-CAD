@@ -19,7 +19,8 @@
  * truth.
  */
 import assert from "node:assert/strict";
-import { defineTask, TASKS, taskById } from "../lib/task.mjs";
+import { defineTask, TASKS, taskById, taskDigest } from "../lib/task.mjs";
+import { digestOf } from "../lib/provenance.mjs";
 
 const checks = [];
 const check = (name, fn) => checks.push([name, fn]);
@@ -223,6 +224,25 @@ check("the seed pair does NOT pin (r, h) — the conjugate cylinder is pinned as
 check("taskById finds a seed task and misses cleanly", () => {
   assert.equal(taskById(TASKS[0].id).id, TASKS[0].id);
   assert.equal(taskById("no-such-task"), undefined);
+});
+
+check("family defaults to id when not given", () => {
+  const t = defineTask(valid);
+  assert.equal(t.family, valid.id,
+    "a task with no explicit family belongs to a family of one — itself");
+});
+
+check("an explicit family is kept and frozen with the rest of the task", () => {
+  const t = defineTask({ ...valid, family: "cylinder-family" });
+  assert.equal(t.family, "cylinder-family");
+  assert.throws(() => { t.family = "other"; }, TypeError,
+    "family is not exempt from the task's own immutability");
+});
+
+check("taskDigest is digestOf, exported for callers that only want the digest", () => {
+  const t = defineTask(valid);
+  assert.equal(taskDigest(t), digestOf(t));
+  assert.match(taskDigest(t), /^sha256:/);
 });
 
 for (const [name, fn] of checks) { fn(); process.stdout.write(`  ok - ${name}\n`); }

@@ -37,6 +37,8 @@
  * task, not a hard one.
  */
 
+import { digestOf } from "./provenance.mjs";
+
 const SPLITS = Object.freeze(["train", "eval"]);
 
 /** The closed measure enum, verbatim from tools/inspect.ts:73-80. */
@@ -86,10 +88,14 @@ function checkBinding(taskId, claimName, b) {
 }
 
 export function defineTask({
-  id, prompt, toolAllowlist, claims, stepBudget, tokenBudget, split,
+  id, family, prompt, toolAllowlist, claims, stepBudget, tokenBudget, split,
 }) {
   if (typeof id !== "string" || id.trim() === "") {
     throw new Error("a task needs a non-empty id");
+  }
+  const resolvedFamily = family === undefined ? id : family;
+  if (typeof resolvedFamily !== "string" || resolvedFamily.trim() === "") {
+    throw new Error(`task ${id}: family must be a non-empty string when given`);
   }
   if (typeof prompt !== "string" || prompt.trim() === "") {
     throw new Error(`task ${id}: a task needs a prompt`);
@@ -150,7 +156,7 @@ export function defineTask({
     throw new Error(`task ${id}: tokenBudget must be a positive integer`);
   }
   return Object.freeze({
-    id, prompt,
+    id, family: resolvedFamily, prompt,
     toolAllowlist: Object.freeze([...toolAllowlist]),
     claims: Object.freeze(claims.map((c) => Object.freeze({
       ...c,
@@ -265,3 +271,7 @@ export const TASKS = Object.freeze([
 export function taskById(id) {
   return TASKS.find((t) => t.id === id);
 }
+
+/** Re-exported for callers that only want the digest, not the assembler. */
+export const taskDigest = digestOf;
+

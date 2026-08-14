@@ -14,7 +14,10 @@
 import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
-import { resolveKernelIdentity, KernelIdentityConflict } from "../lib/provenance.mjs";
+import { fileURLToPath } from "node:url";
+import { resolveKernelIdentity, KernelIdentityConflict, buildProvenance, digestOf } from "../lib/provenance.mjs";
+import { defineTask } from "../lib/task.mjs";
+import { scriptedPolicy } from "../lib/policy.mjs";
 
 let reply = {};
 const stub = http.createServer((req, res) => {
@@ -117,6 +120,76 @@ check("an operator claim differing only in case from the server's sha AGREES, an
   const k = await resolveKernelIdentity({ baseUrl, authHeader: {}, claimed: "abc1234" });
   assert.equal(k.sha, "ABC1234", "the RECORDED sha is the server's own casing, never the operator's");
   assert.equal(k.reported_by, "server");
+});
+
+// NOTE: the brief's claim shape (`bindings: { s: "solid:0" }`) predates the
+// stricter binding schema `defineTask` now enforces — an array of
+// `{var, measure}` closed over verify_claim's five measure kinds
+// (task.mjs:57-86). Rewritten here to a valid claim carrying the same name,
+// expected value and tolerance, so the test still exercises exactly what it
+// says: a real task's `family` field and a digest that moves with tolerance.
+const t = defineTask({
+  id: "t", family: "fam", prompt: "p", toolAllowlist: ["create_cylinder"],
+  claims: [{
+    name: "v", expr: "v",
+    bindings: [{ var: "v", measure: { kind: "volume", part: "solid:0" } }],
+    expected: 1, tolerance: 0.1,
+  }],
+  stepBudget: 5, tokenBudget: 100, split: "train",
+});
+
+check("a complete block is attributable", async () => {
+  const p = await buildProvenance({
+    kernel: { sha: "abc1234", dirty: false, reported_by: "server" },
+    policy: scriptedPolicy([]), task: t,
+    // fileURLToPath, not `.pathname`: on Windows `.pathname` is percent-encoded
+    // and carries a leading slash before the drive letter (`/C:/Users/Varun%20…`),
+    // which is not a path `fs`/`execFile` can open — it breaks on any account
+    // name containing a space, which this machine's does.
+    mcpEntry: fileURLToPath(new URL("../package.json", import.meta.url)),
+    harnessRoot: fileURLToPath(new URL("..", import.meta.url)),
+  });
+  assert.equal(p.attributable, true);
+  assert.equal(p.kernel.reported_by, "server");
+  assert.equal(p.policy.kind, "scripted");
+  assert.match(p.policy.script_digest, /^sha256:/);
+  assert.match(p.task.digest, /^sha256:/);
+  assert.match(p.mcp.dist_digest, /^sha256:/);
+});
+
+check("an absent kernel identity makes the whole block UNATTRIBUTABLE", async () => {
+  const p = await buildProvenance({
+    kernel: { reported_by: "server", absent: "could not be reached" },
+    policy: scriptedPolicy([]), task: t,
+    // fileURLToPath, not `.pathname`: on Windows `.pathname` is percent-encoded
+    // and carries a leading slash before the drive letter (`/C:/Users/Varun%20…`),
+    // which is not a path `fs`/`execFile` can open — it breaks on any account
+    // name containing a space, which this machine's does.
+    mcpEntry: fileURLToPath(new URL("../package.json", import.meta.url)),
+    harnessRoot: fileURLToPath(new URL("..", import.meta.url)),
+  });
+  assert.equal(p.attributable, false,
+    "one absent identity makes the row untrustworthy — the flag is the whole point");
+  assert.ok(!("sha" in p.kernel));
+});
+
+check("an unreadable mcp dist is a stated absence, not a zero digest", async () => {
+  const p = await buildProvenance({
+    kernel: { sha: "abc1234", dirty: false, reported_by: "server" },
+    policy: scriptedPolicy([]), task: t,
+    mcpEntry: "C:/definitely/not/here/index.js",
+    harnessRoot: fileURLToPath(new URL("..", import.meta.url)),
+  });
+  assert.ok(!("dist_digest" in p.mcp), "no digest may be invented for a file that was not read");
+  assert.ok(typeof p.mcp.absent === "string" && p.mcp.absent.length > 0);
+  assert.equal(p.attributable, false);
+});
+
+check("the task digest changes when a TOLERANCE changes", () => {
+  const a = defineTask({ ...t, claims: [{ ...t.claims[0], tolerance: 0.1 }] });
+  const b = defineTask({ ...t, claims: [{ ...t.claims[0], tolerance: 0.2 }] });
+  assert.notEqual(digestOf(a), digestOf(b),
+    "task ids are stable NAMES, not stable MEANINGS — a changed tolerance is a different task");
 });
 
 for (const [name, fn] of checks) { await fn(); process.stdout.write(`  ok - ${name}\n`); }
