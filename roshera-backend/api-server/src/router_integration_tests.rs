@@ -9836,3 +9836,163 @@ async fn health_reports_the_build_identity_or_states_its_absence() {
         );
     }
 }
+
+// =====================================================================
+// Facet loss across the boolean route's `spawn_blocking` boundary
+// (.superpowers/sdd/2026-08-15-constraint-harness-hardening/facet-loss-brief.md)
+// =====================================================================
+
+/// A capturing `EventSink` that records the full `(TimelineEvent, document)`
+/// pair the drain worker hands it — the same pattern
+/// `timeline_engine::recorder_bridge`'s own test suite uses to observe
+/// `DOCUMENT_OVERRIDE`, because the document never lands on the event
+/// itself (it is the sink's persistence key, not event content — see that
+/// module's `EventSink` doc comment).
+#[derive(Default)]
+struct FacetCapturingSink {
+    persisted: std::sync::Mutex<Vec<(timeline_engine::TimelineEvent, Option<String>)>>,
+}
+
+#[async_trait::async_trait]
+impl timeline_engine::EventSink for FacetCapturingSink {
+    async fn persist(
+        &self,
+        event: &timeline_engine::TimelineEvent,
+        document: Option<&str>,
+    ) -> Result<(), String> {
+        self.persisted
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push((event.clone(), document.map(str::to_owned)));
+        Ok(())
+    }
+}
+
+/// THE RED for the facet-loss defect. `boolean_operation` runs its kernel
+/// call inside `bounded_exec::bounded_model_op`'s `spawn_blocking` closure —
+/// a DIFFERENT OS thread from the request task the four global middleware
+/// layers (`agent_author_layer` / `agent_intent_layer` / `agent_origin_layer`
+/// / `document_scope_layer`) scoped `AUTHOR_OVERRIDE` / `INTENT_OVERRIDE` /
+/// `ORIGIN_OVERRIDE` / `DOCUMENT_OVERRIDE` on. Tokio task-locals do not cross
+/// a `spawn_blocking` boundary by inheritance — `37541ab3` proved this for a
+/// FIFTH override on this same route (`ACK_UNSOUND_OVERRIDE`) and fixed it
+/// by re-entering the scope INSIDE the closure, on the thread that actually
+/// runs the kernel call. That commit's own doc comment flagged, but did not
+/// fix, whether the other four survive the same route.
+///
+/// Drives a real boolean union through the FULL router (every global
+/// middleware layer live, exactly as production wires them in
+/// `build_router`) with all four headers declared, and reads back what the
+/// drain worker actually handed the durability sink — the only place
+/// `document` is observable at all, and the same envelope `author` and the
+/// `roshera.intent` / `roshera.origin` facets travel in.
+///
+/// A caller that DID declare all four must never see them silently dropped:
+/// this project names that as worse than a plain, honest absence.
+#[tokio::test]
+async fn boolean_route_carries_declared_facets_across_the_spawn_blocking_boundary() {
+    let sink = Arc::new(FacetCapturingSink::default());
+    let sink_dyn: Arc<dyn timeline_engine::EventSink> = sink.clone();
+
+    let db_config = DatabaseConfig {
+        db_type: DatabaseType::SQLite,
+        url: "sqlite::memory:".to_string(),
+        max_connections: 4,
+        connect_timeout: 5,
+        run_migrations: true,
+    };
+    let database: Arc<dyn DatabasePersistence + Send + Sync> = Arc::new(
+        SqliteDatabase::new(&db_config)
+            .await
+            .expect("sqlite::memory: must initialise"),
+    );
+    let state = make_test_state_with_database(database, Some(sink_dyn), None).await;
+    let (uuid_a, _sa, uuid_b, _sb) = seed_two_overlapping_boxes(&state).await;
+
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/api/geometry/boolean")
+        .header("content-type", "application/json")
+        .header("x-roshera-agent", "facet-probe-agent")
+        .header("x-roshera-intent", "close the facet-loss defect")
+        .header("x-roshera-intent-turn", "7")
+        .header("x-roshera-document", "facet-probe-doc")
+        .body(Body::from(
+            json!({
+                "operation": "union",
+                "object_a": uuid_a.to_string(),
+                "object_b": uuid_b.to_string(),
+            })
+            .to_string(),
+        ))
+        .expect("static request must build");
+
+    let (status, body) = dispatch(&state, request).await;
+    assert_eq!(status, StatusCode::OK, "union must 200; body = {body}");
+
+    // Drain barrier: the recorder's worker persists asynchronously off the
+    // request task; wait for it to actually reach the sink before reading.
+    let _ = state.timeline_recorder.flush().await;
+
+    let captured = sink.persisted.lock().unwrap_or_else(|p| p.into_inner());
+    let (event, document) = captured
+        .iter()
+        .find(|(e, _)| {
+            matches!(
+                &e.operation,
+                timeline_engine::Operation::Generic { command_type, .. }
+                    if command_type.to_lowercase().contains("boolean")
+            )
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "the boolean op must reach the durability sink; captured kinds = {:?}",
+                captured
+                    .iter()
+                    .map(|(e, d)| (
+                        crate::handlers::timeline::operation_kind(&e.operation),
+                        d.clone()
+                    ))
+                    .collect::<Vec<_>>()
+            )
+        });
+
+    assert_eq!(
+        event.author,
+        timeline_engine::Author::AIAgent {
+            id: "facet-probe-agent".to_string(),
+            model: "facet-probe-agent".to_string(),
+        },
+        "the request's declared agent must reach the durable event's author \
+         even though the kernel call ran on a spawn_blocking thread — a \
+         request that DID declare an author must never fall back to the \
+         recorder's default; event = {event:?}"
+    );
+
+    let params = match &event.operation {
+        timeline_engine::Operation::Generic { parameters, .. } => parameters,
+        other => panic!("expected Operation::Generic, got {other:?}"),
+    };
+    assert_eq!(
+        params["facets"]["roshera.intent"]["text"].as_str(),
+        Some("close the facet-loss defect"),
+        "the request's declared intent must reach the durable event — an \
+         absence here means the caller DID declare intent and it was \
+         silently dropped, which this project names as worse than a plain \
+         absence; event params = {params}"
+    );
+    assert_eq!(
+        params["facets"]["roshera.origin"]["channel"].as_str(),
+        Some("mcp"),
+        "the MCP wire signature (agent + intent headers together) must \
+         reach the durable event as origin `mcp`, not fall back to \
+         `not_determined`; event params = {params}"
+    );
+    assert_eq!(
+        document.as_deref(),
+        Some("facet-probe-doc"),
+        "the request's declared document must reach the durability sink's \
+         persist call — never silently fall back to the ambient active \
+         document; captured document = {document:?}"
+    );
+}

@@ -70,11 +70,111 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use geometry_engine::operations::recorder::Origin;
 use geometry_engine::primitives::snapshot::ModelSnapshot;
 use geometry_engine::primitives::topology_builder::BRepModel;
+use timeline_engine::recorder_bridge::{
+    IntentContext, AUTHOR_OVERRIDE, DOCUMENT_OVERRIDE, INTENT_OVERRIDE, ORIGIN_OVERRIDE,
+};
+use timeline_engine::Author;
 use tokio::sync::RwLock;
 
 use crate::error_catalog::{ApiError, ErrorCode};
+
+/// The four per-request provenance task-locals [`TimelineRecorder::record`]
+/// consults (`AUTHOR_OVERRIDE` / `INTENT_OVERRIDE` / `ORIGIN_OVERRIDE` /
+/// `DOCUMENT_OVERRIDE`), snapshotted together so a `bounded_model_op` caller
+/// does not need to know their names individually.
+///
+/// # Why this exists
+///
+/// `agent_author_layer` / `agent_intent_layer` / `agent_origin_layer` /
+/// `document_scope_layer` (`main.rs`) scope these four task-locals on the
+/// REQUEST task. `bounded_model_op` runs its `op` closure inside
+/// `spawn_blocking` — a DIFFERENT OS thread — where none of them are visible
+/// by inheritance: a Tokio task-local scoped on one task is simply absent on
+/// another, blocking or not. Read here, on the request task, `try_with`
+/// still sees whatever the middleware scoped; carried across the boundary as
+/// plain owned values and re-applied via [`with_request_scope`] on the
+/// blocking thread that actually runs the kernel op.
+///
+/// This is the SAME shape `37541ab3` already proved for a FIFTH override on
+/// this exact route (`ACK_UNSOUND_OVERRIDE`, scoped by the handler rather
+/// than by request middleware) — a task-local scoped on the request task
+/// does not survive `spawn_blocking` by inheritance, only by being
+/// explicitly re-entered on the thread that runs the call. That commit's own
+/// doc comment flagged, but did not fix, whether these four survive the same
+/// boundary; they did not — `TimelineRecorder::record()` fell back to its
+/// defaults (`Author::System`, no intent facet, `Origin::NotDetermined`, no
+/// bound document) even when the caller had declared all four, which this
+/// project names as worse than an honest absence.
+///
+/// [`TimelineRecorder::record`]: timeline_engine::recorder_bridge::TimelineRecorder::record
+struct RequestScopeOverrides {
+    author: Option<Author>,
+    intent: Option<IntentContext>,
+    origin: Option<Origin>,
+    document: Option<String>,
+}
+
+/// Snapshot the four provenance task-locals from whatever is live on the
+/// CURRENT task. Must be called on the request task, before crossing into
+/// `spawn_blocking` — see [`RequestScopeOverrides`]. A dimension the request
+/// never declared resolves to `None` here (`try_with` fails with no live
+/// scope), and stays `None` all the way through — [`with_request_scope`]
+/// leaves an absent dimension unscoped, never substituting a default.
+fn snapshot_request_scope() -> RequestScopeOverrides {
+    RequestScopeOverrides {
+        author: AUTHOR_OVERRIDE.try_with(Clone::clone).ok(),
+        intent: INTENT_OVERRIDE.try_with(Clone::clone).ok(),
+        origin: ORIGIN_OVERRIDE.try_with(|o| *o).ok(),
+        document: DOCUMENT_OVERRIDE.try_with(Clone::clone).ok(),
+    }
+}
+
+/// Re-enter, on the CURRENT thread, whichever of the four provenance
+/// task-locals were live on the request task when [`snapshot_request_scope`]
+/// captured them. Each dimension nests independently: a request that
+/// declared an agent but no document re-enters `AUTHOR_OVERRIDE` and leaves
+/// `DOCUMENT_OVERRIDE` unscoped, so `TimelineRecorder::record()` sees
+/// exactly the same presence/absence pattern it would have seen running
+/// in-place on the request task — never a fabricated value for a dimension
+/// the caller did not declare.
+fn with_request_scope<R>(overrides: RequestScopeOverrides, op: impl FnOnce() -> R) -> R {
+    fn with_document<R>(document: Option<String>, op: impl FnOnce() -> R) -> R {
+        match document {
+            Some(d) => DOCUMENT_OVERRIDE.sync_scope(d, op),
+            None => op(),
+        }
+    }
+    fn with_origin<R>(
+        origin: Option<Origin>,
+        document: Option<String>,
+        op: impl FnOnce() -> R,
+    ) -> R {
+        match origin {
+            Some(o) => ORIGIN_OVERRIDE.sync_scope(o, || with_document(document, op)),
+            None => with_document(document, op),
+        }
+    }
+    fn with_intent<R>(
+        intent: Option<IntentContext>,
+        origin: Option<Origin>,
+        document: Option<String>,
+        op: impl FnOnce() -> R,
+    ) -> R {
+        match intent {
+            Some(i) => INTENT_OVERRIDE.sync_scope(i, || with_origin(origin, document, op)),
+            None => with_origin(origin, document, op),
+        }
+    }
+    match overrides.author {
+        Some(a) => AUTHOR_OVERRIDE.sync_scope(a, || {
+            with_intent(overrides.intent, overrides.origin, overrides.document, op)
+        }),
+        None => with_intent(overrides.intent, overrides.origin, overrides.document, op),
+    }
+}
 
 /// Handle to the model a bounded op runs against — the same
 /// `Arc<RwLock<BRepModel>>` the `ActiveModel` extractor yields.
@@ -244,6 +344,16 @@ fn model_fingerprint(m: &BRepModel) -> (usize, usize, usize, usize, usize, usize
 /// [`ErrorCode::OpTimeout`] is returned with the operand ids and budget.
 ///
 /// `operands` are the solid ids surfaced in the timeout error's details.
+///
+/// # Provenance across the `spawn_blocking` boundary
+///
+/// `op` runs on a blocking-pool thread, not the request task — see
+/// [`RequestScopeOverrides`]. The four per-request provenance task-locals
+/// are snapshotted on the request task BEFORE the boundary and re-entered
+/// on the blocking thread around `op`, so every caller of this function
+/// inherits correct attribution for free; a future route through
+/// `bounded_model_op` cannot reintroduce this hole by forgetting to repeat
+/// the re-entry itself.
 pub async fn bounded_model_op<T, F, C>(
     model_handle: ModelHandle,
     class: OpClass,
@@ -259,9 +369,17 @@ where
 {
     let budget = budgets.budget(class);
 
+    // Snapshot the four per-request provenance task-locals HERE, on the
+    // request task — the only place `try_with` can see what
+    // `agent_author_layer` / `agent_intent_layer` / `agent_origin_layer` /
+    // `document_scope_layer` scoped for this request. See
+    // `RequestScopeOverrides`.
+    let scope_overrides = snapshot_request_scope();
+
     // spawn_blocking: snapshot under a brief read lock, then run the heavy op
     // on an owned clone with NO lock held. Only the `Arc` handle, the class,
-    // and the op closure cross the boundary — all `Send`.
+    // the op closure, and the snapshotted overrides cross the boundary —
+    // all `Send`.
     let handle = Arc::clone(&model_handle);
     let join = tokio::task::spawn_blocking(move || {
         // Brief read lock: deep-copy + capture recorder + fingerprint, then
@@ -279,7 +397,9 @@ where
         let mut clone = BRepModel::new();
         snapshot.restore(&mut clone);
         clone.attach_recorder(recorder);
-        let outcome = op(&mut clone);
+        // Re-enter the snapshotted scopes HERE, on the thread that actually
+        // runs the kernel op — see `with_request_scope`.
+        let outcome = with_request_scope(scope_overrides, || op(&mut clone));
         (outcome, clone, fingerprint)
     });
 
