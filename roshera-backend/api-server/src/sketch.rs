@@ -2313,6 +2313,7 @@ pub async fn extrude_cut_sketch(
         &[target_solid_id],
     )
     .await?;
+    let ack_unsound = body.acknowledge_unsound.as_bool() == Some(true);
 
     let session = state
         .sketches
@@ -2431,14 +2432,22 @@ pub async fn extrude_cut_sketch(
             .solids
             .get(target_solid_id)
             .and_then(|s| s.name.clone());
-        let cut_id = boolean_operation(
-            &mut model,
-            target_solid_id,
-            cutter,
-            BooleanOp::Difference,
-            BooleanOptions::default(),
-        )
-        .map_err(ApiError::kernel_error)?;
+        // Only THIS call consumes the gated base (`target_solid_id`) — the
+        // cutter-construction calls above (shape extrudes, region
+        // holes/unions) operate on freshly-built solids that never went
+        // through `refuse_unsound_base`, so the scope is narrowed to this
+        // one call rather than wrapping the whole cutter-build sequence.
+        let cut_id = timeline_engine::recorder_bridge::ACK_UNSOUND_OVERRIDE
+            .sync_scope(ack_unsound, || {
+                boolean_operation(
+                    &mut model,
+                    target_solid_id,
+                    cutter,
+                    BooleanOp::Difference,
+                    BooleanOptions::default(),
+                )
+            })
+            .map_err(ApiError::kernel_error)?;
         if let (Some(name), Some(result)) = (host_name, model.solids.get_mut(cut_id)) {
             result.name = Some(name);
         }
@@ -4509,6 +4518,77 @@ mod extrude_cut_unsound_base_gate_tests {
             body["error_code"].as_str(),
             Some("unsound_base"),
             "a sound target must never produce an unsound_base refusal; body = {body}"
+        );
+    }
+
+    /// THE NARROW-SCOPE PIN (2026-08-15 closeout). `extrude_cut_sketch`
+    /// builds a cutter (a shape extrude, here exactly one region — no
+    /// hole-differences or region-unions for a single rectangle) BEFORE the
+    /// one call that actually consumes the gated target
+    /// (`boolean_operation(target_solid_id, cutter, Difference, ..)`). Only
+    /// THAT event may carry `roshera.acknowledge_unsound` — the
+    /// cutter-construction extrude never touched the flagged base, so
+    /// stamping it too would misrepresent which operation actually
+    /// proceeded over the unsound solid.
+    #[tokio::test]
+    async fn acknowledge_unsound_facet_lands_only_on_the_event_that_consumes_the_target() {
+        let state = make_test_state().await;
+        let (bad_uuid, _bad_solid) = seed_box_with_drifted_construction(&state, 20.0).await;
+        let sketch_id = rectangle_sketch(&state).await;
+
+        let (status, body) = dispatch(
+            &state,
+            post(
+                &format!("/api/sketch/{sketch_id}/extrude_cut"),
+                json!({
+                    "distance": 5.0,
+                    "target_id": bad_uuid.to_string(),
+                    "acknowledge_unsound": true
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body = {body}");
+
+        let (hstatus, hbody) = dispatch(
+            &state,
+            crate::durability_boot_tests::get("/api/timeline/history/main"),
+        )
+        .await;
+        assert_eq!(
+            hstatus,
+            StatusCode::OK,
+            "history GET must 200; body = {hbody}"
+        );
+        let events = hbody
+            .as_array()
+            .cloned()
+            .expect("bare event array (durability off in test state)");
+
+        let stamped: Vec<&serde_json::Value> = events
+            .iter()
+            .filter(|e| {
+                !e["operation"]["parameters"]["facets"]["roshera.acknowledge_unsound"].is_null()
+            })
+            .collect();
+        assert_eq!(
+            stamped.len(),
+            1,
+            "exactly one event (the final difference consuming the gated \
+             target) may carry the facet; stamped = {stamped:?}, all events = {events:?}"
+        );
+        assert_eq!(
+            stamped[0]["operation"]["command_type"].as_str(),
+            Some("boolean_difference"),
+            "the stamped event must be the boolean that actually consumed \
+             the gated target, not the cutter-construction extrude; \
+             event = {:?}",
+            stamped[0]
+        );
+        assert_eq!(
+            stamped[0]["operation"]["parameters"]["facets"]["roshera.acknowledge_unsound"]
+                ["acknowledged"],
+            json!(true)
         );
     }
 }

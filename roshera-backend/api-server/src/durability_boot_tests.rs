@@ -2322,3 +2322,83 @@ async fn unbound_writes_still_land_in_the_globally_active_document() {
         in_a.len()
     );
 }
+
+// =====================================================================
+// `acknowledge_unsound` — the escape must survive INSIDE the durable
+// event blob (2026-08-15 closeout), the same standard
+// `checkpoints_persist_under_the_request_bound_document` holds
+// `skip_verification` to: read the LITERAL persisted JSON `data` column a
+// `TimelineEventData` row actually wrote, not the in-memory `TimelineEvent`
+// the create response echoed. This is the strongest available proof short
+// of an actual process restart (same caveat as that test: this harness
+// works against the same `db` handle rather than a real boot cycle).
+// =====================================================================
+
+/// A mutating call that used `acknowledge_unsound: true` over a verified-
+/// unsound base must leave the `roshera.acknowledge_unsound` facet inside
+/// the raw persisted event blob — readable back by anyone who later loads
+/// this document's event log, including after a restart, not merely by the
+/// one process that answered the original request.
+///
+/// RED before the api-server call sites were wired: `data["operation"]
+/// ["parameters"]["facets"]` carried no `roshera.acknowledge_unsound` key
+/// at all for the transform event, on any of the persisted rows.
+#[tokio::test]
+async fn acknowledge_unsound_survives_in_the_raw_persisted_event_blob() {
+    let path = temp_db_path();
+    let db = open_db(&path).await;
+    let state = build_state(db.clone(), true).await;
+
+    let (uuid, _solid_id) =
+        crate::router_integration_tests::seed_box_with_drifted_construction(&state, 10.0).await;
+
+    let (status, body) = dispatch(
+        &state,
+        post(
+            "/api/geometry/transform",
+            json!({
+                "object": uuid.to_string(),
+                "translation": [0.0, 0.0, 1.0],
+                "acknowledge_unsound": true,
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the acknowledged transform must proceed; body = {body}"
+    );
+    state.timeline_recorder.flush().await.expect(
+        "recorder flush must succeed — durability write-through runs \
+             on the drain worker, after flush returns every prior op has \
+             been both applied AND persisted",
+    );
+
+    let events = db
+        .load_all_timeline_events(durability::DURABILITY_SESSION_ID)
+        .await
+        .expect("the default document's log must be readable");
+    let stamped: Vec<&TimelineEventData> = events
+        .iter()
+        .filter(|e| {
+            !e.data["operation"]["parameters"]["facets"]["roshera.acknowledge_unsound"].is_null()
+        })
+        .collect();
+    assert_eq!(
+        stamped.len(),
+        1,
+        "exactly one persisted row (the transform_solid event) must carry \
+         the facet; persisted rows = {:?}",
+        events.iter().map(|e| &e.data).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        stamped[0].data["operation"]["parameters"]["facets"]["roshera.acknowledge_unsound"]
+            ["acknowledged"],
+        json!(true),
+        "the facet inside the RAW persisted blob must read `acknowledged: \
+         true` — not merely the in-memory event the create response echoed; \
+         record = {:?}",
+        stamped[0].data
+    );
+}

@@ -1897,6 +1897,15 @@ async fn boolean_operation(
     // an unsound TOOL poisons it exactly as an unsound base does.
     refuse_unsound_base(&model_handle, &payload, "boolean", &[solid_a, solid_b]).await?;
 
+    // The escape argument, read exactly as `refuse_unsound_base` reads it.
+    // Captured here (not inside the `spawn_blocking` closure below) so it
+    // can be `move`d into that closure as a plain `bool` — the closure runs
+    // on a different OS thread, off this request's task, so a task-local
+    // scoped OUT HERE would not be visible inside it; see the `sync_scope`
+    // call inside the closure, which re-enters the scope on the thread that
+    // actually runs the kernel call.
+    let ack_unsound = payload.get("acknowledge_unsound").and_then(|v| v.as_bool()) == Some(true);
+
     // Task #41 — BOUNDED execution. The kernel boolean runs arbitrary
     // corefinement and has spun >120 s under the write lock on a
     // thin-wall coincident-throat union, pinning the whole instance. Route
@@ -1920,49 +1929,57 @@ async fn boolean_operation(
         vec![solid_a, solid_b],
         move |model| {
             let base_kernel_name = model.solids.get(solid_a).and_then(|s| s.name.clone());
-            let id = kernel_boolean(
-                model,
-                solid_a,
-                solid_b,
-                operation,
-                // Product policy (task #34): at the API surface a difference
-                // that removes nothing is a caller positioning error, not a
-                // silent no-op. Opt into the typed DisjointDifference refusal
-                // so a bore-miss surfaces `boolean_disjoint` (mapped below).
-                // The kernel primitive itself stays honest math (A∖B = A for
-                // disjoint B) for direct callers via the default options.
-                BooleanOptions {
-                    refuse_disjoint_difference: true,
-                    ..BooleanOptions::default()
-                },
-            )
-            .map_err(|e| match e {
-                // Honesty gate: a difference whose tool never touches the
-                // target is a caller positioning error, not a kernel fault —
-                // surface the typed refusal (400, non-retryable) instead of
-                // the generic 500 kernel_error. Both operands are rolled
-                // back intact (on the clone) and keep their UUID mappings —
-                // the live model was never touched.
-                geometry_engine::operations::OperationError::DisjointDifference => ApiError::new(
-                    ErrorCode::BooleanDisjoint,
-                    format!(
-                        "difference removed nothing: tool {uuid_b} does not \
+            // Re-enter the `ACK_UNSOUND_OVERRIDE` scope HERE, on the
+            // `spawn_blocking` thread that actually runs the kernel call —
+            // see the doc comment where `ack_unsound` was captured above.
+            let id = timeline_engine::recorder_bridge::ACK_UNSOUND_OVERRIDE
+                .sync_scope(ack_unsound, || {
+                    kernel_boolean(
+                        model,
+                        solid_a,
+                        solid_b,
+                        operation,
+                        // Product policy (task #34): at the API surface a difference
+                        // that removes nothing is a caller positioning error, not a
+                        // silent no-op. Opt into the typed DisjointDifference refusal
+                        // so a bore-miss surfaces `boolean_disjoint` (mapped below).
+                        // The kernel primitive itself stays honest math (A∖B = A for
+                        // disjoint B) for direct callers via the default options.
+                        BooleanOptions {
+                            refuse_disjoint_difference: true,
+                            ..BooleanOptions::default()
+                        },
+                    )
+                })
+                .map_err(|e| match e {
+                    // Honesty gate: a difference whose tool never touches the
+                    // target is a caller positioning error, not a kernel fault —
+                    // surface the typed refusal (400, non-retryable) instead of
+                    // the generic 500 kernel_error. Both operands are rolled
+                    // back intact (on the clone) and keep their UUID mappings —
+                    // the live model was never touched.
+                    geometry_engine::operations::OperationError::DisjointDifference => {
+                        ApiError::new(
+                            ErrorCode::BooleanDisjoint,
+                            format!(
+                                "difference removed nothing: tool {uuid_b} does not \
                          intersect target {uuid_a} — the cut misses the part \
                          entirely, so no hole was drilled"
-                    ),
-                )
-                .with_hint(
-                    "Re-position the tool so it overlaps the target (check the \
+                            ),
+                        )
+                        .with_hint(
+                            "Re-position the tool so it overlaps the target (check the \
                      pattern center / axis against the part's actual location), \
                      then retry."
-                        .to_string(),
-                )
-                .with_details(serde_json::json!({
-                    "object_a": uuid_a.to_string(),
-                    "object_b": uuid_b.to_string(),
-                })),
-                other => ApiError::kernel_error(other),
-            })?;
+                                .to_string(),
+                        )
+                        .with_details(serde_json::json!({
+                            "object_a": uuid_a.to_string(),
+                            "object_b": uuid_b.to_string(),
+                        }))
+                    }
+                    other => ApiError::kernel_error(other),
+                })?;
             if let (Some(name), Some(result)) = (base_kernel_name, model.solids.get_mut(id)) {
                 result.name = Some(name);
             }
@@ -2187,24 +2204,28 @@ async fn shell_solid(
 
     // ★ UNSOUND-BASE GATE.
     refuse_unsound_base(&model_handle, &payload, "shell", &[solid_id]).await?;
+    let ack_unsound = payload.get("acknowledge_unsound").and_then(|v| v.as_bool()) == Some(true);
 
     // Hold the model write lock only for the kernel shell op — same
     // pattern as boolean_operation. Tessellation runs under read.
     let thickness_abs = thickness.abs();
     let result_solid_id = {
         let mut model = model_handle.write().await;
-        let new_id = kernel_offset_solid(
-            &mut model,
-            solid_id,
-            thickness_abs,
-            faces_to_remove,
-            OffsetOptions {
-                offset_type: OffsetType::Distance(thickness_abs),
-                intersection_handling: IntersectionHandling::Trim,
-                ..OffsetOptions::default()
-            },
-        )
-        .map_err(ApiError::kernel_error)?;
+        let new_id = timeline_engine::recorder_bridge::ACK_UNSOUND_OVERRIDE
+            .sync_scope(ack_unsound, || {
+                kernel_offset_solid(
+                    &mut model,
+                    solid_id,
+                    thickness_abs,
+                    faces_to_remove,
+                    OffsetOptions {
+                        offset_type: OffsetType::Distance(thickness_abs),
+                        intersection_handling: IntersectionHandling::Trim,
+                        ..OffsetOptions::default()
+                    },
+                )
+            })
+            .map_err(ApiError::kernel_error)?;
         // Re-point the host UUID under the SAME write lock (see
         // boolean_operation): if the kernel minted a fresh SolidId the
         // remap must be atomic with the mutation, else a window opened
@@ -2407,20 +2428,24 @@ async fn mirror_solid(
 
     // ★ UNSOUND-BASE GATE.
     refuse_unsound_base(&model_handle, &payload, "mirror", &[solid_id]).await?;
+    let ack_unsound = payload.get("acknowledge_unsound").and_then(|v| v.as_bool()) == Some(true);
 
     // Hold the model write lock only for the kernel mirror op; tessellation
     // runs under a read lock so concurrent writers aren't blocked. Same
     // pattern as boolean_operation / shell_solid.
     {
         let mut model = model_handle.write().await;
-        kernel_mirror(
-            &mut model,
-            vec![solid_id],
-            Point3::new(origin[0], origin[1], origin[2]),
-            Vector3::new(normal[0], normal[1], normal[2]),
-            TransformOptions::default(),
-        )
-        .map_err(ApiError::kernel_error)?;
+        timeline_engine::recorder_bridge::ACK_UNSOUND_OVERRIDE
+            .sync_scope(ack_unsound, || {
+                kernel_mirror(
+                    &mut model,
+                    vec![solid_id],
+                    Point3::new(origin[0], origin[1], origin[2]),
+                    Vector3::new(normal[0], normal[1], normal[2]),
+                    TransformOptions::default(),
+                )
+            })
+            .map_err(ApiError::kernel_error)?;
     };
 
     let (tri_mesh, tessellation_ms) = {
@@ -2790,6 +2815,7 @@ async fn fillet_edges_endpoint(
 
     // ★ UNSOUND-BASE GATE.
     refuse_unsound_base(&model_handle, &payload, "fillet", &[solid_id]).await?;
+    let ack_unsound = payload.get("acknowledge_unsound").and_then(|v| v.as_bool()) == Some(true);
 
     // Hold the model write lock only for the kernel fillet op;
     // tessellation runs under a read lock. Same pattern as boolean /
@@ -2838,87 +2864,100 @@ async fn fillet_edges_endpoint(
     // call, never across a yield point.
     {
         let mut model = model_handle.write().await;
-        if radii_parsed.per_edge_overrides.is_some() {
-            // F5-β.5.9 — Mixed{default, overrides} → PerEdgeProfile.
-            // The expansion fills every edge in `edges` with either
-            // its explicit override profile or the broadcast
-            // default. The conservative radius seeded into
-            // `FilletOptions.radius` is the max across the default
-            // and every override; the kernel's F6-α curvature gate
-            // walks the map itself for per-edge bounds.
-            let expanded = radii_parsed.expand_to_per_edge_profile(&edges);
-            let conservative_radius = expanded
-                .values()
-                .map(|p| match p {
-                    geometry_engine::operations::blend_graph::EdgeFilletProfile::Radius(b) => {
-                        b.max_value()
+        timeline_engine::recorder_bridge::ACK_UNSOUND_OVERRIDE.sync_scope(
+            ack_unsound,
+            || -> Result<(), ApiError> {
+                if radii_parsed.per_edge_overrides.is_some() {
+                    // F5-β.5.9 — Mixed{default, overrides} → PerEdgeProfile.
+                    // The expansion fills every edge in `edges` with either
+                    // its explicit override profile or the broadcast
+                    // default. The conservative radius seeded into
+                    // `FilletOptions.radius` is the max across the default
+                    // and every override; the kernel's F6-α curvature gate
+                    // walks the map itself for per-edge bounds.
+                    let expanded = radii_parsed.expand_to_per_edge_profile(&edges);
+                    let conservative_radius = expanded
+                        .values()
+                        .map(|p| match p {
+                            geometry_engine::operations::blend_graph::EdgeFilletProfile::Radius(
+                                b,
+                            ) => b.max_value(),
+                            geometry_engine::operations::blend_graph::EdgeFilletProfile::Chord(
+                                c,
+                            ) => *c,
+                        })
+                        .fold(0.0_f64, f64::max);
+                    let opts = FilletOptions {
+                        fillet_type: FilletType::PerEdgeProfile(expanded),
+                        radius: conservative_radius,
+                        propagation: PropagationMode::None,
+                        partial_corner_vertices: partial_corner_vertices.clone(),
+                        seam_continuity,
+                        graceful_corner_skip,
+                        ..FilletOptions::default()
+                    };
+                    kernel_fillet(&mut model, solid_id, edges.clone(), opts)
+                        .map_err(ApiError::from)?;
+                } else if radii_parsed.uniform_constant {
+                    let opts = FilletOptions {
+                        fillet_type: radii_parsed.to_fillet_type(0),
+                        propagation: PropagationMode::None,
+                        partial_corner_vertices: partial_corner_vertices.clone(),
+                        seam_continuity,
+                        graceful_corner_skip,
+                        ..FilletOptions::default()
+                    };
+                    kernel_fillet(&mut model, solid_id, edges.clone(), opts)
+                        .map_err(ApiError::from)?;
+                } else if radii_parsed.all_constant {
+                    // F5-β.5.3 — distinct per-edge constants in one atomic
+                    // call. `to_per_edge_constant_map` returns `Some` iff
+                    // every profile is `Constant`, which `all_constant`
+                    // guarantees here; the `None` branch is defensive
+                    // against future parser drift.
+                    let map = radii_parsed
+                        .to_per_edge_constant_map(&edges)
+                        .ok_or_else(|| {
+                            ApiError::new(
+                                ErrorCode::InvalidParameter,
+                                "internal: all_constant flag set but per-edge map empty"
+                                    .to_string(),
+                            )
+                        })?;
+                    let radius_repr = map.values().copied().fold(f64::INFINITY, f64::min);
+                    let opts = FilletOptions {
+                        fillet_type: FilletType::PerEdgeConstant(map),
+                        radius: radius_repr,
+                        propagation: PropagationMode::None,
+                        partial_corner_vertices: partial_corner_vertices.clone(),
+                        seam_continuity,
+                        graceful_corner_skip,
+                        ..FilletOptions::default()
+                    };
+                    kernel_fillet(&mut model, solid_id, edges.clone(), opts)
+                        .map_err(ApiError::from)?;
+                } else {
+                    // Per-edge variable-profile loop. The opt-in vector is
+                    // cloned per iteration: at each kernel call the same
+                    // pending-corner set carves out the same corner from
+                    // F2-γ.1, and the surgery-side dedup is idempotent for
+                    // already-pending vertices.
+                    for (i, &edge_id) in edges.iter().enumerate() {
+                        let opts = FilletOptions {
+                            fillet_type: radii_parsed.to_fillet_type(i),
+                            propagation: PropagationMode::None,
+                            partial_corner_vertices: partial_corner_vertices.clone(),
+                            seam_continuity,
+                            graceful_corner_skip,
+                            ..FilletOptions::default()
+                        };
+                        kernel_fillet(&mut model, solid_id, vec![edge_id], opts)
+                            .map_err(ApiError::from)?;
                     }
-                    geometry_engine::operations::blend_graph::EdgeFilletProfile::Chord(c) => *c,
-                })
-                .fold(0.0_f64, f64::max);
-            let opts = FilletOptions {
-                fillet_type: FilletType::PerEdgeProfile(expanded),
-                radius: conservative_radius,
-                propagation: PropagationMode::None,
-                partial_corner_vertices: partial_corner_vertices.clone(),
-                seam_continuity,
-                graceful_corner_skip,
-                ..FilletOptions::default()
-            };
-            kernel_fillet(&mut model, solid_id, edges.clone(), opts).map_err(ApiError::from)?;
-        } else if radii_parsed.uniform_constant {
-            let opts = FilletOptions {
-                fillet_type: radii_parsed.to_fillet_type(0),
-                propagation: PropagationMode::None,
-                partial_corner_vertices: partial_corner_vertices.clone(),
-                seam_continuity,
-                graceful_corner_skip,
-                ..FilletOptions::default()
-            };
-            kernel_fillet(&mut model, solid_id, edges.clone(), opts).map_err(ApiError::from)?;
-        } else if radii_parsed.all_constant {
-            // F5-β.5.3 — distinct per-edge constants in one atomic
-            // call. `to_per_edge_constant_map` returns `Some` iff
-            // every profile is `Constant`, which `all_constant`
-            // guarantees here; the `None` branch is defensive
-            // against future parser drift.
-            let map = radii_parsed
-                .to_per_edge_constant_map(&edges)
-                .ok_or_else(|| {
-                    ApiError::new(
-                        ErrorCode::InvalidParameter,
-                        "internal: all_constant flag set but per-edge map empty".to_string(),
-                    )
-                })?;
-            let radius_repr = map.values().copied().fold(f64::INFINITY, f64::min);
-            let opts = FilletOptions {
-                fillet_type: FilletType::PerEdgeConstant(map),
-                radius: radius_repr,
-                propagation: PropagationMode::None,
-                partial_corner_vertices: partial_corner_vertices.clone(),
-                seam_continuity,
-                graceful_corner_skip,
-                ..FilletOptions::default()
-            };
-            kernel_fillet(&mut model, solid_id, edges.clone(), opts).map_err(ApiError::from)?;
-        } else {
-            // Per-edge variable-profile loop. The opt-in vector is
-            // cloned per iteration: at each kernel call the same
-            // pending-corner set carves out the same corner from
-            // F2-γ.1, and the surgery-side dedup is idempotent for
-            // already-pending vertices.
-            for (i, &edge_id) in edges.iter().enumerate() {
-                let opts = FilletOptions {
-                    fillet_type: radii_parsed.to_fillet_type(i),
-                    propagation: PropagationMode::None,
-                    partial_corner_vertices: partial_corner_vertices.clone(),
-                    seam_continuity,
-                    graceful_corner_skip,
-                    ..FilletOptions::default()
-                };
-                kernel_fillet(&mut model, solid_id, vec![edge_id], opts).map_err(ApiError::from)?;
-            }
-        }
+                }
+                Ok(())
+            },
+        )?;
     };
 
     // Bind for the downstream broadcast block — the canonical per-edge
@@ -3155,6 +3194,7 @@ async fn chamfer_edges_endpoint(
 
     // ★ UNSOUND-BASE GATE.
     refuse_unsound_base(&model_handle, &payload, "chamfer", &[solid_id]).await?;
+    let ack_unsound = payload.get("acknowledge_unsound").and_then(|v| v.as_bool()) == Some(true);
 
     {
         let mut model = model_handle.write().await;
@@ -3168,7 +3208,11 @@ async fn chamfer_edges_endpoint(
             seam_continuity,
             ..ChamferOptions::default()
         };
-        kernel_chamfer(&mut model, solid_id, edges, opts).map_err(ApiError::from)?;
+        timeline_engine::recorder_bridge::ACK_UNSOUND_OVERRIDE
+            .sync_scope(ack_unsound, || {
+                kernel_chamfer(&mut model, solid_id, edges, opts)
+            })
+            .map_err(ApiError::from)?;
     };
 
     let (tri_mesh, tessellation_ms) = {
@@ -3343,6 +3387,7 @@ async fn transform_geometry_endpoint(
 
     // ★ UNSOUND-BASE GATE.
     refuse_unsound_base(&model_handle, &payload, "transform", &[solid_id]).await?;
+    let ack_unsound = payload.get("acknowledge_unsound").and_then(|v| v.as_bool()) == Some(true);
 
     // Build the matrices to apply, in order: rotation (about center) then
     // translation. Each is applied as its own transform_solid call.
@@ -3409,10 +3454,16 @@ async fn transform_geometry_endpoint(
 
     {
         let mut model = model_handle.write().await;
-        for m in &mats {
-            transform_solid(&mut model, solid_id, *m, TransformOptions::default())
-                .map_err(ApiError::kernel_error)?;
-        }
+        timeline_engine::recorder_bridge::ACK_UNSOUND_OVERRIDE.sync_scope(
+            ack_unsound,
+            || -> Result<(), ApiError> {
+                for m in &mats {
+                    transform_solid(&mut model, solid_id, *m, TransformOptions::default())
+                        .map_err(ApiError::kernel_error)?;
+                }
+                Ok(())
+            },
+        )?;
     }
     let tri_mesh = {
         let model = model_handle.read().await;
@@ -3552,6 +3603,7 @@ async fn pattern_linear_endpoint(
     // ★ UNSOUND-BASE GATE. A pattern REPLICATES the base — an unsound base
     // would be copied N times, not merely inherited from once.
     refuse_unsound_base(&model_handle, &payload, "pattern/linear", &[solid_id]).await?;
+    let ack_unsound = payload.get("acknowledge_unsound").and_then(|v| v.as_bool()) == Some(true);
 
     let mut emitted: Vec<String> = Vec::with_capacity((count as usize) - 1);
 
@@ -3562,20 +3614,28 @@ async fn pattern_linear_endpoint(
             dir_norm.z * spacing * (i as f64),
         );
 
-        // Clone + transform under a single write lock per instance.
+        // Clone + transform under a single write lock per instance. Both
+        // ops inherit from `solid_id` (the clone copies its geometry, the
+        // transform then moves that copy), so both are scoped — every one
+        // of the N copies carries the acknowledgement, not just the first.
         // Tessellation runs under a read lock immediately after.
         let new_solid_id = {
             let mut model = model_handle.write().await;
-            let cloned =
-                deep_clone_solid(&mut model, solid_id, None).map_err(ApiError::kernel_error)?;
-            transform_solid(
-                &mut model,
-                cloned,
-                Matrix4::from_translation(&translation),
-                TransformOptions::default(),
-            )
-            .map_err(ApiError::kernel_error)?;
-            cloned
+            timeline_engine::recorder_bridge::ACK_UNSOUND_OVERRIDE.sync_scope(
+                ack_unsound,
+                || -> Result<u32, ApiError> {
+                    let cloned = deep_clone_solid(&mut model, solid_id, None)
+                        .map_err(ApiError::kernel_error)?;
+                    transform_solid(
+                        &mut model,
+                        cloned,
+                        Matrix4::from_translation(&translation),
+                        TransformOptions::default(),
+                    )
+                    .map_err(ApiError::kernel_error)?;
+                    Ok(cloned)
+                },
+            )?
         };
 
         let tri_mesh = {
@@ -3735,6 +3795,7 @@ async fn pattern_circular_endpoint(
 
     // ★ UNSOUND-BASE GATE. See the linear-pattern note above.
     refuse_unsound_base(&model_handle, &payload, "pattern/circular", &[solid_id]).await?;
+    let ack_unsound = payload.get("acknowledge_unsound").and_then(|v| v.as_bool()) == Some(true);
 
     let step = total_angle / (count as f64);
     let origin_pt = Point3::new(axis_origin[0], axis_origin[1], axis_origin[2]);
@@ -3749,13 +3810,20 @@ async fn pattern_circular_endpoint(
             )
         })?;
 
+        // Both ops (clone, then transform) inherit from `solid_id` — see
+        // the linear-pattern note above for why both are scoped.
         let new_solid_id = {
             let mut model = model_handle.write().await;
-            let cloned =
-                deep_clone_solid(&mut model, solid_id, None).map_err(ApiError::kernel_error)?;
-            transform_solid(&mut model, cloned, rot, TransformOptions::default())
-                .map_err(ApiError::kernel_error)?;
-            cloned
+            timeline_engine::recorder_bridge::ACK_UNSOUND_OVERRIDE.sync_scope(
+                ack_unsound,
+                || -> Result<u32, ApiError> {
+                    let cloned = deep_clone_solid(&mut model, solid_id, None)
+                        .map_err(ApiError::kernel_error)?;
+                    transform_solid(&mut model, cloned, rot, TransformOptions::default())
+                        .map_err(ApiError::kernel_error)?;
+                    Ok(cloned)
+                },
+            )?
         };
 
         let tri_mesh = {
@@ -6143,6 +6211,7 @@ async fn extrude_face_endpoint(
     // face-ownership check below — so no work is spent validating a
     // selection on a solid the operation is not allowed to touch.
     refuse_unsound_base(&model_handle, &payload, "face/extrude", &[host_solid_id]).await?;
+    let ack_unsound = payload.get("acknowledge_unsound").and_then(|v| v.as_bool()) == Some(true);
 
     {
         let model = model_handle.read().await;
@@ -6226,7 +6295,9 @@ async fn extrude_face_endpoint(
             distance,
             ..ExtrudeOptions::default()
         };
-        let new_id = extrude_face(&mut model, face_id, options).map_err(ApiError::kernel_error)?;
+        let new_id = timeline_engine::recorder_bridge::ACK_UNSOUND_OVERRIDE
+            .sync_scope(ack_unsound, || extrude_face(&mut model, face_id, options))
+            .map_err(ApiError::kernel_error)?;
         // Re-point the host UUID under the SAME write lock (see
         // boolean_operation): when the kernel mints a fresh SolidId the
         // remap must be atomic with the mutation, else a window opened

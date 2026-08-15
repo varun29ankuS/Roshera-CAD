@@ -669,3 +669,215 @@ async fn read_only_routes_are_not_gated() {
         "reading an unsound solid must never be refused; body = {body}"
     );
 }
+
+// =====================================================================
+// 7. `acknowledge_unsound: true` is DURABLY RECORDED (2026-08-15
+//    closeout — the last of the three escapes to leave a durable record;
+//    see `.superpowers/sdd/2026-08-15-constraint-harness-hardening/
+//    ack-unsound-report.md`). The escape hatch already worked (section 2
+//    above pins that); this pins that USING it now leaves a fact on the
+//    timeline event the operation produced — readable back via
+//    `GET /api/timeline/history/{branch}`, not merely present in the
+//    response that answered the one request that used it.
+// =====================================================================
+
+/// Every recorded event's `roshera.acknowledge_unsound` facet, read off
+/// `GET /api/timeline/history/main` — the wire shape `EventSummary.operation`
+/// carries verbatim (`Operation::Generic { parameters: { facets: {...} } }`).
+async fn ack_unsound_facets_in_history(state: &AppState) -> Vec<serde_json::Value> {
+    let (status, body) = dispatch(state, get("/api/timeline/history/main")).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "timeline history must 200; body = {body}"
+    );
+    let events = body.as_array().cloned().unwrap_or_else(|| {
+        panic!("expected a bare event array (durability off in test state); got {body}")
+    });
+    events
+        .iter()
+        .filter_map(|e| {
+            e["operation"]["parameters"]["facets"]["roshera.acknowledge_unsound"].as_object()
+        })
+        .map(|obj| serde_json::Value::Object(obj.clone()))
+        .collect()
+}
+
+/// THE PRODUCER PIN, REST-level, all nine `main.rs` gated routes.
+/// `acknowledge_unsound: true` over a verified-unsound base must leave AT
+/// LEAST ONE event in the timeline carrying `AckUnsoundFacet { acknowledged:
+/// true }` — readable back independently of the create response, exactly
+/// the property the brief calls "durable means readable back out of the
+/// persisted representation, not merely present on a struct in RAM."
+///
+/// RED before the api-server call sites were wired: every one of these
+/// routes recorded its event with no `facets.roshera.acknowledge_unsound`
+/// key at all (the flag was read once by `refuse_unsound_base` and
+/// discarded — the audit's S3/S11 defect, item 4c).
+#[tokio::test]
+async fn acknowledge_unsound_true_records_the_facet_across_every_gated_route() {
+    let cases: Vec<(&str, Box<dyn Fn(&Uuid, &Uuid) -> serde_json::Value>)> = vec![
+        (
+            "/api/geometry/boolean",
+            Box::new(|bad: &Uuid, good: &Uuid| {
+                json!({
+                    "operation": "difference",
+                    "object_a": bad.to_string(),
+                    "object_b": good.to_string(),
+                    "acknowledge_unsound": true,
+                })
+            }),
+        ),
+        (
+            "/api/geometry/shell",
+            Box::new(
+                |bad: &Uuid, _g: &Uuid| json!({ "object": bad.to_string(), "thickness": 1.0, "acknowledge_unsound": true }),
+            ),
+        ),
+        (
+            "/api/geometry/fillet",
+            Box::new(
+                |bad: &Uuid, _g: &Uuid| json!({ "object": bad.to_string(), "edges": [0], "radius": 1.0, "acknowledge_unsound": true }),
+            ),
+        ),
+        (
+            "/api/geometry/chamfer",
+            Box::new(
+                |bad: &Uuid, _g: &Uuid| json!({ "object": bad.to_string(), "edges": [0], "distance": 1.0, "acknowledge_unsound": true }),
+            ),
+        ),
+        (
+            "/api/geometry/transform",
+            Box::new(
+                |bad: &Uuid, _g: &Uuid| json!({ "object": bad.to_string(), "translation": [0.0, 0.0, 1.0], "acknowledge_unsound": true }),
+            ),
+        ),
+        (
+            "/api/geometry/face/extrude",
+            Box::new(
+                |bad: &Uuid, _g: &Uuid| json!({ "object_uuid": bad.to_string(), "face_id": 0, "distance": 1.0, "acknowledge_unsound": true }),
+            ),
+        ),
+        (
+            "/api/geometry/mirror",
+            Box::new(|bad: &Uuid, _g: &Uuid| {
+                json!({
+                    "object": bad.to_string(),
+                    "plane_origin": [0.0, 0.0, 0.0],
+                    "plane_normal": [1.0, 0.0, 0.0],
+                    "acknowledge_unsound": true,
+                })
+            }),
+        ),
+        (
+            "/api/geometry/pattern/linear",
+            Box::new(|bad: &Uuid, _g: &Uuid| {
+                json!({
+                    "object": bad.to_string(),
+                    "direction": [1.0, 0.0, 0.0],
+                    "spacing": 20.0,
+                    "count": 2,
+                    "acknowledge_unsound": true,
+                })
+            }),
+        ),
+        (
+            "/api/geometry/pattern/circular",
+            Box::new(
+                |bad: &Uuid, _g: &Uuid| json!({ "object": bad.to_string(), "count": 3, "acknowledge_unsound": true }),
+            ),
+        ),
+    ];
+
+    for (route, build) in cases {
+        let state = make_test_state().await;
+        let (bad_uuid, _bad_solid) = seed_box_with_drifted_construction(&state, 10.0).await;
+        let good_uuid = sound_box(&state).await;
+
+        let (status, body) = dispatch(&state, post(route, build(&bad_uuid, &good_uuid))).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{route} with acknowledge_unsound:true must proceed; body = {body}"
+        );
+
+        let facets = ack_unsound_facets_in_history(&state).await;
+        assert!(
+            !facets.is_empty(),
+            "{route}: no event in history carries the roshera.acknowledge_unsound \
+             facet after a call that used the escape — the argument was read \
+             and discarded, not recorded"
+        );
+        for facet in &facets {
+            assert_eq!(
+                facet["acknowledged"],
+                json!(true),
+                "{route}: facet must read `acknowledged: true`; got {facet}"
+            );
+        }
+    }
+}
+
+/// A pattern replicates the base N times — EVERY copy's events (the clone
+/// AND the transform, per instance) must carry the facet, not just the
+/// first instance. Distinguishes "wired once" from "wired per iteration."
+#[tokio::test]
+async fn acknowledge_unsound_true_on_a_pattern_stamps_every_instance() {
+    let state = make_test_state().await;
+    let (bad_uuid, _bad_solid) = seed_box_with_drifted_construction(&state, 10.0).await;
+
+    let (status, body) = dispatch(
+        &state,
+        post(
+            "/api/geometry/pattern/linear",
+            json!({
+                "object": bad_uuid.to_string(),
+                "direction": [1.0, 0.0, 0.0],
+                "spacing": 20.0,
+                "count": 4,
+                "acknowledge_unsound": true,
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body = {body}");
+
+    let facets = ack_unsound_facets_in_history(&state).await;
+    // 3 new copies (count=4 → instances 1,2,3), each producing a clone
+    // event AND a transform event => 6 facet-bearing events, plus none
+    // from the box creation itself.
+    assert_eq!(
+        facets.len(),
+        6,
+        "every copy's clone AND transform event must carry the facet, not \
+         just the first instance's; facets = {facets:?}"
+    );
+}
+
+/// THE ABSENCE PIN, REST-level. A gated call WITHOUT the escape (on a
+/// SOUND base, so it actually proceeds) must record NO
+/// `roshera.acknowledge_unsound` facet anywhere in the resulting history —
+/// absence is the honest reading for "no escape was taken," never a stored
+/// `false`.
+#[tokio::test]
+async fn no_acknowledge_unsound_argument_records_no_facet() {
+    let state = make_test_state().await;
+    let uuid = sound_box(&state).await;
+
+    let (status, body) = dispatch(
+        &state,
+        post(
+            "/api/geometry/transform",
+            json!({ "object": uuid.to_string(), "translation": [0.0, 0.0, 1.0] }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body = {body}");
+
+    let facets = ack_unsound_facets_in_history(&state).await;
+    assert!(
+        facets.is_empty(),
+        "a call that never passed acknowledge_unsound must leave no facet \
+         anywhere in history; found {facets:?}"
+    );
+}

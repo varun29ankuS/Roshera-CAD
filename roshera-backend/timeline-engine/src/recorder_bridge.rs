@@ -39,6 +39,7 @@ use geometry_engine::operations::recorder::{
     RecorderError,
 };
 use parking_lot::RwLock as PlRwLock;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot, RwLock};
 
 use crate::timeline::Timeline;
@@ -144,6 +145,79 @@ pub struct IntentContext {
     /// The client-side turn the checkpoint opened at, as free text.
     /// `None` = not sent, never an empty string.
     pub turn_id: Option<String>,
+}
+
+/// The `roshera.acknowledge_unsound` facet: the caller explicitly passed
+/// `acknowledge_unsound: true` on the REST call that produced this event —
+/// "I know the base this operation inherits from was refused as unsound by
+/// `refuse_unsound_base`, and I choose to proceed anyway."
+///
+/// # Why this type lives here, not in `geometry-engine`
+///
+/// `IntentFacet` and `OriginFacet` are defined in `geometry-engine` even
+/// though they too are stamped by the timeline layer, because both describe
+/// something about the OPERATION itself (what was asked for, which channel
+/// it arrived on) that a kernel-adjacent consumer might reasonably want
+/// typed at that layer. `acknowledge_unsound` is different in kind: it is a
+/// policy decision the kernel never consults — `refuse_unsound_base` runs
+/// entirely in `api-server`, before the kernel call, and the kernel has no
+/// notion of "unsound base" as an input. Defining its shape in
+/// `geometry-engine` would mean the kernel's own crate carries a type for a
+/// policy it cannot see, for the sole benefit of a caller two layers up.
+/// Keeping it in `timeline-engine` — the same layer `skip_verification`
+/// already lives on (`timeline_engine::types::Checkpoint`) — is the
+/// substance of the audit's ruling: a policy-layer acknowledgement is
+/// recorded at the policy/timeline layer, never smuggled into the kernel's
+/// own recorded parameters. `Facets::set_facet`/`Facets::facet` are generic
+/// over any `Serialize`/`DeserializeOwned` type, so this works without
+/// touching `geometry-engine` at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AckUnsoundFacet {
+    /// Always `true` when the facet is present. There is no `false` variant
+    /// by design — "the caller did not pass the escape" is represented by
+    /// the facet's ABSENCE (`Facets::facet` returning `None`), never by a
+    /// stored `false`. Storing `false` on every non-escaping op would be
+    /// exactly the fabricated-zero defect this branch has been closing.
+    pub acknowledged: bool,
+}
+
+impl AckUnsoundFacet {
+    /// The facet's namespaced wire name. Mirrors the REST argument name
+    /// (`acknowledge_unsound`) so the durable record is grep-able against
+    /// the API surface that produced it.
+    pub const NAME: &'static str = "roshera.acknowledge_unsound";
+}
+
+tokio::task_local! {
+    /// Per-call override consulted by [`TimelineRecorder::record`] to stamp
+    /// [`AckUnsoundFacet`].
+    ///
+    /// A SEPARATE task-local from [`AUTHOR_OVERRIDE`] / [`INTENT_OVERRIDE`] /
+    /// [`ORIGIN_OVERRIDE`] / [`DOCUMENT_OVERRIDE`], and scoped differently
+    /// from all four: those are scoped once per REQUEST, by middleware,
+    /// because author/intent/origin/document describe the whole request.
+    /// `acknowledge_unsound` describes ONE specific kernel call — the one
+    /// that consumes the base `refuse_unsound_base` just refused-or-passed
+    /// — so it is scoped by the HANDLER, narrowly around that call (or that
+    /// call's containing loop, for a pattern that replicates the base N
+    /// times), via [`tokio::task_local::LocalKey::sync_scope`] since the
+    /// kernel call itself is always synchronous (no `.await` between lock
+    /// acquisition and the kernel op). This also sidesteps a question this
+    /// slice does not need to answer: whether a task-local scoped on the
+    /// request task is even visible inside `bounded_exec::bounded_model_op`'s
+    /// `spawn_blocking` closure (a different OS thread) — every call site
+    /// re-enters the scope explicitly, inside whatever thread actually runs
+    /// the kernel call, rather than relying on ambient inheritance.
+    ///
+    /// Value is `bool`, not `Option<()>` or similar: every gated call site
+    /// scopes UNCONDITIONALLY with whatever `acknowledge_unsound` resolved
+    /// to (`true` or `false`), and `record()` only stamps the facet when the
+    /// scoped value is `true` — so a call that did NOT pass the escape still
+    /// enters a scope, but with `false`, and produces no facet. This keeps
+    /// every call site's shape identical (no `if flag { scope } else {
+    /// don't }` branching duplicating the kernel call) while preserving the
+    /// "absence is stated, never defaulted" contract at the facet layer.
+    pub static ACK_UNSOUND_OVERRIDE: bool;
 }
 
 tokio::task_local! {
@@ -720,6 +794,44 @@ impl OperationRecorder for TimelineRecorder {
                     kind = %operation.kind,
                     error = %err,
                     "failed to stamp OriginFacet — recording without it"
+                );
+            }
+        }
+        // Stamp the caller's unsound-base acknowledgement NOW, on the
+        // recording task/thread, for the same reason intent/origin are
+        // resolved here rather than on the drain worker — except this
+        // override is scoped per-CALL by the handler (see
+        // `ACK_UNSOUND_OVERRIDE`'s doc comment), not per-request by
+        // middleware, so `try_with` reads whatever the immediately
+        // enclosing `sync_scope` set. A record that already carries the
+        // facet (replay re-applying a stored event whose original record
+        // already has one) is left untouched — replay must never relabel
+        // history from whatever escape happens to be in scope on the
+        // REPLAY call, only preserve what was actually recorded live.
+        //
+        // Only stamps when the scoped value is `true`. `false` (every
+        // gated call site scopes unconditionally, per the task-local's doc
+        // comment) and "no scope at all" (every non-gated kernel op — the
+        // overwhelming majority) both leave the facet OFF: absence is the
+        // honest reading for "no escape was taken," never a stored `false`.
+        if operation
+            .facets
+            .facet::<AckUnsoundFacet>(AckUnsoundFacet::NAME)
+            .is_none()
+            && ACK_UNSOUND_OVERRIDE.try_with(|v| *v).unwrap_or(false)
+        {
+            if let Err(err) = operation.facets.set_facet(
+                AckUnsoundFacet::NAME,
+                &AckUnsoundFacet { acknowledged: true },
+            ) {
+                // A one-field bool struct cannot realistically fail to
+                // serialize; if it ever does, record WITHOUT the facet
+                // (honest absence) rather than dropping the op.
+                tracing::warn!(
+                    target: "timeline.recorder_bridge",
+                    kind = %operation.kind,
+                    error = %err,
+                    "failed to stamp AckUnsoundFacet — recording without it"
                 );
             }
         }
@@ -2121,6 +2233,241 @@ mod tests {
                  worse than not_determined"
             );
         }
+    }
+
+    // ──────────── Unsound-base acknowledgement (`roshera.acknowledge_unsound`) ────────────
+
+    /// Extract the `roshera.acknowledge_unsound` facet payload from an
+    /// event's replay envelope, or `None` when the event carries no
+    /// acknowledgement at all.
+    fn ack_unsound_of(event: &TimelineEvent) -> Option<serde_json::Value> {
+        match &event.operation {
+            Operation::Generic { parameters, .. } => parameters
+                .get("facets")
+                .and_then(|f| f.get(AckUnsoundFacet::NAME))
+                .cloned(),
+            other => panic!("expected Operation::Generic, got {:?}", other),
+        }
+    }
+
+    /// THE ABSENCE PIN. An op recorded with no `ACK_UNSOUND_OVERRIDE` scope
+    /// at all must carry NO facet — unlike origin (always stamped, even as
+    /// `not_determined`), this dimension has no honest "undetermined"
+    /// value: an op that never went near `refuse_unsound_base` has nothing
+    /// to acknowledge, and stamping anything would fabricate a fact.
+    #[tokio::test]
+    async fn record_with_no_ack_unsound_scope_stamps_nothing() {
+        let timeline: SharedTimeline =
+            Arc::new(RwLock::new(Timeline::new(TimelineConfig::default())));
+        let recorder =
+            TimelineRecorder::new(Arc::clone(&timeline), Author::System, BranchId::main());
+
+        recorder
+            .record(RecordedOperation::new("no-scope"))
+            .expect("record with no ack-unsound scope");
+        drop(recorder);
+
+        let events = drained_events(&timeline, 1).await;
+        assert!(
+            ack_unsound_of(&events[0]).is_none(),
+            "an op recorded with no ACK_UNSOUND_OVERRIDE scope must carry no facet"
+        );
+    }
+
+    /// THE FALSE-IS-NOT-STAMPED PIN. Every gated call site scopes
+    /// UNCONDITIONALLY with whatever `acknowledge_unsound` resolved to, so a
+    /// call that did NOT pass the escape still runs inside a live scope —
+    /// just with `false`. That must produce the SAME absence as no scope at
+    /// all, never a stored `acknowledged: false`. This is the specific
+    /// defect class this branch has spent several items closing (fabricated
+    /// zeros / defaulted-false fields standing in for "never asked").
+    #[tokio::test]
+    async fn ack_unsound_scope_false_stamps_nothing() {
+        let timeline: SharedTimeline =
+            Arc::new(RwLock::new(Timeline::new(TimelineConfig::default())));
+        let recorder =
+            TimelineRecorder::new(Arc::clone(&timeline), Author::System, BranchId::main());
+
+        ACK_UNSOUND_OVERRIDE
+            .scope(false, async {
+                recorder
+                    .record(RecordedOperation::new("scoped-false"))
+                    .expect("record inside a false scope");
+            })
+            .await;
+        drop(recorder);
+
+        let events = drained_events(&timeline, 1).await;
+        assert!(
+            ack_unsound_of(&events[0]).is_none(),
+            "a scope carrying `false` must produce the same absence as no scope — \
+             never a stored `false`"
+        );
+    }
+
+    /// THE PRODUCER PIN. An op recorded while `ACK_UNSOUND_OVERRIDE` is
+    /// scoped `true` must land on the timeline carrying `AckUnsoundFacet {
+    /// acknowledged: true }`. RED before the producer existed: `record()`
+    /// never consulted the override at all, so this returned `None`
+    /// regardless of scope.
+    #[tokio::test]
+    async fn ack_unsound_scope_true_stamps_facet() {
+        let timeline: SharedTimeline =
+            Arc::new(RwLock::new(Timeline::new(TimelineConfig::default())));
+        let recorder =
+            TimelineRecorder::new(Arc::clone(&timeline), Author::System, BranchId::main());
+
+        ACK_UNSOUND_OVERRIDE
+            .scope(true, async {
+                recorder
+                    .record(RecordedOperation::new("scoped-true"))
+                    .expect("record inside a true scope");
+            })
+            .await;
+        drop(recorder);
+
+        let events = drained_events(&timeline, 1).await;
+        let facet = ack_unsound_of(&events[0])
+            .expect("an op recorded inside a `true` ack-unsound scope must carry the facet");
+        assert_eq!(facet["acknowledged"], true);
+    }
+
+    /// THE PRODUCTION-MECHANISM PIN. Every real call site uses
+    /// `sync_scope`, not `scope` — the kernel call it wraps is always
+    /// synchronous — so this proves that specific path, not just the async
+    /// `scope` API the test above exercises. `record()` cannot tell which
+    /// scoping API set the task-local; if this failed while the async test
+    /// passed, `sync_scope`'s TLS write would be the culprit.
+    #[tokio::test]
+    async fn ack_unsound_sync_scope_true_stamps_facet() {
+        let timeline: SharedTimeline =
+            Arc::new(RwLock::new(Timeline::new(TimelineConfig::default())));
+        let recorder =
+            TimelineRecorder::new(Arc::clone(&timeline), Author::System, BranchId::main());
+
+        ACK_UNSOUND_OVERRIDE.sync_scope(true, || {
+            recorder
+                .record(RecordedOperation::new("sync-scoped-true"))
+                .expect("record inside a sync true scope")
+        });
+        drop(recorder);
+
+        let events = drained_events(&timeline, 1).await;
+        let facet = ack_unsound_of(&events[0])
+            .expect("an op recorded inside a `sync_scope(true, ..)` must carry the facet");
+        assert_eq!(facet["acknowledged"], true);
+    }
+
+    /// A record that already carries the facet (replay re-applying a stored
+    /// event whose original `RecordedOperation` was reconstructed with one
+    /// already set) is left untouched by whatever scope happens to be live
+    /// on the REPLAY call — replay must never relabel history from today's
+    /// ambient context, only preserve what was actually recorded live. Pins
+    /// the same "already carries" guard `IntentFacet`/`OriginFacet` use.
+    #[tokio::test]
+    async fn a_record_that_already_carries_the_facet_is_not_overwritten() {
+        let timeline: SharedTimeline =
+            Arc::new(RwLock::new(Timeline::new(TimelineConfig::default())));
+        let recorder =
+            TimelineRecorder::new(Arc::clone(&timeline), Author::System, BranchId::main());
+
+        let mut rec = RecordedOperation::new("already-stamped");
+        rec.facets
+            .set_facet(
+                AckUnsoundFacet::NAME,
+                &AckUnsoundFacet { acknowledged: true },
+            )
+            .expect("set facet on the pre-built record");
+
+        // No live scope at all — if `record()` overwrote instead of
+        // respecting the existing facet, this would either stay `true` by
+        // coincidence (false negative) or, with a scope live and `false`,
+        // would incorrectly strip it. Exercise the stronger case: scope is
+        // live and `false`, which would DELETE-BY-OMISSION if `record()`
+        // ignored the "already present" guard and rebuilt the facet from
+        // scratch instead of skipping the stamp entirely.
+        ACK_UNSOUND_OVERRIDE
+            .scope(false, async {
+                recorder
+                    .record(rec)
+                    .expect("record a pre-stamped op inside an unrelated false scope");
+            })
+            .await;
+        drop(recorder);
+
+        let events = drained_events(&timeline, 1).await;
+        let facet = ack_unsound_of(&events[0])
+            .expect("a pre-stamped facet must survive record() untouched");
+        assert_eq!(facet["acknowledged"], true);
+    }
+
+    /// THE CROSS-ATTRIBUTION PIN, unsound-base variant. Two concurrent
+    /// recording tasks, each inside its OWN `ACK_UNSOUND_OVERRIDE` scope
+    /// with a DIFFERENT value, both record before the drain worker applies
+    /// either (driven via the timeline write lock, exactly as the intent
+    /// and origin cross-attribution pins do). Each event must carry
+    /// (or lack) the facet according to ITS OWN scope, never the concurrent
+    /// call's — this is what justifies scoping per-call rather than
+    /// per-request for this dimension.
+    #[tokio::test(flavor = "current_thread")]
+    async fn concurrent_calls_with_different_ack_unsound_never_cross_attribute() {
+        let timeline: SharedTimeline =
+            Arc::new(RwLock::new(Timeline::new(TimelineConfig::default())));
+        let recorder =
+            TimelineRecorder::new(Arc::clone(&timeline), Author::System, BranchId::main());
+
+        let write_guard = timeline.write().await;
+
+        let alpha_recorder = recorder.clone();
+        let alpha = tokio::spawn(ACK_UNSOUND_OVERRIDE.scope(true, async move {
+            alpha_recorder
+                .record(RecordedOperation::new("op-alpha"))
+                .expect("record op-alpha inside alpha's true scope");
+        }));
+        let beta_recorder = recorder.clone();
+        let beta = tokio::spawn(ACK_UNSOUND_OVERRIDE.scope(false, async move {
+            beta_recorder
+                .record(RecordedOperation::new("op-beta"))
+                .expect("record op-beta inside beta's false scope");
+        }));
+        alpha.await.expect("alpha task completes");
+        beta.await.expect("beta task completes");
+
+        drop(write_guard);
+        drop(recorder);
+
+        let events = drained_events(&timeline, 2).await;
+        assert_eq!(
+            events.len(),
+            2,
+            "both concurrent records reach the timeline"
+        );
+
+        let alpha_event = events
+            .iter()
+            .find(|e| {
+                matches!(&e.operation, Operation::Generic { command_type, .. }
+                    if command_type == "op-alpha")
+            })
+            .expect("op-alpha's event exists");
+        assert_eq!(
+            ack_unsound_of(alpha_event).expect("op-alpha scoped true must carry the facet")
+                ["acknowledged"],
+            true
+        );
+
+        let beta_event = events
+            .iter()
+            .find(|e| {
+                matches!(&e.operation, Operation::Generic { command_type, .. }
+                    if command_type == "op-beta")
+            })
+            .expect("op-beta's event exists");
+        assert!(
+            ack_unsound_of(beta_event).is_none(),
+            "op-beta scoped false must carry NO facet, never alpha's `true` \
+             cross-attributed onto it"
+        );
     }
 
     // =================================================================
