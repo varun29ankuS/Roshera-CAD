@@ -249,12 +249,34 @@ pub struct AddViewResponse {
     pub view_id: Uuid,
 }
 
+/// Query parameters accepted by every sheet-export route
+/// (`GET /api/drawings/{id}/{svg,pdf,dxf}`). `plain` only affects the SVG
+/// route's Content-Type; `acknowledge_layout_issues` is the sheet-export
+/// gate's one documented escape, shared by all three routes — the same
+/// name `roshera-mcp/src/gates.ts::sheetExportGate` already uses
+/// (`gates.ts:699`), so an agent that read the MCP tool doc recognises the
+/// REST query parameter as the same escape rather than a new vocabulary.
+/// Arrives as a query parameter (not a body field) because these are GET
+/// routes.
 #[derive(Debug, Clone, Deserialize, Default)]
-pub struct SvgQuery {
+pub struct ExportQuery {
     /// Optional override of the standard `image/svg+xml` Content-Type
     /// to `text/plain` for callers that prefer inline display.
     #[serde(default)]
     pub plain: bool,
+    /// The layout-quality branch's bypass. Only the literal boolean
+    /// `true` opens it — `Query<ExportQuery>`'s `bool` deserialization
+    /// already rejects non-boolean junk (`?acknowledge_layout_issues=1`)
+    /// with a 400 before this handler ever runs, so there is no truthy-
+    /// junk surface to guard against here (contrast
+    /// `refuse_unsound_base`'s `acknowledge_unsound`, which arrives as a
+    /// body `serde_json::Value` and must check `== Some(true)` by hand).
+    /// Pinned, not assumed:
+    /// `sheet_export_gate_tests::junk_acknowledge_layout_issues_value_
+    /// does_not_open_the_bypass`. Never opens the stale/dangling branch —
+    /// see [`crate::error_catalog::ErrorCode::SheetUnsound`].
+    #[serde(default)]
+    pub acknowledge_layout_issues: bool,
 }
 
 // ── Handlers ────────────────────────────────────────────────────────
@@ -527,10 +549,14 @@ pub async fn remove_view(
 
 pub async fn export_svg(
     State(state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
     Path(id): Path<Uuid>,
-    Query(q): Query<SvgQuery>,
+    Query(q): Query<ExportQuery>,
 ) -> Result<Response, ApiError> {
     let handle = state.drawings.get(&id).ok_or_else(|| not_found(id))?;
+    let snapshot = { handle.read().await.clone() };
+    refuse_unsound_sheet(model_handle, id, snapshot, q.acknowledge_layout_issues).await?;
+
     let guard = handle.read().await;
     let svg = render_drawing_svg(&guard);
     let content_type = if q.plain {
@@ -777,6 +803,67 @@ async fn certify_off_lock(
     .map_err(|_| ApiError::new(ErrorCode::KernelError, "sheet certification task failed"))
 }
 
+/// **The sheet-export gate — server-side.** Mirrors
+/// `roshera-mcp/src/gates.ts::sheetExportGate` (gate 4), exactly as
+/// `crate::refuse_unsound_base` mirrors gate 3: the rule previously
+/// enforced ONLY in the MCP client, closed here for the one gate whose own
+/// published rationale is that nothing downstream can re-verify the
+/// exported artifact (`gates.ts:50-53`). A REST-speaking agent could
+/// `POST /api/parts/{id}/drawing` then `GET /api/drawings/{id}/pdf` and
+/// walk straight around the TypeScript-only version of this check.
+///
+/// One helper, called at the head of `export_pdf` / `export_dxf` /
+/// `export_svg`, immediately after each handler resolves its own drawing
+/// (so an unknown UUID still gets that handler's own 404 — the same
+/// "already-resolved id" discipline `refuse_unsound_base` documents).
+///
+/// # Checked in severity order, matching `sheetExportGate` exactly
+///
+/// 1. **Certificate unreadable → refused, NO bypass.** Unlike gate 3,
+///    which fails OPEN on a preflight-fetch failure (the op's own
+///    certificate still tells the truth afterwards), this gate fails
+///    CLOSED: an exported file has no downstream truth-teller, so
+///    exporting without ever having read the verdict would ship an
+///    approximation labeled as exact.
+/// 2. **Stale or dangling facts → refused, NO bypass.** The model moved
+///    since projection, or a referenced face is gone. Regenerating
+///    (`POST /api/parts/{id}/drawing`) is one cheap call, so nothing
+///    legitimately ships a sheet that disagrees with the model it claims
+///    to describe.
+/// 3. **Layout-quality Errors → refused unless `acknowledge_layout_issues:
+///    true`.** The one bypass, for the draft-for-human-review flow.
+///
+/// `drawing` is the ALREADY-fetched sheet (the caller already took the
+/// read lock to build it for its own render step), so this never
+/// re-touches the drawing registry.
+async fn refuse_unsound_sheet(
+    model_handle: Arc<RwLock<BRepModel>>,
+    drawing_id: Uuid,
+    drawing: Drawing,
+    acknowledge_layout_issues: bool,
+) -> Result<(), ApiError> {
+    let cert = certify_off_lock(model_handle, drawing)
+        .await
+        .map_err(|_| ApiError::sheet_uncertified(drawing_id))?;
+
+    if !cert.sound || cert.counts.stale > 0 || cert.counts.dangling > 0 {
+        return Err(ApiError::sheet_unsound(
+            drawing_id,
+            cert.counts.stale,
+            cert.counts.dangling,
+        ));
+    }
+
+    if !cert.quality.passed && !acknowledge_layout_issues {
+        return Err(ApiError::sheet_quality(
+            drawing_id,
+            cert.quality.error_count(),
+        ));
+    }
+
+    Ok(())
+}
+
 /// `GET /api/drawings/{id}/certificate` — the sheet readback certificate only
 /// (a cheap poll): per-fact live-checked verdicts + the layout quality report,
 /// re-measured against the active model.
@@ -864,9 +951,14 @@ fn content_disposition(name: &str, drawing_id: Uuid, extension: &str) -> String 
 
 pub async fn export_pdf(
     State(state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
     Path(id): Path<Uuid>,
+    Query(q): Query<ExportQuery>,
 ) -> Result<Response, ApiError> {
     let handle = state.drawings.get(&id).ok_or_else(|| not_found(id))?;
+    let snapshot = { handle.read().await.clone() };
+    refuse_unsound_sheet(model_handle, id, snapshot, q.acknowledge_layout_issues).await?;
+
     let (bytes, name) = {
         let guard = handle.read().await;
         let bytes = render_drawing_pdf(&guard).map_err(|e| {
@@ -888,9 +980,14 @@ pub async fn export_pdf(
 
 pub async fn export_dxf(
     State(state): State<AppState>,
+    ActiveModel(model_handle): ActiveModel,
     Path(id): Path<Uuid>,
+    Query(q): Query<ExportQuery>,
 ) -> Result<Response, ApiError> {
     let handle = state.drawings.get(&id).ok_or_else(|| not_found(id))?;
+    let snapshot = { handle.read().await.clone() };
+    refuse_unsound_sheet(model_handle, id, snapshot, q.acknowledge_layout_issues).await?;
+
     let (bytes, name) = {
         let guard = handle.read().await;
         let bytes = render_drawing_dxf(&guard).map_err(|e| {
@@ -1434,18 +1531,31 @@ mod tests {
         );
     }
 
-    // ── Wire types — SvgQuery ────────────────────────────────────────
+    // ── Wire types — ExportQuery ───────────────────────────────────────
 
     #[test]
-    fn svg_query_default_is_not_plain() {
-        let q: SvgQuery = serde_json::from_value(serde_json::json!({})).unwrap();
+    fn export_query_default_is_not_plain() {
+        let q: ExportQuery = serde_json::from_value(serde_json::json!({})).unwrap();
         assert!(!q.plain);
     }
 
     #[test]
-    fn svg_query_plain_true_parses() {
-        let q: SvgQuery = serde_json::from_value(serde_json::json!({"plain": true})).unwrap();
+    fn export_query_plain_true_parses() {
+        let q: ExportQuery = serde_json::from_value(serde_json::json!({"plain": true})).unwrap();
         assert!(q.plain);
+    }
+
+    #[test]
+    fn export_query_default_does_not_acknowledge_layout_issues() {
+        let q: ExportQuery = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(!q.acknowledge_layout_issues);
+    }
+
+    #[test]
+    fn export_query_acknowledge_layout_issues_true_parses() {
+        let q: ExportQuery =
+            serde_json::from_value(serde_json::json!({"acknowledge_layout_issues": true})).unwrap();
+        assert!(q.acknowledge_layout_issues);
     }
 
     // ── Wire types — ProjectionType ──────────────────────────────────

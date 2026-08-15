@@ -56,6 +56,8 @@ mod protocol; // ClientMessage/ServerMessage protocol (WebSocket is just transpo
 mod reconcile_task;
 #[cfg(test)]
 mod router_integration_tests;
+#[cfg(test)]
+mod sheet_export_gate_tests;
 mod sketch;
 mod transactions;
 #[cfg(test)]

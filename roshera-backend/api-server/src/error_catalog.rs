@@ -160,6 +160,61 @@ pub enum ErrorCode {
     /// `details` carries `gate`, `solid_id`, `verdict`, and `operation`.
     UnsoundBase,
 
+    // ── Sheet-export gate ────────────────────────────────────────
+    // Mirrors `roshera-mcp/src/gates.ts::sheetExportGate` (gate 4)
+    // server-side, exactly as `UnsoundBase` above mirrors gate 3 — the
+    // rule previously enforced ONLY in the MCP client, closed by
+    // `b02da15f` for gate 3 and left open here until now. A REST-speaking
+    // agent could `POST /api/parts/{id}/drawing` then
+    // `GET /api/drawings/{id}/pdf` and walk straight around the gate.
+    //
+    // Unlike `UnsoundBase`, this gate fails CLOSED (see `SheetUncertified`
+    // below): an exported PDF/DXF/SVG carries no ambient certificate and
+    // can never re-verify itself, so a preflight that cannot be read must
+    // refuse rather than proceed.
+    /// **Sheet-export gate — certificate unreadable.** The live readback
+    /// certificate for the drawing being exported could not be computed.
+    /// This is the ONE gate in the catalog that fails CLOSED on a
+    /// preflight failure — the inverse of `UnsoundBase`, which fails OPEN
+    /// because the op's own certificate still tells the truth afterwards.
+    /// An exported file has no such downstream truth-teller, so exporting
+    /// without ever having read the verdict would ship an approximation
+    /// labeled as exact. No bypass — a transport/compute hiccup is not a
+    /// documented escape. Mapped to HTTP 503 (the server, not the
+    /// caller's input, failed to produce an answer) and retryable: the
+    /// only production trigger is a `spawn_blocking` join failure on the
+    /// certification task, which is transient by nature. `details`
+    /// carries `gate` and `drawing_id`.
+    SheetUncertified,
+    /// **Sheet-export gate — the sheet is unsound against the live
+    /// model.** The drawing's live-checked certificate reports a `stale`
+    /// fact (the model moved since this sheet was projected) or a
+    /// `dangling` fact (a referenced face no longer exists). A sheet whose
+    /// printed dimensions disagree with the model would have a shop
+    /// machine the wrong part. **No bypass, ever** —
+    /// `acknowledge_layout_issues` does NOT open this branch, only the
+    /// layout-quality branch below: regenerating the sheet
+    /// (`POST /api/parts/{id}/drawing`) is one cheap call, so nothing
+    /// legitimately ships a sheet that disagrees with the model it claims
+    /// to describe. Mapped to HTTP 409 (state conflict, same reasoning as
+    /// `UnsoundBase`). Non-retryable from the same drawing_id — it
+    /// becomes possible again only against a freshly regenerated
+    /// drawing_id. `details` carries `gate`, `drawing_id`, `stale`, and
+    /// `dangling` counts.
+    SheetUnsound,
+    /// **Sheet-export gate — layout-quality certificate failed.** The
+    /// drawing's Error-severity findings (label collisions, redundant
+    /// dimensions, a broken third-angle arrangement) are exactly what a
+    /// drawing checker rejects on sight. **Escape hatch (deliberate,
+    /// documented):** `acknowledge_layout_issues=true` (a query parameter
+    /// on these GET routes — the escape argument the TS gate already
+    /// names, `gates.ts:699`) proceeds anyway, for the draft-for-human-
+    /// review flow: sometimes the defective layout is exactly what a
+    /// human asked to see. Mapped to HTTP 409, non-retryable without
+    /// either the flag or a regenerated sheet. `details` carries `gate`,
+    /// `drawing_id`, and `error_count`.
+    SheetQuality,
+
     // ── Idempotency layer ─────────────────────────────────────────
     /// `Idempotency-Key` header was sent with an empty value.
     IdempotencyKeyEmpty,
@@ -336,7 +391,9 @@ impl ErrorCode {
             // The request is well-formed and its parameters are valid —
             // the MODEL is in a state that forbids the operation. That is
             // a conflict, not a bad value, so 409 rather than 422.
-            | ErrorCode::UnsoundBase => StatusCode::CONFLICT,
+            | ErrorCode::UnsoundBase
+            | ErrorCode::SheetUnsound
+            | ErrorCode::SheetQuality => StatusCode::CONFLICT,
             ErrorCode::IdempotencyBodyTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
 
             // Well-formed request, semantically unacceptable value —
@@ -358,7 +415,12 @@ impl ErrorCode {
             | ErrorCode::IdempotencyReplayFailed
             | ErrorCode::Internal => StatusCode::INTERNAL_SERVER_ERROR,
 
-            ErrorCode::AiNotConfigured => StatusCode::SERVICE_UNAVAILABLE,
+            ErrorCode::AiNotConfigured
+            // The one gate in the catalog that fails CLOSED on a
+            // preflight-fetch failure — see the variant doc. A 503, not a
+            // 500: the server could not produce an answer this time, not
+            // that the request itself is malformed.
+            | ErrorCode::SheetUncertified => StatusCode::SERVICE_UNAVAILABLE,
 
             ErrorCode::AiCredentialInvalid
             | ErrorCode::AiModelRejected
@@ -437,6 +499,13 @@ impl ErrorCode {
             // a blind retry is pure waste. The caller must either repair
             // the base or re-issue with `acknowledge_unsound: true`.
             | ErrorCode::UnsoundBase
+            // Same reasoning, one level up the stack: the same drawing_id
+            // against the same live model earns the same refusal. The
+            // caller must regenerate the sheet (a new drawing_id) or, for
+            // `SheetQuality` only, re-issue with
+            // `acknowledge_layout_issues=true`.
+            | ErrorCode::SheetUnsound
+            | ErrorCode::SheetQuality
             | ErrorCode::PermissionDenied
             | ErrorCode::MethodNotAllowed => false,
 
@@ -446,6 +515,10 @@ impl ErrorCode {
             | ErrorCode::KernelReturnedWrongType
             | ErrorCode::IdempotencyResponseTooLarge
             | ErrorCode::IdempotencyReplayFailed
+            // The only production trigger is a `spawn_blocking` join
+            // failure on the certification task — transient by nature,
+            // unlike the two refusals above.
+            | ErrorCode::SheetUncertified
             | ErrorCode::Internal => true,
         }
     }
@@ -470,6 +543,9 @@ impl ErrorCode {
             ErrorCode::PartNotFound => "part_not_found",
             ErrorCode::KernelReturnedWrongType => "kernel_returned_wrong_type",
             ErrorCode::UnsoundBase => "unsound_base",
+            ErrorCode::SheetUncertified => "sheet_uncertified",
+            ErrorCode::SheetUnsound => "sheet_unsound",
+            ErrorCode::SheetQuality => "sheet_quality",
             ErrorCode::IdempotencyKeyEmpty => "idempotency_key_empty",
             ErrorCode::IdempotencyKeyTooLong => "idempotency_key_too_long",
             ErrorCode::IdempotencyKeyReused => "idempotency_key_reused",
@@ -519,6 +595,9 @@ impl ErrorCode {
             ErrorCode::PartNotFound,
             ErrorCode::KernelReturnedWrongType,
             ErrorCode::UnsoundBase,
+            ErrorCode::SheetUncertified,
+            ErrorCode::SheetUnsound,
+            ErrorCode::SheetQuality,
             ErrorCode::IdempotencyKeyEmpty,
             ErrorCode::IdempotencyKeyTooLong,
             ErrorCode::IdempotencyKeyReused,
@@ -818,6 +897,97 @@ impl ApiError {
             "solid_id": solid_id,
             "verdict": verdict,
             "operation": operation,
+        }))
+    }
+
+    /// **Sheet-export gate — certificate unreadable.** Mirrors
+    /// `roshera-mcp/src/gates.ts::sheetExportGate`'s `cert === null`
+    /// branch. See [`ErrorCode::SheetUncertified`] for the fail-CLOSED
+    /// rationale — the inverse of `unsound_base`'s fail-open, because an
+    /// exported file can never re-verify itself.
+    pub fn sheet_uncertified(drawing_id: uuid::Uuid) -> Self {
+        Self::new(
+            ErrorCode::SheetUncertified,
+            format!(
+                "the live certificate for drawing {drawing_id} could not be \
+                 computed, so nothing certifies its printed dimensions \
+                 against the current model — and a PDF/DXF/SVG on disk can \
+                 never re-verify itself. Exporting an uncertified sheet \
+                 would ship an approximation labeled as exact."
+            ),
+        )
+        .with_hint(
+            "Retry the export. If this persists, read \
+             GET /api/drawings/{id}/semantic directly to see the \
+             underlying failure.",
+        )
+        .with_details(serde_json::json!({
+            "gate": "sheet_uncertified",
+            "drawing_id": drawing_id,
+        }))
+    }
+
+    /// **Sheet-export gate — the sheet is unsound against the live
+    /// model.** Mirrors `roshera-mcp/src/gates.ts::sheetExportGate`'s
+    /// stale/dangling branch. `stale` counts facts whose live-remeasured
+    /// value has drifted past the dimensioning oracle; `dangling` counts
+    /// facts whose referenced face no longer exists. No bypass — see the
+    /// variant doc.
+    pub fn sheet_unsound(drawing_id: uuid::Uuid, stale: usize, dangling: usize) -> Self {
+        Self::new(
+            ErrorCode::SheetUnsound,
+            format!(
+                "drawing {drawing_id} is UNSOUND against the live model: \
+                 {stale} stale fact(s) (the model moved since this sheet \
+                 was projected) and {dangling} dangling fact(s) (a \
+                 referenced face no longer exists). A sheet whose printed \
+                 dimensions disagree with the model would have a shop \
+                 machine the wrong part."
+            ),
+        )
+        .with_hint(
+            "Regenerate the sheet from the current model \
+             (POST /api/parts/{id}/drawing) and export the new drawing_id. \
+             There is no override: regeneration is one cheap call, and no \
+             flow legitimately ships a sheet that disagrees with the model \
+             it claims to describe.",
+        )
+        .with_details(serde_json::json!({
+            "gate": "sheet_unsound",
+            "drawing_id": drawing_id,
+            "stale": stale,
+            "dangling": dangling,
+        }))
+    }
+
+    /// **Sheet-export gate — layout-quality certificate failed.** Mirrors
+    /// `roshera-mcp/src/gates.ts::sheetExportGate`'s quality branch.
+    /// **Escape hatch (deliberate, documented):** re-issue with
+    /// `acknowledge_layout_issues=true` (a query parameter on these GET
+    /// routes) for the draft-for-human-review flow. `hint` always names
+    /// the flag.
+    pub fn sheet_quality(drawing_id: uuid::Uuid, error_count: usize) -> Self {
+        Self::new(
+            ErrorCode::SheetQuality,
+            format!(
+                "drawing {drawing_id} failed its layout-quality \
+                 certificate — {error_count} Error-severity finding(s) \
+                 (label collisions, redundant dimensions, broken view \
+                 arrangement): exactly what a drawing checker rejects on \
+                 sight."
+            ),
+        )
+        .with_hint(
+            "Regenerate with a fresh POST /api/parts/{id}/drawing after \
+             fixing the cause where possible. If a human asked to see the \
+             defective layout itself (a draft for review, not a shop \
+             release), re-issue this exact request with \
+             acknowledge_layout_issues=true.",
+        )
+        .with_details(serde_json::json!({
+            "gate": "sheet_quality",
+            "drawing_id": drawing_id,
+            "error_count": error_count,
         }))
     }
 
