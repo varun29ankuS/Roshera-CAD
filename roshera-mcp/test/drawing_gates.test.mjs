@@ -49,6 +49,12 @@ rmSync(OUT, { force: true });
 
 const counts = { perception: 0, make: 0, semantic: 0, pdf: 0 };
 let partSound = false;
+// The exact `acknowledge_layout_issues` query value the last /pdf request
+// carried (the string as received, "" when the param was absent) — item 4's
+// forwarding half needs a way to prove the flag actually reached the wire,
+// not merely that the export proceeded (a call that never sends the flag at
+// all would also "proceed" once the certificate is clean).
+let lastPdfQuery = undefined;
 
 // The live sheet certificate the stub serves — mutated between phases.
 let cert = {
@@ -64,7 +70,8 @@ let cert = {
 };
 
 const stub = http.createServer((req, res) => {
-  const url = req.url ?? "";
+  const rawUrl = req.url ?? "";
+  const [url, qs] = rawUrl.split("?");
   const send = (obj) => {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify(obj));
@@ -96,6 +103,7 @@ const stub = http.createServer((req, res) => {
     }
     if (req.method === "GET" && url === `/api/drawings/${DRAWING}/pdf`) {
       counts.pdf++;
+      lastPdfQuery = new URLSearchParams(qs ?? "").get("acknowledge_layout_issues");
       res.writeHead(200, { "Content-Type": "application/pdf" });
       return res.end(PDF_BYTES);
     }
@@ -251,6 +259,11 @@ check("acknowledge_layout_issues:true exports the draft (via invoke — flag sur
   assert.equal(firstJson(q2).refused, undefined);
   assert.equal(counts.pdf, 1, "artifact fetched exactly once");
   assert.deepEqual(readFileSync(OUT), PDF_BYTES, "the sheet really landed on disk");
+  // S11/item 4: the escape must be FORWARDED, not merely honoured MCP-side —
+  // a call that never sent the flag at all would also "proceed" once the
+  // gate reads a stale cert, so the property worth pinning is that the wire
+  // actually carries the acknowledgement, not just that export succeeded.
+  assert.equal(lastPdfQuery, "true", "acknowledge_layout_issues reached the export route");
 });
 
 rmSync(OUT, { force: true });
@@ -261,6 +274,8 @@ check("a certified clean sheet exports plainly", () => {
   assert.equal(firstJson(q3).refused, undefined);
   assert.equal(counts.pdf, 2);
   assert.deepEqual(readFileSync(OUT), PDF_BYTES);
+  // exportArgs never sets the flag — it must not be defaulted onto the wire.
+  assert.equal(lastPdfQuery, null, "no acknowledge_layout_issues query param when the flag was never passed");
 });
 
 // ─── 4. unreadable certificate fails CLOSED ─────────────────────────────────

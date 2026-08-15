@@ -186,6 +186,20 @@ pub struct Checkpoint {
 
     /// Tags for categorization
     pub tags: Vec<String>,
+
+    /// This checkpoint CLOSED the previously-open intent with mutating work
+    /// under it that was never re-examined (`verify_part`/`verify_claim`),
+    /// via the MCP dispatch gate's explicit `skip_verification: true` escape
+    /// (`roshera-mcp/src/gates.ts`, gate 6 — verification scope). The escape
+    /// is deliberately ON THE RECORD rather than a silent omission: before
+    /// this field existed the flag was read by the gate, decided the call,
+    /// and then vanished — true only in the MCP process's RAM, never in the
+    /// durable timeline the checkpoint itself lives in (2026-08-14 audit,
+    /// finding S3/S11). `#[serde(default)]` keeps every checkpoint recorded
+    /// before this field existed deserializable, reading as `false` — the
+    /// honest answer, since the escape did not exist to have been taken.
+    #[serde(default)]
+    pub skip_verification: bool,
 }
 
 /// Author of an event

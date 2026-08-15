@@ -8214,6 +8214,69 @@ async fn checkpoint_accepts_branch_and_returns_identity() {
     );
 }
 
+/// 2026-08-15 item 4 (audit S3/S11): `skip_verification` used to be read by
+/// the MCP dispatch gate and then discarded — true only in the MCP process's
+/// RAM, never on the durable timeline the checkpoint itself lives in. This
+/// pins the fix at the REST boundary, independent of the MCP client: the
+/// flag is accepted on the request, echoed in the create response, and —
+/// the actually load-bearing property — still readable from a SEPARATE,
+/// LATER `GET /api/timeline/checkpoints` call, proving it is a durable
+/// record and not merely something the create response happened to echo.
+#[tokio::test]
+async fn checkpoint_skip_verification_is_forwarded_and_persisted() {
+    let state = make_test_state().await;
+
+    let (status, body) = dispatch(
+        &state,
+        json_post(
+            "/api/timeline/checkpoint",
+            json!({ "name": "relief slot 6 wide x 3 deep", "skip_verification": true }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "body = {body}");
+    assert_eq!(
+        body["skip_verification"],
+        json!(true),
+        "the create response must echo the recorded flag; body = {body}"
+    );
+    let checkpoint_id = body["id"].as_str().expect("checkpoint id").to_string();
+
+    // A SEPARATE read — not the create response — must still show it.
+    let (ls, lbody) = dispatch(&state, json_get("/api/timeline/checkpoints")).await;
+    assert_eq!(ls, StatusCode::OK);
+    let row = lbody
+        .as_array()
+        .expect("checkpoints array")
+        .iter()
+        .find(|c| c["id"].as_str() == Some(checkpoint_id.as_str()))
+        .unwrap_or_else(|| panic!("the created checkpoint must be listed; body = {lbody}"));
+    assert_eq!(
+        row["skip_verification"],
+        json!(true),
+        "a durable, later GET must still report the escape was taken; row = {row}"
+    );
+
+    // An ordinary checkpoint (the flag omitted, exactly what every existing
+    // caller sends) must record `false`, never `null` or an absent key —
+    // ambiguity here would be a confidently-wrong provenance record, the
+    // exact failure class this repo treats as worse than absence.
+    let (status2, body2) = dispatch(
+        &state,
+        json_post(
+            "/api/timeline/checkpoint",
+            json!({ "name": "counterbore ø14 x 6 deep, top face" }),
+        ),
+    )
+    .await;
+    assert_eq!(status2, StatusCode::CREATED, "body = {body2}");
+    assert_eq!(
+        body2["skip_verification"],
+        json!(false),
+        "an ordinary checkpoint must record skip_verification: false, not null/absent; body = {body2}"
+    );
+}
+
 // =====================================================================
 // Durability disclosure on agent-facing reads (#39 follow-up)
 // =====================================================================

@@ -229,14 +229,42 @@ const READ_ONLY = new Set<string>([
 ]);
 
 /**
- * Solid-mutating verbs the intent gate covers: everything that creates or
- * reshapes a solid — the calls the policy's "checkpoint before the first
- * mutating call of every feature" was written about. Sketch construction
- * (psketch_begin/add_entity/constrain/solve) is deliberately NOT gated: the
- * feature materialises at the extrude/revolve, and nagging during sketch
- * iteration would teach the model to open garbage checkpoints. Assembly and
- * label tools are out of scope here (assembly placement policy is mid-flight
- * in the audit-fix wave, audit §6).
+ * Solid-mutating verbs the intent gate covers: everything that creates,
+ * reshapes, or destroys a solid — the calls the policy's "checkpoint before
+ * the first mutating call of every feature" was written about. Sketch
+ * construction (psketch_begin/add_entity/constrain/solve) is deliberately
+ * NOT gated: the feature materialises at the extrude/revolve, and nagging
+ * during sketch iteration would teach the model to open garbage checkpoints.
+ * Assembly and label tools are out of scope here (assembly placement policy
+ * is mid-flight in the audit-fix wave, audit §6).
+ *
+ * `timeline_mould`, `delete_part`, `clear_parts` (audit S6/S7): all three
+ * change the live model and were previously invisible to this set.
+ * `timeline_mould` "edits a recorded parameter and re-derives the model" —
+ * geometry changes exactly as a create/reshape op's does, and its absence
+ * here was the audit's own exploit path (checkpoint → build → verify_part →
+ * mould the just-verified thing → close the NEXT checkpoint, which used to
+ * pass reporting the mould's target as verified when it is not — see gate 6's
+ * `intentUnverified` bookkeeping below, which keys off THIS set, so adding a
+ * tool here both requires an intent to run it AND arms gate 6 for it, closing
+ * both halves of S6/S7 with one list membership). `delete_part`/`clear_parts`
+ * change the live model with no gate of their own: `cad_program` guards them
+ * behind `allow_destructive`, but only for ops it validates and dispatches
+ * itself — a direct call or `invoke` reached neither that guard nor this one.
+ * The `BASE_REFS` half of `timeline_mould` (a pre-flight unsound-base check)
+ * is deliberately NOT added: a mould targets a recorded EVENT, not a live
+ * solid uuid/part_id, and `BASE_REFS`'s extractors assume the latter — left
+ * out per the brief rather than forcing a mismatched shape.
+ *
+ * Deliberately NOT gated, and this is the actual decision the audit found
+ * undocumented (S7): `timeline_undo`, `timeline_redo`, `timeline_switch`,
+ * `timeline_merge`. These are history NAVIGATION, not new feature work —
+ * requiring a declared intent to undo a mistake would mean opening a
+ * checkpoint in order to fix a checkpoint, which defeats the point of undo
+ * as a low-friction correction. `clear_timeline` is excluded from gate 6 for
+ * the same reason (see its own module-doc note); it is not in this set
+ * either, since it destroys the branch's events rather than reshaping a
+ * solid.
  */
 const MUTATES_SOLIDS = new Set<string>([
   "create_box",
@@ -256,6 +284,9 @@ const MUTATES_SOLIDS = new Set<string>([
   "psketch_extrude",
   "psketch_revolve",
   "import_step",
+  "timeline_mould",
+  "delete_part",
+  "clear_parts",
 ]);
 
 /**

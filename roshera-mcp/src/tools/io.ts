@@ -198,8 +198,18 @@ export function registerIoTools(server: ToolHost) {
         .string()
         .optional()
         .describe("absolute destination path; overrides file_name/Desktop"),
-      // Read by the dispatch gate only (gates.ts); never forwarded to the
-      // backend — the handler below deliberately ignores it.
+      // Read by the dispatch gate (gates.ts) AND forwarded to the backend as
+      // a query parameter (item 5, 2026-08-15: `export_svg`/`export_pdf`/
+      // `export_dxf` in `drawing_mgr.rs` gained their own live
+      // `refuse_unsound_sheet` gate, matching `sheetExportGate` here fact for
+      // fact). Forwarding it is what makes this an escape ON THE RECORD
+      // rather than an MCP-process-local skip: the server-side gate is the
+      // one a raw HTTP client would hit too, and it needs the same
+      // acknowledgement this tool's caller already gave. Only sent as
+      // `?acknowledge_layout_issues=true` when the caller actually passed
+      // `true` — never defaulted onto a call that omitted it (same
+      // discipline `ACK_UNSOUND`'s doc comment states for the 9 mutating
+      // routes).
       acknowledge_layout_issues: z
         .boolean()
         .optional()
@@ -209,11 +219,16 @@ export function registerIoTools(server: ToolHost) {
             "Never bypasses stale/dangling facts.",
         ),
     },
-    async ({ drawing_id, format, file_name, save_path }) => {
+    async ({ drawing_id, format, file_name, save_path, acknowledge_layout_issues }) => {
       try {
         const { join } = await import("node:path");
         const dest = save_path ?? join(await defaultSaveDir(), file_name);
-        const bytes = await saveBinary(`/api/drawings/${drawing_id}/${format}`, dest);
+        const qs =
+          acknowledge_layout_issues === true ? "?acknowledge_layout_issues=true" : "";
+        const bytes = await saveBinary(
+          `/api/drawings/${drawing_id}/${format}${qs}`,
+          dest,
+        );
         return ok({ saved_to: dest, bytes, format });
       } catch (e) {
         return fail(e);

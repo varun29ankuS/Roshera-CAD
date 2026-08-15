@@ -463,8 +463,14 @@ export function registerTimelineTools(server: ToolHost) {
       // checked with verify_part / verify_claim, this call is refused typed.
       // This flag is the one way through, and it is deliberately an ARGUMENT
       // rather than an omission: the intent then closes unverified ON THE
-      // RECORD. Read by the gate before dispatch; never forwarded to the
-      // backend, which has no notion of it.
+      // RECORD. Read by the gate before dispatch, AND forwarded to the
+      // backend (2026-08-15, item 4 — S3/S11's "true only in the MCP
+      // process's RAM" finding): `POST /api/timeline/checkpoint` now
+      // persists it onto the created checkpoint
+      // (`timeline_engine::Checkpoint::skip_verification`), so the escape
+      // survives a restart and is retrievable via timeline_checkpoints —
+      // not merely a permitted call. Only sent as `true` when the caller
+      // actually passed it — never defaulted onto a call that omitted it.
       skip_verification: z
         .boolean()
         .optional()
@@ -474,12 +480,13 @@ export function registerTimelineTools(server: ToolHost) {
             "verification gate explicitly instead of silently",
         ),
     },
-    async ({ name, description, branch }) => {
+    async ({ name, description, branch, skip_verification }) => {
       try {
         const r = await api("POST", "/api/timeline/checkpoint", {
           name,
           description,
           branch,
+          ...(skip_verification === true ? { skip_verification: true } : {}),
         });
         // NOTEBOOK MIRROR (audit 2026-08-01 §5): the policy used to ask for a
         // separate blackboard_add_entry carrying the same intent — a two-call

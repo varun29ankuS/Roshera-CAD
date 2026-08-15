@@ -129,6 +129,12 @@ const stub = http.createServer((req, res) => {
       counts.checkpoint++;
       return send({ id: "cp-1", name: JSON.parse(body || "{}").name });
     }
+    if (req.method === "POST" && url === "/api/timeline/undo") {
+      // timeline_undo is deliberately NOT in MUTATES_SOLIDS (history
+      // navigation, not a new feature) — this route only needs to answer
+      // honestly enough for the "not gated" check below to read valid JSON.
+      return send({ success: false, can_undo: false });
+    }
     if (req.method === "POST" && url === "/api/blackboard/entries") {
       counts.blackboard++;
       return send({
@@ -157,6 +163,10 @@ process.env.ROSHERA_MCP_PERCEPTION_TIMEOUT_MS = "200";
 
 const { buildTable } = await import(
   pathToFileURL(join(HERE, ".build", "surface.js")).href
+);
+
+const { resetSessionGates } = await import(
+  pathToFileURL(join(HERE, ".build", "gates.js")).href
 );
 
 const table = buildTable();
@@ -394,6 +404,50 @@ check("once both fetches answer again, the SAME base ref proceeds with no marker
   assert.equal(j.refused, undefined);
   assert.equal(j.gate_preflight, undefined, "absent marker means the gate ran — must stay true");
   assert.equal(j.gate_preflight_gaps, undefined);
+});
+
+// ─── S6/S7 — timeline_mould, delete_part, clear_parts require an open intent ─
+//
+// Audit S6: `timeline_mould` "edits a recorded parameter and re-derives the
+// model" — it changes geometry, but was in neither MUTATES_SOLIDS nor
+// BASE_REFS, so the intent gate never saw it (the gate-6-arming half of this
+// exploit is reproduced end-to-end in verification_scope_gate.test.mjs).
+// Audit S7: `delete_part`/`clear_parts` change the live model with no intent
+// gate; `cad_program`'s `allow_destructive` guard only covers ops routed
+// through a cad_program batch (phase-1 validation, before any dispatch) —
+// never a direct call or `invoke`, which is exactly this gate's job.
+
+resetSessionGates();
+
+const mouldNoIntent = await call("timeline_mould", {
+  target_event_id: "11111111-2222-4333-8444-555555555555",
+  parameter: "height",
+  value: 400,
+});
+check("timeline_mould with no open intent is refused (gate: intent)", () => {
+  assert.ok(isRefusal(mouldNoIntent, "intent"));
+  assert.equal(mouldNoIntent.isError, true);
+});
+
+const deleteNoIntent = await call("delete_part", { part_id: 1 });
+check("delete_part with no open intent is refused (gate: intent)", () => {
+  assert.ok(isRefusal(deleteNoIntent, "intent"));
+  assert.equal(deleteNoIntent.isError, true);
+});
+
+const clearNoIntent = await call("clear_parts", {});
+check("clear_parts with no open intent is refused (gate: intent)", () => {
+  assert.ok(isRefusal(clearNoIntent, "intent"));
+  assert.equal(clearNoIntent.isError, true);
+});
+
+// `timeline_undo`/`timeline_redo`/`timeline_switch`/`timeline_merge` are
+// DELIBERATELY not gated (documented decision, gates.ts) — history
+// navigation, not a new feature. Pinned here so a future change to that
+// decision has to touch this test, not just the comment.
+const undoNoIntent = await call("timeline_undo", {});
+check("timeline_undo is deliberately NOT gated — no open intent required", () => {
+  assert.notEqual(firstJson(undoNoIntent).refused, true);
 });
 
 stub.close();

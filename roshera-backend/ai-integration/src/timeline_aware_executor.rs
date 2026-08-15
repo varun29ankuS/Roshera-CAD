@@ -339,6 +339,8 @@ impl TimelineAwareExecutor {
                     BranchId::main(),
                     Author::System,
                     vec![], // No specific entities - checkpoint everything
+                    false,  // an automatic checkpoint never went through the MCP
+                            // gate's skip_verification escape — there is nothing to record.
                 )
                 .await;
 

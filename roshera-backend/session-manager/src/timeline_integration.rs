@@ -206,6 +206,7 @@ impl TimelineIntegration {
                 branch_id,
                 Author::System,
                 vec![format!("session:{}", session_id.0)],
+                false, // this path has no MCP gate 6 escape to record
             )
             .await?;
 

@@ -631,6 +631,13 @@ impl Timeline {
     /// for deciding whether checkpointing an empty branch is sensible
     /// (we don't reject it — system / scheduled checkpoints may legitimately
     /// fire before any events have arrived).
+    ///
+    /// `skip_verification` records whether THIS checkpoint closed the
+    /// previous intent via the MCP gate's explicit escape (see
+    /// [`Checkpoint::skip_verification`]'s doc comment) — every caller other
+    /// than the REST handler that actually reads the request flag passes
+    /// `false`, which is the correct answer for an auto/system checkpoint or
+    /// a test fixture that never went through gate 6 at all.
     pub async fn create_checkpoint(
         &self,
         name: String,
@@ -638,6 +645,7 @@ impl Timeline {
         branch_id: BranchId,
         author: Author,
         tags: Vec<String>,
+        skip_verification: bool,
     ) -> TimelineResult<CheckpointId> {
         let branch_events = self
             .branch_events
@@ -661,6 +669,7 @@ impl Timeline {
             author,
             timestamp: Utc::now(),
             tags,
+            skip_verification,
         };
 
         self.checkpoints.insert(checkpoint.id, checkpoint.clone());
@@ -2556,6 +2565,7 @@ mod tests {
                 branch_id,
                 Author::System,
                 Vec::new(),
+                false,
             )
             .await
             .unwrap();
@@ -2582,6 +2592,7 @@ mod tests {
                 BranchId::main(),
                 Author::System,
                 vec!["intent".to_string()],
+                false,
             )
             .await
             .unwrap();
@@ -2599,6 +2610,10 @@ mod tests {
         assert_eq!(back.branch_id, persisted.branch_id);
         assert_eq!(back.timestamp, persisted.timestamp);
         assert_eq!(back.tags, persisted.tags);
+        assert_eq!(
+            back.skip_verification, persisted.skip_verification,
+            "the gate-6 escape record must survive restart exactly as every other field does"
+        );
 
         let on_branch = restored.get_branch_checkpoints(&BranchId::main());
         assert_eq!(
@@ -2624,6 +2639,11 @@ mod tests {
         });
         let cp: Checkpoint = serde_json::from_value(legacy).unwrap();
         assert_eq!(cp.branch_id, BranchId::main());
+        // Same discipline for `skip_verification` (2026-08-15, item 4): a row
+        // persisted before the field existed must deserialize, defaulting to
+        // `false` — the honest reading, since the gate-6 escape did not exist
+        // to have been taken when this row was written.
+        assert_eq!(cp.skip_verification, false);
     }
 
     // ---------------------------------------------------------------

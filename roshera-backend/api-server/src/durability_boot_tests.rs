@@ -2174,7 +2174,10 @@ async fn checkpoints_persist_under_the_request_bound_document() {
         &state,
         post_bound(
             "/api/timeline/checkpoint",
-            json!({ "name": "bore D20 through the 40 mm plate, centred" }),
+            json!({
+                "name": "bore D20 through the 40 mm plate, centred",
+                "skip_verification": true,
+            }),
             &doc_a,
         ),
     )
@@ -2194,6 +2197,17 @@ async fn checkpoints_persist_under_the_request_bound_document() {
         1,
         "a checkpoint declared under a request bound to {doc_a} must be \
          persisted under {doc_a}"
+    );
+    // 2026-08-15 item 4 (audit S3/S11): read the LITERAL persisted blob, not
+    // an in-memory struct — `skip_verification` must be inside the opaque
+    // `data` JSON `CheckpointRecord` actually wrote to the durable store, or
+    // the "survives a restart" claim in the doc comments is unproven.
+    assert_eq!(
+        in_a[0].data["skip_verification"],
+        json!(true),
+        "the escape must be inside the durable blob itself, not merely the \
+         in-memory Checkpoint the create request returned; record = {:?}",
+        in_a[0].data
     );
 
     let in_global = db

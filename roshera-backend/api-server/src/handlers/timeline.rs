@@ -2949,6 +2949,7 @@ pub async fn create_checkpoint(
                 branch,
                 author_from_auth_info(&auth_info),
                 Vec::new(), // No tags for now
+                request.skip_verification,
             )
             .await
             .map_err(|e| match e {
@@ -2989,6 +2990,7 @@ pub async fn create_checkpoint(
             id: checkpoint.id.to_string(),
             name,
             branch: branch_ref_string(&branch),
+            skip_verification: checkpoint.skip_verification,
         }),
     ))
 }
@@ -3011,6 +3013,18 @@ pub struct CreateCheckpointRequest {
     /// `"main"` (default) or a branch UUIDv4 — must already exist.
     #[serde(default)]
     pub branch: Option<String>,
+    /// This checkpoint closes the previously-open intent with unverified
+    /// mutating work under it, via `roshera-mcp/src/gates.ts`'s gate-6
+    /// escape hatch. Read and forwarded ONLY by the MCP `timeline_checkpoint`
+    /// tool when the caller explicitly passed `skip_verification: true` —
+    /// never defaulted. `#[serde(default)]` keeps a raw HTTP client (or the
+    /// frontend, which has no notion of this flag) working unchanged: an
+    /// absent flag is `false`, the same as before this field existed.
+    /// Recorded verbatim onto the created [`timeline_engine::Checkpoint`]
+    /// (2026-08-15, item 4 — closes S3/S11's "escape leaves no durable
+    /// record" finding for gate 6).
+    #[serde(default)]
+    pub skip_verification: bool,
 }
 
 /// `POST /api/timeline/checkpoint` response: the created checkpoint's
@@ -3025,6 +3039,10 @@ pub struct CheckpointCreatedView {
     pub name: String,
     /// Branch whose event range was captured.
     pub branch: String,
+    /// Echo of the recorded `skip_verification` — the caller sees, in the
+    /// same response, that its escape from gate 6 is now durable rather
+    /// than only having been true in the MCP process's memory.
+    pub skip_verification: bool,
 }
 
 // Helper functions to convert DTOs
@@ -4215,6 +4233,7 @@ fn checkpoint_summary(c: timeline_engine::Checkpoint) -> CheckpointSummary {
         author: author_label(&c.author),
         timestamp: c.timestamp.to_rfc3339(),
         tags: c.tags,
+        skip_verification: c.skip_verification,
     }
 }
 
@@ -4683,6 +4702,15 @@ pub struct CheckpointSummary {
     pub author: String,
     pub timestamp: String,
     pub tags: Vec<String>,
+    /// This checkpoint closed the previous intent with unverified mutating
+    /// work under it via the MCP gate's explicit `skip_verification: true`
+    /// escape (see [`timeline_engine::Checkpoint::skip_verification`]).
+    /// `false` for every checkpoint recorded before this field existed —
+    /// the honest reading, since the escape did not exist to have been
+    /// taken. Makes the escape genuinely RETRIEVABLE, not merely accepted:
+    /// an agent (or a human reviewing the timeline) can list checkpoints and
+    /// see which ones closed unverified work on purpose.
+    pub skip_verification: bool,
 }
 
 /// The wire spelling for a branch reference: the well-known label
@@ -4749,6 +4777,7 @@ pub async fn list_checkpoints(State(state): State<AppState>) -> Json<Vec<Checkpo
             author: author_label(&c.author),
             timestamp: c.timestamp.to_rfc3339(),
             tags: c.tags,
+            skip_verification: c.skip_verification,
         })
         .collect();
     fill_covers(&mut out);
@@ -5536,6 +5565,7 @@ mod checkpoint_name_gate_tests {
             author: "System".to_string(),
             timestamp: "2026-08-01T00:00:00Z".to_string(),
             tags: vec![],
+            skip_verification: false,
         };
         let v = serde_json::to_value(&summary).expect("serializes");
         assert_eq!(v["branch_id"], "main");
@@ -5555,6 +5585,7 @@ mod checkpoint_name_gate_tests {
             author: "user".to_string(),
             timestamp: "2026-08-08T00:00:00Z".to_string(),
             tags: vec![],
+            skip_verification: false,
         }
     }
 
