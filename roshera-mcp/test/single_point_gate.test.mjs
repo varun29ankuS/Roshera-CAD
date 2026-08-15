@@ -38,6 +38,18 @@
  *      single_point_cumulative), with a further filler call NOT unblocking
  *      it and the refusal read fresh every time, never cache-replayed;
  *   9. the cumulative counter is per sketch, same as the run counter.
+ *
+ * M5 (2026-08-15 final review) — the doc comment above `pointCumulative`
+ * promises the total is "NEVER reset by an intervening call" and "a
+ * permanent fact about this sketch's history". The 64-distinct-sketch bound
+ * was implemented as a wholesale `.clear()` that runs BEFORE the increment
+ * on every successful single-point call once the map is full — so reaching
+ * the 64th distinct sketch key wipes every sketch's total, not just makes
+ * room for one more:
+ *   10. a sketch already at its cumulative cap (32) survives 63 OTHER
+ *       sketches being added around it (map reaches exactly 64 distinct
+ *       keys) — its next point must still be refused, proving its 32-point
+ *       history was not silently zeroed by the bound.
  */
 
 import assert from "node:assert/strict";
@@ -323,6 +335,67 @@ check(
   "a fresh sketch is unaffected by SK_C's cumulative cap — counters are per sketch",
   () => {
     assert.equal(firstJson(dFirst).refused, undefined);
+  },
+);
+
+// ─── 10. the 64-distinct-sketch bound must EVICT, not wipe the map (M5) ─────
+//
+// Build a victim sketch to its cumulative cap FIRST (while the map is
+// nearly empty), then surround it with 63 other distinct one-point sketches
+// so the map reaches exactly 64 entries with the victim planted safely in
+// the MIDDLE of the insertion order (neither first — which a correct
+// evict-the-oldest fix is allowed to reclaim — nor last). One more distinct
+// sketch then pushes the map over the bound. A wholesale `.clear()` loses
+// the victim's total; evicting only the oldest key does not.
+
+const SK_VICTIM = "eeeeeeee-5555-4555-8555-555555555555";
+
+// 32 filler sketches BEFORE the victim — these become the oldest entries,
+// the only ones a correct fix is entitled to reclaim.
+for (let i = 0; i < 32; i++) {
+  const r = await addPoint(`ffffffff-0000-4000-8000-${String(i).padStart(12, "0")}`, 0, 0);
+  assert.equal(firstJson(r).refused, undefined, `pre-victim filler ${i} passes`);
+}
+
+// Victim reaches its cumulative cap: 4 bursts of 8 with a genuine filler
+// (list_parts — NOT a single-point call) between bursts, exactly the
+// technique that isolated the cumulative condition in section 8 above.
+for (let burst = 0; burst < 4; burst++) {
+  for (let i = 0; i < 8; i++) {
+    const r = await addPoint(SK_VICTIM, burst * 10 + i, 0);
+    assert.equal(
+      firstJson(r).refused,
+      undefined,
+      `victim burst ${burst} point ${i} passes`,
+    );
+  }
+  await call("list_parts", {});
+}
+
+// 31 MORE filler sketches AFTER the victim — brings the map to exactly 64
+// distinct keys (32 before + 1 victim + 31 after), with the victim planted
+// safely in the middle of insertion order.
+for (let i = 0; i < 31; i++) {
+  const r = await addPoint(`ffffffff-1111-4111-8111-${String(i).padStart(12, "0")}`, 0, 0);
+  assert.equal(firstJson(r).refused, undefined, `post-victim filler ${i} passes`);
+}
+
+// One more distinct sketch key: the map is at exactly 64 before this call,
+// so this is the call that trips the bound.
+const SK_TRIGGER = "99999999-9999-4999-8999-999999999999";
+await addPoint(SK_TRIGGER, 0, 0);
+
+// The victim was at its cap (32) and never touched again — if its total
+// survived the bound being hit, its very next point is still refused.
+const victimAfter = await addPoint(SK_VICTIM, 999, 999);
+check(
+  "a sketch already at its cumulative cap survives the 64-distinct-sketch bound — the bound evicts, it does not wipe",
+  () => {
+    assert.ok(
+      isRefusal(victimAfter, "single_point_cumulative"),
+      "the victim's 32-point cumulative history must not be silently zeroed " +
+        "by 63 unrelated sketches filling the map around it",
+    );
   },
 );
 

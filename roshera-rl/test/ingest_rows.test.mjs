@@ -355,6 +355,50 @@ check("a trajectory whose provenance is absent still produces rows but with attr
   assert.equal(r.lineageEdges.length, 2, "lineage derivation runs the same regardless of attributable");
 });
 
+// ─── unverified_mutations (M6, 2026-08-15 final review) ───────────────────
+//
+// `trajectory.mjs`'s `close()` has always written this key into every
+// terminal record; this fixture predates that (it started from a real saved
+// trajectory, see the module docstring), so its terminal line carries no
+// such key at all — exactly the population the always-present default in
+// `episodeRowFrom` exists for, mirroring `model_scope`'s own convention.
+
+check("a trajectory whose terminal carries no unverified_mutations key defaults to a stated absence, never a fabricated zero", () => {
+  const r = rowsFromTrajectory(completeText, { path: completePath });
+  assert.deepEqual(r.episode.unverified_mutations, {
+    absent: "the terminal record carried no unverified_mutations reading",
+  });
+});
+
+check("a terminal's real {count, tools} unverified_mutations reading is carried through unchanged", () => {
+  const lines = completeText.trim().split("\n");
+  const terminal = JSON.parse(lines[lines.length - 1]);
+  terminal.unverified_mutations = { count: 2, tools: ["boolean_subtract", "create_cylinder"] };
+  lines[lines.length - 1] = JSON.stringify(terminal);
+  const r = rowsFromTrajectory(lines.join("\n") + "\n", { path: "unverified.jsonl" });
+  assert.deepEqual(r.episode.unverified_mutations, { count: 2, tools: ["boolean_subtract", "create_cylinder"] });
+});
+
+check("a terminal's own stated absence (e.g. M2's composite-dispatch case) is carried through, not overwritten by the default", () => {
+  const lines = completeText.trim().split("\n");
+  const terminal = JSON.parse(lines[lines.length - 1]);
+  const reason = "the step log contains a successful 'cad_program' dispatch — a composite call";
+  terminal.unverified_mutations = { absent: reason };
+  lines[lines.length - 1] = JSON.stringify(terminal);
+  const r = rowsFromTrajectory(lines.join("\n") + "\n", { path: "composite-absent.jsonl" });
+  assert.equal(r.episode.unverified_mutations.absent, reason);
+});
+
+check("a terminal's genuinely clean {count: 0, tools: []} reading is NOT replaced by the default absence", () => {
+  const lines = completeText.trim().split("\n");
+  const terminal = JSON.parse(lines[lines.length - 1]);
+  terminal.unverified_mutations = { count: 0, tools: [] };
+  lines[lines.length - 1] = JSON.stringify(terminal);
+  const r = rowsFromTrajectory(lines.join("\n") + "\n", { path: "clean.jsonl" });
+  assert.deepEqual(r.episode.unverified_mutations, { count: 0, tools: [] },
+    "a positive statement that nothing was left unverified must not collapse into the absent-key default");
+});
+
 // ─── recipe_ref stated absence (every non-COMPLETED outcome) ──────────────
 // This is the COMMON case for any episode that never reached terminal
 // scoring, not an edge case: `unscoredFor` (lib/episode.mjs:94-109) is the

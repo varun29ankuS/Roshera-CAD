@@ -209,6 +209,17 @@ function episodeRowFrom({ path, header, terminal, runId, attributable, sourceDig
     // always-present convention trajectory.mjs's close() documents.
     error: terminal.error ?? null,
     model_scope: terminal.model_scope ?? { absent: "the terminal record carried no model_scope" },
+    // M6 (2026-08-15 final review): `trajectory.mjs`'s `close()` has always
+    // written `unverified_mutations` into every terminal record (item 7) —
+    // this column is the other half, mirroring `model_scope` immediately
+    // above field-for-field: same always-present convention, same stated
+    // absence with a reason rather than a dropped key, for the same class of
+    // caller (a `Trajectory` built outside `episode.mjs`'s own drive loop,
+    // e.g. `runner.mjs`'s `setupFailedBeforeEpisode`, where no step history
+    // ever existed to derive it from).
+    unverified_mutations: terminal.unverified_mutations ?? {
+      absent: "the terminal record carried no unverified_mutations reading",
+    },
     source_digest: sourceDigest,
   };
 }

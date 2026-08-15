@@ -149,8 +149,8 @@ async function upsertEpisode(client, episode) {
   await client.query(
     `INSERT INTO rl_episode
        (episode_id, run_id, path, task_id, seed, started_at, outcome, attributable,
-        reward_final, tokens, wall_ms, error, model_scope, source_digest, ingested_at)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14, now())
+        reward_final, tokens, wall_ms, error, model_scope, unverified_mutations, source_digest, ingested_at)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15, now())
      ON CONFLICT (episode_id) DO UPDATE SET
        run_id = EXCLUDED.run_id,
        path = EXCLUDED.path,
@@ -164,13 +164,14 @@ async function upsertEpisode(client, episode) {
        wall_ms = EXCLUDED.wall_ms,
        error = EXCLUDED.error,
        model_scope = EXCLUDED.model_scope,
+       unverified_mutations = EXCLUDED.unverified_mutations,
        source_digest = EXCLUDED.source_digest,
        ingested_at = now()`,
     [
       episode.episode_id, episode.run_id, nn(episode.path), episode.task_id, nn(episode.seed),
       nn(episode.started_at), episode.outcome, episode.attributable, jsonb(episode.reward_final),
       nn(episode.tokens), nn(episode.wall_ms), nn(episode.error), jsonb(episode.model_scope),
-      episode.source_digest,
+      jsonb(episode.unverified_mutations), episode.source_digest,
     ],
   );
 }

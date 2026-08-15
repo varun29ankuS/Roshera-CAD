@@ -115,7 +115,12 @@
  *      naming exactly what was built and the two verification verbs. ONE
  *      escape, and it is explicit: `skip_verification: true` on the closing
  *      checkpoint. The constraint is therefore escapable but NEVER silent —
- *      the escape is a recorded argument in the call, not an omission.
+ *      the escape is a recorded argument in the call, not an omission. The
+ *      durable record only ever carries `skip_verification: true` when the
+ *      gate would actually have refused without it (L1, 2026-08-15 final
+ *      review, `gate6WouldRefuse` below) — a caller passing the flag on a
+ *      checkpoint with nothing unverified under it gets a normal close, not
+ *      a persisted claim that an escape was taken when none was.
  *      `clear_timeline` is deliberately OUT of scope: it wipes the ledger the
  *      work lives in, so nagging to verify a part whose history is being
  *      destroyed is noise, not a constraint. Live session state, never cached
@@ -273,6 +278,24 @@ const READ_ONLY = new Set<string>([
  * is deliberately NOT added: a mould targets a recorded EVENT, not a live
  * solid uuid/part_id, and `BASE_REFS`'s extractors assume the latter — left
  * out per the brief rather than forcing a mismatched shape.
+ *
+ * `clear_parts` is membership WITHOUT the "closes both halves" rule above
+ * (M1, 2026-08-15 final review): it still requires an open intent to run
+ * (the intent-gate half), but its own successful dispatch is handled as a
+ * SEPARATE case in `recordDispatchOutcome`, not folded into the generic
+ * arming branch below. `clear_parts` deletes EVERY part — after it succeeds
+ * there is no live part_id left for `verify_part` to name and no geometry
+ * left for `verify_claim` to measure, so arming gate 6 for it (or leaving
+ * any earlier unverified entry standing) would hand back a refusal whose
+ * only stated remedy is impossible to perform. Same argument `clear_timeline`
+ * already gets for the same reason — it destroys the work rather than
+ * reshaping it — applied to the parts it destroys rather than the ledger.
+ * Unlike `clear_timeline`, `clear_parts` does NOT close the open intent
+ * itself: the design intent survives; only the geometry built under it does
+ * not, and the caller may still build fresh work under the same checkpoint.
+ * `delete_part` gets no such exception — it removes ONE part, so any OTHER
+ * unverified work from this intent can still be verified afterward, and
+ * `verify_part` on a different, still-live part remains a real remedy.
  *
  * Deliberately NOT gated, and this is the actual decision the audit found
  * undocumented (S7): `timeline_undo`, `timeline_redo`, `timeline_switch`,
@@ -507,6 +530,29 @@ export function currentOpenIntent(): { name: string; turn: number } | null {
   return openIntent;
 }
 
+/**
+ * Whether gate 6 would actually refuse a checkpoint close RIGHT NOW — i.e.
+ * whether `skip_verification: true` on the next `timeline_checkpoint` call
+ * would be escaping a real condition rather than a vacuous one.
+ *
+ * L1 (2026-08-15 final review): `timeline_checkpoint`'s handler used to
+ * forward `skip_verification: true` to the backend — and the backend
+ * persists it verbatim onto the durable `Checkpoint` — whenever the CALLER
+ * passed it, with no regard for whether an open intent actually carried any
+ * unverified mutating work. Gate 6 is TS-only (see the per-gate table in
+ * this module's own doc) — nothing on the backend re-evaluates "was there
+ * really something to skip" the way gate 3's unsound-base check does for
+ * `acknowledge_unsound`, so there is no defence-in-depth reason to forward
+ * the flag unconditionally the way that ack is. Persisting it anyway would
+ * make the durable record assert an escape that was never taken — reading
+ * as "verification was skipped" on a checkpoint that had nothing to verify.
+ * The handler reads this before deciding whether to put the flag on the
+ * wire at all.
+ */
+export function gate6WouldRefuse(): boolean {
+  return openIntent !== null && intentUnverified.count > 0;
+}
+
 /** Hash key for the identical-call test: tool name + canonical (key-sorted,
  *  compact) JSON of the SDK-parsed args — defaults applied, so the direct
  *  path and the invoke path produce the same key for the same call. */
@@ -548,9 +594,11 @@ const SINGLE_POINT_CUMULATIVE_MAX = 32;
  *  cost of the single-point calls already made was already paid, and is
  *  not undone by later good behaviour — the cumulative total is a
  *  permanent fact about this sketch's history, not a debt later bulk work
- *  forgives. Cleared only by the same 64-sketch wholesale bound `pointRuns`
- *  uses (independently applied to this map's own size) and by
- *  resetSessionGates() (test seam). */
+ *  forgives. Bounded at 64 distinct sketches like `pointRuns`, but by
+ *  EVICTING the single oldest entry rather than clearing the map — a
+ *  wholesale clear would zero every OTHER sketch's total too, which this
+ *  map's "permanent fact" promise cannot survive (M5, 2026-08-15 final
+ *  review). resetSessionGates() (test seam) is the only wholesale clear. */
 const pointCumulative = new Map<string, number>();
 
 /**
@@ -1250,7 +1298,20 @@ export function recordDispatchOutcome(
   } else if (result?.isError !== true) {
     if (pointRuns.size >= 64) pointRuns.clear();
     pointRuns.set(spKey, (pointRuns.get(spKey) ?? 0) + 1);
-    if (pointCumulative.size >= 64) pointCumulative.clear();
+    // M5 (2026-08-15 final review): this bound must EVICT, not wipe. A
+    // wholesale clear() here would zero every sketch's cumulative total —
+    // including the one this very call is about to increment — the moment a
+    // 64th distinct sketch shows up, which contradicts this map's own doc
+    // comment ("NEVER reset by an intervening call", "a permanent fact about
+    // this sketch's history"). Evicting only the single oldest key (Map
+    // preserves insertion order; re-`set`ting an existing key does not move
+    // it) keeps that promise true for every sketch except the one about to
+    // fall off a 64-deep bound — the same trade `refusalCache`'s FIFO already
+    // makes, not a new one.
+    if (!pointCumulative.has(spKey) && pointCumulative.size >= 64) {
+      const oldest = pointCumulative.keys().next().value;
+      if (oldest !== undefined) pointCumulative.delete(oldest);
+    }
     pointCumulative.set(spKey, (pointCumulative.get(spKey) ?? 0) + 1);
   }
 
@@ -1282,6 +1343,17 @@ export function recordDispatchOutcome(
       clearUnverified();
     } else if (tool === "clear_timeline") {
       openIntent = null;
+      clearUnverified();
+    } else if (tool === "clear_parts") {
+      // M1 (2026-08-15 final review): clear_parts deletes EVERY part, so a
+      // successful dispatch leaves no live part_id for verify_part to name
+      // and no geometry for verify_claim to measure — arming gate 6 for it
+      // (or leaving an earlier unverified entry standing) would refuse the
+      // NEXT checkpoint close naming a remedy nothing can perform. Clearing
+      // the tally, not adding to it, is the same argument clear_timeline
+      // gets, applied to the parts destroyed rather than the ledger. The
+      // open intent itself is left alone: the design intent survives even
+      // though the geometry built under it does not.
       clearUnverified();
     } else if (VERIFIES.has(tool)) {
       // The caller LOOKED — but only if the look actually measured

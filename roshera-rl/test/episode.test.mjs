@@ -641,6 +641,32 @@ check("unverifiedMutatingWork: clear_timeline resets the tally too — gate 6 ex
   assert.deepEqual(r, { count: 0, tools: [] });
 });
 
+// ─── M1 mirror (2026-08-15 final review) — clear_parts clears the tally
+//     here too, matching gates.ts's own M1 fix exactly. Before this fix,
+//     episode.mjs still treated clear_parts as ordinary MUTATES_SOLIDS work
+//     (it IS a gates.ts MUTATES_SOLIDS member — the set-equality parity pin
+//     below cannot see this divergence, since membership is unchanged): a
+//     terminal record would flag "clear_parts, create_box" as unverified
+//     when every part they could have named to verify_part is already gone.
+
+check("unverifiedMutatingWork: clear_parts clears the tally too, mirroring gates.ts's M1 fix — not counted as ordinary mutating work", () => {
+  const r = unverifiedMutatingWork([
+    { tool: "create_box", ok: true },
+    { tool: "clear_parts", ok: true },
+  ]);
+  assert.deepEqual(r, { count: 0, tools: [] },
+    "create_box's part no longer exists after clear_parts — flagging it names an impossible remedy");
+});
+
+check("unverifiedMutatingWork: delete_part gets NO such exception — it removes only ONE part, so it still tallies as ordinary work", () => {
+  const r = unverifiedMutatingWork([
+    { tool: "create_box", ok: true },
+    { tool: "delete_part", ok: true },
+  ]);
+  assert.equal(r.count, 2);
+  assert.deepEqual(r.tools, ["create_box", "delete_part"]);
+});
+
 check("unverifiedMutatingWork: a refused mutating call built nothing, so it counts for nothing", () => {
   assert.deepEqual(unverifiedMutatingWork([{ tool: "create_cylinder", ok: false }]), { count: 0, tools: [] });
 });
@@ -662,6 +688,37 @@ check("unverifiedMutatingWork: malformed input degrades to the clean answer rath
     unverifiedMutatingWork([null, {}, { tool: "create_cylinder", ok: true }]),
     { count: 1, tools: ["create_cylinder"] },
   );
+});
+
+// ─── M2 (2026-08-15 final review) — composite dispatch (cad_program /
+//     workbench / invoke) makes the reconstruction unreliable, so it must
+//     return a STATED ABSENCE, never a fabricated {count: 0} ──────────────
+
+check("unverifiedMutatingWork: a successful cad_program dispatch is a stated absence, not a fabricated zero", () => {
+  const r = unverifiedMutatingWork([
+    { tool: "create_cylinder", ok: true },
+    { tool: "cad_program", ok: true },
+  ]);
+  assert.equal(typeof r.absent, "string", "membership parity with gates.ts's MUTATES_SOLIDS proves nothing about what ran inside a composite call");
+  assert.equal(r.count, undefined);
+  assert.equal(r.tools, undefined);
+});
+
+check("unverifiedMutatingWork: workbench and invoke get the same composite-dispatch treatment", () => {
+  assert.equal(typeof unverifiedMutatingWork([{ tool: "workbench", ok: true }]).absent, "string");
+  assert.equal(typeof unverifiedMutatingWork([{ tool: "invoke", ok: true }]).absent, "string");
+});
+
+check("unverifiedMutatingWork: a REFUSED/errored composite dispatch built nothing — same rule as any other refused call", () => {
+  assert.deepEqual(unverifiedMutatingWork([{ tool: "cad_program", ok: false }]), { count: 0, tools: [] });
+});
+
+check("unverifiedMutatingWork: a composite dispatch that ran cleanly BEFORE it, and normal calls after it, still cannot be trusted — the absence sticks", () => {
+  const r = unverifiedMutatingWork([
+    { tool: "cad_program", ok: true },
+    { tool: "verify_part", ok: true }, // this outer call cannot un-poison the reconstruction
+  ]);
+  assert.equal(typeof r.absent, "string");
 });
 
 /** verify_part's own body: `sound` at the TOP LEVEL (tools/perception.ts:206), no `perception` wrapper. */
@@ -827,6 +884,35 @@ check("a SETUP_FAILED episode (no steps ever ran) reports the clean answer, not 
   assert.deepEqual(terminal.unverified_mutations, { count: 0, tools: [] });
 });
 
+// ─── M2 end to end — a composite dispatch must not tally zero ──────────────
+
+const COMPOSITE_TASK = defineTask({
+  id: "t-composite", prompt: "p", toolAllowlist: ["cad_program"],
+  claims: [{
+    name: "volume", expr: "v",
+    bindings: [{ var: "v", measure: { kind: "volume", part: "solid:0" } }],
+    expected: 117809.724509617, tolerance: 117.8,
+  }],
+  stepBudget: 3, tokenBudget: 1000, split: "train",
+});
+
+check("M2 CLOSED: an episode ending on a successful cad_program dispatch reports unverified_mutations as a stated absence, never a fabricated zero", async () => {
+  const path = join(dir, "m2-composite.jsonl");
+  const r = await runEpisode({
+    task: COMPOSITE_TASK,
+    policy: scriptedPolicy([{ tool: "cad_program", args: { ops: [] } }]),
+    seed: 1, baseUrl, authHeader: {}, trajectoryPath: path, kernelSha: "abc",
+    spawn: fakeSpawn(() => CREATED_OK),
+  });
+  assert.equal(r.outcome, "COMPLETED");
+  const { terminal } = readTrajectory(path);
+  assert.equal(
+    typeof terminal.unverified_mutations.absent, "string",
+    "the review's concrete case: ten mutations inside one cad_program call must not tally {count: 0}",
+  );
+  assert.equal(terminal.unverified_mutations.count, undefined);
+});
+
 // ─── the copy of gates.ts's MUTATES_SOLIDS is PINNED, not merely disclosed ───
 //
 // `episode.mjs` copies `MUTATES_SOLIDS` rather than importing it, for a good
@@ -843,6 +929,21 @@ check("a SETUP_FAILED episode (no steps ever ran) reports the clean answer, not 
 // it. This does the same, in the same style: read the other surface from
 // disk and assert set equality. If gates.ts gains a mutating verb — as it did
 // twice on this branch alone — this fails until the copy follows.
+//
+// WHAT THIS DOES NOT PIN, stated plainly rather than implied (M2, 2026-08-15
+// final review): set equality proves the two files agree on WHICH tools
+// mutate solids. It proves NOTHING about whether the two packages' BEHAVIOUR
+// agrees once one of those tools is a COMPOSITE — `cad_program`, `workbench`,
+// `invoke` are absent from both sets (correctly: the outer call itself is not
+// a mutation) while their INNER dispatches run through gates.ts's real gate
+// individually. `episode.mjs`'s step log only ever sees the outer call name,
+// so this pin passing is fully consistent with "ten mutations inside one
+// cad_program call tally zero" — the review's concrete answer to "can the two
+// sets be equal while the behaviour differs". That gap is closed by
+// `COMPOSITE_DISPATCH` in episode.mjs (a stated absence instead of a
+// fabricated zero), not by this pin, and this pin cannot verify that fix
+// either — a reader should not over-trust a green set-equality check here as
+// proof the composite case is handled.
 check("the MUTATES_SOLIDS copy equals gates.ts's, verb for verb", () => {
   const setLiteral = (src, name) => {
     const m = src.match(new RegExp(`const ${name}\\s*=\\s*new Set(?:<string>)?\\(\\[([\\s\\S]*?)\\]\\)`));

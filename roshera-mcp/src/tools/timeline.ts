@@ -6,6 +6,7 @@ import type { ToolHost } from "../registry.js";
 import { z } from "zod";
 import { randomUUID } from "node:crypto";
 import { api, ok, fail, ApiError } from "../core.js";
+import { gate6WouldRefuse } from "../gates.js";
 
 /**
  * One stable session id per MCP process: the backend's undo/redo walk a
@@ -470,7 +471,12 @@ export function registerTimelineTools(server: ToolHost) {
       // (`timeline_engine::Checkpoint::skip_verification`), so the escape
       // survives a restart and is retrievable via timeline_checkpoints —
       // not merely a permitted call. Only sent as `true` when the caller
-      // actually passed it — never defaulted onto a call that omitted it.
+      // actually passed it AND gate 6 would actually have refused without it
+      // (L1, 2026-08-15 final review, `gate6WouldRefuse` in gates.ts) —
+      // gate 6 is TS-only, so nothing on the backend re-checks whether there
+      // really was anything to skip the way it does for `acknowledge_unsound`;
+      // forwarding the flag unconditionally would let the durable record
+      // assert an escape that was never taken.
       skip_verification: z
         .boolean()
         .optional()
@@ -482,11 +488,17 @@ export function registerTimelineTools(server: ToolHost) {
     },
     async ({ name, description, branch, skip_verification }) => {
       try {
+        // L1: forward the flag only when it would actually be escaping
+        // something — read BEFORE the call, while intentUnverified still
+        // reflects the state the gate itself just evaluated for this exact
+        // dispatch (nothing else runs between the gate and this handler).
+        const escapedSomething =
+          skip_verification === true && gate6WouldRefuse();
         const r = await api("POST", "/api/timeline/checkpoint", {
           name,
           description,
           branch,
-          ...(skip_verification === true ? { skip_verification: true } : {}),
+          ...(escapedSomething ? { skip_verification: true } : {}),
         });
         // NOTEBOOK MIRROR (audit 2026-08-01 §5): the policy used to ask for a
         // separate blackboard_add_entry carrying the same intent — a two-call

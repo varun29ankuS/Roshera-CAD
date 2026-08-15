@@ -72,6 +72,23 @@ const MUTATES_SOLIDS = new Set([
 const VERIFIES = new Set(["verify_part", "verify_claim"]);
 
 /**
+ * M2 (2026-08-15 final review) — `cad_program`, `workbench` and `invoke` are
+ * COMPOSITE dispatch: each runs its own inner calls through gates.ts's
+ * wrapper individually (`registry.ts:119-132`, reached from
+ * `cad_program.ts:453`'s `entry.handler(parsed, extra)` — confirmed by the
+ * review, not assumed), so ten mutations inside one `cad_program` batch each
+ * arm and clear gate 6 exactly as ten direct calls would. None of that shows
+ * up as separate entries in THIS package's step log — `stepLog` records only
+ * the OUTER tool name (`action.tool` below) — so a successful composite
+ * dispatch is the concrete, measured answer to "can `MUTATES_SOLIDS` and
+ * `VERIFIES` be byte-identical to gates.ts's copies while the two packages'
+ * BEHAVIOUR still differs": yes, exactly here. The set-equality pin in
+ * episode.test.mjs proves the two membership lists agree; it cannot and does
+ * not prove anything about what a composite call did once dispatched.
+ */
+const COMPOSITE_DISPATCH = new Set(["cad_program", "workbench", "invoke"]);
+
+/**
  * F1 (2026-08-15 whole-branch review, finding H3) — the `gates.ts` copy of
  * this exact function ("Whether a successful `verify_claim` dispatch
  * actually measured something", gates.ts, next to `VERIFIES`) explains the
@@ -107,12 +124,31 @@ export function verifyClaimActuallyMeasured(args, data) {
  *     itself (verified, or explicitly `skip_verification`'d ON THE RECORD),
  *     so whatever preceded it is settled and must not haunt the episode's
  *     own final verdict;
+ *   - `clear_parts` (successful) CLEARS the tally too (M1, 2026-08-15 final
+ *     review) — mirroring gates.ts's own `recordDispatchOutcome` exactly:
+ *     `clear_parts` deletes EVERY part, so nothing recorded before it
+ *     (including `clear_parts` itself) can be named to `verify_part` any
+ *     more. Tallying it as ordinary `MUTATES_SOLIDS` work — the naive
+ *     reading of gates.ts's own `MUTATES_SOLIDS` membership, which still
+ *     includes `clear_parts` — would flag the episode over work whose only
+ *     remedy is impossible, the exact corpus consequence M1 closed one layer
+ *     up. `delete_part` gets no such exception (removes ONE part; other
+ *     unverified work under the intent may still be real) and falls through
+ *     to the ordinary `MUTATES_SOLIDS` branch below, same as gates.ts;
  *   - `verify_part` (successful) always clears it — the caller LOOKED;
  *   - `verify_claim` (successful) clears it ONLY when
  *     `verifyClaimActuallyMeasured` says the call measured something (F1) —
  *     a step entry that does not carry `claimMeasured: true` is treated as
  *     NOT having looked, the conservative default;
- *   - any other successful `MUTATES_SOLIDS` call adds to it.
+ *   - any other successful `MUTATES_SOLIDS` call adds to it;
+ *   - a successful `COMPOSITE_DISPATCH` call (M2) makes the WHOLE
+ *     reconstruction unreliable from that point on and short-circuits to a
+ *     STATED ABSENCE rather than a count: its inner dispatches (each one
+ *     itself possibly a mutation, a verify, or a checkpoint close) ran
+ *     through gates.ts individually but left no trace under their own name
+ *     in this step log, so `{count: 0}` here would be exactly the fabricated
+ *     "measured, and clean" reading this project refuses — the honest
+ *     answer is "cannot be reconstructed", not "nothing was left unverified".
  *
  * `tools` is the DISTINCT verbs (a Set, matching gates.ts's own choice —
  * "boolean, fillet_edges across 40 calls" is legible, forty repetitions of
@@ -134,7 +170,17 @@ export function unverifiedMutatingWork(stepLog) {
     if (s.ok !== true) continue; // refused/errored — built nothing to verify
     const tool = s.tool;
     if (typeof tool !== "string") continue;
-    if (tool === "timeline_checkpoint" || tool === "clear_timeline") {
+    if (COMPOSITE_DISPATCH.has(tool)) {
+      return {
+        absent:
+          `the step log contains a successful '${tool}' dispatch — a ` +
+          "composite call whose inner mutations and inner verify_part/" +
+          "verify_claim calls run through gates.ts individually but are " +
+          "not logged as separate entries here, so unverified-mutation " +
+          "tracking cannot be reconstructed from this step log",
+      };
+    }
+    if (tool === "timeline_checkpoint" || tool === "clear_timeline" || tool === "clear_parts") {
       tools.clear();
       count = 0;
     } else if (VERIFIES.has(tool)) {

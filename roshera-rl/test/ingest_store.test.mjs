@@ -122,11 +122,30 @@ const preflightText = [
 ].join("\n") + "\n";
 const preflightEpisodeId = rowsFromTrajectory(preflightText, { path: "preflight-probe" }).episode.episode_id;
 
+// A sixth sibling: a terminal carrying a REAL {count, tools} unverified_mutations
+// reading (M6) — proves the non-absence shape round-trips through Postgres too,
+// not only the fixture's own default-absence case exercised on the base fixture.
+const unverifiedSeed = 999905;
+const unverifiedTerminalRest = (() => {
+  const lines = [...siblingRest];
+  const terminal = JSON.parse(lines[lines.length - 1]);
+  terminal.unverified_mutations = { count: 1, tools: ["boolean_subtract"] };
+  lines[lines.length - 1] = JSON.stringify(terminal);
+  return lines;
+})();
+const unverifiedText = [
+  JSON.stringify({ ...siblingHeader, task_id: "cylinder-r25-h60-unverified-mutations-probe", seed: unverifiedSeed }),
+  ...unverifiedTerminalRest,
+].join("\n") + "\n";
+const unverifiedRows = rowsFromTrajectory(unverifiedText, { path: "unverified-probe" });
+const unverifiedEpisodeId = unverifiedRows.episode.episode_id;
+
 const scratchDir = mkdtempSync(join(tmpdir(), "roshera-rl-ingest-store-"));
 const scratchPath = join(scratchDir, "drift-probe.jsonl");
 const fixArcPath = join(scratchDir, "quarantine-fix-probe.jsonl");
 const noDirtyPath = join(scratchDir, "dirty-absent-probe.jsonl");
 const preflightPath = join(scratchDir, "gate-preflight-probe.jsonl");
+const unverifiedPath = join(scratchDir, "unverified-mutations-probe.jsonl");
 
 async function countWhere(table, whereSql, params) {
   const r = await client.query(`SELECT count(*)::int AS n FROM ${table} WHERE ${whereSql}`, params);
@@ -139,6 +158,7 @@ async function cleanup() {
   // deleting the episode rows is enough to clear their whole subtree.
   await client.query(`DELETE FROM rl_episode WHERE episode_id = ANY($1)`, [[
     fixtureEpisodeId, siblingEpisodeId, fixArcEpisodeId, noDirtyEpisodeId, preflightEpisodeId,
+    unverifiedEpisodeId,
   ]]);
   await client.query(`DELETE FROM rl_quarantine WHERE path = $1 OR path = $2`, [malformedPath, fixArcPath]);
   // This suite MINTS this build identity; nothing else in the corpus uses it,
@@ -193,6 +213,57 @@ check("ingesting the complete fixture produces row counts matching rows.mjs's ow
   // dimension rollups: the fixture's kernel/task identity are real (attributable: true)
   assert.equal(await countWhere("rl_kernel_build", "sha = $1", [fixtureRows.run.provenance.kernel.sha]), 1);
   assert.equal(await countWhere("rl_task_family", "name = $1", [fixtureRows.run.provenance.task.family]), 1);
+});
+
+// ─── M6 (2026-08-15 final review) — unverified_mutations reaches Postgres ──
+//
+// `trajectory.mjs`'s `close()` always writes this into the JSONL terminal
+// record; before this fix, `rl_episode` had no column for it at all, so the
+// corpus could not answer "which episodes ended with unverified mutating
+// work" — the one question item 7 exists to make answerable. Its sibling
+// fact from the same commit, `gate_preflight`, DID land (proven above),
+// which is what made this an asymmetry rather than a whole feature never
+// wired.
+
+check("unverified_mutations reaches Postgres as the same stated absence rows.mjs computed for a fixture with no such key", async () => {
+  const r = await client.query(`SELECT unverified_mutations FROM rl_episode WHERE episode_id = $1`, [fixtureEpisodeId]);
+  assert.equal(r.rows.length, 1);
+  assert.deepEqual(r.rows[0].unverified_mutations, fixtureRows.episode.unverified_mutations);
+  assert.equal(typeof r.rows[0].unverified_mutations.absent, "string",
+    "the fixture's own terminal carries no unverified_mutations key, so this must land as a STATED absence, never a fabricated {count: 0}");
+});
+
+check("a real {count, tools} unverified_mutations reading lands in Postgres unchanged, and survives a re-ingest", async () => {
+  writeFileSync(unverifiedPath, unverifiedText, "utf8");
+  const res = await ingestFile(client, unverifiedPath);
+  assert.equal(res.status, "ingested");
+  assert.equal(res.episode_id, unverifiedEpisodeId);
+
+  const r = await client.query(`SELECT unverified_mutations FROM rl_episode WHERE episode_id = $1`, [unverifiedEpisodeId]);
+  assert.equal(r.rows.length, 1);
+  assert.deepEqual(r.rows[0].unverified_mutations, { count: 1, tools: ["boolean_subtract"] });
+
+  // Idempotency — the ONE-ROW-PER-EPISODE family's own upsert, re-run.
+  const second = await ingestFile(client, unverifiedPath);
+  assert.equal(second.status, "ingested");
+  const again = await client.query(`SELECT unverified_mutations FROM rl_episode WHERE episode_id = $1`, [unverifiedEpisodeId]);
+  assert.deepEqual(again.rows[0].unverified_mutations, { count: 1, tools: ["boolean_subtract"] });
+});
+
+check("ensureSchema run against a database that already has rl_episode (no unverified_mutations column) adds it without reshaping anything else", async () => {
+  // Mirrors the exact concern schema.mjs's own docstring names for
+  // `gate_preflight`: `CREATE TABLE IF NOT EXISTS` creates, it never
+  // reshapes, so the ADD COLUMN statement must be safe to issue
+  // unconditionally against a database that already ran an older version of
+  // this file. Proven directly: the column info_schema lookup succeeds and
+  // the type is jsonb, on a schema this suite already called ensureSchema
+  // against once above — re-running it here must not error or alter the type.
+  await ensureSchema(client);
+  const col = await client.query(
+    `SELECT data_type FROM information_schema.columns WHERE table_name = 'rl_episode' AND column_name = 'unverified_mutations'`,
+  );
+  assert.equal(col.rows.length, 1, "the column exists");
+  assert.equal(col.rows[0].data_type, "jsonb");
 });
 
 check("ingesting the SAME file again leaves every row count unchanged — idempotency", async () => {

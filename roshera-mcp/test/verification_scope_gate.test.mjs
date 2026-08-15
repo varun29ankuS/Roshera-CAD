@@ -35,6 +35,18 @@
  *   9. clear_timeline is deliberately out of scope: wiping the ledger the work
  *      lives in must not be nagged;
  *  10. the generic-name gate still fires first and independently.
+ *  11. S6 CLOSED — timeline_mould re-arms gate 6.
+ *  12. S7 CLOSED — delete_part / clear_parts re-arm gate 6 (membership alone).
+ *  13. M1 (2026-08-15 final review) — clear_parts must not arm gate 6 with a
+ *      refusal whose only stated remedy (verify_part) is impossible after it:
+ *      clear_parts deletes EVERY part, so a checkpoint closing right after it
+ *      must proceed freely rather than refuse naming a part_id that no
+ *      longer exists.
+ *  14. L1 (2026-08-15 final review) — skip_verification:true must reach the
+ *      backend (and so the durable record) ONLY when gate 6 would actually
+ *      have refused without it. A caller passing the flag when there is
+ *      nothing unverified must not leave a checkpoint durably asserting an
+ *      escape that was never taken.
  */
 
 import assert from "node:assert/strict";
@@ -487,8 +499,14 @@ check("S6 CLOSED: the mould re-arms gate 6 — closing over it now refuses", () 
   assert.deepEqual(firstJson(cpAfterMould).unverified_operations, ["timeline_mould"]);
 });
 
-// ─── 12. S7 — delete_part / clear_parts share the same bookkeeping, so they
-//              arm gate 6 too, for free, once they are in MUTATES_SOLIDS ─────
+// ─── 12. S7 — delete_part shares gate 6's bookkeeping, so it arms the gate
+//              too, for free, once it is in MUTATES_SOLIDS ──────────────────
+//
+// clear_parts does NOT get this treatment — see 13 (M1): unlike delete_part,
+// which removes ONE part and leaves any other unverified work in this intent
+// still checkable, clear_parts removes EVERY part, so arming the gate for it
+// (or for anything recorded before it) would refuse the next checkpoint close
+// naming a part_id verify_part can no longer find.
 
 resetSessionGates();
 await checkpoint("scrap block for a boolean rehearsal");
@@ -501,16 +519,110 @@ check("S7: delete_part after verify_part re-arms gate 6", () => {
   assert.deepEqual(firstJson(cpAfterDelete).unverified_operations, ["delete_part"]);
 });
 
+// ─── 13. M1 (2026-08-15 final review) — clear_parts must not arm gate 6 with
+//         a refusal whose only real remedy is impossible after it ──────────
+//
+// clear_parts deletes EVERY part. If it armed gate 6 the way delete_part
+// does, the refusal's own stated remedy — "verify_part({ part_id }) returns
+// the full certificate" — would be unreachable: there is no part_id left to
+// pass, verify_part 404s, and the only exits left would be
+// skip_verification:true or a contentless verify_claim. Proven two ways:
+// UNVERIFIED work wiped out by clear_parts (no verify_part call at all), and
+// VERIFIED work followed by clear_parts (the old S7 shape) — both must close
+// freely, with no verify_part call needed after clear_parts in either case.
+
 resetSessionGates();
-await checkpoint("scrap block for a second rehearsal");
+await checkpoint("scrap block for a third rehearsal");
+await call("create_box", { plane: "xy", cx: 0, cy: 0, width: 2, depth: 2, height: 2 }); // never verified
+await call("clear_parts", {}); // wipes the unverified box along with it
+const cpAfterUnverifiedClear = await checkpoint("next feature, 9mm boss");
+check(
+  "M1 CLOSED: clear_parts wipes UNVERIFIED work along with the parts it deletes — the closing checkpoint proceeds with no verify_part call at all",
+  () => {
+    assert.equal(
+      firstJson(cpAfterUnverifiedClear).refused,
+      undefined,
+      "a refusal here would name a part_id that no longer exists",
+    );
+  },
+);
+
+resetSessionGates();
+await checkpoint("scrap block for a fourth rehearsal");
 await call("create_box", { plane: "xy", cx: 0, cy: 0, width: 2, depth: 2, height: 2 });
 await call("verify_part", { part_id: 1 });
 await call("clear_parts", {});
 const cpAfterClearParts = await checkpoint("next feature, 10mm boss");
-check("S7: clear_parts after verify_part re-arms gate 6", () => {
-  assert.ok(isRefusal(cpAfterClearParts, "verification_scope"));
-  assert.deepEqual(firstJson(cpAfterClearParts).unverified_operations, ["clear_parts"]);
+check(
+  "M1 CLOSED: clear_parts after verify_part does not re-arm gate 6 — the next checkpoint closes freely",
+  () => {
+    assert.equal(firstJson(cpAfterClearParts).refused, undefined);
+  },
+);
+
+// ─── 14. L1 (2026-08-15 final review) — skip_verification only reaches the
+//         backend when gate 6 would actually have refused without it ───────
+
+// 14a. The FIRST checkpoint of a fresh session: nothing was ever built, so
+// gate 6 could not possibly have fired. Passing skip_verification:true here
+// must not persist a claim that an escape was taken.
+resetSessionGates();
+const cpFirstWithSkip = await checkpoint("boss ø30 x 8 tall, centred", {
+  skip_verification: true,
 });
+check(
+  "L1 CLOSED: skip_verification:true on the FIRST checkpoint (nothing built, nothing to skip) is not forwarded to the backend",
+  () => {
+    assert.equal(firstJson(cpFirstWithSkip).refused, undefined);
+    assert.equal(
+      lastSkipVerification,
+      undefined,
+      "the POST body must not carry the flag when gate 6 never armed",
+    );
+    assert.equal(
+      firstJson(cpFirstWithSkip).checkpoint.skip_verification,
+      false,
+      "and the durable record must not assert an escape that was never taken",
+    );
+  },
+);
+
+// 14b. Work WAS built but was already genuinely verified before the close —
+// gate 6 would not refuse either. skip_verification:true here is still a
+// no-op escape and must not be persisted.
+await call("create_cylinder", { plane: "xy", cx: 0, cy: 0, radius: 3, height: 6 });
+await call("verify_part", { part_id: 1 }); // clears intentUnverified for real
+const cpVerifiedWithSkip = await checkpoint("counterbore ø10 x 4 deep", {
+  skip_verification: true,
+});
+check(
+  "L1 CLOSED: skip_verification:true after a genuine verify (nothing unverified left) is not forwarded either",
+  () => {
+    assert.equal(firstJson(cpVerifiedWithSkip).refused, undefined);
+    assert.equal(
+      lastSkipVerification,
+      undefined,
+      "already-verified work is not something skip_verification could have escaped",
+    );
+  },
+);
+
+// 14c. Control: the flag STILL reaches the backend when gate 6 genuinely
+// would have refused — confirms the fix narrows the forward, it does not
+// silently disable it (this mirrors section 5 above, restated here as the
+// direct control for 14a/14b).
+await call("create_box", { plane: "xy", cx: 0, cy: 0, width: 4, depth: 4, height: 4 }); // unverified
+const cpGenuineSkip = await checkpoint("relief pocket 10 x 10 x 3", {
+  skip_verification: true,
+});
+check(
+  "L1 control: skip_verification:true still reaches the backend when gate 6 truly would have refused",
+  () => {
+    assert.equal(firstJson(cpGenuineSkip).refused, undefined);
+    assert.equal(lastSkipVerification, true);
+    assert.equal(firstJson(cpGenuineSkip).checkpoint.skip_verification, true);
+  },
+);
 
 stub.close();
 console.log(`\nverification_scope_gate: ${passed} checks passed`);

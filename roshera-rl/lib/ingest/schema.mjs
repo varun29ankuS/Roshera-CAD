@@ -132,6 +132,24 @@ const STATEMENTS = [
   )`,
   `CREATE INDEX IF NOT EXISTS rl_episode_run_id_idx ON rl_episode(run_id)`,
 
+  // `unverified_mutations` (M6, 2026-08-15 final review): item 7's whole
+  // point was to make "did this episode end with mutating work nobody
+  // checked" an answerable question, and `trajectory.mjs`'s `close()` has
+  // always written it into every terminal record — but this column did not
+  // exist, so the JSONL was the only place the fact ever landed. Its sibling
+  // fact from the very same commit, `gate_preflight` (`rl_step`, above), DID
+  // get a column, which is what made this an asymmetry rather than a whole
+  // feature never wired. Same `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`
+  // pattern for the same reason: a database that already ran an older
+  // version of this file has `rl_episode` but not this column, and adding a
+  // nullable column destroys nothing, so it is safe to issue unconditionally
+  // rather than treated as an operator's deliberate reshape (see this file's
+  // own top docstring). JSONB, not two flattened columns: the field is a
+  // tagged union (`{count, tools}` XOR `{absent}`, trajectory.mjs), and a
+  // relational shredding of that union is a bigger change than this item
+  // asks for.
+  `ALTER TABLE rl_episode ADD COLUMN IF NOT EXISTS unverified_mutations JSONB`,
+
   `CREATE TABLE IF NOT EXISTS rl_step (
     id BIGSERIAL PRIMARY KEY,
     episode_id TEXT NOT NULL REFERENCES rl_episode(episode_id) ON DELETE CASCADE,

@@ -78,9 +78,15 @@
  *     omitted); `tools` is the distinct verbs, `count` every dispatch,
  *     mirroring gates.ts's own `intentUnverified` shape exactly.
  *   - `{absent: "<reason>"}` — the check itself could not run (a throw
- *     inside the derivation, caught at its one call site). The hard
+ *     inside the derivation, caught at its one call site — the hard
  *     constraint this exists under outranks the feature: this check must
- *     never cost an episode its trajectory.
+ *     never cost an episode its trajectory), OR the check ran but could not
+ *     be trusted: a successful `cad_program` / `workbench` / `invoke`
+ *     dispatch in the step log (M2, 2026-08-15 final review) runs its own
+ *     inner mutations and verifies through gates.ts individually, invisibly
+ *     to this reconstruction, so `unverifiedMutatingWork` reports the honest
+ *     "cannot be reconstructed" here rather than a count that might be wrong
+ *     in either direction.
  * A caller that passes neither (every `Trajectory` construction this
  * package does NOT drive through `episode.mjs`'s own loop, e.g.
  * `runner.mjs`'s `setupFailedBeforeEpisode`, where no episode — and so no
