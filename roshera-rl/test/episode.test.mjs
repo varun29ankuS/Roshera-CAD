@@ -79,6 +79,27 @@ const CREATED_OK = ok({
 const RATE_LIMITED = fail(
   'POST /api/geometry/cylinder → 429: {"error":"Rate limit exceeded","code":"RATE_LIMIT_EXCEEDED","status":429}',
 );
+/**
+ * A successful op result whose gate-3 pre-flight could NOT complete —
+ * `registry.ts`'s `attachGatePreflightGaps` merging `gates.ts`'s
+ * `GatePreflightGap[]` into the op's own JSON (item 1, audit S4). Copied
+ * verbatim from that shape, the same discipline `CREATED_OK` above follows:
+ * a fake that speaks a friendlier shape than the wire proves nothing.
+ */
+const CREATED_WITH_GATE_PREFLIGHT = ok({
+  object_uuid: "3f2b8c1e-77aa-4a9f-8b21-9f0f2a6d5e10", part_id: 1, placement: null,
+  perception: { sound: true, brep_valid: true, watertight: true, volume: 117809.7, face_count: 3 },
+  gate_preflight: "unavailable",
+  gate_preflight_gaps: [
+    {
+      ref: "3f2b8c1e-77aa-4a9f-8b21-9f0f2a6d5e10",
+      stage: "verify",
+      reason:
+        "GET /api/agent/parts/1/perception → timed out after 4000ms (backend " +
+        "may still be computing a heavy op; raise ROSHERA_MCP_TIMEOUT_MS)",
+    },
+  ],
+});
 
 const task = defineTask({
   id: "t", prompt: "p", toolAllowlist: ["create_cylinder", "verify_part"],
@@ -459,6 +480,53 @@ check("an unwritable trajectory path is SETUP_FAILED, not a throw", async () => 
   });
   assert.equal(r.outcome, "SETUP_FAILED");
   assert.ok(r.error.includes("trajectory could not be opened"));
+});
+
+check("a step whose gate-3 pre-flight was unavailable records that fact in the JSONL a trajectory writes", async () => {
+  // THE LOAD-BEARING CASE for item 1 (audit S4). A gates.ts unit test proves
+  // the marker CONSTRUCTS correctly; it does not prove anything in production
+  // carries it end to end. This repo has the exact incident on record: the
+  // kernel started emitting a fidelity block and `core.ts` rebuilt perception
+  // from a FIXED KEY SET, so the block reached NO agent behind 42 green
+  // tests. `Trajectory.step()` (trajectory.mjs) writes exactly such a fixed
+  // key set — `{i, action, result_digest, reward, refusal, ms}` — and
+  // `episode.mjs`'s own `traj.step()` call only ever forwards a DIGEST of
+  // `result.data`, never the raw value, so this is the one place the same
+  // failure mode could recur one layer downstream of gates.ts.
+  const path = join(dir, "gate-preflight.jsonl");
+  const r = await runEpisode({
+    task, policy: scriptedPolicy([{ tool: "create_cylinder", args: { radius: 25 } }]),
+    seed: 1, baseUrl, authHeader: {}, trajectoryPath: path, kernelSha: "abc",
+    spawn: fakeSpawn(() => CREATED_WITH_GATE_PREFLIGHT),
+  });
+  assert.equal(r.outcome, "COMPLETED");
+  const { steps } = readTrajectory(path);
+  assert.equal(steps.length, 1);
+  const step = steps[0];
+  assert.equal(step.gate_preflight, "unavailable",
+    "the STEP LINE ITSELF must carry the fact — a digest of result.data cannot be " +
+    "read back by anything scoring the trajectory afterward, only compared byte-for-byte");
+  assert.equal(Array.isArray(step.gate_preflight_gaps), true);
+  assert.equal(step.gate_preflight_gaps.length, 1);
+  assert.equal(step.gate_preflight_gaps[0].ref, "3f2b8c1e-77aa-4a9f-8b21-9f0f2a6d5e10");
+  assert.equal(step.gate_preflight_gaps[0].stage, "verify");
+  assert.match(step.gate_preflight_gaps[0].reason, /timed out after 4000ms/);
+});
+
+check("a healthy step (no preflight gap) writes no gate_preflight key at all", async () => {
+  // The mirror assertion: a normal successful step must NOT grow a new key —
+  // an absent marker means "the gate ran", and that must stay true in the
+  // JSONL as much as in the raw tool result (item 1's own constraint).
+  const path = join(dir, "gate-preflight-clean.jsonl");
+  await runEpisode({
+    task, policy: scriptedPolicy([{ tool: "create_cylinder", args: { radius: 25 } }]),
+    seed: 1, baseUrl, authHeader: {}, trajectoryPath: path, kernelSha: "abc",
+    spawn: fakeSpawn(() => CREATED_OK),
+  });
+  const { steps } = readTrajectory(path);
+  assert.equal(steps.length, 1);
+  assert.equal("gate_preflight" in steps[0], false);
+  assert.equal("gate_preflight_gaps" in steps[0], false);
 });
 
 for (const [name, fn] of checks) { await fn(); process.stdout.write(`  ok - ${name}\n`); }

@@ -18,7 +18,11 @@
 import { z } from "zod";
 import { toJsonSchemaCompat } from "@modelcontextprotocol/sdk/server/zod-json-schema-compat.js";
 import { nextTurn } from "./core.js";
-import { preDispatchGate, recordDispatchOutcome } from "./gates.js";
+import {
+  preDispatchGate,
+  recordDispatchOutcome,
+  attachGatePreflightGaps,
+} from "./gates.js";
 
 // ─── The capture shim ──────────────────────────────────────────────────────
 
@@ -99,15 +103,30 @@ export class ToolTable implements ToolHost {
     // real handler, and every outcome (gated or handled) is recorded after —
     // so no call path can retry a refused call, build without a declared
     // intent, or stack work on an unsound base, without the gate seeing it.
+    //
+    // `preDispatchGate` returns a DECISION, not a nullable result: `{refusal}`
+    // short-circuits exactly as before; `{proceed: true, preflight?}` lets the
+    // real handler run and, when gate 3's live fetch could not complete for
+    // one of the op's base refs, attaches that fact to the handler's OWN
+    // result (`attachGatePreflightGaps`, gates.ts) before it is recorded or
+    // returned — so a fail-open pre-flight stops being byte-identical to one
+    // that actually ran (audit S4). The gap is carried in the return value of
+    // THIS call, not in module state read back by `recordDispatchOutcome`:
+    // gate 3's own skip paths span two `await`s, so a module-level "last gap"
+    // would race under interleaved dispatches (see gates.ts's `GateDecision`
+    // doc comment).
     const rawHandler = t.handler;
     const wrapped: RegisteredTool["handler"] = async (args, extra) => {
       const turn = nextTurn();
-      const gated = await preDispatchGate(t.name, args, turn);
-      if (gated) {
-        recordDispatchOutcome(t.name, args, gated, turn);
-        return gated;
+      const decision = await preDispatchGate(t.name, args, turn);
+      if ("refusal" in decision) {
+        recordDispatchOutcome(t.name, args, decision.refusal, turn);
+        return decision.refusal;
       }
-      const result = await rawHandler(args, extra);
+      let result = await rawHandler(args, extra);
+      if (decision.preflight && decision.preflight.length > 0) {
+        result = attachGatePreflightGaps(result, decision.preflight);
+      }
       recordDispatchOutcome(t.name, args, result, turn);
       return result;
     };

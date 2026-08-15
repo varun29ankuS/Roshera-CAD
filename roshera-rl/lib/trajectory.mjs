@@ -6,9 +6,24 @@
  *
  *   line 1   header   { schema_version, task_id, seed, kernel_sha,
  *                       mcp_version, tool_allowlist, split, started_at }
- *   line 2+  step     { i, action, result_digest, reward, refusal, ms }
+ *   line 2+  step     { i, action, result_digest, reward, refusal, ms,
+ *                       gate_preflight?, gate_preflight_gaps? }
  *   last     terminal { outcome, reward_final, claims, recipe_ref,
  *                       model_scope, tokens, wall_ms, error }
+ *
+ * `gate_preflight` / `gate_preflight_gaps` (item 1, audit S4): the ONLY two
+ * keys in this schema that are OMITTED rather than defaulted on the common
+ * path. `roshera-mcp/src/gates.ts`'s unsound-base gate deliberately fails
+ * open when it cannot fetch a live verdict for one of an op's base refs (a
+ * transport hiccup must never turn into a refusal); this item made that
+ * fail-open legible by attaching `gate_preflight: "unavailable"` plus the
+ * per-ref gaps to the OP'S OWN result when it happens. Carrying that through
+ * to the step line is the load-bearing half of the fix: `result_digest` is a
+ * HASH, unreadable by anything scoring the trajectory, so without this the
+ * fact would construct correctly in gates.ts and still never reach a
+ * trajectory — the same "fixed key set" failure mode that once cost this
+ * package a fidelity block reaching no agent. An absent key means the
+ * pre-flight completed; it is never stamped `"ok"`.
  *
  * `reward_final` is the terminal reading of each NAMED component — not a sum
  * and not a scalar. Naming it `total` would imply an aggregation the
@@ -71,11 +86,22 @@ class Trajectory {
   #closed = false;
   constructor(path) { this.#path = path; }
 
-  step({ i, action, resultDigest, reward, refusal, ms }) {
+  step({ i, action, resultDigest, reward, refusal, ms, gatePreflight, gatePreflightGaps }) {
     if (this.#closed) throw new Error("trajectory already closed");
+    // `gate_preflight` (item 1, audit S4): gate 3's own result — gates.ts —
+    // OMITS this key on a call whose pre-flight completed, on purpose ("an
+    // absent marker means the gate ran"). Mirrored here rather than defaulted
+    // to `null`: a `gate_preflight: null` key on EVERY step would itself be
+    // the shape-change the source discipline refuses to make, one layer
+    // downstream. Only ever added when the caller actually has a value.
+    const preflightFields =
+      gatePreflight !== undefined && gatePreflight !== null
+        ? { gate_preflight: gatePreflight, gate_preflight_gaps: gatePreflightGaps ?? null }
+        : {};
     appendFileSync(this.#path, JSON.stringify({
       kind: "step", i, action, result_digest: resultDigest,
       reward, refusal: refusal ?? null, ms,
+      ...preflightFields,
     }) + "\n");
   }
 

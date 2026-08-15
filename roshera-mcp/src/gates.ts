@@ -463,10 +463,34 @@ export function resetSessionGates(): void {
 
 // ─── Live-verdict lookups (pre-flight, short budget, honest on failure) ─────
 
-/** Resolve a public object UUID to its kernel part id via the scene snapshot
- *  (the only agent-visible carrier of the UUID↔SolidId map). null = not
- *  resolvable — the op proceeds and fails loudly in its own handler. */
-async function partIdForUuid(uuid: string): Promise<number | null> {
+/** `e.message` when `e` is an Error, else its string form — the same idiom
+ *  `core.ts`'s own error path uses, so a caught `ApiError` reports the exact
+ *  `"<METHOD> <path> → timed out after Xms …"` / `"→ 404: …"` text it threw
+ *  with, which is what lets a reader tell a timeout from a 404. */
+function describeError(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
+}
+
+/**
+ * Resolve a public object UUID to its kernel part id via the scene snapshot
+ * (the only agent-visible carrier of the UUID↔SolidId map).
+ *
+ * TWO outcomes are collapsed into `partId: null` by design, because they mean
+ * the SAME thing to the caller — proceed, the op's own handler fails loudly
+ * on a genuinely absent object: the snapshot fetch SUCCEEDED and the uuid is
+ * simply not in the live scene. That is a completed pre-flight with a
+ * definitive (if unhelpful) answer, not an unavailable one.
+ *
+ * A THIRD outcome is different in kind and gets its own arm: the fetch itself
+ * failed (`err`, matching S4's `partIdForUuid` throws → null` citation). The
+ * gate still proceeds — refusing on a transport hiccup would be the
+ * approximation this gate's whole design avoids — but callers can now tell
+ * "the ref checked out empty" from "the pre-flight never ran", which is
+ * exactly the marker item 1 exists to attach.
+ */
+async function partIdForUuid(
+  uuid: string,
+): Promise<{ partId: number | null } | { unavailable: string }> {
   try {
     const snap = await api(
       "GET",
@@ -478,19 +502,34 @@ async function partIdForUuid(uuid: string): Promise<number | null> {
     for (const o of objects) {
       if (o?.id === uuid) {
         const sid = o?.analytical_geometry?.solid_id;
-        return typeof sid === "number" ? sid : null;
+        return { partId: typeof sid === "number" ? sid : null };
       }
     }
-    return null;
-  } catch {
-    return null;
+    return { partId: null };
+  } catch (err) {
+    return { unavailable: describeError(err) };
   }
 }
 
-/** The part's LIVE cheap verdict. null = unavailable (never fabricated). */
+/**
+ * The part's LIVE cheap verdict.
+ *
+ * `verdict: null` covers both "unreadable shape" (the response carried
+ * neither `sound` nor `valid` as a boolean — never fabricated into one) and
+ * is otherwise unchanged from before this item: that branch is not the S4
+ * citation (`liveVerdict throws → null`, gates.ts:507-509 in the audit) and
+ * is left exactly as it behaved previously — silent proceed, no marker.
+ *
+ * `unavailable` is the NEW arm: the fetch itself threw (timeout, network
+ * error, non-2xx), which is the actual S4 fail-open path. The gate still
+ * proceeds on this arm too — see module doc, gate 3 — but the caller can now
+ * attach a reasoned marker instead of a silent skip.
+ */
 async function liveVerdict(
   partId: number,
-): Promise<{ sound: boolean; verdict: string | null } | null> {
+): Promise<
+  { verdict: { sound: boolean; verdict: string | null } | null } | { unavailable: string }
+> {
   try {
     const p = await api(
       "GET",
@@ -499,13 +538,15 @@ async function liveVerdict(
       PERCEPTION_TIMEOUT_MS,
     );
     const flag = p?.sound ?? p?.valid;
-    if (typeof flag !== "boolean") return null;
+    if (typeof flag !== "boolean") return { verdict: null };
     return {
-      sound: flag,
-      verdict: typeof p?.verdict === "string" ? p.verdict : null,
+      verdict: {
+        sound: flag,
+        verdict: typeof p?.verdict === "string" ? p.verdict : null,
+      },
     };
-  } catch {
-    return null;
+  } catch (err) {
+    return { unavailable: describeError(err) };
   }
 }
 
@@ -722,9 +763,49 @@ async function sheetExportGate(args: any): Promise<any | null> {
 }
 
 /**
+ * One base ref whose gate-3 pre-flight could NOT complete — a live fetch
+ * (the snapshot resolve, or the perception read) threw rather than
+ * answering. Distinct from a ref that resolved and turned out sound, and
+ * distinct from a uuid that plainly is not in the live scene (that pre-flight
+ * DID complete; the op's own handler fails loudly on it, which is not the
+ * silent, byte-identical coin flip S4 is about).
+ */
+export interface GatePreflightGap {
+  /** The uuid or `part <id>` this pre-flight step was about. */
+  ref: string;
+  /** Which pre-flight step failed to complete. */
+  stage: "resolve" | "verify";
+  /** The underlying error/timeout message, verbatim — this is what lets a
+   *  reader tell a timeout from a 404 rather than a bare "unavailable". */
+  reason: string;
+}
+
+/**
+ * `preDispatchGate`'s return contract. Deliberately NOT `any | null`: a
+ * refusal (`{refusal}`) always short-circuits, unchanged from before this
+ * item. `{proceed: true}` lets the call through exactly as `null` used to —
+ * `preflight`, when present, carries gate 3's fail-open gaps so the ToolTable
+ * wrapper (registry.ts, the one call site) can attach them to whatever the
+ * real handler returns.
+ *
+ * This is state carried in the RETURN VALUE, not in a module-level variable
+ * read back by `recordDispatchOutcome` — gate 3's own skip paths span two
+ * `await`s (`partIdForUuid`, `liveVerdict`), so if the SDK ever interleaves
+ * two dispatches, a module-level "last preflight gap" would let dispatch B's
+ * pre-flight clear dispatch A's gap before A's own outcome is recorded.
+ * Threading the gap through the return value and then straight into the same
+ * async call's own result is race-free by construction — there is nothing
+ * for another interleaved dispatch to clobber.
+ */
+export type GateDecision =
+  | { refusal: any }
+  | { proceed: true; preflight?: GatePreflightGap[] };
+
+/**
  * Pre-dispatch gate, called by the ToolTable wrapper before the real handler.
- * Returns a refusal result (the call never reaches the kernel) or null (the
- * call proceeds). Order matters: the cache answers first (no kernel work at
+ * Returns `{refusal}` (the call never reaches the kernel) or `{proceed:
+ * true, preflight?}` (the call proceeds, with zero or more fail-open notes
+ * from gate 3). Order matters: the cache answers first (no kernel work at
  * all on an identical re-issue), then the local gates, then the one gate that
  * needs a live fetch.
  */
@@ -732,24 +813,26 @@ export async function preDispatchGate(
   tool: string,
   args: unknown,
   turn: number,
-): Promise<any | null> {
+): Promise<GateDecision> {
   // 1. Identical re-issue of a refused call → the same refusal, from cache.
   const hit = refusalCache.get(refusalKey(tool, args));
   if (hit) {
     return {
-      ...hit.result,
-      content: [
-        ...hit.result.content,
-        {
-          type: "text" as const,
-          text:
-            `[refusal cache] this exact call was refused at turn ${hit.turn} ` +
-            "and no state-changing operation has succeeded since — the answer " +
-            "above is unchanged and was served without re-running anything. " +
-            "An identical re-issue will keep receiving it: change the " +
-            "arguments or the design, or escalate quoting the refusal.",
-        },
-      ],
+      refusal: {
+        ...hit.result,
+        content: [
+          ...hit.result.content,
+          {
+            type: "text" as const,
+            text:
+              `[refusal cache] this exact call was refused at turn ${hit.turn} ` +
+              "and no state-changing operation has succeeded since — the answer " +
+              "above is unchanged and was served without re-running anything. " +
+              "An identical re-issue will keep receiving it: change the " +
+              "arguments or the design, or escalate quoting the refusal.",
+          },
+        ],
+      },
     };
   }
 
@@ -760,7 +843,7 @@ export async function preDispatchGate(
   if (spKey !== null) {
     const run = pointRuns.get(spKey) ?? 0;
     if (run >= SINGLE_POINT_RUN_MAX) {
-      return singlePointRunRefusal(tool, run);
+      return { refusal: singlePointRunRefusal(tool, run) };
     }
   }
 
@@ -772,7 +855,7 @@ export async function preDispatchGate(
       GENERIC_CHECKPOINT_NAME.test(trimmed) ||
       CLOCK_CHECKPOINT_NAME.test(trimmed)
     ) {
-      return genericNameRefusal(name);
+      return { refusal: genericNameRefusal(name) };
     }
     // 2b. Verification-scope gate (gate 6). A new checkpoint CLOSES the open
     // one — the only close this surface has — so this is the last moment the
@@ -783,45 +866,125 @@ export async function preDispatchGate(
       intentUnverified.count > 0 &&
       (args as any)?.skip_verification !== true
     ) {
-      return verificationScopeRefusal(
-        openIntent.name,
-        [...intentUnverified.tools],
-        intentUnverified.count,
-        trimmed,
-      );
+      return {
+        refusal: verificationScopeRefusal(
+          openIntent.name,
+          [...intentUnverified.tools],
+          intentUnverified.count,
+          trimmed,
+        ),
+      };
     }
-    return null; // a real intent phrase — let the handler record it
+    return { proceed: true }; // a real intent phrase — let the handler record it
   }
   if (MUTATES_SOLIDS.has(tool) && openIntent === null) {
-    return intentGateRefusal(tool);
+    return { refusal: intentGateRefusal(tool) };
   }
 
   // 3. Unsound-base gate (live verdict; explicit acknowledgement bypasses).
   const extractRefs = BASE_REFS[tool];
+  const preflight: GatePreflightGap[] = [];
   if (extractRefs && (args as any)?.acknowledge_unsound !== true) {
     for (const ref of extractRefs(args)) {
       let partId: number | null = null;
-      if (typeof ref.part_id === "number") partId = ref.part_id;
-      else if (typeof ref.uuid === "string" && ref.uuid.length > 0) {
-        partId = await partIdForUuid(ref.uuid);
+      if (typeof ref.part_id === "number") {
+        partId = ref.part_id;
+      } else if (typeof ref.uuid === "string" && ref.uuid.length > 0) {
+        const resolved = await partIdForUuid(ref.uuid);
+        if ("unavailable" in resolved) {
+          preflight.push({
+            ref: ref.uuid,
+            stage: "resolve",
+            reason: resolved.unavailable,
+          });
+          continue; // pre-flight could not complete → proceed; the handler
+          // still runs and its own ambient certificate tells the truth
+        }
+        partId = resolved.partId;
       }
-      if (partId === null) continue; // unresolvable → the handler fails loudly itself
+      if (partId === null) continue; // uuid genuinely not in the live scene —
+      // the pre-flight DID complete; the handler fails loudly on its own
       const v = await liveVerdict(partId);
-      if (v && v.sound === false) {
-        return unsoundBaseGateRefusal(tool, partId, v.verdict);
+      if ("unavailable" in v) {
+        preflight.push({
+          ref: typeof ref.uuid === "string" && ref.uuid.length > 0 ? ref.uuid : `part ${partId}`,
+          stage: "verify",
+          reason: v.unavailable,
+        });
+        continue; // verdict unavailable → proceed; the op's own ambient
+        // certificate still reports the truth (see module doc: no assertion
+        // is made, so nothing is approximated).
       }
-      // v === null → verdict unavailable → proceed; the op's own ambient
-      // certificate still reports the truth (see module doc: no assertion is
-      // made, so nothing is approximated).
+      if (v.verdict && v.verdict.sound === false) {
+        return { refusal: unsoundBaseGateRefusal(tool, partId, v.verdict.verdict) };
+      }
+      // v.verdict === null → no live fact of a DIFFERENT kind (unreadable
+      // response shape, not a fetch failure) → proceed silently, unchanged
+      // from this gate's behaviour before this item.
     }
   }
 
   // 4. Sheet-export gate (live certificate; fails CLOSED — see module doc).
   if (tool === "drawing_export_sheet") {
-    return sheetExportGate(args);
+    const sheetRefusal = await sheetExportGate(args);
+    if (sheetRefusal) return { refusal: sheetRefusal };
   }
 
-  return null;
+  return preflight.length > 0 ? { proceed: true, preflight } : { proceed: true };
+}
+
+/**
+ * Merge gate 3's fail-open notes into a PROCEEDING op's own result — never a
+ * side channel. `readToolResult` (roshera-rl/lib/mcp_session.mjs) builds its
+ * `data` field from exactly the first text content block's JSON, and every
+ * downstream reader (reward.mjs, episode.mjs) reads `data`, not
+ * `structuredContent` — checked, not assumed, before choosing this over a
+ * second content block or a `structuredContent` field, either of which a
+ * trajectory would silently never read.
+ *
+ * Only merges when that block parses as a JSON OBJECT — the `ok()`/`okp()`
+ * success shape. A `fail()` result is prose by construction (`ERROR: <msg>`)
+ * and is left completely untouched: forcing a key into it would trade one
+ * invisible failure mode for a worse one (corrupted tool output), and an
+ * op's own failure already makes that step visibly different from a clean
+ * pass — the ambiguity this item exists to remove is specifically between
+ * two SUCCESSFUL, otherwise-identical results.
+ *
+ * A result that already carries `gate_preflight` (should never happen — no
+ * handler sets this key) is left alone rather than overwritten, on the same
+ * "never fabricate" discipline the rest of this module follows.
+ *
+ * NEVER THROWS. Any shape this cannot safely annotate is returned completely
+ * unchanged — the disclosure itself must never become a new way for a call
+ * to fail (an explicit constraint of this item).
+ */
+export function attachGatePreflightGaps(
+  result: any,
+  gaps: GatePreflightGap[] | undefined,
+): any {
+  if (!Array.isArray(gaps) || gaps.length === 0) return result;
+  try {
+    const content: any[] = Array.isArray(result?.content) ? result.content : [];
+    const idx = content.findIndex(
+      (c) => c?.type === "text" && typeof c.text === "string",
+    );
+    if (idx === -1) return result;
+    const parsed = JSON.parse(content[idx].text);
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return result;
+    }
+    if ("gate_preflight" in parsed) return result;
+    const withMarker = {
+      ...parsed,
+      gate_preflight: "unavailable",
+      gate_preflight_gaps: gaps,
+    };
+    const newContent = content.slice();
+    newContent[idx] = { ...content[idx], text: JSON.stringify(withMarker, null, 2) };
+    return { ...result, content: newContent };
+  } catch {
+    return result;
+  }
 }
 
 /**

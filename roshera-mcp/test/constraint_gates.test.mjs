@@ -32,6 +32,10 @@ import { fileURLToPath } from "node:url";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const UUID = "11111111-2222-4333-8444-555555555555";
+// A SECOND object/part, dedicated to the gate-3 fail-open (S4) tests below —
+// isolated from UUID/part 7 so toggling its snapshot/perception failure mode
+// cannot perturb any assertion that already runs against part 7.
+const UUID2 = "66666666-7777-4888-8999-aaaaaaaaaaaa";
 
 // ─── Stub backend ───────────────────────────────────────────────────────────
 
@@ -41,8 +45,18 @@ const counts = {
   shell: 0,
   checkpoint: 0,
   blackboard: 0,
+  perception2: 0,
 };
 let partSound = false;
+// Gate-3 fail-open (S4) controls for UUID2/part 42. "ok" leaves both fetches
+// answering normally; "fail" answers with a 404 (so the pre-flight fetch
+// THROWS, exercising the S4 catch paths — gates.ts:485-487/507-509 before
+// this item, now the `unavailable` arms of partIdForUuid/liveVerdict);
+// "hang" never responds, so the client's own AbortSignal.timeout fires
+// (ROSHERA_MCP_PERCEPTION_TIMEOUT_MS is set below, before the fixture is
+// imported, so this resolves in well under a second).
+let snapshotMode = "ok"; // "ok" | "fail" | "hang"
+let perceptionMode2 = "ok"; // "ok" | "fail" | "hang" — governs part 42 only
 
 const stub = http.createServer((req, res) => {
   const url = req.url ?? "";
@@ -55,8 +69,16 @@ const stub = http.createServer((req, res) => {
   req.on("end", () => {
     if (req.method === "GET" && url === "/api/scene/snapshot") {
       counts.snapshot++;
+      if (snapshotMode === "hang") return; // never respond — client times out
+      if (snapshotMode === "fail") {
+        res.writeHead(404, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify({ error: "no such document" }));
+      }
       return send({
-        objects: [{ id: UUID, analytical_geometry: { solid_id: 7 } }],
+        objects: [
+          { id: UUID, analytical_geometry: { solid_id: 7 } },
+          { id: UUID2, analytical_geometry: { solid_id: 42 } },
+        ],
       });
     }
     if (req.method === "GET" && url === "/api/agent/parts/7/perception") {
@@ -69,6 +91,15 @@ const stub = http.createServer((req, res) => {
             open_edges: 3,
             verdict: "UNSOUND — see verify_part",
           });
+    }
+    if (req.method === "GET" && url === "/api/agent/parts/42/perception") {
+      counts.perception2++;
+      if (perceptionMode2 === "hang") return; // never respond — client times out
+      if (perceptionMode2 === "fail") {
+        res.writeHead(404, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify({ error: "no such part" }));
+      }
+      return send({ valid: true, watertight: true, open_edges: 0 });
     }
     if (req.method === "GET" && url === "/api/agent/parts/7") {
       return send({
@@ -119,6 +150,10 @@ const port = stub.address().port;
 
 // BASE is read at core.js module load — set it BEFORE importing anything.
 process.env.ROSHERA_URL = `http://127.0.0.1:${port}`;
+// PERCEPTION_TIMEOUT_MS is also read at core.js module load. Lowered so the
+// "hang" fail-open tests below resolve in well under a second instead of
+// waiting out the production 4000ms default.
+process.env.ROSHERA_MCP_PERCEPTION_TIMEOUT_MS = "200";
 
 const { buildTable } = await import(
   pathToFileURL(join(HERE, ".build", "surface.js")).href
@@ -286,7 +321,85 @@ const r6 = await call("shell", shellArgs);
 check("repaired base (live verdict sound) proceeds without the flag", () => {
   assert.equal(firstJson(r6).refused, undefined);
   assert.equal(counts.shell, 2);
+  // A result with a COMPLETE pre-flight must be unchanged — no key added, no
+  // shape change (item 1's own constraint). Pinned here, on a call that ran
+  // through the real gate 3 loop and found the base genuinely sound, so a
+  // regression that started stamping `gate_preflight` on every proceed (not
+  // only a fail-open one) would be caught here, not only on the new tests
+  // below that expect the marker.
+  assert.deepEqual(
+    Object.keys(firstJson(r6)).sort(),
+    ["object_uuid", "part_id", "perception", "placement", "triangles"].sort(),
+    "no gate_preflight (or any other new key) on a call whose pre-flight completed",
+  );
+});
+
+// ─── S4 — gate 3's fail-open, made visible (item 1) ─────────────────────────
+//
+// Two independent skip paths, each proven separately, per the brief:
+//  - partIdForUuid's live fetch fails → the ref cannot even be RESOLVED
+//    (gates.ts's `resolve` stage) — the op still proceeds (fail-open stays
+//    open) and its result now carries `gate_preflight: "unavailable"` naming
+//    the ref and the underlying error.
+//  - liveVerdict's live fetch fails → the ref resolves but its verdict
+//    cannot be READ (`verify` stage) — same proceed, same marker, and the
+//    reason text is provably DIFFERENT (a timeout vs a 404), so a reader can
+//    tell them apart rather than seeing an undifferentiated "unavailable".
+// UUID2/part 42 is used throughout so `counts.shell` / `counts.perception`
+// from the part-7 tests above are never touched by these.
+
+const shellArgs2 = { object: UUID2, thickness: 2, faces_to_remove: [] };
+
+snapshotMode = "fail"; // GET /api/scene/snapshot → 404, so the resolve step throws
+const shellBeforeResolveFail = counts.shell;
+const r7 = await call("shell", shellArgs2);
+check("resolve-stage fail-open (404 on snapshot) still lets the op proceed", () => {
+  assert.equal(firstJson(r7).refused, undefined, "the fail-open must REMAIN open — never a refusal");
+  assert.equal(counts.shell, shellBeforeResolveFail + 1, "the kernel op actually ran");
+});
+check("resolve-stage fail-open is now MARKED, naming the ref and the 404", () => {
+  const j = firstJson(r7);
+  assert.equal(j.gate_preflight, "unavailable");
+  assert.equal(j.gate_preflight_gaps.length, 1);
+  assert.equal(j.gate_preflight_gaps[0].ref, UUID2);
+  assert.equal(j.gate_preflight_gaps[0].stage, "resolve");
+  assert.match(j.gate_preflight_gaps[0].reason, /404/, "the reason names the 404, not a generic label");
+});
+snapshotMode = "ok";
+
+perceptionMode2 = "hang"; // resolves fine (part 42); the perception read times out
+const perception2Before = counts.perception2;
+const shellBeforeVerifyFail = counts.shell;
+const r8 = await call("shell", shellArgs2);
+check("verify-stage fail-open (perception timeout) still lets the op proceed", () => {
+  assert.equal(firstJson(r8).refused, undefined, "the fail-open must REMAIN open — never a refusal");
+  assert.equal(counts.shell, shellBeforeVerifyFail + 1, "the kernel op actually ran");
+  assert.equal(counts.perception2, perception2Before + 1, "the live fetch really was attempted");
+});
+check("verify-stage fail-open is MARKED, and the reason names a TIMEOUT — distinct from the 404 above", () => {
+  const j = firstJson(r8);
+  assert.equal(j.gate_preflight, "unavailable");
+  assert.equal(j.gate_preflight_gaps.length, 1);
+  assert.equal(j.gate_preflight_gaps[0].ref, UUID2);
+  assert.equal(j.gate_preflight_gaps[0].stage, "verify");
+  assert.match(j.gate_preflight_gaps[0].reason, /timed out after 200ms/);
+  assert.doesNotMatch(j.gate_preflight_gaps[0].reason, /404/,
+    "a timeout must not read the same as the 404 case — a reader tells them apart");
+});
+perceptionMode2 = "ok";
+
+const r9 = await call("shell", shellArgs2);
+check("once both fetches answer again, the SAME base ref proceeds with no marker at all", () => {
+  const j = firstJson(r9);
+  assert.equal(j.refused, undefined);
+  assert.equal(j.gate_preflight, undefined, "absent marker means the gate ran — must stay true");
+  assert.equal(j.gate_preflight_gaps, undefined);
 });
 
 stub.close();
+// Two of the checks above deliberately leave a request unanswered (the
+// "hang" fail-open modes) so the CLIENT's own timeout fires; the server side
+// of that socket is otherwise left dangling. Force it closed so the process
+// exits promptly instead of waiting on a connection nothing will ever answer.
+stub.closeAllConnections();
 console.log(`\nconstraint_gates: ${passed} checks passed`);

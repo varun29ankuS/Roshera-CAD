@@ -385,6 +385,17 @@ export async function runEpisode({
             reason: result.data?.reason ?? result.data?.refused?.error ?? result.text ?? null,
           }
         : null,
+      // gate 3's fail-open, made legible (item 1, audit S4): `result.data` is
+      // the op's OWN result, which `registry.ts`'s `attachGatePreflightGaps`
+      // merges these two keys into ONLY when a live pre-flight fetch could
+      // not complete. `resultDigest` above is a HASH — nothing downstream can
+      // read a reason out of it — so this is the one line that actually
+      // carries the fact from gates.ts into a step a trajectory can be
+      // scored on. Straight pass-through, undefined on the (overwhelmingly
+      // common) path where the pre-flight completed, exactly mirroring
+      // gates.ts's own choice never to stamp a healthy call `"ok"`.
+      gatePreflight: result?.data?.gate_preflight,
+      gatePreflightGaps: result?.data?.gate_preflight_gaps,
       ms: Date.now() - t0,
     });
     if (result?.rate_limited === true) {
