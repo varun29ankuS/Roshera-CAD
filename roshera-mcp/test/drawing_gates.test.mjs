@@ -55,6 +55,14 @@ let partSound = false;
 // not merely that the export proceeded (a call that never sends the flag at
 // all would also "proceed" once the certificate is clean).
 let lastPdfQuery = undefined;
+// The `acknowledge_unsound` value each route actually received. Separate from
+// the layout flag on purpose: the server refuses a sheet of an UNSOUND SOLID
+// and a sheet with poor LAYOUT QUALITY for two different reasons, and
+// `acknowledge_layout_issues` deliberately does not open the first. If these
+// were captured in one variable a test could not tell a correct forward from a
+// collapsed one.
+let lastMakeAckUnsound = undefined;
+let lastPdfAckUnsound = undefined;
 
 // The live sheet certificate the stub serves — mutated between phases.
 let cert = {
@@ -92,6 +100,7 @@ const stub = http.createServer((req, res) => {
     }
     if (req.method === "POST" && url.startsWith("/api/parts/9/drawing")) {
       counts.make++;
+      lastMakeAckUnsound = new URLSearchParams(qs ?? "").get("acknowledge_unsound");
       return send({
         id: DRAWING,
         quality: { passed: true, sheet_utilization: 0.4, issues: [] },
@@ -104,6 +113,7 @@ const stub = http.createServer((req, res) => {
     if (req.method === "GET" && url === `/api/drawings/${DRAWING}/pdf`) {
       counts.pdf++;
       lastPdfQuery = new URLSearchParams(qs ?? "").get("acknowledge_layout_issues");
+      lastPdfAckUnsound = new URLSearchParams(qs ?? "").get("acknowledge_unsound");
       res.writeHead(200, { "Content-Type": "application/pdf" });
       return res.end(PDF_BYTES);
     }
@@ -278,15 +288,59 @@ check("a certified clean sheet exports plainly", () => {
   assert.equal(lastPdfQuery, null, "no acknowledge_layout_issues query param when the flag was never passed");
 });
 
+// ─── 3b. acknowledge_unsound reaches BOTH sheet routes ──────────────────────
+//
+// The server now refuses a sheet of a solid the kernel has verified UNSOUND —
+// at creation AND at export — which is a different fact from the sheet's own
+// layout quality. Before this, neither `make_drawing` nor
+// `drawing_export_sheet` forwarded `acknowledge_unsound` at all, so an agent
+// deliberately producing an inspection sheet of a BROKEN part could satisfy
+// gates.ts and still be refused 409 by the server with no way to say what it
+// had already said. A gate a caller cannot legitimately escape is a bug, not
+// a constraint.
+//
+// Asserting on the wire, not on success: once the stub's certificate is clean
+// a call that forwarded NOTHING would also "proceed", so proceeding proves
+// nothing here.
+
+const a1 = await call("make_drawing", { part_id: 9, acknowledge_unsound: true });
+check("make_drawing forwards acknowledge_unsound to the creation route", () => {
+  assert.equal(firstJson(a1).refused, undefined);
+  assert.equal(lastMakeAckUnsound, "true", "the acknowledgement reached the wire");
+});
+
+const a2 = await call("make_drawing", { part_id: 9 });
+check("make_drawing never defaults acknowledge_unsound onto a call that omitted it", () => {
+  assert.equal(firstJson(a2).refused, undefined);
+  assert.equal(lastMakeAckUnsound, null, "an omission must stay an omission on the wire");
+});
+
+rmSync(OUT, { force: true });
+const a3 = await call("drawing_export_sheet", { ...exportArgs, acknowledge_unsound: true });
+check("drawing_export_sheet forwards acknowledge_unsound, distinctly from the layout flag", () => {
+  assert.equal(firstJson(a3).refused, undefined);
+  assert.equal(lastPdfAckUnsound, "true", "the acknowledgement reached the export route");
+  // The two escapes must stay SEPARATE: acknowledging a rough layout is not
+  // the same statement as acknowledging broken geometry, and the server pins
+  // that asymmetry too.
+  assert.equal(lastPdfQuery, null, "acknowledging unsoundness must not silently assert the layout flag");
+});
+
 // ─── 4. unreadable certificate fails CLOSED ─────────────────────────────────
 
+// Captured rather than hardcoded: the property this check actually owns is
+// "the refused call did NOT reach the artifact endpoint", which is a
+// DIFFERENCE of zero. A literal expectation makes it fail whenever any
+// unrelated export is added above — which is a test breaking on bookkeeping,
+// not on behaviour, and invites bumping the number instead of reading it.
+const pdfCountBeforeUnknown = counts.pdf;
 const u1 = await call("drawing_export_sheet", {
   ...exportArgs,
   drawing_id: UNKNOWN,
 });
 check("unreadable certificate refuses the export (gate: sheet_uncertified)", () => {
   assert.ok(isRefusal(u1, "sheet_uncertified"));
-  assert.equal(counts.pdf, 2, "artifact endpoint not touched again");
+  assert.equal(counts.pdf, pdfCountBeforeUnknown, "artifact endpoint not touched again");
   assert.match(firstJson(u1).reason, /could not be read/);
 });
 

@@ -157,18 +157,23 @@ export function registerIoTools(server: ToolHost) {
       // backend — the handler below deliberately ignores it. Unlike the 9
       // mutating geometry routes ACK_UNSOUND's doc comment (modify.ts)
       // describes, `POST /api/parts/{id}/drawing` (drawing_mgr::
-      // create_part_drawing) has NO `refuse_unsound_base` call of its own
-      // (verified against every call site in api-server/src/main.rs) — the
-      // unsound-base rule for this tool lives ONLY in gates.ts today, so
-      // there is nothing on the wire for this flag to satisfy. Forwarding it
-      // would be a silent no-op (the endpoint takes a query struct with no
-      // such field). If the backend ever grows a drawing-side gate, this
-      // comment and the handler both need to change together.
+      // create_part_drawing) NOW carries its own server-side solid-soundness
+      // refusal, so this flag is forwarded rather than dropped. It used to be
+      // a client-only check whose comment here said, in as many words, that
+      // "if the backend ever grows a drawing-side gate, this comment and the
+      // handler both need to change together" — this is that change. Without
+      // the forward, an agent deliberately inspecting a BROKEN part's drawing
+      // acknowledges the unsoundness at the gate, gets past gates.ts, and is
+      // then refused 409 by the server with no way to say so: a gate the
+      // caller cannot legitimately escape is a bug, not a constraint.
       acknowledge_unsound: ACK_UNSOUND,
     },
-    async ({ part_id, name }) => {
+    async ({ part_id, name, acknowledge_unsound }) => {
       try {
-        const qs = name ? `?name=${encodeURIComponent(name)}` : "";
+        const params = new URLSearchParams();
+        if (name) params.set("name", name);
+        if (acknowledge_unsound === true) params.set("acknowledge_unsound", "true");
+        const qs = params.toString() ? `?${params.toString()}` : "";
         const r = await api("POST", `/api/parts/${part_id}/drawing${qs}`);
         const q = r?.quality ?? null;
         return ok({
@@ -229,13 +234,27 @@ export function registerIoTools(server: ToolHost) {
             "quality certificate has Error findings (otherwise refused). " +
             "Never bypasses stale/dangling facts.",
         ),
+      // The export routes ALSO refuse a sheet of a solid the kernel has
+      // verified UNSOUND, which is a different fact from the sheet's own
+      // layout quality: `acknowledge_layout_issues` deliberately does not
+      // open it (pinned server-side by
+      // `acknowledge_layout_issues_does_not_bypass_an_unsound_solid`). Two
+      // distinct refusals need two distinct acknowledgements — collapsing
+      // them would let a caller who meant "the layout is rough" also assert
+      // "and I know the geometry is broken", which they never said.
+      acknowledge_unsound: ACK_UNSOUND,
     },
-    async ({ drawing_id, format, file_name, save_path, acknowledge_layout_issues }) => {
+    async ({
+      drawing_id, format, file_name, save_path,
+      acknowledge_layout_issues, acknowledge_unsound,
+    }) => {
       try {
         const { join } = await import("node:path");
         const dest = save_path ?? join(await defaultSaveDir(), file_name);
-        const qs =
-          acknowledge_layout_issues === true ? "?acknowledge_layout_issues=true" : "";
+        const params = new URLSearchParams();
+        if (acknowledge_layout_issues === true) params.set("acknowledge_layout_issues", "true");
+        if (acknowledge_unsound === true) params.set("acknowledge_unsound", "true");
+        const qs = params.toString() ? `?${params.toString()}` : "";
         const bytes = await saveBinary(
           `/api/drawings/${drawing_id}/${format}${qs}`,
           dest,
