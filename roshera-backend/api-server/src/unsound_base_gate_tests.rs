@@ -504,23 +504,18 @@ async fn the_rust_gate_and_gates_ts_name_the_same_rule_and_escape() {
         );
     }
 
-    // Every base-taking op the TS gate covers that is ALSO reachable over
-    // plain REST must be covered here. (`make_drawing` is a drawing gate,
-    // deliberately out of scope; `boolean_many` and `drill_pattern` are MCP
-    // compositions over the REST booleans, which ARE gated below.)
-    for tool in [
-        "boolean:",
-        "shell:",
-        "transform:",
-        "fillet_edges:",
-        "chamfer_edges:",
-    ] {
-        assert!(
-            src.contains(tool),
-            "gates.ts::BASE_REFS no longer lists {tool:?} — the two gates' \
-             coverage has diverged"
-        );
-    }
+    // Coverage (does the TS key SET match the Rust call-site SET, modulo an
+    // explicit exemption list?) used to be checked here as five hardcoded
+    // substring lookups — pure presence, unable to fail on a dropped Rust
+    // route, an added TS key, or an escape-semantics mismatch (item 6, audit
+    // S8: "the two sets already differ in both directions, measured"). That
+    // coverage question now has its OWN test, derived from both files'
+    // source text rather than hardcoded twice:
+    // `gate3_drift_set_equality_tests::the_two_base_ref_surfaces_are_equal_
+    // modulo_the_exemption_list`. This test keeps the identity/escape needle
+    // checks above (a DIFFERENT question — do the two sides agree on the
+    // gate's NAME and ESCAPE TOKEN, not on which routes it covers) and the
+    // live-refusal verdict-string check below.
 
     // Now the Rust side of the same three facts, read off a live refusal.
     let state = make_test_state().await;

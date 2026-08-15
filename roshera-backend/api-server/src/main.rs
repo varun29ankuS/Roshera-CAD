@@ -40,10 +40,14 @@ mod durability;
 mod durability_boot_tests;
 mod error_catalog;
 mod evidence_pack_tests;
+#[cfg(test)]
+mod export_unsound_gate_tests;
 mod fillet_payload;
 #[cfg(test)]
 mod fillet_radius_harness;
 mod frame;
+#[cfg(test)]
+mod gate3_drift_set_equality_tests;
 #[cfg(test)]
 mod geometry_routes_coverage_tests;
 mod goose_acp;

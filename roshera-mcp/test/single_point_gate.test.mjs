@@ -27,6 +27,17 @@
  *   6. counters are PER SKETCH — a parallel second sketch has its own run;
  *   7. sketch_points rides the same gate when called with ONE point per
  *      call, while a legitimate multi-point call neither counts nor trips.
+ *
+ * Item 9 (2026-08-15, audit S11) additions — the CUMULATIVE counter that
+ * closes the interleave escape the run counter alone leaves open
+ * (`point×8 → filler → repeat` never trips the run cap):
+ *   8. 4 interleaved 8-point bursts (32 points, one filler call between
+ *      each) all reach the backend — the run cap never trips, isolating
+ *      the cumulative condition — and the 33rd point (a 5th burst after
+ *      the SAME filler trick) is refused typed (gate:
+ *      single_point_cumulative), with a further filler call NOT unblocking
+ *      it and the refusal read fresh every time, never cache-replayed;
+ *   9. the cumulative counter is per sketch, same as the run counter.
  */
 
 import assert from "node:assert/strict";
@@ -217,6 +228,103 @@ check("a multi-point call neither counts nor trips, and resets the run", () => {
   // 8 single points + 4 from the multi-point call + 1 after the reset.
   assert.equal(counts.clickPoint, 13, "every allowed point reached the backend");
 });
+
+// ─── 8. the cumulative counter closes the interleave escape (item 9) ───────
+//
+// S11's exploit: psketch_add_entity{point}×8 → list_parts{} → repeat never
+// trips the RUN counter (each burst is exactly 8, and the filler call
+// resets it before the next burst starts) while still reaching arbitrarily
+// large point counts at the cost of one cheap call per 8 points. A fresh
+// sketch (SK_C) isolates this from every counter state built up above.
+
+const SK_C = "cccccccc-3333-4333-8333-333333333333";
+const beforeC = counts.psketchPoint;
+
+let sawRefusalDuringBursts = false;
+for (let burst = 0; burst < 4 && !sawRefusalDuringBursts; burst++) {
+  for (let i = 0; i < 8; i++) {
+    const r = await addPoint(SK_C, burst * 100 + i, 0);
+    if (firstJson(r).refused) {
+      sawRefusalDuringBursts = true;
+      break;
+    }
+  }
+  await call("list_parts", {}); // the filler — resets the RUN counter only
+}
+check(
+  "32 points across 4 interleaved 8-point bursts all reach the backend (the run cap never trips)",
+  () => {
+    assert.equal(
+      sawRefusalDuringBursts,
+      false,
+      "the filler-call trick must not trip the RUN gate itself — that would " +
+        "mean this test is no longer isolating the cumulative condition",
+    );
+    assert.equal(
+      counts.psketchPoint - beforeC,
+      32,
+      "all 32 points across the 4 bursts must reach the backend",
+    );
+  },
+);
+
+const r33 = await addPoint(SK_C, 999, 0);
+check(
+  "the 33rd point — a 5th burst after the SAME filler trick — is refused " +
+    "(gate: single_point_cumulative), closing the interleave escape",
+  () => {
+    assert.ok(isRefusal(r33, "single_point_cumulative"));
+    assert.equal(r33.isError, true);
+    const j = firstJson(r33);
+    assert.equal(j.points_placed_cumulative, 32);
+    assert.match(j.how_to_proceed, /polyline/);
+    assert.equal(
+      counts.psketchPoint - beforeC,
+      32,
+      "backend never saw the 33rd point",
+    );
+  },
+);
+
+// The filler trick that resets the RUN counter does NOT help here — that is
+// the entire point of the fix.
+await call("list_parts", {});
+const r34 = await addPoint(SK_C, 1000, 0);
+check(
+  "another filler call does not unblock the cumulative refusal — the interleave escape stays closed",
+  () => {
+    assert.ok(isRefusal(r34, "single_point_cumulative"));
+    assert.equal(
+      counts.psketchPoint - beforeC,
+      32,
+      "still backend-untouched after the filler",
+    );
+  },
+);
+
+const r35 = await addPoint(SK_C, 1001, 0);
+check(
+  "the cumulative refusal is a fresh live read every time, never a refusal-cache replay",
+  () => {
+    assert.ok(isRefusal(r35, "single_point_cumulative"));
+    assert.equal(
+      r35.content.length,
+      1,
+      "fresh live refusal — never a refusal-cache replay",
+    );
+  },
+);
+
+// ─── 9. the cumulative counter is per sketch ────────────────────────────────
+
+const SK_D = "dddddddd-4444-4444-8444-444444444444";
+const dFirst = await addPoint(SK_D, 0, 0);
+check(
+  "a fresh sketch is unaffected by SK_C's cumulative cap — counters are per sketch",
+  () => {
+    assert.equal(firstJson(dFirst).refused, undefined);
+  },
+);
 
 stub.close();
 console.log(`\nsingle_point_gate: ${passed} checks passed`);

@@ -99,6 +99,15 @@ pub struct ExportRequest {
     /// exports.
     #[serde(default)]
     pub quality: crate::DisplayQuality,
+    /// Repair-flow override for the P1 unsound-solid gate (item 8,
+    /// 2026-08-15): proceed although a selected solid's live kernel
+    /// verdict is `Unsound` (otherwise refused). Mirrors `acknowledge_
+    /// unsound` on the 10 mutating routes gated by `refuse_unsound_base`
+    /// — same token, same scope (never bypasses the separate `Stale`/
+    /// never-verified branch, which has no escape). Defaults to `false`
+    /// so an omitted field never silently opens the gate.
+    #[serde(default)]
+    pub acknowledge_unsound: bool,
 }
 
 /// Response for export operation

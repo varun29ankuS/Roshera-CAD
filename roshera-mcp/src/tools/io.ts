@@ -89,7 +89,12 @@ export function registerIoTools(server: ToolHost) {
       "return the absolute path. `objects` empty = every solid. Saves to " +
       "`save_path`, else ~/Desktop/<file_name>. ENFORCED: refused (422) for any " +
       "part mutated (or never certified) since its last full verification — " +
-      "call verify_part first. An unverified solid cannot become a file.",
+      "call verify_part first. ALSO ENFORCED (409): refused for any part " +
+      "whose live kernel verdict is unsound, even if fully verified — an " +
+      "exported file carries no certificate, so shipping a known defect as a " +
+      "file is the same hole gate 4 closed for drawings (acknowledge_unsound " +
+      "for a deliberate export of the defect). An unverified OR unsound " +
+      "solid cannot become a file.",
     {
       format: z.enum(["STEP", "STL", "OBJ"]).default("STEP").describe("output file format"),
       objects: z
@@ -108,10 +113,16 @@ export function registerIoTools(server: ToolHost) {
         .enum(["Low", "Medium", "High"])
         .default("High")
         .describe("tessellation quality for STL/OBJ meshes"),
+      acknowledge_unsound: ACK_UNSOUND,
     },
-    async ({ format, objects, file_name, save_path, quality }) => {
+    async ({ format, objects, file_name, save_path, quality, acknowledge_unsound }) => {
       try {
-        const r = await api("POST", "/api/export", { format, objects, quality });
+        const r = await api("POST", "/api/export", {
+          format,
+          objects,
+          quality,
+          ...(acknowledge_unsound ? { acknowledge_unsound: true } : {}),
+        });
         if (!r?.download_url) {
           throw new Error(`export returned no download_url: ${JSON.stringify(r)}`);
         }

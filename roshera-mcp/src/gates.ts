@@ -69,20 +69,38 @@
  *          uncertified WOULD be an approximation labeled as exact.
  *      All three are live facts and are never served from the refusal cache.
  *
- *   5. SINGLE-POINT-RUN GATE (2026-08-09 token-burn constraint). Measured
- *      failure: an agent laid out a 256-point gear profile one
- *      psketch_add_entity {kind:'point'} call at a time — 1.3M tokens for
- *      geometry ONE polyline call expresses. The tool descriptions already
- *      steer against it ("NEVER loop this tool"); steering is ignorable, so
- *      this gate is the constraint: after SINGLE_POINT_RUN_MAX consecutive
- *      successful single-point additions to the SAME sketch with no other
- *      call in between, the next one is refused typed, naming the count and
- *      the bulk path (psketch_add_entity kind:'polyline' — every vertex in
- *      ONE call). ANY other tool call resets the counters, so a legitimate
+ *   5. SINGLE-POINT-RUN GATE (2026-08-09 token-burn constraint; cumulative
+ *      half added 2026-08-15, audit S11/item 9). Measured failure: an agent
+ *      laid out a 256-point gear profile one psketch_add_entity
+ *      {kind:'point'} call at a time — 1.3M tokens for geometry ONE
+ *      polyline call expresses. The tool descriptions already steer against
+ *      it ("NEVER loop this tool"); steering is ignorable, so this gate is
+ *      the constraint: after SINGLE_POINT_RUN_MAX consecutive successful
+ *      single-point additions to the SAME sketch with no other call in
+ *      between, the next one is refused typed, naming the count and the
+ *      bulk path (psketch_add_entity kind:'polyline' — every vertex in ONE
+ *      call). ANY other tool call resets the RUN counter, so a legitimate
  *      small sketch (2-8 named vertices for constraints) never meets the
- *      gate. Purely MCP-side session state — no backend change — and never
- *      served from the refusal cache: the counter is live state this
- *      session's own next call can reset, so every re-issue re-reads it.
+ *      gate.
+ *
+ *      The run counter alone is defeated by ONE filler call per burst:
+ *      `psketch_add_entity{point}×8 → list_parts{} → repeat` never trips it
+ *      while still reaching the 256-point failure mode at the cost of one
+ *      cheap call per 8 points — acknowledged in the run counter's own
+ *      design as the price of never bothering a legitimate small sketch,
+ *      which is the right trade for a SAFETY RAIL but the wrong one for a
+ *      TRAINING SIGNAL: it teaches "insert a filler call", not "use the
+ *      bulk path". A SEPARATE cumulative counter closes that: it counts
+ *      every successful single-point addition to a sketch across the WHOLE
+ *      session and is NEVER reset by an intervening call — not by a filler
+ *      call (the whole point) and not even by a polyline call to the SAME
+ *      sketch (the round-trip cost already spent placing the points already
+ *      placed is not undone by later bulk work; the cumulative total is a
+ *      permanent fact about this sketch's history). Both counters ride the
+ *      same live-fact discipline (session state, never cached) but trip
+ *      under DIFFERENT typed gate names (`single_point_run` /
+ *      `single_point_cumulative`) so a trajectory can tell which condition
+ *      fired. Purely MCP-side session state — no backend change.
  *
  *   6. VERIFICATION-SCOPE GATE (2026-08-11, task #9 half B). Gate 2 forces an
  *      intent to be DECLARED before geometry is built. Nothing forced anyone
@@ -311,6 +329,19 @@ const BASE_REFS: Record<
   // from an unsound solid dimensions the defect as truth. acknowledge_unsound
   // is the deliberate inspection-sheet flow (a drawing OF the defect).
   make_drawing: (a) => [{ part_id: a?.part_id }],
+  // Item 8 (audit S5, 2026-08-15): an STL/STEP/OBJ file on disk carries NO
+  // ambient certificate — the exact argument gate 4 (sheet-export) was built
+  // on, applied to the more common export path. `objects` empty means
+  // "every solid" (io.ts: export_part) and is left UNCHECKED here — this
+  // pre-flight can only gate refs it can name without a second fetch — the
+  // server-side mirror in export.rs has no such gap: it iterates the
+  // resolved solid set unconditionally, empty selection included.
+  export_part: (a) =>
+    Array.isArray(a?.objects)
+      ? a.objects
+          .filter((u: unknown) => typeof u === "string")
+          .map((uuid: string) => ({ uuid }))
+      : [],
 };
 
 /**
@@ -326,6 +357,16 @@ const LIVE_FACT_GATES = new Set<string>([
   "sheet_quality",
   "sheet_uncertified",
   "single_point_run",
+  // Item 9 (audit S11, 2026-08-15): the cumulative counter never resets on
+  // its own next call the way the run counter does — it only ever grows —
+  // so caching its refusal would not create the deadlock the doc comment
+  // above warns about for gate 6. It is listed here for the SAME reason
+  // `unsound_base` is: the underlying fact is live session state read fresh
+  // on every dispatch (not a fixed fact about the arguments), so a cached
+  // refusal could go STALE the moment the cumulative count changes shape
+  // (e.g. a future change adds a way to lower it) — every re-issue re-reads
+  // the counter rather than trusting a cached verdict about it.
+  "single_point_cumulative",
   // Gate 6: the unverified-work list is live session state this session's own
   // next call clears. Caching it would deadlock precisely the caller who
   // COMPLIED — verify_part, then re-issue the identical checkpoint, and be
@@ -455,6 +496,31 @@ const SINGLE_POINT_RUN_MAX = 8;
  *  against a pathological interleave — clearing early only ever ALLOWS calls. */
 const pointRuns = new Map<string, number>();
 
+/** Total single-point additions allowed to one sketch across the WHOLE
+ *  session before every further one is refused, regardless of run resets
+ *  (item 9, audit S11). 4x SINGLE_POINT_RUN_MAX: generous enough that
+ *  legitimate named-anchor work spread across several short bursts (a
+ *  handful of constraint points after each of a few separate profile
+ *  edits) never trips it — the existing single_point_gate.test.mjs
+ *  scenarios organically reach 24 cumulative points on one sketch across
+ *  their run-reset exercises and none of them needed to change — but small
+ *  enough that the interleave escape (8 points, 1 filler, repeat) is
+ *  blocked at the 5th burst: 32 points, not the 256 the 1.3M-token failure
+ *  was measured at. */
+const SINGLE_POINT_CUMULATIVE_MAX = 32;
+
+/** Per-sketch TOTAL of successful single-point additions, EVER — never
+ *  reset by an intervening call (that is the entire point: the run counter
+ *  alone is defeated by one filler call between every burst, S11). Not even
+ *  a polyline call to the SAME sketch clears this: the round-trip/token
+ *  cost of the single-point calls already made was already paid, and is
+ *  not undone by later good behaviour — the cumulative total is a
+ *  permanent fact about this sketch's history, not a debt later bulk work
+ *  forgives. Cleared only by the same 64-sketch wholesale bound `pointRuns`
+ *  uses (independently applied to this map's own size) and by
+ *  resetSessionGates() (test seam). */
+const pointCumulative = new Map<string, number>();
+
 /**
  * The per-sketch counter key when `tool(args)` is a single-point addition,
  * else null. Two shapes qualify:
@@ -490,6 +556,7 @@ export function resetSessionGates(): void {
   openIntent = null;
   clearUnverified();
   pointRuns.clear();
+  pointCumulative.clear();
 }
 
 // ─── Live-verdict lookups (pre-flight, short budget, honest on failure) ─────
@@ -635,6 +702,41 @@ function singlePointRunRefusal(tool: string, count: number) {
       "polyline). The points already placed are live and unaffected. " +
       "kind:'point' remains available for the few named vertices constraints " +
       "will reference; any other tool call resets this counter.",
+  });
+}
+
+/**
+ * Item 9 (audit S11). Refusal for the CUMULATIVE counter — a different
+ * condition from the run counter above: this fires even when no unbroken
+ * run ever reached SINGLE_POINT_RUN_MAX, because the caller has been
+ * resetting the run counter with a filler call between bursts. Distinct
+ * `gate` name (`single_point_cumulative`, not `single_point_run`) so a
+ * trajectory can tell which condition actually tripped.
+ */
+function singlePointCumulativeRefusal(tool: string, count: number) {
+  return gateRefusal({
+    gate: "single_point_cumulative",
+    reason:
+      `${count} single-point additions to this sketch across the WHOLE ` +
+      `session — not just the current unbroken run — regardless of how ` +
+      `many other calls were interleaved between them. '${tool}' costs one ` +
+      `backend mutation and one round trip PER POINT no matter what runs ` +
+      `between them, so spacing a large point count out with a cheap ` +
+      `filler call every few points still burns the same rate budget and ` +
+      `context window the run counter alone exists to prevent (measured: ` +
+      `a 256-point gear profile placed this way cost ~1.3M tokens, and one ` +
+      `filler call per 8 points is enough to keep the run counter under ` +
+      `its own limit forever).`,
+    points_placed_cumulative: count,
+    how_to_proceed:
+      "Send the remaining vertices in ONE call: psketch_add_entity " +
+      "{ csketch_id, kind:'polyline', params:{ points:[[x,y],…], closed:true } } " +
+      "carries the entire loop in a single backend mutation. The points " +
+      "already placed are live and unaffected. This cumulative total does " +
+      "NOT reset — unlike the run counter, no intervening call (including " +
+      "a polyline call to this SAME sketch) lowers it, because the round " +
+      "trip already spent placing these points is not undone by later " +
+      "bulk work.",
   });
 }
 
@@ -867,14 +969,22 @@ export async function preDispatchGate(
     };
   }
 
-  // 1b. Single-point-run gate (gate 5): a live session-local counter, never
-  // answered from the refusal cache — the count is re-read on every issue, so
-  // the reset any other call performs unblocks the next point immediately.
+  // 1b. Single-point-run gate (gate 5): two live session-local counters,
+  // never answered from the refusal cache — both are re-read on every
+  // issue. The RUN counter resets on any other call (so the reset unblocks
+  // the next point immediately); the CUMULATIVE counter (item 9, audit
+  // S11) does not, which is what makes the interleave escape stop being
+  // free — checked second, so a call that already trips the run counter
+  // reports that reason, not the cumulative one.
   const spKey = singlePointKey(tool, args);
   if (spKey !== null) {
     const run = pointRuns.get(spKey) ?? 0;
     if (run >= SINGLE_POINT_RUN_MAX) {
       return { refusal: singlePointRunRefusal(tool, run) };
+    }
+    const cumulative = pointCumulative.get(spKey) ?? 0;
+    if (cumulative >= SINGLE_POINT_CUMULATIVE_MAX) {
+      return { refusal: singlePointCumulativeRefusal(tool, cumulative) };
     }
   }
 
@@ -1042,12 +1152,21 @@ export function recordDispatchOutcome(
   // untouched). A refused or failed single-point call neither extends nor
   // resets — the run stands, so re-issuing a refused point keeps meeting the
   // gate instead of grinding it down.
+  //
+  // The CUMULATIVE counter (item 9) extends alongside the run counter on
+  // every successful single-point addition, but is NEVER cleared by a
+  // non-single-point dispatch — that asymmetry is the whole fix: a filler
+  // call resets `pointRuns` (by design, so short legitimate sketches are
+  // never bothered) but must NOT reset `pointCumulative`, or the interleave
+  // escape S11 found would simply move here instead of closing.
   const spKey = singlePointKey(tool, args);
   if (spKey === null) {
     pointRuns.clear();
   } else if (result?.isError !== true) {
     if (pointRuns.size >= 64) pointRuns.clear();
     pointRuns.set(spKey, (pointRuns.get(spKey) ?? 0) + 1);
+    if (pointCumulative.size >= 64) pointCumulative.clear();
+    pointCumulative.set(spKey, (pointCumulative.get(spKey) ?? 0) + 1);
   }
 
   const refusal = typedRefusalOf(result);

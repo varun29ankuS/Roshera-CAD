@@ -7,10 +7,16 @@
 //! plain numeric strings are accepted as legacy local solid ids; an
 //! empty list means "every reachable solid".
 
+use crate::error_catalog::ApiError;
 use crate::AppState;
-use axum::{extract::State, http::StatusCode, response::Json};
+use axum::{
+    extract::State,
+    http::StatusCode,
+    response::{IntoResponse, Json, Response},
+};
 use export_engine::formats::ros::HistData;
 use export_engine::formats::timeline_chunk::BranchManifest;
+use geometry_engine::primitives::provenance::SoundnessReading;
 use geometry_engine::tessellation::{tessellate_solid, TessellationParams};
 use shared_types::*;
 use std::time::Instant;
@@ -19,7 +25,7 @@ use uuid::Uuid;
 pub async fn export_mesh(
     State(state): State<AppState>,
     Json(request): Json<ExportRequest>,
-) -> Result<Json<ExportResponse>, (StatusCode, String)> {
+) -> Result<Json<ExportResponse>, Response> {
     let start = Instant::now();
 
     // .ros v3.1 declares HIST (timeline) as a MANDATORY chunk: a ROS
@@ -54,6 +60,7 @@ pub async fn export_mesh(
                                 branch.id
                             ),
                         )
+                            .into_response()
                     })?;
             for event in branch_events {
                 // A branch's event window can include events inherited
@@ -111,27 +118,59 @@ pub async fn export_mesh(
         return Err((
             StatusCode::NOT_FOUND,
             "export: no solids resolved to export (empty selection or unmapped ids)".to_string(),
-        ));
+        )
+            .into_response());
     }
 
-    // P1 ENFORCEMENT — HARD STOP. Refuse to export any solid that has been
-    // mutated (or never certified) since its last full verification. This is
-    // where the consequences of a stale soundness verdict leave the system:
-    // an unverified solid must not become an STL/OBJ/STEP/ROS file a shop
-    // machines from. `soundness_reading` never recomputes (read-only, no
-    // write lock needed), so this check cannot silently "fix" the staleness
-    // it exists to catch — the agent must call `verify_part` first. The
-    // typed `ExportError::UnverifiedSolid` is propagated verbatim, same
-    // honesty invariant as every other export failure on this path.
+    // P1 ENFORCEMENT — HARD STOP, both halves. `soundness_reading` never
+    // recomputes (read-only, no write lock needed) — this is the surface
+    // named in its own doc comment ("every surface that reports or gates on
+    // soundness to an agent … export … must read through here, not through
+    // certify_solid") — so neither branch below can silently "fix" the
+    // verdict it exists to check.
+    //
+    // 1. STALE (mutated, or never certified, since the last full
+    //    verification): the typed `ExportError::UnverifiedSolid` is
+    //    propagated verbatim, same honesty invariant as every other export
+    //    failure on this path. NO bypass — `verify_part` is one cheap call.
+    //
+    // 2. UNSOUND (item 8, S5 audit, 2026-08-15): a solid that WAS verified
+    //    and the kernel's live verdict says is NOT sound. Gate 4's own
+    //    rationale — "a PDF/DXF on disk carries NO ambient certificate, so
+    //    unlike a kernel op there is no downstream truth-teller after this
+    //    point" — applies verbatim to an STL/OBJ/STEP/ROS file, the artifact
+    //    that actually reaches a machine, and was the hole the stale-only
+    //    check above left open: a solid that had been explicitly verify_
+    //    part'd and found unsound reads `Unsound`, not `Stale`, so the loop
+    //    above let it through. This is an unsound-BASE question exactly like
+    //    the 10 REST routes `refuse_unsound_base` covers, so it reuses that
+    //    gate's own escape token and wire shape (`ApiError::unsound_base`,
+    //    `gate: "unsound_base"`, `acknowledge_unsound: true`) rather than
+    //    inventing a new vocabulary — NOT `refuse_unsound_base` itself,
+    //    which takes a write lock and RECOMPUTES via `certify_solid`
+    //    (exactly the silent-launder-by-asking this reading exists to
+    //    avoid, and a second write-lock acquisition here would deadlock
+    //    against the read guard `model` already holds for the whole
+    //    tessellation pass below). Scoped to this branch only — the escape
+    //    never opens the Stale branch above.
     for &solid_id in &solids_to_export {
-        if model
-            .soundness_reading(solid_id)
-            .map(|r| r.is_stale())
-            .unwrap_or(false)
-        {
-            let err = ExportError::UnverifiedSolid { solid_id };
-            tracing::warn!(solid_id, "export refused: solid is stale (unverified)");
-            return Err((StatusCode::UNPROCESSABLE_ENTITY, err.to_string()));
+        match model.soundness_reading(solid_id) {
+            Some(reading) if reading.is_stale() => {
+                let err = ExportError::UnverifiedSolid { solid_id };
+                tracing::warn!(solid_id, "export refused: solid is stale (unverified)");
+                return Err((StatusCode::UNPROCESSABLE_ENTITY, err.to_string()).into_response());
+            }
+            Some(SoundnessReading::Unsound(_)) if !request.acknowledge_unsound => {
+                tracing::warn!(
+                    solid_id,
+                    "export refused: solid is unsound (no acknowledge_unsound)"
+                );
+                return Err(
+                    ApiError::unsound_base("export", solid_id, crate::VERDICT_UNSOUND)
+                        .into_response(),
+                );
+            }
+            _ => {}
         }
     }
 
@@ -192,7 +231,8 @@ pub async fn export_mesh(
         return Err((
             StatusCode::NOT_FOUND,
             "export: every selected solid tessellated to zero triangles".to_string(),
-        ));
+        )
+            .into_response());
     }
 
     let final_mesh = Mesh {
@@ -241,6 +281,7 @@ pub async fn export_mesh(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     format!("STL export failed: {e}"),
                 )
+                    .into_response()
             })?,
         ExportFormat::OBJ => state
             .export_engine
@@ -252,6 +293,7 @@ pub async fn export_mesh(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     format!("OBJ export failed: {e}"),
                 )
+                    .into_response()
             })?,
         ExportFormat::ROS => {
             // PROV is mandatory, and since intent became a recorded fact
@@ -280,6 +322,7 @@ pub async fn export_mesh(
                         StatusCode::INTERNAL_SERVER_ERROR,
                         format!("ROS export failed: {e}"),
                     )
+                        .into_response()
                 })?;
             ros_contents = Some(RosFileContents {
                 hist_event_count: summary.hist_event_count,
@@ -305,13 +348,15 @@ pub async fn export_mesh(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     format!("STEP export failed: {e}"),
                 )
+                    .into_response()
             })?,
         _ => {
             tracing::warn!("Unsupported export format: {:?}", request.format);
             return Err((
                 StatusCode::NOT_IMPLEMENTED,
                 format!("export format {:?} is not supported", request.format),
-            ));
+            )
+                .into_response());
         }
     };
 
