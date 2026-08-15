@@ -9,7 +9,8 @@
  *   line 2+  step     { i, action, result_digest, reward, refusal, ms,
  *                       gate_preflight?, gate_preflight_gaps? }
  *   last     terminal { outcome, reward_final, claims, recipe_ref,
- *                       model_scope, tokens, wall_ms, error }
+ *                       model_scope, unverified_mutations, tokens, wall_ms,
+ *                       error }
  *
  * `gate_preflight` / `gate_preflight_gaps` (item 1, audit S4): the ONLY two
  * keys in this schema that are OMITTED rather than defaulted on the common
@@ -58,6 +59,34 @@
  * only ever mean "we did not check" — which is stated per claim as
  * `{name, verified: null, absent: "<reason>"}` instead.
  *
+ * `unverified_mutations` (item 7, audit S3.1): gate 6 in
+ * `roshera-mcp/src/gates.ts` refuses a checkpoint CLOSE over unverified
+ * mutating work, but fires only when a NEW checkpoint does the closing —
+ * an episode that opens one checkpoint, mutates, and simply STOPS is never
+ * asked to verify anything, which is the normal shape of an episode's own
+ * final steps. The episode is the only place a session has a defined end,
+ * so this is computed here, once, from the step tool/success list
+ * `episode.mjs`'s drive loop already gathers (`unverifiedMutatingWork`,
+ * episode.mjs) — never omitted, unlike `gate_preflight` above: this is a
+ * TERMINAL field, and every other terminal field in this schema (`error`,
+ * `model_scope`) is always present with a stated reason rather than
+ * silently dropped, so this follows that convention, not the step-level
+ * omit-on-the-common-path one. Two shapes:
+ *   - `{count, tools}` — the check ran. `count` is zero when nothing was
+ *     left unverified (an episode that verified, or built nothing
+ *     mutating, is NOT flagged — `count: 0` says so honestly, it is not
+ *     omitted); `tools` is the distinct verbs, `count` every dispatch,
+ *     mirroring gates.ts's own `intentUnverified` shape exactly.
+ *   - `{absent: "<reason>"}` — the check itself could not run (a throw
+ *     inside the derivation, caught at its one call site). The hard
+ *     constraint this exists under outranks the feature: this check must
+ *     never cost an episode its trajectory.
+ * A caller that passes neither (every `Trajectory` construction this
+ * package does NOT drive through `episode.mjs`'s own loop, e.g.
+ * `runner.mjs`'s `setupFailedBeforeEpisode`, where no episode — and so no
+ * step history — ever existed) gets the same absence, defaulted here for
+ * exactly that reason, mirroring `model_scope`'s own default below.
+ *
  * `tool_allowlist` is stamped here because a shifting action space makes two
  * trajectories incomparable — `find_tool` ranks by IDF over the tool corpus,
  * so any new tool perturbs rankings corpus-wide.
@@ -105,7 +134,7 @@ class Trajectory {
     }) + "\n");
   }
 
-  close({ outcome, rewardFinal, claims, recipeRef, modelScope, tokens, wallMs, error }) {
+  close({ outcome, rewardFinal, claims, recipeRef, modelScope, tokens, wallMs, error, unverifiedMutations }) {
     if (this.#closed) throw new Error("trajectory already closed");
     if (!OUTCOMES.includes(outcome)) {
       throw new Error(
@@ -116,6 +145,14 @@ class Trajectory {
     appendFileSync(this.#path, JSON.stringify({
       kind: "terminal", outcome, reward_final: rewardFinal,
       claims, recipe_ref: recipeRef ?? null, tokens, wall_ms: wallMs,
+      // Item 7 (audit S3.1) — ALWAYS present, unlike step-level
+      // `gate_preflight`: see the module docstring above for why this
+      // terminal field follows `model_scope`'s always-present convention
+      // instead. `{count: 0, tools: []}` is a positive statement that
+      // nothing was left unverified, never confused with "not checked".
+      unverified_mutations: unverifiedMutations ?? {
+        absent: "the caller recorded no unverified-mutations reading",
+      },
       // WHAT THIS EPISODE'S OWN MODEL HELD, read by `list_parts` inside the
       // session (mcp_session.mjs `readModelScope`). Concurrent episodes shared
       // one `BRepModel` for as long as this environment has existed, and

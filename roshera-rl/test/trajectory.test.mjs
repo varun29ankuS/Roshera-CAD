@@ -94,6 +94,45 @@ check("the taxonomy is exactly the six named outcomes", () => {
   ]);
 });
 
+// ─── item 7 (audit S3.1): unverified_mutations, both the pass-through and the default ──
+check("close() writes unverified_mutations verbatim when the caller passes it", () => {
+  const path = join(dir, "ep5.jsonl");
+  const t = openTrajectory({
+    path, taskId: "t", seed: 1, kernelSha: "x", mcpVersion: "y",
+    toolAllowlist: [], split: "eval",
+  });
+  t.close({
+    outcome: "COMPLETED", rewardFinal: { components: {}, gaps: [] },
+    claims: [], recipeRef: null, tokens: 0, wallMs: 1,
+    unverifiedMutations: { count: 2, tools: ["boolean", "create_box"] },
+  });
+  const { terminal } = readTrajectory(path);
+  assert.deepEqual(terminal.unverified_mutations, { count: 2, tools: ["boolean", "create_box"] });
+});
+
+// A caller that omits `unverifiedMutations` entirely — every `Trajectory`
+// construction this package does NOT drive through episode.mjs's own drive
+// loop, e.g. runner.mjs's `setupFailedBeforeEpisode` — must not have this
+// field silently vanish, or read as the false claim "checked, and clean".
+// Delete the `?? {absent: ...}` default in trajectory.mjs's close() and this
+// check goes red: `"unverified_mutations" in terminal` becomes false, since
+// nothing else in this file's own suite exercises the omitted-argument path.
+check("close() without unverifiedMutations states an absence, never silently drops the key", () => {
+  const path = join(dir, "ep6.jsonl");
+  const t = openTrajectory({
+    path, taskId: "t", seed: 1, kernelSha: "x", mcpVersion: "y",
+    toolAllowlist: [], split: "eval",
+  });
+  t.close({
+    outcome: "SETUP_FAILED", rewardFinal: { components: {}, gaps: [] },
+    claims: [], recipeRef: null, tokens: 0, wallMs: 1,
+  });
+  const { terminal } = readTrajectory(path);
+  assert.ok("unverified_mutations" in terminal, "the key must be present, not omitted");
+  assert.equal(typeof terminal.unverified_mutations.absent, "string");
+  assert.match(terminal.unverified_mutations.absent, /caller recorded no unverified-mutations reading/);
+});
+
 check("closing twice is refused — a trajectory has one terminal record", () => {
   const path = join(dir, "ep4.jsonl");
   const t = openTrajectory({

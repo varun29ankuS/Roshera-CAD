@@ -14,10 +14,13 @@
 import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { runEpisode } from "../lib/episode.mjs";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const HERE = dirname(fileURLToPath(import.meta.url));
+import { runEpisode, unverifiedMutatingWork } from "../lib/episode.mjs";
 import { readTrajectory } from "../lib/trajectory.mjs";
 import { scriptedPolicy } from "../lib/policy.mjs";
 import { defineTask } from "../lib/task.mjs";
@@ -527,6 +530,184 @@ check("a healthy step (no preflight gap) writes no gate_preflight key at all", a
   assert.equal(steps.length, 1);
   assert.equal("gate_preflight" in steps[0], false);
   assert.equal("gate_preflight_gaps" in steps[0], false);
+});
+
+// ─── item 7 (audit S3.1) — gate 6's by-omission escape, closed at the episode's own end ──
+//
+// Gate 6 fires only when a NEW checkpoint closes the open one; an episode
+// that opens one checkpoint, mutates, and simply STOPS is never asked to
+// verify anything. The design ruling: close this in roshera-rl, not MCP,
+// because the episode is the only place a session has a defined end — a
+// PURE function over the step tool/success list `runEpisode`'s own loop
+// already gathers, no MCP query, no new tool.
+//
+// `unverifiedMutatingWork` unit-tested directly first (every branch of its
+// own mirror of gates.ts's `MUTATES_SOLIDS`/`VERIFIES`/`intentUnverified`
+// bookkeeping — gates.ts:269-290, :347, :1069-1089), then proved end to end
+// through `runEpisode` for the two directions the brief names explicitly.
+
+check("unverifiedMutatingWork: a mutating success with nothing after it is one tool, count one", () => {
+  const r = unverifiedMutatingWork([{ tool: "create_cylinder", ok: true }]);
+  assert.deepEqual(r, { count: 1, tools: ["create_cylinder"] });
+});
+
+check("unverifiedMutatingWork: an empty step list is the clean answer, not an absence", () => {
+  assert.deepEqual(unverifiedMutatingWork([]), { count: 0, tools: [] });
+});
+
+check("unverifiedMutatingWork: verify_part clears everything that preceded it", () => {
+  const r = unverifiedMutatingWork([
+    { tool: "create_cylinder", ok: true },
+    { tool: "verify_part", ok: true },
+  ]);
+  assert.deepEqual(r, { count: 0, tools: [] });
+});
+
+check("unverifiedMutatingWork: verify_claim clears too, not only verify_part", () => {
+  const r = unverifiedMutatingWork([
+    { tool: "boolean", ok: true },
+    { tool: "verify_claim", ok: true },
+  ]);
+  assert.deepEqual(r, { count: 0, tools: [] });
+});
+
+check("unverifiedMutatingWork: a NEW timeline_checkpoint resets the tally — it already passed gate 6 itself to close", () => {
+  const r = unverifiedMutatingWork([
+    { tool: "create_cylinder", ok: true },
+    { tool: "timeline_checkpoint", ok: true },
+  ]);
+  assert.deepEqual(r, { count: 0, tools: [] });
+});
+
+check("unverifiedMutatingWork: clear_timeline resets the tally too — gate 6 excludes it by the same design as gates.ts", () => {
+  const r = unverifiedMutatingWork([
+    { tool: "boolean", ok: true },
+    { tool: "clear_timeline", ok: true },
+  ]);
+  assert.deepEqual(r, { count: 0, tools: [] });
+});
+
+check("unverifiedMutatingWork: a refused mutating call built nothing, so it counts for nothing", () => {
+  assert.deepEqual(unverifiedMutatingWork([{ tool: "create_cylinder", ok: false }]), { count: 0, tools: [] });
+});
+
+check("unverifiedMutatingWork: distinct verbs in `tools`, every call still tallied in `count`", () => {
+  const r = unverifiedMutatingWork([
+    { tool: "boolean", ok: true },
+    { tool: "boolean", ok: true },
+    { tool: "fillet_edges", ok: true },
+  ]);
+  assert.equal(r.count, 3, "count is every dispatch, matching gates.ts's own intentUnverified.count");
+  assert.deepEqual(r.tools, ["boolean", "fillet_edges"], "tools is the distinct-verb Set, matching gates.ts's own intentUnverified.tools");
+});
+
+check("unverifiedMutatingWork: malformed input degrades to the clean answer rather than throwing", () => {
+  assert.deepEqual(unverifiedMutatingWork(null), { count: 0, tools: [] });
+  assert.deepEqual(unverifiedMutatingWork(undefined), { count: 0, tools: [] });
+  assert.deepEqual(
+    unverifiedMutatingWork([null, {}, { tool: "create_cylinder", ok: true }]),
+    { count: 1, tools: ["create_cylinder"] },
+  );
+});
+
+/** verify_part's own body: `sound` at the TOP LEVEL (tools/perception.ts:206), no `perception` wrapper. */
+const VERIFIED_OK = ok({ sound: true, part_id: 1, brep_valid: true, watertight: true });
+
+check("an episode that ends with mutating work never verified is flagged in its terminal record", async () => {
+  const path = join(dir, "unverified-mutation.jsonl");
+  const r = await runEpisode({
+    task, policy: scriptedPolicy([{ tool: "create_cylinder", args: { radius: 25 } }]),
+    seed: 1, baseUrl, authHeader: {}, trajectoryPath: path, kernelSha: "abc",
+    spawn: fakeSpawn((tool) => (tool === "verify_part" ? VERIFIED_OK : CREATED_OK)),
+  });
+  assert.equal(r.outcome, "COMPLETED");
+  const { terminal } = readTrajectory(path);
+  assert.ok(terminal.unverified_mutations,
+    "the field must be PRESENT, not silently omitted — S3.1's whole exploit is a record that stays quiet");
+  assert.equal(terminal.unverified_mutations.count, 1);
+  assert.deepEqual(terminal.unverified_mutations.tools, ["create_cylinder"]);
+});
+
+check("an episode that verifies its mutating work before ending is NOT flagged", async () => {
+  const path = join(dir, "verified-mutation.jsonl");
+  const r = await runEpisode({
+    task, policy: scriptedPolicy([
+      { tool: "create_cylinder", args: { radius: 25 } },
+      { tool: "verify_part", args: { part_id: 1 } },
+    ]),
+    seed: 1, baseUrl, authHeader: {}, trajectoryPath: path, kernelSha: "abc",
+    spawn: fakeSpawn((tool) => (tool === "verify_part" ? VERIFIED_OK : CREATED_OK)),
+  });
+  assert.equal(r.outcome, "COMPLETED");
+  const { terminal } = readTrajectory(path);
+  assert.equal(terminal.unverified_mutations.count, 0);
+  assert.deepEqual(terminal.unverified_mutations.tools, []);
+});
+
+check("a mutating call the kernel refused contributes no unverified work — nothing was built to verify", async () => {
+  const path = join(dir, "refused-mutation.jsonl");
+  await runEpisode({
+    task, policy: scriptedPolicy([{ tool: "create_cylinder", args: { radius: 25 } }]),
+    seed: 1, baseUrl, authHeader: {}, trajectoryPath: path, kernelSha: "abc",
+    spawn: fakeSpawn(() => fail("kernel refused the call")),
+  });
+  const { terminal } = readTrajectory(path);
+  assert.equal(terminal.unverified_mutations.count, 0);
+  assert.deepEqual(terminal.unverified_mutations.tools, []);
+});
+
+check("a SETUP_FAILED episode (no steps ever ran) reports the clean answer, not an absence — zero steps really did run", async () => {
+  const path = join(dir, "unverified-mutation-setup-failed.jsonl");
+  failCreate = true; createStatus = 500;
+  await runEpisode({
+    task, policy: scriptedPolicy([]), seed: 1, baseUrl, authHeader: {},
+    trajectoryPath: path, kernelSha: "abc", spawn: fakeSpawn(() => CREATED_OK),
+  });
+  failCreate = false;
+  const { terminal } = readTrajectory(path);
+  assert.deepEqual(terminal.unverified_mutations, { count: 0, tools: [] });
+});
+
+// ─── the copy of gates.ts's MUTATES_SOLIDS is PINNED, not merely disclosed ───
+//
+// `episode.mjs` copies `MUTATES_SOLIDS` rather than importing it, for a good
+// reason: gates.ts lives in a sibling package with its own build, and item 7
+// asks for a PURE function over data this package already holds, not a new
+// cross-package dependency. But a copy is two independently-maintained
+// surfaces that only disagree at runtime — the failure class this repo keeps
+// an ontology-drift gate for, after `psketch_plane_from_face` was classified
+// MCP-side and never added backend-side.
+//
+// The precedent the source comment cites for accepting the drift
+// (`handlers/timeline.rs:5478-5484`) is in fact a case where the repo
+// MECHANICALLY PINNED two surfaces across packages rather than living with
+// it. This does the same, in the same style: read the other surface from
+// disk and assert set equality. If gates.ts gains a mutating verb — as it did
+// twice on this branch alone — this fails until the copy follows.
+check("the MUTATES_SOLIDS copy equals gates.ts's, verb for verb", () => {
+  const setLiteral = (src, name) => {
+    const m = src.match(new RegExp(`const ${name}\\s*=\\s*new Set(?:<string>)?\\(\\[([\\s\\S]*?)\\]\\)`));
+    assert.ok(m, `could not locate ${name}'s set literal — the parse, not the sets, is broken`);
+    return new Set([...m[1].matchAll(/"([a-z0-9_]+)"/g)].map((x) => x[1]));
+  };
+  const gatesSrc = readFileSync(join(HERE, "..", "..", "roshera-mcp", "src", "gates.ts"), "utf8");
+  const episodeSrc = readFileSync(join(HERE, "..", "lib", "episode.mjs"), "utf8");
+
+  const theirs = setLiteral(gatesSrc, "MUTATES_SOLIDS");
+  const ours = setLiteral(episodeSrc, "MUTATES_SOLIDS");
+
+  // Vacuity guard: a regex that silently matched nothing would make two empty
+  // sets compare equal and this check would pass forever while proving zero.
+  assert.ok(theirs.size >= 15, `parsed only ${theirs.size} verbs from gates.ts — the parse is broken`);
+  assert.ok(theirs.has("boolean") && ours.has("boolean"), "neither set should be missing 'boolean'");
+
+  const missingHere = [...theirs].filter((t) => !ours.has(t));
+  const extraHere = [...ours].filter((t) => !theirs.has(t));
+  assert.deepEqual(
+    { missingHere, extraHere }, { missingHere: [], extraHere: [] },
+    "gates.ts and episode.mjs disagree about which tools mutate solids. An episode's " +
+    "unverified-mutation check would then miss work the gate counts, or flag work it does not.",
+  );
 });
 
 for (const [name, fn] of checks) { await fn(); process.stdout.write(`  ok - ${name}\n`); }

@@ -144,6 +144,16 @@ const STATEMENTS = [
   )`,
   `CREATE INDEX IF NOT EXISTS rl_step_episode_id_idx ON rl_step(episode_id)`,
 
+  // `gate_preflight` (item 1b, audit S4): added after `rl_step` first shipped,
+  // so a database that already ran an older version of this file has the
+  // table but not the column — `CREATE TABLE IF NOT EXISTS` creates, it never
+  // reshapes (see this file's own top docstring). Unlike the three columns
+  // that docstring describes DROPPING, adding a nullable column destroys
+  // nothing, so `ADD COLUMN IF NOT EXISTS` is safe to issue unconditionally on
+  // every call rather than treated as an operator's deliberate decision. NULL
+  // here means exactly what an absent key means in the JSONL: the gate ran.
+  `ALTER TABLE rl_step ADD COLUMN IF NOT EXISTS gate_preflight TEXT`,
+
   `CREATE TABLE IF NOT EXISTS rl_refusal (
     id BIGSERIAL PRIMARY KEY,
     episode_id TEXT NOT NULL REFERENCES rl_episode(episode_id) ON DELETE CASCADE,
@@ -152,6 +162,21 @@ const STATEMENTS = [
     reason TEXT
   )`,
   `CREATE INDEX IF NOT EXISTS rl_refusal_episode_id_idx ON rl_refusal(episode_id)`,
+
+  // One row per base ref a step's gate-3 pre-flight could not complete for
+  // (item 1b). Many-rows-per-episode, same family and same idempotency
+  // pattern as `rl_refusal` right above: no uniqueness constraint on the
+  // natural key, a surrogate BIGSERIAL id, and `store.mjs` owns idempotency
+  // via `DELETE FROM ... WHERE episode_id = $1` before the bulk re-insert.
+  `CREATE TABLE IF NOT EXISTS rl_gate_preflight_gap (
+    id BIGSERIAL PRIMARY KEY,
+    episode_id TEXT NOT NULL REFERENCES rl_episode(episode_id) ON DELETE CASCADE,
+    step_index INT NOT NULL,
+    ref TEXT,
+    stage TEXT,
+    reason TEXT
+  )`,
+  `CREATE INDEX IF NOT EXISTS rl_gate_preflight_gap_episode_id_idx ON rl_gate_preflight_gap(episode_id)`,
 
   `CREATE TABLE IF NOT EXISTS rl_claim_result (
     id BIGSERIAL PRIMARY KEY,

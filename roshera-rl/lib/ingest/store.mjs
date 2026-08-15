@@ -179,9 +179,9 @@ async function replaceSteps(client, episodeId, steps) {
   await client.query(`DELETE FROM rl_step WHERE episode_id = $1`, [episodeId]);
   for (const s of steps) {
     await client.query(
-      `INSERT INTO rl_step (episode_id, step_index, tool, args, result_digest, reward, duration_ms)
-       VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-      [episodeId, s.index, nn(s.tool), jsonb(s.args), nn(s.result_digest), jsonb(s.reward), nn(s.duration_ms)],
+      `INSERT INTO rl_step (episode_id, step_index, tool, args, result_digest, reward, duration_ms, gate_preflight)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+      [episodeId, s.index, nn(s.tool), jsonb(s.args), nn(s.result_digest), jsonb(s.reward), nn(s.duration_ms), nn(s.gate_preflight)],
     );
   }
 }
@@ -193,6 +193,18 @@ async function replaceRefusals(client, episodeId, refusals) {
       `INSERT INTO rl_refusal (episode_id, step_index, gate, reason)
        VALUES ($1,$2,$3,$4)`,
       [episodeId, r.step_index, nn(r.gate), nn(r.reason)],
+    );
+  }
+}
+
+/** Item 1b (audit S4) — same shape and same idempotency guard as `replaceRefusals` above. */
+async function replaceGatePreflightGaps(client, episodeId, gaps) {
+  await client.query(`DELETE FROM rl_gate_preflight_gap WHERE episode_id = $1`, [episodeId]);
+  for (const g of gaps) {
+    await client.query(
+      `INSERT INTO rl_gate_preflight_gap (episode_id, step_index, ref, stage, reason)
+       VALUES ($1,$2,$3,$4,$5)`,
+      [episodeId, g.step_index, nn(g.ref), nn(g.stage), nn(g.reason)],
     );
   }
 }
@@ -367,6 +379,7 @@ export async function ingestFile(client, path) {
     await upsertDimensions(client, rows.run.provenance);
     await upsertEpisode(client, rows.episode);
     await replaceSteps(client, rows.episode.episode_id, rows.steps);
+    await replaceGatePreflightGaps(client, rows.episode.episode_id, rows.gatePreflightGaps);
     await replaceRefusals(client, rows.episode.episode_id, rows.refusals);
     await replaceClaims(client, rows.episode.episode_id, rows.claims);
     await upsertRecipe(client, rows.episode.episode_id, rows.recipe);

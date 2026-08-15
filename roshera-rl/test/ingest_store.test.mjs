@@ -99,10 +99,34 @@ const noDirtyText = [JSON.stringify(noDirtyHeader), ...siblingRest].join("\n") +
 const noDirtyRows = rowsFromTrajectory(noDirtyText, { path: "no-dirty" });
 const noDirtyEpisodeId = noDirtyRows.episode.episode_id;
 
+// A fifth sibling: one step (i=1, create_cylinder) whose gate-3 pre-flight
+// was unavailable (item 1b, audit S4). `siblingRest[1]` is that step line —
+// proves gate_preflight/gate_preflight_gaps actually land in Postgres and
+// survive a re-ingest, not just in rows.mjs's pure output (ingest_rows.test.mjs
+// already proves the pure half). The gap shape is the real one
+// (`roshera-mcp/src/gates.ts` `GatePreflightGap`: `{ref, stage, reason}`).
+const preflightSeed = 999904;
+const preflightRest = siblingRest.map((line, idx) => {
+  if (idx !== 1) return line;
+  const step = JSON.parse(line);
+  assert.equal(step.i, 1, "sanity: siblingRest[1] is the create_cylinder step");
+  step.gate_preflight = "unavailable";
+  step.gate_preflight_gaps = [
+    { ref: "9c1c2b0a-preflight-probe", stage: "verify", reason: "perception fetch timed out after 4000ms" },
+  ];
+  return JSON.stringify(step);
+});
+const preflightText = [
+  JSON.stringify({ ...siblingHeader, task_id: "cylinder-r25-h60-gate-preflight-probe", seed: preflightSeed }),
+  ...preflightRest,
+].join("\n") + "\n";
+const preflightEpisodeId = rowsFromTrajectory(preflightText, { path: "preflight-probe" }).episode.episode_id;
+
 const scratchDir = mkdtempSync(join(tmpdir(), "roshera-rl-ingest-store-"));
 const scratchPath = join(scratchDir, "drift-probe.jsonl");
 const fixArcPath = join(scratchDir, "quarantine-fix-probe.jsonl");
 const noDirtyPath = join(scratchDir, "dirty-absent-probe.jsonl");
+const preflightPath = join(scratchDir, "gate-preflight-probe.jsonl");
 
 async function countWhere(table, whereSql, params) {
   const r = await client.query(`SELECT count(*)::int AS n FROM ${table} WHERE ${whereSql}`, params);
@@ -114,7 +138,7 @@ async function cleanup() {
   // rl_solid/rl_lineage_edge/rl_recipe/rl_certificate (ON DELETE CASCADE) —
   // deleting the episode rows is enough to clear their whole subtree.
   await client.query(`DELETE FROM rl_episode WHERE episode_id = ANY($1)`, [[
-    fixtureEpisodeId, siblingEpisodeId, fixArcEpisodeId, noDirtyEpisodeId,
+    fixtureEpisodeId, siblingEpisodeId, fixArcEpisodeId, noDirtyEpisodeId, preflightEpisodeId,
   ]]);
   await client.query(`DELETE FROM rl_quarantine WHERE path = $1 OR path = $2`, [malformedPath, fixArcPath]);
   // This suite MINTS this build identity; nothing else in the corpus uses it,
@@ -146,6 +170,7 @@ async function assertCountsMatchFixture(label) {
   assert.equal(await countWhere("rl_episode", "episode_id = $1", [fixtureEpisodeId]), 1, `rl_episode ${label}`);
   assert.equal(await countWhere("rl_step", "episode_id = $1", [fixtureEpisodeId]), fixtureRows.steps.length, `rl_step ${label}`);
   assert.equal(await countWhere("rl_refusal", "episode_id = $1", [fixtureEpisodeId]), fixtureRows.refusals.length, `rl_refusal ${label}`);
+  assert.equal(await countWhere("rl_gate_preflight_gap", "episode_id = $1", [fixtureEpisodeId]), fixtureRows.gatePreflightGaps.length, `rl_gate_preflight_gap ${label}`);
   assert.equal(await countWhere("rl_claim_result", "episode_id = $1", [fixtureEpisodeId]), fixtureRows.claims.length, `rl_claim_result ${label}`);
   assert.equal(await countWhere("rl_recipe", "episode_id = $1", [fixtureEpisodeId]), fixtureRows.recipe ? 1 : 0, `rl_recipe ${label}`);
   assert.equal(await countWhere("rl_recipe_step", "episode_id = $1", [fixtureEpisodeId]), fixtureRows.recipeSteps.length, `rl_recipe_step ${label}`);
@@ -258,6 +283,52 @@ check("a kernel identity with no dirty reading lands as SQL NULL, never a fabric
   const run = await client.query(`SELECT provenance FROM rl_run WHERE run_id = $1`, [noDirtyRows.run.run_id]);
   assert.match(run.rows[0].provenance.kernel.dirty_absent, /no dirty reading/,
     "the stated reason must reach Postgres, not just the boolean's absence");
+});
+
+// ─── item 1b, audit S4 — the fail-open marker in Postgres, not just in rows.mjs's pure output ──
+check("a step whose gate-3 pre-flight was unavailable lands its marker and gap row in Postgres, and re-ingesting is idempotent", async () => {
+  writeFileSync(preflightPath, preflightText, "utf8");
+  const res = await ingestFile(client, preflightPath);
+  assert.equal(res.status, "ingested");
+  assert.equal(res.episode_id, preflightEpisodeId);
+
+  const markedStep = await client.query(
+    `SELECT gate_preflight FROM rl_step WHERE episode_id = $1 AND step_index = 1`,
+    [preflightEpisodeId],
+  );
+  assert.equal(markedStep.rows.length, 1);
+  assert.equal(markedStep.rows[0].gate_preflight, "unavailable");
+
+  const otherSteps = await client.query(
+    `SELECT step_index, gate_preflight FROM rl_step WHERE episode_id = $1 AND step_index != 1`,
+    [preflightEpisodeId],
+  );
+  assert.ok(otherSteps.rows.length > 0, "sanity: the episode has other steps too");
+  for (const row of otherSteps.rows) {
+    assert.equal(row.gate_preflight, null,
+      `step ${row.step_index} must read back SQL NULL, not "unavailable" — an absent marker means the gate ran`);
+  }
+
+  const gaps = await client.query(
+    `SELECT step_index, ref, stage, reason FROM rl_gate_preflight_gap WHERE episode_id = $1`,
+    [preflightEpisodeId],
+  );
+  assert.equal(gaps.rows.length, 1);
+  assert.equal(gaps.rows[0].step_index, 1);
+  assert.equal(gaps.rows[0].ref, "9c1c2b0a-preflight-probe");
+  assert.equal(gaps.rows[0].stage, "verify");
+  assert.match(gaps.rows[0].reason, /timed out after 4000ms/);
+
+  // Idempotency (the load-bearing property `rl_refusal` already has, and this
+  // table shares its exact delete-then-insert shape): re-ingesting the same
+  // file must not double the gap rows or resurrect a stale one.
+  const second = await ingestFile(client, preflightPath);
+  assert.equal(second.status, "ingested");
+  const gapCountAfter = await client.query(
+    `SELECT count(*)::int AS n FROM rl_gate_preflight_gap WHERE episode_id = $1`,
+    [preflightEpisodeId],
+  );
+  assert.equal(gapCountAfter.rows[0].n, 1, "re-ingesting the same file must not double the gap rows");
 });
 
 check("ingestDir walks every .jsonl fixture in a directory, ingesting the good one and quarantining the bad one", async () => {

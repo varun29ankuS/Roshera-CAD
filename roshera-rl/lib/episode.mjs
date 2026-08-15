@@ -45,6 +45,95 @@ const digest = (v) => {
   return `fnv1a64:${h.toString(16)}`;
 };
 
+/**
+ * Item 7 (audit S3.1) — gate 6 (`roshera-mcp/src/gates.ts`'s
+ * verification-scope gate) fires only when a NEW `timeline_checkpoint`
+ * closes the open one; an episode that opens one checkpoint, mutates, and
+ * simply STOPS is never asked to verify anything, which is the normal shape
+ * of an RL episode's own final steps. The design ruling: close this HERE,
+ * not in MCP — the episode is the only place a session has a defined end,
+ * so it is the only place the check can be complete.
+ *
+ * `MUTATES_SOLIDS` and `VERIFIES` are copied from gates.ts (`:269-290`,
+ * `:347`), not imported: gates.ts lives in a sibling package with its own
+ * build, and the design ruling asks for a PURE function over data this
+ * package already holds, not a new cross-package dependency. A drift
+ * between the two lists is a real, accepted limit — the same one the repo
+ * already lives with for gate 2a's cross-package parity check
+ * (`handlers/timeline.rs:5478-5484`).
+ */
+const MUTATES_SOLIDS = new Set([
+  "create_box", "create_cylinder", "create_sphere", "create_cone",
+  "boolean", "boolean_many", "revolve", "nurbs_loft", "shell",
+  "fillet_edges", "chamfer_edges", "drill_pattern", "transform",
+  "sketch_extrude", "psketch_extrude", "psketch_revolve", "import_step",
+  "timeline_mould", "delete_part", "clear_parts",
+]);
+const VERIFIES = new Set(["verify_part", "verify_claim"]);
+
+/**
+ * A pure function from the episode's own step tool/success list to "what
+ * mutating work, if any, ended the episode unverified" — mirroring gates.ts's
+ * `intentUnverified` bookkeeping (`gates.ts:1069-1089`) exactly, one call at
+ * a time, in step order:
+ *
+ *   - a call that was refused or errored (`ok: false`) built nothing, so it
+ *     is skipped entirely — matching gates.ts's own `result?.isError !== true`
+ *     guard around this whole branch;
+ *   - `timeline_checkpoint` or `clear_timeline` (successful) CLEAR the
+ *     tally: a checkpoint that closed successfully already passed gate 6
+ *     itself (verified, or explicitly `skip_verification`'d ON THE RECORD),
+ *     so whatever preceded it is settled and must not haunt the episode's
+ *     own final verdict;
+ *   - `verify_part` / `verify_claim` (successful) also clear it — the
+ *     caller LOOKED;
+ *   - any other successful `MUTATES_SOLIDS` call adds to it.
+ *
+ * `tools` is the DISTINCT verbs (a Set, matching gates.ts's own choice —
+ * "boolean, fillet_edges across 40 calls" is legible, forty repetitions of
+ * "boolean" is not); `count` tallies every call, distinct or not, same as
+ * gates.ts's own `intentUnverified.count`.
+ *
+ * Defensively coded against malformed input (`null`/`undefined`/non-array,
+ * entries missing `tool`) so it degrades to the clean answer rather than
+ * throwing — belt-and-braces alongside the try/catch at its one call site
+ * below, per the hard constraint that this check must never cost an episode
+ * its trajectory.
+ */
+export function unverifiedMutatingWork(stepLog) {
+  const tools = new Set();
+  let count = 0;
+  const entries = Array.isArray(stepLog) ? stepLog : [];
+  for (const s of entries) {
+    if (s == null || typeof s !== "object") continue;
+    if (s.ok !== true) continue; // refused/errored — built nothing to verify
+    const tool = s.tool;
+    if (typeof tool !== "string") continue;
+    if (tool === "timeline_checkpoint" || tool === "clear_timeline" || VERIFIES.has(tool)) {
+      tools.clear();
+      count = 0;
+    } else if (MUTATES_SOLIDS.has(tool)) {
+      tools.add(tool);
+      count += 1;
+    }
+  }
+  return { count, tools: [...tools].sort() };
+}
+
+/**
+ * Item 7's one call site, wrapped so a throw inside the derivation above
+ * (or any future edit to it) becomes a STATED ABSENCE rather than a failed
+ * episode — the hard constraint the brief names outranking the feature
+ * itself: "the episode path must gain no new failure mode."
+ */
+function deriveUnverifiedMutations(stepLog) {
+  try {
+    return unverifiedMutatingWork(stepLog);
+  } catch (e) {
+    return { absent: `the unverified-mutations check itself failed: ${String(e?.message ?? e)}` };
+  }
+}
+
 /** Why terminal scoring did not run, per outcome. Never a bare `[]`/`null`. */
 const NO_TERMINAL_SCORING = {
   BUDGET_EXHAUSTED: "the step or token budget ran out before the policy declared done, so terminal verification never ran",
@@ -192,6 +281,13 @@ export async function runEpisode({
   /** This episode's task, bound to the shared `unscoredFor` above. */
   const unscored = (outcome, detail) => unscoredFor(task, outcome, detail);
 
+  // Item 7 — every dispatched call's tool name and whether it succeeded, in
+  // step order. Genuinely empty until the drive loop below reaches its
+  // first `session.call`, which is what makes `deriveUnverifiedMutations`
+  // trivially and honestly `{count: 0, tools: []}` for a SETUP_FAILED
+  // episode below: zero steps really did run.
+  const stepLog = [];
+
   // ── setup ────────────────────────────────────────────────────────────
   let documentId = null;
   let partId = null;
@@ -258,6 +354,7 @@ export async function runEpisode({
       outcome,
       rewardFinal: mergeFinal([]),
       claims, recipeRef, modelScope, tokens: 0, wallMs: Date.now() - started, error,
+      unverifiedMutations: deriveUnverifiedMutations(stepLog),
     });
     return {
       outcome, rewardFinal: mergeFinal([]), documentId, partId,
@@ -377,6 +474,12 @@ export async function runEpisode({
     // tally a policy could still rewrite.
     rewards.push(deepFreeze(reward));
     observation = result;
+    // Item 7 — the tool name and whether the call actually did anything
+    // (`is_error !== true`, the same test gates.ts's own intentUnverified
+    // bookkeeping uses), in step order. A harness-level refusal (above,
+    // `assertActionAllowed`) never reaches here because it never reached the
+    // kernel — nothing was built, so there is nothing to log either.
+    stepLog.push({ tool: action.tool, ok: result?.is_error !== true });
     traj.step({
       i, action, resultDigest: digest(result?.data ?? result?.text ?? null), reward,
       refusal: result?.refusal
@@ -446,9 +549,15 @@ export async function runEpisode({
 
   const rewardFinal = mergeFinal(rewards);
   const wallMs = Date.now() - started;
+  // Item 7 — computed for EVERY outcome, not only COMPLETED: unlike `claims`/
+  // `recipeRef` above (which need the terminal claim-scoring call the loop
+  // above only makes on COMPLETED), whether the agent verified its own
+  // mutating work is a fact about the STEP HISTORY alone, and that history
+  // exists no matter how the episode ended.
   traj.close({
     outcome, rewardFinal, claims, recipeRef, modelScope,
     tokens: policy.tokensUsed(), wallMs, error: episodeError,
+    unverifiedMutations: deriveUnverifiedMutations(stepLog),
   });
   return {
     outcome, rewardFinal, documentId, partId, trajectoryPath, wallMs,

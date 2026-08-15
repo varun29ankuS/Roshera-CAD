@@ -259,6 +259,85 @@ check("lineage edges are the real recipe step's inputs x outputs cross product",
   }
 });
 
+// ─── gate_preflight (item 1b, audit S4): the fail-open marker survives ────
+// into the row mapper, one layer past where item 1 landed it in the JSONL.
+// The step shape injected below is copied verbatim from the real emitter's
+// output (roshera-mcp/src/gates.ts `GatePreflightGap`, and
+// roshera-rl/test/episode.test.mjs's own `CREATED_WITH_GATE_PREFLIGHT`
+// fixture) — not invented, the same way the refusal step above is a real
+// shape synthetically injected because no saved trajectory happens to carry
+// one yet.
+check("a step whose gate-3 pre-flight was unavailable carries the marker onto its row, and only that step's row", () => {
+  const lines = completeText.trim().split("\n");
+  const createStep = JSON.parse(lines[2]); // i=1, create_cylinder
+  assert.equal(createStep.i, 1, "sanity: this is the create_cylinder step");
+  createStep.gate_preflight = "unavailable";
+  createStep.gate_preflight_gaps = [
+    {
+      ref: "3f2b8c1e-77aa-4a9f-8b21-9f0f2a6d5e10",
+      stage: "verify",
+      reason: "perception fetch timed out after 4000ms",
+    },
+  ];
+  lines[2] = JSON.stringify(createStep);
+  const r = rowsFromTrajectory(lines.join("\n") + "\n", { path: "gate-preflight.jsonl" });
+
+  const marked = r.steps.find((s) => s.index === 1);
+  assert.equal(marked.gate_preflight, "unavailable");
+
+  for (const s of r.steps) {
+    if (s.index === 1) continue;
+    assert.equal(s.gate_preflight, null,
+      "an absent marker means the gate ran — it must read back as SQL-NULL-shaped `null`, " +
+        "never left `undefined` and never defaulted to any other value, for every OTHER step");
+  }
+
+  assert.equal(r.gatePreflightGaps.length, 1, "exactly one gap row, for the one marked step");
+  const gap = r.gatePreflightGaps[0];
+  assert.equal(gap.episode_id, r.episode.episode_id);
+  assert.equal(gap.step_index, 1);
+  assert.equal(gap.ref, "3f2b8c1e-77aa-4a9f-8b21-9f0f2a6d5e10");
+  assert.equal(gap.stage, "verify");
+  assert.match(gap.reason, /timed out after 4000ms/);
+});
+
+// A `boolean` names two operands, so both are reported independently if both
+// fail (item-1-report.md, Part A) — one step, two gap rows, distinguishable
+// by `stage`/`ref`, never collapsed into one.
+check("a step naming two failed base refs produces two gap rows, not one", () => {
+  const lines = completeText.trim().split("\n");
+  const createStep = JSON.parse(lines[2]);
+  createStep.gate_preflight = "unavailable";
+  createStep.gate_preflight_gaps = [
+    { ref: "uuid-a", stage: "resolve", reason: "404 on GET /api/scene/snapshot" },
+    { ref: "uuid-b", stage: "verify", reason: "perception fetch timed out after 4000ms" },
+  ];
+  lines[2] = JSON.stringify(createStep);
+  const r = rowsFromTrajectory(lines.join("\n") + "\n", { path: "gate-preflight-two.jsonl" });
+
+  assert.equal(r.gatePreflightGaps.length, 2);
+  const byRef = Object.fromEntries(r.gatePreflightGaps.map((g) => [g.ref, g]));
+  assert.equal(byRef["uuid-a"].stage, "resolve");
+  assert.match(byRef["uuid-a"].reason, /404/);
+  assert.equal(byRef["uuid-b"].stage, "verify");
+  assert.match(byRef["uuid-b"].reason, /timed out/);
+  for (const g of r.gatePreflightGaps) {
+    assert.equal(g.step_index, 1);
+    assert.equal(g.episode_id, r.episode.episode_id);
+  }
+});
+
+// The common case, proven directly rather than by omission: a trajectory
+// with NO gate_preflight anywhere (the fixture as-is) must not manufacture
+// any gap rows, and every step's `gate_preflight` column must read back null.
+check("a healthy trajectory (no fail-open anywhere) carries no gate_preflight marker and no gap rows", () => {
+  const r = rowsFromTrajectory(completeText, { path: completePath });
+  assert.deepEqual(r.gatePreflightGaps, []);
+  for (const s of r.steps) {
+    assert.equal(s.gate_preflight, null);
+  }
+});
+
 // ─── provenance absent → rows still produced, flagged unattributable ──────
 check("a trajectory whose provenance is absent still produces rows but with attributable: false", () => {
   const text = withoutProvenance(completeText);
@@ -317,6 +396,7 @@ check("a malformed file produces a quarantine entry naming the reason rather tha
   assert.deepEqual(r.recipeSteps, []);
   assert.deepEqual(r.solids, []);
   assert.deepEqual(r.lineageEdges, []);
+  assert.deepEqual(r.gatePreflightGaps, []);
   assert.equal(r.quarantine.length, 1);
   assert.equal(r.quarantine[0].path, malformedPath);
   assert.match(r.quarantine[0].reason, /not valid JSON/i);

@@ -69,7 +69,7 @@ function isAbsent(v) {
 function quarantined(path, reason) {
   return {
     run: null, episode: null, steps: [], refusals: [], claims: [],
-    recipe: null, recipeSteps: [], solids: [], lineageEdges: [],
+    recipe: null, recipeSteps: [], solids: [], lineageEdges: [], gatePreflightGaps: [],
     quarantine: [{ path: path ?? null, reason }],
   };
 }
@@ -222,6 +222,15 @@ function stepRows(episodeId, stepLines) {
     result_digest: s.result_digest ?? null,
     reward: s.reward ?? null,
     duration_ms: s.ms ?? null,
+    // `gate_preflight` (item 1b, audit S4): mirrors the SAME `?? null` used
+    // by every other column on this row. That is not a contradiction of
+    // "omit, never default" — that rule governs the JSONL line, where an
+    // absent KEY is what says "the gate ran" (trajectory.mjs). A relational
+    // row has no such option: every row of `rl_step` carries this column,
+    // so the only honest representation of "this step's gate ran" is SQL
+    // NULL, exactly like `result_digest`/`tool`/`duration_ms` above. Never
+    // stamped `"ok"` — an absent marker IS the "gate ran" statement.
+    gate_preflight: s.gate_preflight ?? null,
   }));
 }
 
@@ -234,6 +243,33 @@ function refusalRows(episodeId, stepLines) {
       gate: s.refusal.gate ?? null,
       reason: s.refusal.reason ?? null,
     }));
+}
+
+/**
+ * One row per base ref a step's gate-3 pre-flight could not complete for
+ * (item 1b, audit S4's "cheapest high-value item"). Modeled on
+ * `refusalRows` immediately above — a step-scoped optional fact gets its
+ * own many-rows-per-episode table rather than a JSONB blob squeezed into
+ * `rl_step`, the same shape `rl_refusal` already uses for `s.refusal`. A
+ * step with no `gate_preflight_gaps` array (the common case — the gate ran)
+ * contributes nothing; this function never invents a gap.
+ */
+function gatePreflightGapRows(episodeId, stepLines) {
+  const rows = [];
+  for (const s of stepLines) {
+    const gaps = s.gate_preflight_gaps;
+    if (!Array.isArray(gaps)) continue;
+    for (const g of gaps) {
+      rows.push({
+        episode_id: episodeId,
+        step_index: s.i,
+        ref: g?.ref ?? null,
+        stage: g?.stage ?? null,
+        reason: g?.reason ?? null,
+      });
+    }
+  }
+  return rows;
 }
 
 function claimRows(episodeId, claims) {
@@ -386,6 +422,7 @@ export function rowsFromTrajectory(text, { path } = {}) {
       episode,
       steps: stepRows(episode.episode_id, stepLines),
       refusals: refusalRows(episode.episode_id, stepLines),
+      gatePreflightGaps: gatePreflightGapRows(episode.episode_id, stepLines),
       claims: claimRows(episode.episode_id, terminal.claims),
       recipe: recipeRowFrom(episode.episode_id, recipeRef),
       recipeSteps: recipeStepRows(episode.episode_id, recipeRef),
