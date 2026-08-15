@@ -72,21 +72,39 @@ const MUTATES_SOLIDS = new Set([
 const VERIFIES = new Set(["verify_part", "verify_claim"]);
 
 /**
- * M2 (2026-08-15 final review) — `cad_program`, `workbench` and `invoke` are
- * COMPOSITE dispatch: each runs its own inner calls through gates.ts's
- * wrapper individually (`registry.ts:119-132`, reached from
- * `cad_program.ts:453`'s `entry.handler(parsed, extra)` — confirmed by the
- * review, not assumed), so ten mutations inside one `cad_program` batch each
- * arm and clear gate 6 exactly as ten direct calls would. None of that shows
- * up as separate entries in THIS package's step log — `stepLog` records only
- * the OUTER tool name (`action.tool` below) — so a successful composite
- * dispatch is the concrete, measured answer to "can `MUTATES_SOLIDS` and
- * `VERIFIES` be byte-identical to gates.ts's copies while the two packages'
- * BEHAVIOUR still differs": yes, exactly here. The set-equality pin in
- * episode.test.mjs proves the two membership lists agree; it cannot and does
- * not prove anything about what a composite call did once dispatched.
+ * M2 (2026-08-15 final review), corrected by H1 (2026-08-15 whole-branch
+ * review) — `cad_program` and `invoke` are COMPOSITE dispatch: each runs its
+ * own inner calls through gates.ts's wrapper individually
+ * (`registry.ts:119-132`), so ten mutations inside one `cad_program` batch
+ * each arm and clear gate 6 exactly as ten direct calls would. None of that
+ * shows up as separate entries in THIS package's step log — `stepLog`
+ * records only the OUTER tool name (`action.tool` below) — so a successful
+ * composite dispatch is the concrete, measured answer to "can
+ * `MUTATES_SOLIDS` and `VERIFIES` be byte-identical to gates.ts's copies
+ * while the two packages' BEHAVIOUR still differs": yes, exactly here.
+ *
+ * **How this set was derived, so the next person can re-derive it rather
+ * than guess:** grep `roshera-mcp/src` for `entry.handler(` — the call that
+ * actually dispatches an inner tool through the registry. There are exactly
+ * two hits today: `cad_program.ts:454` and `metatools.ts:571` (`invoke`'s
+ * handler). Any tool whose OWN handler is not one of those two call sites is
+ * not composite, however tempting its name — `workbench` was in this set
+ * until H1: its handler is `async ({ mode }) => ok(wb.enter(mode))`
+ * (`workbench.ts:293`), which dispatches nothing, changes only which tools
+ * are *exposed*, and was never one of the two `entry.handler(` sites. One
+ * successful `workbench` call was short-circuiting `unverifiedMutatingWork`
+ * for the WHOLE episode from that point on while stating a reason below
+ * ("inner mutations and inner verify_part/verify_claim calls … not logged
+ * as separate entries here") that was false for `workbench` specifically —
+ * there are no inner calls to not-log. Latent only because the shipped task
+ * allowlist (`task.mjs:248`) never named it; `task.mjs:10-11` anticipates a
+ * future task that does.
+ *
+ * The set-equality pin in episode.test.mjs proves the two membership lists
+ * agree; it cannot and does not prove anything about what a composite call
+ * did once dispatched.
  */
-const COMPOSITE_DISPATCH = new Set(["cad_program", "workbench", "invoke"]);
+const COMPOSITE_DISPATCH = new Set(["cad_program", "invoke"]);
 
 /**
  * F1 (2026-08-15 whole-branch review, finding H3) — the `gates.ts` copy of

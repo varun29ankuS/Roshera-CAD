@@ -298,20 +298,23 @@ async fn the_two_base_ref_surfaces_are_equal_modulo_the_exemption_list() {
         ),
         (
             "drawing_export",
-            "GENUINE, KNOWN gap, not silently closed by relabelling: \
-             `export_svg`/`export_pdf`/`export_dxf` (drawing_mgr.rs) now \
-             check the underlying SOLID's soundness server-side \
-             (`refuse_unsound_solid`), reached from MCP via \
-             `drawing_export_sheet` (io.ts) — but that tool's ONLY \
-             client-side gate is `sheetExportGate` (gate 4, \
-             acknowledge_layout_issues), which has no solid-soundness \
-             branch and forwards no `acknowledge_unsound`. An MCP-driven \
-             acknowledged-inspection-sheet export will 409 until \
-             `drawing_export_sheet`'s schema/handler grow that forwarding \
-             — a REST-only-territory fix cannot close the MCP half; a \
-             raw HTTP client is fully covered today (`?acknowledge_unsound=\
-             true`), which is the surface this whole closeout exists to \
-             harden.",
+            "GENUINE gap, but between gate 3 and gate 4, not a missing \
+             forwarding: `export_svg`/`export_pdf`/`export_dxf` \
+             (drawing_mgr.rs) check the underlying SOLID's soundness \
+             server-side via `refuse_unsound_solid` — a DIFFERENT \
+             mechanism from the `refuse_unsound_base` call sites THIS \
+             module's `BASE_REFS`/gate-3 comparison actually tracks — so \
+             `drawing_export` structurally can never appear as a \
+             `BASE_REFS` key, independent of what the MCP side forwards. \
+             Reached from MCP via `drawing_export_sheet` (io.ts); as of \
+             `348cfadb` (one commit after this exemption was first \
+             written, same branch) that tool's `acknowledge_unsound` IS \
+             forwarded (io.ts:245 schema, io.ts:256 handler) alongside \
+             `sheetExportGate`'s own `acknowledge_layout_issues` (gate 4) \
+             — the MCP half is closed, and a raw HTTP client was already \
+             covered (`?acknowledge_unsound=true`). This entry documents \
+             gate-3/gate-4 non-comparability, which `348cfadb` does not \
+             and cannot change.",
         ),
         (
             "drawing_svg",
@@ -383,11 +386,18 @@ async fn the_two_base_ref_surfaces_are_equal_modulo_the_exemption_list() {
     // `make_drawing` CLOSED for real, `drawing_export` and `drawing_svg`
     // ADDED as the sheet surface grew its own gate). Of the 9, 7 are
     // legitimate (compositions over an already-gated primitive, or routes
-    // no MCP tool reaches) and 2 (`drawing_export`, `drawing_svg`) are a
-    // known, currently-irreducible gap: this module compares `BASE_REFS`
-    // (gate 3) specifically, and the sheet surface's client-side gate is
-    // `sheetExportGate` (gate 4) — a real gap between the Rust and MCP
-    // surfaces for `drawing_export` remains (see that entry) until
-    // `roshera-mcp` (a concurrent agent's territory on this branch) grows
-    // the forwarding.
+    // no MCP tool reaches) and 2 (`drawing_export`, `drawing_svg`) stand for
+    // a structural reason, not an outstanding gap: this module compares
+    // `BASE_REFS` (gate 3, the `refuse_unsound_base` call sites) against
+    // gates.ts, but the sheet surface's solid-soundness check runs through
+    // `refuse_unsound_solid` — a different gate entirely, client-gated by
+    // `sheetExportGate` (gate 4) — so neither name can ever be a `BASE_REFS`
+    // key regardless of what MCP forwards. `348cfadb`, the very next commit
+    // on this branch after this exemption was first written, closed the MCP
+    // half of gate 4's own forwarding (`io.ts:245`/`:256`); that closure
+    // does not and cannot retire this exemption, because gate 3 and gate 4
+    // were never the same comparison (M1, 2026-08-15 whole-branch review —
+    // this file's exemption text previously described the now-closed gate-4
+    // gap as the reason for a gate-3 exemption, which stopped being true the
+    // moment `348cfadb` landed).
 }

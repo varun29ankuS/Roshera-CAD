@@ -462,3 +462,176 @@ async fn a_verified_sound_solid_is_never_refused_by_the_solid_soundness_gate() {
         "one-call svg of a verified-sound solid must 200; body = {body}"
     );
 }
+
+// =====================================================================
+// 6. `record_event` fires only when an escape was actually taken (H2,
+//    2026-08-15 closeout wave 2). Before this fix every export —
+//    escaped or not — wrote `acknowledge_layout_issues: false,
+//    acknowledge_unsound: false` to the timeline unconditionally: a
+//    fabricated "an escape was considered and declined" on an ordinary
+//    GET, and behaviour change on a route that used to record nothing
+//    at all (M4). Mirrors `unsound_base_gate_tests::
+//    no_acknowledge_unsound_argument_records_no_facet` for the facet
+//    mechanism.
+// =====================================================================
+
+/// Every event in `main`'s history whose `command_type` is one of the
+/// drawing-export kinds, paired with its recorded `params` — the same
+/// `operation.parameters.params` accessor `router_integration_tests.rs`
+/// already uses for this envelope shape (`to_timeline_operation`,
+/// `recorder_bridge.rs:1068-1092`: `parameters` on the wire is
+/// `{"params": <RecordedOperation::parameters>, "inputs": [...],
+/// "outputs": [...], "facets"?: {...}}`).
+async fn drawing_export_events_in_history(state: &AppState) -> Vec<(String, serde_json::Value)> {
+    let (status, body) = dispatch(state, get("/api/timeline/history/main")).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "timeline history must 200; body = {body}"
+    );
+    let events = body.as_array().cloned().unwrap_or_else(|| {
+        panic!("expected a bare event array (durability off in test state); got {body}")
+    });
+    events
+        .into_iter()
+        .filter_map(|e| {
+            let kind = e["operation"]["command_type"].as_str()?.to_string();
+            if kind == "drawing.export" || kind == "drawing.svg_export" {
+                Some((kind, e["operation"]["parameters"]["params"].clone()))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// RED before the fix: an ordinary export of a clean sheet — neither gate's
+/// escape ever invoked — wrote a `drawing.export`/`drawing.svg_export`
+/// event on every call. It must now write nothing at all.
+#[tokio::test]
+async fn a_clean_export_with_no_escape_records_nothing() {
+    let state = make_test_state().await;
+    let (_uuid, solid_id) = sound_verified_box(&state).await;
+    let drawing_id = register_drawing_for(&state, solid_id).await;
+
+    for kind in ["pdf", "dxf", "svg"] {
+        let (status, body) =
+            dispatch(&state, get(&format!("/api/drawings/{drawing_id}/{kind}"))).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{kind} export must 200; body = {body}"
+        );
+    }
+    let (status, body) = dispatch(&state, get(&format!("/api/parts/{solid_id}/drawing.svg"))).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "one-call svg must 200; body = {body}"
+    );
+
+    let events = drawing_export_events_in_history(&state).await;
+    assert!(
+        events.is_empty(),
+        "four clean exports (no escape taken on either gate) must leave \
+         ZERO drawing-export events on the timeline; found {events:?}"
+    );
+}
+
+/// A registered export that DID take the `acknowledge_unsound` escape
+/// records exactly that flag as `true`, and carries no
+/// `acknowledge_layout_issues` key at all — that escape was never taken,
+/// and absence (not a stored `false`) is how "not taken" is represented.
+#[tokio::test]
+async fn a_registered_export_using_only_acknowledge_unsound_records_only_that_flag() {
+    let state = make_test_state().await;
+    let (_uuid, solid_id) = unsound_verified_box(&state).await;
+    let drawing_id = {
+        let (status, body) = dispatch(
+            &state,
+            post(
+                &format!("/api/parts/{solid_id}/drawing?acknowledge_unsound=true"),
+                json!({}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body = {body}");
+        Uuid::parse_str(body["id"].as_str().expect("drawing id string"))
+            .expect("drawing id must parse")
+    };
+
+    let (status, body) = dispatch(
+        &state,
+        get(&format!(
+            "/api/drawings/{drawing_id}/pdf?acknowledge_unsound=true"
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "pdf export must 200; body = {body}");
+
+    let events = drawing_export_events_in_history(&state).await;
+    let export_events: Vec<_> = events
+        .iter()
+        .filter(|(kind, _)| kind == "drawing.export")
+        .collect();
+    assert_eq!(
+        export_events.len(),
+        1,
+        "exactly one export event — the pdf export that used the escape; \
+         found {events:?}"
+    );
+    let params = &export_events[0].1;
+    assert_eq!(
+        params["acknowledge_unsound"].as_bool(),
+        Some(true),
+        "the escape actually taken must be recorded true; params = {params}"
+    );
+    assert!(
+        params.get("acknowledge_layout_issues").is_none(),
+        "the escape NOT taken must be absent, never a stored false; \
+         params = {params}"
+    );
+}
+
+/// The one-call svg route (`drawing.svg_export`) mirrors the same rule:
+/// only the escape actually taken is recorded, by its own key, and the
+/// other stays absent.
+#[tokio::test]
+async fn the_one_call_svg_export_using_only_acknowledge_unsound_records_only_that_flag() {
+    let state = make_test_state().await;
+    let (_uuid, solid_id) = unsound_verified_box(&state).await;
+
+    let (status, body) = dispatch(
+        &state,
+        get(&format!(
+            "/api/parts/{solid_id}/drawing.svg?acknowledge_unsound=true"
+        )),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "one-call svg must 200; body = {body}"
+    );
+
+    let events = drawing_export_events_in_history(&state).await;
+    let svg_events: Vec<_> = events
+        .iter()
+        .filter(|(kind, _)| kind == "drawing.svg_export")
+        .collect();
+    assert_eq!(
+        svg_events.len(),
+        1,
+        "exactly one svg_export event; found {events:?}"
+    );
+    let params = &svg_events[0].1;
+    assert_eq!(
+        params["acknowledge_unsound"].as_bool(),
+        Some(true),
+        "params = {params}"
+    );
+    assert!(
+        params.get("acknowledge_layout_issues").is_none(),
+        "params = {params}"
+    );
+}

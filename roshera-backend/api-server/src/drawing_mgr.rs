@@ -600,20 +600,31 @@ pub async fn export_svg(
     // lock acquisition.
     let svg = render_drawing_svg(&snapshot);
 
-    // Concern C (M4, 2026-08-15 review) — the escape taken above
-    // (`acknowledge_layout_issues` / `acknowledge_unsound`) is recorded on
-    // the timeline rather than left to live only in this request's memory,
-    // in the same shape `drawing.create`/`drawing.rename`/`drawing.add_view`/
-    // `drawing.remove_view` already use.
-    state.drawings.record_event(
-        RecordedOperation::new("drawing.export")
-            .with_parameters(serde_json::json!({
-                "format": "svg",
-                "acknowledge_layout_issues": q.acknowledge_layout_issues,
-                "acknowledge_unsound": q.acknowledge_unsound,
-            }))
-            .with_input_drawing(id),
-    );
+    // Concern C (M4, 2026-08-15 review; corrected per H2, closeout wave 2)
+    // — record an escape ONLY when one was actually taken. Reaching this
+    // line at all means both gates above already let the request through,
+    // so recording unconditionally here would assert "an escape was
+    // considered and declined" for a request that never invoked either
+    // gate's escape hatch — the exact fabricated-zero shape
+    // `AckUnsoundFacet`'s own doc (`recorder_bridge.rs:176-182`) names and
+    // `4c89436a`'s L1 ruling forbids for the sibling mechanism. Absence
+    // (no event at all) is how "no escape" is represented; the two flags
+    // present in the recorded parameters are therefore always `true` —
+    // there is no `false` variant here, same as `AckUnsoundFacet`.
+    if q.acknowledge_layout_issues || q.acknowledge_unsound {
+        let mut parameters = serde_json::json!({ "format": "svg" });
+        if q.acknowledge_layout_issues {
+            parameters["acknowledge_layout_issues"] = serde_json::json!(true);
+        }
+        if q.acknowledge_unsound {
+            parameters["acknowledge_unsound"] = serde_json::json!(true);
+        }
+        state.drawings.record_event(
+            RecordedOperation::new("drawing.export")
+                .with_parameters(parameters)
+                .with_input_drawing(id),
+        );
+    }
 
     let content_type = if q.plain {
         "text/plain; charset=utf-8"
@@ -788,23 +799,33 @@ async fn drawing_svg_for_solid(
     )
     .await?;
 
-    // Concern C (2026-08-15 closeout), extended to this route: an escape
-    // taken here (`acknowledge_unsound` / `acknowledge_layout_issues`) must
-    // not live only in this request's memory — the same principle M4 fixed
-    // for the three registered-export routes below. This route registers
-    // nothing durable of its own (`Uuid::nil()`, nothing in `state.drawings`
-    // to attach an event to), so the event names the SOLID as its input
-    // instead of a drawing id.
-    state.drawings.record_event(
-        RecordedOperation::new("drawing.svg_export")
-            .with_parameters(serde_json::json!({
-                "solid_id": solid_id,
-                "part_uuid": part_uuid,
-                "acknowledge_unsound": q.acknowledge_unsound,
-                "acknowledge_layout_issues": q.acknowledge_layout_issues,
-            }))
-            .with_input_solids(std::iter::once(solid_id as u64)),
-    );
+    // Concern C (2026-08-15 closeout; corrected per H2, closeout wave 2),
+    // extended to this route: an escape taken here (`acknowledge_unsound` /
+    // `acknowledge_layout_issues`) must not live only in this request's
+    // memory — the same principle M4 fixed for the three registered-export
+    // routes, and the same absence-means-no-escape rule H2 restored there.
+    // Both gates above already passed by the time this line runs, so
+    // recording unconditionally would assert an escape that was never
+    // taken. This route registers nothing durable of its own (`Uuid::nil()`,
+    // nothing in `state.drawings` to attach an event to), so the event
+    // names the SOLID as its input instead of a drawing id.
+    if q.acknowledge_unsound || q.acknowledge_layout_issues {
+        let mut parameters = serde_json::json!({
+            "solid_id": solid_id,
+            "part_uuid": part_uuid,
+        });
+        if q.acknowledge_unsound {
+            parameters["acknowledge_unsound"] = serde_json::json!(true);
+        }
+        if q.acknowledge_layout_issues {
+            parameters["acknowledge_layout_issues"] = serde_json::json!(true);
+        }
+        state.drawings.record_event(
+            RecordedOperation::new("drawing.svg_export")
+                .with_parameters(parameters)
+                .with_input_solids(std::iter::once(solid_id as u64)),
+        );
+    }
 
     let svg = render_drawing_svg(&drawing);
     let content_type = if q.plain {
@@ -1245,17 +1266,24 @@ pub async fn export_pdf(
         .map_err(|e| ApiError::new(ErrorCode::KernelError, format!("pdf render failed: {e}")))?;
     let name = snapshot.name.clone();
 
-    // Concern C (M4, 2026-08-15 review) — record the escape, if any, on
-    // the timeline. See `export_svg`'s identical block.
-    state.drawings.record_event(
-        RecordedOperation::new("drawing.export")
-            .with_parameters(serde_json::json!({
-                "format": "pdf",
-                "acknowledge_layout_issues": q.acknowledge_layout_issues,
-                "acknowledge_unsound": q.acknowledge_unsound,
-            }))
-            .with_input_drawing(id),
-    );
+    // Concern C (M4, 2026-08-15 review; corrected per H2, closeout wave 2)
+    // — record an escape only when one was actually taken. See
+    // `export_svg`'s identical block for why unconditional recording here
+    // would be the fabricated-zero defect.
+    if q.acknowledge_layout_issues || q.acknowledge_unsound {
+        let mut parameters = serde_json::json!({ "format": "pdf" });
+        if q.acknowledge_layout_issues {
+            parameters["acknowledge_layout_issues"] = serde_json::json!(true);
+        }
+        if q.acknowledge_unsound {
+            parameters["acknowledge_unsound"] = serde_json::json!(true);
+        }
+        state.drawings.record_event(
+            RecordedOperation::new("drawing.export")
+                .with_parameters(parameters)
+                .with_input_drawing(id),
+        );
+    }
 
     let disposition = content_disposition(&name, id, "pdf");
     Ok((
@@ -1302,17 +1330,24 @@ pub async fn export_dxf(
         .map_err(|e| ApiError::new(ErrorCode::KernelError, format!("dxf render failed: {e}")))?;
     let name = snapshot.name.clone();
 
-    // Concern C (M4, 2026-08-15 review) — record the escape, if any, on
-    // the timeline. See `export_svg`'s identical block.
-    state.drawings.record_event(
-        RecordedOperation::new("drawing.export")
-            .with_parameters(serde_json::json!({
-                "format": "dxf",
-                "acknowledge_layout_issues": q.acknowledge_layout_issues,
-                "acknowledge_unsound": q.acknowledge_unsound,
-            }))
-            .with_input_drawing(id),
-    );
+    // Concern C (M4, 2026-08-15 review; corrected per H2, closeout wave 2)
+    // — record an escape only when one was actually taken. See
+    // `export_svg`'s identical block for why unconditional recording here
+    // would be the fabricated-zero defect.
+    if q.acknowledge_layout_issues || q.acknowledge_unsound {
+        let mut parameters = serde_json::json!({ "format": "dxf" });
+        if q.acknowledge_layout_issues {
+            parameters["acknowledge_layout_issues"] = serde_json::json!(true);
+        }
+        if q.acknowledge_unsound {
+            parameters["acknowledge_unsound"] = serde_json::json!(true);
+        }
+        state.drawings.record_event(
+            RecordedOperation::new("drawing.export")
+                .with_parameters(parameters)
+                .with_input_drawing(id),
+        );
+    }
 
     let disposition = content_disposition(&name, id, "dxf");
     Ok((

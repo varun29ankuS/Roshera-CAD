@@ -81,8 +81,10 @@
  *     inside the derivation, caught at its one call site — the hard
  *     constraint this exists under outranks the feature: this check must
  *     never cost an episode its trajectory), OR the check ran but could not
- *     be trusted: a successful `cad_program` / `workbench` / `invoke`
- *     dispatch in the step log (M2, 2026-08-15 final review) runs its own
+ *     be trusted: a successful `cad_program` / `invoke` dispatch in the
+ *     step log (M2, 2026-08-15 final review; the set was `cad_program` /
+ *     `workbench` / `invoke` until H1, 2026-08-15 whole-branch review,
+ *     removed `workbench` — its handler dispatches nothing) runs its own
  *     inner mutations and verifies through gates.ts individually, invisibly
  *     to this reconstruction, so `unverifiedMutatingWork` reports the honest
  *     "cannot be reconstructed" here rather than a count that might be wrong

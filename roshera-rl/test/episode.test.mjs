@@ -690,9 +690,17 @@ check("unverifiedMutatingWork: malformed input degrades to the clean answer rath
   );
 });
 
-// ─── M2 (2026-08-15 final review) — composite dispatch (cad_program /
-//     workbench / invoke) makes the reconstruction unreliable, so it must
-//     return a STATED ABSENCE, never a fabricated {count: 0} ──────────────
+// ─── M2 (2026-08-15 final review), corrected by H1 (2026-08-15 whole-branch
+//     review) — composite dispatch is `cad_program` / `invoke` ONLY. Each
+//     runs its own inner calls through gates.ts's wrapper individually
+//     (the two `entry.handler(` call sites, `cad_program.ts:454` and
+//     `metatools.ts:571`), so a successful call must return a STATED
+//     ABSENCE, never a fabricated {count: 0}. `workbench` is NOT composite —
+//     its handler (`workbench.ts:293`) only changes which tools are
+//     exposed and dispatches nothing, so it must NOT poison the
+//     reconstruction; a successful `workbench` call is simply not tracked
+//     by this function at all, the same as any other tool absent from every
+//     set below ──────────────
 
 check("unverifiedMutatingWork: a successful cad_program dispatch is a stated absence, not a fabricated zero", () => {
   const r = unverifiedMutatingWork([
@@ -704,9 +712,21 @@ check("unverifiedMutatingWork: a successful cad_program dispatch is a stated abs
   assert.equal(r.tools, undefined);
 });
 
-check("unverifiedMutatingWork: workbench and invoke get the same composite-dispatch treatment", () => {
-  assert.equal(typeof unverifiedMutatingWork([{ tool: "workbench", ok: true }]).absent, "string");
+check("unverifiedMutatingWork: invoke gets the same composite-dispatch treatment as cad_program", () => {
   assert.equal(typeof unverifiedMutatingWork([{ tool: "invoke", ok: true }]).absent, "string");
+});
+
+check("unverifiedMutatingWork: workbench is NOT composite dispatch (H1) — it must not poison the reconstruction", () => {
+  const bare = unverifiedMutatingWork([{ tool: "workbench", ok: true }]);
+  assert.equal(bare.absent, undefined, "workbench dispatches nothing (workbench.ts:293), so a lone successful call is not a stated absence");
+  assert.deepEqual(bare, { count: 0, tools: [] });
+
+  const r = unverifiedMutatingWork([
+    { tool: "create_box", ok: true },
+    { tool: "workbench", ok: true },
+  ]);
+  assert.deepEqual(r, { count: 1, tools: ["create_box"] },
+    "a workbench call after a real mutation must leave the tally exactly as it was — the H1 defect was this reading {absent: ...} instead");
 });
 
 check("unverifiedMutatingWork: a REFUSED/errored composite dispatch built nothing — same rule as any other refused call", () => {
@@ -933,10 +953,13 @@ check("M2 CLOSED: an episode ending on a successful cad_program dispatch reports
 // WHAT THIS DOES NOT PIN, stated plainly rather than implied (M2, 2026-08-15
 // final review): set equality proves the two files agree on WHICH tools
 // mutate solids. It proves NOTHING about whether the two packages' BEHAVIOUR
-// agrees once one of those tools is a COMPOSITE — `cad_program`, `workbench`,
-// `invoke` are absent from both sets (correctly: the outer call itself is not
-// a mutation) while their INNER dispatches run through gates.ts's real gate
-// individually. `episode.mjs`'s step log only ever sees the outer call name,
+// agrees once one of those tools is a COMPOSITE — `cad_program` and `invoke`
+// are absent from both sets (correctly: the outer call itself is not a
+// mutation) while their INNER dispatches run through gates.ts's real gate
+// individually. (`workbench` is also absent from both sets, but for the
+// ordinary reason any non-mutating, non-composite tool is — H1, 2026-08-15
+// whole-branch review, corrected the earlier belief that it was composite.)
+// `episode.mjs`'s step log only ever sees the outer call name,
 // so this pin passing is fully consistent with "ten mutations inside one
 // cad_program call tally zero" — the review's concrete answer to "can the two
 // sets be equal while the behaviour differs". That gap is closed by
