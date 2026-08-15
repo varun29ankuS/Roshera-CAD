@@ -37,6 +37,40 @@
 //! - **Refactor safety.** Adding a variant forces the compiler to
 //!   surface every match site, so a new failure mode cannot be
 //!   silently bucketed under an old one.
+//!
+//! # A deliberate REFUSAL is spelled `REFUSED:` (concern E, L3, 2026-08-15
+//! # closeout)
+//!
+//! `roshera-mcp`'s generic HTTP error path (`core.ts::api`) embeds the raw
+//! response body text verbatim into the thrown `ApiError.message`, which
+//! `fail()` then wraps as `content[0].text = "ERROR: ${msg}\nHINT: ..."` —
+//! prose, never the structured JSON this module emits. The MCP surface's
+//! own refusal detector, `gates.ts::typedRefusalOf`, recognises a refusal
+//! two ways: a top-level JSON `refused` key (client-side refusals only —
+//! this module's wire shape has no such key, and adding one would not
+//! reach `content[0].text` without also changing `fail()`, which is
+//! `roshera-mcp` territory), or the literal word-bounded token `REFUSED` in
+//! the text alongside `isError: true`. Because the whole response body
+//! (including this catalog's own `error` prose) is embedded in that text,
+//! any gate-class constructor that opens its `error` message with
+//! `"REFUSED: "` makes `typedRefusalOf`'s SECOND branch fire — a real
+//! refusal classification, reached with NO change on the `roshera-mcp`
+//! side. `sheet_uncertified`, `sheet_unsound`, `sheet_quality`, and
+//! `intent_required` all do this.
+//!
+//! **`unsound_base` deliberately does NOT** — see its own doc for why: it
+//! is a `LIVE_FACT_GATES` member specifically so its refusal is NEVER
+//! cached client-side, and `typedRefusalOf`'s REFUSED-token branch returns
+//! `gate: undefined`, which `recordDispatchOutcome`'s cache-skip check
+//! (keyed on `gate`) cannot recognise as exempt — caching it would leave a
+//! repaired solid's identical retry answered from a stale cache, with
+//! `acknowledge_unsound` as the only apparent exit. Applying this
+//! convention to a NEW gate constructor requires checking whether
+//! `roshera-mcp/src/gates.ts`'s `LIVE_FACT_GATES` set and its cache-skip
+//! check have the same interaction BEFORE adding the prefix — it is not a
+//! blanket-safe transformation. Pin any new one with a needle test in the
+//! shape `refusal_token_tests.rs` uses, and record the cache-interaction
+//! check in the same place this file's own history does.
 
 use axum::{
     http::StatusCode,
@@ -82,6 +116,18 @@ pub enum ErrorCode {
     /// value). Non-retryable with the same name; `details` carries the
     /// rejected name.
     CheckpointNameRejected,
+    /// A mutating REST call on one of the ten gate-3 routes carried no
+    /// declared `X-Roshera-Intent` header, and `IntentPosture::Required`
+    /// is active (`ROSHERA_REQUIRE_INTENT=1` — audit item 10 / S2, opt-in,
+    /// OFF by default). Absent-is-legal is the deliberate DEFAULT posture
+    /// (`documents.rs:56-78`); this code exists only for the deployment
+    /// that has explicitly opted into demanding a declared intent on
+    /// every mutation (an RL run, most concretely). Same "carries no
+    /// intent" family as [`ErrorCode::CheckpointNameRejected`] — mapped to
+    /// the same 422, non-retryable. `details.gate = "intent"` matches
+    /// `roshera-mcp/src/gates.ts::intentGateRefusal`'s own `gate` field —
+    /// the SAME gate name, reached from the REST surface instead of MCP.
+    IntentRequired,
 
     // ── Kernel surface ────────────────────────────────────────────
     /// The kernel rejected the operation (topology, tolerance, etc.).
@@ -400,7 +446,9 @@ impl ErrorCode {
             // the canonical 422. Kept distinct from 400 so a client can
             // tell "your JSON is malformed" from "your name carries no
             // intent".
-            ErrorCode::CheckpointNameRejected => StatusCode::UNPROCESSABLE_ENTITY,
+            ErrorCode::CheckpointNameRejected | ErrorCode::IntentRequired => {
+                StatusCode::UNPROCESSABLE_ENTITY
+            }
 
             ErrorCode::SolidNotFound
             | ErrorCode::PartNotFound
@@ -454,6 +502,7 @@ impl ErrorCode {
             | ErrorCode::UnknownShapeType
             | ErrorCode::InvalidJson
             | ErrorCode::CheckpointNameRejected
+            | ErrorCode::IntentRequired
             | ErrorCode::BlendFailed
             | ErrorCode::BooleanDisjoint
             | ErrorCode::SolidNotFound
@@ -534,6 +583,7 @@ impl ErrorCode {
             ErrorCode::UnknownShapeType => "unknown_shape_type",
             ErrorCode::InvalidJson => "invalid_json",
             ErrorCode::CheckpointNameRejected => "checkpoint_name_rejected",
+            ErrorCode::IntentRequired => "intent_required",
             ErrorCode::KernelError => "kernel_error",
             ErrorCode::BlendFailed => "blend_failed",
             ErrorCode::BooleanDisjoint => "boolean_disjoint",
@@ -586,6 +636,7 @@ impl ErrorCode {
             ErrorCode::UnknownShapeType,
             ErrorCode::InvalidJson,
             ErrorCode::CheckpointNameRejected,
+            ErrorCode::IntentRequired,
             ErrorCode::KernelError,
             ErrorCode::BlendFailed,
             ErrorCode::BooleanDisjoint,
@@ -874,6 +925,31 @@ impl ApiError {
     /// reports for this solid — that endpoint is where `gates.ts` reads
     /// its own copy, so quoting it verbatim is what makes the two
     /// refusals agree by construction instead of by hand-synced prose.
+    ///
+    /// **Deliberately does NOT open with `"REFUSED: "`** (concern E, L3,
+    /// 2026-08-15 closeout — see this module's doc, "A deliberate REFUSAL
+    /// is spelled `REFUSED:`"). `unsound_base` is a `LIVE_FACT_GATES`
+    /// member (`gates.ts:378`) specifically so `recordDispatchOutcome`
+    /// NEVER caches its refusal — a repaired base must unblock the very
+    /// next identical call. `typedRefusalOf`'s REFUSED-token branch
+    /// (`gates.ts:184`) returns `{}` with `gate: undefined`, and the
+    /// cache-skip check (`gates.ts:1320`) is `refusal.gate !== undefined
+    /// && LIVE_FACT_GATES.has(refusal.gate)` — a gate-less refusal fails
+    /// that check and WOULD be cached under the same `(tool, args)` key a
+    /// legitimately-repaired retry re-issues. For `unsound_base` that key
+    /// is the SAME solid id before and after repair, so a cached refusal
+    /// would wrongly survive the repair and leave `acknowledge_unsound`
+    /// as the only apparent exit — teaching the escape instead of the
+    /// repair, the opposite of this gate's purpose. (The sheet gates below
+    /// don't have this problem: a stale/quality-failing sheet's `args`
+    /// carry the `drawing_id`, and repair mints a NEW drawing_id, so even
+    /// a cached refusal for the OLD id is simply never looked up again.)
+    /// Losing the REFUSED-token classification for a REST-originated
+    /// `unsound_base` refusal leaves it exactly where it stood before this
+    /// closeout — a generic (unclassified) failure to `roshera-mcp`, not a
+    /// regression — until `roshera-mcp`'s cache-skip check is made to key
+    /// off something other than `gate`, which is out of this task's
+    /// territory.
     pub fn unsound_base(operation: &str, solid_id: u32, verdict: &str) -> Self {
         Self::new(
             ErrorCode::UnsoundBase,
@@ -909,11 +985,12 @@ impl ApiError {
         Self::new(
             ErrorCode::SheetUncertified,
             format!(
-                "the live certificate for drawing {drawing_id} could not be \
-                 computed, so nothing certifies its printed dimensions \
-                 against the current model — and a PDF/DXF/SVG on disk can \
-                 never re-verify itself. Exporting an uncertified sheet \
-                 would ship an approximation labeled as exact."
+                "REFUSED: the live certificate for drawing {drawing_id} \
+                 could not be computed, so nothing certifies its printed \
+                 dimensions against the current model — and a PDF/DXF/SVG \
+                 on disk can never re-verify itself. Exporting an \
+                 uncertified sheet would ship an approximation labeled as \
+                 exact."
             ),
         )
         .with_hint(
@@ -937,9 +1014,9 @@ impl ApiError {
         Self::new(
             ErrorCode::SheetUnsound,
             format!(
-                "drawing {drawing_id} is UNSOUND against the live model: \
-                 {stale} stale fact(s) (the model moved since this sheet \
-                 was projected) and {dangling} dangling fact(s) (a \
+                "REFUSED: drawing {drawing_id} is UNSOUND against the live \
+                 model: {stale} stale fact(s) (the model moved since this \
+                 sheet was projected) and {dangling} dangling fact(s) (a \
                  referenced face no longer exists). A sheet whose printed \
                  dimensions disagree with the model would have a shop \
                  machine the wrong part."
@@ -970,7 +1047,7 @@ impl ApiError {
         Self::new(
             ErrorCode::SheetQuality,
             format!(
-                "drawing {drawing_id} failed its layout-quality \
+                "REFUSED: drawing {drawing_id} failed its layout-quality \
                  certificate — {error_count} Error-severity finding(s) \
                  (label collisions, redundant dimensions, broken view \
                  arrangement): exactly what a drawing checker rejects on \
@@ -988,6 +1065,37 @@ impl ApiError {
             "gate": "sheet_quality",
             "drawing_id": drawing_id,
             "error_count": error_count,
+        }))
+    }
+
+    /// **Intent-required mode** (audit item 10 / S2, 2026-08-15 closeout).
+    /// A mutating REST call on one of the ten gate-3 routes carried no
+    /// declared `X-Roshera-Intent` header while `IntentPosture::Required`
+    /// is active. Mirrors `roshera-mcp/src/gates.ts::intentGateRefusal`'s
+    /// wording and `gate: "intent"` field so an agent that has already
+    /// learned the MCP intent gate's shape recognises this as the same
+    /// rule, reached over REST.
+    pub fn intent_required(operation: &str) -> Self {
+        Self::new(
+            ErrorCode::IntentRequired,
+            format!(
+                "REFUSED: '{operation}' would mutate the model, but no \
+                 design intent was declared (X-Roshera-Intent) — this \
+                 server is running with intent-required mode ON \
+                 (ROSHERA_REQUIRE_INTENT=1), so a mutation with no \
+                 attached engineering decision is refused rather than \
+                 recorded anonymously."
+            ),
+        )
+        .with_hint(
+            "Send an X-Roshera-Intent header (URL-encoded free text) naming \
+             the feature, its governing dimensions, and where it sits — the \
+             same phrase the MCP intent checkpoint would open with — then \
+             re-issue this exact call.",
+        )
+        .with_details(serde_json::json!({
+            "gate": "intent",
+            "operation": operation,
         }))
     }
 

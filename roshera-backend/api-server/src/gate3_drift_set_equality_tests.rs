@@ -118,6 +118,27 @@ fn rust_direct_unsound_base_operations(src: &str) -> BTreeSet<String> {
     re.captures_iter(src).map(|c| c[1].to_string()).collect()
 }
 
+/// Every distinct operation string passed as the 2nd argument to a call of
+/// `drawing_mgr::refuse_unsound_solid(model_handle, "OPERATION", ...)` —
+/// concern A's (2026-08-15 closeout) sheet-surface twin of `refuse_unsound_
+/// base`, added to close the `make_drawing` gap this module's own exemption
+/// list used to carry as "GENUINE, STILL-OPEN". It cannot go through
+/// `refuse_unsound_base` itself for the same reason `export.rs`'s item-8
+/// fix cannot (see `rust_direct_unsound_base_operations`'s doc): several
+/// call sites already hold a read guard on the same `model_handle`, and the
+/// helper reads the non-recomputing `soundness_reading` rather than
+/// `certify_solid`. The function's OWN internal call,
+/// `ApiError::unsound_base(operation, solid_id, crate::VERDICT_UNSOUND)`,
+/// passes a `&str` VARIABLE, not a quoted literal — verified: the required
+/// `\s*"` immediately after `unsound_base(` never matches an identifier —
+/// so it cannot double-count against `rust_direct_unsound_base_operations`
+/// (which scans a disjoint file list) or against itself.
+fn rust_drawing_solid_gate_operations(src: &str) -> BTreeSet<String> {
+    let re =
+        Regex::new(r#"(?s)refuse_unsound_solid\(\s*[^,]+,\s*"([^"]+)""#).expect("static regex");
+    re.captures_iter(src).map(|c| c[1].to_string()).collect()
+}
+
 /// Canonicalise a name so a deliberate, known naming difference between the
 /// two languages does not read as a false divergence. Only the pairs
 /// actually known to differ are listed; anything else passes through
@@ -137,6 +158,7 @@ async fn the_two_base_ref_surfaces_are_equal_modulo_the_exemption_list() {
     let main_rs = repo_file("src/main.rs");
     let sketch_rs = repo_file("src/sketch.rs");
     let export_rs = repo_file("src/handlers/export.rs");
+    let drawing_mgr_rs = repo_file("src/drawing_mgr.rs");
 
     let ts_keys = ts_base_refs_keys(&gates_ts);
     assert!(
@@ -154,6 +176,10 @@ async fn the_two_base_ref_surfaces_are_equal_modulo_the_exemption_list() {
     rust_ops.extend(rust_direct_unsound_base_operations(&main_rs));
     rust_ops.extend(rust_direct_unsound_base_operations(&sketch_rs));
     rust_ops.extend(rust_direct_unsound_base_operations(&export_rs));
+    // Concern A, 2026-08-15 closeout: the sheet surface's own gate,
+    // `drawing_mgr::refuse_unsound_solid` — closes `make_drawing`'s
+    // exemption for real (below) rather than leaving the comment stale.
+    rust_ops.extend(rust_drawing_solid_gate_operations(&drawing_mgr_rs));
     assert!(
         rust_ops.len() >= 5,
         "sanity: only {} Rust operation name(s) found ({:?}) — the regex \
@@ -163,6 +189,25 @@ async fn the_two_base_ref_surfaces_are_equal_modulo_the_exemption_list() {
         rust_ops
     );
 
+    // ── L4 (2026-08-15 whole-branch review), concern F of the closeout ──
+    // This comparison proves NAME parity only: that both surfaces agree an
+    // operation called "boolean" is gated. It does NOT prove they gate the
+    // SAME REFS — `gates.ts`'s `boolean: (a) => [{ uuid: a?.object_a },
+    // { uuid: a?.object_b }]` (gates.ts:321) checks BOTH operands, and
+    // Rust's `refuse_unsound_base(&model_handle, &payload, "boolean",
+    // &[solid_a, solid_b])` (main.rs) also checks both — but nothing here
+    // reads either array's LENGTH or contents. A change that drops one
+    // operand from either side's array — TS returning only `object_a`, or
+    // Rust passing `&[solid_a]` — passes this test silently: canonical name
+    // sets still match, and the dropped operand is invisible to a
+    // string-level scan of an argument list. Left as a follow-up rather
+    // than attempted here: a real arity check would need to parse each
+    // side's array LITERAL (not just detect that one exists) — TS's is a
+    // multi-line arrow-function body, Rust's is a `&[...]` slice literal —
+    // and correlate operation names across two different literal syntaxes,
+    // which is a meaningfully different (and more fragile) parser than the
+    // presence-only regexes above. Per the review's own assessment: worth
+    // stating the limit precisely rather than a real fix in this pass.
     let ts_canonical: BTreeSet<&str> = ts_keys.iter().map(|k| canonical(k)).collect();
     let rust_canonical: BTreeSet<&str> = rust_ops.iter().map(|k| canonical(k)).collect();
 
@@ -190,27 +235,36 @@ async fn the_two_base_ref_surfaces_are_equal_modulo_the_exemption_list() {
              unrelated whole-solid-replication feature. Each boolean step \
              is already gated under \"boolean\".",
         ),
-        (
-            "make_drawing",
-            "GENUINE, STILL-OPEN gap (audit S8/S5). POST /api/parts/{id}/\
-             drawing (drawing_mgr::create_part_drawing) has no \
-             refuse_unsound_base / ApiError::unsound_base call of its own. \
-             Item 8 (2026-08-15) and 4b1ef771 gated the THREE EXPORT \
-             routes downstream — a DIFFERENT gate (sheet staleness/quality, \
-             not this one) — neither touched the CREATION route. Not fixed \
-             on this branch; belongs in a future pass, not silently closed \
-             by relabelling this exemption.",
-        ),
+        // `make_drawing` REMOVED (concern A, 2026-08-15 closeout): CLOSED
+        // for real, not relabelled. `drawing_mgr::create_part_drawing_
+        // inner` now calls `refuse_unsound_solid(&model_handle,
+        // "make_drawing", &[solid_id], q.acknowledge_unsound)` before
+        // building the sheet — the canonical name matches gates.ts's own
+        // `BASE_REFS` key (`gates.ts:349`) exactly, so it now falls out of
+        // `ts_only` on its own; there is nothing left to exempt. See
+        // `unsound_solid_sheet_gate_tests.rs` for the tests, and this
+        // file's own mutation-proof (the gate call site was temporarily
+        // forced open, confirmed RED, then restored).
     ];
 
     // ── Rust-only exemptions ────────────────────────────────────────────
-    // Verified by grep across roshera-mcp/src (not assumed): NO MCP tool
-    // calls any of these five REST routes, under any name. `BASE_REFS` is
-    // keyed by MCP TOOL NAME, so there is structurally no TS key to add for
-    // a route nothing in roshera-mcp ever dispatches to — the Rust gate is
-    // the ONLY gate these operations need, because an agent cannot walk
-    // around a client-side pre-flight that does not exist for a route it
-    // cannot reach through MCP in the first place.
+    // Two different reasons appear below, both legitimate. `mirror` through
+    // `sketch/extrude_cut` are verified by grep across roshera-mcp/src (not
+    // assumed): NO MCP tool calls those five REST routes, under any name.
+    // `BASE_REFS` is keyed by MCP TOOL NAME, so there is structurally no TS
+    // key to add for a route nothing in roshera-mcp ever dispatches to — the
+    // Rust gate is the ONLY gate those operations need, because an agent
+    // cannot walk around a client-side pre-flight that does not exist for a
+    // route it cannot reach through MCP in the first place.
+    //
+    // `drawing_export` and `drawing_svg` (concern A, 2026-08-15 closeout)
+    // are the OTHER reason: an MCP tool DOES reach `drawing_export`
+    // (`drawing_export_sheet`, `io.ts`), but its client-side gate is
+    // `sheetExportGate` (gate 4) — a DIFFERENT mechanism from `BASE_REFS`
+    // (gate 3), which is specifically what this module compares. `BASE_REFS`
+    // genuinely has no key for either name; that is not drift, it is gate 4
+    // not yet having grown a solid-soundness branch to mirror this one. See
+    // each entry.
     let rust_only_exempt: &[(&str, &str)] = &[
         (
             "mirror",
@@ -241,6 +295,33 @@ async fn the_two_base_ref_surfaces_are_equal_modulo_the_exemption_list() {
             "POST /api/csketch/{id}/extrude_cut (sketch.rs) has no MCP \
              tool — zero references anywhere in roshera-mcp/src (only \
              named in kb_data.ts's prose, never dispatched).",
+        ),
+        (
+            "drawing_export",
+            "GENUINE, KNOWN gap, not silently closed by relabelling: \
+             `export_svg`/`export_pdf`/`export_dxf` (drawing_mgr.rs) now \
+             check the underlying SOLID's soundness server-side \
+             (`refuse_unsound_solid`), reached from MCP via \
+             `drawing_export_sheet` (io.ts) — but that tool's ONLY \
+             client-side gate is `sheetExportGate` (gate 4, \
+             acknowledge_layout_issues), which has no solid-soundness \
+             branch and forwards no `acknowledge_unsound`. An MCP-driven \
+             acknowledged-inspection-sheet export will 409 until \
+             `drawing_export_sheet`'s schema/handler grow that forwarding \
+             — a REST-only-territory fix cannot close the MCP half; a \
+             raw HTTP client is fully covered today (`?acknowledge_unsound=\
+             true`), which is the surface this whole closeout exists to \
+             harden.",
+        ),
+        (
+            "drawing_svg",
+            "GENUINE, DELIBERATE gap: `GET /api/parts/{id}/drawing.svg` / \
+             .../uuid/{uuid}/drawing.svg` (drawing_mgr::part_drawing_svg / \
+             _by_uuid) now check the underlying solid's soundness \
+             server-side, but no MCP tool calls this one-call route at \
+             all — verified by grep, zero references to \"drawing.svg\" \
+             anywhere in roshera-mcp/src. Same shape as `mirror` above: \
+             there is structurally no TS key to add.",
         ),
     ];
 
@@ -297,9 +378,16 @@ async fn the_two_base_ref_surfaces_are_equal_modulo_the_exemption_list() {
     }
 
     // The exemption list should be as close to empty as the code actually
-    // allows (brief, item 6). It is NOT empty: 3 TS-only + 5 Rust-only = 8
-    // documented divergences remain, of which 7 are legitimate (compositions
-    // over an already-gated primitive, or routes no MCP tool reaches) and 1
-    // (`make_drawing`) is a real, open gap. See the lane-a report for the
-    // honest accounting.
+    // allows (brief, item 6). It is NOT empty: 2 TS-only + 7 Rust-only = 9
+    // documented divergences remain (2026-08-15 closeout, concern A —
+    // `make_drawing` CLOSED for real, `drawing_export` and `drawing_svg`
+    // ADDED as the sheet surface grew its own gate). Of the 9, 7 are
+    // legitimate (compositions over an already-gated primitive, or routes
+    // no MCP tool reaches) and 2 (`drawing_export`, `drawing_svg`) are a
+    // known, currently-irreducible gap: this module compares `BASE_REFS`
+    // (gate 3) specifically, and the sheet surface's client-side gate is
+    // `sheetExportGate` (gate 4) — a real gap between the Rust and MCP
+    // surfaces for `drawing_export` remains (see that entry) until
+    // `roshera-mcp` (a concurrent agent's territory on this branch) grows
+    // the forwarding.
 }

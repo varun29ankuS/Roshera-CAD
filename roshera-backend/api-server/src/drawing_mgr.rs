@@ -39,6 +39,7 @@ use geometry_engine::drawing::{
     SheetReadbackCertificate, SheetSize, TitleBlock, ViewSource,
 };
 use geometry_engine::operations::recorder::{OperationRecorder, RecordedOperation};
+use geometry_engine::primitives::provenance::SoundnessReading;
 use geometry_engine::primitives::snapshot::ModelSnapshot;
 use geometry_engine::primitives::solid::SolidId;
 use geometry_engine::primitives::topology_builder::BRepModel;
@@ -277,6 +278,19 @@ pub struct ExportQuery {
     /// see [`crate::error_catalog::ErrorCode::SheetUnsound`].
     #[serde(default)]
     pub acknowledge_layout_issues: bool,
+    /// The SOLID-soundness escape (concern A, 2026-08-15 closeout) — the
+    /// SAME name and semantics the 10 REST mutation routes' body flag
+    /// already uses (`main.rs::refuse_unsound_base`, `ApiError::
+    /// unsound_base`), reused deliberately rather than inventing a
+    /// parallel vocabulary. A DIFFERENT question from
+    /// `acknowledge_layout_issues` above: that one covers the SHEET's own
+    /// layout-quality certificate; this one covers whether the
+    /// underlying SOLID a sheet asserts facts about is itself sound. See
+    /// [`refuse_unsound_solid`]. Only the literal boolean `true` opens
+    /// it — same `Query<bool>` rejection of non-boolean junk that
+    /// `acknowledge_layout_issues` documents above.
+    #[serde(default)]
+    pub acknowledge_unsound: bool,
 }
 
 // ── Handlers ────────────────────────────────────────────────────────
@@ -555,10 +569,52 @@ pub async fn export_svg(
 ) -> Result<Response, ApiError> {
     let handle = state.drawings.get(&id).ok_or_else(|| not_found(id))?;
     let snapshot = { handle.read().await.clone() };
-    refuse_unsound_sheet(model_handle, id, snapshot, q.acknowledge_layout_issues).await?;
 
-    let guard = handle.read().await;
-    let svg = render_drawing_svg(&guard);
+    // Concern A (2026-08-15 closeout) — the solid-soundness gate. See
+    // `refuse_unsound_solid`'s own doc for what this does and does not
+    // know; `drawing_solid_ids` reads every view's solid off the ALREADY-
+    // fetched snapshot, the same one `refuse_unsound_sheet` below
+    // re-certifies.
+    refuse_unsound_solid(
+        &model_handle,
+        "drawing_export",
+        &drawing_solid_ids(&snapshot),
+        q.acknowledge_unsound,
+    )
+    .await?;
+
+    refuse_unsound_sheet(
+        model_handle,
+        id,
+        snapshot.clone(),
+        q.acknowledge_layout_issues,
+    )
+    .await?;
+
+    // Concern D (L2, 2026-08-15 review) — render from the SAME snapshot
+    // that was just certified, not a second independent read of `handle`.
+    // A concurrent add_view/remove_view landing between the certify-read
+    // above and a fresh `handle.read().await` here could otherwise hand
+    // out bytes that were never the bytes certified. The owned snapshot is
+    // already in hand, so closing the window costs nothing and removes a
+    // lock acquisition.
+    let svg = render_drawing_svg(&snapshot);
+
+    // Concern C (M4, 2026-08-15 review) — the escape taken above
+    // (`acknowledge_layout_issues` / `acknowledge_unsound`) is recorded on
+    // the timeline rather than left to live only in this request's memory,
+    // in the same shape `drawing.create`/`drawing.rename`/`drawing.add_view`/
+    // `drawing.remove_view` already use.
+    state.drawings.record_event(
+        RecordedOperation::new("drawing.export")
+            .with_parameters(serde_json::json!({
+                "format": "svg",
+                "acknowledge_layout_issues": q.acknowledge_layout_issues,
+                "acknowledge_unsound": q.acknowledge_unsound,
+            }))
+            .with_input_drawing(id),
+    );
+
     let content_type = if q.plain {
         "text/plain; charset=utf-8"
     } else {
@@ -585,6 +641,12 @@ pub struct PartDrawingQuery {
     /// ONLY, never for a stale/dangling fact. See `refuse_unsound_sheet`.
     #[serde(default)]
     pub acknowledge_layout_issues: bool,
+    /// The SOLID-soundness escape (concern A, 2026-08-15 closeout) — see
+    /// the field of the same name on [`ExportQuery`] for the full
+    /// rationale. Distinct from `acknowledge_layout_issues`: this solid
+    /// may be flawless-on-the-sheet and still be a defective B-Rep.
+    #[serde(default)]
+    pub acknowledge_unsound: bool,
 }
 
 /// `GET /api/parts/{id}/drawing.svg` — ONE-CALL engineering drawing of a part by
@@ -593,11 +655,12 @@ pub struct PartDrawingQuery {
 /// part to the sheet (override with `?scale=`). This is the right-click "Create
 /// Drawing" endpoint.
 pub async fn part_drawing_svg(
+    State(state): State<AppState>,
     ActiveModel(model_handle): ActiveModel,
     Path(id): Path<SolidId>,
     Query(q): Query<PartDrawingQuery>,
 ) -> Result<Response, ApiError> {
-    drawing_svg_for_solid(model_handle, id, Uuid::nil(), q).await
+    drawing_svg_for_solid(state, model_handle, id, Uuid::nil(), q).await
 }
 
 /// `GET /api/parts/uuid/{uuid}/drawing.svg` — UUID-keyed wrapper (the frontend
@@ -611,7 +674,7 @@ pub async fn part_drawing_svg_by_uuid(
     let solid_id = state
         .get_local_id(&uuid)
         .ok_or_else(|| ApiError::part_not_found(uuid))?;
-    drawing_svg_for_solid(model_handle, solid_id, uuid, q).await
+    drawing_svg_for_solid(state, model_handle, solid_id, uuid, q).await
 }
 
 /// Build the standard sheet OFF the model lock and OFF the async workers.
@@ -655,11 +718,25 @@ async fn build_standard_drawing_off_lock(
 }
 
 async fn drawing_svg_for_solid(
+    state: AppState,
     model_handle: std::sync::Arc<RwLock<BRepModel>>,
     solid_id: SolidId,
     part_uuid: Uuid,
     q: PartDrawingQuery,
 ) -> Result<Response, ApiError> {
+    // Concern A (2026-08-15 closeout) — the solid-soundness gate, BEFORE the
+    // (expensive, off-lock but still real CPU) HLR/dimensioning pipeline
+    // runs, so a doomed request fails fast rather than after paying for a
+    // sheet that is about to be refused. See `refuse_unsound_solid`'s own
+    // doc for exactly what this does and does not know.
+    refuse_unsound_solid(
+        &model_handle,
+        "drawing_svg",
+        &[solid_id],
+        q.acknowledge_unsound,
+    )
+    .await?;
+
     // `model_handle` is cloned here because `refuse_unsound_sheet` below
     // needs its OWN live read of the model (a second, independent
     // certification pass) after `build_standard_drawing_off_lock` has
@@ -687,24 +764,22 @@ async fn drawing_svg_for_solid(
     // `drawing_id` exists for this one-call path, so `Uuid::nil()` is passed
     // through exactly as the review's own remediation sketch specifies.
     //
-    // `certify_drawing` has NO notion of the underlying SOLID's own B-Rep
-    // soundness — `SheetReadbackCertificate::sound` means "no fact is stale
-    // or dangling" (sheet_certificate.rs:206-209), a sheet-VS-MODEL
-    // consistency check, not a solid-VALIDITY one. Whether the solid itself
-    // is watertight/manifold/self-intersection-free is a SEPARATE, already
-    // open gap this route shares with every other sheet-producing route in
-    // the codebase (confirmed: `make_drawing`'s own creation route has no
-    // unsound-base check anywhere in the pipeline either) — deliberately
-    // left alone here rather than having this refusal claim a check the
-    // certificate cannot actually make. What IS applied, honestly, in the
-    // shape `4b1ef771` established:
-    //   - stale/dangling facts: structurally always zero on THIS path — the
-    //     sheet is projected in the SAME request it is exported in, so there
-    //     is no time gap for the model to have moved — but genuinely
-    //     checked, not assumed, so a future change to this function that
-    //     introduces a gap between projection and export is still covered;
+    // `certify_drawing` still has NO notion of the underlying SOLID's own
+    // B-Rep soundness — `SheetReadbackCertificate::sound` means "no fact is
+    // stale or dangling" (sheet_certificate.rs:206-209), a sheet-VS-MODEL
+    // consistency check, not a solid-VALIDITY one. That gap is now closed
+    // for THIS route by the separate `refuse_unsound_solid` call above,
+    // which reads the SOLID's own live verdict directly — not by asking
+    // this certificate a question it structurally cannot answer. What this
+    // call below applies, honestly, in the shape `4b1ef771` established:
+    //   - stale/dangling SHEET facts: structurally always zero on THIS path
+    //     — the sheet is projected in the SAME request it is exported in,
+    //     so there is no time gap for the model to have moved — but
+    //     genuinely checked, not assumed, so a future change to this
+    //     function that introduces a gap between projection and export is
+    //     still covered;
     //   - layout-quality Errors: real and applicable, and the one this route
-    //     was actually missing.
+    //     was actually missing before H1.
     refuse_unsound_sheet(
         model_handle,
         Uuid::nil(),
@@ -712,6 +787,24 @@ async fn drawing_svg_for_solid(
         q.acknowledge_layout_issues,
     )
     .await?;
+
+    // Concern C (2026-08-15 closeout), extended to this route: an escape
+    // taken here (`acknowledge_unsound` / `acknowledge_layout_issues`) must
+    // not live only in this request's memory — the same principle M4 fixed
+    // for the three registered-export routes below. This route registers
+    // nothing durable of its own (`Uuid::nil()`, nothing in `state.drawings`
+    // to attach an event to), so the event names the SOLID as its input
+    // instead of a drawing id.
+    state.drawings.record_event(
+        RecordedOperation::new("drawing.svg_export")
+            .with_parameters(serde_json::json!({
+                "solid_id": solid_id,
+                "part_uuid": part_uuid,
+                "acknowledge_unsound": q.acknowledge_unsound,
+                "acknowledge_layout_issues": q.acknowledge_layout_issues,
+            }))
+            .with_input_solids(std::iter::once(solid_id as u64)),
+    );
 
     let svg = render_drawing_svg(&drawing);
     let content_type = if q.plain {
@@ -732,7 +825,7 @@ pub async fn create_part_drawing(
     ActiveModel(model_handle): ActiveModel,
     Path(id): Path<SolidId>,
     Query(q): Query<PartDrawingQuery>,
-) -> Result<Json<PartDrawingResponse>, StatusCode> {
+) -> Result<Json<PartDrawingResponse>, Response> {
     create_part_drawing_inner(state, model_handle, id, Uuid::nil(), q).await
 }
 
@@ -746,25 +839,56 @@ pub async fn create_part_drawing_by_uuid(
     ActiveModel(model_handle): ActiveModel,
     Path(uuid): Path<Uuid>,
     Query(q): Query<PartDrawingQuery>,
-) -> Result<Json<PartDrawingResponse>, StatusCode> {
-    let solid_id = state.get_local_id(&uuid).ok_or(StatusCode::NOT_FOUND)?;
+) -> Result<Json<PartDrawingResponse>, Response> {
+    let solid_id = state
+        .get_local_id(&uuid)
+        .ok_or_else(|| StatusCode::NOT_FOUND.into_response())?;
     create_part_drawing_inner(state, model_handle, solid_id, uuid, q).await
 }
 
+/// Widened to `Result<_, Response>` rather than `Result<_, ApiError>`
+/// (concern A, 2026-08-15 closeout — see commit `1467681c`'s own reasoning
+/// for `export_mesh`, which faced the identical problem): this handler's
+/// PRE-EXISTING error paths are bare `StatusCode`s with no body
+/// (`build_standard_drawing_off_lock` below), and converting them to
+/// `ApiError` would silently change their wire shape (e.g. a 422 that
+/// today has no body would suddenly grow one, and a careless `map_err`
+/// could just as easily relabel it a 500) — an unsanctioned side effect on
+/// a route this task was not asked to otherwise touch. `.into_response()`
+/// is appended at each existing `Err` site instead, byte-identical to
+/// today; only the NEW refusal below is a genuine `ApiError` body.
 async fn create_part_drawing_inner(
     state: AppState,
     model_handle: std::sync::Arc<RwLock<BRepModel>>,
     solid_id: SolidId,
     part_uuid: Uuid,
     q: PartDrawingQuery,
-) -> Result<Json<PartDrawingResponse>, StatusCode> {
+) -> Result<Json<PartDrawingResponse>, Response> {
+    // Concern A (2026-08-15 closeout) — the solid-soundness gate, BEFORE
+    // the (expensive) HLR/dimensioning pipeline runs. This is the literal
+    // exploit the review named: `POST /api/parts/{id}/drawing` on a
+    // defective solid used to register cleanly every time. Operation name
+    // "make_drawing" matches `gates.ts::BASE_REFS`'s own key for this
+    // route (`gates.ts:349`) — the client-side twin of this exact check —
+    // so `gate3_drift_set_equality_tests` can prove the two surfaces now
+    // agree instead of leaving `make_drawing` a documented, open gap.
+    refuse_unsound_solid(
+        &model_handle,
+        "make_drawing",
+        &[solid_id],
+        q.acknowledge_unsound,
+    )
+    .await
+    .map_err(|e| e.into_response())?;
+
     // Fully automatic: picks the sheet size + fill scale, centers the four-view
     // layout (Front/Top/Right + isometric), and draws proper offset dimensions.
     // A manual `?scale=` override falls back to the fixed-A3 path for callers
     // that want an exact ratio. Built OFF the model lock on a blocking thread so
     // a heavy sheet never starves the runtime (see `build_standard_drawing_off_lock`).
-    let mut drawing =
-        build_standard_drawing_off_lock(model_handle, solid_id, part_uuid, q.scale).await?;
+    let mut drawing = build_standard_drawing_off_lock(model_handle, solid_id, part_uuid, q.scale)
+        .await
+        .map_err(|code| code.into_response())?;
 
     // Name the sheet after the originating part when the caller didn't
     // supply one. The drawing title block renders this name, so a
@@ -793,6 +917,7 @@ async fn create_part_drawing_inner(
                 "sheet_size": SheetSize::A3,
                 "quality_passed": quality.passed,
                 "quality_issues": quality.issues.len(),
+                "acknowledge_unsound": q.acknowledge_unsound,
             }))
             // #32: record the source solid as an INPUT so the feature-DAG
             // projection links the sheet downstream of its part. A mould on the
@@ -922,6 +1047,86 @@ async fn refuse_unsound_sheet(
     Ok(())
 }
 
+/// **Solid-soundness gate for the SHEET surface** (concern A, 2026-08-15
+/// closeout — the largest gap the whole-branch review found).
+/// `refuse_unsound_sheet` above measures **sheet-vs-model**: whether the
+/// facts PRINTED on the sheet still match the live model
+/// (`SheetReadbackCertificate::sound`, `sheet_certificate.rs:206-209`). It
+/// has NO notion of the underlying SOLID's own B-Rep validity — a sheet can
+/// be a perfectly faithful drawing of a solid the kernel has already
+/// verified is broken, and passing `refuse_unsound_sheet` alone proves
+/// nothing about that. This is the SAME question the 10 REST mutation
+/// routes' `refuse_unsound_base` (`main.rs`) already answers for a solid
+/// about to be BUILT ON; here it is a solid a SHEET is about to assert
+/// dimensioned facts about.
+///
+/// Reuses that vocabulary verbatim — `ApiError::unsound_base`,
+/// `acknowledge_unsound` — rather than inventing a parallel one, exactly as
+/// `export.rs`'s item-8 fix does for the mesh/STEP export path (commit
+/// `1467681c`). Reads through `BRepModel::soundness_reading` (`&self`,
+/// NEVER recomputes) for the same two reasons that fix gives: (1) a
+/// write-locked `certify_solid` recompute could deadlock a caller already
+/// holding a read guard on this same `model_handle`, and (2) it would
+/// illegitimately re-derive a verdict this path has no business
+/// re-deriving — a sheet route reports what the kernel already knows, it
+/// does not go compute a fresh opinion of its own.
+///
+/// Only `SoundnessReading::Unsound` (a full certificate WAS computed and it
+/// is bad) refuses. `Stale` (mutated, or never certified, since the last
+/// verification — the ordinary state of most solids most of the time) and
+/// an unresolvable id are both treated as "not known to be bad" and pass —
+/// refusing on `Stale` would (a) break the ubiquitous unverified-solid
+/// workflow every other sheet route already tolerates and (b) claim
+/// knowledge ("this solid is defective") the kernel does not actually have.
+/// This mirrors `refuse_unsound_base`'s own "an unresolvable base is not
+/// gated" rule (`main.rs`) — see `unsound_solid_sheet_gate_tests::
+/// a_never_verified_solid_is_not_refused_by_the_solid_soundness_gate`.
+///
+/// `acknowledge_unsound` bypasses unconditionally — never re-derived, only
+/// a literal `true` opens it, checked by the caller's `Query<bool>`
+/// deserialization exactly as `acknowledge_layout_issues` is.
+async fn refuse_unsound_solid(
+    model_handle: &Arc<RwLock<BRepModel>>,
+    operation: &str,
+    solid_ids: &[SolidId],
+    acknowledge_unsound: bool,
+) -> Result<(), ApiError> {
+    if acknowledge_unsound {
+        return Ok(());
+    }
+    let model = model_handle.read().await;
+    for &solid_id in solid_ids {
+        if let Some(SoundnessReading::Unsound(_)) = model.soundness_reading(solid_id) {
+            return Err(ApiError::unsound_base(
+                operation,
+                solid_id,
+                crate::VERDICT_UNSOUND,
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Every solid a registered [`Drawing`]'s views reference, for callers that
+/// only have the built `Drawing` in hand (the registry export surface)
+/// rather than a `solid_id` from their own request path. `solid_id` is
+/// resolved against whatever model `ActiveModel` resolved for THIS request
+/// — the SAME model [`refuse_unsound_sheet`]'s own sheet-vs-model
+/// certificate re-measures against. A view whose solid does not exist in
+/// that model (the drawing was built against a different part-tab than the
+/// one active now) is simply absent from the returned list —
+/// `refuse_unsound_solid` then treats it as unresolvable and does not gate
+/// on it, never claiming sound or unsound for a solid it cannot see.
+fn drawing_solid_ids(drawing: &Drawing) -> Vec<SolidId> {
+    drawing
+        .views
+        .iter()
+        .map(|v| match v.source {
+            ViewSource::Part { solid_id, .. } => solid_id,
+        })
+        .collect()
+}
+
 /// `GET /api/drawings/{id}/certificate` — the sheet readback certificate only
 /// (a cheap poll): per-fact live-checked verdicts + the layout quality report,
 /// re-measured against the active model.
@@ -1015,15 +1220,43 @@ pub async fn export_pdf(
 ) -> Result<Response, ApiError> {
     let handle = state.drawings.get(&id).ok_or_else(|| not_found(id))?;
     let snapshot = { handle.read().await.clone() };
-    refuse_unsound_sheet(model_handle, id, snapshot, q.acknowledge_layout_issues).await?;
 
-    let (bytes, name) = {
-        let guard = handle.read().await;
-        let bytes = render_drawing_pdf(&guard).map_err(|e| {
-            ApiError::new(ErrorCode::KernelError, format!("pdf render failed: {e}"))
-        })?;
-        (bytes, guard.name.clone())
-    };
+    // Concern A (2026-08-15 closeout) — see `export_svg`'s identical block.
+    refuse_unsound_solid(
+        &model_handle,
+        "drawing_export",
+        &drawing_solid_ids(&snapshot),
+        q.acknowledge_unsound,
+    )
+    .await?;
+
+    refuse_unsound_sheet(
+        model_handle,
+        id,
+        snapshot.clone(),
+        q.acknowledge_layout_issues,
+    )
+    .await?;
+
+    // Concern D (L2, 2026-08-15 review) — render from the certified
+    // snapshot, not a second independent read of `handle`. See
+    // `export_svg`'s identical comment for the race this closes.
+    let bytes = render_drawing_pdf(&snapshot)
+        .map_err(|e| ApiError::new(ErrorCode::KernelError, format!("pdf render failed: {e}")))?;
+    let name = snapshot.name.clone();
+
+    // Concern C (M4, 2026-08-15 review) — record the escape, if any, on
+    // the timeline. See `export_svg`'s identical block.
+    state.drawings.record_event(
+        RecordedOperation::new("drawing.export")
+            .with_parameters(serde_json::json!({
+                "format": "pdf",
+                "acknowledge_layout_issues": q.acknowledge_layout_issues,
+                "acknowledge_unsound": q.acknowledge_unsound,
+            }))
+            .with_input_drawing(id),
+    );
+
     let disposition = content_disposition(&name, id, "pdf");
     Ok((
         StatusCode::OK,
@@ -1044,15 +1277,43 @@ pub async fn export_dxf(
 ) -> Result<Response, ApiError> {
     let handle = state.drawings.get(&id).ok_or_else(|| not_found(id))?;
     let snapshot = { handle.read().await.clone() };
-    refuse_unsound_sheet(model_handle, id, snapshot, q.acknowledge_layout_issues).await?;
 
-    let (bytes, name) = {
-        let guard = handle.read().await;
-        let bytes = render_drawing_dxf(&guard).map_err(|e| {
-            ApiError::new(ErrorCode::KernelError, format!("dxf render failed: {e}"))
-        })?;
-        (bytes, guard.name.clone())
-    };
+    // Concern A (2026-08-15 closeout) — see `export_svg`'s identical block.
+    refuse_unsound_solid(
+        &model_handle,
+        "drawing_export",
+        &drawing_solid_ids(&snapshot),
+        q.acknowledge_unsound,
+    )
+    .await?;
+
+    refuse_unsound_sheet(
+        model_handle,
+        id,
+        snapshot.clone(),
+        q.acknowledge_layout_issues,
+    )
+    .await?;
+
+    // Concern D (L2, 2026-08-15 review) — render from the certified
+    // snapshot, not a second independent read of `handle`. See
+    // `export_svg`'s identical comment for the race this closes.
+    let bytes = render_drawing_dxf(&snapshot)
+        .map_err(|e| ApiError::new(ErrorCode::KernelError, format!("dxf render failed: {e}")))?;
+    let name = snapshot.name.clone();
+
+    // Concern C (M4, 2026-08-15 review) — record the escape, if any, on
+    // the timeline. See `export_svg`'s identical block.
+    state.drawings.record_event(
+        RecordedOperation::new("drawing.export")
+            .with_parameters(serde_json::json!({
+                "format": "dxf",
+                "acknowledge_layout_issues": q.acknowledge_layout_issues,
+                "acknowledge_unsound": q.acknowledge_unsound,
+            }))
+            .with_input_drawing(id),
+    );
+
     let disposition = content_disposition(&name, id, "dxf");
     Ok((
         StatusCode::OK,

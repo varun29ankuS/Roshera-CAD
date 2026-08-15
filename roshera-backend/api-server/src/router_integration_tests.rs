@@ -222,6 +222,11 @@ pub(crate) async fn make_test_state_with_database(
         // handler behaviour rather than the 401 boundary. Auth-specific
         // behaviour is pinned separately in `auth_slice1_tests`.
         auth_posture: crate::auth_middleware::AuthPosture::InsecureDevBypass,
+        // Default OFF (audit item 10 / S2, 2026-08-15 closeout) — every
+        // existing test's behaviour must stay byte-identical to before this
+        // mode existed. `intent_required_mode_tests` builds its own state
+        // with `IntentPosture::Required` explicitly where it needs it.
+        intent_posture: crate::IntentPosture::Optional,
         cache_manager,
         timeline,
         timeline_recorder: timeline_recorder.clone(),

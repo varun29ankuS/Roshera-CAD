@@ -53,11 +53,15 @@ mod geometry_routes_coverage_tests;
 mod goose_acp;
 mod handlers;
 mod idempotency;
+#[cfg(test)]
+mod intent_required_mode_tests;
 mod kernel_state;
 mod metrics;
 mod part_mgr;
 mod protocol; // ClientMessage/ServerMessage protocol (WebSocket is just transport)
 mod reconcile_task;
+#[cfg(test)]
+mod refusal_token_tests;
 #[cfg(test)]
 mod router_integration_tests;
 #[cfg(test)]
@@ -66,6 +70,8 @@ mod sketch;
 mod transactions;
 #[cfg(test)]
 mod unsound_base_gate_tests;
+#[cfg(test)]
+mod unsound_solid_sheet_gate_tests;
 mod viewport_bridge;
 mod ws_identity_tests;
 // Using core geometry-engine directly
@@ -235,6 +241,16 @@ pub struct AppState {
     /// changed by mid-flight env mutation. Default is
     /// `AuthPosture::Required`.
     auth_posture: auth_middleware::AuthPosture,
+
+    /// Audit item 10 / S2 (2026-08-15 closeout): whether the ten gate-3
+    /// mutating routes require a declared `X-Roshera-Intent` header.
+    /// Resolved once at startup (`IntentPosture::from_env`) and baked into
+    /// the router, same discipline as `auth_posture` immediately above and
+    /// for the same reason — deterministic enforcement, immune to
+    /// mid-flight env mutation. Default is `IntentPosture::Optional`
+    /// (absent-is-legal, `documents.rs:56-78`'s explicit design decision;
+    /// flipping this is an explicit opt-in, never a default).
+    intent_posture: IntentPosture,
 
     // Timeline and collaboration
     timeline: Arc<RwLock<Timeline>>,
@@ -9745,6 +9761,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         session_manager,
         permission_manager,
         auth_posture: auth_middleware::AuthPosture::from_env(),
+        intent_posture: IntentPosture::from_env(),
         cache_manager,
         timeline,
         timeline_recorder: timeline_recorder.clone(),
@@ -9949,6 +9966,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// production gate so tests pick up exactly the routes a real server
 /// would expose.
 pub(crate) fn build_router(state: AppState) -> Router {
+    // Copied out (not moved) before `state` is consumed by `.with_state`
+    // far below — `IntentPosture` is `Copy`, so each of the ten gate-3
+    // route registrations below can capture its own copy for its
+    // `route_layer(from_fn_with_state(intent_posture, require_declared_
+    // intent))`. Read once here rather than per-route so every route
+    // provably shares the exact same resolved posture.
+    let intent_posture = state.intent_posture;
     let mut app = Router::new()
         // Root and health
         .route("/", get(root))
@@ -10041,9 +10065,14 @@ pub(crate) fn build_router(state: AppState) -> Router {
         )
         .route(
             "/api/geometry/boolean",
-            post(boolean_operation).route_layer(axum::middleware::from_fn(
-                auth_middleware::require_modify_geometry,
-            )),
+            post(boolean_operation)
+                .route_layer(axum::middleware::from_fn(
+                    auth_middleware::require_modify_geometry,
+                ))
+                .route_layer(axum::middleware::from_fn_with_state(
+                    intent_posture,
+                    require_declared_intent,
+                )),
         )
         .route("/api/assembly/verify", post(assembly_verify))
         .route(
@@ -10105,9 +10134,14 @@ pub(crate) fn build_router(state: AppState) -> Router {
         )
         .route(
             "/api/geometry/face/extrude",
-            post(extrude_face_endpoint).route_layer(axum::middleware::from_fn(
-                auth_middleware::require_modify_geometry,
-            )),
+            post(extrude_face_endpoint)
+                .route_layer(axum::middleware::from_fn(
+                    auth_middleware::require_modify_geometry,
+                ))
+                .route_layer(axum::middleware::from_fn_with_state(
+                    intent_posture,
+                    require_declared_intent,
+                )),
         )
         .route(
             "/api/geometry/face/extrude/preview",
@@ -10115,45 +10149,80 @@ pub(crate) fn build_router(state: AppState) -> Router {
         )
         .route(
             "/api/geometry/shell",
-            post(shell_solid).route_layer(axum::middleware::from_fn(
-                auth_middleware::require_modify_geometry,
-            )),
+            post(shell_solid)
+                .route_layer(axum::middleware::from_fn(
+                    auth_middleware::require_modify_geometry,
+                ))
+                .route_layer(axum::middleware::from_fn_with_state(
+                    intent_posture,
+                    require_declared_intent,
+                )),
         )
         .route(
             "/api/geometry/mirror",
-            post(mirror_solid).route_layer(axum::middleware::from_fn(
-                auth_middleware::require_modify_geometry,
-            )),
+            post(mirror_solid)
+                .route_layer(axum::middleware::from_fn(
+                    auth_middleware::require_modify_geometry,
+                ))
+                .route_layer(axum::middleware::from_fn_with_state(
+                    intent_posture,
+                    require_declared_intent,
+                )),
         )
         .route(
             "/api/geometry/fillet",
-            post(fillet_edges_endpoint).route_layer(axum::middleware::from_fn(
-                auth_middleware::require_modify_geometry,
-            )),
+            post(fillet_edges_endpoint)
+                .route_layer(axum::middleware::from_fn(
+                    auth_middleware::require_modify_geometry,
+                ))
+                .route_layer(axum::middleware::from_fn_with_state(
+                    intent_posture,
+                    require_declared_intent,
+                )),
         )
         .route(
             "/api/geometry/chamfer",
-            post(chamfer_edges_endpoint).route_layer(axum::middleware::from_fn(
-                auth_middleware::require_modify_geometry,
-            )),
+            post(chamfer_edges_endpoint)
+                .route_layer(axum::middleware::from_fn(
+                    auth_middleware::require_modify_geometry,
+                ))
+                .route_layer(axum::middleware::from_fn_with_state(
+                    intent_posture,
+                    require_declared_intent,
+                )),
         )
         .route(
             "/api/geometry/transform",
-            post(transform_geometry_endpoint).route_layer(axum::middleware::from_fn(
-                auth_middleware::require_modify_geometry,
-            )),
+            post(transform_geometry_endpoint)
+                .route_layer(axum::middleware::from_fn(
+                    auth_middleware::require_modify_geometry,
+                ))
+                .route_layer(axum::middleware::from_fn_with_state(
+                    intent_posture,
+                    require_declared_intent,
+                )),
         )
         .route(
             "/api/geometry/pattern/linear",
-            post(pattern_linear_endpoint).route_layer(axum::middleware::from_fn(
-                auth_middleware::require_modify_geometry,
-            )),
+            post(pattern_linear_endpoint)
+                .route_layer(axum::middleware::from_fn(
+                    auth_middleware::require_modify_geometry,
+                ))
+                .route_layer(axum::middleware::from_fn_with_state(
+                    intent_posture,
+                    require_declared_intent,
+                )),
         )
         .route(
             "/api/geometry/pattern/circular",
-            post(pattern_circular_endpoint).route_layer(axum::middleware::from_fn(
-                auth_middleware::require_modify_geometry,
-            )),
+            post(pattern_circular_endpoint)
+                .route_layer(axum::middleware::from_fn(
+                    auth_middleware::require_modify_geometry,
+                ))
+                .route_layer(axum::middleware::from_fn_with_state(
+                    intent_posture,
+                    require_declared_intent,
+                )),
         )
         .route("/api/section/preview", post(post_section_preview))
         // 2D sketch sessions — backend-owned source of truth for the
@@ -10192,7 +10261,10 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route("/api/sketch/{id}/extrude", post(sketch::extrude_sketch))
         .route(
             "/api/sketch/{id}/extrude_cut",
-            post(sketch::extrude_cut_sketch),
+            post(sketch::extrude_cut_sketch).route_layer(axum::middleware::from_fn_with_state(
+                intent_posture,
+                require_declared_intent,
+            )),
         )
         .route("/api/sketch/{id}/revolve", post(sketch::revolve_sketch))
         .route("/api/sketch/plane-from-face", post(sketch::plane_from_face))
@@ -11330,6 +11402,110 @@ fn decode_intent_header(raw: &str) -> Option<String> {
         }
     }
     String::from_utf8(out).ok()
+}
+
+/// Whether the ten gate-3 mutating routes (`boolean`, `shell`, `mirror`,
+/// `fillet`, `chamfer`, `transform`, `pattern/linear`, `pattern/circular`,
+/// `face/extrude`, `sketch/extrude_cut` — the same set `refuse_unsound_
+/// base` protects) require a declared `X-Roshera-Intent` header before the
+/// operation runs (audit item 10 / S2, 2026-08-15 closeout: "gate 2's
+/// presence half is TS-only — a REST-speaking agent mutates freely with no
+/// declared intent at all").
+///
+/// # Why opt-in, not a hard requirement
+///
+/// A hard requirement would break the frontend (which never sends this
+/// header) and every legacy REST client. Absent-is-legal is an explicit,
+/// pre-existing design decision (`documents.rs:56-78`) that this mode does
+/// NOT reverse — it adds a second, OFF-by-default posture for the
+/// deployment that wants to demand declared intent (an RL run, most
+/// concretely), exactly the audit's own proposal.
+///
+/// # Resolved once, not read per request
+///
+/// Same discipline as [`auth_middleware::AuthPosture`] and for the same
+/// reason: reading `ROSHERA_REQUIRE_INTENT` on every request would make
+/// enforcement racy against a mid-flight env mutation (and, in tests,
+/// against the process-global environment other tests also touch).
+/// Resolved once at startup, baked into [`AppState`], and threaded to each
+/// gated route's `route_layer` from there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntentPosture {
+    /// Default. A mutating call with no intent header runs exactly as it
+    /// always has — zero behavioural change, proven byte-identical by
+    /// `intent_required_mode_tests::default_off_is_byte_identical_to_
+    /// today`.
+    Optional,
+    /// `ROSHERA_REQUIRE_INTENT=1` (or `true`, case-insensitive). A
+    /// mutating call on one of the ten gate-3 routes with no declared
+    /// intent is refused, typed (`ApiError::intent_required`), before the
+    /// handler runs.
+    Required,
+}
+
+impl IntentPosture {
+    /// Resolve from the real process environment. Called once, at
+    /// `AppState` construction.
+    pub fn from_env() -> Self {
+        Self::from_env_with(|k| std::env::var(k).ok())
+    }
+
+    /// Environment-getter seam for [`IntentPosture::from_env`] — same
+    /// pattern as `AuthPosture::from_env_with`, so a test can resolve a
+    /// posture deterministically without racing the process-global
+    /// environment.
+    pub fn from_env_with<F>(get: F) -> Self
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        let truthy = get("ROSHERA_REQUIRE_INTENT")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if truthy {
+            IntentPosture::Required
+        } else {
+            IntentPosture::Optional
+        }
+    }
+}
+
+/// Route layer for the ten gate-3 mutating routes: in `IntentPosture::
+/// Required`, refuse a request carrying no declared `X-Roshera-Intent`
+/// header (or one that is present but undecodable/empty — the SAME "absent
+/// or undecodable → treated as absent" rule `agent_intent_layer` /
+/// `decode_intent_header` already document; an undecodable intent must not
+/// be treated as more legitimate than a missing one). In `IntentPosture::
+/// Optional` — the default — this is a complete no-op: `next.run(request)`
+/// on the very first line, nothing inspected, nothing logged. That is what
+/// makes default-OFF byte-identical to today, not merely "usually passes".
+///
+/// Reads the raw header directly rather than the `INTENT_OVERRIDE`
+/// task-local `agent_intent_layer` scopes: `route_layer`s run INSIDE the
+/// global `.layer(...)` stack (per-route, closer to the handler), so this
+/// layer executes AFTER `agent_intent_layer` has already run and scoped (or
+/// not scoped) that task-local for the current task — reading it back here
+/// would work too, but reading the header directly keeps this layer legible
+/// on its own, with no ordering dependency on a sibling layer to reason
+/// about.
+async fn require_declared_intent(
+    axum::extract::State(posture): axum::extract::State<IntentPosture>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if posture != IntentPosture::Required {
+        return next.run(request).await;
+    }
+    let declared = request
+        .headers()
+        .get("x-roshera-intent")
+        .and_then(|v| v.to_str().ok())
+        .and_then(decode_intent_header)
+        .filter(|s| !s.is_empty());
+    if declared.is_some() {
+        return next.run(request).await;
+    }
+    let operation = request.uri().path().to_string();
+    error_catalog::ApiError::intent_required(&operation).into_response()
 }
 
 /// Attribute kernel ops to the CHANNEL that initiated them.
