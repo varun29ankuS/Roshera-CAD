@@ -379,13 +379,45 @@ const LIVE_FACT_GATES = new Set<string>([
  *
  * `verify_part` reads the full certificate plus a diagnostic render of one
  * part; `verify_claim` checks a stated dimensional claim against the live
- * kernel. Both are read-only and neither can be satisfied by accident — an
- * agent that calls one has genuinely inspected its own output. `get_part` /
- * `list_parts` / `mass_properties` deliberately do NOT count: they report
- * facts without checking them against anything, which is exactly the
- * "certified sound, wrong shape" hole this gate exists to close.
+ * kernel. `get_part` / `list_parts` / `mass_properties` deliberately do NOT
+ * count: they report facts without checking them against anything, which is
+ * exactly the "certified sound, wrong shape" hole this gate exists to close.
+ *
+ * Membership alone is NOT sufficient for `verify_claim` — see
+ * `verifyClaimActuallyMeasured` below (2026-08-15 review, finding H3):
+ * `verify_claim_handler` is structurally always HTTP 200, including its own
+ * `refused: true` shape, and a claim built entirely from `constant` bindings
+ * references no part at all. `verify_part` needs no such check: it takes a
+ * mandatory `part_id` and 404s (isError true, never reaching the clearing
+ * branch) on an unknown one, so a successful dispatch always inspected a
+ * real part's live certificate.
  */
 const VERIFIES = new Set<string>(["verify_part", "verify_claim"]);
+
+/**
+ * H3's second half, decided rather than half-built: clearing stays GLOBAL
+ * (any qualifying verify clears the WHOLE tally, not only the part it
+ * measured), not scoped to the part(s) the verification actually touched.
+ *
+ * Scoping would need every `MUTATES_SOLIDS` verb to report the identity
+ * (uuid or part_id) of what it changed in a UNIFORM shape `intentUnverified`
+ * could key on — `BASE_REFS` above shows this is not uniform today: pure
+ * creators (`create_box`, `create_cylinder`, …) have no base ref at all and
+ * only produce their uuid in the RESPONSE, not the args, while several
+ * mutators (`shell`, `transform`, `fillet_edges`) name a base in the args
+ * under different keys. Building that map is comparable in size to this
+ * whole gate, not a ~5-line addition, and `verify_claim`'s own bindings
+ * address geometry by uuid/face-id/edge-id — reconciling a face/edge check
+ * back to "which part" would need a further live fetch this gate's
+ * pre-flight discipline does not otherwise require. Global clearing is also
+ * the EXISTING, load-bearing design: `verify_part(any part)` has cleared
+ * every mutation under the open intent since gate 6 shipped
+ * (`verificationScopeRefusal`'s own prose says "the work done so far", not
+ * "the part named above") — narrowing only `verify_claim` while
+ * `verify_part` stays global would make the two verbs disagree about what
+ * "looked" means, which is worse than the status quo. Left as a follow-up,
+ * not half-done here.
+ */
 
 /**
  * Checkpoint names that name a sequence position instead of a design intent
@@ -771,6 +803,59 @@ function verificationScopeRefusal(
       "skip_verification: true — the intent then closes unverified ON THE " +
       "RECORD rather than by omission.",
   });
+}
+
+/**
+ * H3 (2026-08-15 whole-branch review) — whether a successful `verify_claim`
+ * dispatch actually measured something, rather than merely returning HTTP
+ * 200. Two independent reasons `isError !== true` alone is not "the caller
+ * looked":
+ *
+ *   1. `verify_claim_handler` (api-server/src/handlers/agent.rs:192) returns
+ *      `Json<ClaimVerdict>` — HTTP 200 on every path, including the
+ *      `refused: true` shape it builds at :222-234 for an unresolvable
+ *      binding or an expression that fails to evaluate (claim.rs:116-146).
+ *      A claim the kernel declined to evaluate is not a look.
+ *   2. `VerifyMeasure::Constant { value }` (agent.rs:201 /
+ *      readable/claim.rs:39) resolves without touching a solid. A claim
+ *      built entirely from supplied constants measures nothing about any
+ *      geometry, however cleanly `verified: true` comes back.
+ *
+ * Both checks read data already in hand at the one call site below (the
+ * request `args` this dispatch was made with, and the parsed response
+ * body) — no second fetch. In practice a `refused: true` body is USUALLY
+ * intercepted earlier in `recordDispatchOutcome`, by `typedRefusalOf`'s
+ * generic detection of a top-level `refused` key (it treats the body
+ * exactly like a gate refusal and caches it, returning before this
+ * function is ever reached) — but that interception is an ACCIDENT of a
+ * function built for a different purpose (recognising gates.ts's own and
+ * the timeline tools' refusal shapes), not a contract `verify_claim` can
+ * rely on. This check is kept explicit and load-bearing on its own so the
+ * clearing rule does not depend on that coincidence continuing to hold.
+ */
+function verifyClaimActuallyMeasured(args: unknown, result: any): boolean {
+  const bindings: any[] = Array.isArray((args as any)?.bindings)
+    ? (args as any).bindings
+    : [];
+  const measuresGeometry = bindings.some(
+    (b) => b?.measure?.kind !== "constant",
+  );
+  if (!measuresGeometry) return false;
+  const content: any[] = Array.isArray(result?.content) ? result.content : [];
+  const first = content.find(
+    (c) => c?.type === "text" && typeof c.text === "string",
+  );
+  if (!first) return false; // no parseable verdict — cannot confirm it looked
+  try {
+    const data = JSON.parse(first.text);
+    return !(
+      data &&
+      typeof data === "object" &&
+      (data as any).refused === true
+    );
+  } catch {
+    return false; // unparseable body — cannot confirm it looked either
+  }
 }
 
 function unsoundBaseGateRefusal(
@@ -1199,9 +1284,17 @@ export function recordDispatchOutcome(
       openIntent = null;
       clearUnverified();
     } else if (VERIFIES.has(tool)) {
-      // The caller LOOKED. Everything built so far under this intent has been
-      // examined; only mutations after this point can re-arm the gate.
-      clearUnverified();
+      // The caller LOOKED — but only if the look actually measured
+      // something (H3). `verify_part` always counts on success (see
+      // VERIFIES's doc comment); `verify_claim` needs
+      // `verifyClaimActuallyMeasured` because a structurally-200 refusal or
+      // an all-constant claim is not a look, however cleanly it returns.
+      if (tool === "verify_part" || verifyClaimActuallyMeasured(args, result)) {
+        clearUnverified();
+      }
+      // else: this verify_claim measured nothing — the tally stands exactly
+      // as it was, so the NEXT checkpoint close still sees the unverified
+      // work as unverified.
     } else if (MUTATES_SOLIDS.has(tool) && openIntent !== null) {
       intentUnverified.tools.add(tool);
       intentUnverified.count += 1;

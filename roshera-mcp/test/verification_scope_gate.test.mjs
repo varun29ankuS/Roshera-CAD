@@ -97,6 +97,50 @@ const stub = http.createServer((req, res) => {
     if (req.method === "POST" && url === "/api/blackboard/entries") {
       return send({ id: "nb-1" });
     }
+    if (req.method === "POST" && url === "/api/agent/verify-claim") {
+      // Mirrors ClaimVerdict (geometry-engine/src/readable/claim.rs:64-78)
+      // closely enough to exercise F1 (2026-08-15 review H3): a `constant`
+      // binding resolves to its own value without touching a "part"; a
+      // `volume` binding resolves only for PART_UUID (this fixture's one
+      // live solid, volume 8) and is otherwise UNRESOLVED — refused, never
+      // guessed — matching the real handler's honest-refusal discipline.
+      const parsed = body ? JSON.parse(body) : {};
+      const resolved = [];
+      const unresolved = [];
+      const values = {};
+      for (const b of parsed.bindings ?? []) {
+        const m = b.measure ?? {};
+        if (m.kind === "constant") {
+          values[b.var] = m.value;
+          resolved.push([b.var, m.value]);
+        } else if (m.kind === "volume" && m.part === PART_UUID) {
+          values[b.var] = 8;
+          resolved.push([b.var, 8]);
+        } else {
+          unresolved.push(b.var);
+        }
+      }
+      const tolerance_used =
+        parsed.tolerance ?? Math.max(Math.abs(parsed.expected ?? 0), 1) * 1e-6;
+      if (unresolved.length > 0) {
+        return send({
+          verified: false, refused: true, computed: null,
+          expected: parsed.expected, abs_error: null, tolerance_used,
+          resolved, unresolved,
+        });
+      }
+      // Every scenario below uses a single-variable expr equal to the
+      // binding's own var name — enough to exercise the gate, not a full
+      // expression evaluator.
+      const vars = Object.keys(values);
+      const computed = vars.length === 1 ? values[vars[0]] : null;
+      const abs_error = computed === null ? null : Math.abs(computed - parsed.expected);
+      const verified = abs_error !== null && abs_error <= tolerance_used;
+      return send({
+        verified, refused: false, computed, expected: parsed.expected,
+        abs_error, tolerance_used, resolved, unresolved: [],
+      });
+    }
     if (req.method === "POST" && url === "/api/geometry/box") {
       counts.box++;
       return send({
@@ -234,11 +278,76 @@ check("verify_part unblocks the identical closing call (never cached)", () => {
 
 await call("create_cylinder", { plane: "xy", cx: 0, cy: 0, radius: 4, height: 12 });
 const cp3refused = await checkpoint("counterbore ø14 x 6 deep, top face");
-await call("verify_claim", { part_id: 1, claim: "volume is 8 mm^3" });
+await call("verify_claim", {
+  expr: "v",
+  bindings: [{ var: "v", measure: { kind: "volume", part: PART_UUID } }],
+  expected: 8,
+});
 const cp3 = await checkpoint("counterbore ø14 x 6 deep, top face");
 check("verify_claim clears the gate as well as verify_part", () => {
   assert.ok(isRefusal(cp3refused, "verification_scope"), "armed by the cylinder");
   assert.equal(firstJson(cp3).refused, undefined, "and cleared by verify_claim");
+});
+
+// ─── 4b. F1 (2026-08-15 review H3) — a verify_claim that measured NOTHING
+//         must not clear the gate. `VerifyMeasure::Constant` references no
+//         part at all, so an all-constant claim is a single cheap call, with
+//         no `part` field anywhere in it, that used to zero the tally.
+
+await call("create_box", { plane: "xy", cx: 0, cy: 0, width: 6, depth: 6, height: 6 });
+const cp4armed = await checkpoint("spot face ø18 x 2 deep, four corners");
+check("armed by the box", () => {
+  assert.ok(isRefusal(cp4armed, "verification_scope"));
+});
+const constantOnlyClaim = await call("verify_claim", {
+  expr: "x",
+  bindings: [{ var: "x", measure: { kind: "constant", value: 1 } }],
+  expected: 1,
+});
+check("a contentless (all-constant) verify_claim is itself a genuine, successful verdict", () => {
+  // Not a refusal — `verified: true`. The exploit is that this call
+  // SUCCEEDS cleanly while measuring nothing about any part.
+  assert.equal(firstJson(constantOnlyClaim).refused, false);
+  assert.equal(firstJson(constantOnlyClaim).verified, true);
+});
+const cp4still = await checkpoint("spot face ø18 x 2 deep, four corners");
+check("F1 CLOSED: an all-constant verify_claim does not clear gate 6 — it measured nothing", () => {
+  assert.ok(
+    isRefusal(cp4still, "verification_scope"),
+    "a claim over supplied constants never touched the box's own geometry",
+  );
+  assert.deepEqual(firstJson(cp4still).unverified_operations, ["create_box"]);
+});
+
+// ─── 4c. F1 — a verify_claim the kernel REFUSED (unresolved binding) must
+//         not clear the gate either: `verify_claim_handler` is structurally
+//         always HTTP 200, including its own `refused: true` shape.
+
+const unresolvableClaim = await call("verify_claim", {
+  expr: "v",
+  bindings: [
+    { var: "v", measure: { kind: "volume", part: "00000000-0000-4000-8000-000000000000" } },
+  ],
+  expected: 8,
+});
+check("a claim over an unresolvable part is a REFUSED verdict, not an error result", () => {
+  assert.equal(unresolvableClaim.isError, undefined, "structurally always 200 — H3");
+  assert.equal(firstJson(unresolvableClaim).refused, true);
+});
+const cp4c = await checkpoint("spot face ø18 x 2 deep, four corners");
+check("F1: a refused verify_claim does not clear gate 6", () => {
+  assert.ok(isRefusal(cp4c, "verification_scope"));
+});
+
+// Finally, a genuine look — leaves the fixture clean for what follows.
+await call("verify_claim", {
+  expr: "v",
+  bindings: [{ var: "v", measure: { kind: "volume", part: PART_UUID } }],
+  expected: 8,
+});
+const cp4clean = await checkpoint("spot face ø18 x 2 deep, four corners");
+check("a genuine binding finally clears it", () => {
+  assert.equal(firstJson(cp4clean).refused, undefined);
 });
 
 // ─── 5. skip_verification:true is the one escape — AND now a DURABLE record ─

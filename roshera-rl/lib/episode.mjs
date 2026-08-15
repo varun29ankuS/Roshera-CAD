@@ -72,8 +72,30 @@ const MUTATES_SOLIDS = new Set([
 const VERIFIES = new Set(["verify_part", "verify_claim"]);
 
 /**
- * A pure function from the episode's own step tool/success list to "what
- * mutating work, if any, ended the episode unverified" — mirroring gates.ts's
+ * F1 (2026-08-15 whole-branch review, finding H3) — the `gates.ts` copy of
+ * this exact function ("Whether a successful `verify_claim` dispatch
+ * actually measured something", gates.ts, next to `VERIFIES`) explains the
+ * two reasons `ok: true` alone is not "the caller looked": the backend
+ * `verify_claim_handler` is structurally always HTTP 200, including its own
+ * `refused: true` shape, and a claim built entirely from `constant` bindings
+ * references no part at all. Both copies must agree — see the parity test
+ * in `episode.test.mjs`.
+ *
+ * `args` is the request `action.args` this dispatch was made with; `data`
+ * is the parsed response body (`result?.data` from `readToolResult`,
+ * mcp_session.mjs) — both already in hand at the one call site below, no
+ * second fetch, mirroring gates.ts's own no-second-fetch discipline.
+ */
+export function verifyClaimActuallyMeasured(args, data) {
+  const bindings = Array.isArray(args?.bindings) ? args.bindings : [];
+  const measuresGeometry = bindings.some((b) => b?.measure?.kind !== "constant");
+  if (!measuresGeometry) return false;
+  return !(data !== null && typeof data === "object" && data.refused === true);
+}
+
+/**
+ * A pure function from the episode's own step log to "what mutating work, if
+ * any, ended the episode unverified" — mirroring gates.ts's
  * `intentUnverified` bookkeeping (`gates.ts:1069-1089`) exactly, one call at
  * a time, in step order:
  *
@@ -85,8 +107,11 @@ const VERIFIES = new Set(["verify_part", "verify_claim"]);
  *     itself (verified, or explicitly `skip_verification`'d ON THE RECORD),
  *     so whatever preceded it is settled and must not haunt the episode's
  *     own final verdict;
- *   - `verify_part` / `verify_claim` (successful) also clear it — the
- *     caller LOOKED;
+ *   - `verify_part` (successful) always clears it — the caller LOOKED;
+ *   - `verify_claim` (successful) clears it ONLY when
+ *     `verifyClaimActuallyMeasured` says the call measured something (F1) —
+ *     a step entry that does not carry `claimMeasured: true` is treated as
+ *     NOT having looked, the conservative default;
  *   - any other successful `MUTATES_SOLIDS` call adds to it.
  *
  * `tools` is the DISTINCT verbs (a Set, matching gates.ts's own choice —
@@ -109,9 +134,17 @@ export function unverifiedMutatingWork(stepLog) {
     if (s.ok !== true) continue; // refused/errored — built nothing to verify
     const tool = s.tool;
     if (typeof tool !== "string") continue;
-    if (tool === "timeline_checkpoint" || tool === "clear_timeline" || VERIFIES.has(tool)) {
+    if (tool === "timeline_checkpoint" || tool === "clear_timeline") {
       tools.clear();
       count = 0;
+    } else if (VERIFIES.has(tool)) {
+      if (tool === "verify_part" || s.claimMeasured === true) {
+        tools.clear();
+        count = 0;
+      }
+      // else: a verify_claim step logged without claimMeasured:true — it
+      // measured nothing (refused, or all-constant bindings) — leave the
+      // tally exactly as it was.
     } else if (MUTATES_SOLIDS.has(tool)) {
       tools.add(tool);
       count += 1;
@@ -479,7 +512,20 @@ export async function runEpisode({
     // bookkeeping uses), in step order. A harness-level refusal (above,
     // `assertActionAllowed`) never reaches here because it never reached the
     // kernel — nothing was built, so there is nothing to log either.
-    stepLog.push({ tool: action.tool, ok: result?.is_error !== true });
+    //
+    // F1 — `claimMeasured` is computed HERE, where `action.args` (the
+    // request) and `result.data` (the parsed response) are both in hand, and
+    // carried on the step entry rather than recomputed later: `verify_claim`
+    // is the only tool this matters for, so the key is simply absent
+    // (`undefined`) for every other tool, which `unverifiedMutatingWork`
+    // above treats identically to `false` — the conservative default.
+    stepLog.push({
+      tool: action.tool,
+      ok: result?.is_error !== true,
+      ...(action.tool === "verify_claim"
+        ? { claimMeasured: verifyClaimActuallyMeasured(action.args, result?.data) }
+        : {}),
+    });
     traj.step({
       i, action, resultDigest: digest(result?.data ?? result?.text ?? null), reward,
       refusal: result?.refusal

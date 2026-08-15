@@ -580,6 +580,11 @@ pub struct PartDrawingQuery {
     /// Display name for the registered drawing (registry path only).
     /// Defaults to a name derived from the part when omitted.
     pub name: Option<String>,
+    /// Sheet-export gate (H1, 2026-08-15 whole-branch review) — the SAME
+    /// bypass `drawing_export_sheet` accepts for the layout-quality branch
+    /// ONLY, never for a stale/dangling fact. See `refuse_unsound_sheet`.
+    #[serde(default)]
+    pub acknowledge_layout_issues: bool,
 }
 
 /// `GET /api/parts/{id}/drawing.svg` — ONE-CALL engineering drawing of a part by
@@ -591,7 +596,7 @@ pub async fn part_drawing_svg(
     ActiveModel(model_handle): ActiveModel,
     Path(id): Path<SolidId>,
     Query(q): Query<PartDrawingQuery>,
-) -> Result<Response, StatusCode> {
+) -> Result<Response, ApiError> {
     drawing_svg_for_solid(model_handle, id, Uuid::nil(), q).await
 }
 
@@ -602,8 +607,10 @@ pub async fn part_drawing_svg_by_uuid(
     ActiveModel(model_handle): ActiveModel,
     Path(uuid): Path<Uuid>,
     Query(q): Query<PartDrawingQuery>,
-) -> Result<Response, StatusCode> {
-    let solid_id = state.get_local_id(&uuid).ok_or(StatusCode::NOT_FOUND)?;
+) -> Result<Response, ApiError> {
+    let solid_id = state
+        .get_local_id(&uuid)
+        .ok_or_else(|| ApiError::part_not_found(uuid))?;
     drawing_svg_for_solid(model_handle, solid_id, uuid, q).await
 }
 
@@ -652,9 +659,60 @@ async fn drawing_svg_for_solid(
     solid_id: SolidId,
     part_uuid: Uuid,
     q: PartDrawingQuery,
-) -> Result<Response, StatusCode> {
+) -> Result<Response, ApiError> {
+    // `model_handle` is cloned here because `refuse_unsound_sheet` below
+    // needs its OWN live read of the model (a second, independent
+    // certification pass) after `build_standard_drawing_off_lock` has
+    // consumed the first clone.
     let drawing =
-        build_standard_drawing_off_lock(model_handle, solid_id, part_uuid, q.scale).await?;
+        build_standard_drawing_off_lock(model_handle.clone(), solid_id, part_uuid, q.scale)
+            .await
+            .map_err(|code| match code {
+                StatusCode::NOT_FOUND => ApiError::solid_not_found(solid_id),
+                StatusCode::UNPROCESSABLE_ENTITY => ApiError::new(
+                    ErrorCode::KernelError,
+                    format!("drawing generation failed for solid {solid_id}"),
+                ),
+                _ => ApiError::new(
+                    ErrorCode::Internal,
+                    "drawing generation task failed".to_string(),
+                ),
+            })?;
+
+    // Gate 4, server-side (H1, 2026-08-15 whole-branch review): this route
+    // hands out the SAME third-angle sheet with HLR + auto dimensions that
+    // `drawing_export_sheet` (`export_svg` below, plus `export_pdf` /
+    // `export_dxf`) already gates — "the argument is about the artifact, not
+    // about which route produced it" (the review's own words). No registered
+    // `drawing_id` exists for this one-call path, so `Uuid::nil()` is passed
+    // through exactly as the review's own remediation sketch specifies.
+    //
+    // `certify_drawing` has NO notion of the underlying SOLID's own B-Rep
+    // soundness — `SheetReadbackCertificate::sound` means "no fact is stale
+    // or dangling" (sheet_certificate.rs:206-209), a sheet-VS-MODEL
+    // consistency check, not a solid-VALIDITY one. Whether the solid itself
+    // is watertight/manifold/self-intersection-free is a SEPARATE, already
+    // open gap this route shares with every other sheet-producing route in
+    // the codebase (confirmed: `make_drawing`'s own creation route has no
+    // unsound-base check anywhere in the pipeline either) — deliberately
+    // left alone here rather than having this refusal claim a check the
+    // certificate cannot actually make. What IS applied, honestly, in the
+    // shape `4b1ef771` established:
+    //   - stale/dangling facts: structurally always zero on THIS path — the
+    //     sheet is projected in the SAME request it is exported in, so there
+    //     is no time gap for the model to have moved — but genuinely
+    //     checked, not assumed, so a future change to this function that
+    //     introduces a gap between projection and export is still covered;
+    //   - layout-quality Errors: real and applicable, and the one this route
+    //     was actually missing.
+    refuse_unsound_sheet(
+        model_handle,
+        Uuid::nil(),
+        drawing.clone(),
+        q.acknowledge_layout_issues,
+    )
+    .await?;
+
     let svg = render_drawing_svg(&drawing);
     let content_type = if q.plain {
         "text/plain; charset=utf-8"

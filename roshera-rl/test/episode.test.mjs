@@ -20,7 +20,7 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-import { runEpisode, unverifiedMutatingWork } from "../lib/episode.mjs";
+import { runEpisode, unverifiedMutatingWork, verifyClaimActuallyMeasured } from "../lib/episode.mjs";
 import { readTrajectory } from "../lib/trajectory.mjs";
 import { scriptedPolicy } from "../lib/policy.mjs";
 import { defineTask } from "../lib/task.mjs";
@@ -563,12 +563,66 @@ check("unverifiedMutatingWork: verify_part clears everything that preceded it", 
   assert.deepEqual(r, { count: 0, tools: [] });
 });
 
-check("unverifiedMutatingWork: verify_claim clears too, not only verify_part", () => {
+check("unverifiedMutatingWork: verify_claim clears too, when it actually measured something", () => {
   const r = unverifiedMutatingWork([
     { tool: "boolean", ok: true },
-    { tool: "verify_claim", ok: true },
+    { tool: "verify_claim", ok: true, claimMeasured: true },
   ]);
   assert.deepEqual(r, { count: 0, tools: [] });
+});
+
+// ─── F1 (2026-08-15 review H3) — the load-bearing case: a contentless
+//     verify_claim between a mutation and the episode's end must NOT read as
+//     verified work. `episode.mjs` copies gates.ts's clearing rule, not only
+//     its VERIFIES set (see H3: `VerifyMeasure::Constant` references no part
+//     at all, and the handler is structurally always HTTP 200).
+
+check("unverifiedMutatingWork: a verify_claim step with no claimMeasured:true does NOT clear — the conservative default", () => {
+  const r = unverifiedMutatingWork([
+    { tool: "boolean", ok: true },
+    { tool: "verify_claim", ok: true }, // no claimMeasured key at all
+  ]);
+  assert.deepEqual(r, { count: 1, tools: ["boolean"] }, "measured nothing — not a look");
+});
+
+check("unverifiedMutatingWork: a verify_claim step explicitly marked claimMeasured:false does NOT clear", () => {
+  const r = unverifiedMutatingWork([
+    { tool: "boolean", ok: true },
+    { tool: "verify_claim", ok: true, claimMeasured: false },
+  ]);
+  assert.deepEqual(r, { count: 1, tools: ["boolean"] });
+});
+
+check("unverifiedMutatingWork: verify_part still clears unconditionally — no claimMeasured needed", () => {
+  const r = unverifiedMutatingWork([
+    { tool: "boolean", ok: true },
+    { tool: "verify_part", ok: true },
+  ]);
+  assert.deepEqual(r, { count: 0, tools: [] });
+});
+
+check("verifyClaimActuallyMeasured: all-constant bindings measure nothing, however cleanly they verify", () => {
+  const args = { bindings: [{ var: "x", measure: { kind: "constant", value: 1 } }] };
+  const data = { verified: true, refused: false, computed: 1 };
+  assert.equal(verifyClaimActuallyMeasured(args, data), false);
+});
+
+check("verifyClaimActuallyMeasured: a refused verdict is not a look, even with a real binding", () => {
+  const args = { bindings: [{ var: "v", measure: { kind: "volume", part: "some-uuid" } }] };
+  const data = { verified: false, refused: true, computed: null };
+  assert.equal(verifyClaimActuallyMeasured(args, data), false);
+});
+
+check("verifyClaimActuallyMeasured: a real binding, not refused, IS a look", () => {
+  const args = { bindings: [{ var: "v", measure: { kind: "volume", part: "some-uuid" } }] };
+  const data = { verified: true, refused: false, computed: 8 };
+  assert.equal(verifyClaimActuallyMeasured(args, data), true);
+});
+
+check("verifyClaimActuallyMeasured: malformed args/data degrade to false, never throw", () => {
+  assert.equal(verifyClaimActuallyMeasured(null, null), false);
+  assert.equal(verifyClaimActuallyMeasured({}, {}), false);
+  assert.equal(verifyClaimActuallyMeasured(undefined, undefined), false);
 });
 
 check("unverifiedMutatingWork: a NEW timeline_checkpoint resets the tally — it already passed gate 6 itself to close", () => {
@@ -644,6 +698,111 @@ check("an episode that verifies its mutating work before ending is NOT flagged",
   assert.deepEqual(terminal.unverified_mutations.tools, []);
 });
 
+// ─── F1 (2026-08-15 review H3) — end to end through `runEpisode`: the load-
+//     bearing case named in the fix brief. A contentless verify_claim between
+//     a mutation and the episode's own end must NOT let `unverified_mutations`
+//     read as verified — the corpus field item 7 added must not inherit the
+//     same hole H3 found in gates.ts's live gate.
+
+const CLAIM_TASK = defineTask({
+  id: "t-claim", prompt: "p", toolAllowlist: ["create_cylinder", "verify_claim"],
+  claims: [{
+    name: "volume", expr: "v",
+    bindings: [{ var: "v", measure: { kind: "volume", part: "solid:0" } }],
+    expected: 117809.724509617, tolerance: 117.8,
+  }],
+  stepBudget: 3, tokenBudget: 1000, split: "train",
+});
+
+/** claim.rs's ClaimVerdict shape for an all-constant, genuinely-successful
+ *  claim: `verified: true`, but nothing about any part was ever measured. */
+const CONSTANT_ONLY_CLAIM_OK = ok({
+  verified: true, refused: false, computed: 1, expected: 1,
+  abs_error: 0, tolerance_used: 1e-6, resolved: [["x", 1]], unresolved: [],
+});
+
+/** claim.rs's ClaimVerdict shape for a REFUSED claim (unresolved binding) —
+ *  structurally still a 200/`ok()` result, per H3's first finding. */
+const REFUSED_CLAIM = ok({
+  verified: false, refused: true, computed: null, expected: 8,
+  abs_error: null, tolerance_used: 1e-6, resolved: [], unresolved: ["v"],
+});
+
+check("F1: an all-constant verify_claim does not clear unverified_mutations end to end", async () => {
+  const path = join(dir, "f1-constant-claim.jsonl");
+  await runEpisode({
+    task: CLAIM_TASK,
+    policy: scriptedPolicy([
+      { tool: "create_cylinder", args: { radius: 25 } },
+      {
+        tool: "verify_claim",
+        args: {
+          expr: "x",
+          bindings: [{ var: "x", measure: { kind: "constant", value: 1 } }],
+          expected: 1,
+        },
+      },
+    ]),
+    seed: 1, baseUrl, authHeader: {}, trajectoryPath: path, kernelSha: "abc",
+    spawn: fakeSpawn((tool) => (tool === "verify_claim" ? CONSTANT_ONLY_CLAIM_OK : CREATED_OK)),
+  });
+  const { terminal } = readTrajectory(path);
+  assert.equal(terminal.unverified_mutations.count, 1,
+    "the constant-only claim measured nothing about the cylinder — F1's load-bearing case");
+  assert.deepEqual(terminal.unverified_mutations.tools, ["create_cylinder"]);
+});
+
+check("F1: a REFUSED verify_claim (structurally a 200) does not clear unverified_mutations end to end", async () => {
+  const path = join(dir, "f1-refused-claim.jsonl");
+  await runEpisode({
+    task: CLAIM_TASK,
+    policy: scriptedPolicy([
+      { tool: "create_cylinder", args: { radius: 25 } },
+      {
+        tool: "verify_claim",
+        args: {
+          expr: "v",
+          bindings: [{ var: "v", measure: { kind: "volume", part: "bad-uuid" } }],
+          expected: 8,
+        },
+      },
+    ]),
+    seed: 1, baseUrl, authHeader: {}, trajectoryPath: path, kernelSha: "abc",
+    spawn: fakeSpawn((tool) => (tool === "verify_claim" ? REFUSED_CLAIM : CREATED_OK)),
+  });
+  const { terminal } = readTrajectory(path);
+  assert.equal(terminal.unverified_mutations.count, 1,
+    "a claim the kernel declined to evaluate is not a look");
+  assert.deepEqual(terminal.unverified_mutations.tools, ["create_cylinder"]);
+});
+
+check("F1: a verify_claim over a REAL binding, not refused, DOES clear unverified_mutations end to end", async () => {
+  const path = join(dir, "f1-real-claim.jsonl");
+  const REAL_CLAIM_OK = ok({
+    verified: true, refused: false, computed: 117809.724509617, expected: 117809.724509617,
+    abs_error: 0, tolerance_used: 117.8, resolved: [["v", 117809.724509617]], unresolved: [],
+  });
+  await runEpisode({
+    task: CLAIM_TASK,
+    policy: scriptedPolicy([
+      { tool: "create_cylinder", args: { radius: 25 } },
+      {
+        tool: "verify_claim",
+        args: {
+          expr: "v",
+          bindings: [{ var: "v", measure: { kind: "volume", part: "3f2b8c1e-77aa-4a9f-8b21-9f0f2a6d5e10" } }],
+          expected: 117809.724509617,
+        },
+      },
+    ]),
+    seed: 1, baseUrl, authHeader: {}, trajectoryPath: path, kernelSha: "abc",
+    spawn: fakeSpawn((tool) => (tool === "verify_claim" ? REAL_CLAIM_OK : CREATED_OK)),
+  });
+  const { terminal } = readTrajectory(path);
+  assert.equal(terminal.unverified_mutations.count, 0, "a genuine measurement clears it, exactly as before");
+  assert.deepEqual(terminal.unverified_mutations.tools, []);
+});
+
 check("a mutating call the kernel refused contributes no unverified work — nothing was built to verify", async () => {
   const path = join(dir, "refused-mutation.jsonl");
   await runEpisode({
@@ -707,6 +866,57 @@ check("the MUTATES_SOLIDS copy equals gates.ts's, verb for verb", () => {
     { missingHere, extraHere }, { missingHere: [], extraHere: [] },
     "gates.ts and episode.mjs disagree about which tools mutate solids. An episode's " +
     "unverified-mutation check would then miss work the gate counts, or flag work it does not.",
+  );
+});
+
+// ─── the copy of gates.ts's VERIFIES is PINNED too (M3 / F1 follow-up) ──────
+//
+// M3 (2026-08-15 review): `VERIFIES` was copied (gates.ts:388, episode.mjs)
+// but never pinned — only `MUTATES_SOLIDS` was. Same shape, same regex, same
+// vacuity-guard discipline as the pin above; a third verification verb added
+// to gates.ts now fails this test until episode.mjs's copy follows, instead
+// of silently making the episode-end check over- or under-report forever.
+//
+// WHAT THIS DOES NOT PIN, stated plainly rather than implied: SET equality
+// proves the two files agree on WHICH tools count as "verifying" — it proves
+// nothing about the CLEARING RULE this fix (F1) attached to `verify_claim`
+// specifically (`verifyClaimActuallyMeasured` in both files: refused-body and
+// all-constant-bindings checks). Two files can carry byte-identical
+// `VERIFIES` sets while one clears unconditionally and the other does not —
+// exactly the review's own point about M2/M3 ("membership parity proves
+// nothing about [behaviour]"). That agreement is NOT mechanically pinned
+// here; it is covered only by the parallel hand-written scenarios above (the
+// gates.ts suite's "F1" checks in verification_scope_gate.test.mjs and this
+// file's "F1" checks), which a future edit to either copy's clearing logic
+// could still defeat without this test noticing. A mechanical pin over
+// `verifyClaimActuallyMeasured`'s BODY (not just its name) would need a
+// source-level behavioural-equivalence check neither file has infrastructure
+// for today — left as a named gap, not silently assumed covered.
+check("the VERIFIES copy equals gates.ts's, verb for verb", () => {
+  const setLiteral = (src, name) => {
+    const m = src.match(new RegExp(`const ${name}\\s*=\\s*new Set(?:<string>)?\\(\\[([\\s\\S]*?)\\]\\)`));
+    assert.ok(m, `could not locate ${name}'s set literal — the parse, not the sets, is broken`);
+    return new Set([...m[1].matchAll(/"([a-z0-9_]+)"/g)].map((x) => x[1]));
+  };
+  const gatesSrc = readFileSync(join(HERE, "..", "..", "roshera-mcp", "src", "gates.ts"), "utf8");
+  const episodeSrc = readFileSync(join(HERE, "..", "lib", "episode.mjs"), "utf8");
+
+  const theirs = setLiteral(gatesSrc, "VERIFIES");
+  const ours = setLiteral(episodeSrc, "VERIFIES");
+
+  // Vacuity guard: a regex that silently matched nothing would make two empty
+  // sets compare equal and this check would pass forever while proving zero.
+  assert.ok(theirs.size >= 2, `parsed only ${theirs.size} verbs from gates.ts — the parse is broken`);
+  assert.ok(theirs.has("verify_part") && ours.has("verify_part"), "neither set should be missing 'verify_part'");
+  assert.ok(theirs.has("verify_claim") && ours.has("verify_claim"), "neither set should be missing 'verify_claim'");
+
+  const missingHere = [...theirs].filter((t) => !ours.has(t));
+  const extraHere = [...ours].filter((t) => !theirs.has(t));
+  assert.deepEqual(
+    { missingHere, extraHere }, { missingHere: [], extraHere: [] },
+    "gates.ts and episode.mjs disagree about which tools count as having verified. An " +
+    "episode's unverified-mutation check would then miss a verb the gate counts, or " +
+    "flag one it does not.",
   );
 });
 

@@ -14,16 +14,35 @@
 //! These tests pin the server-side rule, mirroring `unsound_base_gate_
 //! tests.rs`'s both-directions discipline:
 //!   1. a STALE sheet (a live-remeasured dimension has drifted) is refused
-//!      on every export route, with NO bypass;
+//!      on every REGISTERED export route, with NO bypass;
 //!   2. `acknowledge_layout_issues: true` does NOT open that branch — the
 //!      escape is scoped to layout quality only, never to stale/dangling
 //!      facts;
 //!   3. a sheet with an Error-severity layout-quality finding is refused
 //!      unless `acknowledge_layout_issues=true`, which DOES let it through;
 //!   4. a SOUND, quality-passing sheet is never refused, on any of the
-//!      three routes;
+//!      three registered-export routes;
 //!   5. the Rust refusal and the `gates.ts` refusal name the same gates and
 //!      the same escape token.
+//!
+//! ## Five routes hand out sheet bytes, not three (H1, 2026-08-15 review)
+//!
+//! `export_pdf` / `export_dxf` / `export_svg` (gated by `4b1ef771`, proven in
+//! section 1-4 below) all address a REGISTERED drawing by `drawing_id`. Two
+//! more routes produce the identical third-angle HLR sheet from a live SOLID
+//! directly, registering nothing: `GET /api/parts/{id}/drawing.svg` and
+//! `GET /api/parts/uuid/{uuid}/drawing.svg` (`drawing_mgr::part_drawing_svg`
+//! / `part_drawing_svg_by_uuid`). Section 5 below gates and proves those two.
+//! They cannot share `registered_export_routes()`'s helper (there is no
+//! `drawing_id` to key on — the sheet is built AND rendered within the one
+//! request) and the STALE branch cannot structurally apply to them (nothing
+//! is left registered between projection and export for the model to move
+//! out from under) — which is exactly why the original name of test 1 below
+//! overclaimed "every export route" while its `export_routes()` helper
+//! enumerated exactly three: a reader learned a completeness the route table
+//! (five routes) contradicted. Renamed to say what it actually proves;
+//! coverage of the two one-call routes is added in section 5, for the checks
+//! that genuinely apply to them (quality-Error, sound-passthrough).
 //!
 //! ## Fixtures
 //!
@@ -60,6 +79,14 @@ use uuid::Uuid;
 /// Create a plain 10x10x10 box through the live REST route and return its
 /// kernel `SolidId`.
 async fn create_box(state: &AppState) -> u32 {
+    let (id, _uuid) = create_box_full(state).await;
+    id
+}
+
+/// Same fixture as `create_box`, but also returns the object UUID — the
+/// one-call `drawing.svg` uuid route (`part_drawing_svg_by_uuid`) addresses
+/// solids by UUID, not by kernel `SolidId`.
+async fn create_box_full(state: &AppState) -> (u32, Uuid) {
     let (status, body) = dispatch(
         state,
         post(
@@ -69,9 +96,12 @@ async fn create_box(state: &AppState) -> u32 {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "box create must 200; body = {body}");
-    body["solid_id"]
+    let id = body["solid_id"]
         .as_u64()
-        .expect("solid_id must be a number") as u32
+        .expect("solid_id must be a number") as u32;
+    let uuid = Uuid::parse_str(body["object"]["id"].as_str().expect("box uuid string"))
+        .expect("box uuid must parse");
+    (id, uuid)
 }
 
 /// Build and register the standard one-call sheet for a fresh box (the
@@ -217,7 +247,11 @@ fn assert_sheet_refusal(
     );
 }
 
-fn export_routes(drawing_id: Uuid) -> [(&'static str, String); 3] {
+/// The three routes that export a REGISTERED drawing by `drawing_id`. Named
+/// for what it covers (see the module doc's "Five routes" note) — the two
+/// one-call `drawing.svg` routes (section 5) address a live solid directly
+/// and have no `drawing_id` to key this helper on.
+fn registered_export_routes(drawing_id: Uuid) -> [(&'static str, String); 3] {
     [
         ("pdf", format!("/api/drawings/{drawing_id}/pdf")),
         ("dxf", format!("/api/drawings/{drawing_id}/dxf")),
@@ -230,14 +264,25 @@ fn export_routes(drawing_id: Uuid) -> [(&'static str, String); 3] {
 // =====================================================================
 
 /// THE GATE, stale branch. A drawing whose live-remeasured facts have
-/// drifted past the dimensioning oracle is refused on all three export
+/// drifted past the dimensioning oracle is refused on all three REGISTERED
+/// export routes.
+///
+/// Named for exactly what it covers (H1, 2026-08-15 review): staleness is a
+/// property of a REGISTERED drawing whose sheet was projected in an EARLIER
+/// request than the one exporting it — the one-call `drawing.svg` routes
+/// build and render within the SAME request, so there is no gap for the
+/// model to have moved in and this scenario cannot be constructed against
+/// them. The former name (`..._on_every_export_route`) claimed a
+/// completeness this test never covered even before the one-call routes
+/// existed to expose it: `export_routes()` (now `registered_export_routes`)
+/// always enumerated exactly three of what were already five sheet-emitting
 /// routes.
 ///
 /// RED before the Rust gate existed: every one of these three GETs
 /// returned 200 OK with rendered bytes, regardless of the sheet's live
 /// certificate — that is exactly S1 in the audit.
 #[tokio::test]
-async fn a_stale_sheet_is_refused_on_every_export_route() {
+async fn a_stale_sheet_is_refused_on_every_registered_export_route() {
     for kind in ["pdf", "dxf", "svg"] {
         let state = make_test_state().await;
         let drawing_id = sound_passing_drawing(&state).await;
@@ -392,13 +437,13 @@ async fn explicit_false_does_not_acknowledge_layout_issues() {
 
 /// No behaviour change on the happy path: a sound sheet that also passes
 /// its layout-quality check exports exactly as it did before the gate
-/// existed, on all three routes.
+/// existed, on all three registered-export routes.
 #[tokio::test]
 async fn a_sound_passing_sheet_is_never_refused() {
     let state = make_test_state().await;
     let drawing_id = sound_passing_drawing(&state).await;
 
-    for (label, route) in export_routes(drawing_id) {
+    for (label, route) in registered_export_routes(drawing_id) {
         let (status, body) = dispatch(&state, get(&route)).await;
         assert_eq!(
             status,
@@ -459,5 +504,120 @@ async fn the_rust_gate_and_gates_ts_name_the_same_gates_and_escape() {
         body["retryable"].as_bool() == Some(false),
         "the refusal is not transient — the same drawing_id gets the same \
          answer until it is regenerated; body = {body}"
+    );
+}
+
+// =====================================================================
+// 5. F2 (2026-08-15 review H1) — the two ONE-CALL `drawing.svg` routes
+// =====================================================================
+//
+// `GET /api/parts/{id}/drawing.svg` and `GET /api/parts/uuid/{uuid}/
+// drawing.svg` hand out the identical third-angle HLR sheet as the three
+// routes above, addressing a live solid directly rather than a registered
+// drawing. `refuse_unsound_sheet` is called in the same shape `4b1ef771`
+// established (`drawing_svg_for_solid`, drawing_mgr.rs); no `drawing_id`
+// exists for this path, so the refusal names `Uuid::nil()` — proven below,
+// not merely asserted. The stale/dangling branch is not exercised here: it
+// cannot be constructed against a sheet that is built and rendered within
+// one request (see the rename note on section 1 above) — only the
+// layout-quality branch and the sound-passthrough path genuinely apply.
+//
+// Forcing a quality-Error finding needs a different trick than
+// `make_a_dimension_stale` (there is no registered `Drawing` to reach into
+// before the request runs): `?scale=1000` on a 10mm box overflows the fixed
+// A3 sheet by three orders of magnitude, which reliably trips
+// `ViewOutsideFrame` (Error-severity, geometry-engine/src/drawing/
+// verify.rs:47,253-258) regardless of the exact layout thresholds.
+
+/// A quality-failing one-call sheet (forced by an absurd `?scale=`) is
+/// refused on both routes, without acknowledgement.
+#[tokio::test]
+async fn a_quality_failing_one_call_svg_is_refused_without_acknowledgement() {
+    let nil = Uuid::nil();
+    for label in ["id", "uuid"] {
+        let state = make_test_state().await;
+        let (id, uuid) = create_box_full(&state).await;
+        let path = if label == "id" {
+            format!("/api/parts/{id}/drawing.svg?scale=1000")
+        } else {
+            format!("/api/parts/uuid/{uuid}/drawing.svg?scale=1000")
+        };
+        let (status, body) = dispatch(&state, get(&path)).await;
+        assert_sheet_refusal(
+            status,
+            &body,
+            nil,
+            "sheet_quality",
+            StatusCode::CONFLICT,
+            &format!("one-call svg ({label}) with a forced quality failure"),
+        );
+    }
+}
+
+/// `acknowledge_layout_issues=true` DOES let the same quality-failing
+/// one-call sheet export, on both routes — the documented
+/// draft-for-human-review escape, exactly as it does for the registered
+/// routes.
+#[tokio::test]
+async fn acknowledge_layout_issues_true_lets_the_one_call_svg_draft_export_proceed() {
+    for label in ["id", "uuid"] {
+        let state = make_test_state().await;
+        let (id, uuid) = create_box_full(&state).await;
+        let path = if label == "id" {
+            format!("/api/parts/{id}/drawing.svg?scale=1000&acknowledge_layout_issues=true")
+        } else {
+            format!("/api/parts/uuid/{uuid}/drawing.svg?scale=1000&acknowledge_layout_issues=true")
+        };
+        let (status, body) = dispatch(&state, get(&path)).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "one-call svg ({label}) with acknowledge_layout_issues=true must proceed; body = {body}"
+        );
+    }
+}
+
+/// No behaviour change on the happy path: a sound, quality-passing one-call
+/// sheet exports exactly as it did before this gate was wired in, on both
+/// routes.
+#[tokio::test]
+async fn a_sound_passing_one_call_svg_is_never_refused() {
+    for label in ["id", "uuid"] {
+        let state = make_test_state().await;
+        let (id, uuid) = create_box_full(&state).await;
+        let path = if label == "id" {
+            format!("/api/parts/{id}/drawing.svg")
+        } else {
+            format!("/api/parts/uuid/{uuid}/drawing.svg")
+        };
+        let (status, body) = dispatch(&state, get(&path)).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "one-call svg ({label}) of a sound, passing sheet must 200; body = {body}"
+        );
+    }
+}
+
+/// Junk (`?acknowledge_layout_issues=1`) must not open the bypass, on
+/// either route — the same fail-CLOSED-on-junk discipline
+/// `junk_acknowledge_layout_issues_value_does_not_open_the_bypass` pins for
+/// the registered routes, `Query<PartDrawingQuery>`'s `bool` deserialization
+/// rejecting non-boolean junk before the handler runs.
+#[tokio::test]
+async fn junk_acknowledge_layout_issues_does_not_open_the_one_call_svg_bypass() {
+    let state = make_test_state().await;
+    let (id, _uuid) = create_box_full(&state).await;
+    let (status, body) = dispatch(
+        &state,
+        get(&format!(
+            "/api/parts/{id}/drawing.svg?scale=1000&acknowledge_layout_issues=1"
+        )),
+    )
+    .await;
+    assert_ne!(
+        status,
+        StatusCode::OK,
+        "junk acknowledge_layout_issues must never open the one-call svg bypass; body = {body}"
     );
 }
