@@ -96,6 +96,22 @@ export-engine::sign_flag_vs_sign_chunk  # class=wiring-shape file=roshera-backen
 # the `facets.intent()` accessor. Both are true; only the second is machine-
 # checkable. The real gate is a regression test pinning "intent set at the MCP
 # gate survives to the stored event".
+#
+# CLOSED 2026-08-15. Both entry lines are REMOVED from Section B (the ratchet
+# fired exit 2 on them, which is how this was noticed). The gate this diagnosis
+# asked for now exists, and it was written because the defect was still LIVE:
+# `boolean_route_carries_declared_facets_across_the_spawn_blocking_boundary`
+# (api-server/src/router_integration_tests.rs) drives a real boolean union
+# through the full router with the intent, agent and document headers set, and
+# asserts the facets reach the recorded event. It went RED first -- author came
+# back `System` instead of the declared agent, with no intent facet at all --
+# because `bounded_model_op` runs the kernel call in `spawn_blocking` and tokio
+# task-locals are not inherited across that boundary. So this instance's
+# "upstream code path stopped SETTING it" was still true, five years of prose
+# later, on the one route where part identity changes. Fixed at the choke point
+# in api-server/src/bounded_exec.rs (`snapshot_request_scope` /
+# `with_request_scope`), which re-enters only the overrides actually present --
+# an absent one stays absent rather than being materialised as a default.
 ros-format::verify_crc  # class=wiring-shape file=roshera-backend/ros-format/src/chunk.rs:272 date=2026-08-10 diag: instance 6 -- verify_crc exists and is called (chunk.rs:413 and in tests); the historical gap was the READER not calling it on the declared/on-disk value during import. A call-site omission in ONE path is invisible to symbol reachability. Gate = import-path integration test that tampers chunk bytes and asserts refusal.
 ros-format::header_ai_hints  # class=wiring-shape file=roshera-backend/ros-format/src/header.rs date=2026-08-10 diag: instance 7 -- NO SYMBOL EXISTS. Re-verified 2026-08-10: zero grep hits for ai_hints/AiHints/AI_HINTS in ros-format/src. If this was ever a doc-comment promise with no backing field, no code gate catches prose. Resolution is a test that pins the claim, or deletion of the claim.
 roshera-app::establishAcpSession  # class=out-of-scope file=roshera-app/src/lib/acp-blackboard.ts:571 date=2026-08-10 diag: instance 8 -- at introduction it was exported with ZERO importers. Now called at App.tsx:111 and imported by ProviderSettingsDialog.tsx:32. This is the TypeScript dead-export case; ts-prune is the right tool and is blocked on disk today (design doc Â§4). Out of scope until then.
@@ -599,8 +615,6 @@ timeline-engine::get_entity_deps  # class=dead-symbol file=roshera-backend/timel
 timeline-engine::get_event_helper  # class=dead-symbol file=roshera-backend/timeline-engine/src/timeline_impl.rs:169 date=2026-08-10
 timeline-engine::get_event_internal  # class=dead-symbol file=roshera-backend/timeline-engine/src/timeline.rs:1745 date=2026-08-10
 timeline-engine::get_parallel_groups  # class=dead-symbol file=roshera-backend/timeline-engine/src/dependency_graph.rs:245 date=2026-08-10
-timeline-engine::INTENT_OVERRIDE  # class=dead-symbol file=roshera-backend/timeline-engine/src/recorder_bridge.rs:135 date=2026-08-10
-timeline-engine::IntentContext  # class=dead-symbol file=roshera-backend/timeline-engine/src/recorder_bridge.rs:115 date=2026-08-10
 timeline-engine::IntoTimelineError  # class=dead-symbol file=roshera-backend/timeline-engine/src/error.rs:111 date=2026-08-10
 timeline-engine::invalidate_entities  # class=dead-symbol file=roshera-backend/timeline-engine/src/cache/operation_cache.rs:139 date=2026-08-10
 timeline-engine::is_branch_active  # class=dead-symbol file=roshera-backend/timeline-engine/src/timeline.rs:2010 date=2026-08-10
