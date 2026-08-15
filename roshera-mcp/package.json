@@ -12,7 +12,9 @@
     "test:perception": "node test/auto_feedback.mjs",
     "test:find-recall": "node test/find_tool_recall.mjs",
     "test:find-heldout": "node test/find_tool_heldout.mjs",
-    "test:ontology": "node test/ontology_coverage.mjs"
+    "test:ontology": "node test/ontology_coverage.mjs",
+    "test:gates:build": "tsc -p tsconfig.json --outDir test/.build",
+    "test:gates": "npm run test:gates:build && node test/constraint_gates.test.mjs && node test/drawing_gates.test.mjs && node test/single_point_gate.test.mjs && node test/verification_scope_gate.test.mjs"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",

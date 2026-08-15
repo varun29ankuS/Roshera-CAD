@@ -239,6 +239,28 @@ jobs:
       run: node test/scale_s2.mjs
       working-directory: ./roshera-mcp
 
+    - name: Run constraint-gate suites
+      if: steps.filter.outputs.mcp == 'true'
+      # The four suites that prove the CONSTRAINT harness — the refusal cache,
+      # the intent gate, the unsound-base gate, the sheet-export gate, the
+      # single-point-run gate and the verification-scope gate. Each has at
+      # least one check that fails if its gate's logic is deleted (audited
+      # 2026-08-14), so this step is a real gate rather than a smoke test.
+      #
+      # They ran nowhere until now: `scale_s2.mjs` above is the only MCP test
+      # CI executed, and it mentions the intent gate only to work AROUND it.
+      # The mutation proofs behind these suites were real history that nothing
+      # re-established — which matters more since `roshera-rl` began treating
+      # these gates as an RL environment's dynamics, where a refusal is a
+      # training signal and a silently-removed gate corrupts a corpus.
+      #
+      # They compile src/ to test/.build (an untracked fixture, never dist/)
+      # so every assertion runs the real ToolTable wrapper and the real
+      # handlers against a stub backend — the exact path a live call takes,
+      # minus the Rust kernel. `npm run test:gates` does that build itself.
+      run: npm run test:gates
+      working-directory: ./roshera-mcp
+
     - name: Grade with jig (best-effort, non-blocking)
       if: steps.filter.outputs.mcp == 'true'
       # jig (github.com/Shodh-Labs/jig, the MCP report-card grader) is NOT
