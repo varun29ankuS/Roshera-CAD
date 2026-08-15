@@ -181,6 +181,60 @@ jobs:
       run: npm run build
       working-directory: ./roshera-app
 
+  rl-harness:
+    # `roshera-rl` runs certificate-scored agent episodes over the MCP surface
+    # and projects the resulting JSONL trajectories into Postgres. It had NO CI
+    # job at all until now — its suites ran only when a human typed `npm test`.
+    #
+    # That is the same defect this workflow just fixed for the constraint-gate
+    # suites, one package over, and it bites harder here: this package holds the
+    # parity test pinning its copy of `MUTATES_SOLIDS` to `gates.ts`'s. An
+    # unrun parity test is not a pin, and `gates.ts` gained mutating verbs twice
+    # in a single branch.
+    #
+    # Triggered by changes to EITHER package, because a `gates.ts` edit is
+    # exactly what the parity test exists to catch and `roshera-rl/**` alone
+    # would miss it.
+    #
+    # No Postgres service here on purpose: the ingest suite states an honest,
+    # reasoned skip when `ROSHERA_RL_PG` is unset, and the rest of the suite is
+    # fully offline. Adding a service container to turn one honest skip into a
+    # run is a later call, not a blocker — what matters is that the ~200 other
+    # checks stop depending on someone remembering.
+    name: RL harness (episode + trajectory + parity)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Detect roshera-rl or gates.ts changes
+      uses: dorny/paths-filter@v3
+      id: filter
+      with:
+        filters: |
+          rl:
+            - 'roshera-rl/**'
+            - 'roshera-mcp/src/gates.ts'
+
+    - name: Setup Node.js
+      if: steps.filter.outputs.rl == 'true'
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+        cache: 'npm'
+        cache-dependency-path: roshera-rl/package-lock.json
+
+    - name: Install dependencies
+      if: steps.filter.outputs.rl == 'true'
+      run: npm ci
+      working-directory: ./roshera-rl
+
+    - name: Run the RL harness suites
+      if: steps.filter.outputs.rl == 'true'
+      run: npm test
+      working-directory: ./roshera-rl
+
   mcp-quality:
     # The jig ratchet (MCP scale architecture, Slice 5). Grades the agent tool
     # surface the way the fmt gate grades formatting: the minimal default surface
