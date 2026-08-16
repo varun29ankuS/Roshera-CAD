@@ -156,10 +156,23 @@ pub fn section_view(
     ));
     let centerlines = section_centerlines(model, solid_id, plane_origin, n, u, v);
 
-    // The view's DECLARED extent additionally folds in the outline/
-    // centerline geometry just added, so nothing the caller places on the
-    // sheet is silently clipped out of the view's own reported bounds (the
-    // hatch sweep above already ran against the tighter tris2d-only range).
+    // The view's DECLARED extent additionally folds in the back-of-plane
+    // OUTLINE just added, so nothing the caller places on the sheet is
+    // silently clipped out of the view's own reported bounds (the hatch
+    // sweep above already ran against the tighter tris2d-only range).
+    //
+    // Deliberately NOT folding in `centerlines`: a chain-line's endpoints
+    // are `extend_segment`'s ISO-128 OVERSHOOT past the feature it marks —
+    // annotation, not physical cross-section geometry. This view's extent
+    // is a measurement of the cut ("the section spans 60×12"), read by
+    // `ring_plate_section_shows_bore_voids` and by the layout solver; a
+    // section through a feature whose axis runs parallel to `v` (as every
+    // bore here does) would otherwise report itself several mm taller than
+    // the material actually is, purely because of a drafting-convention
+    // annotation extending past it. Confirmed empirically on the ring-plate
+    // fixture: folding centerlines in reported 12mm of true thickness as
+    // 17.4mm (0 − 2.7 to 12 + 2.7, exactly `extend_segment`'s
+    // `len·0.1 + 1.5` overshoot at each end of a 12mm span).
     let (mut ext_min_x, mut ext_min_y, mut ext_max_x, mut ext_max_y) = (min_x, min_y, max_x, max_y);
     for pl in &polylines {
         for p in &pl.points {
@@ -167,14 +180,6 @@ pub fn section_view(
             ext_min_y = ext_min_y.min(p[1]);
             ext_max_x = ext_max_x.max(p[0]);
             ext_max_y = ext_max_y.max(p[1]);
-        }
-    }
-    for cl in &centerlines {
-        for seg in &cl.segments {
-            ext_min_x = ext_min_x.min(seg[0]).min(seg[2]);
-            ext_min_y = ext_min_y.min(seg[1]).min(seg[3]);
-            ext_max_x = ext_max_x.max(seg[0]).max(seg[2]);
-            ext_max_y = ext_max_y.max(seg[1]).max(seg[3]);
         }
     }
 
