@@ -1119,6 +1119,100 @@ pub fn intersection_curve_to_nurbs(
     fit_nurbs_curve_through_points(&curve.points, &chord_lengths, degree)
 }
 
+/// Calibrated bound on [`intersection_curve_to_nurbs_checked`]'s measured
+/// deviation, as a multiple of the caller's requested distance tolerance.
+///
+/// [`intersection_curve_to_nurbs`] does not solve a true interpolation
+/// system — it seeds a clamped B-spline's CONTROL POINTS directly with the
+/// marched samples, which pins the curve exactly at the first and last
+/// sample but only approximately at the interior ones. Measured on this
+/// crate's own dense marched fixtures (sagitta-adaptive stepper, so chords
+/// are already tolerance-scaled): sphere-sphere overlap measured
+/// 1.93× the requested tolerance at 2066 points, orthogonal cylinders
+/// 1.88× at 3721 points. Both cluster tightly, so the residual is a
+/// property of using raw samples as control points, not of either fixture's
+/// curvature. `3.0` sits with real headroom above both measurements — a
+/// densely-marched, well-behaved curve passes; a curve decimated to a
+/// fraction of its samples (this module's own red case) measures far
+/// beyond it and correctly refuses.
+const MAX_FIT_DEVIATION_FACTOR: f64 = 3.0;
+
+/// [`intersection_curve_to_nurbs`], but MEASURES how far the fitted curve
+/// deviates from the true surface-surface intersection it approximates and
+/// refuses — [`MathError::ToleranceExceeded`], naming both numbers — when
+/// that deviation exceeds the caller's tolerance by more than
+/// [`MAX_FIT_DEVIATION_FACTOR`].
+///
+/// The traced sample points lie on the true intersection within the
+/// marching tolerance; the fitted curve is only PINNED at those samples
+/// (see [`MAX_FIT_DEVIATION_FACTOR`] for why even that is approximate) and
+/// makes no promise about hugging the true curve BETWEEN them. This
+/// evaluates the fit at the midpoint of every consecutive sample pair (the
+/// point on the fit furthest, by construction, from an anchor) and measures
+/// its distance to both `surface1` and `surface2` via closest-point
+/// projection, seeded from that sample's own recorded `(u, v)` — not the
+/// domain midpoint, which `find_closest_point_on_surface`'s own docs warn
+/// converges to the wrong minimum on periodic/unbounded domains and would
+/// overstate the deviation into a false refusal. A point genuinely on the
+/// true intersection lies on both surfaces at once, so the achieved
+/// deviation is the larger of the two per-checkpoint distances, maximized
+/// over every checkpoint — always a magnitude (a distance is never
+/// negative), not a signed requested-minus-measured comparison; there is no
+/// meaningful single "direction" for two independent per-surface distances
+/// the way `queries::fidelity`'s single-quantity comparisons have one.
+///
+/// Follows the same discipline `queries::fidelity` establishes elsewhere in
+/// this kernel: requested vs measured, and NOTHING measured is never
+/// reported as a pass — a curve with fewer than two samples (nothing lies
+/// BETWEEN them to check) is refused by the underlying
+/// [`intersection_curve_to_nurbs`] call before any measurement is attempted,
+/// never silently accepted with an invented zero deviation.
+pub fn intersection_curve_to_nurbs_checked(
+    curve: &IntersectionCurve,
+    degree: usize,
+    surface1: &dyn Surface,
+    surface2: &dyn Surface,
+    tolerance: &Tolerance,
+) -> MathResult<NurbsCurve> {
+    let fitted = intersection_curve_to_nurbs(curve, degree)?;
+
+    let n = curve.points.len();
+    let mut chord = vec![0.0_f64; n];
+    let mut total = 0.0;
+    for i in 1..n {
+        total += (curve.points[i] - curve.points[i - 1]).magnitude();
+        chord[i] = total;
+    }
+    if total > 0.0 {
+        for c in &mut chord {
+            *c /= total;
+        }
+    }
+
+    let mut achieved: f64 = 0.0;
+    for i in 0..n.saturating_sub(1) {
+        let t_mid = 0.5 * (chord[i] + chord[i + 1]);
+        let p = fitted.evaluate(t_mid).point;
+        let c1 =
+            find_closest_point_on_surface_from(surface1, &p, Some(curve.params1[i]), tolerance)?;
+        let c2 =
+            find_closest_point_on_surface_from(surface2, &p, Some(curve.params2[i]), tolerance)?;
+        let d1 = (c1.position - p).magnitude();
+        let d2 = (c2.position - p).magnitude();
+        achieved = achieved.max(d1.max(d2));
+    }
+
+    let allowed = tolerance.distance() * MAX_FIT_DEVIATION_FACTOR;
+    if achieved > allowed {
+        return Err(MathError::ToleranceExceeded {
+            requested: tolerance.distance(),
+            achieved,
+        });
+    }
+
+    Ok(fitted)
+}
+
 /// Fit a NURBS curve that passes (approximately) through the given points
 /// at the given parameter values, using averaging for interior knots.
 fn fit_nurbs_curve_through_points(
@@ -1372,5 +1466,96 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ===== Fix 3 (exact-curves brief): the NURBS fit states its own error =====
+
+    #[test]
+    fn checked_fit_of_a_densely_marched_curve_meets_tolerance() {
+        // Sphere-sphere overlap: the marcher's canonical "no analytic
+        // specialization" fixture, densely sampled by the sagitta-adaptive
+        // stepper. A healthy fit through dense samples must MEASURE within
+        // the calibrated bound and succeed — Fix 3 must not make every
+        // marched fit refuse, only genuinely bad ones.
+        let s1 = Sphere::new(Point3::ORIGIN, 1.0).expect("s1");
+        let s2 = Sphere::new(Point3::new(1.0, 0.0, 0.0), 1.0).expect("s2");
+        let t = tol();
+        let curves = intersect_surfaces(&s1, &s2, &t).expect("ssi");
+        let c = curves
+            .iter()
+            .find(|c| c.points.len() >= 4)
+            .expect("a curve with >= 4 points");
+        let fitted = intersection_curve_to_nurbs_checked(c, 3, &s1, &s2, &t)
+            .expect("a densely-marched fit must meet the calibrated bound");
+        // Sanity: still the same interpolant `intersection_curve_to_nurbs`
+        // would have produced (Fix 3 measures, it does not change the fit).
+        assert_eq!(fitted.control_points.len(), c.points.len());
+    }
+
+    #[test]
+    fn checked_fit_of_a_decimated_curve_refuses_naming_the_deviation() {
+        // Keep only every 8th sample of a genuine marched curve — the
+        // resulting curve is still a valid `IntersectionCurve` (its own
+        // points still lie on both spheres), but interpolating a cubic
+        // through 8x-sparser anchors bulges well off the true sphere-sphere
+        // circle BETWEEN them. This is the case Fix 3 exists to catch: a fit
+        // that looks exactly like a healthy one (same struct, same "always
+        // succeeds" prior behavior) and is not.
+        let s1 = Sphere::new(Point3::ORIGIN, 1.0).expect("s1");
+        let s2 = Sphere::new(Point3::new(1.0, 0.0, 0.0), 1.0).expect("s2");
+        let t = tol();
+        let curves = intersect_surfaces(&s1, &s2, &t).expect("ssi");
+        let dense = curves
+            .iter()
+            .find(|c| c.points.len() >= 64)
+            .expect("a curve with plenty of points to decimate");
+        let sparse = IntersectionCurve {
+            points: dense.points.iter().step_by(8).copied().collect(),
+            params1: dense.params1.iter().step_by(8).copied().collect(),
+            params2: dense.params2.iter().step_by(8).copied().collect(),
+            tangents: dense.tangents.iter().step_by(8).copied().collect(),
+            is_closed: dense.is_closed,
+        };
+        assert!(sparse.points.len() >= 4, "decimation left too few points");
+
+        let result = intersection_curve_to_nurbs_checked(&sparse, 3, &s1, &s2, &t);
+        match result {
+            Err(MathError::ToleranceExceeded {
+                requested,
+                achieved,
+            }) => {
+                assert!((requested - t.distance()).abs() < 1e-15);
+                assert!(
+                    achieved > requested,
+                    "a refusal must name a deviation that actually exceeds what was requested \
+                     (achieved={achieved:e}, requested={requested:e})"
+                );
+            }
+            other => panic!(
+                "expected a typed ToleranceExceeded refusal naming the achieved deviation, got: \
+                 {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn checked_fit_omits_measurement_rather_than_reports_green_when_too_few_points() {
+        // Fewer than 2 samples: there is nothing BETWEEN samples to check, so
+        // the deviation measurement has nothing to measure. This must not be
+        // silently reported as "0 deviation, passes" — the underlying
+        // `intersection_curve_to_nurbs` already refuses below degree+1
+        // points, so the checked variant inherits that honest refusal
+        // rather than inventing a green verdict over an unmeasured curve.
+        let s1 = Sphere::new(Point3::ORIGIN, 1.0).expect("s1");
+        let s2 = Sphere::new(Point3::new(1.0, 0.0, 0.0), 1.0).expect("s2");
+        let t = tol();
+        let too_few = IntersectionCurve {
+            points: vec![Point3::new(0.5, 0.0, 1.0), Point3::new(0.5, 0.5, 0.866)],
+            params1: vec![(0.0, 0.0); 2],
+            params2: vec![(0.0, 0.0); 2],
+            tangents: vec![Vector3::Z; 2],
+            is_closed: false,
+        };
+        assert!(intersection_curve_to_nurbs_checked(&too_few, 3, &s1, &s2, &t).is_err());
     }
 }

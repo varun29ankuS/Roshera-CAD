@@ -298,6 +298,36 @@ pub(crate) fn view_geometry_rect(view: &ProjectedView, sheet_h: f64) -> Option<R
             any = true;
         }
     }
+    // Analytic circles/ellipses (Fix 2,
+    // `.superpowers/sdd/2026-08-16-exact-curves/brief.md`) carry geometry
+    // that used to live in `polylines` before a rim was recognised as an
+    // exact conic — this rect must still cover it. Missing it here starves
+    // every consumer of this "canonical" rect: the isometric cell's shaded
+    // raster is placed and SCALED from it (`svg::view_geometry_rect` inflated
+    // by `1/RASTER_FILL_FACTOR`), so a view whose only large features are
+    // circles/ellipses (a bore, a bolt circle, viewed obliquely) rendered a
+    // raster far smaller than the true part while the analytic ellipse — laid
+    // out independently, correctly, at true size — read as oversized against
+    // it. Same principle for `view.circles`, which predates Fix 2: a view
+    // with a raster AND a dominant true circle had this exact latent gap
+    // already, just never visible because no such view existed before the
+    // isometric started carrying analytic conics.
+    for c in view.circles.iter().chain(view.hidden_circles.iter()) {
+        fold([c.cx - c.r, c.cy - c.r]);
+        fold([c.cx + c.r, c.cy + c.r]);
+        any = true;
+    }
+    for e in view.ellipses.iter().chain(view.hidden_ellipses.iter()) {
+        // Axis-aligned bounding box of a rotated ellipse: for
+        // p(t) = rotate(rx cos t, ry sin t, by rotation), the extremal x/y
+        // are the amplitudes of the resulting A cos t + B sin t combinations.
+        let (sin_r, cos_r) = e.rotation.sin_cos();
+        let half_w = ((e.rx * cos_r).powi(2) + (e.ry * sin_r).powi(2)).sqrt();
+        let half_h = ((e.rx * sin_r).powi(2) + (e.ry * cos_r).powi(2)).sqrt();
+        fold([e.cx - half_w, e.cy - half_h]);
+        fold([e.cx + half_w, e.cy + half_h]);
+        any = true;
+    }
     if !any && !view.extent.is_empty() {
         fold([view.extent.min_x, view.extent.min_y]);
         fold([view.extent.max_x, view.extent.max_y]);
@@ -1837,10 +1867,104 @@ mod tests {
             hidden_polylines: Vec::new(),
             circles: Vec::new(),
             hidden_circles: Vec::new(),
+            ellipses: Vec::new(),
+            hidden_ellipses: Vec::new(),
             shaded_raster: None,
             hatch_polylines: Vec::new(),
             polyline_sources: Vec::new(),
         }
+    }
+
+    /// RED for the isometric-ellipse-oversized-vs-raster regression: a view
+    /// whose large features are analytic circles/ellipses (not polylines) —
+    /// exactly what an obliquely-viewed rim becomes under Fix 2 — must still
+    /// produce a geometry rect that covers them. Before this fix,
+    /// `view_geometry_rect` folded only `polylines`/`hidden_polylines`, so a
+    /// view with a small polyline outline but a much larger circle/ellipse
+    /// reported a rect sized to the SMALL polyline only — which is exactly
+    /// the rect the isometric cell's shaded raster is placed and scaled
+    /// from, so the raster rendered far smaller than the true part while the
+    /// analytic conic (laid out independently, at true size) read as
+    /// oversized against it.
+    #[test]
+    fn geometry_rect_covers_circles_and_ellipses_not_just_polylines() {
+        use crate::drawing::types::{ProjectedCircle, ProjectedEllipse};
+
+        let mut view = simple_view("ISO", ProjectionType::Isometric, [0.0, 0.0]);
+        // A tiny polyline (far smaller than the circle/ellipse below) so the
+        // "no polylines at all" extent fallback does NOT mask the bug.
+        view.polylines = vec![Polyline2d::from_points(vec![[-1.0, -1.0], [1.0, 1.0]])];
+        view.circles = vec![ProjectedCircle {
+            cx: 0.0,
+            cy: 0.0,
+            r: 60.0,
+            face_ids: Vec::new(),
+        }];
+        view.ellipses = vec![ProjectedEllipse {
+            cx: 0.0,
+            cy: 0.0,
+            rx: 60.0,
+            ry: 34.641,
+            rotation: 0.0,
+            face_ids: Vec::new(),
+        }];
+
+        let sheet_h = 297.0;
+        let rect = view_geometry_rect(&view, sheet_h).expect("rect exists");
+        // Sheet-space y is flipped (`sheet_h - view_y`), so compare spans,
+        // not raw min/max, to stay independent of that convention.
+        let width = rect.x1 - rect.x0;
+        let height = rect.y1 - rect.y0;
+        assert!(
+            width >= 119.9,
+            "rect width {width} must cover the r=60 circle/ellipse (120 mm), not just the tiny \
+             polyline outline"
+        );
+        assert!(
+            height >= 119.9,
+            "rect height {height} must cover the r=60 circle's full diameter"
+        );
+    }
+
+    /// Same regression, through the rotated-ellipse bbox path specifically:
+    /// a 45°-rotated ellipse's axis-aligned extent is LARGER than either of
+    /// its own semi-axes (max over its own major/minor lengths only when
+    /// rotation is 0/90°) — verifies the closed-form bbox formula, not just
+    /// the axis-aligned case above.
+    #[test]
+    fn geometry_rect_covers_a_rotated_ellipse() {
+        use crate::drawing::types::ProjectedEllipse;
+
+        let mut view = simple_view("ISO", ProjectionType::Isometric, [0.0, 0.0]);
+        view.polylines = Vec::new();
+        view.ellipses = vec![ProjectedEllipse {
+            cx: 5.0,
+            cy: -3.0,
+            rx: 10.0,
+            ry: 4.0,
+            rotation: std::f64::consts::FRAC_PI_4,
+            face_ids: Vec::new(),
+        }];
+
+        let sheet_h = 297.0;
+        let rect = view_geometry_rect(&view, sheet_h).expect("rect exists");
+        let width = rect.x1 - rect.x0;
+        let height = rect.y1 - rect.y0;
+        // Closed form: half_w = sqrt((rx cosθ)^2 + (ry sinθ)^2), θ = 45°.
+        let expected_half =
+            ((10.0_f64 * 0.5_f64.sqrt()).powi(2) + (4.0 * 0.5_f64.sqrt()).powi(2)).sqrt();
+        assert!(
+            (width / 2.0 - expected_half).abs() < 1e-6,
+            "width/2={} expected {}",
+            width / 2.0,
+            expected_half
+        );
+        assert!(
+            (height / 2.0 - expected_half).abs() < 1e-6,
+            "height/2={} expected {} (square bbox at 45deg by symmetry here)",
+            height / 2.0,
+            expected_half
+        );
     }
 
     /// Two views stacked so naive top-left labels would land at the same y.

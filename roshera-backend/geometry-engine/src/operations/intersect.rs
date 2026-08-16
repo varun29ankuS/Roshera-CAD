@@ -1696,11 +1696,25 @@ fn intersect_plane_plane(
     }]))
 }
 
-/// General surface-surface intersection — delegates to the canonical math
-/// layer ([`crate::math::surface_intersection::intersect_surfaces`]) and
-/// wraps each traced polyline as a `Box<dyn Curve>` for the `IntersectionResult`.
+/// General surface-surface intersection.
 ///
-/// The working tolerance handed to the math layer is the per-face
+/// Fix 1 (`.superpowers/sdd/2026-08-16-exact-curves/brief.md`): tries the
+/// crate's canonical analytic SSI suite first —
+/// [`crate::operations::boolean::analytic_surface_intersection`], the SAME
+/// dispatch the boolean pipeline itself uses — so a cylinder cut by a plane
+/// reached through THIS function gets the same exact `Circle` a boolean
+/// operation would get, not a marched approximation. `operations::boolean`
+/// is a same-layer sibling module, so this is an ordinary intra-layer call.
+/// Only when the analytic suite reports no closed form (`Ok(None)`) does
+/// this fall back to the canonical marcher
+/// ([`crate::math::surface_intersection::intersect_surfaces`]) plus a
+/// deviation-checked NURBS fit (Fix 3,
+/// [`crate::math::surface_intersection::intersection_curve_to_nurbs_checked`]):
+/// the fit reports how far it actually deviates from the true intersection
+/// and refuses rather than silently returning an approximation that looks
+/// exact and is not.
+///
+/// The working tolerance handed to both paths is the per-face
 /// tolerance propagation: each face contributes its own surface-fit
 /// slack, and the operation's nominal `tolerance` acts as a snapping
 /// floor. This is the F1-α / F1-δ contract — without this, an edge
@@ -1715,7 +1729,7 @@ fn intersect_general_surfaces(
     tolerance: Tolerance,
 ) -> OperationResult<IntersectionResult> {
     use crate::math::surface_intersection::{
-        intersect_surfaces as math_intersect, intersection_curve_to_nurbs,
+        intersect_surfaces as math_intersect, intersection_curve_to_nurbs_checked,
     };
     use crate::primitives::curve::NurbsCurve as PrimNurbsCurve;
     use crate::primitives::tolerance_propagation::intersection_tolerance;
@@ -1723,6 +1737,36 @@ fn intersect_general_surfaces(
     let working_distance =
         intersection_tolerance(face1.tolerance, face2.tolerance, tolerance.distance());
     let working_tolerance = Tolerance::new(working_distance, tolerance.angle());
+
+    if let Some(curves) = crate::operations::boolean::analytic_surface_intersection(
+        surface1,
+        surface2,
+        &working_tolerance,
+    )
+    .map_err(|e| {
+        OperationError::NumericalError(format!(
+            "analytic surface-surface intersection failed: {:?}",
+            e
+        ))
+    })? {
+        let out: Vec<IntersectionCurve> = curves
+            .into_iter()
+            .map(|curve_3d| {
+                let range = curve_3d.parameter_range();
+                IntersectionCurve {
+                    curve_3d,
+                    param_curve1: None,
+                    param_curve2: None,
+                    t_range: (range.start, range.end),
+                }
+            })
+            .collect();
+        return if out.is_empty() {
+            Ok(IntersectionResult::None)
+        } else {
+            Ok(IntersectionResult::Curves(out))
+        };
+    }
 
     let raw = math_intersect(surface1, surface2, &working_tolerance).map_err(|e| {
         OperationError::NumericalError(format!("surface-surface intersection failed: {:?}", e))
@@ -1738,9 +1782,11 @@ fn intersect_general_surfaces(
         if curve.points.len() < 4 {
             continue;
         }
-        let math_nurbs = intersection_curve_to_nurbs(curve, 3).map_err(|e| {
-            OperationError::NumericalError(format!("intersection curve fit failed: {:?}", e))
-        })?;
+        let math_nurbs =
+            intersection_curve_to_nurbs_checked(curve, 3, surface1, surface2, &working_tolerance)
+                .map_err(|e| {
+                OperationError::NumericalError(format!("intersection curve fit failed: {:?}", e))
+            })?;
         let prim = PrimNurbsCurve::new(
             math_nurbs.degree,
             math_nurbs.control_points,
@@ -1771,6 +1817,53 @@ mod tests {
     use super::*;
     use crate::primitives::curve::ParameterRange;
     use crate::primitives::edge::EdgeOrientation;
+    use crate::primitives::face::{Face, FaceOrientation};
+    use crate::primitives::surface::{Cylinder, Sphere};
+
+    fn dummy_face() -> Face {
+        // Topology-free: `intersect_general_surfaces` only reads `.tolerance`
+        // off the face, never resolves `surface_id`/`outer_loop` through a
+        // model, so a face with placeholder ids exercises the real function
+        // without needing a full `BRepModel`.
+        Face::new(0, 0, 0, FaceOrientation::Forward)
+    }
+
+    // ===== Fix 1 (exact-curves brief): `intersect_general_surfaces` gets the
+    // analytic suite's exact curve, not a marched NURBS fit =====
+    #[test]
+    fn intersect_general_surfaces_coaxial_cylinder_sphere_yields_exact_circle() {
+        let cyl = Cylinder::new(Point3::ORIGIN, Vector3::Z, 2.0).expect("cyl");
+        let sphere = Sphere::new(Point3::ORIGIN, 3.0).expect("sphere");
+        let f1 = dummy_face();
+        let f2 = dummy_face();
+        let tol = Tolerance::default();
+
+        let result = intersect_general_surfaces(&cyl, &sphere, &f1, &f2, tol).expect("ok");
+        match result {
+            IntersectionResult::Curves(curves) => {
+                assert!(!curves.is_empty(), "coaxial cylinder/sphere must intersect");
+                let mut found_circle = false;
+                for c in &curves {
+                    if c.curve_3d
+                        .as_any()
+                        .downcast_ref::<crate::primitives::curve::Circle>()
+                        .is_some()
+                    {
+                        found_circle = true;
+                    }
+                    assert!(
+                        c.curve_3d
+                            .as_any()
+                            .downcast_ref::<crate::primitives::curve::NurbsCurve>()
+                            .is_none(),
+                        "an analytic pair must never be reported as a marched NURBS fit"
+                    );
+                }
+                assert!(found_circle, "expected at least one exact Circle curve");
+            }
+            other => panic!("expected Curves, got {:?}", other),
+        }
+    }
 
     fn unit_edge() -> Edge {
         Edge::new(0, 0, 0, 0, EdgeOrientation::Forward, ParameterRange::unit())

@@ -31,10 +31,10 @@
 
 use std::io::Cursor;
 
-use dxf::entities::{Entity, EntityCommon, EntityType, Line, LwPolyline, Text};
+use dxf::entities::{Circle, Ellipse, Entity, EntityCommon, EntityType, Line, LwPolyline, Text};
 use dxf::enums::HorizontalTextJustification;
 use dxf::tables::Layer;
-use dxf::{Color, Drawing as DxfDrawing, LwPolylineVertex, Point};
+use dxf::{Color, Drawing as DxfDrawing, LwPolylineVertex, Point, Vector};
 use thiserror::Error;
 
 use super::layout::{compute_layout, SheetItemKind};
@@ -142,6 +142,7 @@ pub fn render_drawing_dxf(drawing: &Drawing) -> Result<Vec<u8>, DxfRenderError> 
     let sheet_h = drawing.sheet_size.height();
     for (view, layer) in drawing.views.iter().zip(view_layers.iter()) {
         emit_view_polylines(&mut dxf, view, layer, sheet_h);
+        emit_view_circles(&mut dxf, view, layer);
     }
 
     // -- View labels + dimension text from the layout ------------------
@@ -299,6 +300,61 @@ fn emit_view_polylines(
         let mut common = EntityCommon::default();
         common.layer = layer.to_string();
         let mut ent = Entity::new(EntityType::LwPolyline(lw));
+        ent.common = common;
+        dxf.add_entity(ent);
+    }
+}
+
+/// Emit every VISIBLE analytic circle/ellipse in a view as a native DXF
+/// CIRCLE / ELLIPSE entity — Fix 2
+/// (`.superpowers/sdd/2026-08-16-exact-curves/brief.md`): a hole rim reaches
+/// a CAM/CNC post-processor as an actual circle or ellipse entity, not a
+/// polyline it has to re-fit. Same y-up, no-flip coordinate convention as
+/// [`emit_view_polylines`].
+///
+/// Scope: only `view.circles` / `view.ellipses` (visible). `hidden_circles`
+/// / `hidden_ellipses` are left unemitted — DXF here already drops
+/// `hidden_polylines` entirely (hidden-line removal has no DXF path at all
+/// today; see this function's absence from the pre-Fix-2 code), so leaving
+/// hidden analytic conics out too is consistent with that PRE-EXISTING gap,
+/// not a new one Fix 2 introduces. Fixing DXF hidden-line output altogether
+/// is out of this fix's scope.
+fn emit_view_circles(dxf: &mut DxfDrawing, view: &ProjectedView, layer: &str) {
+    let s = view.scale;
+    let tx = view.position_mm[0];
+    let ty = view.position_mm[1];
+
+    for c in &view.circles {
+        let circle = Circle {
+            center: Point::new(tx + s * c.cx, ty + s * c.cy, 0.0),
+            radius: s * c.r,
+            normal: Vector::z_axis(),
+            ..Circle::default()
+        };
+        let mut common = EntityCommon::default();
+        common.layer = layer.to_string();
+        let mut ent = Entity::new(EntityType::Circle(circle));
+        ent.common = common;
+        dxf.add_entity(ent);
+    }
+
+    for e in &view.ellipses {
+        let rx = s * e.rx;
+        let ry = s * e.ry;
+        if rx <= 0.0 {
+            continue;
+        }
+        let major_axis = Vector::new(rx * e.rotation.cos(), rx * e.rotation.sin(), 0.0);
+        let ellipse = Ellipse {
+            center: Point::new(tx + s * e.cx, ty + s * e.cy, 0.0),
+            major_axis,
+            normal: Vector::z_axis(),
+            minor_axis_ratio: ry / rx,
+            ..Ellipse::default()
+        };
+        let mut common = EntityCommon::default();
+        common.layer = layer.to_string();
+        let mut ent = Entity::new(EntityType::Ellipse(ellipse));
         ent.common = common;
         dxf.add_entity(ent);
     }
@@ -1065,6 +1121,8 @@ mod tests {
                 hidden_polylines: Vec::new(),
                 circles: Vec::new(),
                 hidden_circles: Vec::new(),
+                ellipses: Vec::new(),
+                hidden_ellipses: Vec::new(),
                 shaded_raster: None,
                 hatch_polylines: Vec::new(),
                 polyline_sources: Vec::new(),
@@ -1072,6 +1130,71 @@ mod tests {
         }
         let layers = assign_view_layers(&drawing.views);
         assert_eq!(layers, vec!["Detail", "Detail_2", "Detail_3"]);
+    }
+
+    /// Fix 2 (`.superpowers/sdd/2026-08-16-exact-curves/brief.md`): a view's
+    /// analytic circles/ellipses reach the DXF file as native CIRCLE/ELLIPSE
+    /// entities, not silently dropped the way `hidden_polylines` already is.
+    /// Before this fix, `render_drawing_dxf` never read `view.circles` /
+    /// `view.ellipses` at all — this is the RED case for that gap, not just
+    /// for the new ellipse field.
+    #[test]
+    fn analytic_circles_and_ellipses_emit_dxf_entities() {
+        use crate::drawing::types::{
+            Polyline2d, ProjectedCircle, ProjectedEllipse, ProjectedView, ProjectedViewId,
+            ProjectionType, ViewExtent, ViewSource,
+        };
+        let mut drawing = Drawing::new("Conics", SheetSize::A3);
+        drawing.views.push(ProjectedView {
+            id: ProjectedViewId::new(),
+            name: "FRONT".to_string(),
+            projection: ProjectionType::Front,
+            source: ViewSource::Part {
+                part_id: uuid::Uuid::nil(),
+                solid_id: 0,
+            },
+            position_mm: [50.0, 50.0],
+            scale: 1.0,
+            polylines: vec![Polyline2d::from_points(vec![[0.0, 0.0], [10.0, 10.0]])],
+            extent: ViewExtent::empty(),
+            dimensions: Vec::new(),
+            centerlines: Vec::new(),
+            hidden_polylines: Vec::new(),
+            circles: vec![ProjectedCircle {
+                cx: 5.0,
+                cy: 5.0,
+                r: 2.0,
+                face_ids: vec![7],
+            }],
+            hidden_circles: Vec::new(),
+            ellipses: vec![ProjectedEllipse {
+                cx: 3.0,
+                cy: 4.0,
+                rx: 2.0,
+                ry: 1.0,
+                rotation: 0.3,
+                face_ids: vec![9],
+            }],
+            hidden_ellipses: Vec::new(),
+            shaded_raster: None,
+            hatch_polylines: Vec::new(),
+            polyline_sources: Vec::new(),
+        });
+
+        let bytes = render_drawing_dxf(&drawing).expect("dxf render");
+        let text = String::from_utf8(bytes).expect("dxf is ascii/utf8 text");
+        let circle_entities =
+            text.matches("\r\nCIRCLE\r\n").count() + text.matches("\nCIRCLE\n").count();
+        let ellipse_entities =
+            text.matches("\r\nELLIPSE\r\n").count() + text.matches("\nELLIPSE\n").count();
+        assert!(
+            circle_entities > 0,
+            "expected at least one CIRCLE entity in the DXF output"
+        );
+        assert!(
+            ellipse_entities > 0,
+            "expected at least one ELLIPSE entity in the DXF output"
+        );
     }
 
     /// Every view label appears EXACTLY ONCE in the DXF TEXT entities, at the
@@ -1124,6 +1247,8 @@ mod tests {
                 hidden_polylines: Vec::new(),
                 circles: Vec::new(),
                 hidden_circles: Vec::new(),
+                ellipses: Vec::new(),
+                hidden_ellipses: Vec::new(),
                 shaded_raster: None,
                 hatch_polylines: Vec::new(),
                 polyline_sources: Vec::new(),
@@ -1260,6 +1385,8 @@ mod tests {
             hidden_polylines: Vec::new(),
             circles: Vec::new(),
             hidden_circles: Vec::new(),
+            ellipses: Vec::new(),
+            hidden_ellipses: Vec::new(),
             shaded_raster: None,
             hatch_polylines: Vec::new(),
             polyline_sources: Vec::new(),

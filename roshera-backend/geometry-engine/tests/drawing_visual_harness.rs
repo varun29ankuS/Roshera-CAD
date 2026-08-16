@@ -411,3 +411,200 @@ fn flange_labels_omit_the_redundant_unit_suffix() {
         "D4: hole-table Ø cells must also omit the suffix; found {suffixed_table:?}"
     );
 }
+
+// ── Invariant #5: an analytic conic agrees with the rest of its own view ───
+
+/// Find the FIRST `name="..."` attribute value at or after `from` in `s`,
+/// as an `f64`. Manual, dependency-free XML-attribute scraping (this crate
+/// has no `regex` dependency; `dxf.rs`'s own test module does the same kind
+/// of hand-rolled parsing for the same reason).
+fn attr_f64(s: &str, from: usize, name: &str) -> Option<f64> {
+    let needle = format!("{name}=\"");
+    let start = s[from..].find(&needle)? + from + needle.len();
+    let end = s[start..].find('"')? + start;
+    s[start..end].trim().parse().ok()
+}
+
+/// Sheet-space `(x0, y0, x1, y1)` of the isometric cell's shaded-raster
+/// `<image>` element, or `None` if this drawing has no isometric raster
+/// (e.g. the box fixture, which is small enough not to force one — this
+/// invariant only applies where a raster exists to compare against).
+fn iso_raster_rect(svg: &str) -> Option<(f64, f64, f64, f64)> {
+    let tag_start = svg.find("<image")?;
+    let tag_end = svg[tag_start..].find("/>")? + tag_start;
+    let tag = &svg[tag_start..tag_end];
+    if !tag.contains("data-projection=\"Isometric\"") {
+        return None;
+    }
+    let x = attr_f64(tag, 0, "x")?;
+    let y = attr_f64(tag, 0, "y")?;
+    let w = attr_f64(tag, 0, "width")?;
+    let h = attr_f64(tag, 0, "height")?;
+    Some((x, y, x + w, y + h))
+}
+
+/// Sheet-space axis-aligned bounding boxes of every `<ellipse>` in the
+/// isometric view's own `<g>` group — converted through THAT group's own
+/// `translate(tx ty) scale(sx neg)` transform (`svg::render_view`'s
+/// convention: `neg = -sx`), the SAME transform the rest of that view's
+/// geometry (polylines, circles) is drawn through.
+fn iso_ellipse_sheet_rects(svg: &str) -> Vec<(f64, f64, f64, f64)> {
+    let Some(g_start) = svg.find("<g class=\"view\"") else {
+        return Vec::new();
+    };
+    // Scope to the isometric view's own <g>...</g> block specifically —
+    // there are several `<g class="view">` blocks (one per view), so scan
+    // forward from the FIRST match to find the one tagged Isometric, then
+    // bound the block at its own closing `</g>`.
+    let mut search_from = g_start;
+    let (block, tx, ty, sx) = loop {
+        let start = svg[search_from..]
+            .find("<g class=\"view\"")
+            .map(|i| i + search_from);
+        let Some(start) = start else {
+            return Vec::new();
+        };
+        let header_end = svg[start..]
+            .find('>')
+            .map(|i| i + start + 1)
+            .unwrap_or(start);
+        let header = &svg[start..header_end];
+        let block_end = svg[header_end..]
+            .find("</g>")
+            .map(|i| i + header_end)
+            .unwrap_or(svg.len());
+        if header.contains("data-projection=\"Isometric\"") {
+            // transform="translate(tx ty) scale(sx neg)"
+            let Some(t_start) = header.find("translate(") else {
+                return Vec::new();
+            };
+            let t_start = t_start + "translate(".len();
+            let Some(t_end) = header[t_start..].find(')').map(|i| i + t_start) else {
+                return Vec::new();
+            };
+            let mut nums = header[t_start..t_end].split_whitespace();
+            let (Some(tx), Some(ty)) = (
+                nums.next().and_then(|v| v.parse::<f64>().ok()),
+                nums.next().and_then(|v| v.parse::<f64>().ok()),
+            ) else {
+                return Vec::new();
+            };
+            let Some(s_start) = header.find("scale(") else {
+                return Vec::new();
+            };
+            let s_start = s_start + "scale(".len();
+            let Some(sx) = header[s_start..]
+                .split_whitespace()
+                .next()
+                .and_then(|v| v.parse::<f64>().ok())
+            else {
+                return Vec::new();
+            };
+            break (&svg[header_end..block_end], tx, ty, sx);
+        }
+        search_from = block_end.max(start + 1);
+    };
+
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+    while let Some(rel) = block[pos..].find("<ellipse") {
+        let tag_start = pos + rel;
+        let Some(tag_end) = block[tag_start..].find("/>").map(|i| i + tag_start) else {
+            break;
+        };
+        let tag = &block[tag_start..tag_end];
+        pos = tag_end;
+        let (Some(cx), Some(cy), Some(rx), Some(ry)) = (
+            attr_f64(tag, 0, "cx"),
+            attr_f64(tag, 0, "cy"),
+            attr_f64(tag, 0, "rx"),
+            attr_f64(tag, 0, "ry"),
+        ) else {
+            continue;
+        };
+        // `transform="rotate(deg cx cy)"` — deg is the first number.
+        let rotation_deg = tag
+            .find("rotate(")
+            .and_then(|i| tag[i + "rotate(".len()..].split_whitespace().next())
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.0);
+        let rot = rotation_deg.to_radians();
+        let (sin_r, cos_r) = rot.sin_cos();
+        let half_w = ((rx * cos_r).powi(2) + (ry * sin_r).powi(2)).sqrt();
+        let half_h = ((rx * sin_r).powi(2) + (ry * cos_r).powi(2)).sqrt();
+        // Sheet-space, through the SAME group transform every other shape in
+        // this view is drawn through: x' = tx + sx*x, y' = ty - sx*y.
+        let sheet_cx = tx + sx * cx;
+        let sheet_cy = ty - sx * cy;
+        let sheet_half_w = sx.abs() * half_w;
+        let sheet_half_h = sx.abs() * half_h;
+        out.push((
+            sheet_cx - sheet_half_w,
+            sheet_cy - sheet_half_h,
+            sheet_cx + sheet_half_w,
+            sheet_cy + sheet_half_h,
+        ));
+    }
+    out
+}
+
+/// **The regression this invariant exists to catch**: Fix 2
+/// (`.superpowers/sdd/2026-08-16-exact-curves/brief.md`) made an obliquely-
+/// viewed circular rim an exact `<ellipse>` instead of a sampled polyline —
+/// correct on its own terms, computed straight from the view's own rotation
+/// matrix and verified against direct point-projection
+/// (`drawing::visibility::tests::diag_ellipse_matches_direct_sample_of_real_cylinder_rim_isometric`).
+/// But a SEPARATE, pre-existing rect (`layout::view_geometry_rect`, which
+/// places and SCALES the isometric cell's shaded raster) only folded
+/// `polylines`/`hidden_polylines` — never `circles`/`ellipses` — so once a
+/// rim's ink moved OUT of `polylines`, that rect silently shrank to
+/// whatever polylines remained, and the raster was placed and scaled from
+/// the shrunken rect while the ellipse (laid out independently, at its true
+/// size) was not. The result: an ellipse rendered visibly larger than, and
+/// not registered with, the shaded solid underneath it — caught by eye, not
+/// by any prior test, because no prior test compared a conic's OWN sheet-
+/// space extent against anything else drawn in the same view.
+///
+/// This compares the isometric cell's analytic ellipses (the flange's OD,
+/// bore, and bolt-hole rims, all obliquely viewed) against the shaded
+/// raster's own placed rect in FINAL SHEET-SPACE mm — the same space a human
+/// looking at the rendered sheet judges by eye. A margin equal to
+/// `1/RASTER_FILL_FACTOR − 1 ≈ 11%` of the raster's own size is allowed
+/// (the raster is deliberately placed slightly larger than the geometry
+/// rect it registers against, by construction — see `svg::render_view`'s
+/// raster-placement comment), plus a small absolute pad for rounding.
+#[test]
+fn iso_ellipses_stay_registered_with_the_shaded_raster() {
+    let (m, part) = flange();
+    let drawing = standard_drawing_auto(&m, part, uuid::Uuid::nil()).expect("sheet");
+    let svg = render_drawing_svg(&drawing);
+
+    let (rx0, ry0, rx1, ry1) =
+        iso_raster_rect(&svg).expect("flange isometric cell must have a shaded raster");
+    let raster_w = rx1 - rx0;
+    let raster_h = ry1 - ry0;
+    // 11% of the raster's own extent on EACH side (matches the raster's own
+    // deliberate 1/RASTER_FILL_FACTOR inflation), plus 1 mm absolute slack.
+    let margin_x = raster_w * (1.0 / geometry_engine::render::RASTER_FILL_FACTOR - 1.0) + 1.0;
+    let margin_y = raster_h * (1.0 / geometry_engine::render::RASTER_FILL_FACTOR - 1.0) + 1.0;
+
+    let ellipses = iso_ellipse_sheet_rects(&svg);
+    assert!(
+        !ellipses.is_empty(),
+        "the flange's obliquely-viewed rims must produce at least one isometric ellipse — \
+         otherwise this invariant is checking nothing"
+    );
+    for (ex0, ey0, ex1, ey1) in &ellipses {
+        assert!(
+            *ex0 >= rx0 - margin_x
+                && *ex1 <= rx1 + margin_x
+                && *ey0 >= ry0 - margin_y
+                && *ey1 <= ry1 + margin_y,
+            "an isometric ellipse [{ex0:.2},{ey0:.2}]..[{ex1:.2},{ey1:.2}] must lie within the \
+             shaded raster's own placed rect [{rx0:.2},{ry0:.2}]..[{rx1:.2},{ry1:.2}] \
+             (± {margin_x:.2} x, {margin_y:.2} y margin) — an ellipse extending well past the \
+             raster reads as oversized/misregistered against the shaded solid, exactly the \
+             regression this invariant guards"
+        );
+    }
+}

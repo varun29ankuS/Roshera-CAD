@@ -223,6 +223,25 @@ pub enum MathError {
 
     /// Operation not yet implemented
     NotImplemented(String),
+
+    /// A fitted approximation (e.g. a NURBS interpolant of marched
+    /// surface-surface intersection samples) was MEASURED to deviate from
+    /// the geometry it claims to represent by more than the caller's
+    /// requested tolerance. Distinct from [`MathError::ConvergenceFailure`]:
+    /// the fit itself succeeded (it interpolates every sample), but honest
+    /// measurement — evaluating the fit BETWEEN its anchor samples and
+    /// checking distance back to the true geometry — shows it is not what it
+    /// would look like if returned bare. Carries both numbers so the caller
+    /// can decide whether to retry denser, widen its own tolerance
+    /// deliberately, or refuse outright — the discipline `queries::fidelity`
+    /// already establishes elsewhere in this kernel: never return an
+    /// approximation silently relabelled as exact.
+    ToleranceExceeded {
+        /// The tolerance the caller requested (world units).
+        requested: f64,
+        /// The maximum deviation actually measured (world units).
+        achieved: f64,
+    },
 }
 
 impl std::fmt::Display for MathError {
@@ -261,6 +280,14 @@ impl std::fmt::Display for MathError {
             MathError::NotImplemented(msg) => {
                 write!(f, "Not implemented: {}", msg)
             }
+            MathError::ToleranceExceeded {
+                requested,
+                achieved,
+            } => write!(
+                f,
+                "fit deviates {:.6e} from the true geometry, exceeding the requested tolerance {:.6e}",
+                achieved, requested
+            ),
         }
     }
 }

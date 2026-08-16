@@ -1782,7 +1782,7 @@ impl std::fmt::Debug for SurfaceIntersectionCurve {
 ///
 /// Uses specialized algorithms based on surface type pairs for maximum efficiency:
 /// - Plane-Plane: Analytical line intersection
-/// - Plane-Cylinder: Analytical circle/ellipse intersection  
+/// - Plane-Cylinder: Analytical circle/ellipse intersection
 /// - Cylinder-Cylinder: Analytical quartic solving
 /// - General case: Robust marching algorithm with adaptive step size
 fn surface_surface_intersection(
@@ -1790,6 +1790,35 @@ fn surface_surface_intersection(
     surface_b: &dyn Surface,
     tolerance: &Tolerance,
 ) -> OperationResult<Vec<SurfaceIntersectionCurve>> {
+    match analytic_surface_intersection_curves(surface_a, surface_b, tolerance)? {
+        Some(curves) => Ok(curves),
+        // No closed-form handler covers this pair (e.g. NURBS×NURBS,
+        // NURBS×Cylinder). Marching solver is the last resort.
+        None => march_surface_intersection(surface_a, surface_b, tolerance),
+    }
+}
+
+/// The closed-form half of [`surface_surface_intersection`]: every pair this
+/// crate has an analytic solution for, and `None` for the pairs that do not
+/// (the caller marches those). Factored out so this ONE match is the single
+/// source of truth for "does an exact curve exist for this pair" — every
+/// crate-internal consumer that needs an exact curve when one exists, not
+/// just the boolean pipeline, calls [`analytic_surface_intersection`] (the
+/// thin `Box<dyn Curve>`-only wrapper below) instead of re-deriving its own
+/// notion of which pairs are analytic. See
+/// `.superpowers/sdd/2026-08-16-exact-curves/brief.md` Fix 1: this crate
+/// used to have `math::surface_intersection::intersect_surfaces` (marching,
+/// no closed forms beyond plane∘plane) as a second, independently-consulted
+/// answer for the very same question this match already settles — the
+/// two-implementations defect the brief closes. `math::surface_intersection`
+/// remains the marching PRIMITIVE (still used by [`march_surface_intersection`]
+/// below and validated directly by its own hardening tests); it is no longer
+/// consulted as a first answer by anything that could ask this match instead.
+fn analytic_surface_intersection_curves(
+    surface_a: &dyn Surface,
+    surface_b: &dyn Surface,
+    tolerance: &Tolerance,
+) -> OperationResult<Option<Vec<SurfaceIntersectionCurve>>> {
     // Dispatch by analytical role, NOT surface_type alone. A RuledSurface
     // built for an extrusion side wall reports surface_type=RuledSurface
     // but is geometrically planar — and a Plane-vs-planar-RuledSurface
@@ -1802,24 +1831,28 @@ fn surface_surface_intersection(
     let kind_b = analytical_surface_kind(surface_b, tolerance);
     use AnalyticalSurfaceKind::*;
     match (kind_a, kind_b) {
-        (Planar, Planar) => plane_plane_intersection(surface_a, surface_b, tolerance),
+        (Planar, Planar) => plane_plane_intersection(surface_a, surface_b, tolerance).map(Some),
         (Planar, Cylinder) | (Cylinder, Planar) => {
-            plane_cylinder_intersection(surface_a, surface_b, tolerance)
+            plane_cylinder_intersection(surface_a, surface_b, tolerance).map(Some)
         }
-        (Cylinder, Cylinder) => cylinder_cylinder_intersection(surface_a, surface_b, tolerance),
+        (Cylinder, Cylinder) => {
+            cylinder_cylinder_intersection(surface_a, surface_b, tolerance).map(Some)
+        }
         (Planar, Sphere) | (Sphere, Planar) => {
-            plane_sphere_intersection(surface_a, surface_b, tolerance)
+            plane_sphere_intersection(surface_a, surface_b, tolerance).map(Some)
         }
-        (Sphere, Sphere) => sphere_sphere_intersection(surface_a, surface_b, tolerance),
+        (Sphere, Sphere) => sphere_sphere_intersection(surface_a, surface_b, tolerance).map(Some),
         (Cylinder, Sphere) | (Sphere, Cylinder) => {
-            cylinder_sphere_intersection(surface_a, surface_b, tolerance)
+            cylinder_sphere_intersection(surface_a, surface_b, tolerance).map(Some)
         }
-        (Planar, Cone) | (Cone, Planar) => plane_cone_intersection(surface_a, surface_b, tolerance),
+        (Planar, Cone) | (Cone, Planar) => {
+            plane_cone_intersection(surface_a, surface_b, tolerance).map(Some)
+        }
         (Cone, Cylinder) | (Cylinder, Cone) => {
-            cone_cylinder_intersection(surface_a, surface_b, tolerance)
+            cone_cylinder_intersection(surface_a, surface_b, tolerance).map(Some)
         }
         (Cone, Sphere) | (Sphere, Cone) => {
-            cone_sphere_intersection(surface_a, surface_b, tolerance)
+            cone_sphere_intersection(surface_a, surface_b, tolerance).map(Some)
         }
         // A PLANE cutting a general (NURBS / freeform) surface — the F1
         // cockpit-cut case. The intersection is the zero-set of the scalar
@@ -1831,7 +1864,7 @@ fn surface_surface_intersection(
         // leaving the freeform face un-split and the boolean rejecting the
         // result. Routing the plane case here is the fix for #17.
         (Planar, Other) | (Other, Planar) => {
-            plane_general_intersection(surface_a, surface_b, tolerance)
+            plane_general_intersection(surface_a, surface_b, tolerance).map(Some)
         }
         _ => {
             use crate::primitives::surface::SurfaceType;
@@ -1839,13 +1872,52 @@ fn surface_surface_intersection(
                 (surface_a.surface_type(), surface_b.surface_type()),
                 (SurfaceType::Plane, SurfaceType::Torus) | (SurfaceType::Torus, SurfaceType::Plane)
             ) {
-                return plane_torus_intersection(surface_a, surface_b, tolerance);
+                return plane_torus_intersection(surface_a, surface_b, tolerance).map(Some);
             }
-            // No closed-form handler covers this pair (e.g. NURBS×NURBS,
-            // NURBS×Cylinder). Marching solver is the last resort.
-            march_surface_intersection(surface_a, surface_b, tolerance)
+            Ok(None)
         }
     }
+}
+
+/// Crate-wide entry point for "give me the exact curve(s) this pair of
+/// surfaces intersects in, if a closed form exists" — the single source of
+/// truth every surface-surface consumer that wants exactness should call
+/// FIRST, falling back to its own marching + curve-fit only on `Ok(None)`.
+///
+/// Thin: delegates to [`analytic_surface_intersection_curves`] (this
+/// module's boolean-pipeline dispatcher) and discards the boolean-specific
+/// `SurfaceIntersectionCurve` wrapper fields (`on_surface_a`/`on_surface_b`
+/// parametric images, saddle `crossings`) that only the boolean face-split
+/// pipeline consumes, keeping just the 3D curve.
+///
+/// Layering note: this lives in `operations::boolean` rather than `math::`
+/// because the full analytic suite (~2500 lines: the quartic cylinder∘cylinder
+/// solver, the general-position cylinder∘sphere QSIC, the torus quartic, the
+/// saddle-crossing bookkeeping) is deeply interleaved with boolean-pipeline
+/// helpers, and a mechanical relocation carries real regression risk for a
+/// crate-cornerstone module with no matching payoff — `math::` cannot safely
+/// re-delegate to boolean's OWN marching fallback without calling back into
+/// itself (see [`march_surface_intersection`]'s doc comment), so the analytic
+/// dispatch has to stay where its fallback already lives. `operations::intersect`
+/// calling this is an ordinary same-layer sibling call. `primitives::surface`
+/// calling this (its `dispatch_via_math_ssi` fallback) reaches from a lower
+/// layer into a higher one — a real, acknowledged layering wart — but it is
+/// the ONLY way to give that trait method's fallback branch an exact answer
+/// without duplicating ~2500 lines of analytic geometry a second time, and a
+/// crate-wide grep confirms zero production callers reach that trait method
+/// today (`Surface::intersect()` has none outside test code), so the wart is
+/// structural, not a live behavioral risk. See Fix 1 in
+/// `.superpowers/sdd/2026-08-16-exact-curves/brief.md` for the full
+/// assessment of why a full lift into `math::` was rejected.
+pub(crate) fn analytic_surface_intersection(
+    surface_a: &dyn Surface,
+    surface_b: &dyn Surface,
+    tolerance: &Tolerance,
+) -> OperationResult<Option<Vec<Box<dyn Curve>>>> {
+    Ok(
+        analytic_surface_intersection_curves(surface_a, surface_b, tolerance)?
+            .map(|curves| curves.into_iter().map(|c| c.curve).collect()),
+    )
 }
 
 /// Analytical role of a surface for boolean-intersection dispatch.

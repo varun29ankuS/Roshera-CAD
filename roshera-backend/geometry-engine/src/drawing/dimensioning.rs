@@ -633,6 +633,45 @@ fn select_circles(
     out
 }
 
+/// As [`select_circles`], for [`super::types::ProjectedEllipse`] (Fix 2): a
+/// revolved part's ISO view stacks concentric ellipses the same way its TOP
+/// view stacks concentric circles, so the same de-clutter applies — grouped
+/// by projected centre, capped to the 3 largest + 2 smallest by semi-major
+/// axis (the ellipse's analogue of radius).
+fn select_ellipses(
+    ellipses: Vec<super::types::ProjectedEllipse>,
+) -> Vec<super::types::ProjectedEllipse> {
+    use std::collections::{HashMap, HashSet};
+    let q = |v: f64| (v * 10.0).round() as i64;
+    let mut seen: HashSet<(i64, i64, i64, i64)> = HashSet::new();
+    let mut groups: HashMap<(i64, i64), Vec<super::types::ProjectedEllipse>> = HashMap::new();
+    for e in ellipses {
+        let key = (q(e.cx), q(e.cy), q(e.rx), q(e.ry));
+        if seen.insert(key) {
+            groups.entry((key.0, key.1)).or_default().push(e);
+        } else if let Some(g) = groups.get_mut(&(key.0, key.1)) {
+            if let Some(kept) = g.iter_mut().find(|k| q(k.rx) == key.2 && q(k.ry) == key.3) {
+                for f in &e.face_ids {
+                    if !kept.face_ids.contains(f) {
+                        kept.face_ids.push(*f);
+                    }
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for (_, mut g) in groups {
+        if g.len() > 5 {
+            g.sort_by(|a, b| b.rx.partial_cmp(&a.rx).unwrap_or(std::cmp::Ordering::Equal));
+            out.extend(g.iter().take(3).cloned());
+            out.extend(g.iter().rev().take(2).cloned());
+        } else {
+            out.extend(g);
+        }
+    }
+    out
+}
+
 /// Build one HLR view: wireframe (for extent + placement), edges split
 /// into visible / hidden by the raytrace eye, plus auto dimensions and
 /// centerlines. Shared by [`standard_drawing_hlr`] and
@@ -681,12 +720,18 @@ fn build_hlr_view(
         all_circles.extend(edges.hidden_circles);
         view.circles = select_circles(all_circles);
         view.hidden_circles = Vec::new();
+        let mut all_ellipses = edges.ellipses;
+        all_ellipses.extend(edges.hidden_ellipses);
+        view.ellipses = select_ellipses(all_ellipses);
+        view.hidden_ellipses = Vec::new();
     } else {
         view.polylines = edges.visible;
         view.polyline_sources = edges.visible_sources;
         view.hidden_polylines = edges.hidden;
         view.circles = select_circles(edges.circles);
         view.hidden_circles = select_circles(edges.hidden_circles);
+        view.ellipses = select_ellipses(edges.ellipses);
+        view.hidden_ellipses = select_ellipses(edges.hidden_ellipses);
     }
     view.dimensions = visible_dimensions(model, solid_id, proj, min_span);
     view.centerlines = super::centerlines::centerlines(model, solid_id, proj);

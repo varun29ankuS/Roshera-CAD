@@ -215,7 +215,16 @@ pub fn verify_drawing(drawing: &Drawing) -> DrawingQualityReport {
     for (idx, v) in drawing.views.iter().enumerate() {
         let name = v.name.clone();
 
-        if v.polylines.is_empty() && v.hidden_polylines.is_empty() {
+        // A view whose only content is analytic circles/ellipses (Fix 2 can
+        // move a rim's ink out of `polylines` entirely) is not empty — check
+        // every shape class the projector can populate, not just polylines.
+        if v.polylines.is_empty()
+            && v.hidden_polylines.is_empty()
+            && v.circles.is_empty()
+            && v.hidden_circles.is_empty()
+            && v.ellipses.is_empty()
+            && v.hidden_ellipses.is_empty()
+        {
             issues.push(warning(
                 DrawingIssueKind::EmptyView,
                 format!("view '{name}' projected to no edges"),
@@ -1558,6 +1567,8 @@ mod harness_invariant_tests {
             hidden_polylines: Vec::new(),
             circles: Vec::new(),
             hidden_circles: Vec::new(),
+            ellipses: Vec::new(),
+            hidden_ellipses: Vec::new(),
             shaded_raster: None,
             hatch_polylines: hatch,
             polyline_sources: Vec::new(),

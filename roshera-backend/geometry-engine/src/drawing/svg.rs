@@ -192,6 +192,12 @@ fn write_stylesheet(out: &mut String) {
         "    .view circle.hidden { fill: none; stroke: #111; stroke-width: 0.25; \
          stroke-dasharray: 4 2; }\n",
     );
+    // Analytic ellipses (Fix 2) — oblique circles, same weighting.
+    out.push_str("    .view ellipse { fill: none; stroke: #111; stroke-width: 0.50; }\n");
+    out.push_str(
+        "    .view ellipse.hidden { fill: none; stroke: #111; stroke-width: 0.25; \
+         stroke-dasharray: 4 2; }\n",
+    );
     // Centerline — ISO 128 chain line (long-short-long), 0.18 mm thin tier.
     // Dash pattern: 8 mm dash, 1 mm gap, 1 mm dot, 1 mm gap (long-short-long).
     out.push_str(
@@ -457,6 +463,30 @@ fn render_view(out: &mut String, view: &ProjectedView, sheet_height_mm: f64) {
             out,
             "    <circle class=\"hidden\" cx=\"{:.4}\" cy=\"{:.4}\" r=\"{:.4}\" />\n",
             c.cx, c.cy, c.r
+        );
+    }
+
+    // Analytic ellipses (Fix 2) — a circular edge viewed OBLIQUELY, the
+    // general case of the true circle above. `rotation` is in the SAME
+    // view-space frame `cx`/`cy` live in (pre-scale, pre-flip), so rotating
+    // about `(cx, cy)` INSIDE this group composes correctly with the group's
+    // own outer `translate·scale` transform regardless of its Y-flip.
+    for e in &view.ellipses {
+        let deg = e.rotation.to_degrees();
+        let _ = write!(
+            out,
+            "    <ellipse cx=\"{:.4}\" cy=\"{:.4}\" rx=\"{:.4}\" ry=\"{:.4}\" \
+             transform=\"rotate({:.4} {:.4} {:.4})\" />\n",
+            e.cx, e.cy, e.rx, e.ry, deg, e.cx, e.cy
+        );
+    }
+    for e in &view.hidden_ellipses {
+        let deg = e.rotation.to_degrees();
+        let _ = write!(
+            out,
+            "    <ellipse class=\"hidden\" cx=\"{:.4}\" cy=\"{:.4}\" rx=\"{:.4}\" ry=\"{:.4}\" \
+             transform=\"rotate({:.4} {:.4} {:.4})\" />\n",
+            e.cx, e.cy, e.rx, e.ry, deg, e.cx, e.cy
         );
     }
 

@@ -406,13 +406,18 @@ fn face_bounds(model: &BRepModel, face_id: FaceId, vm: &Matrix4) -> Option<FaceB
 /// The edges of a view split by visibility. `visible` draws solid; `hidden`
 /// draws dashed. Closed circular edges that project to a TRUE circle are split
 /// out as analytic `circles` / `hidden_circles` (rendered as exact SVG
-/// circles, not faceted polylines).
+/// circles, not faceted polylines); circular edges viewed OBLIQUELY are split
+/// out as `ellipses` / `hidden_ellipses` (Fix 2,
+/// `.superpowers/sdd/2026-08-16-exact-curves/brief.md`) — the general case of
+/// a circle projected under an orthographic view.
 #[derive(Debug, Clone)]
 pub struct ViewEdges {
     pub visible: Vec<Polyline2d>,
     pub hidden: Vec<Polyline2d>,
     pub circles: Vec<super::types::ProjectedCircle>,
     pub hidden_circles: Vec<super::types::ProjectedCircle>,
+    pub ellipses: Vec<super::types::ProjectedEllipse>,
+    pub hidden_ellipses: Vec<super::types::ProjectedEllipse>,
     /// Per-polyline B-Rep lineage, parallel to [`Self::visible`] (campaign #55
     /// residual — view-polyline edge provenance). `visible_sources[i]` is the
     /// edge/face identity of `visible[i]`.
@@ -456,6 +461,126 @@ struct CircleGroup {
     /// feature that produced it by entity identity.
     face_ids: Vec<u32>,
 }
+
+/// As [`CircleGroup`], but for a rim whose circle plane does NOT face the
+/// camera and therefore projects to a true ellipse (Fix 2).
+struct EllipseGroup {
+    cx: f64,
+    cy: f64,
+    rx: f64,
+    ry: f64,
+    rotation: f64,
+    all_visible: bool,
+    all_hidden: bool,
+    fallback: Vec<(bool, Polyline2d)>,
+    face_ids: Vec<u32>,
+}
+
+/// A circle projected through an orthographic view matrix, exactly: view-space
+/// centre, semi-major/semi-minor axis lengths, and the major axis's rotation
+/// from view-space +X (radians). `None` only on a degenerate input (a
+/// non-unit-normalizable normal, radius/scale collapsing to zero) — the
+/// caller falls back to sampling in that case.
+///
+/// Below [`MIN_ELLIPSE_MINOR_FRACTION`] of the major axis (or an absolute
+/// floor), the minor axis is treated as having collapsed to a line: an SVG/DXF
+/// consumer cannot draw a meaningfully thin ellipse (an `rx`/`ry` of exactly
+/// zero does not render at all in SVG), and geometrically this is the
+/// EDGE-ON case — a rim whose plane contains the view direction, which
+/// projects to a straight chord, not a curve. That is a real and distinct
+/// shape from "a very flat true ellipse"; sampling remains the honest
+/// representation for it rather than an ellipse a renderer would drop.
+///
+/// # Method
+///
+/// The circle is `C(θ) = center + r·cosθ·e1 + r·sinθ·e2` for an orthonormal
+/// basis `(e1, e2)` of the circle's plane. Projecting through the view's
+/// linear (orthographic) map `M = [u; v]` (its rotation, dropping view-space
+/// Z) gives `p(θ) = M·center + r·(M·e1)·cosθ + r·(M·e2)·sinθ` — the image of
+/// a unit circle under the 2×2 matrix whose columns are `r·(M·e1)` and
+/// `r·(M·e2)`. That image is an ellipse whose semi-axis lengths are the
+/// singular values of that matrix and whose axis directions are its left
+/// singular vectors; both are recovered in closed form from the eigenvalues
+/// of the matrix's own `M·Mᵀ` (a 2×2 symmetric matrix), which is
+/// numerically identical to an SVD for a real 2×2 map and avoids pulling in
+/// a general SVD routine for a two-line closed form. Verified by hand for
+/// the camera-facing case (recovers `rx = ry = r`) and a circle tilted by
+/// angle `α` from facing the camera about an in-plane axis (recovers the
+/// standard foreshortening `rx = r`, `ry = r·cos α`, major axis normal to
+/// the tilt) — see this module's own tests.
+fn circle_to_view_ellipse(
+    view_matrix: &Matrix4,
+    center: Point3,
+    normal: Vector3,
+    radius: f64,
+) -> Option<ViewEllipse> {
+    let n = normal.normalize().ok()?;
+    // Any world axis not (near-)parallel to n serves as a helper to build an
+    // orthonormal in-plane basis.
+    let helper = if n.x.abs() < 0.9 {
+        Vector3::X
+    } else {
+        Vector3::Y
+    };
+    let e1 = n.cross(&helper).normalize().ok()?;
+    let e2 = n.cross(&e1).normalize().ok()?;
+
+    let c2 = view_matrix.transform_point(&center);
+    let a2 = view_matrix.transform_vector(&e1);
+    let b2 = view_matrix.transform_vector(&e2);
+
+    // M's columns, scaled by radius.
+    let m00 = radius * a2.x;
+    let m01 = radius * b2.x;
+    let m10 = radius * a2.y;
+    let m11 = radius * b2.y;
+
+    // S = M·Mᵀ (symmetric 2×2): eigen-decomposition gives the ellipse's
+    // semi-axis lengths (sqrt of eigenvalues) and major-axis rotation.
+    let sxx = m00 * m00 + m01 * m01;
+    let syy = m10 * m10 + m11 * m11;
+    let sxy = m00 * m10 + m01 * m11;
+
+    let mid = (sxx + syy) * 0.5;
+    let diff = (sxx - syy) * 0.5;
+    let disc = (diff * diff + sxy * sxy).max(0.0).sqrt();
+    let lambda1 = (mid + disc).max(0.0);
+    let lambda2 = (mid - disc).max(0.0);
+    let rx = lambda1.sqrt();
+    let ry = lambda2.sqrt();
+    if !(rx.is_finite() && ry.is_finite()) || rx <= 0.0 {
+        return None;
+    }
+    let rotation = if disc > 1e-15 {
+        0.5 * sxy.atan2(diff)
+    } else {
+        0.0
+    };
+
+    Some(ViewEllipse {
+        cx: c2.x,
+        cy: c2.y,
+        rx,
+        ry,
+        rotation,
+    })
+}
+
+/// A circle's exact projection through an orthographic view matrix. See
+/// [`circle_to_view_ellipse`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ViewEllipse {
+    cx: f64,
+    cy: f64,
+    rx: f64,
+    ry: f64,
+    rotation: f64,
+}
+
+/// Below this fraction of the major axis, an ellipse is treated as
+/// degenerate (edge-on) rather than drawn. See [`circle_to_view_ellipse`]'s
+/// doc comment for why this is a distinct shape, not just "a thin ellipse".
+const MIN_ELLIPSE_MINOR_FRACTION: f64 = 0.02;
 
 /// Into-scene view direction (unit) for a projection: the third row of the
 /// world→view matrix, recovered as `(Tx.z, Ty.z, Tz.z)` where `T` transforms a
@@ -649,12 +774,18 @@ pub(crate) fn project_solid_edges_visibility_mode(
         hidden: Vec::new(),
         circles: Vec::new(),
         hidden_circles: Vec::new(),
+        ellipses: Vec::new(),
+        hidden_ellipses: Vec::new(),
         visible_sources: Vec::new(),
         hidden_sources: Vec::new(),
     };
     // Co-circular arc-edges of each camera-facing rim, keyed by quantised
     // (centre, radius), regrouped after the edge walk into one drawn circle.
     let mut circle_groups: std::collections::HashMap<(i64, i64, i64, i64), CircleGroup> =
+        std::collections::HashMap::new();
+    // As `circle_groups`, for rims viewed obliquely (Fix 2) — regrouped into
+    // one drawn ellipse per rim.
+    let mut ellipse_groups: std::collections::HashMap<(i64, i64, i64, i64), EllipseGroup> =
         std::collections::HashMap::new();
 
     // All shells (outer + inner), so a bore's own walls are classified too.
@@ -834,6 +965,56 @@ pub(crate) fn project_solid_edges_visibility_mode(
                             }
                             continue;
                         }
+
+                        // Fix 2 — the general case: the rim's plane does not
+                        // face the camera (a hole viewed in the isometric,
+                        // e.g.), so it projects to a true ELLIPSE rather than
+                        // a circle. Computed exactly from (centre, normal,
+                        // radius) — never sampled — unless the projection is
+                        // itself near-degenerate (edge-on), where an ellipse
+                        // would collapse below what an SVG/DXF consumer can
+                        // draw; that case keeps the polyline fallback below.
+                        if !runs.is_empty() {
+                            if let Some(ell) = circle_to_view_ellipse(&vm, c3, nrm, r) {
+                                if ell.ry >= ell.rx * MIN_ELLIPSE_MINOR_FRACTION {
+                                    let key = (
+                                        (c3.x * 1e3).round() as i64,
+                                        (c3.y * 1e3).round() as i64,
+                                        (c3.z * 1e3).round() as i64,
+                                        (r * 1e3).round() as i64,
+                                    );
+                                    let g = ellipse_groups.entry(key).or_insert(EllipseGroup {
+                                        cx: ell.cx,
+                                        cy: ell.cy,
+                                        rx: ell.rx,
+                                        ry: ell.ry,
+                                        rotation: ell.rotation,
+                                        all_visible: true,
+                                        all_hidden: true,
+                                        fallback: Vec::new(),
+                                        face_ids: Vec::new(),
+                                    });
+                                    if let Some(adj) = edge_faces.get(edge_id) {
+                                        for f in adj {
+                                            if !g.face_ids.contains(f) {
+                                                g.face_ids.push(*f);
+                                            }
+                                        }
+                                    }
+                                    let arc_vis = runs.iter().all(|(v, _)| *v);
+                                    let arc_hid = runs.iter().all(|(v, _)| !*v);
+                                    g.all_visible &= arc_vis;
+                                    g.all_hidden &= arc_hid;
+                                    for (vis, pts) in &runs {
+                                        let pl = Polyline2d::from_points(pts.clone());
+                                        if pl.points.len() >= 2 {
+                                            g.fallback.push((*vis, pl));
+                                        }
+                                    }
+                                    continue;
+                                }
+                            }
+                        }
                     }
 
                     // The edge's B-Rep lineage — this whole run set came from the
@@ -900,6 +1081,38 @@ pub(crate) fn project_solid_edges_visibility_mode(
         }
     }
 
+    // As above, for oblique rims accumulated as ellipses (Fix 2).
+    for g in ellipse_groups.into_values() {
+        let ell = super::types::ProjectedEllipse {
+            cx: g.cx,
+            cy: g.cy,
+            rx: g.rx,
+            ry: g.ry,
+            rotation: g.rotation,
+            face_ids: g.face_ids.clone(),
+        };
+        if g.all_visible {
+            out.ellipses.push(ell);
+        } else if g.all_hidden {
+            out.hidden_ellipses.push(ell);
+        } else {
+            for (vis, pl) in g.fallback {
+                let source = super::types::PolylineSource {
+                    edge_id: None,
+                    face_ids: g.face_ids.clone(),
+                    role: super::types::PolylineRole::Edge,
+                };
+                if vis {
+                    out.visible.push(pl);
+                    out.visible_sources.push(source);
+                } else {
+                    out.hidden.push(pl);
+                    out.hidden_sources.push(source);
+                }
+            }
+        }
+    }
+
     Ok(out)
 }
 
@@ -915,6 +1128,149 @@ mod tests {
             GeometryId::Solid(s) => s,
             o => panic!("expected solid, got {o:?}"),
         }
+    }
+
+    // ===== Fix 2 (exact-curves brief): circle_to_view_ellipse =====
+
+    #[test]
+    fn circle_to_view_ellipse_facing_camera_is_a_circle() {
+        // Front view looks down −Y; a circle in the XZ plane (normal = Y)
+        // faces the camera exactly, so its projection must be rx == ry == r,
+        // matching the existing true-circle path's own answer.
+        let vm = view_matrix_for_projection(ProjectionType::Front);
+        let ell = circle_to_view_ellipse(&vm, Point3::new(1.0, 0.0, 2.0), Vector3::Y, 3.0)
+            .expect("camera-facing circle must project");
+        assert!((ell.rx - 3.0).abs() < 1e-12, "rx={}", ell.rx);
+        assert!((ell.ry - 3.0).abs() < 1e-12, "ry={}", ell.ry);
+    }
+
+    #[test]
+    fn circle_to_view_ellipse_tilted_matches_foreshortening() {
+        // A circle in the XY plane (normal = Z), viewed by a camera tilted by
+        // angle α off dead-on, foreshortens to semi-minor r·cos(α) while the
+        // semi-major axis (perpendicular to the tilt) stays exactly r — the
+        // standard optics result, independent of this module's own math.
+        // Built directly (not via ProjectionType) so the test is an
+        // independent check of the eigen-decomposition, not a re-assertion
+        // of `view_matrix_for_projection`.
+        let alpha = std::f64::consts::FRAC_PI_3; // 60°
+        let w = Vector3::new(alpha.sin(), 0.0, alpha.cos()); // view direction
+        let u = Vector3::new(alpha.cos(), 0.0, -alpha.sin()); // page X, ⟂ w
+        let v = Vector3::new(0.0, 1.0, 0.0); // page Y, ⟂ w
+        let vm = Matrix4::new(
+            u.x, u.y, u.z, 0.0, v.x, v.y, v.z, 0.0, w.x, w.y, w.z, 0.0, 0.0, 0.0, 0.0, 1.0,
+        );
+        let r = 2.5;
+        let ell = circle_to_view_ellipse(&vm, Point3::ORIGIN, Vector3::Z, r)
+            .expect("tilted circle must project");
+        assert!(
+            (ell.rx - r).abs() < 1e-9,
+            "major axis unchanged: rx={}",
+            ell.rx
+        );
+        let expected_minor = r * alpha.cos();
+        assert!(
+            (ell.ry - expected_minor).abs() < 1e-9,
+            "ry={} expected {}",
+            ell.ry,
+            expected_minor
+        );
+        // Major axis (the unforeshortened one) lies along page-Y (the +90°
+        // frame relative to +X, since the tilt is about the page-Y axis).
+        let rot_norm = ell.rotation.rem_euclid(std::f64::consts::PI);
+        assert!(
+            (rot_norm - std::f64::consts::FRAC_PI_2).abs() < 1e-9,
+            "rotation={} expected pi/2",
+            rot_norm
+        );
+    }
+
+    #[test]
+    fn diag_ellipse_matches_direct_sample_of_real_cylinder_rim_isometric() {
+        // A real B-Rep rim (not a hand-built Point3/Vector3/f64 triple):
+        // cylinder along Z, radius 10, base at z=0, height 5. Its TOP rim
+        // circle has centre (0,0,5), normal Z, radius 10 — obliquely viewed
+        // in the isometric (normal is not parallel to the -1,-1,-1 view
+        // direction), so it is exactly the Fix 2 case.
+        let mut m = BRepModel::new();
+        let solid = sid(TopologyBuilder::new(&mut m)
+            .create_cylinder_3d(Point3::new(0.0, 0.0, 0.0), Vector3::Z, 10.0, 5.0)
+            .expect("cylinder"));
+
+        let edges = project_solid_edges_visibility(&m, solid, ProjectionType::Isometric, 96)
+            .expect("project");
+        assert!(
+            !edges.ellipses.is_empty() || !edges.hidden_ellipses.is_empty(),
+            "the cylinder's rim must be classified as an oblique ellipse in the isometric view"
+        );
+        let ell = edges
+            .ellipses
+            .iter()
+            .chain(edges.hidden_ellipses.iter())
+            .find(|e| (e.rx - 10.0).abs() < 1e-6)
+            .expect("an ellipse with the cylinder's true radius (10) must exist");
+
+        // Independently sample the TOP rim circle in 3D and project each
+        // point through the SAME view matrix the rest of the view uses, then
+        // check every sample lies ON the reported ellipse's boundary.
+        let vm = view_matrix_for_projection(ProjectionType::Isometric);
+        let mut max_err: f64 = 0.0;
+        for i in 0..64 {
+            let theta = (i as f64 / 64.0) * std::f64::consts::TAU;
+            let p3 = Point3::new(10.0 * theta.cos(), 10.0 * theta.sin(), 5.0);
+            let p2 = vm.transform_point(&p3);
+            let dx = p2.x - ell.cx;
+            let dy = p2.y - ell.cy;
+            let (sin_r, cos_r) = ell.rotation.sin_cos();
+            let lx = dx * cos_r + dy * sin_r;
+            let ly = -dx * sin_r + dy * cos_r;
+            let normalized = (lx / ell.rx).powi(2) + (ly / ell.ry).powi(2);
+            max_err = max_err.max((normalized - 1.0).abs());
+        }
+        assert!(
+            max_err < 1e-6,
+            "every directly-projected rim sample must lie ON the reported ellipse boundary \
+             (normalized radius within 1e-6 of 1.0); max deviation {max_err:e} — ellipse \
+             cx={} cy={} rx={} ry={} rotation={}",
+            ell.cx,
+            ell.cy,
+            ell.rx,
+            ell.ry,
+            ell.rotation
+        );
+
+        // AND: the ellipse's own centre must equal the rim centre projected
+        // through that same matrix — catches a registration bug (right shape,
+        // wrong place) that the boundary check alone could miss if the whole
+        // ellipse were merely translated.
+        let true_center_2d = vm.transform_point(&Point3::new(0.0, 0.0, 5.0));
+        assert!(
+            (ell.cx - true_center_2d.x).abs() < 1e-6 && (ell.cy - true_center_2d.y).abs() < 1e-6,
+            "ellipse centre ({}, {}) must equal the rim centre projected through the view's \
+             own matrix ({}, {})",
+            ell.cx,
+            ell.cy,
+            true_center_2d.x,
+            true_center_2d.y
+        );
+    }
+
+    #[test]
+    fn circle_to_view_ellipse_edge_on_collapses_minor_axis_to_near_zero() {
+        // Circle plane CONTAINS the view direction (normal ⟂ view dir): the
+        // rim is edge-on and projects to a line segment, i.e. an ellipse
+        // whose minor axis has collapsed — this is what the caller's
+        // MIN_ELLIPSE_MINOR_FRACTION gate exists to catch and fall back to
+        // sampling on.
+        let vm = view_matrix_for_projection(ProjectionType::Front); // looks down -Y
+                                                                    // Normal = Z is perpendicular to the Front view direction (Y).
+        let ell = circle_to_view_ellipse(&vm, Point3::ORIGIN, Vector3::Z, 1.0)
+            .expect("edge-on circle still projects to SOME conic");
+        assert!(
+            ell.ry < ell.rx * 1e-9,
+            "expected near-zero minor axis, got {}",
+            ell.ry
+        );
     }
 
     #[test]

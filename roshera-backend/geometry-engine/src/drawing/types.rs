@@ -260,6 +260,15 @@ pub struct ProjectedView {
     /// Occluded analytic circles, drawn dashed.
     #[serde(default)]
     pub hidden_circles: Vec<ProjectedCircle>,
+    /// Circular edges viewed OBLIQUELY — the general case of [`Self::circles`]
+    /// where the circle's plane does not face the camera, so it projects to a
+    /// true ellipse rather than a circle. Rendered as an exact SVG/DXF
+    /// ellipse, not a faceted polyline. View-space (pre-scale).
+    #[serde(default)]
+    pub ellipses: Vec<ProjectedEllipse>,
+    /// Occluded analytic ellipses, drawn dashed.
+    #[serde(default)]
+    pub hidden_ellipses: Vec<ProjectedEllipse>,
     /// Deterministic shaded-solid raster for a PICTORIAL (isometric) cell.
     /// When `Some`, the SVG/PDF renderer inks this image over the view's
     /// sheet-space geometry rect INSTEAD of the wireframe polylines/circles
@@ -372,6 +381,33 @@ pub struct ProjectedCircle {
     /// projected circle by face-id intersection — no coordinate heuristics.
     /// Populated at the projection site (`project_solid_edges_visibility`);
     /// serde-defaulted so pre-existing serialized drawings still load.
+    #[serde(default)]
+    pub face_ids: Vec<u32>,
+}
+
+/// A circular edge projected OBLIQUELY — the circle's plane does not face
+/// the camera, so under an orthographic view it projects to a true 2D
+/// ellipse rather than a circle (a circle projects to an ellipse in
+/// general; [`ProjectedCircle`] is the special case where the view plane
+/// is parallel to the circle's plane). Computed exactly from the circle's
+/// 3D centre/normal/radius and the view's rotation — never sampled — so a
+/// hole rim in an isometric view stays a real conic instead of a faceted
+/// polyline. View-space (mm, pre-scale); see
+/// `.superpowers/sdd/2026-08-16-exact-curves/brief.md` Fix 2.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectedEllipse {
+    /// Centre, view-space.
+    pub cx: f64,
+    pub cy: f64,
+    /// Semi-major axis length.
+    pub rx: f64,
+    /// Semi-minor axis length.
+    pub ry: f64,
+    /// Rotation of the major axis from the view-space +X axis, radians,
+    /// measured in the SAME (pre-flip) view-space frame `cx`/`cy` live in.
+    pub rotation: f64,
+    /// B-Rep face ids adjacent to the rim edges that produced this ellipse —
+    /// mirrors [`ProjectedCircle::face_ids`], the same entity-identity link.
     #[serde(default)]
     pub face_ids: Vec<u32>,
 }

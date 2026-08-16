@@ -160,6 +160,33 @@ fn point_seg_dist(p: [f64; 2], a: [f64; 2], b: [f64; 2]) -> f64 {
     ((p[0] - cx).powi(2) + (p[1] - cy).powi(2)).sqrt()
 }
 
+/// `true` when `p` lies within `hit_tol` of `e`'s boundary. `p` is rotated
+/// into the ellipse's own unrotated local frame (centred at the origin,
+/// major axis along local +X), then its local radius is compared against
+/// the ellipse's boundary radius AT THAT ANGLE — exact for a circle
+/// (`rx == ry`) and a close approximation for a genuine ellipse, which is
+/// all a click-tolerance hit-test needs.
+fn ellipse_hit(p: [f64; 2], e: &super::types::ProjectedEllipse, hit_tol: f64) -> bool {
+    let dx = p[0] - e.cx;
+    let dy = p[1] - e.cy;
+    let (sin_r, cos_r) = e.rotation.sin_cos();
+    let lx = dx * cos_r + dy * sin_r;
+    let ly = -dx * sin_r + dy * cos_r;
+    if e.rx <= 0.0 || e.ry <= 0.0 {
+        return false;
+    }
+    let local_r = (lx * lx + ly * ly).sqrt();
+    let theta = ly.atan2(lx);
+    let a = theta.cos() / e.rx;
+    let b = theta.sin() / e.ry;
+    let denom = (a * a + b * b).sqrt();
+    if denom <= 0.0 {
+        return false;
+    }
+    let boundary_r = 1.0 / denom;
+    (local_r - boundary_r).abs() <= hit_tol
+}
+
 /// Answer a [`DrawingQuery`] against the sheet + its live certificate.
 pub fn answer_query(
     drawing: &Drawing,
@@ -376,6 +403,19 @@ pub fn answer_query(
                     role: "circle".to_string(),
                     label: None,
                     face_ids: c.face_ids.clone(),
+                    pid: None,
+                });
+            }
+            // Provenanced ellipse (Fix 2's general oblique circle, same
+            // entity-identity contract as the circle above). Hit-tested by
+            // rotating the query point into the ellipse's own unrotated
+            // frame, then comparing its radius at that angle against the
+            // boundary radius `R(θ) = 1 / sqrt((cosθ/rx)² + (sinθ/ry)²)`.
+            if let Some(e) = v.ellipses.iter().find(|e| ellipse_hit(p, e, HIT_TOL)) {
+                return DrawingAnswer::EntityAt(EntityAtAnswer {
+                    role: "ellipse".to_string(),
+                    label: None,
+                    face_ids: e.face_ids.clone(),
                     pid: None,
                 });
             }

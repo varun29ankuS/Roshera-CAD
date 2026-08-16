@@ -42,11 +42,38 @@ pub enum SurfaceIntersectionResult {
     Coincident,
 }
 
-/// Dispatch a surface-surface intersection to the canonical math-layer
-/// implementation when no analytical closed-form is available.
+/// Dispatch a surface-surface intersection when no PER-TYPE closed-form
+/// method on this file's own `intersect()` impls covers the pair (e.g.
+/// Cylinder×Sphere, Cone×anything but Plane, Torus×anything, any
+/// `GeneralNurbsSurface` pairing).
+///
+/// Fix 1 (`.superpowers/sdd/2026-08-16-exact-curves/brief.md`): tries the
+/// crate's canonical analytic SSI suite — [`crate::operations::boolean`]'s
+/// `analytic_surface_intersection`, the SAME dispatch the boolean pipeline
+/// itself uses — FIRST, so a pair this file has no bespoke method for but
+/// the analytic suite does (cylinder∘sphere, cone∘cylinder, cone∘sphere,
+/// plane∘torus, …) still gets an exact `Circle`/`Ellipse`/`Line`. Only when
+/// that reports no closed form (`Ok(None)`) does this fall back to the
+/// canonical marcher, and even then the fit reports its measured deviation
+/// ([`intersection_curve_to_nurbs_checked`], Fix 3) instead of always
+/// succeeding silently. This is what closes the two-implementations defect
+/// for this trait method: before Fix 1, EVERY pair without a bespoke method
+/// here — including ones the boolean pipeline solves in closed form — went
+/// straight to the weak marcher.
+///
+/// Layering: this reaches from `primitives` up into `operations::boolean`,
+/// upstream of the crate's normal math→primitives→operations layering — a
+/// real, acknowledged wart, not a design endorsement. It is accepted here
+/// because a crate-wide grep confirms `Surface::intersect()` has ZERO
+/// production callers today (only test code reaches it), so the wart is
+/// structural, not a live behavioral risk, and the alternative — a second
+/// copy of ~2500 lines of analytic geometry duplicated into `primitives` —
+/// is exactly the drift this fix exists to close. See Fix 1's full
+/// reasoning in the brief for why a full relocation into `math::` was
+/// assessed and rejected.
 ///
 /// The inherent `intersect()` trait method returns `Vec<SurfaceIntersectionResult>`
-/// with no error channel; any math-layer failure is logged via `tracing::warn!`
+/// with no error channel; any failure is logged via `tracing::warn!`
 /// and degrades to an empty vector. This replaces the previous silent
 /// `_ => vec![]` fallthrough in analytical primitive dispatchers, so failures
 /// become observable without changing the trait signature.
@@ -55,8 +82,31 @@ pub(crate) fn dispatch_via_math_ssi(
     surface2: &dyn Surface,
     tolerance: Tolerance,
 ) -> Vec<SurfaceIntersectionResult> {
-    use crate::math::surface_intersection::{intersect_surfaces, intersection_curve_to_nurbs};
+    use crate::math::surface_intersection::{
+        intersect_surfaces, intersection_curve_to_nurbs_checked,
+    };
     use crate::primitives::curve::NurbsCurve as PrimNurbsCurve;
+
+    match crate::operations::boolean::analytic_surface_intersection(surface1, surface2, &tolerance)
+    {
+        Ok(Some(curves)) => {
+            return curves
+                .into_iter()
+                .map(SurfaceIntersectionResult::Curve)
+                .collect();
+        }
+        // No closed form for this pair — fall through to the marcher below.
+        Ok(None) => {}
+        Err(e) => {
+            tracing::warn!(
+                "analytic surface-surface intersection failed ({:?} vs {:?}): {:?}",
+                surface1.surface_type(),
+                surface2.surface_type(),
+                e,
+            );
+            return Vec::new();
+        }
+    }
 
     let raw = match intersect_surfaces(surface1, surface2, &tolerance) {
         Ok(v) => v,
@@ -77,18 +127,19 @@ pub(crate) fn dispatch_via_math_ssi(
         if curve.points.len() < 4 {
             continue;
         }
-        let math_nurbs = match intersection_curve_to_nurbs(curve, 3) {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!(
-                    "intersection curve fit failed ({:?} vs {:?}): {:?}",
-                    surface1.surface_type(),
-                    surface2.surface_type(),
-                    e,
-                );
-                continue;
-            }
-        };
+        let math_nurbs =
+            match intersection_curve_to_nurbs_checked(curve, 3, surface1, surface2, &tolerance) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(
+                        "intersection curve fit failed ({:?} vs {:?}): {:?}",
+                        surface1.surface_type(),
+                        surface2.surface_type(),
+                        e,
+                    );
+                    continue;
+                }
+            };
         match PrimNurbsCurve::new(
             math_nurbs.degree,
             math_nurbs.control_points,
@@ -6119,6 +6170,57 @@ mod tests {
 
     fn default_tolerance() -> Tolerance {
         Tolerance::default()
+    }
+
+    // ===== Fix 1 (exact-curves brief): dispatch_via_math_ssi consumers get
+    // the analytic suite's exact curve, not a marched NURBS fit =====
+    //
+    // `Cylinder`'s own `intersect()` dispatch (below) special-cases Plane and
+    // Cylinder directly but falls to `dispatch_via_math_ssi` for a Sphere
+    // partner — `operations::boolean` HAS a closed form for coaxial
+    // cylinder∘sphere (two circles), but before Fix 1 this trait-method path
+    // never saw it: `dispatch_via_math_ssi` called the weak
+    // `math::surface_intersection::intersect_surfaces` marcher directly and
+    // always wrapped the result in a chord-length NURBS fit. A coaxial
+    // cylinder∘sphere pair is exactly the two-implementations defect the
+    // brief names: boolean's own pipeline got a `Circle`, this trait method
+    // got a faceted `NurbsCurve` approximation of the same geometry.
+    #[test]
+    fn dispatch_via_math_ssi_coaxial_cylinder_sphere_yields_exact_circle() {
+        let cyl = Cylinder::new(Point3::ORIGIN, Vector3::Z, 2.0).expect("cyl");
+        // Sphere centred on the cylinder axis, radius > cylinder radius, so
+        // the sphere's surface separates the cylinder wall in two circles
+        // (the coaxial closed form in `cylinder_sphere_intersection`).
+        let sphere = Sphere::new(Point3::ORIGIN, 3.0).expect("sphere");
+        let tol = default_tolerance();
+
+        let results = cyl.intersect(&sphere, tol);
+        assert!(
+            !results.is_empty(),
+            "coaxial cylinder/sphere must intersect in two circles"
+        );
+        let mut found_circle = false;
+        for r in &results {
+            if let SurfaceIntersectionResult::Curve(c) = r {
+                if c.as_any()
+                    .downcast_ref::<crate::primitives::curve::Circle>()
+                    .is_some()
+                {
+                    found_circle = true;
+                }
+                assert!(
+                    c.as_any()
+                        .downcast_ref::<crate::primitives::curve::NurbsCurve>()
+                        .is_none(),
+                    "an analytic pair must never be reported as a marched NURBS fit"
+                );
+            }
+        }
+        assert!(
+            found_circle,
+            "expected at least one exact Circle curve, got: {:?}",
+            results
+        );
     }
 
     // ===== Fundamental form tests (CD-φ.1.1) =====
