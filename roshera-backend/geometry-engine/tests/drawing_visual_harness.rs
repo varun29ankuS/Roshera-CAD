@@ -71,10 +71,10 @@
 //!    onto a leader, so an oversized label there is unreadable).
 //! 4. **A view carrying a cutting plane has outline geometry, not only
 //!    hatch.** [`geometry_engine::drawing::verify::section_shows_only_hatch`]
-//!    — `#[ignore]`d in [`section_a_a_shows_more_than_the_cut_faces`]: this
-//!    is finding **D1**, deliberately out of scope for this change (the
-//!    section-view repair is Part 3). Confirmed RED against the live flange
-//!    fixture; un-ignore it once D1 lands.
+//!    in [`section_a_a_shows_more_than_the_cut_faces`] — finding **D1**,
+//!    confirmed RED against the live flange fixture before the section-view
+//!    repair landed; now GREEN because `section_view.rs` draws the wireframe
+//!    behind the cutting plane, not only the cut itself.
 
 use geometry_engine::drawing::dimensioning::standard_drawing_auto;
 use geometry_engine::drawing::layout::compute_layout;
@@ -324,15 +324,16 @@ fn no_dimension_text_overflows_its_span_on_either_fixture() {
 /// anything behind the cutting plane, so SECTION A-A reads as disconnected
 /// hatched rectangles rather than a part.
 ///
-/// `#[ignore]`d so the crate stays green; un-ignore this once D1 lands. It
-/// is not vacuously green today — `section_shows_only_hatch` was confirmed
-/// to fire on this exact fixture (see
-/// `drawing::verify::harness_invariant_tests::flange_section_view_is_flagged_today`
-/// in `src/drawing/verify.rs`, which asserts the RED state directly so a
-/// mistaken "staged but already passing" invariant would be caught there,
-/// not silently skipped here).
+/// D1 is FIXED: `section_view.rs` now adds the wireframe of every solid
+/// edge behind the cutting plane (clipped to the kept half) plus a bore/hole
+/// centerline, so SECTION A-A ties its four hatched bands into a readable
+/// part instead of confetti. Not vacuously green — `section_shows_only_hatch`
+/// was confirmed to fire on the PRE-repair shape of this exact fixture (see
+/// `drawing::verify::harness_invariant_tests::outline_confined_to_bands_
+/// leaves_the_gap_unbridged` in `src/drawing/verify.rs`), and the companion
+/// `flange_section_view_bridges_the_gaps_after_repair` proves the live,
+/// repaired pipeline now reads as bridged on the SAME multi-band fixture.
 #[test]
-#[ignore = "D1 (2026-08-16 brief): section view repair is Part 3, not this change"]
 fn section_a_a_shows_more_than_the_cut_faces() {
     let (m, part) = flange();
     let drawing = standard_drawing_auto(&m, part, uuid::Uuid::nil()).expect("sheet");

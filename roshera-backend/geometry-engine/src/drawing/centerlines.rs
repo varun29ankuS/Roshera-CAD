@@ -41,7 +41,12 @@ pub struct Centerline {
 
 /// Signed axial extent `(lo, hi)` of a face along `axis` through `origin`,
 /// taken from the face's own loop-edge vertices: `min/max of (V − O)·D`.
-fn face_axial_extent(
+///
+/// `pub(crate)`: reused by `section_view::section_centerlines`, which needs
+/// the SAME per-face axial-span math but through its own (u, v) mapping
+/// (`view_matrix_for_projection`'s `Custom` variant carries no translation,
+/// so it cannot stand in for a section whose cutting plane is off-origin).
+pub(crate) fn face_axial_extent(
     model: &BRepModel,
     face: &Face,
     origin: crate::math::Point3,
@@ -84,8 +89,9 @@ fn face_axial_extent(
 }
 
 /// Extend a 2D segment `a→b` outward by `frac` of its length plus a fixed
-/// overshoot, returning `[x1, y1, x2, y2]`.
-fn extend_segment(a: [f64; 2], b: [f64; 2], frac: f64, min_overshoot: f64) -> [f64; 4] {
+/// overshoot, returning `[x1, y1, x2, y2]`. `pub(crate)`: shared with
+/// `section_view::section_centerlines` (see `face_axial_extent`).
+pub(crate) fn extend_segment(a: [f64; 2], b: [f64; 2], frac: f64, min_overshoot: f64) -> [f64; 4] {
     let dx = b[0] - a[0];
     let dy = b[1] - a[1];
     let len = (dx * dx + dy * dy).sqrt();
@@ -222,7 +228,11 @@ fn centerline_key(cl: &Centerline) -> (String, f64) {
     }
 }
 
-fn dedup_centerlines(cands: Vec<Centerline>) -> Vec<Centerline> {
+/// `pub(crate)`: shared with `section_view::section_centerlines` (see
+/// `face_axial_extent`) — a section view collapses coaxial features (the
+/// bore's axis line and an off-plane hole sharing the same projected axis)
+/// exactly the way an orthographic view does, so the merge rule must match.
+pub(crate) fn dedup_centerlines(cands: Vec<Centerline>) -> Vec<Centerline> {
     use std::collections::HashMap;
     let mut best: HashMap<String, (f64, Centerline)> = HashMap::new();
     let mut order: Vec<String> = Vec::new();

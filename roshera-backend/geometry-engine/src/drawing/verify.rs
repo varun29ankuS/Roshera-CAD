@@ -1096,23 +1096,32 @@ pub fn find_span_overflows(layout: &super::layout::SheetLayout) -> Vec<Dimension
 
 /// True when a view carrying a cutting plane shows ONLY the hatched cut
 /// cross-section, with no outline ink beyond it — **finding D1**
-/// (2026-08-16 drawing-quality brief), deliberately left `#[ignore]`d in the
-/// harness: the section-view repair is a separate pass (Part 3), not this
-/// change.
+/// (2026-08-16 drawing-quality brief).
 ///
-/// `drawing/section_view.rs` derives the outline from edges of the SAME
-/// triangles the hatch is clipped against (`edge_count`/`tris2d` share one
-/// source), so TODAY outline bbox == hatch bbox exactly and this always
-/// returns `true` for a real section — confirmed empirically against the
-/// live flange fixture (Ø120×14 disc, Ø50 bore, 4×Ø12 bolts) before this
-/// function was written, not assumed.
+/// **The bbox-growth check this function used before the D1 repair landed is
+/// UNSATISFIABLE on the flange fixture the brief names**, and stayed that
+/// way even after a correct repair — confirmed empirically, not assumed
+/// (`section_a_a_shows_more_than_the_cut_faces`'s fixture cuts a Ø120 disc
+/// through its centre, so the hatch's own bbox already reaches the part's
+/// full physical extent: x ∈ [−60, 60], y ∈ [0, 14]; nothing behind the
+/// plane can ever draw outside the part's own silhouette, so "outline bbox
+/// grew past hatch bbox" can never fire here). The check now measures the
+/// thing the finding actually names — bands tied into a part — directly:
+/// whether the outline carries ink that BRIDGES a gap between hatched
+/// bands (the void a bore or bolt hole leaves in the cut). A cut-faces-only
+/// outline never reaches into a gap (by definition — the hatch stops
+/// exactly where the void starts); a repaired section's clipped rim edges
+/// do (see `section_view::back_of_plane_outline`'s doc for why: a rim
+/// circle bisected by the cutting plane, viewed edge-on, projects to a
+/// segment spanning the ENTIRE visible chord at that rim's height —
+/// including the span the void leaves in the hatch).
 ///
-/// Approximation: judges "shows more than the cut" only when the outline
-/// extends beyond the hatched footprint by more than one hatch pitch
-/// (`section_view::HATCH_SPACING`) in some direction. A real silhouette edge
-/// for material BEHIND the plane (the far bore wall, the outer profile) is
-/// not confined inside the hatched triangles' own bbox, so the repaired
-/// section will grow past this margin; today's cut-faces-only output cannot.
+/// Falls back to the OLD bbox-growth check when the hatch has no internal
+/// gap at all (a slice with no void to bridge — e.g. a solid disc with no
+/// bore in the cut plane) — there, "did the outline reach beyond the cut's
+/// own footprint" is still the only meaningful signal, and remains
+/// satisfiable (an outer profile need not lie flush with a convex hatch
+/// footprint in general).
 pub fn section_shows_only_hatch(view: &super::types::ProjectedView) -> bool {
     if view.hatch_polylines.is_empty() {
         return false; // not a section view (or nothing was cut) — no verdict
@@ -1142,15 +1151,107 @@ pub fn section_shows_only_hatch(view: &super::types::ProjectedView) -> bool {
     let Some(hatch_b) = bbox_of(&view.hatch_polylines) else {
         return false;
     };
-    let Some(outline_b) = bbox_of(&view.polylines) else {
-        return true; // hatch present, no outline at all — definitely missing
+
+    // The hatch's own x-coverage: each 45° hatch segment covers the x-span
+    // between its two endpoints; merging every segment's span gives the
+    // BANDS the cut actually inked, and the complement (within the hatch's
+    // overall bbox) gives the GAPS between them.
+    let mut spans: Vec<(f64, f64)> = view
+        .hatch_polylines
+        .iter()
+        .filter_map(|p| {
+            let xs: Vec<f64> = p.points.iter().map(|q| q[0]).collect();
+            let lo = xs.iter().cloned().fold(f64::INFINITY, f64::min);
+            let hi = xs.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            lo.is_finite().then_some((lo, hi))
+        })
+        .collect();
+    spans.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    const EPS: f64 = 1e-6;
+    let mut bands: Vec<(f64, f64)> = Vec::new();
+    for (s, e) in spans {
+        match bands.last_mut() {
+            Some((_, be)) if s <= *be + EPS => {
+                if e > *be {
+                    *be = e;
+                }
+            }
+            _ => bands.push((s, e)),
+        }
+    }
+    let mut gaps: Vec<(f64, f64)> = Vec::new();
+    let mut cursor = hatch_b.x0;
+    for &(s, e) in &bands {
+        if s > cursor + EPS {
+            gaps.push((cursor, s));
+        }
+        cursor = cursor.max(e);
+    }
+    if cursor < hatch_b.x1 - EPS {
+        gaps.push((cursor, hatch_b.x1));
+    }
+
+    let margin = super::section_view::HATCH_SPACING * 0.25;
+    if gaps.iter().all(|&(s, e)| e - s <= 2.0 * margin) {
+        // No usable internal gap (a one-band cut, or every gap is too
+        // narrow to distinguish "bridges it" from sampling noise) — fall
+        // back to the bbox-growth check.
+        let Some(outline_b) = bbox_of(&view.polylines) else {
+            return true; // hatch present, no outline at all — definitely missing
+        };
+        let grew = outline_b.x0 < hatch_b.x0 - super::section_view::HATCH_SPACING
+            || outline_b.x1 > hatch_b.x1 + super::section_view::HATCH_SPACING
+            || outline_b.y0 < hatch_b.y0 - super::section_view::HATCH_SPACING
+            || outline_b.y1 > hatch_b.y1 + super::section_view::HATCH_SPACING;
+        return !grew;
+    }
+
+    // Length of outline ink whose x falls strictly inside a gap window
+    // (inset by `margin` from each gap's edges, so a cap-boundary corner
+    // sitting exactly AT the gap's own edge doesn't count as "bridging"
+    // it).
+    let clipped_len_in = |a: [f64; 2], b: [f64; 2], lo: f64, hi: f64| -> f64 {
+        if hi <= lo {
+            return 0.0;
+        }
+        let dx = b[0] - a[0];
+        let full_len = ((b[0] - a[0]).powi(2) + (b[1] - a[1]).powi(2)).sqrt();
+        if dx.abs() < 1e-12 {
+            return if a[0] >= lo && a[0] <= hi {
+                full_len
+            } else {
+                0.0
+            };
+        }
+        let (t_lo, t_hi) = if dx > 0.0 {
+            (
+                ((lo - a[0]) / dx).clamp(0.0, 1.0),
+                ((hi - a[0]) / dx).clamp(0.0, 1.0),
+            )
+        } else {
+            (
+                ((hi - a[0]) / dx).clamp(0.0, 1.0),
+                ((lo - a[0]) / dx).clamp(0.0, 1.0),
+            )
+        };
+        if t_hi <= t_lo {
+            0.0
+        } else {
+            (t_hi - t_lo) * full_len
+        }
     };
-    let margin = super::section_view::HATCH_SPACING;
-    let grew = outline_b.x0 < hatch_b.x0 - margin
-        || outline_b.x1 > hatch_b.x1 + margin
-        || outline_b.y0 < hatch_b.y0 - margin
-        || outline_b.y1 > hatch_b.y1 + margin;
-    !grew
+    let mut bridged = 0.0;
+    for p in &view.polylines {
+        for w in p.points.windows(2) {
+            for &(gs, ge) in &gaps {
+                if ge - gs <= 2.0 * margin {
+                    continue;
+                }
+                bridged += clipped_len_in(w[0], w[1], gs + margin, ge - margin);
+            }
+        }
+    }
+    bridged <= super::section_view::HATCH_SPACING
 }
 
 fn error(kind: DrawingIssueKind, message: String, view: Option<String>) -> DrawingIssue {
@@ -1612,13 +1713,66 @@ mod harness_invariant_tests {
         assert!(!section_shows_only_hatch(&view));
     }
 
-    /// LIVE PIPELINE PROOF: the real `standard_drawing_auto` flange fixture's
-    /// SECTION A-A view — the exact shape finding D1 describes — must be
-    /// flagged by `section_shows_only_hatch` TODAY. This is the harness's own
-    /// self-check that the approximation is not accidentally green (advisor
-    /// caution: a staged invariant that is already green is worse than none).
+    /// Two hatched bands (mirroring the flange's real multi-band shape) with
+    /// NO outline ink reaching into the gap between them — today's D1 shape,
+    /// where the cut-boundary outline stops exactly where each band does.
+    /// Must stay flagged: this is the branch `outline_matching_hatch_bbox_
+    /// is_flagged` above does not exercise (that fixture has a single band,
+    /// so it falls back to the bbox-growth path instead).
     #[test]
-    fn flange_section_view_is_flagged_today() {
+    fn outline_confined_to_bands_leaves_the_gap_unbridged() {
+        let hatch = vec![
+            Polyline2d::from_points(vec![[0.0, 0.0], [10.0, 10.0]]),
+            Polyline2d::from_points(vec![[50.0, 0.0], [60.0, 10.0]]),
+        ];
+        let confined = vec![
+            Polyline2d::from_points(vec![[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]]),
+            Polyline2d::from_points(vec![[50.0, 0.0], [60.0, 0.0], [60.0, 10.0], [50.0, 10.0]]),
+        ];
+        let view = view_with(confined, hatch);
+        assert!(
+            section_shows_only_hatch(&view),
+            "two hatched bands with no outline crossing the gap between them \
+             must still read as cut-faces-only"
+        );
+    }
+
+    /// The same two bands, but the outline now carries a line spanning the
+    /// gap (the repaired shape: a rim edge bisected by the cutting plane,
+    /// clipped to the kept half, bridges exactly this span — see
+    /// `section_view::back_of_plane_outline`). Must NOT be flagged.
+    #[test]
+    fn outline_bridging_the_gap_between_bands_is_not_flagged() {
+        let hatch = vec![
+            Polyline2d::from_points(vec![[0.0, 0.0], [10.0, 10.0]]),
+            Polyline2d::from_points(vec![[50.0, 0.0], [60.0, 10.0]]),
+        ];
+        let mut outline = vec![
+            Polyline2d::from_points(vec![[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]]),
+            Polyline2d::from_points(vec![[50.0, 0.0], [60.0, 0.0], [60.0, 10.0], [50.0, 10.0]]),
+        ];
+        outline.push(Polyline2d::from_points(vec![[10.0, 5.0], [50.0, 5.0]]));
+        let view = view_with(outline, hatch);
+        assert!(
+            !section_shows_only_hatch(&view),
+            "outline ink bridging the gap between hatch bands must NOT be \
+             flagged as cut-faces-only"
+        );
+    }
+
+    /// LIVE PIPELINE PROOF: the real `standard_drawing_auto` flange fixture's
+    /// SECTION A-A view — the exact shape finding D1 describes — is a
+    /// MULTI-band cut (the bore plus two on-plane bolt holes each leave a
+    /// gap), so it exercises the gap-bridging branch above, not the
+    /// bbox-growth fallback. This is the harness's own self-check that the
+    /// repaired `section_view.rs` actually produces gap-bridging ink on the
+    /// SAME fixture the ignored integration test
+    /// (`section_a_a_shows_more_than_the_cut_faces`) targets — the
+    /// complementary direction: that test proves the harness invariant
+    /// passes; this one proves the invariant is testing real geometry, not
+    /// a fixture whose gaps happen to be too narrow to register.
+    #[test]
+    fn flange_section_view_bridges_the_gaps_after_repair() {
         use crate::math::{Point3, Vector3};
         use crate::operations::boolean::{boolean_operation, BooleanOp, BooleanOptions};
         use crate::primitives::topology_builder::{BRepModel, GeometryId, TopologyBuilder};
@@ -1691,11 +1845,31 @@ mod harness_invariant_tests {
             "specimen must actually be a hatched section, else this proves nothing"
         );
         assert!(
-            section_shows_only_hatch(section),
-            "D1 is unresolved today — the live section view must still read as \
-             cut-faces-only; this test flips to failing the moment the Part 3 \
-             section-view repair lands, which is the signal to un-ignore the \
-             harness's own D1 assertion"
+            !section_shows_only_hatch(section),
+            "D1 is fixed: the live SECTION A-A must show outline geometry \
+             beyond the hatched cut faces, bridging the gaps the bore and \
+             the two on-plane bolt holes leave in the hatch"
+        );
+
+        // The brief's explicit DoD line item — "a centerline through the
+        // bore" — is invisible to `section_shows_only_hatch` (which only
+        // looks at `polylines`/`hatch_polylines`), so it needs its OWN
+        // assertion: deleting `section_centerlines`'s call site would leave
+        // every check above green. The bore sits at the world origin, on
+        // the u=0 cutting plane, so its axis line must run through u≈0
+        // spanning at least the disc's 14mm thickness.
+        let bore_axis = section.centerlines.iter().find(|cl| {
+            cl.kind == "axis"
+                && cl
+                    .segments
+                    .iter()
+                    .any(|s| s[0].abs() < 1.0 && s[2].abs() < 1.0 && (s[3] - s[1]).abs() >= 14.0)
+        });
+        assert!(
+            bore_axis.is_some(),
+            "SECTION A-A must carry a chain-line centerline through the bore \
+             (u≈0, spanning the full 14mm thickness); centerlines present: {:#?}",
+            section.centerlines
         );
     }
 }
