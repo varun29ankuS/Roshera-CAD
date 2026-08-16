@@ -635,3 +635,468 @@ async fn the_one_call_svg_export_using_only_acknowledge_unsound_records_only_tha
         "params = {params}"
     );
 }
+
+// =====================================================================
+// L3 (2026-08-16 residuals) — one escape, two durable vocabularies
+// =====================================================================
+//
+// The ten gate-3 kernel routes record `acknowledge_unsound: true` as the
+// `roshera.acknowledge_unsound` FACET (`AckUnsoundFacet`), the vocabulary
+// `recorder_bridge.rs:184-189` documents as canonical and
+// `unsound_base_gate_tests` pins across every one of those routes. The
+// four drawing routes recorded ONLY their own plain JSON parameter (pinned
+// above) — a lineage query that only knows the facet-shaped vocabulary
+// would silently miss every drawing-route escape. Fixed by stamping the
+// facet alongside the parameter (`drawing_mgr.rs`, `ACK_UNSOUND_OVERRIDE.
+// sync_scope`, the same mechanism the kernel routes already use, since
+// these routes run entirely on the request task).
+
+/// Facet-shaped reading of `roshera.acknowledge_unsound` off the
+/// `drawing.export` / `drawing.svg_export` events in durable history — the
+/// sibling of `drawing_export_events_in_history` above, which reads the
+/// PARAMETER-shaped vocabulary instead.
+async fn ack_unsound_facets_in_drawing_history(state: &AppState) -> Vec<serde_json::Value> {
+    let (status, body) = dispatch(state, get("/api/timeline/history/main")).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "timeline history must 200; body = {body}"
+    );
+    let events = body.as_array().cloned().unwrap_or_else(|| {
+        panic!("expected a bare event array (durability off in test state); got {body}")
+    });
+    events
+        .iter()
+        .filter(|e| {
+            matches!(
+                e["operation"]["command_type"].as_str(),
+                Some("drawing.export")
+                    | Some("drawing.svg_export")
+                    | Some("drawing.create_from_part")
+            )
+        })
+        .filter_map(|e| {
+            e["operation"]["parameters"]["facets"]["roshera.acknowledge_unsound"].as_object()
+        })
+        .map(|obj| serde_json::Value::Object(obj.clone()))
+        .collect()
+}
+
+/// THE RED for L3 on the CREATION path (`POST /api/parts/{id}/drawing`,
+/// `drawing.create_from_part`) — the fifth site the closeout's own line
+/// list named. Unlike the four export-shaped routes, this one records its
+/// event UNCONDITIONALLY (the quality report always ships), so the correct
+/// pin is two-directional: `acknowledge_unsound=true` on a verified-unsound
+/// solid must stamp the facet, and `acknowledge_unsound` omitted on a
+/// verified-sound solid (the ordinary case, which still records an event)
+/// must NOT fabricate one.
+#[tokio::test]
+async fn creation_using_acknowledge_unsound_also_stamps_the_canonical_facet() {
+    let state = make_test_state().await;
+    let (_uuid, solid_id) = unsound_verified_box(&state).await;
+
+    let (status, body) = dispatch(
+        &state,
+        post(
+            &format!("/api/parts/{solid_id}/drawing?acknowledge_unsound=true"),
+            json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body = {body}");
+
+    let facets = ack_unsound_facets_in_drawing_history(&state).await;
+    assert!(
+        !facets.is_empty(),
+        "no event in history carries the canonical roshera.acknowledge_unsound \
+         FACET after a creation that used the escape — only the route's own \
+         parameter was stamped before this fix; facets = {facets:?}"
+    );
+    for facet in &facets {
+        assert_eq!(
+            facet["acknowledged"],
+            json!(true),
+            "facet must read `acknowledged: true`; got {facet}"
+        );
+    }
+}
+
+/// The converse of the test above: an ORDINARY creation (sound solid, no
+/// escape) still records an event (unconditionally) but must NOT stamp the
+/// facet — `ACK_UNSOUND_OVERRIDE.sync_scope` is entered with `q.
+/// acknowledge_unsound` itself (here `false`), and `record()` only stamps
+/// on `true`.
+#[tokio::test]
+async fn ordinary_creation_with_no_escape_does_not_stamp_the_acknowledge_unsound_facet() {
+    let state = make_test_state().await;
+    let (_uuid, solid_id) = sound_verified_box(&state).await;
+
+    let (status, body) = dispatch(
+        &state,
+        post(&format!("/api/parts/{solid_id}/drawing"), json!({})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body = {body}");
+
+    let facets = ack_unsound_facets_in_drawing_history(&state).await;
+    assert!(
+        facets.is_empty(),
+        "an ordinary creation with no escape must never stamp the \
+         acknowledge_unsound facet, even though this route always records \
+         an event; facets = {facets:?}"
+    );
+}
+
+/// THE RED for L3 on the registered-export path: a PDF export that used
+/// `acknowledge_unsound=true` must stamp the SAME canonical facet the ten
+/// kernel routes stamp, not just its own `acknowledge_unsound` JSON
+/// parameter (pinned separately above).
+#[tokio::test]
+async fn a_registered_export_using_acknowledge_unsound_also_stamps_the_canonical_facet() {
+    let state = make_test_state().await;
+    let (_uuid, solid_id) = unsound_verified_box(&state).await;
+    let drawing_id = {
+        let (status, body) = dispatch(
+            &state,
+            post(
+                &format!("/api/parts/{solid_id}/drawing?acknowledge_unsound=true"),
+                json!({}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body = {body}");
+        Uuid::parse_str(body["id"].as_str().expect("drawing id string"))
+            .expect("drawing id must parse")
+    };
+
+    let (status, body) = dispatch(
+        &state,
+        get(&format!(
+            "/api/drawings/{drawing_id}/pdf?acknowledge_unsound=true"
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "pdf export must 200; body = {body}");
+
+    let facets = ack_unsound_facets_in_drawing_history(&state).await;
+    assert!(
+        !facets.is_empty(),
+        "no event in history carries the canonical roshera.acknowledge_unsound \
+         FACET after a registered export that used the escape — the drawing \
+         route's own parameter is not the vocabulary a lineage query for \
+         'which operations escaped the unsound gate' actually reads"
+    );
+    for facet in &facets {
+        assert_eq!(
+            facet["acknowledged"],
+            json!(true),
+            "facet must read `acknowledged: true`; got {facet}"
+        );
+    }
+}
+
+/// THE RED for L3 on the one-call SVG path — same rule, the route with no
+/// registered drawing at all.
+#[tokio::test]
+async fn the_one_call_svg_export_using_acknowledge_unsound_also_stamps_the_canonical_facet() {
+    let state = make_test_state().await;
+    let (_uuid, solid_id) = unsound_verified_box(&state).await;
+
+    let (status, body) = dispatch(
+        &state,
+        get(&format!(
+            "/api/parts/{solid_id}/drawing.svg?acknowledge_unsound=true"
+        )),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "one-call svg must 200; body = {body}"
+    );
+
+    let facets = ack_unsound_facets_in_drawing_history(&state).await;
+    assert!(
+        !facets.is_empty(),
+        "no event in history carries the canonical roshera.acknowledge_unsound \
+         FACET after a one-call svg export that used the escape; only the \
+         route's own parameter was stamped before this fix"
+    );
+    for facet in &facets {
+        assert_eq!(
+            facet["acknowledged"],
+            json!(true),
+            "facet must read `acknowledged: true`; got {facet}"
+        );
+    }
+}
+
+/// A registered export that used ONLY `acknowledge_layout_issues` (never
+/// `acknowledge_unsound`) must NOT stamp the `roshera.acknowledge_unsound`
+/// facet — the facet is scoped to the ONE escape it names, never a
+/// blanket "some escape was used" flag. `ACK_UNSOUND_OVERRIDE.sync_scope`
+/// is entered with `q.acknowledge_unsound` specifically, not with whether
+/// any event was recorded at all.
+#[tokio::test]
+async fn acknowledge_layout_issues_alone_does_not_stamp_the_acknowledge_unsound_facet() {
+    let state = make_test_state().await;
+    let (_uuid, solid_id) = sound_verified_box(&state).await;
+    // `?scale=1000` on a 10mm box overflows the fixed A3 sheet by three
+    // orders of magnitude, reliably tripping the layout-quality Error
+    // branch (`ViewOutsideFrame`) without touching solid soundness — the
+    // same trick `sheet_export_gate_tests::quality_failing_drawing` uses.
+    // `create_part_drawing_inner` does not itself refuse on quality (only
+    // export does), so registration still 200s.
+    let drawing_id = {
+        let (status, body) = dispatch(
+            &state,
+            post(
+                &format!("/api/parts/{solid_id}/drawing?scale=1000"),
+                json!({}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body = {body}");
+        Uuid::parse_str(body["id"].as_str().expect("drawing id string"))
+            .expect("drawing id must parse")
+    };
+
+    let (status, body) = dispatch(
+        &state,
+        get(&format!(
+            "/api/drawings/{drawing_id}/pdf?acknowledge_layout_issues=true"
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body = {body}");
+
+    let facets = ack_unsound_facets_in_drawing_history(&state).await;
+    assert!(
+        facets.is_empty(),
+        "acknowledge_layout_issues alone must never stamp the \
+         acknowledge_unsound facet; facets = {facets:?}"
+    );
+}
+
+// =====================================================================
+// L2 (2026-08-16 residuals) — `/semantic` and `/certificate` disclose,
+// rather than refuse, an unsound solid's sheet
+// =====================================================================
+//
+// Neither read-only route ever refused on solid soundness (H1 gated only
+// the routes that hand out bytes: export + the one-call SVG). The ruling:
+// disclose rather than refuse — these two routes must still 200 a
+// dimensioned sheet for an unsound solid (a caller diagnosing the broken
+// thing needs to SEE it), but the response must now carry a live,
+// never-fabricated `solid_soundness` reading rather than staying silent
+// about the solid's own B-Rep validity.
+
+/// THE RED for L2 on `/certificate`: a sheet built on a solid the kernel
+/// has verified UNSOUND must disclose that reading in `solid_soundness`,
+/// not merely stay silent about it while still returning `sound: true`
+/// (sheet-vs-model, a different question) at 200.
+#[tokio::test]
+async fn certificate_discloses_an_unsound_solid_reading_without_refusing() {
+    let state = make_test_state().await;
+    let (_uuid, solid_id) = unsound_verified_box(&state).await;
+    // Registration itself gates on solid soundness (Concern A) — pass the
+    // escape to get an unsound solid with a REGISTERED sheet at all, the
+    // same trick `a_registered_export_refuses_a_solid_the_kernel_has_
+    // verified_unsound` uses. `/certificate` and `/semantic` never gate on
+    // this escape (that is the whole point of L2): no escape is passed on
+    // the read below.
+    let drawing_id = {
+        let (status, body) = dispatch(
+            &state,
+            post(
+                &format!("/api/parts/{solid_id}/drawing?acknowledge_unsound=true"),
+                json!({}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body = {body}");
+        Uuid::parse_str(body["id"].as_str().expect("drawing id string"))
+            .expect("drawing id must parse")
+    };
+
+    let (status, body) = dispatch(
+        &state,
+        get(&format!("/api/drawings/{drawing_id}/certificate")),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a read-only inspection surface must never refuse — disclose, not \
+         refuse; body = {body}"
+    );
+    assert_eq!(
+        body["sound"].as_bool(),
+        Some(true),
+        "the SHEET-vs-model certificate is a different question from solid \
+         validity and must be unaffected by this fix (flatten preserves the \
+         existing top-level key); body = {body}"
+    );
+    let readings = body["solid_soundness"]
+        .as_array()
+        .expect("solid_soundness must be a JSON array");
+    assert!(
+        readings
+            .iter()
+            .any(|r| r["reading"] == "unsound" && r["solid_id"] == solid_id),
+        "solid_soundness must disclose the verified-unsound reading for \
+         solid {solid_id}, live and never fabricated as sound by omission; \
+         body = {body}"
+    );
+}
+
+/// The `/semantic` sibling of the test above — same disclosure, the fuller
+/// response.
+#[tokio::test]
+async fn semantic_discloses_an_unsound_solid_reading_without_refusing() {
+    let state = make_test_state().await;
+    let (_uuid, solid_id) = unsound_verified_box(&state).await;
+    // See the `/certificate` sibling test above for why the escape is
+    // needed at REGISTRATION (Concern A gates creation) but not on the
+    // read below (L2's whole point: this route never gates on it).
+    let drawing_id = {
+        let (status, body) = dispatch(
+            &state,
+            post(
+                &format!("/api/parts/{solid_id}/drawing?acknowledge_unsound=true"),
+                json!({}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body = {body}");
+        Uuid::parse_str(body["id"].as_str().expect("drawing id string"))
+            .expect("drawing id must parse")
+    };
+
+    let (status, body) =
+        dispatch(&state, get(&format!("/api/drawings/{drawing_id}/semantic"))).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a read-only inspection surface must never refuse — disclose, not \
+         refuse; body = {body}"
+    );
+    let readings = body["solid_soundness"]
+        .as_array()
+        .expect("solid_soundness must be a JSON array");
+    assert!(
+        readings
+            .iter()
+            .any(|r| r["reading"] == "unsound" && r["solid_id"] == solid_id),
+        "solid_soundness must disclose the verified-unsound reading for \
+         solid {solid_id}; body = {body}"
+    );
+}
+
+/// The converse: a verified-SOUND solid's sheet discloses `"sound"`, not
+/// merely the absence of an unsound reading — a stated positive, not a
+/// default.
+#[tokio::test]
+async fn certificate_discloses_a_sound_solid_reading() {
+    let state = make_test_state().await;
+    let (_uuid, solid_id) = sound_verified_box(&state).await;
+    let drawing_id = register_drawing_for(&state, solid_id).await;
+
+    let (status, body) = dispatch(
+        &state,
+        get(&format!("/api/drawings/{drawing_id}/certificate")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body = {body}");
+    let readings = body["solid_soundness"]
+        .as_array()
+        .expect("solid_soundness must be a JSON array");
+    assert!(
+        readings
+            .iter()
+            .any(|r| r["reading"] == "sound" && r["solid_id"] == solid_id),
+        "solid_soundness must disclose the verified-sound reading; \
+         body = {body}"
+    );
+}
+
+/// A NEVER-verified solid (no certificate computed at all — the ordinary
+/// state of most solids most of the time) must disclose `"stale"`, never
+/// silently read as sound.
+#[tokio::test]
+async fn certificate_discloses_a_stale_reading_for_a_never_verified_solid() {
+    let state = make_test_state().await;
+    let (_uuid, solid_id) = never_verified_box(&state).await;
+    let drawing_id = register_drawing_for(&state, solid_id).await;
+
+    let (status, body) = dispatch(
+        &state,
+        get(&format!("/api/drawings/{drawing_id}/certificate")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body = {body}");
+    let readings = body["solid_soundness"]
+        .as_array()
+        .expect("solid_soundness must be a JSON array");
+    assert!(
+        readings
+            .iter()
+            .any(|r| r["reading"] == "stale" && r["solid_id"] == solid_id),
+        "an unverified solid must disclose `stale`, never silently read as \
+         sound by omission; body = {body}"
+    );
+}
+
+/// THE RED for the `Unresolvable` arm specifically — pins the branch a
+/// mutation that replaced `None => SolidSoundnessDisclosure::Unresolvable`
+/// with `None => SolidSoundnessDisclosure::Sound` would sail straight
+/// through undetected without this test. Reaches directly into the
+/// registered drawing (same technique `make_a_dimension_stale` uses) and
+/// rewrites a view's `solid_id` to one the active model does not contain —
+/// the drawing-vs-model mismatch `drawing_solid_ids`'s own doc names as the
+/// honest failure mode, distinct from the aliasing risk (L8b) it also
+/// names.
+#[tokio::test]
+async fn certificate_discloses_unresolvable_for_a_solid_the_model_does_not_contain() {
+    let state = make_test_state().await;
+    let (_uuid, solid_id) = sound_verified_box(&state).await;
+    let drawing_id = register_drawing_for(&state, solid_id).await;
+
+    const ABSENT_SOLID_ID: u32 = 999_999;
+    {
+        let handle = state
+            .drawings
+            .get(&drawing_id)
+            .expect("drawing must be registered before it can be mutated");
+        let mut guard = handle.write().await;
+        for view in guard.views.iter_mut() {
+            match &mut view.source {
+                geometry_engine::drawing::ViewSource::Part { solid_id, .. } => {
+                    *solid_id = ABSENT_SOLID_ID;
+                }
+            }
+        }
+    }
+
+    let (status, body) = dispatch(
+        &state,
+        get(&format!("/api/drawings/{drawing_id}/certificate")),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a view referencing a solid the active model lacks must still 200 \
+         (disclose, not refuse); body = {body}"
+    );
+    let readings = body["solid_soundness"]
+        .as_array()
+        .expect("solid_soundness must be a JSON array");
+    assert!(
+        readings
+            .iter()
+            .any(|r| r["reading"] == "unresolvable" && r["solid_id"] == ABSENT_SOLID_ID),
+        "a solid absent from the active model must disclose `unresolvable`, \
+         never silently read as `sound` by omission; body = {body}"
+    );
+}

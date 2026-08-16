@@ -516,10 +516,16 @@ async fn the_rust_gate_and_gates_ts_name_the_same_gates_and_escape() {
 // routes above, addressing a live solid directly rather than a registered
 // drawing. `refuse_unsound_sheet` is called in the same shape `4b1ef771`
 // established (`drawing_svg_for_solid`, drawing_mgr.rs); no `drawing_id`
-// exists for this path, so the refusal names `Uuid::nil()` — proven below,
-// not merely asserted. The stale/dangling branch is not exercised here: it
-// cannot be constructed against a sheet that is built and rendered within
-// one request (see the rename note on section 1 above) — only the
+// exists for this path, so the refusal names the SOLID instead
+// (`details.solid_id`, no `drawing_id` key at all) — proven below, not
+// merely asserted. Before M5 (2026-08-16 residuals) this route threaded
+// `Uuid::nil()` through the same shared constructor the registered routes
+// use, producing a refusal naming a drawing that does not exist and a hint
+// prescribing a remedy ("export the new drawing_id") this route cannot
+// follow; `ApiError::sheet_quality_for_solid` / `sheet_unsound_for_solid`
+// close that. The stale/dangling branch is not exercised here: it cannot
+// be constructed against a sheet that is built and rendered within one
+// request (see the rename note on section 1 above) — only the
 // layout-quality branch and the sound-passthrough path genuinely apply.
 //
 // Forcing a quality-Error finding needs a different trick than
@@ -529,11 +535,53 @@ async fn the_rust_gate_and_gates_ts_name_the_same_gates_and_escape() {
 // `ViewOutsideFrame` (Error-severity, geometry-engine/src/drawing/
 // verify.rs:47,253-258) regardless of the exact layout thresholds.
 
+/// The one-call-route sibling of [`assert_sheet_refusal`] (M5, 2026-08-16
+/// residuals). This route registers no [`Drawing`](geometry_engine::drawing::Drawing),
+/// so its refusal must name the SOLID (`details.solid_id`) rather than a
+/// `drawing_id` — and, per this project's absence discipline, a field with
+/// no value must be OMITTED, never defaulted to a nil UUID. Both halves are
+/// checked: the solid is named, and `drawing_id` is genuinely absent from
+/// `details`, not merely unequal to the caller's expectation.
+fn assert_one_call_sheet_refusal(
+    status: StatusCode,
+    body: &serde_json::Value,
+    solid_id: u32,
+    expected_gate: &str,
+    expected_status: StatusCode,
+    route: &str,
+) {
+    assert_eq!(
+        status, expected_status,
+        "{route} must refuse with {expected_status}; body = {body}"
+    );
+    assert_eq!(
+        body["success"].as_bool(),
+        Some(false),
+        "{route} refusal must carry success:false; body = {body}"
+    );
+    assert_eq!(
+        body["details"]["gate"].as_str(),
+        Some(expected_gate),
+        "{route} refusal must carry the gate name {expected_gate:?}; body = {body}"
+    );
+    assert_eq!(
+        body["details"]["solid_id"].as_u64(),
+        Some(solid_id as u64),
+        "{route} refusal must name the offending SOLID (this route has no \
+         registered drawing); body = {body}"
+    );
+    assert!(
+        body["details"].get("drawing_id").is_none(),
+        "{route} refusal must OMIT drawing_id — this route never registers \
+         one, and a nil UUID would name a drawing that does not exist; \
+         body = {body}"
+    );
+}
+
 /// A quality-failing one-call sheet (forced by an absurd `?scale=`) is
 /// refused on both routes, without acknowledgement.
 #[tokio::test]
 async fn a_quality_failing_one_call_svg_is_refused_without_acknowledgement() {
-    let nil = Uuid::nil();
     for label in ["id", "uuid"] {
         let state = make_test_state().await;
         let (id, uuid) = create_box_full(&state).await;
@@ -543,10 +591,10 @@ async fn a_quality_failing_one_call_svg_is_refused_without_acknowledgement() {
             format!("/api/parts/uuid/{uuid}/drawing.svg?scale=1000")
         };
         let (status, body) = dispatch(&state, get(&path)).await;
-        assert_sheet_refusal(
+        assert_one_call_sheet_refusal(
             status,
             &body,
-            nil,
+            id,
             "sheet_quality",
             StatusCode::CONFLICT,
             &format!("one-call svg ({label}) with a forced quality failure"),

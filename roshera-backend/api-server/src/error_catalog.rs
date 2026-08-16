@@ -943,7 +943,14 @@ impl ApiError {
     /// repair, the opposite of this gate's purpose. (The sheet gates below
     /// don't have this problem: a stale/quality-failing sheet's `args`
     /// carry the `drawing_id`, and repair mints a NEW drawing_id, so even
-    /// a cached refusal for the OLD id is simply never looked up again.)
+    /// a cached refusal for the OLD id is simply never looked up again.
+    /// **Limit (L7, 2026-08-16 residuals): this does NOT extend to
+    /// `drawing_svg_for_solid`** (the one-call SVG route) — its args carry
+    /// a SOLID id, which repair does not mint fresh, so a cached refusal
+    /// for that solid could survive a repair. Latent today: no MCP tool
+    /// reaches that route (`gate3_drift_set_equality_tests.rs`'s
+    /// `drawing_svg` exemption pins the gap) — but the reasoning above is
+    /// narrower than the caching convention's actual reach.)
     /// Losing the REFUSED-token classification for a REST-originated
     /// `unsound_base` refusal leaves it exactly where it stood before this
     /// closeout — a generic (unclassified) failure to `roshera-mcp`, not a
@@ -1004,6 +1011,40 @@ impl ApiError {
         }))
     }
 
+    /// **Sibling of [`sheet_uncertified`](Self::sheet_uncertified) for the
+    /// one-call SVG route** (`drawing_svg_for_solid`, `GET
+    /// /api/parts/{id}/drawing.svg`), which registers no [`Drawing`] and
+    /// therefore has no `drawing_id` to name (M5, 2026-08-16 residuals).
+    /// Before this fix the route passed `Uuid::nil()` into `sheet_uncertified`,
+    /// producing a refusal naming `drawing
+    /// 00000000-0000-0000-0000-000000000000` and a hint pointing at
+    /// `GET /api/drawings/{id}/semantic` — an endpoint this route has no id
+    /// to address. Names the SOLID instead: the true subject of a route
+    /// keyed by solid id, not by a registry entry.
+    ///
+    /// [`Drawing`]: geometry_engine::drawing::Drawing
+    pub fn sheet_uncertified_for_solid(solid_id: u32) -> Self {
+        Self::new(
+            ErrorCode::SheetUncertified,
+            format!(
+                "REFUSED: the one-call sheet for solid {solid_id} could not be \
+                 certified, so nothing certifies its printed dimensions \
+                 against the current model — and an SVG on disk can never \
+                 re-verify itself. Exporting an uncertified sheet would ship \
+                 an approximation labeled as exact."
+            ),
+        )
+        .with_hint(
+            "Retry GET /api/parts/{id}/drawing.svg. If this persists, read \
+             GET /api/agent/parts/{id}/perception directly to see the \
+             underlying failure.",
+        )
+        .with_details(serde_json::json!({
+            "gate": "sheet_uncertified",
+            "solid_id": solid_id,
+        }))
+    }
+
     /// **Sheet-export gate — the sheet is unsound against the live
     /// model.** Mirrors `roshera-mcp/src/gates.ts::sheetExportGate`'s
     /// stale/dangling branch. `stale` counts facts whose live-remeasured
@@ -1037,6 +1078,40 @@ impl ApiError {
         }))
     }
 
+    /// **Sibling of [`sheet_unsound`](Self::sheet_unsound) for the one-call
+    /// SVG route** (M5, 2026-08-16 residuals) — see
+    /// [`sheet_uncertified_for_solid`](Self::sheet_uncertified_for_solid)
+    /// for why this route needs its own constructor. The prior shared
+    /// constructor named a nil drawing id and its hint prescribed
+    /// "export the new drawing_id" — a remedy this route cannot follow,
+    /// since it never registers a drawing at all. This version names the
+    /// solid and points the remedy at re-issuing THIS route.
+    pub fn sheet_unsound_for_solid(solid_id: u32, stale: usize, dangling: usize) -> Self {
+        Self::new(
+            ErrorCode::SheetUnsound,
+            format!(
+                "REFUSED: the one-call sheet for solid {solid_id} is UNSOUND \
+                 against the live model: {stale} stale fact(s) (the model \
+                 moved since this sheet was projected) and {dangling} \
+                 dangling fact(s) (a referenced face no longer exists). A \
+                 sheet whose printed dimensions disagree with the model \
+                 would have a shop machine the wrong part."
+            ),
+        )
+        .with_hint(
+            "Re-issue GET /api/parts/{id}/drawing.svg against the current \
+             model. There is no override: regeneration is one cheap call, \
+             and no flow legitimately ships a sheet that disagrees with the \
+             model it claims to describe.",
+        )
+        .with_details(serde_json::json!({
+            "gate": "sheet_unsound",
+            "solid_id": solid_id,
+            "stale": stale,
+            "dangling": dangling,
+        }))
+    }
+
     /// **Sheet-export gate — layout-quality certificate failed.** Mirrors
     /// `roshera-mcp/src/gates.ts::sheetExportGate`'s quality branch.
     /// **Escape hatch (deliberate, documented):** re-issue with
@@ -1064,6 +1139,39 @@ impl ApiError {
         .with_details(serde_json::json!({
             "gate": "sheet_quality",
             "drawing_id": drawing_id,
+            "error_count": error_count,
+        }))
+    }
+
+    /// **Sibling of [`sheet_quality`](Self::sheet_quality) for the one-call
+    /// SVG route** (M5, 2026-08-16 residuals) — same reasoning as
+    /// [`sheet_unsound_for_solid`](Self::sheet_unsound_for_solid). The
+    /// `acknowledge_layout_issues=true` half of the original hint IS
+    /// followable on this route (it is a query parameter on this exact
+    /// GET, not tied to a registered drawing) and survives unchanged; only
+    /// the subject naming and the regenerate-by-`POST` half are corrected,
+    /// since this route has no registry entry to `POST` into.
+    pub fn sheet_quality_for_solid(solid_id: u32, error_count: usize) -> Self {
+        Self::new(
+            ErrorCode::SheetQuality,
+            format!(
+                "REFUSED: the one-call sheet for solid {solid_id} failed its \
+                 layout-quality certificate — {error_count} Error-severity \
+                 finding(s) (label collisions, redundant dimensions, broken \
+                 view arrangement): exactly what a drawing checker rejects \
+                 on sight."
+            ),
+        )
+        .with_hint(
+            "Re-issue GET /api/parts/{id}/drawing.svg after fixing the \
+             cause where possible. If a human asked to see the defective \
+             layout itself (a draft for review, not a shop release), \
+             re-issue this exact request with \
+             acknowledge_layout_issues=true.",
+        )
+        .with_details(serde_json::json!({
+            "gate": "sheet_quality",
+            "solid_id": solid_id,
             "error_count": error_count,
         }))
     }
@@ -1460,6 +1568,75 @@ mod tests {
         assert_eq!(v["error_code"], "checkpoint_name_rejected");
         assert_eq!(v["details"]["rejected_name"], "Checkpoint 9:59:36 PM");
         assert!(v["hint"].as_str().unwrap().contains("bolt circle"));
+    }
+
+    /// M5 (2026-08-16 residuals) — THE RED for the "refusal names a
+    /// drawing which does not exist" defect. Before this fix,
+    /// `drawing_svg_for_solid` threaded `Uuid::nil()` through the shared
+    /// `sheet_unsound` / `sheet_quality` constructors, so a caller of
+    /// `GET /api/parts/{id}/drawing.svg` got a message naming
+    /// `drawing 00000000-0000-0000-0000-000000000000`, a nil
+    /// `details.drawing_id`, and (the `sheet_unsound` case) a hint
+    /// prescribing "export the new drawing_id" — a remedy this route has
+    /// no drawing_id to name. This test would fail against that shape:
+    /// `details.drawing_id` would be present (nil) rather than absent, and
+    /// the hint would name a non-existent remedy.
+    #[test]
+    fn sheet_unsound_for_solid_names_the_solid_not_a_nil_drawing() {
+        let e = ApiError::sheet_unsound_for_solid(42, 1, 2);
+        assert_eq!(e.code, ErrorCode::SheetUnsound);
+        assert!(
+            e.error.contains("solid 42"),
+            "message must name the solid; got {:?}",
+            e.error
+        );
+        assert!(
+            !e.error.contains("00000000-0000-0000-0000-000000000000"),
+            "message must never name a nil drawing; got {:?}",
+            e.error
+        );
+        let v = serde_json::to_value(&e).unwrap();
+        assert_eq!(v["details"]["solid_id"], 42);
+        assert!(
+            v["details"].get("drawing_id").is_none(),
+            "an absent drawing_id must be OMITTED, never a stored nil UUID; \
+             details = {:?}",
+            v["details"]
+        );
+        let hint = e.hint.expect("sheet_unsound must carry a hint");
+        assert!(
+            !hint.contains("export the new drawing_id"),
+            "hint must not prescribe a remedy this route has no drawing_id \
+             to name; hint = {hint:?}"
+        );
+        assert!(
+            hint.contains("drawing.svg"),
+            "hint must point at a remedy this route can actually follow; \
+             hint = {hint:?}"
+        );
+    }
+
+    /// Sibling pin for `sheet_quality_for_solid` — the followable half of
+    /// the original hint (`acknowledge_layout_issues=true`) must survive
+    /// unchanged, per M5's own scoping.
+    #[test]
+    fn sheet_quality_for_solid_names_the_solid_and_keeps_the_followable_hint() {
+        let e = ApiError::sheet_quality_for_solid(7, 3);
+        assert_eq!(e.code, ErrorCode::SheetQuality);
+        assert!(
+            e.error.contains("solid 7"),
+            "message must name the solid; got {:?}",
+            e.error
+        );
+        let v = serde_json::to_value(&e).unwrap();
+        assert_eq!(v["details"]["solid_id"], 7);
+        assert!(v["details"].get("drawing_id").is_none());
+        let hint = e.hint.expect("sheet_quality must carry a hint");
+        assert!(
+            hint.contains("acknowledge_layout_issues=true"),
+            "the followable escape half of the hint must survive; \
+             hint = {hint:?}"
+        );
     }
 
     #[test]

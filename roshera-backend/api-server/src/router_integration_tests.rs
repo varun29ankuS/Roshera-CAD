@@ -9981,6 +9981,18 @@ async fn boolean_route_carries_declared_facets_across_the_spawn_blocking_boundar
          silently dropped, which this project names as worse than a plain \
          absence; event params = {params}"
     );
+    // M3 (2026-08-15 closeout residual): the request sends
+    // `x-roshera-intent-turn: 7` above but nothing previously asserted it
+    // reached the facet — dropping `IntentContext::turn_id` would have
+    // stayed green.
+    assert_eq!(
+        params["facets"]["roshera.intent"]["turn_id"].as_str(),
+        Some("7"),
+        "the request's declared intent turn must reach the durable event's \
+         IntentFacet — dropping IntentContext::turn_id across the \
+         spawn_blocking boundary must not stay silently unnoticed; \
+         event params = {params}"
+    );
     assert_eq!(
         params["facets"]["roshera.origin"]["channel"].as_str(),
         Some("mcp"),
@@ -9994,5 +10006,125 @@ async fn boolean_route_carries_declared_facets_across_the_spawn_blocking_boundar
         "the request's declared document must reach the durability sink's \
          persist call — never silently fall back to the ambient active \
          document; captured document = {document:?}"
+    );
+}
+
+/// THE ABSENCE-DIRECTION RED for the facet-loss defect (M3, 2026-08-15
+/// closeout residual). The sibling test above only proves the four
+/// PRESENT headers survive the `spawn_blocking` boundary; it says nothing
+/// about a request that declares NONE of them. This project's whole
+/// argument for that commit is that materialising an absent override as a
+/// default "swaps one silent lie for another" — an `unwrap_or_default()`
+/// slipped into `bounded_exec::snapshot_request_scope` would pass the
+/// sibling test unchanged while failing this one: the event would carry a
+/// fabricated `roshera.intent` facet, `roshera.origin: "not_determined"`
+/// instead of the honest unconditional `"rest"`, or a fabricated document
+/// instead of `None`.
+///
+/// Drives the SAME real boolean union through the FULL router with no
+/// `x-roshera-*` headers at all, and asserts the honest absence pattern:
+/// `Author::System` (the recorder's own default, never overridden),
+/// no `roshera.intent` facet key at all, `roshera.origin: "rest"` (origin
+/// is scoped UNCONDITIONALLY by `agent_origin_layer` — see that layer's own
+/// doc — so it is always present, just never `"mcp"` without the wire
+/// signature), and `document: None` on the durability sink's `persist`
+/// call (the sink's own ambient-document fallback happens deeper than
+/// this boundary — see `TimelineRecorder::record`'s doc comment).
+#[tokio::test]
+async fn boolean_route_with_no_headers_records_no_facets_across_the_spawn_blocking_boundary() {
+    let sink = Arc::new(FacetCapturingSink::default());
+    let sink_dyn: Arc<dyn timeline_engine::EventSink> = sink.clone();
+
+    let db_config = DatabaseConfig {
+        db_type: DatabaseType::SQLite,
+        url: "sqlite::memory:".to_string(),
+        max_connections: 4,
+        connect_timeout: 5,
+        run_migrations: true,
+    };
+    let database: Arc<dyn DatabasePersistence + Send + Sync> = Arc::new(
+        SqliteDatabase::new(&db_config)
+            .await
+            .expect("sqlite::memory: must initialise"),
+    );
+    let state = make_test_state_with_database(database, Some(sink_dyn), None).await;
+    let (uuid_a, _sa, uuid_b, _sb) = seed_two_overlapping_boxes(&state).await;
+
+    // Deliberately NO x-roshera-* headers of any kind.
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/api/geometry/boolean")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({
+                "operation": "union",
+                "object_a": uuid_a.to_string(),
+                "object_b": uuid_b.to_string(),
+            })
+            .to_string(),
+        ))
+        .expect("static request must build");
+
+    let (status, body) = dispatch(&state, request).await;
+    assert_eq!(status, StatusCode::OK, "union must 200; body = {body}");
+
+    let _ = state.timeline_recorder.flush().await;
+
+    let captured = sink.persisted.lock().unwrap_or_else(|p| p.into_inner());
+    let (event, document) = captured
+        .iter()
+        .find(|(e, _)| {
+            matches!(
+                &e.operation,
+                timeline_engine::Operation::Generic { command_type, .. }
+                    if command_type.to_lowercase().contains("boolean")
+            )
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "the boolean op must reach the durability sink; captured kinds = {:?}",
+                captured
+                    .iter()
+                    .map(|(e, d)| (
+                        crate::handlers::timeline::operation_kind(&e.operation),
+                        d.clone()
+                    ))
+                    .collect::<Vec<_>>()
+            )
+        });
+
+    assert_eq!(
+        event.author,
+        timeline_engine::Author::System,
+        "no x-roshera-agent header means no declared author — the event \
+         must carry the recorder's own honest default, never a fabricated \
+         agent; event = {event:?}"
+    );
+
+    let params = match &event.operation {
+        timeline_engine::Operation::Generic { parameters, .. } => parameters,
+        other => panic!("expected Operation::Generic, got {other:?}"),
+    };
+    assert!(
+        params["facets"].get("roshera.intent").is_none(),
+        "no x-roshera-intent header means no declared intent — an \
+         `unwrap_or_default()` slip in snapshot_request_scope would \
+         fabricate a facet here; event params = {params}"
+    );
+    assert_eq!(
+        params["facets"]["roshera.origin"]["channel"].as_str(),
+        Some("rest"),
+        "origin is scoped UNCONDITIONALLY by agent_origin_layer, so it is \
+         always present — but with no agent+intent wire signature it must \
+         read the honest `rest`, never `mcp` and never dropped to \
+         `not_determined`; event params = {params}"
+    );
+    assert!(
+        document.is_none(),
+        "no x-roshera-document header means no bound document — the \
+         durability sink's persist call must receive None, never a \
+         fabricated document id and never a silent fallback to the ambient \
+         active document baked in at this boundary; captured document = \
+         {document:?}"
     );
 }

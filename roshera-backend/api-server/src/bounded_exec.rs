@@ -470,6 +470,119 @@ where
 mod tests {
     use super::*;
 
+    /// M3 (2026-08-15 closeout residual) — THE unit pin the review named as
+    /// both the higher-value and the cheaper fix. `router_integration_tests
+    /// ::boolean_route_carries_declared_facets_across_the_spawn_blocking_
+    /// boundary` only drove the all-four-declared case through the full
+    /// router; `with_request_scope`'s four-level independent nesting
+    /// (`with_document` / `with_origin` / `with_intent` above) exists ONLY
+    /// for partial presence, and that all-or-none integration test never
+    /// executed a single intermediate `None` branch. This exercises every
+    /// one of the 2^4 = 16 presence combinations directly against
+    /// `with_request_scope` and, inside the closure, reads back what is
+    /// ACTUALLY visible on the current thread via `try_with` on each of the
+    /// four task-locals — so a dimension that was declared absent but
+    /// fabricated a value (the `unwrap_or_default()` slip the review named)
+    /// or a dimension that was declared present but silently dropped both
+    /// fail here, for every mixed combination, not just all-set/all-unset.
+    #[test]
+    fn with_request_scope_enters_exactly_the_declared_dimensions_over_every_presence_combination() {
+        use timeline_engine::recorder_bridge::{
+            AUTHOR_OVERRIDE, DOCUMENT_OVERRIDE, INTENT_OVERRIDE, ORIGIN_OVERRIDE,
+        };
+
+        let test_author = Author::AIAgent {
+            id: "test-agent".to_string(),
+            model: "test-agent".to_string(),
+        };
+        let test_intent = IntentContext {
+            text: "test intent".to_string(),
+            turn_id: Some("42".to_string()),
+        };
+        let test_origin = Origin::Mcp;
+        let test_document = "test-doc".to_string();
+
+        for bits in 0u8..16 {
+            let has_author = bits & 0b0001 != 0;
+            let has_intent = bits & 0b0010 != 0;
+            let has_origin = bits & 0b0100 != 0;
+            let has_document = bits & 0b1000 != 0;
+
+            let overrides = RequestScopeOverrides {
+                author: has_author.then(|| test_author.clone()),
+                intent: has_intent.then(|| test_intent.clone()),
+                origin: has_origin.then_some(test_origin),
+                document: has_document.then(|| test_document.clone()),
+            };
+
+            with_request_scope(overrides, || {
+                match AUTHOR_OVERRIDE.try_with(Clone::clone) {
+                    Ok(a) => {
+                        assert!(
+                            has_author,
+                            "bits={bits:#06b}: author visible but was NOT declared \
+                             — a fabricated value for an absent dimension"
+                        );
+                        assert_eq!(a, test_author, "bits={bits:#06b}: wrong author");
+                    }
+                    Err(_) => assert!(
+                        !has_author,
+                        "bits={bits:#06b}: declared author is NOT visible — silently dropped"
+                    ),
+                }
+                match INTENT_OVERRIDE.try_with(Clone::clone) {
+                    Ok(i) => {
+                        assert!(
+                            has_intent,
+                            "bits={bits:#06b}: intent visible but was NOT declared \
+                             — a fabricated value for an absent dimension"
+                        );
+                        assert_eq!(
+                            i.text, test_intent.text,
+                            "bits={bits:#06b}: wrong intent text"
+                        );
+                        assert_eq!(
+                            i.turn_id, test_intent.turn_id,
+                            "bits={bits:#06b}: wrong intent turn_id"
+                        );
+                    }
+                    Err(_) => assert!(
+                        !has_intent,
+                        "bits={bits:#06b}: declared intent is NOT visible — silently dropped"
+                    ),
+                }
+                match ORIGIN_OVERRIDE.try_with(|o| *o) {
+                    Ok(o) => {
+                        assert!(
+                            has_origin,
+                            "bits={bits:#06b}: origin visible but was NOT declared \
+                             — a fabricated value for an absent dimension"
+                        );
+                        assert_eq!(o, test_origin, "bits={bits:#06b}: wrong origin");
+                    }
+                    Err(_) => assert!(
+                        !has_origin,
+                        "bits={bits:#06b}: declared origin is NOT visible — silently dropped"
+                    ),
+                }
+                match DOCUMENT_OVERRIDE.try_with(Clone::clone) {
+                    Ok(d) => {
+                        assert!(
+                            has_document,
+                            "bits={bits:#06b}: document visible but was NOT declared \
+                             — a fabricated value for an absent dimension"
+                        );
+                        assert_eq!(d, test_document, "bits={bits:#06b}: wrong document");
+                    }
+                    Err(_) => assert!(
+                        !has_document,
+                        "bits={bits:#06b}: declared document is NOT visible — silently dropped"
+                    ),
+                }
+            });
+        }
+    }
+
     #[test]
     fn default_budgets_are_generous_and_on() {
         let b = OpBudgets::default();
