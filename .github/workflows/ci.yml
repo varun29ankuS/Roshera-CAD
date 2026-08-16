@@ -196,14 +196,45 @@ jobs:
     # exactly what the parity test exists to catch and `roshera-rl/**` alone
     # would miss it.
     #
-    # No Postgres service here on purpose: the ingest suite states an honest,
-    # reasoned skip when `ROSHERA_RL_PG` is unset, and the rest of the suite is
-    # fully offline. Adding a service container to turn one honest skip into a
-    # run is a later call, not a blocker — what matters is that the ~200 other
-    # checks stop depending on someone remembering.
+    # A Postgres service DOES run here, and the reasoning that said otherwise
+    # is superseded rather than deleted, because the change of mind is the
+    # useful part. When this job was written the argument was: the ingest suite
+    # states an honest reasoned skip without a database, the rest is offline,
+    # and turning one honest skip into a run is a later call. That was true.
+    #
+    # It stopped being true the moment the branch put load-bearing coverage
+    # INSIDE the skipped block. `rl_episode.unverified_mutations` — the column
+    # that answers "which episodes ended with mutating work nobody verified" —
+    # has exactly one real round-trip test, and it sits in the block that
+    # skips. So the honest skip had quietly become the thing hiding the only
+    # proof that the migration works, and a skip that hides load-bearing
+    # coverage is no longer honest, however well it explains itself.
+    #
+    # The suite still passes with no database and still states its skip, so
+    # nothing here depends on the service being reachable to be correct — the
+    # service exists to stop one specific test from never running.
     name: RL harness (episode + trajectory + parity)
     runs-on: ubuntu-latest
     timeout-minutes: 15
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_USER: postgres
+          POSTGRES_DB: roshera
+        ports:
+          - 5432:5432
+        # Without the health check the job can reach `npm test` before Postgres
+        # accepts connections, and the suite would take its honest skip — going
+        # green while proving exactly what it was proving before the service
+        # was added. A flaky skip is worse than a stated one.
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
 
     steps:
     - uses: actions/checkout@v4
@@ -230,10 +261,29 @@ jobs:
       run: npm ci
       working-directory: ./roshera-rl
 
-    - name: Run the RL harness suites
+    # One invocation, not two: the suite is the test AND the evidence.
+    #
+    # The second half matters as much as the first. The suite SKIPS its ingest
+    # tests when it cannot reach a database and reports that honestly rather
+    # than failing — right locally, and exactly the wrong thing to rely on
+    # here, because a service that silently stopped resolving would turn this
+    # job green while testing strictly less than it did the day before. The
+    # whole reason the service was added is that one test must actually run,
+    # so a skip is a failure in this environment even though it is a virtue
+    # outside it. `pipefail` so npm's own exit code still decides the step.
+    - name: Run the RL harness suites (and refuse a silent no-database skip)
       if: steps.filter.outputs.rl == 'true'
-      run: npm test
+      shell: bash
+      run: |
+        set -o pipefail
+        npm test 2>&1 | tee rl-test.log
+        if grep -q "1 suite skipped (no ROSHERA_RL_PG)" rl-test.log; then
+          echo "::error::ingest_store took its no-database skip although a postgres service is configured — the unverified_mutations migration round-trip did NOT run, so this job proved less than it claims"
+          exit 1
+        fi
       working-directory: ./roshera-rl
+      env:
+        ROSHERA_RL_PG: postgresql://postgres:postgres@localhost:5432/roshera
 
   mcp-quality:
     # The jig ratchet (MCP scale architecture, Slice 5). Grades the agent tool
