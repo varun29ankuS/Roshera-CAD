@@ -47,6 +47,23 @@
  *      have refused without it. A caller passing the flag when there is
  *      nothing unverified must not leave a checkpoint durably asserting an
  *      escape that was never taken.
+ *  15. M6 (2026-08-16 residuals) — L1's forwarding decision must survive a
+ *      concurrently in-flight dispatch that mutates gate 6's module state
+ *      AFTER `preDispatchGate` already decided but BEFORE the handler body
+ *      runs. Scripted, not timing-dependent: `preDispatchGate` and
+ *      `recordDispatchOutcome` are the real exported functions this module
+ *      uses everywhere else in this file, driven in the exact order a truly
+ *      interleaved dispatch would produce, deterministically rather than by
+ *      chance (an empirically-probed genuine `Promise.all` race did not
+ *      reproduce this in-process — see the residuals report — because every
+ *      path that clears `intentUnverified` needs real I/O, which cannot
+ *      land inside the single microtask gap between the decision and the
+ *      handler's first line; the defect is structural, not live under
+ *      today's scheduling, and is fixed on that structural ground). The RAW
+ *      `timeline_checkpoint` handler is captured directly (bypassing the
+ *      registry wrapper, which would recompute its own fresh decision) so
+ *      the decision fed to it can be the one taken BEFORE the simulated
+ *      interleaving.
  */
 
 import assert from "node:assert/strict";
@@ -210,12 +227,33 @@ process.env.ROSHERA_URL = `http://127.0.0.1:${port}`;
 const { buildTable } = await import(
   pathToFileURL(join(HERE, ".build", "surface.js")).href
 );
-const { resetSessionGates } = await import(
-  pathToFileURL(join(HERE, ".build", "gates.js")).href
+const { resetSessionGates, preDispatchGate, recordDispatchOutcome } =
+  await import(pathToFileURL(join(HERE, ".build", "gates.js")).href);
+const { registerTimelineTools } = await import(
+  pathToFileURL(join(HERE, ".build", "tools", "timeline.js")).href
 );
 
 const table = buildTable();
 const call = (name, args) => table.get(name).handler(args, {});
+
+// ─── M6 (item 15): the RAW timeline_checkpoint handler, captured directly —
+// bypassing the registry.ts wrapper, which would compute its OWN fresh
+// decision at call time and defeat the whole point of feeding it a decision
+// taken BEFORE a simulated interleaving.
+let rawCheckpointHandler;
+registerTimelineTools({
+  tool(name, _description, _shape, handler) {
+    if (name === "timeline_checkpoint") rawCheckpointHandler = handler;
+  },
+  registerTool() {},
+});
+if (typeof rawCheckpointHandler !== "function") {
+  throw new Error(
+    "M6 fixture: registerTimelineTools never registered timeline_checkpoint " +
+      "via server.tool(...) — capture shim did not match, would silently skip item 15",
+  );
+}
+
 const firstJson = (r) => {
   try {
     return JSON.parse(r.content[0].text);
@@ -621,6 +659,75 @@ check(
     assert.equal(firstJson(cpGenuineSkip).refused, undefined);
     assert.equal(lastSkipVerification, true);
     assert.equal(firstJson(cpGenuineSkip).checkpoint.skip_verification, true);
+  },
+);
+
+// ─── 15. M6 (2026-08-16 residuals) — the decision survives an interleaving ──
+//
+// Arm gate 6 for real, take the SAME decision `preDispatchGate` would hand
+// the registry wrapper for a closing checkpoint carrying
+// skip_verification:true — then SIMULATE the concurrently in-flight
+// dispatch the finding names: a `verify_part` success completing and
+// clearing `intentUnverified`, via the real `recordDispatchOutcome`, placed
+// in exactly the position between the decision and the handler run that the
+// finding describes. Scripted, not timing-dependent — see the item-15 doc
+// comment above for why a genuine `Promise.all` race does not reproduce
+// this in-process. Finally the RAW `timeline_checkpoint` handler (captured
+// pre-wrap, above) is invoked with the decision taken BEFORE the simulated
+// interleaving: the old handler (a fresh, independent `gate6WouldRefuse()`
+// read) would see the now-cleared state and drop the flag; the fixed
+// handler must still forward it, because the decision already settled the
+// question before the interleaving happened.
+
+resetSessionGates();
+recordDispatchOutcome(
+  "timeline_checkpoint",
+  { name: "boss ø40 x 12 on the base plate" },
+  { content: [{ type: "text", text: "{}" }] },
+  1,
+); // opens the intent directly — this item targets the raw handler in
+// isolation, not the gate's own refusal path (already covered above)
+recordDispatchOutcome(
+  "create_box",
+  { plane: "xy", cx: 0, cy: 0, width: 2, depth: 2, height: 2 },
+  { content: [{ type: "text", text: "{}" }] },
+  2,
+); // arms gate 6 — one unverified mutating op under the open intent
+
+const closingArgs = {
+  name: "relief slot 6 wide x 3 deep, left flank",
+  branch: "main",
+  skip_verification: true,
+};
+const decision = await preDispatchGate("timeline_checkpoint", closingArgs, 3);
+check(
+  "M6 setup: the decision for the closing call genuinely reflects an escape",
+  () => {
+    assert.deepEqual(decision, { proceed: true, gate6WouldHaveRefused: true });
+  },
+);
+
+// The interleaving itself: a concurrently in-flight verify_part completes
+// and clears intentUnverified — AFTER the decision above was computed,
+// BEFORE the handler (below) runs. The same real function every other
+// verify_part call in this file goes through.
+recordDispatchOutcome(
+  "verify_part",
+  { part_id: 1 },
+  { content: [{ type: "text", text: JSON.stringify({ refused: false }) }] },
+  2.5,
+);
+
+const cpInterleaved = await rawCheckpointHandler(closingArgs, {}, decision);
+check(
+  "M6 CLOSED: skip_verification still reaches the backend after an interleaved verify_part clears the tally BETWEEN the decision and the handler run",
+  () => {
+    assert.equal(
+      lastSkipVerification,
+      true,
+      "the decision taken BEFORE the interleaving must not be overridden by a fresh, later read of now-cleared state",
+    );
+    assert.equal(firstJson(cpInterleaved).checkpoint.skip_verification, true);
   },
 );
 

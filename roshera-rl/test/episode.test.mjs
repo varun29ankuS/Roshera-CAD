@@ -14,9 +14,9 @@
 import assert from "node:assert/strict";
 import http from "node:http";
 import { once } from "node:events";
-import { mkdtempSync, rmSync, readFileSync } from "node:fs";
+import { mkdtempSync, rmSync, readFileSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, dirname } from "node:path";
+import { join, dirname, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -1041,6 +1041,127 @@ check("the VERIFIES copy equals gates.ts's, verb for verb", () => {
     "gates.ts and episode.mjs disagree about which tools count as having verified. An " +
     "episode's unverified-mutation check would then miss a verb the gate counts, or " +
     "flag one it does not.",
+  );
+});
+
+// ─── COMPOSITE_DISPATCH is PINNED too (M4, 2026-08-16 residuals) ────────────
+//
+// H1 (2026-08-15 whole-branch review): `workbench` was in this set purely on
+// the strength of its NAME — nobody grepped `entry.handler(` before adding
+// it, and its handler dispatches nothing (`workbench.ts:293`,
+// `async ({ mode }) => ok(wb.enter(mode))`). `MUTATES_SOLIDS` and `VERIFIES`
+// got a mechanical cross-package pin on the SAME branch that fixed H1;
+// `COMPOSITE_DISPATCH` did not — it was only asserted, in a doc comment and
+// in the "workbench is NOT composite" unit check above, both of which a
+// human has to keep honest by hand. If `roshera-mcp` grows a fourth
+// composite tool, `episode.mjs` silently reverts to fabricating {count: 0}
+// for it — the exact defect M2 closed, one tool-addition away.
+//
+// This pin derives the set from source instead of repeating episode.mjs's
+// own claim: walk every .ts file under roshera-mcp/src, find each REAL
+// (non-comment) `entry.handler(` call site — the one thing that actually
+// makes a tool composite (registry.ts: "wrapping it HERE is the single
+// choke point... direct mount, invoke(), or cad_program()'s batch loop all
+// call entry.handler(...)") — and attribute each hit to the nearest
+// PRECEDING `.tool("name"` / `.registerTool("name"` registration in the
+// same file. The attribution step matters: metatools.ts registers THREE
+// tools (find_tool, describe_tool, invoke) and only `invoke`'s handler body
+// contains the dispatch — a file-level "this file has a hit" check would
+// wrongly implicate find_tool/describe_tool too.
+//
+// `registry.ts` is excluded BY STATED FILE IDENTITY, not by count or
+// position in the results: it is the dispatch table every call path
+// (direct mount, invoke, cad_program) funnels through, and its own doc
+// comment names the pattern in PROSE ("`entry.handler(...)`, so wrapping it
+// HERE...") without registering any tool that dispatches to another — a
+// comment-line match on the literal string, not a real call site (verified:
+// the text immediately before that hit on its own line is `// `). The loop
+// below still requires this hit to be excluded by identity rather than by
+// the comment-line check finding nothing there — if registry.ts ever grows
+// an ACTUAL entry.handler( call site inside some future registered tool's
+// own handler, this file-identity exclusion is what a reader must revisit,
+// not something the mechanism papers over silently.
+//
+// This pin would have failed on H1: `workbench.ts` has no `entry.handler(`
+// call site at all, so the derived set is exactly {cad_program, invoke},
+// and a COMPOSITE_DISPATCH still naming "workbench" fails the equality
+// assertion below rather than passing on the strength of a name.
+check("the COMPOSITE_DISPATCH copy is derived from real entry.handler( call sites, not merely asserted", () => {
+  const SRC_DIR = join(HERE, "..", "..", "roshera-mcp", "src");
+  const walk = (dir) => {
+    const out = [];
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const full = join(dir, entry.name);
+      if (entry.isDirectory()) out.push(...walk(full));
+      else if (entry.name.endsWith(".ts")) out.push(full);
+    }
+    return out;
+  };
+  const files = walk(SRC_DIR);
+  // Vacuity guard: a broken walk (wrong path, wrong extension filter) would
+  // silently derive an empty set that compares equal to nothing meaningful.
+  assert.ok(
+    files.length >= 15,
+    `walked only ${files.length} .ts files under roshera-mcp/src — the walk is broken`,
+  );
+
+  const TOOL_NAME_RE = /\.(?:tool|registerTool)\(\s*\n?\s*"([a-z0-9_]+)"/g;
+  const derived = new Set();
+  let realHitCount = 0;
+  for (const file of files) {
+    if (file.endsWith(`${sep}registry.ts`)) continue; // stated exclusion, see comment above
+    const src = readFileSync(file, "utf8");
+    const toolStarts = [];
+    let tm;
+    while ((tm = TOOL_NAME_RE.exec(src))) {
+      toolStarts.push({ index: tm.index, name: tm[1] });
+    }
+    const hitRe = /entry\.handler\(/g;
+    let hm;
+    while ((hm = hitRe.exec(src))) {
+      // A REAL call site, not a comment mentioning the pattern: the text on
+      // the hit's own line, before the hit, must not itself start a `//`
+      // comment.
+      const lineStart = src.lastIndexOf("\n", hm.index) + 1;
+      const linePrefix = src.slice(lineStart, hm.index);
+      if (linePrefix.includes("//")) continue;
+      realHitCount++;
+      const owner = [...toolStarts].reverse().find((t) => t.index <= hm.index);
+      assert.ok(
+        owner,
+        `${file}:${hm.index} calls entry.handler( but no preceding .tool("name" ` +
+          "registration was found in the same file — the attribution, not the tool, is broken",
+      );
+      derived.add(owner.name);
+    }
+  }
+
+  assert.ok(
+    realHitCount >= 2,
+    `found only ${realHitCount} real entry.handler( call site(s) outside registry.ts — the parse is broken`,
+  );
+  assert.ok(derived.has("cad_program"), "cad_program's own dispatch loop must be found");
+  assert.ok(
+    derived.has("invoke"),
+    "invoke's own dispatch must be found, distinguished from find_tool/describe_tool in the same file",
+  );
+
+  const episodeSrc = readFileSync(join(HERE, "..", "lib", "episode.mjs"), "utf8");
+  const m = episodeSrc.match(/const COMPOSITE_DISPATCH\s*=\s*new Set\(\[([\s\S]*?)\]\)/);
+  assert.ok(
+    m,
+    "could not locate COMPOSITE_DISPATCH's set literal in episode.mjs — the parse, not the set, is broken",
+  );
+  const ours = new Set([...m[1].matchAll(/"([a-z0-9_]+)"/g)].map((x) => x[1]));
+
+  const missingHere = [...derived].filter((t) => !ours.has(t));
+  const extraHere = [...ours].filter((t) => !derived.has(t));
+  assert.deepEqual(
+    { missingHere, extraHere }, { missingHere: [], extraHere: [] },
+    "episode.mjs's COMPOSITE_DISPATCH disagrees with the tools that actually dispatch to another " +
+    "registered handler (entry.handler( call sites in roshera-mcp/src). A tool present here but not " +
+    "derived is asserted rather than measured (H1's exact defect); a derived tool missing here " +
+    "silently reverts to fabricating {count: 0} for it (M2's exact defect).",
   );
 });
 

@@ -22,6 +22,7 @@ import {
   preDispatchGate,
   recordDispatchOutcome,
   attachGatePreflightGaps,
+  type GateDecision,
 } from "./gates.js";
 
 // ─── The capture shim ──────────────────────────────────────────────────────
@@ -53,7 +54,13 @@ export interface RegisteredTool {
   /** Normalized Zod object schema — defaults, `.optional()`, `.strict()` all
    *  preserved verbatim, so `invoke` validates byte-for-byte as a direct call. */
   schema: z.ZodTypeAny;
-  handler: (args: any, extra?: any) => any;
+  /** `decision` (3rd param, optional) is the SAME `GateDecision` the wrapper
+   *  below just computed for THIS dispatch — never a separate, later read of
+   *  gates.ts module state (M6, 2026-08-16 residuals). Every raw handler but
+   *  `timeline_checkpoint`'s ignores it; it is threaded through unconditionally
+   *  so the one handler that needs it never has to fall back to re-deriving
+   *  the same fact itself. */
+  handler: (args: any, extra?: any, decision?: GateDecision) => any;
 }
 
 /** True when `v` is a Zod schema (as opposed to a raw `{key: zodType}` shape). */
@@ -114,7 +121,12 @@ export class ToolTable implements ToolHost {
     // THIS call, not in module state read back by `recordDispatchOutcome`:
     // gate 3's own skip paths span two `await`s, so a module-level "last gap"
     // would race under interleaved dispatches (see gates.ts's `GateDecision`
-    // doc comment).
+    // doc comment). The SAME decision object is also handed straight into
+    // `rawHandler` as a 3rd argument (M6, 2026-08-16 residuals) — gate 6's
+    // `gate6WouldHaveRefused` verdict rides along on it for exactly the same
+    // reason: `timeline_checkpoint`'s handler must never take a second,
+    // later read of `gates.ts`'s module state to reconstruct a fact this
+    // call already decided.
     const rawHandler = t.handler;
     const wrapped: RegisteredTool["handler"] = async (args, extra) => {
       const turn = nextTurn();
@@ -123,7 +135,7 @@ export class ToolTable implements ToolHost {
         recordDispatchOutcome(t.name, args, decision.refusal, turn);
         return decision.refusal;
       }
-      let result = await rawHandler(args, extra);
+      let result = await rawHandler(args, extra, decision);
       if (decision.preflight && decision.preflight.length > 0) {
         result = attachGatePreflightGaps(result, decision.preflight);
       }

@@ -250,20 +250,98 @@ check("a real {count, tools} unverified_mutations reading lands in Postgres unch
   assert.deepEqual(again.rows[0].unverified_mutations, { count: 1, tools: ["boolean_subtract"] });
 });
 
-check("ensureSchema run against a database that already has rl_episode (no unverified_mutations column) adds it without reshaping anything else", async () => {
-  // Mirrors the exact concern schema.mjs's own docstring names for
+check("ensureSchema run against a database whose rl_episode predates unverified_mutations adds the column without reshaping anything else", async () => {
+  // M7 (2026-08-16 residuals): the old body of this test re-ran ensureSchema
+  // against THIS suite's own rl_episode — which already carries the column
+  // from setup at the top of this file — and only proved the re-run does not
+  // error or change the type. That is idempotency, not migration: it never
+  // constructed the shape the test's own name claims ("no unverified_mutations
+  // column"), so a schema.mjs regression that made the ALTER a no-op on a
+  // genuinely legacy table would still pass this test.
+  //
+  // Constructed for real here, on a SEPARATE Postgres schema and a SEPARATE
+  // connection — never on the shared rl_episode the rest of this file's
+  // checks depend on — mirroring schema.mjs's own docstring concern for
   // `gate_preflight`: `CREATE TABLE IF NOT EXISTS` creates, it never
-  // reshapes, so the ADD COLUMN statement must be safe to issue
-  // unconditionally against a database that already ran an older version of
-  // this file. Proven directly: the column info_schema lookup succeeds and
-  // the type is jsonb, on a schema this suite already called ensureSchema
-  // against once above — re-running it here must not error or alter the type.
-  await ensureSchema(client);
-  const col = await client.query(
-    `SELECT data_type FROM information_schema.columns WHERE table_name = 'rl_episode' AND column_name = 'unverified_mutations'`,
-  );
-  assert.equal(col.rows.length, 1, "the column exists");
-  assert.equal(col.rows[0].data_type, "jsonb");
+  // reshapes, so `ensureSchema`'s `CREATE TABLE IF NOT EXISTS rl_episode`
+  // statement (whose own column list never includes unverified_mutations —
+  // the column exists ONLY via the ALTER two statements later) will see this
+  // bare table already exists and leave it exactly as bare as it starts,
+  // making the ALTER the ONLY statement that could possibly add the column —
+  // exactly what a database that ran an older version of this file looks
+  // like.
+  const schemaName = `rl_test_migration_${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
+  const scoped = new pg.default.Client({ connectionString });
+  await scoped.connect();
+  try {
+    await scoped.query(`CREATE SCHEMA "${schemaName}"`);
+    await scoped.query(`SET search_path TO "${schemaName}"`);
+    // Verbatim from schema.mjs's own CREATE TABLE statements for rl_run and
+    // rl_episode (the FK target, then the table itself) — the pre-item-7
+    // shape, column for column, with unverified_mutations genuinely absent
+    // because it never appears in either CREATE TABLE (only in the later
+    // ALTER). Not a hand-picked minimal stand-in: every other column an
+    // ensureSchema run downstream of this one expects (run_id for the index
+    // statement two lines later, in particular) is present, so the ONLY
+    // thing under test is whether the ALTER adds the missing column.
+    await scoped.query(`CREATE TABLE rl_run (
+      run_id TEXT PRIMARY KEY,
+      schema_version TEXT,
+      split TEXT,
+      provenance JSONB,
+      attributable BOOLEAN NOT NULL,
+      first_ingested_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )`);
+    await scoped.query(`CREATE TABLE rl_episode (
+      episode_id TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL REFERENCES rl_run(run_id),
+      path TEXT,
+      task_id TEXT NOT NULL,
+      seed DOUBLE PRECISION,
+      started_at TIMESTAMPTZ,
+      outcome TEXT NOT NULL,
+      attributable BOOLEAN NOT NULL,
+      reward_final JSONB,
+      tokens DOUBLE PRECISION,
+      wall_ms DOUBLE PRECISION,
+      error TEXT,
+      model_scope JSONB,
+      source_digest TEXT NOT NULL,
+      ingested_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )`);
+
+    const before = await scoped.query(
+      `SELECT column_name FROM information_schema.columns WHERE table_schema = $1 AND table_name = 'rl_episode' AND column_name = 'unverified_mutations'`,
+      [schemaName],
+    );
+    assert.equal(
+      before.rows.length, 0,
+      "setup check: the column must genuinely be absent before ensureSchema runs, or this test proves nothing",
+    );
+
+    await ensureSchema(scoped);
+
+    const after = await scoped.query(
+      `SELECT data_type FROM information_schema.columns WHERE table_schema = $1 AND table_name = 'rl_episode' AND column_name = 'unverified_mutations'`,
+      [schemaName],
+    );
+    assert.equal(after.rows.length, 1, "ensureSchema must add the column to a table that predates it");
+    assert.equal(after.rows[0].data_type, "jsonb");
+
+    // The docstring's OTHER claim — "without reshaping anything else" —
+    // gets its own check: the pre-existing episode_id column must survive
+    // untouched (still the primary key, still text), not merely "some
+    // column happens to still be named episode_id".
+    const pk = await scoped.query(
+      `SELECT data_type FROM information_schema.columns WHERE table_schema = $1 AND table_name = 'rl_episode' AND column_name = 'episode_id'`,
+      [schemaName],
+    );
+    assert.equal(pk.rows.length, 1);
+    assert.equal(pk.rows[0].data_type, "text");
+  } finally {
+    await scoped.query(`DROP SCHEMA IF EXISTS "${schemaName}" CASCADE`);
+    await scoped.end();
+  }
 });
 
 check("ingesting the SAME file again leaves every row count unchanged — idempotency", async () => {

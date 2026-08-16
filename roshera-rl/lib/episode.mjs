@@ -131,8 +131,25 @@ export function verifyClaimActuallyMeasured(args, data) {
 /**
  * A pure function from the episode's own step log to "what mutating work, if
  * any, ended the episode unverified" — mirroring gates.ts's
- * `intentUnverified` bookkeeping (`gates.ts:1069-1089`) exactly, one call at
- * a time, in step order:
+ * `intentUnverified` bookkeeping (`gates.ts`'s `recordDispatchOutcome`), one
+ * call at a time, in step order — with ONE undocumented-until-now
+ * dependency (L5, 2026-08-16 residuals): gates.ts only ever tallies a
+ * `MUTATES_SOLIDS` call when `openIntent !== null` (`recordDispatchOutcome`'s
+ * own guard); this function has no `openIntent` concept at all and tallies
+ * every successful `MUTATES_SOLIDS` step unconditionally. The two agree
+ * TODAY only because gates.ts's intent gate refuses every intent-less
+ * mutation before it can succeed (`MUTATES_SOLIDS.has(tool) && openIntent
+ * === null` → refusal, `preDispatchGate`) — such a call reaches this
+ * package's step log as `ok: false` and is skipped at the top of the loop
+ * below, before it would ever reach the unconditional tally branch. That
+ * refusal is the coupling this function's accuracy rests on; if the intent
+ * gate ever stopped refusing an intent-less mutation (or a future caller
+ * fed this function a step log that never went through gates.ts at all),
+ * this function would silently start tallying calls gates.ts itself never
+ * counted. Not pinned mechanically — the two files disagree in SHAPE
+ * (`openIntent` is not data this function's step-log-only signature could
+ * see), not merely in a copied constant the `MUTATES_SOLIDS`/`VERIFIES`
+ * set-equality pins below can catch.
  *
  *   - a call that was refused or errored (`ok: false`) built nothing, so it
  *     is skipped entirely — matching gates.ts's own `result?.isError !== true`

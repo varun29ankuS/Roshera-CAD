@@ -118,9 +118,11 @@
  *      the escape is a recorded argument in the call, not an omission. The
  *      durable record only ever carries `skip_verification: true` when the
  *      gate would actually have refused without it (L1, 2026-08-15 final
- *      review, `gate6WouldRefuse` below) — a caller passing the flag on a
- *      checkpoint with nothing unverified under it gets a normal close, not
- *      a persisted claim that an escape was taken when none was.
+ *      review; the verdict is carried on `GateDecision.gate6WouldHaveRefused`,
+ *      M6, 2026-08-16 residuals — the handler never re-derives it) — a caller
+ *      passing the flag on a checkpoint with nothing unverified under it gets
+ *      a normal close, not a persisted claim that an escape was taken when
+ *      none was.
  *      `clear_timeline` is deliberately OUT of scope: it wipes the ledger the
  *      work lives in, so nagging to verify a part whose history is being
  *      destroyed is noise, not a constraint. Live session state, never cached
@@ -528,29 +530,6 @@ function clearUnverified(): void {
  */
 export function currentOpenIntent(): { name: string; turn: number } | null {
   return openIntent;
-}
-
-/**
- * Whether gate 6 would actually refuse a checkpoint close RIGHT NOW — i.e.
- * whether `skip_verification: true` on the next `timeline_checkpoint` call
- * would be escaping a real condition rather than a vacuous one.
- *
- * L1 (2026-08-15 final review): `timeline_checkpoint`'s handler used to
- * forward `skip_verification: true` to the backend — and the backend
- * persists it verbatim onto the durable `Checkpoint` — whenever the CALLER
- * passed it, with no regard for whether an open intent actually carried any
- * unverified mutating work. Gate 6 is TS-only (see the per-gate table in
- * this module's own doc) — nothing on the backend re-evaluates "was there
- * really something to skip" the way gate 3's unsound-base check does for
- * `acknowledge_unsound`, so there is no defence-in-depth reason to forward
- * the flag unconditionally the way that ack is. Persisting it anyway would
- * make the durable record assert an escape that was never taken — reading
- * as "verification was skipped" on a checkpoint that had nothing to verify.
- * The handler reads this before deciding whether to put the flag on the
- * wire at all.
- */
-export function gate6WouldRefuse(): boolean {
-  return openIntent !== null && intentUnverified.count > 0;
 }
 
 /** Hash key for the identical-call test: tool name + canonical (key-sorted,
@@ -1062,10 +1041,30 @@ export interface GatePreflightGap {
  * Threading the gap through the return value and then straight into the same
  * async call's own result is race-free by construction — there is nothing
  * for another interleaved dispatch to clobber.
+ *
+ * `gate6WouldHaveRefused`, present only for a proceeding `timeline_checkpoint`
+ * dispatch, is the SAME discipline applied to gate 6 (M6, 2026-08-16
+ * residuals): whether the close would have been refused WITHOUT
+ * `skip_verification` — i.e. whether the flag, if the caller passed it, is
+ * escaping a real condition. It is computed once, here, in the same
+ * synchronous evaluation that decided whether to proceed at all, and handed
+ * to the handler through this return value. The handler used to take a
+ * SECOND, independent read of the same module state
+ * (`intentUnverified`/`openIntent`, via a since-removed `gate6WouldRefuse`)
+ * after its own `await` boundary — exactly the module-state-read-back
+ * pattern this type's own doc above already refuses for gate 3, and for the
+ * identical reason: a concurrently in-flight dispatch's
+ * `recordDispatchOutcome` (a successful `verify_part`) can run in that gap
+ * and clear `intentUnverified` before the second read sees it, silently
+ * dropping a genuinely-taken escape from the durable record.
  */
 export type GateDecision =
   | { refusal: any }
-  | { proceed: true; preflight?: GatePreflightGap[] };
+  | {
+      proceed: true;
+      preflight?: GatePreflightGap[];
+      gate6WouldHaveRefused?: boolean;
+    };
 
 /**
  * Pre-dispatch gate, called by the ToolTable wrapper before the real handler.
@@ -1135,6 +1134,13 @@ export async function preDispatchGate(
     // one — the only close this surface has — so this is the last moment the
     // previous feature's result can be questioned. Refused when work ran under
     // it unverified, unless the caller says so explicitly.
+    //
+    // `gate6WouldRefuseWithoutEscape` is computed ONCE, here, in the same
+    // synchronous evaluation as the refusal check two lines below — not
+    // re-derived later by the handler (M6, 2026-08-16 residuals; see
+    // `GateDecision`'s own doc comment for the race that reintroduces).
+    const gate6WouldRefuseWithoutEscape =
+      openIntent !== null && intentUnverified.count > 0;
     if (
       openIntent !== null &&
       intentUnverified.count > 0 &&
@@ -1149,7 +1155,10 @@ export async function preDispatchGate(
         ),
       };
     }
-    return { proceed: true }; // a real intent phrase — let the handler record it
+    // a real intent phrase — let the handler record it. The verdict rides
+    // along in the decision itself; the handler must not take a second,
+    // later, independent read of the same module state to reconstruct it.
+    return { proceed: true, gate6WouldHaveRefused: gate6WouldRefuseWithoutEscape };
   }
   if (MUTATES_SOLIDS.has(tool) && openIntent === null) {
     return { refusal: intentGateRefusal(tool) };

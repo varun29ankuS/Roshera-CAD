@@ -213,10 +213,17 @@ function episodeRowFrom({ path, header, terminal, runId, attributable, sourceDig
     // written `unverified_mutations` into every terminal record (item 7) —
     // this column is the other half, mirroring `model_scope` immediately
     // above field-for-field: same always-present convention, same stated
-    // absence with a reason rather than a dropped key, for the same class of
-    // caller (a `Trajectory` built outside `episode.mjs`'s own drive loop,
-    // e.g. `runner.mjs`'s `setupFailedBeforeEpisode`, where no step history
-    // ever existed to derive it from).
+    // absence with a reason rather than a dropped key. This `??` branch is
+    // NOT for a `Trajectory` built outside `episode.mjs`'s own drive loop
+    // (`runner.mjs`'s `setupFailedBeforeEpisode` calls `close()` with no
+    // `unverifiedMutations` option, but `close()` itself already defaults
+    // the key — every terminal record it writes carries SOME value here, so
+    // that branch can never fire for that caller, or for any caller that
+    // goes through `close()`). The population this default actually serves
+    // (L4, 2026-08-16 residuals) is legacy JSONL predating item 7: a
+    // terminal record written before `unverified_mutations` existed at all,
+    // whose line carries no such key — the case `ingest_rows.test.mjs`'s
+    // "predates that" fixture names correctly.
     unverified_mutations: terminal.unverified_mutations ?? {
       absent: "the terminal record carried no unverified_mutations reading",
     },

@@ -6,7 +6,7 @@ import type { ToolHost } from "../registry.js";
 import { z } from "zod";
 import { randomUUID } from "node:crypto";
 import { api, ok, fail, ApiError } from "../core.js";
-import { gate6WouldRefuse } from "../gates.js";
+import type { GateDecision } from "../gates.js";
 
 /**
  * One stable session id per MCP process: the backend's undo/redo walk a
@@ -472,7 +472,10 @@ export function registerTimelineTools(server: ToolHost) {
       // survives a restart and is retrievable via timeline_checkpoints —
       // not merely a permitted call. Only sent as `true` when the caller
       // actually passed it AND gate 6 would actually have refused without it
-      // (L1, 2026-08-15 final review, `gate6WouldRefuse` in gates.ts) —
+      // (L1, 2026-08-15 final review; the verdict is read off the gate's own
+      // `GateDecision`, `gate6WouldHaveRefused` — M6, 2026-08-16 residuals,
+      // NOT a second, later, independent read of gates.ts module state,
+      // which a concurrently in-flight `verify_part` can clear in the gap) —
       // gate 6 is TS-only, so nothing on the backend re-checks whether there
       // really was anything to skip the way it does for `acknowledge_unsound`;
       // forwarding the flag unconditionally would let the durable record
@@ -486,14 +489,31 @@ export function registerTimelineTools(server: ToolHost) {
             "verification gate explicitly instead of silently",
         ),
     },
-    async ({ name, description, branch, skip_verification }) => {
+    async (
+      { name, description, branch, skip_verification },
+      _extra,
+      decision?: GateDecision,
+    ) => {
       try {
-        // L1: forward the flag only when it would actually be escaping
-        // something — read BEFORE the call, while intentUnverified still
-        // reflects the state the gate itself just evaluated for this exact
-        // dispatch (nothing else runs between the gate and this handler).
+        // L1 + M6 (2026-08-16 residuals): forward the flag only when it
+        // would actually be escaping something, read off the SAME decision
+        // `preDispatchGate` already made for THIS dispatch
+        // (`decision.gate6WouldHaveRefused`) — never a fresh, later,
+        // independent read of gates.ts module state. A concurrently
+        // in-flight dispatch's successful `verify_part` can clear
+        // `intentUnverified` in the gap after that decision was returned;
+        // reading module state again here would silently drop a genuinely
+        // taken escape from the durable record — the exact property this
+        // flag exists to guarantee. `decision` is always the `proceed`
+        // variant here (a refusal never reaches this handler), and always
+        // present (registry.ts's wrapper supplies it on every dispatch) —
+        // the checks below are a defensive fallback to `false`, never a
+        // fabricated `true`, should either assumption ever not hold.
         const escapedSomething =
-          skip_verification === true && gate6WouldRefuse();
+          skip_verification === true &&
+          decision !== undefined &&
+          "proceed" in decision &&
+          decision.gate6WouldHaveRefused === true;
         const r = await api("POST", "/api/timeline/checkpoint", {
           name,
           description,

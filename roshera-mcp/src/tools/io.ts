@@ -153,9 +153,7 @@ export function registerIoTools(server: ToolHost) {
     {
       part_id: z.number().int().describe("kernel part/solid id from list_parts"),
       name: z.string().optional().describe("title-block name for the sheet"),
-      // Read by the dispatch gate only (gates.ts); never forwarded to the
-      // backend — the handler below deliberately ignores it. Unlike the 9
-      // mutating geometry routes ACK_UNSOUND's doc comment (modify.ts)
+      // Unlike the 9 mutating geometry routes ACK_UNSOUND's doc comment (modify.ts)
       // describes, `POST /api/parts/{id}/drawing` (drawing_mgr::
       // create_part_drawing) NOW carries its own server-side solid-soundness
       // refusal, so this flag is forwarded rather than dropped. It used to be

@@ -326,6 +326,18 @@ check("drawing_export_sheet forwards acknowledge_unsound, distinctly from the la
   assert.equal(lastPdfQuery, null, "acknowledging unsoundness must not silently assert the layout flag");
 });
 
+// L6 (2026-08-16 residuals): the OMISSION direction was pinned for
+// make_drawing (a2 above) but not for drawing_export_sheet — a handler that
+// unconditionally forwarded acknowledge_unsound=true would have passed the
+// whole suite up to this point (the cert is clean, so the call would still
+// "proceed" either way; a3 above only ever exercises the flag PRESENT).
+rmSync(OUT, { force: true });
+const a4 = await call("drawing_export_sheet", exportArgs);
+check("drawing_export_sheet never defaults acknowledge_unsound onto a call that omitted it", () => {
+  assert.equal(firstJson(a4).refused, undefined);
+  assert.equal(lastPdfAckUnsound, null, "an omission must stay an omission on the export route too");
+});
+
 // ─── 4. unreadable certificate fails CLOSED ─────────────────────────────────
 
 // Captured rather than hardcoded: the property this check actually owns is
