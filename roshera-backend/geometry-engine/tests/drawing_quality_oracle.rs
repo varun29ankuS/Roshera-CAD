@@ -1245,9 +1245,9 @@ fn hole_tag_forced_onto_dimension_text_fires_collision() {
 ///
 /// Fixture note: `create_box_3d` builds a CENTRED plate (−20..20 in X/Y,
 /// −4..4 in Z), so bores at ±8 sit 12 mm and 28 mm from the part-corner
-/// datum at (−20, −20). The position labels ("12.00mm", "28.00mm") can
-/// never collide with extent/length labels ("40.00mm", "8.00mm") — the
-/// label-set containment check below is exact.
+/// datum at (−20, −20). The position labels ("12.00", "28.00" — suffix-free
+/// since the 2026-08-16 D4 fix) can never collide with extent/length labels
+/// ("40.00", "8.00") — the label-set containment check below is exact.
 ///
 /// Mutation proof (run 2026-07-04): disabling both position gates in
 /// `place_dimensions` makes position spans appear in the layout → RED.

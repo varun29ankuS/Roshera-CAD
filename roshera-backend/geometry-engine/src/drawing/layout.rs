@@ -1578,14 +1578,26 @@ fn dim_to_sheet(view: &ProjectedView, sheet_h: f64, p: [f64; 2]) -> [f64; 2] {
 /// with degenerate (zero-length) `line` / `ext` / arrows positioned at
 /// the label anchor — the renderer skips drawing lines/arrows for those.
 ///
-/// # Tabled-position suppression
+/// # Tabled-position AND tabled-diameter suppression (D2 fix)
 ///
 /// When `tabled_face_ids` is non-empty, every dimension with
-/// `kind == "position"` whose entity set intersects `tabled_face_ids`
-/// is DROPPED from the general dimension stack. These positions are
-/// represented in the hole table (X/Y columns) and tag callouts;
-/// rendering them again as stacked dim lines would be redundant and
-/// confusing for the machinist.
+/// `kind == "position"` OR `kind == "diameter"` whose entity set intersects
+/// `tabled_face_ids` is DROPPED from the general dimension stack. Positions
+/// are represented in the hole table's X/Y columns and tag callouts;
+/// diameters are represented in the hole table's Ø column keyed to the same
+/// tag. Rendering either again as a stacked dim line would be redundant and
+/// — for diameters specifically — actively harmful: `extract_dimensions`
+/// anchors a diameter callout's span across the FEATURE (e.g. a Ø12 hole),
+/// so at typical drawing scale the span is a few sheet-mm while its label
+/// ("Ø12.00") is wider than that, and the extension lines land nowhere near
+/// the circle they describe (2026-08 finding D2: "Ø12.00mm parked below the
+/// TOP view, extension lines that do not visually connect to the circle").
+/// A leader-with-callout was the other drafting-standard option; table
+/// delegation was chosen because the hole table already carries the full
+/// Ø + X + Y + depth row per tag, making a floating diameter dim strictly
+/// redundant, and because it reuses the exact suppression architecture
+/// already proven for positions rather than adding new leader-routing /
+/// collision-avoidance machinery.
 ///
 /// Interaction with `qualifies_for_baseline`: the baseline oracle applies
 /// only to the remaining (untabled) position dims. With all bores tabled,
@@ -1622,9 +1634,10 @@ pub(crate) fn place_dimensions(
     let mut vert: Vec<Lin> = Vec::new();
     let mut result: Vec<PlacedDimension> = Vec::new();
 
-    // Tabled-position predicate: this bore's X/Y live in the hole table.
+    // Tabled predicate: this bore's X/Y and/or Ø live in the hole table
+    // (D2 fix — diameter joins position in the suppression).
     let is_tabled = |d: &crate::drawing::dimensioning::Dimension2d| -> bool {
-        d.kind == "position"
+        matches!(d.kind.as_str(), "position" | "diameter")
             && !tabled_face_ids.is_empty()
             && d.entities.iter().any(|eid| tabled_face_ids.contains(eid))
     };
@@ -1641,10 +1654,10 @@ pub(crate) fn place_dimensions(
     let baseline = super::hole_table::qualifies_for_baseline(&untabled_positions);
 
     for d in &view.dimensions {
-        // Tabled-position suppression: skip position dims whose entity set
-        // intersects any tabled bore's face ids. These X/Y positions are
-        // represented in the hole table and must not appear again in the
-        // general dimension stack.
+        // Tabled-position / tabled-diameter suppression: skip position or
+        // diameter dims whose entity set intersects any tabled bore's face
+        // ids. These X/Y/Ø values are represented in the hole table and
+        // must not appear again in the general dimension stack (D2 fix).
         if is_tabled(d) {
             continue;
         }

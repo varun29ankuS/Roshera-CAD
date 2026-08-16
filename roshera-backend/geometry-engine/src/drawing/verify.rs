@@ -892,6 +892,258 @@ fn iso_marker_disagreement(
     None
 }
 
+// ── Standalone harness invariants (2026-08-16 drawing-quality brief) ─────────
+//
+// The four checks below (`find_text_collisions`, `find_ink_outside_frame`,
+// `find_span_overflows`, `section_shows_only_hatch`) are pure functions over
+// `SheetLayout` / `ProjectedView` that the visual harness
+// (`tests/drawing_visual_harness.rs`) calls directly. They are deliberately
+// NOT wired into `verify_drawing`'s `DrawingIssueKind` report: checked
+// empirically against the two most elaborate pre-existing fixtures
+// (`six_hole_plate`, `ring_plate` in `tests/drawing_quality_oracle.rs`),
+// `find_text_collisions` and `find_span_overflows` are BOTH currently silent
+// on both — so this is a deliberately conservative policy choice, not a
+// response to an observed conflict. These are four brand-new invariants
+// that have not been swept across this crate's 180+ drawing-adjacent test
+// binaries within this change's budget; folding them into the mandatory
+// `passed` gate is a real widening of what every future drawing must satisfy,
+// and that call belongs to whoever owns `verify_drawing`'s broader scope,
+// made deliberately rather than as a side effect of a Part-2 annotation fix.
+// The checks themselves are real, reusable, unit-tested production code
+// either way.
+
+/// One pair of overlapping TEXT-bearing sheet items — the general
+/// "no annotation text collides" invariant (brief Part 1, invariant #1).
+///
+/// Complements the existing `DimensionLabelCollision` / `ViewLabelCollision`
+/// / `GdtSymbolCollision` checks wired into `verify_drawing`: those police
+/// specific KNOWN pairings (ViewLabel × anything, GD&T × GD&T, dim/tag text
+/// × dim/tag text). This checks EVERY pair of text-carrying items with no
+/// kind restriction, so a pairing the existing checks don't cover (two
+/// `NoteText` lines, a `HoleTableText` cell against a `CuttingPlaneLabel`, a
+/// `ZoneRef` against a `DatumSymbol`, …) is not silently missed.
+#[derive(Debug, Clone)]
+pub struct TextCollision {
+    pub a_kind: SheetItemKind,
+    pub a_text: String,
+    pub a_bbox: Rect2,
+    pub b_kind: SheetItemKind,
+    pub b_text: String,
+    pub b_bbox: Rect2,
+}
+
+/// `SheetItemKind`s that carry glyphs — the universe [`find_text_collisions`]
+/// pairs. Deliberately excludes `ViewGeometry` / `TitleBlock` /
+/// `HoleTableBorder` (ink, not text) and `DatumMarker` / `ProjectionSymbol`
+/// (documented, intentional adjacency — see their doc comments on
+/// [`SheetItemKind`]).
+fn is_text_item(kind: SheetItemKind) -> bool {
+    matches!(
+        kind,
+        SheetItemKind::ViewLabel
+            | SheetItemKind::DimensionText
+            | SheetItemKind::HoleTag
+            | SheetItemKind::HoleTableText
+            | SheetItemKind::ZoneRef
+            | SheetItemKind::NoteText
+            | SheetItemKind::CuttingPlaneLabel
+            | SheetItemKind::DatumSymbol
+            | SheetItemKind::FcfBlock
+    )
+}
+
+/// Every pair of overlapping text items on the sheet, with full coordinates
+/// — a failure this returns names exactly what collided and where, per the
+/// brief's "a failure that says 'invariant violated' is worthless at 3am".
+pub fn find_text_collisions(layout: &super::layout::SheetLayout) -> Vec<TextCollision> {
+    let items: Vec<&super::layout::SheetItem> = layout
+        .items
+        .iter()
+        .filter(|it| is_text_item(it.kind))
+        .collect();
+    let mut out = Vec::new();
+    for i in 0..items.len() {
+        for j in (i + 1)..items.len() {
+            if items[i]
+                .bbox
+                .intersects(&items[j].bbox, DIM_TEXT_COLLISION_TOL_MM)
+            {
+                out.push(TextCollision {
+                    a_kind: items[i].kind,
+                    a_text: items[i].text.clone().unwrap_or_default(),
+                    a_bbox: items[i].bbox,
+                    b_kind: items[j].kind,
+                    b_text: items[j].text.clone().unwrap_or_default(),
+                    b_bbox: items[j].bbox,
+                });
+            }
+        }
+    }
+    out
+}
+
+/// The inner drawing frame rect for a sheet size — the same inset
+/// `frame_margins` produces internally to `verify_drawing`, exposed here so
+/// callers (the harness) can feed [`find_ink_outside_frame`] the exact rect
+/// the renderer draws, without duplicating the margin table.
+pub fn frame_rect(sheet: &super::types::SheetSize) -> Rect2 {
+    let (ml, mr, mt, mb) = frame_margins(sheet);
+    Rect2 {
+        x0: ml,
+        y0: mt,
+        x1: sheet.width() - mr,
+        y1: sheet.height() - mb,
+    }
+}
+
+/// One sheet item whose bbox extends past the drawing frame — brief Part 1,
+/// invariant #2: "all ink lies inside the frame".
+#[derive(Debug, Clone)]
+pub struct InkOutsideFrame {
+    pub kind: SheetItemKind,
+    pub text: String,
+    pub bbox: Rect2,
+}
+
+/// Every layout item that extends past `frame` by more than `SLACK_MM`.
+///
+/// Complements `verify_drawing`'s `ViewOutsideFrame`, which only checks a
+/// VIEW's own footprint (expanded by `DIM_MARGIN_MM` when dimensioned). This
+/// is the superset: it walks every item `compute_layout` produced — the hole
+/// table, GD&T callouts, the re-attached pictorial isometric, the
+/// cutting-plane labels placed by an independent free-rect search — any of
+/// which could in principle drift past the margin without tripping the
+/// view-scoped check.
+///
+/// `SheetItemKind::ZoneRef` is deliberately EXCLUDED: per ISO 5457 the
+/// zone-grid letters/numbers are furniture placed in the MARGIN, between the
+/// drawn frame border and the trimmed sheet edge — that is their correct,
+/// intentional position, not ink that escaped the frame. Confirmed
+/// empirically: without this exclusion every zone mark on a real sheet fires
+/// (found on the first run against the flange fixture, not assumed).
+pub fn find_ink_outside_frame(
+    layout: &super::layout::SheetLayout,
+    frame: Rect2,
+) -> Vec<InkOutsideFrame> {
+    layout
+        .items
+        .iter()
+        .filter(|it| it.kind != SheetItemKind::ZoneRef)
+        .filter(|it| !rect_contains(&frame, &it.bbox, SLACK_MM))
+        .map(|it| InkOutsideFrame {
+            kind: it.kind,
+            text: it.text.clone().unwrap_or_default(),
+            bbox: it.bbox,
+        })
+        .collect()
+}
+
+/// A placed dimension whose label text is wider than the span it measures —
+/// brief Part 1, invariant #3: "every dimension's text is legible at its own
+/// scale". `place_dimensions` always centres a linear dimension's label ON
+/// the span (never moves it outside the extension lines onto a leader), so
+/// when the approximate text width exceeds the span the number will overflow
+/// past its own arrows.
+#[derive(Debug, Clone)]
+pub struct DimensionSpanOverflow {
+    pub owner_view: usize,
+    pub label: String,
+    pub text_width_mm: f64,
+    pub span_mm: f64,
+    pub text_anchor: [f64; 2],
+}
+
+/// Sub-mm slack before an overflow counts — mirrors `DIM_TEXT_COLLISION_TOL_MM`.
+const SPAN_TEXT_TOL_MM: f64 = 0.5;
+
+/// Scan every placed dimension for a label wider than its own span.
+/// Point/angle callouts (`line[0] == line[1]`, zero span) are exempt — they
+/// are never centred on a span in the first place, so the "outside the span
+/// or on a leader" escape the brief names does not apply to them.
+pub fn find_span_overflows(layout: &super::layout::SheetLayout) -> Vec<DimensionSpanOverflow> {
+    let mut out = Vec::new();
+    for pd in &layout.dimensions {
+        let dx = pd.line[0][0] - pd.line[1][0];
+        let dy = pd.line[0][1] - pd.line[1][1];
+        let span = (dx * dx + dy * dy).sqrt();
+        if span < 1e-6 {
+            continue;
+        }
+        let text_w = pd.label.chars().count() as f64
+            * super::layout::GLYPH_ADVANCE_EM
+            * super::layout::DIM_TEXT_FONT_MM;
+        if text_w > span + SPAN_TEXT_TOL_MM {
+            out.push(DimensionSpanOverflow {
+                owner_view: pd.owner_view,
+                label: pd.label.clone(),
+                text_width_mm: text_w,
+                span_mm: span,
+                text_anchor: pd.text_anchor,
+            });
+        }
+    }
+    out
+}
+
+/// True when a view carrying a cutting plane shows ONLY the hatched cut
+/// cross-section, with no outline ink beyond it — **finding D1**
+/// (2026-08-16 drawing-quality brief), deliberately left `#[ignore]`d in the
+/// harness: the section-view repair is a separate pass (Part 3), not this
+/// change.
+///
+/// `drawing/section_view.rs` derives the outline from edges of the SAME
+/// triangles the hatch is clipped against (`edge_count`/`tris2d` share one
+/// source), so TODAY outline bbox == hatch bbox exactly and this always
+/// returns `true` for a real section — confirmed empirically against the
+/// live flange fixture (Ø120×14 disc, Ø50 bore, 4×Ø12 bolts) before this
+/// function was written, not assumed.
+///
+/// Approximation: judges "shows more than the cut" only when the outline
+/// extends beyond the hatched footprint by more than one hatch pitch
+/// (`section_view::HATCH_SPACING`) in some direction. A real silhouette edge
+/// for material BEHIND the plane (the far bore wall, the outer profile) is
+/// not confined inside the hatched triangles' own bbox, so the repaired
+/// section will grow past this margin; today's cut-faces-only output cannot.
+pub fn section_shows_only_hatch(view: &super::types::ProjectedView) -> bool {
+    if view.hatch_polylines.is_empty() {
+        return false; // not a section view (or nothing was cut) — no verdict
+    }
+    let bbox_of = |polys: &[super::types::Polyline2d]| -> Option<Rect2> {
+        let mut b: Option<Rect2> = None;
+        for p in polys {
+            for pt in &p.points {
+                b = Some(match b {
+                    None => Rect2 {
+                        x0: pt[0],
+                        y0: pt[1],
+                        x1: pt[0],
+                        y1: pt[1],
+                    },
+                    Some(r) => Rect2 {
+                        x0: r.x0.min(pt[0]),
+                        y0: r.y0.min(pt[1]),
+                        x1: r.x1.max(pt[0]),
+                        y1: r.y1.max(pt[1]),
+                    },
+                });
+            }
+        }
+        b
+    };
+    let Some(hatch_b) = bbox_of(&view.hatch_polylines) else {
+        return false;
+    };
+    let Some(outline_b) = bbox_of(&view.polylines) else {
+        return true; // hatch present, no outline at all — definitely missing
+    };
+    let margin = super::section_view::HATCH_SPACING;
+    let grew = outline_b.x0 < hatch_b.x0 - margin
+        || outline_b.x1 > hatch_b.x1 + margin
+        || outline_b.y0 < hatch_b.y0 - margin
+        || outline_b.y1 > hatch_b.y1 + margin;
+    !grew
+}
+
 fn error(kind: DrawingIssueKind, message: String, view: Option<String>) -> DrawingIssue {
     DrawingIssue {
         severity: Severity::Error,
@@ -1026,5 +1278,413 @@ mod iso_orientation_tests {
         let drawing = Drawing::new("t", super::super::types::SheetSize::A3);
         check_iso_orientation_agreement(&drawing, &mut issues);
         assert!(issues.is_empty(), "no iso cell ⇒ nothing to check");
+    }
+}
+
+// ── Standalone harness invariant tests (2026-08-16 drawing-quality) ──────────
+//
+// Detector-proof specimens: each test builds a deliberately bad input and
+// proves the check fires, plus a clean input and proves it stays silent.
+// Mutation proof for each: return `Vec::new()` / `false` unconditionally from
+// the function under test → the "must fire" half of the pair goes RED.
+#[cfg(test)]
+mod harness_invariant_tests {
+    use super::*;
+    use crate::drawing::layout::{ArrowSpec, PlacedDimension, SheetItem, SheetLayout};
+    use crate::drawing::types::{
+        Polyline2d, ProjectedView, ProjectedViewId, ProjectionType, ViewExtent, ViewSource,
+    };
+
+    fn empty_layout() -> SheetLayout {
+        SheetLayout {
+            sheet: Rect2 {
+                x0: 0.0,
+                y0: 0.0,
+                x1: 420.0,
+                y1: 297.0,
+            },
+            items: Vec::new(),
+            dimensions: Vec::new(),
+            hole_tags: Vec::new(),
+        }
+    }
+
+    fn text_item(kind: SheetItemKind, text: &str, bbox: Rect2) -> SheetItem {
+        SheetItem {
+            kind,
+            bbox,
+            owner_view: None,
+            text: Some(text.to_string()),
+        }
+    }
+
+    // ── find_text_collisions ──────────────────────────────────────────────
+
+    /// Two `NoteText` lines overlapping — a pairing the EXISTING wired checks
+    /// (`check_dimension_label_collisions`'s DimensionText/HoleTag/
+    /// CuttingPlaneLabel trio, and the ViewLabel/GD&T pairing in
+    /// `verify_drawing`) do not cover, since neither is a ViewLabel and
+    /// neither is DatumSymbol/FcfBlock. `find_text_collisions` must still
+    /// catch it.
+    #[test]
+    fn note_text_pair_overlap_detected() {
+        let mut layout = empty_layout();
+        let a = Rect2 {
+            x0: 10.0,
+            y0: 10.0,
+            x1: 40.0,
+            y1: 14.0,
+        };
+        let b = Rect2 {
+            x0: 20.0,
+            y0: 10.0,
+            x1: 50.0,
+            y1: 14.0,
+        };
+        layout
+            .items
+            .push(text_item(SheetItemKind::NoteText, "note one", a));
+        layout
+            .items
+            .push(text_item(SheetItemKind::NoteText, "note two", b));
+        let hits = find_text_collisions(&layout);
+        assert_eq!(hits.len(), 1, "overlapping NoteText pair must be caught");
+        assert_eq!(hits[0].a_text, "note one");
+        assert_eq!(hits[0].b_text, "note two");
+    }
+
+    /// Two non-overlapping text items produce no collision.
+    #[test]
+    fn non_overlapping_text_items_produce_no_collision() {
+        let mut layout = empty_layout();
+        layout.items.push(text_item(
+            SheetItemKind::NoteText,
+            "note one",
+            Rect2 {
+                x0: 10.0,
+                y0: 10.0,
+                x1: 20.0,
+                y1: 14.0,
+            },
+        ));
+        layout.items.push(text_item(
+            SheetItemKind::NoteText,
+            "note two",
+            Rect2 {
+                x0: 100.0,
+                y0: 100.0,
+                x1: 110.0,
+                y1: 104.0,
+            },
+        ));
+        assert!(find_text_collisions(&layout).is_empty());
+    }
+
+    /// `DatumMarker` and `ProjectionSymbol` are deliberately excluded from the
+    /// text-collision universe (documented, intentional adjacency on
+    /// `SheetItemKind`) — an overlap involving either must NOT be reported.
+    #[test]
+    fn datum_marker_and_projection_symbol_excluded() {
+        let mut layout = empty_layout();
+        let shared = Rect2 {
+            x0: 0.0,
+            y0: 0.0,
+            x1: 5.0,
+            y1: 5.0,
+        };
+        layout.items.push(SheetItem {
+            kind: SheetItemKind::DatumMarker,
+            bbox: shared,
+            owner_view: None,
+            text: Some("0,0".to_string()),
+        });
+        layout.items.push(SheetItem {
+            kind: SheetItemKind::ProjectionSymbol,
+            bbox: shared,
+            owner_view: None,
+            text: None,
+        });
+        assert!(find_text_collisions(&layout).is_empty());
+    }
+
+    // ── find_ink_outside_frame ─────────────────────────────────────────────
+
+    /// An item entirely within the frame produces no finding.
+    #[test]
+    fn ink_inside_frame_not_flagged() {
+        let mut layout = empty_layout();
+        layout.items.push(text_item(
+            SheetItemKind::ViewLabel,
+            "FRONT (1:1)",
+            Rect2 {
+                x0: 50.0,
+                y0: 50.0,
+                x1: 90.0,
+                y1: 55.0,
+            },
+        ));
+        let frame = Rect2 {
+            x0: 10.0,
+            y0: 10.0,
+            x1: 400.0,
+            y1: 280.0,
+        };
+        assert!(find_ink_outside_frame(&layout, frame).is_empty());
+    }
+
+    /// An item that pokes past the frame's right edge must be flagged, with
+    /// coordinates.
+    #[test]
+    fn ink_past_frame_edge_flagged() {
+        let mut layout = empty_layout();
+        layout.items.push(text_item(
+            SheetItemKind::CuttingPlaneLabel,
+            "A",
+            Rect2 {
+                x0: 395.0,
+                y0: 50.0,
+                x1: 410.0,
+                y1: 55.0,
+            },
+        ));
+        let frame = Rect2 {
+            x0: 10.0,
+            y0: 10.0,
+            x1: 400.0,
+            y1: 280.0,
+        };
+        let hits = find_ink_outside_frame(&layout, frame);
+        assert_eq!(
+            hits.len(),
+            1,
+            "item crossing the frame edge must be flagged"
+        );
+        assert_eq!(hits[0].text, "A");
+        assert!(
+            hits[0].bbox.x1 > frame.x1,
+            "reported bbox must carry the overrun coordinate"
+        );
+    }
+
+    /// `frame_rect` produces a rect strictly inside the sheet bounds for a
+    /// real sheet size (non-vacuous: margins are non-zero).
+    #[test]
+    fn frame_rect_is_inset_from_sheet() {
+        use crate::drawing::types::SheetSize;
+        let r = frame_rect(&SheetSize::A3);
+        assert!(r.x0 > 0.0 && r.y0 > 0.0);
+        assert!(r.x1 < SheetSize::A3.width());
+        assert!(r.y1 < SheetSize::A3.height());
+    }
+
+    // ── find_span_overflows ────────────────────────────────────────────────
+
+    fn placed_dim(label: &str, span: f64) -> PlacedDimension {
+        PlacedDimension {
+            line: [[0.0, 0.0], [span, 0.0]],
+            ext: [[[0.0, 0.0], [0.0, 0.0]], [[0.0, 0.0], [0.0, 0.0]]],
+            arrows: [
+                ArrowSpec {
+                    tip: [0.0, 0.0],
+                    dir: [1.0, 0.0],
+                },
+                ArrowSpec {
+                    tip: [span, 0.0],
+                    dir: [-1.0, 0.0],
+                },
+            ],
+            text_anchor: [span * 0.5, -1.4],
+            text_rot_deg: 0.0,
+            label: label.to_string(),
+            owner_view: 0,
+        }
+    }
+
+    /// A long label ("Ø120.00") on a 1 mm span is unreadable — the text is
+    /// centred ON a span far narrower than the glyphs themselves.
+    #[test]
+    fn narrow_span_wide_label_flagged() {
+        let mut layout = empty_layout();
+        layout.dimensions.push(placed_dim("\u{00d8}120.00", 1.0));
+        let overflows = find_span_overflows(&layout);
+        assert_eq!(overflows.len(), 1, "narrow-span wide label must be flagged");
+        assert!(overflows[0].text_width_mm > overflows[0].span_mm);
+    }
+
+    /// A comfortably wide span (90 mm) for a short label ("120.00") never
+    /// overflows.
+    #[test]
+    fn comfortable_span_not_flagged() {
+        let mut layout = empty_layout();
+        layout.dimensions.push(placed_dim("120.00", 90.0));
+        assert!(find_span_overflows(&layout).is_empty());
+    }
+
+    /// Degenerate (point/angle) callouts — `line[0] == line[1]`, zero span —
+    /// are exempt: `place_dimensions` never centres them ON a span.
+    #[test]
+    fn degenerate_point_callout_exempt() {
+        let mut layout = empty_layout();
+        let mut pd = placed_dim("45.0\u{00b0}", 0.0);
+        pd.line = [[10.0, 10.0], [10.0, 10.0]];
+        layout.dimensions.push(pd);
+        assert!(find_span_overflows(&layout).is_empty());
+    }
+
+    // ── section_shows_only_hatch ───────────────────────────────────────────
+
+    fn view_with(polylines: Vec<Polyline2d>, hatch: Vec<Polyline2d>) -> ProjectedView {
+        ProjectedView {
+            id: ProjectedViewId::new(),
+            name: "SECTION A-A".to_string(),
+            projection: ProjectionType::Custom {
+                rotation: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+            },
+            source: ViewSource::Part {
+                part_id: uuid::Uuid::nil(),
+                solid_id: 0,
+            },
+            position_mm: [0.0, 0.0],
+            scale: 1.0,
+            polylines,
+            extent: ViewExtent {
+                min_x: 0.0,
+                min_y: 0.0,
+                max_x: 10.0,
+                max_y: 10.0,
+            },
+            dimensions: Vec::new(),
+            centerlines: Vec::new(),
+            hidden_polylines: Vec::new(),
+            circles: Vec::new(),
+            hidden_circles: Vec::new(),
+            shaded_raster: None,
+            hatch_polylines: hatch,
+            polyline_sources: Vec::new(),
+        }
+    }
+
+    /// TODAY's real `section_view.rs` shape: outline == boundary of the SAME
+    /// triangles the hatch is clipped against, so outline bbox == hatch bbox.
+    /// `section_shows_only_hatch` must return `true` (the D1 defect).
+    #[test]
+    fn outline_matching_hatch_bbox_is_flagged() {
+        let outline = Polyline2d::from_points(vec![[0.0, 0.0], [10.0, 0.0], [10.0, 10.0]]);
+        let hatch = Polyline2d::from_points(vec![[1.0, 1.0], [9.0, 9.0]]);
+        let view = view_with(vec![outline], vec![hatch]);
+        assert!(
+            section_shows_only_hatch(&view),
+            "outline confined to the hatched footprint must be flagged as cut-faces-only"
+        );
+    }
+
+    /// Once a repaired section adds silhouette ink for material BEHIND the
+    /// plane (extending well past the hatched triangles' own bbox), the
+    /// check must go quiet.
+    #[test]
+    fn outline_extending_past_hatch_bbox_is_not_flagged() {
+        let outline = Polyline2d::from_points(vec![[0.0, 0.0], [10.0, 0.0], [10.0, 50.0]]);
+        let hatch = Polyline2d::from_points(vec![[1.0, 1.0], [9.0, 9.0]]);
+        let view = view_with(vec![outline], vec![hatch]);
+        assert!(
+            !section_shows_only_hatch(&view),
+            "outline ink well beyond the hatched footprint must NOT be flagged"
+        );
+    }
+
+    /// A non-section view (no hatch at all) is not judged — the check would
+    /// otherwise misfire on every ordinary orthographic view.
+    #[test]
+    fn no_hatch_no_verdict() {
+        let outline = Polyline2d::from_points(vec![[0.0, 0.0], [10.0, 0.0]]);
+        let view = view_with(vec![outline], Vec::new());
+        assert!(!section_shows_only_hatch(&view));
+    }
+
+    /// LIVE PIPELINE PROOF: the real `standard_drawing_auto` flange fixture's
+    /// SECTION A-A view — the exact shape finding D1 describes — must be
+    /// flagged by `section_shows_only_hatch` TODAY. This is the harness's own
+    /// self-check that the approximation is not accidentally green (advisor
+    /// caution: a staged invariant that is already green is worse than none).
+    #[test]
+    fn flange_section_view_is_flagged_today() {
+        use crate::math::{Point3, Vector3};
+        use crate::operations::boolean::{boolean_operation, BooleanOp, BooleanOptions};
+        use crate::primitives::topology_builder::{BRepModel, GeometryId, TopologyBuilder};
+
+        let mut m = BRepModel::new();
+        let disc = match TopologyBuilder::new(&mut m)
+            .create_cylinder_3d(
+                Point3::new(0.0, 0.0, 0.0),
+                Vector3::new(0.0, 0.0, 1.0),
+                60.0,
+                14.0,
+            )
+            .expect("disc")
+        {
+            GeometryId::Solid(s) => s,
+            o => panic!("{o:?}"),
+        };
+        let bore = match TopologyBuilder::new(&mut m)
+            .create_cylinder_3d(
+                Point3::new(0.0, 0.0, -5.0),
+                Vector3::new(0.0, 0.0, 1.0),
+                25.0,
+                24.0,
+            )
+            .expect("bore")
+        {
+            GeometryId::Solid(s) => s,
+            o => panic!("{o:?}"),
+        };
+        let mut cur = boolean_operation(
+            &mut m,
+            disc,
+            bore,
+            BooleanOp::Difference,
+            BooleanOptions::default(),
+        )
+        .expect("bore cut");
+        for (x, y) in [(45.0, 0.0), (-45.0, 0.0), (0.0, 45.0), (0.0, -45.0)] {
+            let hole = match TopologyBuilder::new(&mut m)
+                .create_cylinder_3d(
+                    Point3::new(x, y, -5.0),
+                    Vector3::new(0.0, 0.0, 1.0),
+                    6.0,
+                    24.0,
+                )
+                .expect("hole")
+            {
+                GeometryId::Solid(s) => s,
+                o => panic!("{o:?}"),
+            };
+            cur = boolean_operation(
+                &mut m,
+                cur,
+                hole,
+                BooleanOp::Difference,
+                BooleanOptions::default(),
+            )
+            .expect("bolt hole cut");
+        }
+        let drawing =
+            crate::drawing::dimensioning::standard_drawing_auto(&m, cur, uuid::Uuid::nil())
+                .expect("auto sheet");
+        let section = drawing
+            .views
+            .iter()
+            .find(|v| v.name == "SECTION A-A")
+            .expect("flange sheet must carry a SECTION A-A view");
+        assert!(
+            !section.hatch_polylines.is_empty(),
+            "specimen must actually be a hatched section, else this proves nothing"
+        );
+        assert!(
+            section_shows_only_hatch(section),
+            "D1 is unresolved today — the live section view must still read as \
+             cut-faces-only; this test flips to failing the moment the Part 3 \
+             section-view repair lands, which is the signal to un-ignore the \
+             harness's own D1 assertion"
+        );
     }
 }

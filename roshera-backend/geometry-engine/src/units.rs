@@ -187,6 +187,33 @@ impl LengthUnit {
         )
     }
 
+    /// Format a kernel-native (millimetre) length for display **without**
+    /// the unit suffix.
+    ///
+    /// Same conversion + precision core as [`Self::format_len`] — divide by
+    /// `per_mm()`, format to `precision()` decimal places — differing only
+    /// in the omitted [`Self::suffix()`]. This is the canonical path for any
+    /// drawing text whose unit is already declared once elsewhere on the
+    /// sheet: a dimension callout under the notes strip's "ALL DIMENSIONS IN
+    /// … UNLESS OTHERWISE STATED" (`Drawing::set_unit_notes`), or a GD&T
+    /// tolerance inside an FCF cell (ISO 1101 §7.2, via
+    /// [`Self::format_gdt_tolerance`], a thin wrapper over this same core).
+    /// Repeating the suffix on every value in that context is non-standard
+    /// drafting and wastes horizontal space — see `drawing/dimensioning.rs`
+    /// `Dimension2d::label` and `readable/dimensions.rs::extract_dimensions`.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// # use geometry_engine::units::LengthUnit;
+    /// assert_eq!(LengthUnit::Millimetre.format_len_bare(40.0), "40.00");
+    /// assert_eq!(LengthUnit::Inch.format_len_bare(25.4), "1.000");
+    /// ```
+    pub fn format_len_bare(self, mm: f64) -> String {
+        let converted = mm / self.per_mm();
+        format!("{:.prec$}", converted, prec = self.precision())
+    }
+
     /// Format a kernel-native (millimetre) tolerance value for use inside a
     /// **GD&T Feature Control Frame** — suffix omitted.
     ///
@@ -195,12 +222,10 @@ impl LengthUnit {
     /// (set via `Drawing::set_unit_notes`). Appending a suffix inside every
     /// FCF frame violates the standard and wastes horizontal space.
     ///
-    /// The conversion and precision core is **identical** to [`Self::format_len`]:
-    /// the value is divided by `per_mm()` and formatted to `precision()` decimal
-    /// places. The only difference is that no suffix is appended. This sharing
-    /// guarantees that a tolerance expressed in the document unit always
-    /// matches the numeric part of the corresponding length callout — no
-    /// independent rounding path.
+    /// A thin, GD&T-named wrapper over [`Self::format_len_bare`] — the
+    /// numeric core lives there. This sharing guarantees that a tolerance
+    /// expressed in the document unit always matches the numeric part of
+    /// the corresponding length callout — no independent rounding path.
     ///
     /// # Example
     ///
@@ -212,8 +237,7 @@ impl LengthUnit {
     /// assert_eq!(LengthUnit::Inch.format_gdt_tolerance(25.4), "1.000");
     /// ```
     pub fn format_gdt_tolerance(self, mm: f64) -> String {
-        let converted = mm / self.per_mm();
-        format!("{:.prec$}", converted, prec = self.precision())
+        self.format_len_bare(mm)
     }
 }
 
@@ -332,6 +356,30 @@ mod tests {
     fn mm_per_unit_alias_works() {
         assert_eq!(LengthUnit::Foot.mm_per_unit(), 304.8);
         assert_eq!(LengthUnit::Inch.mm_per_unit(), 25.4);
+    }
+
+    // ── format_len_bare: suffix-free sibling of format_len ───────────────────
+
+    /// `format_len_bare` must equal `format_len` with the suffix stripped,
+    /// across every unit — the exact table `format_len_*` already proves for
+    /// the suffixed form.
+    #[test]
+    fn format_len_bare_matches_format_len_minus_suffix() {
+        for (unit, mm, want) in [
+            (LengthUnit::Millimetre, 40.0, "40.00"),
+            (LengthUnit::Inch, 25.4, "1.000"),
+            (LengthUnit::Foot, 304.8, "1.0000"),
+            (LengthUnit::Metre, 1000.0, "1.0000"),
+            (LengthUnit::Centimetre, 25.4, "2.540"),
+        ] {
+            let bare = unit.format_len_bare(mm);
+            assert_eq!(bare, want, "{unit:?} format_len_bare mismatch");
+            assert_eq!(
+                unit.format_len(mm),
+                format!("{bare}{}", unit.suffix()),
+                "{unit:?}: format_len must be format_len_bare + suffix"
+            );
+        }
     }
 
     // ── format_gdt_tolerance: suffix-free, same numeric core as format_len ────

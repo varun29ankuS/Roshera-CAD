@@ -478,10 +478,15 @@ fn bore_position_from_part_corner_exact() {
         y_rec.value
     );
 
-    // Labels use drawing-style format: axis prefix + formatted value + unit suffix.
-    // Model default is Millimetre (2 dp) so: "X 15.00mm" / "Y 25.00mm".
-    assert_eq!(x_rec.label, "X 15.00mm", "label mismatch: {x_rec:?}");
-    assert_eq!(y_rec.label, "Y 25.00mm", "label mismatch: {y_rec:?}");
+    // Labels use drawing-style format: axis prefix + BARE formatted value —
+    // no unit suffix (2026-08-16 D4 fix: the sheet's notes strip already
+    // declares "ALL DIMENSIONS IN MILLIMETRES UNLESS OTHERWISE STATED", so
+    // repeating "mm" on every callout was non-standard drafting and the
+    // direct mechanical cause of D3, the "A" section label overlapping a
+    // wide "Ø12.00mm" callout it would have cleared as a bare "Ø12.00").
+    // Model default is Millimetre (2 dp) so: "X 15.00" / "Y 25.00".
+    assert_eq!(x_rec.label, "X 15.00", "label mismatch: {x_rec:?}");
+    assert_eq!(y_rec.label, "Y 25.00", "label mismatch: {y_rec:?}");
 
     // Datum must be Some with kind "part_corner".
     let x_datum = x_rec.datum.as_ref().expect("X position must carry a datum");
@@ -593,11 +598,22 @@ fn diagonal_axis_cylinder_emits_no_position_records() {
 }
 
 // ── Task 1 (ui-units campaign): unit-aware labels + coincident-row dedupe ──────
+//
+// SPEC CHANGE 2026-08-16 (D4 fix): drawing labels DROP the unit suffix — the
+// sheet's notes strip already declares "ALL DIMENSIONS IN MILLIMETRES UNLESS
+// OTHERWISE STATED" (or the equivalent for the document's unit) once, so a
+// per-callout suffix was non-standard drafting and the direct mechanical
+// cause of D3 (a wide "Ø12.00mm" callout collided with the section-arrow
+// label where a bare "Ø12.00" would have cleared it). The `unit` FIELD
+// (machine-readable, not drawn) is unaffected — only the drawn `label`
+// changes. `LengthUnit::format_gdt_tolerance` was already suffix-free for
+// GD&T FCF cells (ISO 1101 §7.2); this brings dimension labels in line via
+// the shared `LengthUnit::format_len_bare` core.
 
-/// Labels are formatted via `document_unit`. With the default Millimetre unit
-/// a Ø20 bore must label "Ø20.00mm" and its length must label "L 20.00mm".
+/// Labels are formatted via `document_unit`, suffix-free. With the default
+/// Millimetre unit a Ø20 bore must label "Ø20.00" and its length "L 20.00".
 #[test]
-fn labels_include_unit_suffix_in_default_mm() {
+fn labels_omit_unit_suffix_in_default_mm() {
     let mut m = BRepModel::new();
     // Model default is Millimetre.
     let plate = sid(TopologyBuilder::new(&mut m)
@@ -609,48 +625,53 @@ fn labels_include_unit_suffix_in_default_mm() {
     let part = diff(&mut m, plate, bore_cyl);
     let dims = extract_dimensions(&m, part);
 
-    // Diameter label must carry the "mm" suffix.
+    // Diameter label must NOT carry the "mm" suffix.
     let dia = dims
         .iter()
         .find(|d| d.kind == "diameter" && (d.value - 20.0).abs() < 1e-3)
         .expect("Ø20 diameter record must exist");
     assert_eq!(
-        dia.label, "Ø20.00mm",
-        "diameter label must include mm suffix: got {:?}",
+        dia.label, "Ø20.00",
+        "diameter label must omit the mm suffix: got {:?}",
         dia.label
     );
+    // The `unit` FIELD stays "mm" — it is machine-readable metadata, never
+    // drawn on the sheet, and unaffected by the D4 label-formatting fix.
     assert_eq!(dia.unit, "mm", "unit field must be 'mm'");
 
-    // Length label must carry the "mm" suffix.
+    // Length label must NOT carry the "mm" suffix.
     let len = dims
         .iter()
         .find(|d| d.kind == "length" && (d.value - 20.0).abs() < 1e-3)
         .expect("bore length 20mm record must exist");
-    assert!(
-        len.label.starts_with("L ") && len.label.ends_with("mm"),
-        "length label must be 'L <value>mm': got {:?}",
+    assert_eq!(
+        len.label, "L 20.00",
+        "length label must be 'L <value>' with no suffix: got {:?}",
         len.label
     );
 
-    // Extent labels carry the unit suffix too.
+    // Extent labels omit the unit suffix too.
     let ext_x = dims
         .iter()
         .find(|d| d.kind == "extent" && (d.value - 40.0).abs() < 1e-3)
         .expect("X/Y 40mm extent record must exist");
     assert!(
-        ext_x.label.ends_with("mm"),
-        "extent label must end with 'mm': got {:?}",
+        !ext_x.label.ends_with("mm"),
+        "extent label must not end with 'mm': got {:?}",
         ext_x.label
     );
 }
 
-/// With document_unit set to Inch, labels show the converted value + "in".
+/// With document_unit set to Inch, labels show the converted value with no
+/// suffix — the notes strip declares "ALL DIMENSIONS IN INCHES..." once
+/// regardless of document unit (`Drawing::set_unit_notes`), so the D4 rule
+/// applies uniformly, not only to the mm default.
 #[test]
-fn labels_reflect_inch_document_unit() {
+fn labels_reflect_inch_document_unit_with_no_suffix() {
     use geometry_engine::units::LengthUnit;
     let mut m = BRepModel::new();
     m.set_document_unit(LengthUnit::Inch);
-    // 25.4mm bore → Ø1.000in.
+    // 25.4mm bore → Ø1.000 (in inches, suffix-free).
     let plate = sid(TopologyBuilder::new(&mut m)
         .create_box_3d(50.8, 50.8, 25.4)
         .expect("plate"));
@@ -660,16 +681,17 @@ fn labels_reflect_inch_document_unit() {
     let part = diff(&mut m, plate, bore_cyl);
     let dims = extract_dimensions(&m, part);
 
-    // Ø25.4mm → "Ø1.000in".
+    // Ø25.4mm → "Ø1.000" (converted to inches, no "in" suffix on the label).
     let dia = dims
         .iter()
         .find(|d| d.kind == "diameter" && (d.value - 25.4).abs() < 1e-3)
         .expect("Ø25.4mm bore must exist");
     assert_eq!(
-        dia.label, "Ø1.000in",
-        "diameter label must be in inches: got {:?}",
+        dia.label, "Ø1.000",
+        "diameter label must be the bare inch value: got {:?}",
         dia.label
     );
+    // The `unit` FIELD still records "in" — machine-readable, not drawn.
     assert_eq!(dia.unit, "in", "unit field must be 'in'");
 }
 

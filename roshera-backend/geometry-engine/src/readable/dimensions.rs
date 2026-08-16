@@ -577,7 +577,7 @@ pub fn extract_dimensions(model: &BRepModel, solid_id: SolidId) -> Vec<Dimension
                 kind: "extent".into(),
                 value,
                 unit: unit_suffix.into(),
-                label: format!("{} {}", names[axis], unit.format_len(value)),
+                label: format!("{} {}", names[axis], unit.format_len_bare(value)),
                 entities: Vec::new(),
                 anchor,
                 direction: dirs[axis],
@@ -632,7 +632,7 @@ pub fn extract_dimensions(model: &BRepModel, solid_id: SolidId) -> Vec<Dimension
                     kind: "diameter".into(),
                     value: cyl.radius * 2.0,
                     unit: unit_suffix.into(),
-                    label: format!("Ø{}", unit.format_len(cyl.radius * 2.0)),
+                    label: format!("Ø{}", unit.format_len_bare(cyl.radius * 2.0)),
                     entities: vec![fid],
                     anchor,
                     direction: [rd.x, rd.y, rd.z],
@@ -647,7 +647,7 @@ pub fn extract_dimensions(model: &BRepModel, solid_id: SolidId) -> Vec<Dimension
                         kind: "length".into(),
                         value: length,
                         unit: unit_suffix.into(),
-                        label: format!("L {}", unit.format_len(length)),
+                        label: format!("L {}", unit.format_len_bare(length)),
                         entities: vec![fid],
                         anchor,
                         direction: [axis.x, axis.y, axis.z],
@@ -733,8 +733,11 @@ pub fn extract_dimensions(model: &BRepModel, solid_id: SolidId) -> Vec<Dimension
                             let mut dir = world_axes[perp_idx];
                             dir[perp_idx] *= sign;
 
-                            let label =
-                                format!("{} {}", axis_names[perp_idx], unit.format_len(offset));
+                            let label = format!(
+                                "{} {}",
+                                axis_names[perp_idx],
+                                unit.format_len_bare(offset)
+                            );
 
                             out.push(DimensionRecord {
                                 id: id(),
@@ -758,7 +761,7 @@ pub fn extract_dimensions(model: &BRepModel, solid_id: SolidId) -> Vec<Dimension
                     kind: "diameter".into(),
                     value: sph.radius * 2.0,
                     unit: unit_suffix.into(),
-                    label: format!("SØ{}", unit.format_len(sph.radius * 2.0)),
+                    label: format!("SØ{}", unit.format_len_bare(sph.radius * 2.0)),
                     entities: vec![fid],
                     anchor: [sph.center.x + sph.radius, sph.center.y, sph.center.z],
                     direction: [1.0, 0.0, 0.0],
@@ -800,7 +803,7 @@ pub fn extract_dimensions(model: &BRepModel, solid_id: SolidId) -> Vec<Dimension
                         kind: "diameter".into(),
                         value: base_r * 2.0,
                         unit: unit_suffix.into(),
-                        label: format!("Ø{}", unit.format_len(base_r * 2.0)),
+                        label: format!("Ø{}", unit.format_len_bare(base_r * 2.0)),
                         entities: vec![fid],
                         anchor,
                         direction: [1.0, 0.0, 0.0],

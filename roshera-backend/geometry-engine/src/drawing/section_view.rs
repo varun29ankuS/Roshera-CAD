@@ -23,7 +23,12 @@ use super::types::{
 
 /// Hatch line spacing in model units (pre-scale). Lands at a sensible on-sheet
 /// pitch (~2–3 mm) for the small/medium parts the drawing module targets.
-const HATCH_SPACING: f64 = 4.0;
+///
+/// `pub(crate)`: the D1 harness invariant in `drawing/verify.rs`
+/// (`section_shows_only_hatch`) reuses this exact constant as its tolerance
+/// margin so the check stays honest about what "beyond the hatched footprint"
+/// means in THIS renderer, rather than duplicating the literal.
+pub(crate) const HATCH_SPACING: f64 = 4.0;
 
 /// Build a SECTION view: cut `solid_id` on the plane `(origin, normal)` and
 /// return a [`ProjectedView`] whose polylines are the cut outline plus 45°

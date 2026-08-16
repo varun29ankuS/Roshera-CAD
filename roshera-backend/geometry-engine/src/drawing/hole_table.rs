@@ -92,9 +92,10 @@ pub struct HoleSite {
     /// B-Rep face entity ids for this bore (from the diameter record).
     ///
     /// Used by the dimension-placement filter to suppress `kind == "position"`
-    /// dimensions whose entity set intersects this bore's faces — those positions
-    /// are represented in the hole table's X/Y columns and must NOT also appear
-    /// in the general dimension stack (`place_dimensions` tabled-position suppression).
+    /// AND `kind == "diameter"` dimensions whose entity set intersects this
+    /// bore's faces — those X/Y/Ø values are represented in the hole table's
+    /// columns and must NOT also appear in the general dimension stack
+    /// (`place_dimensions` tabled-position / tabled-diameter suppression, D2 fix).
     #[serde(default)]
     pub face_entities: Vec<u32>,
     /// Reference datum the X/Y columns are measured from (campaign #55 Slice 1),
