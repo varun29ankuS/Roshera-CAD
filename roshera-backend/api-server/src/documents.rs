@@ -666,7 +666,30 @@ pub async fn activate(state: &AppState, document_id: &str) -> durability::Durabi
     state.csketches.clear();
     state.assemblies.clear();
     state.instanced_assemblies.clear();
-    state.drawings.clear();
+    // `state.drawings` is DELIBERATELY absent from this list (drawing-
+    // ownership fix, 2026-08-16 — replaces `state.drawings.clear()`,
+    // which stood here previously). Every OTHER manager above is keyed
+    // DIRECTLY by a raw kernel solid id with no notion of which document
+    // produced it, so the "stale mapping resolves to a different solid"
+    // hazard this comment opens with applies to them exactly as written.
+    // `DrawingManager` no longer has that shape: each registered drawing
+    // now carries its OWNER (`ModelKey::Part` / `ModelKey::Legacy {
+    // document_id }`, stamped once at creation — see `drawing_mgr.rs`'s
+    // module doc), and every read resolves the model FROM THAT OWNER,
+    // never from whichever document/part happens to be ambient. Clearing
+    // the registry here was the destructive MITIGATION for the very bug
+    // that fix closes — it protected the switch path by DESTROYING every
+    // drawing on it, data loss dressed as safety, and did nothing for the
+    // `X-Roshera-Part-Id` header case within a single document session.
+    // Post-fix, a document switch changes what `state.model` currently
+    // holds, and a `Legacy`-owned drawing's owner simply stops resolving
+    // (`drawing_mgr::resolve_owner_model`) until that SAME document is
+    // reactivated — at which point it is measurable again, with its
+    // content intact. A `Part`-owned drawing's owner does NOT come back
+    // on its own after this reset (`state.parts.clear()` two lines above
+    // is unconditional and parts are not document-scoped or replayed);
+    // that limitation is inherited from `PartManager`'s own reset, not
+    // introduced here, and is stated on `drawing_mgr::resolve_owner_model`.
 
     // 4. Point at the new document, then replay its persisted log — empty
     //    for a brand-new document (boots clean, `DurabilityStatus::Empty`);

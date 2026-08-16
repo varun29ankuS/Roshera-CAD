@@ -275,6 +275,57 @@ pub const PART_ID_HEADER: &str = "X-Roshera-Part-Id";
 #[derive(Clone)]
 pub struct ActiveModel(pub Arc<RwLock<BRepModel>>);
 
+/// The semantic identity `ActiveModel` resolved to — which document/part
+/// scope a resolved model handle actually corresponds to, NOT just the
+/// `Arc` pointing at it.
+///
+/// `ActiveModel` itself only carries the `Arc`, which is enough for every
+/// handler that merely wants to READ/MUTATE the currently-addressed model.
+/// A CREATION-time caller that must STAMP an owner on something durable
+/// (a drawing, at minimum — see `drawing_mgr.rs`'s `OwnedDrawing`) needs
+/// this key too, because the `Arc` alone cannot later be compared against
+/// "is this still the model my caller meant" once the caller is gone: the
+/// legacy `AppState.model` Arc survives a document switch and comes to
+/// hold DIFFERENT geometry (`documents::activate` mutates in place —
+/// see that function's own doc), so Arc identity is not document identity.
+/// A semantic key (`Part(uuid)` — stable as long as the part exists — or
+/// `Legacy { document_id }` — stable as long as that document stays
+/// active) is what survives being stored and re-resolved later.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ModelKey {
+    /// A part-scoped model, addressed by its `PartManager` UUID.
+    Part {
+        #[serde(rename = "part_id")]
+        id: Uuid,
+    },
+    /// The legacy singleton model (`AppState.model`), scoped to whichever
+    /// document it currently holds — `AppState.active_document` at the
+    /// moment of resolution. Always a real string: `active_document` is
+    /// initialised at boot to `durability::DURABILITY_SESSION_ID` and is
+    /// never empty/absent, so there is no separate "no document" case to
+    /// invent here — whatever the cell holds IS the stated value.
+    Legacy { document_id: String },
+}
+
+/// Parse and validate the `X-Roshera-Part-Id` header value. Shared by
+/// [`resolve_active_model`] and [`resolve_active_model_and_key`] so the
+/// UUID-parse-error message can never drift between the two — the only
+/// piece of real logic either function has beyond a lookup.
+fn parse_part_id_header(s: &str) -> Result<Uuid, ApiError> {
+    Uuid::parse_str(s).map_err(|_| {
+        ApiError::new(
+            ErrorCode::InvalidParameter,
+            format!("invalid {PART_ID_HEADER} header: not a UUID"),
+        )
+        .with_hint(
+            "Send the UUID returned from POST /api/parts in the \
+             X-Roshera-Part-Id header, or omit the header to use \
+             the default document.",
+        )
+    })
+}
+
 /// Pure routing function — given the legacy fallback model, the
 /// part registry, and an optional header value, decide which model
 /// the caller should use.
@@ -295,19 +346,60 @@ pub fn resolve_active_model(
         // path live until every handler is part-aware.
         None => Ok(Arc::clone(legacy)),
         Some(s) => {
-            let id = Uuid::parse_str(s).map_err(|_| {
-                ApiError::new(
-                    ErrorCode::InvalidParameter,
-                    format!("invalid {PART_ID_HEADER} header: not a UUID"),
-                )
-                .with_hint(
-                    "Send the UUID returned from POST /api/parts in the \
-                     X-Roshera-Part-Id header, or omit the header to use \
-                     the default document.",
-                )
-            })?;
+            let id = parse_part_id_header(s)?;
             parts.get(&id).ok_or_else(|| not_found(id))
         }
+    }
+}
+
+/// Like [`resolve_active_model`] but also returns the [`ModelKey`] the
+/// header resolved to — the routing rule is IDENTICAL (both share
+/// [`parse_part_id_header`] and [`PartManager::get`]), so a caller of this
+/// function and a caller of `resolve_active_model` can never disagree
+/// about which model a given header names.
+///
+/// `active_document` is the caller's ALREADY-read `AppState.active_document`
+/// value — passed in rather than read here so this stays a pure function
+/// (matching `resolve_active_model`'s own testability rationale) and so a
+/// caller that also needs the model handle pays for exactly one
+/// `active_document` read, not a second independent one that could race a
+/// concurrent `documents::activate`.
+pub fn resolve_active_model_and_key(
+    legacy: &Arc<RwLock<BRepModel>>,
+    parts: &PartManager,
+    header: Option<&str>,
+    active_document: &str,
+) -> Result<(Arc<RwLock<BRepModel>>, ModelKey), ApiError> {
+    match header {
+        None => Ok((
+            Arc::clone(legacy),
+            ModelKey::Legacy {
+                document_id: active_document.to_string(),
+            },
+        )),
+        Some(s) => {
+            let id = parse_part_id_header(s)?;
+            let model = parts.get(&id).ok_or_else(|| not_found(id))?;
+            Ok((model, ModelKey::Part { id }))
+        }
+    }
+}
+
+/// Extract and validate the `X-Roshera-Part-Id` header from raw request
+/// parts. Shared by the [`ActiveModel`] and [`ActiveModelKeyed`] extractor
+/// impls so the non-ASCII rejection can never drift between the two.
+fn header_str(parts: &axum::http::request::Parts) -> Result<Option<&str>, ApiError> {
+    match parts.headers.get(PART_ID_HEADER) {
+        None => Ok(None),
+        // `HeaderValue::to_str` rejects non-ASCII bytes — surface
+        // that as InvalidParameter rather than letting a kernel
+        // call inherit a half-decoded id.
+        Some(v) => Ok(Some(v.to_str().map_err(|_| {
+            ApiError::new(
+                ErrorCode::InvalidParameter,
+                format!("invalid {PART_ID_HEADER} header: non-ASCII bytes"),
+            )
+        })?)),
     }
 }
 
@@ -318,19 +410,41 @@ impl axum::extract::FromRequestParts<AppState> for ActiveModel {
         parts: &mut axum::http::request::Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        // `HeaderValue::to_str` rejects non-ASCII bytes — surface
-        // that as InvalidParameter rather than letting a kernel
-        // call inherit a half-decoded id.
-        let header_value: Option<&str> = match parts.headers.get(PART_ID_HEADER) {
-            None => None,
-            Some(v) => Some(v.to_str().map_err(|_| {
-                ApiError::new(
-                    ErrorCode::InvalidParameter,
-                    format!("invalid {PART_ID_HEADER} header: non-ASCII bytes"),
-                )
-            })?),
-        };
+        let header_value = header_str(parts)?;
         resolve_active_model(&state.model, &state.parts, header_value).map(ActiveModel)
+    }
+}
+
+/// Like [`ActiveModel`] but also carries the [`ModelKey`] the header
+/// resolved to. Used ONLY by drawing-creation handlers, which must stamp
+/// the new drawing's owner from the SAME resolution `ActiveModel` itself
+/// would have produced for the identical request — recomputing the header
+/// lookup independently (a second `header_str` + `resolve_active_model`
+/// call site) would risk diverging from `ActiveModel` under a concurrent
+/// part deletion between the two lookups: two independently-maintained
+/// answers to "which model is this request talking about" that could
+/// disagree, the exact "wiring-shape" defect class `roshera-backend/
+/// CLAUDE.md`'s disconnection-gate doc names. This extractor makes ONE
+/// resolution and hands out both halves of it.
+#[derive(Clone)]
+pub struct ActiveModelKeyed(pub Arc<RwLock<BRepModel>>, pub ModelKey);
+
+impl axum::extract::FromRequestParts<AppState> for ActiveModelKeyed {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let header_value = header_str(parts)?;
+        let active_document = state.active_document.read().await.clone();
+        let (model, key) = resolve_active_model_and_key(
+            &state.model,
+            &state.parts,
+            header_value,
+            &active_document,
+        )?;
+        Ok(ActiveModelKeyed(model, key))
     }
 }
 
@@ -764,5 +878,95 @@ mod tests {
         // The constant is part of the public wire contract — pin
         // it so a typo refactor can't silently break clients.
         assert_eq!(PART_ID_HEADER, "X-Roshera-Part-Id");
+    }
+
+    // ── resolve_active_model_and_key / ModelKey (drawing-ownership fix) ──
+
+    #[tokio::test]
+    async fn keyed_resolve_returns_legacy_key_with_active_document_when_header_absent() {
+        let legacy = fresh_legacy();
+        let mgr = PartManager::new();
+        let (resolved, key) = resolve_active_model_and_key(&legacy, &mgr, None, "doc-1")
+            .expect("absent header must resolve to the legacy model");
+        assert!(Arc::ptr_eq(&legacy, &resolved));
+        assert_eq!(
+            key,
+            ModelKey::Legacy {
+                document_id: "doc-1".to_string()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn keyed_resolve_returns_part_key_when_header_matches() {
+        let legacy = fresh_legacy();
+        let mgr = PartManager::new();
+        let id = mgr.create("Routed").await;
+        let header = id.to_string();
+        let (resolved, key) = resolve_active_model_and_key(&legacy, &mgr, Some(&header), "doc-1")
+            .expect("known id must resolve");
+        let expected = mgr.get(&id).expect("part missing after create");
+        assert!(Arc::ptr_eq(&expected, &resolved));
+        assert_eq!(key, ModelKey::Part { id });
+    }
+
+    #[tokio::test]
+    async fn keyed_resolve_agrees_with_resolve_active_model_on_every_path() {
+        // The two functions share `parse_part_id_header` + `PartManager::
+        // get` — pin that they can never disagree about WHICH model a
+        // given header names, only about whether the key is also reported.
+        let legacy = fresh_legacy();
+        let mgr = PartManager::new();
+        let id = mgr.create("Routed").await;
+        for header in [None, Some(id.to_string().as_str()), Some("not-a-uuid")] {
+            let plain = resolve_active_model(&legacy, &mgr, header);
+            let keyed = resolve_active_model_and_key(&legacy, &mgr, header, "doc-1");
+            match (plain, keyed) {
+                (Ok(p), Ok((k, _))) => assert!(Arc::ptr_eq(&p, &k), "header {header:?}"),
+                (Err(pe), Err(ke)) => assert_eq!(pe.code, ke.code, "header {header:?}"),
+                other => panic!(
+                    "resolve_active_model and resolve_active_model_and_key \
+                                  disagreed on Ok/Err for header {header:?}: {other:?}"
+                ),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn keyed_resolve_rejects_non_uuid_header_same_as_plain_resolve() {
+        let legacy = fresh_legacy();
+        let mgr = PartManager::new();
+        let err = resolve_active_model_and_key(&legacy, &mgr, Some("not-a-uuid"), "doc-1")
+            .expect_err("non-UUID must reject");
+        assert_eq!(err.code, ErrorCode::InvalidParameter);
+    }
+
+    #[tokio::test]
+    async fn keyed_resolve_rejects_unknown_part_id() {
+        let legacy = fresh_legacy();
+        let mgr = PartManager::new();
+        let phantom = Uuid::new_v4().to_string();
+        let err = resolve_active_model_and_key(&legacy, &mgr, Some(&phantom), "doc-1")
+            .expect_err("unknown id must reject");
+        assert_eq!(err.code, ErrorCode::PartNotFound);
+    }
+
+    #[test]
+    fn model_key_part_serializes_with_kind_and_part_id() {
+        let id = Uuid::new_v4();
+        let key = ModelKey::Part { id };
+        let json = serde_json::to_value(&key).expect("serialize");
+        assert_eq!(json["kind"], "part");
+        assert_eq!(json["part_id"], id.to_string());
+    }
+
+    #[test]
+    fn model_key_legacy_serializes_with_kind_and_document_id() {
+        let key = ModelKey::Legacy {
+            document_id: "doc-42".to_string(),
+        };
+        let json = serde_json::to_value(&key).expect("serialize");
+        assert_eq!(json["kind"], "legacy");
+        assert_eq!(json["document_id"], "doc-42");
     }
 }

@@ -35,6 +35,8 @@ mod csketch;
 mod documents;
 mod documents_tests;
 mod drawing_mgr;
+#[cfg(test)]
+mod drawing_ownership_tests;
 mod durability;
 #[cfg(test)]
 mod durability_boot_tests;

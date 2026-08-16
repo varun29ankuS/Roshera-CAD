@@ -140,10 +140,36 @@ async function jsonOrThrow<T>(resp: Response, context: string): Promise<T> {
   return resp.json() as Promise<T>
 }
 
-/** List every drawing the server knows about (returns just UUIDs). */
-export async function listDrawings(): Promise<string[]> {
+/**
+ * Which model a drawing's measurements are actually about.
+ *
+ * A drawing stores kernel solid ids, and those are small integers REUSED
+ * across documents — so a sheet is only meaningful against the model that
+ * produced it. The server binds each drawing to that model and discloses it
+ * here, which is why the listing is no longer a bare array of ids: reading
+ * the list while a different document or part is active, you can now see
+ * which one each entry belongs to instead of assuming it is the active one.
+ */
+export type DrawingOwner =
+  | { kind: 'part'; part_id: string }
+  | { kind: 'legacy'; document_id: string }
+
+export interface DrawingListEntry {
+  id: string
+  owner: DrawingOwner
+}
+
+/** List every drawing the server knows about, each with its disclosed owner. */
+export async function listDrawings(): Promise<DrawingListEntry[]> {
   const r = await fetch(`${API_HOST}/api/drawings`)
-  return jsonOrThrow<string[]>(r, 'listDrawings')
+  return jsonOrThrow<DrawingListEntry[]>(r, 'listDrawings')
+}
+
+/** Human-readable one-liner for a drawing's owner, for UI disclosure. */
+export function describeOwner(owner: DrawingOwner): string {
+  return owner.kind === 'part'
+    ? `part ${owner.part_id.slice(0, 8)}`
+    : `document ${owner.document_id.slice(0, 8)}`
 }
 
 /** Fetch the full `Drawing` (views + polylines) by id. */

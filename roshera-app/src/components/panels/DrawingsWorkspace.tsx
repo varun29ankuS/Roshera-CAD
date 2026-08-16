@@ -228,7 +228,12 @@ export function DrawingsWorkspace() {
   const refreshList = useCallback(async (preferId?: string) => {
     setError(null)
     try {
-      const ids = await listDrawings()
+      // `GET /api/drawings` now returns `{id, owner}` per entry rather than
+      // a bare id: a drawing is bound to the model that produced it, and the
+      // server discloses which. Only the ids are needed here, but the owner
+      // is deliberately available rather than discarded at the fetch layer.
+      const entries = await listDrawings()
+      const ids = entries.map((e) => e.id)
       // Resolve summaries in parallel — payload is tiny (no polylines
       // would be cheaper, but the kernel's `Drawing` JSON for a fresh
       // drawing is already < 200 B and we hit the cache after the

@@ -2166,8 +2166,24 @@ pub async fn mould_parameter(
     // IN PLACE and every reference (frontend, agents) survives. Only cleanly
     // re-derived sheets are present; a dangling/failed sheet keeps its old slot
     // and is reported in the certificate verdict, never silently wiped.
+    //
+    // Owner (drawing-ownership fix, 2026-08-16): a UUID that already has a
+    // registry slot keeps its EXISTING owner untouched — a mould changes a
+    // sheet's CONTENT, never which document/part it belongs to. A UUID with
+    // NO existing slot is stamped `ModelKey::Legacy { document_id: <the
+    // document this mould just ran against> }` — a STATED decision: this
+    // whole route (`mould_parameter`) takes no `X-Roshera-Part-Id` /
+    // part-scoping input at all, replaying the CURRENTLY ACTIVE document's
+    // own branch/timeline (`state.timeline`), so a drawing surfacing here
+    // for the first time can only ever be that document's own.
     if reconciled {
-        state.drawings.reconcile_from_replay(cand_drawings.drawings);
+        let mould_document_id = state.active_document.read().await.clone();
+        state.drawings.reconcile_from_replay(
+            cand_drawings.drawings,
+            crate::part_mgr::ModelKey::Legacy {
+                document_id: mould_document_id,
+            },
+        );
     }
 
     let session_key = session_uuid.to_string();

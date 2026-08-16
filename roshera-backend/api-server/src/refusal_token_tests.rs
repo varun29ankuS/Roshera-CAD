@@ -117,6 +117,29 @@ fn unsound_base_deliberately_does_not_carry_the_refused_token() {
     );
 }
 
+/// `drawing_owner_unresolvable` deliberately does NOT carry the token —
+/// see its doc in `error_catalog.rs`. Repair (reactivating the owning
+/// document, or recreating the owning part) leaves the SAME `drawing_id`
+/// and the SAME request `args`, exactly `unsound_base`'s caching hazard,
+/// not `sheet_unsound`'s (whose repair mints a fresh `drawing_id`). Pinned
+/// as a NEGATIVE, same as `unsound_base` above, so a future edit that
+/// "helpfully" adds the prefix here fails loudly instead of silently
+/// reintroducing a stale-cache risk.
+#[test]
+fn drawing_owner_unresolvable_deliberately_does_not_carry_the_refused_token() {
+    let owner = crate::part_mgr::ModelKey::Legacy {
+        document_id: "doc-1".to_string(),
+    };
+    let err = ApiError::drawing_owner_unresolvable(uuid::Uuid::nil(), &owner);
+    assert!(
+        !carries_the_refused_token(&err.error),
+        "drawing_owner_unresolvable must NOT carry REFUSED — see \
+         error_catalog.rs's doc for the caching hazard this avoids; \
+         error = {:?}",
+        err.error
+    );
+}
+
 #[test]
 fn sheet_uncertified_carries_the_refused_token() {
     let err = ApiError::sheet_uncertified(uuid::Uuid::nil());

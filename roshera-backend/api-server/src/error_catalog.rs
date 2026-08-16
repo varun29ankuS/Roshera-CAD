@@ -260,6 +260,46 @@ pub enum ErrorCode {
     /// either the flag or a regenerated sheet. `details` carries `gate`,
     /// `drawing_id`, and `error_count`.
     SheetQuality,
+    /// **Drawing ownership.** A registered [`Drawing`]'s OWNER — the
+    /// document/part it was CREATED against, stamped once and never
+    /// re-derived from a caller's header — does not resolve against the
+    /// server's current live state: the owning part was deleted, or a
+    /// DIFFERENT document is the one currently active. Distinct from
+    /// [`ErrorCode::SolidNotFound`] (`drawing_mgr.rs::not_found`): the
+    /// drawing itself is not missing — its registry entry, its stored
+    /// views, its owner tag are all still there — only the MODEL that
+    /// would certify it cannot be reached right now.
+    ///
+    /// This is the fix for the aliasing hazard L8b named: before this
+    /// code existed, a drawing whose owner didn't resolve was silently
+    /// certified against whatever model the CALLER's header happened to
+    /// select instead — a confident, wrong verdict. This code is what
+    /// that silent substitution was replaced with: an honest "cannot
+    /// reach it" rather than an answer about the wrong solid.
+    ///
+    /// **No bypass.** Unlike `UnsoundBase`, there is no
+    /// `acknowledge_*` escape — the caller cannot assert their way past a
+    /// model that genuinely is not there; the only real remedy is
+    /// reactivating the owning document (`POST /api/documents/{id}/open`)
+    /// or recreating the owning part. Mapped to HTTP 409 (a state
+    /// conflict — the request and the drawing id are both fine; the
+    /// server's CURRENT state cannot resolve the owner). Non-retryable:
+    /// the identical request against the identical server state earns the
+    /// identical refusal — it becomes possible again only after the owner
+    /// resolves. `details` carries `gate`, `drawing_id`, and `owner` (the
+    /// serialized [`crate::part_mgr::ModelKey`]).
+    ///
+    /// **Read/export split (deliberate):** export routes (`svg`/`pdf`/
+    /// `dxf`) refuse with this code — they produce an artifact, and
+    /// "certify the wrong thing" is the one failure mode an export can
+    /// never afford. `GET /api/drawings/{id}/semantic` and `/certificate`
+    /// do NOT refuse on this condition — they are read-only inspection
+    /// surfaces and disclose the stored snapshot with the certificate
+    /// (and `solid_soundness`) as a STATED ABSENCE instead, the same
+    /// disclose-don't-refuse ruling `SolidSoundnessDisclosure::
+    /// Unresolvable` already applies one level down. See
+    /// `drawing_mgr.rs`'s module doc for the full per-route ruling.
+    DrawingOwnerUnresolvable,
 
     // ── Idempotency layer ─────────────────────────────────────────
     /// `Idempotency-Key` header was sent with an empty value.
@@ -439,7 +479,8 @@ impl ErrorCode {
             // a conflict, not a bad value, so 409 rather than 422.
             | ErrorCode::UnsoundBase
             | ErrorCode::SheetUnsound
-            | ErrorCode::SheetQuality => StatusCode::CONFLICT,
+            | ErrorCode::SheetQuality
+            | ErrorCode::DrawingOwnerUnresolvable => StatusCode::CONFLICT,
             ErrorCode::IdempotencyBodyTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
 
             // Well-formed request, semantically unacceptable value —
@@ -555,6 +596,11 @@ impl ErrorCode {
             // `acknowledge_layout_issues=true`.
             | ErrorCode::SheetUnsound
             | ErrorCode::SheetQuality
+            // The owning document/part is a fact about SERVER state, not
+            // about the request — retrying the identical request without
+            // reactivating the owner earns the identical refusal, exactly
+            // like the two sheet gates above.
+            | ErrorCode::DrawingOwnerUnresolvable
             | ErrorCode::PermissionDenied
             | ErrorCode::MethodNotAllowed => false,
 
@@ -596,6 +642,7 @@ impl ErrorCode {
             ErrorCode::SheetUncertified => "sheet_uncertified",
             ErrorCode::SheetUnsound => "sheet_unsound",
             ErrorCode::SheetQuality => "sheet_quality",
+            ErrorCode::DrawingOwnerUnresolvable => "drawing_owner_unresolvable",
             ErrorCode::IdempotencyKeyEmpty => "idempotency_key_empty",
             ErrorCode::IdempotencyKeyTooLong => "idempotency_key_too_long",
             ErrorCode::IdempotencyKeyReused => "idempotency_key_reused",
@@ -649,6 +696,7 @@ impl ErrorCode {
             ErrorCode::SheetUncertified,
             ErrorCode::SheetUnsound,
             ErrorCode::SheetQuality,
+            ErrorCode::DrawingOwnerUnresolvable,
             ErrorCode::IdempotencyKeyEmpty,
             ErrorCode::IdempotencyKeyTooLong,
             ErrorCode::IdempotencyKeyReused,
@@ -1173,6 +1221,57 @@ impl ApiError {
             "gate": "sheet_quality",
             "solid_id": solid_id,
             "error_count": error_count,
+        }))
+    }
+
+    /// **Drawing owner unresolvable** (L8b, 2026-08-16 — the drawing-
+    /// ownership fix). `drawing_id` exists in the registry; `owner` is the
+    /// [`crate::part_mgr::ModelKey`] it was created against, which does not
+    /// resolve against the server's CURRENT live state. Used ONLY by the
+    /// three registered-export routes (`svg`/`pdf`/`dxf`) — see
+    /// [`ErrorCode::DrawingOwnerUnresolvable`]'s own doc for the full
+    /// read/export split and why exports fail closed here.
+    ///
+    /// **Deliberately does NOT open with `"REFUSED: "`** — this module's
+    /// own doc requires checking the `roshera-mcp/src/gates.ts` cache
+    /// interaction before adding that token to a NEW gate, and this one
+    /// fails the check that made `sheet_unsound` / `sheet_uncertified`
+    /// safe: repair there (`POST /api/parts/{id}/drawing`) mints a NEW
+    /// `drawing_id`, so a cached refusal keyed on the OLD id is simply
+    /// never looked up again. Repair HERE (`POST /api/documents/{id}/open`
+    /// to reactivate the owning document, or recreating the owning part)
+    /// leaves the SAME `drawing_id` and the SAME request `args` — exactly
+    /// `unsound_base`'s shape, not `sheet_unsound`'s. If `roshera-mcp`'s
+    /// generic refusal detector (`typedRefusalOf`'s REFUSED-token branch)
+    /// ever cached this refusal by `(tool, args)`, a repaired document's
+    /// retry could replay the STALE cached refusal instead of reaching the
+    /// server. Mirrors `unsound_base`'s own reasoning verbatim; see that
+    /// constructor's doc and `refusal_token_tests.rs`'s pin for this one.
+    pub fn drawing_owner_unresolvable(
+        drawing_id: uuid::Uuid,
+        owner: &crate::part_mgr::ModelKey,
+    ) -> Self {
+        Self::new(
+            ErrorCode::DrawingOwnerUnresolvable,
+            format!(
+                "drawing {drawing_id} exists, but the document/part it was \
+                 created against does not resolve against the server's \
+                 current live state — exporting it now would certify it \
+                 against whatever model happens to be active instead of \
+                 the one it was actually built from."
+            ),
+        )
+        .with_hint(
+            "Reactivate the owning document with POST /api/documents/{id}/open \
+             (for a legacy-owned drawing) or recreate the owning part (for a \
+             part-owned drawing), then retry the export. GET \
+             /api/drawings/{id}/semantic still discloses the stored sheet as \
+             a snapshot in the meantime.",
+        )
+        .with_details(serde_json::json!({
+            "gate": "drawing_owner_unresolvable",
+            "drawing_id": drawing_id,
+            "owner": owner,
         }))
     }
 

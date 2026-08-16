@@ -1,10 +1,10 @@
 //! Drawing module — kernel `Drawing` exposed over REST.
 //!
 //! Mirrors the [`AssemblyManager`](crate::assembly_mgr::AssemblyManager)
-//! pattern: a `DashMap<DrawingId, Arc<RwLock<Drawing>>>` so concurrent
-//! reads of different drawings never contend on the map and a single
-//! handler can hold a write lock across an `await` (none today, but
-//! the pattern is the same).
+//! pattern: a `DashMap<DrawingId, OwnedDrawing>` so concurrent reads of
+//! different drawings never contend on the map and a single handler can
+//! hold a write lock across an `await` (none today, but the pattern is
+//! the same).
 //!
 //! ## Why a manager instead of stashing inside `BRepModel`
 //!
@@ -12,8 +12,36 @@
 //! geometry — it owns 2D polylines projected at the time the view was
 //! added. Coupling drawings to a particular `BRepModel` instance would
 //! tangle their lifecycle with the active-part lifecycle; instead
-//! drawings live alongside `assemblies` and resolve solid ids against
-//! the active model at projection time.
+//! drawings live alongside `assemblies`, registered in one flat registry.
+//!
+//! ## Ownership (drawing-ownership fix, 2026-08-16 — see
+//! `.superpowers/sdd/2026-08-16-drawing-ownership/`)
+//!
+//! Kernel `SolidId`s are small integers REUSED across every document and
+//! every part-tab (`SolidId` is a per-`BRepModel` counter). A flat
+//! registry that resolved a stored drawing's solid ids against
+//! *whatever model the caller's request happened to route to*
+//! (`ActiveModel`, driven by the caller's own `X-Roshera-Part-Id` /
+//! `x-roshera-document` headers) meant a caller could certify — and
+//! export — document/part A's sheet against document/part B's unrelated
+//! geometry merely by naming B in an otherwise-unrelated header. That was
+//! filed as L8b: documented, not fixed, in the residuals wave, and closed
+//! here.
+//!
+//! Each [`Drawing`] is now paired with the [`ModelKey`](crate::part_mgr::
+//! ModelKey) that identifies the model it was CREATED against —
+//! `Part(uuid)` for a part-scoped model, `Legacy { document_id }` for the
+//! legacy singleton model, captured once and never re-derived from a
+//! later caller's header. Every read that touches geometry (certify,
+//! `/semantic`, `/certificate`, the sheet-soundness gates, the export
+//! paths) resolves the model FROM THAT OWNER via [`resolve_owner_model`],
+//! never from the caller's `ActiveModel`. `ActiveModel` no longer appears
+//! in any drawing-READ handler signature at all — the caller's header
+//! cannot influence which model an EXISTING drawing resolves against, so
+//! the aliasing this module used to carry is not merely checked for, it
+//! is inexpressible. (`ActiveModel` — via [`crate::part_mgr::
+//! ActiveModelKeyed`] — still appears at CREATION time, where it is the
+//! legitimate source of the NEW drawing's owner.)
 //!
 //! ## Wire shape
 //!
@@ -24,7 +52,7 @@
 //! same pattern: add fields to the kernel type, the wire follows.
 
 use crate::error_catalog::{ApiError, ErrorCode};
-use crate::part_mgr::ActiveModel;
+use crate::part_mgr::{ActiveModel, ActiveModelKeyed, ModelKey};
 use crate::AppState;
 use axum::{
     extract::{Path, Query, State},
@@ -50,15 +78,39 @@ use uuid::Uuid;
 
 // ── Manager ─────────────────────────────────────────────────────────
 
+/// One registry entry: a drawing paired with the owner it was CREATED
+/// against. `owner` never changes after creation (moving a drawing
+/// between documents/parts is out of scope — see the module doc); only
+/// `drawing`'s inner `RwLock` is ever mutated. Kept as ONE struct in ONE
+/// map — never a second, parallel `DashMap<Uuid, ModelKey>` that would
+/// have to be kept in lockstep by hand, the exact
+/// two-independently-maintained-surfaces defect this whole fix exists to
+/// close, in miniature.
+#[derive(Clone)]
+struct OwnedDrawing {
+    owner: ModelKey,
+    drawing: Arc<RwLock<Drawing>>,
+}
+
+/// One entry of `GET /api/drawings`'s listing — the drawing's id plus
+/// its disclosed owner, so a caller reading the list while a DIFFERENT
+/// document/part is active can see which document/part each entry's
+/// measurements would actually be about.
+#[derive(Debug, Clone, Serialize)]
+pub struct DrawingListEntry {
+    pub id: Uuid,
+    pub owner: ModelKey,
+}
+
 /// Registry of drawings keyed by [`DrawingId`].
 ///
 /// Same lifecycle / locking model as
 /// [`AssemblyManager`](crate::assembly_mgr::AssemblyManager): each
-/// entry is `Arc<RwLock<Drawing>>` so handlers can take a per-drawing
+/// entry wraps `Arc<RwLock<Drawing>>` so handlers can take a per-drawing
 /// write lock without contending on the map.
 #[derive(Default)]
 pub struct DrawingManager {
-    drawings: DashMap<Uuid, Arc<RwLock<Drawing>>>,
+    drawings: DashMap<Uuid, OwnedDrawing>,
     recorder: Option<Arc<dyn OperationRecorder>>,
 }
 
@@ -78,12 +130,6 @@ impl DrawingManager {
         }
     }
 
-    /// Drop every drawing. Used by `documents::activate` when switching the
-    /// live document. The recorder stays attached.
-    pub fn clear(&self) {
-        self.drawings.clear();
-    }
-
     /// Emit a recorded event; logs and swallows recorder errors so
     /// the underlying mutation is not unwound.
     pub fn record_event(&self, op: RecordedOperation) {
@@ -94,21 +140,33 @@ impl DrawingManager {
         }
     }
 
-    /// Allocate a fresh, empty drawing. Returns its UUID.
-    pub fn create(&self, name: impl Into<String>, sheet_size: SheetSize) -> Uuid {
+    /// Allocate a fresh, empty drawing owned by `owner`. Returns its UUID.
+    pub fn create(&self, name: impl Into<String>, sheet_size: SheetSize, owner: ModelKey) -> Uuid {
         let drawing = Drawing::new(name, sheet_size);
         let id = drawing.id.0;
-        self.drawings.insert(id, Arc::new(RwLock::new(drawing)));
+        self.drawings.insert(
+            id,
+            OwnedDrawing {
+                owner,
+                drawing: Arc::new(RwLock::new(drawing)),
+            },
+        );
         id
     }
 
     /// Register a fully-built drawing (e.g. an auto-generated standard
-    /// 3-view sheet) and return its UUID. Unlike [`create`], the views
-    /// and title block are already populated by the caller — this is the
-    /// one-call "right-click → drawing" path.
-    pub fn insert(&self, drawing: Drawing) -> Uuid {
+    /// 3-view sheet), owned by `owner`, and return its UUID. Unlike
+    /// [`create`], the views and title block are already populated by the
+    /// caller — this is the one-call "right-click → drawing" path.
+    pub fn insert(&self, drawing: Drawing, owner: ModelKey) -> Uuid {
         let id = drawing.id.0;
-        self.drawings.insert(id, Arc::new(RwLock::new(drawing)));
+        self.drawings.insert(
+            id,
+            OwnedDrawing {
+                owner,
+                drawing: Arc::new(RwLock::new(drawing)),
+            },
+        );
         id
     }
 
@@ -118,22 +176,72 @@ impl DrawingManager {
     /// (frontend, agents) keeps resolving to the same slot — now showing the
     /// post-mould geometry. Drawings NOT produced by the rebuild (empty `create`d
     /// sheets, manually composed views) are left untouched.
-    pub fn reconcile_from_replay(&self, rebuilt: std::collections::HashMap<Uuid, Drawing>) {
+    ///
+    /// **Owner handling (brief correction #2):** a mould changes a sheet's
+    /// CONTENT, never which document/part it belongs to — the EXISTING
+    /// owner is always preserved for a UUID that already has a slot. A
+    /// UUID with NO existing slot (upsert's insert half) is stamped with
+    /// `default_owner`. The caller (`handlers::timeline::mould_parameter`)
+    /// passes `ModelKey::Legacy { document_id: <the currently active
+    /// document> }` — a STATED decision, not a silent default: this
+    /// reconcile only ever runs against the branch/timeline of whichever
+    /// document is CURRENTLY live (the mould route takes no
+    /// `X-Roshera-Part-Id` / part-scoping input of its own at all), so a
+    /// drawing arriving here for the first time can only ever be that
+    /// document's own.
+    pub fn reconcile_from_replay(
+        &self,
+        rebuilt: std::collections::HashMap<Uuid, Drawing>,
+        default_owner: ModelKey,
+    ) {
         for (id, drawing) in rebuilt {
-            self.drawings.insert(id, Arc::new(RwLock::new(drawing)));
+            let owner = self
+                .drawings
+                .get(&id)
+                .map(|entry| entry.owner.clone())
+                .unwrap_or_else(|| default_owner.clone());
+            self.drawings.insert(
+                id,
+                OwnedDrawing {
+                    owner,
+                    drawing: Arc::new(RwLock::new(drawing)),
+                },
+            );
         }
     }
 
+    /// The drawing handle only — for handlers that mutate/read drawing
+    /// CONTENT (rename, title-block edit, add/remove view, quality re-run)
+    /// and have no business resolving geometry, so they never need the
+    /// owner.
     pub fn get(&self, id: &Uuid) -> Option<Arc<RwLock<Drawing>>> {
-        self.drawings.get(id).map(|e| Arc::clone(e.value()))
+        self.drawings.get(id).map(|e| Arc::clone(&e.drawing))
+    }
+
+    /// The drawing handle AND its owner — for the handlers that resolve
+    /// geometry against it (certify, `/semantic`, `/certificate`, the
+    /// sheet-soundness gates, the export paths). See [`resolve_owner_model`].
+    pub fn get_with_owner(&self, id: &Uuid) -> Option<(ModelKey, Arc<RwLock<Drawing>>)> {
+        self.drawings
+            .get(id)
+            .map(|e| (e.owner.clone(), Arc::clone(&e.drawing)))
     }
 
     pub fn delete(&self, id: &Uuid) -> Option<Arc<RwLock<Drawing>>> {
-        self.drawings.remove(id).map(|(_, v)| v)
+        self.drawings.remove(id).map(|(_, v)| v.drawing)
     }
 
-    pub fn list(&self) -> Vec<Uuid> {
-        self.drawings.iter().map(|e| *e.key()).collect()
+    /// Every registered drawing's id AND owner — never filtered by which
+    /// document/part is currently active. See `GET /api/drawings`'s own
+    /// doc for why disclosure, not filtering, is the ruling here.
+    pub fn list(&self) -> Vec<DrawingListEntry> {
+        self.drawings
+            .iter()
+            .map(|e| DrawingListEntry {
+                id: *e.key(),
+                owner: e.value().owner.clone(),
+            })
+            .collect()
     }
 
     pub fn len(&self) -> usize {
@@ -142,6 +250,74 @@ impl DrawingManager {
 
     pub fn is_empty(&self) -> bool {
         self.drawings.is_empty()
+    }
+}
+
+/// Resolve the model a drawing's OWNER identifies — the fix's whole
+/// point: a caller's `ActiveModel` header can no longer influence which
+/// model an EXISTING drawing's solids are measured against; only the
+/// owner recorded at CREATION can.
+///
+/// `None` means the owner is honestly unresolvable right now:
+/// - `ModelKey::Part` — the owning part is no longer registered
+///   (deleted, or a document switch cleared `state.parts` — see the
+///   module doc's "part-owned drawings" note: parts are NOT
+///   document-scoped or replayed, so a part-owned drawing's owner never
+///   becomes resolvable again after ANY document switch, even switching
+///   back).
+/// - `ModelKey::Legacy` — a DIFFERENT document is the one currently
+///   active. Reactivating the SAME document (`POST
+///   /api/documents/{id}/open`) makes it resolvable again — `activate`
+///   no longer destroys the drawing (the `state.drawings.clear()`
+///   removed from `documents::activate` by this same fix), it only
+///   changes what `state.model` currently holds.
+async fn resolve_owner_model(state: &AppState, owner: &ModelKey) -> Option<Arc<RwLock<BRepModel>>> {
+    match owner {
+        ModelKey::Part { id } => state.parts.get(id),
+        ModelKey::Legacy { document_id } => {
+            let active = state.active_document.read().await;
+            if *active == *document_id {
+                Some(Arc::clone(&state.model))
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// Document facet on drawing events — "the owner should win" (brief,
+/// 2026-08-16). `RecordedOperation`s recorded from this module normally
+/// pick up their document attribution ambiently, from
+/// `timeline_engine::recorder_bridge::DOCUMENT_OVERRIDE` — a task-local
+/// set by `main.rs::document_scope_layer` from the caller's OWN
+/// `X-Roshera-Document` header, independent of which document's geometry
+/// the request actually touched. A caller could have document A active,
+/// hold a drawing genuinely owned by A, and send `X-Roshera-Document: B`
+/// on an unrelated whim — the served content stays correct (this fix's
+/// whole point: the OWNER, not the header, decides which model
+/// certifies/exports), but the recorded EVENT would still be misattributed
+/// to B, the same provenance-mis-attribution class already fixed for
+/// booleans from the other direction two waves ago.
+///
+/// For a `Legacy`-owned drawing this is closeable: the owner's
+/// `document_id` IS the true document (by construction — `resolve_owner_
+/// model` only returns `Some` when it equals the CURRENTLY active
+/// document), so scoping the recording call under THAT id, nested inside
+/// (and overriding) any ambient scope, makes the owner win.
+///
+/// **Gap, named rather than closed:** a `Part`-owned drawing carries no
+/// document id on its owner at all — `ModelKey::Part` only names a part
+/// UUID, not the document that part-tab belongs to (parts are not
+/// document-scoped). There is nothing to correct the facet WITH for that
+/// case; ambient behaviour (whatever `DOCUMENT_OVERRIDE` / the sink's
+/// fallback to `active_document` already produce) is left unchanged, and
+/// is a residual this fix does not close — see the report.
+fn record_under_owner_document<F: FnOnce()>(owner: &ModelKey, f: F) {
+    match owner {
+        ModelKey::Legacy { document_id } => {
+            timeline_engine::recorder_bridge::DOCUMENT_OVERRIDE.sync_scope(document_id.clone(), f);
+        }
+        ModelKey::Part { .. } => f(),
     }
 }
 
@@ -303,8 +479,19 @@ fn not_found(id: Uuid) -> ApiError {
     .with_hint("Create one via POST /api/drawings first.")
 }
 
+/// `POST /api/drawings` — allocate a fresh, empty drawing. Takes
+/// [`ActiveModelKeyed`] (drawing-ownership fix, 2026-08-16) purely to
+/// determine the OWNER to stamp on the new registry slot — the returned
+/// model handle itself is unused, since an empty drawing carries no
+/// geometry yet. "No way to have a drawing without an owner" applies here
+/// too: an unknown/malformed `X-Roshera-Part-Id` header now rejects this
+/// call (via the SAME `PartNotFound`/`InvalidParameter` errors every other
+/// `ActiveModel`-consuming route already gives that header) rather than
+/// being silently ignored as it was before this fix — reported as a
+/// deliberate, minor behaviour change, not an oversight.
 pub async fn create_drawing(
     State(state): State<AppState>,
+    ActiveModelKeyed(_model_handle, owner): ActiveModelKeyed,
     Json(req): Json<CreateDrawingRequest>,
 ) -> Result<Json<CreateDrawingResponse>, ApiError> {
     if req.name.trim().is_empty() {
@@ -315,19 +502,32 @@ pub async fn create_drawing(
     }
     let name = req.name.clone();
     let sheet = req.sheet_size;
-    let id = state.drawings.create(req.name, req.sheet_size);
-    state.drawings.record_event(
-        RecordedOperation::new("drawing.create")
-            .with_parameters(serde_json::json!({
-                "name": name,
-                "sheet_size": sheet,
-            }))
-            .with_output_drawing(id),
-    );
+    let id = state
+        .drawings
+        .create(req.name, req.sheet_size, owner.clone());
+    record_under_owner_document(&owner, || {
+        state.drawings.record_event(
+            RecordedOperation::new("drawing.create")
+                .with_parameters(serde_json::json!({
+                    "name": name,
+                    "sheet_size": sheet,
+                }))
+                .with_output_drawing(id),
+        );
+    });
     Ok(Json(CreateDrawingResponse { id }))
 }
 
-pub async fn list_drawings(State(state): State<AppState>) -> Json<Vec<Uuid>> {
+/// `GET /api/drawings` — every registered drawing, id AND owner, NEVER
+/// filtered by which document/part is currently active (drawing-ownership
+/// fix, 2026-08-16). Filtering would silently hide a drawing that belongs
+/// to a document the caller merely isn't looking at right now — the same
+/// disclose-don't-refuse ruling `/semantic` applies one level down. A
+/// caller reading this list while document/part B is active can now see,
+/// per entry, which document/part its measurements would actually be
+/// about — this is a WIRE-SHAPE CHANGE from the previous bare `Vec<Uuid>`
+/// (report this to the frontend: `DocumentTabs` reads this route today).
+pub async fn list_drawings(State(state): State<AppState>) -> Json<Vec<DrawingListEntry>> {
     Json(state.drawings.list())
 }
 
@@ -474,13 +674,70 @@ pub async fn add_view(
             "scale must be a positive finite number",
         ));
     }
-    let handle = state.drawings.get(&id).ok_or_else(|| not_found(id))?;
+    let (owner, handle) = state
+        .drawings
+        .get_with_owner(&id)
+        .ok_or_else(|| not_found(id))?;
 
     // Resolve the BRepModel from the durable part_id carried on the
     // request. Doing this here keeps the view source explicit on the
     // wire (no dependency on which tab the client happens to have
     // active) and makes the recorded event reproducible.
     let ViewSource::Part { part_id, .. } = req.source;
+
+    // Owner-consistency gate (drawing-ownership fix, 2026-08-16). Every
+    // view this route accepts is part-sourced BY CONTRACT — `part_id`
+    // must resolve against `PartManager` a few lines below, so it is a
+    // real `PartManager` id, never the "viewport uuid or nil" `part_id`
+    // can otherwise hold on a kernel-solid-id-keyed drawing (see the
+    // module doc). A view whose part does NOT match the drawing's OWNER
+    // would make every later owner-scoped read (certify, `/semantic`,
+    // `/certificate`, the export gates) measure this ONE view against the
+    // WRONG model — a fresh, deterministic lie this fix would otherwise
+    // have INTRODUCED, and strictly worse than the pre-fix aliasing bug:
+    // today's caller could at least reach truth by sending the right
+    // header at READ time; post-fix nothing they send at read time
+    // matters at all, so a mis-sourced view would be permanently wrong.
+    // Refused here, at the one place `part_id` is trustworthy — an
+    // existing drawing's owner is fixed at creation (see the module doc)
+    // and cannot be inferred from a view source after the fact.
+    match &owner {
+        ModelKey::Part { id: owner_part } if *owner_part != part_id => {
+            return Err(ApiError::new(
+                ErrorCode::InvalidParameter,
+                format!(
+                    "view source names part {part_id}, but drawing {id} is \
+                     owned by part {owner_part} — a view sourced from a \
+                     DIFFERENT part cannot be added to this drawing, or \
+                     every later read of it would measure the wrong \
+                     part's geometry"
+                ),
+            )
+            .with_hint(format!(
+                "Add this view to a drawing created under X-Roshera-Part-Id: \
+                 {part_id} instead, or source the view from part \
+                 {owner_part} (this drawing's owner)."
+            )));
+        }
+        ModelKey::Legacy { document_id } => {
+            return Err(ApiError::new(
+                ErrorCode::InvalidParameter,
+                format!(
+                    "drawing {id} is owned by the legacy/document model \
+                     (document '{document_id}'), not any part-tab, but the \
+                     view source names part {part_id} — a part-sourced \
+                     view cannot be added to a legacy-owned drawing, or a \
+                     later read would measure the wrong model"
+                ),
+            )
+            .with_hint(format!(
+                "Create the drawing itself under X-Roshera-Part-Id: \
+                 {part_id} instead, then add this view to that drawing."
+            )));
+        }
+        ModelKey::Part { .. } => {} // owner_part == part_id — proceed.
+    }
+
     let model_handle = state.parts.get(&part_id).ok_or_else(|| {
         ApiError::new(
             ErrorCode::SolidNotFound,
@@ -561,13 +818,35 @@ pub async fn remove_view(
     Ok(Json(serde_json::json!({ "success": true })))
 }
 
+/// Shared first step of every registered-export route (`svg`/`pdf`/`dxf`,
+/// drawing-ownership fix, 2026-08-16): fetch the drawing by id and resolve
+/// its OWNER'S model. `not_found` if the drawing itself is missing;
+/// [`ErrorCode::DrawingOwnerUnresolvable`] (fail CLOSED — see that code's
+/// own doc for why export never disclose-don't-refuses the way
+/// `/semantic` and `/certificate` do) if the drawing exists but its owner
+/// does not resolve against live state right now. `ActiveModel` never
+/// enters this at all — the caller's header cannot influence which model
+/// an export certifies against.
+async fn fetch_owned_drawing_for_export(
+    state: &AppState,
+    id: Uuid,
+) -> Result<(Arc<RwLock<BRepModel>>, Arc<RwLock<Drawing>>, ModelKey), ApiError> {
+    let (owner, handle) = state
+        .drawings
+        .get_with_owner(&id)
+        .ok_or_else(|| not_found(id))?;
+    let model_handle = resolve_owner_model(state, &owner)
+        .await
+        .ok_or_else(|| ApiError::drawing_owner_unresolvable(id, &owner))?;
+    Ok((model_handle, handle, owner))
+}
+
 pub async fn export_svg(
     State(state): State<AppState>,
-    ActiveModel(model_handle): ActiveModel,
     Path(id): Path<Uuid>,
     Query(q): Query<ExportQuery>,
 ) -> Result<Response, ApiError> {
-    let handle = state.drawings.get(&id).ok_or_else(|| not_found(id))?;
+    let (model_handle, handle, owner) = fetch_owned_drawing_for_export(&state, id).await?;
     let snapshot = { handle.read().await.clone() };
 
     // Concern A (2026-08-15 closeout) — the solid-soundness gate. See
@@ -629,16 +908,21 @@ pub async fn export_svg(
         if q.acknowledge_unsound {
             parameters["acknowledge_unsound"] = serde_json::json!(true);
         }
-        timeline_engine::recorder_bridge::ACK_UNSOUND_OVERRIDE.sync_scope(
-            q.acknowledge_unsound,
-            || {
-                state.drawings.record_event(
-                    RecordedOperation::new("drawing.export")
-                        .with_parameters(parameters)
-                        .with_input_drawing(id),
-                );
-            },
-        );
+        // Document facet (drawing-ownership fix, 2026-08-16): the OWNER
+        // wins over whatever ambient `X-Roshera-Document` header the
+        // caller sent — see `record_under_owner_document`'s own doc.
+        record_under_owner_document(&owner, || {
+            timeline_engine::recorder_bridge::ACK_UNSOUND_OVERRIDE.sync_scope(
+                q.acknowledge_unsound,
+                || {
+                    state.drawings.record_event(
+                        RecordedOperation::new("drawing.export")
+                            .with_parameters(parameters)
+                            .with_input_drawing(id),
+                    );
+                },
+            );
+        });
     }
 
     let content_type = if q.plain {
@@ -872,11 +1156,11 @@ async fn drawing_svg_for_solid(
 /// drawing's UUID.
 pub async fn create_part_drawing(
     State(state): State<AppState>,
-    ActiveModel(model_handle): ActiveModel,
+    ActiveModelKeyed(model_handle, owner): ActiveModelKeyed,
     Path(id): Path<SolidId>,
     Query(q): Query<PartDrawingQuery>,
 ) -> Result<Json<PartDrawingResponse>, Response> {
-    create_part_drawing_inner(state, model_handle, id, Uuid::nil(), q).await
+    create_part_drawing_inner(state, model_handle, owner, id, Uuid::nil(), q).await
 }
 
 /// `POST /api/parts/uuid/{uuid}/drawing` — UUID-keyed wrapper. The
@@ -886,14 +1170,14 @@ pub async fn create_part_drawing(
 /// drawing stays pinned to the geometry it was generated from.
 pub async fn create_part_drawing_by_uuid(
     State(state): State<AppState>,
-    ActiveModel(model_handle): ActiveModel,
+    ActiveModelKeyed(model_handle, owner): ActiveModelKeyed,
     Path(uuid): Path<Uuid>,
     Query(q): Query<PartDrawingQuery>,
 ) -> Result<Json<PartDrawingResponse>, Response> {
     let solid_id = state
         .get_local_id(&uuid)
         .ok_or_else(|| StatusCode::NOT_FOUND.into_response())?;
-    create_part_drawing_inner(state, model_handle, solid_id, uuid, q).await
+    create_part_drawing_inner(state, model_handle, owner, solid_id, uuid, q).await
 }
 
 /// Widened to `Result<_, Response>` rather than `Result<_, ApiError>`
@@ -910,6 +1194,7 @@ pub async fn create_part_drawing_by_uuid(
 async fn create_part_drawing_inner(
     state: AppState,
     model_handle: std::sync::Arc<RwLock<BRepModel>>,
+    owner: ModelKey,
     solid_id: SolidId,
     part_uuid: Uuid,
     q: PartDrawingQuery,
@@ -958,7 +1243,7 @@ async fn create_part_drawing_inner(
     // outline, sheet utilization).
     let quality = verify_drawing(&drawing);
 
-    let drawing_id = state.drawings.insert(drawing);
+    let drawing_id = state.drawings.insert(drawing, owner.clone());
     // L3 (2026-08-16 residuals): this route also gates on `acknowledge_
     // unsound` (`refuse_unsound_solid` above), and its event ALREADY
     // carries the flag as a plain JSON parameter (unconditionally, `true`
@@ -969,30 +1254,38 @@ async fn create_part_drawing_inner(
     // `ACK_UNSOUND_OVERRIDE.sync_scope` only stamps when the scoped value
     // is `true`, so scoping unconditionally with `q.acknowledge_unsound`
     // is the correct, doc-specified shape for an always-recorded event.
-    timeline_engine::recorder_bridge::ACK_UNSOUND_OVERRIDE.sync_scope(
-        q.acknowledge_unsound,
-        || {
-            state.drawings.record_event(
-                RecordedOperation::new("drawing.create_from_part")
-                    .with_parameters(serde_json::json!({
-                        "solid_id": solid_id,
-                        "part_uuid": part_uuid,
-                        "sheet_size": SheetSize::A3,
-                        "quality_passed": quality.passed,
-                        "quality_issues": quality.issues.len(),
-                        "acknowledge_unsound": q.acknowledge_unsound,
-                    }))
-                    // #32: record the source solid as an INPUT so the
-                    // feature-DAG projection links the sheet downstream of
-                    // its part. A mould on the part then marks the drawing
-                    // dirty and RE-DERIVES it (option a); without this edge
-                    // the sheet would read as `Unaffected` and never
-                    // follow the geometry.
-                    .with_input_solids(std::iter::once(solid_id as u64))
-                    .with_output_drawing(drawing_id),
-            );
-        },
-    );
+    //
+    // Document facet (drawing-ownership fix, 2026-08-16): nested OUTSIDE
+    // the ack-unsound scope, `record_under_owner_document` makes the
+    // OWNER win the document attribution for a `Legacy`-owned drawing
+    // (see that function's own doc) instead of whatever ambient
+    // `X-Roshera-Document` header the caller happened to send.
+    record_under_owner_document(&owner, || {
+        timeline_engine::recorder_bridge::ACK_UNSOUND_OVERRIDE.sync_scope(
+            q.acknowledge_unsound,
+            || {
+                state.drawings.record_event(
+                    RecordedOperation::new("drawing.create_from_part")
+                        .with_parameters(serde_json::json!({
+                            "solid_id": solid_id,
+                            "part_uuid": part_uuid,
+                            "sheet_size": SheetSize::A3,
+                            "quality_passed": quality.passed,
+                            "quality_issues": quality.issues.len(),
+                            "acknowledge_unsound": q.acknowledge_unsound,
+                        }))
+                        // #32: record the source solid as an INPUT so the
+                        // feature-DAG projection links the sheet downstream
+                        // of its part. A mould on the part then marks the
+                        // drawing dirty and RE-DERIVES it (option a);
+                        // without this edge the sheet would read as
+                        // `Unaffected` and never follow the geometry.
+                        .with_input_solids(std::iter::once(solid_id as u64))
+                        .with_output_drawing(drawing_id),
+                );
+            },
+        );
+    });
 
     Ok(Json(PartDrawingResponse {
         id: drawing_id,
@@ -1037,9 +1330,26 @@ pub async fn drawing_quality(
 /// `certify_solid` recompute could deadlock a caller already holding a read
 /// guard, and a read-only inspection surface has no business re-deriving a
 /// verdict the kernel has not already reached. Never `Sound` by omission —
-/// an unresolvable solid (a different document/part is active than the one
-/// this sheet was built from) states that explicitly as `Unresolvable`,
-/// never silently reads as sound.
+/// an unresolvable solid states that explicitly as `Unresolvable`, never
+/// silently reads as sound.
+///
+/// **`Unresolvable` covers two distinct causes** (drawing-ownership fix,
+/// 2026-08-16 — this is what closed L8b, the aliasing hazard this variant's
+/// doc used to name as "documented, not fixed"):
+/// 1. the drawing's OWNER resolves to a real model, but this specific
+///    solid id is no longer present in it (deleted since the sheet was
+///    built);
+/// 2. the OWNER ITSELF does not resolve at all right now (a different
+///    document is active, or the owning part was deleted) — see
+///    [`resolve_owner_model`]. In this case EVERY solid a drawing
+///    references reads `Unresolvable`, produced by [`all_unresolvable`]
+///    rather than a live model read at all (there is no model to read).
+///
+/// Both are honestly "cannot see it, so no claim is made" — never a
+/// resolution against the WRONG model, which is the lie this whole fix
+/// closes. `solid_id` alone cannot distinguish the two causes; a caller
+/// that needs to know which one applies reads the sibling
+/// `unavailable_reason` / `certificate_unavailable_reason` field instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(tag = "reading", rename_all = "snake_case")]
 pub enum SolidSoundnessDisclosure {
@@ -1055,21 +1365,19 @@ pub enum SolidSoundnessDisclosure {
     /// Not a defect; simply not yet (re)checked. Call `verify_part` to get
     /// a real reading.
     Stale { solid_id: SolidId },
-    /// The solid a view referenced does not exist in the model
-    /// `ActiveModel` resolved for THIS request — a different document/part
-    /// is active than the one the sheet was built from. Not claimed sound
-    /// or unsound; an honest "cannot see it," the same reading
-    /// `refuse_unsound_solid` gives this case (and the SAME pre-existing
-    /// aliasing risk `drawing_solid_ids`'s own doc names — see L8b,
-    /// 2026-08-16 residuals).
+    /// Cannot see this solid at all right now — see this enum's own doc
+    /// for the two distinct causes. Not claimed sound or unsound.
     Unresolvable { solid_id: SolidId },
 }
 
 /// Live-read (never recompute) the soundness of every solid `drawing`'s
-/// views reference, against whatever model `model_handle` resolved for
-/// THIS request. Shared by `drawing_certificate` and `drawing_semantic` —
-/// see [`SolidSoundnessDisclosure`] for what each variant means and why
-/// this exists.
+/// views reference, against the OWNER'S model (drawing-ownership fix,
+/// 2026-08-16 — `model_handle` is resolved via [`resolve_owner_model`] by
+/// every caller now, never via the caller's `ActiveModel`). Shared by
+/// `drawing_certificate` and `drawing_semantic` — see
+/// [`SolidSoundnessDisclosure`] for what each variant means and why this
+/// exists. Only called when the owner DID resolve; see [`all_unresolvable`]
+/// for the sibling case.
 async fn disclose_solid_soundness(
     model_handle: &Arc<RwLock<BRepModel>>,
     drawing: &Drawing,
@@ -1087,30 +1395,97 @@ async fn disclose_solid_soundness(
         .collect()
 }
 
+/// The sibling of [`disclose_solid_soundness`] for when the drawing's OWNER
+/// itself does not resolve — there is no model to read at all, so every
+/// solid the drawing references is honestly `Unresolvable`, never
+/// defaulted to any other reading.
+fn all_unresolvable(drawing: &Drawing) -> Vec<SolidSoundnessDisclosure> {
+    drawing_solid_ids(drawing)
+        .into_iter()
+        .map(|solid_id| SolidSoundnessDisclosure::Unresolvable { solid_id })
+        .collect()
+}
+
+/// Human-readable statement of WHY a drawing's owner does not currently
+/// resolve — populated on `CertificateWithSoundness::unavailable_reason`
+/// and `SemanticDrawingResponse::certificate_unavailable_reason` exactly
+/// when their sibling `certificate` field is `None`. A stated reason, not
+/// a bare `null` — the disclose-don't-refuse ruling means the CALLER sees
+/// why, not just that.
+fn unresolvable_reason(owner: &ModelKey) -> String {
+    match owner {
+        ModelKey::Part { id } => format!(
+            "cannot re-measure: this drawing's owning part ({id}) is not \
+             currently registered — deleted, or a document switch cleared \
+             the part registry (part-owned drawings are never restored by \
+             reactivating a document; parts are not document-scoped)"
+        ),
+        ModelKey::Legacy { document_id } => format!(
+            "cannot re-measure: this drawing's owning document \
+             ('{document_id}') is not the one currently active — \
+             reactivate it with POST /api/documents/{{id}}/open to make \
+             this drawing measurable again"
+        ),
+    }
+}
+
 /// Response for `GET /api/drawings/{id}/certificate`: the sheet readback
 /// certificate, plus the live solid-soundness disclosure (L2, 2026-08-16
 /// residuals) — see [`SolidSoundnessDisclosure`]. `#[serde(flatten)]` on
 /// `certificate` keeps every existing top-level key (`sound`, `counts`,
-/// `quality`, …) exactly where callers already read them; `solid_soundness`
-/// is purely additive.
+/// `quality`, …) exactly where callers already read them WHEN the owner
+/// resolves (serde flattens `Some`, omits entirely on `None` — pinned by
+/// `certificate_with_soundness_flatten_tests` below); `solid_soundness` is
+/// purely additive.
+///
+/// **`certificate: None` (drawing-ownership fix, 2026-08-16) is a STATED
+/// ABSENCE, never a default:** it means this drawing's owner does not
+/// resolve against live state right now, so there is no model to
+/// re-measure against — see `unavailable_reason`. `/certificate` is a
+/// read-only inspection surface and disclose-don't-refuses on this
+/// condition, exactly as it already does for a single unsound solid (L2);
+/// the three EXPORT routes (`svg`/`pdf`/`dxf`), which produce an artifact,
+/// refuse instead — see [`ErrorCode::DrawingOwnerUnresolvable`].
 #[derive(Debug, Clone, Serialize)]
 pub struct CertificateWithSoundness {
+    /// The drawing's owner, disclosed so a caller reading this while a
+    /// DIFFERENT document/part is active can see which document/part
+    /// these measurements are actually about.
+    pub owner: ModelKey,
     #[serde(flatten)]
-    pub certificate: SheetReadbackCertificate,
+    pub certificate: Option<SheetReadbackCertificate>,
+    /// Populated ONLY when `certificate` is `None`; always `None` when
+    /// `certificate` is `Some`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unavailable_reason: Option<String>,
     pub solid_soundness: Vec<SolidSoundnessDisclosure>,
 }
 
 /// Response for `GET /api/drawings/{id}/semantic`: the queryable sheet MODEL
 /// (every provenance field restored in Slice 1) plus the readback certificate.
+///
+/// See [`CertificateWithSoundness`]'s doc for the `certificate: None` /
+/// `certificate_unavailable_reason` shape — identical reasoning, applied
+/// here instead of via `flatten` (this response never flattened the
+/// certificate to begin with).
 #[derive(Debug, Clone, Serialize)]
 pub struct SemanticDrawingResponse {
     /// The full sheet model — views with provenance-bearing dimensions, hole
     /// table with datum descriptors, section semantics, GD&T blocks with
-    /// `feature_pid`, and the structured notes.
+    /// `feature_pid`, and the structured notes. Always present: the
+    /// DRAWING is a stored snapshot, unaffected by whether its owner
+    /// currently resolves.
     pub drawing: Drawing,
+    /// The drawing's owner, disclosed — see [`CertificateWithSoundness::
+    /// owner`].
+    pub owner: ModelKey,
     /// The sheet readback certificate: per-fact provenance + live-checked
-    /// verdicts, and the embedded layout quality report.
-    pub certificate: SheetReadbackCertificate,
+    /// verdicts, and the embedded layout quality report. `None` when the
+    /// owner does not resolve — see `certificate_unavailable_reason`.
+    pub certificate: Option<SheetReadbackCertificate>,
+    /// Populated ONLY when `certificate` is `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub certificate_unavailable_reason: Option<String>,
     /// Live solid-soundness disclosure (L2, 2026-08-16 residuals) — see
     /// [`SolidSoundnessDisclosure`]. NOT `certificate.sound`, which means
     /// sheet-vs-model consistency, not B-Rep validity.
@@ -1298,36 +1673,35 @@ async fn refuse_unsound_solid(
 
 /// Every solid a registered [`Drawing`]'s views reference, for callers that
 /// only have the built `Drawing` in hand (the registry export surface)
-/// rather than a `solid_id` from their own request path. `solid_id` is
-/// resolved against whatever model `ActiveModel` resolved for THIS request
-/// — the SAME model [`refuse_unsound_sheet`]'s own sheet-vs-model
-/// certificate re-measures against. A view whose solid does not exist in
-/// that model (the drawing was built against a different part-tab than the
-/// one active now) is simply absent from the returned list —
-/// `refuse_unsound_solid` then treats it as unresolvable and does not gate
-/// on it, never claiming sound or unsound for a solid it cannot see.
+/// rather than a `solid_id` from their own request path.
 ///
-/// # Aliasing (L8b, 2026-08-16 residuals — documented, not fixed)
+/// `solid_id` is resolved by every caller of this function against the
+/// model [`resolve_owner_model`] resolves from the drawing's OWNER
+/// (drawing-ownership fix, 2026-08-16) — NEVER against whatever
+/// `ActiveModel` happens to resolve for the caller's own request. A view
+/// whose solid does not exist in the owner's model (the sheet references
+/// a solid deleted since it was built) is simply absent from the returned
+/// list — `refuse_unsound_solid` / `disclose_solid_soundness` then treat
+/// it as unresolvable and do not gate on it, never claiming sound or
+/// unsound for a solid they cannot see.
 ///
-/// The unresolvable case above is the HONEST failure mode: no solid with
-/// that id exists in the active model, so nothing is gated. There is a
-/// second, dishonest-looking failure mode this function cannot by itself
-/// distinguish from a genuine match: `state.drawings` (the registry this
-/// `Drawing` came out of) is **not scoped per document**, and `SolidId` is
-/// a per-`BRepModel` counter that restarts from the same small integers in
-/// every document. If a drawing registered against document A referenced
-/// solid 3, and document B is the one currently active with ITS OWN solid
-/// 3, this function resolves that id against document B's model and
-/// `refuse_unsound_solid` gates (or clears) A's sheet against B's
-/// unrelated solid — a false match, not a miss. Pre-existing in shape
-/// (the drawing registry has never been document-scoped); this branch
-/// extends it to a NEW gate rather than introducing it. Not fixed here: a
-/// real fix means scoping `state.drawings` per document (or stamping each
-/// registered drawing with the document id it was built against and
-/// checking it here), which touches the registry's storage shape and every
-/// route that reads it — not a small, local change. **UNVERIFIED** by a
-/// live two-document export; reasoned from `SolidId`'s definition as a
-/// per-`BRepModel` counter (`geometry_engine::primitives::solid::SolidId`).
+/// # Aliasing — CLOSED (was L8b, "documented, not fixed"; fixed 2026-08-16)
+///
+/// Before this fix, `solid_id` was resolved against whatever model
+/// `ActiveModel` (the CALLER's own `X-Roshera-Part-Id` header) happened to
+/// select — and because `SolidId` is a per-`BRepModel` counter restarting
+/// from the same small integers in every document/part, a drawing
+/// registered against document/part A whose views referenced solid 3
+/// could be certified against document/part B's UNRELATED solid 3 merely
+/// by the caller naming B in an otherwise-unrelated header: a false
+/// match, not a miss, and the sharpest form of the failure this project
+/// exists to prevent — a confidently wrong verdict, not a mis-fired gate.
+/// Live-verified (not merely reasoned about) by
+/// `drawing_ownership_tests::
+/// red_drawing_certificate_lies_when_read_under_a_different_parts_header`.
+/// Closed by binding every drawing to the `ModelKey` its creating request
+/// resolved, resolving every later read from THAT owner instead of the
+/// caller's `ActiveModel` — see the module doc.
 fn drawing_solid_ids(drawing: &Drawing) -> Vec<SolidId> {
     drawing
         .views
@@ -1340,25 +1714,51 @@ fn drawing_solid_ids(drawing: &Drawing) -> Vec<SolidId> {
 
 /// `GET /api/drawings/{id}/certificate` — the sheet readback certificate only
 /// (a cheap poll): per-fact live-checked verdicts + the layout quality report,
-/// re-measured against the active model.
+/// re-measured against the drawing's OWNER (drawing-ownership fix,
+/// 2026-08-16 — `ActiveModel` no longer appears in this signature; the
+/// caller's header cannot influence which model this measures against).
+/// **Disclose, don't refuse:** when the owner does not currently resolve,
+/// this still returns 200 with the stored `drawing`'s owner disclosed and
+/// `certificate: None` / `unavailable_reason: Some(...)` — a read-only
+/// inspection surface, same ruling L2 already applied to a single unsound
+/// solid. See [`ErrorCode::DrawingOwnerUnresolvable`] for why the export
+/// routes make the OPPOSITE choice.
 pub async fn drawing_certificate(
     State(state): State<AppState>,
-    ActiveModel(model_handle): ActiveModel,
     Path(id): Path<Uuid>,
 ) -> Result<Json<CertificateWithSoundness>, ApiError> {
-    let handle = state.drawings.get(&id).ok_or_else(|| not_found(id))?;
+    let (owner, handle) = state
+        .drawings
+        .get_with_owner(&id)
+        .ok_or_else(|| not_found(id))?;
     let drawing = {
         let guard = handle.read().await;
         guard.clone()
     };
-    // L2 (2026-08-16 residuals): read soundness BEFORE `certify_off_lock`
-    // consumes `model_handle` by value — see `SolidSoundnessDisclosure`.
-    let solid_soundness = disclose_solid_soundness(&model_handle, &drawing).await;
-    let certificate = certify_off_lock(model_handle, drawing).await?;
-    Ok(Json(CertificateWithSoundness {
-        certificate,
-        solid_soundness,
-    }))
+    match resolve_owner_model(&state, &owner).await {
+        Some(model_handle) => {
+            // L2 (2026-08-16 residuals): read soundness BEFORE
+            // `certify_off_lock` consumes `model_handle` by value.
+            let solid_soundness = disclose_solid_soundness(&model_handle, &drawing).await;
+            let certificate = certify_off_lock(model_handle, drawing).await?;
+            Ok(Json(CertificateWithSoundness {
+                owner,
+                certificate: Some(certificate),
+                unavailable_reason: None,
+                solid_soundness,
+            }))
+        }
+        None => {
+            let unavailable_reason = Some(unresolvable_reason(&owner));
+            let solid_soundness = all_unresolvable(&drawing);
+            Ok(Json(CertificateWithSoundness {
+                owner,
+                certificate: None,
+                unavailable_reason,
+                solid_soundness,
+            }))
+        }
+    }
 }
 
 /// `GET /api/drawings/{id}/semantic` — the queryable sheet model + certificate.
@@ -1366,44 +1766,88 @@ pub async fn drawing_certificate(
 /// This is the agent's certified readback surface for a Roshera sheet: the full
 /// provenance-bearing `Drawing` (so answers name PIDs / face ids / datums that
 /// feed straight back into `measure_faces` / `gdt_fcf` / `label_resolve`) plus
-/// the live-checked certificate. Never pixel inference — the sheet MODEL is the
-/// truth, and every numeric fact carries a re-measured verdict.
+/// the live-checked certificate, re-measured against the drawing's OWNER
+/// (drawing-ownership fix, 2026-08-16 — see `drawing_certificate`'s
+/// identical disclose-don't-refuse reasoning; `ActiveModel` no longer
+/// appears in this signature). Never pixel inference — the sheet MODEL is
+/// the truth, and every numeric fact carries a re-measured verdict, or a
+/// stated reason it could not be re-measured.
 pub async fn drawing_semantic(
     State(state): State<AppState>,
-    ActiveModel(model_handle): ActiveModel,
     Path(id): Path<Uuid>,
 ) -> Result<Json<SemanticDrawingResponse>, ApiError> {
-    let handle = state.drawings.get(&id).ok_or_else(|| not_found(id))?;
+    let (owner, handle) = state
+        .drawings
+        .get_with_owner(&id)
+        .ok_or_else(|| not_found(id))?;
     let drawing = {
         let guard = handle.read().await;
         guard.clone()
     };
-    // L2 (2026-08-16 residuals): read soundness BEFORE `certify_off_lock`
-    // consumes `model_handle` by value — see `SolidSoundnessDisclosure`.
-    let solid_soundness = disclose_solid_soundness(&model_handle, &drawing).await;
-    let certificate = certify_off_lock(model_handle, drawing.clone()).await?;
-    Ok(Json(SemanticDrawingResponse {
-        drawing,
-        certificate,
-        solid_soundness,
-    }))
+    match resolve_owner_model(&state, &owner).await {
+        Some(model_handle) => {
+            // L2 (2026-08-16 residuals): read soundness BEFORE
+            // `certify_off_lock` consumes `model_handle` by value.
+            let solid_soundness = disclose_solid_soundness(&model_handle, &drawing).await;
+            let certificate = certify_off_lock(model_handle, drawing.clone()).await?;
+            Ok(Json(SemanticDrawingResponse {
+                drawing,
+                owner,
+                certificate: Some(certificate),
+                certificate_unavailable_reason: None,
+                solid_soundness,
+            }))
+        }
+        None => {
+            let certificate_unavailable_reason = Some(unresolvable_reason(&owner));
+            let solid_soundness = all_unresolvable(&drawing);
+            Ok(Json(SemanticDrawingResponse {
+                drawing,
+                owner,
+                certificate: None,
+                certificate_unavailable_reason,
+                solid_soundness,
+            }))
+        }
+    }
 }
 
 /// `POST /api/drawings/{id}/query` — answer a typed, scoped question against the
-/// sheet, certified live. The agent's certified readback verb: each answer
-/// carries provenance (PIDs / face ids / datums) + a live-check verdict, and
-/// honest-refuses (render_only / unprovenanced) rather than fabricate.
+/// sheet, certified live against the drawing's OWNER (drawing-ownership
+/// fix, 2026-08-16 — `ActiveModel` no longer appears in this signature).
+/// The agent's certified readback verb: each answer carries provenance
+/// (PIDs / face ids / datums) + a live-check verdict, and honest-refuses
+/// (render_only / unprovenanced) rather than fabricate.
+///
+/// **Ruling: refuses (does NOT disclose-don't-refuse) on an unresolvable
+/// owner**, the one deliberate departure from `/semantic` and
+/// `/certificate`'s ruling above — argued, not assumed: unlike those two,
+/// this route's kernel contract
+/// (`geometry_engine::drawing::answer_query`) REQUIRES a real
+/// [`SheetReadbackCertificate`] value to answer against; there is no
+/// "certificate absent, state why" shape this route could hand that
+/// function without inventing one inside `geometry-engine` — genuinely
+/// forced, and out of this task's territory (`geometry-engine` is
+/// untouchable here). Refusing with the same
+/// [`ErrorCode::DrawingOwnerUnresolvable`] the export routes use is the
+/// honest alternative to fabricating a certificate or silently answering
+/// against the wrong model.
 pub async fn drawing_query_handler(
     State(state): State<AppState>,
-    ActiveModel(model_handle): ActiveModel,
     Path(id): Path<Uuid>,
     Json(query): Json<DrawingQuery>,
 ) -> Result<Json<DrawingAnswer>, ApiError> {
-    let handle = state.drawings.get(&id).ok_or_else(|| not_found(id))?;
+    let (owner, handle) = state
+        .drawings
+        .get_with_owner(&id)
+        .ok_or_else(|| not_found(id))?;
     let drawing = {
         let guard = handle.read().await;
         guard.clone()
     };
+    let model_handle = resolve_owner_model(&state, &owner)
+        .await
+        .ok_or_else(|| ApiError::drawing_owner_unresolvable(id, &owner))?;
     let cert = certify_off_lock(model_handle, drawing.clone()).await?;
     Ok(Json(answer_query(&drawing, &cert, &query)))
 }
@@ -1435,11 +1879,10 @@ fn content_disposition(name: &str, drawing_id: Uuid, extension: &str) -> String 
 
 pub async fn export_pdf(
     State(state): State<AppState>,
-    ActiveModel(model_handle): ActiveModel,
     Path(id): Path<Uuid>,
     Query(q): Query<ExportQuery>,
 ) -> Result<Response, ApiError> {
-    let handle = state.drawings.get(&id).ok_or_else(|| not_found(id))?;
+    let (model_handle, handle, owner) = fetch_owned_drawing_for_export(&state, id).await?;
     let snapshot = { handle.read().await.clone() };
 
     // Concern A (2026-08-15 closeout) — see `export_svg`'s identical block.
@@ -1482,16 +1925,20 @@ pub async fn export_pdf(
         if q.acknowledge_unsound {
             parameters["acknowledge_unsound"] = serde_json::json!(true);
         }
-        timeline_engine::recorder_bridge::ACK_UNSOUND_OVERRIDE.sync_scope(
-            q.acknowledge_unsound,
-            || {
-                state.drawings.record_event(
-                    RecordedOperation::new("drawing.export")
-                        .with_parameters(parameters)
-                        .with_input_drawing(id),
-                );
-            },
-        );
+        // Document facet (drawing-ownership fix, 2026-08-16) — see
+        // `export_svg`'s identical block.
+        record_under_owner_document(&owner, || {
+            timeline_engine::recorder_bridge::ACK_UNSOUND_OVERRIDE.sync_scope(
+                q.acknowledge_unsound,
+                || {
+                    state.drawings.record_event(
+                        RecordedOperation::new("drawing.export")
+                            .with_parameters(parameters)
+                            .with_input_drawing(id),
+                    );
+                },
+            );
+        });
     }
 
     let disposition = content_disposition(&name, id, "pdf");
@@ -1508,11 +1955,10 @@ pub async fn export_pdf(
 
 pub async fn export_dxf(
     State(state): State<AppState>,
-    ActiveModel(model_handle): ActiveModel,
     Path(id): Path<Uuid>,
     Query(q): Query<ExportQuery>,
 ) -> Result<Response, ApiError> {
-    let handle = state.drawings.get(&id).ok_or_else(|| not_found(id))?;
+    let (model_handle, handle, owner) = fetch_owned_drawing_for_export(&state, id).await?;
     let snapshot = { handle.read().await.clone() };
 
     // Concern A (2026-08-15 closeout) — see `export_svg`'s identical block.
@@ -1555,16 +2001,20 @@ pub async fn export_dxf(
         if q.acknowledge_unsound {
             parameters["acknowledge_unsound"] = serde_json::json!(true);
         }
-        timeline_engine::recorder_bridge::ACK_UNSOUND_OVERRIDE.sync_scope(
-            q.acknowledge_unsound,
-            || {
-                state.drawings.record_event(
-                    RecordedOperation::new("drawing.export")
-                        .with_parameters(parameters)
-                        .with_input_drawing(id),
-                );
-            },
-        );
+        // Document facet (drawing-ownership fix, 2026-08-16) — see
+        // `export_svg`'s identical block.
+        record_under_owner_document(&owner, || {
+            timeline_engine::recorder_bridge::ACK_UNSOUND_OVERRIDE.sync_scope(
+                q.acknowledge_unsound,
+                || {
+                    state.drawings.record_event(
+                        RecordedOperation::new("drawing.export")
+                            .with_parameters(parameters)
+                            .with_input_drawing(id),
+                    );
+                },
+            );
+        });
     }
 
     let disposition = content_disposition(&name, id, "dxf");
@@ -1631,6 +2081,18 @@ mod tests {
         }
     }
 
+    /// A stand-in owner for manager-level tests that exercise drawing
+    /// content/lifecycle and don't care WHICH document/part the drawing
+    /// belongs to — every `DrawingManager::create`/`insert` call needs
+    /// SOME owner now (drawing-ownership fix, 2026-08-16): "no way to
+    /// have a drawing without an owner" applies to test fixtures too, not
+    /// just production call sites.
+    fn test_owner() -> ModelKey {
+        ModelKey::Legacy {
+            document_id: "test-doc".to_string(),
+        }
+    }
+
     // ── Fixtures ────────────────────────────────────────────────────
 
     /// In-process recorder that captures every emitted event so tests
@@ -1694,7 +2156,7 @@ mod tests {
     fn manager_create_get_delete_round_trips() {
         let m = DrawingManager::new();
         assert!(m.is_empty());
-        let id = m.create("test", SheetSize::A4);
+        let id = m.create("test", SheetSize::A4, test_owner());
         assert_eq!(m.len(), 1);
         assert!(m.get(&id).is_some());
         assert!(m.delete(&id).is_some());
@@ -1704,20 +2166,47 @@ mod tests {
     #[test]
     fn list_returns_every_id() {
         let m = DrawingManager::new();
-        let a = m.create("a", SheetSize::A4);
-        let b = m.create("b", SheetSize::A3);
-        let ids = m.list();
-        assert_eq!(ids.len(), 2);
-        assert!(ids.contains(&a));
-        assert!(ids.contains(&b));
+        let a = m.create("a", SheetSize::A4, test_owner());
+        let b = m.create("b", SheetSize::A3, test_owner());
+        let entries = m.list();
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().any(|e| e.id == a));
+        assert!(entries.iter().any(|e| e.id == b));
+    }
+
+    #[test]
+    fn list_discloses_the_owner_of_each_entry() {
+        // Drawing-ownership fix, 2026-08-16: `GET /api/drawings` must let a
+        // caller see WHICH document/part each entry actually belongs to,
+        // never merely a bare id.
+        let m = DrawingManager::new();
+        let part_id = Uuid::new_v4();
+        let a = m.create("a", SheetSize::A4, ModelKey::Part { id: part_id });
+        let b = m.create(
+            "b",
+            SheetSize::A4,
+            ModelKey::Legacy {
+                document_id: "doc-x".to_string(),
+            },
+        );
+        let entries = m.list();
+        let owner_a = &entries.iter().find(|e| e.id == a).expect("a present").owner;
+        let owner_b = &entries.iter().find(|e| e.id == b).expect("b present").owner;
+        assert_eq!(*owner_a, ModelKey::Part { id: part_id });
+        assert_eq!(
+            *owner_b,
+            ModelKey::Legacy {
+                document_id: "doc-x".to_string()
+            }
+        );
     }
 
     #[test]
     fn create_assigns_unique_uuids() {
         let m = DrawingManager::new();
-        let a = m.create("a", SheetSize::A4);
-        let b = m.create("b", SheetSize::A4);
-        let c = m.create("c", SheetSize::A4);
+        let a = m.create("a", SheetSize::A4, test_owner());
+        let b = m.create("b", SheetSize::A4, test_owner());
+        let c = m.create("c", SheetSize::A4, test_owner());
         assert_ne!(a, b);
         assert_ne!(b, c);
         assert_ne!(a, c);
@@ -1727,7 +2216,7 @@ mod tests {
     #[test]
     fn get_returns_none_for_unknown_id() {
         let m = DrawingManager::new();
-        let id = m.create("a", SheetSize::A4);
+        let id = m.create("a", SheetSize::A4, test_owner());
         assert!(m.get(&Uuid::new_v4()).is_none());
         // Sanity: the real id still resolves.
         assert!(m.get(&id).is_some());
@@ -1742,7 +2231,7 @@ mod tests {
     #[test]
     fn delete_twice_is_idempotent_after_second() {
         let m = DrawingManager::new();
-        let id = m.create("a", SheetSize::A4);
+        let id = m.create("a", SheetSize::A4, test_owner());
         assert!(m.delete(&id).is_some());
         assert!(m.delete(&id).is_none());
         assert!(m.is_empty());
@@ -1768,7 +2257,7 @@ mod tests {
     fn multiple_managers_are_isolated() {
         let m1 = DrawingManager::new();
         let m2 = DrawingManager::new();
-        let id = m1.create("a", SheetSize::A3);
+        let id = m1.create("a", SheetSize::A3, test_owner());
         assert!(m2.get(&id).is_none());
         assert_eq!(m1.len(), 1);
         assert_eq!(m2.len(), 0);
@@ -1779,7 +2268,7 @@ mod tests {
     #[tokio::test]
     async fn add_view_under_write_lock_is_visible_to_readers() {
         let m = DrawingManager::new();
-        let id = m.create("d", SheetSize::A3);
+        let id = m.create("d", SheetSize::A3, test_owner());
         let handle = m.get(&id).expect("drawing missing");
 
         // Build a real projection so we exercise the full view shape.
@@ -1808,7 +2297,7 @@ mod tests {
     #[tokio::test]
     async fn add_then_remove_view_round_trip() {
         let m = DrawingManager::new();
-        let id = m.create("d", SheetSize::A3);
+        let id = m.create("d", SheetSize::A3, test_owner());
         let handle = m.get(&id).unwrap();
         let (model, solid_id) = build_box_model(5.0, 5.0, 5.0);
         let view = geometry_engine::drawing::project_solid_view(
@@ -1837,7 +2326,7 @@ mod tests {
     #[tokio::test]
     async fn remove_view_returns_false_for_unknown_id() {
         let m = DrawingManager::new();
-        let id = m.create("d", SheetSize::A3);
+        let id = m.create("d", SheetSize::A3, test_owner());
         let handle = m.get(&id).unwrap();
         let mut guard = handle.write().await;
         assert!(!guard.remove_view(ProjectedViewId::new()));
@@ -1848,8 +2337,8 @@ mod tests {
         // Two drawings, two write locks held simultaneously — proves
         // the DashMap doesn't serialize per-drawing locks.
         let m = DrawingManager::new();
-        let id_a = m.create("a", SheetSize::A4);
-        let id_b = m.create("b", SheetSize::A4);
+        let id_a = m.create("a", SheetSize::A4, test_owner());
+        let id_b = m.create("b", SheetSize::A4, test_owner());
         let ha = m.get(&id_a).unwrap();
         let hb = m.get(&id_b).unwrap();
         let _ga = ha.write().await;
@@ -1948,7 +2437,7 @@ mod tests {
         }
 
         let mgr = DrawingManager::new();
-        let id = mgr.insert(drawing);
+        let id = mgr.insert(drawing, test_owner());
         let handle = mgr.get(&id).expect("registered drawing resolves");
         let svg = {
             let guard = handle.read().await;
@@ -1977,7 +2466,7 @@ mod tests {
         drawing.add_view(view);
 
         let mgr = DrawingManager::new();
-        let id = mgr.insert(drawing);
+        let id = mgr.insert(drawing, test_owner());
         let handle = mgr.get(&id).unwrap();
         let guard = handle.read().await;
         assert_eq!(guard.views.len(), 1);
@@ -2179,6 +2668,90 @@ mod tests {
         assert!(res.is_err());
     }
 
+    // ── Document facet — record_under_owner_document (drawing-ownership
+    //    fix, 2026-08-16) ─────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn record_under_owner_document_scopes_document_override_for_a_legacy_owner() {
+        let owner = ModelKey::Legacy {
+            document_id: "doc-owner".to_string(),
+        };
+        // No ambient scope beforehand.
+        assert!(timeline_engine::recorder_bridge::DOCUMENT_OVERRIDE
+            .try_with(Clone::clone)
+            .is_err());
+        let seen = std::cell::RefCell::new(None);
+        record_under_owner_document(&owner, || {
+            *seen.borrow_mut() = timeline_engine::recorder_bridge::DOCUMENT_OVERRIDE
+                .try_with(Clone::clone)
+                .ok();
+        });
+        assert_eq!(
+            seen.into_inner(),
+            Some("doc-owner".to_string()),
+            "a Legacy owner must scope DOCUMENT_OVERRIDE to its OWN \
+             document_id — the owner wins over whatever ambient scope (or \
+             absence of one) existed before"
+        );
+    }
+
+    #[tokio::test]
+    async fn record_under_owner_document_overrides_a_different_ambient_scope() {
+        // The exact scenario the brief names: document A is the drawing's
+        // owner, but the caller's `X-Roshera-Document` header (carried via
+        // an OUTER `DOCUMENT_OVERRIDE` scope, exactly as `main.rs::
+        // document_scope_layer` sets it from the header) names B. The
+        // OWNER must win.
+        let owner = ModelKey::Legacy {
+            document_id: "doc-A-owner".to_string(),
+        };
+        let seen = timeline_engine::recorder_bridge::DOCUMENT_OVERRIDE
+            .scope("doc-B-ambient".to_string(), async {
+                let inner = std::cell::RefCell::new(None);
+                record_under_owner_document(&owner, || {
+                    *inner.borrow_mut() = timeline_engine::recorder_bridge::DOCUMENT_OVERRIDE
+                        .try_with(Clone::clone)
+                        .ok();
+                });
+                inner.into_inner()
+            })
+            .await;
+        assert_eq!(
+            seen,
+            Some("doc-A-owner".to_string()),
+            "the drawing's OWNER must win over an ambient DOCUMENT_OVERRIDE \
+             the caller's own X-Roshera-Document header set — provenance \
+             mis-attribution is exactly what this closes"
+        );
+    }
+
+    #[tokio::test]
+    async fn record_under_owner_document_leaves_ambient_scope_untouched_for_a_part_owner() {
+        // A Part-owned drawing carries no document id on its owner at all
+        // — nothing to correct the facet WITH, so ambient behaviour (here,
+        // an outer scope naming B) is left exactly as it was. Documented
+        // gap, not a silent default.
+        let owner = ModelKey::Part { id: Uuid::new_v4() };
+        let seen = timeline_engine::recorder_bridge::DOCUMENT_OVERRIDE
+            .scope("doc-B-ambient".to_string(), async {
+                let inner = std::cell::RefCell::new(None);
+                record_under_owner_document(&owner, || {
+                    *inner.borrow_mut() = timeline_engine::recorder_bridge::DOCUMENT_OVERRIDE
+                        .try_with(Clone::clone)
+                        .ok();
+                });
+                inner.into_inner()
+            })
+            .await;
+        assert_eq!(
+            seen,
+            Some("doc-B-ambient".to_string()),
+            "a Part owner has no document id to correct the facet with; \
+             ambient behaviour must be left untouched, never silently \
+             invented"
+        );
+    }
+
     // ── Recorder integration ─────────────────────────────────────────
 
     #[test]
@@ -2324,7 +2897,7 @@ mod tests {
     #[tokio::test]
     async fn svg_export_contains_sheet_size_and_view_count() {
         let m = DrawingManager::new();
-        let id = m.create("Demo", SheetSize::A4);
+        let id = m.create("Demo", SheetSize::A4, test_owner());
         let handle = m.get(&id).unwrap();
         let (model, sid) = build_box_model(50.0, 50.0, 50.0);
         let view = geometry_engine::drawing::project_solid_view(
@@ -2356,7 +2929,7 @@ mod tests {
     #[tokio::test]
     async fn svg_export_of_empty_drawing_renders_envelope_only() {
         let m = DrawingManager::new();
-        let id = m.create("Empty", SheetSize::A3);
+        let id = m.create("Empty", SheetSize::A3, test_owner());
         let handle = m.get(&id).unwrap();
         let guard = handle.read().await;
         let svg = render_drawing_svg(&guard);
@@ -2372,7 +2945,7 @@ mod tests {
     #[tokio::test]
     async fn svg_export_escapes_xml_in_drawing_name() {
         let m = DrawingManager::new();
-        let id = m.create("<bad>&'\"", SheetSize::A4);
+        let id = m.create("<bad>&'\"", SheetSize::A4, test_owner());
         let handle = m.get(&id).unwrap();
         let guard = handle.read().await;
         let svg = render_drawing_svg(&guard);
@@ -2384,7 +2957,7 @@ mod tests {
     #[tokio::test]
     async fn multiple_views_each_get_their_own_group() {
         let m = DrawingManager::new();
-        let id = m.create("Multi", SheetSize::A3);
+        let id = m.create("Multi", SheetSize::A3, test_owner());
         let handle = m.get(&id).unwrap();
         let (model, sid) = build_box_model(10.0, 10.0, 10.0);
         for (proj, name, pos) in [
