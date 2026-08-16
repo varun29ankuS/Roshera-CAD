@@ -148,6 +148,17 @@ const STATEMENTS = [
   // tagged union (`{count, tools}` XOR `{absent}`, trajectory.mjs), and a
   // relational shredding of that union is a bigger change than this item
   // asks for.
+  //
+  // WHAT SQL `NULL` MEANS HERE, stated because a nullable column that does
+  // not say is exactly the "absence with no reason" this package refuses.
+  // NULL means THE TRAJECTORY PREDATES THIS FIELD — a legacy JSONL whose
+  // terminal record was written before item 7 existed. It does NOT mean "no
+  // unverified mutations": that is `{"count": 0, ...}`, a determinate
+  // measurement, and every trajectory written since item 7 carries one
+  // because `close()` writes the key unconditionally. So NULL is the only
+  // honest reading of a file that never had the fact, and a query counting
+  // clean episodes must not sweep NULL in with zero — they are "we know it
+  // was none" versus "nobody ever asked".
   `ALTER TABLE rl_episode ADD COLUMN IF NOT EXISTS unverified_mutations JSONB`,
 
   `CREATE TABLE IF NOT EXISTS rl_step (

@@ -271,14 +271,27 @@ jobs:
     # whole reason the service was added is that one test must actually run,
     # so a skip is a failure in this environment even though it is a virtue
     # outside it. `pipefail` so npm's own exit code still decides the step.
+    #
+    # The assertion is POSITIVE — "this suite reported passing checks" — not a
+    # grep for the skip message, which is how it was first written and was a
+    # guard that FAILED OPEN on its two likeliest decay paths: reword that
+    # message in `ingest_store.test.mjs`, or drop the suite from the `test`
+    # chain, and a negative grep finds nothing and the job goes green having
+    # proved strictly less. That is the same defect this job exists to catch,
+    # in the catcher. A positive anchor fails CLOSED on all three cases —
+    # skipped, reworded, removed — because all three produce no success line.
+    #
+    # Anchored with `^…$` so it cannot match npm's own echo of the test chain,
+    # which contains the substring `ingest_store` on its command line;
+    # verified against real logs in both directions before being written here.
     - name: Run the RL harness suites (and refuse a silent no-database skip)
       if: steps.filter.outputs.rl == 'true'
       shell: bash
       run: |
         set -o pipefail
         npm test 2>&1 | tee rl-test.log
-        if grep -q "1 suite skipped (no ROSHERA_RL_PG)" rl-test.log; then
-          echo "::error::ingest_store took its no-database skip although a postgres service is configured — the unverified_mutations migration round-trip did NOT run, so this job proved less than it claims"
+        if ! grep -qE '^ingest_store: [0-9]+ checks passed$' rl-test.log; then
+          echo "::error::ingest_store did not report a passing run. Either it took its no-database skip although a postgres service is configured, or it is no longer in the test chain. Either way the unverified_mutations migration round-trip did NOT run and this job proves less than it claims."
           exit 1
         fi
       working-directory: ./roshera-rl
