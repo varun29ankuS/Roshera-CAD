@@ -1669,6 +1669,58 @@ mod tests {
         assert!(v["hint"].as_str().unwrap().contains("bolt circle"));
     }
 
+    /// L-2 (2026-08-16 ownership residuals) — `sheet_uncertified_for_solid`
+    /// shipped alongside `sheet_unsound_for_solid` / `sheet_quality_for_solid`
+    /// with neither a unit pin nor a router pin (the latter is genuinely
+    /// unreachable through any well-formed request — see the note beside
+    /// `assert_one_call_sheet_refusal` in `sheet_export_gate_tests.rs`, which
+    /// this residuals wave extends to name this constructor too). This test
+    /// closes the unit-pin gap: the `REFUSED:` prefix, the solid-naming, and
+    /// the hint are all asserted, matching what its two siblings already
+    /// have.
+    #[test]
+    fn sheet_uncertified_for_solid_names_the_solid_not_a_nil_drawing() {
+        let e = ApiError::sheet_uncertified_for_solid(42);
+        assert_eq!(e.code, ErrorCode::SheetUncertified);
+        assert!(
+            e.error.starts_with("REFUSED:"),
+            "the refusal message must carry the REFUSED: token; got {:?}",
+            e.error
+        );
+        assert!(
+            e.error.contains("solid 42"),
+            "message must name the solid; got {:?}",
+            e.error
+        );
+        assert!(
+            !e.error.contains("00000000-0000-0000-0000-000000000000"),
+            "message must never name a nil drawing; got {:?}",
+            e.error
+        );
+        let v = serde_json::to_value(&e).unwrap();
+        assert_eq!(v["details"]["solid_id"], 42);
+        assert!(
+            v["details"].get("drawing_id").is_none(),
+            "an absent drawing_id must be OMITTED, never a stored nil UUID; \
+             details = {:?}",
+            v["details"]
+        );
+        let hint = e
+            .hint
+            .expect("sheet_uncertified_for_solid must carry a hint");
+        assert!(
+            hint.contains("drawing.svg"),
+            "hint must point at a remedy this route can actually follow; \
+             hint = {hint:?}"
+        );
+        assert!(
+            hint.contains("perception"),
+            "hint must point at GET /api/agent/parts/{{id}}/perception, not \
+             the registered-drawing-only /semantic endpoint this route has \
+             no drawing_id to address; hint = {hint:?}"
+        );
+    }
+
     /// M5 (2026-08-16 residuals) — THE RED for the "refusal names a
     /// drawing which does not exist" defect. Before this fix,
     /// `drawing_svg_for_solid` threaded `Uuid::nil()` through the shared

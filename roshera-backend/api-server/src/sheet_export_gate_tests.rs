@@ -528,6 +528,18 @@ async fn the_rust_gate_and_gates_ts_name_the_same_gates_and_escape() {
 // request (see the rename note on section 1 above) — only the
 // layout-quality branch and the sound-passthrough path genuinely apply.
 //
+// L-2 (2026-08-16 ownership residuals): the third constructor of this
+// sibling set, `ApiError::sheet_uncertified_for_solid`, is likewise not
+// exercised through this router — for a different reason than
+// stale/dangling. Its branch fires only when `certify_off_lock`'s
+// `spawn_blocking` join fails (the certification task itself panicked or
+// was cancelled), which is not constructible against any well-formed
+// request; there is no query parameter or fixture trick that reaches it,
+// the same way none reaches the analogous branch on the three registered
+// routes. It is pinned as a unit test instead
+// (`error_catalog.rs::tests::sheet_uncertified_for_solid_names_the_solid_
+// not_a_nil_drawing`), matching its two siblings' unit pins.
+//
 // Forcing a quality-Error finding needs a different trick than
 // `make_a_dimension_stale` (there is no registered `Drawing` to reach into
 // before the request runs): `?scale=1000` on a 10mm box overflows the fixed

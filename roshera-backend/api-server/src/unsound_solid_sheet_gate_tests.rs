@@ -751,23 +751,35 @@ async fn ordinary_creation_with_no_escape_does_not_stamp_the_acknowledge_unsound
 /// `acknowledge_unsound=true` must stamp the SAME canonical facet the ten
 /// kernel routes stamp, not just its own `acknowledge_unsound` JSON
 /// parameter (pinned separately above).
+///
+/// **Isolation, corrected (L-3 residual, 2026-08-16 ownership residuals):**
+/// the original version of this test created its drawing with
+/// `?acknowledge_unsound=true` on an UNSOUND solid — but the CREATION
+/// route stamps this same facet too (see
+/// `creation_using_acknowledge_unsound_also_stamps_the_canonical_facet`
+/// above), so `ack_unsound_facets_in_drawing_history` was non-empty
+/// BEFORE the PDF export ever ran, and would have stayed non-empty even
+/// with `export_pdf`'s own `sync_scope` wrapper deleted — a test that
+/// would stay green if the code under it were deleted is not a test.
+/// Registers the drawing on a SOUND solid with no escape (creation stamps
+/// nothing — pinned by the ordinary-creation test above), so the export
+/// call below is the ONLY event in history that can carry the facet;
+/// `?acknowledge_unsound=true` on export still enters the gate's bypass
+/// and the recording scope regardless of the solid's actual soundness —
+/// `refuse_unsound_solid` short-circuits on the flag alone.
 #[tokio::test]
 async fn a_registered_export_using_acknowledge_unsound_also_stamps_the_canonical_facet() {
     let state = make_test_state().await;
-    let (_uuid, solid_id) = unsound_verified_box(&state).await;
-    let drawing_id = {
-        let (status, body) = dispatch(
-            &state,
-            post(
-                &format!("/api/parts/{solid_id}/drawing?acknowledge_unsound=true"),
-                json!({}),
-            ),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK, "body = {body}");
-        Uuid::parse_str(body["id"].as_str().expect("drawing id string"))
-            .expect("drawing id must parse")
-    };
+    let (_uuid, solid_id) = sound_verified_box(&state).await;
+    let drawing_id = register_drawing_for(&state, solid_id).await;
+    assert!(
+        ack_unsound_facets_in_drawing_history(&state)
+            .await
+            .is_empty(),
+        "fixture precondition: an ordinary creation with no escape must not \
+         have already stamped the facet, or this test cannot attribute the \
+         facet below to the export call alone"
+    );
 
     let (status, body) = dispatch(
         &state,
@@ -785,6 +797,96 @@ async fn a_registered_export_using_acknowledge_unsound_also_stamps_the_canonical
          FACET after a registered export that used the escape — the drawing \
          route's own parameter is not the vocabulary a lineage query for \
          'which operations escaped the unsound gate' actually reads"
+    );
+    for facet in &facets {
+        assert_eq!(
+            facet["acknowledged"],
+            json!(true),
+            "facet must read `acknowledged: true`; got {facet}"
+        );
+    }
+}
+
+/// The `export_svg` sibling of the PDF test above — same isolation
+/// discipline (sound solid, no-escape creation, escape used only at
+/// export) so the facet in history is attributable to `export_svg`'s own
+/// `sync_scope` wrapper alone. THE RED for L-3's `export_svg` gap: before
+/// this test, `export_svg` had no facet pin at all, so a future edit that
+/// dropped its `sync_scope` wrapper would leave the whole suite green.
+#[tokio::test]
+async fn a_registered_svg_export_using_acknowledge_unsound_also_stamps_the_canonical_facet() {
+    let state = make_test_state().await;
+    let (_uuid, solid_id) = sound_verified_box(&state).await;
+    let drawing_id = register_drawing_for(&state, solid_id).await;
+    assert!(
+        ack_unsound_facets_in_drawing_history(&state)
+            .await
+            .is_empty(),
+        "fixture precondition: an ordinary creation with no escape must not \
+         have already stamped the facet, or this test cannot attribute the \
+         facet below to the export call alone"
+    );
+
+    let (status, body) = dispatch(
+        &state,
+        get(&format!(
+            "/api/drawings/{drawing_id}/svg?acknowledge_unsound=true"
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "svg export must 200; body = {body}");
+
+    let facets = ack_unsound_facets_in_drawing_history(&state).await;
+    assert!(
+        !facets.is_empty(),
+        "no event in history carries the canonical roshera.acknowledge_unsound \
+         FACET after a registered svg export that used the escape — \
+         export_svg's own sync_scope wrapper must stamp it, matching \
+         export_pdf"
+    );
+    for facet in &facets {
+        assert_eq!(
+            facet["acknowledged"],
+            json!(true),
+            "facet must read `acknowledged: true`; got {facet}"
+        );
+    }
+}
+
+/// The `export_dxf` sibling — same isolation discipline. THE RED for
+/// L-3's `export_dxf` gap: before this test, `export_dxf` had no facet
+/// pin at all, so a future edit that dropped its `sync_scope` wrapper
+/// would leave the whole suite green.
+#[tokio::test]
+async fn a_registered_dxf_export_using_acknowledge_unsound_also_stamps_the_canonical_facet() {
+    let state = make_test_state().await;
+    let (_uuid, solid_id) = sound_verified_box(&state).await;
+    let drawing_id = register_drawing_for(&state, solid_id).await;
+    assert!(
+        ack_unsound_facets_in_drawing_history(&state)
+            .await
+            .is_empty(),
+        "fixture precondition: an ordinary creation with no escape must not \
+         have already stamped the facet, or this test cannot attribute the \
+         facet below to the export call alone"
+    );
+
+    let (status, body) = dispatch(
+        &state,
+        get(&format!(
+            "/api/drawings/{drawing_id}/dxf?acknowledge_unsound=true"
+        )),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "dxf export must 200; body = {body}");
+
+    let facets = ack_unsound_facets_in_drawing_history(&state).await;
+    assert!(
+        !facets.is_empty(),
+        "no event in history carries the canonical roshera.acknowledge_unsound \
+         FACET after a registered dxf export that used the escape — \
+         export_dxf's own sync_scope wrapper must stamp it, matching \
+         export_pdf"
     );
     for facet in &facets {
         assert_eq!(
@@ -1098,5 +1200,103 @@ async fn certificate_discloses_unresolvable_for_a_solid_the_model_does_not_conta
             .any(|r| r["reading"] == "unresolvable" && r["solid_id"] == ABSENT_SOLID_ID),
         "a solid absent from the active model must disclose `unresolvable`, \
          never silently read as `sound` by omission; body = {body}"
+    );
+}
+
+// =====================================================================
+// 6. L-4 (2026-08-16 ownership residuals) — cardinality and the empty case
+// =====================================================================
+//
+// `drawing_solid_ids` maps over VIEWS, not distinct solids. Before the
+// dedup fix, a standard one-call sheet (multiple views, all sourced from
+// the SAME solid) produced one identical entry per view in
+// `solid_soundness` — and a registered-but-empty drawing produced `[]`,
+// a shape a consumer could reasonably misread as "nothing unsound here."
+// Both are pinned below.
+
+/// THE RED for the dedup: a standard one-call sheet of ONE solid must
+/// disclose exactly ONE `solid_soundness` entry, not one per view. Before
+/// the fix this asserted `readings.len() == <the standard auto-drawing's
+/// actual view count>` instead — this test fails against that shape,
+/// proving the dedup actually happened rather than merely being
+/// documented. The fixture-precondition check below reads the real view
+/// count off the raw drawing rather than hardcoding it, since the exact
+/// number is standard-auto-drawing's own implementation detail.
+#[tokio::test]
+async fn certificate_discloses_one_entry_per_distinct_solid_not_per_view() {
+    let state = make_test_state().await;
+    let (_uuid, solid_id) = sound_verified_box(&state).await;
+    let drawing_id = register_drawing_for(&state, solid_id).await;
+
+    // Fixture precondition, checked against the RAW drawing (not the
+    // disclosure under test): the standard one-call sheet must genuinely
+    // register more than one view of the same solid, or this test cannot
+    // distinguish "deduped to one" from "never triplicated in the first
+    // place."
+    let (status, drawing_body) =
+        dispatch(&state, get(&format!("/api/drawings/{drawing_id}"))).await;
+    assert_eq!(status, StatusCode::OK, "body = {drawing_body}");
+    let view_count = drawing_body["views"]
+        .as_array()
+        .expect("views must be a JSON array")
+        .len();
+    assert!(
+        view_count >= 2,
+        "fixture precondition: the standard one-call sheet must register \
+         more than one view of the same solid; drawing = {drawing_body:?}"
+    );
+
+    let (status, body) = dispatch(
+        &state,
+        get(&format!("/api/drawings/{drawing_id}/certificate")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body = {body}");
+    let readings = body["solid_soundness"]
+        .as_array()
+        .expect("solid_soundness must be a JSON array");
+    assert_eq!(
+        readings.len(),
+        1,
+        "a single-solid drawing must disclose exactly one solid_soundness \
+         entry, not one per view referencing it (the fixture has \
+         {view_count} views of the same solid); readings = {readings:?}"
+    );
+    assert_eq!(readings[0]["solid_id"], solid_id);
+}
+
+/// THE RED for the empty case: a registered drawing with NO views yet
+/// discloses `solid_soundness: []`, and this is the ONLY shape that
+/// array can take when nothing has been measured — pinned so a later
+/// change cannot quietly turn "no views" into a refusal or a fabricated
+/// reading instead of the honest empty disclosure the doc now names.
+#[tokio::test]
+async fn certificate_discloses_an_empty_array_for_a_drawing_with_no_views() {
+    let state = make_test_state().await;
+    let (status, body) = dispatch(
+        &state,
+        post("/api/drawings", json!({ "name": "empty sheet" })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body = {body}");
+    let drawing_id = body["id"].as_str().expect("drawing id string").to_string();
+
+    let (status, body) = dispatch(
+        &state,
+        get(&format!("/api/drawings/{drawing_id}/certificate")),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a read-only inspection surface must never refuse; body = {body}"
+    );
+    let readings = body["solid_soundness"]
+        .as_array()
+        .expect("solid_soundness must be a JSON array");
+    assert!(
+        readings.is_empty(),
+        "a drawing with no views must disclose an empty solid_soundness \
+         array, not a fabricated reading; readings = {readings:?}"
     );
 }

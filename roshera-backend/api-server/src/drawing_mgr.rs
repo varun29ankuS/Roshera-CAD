@@ -531,13 +531,39 @@ pub async fn list_drawings(State(state): State<AppState>) -> Json<Vec<DrawingLis
     Json(state.drawings.list())
 }
 
+/// Response for `GET /api/drawings/{id}` (gap (a), 2026-08-16 ownership
+/// residuals). `list_drawings` and the `/semantic` and `/certificate`
+/// routes all disclose the owner; this single-fetch route used to return
+/// the bare [`Drawing`], so a caller fetching one drawing while a
+/// different document/part was active had no way to see which
+/// document/part it actually belonged to. `#[serde(flatten)]` on
+/// `drawing` keeps every existing top-level key exactly where a caller
+/// already reads it (`Drawing` has no field named `owner`, so there is no
+/// collision) — additive, not a breaking reshape, matching the same
+/// discipline `CertificateWithSoundness` / `SemanticDrawingResponse` use
+/// for the same disclosure elsewhere. Unlike `list_drawings`'s change (a
+/// bare `Vec<Uuid>` becoming a `Vec<{id, owner}>`), no existing top-level
+/// key moves or disappears here.
+#[derive(Debug, Clone, Serialize)]
+pub struct DrawingWithOwner {
+    pub owner: ModelKey,
+    #[serde(flatten)]
+    pub drawing: Drawing,
+}
+
 pub async fn get_drawing(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
-) -> Result<Json<Drawing>, ApiError> {
-    let handle = state.drawings.get(&id).ok_or_else(|| not_found(id))?;
+) -> Result<Json<DrawingWithOwner>, ApiError> {
+    let (owner, handle) = state
+        .drawings
+        .get_with_owner(&id)
+        .ok_or_else(|| not_found(id))?;
     let guard = handle.read().await;
-    Ok(Json(guard.clone()))
+    Ok(Json(DrawingWithOwner {
+        owner,
+        drawing: guard.clone(),
+    }))
 }
 
 pub async fn rename_drawing(
@@ -1350,6 +1376,18 @@ pub async fn drawing_quality(
 /// closes. `solid_id` alone cannot distinguish the two causes; a caller
 /// that needs to know which one applies reads the sibling
 /// `unavailable_reason` / `certificate_unavailable_reason` field instead.
+///
+/// **Cardinality (L-4, 2026-08-16 residuals):** the `Vec` this type
+/// populates (`CertificateWithSoundness::solid_soundness` /
+/// `SemanticDrawingResponse::solid_soundness`) has ONE entry per DISTINCT
+/// solid the drawing's views reference, not one per view — see
+/// `drawing_solid_ids`'s own doc for why the dedup is lossless. **An empty
+/// array means the drawing has no views yet (`POST /api/drawings` with no
+/// views registered) — nothing has been measured, which is NOT the same
+/// claim as "every referenced solid is sound."** The one shape a consumer
+/// could otherwise misread as a clean bill of health is the one this
+/// disclosure exists to prevent from being read that way; a drawing with
+/// views always populates at least one entry, `Unresolvable` included.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(tag = "reading", rename_all = "snake_case")]
 pub enum SolidSoundnessDisclosure {
@@ -1458,6 +1496,10 @@ pub struct CertificateWithSoundness {
     /// `certificate` is `Some`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unavailable_reason: Option<String>,
+    /// One entry per DISTINCT solid the drawing's views reference, never
+    /// one per view. `[]` means the drawing has no views yet — nothing
+    /// has been measured, NOT a clean bill of health. See
+    /// [`SolidSoundnessDisclosure`]'s own doc for both cases in full.
     pub solid_soundness: Vec<SolidSoundnessDisclosure>,
 }
 
@@ -1488,7 +1530,10 @@ pub struct SemanticDrawingResponse {
     pub certificate_unavailable_reason: Option<String>,
     /// Live solid-soundness disclosure (L2, 2026-08-16 residuals) — see
     /// [`SolidSoundnessDisclosure`]. NOT `certificate.sound`, which means
-    /// sheet-vs-model consistency, not B-Rep validity.
+    /// sheet-vs-model consistency, not B-Rep validity. One entry per
+    /// DISTINCT solid referenced, never one per view; `[]` means no views
+    /// yet, not a clean bill of health — see
+    /// [`SolidSoundnessDisclosure`]'s own doc for both cases in full.
     pub solid_soundness: Vec<SolidSoundnessDisclosure>,
 }
 
@@ -1702,13 +1747,34 @@ async fn refuse_unsound_solid(
 /// Closed by binding every drawing to the `ModelKey` its creating request
 /// resolved, resolving every later read from THAT owner instead of the
 /// caller's `ActiveModel` — see the module doc.
+///
+/// # Distinct solids, not one entry per view (L-4, 2026-08-16 residuals)
+///
+/// Deduplicated, first-occurrence order preserved: a standard three-view
+/// sheet of ONE solid returns a one-element list, not three identical
+/// entries. Before this fix the function mapped one-to-one over `views`,
+/// so `disclose_solid_soundness`/`refuse_unsound_solid` read (and a
+/// caller of `/certificate` or `/semantic` saw in `solid_soundness`)
+/// three identical readings for a single-solid drawing — a `Vec` whose
+/// length a reader could reasonably mistake for "number of solids this
+/// sheet references," which the multiplicity silently contradicted. Every
+/// view of the same solid always yields the SAME reading
+/// (`soundness_reading` is keyed on `solid_id`, not on any per-view
+/// state), so the triplication carried no information the dedup loses.
+/// `refuse_unsound_solid`'s gate is membership-only (it short-circuits on
+/// the first `Unsound` match, never counts), so this is not a behavior
+/// change for the two mutation-gating call sites — only for the two
+/// disclosure call sites' array shape. See [`SolidSoundnessDisclosure`]'s
+/// doc for what an empty result means.
 fn drawing_solid_ids(drawing: &Drawing) -> Vec<SolidId> {
+    let mut seen = std::collections::HashSet::new();
     drawing
         .views
         .iter()
         .map(|v| match v.source {
             ViewSource::Part { solid_id, .. } => solid_id,
         })
+        .filter(|solid_id| seen.insert(*solid_id))
         .collect()
 }
 

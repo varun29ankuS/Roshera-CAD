@@ -631,3 +631,82 @@ async fn add_view_refuses_a_part_sourced_view_on_a_legacy_owned_drawing() {
     );
     assert_eq!(body["error_code"].as_str(), Some("invalid_parameter"));
 }
+
+// =====================================================================
+// 5. Gap (a), 2026-08-16 ownership residuals — the single-fetch route
+//    discloses its owner too
+// =====================================================================
+//
+// `list_drawings`, `/semantic` and `/certificate` all disclose the
+// owner; `GET /api/drawings/{id}` used to return the bare `Drawing`,
+// leaving a caller reading one drawing while a different document/part
+// was active with no way to see which document/part it actually
+// belonged to. THE RED for this gap: before the fix, `body["kind"]`
+// (the flattened `ModelKey` tag) was simply absent.
+
+/// A part-owned drawing's single fetch discloses `owner.kind == "part"`
+/// and the correct `part_id`, while every existing `Drawing` field
+/// (`name`, `views`) survives the `#[serde(flatten)]` unchanged —
+/// additive, not a breaking reshape.
+#[tokio::test]
+async fn get_drawing_discloses_the_owner_for_a_part_owned_drawing() {
+    let state = make_test_state().await;
+    let part_a = create_part(&state, "A").await;
+    let sid_a = sound_box_in_part(&state, part_a, 10.0).await;
+    let drawing_id = register_drawing_for_part(&state, part_a, sid_a).await;
+
+    let (status, body) = dispatch(&state, get(&format!("/api/drawings/{drawing_id}"))).await;
+    assert_eq!(status, StatusCode::OK, "body = {body}");
+    assert_eq!(
+        body["owner"]["kind"].as_str(),
+        Some("part"),
+        "single fetch must disclose the owner's kind; body = {body}"
+    );
+    assert_eq!(
+        body["owner"]["part_id"].as_str(),
+        Some(part_a.to_string().as_str()),
+        "single fetch must disclose the owning part's id; body = {body}"
+    );
+    assert!(
+        body["views"].is_array(),
+        "the Drawing's own fields must survive the flatten unchanged; \
+         body = {body}"
+    );
+    assert!(
+        body["name"].is_string(),
+        "the Drawing's own fields must survive the flatten unchanged; \
+         body = {body}"
+    );
+    assert_eq!(
+        body["id"].as_str(),
+        Some(drawing_id.to_string().as_str()),
+        "the Drawing's own id field must survive the flatten unchanged; \
+         body = {body}"
+    );
+}
+
+/// A legacy-owned drawing's single fetch discloses `owner.kind ==
+/// "legacy"` and the active document id.
+#[tokio::test]
+async fn get_drawing_discloses_the_owner_for_a_legacy_owned_drawing() {
+    let state = make_test_state().await;
+    let (status, body) = dispatch(
+        &state,
+        post("/api/drawings", empty_drawing_request("Legacy sheet")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "body = {body}");
+    let drawing_id = body["id"].as_str().expect("drawing id string").to_string();
+
+    let (status, body) = dispatch(&state, get(&format!("/api/drawings/{drawing_id}"))).await;
+    assert_eq!(status, StatusCode::OK, "body = {body}");
+    assert_eq!(
+        body["owner"]["kind"].as_str(),
+        Some("legacy"),
+        "single fetch must disclose the owner's kind; body = {body}"
+    );
+    assert!(
+        body["owner"]["document_id"].is_string(),
+        "single fetch must disclose the owning document's id; body = {body}"
+    );
+}
