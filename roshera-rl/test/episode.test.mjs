@@ -1119,12 +1119,25 @@ check("the COMPOSITE_DISPATCH copy is derived from real entry.handler( call site
     const hitRe = /entry\.handler\(/g;
     let hm;
     while ((hm = hitRe.exec(src))) {
-      // A REAL call site, not a comment mentioning the pattern: the text on
-      // the hit's own line, before the hit, must not itself start a `//`
-      // comment.
+      // A REAL call site, not a comment mentioning the pattern. Three comment
+      // shapes are rejected, not one:
+      //   `// … entry.handler(`      a line comment
+      //   ` * … entry.handler(`      a block-comment / JSDoc continuation
+      //   `/* … entry.handler( … */` a block comment opened on this line
+      // The first was the only one checked originally (L-6, 2026-08-16
+      // residuals review). No such block-comment line exists in tree today,
+      // and the failure mode is CLOSED rather than open — a spurious derived
+      // tool makes the set-equality assertion RED, never green — so this is
+      // robustness on a pin that already worked, not a defect being repaired.
+      // It is worth having because the pin's whole job is to survive someone
+      // else editing these files later, and prose about dispatch is exactly
+      // what gets written near dispatch code.
       const lineStart = src.lastIndexOf("\n", hm.index) + 1;
       const linePrefix = src.slice(lineStart, hm.index);
-      if (linePrefix.includes("//")) continue;
+      const inLineComment = linePrefix.includes("//");
+      const inBlockContinuation = /^\s*\*/.test(linePrefix);
+      const inOpenedBlock = linePrefix.lastIndexOf("/*") > linePrefix.lastIndexOf("*/");
+      if (inLineComment || inBlockContinuation || inOpenedBlock) continue;
       realHitCount++;
       const owner = [...toolStarts].reverse().find((t) => t.index <= hm.index);
       assert.ok(

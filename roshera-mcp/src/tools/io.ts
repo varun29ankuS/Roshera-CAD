@@ -198,9 +198,12 @@ export function registerIoTools(server: ToolHost) {
       "the shop-ready sheet — and return the absolute path. For the queryable " +
       "semantic data (not a file) use drawing_read_semantics instead. " +
       "ENFORCED: refused while the sheet's live certificate carries stale/" +
-      "dangling facts (regenerate with make_drawing — no override) or " +
+      "dangling facts (regenerate with make_drawing — no override), on " +
       "Error-severity layout findings (acknowledge_layout_issues for a " +
-      "draft-for-review export). An uncertified sheet cannot become a file.",
+      "draft-for-review export), or when the SOLID the sheet depicts has been " +
+      "verified UNSOUND (acknowledge_unsound for a deliberate inspection " +
+      "sheet — a separate statement from the layout one, and it does not " +
+      "open a stale sheet). An uncertified sheet cannot become a file.",
     {
       drawing_id: z.string().uuid().describe("drawing_id from make_drawing"),
       format: z.enum(["pdf", "dxf", "svg"]).default("pdf").describe("output file format"),

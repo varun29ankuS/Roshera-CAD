@@ -375,6 +375,20 @@ jobs:
       # so every assertion runs the real ToolTable wrapper and the real
       # handlers against a stub backend — the exact path a live call takes,
       # minus the Rust kernel. `npm run test:gates` does that build itself.
+      #
+      # A FIFTH suite exists and deliberately does NOT run here:
+      # `constraint_gates_live.mjs` drives the same gates against a REAL
+      # running backend (:8081 or ROSHERA_URL), which CI does not have. It is
+      # invocable as `npm run test:gates:live` — it was previously runnable by
+      # no script at all, which is why it is named here rather than left to be
+      # rediscovered.
+      #
+      # It is safe to leave out of CI precisely because it does not fake
+      # success without a backend: its reachability probe exits **2** — a code
+      # distinct from a test failure's 1, meaning "could not run" rather than
+      # "ran and passed". An absent backend can therefore never be mistaken
+      # for a green live pass. Run it by hand against a live server before
+      # shipping gate changes; the four above cover the logic offline.
       run: npm run test:gates
       working-directory: ./roshera-mcp
 
