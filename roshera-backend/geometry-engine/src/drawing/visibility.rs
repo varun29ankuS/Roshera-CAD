@@ -17,7 +17,7 @@ use std::collections::HashSet;
 
 use crate::math::{Matrix4, Point3, Vector3};
 use crate::primitives::edge::EdgeId;
-use crate::primitives::face::FaceId;
+use crate::primitives::face::{Face, FaceId};
 use crate::primitives::solid::SolidId;
 use crate::primitives::topology_builder::BRepModel;
 use crate::queries::raycast::ray_hit_face_t;
@@ -688,6 +688,451 @@ pub fn is_point_hidden(
     occluded(model, solid_id, p, w, back, eps)
 }
 
+// ─────────────────────────────────────────────────────────────────────────
+// Synthesized curved-surface silhouettes (2026-08-17 brief)
+//
+// A B-Rep cylinder/cone carries exactly one topological SEAM edge — the
+// parameterisation's `u = 0` wrap line, referenced TWICE by the lateral
+// face's own loop (`TopologyBuilder::create_cylinder_topology`'s doc
+// comment: "the seam MUST coincide with the circles' parametric origin").
+// The seam gets drawn today because the HLR walk draws every real
+// topological edge, so it reads as a silhouette only when it happens to
+// face the camera. The true outline — the locus where the surface normal
+// turns perpendicular to the view, `n(u)·w = 0` — is generally a DIFFERENT
+// line, and nothing has ever synthesized it.
+//
+// Cylinder and Cone are RULED surfaces whose normal is constant along each
+// generator (independent of `v` — see both surfaces' own `evaluate_full`
+// doc comments), so `n(u)·w = 0` reduces to a trig equation in `u` alone
+// and picks out up to two whole straight GENERATOR lines, not merely two
+// points. A Sphere's silhouette is the great circle in the plane through
+// its centre perpendicular to `w` — always camera-facing by construction,
+// so unlike the ruled-surface case it is a CIRCLE, and is synthesized by
+// reusing the exact analytic-circle accumulation a real rim edge already
+// takes (`circle_groups`), so it flushes through the SAME
+// uniform-visibility / mixed-rim-fallback logic downstream rather than a
+// second copy of it — and renders as an exact SVG circle, never a sampled
+// polyline, matching the crate's exact-conic principle.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// True when `edge_id` is a pure parameterisation SEAM rather than a design
+/// feature: a cylinder/cone lateral face's own loop references it TWICE (u=0
+/// forward and backward), so it borders exactly ONE distinct face — where a
+/// genuine shared edge borders two. Combined with the surface-type check
+/// this is a tight, false-positive-free predicate: no legitimate edge in a
+/// closed manifold B-Rep is bordered by only one face-use.
+///
+/// **Ruling (brief's open question):** a seam is suppressed HERE
+/// unconditionally, whether or not it happens to coincide with the true
+/// silhouette in this view. It is a parameterisation artifact, not a
+/// feature — drawing it when it does NOT lie on the silhouette would ink a
+/// false line down the middle of the surface, and drawing it when it DOES
+/// would risk a double-draw with the synthesized silhouette below. Both
+/// true silhouette generators are synthesized unconditionally by
+/// [`emit_line_silhouette`], so a seam that does face the camera still gets
+/// exactly the right ink — just sourced from that synthesis, not the
+/// topological edge, and carrying [`super::types::PolylineRole::Silhouette`]
+/// instead of `Edge` provenance.
+fn is_parameterization_seam(
+    model: &BRepModel,
+    edge_id: EdgeId,
+    edge_faces: &std::collections::HashMap<EdgeId, Vec<u32>>,
+) -> bool {
+    let Some(faces) = edge_faces.get(&edge_id) else {
+        return false;
+    };
+    if faces.len() != 1 {
+        return false;
+    }
+    let Some(face) = model.faces.get(faces[0]) else {
+        return false;
+    };
+    let Some(surface) = model.surfaces.get(face.surface_id) else {
+        return false;
+    };
+    surface
+        .as_any()
+        .downcast_ref::<crate::primitives::surface::Cylinder>()
+        .is_some()
+        || surface
+            .as_any()
+            .downcast_ref::<crate::primitives::surface::Cone>()
+            .is_some()
+}
+
+/// Bundled occlusion-classification context, shared by the real-edge walk
+/// and synthesized silhouette curves so both go through IDENTICAL logic —
+/// the accelerator strategy and the `occlude = false` iso shortcut apply
+/// uniformly to every segment classified in a view, real or synthesized.
+struct ViewOcclusionCtx<'a> {
+    model: &'a BRepModel,
+    solid_id: SolidId,
+    w: Vector3,
+    back: f64,
+    eps: f64,
+    occlude: bool,
+    accel: &'a Option<OcclusionGrid>,
+}
+
+impl ViewOcclusionCtx<'_> {
+    fn visible(&self, mid: Point3, mu: f64, mv: f64) -> bool {
+        if !self.occlude {
+            true
+        } else if let Some(accel) = self.accel {
+            !accel.occluded(self.model, mid, mu, mv)
+        } else {
+            !occluded(self.model, self.solid_id, mid, self.w, self.back, self.eps)
+        }
+    }
+}
+
+/// Classify every consecutive segment of a sampled (3D, 2D) point chain as
+/// visible/hidden and group into maximal same-visibility runs — the exact
+/// grouping the real-edge walk performs (per-segment midpoint classification
+/// into visible/hidden runs), factored out so a synthesized silhouette curve
+/// goes through the identical rule instead of a re-implementation that could
+/// drift from it.
+///
+/// The classification point for each segment is the raw CHORD midpoint —
+/// correct for anything whose chord lies exactly ON the true curve (a
+/// straight edge, or a cylinder/cone generator, which IS a straight line)
+/// and safe for a planar rim curve (a circle/arc edge's chord midpoint stays
+/// coplanar with the rim, which borders a void, not solid material, so it
+/// cannot be spuriously self-occluded). It is NOT safe for a curve embedded
+/// in the MIDDLE of a solid, like a sphere's synthesized great-circle
+/// silhouette — see [`split_by_visibility_on_sphere`], which every sphere
+/// silhouette call site uses instead.
+fn split_by_visibility(
+    p3: &[Point3],
+    p2: &[[f64; 2]],
+    ctx: &ViewOcclusionCtx,
+) -> Vec<(bool, Vec<[f64; 2]>)> {
+    split_by_visibility_with(p3, p2, ctx, |a, b| {
+        Point3::new(0.5 * (a.x + b.x), 0.5 * (a.y + b.y), 0.5 * (a.z + b.z))
+    })
+}
+
+/// As [`split_by_visibility`], but the occlusion PROBE point for each
+/// segment is the chord midpoint projected radially back onto the sphere
+/// (`center + (mid − center)·normalize() * radius`) rather than the raw
+/// chord midpoint. A great-circle chord's raw midpoint sits at radius
+/// `r·cos(Δθ/2)` from the centre — strictly INSIDE the ball, at the exact
+/// SAME depth-along-`w` as the equator itself — where the solid's own near
+/// hemisphere legitimately (but spuriously, for this synthesized silhouette)
+/// occludes it: a lone, fully unoccluded sphere would classify its own
+/// silhouette as entirely hidden. Radially re-projecting the probe point
+/// back onto the true surface removes the artificial sagitta while leaving
+/// the drawn geometry (`p2`, the actual sampled circle points) untouched.
+fn split_by_visibility_on_sphere(
+    p3: &[Point3],
+    p2: &[[f64; 2]],
+    center: Point3,
+    radius: f64,
+    ctx: &ViewOcclusionCtx,
+) -> Vec<(bool, Vec<[f64; 2]>)> {
+    split_by_visibility_with(p3, p2, ctx, |a, b| {
+        let raw_mid = Point3::new(0.5 * (a.x + b.x), 0.5 * (a.y + b.y), 0.5 * (a.z + b.z));
+        match (raw_mid - center).normalize() {
+            Ok(dir) => center + dir * radius,
+            Err(_) => raw_mid,
+        }
+    })
+}
+
+/// Shared core of [`split_by_visibility`] / [`split_by_visibility_on_sphere`]:
+/// classify every consecutive segment as visible/hidden — using `midpoint_of`
+/// to compute the 3D point occlusion is evaluated AT, while the 2D geometry
+/// (`p2`) that actually gets drawn is always the true sampled points — and
+/// group into maximal same-visibility runs.
+fn split_by_visibility_with(
+    p3: &[Point3],
+    p2: &[[f64; 2]],
+    ctx: &ViewOcclusionCtx,
+    midpoint_of: impl Fn(Point3, Point3) -> Point3,
+) -> Vec<(bool, Vec<[f64; 2]>)> {
+    let mut runs: Vec<(bool, Vec<[f64; 2]>)> = Vec::new();
+    for i in 0..p2.len().saturating_sub(1) {
+        let mid = midpoint_of(p3[i], p3[i + 1]);
+        let mu = 0.5 * (p2[i][0] + p2[i + 1][0]);
+        let mv = 0.5 * (p2[i][1] + p2[i + 1][1]);
+        let visible = ctx.visible(mid, mu, mv);
+        match runs.last_mut() {
+            Some((v, pts)) if *v == visible => pts.push(p2[i + 1]),
+            _ => runs.push((visible, vec![p2[i], p2[i + 1]])),
+        }
+    }
+    runs
+}
+
+/// Exact axis-projected v-span of a face's own trim boundary: the min/max of
+/// `axis · (p − origin)` over densely sampled points on every boundary edge
+/// (outer + inner loops) — the same per-edge sampling convention
+/// [`face_bounds`] uses for its own boundary pass (2 points for a linear
+/// edge, 24 for a curved one). For a cylinder/cone lateral face, `v` IS the
+/// axial coordinate and the surface is monotonic in it (no interior bulge
+/// along `axis`), so the boundary alone determines the true v-extent
+/// exactly — deliberately NO safety padding, unlike `face_bounds` (which
+/// pads for an unrelated purpose: a conservative screen-space AABB for
+/// occlusion culling). Padding here would only cost precision: reusing
+/// `face_bounds`'s padded box pushed the untrimmed common case in
+/// [`emit_line_silhouette`] out of its fast (exact-endpoint) path on every
+/// ordinary cylinder, insetting the emitted line from the real `0..height`
+/// span by half a sample step for no reason.
+fn face_axis_span(
+    model: &BRepModel,
+    face: &Face,
+    origin: Point3,
+    axis: Vector3,
+) -> Option<(f64, f64)> {
+    let mut lo = f64::INFINITY;
+    let mut hi = f64::NEG_INFINITY;
+    let mut any = false;
+    let mut loop_ids = vec![face.outer_loop];
+    loop_ids.extend(face.inner_loops.iter().copied());
+    for lid in loop_ids {
+        let Some(lp) = model.loops.get(lid) else {
+            continue;
+        };
+        for &eid in &lp.edges {
+            let Some(edge) = model.edges.get(eid) else {
+                continue;
+            };
+            let Some(curve) = model.curves.get(edge.curve_id) else {
+                continue;
+            };
+            let (t0, t1) = (edge.param_range.start, edge.param_range.end);
+            let is_linear = curve.is_linear(crate::math::Tolerance::default());
+            let n = if is_linear { 2 } else { 24 };
+            for i in 0..n {
+                let frac = i as f64 / (n - 1).max(1) as f64;
+                let t = t0 + (t1 - t0) * frac;
+                if let Ok(p) = curve.point_at(t) {
+                    let v = (p - origin).dot(&axis);
+                    lo = lo.min(v);
+                    hi = hi.max(v);
+                    any = true;
+                }
+            }
+        }
+    }
+    if any {
+        Some((lo, hi))
+    } else {
+        None
+    }
+}
+
+/// Synthesize the generator LINE silhouette of a ruled (cylinder/cone)
+/// lateral face at fixed parameter `u`, spanning `[v_lo, v_hi]`, and push its
+/// classified visible/hidden runs into `out`.
+///
+/// Two-tier sampling: the COMMON untrimmed case (both span endpoints land on
+/// the real trimmed face) costs exactly what a real straight edge costs —
+/// one segment, one occlusion probe — matching the existing linear-edge
+/// convention in the main walk (`is_linear ⇒ n = 2`) rather than paying a
+/// curve-fidelity sample budget for a shape that is, by construction,
+/// perfectly straight. Only a face whose span endpoints are NOT both on the
+/// trimmed surface (a partial angle sweep, a feature cut into the lateral
+/// face) pays for the denser fallback scan that actually locates the
+/// trimmed sub-run(s).
+#[allow(clippy::too_many_arguments)]
+fn emit_line_silhouette(
+    model: &BRepModel,
+    face_id: FaceId,
+    face: &Face,
+    surface: &dyn crate::primitives::surface::Surface,
+    vm: &Matrix4,
+    u: f64,
+    v_lo: f64,
+    v_hi: f64,
+    samples_per_curve: usize,
+    ctx: &ViewOcclusionCtx,
+    out: &mut ViewEdges,
+) {
+    // Trim membership is probed slightly INSET from `v`, toward the span's
+    // interior, rather than at `v` itself. The common case is a span
+    // endpoint that sits EXACTLY on the face's own trim boundary (v_lo/v_hi
+    // come from `face_axis_span`, sampled off that same boundary) — a point
+    // exactly on a winding-number boundary is a genuine numerical
+    // coin-flip, and losing it silently downgraded every ordinary untrimmed
+    // cylinder to the denser fallback scan, which then re-lands on the same
+    // ambiguous boundary sample and reports an inset that reads as almost
+    // right rather than exactly right. The nudge only affects the trim
+    // PROBE; the emitted geometry still uses the untouched `v_lo`/`v_hi`.
+    let probe_eps = (v_hi - v_lo).abs().max(1e-9) * 1e-6;
+    let mid = 0.5 * (v_lo + v_hi);
+    let sample = |v: f64| -> Option<(Point3, [f64; 2], bool)> {
+        let p = surface.point_at(u, v).ok()?;
+        let probe_v = if v <= mid {
+            v + probe_eps
+        } else {
+            v - probe_eps
+        };
+        let inside = crate::tessellation::surface::point_inside_face_uv(u, probe_v, face, model);
+        let q = vm.transform_point(&p);
+        Some((p, [q.x, q.y], inside))
+    };
+
+    let lo = sample(v_lo);
+    let hi = sample(v_hi);
+    let fast_path = matches!((&lo, &hi), (Some((_, _, true)), Some((_, _, true))));
+
+    let mut point_runs: Vec<Vec<(Point3, [f64; 2])>> = Vec::new();
+    if fast_path {
+        if let (Some((p0, q0, _)), Some((p1, q1, _))) = (lo, hi) {
+            point_runs.push(vec![(p0, q0), (p1, q1)]);
+        }
+    } else {
+        let n = samples_per_curve.clamp(2, 24);
+        let mut current: Vec<(Point3, [f64; 2])> = Vec::new();
+        for i in 0..n {
+            let frac = i as f64 / (n - 1) as f64;
+            let v = v_lo + (v_hi - v_lo) * frac;
+            match sample(v) {
+                Some((p, q, true)) => current.push((p, q)),
+                _ => {
+                    if current.len() >= 2 {
+                        point_runs.push(std::mem::take(&mut current));
+                    } else {
+                        current.clear();
+                    }
+                }
+            }
+        }
+        if current.len() >= 2 {
+            point_runs.push(current);
+        }
+    }
+
+    for run in point_runs {
+        let p3: Vec<Point3> = run.iter().map(|(p, _)| *p).collect();
+        let p2: Vec<[f64; 2]> = run.iter().map(|(_, q)| *q).collect();
+        for (visible, pts) in split_by_visibility(&p3, &p2, ctx) {
+            let pl = Polyline2d::from_points(pts);
+            if pl.points.len() < 2 {
+                continue;
+            }
+            let source = super::types::PolylineSource {
+                edge_id: None,
+                face_ids: vec![face_id],
+                role: super::types::PolylineRole::Silhouette,
+            };
+            if visible {
+                out.visible.push(pl);
+                out.visible_sources.push(source);
+            } else {
+                out.hidden.push(pl);
+                out.hidden_sources.push(source);
+            }
+        }
+    }
+}
+
+/// Synthesize a sphere's silhouette: the great circle in the plane through
+/// its centre perpendicular to the view direction `w`. Always camera-facing
+/// by construction, so — unlike a cylinder/cone's straight generators — this
+/// is a CIRCLE, sampled around its circumference for trim + occlusion
+/// classification and accumulated into `circle_groups` exactly as a real rim
+/// edge would be, so it flushes through the SAME uniform-visibility /
+/// mixed-rim-fallback logic downstream (an unoccluded standalone sphere
+/// flushes as one exact analytic circle, never a polyline).
+#[allow(clippy::too_many_arguments)]
+fn synth_sphere_silhouette(
+    model: &BRepModel,
+    face_id: FaceId,
+    face: &Face,
+    sphere: &crate::primitives::surface::Sphere,
+    vm: &Matrix4,
+    w: Vector3,
+    samples_per_curve: usize,
+    ctx: &ViewOcclusionCtx,
+    circle_groups: &mut std::collections::HashMap<(i64, i64, i64, i64), CircleGroup>,
+) {
+    let Ok(n) = w.normalize() else {
+        return;
+    };
+    let helper = if n.x.abs() < 0.9 {
+        Vector3::X
+    } else {
+        Vector3::Y
+    };
+    let Ok(e1) = n.cross(&helper).normalize() else {
+        return;
+    };
+    let Ok(e2) = n.cross(&e1).normalize() else {
+        return;
+    };
+
+    let center = sphere.center;
+    let radius = sphere.radius;
+    let tol = model.tolerance();
+    // Endpoint-inclusive (i=0 -> theta=0, i=n-1 -> theta=TAU): explicitly
+    // closes the loop with a sample coincident with the first, matching how
+    // a real closed circle edge samples its own full [t0, t0+2π) range.
+    let n_samples = samples_per_curve.clamp(3, 96);
+
+    let mut run: Vec<(Point3, [f64; 2])> = Vec::new();
+    let mut runs: Vec<Vec<(Point3, [f64; 2])>> = Vec::new();
+    for i in 0..n_samples {
+        let frac = i as f64 / (n_samples - 1) as f64;
+        let theta = frac * std::f64::consts::TAU;
+        let p = center + e1 * (radius * theta.cos()) + e2 * (radius * theta.sin());
+        let inside = match crate::primitives::surface::Surface::closest_point(sphere, &p, tol) {
+            Ok((u, v)) => crate::tessellation::surface::point_inside_face_uv(u, v, face, model),
+            Err(_) => false,
+        };
+        if inside {
+            let q = vm.transform_point(&p);
+            run.push((p, [q.x, q.y]));
+        } else if run.len() >= 2 {
+            runs.push(std::mem::take(&mut run));
+        } else {
+            run.clear();
+        }
+    }
+    if run.len() >= 2 {
+        runs.push(run);
+    }
+    if runs.is_empty() {
+        return;
+    }
+
+    let c2 = vm.transform_point(&center);
+    let key = (
+        (center.x * 1e3).round() as i64,
+        (center.y * 1e3).round() as i64,
+        (center.z * 1e3).round() as i64,
+        (radius * 1e3).round() as i64,
+    );
+    let g = circle_groups.entry(key).or_insert(CircleGroup {
+        cx: c2.x,
+        cy: c2.y,
+        r: radius,
+        all_visible: true,
+        all_hidden: true,
+        fallback: Vec::new(),
+        face_ids: Vec::new(),
+    });
+    if !g.face_ids.contains(&face_id) {
+        g.face_ids.push(face_id);
+    }
+    for pts in runs {
+        let p3: Vec<Point3> = pts.iter().map(|(p, _)| *p).collect();
+        let p2: Vec<[f64; 2]> = pts.iter().map(|(_, q)| *q).collect();
+        let classified = split_by_visibility_on_sphere(&p3, &p2, center, radius, ctx);
+        let arc_vis = classified.iter().all(|(v, _)| *v);
+        let arc_hid = classified.iter().all(|(v, _)| !*v);
+        g.all_visible &= arc_vis;
+        g.all_hidden &= arc_hid;
+        for (vis, seg) in classified {
+            let pl = Polyline2d::from_points(seg);
+            if pl.points.len() >= 2 {
+                g.fallback.push((vis, pl));
+            }
+        }
+    }
+}
+
 /// Project a solid's edges, classifying every sub-segment visible / hidden.
 ///
 /// Occlusion uses the projected-AABB [`OcclusionGrid`] broad phase unless the
@@ -767,6 +1212,15 @@ pub(crate) fn project_solid_edges_visibility_mode(
     } else {
         None
     };
+    let occ_ctx = ViewOcclusionCtx {
+        model,
+        solid_id,
+        w,
+        back,
+        eps,
+        occlude,
+        accel: &accel,
+    };
 
     let mut visited: HashSet<EdgeId> = HashSet::new();
     let mut out = ViewEdges {
@@ -801,11 +1255,17 @@ pub(crate) fn project_solid_edges_visibility_mode(
     // on the LATERAL face id, which may not be the walk-encounter face.
     let mut edge_faces: std::collections::HashMap<EdgeId, Vec<u32>> =
         std::collections::HashMap::new();
+    // Every face of the solid, collected alongside `edge_faces` (same
+    // traversal, no extra shell/face walk) — consumed below by the
+    // silhouette-synthesis pass once `shell_ids` itself has been moved into
+    // the main edge walk.
+    let mut all_face_ids: Vec<FaceId> = Vec::new();
     for sh in &shell_ids {
         let Some(shell) = model.shells.get(*sh) else {
             continue;
         };
         for face_id in &shell.faces {
+            all_face_ids.push(*face_id);
             let Some(face) = model.faces.get(*face_id) else {
                 continue;
             };
@@ -853,6 +1313,14 @@ pub(crate) fn project_solid_edges_visibility_mode(
                         None => continue,
                     };
                     let is_linear = curve.is_linear(crate::math::Tolerance::default());
+                    // A cylinder/cone seam is a parameterisation artifact, not a
+                    // feature — suppressed unconditionally (see
+                    // `is_parameterization_seam`'s doc comment for the ruling);
+                    // the true silhouette is synthesized separately below,
+                    // regardless of whether it coincides with this seam.
+                    if is_linear && is_parameterization_seam(model, *edge_id, &edge_faces) {
+                        continue;
+                    }
                     let n = if is_linear {
                         2
                     } else {
@@ -885,31 +1353,9 @@ pub(crate) fn project_solid_edges_visibility_mode(
                     }
 
                     // Classify each segment, grouping consecutive same-visibility
-                    // runs into polylines.
-                    let mut runs: Vec<(bool, Vec<[f64; 2]>)> = Vec::new();
-                    for i in 0..p2.len() - 1 {
-                        let mid = Point3::new(
-                            0.5 * (p3[i].x + p3[i + 1].x),
-                            0.5 * (p3[i].y + p3[i + 1].y),
-                            0.5 * (p3[i].z + p3[i + 1].z),
-                        );
-                        // View projection is linear (orthographic), so the 2D
-                        // midpoint is the projection of the 3D midpoint — used to
-                        // index the occlusion grid cell.
-                        let mu = 0.5 * (p2[i][0] + p2[i + 1][0]);
-                        let mv = 0.5 * (p2[i][1] + p2[i + 1][1]);
-                        let visible = if !occlude {
-                            true
-                        } else if let Some(accel) = &accel {
-                            !accel.occluded(model, mid, mu, mv)
-                        } else {
-                            !occluded(model, solid_id, mid, w, back, eps)
-                        };
-                        match runs.last_mut() {
-                            Some((v, pts)) if *v == visible => pts.push(p2[i + 1]),
-                            _ => runs.push((visible, vec![p2[i], p2[i + 1]])),
-                        }
-                    }
+                    // runs into polylines — identical rule the synthesized
+                    // silhouette curves below use, via the same helper.
+                    let runs = split_by_visibility(&p3, &p2, &occ_ctx);
 
                     // Analytic circle: a circular arc-edge whose circle plane
                     // faces the camera (normal ∥ view dir) projects, under the
@@ -1043,6 +1489,108 @@ pub(crate) fn project_solid_edges_visibility_mode(
                     }
                 }
             }
+        }
+    }
+
+    // Synthesized curved-surface silhouettes — see the module-level comment
+    // above `is_parameterization_seam` for the design. Runs over every face
+    // of the solid (collected into `all_face_ids` above, before `shell_ids`
+    // was moved into the edge walk); a face whose surface is not Cylinder,
+    // Cone or Sphere is skipped immediately.
+    for face_id in &all_face_ids {
+        let Some(face) = model.faces.get(*face_id) else {
+            continue;
+        };
+        let Some(surface) = model.surfaces.get(face.surface_id) else {
+            continue;
+        };
+
+        if let Some(sph) = surface
+            .as_any()
+            .downcast_ref::<crate::primitives::surface::Sphere>()
+        {
+            synth_sphere_silhouette(
+                model,
+                *face_id,
+                face,
+                sph,
+                &vm,
+                w,
+                samples_per_curve,
+                &occ_ctx,
+                &mut circle_groups,
+            );
+            continue;
+        }
+
+        // Cylinder / Cone share the same ruled-surface derivation: the
+        // silhouette condition `n(u)·w = 0` reduces to `A cos u + B sin u =
+        // C` with `A = w·x_dir`, `B = w·y_dir`, and `C = tan(half_angle) *
+        // (w·axis)` (zero for a cylinder, which is the `half_angle = 0`
+        // special case) — solved in closed form below.
+        let (origin, axis, ref_dir, half_angle) = if let Some(cyl) =
+            surface
+                .as_any()
+                .downcast_ref::<crate::primitives::surface::Cylinder>()
+        {
+            (cyl.origin, cyl.axis, cyl.ref_dir, None)
+        } else if let Some(cone) = surface
+            .as_any()
+            .downcast_ref::<crate::primitives::surface::Cone>()
+        {
+            (cone.apex, cone.axis, cone.ref_dir, Some(cone.half_angle))
+        } else {
+            continue;
+        };
+
+        let x_dir = ref_dir;
+        let y_dir = axis.cross(&x_dir);
+        let wx = w.dot(&x_dir);
+        let wy = w.dot(&y_dir);
+        let wz = w.dot(&axis);
+        let r = (wx * wx + wy * wy).sqrt();
+        const DEGENERATE: f64 = 1e-9;
+        if r < DEGENERATE {
+            // View direction is (near-)parallel to the axis: looking straight
+            // down a cylinder/cone shows only its end rim(s), no generator
+            // line turns edge-on.
+            continue;
+        }
+        let c = half_angle.map(|ha| ha.tan() * wz).unwrap_or(0.0);
+        if c.abs() > r + DEGENERATE {
+            // No real solution: this cone's flare never turns edge-on from
+            // this view direction.
+            continue;
+        }
+        let phi = wy.atan2(wx);
+        let delta = (c / r).clamp(-1.0, 1.0).acos();
+        let mut candidates = vec![phi + delta, phi - delta];
+        if (candidates[0] - candidates[1]).rem_euclid(std::f64::consts::TAU) < 1e-9 {
+            candidates.truncate(1);
+        }
+
+        let Some((v_lo, v_hi)) = face_axis_span(model, face, origin, axis) else {
+            continue;
+        };
+        if !(v_hi > v_lo) {
+            continue;
+        }
+
+        for raw_u in candidates {
+            let u = raw_u.rem_euclid(std::f64::consts::TAU);
+            emit_line_silhouette(
+                model,
+                *face_id,
+                face,
+                surface,
+                &vm,
+                u,
+                v_lo,
+                v_hi,
+                samples_per_curve,
+                &occ_ctx,
+                &mut out,
+            );
         }
     }
 
@@ -1271,6 +1819,49 @@ mod tests {
             "expected near-zero minor axis, got {}",
             ell.ry
         );
+    }
+
+    // ===== 2026-08-17 silhouette brief: synthesized curved-surface silhouettes =====
+
+    /// A lone sphere's silhouette is its own great circle — a locus lying
+    /// entirely ON the surface, so nothing on the SAME solid can occlude it.
+    /// It must flush as a fully-VISIBLE analytic circle, not a hidden one.
+    ///
+    /// This is the mutation-catcher for a subtle sagitta bug: classifying
+    /// occlusion at the CHORD MIDPOINT between two adjacent samples on the
+    /// circle (rather than at a point on the true circle) places the probe
+    /// strictly INSIDE the ball — a great-circle chord's midpoint sits at
+    /// radius `r·cos(Δθ/2)` from the centre, at the SAME depth-along-`w` as
+    /// the equator itself, which is squarely inside the solid, where the
+    /// near hemisphere legitimately (but spuriously, for this purpose)
+    /// occludes it. A real circular RIM edge does not have this problem —
+    /// its chord midpoint stays coplanar with the rim, which borders a void
+    /// (nothing behind it to occlude), not a solid ball — so the bug is
+    /// specific to a curved silhouette synthesized in the middle of a solid.
+    #[test]
+    fn sphere_silhouette_of_a_lone_sphere_is_fully_visible() {
+        let mut m = BRepModel::new();
+        let sphere = sid(TopologyBuilder::new(&mut m)
+            .create_sphere_3d(Point3::ORIGIN, 10.0)
+            .expect("sphere"));
+        let edges =
+            project_solid_edges_visibility(&m, sphere, ProjectionType::Front, 96).expect("project");
+        assert!(
+            edges.hidden_circles.is_empty(),
+            "a lone sphere's silhouette must not flush as hidden; hidden_circles={:?}",
+            edges.hidden_circles
+        );
+        let circ = edges
+            .circles
+            .iter()
+            .find(|c| (c.r - 10.0).abs() < 1e-6)
+            .unwrap_or_else(|| {
+                panic!(
+                    "expected one fully-visible analytic circle with r=10; circles={:?} hidden={:?}",
+                    edges.circles, edges.hidden_circles
+                )
+            });
+        assert!((circ.r - 10.0).abs() < 1e-9, "r={}", circ.r);
     }
 
     #[test]

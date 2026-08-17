@@ -609,3 +609,80 @@ fn iso_ellipses_stay_registered_with_the_shaded_raster() {
         );
     }
 }
+
+// ── Invariant #6: a solid of revolution's silhouette closes on BOTH sides ──
+
+/// True when `view` carries a drawn (visible OR hidden) polyline that reads
+/// as a near-vertical run — x-span under `tol_x`, y-span at least
+/// `MIN_RUN_MM` — whose x sits within `tol_x` of `x`. Scans BOTH
+/// `polylines` and `hidden_polylines`: a silhouette on the far side of the
+/// solid is a hidden edge like any other, and this check must not confuse
+/// "correctly dashed" with "not drawn at all."
+fn vertical_run_at_x(view: &geometry_engine::drawing::types::ProjectedView, x: f64) -> bool {
+    const TOL_X_MM: f64 = 0.5;
+    const MIN_RUN_MM: f64 = 5.0;
+    view.polylines
+        .iter()
+        .chain(view.hidden_polylines.iter())
+        .any(|pl| {
+            if pl.points.len() < 2 {
+                return false;
+            }
+            let xs = pl.points.iter().map(|p| p[0]);
+            let ys = pl.points.iter().map(|p| p[1]);
+            let (xmin, xmax) = xs.fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), v| {
+                (lo.min(v), hi.max(v))
+            });
+            let (ymin, ymax) = ys.fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), v| {
+                (lo.min(v), hi.max(v))
+            });
+            (xmax - xmin) < TOL_X_MM && (ymax - ymin) >= MIN_RUN_MM && (xmin - x).abs() < TOL_X_MM
+        })
+}
+
+/// **The regression this invariant exists to catch** (2026-08-17 silhouette
+/// brief): a B-Rep cylinder carries exactly one topological SEAM edge — the
+/// parameterisation's own wrap line — and the HLR pipeline drew it because
+/// it is a real topological edge, not because it is a feature. On the
+/// flange fixture that seam happened to sit at the OD's RIGHT extreme
+/// (view-space x=+60), so FRONT/RIGHT read as closed on the right. The LEFT
+/// extreme (x=-60) is not a topological edge at all — it is a silhouette,
+/// the locus where the surface normal turns perpendicular to the view — and
+/// nothing synthesized it, so nothing drew it: a machinist reads an
+/// unclosed profile.
+///
+/// **Why this must be an ink check, not an extent check.** `view.extent`
+/// was ALREADY correct before the fix — extent folds every sampled vertex
+/// regardless of whether a LINE was ever drawn through it, and the OD rim
+/// vertices at x=-60 exist (they are real vertices of the cap circles) even
+/// though the silhouette LIMB connecting them was never synthesized. An
+/// assertion on extent alone would have stayed green through the entire
+/// defect. This walks the view's own drawn geometry instead and requires a
+/// vertical run — the exact coordinate-level shape of the original defect
+/// report — at BOTH the view's own x_min and x_max.
+#[test]
+fn flange_od_silhouette_closes_on_both_sides_in_front_and_right() {
+    let (m, part) = flange();
+    let drawing = standard_drawing_auto(&m, part, uuid::Uuid::nil()).expect("sheet");
+    for view_name in ["FRONT", "RIGHT"] {
+        let view = drawing
+            .views
+            .iter()
+            .find(|v| v.name == view_name)
+            .unwrap_or_else(|| panic!("flange sheet must carry a {view_name} view"));
+        let ext = view.extent;
+        assert!(
+            vertical_run_at_x(view, ext.min_x),
+            "{view_name}: the OD silhouette must carry a drawn vertical run at its own x_min \
+             extreme ({:.3}) — a view whose extent reaches this x with no line ever drawn \
+             through it is exactly the open-profile defect this test exists to catch",
+            ext.min_x
+        );
+        assert!(
+            vertical_run_at_x(view, ext.max_x),
+            "{view_name}: the OD silhouette must carry a drawn vertical run at its own x_max \
+             extreme ({:.3})",
+            ext.max_x
+        );
+    }
+}
