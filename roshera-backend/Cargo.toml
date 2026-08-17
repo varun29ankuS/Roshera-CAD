@@ -32,6 +32,32 @@ parking_lot = "0.12"
 rayon = "1.8"
 lru = "0.16.0"
 
+# Dev/test carry NO debuginfo and NO incremental cache, and this lives here
+# rather than in a shell convention on purpose.
+#
+# The team rule was `CARGO_PROFILE_DEV_DEBUG=false CARGO_PROFILE_TEST_DEBUG=false
+# CARGO_INCREMENTAL=0` on every cargo command. Those are per-invocation
+# variables, so anything that did not set them — rust-analyzer, an IDE build, a
+# bare `cargo test` — built with cargo's defaults (`debug = true`,
+# `incremental = true`) instead. Neither `[profile.dev]` nor `[profile.test]`
+# was defined here, so the defaults were what actually applied most of the
+# time. Measured 2026-08-17: `target/debug` had grown to 38.7 GB, of which
+# 11.1 GB was PDBs and 5.4 GB was the incremental cache, on a disk with 20.6 GB
+# free. It had reached 85 GB once before.
+#
+# Declaring it in the manifest makes it apply to every tool that builds this
+# workspace, which is the only version of this rule that holds.
+#
+# `bench` and `demo` deliberately keep their debuginfo (see their sections
+# below) — benches want symbols, and demo wants readable backtraces.
+[profile.dev]
+debug = false
+incremental = false
+
+[profile.test]
+debug = false
+incremental = false
+
 [profile.release]
 lto = true
 codegen-units = 1
