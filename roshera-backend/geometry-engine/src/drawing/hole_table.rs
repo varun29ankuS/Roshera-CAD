@@ -89,6 +89,25 @@ pub struct HoleSite {
     pub is_through: bool,
     /// View-space centre of the bore in the axial view (used for tag callout).
     pub axial_centre: Option<[f64; 2]>,
+    /// WORLD centre of the bore axis, when it could be established.
+    ///
+    /// `x_mm`/`y_mm` are label-paired display offsets: when a bore has no
+    /// position records they read `0.0` beside an "—" label, which the sheet
+    /// renders honestly as "not dimensioned" but which any consumer reading
+    /// the NUMBER sees as "measured, and sitting on the datum origin". That
+    /// cost a section view on every part whose only internal feature is its
+    /// own bore (2026-08-17): `choose_section_plane` added those zeros to the
+    /// datum corner and cut a plane that missed the solid entirely.
+    ///
+    /// This field is the measurement instead of the display value, and it is
+    /// an `Option` so its absence stays absent rather than becoming a zero.
+    /// It is populated from the same exact derivation that feeds
+    /// `axial_centre` (`bore_centres` in `dimensioning.rs`), which recovers
+    /// the axis from the diameter record's rim anchor when no position
+    /// record exists. `serde(default)` keeps previously serialised drawings
+    /// loading.
+    #[serde(default)]
+    pub world_centre: Option<[f64; 3]>,
     /// B-Rep face entity ids for this bore (from the diameter record).
     ///
     /// Used by the dimension-placement filter to suppress `kind == "position"`
@@ -370,6 +389,7 @@ pub fn build_hole_table(dims: &[DimensionRecord], part_extents: [f64; 3]) -> Vec
             depth_label: s.depth_label.clone(),
             is_through: s.is_through,
             axial_centre: None, // filled by the drawing layer
+            world_centre: None, // filled by the drawing layer
             face_entities: s.face_entities.clone(),
             datum: s.datum.clone(),
             // Bound GD&T dimensional tolerance joined later by `attach_tolerances`.

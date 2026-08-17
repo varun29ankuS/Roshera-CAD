@@ -1213,6 +1213,10 @@ fn hole_tag_forced_onto_dimension_text_fires_collision() {
         is_through: true,
         // View-space centre (60, −30) → sheet (160, 177).
         axial_centre: Some([60.0, -30.0]),
+        // These fixtures exercise hole-table RENDERING, not section-plane
+        // choice; `None` keeps them on the display-offset path they were
+        // written against.
+        world_centre: None,
         face_entities: vec![99],
         datum: None,
         tolerance: None,
@@ -1978,6 +1982,8 @@ fn hole_table_on_dimension_text_fires_collision() {
         depth_label: "THRU".to_string(),
         is_through: true,
         axial_centre: Some([10.0, 10.0]),
+        // See the note on the fixture above: rendering, not plane choice.
+        world_centre: None,
         face_entities: vec![7],
         datum: None,
         tolerance: None,

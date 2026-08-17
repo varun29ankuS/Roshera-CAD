@@ -1884,6 +1884,17 @@ fn attach_hole_table_from_dims(
         // anchors the tag identically. The radius gate keeps a same-face but
         // different-radius rim (e.g. a chamfer ring) from matching.
         for site in &mut sites {
+            // The bore's exact world axis, independent of whether it was ever
+            // DIMENSIONED. `bore_centres` derives it from position records
+            // when they exist and from the diameter record's rim anchor when
+            // they do not — both exact, neither defaulted. Recorded before
+            // the tag-callout match below so it is set even when the rim does
+            // not survive projection as an analytic circle.
+            {
+                let mut key = site.face_entities.clone();
+                key.sort_unstable();
+                site.world_centre = bore_centres.get(&key).copied();
+            }
             let r_target = site.diameter_mm * 0.5;
             let r_ok = |r: f64| (r - r_target).abs() < r_target * 0.05 + 0.1;
             let matched = view
@@ -2305,9 +2316,34 @@ fn choose_section_plane(
             .and_then(|d| d.datum.as_ref().map(|dt| dt.origin))
             .unwrap_or([0.0; 3]);
 
+        // ── Plane origin: prefer the MEASURED axis over display offsets ───
+        //
+        // `x_mm`/`y_mm` are label-paired: a bore with no position records
+        // carries `0.0` beside an "—" label. Adding those zeros to the datum
+        // origin claims "the bore sits ON the datum corner", and the corner
+        // is precisely where a cutting plane misses the part. Measured
+        // 2026-08-17 on a revolved hub flange whose only internal feature is
+        // its own Ø12 bore: chosen origin [-30, -30, 0] (the part's corner),
+        // `section_view` returned None, and the sheet shipped four views with
+        // the miss attributed to "plane missed the solid". The same flange
+        // with six drilled bolt holes sectioned correctly only because that
+        // ring's offsets average onto the axis — an accident of symmetry, not
+        // a working code path.
+        //
+        // `world_centre` is the bore axis itself, absent rather than zero
+        // when it could not be established, so the fallback below stays
+        // reachable and honest.
         let mut origin = datum_origin;
-        origin[perps[0]] += cx_offset;
-        origin[perps[1]] += cy_offset;
+        let measured: Vec<[f64; 3]> = group_sites.iter().filter_map(|s| s.world_centre).collect();
+        if measured.len() == group_sites.len() && !measured.is_empty() {
+            let n = measured.len() as f64;
+            for axis in [perps[0], perps[1]] {
+                origin[axis] = measured.iter().map(|c| c[axis]).sum::<f64>() / n;
+            }
+        } else {
+            origin[perps[0]] += cx_offset;
+            origin[perps[1]] += cy_offset;
+        }
 
         // ── Cut-normal choice: pass through INTERIOR bores ────────────────
         // A section is informative when the plane passes through bore
@@ -2699,6 +2735,188 @@ mod tests {
     fn has(dims: &[Dimension2d], kind: &str, value: f64) -> bool {
         dims.iter()
             .any(|d| d.kind == kind && (d.value - value).abs() < 1e-3)
+    }
+
+    /// The cutting plane is placed on the bore's MEASURED axis, not on the
+    /// datum corner a fabricated zero points at.
+    ///
+    /// Measured 2026-08-17, before the fix:
+    ///
+    /// ```text
+    ///   revolve only     : x_mm=0 (—) y_mm=0 (—) → origin [-30, -30, 0] → section NONE (4 views)
+    ///   + 6 drilled holes: bolt offsets average (30,30) → origin [0, 0, 0]  → section SOME (5 views)
+    /// ```
+    ///
+    /// Both parts have the SAME Ø12 bore on the SAME axis, and in both the
+    /// bore's own `x_mm`/`y_mm` are the fabricated `0.0` that pairs with an
+    /// "—" label. The drilled part sectioned only because its bolt ring's
+    /// offsets happen to average onto the axis. Strip the bolt holes — a
+    /// plain bored flange, the most ordinary sectioned part there is — and
+    /// the plane fell on the part's corner and missed.
+    ///
+    /// This test pins BOTH halves: the bore-only part must now section, and
+    /// the drilled part must not regress.
+    #[test]
+    fn section_plane_lands_on_the_measured_bore_axis_not_the_datum_corner() {
+        use crate::operations::revolve::{revolve_meridian, RevolveOptions};
+
+        let meridian = [
+            (6.0, 0.0),
+            (30.0, 0.0),
+            (30.0, 6.0),
+            (12.0, 6.0),
+            (12.0, 20.0),
+            (6.0, 20.0),
+        ];
+        let mut m = BRepModel::new();
+        let opts = RevolveOptions {
+            axis_origin: Point3::new(0.0, 0.0, 0.0),
+            axis_direction: Vector3::new(0.0, 0.0, 1.0),
+            angle: std::f64::consts::TAU,
+            segments: 96,
+            ..Default::default()
+        };
+        let solid = revolve_meridian(&mut m, &meridian, opts).expect("revolve");
+
+        let dims = crate::readable::extract_dimensions(&m, solid);
+        let drawing = standard_drawing_auto(&m, solid, uuid::Uuid::nil()).expect("sheet");
+        let (origin, normal) = choose_section_plane(&drawing, &dims);
+        println!("REVOLVE-ONLY:");
+        println!("  hole_sites      = {}", drawing.hole_sites.len());
+        for s in &drawing.hole_sites {
+            println!(
+                "    tag={} group={} dia={} x_mm={} ({}) y_mm={} ({}) axial_centre={:?}",
+                s.tag, s.group, s.diameter_mm, s.x_mm, s.x_label, s.y_mm, s.y_label, s.axial_centre
+            );
+        }
+        println!(
+            "  chosen origin   = [{:.3}, {:.3}, {:.3}]",
+            origin.x, origin.y, origin.z
+        );
+        println!(
+            "  chosen normal   = [{:.3}, {:.3}, {:.3}]",
+            normal.x, normal.y, normal.z
+        );
+        println!(
+            "  views           = {:?}",
+            drawing
+                .views
+                .iter()
+                .map(|v| v.name.as_str())
+                .collect::<Vec<_>>()
+        );
+        println!(
+            "  section         = {}",
+            if drawing.section.is_some() {
+                "SOME"
+            } else {
+                "NONE"
+            }
+        );
+
+        // The bore sits on the world Z axis, so the cut plane's origin must
+        // lie on it in both perpendicular axes. Pre-fix this was (-30, -30).
+        assert!(
+            origin.x.abs() < 1e-6 && origin.y.abs() < 1e-6,
+            "the cutting plane must pass through the bore's measured axis, got \
+             [{:.3}, {:.3}, {:.3}] — the part's corner is [-30, -30, 0] and a \
+             plane there misses the solid entirely",
+            origin.x,
+            origin.y,
+            origin.z
+        );
+        assert!(
+            drawing.section.is_some(),
+            "a bored flange with no other internal feature must still be sectioned"
+        );
+        assert!(
+            drawing.views.iter().any(|v| v.name.contains("SECTION")),
+            "views were {:?}",
+            drawing
+                .views
+                .iter()
+                .map(|v| v.name.as_str())
+                .collect::<Vec<_>>()
+        );
+
+        // Same flange, now with six boolean-drilled bolt holes — scenario 15's
+        // shape, which DOES get a section live. Reproduces the asymmetry here.
+        let mut cur = solid;
+        for k in 0..6 {
+            let th = std::f64::consts::TAU * (k as f64) / 6.0;
+            let hole = sid(TopologyBuilder::new(&mut m)
+                .create_cylinder_3d(
+                    Point3::new(21.0 * th.cos(), 21.0 * th.sin(), -1.0),
+                    Vector3::new(0.0, 0.0, 1.0),
+                    2.0,
+                    8.0,
+                )
+                .expect("bolt hole"));
+            cur = crate::operations::boolean::boolean_operation(
+                &mut m,
+                cur,
+                hole,
+                crate::operations::boolean::BooleanOp::Difference,
+                crate::operations::boolean::BooleanOptions::default(),
+            )
+            .expect("drill");
+        }
+        let dims2 = crate::readable::extract_dimensions(&m, cur);
+        let drawing2 = standard_drawing_auto(&m, cur, uuid::Uuid::nil()).expect("sheet2");
+        let (origin2, normal2) = choose_section_plane(&drawing2, &dims2);
+        println!("REVOLVE + 6 DRILLED BOLT HOLES:");
+        println!("  hole_sites      = {}", drawing2.hole_sites.len());
+        for s in &drawing2.hole_sites {
+            println!(
+                "    tag={} group={} dia={} x_mm={:.3} ({}) y_mm={:.3} ({})",
+                s.tag, s.group, s.diameter_mm, s.x_mm, s.x_label, s.y_mm, s.y_label
+            );
+        }
+        println!(
+            "  chosen origin   = [{:.3}, {:.3}, {:.3}]",
+            origin2.x, origin2.y, origin2.z
+        );
+        println!(
+            "  chosen normal   = [{:.3}, {:.3}, {:.3}]",
+            normal2.x, normal2.y, normal2.z
+        );
+        println!(
+            "  views           = {:?}",
+            drawing2
+                .views
+                .iter()
+                .map(|v| v.name.as_str())
+                .collect::<Vec<_>>()
+        );
+        println!(
+            "  section         = {}",
+            if drawing2.section.is_some() {
+                "SOME"
+            } else {
+                "NONE"
+            }
+        );
+
+        // No regression on the path that already worked: same origin, and the
+        // section still lands.
+        assert!(
+            origin2.x.abs() < 1e-6 && origin2.y.abs() < 1e-6,
+            "drilled flange plane origin moved off the axis: [{:.3}, {:.3}, {:.3}]",
+            origin2.x,
+            origin2.y,
+            origin2.z
+        );
+        assert!(
+            drawing2.section.is_some() && drawing2.views.iter().any(|v| v.name.contains("SECTION")),
+            "the drilled flange sectioned before this change and must still do so; \
+             views were {:?}",
+            drawing2
+                .views
+                .iter()
+                .map(|v| v.name.as_str())
+                .collect::<Vec<_>>()
+        );
+        let _ = normal2;
     }
 
     #[test]
