@@ -153,10 +153,15 @@ export default {
         name: "barrel",
       }),
     );
-    const sphere = await c.post("/api/geometry/sphere", {
-      center: [CYL.r, 0, 0],
-      radius: SPH.r,
-      name: "biter",
+    // There is no `/api/geometry/sphere` route — spheres are built through
+    // the generic `/api/geometry` shape route, which takes the radius under
+    // `parameters` and the world-absolute centre as top-level `position`.
+    // (`center` is not a key this route accepts, and the server refuses
+    // unknown keys rather than silently defaulting them to the origin.)
+    const sphere = await c.post("/api/geometry", {
+      shape_type: "sphere",
+      parameters: { radius: SPH.r },
+      position: [CYL.r, 0, 0],
     });
     await ctx.time("subtract the sphere (cyl∘sphere SSI)", () =>
       c.raw("POST", "/api/geometry/boolean", {

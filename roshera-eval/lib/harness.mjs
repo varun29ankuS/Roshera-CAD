@@ -118,7 +118,14 @@ export async function runScenario(scenario, client, geom) {
   const start = Date.now();
   let crash = null;
   if (setupError) {
-    t.record("soundness", "scenario setup (clear_parts)", false, setupError);
+    // BLOCKED, not failed. The scenario never ran, so NOTHING was measured —
+    // recording this as a `soundness` check (as this did until 2026-08-17)
+    // publishes a fabricated measurement: a sweep that could not reach the
+    // backend at all scored "soundness 0/19", which reads as "the kernel
+    // produced nineteen unsound results" when the true statement is "the
+    // kernel was never asked". An absence is stated with its reason, never
+    // defaulted to a zero. `blocked` below carries that reason, and `passed`
+    // is forced false so an empty check list cannot score vacuously green.
   } else {
     try {
       await scenario.run(ctx, t);
@@ -142,7 +149,12 @@ export async function runScenario(scenario, client, geom) {
   return {
     id: scenario.id,
     title: scenario.title,
-    passed: t.passed,
+    // A blocked scenario is never "passed": `Checks.passed` is vacuously true
+    // over an empty item list, so without this guard a setup failure would
+    // score as a clean green sweep.
+    passed: setupError ? false : t.passed,
+    /** Non-null when the scenario could not START. Nothing was measured. */
+    blocked: setupError,
     // A scenario may set `knownRed: true` to declare "this is EXPECTED to
     // fail today — it documents a live kernel defect, not a broken test."
     // The harness still scores and prints it honestly (nothing here
@@ -175,8 +187,9 @@ export async function runSuite(scenarios, client, geom) {
     process.stdout.write(`\n▶ ${s.id} — ${s.title}\n`);
     const r = await runScenario(s, client, geom);
     results.push(r);
-    const mark = r.passed ? "PASS" : r.knownRed ? "FAIL (known-red)" : "FAIL";
+    const mark = r.blocked ? "BLOCKED" : r.passed ? "PASS" : r.knownRed ? "FAIL (known-red)" : "FAIL";
     process.stdout.write(`  ${mark}  (${r.wallMs}ms, ${r.checks.filter((c) => c.passed).length}/${r.checks.length} checks)\n`);
+    if (r.blocked) process.stdout.write(`     ⊘ nothing measured — ${r.blocked}\n`);
     for (const c of r.checks.filter((c) => !c.passed)) {
       process.stdout.write(`     ✗ [${c.dim}] ${c.name} — ${c.detail}\n`);
     }
@@ -199,8 +212,12 @@ export function summarize(results) {
     }
   }
   const scenariosPass = results.filter((r) => r.passed).length;
+  // Blocked scenarios contribute NO checks, so they move no dimension tally.
+  // That is the point: a dimension a blocked scenario would have exercised
+  // reads as a smaller denominator, never as failed checks.
+  const blocked = results.filter((r) => r.blocked).length;
   return {
-    scenarios: { pass: scenariosPass, total: results.length },
+    scenarios: { pass: scenariosPass, total: results.length, blocked },
     checks: { pass: checksPass, total: checksTotal },
     dimensions: dimTally,
   };

@@ -141,7 +141,18 @@ async function main() {
       );
     }
   }
-  const failed = results.filter((r) => !r.passed && !r.knownRed).length;
+  // A BLOCKED scenario counts regardless of `knownRed`: the flag says "this
+  // defect is expected to make checks fail", but a blocked scenario ran no
+  // checks at all, so the flag has nothing to excuse. Letting knownRed
+  // swallow a blocked run would turn "the backend was unreachable" into a
+  // green sweep.
+  const blocked = results.filter((r) => r.blocked).length;
+  if (blocked > 0) {
+    process.stdout.write(
+      `\n⊘ ${blocked} scenario(s) BLOCKED — they never ran, so their dimensions are UNMEASURED, not zero.\n`,
+    );
+  }
+  const failed = results.filter((r) => r.blocked || (!r.passed && !r.knownRed)).length;
   process.exit(failed);
 }
 
