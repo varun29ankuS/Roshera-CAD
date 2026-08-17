@@ -1917,12 +1917,11 @@ fn attach_hole_table_from_dims(
 /// - **A4 sheets**: SECTION A-A replaces the ISOMETRIC (the top-right slot).
 ///   A4 is too narrow to add a true fifth column without making everything
 ///   unreadably small; replacing ISO with the section keeps the part viewable.
-/// - **A3 and larger**: add a genuine fifth slot to the right of the ISO,
-///   giving the sheet a two-row-by-three-column arrangement:
-///   ```text
-///     TOP    ISO    SECTION A-A
-///     FRONT  RIGHT
-///   ```
+/// - **A3 and larger**: add a genuine fifth slot for SECTION A-A, packed by
+///   `layout_five_view` into whichever of a side column or a bottom band
+///   fits its actual extent at a larger scale (see that function's doc for
+///   the two candidate shapes). TOP/FRONT/RIGHT keep the same third-angle
+///   relative placement as the four-view layout either way.
 ///
 /// The rule is deterministic (no random, no per-sheet tuning) and
 /// encoded entirely here so unit tests can verify both branches without
@@ -1946,20 +1945,59 @@ pub fn section_slot_rule(sheet: &super::types::SheetSize) -> SectionSlotRule {
     }
 }
 
-/// Extend the four-view layout to accommodate a fifth view (SECTION A-A) in the
-/// top-right column, producing a 2-row × 3-column arrangement:
+/// Extend the four-view layout to accommodate a fifth view (SECTION A-A).
+///
+/// The three orthographics and the isometric keep the SAME 2×2 relative
+/// arrangement `layout_four_view` uses — TOP directly above FRONT, RIGHT
+/// directly beside FRONT (third-angle; not negotiable, see
+/// `tests/drawing_visual_harness.rs::third_angle_relative_placement_holds_*`).
+/// SECTION A-A — the flexible fifth view — is packed into whichever of two
+/// candidate slots yields the LARGER resulting fill scale for its actual
+/// extent:
 ///
 /// ```text
-///   TOP    ISO    SECTION
-///   FRONT  RIGHT  (empty)
+///   column (tall-narrow section, e.g. a deep bore's axial cut):
+///     TOP    ISO    SECTION
+///     FRONT  RIGHT  A-A
+///
+///   band (short-wide section, e.g. a flange's SECTION A-A):
+///     TOP     ISO
+///     FRONT   RIGHT
+///     SECTION A-A  (full-width band)
 /// ```
 ///
-/// The scale and the first four positions are identical to `layout_four_view`;
-/// the fifth position is placed centred in a new right column whose width
-/// equals the section view's extent width at the computed scale.
+/// This is the fix for D6 (sheet-layout defect): the old grid always used
+/// the column form with a row height SHARED across all three columns, so a
+/// short-wide section (a flange's ≈120×14 cut) claimed a full-height third
+/// column while its own row's other half — the bottom-right cell — sat
+/// completely empty; the grid's own shape, not the paper, capped the scale.
+/// Comparing both candidates and keeping the winner packs the section where
+/// its own extent actually leaves a gap, instead of a fixed slot.
 ///
 /// Returns `(scale, [front, top, right, iso, section] position_mm)`.
 fn layout_five_view(
+    sheet: &super::types::SheetSize,
+    fe: super::types::ViewExtent,
+    te: super::types::ViewExtent,
+    re: super::types::ViewExtent,
+    ie: super::types::ViewExtent,
+    se: super::types::ViewExtent,
+) -> (f64, [[f64; 2]; 5]) {
+    let column = five_view_column(sheet, fe, te, re, ie, se);
+    let band = five_view_band(sheet, fe, te, re, ie, se);
+    if band.0 >= column.0 {
+        band
+    } else {
+        column
+    }
+}
+
+/// Candidate A: SECTION A-A as a dedicated third column beside the TOP/ISO
+/// over FRONT/RIGHT core, spanning the core's full height. This is the
+/// natural placement for a tall-narrow section; it is the pre-D6 layout's
+/// shape (kept as a fallback candidate, not a special case — `layout_five_view`
+/// picks it only when it out-scales the band).
+fn five_view_column(
     sheet: &super::types::SheetSize,
     fe: super::types::ViewExtent,
     te: super::types::ViewExtent,
@@ -1990,16 +2028,21 @@ fn layout_five_view(
     let (iw, ih) = (ie.width(), ie.height());
     let (sw, sh) = (se.width(), se.height());
 
-    // Three columns: left = max(Front, Top), centre = max(Right, Iso), right = Section.
+    // Two core columns (left = max(Front, Top), centre = max(Right, Iso)),
+    // plus a dedicated right column for Section spanning the FULL core
+    // height (not a row height shared with the other two columns — a short
+    // section just sits centred in a tall column instead of forcing every
+    // column's row to its own height).
     let left_w = fw.max(tw);
     let mid_w = rw.max(iw);
     let right_w = sw;
 
-    let top_h = th.max(ih).max(sh);
-    let bot_h = fh.max(rh);
+    let core_top_h = th.max(ih);
+    let core_bot_h = fh.max(rh);
+    let core_h = core_top_h + core_bot_h;
 
     let unit_w = (left_w + mid_w + right_w).max(1e-6);
-    let unit_h = (top_h + bot_h).max(1e-6);
+    let unit_h = core_h.max(sh).max(1e-6);
     let s_w = (avail_w - 2.0 * HGAP) / unit_w;
     let s_h = (avail_h - VGAP) / unit_h;
     let mut scale = 0.9 * s_w.min(s_h);
@@ -2011,18 +2054,25 @@ fn layout_five_view(
     let lw = left_w * scale;
     let mwc = mid_w * scale;
     let rwc = right_w * scale;
-    let trh = top_h * scale;
-    let brh = bot_h * scale;
+    let trh = core_top_h * scale;
+    let brh = core_bot_h * scale;
+    let shc = sh * scale;
+    let core_block_h = trh + VGAP + brh;
     let g_w = lw + HGAP + mwc + HGAP + rwc;
-    let g_h = trh + VGAP + brh;
+    let g_h = core_block_h.max(shc);
     let gx = avail_x0 + 0.5 * (avail_w - g_w);
     let gy = avail_y0 + 0.5 * (avail_h - g_h);
 
     let left_cx = gx + 0.5 * lw;
     let mid_cx = gx + lw + HGAP + 0.5 * mwc;
     let right_cx = gx + lw + HGAP + mwc + HGAP + 0.5 * rwc;
-    let top_cy = gy + 0.5 * trh;
-    let bot_cy = gy + trh + VGAP + 0.5 * brh;
+    // The core block (Top/Iso over Front/Right) is centred vertically within
+    // g_h; when Section is shorter than the core (the common case) g_h ==
+    // core_block_h and this is a no-op offset.
+    let core_y0 = gy + 0.5 * (g_h - core_block_h);
+    let top_cy = core_y0 + 0.5 * trh;
+    let bot_cy = core_y0 + trh + VGAP + 0.5 * brh;
+    let sec_cy = gy + 0.5 * g_h;
 
     let place = |cx: f64, cy: f64, e: super::types::ViewExtent| -> [f64; 2] {
         let xtl = cx - 0.5 * e.width() * scale;
@@ -2037,7 +2087,126 @@ fn layout_five_view(
             place(left_cx, top_cy, te),  // TOP    (top-left)
             place(mid_cx, bot_cy, re),   // RIGHT  (bottom-centre)
             place(mid_cx, top_cy, ie),   // ISO    (top-centre)
-            place(right_cx, top_cy, se), // SECTION (top-right)
+            place(right_cx, sec_cy, se), // SECTION (right column)
+        ],
+    )
+}
+
+/// Candidate B: SECTION A-A as a full-width band ABOVE the TOP/ISO over
+/// FRONT/RIGHT core. This is the natural placement for a short-wide
+/// section (a flange's ≈120×14 cut): the band's own height is only the
+/// section's own extent, never a row height shared with — and therefore
+/// forced up to the height of — the other two columns.
+///
+/// The band sits ABOVE the core (not below), and that side is a deliberate
+/// choice, not an arbitrary one: FRONT and RIGHT carry auto-dimensions that
+/// render BELOW them (`svg::render_dimensions`), so the gap under the core
+/// must clear a genuine dimension band (~22 mm, see `VGAP`'s own doc). TOP's
+/// dimensions render below TOP too — INTO the existing core-internal VGAP,
+/// not upward — so the gap ABOVE the core only ever needs to clear a view
+/// LABEL, not a dimension band; Section itself carries no dimensions
+/// (`section_view` always emits `dimensions: Vec::new()`). `SGAP` is sized
+/// for exactly that: two view-label heights (Section's own label below the
+/// band, Top's above the core) plus a small margin — see its definition.
+fn five_view_band(
+    sheet: &super::types::SheetSize,
+    fe: super::types::ViewExtent,
+    te: super::types::ViewExtent,
+    re: super::types::ViewExtent,
+    ie: super::types::ViewExtent,
+    se: super::types::ViewExtent,
+) -> (f64, [[f64; 2]; 5]) {
+    let w = sheet.width();
+    let h = sheet.height();
+    let (ml, mr, mt, mb) = super::svg::frame_margins(sheet);
+    let (_tb_w, tb_h) = super::svg::title_block_size(sheet);
+
+    const PAD_LEFT: f64 = 22.0;
+    const PAD_BOTTOM: f64 = 18.0;
+    const VGAP: f64 = 32.0;
+    const HGAP: f64 = 30.0;
+    // Section-to-core gap: two view-label heights (LABEL_GAP standoff + the
+    // label font, doubled for the label above the core and the label below
+    // the band) plus a 2 mm margin — NOT the full `VGAP` dimension-band
+    // clearance, because neither side of this specific gap carries a
+    // dimension band (see the function doc above).
+    const SGAP: f64 = 2.0 * (super::layout::LABEL_GAP + super::layout::VIEW_LABEL_FONT_MM) + 2.0;
+
+    let avail_x0 = ml + PAD_LEFT;
+    let avail_x1 = w - mr;
+    let avail_y0 = mt;
+    let avail_y1 = h - mb - tb_h - PAD_BOTTOM;
+    let avail_w = (avail_x1 - avail_x0).max(10.0);
+    let avail_h = (avail_y1 - avail_y0).max(10.0);
+
+    let (fw, fh) = (fe.width(), fe.height());
+    let (tw, th) = (te.width(), te.height());
+    let (rw, rh) = (re.width(), re.height());
+    let (iw, ih) = (ie.width(), ie.height());
+    let (sw, sh) = (se.width(), se.height());
+
+    // Two core columns, exactly `layout_four_view`'s shape, plus Section as
+    // a full-width band above. The band's width does not force the core's
+    // width unless Section is itself wider than the core (rare); the core's
+    // height does not force the band's height at all — the two are
+    // independent axes, which is the whole point.
+    let left_w = fw.max(tw);
+    let right_w = rw.max(iw);
+    let core_w = left_w + right_w;
+    let top_h = th.max(ih);
+    let bot_h = fh.max(rh);
+    let core_h = top_h + bot_h;
+
+    let unit_w = core_w.max(sw).max(1e-6);
+    let unit_h = (core_h + sh).max(1e-6);
+    // One HGAP between the two core columns; the section band, alone in its
+    // own row, needs no horizontal gap partner. One VGAP (core-internal, top
+    // row / bottom row) and one SGAP (core-to-band, see above).
+    let s_w = (avail_w - HGAP) / unit_w;
+    let s_h = (avail_h - VGAP - SGAP) / unit_h;
+    let mut scale = 0.9 * s_w.min(s_h);
+    if !scale.is_finite() || scale <= 0.0 {
+        scale = 1.0;
+    }
+    scale = snap_scale(scale);
+
+    let lw = left_w * scale;
+    let rwc = right_w * scale;
+    let trh = top_h * scale;
+    let brh = bot_h * scale;
+    let swc = sw * scale;
+    let shc = sh * scale;
+    let core_block_w = lw + HGAP + rwc;
+    let g_w = core_block_w.max(swc);
+    let g_h = shc + SGAP + trh + VGAP + brh;
+    let gx = avail_x0 + 0.5 * (avail_w - g_w);
+    let gy = avail_y0 + 0.5 * (avail_h - g_h);
+
+    // The core block is centred horizontally within g_w; when Section is
+    // narrower than the core (the common case) g_w == core_block_w and this
+    // is a no-op offset.
+    let core_x0 = gx + 0.5 * (g_w - core_block_w);
+    let left_cx = core_x0 + 0.5 * lw;
+    let right_cx = core_x0 + lw + HGAP + 0.5 * rwc;
+    let band_cx = gx + 0.5 * g_w;
+    let band_cy = gy + 0.5 * shc;
+    let top_cy = gy + shc + SGAP + 0.5 * trh;
+    let bot_cy = gy + shc + SGAP + trh + VGAP + 0.5 * brh;
+
+    let place = |cx: f64, cy: f64, e: super::types::ViewExtent| -> [f64; 2] {
+        let xtl = cx - 0.5 * e.width() * scale;
+        let ytl = cy - 0.5 * e.height() * scale;
+        [xtl - e.min_x * scale, h - ytl - e.max_y * scale]
+    };
+
+    (
+        scale,
+        [
+            place(left_cx, bot_cy, fe),  // FRONT  (bottom-left)
+            place(left_cx, top_cy, te),  // TOP    (top-left)
+            place(right_cx, bot_cy, re), // RIGHT  (bottom-right)
+            place(right_cx, top_cy, ie), // ISO    (top-right)
+            place(band_cx, band_cy, se), // SECTION (band, above the core)
         ],
     )
 }

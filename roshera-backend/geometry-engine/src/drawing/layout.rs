@@ -49,7 +49,7 @@ pub const TITLE_FONT_MM: f64 = 7.0;
 pub const GLYPH_ADVANCE_EM: f64 = 0.62;
 
 /// Gap between a view's geometry rect edge and its label baseline (mm).
-const LABEL_GAP: f64 = 2.0;
+pub(crate) const LABEL_GAP: f64 = 2.0;
 
 /// Collision tolerance: two label boxes overlap only when they share more
 /// than this many mm of positive interior.

@@ -77,12 +77,13 @@
 //!    behind the cutting plane, not only the cut itself.
 
 use geometry_engine::drawing::dimensioning::standard_drawing_auto;
-use geometry_engine::drawing::layout::compute_layout;
+use geometry_engine::drawing::layout::{compute_layout, SheetItemKind};
 use geometry_engine::drawing::svg::render_drawing_svg;
 use geometry_engine::drawing::verify::{
     find_ink_outside_frame, find_span_overflows, find_text_collisions, frame_rect,
     section_shows_only_hatch, verify_drawing,
 };
+use geometry_engine::drawing::ProjectionType;
 use geometry_engine::math::{Point3, Vector3};
 use geometry_engine::operations::boolean::{boolean_operation, BooleanOp, BooleanOptions};
 use geometry_engine::primitives::solid::SolidId;
@@ -683,6 +684,115 @@ fn flange_od_silhouette_closes_on_both_sides_in_front_and_right() {
             "{view_name}: the OD silhouette must carry a drawn vertical run at its own x_max \
              extreme ({:.3})",
             ext.max_x
+        );
+    }
+}
+
+// ── Invariant #7: the sheet uses its own page, not a fraction of it ────────
+
+/// **D6 — the sheet wastes a large region, by construction.** `layout_five_view`
+/// used to give SECTION A-A a full-height third column even though a
+/// flange's section is short and wide (≈120×14), so the bottom-right cell
+/// sat completely empty and the whole sheet was scaled down to fit a grid
+/// whose own shape — not the paper — was the constraint.
+///
+/// RED evidence (pre-fix, captured live in this session on this exact
+/// fixture, same `verify_drawing` call this test uses):
+///   `sheet_utilization=0.1652`, every view at scale `0.75` (A3).
+///
+/// Fixed by packing SECTION A-A into whichever of two candidates —
+/// `five_view_column` (the old shape, kept as a fallback for a tall-narrow
+/// section) or `five_view_band` (a band sized to the section's own extent,
+/// placed above the TOP/ISO row where neither side needs a dimension-band
+/// gap) — yields the larger scale. On this fixture `five_view_band` wins:
+/// every view reaches scale `1.0` and `sheet_utilization` becomes `0.2938`
+/// (measured; also confirms the floor asserted below with headroom).
+#[test]
+fn flange_sheet_utilization_clears_the_pre_fix_floor() {
+    let (m, part) = flange();
+    let drawing = standard_drawing_auto(&m, part, uuid::Uuid::nil()).expect("sheet");
+    let report = verify_drawing(&drawing);
+    assert!(report.passed, "issues: {:?}", report.issues);
+    assert!(
+        report.sheet_utilization > 0.25,
+        "D6: flange sheet utilization {:.4} must clear 0.25 — the pre-fix grid measured \
+         0.1652 (every view pinned at scale 0.75 by a full-height section column with an \
+         empty bottom-right cell); the fixed packing measures 0.2938 (scale 1.0)",
+        report.sheet_utilization
+    );
+}
+
+// ── Invariant #8: third-angle relative placement is never negotiable ───────
+
+/// Sheet-space `ViewGeometry` rect of the FIRST view carrying `want`'s
+/// projection, read from `compute_layout` — the SAME source `verify_drawing`'s
+/// own `check_alignment` reads, so this test and the wired gate can never
+/// disagree about where a view actually landed.
+fn geometry_rect_of(
+    drawing: &geometry_engine::drawing::types::Drawing,
+    layout: &geometry_engine::drawing::layout::SheetLayout,
+    want: ProjectionType,
+) -> geometry_engine::drawing::layout::Rect2 {
+    let idx = drawing
+        .views
+        .iter()
+        .position(|v| v.projection == want)
+        .unwrap_or_else(|| panic!("sheet must carry a {want:?} view"));
+    layout
+        .items
+        .iter()
+        .find(|it| it.kind == SheetItemKind::ViewGeometry && it.owner_view == Some(idx))
+        .map(|it| it.bbox)
+        .unwrap_or_else(|| panic!("{want:?} view must have placed geometry"))
+}
+
+/// **The invariant that matters more than the packing itself** (2026-08-17
+/// sheet-layout brief): third-angle projection means TOP sits above FRONT
+/// and RIGHT sits to the right of FRONT. The sheet declares third-angle in
+/// its own notes strip (`"THIRD-ANGLE PROJECTION."`), so a packing change
+/// that wins space by putting TOP below FRONT, or RIGHT left of FRONT, would
+/// make the drawing lie about its own declared convention — silently, since
+/// nothing else on the sheet would look "wrong" without a machinist checking
+/// the actual view arrangement against the note. This is the harness pin
+/// D6's repack must never regress, on BOTH fixtures — the box (four-view,
+/// untouched by this change) and the flange (five-view, the fixture the
+/// repack actually modifies).
+///
+/// Sheet space is y-DOWN (SVG convention): a smaller y is higher on the
+/// page. "TOP above FRONT" is therefore `top.y1 <= front.y0` (TOP's own
+/// bottom edge sits at or above FRONT's own top edge — the two may not
+/// overlap, which the collision invariants already separately guarantee).
+/// "RIGHT right of FRONT" is `front.x1 <= right.x0`.
+///
+/// Mutation-proof: temporarily swapping the FRONT/TOP `place(...)` calls in
+/// `five_view_band` (so TOP lands at FRONT's row and vice versa) was
+/// confirmed to fail this test's first assertion on the flange fixture
+/// before this change was reverted — the test is not vacuously green.
+#[test]
+fn third_angle_relative_placement_holds_on_both_fixtures() {
+    for (name, (m, part)) in [("flange", flange()), ("box", plain_box())] {
+        let drawing = standard_drawing_auto(&m, part, uuid::Uuid::nil()).expect("sheet");
+        let layout = compute_layout(&drawing);
+        let front = geometry_rect_of(&drawing, &layout, ProjectionType::Front);
+        let top = geometry_rect_of(&drawing, &layout, ProjectionType::Top);
+        let right = geometry_rect_of(&drawing, &layout, ProjectionType::Right);
+        assert!(
+            top.y1 <= front.y0 + 1e-6,
+            "{name}: TOP (y0={:.2},y1={:.2}) must sit above FRONT (y0={:.2},y1={:.2}) — \
+             third-angle projection, declared in the sheet's own notes strip",
+            top.y0,
+            top.y1,
+            front.y0,
+            front.y1
+        );
+        assert!(
+            front.x1 <= right.x0 + 1e-6,
+            "{name}: RIGHT (x0={:.2},x1={:.2}) must sit to the right of FRONT (x0={:.2},x1={:.2}) \
+             — third-angle projection, declared in the sheet's own notes strip",
+            right.x0,
+            right.x1,
+            front.x0,
+            front.x1
         );
     }
 }
