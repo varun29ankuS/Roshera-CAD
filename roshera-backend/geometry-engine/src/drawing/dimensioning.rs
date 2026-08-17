@@ -2499,7 +2499,13 @@ pub(crate) fn attach_section_view(
         1.0,
     );
     let Some(section_unit) = section_unit else {
-        // Plane missed the solid — skip the section.
+        // The plane produced no caps. That reads as "the plane missed the
+        // solid", and this comment used to say exactly that — but a plane can
+        // also miss because its ORIGIN was wrong, which is what happened for
+        // every bored part until `world_centre` landed (see
+        // `choose_section_plane`). A silently dropped view looks identical
+        // either way, so do not read this branch as a statement about the
+        // part's geometry.
         return;
     };
 
