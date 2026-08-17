@@ -51,11 +51,18 @@
  *
  * # Expect ONE known-red
  *
- * The silhouette fix is in flight on `feat/silhouette-edges`, off this same
- * `main @ 81b14736` — NOT merged here. The "-30" half of check S2 is
- * EXPECTED to fail against current `main`; `knownRed: true` documents that,
- * per the convention scenario 18 introduced (see `lib/harness.mjs`). Delete
- * `knownRed` once that branch merges and this scenario turns green.
+ * SUPERSEDED 2026-08-17, and rewritten rather than left standing: this
+ * paragraph used to say the "-30" half of check S2 was the known-red,
+ * pending `feat/silhouette-edges`. That branch merged and BOTH silhouette
+ * extremes now pass live. It also used to be true that no SECTION view
+ * existed at all — fixed in `9976896a`, where the cutting plane was being
+ * placed on the part's corner by a fabricated zero.
+ *
+ * The one remaining red is check T3, "non-hatch geometry extends beyond the
+ * hatched cut faces' bounding box". Measured live at `9976896a`: 11/12, with
+ * SECTION A-A present at 18 polylines and an extent identical to the hatch
+ * bbox ({-30,0}..{30,20}). See the `knownRed` comment on the export below
+ * for why that is an open question and not a check to soften.
  */
 import { buildHubFlange } from "../lib/builders.mjs";
 
@@ -397,14 +404,35 @@ export function oracle(t, d) {
 
 export default {
   id: "19-drawing-export-truth",
-  title: "Drawing export truth — exactness, silhouette, section substance, legibility (silhouette known-red)",
+  title: "Drawing export truth — exactness, silhouette, section substance, legibility (section-extent known-red)",
   dims: ["correctness", "soundness"],
   budgetMs: 120000,
-  // See the header docblock: the -OD-extreme silhouette check is EXPECTED
-  // to fail against current `main` — the fix lives on `feat/silhouette-edges`
-  // and has not merged here. Every other check is expected green. Delete
-  // this flag once that branch lands and re-confirm the scenario passes
-  // clean.
+  // The silhouette reason this flag ORIGINALLY carried is now false, and a
+  // stated reason has to be true: `feat/silhouette-edges` merged, and both
+  // -OD and +OD silhouette checks pass live (measured 2026-08-17 against
+  // `9976896a`, 11/12).
+  //
+  // What is still red is ONE check: "that non-hatch geometry extends beyond
+  // the hatched cut faces' bounding box". It failed for a different reason
+  // before — there was no section at all, fixed in `9976896a` — and now it
+  // fails on its own terms. Live measurement:
+  //
+  //   hatch bbox   = {-30, 0} .. {30, 20}
+  //   SECTION A-A  = 18 polylines, extent {-30, 0} .. {30, 20}
+  //
+  // The cut of a solid of revolution taken through its own axis spans the
+  // part's whole silhouette, so the outline lands ON the hatch boundary and
+  // nothing CAN extend past it. The property is not obviously achievable for
+  // this geometry class, and oracle-19's honest fixture is hand-built, so it
+  // never had to be: it asserted the "beyond" case because it was authored
+  // that way, not because a real sheet was measured.
+  //
+  // Deliberately NOT softened. Either the check's premise is wrong for
+  // axisymmetric parts (then it needs re-stating against a measured sheet,
+  // and re-proving against its T2/T3 confetti mutations), or the section
+  // legitimately owes back-of-plane geometry it is not drawing. That is an
+  // open question, and weakening the assertion to get green would be exactly
+  // the defect this suite exists to catch.
   knownRed: true,
   async run(ctx, t) {
     const { c } = ctx;
