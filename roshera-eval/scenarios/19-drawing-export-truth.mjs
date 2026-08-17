@@ -420,19 +420,28 @@ export default {
   //   hatch bbox   = {-30, 0} .. {30, 20}
   //   SECTION A-A  = 18 polylines, extent {-30, 0} .. {30, 20}
   //
-  // The cut of a solid of revolution taken through its own axis spans the
-  // part's whole silhouette, so the outline lands ON the hatch boundary and
-  // nothing CAN extend past it. The property is not obviously achievable for
-  // this geometry class, and oracle-19's honest fixture is hand-built, so it
-  // never had to be: it asserted the "beyond" case because it was authored
-  // that way, not because a real sheet was measured.
+  // MEASURED against the DRILLED flange too — scenario 15's exact shape,
+  // 7 hole sites, which has always passed — so this is not a guess:
   //
-  // Deliberately NOT softened. Either the check's premise is wrong for
-  // axisymmetric parts (then it needs re-stating against a measured sheet,
-  // and re-proving against its T2/T3 confetti mutations), or the section
-  // legitimately owes back-of-plane geometry it is not drawing. That is an
-  // open question, and weakening the assertion to get green would be exactly
-  // the defect this suite exists to catch.
+  //   drilled flange SECTION A-A: hatch bbox   {-30,0}..{30,20}
+  //                               outline bbox {-30,0}..{30,20}
+  //                               non-hatch points beyond hatch bbox: 0
+  //
+  // So T3 is not merely unsatisfiable for bore-only axisymmetric parts: NO
+  // real sheet in this repo has ever satisfied it. The only thing that ever
+  // passed it is oracle-19's hand-built honest fixture, which asserted the
+  // "beyond" case because it was authored that way and never had to agree
+  // with a rendered sheet. A cut through the axis of a solid of revolution
+  // spans the part's whole silhouette, so the outline lands ON the hatch
+  // boundary by construction.
+  //
+  // Deliberately NOT softened, and NOT redesigned here. The honest repair is
+  // to re-state the property against a MEASURED sheet — most likely "the
+  // section carries connected outline geometry bounding its hatch", which is
+  // what the confetti defect actually violated — and then re-prove the
+  // replacement against the T2/T3 mutations so it is known to discriminate.
+  // Editing the assertion to reach green without that is exactly the defect
+  // this suite exists to catch, which is why it stays red.
   knownRed: true,
   async run(ctx, t) {
     const { c } = ctx;
