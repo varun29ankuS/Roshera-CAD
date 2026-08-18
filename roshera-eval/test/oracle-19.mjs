@@ -6,7 +6,9 @@
  * EXACT markup shape `geometry-engine/src/drawing/svg.rs`'s `render_view` /
  * `render_view_labels` and `dxf.rs`'s DXF writer emit (verified against that
  * source directly — see scenario 19's header docblock), then a set of
- * single-mutation lies, one per scored check:
+ * single-mutation lies, at least one per scored check — the section's
+ * connected-run check carries two, because T4 exists precisely to show that
+ * the weaker aggregate-bbox form of that same check would pass a lie:
  *
  *   E1  the bore's SVG circle is replaced by a 96-vertex facet polyline
  *   E2  the DXF export's CIRCLE entity is renamed away (CAM can't see it)
