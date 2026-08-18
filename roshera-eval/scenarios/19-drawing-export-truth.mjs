@@ -11,9 +11,9 @@
  *   1. EXACTNESS    — a bore drawn as a 96-vertex polyline instead of a real
  *                      circle: not CAM-recognisable as a hole.
  *   2. SILHOUETTE    — a cylinder's FRONT view open on one side: a seam edge
- *                      at x=+R, nothing at x=-R. Fixed 2026-08-16/17 on
- *                      `415c3a98` (exact curves) and in flight on
- *                      `feat/silhouette-edges` for the silhouette itself.
+ *                      at x=+R, nothing at x=-R. Fixed 2026-08-16/17 by
+ *                      `415c3a98` (exact curves) and `11234d7b` (synthesised
+ *                      silhouettes, seam suppressed).
  *   3. SECTION       — SECTION A-A rendered as disconnected hatched
  *                      rectangles, correct topology, unusable. Fixed by
  *                      `cbef4dda`/`81b14736`.
@@ -32,11 +32,26 @@
  * red. Feeding raw bytes means the proof covers parse+judge together, the
  * same discipline 15's `oracle-15.mjs` uses for its DrawingAnswer JSON.
  *
- * The honest fixture in `test/oracle-19.mjs` is hand-built in the EXACT
- * markup shape `geometry-engine/src/drawing/svg.rs`'s `render_view` /
- * `render_view_labels` and `dxf.rs`'s DXF writer emit (verified by reading
- * both files directly, not guessed) — this is the same "reference source"
+ * The honest fixture in `test/oracle-19.mjs` is hand-built in the markup shape
+ * `geometry-engine/src/drawing/svg.rs`'s `render_view` / `render_view_labels`
+ * and `dxf.rs`'s DXF writer emit — this is the same "reference source"
  * discipline scenario 18 uses for its closed-form volumes.
+ *
+ * That claim used to say "verified by reading both files directly, not
+ * guessed", and READING THE SOURCE WAS NOT ENOUGH. The section fixture it
+ * produced modelled hatch as closed rectangles and the outline as one chained
+ * polyline; the renderer emits 45-degree hatch LINES and one 2-point polyline
+ * per outline edge. That mismatch is what let an unsatisfiable check look
+ * satisfiable for as long as it did. The section half of the fixture is now
+ * derived from RENDERED OUTPUT — `target/drawing-visual-harness/harness_
+ * {flange,ring_plate}.svg` — and the re-stated section property is confirmed
+ * by running this oracle against those sheets, not only against the fixture.
+ *
+ * FRONT still carries one chained polyline where the renderer would emit
+ * per-edge segments. Left as is deliberately: `frontInkSegments` flattens
+ * polylines to segments before judging, so the two shapes are equivalent for
+ * every check that reads it, and re-authoring S1/S2's vertex-drop mutations
+ * would buy nothing.
  *
  * # Part under test
  *
@@ -49,20 +64,26 @@
  *   - PLATE_T = 6  — the base flange plate thickness (z 0..6): the vertical
  *     span the OD silhouette segment must carry at BOTH x=+30 and x=-30.
  *
- * # Expect ONE known-red
+ * # No known-red — and the history of that flag is the point
  *
- * SUPERSEDED 2026-08-17, and rewritten rather than left standing: this
- * paragraph used to say the "-30" half of check S2 was the known-red,
- * pending `feat/silhouette-edges`. That branch merged and BOTH silhouette
- * extremes now pass live. It also used to be true that no SECTION view
- * existed at all — fixed in `9976896a`, where the cutting plane was being
- * placed on the part's corner by a fabricated zero.
+ * This scenario carried a known-red twice, and BOTH reasons turned out to be
+ * false while the flag stayed true:
  *
- * The one remaining red is check T3, "non-hatch geometry extends beyond the
- * hatched cut faces' bounding box". Measured live at `9976896a`: 11/12, with
- * SECTION A-A present at 18 polylines and an extent identical to the hatch
- * bbox ({-30,0}..{30,20}). See the `knownRed` comment on the export below
- * for why that is an open question and not a check to soften.
+ *   1. "the -OD silhouette check fails pending `feat/silhouette-edges`" —
+ *      that branch merged and both extremes pass.
+ *   2. "non-hatch geometry extends beyond the hatched cut faces' bounding
+ *      box" — measured, and NO real sheet in this repo has ever satisfied it.
+ *      A cut through the axis of a solid of revolution spans the part's whole
+ *      silhouette, so the outline lands ON the hatch boundary by construction.
+ *      The only thing that ever passed it was this suite's own hand-built
+ *      fixture, which asserted the "beyond" case because it was authored that
+ *      way and never had to agree with a rendered sheet.
+ *
+ * (2) is now repaired rather than softened: the property is re-stated as "the
+ * SECTION's outline forms one connected run whose extent BOUNDS the hatched
+ * cut faces", which is what the confetti defect actually violated, and the
+ * fixture is rebuilt from measured markup. See the export block at the foot
+ * of this file for the measurements and what is still owed.
  */
 import { buildHubFlange } from "../lib/builders.mjs";
 
@@ -289,7 +310,7 @@ function scoreSilhouette(t, svg) {
   });
 }
 
-// ── Property 3: SECTION substance — geometry beyond the hatched cut faces ─
+// ── Property 3: SECTION substance — a connected outline spanning the cut ──
 
 function bboxOf(points) {
   let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
@@ -302,9 +323,52 @@ function bboxOf(points) {
   return { minX, minY, maxX, maxY };
 }
 
-function outsideBbox(pt, bbox, margin) {
-  const [x, y] = pt;
-  return x < bbox.minX - margin || x > bbox.maxX + margin || y < bbox.minY - margin || y > bbox.maxY + margin;
+function boundsBbox(outer, inner, margin) {
+  return (
+    inner.minX >= outer.minX - margin &&
+    inner.maxX <= outer.maxX + margin &&
+    inner.minY >= outer.minY - margin &&
+    inner.maxY <= outer.maxY + margin
+  );
+}
+
+/** mm — endpoint distance at which two outline edges count as joined.
+ *
+ *  MEASURED, not chosen: `svg.rs` emits the section outline as one 2-point
+ *  `<polyline>` PER EDGE (flange SECTION A-A = 46 of them, ring plate = 35),
+ *  so "connected" can only ever mean shared ENDPOINTS — there is no single
+ *  polyline to test. Where an arc meets a line the two endpoints disagree by
+ *  ~3e-3 mm. Swept against both rendered sheets: at 1e-6 the outline shatters
+ *  into 14 (flange) and 2 (ring plate) components; at >= 5e-3 both collapse to
+ *  exactly ONE. 0.01 sits above the measured gap and orders of magnitude below
+ *  any gap that would matter on a sheet this size. */
+const OUTLINE_JOIN_TOL = 0.01;
+
+/** Group outline polylines into connected components by shared endpoints,
+ *  returning each component's points. Pairwise rather than bucketed: a bucket
+ *  boundary can fall between two points that are within tolerance and split a
+ *  component that is physically joined, and a section view carries a few
+ *  hundred points at most. */
+function outlineComponents(polylines) {
+  const parent = polylines.map((_, i) => i);
+  const find = (a) => (parent[a] === a ? a : (parent[a] = find(parent[a])));
+  const joined = (a, b) =>
+    a.points.some(([ax, ay]) => b.points.some(([bx, by]) => Math.hypot(ax - bx, ay - by) <= OUTLINE_JOIN_TOL));
+
+  for (let i = 0; i < polylines.length; i++) {
+    for (let j = i + 1; j < polylines.length; j++) {
+      if (find(i) === find(j)) continue;
+      if (joined(polylines[i], polylines[j])) parent[find(i)] = find(j);
+    }
+  }
+
+  const groups = new Map();
+  polylines.forEach((pl, i) => {
+    const r = find(i);
+    if (!groups.has(r)) groups.set(r, []);
+    groups.get(r).push(...pl.points);
+  });
+  return [...groups.values()];
 }
 
 function scoreSection(t, svg) {
@@ -335,13 +399,26 @@ function scoreSection(t, svg) {
   });
 
   const hatchPts = hatchPolylines.flatMap((pl) => pl.points);
-  const nonHatchPts = nonHatchPolylines.flatMap((pl) => pl.points);
   const hatchBbox = bboxOf(hatchPts);
   const margin = 0.1;
-  const extendsBeyond = hatchPts.length > 0 && nonHatchPts.some((pt) => outsideBbox(pt, hatchBbox, margin));
-  t.ok("that non-hatch geometry extends beyond the hatched cut faces' bounding box", extendsBeyond, {
+
+  // Rank components by half-perimeter, NOT area. Measured: a section carries
+  // flat polylines — circles seen edge-on collapse to a horizontal run at the
+  // face they sit on (14 of them on the ring plate) — so bbox area is 0 for
+  // real geometry and an area ranking picks an arbitrary winner.
+  const components = outlineComponents(nonHatchPolylines)
+    .map((pts) => ({ n: pts.length, b: bboxOf(pts) }))
+    .sort((x, y) => y.b.maxX - y.b.minX + (y.b.maxY - y.b.minY) - (x.b.maxX - x.b.minX + (x.b.maxY - x.b.minY)));
+
+  const largest = components[0] ?? null;
+  const spansTheCut = largest !== null && hatchPts.length > 0 && boundsBbox(largest.b, hatchBbox, margin);
+  t.ok("the SECTION's outline forms one connected run whose extent bounds the hatched cut faces", spansTheCut, {
     dim: "correctness",
-    detail: `hatch bbox=${JSON.stringify(hatchBbox)}, non-hatch points=${nonHatchPts.length}`,
+    detail:
+      largest === null
+        ? "the SECTION view carries no non-hatch outline geometry at all"
+        : `hatch bbox=${JSON.stringify(hatchBbox)}, ${components.length} outline component(s), ` +
+          `largest=${largest.n} points bbox=${JSON.stringify(largest.b)}`,
   });
 }
 
@@ -404,45 +481,49 @@ export function oracle(t, d) {
 
 export default {
   id: "19-drawing-export-truth",
-  title: "Drawing export truth — exactness, silhouette, section substance, legibility (section-extent known-red)",
+  title: "Drawing export truth — exactness, silhouette, section substance, legibility",
   dims: ["correctness", "soundness"],
   budgetMs: 120000,
-  // The silhouette reason this flag ORIGINALLY carried is now false, and a
-  // stated reason has to be true: `feat/silhouette-edges` merged, and both
-  // -OD and +OD silhouette checks pass live (measured 2026-08-17 against
-  // `9976896a`, 11/12).
+  // T3 RE-STATED 2026-08-18, against measured sheets rather than reasoning.
   //
-  // What is still red is ONE check: "that non-hatch geometry extends beyond
-  // the hatched cut faces' bounding box". It failed for a different reason
-  // before — there was no section at all, fixed in `9976896a` — and now it
-  // fails on its own terms. Live measurement:
+  // The old property — "non-hatch geometry extends BEYOND the hatched cut
+  // faces' bounding box" — was unsatisfiable, not unsatisfied. Every sheet
+  // measured puts the outline extent EQUAL to the hatch extent, because a cut
+  // through the axis of a solid of revolution spans the whole silhouette:
   //
-  //   hatch bbox   = {-30, 0} .. {30, 20}
-  //   SECTION A-A  = 18 polylines, extent {-30, 0} .. {30, 20}
+  //   drilled flange (live, `9976896a`)  hatch {-30,0}..{30,20}  outline same
+  //   harness_flange.svg   (HEAD)        hatch {-60,0}..{60,14}  outline same
+  //   harness_ring_plate.svg             hatch {-30,0}..{30,12}  outline same
   //
-  // MEASURED against the DRILLED flange too — scenario 15's exact shape,
-  // 7 hole sites, which has always passed — so this is not a guess:
+  // The replacement asserts the thing the CONFETTI defect actually violated:
+  // the outline is ONE CONNECTED RUN whose extent BOUNDS the hatch. Strictly
+  // more general than the old form — a sheet where "beyond" is genuinely true
+  // (an offset section through a rib on a wider body) still satisfies it.
   //
-  //   drilled flange SECTION A-A: hatch bbox   {-30,0}..{30,20}
-  //                               outline bbox {-30,0}..{30,20}
-  //                               non-hatch points beyond hatch bbox: 0
+  // Two premises were measured before being asserted, and BOTH would have
+  // shipped a second unsatisfiable check if they had been taken on reasoning:
   //
-  // So T3 is not merely unsatisfiable for bore-only axisymmetric parts: NO
-  // real sheet in this repo has ever satisfied it. The only thing that ever
-  // passed it is oracle-19's hand-built honest fixture, which asserted the
-  // "beyond" case because it was authored that way and never had to agree
-  // with a rendered sheet. A cut through the axis of a solid of revolution
-  // spans the part's whole silhouette, so the outline lands ON the hatch
-  // boundary by construction.
+  //   - "connected" cannot mean one polyline. svg.rs emits the outline one
+  //     2-point polyline PER EDGE — 46 on the flange sheet, 35 on the ring
+  //     plate — so no single-polyline form of this check can ever pass, and
+  //     neither can "some single polyline bounds the hatch".
+  //   - connectivity is tolerance-dependent: at 1e-6 the flange outline is 14
+  //     components and NONE bounds the hatch; at >= 5e-3 it is exactly one.
+  //     Adjacent edges disagree by ~3e-3 mm where an arc meets a line.
   //
-  // Deliberately NOT softened, and NOT redesigned here. The honest repair is
-  // to re-state the property against a MEASURED sheet — most likely "the
-  // section carries connected outline geometry bounding its hatch", which is
-  // what the confetti defect actually violated — and then re-prove the
-  // replacement against the T2/T3 mutations so it is known to discriminate.
-  // Editing the assertion to reach green without that is exactly the defect
-  // this suite exists to catch, which is why it stays red.
-  knownRed: true,
+  // Proven to discriminate: oracle-19 catches 9 of 9 lies, including a NEW
+  // T4 — outline confetti parked on the four corners of the hatch extent —
+  // which an aggregate bounding box passes and only the connected-run form
+  // catches. The honest fixture was rebuilt to the markup shape svg.rs really
+  // emits; the old one asserted closed rectangles nothing renders.
+  //
+  // STILL OWED, and stated rather than implied: no live backend was running
+  // when this landed, so the re-stated check has NOT been run end-to-end
+  // against the export routes. It is verified against the SAME renderer
+  // (`render_drawing_svg`) via two rendered sheets, and the knownRed flag is
+  // removed rather than left standing on an unmeasured reason — a flag whose
+  // reason has gone stale is worse than no flag, which is the mistake this
+  // scenario has now made twice.
   async run(ctx, t) {
     const { c } = ctx;
 

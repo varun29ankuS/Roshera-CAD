@@ -14,7 +14,9 @@
  *   S2  the FRONT view's -OD silhouette vertex is dropped (the shipped defect)
  *   T1  no view group in the export carries hatch ink at all
  *   T2  the SECTION view's hatch survives but the outline is stripped
- *   T3  the SECTION view's outline survives but never leaves the hatch bbox
+ *   T3  the outline survives but covers only the bore, not the cut extent
+ *   T4  the outline is confetti on the corners of that extent (bulk bbox
+ *       spans it perfectly; only the CONNECTED-run form catches this)
  *   L1  two annotation labels are moved to the same anchor
  *
  * Usage: node test/oracle-19.mjs   (exit 0 = the oracle discriminates)
@@ -26,12 +28,40 @@ import scenario, { oracle } from "../scenarios/19-drawing-export-truth.mjs";
 const DEFAULT_FRONT_POINTS = [
   [-30, 0], [30, 0], [30, 6], [12, 6], [12, 20], [-12, 20], [-12, 6], [-30, 6], [-30, 0],
 ];
+// The SECTION fixture is built to AGREE WITH A RENDERED SHEET, which the
+// previous hand-built one never had to. Two structural facts, both measured
+// off `target/drawing-visual-harness/harness_{flange,ring_plate}.svg`:
+//
+//   - hatch is 45-degree LINE segments, one 2-point polyline each (not the
+//     closed rectangles this fixture used to assert)
+//   - the outline is one 2-point polyline PER EDGE (46 on the flange sheet,
+//     35 on the ring plate), never a single chained polyline
+//
+// The geometry is buildHubFlange's own revolve profile cut through its axis:
+// bore r=6, plate r=30 x z 0..6, hub r=12 to z=20, mirrored about the axis.
+// Hatch extent and outline extent therefore COINCIDE at {-30,0}..{30,20} —
+// which is exactly what the live drilled flange measured at `9976896a`, and
+// why the old "outline extends BEYOND the hatch" premise was unsatisfiable.
 const DEFAULT_HATCH = [
-  [[-30, 0], [-20, 0], [-20, 6], [-30, 6]],
-  [[-8, 0], [8, 0], [8, 6], [-8, 6]],
-  [[20, 0], [30, 0], [30, 6], [20, 6]],
+  // right cut face: the plate's L-section, then the hub column
+  [[24, 0], [30, 6]], [[18, 0], [24, 6]], [[12, 0], [18, 6]], [[6, 0], [12, 6]],
+  [[6, 8], [12, 14]], [[6, 14], [12, 20]],
+  // left cut face, mirrored
+  [[-24, 0], [-30, 6]], [[-18, 0], [-24, 6]], [[-12, 0], [-18, 6]], [[-6, 0], [-12, 6]],
+  [[-6, 8], [-12, 14]], [[-6, 14], [-12, 20]],
 ];
-const DEFAULT_NONHATCH = [[[-12, 6], [-12, 20], [12, 20], [12, 6]]];
+const DEFAULT_NONHATCH = [
+  // right half of the cut profile, edge by edge
+  [[6, 0], [30, 0]], [[30, 0], [30, 6]], [[30, 6], [12, 6]],
+  [[12, 6], [12, 20]], [[12, 20], [6, 20]], [[6, 20], [6, 0]],
+  // left half, mirrored
+  [[-6, 0], [-30, 0]], [[-30, 0], [-30, 6]], [[-30, 6], [-12, 6]],
+  [[-12, 6], [-12, 20]], [[-12, 20], [-6, 20]], [[-6, 20], [-6, 0]],
+  // the bore's far wall, seen through the opening — back-of-plane geometry,
+  // which lands INSIDE the hatch extent and is what joins the two halves into
+  // a single connected run. The ring-plate sheet carries the same edge.
+  [[-6, 0], [6, 0]], [[-6, 20], [6, 20]],
+];
 const DEFAULT_TEXTS = [
   { cls: "dim-text dim-text-c", x: 60.0, y: 40.0, content: "Ø12.00" },
   { cls: "label", x: 10.0, y: 15.0, content: "FRONT" },
@@ -131,8 +161,32 @@ const LIES = [
     build: () => ({ svg: buildSvg({ nonHatchPolylines: [] }), dxf: buildDxf() }),
   },
   {
-    name: "T3 the SECTION view's outline survives but never leaves the hatch bbox",
-    build: () => ({ svg: buildSvg({ nonHatchPolylines: [[[-8, 0], [8, 0], [8, 6], [-8, 6]]] }), dxf: buildDxf() }),
+    name: "T3 the SECTION view's outline survives but covers only the bore, not the cut faces' extent",
+    build: () => ({
+      svg: buildSvg({
+        nonHatchPolylines: [[[-6, 0], [6, 0]], [[6, 0], [6, 20]], [[6, 20], [-6, 20]], [[-6, 20], [-6, 0]]],
+      }),
+      dxf: buildDxf(),
+    }),
+  },
+  {
+    // The lie an AGGREGATE bounding box cannot catch: four disconnected scraps
+    // parked on the corners of the hatch extent span it perfectly in bulk.
+    // Only the CONNECTED-run form of the check sees that the largest actual
+    // run is a 2 mm square. This mutation is what earns the connectivity
+    // clause its place in the property.
+    name: "T4 the SECTION view's outline is confetti on the corners of the cut faces' extent",
+    build: () => ({
+      svg: buildSvg({
+        nonHatchPolylines: [
+          [[-30, 0], [-28, 0]], [[-28, 0], [-28, 2]], [[-28, 2], [-30, 2]], [[-30, 2], [-30, 0]],
+          [[30, 0], [28, 0]], [[28, 0], [28, 2]], [[28, 2], [30, 2]], [[30, 2], [30, 0]],
+          [[-30, 20], [-28, 20]], [[-28, 20], [-28, 18]], [[-28, 18], [-30, 18]], [[-30, 18], [-30, 20]],
+          [[30, 20], [28, 20]], [[28, 20], [28, 18]], [[28, 18], [30, 18]], [[30, 18], [30, 20]],
+        ],
+      }),
+      dxf: buildDxf(),
+    }),
   },
   {
     name: "L1 two annotation labels are moved to the same anchor",
