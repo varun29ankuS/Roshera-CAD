@@ -197,3 +197,7 @@ EXACT_PREDICATES_CAMPAIGN.md
 # roshera-mcp constraint-gate test fixture: compiled from src by
 # `npx tsc -p tsconfig.json --outDir test/.build`, never shipped.
 roshera-mcp/test/.build/
+
+# Ground plan: the page is generated, the generator is what is version-controlled
+scripts/ground-plan/ground-plan.html
+scripts/ground-plan/plan.json

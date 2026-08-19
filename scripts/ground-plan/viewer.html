@@ -1,0 +1,826 @@
+<title>Roshera Ground Plan</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+
+<style>
+  /* Vellum by day, cyanotype by night — the two grounds a drawing lives on. */
+  :root {
+    --paper:#E3DCC6; --paper-2:#DAD2B8; --ink:#1B1A16; --ink-2:#4A4638; --ink-3:#7C7660;
+    --rule:#B9B096; --rule-soft:#C8C0A6; --blue:#0F4C81; --blue-2:#2E6FA3;
+    --redline:#B3261E; --green:#1E7A44; --amber:#B45309; --hatch:#1B1A16;
+    --plate:rgba(27,26,22,.05); --glass:rgba(227,220,198,.94); --face:#DAD2B8;
+  }
+  @media (prefers-color-scheme:dark){ :root:not([data-theme="light"]){
+    --paper:#0A2036; --paper-2:#0D2942; --ink:#DCE8F2; --ink-2:#A8C0D6; --ink-3:#6E8CA8;
+    --rule:#1F4467; --rule-soft:#163450; --blue:#6FB3E0; --blue-2:#9BCDEC;
+    --redline:#F0736A; --green:#5BC189; --amber:#E0A24A; --hatch:#DCE8F2;
+    --plate:rgba(220,232,242,.06); --glass:rgba(10,32,54,.94); --face:#12314F;
+  }}
+  :root[data-theme="dark"]{
+    --paper:#0A2036; --paper-2:#0D2942; --ink:#DCE8F2; --ink-2:#A8C0D6; --ink-3:#6E8CA8;
+    --rule:#1F4467; --rule-soft:#163450; --blue:#6FB3E0; --blue-2:#9BCDEC;
+    --redline:#F0736A; --green:#5BC189; --amber:#E0A24A; --hatch:#DCE8F2;
+    --plate:rgba(220,232,242,.06); --glass:rgba(10,32,54,.94); --face:#12314F;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--paper);color:var(--ink);
+    font-family:"IBM Plex Sans",ui-sans-serif,system-ui,sans-serif;font-size:14px;line-height:1.5;
+    height:100vh;overflow:hidden;display:grid;grid-template-rows:auto 1fr auto}
+  .mono{font-family:"IBM Plex Mono",ui-monospace,monospace}
+
+  header{display:flex;align-items:stretch;flex-wrap:wrap;border-bottom:1.5px solid var(--ink);background:var(--paper-2)}
+  .dno{padding:8px 16px;display:flex;flex-direction:column;justify-content:center;border-right:1px solid var(--rule);min-width:196px}
+  .dno b{font-family:"IBM Plex Mono",monospace;font-size:13px;font-weight:600;letter-spacing:.06em;text-transform:uppercase}
+  .dno span{font-size:10.5px;color:var(--ink-3);letter-spacing:.04em}
+  .stat{padding:8px 16px;border-right:1px solid var(--rule);display:flex;flex-direction:column;justify-content:center}
+  .stat i{font-style:normal;font-size:9px;letter-spacing:.13em;text-transform:uppercase;color:var(--ink-3);font-family:"IBM Plex Mono",monospace}
+  .stat b{font-family:"IBM Plex Mono",monospace;font-size:15px;font-weight:500;font-variant-numeric:tabular-nums}
+  .ctl{margin-left:auto;display:flex;align-items:center;gap:6px;padding:0 12px}
+  button{font-family:"IBM Plex Mono",monospace;font-size:10px;letter-spacing:.1em;text-transform:uppercase;
+    padding:6px 11px;cursor:pointer;background:transparent;color:var(--ink);border:1px solid var(--ink-2);transition:background .12s,color .12s}
+  button:hover{background:var(--ink);color:var(--paper)}
+  button:focus-visible{outline:2px solid var(--blue);outline-offset:2px}
+  button[aria-pressed="true"]{background:var(--blue);border-color:var(--blue);color:#fff}
+  :root[data-theme="dark"] button[aria-pressed="true"],:root:not([data-theme="light"]) button[aria-pressed="true"]{color:#06182a}
+  button:disabled{opacity:.35;cursor:default}
+  button:disabled:hover{background:transparent;color:var(--ink)}
+
+  main{display:grid;grid-template-columns:240px 1fr 358px;min-height:0}
+  aside{overflow-y:auto;background:var(--paper-2)}
+  #index{border-right:1px solid var(--rule)}
+  #panel{border-left:1.5px solid var(--ink);background:var(--paper)}
+
+  .grp{font-family:"IBM Plex Mono",monospace;font-size:9px;letter-spacing:.14em;text-transform:uppercase;
+    color:var(--ink-3);padding:13px 12px 5px;border-bottom:1px solid var(--rule-soft);
+    display:block;width:100%;text-align:left;border-left:0;border-right:0;border-top:0;cursor:pointer;background:transparent}
+  .grp:hover{background:var(--plate);color:var(--ink-2)}
+  .grp.iso{color:var(--blue);border-left:3px solid var(--blue)}
+  .row{display:grid;grid-template-columns:22px 1fr auto;gap:8px;align-items:center;padding:6px 12px;cursor:pointer;
+    border-bottom:1px solid var(--rule-soft);border-left:3px solid transparent;width:100%;text-align:left;
+    background:transparent;color:var(--ink);font-family:inherit;font-size:12px;text-transform:none;letter-spacing:0}
+  .row:hover{background:var(--plate)}
+  .row.on{border-left-color:var(--blue);background:var(--plate)}
+  .row.dim{opacity:.3}
+  .row .k{font-family:"IBM Plex Mono",monospace;font-size:9.5px;font-weight:600;border:1px solid var(--ink-2);text-align:center;line-height:15px;height:16px}
+  .row .f{font-family:"IBM Plex Mono",monospace;font-size:9.5px;color:var(--ink-3)}
+  .row .f.red{color:var(--redline);font-weight:600}
+  .row.file .k{border:0;color:var(--ink-3);font-weight:400}
+
+  #stage{position:relative;overflow:hidden;background:var(--paper);cursor:grab}
+  #stage.drag{cursor:grabbing}
+  #stage svg{display:block;width:100%;height:100%;touch-action:none;user-select:none;-webkit-user-select:none}
+  .bld{cursor:pointer}
+  .bld .face{stroke:var(--ink);vector-effect:non-scaling-stroke;stroke-width:1;stroke-linejoin:round}
+  .bld.sel .face,.bld.hot .face{stroke-width:2.2}
+  .bld.mute{opacity:.13}
+  .lbl{font-family:"IBM Plex Mono",monospace;font-weight:600;fill:var(--ink);pointer-events:none;text-anchor:middle}
+  .plot-lbl{font-family:"IBM Plex Mono",monospace;letter-spacing:.16em;fill:var(--ink-3);pointer-events:none;text-transform:uppercase}
+  .edge{fill:none;pointer-events:none}
+  .crumb{position:absolute;top:12px;left:12px;display:flex;gap:6px;align-items:center;
+    font-family:"IBM Plex Mono",monospace;font-size:10px;letter-spacing:.08em;text-transform:uppercase;
+    background:var(--glass);border:1px solid var(--rule);padding:5px 9px;color:var(--ink-3)}
+  .crumb b{color:var(--ink);font-weight:600}
+  .crumb button{padding:2px 7px;font-size:9px}
+  .zoombtns{position:absolute;top:12px;right:12px;display:flex;flex-direction:column;gap:4px}
+  .zoombtns button{width:26px;height:26px;padding:0;font-size:13px;background:var(--glass)}
+  .legend{position:absolute;left:12px;bottom:12px;background:var(--glass);border:1px solid var(--rule);
+    padding:9px 11px;width:296px;font-family:"IBM Plex Mono",monospace;font-size:9.5px;line-height:1.6;color:var(--ink-2)}
+  .legend b{color:var(--ink);font-weight:500}
+  .legend .kk{display:block;margin-top:7px}
+  .legend .kk span{display:flex;align-items:center;gap:6px;line-height:1.9}
+  .legend .kk i{display:block;width:26px;height:0;flex:0 0 26px;border-top:2px solid currentColor}
+  .legend .kk i.dash{border-top-style:dashed;border-top-width:2px}
+  .legend .kk i.sq{height:9px;width:9px;flex-basis:9px;border:0;background:currentColor}
+  .legend .kk span{display:flex;align-items:center;gap:4px}
+  .legend svg{display:block}
+
+  .tabs{display:flex;border-bottom:1.5px solid var(--ink);flex-wrap:wrap}
+  .tabs button{flex:1;border:0;border-right:1px solid var(--rule);padding:9px 4px;font-size:9px;min-width:0}
+  .tabs button:last-child{border-right:0}
+  .tabs button[aria-selected="true"]{background:var(--ink);color:var(--paper)}
+  .pbody{padding:16px 18px 44px}
+  .eyebrow{font-family:"IBM Plex Mono",monospace;font-size:9px;letter-spacing:.15em;text-transform:uppercase;color:var(--ink-3)}
+  .pbody h2{font-size:20px;line-height:1.15;margin:5px 0 3px;font-weight:600;text-wrap:balance;letter-spacing:-.015em}
+  .path{font-family:"IBM Plex Mono",monospace;font-size:10.5px;color:var(--blue);word-break:break-all;margin-bottom:14px;display:block}
+  .metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:1px;background:var(--rule);border:1px solid var(--rule);margin-bottom:15px}
+  .metrics div{background:var(--paper);padding:7px 7px}
+  .metrics i{font-style:normal;display:block;font-family:"IBM Plex Mono",monospace;font-size:8px;letter-spacing:.09em;text-transform:uppercase;color:var(--ink-3)}
+  .metrics b{font-family:"IBM Plex Mono",monospace;font-size:14px;font-weight:500;font-variant-numeric:tabular-nums}
+  .pbody p{margin:0 0 11px;max-width:62ch}
+  .sect{font-family:"IBM Plex Mono",monospace;font-size:9px;letter-spacing:.14em;text-transform:uppercase;color:var(--ink-3);
+    border-bottom:1px solid var(--rule);padding-bottom:4px;margin:20px 0 10px}
+  .cond{border-left:3px solid var(--redline);padding:2px 0 2px 11px;margin-bottom:11px}
+  .cond p{margin:0;font-size:13px}
+  .cond .tag{font-family:"IBM Plex Mono",monospace;font-size:9px;letter-spacing:.1em;text-transform:uppercase;color:var(--redline);font-weight:600;display:block}
+  .cond.by-design{border-left-color:var(--green)}
+  .cond.by-design .tag{color:var(--green)}
+  .clean{border-left:3px solid var(--green);padding:2px 0 2px 11px;font-size:13px;color:var(--ink-2)}
+  .rel{display:flex;align-items:baseline;gap:8px;padding:5px 0;border-bottom:1px solid var(--rule-soft);cursor:pointer;
+    width:100%;text-align:left;background:transparent;border-top:0;border-left:0;border-right:0;
+    font-family:inherit;font-size:12.5px;color:var(--ink);text-transform:none;letter-spacing:0}
+  .rel:hover{background:var(--plate)}
+  .rel .w{font-family:"IBM Plex Mono",monospace;font-size:10px;color:var(--ink-3);margin-left:auto;white-space:nowrap}
+  .rel .kk{font-family:"IBM Plex Mono",monospace;font-size:9.5px;font-weight:600;border:1px solid var(--ink-2);padding:0 4px}
+  .rel.wire .kk{border-style:dashed;color:var(--blue);border-color:var(--blue)}
+  code{font-family:"IBM Plex Mono",monospace;font-size:.92em;background:var(--plate);padding:0 3px}
+  pre{font-family:"IBM Plex Mono",monospace;font-size:10.5px;background:var(--plate);padding:10px;overflow-x:auto;
+    border-left:2px solid var(--rule);line-height:1.5}
+  mark{background:var(--ink);color:var(--paper);padding:0 3px}
+  .filelist{max-height:none}
+  footer{border-top:1px solid var(--rule);background:var(--paper-2);padding:6px 16px;
+    font-family:"IBM Plex Mono",monospace;font-size:9.5px;letter-spacing:.06em;color:var(--ink-3);display:flex;gap:18px;flex-wrap:wrap}
+  footer b{color:var(--ink-2);font-weight:500}
+  @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+  @media (max-width:1180px){main{grid-template-columns:196px 1fr 300px}}
+  @media (max-width:880px){main{grid-template-columns:1fr;grid-template-rows:1fr auto}
+    #index{display:none}#panel{border-left:0;border-top:1.5px solid var(--ink);max-height:44vh}}
+</style>
+
+<header>
+  <div class="dno">
+    <b>Roshera &middot; ground plan</b>
+    <span class="mono" id="rev"></span>
+  </div>
+  <div class="stat"><i>Lines</i><b id="s-loc"></b></div>
+  <div class="stat"><i>Files</i><b id="s-files"></b></div>
+  <div class="stat"><i>Structures</i><b id="s-str"></b></div>
+  <div class="stat"><i>Measured links</i><b id="s-edge"></b></div>
+  <div class="stat"><i>Open ceilings</i><b id="s-cond" style="color:var(--redline)"></b></div>
+  <div class="ctl">
+    <button id="btn-flow">&#9654; Run the flow</button>
+    <button id="btn-wire" aria-pressed="true">Wiring</button>
+    <button id="btn-rot">Rotate</button>
+    <button id="btn-reset">Reset</button>
+  </div>
+</header>
+
+<main>
+  <aside id="index"></aside>
+  <div id="stage">
+    <svg id="svg" role="img" aria-label="Isometric plan of the Roshera codebase"></svg>
+    <div class="crumb" id="crumb"></div>
+    <div class="zoombtns">
+      <button id="btn-in" aria-label="Zoom in">+</button>
+      <button id="btn-out" aria-label="Zoom out">&minus;</button>
+    </div>
+    <div class="legend" id="legend"></div>
+  </div>
+  <aside id="panel">
+    <div class="tabs" role="tablist">
+      <button role="tab" aria-selected="true" data-tab="what">What</button>
+      <button role="tab" aria-selected="false" data-tab="built">Built</button>
+      <button role="tab" aria-selected="false" data-tab="rel">Links</button>
+      <button role="tab" aria-selected="false" data-tab="files">Inside</button>
+      <button role="tab" aria-selected="false" data-tab="cond">Condition</button>
+      <button role="tab" aria-selected="false" data-tab="data">Data</button>
+    </div>
+    <div class="pbody" id="pbody"></div>
+  </aside>
+</main>
+
+<footer>
+  <span><b>Click</b> to pin</span>
+  <span><b>Inside</b> tab &rarr; drill into the files</span>
+  <span><b>Links</b> tab &rarr; what it uses, what uses it</span>
+  <span><b>Drag</b> pan &middot; <b>scroll</b> zoom</span>
+  <span style="margin-left:auto">Generated from the tree at <b id="rev2"></b> &mdash; nothing on this plan is hand-entered</span>
+</footer>
+
+<script type="application/json" id="roshera-plan">/*__PLAN_JSON__*/</script>
+
+<script>
+// ═══════════════════════════════════════════════════════════════════════════
+//  Roshera ground plan — viewer.
+//
+//  FOR AGENTS: the complete dataset is in the <script type="application/json"
+//  id="roshera-plan"> element above and on window.__ROSHERA_PLAN__. It is the
+//  generator's output, unmodified. Schema is documented in the Data tab.
+// ═══════════════════════════════════════════════════════════════════════════
+const PLAN = JSON.parse(document.getElementById("roshera-plan").textContent);
+window.__ROSHERA_PLAN__ = PLAN;
+
+const S = PLAN.structures, D = PLAN.districts, E = PLAN.edges, F = PLAN.files;
+const byK = Object.fromEntries(S.map(s => [s.k, s]));
+
+/* ── Authored annotations. The ONLY hand-written content on the plan; every
+      number comes from the generator. Keyed by structure. ─────────────── */
+const ANN = {
+A:{what:"The largest structure here, and the one everything else waits on. Union, difference and intersection of solids; fillets and chamfers; extrude, revolve, loft and sweep; and the section cuts a drawing is made from.",
+  built:"<code>boolean.rs</code> alone is <b>29,410 lines</b> &mdash; the biggest file in the repository by a distance, and touched by 221 commits. <code>fillet.rs</code> adds 14,191.",
+  cond:[["pipe-tee","A curved cylinder&cap;cylinder union builds, but boring the result panics inside the winding-number classification of the saddle-faced tee. Pinned and ignored at HEAD."],
+        ["#86 near-tangency","A shallow cylinder/face lens breaks the union. The adversarial predicate census holds it red."],
+        ["task #82 &mdash; corner blends","Slice 1 closed the re-entrant three-way concave corner. A fillet across a shared corner still returns a typed refusal. This is the single-part complexity ceiling."]],
+  ok:[["threads & helices","Refused by design. The kernel will not approximate a thread and call it exact."]]},
+B:{what:"The solid model itself: shells, faces, loops, co-edges, edges, vertices, and the analytic surfaces they carry. When the kernel says a solid is watertight, this is what has to be right.",
+  built:"<code>topology_builder.rs</code> assembles it. Peer bodies got their own slot in August, closing the last certified lie &mdash; a disjoint second body used to be filed as an interior void, so mass properties subtracted what the mesh added."},
+C:{what:"The bedrock. Orientation, in-circle and point-in-polygon decided exactly rather than in floating point, so a geometric question has one answer instead of one per rounding mode.",
+  built:"Adaptive exact arithmetic with a BigRational oracle behind the census. The strongest evidence line in the project lives here: over a 12,000-case adversarial census, three shipped floating-point variants each lied on <b>3.49&ndash;3.54%</b> of cases. The exact core lied on <b>zero</b>.",
+  cond:[["occt-parity ladder","General cylinder&compfn;sphere surface-surface intersection is still owed."]]},
+D:{what:"2D constraint solving with degree-of-freedom accounting. An agent states what should be true &mdash; this line horizontal, these circles concentric &mdash; and gets back a solved sketch or an honest count of what is still free.",
+  built:"DOF accounting is emitted as part of the certificate rather than left for the caller to infer, so an under-constrained sketch cannot pass as solved."},
+E:{what:"Hidden-line removal, orthographic and section views, dimensioning, hole tables, GD&amp;T frames, and the SVG and DXF a machinist actually receives.",
+  built:"Rebuilt 16&ndash;17 August. Six visible defects, every one found by a human rendering a sheet and looking at it &mdash; a section drawn as confetti, a cylinder open on one side because the pipeline drew the parameterisation's seam and never synthesised the true silhouette, half an A3 wasted by the view grid.",
+  cond:[["display-valued coordinates","<code>x_mm</code>/<code>y_mm</code> are still display-valued for every consumer but the section plane &mdash; the label reads &ldquo;&mdash;&rdquo; while the number reads 0.0."],
+        ["silent scale cost","<code>standard_drawing_hlr</code> never attaches a section, so passing it a scale silently costs the view."]]},
+F:{what:"Turns exact surfaces into triangles, for display, export, and the winding-number classification the booleans lean on.",
+  built:"Watertight welding runs to a stated tolerance rather than a hopeful one.",
+  cond:[["#24 bolt hole","A bored revolved flange's mesh does not reflect the bolt hole &mdash; the volume comes back unchanged."],
+        ["task #11 blind spot","An extreme-aspect cylinder (r 0.5 &times; h 200) falls outside the tested envelope."]]},
+G:{what:"Reads a finished solid for the things that stop it being made: wall thickness, bore depth-to-diameter, blend radii below tool size, voids with no way out.",
+  built:"Analyzers compose into process packs &mdash; FDM and injection moulding &mdash; so geometry is judged against the process actually chosen."},
+H:{what:"The machinery that stops a capability shipping unproven. Every new public capability must arrive with a test that calls it from a production site, not a fixture.",
+  built:"Holds the disconnection-gate ratchet (14 classified, 5 closed) and the gate that refuses a bare <code>#[ignore]</code>. That second gate is why the ceilings on this plan can be trusted: an ignored test has to say why it is ignored."},
+I:{what:"Mass properties, and the thing that makes the project's whole claim checkable: <b>fidelity</b> &mdash; what was asked for, measured against what was actually built.",
+  built:"<code>queries::fidelity</code> never flips <code>sound</code>; it rides beside it, because a request-dependent field on a memoised per-solid certificate would make a cached answer depend on who asked. Nothing measured means the key is <b>omitted</b>, never reported green, and every deviation carries its sign.",
+  ok:[["soundness &ne; fidelity","A loft made of octagons was perfectly sound and completely wrong. Soundness says the solid is well-formed; fidelity says it is the one you asked for."]]},
+J:{what:"Rigid transforms and the SE(3) frame algebra the assembly solver stands on."},
+K:{what:"Server-side raster of a part or a sheet &mdash; how an agent sees what it built, with no browser in the loop."},
+L:{what:"The differentiator, and the smallest structure that matters this much. Turns topology into language a model can reason about &mdash; this face is a bore wall, this edge is a fillet's tangent boundary &mdash; rather than an anonymous index into a face list.",
+  built:"The thesis in one module: geometry carries semantic meaning an agent can query, reason over and verify."},
+M:{what:"Datum reference frames and geometric tolerance verification."},
+N:{what:"Spatial indexing, labelling, perception helpers and the kernel's own binaries."},
+O:{what:"The front door. REST for CRUD, WebSocket for real-time collaboration, and the error catalogue that makes a refusal typed rather than a 500 with prose.",
+  built:"<code>main.rs</code> is 11,815 lines, and the routing layer's integration tests are nearly the size of the routing layer."},
+P:{what:"Per-domain handlers: parts, sketches, drawings, timeline, sessions.",
+  built:"A drawing is bound to the model that made it, so a sheet can no longer be certified against the wrong geometry."},
+Q:{what:"Event-sourced design history. Not a parametric feature tree &mdash; an append-only record of what was asked for, in order, that can be replayed.",
+  built:"Recipes are read back out of lineage, which is how a proven build becomes something an agent retrieves rather than re-derives.",
+  cond:[["ordering","Checkpoint tie-order differs between the live and durable views; the slip-on durable log has a duplicate sequence 5 and a gap from 73 to 264."]]},
+R:{what:"Multi-user sessions, permissions, and the binding between a session and the document it may touch.",
+  cond:[["stale viewport","The stale-viewport-delete half of session binding is open &mdash; per-document models or a mismatch refusal, and that is a product call rather than a bug."]]},
+S:{what:"Where an agent actually meets the kernel. Tools for building, querying, verifying and checkpointing &mdash; and the gates that refuse the calls which would let an agent fool itself.",
+  built:"Six gates. The sixth, <code>verification_scope</code>, refuses to close a checkpoint over unverified mutating work; the escape is <code>skip_verification: true</code>, an <b>argument</b> that lands on the record, never a silent omission.",
+  ok:[["a refusal is a feature","Constraint beats steering. The question is not how to prompt a model out of doing X, but whether X can be made inexpressible."]]},
+T:{what:"Claude and OpenAI behind one interface. API-only by policy &mdash; no local weights in the loop."},
+U:{what:"Runs certificate-scored agent episodes in parallel. Each episode is its own OS process pinned to its own document, so eight agents can build eight parts without touching each other's state.",
+  built:"Trajectories land in Postgres; ingesting the same run twice changes nothing. <mark>42 green tests were green against a mock</mark> &mdash; the live run found nine defects, two of them tools that could not be called at all.",
+  cond:[["model isolation","Not real yet. Episodes are process-isolated; the model choice is not."],
+        ["recipe replay","Dead &mdash; <code>step_count: 0</code>. Lineage is recorded but cannot yet be re-run from the record."]]},
+V:{what:"Multi-agent verdict and consensus &mdash; several judges over one artifact, and a recorded disagreement rather than an averaged one."},
+W:{what:"STL, OBJ, STEP, and the SVG and DXF a drawing leaves as. The bytes someone else's software has to read.",
+  built:"Exactness survives the trip: a bore leaves as a native CIRCLE entity in DXF, not a 96-sided polygon a CAM package would read as a pocket."},
+X:{what:"The native serialisation &mdash; a document, its timeline and its certificates in one file."},
+Y:{what:"React and Three.js. The 3D viewport, sketcher, drawing workspace, timeline scrubber and document tabs.",
+  built:"A thin display layer by design &mdash; the backend drives, the frontend shows. Large, but not load-bearing.",
+  cond:[["two id spaces","The kernel's <code>SolidId</code> and the viewport's UUID are different namespaces, and confusing them has caused real bugs."]]},
+Z:{what:"API client, WebSocket transport, geometry helpers, tessellation adapters."},
+AA:{what:"Client-side state. Deliberately small: the server is the source of truth."},
+AB:{what:"Routing, layout, theme and entry points."},
+AC:{what:"Twenty certificate-scored scenarios. Not &ldquo;did the agent produce something&rdquo; but &ldquo;does the artifact satisfy a property a machinist would care about, measured against the exported bytes.&rdquo;",
+  built:"Every oracle is <b>mutation-proven</b>: an honest fixture scores clean and a set of single-mutation lies are each caught. Parsing lives inside the oracle &mdash; put it outside and the proof only exercises the judging, leaving a parse bug invisible to the thing meant to establish trust.",
+  cond:[["one live run owed","Scenario 19's re-stated section property is verified against the same renderer via two rendered sheets, but has not been run end-to-end through the export routes."]]},
+AD:{what:"The vocabulary every crate agrees on &mdash; ObjectId, Position3D, and the command and certificate shapes. Everything depends on it; it depends on nothing.",
+  built:"Being depended on by all seven districts is what makes this the one structure that cannot change casually."},
+AE:{what:"Instances and mates, SE(3) solve, and interference checks between placed parts."},
+};
+
+const FLOW = [
+  ["S","An agent calls a tool on the MCP surface."],
+  ["O","The server takes it over REST, and types the refusal if it cannot comply."],
+  ["P","A handler routes it to the domain that owns it."],
+  ["A","The kernel performs the operation. This is the expensive part."],
+  ["I","Queries measure what was actually built, and emit the certificate."],
+  ["Q","The timeline files the event, so the build can be replayed."],
+  ["W","Export turns it into bytes another package can read."],
+  ["Y","The viewport shows it. One client, and it comes last."],
+];
+
+// ── derived ───────────────────────────────────────────────────────────────
+for (const s of S) { const a = ANN[s.k] || {}; s.ann = a; s.cond = a.cond || []; s.ok = a.ok || []; }
+const filesOf = k => F.filter(f => f.k === k);
+const outOf = k => E.filter(e => e.from === k);
+const inTo  = k => E.filter(e => e.to === k);
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  LAYOUT
+// ═══════════════════════════════════════════════════════════════════════════
+const KRING = { C:[0,0], B:[0,0] };            // core, placed explicitly below
+const RING1 = ["A","B","F","I","D"], RING2 = ["E","H","G","M","L","K","J","N"];
+const PLOTS = {
+  server:{x: 26,y:-11,w:15}, agent:{x:-17,y:-31,w:16}, out:{x: 27,y: 11,w:13},
+  view:{x: -3,y: 25,w:16},   proof:{x:-32,y: -3,w:13}, vocab:{x:-30,y: 15,w:8},
+};
+
+function foot(n, lo, hi, k) { return Math.max(lo, Math.min(hi, Math.sqrt(n) * k)); }
+
+function layoutStructures() {
+  for (const s of S) { s.w = foot(s.files, 1.9, 5.6, .62); s.dz = s.w; }
+  byK.C.gx = -6.2; byK.C.gy = -2.2;
+  byK.C.w = byK.C.dz = 4.4;
+  const r1 = 9.5, r2 = 16.5;
+  const ring1 = RING1.filter(k => k !== "B");
+  ring1.forEach((k, i) => {
+    const a = (i / ring1.length) * Math.PI * 2 - Math.PI / 4;
+    byK[k].gx = Math.cos(a) * r1 - byK[k].w / 2;
+    byK[k].gy = Math.sin(a) * r1 - byK[k].dz / 2;
+  });
+  byK.B.gx = 1.9; byK.B.gy = -2.2; byK.B.w = byK.B.dz = 4.4;
+  RING2.forEach((k, i) => {
+    const a = (i / RING2.length) * Math.PI * 2 + Math.PI / 8;
+    byK[k].gx = Math.cos(a) * r2 - byK[k].w / 2;
+    byK[k].gy = Math.sin(a) * r2 - byK[k].dz / 2;
+  });
+  for (const d of D) {
+    if (d.id === "kernel") continue;
+    const plot = PLOTS[d.id]; let cx = 0, cy = 0, rowD = 0;
+    for (const s of S.filter(x => x.d === d.id)) {
+      if (cx + s.w > plot.w) { cx = 0; cy += rowD + 1.3; rowD = 0; }
+      s.gx = plot.x + cx; s.gy = plot.y + cy;
+      cx += s.w + 1.3; rowD = Math.max(rowD, s.dz);
+    }
+    d.depth = cy + rowD; d.plot = plot;
+  }
+}
+layoutStructures();
+
+// File level: shelf-pack one structure's files into a square-ish block.
+function layoutFiles(k) {
+  const fs = filesOf(k).slice().sort((a, b) => b.loc - a.loc);
+  const wide = Math.ceil(Math.sqrt(fs.length)) * 3.4;
+  let cx = 0, cy = 0, rowD = 0;
+  for (const f of fs) {
+    f.w = foot(f.r.length + 1, 1.5, 4.2, 1.15); f.dz = f.w;
+    if (cx + f.w > wide) { cx = 0; cy += rowD + .9; rowD = 0; }
+    f.gx = cx - wide / 2; f.gy = cy - wide / 2;
+    cx += f.w + .9; rowD = Math.max(rowD, f.dz);
+  }
+  return fs;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  RENDER
+// ═══════════════════════════════════════════════════════════════════════════
+const NS = "http://www.w3.org/2000/svg";
+const svg = document.getElementById("svg"), stage = document.getElementById("stage");
+const U = 30, V = 15;
+let view = { zoom:.72, px:0, py:0, rot:0 };
+let level = "plan", inside = null, sel = null, hot = null, iso = null, tab = "what", wire = true;
+let flowOn = false, flowStep = -1, flowTimer = null;
+
+const maxLoc = Math.max(...S.map(s => s.loc));
+const maxChurn = Math.max(...S.map(s => s.churn));
+const hgt = (loc, mx) => Math.pow(loc, .55) / Math.pow(mx, .55) * 190 + 9;
+const band = (c, mx) => Math.min(4, Math.floor(Math.log(c + 1) / Math.log(mx + 1) * 5));
+
+function rot(x, y) { let dx = x, dy = y;
+  for (let i = 0; i < view.rot; i++) { const t = dx; dx = -dy; dy = t; } return [dx, dy]; }
+function proj(x, y, z) { const [rx, ry] = rot(x, y); return [(rx - ry) * U, (rx + ry) * V - z]; }
+const poly = p => p.map(q => q.join(",")).join(" ");
+function el(t, a) { const n = document.createElementNS(NS, t); for (const k in a) n.setAttribute(k, a[k]); return n; }
+
+function defs() {
+  const d = el("defs", {});
+  [11, 7.5, 5, 3.4, 2.2].forEach((s, i) => {
+    const p = el("pattern", { id:"h"+i, width:s, height:s, patternTransform:"rotate(45)", patternUnits:"userSpaceOnUse" });
+    p.appendChild(el("rect", { width:s, height:s, fill:"var(--face)" }));
+    p.appendChild(el("line", { x1:0, y1:0, x2:0, y2:s, stroke:"var(--hatch)", "stroke-width":.85, opacity:.5+i*.1 }));
+    d.appendChild(p);
+  });
+  for (const [id, col] of [["ao","var(--blue)"],["ai","var(--ink-2)"]]) {
+    const m = el("marker", { id, viewBox:"0 0 8 8", refX:7, refY:4, markerWidth:6, markerHeight:6, orient:"auto" });
+    m.appendChild(el("path", { d:"M0,0 L8,4 L0,8 z", fill:col }));
+    d.appendChild(m);
+  }
+  return d;
+}
+
+function centre(o, mx) { return proj(o.gx + o.w / 2, o.gy + o.dz / 2, hgt(o.loc, mx) + 9); }
+
+function drawEdges(root, items, mx, onTop) {
+  if (!wire && !onTop) return;
+  const pos = Object.fromEntries(items.map(o => [o.k, centre(o, mx)]));
+  for (const e of E) {
+    if (!pos[e.from] || !pos[e.to]) continue;
+    const isSel = sel && (e.from === sel || e.to === sel);
+    if (onTop !== !!isSel) continue;
+    const a = pos[e.from], b = pos[e.to];
+    // Bow the line so opposing pairs don't overprint each other.
+    const mx2 = (a[0]+b[0])/2, my2 = (a[1]+b[1])/2;
+    const dx = b[0]-a[0], dy = b[1]-a[1], len = Math.hypot(dx,dy) || 1;
+    const bow = Math.min(34, len*.14);
+    const cx = mx2 - dy/len*bow, cy = my2 + dx/len*bow;
+    const outgoing = e.from === sel;
+    root.appendChild(el("path", {
+      d:`M${a[0]},${a[1]} Q${cx},${cy} ${b[0]},${b[1]}`,
+      class:"edge",
+      stroke: isSel ? (outgoing ? "var(--blue)" : "var(--ink-2)") : (e.kind === "wire" ? "var(--blue)" : "var(--ink-3)"),
+      "stroke-width": (isSel ? Math.min(4, 1.3 + Math.log(e.w+1)*.55) : Math.min(2.2,.5+Math.log(e.w+1)*.3)) / view.zoom,
+      "stroke-dasharray": e.kind === "wire" ? (6/view.zoom)+" "+(5/view.zoom) : "none",
+      opacity: isSel ? .97 : (iso ? .07 : .42),
+      "marker-end": isSel ? (outgoing ? "url(#ao)" : "url(#ai)") : "none",
+    }));
+  }
+}
+
+/** Frame the current level. The plan is wider than it is tall and the file
+ *  level changes size with every structure, so the view is fitted rather than
+ *  set to a guessed zoom — nothing should ever open half off-screen. */
+function fitView() {
+  const items = level === "plan" ? S : layoutFiles(inside);
+  const mx = level === "plan" ? maxLoc : Math.max(...items.map(f => f.loc));
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  for (const o of items) {
+    const h = hgt(o.loc, mx);
+    for (const c of [proj(o.gx,o.gy,0), proj(o.gx+o.w,o.gy,0), proj(o.gx,o.gy+o.dz,0),
+                     proj(o.gx+o.w,o.gy+o.dz,0), proj(o.gx,o.gy,h), proj(o.gx+o.w,o.gy+o.dz,h)]) {
+      x0 = Math.min(x0,c[0]); x1 = Math.max(x1,c[0]);
+      y0 = Math.min(y0,c[1]); y1 = Math.max(y1,c[1]);
+    }
+  }
+  const pad = 78;
+  const W = stage.clientWidth || 1200, H = stage.clientHeight || 700;
+  view.zoom = Math.max(.12, Math.min(2.4, Math.min((W-pad)/(x1-x0), (H-pad)/(y1-y0))));
+  view.px = -(x0+x1)/2; view.py = -(y0+y1)/2;
+}
+
+function draw() {
+  svg.textContent = "";
+  const W = stage.clientWidth, H = stage.clientHeight;
+  svg.setAttribute("viewBox", `${-W/2/view.zoom - view.px} ${-H/2/view.zoom - view.py} ${W/view.zoom} ${H/view.zoom}`);
+  svg.appendChild(defs());
+  const root = el("g", {}); svg.appendChild(root);
+
+  if (level === "plan") drawPlan(root); else drawInside(root);
+  legend();
+}
+
+function drawPlan(root) {
+  // district plates
+  for (const d of D) {
+    const on = !iso || iso === d.id;
+    let c;
+    if (d.id === "kernel") {
+      const R = 21;
+      c = [proj(-R,-R,0), proj(R,-R,0), proj(R,R,0), proj(-R,R,0)];
+    } else {
+      const p = d.plot, pd = 1.5;
+      c = [proj(p.x-pd,p.y-pd,0), proj(p.x+p.w+pd,p.y-pd,0),
+           proj(p.x+p.w+pd,p.y+d.depth+pd,0), proj(p.x-pd,p.y+d.depth+pd,0)];
+    }
+    root.appendChild(el("polygon", { points:poly(c), fill:"var(--plate)", stroke:"var(--rule)",
+      "stroke-width":1, "stroke-dasharray":"5 4", opacity:on?1:.1 }));
+    const fs = 10.5 / view.zoom;
+    const t = el("text", { x:c[0][0]+6/view.zoom, y:c[0][1]-8/view.zoom, class:"plot-lbl",
+      style:`font-size:${fs}px`, opacity:on?1:.1 });
+    t.textContent = d.n.toUpperCase(); root.appendChild(t);
+  }
+
+  drawEdges(root, S, maxLoc, false);
+
+  const order = S.slice().sort((a,b) => {
+    const [ax,ay] = rot(a.gx+a.w/2, a.gy+a.dz/2), [bx,by] = rot(b.gx+b.w/2, b.gy+b.dz/2);
+    return (ax+ay)-(bx+by);
+  });
+  for (const s of order) box(root, s, hgt(s.loc,maxLoc), band(s.churn,maxChurn), s.k, s.cond.length, () => pick(s.k));
+  drawEdges(root, S, maxLoc, true);
+
+  if (flowOn && flowStep >= 0) {
+    const s = byK[FLOW[flowStep % FLOW.length][0]], p = centre(s, maxLoc);
+    root.appendChild(el("circle", { cx:p[0], cy:p[1], r:6, fill:"var(--blue)" }));
+  }
+}
+
+function drawInside(root) {
+  const fs = layoutFiles(inside);
+  const mx = Math.max(...fs.map(f => f.loc));
+  const mc = Math.max(...fs.map(f => f.c), 1);
+  const R = Math.ceil(Math.sqrt(fs.length)) * 1.8 + 2;
+  root.appendChild(el("polygon", { points:poly([proj(-R,-R,0),proj(R,-R,0),proj(R,R,0),proj(-R,R,0)]),
+    fill:"var(--plate)", stroke:"var(--rule)", "stroke-width":1, "stroke-dasharray":"5 4" }));
+
+  const order = fs.slice().sort((a,b) => {
+    const [ax,ay] = rot(a.gx+a.w/2,a.gy+a.dz/2), [bx,by] = rot(b.gx+b.w/2,b.gy+b.dz/2);
+    return (ax+ay)-(bx+by);
+  });
+  for (const f of order) {
+    const nm = f.p.split("/").pop();
+    box(root, f, hgt(f.loc,mx), band(f.c,mc), fs.length <= 26 ? nm.replace(/\.(rs|tsx?|mjs|js)$/,"") : "",
+        0, () => pickFile(f), sel === f.p);
+  }
+}
+
+function box(root, o, h, pat, label, flagged, onClick, isSel) {
+  const selected = isSel !== undefined ? isSel : sel === o.k;
+  const hovered = hot === (o.k || o.p);
+  const x0=o.gx, y0=o.gy, x1=o.gx+o.w, y1=o.gy+o.dz;
+  const g = el("g", { class:"bld"+(selected?" sel":"")+(hovered?" hot":"")+
+    ((iso && o.d && iso!==o.d)?" mute":""), tabindex:"0", role:"button" });
+  const top=[proj(x0,y0,h),proj(x1,y0,h),proj(x1,y1,h),proj(x0,y1,h)];
+  const rgt=[proj(x1,y0,0),proj(x1,y1,0),proj(x1,y1,h),proj(x1,y0,h)];
+  const lft=[proj(x0,y1,0),proj(x1,y1,0),proj(x1,y1,h),proj(x0,y1,h)];
+  g.appendChild(el("polygon",{points:poly(lft),class:"face",fill:`url(#h${pat})`,opacity:.94}));
+  g.appendChild(el("polygon",{points:poly(rgt),class:"face",fill:`url(#h${pat})`,opacity:.7}));
+  g.appendChild(el("polygon",{points:poly(top),class:"face",
+    fill:(selected||hovered)?"var(--blue)":"var(--face)"}));
+  if (label) {
+    const c = proj(x0+o.w/2, y0+o.dz/2, h);
+    // Counter-scale: the viewBox scales everything, and a 10px label at 0.3
+    // zoom is 3px of unreadable ink. Type stays the same size on screen.
+    const fs = (label.length > 3 ? 8.5 : 11.5) / view.zoom;
+    const t = el("text",{x:c[0], y:c[1]+fs*.36, class:"lbl", style:`font-size:${fs}px`});
+    if (selected||hovered) t.setAttribute("fill","#fff");
+    t.textContent = label; g.appendChild(t);
+  }
+  if (flagged) {
+    const f = proj(x1,y0,h), u = 1/view.zoom;
+    g.appendChild(el("rect",{x:f[0]-3*u,y:f[1]-16*u,width:7*u,height:7*u,fill:"var(--redline)"}));
+    g.appendChild(el("line",{x1:f[0]-3*u,y1:f[1]-16*u,x2:f[0]-3*u,y2:f[1],
+      stroke:"var(--redline)","stroke-width":1.3*u}));
+  }
+  const id = o.k || o.p;
+  g.addEventListener("mouseenter", () => { hot = id; draw(); });
+  g.addEventListener("mouseleave", () => { hot = null; draw(); });
+  g.addEventListener("click", e => { e.stopPropagation(); onClick(); });
+  g.addEventListener("keydown", e => { if (e.key==="Enter"||e.key===" ") { e.preventDefault(); onClick(); } });
+  root.appendChild(g);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  PANEL
+// ═══════════════════════════════════════════════════════════════════════════
+const pbody = document.getElementById("pbody");
+const nf = n => n.toLocaleString("en-US");
+const esc = s => s.replace(/[&<>]/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;" }[c]));
+
+function pick(k) { sel = k; inside = null; level = "plan"; render(); }
+function pickFile(f) { sel = f.p; render(); }
+function goInside(k) { inside = k; level = "inside"; sel = k; tab = "files"; view.rot = 0; render(); fitView(); draw(); }
+function goOut() { level = "plan"; sel = inside; inside = null; tab = "what"; render(); fitView(); draw(); }
+
+function relRow(e, other, dir) {
+  const s = byK[other];
+  const unit = e.kind === "wire" ? "files calling over HTTP" : "files referencing";
+  return `<button class="rel ${e.kind}" data-go="${other}">
+    <span class="kk">${other}</span><span>${s ? s.n : other}</span>
+    <span class="w">${dir} ${e.w} ${unit}</span></button>`;
+}
+
+function panelFor(k) {
+  const s = byK[k], a = s.ann, dist = D.find(d => d.id === s.d);
+  const out = outOf(k), inn = inTo(k);
+  let body = "";
+
+  if (tab === "what") body = `<p>${a.what || "&mdash;"}</p>` + (dist.blurb ? `<p style="color:var(--ink-3)">${dist.blurb}</p>` : "");
+  else if (tab === "built") body = a.built ? `<p>${a.built}</p>`
+    : `<p style="color:var(--ink-3)">No implementation note recorded. The measured figures above are still exact.</p>`;
+  else if (tab === "rel") {
+    body = `<div class="sect">Depends on &mdash; ${out.length}</div>` +
+      (out.length ? out.map(e => relRow(e, e.to, "&rarr;")).join("")
+        : `<div class="clean">Depends on nothing measured here.</div>`) +
+      `<div class="sect">Depended on by &mdash; ${inn.length}</div>` +
+      (inn.length ? inn.map(e => relRow(e, e.from, "&larr;")).join("")
+        : `<div class="clean">Nothing measured here depends on it.</div>`) +
+      `<p style="margin-top:16px;font-size:12px;color:var(--ink-3)">A weight is the number of <b>files</b> on one
+       side that reference the other, counted from <code>use crate::</code> and <code>import</code> statements.
+       A <b>dashed</b> link is an HTTP or WebSocket call &mdash; not a link-time dependency, which is exactly
+       why the agent surface can be replaced without rebuilding the kernel.</p>`;
+  }
+  else if (tab === "files") {
+    const fs = filesOf(k).slice(0, 400);
+    body = `<div style="display:flex;gap:8px;margin-bottom:12px">
+        <button onclick="window.__go('${k}')" style="flex:1">&rarr; Walk inside (${fs.length} files)</button></div>
+      <div class="sect">Files by size</div>` +
+      fs.map(f => `<button class="rel" data-file="${esc(f.p)}">
+        <span>${esc(f.p.split("/").pop())}</span>
+        <span class="w">${nf(f.loc)} ln &middot; ${f.c}c</span></button>`).join("");
+  }
+  else if (tab === "cond") {
+    body = (s.cond.length || s.ok.length)
+      ? s.cond.map(c => `<div class="cond"><span class="tag">${c[0]}</span><p>${c[1]}</p></div>`).join("")
+        + s.ok.map(c => `<div class="cond by-design"><span class="tag">${c[0]} &mdash; by design</span><p>${c[1]}</p></div>`).join("")
+      : `<div class="clean">No open ceiling recorded for this structure at <b>${PLAN.meta.commit}</b>.
+         That is an absence of pinned defects, not a proof of correctness.</div>`;
+  }
+  else if (tab === "data") body = dataTab();
+
+  return `<div class="eyebrow">${dist.n} &middot; ${k}</div>
+    <h2>${s.n}</h2><code class="path">${s.path}</code>
+    <div class="metrics">
+      <div><i>Lines</i><b>${nf(s.loc)}</b></div><div><i>Files</i><b>${nf(s.files)}</b></div>
+      <div><i>Commits</i><b>${nf(s.churn)}</b></div><div><i>Tests</i><b>${nf(s.tests)}</b></div>
+    </div>${body}`;
+}
+
+function panelForFile(path) {
+  const f = F.find(x => x.p === path); if (!f) return intro();
+  const s = byK[f.k];
+  const refs = f.r.map(r => `<code>${esc(r)}</code>`).join(" ");
+  return `<div class="eyebrow">${s.n} &middot; file</div>
+    <h2 style="font-size:16px;font-family:'IBM Plex Mono',monospace">${esc(f.p.split("/").pop())}</h2>
+    <code class="path">${esc(f.p)}</code>
+    <div class="metrics">
+      <div><i>Lines</i><b>${nf(f.loc)}</b></div><div><i>Commits</i><b>${nf(f.c)}</b></div>
+      <div><i>Tests</i><b>${nf(f.t)}</b></div><div><i>Reaches</i><b>${f.r.length}</b></div>
+    </div>
+    <div class="sect">What it reaches for</div>
+    ${refs ? `<p>${refs}</p><p style="font-size:12px;color:var(--ink-3)">Modules this file names in
+      its <code>use</code>/<code>import</code> statements. Rust edges are module-level: the module tree
+      is not the file tree, so a file-to-file arrow would be a guess.</p>`
+      : `<div class="clean">Reaches for nothing outside itself.</div>`}
+    <div class="sect">Where it sits</div>
+    <button class="rel" data-go="${f.k}"><span class="kk">${f.k}</span><span>${s.n}</span>
+      <span class="w">${nf(s.files)} files</span></button>`;
+}
+
+function dataTab() {
+  return `<div class="sect">This plan is generated</div>
+    <p>Nothing here is hand-entered. A generator walks the working tree, counts lines, reads
+      <code>git log</code> for churn, and parses every <code>use</code> and <code>import</code>
+      statement into the links you can see. Re-run it and the plan is current.</p>
+    <div class="sect">For agents</div>
+    <p>The complete dataset is embedded in this page as JSON, unmodified generator output.
+      Fetch the page and read it directly &mdash; no DOM scraping:</p>
+    <pre>const html = await (await fetch(URL)).text();
+const json = html.match(
+  /id="roshera-plan"[^&gt;]*&gt;([\\s\\S]*?)&lt;\\/script&gt;/)[1];
+const plan = JSON.parse(json);
+
+plan.meta        // commit, totals, caveats
+plan.districts   // 7
+plan.structures  // ${S.length}: loc, files, churn, tests
+plan.edges       // ${E.length}: {from, to, w, kind}
+plan.files       // ${F.length}: {p, k, loc, c, t, r[]}</pre>
+    <p style="font-size:12px;color:var(--ink-3)">In a browser context it is also on
+      <code>window.__ROSHERA_PLAN__</code>.</p>
+    <div class="sect">What the numbers do not say</div>
+    ${PLAN.meta.caveats.map(c => `<div class="cond by-design" style="border-left-color:var(--amber)">
+      <p style="font-size:12.5px">${c}</p></div>`).join("")}`;
+}
+
+function intro() {
+  const t = PLAN.meta.totals;
+  return `<div class="eyebrow">Roshera</div>
+    <h2>An agent runtime for geometry</h2>
+    <div class="metrics" style="margin-top:12px">
+      <div><i>Lines</i><b>${nf(t.loc)}</b></div><div><i>Files</i><b>${nf(t.files)}</b></div>
+      <div><i>Structures</i><b>${t.structures}</b></div><div><i>Links</i><b>${E.length}</b></div>
+    </div>
+    <p>Every figure is measured from the working tree at <b>${PLAN.meta.commit}</b>. Footprint is
+      file count, height is lines of code on a compressed scale, hatch density is how many commits
+      have ever touched that code, and the lines between structures are real
+      <code>use</code> and <code>import</code> statements &mdash; not an architecture diagram
+      somebody drew.</p>
+    <div class="sect">How to read the kernel</div>
+    <p>The kernel is laid out in <b>rings by dependency depth</b>, not by taste.
+      <b>C</b>&nbsp;exact predicates and <b>B</b>&nbsp;B-Rep topology sit at the centre because
+      everything stands on them &mdash; 41 of the 44 files in booleans reference topology, and
+      39 reference the predicates. The outer ring depends inward and almost nothing depends back out.</p>
+    <div class="sect">Why the red flags</div>
+    <p>Structures carrying a recorded ceiling are marked. A kernel whose whole claim is that it
+      <b>cannot lie</b> does not get to be vague about where it stops, so the same registry that
+      pins those defects in the test suite is what this plan is drawn from.</p>
+    <p style="font-size:12.5px;color:var(--ink-3)">Click any structure, then <b>Inside</b> to walk
+      its files, or <b>Links</b> to see what it uses and what uses it.</p>`;
+}
+
+function render() {
+  pbody.innerHTML = level === "inside" && sel && sel.includes("/") ? panelForFile(sel)
+    : sel && byK[sel] ? panelFor(sel)
+    : level === "inside" ? panelFor(inside)
+    : tab === "data" ? `<div class="eyebrow">Roshera</div><h2>The dataset</h2>${dataTab()}`
+    : intro();
+
+  pbody.querySelectorAll("[data-go]").forEach(b =>
+    b.addEventListener("click", () => { pick(b.dataset.go); }));
+  pbody.querySelectorAll("[data-file]").forEach(b =>
+    b.addEventListener("click", () => { goInside(byK[sel] ? sel : inside); sel = b.dataset.file; render(); }));
+
+  buildIndex(); crumb(); draw();
+}
+window.__go = goInside;
+
+// ── index ────────────────────────────────────────────────────────────────
+const index = document.getElementById("index");
+function buildIndex() {
+  index.textContent = "";
+  if (level === "inside") {
+    const s = byK[inside];
+    const back = document.createElement("button");
+    back.className = "grp"; back.innerHTML = "&larr; Back to the plan";
+    back.addEventListener("click", goOut); index.appendChild(back);
+    const h = document.createElement("div");
+    h.className = "grp"; h.style.cursor = "default";
+    h.innerHTML = `${s.n} &mdash; ${s.files} files`;
+    index.appendChild(h);
+    for (const f of filesOf(inside)) {
+      const r = document.createElement("button");
+      r.className = "row file" + (sel === f.p ? " on" : "");
+      r.innerHTML = `<span class="k">&middot;</span><span>${esc(f.p.split("/").pop())}</span>
+        <span class="f">${nf(f.loc)}</span>`;
+      r.addEventListener("click", () => { sel = f.p; render(); });
+      r.addEventListener("mouseenter", () => { hot = f.p; draw(); });
+      r.addEventListener("mouseleave", () => { hot = null; draw(); });
+      index.appendChild(r);
+    }
+    return;
+  }
+  for (const d of D) {
+    const h = document.createElement("button");
+    h.className = "grp" + (iso === d.id ? " iso" : "");
+    h.innerHTML = `${d.n} ${iso === d.id ? "&nbsp;&#9679; only" : ""}`;
+    h.addEventListener("click", () => { iso = iso === d.id ? null : d.id; render(); });
+    index.appendChild(h);
+    for (const s of S.filter(x => x.d === d.id)) {
+      const r = document.createElement("button");
+      r.className = "row" + (sel === s.k ? " on" : "") + ((iso && iso !== d.id) ? " dim" : "");
+      r.innerHTML = `<span class="k">${s.k}</span><span>${s.n}</span>
+        <span class="f ${s.cond.length ? "red" : ""}">${s.cond.length ? s.cond.length + "&#9873;" : Math.round(s.loc/1000)+"k"}</span>`;
+      r.addEventListener("click", () => pick(s.k));
+      r.addEventListener("mouseenter", () => { hot = s.k; draw(); });
+      r.addEventListener("mouseleave", () => { hot = null; draw(); });
+      index.appendChild(r);
+    }
+  }
+}
+
+function crumb() {
+  const c = document.getElementById("crumb");
+  if (level === "inside") {
+    c.innerHTML = `<button id="cb">&larr; Out</button><span>Plan /</span>
+      <b>${byK[inside].n}</b><span>&middot; ${byK[inside].files} files</span>`;
+    document.getElementById("cb").addEventListener("click", goOut);
+  } else {
+    c.innerHTML = `<b>Ground plan</b><span>&middot; ${S.length} structures &middot; ${E.length} links</span>`;
+  }
+}
+
+// ── legend ───────────────────────────────────────────────────────────────
+function legend() {
+  document.getElementById("legend").innerHTML = `<b>HOW TO READ IT</b><br>
+    Footprint &rarr; ${level === "inside" ? "modules the file reaches for" : "file count"}
+    &middot; Height &rarr; lines <span style="color:var(--ink-3)">(compressed, loc<sup>0.55</sup>)</span><br>
+    <svg width="152" height="14" aria-hidden="true">${[0,1,2,3,4].map((i,n)=>
+      `<rect x="${n*30}" y="0" width="26" height="13" fill="url(#h${i})" stroke="var(--ink-2)" stroke-width=".7"/>`).join("")}</svg>
+    hatch &rarr; commits, quiet &rarr; hot
+    <div class="kk">
+      <span style="color:var(--blue)"><i></i><b style="color:var(--ink)">this uses that</b></span>
+      <span style="color:var(--ink-2)"><i></i><b style="color:var(--ink)">that uses this</b></span>
+      <span style="color:var(--blue)"><i class="dash"></i><b style="color:var(--ink)">over the wire &mdash; no link-time coupling</b></span>
+      <span style="color:var(--redline)"><i class="sq"></i><b style="color:var(--ink)">recorded ceiling</b></span>
+    </div>`;
+}
+
+// ── controls ─────────────────────────────────────────────────────────────
+document.querySelectorAll(".tabs button").forEach(t => t.addEventListener("click", () => {
+  document.querySelectorAll(".tabs button").forEach(o => o.setAttribute("aria-selected","false"));
+  t.setAttribute("aria-selected","true"); tab = t.dataset.tab; render();
+}));
+document.getElementById("btn-wire").addEventListener("click", e => {
+  wire = !wire; e.currentTarget.setAttribute("aria-pressed", wire); draw(); });
+document.getElementById("btn-rot").addEventListener("click", () => { view.rot = (view.rot+1)%4; fitView(); draw(); });
+document.getElementById("btn-in").addEventListener("click", () => { view.zoom = Math.min(3.2, view.zoom*1.25); draw(); });
+document.getElementById("btn-out").addEventListener("click", () => { view.zoom = Math.max(.28, view.zoom/1.25); draw(); });
+document.getElementById("btn-reset").addEventListener("click", () => {
+  view.rot = 0; sel = null; iso = null; level = "plan"; inside = null;
+  tab = "what"; flowOn = false; flowStep = -1; clearInterval(flowTimer);
+  fitView();
+  document.getElementById("btn-flow").innerHTML = "&#9654; Run the flow";
+  document.querySelectorAll(".tabs button").forEach((o,i) => o.setAttribute("aria-selected", i===0?"true":"false"));
+  render();
+});
+document.getElementById("btn-flow").addEventListener("click", e => {
+  flowOn = !flowOn; e.currentTarget.setAttribute("aria-pressed", flowOn);
+  e.currentTarget.innerHTML = flowOn ? "&#9632; Stop" : "&#9654; Run the flow";
+  clearInterval(flowTimer);
+  if (flowOn) { level = "plan"; inside = null; flowStep = 0; stepTo(0);
+    flowTimer = setInterval(() => stepTo(++flowStep), 2200); }
+  else { flowStep = -1; draw(); }
+});
+function stepTo(i) {
+  const [k, say] = FLOW[i % FLOW.length];
+  sel = k; tab = "what"; render();
+  pbody.insertAdjacentHTML("afterbegin",
+    `<div style="border:1px solid var(--blue);border-left-width:3px;padding:7px 10px;margin-bottom:14px">
+      <span class="eyebrow" style="color:var(--blue)">Step ${(i%FLOW.length)+1} of ${FLOW.length}</span>
+      <div style="font-size:13px;margin-top:2px">${say}</div></div>`);
+}
+
+let dragging = false, last = null, moved = false;
+stage.addEventListener("pointerdown", e => { dragging = true; moved = false;
+  last = [e.clientX, e.clientY]; stage.classList.add("drag"); stage.setPointerCapture(e.pointerId); });
+stage.addEventListener("pointermove", e => { if (!dragging) return;
+  const dx = e.clientX-last[0], dy = e.clientY-last[1];
+  if (Math.abs(dx)+Math.abs(dy) > 3) moved = true;
+  view.px += dx/view.zoom; view.py += dy/view.zoom; last = [e.clientX,e.clientY]; draw(); });
+stage.addEventListener("pointerup", () => { dragging = false; stage.classList.remove("drag"); });
+stage.addEventListener("wheel", e => { e.preventDefault();
+  view.zoom = Math.max(.28, Math.min(3.2, view.zoom * (e.deltaY>0?.92:1.08))); draw(); }, { passive:false });
+stage.addEventListener("click", () => { if (!moved && level === "plan") { sel = null; render(); } });
+window.addEventListener("resize", () => { fitView(); draw(); });
+window.addEventListener("keydown", e => {
+  if (e.key === "Escape" && level === "inside") goOut();
+  if (e.key === "Enter" && level === "plan" && sel && byK[sel]) goInside(sel);
+});
+
+// ── boot ─────────────────────────────────────────────────────────────────
+document.getElementById("rev").textContent = `rev ${PLAN.meta.commit} · ${PLAN.meta.generated}`;
+document.getElementById("rev2").textContent = PLAN.meta.commit;
+document.getElementById("s-loc").textContent = nf(PLAN.meta.totals.loc);
+document.getElementById("s-files").textContent = nf(PLAN.meta.totals.files);
+document.getElementById("s-str").textContent = S.length;
+document.getElementById("s-edge").textContent = E.length;
+document.getElementById("s-cond").textContent = S.filter(s => s.cond.length).length;
+render(); fitView(); draw();
+
+</script>
