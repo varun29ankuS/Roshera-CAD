@@ -33,6 +33,30 @@
      screen looked cluttered before a single element was misplaced. Ink is for
      type; boxes get a hairline. The old value survives as --border-strong for
      the few things that genuinely want a drawn edge. */
+  /* ── Trust semantics ───────────────────────────────────────────────
+     Colour here means STATE and nothing else. These are deliberately not
+     the selection accent: selection describes the HUMAN's attention, these
+     describe the MACHINE's verdict, and they must be able to coexist on one
+     row. The governing rule where they collide: selection always takes the
+     FILL, the verdict always keeps its glyph. */
+  --positive: oklch(0.52 0.12 152);
+  --positive-dot: oklch(0.70 0.16 150);
+  --positive-wash: oklch(0.94 0.025 150);
+  --positive-border: oklch(0.80 0.07 152);
+
+  /* Caution sits at H75, next door to the H60 selection accent, so it is
+     separated by ROLE rather than by hue: caution is never a fill and always
+     travels with its glyph. */
+  --caution: oklch(0.52 0.11 75);
+  --caution-border: oklch(0.82 0.08 78);
+  --caution-wash: oklch(0.95 0.035 85);
+
+  --negative-wash: oklch(0.95 0.02 25);
+  --negative-border: oklch(0.80 0.08 25);
+
+  /* Selection needs a wash for list rows, not only a geometry highlight. */
+  --cad-selected-wash: oklch(0.65 0.18 60 / 0.16);
+
   --border: oklch(0.88 0.015 252);
   --border-strong: oklch(0.55 0.08 252);
   --input: oklch(0.85 0.03 252);
@@ -97,6 +121,21 @@
   --destructive-foreground: oklch(0.97 0.012 90);
   /* Same split on the dark ground: a hairline that separates without drawing
      attention, and the old weight kept for edges that must be seen. */
+  /* Trust semantics on the dark ground — same roles, lifted for contrast. */
+  --positive: oklch(0.74 0.13 152);
+  --positive-dot: oklch(0.72 0.16 150);
+  --positive-wash: oklch(0.26 0.04 152);
+  --positive-border: oklch(0.40 0.07 152);
+
+  --caution: oklch(0.78 0.12 78);
+  --caution-border: oklch(0.44 0.08 78);
+  --caution-wash: oklch(0.28 0.05 80);
+
+  --negative-wash: oklch(0.27 0.05 25);
+  --negative-border: oklch(0.45 0.10 25);
+
+  --cad-selected-wash: oklch(0.72 0.17 70 / 0.20);
+
   --border: oklch(0.34 0 0);
   --border-strong: oklch(0.55 0 0);
   --input: oklch(0.28 0.060 252);
@@ -157,6 +196,15 @@
   --color-destructive-foreground: var(--destructive-foreground);
   --color-border: var(--border);
   --color-border-strong: var(--border-strong);
+  --color-positive: var(--positive);
+  --color-positive-dot: var(--positive-dot);
+  --color-positive-wash: var(--positive-wash);
+  --color-positive-border: var(--positive-border);
+  --color-caution: var(--caution);
+  --color-caution-border: var(--caution-border);
+  --color-caution-wash: var(--caution-wash);
+  --color-negative-wash: var(--negative-wash);
+  --color-negative-border: var(--negative-border);
   --color-input: var(--input);
   --color-ring: var(--ring);
   --color-chart-1: var(--chart-1);

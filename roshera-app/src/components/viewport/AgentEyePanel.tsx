@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import { StatusPill, TabChip } from '@/components/ui/status-pill'
 
 const API_HOST = import.meta.env.VITE_API_URL || ''
 
@@ -191,12 +192,9 @@ export function AgentEyePanel() {
       <div className="flex items-center justify-between border-b border-border px-2 py-1.5">
         <div className="flex items-center gap-1.5 text-xs font-semibold">
           <span>👁 Agent Eye</span>
-          <span
-            className={`inline-block h-1.5 w-1.5 rounded-full ${
-              live ? 'animate-pulse bg-green-500' : 'bg-muted-foreground'
-            }`}
-          />
-          <span className="text-[10px] text-muted-foreground">{live ? 'LIVE' : 'paused'}</span>
+          {/* Liveness is a verdict about the machine, so it wears the one
+              status grammar rather than a bespoke dot-and-word pair. */}
+          <StatusPill tone={live ? 'positive' : 'neutral'} label={live ? 'LIVE' : 'paused'} />
         </div>
         <div className="flex items-center gap-1">
           <button
@@ -227,14 +225,11 @@ export function AgentEyePanel() {
           or the whole-scene composite when no id is given). */}
       <div className="flex border-b border-border">
         {(['part', 'assembly'] as Scope[]).map((s) => (
-          <button
+          <TabChip
             key={s}
+            selected={scope === s}
             onClick={() => setScope(s)}
-            className={`flex-1 px-2 py-1 text-[10px] font-medium capitalize ${
-              scope === s
-                ? 'bg-primary text-primary-foreground'
-                : 'text-muted-foreground hover:bg-accent'
-            }`}
+            className="flex-1 rounded-none border-0 px-2 py-1 text-[10px] font-medium capitalize"
             title={
               s === 'part'
                 ? 'Show the newest part on its own'
@@ -242,7 +237,7 @@ export function AgentEyePanel() {
             }
           >
             {s}
-          </button>
+          </TabChip>
         ))}
       </div>
 
