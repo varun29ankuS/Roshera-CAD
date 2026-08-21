@@ -990,6 +990,15 @@ pub struct FeatureNode {
     pub children: Vec<FeatureNode>,
 }
 
+/// How many of a branch's most recent events the feature tree describes.
+///
+/// A cap exists because the tree is rebuilt per request and a branch is
+/// unbounded; it sits at the RECENT end because the tree's job is to describe
+/// the model that exists now. A consequence worth knowing when reading
+/// `FeatureNode::parent_event_id`: an operation whose producer fell before the
+/// window has no in-window parent and renders as a root.
+const FEATURE_TREE_WINDOW: usize = 100;
+
 /// `GET /api/feature-tree/{branch_id}` — derived hierarchy of the
 /// branch's recorded operations.
 ///
@@ -1005,9 +1014,23 @@ pub async fn get_feature_tree(
     let timeline = state.timeline.read().await;
     let branch_id = resolve_branch_ref(&branch_id)?;
 
-    let events = timeline
-        .get_branch_events(&branch_id, Some(0), Some(100))
+    // THE WINDOW IS THE RECENT END OF THE BRANCH, not the start of it.
+    //
+    // This was `Some(0), Some(100)` — the FIRST hundred events, fixed. A
+    // feature tree describes the model as it stands, so on any branch longer
+    // than the window it described a model that no longer exists: a 213-event
+    // branch rendered events 0..=99 and nothing after, permanently, so work
+    // done in this session could not appear in it at all.
+    //
+    // Counted by fetching the branch and taking its tail, which is what the
+    // branch-summary handler already does for `event_count` — there is no
+    // cheaper count on `Timeline`, and doing it twice would cost more than
+    // doing it once.
+    let all = timeline
+        .get_branch_events(&branch_id, None, None)
         .map_err(|_| StatusCode::NOT_FOUND)?;
+    let skipped = all.len().saturating_sub(FEATURE_TREE_WINDOW);
+    let events: Vec<_> = all.into_iter().skip(skipped).collect();
 
     let paired: Vec<(EventSummary, Lineage)> = events
         .into_iter()
