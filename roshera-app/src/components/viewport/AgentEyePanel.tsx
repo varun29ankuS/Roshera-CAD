@@ -174,7 +174,7 @@ export function AgentEyePanel() {
     return (
       <button
         onClick={() => setMinimized(false)}
-        className="absolute bottom-2 right-2 z-20 rounded-md border border-border bg-background/90 px-3 py-1.5 text-xs font-medium shadow-md backdrop-blur hover:bg-accent"
+        className="absolute bottom-2 right-2 z-20 rounded-md border border-border bg-card px-3 py-1.5 text-xs font-medium shadow-md hover:bg-accent"
         title="Open the agent-eye view"
       >
         👁 Agent Eye
@@ -187,7 +187,7 @@ export function AgentEyePanel() {
     isSceneScope ? SCENE_MODES : (['shaded', 'diagnostic', 'ids', 'dim', 'section'] as RenderMode[])
 
   return (
-    <div className="absolute bottom-2 right-2 z-20 w-[208px] overflow-hidden rounded-md border border-border bg-background/95 shadow-lg backdrop-blur">
+    <div className="absolute bottom-2 right-2 z-20 w-[208px] overflow-hidden rounded-md border border-border bg-card shadow-lg">
       <div className="flex items-center justify-between border-b border-border px-2 py-1.5">
         <div className="flex items-center gap-1.5 text-xs font-semibold">
           <span>👁 Agent Eye</span>

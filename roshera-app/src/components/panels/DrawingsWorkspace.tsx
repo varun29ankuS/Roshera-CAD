@@ -866,7 +866,7 @@ export function DrawingsWorkspace() {
                 so the user can rescue the view if the sheet renders
                 off-screen at native physical size. */}
             {activeDrawing && (
-              <div className="absolute bottom-3 right-3 flex items-center gap-0.5 bg-background/95 backdrop-blur border border-border rounded-md shadow-md px-1 py-1 select-none">
+              <div className="absolute bottom-3 right-3 flex items-center gap-0.5 bg-card border border-border rounded-md shadow-md px-1 py-1 select-none">
                 <button
                   type="button"
                   onClick={zoomOut}

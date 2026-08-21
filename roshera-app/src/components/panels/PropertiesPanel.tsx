@@ -44,7 +44,7 @@ export function PropertiesPanel() {
   const ag = obj.analyticalGeometry
 
   return (
-    <div className="w-56 border-l border-border bg-card/80 backdrop-blur-sm flex flex-col min-h-0 overflow-hidden">
+    <div className="w-56 border-l border-border bg-card flex flex-col min-h-0 overflow-hidden">
       <div className="cad-panel-header">Properties</div>
 
       <ScrollArea className="flex-1 min-h-0">

@@ -368,7 +368,7 @@ export function Blackboard() {
     // covered the entire tree. The tree was not unreadable — it was hidden,
     // and every judgement about "the tree" was really about four datum rows.
     // 15.5rem = the rail's right edge plus a gutter.
-    <div className="absolute bottom-8 left-[15.5rem] z-20 w-[50rem] max-w-[calc(100vw-17rem)] flex flex-col rounded-xl overflow-hidden bg-background/35 backdrop-blur-md border border-border/60">
+    <div className="absolute bottom-8 left-[15.5rem] z-20 w-[50rem] max-w-[calc(100vw-17rem)] flex flex-col rounded-xl overflow-hidden bg-card border border-border">
       {/* Resize grip — a drag here overrides the attention-following split
           and STICKS until released (double-click, or the "auto" chip). */}
       <div

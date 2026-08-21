@@ -1007,7 +1007,7 @@ export function ModelTree({
           control is hidden because there's no body for it to drive. */}
       <div
         className={cn(
-          'cad-panel-header flex items-center gap-1.5 font-mono border border-border rounded shadow-md backdrop-blur-sm w-full',
+          'cad-panel-header flex items-center gap-1.5 font-mono border border-border rounded shadow-md w-full',
           expanded ? 'bg-card/95' : 'bg-muted/95',
         )}
       >

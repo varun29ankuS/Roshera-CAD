@@ -557,7 +557,7 @@ export function ModifyDialog({ open, mode, onOpenChange, onApply }: ModifyDialog
       aria-label={`${spec.title} settings`}
       // Top-left, just under the menubar. Non-modal, so no backdrop —
       // user can still pan/orbit + pick edges in the canvas.
-      className="fixed left-4 top-20 z-40 w-[280px] select-none rounded-lg border border-border bg-card/95 shadow-xl backdrop-blur"
+      className="fixed left-4 top-20 z-40 w-[280px] select-none rounded-lg border border-border bg-card shadow-xl"
     >
       {/* Header */}
       <div className="flex items-center justify-between border-b border-border px-3 py-2">

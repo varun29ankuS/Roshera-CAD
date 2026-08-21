@@ -282,12 +282,13 @@ export function ExpandableProse({
           'relative',
           overflows &&
             !expanded &&
-            // The cut is faded by masking the CONTENT to transparent, not by
-            // laying an opaque gradient over it. The panel is
-            // `bg-background/35 backdrop-blur-md` — translucent over the live
-            // viewport — so a `from-background` overlay is a solid block of
-            // the wrong colour and reads as a grey bar, which is what this
-            // measured as before the mask.
+            // The cut is faded by masking the CONTENT to transparent, not
+            // by laying an opaque gradient over it. A `from-background`
+            // overlay is a solid block of the wrong colour against the
+            // panel's `bg-card` and reads as a grey bar, which is what this
+            // measured as before the mask. (The panel used to be translucent
+            // over the live viewport, which was the original reason; it is
+            // opaque now and the mask is still the right mechanism.)
             'max-h-80 overflow-hidden [mask-image:linear-gradient(to_bottom,black_calc(100%-3.5rem),transparent)] [-webkit-mask-image:linear-gradient(to_bottom,black_calc(100%-3.5rem),transparent)]',
         )}
       >

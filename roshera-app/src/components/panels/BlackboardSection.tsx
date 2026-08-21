@@ -89,7 +89,7 @@ export function BlackboardSection({
         aria-expanded={!collapsed}
         className={cn(
           'sticky top-0 z-10 flex w-full items-center gap-1.5 px-3 py-1',
-          'bg-background/80 backdrop-blur-sm border-b border-white/5',
+          'bg-card border-b border-border',
           'text-left text-[11px] font-medium text-foreground/80 hover:text-foreground transition-colors',
         )}
       >
