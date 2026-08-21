@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useMemo } from 'react'
 import { Eye, EyeOff, Trash2, Pencil, Plus, FileText } from 'lucide-react'
 import {
   ContextMenu,
@@ -541,6 +541,149 @@ function buildLocalNode(
   }
 }
 
+
+// ─── Solid classification (what KIND of thing is this row?) ─────────
+//
+// The rail listed every solid with an identical bullet, so a part, a
+// cutter body and the result of a boolean were indistinguishable at a
+// glance — the founder's complaint, twice: "i cannot make out with one
+// look which is the part, which is an assembly, which is an operation
+// within a part".
+//
+// Two facts the kernel now reports per solid answer it without any
+// hierarchy: `named` (was the name CHOSEN, or generated) and `role`
+// (`derived` means it came out of a boolean, which consumes its
+// operands — so a live `primitive` was combined into nothing).
+
+export type SolidClass = 'part' | 'result' | 'unnamed'
+
+interface AgentPart {
+  id: number
+  name: string
+  named: boolean
+  role: 'primitive' | 'derived'
+  anchor_datum_id: number
+  anchor_datum_name: string
+  location_oneliner: string
+}
+
+interface Section {
+  key: SolidClass
+  label: string
+  nodes: TreeNode[]
+  defaultOpen: boolean
+}
+
+/** `GET /api/agent/parts`, keyed by kernel solid id.
+ *
+ *  Starts empty and STAYS empty on failure: a dead endpoint must degrade
+ *  every row to `unnamed`, never blank the tree. */
+function useAgentParts(): Map<number, AgentPart> {
+  const [parts, setParts] = useState<Map<number, AgentPart>>(() => new Map())
+  useEffect(() => {
+    const controller = new AbortController()
+    fetch(`${API_BASE}/api/agent/parts`, { signal: controller.signal })
+      .then((res) => {
+        if (!res.ok) throw new Error(`GET /api/agent/parts -> ${res.status}`)
+        return res.json() as Promise<AgentPart[]>
+      })
+      .then((rows) => {
+        const next = new Map<number, AgentPart>()
+        for (const row of rows) next.set(row.id, row)
+        setParts(next)
+      })
+      .catch(() => {
+        /* aborted or failed — keep the empty map and keep rendering */
+      })
+    return () => controller.abort()
+  }, [])
+  return parts
+}
+
+/** Names the SERVER invented before it stopped doing so.
+ *
+ *  `create_cylinder`/`box`/`cone` used to persist `format!("Cylinder {id}")`
+ *  when the caller supplied no name, which made an invented name
+ *  indistinguishable from a chosen one. That is fixed at the source, but the
+ *  fix is NOT retroactive: solids created before it still carry the invented
+ *  string and report `named: true`, so they file under PARTS and crowd out the
+ *  bodies somebody actually named.
+ *
+ *  DELETE THIS once those rows are migrated. It is a display-level stopgap for
+ *  a known, finite, shrinking set — not a naming convention, and nothing else
+ *  should ever depend on the shape of a name. */
+const SERVER_INVENTED_NAME = /^(Cylinder|Box|Sphere|Cone) \d+$/
+
+/** An UNJOINED solid classifies as `unnamed`, never as `part`. A row we
+ *  could not measure must not be promoted to the section that means
+ *  "this is a finished thing". */
+function classifySolid(part: AgentPart | undefined): SolidClass {
+  if (part === undefined) return 'unnamed'
+  const chosen = part.named && !SERVER_INVENTED_NAME.test(part.name)
+  if (chosen && part.role === 'primitive') return 'part'
+  if (part.role === 'derived') return 'result'
+  return 'unnamed'
+}
+
+/** Shape carries ROLE, fill carries PROVENANCE, so the glyph column is
+ *  the answer column when scanning straight down the rail. */
+function symbolForClass(cls: SolidClass, named: boolean): string {
+  if (cls === 'part') return '◆'
+  if (cls === 'result') return named ? '◈' : '◇'
+  return '◌'
+}
+
+function groupIntoSections(
+  nodes: TreeNode[],
+  parts: Map<number, AgentPart>,
+  solidIdOf: (n: TreeNode) => number | undefined,
+): Section[] {
+  const buckets: Record<SolidClass, TreeNode[]> = { part: [], result: [], unnamed: [] }
+  for (const node of nodes) {
+    const solidId = solidIdOf(node)
+    const part = solidId === undefined ? undefined : parts.get(solidId)
+    const cls = classifySolid(part)
+    const chosen = part !== undefined && part.named && !SERVER_INVENTED_NAME.test(part.name)
+    buckets[cls].push({ ...node, symbol: symbolForClass(cls, chosen) })
+  }
+
+  // A missing id sinks to the END of a descending sort: "newest" is
+  // unknowable for a solid that was never measured, so it must not
+  // outrank one that was.
+  const rankId = (n: TreeNode): number => solidIdOf(n) ?? Number.NEGATIVE_INFINITY
+  const byName = (a: TreeNode, b: TreeNode): number =>
+    a.name.toLowerCase().localeCompare(b.name.toLowerCase())
+  const isNamed = (n: TreeNode): boolean => {
+    const id = solidIdOf(n)
+    const p = id === undefined ? undefined : parts.get(id)
+    return p !== undefined && p.named && !SERVER_INVENTED_NAME.test(p.name)
+  }
+
+  const sections: Section[] = []
+  if (buckets.part.length > 0) {
+    // Alphabetical: you are looking for a body you already know the name of.
+    buckets.part.sort(byName)
+    sections.push({ key: 'part', label: 'PARTS', nodes: buckets.part, defaultOpen: true })
+  }
+  if (buckets.result.length > 0) {
+    buckets.result.sort((a, b) => {
+      const na = isNamed(a)
+      const nb = isNamed(b)
+      if (na !== nb) return na ? -1 : 1
+      if (na && nb) return byName(a, b)
+      return rankId(b) - rankId(a)
+    })
+    sections.push({ key: 'result', label: 'RESULTS', nodes: buckets.result, defaultOpen: true })
+  }
+  if (buckets.unnamed.length > 0) {
+    // Newest first: the question this section answers is "what did I just
+    // make that never got a name?"
+    buckets.unnamed.sort((a, b) => rankId(b) - rankId(a))
+    sections.push({ key: 'unnamed', label: 'UNNAMED', nodes: buckets.unnamed, defaultOpen: false })
+  }
+  return sections
+}
+
 // ─── Main panel ─────────────────────────────────────────────────────
 
 interface TreeContextMenuState {
@@ -742,6 +885,33 @@ export function ModelTree({
   const objectNodes = nestSketchesUnderOwners(baseObjectNodes, sketchesByOwnerId)
   const treeNodes = [...datumNodes, ...objectNodes, ...standaloneSketchNodes]
 
+  // Sections over the OBJECT rows only. Datums and standalone sketches keep
+  // their own places; they are already distinguishable and re-sorting them
+  // would move furniture the reader navigates by.
+  const agentParts = useAgentParts()
+  const solidIdOf = useCallback(
+    (n: TreeNode): number | undefined => objects.get(n.id)?.analyticalGeometry?.solidId,
+    [objects],
+  )
+  const sections = useMemo(
+    () => groupIntoSections(objectNodes, agentParts, solidIdOf),
+    // objectNodes is rebuilt every render; key the memo on what it is derived
+    // from instead, so this does not recompute on unrelated state changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [objects, objectOrder, backendNodes, agentParts, solidIdOf],
+  )
+  const [closedSections, setClosedSections] = useState<Set<SolidClass>>(
+    () => new Set<SolidClass>(['unnamed']),
+  )
+  const toggleSection = useCallback((key: SolidClass) => {
+    setClosedSections((prev) => {
+      const next = new Set(prev)
+      if (next.has(key)) next.delete(key)
+      else next.add(key)
+      return next
+    })
+  }, [])
+
   const handleToggleVisibility = useCallback(
     (id: string) => {
       // Datum ids carry the `datum:` prefix; route them back to the
@@ -911,20 +1081,45 @@ export function ModelTree({
             </div>
           ) : (
             <div className="py-1 px-1">
-              {treeNodes.map((node, idx) => (
-                <TreeItem
-                  key={node.id}
-                  node={node}
-                  isLast={idx === treeNodes.length - 1}
-                  ancestorIsLast={[]}
-                  selectedIds={selectedIds}
-                  onSelect={selectObject}
-                  onToggleVisibility={handleToggleVisibility}
-                  onToggleLock={handleToggleLock}
-                  onContextMenu={handleNodeContextMenu}
-                  onAdd={node.id === 'datum:group' ? handleAdd : undefined}
-                />
-              ))}
+              {[
+                { key: null as SolidClass | null, label: null, nodes: datumNodes },
+                ...sections.map((s: Section) => ({ key: s.key as SolidClass | null, label: s.label as string | null, nodes: s.nodes })),
+                { key: null as SolidClass | null, label: null, nodes: standaloneSketchNodes },
+              ].map((group) => {
+                if (group.nodes.length === 0) return null
+                const collapsed = group.key !== null && closedSections.has(group.key)
+                return (
+                  <div key={group.label ?? `plain-${group.nodes[0]?.id ?? 'x'}`}>
+                    {group.label !== null && group.key !== null && (
+                      <button
+                        type="button"
+                        onClick={() => toggleSection(group.key as SolidClass)}
+                        className="w-full flex items-center gap-1.5 px-1 pt-2 pb-0.5 text-[9px] font-mono uppercase tracking-[0.14em] text-muted-foreground/55 hover:text-muted-foreground transition-colors"
+                        aria-expanded={!collapsed}
+                      >
+                        <span className="w-2 text-[8px]">{collapsed ? '▸' : '▾'}</span>
+                        <span>{group.label}</span>
+                        <span className="text-muted-foreground/35">{group.nodes.length}</span>
+                      </button>
+                    )}
+                    {!collapsed &&
+                      group.nodes.map((node: TreeNode, idx: number) => (
+                        <TreeItem
+                          key={node.id}
+                          node={node}
+                          isLast={idx === group.nodes.length - 1}
+                          ancestorIsLast={[]}
+                          selectedIds={selectedIds}
+                          onSelect={selectObject}
+                          onToggleVisibility={handleToggleVisibility}
+                          onToggleLock={handleToggleLock}
+                          onContextMenu={handleNodeContextMenu}
+                          onAdd={node.id === 'datum:group' ? handleAdd : undefined}
+                        />
+                      ))}
+                  </div>
+                )
+              })}
             </div>
           )}
         </ScrollArea>
