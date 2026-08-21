@@ -98,8 +98,22 @@ const WIRE = [
 ];
 
 const SOURCE_EXT = new Set([".rs", ".ts", ".tsx", ".mjs", ".js"]);
-const SKIP_DIR = new Set(["node_modules", "target", "dist", ".git", "runs", "build", ".vite"]);
+const SKIP_DIR = new Set(["node_modules", "target", "dist", ".git", "runs", "build", ".vite", ".build"]);
 const MIN_EDGE_WEIGHT = 3;
+/** Test suites that live OUTSIDE any structure's `src` prefix. A structure's
+ *  own `tests` count is inline `#[cfg(test)]`/colocated tests only; a Rust
+ *  crate keeps its integration tests in `<crate>/tests/`, so reading `tests`
+ *  alone under-reports a crate by an order of magnitude and makes a
+ *  well-tested kernel look untested. Counted at suite level because a single
+ *  `tests/` directory covers many structures and splitting it across them
+ *  would be a guess. */
+const TEST_SUITES = [
+  { path: "roshera-backend/geometry-engine/tests", covers: "kernel" },
+  { path: "roshera-backend/api-server/tests",      covers: "server" },
+  { path: "roshera-mcp/test",                      covers: "agent" },
+  { path: "roshera-eval/test",                     covers: "proof" },
+  { path: "roshera-rl/test",                       covers: "agent" },
+];
 const CALLS_SERVER = /fetch\(|axios|new WebSocket|\/api\//;
 
 function walk(dir, out = []) {
@@ -216,6 +230,25 @@ export function extract(root, log = () => {}) {
   }
   for (const f of files) delete f.wire;
 
+  // Counting `#[test]` / `it(` / `test(` is FRAMEWORK-SHAPED and reads ZERO for
+  // a suite of plain assert scripts -- which is exactly what roshera-mcp,
+  // roshera-eval and roshera-rl are (`node test/foo.test.mjs`, no runner).
+  // Reporting only that number made tested packages look untested, and a
+  // reader drew a wrong conclusion from it. `files` is the measure that holds
+  // whatever shape a suite is written in, so the two always travel together.
+  const testSuites = [];
+  for (const suite of TEST_SUITES) {
+    const suiteFiles = walk(join(root, ...suite.path.split("/")));
+    if (suiteFiles.length === 0) continue;
+    let declarations = 0;
+    for (const abs of suiteFiles) {
+      let src = "";
+      try { src = readFileSync(abs, "utf8"); } catch { continue; }
+      declarations += (src.match(/#\[test\]|#\[tokio::test\]|it\(|test\(/g) || []).length;
+    }
+    testSuites.push({ path: suite.path, covers: suite.covers, files: suiteFiles.length, declarations });
+  }
+
   return {
     meta: {
       project: "Roshera",
@@ -233,11 +266,14 @@ export function extract(root, log = () => {}) {
         "Rust reference edges are module-level: Rust's module tree is not the file tree, so a file-to-file edge would be a guess",
         "a use of the geometry-engine CRATE from outside it is attributed to A, the kernel's largest structure — crate-level granularity, not module-level",
         "loc counts every line, including blanks and comments",
+        "a structure's `tests` is INLINE tests under its own src prefix only; out-of-src suites (a Rust crate's tests/ directory, a TS package's test/) are reported separately in `testSuites` and are NOT added to any structure",
+        "test counts are framework-shaped: `declarations` counts #[test]/it()/test(), which reads ZERO for a suite of plain assert scripts run as `node foo.test.mjs` -- read `files` and `assertions` alongside it before concluding anything is untested",
         `reference edges below ${MIN_EDGE_WEIGHT} referencing files are omitted, to keep the plan legible`,
       ],
     },
     districts: DISTRICTS,
     structures,
+    testSuites,
     edges,
     files,
   };
