@@ -1171,7 +1171,7 @@ export function ProviderSettingsButton() {
                             Vite error pasted in as a "key" — before any
                             network call, for either action below. */}
                         {apiKey && implausibleApiKeyReason(apiKey) && (
-                          <p className="text-[10px] text-red-400">
+                          <p className="text-[11px] text-red-400">
                             API key {implausibleApiKeyReason(apiKey)}
                           </p>
                         )}
@@ -1198,7 +1198,7 @@ export function ProviderSettingsButton() {
                           )}
                         </div>
                         <p
-                          className="text-[10px] text-muted-foreground"
+                          className="text-[11px] text-muted-foreground"
                           title="Roshera never claims a key works without checking it live first."
                         >
                           Validated live before it can be saved.
@@ -1242,7 +1242,7 @@ export function ProviderSettingsButton() {
                             </span>
                           )}
                         </div>
-                        <p className="text-[10px] text-muted-foreground">
+                        <p className="text-[11px] text-muted-foreground">
                           Asks the vendor&apos;s own model-listing endpoint what it actually
                           serves — never a stored or guessed list.
                         </p>
@@ -1298,7 +1298,7 @@ export function ProviderSettingsButton() {
                     <div className="flex flex-col gap-1">
                       <label
                         htmlFor="provider-model-select"
-                        className="text-[10px] font-medium text-muted-foreground"
+                        className="text-[11px] font-medium text-muted-foreground"
                       >
                         Model
                       </label>
@@ -1378,7 +1378,7 @@ export function ProviderSettingsButton() {
                           autoComplete="off"
                         />
                       )}
-                      <p className="text-[10px] text-muted-foreground">
+                      <p className="text-[11px] text-muted-foreground">
                         {discoveredModels
                           ? discoveredModels.length > 0
                             ? "The vendor's own model list — not a suggestion."

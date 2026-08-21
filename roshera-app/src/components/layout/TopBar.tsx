@@ -196,7 +196,7 @@ export function TopBar() {
     <div className="flex items-center h-9 cad-panel border-b px-1">
       <div className="flex items-center gap-1.5 px-2">
         <div className="w-4 h-4 rounded-sm bg-primary flex items-center justify-center">
-          <span className="text-[8px] font-bold text-primary-foreground">R</span>
+          <span className="text-[11px] font-bold text-primary-foreground">R</span>
         </div>
         <span className="text-xs font-semibold tracking-tight text-foreground">
           Roshera CAD
@@ -348,7 +348,7 @@ export function TopBar() {
           className="cad-focus inline-flex items-center gap-1.5 h-6 px-2 rounded border border-border/60 bg-background/40 hover:bg-accent/30 text-[11px] text-muted-foreground"
         >
           <span>Commands</span>
-          <kbd className="font-mono text-[10px] text-foreground/80 border border-border/60 rounded px-1">
+          <kbd className="font-mono text-[11px] text-foreground/80 border border-border/60 rounded px-1">
             {typeof navigator !== 'undefined' && /mac/i.test(navigator.platform)
               ? '⌘K'
               : 'Ctrl K'}
@@ -376,7 +376,7 @@ export function TopBar() {
             >
               <span className="text-muted-foreground">Workspace:</span>
               <span className="font-medium">{WORKSPACE_LABELS[docMode]}</span>
-              <span className="text-muted-foreground text-[10px]">▾</span>
+              <span className="text-muted-foreground text-[11px]">▾</span>
             </MenubarTrigger>
             <MenubarContent align="end">
               {WORKSPACE_CHOICES.map((m) => (
@@ -421,7 +421,7 @@ export function TopBar() {
             role="status"
           />
         ) : (
-          <Badge variant="secondary" className="text-[10px] h-4 px-1.5" role="status">
+          <Badge variant="secondary" className="text-[11px] h-4 px-1.5" role="status">
             <span
               className={`inline-block w-1.5 h-1.5 rounded-full mr-1 ${
                 status === 'connecting' ? 'bg-yellow-400 animate-pulse' : 'bg-red-400'

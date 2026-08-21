@@ -334,7 +334,7 @@ export function AssemblyWorkspace() {
         {/* ── Assembly list sidebar ───────────────────────────────── */}
         <aside className="w-72 flex flex-col border-r border-border/60 bg-background/40 overflow-hidden">
           <div className="px-3 py-2 border-b border-border/60">
-            <div className="text-[10px] uppercase tracking-wider text-muted-foreground">
+            <div className="text-[11px] uppercase tracking-wider text-muted-foreground">
               Assemblies
             </div>
           </div>
@@ -406,7 +406,7 @@ export function AssemblyWorkspace() {
               <header className="px-3 py-2 border-b border-border/40 flex items-center justify-between gap-2">
                 <div className="flex flex-col min-w-0">
                   <h2 className="text-sm font-medium truncate">{active.name}</h2>
-                  <span className="text-[10px] uppercase tracking-wider text-muted-foreground">
+                  <span className="text-[11px] uppercase tracking-wider text-muted-foreground">
                     {active.components.length} comp · {active.mates.length} mates
                   </span>
                 </div>
@@ -426,7 +426,7 @@ export function AssemblyWorkspace() {
               <div className="flex-1 min-h-0 overflow-y-auto">
                 <section className="px-3 py-2 border-b border-border/40">
                   <div className="flex items-center justify-between mb-2">
-                    <div className="text-[10px] uppercase tracking-wider text-muted-foreground">
+                    <div className="text-[11px] uppercase tracking-wider text-muted-foreground">
                       Components
                     </div>
                     <button
@@ -461,7 +461,7 @@ export function AssemblyWorkspace() {
 
                 <section className="flex flex-col">
                   <div className="px-3 py-2 border-b border-border/40 flex items-center justify-between">
-                    <div className="text-[10px] uppercase tracking-wider text-muted-foreground">
+                    <div className="text-[11px] uppercase tracking-wider text-muted-foreground">
                       Mates
                     </div>
                     <button
@@ -621,7 +621,7 @@ function ComponentRow({
         <span className="flex-1 truncate font-medium">{component.name}</span>
         <span className="text-muted-foreground">DoF: {component.degrees_of_freedom}</span>
         {component.is_fixed && (
-          <span className="text-[10px] uppercase text-amber-500/80">fixed</span>
+          <span className="text-[11px] uppercase text-amber-500/80">fixed</span>
         )}
         <button
           type="button"
@@ -636,7 +636,7 @@ function ComponentRow({
       {expanded && (
         <div className="ml-6 mb-2 mr-2 space-y-2 px-2 py-2 rounded bg-background/40 border border-border/40">
           <div>
-            <div className="text-[10px] uppercase tracking-wider text-muted-foreground mb-1">
+            <div className="text-[11px] uppercase tracking-wider text-muted-foreground mb-1">
               Translation (mm)
             </div>
             <div className="grid grid-cols-3 gap-1">
@@ -671,7 +671,7 @@ function ComponentRow({
               ))}
             </div>
             {dirty && (
-              <div className="mt-1 text-[10px] text-muted-foreground">
+              <div className="mt-1 text-[11px] text-muted-foreground">
                 Press Enter to apply, Esc to revert.
               </div>
             )}
@@ -679,13 +679,13 @@ function ComponentRow({
 
           <div>
             <div className="flex items-center justify-between mb-1">
-              <div className="text-[10px] uppercase tracking-wider text-muted-foreground">
+              <div className="text-[11px] uppercase tracking-wider text-muted-foreground">
                 Mate references ({component.mate_references.length})
               </div>
               <button
                 type="button"
                 onClick={onAddReference}
-                className="cad-focus px-2 py-0.5 text-[10px] rounded border border-border hover:bg-accent/40"
+                className="cad-focus px-2 py-0.5 text-[11px] rounded border border-border hover:bg-accent/40"
               >
                 + Ref
               </button>
@@ -746,7 +746,7 @@ function MateRow({
       <div className="flex-1 min-w-0">
         <div className="flex items-baseline gap-2">
           <span className="font-medium truncate">{mate.name || `${tag} mate`}</span>
-          <span className="text-[10px] uppercase tracking-wider text-muted-foreground">
+          <span className="text-[11px] uppercase tracking-wider text-muted-foreground">
             {mateTypeLabel(tag)}
           </span>
           {/* Tri-state solve status: tick = solved, cross = solver error
@@ -754,14 +754,14 @@ function MateRow({
               yet solved. Same glyph vocabulary as cards/card-chrome. */}
           {mate.solved ? (
             <span
-              className="inline-flex items-center gap-0.5 text-[10px] text-emerald-600 dark:text-emerald-400"
+              className="inline-flex items-center gap-0.5 text-[11px] text-emerald-600 dark:text-emerald-400"
               title="Mate solved"
             >
               <Check size={10} /> solved
             </span>
           ) : mate.error ? (
             <span
-              className="inline-flex min-w-0 items-center gap-0.5 text-[10px] text-red-600 dark:text-red-400"
+              className="inline-flex min-w-0 items-center gap-0.5 text-[11px] text-red-600 dark:text-red-400"
               title={mate.error}
             >
               <X size={10} className="shrink-0" />
@@ -769,14 +769,14 @@ function MateRow({
             </span>
           ) : (
             <span
-              className="inline-flex items-center gap-0.5 text-[10px] text-amber-600 dark:text-amber-400"
+              className="inline-flex items-center gap-0.5 text-[11px] text-amber-600 dark:text-amber-400"
               title="Not solved yet — run Solve"
             >
               <CircleSlash size={10} /> unsolved
             </span>
           )}
         </div>
-        <div className="text-[10px] text-muted-foreground truncate">
+        <div className="text-[11px] text-muted-foreground truncate">
           {componentName(mate.component1)} · {mate.reference1}
           {' ↔ '}
           {componentName(mate.component2)} · {mate.reference2}
@@ -790,7 +790,7 @@ function MateRow({
         onClick={() => onTogglePatch({ flip: !mate.flip })}
         title="Flip mate alignment"
         className={[
-          'cad-focus px-2 py-0.5 text-[10px] uppercase tracking-wider rounded border',
+          'cad-focus px-2 py-0.5 text-[11px] uppercase tracking-wider rounded border',
           mate.flip
             ? 'border-primary text-primary'
             : 'border-border text-muted-foreground hover:text-foreground',
@@ -805,7 +805,7 @@ function MateRow({
         onClick={() => onTogglePatch({ suppressed: !mate.suppressed })}
         title={mate.suppressed ? 'Unsuppress mate' : 'Suppress mate'}
         className={[
-          'cad-focus px-2 py-0.5 text-[10px] uppercase tracking-wider rounded border',
+          'cad-focus px-2 py-0.5 text-[11px] uppercase tracking-wider rounded border',
           mate.suppressed
             ? 'border-amber-500/60 text-amber-500'
             : 'border-border text-muted-foreground hover:text-foreground',

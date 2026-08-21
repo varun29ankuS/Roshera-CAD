@@ -55,7 +55,7 @@ export function PropertiesPanel() {
               <Box size={12} className="text-primary" />
               <span className="text-xs font-medium truncate">{obj.name}</span>
             </div>
-            <span className="text-[10px] text-muted-foreground uppercase tracking-wider">
+            <span className="text-[11px] text-muted-foreground uppercase tracking-wider">
               {obj.objectType}
             </span>
           </div>
@@ -95,12 +95,12 @@ export function PropertiesPanel() {
             <>
               <Separator />
               <div>
-                <p className="text-[10px] text-muted-foreground uppercase tracking-wider mb-1.5">
+                <p className="text-[11px] text-muted-foreground uppercase tracking-wider mb-1.5">
                   Dimensions
                 </p>
                 <div className="space-y-0.5">
                   {Object.entries(ag.params).map(([key, val]) => (
-                    <div key={key} className="flex justify-between text-[10px]">
+                    <div key={key} className="flex justify-between text-[11px]">
                       <span className="text-muted-foreground">{key}</span>
                       <span className="font-mono">{typeof val === 'number' ? val.toFixed(2) : String(val)}</span>
                     </div>
@@ -113,7 +113,7 @@ export function PropertiesPanel() {
           {/* Material */}
           <Separator />
           <div>
-            <p className="text-[10px] text-muted-foreground uppercase tracking-wider mb-1.5">
+            <p className="text-[11px] text-muted-foreground uppercase tracking-wider mb-1.5">
               Material
             </p>
             <ColorPicker
@@ -124,7 +124,7 @@ export function PropertiesPanel() {
             />
             <div className="mt-1.5 space-y-1">
               <div>
-                <div className="flex justify-between text-[10px] text-muted-foreground mb-0.5">
+                <div className="flex justify-between text-[11px] text-muted-foreground mb-0.5">
                   <span>Metalness</span>
                   <span className="font-mono">{obj.material.metalness.toFixed(2)}</span>
                 </div>
@@ -143,7 +143,7 @@ export function PropertiesPanel() {
                 />
               </div>
               <div>
-                <div className="flex justify-between text-[10px] text-muted-foreground mb-0.5">
+                <div className="flex justify-between text-[11px] text-muted-foreground mb-0.5">
                   <span>Roughness</span>
                   <span className="font-mono">{obj.material.roughness.toFixed(2)}</span>
                 </div>
@@ -162,7 +162,7 @@ export function PropertiesPanel() {
                 />
               </div>
               <div>
-                <div className="flex justify-between text-[10px] text-muted-foreground mb-0.5">
+                <div className="flex justify-between text-[11px] text-muted-foreground mb-0.5">
                   <span>Opacity</span>
                   <span className="font-mono">{obj.material.opacity.toFixed(2)}</span>
                 </div>
@@ -188,10 +188,10 @@ export function PropertiesPanel() {
             <>
               <Separator />
               <div>
-                <p className="text-[10px] text-muted-foreground uppercase tracking-wider mb-1.5">
+                <p className="text-[11px] text-muted-foreground uppercase tracking-wider mb-1.5">
                   Selection ({selectionMode})
                 </p>
-                <div className="space-y-0.5 text-[10px]">
+                <div className="space-y-0.5 text-[11px]">
                   {subSelections.map((sel, i) => (
                     <div key={i} className="text-muted-foreground">
                       {sel.type} #{sel.index}
@@ -285,7 +285,7 @@ function ColorPicker({
             setDraft(e.target.value)
             commit(e.target.value.trim())
           }}
-          className="flex-1 bg-background/50 rounded px-1.5 py-0.5 text-[10px] font-mono outline-none text-foreground"
+          className="flex-1 bg-background/50 rounded px-1.5 py-0.5 text-[11px] font-mono outline-none text-foreground"
           spellCheck={false}
         />
       </div>
@@ -336,12 +336,12 @@ function EdgeDisplayControls() {
 
   return (
     <div>
-      <p className="text-[10px] text-muted-foreground uppercase tracking-wider mb-1.5">
+      <p className="text-[11px] text-muted-foreground uppercase tracking-wider mb-1.5">
         Edge Display
       </p>
       <div className="space-y-1.5">
         <div className="flex items-center justify-between">
-          <span className="text-[10px] text-muted-foreground">Show Edges</span>
+          <span className="text-[11px] text-muted-foreground">Show Edges</span>
           <button
             onClick={() => setEdgeSettings({ visible: !edgeSettings.visible })}
             className={`w-7 h-4 rounded-full transition-colors ${edgeSettings.visible ? 'bg-primary' : 'bg-muted'}`}
@@ -350,7 +350,7 @@ function EdgeDisplayControls() {
           </button>
         </div>
         <div>
-          <div className="flex justify-between text-[10px] text-muted-foreground mb-0.5">
+          <div className="flex justify-between text-[11px] text-muted-foreground mb-0.5">
             <span>Threshold</span>
             <span className="font-mono">{edgeSettings.threshold}°</span>
           </div>
@@ -364,7 +364,7 @@ function EdgeDisplayControls() {
           />
         </div>
         <div>
-          <div className="flex justify-between text-[10px] text-muted-foreground mb-0.5">
+          <div className="flex justify-between text-[11px] text-muted-foreground mb-0.5">
             <span>Line Width</span>
             <span className="font-mono">{edgeSettings.lineWidth.toFixed(1)}</span>
           </div>
@@ -405,7 +405,7 @@ function TransformEditor({ objectId }: { objectId: string }) {
 
   return (
     <div>
-      <p className="text-[10px] text-muted-foreground uppercase tracking-wider mb-1.5">
+      <p className="text-[11px] text-muted-foreground uppercase tracking-wider mb-1.5">
         <Ruler size={10} className="inline mr-1" />
         Transform (editable)
       </p>
@@ -453,22 +453,22 @@ function TransformRow({
 
   return (
     <div className="flex items-center gap-1">
-      <span className="text-[9px] text-muted-foreground w-5 shrink-0">{label}</span>
+      <span className="text-[11px] text-muted-foreground w-5 shrink-0">{label}</span>
       {([0, 1, 2] as const).map((i) => (
         // `min-w-0` is required so the flex item can shrink below the
         // browser's default `<input type="number">` intrinsic width
         // (~150px in Chromium). Without it, three axis cells each
         // refuse to shrink and the row blows past the panel column.
         <div key={i} className="flex-1 min-w-0 flex items-center gap-0.5 bg-background/50 rounded px-1 py-0.5">
-          <span className={`text-[8px] ${colors[i]} shrink-0`}>{axes[i]}</span>
+          <span className={`text-[11px] ${colors[i]} shrink-0`}>{axes[i]}</span>
           <input
             type="number"
             step={label === 'Scl' ? 0.1 : 1}
             value={values[i].toFixed(label === 'Scl' ? 2 : 1)}
             onChange={(e) => onChange(i, e.target.value)}
-            className="w-full min-w-0 bg-transparent text-[10px] font-mono outline-none text-foreground"
+            className="w-full min-w-0 bg-transparent text-[11px] font-mono outline-none text-foreground"
           />
-          {suffix && <span className="text-[8px] text-muted-foreground shrink-0">{suffix}</span>}
+          {suffix && <span className="text-[11px] text-muted-foreground shrink-0">{suffix}</span>}
         </div>
       ))}
     </div>

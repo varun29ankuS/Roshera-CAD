@@ -152,7 +152,7 @@ function LabelChip({ label }: { label: Label }) {
     <div
       title={title}
       style={style}
-      className={`inline-flex items-center gap-1 px-1.5 h-5 whitespace-nowrap text-[10px] font-medium tracking-tight border ${tone} bg-background/85 backdrop-blur-sm shadow-sm`}
+      className={`inline-flex items-center gap-1 px-1.5 h-5 whitespace-nowrap text-[11px] font-medium tracking-tight border ${tone} bg-background/85 backdrop-blur-sm shadow-sm`}
     >
       {label.color !== null && (
         // Colour swatch: a small square in the label colour. Present even

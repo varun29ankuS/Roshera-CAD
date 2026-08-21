@@ -692,7 +692,7 @@ export function ExtrudeGizmo() {
           center
           style={{ pointerEvents: 'none' }}
         >
-          <div className="cad-panel cad-readout px-2 py-1 text-[10px] uppercase tracking-wider whitespace-nowrap">
+          <div className="cad-panel cad-readout px-2 py-1 text-[11px] uppercase tracking-wider whitespace-nowrap">
             <span className="text-muted-foreground mr-2">PULL</span>
             <span className="text-foreground tabular-nums">
               {distance >= 0 ? '+' : ''}

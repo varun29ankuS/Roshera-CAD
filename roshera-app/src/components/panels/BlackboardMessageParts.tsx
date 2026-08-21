@@ -130,7 +130,7 @@ export function ToolCallRow({ call }: { call: ParsedToolCall }) {
         </span>
         <span
           className={cn(
-            'inline-flex shrink-0 items-center gap-1 rounded border px-1.5 py-[2px] text-[10px] leading-none',
+            'inline-flex shrink-0 items-center gap-1 rounded border px-1.5 py-[2px] text-[11px] leading-none',
             style.chip,
           )}
         >
@@ -142,7 +142,7 @@ export function ToolCallRow({ call }: { call: ParsedToolCall }) {
             type="button"
             onClick={() => setExpanded((v) => !v)}
             aria-expanded={expanded}
-            className="cad-icon-btn h-5 shrink-0 gap-1 px-1.5 text-[10px] text-muted-foreground/80"
+            className="cad-icon-btn h-5 shrink-0 gap-1 px-1.5 text-[11px] text-muted-foreground/80"
           >
             {expanded ? <ChevronDown size={10} /> : <ChevronRight size={10} />}
             {expanded ? 'hide result' : 'result'}
@@ -190,7 +190,7 @@ export function FailedTurnBlock({ text }: { text: string }) {
       <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
         <AlertTriangle size={13} className="shrink-0 text-red-600 dark:text-red-400" />
         <span className="text-xs font-medium text-foreground/90">Turn failed</span>
-        <span className="ml-auto inline-flex shrink-0 items-center gap-1 rounded border border-red-500/40 px-1.5 py-[2px] font-mono text-[10px] uppercase tracking-wide text-red-700 dark:text-red-300">
+        <span className="ml-auto inline-flex shrink-0 items-center gap-1 rounded border border-red-500/40 px-1.5 py-[2px] font-mono text-[11px] uppercase tracking-wide text-red-700 dark:text-red-300">
           <X size={9} />
           failed
         </span>
@@ -299,7 +299,7 @@ export function ExpandableProse({
           type="button"
           onClick={() => setExpanded((v) => !v)}
           aria-expanded={expanded}
-          className="cad-icon-btn mt-1 h-5 gap-1 px-1.5 text-[10px] text-muted-foreground/80"
+          className="cad-icon-btn mt-1 h-5 gap-1 px-1.5 text-[11px] text-muted-foreground/80"
         >
           {expanded ? <ChevronDown size={10} /> : <ChevronRight size={10} />}
           {expanded ? 'Show less' : 'Show full message'}

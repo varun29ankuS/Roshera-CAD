@@ -276,7 +276,7 @@ function ImportReportCard({ phase, onDismiss }: { phase: ActivePhase; onDismiss:
         </span>
         <button
           onClick={onDismiss}
-          className="ml-2 rounded px-1.5 py-0.5 text-[10px] hover:bg-accent"
+          className="ml-2 rounded px-1.5 py-0.5 text-[11px] hover:bg-accent"
           title="Dismiss"
         >
           ✕
@@ -350,7 +350,7 @@ function ReportBody({ res }: { res: ImportResponse }) {
         {/* Surface the first concrete error message for any invalid solid so the
             failure is legible, not just a count. */}
         {solids.some((s) => !s.valid && s.errors.length > 0) && (
-          <div className="mt-1 max-h-16 overflow-auto rounded bg-red-500/5 px-1.5 py-1 text-[10px] text-red-500">
+          <div className="mt-1 max-h-16 overflow-auto rounded bg-red-500/5 px-1.5 py-1 text-[11px] text-red-500">
             {solids
               .filter((s) => !s.valid && s.errors.length > 0)
               .flatMap((s) => s.errors.slice(0, 2))

@@ -112,10 +112,10 @@ function DecisionChip({
           `covers` (the authored span) and is what the expanded row at the
           bottom of this file already uses; this chip was the one place still
           reaching past it. */}
-      <span className="text-muted-foreground/80 font-mono text-[10px]">
+      <span className="text-muted-foreground/80 font-mono text-[11px]">
         {formatEventRange(spanOf(cp))}
       </span>
-      <span className="text-muted-foreground/60 text-[10px]">
+      <span className="text-muted-foreground/60 text-[11px]">
         {cp.author} · {relativeTime(cp.timestamp)}
       </span>
     </button>
@@ -167,7 +167,7 @@ export function DecisionRail({
     <div className="flex items-center gap-1.5 px-3 py-1 overflow-x-auto whitespace-nowrap">
       <span
         aria-hidden
-        className="shrink-0 text-[10px] uppercase tracking-wide text-muted-foreground/50"
+        className="shrink-0 text-[11px] uppercase tracking-wide text-muted-foreground/50"
         title="Named design states — what each span of operations was for"
       >
         decisions
@@ -297,7 +297,7 @@ function decisionsOnBranch(
 
 function StandardChip({ text }: { text: string }) {
   return (
-    <span className="inline-flex shrink-0 items-center gap-1 rounded border border-foreground/25 bg-accent/60 px-1.5 py-[3px] text-[10px] font-medium leading-none text-foreground">
+    <span className="inline-flex shrink-0 items-center gap-1 rounded border border-foreground/25 bg-accent/60 px-1.5 py-[3px] text-[11px] font-medium leading-none text-foreground">
       <Ruler size={10} className="shrink-0" aria-hidden />
       {text}
     </span>
@@ -306,7 +306,7 @@ function StandardChip({ text }: { text: string }) {
 
 function TimeChip({ timestamp }: { timestamp: string }) {
   return (
-    <span className="inline-flex shrink-0 items-center gap-1 rounded border border-border/70 px-1.5 py-[3px] text-[10px] leading-none text-muted-foreground">
+    <span className="inline-flex shrink-0 items-center gap-1 rounded border border-border/70 px-1.5 py-[3px] text-[11px] leading-none text-muted-foreground">
       <Clock size={10} className="shrink-0" aria-hidden />
       <span className="font-mono">{formatTimestamp(timestamp)}</span>
       <span className="text-muted-foreground/70">{relativeTime(timestamp)}</span>
@@ -318,7 +318,7 @@ function CountChip({ label, dashed = false }: { label: string; dashed?: boolean 
   return (
     <span
       className={cn(
-        'inline-flex shrink-0 items-center rounded border bg-accent/25 px-1.5 py-[3px] font-mono text-[10px] leading-none text-foreground/80',
+        'inline-flex shrink-0 items-center rounded border bg-accent/25 px-1.5 py-[3px] font-mono text-[11px] leading-none text-foreground/80',
         dashed ? 'border-dashed border-border' : 'border-border/70',
       )}
     >
@@ -334,7 +334,7 @@ function CountChip({ label, dashed = false }: { label: string; dashed?: boolean 
  *  copies to drift apart. */
 function OpChip({ op }: { op: DecisionOp }) {
   return (
-    <span className="inline-flex items-center gap-1 rounded border border-border/60 bg-card px-1.5 py-[3px] font-mono text-[10px] leading-none text-foreground/80">
+    <span className="inline-flex items-center gap-1 rounded border border-border/60 bg-card px-1.5 py-[3px] font-mono text-[11px] leading-none text-foreground/80">
       <span aria-hidden className="text-[11px] leading-none text-foreground/60">
         {symbolForOperation(op.operation_type)}
       </span>
@@ -417,7 +417,7 @@ function DecisionListRow({
         )}
         <span
           aria-hidden
-          className="flex h-5 w-5 shrink-0 items-center justify-center rounded bg-accent/70 font-mono text-[10px] text-foreground"
+          className="flex h-5 w-5 shrink-0 items-center justify-center rounded bg-accent/70 font-mono text-[11px] text-foreground"
         >
           {step}
         </span>
@@ -446,7 +446,7 @@ function DecisionListRow({
               no description recorded — the name is all this decision says
             </p>
           )}
-          <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[10px] text-muted-foreground/80">
+          <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-muted-foreground/80">
             <span className="font-mono">{formatEventRange(spanOf(cp))}</span>
             <span aria-hidden className="text-muted-foreground/40">
               │
@@ -515,7 +515,7 @@ function UnattributedRow({
         )}
         <span
           aria-hidden
-          className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full border border-dashed border-muted-foreground/60 text-[10px] text-muted-foreground"
+          className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full border border-dashed border-muted-foreground/60 text-[11px] text-muted-foreground"
         >
           ?
         </span>
@@ -651,7 +651,7 @@ export function DecisionList({
               <button
                 type="button"
                 onClick={onRetry}
-                className="rounded border border-border px-1.5 py-[1px] text-[10px] hover:bg-accent/40"
+                className="rounded border border-border px-1.5 py-[1px] text-[11px] hover:bg-accent/40"
               >
                 retry
               </button>
@@ -661,7 +661,7 @@ export function DecisionList({
       </div>
 
       {(nesting || truncated) && (
-        <div className="mb-2 space-y-1 rounded border border-dashed border-amber-500/40 bg-amber-500/5 px-2 py-1.5 text-[10.5px] text-amber-800 dark:text-amber-300">
+        <div className="mb-2 space-y-1 rounded border border-dashed border-amber-500/40 bg-amber-500/5 px-2 py-1.5 text-[11px] text-amber-800 dark:text-amber-300">
           {nesting && (
             <div>
               This backend does not send authored spans, so a decision's range is its RESTORE

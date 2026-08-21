@@ -310,7 +310,7 @@ function OpNode({ data }: NodeProps<Node<OpNodeData>>) {
             a range match against a checkpoint declared on some other
             branch. Neutral text — colour stays reserved for state. */}
         {intent && (
-          <div className="flex items-center gap-1 text-[10px] leading-tight text-foreground/80 mb-0.5 min-w-0">
+          <div className="flex items-center gap-1 text-[11px] leading-tight text-foreground/80 mb-0.5 min-w-0">
             <span aria-hidden className="shrink-0 text-foreground/60">◈</span>
             <span className="truncate font-medium">{intent}</span>
           </div>
@@ -327,18 +327,18 @@ function OpNode({ data }: NodeProps<Node<OpNodeData>>) {
             </span>
             <span className="truncate">{key}</span>
           </span>
-          <span className="shrink-0 text-[9.5px] text-muted-foreground/60">#{node.sequence_number}</span>
+          <span className="shrink-0 text-[11px] text-muted-foreground/60">#{node.sequence_number}</span>
         </div>
         {/* Line 2 — result, retirement, or the honest absence. */}
         <div
-          className={`text-[10.5px] truncate mt-0.5 ${
+          className={`text-[11px] truncate mt-0.5 ${
             unlinked ? 'italic text-muted-foreground/70' : 'text-muted-foreground/80'
           }`}
         >
           {detail}
         </div>
         {hiddenInputs > 0 && (
-          <div className="text-[9.5px] text-muted-foreground/60 truncate">
+          <div className="text-[11px] text-muted-foreground/60 truncate">
             ⇠ {hiddenInputs} from before the fork
           </div>
         )}
@@ -385,16 +385,16 @@ function LaneNode({ data }: NodeProps<Node<LaneNodeData>>) {
           {data.label}
         </span>
         {data.isActive && (
-          <span className="text-[9px] uppercase tracking-wide text-muted-foreground">recording</span>
+          <span className="text-[11px] uppercase tracking-wide text-muted-foreground">recording</span>
         )}
         {data.state === 'merged' && (
-          <span className="text-[9px] uppercase tracking-wide text-muted-foreground">merged</span>
+          <span className="text-[11px] uppercase tracking-wide text-muted-foreground">merged</span>
         )}
         {data.state === 'abandoned' && (
-          <span className="text-[9px] uppercase tracking-wide" style={{ color: stroke }}>abandoned</span>
+          <span className="text-[11px] uppercase tracking-wide" style={{ color: stroke }}>abandoned</span>
         )}
         {data.unlinked > 0 && (
-          <span className="text-[9px] uppercase tracking-wide text-muted-foreground/80">
+          <span className="text-[11px] uppercase tracking-wide text-muted-foreground/80">
             {data.unlinked} unlinked
           </span>
         )}
@@ -428,7 +428,7 @@ function StubNode({ data }: NodeProps<Node<StubNodeData>>) {
           ? `${data.branch.name} — lineage not read: ${data.reason}`
           : `${data.branch.name} — forked, no operations recorded on it yet`
       }
-      className="flex items-center justify-center px-2 text-[10.5px] italic text-muted-foreground/70"
+      className="flex items-center justify-center px-2 text-[11px] italic text-muted-foreground/70"
       style={{
         width: STUB_WIDTH,
         height: STUB_HEIGHT,
@@ -1048,7 +1048,7 @@ export default function TimelineGraph({
             {truncated && tab === 'graph' && (
               <span
                 title="The lineage window filled up — producers outside it are not represented, so some nodes may look like roots that are not."
-                className="shrink-0 px-1.5 py-0.5 rounded text-[9.5px] uppercase tracking-wide border border-amber-500/40 text-amber-700 dark:text-amber-300"
+                className="shrink-0 px-1.5 py-0.5 rounded text-[11px] uppercase tracking-wide border border-amber-500/40 text-amber-700 dark:text-amber-300"
               >
                 partial window
               </span>
@@ -1066,7 +1066,7 @@ export default function TimelineGraph({
                 title="What connects two cards here (click to expand)"
                 aria-label="More about this map"
                 aria-expanded={detailsOpen}
-                className="shrink-0 w-4 h-4 rounded-full text-[10px] leading-none flex items-center justify-center border border-muted-foreground/40 text-muted-foreground/70 hover:text-foreground hover:border-foreground/60"
+                className="shrink-0 w-4 h-4 rounded-full text-[11px] leading-none flex items-center justify-center border border-muted-foreground/40 text-muted-foreground/70 hover:text-foreground hover:border-foreground/60"
               >
                 i
               </button>
@@ -1221,7 +1221,7 @@ export default function TimelineGraph({
         )}
 
         {tab === 'decisions' ? (
-        <div className="flex items-center gap-3 px-4 py-1.5 border-t border-border text-[10px] text-muted-foreground/70 shrink-0 flex-wrap">
+        <div className="flex items-center gap-3 px-4 py-1.5 border-t border-border text-[11px] text-muted-foreground/70 shrink-0 flex-wrap">
           <span className="flex items-center gap-1">
             <span
               className="inline-block w-2 h-3 rounded-[1px]"
@@ -1243,7 +1243,7 @@ export default function TimelineGraph({
           <span className="ml-auto">rows read top → bottom in build order</span>
         </div>
         ) : (
-        <div className="flex items-center gap-3 px-4 py-1.5 border-t border-border text-[10px] text-muted-foreground/70 shrink-0 flex-wrap">
+        <div className="flex items-center gap-3 px-4 py-1.5 border-t border-border text-[11px] text-muted-foreground/70 shrink-0 flex-wrap">
           <span className="flex items-center gap-1">
             <span className="inline-block w-2 h-2 rounded-full" style={{ backgroundColor: '#2ecc71' }} /> active branch
           </span>

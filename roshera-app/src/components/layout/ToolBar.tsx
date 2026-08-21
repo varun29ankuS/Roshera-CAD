@@ -1185,7 +1185,15 @@ function FlyoutGroup({ group, openId, onToggle }: {
         aria-expanded={isOpen}
       >
         <group.icon size={22} strokeWidth={1.5} />
-        <span className="text-[9px] leading-none tracking-wide">{group.tooltip.split(' ')[0]}</span>
+        {/* The rail is 56px and the label is derived by taking the tooltip's
+            first word, which is fine for "Transform" and "Create" and clips
+            "Manufacturing" mid-word. Deriving a label by splitting a sentence
+            is the fragile part — it works until a word is long — so the label
+            truncates with an ellipsis instead of being cut off at the paint,
+            and the full text stays on `title`/`aria-label` above. */}
+        <span className="w-full truncate text-center text-[11px] leading-none tracking-wide">
+          {group.tooltip.split(' ')[0]}
+        </span>
       </button>
 
       {/* Portal to body so Three.js canvas cannot intercept pointer events */}
@@ -1199,7 +1207,7 @@ function FlyoutGroup({ group, openId, onToggle }: {
           {group.sections.map((section, si) => (
             <div key={section.label}>
               {si > 0 && <div className="h-px bg-border/40 mx-2 my-1" />}
-              <div className="px-3 py-1 text-[9px] uppercase tracking-widest text-muted-foreground/50 font-medium">
+              <div className="px-3 py-1 text-[11px] uppercase tracking-widest text-muted-foreground/50 font-medium">
                 {section.label}
               </div>
               {section.items.map((item) => (
@@ -1216,7 +1224,7 @@ function FlyoutGroup({ group, openId, onToggle }: {
                   <item.icon size={14} strokeWidth={1.5} className="shrink-0" />
                   <span className="flex-1 text-left">{item.label}</span>
                   {item.shortcut && (
-                    <span className="text-[10px] text-muted-foreground/50 font-mono">{item.shortcut}</span>
+                    <span className="text-[11px] text-muted-foreground/50 font-mono">{item.shortcut}</span>
                   )}
                 </button>
               ))}

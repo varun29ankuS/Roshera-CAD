@@ -259,7 +259,7 @@ function DimensionKindChips() {
   if (showDimensions.size === 0) return null
 
   return (
-    <div className="absolute top-3 left-3 cad-panel px-1.5 py-1 flex items-center gap-1 text-[10px] uppercase tracking-wider">
+    <div className="absolute top-3 left-3 cad-panel px-1.5 py-1 flex items-center gap-1 text-[11px] uppercase tracking-wider">
       <span className="px-1 text-muted-foreground/70 select-none">Dims</span>
       {ALL_DIMENSION_KINDS.map((kind) => {
         const active = kindFilter.has(kind)
@@ -331,7 +331,7 @@ function SketchCoordReadout() {
   const worldXYZ = hover ? sketchUvToWorldXYZ(hover, plane) : null
 
   return (
-    <div className="absolute bottom-3 left-1/2 -translate-x-1/2 pointer-events-none cad-panel cad-readout px-2.5 py-1.5 text-[10px] uppercase tracking-wider min-w-[180px]">
+    <div className="absolute bottom-3 left-1/2 -translate-x-1/2 pointer-events-none cad-panel cad-readout px-2.5 py-1.5 text-[11px] uppercase tracking-wider min-w-[180px]">
       <div className="flex items-center justify-between gap-3">
         <span className="text-muted-foreground">Plane</span>
         <span className="text-foreground">{planeLabel}</span>
@@ -464,7 +464,7 @@ function CSketchDofHud() {
   const filteredCount = filter?.dropped.length ?? 0
 
   return (
-    <div className="absolute top-3 right-3 pointer-events-none cad-panel cad-readout px-2.5 py-1.5 text-[10px] uppercase tracking-wider min-w-[180px]">
+    <div className="absolute top-3 right-3 pointer-events-none cad-panel cad-readout px-2.5 py-1.5 text-[11px] uppercase tracking-wider min-w-[180px]">
       {statusLabel && (
         <div className="flex items-center justify-between gap-3">
           <span className="text-muted-foreground">DOF</span>
@@ -760,7 +760,7 @@ function ViewportReadout() {
   const selectedCount = useSceneStore((s) => s.selectedIds.size)
 
   return (
-    <div className="absolute bottom-3 right-3 pointer-events-none cad-panel cad-readout px-2.5 py-1.5 text-[10px] uppercase tracking-wider min-w-[140px]">
+    <div className="absolute bottom-3 right-3 pointer-events-none cad-panel cad-readout px-2.5 py-1.5 text-[11px] uppercase tracking-wider min-w-[140px]">
       <div className="flex items-center justify-between gap-3">
         <span className="text-muted-foreground">Tool</span>
         <span className="text-foreground">{activeTool}</span>
@@ -795,7 +795,7 @@ function SectionViewPanel() {
   if (!sectionView.enabled) return null
 
   return (
-    <div className="absolute top-3 right-3 cad-panel px-3 py-2 flex flex-col gap-2 text-[10px] uppercase tracking-wider min-w-[200px]">
+    <div className="absolute top-3 right-3 cad-panel px-3 py-2 flex flex-col gap-2 text-[11px] uppercase tracking-wider min-w-[200px]">
       <div className="flex items-center justify-between gap-3">
         <span className="text-foreground font-semibold">Section View</span>
         <button
@@ -900,7 +900,7 @@ function ViewportHints() {
   if (dismissed) return null
 
   return (
-    <div className="absolute bottom-3 left-3 pointer-events-none flex items-center gap-4 px-2.5 py-1 text-[10px] uppercase tracking-wider font-mono text-muted-foreground/80">
+    <div className="absolute bottom-3 left-3 pointer-events-none flex items-center gap-4 px-2.5 py-1 text-[11px] uppercase tracking-wider font-mono text-muted-foreground/80">
       <span>LMB · Orbit</span>
       <span>MMB · Pan</span>
       <span>Scroll · Zoom</span>

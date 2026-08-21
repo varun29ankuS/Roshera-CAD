@@ -99,7 +99,7 @@ export function BlackboardSection({
           <ChevronDown size={11} className="shrink-0 text-muted-foreground/60" />
         )}
         <span className="truncate">{checkpoint.name}</span>
-        <span className="ml-1 shrink-0 font-mono text-[10px] tabular-nums text-muted-foreground/50">
+        <span className="ml-1 shrink-0 font-mono text-[11px] tabular-nums text-muted-foreground/50">
           {lineCount} {lineCount === 1 ? 'line' : 'lines'}
         </span>
       </button>

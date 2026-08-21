@@ -41,7 +41,7 @@ export function DialogError({ children }: { children: ReactNode }) {
 export function FormField({ label, children }: { label: string; children: ReactNode }) {
   return (
     <label className="flex flex-col gap-1">
-      <span className="font-mono text-[10px] uppercase tracking-wider text-muted-foreground/70">
+      <span className="font-mono text-[11px] uppercase tracking-wider text-muted-foreground/70">
         {label}
       </span>
       {children}
@@ -93,7 +93,7 @@ export function Vec3Input({
       <div className="grid grid-cols-3 gap-2">
         {(['x', 'y', 'z'] as const).map((axis, i) => (
           <label key={axis} className="flex items-center gap-1">
-            <span className="w-3 font-mono text-[10px] uppercase text-muted-foreground">
+            <span className="w-3 font-mono text-[11px] uppercase text-muted-foreground">
               {axis}
             </span>
             <Input

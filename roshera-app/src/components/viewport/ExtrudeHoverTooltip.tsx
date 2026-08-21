@@ -68,7 +68,7 @@ export function ExtrudeHoverTooltip() {
 
   return (
     <div
-      className="fixed z-40 pointer-events-none cad-panel px-2.5 py-1.5 text-[10px] uppercase tracking-wider min-w-[160px] max-w-[240px] shadow-lg"
+      className="fixed z-40 pointer-events-none cad-panel px-2.5 py-1.5 text-[11px] uppercase tracking-wider min-w-[160px] max-w-[240px] shadow-lg"
       style={{ left, top }}
       role="tooltip"
     >
@@ -90,7 +90,7 @@ export function ExtrudeHoverTooltip() {
             {shapes.map((s, i) => (
               <li
                 key={s.id || i}
-                className="flex items-center justify-between gap-2 normal-case tracking-normal text-[10.5px]"
+                className="flex items-center justify-between gap-2 normal-case tracking-normal text-[11px]"
               >
                 <span className="text-muted-foreground tabular-nums">
                   #{i + 1}

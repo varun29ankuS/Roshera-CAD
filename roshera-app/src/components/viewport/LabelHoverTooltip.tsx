@@ -76,7 +76,7 @@ export function LabelHoverTooltip() {
 
   return (
     <div
-      className="fixed z-40 pointer-events-none cad-panel px-2.5 py-1.5 text-[10px] uppercase tracking-wider min-w-[140px] max-w-[260px] shadow-lg"
+      className="fixed z-40 pointer-events-none cad-panel px-2.5 py-1.5 text-[11px] uppercase tracking-wider min-w-[140px] max-w-[260px] shadow-lg"
       style={{ left, top }}
       role="tooltip"
     >

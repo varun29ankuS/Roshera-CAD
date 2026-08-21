@@ -570,7 +570,7 @@ function StreamingDemo() {
             </button>
           </>
         )}
-        <span className="text-[10px] text-muted-foreground">
+        <span className="text-[11px] text-muted-foreground">
           {complete
             ? 'settled — full text through the normal render path'
             : 'streaming — math and the card are withheld until complete, then typeset once'}
@@ -609,21 +609,21 @@ function SymbolReference() {
                 <span className="w-40 text-foreground/90">{c.name}</span>
                 <span className="cad-readout w-20 text-muted-foreground">{c.codePoint}</span>
                 {c.certified ? (
-                  <span className="rounded border border-emerald-500/40 px-1.5 py-px text-[10px] uppercase tracking-wide text-emerald-400">
+                  <span className="rounded border border-emerald-500/40 px-1.5 py-px text-[11px] uppercase tracking-wide text-emerald-400">
                     kernel-certified · RFS
                   </span>
                 ) : (
-                  <span className="rounded border border-dashed border-border px-1.5 py-px text-[10px] uppercase tracking-wide text-muted-foreground">
+                  <span className="rounded border border-dashed border-border px-1.5 py-px text-[11px] uppercase tracking-wide text-muted-foreground">
                     design intent
                   </span>
                 )}
                 {c.asme === 'removed-2018' && (
-                  <span className="text-[10px] text-amber-400/90">
+                  <span className="text-[11px] text-amber-400/90">
                     removed in ASME Y14.5-2018{c.isoName ? ` · ISO retains ${c.isoName.toLowerCase()}` : ''}
                   </span>
                 )}
                 {c.conventional && (
-                  <span className="basis-full pl-11 text-[10px] text-muted-foreground/80">
+                  <span className="basis-full pl-11 text-[11px] text-muted-foreground/80">
                     {c.conventional}
                   </span>
                 )}
@@ -644,14 +644,14 @@ function SymbolReference() {
               <span className="w-56 text-foreground/90">{m.name}</span>
               <span className="cad-readout w-20 text-muted-foreground">{m.codePoint ?? 'none'}</span>
               {m.glyph === null && (
-                <span className="text-[10px] text-amber-400/80">
+                <span className="text-[11px] text-amber-400/80">
                   no Unicode character — deliberate fallback, not a lookalike
                 </span>
               )}
               {m.dialect === 'iso-only' && (
-                <span className="text-[10px] text-muted-foreground">ISO only</span>
+                <span className="text-[11px] text-muted-foreground">ISO only</span>
               )}
-              <span className="basis-full pl-11 text-[10px] text-muted-foreground/80">{m.meaning}</span>
+              <span className="basis-full pl-11 text-[11px] text-muted-foreground/80">{m.meaning}</span>
             </div>
           ))}
           {GDT_TEXT_NOTATIONS.map((t) => (
@@ -662,7 +662,7 @@ function SymbolReference() {
             </div>
           ))}
         </div>
-        <p className="mt-2 max-w-2xl text-[10px] leading-relaxed text-muted-foreground">
+        <p className="mt-2 max-w-2xl text-[11px] leading-relaxed text-muted-foreground">
           No modifier is accepted by the kernel schema — a frame carrying one is design intent
           by definition (kernel evaluation is RFS-only). Basic dimensions, datum feature symbols
           and datum targets have no character representation; they are renderings (boxed value,
@@ -881,12 +881,12 @@ export function BlackboardFixtures({ onExit }: BlackboardFixturesProps) {
                 {a}
               </button>
             ))}
-            <span className="text-[10px] text-muted-foreground">
+            <span className="text-[11px] text-muted-foreground">
               drives the real store setter — the ACP wiring lands in a later slice
             </span>
           </div>
           <div className="mb-2 flex flex-wrap items-center gap-1.5 border-t border-border/40 pt-2">
-            <span className="text-[10px] font-medium text-foreground/80">Live repro (writes real lines below):</span>
+            <span className="text-[11px] font-medium text-foreground/80">Live repro (writes real lines below):</span>
             <button
               onClick={seedBuildSteps}
               className="cad-icon-btn h-6 px-1.5 text-[11px]"
@@ -922,7 +922,7 @@ export function BlackboardFixtures({ onExit }: BlackboardFixturesProps) {
             >
               seed verdict markers
             </button>
-            <span className="text-[10px] text-muted-foreground">
+            <span className="text-[11px] text-muted-foreground">
               use the panel's own trash icon to clear
             </span>
           </div>
@@ -957,7 +957,7 @@ export function BlackboardFixtures({ onExit }: BlackboardFixturesProps) {
               {CARD_FIXTURES.map((f) => (
                 <div key={f.title}>
                   <div className="mb-1 text-xs font-medium text-foreground/90">{f.title}</div>
-                  <div className="mb-1 max-w-3xl text-[10px] text-muted-foreground">{f.note}</div>
+                  <div className="mb-1 max-w-3xl text-[11px] text-muted-foreground">{f.note}</div>
                   <div className="text-sm">
                     <MessageMarkdown content={f.source} />
                   </div>

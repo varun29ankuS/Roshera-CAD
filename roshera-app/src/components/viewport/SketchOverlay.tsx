@@ -1612,7 +1612,7 @@ function CSketchGeometricBadges({ plane }: { plane: SketchPlane }) {
                 <div
                   key={b.constraintId}
                   title={b.title}
-                  className={`px-1 min-w-[16px] h-4 inline-flex items-center justify-center text-[9px] font-mono font-semibold uppercase tracking-tight border ${tone} backdrop-blur-sm`}
+                  className={`px-1 min-w-[16px] h-4 inline-flex items-center justify-center text-[11px] font-mono font-semibold uppercase tracking-tight border ${tone} backdrop-blur-sm`}
                 >
                   {b.glyph}
                 </div>
@@ -2515,7 +2515,7 @@ function DimLabel({
             if (e.key === 'Enter') commit()
             else if (e.key === 'Escape') cancel()
           }}
-          className={`px-1.5 py-0.5 w-20 text-[10px] font-mono uppercase tracking-wider bg-background border ${tone} outline-none focus:ring-1 focus:ring-primary/40`}
+          className={`px-1.5 py-0.5 w-20 text-[11px] font-mono uppercase tracking-wider bg-background border ${tone} outline-none focus:ring-1 focus:ring-primary/40`}
         />
       ) : (
         <div
@@ -2524,7 +2524,7 @@ function DimLabel({
           // entering edit mode. `cursor-text` only when editable so
           // the affordance signals which labels are interactive.
           onDoubleClick={editable ? beginEdit : undefined}
-          className={`px-1.5 py-0.5 text-[10px] font-mono uppercase tracking-wider bg-background/80 border ${tone} backdrop-blur-sm whitespace-nowrap select-none ${editable ? 'cursor-text hover:bg-background' : 'pointer-events-none'}`}
+          className={`px-1.5 py-0.5 text-[11px] font-mono uppercase tracking-wider bg-background/80 border ${tone} backdrop-blur-sm whitespace-nowrap select-none ${editable ? 'cursor-text hover:bg-background' : 'pointer-events-none'}`}
         >
           {text}
         </div>

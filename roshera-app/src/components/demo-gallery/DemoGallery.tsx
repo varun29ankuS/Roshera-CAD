@@ -103,7 +103,7 @@ export function DemoGallery({ onExit }: DemoGalleryProps) {
             <div className="text-[11px] font-mono uppercase tracking-[0.16em] text-foreground">
               Kernel Demo Gallery
             </div>
-            <div className="text-[10px] text-muted-foreground mt-0.5">
+            <div className="text-[11px] text-muted-foreground mt-0.5">
               Live STL output from each kernel example. Click a card to render it.
             </div>
           </div>
@@ -126,11 +126,11 @@ export function DemoGallery({ onExit }: DemoGalleryProps) {
                 <div className="text-muted-foreground mt-1">{manifestError}</div>
                 <div className="text-muted-foreground mt-1">
                   Run the kernel demos with{' '}
-                  <code className="font-mono text-[10px] bg-background px-1 py-0.5 rounded">
+                  <code className="font-mono text-[11px] bg-background px-1 py-0.5 rounded">
                     ROSHERA_DEMO_OUT=../roshera-app/public/demos cargo run --release --example
                     demo_X
                   </code>{' '}
-                  to populate <code className="font-mono text-[10px]">/demos/</code>.
+                  to populate <code className="font-mono text-[11px]">/demos/</code>.
                 </div>
               </div>
             </div>
@@ -143,11 +143,11 @@ export function DemoGallery({ onExit }: DemoGalleryProps) {
                 return (
                   <div key={category} className="space-y-2">
                     <div className="border-b border-border/60 pb-1.5">
-                      <div className="text-[10px] font-mono uppercase tracking-[0.16em] text-foreground">
+                      <div className="text-[11px] font-mono uppercase tracking-[0.16em] text-foreground">
                         {info.title}
                       </div>
                       {info.description && (
-                        <div className="text-[10px] text-muted-foreground mt-0.5">
+                        <div className="text-[11px] text-muted-foreground mt-0.5">
                           {info.description}
                         </div>
                       )}

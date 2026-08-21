@@ -607,7 +607,7 @@ export function DrawingsWorkspace() {
         {/* ── Drawings list sidebar ───────────────────────────────── */}
         <aside className="w-64 flex flex-col border-r border-border/60 bg-background/40">
           <div className="px-3 py-2 border-b border-border/60">
-            <div className="text-[10px] uppercase tracking-wider text-muted-foreground">
+            <div className="text-[11px] uppercase tracking-wider text-muted-foreground">
               Drawings
             </div>
           </div>
@@ -790,7 +790,7 @@ export function DrawingsWorkspace() {
                 </button>
               )}
               {activeDrawing && (
-                <span className="text-[10px] uppercase tracking-wider text-muted-foreground">
+                <span className="text-[11px] uppercase tracking-wider text-muted-foreground">
                   {typeof activeDrawing.sheet_size === 'string'
                     ? activeDrawing.sheet_size
                     : 'Custom'}
@@ -929,7 +929,7 @@ export function DrawingsWorkspace() {
                         type="button"
                         onClick={() => void handleRemoveView(v.id)}
                         title="Remove view"
-                        className="cad-focus ml-1 text-destructive hover:text-destructive/80 text-[10px]"
+                        className="cad-focus ml-1 text-destructive hover:text-destructive/80 text-[11px]"
                       >
                         ✕
                       </button>
@@ -1092,7 +1092,7 @@ export function DrawingsWorkspace() {
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
   return (
     <label className="flex flex-col gap-0.5">
-      <span className="text-[10px] uppercase tracking-wider text-muted-foreground">{label}</span>
+      <span className="text-[11px] uppercase tracking-wider text-muted-foreground">{label}</span>
       {children}
     </label>
   )
@@ -1242,7 +1242,7 @@ function TitleBlockEditor({
                   setTimeout(() => void commit(), 0)
                 }}
                 title="Revert to auto-derived ID"
-                className="cad-focus text-[10px] text-muted-foreground hover:text-foreground px-1"
+                className="cad-focus text-[11px] text-muted-foreground hover:text-foreground px-1"
               >
                 auto
               </button>
@@ -1273,7 +1273,7 @@ function TitleBlockEditor({
               onBlur={() => void commit()}
               className="cad-focus w-12 px-2 py-1 text-xs rounded border border-border bg-background"
             />
-            <span className="text-[10px] text-muted-foreground">of</span>
+            <span className="text-[11px] text-muted-foreground">of</span>
             <input
               type="number"
               min={1}

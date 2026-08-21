@@ -228,7 +228,7 @@ export function MateSuggestionPopover() {
           ),
         )}
       </div>
-      <div className="mt-2 normal-case tracking-normal text-[10px] text-muted-foreground">
+      <div className="mt-2 normal-case tracking-normal text-[11px] text-muted-foreground">
         {busy
           ? 'Solving…'
           : ref2

@@ -470,7 +470,7 @@ function DimBadge({
       <div
         onPointerEnter={hoverable ? () => onHoverChange(true) : undefined}
         onPointerLeave={hoverable ? () => onHoverChange(false) : undefined}
-        className={`px-1.5 py-0.5 text-[10px] font-mono uppercase tracking-wider bg-background/80 border border-border/60 text-foreground backdrop-blur-sm whitespace-nowrap select-none ${
+        className={`px-1.5 py-0.5 text-[11px] font-mono uppercase tracking-wider bg-background/80 border border-border/60 text-foreground backdrop-blur-sm whitespace-nowrap select-none ${
           hoverable
             ? 'pointer-events-auto cursor-default hover:border-foreground/60'
             : 'pointer-events-none'
@@ -945,7 +945,7 @@ function PinnedMeasurementAnnotation({ pin }: { pin: PinnedMeasurement }) {
       zIndexRange={[110, 0]}
       distanceFactor={HTML_DISTANCE_FACTOR}
     >
-      <div className="flex items-center gap-1 px-1.5 py-0.5 text-[10px] font-mono uppercase tracking-wider bg-background/85 border border-primary/70 text-primary backdrop-blur-sm whitespace-nowrap select-none">
+      <div className="flex items-center gap-1 px-1.5 py-0.5 text-[11px] font-mono uppercase tracking-wider bg-background/85 border border-primary/70 text-primary backdrop-blur-sm whitespace-nowrap select-none">
         <span>{pin.row.label}</span>
         <button
           type="button"

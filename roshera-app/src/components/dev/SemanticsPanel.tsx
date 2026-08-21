@@ -76,7 +76,7 @@ function StateChip({
   return (
     <span
       className={cn(
-        'inline-flex shrink-0 items-center gap-1 rounded border px-1.5 py-[2px] text-[10px] leading-none whitespace-nowrap',
+        'inline-flex shrink-0 items-center gap-1 rounded border px-1.5 py-[2px] text-[11px] leading-none whitespace-nowrap',
         tone === 'recorded' && 'border-border text-foreground/80',
         (tone === 'partial' || tone === 'absent') &&
           'border-dashed border-amber-500/40 bg-amber-500/5 text-amber-800 dark:text-amber-300',
@@ -173,7 +173,7 @@ function OntologyCensus({ registry }: { registry: ToolRegistry }) {
                   >
                     {t.name}
                     {t.source === 'kernel' && (
-                      <sup className="text-[8px] text-muted-foreground/70">k</sup>
+                      <sup className="text-[11px] text-muted-foreground/70">k</sup>
                     )}
                   </span>
                 ))}

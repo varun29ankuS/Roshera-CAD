@@ -117,7 +117,7 @@ function FeatureRow({
         <span className="truncate flex-1">
           {label}-{node.kind_index}
         </span>
-        <div className="flex items-center gap-0.5 px-1 text-[10px] leading-tight shrink-0">
+        <div className="flex items-center gap-0.5 px-1 text-[11px] leading-tight shrink-0">
           <span className={authorTextClass(kind, false)}>{glyph}</span>
           <span className="text-muted-foreground/60">{rel}</span>
         </div>

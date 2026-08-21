@@ -110,7 +110,7 @@ export function SoundnessCard({ card }: { card: SoundnessCardData }) {
         card.watertight === true &&
         card.manifold === true &&
         genus !== null && (
-          <div className="mt-0.5 text-[10px] text-muted-foreground/80">
+          <div className="mt-0.5 text-[11px] text-muted-foreground/80">
             genus {genus} — closed orientable surface, g = (2 − χ) / 2
           </div>
         )}

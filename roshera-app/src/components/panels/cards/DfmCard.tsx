@@ -94,7 +94,7 @@ function reasonBlock(reason: DfmUnverifiableReason, unit: string) {
 function FaceChips({ label, faces }: { label: string; faces: number[] }) {
   if (faces.length === 0) return null
   return (
-    <div className="mt-1 flex flex-wrap items-center gap-1 text-[10px] text-muted-foreground">
+    <div className="mt-1 flex flex-wrap items-center gap-1 text-[11px] text-muted-foreground">
       <span>{label}:</span>
       {faces.map((f) => (
         <span key={f} className="cad-readout rounded border border-border px-1 py-px">
@@ -141,9 +141,9 @@ export function DfmCard({ card }: { card: DfmCardData }) {
               {unit}
             </KV>
             {boundSuffix(v.margin, unit) !== null && (
-              <div className="text-[10px] text-muted-foreground">{boundSuffix(v.margin, unit)}</div>
+              <div className="text-[11px] text-muted-foreground">{boundSuffix(v.margin, unit)}</div>
             )}
-            <div className="text-[10px] text-muted-foreground">{derivationLine(v.margin)}</div>
+            <div className="text-[11px] text-muted-foreground">{derivationLine(v.margin)}</div>
           </>
         )}
 
@@ -158,11 +158,11 @@ export function DfmCard({ card }: { card: DfmCardData }) {
               {unit}
             </KV>
             {boundSuffix(v.measured, unit) !== null && (
-              <div className="text-[10px] text-muted-foreground">
+              <div className="text-[11px] text-muted-foreground">
                 measured {boundSuffix(v.measured, unit)}
               </div>
             )}
-            <div className="text-[10px] text-muted-foreground">
+            <div className="text-[11px] text-muted-foreground">
               measured: {derivationLine(v.measured)} · limit: {derivationLine(v.limit)}
             </div>
             <FaceChips label="witnesses" faces={v.witnesses} />
@@ -177,7 +177,7 @@ export function DfmCard({ card }: { card: DfmCardData }) {
         )}
       </div>
 
-      <div className="mt-1.5 flex flex-wrap items-baseline gap-1.5 border-t border-border/50 pt-1 text-[10px] text-muted-foreground">
+      <div className="mt-1.5 flex flex-wrap items-baseline gap-1.5 border-t border-border/50 pt-1 text-[11px] text-muted-foreground">
         <span className="rounded border border-border px-1 py-px font-mono uppercase tracking-wide">
           {prov.label}
         </span>

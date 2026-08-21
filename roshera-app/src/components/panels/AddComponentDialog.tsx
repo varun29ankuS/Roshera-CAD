@@ -213,7 +213,7 @@ export function AddComponentDialog({ assemblyId, defaultName, onClose, onCreated
               solver overrides, and making it prominent taught the wrong
               mental model (Varun, 2026-08-01). */}
           <details className="group">
-            <summary className="cad-focus cursor-pointer list-none font-mono text-[10px] uppercase tracking-wider text-muted-foreground/70 hover:text-foreground">
+            <summary className="cad-focus cursor-pointer list-none font-mono text-[11px] uppercase tracking-wider text-muted-foreground/70 hover:text-foreground">
               <span className="mr-1 inline-block transition-transform group-open:rotate-90">▸</span>
               Starting offset (mm) — optional
             </summary>
@@ -255,7 +255,7 @@ function SizeField({
 }) {
   return (
     <label className="flex items-center gap-1">
-      <span className="w-3 font-mono text-[10px] uppercase text-muted-foreground">{label}</span>
+      <span className="w-3 font-mono text-[11px] uppercase text-muted-foreground">{label}</span>
       <Input
         type="number"
         value={value}

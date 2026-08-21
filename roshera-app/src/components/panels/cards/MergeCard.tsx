@@ -27,7 +27,7 @@ function Witness({ side, w }: { side: 'source' | 'target'; w: MergeConflictWitne
   // stays on the tooltip.
   const time = /T(\d{2}:\d{2}:\d{2})/.exec(w.timestamp)?.[1] ?? w.timestamp
   return (
-    <div className="flex flex-wrap items-baseline gap-x-2 text-[10px] text-muted-foreground" title={w.timestamp}>
+    <div className="flex flex-wrap items-baseline gap-x-2 text-[11px] text-muted-foreground" title={w.timestamp}>
       <span className="w-10 shrink-0 font-mono uppercase tracking-wide">{side}</span>
       <span className="cad-readout text-foreground/85">{w.operation_type}</span>
       <span>by {w.author}</span>
@@ -64,7 +64,7 @@ export function MergeCard({ card }: { card: MergeCardData }) {
       }
     >
       {stats !== undefined && (
-        <div className="mt-1.5 flex flex-wrap gap-x-3 gap-y-0.5 text-[10px] text-muted-foreground">
+        <div className="mt-1.5 flex flex-wrap gap-x-3 gap-y-0.5 text-[11px] text-muted-foreground">
           <span>
             <span className="cad-readout text-foreground/85">{stats.events_merged}</span> events merged
           </span>
@@ -89,10 +89,10 @@ export function MergeCard({ card }: { card: MergeCardData }) {
                     ("solid:0", "entity:<uuid>") is the attach point for
                     highlighting the contested body in the viewport once
                     persistent-ID selection integration lands. */}
-                <span className="cad-readout rounded border border-border px-1 py-px text-[10px] text-foreground/90">
+                <span className="cad-readout rounded border border-border px-1 py-px text-[11px] text-foreground/90">
                   {c.subject}
                 </span>
-                <span className="rounded border border-amber-500/40 px-1 py-px text-[10px] text-amber-400">
+                <span className="rounded border border-amber-500/40 px-1 py-px text-[11px] text-amber-400">
                   {humanizeConflictType(c.conflict_type)}
                 </span>
               </div>

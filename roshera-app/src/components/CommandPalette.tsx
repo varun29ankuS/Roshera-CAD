@@ -463,7 +463,7 @@ export function CommandPalette() {
             spellCheck={false}
             className="cad-focus flex-1 bg-transparent text-sm outline-none placeholder:text-muted-foreground"
           />
-          <kbd className="text-[10px] font-mono text-muted-foreground border border-border/60 rounded px-1.5 py-0.5">
+          <kbd className="text-[11px] font-mono text-muted-foreground border border-border/60 rounded px-1.5 py-0.5">
             Esc
           </kbd>
         </div>
@@ -486,7 +486,7 @@ export function CommandPalette() {
                 return (
                   <div key={s.cmd.id}>
                     {header && (
-                      <div className="px-3 pt-2 pb-0.5 text-[10px] uppercase tracking-wider text-muted-foreground">
+                      <div className="px-3 pt-2 pb-0.5 text-[11px] uppercase tracking-wider text-muted-foreground">
                         {s.cmd.group}
                       </div>
                     )}
@@ -507,7 +507,7 @@ export function CommandPalette() {
                     >
                       <span className="truncate">{s.cmd.label}</span>
                       {s.cmd.hint && (
-                        <kbd className="ml-2 text-[10px] font-mono text-muted-foreground border border-border/60 rounded px-1 py-0.5 shrink-0">
+                        <kbd className="ml-2 text-[11px] font-mono text-muted-foreground border border-border/60 rounded px-1 py-0.5 shrink-0">
                           {s.cmd.hint}
                         </kbd>
                       )}
@@ -520,7 +520,7 @@ export function CommandPalette() {
         </div>
 
         {/* Footer hints */}
-        <div className="flex items-center justify-between gap-3 px-3 py-1.5 border-t border-border/60 text-[10px] text-muted-foreground">
+        <div className="flex items-center justify-between gap-3 px-3 py-1.5 border-t border-border/60 text-[11px] text-muted-foreground">
           <span>
             <kbd className="font-mono border border-border/60 rounded px-1">↑</kbd>{' '}
             <kbd className="font-mono border border-border/60 rounded px-1">↓</kbd>{' '}

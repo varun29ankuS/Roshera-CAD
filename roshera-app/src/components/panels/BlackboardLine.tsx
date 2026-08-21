@@ -183,7 +183,7 @@ function TurnStatus({ elapsedMs, onCancel }: { elapsedMs: number; onCancel?: () 
   const observed = useObservedTurnActivity(true)
   const activity = turnActivity(observed)
   return (
-    <div className="mt-1.5 flex flex-wrap items-center gap-2 text-[10px] text-muted-foreground/70">
+    <div className="mt-1.5 flex flex-wrap items-center gap-2 text-[11px] text-muted-foreground/70">
       <span
         className="flex items-center gap-1.5 font-medium text-amber-600 dark:text-amber-400"
         title={
@@ -218,7 +218,7 @@ function TurnStatus({ elapsedMs, onCancel }: { elapsedMs: number; onCancel?: () 
             onCancel()
           }}
           disabled={stopping}
-          className="cad-icon-btn h-5 gap-1 px-1.5 text-[10px] disabled:opacity-50"
+          className="cad-icon-btn h-5 gap-1 px-1.5 text-[11px] disabled:opacity-50"
           title="End this turn"
           aria-label="Stop agent turn"
         >
@@ -291,7 +291,7 @@ function PartTag({ line }: { line: Line }) {
   const label = name ?? `part ${line.partId}`
   return (
     <span
-      className="ml-1 text-[10px] text-muted-foreground/50"
+      className="ml-1 text-[11px] text-muted-foreground/50"
       title="Written in this part's own notebook before the blackboard became one notebook per document — carried into the document view here."
     >
       · {label}
@@ -561,7 +561,7 @@ export function BlackboardLine({ line, onCommit, onDelete, streaming = false, on
               )}
               {isSystem && line.repeatCount !== undefined && line.repeatCount > 1 && (
                 <span
-                  className="ml-1 text-[10px] text-muted-foreground/50"
+                  className="ml-1 text-[11px] text-muted-foreground/50"
                   title={`Reposted ${line.repeatCount} times — identical consecutive lines collapse into one`}
                 >
                   (×{line.repeatCount})
@@ -641,7 +641,7 @@ export function BlackboardLine({ line, onCommit, onDelete, streaming = false, on
               )}
               {isSystem && line.repeatCount !== undefined && line.repeatCount > 1 && (
                 <span
-                  className="ml-1 text-[10px] text-muted-foreground/60"
+                  className="ml-1 text-[11px] text-muted-foreground/60"
                   title={`Reposted ${line.repeatCount} times — identical consecutive lines collapse into one`}
                 >
                   (×{line.repeatCount})

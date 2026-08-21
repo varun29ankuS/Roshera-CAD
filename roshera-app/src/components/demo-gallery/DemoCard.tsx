@@ -33,7 +33,7 @@ export function DemoCard({ demo, isActive, isLoading, onLoad }: DemoCardProps) {
         )}
       </div>
 
-      <div className="flex flex-col gap-0.5 text-[10px] font-mono text-muted-foreground tabular-nums">
+      <div className="flex flex-col gap-0.5 text-[11px] font-mono text-muted-foreground tabular-nums">
         <div className="flex items-baseline gap-2">
           <span className="uppercase tracking-wider min-w-[40px]">Verts</span>
           <span className="flex-1 border-b border-dotted border-border/60 translate-y-[-2px]" />

@@ -92,7 +92,7 @@ export function Chip({
     <span
       title={title}
       className={cn(
-        'inline-flex items-center gap-1 rounded border px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wide',
+        'inline-flex items-center gap-1 rounded border px-1.5 py-0.5 font-mono text-[11px] uppercase tracking-wide',
         a.text,
         dashed ? 'border-dashed border-current/50' : 'border-current/40',
       )}
@@ -160,7 +160,7 @@ export function Claim({
       <span>
         {children}
         {detail !== undefined && (
-          <span className="ml-1.5 text-[10px] text-muted-foreground/80">{detail}</span>
+          <span className="ml-1.5 text-[11px] text-muted-foreground/80">{detail}</span>
         )}
       </span>
     </div>
@@ -209,7 +209,7 @@ export function ClaimBadge({
       title={detail}
       aria-label={detail}
       className={cn(
-        'inline-flex items-center gap-1 rounded border px-1.5 py-[3px] text-[10px] leading-none',
+        'inline-flex items-center gap-1 rounded border px-1.5 py-[3px] text-[11px] leading-none',
         status === true && 'border-emerald-500/30 bg-emerald-500/10 text-emerald-800 dark:text-emerald-300',
         status === false && 'border-red-500/40 bg-red-500/10 text-red-800 dark:text-red-300',
         status === null &&

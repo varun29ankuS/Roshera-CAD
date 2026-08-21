@@ -389,13 +389,13 @@ export function Blackboard() {
           <span className="text-xs font-medium shrink-0">Blackboard</span>
           {/* Attention state, legible without reading the board. */}
           {agentAttention === 'writing' && (
-            <span className="flex shrink-0 items-center gap-1 text-[10px] text-primary/90">
+            <span className="flex shrink-0 items-center gap-1 text-[11px] text-primary/90">
               <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-primary" />
               writing
             </span>
           )}
           {agentAttention === 'geometry' && (
-            <span className="flex shrink-0 items-center gap-1 text-[10px] text-amber-400/90">
+            <span className="flex shrink-0 items-center gap-1 text-[11px] text-amber-400/90">
               <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-amber-400" />
               executing — viewport has focus
             </span>
@@ -406,7 +406,7 @@ export function Blackboard() {
               (or a dropped one) reads as "—", never a fabricated model
               name — see acp-session-store.ts's doc for why. */}
           <span
-            className="hidden shrink-0 items-center gap-1.5 whitespace-nowrap text-[10px] text-muted-foreground/70 sm:flex"
+            className="hidden shrink-0 items-center gap-1.5 whitespace-nowrap text-[11px] text-muted-foreground/70 sm:flex"
             title={acpLive ? 'Agent session live' : 'No agent session'}
           >
             <span
@@ -479,7 +479,7 @@ export function Blackboard() {
           {overrideHeight !== null && (
             <button
               onClick={releaseOverride}
-              className="cad-icon-btn h-6 px-1.5 font-mono text-[10px] uppercase tracking-wide"
+              className="cad-icon-btn h-6 px-1.5 font-mono text-[11px] uppercase tracking-wide"
               title="Release the manual size — follow the agent's attention again"
               aria-label="Release manual size"
             >
@@ -580,7 +580,7 @@ export function Blackboard() {
                   </span>
                   <span className="flex flex-wrap items-center gap-1.5">
                     <span className="font-mono text-[11px] text-foreground/85">tool calls</span>
-                    <span className="inline-flex items-center gap-1 rounded border border-emerald-500/30 bg-emerald-500/10 px-1.5 py-[2px] text-[10px] leading-none text-emerald-800 dark:text-emerald-300">
+                    <span className="inline-flex items-center gap-1 rounded border border-emerald-500/30 bg-emerald-500/10 px-1.5 py-[2px] text-[11px] leading-none text-emerald-800 dark:text-emerald-300">
                       <Check size={10} /> done
                     </span>
                     <span>— one row each, result on a click</span>
@@ -642,7 +642,7 @@ export function Blackboard() {
         {waiting.length > 0 && (
           <div
             role="status"
-            className="flex flex-wrap items-center gap-1.5 border-b border-white/5 px-3 py-1.5 text-[10px]"
+            className="flex flex-wrap items-center gap-1.5 border-b border-white/5 px-3 py-1.5 text-[11px]"
           >
             <Clock size={10} className="shrink-0 text-amber-500" />
             <span className="shrink-0 font-medium text-amber-600 dark:text-amber-400">

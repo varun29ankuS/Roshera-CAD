@@ -190,8 +190,12 @@ export function AgentEyePanel() {
   return (
     <div className="absolute bottom-2 right-2 z-20 w-[208px] overflow-hidden rounded-md border border-border bg-card shadow-lg">
       <div className="flex items-center justify-between border-b border-border px-2 py-1.5">
-        <div className="flex items-center gap-1.5 text-xs font-semibold">
-          <span>👁 Agent Eye</span>
+        <div className="flex min-w-0 items-center gap-1.5 text-xs font-semibold">
+          {/* nowrap: the header is 208px wide and the status pill grew with the
+              11px type floor, which wrapped the title to "Agent / Eye". A panel
+              title that reflows because a sibling changed size is a layout that
+              was only ever accidentally correct. */}
+          <span className="shrink-0 whitespace-nowrap">👁 Agent Eye</span>
           {/* Liveness is a verdict about the machine, so it wears the one
               status grammar rather than a bespoke dot-and-word pair. */}
           <StatusPill tone={live ? 'positive' : 'neutral'} label={live ? 'LIVE' : 'paused'} />
@@ -199,21 +203,21 @@ export function AgentEyePanel() {
         <div className="flex items-center gap-1">
           <button
             onClick={() => setLive((v) => !v)}
-            className="rounded px-1.5 py-0.5 text-[10px] hover:bg-accent"
+            className="rounded px-1.5 py-0.5 text-[11px] hover:bg-accent"
             title={live ? 'Pause live updates' : 'Resume live updates'}
           >
             {live ? '⏸' : '▶'}
           </button>
           <button
             onClick={grab}
-            className="rounded px-1.5 py-0.5 text-[10px] hover:bg-accent"
+            className="rounded px-1.5 py-0.5 text-[11px] hover:bg-accent"
             title="Refresh now"
           >
             ⟳
           </button>
           <button
             onClick={() => setMinimized(true)}
-            className="rounded px-1.5 py-0.5 text-[10px] hover:bg-accent"
+            className="rounded px-1.5 py-0.5 text-[11px] hover:bg-accent"
             title="Minimize"
           >
             ▁
@@ -229,7 +233,7 @@ export function AgentEyePanel() {
             key={s}
             selected={scope === s}
             onClick={() => setScope(s)}
-            className="flex-1 rounded-none border-0 px-2 py-1 text-[10px] font-medium capitalize"
+            className="flex-1 rounded-none border-0 px-2 py-1 text-[11px] font-medium capitalize"
             title={
               s === 'part'
                 ? 'Show the newest part on its own'
@@ -250,7 +254,7 @@ export function AgentEyePanel() {
             value={assemblyId}
             onChange={(e) => setAssemblyId(e.target.value)}
             placeholder="assembly id (uuid) — blank = whole scene"
-            className="w-full rounded border border-border bg-background px-1.5 py-0.5 font-mono text-[10px]"
+            className="w-full rounded border border-border bg-background px-1.5 py-0.5 font-mono text-[11px]"
           />
         </div>
       )}
@@ -268,7 +272,7 @@ export function AgentEyePanel() {
           </div>
         )}
         {activeMode === 'diagnostic' && diag && (
-          <div className="absolute left-1 top-1 rounded bg-background/80 px-1.5 py-0.5 font-mono text-[10px]">
+          <div className="absolute left-1 top-1 rounded bg-background/80 px-1.5 py-0.5 font-mono text-[11px]">
             <span className={diag.open ? 'text-red-500' : 'text-green-500'}>open {diag.open}</span>
             {' · '}
             <span className={diag.nm ? 'text-fuchsia-500' : 'text-green-500'}>nm {diag.nm}</span>
@@ -277,7 +281,7 @@ export function AgentEyePanel() {
       </div>
 
       {scope === 'part' && perc && (
-        <div className="flex items-center justify-between gap-2 border-t border-border px-2 py-1 font-mono text-[10px]">
+        <div className="flex items-center justify-between gap-2 border-t border-border px-2 py-1 font-mono text-[11px]">
           <span className={perc.watertight && perc.valid ? 'text-green-600' : 'text-red-500'}>
             {perc.watertight && perc.valid ? '✓ sound' : '✗ defect'}
           </span>
@@ -304,7 +308,7 @@ export function AgentEyePanel() {
             <button
               key={m}
               onClick={() => setMode(m)}
-              className={`rounded px-1 py-0.5 text-[10px] ${
+              className={`rounded px-1 py-0.5 text-[11px] ${
                 activeMode === m ? 'bg-primary text-primary-foreground' : 'hover:bg-accent'
               }`}
             >
@@ -318,7 +322,7 @@ export function AgentEyePanel() {
               <button
                 key={v}
                 onClick={() => setView(v)}
-                className={`rounded px-1.5 py-0.5 text-[10px] ${
+                className={`rounded px-1.5 py-0.5 text-[11px] ${
                   view === v ? 'bg-primary text-primary-foreground' : 'hover:bg-accent'
                 }`}
               >
@@ -331,7 +335,7 @@ export function AgentEyePanel() {
 
       {/* Scene orbit controls: az/el step the scene-eye camera. */}
       {isSceneScope && (
-        <div className="flex items-center justify-between gap-1 border-t border-border px-2 py-1 font-mono text-[10px]">
+        <div className="flex items-center justify-between gap-1 border-t border-border px-2 py-1 font-mono text-[11px]">
           <div className="flex items-center gap-0.5">
             <span className="text-muted-foreground">az</span>
             <button

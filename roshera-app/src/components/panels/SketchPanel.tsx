@@ -465,7 +465,7 @@ export function SketchPanel() {
         <div className="ml-auto flex items-center gap-1">
           {!isStandardPlane(sketch.plane) && (
             <span
-              className="px-2 py-0.5 border border-amber-400/60 text-amber-300 bg-amber-500/10 text-[10px] font-mono"
+              className="px-2 py-0.5 border border-amber-400/60 text-amber-300 bg-amber-500/10 text-[11px] font-mono"
               title="Sketch is anchored to a model face. Click XY/XZ/YZ to pivot off the face."
             >
               FACE
@@ -477,7 +477,7 @@ export function SketchPanel() {
               type="button"
               onClick={() => setSketchPlane(opt.value)}
               className={cn(
-                'px-2 py-0.5 border text-[10px] font-mono transition-colors',
+                'px-2 py-0.5 border text-[11px] font-mono transition-colors',
                 isStandardPlane(sketch.plane) && sketch.plane === opt.value
                   ? 'border-border text-foreground bg-foreground/10'
                   : 'border-border/40 text-muted-foreground hover:text-foreground hover:border-border/80',
@@ -509,7 +509,7 @@ export function SketchPanel() {
               type="button"
               onClick={() => setSketchTool(opt.value)}
               className={cn(
-                'flex items-center gap-1.5 px-2 py-1 border text-[10px] transition-colors',
+                'flex items-center gap-1.5 px-2 py-1 border text-[11px] transition-colors',
                 sketch.tool === opt.value
                   ? 'border-border text-foreground bg-foreground/10'
                   : 'border-border/40 text-muted-foreground hover:text-foreground hover:border-border/80',
@@ -542,7 +542,7 @@ export function SketchPanel() {
             type="button"
             onClick={() => setSketchView({ measure: !sketch.measure })}
             className={cn(
-              'flex items-center gap-1 px-2 py-1 border text-[10px] transition-colors',
+              'flex items-center gap-1 px-2 py-1 border text-[11px] transition-colors',
               sketch.measure
                 ? 'border-amber-400/60 text-amber-300 bg-amber-500/10'
                 : 'border-border/40 text-muted-foreground hover:text-foreground hover:border-border/80',
@@ -564,7 +564,7 @@ export function SketchPanel() {
           `addCircle` instead of the legacy sketch handler. */}
       {csketchActiveId !== null && (
         <div className="flex items-center gap-1">
-          <span className="text-[10px] text-muted-foreground/80 mr-1">
+          <span className="text-[11px] text-muted-foreground/80 mr-1">
             cSketch
           </span>
           {CSKETCH_TOOL_OPTIONS.map((opt) => {
@@ -578,7 +578,7 @@ export function SketchPanel() {
                   setCSketchTool(active ? null : opt.value)
                 }
                 className={cn(
-                  'flex items-center gap-1.5 px-2 py-1 border text-[10px] transition-colors',
+                  'flex items-center gap-1.5 px-2 py-1 border text-[11px] transition-colors',
                   active
                     ? 'border-sky-400/60 text-sky-300 bg-sky-500/10'
                     : 'border-border/40 text-muted-foreground hover:text-foreground hover:border-border/80',
@@ -622,7 +622,7 @@ export function SketchPanel() {
           out of scope for the single-sketch session (need cross-
           sketch coordination — see slice J-5). */}
       <div className="flex items-center gap-1 pt-1 border-t border-border/30 flex-wrap">
-        <span className="text-muted-foreground text-[10px] mr-1">Op</span>
+        <span className="text-muted-foreground text-[11px] mr-1">Op</span>
         {FINISH_OP_OPTIONS.map((opt) => {
           const Icon = opt.icon
           return (
@@ -631,7 +631,7 @@ export function SketchPanel() {
               type="button"
               onClick={() => setFinishOp(opt.value)}
               className={cn(
-                'flex items-center gap-1 px-2 py-0.5 border text-[10px] transition-colors',
+                'flex items-center gap-1 px-2 py-0.5 border text-[11px] transition-colors',
                 finishOp === opt.value
                   ? 'border-border text-foreground bg-foreground/10'
                   : 'border-border/40 text-muted-foreground hover:text-foreground hover:border-border/80',
@@ -645,7 +645,7 @@ export function SketchPanel() {
           )
         })}
         {finishOp === 'extrude_cut' && (
-          <span className="ml-2 text-[10px] font-mono text-muted-foreground">
+          <span className="ml-2 text-[11px] font-mono text-muted-foreground">
             target:{' '}
             <span className={cn(cutTargetId ? 'text-foreground' : 'text-rose-400')}>
               {cutTargetId ? cutTargetId.slice(0, 8) : '— select a body —'}
@@ -688,7 +688,7 @@ export function SketchPanel() {
           type="button"
           onClick={popSketchPoint}
           disabled={sketch.points.length === 0 || busy}
-          className="flex items-center gap-1.5 px-2 py-1 border border-border/40 text-muted-foreground hover:text-foreground hover:border-border/80 disabled:opacity-40 disabled:hover:text-muted-foreground transition-colors text-[10px]"
+          className="flex items-center gap-1.5 px-2 py-1 border border-border/40 text-muted-foreground hover:text-foreground hover:border-border/80 disabled:opacity-40 disabled:hover:text-muted-foreground transition-colors text-[11px]"
           title="Undo last point (Backspace)"
         >
           <Undo2 className="w-3 h-3" />
@@ -698,13 +698,13 @@ export function SketchPanel() {
           type="button"
           onClick={clearSketchPoints}
           disabled={sketch.points.length === 0 || busy}
-          className="flex items-center gap-1.5 px-2 py-1 border border-border/40 text-muted-foreground hover:text-foreground hover:border-border/80 disabled:opacity-40 disabled:hover:text-muted-foreground transition-colors text-[10px]"
+          className="flex items-center gap-1.5 px-2 py-1 border border-border/40 text-muted-foreground hover:text-foreground hover:border-border/80 disabled:opacity-40 disabled:hover:text-muted-foreground transition-colors text-[11px]"
           title="Clear all points"
         >
           <Trash2 className="w-3 h-3" />
           <span>Clear</span>
         </button>
-        <span className="text-muted-foreground text-[10px] ml-2">
+        <span className="text-muted-foreground text-[11px] ml-2">
           {sketch.points.length} pts
         </span>
 
@@ -725,7 +725,7 @@ export function SketchPanel() {
             (finishOp === 'extrude_cut' && cutTargetId === null)
           }
           className={cn(
-            'ml-auto flex items-center gap-1.5 px-3 py-1 border text-[10px] font-semibold transition-colors',
+            'ml-auto flex items-center gap-1.5 px-3 py-1 border text-[11px] font-semibold transition-colors',
             busy
               ? 'border-border/40 text-muted-foreground'
               : 'border-emerald-400/60 text-emerald-300 hover:bg-emerald-500/10 disabled:opacity-40',
@@ -757,7 +757,7 @@ export function SketchPanel() {
 
       {/* Live measurements + error */}
       {(summary || error) && (
-        <div className="flex items-center gap-4 pt-1 border-t border-border/30 text-[10px] text-muted-foreground font-mono">
+        <div className="flex items-center gap-4 pt-1 border-t border-border/30 text-[11px] text-muted-foreground font-mono">
           {summary && (
             <>
               <span>
@@ -793,7 +793,7 @@ interface NumberFieldProps {
 
 function NumberField({ label, value, onChange, min, step }: NumberFieldProps) {
   return (
-    <label className="flex items-center gap-1 text-[10px] text-muted-foreground">
+    <label className="flex items-center gap-1 text-[11px] text-muted-foreground">
       <span>{label}</span>
       <input
         type="number"
@@ -804,7 +804,7 @@ function NumberField({ label, value, onChange, min, step }: NumberFieldProps) {
           const n = Number(e.target.value)
           if (Number.isFinite(n)) onChange(n)
         }}
-        className="w-16 px-1.5 py-0.5 bg-background/40 border border-border/40 text-foreground text-[10px] font-mono focus:outline-none focus:border-border"
+        className="w-16 px-1.5 py-0.5 bg-background/40 border border-border/40 text-foreground text-[11px] font-mono focus:outline-none focus:border-border"
       />
     </label>
   )
@@ -824,7 +824,7 @@ interface AxisInputsProps {
  */
 function AxisInputs({ label, value, onChange }: AxisInputsProps) {
   return (
-    <span className="flex items-center gap-1 text-[10px] text-muted-foreground">
+    <span className="flex items-center gap-1 text-[11px] text-muted-foreground">
       <span>{label}</span>
       {(['x', 'y', 'z'] as const).map((axis, i) => (
         <input
@@ -839,7 +839,7 @@ function AxisInputs({ label, value, onChange }: AxisInputsProps) {
             next[i] = n
             onChange(next)
           }}
-          className="w-12 px-1 py-0.5 bg-background/40 border border-border/40 text-foreground text-[10px] font-mono focus:outline-none focus:border-border"
+          className="w-12 px-1 py-0.5 bg-background/40 border border-border/40 text-foreground text-[11px] font-mono focus:outline-none focus:border-border"
           title={`${label} ${axis}`}
           aria-label={`${label} ${axis}`}
         />
@@ -903,7 +903,7 @@ function DimensionInputs({ tool, points, setSketchPoint }: DimensionInputsProps)
     }
     return (
       <div className="flex items-center gap-3 pt-1 border-t border-border/30">
-        <span className="text-muted-foreground text-[10px]">Dimensions</span>
+        <span className="text-muted-foreground text-[11px]">Dimensions</span>
         <NumberField label="W" value={Math.abs(width)} onChange={setWidth} min={0} step={1} />
         <NumberField label="H" value={Math.abs(height)} onChange={setHeight} min={0} step={1} />
       </div>
@@ -930,9 +930,9 @@ function DimensionInputs({ tool, points, setSketchPoint }: DimensionInputsProps)
     }
     return (
       <div className="flex items-center gap-3 pt-1 border-t border-border/30">
-        <span className="text-muted-foreground text-[10px]">Dimensions</span>
+        <span className="text-muted-foreground text-[11px]">Dimensions</span>
         <NumberField label="R" value={r} onChange={setRadius} min={0.001} step={0.5} />
-        <span className="text-muted-foreground/60 text-[10px] font-mono">
+        <span className="text-muted-foreground/60 text-[11px] font-mono">
           Ø {(r * 2).toFixed(2)}
         </span>
       </div>
@@ -959,7 +959,7 @@ function DimensionInputs({ tool, points, setSketchPoint }: DimensionInputsProps)
   }
   return (
     <div className="flex items-start gap-3 pt-1 border-t border-border/30">
-      <span className="text-muted-foreground text-[10px] mt-1 whitespace-nowrap">
+      <span className="text-muted-foreground text-[11px] mt-1 whitespace-nowrap">
         Segments <span className="opacity-50">({segments.length})</span>
       </span>
       {/* Cap the editable-segment list to a small scrollable box. A dense or

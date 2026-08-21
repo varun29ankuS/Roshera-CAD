@@ -70,7 +70,7 @@ export function RefusalCard({ card }: { card: RefusalCardData }) {
         <div className="mt-1.5 flex items-start gap-1.5 text-[11px] leading-relaxed text-foreground/80">
           <Lightbulb size={10} className="mt-0.5 shrink-0 text-sky-400/70" />
           <span>
-            <span className="mr-1.5 font-mono text-[10px] uppercase tracking-wide text-muted-foreground">
+            <span className="mr-1.5 font-mono text-[11px] uppercase tracking-wide text-muted-foreground">
               hint
             </span>
             {card.hint}
@@ -79,7 +79,7 @@ export function RefusalCard({ card }: { card: RefusalCardData }) {
       )}
       {card.options !== undefined && card.options.length > 0 && (
         <div className="mt-1.5 space-y-0.5">
-          <div className="text-[10px] font-mono uppercase tracking-wide text-muted-foreground">
+          <div className="text-[11px] font-mono uppercase tracking-wide text-muted-foreground">
             next
           </div>
           {card.options.map((opt, i) => (

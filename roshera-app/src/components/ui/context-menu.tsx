@@ -176,7 +176,7 @@ export function ContextMenuSeparator() {
 /** Non-interactive header naming what the menu acts on. */
 export function ContextMenuHeader({ children }: { children: React.ReactNode }) {
   return (
-    <div className="truncate px-3 py-1 font-mono text-[10px] uppercase tracking-wider text-muted-foreground/70">
+    <div className="truncate px-3 py-1 font-mono text-[11px] uppercase tracking-wider text-muted-foreground/70">
       {children}
     </div>
   )

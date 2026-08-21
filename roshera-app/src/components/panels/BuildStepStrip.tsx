@@ -49,7 +49,7 @@ export function BuildStepStrip({
         <button
           type="button"
           onClick={() => setExpanded(false)}
-          className="cad-icon-btn ml-3 mt-1 h-5 gap-1 px-1.5 text-[10px] text-muted-foreground/70"
+          className="cad-icon-btn ml-3 mt-1 h-5 gap-1 px-1.5 text-[11px] text-muted-foreground/70"
           title="Collapse back into one row"
         >
           <ChevronDown size={10} />
@@ -83,7 +83,7 @@ export function BuildStepStrip({
         >
           <ChevronRight size={11} className="shrink-0 text-muted-foreground/60" />
           <span className="min-w-0 truncate text-[11px] text-foreground/85">{display}</span>
-          <span className="shrink-0 text-[10px] text-muted-foreground/60">
+          <span className="shrink-0 text-[11px] text-muted-foreground/60">
             — {lines.length} steps
           </span>
         </button>

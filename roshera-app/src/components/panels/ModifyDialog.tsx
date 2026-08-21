@@ -674,7 +674,7 @@ export function ModifyDialog({ open, mode, onOpenChange, onApply }: ModifyDialog
                 const rowValid = Number.isFinite(field.parsed) && field.parsed > 0
                 return (
                   <div key={field.label} className="flex flex-col gap-1">
-                    <span className="text-[10px] uppercase tracking-wider text-muted-foreground/70 font-mono">
+                    <span className="text-[11px] uppercase tracking-wider text-muted-foreground/70 font-mono">
                       {field.label}
                     </span>
                     <div className="flex items-stretch overflow-hidden rounded-md border border-input focus-within:border-ring focus-within:ring-3 focus-within:ring-ring/50">
@@ -729,7 +729,7 @@ export function ModifyDialog({ open, mode, onOpenChange, onApply }: ModifyDialog
         {spec.profile === 'stations' && (
           <Field label="Station radii">
             <div className="flex max-h-[240px] flex-col gap-1 overflow-y-auto pr-1">
-              <div className="grid grid-cols-[1fr_1fr_auto] items-center gap-1.5 pb-1 text-[10px] uppercase tracking-wider text-muted-foreground/70 font-mono">
+              <div className="grid grid-cols-[1fr_1fr_auto] items-center gap-1.5 pb-1 text-[11px] uppercase tracking-wider text-muted-foreground/70 font-mono">
                 <span>Station (0–1)</span>
                 <span>Radius (mm)</span>
                 <span className="w-6" />
@@ -895,7 +895,7 @@ export function ModifyDialog({ open, mode, onOpenChange, onApply }: ModifyDialog
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
   return (
     <label className="flex flex-col gap-1">
-      <span className="text-[10px] uppercase tracking-wider text-muted-foreground/70 font-mono">
+      <span className="text-[11px] uppercase tracking-wider text-muted-foreground/70 font-mono">
         {label}
       </span>
       {children}

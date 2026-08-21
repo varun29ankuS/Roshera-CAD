@@ -367,7 +367,7 @@ export function DocumentTabs() {
                   {doc.name}
                 </span>
               )}
-              <span className="truncate text-[9px] font-normal text-muted-foreground/60 tabular-nums">
+              <span className="truncate text-[11px] font-normal text-muted-foreground/60 tabular-nums">
                 {formatShortDate(doc.createdAt)}
                 {ambiguousNames.has(doc.name) && (
                   <span className="font-mono"> · {idFragment(doc.id)}</span>
@@ -423,7 +423,7 @@ export function DocumentTabs() {
             {hiddenDocuments.length > 0 && (
               <>
                 <div className="my-1 border-t border-border/40" />
-                <div className="px-3 py-1 text-[10px] uppercase tracking-wide text-muted-foreground/60">
+                <div className="px-3 py-1 text-[11px] uppercase tracking-wide text-muted-foreground/60">
                   Open existing
                 </div>
                 {hiddenDocuments.map((doc) => (
@@ -435,7 +435,7 @@ export function DocumentTabs() {
                     className="w-full flex flex-col min-w-0 text-left px-3 py-1.5 hover:bg-accent/40"
                   >
                     <span className="truncate text-foreground/90">{doc.name}</span>
-                    <span className="truncate text-[10px] text-muted-foreground/60 tabular-nums">
+                    <span className="truncate text-[11px] text-muted-foreground/60 tabular-nums">
                       {formatShortDate(doc.createdAt)}
                       <span className="font-mono"> · {idFragment(doc.id)}</span>
                     </span>

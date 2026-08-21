@@ -138,7 +138,7 @@ function EventNode({
       >
         {label}
       </div>
-      <div className="flex items-center gap-0.5 text-[10px] leading-tight mt-0.5">
+      <div className="flex items-center gap-0.5 text-[11px] leading-tight mt-0.5">
         <span className={authorTextClass(kind, isLatest)}>{glyph}</span>
         <span className={isLatest ? 'text-foreground/70' : 'text-muted-foreground/60'}>{rel}</span>
       </div>

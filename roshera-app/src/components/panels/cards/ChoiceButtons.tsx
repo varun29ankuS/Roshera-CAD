@@ -67,7 +67,7 @@ export function ChoiceButtons({
               <span className="min-w-0 truncate">{opt.label}</span>
             </span>
             {opt.detail && (
-              <span className="text-[10px] text-muted-foreground/80">{opt.detail}</span>
+              <span className="text-[11px] text-muted-foreground/80">{opt.detail}</span>
             )}
           </button>
         )

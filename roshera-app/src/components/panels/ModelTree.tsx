@@ -1097,10 +1097,10 @@ export function ModelTree({
                       <button
                         type="button"
                         onClick={() => toggleSection(group.key as SolidClass)}
-                        className="w-full flex items-center gap-1.5 px-1 pt-2 pb-0.5 text-[9px] font-mono uppercase tracking-[0.14em] text-muted-foreground/55 hover:text-muted-foreground transition-colors"
+                        className="w-full flex items-center gap-1.5 px-1 pt-2 pb-0.5 text-[11px] font-mono uppercase tracking-[0.14em] text-muted-foreground/55 hover:text-muted-foreground transition-colors"
                         aria-expanded={!collapsed}
                       >
-                        <span className="w-2 text-[8px]">{collapsed ? '▸' : '▾'}</span>
+                        <span className="w-2 text-[11px]">{collapsed ? '▸' : '▾'}</span>
                         <span>{group.label}</span>
                         <span className="text-muted-foreground/35">{group.nodes.length}</span>
                       </button>
