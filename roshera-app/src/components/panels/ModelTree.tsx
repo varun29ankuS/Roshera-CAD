@@ -206,7 +206,10 @@ function TreeItem({
    */
   onAdd?: (node: TreeNode) => void
 }) {
-  const [expanded, setExpanded] = useState(true)
+  // Datums are furniture: seven rows of Origin/planes/axes ahead of any
+  // content the reader came for. They collapse by default and expand on
+  // click; every other row keeps its previous behaviour.
+  const [expanded, setExpanded] = useState(node.id !== 'datum:group')
   const isSelected = selectedIds.has(node.id)
   const hasChildren = !!node.children && node.children.length > 0
 

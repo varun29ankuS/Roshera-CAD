@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { Canvas } from '@react-three/fiber'
 import { Box, Grid3x3, Ruler, SquareDashed, Tags } from 'lucide-react'
 import { CADGrid } from './CADGrid'
@@ -857,8 +857,48 @@ function SectionViewPanel() {
 
 /**
  * Bottom-edge mouse-control hints, blueprint styled.
+ *
+ * Shown until the viewport has actually been driven once, then never again.
+ * They were permanent, which makes them training wheels bolted to a
+ * professional tool: after the first orbit they are three lines of chrome
+ * telling an engineer what a mouse does, competing for the same corner as the
+ * geometry. Dismissal is keyed on USE rather than on a close button, because
+ * nobody should have to tidy up after a hint.
  */
+const VIEWPORT_HINTS_SEEN = 'roshera.viewportHintsSeen'
+
 function ViewportHints() {
+  const [dismissed, setDismissed] = useState(() => {
+    try {
+      return localStorage.getItem(VIEWPORT_HINTS_SEEN) === '1'
+    } catch {
+      // Private mode or a blocked store: show the hints. Erring toward
+      // showing them is the recoverable direction.
+      return false
+    }
+  })
+
+  useEffect(() => {
+    if (dismissed) return
+    const seen = () => {
+      setDismissed(true)
+      try {
+        localStorage.setItem(VIEWPORT_HINTS_SEEN, '1')
+      } catch {
+        /* not persisting is fine; they return next session and dismiss again */
+      }
+    }
+    // Any real camera input counts: a drag or a wheel over the canvas.
+    window.addEventListener('pointerdown', seen, { once: true })
+    window.addEventListener('wheel', seen, { once: true, passive: true })
+    return () => {
+      window.removeEventListener('pointerdown', seen)
+      window.removeEventListener('wheel', seen)
+    }
+  }, [dismissed])
+
+  if (dismissed) return null
+
   return (
     <div className="absolute bottom-3 left-3 pointer-events-none flex items-center gap-4 px-2.5 py-1 text-[10px] uppercase tracking-wider font-mono text-muted-foreground/80">
       <span>LMB · Orbit</span>
