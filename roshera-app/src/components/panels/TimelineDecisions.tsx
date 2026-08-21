@@ -20,13 +20,15 @@
  *    (Checkpoints themselves are durable — persisted on creation and
  *    restored at boot, api-server durability.rs.);
  *  - a quarantined boot (the kernel refusing to replay a tail it cannot
- *    certify) is disclosed in the strip header via `DurabilityChip` —
- *    amber, dashed, CircleSlash: the same "withheld / not checked"
- *    vocabulary the Blackboard cards already use. Never styled as an
- *    error — it is the kernel keeping its no-lying promise.
+ *    certify) is disclosed in the strip header via `DurabilityChip` — a
+ *    CAUTION pill, which is the shared "withheld / not checked" tone rather
+ *    than a look invented here. Never styled as an ERROR: withholding a tail
+ *    it cannot certify is the kernel keeping its no-lying promise, and a
+ *    negative tone would accuse it of failing at the moment it behaved.
  */
 import { useMemo, useState } from 'react'
-import { ChevronDown, ChevronRight, CircleSlash, Clock, Ruler, X } from 'lucide-react'
+import { StatusPill } from '@/components/ui/status-pill'
+import { ChevronDown, ChevronRight, Clock, Ruler } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import {
   type CheckpointSummary,
@@ -40,33 +42,32 @@ import {
 
 // ─── Durability chip (strip header) ─────────────────────────────────
 //
-// Tri-state colour language borrowed from `cards/card-chrome.tsx`:
-// amber dashed = withheld/not-checked, red = failure, neutral = off.
-// Colour carries STATE only; the calm cases (full replay, empty log)
-// produce no chip at all — `durabilityNotice` returns null for them.
+// Tri-state, mapped onto the shared status tones: caution = withheld /
+// not-checked, negative = failure, neutral = off. Colour carries STATE only;
+// the calm cases (full replay, empty log) produce no chip at all —
+// `durabilityNotice` returns null for them, and a component that renders
+// nothing when there is nothing to say is the whole point of the row.
 
 export function DurabilityChip({ notice }: { notice: DurabilityNotice }) {
+  // Withholding a tail the kernel cannot faithfully replay is a caution, and a
+  // failed boot is a negative. Both used bespoke amber/red class stacks that
+  // made them a third species next to every other badge on the bar; they wear
+  // the one status grammar now, and the ▲ / ✕ come from the tone rather than
+  // from a caller remembering an icon import.
   return (
-    <span
+    <StatusPill
+      tone={notice.tone === 'failed' ? 'negative' : notice.tone === 'withheld' ? 'caution' : 'neutral'}
+      // caution and negative carry their own ▲ / ✕. `off` maps to NEUTRAL,
+      // whose glyph is optional — so it is passed explicitly here rather than
+      // dropped: the chip used to show a CircleSlash in that state, and a
+      // silent relabel would have quietly deleted the signal while the commit
+      // claimed to be re-skinning.
+      glyph={notice.tone === 'off' ? '○' : undefined}
+      label={notice.label}
       title={notice.detail}
-      aria-label={notice.detail}
-      className={cn(
-        'inline-flex shrink-0 items-center gap-1 rounded border px-1.5 py-[2px] text-[10px] leading-none whitespace-nowrap',
-        notice.tone === 'withheld' &&
-          'border-dashed border-amber-500/40 bg-amber-500/5 text-amber-800 dark:text-amber-300',
-        notice.tone === 'failed' &&
-          'border-red-500/40 bg-red-500/10 text-red-800 dark:text-red-300',
-        notice.tone === 'off' &&
-          'border-dashed border-border text-muted-foreground',
-      )}
-    >
-      {notice.tone === 'failed' ? (
-        <X size={10} className="shrink-0" />
-      ) : (
-        <CircleSlash size={10} className="shrink-0" />
-      )}
-      {notice.label}
-    </span>
+      ariaLabel={notice.detail}
+      className="shrink-0"
+    />
   )
 }
 
