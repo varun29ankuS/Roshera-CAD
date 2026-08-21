@@ -147,6 +147,26 @@ export function DocumentTabs() {
     [documents, closedIds],
   )
 
+  /**
+   * Names carried by more than one OPEN tab.
+   *
+   * The id fragment used to be printed on every tab, at the same width as the
+   * date, which is where the strip lost its legibility: with 49 documents open
+   * the overwhelming majority have a unique name and the hash tells the reader
+   * nothing they can act on. It earns its place only where a name is genuinely
+   * ambiguous — and it is, for `Untitled` (x4), `Depth probe v3
+   * no-coincidence`, and four `Demo - ...` pairs, all of which are otherwise
+   * indistinguishable on the strip.
+   *
+   * So the disambiguator appears exactly where it disambiguates. The full id
+   * stays in the tab's `title`, reachable on hover, for every tab.
+   */
+  const ambiguousNames = useMemo(() => {
+    const seen = new Map<string, number>()
+    for (const d of tabs) seen.set(d.name, (seen.get(d.name) ?? 0) + 1)
+    return new Set([...seen].filter(([, n]) => n > 1).map(([name]) => name))
+  }, [tabs])
+
   const handleSwitch = useCallback(
     async (doc: DocumentInfo) => {
       if (doc.active || switchingId) return
@@ -349,7 +369,9 @@ export function DocumentTabs() {
               )}
               <span className="truncate text-[9px] font-normal text-muted-foreground/60 tabular-nums">
                 {formatShortDate(doc.createdAt)}
-                <span className="font-mono"> · {idFragment(doc.id)}</span>
+                {ambiguousNames.has(doc.name) && (
+                  <span className="font-mono"> · {idFragment(doc.id)}</span>
+                )}
               </span>
             </span>
             <button
