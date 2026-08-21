@@ -104,8 +104,15 @@ function DecisionChip({
           live intent declared through the new picker) without letting a
           run-on paragraph eat the rail. */}
       <span className="font-medium max-w-[44ch] truncate">{cp.name}</span>
+      {/* `spanOf`, not `cp.event_range`. The raw field is the RESTORE marker
+          and always starts at 0, so every chip on the rail read `#0-#N` — the
+          same left edge on every card, widening forever, telling the reader
+          nothing about which events this decision authored. `spanOf` returns
+          `covers` (the authored span) and is what the expanded row at the
+          bottom of this file already uses; this chip was the one place still
+          reaching past it. */}
       <span className="text-muted-foreground/80 font-mono text-[10px]">
-        {formatEventRange(cp.event_range)}
+        {formatEventRange(spanOf(cp))}
       </span>
       <span className="text-muted-foreground/60 text-[10px]">
         {cp.author} · {relativeTime(cp.timestamp)}
