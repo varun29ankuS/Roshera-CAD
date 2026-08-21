@@ -352,7 +352,7 @@ export function Blackboard() {
     return (
       <button
         onClick={togglePanel}
-        className="cad-focus absolute bottom-10 left-4 z-20 w-10 h-10 rounded-full bg-primary text-primary-foreground flex items-center justify-center shadow-lg hover:scale-105 transition-transform"
+        className="cad-focus absolute bottom-10 left-[15.5rem] z-20 w-10 h-10 rounded-full bg-primary text-primary-foreground flex items-center justify-center shadow-lg hover:scale-105 transition-transform"
         aria-label="Open Blackboard"
         title="Blackboard"
       >
@@ -362,7 +362,13 @@ export function Blackboard() {
   }
 
   return (
-    <div className="absolute bottom-8 left-3 z-20 w-[50rem] max-w-[calc(100vw-1.5rem)] flex flex-col rounded-xl overflow-hidden bg-background/35 backdrop-blur-md border border-border/60">
+    // Anchored CLEAR of the model-tree rail, not over it. The rail is
+    // `left-2 w-56` (App.tsx) and so ends at 232px; this panel sat at `left-3`
+    // with `z-20` against the rail's `z-10`, which meant an open Blackboard
+    // covered the entire tree. The tree was not unreadable — it was hidden,
+    // and every judgement about "the tree" was really about four datum rows.
+    // 15.5rem = the rail's right edge plus a gutter.
+    <div className="absolute bottom-8 left-[15.5rem] z-20 w-[50rem] max-w-[calc(100vw-17rem)] flex flex-col rounded-xl overflow-hidden bg-background/35 backdrop-blur-md border border-border/60">
       {/* Resize grip — a drag here overrides the attention-following split
           and STICKS until released (double-click, or the "auto" chip). */}
       <div
