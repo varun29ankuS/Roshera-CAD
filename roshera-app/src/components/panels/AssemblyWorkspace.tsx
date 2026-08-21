@@ -621,7 +621,7 @@ function ComponentRow({
         <span className="flex-1 truncate font-medium">{component.name}</span>
         <span className="text-muted-foreground">DoF: {component.degrees_of_freedom}</span>
         {component.is_fixed && (
-          <span className="text-[11px] uppercase text-amber-500/80">fixed</span>
+          <span className="text-[11px] uppercase text-caution">fixed</span>
         )}
         <button
           type="button"
@@ -769,7 +769,7 @@ function MateRow({
             </span>
           ) : (
             <span
-              className="inline-flex items-center gap-0.5 text-[11px] text-amber-600 dark:text-amber-400"
+              className="inline-flex items-center gap-0.5 text-[11px] text-caution "
               title="Not solved yet — run Solve"
             >
               <CircleSlash size={10} /> unsolved
@@ -807,7 +807,7 @@ function MateRow({
         className={[
           'cad-focus px-2 py-0.5 text-[11px] uppercase tracking-wider rounded border',
           mate.suppressed
-            ? 'border-amber-500/60 text-amber-500'
+            ? 'border-caution-border text-caution'
             : 'border-border text-muted-foreground hover:text-foreground',
         ].join(' ')}
       >

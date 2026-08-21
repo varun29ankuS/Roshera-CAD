@@ -103,7 +103,7 @@ const TOKENS_TITLE =
  *  assembly is a good turn. */
 function turnWeight(tokens: number): { className: string; label: string } {
   if (tokens < 40_000) return { className: 'text-emerald-500', label: 'light turn' }
-  if (tokens < 120_000) return { className: 'text-amber-500', label: 'moderate turn' }
+  if (tokens < 120_000) return { className: 'text-caution', label: 'moderate turn' }
   return { className: 'text-red-500', label: 'heavy turn' }
 }
 
@@ -395,8 +395,8 @@ export function Blackboard() {
             </span>
           )}
           {agentAttention === 'geometry' && (
-            <span className="flex shrink-0 items-center gap-1 text-[11px] text-amber-400/90">
-              <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-amber-400" />
+            <span className="flex shrink-0 items-center gap-1 text-[11px] text-caution">
+              <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-caution-wash" />
               executing — viewport has focus
             </span>
           )}
@@ -594,7 +594,7 @@ export function Blackboard() {
                   <span className="inline-flex items-center gap-1 text-red-600 dark:text-red-400">
                     <X size={10} /> fail
                   </span>
-                  <span className="inline-flex items-center gap-1 text-amber-600 dark:text-amber-400">
+                  <span className="inline-flex items-center gap-1 text-caution ">
                     <CircleSlash size={10} /> inconclusive
                   </span>
                 </div>
@@ -644,8 +644,8 @@ export function Blackboard() {
             role="status"
             className="flex flex-wrap items-center gap-1.5 border-b border-white/5 px-3 py-1.5 text-[11px]"
           >
-            <Clock size={10} className="shrink-0 text-amber-500" />
-            <span className="shrink-0 font-medium text-amber-600 dark:text-amber-400">
+            <Clock size={10} className="shrink-0 text-caution" />
+            <span className="shrink-0 font-medium text-caution ">
               {waiting.length} queued
             </span>
             <span className="shrink-0 text-muted-foreground/60">
@@ -655,7 +655,7 @@ export function Blackboard() {
               <span
                 key={w.id}
                 title={w.text}
-                className="max-w-[16rem] truncate rounded border border-dashed border-amber-500/40 bg-amber-500/5 px-1.5 py-0.5 text-amber-700 dark:text-amber-300"
+                className="max-w-[16rem] truncate rounded border border-dashed border-caution-border bg-caution-wash px-1.5 py-0.5 text-caution "
               >
                 {w.text}
               </span>

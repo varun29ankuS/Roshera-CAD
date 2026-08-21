@@ -210,7 +210,7 @@ const MODEL_PRESETS: { value: string; label: string }[] = [
  *  at a time (the active one — `ai_provider.rs::get_provider`'s `stored`
  *  is a single `Option`), so there is no "a key is stored for this OTHER
  *  mode" fact to report. `ready` only fires for CLI-detected modes, where
- *  "a credential exists" is a live fact (`cli.installed && cli.signed_in`)
+ * "a credential exists" is a live fact (`cli.installed && cli.signed_in`)
  *  independent of what Roshera has persisted. */
 type WireState = 'active' | 'ready' | 'available' | 'unavailable'
 
@@ -221,7 +221,7 @@ type WireState = 'active' | 'ready' | 'available' | 'unavailable'
 const STATE_STYLES: Record<WireState, { text: string; dot: string }> = {
   active: { text: 'text-emerald-400', dot: 'bg-emerald-500' },
   ready: { text: 'text-sky-400', dot: 'bg-sky-400' },
-  available: { text: 'text-amber-400/90', dot: 'bg-amber-400' },
+  available: { text: 'text-caution', dot: 'bg-caution-wash' },
   unavailable: { text: 'text-muted-foreground', dot: 'bg-muted-foreground/40' },
 }
 
@@ -845,14 +845,14 @@ export function ProviderSettingsButton() {
                 driven by `acpLive`, NOT by `data.active` alone — a saved
                 provider with no live session is a real, distinct state
                 (amber, not emerald) that needs its own control to resolve:
-                "Start agent" below, not just "Disconnect". */}
+ "Start agent" below, not just "Disconnect". */}
             {data.active && (
               <div
                 className={cn(
                   'flex items-center justify-between gap-2 rounded-md border px-3 py-1.5',
                   acpLive
                     ? 'border-emerald-500/40 bg-emerald-500/5'
-                    : 'border-amber-500/40 bg-amber-500/5',
+                    : 'border-caution-border bg-caution-wash',
                 )}
               >
                 <span className="flex flex-wrap items-center gap-1 text-[11px] text-foreground/90">
@@ -864,7 +864,7 @@ export function ProviderSettingsButton() {
                   {acpLive ? (
                     <CheckCircle2 size={12} className="text-emerald-500" />
                   ) : (
-                    <XCircle size={12} className="text-amber-400" />
+                    <XCircle size={12} className="text-caution" />
                   )}
                   <span className="font-medium">
                     {activeProviderMeta?.display_name ?? data.active.provider}
@@ -876,7 +876,7 @@ export function ProviderSettingsButton() {
                     {data.active.model && data.active.model_verified === false && ' (unverified)'}
                     {data.active.model && data.active.model_verified === true && ' (verified)'}
                   </span>
-                  <span className={acpLive ? 'text-emerald-500' : 'text-amber-400/90'}>
+                  <span className={acpLive ? 'text-emerald-500' : 'text-caution'}>
                     · {acpLive ? 'agent running' : 'agent not started'}
                   </span>
                 </span>
@@ -1039,7 +1039,7 @@ export function ProviderSettingsButton() {
                               the active one. Colour is the ONLY thing
                               distinguishing the four states here; "wired but
                               not connected" (amber/blue) must never look like
-                              "connected" (emerald) at a glance across the
+ "connected" (emerald) at a glance across the
                               row. What each colour MEANS used to be spelled
                               out in a standing legend below this row — that
                               read as explanation, not recognition, so it
@@ -1132,7 +1132,7 @@ export function ProviderSettingsButton() {
                                 {entry.spawns_local_process && (
                                   <Terminal
                                     size={10}
-                                    className="text-amber-400/90"
+                                    className="text-caution"
                                     aria-label="Spawns a local process on this machine"
                                   />
                                 )}
@@ -1210,7 +1210,7 @@ export function ProviderSettingsButton() {
                             `Test` accepts the key without a network round
                             trip (see this component's own module doc), so
                             THIS is the one action that earns a genuine
-                            "Verified" claim for those vendors. */}
+ "Verified" claim for those vendors. */}
                         <div className="flex items-center gap-2 border-t border-border/40 pt-2">
                           <Button
                             variant="outline"
@@ -1284,7 +1284,7 @@ export function ProviderSettingsButton() {
                     {/* Model — the ONE model control in this dialog, and a
                         plain, unambiguous picker: no colour, no inline
                         per-option styling, nothing that could read as
-                        "locked" or already-decided. CHOOSING a model
+ "locked" or already-decided. CHOOSING a model
                         (this dropdown) and what is actually ACTIVE (the
                         green line below) are two different facts — until
                         Save is pressed they can legitimately differ, and

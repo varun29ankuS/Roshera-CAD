@@ -55,8 +55,8 @@ const VERDICT_MARKER: Record<LineVerdict, { fill: string; icon: string }> = {
   pass: { fill: 'bg-emerald-500/20 ring-1 ring-emerald-500/60', icon: 'text-emerald-600 dark:text-emerald-400' },
   fail: { fill: 'bg-red-500/20 ring-1 ring-red-500/60', icon: 'text-red-600 dark:text-red-400' },
   inconclusive: {
-    fill: 'bg-amber-500/20 ring-1 ring-amber-500/60',
-    icon: 'text-amber-600 dark:text-amber-400',
+    fill: 'bg-caution-wash ring-1 ring-caution-border',
+    icon: 'text-caution ',
   },
 }
 
@@ -185,14 +185,14 @@ function TurnStatus({ elapsedMs, onCancel }: { elapsedMs: number; onCancel?: () 
   return (
     <div className="mt-1.5 flex flex-wrap items-center gap-2 text-[11px] text-muted-foreground/70">
       <span
-        className="flex items-center gap-1.5 font-medium text-amber-600 dark:text-amber-400"
+        className="flex items-center gap-1.5 font-medium text-caution "
         title={
           observed.kind === 'operation'
             ? 'The operation the kernel most recently served for this agent — observed from its own authenticated requests, never inferred.'
             : 'The turn is running but no operation has reached the kernel yet — the model may be thinking, or working without touching geometry. Nothing is invented here.'
         }
       >
-        <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-amber-500" />
+        <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-caution-wash" />
         <span>{activity}</span>
         <EllipsisDots />
       </span>
@@ -253,7 +253,7 @@ function TurnStatusGlyph({ status }: { status: AgentTurnStatus }) {
         'mt-0.5 inline-flex shrink-0',
         status === 'completed' && 'text-emerald-600 dark:text-emerald-400',
         status === 'failed' && 'text-red-600 dark:text-red-400',
-        status === 'cancelled' && 'text-amber-600 dark:text-amber-400',
+        status === 'cancelled' && 'text-caution ',
       )}
       title={title}
       aria-label={title}
@@ -629,7 +629,7 @@ export function BlackboardLine({ line, onCommit, onDelete, streaming = false, on
                   <RevealContext.Provider value={reveal}>
                     {/* Only the prose is height-capped; the choice buttons
                         below it are a control and must never sit behind a
-                        "show more". */}
+ "show more". */}
                     <ExpandableProse source={line.text}>
                       <MessageMarkdown content={line.text} />
                     </ExpandableProse>

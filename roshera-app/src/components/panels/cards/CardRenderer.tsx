@@ -20,7 +20,7 @@ export function CardRenderer({ kind, source }: { kind: CardKind; source: string 
   if (!result.ok) {
     return (
       <div className="my-1 rounded border border-border/70 bg-foreground/5 p-2">
-        <div className="mb-1 text-[11px] text-amber-400/80">
+        <div className="mb-1 text-[11px] text-caution">
           roshera:{kind} payload failed validation — {result.error}
         </div>
         <pre className="overflow-x-auto font-mono text-[0.8em] text-foreground/70">{source}</pre>

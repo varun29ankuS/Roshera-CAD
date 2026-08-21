@@ -1048,7 +1048,7 @@ export default function TimelineGraph({
             {truncated && tab === 'graph' && (
               <span
                 title="The lineage window filled up — producers outside it are not represented, so some nodes may look like roots that are not."
-                className="shrink-0 px-1.5 py-0.5 rounded text-[11px] uppercase tracking-wide border border-amber-500/40 text-amber-700 dark:text-amber-300"
+                className="shrink-0 px-1.5 py-0.5 rounded text-[11px] uppercase tracking-wide border border-caution-border text-caution "
               >
                 partial window
               </span>
@@ -1101,7 +1101,7 @@ export default function TimelineGraph({
           </div>
         )}
         {refusals.length > 0 && (
-          <div className="px-4 py-2 border-b border-border shrink-0 bg-amber-500/10 text-[11px] text-amber-800 dark:text-amber-300">
+          <div className="px-4 py-2 border-b border-border shrink-0 bg-caution-wash text-[11px] text-caution ">
             {refusals.map((l) => (
               <div key={l.branch.id} className="truncate">
                 <span className="font-semibold">{l.branch.name || 'main'}: lineage refused</span>
@@ -1140,18 +1140,18 @@ export default function TimelineGraph({
           ) : totalOps === 0 && unreachable.length > 0 ? (
             // A failed read is NOT an empty document — say which it was,
             // and offer the retry in place.
-            <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 text-[12px] text-amber-800 dark:text-amber-300">
+            <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 text-[12px] text-caution ">
               <span>lineage not read ({unreachable[0].unreachable}) — the log was not consulted</span>
               <button
                 type="button"
                 onClick={() => setLoadEpoch((n) => n + 1)}
-                className="px-2 py-1 rounded border border-amber-500/40 hover:bg-amber-500/10"
+                className="px-2 py-1 rounded border border-caution-border hover:bg-caution-wash"
               >
                 retry
               </button>
             </div>
           ) : totalOps === 0 && refusals.length > 0 ? (
-            <div className="absolute inset-0 flex items-center justify-center px-8 text-center text-[12px] text-amber-800 dark:text-amber-300">
+            <div className="absolute inset-0 flex items-center justify-center px-8 text-center text-[12px] text-caution ">
               no graph is drawn: the recorded lineage was refused (see above) — an empty map would
               be a false answer
             </div>

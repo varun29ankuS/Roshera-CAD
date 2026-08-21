@@ -1187,7 +1187,7 @@ function FlyoutGroup({ group, openId, onToggle }: {
         <group.icon size={22} strokeWidth={1.5} />
         {/* The rail is 56px and the label is derived by taking the tooltip's
             first word, which is fine for "Transform" and "Create" and clips
-            "Manufacturing" mid-word. Deriving a label by splitting a sentence
+ "Manufacturing" mid-word. Deriving a label by splitting a sentence
             is the fragile part — it works until a word is long — so the label
             truncates with an ellipsis instead of being cut off at the paint,
             and the full text stays on `title`/`aria-label` above. */}

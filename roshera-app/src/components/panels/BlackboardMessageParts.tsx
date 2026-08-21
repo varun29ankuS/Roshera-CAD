@@ -55,7 +55,7 @@ export interface ParsedToolCall {
 }
 
 /** Status word, glyph and colour for a tool call — the same tick / cross /
- *  "not run" vocabulary `cards/card-chrome.tsx` uses for certificate claims,
+ * "not run" vocabulary `cards/card-chrome.tsx` uses for certificate claims,
  *  plus a spinner for the one state a certificate never has: still running. */
 const TOOL_STATUS_STYLE: Record<
   ToolCallStatus,
@@ -63,12 +63,12 @@ const TOOL_STATUS_STYLE: Record<
 > = {
   pending: {
     word: 'queued',
-    chip: 'border-dashed border-amber-500/40 bg-amber-500/5 text-amber-700 dark:text-amber-300',
+    chip: 'border-dashed border-caution-border bg-caution-wash text-caution ',
     glyph: 'idle',
   },
   in_progress: {
     word: 'running',
-    chip: 'border-amber-500/40 bg-amber-500/10 text-amber-700 dark:text-amber-300',
+    chip: 'border-caution-border bg-caution-wash text-caution ',
     glyph: 'spin',
   },
   completed: {

@@ -318,7 +318,7 @@ function DatumFlag({ datum }: { datum: GdtDatumWire }) {
         zIndexRange={[100, 0]}
         distanceFactor={HTML_DISTANCE_FACTOR}
       >
-        <div className="px-1.5 py-0.5 text-[11px] font-mono tracking-wider bg-background/80 border border-amber-500/60 text-amber-400/60 backdrop-blur-sm whitespace-nowrap select-none line-through decoration-amber-500/40">
+        <div className="px-1.5 py-0.5 text-[11px] font-mono tracking-wider bg-background/80 border border-caution-border text-caution backdrop-blur-sm whitespace-nowrap select-none line-through decoration-caution">
           [{datum.label}] dangling
         </div>
       </Html>
@@ -381,7 +381,7 @@ function DatumFlag({ datum }: { datum: GdtDatumWire }) {
           className={`px-1.5 py-0.5 text-[11px] font-mono font-semibold tracking-wider bg-background/85 border backdrop-blur-sm whitespace-nowrap select-none ${
             isLive
               ? 'border-border/70 text-foreground'
-              : 'border-amber-500/60 text-amber-400/60 line-through decoration-amber-500/40'
+              : 'border-caution-border text-caution line-through decoration-caution'
           }`}
         >
           [{datum.label}]

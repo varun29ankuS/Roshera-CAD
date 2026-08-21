@@ -192,7 +192,7 @@ export function FcfCard({ card }: { card: FcfCardData }) {
             </div>
           )}
           {conforms === 'not_evaluable' && (
-            <div className="flex items-baseline gap-1.5 text-amber-600 dark:text-amber-400">
+            <div className="flex items-baseline gap-1.5 text-caution ">
               <CircleSlash size={11} className="shrink-0 translate-y-px" />
               <span>
                 NOT EVALUABLE
@@ -203,7 +203,7 @@ export function FcfCard({ card }: { card: FcfCardData }) {
             </div>
           )}
           {danglingDatums.length > 0 && (
-            <div className="text-amber-400/90">
+            <div className="text-caution">
               {danglingDatums.map((d) => (
                 // Geometry-anchoring slice: a dangling datum names a consumed
                 // face — the natural place to highlight lineage in the
@@ -230,7 +230,7 @@ export function FcfCard({ card }: { card: FcfCardData }) {
         <div className="mt-1 text-[11px] text-muted-foreground">{intentReason}</div>
       )}
       {dialectNote !== null && (
-        <div className="mt-0.5 text-[11px] text-amber-400/80">{dialectNote}</div>
+        <div className="mt-0.5 text-[11px] text-caution">{dialectNote}</div>
       )}
       {card.note && <div className="mt-1 text-[11px] text-foreground/70">{card.note}</div>}
     </CardShell>

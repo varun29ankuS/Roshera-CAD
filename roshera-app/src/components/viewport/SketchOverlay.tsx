@@ -1606,7 +1606,7 @@ function CSketchGeometricBadges({ plane }: { plane: SketchPlane }) {
                 b.status === 'conflict'
                   ? 'border-rose-400/60 text-rose-300 bg-rose-950/40'
                   : b.status === 'redundant'
-                    ? 'border-amber-400/50 text-amber-300 bg-amber-950/40'
+                    ? 'border-caution-border text-caution bg-caution-wash'
                     : 'border-border/60 text-foreground bg-background/80'
               return (
                 <div
@@ -2486,7 +2486,7 @@ function DimLabel({
   }, [editable, value])
 
   const tone =
-    variant === 'angle' ? 'border-amber-400/40 text-amber-300' : 'border-border/60 text-foreground'
+    variant === 'angle' ? 'border-caution-border text-caution' : 'border-border/60 text-foreground'
 
   // While editing, the label needs pointer events to receive keystrokes
   // and clicks. While read-only (no editable wiring) we keep

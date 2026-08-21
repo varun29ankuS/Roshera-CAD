@@ -424,7 +424,7 @@ export function TopBar() {
           <Badge variant="secondary" className="text-[11px] h-4 px-1.5" role="status">
             <span
               className={`inline-block w-1.5 h-1.5 rounded-full mr-1 ${
-                status === 'connecting' ? 'bg-yellow-400 animate-pulse' : 'bg-red-400'
+                status === 'connecting' ? 'bg-caution animate-pulse' : 'bg-red-400'
               }`}
             />
             {status}

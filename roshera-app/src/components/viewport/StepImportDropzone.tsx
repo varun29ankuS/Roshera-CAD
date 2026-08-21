@@ -285,7 +285,7 @@ function ImportReportCard({ phase, onDismiss }: { phase: ActivePhase; onDismiss:
 
       {phase.kind === 'loading' && (
         <div className="flex items-center gap-2 px-2.5 py-3 text-xs text-muted-foreground">
-          <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-amber-500" />
+          <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-caution-wash" />
           Reconstructing B-Rep…
         </div>
       )}
@@ -371,7 +371,7 @@ function ReportBody({ res }: { res: ImportResponse }) {
           {resolvedTypes === 1 ? '' : 's'}
         </div>
         {unsupportedTotal > 0 ? (
-          <div className="text-amber-600">
+          <div className="text-caution">
             skipped {unsupportedTotal} ({unsupportedTypes} type{unsupportedTypes === 1 ? '' : 's'}) — unsupported
           </div>
         ) : (

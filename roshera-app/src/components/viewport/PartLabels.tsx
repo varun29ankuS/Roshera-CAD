@@ -122,7 +122,7 @@ function LabelChip({ label }: { label: Label }) {
   // reads at a glance; the colour swatch still anchors which feature it
   // was. Live chips take the label colour on border + glyph when present,
   // else the neutral blueprint tone (older backend).
-  const staleTone = 'border-amber-400/60 text-amber-300 bg-amber-950/50'
+  const staleTone = 'border-caution-border text-caution bg-caution-wash'
   const neutralTone = 'border-border/70 text-foreground bg-background/85'
   const colored = !label.stale && label.color !== null
   const tone = label.stale ? staleTone : colored ? '' : neutralTone
@@ -165,7 +165,7 @@ function LabelChip({ label }: { label: Label }) {
         />
       )}
       <Icon className="w-3 h-3 shrink-0" aria-hidden />
-      <span className={label.stale ? 'line-through decoration-amber-400/70' : ''}>
+      <span className={label.stale ? 'line-through decoration-caution' : ''}>
         {text}
       </span>
       <ConformanceBadge label={label} />

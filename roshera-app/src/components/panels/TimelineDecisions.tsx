@@ -661,7 +661,7 @@ export function DecisionList({
       </div>
 
       {(nesting || truncated) && (
-        <div className="mb-2 space-y-1 rounded border border-dashed border-amber-500/40 bg-amber-500/5 px-2 py-1.5 text-[11px] text-amber-800 dark:text-amber-300">
+        <div className="mb-2 space-y-1 rounded border border-dashed border-caution-border bg-caution-wash px-2 py-1.5 text-[11px] text-caution ">
           {nesting && (
             <div>
               This backend does not send authored spans, so a decision's range is its RESTORE

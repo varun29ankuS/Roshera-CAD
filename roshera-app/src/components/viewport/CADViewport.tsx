@@ -456,7 +456,7 @@ function CSketchDofHud() {
       ? 'text-emerald-400'
       : statusTone === 'negative'
         ? 'text-rose-400'
-        : 'text-amber-300'
+        : 'text-caution'
 
   const conflictCount = report?.conflicts.length ?? 0
   const redundantCount = report?.redundant.length ?? 0
@@ -484,7 +484,7 @@ function CSketchDofHud() {
           {redundantCount > 0 && (
             <div className="flex items-center justify-between gap-3">
               <span className="text-muted-foreground">Redundant</span>
-              <span className="text-amber-300 font-semibold tabular-nums">
+              <span className="text-caution font-semibold tabular-nums">
                 {redundantCount}
               </span>
             </div>
@@ -505,7 +505,7 @@ function CSketchDofHud() {
             <span className="text-muted-foreground/70">
               Filtered this sketch (&lt;{filter.threshold.toFixed(2)})
             </span>
-            <span className="text-amber-300 font-semibold tabular-nums">
+            <span className="text-caution font-semibold tabular-nums">
               {filteredCount}
             </span>
           </div>

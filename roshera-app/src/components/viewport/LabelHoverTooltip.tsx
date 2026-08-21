@@ -99,12 +99,12 @@ function LabelRow({ label }: { label: Label }) {
   // the amber semantic; older backends (no colour) keep the neutral tone.
   const colored = !label.stale && label.color !== null
   const iconClass = label.stale
-    ? 'text-amber-400'
+    ? 'text-caution'
     : colored
       ? ''
       : 'text-muted-foreground'
   const nameClass = label.stale
-    ? 'text-amber-300 line-through decoration-amber-400/70'
+    ? 'text-caution line-through decoration-caution'
     : colored
       ? ''
       : 'text-foreground'

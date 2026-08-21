@@ -214,7 +214,7 @@ function TreeItem({
   const hasChildren = !!node.children && node.children.length > 0
 
   // Build lineage prefix: │ for ancestors with more siblings, spaces otherwise.
-  const lineagePrefix = ancestorIsLast.map((last) => (last ? '   ' : '│  ')).join('')
+  const lineagePrefix = ancestorIsLast.map((last) => (last ? ' ' : '│  ')).join('')
 
   // Branch char + arm char (the latter doubles as the expand/collapse affordance).
   const branchChar = isLast ? '└' : '├'
@@ -619,7 +619,7 @@ const SERVER_INVENTED_NAME = /^(Cylinder|Box|Sphere|Cone) \d+$/
 
 /** An UNJOINED solid classifies as `unnamed`, never as `part`. A row we
  *  could not measure must not be promoted to the section that means
- *  "this is a finished thing". */
+ * "this is a finished thing". */
 function classifySolid(part: AgentPart | undefined): SolidClass {
   if (part === undefined) return 'unnamed'
   const chosen = part.named && !SERVER_INVENTED_NAME.test(part.name)

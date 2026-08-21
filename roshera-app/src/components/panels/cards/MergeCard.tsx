@@ -83,7 +83,7 @@ export function MergeCard({ card }: { card: MergeCardData }) {
       {card.conflicts.length > 0 && (
         <div className="mt-1.5 space-y-1.5">
           {card.conflicts.map((c, i) => (
-            <div key={i} className="rounded border border-amber-500/25 bg-amber-500/5 px-2 py-1.5">
+            <div key={i} className="rounded border border-caution-border bg-caution-wash px-2 py-1.5">
               <div className="flex flex-wrap items-center gap-1.5">
                 {/* Geometry-anchoring slice: the conflict subject
                     ("solid:0", "entity:<uuid>") is the attach point for
@@ -92,7 +92,7 @@ export function MergeCard({ card }: { card: MergeCardData }) {
                 <span className="cad-readout rounded border border-border px-1 py-px text-[11px] text-foreground/90">
                   {c.subject}
                 </span>
-                <span className="rounded border border-amber-500/40 px-1 py-px text-[11px] text-amber-400">
+                <span className="rounded border border-caution-border px-1 py-px text-[11px] text-caution">
                   {humanizeConflictType(c.conflict_type)}
                 </span>
               </div>

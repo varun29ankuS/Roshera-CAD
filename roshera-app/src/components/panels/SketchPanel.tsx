@@ -465,7 +465,7 @@ export function SketchPanel() {
         <div className="ml-auto flex items-center gap-1">
           {!isStandardPlane(sketch.plane) && (
             <span
-              className="px-2 py-0.5 border border-amber-400/60 text-amber-300 bg-amber-500/10 text-[11px] font-mono"
+              className="px-2 py-0.5 border border-caution-border text-caution bg-caution-wash text-[11px] font-mono"
               title="Sketch is anchored to a model face. Click XY/XZ/YZ to pivot off the face."
             >
               FACE
@@ -544,7 +544,7 @@ export function SketchPanel() {
             className={cn(
               'flex items-center gap-1 px-2 py-1 border text-[11px] transition-colors',
               sketch.measure
-                ? 'border-amber-400/60 text-amber-300 bg-amber-500/10'
+                ? 'border-caution-border text-caution bg-caution-wash'
                 : 'border-border/40 text-muted-foreground hover:text-foreground hover:border-border/80',
             )}
             title="Show angles, perimeter, area"

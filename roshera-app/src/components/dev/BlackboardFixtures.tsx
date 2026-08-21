@@ -618,7 +618,7 @@ function SymbolReference() {
                   </span>
                 )}
                 {c.asme === 'removed-2018' && (
-                  <span className="text-[11px] text-amber-400/90">
+                  <span className="text-[11px] text-caution">
                     removed in ASME Y14.5-2018{c.isoName ? ` · ISO retains ${c.isoName.toLowerCase()}` : ''}
                   </span>
                 )}
@@ -644,7 +644,7 @@ function SymbolReference() {
               <span className="w-56 text-foreground/90">{m.name}</span>
               <span className="cad-readout w-20 text-muted-foreground">{m.codePoint ?? 'none'}</span>
               {m.glyph === null && (
-                <span className="text-[11px] text-amber-400/80">
+                <span className="text-[11px] text-caution">
                   no Unicode character — deliberate fallback, not a lookalike
                 </span>
               )}

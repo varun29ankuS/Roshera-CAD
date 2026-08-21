@@ -79,7 +79,7 @@ function StateChip({
         'inline-flex shrink-0 items-center gap-1 rounded border px-1.5 py-[2px] text-[11px] leading-none whitespace-nowrap',
         tone === 'recorded' && 'border-border text-foreground/80',
         (tone === 'partial' || tone === 'absent') &&
-          'border-dashed border-amber-500/40 bg-amber-500/5 text-amber-800 dark:text-amber-300',
+          'border-dashed border-caution-border bg-caution-wash text-caution ',
         tone === 'failed' && 'border-red-500/40 bg-red-500/10 text-red-800 dark:text-red-300',
       )}
     >
@@ -132,7 +132,7 @@ function OntologyCensus({ registry }: { registry: ToolRegistry }) {
     <div className="space-y-1.5">
       <div className="text-[11px] text-muted-foreground">
         <span className="font-medium text-foreground">{registry.tool_count} tools</span> served ·
-        experimental in <span className="text-amber-700 dark:text-amber-300">amber</span> · kernel-sourced
+        experimental in <span className="text-caution ">amber</span> · kernel-sourced
         purpose marked <span className="font-mono">k</span> (all others: curated from the MCP zod contract)
       </div>
       {[...BENCH_ORDER, ...strayBenches].map((bench) => {
@@ -167,7 +167,7 @@ function OntologyCensus({ registry }: { registry: ToolRegistry }) {
                     className={cn(
                       'font-mono text-[11px] leading-tight',
                       t.stability === 'experimental'
-                        ? 'text-amber-700 dark:text-amber-300'
+                        ? 'text-caution '
                         : 'text-foreground/85',
                     )}
                   >
@@ -365,7 +365,7 @@ function CoverageSection({
 function DriftSection({ registry }: { registry: Fetched<ToolRegistry> }) {
   return (
     <div className="space-y-1.5">
-      <div className="rounded border border-dashed border-amber-500/40 bg-amber-500/5 px-2 py-1.5 text-[11px] leading-snug text-amber-800 dark:text-amber-300">
+      <div className="rounded border border-dashed border-caution-border bg-caution-wash px-2 py-1.5 text-[11px] leading-snug text-caution ">
         <span className="font-medium">Per-tool comparison is not possible from this panel.</span>{' '}
         Two sources classify the same tools: the backend&apos;s <span className="font-mono">bench</span>{' '}
         column (api-server <span className="font-mono">agent_registry.rs</span>, shown in Section 1)

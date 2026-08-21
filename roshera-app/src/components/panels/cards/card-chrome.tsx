@@ -29,9 +29,9 @@ const ACCENT = {
     chalk: 'text-red-400/60',
   },
   warn: {
-    edge: 'border-l-amber-500/70',
-    text: 'text-amber-400',
-    chalk: 'text-amber-400/60',
+    edge: 'border-l-caution-border',
+    text: 'text-caution',
+    chalk: 'text-caution',
   },
   info: {
     edge: 'border-l-sky-500/70',
@@ -152,7 +152,7 @@ export function Claim({
           'inline-flex shrink-0 translate-y-px',
           status === true && 'text-emerald-600 dark:text-emerald-400',
           status === false && 'text-red-600 dark:text-red-400',
-          status === null && 'text-amber-600 dark:text-amber-400',
+          status === null && 'text-caution ',
         )}
       >
         {status === true ? <Check size={11} /> : status === false ? <X size={11} /> : <CircleSlash size={11} />}
@@ -213,7 +213,7 @@ export function ClaimBadge({
         status === true && 'border-emerald-500/30 bg-emerald-500/10 text-emerald-800 dark:text-emerald-300',
         status === false && 'border-red-500/40 bg-red-500/10 text-red-800 dark:text-red-300',
         status === null &&
-          'border-dashed border-amber-500/40 bg-amber-500/5 text-amber-800 dark:text-amber-300',
+          'border-dashed border-caution-border bg-caution-wash text-caution ',
       )}
     >
       <span
@@ -221,7 +221,7 @@ export function ClaimBadge({
           'inline-flex shrink-0',
           status === true && 'text-emerald-600 dark:text-emerald-400',
           status === false && 'text-red-600 dark:text-red-400',
-          status === null && 'text-amber-600 dark:text-amber-400',
+          status === null && 'text-caution ',
         )}
       >
         {status === true ? <Check size={10} /> : status === false ? <X size={10} /> : <CircleSlash size={10} />}
