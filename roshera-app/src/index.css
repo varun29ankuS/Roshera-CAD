@@ -28,7 +28,13 @@
   --accent-foreground: oklch(0.22 0.07 252);
   --destructive: oklch(0.50 0.20 25);
   --destructive-foreground: oklch(0.97 0.012 90);
-  --border: oklch(0.55 0.08 252);
+  /* HAIRLINE, not a pen. This was oklch(0.55 0.08 252) — nearly as dark as body
+     text — so every card, chip and panel read as a heavily outlined box and the
+     screen looked cluttered before a single element was misplaced. Ink is for
+     type; boxes get a hairline. The old value survives as --border-strong for
+     the few things that genuinely want a drawn edge. */
+  --border: oklch(0.88 0.015 252);
+  --border-strong: oklch(0.55 0.08 252);
   --input: oklch(0.85 0.03 252);
   --ring: oklch(0.30 0.10 252);
   /* Charts stay in the navy/cyan family — no rainbow palettes. */
@@ -89,7 +95,10 @@
   --accent-foreground: oklch(0.95 0 0);
   --destructive: oklch(0.65 0.22 25);
   --destructive-foreground: oklch(0.97 0.012 90);
-  --border: oklch(0.55 0 0);
+  /* Same split on the dark ground: a hairline that separates without drawing
+     attention, and the old weight kept for edges that must be seen. */
+  --border: oklch(0.34 0 0);
+  --border-strong: oklch(0.55 0 0);
   --input: oklch(0.28 0.060 252);
   --ring: oklch(0.92 0 0);
   /* Charts: neutral white-on-navy; destructive red preserved as the single
@@ -147,6 +156,7 @@
   --color-destructive: var(--destructive);
   --color-destructive-foreground: var(--destructive-foreground);
   --color-border: var(--border);
+  --color-border-strong: var(--border-strong);
   --color-input: var(--input);
   --color-ring: var(--ring);
   --color-chart-1: var(--chart-1);
