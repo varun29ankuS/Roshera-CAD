@@ -20,7 +20,7 @@
 //! production-sized models and an LRU cache would be premature).
 
 use crate::primitives::datum::{DatumId, DatumKind, LocationDescriptor};
-use crate::primitives::solid::{MassPropertiesMethod, SolidId};
+use crate::primitives::solid::{MassPropertiesMethod, SolidId, SolidRole};
 use serde::{Deserialize, Serialize};
 
 /// Topology fingerprint — counts of the canonical entity types a solid
@@ -405,8 +405,28 @@ pub struct PartReport {
 pub struct PartSummary {
     /// Stable kernel identifier.
     pub id: SolidId,
-    /// User-facing label or auto-generated placeholder.
+    /// User-facing label or auto-generated placeholder. Read `named` before
+    /// trusting this to mean anything — a placeholder is a rendering of an
+    /// absence, not a choice anybody made.
     pub name: String,
+    /// Whether `name` was CHOSEN or is a placeholder this layer generated.
+    ///
+    /// A tree that cannot tell those apart cannot tell a part from stock: a
+    /// solid somebody bothered to call `flange` and one the system called
+    /// `solid_76` are different kinds of thing, and the difference is already
+    /// in the model as `Option<String>` — it was simply flattened away on the
+    /// way out.
+    pub named: bool,
+    /// What produced this solid — see [`SolidRole`]. Derived from the
+    /// operation that built it, never declared by the caller, so it cannot be
+    /// forgotten or misreported.
+    ///
+    /// Together with `named` this is what separates the four things a reader
+    /// actually needs to tell apart: a named primitive is a part built in one
+    /// operation (`flange`), a named derived solid is the result of a
+    /// combination (`bore 1/4`), and an unnamed solid of either role is stock
+    /// or scaffolding nobody claimed.
+    pub role: SolidRole,
     /// Anchor datum id (denormalized for filterability).
     pub anchor_datum_id: DatumId,
     /// Anchor datum name (e.g. `"FrontPlane"`).
@@ -721,6 +741,8 @@ mod tests {
         let summary = PartSummary {
             id: 7,
             name: "Bracket".to_string(),
+            named: true,
+            role: SolidRole::Derived,
             anchor_datum_id: 1,
             anchor_datum_name: "FrontPlane".to_string(),
             location_oneliner: "FrontPlane, offset (0, 0, 0), 10×10×10".to_string(),
@@ -728,6 +750,10 @@ mod tests {
         let json = serde_json::to_string(&summary).expect("serialize");
         assert!(json.contains("\"id\":7"));
         assert!(json.contains("\"name\":\"Bracket\""));
+        // Both reach the wire. A reader that cannot see them cannot tell a
+        // part from stock, which is the whole reason they exist.
+        assert!(json.contains("\"named\":true"));
+        assert!(json.contains("\"role\":\"derived\""));
         assert!(json.contains("\"anchor_datum_id\":1"));
         assert!(json.contains("\"anchor_datum_name\":\"FrontPlane\""));
     }

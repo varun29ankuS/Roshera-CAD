@@ -99,6 +99,32 @@ pub struct Feature {
     pub suppressed: bool,
 }
 
+/// What produced a solid — a fact about its own history, never a label a
+/// caller had to remember to attach.
+///
+/// The model tree has no way to separate a part from its scaffolding: a cutter
+/// body nobody consumed, the result of a difference, and a finished part all
+/// render as the same row, because a solid carried no kind at all. A
+/// caller-declared kind (`role: "tool"` on the create call) was rejected for
+/// the reason the house rule gives — an agent that forgets to pass it is
+/// indistinguishable from one that meant it, so tidiness would be something
+/// steering has to win rather than something the model states. This is derived
+/// instead: a boolean consumes its operands, so a solid still alive that never
+/// went through one was combined into nothing.
+///
+/// Deliberately only two cases. "Assembly", "part" and "feature of a part" are
+/// real distinctions and belong to the assembly hierarchy, which this is not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SolidRole {
+    /// Straight from a constructor (box, cylinder, sphere, revolve, extrude)
+    /// and through no boolean: loose stock, a tool body, an abandoned attempt.
+    #[default]
+    Primitive,
+    /// Came out of a boolean, so operands were consumed to build it.
+    Derived,
+}
+
 /// Solid attributes
 #[derive(Debug, Clone)]
 pub struct SolidAttributes {
@@ -117,6 +143,9 @@ pub struct SolidAttributes {
     pub selectable: bool,
     /// User-defined attributes
     pub user_data: HashMap<String, String>,
+    /// What produced this solid. Set by the kernel, not by the caller — see
+    /// [`SolidRole`].
+    pub role: SolidRole,
 }
 
 impl Default for SolidAttributes {
@@ -129,6 +158,10 @@ impl Default for SolidAttributes {
             selected: false,
             selectable: true,
             user_data: HashMap::new(),
+            // Primitive is the honest default: a solid that has been through
+            // no boolean has been combined with nothing, and every
+            // constructor lands here before any operation claims it.
+            role: SolidRole::Primitive,
         }
     }
 }

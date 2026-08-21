@@ -4289,8 +4289,18 @@ async fn create_cylinder_primitive(
     let result_id_str = result_uuid.to_string();
     state.register_id_mapping(result_uuid, result_solid_id);
 
-    let name = display_name.unwrap_or_else(|| format!("Cylinder {result_solid_id}"));
-    persist_display_name(&state, &model_handle, result_solid_id, &name).await;
+    // A label nobody chose is not a name. Persisting an invented
+    // "Cylinder 93" made it indistinguishable from one the builder meant, and a
+    // tree cannot then separate a part from loose stock. The placeholder is
+    // still needed for the viewport broadcast below, so it is computed for
+    // DISPLAY and never written back to the solid; `PartSummary::named`
+    // carries the difference to any reader that asks.
+    let name = display_name
+        .clone()
+        .unwrap_or_else(|| format!("Cylinder {result_solid_id}"));
+    if let Some(chosen) = display_name.as_deref() {
+        persist_display_name(&state, &model_handle, result_solid_id, chosen).await;
+    }
     let parameters = serde_json::json!({
         "center": c, "axis": ax, "radius": radius, "height": height,
     });
@@ -4509,8 +4519,18 @@ async fn create_box_primitive(
     let result_id_str = result_uuid.to_string();
     state.register_id_mapping(result_uuid, result_solid_id);
 
-    let name = display_name.unwrap_or_else(|| format!("Box {result_solid_id}"));
-    persist_display_name(&state, &model_handle, result_solid_id, &name).await;
+    // A label nobody chose is not a name. Persisting an invented
+    // "Box 93" made it indistinguishable from one the builder meant, and a
+    // tree cannot then separate a part from loose stock. The placeholder is
+    // still needed for the viewport broadcast below, so it is computed for
+    // DISPLAY and never written back to the solid; `PartSummary::named`
+    // carries the difference to any reader that asks.
+    let name = display_name
+        .clone()
+        .unwrap_or_else(|| format!("Box {result_solid_id}"));
+    if let Some(chosen) = display_name.as_deref() {
+        persist_display_name(&state, &model_handle, result_solid_id, chosen).await;
+    }
     let parameters = serde_json::json!({
         "center": center, "u_axis": u, "v_axis": v,
         "width": width, "depth": depth, "height": height,
@@ -4718,8 +4738,18 @@ async fn create_cone_primitive(
     let result_id_str = result_uuid.to_string();
     state.register_id_mapping(result_uuid, result_solid_id);
 
-    let name = display_name.unwrap_or_else(|| format!("Cone {result_solid_id}"));
-    persist_display_name(&state, &model_handle, result_solid_id, &name).await;
+    // A label nobody chose is not a name. Persisting an invented
+    // "Cone 93" made it indistinguishable from one the builder meant, and a
+    // tree cannot then separate a part from loose stock. The placeholder is
+    // still needed for the viewport broadcast below, so it is computed for
+    // DISPLAY and never written back to the solid; `PartSummary::named`
+    // carries the difference to any reader that asks.
+    let name = display_name
+        .clone()
+        .unwrap_or_else(|| format!("Cone {result_solid_id}"));
+    if let Some(chosen) = display_name.as_deref() {
+        persist_display_name(&state, &model_handle, result_solid_id, chosen).await;
+    }
     let parameters = serde_json::json!({
         "center": c, "axis": ax,
         "base_radius": base_radius, "top_radius": top_radius, "height": height,

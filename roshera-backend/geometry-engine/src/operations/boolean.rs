@@ -19424,7 +19424,12 @@ fn reconstruct_topology(
         ));
     }
 
-    let solid = crate::primitives::solid::Solid::new(0, outer_shell);
+    let mut solid = crate::primitives::solid::Solid::new(0, outer_shell);
+    // This solid exists because operands were consumed to build it. Stamped
+    // here, at the one place a boolean result is constructed, so the kind is a
+    // consequence of what happened rather than something a caller declared and
+    // could have got wrong. See `SolidRole`.
+    solid.attributes.role = crate::primitives::solid::SolidRole::Derived;
     let solid_id = model.solids.add(solid);
 
     // Attach the remaining shells to the slot their PROVED status earned.

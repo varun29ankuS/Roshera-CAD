@@ -176,6 +176,11 @@ impl BRepModel {
                     }
                 }
                 let location = self.solid_location_descriptor_cached(id)?;
+                // `named` is the fact; the placeholder is only how an
+                // absence is rendered. Capture it BEFORE the fallback flattens
+                // the two together.
+                let named = solid.name.is_some();
+                let role = solid.attributes.role;
                 let name = solid.name.clone().unwrap_or_else(|| format!("solid_{id}"));
                 if let Some(needle) = needle_lower.as_deref() {
                     if !name.to_lowercase().contains(needle) {
@@ -186,6 +191,8 @@ impl BRepModel {
                 Some(PartSummary {
                     id,
                     name,
+                    named,
+                    role,
                     anchor_datum_id: location.anchor_datum_id,
                     anchor_datum_name: location.anchor_datum_name,
                     location_oneliner,
