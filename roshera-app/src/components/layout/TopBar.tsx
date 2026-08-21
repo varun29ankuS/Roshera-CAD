@@ -407,21 +407,29 @@ export function TopBar() {
         >
           {useThemeStore((s) => s.theme) === 'dark' ? <Sun size={14} /> : <Moon size={14} />}
         </button>
-        <Badge
-          variant={status === 'connected' ? 'default' : 'secondary'}
-          className="text-[10px] h-4 px-1.5"
-        >
+        {/* Connection is a boolean, and a boolean does not need a sentence.
+            This was a navy-FILLED badge reading the word "connected" — the
+            loudest object in the top bar, announcing the least interesting
+            fact on screen, and claiming a fill that is reserved for "this is
+            the active mode". Healthy is now a bare dot; only the states worth
+            interrupting for keep their words. */}
+        {status === 'connected' ? (
           <span
-            className={`inline-block w-1.5 h-1.5 rounded-full mr-1 ${
-              status === 'connected'
-                ? 'bg-green-400'
-                : status === 'connecting'
-                  ? 'bg-yellow-400 animate-pulse'
-                  : 'bg-red-400'
-            }`}
+            className="inline-block w-1.5 h-1.5 rounded-full bg-emerald-500/80"
+            title="Connected to the kernel"
+            aria-label="Connected to the kernel"
+            role="status"
           />
-          {status}
-        </Badge>
+        ) : (
+          <Badge variant="secondary" className="text-[10px] h-4 px-1.5" role="status">
+            <span
+              className={`inline-block w-1.5 h-1.5 rounded-full mr-1 ${
+                status === 'connecting' ? 'bg-yellow-400 animate-pulse' : 'bg-red-400'
+              }`}
+            />
+            {status}
+          </Badge>
+        )}
       </div>
     </div>
   )
