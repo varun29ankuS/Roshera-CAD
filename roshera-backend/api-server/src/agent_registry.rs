@@ -1900,6 +1900,84 @@ fn raw_tools() -> Vec<ToolSpec> {
                 "required": []
             }),
         ),
+        t(
+            "workbench",
+            Core,
+            Stable,
+            Curated,
+            "Switch the LIVE toolset to a CAD workbench — an attention optimization, never a capability gate (find_tool/describe_tool/invoke reach every tool in any mode). Entering a bench adds its tools to the always-on core+meta surface and retires the previous bench. modes: 'sketch' (psketch_*), 'assembly', 'drawing' (dimensions/GD&T), 'analysis' (queries/ground_truth), 'labels' (labels + the shared human-visible notebook), 'timeline' (history/branch/merge/moulds), 'core_only' (retire the bench), 'status' (active bench, exposed count, token bill).",
+            json!({
+                "type": "object",
+                "properties": {
+                    "mode": {"type": "string", "enum": ["sketch", "assembly", "drawing", "analysis", "labels", "timeline", "core_only", "status"], "description": "bench to enter, 'core_only' to retire the bench, or 'status'"}
+                },
+                "required": ["mode"],
+                "additionalProperties": false
+            }),
+        ),
+
+        t(
+            "cad_program",
+            Core,
+            Stable,
+            Curated,
+            "Run up to 50 tool ops as ONE certified program through the SAME handlers individual calls use. ALL ops are schema-validated up front — any bad op refuses the WHOLE program (per-op report, nothing runs). Execution is sequential and STOPS at the first failure, returning a LEDGER {completed, total, ops:[{index, tool, ok, certificate|error}]} — the certificate is each op's own soundness verdict. NO rollback: backend state = the completed prefix exactly; undo is your explicit next call. Ops may not be meta/composition tools, nor clear_parts/delete_part unless allow_destructive is set. A many-vertex profile is ONE polyline op, never one op per vertex (single-point runs past 8 refuse typed). CHAINING: a string arg exactly '$N.key' or '$prev.key' (dot-path into an earlier op's result) resolves before the op runs — begin, polyline {csketch_id:'$0.csketch_id'}, extrude is ONE program. Placeholder ops validate at run time; an unresolvable path or forward reference is a typed refusal; '$$' escapes a literal '$'.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "optional label for the program (echoed in the ledger)"},
+                    "ops": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "tool": {"type": "string", "minLength": 1, "description": "exact tool name (from find_tool)"},
+                                "args": {"type": "object", "additionalProperties": {}, "description": "the tool's arguments (validated by its own schema)"}
+                            },
+                            "required": ["tool"],
+                            "additionalProperties": false
+                        },
+                        "minItems": 1,
+                        "maxItems": 50,
+                        "description": "ordered ops to run (1..50)"
+                    },
+                    "allow_destructive": {"type": "boolean", "description": "permit clear_parts/delete_part ops (footgun guard; default false)"}
+                },
+                "required": ["ops"],
+                "additionalProperties": false
+            }),
+        ),
+
+        t(
+            "ask_choice",
+            Labels,
+            Stable,
+            Curated,
+            "THE way to ask the human a closed question (a clearance class, a standard, a process, a datum): pass the question and the options, get back a ```roshera:choices``` fence the Blackboard renders as clickable buttons — correctly formed by construction, so the human never retypes your list. Post the returned fence VERBATIM as its own line with blackboard_add_entry (or end your reply with it). Only for a genuinely closed set you can name; keep asking in prose when the answer is a number, a name, or anything open. Every option must be one you would actually accept.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "question": {"type": "string", "description": "the closed question, one sentence"},
+                    "options": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "value": {"type": "string", "description": "sent verbatim as the human's reply when clicked"},
+                                "label": {"type": "string", "description": "button text; defaults to value"},
+                                "detail": {"type": "string", "description": "secondary text beneath the label"}
+                            },
+                            "required": ["value"],
+                            "additionalProperties": false
+                        },
+                        "minItems": 2,
+                        "description": "the closed set, >= 2 options you would all accept"
+                    }
+                },
+                "required": ["question", "options"],
+                "additionalProperties": false
+            }),
+        ),
     ]
 }
 
@@ -2080,7 +2158,17 @@ mod tests {
         // src/tools/timeline.ts entry and its `BENCH_OF.recipe_get` row;
         // full-table only, the same non-resident placement as the rest of the
         // Timeline bench.
-        assert_eq!(tools.len(), 105, "expected 105 tools, got {}", tools.len());
+        // 106-108: `workbench`, `cad_program` (Core / Stable / Curated) and
+        // `ask_choice` (Labels / Stable / Curated) — all three shipped on the
+        // MCP side with working schemas and handlers but had no backend row,
+        // so every `roshera-mcp` spawn printed "tool inventory drift —
+        // compiled but not in kernel: ask_choice, workbench, cad_program".
+        // Same shape as 103 and found the same way: the ontology drift gate
+        // cross-checks this table against roshera-mcp's BENCH_OF, and a tool
+        // classified on one side only has no row on the other. Purposes and
+        // schemas are transcribed verbatim from what `describe_tool` serves,
+        // which is the compiled zod contract and therefore the wire truth.
+        assert_eq!(tools.len(), 108, "expected 108 tools, got {}", tools.len());
     }
 
     /// The kernel-sourced rows correspond to operations actually registered in

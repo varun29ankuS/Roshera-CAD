@@ -38,131 +38,78 @@ const ALLOWED_BENCHES: &[&str] = &[
     "core", "sketch", "assembly", "drawing", "analysis", "labels", "timeline",
 ];
 
-/// The complete set of tool names the MCP server exposes today (102 tools).
+/// The tool names `roshera-mcp` classifies today, read from ITS OWN table.
 ///
-/// Extracted verbatim from `roshera-mcp/src/tools/*.ts` +
-/// `roshera-mcp/src/core.ts` `server.tool(…)` / `server.registerTool(…)`
-/// registrations. This is the COMPLETENESS PIN: it is intentionally an
-/// explicit hand-list, not a glob, so a new MCP tool must be added here AND
-/// given a registry entry in the same change — otherwise this test goes red.
-const MCP_TOOL_NAMES: &[&str] = &[
-    // assembly.ts
-    "assembly_add_instance",
-    "assembly_certify",
-    "assembly_create",
-    "assembly_dof",
-    "assembly_drag",
-    "assembly_interference",
-    "assembly_list_instances",
-    "assembly_mate",
-    "assembly_solve",
-    "assembly_transform_instance",
-    "assembly_verify",
-    "assembly_view",
-    // timeline.ts
-    "bind_parameter_name",
-    "clear_timeline",
-    "rebuild_certificate",
-    "timeline_branch",
-    "timeline_branches",
-    "timeline_checkpoint",
-    "timeline_checkpoints",
-    "timeline_conflicts",
-    "timeline_history",
-    "timeline_merge",
-    "timeline_mould",
-    "timeline_redo",
-    "timeline_scrub",
-    "timeline_switch",
-    "timeline_undo",
-    // blackboard.ts
-    "blackboard_add_entry",
-    "blackboard_clear",
-    "blackboard_edit_entry",
-    "blackboard_list",
-    // modify.ts
-    "boolean",
-    "boolean_many",
-    "chamfer_edges",
-    "clear_parts",
-    "delete_part",
-    "drill_pattern",
-    "fillet_edges",
-    "shell",
-    "transform",
-    // create.ts
-    "create_box",
-    "create_cone",
-    "create_cylinder",
-    "create_sketch",
-    "create_sphere",
-    "nurbs_loft",
-    "plane_from_face",
-    "revolve",
-    "sketch_add_shape",
-    "sketch_extrude",
-    "sketch_points",
-    // inspect.ts
-    "dfm_check",
-    "document_units",
-    "get_face",
-    "get_part",
-    "get_revolve_profile",
-    "list_parts",
-    "mass_properties",
-    "part_distance",
-    "part_features",
-    "select_edge",
-    "select_face",
-    "set_part_color",
-    "verify_claim",
-    // kb.ts
-    "kb_lookup",
-    // io.ts
-    "drawing_export_sheet",
-    "export_part",
-    "import_step",
-    "make_drawing",
-    // drawing.ts
-    "drawing_query",
-    "drawing_read_semantics",
-    // perception.ts
-    "dimension_part",
-    "get_pointer",
-    "ground_truth",
-    "measure_faces",
-    "occupancy_view",
-    "part_coverage",
-    "render_part",
-    "scene_view",
-    "section_view",
-    "verify_part",
-    // gdt.ts
-    "gdt_datum",
-    "gdt_fcf",
-    "gdt_report",
-    // labels.ts
-    "label_create",
-    "label_delete",
-    "label_list",
-    "label_rename",
-    "label_resolve",
-    "propose_labels",
-    // psketch.ts
-    "psketch_add_entity",
-    "psketch_begin",
-    "psketch_certify",
-    "psketch_constrain",
-    "psketch_dof",
-    "psketch_extrude",
-    "psketch_op",
-    "psketch_revolve",
-    "psketch_solve",
-    // queries.ts
-    "point_query",
-    "ray_query",
-    "region_query",
-];
+/// This used to be `MCP_TOOL_NAMES`, a hand-kept list in this file, justified
+/// as a completeness pin: "a new MCP tool must be added here AND given a
+/// registry entry in the same change — otherwise this test goes red."
+///
+/// The mechanism is backwards, and it failed silently for six tools. The list
+/// only goes red when somebody remembers to update it, which is precisely the
+/// step that gets forgotten; `ask_choice`, `cad_program`, `document_rename`,
+/// `psketch_plane_from_face`, `recipe_get` and `workbench` all reached the MCP
+/// AND the backend registry while this constant sat at 102 and the gate
+/// reported green. A hand-kept copy of a surface is a third surface, and the
+/// whole point of a drift gate is to compare two INDEPENDENTLY MAINTAINED
+/// ones. So it now reads `BENCH_OF` — the classification the MCP actually
+/// ships — and a tool added there is visible here the moment it exists.
+///
+/// Parse failure is a HARD failure, never an empty set: a gate that checked
+/// nothing must not be indistinguishable from a gate that passed.
+fn mcp_tool_names() -> Vec<String> {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("roshera-mcp")
+        .join("src")
+        .join("registry.ts");
+    let source = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+        panic!(
+            "cannot read roshera-mcp's registry at {}: {e}",
+            path.display()
+        )
+    });
+
+    let after = source
+        .split_once("BENCH_OF")
+        .unwrap_or_else(|| panic!("registry.ts no longer contains BENCH_OF"))
+        .1;
+    let body = after
+        .split_once("};")
+        .unwrap_or_else(|| panic!("BENCH_OF is not terminated by a closing brace"))
+        .0;
+
+    let mut names: Vec<String> = Vec::new();
+    for line in body.lines() {
+        let line = line.trim();
+        if line.starts_with("//") {
+            continue;
+        }
+        let Some((key, _)) = line.split_once(':') else {
+            continue;
+        };
+        let key = key.trim().trim_matches('"').trim_matches('\'');
+        if !key.is_empty()
+            && key
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        {
+            names.push(key.to_string());
+        }
+    }
+
+    // A floor, not a count: pinning the exact number would recreate the
+    // hand-maintained constant this replaced. This only catches the case where
+    // the parse broke and returned a set too small to be real.
+    assert!(
+        names.len() > 80,
+        "parsed only {} tool names from roshera-mcp's BENCH_OF — the parse is \
+         broken, and an empty-ish set would make this gate pass without \
+         checking anything",
+        names.len()
+    );
+    names
+}
 
 /// GET a URI through the live router and return `(status, json_body)`.
 async fn get(state: &AppState, uri: &str) -> (StatusCode, Value) {
@@ -267,13 +214,14 @@ async fn tool_registry_covers_every_mcp_tool() {
     let names: std::collections::HashSet<&str> =
         tools.iter().filter_map(|t| t["name"].as_str()).collect();
 
-    let missing: Vec<&&str> = MCP_TOOL_NAMES
-        .iter()
-        .filter(|n| !names.contains(**n))
-        .collect();
+    let mcp = mcp_tool_names();
+    let missing: Vec<&String> = mcp.iter().filter(|n| !names.contains(n.as_str())).collect();
     assert!(
         missing.is_empty(),
-        "registry is missing entries for MCP tools exposed today: {missing:?}"
+        "registry is missing entries for {} of the {} tools roshera-mcp \
+         classifies today: {missing:?}",
+        missing.len(),
+        mcp.len()
     );
 }
 
