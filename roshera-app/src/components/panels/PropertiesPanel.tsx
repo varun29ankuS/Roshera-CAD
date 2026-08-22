@@ -44,7 +44,11 @@ export function PropertiesPanel() {
   const ag = obj.analyticalGeometry
 
   return (
-    <div className="w-56 border-l border-border bg-card flex flex-col min-h-0 overflow-hidden">
+    // No w-56, no border-l, no bg: the right dock owns the column's chrome.
+    // A panel that carries its own shell inside a dock draws a second border
+    // and a second width, which is how a "docked" panel ends up looking pasted
+    // on rather than built in.
+    <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
       <div className="cad-panel-header">Properties</div>
 
       <ScrollArea className="flex-1 min-h-0">

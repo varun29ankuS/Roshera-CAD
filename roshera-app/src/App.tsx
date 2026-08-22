@@ -165,7 +165,6 @@ export function App() {
             <div className="relative flex-1 overflow-hidden">
               <CADViewport />
               <Blackboard />
-              <AgentEyePanel />
               <StepImportDropzone />
 
               {/* Browser — single consolidated panel. The header chip is
@@ -183,8 +182,20 @@ export function App() {
               </div>
             </div>
 
-            {/* Right panel: Properties (conditional) */}
-            {hasSelection && <PropertiesPanel />}
+            {/* Right dock — ONE column, ONE hairline. Properties appears above
+                Agent Eye when something is selected; Agent Eye is always
+                present. Neither floats: a panel parked over the canvas hides
+                the geometry the app exists to show, and two panels each
+                carrying their own border read as things stuck onto the screen
+                rather than parts of it. */}
+            <div className="flex w-56 shrink-0 flex-col border-l border-border bg-card">
+              {hasSelection && (
+                <div className="flex min-h-0 flex-1 flex-col border-b border-border/40">
+                  <PropertiesPanel />
+                </div>
+              )}
+              <AgentEyePanel />
+            </div>
           </>
         )}
       </div>

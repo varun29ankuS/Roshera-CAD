@@ -206,7 +206,6 @@ export function CADViewport() {
 
       <ViewportFrame />
       <ViewportControls />
-      <ViewportReadout />
       <SketchCoordReadout />
       <DimensionKindChips />
       <ViewportHints />
@@ -750,32 +749,17 @@ function ViewportFrame() {
   )
 }
 
-/**
- * Top-right blueprint readout — current tool, selection mode, selected
- * count. Mirrors the LABEL · VALUE pattern used elsewhere in the UI.
+/*
+ * ViewportReadout is gone. It floated tool / selection-mode / selected-count
+ * over the bottom-right corner of the canvas, and the status bar already
+ * carries all three: the first cell is the tool or the active selection mode,
+ * and the right cell is `N objects (M selected)`. It read as a second opinion
+ * on facts that already had a home, and it occluded the model to do it.
+ *
+ * It survived this long only because the floating Agent Eye panel sat on top
+ * of it; docking Agent Eye uncovered the duplicate. Numbers live in the status
+ * bar.
  */
-function ViewportReadout() {
-  const activeTool = useSceneStore((s) => s.activeTool)
-  const selectionMode = useSceneStore((s) => s.selectionMode)
-  const selectedCount = useSceneStore((s) => s.selectedIds.size)
-
-  return (
-    <div className="absolute bottom-3 right-3 pointer-events-none cad-panel cad-readout px-2.5 py-1.5 text-[11px] uppercase tracking-wider min-w-[140px]">
-      <div className="flex items-center justify-between gap-3">
-        <span className="text-muted-foreground">Tool</span>
-        <span className="text-foreground">{activeTool}</span>
-      </div>
-      <div className="flex items-center justify-between gap-3">
-        <span className="text-muted-foreground">Mode</span>
-        <span className="text-foreground">{selectionMode}</span>
-      </div>
-      <div className="flex items-center justify-between gap-3">
-        <span className="text-muted-foreground">Selected</span>
-        <span className="text-foreground tabular-nums">{selectedCount}</span>
-      </div>
-    </div>
-  )
-}
 
 /**
  * Floating panel surfaced when Section View is enabled. Lets the user

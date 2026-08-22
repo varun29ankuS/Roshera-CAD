@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { StatusPill, TabChip } from '@/components/ui/status-pill'
+import { ModeChip, ModeChipGroup, StatusPill, TabChip } from '@/components/ui/status-pill'
 
 const API_HOST = import.meta.env.VITE_API_URL || ''
 
@@ -173,9 +173,15 @@ export function AgentEyePanel() {
 
   if (minimized) {
     return (
+      // mt-auto, because the dock is a flex column and this bar is sometimes
+      // its only child. With a selection, Properties grows and pushes the bar
+      // down on its own; with nothing selected there is nothing above it, and
+      // without mt-auto the bar strands itself at the TOP of a full-height
+      // empty card — a top border drawn against no edge, with the rest of the
+      // column blank beneath it. It belongs at the foot either way.
       <button
         onClick={() => setMinimized(false)}
-        className="absolute bottom-2 right-2 z-20 rounded-md border border-border bg-card px-3 py-1.5 text-xs font-medium shadow-md hover:bg-accent"
+        className="mt-auto w-full shrink-0 border-t border-border bg-card px-3 py-1.5 text-left text-xs font-medium hover:bg-accent"
         title="Open the agent-eye view"
       >
         👁 Agent Eye
@@ -188,11 +194,11 @@ export function AgentEyePanel() {
     isSceneScope ? SCENE_MODES : (['shaded', 'diagnostic', 'ids', 'dim', 'section'] as RenderMode[])
 
   return (
-    <div // 236px, not 208: the header carries a title plus a status pill, and at the
-        // 11px floor the pill was being clipped at the panel edge — a status
-        // indicator you cannot read is worse than none, because it still costs
-        // the space.
-        className="absolute bottom-2 right-2 z-20 w-[236px] overflow-hidden rounded-md border border-border bg-card shadow-lg">
+    // DOCKED, not floating. A panel parked permanently over the canvas occludes
+    // the model in an app whose whole purpose is looking at the model, and it
+    // took its own width, border and shadow with it. The dock owns the chrome
+    // now; this fills the slot it is given.
+    <div className="flex min-h-0 w-full flex-1 flex-col overflow-hidden">
       <div className="flex items-center justify-between border-b border-border px-2 py-1.5">
         <div className="flex min-w-0 items-center gap-1.5 text-xs font-semibold">
           {/* nowrap: the header is 208px wide and the status pill grew with the
@@ -306,34 +312,37 @@ export function AgentEyePanel() {
         </div>
       )}
 
-      <div className="flex items-center justify-between gap-1 border-t border-border px-2 py-1">
-        <div className="flex gap-0.5">
+      {/* Two segmented controls, and the row WRAPS. Docking took this panel from
+          236px floating to the 224px dock, and nine chips on one non-wrapping
+          row put `front`/`top`/`right` past the right edge with no ellipsis to
+          admit it. Wrapping drops the camera group to its own line instead of
+          clipping it; nothing is ever silently cut off. */}
+      <div className="flex flex-wrap items-center justify-between gap-1 border-t border-border px-2 py-1">
+        <ModeChipGroup aria-label="Render mode">
           {modeOptions.map((m) => (
-            <button
+            <ModeChip
               key={m}
+              selected={activeMode === m}
               onClick={() => setMode(m)}
-              className={`rounded px-1 py-0.5 text-[11px] ${
-                activeMode === m ? 'bg-primary text-primary-foreground' : 'hover:bg-accent'
-              }`}
+              title={`Render mode: ${m}`}
             >
               {m === 'diagnostic' ? 'diag' : m === 'section' ? 'sec' : m}
-            </button>
+            </ModeChip>
           ))}
-        </div>
+        </ModeChipGroup>
         {scope === 'part' && SINGLE_VIEW.includes(mode) && (
-          <div className="flex gap-0.5">
+          <ModeChipGroup aria-label="Camera">
             {(['iso', 'front', 'top', 'right'] as ViewName[]).map((v) => (
-              <button
+              <ModeChip
                 key={v}
+                selected={view === v}
                 onClick={() => setView(v)}
-                className={`rounded px-1.5 py-0.5 text-[11px] ${
-                  view === v ? 'bg-primary text-primary-foreground' : 'hover:bg-accent'
-                }`}
+                title={`Camera: ${v}`}
               >
                 {v}
-              </button>
+              </ModeChip>
             ))}
-          </div>
+          </ModeChipGroup>
         )}
       </div>
 
