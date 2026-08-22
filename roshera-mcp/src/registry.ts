@@ -236,6 +236,7 @@ const BENCH_OF: Record<string, Bench> = {
   create_cone: "core",
   boolean: "core",
   boolean_many: "core",
+  part_rename: "core",
   revolve: "core",
   nurbs_loft: "core",
   shell: "core",

@@ -301,6 +301,21 @@ fn raw_tools() -> Vec<ToolSpec> {
             }),
         ),
         t(
+            "part_rename",
+            Core,
+            Stable,
+            Kernel,
+            "Name a solid — the only way to say what a result IS. A boolean's result inherits its base's name, so an unnamed base leaves the deliverable as `solid_11`.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "object_uuid": {"type": "string", "format": "uuid", "description": "object_uuid of the solid to name; for a boolean, the RESULT's uuid"},
+                    "name": {"type": "string", "description": "what this solid IS, in the vocabulary of the design; trimmed, non-empty, <=200 chars"}
+                },
+                "required": ["object_uuid", "name"]
+            }),
+        ),
+        t(
             "boolean_many",
             Core,
             Stable,
@@ -2168,7 +2183,7 @@ mod tests {
         // classified on one side only has no row on the other. Purposes and
         // schemas are transcribed verbatim from what `describe_tool` serves,
         // which is the compiled zod contract and therefore the wire truth.
-        assert_eq!(tools.len(), 108, "expected 108 tools, got {}", tools.len());
+        assert_eq!(tools.len(), 109, "expected 109 tools, got {}", tools.len());
     }
 
     /// The kernel-sourced rows correspond to operations actually registered in

@@ -243,3 +243,50 @@ async fn tool_registry_schemas_are_object_typed() {
         );
     }
 }
+
+/// (d) DISCONNECTION GATE — the agent can actually reach the rename route.
+///
+/// `rename_part_by_uuid` was built, correct, routed, auth-guarded and covered
+/// by `rename_endpoint_persists_name_into_kernel_snapshot` — and unreachable by
+/// an agent, because no MCP tool called it. That is the fifteenth instance of
+/// this repo's oldest failure class, and it had a visible cost: every
+/// solid-producing tool takes a `name` EXCEPT `boolean`, whose result merely
+/// inherits its base's name. So the throwaway cutters were called
+/// `circlip_groove_cutter` while the piston they cut was called `solid_11`, and
+/// the model tree could not say what the part was because nothing could tell it.
+///
+/// A registry entry alone would NOT have caught this: the ontology drift gate
+/// compares two classification tables, and a tool can be classified on both
+/// surfaces while its handler talks to nothing. This asserts the PRODUCTION CALL
+/// SITE — that the shipped handler names the route the backend actually serves.
+#[test]
+fn part_rename_tool_calls_the_rename_route() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("roshera-mcp")
+        .join("src")
+        .join("tools")
+        .join("modify.ts");
+    let source = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+        panic!(
+            "cannot read the MCP modify tools at {}: {e}. A gate that checked \
+             nothing must not be mistaken for a gate that passed.",
+            path.display()
+        )
+    });
+
+    assert!(
+        source.contains("\"part_rename\""),
+        "roshera-mcp must expose a part_rename tool — without it the rename \
+         route is reachable only from the frontend and an agent has no way to \
+         say what the geometry it just built IS"
+    );
+    // The exact path the router serves. If either side moves, this fails.
+    assert!(
+        source.contains("/api/parts/uuid/${encodeURIComponent(object_uuid)}/name"),
+        "part_rename must POST to /api/parts/uuid/{{uuid}}/name — the route \
+         registered in main.rs. A tool that exists but calls nothing is the \
+         disconnection this gate is for."
+    );
+}

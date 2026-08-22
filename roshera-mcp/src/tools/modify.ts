@@ -248,6 +248,39 @@ export function registerModifyTools(server: ToolHost) {
   );
 
   server.tool(
+    "part_rename",
+    "Name a solid — the ONLY way to say what a result IS. Every solid-producing " +
+      "call takes a `name` EXCEPT the one that makes the deliverable: a boolean's " +
+      "result inherits its base's name, so an unnamed base propagates namelessness " +
+      "through every cut and the part you actually shipped ends up as `solid_11` " +
+      "while the cutters you threw away are called `circlip_groove_cutter`. Call " +
+      "this on the RESULT uuid after a boolean to say what the geometry became. " +
+      "Writes Solid::name durably (`POST /api/parts/uuid/{uuid}/name`), the single " +
+      "name source every reader derives from — model tree, part list, drawings.",
+    {
+      object_uuid: z
+        .string()
+        .uuid()
+        .describe("object_uuid of the solid to name — for a boolean, the RESULT's uuid, not an operand's (operands are consumed)"),
+      name: z
+        .string()
+        .describe("what this solid IS, in the vocabulary of the design — 'piston body', 'ring groove z55'. Trimmed server-side; non-empty; ≤200 chars"),
+    },
+    async ({ object_uuid, name }) => {
+      try {
+        const r = await api(
+          "POST",
+          `/api/parts/uuid/${encodeURIComponent(object_uuid)}/name`,
+          { name },
+        );
+        return ok(r);
+      } catch (e) {
+        return fail(e);
+      }
+    },
+  );
+
+  server.tool(
     "boolean_many",
     "BATCH boolean: apply MANY tool solids against one base sequentially in a " +
       "single MCP call — the backend still runs ONE boolean mutation + ONE " +
