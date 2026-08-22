@@ -725,10 +725,41 @@ fn generate_steiner_candidates(
     let v_straight = [u_lo, u_mid, u_hi]
         .iter()
         .all(|&u| straight_chain(pos(u, v_lo), pos(u, v_mid), pos(u, v_hi)));
-    if u_straight {
+    // SCOPE, not idea. The collapse is right for a hole-free lateral: every
+    // interior sample along a straight generator is collinear, adds no shape,
+    // and the elongated triangles it leaves are safe because nothing can
+    // connect ACROSS the face — the only vertices are on the outer rim, and a
+    // rim-to-rim chord is short.
+    //
+    // A TRIMMED lateral breaks that. Interior loops put vertices in the middle
+    // of the face, and with the u-grid collapsed to `min_segments` there is
+    // nothing between them for the Delaunay criterion to prefer: on a hollow
+    // skirt with one cross bore, the CDT joined a vertex on one breakout
+    // straight to a vertex on the antipodal breakout — du = pi, an 86mm chord
+    // through the middle of a part of radius 43, 90 degrees off the true
+    // normal. That is the `worst_aspect_ratio` 456.2 the piston certifies with.
+    //
+    // Restoring the grid on trimmed faces does not merely give refinement a
+    // chance to repair the chord — it makes the chord UNSELECTABLE, because a
+    // candidate spanning half the period has a circumcircle containing dozens
+    // of grid vertices and Delaunay rejects it locally. The initial
+    // triangulation is chord-faithful by construction, which is what the
+    // collapse's own comment claimed already held.
+    //
+    // Deliberately NOT fixed by re-enabling refinement for developables: a
+    // chord scan fires on ordinary cylinders wherever R*du exceeds tolerance
+    // and multiplies triangles on the most common primitive in the kernel.
+    // This predicate leaves the untrimmed wall byte-identical.
+    // Restoring only the PERIODIC direction was tried and measured: it reverts
+    // the fix completely (11600 tris, aspect 456.2, 4 wings — identical to no
+    // fix at all), because `effective_period_u_tess` reports None for this
+    // face. The narrower predicate was a guess about the data that the data
+    // refused, so the gate stays on trimming alone.
+    let trimmed = !inner_polygons.is_empty();
+    if u_straight && !trimmed {
         nu = params.min_segments;
     }
-    if v_straight {
+    if v_straight && !trimmed {
         nv = params.min_segments;
     }
     if std::env::var("ROSHERA_TESS_TRACE").is_ok() {

@@ -36,16 +36,44 @@
 //! and this file asserted one as a premise until the instrument was fixed.
 //!
 //! ```text
-//!   AXIAL bore r12 (control)  aspect= 30.3  min_angle=1.890deg  dev= 1.0deg  wings=0  clean=TRUE
-//!   CROSS bore r12 (red)      aspect=456.2  min_angle=0.068deg  dev=90.0deg  wings=4  clean=false
+//!   AXIAL bore r12 (control)   aspect= 30.3  min_angle=1.890deg  dev= 1.0deg  wings=0  clean=TRUE
+//!   CROSS bore r12, before     aspect=456.2  min_angle=0.068deg  dev=90.0deg  wings=4  clean=false
+//!   CROSS bore r12, today      aspect=172.6  min_angle=0.024deg  dev=83.6deg  wings=0  clean=false
 //! ```
 //!
-//! The defect is a facet standing perpendicular to the surface it approximates
-//! — one straight 86mm chord from `y=+43` to `y=-43` straight through the
-//! solid's interior, on a surface of radius 43, with a 456:1 aspect ratio and
-//! a 0.068 degree minimum angle. The reduced aspect ratio reproduces the live
-//! piston's 456.2485 to four figures, which is what ties this file to the part
-//! on screen.
+//! ## Half fixed, and the half that is left is a DIFFERENT sliver
+//!
+//! The antipodal bridge is gone. `generate_steiner_candidates` used to collapse
+//! a straight parametric direction to `min_segments` on every developable
+//! lateral; that is correct for a HOLE-FREE wall, where the only vertices are
+//! on the outer rim and a rim-to-rim chord is short, and wrong the moment
+//! interior loops put vertices in the middle of the face with nothing between
+//! them. Scoping the collapse to untrimmed faces restores the grid, which does
+//! not merely give refinement a chance to repair the 86mm chord — it makes that
+//! chord UNSELECTABLE, since a candidate spanning half the period has a
+//! circumcircle full of grid vertices and Delaunay rejects it locally.
+//!
+//! `boundary_crossing_facets` is 4 -> 0 and the worst aspect ratio falls from
+//! 456.2 to 172.6. But `max_normal_deviation_deg` is still 83.6 and the minimum
+//! angle got WORSE (0.068 -> 0.024), so a second sliver was sitting underneath
+//! the first. This file stays RED, and deliberately keeps the old numbers above
+//! so the improvement and the remainder are both legible.
+//!
+//! The cost is real and confined: 11600 -> 47996 triangles on this trimmed
+//! face, and 15-35% wall-clock on boolean-heavy suites. Untrimmed primitives
+//! are untouched — the predicate is "has interior loops", so a plain cylinder
+//! wall keeps its collapsed grid and its exact former triangle count.
+//!
+//! Restoring only the PERIODIC direction was tried, to halve that cost, and
+//! measured: it reverts the fix completely because the face reports no period
+//! at that call site. Recorded rather than deleted, so the next person does not
+//! spend the same hour on the same guess.
+//!
+//! What tied this file to the part on screen: the BEFORE aspect ratio of 456.2
+//! reproduced the live piston's 456.2485 to four figures. That correspondence
+//! is why the numbers above are kept rather than overwritten — the live piston
+//! has not been re-tessellated against this change, so its certificate still
+//! reads the old figures until the server is rebuilt.
 //!
 //! That the reduced skirt is manifold while the solid-blank cross bore of
 //! `cross_bore_manifold.rs` is not says these are two different defects that
