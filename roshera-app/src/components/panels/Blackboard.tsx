@@ -347,16 +347,36 @@ export function Blackboard() {
     [handleSubmit, histIdx, draft],
   )
 
-  // Collapsed state — floating button.
+  // Collapsed state — an edge-docked tab, not a floating orb.
+  //
+  // This was a navy circle with a shadow parked over the model: a fourth
+  // navy-filled shouter competing with real primary actions, and an unlabelled
+  // one, so the only way to learn what it did was to press it. It sits at
+  // `bottom-8 left-[15.5rem]` now — exactly where the open panel's bottom-left
+  // corner rests — so closing the panel visibly collapses it into this handle
+  // instead of swapping it for an unrelated object somewhere else. `border-l-0
+  // rounded-r-md` makes it read as attached chrome rather than something
+  // floating on top of the scene, and the vertical label answers the question
+  // the circle refused to. 14.5rem, not the panel's own 15.5rem: a left-less
+  // border has to butt against a real edge or it just looks sliced off, and
+  // the rail's right edge is at 14.5rem. The 16px it gives up in corner
+  // continuity buys a tab that is actually attached to something.
+  //
+  // Opaque `bg-card`, no backdrop blur: a translucent panel over a shaded
+  // model is a legibility gamble that depends on whatever geometry happens to
+  // be behind it.
   if (!isPanelOpen) {
     return (
       <button
         onClick={togglePanel}
-        className="cad-focus absolute bottom-10 left-[15.5rem] z-20 w-10 h-10 rounded-full bg-primary text-primary-foreground flex items-center justify-center shadow-lg hover:scale-105 transition-transform"
+        className="cad-focus absolute bottom-8 left-[14.5rem] z-20 flex flex-col items-center gap-2 rounded-r-md border border-l-0 border-border bg-card px-1.5 py-3 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
         aria-label="Open Blackboard"
         title="Blackboard"
       >
-        <NotebookPen size={18} />
+        <NotebookPen size={14} />
+        <span className="font-mono text-[11px] uppercase tracking-wider [writing-mode:vertical-rl]">
+          Blackboard
+        </span>
       </button>
     )
   }
