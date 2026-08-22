@@ -277,8 +277,14 @@
     @apply bg-popover backdrop-blur-md border border-border;
     box-shadow: var(--shadow-floating);
   }
+  /* 11px, not 10. The floor is absolute and this token was quietly below it
+     everywhere it was used — the audit found it rendered on the model tree's
+     header, but a token is not one instance, so the fix is here rather than at
+     the call sites. Uppercase + 0.14em tracking makes small type harder to
+     read, not easier, which is exactly why a header set below the floor is
+     worse than body text set below it. */
   .cad-panel-header {
-    @apply px-3 py-2 text-[10px] font-mono font-medium uppercase tracking-[0.14em] text-muted-foreground border-b border-border;
+    @apply px-3 py-2 text-[11px] font-mono font-medium uppercase tracking-[0.14em] text-muted-foreground border-b border-border;
   }
   /* Numeric / data readouts — monospace, tight tracking, used for
      coordinates, dimensions, and any value the user is meant to read

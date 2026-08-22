@@ -1076,9 +1076,12 @@ export function ModelTree({
           When collapsed, only the chip remains visible — the mode
           control is hidden because there's no body for it to drive. */}
       <div
+        // No border, no radius, no shadow: this is a docked column's header
+        // now, not a card floating on the canvas. A shadow is for something
+        // ON TOP of the model; the rail is beside it.
         className={cn(
-          'cad-panel-header flex items-center gap-1.5 font-mono border border-border rounded shadow-md w-full',
-          expanded ? 'bg-card/95' : 'bg-muted/95',
+          'cad-panel-header flex w-full items-center gap-1.5 font-mono',
+          expanded ? 'bg-card' : 'bg-muted/60',
         )}
       >
         <button
@@ -1088,12 +1091,21 @@ export function ModelTree({
           aria-controls="browser-tree"
           title={expanded ? 'Collapse browser' : 'Expand browser'}
           className={cn(
-            'flex-1 text-left cursor-pointer transition-colors',
-            expanded ? 'hover:text-foreground' : 'hover:text-foreground',
+            'cursor-pointer text-left transition-colors hover:text-foreground',
+            // Collapsed, the rail is a 40px strip and the word does not fit —
+            // it rendered as "brow", which a tooltip technically admits and no
+            // reader forgives. The chevron carries the affordance at that
+            // width; the label returns with the room to hold it.
+            expanded ? 'flex-1' : 'sr-only',
           )}
         >
           browser
         </button>
+        {!expanded && (
+          <span aria-hidden className="flex-1 text-center text-muted-foreground">
+            ⌸
+          </span>
+        )}
         {expanded && (
           <div
             role="tablist"

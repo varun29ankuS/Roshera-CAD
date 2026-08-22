@@ -221,17 +221,30 @@ export function AgentEyePanel({
     // lines to give a fixed-size thumbnail half the rail. The board is the
     // tenant that grows; this one is sized by its content and sits at the foot.
     <div className="flex w-full shrink-0 flex-col overflow-hidden">
-      {/* justify-between is legal HERE: title and chrome are different roles,
-          and title-left/chrome-right is load-bearing convention. What was
-          illegal was leaving each side loose, so the gap read as a hole rather
-          than as chrome-distance. Both sides are tight clusters now. */}
-      <div className="flex items-center justify-between gap-3 border-b border-border px-2 py-1.5">
+      {/* Hug. The rule was "roles bookend", and bookending a title against its
+          own three buttons was defensible at 224px where the seam was ~18px —
+          at 560 it is a 332px hole in a panel header. The rule was written for
+          full-width app BARS, where end-anchoring spans real working space; a
+          panel header is one unit and should read as one.
+          Amended: bookend app-level bars, panel headers hug.
+          The trailing space after the last button is row slack, not a void —
+          every left-aligned toolbar has it. */}
+      <div className="flex items-center gap-3 border-b border-border px-2 py-1.5">
         <div className="flex min-w-0 items-center gap-1.5 text-xs font-semibold">
           {/* nowrap: the header is 208px wide and the status pill grew with the
               11px type floor, which wrapped the title to "Agent / Eye". A panel
               title that reflows because a sibling changed size is a layout that
               was only ever accidentally correct. */}
-          <span className="shrink-0 whitespace-nowrap">👁 Agent Eye</span>
+          <span className="shrink-0" aria-hidden>
+            👁
+          </span>
+          {/* The only element allowed to give: at 224 the header is ~206px of
+              content in 208px, so first pressure squeezes the wordmark and
+              nothing else. It carries BOTH an ellipsis and a title, so a cut
+              is admitted twice over. */}
+          <span className="truncate" title="Agent Eye">
+            Agent Eye
+          </span>
           {/* Liveness is a verdict about the machine, so it wears the one
               status grammar rather than a bespoke dot-and-word pair. */}
           <StatusPill tone={live ? 'positive' : 'neutral'} label={live ? 'LIVE' : 'paused'} />

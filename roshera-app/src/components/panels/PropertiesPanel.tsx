@@ -52,7 +52,14 @@ export function PropertiesPanel() {
       <div className="cad-panel-header">Properties</div>
 
       <ScrollArea className="flex-1 min-h-0">
-        <div className="p-3 space-y-3">
+        {/* A measure cap, for the same reason prose gets one. Every row here is
+            a label bookended against its value, which is legitimate — a spec
+            sheet — but only while the eye can still bind the two. In the 560px
+            rail the gap between "Opacity" and "1.00" measured 470px, at which
+            point they are two unrelated words on opposite sides of a panel.
+            340px keeps the pair readable; below that the cap does nothing, so
+            the narrow rail is unaffected. */}
+        <div className="max-w-[340px] p-3 space-y-3">
           {/* Name & Type */}
           <div>
             <div className="flex items-center gap-1.5 mb-1">
@@ -104,7 +111,7 @@ export function PropertiesPanel() {
                 </p>
                 <div className="space-y-0.5">
                   {Object.entries(ag.params).map(([key, val]) => (
-                    <div key={key} className="flex justify-between text-[11px]">
+                    <div key={key} data-role="pair" className="flex justify-between text-[11px]">
                       <span className="text-muted-foreground">{key}</span>
                       <span className="font-mono">{typeof val === 'number' ? val.toFixed(2) : String(val)}</span>
                     </div>
@@ -128,7 +135,7 @@ export function PropertiesPanel() {
             />
             <div className="mt-1.5 space-y-1">
               <div>
-                <div className="flex justify-between text-[11px] text-muted-foreground mb-0.5">
+                <div data-role="pair" className="flex justify-between text-[11px] text-muted-foreground mb-0.5">
                   <span>Metalness</span>
                   <span className="font-mono">{obj.material.metalness.toFixed(2)}</span>
                 </div>
@@ -147,7 +154,7 @@ export function PropertiesPanel() {
                 />
               </div>
               <div>
-                <div className="flex justify-between text-[11px] text-muted-foreground mb-0.5">
+                <div data-role="pair" className="flex justify-between text-[11px] text-muted-foreground mb-0.5">
                   <span>Roughness</span>
                   <span className="font-mono">{obj.material.roughness.toFixed(2)}</span>
                 </div>
@@ -166,7 +173,7 @@ export function PropertiesPanel() {
                 />
               </div>
               <div>
-                <div className="flex justify-between text-[11px] text-muted-foreground mb-0.5">
+                <div data-role="pair" className="flex justify-between text-[11px] text-muted-foreground mb-0.5">
                   <span>Opacity</span>
                   <span className="font-mono">{obj.material.opacity.toFixed(2)}</span>
                 </div>
@@ -344,7 +351,7 @@ function EdgeDisplayControls() {
         Edge Display
       </p>
       <div className="space-y-1.5">
-        <div className="flex items-center justify-between">
+        <div data-role="pair" className="flex items-center justify-between">
           <span className="text-[11px] text-muted-foreground">Show Edges</span>
           <button
             onClick={() => setEdgeSettings({ visible: !edgeSettings.visible })}
@@ -354,7 +361,7 @@ function EdgeDisplayControls() {
           </button>
         </div>
         <div>
-          <div className="flex justify-between text-[11px] text-muted-foreground mb-0.5">
+          <div data-role="pair" className="flex justify-between text-[11px] text-muted-foreground mb-0.5">
             <span>Threshold</span>
             <span className="font-mono">{edgeSettings.threshold}°</span>
           </div>
@@ -368,7 +375,7 @@ function EdgeDisplayControls() {
           />
         </div>
         <div>
-          <div className="flex justify-between text-[11px] text-muted-foreground mb-0.5">
+          <div data-role="pair" className="flex justify-between text-[11px] text-muted-foreground mb-0.5">
             <span>Line Width</span>
             <span className="font-mono">{edgeSettings.lineWidth.toFixed(1)}</span>
           </div>

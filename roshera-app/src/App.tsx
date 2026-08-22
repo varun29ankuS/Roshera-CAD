@@ -187,24 +187,33 @@ export function App() {
           <>
             <ToolBar />
 
-            {/* Viewport + floating overlays in the standard CAD layout */}
+            {/* Left rail — DOCKED, like the right one. It was
+                `absolute top-2 bottom-2 left-2 z-10`, a 224×670 card sitting
+                ON the canvas, and it had no closed state at all, so it covered
+                the model permanently. That is the same objection that moved the
+                Blackboard off the viewport; the symmetry was only half true
+                while this stayed a floating card pretending to be a rail.
+
+                Docking does not newly cost the viewport anything — those pixels
+                were already hidden whenever the tree was open. What it adds is
+                the ability to give them back: collapsed, the rail is a 40px
+                strip rather than a 224px overlay, which is strictly more canvas
+                than the floating version could ever return. */}
+            <div
+              className={cn(
+                'flex shrink-0 flex-col overflow-hidden border-r border-border bg-card transition-[width] duration-200',
+                browserOpen ? 'w-56' : 'w-10',
+              )}
+            >
+              <ModelTree
+                expanded={browserOpen}
+                onToggle={() => setBrowserOpen((open) => !open)}
+              />
+            </div>
+
             <div className="relative flex-1 overflow-hidden">
               <CADViewport />
               <StepImportDropzone />
-
-              {/* Browser — single consolidated panel. The header chip is
-                  always visible and acts as the collapse toggle; an
-                  inline segmented control flips the body between the
-                  assembly hierarchy ("parts") and the timeline-derived
-                  feature tree ("features"). Only the header carries its
-                  own outline, so the chip stays as an anchor even when
-                  the tree is hidden. */}
-              <div className="absolute top-2 bottom-2 left-2 z-10 w-56 flex flex-col overflow-hidden">
-                <ModelTree
-                  expanded={browserOpen}
-                  onToggle={() => setBrowserOpen((open) => !open)}
-                />
-              </div>
             </div>
 
             {/* Right dock — ONE column, ONE hairline, three tenants in a fixed
