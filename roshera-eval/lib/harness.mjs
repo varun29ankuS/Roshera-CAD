@@ -172,10 +172,105 @@ export async function runScenario(scenario, client, geom) {
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+// ─── ANSI kit ─────────────────────────────────────────────────────────────
+// Hue is a verdict: only the four state marks take colour. Hierarchy takes
+// intensity (dim/bold), never hue. Every escape byte is gated on TTY; piped
+// output is plain, greppable text. summarize() is untouched.
+const TTY = !!process.stdout.isTTY;
+
+// PASS/FAIL/KNOWN-RED are grades and share the traffic-light axis. BLOCKED is
+// NOT a grade — it means nothing was measured — so it takes a hue off that
+// axis entirely. A column of cyan reads "infrastructure", never "quality",
+// which is the whole distinction this harness keeps getting wrong.
+const HUE = { pass: 32, fail: 31, knownRed: 33, blocked: 36 };
+const ink = (code, s) => (TTY ? `\x1b[${code}m${s}\x1b[0m` : String(s));
+const dim = (s) => ink("2", s);
+
+// Every state is triple-encoded — word, glyph, hue — so no channel is
+// load-bearing alone: colour-blind eyes, `grep`, and monochrome screenshots
+// all still sort the four states.
+const STATES = {
+  pass: { word: "PASS", glyph: "✓", hue: HUE.pass },
+  fail: { word: "FAIL", glyph: "✗", hue: HUE.fail },
+  knownRed: { word: "KNOWN-RED", glyph: "⚑", hue: HUE.knownRed },
+  blocked: { word: "BLOCKED", glyph: "⊘", hue: HUE.blocked },
+};
+
+// Single source of truth for the four states — live line, stream, scorecard.
+// They used to be re-derived by a ternary in each place, which is how the
+// scorecard's copy quietly lost its blocked branch.
+const stateOf = (r) =>
+  r.blocked ? "blocked" : r.passed ? "pass" : r.knownRed ? "knownRed" : "fail";
+const mark = (key) => {
+  const st = STATES[key];
+  return ink(`1;${st.hue}`, `${st.glyph} ${st.word}`);
+};
+
+const write = (s) => process.stdout.write(s);
+const fmtSecs = (ms) => `${(ms / 1000).toFixed(1)}s`;
+const fmtClock = (ms) => {
+  const t = Math.floor(ms / 1000);
+  return `${String(Math.floor(t / 60)).padStart(2, "0")}:${String(t % 60).padStart(2, "0")}`;
+};
+const termCols = () => (process.stdout.columns || 80) - 1;
+
+// One rewritten status line while a scenario runs. Elapsed wall time is the
+// only fact we truly have mid-run (checks arrive when runScenario resolves),
+// so it is the only thing shown — and it is the fact that matters, because a
+// spinner animates identically whether the kernel is about to return or has
+// hung. A 2s scenario showing 00:45 tells you it died before any check fires.
+// Returns an eraser.
+function liveStatus(label) {
+  if (!TTY) return () => {};
+  const t0 = Date.now();
+  const draw = () => {
+    const txt = `  · ${label} ${fmtClock(Date.now() - t0)}`;
+    write(`\r\x1b[2K${dim(txt.length > termCols() ? txt.slice(0, termCols()) : txt)}`);
+  };
+  draw();
+  const iv = setInterval(draw, 500);
+  return () => {
+    clearInterval(iv);
+    write(`\r\x1b[2K`);
+  };
+}
+
+// The inter-scenario rate-limit pause, made visible instead of felt as lag.
+async function holdVisible(ms) {
+  if (!TTY) return sleep(ms);
+  const t0 = Date.now();
+  const iv = setInterval(() => {
+    write(`\r\x1b[2K${dim(`  ·· rate-limit hold ${((Date.now() - t0) / 1000).toFixed(1)}s`)}`);
+  }, 200);
+  try {
+    await sleep(ms);
+  } finally {
+    clearInterval(iv);
+    write(`\r\x1b[2K`);
+  }
+}
+
+function emitVerdict(r) {
+  const key = stateOf(r);
+  if (key === "blocked") {
+    // No counts, no time: BLOCKED measured nothing, so it prints nothing
+    // numeric. Zero is a measurement; this is the absence of one.
+    write(`  ${mark(key)}${dim(" — nothing measured")}\n`);
+    write(`     ${ink(HUE.blocked, `⊘ ${r.blocked}`)}\n`);
+    return;
+  }
+  const cp = r.checks.filter((c) => c.passed).length;
+  write(`  ${mark(key)}  ${dim(`${cp}/${r.checks.length} checks · ${fmtSecs(r.wallMs)}`)}\n`);
+  for (const c of r.checks.filter((c) => !c.passed)) {
+    write(`     ${ink(HUE.fail, "✗")} ${dim(`[${c.dim}]`)} ${c.name} — ${c.detail}\n`);
+  }
+}
+
 /** Run the whole suite in order. */
 export async function runSuite(scenarios, client, geom) {
   const results = [];
-  for (const s of scenarios) {
+  for (let i = 0; i < scenarios.length; i++) {
+    const s = scenarios[i];
     // A full 17-18 scenario sweep run back-to-back trips the live backend's
     // per-window rate limiter (measured 2026-08-08: every scenario after the
     // first got a 429 on its very first request). This is NOT concurrency —
@@ -183,16 +278,19 @@ export async function runSuite(scenarios, client, geom) {
     // simply request VOLUME. A short pause between scenarios (not between
     // requests within one) keeps the suite under the limiter without
     // materially lengthening a sweep that already runs one scenario at a time.
-    if (results.length > 0) await sleep(1500);
-    process.stdout.write(`\n▶ ${s.id} — ${s.title}\n`);
-    const r = await runScenario(s, client, geom);
-    results.push(r);
-    const mark = r.blocked ? "BLOCKED" : r.passed ? "PASS" : r.knownRed ? "FAIL (known-red)" : "FAIL";
-    process.stdout.write(`  ${mark}  (${r.wallMs}ms, ${r.checks.filter((c) => c.passed).length}/${r.checks.length} checks)\n`);
-    if (r.blocked) process.stdout.write(`     ⊘ nothing measured — ${r.blocked}\n`);
-    for (const c of r.checks.filter((c) => !c.passed)) {
-      process.stdout.write(`     ✗ [${c.dim}] ${c.name} — ${c.detail}\n`);
+    if (i > 0) await holdVisible(1500);
+
+    write(`\n▶ [${i + 1}/${scenarios.length}] ${s.id} — ${s.title}\n`);
+
+    const erase = liveStatus(`running ${s.id}`);
+    let r;
+    try {
+      r = await runScenario(s, client, geom);
+    } finally {
+      erase(); // the verdict replaces the status line, in place
     }
+    results.push(r);
+    emitVerdict(r);
   }
   return results;
 }
@@ -223,55 +321,82 @@ export function summarize(results) {
   };
 }
 
+// ─── scorecard ────────────────────────────────────────────────────────────
+// Eighth-block partials so a bar's length is the fraction, not a rounding of
+// it: at 20 cells a whole-block bar quantises to 5% steps, which is wide
+// enough to render 19/20 and 20/20 identically.
+const EIGHTHS = ["", "▏", "▎", "▍", "▌", "▋", "▊", "▉"];
+function bar(frac, width) {
+  const units = Math.round(Math.max(0, Math.min(1, frac)) * width * 8);
+  const full = Math.floor(units / 8);
+  const part = EIGHTHS[units % 8];
+  return "█".repeat(full) + part + "░".repeat(width - full - (part ? 1 : 0));
+}
+
 /** Pretty ASCII scorecard. */
 export function scorecard(results, summary) {
+  const W = 74, ID = 34, RES = 13, CHK = 8, TIME = 7;
+  const TBL = 2 + ID + RES + CHK + TIME;
   const L = [];
+
   L.push("");
-  L.push("═".repeat(74));
-  L.push("  AGENT-EVAL-α  SCORECARD".padEnd(60) + new Date().toISOString());
-  L.push("═".repeat(74));
+  L.push("═".repeat(W));
+  L.push("  AGENT-EVAL-α  SCORECARD".padEnd(W - 24) + dim(new Date().toISOString()));
+  L.push("═".repeat(W));
   L.push("");
-  L.push("  " + "SCENARIO".padEnd(34) + "RESULT".padEnd(10) + "CHECKS".padEnd(9) + "TIME");
-  L.push("  " + "-".repeat(68));
+  L.push("  " + "SCENARIO".padEnd(ID) + "RESULT".padEnd(RES) + "CHECKS".padEnd(CHK) + "TIME".padEnd(TIME));
+  L.push(dim("─".repeat(TBL)));
+
   for (const r of results) {
-    const cp = r.checks.filter((c) => c.passed).length;
-    const ct = r.checks.length;
-    // BLOCKED is its own mark, and it comes FIRST. A blocked scenario has
-    // `passed === false`, so without this branch it fell through to "FAIL ✗"
-    // and rendered identically to a scenario that ran and failed — the exact
-    // fabricated measurement `runScenario` refuses to record, reintroduced at
-    // the one place a human actually reads. Its check column is "—" and not
-    // "0/0" for the same reason: 0/0 is a tally, and nothing was tallied.
-    const mark = r.blocked ? "BLOCKED ⊘" : r.passed ? "PASS ✓" : r.knownRed ? "FAIL(kr)" : "FAIL ✗";
+    const key = stateOf(r);
+    const st = STATES[key];
+    // Pad from the UNCOLOURED text: `mark()` carries escape bytes that
+    // padEnd would count as visible width and misalign every column.
+    const resTxt = `${st.glyph} ${st.word}`;
+    const pad = " ".repeat(Math.max(0, RES - resTxt.length));
+    // BLOCKED prints "—" for both counts and time. 0/0 and 0.0s are tallies,
+    // and nothing was tallied — rendering zeros is exactly how "the kernel was
+    // never asked" cosplays as "the kernel answered badly".
+    const chkTxt =
+      key === "blocked"
+        ? "—".padEnd(CHK)
+        : `${r.checks.filter((c) => c.passed).length}/${r.checks.length}`.padEnd(CHK);
+    const timeTxt =
+      key === "blocked" ? "—".padStart(TIME - 1) : fmtSecs(r.wallMs).padStart(TIME - 1);
     L.push(
       "  " +
-        r.id.padEnd(34) +
-        mark.padEnd(10) +
-        (r.blocked ? "—" : `${cp}/${ct}`).padEnd(9) +
-        `${(r.wallMs / 1000).toFixed(1)}s`,
+        r.id.padEnd(ID).slice(0, ID) +
+        mark(key) + pad + // hue lands on the verdict word only
+        (key === "blocked" ? dim(chkTxt) + dim(timeTxt) : chkTxt + timeTxt),
     );
   }
-  L.push("  " + "-".repeat(68));
+
+  L.push(dim("─".repeat(TBL)));
   L.push("");
-  L.push("  SCORE DIMENSIONS");
+  L.push(dim("  SCORE DIMENSIONS"));
   for (const d of DIMS) {
     const t = summary.dimensions[d];
-    if (t.total === 0) continue;
-    const pct = ((t.pass / t.total) * 100).toFixed(0);
-    const bar = "█".repeat(Math.round((t.pass / t.total) * 20)).padEnd(20, "░");
-    L.push(`    ${d.padEnd(14)} ${bar} ${t.pass}/${t.total} (${pct}%)`);
+    if (!t || t.total === 0) continue; // never exercised ≠ 0% — silence is the honest render
+    const frac = t.pass / t.total;
+    L.push(
+      `    ${d.padEnd(14)}${bar(frac, 20)} ` +
+        dim(`${String(t.pass).padStart(3)}/${String(t.total).padEnd(3)}`) +
+        dim(`${Math.round(frac * 100)}%`.padStart(5)),
+    );
   }
+
   L.push("");
   // The blocked count was computed by `summarize` and then never printed, so
   // the one number that distinguishes "the kernel failed" from "the kernel was
-  // never asked" existed in the struct and reached nobody. It is stated when
-  // non-zero, and stays absent when there is nothing to state.
+  // never asked" existed in the struct and reached nobody.
+  const blockedN = summary.scenarios.blocked || 0;
   L.push(
-    `  SCENARIOS: ${summary.scenarios.pass}/${summary.scenarios.total} passed` +
-      (summary.scenarios.blocked ? `  (${summary.scenarios.blocked} blocked, nothing measured)` : "") +
-      `    CHECKS: ${summary.checks.pass}/${summary.checks.total} passed`,
+    `  SCENARIOS ${summary.scenarios.pass}/${summary.scenarios.total} passed` +
+      (blockedN ? ` · ${ink(HUE.blocked, `${blockedN} blocked`)}` : "") +
+      `    CHECKS ${summary.checks.pass}/${summary.checks.total} passed`,
   );
-  L.push("═".repeat(74));
+  L.push(dim(`  Σ scenario time ${fmtClock(results.reduce((a, r) => a + (r.wallMs || 0), 0))}`));
+  L.push("═".repeat(W));
   L.push("");
   return L.join("\n");
 }
