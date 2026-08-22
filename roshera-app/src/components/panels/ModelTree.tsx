@@ -177,10 +177,76 @@ function datumsToNodes(datums: DatumDto[]): TreeNode[] {
   ]
 }
 
+// ─── Name rendering: protect the characters that actually identify a row ───
+
+/**
+ * Longest prefix `name` shares with any sibling, backed off to the last `_`
+ * boundary so the remainder is a whole token.
+ *
+ * The backoff is the load-bearing part. A raw longest-shared-prefix returns
+ * the ENTIRE name whenever one name is a proper prefix of a sibling —
+ * `valve_pocket_cutter_L` against `valve_pocket_cutter_L2` shares all 21
+ * characters — which would leave nothing to protect and render the row
+ * exactly as before, still indistinguishable from `..._R`. Backing off to the
+ * boundary yields tails of `L` / `L2` / `R` / `R2`, which is the whole point.
+ *
+ * Returns '' when the name shares nothing worth compressing.
+ */
+function sharedPrefix(name: string, siblings: readonly string[]): string {
+  let longest = 0
+  for (const other of siblings) {
+    if (other === name) continue
+    const stop = Math.min(name.length, other.length)
+    let i = 0
+    while (i < stop && name[i] === other[i]) i++
+    if (i > longest) longest = i
+  }
+  if (longest === 0) return ''
+  // Back off to the last separator at or before the shared run.
+  const cut = name.lastIndexOf('_', longest - 1)
+  return cut <= 0 ? '' : name.slice(0, cut + 1)
+}
+
+// Under this many characters a split costs more attention than it saves.
+const MIN_COMPRESSIBLE_PREFIX = 4
+
+/**
+ * A tree row's name, with the shared head dimmed and clipped and the
+ * discriminating tail protected from truncation.
+ *
+ * `text-overflow: ellipsis` is tail-biased, but in generated CAD names the
+ * entropy lives in the tail — six parts whose names differ only in `_v2` /
+ * `_L2` / `_R2` collapsed into two visible strings, because the renderer spent
+ * its 145px preserving the redundant head and deleting the variant marker.
+ * Flex does the budgeting: the head is `truncate min-w-0` and absorbs the cut,
+ * the tail is `shrink-0` and never clips. No measurement, no font metrics, no
+ * knowledge of the rail's width.
+ */
+function NameCell({ name, siblings }: { name: string; siblings: readonly string[] }) {
+  const prefix = sharedPrefix(name, siblings)
+  const rest = name.slice(prefix.length)
+
+  if (prefix.length < MIN_COMPRESSIBLE_PREFIX) {
+    return (
+      <span className="truncate flex-1" title={name}>
+        {name}
+      </span>
+    )
+  }
+
+  return (
+    <span className="flex min-w-0 flex-1 items-baseline overflow-hidden" title={name}>
+      <span className="truncate min-w-0 text-muted-foreground/60">{prefix}</span>
+      <span className="shrink-0 whitespace-nowrap">{rest}</span>
+    </span>
+  )
+}
+
 // ─── Tree row (terminal lineage style) ──────────────────────────────
 
 function TreeItem({
   node,
+  siblings,
   isLast,
   ancestorIsLast,
   selectedIds,
@@ -191,6 +257,9 @@ function TreeItem({
   onAdd,
 }: {
   node: TreeNode
+  // Names of every node at this level, this one included — the comparison set
+  // that decides which characters are redundant.
+  siblings: readonly string[]
   isLast: boolean
   ancestorIsLast: boolean[] // one entry per ancestor depth: true = ancestor was last sibling
   selectedIds: Set<string>
@@ -271,8 +340,8 @@ function TreeItem({
         {/* Type symbol */}
         <span className="shrink-0 text-muted-foreground/80 mr-1">{node.symbol}</span>
 
-        {/* Name */}
-        <span className="truncate flex-1">{node.name}</span>
+        {/* Name — shared head dimmed and clipped, identifying tail protected */}
+        <NameCell name={node.name} siblings={siblings} />
 
         {/* Visibility / lock — hover-revealed unicode */}
         <div className="flex items-center gap-1 px-1 opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity shrink-0">
@@ -329,6 +398,7 @@ function TreeItem({
             <TreeItem
               key={child.id}
               node={child}
+              siblings={node.children!.map((c) => c.name)}
               isLast={idx === node.children!.length - 1}
               ancestorIsLast={[...ancestorIsLast, isLast]}
               selectedIds={selectedIds}
@@ -1110,6 +1180,7 @@ export function ModelTree({
                         <TreeItem
                           key={node.id}
                           node={node}
+                          siblings={group.nodes.map((n: TreeNode) => n.name)}
                           isLast={idx === group.nodes.length - 1}
                           ancestorIsLast={[]}
                           selectedIds={selectedIds}
