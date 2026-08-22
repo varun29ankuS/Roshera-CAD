@@ -119,10 +119,18 @@ export function registerBlackboardTools(server: ToolHost) {
   server.tool(
     "blackboard_add_entry",
     "Your notebook TO the human: show your working — given values, derivation, " +
-      "result, design rationale (markdown + $math$; the human sees each line " +
-      "live and can edit it). Write it UNPROMPTED whenever a dimension, " +
+      "result, design rationale. Write it UNPROMPTED whenever a dimension, " +
       "tolerance, or shape came from a calculation or a decision worth " +
-      "defending. Always the one document-wide notebook. Returns the line id.",
+      "defending. Always the one document-wide notebook. Returns the line id. " +
+      "RENDERS LaTeX: inline $...$ and display $$...$$ are typeset with KaTeX, " +
+      "so write engineering notation AS notation instead of flattening it to " +
+      "ASCII. A worked line looks like: Base circle " +
+      "$d_b = d\cos\alpha = 48\cos 20^\circ = 45.105$ mm, so the tip " +
+      "pressure angle is $\alpha_a = \arccos(d_b/d_a) = 29.85^\circ$. " +
+      "Symbols the human reads as CAD: \varnothing (diameter), \times, " +
+      "\pm, \le, \ge, \approx, ^\circ, \mu\mathrm{m}. Malformed LaTeX " +
+      "degrades to its own source and never breaks the panel, so an equation " +
+      "is always safe to attempt.",
     {
       text: z.string().describe("markdown + $math$ source for the line"),
       author: z.enum(["agent", "user"]).default("agent").describe("who the line is attributed to"),
