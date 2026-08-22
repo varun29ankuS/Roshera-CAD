@@ -20,27 +20,32 @@
 //! mesh. On screen it is the long slivers radiating out of the pin bore across
 //! the skirt.
 //!
-//! ## What the reduction actually showed, against what was predicted
+//! ## What the reduction showed, against what was predicted
 //!
 //! The prediction was the periodic-seam wrap that `boundary_crossing_facets`
-//! gates — a facet bridging the bore "the long way" around the lateral. The
-//! measurement says otherwise, and the RED below asserts the measurement:
+//! gates — a facet bridging the bore the long way around the lateral. The
+//! first measurement appeared to refute that: the gate reported ZERO bridging
+//! facets. It was the GATE that was wrong, not the prediction.
+//!
+//! `is_bridging_facet` used to test `coverage > p * 0.5`, and a bore drilled
+//! on the axis breaks out at two exactly antipodal `u`, so its bridging facet
+//! covers precisely `p/2` — which a strict `>` cannot catch. Once the gate was
+//! corrected (see `tests/bridging_facet_gate.rs`) the same unchanged mesh
+//! reported four of them. The lesson is recorded here rather than quietly
+//! edited away: **a zero from an instrument is not a fact about the world**,
+//! and this file asserted one as a premise until the instrument was fixed.
 //!
 //! ```text
 //!   AXIAL bore r12 (control)  aspect= 30.3  min_angle=1.890deg  dev= 1.0deg  wings=0  clean=TRUE
-//!   CROSS bore r12 (red)      aspect=456.2  min_angle=0.068deg  dev=90.0deg  wings=0  clean=false
+//!   CROSS bore r12 (red)      aspect=456.2  min_angle=0.068deg  dev=90.0deg  wings=4  clean=false
 //! ```
 //!
-//! `boundary_crossing_facets` is **zero** for the reduced cross bore. Nothing
-//! wraps the seam. The defect is `max_normal_deviation_deg = 90` — facets
-//! standing perpendicular to the surface they are supposed to approximate,
-//! with a 456:1 aspect ratio and a 0.068 degree minimum angle. The reduced
-//! aspect ratio reproduces the live piston's 456.2485 to four figures, which
-//! is what ties this file to the part on screen.
-//!
-//! The piston's six boundary-crossing facets therefore come from some OTHER
-//! feature of it — a valve pocket, a circlip groove, or the crown — and are
-//! NOT reproduced here. That is left unexplained rather than guessed at.
+//! The defect is a facet standing perpendicular to the surface it approximates
+//! — one straight 86mm chord from `y=+43` to `y=-43` straight through the
+//! solid's interior, on a surface of radius 43, with a 456:1 aspect ratio and
+//! a 0.068 degree minimum angle. The reduced aspect ratio reproduces the live
+//! piston's 456.2485 to four figures, which is what ties this file to the part
+//! on screen.
 //!
 //! That the reduced skirt is manifold while the solid-blank cross bore of
 //! `cross_bore_manifold.rs` is not says these are two different defects that
@@ -199,6 +204,10 @@ fn axial_bore_through_a_hollow_skirt_meshes_cleanly() {
         r.boundary_edges, 0,
         "an axial bore must leave a closed solid"
     );
+    assert_eq!(
+        r.boundary_crossing_facets, 0,
+        "an axial bore must not produce facets bridging the surface"
+    );
     assert!(
         r.max_normal_deviation_deg <= 30.0,
         "an axial bore must not fold facets off the surface; got {:.1}deg",
@@ -229,22 +238,24 @@ fn cross_bore_through_a_hollow_skirt_meshes_cleanly() {
         Point3::new(0.0, -(SKIRT_OUTER_R + 10.0), PIN_BORE_Z),
         "cross-r12",
     );
-    // Guard: if these move, the defect under test changed and every number
-    // in this file's header is describing something else.
+    // Guard: if this moves, the defect under test changed and every number in
+    // this file's header is describing something else. Topology stays clean —
+    // that is what separates this from the RED in cross_bore_manifold.rs.
     assert_eq!(
         r.manifold_edges, 0,
-        "the reduced cross bore is manifold; a non-zero count here means this          test has drifted onto the topology defect pinned in cross_bore_manifold.rs"
+        "the reduced cross bore is manifold; a non-zero count here means this \
+         test has drifted onto the topology defect pinned in cross_bore_manifold.rs"
     );
     assert_eq!(
         r.boundary_crossing_facets, 0,
-        "the reduced cross bore wraps no seam (measured 0); a non-zero count          here is a NEW defect, not the one this file pins"
+        "facets bridge straight across the bore — measured 4, each an 86mm chord \
+         through the interior of a part whose radius is 43mm"
     );
-
     assert!(
         r.max_normal_deviation_deg <= 30.0,
-        "facets at the bore breakout stand off the surface they approximate;          got {:.1}deg against {:.1}deg on the axial control",
+        "facets at the bore breakout stand off the surface they approximate; \
+         got {:.1}deg against 1.0deg on the axial control",
         r.max_normal_deviation_deg,
-        1.0,
     );
     assert!(
         r.clean,

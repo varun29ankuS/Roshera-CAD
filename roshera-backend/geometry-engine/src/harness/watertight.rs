@@ -14,6 +14,7 @@
 //! correctness primitive the whole geometry module is held to.
 
 use crate::primitives::solid::SolidId;
+use crate::primitives::surface::Surface;
 use crate::primitives::topology_builder::BRepModel;
 use crate::tessellation::mesh::TriangleMesh;
 use crate::tessellation::{tessellate_solid, TessellationParams};
@@ -569,6 +570,154 @@ pub fn periodic_coverage(u0: f64, u1: f64, u2: f64, p: f64) -> f64 {
     p - max_gap
 }
 
+/// Relative width of the "exactly half the period" band.
+///
+/// `rem_euclid` and the sort leave a few ulps of error, so a facet whose
+/// extreme vertices are exactly antipodal lands at `p/2 ± 1e-16` and never
+/// exactly on it. `p * 1e-9` sits millions of ulps above that noise floor
+/// while still being ~1e-9 rad — nine orders below any span that means
+/// anything geometrically.
+const HALF_PERIOD_BAND_REL: f64 = 1e-9;
+
+/// True when a facet bridges across a periodic face — an edge cutting through
+/// the interior instead of lying inside the trim.
+///
+/// **Why this is not simply `coverage > p/2`.** It was, and the strict
+/// inequality had a blind spot exactly where it mattered most. A bore drilled
+/// through a cylinder ON ITS AXIS breaks out at two exactly antipodal `u`, so
+/// the facet spanning between them has coverage of precisely `p/2` — and
+/// `p/2 > p/2` is false. Measured on a hollow skirt with one cross bore: the
+/// worst facet ran as a single straight 86mm chord from `y=+43` to `y=-43`
+/// through the solid's interior, the certificate reported
+/// `max_normal_deviation_deg = 90.0` for it, and this gate reported ZERO
+/// bridging facets. The maximally-bridging facet was the one case the test let
+/// through, and it is not a rare tie — every axis-centred bore produces it.
+///
+/// **Why not just relax to `>=`.** Coverage of exactly `p/2` means "some
+/// vertex pair is antipodal", and antipodal pairs are not exclusively
+/// bridging. Split a cylinder lengthwise into two π-wide faces: a facet with
+/// vertices on both seam trim edges has coverage `p/2` and crosses nothing.
+/// In UV that facet and the bore bridge are structurally identical, so the
+/// discriminator cannot come from the facet — it comes from the FACE. A face
+/// that only spans half a period legitimately owns `p/2` boundary facets; a
+/// face wider than that does not.
+///
+/// `face_u_span` is the face's own measured u-extent. Pass `p` when it is
+/// unknown, which degrades this to the plain half-period test.
+pub fn is_bridging_facet(u0: f64, u1: f64, u2: f64, p: f64, face_u_span: f64) -> bool {
+    if p <= 0.0 {
+        return false;
+    }
+    let coverage = periodic_coverage(u0, u1, u2, p);
+    let half = 0.5 * p;
+    let band = p * HALF_PERIOD_BAND_REL;
+
+    if coverage > half + band {
+        // Unambiguously wider than half the period. No facet of any face
+        // reaches this without an edge leaving the surface.
+        true
+    } else if coverage >= half - band {
+        // Antipodal within tolerance — the ambiguous case, decided by the
+        // face rather than the facet.
+        face_u_span > half + band
+    } else {
+        false
+    }
+}
+
+/// True when the surface does not actually move as `u` varies at this `v` —
+/// a parametric singularity, i.e. a pole.
+///
+/// **Why this exists.** A sphere's pole is one 3D point that every `u` maps to,
+/// so the pole vertex's `u` is whatever the tessellator happened to write. On a
+/// radius-10 sphere the four pole facets record `u = (π, 0, 0.063)`, which
+/// reads as spanning exactly half the period while the facet's real 3D edges
+/// are 0.3mm. Judged on `u` alone they are indistinguishable from a bore bridge
+/// whose edge is an 86mm chord through the middle of the part; judged on
+/// whether the surface moves with `u`, they are trivially separable.
+///
+/// Measures rather than special-cases the sphere: step half a period in `u` and
+/// ask whether the surface went anywhere. Any surface with a degenerate `u` row
+/// is handled, including ones not yet written.
+fn u_is_degenerate_at(surface: &dyn Surface, v: f64, p: f64) -> bool {
+    let (Ok(a), Ok(b)) = (surface.point_at(0.0, v), surface.point_at(0.5 * p, v)) else {
+        // A surface that cannot be evaluated here tells us nothing; treat the
+        // parameterisation as sound rather than silently excusing the facet.
+        return false;
+    };
+    // Scaled to the surface's own size so this is not a millimetre threshold
+    // pretending to be general: a pole is where the half-period step collapses
+    // to nothing next to the extent the same step covers elsewhere.
+    let reference = surface
+        .point_at(0.0, v)
+        .ok()
+        .zip(surface.point_at(0.25 * p, v).ok())
+        .map(|(x, y)| (y - x).magnitude())
+        .unwrap_or(0.0);
+    let step = (b - a).magnitude();
+    step <= 1e-9 || step <= reference * 1e-6
+}
+
+/// Each periodic face's u-extent, measured from the tessellated vertices.
+///
+/// Deliberately NOT read from `Face::uv_bounds`: on the boolean-produced faces
+/// this gate exists to judge, that field reads its `[0, 1, 0, 1]` default while
+/// the same face's vertices span `u` over `[0, 2π]`. Trusting it would silently
+/// hand `is_bridging_facet` a span of 1.0 radian for a full cylinder and
+/// classify every antipodal facet as legitimate.
+///
+/// The extent is `p - largest_gap` rather than `max - min`, for the same reason
+/// `periodic_coverage` is: a face straddling the seam has vertices at both ends
+/// of the domain, and `max - min` would read the full period for a face that
+/// occupies a sliver of it.
+fn measure_face_u_spans(
+    mesh: &TriangleMesh,
+    model: &BRepModel,
+    has_faces: bool,
+) -> HashMap<u32, f64> {
+    let mut us_by_face: HashMap<u32, Vec<f64>> = HashMap::new();
+    for (i, tri) in mesh.triangles.iter().enumerate() {
+        let fid = if has_faces { mesh.face_map[i] } else { 0 };
+        let periodic = model
+            .faces
+            .get(fid)
+            .and_then(|f| model.surfaces.get(f.surface_id))
+            .and_then(|s| s.period_u());
+        let Some(p) = periodic else { continue };
+        let entry = us_by_face.entry(fid).or_default();
+        for &vi in tri.iter() {
+            if let Some(uv) = mesh.vertices[vi as usize].uv {
+                entry.push(uv.0.rem_euclid(p));
+            }
+        }
+    }
+
+    let mut spans = HashMap::new();
+    for (fid, mut us) in us_by_face {
+        let Some(p) = model
+            .faces
+            .get(fid)
+            .and_then(|f| model.surfaces.get(f.surface_id))
+            .and_then(|s| s.period_u())
+        else {
+            continue;
+        };
+        if us.is_empty() {
+            continue;
+        }
+        us.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let mut max_gap = p - us[us.len() - 1] + us[0]; // wrap gap
+        for w in us.windows(2) {
+            let g = w[1] - w[0];
+            if g > max_gap {
+                max_gap = g;
+            }
+        }
+        spans.insert(fid, p - max_gap);
+    }
+    spans
+}
+
 /// **Mesh-quality** verdict — the render mesh against the CAD tessellation rules:
 /// boundary conformance (no facet bridges across a periodic/closed lateral),
 /// normal deviation from the true surface (smoothness / off-surface bridges), and
@@ -589,6 +738,11 @@ pub fn mesh_quality(
     }
     let has_faces = mesh.face_map.len() == mesh.triangles.len();
     let tol = model.tolerance;
+
+    // Every periodic face's own u-extent, measured before any facet is judged.
+    // `is_bridging_facet` cannot decide the exactly-half-period case from the
+    // facet alone, and this is the only thing that separates the two readings.
+    let face_spans = measure_face_u_spans(&mesh, model, has_faces);
 
     // Per face: (worst_aspect, min_angle_deg, max_normal_dev_deg, boundary_cross).
     let mut per_face: HashMap<u32, (f64, f64, f64, usize)> = HashMap::new();
@@ -641,7 +795,20 @@ pub fn mesh_quality(
         {
             if let Some(surface) = model.surfaces.get(face.surface_id) {
                 if let Some(p) = surface.period_u() {
-                    if periodic_coverage(uv0.0, uv1.0, uv2.0, p) > p * 0.5 {
+                    // The face's own u-extent is the discriminator — see
+                    // `is_bridging_facet`. Absent a measurement, `p` reduces
+                    // this to the plain half-period test.
+                    let span = face_spans.get(&fid).copied().unwrap_or(p);
+                    // A vertex at a u-singularity (a sphere's pole) has an
+                    // ARBITRARY u, so the facet's apparent span is nominal and
+                    // the test below would be reading noise. Checked only for
+                    // facets that already passed the span screen — 4 of 19800
+                    // on a sphere — so the two extra surface evaluations cost
+                    // nothing on the common path.
+                    let at_singularity = [uv0, uv1, uv2]
+                        .iter()
+                        .any(|uv| u_is_degenerate_at(surface, uv.1, p));
+                    if !at_singularity && is_bridging_facet(uv0.0, uv1.0, uv2.0, p, span) {
                         boundary_crossing += 1;
                         entry.3 += 1;
                     }
