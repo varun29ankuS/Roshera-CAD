@@ -1,4 +1,6 @@
 import { useRef, useEffect, useState, useCallback, useMemo } from 'react'
+import { PermissionCard, PermissionStrip } from './PermissionCard'
+import { useAcpPermissionStore } from '@/stores/acp-permission-store'
 import { useBlackboardStore } from '@/stores/blackboard-store'
 import { useAcpSessionStore } from '@/stores/acp-session-store'
 import { useWSStore } from '@/stores/ws-store'
@@ -197,6 +199,7 @@ export function Blackboard() {
   const [histIdx, setHistIdx] = useState<number | null>(null)
   const historyRef = useRef<string[]>(loadPromptHistory())
   const scrollRef = useRef<HTMLDivElement>(null)
+  const pendingPermissions = useAcpPermissionStore((s) => s.pending)
   const inputRef = useRef<HTMLTextAreaElement>(null)
 
   // Autosize the composer to its content (recall can change the value
@@ -647,6 +650,16 @@ export function Blackboard() {
               <span className="text-xs text-muted-foreground">Thinking...</span>
             </div>
           )}
+
+          {/* The agent is blocked on a human. These sit at the tail of the
+              transcript because that is where the turn actually stopped —
+              hoisting them into chrome would separate the ask from the work
+              that prompted it. */}
+          {pendingPermissions.map((req) => (
+            <div key={String(req.requestId)} className="px-3">
+              <PermissionCard request={req} />
+            </div>
+          ))}
         </div>
       </div>
 
@@ -656,6 +669,13 @@ export function Blackboard() {
           line. Never disabled mid-turn: the transport queues serially and
           the strip below makes that queue visible. */}
       <div className="shrink-0 border-t border-white/10 bg-white/[0.04]">
+        {/* Someone watching the render rather than the transcript still has
+            to learn the agent stopped and is waiting on them. */}
+        <PermissionStrip
+          onFocus={() => {
+            if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight
+          }}
+        />
         {/* QUEUE STRIP — prompts received but not yet dispatched. Dashed
             amber is the app's existing "not run yet" grammar (ClaimBadge's
             null state in cards/card-chrome.tsx) — waiting is a state, so

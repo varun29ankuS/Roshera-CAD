@@ -29,6 +29,7 @@
 
 import { useBlackboardStore } from '@/stores/blackboard-store'
 import { useAcpSessionStore } from '@/stores/acp-session-store'
+import { useAcpPermissionStore } from '@/stores/acp-permission-store'
 import { parseCard, type CardKind } from '@/lib/blackboard-cards'
 import {
   AcpClient,
@@ -504,6 +505,17 @@ let sharedClientPromise: Promise<AcpClient> | null = null
 
 async function createAndConnect(): Promise<AcpClient> {
   const client = new AcpClient()
+
+  // The agent's permission asks reach a human now instead of being answered
+  // by the client. `onPermissionRequest` parks the request; `setResponder`
+  // gives the card the only way to post the answer back, so the store never
+  // needs to import the transport.
+  client.onPermissionRequest = (req) => useAcpPermissionStore.getState().open(req)
+  useAcpPermissionStore.getState().setResponder((requestId, optionId) => {
+    void client.answerPermission(requestId, optionId).catch((err) => {
+      console.error('[acp] answering permission failed:', err)
+    })
+  })
   // Subscribed BEFORE the first newSession() so one code path serves both
   // session starts: the initial connect below AND every rebuild the
   // client makes on its own (`reestablish` after a backend restart or a
@@ -535,7 +547,13 @@ async function createAndConnect(): Promise<AcpClient> {
   // A stream drop (not just an explicit `resetAcpClient()` call below)
   // must also end the session in the header — a dead connection showing
   // live counts would be worse than showing nothing.
-  client.onDisconnect(() => useAcpSessionStore.getState().endSession())
+  client.onDisconnect(() => {
+    useAcpSessionStore.getState().endSession()
+    // A dead session's questions are unanswerable: their request ids belong to
+    // a connection that is gone, so leaving the cards up would offer buttons
+    // that cannot post.
+    useAcpPermissionStore.getState().clear()
+  })
   return client
 }
 

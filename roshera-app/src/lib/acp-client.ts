@@ -42,11 +42,10 @@
  *   (callers can read that pending delay via `acpCooldownRemainingMs()`
  *   and SHOW it), and the 429 itself throws `AcpRateLimitError` verbatim
  *   for the caller to surface — never a silently-swallowed retry.
- * - It never approves anything beyond `allow_once` and never answers an
- *   unrecognized server→client method by hanging — session mode is
- *   `auto` (no human approval round-trip is expected), so the one
- *   real-world case (`session/request_permission`) is answered
- *   immediately and everything else gets a typed JSON-RPC `-32601`.
+ * - It approves NOTHING on the human's behalf. `session/request_permission`
+ *   is handed to `onPermissionRequest` and left unanswered until a person
+ *   decides; every other unrecognized server→client method gets a typed
+ *   JSON-RPC `-32601` rather than hanging the agent's turn forever.
  */
 
 // ── JSON-RPC message shapes ─────────────────────────────────────────────
@@ -397,7 +396,23 @@ type PendingEntry = { resolve: (value: unknown) => void; reject: (err: Error) =>
 
 const DEFAULT_ACP_PATH = '/acp'
 
+/** What the client hands out when the agent asks the human for permission. */
+export interface AcpPermissionRequest {
+  requestId: JsonRpcId
+  options: Array<{ optionId: string; kind?: string; name?: string }>
+  toolCallId: string | null
+  title: string | null
+  description: string | null
+  askedAt: number
+}
+
 export class AcpClient {
+  /** Called when `session/request_permission` arrives. The request is NOT
+   *  answered until {@link answerPermission} is called, so a client that
+   *  leaves this unset stalls the agent's turn — which is the honest failure,
+   *  and strictly better than approving on a human's behalf. */
+  public onPermissionRequest: ((req: AcpPermissionRequest) => void) | null = null
+
   private readonly acpPath: string
   /** Explicit override only (ctor option or `VITE_ACP_CWD`) — empty means
    *  "ask the backend", resolved and cached lazily by {@link resolveCwd}.
@@ -563,26 +578,66 @@ export class AcpClient {
     for (const cb of this.updateHandlers) cb(params.update)
   }
 
-  /** Server→client requests. `auto` session mode means no human approval
-   *  round-trip is expected, so a permission prompt is answered
-   *  immediately with `allow_once`; anything this client doesn't
-   *  recognize gets a typed JSON-RPC `-32601` rather than hanging the
-   *  agent's turn forever. */
+  /** Server→client requests. A permission request is HELD for a human;
+   *  anything this client doesn't recognize gets a typed JSON-RPC `-32601`
+   *  rather than hanging the agent's turn forever. */
   private async handleServerRequest(req: JsonRpcRequestMsg): Promise<void> {
     if (req.method === 'session/request_permission') {
+      // This used to answer itself — `find(allow_once) ?? options[0]` — and
+      // the human never learned the agent had asked. In a product whose whole
+      // claim is that a person judges and the kernel cannot lie, the one
+      // moment judgement was demanded was the one moment it was skipped. The
+      // `options[0]` fallback was worse than the preference: it would have
+      // auto-selected a destructive option purely for being listed first.
+      //
+      // The request is now parked, unanswered, until someone answers it.
+      // There is deliberately no client-side timeout: a stall is made visible
+      // rather than resolved fictionally, and the agent giving up is a fact
+      // the wire reports.
       const params = req.params as
-        | { options?: Array<{ optionId: string; kind?: string }> }
+        | {
+            options?: Array<{ optionId: string; kind?: string; name?: string }>
+            toolCallId?: string
+            title?: string
+            description?: string
+          }
         | undefined
-      const chosen =
-        params?.options?.find((o) => o.kind === 'allow_once') ?? params?.options?.[0]
-      await this.respondToServer(req.id, {
-        outcome: { outcome: 'selected', optionId: chosen?.optionId ?? 'allow_once' },
+      const options = Array.isArray(params?.options) ? params.options : []
+      if (options.length === 0) {
+        // Nothing to choose between. Refusing is honest; inventing an
+        // `allow_once` id the agent never offered is not.
+        await this.respondToServer(req.id, undefined, {
+          code: -32602,
+          message: 'session/request_permission carried no options to choose from',
+        })
+        return
+      }
+      this.onPermissionRequest?.({
+        requestId: req.id,
+        options: options.map((o) => ({ optionId: o.optionId, kind: o.kind, name: o.name })),
+        toolCallId: typeof params?.toolCallId === 'string' ? params.toolCallId : null,
+        title: typeof params?.title === 'string' ? params.title : null,
+        description: typeof params?.description === 'string' ? params.description : null,
+        askedAt: Date.now(),
       })
       return
     }
     await this.respondToServer(req.id, undefined, {
       code: -32601,
       message: `Method not found: ${req.method}`,
+    })
+  }
+
+  /**
+   * Answer a held permission request with the option the human chose.
+   *
+   * `optionId` must be one the agent actually offered; this client never
+   * invents one. Safe to call once per request — a second call posts a
+   * response for an id the agent has already closed, which goose ignores.
+   */
+  public async answerPermission(requestId: JsonRpcId, optionId: string): Promise<void> {
+    await this.respondToServer(requestId, {
+      outcome: { outcome: 'selected', optionId },
     })
   }
 
