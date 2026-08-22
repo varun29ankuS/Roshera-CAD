@@ -347,48 +347,45 @@ export function Blackboard() {
     [handleSubmit, histIdx, draft],
   )
 
-  // Collapsed state — an edge-docked tab, not a floating orb.
+  // The last thing said, for the collapsed stub. A label that only ever reads
+  // "Blackboard" tells the human nothing about whether the agent answered.
+  const lastLine = lines.length > 0 ? lines[lines.length - 1]?.text?.trim() : undefined
+
+  // Collapsed state — a stub row inside the rail, not a tab on the canvas.
   //
-  // This was a navy circle with a shadow parked over the model: a fourth
-  // navy-filled shouter competing with real primary actions, and an unlabelled
-  // one, so the only way to learn what it did was to press it. It sits at
-  // `bottom-8 left-[15.5rem]` now — exactly where the open panel's bottom-left
-  // corner rests — so closing the panel visibly collapses it into this handle
-  // instead of swapping it for an unrelated object somewhere else. `border-l-0
-  // rounded-r-md` makes it read as attached chrome rather than something
-  // floating on top of the scene, and the vertical label answers the question
-  // the circle refused to. 14.5rem, not the panel's own 15.5rem: a left-less
-  // border has to butt against a real edge or it just looks sliced off, and
-  // the rail's right edge is at 14.5rem. The 16px it gives up in corner
-  // continuity buys a tab that is actually attached to something.
-  //
-  // Opaque `bg-card`, no backdrop blur: a translucent panel over a shaded
-  // model is a legibility gamble that depends on whatever geometry happens to
-  // be behind it.
+  // This has been a navy orb over the model, then an edge-docked tab against
+  // the tree rail. Both existed because the Blackboard floated and needed
+  // somewhere to hide. It does not float any more: the rail is its home, so
+  // collapsed simply means the rail is narrow and the board is one line of it.
   if (!isPanelOpen) {
     return (
       <button
         onClick={togglePanel}
-        className="cad-focus absolute bottom-8 left-[14.5rem] z-20 flex flex-col items-center gap-2 rounded-r-md border border-l-0 border-border bg-card px-1.5 py-3 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+        className="flex w-full shrink-0 items-center gap-2 border-b border-border/40 px-3 py-2 text-left transition-colors hover:bg-accent"
         aria-label="Open Blackboard"
-        title="Blackboard"
+        title="Blackboard — the conversation with the agent"
       >
-        <NotebookPen size={14} />
-        <span className="font-mono text-[11px] uppercase tracking-wider [writing-mode:vertical-rl]">
-          Blackboard
+        <NotebookPen size={13} className="shrink-0 text-muted-foreground" aria-hidden />
+        <span className="min-w-0 flex-1 truncate text-[11px] text-muted-foreground">
+          {lastLine ?? 'Blackboard'}
         </span>
       </button>
     )
   }
 
   return (
-    // Anchored CLEAR of the model-tree rail, not over it. The rail is
-    // `left-2 w-56` (App.tsx) and so ends at 232px; this panel sat at `left-3`
-    // with `z-20` against the rail's `z-10`, which meant an open Blackboard
-    // covered the entire tree. The tree was not unreadable — it was hidden,
-    // and every judgement about "the tree" was really about four datum rows.
-    // 15.5rem = the rail's right edge plus a gutter.
-    <div className="absolute bottom-8 left-[15.5rem] z-20 w-[50rem] max-w-[calc(100vw-17rem)] flex flex-col rounded-xl overflow-hidden bg-card border border-border">
+    // DOCKED in the right rail. This was an 800px slab floating over the
+    // model — the one thing the human's job depends on looking at — and it
+    // had already been moved once to stop it covering the tree, which is the
+    // shape of a panel that has no home rather than a panel in the wrong
+    // place. It has a home now: left rail is the structure of the MODEL,
+    // right rail is the structure of the DIALOGUE, and the viewport is an
+    // unobstructed bench between them.
+    //
+    // The trade is width for height. A full-height column at 560px carries
+    // the same prose at a better measure than 800px ever did lying down, so
+    // the board loses a third of its width and gains capacity.
+    <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
       {/* Resize grip — a drag here overrides the attention-following split
           and STICKS until released (double-click, or the "auto" chip). */}
       <div

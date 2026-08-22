@@ -41,8 +41,26 @@ const DEFAULT_EL = 20
  * watertightness is visible at a glance; `ids` paints each B-Rep face a
  * distinct flat colour. The panel polls the same endpoints the agent reads.
  */
-export function AgentEyePanel() {
-  const [minimized, setMinimized] = useState(false)
+/**
+ * `onMinimizedChange` lets the rail know whether this panel is showing.
+ *
+ * The rail's splitter sets an explicit height on the slot below it, and an
+ * explicit height on a collapsed panel is a tall empty card. The rail cannot
+ * ask the DOM mid-render, so the panel reports it.
+ */
+export function AgentEyePanel({
+  onMinimizedChange,
+}: {
+  onMinimizedChange?: (minimized: boolean) => void
+} = {}) {
+  const [minimized, setMinimizedState] = useState(false)
+  const setMinimized = useCallback(
+    (next: boolean) => {
+      setMinimizedState(next)
+      onMinimizedChange?.(next)
+    },
+    [onMinimizedChange],
+  )
   const [live, setLive] = useState(true)
   const [scope, setScope] = useState<Scope>('part')
   // The instanced-assembly id the 'assembly' scope renders (#19). Empty = render
@@ -198,7 +216,11 @@ export function AgentEyePanel() {
     // the model in an app whose whole purpose is looking at the model, and it
     // took its own width, border and shadow with it. The dock owns the chrome
     // now; this fills the slot it is given.
-    <div className="flex min-h-0 w-full flex-1 flex-col overflow-hidden">
+    // shrink-0, not flex-1. Agent Eye and the Blackboard both claimed flex-1
+    // and split the column evenly, which squeezed a transcript down to six
+    // lines to give a fixed-size thumbnail half the rail. The board is the
+    // tenant that grows; this one is sized by its content and sits at the foot.
+    <div className="flex w-full shrink-0 flex-col overflow-hidden">
       <div className="flex items-center justify-between border-b border-border px-2 py-1.5">
         <div className="flex min-w-0 items-center gap-1.5 text-xs font-semibold">
           {/* nowrap: the header is 208px wide and the status pill grew with the
@@ -269,7 +291,12 @@ export function AgentEyePanel() {
         </div>
       )}
 
-      <div className="relative aspect-square w-full bg-muted">
+      {/* Capped, and centred rather than stretched. `aspect-square w-full`
+          made the render exactly as tall as the rail is wide, so widening the
+          rail to 560px turned a glanceable instrument into a 560px second
+          viewport that halved the conversation above it. This is a thumbnail
+          of what the agent sees; it does not compete with the bench. */}
+      <div className="relative mx-auto aspect-square w-full max-w-[240px] bg-muted">
         {png ? (
           <img
             src={`data:image/png;base64,${png}`}

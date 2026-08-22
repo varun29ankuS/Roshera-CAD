@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from 'react'
+import { useEffect, useRef, useState, useCallback } from 'react'
 import { TopBar } from '@/components/layout/TopBar'
 import { DocumentTabs } from '@/components/layout/DocumentTabs'
 import { ToolBar } from '@/components/layout/ToolBar'
@@ -17,7 +17,10 @@ import { BlackboardFixtures } from '@/components/dev/BlackboardFixtures'
 import { SemanticsPanel } from '@/components/dev/SemanticsPanel'
 import { CommandPalette } from '@/components/CommandPalette'
 import { LoginDialog } from '@/components/LoginDialog'
+import { cn } from '@/lib/utils'
+import { RailSplitter, useRailSplit } from '@/components/layout/RailSplitter'
 import { useKeyboardShortcuts } from '@/lib/shortcuts'
+import { useBlackboardStore } from '@/stores/blackboard-store'
 import { useSceneStore } from '@/stores/scene-store'
 import { useDocModeStore } from '@/stores/doc-mode-store'
 import { initWebSocket, teardownWebSocket } from '@/lib/ws-bridge'
@@ -48,6 +51,29 @@ function routeFromHash(): Route {
 export function App() {
   useKeyboardShortcuts()
   const hasSelection = useSceneStore((s) => s.selectedIds.size > 0)
+  // Rail tenancy. The right rail has two widths, and which one it is depends
+  // on whether anybody needs the room — not on how much content happens to
+  // exist. Content-driven width resizes the canvas while the agent is
+  // streaming, which moves the model under the cursor mid-read.
+  const agentBusy = useBlackboardStore((s) => s.isProcessing)
+  const boardOpen = useBlackboardStore((s) => s.isPanelOpen)
+  const railWants = hasSelection || agentBusy || boardOpen
+  const [railWide, setRailWide] = useState(railWants)
+  const railRef = useRef<HTMLDivElement>(null)
+  const split = useRailSplit(railRef)
+  // A dragged height applies only while Agent Eye is actually showing.
+  // Forcing it on a collapsed panel would render a tall empty card.
+  const [eyeMinimized, setEyeMinimized] = useState(false)
+  useEffect(() => {
+    if (railWants) {
+      setRailWide(true)
+      return
+    }
+    // Closing is delayed; opening is not. A quick select/deselect would
+    // otherwise thrash the viewport's width twice in a few hundred ms.
+    const t = setTimeout(() => setRailWide(false), 500)
+    return () => clearTimeout(t)
+  }, [railWants])
   // Default to Part workspace when nothing has been chosen yet so the
   // UI is never blank. The tab strip still mirrors the store so users
   // can switch freely.
@@ -164,7 +190,6 @@ export function App() {
             {/* Viewport + floating overlays in the standard CAD layout */}
             <div className="relative flex-1 overflow-hidden">
               <CADViewport />
-              <Blackboard />
               <StepImportDropzone />
 
               {/* Browser — single consolidated panel. The header chip is
@@ -182,19 +207,52 @@ export function App() {
               </div>
             </div>
 
-            {/* Right dock — ONE column, ONE hairline. Properties appears above
-                Agent Eye when something is selected; Agent Eye is always
-                present. Neither floats: a panel parked over the canvas hides
-                the geometry the app exists to show, and two panels each
-                carrying their own border read as things stuck onto the screen
-                rather than parts of it. */}
-            <div className="flex w-56 shrink-0 flex-col border-l border-border bg-card">
+            {/* Right dock — ONE column, ONE hairline, three tenants in a fixed
+                vertical order. Left rail is the structure of the MODEL, this
+                is the structure of the DIALOGUE, and the viewport is an
+                unobstructed bench between them.
+
+                The order is load-bearing rather than cosmetic. Streamed agent
+                output lands at the Blackboard's BOTTOM edge, and that edge
+                stays anchored just above Agent Eye whether or not Properties
+                is present above it — so selecting something mid-run inserts a
+                panel at the top and compresses the board downward, and the
+                live text never jumps.
+
+                Stacked, not tabbed. Agent Eye is an ambient instrument whose
+                whole job is being glanceable mid-run; a tab demotes it to
+                pull-to-view at exactly the moment it matters, and a selection
+                made during a stream needs both tenants live at once, which
+                tabs serialise. */}
+            <div
+              ref={railRef}
+              className={cn(
+                'flex shrink-0 flex-col border-l border-border bg-card transition-[width] duration-200',
+                railWide ? 'w-[560px]' : 'w-56',
+              )}
+            >
               {hasSelection && (
-                <div className="flex min-h-0 flex-1 flex-col border-b border-border/40">
+                <div className="flex max-h-[280px] min-h-0 shrink-0 flex-col overflow-hidden border-b border-border/40">
                   <PropertiesPanel />
                 </div>
               )}
-              <AgentEyePanel />
+              <Blackboard />
+              <RailSplitter dragging={split.dragging} {...split.handleProps} />
+              {/* An explicit height, so the splitter can GROW this panel and
+                  not merely cap it — `maxHeight` could only ever shrink it,
+                  which made dragging upward do nothing. Suppressed while Agent
+                  Eye is collapsed, where a fixed height would be a tall empty
+                  card. */}
+              <div
+                className="flex shrink-0 flex-col overflow-hidden"
+                style={
+                  split.height === null || eyeMinimized
+                    ? undefined
+                    : { height: split.height }
+                }
+              >
+                <AgentEyePanel onMinimizedChange={setEyeMinimized} />
+              </div>
             </div>
           </>
         )}
