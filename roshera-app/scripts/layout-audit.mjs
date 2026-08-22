@@ -150,8 +150,11 @@ export const PROBE = `(() => {
       if (ox > 40 && oy > 40) out.occluding.push({ text: label(el), area: Math.round(ox * oy) });
     }
 
-    // Through the type floor.
-    if (el.children.length === 0 && (el.textContent || '').trim()) {
+    // Through the type floor. Zero-width joiners and spacers carry no
+    // readable glyph, so their font size is not a legibility fact — a U+200B
+    // set at 1px is a layout device, not unreadable text.
+    const readable = (el.textContent || '').replace(/[​-‍﻿]/g, '').trim();
+    if (el.children.length === 0 && readable) {
       const px = parseFloat(cs.fontSize);
       if (px && px < FLOOR) out.tiny.push({ text: label(el), px });
     }
