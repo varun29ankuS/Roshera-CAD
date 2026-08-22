@@ -400,8 +400,13 @@ export function Blackboard() {
         <GripHorizontal size={11} className="text-muted-foreground/40" />
       </div>
       {/* Header */}
-      <div className="flex items-center justify-between px-3 py-1.5 border-b border-white/5">
-        <div className="flex items-center gap-2 min-w-0">
+      {/* Title and chrome are different roles, so bookending them is legal —
+          but each side has to be a tight cluster, or the gutter between them
+          reads as a hole instead of as chrome-distance. The identity meta
+          (turns, tokens) is the expendable half: it truncates rather than
+          shoving the controls off the panel. */}
+      <div className="flex items-center justify-between gap-3 px-3 py-1.5 border-b border-white/5">
+        <div className="flex min-w-0 items-center gap-2">
           <NotebookPen size={14} className="text-primary shrink-0" />
           <span className="text-xs font-medium shrink-0">Blackboard</span>
           {/* Attention state, legible without reading the board. */}
@@ -492,7 +497,7 @@ export function Blackboard() {
             )}
           </span>
         </div>
-        <div className="flex items-center gap-0.5">
+        <div className="flex shrink-0 items-center gap-0.5">
           {overrideHeight !== null && (
             <button
               onClick={releaseOverride}

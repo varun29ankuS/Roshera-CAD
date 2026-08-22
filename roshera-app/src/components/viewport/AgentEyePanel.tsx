@@ -221,7 +221,11 @@ export function AgentEyePanel({
     // lines to give a fixed-size thumbnail half the rail. The board is the
     // tenant that grows; this one is sized by its content and sits at the foot.
     <div className="flex w-full shrink-0 flex-col overflow-hidden">
-      <div className="flex items-center justify-between border-b border-border px-2 py-1.5">
+      {/* justify-between is legal HERE: title and chrome are different roles,
+          and title-left/chrome-right is load-bearing convention. What was
+          illegal was leaving each side loose, so the gap read as a hole rather
+          than as chrome-distance. Both sides are tight clusters now. */}
+      <div className="flex items-center justify-between gap-3 border-b border-border px-2 py-1.5">
         <div className="flex min-w-0 items-center gap-1.5 text-xs font-semibold">
           {/* nowrap: the header is 208px wide and the status pill grew with the
               11px type floor, which wrapped the title to "Agent / Eye". A panel
@@ -232,7 +236,7 @@ export function AgentEyePanel({
               status grammar rather than a bespoke dot-and-word pair. */}
           <StatusPill tone={live ? 'positive' : 'neutral'} label={live ? 'LIVE' : 'paused'} />
         </div>
-        <div className="flex items-center gap-1">
+        <div className="flex shrink-0 items-center gap-0.5">
           <button
             onClick={() => setLive((v) => !v)}
             className="rounded px-1.5 py-0.5 text-[11px] hover:bg-accent"
@@ -259,13 +263,16 @@ export function AgentEyePanel({
 
       {/* Scope: a single part vs an assembly (a named instanced assembly by id,
           or the whole-scene composite when no id is given). */}
-      <div className="flex border-b border-border">
+      {/* Peers hug. `flex-1` on each chip made 'Part' and 'Assembly' into two
+          280px slabs at the working width — a tab is a label, not a column, and
+          a tab row ending short of the right edge is correct. */}
+      <div className="flex items-center gap-1 border-b border-border px-2 py-1">
         {(['part', 'assembly'] as Scope[]).map((s) => (
           <TabChip
             key={s}
             selected={scope === s}
             onClick={() => setScope(s)}
-            className="flex-1 rounded-none border-0 px-2 py-1 text-[11px] font-medium capitalize"
+            className="whitespace-nowrap px-2.5 py-1 text-[11px] font-medium capitalize"
             title={
               s === 'part'
                 ? 'Show the newest part on its own'
@@ -291,60 +298,97 @@ export function AgentEyePanel({
         </div>
       )}
 
-      {/* Capped, and centred rather than stretched. `aspect-square w-full`
-          made the render exactly as tall as the rail is wide, so widening the
-          rail to 560px turned a glanceable instrument into a 560px second
-          viewport that halved the conversation above it. This is a thumbnail
-          of what the agent sees; it does not compete with the bench. */}
-      <div className="relative mx-auto aspect-square w-full max-w-[240px] bg-muted">
-        {png ? (
-          <img
-            src={`data:image/png;base64,${png}`}
-            alt={isSceneScope ? 'agent scene view' : 'agent part view'}
-            className="h-full w-full object-contain"
-          />
-        ) : (
-          <div className="flex h-full w-full items-center justify-center text-xs text-muted-foreground">
-            {err ?? 'loading…'}
-          </div>
-        )}
-        {activeMode === 'diagnostic' && diag && (
-          <div className="absolute left-1 top-1 rounded bg-background/80 px-1.5 py-0.5 font-mono text-[11px]">
-            <span className={diag.open ? 'text-red-500' : 'text-green-500'}>open {diag.open}</span>
-            {' · '}
-            <span className={diag.nm ? 'text-fuchsia-500' : 'text-green-500'}>nm {diag.nm}</span>
-          </div>
-        )}
-      </div>
+      {/* The render and the kernel's verdict share one row.
+          `aspect-square w-full max-w-[240px] mx-auto` put a 240px image in the
+          middle of a 560px field with 160px of dead grey either side — panel
+          slack dumped symmetrically around an island. The cap was innocent;
+          the centring was the mistake. The image is anchored left at a fixed
+          200px and the slack goes to the readout, which is where the eye should
+          be going anyway.
 
-      {scope === 'part' && perc && (
-        <div className="flex items-center justify-between gap-2 border-t border-border px-2 py-1 font-mono text-[11px]">
-          <span className={perc.watertight && perc.valid ? 'text-green-600' : 'text-red-500'}>
-            {perc.watertight && perc.valid ? '✓ sound' : '✗ defect'}
-          </span>
-          <span className={perc.open_edges ? 'text-red-500' : 'text-muted-foreground'}>
-            open {perc.open_edges}
-          </span>
-          <span className={perc.nonmanifold_edges ? 'text-fuchsia-500' : 'text-muted-foreground'}>
-            nm {perc.nonmanifold_edges}
-          </span>
-          <span className={perc.valid ? 'text-muted-foreground' : 'text-red-500'}>
-            {perc.valid ? 'valid' : 'invalid'}
-          </span>
-          {perc.dims && (
-            <span className="text-muted-foreground">
-              {perc.dims.map((d) => Math.round(d)).join('×')}
-            </span>
+          One tree, both widths, no container queries: at 560 the render and the
+          readout sit side by side and there is no grey field at all; at 224 the
+          row cannot fit both, so flex-wrap stacks them and the readout becomes
+          a spec table under the image. `object-contain` with the background on
+          the image itself means an off-square snapshot letterboxes INSIDE its
+          own frame, so no field ever surrounds it. */}
+      <div className="flex flex-wrap items-start gap-3 px-2 py-2">
+        <div className="relative h-[200px] w-[200px] shrink-0 overflow-hidden rounded border border-border bg-muted">
+          {png ? (
+            <img
+              src={`data:image/png;base64,${png}`}
+              alt={isSceneScope ? 'agent scene view' : 'agent part view'}
+              className="h-full w-full object-contain"
+            />
+          ) : (
+            <div className="flex h-full w-full items-center justify-center text-xs text-muted-foreground">
+              {err ?? 'loading…'}
+            </div>
+          )}
+          {activeMode === 'diagnostic' && diag && (
+            <div className="absolute left-1 top-1 rounded bg-background/80 px-1.5 py-0.5 font-mono text-[11px]">
+              <span className={diag.open ? 'text-red-500' : 'text-green-500'}>open {diag.open}</span>
+              {' · '}
+              <span className={diag.nm ? 'text-fuchsia-500' : 'text-green-500'}>nm {diag.nm}</span>
+            </div>
           )}
         </div>
-      )}
+
+        {scope === 'part' && perc && (
+          // Label/value pairs in a column, not five chips distributed across
+          // the panel. Bookending is legal at the PAIR level — that is a spec
+          // sheet — and illegal across five peers, which is what made the old
+          // strip read as scattered.
+          <dl className="flex min-w-[150px] flex-1 flex-col gap-1 font-mono text-[11px]">
+            <div className="flex justify-between gap-3">
+              <dt className="text-muted-foreground">soundness</dt>
+              <dd className={perc.watertight && perc.valid ? 'text-green-600' : 'text-red-500'}>
+                {perc.watertight && perc.valid ? '✓ sound' : '✗ defect'}
+              </dd>
+            </div>
+            <div className="flex justify-between gap-3">
+              <dt className="text-muted-foreground">open edges</dt>
+              <dd className={`tabular-nums ${perc.open_edges ? 'text-red-500' : 'text-muted-foreground'}`}>
+                {perc.open_edges}
+              </dd>
+            </div>
+            <div className="flex justify-between gap-3">
+              <dt className="text-muted-foreground">non-manifold</dt>
+              <dd className={`tabular-nums ${perc.nonmanifold_edges ? 'text-fuchsia-500' : 'text-muted-foreground'}`}>
+                {perc.nonmanifold_edges}
+              </dd>
+            </div>
+            <div className="flex justify-between gap-3">
+              <dt className="text-muted-foreground">brep</dt>
+              <dd className={perc.valid ? 'text-muted-foreground' : 'text-red-500'}>
+                {perc.valid ? 'valid' : 'invalid'}
+              </dd>
+            </div>
+            {perc.dims && (
+              <div className="flex justify-between gap-3">
+                <dt className="text-muted-foreground">bounds</dt>
+                <dd className="tabular-nums text-muted-foreground">
+                  {perc.dims.map((d) => Math.round(d)).join('×')}
+                </dd>
+              </div>
+            )}
+          </dl>
+        )}
+      </div>
 
       {/* Two segmented controls, and the row WRAPS. Docking took this panel from
           236px floating to the 224px dock, and nine chips on one non-wrapping
           row put `front`/`top`/`right` past the right edge with no ellipsis to
           admit it. Wrapping drops the camera group to its own line instead of
           clipping it; nothing is ever silently cut off. */}
-      <div className="flex flex-wrap items-center justify-between gap-1 border-t border-border px-2 py-1">
+      {/* Hug, do not distribute. Render mode and camera are PEERS — both are
+          chip groups steering the same picture — so bookending them left a
+          300px hole at the working width. They sit together and the row ends
+          short of the right edge, which is what a group of controls should do.
+          It still wraps: nine chips do not fit the 224px idle rail, and
+          wrapping drops the camera group to its own line rather than clipping
+          `front`/`top`/`right` with no ellipsis to admit it. */}
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 border-t border-border px-2 py-1">
         <ModeChipGroup aria-label="Render mode">
           {modeOptions.map((m) => (
             <ModeChip
