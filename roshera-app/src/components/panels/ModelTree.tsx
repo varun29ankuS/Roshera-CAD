@@ -1079,9 +1079,20 @@ export function ModelTree({
         // No border, no radius, no shadow: this is a docked column's header
         // now, not a card floating on the canvas. A shadow is for something
         // ON TOP of the model; the rail is beside it.
+        // The `cad-panel-header` TOKEN is deliberately not used here, and a
+        // `px-2` utility beside it does not work: the token sets padding via
+        // `@apply px-3` inside a component layer, which wins, so the override
+        // reads as applied and measures as 12px. Silently losing to a token is
+        // worse than not trying — the type is copied out, the padding is this
+        // header's own.
+        //
+        // The density differs for a reason: a panel header spans a panel, this
+        // one spans a 224px rail carrying a label, a two-tab control and a
+        // chevron, and the token's padding pushed that row past its own edge.
         className={cn(
-          'cad-panel-header flex w-full items-center gap-1.5 font-mono',
-          expanded ? 'bg-card' : 'bg-muted/60',
+          'flex w-full items-center gap-1.5 border-b border-border px-2 py-1.5',
+          'font-mono text-[11px] font-medium uppercase tracking-[0.1em] text-muted-foreground',
+          expanded ? 'bg-transparent' : 'bg-transparent',
         )}
       >
         <button

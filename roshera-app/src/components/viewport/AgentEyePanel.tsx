@@ -235,13 +235,12 @@ export function AgentEyePanel({
               11px type floor, which wrapped the title to "Agent / Eye". A panel
               title that reflows because a sibling changed size is a layout that
               was only ever accidentally correct. */}
-          <span className="shrink-0" aria-hidden>
-            👁
-          </span>
-          {/* The only element allowed to give: at 224 the header is ~206px of
-              content in 208px, so first pressure squeezes the wordmark and
-              nothing else. It carries BOTH an ellipsis and a title, so a cut
-              is admitted twice over. */}
+          {/* The eye glyph is gone. The header is ~206px of content in 208px
+              at the narrow width, so the wordmark — the only element allowed
+              to give — was the one that gave, and "Agen…" is a worse panel
+              title than no decoration. Dropping the glyph frees ~19px, which
+              is the whole margin. It carries an ellipsis and a title anyway,
+              so any future cut is still admitted twice over. */}
           <span className="truncate" title="Agent Eye">
             Agent Eye
           </span>

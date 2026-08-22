@@ -55,7 +55,22 @@ export const PROBE = `(() => {
     // trips every naive scrollWidth check — this probe reported a correctly
     // hidden rail label as destroyed text until that was measured.
     const srOnly = el.clientWidth <= 1 || el.clientHeight <= 1;
-    if (!srOnly && el.children.length === 0 && el.scrollWidth > el.clientWidth + 2) {
+    // An empty <input> reports scrollWidth > clientWidth from its own internal
+    // padding box, with no text to destroy. Only a control that HAS a value
+    // can be clipping one.
+    const emptyField =
+      (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') && !el.value;
+    // Requires TEXT. This check exists to catch characters being destroyed, and
+    // an element with none has none to destroy — a decorative box whose
+    // scrollWidth exceeds its clientWidth is a box, not a truncation.
+    const hasText = (el.textContent || '').replace(/[​-‍﻿]/g, '').trim().length > 0;
+    if (
+      !srOnly &&
+      !emptyField &&
+      hasText &&
+      el.children.length === 0 &&
+      el.scrollWidth > el.clientWidth + 2
+    ) {
       const admits = cs.textOverflow === 'ellipsis' || !!el.title || !!el.closest('[title]');
       if (!admits) out.clipped.push({ text: label(el), width: Math.round(r.width), needs: el.scrollWidth });
     }

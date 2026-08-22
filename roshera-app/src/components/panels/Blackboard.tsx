@@ -413,7 +413,7 @@ export function Blackboard() {
     return (
       <button
         onClick={togglePanel}
-        className="flex w-full shrink-0 items-center gap-2 border-b border-border/40 px-3 py-2 text-left transition-colors hover:bg-accent"
+        className="pointer-events-auto flex max-w-[34rem] items-center gap-2 self-start rounded-full border border-border bg-card/95 px-3 py-1.5 text-left transition-colors hover:bg-accent"
         aria-label="Open Blackboard"
         title="Blackboard — the conversation with the agent"
       >
@@ -437,7 +437,9 @@ export function Blackboard() {
     // The trade is width for height. A full-height column at 560px carries
     // the same prose at a better measure than 800px ever did lying down, so
     // the board loses a third of its width and gains capacity.
-    <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+    // pointer-events-auto: the slot around this is pass-through so the model
+    // stays orbitable everywhere the panel is not.
+    <div className="pointer-events-auto flex max-h-full min-h-0 w-full max-w-[52rem] flex-col overflow-hidden rounded-lg border border-border bg-card/95">
       {/* Resize grip — a drag here overrides the attention-following split
           and STICKS until released (double-click, or the "auto" chip). */}
       <div
@@ -452,12 +454,13 @@ export function Blackboard() {
         <GripHorizontal size={11} className="text-muted-foreground/40" />
       </div>
       {/* Header */}
-      {/* Title and chrome are different roles, so bookending them is legal —
-          but each side has to be a tight cluster, or the gutter between them
-          reads as a hole instead of as chrome-distance. The identity meta
-          (turns, tokens) is the expendable half: it truncates rather than
-          shoving the controls off the panel. */}
-      <div className="flex items-center justify-between gap-3 px-3 py-1.5 border-b border-white/5">
+      {/* Hug, do not bookend. This header bookended its title against its own
+          controls, which measured an 18px seam in a narrow rail and a 414px
+          hole once the panel floated at 52rem. The rule is the one Agent Eye's
+          header settled on: bookend app-level BARS, where end-anchoring spans
+          real working space; a panel header is one unit and reads as one.
+          Trailing space after the last button is row slack, not a void. */}
+      <div className="flex items-center gap-3 px-3 py-1.5 border-b border-white/5">
         <div className="flex min-w-0 items-center gap-2">
           <NotebookPen size={14} className="text-primary shrink-0" />
           <span className="text-xs font-medium shrink-0">Blackboard</span>

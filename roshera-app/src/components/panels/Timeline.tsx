@@ -1489,7 +1489,7 @@ export function Timeline() {
     (checkpointSubmitAttempted || checkpointNameInput.trim().length > 0)
 
   return (
-    <div className="relative font-mono flex flex-col border-t border-border bg-card shrink-0">
+    <div className="relative font-mono flex flex-col shrink-0 bg-transparent">
       {branchPickerOpen && (
         <div
           ref={branchPickerRef}

@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, useCallback } from 'react'
+import { useEffect, useState, useCallback } from 'react'
 import { TopBar } from '@/components/layout/TopBar'
 import { DocumentTabs } from '@/components/layout/DocumentTabs'
 import { ToolBar } from '@/components/layout/ToolBar'
@@ -18,9 +18,7 @@ import { SemanticsPanel } from '@/components/dev/SemanticsPanel'
 import { CommandPalette } from '@/components/CommandPalette'
 import { LoginDialog } from '@/components/LoginDialog'
 import { cn } from '@/lib/utils'
-import { RailSplitter, useRailSplit } from '@/components/layout/RailSplitter'
 import { useKeyboardShortcuts } from '@/lib/shortcuts'
-import { useBlackboardStore } from '@/stores/blackboard-store'
 import { useSceneStore } from '@/stores/scene-store'
 import { useDocModeStore } from '@/stores/doc-mode-store'
 import { initWebSocket, teardownWebSocket } from '@/lib/ws-bridge'
@@ -51,29 +49,6 @@ function routeFromHash(): Route {
 export function App() {
   useKeyboardShortcuts()
   const hasSelection = useSceneStore((s) => s.selectedIds.size > 0)
-  // Rail tenancy. The right rail has two widths, and which one it is depends
-  // on whether anybody needs the room — not on how much content happens to
-  // exist. Content-driven width resizes the canvas while the agent is
-  // streaming, which moves the model under the cursor mid-read.
-  const agentBusy = useBlackboardStore((s) => s.isProcessing)
-  const boardOpen = useBlackboardStore((s) => s.isPanelOpen)
-  const railWants = hasSelection || agentBusy || boardOpen
-  const [railWide, setRailWide] = useState(railWants)
-  const railRef = useRef<HTMLDivElement>(null)
-  const split = useRailSplit(railRef)
-  // A dragged height applies only while Agent Eye is actually showing.
-  // Forcing it on a collapsed panel would render a tall empty card.
-  const [eyeMinimized, setEyeMinimized] = useState(false)
-  useEffect(() => {
-    if (railWants) {
-      setRailWide(true)
-      return
-    }
-    // Closing is delayed; opening is not. A quick select/deselect would
-    // otherwise thrash the viewport's width twice in a few hundred ms.
-    const t = setTimeout(() => setRailWide(false), 500)
-    return () => clearTimeout(t)
-  }, [railWants])
   // Default to Part workspace when nothing has been chosen yet so the
   // UI is never blank. The tab strip still mirrors the store so users
   // can switch freely.
@@ -187,88 +162,84 @@ export function App() {
           <>
             <ToolBar />
 
-            {/* Left rail — DOCKED, like the right one. It was
-                `absolute top-2 bottom-2 left-2 z-10`, a 224×670 card sitting
-                ON the canvas, and it had no closed state at all, so it covered
-                the model permanently. That is the same objection that moved the
-                Blackboard off the viewport; the symmetry was only half true
-                while this stayed a floating card pretending to be a rail.
-
-                Docking does not newly cost the viewport anything — those pixels
-                were already hidden whenever the tree was open. What it adds is
-                the ability to give them back: collapsed, the rail is a 40px
-                strip rather than a 224px overlay, which is strictly more canvas
-                than the floating version could ever return. */}
-            <div
-              className={cn(
-                'flex shrink-0 flex-col overflow-hidden border-r border-border bg-card transition-[width] duration-200',
-                browserOpen ? 'w-56' : 'w-10',
-              )}
-            >
-              <ModelTree
-                expanded={browserOpen}
-                onToggle={() => setBrowserOpen((open) => !open)}
-              />
-            </div>
-
+            {/* The tree lives INSIDE the viewport, over the model — not beside
+                it. I had docked it as a column for symmetry with the right
+                rail, and Varun rejected that on the ground that matters more
+                than symmetry: a docked tree permanently narrows the graphics
+                area, and in CAD the graphics area is the work. Every kernel
+                this competes with overlays its feature tree for exactly that
+                reason.
+                What survives from the dock is the part that was actually an
+                improvement — it collapses to a 40px strip, which the old
+                floating card could not do, so the model can be seen whole
+                without losing the tree entirely. */}
             <div className="relative flex-1 overflow-hidden">
               <CADViewport />
               <StepImportDropzone />
-            </div>
 
-            {/* Right dock — ONE column, ONE hairline, three tenants in a fixed
-                vertical order. Left rail is the structure of the MODEL, this
-                is the structure of the DIALOGUE, and the viewport is an
-                unobstructed bench between them.
+              <div
+                className={cn(
+                  // Transparent, so the model reads THROUGH the tree instead
+                  // of behind a slab. No blur: blur over a CAD viewport smears
+                  // the one thing the app exists to show, and the point here is
+                  // to see the geometry, not a frosted version of it.
+                  'absolute bottom-2 left-2 top-2 z-10 flex flex-col overflow-hidden rounded border border-border/70 bg-card/40 transition-[width] duration-200',
+                  browserOpen ? 'w-56' : 'w-10',
+                )}
+              >
+                <ModelTree
+                  expanded={browserOpen}
+                  onToggle={() => setBrowserOpen((open) => !open)}
+                />
+              </div>
 
-                The order is load-bearing rather than cosmetic. Streamed agent
-                output lands at the Blackboard's BOTTOM edge, and that edge
-                stays anchored just above Agent Eye whether or not Properties
-                is present above it — so selecting something mid-run inserts a
-                panel at the top and compresses the board downward, and the
-                live text never jumps.
-
-                Stacked, not tabbed. Agent Eye is an ambient instrument whose
-                whole job is being glanceable mid-run; a tab demotes it to
-                pull-to-view at exactly the moment it matters, and a selection
-                made during a stream needs both tenants live at once, which
-                tabs serialise. */}
-            <div
-              ref={railRef}
-              className={cn(
-                'flex shrink-0 flex-col border-l border-border bg-card transition-[width] duration-200',
-                railWide ? 'w-[560px]' : 'w-56',
-              )}
-            >
+              {/* Properties: about the SELECTED OBJECT, so it belongs with the
+                  object. Top-right, appearing only when there is a selection —
+                  it was a permanent tenant of the right rail, which meant the
+                  conversation lost a third of its column to a panel that is
+                  empty most of the time. */}
               {hasSelection && (
-                <div className="flex max-h-[280px] min-h-0 shrink-0 flex-col overflow-hidden border-b border-border/40">
+                <div className="absolute right-2 top-2 z-10 flex max-h-[45%] w-56 flex-col overflow-hidden rounded border border-border bg-card/95">
                   <PropertiesPanel />
                 </div>
               )}
-              <Blackboard />
-              <RailSplitter dragging={split.dragging} {...split.handleProps} />
-              {/* An explicit height, so the splitter can GROW this panel and
-                  not merely cap it — `maxHeight` could only ever shrink it,
-                  which made dragging upward do nothing. Suppressed while Agent
-                  Eye is collapsed, where a fixed height would be a tall empty
-                  card. */}
-              <div
-                className="flex shrink-0 flex-col overflow-hidden"
-                style={
-                  split.height === null || eyeMinimized
-                    ? undefined
-                    : { height: split.height }
-                }
-              >
-                <AgentEyePanel onMinimizedChange={setEyeMinimized} />
+
+              {/* Agent Eye: a RENDER of the part, which makes it an instrument
+                  of the model rather than of the dialogue. Bottom-right, out of
+                  the tree's corner, and it keeps its own collapse. */}
+              <div className="absolute bottom-2 right-2 z-10 flex w-56 flex-col overflow-hidden rounded border border-border bg-card/95">
+                <AgentEyePanel />
+              </div>
+
+              {/* The Blackboard is an overlay too. It has now been a floating
+                  slab, a docked rail tenant, and a rail of its own; what
+                  settled it is that the viewport is the work, and everything
+                  else is an instrument laid over it that the human can put
+                  away. Bottom-left, clear of the tree's column, closable to a
+                  pill. */}
+              <div className="pointer-events-none absolute bottom-[7.5rem] left-[15.5rem] right-[15.5rem] top-2 z-20 flex flex-col justify-end">
+                <Blackboard />
+              </div>
+
+              {/* The timeline is an overlay as well, starting to the RIGHT of
+                  the tree's column. It was a full-width strip below the
+                  viewport, which is height the 3D view never got back —
+                  and the 3D view is the work. Sitting inside means the
+                  history is read against the model rather than beneath it. */}
+              {/* Transparent, like the tree: an overlay on a CAD viewport should
+                  let the model read through it rather than stamping a slab over
+                  the geometry. No blur — blur smears the one thing the app
+                  exists to show. */}
+              <div className="pointer-events-auto absolute bottom-2 left-[15.5rem] right-[15.5rem] z-20 overflow-hidden rounded-lg border border-border/70 bg-card/45">
+                <Timeline />
               </div>
             </div>
+
           </>
         )}
       </div>
       {/* Timeline — horizontal strip, full width. Hidden in Drawing
           mode where the sheet *is* the work product. */}
-      {docMode !== 'drawing' && <Timeline />}
       <StatusBar />
       {/* Command palette — fixed-position overlay; reachable from
           every workspace via Ctrl/Cmd-K. Mounted unconditionally so
