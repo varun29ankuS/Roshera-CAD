@@ -334,7 +334,7 @@ export function DocumentTabs() {
                 className="inline-block w-2 h-2 rounded-full bg-primary shrink-0 animate-pulse"
               />
             )}
-            <span className="min-w-0 flex flex-col justify-center leading-tight">
+            <span className="min-w-0 flex items-baseline leading-tight">
               {renamingId === doc.id ? (
                 <input
                   ref={renameInputRef}
@@ -357,22 +357,26 @@ export function DocumentTabs() {
                 />
               ) : (
                 <span
-                  className="truncate"
+                  className="flex min-w-0 items-baseline gap-1"
                   onDoubleClick={(e) => {
                     e.stopPropagation()
                     startRename(doc)
                   }}
                   title="Double-click to rename"
                 >
-                  {doc.name}
+                  <span className="truncate">{doc.name}</span>
+                  {/* The date line is gone: with the strip on one line the tab is
+                      a name, and `title` already carries name + date + full id on
+                      hover. The id fragment stays INLINE for ambiguous names only
+                      — two tabs reading the same word, with the discriminator
+                      hidden behind a hover, is worse than a little noise. */}
+                  {ambiguousNames.has(doc.name) && (
+                    <span className="shrink-0 font-mono text-[11px] text-muted-foreground/60">
+                      · {idFragment(doc.id)}
+                    </span>
+                  )}
                 </span>
               )}
-              <span className="truncate text-[11px] font-normal text-muted-foreground/60 tabular-nums">
-                {formatShortDate(doc.createdAt)}
-                {ambiguousNames.has(doc.name) && (
-                  <span className="font-mono"> · {idFragment(doc.id)}</span>
-                )}
-              </span>
             </span>
             <button
               type="button"

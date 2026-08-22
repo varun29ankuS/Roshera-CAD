@@ -1175,7 +1175,11 @@ function FlyoutGroup({ group, openId, onToggle }: {
         ref={triggerRef}
         onClick={() => onToggle(group.id)}
         className={cn(
-          'cad-focus w-14 py-2 flex flex-col items-center justify-center rounded-lg transition-colors cursor-pointer gap-1',
+          // w-16, not w-14: at the 11px type floor 'Operations' and
+          // 'Manufacturing' no longer fit 56px and were ellipsising away their
+          // own meaning. Widening the rail by 8px is cheaper than abbreviating
+          // every label to fit a number nobody chose deliberately.
+          'cad-focus w-16 py-2 flex flex-col items-center justify-center rounded-lg transition-colors cursor-pointer gap-1',
           anyActive && !isOpen && 'bg-primary/20 text-primary',
           isOpen && 'bg-accent text-foreground',
           !anyActive && !isOpen && 'text-muted-foreground hover:text-foreground hover:bg-accent',

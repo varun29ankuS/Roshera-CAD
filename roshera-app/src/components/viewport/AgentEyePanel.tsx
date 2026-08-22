@@ -188,7 +188,11 @@ export function AgentEyePanel() {
     isSceneScope ? SCENE_MODES : (['shaded', 'diagnostic', 'ids', 'dim', 'section'] as RenderMode[])
 
   return (
-    <div className="absolute bottom-2 right-2 z-20 w-[208px] overflow-hidden rounded-md border border-border bg-card shadow-lg">
+    <div // 236px, not 208: the header carries a title plus a status pill, and at the
+        // 11px floor the pill was being clipped at the panel edge — a status
+        // indicator you cannot read is worse than none, because it still costs
+        // the space.
+        className="absolute bottom-2 right-2 z-20 w-[236px] overflow-hidden rounded-md border border-border bg-card shadow-lg">
       <div className="flex items-center justify-between border-b border-border px-2 py-1.5">
         <div className="flex min-w-0 items-center gap-1.5 text-xs font-semibold">
           {/* nowrap: the header is 208px wide and the status pill grew with the

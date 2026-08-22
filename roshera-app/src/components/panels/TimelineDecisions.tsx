@@ -163,8 +163,16 @@ export function DecisionRail({
       </div>
     )
   }
+  // ONE decision, plus a count. The rail used to render every checkpoint in a
+  // horizontally scrolling row, which turned the most valuable line on the
+  // screen into a ticker: four near-identical cards, no marginal information
+  // per card, and the newest one liable to be off-screen. The latest decision
+  // is the one that describes the model as it stands; the rest are history and
+  // history has a drawer.
+  const latest = checkpoints[checkpoints.length - 1]
+
   return (
-    <div className="flex items-center gap-1.5 px-3 py-1 overflow-x-auto whitespace-nowrap">
+    <div className="flex min-w-0 items-center gap-2 px-3 py-1">
       <span
         aria-hidden
         className="shrink-0 text-[11px] uppercase tracking-wide text-muted-foreground/50"
@@ -172,9 +180,25 @@ export function DecisionRail({
       >
         decisions
       </span>
-      {checkpoints.map((cp) => (
-        <DecisionChip key={cp.id} cp={cp} onOpen={onOpen} />
-      ))}
+      {latest && (
+        <>
+          <div className="min-w-0 flex-1">
+            <DecisionChip cp={latest} onOpen={onOpen} />
+          </div>
+          {checkpoints.length > 1 && (
+            <button
+              type="button"
+              className="shrink-0 cursor-pointer appearance-none border-0 bg-transparent p-0 disabled:cursor-default"
+              onClick={() => onOpen?.(latest)}
+              disabled={!onOpen}
+              title="Open the full decision history"
+              aria-label={`Show ${checkpoints.length - 1} earlier decisions`}
+            >
+              <StatusPill tone="neutral" label={`+${checkpoints.length - 1} earlier`} />
+            </button>
+          )}
+        </>
+      )}
     </div>
   )
 }
