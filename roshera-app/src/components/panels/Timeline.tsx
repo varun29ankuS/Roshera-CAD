@@ -204,7 +204,7 @@ function RecentOpsStrip({
   const recent = events.slice(-RECENT_OPS_COUNT)
   const hiddenCount = events.length - recent.length
   return (
-    <div className="flex items-center gap-0 px-3 py-1.5 overflow-x-auto whitespace-nowrap">
+    <div className="flex min-w-0 flex-1 items-center gap-0 overflow-x-auto whitespace-nowrap px-3 py-1.5">
       {hiddenCount > 0 && (
         <Fragment>
           {onOpenMap ? (
@@ -1761,12 +1761,22 @@ export function Timeline() {
           exist, and the honest "N ops without a named decision" line when
           work happened but nobody declared what it was for. */}
       {!bodyCollapsed && (
-        <div className="border-t border-border/40">
+        // ONE machine strip, not two stacked ones. The decision rail and the
+        // ops ribbon are two granularities of the same fact stream — what was
+        // DECIDED, and what was DONE — and stacking them made two time-shaped
+        // rows compete over which was authoritative.
+        //
+        // The decision zone keeps its own space and its own hairline rather
+        // than collapsing into a marker on the ribbon: it is the record of
+        // what the agent decided, which is the thing this product exists to
+        // keep, and a glyph cannot carry a sentence of declared intent.
+        <div className="flex items-stretch overflow-hidden border-t border-border/40">
           <DecisionRail
             checkpoints={checkpoints}
             eventCount={events.length}
             onOpen={() => setGraphOpen(true)}
           />
+          <div aria-hidden className="w-px shrink-0 self-stretch bg-border/40" />
           <RecentOpsStrip
             events={events}
             now={now}

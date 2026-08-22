@@ -147,7 +147,7 @@ export function DecisionRail({
     // decision record is itself information a reviewer needs.
     return (
       <div
-        className="flex items-center gap-1.5 px-3 py-1 text-[11px] text-muted-foreground/60"
+        className="flex shrink-0 items-center gap-1.5 px-3 py-1 text-[11px] text-muted-foreground/60"
         title={
           'No checkpoints exist on this document right now. Agents must open a named ' +
           'intent before mutating the model, but operations made from the UI or by ' +
@@ -172,7 +172,7 @@ export function DecisionRail({
   const latest = checkpoints[checkpoints.length - 1]
 
   return (
-    <div className="flex min-w-0 items-center gap-2 px-3 py-1">
+    <div className="flex max-w-[52%] shrink-0 items-center gap-2 px-3 py-1">
       <span
         aria-hidden
         className="shrink-0 text-[11px] uppercase tracking-wide text-muted-foreground/50"
