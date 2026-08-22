@@ -432,7 +432,13 @@ export function durabilityNotice(
     case 'quarantined':
       return {
         tone: 'withheld',
-        label: `history: ${status.events_served}/${status.events_total} served`,
+        // Counts what is MISSING, not what survived. `22/45 served` is the
+        // replay engine's own bookkeeping; the person's question is whether
+        // the model in front of them is all of what they asked for. And
+        // "withheld, not approximated" names a deliberate refusal, so the
+        // chip reads as the kernel keeping its promise rather than an
+        // incident — nothing here is broken.
+        label: `${status.events_total - status.events_served} of ${status.events_total} operations missing — withheld, not approximated`,
         detail:
           `Tail withheld at boot — by design. Event #${status.first_break_sequence} ` +
           `(${status.first_break_kind}) cannot be faithfully replayed by this kernel: ` +
@@ -443,7 +449,10 @@ export function durabilityNotice(
     case 'failed':
       return {
         tone: 'failed',
-        label: 'history unreadable',
+        // Same missing-first frame so the three tones scan as one family, but
+        // this one is allowed to read as broken, because unlike `withheld`
+        // something actually did break.
+        label: 'history unreadable — no operations recovered',
         detail:
           `The event log could not be read at boot: ${status.reason}. ` +
           `Serving a blank model rather than pretending the document is empty.`,
@@ -451,7 +460,9 @@ export function durabilityNotice(
     case 'disabled':
       return {
         tone: 'off',
-        label: 'persistence off',
+        // No honest count exists when nothing is being recorded, so this
+        // states the capability gap rather than implying a number.
+        label: 'history off — nothing this session is kept',
         detail:
           'ROSHERA_DURABILITY=off — nothing recorded this session survives a restart.',
       }
@@ -535,8 +546,39 @@ export function shortLabel(op: string): string {
   if (k.includes('difference')) return 'Df'
   if (k.includes('delete')) return 'Del'
   if (k.includes('update')) return 'Upd'
-  const match = k.match(/^(\w+)/)
-  return match ? match[1].slice(0, 4) : '?'
+  // Naming, colouring and tagging a solid — the operations that give a body
+  // its identity rather than its shape.
+  if (k.startsWith('set_attributes') || k.startsWith('set_')) return 'Name'
+  return fallbackLabel(k)
+}
+
+/**
+ * Last resort for a kind with no mapping above.
+ *
+ * The previous form was `k.match(/^(\w+)/)[1].slice(0, 4)`, a blind four-character
+ * cut that turned `set_attributes` into `set_` — a truncated internal call name,
+ * ending in an underscore, rendered on the screen of a CAD product. A label is a
+ * word or it is a bug; slicing mid-token produces neither the full name nor an
+ * abbreviation, just debris.
+ *
+ * Takes whole words, prefers initials when there are several, and never emits a
+ * trailing separator.
+ */
+function fallbackLabel(kind: string): string {
+  const words = kind.split(/[^a-z0-9]+/i).filter(Boolean)
+  if (words.length === 0) return '?'
+  const cap = (w: string) => w.charAt(0).toUpperCase() + w.slice(1)
+  // One word: show it whole if it is short enough to be a word, else its
+  // first syllable's worth — but never cut inside four characters.
+  if (words.length === 1) {
+    const w = words[0]
+    return cap(w.length <= 6 ? w : w.slice(0, 4))
+  }
+  // Several words: initials read as an abbreviation, which a fragment does not.
+  return words
+    .slice(0, 3)
+    .map((w) => w.charAt(0).toUpperCase())
+    .join('')
 }
 
 export function formatTimestamp(ts: string): string {

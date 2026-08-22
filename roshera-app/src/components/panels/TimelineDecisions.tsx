@@ -94,7 +94,7 @@ function DecisionChip({
       onClick={onOpen ? () => onOpen(cp) : undefined}
       title={hover}
       className={cn(
-        'shrink-0 inline-flex items-baseline gap-1.5 rounded border border-border/70 px-2 py-0.5 text-[11px] leading-tight',
+        'inline-flex min-w-0 items-baseline gap-1.5 rounded border border-border/70 px-2 py-0.5 text-[11px] leading-tight',
         'text-foreground/90 transition-colors',
         onOpen ? 'hover:bg-accent/40 hover:border-foreground/30 cursor-pointer' : 'cursor-default',
       )}
@@ -104,7 +104,9 @@ function DecisionChip({
           fit, 4x base corners" is 44 chars — measured against the first
           live intent declared through the new picker) without letting a
           run-on paragraph eat the rail. */}
-      <span className="font-medium max-w-[44ch] truncate">{cp.name}</span>
+      <span className="min-w-0 break-words font-medium [display:-webkit-box] [-webkit-box-orient:vertical] [-webkit-line-clamp:2] overflow-hidden leading-snug">
+        {cp.name}
+      </span>
       {/* `spanOf`, not `cp.event_range`. The raw field is the RESTORE marker
           and always starts at 0, so every chip on the rail read `#0-#N` — the
           same left edge on every card, widening forever, telling the reader
@@ -172,7 +174,12 @@ export function DecisionRail({
   const latest = checkpoints[checkpoints.length - 1]
 
   return (
-    <div className="flex max-w-[52%] shrink-0 items-center gap-2 px-3 py-1">
+    // flex-1, not shrink-0 with a 52% ceiling. This line is the only string on
+    // the strip written in the product's own language — the human's stated
+    // intent — and it was being truncated at the panel edge so that a row of
+    // kernel call names could have the width. The ops are the evidence layer;
+    // the crime was promotion, not their existence.
+    <div className="flex min-w-0 flex-1 items-center gap-2 px-3 py-1">
       <span
         aria-hidden
         className="shrink-0 text-[11px] uppercase tracking-wide text-muted-foreground/50"
