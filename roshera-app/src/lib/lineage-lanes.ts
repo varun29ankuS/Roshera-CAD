@@ -44,7 +44,9 @@ export interface LineageNode {
   timestamp: string
   operation_type: string
   author: string
-  author_kind: string
+  /** Optional on the wire — a node may record an author with no classified
+   *  kind, and defaulting one would assert a classification nobody made. */
+  author_kind?: string
   inputs: string[]
   outputs: string[]
   deleted: string[]

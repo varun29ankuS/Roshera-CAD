@@ -105,6 +105,7 @@ import {
   formatTimestamp,
 } from '@/lib/timeline-events'
 import { DecisionList, DurabilityChip, type DecisionOpsState } from './TimelineDecisions'
+import { LineageLanes } from './LineageLanes'
 
 // ─── Minimal branch shape this view needs (mirrors `BranchView` in
 // Timeline.tsx — duplicated rather than imported so this module stays
@@ -862,8 +863,17 @@ export default function TimelineGraph({
   // DECISIONS is the default — see this file's header. The graph is not
   // removed, it is one click away, and its state (fetched lineage) is
   // shared, so switching tabs costs no request.
-  const [tab, setTab] = useState<'decisions' | 'graph'>('decisions')
+  const [tab, setTab] = useState<'decisions' | 'lanes' | 'graph'>('lanes')
   const [rfInstance, setRfInstance] = useState<ReactFlowInstance | null>(null)
+
+  // The lanes view reads the SAME fetched lineage the graph does — switching
+  // tabs costs no request, and both views therefore describe the same bytes.
+  // A refused or unreachable branch yields no nodes rather than an empty
+  // graph: those are different facts and the lanes view says so itself.
+  const activeLineageNodes = useMemo(() => {
+    const hit = fetched.find((f) => f.branch.id === activeBranchId)
+    return hit && hit.outcome.state === 'graph' ? hit.outcome.map.nodes : []
+  }, [fetched, activeBranchId])
   const canvasRef = useRef<HTMLDivElement | null>(null)
   // Floor for how far the user can zoom out — set from the fitted zoom
   // once the graph is measured, so "zoom out" can never land on an empty
@@ -1013,7 +1023,7 @@ export default function TimelineGraph({
             {/* Decisions | Graph. Decisions is the default view; the graph
                 keeps every capability it had, behind one click. */}
             <span className="shrink-0 inline-flex items-center rounded border border-border/70 p-[2px] text-[11px]">
-              {(['decisions', 'graph'] as const).map((t) => (
+              {(['lanes', 'decisions', 'graph'] as const).map((t) => (
                 <button
                   key={t}
                   type="button"
@@ -1031,7 +1041,9 @@ export default function TimelineGraph({
               ))}
             </span>
             <span className="text-[11px] text-muted-foreground/70 truncate">
-              {tab === 'decisions'
+              {tab === 'lanes'
+                ? 'What became of each solid — one row per life, a mark per operation that touched it.'
+                : tab === 'decisions'
                 ? 'What was decided — expand a row for its rationale and the operations it covers.'
                 : totalOps === 0
                   ? 'Linked by recorded lineage.'
@@ -1115,7 +1127,13 @@ export default function TimelineGraph({
           </div>
         )}
 
-        {tab === 'decisions' ? (
+        {tab === 'lanes' ? (
+          <LineageLanes
+            key={activeBranchId}
+            nodes={activeLineageNodes}
+            checkpoints={checkpoints}
+          />
+        ) : tab === 'decisions' ? (
           <div className="flex-1 min-h-0">
             {/* Keyed by branch: expansion state belongs to the branch it
                 was opened on. Without this the list stays mounted across a
@@ -1220,7 +1238,25 @@ export default function TimelineGraph({
         </div>
         )}
 
-        {tab === 'decisions' ? (
+        {tab === 'lanes' ? (
+          // The graph's legend describes ARROWS and branch colours, neither of
+          // which this view draws. A legend for the wrong picture is worse than
+          // none — it teaches a vocabulary the marks do not use.
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1 border-t border-border px-4 py-1.5 font-mono text-[11px] text-muted-foreground/70">
+            <span>one row = one solid's life</span>
+            <span className="text-muted-foreground/40">·</span>
+            <span>● born</span>
+            <span className="text-primary">◆ new id</span>
+            <span>✕ consumed by a boolean</span>
+            <span>■ deleted</span>
+            <span className="text-positive">▶ live</span>
+            <span className="text-caution">? no successor recorded</span>
+            <span className="text-destructive">⚠ id re-used while live</span>
+            <span className="text-muted-foreground/40">·</span>
+            <span className="text-muted-foreground/60">dotted = began before this window</span>
+            <span className="ml-auto text-muted-foreground/60">click a row for its operations</span>
+          </div>
+        ) : tab === 'decisions' ? (
         <div className="flex items-center gap-3 px-4 py-1.5 border-t border-border text-[11px] text-muted-foreground/70 shrink-0 flex-wrap">
           <span className="flex items-center gap-1">
             <span
