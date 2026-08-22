@@ -231,17 +231,23 @@ export function scorecard(results, summary) {
   L.push("  AGENT-EVAL-α  SCORECARD".padEnd(60) + new Date().toISOString());
   L.push("═".repeat(74));
   L.push("");
-  L.push("  " + "SCENARIO".padEnd(34) + "RESULT".padEnd(8) + "CHECKS".padEnd(9) + "TIME");
+  L.push("  " + "SCENARIO".padEnd(34) + "RESULT".padEnd(10) + "CHECKS".padEnd(9) + "TIME");
   L.push("  " + "-".repeat(68));
   for (const r of results) {
     const cp = r.checks.filter((c) => c.passed).length;
     const ct = r.checks.length;
-    const mark = r.passed ? "PASS ✓" : r.knownRed ? "FAIL(kr)" : "FAIL ✗";
+    // BLOCKED is its own mark, and it comes FIRST. A blocked scenario has
+    // `passed === false`, so without this branch it fell through to "FAIL ✗"
+    // and rendered identically to a scenario that ran and failed — the exact
+    // fabricated measurement `runScenario` refuses to record, reintroduced at
+    // the one place a human actually reads. Its check column is "—" and not
+    // "0/0" for the same reason: 0/0 is a tally, and nothing was tallied.
+    const mark = r.blocked ? "BLOCKED ⊘" : r.passed ? "PASS ✓" : r.knownRed ? "FAIL(kr)" : "FAIL ✗";
     L.push(
       "  " +
         r.id.padEnd(34) +
-        mark.padEnd(8) +
-        `${cp}/${ct}`.padEnd(9) +
+        mark.padEnd(10) +
+        (r.blocked ? "—" : `${cp}/${ct}`).padEnd(9) +
         `${(r.wallMs / 1000).toFixed(1)}s`,
     );
   }
@@ -256,8 +262,13 @@ export function scorecard(results, summary) {
     L.push(`    ${d.padEnd(14)} ${bar} ${t.pass}/${t.total} (${pct}%)`);
   }
   L.push("");
+  // The blocked count was computed by `summarize` and then never printed, so
+  // the one number that distinguishes "the kernel failed" from "the kernel was
+  // never asked" existed in the struct and reached nobody. It is stated when
+  // non-zero, and stays absent when there is nothing to state.
   L.push(
     `  SCENARIOS: ${summary.scenarios.pass}/${summary.scenarios.total} passed` +
+      (summary.scenarios.blocked ? `  (${summary.scenarios.blocked} blocked, nothing measured)` : "") +
       `    CHECKS: ${summary.checks.pass}/${summary.checks.total} passed`,
   );
   L.push("═".repeat(74));
