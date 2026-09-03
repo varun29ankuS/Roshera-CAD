@@ -389,8 +389,12 @@ impl PermissionManager {
         permission: Permission,
         granted_by: &str,
     ) -> Result<(), SessionError> {
-        // Check if granter has permission to change roles
-        self.check_permission(session_id, granted_by, Permission::ChangeRoles)?;
+        // Check if granter has permission to change roles. The `bool`
+        // IS the answer — `?` alone only propagates the non-member
+        // `Err`, which would let any member grant itself anything.
+        if !self.check_permission(session_id, granted_by, Permission::ChangeRoles)? {
+            return Err(SessionError::AccessDenied);
+        }
 
         // Get session permissions and update user in same scope
         let session_perms =
@@ -424,8 +428,11 @@ impl PermissionManager {
         permission: Permission,
         denied_by: &str,
     ) -> Result<(), SessionError> {
-        // Check if denier has permission to change roles
-        self.check_permission(session_id, denied_by, Permission::ChangeRoles)?;
+        // Check if denier has permission to change roles. The `bool`
+        // IS the answer — see `grant_permission`.
+        if !self.check_permission(session_id, denied_by, Permission::ChangeRoles)? {
+            return Err(SessionError::AccessDenied);
+        }
 
         // Get session permissions and update user in same scope
         let session_perms =
@@ -466,8 +473,11 @@ impl PermissionManager {
                     id: session_id.to_string(),
                 })?;
 
-        // Check if adder has permission
-        self.check_permission(session_id, added_by, Permission::InviteUsers)?;
+        // Check if adder has permission. The `bool` IS the answer —
+        // see `grant_permission`.
+        if !self.check_permission(session_id, added_by, Permission::InviteUsers)? {
+            return Err(SessionError::AccessDenied);
+        }
 
         // Check max users limit
         if session_perms.max_users > 0 && session_perms.users.len() >= session_perms.max_users {
@@ -504,8 +514,11 @@ impl PermissionManager {
                     id: session_id.to_string(),
                 })?;
 
-        // Check if remover has permission
-        self.check_permission(session_id, removed_by, Permission::RemoveUsers)?;
+        // Check if remover has permission. The `bool` IS the answer —
+        // see `grant_permission`.
+        if !self.check_permission(session_id, removed_by, Permission::RemoveUsers)? {
+            return Err(SessionError::AccessDenied);
+        }
 
         // Can't remove owner
         if session_perms.owner == user_id {
@@ -781,6 +794,143 @@ mod tests {
         assert!(!manager
             .check_permission(session_id, user, Permission::CreateGeometry)
             .unwrap());
+    }
+
+    /// `grant_permission` gates on the granter holding
+    /// `Permission::ChangeRoles`. A `Viewer` does not hold it, so a
+    /// viewer naming *itself* as the granter must be refused and must
+    /// not acquire the permission it asked for.
+    ///
+    /// This is the escalation the four granter checks in this module
+    /// exist to block: each gate called `check_permission` and
+    /// discarded the `bool` it returned, so only a non-member (the
+    /// `Err` arm) was stopped and every member could grant itself
+    /// anything.
+    #[test]
+    fn viewer_cannot_grant_itself_permissions() {
+        let manager = PermissionManager::new();
+        let session_id = "test-session";
+        let owner = "owner-user";
+        let mallory = "mallory";
+
+        manager.create_session_permissions(session_id.to_string(), owner.to_string());
+        manager
+            .add_user(session_id, mallory.to_string(), Role::Viewer, owner)
+            .unwrap();
+
+        let result =
+            manager.grant_permission(session_id, mallory, Permission::DeleteSession, mallory);
+
+        assert!(
+            matches!(result, Err(SessionError::AccessDenied)),
+            "a Viewer granting itself DeleteSession must be refused with \
+             AccessDenied, got {result:?}"
+        );
+        assert!(
+            !manager
+                .check_permission(session_id, mallory, Permission::DeleteSession)
+                .unwrap(),
+            "the refused grant must not have taken effect"
+        );
+    }
+
+    /// `deny_permission` is the second `ChangeRoles`-gated site. A
+    /// `Viewer` must not be able to strip a permission from another
+    /// member, and the target must still hold it afterwards.
+    #[test]
+    fn viewer_cannot_change_roles() {
+        let manager = PermissionManager::new();
+        let session_id = "test-session";
+        let owner = "owner-user";
+        let editor = "editor-user";
+        let viewer = "viewer-user";
+
+        manager.create_session_permissions(session_id.to_string(), owner.to_string());
+        manager
+            .add_user(session_id, editor.to_string(), Role::Editor, owner)
+            .unwrap();
+        manager
+            .add_user(session_id, viewer.to_string(), Role::Viewer, owner)
+            .unwrap();
+
+        let result =
+            manager.deny_permission(session_id, editor, Permission::CreateGeometry, viewer);
+
+        assert!(
+            matches!(result, Err(SessionError::AccessDenied)),
+            "a Viewer denying an Editor's CreateGeometry must be refused with \
+             AccessDenied, got {result:?}"
+        );
+        assert!(
+            manager
+                .check_permission(session_id, editor, Permission::CreateGeometry)
+                .unwrap(),
+            "the refused denial must not have stripped the Editor's permission"
+        );
+    }
+
+    /// `add_user` gates on `Permission::InviteUsers`, which a `Viewer`
+    /// does not hold. The invited user must not appear in the session.
+    #[test]
+    fn viewer_cannot_invite() {
+        let manager = PermissionManager::new();
+        let session_id = "test-session";
+        let owner = "owner-user";
+        let viewer = "viewer-user";
+        let intruder = "intruder";
+
+        manager.create_session_permissions(session_id.to_string(), owner.to_string());
+        manager
+            .add_user(session_id, viewer.to_string(), Role::Viewer, owner)
+            .unwrap();
+
+        let result = manager.add_user(session_id, intruder.to_string(), Role::Editor, viewer);
+
+        assert!(
+            matches!(result, Err(SessionError::AccessDenied)),
+            "a Viewer inviting a new user must be refused with AccessDenied, \
+             got {result:?}"
+        );
+        let users = manager.get_session_users(session_id).unwrap();
+        assert!(
+            !users.iter().any(|u| u.user_id == intruder),
+            "the refused invite must not have added {intruder} to the session; \
+             members are {:?}",
+            users.iter().map(|u| u.user_id.clone()).collect::<Vec<_>>()
+        );
+    }
+
+    /// `remove_user` gates on `Permission::RemoveUsers`, which a
+    /// `Viewer` does not hold. The target must still be a member.
+    #[test]
+    fn viewer_cannot_evict() {
+        let manager = PermissionManager::new();
+        let session_id = "test-session";
+        let owner = "owner-user";
+        let editor = "editor-user";
+        let viewer = "viewer-user";
+
+        manager.create_session_permissions(session_id.to_string(), owner.to_string());
+        manager
+            .add_user(session_id, editor.to_string(), Role::Editor, owner)
+            .unwrap();
+        manager
+            .add_user(session_id, viewer.to_string(), Role::Viewer, owner)
+            .unwrap();
+
+        let result = manager.remove_user(session_id, editor, viewer);
+
+        assert!(
+            matches!(result, Err(SessionError::AccessDenied)),
+            "a Viewer evicting an Editor must be refused with AccessDenied, \
+             got {result:?}"
+        );
+        let users = manager.get_session_users(session_id).unwrap();
+        assert!(
+            users.iter().any(|u| u.user_id == editor),
+            "the refused eviction must not have removed {editor}; members are {:?}",
+            users.iter().map(|u| u.user_id.clone()).collect::<Vec<_>>()
+        );
     }
 
     #[test]
