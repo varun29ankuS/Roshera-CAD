@@ -1109,3 +1109,233 @@ async fn provider_test_bucket_is_tight_and_independent_of_provider_config() {
          traffic exhausting a bucket it does not share — got 429: {body}"
     );
 }
+
+// =====================================================================
+// RED 12-15 — sketch/csketch extrude+revolve must carry a create-geometry
+// permission layer
+// =====================================================================
+//
+// `auth_middleware::require_create_geometry`'s own doc-comment names
+// `/api/sketch/{id}/extrude` and `/api/sketch/{id}/revolve` as routes it
+// gates. It gated neither: both were declared bare in `build_router`, as
+// were their constrained-sketch twins `/api/csketch/{id}/extrude` and
+// `/api/csketch/{id}/revolve`. All four run
+// `geometry_engine::operations::{extrude,revolve}` against the active
+// model and introduce a NEW SOLID — precisely what
+// `Permission::CreateGeometry` exists to scope — so a credential minted
+// without that scope could create geometry anyway. The front door
+// (`auth_middleware`) never caught it: the caller IS authenticated; what
+// they lack is the scope, and only a per-route layer tests scope.
+//
+// This is the #44 silent-lie family again, in the same shape Slice 1
+// opened with: the *documentation* of the gate was the only thing that
+// existed. These tests assert the wire behaviour instead.
+//
+// # Why an API key and not a JWT
+//
+// `validate_jwt` hands EVERY validated JWT `get_default_user_permissions()`
+// — the full geometry scope set — regardless of the roles in the token.
+// There is therefore no such thing as a viewer-scoped JWT on the HTTP
+// surface today; the only credential that carries a genuinely reduced
+// scope is an API key, whose minted `permissions` are decoded verbatim by
+// `validate_api_key`. So "viewer" here means an API key holding
+// `ViewGeometry` and nothing else — which is exactly the shape a scoped
+// agent credential takes (`provision_api_key`), i.e. the principal this
+// gate actually protects against. See the report accompanying this slice.
+
+/// The four routes that introduce a new solid from a sketch profile,
+/// named individually so each assertion below states which route it
+/// covers rather than indexing a list positionally.
+const SKETCH_EXTRUDE: &str = "/api/sketch/{id}/extrude";
+const SKETCH_REVOLVE: &str = "/api/sketch/{id}/revolve";
+const CSKETCH_EXTRUDE: &str = "/api/csketch/{id}/extrude";
+const CSKETCH_REVOLVE: &str = "/api/csketch/{id}/revolve";
+
+/// All four as one list, for the control that must sweep the whole
+/// family — so a gate that opens for an editor on three of four cannot
+/// pass unnoticed.
+const SKETCH_SOLID_ROUTES: &[&str] = &[
+    SKETCH_EXTRUDE,
+    SKETCH_REVOLVE,
+    CSKETCH_EXTRUDE,
+    CSKETCH_REVOLVE,
+];
+
+/// Mint an API key on `state`'s `AuthManager` carrying exactly
+/// `permissions` (PascalCase, the form `Permission::from_str` decodes),
+/// and return it as an `Authorization` header value.
+///
+/// The raw key is hashed whole by `verify_api_key`, so it is handed back
+/// verbatim behind the `ApiKey ` scheme prefix `auth_middleware_inner`
+/// strips.
+fn api_key_header(state: &AppState, user_id: &str, permissions: &[&str]) -> String {
+    let (raw_key, _record) = state
+        .session_manager
+        .auth_manager()
+        .create_api_key(
+            user_id,
+            "auth-slice-permission-fixture",
+            permissions.iter().map(|p| (*p).to_string()).collect(),
+            None,
+            // The scope, not the principal kind, is what these tests
+            // exercise; `Human` keeps the fixture free of a fabricated
+            // model string (`PrincipalKind::Agent` requires one).
+            session_manager::PrincipalKind::Human,
+        )
+        .expect("minting an API key on a fresh AuthManager must succeed");
+    format!("ApiKey {raw_key}")
+}
+
+/// A minimal but well-formed extrude/revolve body. The permission layer
+/// short-circuits before the handler's extractors run, so the body only
+/// has to be valid JSON for the RED assertion; it is shaped plausibly so
+/// the *editor* control gets as far into the handler as the (absent)
+/// sketch allows rather than dying on a malformed frame.
+fn sketch_solid_payload() -> Value {
+    json!({ "distance": 10.0, "angle_degrees": 360.0 })
+}
+
+/// A viewer-scoped credential (`ViewGeometry` only) must be refused on
+/// every route that introduces a solid from a sketch, with the
+/// catalogued `permission_denied` code — not merely "some 403".
+///
+/// **Fails against the pre-fix tree:** none of the four routes carries a
+/// `route_layer`, so the request sails past the scope check into the
+/// handler and comes back as the handler's own status (404 — no such
+/// sketch), never 403.
+#[tokio::test]
+async fn viewer_cannot_extrude_sketch() {
+    let state = secure_state().await;
+    let viewer = api_key_header(&state, "viewer-extrude", &["ViewGeometry"]);
+    let path = SKETCH_EXTRUDE.replace("{id}", &Uuid::new_v4().to_string());
+
+    let (status, body) = authed(
+        &state,
+        Method::POST,
+        &path,
+        &viewer,
+        Some(sketch_solid_payload()),
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a credential without CreateGeometry must be refused on {path} — \
+         extruding a sketch profile introduces a new solid. Got {status}: {body}"
+    );
+    assert_eq!(
+        body["error_code"], "permission_denied",
+        "the refusal must be the catalogued `permission_denied` the \
+         require_create_geometry layer emits, so an agent can tell a missing \
+         scope from any other 403. Got: {body}"
+    );
+}
+
+/// The revolve half of the same gate.
+///
+/// **Fails against the pre-fix tree** for the same reason as
+/// [`viewer_cannot_extrude_sketch`].
+#[tokio::test]
+async fn viewer_cannot_revolve_sketch() {
+    let state = secure_state().await;
+    let viewer = api_key_header(&state, "viewer-revolve", &["ViewGeometry"]);
+    let path = SKETCH_REVOLVE.replace("{id}", &Uuid::new_v4().to_string());
+
+    let (status, body) = authed(
+        &state,
+        Method::POST,
+        &path,
+        &viewer,
+        Some(sketch_solid_payload()),
+    )
+    .await;
+
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a credential without CreateGeometry must be refused on {path} — \
+         revolving a sketch profile introduces a new solid. Got {status}: {body}"
+    );
+    assert_eq!(
+        body["error_code"], "permission_denied",
+        "the refusal must be the catalogued `permission_denied`. Got: {body}"
+    );
+}
+
+/// The constrained-sketch twins carry the same gate. `/api/csketch/*` is
+/// the surface agents actually build on (it owns the constraint solver),
+/// so leaving it bare while gating `/api/sketch/*` would gate the click-
+/// to-place workflow and leave the agent workflow open — the more
+/// consequential half.
+///
+/// **Fails against the pre-fix tree:** both csketch routes are declared
+/// bare at `main.rs:10436-10437`.
+#[tokio::test]
+async fn viewer_cannot_create_solids_from_a_constrained_sketch() {
+    let state = secure_state().await;
+    let viewer = api_key_header(&state, "viewer-csketch", &["ViewGeometry"]);
+
+    for template in [CSKETCH_EXTRUDE, CSKETCH_REVOLVE] {
+        let path = template.replace("{id}", &Uuid::new_v4().to_string());
+        let (status, body) = authed(
+            &state,
+            Method::POST,
+            &path,
+            &viewer,
+            Some(sketch_solid_payload()),
+        )
+        .await;
+
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "a credential without CreateGeometry must be refused on {path} — \
+             got {status}: {body}"
+        );
+        assert_eq!(
+            body["error_code"], "permission_denied",
+            "the refusal on {path} must be the catalogued `permission_denied`. \
+             Got: {body}"
+        );
+    }
+}
+
+/// Control: the layer is a GATE, not a blanket refusal. A credential that
+/// *does* carry `CreateGeometry` must get past it.
+///
+/// The assertion is deliberately `!= 403` rather than a specific success
+/// status: the sketch id is random, so the handler is expected to fail on
+/// its own terms (404 / 400). What matters is that the failure is the
+/// handler's and not the permission layer's — i.e. the request reached
+/// the handler at all. Without this control, deleting the routes outright
+/// would "pass" the three tests above.
+#[tokio::test]
+async fn editor_can_extrude_sketch() {
+    let state = secure_state().await;
+    let editor = api_key_header(
+        &state,
+        "editor-extrude",
+        &["ViewGeometry", "CreateGeometry", "ModifyGeometry"],
+    );
+
+    for template in SKETCH_SOLID_ROUTES {
+        let path = template.replace("{id}", &Uuid::new_v4().to_string());
+        let (status, body) = authed(
+            &state,
+            Method::POST,
+            &path,
+            &editor,
+            Some(sketch_solid_payload()),
+        )
+        .await;
+
+        assert_ne!(
+            status,
+            StatusCode::FORBIDDEN,
+            "a credential carrying CreateGeometry must pass the permission \
+             layer on {path} and reach the handler (which may then fail on the \
+             unknown sketch id — any non-403 is fine here). Got 403: {body}"
+        );
+    }
+}

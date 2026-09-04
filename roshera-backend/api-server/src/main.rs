@@ -10361,7 +10361,26 @@ pub(crate) fn build_router(state: AppState) -> Router {
             "/api/sketch/{id}/circle-segments",
             put(sketch::set_sketch_circle_segments),
         )
-        .route("/api/sketch/{id}/extrude", post(sketch::extrude_sketch))
+        // Extrude/revolve turn a sketch profile into a NEW SOLID, so they
+        // carry the same `Permission::CreateGeometry` gate as
+        // `/api/geometry/extrude` and `/api/geometry/revolve` above —
+        // `require_create_geometry`'s own doc-comment has named these two
+        // routes since AUDIT-H7 while the router declared them bare, so an
+        // authenticated credential minted WITHOUT the create scope (an
+        // API key provisioned read-only, say) could create geometry
+        // anyway. The front door cannot catch that: the caller is
+        // authenticated; what they lack is the scope, and only a
+        // per-route layer tests scope.
+        .route(
+            "/api/sketch/{id}/extrude",
+            post(sketch::extrude_sketch).route_layer(axum::middleware::from_fn(
+                auth_middleware::require_create_geometry,
+            )),
+        )
+        // `extrude_cut` keeps the intent gate and NOT the create gate: it
+        // removes material from an existing solid rather than introducing
+        // one, so its policy question is "was this destructive edit
+        // declared?", not "may this caller create?".
         .route(
             "/api/sketch/{id}/extrude_cut",
             post(sketch::extrude_cut_sketch).route_layer(axum::middleware::from_fn_with_state(
@@ -10369,7 +10388,12 @@ pub(crate) fn build_router(state: AppState) -> Router {
                 require_declared_intent,
             )),
         )
-        .route("/api/sketch/{id}/revolve", post(sketch::revolve_sketch))
+        .route(
+            "/api/sketch/{id}/revolve",
+            post(sketch::revolve_sketch).route_layer(axum::middleware::from_fn(
+                auth_middleware::require_create_geometry,
+            )),
+        )
         .route("/api/sketch/plane-from-face", post(sketch::plane_from_face))
         // Region preview — server-authoritative outer/hole topology
         // classification for the multi-shape extrusion workflow. The
@@ -10433,8 +10457,22 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route("/api/csketch/{id}/rectangle", post(csketch::add_rectangle))
         .route("/api/csketch/{id}/ellipse", post(csketch::add_ellipse))
         .route("/api/csketch/{id}/polyline", post(csketch::add_polyline))
-        .route("/api/csketch/{id}/extrude", post(csketch::extrude_csketch))
-        .route("/api/csketch/{id}/revolve", post(csketch::revolve_csketch))
+        // The constrained-sketch twins of the two routes above, and the
+        // pair agents actually build on. Same gate for the same reason:
+        // both run the kernel extrude/revolve against the active model
+        // and introduce a new solid.
+        .route(
+            "/api/csketch/{id}/extrude",
+            post(csketch::extrude_csketch).route_layer(axum::middleware::from_fn(
+                auth_middleware::require_create_geometry,
+            )),
+        )
+        .route(
+            "/api/csketch/{id}/revolve",
+            post(csketch::revolve_csketch).route_layer(axum::middleware::from_fn(
+                auth_middleware::require_create_geometry,
+            )),
+        )
         .route(
             "/api/csketch/{id}/constraint",
             post(csketch::add_constraint),

@@ -437,7 +437,8 @@ pub fn enforce_permission(
 /// Route layer for endpoints that introduce new geometry into the
 /// model: `/api/geometry` (POST), `/api/geometry/extrude` (POST),
 /// `/api/sketch/{id}/extrude` (POST), `/api/sketch/{id}/revolve`
-/// (POST), …
+/// (POST), `/api/csketch/{id}/extrude` (POST),
+/// `/api/csketch/{id}/revolve` (POST), …
 pub async fn require_create_geometry(request: Request, next: Next) -> Response {
     enforce_permission_layer(Permission::CreateGeometry, "create_geometry", request, next).await
 }
