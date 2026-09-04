@@ -596,9 +596,19 @@ pub async fn create_branch(
     // would compute the fork point against a stale parent head and the
     // new branch would visually fork off an earlier event. Flushing here
     // gives the fork point the parent's *actual* most-recent event.
-    // Failure is non-fatal: the worker may have shut down, in which
-    // case there is nothing in flight to drain anyway.
-    let _ = state.timeline_recorder.flush().await;
+    //
+    // A failed drain is a REFUSAL, not a discarded `Result`: the drain
+    // is what makes the fork point correct, so proceeding after one
+    // fails forks the branch off a stale head and records that wrong
+    // fork point durably — a confident, unrecoverable lie about where
+    // the branch diverged. Refuse before anything is created.
+    if let Err(e) = state.timeline_recorder.flush().await {
+        return Err(ApiError::durability_persist_failed(
+            "branch",
+            "recorder_flush",
+            e,
+        ));
+    }
 
     // Acquire the timeline write lock for the smallest possible window:
     // create_branch reads parent existence then inserts. Drop before
@@ -634,7 +644,12 @@ pub async fn create_branch(
     // was memory-only and silently lost on restart even though its EVENTS
     // were persisted (orphaned, with no branch record to rehydrate into).
     // The author is the one the timeline RECORDED, read back from the branch.
-    crate::durability::persist_branch(
+    //
+    // A failed store write is a typed refusal with the in-memory create
+    // ROLLED BACK, never a 200 over a branch that only exists in RAM:
+    // that branch would collect events which, on reboot, come back
+    // orphaned with no branch record to rehydrate into.
+    if let Err(e) = crate::durability::persist_branch(
         &state,
         new_id,
         Some(parent),
@@ -642,7 +657,18 @@ pub async fn create_branch(
         body.name,
         created_by,
     )
-    .await;
+    .await
+    {
+        {
+            let timeline = state.timeline.write().await;
+            timeline.remove_branch(&new_id);
+        }
+        return Err(ApiError::durability_persist_failed(
+            e.record(),
+            "store_write",
+            e.reason(),
+        ));
+    }
 
     Ok(Json(view))
 }

@@ -2402,3 +2402,654 @@ async fn acknowledge_unsound_survives_in_the_raw_persisted_event_blob() {
         stamped[0].data
     );
 }
+
+// =====================================================================
+// Task 6 — a swallowed persistence failure is a 201 that lies.
+//
+// `durability::persist_checkpoint` / `persist_branch` returned `()`: a
+// `save_checkpoint` / `save_branch` error was `tracing::error!`d and
+// dropped, and the handler then answered 201 CREATED with the record's
+// id. The record existed in RAM only; the next restart lost it silently,
+// and the caller was told the opposite. In a kernel whose thesis is
+// "honest refusal over silent wrong answers", that is the defect this
+// section pins.
+//
+// The double below is a REAL `DatabasePersistence` implementation, not a
+// mock of production behaviour: it delegates every method to a live
+// file-backed SQLite database (so the event log, documents, and the
+// recorder's write-through all keep working exactly as in production)
+// and fails EXACTLY the two writes under test. That isolation is the
+// point — the checkpoint's own events persist fine; only the checkpoint
+// record's write fails, which is precisely the production failure mode
+// (a store-level error on one insert, not a dead database).
+// =====================================================================
+
+/// The store-level failure the double injects. Verbatim in the wire
+/// `details.reason`, so a test can prove the handler reported the REAL
+/// cause rather than a generic "something went wrong".
+const INJECTED_STORE_FAILURE: &str = "injected store failure: disk quota exceeded";
+
+/// A `DatabasePersistence` that delegates everything to a real database
+/// except `save_checkpoint` and `save_branch`, which always fail.
+struct FailingSaves {
+    inner: Db,
+}
+
+impl FailingSaves {
+    fn wrap(inner: Db) -> Arc<Self> {
+        Arc::new(Self { inner })
+    }
+
+    fn refuse() -> session_manager::SessionError {
+        session_manager::SessionError::PersistenceError {
+            reason: INJECTED_STORE_FAILURE.to_string(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl DatabasePersistence for FailingSaves {
+    // ---- The two writes under test: always fail ----
+    async fn save_checkpoint(
+        &self,
+        _checkpoint: &session_manager::CheckpointRecord,
+    ) -> Result<(), session_manager::SessionError> {
+        Err(Self::refuse())
+    }
+    async fn save_branch(
+        &self,
+        _branch: &session_manager::BranchRecord,
+    ) -> Result<(), session_manager::SessionError> {
+        Err(Self::refuse())
+    }
+
+    // ---- Everything else: verbatim delegation ----
+    async fn save_session(
+        &self,
+        session: &session_manager::SessionState,
+    ) -> Result<(), session_manager::SessionError> {
+        self.inner.save_session(session).await
+    }
+    async fn load_session(
+        &self,
+        session_id: &str,
+    ) -> Result<session_manager::SessionState, session_manager::SessionError> {
+        self.inner.load_session(session_id).await
+    }
+    async fn delete_session(&self, session_id: &str) -> Result<(), session_manager::SessionError> {
+        self.inner.delete_session(session_id).await
+    }
+    async fn list_sessions(
+        &self,
+        user_id: Option<&str>,
+    ) -> Result<Vec<session_manager::SessionMetadata>, session_manager::SessionError> {
+        self.inner.list_sessions(user_id).await
+    }
+    async fn save_object(
+        &self,
+        session_id: &str,
+        object: &shared_types::CADObject,
+    ) -> Result<(), session_manager::SessionError> {
+        self.inner.save_object(session_id, object).await
+    }
+    async fn load_object(
+        &self,
+        session_id: &str,
+        object_id: &shared_types::GeometryId,
+    ) -> Result<shared_types::CADObject, session_manager::SessionError> {
+        self.inner.load_object(session_id, object_id).await
+    }
+    async fn delete_object(
+        &self,
+        session_id: &str,
+        object_id: &shared_types::GeometryId,
+    ) -> Result<(), session_manager::SessionError> {
+        self.inner.delete_object(session_id, object_id).await
+    }
+    async fn list_objects(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<session_manager::ObjectMetadata>, session_manager::SessionError> {
+        self.inner.list_objects(session_id).await
+    }
+    async fn save_user(
+        &self,
+        user: &session_manager::UserData,
+    ) -> Result<(), session_manager::SessionError> {
+        self.inner.save_user(user).await
+    }
+    async fn load_user(
+        &self,
+        user_id: &str,
+    ) -> Result<session_manager::UserData, session_manager::SessionError> {
+        self.inner.load_user(user_id).await
+    }
+    async fn load_user_by_email(
+        &self,
+        email: &str,
+    ) -> Result<session_manager::UserData, session_manager::SessionError> {
+        self.inner.load_user_by_email(email).await
+    }
+    async fn update_user(
+        &self,
+        user: &session_manager::UserData,
+    ) -> Result<(), session_manager::SessionError> {
+        self.inner.update_user(user).await
+    }
+    async fn save_permissions(
+        &self,
+        session_id: &str,
+        permissions: &session_manager::UserPermissions,
+    ) -> Result<(), session_manager::SessionError> {
+        self.inner.save_permissions(session_id, permissions).await
+    }
+    async fn load_permissions(
+        &self,
+        session_id: &str,
+        user_id: &str,
+    ) -> Result<session_manager::UserPermissions, session_manager::SessionError> {
+        self.inner.load_permissions(session_id, user_id).await
+    }
+    async fn list_permissions(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<session_manager::UserPermissions>, session_manager::SessionError> {
+        self.inner.list_permissions(session_id).await
+    }
+    async fn save_token(
+        &self,
+        token: &session_manager::SessionToken,
+    ) -> Result<(), session_manager::SessionError> {
+        self.inner.save_token(token).await
+    }
+    async fn load_token(
+        &self,
+        token_id: &str,
+    ) -> Result<session_manager::SessionToken, session_manager::SessionError> {
+        self.inner.load_token(token_id).await
+    }
+    async fn delete_token(&self, token_id: &str) -> Result<(), session_manager::SessionError> {
+        self.inner.delete_token(token_id).await
+    }
+    async fn save_api_key(
+        &self,
+        api_key: &session_manager::ApiKey,
+    ) -> Result<(), session_manager::SessionError> {
+        self.inner.save_api_key(api_key).await
+    }
+    async fn load_api_key(
+        &self,
+        key_id: &str,
+    ) -> Result<session_manager::ApiKey, session_manager::SessionError> {
+        self.inner.load_api_key(key_id).await
+    }
+    async fn delete_api_key(&self, key_id: &str) -> Result<(), session_manager::SessionError> {
+        self.inner.delete_api_key(key_id).await
+    }
+    async fn load_all_api_keys(
+        &self,
+    ) -> Result<Vec<session_manager::ApiKey>, session_manager::SessionError> {
+        self.inner.load_all_api_keys().await
+    }
+    async fn save_timeline_event(
+        &self,
+        session_id: &str,
+        event: &TimelineEventData,
+    ) -> Result<(), session_manager::SessionError> {
+        self.inner.save_timeline_event(session_id, event).await
+    }
+    async fn load_timeline_events(
+        &self,
+        session_id: &str,
+        start: i64,
+        end: i64,
+    ) -> Result<Vec<TimelineEventData>, session_manager::SessionError> {
+        self.inner
+            .load_timeline_events(session_id, start, end)
+            .await
+    }
+    async fn get_event_count(
+        &self,
+        session_id: &str,
+    ) -> Result<i64, session_manager::SessionError> {
+        self.inner.get_event_count(session_id).await
+    }
+    async fn load_all_timeline_events(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<TimelineEventData>, session_manager::SessionError> {
+        self.inner.load_all_timeline_events(session_id).await
+    }
+    async fn load_branches(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<session_manager::BranchRecord>, session_manager::SessionError> {
+        self.inner.load_branches(session_id).await
+    }
+    async fn load_checkpoints(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<session_manager::CheckpointRecord>, session_manager::SessionError> {
+        self.inner.load_checkpoints(session_id).await
+    }
+    async fn save_blackboard_notebook(
+        &self,
+        notebook: &session_manager::NotebookRecord,
+    ) -> Result<(), session_manager::SessionError> {
+        self.inner.save_blackboard_notebook(notebook).await
+    }
+    async fn load_blackboard_notebooks(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<session_manager::NotebookRecord>, session_manager::SessionError> {
+        self.inner.load_blackboard_notebooks(session_id).await
+    }
+    async fn save_document(
+        &self,
+        document: &session_manager::DocumentRecord,
+    ) -> Result<(), session_manager::SessionError> {
+        self.inner.save_document(document).await
+    }
+    async fn load_documents(
+        &self,
+    ) -> Result<Vec<session_manager::DocumentRecord>, session_manager::SessionError> {
+        self.inner.load_documents().await
+    }
+    async fn delete_document(&self, id: &str) -> Result<(), session_manager::SessionError> {
+        self.inner.delete_document(id).await
+    }
+}
+
+/// The stable wire code a swallowed persistence failure must now carry.
+/// A literal, not `ErrorCode::…as_str()`: the point of a stable catalog
+/// code is that the WIRE string is pinned, and a test that reads the
+/// enum back cannot catch a rename of the wire value.
+const DURABILITY_PERSIST_FAILED: &str = "durability_persist_failed";
+
+/// Build an `AppState` whose durability writes go through
+/// [`FailingSaves`]: the event log persists normally (so the recorder's
+/// write-through and any seeded geometry behave exactly as in
+/// production), and only `save_checkpoint` / `save_branch` fail.
+async fn build_state_with_failing_saves(path: &str) -> AppState {
+    let real = open_db(path).await;
+    let failing: Db = FailingSaves::wrap(real);
+    build_state(failing, true).await
+}
+
+/// A `TimelineRecorder` whose drain worker is already dead, so
+/// `flush()` cannot complete. Built on a throwaway current-thread
+/// runtime that is dropped immediately — the `tokio::spawn`ed worker
+/// goes with it, closing the command channel's receiving half. This is a
+/// real recorder in a real failure state (the exact state
+/// `RecorderError::Unavailable` names), not a stub.
+fn dead_recorder(timeline: timeline_engine::SharedTimeline) -> timeline_engine::TimelineRecorder {
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("throwaway runtime must build");
+        let recorder = rt.block_on(async {
+            timeline_engine::TimelineRecorder::new(
+                timeline,
+                timeline_engine::Author::System,
+                timeline_engine::BranchId::main(),
+            )
+        });
+        // Dropping the runtime drops the spawned worker task (it never
+        // ran), closing the receiver. Every later `flush()` fails.
+        drop(rt);
+        recorder
+    })
+    .join()
+    .expect("recorder-construction thread must not panic")
+}
+
+/// A checkpoint name that clears `checkpoint_name_refusal` — the 422
+/// name-quality floor is a DIFFERENT refusal, and a generic name here
+/// would let these tests pass for the wrong reason.
+const REAL_INTENT_NAME: &str = "bore pattern 4 x D8 on D60 B.C., through";
+
+/// (i) + (ii) THE DEFECT: `POST /api/timeline/checkpoint` answered 201
+/// CREATED after `save_checkpoint` failed, and
+/// `GET /api/timeline/checkpoints` then listed a checkpoint that exists
+/// nowhere durable. It must be a typed 5xx, and the in-memory insert
+/// must be rolled back — both halves of it.
+#[tokio::test]
+async fn checkpoint_persistence_failure_is_a_typed_5xx_and_leaves_no_record() {
+    let path = temp_db_path();
+    let state = build_state_with_failing_saves(&path).await;
+
+    // Real events under the checkpoint, persisted through the (working)
+    // event-log path — proving the failure under test is the CHECKPOINT
+    // write, not a dead database.
+    build_bored_box(&state, 10.0).await;
+    state
+        .timeline_recorder
+        .flush()
+        .await
+        .expect("the event log write-through must still work");
+
+    let (status, body) = dispatch(
+        &state,
+        post(
+            "/api/timeline/checkpoint",
+            json!({ "name": REAL_INTENT_NAME }),
+        ),
+    )
+    .await;
+
+    assert!(
+        status.is_server_error(),
+        "a checkpoint whose durable write FAILED must not be reported as created — \
+         expected a 5xx, got {status}; body = {body}"
+    );
+    assert_eq!(
+        body["error_code"], DURABILITY_PERSIST_FAILED,
+        "the refusal must carry the stable persistence-failure code; body = {body}"
+    );
+    assert_eq!(
+        body["success"],
+        json!(false),
+        "every catalog error carries success=false; body = {body}"
+    );
+    assert!(
+        body["error"]
+            .as_str()
+            .map(|e| e.contains(INJECTED_STORE_FAILURE))
+            .unwrap_or(false)
+            || body["details"]["reason"]
+                .as_str()
+                .map(|r| r.contains(INJECTED_STORE_FAILURE))
+                .unwrap_or(false),
+        "the refusal must name the REAL store failure, not a generic fault; body = {body}"
+    );
+
+    // (ii) Rollback, half one: the read surface must not list it.
+    let (status, listing) = dispatch(&state, get("/api/timeline/checkpoints")).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "listing must serve; body = {listing}"
+    );
+    let named: Vec<&Value> = listing
+        .as_array()
+        .expect("checkpoints must be an array")
+        .iter()
+        .filter(|c| c["name"] == REAL_INTENT_NAME)
+        .collect();
+    assert!(
+        named.is_empty(),
+        "a checkpoint whose durable write failed MUST NOT be listed — a phantom \
+         record is the 201 lie wearing a different hat; listing = {listing}"
+    );
+
+    // (ii) Rollback, half two: the branch's own checkpoint index. The
+    // listing above reads only the checkpoint map; a rollback that
+    // forgets `branch.metadata.checkpoints` would pass it and still
+    // leave the id dangling on the branch.
+    let on_branch = {
+        let timeline = state.timeline.read().await;
+        timeline.get_branch_checkpoints(&timeline_engine::BranchId::main())
+    };
+    assert!(
+        on_branch.is_empty(),
+        "the rolled-back checkpoint must leave no id on the branch's checkpoint \
+         index either; got {on_branch:?}"
+    );
+}
+
+/// (iii) The same defect on the branch lane that actually works,
+/// `POST /api/branches`: a failed `save_branch` was logged and the
+/// handler returned the created branch anyway.
+#[tokio::test]
+async fn branch_persistence_failure_is_a_typed_5xx_and_leaves_no_branch() {
+    let path = temp_db_path();
+    let state = build_state_with_failing_saves(&path).await;
+
+    build_bored_box(&state, 8.0).await;
+    state
+        .timeline_recorder
+        .flush()
+        .await
+        .expect("the event log write-through must still work");
+
+    let before: Vec<String> = {
+        let (_, listing) = dispatch(&state, get("/api/branches")).await;
+        listing
+            .as_array()
+            .expect("branches must be an array")
+            .iter()
+            .map(|b| b["id"].as_str().unwrap_or_default().to_string())
+            .collect()
+    };
+
+    let (status, body) = dispatch(
+        &state,
+        post("/api/branches", json!({ "name": "persist-fail-sandbox" })),
+    )
+    .await;
+    assert!(
+        status.is_server_error(),
+        "a branch whose durable write FAILED must not be reported as created — \
+         expected a 5xx, got {status}; body = {body}"
+    );
+    assert_eq!(
+        body["error_code"], DURABILITY_PERSIST_FAILED,
+        "the refusal must carry the stable persistence-failure code; body = {body}"
+    );
+
+    // Rollback: neither the listing nor the timeline's own branch store
+    // may retain it. Matched by NAME — a refusal carries no id.
+    let (status, listing) = dispatch(&state, get("/api/branches")).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "listing must serve; body = {listing}"
+    );
+    let rows = listing.as_array().expect("branches must be an array");
+    assert!(
+        rows.iter().all(|b| b["name"] != "persist-fail-sandbox"),
+        "a branch whose durable write failed MUST NOT be listed; listing = {listing}"
+    );
+    let after: Vec<String> = rows
+        .iter()
+        .map(|b| b["id"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert_eq!(
+        after, before,
+        "the branch set must be identical to before the failed create"
+    );
+
+    // And the per-branch event map must go with it: a `branch_events`
+    // entry left behind is a branch `get_branch_events` still answers
+    // for while `GET /api/branches` denies it exists.
+    let leftover = {
+        let timeline = state.timeline.read().await;
+        timeline
+            .list_branches()
+            .into_iter()
+            .filter_map(|id| timeline.get_branch(&id))
+            .filter(|b| b.name == "persist-fail-sandbox")
+            .count()
+    };
+    assert_eq!(
+        leftover, 0,
+        "the rolled-back branch must be gone from the timeline's own store too"
+    );
+}
+
+/// (iv) The flush that makes the checkpoint's event range complete is
+/// itself a precondition: `create_checkpoint` discarded its result
+/// (`let _ = …flush().await`) while its own comment said the drain is
+/// what makes the range complete. A failed drain must be a typed error
+/// BEFORE any checkpoint is created — not a checkpoint over a range
+/// that silently omits in-flight work.
+#[tokio::test]
+async fn checkpoint_refuses_when_the_recorder_drain_fails() {
+    let path = temp_db_path();
+    let db = open_db(&path).await;
+    let mut state = build_state(db, true).await;
+
+    // Swap in a recorder whose worker is dead. Precondition asserted, so
+    // this fixture cannot pass by simply not being in the state it claims.
+    state.timeline_recorder = Arc::new(dead_recorder(state.timeline.clone()));
+    assert!(
+        state.timeline_recorder.flush().await.is_err(),
+        "fixture precondition: the swapped recorder's flush must actually fail"
+    );
+
+    let (status, body) = dispatch(
+        &state,
+        post(
+            "/api/timeline/checkpoint",
+            json!({ "name": REAL_INTENT_NAME }),
+        ),
+    )
+    .await;
+    assert!(
+        status.is_server_error(),
+        "a checkpoint whose drain could not complete must be refused, not created \
+         over an incomplete event range — expected a 5xx, got {status}; body = {body}"
+    );
+    assert_eq!(
+        body["error_code"], DURABILITY_PERSIST_FAILED,
+        "the drain refusal must carry the same typed code; body = {body}"
+    );
+
+    let (status, listing) = dispatch(&state, get("/api/timeline/checkpoints")).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "listing must serve; body = {listing}"
+    );
+    assert!(
+        listing
+            .as_array()
+            .expect("checkpoints must be an array")
+            .is_empty(),
+        "no checkpoint may exist after a refused drain; listing = {listing}"
+    );
+}
+
+/// (iii-b) The OTHER branch-create lane, `POST /api/timeline/branch/create`
+/// — the one the audit finding actually cited. It carried the same
+/// swallowed persist AND could not have reported it: its error type was a
+/// bare `StatusCode`, which can hold neither a machine-readable code nor
+/// the store's own reason. It now returns `ApiError`, so this asserts the
+/// typed refusal on that lane specifically, not just its sibling.
+#[tokio::test]
+async fn timeline_lane_branch_persistence_failure_is_a_typed_5xx_and_leaves_no_branch() {
+    let path = temp_db_path();
+    let state = build_state_with_failing_saves(&path).await;
+
+    build_bored_box(&state, 8.0).await;
+    state
+        .timeline_recorder
+        .flush()
+        .await
+        .expect("the event log write-through must still work");
+
+    let (status, body) = dispatch(
+        &state,
+        post(
+            "/api/timeline/branch/create",
+            json!({
+                "name": "timeline-lane-persist-fail",
+                "purpose": { "type": "Experiment", "hypothesis": "durable branch record" },
+            }),
+        ),
+    )
+    .await;
+    assert!(
+        status.is_server_error(),
+        "a branch whose durable write FAILED must not be reported as created on this \
+         lane either — expected a 5xx, got {status}; body = {body}"
+    );
+    assert_eq!(
+        body["error_code"], DURABILITY_PERSIST_FAILED,
+        "this lane must carry the same stable code as POST /api/branches, not a \
+         bodiless 500; body = {body}"
+    );
+
+    let (status, listing) = dispatch(&state, get("/api/branches")).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "listing must serve; body = {listing}"
+    );
+    assert!(
+        listing
+            .as_array()
+            .expect("branches must be an array")
+            .iter()
+            .all(|b| b["name"] != "timeline-lane-persist-fail"),
+        "the rolled-back branch must not be listed; listing = {listing}"
+    );
+    let leftover = {
+        let timeline = state.timeline.read().await;
+        timeline
+            .list_branches()
+            .into_iter()
+            .filter_map(|id| timeline.get_branch(&id))
+            .filter(|b| b.name == "timeline-lane-persist-fail")
+            .count()
+    };
+    assert_eq!(
+        leftover, 0,
+        "the rolled-back branch must be gone from the timeline's own store too"
+    );
+}
+
+/// (iv-b) The drain precondition on the branch lane. A branch's FORK POINT
+/// is computed against the parent's head, so an undrained recorder forks
+/// it off a stale event — and that wrong fork point is then written to
+/// durable storage, where no later read can tell it from the truth. A
+/// failed drain must therefore refuse before anything is created.
+#[tokio::test]
+async fn branch_create_refuses_when_the_recorder_drain_fails() {
+    let path = temp_db_path();
+    let db = open_db(&path).await;
+    let mut state = build_state(db, true).await;
+
+    let before = {
+        let (_, listing) = dispatch(&state, get("/api/branches")).await;
+        listing.as_array().expect("branches must be an array").len()
+    };
+
+    state.timeline_recorder = Arc::new(dead_recorder(state.timeline.clone()));
+    assert!(
+        state.timeline_recorder.flush().await.is_err(),
+        "fixture precondition: the swapped recorder's flush must actually fail"
+    );
+
+    let (status, body) = dispatch(
+        &state,
+        post("/api/branches", json!({ "name": "drain-fail-sandbox" })),
+    )
+    .await;
+    assert!(
+        status.is_server_error(),
+        "a branch whose fork point could not be drained must be refused, not forked \
+         off a stale head — expected a 5xx, got {status}; body = {body}"
+    );
+    assert_eq!(
+        body["error_code"], DURABILITY_PERSIST_FAILED,
+        "the drain refusal must carry the same typed code; body = {body}"
+    );
+
+    let (status, listing) = dispatch(&state, get("/api/branches")).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "listing must serve; body = {listing}"
+    );
+    let rows = listing.as_array().expect("branches must be an array");
+    assert!(
+        rows.iter().all(|b| b["name"] != "drain-fail-sandbox"),
+        "no branch may exist after a refused drain; listing = {listing}"
+    );
+    assert_eq!(
+        rows.len(),
+        before,
+        "the branch set must be unchanged by a refused create; listing = {listing}"
+    );
+}

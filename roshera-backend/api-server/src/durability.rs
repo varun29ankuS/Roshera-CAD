@@ -110,6 +110,62 @@ pub enum DurabilityStatus {
 /// A shared, mutable durability status handle carried in `AppState`.
 pub type SharedDurabilityStatus = Arc<RwLock<DurabilityStatus>>;
 
+/// Why a write-behind of a durable RECORD (a branch, a checkpoint)
+/// failed.
+///
+/// This type exists because its absence shipped a lie: both persist
+/// functions used to return `()`, `tracing::error!` the store failure,
+/// and let the handler answer `201 Created` with the record's id. The
+/// record lived in RAM only, the next restart lost it, and the caller
+/// had been told the opposite — the silent-wrong-answer class this
+/// kernel refuses. The failure is now the function's RESULT, so a caller
+/// cannot ignore it without saying so in the diff.
+///
+/// Both variants are terminal for the write: neither leaves a partially
+/// written record. The caller is responsible for rolling back whatever
+/// in-memory insert the write was supposed to make durable.
+#[derive(Debug, thiserror::Error)]
+pub enum DurabilityError {
+    /// The record could not be serialized into its storage blob. Not
+    /// retryable in any useful sense — the same record serializes the
+    /// same way — but it is still a refusal, never a silent skip.
+    #[error("{record} could not be serialized for storage: {source}")]
+    Serialize {
+        /// The record kind ("checkpoint", "branch").
+        record: &'static str,
+        /// The serde failure.
+        source: serde_json::Error,
+    },
+    /// The durable store refused or failed the write.
+    #[error("{record} could not be written to durable storage: {source}")]
+    Store {
+        /// The record kind ("checkpoint", "branch").
+        record: &'static str,
+        /// The store's own error, preserved verbatim.
+        source: session_manager::SessionError,
+    },
+}
+
+impl DurabilityError {
+    /// The record kind this failure concerns — `"checkpoint"` or
+    /// `"branch"`. Surfaced in the typed `ApiError`'s `details.record`.
+    pub fn record(&self) -> &'static str {
+        match self {
+            DurabilityError::Serialize { record, .. } | DurabilityError::Store { record, .. } => {
+                record
+            }
+        }
+    }
+
+    /// The underlying cause, verbatim, for `details.reason`.
+    pub fn reason(&self) -> String {
+        match self {
+            DurabilityError::Serialize { source, .. } => source.to_string(),
+            DurabilityError::Store { source, .. } => source.to_string(),
+        }
+    }
+}
+
 /// Document-level durability disclosure for agent-facing reads (the #39
 /// follow-up: an agent asking "what parts exist" / "what happened" got a
 /// clean answer on a QUARANTINED document — `/api/durability/status` and
@@ -263,6 +319,11 @@ async fn write_document(state: &AppState) -> String {
 /// record's opaque `data` blob so no schema migration is needed, and restored
 /// verbatim by [`restore_branch`] so a reboot does not decay a named
 /// principal's branch to `system`.
+///
+/// A store failure is the RETURNED [`DurabilityError`], not a log line: the
+/// caller must either make the branch durable or roll its in-memory create
+/// back. `Ok(())` when durability is switched off — nothing was promised, so
+/// nothing was broken.
 pub async fn persist_branch(
     state: &AppState,
     branch_id: BranchId,
@@ -270,9 +331,9 @@ pub async fn persist_branch(
     fork_sequence: i64,
     name: String,
     created_by: Author,
-) {
+) -> Result<(), DurabilityError> {
     if !durability_enabled() {
-        return;
+        return Ok(());
     }
     let document_id = write_document(state).await;
     let record = BranchRecord {
@@ -283,24 +344,36 @@ pub async fn persist_branch(
         name,
         data: serde_json::json!({ "created_by": created_by }),
     };
-    if let Err(e) = state.database.save_branch(&record).await {
+    state.database.save_branch(&record).await.map_err(|e| {
         tracing::error!(
             target: "durability",
             branch = %branch_id,
             error = %e,
             "durability: failed to persist branch metadata"
         );
-    }
+        DurabilityError::Store {
+            record: "branch",
+            source: e,
+        }
+    })
 }
 
 /// Persist a named checkpoint so the declared-intent layer survives a restart
 /// (the event log already did; the checkpoints labelling it did not — twice
 /// verified on 2026-08-01). Full `Checkpoint` stored losslessly in the `data`
-/// blob, mirroring [`persist_branch`]. Write-behind failure is named loudly
-/// with its consequence; the in-memory create has already succeeded.
-pub async fn persist_checkpoint(state: &AppState, checkpoint: &timeline_engine::Checkpoint) {
+/// blob, mirroring [`persist_branch`].
+///
+/// Write-behind failure is the RETURNED [`DurabilityError`], not a log line
+/// under a `201 Created`: the caller must roll the in-memory create back and
+/// refuse, because a checkpoint that exists only in memory is exactly the
+/// declared intent the next restart drops on the floor. `Ok(())` when
+/// durability is switched off — nothing was promised, so nothing was broken.
+pub async fn persist_checkpoint(
+    state: &AppState,
+    checkpoint: &timeline_engine::Checkpoint,
+) -> Result<(), DurabilityError> {
     if !durability_enabled() {
-        return;
+        return Ok(());
     }
     let document_id = write_document(state).await;
     let data = match serde_json::to_value(checkpoint) {
@@ -312,7 +385,10 @@ pub async fn persist_checkpoint(state: &AppState, checkpoint: &timeline_engine::
                 error = %e,
                 "durability: checkpoint could not be serialized — it will NOT survive a restart"
             );
-            return;
+            return Err(DurabilityError::Serialize {
+                record: "checkpoint",
+                source: e,
+            });
         }
     };
     let record = session_manager::CheckpointRecord {
@@ -322,17 +398,21 @@ pub async fn persist_checkpoint(state: &AppState, checkpoint: &timeline_engine::
         created_at: checkpoint.timestamp.timestamp_millis(),
         data,
     };
-    if let Err(e) = state.database.save_checkpoint(&record).await {
+    state.database.save_checkpoint(&record).await.map_err(|e| {
         tracing::error!(
             target: "durability",
             checkpoint = %checkpoint.id,
             name = %checkpoint.name,
             error = %e,
-            "durability: checkpoint '{}' was recorded in memory but NOT persisted — \
-             it will not survive a restart",
+            "durability: checkpoint '{}' could NOT be persisted — the caller is \
+             refused and the in-memory record rolled back",
             checkpoint.name
         );
-    }
+        DurabilityError::Store {
+            record: "checkpoint",
+            source: e,
+        }
+    })
 }
 
 /// Boot-time restore of the named-intent layer: reload every persisted

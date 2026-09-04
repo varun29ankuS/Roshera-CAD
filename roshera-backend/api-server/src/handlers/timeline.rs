@@ -644,13 +644,21 @@ pub async fn record_operation(
 /// lane — `Timeline::create_branch` — shared with `POST /api/branches`:
 /// recorder flush → `create_branch(.., None, ..)` (fork at the parent's
 /// real head) → `durability::persist_branch`.
+///
+/// The error type is [`ApiError`], not a bare `StatusCode`: the
+/// durability refusal below has to carry a machine-readable code
+/// (`durability_persist_failed`) and the store's own reason, and a
+/// bodiless 500 can carry neither. The status NUMBERS are unchanged —
+/// `BranchNotFound` still answers 404, a malformed reference still 400,
+/// any other timeline failure still 500 — so a client reading only the
+/// status sees exactly what it saw before.
 pub async fn create_branch(
     State(state): State<AppState>,
     auth_info: AuthInfo,
     Json(request): Json<CreateBranchRequest>,
-) -> Result<Json<BranchInfo>, StatusCode> {
+) -> Result<Json<BranchInfo>, ApiError> {
     let parent = match request.parent_branch {
-        Some(id) => resolve_branch_ref(&id)?,
+        Some(id) => resolve_branch_ref_typed(&id)?,
         None => BranchId::main(),
     };
 
@@ -660,9 +668,16 @@ pub async fn create_branch(
     // Drain in-flight kernel events first. The recorder is sync
     // fire-and-forget into an MPSC channel; without the drain the fork
     // point is computed against a stale parent head and the branch
-    // forks off an earlier event. Failure is non-fatal (the worker may
-    // be down, in which case nothing is in flight to drain).
-    let _ = state.timeline_recorder.flush().await;
+    // forks off an earlier event — which is then persisted as the
+    // branch's real fork point. A failed drain is therefore a refusal,
+    // not a discarded `Result`.
+    if let Err(e) = state.timeline_recorder.flush().await {
+        return Err(ApiError::durability_persist_failed(
+            "branch",
+            "recorder_flush",
+            e,
+        ));
+    }
 
     // Acquire the timeline write lock for the smallest possible window:
     // create_branch reads parent existence then inserts. Drop before
@@ -674,8 +689,16 @@ pub async fn create_branch(
             .create_branch(request.name.clone(), parent, None, author.clone(), purpose)
             .await
             .map_err(|e| match e {
-                TimelineError::BranchNotFound(_) => StatusCode::NOT_FOUND,
-                _ => StatusCode::INTERNAL_SERVER_ERROR,
+                TimelineError::BranchNotFound(b) => ApiError::new(
+                    ErrorCode::BranchNotFound,
+                    format!("branch '{b}' does not exist in the timeline"),
+                )
+                .with_hint("List live branches with GET /api/branches.")
+                .with_details(serde_json::json!({ "branch_id": b.to_string() })),
+                other => ApiError::new(
+                    ErrorCode::Internal,
+                    format!("branch could not be created: {other}"),
+                ),
             })?
     };
 
@@ -698,7 +721,10 @@ pub async fn create_branch(
     // point, and authorship survive a restart. The event log already tags each
     // event with its branch_id; this makes the branch itself restorable on
     // boot.
-    crate::durability::persist_branch(
+    //
+    // A failed store write is a typed refusal with the in-memory create
+    // rolled back — never a 200 over a branch that exists only in RAM.
+    if let Err(e) = crate::durability::persist_branch(
         &state,
         branch_id,
         Some(parent),
@@ -706,7 +732,18 @@ pub async fn create_branch(
         request.name.clone(),
         author,
     )
-    .await;
+    .await
+    {
+        {
+            let timeline = state.timeline.write().await;
+            timeline.remove_branch(&branch_id);
+        }
+        return Err(ApiError::durability_persist_failed(
+            e.record(),
+            "store_write",
+            e.reason(),
+        ));
+    }
 
     Ok(Json(BranchInfo {
         id: branch_id.to_string(),
@@ -2976,8 +3013,18 @@ pub async fn create_checkpoint(
     };
 
     // Drain in-flight recorder ops so the captured event range covers
-    // every operation the caller has already issued.
-    let _ = state.timeline_recorder.flush().await;
+    // every operation the caller has already issued. The drain is what
+    // MAKES the range complete, so a failed drain is a refusal here, not
+    // a discarded `Result`: checkpointing over a range that silently
+    // omits in-flight work labels the timeline with a lie, and the
+    // caller cannot tell.
+    if let Err(e) = state.timeline_recorder.flush().await {
+        return Err(ApiError::durability_persist_failed(
+            "checkpoint",
+            "recorder_flush",
+            e,
+        ));
+    }
 
     let created = {
         let timeline = state.timeline.write().await;
@@ -3019,9 +3066,23 @@ pub async fn create_checkpoint(
     };
 
     // Durability: the named-intent layer must be at least as durable as
-    // the events it labels. Write-behind failure is logged loudly by
-    // persist_checkpoint itself; the in-memory create already succeeded.
-    crate::durability::persist_checkpoint(&state, &checkpoint).await;
+    // the events it labels. A failed write-behind used to be logged and
+    // dropped while this handler answered 201 CREATED with the id — a
+    // checkpoint that lived in RAM only, lost at the next restart, with
+    // the caller told the opposite. It is now a typed refusal, and the
+    // in-memory create is ROLLED BACK first so the refusal leaves no
+    // phantom for `GET /api/timeline/checkpoints` to list.
+    if let Err(e) = crate::durability::persist_checkpoint(&state, &checkpoint).await {
+        {
+            let timeline = state.timeline.write().await;
+            timeline.remove_checkpoint(&checkpoint.id);
+        }
+        return Err(ApiError::durability_persist_failed(
+            e.record(),
+            "store_write",
+            e.reason(),
+        ));
+    }
 
     Ok((
         StatusCode::CREATED,

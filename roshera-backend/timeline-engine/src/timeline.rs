@@ -699,6 +699,57 @@ impl Timeline {
         self.checkpoints.get(id).map(|e| e.value().clone())
     }
 
+    /// Undo a [`create_checkpoint`](Self::create_checkpoint) whose
+    /// DURABLE write then failed. Returns the removed record, or `None`
+    /// if the id is not present.
+    ///
+    /// A checkpoint lives in two places — the `checkpoints` map and the
+    /// owning branch's `metadata.checkpoints` index — and both are
+    /// undone here. Removing only the map would leave the branch
+    /// pointing at an id nothing can resolve: `GET
+    /// /api/timeline/checkpoints` would agree the checkpoint is gone
+    /// while `get_branch_checkpoints` still named it.
+    ///
+    /// This is the compensating half of the api-server's
+    /// create-then-persist sequence, NOT a user-facing delete: a
+    /// checkpoint that was successfully persisted is never removed
+    /// (deleting a declared design intent is a different operation with
+    /// different semantics, and there is no durable delete to pair it
+    /// with).
+    pub fn remove_checkpoint(&self, id: &CheckpointId) -> Option<Checkpoint> {
+        let (_, checkpoint) = self.checkpoints.remove(id)?;
+        if let Some(mut branch) = self.branches.get_mut(&checkpoint.branch_id) {
+            branch.metadata.checkpoints.retain(|c| c != id);
+        }
+        Some(checkpoint)
+    }
+
+    /// Undo a [`create_branch`](Self::create_branch) whose DURABLE write
+    /// then failed. Returns `true` if a branch was removed.
+    ///
+    /// `create_branch` writes two entries — the `Branch` record and the
+    /// branch's own `branch_events` map (seeded with the parent's
+    /// pre-fork event indices) — and both are undone here. Removing only
+    /// the record would leave `get_branch_events` answering for a branch
+    /// `list_branches` no longer knows.
+    ///
+    /// Only the trunk's own events are shared state; a freshly created
+    /// branch's `branch_events` map holds copies of the parent's
+    /// (index → event id) pairs, so dropping it removes nothing the
+    /// parent still needs. Events in `self.events` are untouched: they
+    /// are the parent's, and were never this branch's to delete.
+    ///
+    /// Refuses to remove `main` (or any protected branch) — the trunk is
+    /// never the product of a create that could be rolled back.
+    pub fn remove_branch(&self, id: &BranchId) -> bool {
+        if self.branches.get(id).map(|b| b.protected).unwrap_or(false) || *id == BranchId::main() {
+            return false;
+        }
+        let removed = self.branches.remove(id).is_some();
+        self.branch_events.remove(id);
+        removed
+    }
+
     /// Durability boot restore: reinsert a persisted checkpoint
     /// verbatim — original `id`, `event_range`, `branch_id`, `author`,
     /// and `timestamp` all preserved, so `GET /api/timeline/checkpoints`

@@ -1755,23 +1755,37 @@ async fn handle_websocket_connection(socket: WebSocket, state: AppState) {
 
                                         // Drain in-flight kernel events so the fork
                                         // point is computed against the parent's real
-                                        // head. Non-fatal: the worker may be down, in
-                                        // which case nothing is in flight to drain.
-                                        let _ = state.timeline_recorder.flush().await;
-
+                                        // head. A failed drain is a REFUSAL, not a
+                                        // discarded `Result`: proceeding forks the
+                                        // branch off a stale head and then persists
+                                        // that wrong fork point — a confident,
+                                        // unrecoverable lie about where the branch
+                                        // diverged.
+                                        //
                                         // Smallest write window (guard dropped before
                                         // the reply is awaited).
-                                        let result = {
-                                            let timeline_guard = timeline.write().await;
-                                            timeline_guard
-                                                .create_branch(
-                                                    name.clone(),
-                                                    timeline_engine::BranchId::main(),
-                                                    from_point.map(|p| p as u64),
-                                                    author.clone(),
-                                                    purpose,
-                                                )
-                                                .await
+                                        let result = match state
+                                            .timeline_recorder
+                                            .flush()
+                                            .await
+                                        {
+                                            Err(e) => Err(format!(
+                                                "the recorder drain that fixes the fork \
+                                                 point could not complete: {e}"
+                                            )),
+                                            Ok(()) => {
+                                                let timeline_guard = timeline.write().await;
+                                                timeline_guard
+                                                    .create_branch(
+                                                        name.clone(),
+                                                        timeline_engine::BranchId::main(),
+                                                        from_point.map(|p| p as u64),
+                                                        author.clone(),
+                                                        purpose,
+                                                    )
+                                                    .await
+                                                    .map_err(|e| format!("{e:?}"))
+                                            }
                                         };
 
                                         match result {
@@ -1788,32 +1802,64 @@ async fn handle_websocket_connection(socket: WebSocket, state: AppState) {
                                                         .map(|b| b.fork_point.event_index as i64)
                                                         .unwrap_or(0)
                                                 };
-                                                crate::durability::persist_branch(
-                                                    &state,
-                                                    branch_id,
-                                                    Some(timeline_engine::BranchId::main()),
-                                                    fork_sequence,
-                                                    name.clone(),
-                                                    author,
-                                                )
-                                                .await;
-                                                info!(
-                                                    "Created branch '{}' with ID: {:?}",
-                                                    name, branch_id
-                                                );
-                                                ServerMessage::TimelineUpdate {
-                                                    update: super::protocol::TimelineUpdate::BranchCreated {
-                                                        name: name.clone(),
-                                                    },
+                                                //
+                                                // A failed store write is
+                                                // reported, never swallowed
+                                                // under a BranchCreated: the
+                                                // in-memory create is rolled
+                                                // back first, so this surface
+                                                // does not announce a branch
+                                                // that the next restart loses.
+                                                let persisted =
+                                                    crate::durability::persist_branch(
+                                                        &state,
+                                                        branch_id,
+                                                        Some(timeline_engine::BranchId::main()),
+                                                        fork_sequence,
+                                                        name.clone(),
+                                                        author,
+                                                    )
+                                                    .await;
+                                                if let Err(e) = persisted {
+                                                    {
+                                                        let timeline_guard =
+                                                            timeline.write().await;
+                                                        timeline_guard.remove_branch(&branch_id);
+                                                    }
+                                                    error!(
+                                                        "Branch '{}' was not made durable: {}",
+                                                        name, e
+                                                    );
+                                                    ServerMessage::Error {
+                                                        error_code: "BRANCH_PERSIST_FAILED"
+                                                            .to_string(),
+                                                        message: format!(
+                                                            "Branch '{}' was not made durable \
+                                                             ({}) — it has been rolled back \
+                                                             rather than reported as created",
+                                                            name, e
+                                                        ),
+                                                        details: None,
+                                                        request_id,
+                                                    }
+                                                } else {
+                                                    info!(
+                                                        "Created branch '{}' with ID: {:?}",
+                                                        name, branch_id
+                                                    );
+                                                    ServerMessage::TimelineUpdate {
+                                                        update: super::protocol::TimelineUpdate::BranchCreated {
+                                                            name: name.clone(),
+                                                        },
+                                                    }
                                                 }
                                             }
-                                            Err(e) => {
-                                                error!("Failed to create branch: {:?}", e);
+                                            Err(reason) => {
+                                                error!("Failed to create branch: {}", reason);
                                                 ServerMessage::Error {
                                                     error_code: "BRANCH_CREATE_FAILED".to_string(),
                                                     message: format!(
-                                                        "Failed to create branch: {:?}",
-                                                        e
+                                                        "Failed to create branch: {reason}"
                                                     ),
                                                     details: None,
                                                     request_id,

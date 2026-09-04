@@ -444,6 +444,34 @@ pub enum ErrorCode {
     /// endpoint, not just retry.
     MethodNotAllowed,
 
+    // ── Durability ────────────────────────────────────────────────
+    /// A record whose whole purpose is to OUTLIVE the process — a named
+    /// checkpoint, a branch — could not be written to durable storage,
+    /// or the recorder drain that makes its event range complete could
+    /// not finish.
+    ///
+    /// This exists because the alternative shipped for a while and lied:
+    /// `persist_checkpoint`/`persist_branch` returned `()`, logged the
+    /// store error, and the handler answered `201 Created` with the
+    /// record's id. The record was in RAM only and the next restart lost
+    /// it, while the caller had been told the opposite — precisely the
+    /// silent-wrong-answer class this kernel refuses.
+    ///
+    /// The in-memory insert is ROLLED BACK before this is returned, so
+    /// the failure leaves no phantom: the record the caller was refused
+    /// is not listed by `GET /api/timeline/checkpoints` or
+    /// `GET /api/branches` either. `details` carries `record` (the kind),
+    /// `stage` (`recorder_flush` or `store_write`), `rolled_back`, and
+    /// the store's own `reason` verbatim — a caller must be able to see
+    /// the real cause, not a generic fault.
+    ///
+    /// Mapped to HTTP 500 and RETRYABLE: a store write that failed once
+    /// (a full disk, a dropped connection, a downed drain worker) may
+    /// well succeed on the next attempt, and the rollback means a retry
+    /// starts from a clean state rather than duplicating a half-made
+    /// record.
+    DurabilityPersistFailed,
+
     // ── Catch-alls ────────────────────────────────────────────────
     /// Unspecified server-side fault. Always retryable.
     #[serde(rename = "internal_error")]
@@ -502,6 +530,7 @@ impl ErrorCode {
             | ErrorCode::KernelReturnedWrongType
             | ErrorCode::IdempotencyResponseTooLarge
             | ErrorCode::IdempotencyReplayFailed
+            | ErrorCode::DurabilityPersistFailed
             | ErrorCode::Internal => StatusCode::INTERNAL_SERVER_ERROR,
 
             ErrorCode::AiNotConfigured
@@ -614,6 +643,11 @@ impl ErrorCode {
             // failure on the certification task — transient by nature,
             // unlike the two refusals above.
             | ErrorCode::SheetUncertified
+            // A store write or a recorder drain that failed once may
+            // succeed on the next attempt, and the handler rolled its
+            // in-memory insert back — so a retry starts clean rather
+            // than duplicating a half-made record.
+            | ErrorCode::DurabilityPersistFailed
             | ErrorCode::Internal => true,
         }
     }
@@ -669,6 +703,7 @@ impl ErrorCode {
             ErrorCode::AcpForbiddenSessionMeta => "acp_forbidden_session_meta",
             ErrorCode::PermissionDenied => "permission_denied",
             ErrorCode::MethodNotAllowed => "method_not_allowed",
+            ErrorCode::DurabilityPersistFailed => "durability_persist_failed",
             ErrorCode::Internal => "internal_error",
         }
     }
@@ -723,6 +758,7 @@ impl ErrorCode {
             ErrorCode::AcpForbiddenSessionMeta,
             ErrorCode::PermissionDenied,
             ErrorCode::MethodNotAllowed,
+            ErrorCode::DurabilityPersistFailed,
             ErrorCode::Internal,
         ]
     }
@@ -852,6 +888,50 @@ impl ApiError {
              D160 B.C.' or 'M8 clearance holes, close fit, 4x base corners'.",
         )
         .with_details(serde_json::json!({ "rejected_name": name }))
+    }
+
+    /// A record that must outlive the process could not be made durable,
+    /// and the in-memory insert has been rolled back.
+    ///
+    /// `record` is the kind ("checkpoint", "branch"); `stage` is where it
+    /// broke — `"recorder_flush"` (the drain that makes the record's
+    /// event range complete could not finish) or `"store_write"` (the
+    /// database write itself failed); `reason` is the underlying error,
+    /// carried VERBATIM so the caller sees the real cause rather than a
+    /// generic fault.
+    ///
+    /// `details.rolled_back` is always `true`, and it means exactly one
+    /// thing: **no such record exists on this server after this
+    /// refusal**. At the `recorder_flush` stage nothing was created yet;
+    /// at `store_write` the in-memory insert has already been undone.
+    /// A handler that cannot honour that must not use this constructor —
+    /// reporting the failure while leaving the phantom record listed is
+    /// the same lie in a new costume.
+    pub fn durability_persist_failed(
+        record: &str,
+        stage: &str,
+        reason: impl std::fmt::Display,
+    ) -> Self {
+        let reason = reason.to_string();
+        Self::new(
+            ErrorCode::DurabilityPersistFailed,
+            format!(
+                "the {record} was not made durable ({stage}: {reason}) — it has been \
+                 rolled back rather than reported as created, because a {record} that \
+                 exists only in memory is lost at the next restart"
+            ),
+        )
+        .with_hint(
+            "Retry the request. If it keeps failing, the durable store is \
+             unavailable — check GET /api/durability/status and the server log \
+             (target `durability`) before re-issuing.",
+        )
+        .with_details(serde_json::json!({
+            "record": record,
+            "stage": stage,
+            "reason": reason,
+            "rolled_back": true,
+        }))
     }
 
     /// Kernel-side failure with the kernel's own error string attached.
