@@ -760,61 +760,70 @@ async fn handle_websocket_connection(socket: WebSocket, state: AppState) {
 
                                         match primitive_type {
                                             PrimitiveType::Sphere => {
-                                                let radius = parameters
-                                                    .params
-                                                    .get("radius")
-                                                    .copied()
-                                                    .unwrap_or(5.0);
-
-                                                match builder.create_sphere_3d(
-                                                    geometry_engine::math::Point3::ZERO,
-                                                    radius,
-                                                ) {
-                                                    Ok(id) => {
+                                                // A dimension the caller did not supply is a
+                                                // refusal, never a default silently reported
+                                                // back as the radius they asked for.
+                                                match required_dimension(
+                                                    parameters,
+                                                    primitive_type,
+                                                    "radius",
+                                                )
+                                                .and_then(|radius| {
+                                                    builder
+                                                        .create_sphere_3d(
+                                                            geometry_engine::math::Point3::ZERO,
+                                                            radius,
+                                                        )
+                                                        .map(|id| (id, radius))
+                                                        .map_err(WsCreateError::Kernel)
+                                                }) {
+                                                    Ok((id, radius)) => {
                                                         serde_json::json!({
                                                             "type": "sphere",
                                                             "id": id,
                                                             "radius": radius
                                                         })
                                                     }
-                                                    Ok(_) => serde_json::json!({
-                                                        "error": "Unexpected geometry type (not a solid)"
-                                                    }),
                                                     Err(e) => serde_json::json!({
-                                                        "error": format!("Failed to create sphere: {}", e)
+                                                        "error": format!("Failed to create sphere: {}", e),
+                                                        "error_code": e.error_code(),
+                                                        "details": e.details()
                                                     }),
                                                 }
                                             }
                                             PrimitiveType::Box => {
-                                                let width = parameters
-                                                    .params
-                                                    .get("width")
-                                                    .copied()
-                                                    .unwrap_or(10.0);
-                                                let height = parameters
-                                                    .params
-                                                    .get("height")
-                                                    .copied()
-                                                    .unwrap_or(10.0);
-                                                let depth = parameters
-                                                    .params
-                                                    .get("depth")
-                                                    .copied()
-                                                    .unwrap_or(10.0);
-
-                                                match builder.create_box_3d(width, height, depth) {
-                                                    Ok(id) => {
+                                                match required_dimension(
+                                                    parameters,
+                                                    primitive_type,
+                                                    "width",
+                                                )
+                                                .and_then(|width| {
+                                                    let height = required_dimension(
+                                                        parameters,
+                                                        primitive_type,
+                                                        "height",
+                                                    )?;
+                                                    let depth = required_dimension(
+                                                        parameters,
+                                                        primitive_type,
+                                                        "depth",
+                                                    )?;
+                                                    builder
+                                                        .create_box_3d(width, height, depth)
+                                                        .map(|id| (id, [width, height, depth]))
+                                                        .map_err(WsCreateError::Kernel)
+                                                }) {
+                                                    Ok((id, dimensions)) => {
                                                         serde_json::json!({
                                                             "type": "box",
                                                             "id": id,
-                                                            "dimensions": [width, height, depth]
+                                                            "dimensions": dimensions
                                                         })
                                                     }
-                                                    Ok(_) => serde_json::json!({
-                                                        "error": "Unexpected geometry type (not a solid)"
-                                                    }),
                                                     Err(e) => serde_json::json!({
-                                                        "error": format!("Failed to create box: {}", e)
+                                                        "error": format!("Failed to create box: {}", e),
+                                                        "error_code": e.error_code(),
+                                                        "details": e.details()
                                                     }),
                                                 }
                                             }
@@ -931,49 +940,12 @@ async fn handle_websocket_connection(socket: WebSocket, state: AppState) {
                                                         let mut model = state.model.write().await;
                                                         let mut builder = TopologyBuilder::new(&mut *model);
 
-                                                        // Continue with normal creation...
-                                                        match primitive {
-                                                            shared_types::PrimitiveType::Box => {
-                                                                let width = parameters.params.get("width").copied().unwrap_or(10.0);
-                                                                let height = parameters.params.get("height").copied().unwrap_or(10.0);
-                                                                let depth = parameters.params.get("depth").copied().unwrap_or(10.0);
-                                                                builder.create_box_3d(width, height, depth)
-                                                                    .map(|id| ("box", id))
-                                                            }
-                                                            shared_types::PrimitiveType::Sphere => {
-                                                                let radius = parameters.params.get("radius").copied().unwrap_or(5.0);
-                                                                builder.create_sphere_3d(
-                                                                    geometry_engine::math::Point3::ZERO,
-                                                                    radius
-                                                                ).map(|id| ("sphere", id))
-                                                            }
-                                                            shared_types::PrimitiveType::Cylinder => {
-                                                                let radius = parameters.params.get("radius").copied().unwrap_or(5.0);
-                                                                let height = parameters.params.get("height").copied().unwrap_or(10.0);
-                                                                builder.create_cylinder_3d(
-                                                                    geometry_engine::math::Point3::ZERO,
-                                                                    geometry_engine::math::Vector3::Z,
-                                                                    radius,
-                                                                    height,
-                                                                ).map(|id| ("cylinder", id))
-                                                            }
-                                                            shared_types::PrimitiveType::Cone => {
-                                                                let radius = parameters.params.get("radius").copied().unwrap_or(5.0);
-                                                                let height = parameters.params.get("height").copied().unwrap_or(10.0);
-                                                                builder.create_cone_3d(
-                                                                    geometry_engine::math::Point3::ZERO,
-                                                                    geometry_engine::math::Vector3::Z,
-                                                                    radius,  // base_radius
-                                                                    0.0,     // top_radius (0 for a pointed cone)
-                                                                    height,
-                                                                ).map(|id| ("cone", id))
-                                                            }
-                                                            _ => Err(geometry_engine::primitives::primitive_traits::PrimitiveError::InvalidParameters {
-                                                                parameter: "primitive_type".to_string(),
-                                                                value: "unsupported".to_string(),
-                                                                constraint: "must be box, sphere, cylinder, or cone".to_string(),
-                                                            })
-                                                        }
+                                                        // Continue with normal creation... through the
+                                                        // same dispatch the legacy `Create` arm uses, so
+                                                        // the two arms cannot disagree about what a
+                                                        // primitive name builds or which dimensions it
+                                                        // requires.
+                                                        build_ws_primitive(&mut builder, &primitive, &parameters)
                                                         }; // end AUDIT-C5 scope: write lock released before send
 
                                                         // Send response based on result
@@ -1067,112 +1039,18 @@ async fn handle_websocket_connection(socket: WebSocket, state: AppState) {
                                                         let mut builder = TopologyBuilder::new(&mut *model);
 
                                                         // Extract dimensions from parameters
-                                                        match primitive {
-                                                            shared_types::PrimitiveType::Box => {
-                                                                let width = parameters.params.get("width").copied().unwrap_or(10.0);
-                                                                let height = parameters.params.get("height").copied().unwrap_or(10.0);
-                                                                let depth = parameters.params.get("depth").copied().unwrap_or(10.0);
-                                                                builder.create_box_3d(width, height, depth)
-                                                                    .map(|id| ("box", id))
-                                                            }
-                                                            shared_types::PrimitiveType::Sphere => {
-                                                                let radius = parameters.params.get("radius").copied().unwrap_or(5.0);
-                                                                builder.create_sphere_3d(
-                                                                    geometry_engine::math::Point3::ZERO,
-                                                                    radius
-                                                                ).map(|id| ("sphere", id))
-                                                            }
-                                                            shared_types::PrimitiveType::Cylinder => {
-                                                                let radius = parameters.params.get("radius").copied().unwrap_or(5.0);
-                                                                let height = parameters.params.get("height").copied().unwrap_or(10.0);
-                                                                builder.create_cylinder_3d(
-                                                                    geometry_engine::math::Point3::ZERO,
-                                                                    geometry_engine::math::Vector3::Z,
-                                                                    radius,
-                                                                    height,
-                                                                ).map(|id| ("cylinder", id))
-                                                            }
-                                                            shared_types::PrimitiveType::Cone => {
-                                                                let radius = parameters.params.get("radius").copied().unwrap_or(5.0);
-                                                                let height = parameters.params.get("height").copied().unwrap_or(10.0);
-                                                                // For now, create cylinder as cone implementation may not be complete
-                                                                builder.create_cylinder_3d(
-                                                                    geometry_engine::math::Point3::ZERO,
-                                                                    geometry_engine::math::Vector3::Z,
-                                                                    radius,
-                                                                    height,
-                                                                ).map(|id| ("cone", id))
-                                                            }
-                                                            _ => {
-                                                                // Torus and other primitives - create a default sphere for now
-                                                                builder.create_sphere_3d(
-                                                                    geometry_engine::math::Point3::ZERO,
-                                                                    5.0
-                                                                ).map(|id| ("sphere", id))
-                                                            }
-                                                        }
+                                                        build_ws_primitive(&mut builder, &primitive, &parameters)
                                                         }; // end AUDIT-C5 scope: write lock released before send
 
-                                                        match result {
-                                                            Ok((shape_name, LocalGeometryId::Solid(solid_id))) => {
-                                                                // Send success response
-                                                                let response = ServerMessage::AIResponse {
-                                                                    response: crate::protocol::protocol::AIResponse::CommandExecuted {
-                                                                        command: format!("create_{}", shape_name),
-                                                                        results: vec![uuid::Uuid::new_v4()],
-                                                                    },
-                                                                    request_id: request_id.clone(),
-                                                                };
-                                                                if let Ok(json) = serde_json::to_string(&response) {
-                                                                    let _ = sender.send(Message::Text(json.into())).await;
-                                                                }
-
-                                                                // Also send geometry created notification
-                                                                let msg = WebSocketMessage::GeometryCreated {
-                                                                    object_id: solid_id,
-                                                                    shape_type: shape_name.to_string(),
-                                                                    created_by: "AI".to_string(),
-                                                                };
-                                                                if let Ok(json) = serde_json::to_string(&msg) {
-                                                                    let _ = sender.send(Message::Text(json.into())).await;
-                                                                }
+                                                        // Every frame this request emits, in wire
+                                                        // order, decided in one place so the id the
+                                                        // CommandExecuted reply carries and the id
+                                                        // the GeometryCreated notification carries
+                                                        // cannot drift apart.
+                                                        for frame in ws_create_frames(&state, result, &primitive, &request_id) {
+                                                            if let Ok(json) = frame.to_json() {
+                                                                let _ = sender.send(Message::Text(json.into())).await;
                                                             }
-                                                            Ok(_) => {
-                                                                let response = ServerMessage::Error {
-                                                                    error_code: "INVALID_GEOMETRY".to_string(),
-                                                                    message: "Created geometry was not a solid".to_string(),
-                                                                    details: None,
-                                                                    request_id: request_id.clone(),
-                                                                };
-                                                                if let Ok(json) = serde_json::to_string(&response) {
-                                                                    let _ = sender.send(Message::Text(json.into())).await;
-                                                                }
-                                                            }
-                                                            Err(e) => {
-                                                                let response = ServerMessage::Error {
-                                                                    error_code: "GEOMETRY_ERROR".to_string(),
-                                                                    message: format!("Failed to create geometry: {}", e),
-                                                                    details: None,
-                                                                    request_id: request_id.clone(),
-                                                                };
-                                                                if let Ok(json) = serde_json::to_string(&response) {
-                                                                    let _ = sender.send(Message::Text(json.into())).await;
-                                                                }
-                                                            }
-                                                        }
-
-                                                        // Send success response after creating geometry
-                                                        let response = ServerMessage::Success {
-                                                            result: Some(serde_json::json!({
-                                                                "message": "Geometry created successfully",
-                                                                "type": "primitive",
-                                                                "primitive_type": format!("{:?}", primitive)
-                                                            })),
-                                                            request_id: request_id.clone(),
-                                                        };
-                                                        if let Ok(json) = serde_json::to_string(&response) {
-                                                            info!("Sending success response for AI command");
-                                                            let _ = sender.send(Message::Text(json.into())).await;
                                                         }
                                                     }
                                                     _ => {
@@ -3345,6 +3223,270 @@ fn subelement_error(object_id: &str, message: &str) -> serde_json::Value {
     })
 }
 
+/// Why a WebSocket create request produced no solid.
+///
+/// These are the three honest answers the create arms can give: the
+/// caller omitted a dimension the primitive cannot be built without,
+/// the caller named a primitive no kernel builder is wired to on this
+/// surface, or the kernel itself refused the parameters it was given.
+/// None of them is a substitution.
+#[derive(Debug)]
+pub(crate) enum WsCreateError {
+    /// A dimension the primitive requires was absent from
+    /// `ShapeParameters::params`. Never defaulted — a number nobody
+    /// supplied, reported as the solid the caller asked for, is the
+    /// "default value presented as a measurement" this surface refuses.
+    MissingParameter {
+        primitive: PrimitiveType,
+        parameter: &'static str,
+    },
+    /// The primitive is in the `PrimitiveType` enum but no builder on
+    /// this surface constructs it. The request is refused by name; no
+    /// other primitive is created in its place.
+    UnsupportedPrimitive { primitive: PrimitiveType },
+    /// The kernel builder rejected the parameters it was handed.
+    Kernel(geometry_engine::primitives::primitive_traits::PrimitiveError),
+}
+
+impl std::fmt::Display for WsCreateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WsCreateError::MissingParameter {
+                primitive,
+                parameter,
+            } => write!(
+                f,
+                "{:?} requires a '{}' parameter and none was supplied",
+                primitive, parameter
+            ),
+            WsCreateError::UnsupportedPrimitive { primitive } => write!(
+                f,
+                "{:?} has no builder on this surface; no substitute primitive was created",
+                primitive
+            ),
+            WsCreateError::Kernel(e) => write!(f, "{}", e),
+        }
+    }
+}
+
+impl WsCreateError {
+    /// Stable WS `error_code`. `GEOMETRY_ERROR` is the code the create
+    /// arm already sent for a kernel refusal; the two new codes name the
+    /// two new refusals.
+    pub(crate) fn error_code(&self) -> &'static str {
+        match self {
+            WsCreateError::MissingParameter { .. } => "MISSING_PARAMETER",
+            WsCreateError::UnsupportedPrimitive { .. } => "UNSUPPORTED_PRIMITIVE",
+            WsCreateError::Kernel(_) => "GEOMETRY_ERROR",
+        }
+    }
+
+    /// Machine-readable `details` payload, so a client can branch on the
+    /// offending parameter/primitive without parsing the message text.
+    pub(crate) fn details(&self) -> Option<serde_json::Value> {
+        match self {
+            WsCreateError::MissingParameter {
+                primitive,
+                parameter,
+            } => Some(serde_json::json!({
+                "primitive": format!("{:?}", primitive),
+                "parameter": parameter,
+            })),
+            WsCreateError::UnsupportedPrimitive { primitive } => Some(serde_json::json!({
+                "primitive": format!("{:?}", primitive),
+            })),
+            WsCreateError::Kernel(_) => None,
+        }
+    }
+}
+
+/// Read a dimension the primitive cannot be built without.
+fn required_dimension(
+    parameters: &shared_types::ShapeParameters,
+    primitive: &PrimitiveType,
+    parameter: &'static str,
+) -> Result<f64, WsCreateError> {
+    parameters
+        .params
+        .get(parameter)
+        .copied()
+        .ok_or_else(|| WsCreateError::MissingParameter {
+            primitive: primitive.clone(),
+            parameter,
+        })
+}
+
+/// Build the primitive a WebSocket create command asked for.
+///
+/// The single kernel-dispatch point behind the `VoiceCommand::Create`
+/// and `VoiceCommand::ActivatePartMaturityWorkflow` arms. Returns the
+/// shape name that goes on the wire alongside the geometry id.
+///
+/// Every `PrimitiveType` the kernel has a builder for is wired here —
+/// box, sphere, cylinder, cone, torus. A primitive is refused only when
+/// the kernel genuinely cannot construct it (Gear, Bracket, Parametric,
+/// the curve/surface variants); refusing one the kernel CAN build is as
+/// dishonest as substituting a different solid for it.
+pub(crate) fn build_ws_primitive(
+    builder: &mut TopologyBuilder<'_>,
+    primitive: &PrimitiveType,
+    parameters: &shared_types::ShapeParameters,
+) -> Result<(&'static str, LocalGeometryId), WsCreateError> {
+    match primitive {
+        PrimitiveType::Box => {
+            let width = required_dimension(parameters, primitive, "width")?;
+            let height = required_dimension(parameters, primitive, "height")?;
+            let depth = required_dimension(parameters, primitive, "depth")?;
+            builder
+                .create_box_3d(width, height, depth)
+                .map(|id| ("box", id))
+                .map_err(WsCreateError::Kernel)
+        }
+        PrimitiveType::Sphere => {
+            let radius = required_dimension(parameters, primitive, "radius")?;
+            builder
+                .create_sphere_3d(geometry_engine::math::Point3::ZERO, radius)
+                .map(|id| ("sphere", id))
+                .map_err(WsCreateError::Kernel)
+        }
+        PrimitiveType::Cylinder => {
+            let radius = required_dimension(parameters, primitive, "radius")?;
+            let height = required_dimension(parameters, primitive, "height")?;
+            builder
+                .create_cylinder_3d(
+                    geometry_engine::math::Point3::ZERO,
+                    geometry_engine::math::Vector3::Z,
+                    radius,
+                    height,
+                )
+                .map(|id| ("cylinder", id))
+                .map_err(WsCreateError::Kernel)
+        }
+        PrimitiveType::Cone => {
+            let radius = required_dimension(parameters, primitive, "radius")?;
+            let height = required_dimension(parameters, primitive, "height")?;
+            // `top_radius` is optional and defaults to a POINTED cone —
+            // that is the shape the word "cone" names, not a substitute
+            // for a dimension the caller withheld. Supplying it builds a
+            // frustum.
+            let top_radius = parameters.params.get("top_radius").copied().unwrap_or(0.0);
+            builder
+                .create_cone_3d(
+                    geometry_engine::math::Point3::ZERO,
+                    geometry_engine::math::Vector3::Z,
+                    radius,
+                    top_radius,
+                    height,
+                )
+                .map(|id| ("cone", id))
+                .map_err(WsCreateError::Kernel)
+        }
+        PrimitiveType::Torus => {
+            // Both radii are required. The kernel rejects
+            // `minor_radius >= major_radius` (a self-intersecting torus)
+            // on its own, so that check is not duplicated here — its
+            // `PrimitiveError` travels out as `WsCreateError::Kernel`.
+            let major_radius = required_dimension(parameters, primitive, "major_radius")?;
+            let minor_radius = required_dimension(parameters, primitive, "minor_radius")?;
+            builder
+                .create_torus_3d(
+                    geometry_engine::math::Point3::ZERO,
+                    geometry_engine::math::Vector3::Z,
+                    major_radius,
+                    minor_radius,
+                )
+                .map(|id| ("torus", id))
+                .map_err(WsCreateError::Kernel)
+        }
+        other => Err(WsCreateError::UnsupportedPrimitive {
+            primitive: other.clone(),
+        }),
+    }
+}
+
+/// One outgoing frame. The create path emits both `ServerMessage`s
+/// (request-correlated protocol replies) and `WebSocketMessage`s
+/// (broadcast-shaped notifications) and their ORDER on the wire is part
+/// of the contract, so they travel in one ordered list.
+pub(crate) enum WsFrame {
+    Protocol(ServerMessage),
+    Notification(WebSocketMessage),
+}
+
+impl WsFrame {
+    fn to_json(&self) -> Result<String, serde_json::Error> {
+        match self {
+            WsFrame::Protocol(m) => serde_json::to_string(m),
+            WsFrame::Notification(m) => serde_json::to_string(m),
+        }
+    }
+}
+
+/// Every frame the `VoiceCommand::Create` arm sends for one create
+/// request, in wire order.
+pub(crate) fn ws_create_frames(
+    state: &AppState,
+    result: Result<(&'static str, LocalGeometryId), WsCreateError>,
+    primitive: &PrimitiveType,
+    request_id: &Option<String>,
+) -> Vec<WsFrame> {
+    match result {
+        Ok((shape_name, LocalGeometryId::Solid(solid_id))) => {
+            // `results` is a `Vec<ObjectId>` (UUID) while `object_id` on
+            // the GeometryCreated frame is the kernel-local id, so the
+            // two name the same solid through the AppState id_mapping —
+            // NOT through a fresh UUID minted for the response, which
+            // resolved to nothing and made the reply unfollowable. Kernel
+            // ids are recycled across workspace resets, so any stale row
+            // for this local id is dropped first (the timeline replay
+            // path in `handlers::timeline` does the same) before one
+            // UUID is registered and reported.
+            if let Some(stale) = state.get_uuid(solid_id) {
+                state.unregister_id_mapping(&stale);
+            }
+            let object_uuid = state.create_uuid_for_local(solid_id);
+            vec![
+                WsFrame::Protocol(ServerMessage::AIResponse {
+                    response: crate::protocol::protocol::AIResponse::CommandExecuted {
+                        command: format!("create_{}", shape_name),
+                        results: vec![object_uuid],
+                    },
+                    request_id: request_id.clone(),
+                }),
+                WsFrame::Notification(WebSocketMessage::GeometryCreated {
+                    object_id: solid_id,
+                    shape_type: shape_name.to_string(),
+                    created_by: "AI".to_string(),
+                }),
+                WsFrame::Protocol(ServerMessage::Success {
+                    result: Some(serde_json::json!({
+                        "message": "Geometry created successfully",
+                        "type": "primitive",
+                        "primitive_type": format!("{:?}", primitive)
+                    })),
+                    request_id: request_id.clone(),
+                }),
+            ]
+        }
+        // A refusal is ONE frame. The arm used to send its
+        // "Geometry created successfully" Success unconditionally,
+        // AFTER the error — so every refusal was immediately
+        // contradicted by a success on the same socket.
+        Ok(_) => vec![WsFrame::Protocol(ServerMessage::Error {
+            error_code: "INVALID_GEOMETRY".to_string(),
+            message: "Created geometry was not a solid".to_string(),
+            details: None,
+            request_id: request_id.clone(),
+        })],
+        Err(e) => vec![WsFrame::Protocol(ServerMessage::Error {
+            error_code: e.error_code().to_string(),
+            message: format!("Failed to create geometry: {}", e),
+            details: e.details(),
+            request_id: request_id.clone(),
+        })],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3471,5 +3613,411 @@ mod tests {
             other => panic!("expected Operation::Generic, got {:?}", other),
         };
         assert_eq!(origin["channel"], "websocket");
+    }
+
+    // ── The WebSocket create command must not lie about what it built ──
+    //
+    // These four pin `build_ws_primitive` and `ws_create_frames`, the two
+    // functions the `VoiceCommand::Create` arm actually calls (the arm is
+    // otherwise unreachable from a unit test: it sits behind a live socket
+    // AND a live LLM round-trip through `state.ai_processor`).
+
+    fn shape_params(pairs: &[(&str, f64)]) -> shared_types::ShapeParameters {
+        shared_types::ShapeParameters {
+            params: pairs.iter().map(|(k, v)| ((*k).to_string(), *v)).collect(),
+        }
+    }
+
+    /// The distinct surface types carried by the faces of `solid_id`.
+    fn solid_surface_types(
+        model: &BRepModel,
+        solid_id: SolidId,
+    ) -> Vec<geometry_engine::primitives::surface::SurfaceType> {
+        let solid = model.solids.get(solid_id).expect("solid must exist");
+        let mut kinds = Vec::new();
+        for &shell_id in std::iter::once(&solid.outer_shell)
+            .chain(solid.inner_shells.iter())
+            .chain(solid.peer_shells.iter())
+        {
+            if let Some(shell) = model.shells.get(shell_id) {
+                for &face_id in &shell.faces {
+                    if let Some(face) = model.faces.get(face_id) {
+                        if let Some(surface) = model.surfaces.get(face.surface_id) {
+                            let kind = surface.surface_type();
+                            if !kinds.contains(&kind) {
+                                kinds.push(kind);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        kinds
+    }
+
+    /// Disconnection gate for this fix: the two helpers above are only
+    /// worth testing if the CONNECTION HANDLER is what calls them. A
+    /// future edit that inlines a match back into either AI create arm —
+    /// or reintroduces a response-body `Uuid::new_v4()` into the frame
+    /// builder — would leave the four behaviour tests green while the
+    /// live socket went back to lying. This asserts the production call
+    /// sites by source, which is the only handle a unit test has on an
+    /// arm that sits behind both a live socket and a live LLM.
+    #[test]
+    fn ws_create_arms_dispatch_through_the_pinned_helpers() {
+        // Only PRODUCTION source is scanned — this test's own body is
+        // part of the file and would otherwise match its own needles.
+        let production = include_str!("message_handlers.rs")
+            .split("\n#[cfg(test)]")
+            .next()
+            .expect("split always yields a first element");
+
+        assert_eq!(
+            production
+                .matches("build_ws_primitive(&mut builder, &primitive, &parameters)")
+                .count(),
+            2,
+            "both AI create arms (Create and ActivatePartMaturityWorkflow) must \
+             dispatch through build_ws_primitive"
+        );
+        assert!(
+            production
+                .contains("for frame in ws_create_frames(&state, result, &primitive, &request_id)"),
+            "the Create arm must send exactly the frames ws_create_frames decides"
+        );
+
+        // Scope the scan to the frame builder's own body: no id in a
+        // response may be minted rather than resolved.
+        let frames_body = production
+            .split("pub(crate) fn ws_create_frames(")
+            .nth(1)
+            .expect("ws_create_frames must exist");
+        assert!(
+            !frames_body.contains("Uuid::new_v4"),
+            "a response body must carry the registered id for the solid, never a fresh UUID"
+        );
+    }
+
+    /// A create request naming `Cone` must produce a solid with a CONICAL
+    /// face. Before the fix the arm called `create_cylinder_3d` and stuck
+    /// the label "cone" on the result — the kernel has had
+    /// `create_cone_3d` since long before.
+    #[test]
+    fn ws_create_cone_does_not_build_a_cylinder() {
+        use geometry_engine::primitives::surface::SurfaceType;
+
+        let mut model = BRepModel::new();
+        let params = shape_params(&[("radius", 4.0), ("height", 12.0)]);
+        let (shape_name, geometry_id) = {
+            let mut builder = TopologyBuilder::new(&mut model);
+            build_ws_primitive(&mut builder, &PrimitiveType::Cone, &params)
+                .expect("the kernel has a cone builder; a fully-dimensioned cone must build")
+        };
+        assert_eq!(shape_name, "cone");
+        let solid_id = match geometry_id {
+            LocalGeometryId::Solid(id) => id,
+            other => panic!("expected a solid, got {:?}", other),
+        };
+
+        let kinds = solid_surface_types(&model, solid_id);
+        assert!(
+            kinds.contains(&SurfaceType::Cone),
+            "a solid labelled \"cone\" must carry a conical face; surfaces were {:?}",
+            kinds
+        );
+        assert!(
+            !kinds.contains(&SurfaceType::Cylinder),
+            "a solid labelled \"cone\" must not be a cylinder; surfaces were {:?}",
+            kinds
+        );
+    }
+
+    /// A primitive with no builder on this surface is refused BY NAME, in
+    /// exactly one frame. Before the fix ANY primitive past cone — `Gear`
+    /// included — silently became a radius-5 sphere and the caller was
+    /// told the create succeeded. `Gear` is used here rather than `Torus`
+    /// because the kernel HAS a torus builder and this arm now calls it;
+    /// the refusal must be measured on a primitive the kernel genuinely
+    /// cannot build, or the test proves nothing about refusal.
+    #[tokio::test]
+    async fn ws_create_unknown_primitive_refuses() {
+        let state = crate::router_integration_tests::make_test_state().await;
+        let params = shape_params(&[("radius", 20.0), ("teeth", 24.0)]);
+        let before = state.model.read().await.solids.len();
+
+        let result = {
+            let mut model = state.model.write().await;
+            let mut builder = TopologyBuilder::new(&mut model);
+            build_ws_primitive(&mut builder, &PrimitiveType::Gear, &params)
+        };
+        let frames = ws_create_frames(
+            &state,
+            result,
+            &PrimitiveType::Gear,
+            &Some("req-gear".to_string()),
+        );
+
+        assert_eq!(
+            frames.len(),
+            1,
+            "a refusal is ONE frame: no GeometryCreated, no trailing success"
+        );
+        match frames.first().expect("the refusal frame") {
+            WsFrame::Protocol(ServerMessage::Error {
+                error_code,
+                message,
+                details,
+                ..
+            }) => {
+                assert_eq!(error_code, "UNSUPPORTED_PRIMITIVE");
+                assert!(
+                    message.contains("Gear"),
+                    "the refusal must name the primitive; message was {:?}",
+                    message
+                );
+                assert_eq!(
+                    details
+                        .as_ref()
+                        .and_then(|d| d.get("primitive"))
+                        .and_then(|p| p.as_str()),
+                    Some("Gear")
+                );
+            }
+            WsFrame::Protocol(_) => panic!("expected a typed Error frame"),
+            WsFrame::Notification(_) => {
+                panic!("a refused create must emit no GeometryCreated notification")
+            }
+        }
+        assert_eq!(
+            state.model.read().await.solids.len(),
+            before,
+            "a refused create must leave no solid behind"
+        );
+    }
+
+    /// The kernel has `create_torus_3d`, so a create request naming
+    /// `Torus` must BUILD one — a refusal for a capability the kernel
+    /// holds is as dishonest as a substitution. The solid must carry a
+    /// toroidal face, and the id the response reports must resolve to it.
+    #[tokio::test]
+    async fn ws_create_torus_builds_a_torus() {
+        use geometry_engine::primitives::surface::SurfaceType;
+
+        let state = crate::router_integration_tests::make_test_state().await;
+        let params = shape_params(&[("major_radius", 20.0), ("minor_radius", 4.0)]);
+
+        let result = {
+            let mut model = state.model.write().await;
+            let mut builder = TopologyBuilder::new(&mut model);
+            build_ws_primitive(&mut builder, &PrimitiveType::Torus, &params)
+        };
+        let (shape_name, solid_id) = match &result {
+            Ok((name, LocalGeometryId::Solid(id))) => (*name, *id),
+            Ok((_, other)) => panic!("expected a solid, got {:?}", other),
+            Err(e) => panic!("the kernel has a torus builder; got a refusal: {}", e),
+        };
+        assert_eq!(shape_name, "torus");
+
+        let kinds = {
+            let model = state.model.read().await;
+            solid_surface_types(&model, solid_id)
+        };
+        assert!(
+            kinds.contains(&SurfaceType::Torus),
+            "a solid labelled \"torus\" must carry a toroidal face; surfaces were {:?}",
+            kinds
+        );
+
+        let frames = ws_create_frames(
+            &state,
+            result,
+            &PrimitiveType::Torus,
+            &Some("req-torus".to_string()),
+        );
+        assert_eq!(
+            frames.len(),
+            3,
+            "a successful create is CommandExecuted + GeometryCreated + Success"
+        );
+        let reported = match frames.first().expect("the CommandExecuted frame") {
+            WsFrame::Protocol(ServerMessage::AIResponse {
+                response:
+                    crate::protocol::protocol::AIResponse::CommandExecuted { command, results },
+                ..
+            }) => {
+                assert_eq!(command, "create_torus");
+                *results.first().expect("one reported id")
+            }
+            _ => panic!("the first frame must be the CommandExecuted reply"),
+        };
+        assert_eq!(
+            state.get_local_id(&reported),
+            Some(solid_id),
+            "the id the response reports must resolve to the torus it created"
+        );
+    }
+
+    /// `major_radius` and `minor_radius` are as required for a torus as
+    /// `depth` is for a box — a missing one is the same typed refusal,
+    /// never a default standing in for a dimension nobody supplied.
+    #[tokio::test]
+    async fn ws_create_torus_missing_minor_radius_refuses() {
+        let state = crate::router_integration_tests::make_test_state().await;
+        let params = shape_params(&[("major_radius", 20.0)]);
+        let before = state.model.read().await.solids.len();
+
+        let result = {
+            let mut model = state.model.write().await;
+            let mut builder = TopologyBuilder::new(&mut model);
+            build_ws_primitive(&mut builder, &PrimitiveType::Torus, &params)
+        };
+        let frames = ws_create_frames(
+            &state,
+            result,
+            &PrimitiveType::Torus,
+            &Some("req-torus".to_string()),
+        );
+
+        assert_eq!(frames.len(), 1, "a refusal is ONE frame");
+        match frames.first().expect("the refusal frame") {
+            WsFrame::Protocol(ServerMessage::Error {
+                error_code,
+                message,
+                details,
+                ..
+            }) => {
+                assert_eq!(error_code, "MISSING_PARAMETER");
+                assert!(
+                    message.contains("minor_radius"),
+                    "the refusal must name the missing parameter; message was {:?}",
+                    message
+                );
+                assert_eq!(
+                    details
+                        .as_ref()
+                        .and_then(|d| d.get("parameter"))
+                        .and_then(|p| p.as_str()),
+                    Some("minor_radius")
+                );
+            }
+            WsFrame::Protocol(_) => panic!("expected a typed Error frame"),
+            WsFrame::Notification(_) => {
+                panic!("a refused create must emit no GeometryCreated notification")
+            }
+        }
+        assert_eq!(
+            state.model.read().await.solids.len(),
+            before,
+            "a refused create must leave no solid behind"
+        );
+    }
+
+    /// A dimension the primitive cannot be built without is never
+    /// defaulted. Before the fix a box with no `depth` was built 10.0
+    /// deep and reported as the box the caller asked for.
+    #[tokio::test]
+    async fn ws_create_missing_dimension_refuses() {
+        let state = crate::router_integration_tests::make_test_state().await;
+        let params = shape_params(&[("width", 10.0), ("height", 20.0)]);
+        let before = state.model.read().await.solids.len();
+
+        let result = {
+            let mut model = state.model.write().await;
+            let mut builder = TopologyBuilder::new(&mut model);
+            build_ws_primitive(&mut builder, &PrimitiveType::Box, &params)
+        };
+        let frames = ws_create_frames(
+            &state,
+            result,
+            &PrimitiveType::Box,
+            &Some("req-box".to_string()),
+        );
+
+        assert_eq!(frames.len(), 1, "a refusal is ONE frame");
+        match frames.first().expect("the refusal frame") {
+            WsFrame::Protocol(ServerMessage::Error {
+                error_code,
+                message,
+                details,
+                ..
+            }) => {
+                assert_eq!(error_code, "MISSING_PARAMETER");
+                assert!(
+                    message.contains("depth"),
+                    "the refusal must name the missing parameter; message was {:?}",
+                    message
+                );
+                assert_eq!(
+                    details
+                        .as_ref()
+                        .and_then(|d| d.get("parameter"))
+                        .and_then(|p| p.as_str()),
+                    Some("depth")
+                );
+            }
+            WsFrame::Protocol(_) => panic!("expected a typed Error frame"),
+            WsFrame::Notification(_) => {
+                panic!("a refused create must emit no GeometryCreated notification")
+            }
+        }
+        assert_eq!(
+            state.model.read().await.solids.len(),
+            before,
+            "a refused create must leave no solid behind"
+        );
+    }
+
+    /// The id the `CommandExecuted` reply reports must be the id the
+    /// GeometryCreated notification beside it names. `results` is a
+    /// `Vec<ObjectId>` (UUID) and `object_id` is the kernel-local id, so
+    /// they are tied through the AppState id_mapping. Before the fix
+    /// `results` carried a fresh `Uuid::new_v4()` that resolved to
+    /// nothing at all.
+    #[tokio::test]
+    async fn ws_create_response_id_matches_created_solid() {
+        let state = crate::router_integration_tests::make_test_state().await;
+        let params = shape_params(&[("width", 10.0), ("height", 20.0), ("depth", 30.0)]);
+
+        let result = {
+            let mut model = state.model.write().await;
+            let mut builder = TopologyBuilder::new(&mut model);
+            build_ws_primitive(&mut builder, &PrimitiveType::Box, &params)
+        };
+        let frames = ws_create_frames(
+            &state,
+            result,
+            &PrimitiveType::Box,
+            &Some("req-box".to_string()),
+        );
+
+        assert_eq!(
+            frames.len(),
+            3,
+            "a successful create is CommandExecuted + GeometryCreated + Success"
+        );
+        let reported = match frames.first().expect("the CommandExecuted frame") {
+            WsFrame::Protocol(ServerMessage::AIResponse {
+                response:
+                    crate::protocol::protocol::AIResponse::CommandExecuted { command, results },
+                ..
+            }) => {
+                assert_eq!(command, "create_box");
+                assert_eq!(results.len(), 1, "one solid was created, one id reported");
+                *results.first().expect("one reported id")
+            }
+            _ => panic!("the first frame must be the CommandExecuted reply"),
+        };
+        let created = match frames.get(1).expect("the GeometryCreated frame") {
+            WsFrame::Notification(WebSocketMessage::GeometryCreated { object_id, .. }) => {
+                *object_id
+            }
+            _ => panic!("the second frame must be the GeometryCreated notification"),
+        };
+
+        assert_eq!(
+            state.get_local_id(&reported),
+            Some(created),
+            "the id the response reports must resolve to the solid the same frame created"
+        );
     }
 }
