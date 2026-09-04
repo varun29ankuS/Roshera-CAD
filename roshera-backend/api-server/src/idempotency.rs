@@ -9,10 +9,15 @@
 //! agent's mental model in a way that is almost impossible to debug
 //! after the fact.
 //!
-//! This module implements `Idempotency-Key`-keyed response caching for
+//! This module implements `Idempotency-Key`-scoped response caching for
 //! every mutating route, following the IETF draft
 //! "draft-ietf-httpapi-idempotency-key-header" with two pragmatic
 //! deviations:
+//!
+//! The header value is a *component* of the cache key, never the key
+//! itself: it is a client-chosen opaque string, so the entry is scoped
+//! to `(principal, method, path-and-query, header value)` — see
+//! [`CacheKey`].
 //!
 //! 1. **Bodies are fingerprinted, not just keys.** When the same key is
 //!    seen twice with a different request body the server replies with
@@ -30,6 +35,7 @@
 //! for this layer. When that changes, swap `IdempotencyStore`'s inner
 //! `DashMap` for a Redis-backed store; the public API does not move.
 
+use crate::auth_middleware::AuthInfo;
 use crate::error_catalog::{ApiError, ErrorCode};
 use axum::{
     body::{to_bytes, Body, Bytes},
@@ -93,7 +99,57 @@ const DEFAULT_MAX_ENTRIES: usize = 50_000;
 const RETAIN_NUM: usize = 4;
 const RETAIN_DEN: usize = 5;
 
-/// One cached HTTP response, indexed by `Idempotency-Key`. Stored
+/// Who is retrying. An `Idempotency-Key` is opaque and client-chosen,
+/// so two unrelated callers routinely pick the same string; without
+/// this component of the key, the second caller reads the first
+/// caller's response body verbatim and never reaches the kernel.
+///
+/// [`Principal::Anonymous`] is a variant rather than a reserved user-id
+/// string precisely so it cannot be impersonated: no value of
+/// `AuthInfo::user_id` can alias it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum Principal {
+    /// An authenticated caller, identified by `AuthInfo::user_id`. Two
+    /// credentials for the same user (a JWT and an API key) are the
+    /// same principal on purpose — a retry that swaps transport is
+    /// still the same command from the same caller.
+    User(String),
+    /// No `AuthInfo` in request extensions. Reachable on routes the
+    /// auth layer exempts; those requests share one anonymous scope,
+    /// still separated from each other by method and path.
+    Anonymous,
+}
+
+/// What an `Idempotency-Key` actually names.
+///
+/// The client key alone is NOT an identity: it is a client-chosen
+/// opaque string whose uniqueness is guaranteed only within whatever
+/// scope that client had in mind. Keying the cache on it alone lets one
+/// request's response answer a completely different request — a key
+/// reused across routes replays `POST /api/timeline/checkpoint`'s 201
+/// in answer to `POST /api/assemblies/{id}/solve`, and the solve never
+/// runs while the agent is told it did.
+///
+/// The key is therefore the four facts that together identify one
+/// command: **who** asked ([`Principal`]), **what** they asked
+/// (`method` + `target`), and **which attempt** it is (`client_key`).
+///
+/// `target` is the request target — `Uri::path_and_query()`, so the
+/// query string is **inside** the key. A query parameter changes what a
+/// mutating call does (`POST /x?mode=a` is not `POST /x?mode=b`), the
+/// route matcher ignores it, and the body fingerprint hashes the body
+/// alone and so does not cover it either. Were the query excluded, the
+/// cache key would be the only thing that could tell those two calls
+/// apart, and it would say they are the same.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct CacheKey {
+    principal: Principal,
+    method: Method,
+    target: String,
+    client_key: String,
+}
+
+/// One cached HTTP response, indexed by [`CacheKey`]. Stored
 /// fully materialised (status + headers we care about + body) so a
 /// replay is a single map lookup followed by a clone — no async work,
 /// no kernel re-entry.
@@ -115,7 +171,7 @@ struct CachedResponse {
     inserted_at: Instant,
 }
 
-/// Concurrent, in-memory store of `Idempotency-Key` → cached response.
+/// Concurrent, in-memory store of [`CacheKey`] → cached response.
 ///
 /// Cloning is cheap (`Arc<DashMap>`), so a single instance is shared
 /// across the whole `AppState`. Eviction is two-tier:
@@ -129,7 +185,7 @@ struct CachedResponse {
 ///    amortised steady-state insert cost.
 #[derive(Debug)]
 pub struct IdempotencyStore {
-    entries: DashMap<String, CachedResponse>,
+    entries: DashMap<CacheKey, CachedResponse>,
     max_entries: usize,
     /// Time-to-live for cached entries. Defaults to `CACHE_TTL` in
     /// production; tests use a short value so the sweep path can be
@@ -186,7 +242,7 @@ impl IdempotencyStore {
     /// Look up a key. Returns the cached entry only if it has not
     /// expired; expired entries are dropped on the way out so the
     /// cache stays bounded under steady-state agent traffic.
-    fn get(&self, key: &str) -> Option<CachedResponse> {
+    fn get(&self, key: &CacheKey) -> Option<CachedResponse> {
         let now = Instant::now();
         let cached = self.entries.get(key).map(|e| e.value().clone());
         if let Some(ref c) = cached {
@@ -202,7 +258,7 @@ impl IdempotencyStore {
     /// happened to share the key. When the cap is reached this kicks
     /// off a sweep (see `sweep_for_capacity`) so the cache size stays
     /// bounded even when every agent emits a fresh UUID per command.
-    fn insert(&self, key: String, value: CachedResponse) {
+    fn insert(&self, key: CacheKey, value: CachedResponse) {
         if self.entries.len() >= self.max_entries {
             self.sweep_for_capacity();
         }
@@ -225,7 +281,7 @@ impl IdempotencyStore {
     /// the per-shard locks on contention).
     fn sweep_for_capacity(&self) {
         let now = Instant::now();
-        let expired: Vec<String> = self
+        let expired: Vec<CacheKey> = self
             .entries
             .iter()
             .filter(|e| now.duration_since(e.value().inserted_at) > self.ttl)
@@ -245,7 +301,7 @@ impl IdempotencyStore {
             .max_entries
             .saturating_mul(RETAIN_NUM)
             .saturating_div(RETAIN_DEN.max(1));
-        let mut by_age: Vec<(String, Instant)> = self
+        let mut by_age: Vec<(CacheKey, Instant)> = self
             .entries
             .iter()
             .map(|e| (e.key().clone(), e.value().inserted_at))
@@ -302,6 +358,10 @@ fn is_mutating(method: &Method) -> bool {
 /// Behavioural contract:
 /// - No `Idempotency-Key` header → pass through, no caching.
 /// - Non-mutating method → pass through, no caching.
+/// - The cache is keyed on [`CacheKey`], not on the header alone: the
+///   same header value seen from a different principal, method, path or
+///   query string is a different command and MISSES, so it is served
+///   fresh rather than answered with an unrelated response.
 /// - Key present + cache hit + matching body → replay cached response
 ///   with `Idempotency-Replayed: true`.
 /// - Key present + cache hit + different body → `409 CONFLICT` with
@@ -330,7 +390,7 @@ pub async fn idempotency_layer(
         .get(HeaderName::from_static(IDEMPOTENCY_KEY_HEADER))
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
-    let key = match raw_key {
+    let client_key = match raw_key {
         None => return next.run(request).await,
         Some(s) if s.is_empty() => {
             return ApiError::new(
@@ -347,6 +407,34 @@ pub async fn idempotency_layer(
             .into_response();
         }
         Some(s) => s,
+    };
+
+    // Scope the client's opaque key to the command it actually names.
+    // The auth layer is mounted OUTSIDE this one (`main.rs`: auth ->
+    // rate_limit -> idempotency), so on any non-exempt route the
+    // `AuthInfo` extension is already present; an exempt route lands on
+    // `Principal::Anonymous` and is still separated by method and
+    // target. Read before `into_parts()` consumes the request.
+    //
+    // `path_and_query()` keeps the query string in the key. It is
+    // `None` only for a URI carrying no path component at all (the
+    // authority form a CONNECT uses, which never reaches an axum
+    // route); falling back to `path()` there keeps the key well-formed
+    // without inventing a target the request did not carry.
+    let uri = request.uri();
+    let target = uri
+        .path_and_query()
+        .map(|pq| pq.as_str().to_string())
+        .unwrap_or_else(|| uri.path().to_string());
+    let key = CacheKey {
+        principal: request
+            .extensions()
+            .get::<AuthInfo>()
+            .map(|info| Principal::User(info.user_id.clone()))
+            .unwrap_or(Principal::Anonymous),
+        method: request.method().clone(),
+        target,
+        client_key,
     };
 
     // Buffer the body so we can fingerprint it AND replay it into the
@@ -455,9 +543,52 @@ fn replay(cached: CachedResponse) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth_middleware::AuthInfo;
     use axum::{routing::post, Router};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tower::ServiceExt;
+
+    /// Build a `POST /echo` carrying the `AuthInfo` extension that the
+    /// global `auth_middleware` would already have inserted by the time
+    /// this layer runs — the auth layer is mounted OUTSIDE idempotency
+    /// (`main.rs`: auth -> rate_limit -> idempotency), so on a real
+    /// request the extension is always there before we look.
+    fn request_as(user_id: &str, key: &'static str, body: &'static str) -> Request {
+        request_to(user_id, "/echo", key, body)
+    }
+
+    /// `request_as` with an explicit target, so a test can vary the path
+    /// or the query string while holding the principal, key and body
+    /// fixed.
+    fn request_to(user_id: &str, uri: &str, key: &'static str, body: &'static str) -> Request {
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri(uri)
+            .header(IDEMPOTENCY_KEY_HEADER, key)
+            .body(Body::from(body))
+            .unwrap();
+        req.extensions_mut().insert(AuthInfo {
+            user_id: user_id.to_string(),
+            session_id: None,
+            permissions: vec![],
+            roles: vec![],
+            is_api_key: false,
+            principal: session_manager::PrincipalKind::Human,
+        });
+        req
+    }
+
+    /// A cache key for the store-level eviction tests, which exercise
+    /// capacity and TTL rather than scoping: one anonymous principal on
+    /// one route, varying only the client-supplied key.
+    fn cache_key(client_key: &str) -> CacheKey {
+        CacheKey {
+            principal: Principal::Anonymous,
+            method: Method::POST,
+            target: "/echo".to_string(),
+            client_key: client_key.to_string(),
+        }
+    }
 
     /// Counter handler: returns the call count as JSON. Used to prove
     /// the inner handler is (or is not) invoked on replay.
@@ -550,6 +681,165 @@ mod tests {
             counter.load(Ordering::SeqCst),
             1,
             "inner handler must run exactly once across two retries"
+        );
+    }
+
+    /// An idempotency key scopes ONE command on ONE route. Reusing it
+    /// on a different path — the exact bug an agent hits when its
+    /// planner mints one key per *turn* rather than per *command* —
+    /// must miss the cache and execute the second route for real.
+    /// Replaying `POST /api/timeline/checkpoint`'s 201 in answer to
+    /// `POST /api/assemblies/{id}/solve` would tell the agent the solve
+    /// ran when it never did: the kernel lying by omission.
+    #[tokio::test]
+    async fn different_route_same_key_same_body_must_not_replay() {
+        let store = Arc::new(IdempotencyStore::new());
+        let counter = Arc::new(AtomicUsize::new(0));
+
+        async fn handler(
+            axum::extract::State(c): axum::extract::State<Arc<AtomicUsize>>,
+            body: String,
+        ) -> Response {
+            let n = c.fetch_add(1, Ordering::SeqCst) + 1;
+            (
+                StatusCode::OK,
+                axum::Json(serde_json::json!({ "calls": n, "echo": body })),
+            )
+                .into_response()
+        }
+
+        let app = Router::new()
+            .route("/checkpoint", post(handler))
+            .route("/solve", post(handler))
+            .with_state(counter.clone())
+            .layer(axum::middleware::from_fn_with_state(
+                store.clone(),
+                idempotency_layer,
+            ));
+
+        let mk = |uri: &'static str| {
+            Request::builder()
+                .method(Method::POST)
+                .uri(uri)
+                .header(IDEMPOTENCY_KEY_HEADER, "k1")
+                .body(Body::from("{}"))
+                .unwrap()
+        };
+
+        let r1 = app.clone().oneshot(mk("/checkpoint")).await.unwrap();
+        assert_eq!(r1.status(), StatusCode::OK);
+
+        let r2 = app.oneshot(mk("/solve")).await.unwrap();
+        assert_eq!(r2.status(), StatusCode::OK);
+        assert!(
+            r2.headers().get(IDEMPOTENCY_REPLAYED_HEADER).is_none(),
+            "a key reused on a different path must MISS, not replay the \
+             first route's response"
+        );
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            2,
+            "the second route's handler must actually run"
+        );
+    }
+
+    /// A query string is part of what a mutating call asks for, so
+    /// `POST /echo?mode=a` and `POST /echo?mode=b` are two different
+    /// operations even from the same principal with the same body. The
+    /// route matcher ignores the query, so both land on one handler and
+    /// only the cache key can tell them apart.
+    #[tokio::test]
+    async fn different_query_same_key_same_body_must_not_replay() {
+        let store = Arc::new(IdempotencyStore::new());
+        let counter = Arc::new(AtomicUsize::new(0));
+        let app = counter_app(store.clone(), counter.clone());
+
+        let r1 = app
+            .clone()
+            .oneshot(request_to("user-a", "/echo?mode=a", "k1", "{}"))
+            .await
+            .unwrap();
+        assert_eq!(r1.status(), StatusCode::OK);
+
+        let r2 = app
+            .oneshot(request_to("user-a", "/echo?mode=b", "k1", "{}"))
+            .await
+            .unwrap();
+        assert_eq!(r2.status(), StatusCode::OK);
+        assert!(
+            r2.headers().get(IDEMPOTENCY_REPLAYED_HEADER).is_none(),
+            "a key reused with a different query string must MISS — the \
+             body fingerprint does not cover the query, so nothing else \
+             would catch it"
+        );
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            2,
+            "the second query must execute the handler for real"
+        );
+    }
+
+    /// The same key from two different principals is two different
+    /// commands. Replaying user A's response to user B is both a wrong
+    /// answer and a cross-tenant data leak: B reads A's response body
+    /// verbatim without ever touching the kernel.
+    #[tokio::test]
+    async fn different_principal_same_key_must_not_replay() {
+        let store = Arc::new(IdempotencyStore::new());
+        let counter = Arc::new(AtomicUsize::new(0));
+        let app = counter_app(store.clone(), counter.clone());
+
+        let r1 = app
+            .clone()
+            .oneshot(request_as("user-a", "k1", "{}"))
+            .await
+            .unwrap();
+        assert_eq!(r1.status(), StatusCode::OK);
+
+        let r2 = app.oneshot(request_as("user-b", "k1", "{}")).await.unwrap();
+        assert_eq!(r2.status(), StatusCode::OK);
+        assert!(
+            r2.headers().get(IDEMPOTENCY_REPLAYED_HEADER).is_none(),
+            "user B must never receive user A's cached response"
+        );
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            2,
+            "user B's request must execute the handler for real"
+        );
+    }
+
+    /// Control for the two tests above: scoping the key must not break
+    /// the behaviour the layer exists for. Same principal, same route,
+    /// same key, same body → exactly one execution and an explicit
+    /// replay marker on the second call.
+    #[tokio::test]
+    async fn same_principal_same_route_same_key_still_replays() {
+        let store = Arc::new(IdempotencyStore::new());
+        let counter = Arc::new(AtomicUsize::new(0));
+        let app = counter_app(store.clone(), counter.clone());
+
+        let r1 = app
+            .clone()
+            .oneshot(request_as("user-a", "k1", "{}"))
+            .await
+            .unwrap();
+        assert_eq!(r1.status(), StatusCode::OK);
+        assert!(r1.headers().get(IDEMPOTENCY_REPLAYED_HEADER).is_none());
+
+        let r2 = app.oneshot(request_as("user-a", "k1", "{}")).await.unwrap();
+        assert_eq!(r2.status(), StatusCode::OK);
+        assert_eq!(
+            r2.headers()
+                .get(IDEMPOTENCY_REPLAYED_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some("true"),
+            "an authenticated retry of the same command must still replay"
+        );
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "the handler must run exactly once for one principal's retry"
         );
     }
 
@@ -657,7 +947,7 @@ mod tests {
         // deterministic, which would flake the test.
         for i in 0..4 {
             store.insert(
-                format!("k{i}"),
+                cache_key(&format!("k{i}")),
                 CachedResponse {
                     request_fingerprint: i as u64,
                     status: StatusCode::OK,
@@ -674,7 +964,7 @@ mod tests {
         // so force-eviction kicks in: floor = 4 * 4/5 = 3 retained,
         // then the new entry brings len back to 4.
         store.insert(
-            "k4".to_string(),
+            cache_key("k4"),
             CachedResponse {
                 request_fingerprint: 4,
                 status: StatusCode::OK,
@@ -689,11 +979,11 @@ mod tests {
             "at cap, sweep retains the floor and admits the new entry"
         );
         assert!(
-            store.entries.contains_key("k4"),
+            store.entries.contains_key(&cache_key("k4")),
             "the just-inserted entry must survive the sweep"
         );
         assert!(
-            !store.entries.contains_key("k0"),
+            !store.entries.contains_key(&cache_key("k0")),
             "the oldest entry must be the one evicted"
         );
     }
@@ -717,7 +1007,7 @@ mod tests {
         // we sleep past the TTL.
         for i in 0..2 {
             store.entries.insert(
-                format!("stale{i}"),
+                cache_key(&format!("stale{i}")),
                 CachedResponse {
                     request_fingerprint: i as u64,
                     status: StatusCode::OK,
@@ -734,7 +1024,7 @@ mod tests {
         // relative to the now-current `Instant::now()`.
         for i in 0..2 {
             store.entries.insert(
-                format!("live{i}"),
+                cache_key(&format!("live{i}")),
                 CachedResponse {
                     request_fingerprint: 10 + i as u64,
                     status: StatusCode::OK,
@@ -749,7 +1039,7 @@ mod tests {
         // 5th insert: sweep should drop both stale entries, freeing
         // enough room that the force-eviction branch never runs.
         store.insert(
-            "fresh".to_string(),
+            cache_key("fresh"),
             CachedResponse {
                 request_fingerprint: 99,
                 status: StatusCode::OK,
@@ -758,11 +1048,11 @@ mod tests {
                 inserted_at: Instant::now(),
             },
         );
-        assert!(store.entries.contains_key("live0"));
-        assert!(store.entries.contains_key("live1"));
-        assert!(store.entries.contains_key("fresh"));
-        assert!(!store.entries.contains_key("stale0"));
-        assert!(!store.entries.contains_key("stale1"));
+        assert!(store.entries.contains_key(&cache_key("live0")));
+        assert!(store.entries.contains_key(&cache_key("live1")));
+        assert!(store.entries.contains_key(&cache_key("fresh")));
+        assert!(!store.entries.contains_key(&cache_key("stale0")));
+        assert!(!store.entries.contains_key(&cache_key("stale1")));
     }
 
     #[tokio::test]
