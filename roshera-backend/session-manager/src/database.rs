@@ -6,39 +6,163 @@
 use crate::auth::{ApiKey, PrincipalKind, SessionToken};
 use crate::permissions::{Permission, Role, UserPermissions};
 
+/// A persisted authorization cell that could not be decoded.
+///
+/// Authorization state has no honest default: there is no role that is
+/// safely "less than" every other role (`Custom(_)` carries no role-derived
+/// permissions at all, `Commenter` carries two, `Viewer` four — see
+/// `permissions::PermissionManager::role_has_permission`), and an empty
+/// denial set is not a restriction but a blanket un-deny, because
+/// `check_permission` consults denials before anything else. So a row this
+/// module cannot read is refused, never approximated.
+#[derive(Debug, thiserror::Error)]
+enum PermissionDecodeError {
+    /// The `role` cell held a string outside the canonical alphabet.
+    #[error("unrecognised role string in the persisted `role` cell: {0:?}")]
+    UnknownRole(String),
+
+    /// A permission-list cell held a string outside the canonical alphabet.
+    #[error("unrecognised permission string {permission:?} in the persisted `{field}` cell")]
+    UnknownPermission {
+        /// Name of the column the string came from.
+        field: &'static str,
+        /// The string that is not a `Permission`.
+        permission: String,
+    },
+
+    /// A JSON permission-list cell did not decode as a set of permissions.
+    #[error("malformed `{field}` cell: {reason}")]
+    MalformedPermissionCell {
+        /// Name of the column that failed to decode.
+        field: &'static str,
+        /// The underlying serde failure.
+        reason: String,
+    },
+
+    /// A column could not be read out of the row at all.
+    #[error("unreadable `{field}` cell: {reason}")]
+    UnreadableCell {
+        /// Name of the column that could not be read.
+        field: &'static str,
+        /// The underlying sqlx decode failure.
+        reason: String,
+    },
+}
+
+impl From<PermissionDecodeError> for SessionError {
+    fn from(err: PermissionDecodeError) -> Self {
+        SessionError::PersistenceError {
+            reason: format!("Failed to decode persisted permissions: {}", err),
+        }
+    }
+}
+
 /// Parse a role string (the Debug representation of `Role`) back into the enum.
-/// Defaults to the most-restrictive role (`Viewer`) on unrecognised input —
-/// fail-closed is the correct stance for an authorization-relevant decoder.
-fn role_from_str(s: &str) -> Role {
-    match s {
+///
+/// An unrecognised string is a typed decode error
+/// ([`PermissionDecodeError::UnknownRole`]) that every caller propagates — it
+/// is NEVER silently mapped to a role. There is no fail-closed default to map
+/// it to: `Viewer` is not the floor of this lattice (`Commenter` grants two
+/// permissions and `Custom(_)` none, both strictly fewer than `Viewer`'s
+/// four), so substituting `Viewer` for an unreadable cell ESCALATES the
+/// principal on reload. A malformed `Custom(<n>)` discriminant is an error for
+/// the same reason.
+fn role_from_str(s: &str) -> Result<Role, PermissionDecodeError> {
+    Ok(match s {
         "Owner" => Role::Owner,
         "Editor" => Role::Editor,
         "Viewer" => Role::Viewer,
         "Commenter" => Role::Commenter,
         // Custom(u32) is encoded by Debug as "Custom(<n>)" — recognise that
-        // shape and recover the discriminant; fall through to Viewer on a
-        // parse failure so authorization defaults to the least-privileged role.
+        // shape and recover the discriminant.
         other => {
-            if let Some(rest) = other
+            let discriminant = other
                 .strip_prefix("Custom(")
-                .and_then(|s| s.strip_suffix(")"))
-            {
-                if let Ok(n) = rest.parse::<u32>() {
-                    return Role::Custom(n);
-                }
-            }
-            Role::Viewer
+                .and_then(|rest| rest.strip_suffix(")"))
+                .and_then(|rest| rest.parse::<u32>().ok())
+                .ok_or_else(|| PermissionDecodeError::UnknownRole(other.to_string()))?;
+            Role::Custom(discriminant)
         }
-    }
+    })
 }
 
 /// Parse a permission string (the canonical PascalCase wire form) back
-/// into the enum. Returns `None` for unknown variants so callers can
-/// `filter_map` cleanly. A thin wrapper over [`Permission::from_str`] —
-/// the single canonical codec — so this module never carries its own
-/// copy of the variant list to drift out of sync with it.
+/// into the enum, returning `None` for anything outside that alphabet.
+///
+/// A thin wrapper over [`Permission::from_str`] — the single canonical codec —
+/// so this module never carries its own copy of the variant list to drift out
+/// of sync with it. What a caller does with the `None` is the caller's policy,
+/// and the two policies in this module are deliberately different:
+/// [`decode_permission_strings`] turns it into a typed error (used for
+/// `denied_permissions`, where dropping an element GRANTS what was denied),
+/// while the `explicit_permissions` readers still `filter_map` it away
+/// (dropping a grant only ever removes access).
 fn permission_from_str(s: &str) -> Option<Permission> {
     Permission::from_str(s)
+}
+
+/// Decode a `TEXT[]` permission cell (the PostgreSQL encoding) into the set.
+///
+/// Every element must be in the canonical alphabet; an unknown string is a
+/// typed error rather than a dropped element. Used for `denied_permissions`,
+/// where a dropped element is a silently lifted denial.
+fn decode_permission_strings<S: AsRef<str>>(
+    field: &'static str,
+    cells: &[S],
+) -> Result<std::collections::HashSet<Permission>, PermissionDecodeError> {
+    cells
+        .iter()
+        .map(|s| {
+            permission_from_str(s.as_ref()).ok_or_else(|| {
+                PermissionDecodeError::UnknownPermission {
+                    field,
+                    permission: s.as_ref().to_string(),
+                }
+            })
+        })
+        .collect()
+}
+
+/// Read one column out of a `permissions` row, on either backend.
+///
+/// `sqlx::Row::get` PANICS on a cell it cannot decode — that is its documented
+/// contract, and it unwinds inside the library before any decoder in this
+/// module runs, so a single corrupt cell kills the request rather than
+/// returning a refusal. The workspace denies panics in production code and a
+/// hidden library panic is the same defect, so every cell in the permission
+/// readers goes through `try_get` and an unreadable one becomes a typed error
+/// naming the column.
+///
+/// Generic over the row type on purpose: `PostgresDatabase` and
+/// `SqliteDatabase` implement the SAME `DatabasePersistence` methods, so they
+/// must not have different panic contracts for them. One helper means the two
+/// impls cannot drift apart on this again.
+fn row_cell<'r, R, T>(row: &'r R, field: &'static str) -> Result<T, PermissionDecodeError>
+where
+    R: Row,
+    T: sqlx::Decode<'r, <R as Row>::Database> + sqlx::Type<<R as Row>::Database>,
+    &'static str: sqlx::ColumnIndex<R>,
+{
+    row.try_get(field)
+        .map_err(|e| PermissionDecodeError::UnreadableCell {
+            field,
+            reason: e.to_string(),
+        })
+}
+
+/// Decode a JSON permission cell (the SQLite encoding) into the set.
+///
+/// A cell that does not deserialize as a set of `Permission` is a typed error,
+/// never an empty set — an empty `denied_permissions` set is not the
+/// conservative reading of an unreadable cell, it is "nothing is denied".
+fn decode_permission_json(
+    field: &'static str,
+    cell: serde_json::Value,
+) -> Result<std::collections::HashSet<Permission>, PermissionDecodeError> {
+    serde_json::from_value(cell).map_err(|e| PermissionDecodeError::MalformedPermissionCell {
+        field,
+        reason: e.to_string(),
+    })
 }
 
 use async_trait::async_trait;
@@ -1217,28 +1341,27 @@ impl DatabasePersistence for PostgresDatabase {
         // The on-disk encoding is whatever `format!("{:?}", ...)` produces in
         // `save_permissions` above, so the decoder here mirrors the Debug
         // representation of the enums in `permissions.rs`.
-        let role_str: String = row.get("role");
-        let role = role_from_str(&role_str);
+        let role_str: String = row_cell(&row, "role")?;
+        let role = role_from_str(&role_str)?;
 
-        let explicit_perms: Vec<String> = row.get("explicit_permissions");
-        let denied_perms: Vec<String> = row.get("denied_permissions");
+        let explicit_perms: Vec<String> = row_cell(&row, "explicit_permissions")?;
+        let denied_perms: Vec<String> = row_cell(&row, "denied_permissions")?;
 
         let explicit_permissions = explicit_perms
             .iter()
             .filter_map(|s| permission_from_str(s))
             .collect();
-        let denied_permissions = denied_perms
-            .iter()
-            .filter_map(|s| permission_from_str(s))
-            .collect();
+        // Denials decode strictly: a dropped element here is a lifted denial,
+        // and `check_permission` reads denials before anything else.
+        let denied_permissions = decode_permission_strings("denied_permissions", &denied_perms)?;
 
         Ok(UserPermissions {
-            user_id: row.get("user_id"),
+            user_id: row_cell(&row, "user_id")?,
             role,
             explicit_permissions,
             denied_permissions,
-            updated_at: row.get("updated_at"),
-            granted_by: row.get("granted_by"),
+            updated_at: row_cell(&row, "updated_at")?,
+            granted_by: row_cell(&row, "granted_by")?,
         })
     }
 
@@ -1256,38 +1379,31 @@ impl DatabasePersistence for PostgresDatabase {
 
         let permissions = rows
             .into_iter()
-            .map(|row| {
-                let role_str: String = row.get("role");
-                let role = match role_str.as_str() {
-                    "Owner" => Role::Owner,
-                    "Editor" => Role::Editor,
-                    "Viewer" => Role::Viewer,
-                    _ => Role::Viewer,
-                };
+            .map(|row| -> Result<UserPermissions, SessionError> {
+                let role_str: String = row_cell(&row, "role")?;
+                let role = role_from_str(&role_str)?;
 
-                let explicit_perms: Vec<String> = row.get("explicit_permissions");
-                let denied_perms: Vec<String> = row.get("denied_permissions");
+                let explicit_perms: Vec<String> = row_cell(&row, "explicit_permissions")?;
+                let denied_perms: Vec<String> = row_cell(&row, "denied_permissions")?;
 
                 let explicit_permissions = explicit_perms
                     .into_iter()
                     .filter_map(|p| permission_from_str(&p))
                     .collect();
 
-                let denied_permissions = denied_perms
-                    .into_iter()
-                    .filter_map(|p| permission_from_str(&p))
-                    .collect();
+                let denied_permissions =
+                    decode_permission_strings("denied_permissions", &denied_perms)?;
 
-                UserPermissions {
-                    user_id: row.get("user_id"),
+                Ok(UserPermissions {
+                    user_id: row_cell(&row, "user_id")?,
                     role,
                     explicit_permissions,
                     denied_permissions,
-                    updated_at: row.get("updated_at"),
-                    granted_by: row.get("granted_by"),
-                }
+                    updated_at: row_cell(&row, "updated_at")?,
+                    granted_by: row_cell(&row, "granted_by")?,
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>, _>>()?;
 
         Ok(permissions)
     }
@@ -2574,30 +2690,26 @@ impl DatabasePersistence for SqliteDatabase {
                 id: format!("{}/{}", session_id, user_id),
             })?;
 
-        let role_str: String = row.get("role");
-        let role = match role_str.as_str() {
-            "Owner" => Role::Owner,
-            "Editor" => Role::Editor,
-            "Viewer" => Role::Viewer,
-            _ => Role::Viewer,
-        };
+        let role_str: String = row_cell(&row, "role")?;
+        let role = role_from_str(&role_str)?;
 
-        let explicit_perms_json: serde_json::Value = row.get("explicit_permissions");
-        let denied_perms_json: serde_json::Value = row.get("denied_permissions");
+        let explicit_perms_json: serde_json::Value = row_cell(&row, "explicit_permissions")?;
+        let denied_perms_json: serde_json::Value = row_cell(&row, "denied_permissions")?;
 
         let explicit_permissions = serde_json::from_value(explicit_perms_json)
             .unwrap_or_else(|_| std::collections::HashSet::new());
 
-        let denied_permissions = serde_json::from_value(denied_perms_json)
-            .unwrap_or_else(|_| std::collections::HashSet::new());
+        // Denials decode strictly: an empty set is not the conservative
+        // reading of an unreadable cell, it is "nothing is denied".
+        let denied_permissions = decode_permission_json("denied_permissions", denied_perms_json)?;
 
         Ok(UserPermissions {
-            user_id: row.get("user_id"),
+            user_id: row_cell(&row, "user_id")?,
             role,
             explicit_permissions,
             denied_permissions,
-            updated_at: row.get("updated_at"),
-            granted_by: row.get("granted_by"),
+            updated_at: row_cell(&row, "updated_at")?,
+            granted_by: row_cell(&row, "granted_by")?,
         })
     }
 
@@ -2615,34 +2727,30 @@ impl DatabasePersistence for SqliteDatabase {
 
         let permissions = rows
             .into_iter()
-            .map(|row| {
-                let role_str: String = row.get("role");
-                let role = match role_str.as_str() {
-                    "Owner" => Role::Owner,
-                    "Editor" => Role::Editor,
-                    "Viewer" => Role::Viewer,
-                    _ => Role::Viewer,
-                };
+            .map(|row| -> Result<UserPermissions, SessionError> {
+                let role_str: String = row_cell(&row, "role")?;
+                let role = role_from_str(&role_str)?;
 
-                let explicit_perms_json: serde_json::Value = row.get("explicit_permissions");
-                let denied_perms_json: serde_json::Value = row.get("denied_permissions");
+                let explicit_perms_json: serde_json::Value =
+                    row_cell(&row, "explicit_permissions")?;
+                let denied_perms_json: serde_json::Value = row_cell(&row, "denied_permissions")?;
 
                 let explicit_permissions = serde_json::from_value(explicit_perms_json)
                     .unwrap_or_else(|_| std::collections::HashSet::new());
 
-                let denied_permissions = serde_json::from_value(denied_perms_json)
-                    .unwrap_or_else(|_| std::collections::HashSet::new());
+                let denied_permissions =
+                    decode_permission_json("denied_permissions", denied_perms_json)?;
 
-                UserPermissions {
-                    user_id: row.get("user_id"),
+                Ok(UserPermissions {
+                    user_id: row_cell(&row, "user_id")?,
                     role,
                     explicit_permissions,
                     denied_permissions,
-                    updated_at: row.get("updated_at"),
-                    granted_by: row.get("granted_by"),
-                }
+                    updated_at: row_cell(&row, "updated_at")?,
+                    granted_by: row_cell(&row, "granted_by")?,
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>, _>>()?;
 
         Ok(permissions)
     }
@@ -3263,5 +3371,413 @@ mod tests {
     #[tokio::test]
     async fn test_database_operations() {
         // Tests would go here
+    }
+
+    // ---------------------------------------------------------------------
+    // Role / denial decode round-trips.
+    //
+    // The persistence layer writes `format!("{:?}", role)` and reads it back
+    // through a decoder. Three inline decoders in this file recognised only
+    // Owner/Editor/Viewer and fell through to `Role::Viewer`, so a persisted
+    // `Commenter` (2 role permissions) or `Custom(n)` (0) came back as a
+    // `Viewer` (4) — a reload ESCALATED privilege. The denial decoders were
+    // the mirror image: an undecodable `denied_permissions` cell collapsed to
+    // an empty set, and `PermissionManager::check_permission` consults denials
+    // FIRST, so a corrupt cell silently un-denied everything.
+    //
+    // These exercise the SQLite backend end to end (file-backed, `tempfile`,
+    // zero live infrastructure — the same fixture shape as
+    // `tests/api_key_persistence.rs`). The PostgreSQL sites decode through the
+    // same shared functions, unit-tested directly below.
+    // ---------------------------------------------------------------------
+
+    /// Open (creating if absent) a file-backed SQLite database with migrations
+    /// run. A FILE, not `sqlite::memory:`, because an in-memory SQLite database
+    /// is per-connection and the pool holds several.
+    async fn open_sqlite(path: &str) -> SqliteDatabase {
+        let cfg = DatabaseConfig {
+            db_type: DatabaseType::SQLite,
+            url: format!("sqlite://{path}?mode=rwc"),
+            max_connections: 4,
+            connect_timeout: 5,
+            run_migrations: true,
+        };
+        SqliteDatabase::new(&cfg)
+            .await
+            .expect("file-backed sqlite must initialise")
+    }
+
+    /// `permissions` carries foreign keys onto `sessions` and `users`, and
+    /// sqlx enables `PRAGMA foreign_keys` by default — the parent rows must
+    /// exist before a permission row can be written.
+    async fn seed_parents(db: &SqliteDatabase, session_id: &str, user_id: &str) {
+        let now = Utc::now();
+        sqlx::query(
+            "INSERT INTO sessions (id, name, owner, created_at, modified_at, is_public, data) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        )
+        .bind(session_id)
+        .bind("decode-fixture")
+        .bind(user_id)
+        .bind(now)
+        .bind(now)
+        .bind(false)
+        .bind(serde_json::json!({}))
+        .execute(&db.pool)
+        .await
+        .expect("seed session row");
+
+        sqlx::query(
+            "INSERT INTO users (id, email, name, password_hash, created_at, is_active, is_verified) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        )
+        .bind(user_id)
+        .bind(format!("{user_id}@example.test"))
+        .bind(user_id)
+        .bind("not-a-real-hash")
+        .bind(now)
+        .bind(true)
+        .bind(true)
+        .execute(&db.pool)
+        .await
+        .expect("seed user row");
+    }
+
+    fn fixture_permissions(user_id: &str, role: Role) -> UserPermissions {
+        UserPermissions {
+            user_id: user_id.to_string(),
+            role,
+            explicit_permissions: std::collections::HashSet::new(),
+            denied_permissions: std::collections::HashSet::new(),
+            updated_at: Utc::now(),
+            granted_by: "fixture".to_string(),
+        }
+    }
+
+    /// A temp directory plus the forward-slash path SQLite wants on Windows.
+    fn temp_db_path(name: &str) -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(name).to_string_lossy().replace('\\', "/");
+        (dir, path)
+    }
+
+    /// `Role::Custom(7)` has NO role-derived permissions. Decoding it as
+    /// `Viewer` on reload hands the principal four it never had.
+    #[tokio::test]
+    async fn persisted_custom_role_round_trips() {
+        let (_dir, path) = temp_db_path("custom_role.db");
+        let db = open_sqlite(&path).await;
+        seed_parents(&db, "sess-custom", "user-custom").await;
+
+        db.save_permissions(
+            "sess-custom",
+            &fixture_permissions("user-custom", Role::Custom(7)),
+        )
+        .await
+        .expect("save must succeed");
+
+        let loaded = db
+            .load_permissions("sess-custom", "user-custom")
+            .await
+            .expect("load must succeed");
+        assert_eq!(
+            loaded.role,
+            Role::Custom(7),
+            "load_permissions must decode the persisted Custom(7), not substitute a role"
+        );
+
+        let listed = db
+            .list_permissions("sess-custom")
+            .await
+            .expect("list must succeed");
+        let row = listed
+            .iter()
+            .find(|p| p.user_id == "user-custom")
+            .expect("the persisted row must be listed");
+        assert_eq!(
+            row.role,
+            Role::Custom(7),
+            "list_permissions must decode the persisted Custom(7), not substitute a role"
+        );
+    }
+
+    /// `Role::Commenter` grants 2 permissions; `Viewer` grants 4. Decoding a
+    /// persisted Commenter as Viewer is an escalation on every reload.
+    #[tokio::test]
+    async fn persisted_commenter_round_trips() {
+        let (_dir, path) = temp_db_path("commenter_role.db");
+        let db = open_sqlite(&path).await;
+        seed_parents(&db, "sess-commenter", "user-commenter").await;
+
+        db.save_permissions(
+            "sess-commenter",
+            &fixture_permissions("user-commenter", Role::Commenter),
+        )
+        .await
+        .expect("save must succeed");
+
+        let loaded = db
+            .load_permissions("sess-commenter", "user-commenter")
+            .await
+            .expect("load must succeed");
+        assert_eq!(
+            loaded.role,
+            Role::Commenter,
+            "load_permissions must decode the persisted Commenter, not widen it to Viewer"
+        );
+
+        let listed = db
+            .list_permissions("sess-commenter")
+            .await
+            .expect("list must succeed");
+        let row = listed
+            .iter()
+            .find(|p| p.user_id == "user-commenter")
+            .expect("the persisted row must be listed");
+        assert_eq!(
+            row.role,
+            Role::Commenter,
+            "list_permissions must decode the persisted Commenter, not widen it to Viewer"
+        );
+    }
+
+    /// A `denied_permissions` cell that does not decode must REFUSE, never
+    /// yield an empty denial set: `check_permission` reads denials first, so
+    /// an empty set is a blanket un-deny.
+    #[tokio::test]
+    async fn malformed_denied_permissions_is_an_error_not_empty() {
+        let (_dir, path) = temp_db_path("malformed_denials.db");
+        let db = open_sqlite(&path).await;
+        seed_parents(&db, "sess-denials", "user-denials").await;
+
+        let mut perms = fixture_permissions("user-denials", Role::Editor);
+        perms.denied_permissions.insert(Permission::DeleteGeometry);
+        db.save_permissions("sess-denials", &perms)
+            .await
+            .expect("save must succeed");
+
+        // Valid JSON of the wrong shape — an unknown permission string. This
+        // is what a schema drift or a hand-edited row looks like; it must not
+        // be quietly normalised into "nothing is denied".
+        sqlx::query(
+            "UPDATE permissions SET denied_permissions = ?1 \
+             WHERE session_id = ?2 AND user_id = ?3",
+        )
+        .bind(serde_json::json!(["NotAPermission"]))
+        .bind("sess-denials")
+        .bind("user-denials")
+        .execute(&db.pool)
+        .await
+        .expect("corrupt the denial cell");
+
+        let loaded = db.load_permissions("sess-denials", "user-denials").await;
+        match loaded {
+            Ok(p) => panic!(
+                "load_permissions accepted a malformed denial cell and returned {} denials \
+                 (fail-open); it must return a typed decode error",
+                p.denied_permissions.len()
+            ),
+            Err(SessionError::PersistenceError { reason }) => {
+                assert!(
+                    reason.contains("denied_permissions"),
+                    "the error must name the cell it could not decode, got: {reason}"
+                );
+            }
+            Err(other) => panic!("expected a PersistenceError decode failure, got: {other:?}"),
+        }
+
+        let listed = db.list_permissions("sess-denials").await;
+        match listed {
+            Ok(rows) => panic!(
+                "list_permissions accepted a malformed denial cell and returned {} row(s) \
+                 (fail-open); it must return a typed decode error",
+                rows.len()
+            ),
+            Err(SessionError::PersistenceError { reason }) => {
+                assert!(
+                    reason.contains("denied_permissions"),
+                    "the error must name the cell it could not decode, got: {reason}"
+                );
+            }
+            Err(other) => panic!("expected a PersistenceError decode failure, got: {other:?}"),
+        }
+    }
+
+    /// A cell that is not JSON AT ALL never reaches the decoders: `sqlx::Row::get`
+    /// panics on an undecodable cell by contract, so the request dies inside the
+    /// library. The workspace denies panics in production code and a hidden
+    /// library panic is the same defect - every cell must be read with `try_get`
+    /// and refuse with a typed error naming the column.
+    #[tokio::test]
+    async fn non_json_denied_permissions_cell_is_an_error_not_a_panic() {
+        let (_dir, path) = temp_db_path("non_json_denials.db");
+        let db = open_sqlite(&path).await;
+        seed_parents(&db, "sess-nonjson", "user-nonjson").await;
+
+        let mut perms = fixture_permissions("user-nonjson", Role::Editor);
+        perms.denied_permissions.insert(Permission::DeleteGeometry);
+        db.save_permissions("sess-nonjson", &perms)
+            .await
+            .expect("save must succeed");
+
+        // Not valid JSON in any shape - what a truncated write or a hand-edited
+        // row looks like. `serde_json::Value` cannot decode it at all.
+        sqlx::query(
+            "UPDATE permissions SET denied_permissions = ?1 \
+             WHERE session_id = ?2 AND user_id = ?3",
+        )
+        .bind("this is not json")
+        .bind("sess-nonjson")
+        .bind("user-nonjson")
+        .execute(&db.pool)
+        .await
+        .expect("write a non-JSON denial cell");
+
+        match db.load_permissions("sess-nonjson", "user-nonjson").await {
+            Ok(p) => panic!(
+                "load_permissions returned Ok with {} denial(s) from an unreadable cell",
+                p.denied_permissions.len()
+            ),
+            Err(SessionError::PersistenceError { reason }) => {
+                assert!(
+                    reason.contains("denied_permissions"),
+                    "the error must name the unreadable column, got: {reason}"
+                );
+            }
+            Err(other) => panic!("expected a PersistenceError, got: {other:?}"),
+        }
+
+        match db.list_permissions("sess-nonjson").await {
+            Ok(rows) => panic!(
+                "list_permissions returned Ok with {} row(s) from an unreadable cell",
+                rows.len()
+            ),
+            Err(SessionError::PersistenceError { reason }) => {
+                assert!(
+                    reason.contains("denied_permissions"),
+                    "the error must name the unreadable column, got: {reason}"
+                );
+            }
+            Err(other) => panic!("expected a PersistenceError, got: {other:?}"),
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // The shared decoders, unit-tested directly. The PostgreSQL persistence
+    // paths cannot be exercised without a live server, and they decode
+    // through exactly these functions.
+    // ---------------------------------------------------------------------
+
+    /// There is no safe default role to substitute: `Viewer` is not the floor
+    /// of the lattice, so an unreadable `role` cell must refuse.
+    #[test]
+    fn unknown_role_string_is_a_decode_error() {
+        for cell in [
+            "Superuser",
+            "",
+            "viewer",
+            "Custom(",
+            "Custom(abc)",
+            "Custom(-1)",
+        ] {
+            match role_from_str(cell) {
+                Ok(role) => panic!(
+                    "role_from_str({cell:?}) invented {role:?}; an unrecognised role cell must be \
+                     a typed decode error, never a substituted role"
+                ),
+                Err(PermissionDecodeError::UnknownRole(reported)) => {
+                    assert_eq!(reported, cell, "the error must quote the offending cell");
+                }
+                Err(other) => panic!("expected UnknownRole for {cell:?}, got: {other:?}"),
+            }
+        }
+
+        // The canonical alphabet still decodes, including the two roles the
+        // inline decoders never recognised.
+        assert_eq!(role_from_str("Owner").expect("Owner decodes"), Role::Owner);
+        assert_eq!(
+            role_from_str("Editor").expect("Editor decodes"),
+            Role::Editor
+        );
+        assert_eq!(
+            role_from_str("Viewer").expect("Viewer decodes"),
+            Role::Viewer
+        );
+        assert_eq!(
+            role_from_str("Commenter").expect("Commenter decodes"),
+            Role::Commenter
+        );
+        assert_eq!(
+            role_from_str("Custom(7)").expect("Custom(7) decodes"),
+            Role::Custom(7)
+        );
+    }
+
+    /// The PostgreSQL `TEXT[]` denial cell: an element outside the canonical
+    /// alphabet is an error, not a dropped denial.
+    #[test]
+    fn unknown_permission_string_in_a_denial_cell_is_a_decode_error() {
+        let good = vec!["DeleteGeometry".to_string(), "ModifyGeometry".to_string()];
+        let decoded =
+            decode_permission_strings("denied_permissions", &good).expect("canonical cell decodes");
+        assert_eq!(decoded.len(), 2);
+        assert!(decoded.contains(&Permission::DeleteGeometry));
+
+        let bad = vec!["DeleteGeometry".to_string(), "NotAPermission".to_string()];
+        match decode_permission_strings("denied_permissions", &bad) {
+            Ok(set) => panic!(
+                "an unknown denial string was dropped, leaving {} denial(s); dropping a denial \
+                 GRANTS the permission it was denying",
+                set.len()
+            ),
+            Err(PermissionDecodeError::UnknownPermission { field, permission }) => {
+                assert_eq!(field, "denied_permissions");
+                assert_eq!(permission, "NotAPermission");
+            }
+            Err(other) => panic!("expected UnknownPermission, got: {other:?}"),
+        }
+    }
+
+    /// The SQLite JSON denial cell: an undecodable cell is an error, not an
+    /// empty set.
+    #[test]
+    fn malformed_json_denial_cell_is_a_decode_error() {
+        let good =
+            decode_permission_json("denied_permissions", serde_json::json!(["DeleteGeometry"]))
+                .expect("canonical cell decodes");
+        assert_eq!(good.len(), 1);
+
+        match decode_permission_json("denied_permissions", serde_json::json!({ "a": 1 })) {
+            Ok(set) => panic!(
+                "a malformed denial cell decoded to {} denial(s) instead of refusing",
+                set.len()
+            ),
+            Err(PermissionDecodeError::MalformedPermissionCell { field, .. }) => {
+                assert_eq!(field, "denied_permissions");
+            }
+            Err(other) => panic!("expected MalformedPermissionCell, got: {other:?}"),
+        }
+    }
+
+    /// Call-site gate: no decoder in this file may reconstruct the defect by
+    /// re-inlining a role match with a catch-all `Viewer` arm. Scans the source
+    /// rather than the behaviour because the two PostgreSQL sites have no
+    /// reachable test database.
+    ///
+    /// Narrow by construction, and named for what it actually checks: it
+    /// matches ONE literal, so a fail-open of a different SHAPE (say
+    /// `.unwrap_or(Role::Viewer)`) walks straight past it — demonstrated by
+    /// MUTATION 2 in this task's report. The general property is carried by
+    /// [`unknown_role_string_is_a_decode_error`], not by this gate.
+    #[test]
+    fn no_catch_all_viewer_arm_is_reinlined() {
+        let source = include_str!("database.rs");
+        // Assembled from fragments so this assertion's own text is not a hit.
+        let catch_all = concat!("_ => ", "Role::Viewer,");
+        assert!(
+            !source.contains(catch_all),
+            "a catch-all `{catch_all}` arm is back in database.rs: an unreadable role cell must \
+             reach role_from_str and become a typed decode error, not a substituted Viewer"
+        );
     }
 }
