@@ -226,13 +226,17 @@ async function doRefresh(): Promise<boolean> {
       body: JSON.stringify({ refresh_token: refreshToken }),
     })
     const body = (await res.json().catch(() => null)) as
-      | { success?: boolean; token?: string; error?: string }
+      | { success?: boolean; token?: string; refresh_token?: string; error?: string }
       | null
-    // RefreshResponse carries a new access token but no new refresh
-    // token (the refresh token itself is not rotated) — the one already
-    // in storage keeps working for the next renewal.
+    // Refresh is single-use: the server retires the token we just spent
+    // and returns its replacement, so the replacement MUST be stored or
+    // the next renewal presents a revoked token and the session dies at
+    // the next 401. Storing it is also what makes logout work — the
+    // server links revocation to the newest pair, so a client holding a
+    // stale refresh token could log out and keep renewing.
     if (res.ok && body?.success && body.token) {
       setToken(body.token)
+      if (body.refresh_token) setRefreshToken(body.refresh_token)
       scheduleProactiveRefresh(body.token)
       return true
     }

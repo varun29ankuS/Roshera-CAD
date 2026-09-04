@@ -20,6 +20,17 @@ use uuid::Uuid;
 
 type HmacSha256 = Hmac<Sha256>;
 
+/// The reserved `aud` value that marks a credential as a refresh token.
+///
+/// Access tokens and refresh tokens are signed with the same HMAC key and
+/// share a claim shape; the audience is the ONLY thing that distinguishes
+/// them on the wire. That makes this literal load-bearing, so it is named
+/// once and referenced from all three sites that depend on it: minting
+/// ([`AuthManager::create_token`]), the access gate
+/// ([`AuthManager::verify_token`]), and the refresh gate
+/// ([`AuthManager::verify_refresh_token`]).
+const REFRESH_AUDIENCE: &str = "refresh";
+
 /// The kind of principal a credential was minted for.
 ///
 /// This is the claim `author_from_auth_info`
@@ -201,6 +212,21 @@ pub enum SecurityEvent {
     },
 }
 
+/// The refresh token minted alongside one access token.
+///
+/// `expires_at` is the REFRESH token's expiry, not the access token's.
+/// The two differ by orders of magnitude (1 hour vs. 7 days by default),
+/// and the longer one is what governs how long this link must survive:
+/// dropping it when the access token expired would silently make the
+/// still-valid refresh token unrevocable for the rest of its life.
+#[derive(Debug, Clone)]
+struct RefreshLink {
+    /// `jti` of the refresh token.
+    jti: String,
+    /// When that refresh token stops being valid on its own.
+    expires_at: DateTime<Utc>,
+}
+
 /// Authentication manager
 pub struct AuthManager {
     /// JWT signing key
@@ -215,6 +241,19 @@ pub struct AuthManager {
     security_events: Arc<DashMap<String, Vec<SecurityEvent>>>,
     /// Revoked tokens
     revoked_tokens: Arc<DashMap<String, DateTime<Utc>>>,
+    /// Access `jti` → the `jti` of the refresh token minted with it.
+    ///
+    /// Logout revokes the access `jti` because that is the only id the
+    /// logout handler holds — the refresh token is never presented at
+    /// logout. Without this link, revoking the access token left its
+    /// refresh token valid for the remaining seven days, so "log out"
+    /// ended one hour of access and none of the renewal rights.
+    ///
+    /// The refresh claims already carry `custom.parent_jti` pointing the
+    /// other way (refresh → access); that direction is useless here,
+    /// since revocation starts from the access side and never sees the
+    /// refresh token's bytes. This map is the forward edge.
+    refresh_jtis: Arc<DashMap<String, RefreshLink>>,
     /// Failed login attempts
     failed_attempts: Arc<DashMap<String, Vec<DateTime<Utc>>>>,
     /// Rate limiting tracking
@@ -481,6 +520,7 @@ impl AuthManager {
             two_factor: Arc::new(DashMap::new()),
             security_events: Arc::new(DashMap::new()),
             revoked_tokens: Arc::new(DashMap::new()),
+            refresh_jtis: Arc::new(DashMap::new()),
             failed_attempts: Arc::new(DashMap::new()),
             rate_limits: Arc::new(DashMap::new()),
             api_key_store: OnceLock::new(),
@@ -582,8 +622,8 @@ impl AuthManager {
             nbf: now.timestamp(),
             iss: self.config.issuer.clone(),
             aud: self.config.audience.clone(),
-            email,
-            roles,
+            email: email.clone(),
+            roles: roles.clone(),
             custom: serde_json::Value::Object(serde_json::Map::new()),
             principal: principal.clone(),
         };
@@ -594,21 +634,36 @@ impl AuthManager {
             }
         })?;
 
-        // Create refresh token. Carries the SAME principal as the access
-        // token (see the doc comment above) — the refresh path in
-        // `api-server/src/handlers/auth.rs` reads it back off the
-        // verified refresh claims and forwards it, rather than
-        // hardcoding `Human`.
+        // Create refresh token. Carries the SAME principal, email and
+        // roles as the access token — `rotate_refresh_token` builds the
+        // next access token out of these claims, so whatever is missing
+        // here is missing from the credential after the first renewal.
+        //
+        // `email: None, roles: vec![]` is what it used to say, and the
+        // consequence was silent: an operator holding
+        // `["engineer", "reviewer"]` came back from their first renewal
+        // authenticated but anonymous — the token still verified, it just
+        // no longer said who it was or what it could do.
+        //
+        // This is also why the identity is carried in the token rather
+        // than looked up at rotation time: the mint site is the one place
+        // that has been TOLD the identity by whoever authorized the
+        // credential. Re-deriving it later would be inventing it.
+        //
+        // No new exposure: a JWT payload is base64, not encrypted, but the
+        // access token minted in the same breath already carries these
+        // exact claims to the same holder.
+        let refresh_id = Uuid::new_v4().to_string();
         let refresh_claims = TokenClaims {
             sub: user_id.to_string(),
-            jti: Uuid::new_v4().to_string(),
+            jti: refresh_id.clone(),
             iat: now.timestamp(),
             exp: (now + Duration::seconds(self.config.refresh_expiry_seconds)).timestamp(),
             nbf: now.timestamp(),
             iss: self.config.issuer.clone(),
-            aud: vec!["refresh".to_string()],
-            email: None,
-            roles: vec![],
+            aud: vec![REFRESH_AUDIENCE.to_string()],
+            email,
+            roles,
             custom: serde_json::json!({ "parent_jti": token_id }),
             principal,
         };
@@ -631,8 +686,16 @@ impl AuthManager {
             user_agent: None,
         };
 
-        // Store token
+        // Store token, and the access → refresh link that lets
+        // `revoke_token` reach the refresh credential it was minted with.
         self.tokens.insert(token_id.clone(), session_token.clone());
+        self.refresh_jtis.insert(
+            token_id.clone(),
+            RefreshLink {
+                jti: refresh_id,
+                expires_at: now + Duration::seconds(self.config.refresh_expiry_seconds),
+            },
+        );
 
         // Log security event
         self.log_security_event(SecurityEvent::TokenCreated {
@@ -649,9 +712,14 @@ impl AuthManager {
     /// Checks (in order):
     ///
     /// 1. JWT signature against the server's secret.
-    /// 2. `revoked_tokens` (AUDIT-C9).
-    /// 3. Absolute expiry from the JWT `exp` claim.
-    /// 4. **Idle timeout** (AUDIT-H8). When `idle_timeout_seconds > 0`
+    /// 2. **Audience** — see [`AuthManager::audience_admits_access`].
+    ///    Checked immediately after the signature, before anything
+    ///    reads or mutates `self.tokens`: a credential that is not for
+    ///    this audience must not be able to bump a `last_activity`
+    ///    timestamp or evict a cache entry on its way to being refused.
+    /// 3. `revoked_tokens` (AUDIT-C9).
+    /// 4. Absolute expiry from the JWT `exp` claim.
+    /// 5. **Idle timeout** (AUDIT-H8). When `idle_timeout_seconds > 0`
     ///    and a cached `SessionToken` exists for this `jti`, reject
     ///    the token if `last_activity` is older than the configured
     ///    idle window and drop the cached entry so it cannot be
@@ -665,11 +733,15 @@ impl AuthManager {
     ///    the JWT is still within `exp`) falls through to absolute-
     ///    expiry enforcement only.
     pub fn verify_token(&self, token: &str) -> Result<TokenClaims, SessionError> {
-        // Check if token is revoked
         let claims: TokenClaims = token
             .verify_with_key(&*self.jwt_secret)
             .map_err(|_e| SessionError::AccessDenied)?;
 
+        if !self.audience_admits_access(&claims.aud) {
+            return Err(SessionError::AccessDenied);
+        }
+
+        // Check if token is revoked
         if self.revoked_tokens.contains_key(&claims.jti) {
             return Err(SessionError::AccessDenied);
         }
@@ -710,9 +782,146 @@ impl AuthManager {
         Ok(claims)
     }
 
-    /// Revoke token
+    /// Does this `aud` claim admit a credential to the ACCESS path?
+    ///
+    /// Deliberately one expression carrying both rules, because they are
+    /// one decision:
+    ///
+    /// 1. The token must name an audience this server serves — RFC 7519
+    ///    §4.1.3 admits a token when the recipient identifies itself with
+    ///    ANY value in `aud`, so this is an intersection with
+    ///    `config.audience`, not equality. A token minted by this key for
+    ///    a different service is refused.
+    /// 2. The token must not carry [`REFRESH_AUDIENCE`], whatever the
+    ///    operator put in `ROSHERA_AUTH_AUDIENCE`. Rule 1 alone would let
+    ///    an operator who listed `refresh` in that env var re-open the
+    ///    hole from configuration; a refresh token is admitted by
+    ///    [`AuthManager::verify_refresh_token`] and by nothing else, and
+    ///    that is not the operator's to negotiate.
+    ///
+    /// The `jwt` crate this module signs with (`jwt 0.16`) verifies the
+    /// signature and deserializes the claims; it validates no registered
+    /// claim, which is why `exp` is checked by hand below and `aud` is
+    /// checked here. There is no `Validation`-style configuration object
+    /// to hand the audience to — this predicate is that configuration.
+    fn audience_admits_access(&self, aud: &[String]) -> bool {
+        aud.iter()
+            .any(|a| self.config.audience.iter().any(|served| served == a))
+            && !aud.iter().any(|a| a == REFRESH_AUDIENCE)
+    }
+
+    /// Verify a refresh token, for the token-refresh path ONLY
+    /// (`api-server/src/handlers/auth.rs::refresh_token`).
+    ///
+    /// This is the only function that accepts a refresh credential, and
+    /// it accepts nothing else: `aud` must be exactly
+    /// `[`[`REFRESH_AUDIENCE`]`]`, so an access token presented at
+    /// `/api/auth/refresh` is refused rather than rolled forward into a
+    /// fresh hour of access indefinitely.
+    ///
+    /// Checks: signature → audience → revocation → absolute expiry.
+    ///
+    /// No idle-timeout check and no `last_activity` write, unlike
+    /// [`AuthManager::verify_token`]: a refresh token has no
+    /// `SessionToken` entry of its own (only the access `jti` is cached),
+    /// so there is no activity clock to consult or advance. Its
+    /// revocation is reached through the access → refresh link recorded
+    /// by [`AuthManager::create_token`] and walked by
+    /// [`AuthManager::revoke_token`].
+    pub fn verify_refresh_token(&self, token: &str) -> Result<TokenClaims, SessionError> {
+        let claims: TokenClaims = token
+            .verify_with_key(&*self.jwt_secret)
+            .map_err(|_e| SessionError::AccessDenied)?;
+
+        if !matches!(claims.aud.as_slice(), [only] if only == REFRESH_AUDIENCE) {
+            return Err(SessionError::AccessDenied);
+        }
+
+        if self.revoked_tokens.contains_key(&claims.jti) {
+            return Err(SessionError::AccessDenied);
+        }
+
+        if claims.exp < Utc::now().timestamp() {
+            return Err(SessionError::Expired { id: claims.jti });
+        }
+
+        Ok(claims)
+    }
+
+    /// Exchange a refresh token for a fresh access + refresh pair,
+    /// retiring the presented one. This is the whole of the refresh path
+    /// (`api-server/src/handlers/auth.rs::refresh_token`).
+    ///
+    /// **Refresh is single-use.** Two things depend on that, and both were
+    /// broken while the exchange left the presented token alive:
+    ///
+    /// - *Logout could not reach the client's token.* Revocation is linked
+    ///   access → refresh, so a renewal that minted A2/R2 while the client
+    ///   kept R1 meant logging out revoked a refresh token nobody held and
+    ///   left R1 valid for its remaining days. From the second hour of any
+    ///   session onward, "log out" ended access and not renewal.
+    /// - *A captured refresh token was replayable.* It could be spent over
+    ///   and over for a new hour of access each time, outliving the session
+    ///   it was taken from.
+    ///
+    /// The new pair is minted BEFORE the old token is retired: if minting
+    /// fails, the caller still holds a working refresh token rather than
+    /// having spent it on nothing.
+    ///
+    /// The `email` and `roles` forwarded are the REFRESH claims' own, and
+    /// `create_token` now stamps them there identically to the access
+    /// token — so renewal carries a whole identity forward. While those
+    /// fields were minted `None`/empty, this forwarding emptied the
+    /// credential at the first renewal: still authenticated, no longer
+    /// saying who it was.
+    ///
+    /// The identity comes from the token rather than from a user-store
+    /// lookup because the mint site is the one place that was TOLD it by
+    /// whoever authorized the credential. The cost is honest and worth
+    /// naming: a role revoked mid-session is not observed until the
+    /// refresh token itself expires, since nothing re-reads the store.
+    pub fn rotate_refresh_token(&self, refresh_token: &str) -> Result<SessionToken, SessionError> {
+        let claims = self.verify_refresh_token(refresh_token)?;
+
+        let rotated =
+            self.create_token(&claims.sub, claims.email, claims.roles, claims.principal)?;
+
+        // Retire the spent token. `revoked_tokens` is the same list
+        // `verify_refresh_token` consults, so a replay is refused there.
+        self.revoked_tokens.insert(claims.jti.clone(), Utc::now());
+        self.log_security_event(SecurityEvent::TokenRevoked {
+            user_id: claims.sub.clone(),
+            token_id: claims.jti.clone(),
+            reason: "refresh_token_rotated".to_string(),
+        });
+
+        // Drop the spent token's own access → refresh link. Without this
+        // every renewal left one behind, and the map grew for the life of
+        // the session rather than the life of a credential. The refresh
+        // claims carry their access token's id in `parent_jti`; a token
+        // that somehow lacks it simply leaves the entry to `cleanup_expired`
+        // rather than guessing at a key to delete.
+        if let Some(parent_jti) = claims.custom.get("parent_jti").and_then(|v| v.as_str()) {
+            self.refresh_jtis.remove(parent_jti);
+        }
+
+        Ok(rotated)
+    }
+
+    /// Revoke a token, and with it the refresh token minted alongside it.
+    ///
+    /// `token_id` is an access `jti` — that is what logout has in hand.
+    /// The refresh token minted with it is revoked in the same call, via
+    /// the link recorded by [`AuthManager::create_token`]: leaving it
+    /// alive would mean "log out" ended one hour of access while the
+    /// seven-day right to mint fresh access tokens survived.
+    ///
+    /// Both revocations are logged. Two credentials stopped being valid,
+    /// and an audit log that recorded one of them would be understating
+    /// what happened.
     pub fn revoke_token(&self, token_id: &str, reason: &str, revoked_by: &str) {
-        self.revoked_tokens.insert(token_id.to_string(), Utc::now());
+        let now = Utc::now();
+        self.revoked_tokens.insert(token_id.to_string(), now);
         self.tokens.remove(token_id);
 
         self.log_security_event(SecurityEvent::TokenRevoked {
@@ -720,6 +929,15 @@ impl AuthManager {
             token_id: token_id.to_string(),
             reason: reason.to_string(),
         });
+
+        if let Some((_, link)) = self.refresh_jtis.remove(token_id) {
+            self.revoked_tokens.insert(link.jti.clone(), now);
+            self.log_security_event(SecurityEvent::TokenRevoked {
+                user_id: revoked_by.to_string(),
+                token_id: link.jti,
+                reason: format!("{} (refresh token of {})", reason, token_id),
+            });
+        }
     }
 
     /// Create API key
@@ -1174,8 +1392,38 @@ impl AuthManager {
         // Remove expired tokens
         self.tokens.retain(|_, token| token.expires_at > now);
 
-        // Remove old revoked tokens (keep for 7 days)
-        let cutoff = now - Duration::days(7);
+        // Drop access → refresh links only once the REFRESH token itself
+        // has expired. Keying this on the access token's expiry (an hour,
+        // by default) would leave six days of still-valid refresh tokens
+        // that `revoke_token` could no longer reach.
+        self.refresh_jtis.retain(|_, link| link.expires_at > now);
+
+        // Remove old revoked tokens.
+        //
+        // A revocation must outlive the credential it revokes, so the
+        // horizon is DERIVED from the lifetimes this manager actually
+        // mints — never a literal. It was `Duration::days(7)`, which
+        // matched the *default* refresh lifetime exactly and was
+        // therefore right by coincidence rather than by construction:
+        // `refresh_expiry_seconds` is operator-configurable
+        // (`ROSHERA_REFRESH_EXPIRY_SECONDS`), and at the 14 days that env
+        // var is documented to accept, a revoked refresh token had its
+        // revocation pruned on day 8 and began verifying again — a logout
+        // that silently un-did itself six days later.
+        //
+        // `max` over both lifetimes rather than `refresh_expiry_seconds`
+        // alone: nothing forces an operator to configure the refresh
+        // token as the longer-lived of the two, and the horizon must
+        // cover whichever credential outlives the other. Clamped at zero
+        // so a nonsensical negative config cannot push the cutoff into
+        // the future and prune every revocation on the spot.
+        let revocation_horizon = Duration::seconds(
+            self.config
+                .refresh_expiry_seconds
+                .max(self.config.token_expiry_seconds)
+                .max(0),
+        );
+        let cutoff = now - revocation_horizon;
         self.revoked_tokens
             .retain(|_, revoked_at| *revoked_at > cutoff);
 
@@ -1393,6 +1641,387 @@ mod tests {
             !auth.tokens.contains_key(&session_token.id),
             "idle-expired tokens must be dropped from the cache",
         );
+    }
+
+    /// AUDIT: a refresh token is signed with the same HMAC key as the
+    /// access token it accompanies, and differs from it only by its
+    /// `aud` claim. Until `verify_token` checked `aud`, a refresh token
+    /// presented as `Authorization: Bearer …` authenticated every
+    /// request for its full seven-day lifetime — a 7-day access token
+    /// handed to the client on every login.
+    #[test]
+    fn refresh_token_is_rejected_as_an_access_token() {
+        let auth = AuthManager::new(AuthConfig::default(), "test-secret").unwrap();
+
+        let session_token = auth
+            .create_token(
+                "user-aud",
+                None,
+                vec!["user".to_string()],
+                PrincipalKind::Human,
+            )
+            .unwrap();
+        let refresh_token = session_token
+            .refresh_token
+            .expect("create_token must always mint a refresh token");
+
+        match auth.verify_token(&refresh_token) {
+            Err(SessionError::AccessDenied) => {}
+            other => panic!(
+                "a refresh token must never verify as an access token, got {:?}",
+                other
+            ),
+        }
+    }
+
+    /// The audience gate is a check against the CONFIGURED audience,
+    /// not merely a "is this the refresh marker" test. A token minted
+    /// for a different service — same signing key, different `aud` —
+    /// must not authenticate here either.
+    #[test]
+    fn token_for_a_foreign_audience_is_rejected() {
+        let auth = AuthManager::new(AuthConfig::default(), "test-secret").unwrap();
+        let now = Utc::now();
+
+        let foreign = TokenClaims {
+            sub: "user-foreign".to_string(),
+            jti: Uuid::new_v4().to_string(),
+            iat: now.timestamp(),
+            exp: (now + Duration::seconds(3600)).timestamp(),
+            nbf: now.timestamp(),
+            iss: AuthConfig::default().issuer,
+            aud: vec!["some-other-service".to_string()],
+            email: None,
+            roles: vec!["user".to_string()],
+            custom: serde_json::Value::Object(serde_json::Map::new()),
+            principal: PrincipalKind::Human,
+        };
+        let token = foreign
+            .sign_with_key(&*auth.jwt_secret)
+            .expect("foreign-audience claims must sign");
+
+        match auth.verify_token(&token) {
+            Err(SessionError::AccessDenied) => {}
+            other => panic!(
+                "a token minted for another audience must not authenticate here, got {:?}",
+                other
+            ),
+        }
+    }
+
+    /// The refresh path is the ONLY path that accepts a refresh token,
+    /// and it accepts NOTHING ELSE. An access token walked in through
+    /// `/api/auth/refresh` would let a stolen one-hour credential be
+    /// rolled forward indefinitely.
+    #[test]
+    fn access_token_is_rejected_by_refresh_path() {
+        let auth = AuthManager::new(AuthConfig::default(), "test-secret").unwrap();
+
+        let session_token = auth
+            .create_token(
+                "user-refresh-path",
+                None,
+                vec!["user".to_string()],
+                PrincipalKind::Human,
+            )
+            .unwrap();
+
+        match auth.verify_refresh_token(&session_token.token) {
+            Err(SessionError::AccessDenied) => {}
+            other => panic!(
+                "the refresh path must reject an access token, got {:?}",
+                other
+            ),
+        }
+    }
+
+    /// Logout revokes the access `jti` — the only id the logout handler
+    /// (`api-server/src/handlers/auth.rs`) has in hand. Revoking it must
+    /// also revoke the refresh token minted with it, or logging out
+    /// leaves the caller holding a credential that mints fresh access
+    /// tokens for another seven days.
+    #[test]
+    fn logout_revokes_the_refresh_token() {
+        let auth = AuthManager::new(AuthConfig::default(), "test-secret").unwrap();
+
+        let session_token = auth
+            .create_token(
+                "user-logout",
+                None,
+                vec!["user".to_string()],
+                PrincipalKind::Human,
+            )
+            .unwrap();
+        let refresh_token = session_token
+            .refresh_token
+            .clone()
+            .expect("create_token must always mint a refresh token");
+
+        assert!(
+            auth.verify_refresh_token(&refresh_token).is_ok(),
+            "sanity: the refresh token must be usable before logout",
+        );
+
+        // Exactly what `handlers::auth::logout` does: revoke the access jti.
+        auth.revoke_token(&session_token.id, "user_logout", "user-logout");
+
+        match auth.verify_refresh_token(&refresh_token) {
+            Err(SessionError::AccessDenied) => {}
+            other => panic!(
+                "logout must revoke the refresh token alongside its access token, got {:?}",
+                other
+            ),
+        }
+    }
+
+    /// Rule 2 of `audience_admits_access` — the unconditional refusal of
+    /// [`REFRESH_AUDIENCE`] — needs a hostile config to be observable at
+    /// all. Under the default config rule 1 already refuses a refresh
+    /// token (`"refresh"` is not in `["roshera-api"]`), so every other
+    /// test in this module passes on rule 1 alone and deleting rule 2
+    /// leaves them all green. This is the only test that can see it:
+    /// an operator who lists `refresh` in `ROSHERA_AUTH_AUDIENCE`
+    /// satisfies rule 1, and must STILL not be able to turn a refresh
+    /// token into an access token by configuration.
+    #[test]
+    fn refresh_audience_is_refused_even_when_an_operator_configures_it() {
+        let config = AuthConfig {
+            audience: vec!["roshera-api".to_string(), REFRESH_AUDIENCE.to_string()],
+            ..Default::default()
+        };
+        let auth = AuthManager::new(config, "test-secret").unwrap();
+
+        let session_token = auth
+            .create_token(
+                "user-hostile-aud",
+                None,
+                vec!["user".to_string()],
+                PrincipalKind::Human,
+            )
+            .unwrap();
+        let refresh_token = session_token
+            .refresh_token
+            .expect("create_token must always mint a refresh token");
+
+        match auth.verify_token(&refresh_token) {
+            Err(SessionError::AccessDenied) => {}
+            other => panic!(
+                "listing `refresh` in the configured audience must not make a \
+                 refresh token usable as an access token, got {:?}",
+                other
+            ),
+        }
+    }
+
+    /// Renewal must not empty the identity it renews.
+    ///
+    /// `create_token` minted refresh claims with `email: None` and
+    /// `roles: vec![]`, and the refresh path builds the new access token
+    /// out of those claims — so an operator holding
+    /// `["engineer", "reviewer"]` came back from their first renewal with
+    /// no email and NO ROLES AT ALL. The credential still authenticated;
+    /// it just stopped saying who it was. Nothing failed loudly, which is
+    /// exactly why it survived: the token verifies, and the identity it
+    /// carries is simply blank.
+    #[test]
+    fn rotated_access_token_keeps_email_and_roles() {
+        let auth = AuthManager::new(AuthConfig::default(), "test-secret").unwrap();
+        let email = Some("engineer@example.com".to_string());
+        let roles = vec!["engineer".to_string(), "reviewer".to_string()];
+
+        let first = auth
+            .create_token(
+                "user-identity",
+                email.clone(),
+                roles.clone(),
+                PrincipalKind::Human,
+            )
+            .unwrap();
+        let r1 = first
+            .refresh_token
+            .clone()
+            .expect("create_token must always mint a refresh token");
+
+        let rotated = auth
+            .rotate_refresh_token(&r1)
+            .expect("a valid refresh token must rotate");
+        let claims = auth
+            .verify_token(&rotated.token)
+            .expect("the rotated access token must verify");
+
+        assert_eq!(
+            claims.email, email,
+            "renewal must not drop the credential's email",
+        );
+        assert_eq!(
+            claims.roles, roles,
+            "renewal must not empty the credential's roles",
+        );
+    }
+
+    /// The client keeps whatever refresh token it was last given. Before
+    /// rotation the refresh endpoint returned a new ACCESS token and no
+    /// new refresh token, so after the first renewal the client held R1
+    /// while the server had linked logout-revocation to R2 — and logging
+    /// out revoked a token nobody had, leaving R1 alive for its whole
+    /// seven days. Every session older than one access-token lifetime was
+    /// in that state.
+    #[test]
+    fn logout_after_a_refresh_revokes_the_token_the_client_actually_holds() {
+        let auth = AuthManager::new(AuthConfig::default(), "test-secret").unwrap();
+
+        let first = auth
+            .create_token(
+                "user-rotate",
+                None,
+                vec!["user".to_string()],
+                PrincipalKind::Human,
+            )
+            .unwrap();
+        let r1 = first
+            .refresh_token
+            .clone()
+            .expect("create_token must always mint a refresh token");
+
+        // The access token lapses and the client renews — exactly what
+        // `handlers::auth::refresh_token` does.
+        let second = auth
+            .rotate_refresh_token(&r1)
+            .expect("a valid refresh token must rotate");
+        let r2 = second
+            .refresh_token
+            .clone()
+            .expect("rotation must hand back a replacement refresh token");
+
+        // The client logs out with the access token it now holds.
+        auth.revoke_token(&second.id, "user_logout", "user-rotate");
+
+        // R2 is the token the client ACTUALLY holds after renewing, and it
+        // is the assertion with teeth: only `revoke_token`'s A2 → R2 link
+        // walk can kill it. Assert it FIRST so the test's purpose cannot be
+        // mistaken for R1's.
+        match auth.verify_refresh_token(&r2) {
+            Err(SessionError::AccessDenied) => {}
+            other => panic!(
+                "logout must revoke the refresh token the client holds after \
+                 renewing, got {:?}",
+                other
+            ),
+        }
+
+        // R1 too, for completeness. This one is weak on its own: rotation
+        // already retired R1, so it would pass even if the link walk were
+        // deleted outright — which is precisely why it cannot be the only
+        // assertion here.
+        match auth.verify_refresh_token(&r1) {
+            Err(SessionError::AccessDenied) => {}
+            other => panic!(
+                "after logout no refresh token the client ever held may still \
+                 verify, got {:?}",
+                other
+            ),
+        }
+    }
+
+    /// Refresh is single-use. A refresh token that survived its own
+    /// exchange would let a captured one be replayed for the rest of its
+    /// lifetime, minting a fresh hour of access each time — the stolen
+    /// credential outliving the session it was stolen from.
+    #[test]
+    fn a_refresh_token_cannot_be_spent_twice() {
+        let auth = AuthManager::new(AuthConfig::default(), "test-secret").unwrap();
+
+        let first = auth
+            .create_token(
+                "user-replay",
+                None,
+                vec!["user".to_string()],
+                PrincipalKind::Human,
+            )
+            .unwrap();
+        let r1 = first
+            .refresh_token
+            .clone()
+            .expect("create_token must always mint a refresh token");
+
+        let second = auth
+            .rotate_refresh_token(&r1)
+            .expect("the first exchange must succeed");
+        assert!(
+            second.refresh_token.is_some(),
+            "rotation must hand back a replacement refresh token, or the \
+             client is left unable to renew",
+        );
+
+        match auth.rotate_refresh_token(&r1) {
+            Err(SessionError::AccessDenied) => {}
+            other => panic!(
+                "a refresh token must not be spendable a second time, got {:?}",
+                other.map(|t| t.id)
+            ),
+        }
+    }
+
+    /// A revocation must outlive the credential it revokes.
+    ///
+    /// `cleanup_expired` prunes `revoked_tokens` on a retention horizon.
+    /// While that horizon was the literal `Duration::days(7)` it matched
+    /// the *default* refresh lifetime exactly — right by coincidence, not
+    /// by construction. `refresh_expiry_seconds` is operator-configurable
+    /// (`ROSHERA_REFRESH_EXPIRY_SECONDS`, and
+    /// `from_env_with_overrides_every_field` in this very module drives it
+    /// to 14 days), so at 14 days a revoked refresh token had its
+    /// revocation pruned out from under it on day 8 and started verifying
+    /// again — a logout that silently un-did itself, six days late.
+    ///
+    /// Elapsed time is simulated by rewinding the stored revocation
+    /// timestamps, the same idiom `verify_token_rejects_idle_session`
+    /// uses on `last_activity`: this module has no clock seam, and
+    /// sleeping for eight days is not a test.
+    #[tokio::test]
+    async fn revocation_outlives_a_longer_than_default_refresh_token() {
+        let config = AuthConfig {
+            // Exactly what ROSHERA_REFRESH_EXPIRY_SECONDS=1209600 produces.
+            refresh_expiry_seconds: 1_209_600, // 14 days
+            ..Default::default()
+        };
+        let auth = AuthManager::new(config, "test-secret").unwrap();
+
+        let session_token = auth
+            .create_token(
+                "user-retention",
+                None,
+                vec!["user".to_string()],
+                PrincipalKind::Human,
+            )
+            .unwrap();
+        let refresh_token = session_token
+            .refresh_token
+            .clone()
+            .expect("create_token must always mint a refresh token");
+
+        auth.revoke_token(&session_token.id, "user_logout", "user-retention");
+        assert!(
+            auth.verify_refresh_token(&refresh_token).is_err(),
+            "sanity: the refresh token must be revoked the moment logout runs",
+        );
+
+        // Eight days pass. The refresh token is still six days from its
+        // own expiry, so its revocation must still be on file.
+        let eight_days_ago = Utc::now() - Duration::days(8);
+        for mut entry in auth.revoked_tokens.iter_mut() {
+            *entry.value_mut() = eight_days_ago;
+        }
+
+        auth.cleanup_expired().await;
+
+        match auth.verify_refresh_token(&refresh_token) {
+            Err(SessionError::AccessDenied) => {}
+            other => panic!(
+                "a revoked refresh token must stay revoked for its whole configured life, got {:?}",
+                other
+            ),
+        }
     }
 
     /// AUDIT-H8: `idle_timeout_seconds == 0` is the documented opt-out;
@@ -1789,8 +2418,10 @@ mod tests {
             .refresh_token
             .expect("create_token must always mint a refresh token");
 
+        // Verified through the refresh path, which is now the only path
+        // that accepts a refresh token at all.
         let refresh_claims = auth
-            .verify_token(&refresh_token)
+            .verify_refresh_token(&refresh_token)
             .expect("the freshly minted refresh token must verify");
 
         assert_eq!(

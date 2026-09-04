@@ -68,6 +68,16 @@ pub struct RefreshRequest {
 pub struct RefreshResponse {
     pub success: bool,
     pub token: Option<String>,
+    /// The ROTATED refresh token, `Some` on success.
+    ///
+    /// Refresh is single-use: the token the client presented is retired by
+    /// the exchange, so the replacement has to come back on this field or
+    /// the client is left holding a dead credential. Its absence was a
+    /// silent hole — the client kept its original refresh token across
+    /// every renewal, while the server linked logout-revocation to the
+    /// newest one, so from the second hour of any session onwards logging
+    /// out left a working refresh token in the client's storage.
+    pub refresh_token: Option<String>,
     pub expires_in: Option<u64>,
     pub error: Option<String>,
 }
@@ -448,7 +458,10 @@ pub async fn change_password(
 /// The supplied refresh token must be a valid, unexpired JWT signed by this server.
 /// The `sub` claim in the refresh token is used to identify the user for whom
 /// a new access token is issued. The refresh token itself is validated via
-/// `AuthManager::verify_token` so revoked or expired refresh tokens are rejected.
+/// `AuthManager::verify_refresh_token` so revoked or expired refresh tokens are
+/// rejected — and so is an ACCESS token presented here, which `verify_token`
+/// would have accepted, letting a stolen one-hour credential be rolled forward
+/// indefinitely. That function is the only one that accepts a refresh token.
 pub async fn refresh_token(
     State(state): State<AppState>,
     Json(payload): Json<RefreshRequest>,
@@ -457,41 +470,53 @@ pub async fn refresh_token(
 
     let auth_manager = state.session_manager.auth_manager();
 
-    // Validate the refresh token as a JWT. verify_token checks signature, expiry,
-    // and revocation list, so a bare UUID or tampered token is rejected here.
-    let claims = match auth_manager.verify_token(&payload.refresh_token) {
-        Ok(c) => c,
+    // Rotate: verify the presented refresh token (signature, audience
+    // `aud == ["refresh"]` exactly, revocation, expiry), mint a fresh
+    // access + refresh pair, and retire the presented one. A bare UUID, a
+    // tampered token, an access token, or an already-spent refresh token
+    // is rejected here.
+    let rotated = match auth_manager.rotate_refresh_token(&payload.refresh_token) {
+        Ok(t) => t,
         Err(e) => {
             warn!("Token refresh rejected — invalid token: {:?}", e);
             return Ok(Json(RefreshResponse {
                 success: false,
                 token: None,
+                refresh_token: None,
                 expires_in: None,
                 error: Some("Invalid or expired refresh token".to_string()),
             }));
         }
     };
 
-    let user_id = claims.sub;
+    // The rotated refresh token MUST be returned. It is not a convenience:
+    // the client stores what it is given, and a client left holding the
+    // retired token cannot renew, while a client left holding a token the
+    // server never linked to its access token cannot be logged out.
+    let refresh_token = match rotated.refresh_token.clone() {
+        Some(rt) => rt,
+        None => {
+            // `create_token` always mints one; a None here means that
+            // invariant broke. Refuse rather than hand back a half-rotated
+            // session whose refresh token is now unrecoverable.
+            error!(
+                "Token refresh produced no refresh token for user: {}",
+                rotated.user_id
+            );
+            // `.into()` because this handler's `Result` carries axum's
+            // `ErrorResponse`; the `?` operator elsewhere in this file does
+            // that conversion implicitly, an explicit `return Err` does not.
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, "Token creation failed").into());
+        }
+    };
 
-    // The refresh token already carries the original credential's
-    // principal (`AuthManager::create_token` stamps it on both the
-    // access and refresh claims) — forward it verbatim. Hardcoding
-    // `Human` here would silently decay an agent's credential to a
-    // human one on every refresh.
-    let new_token = auth_manager
-        .create_token(&user_id, claims.email, claims.roles, claims.principal)
-        .map_err(|e| {
-            error!("Failed to create new token during refresh: {:?}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, "Token creation failed")
-        })?;
-
-    info!("Token refresh successful for user: {}", user_id);
+    info!("Token refresh successful for user: {}", rotated.user_id);
 
     Ok(Json(RefreshResponse {
         success: true,
-        token: Some(new_token.token),
-        expires_in: Some(new_token.expires_at.timestamp() as u64),
+        token: Some(rotated.token),
+        refresh_token: Some(refresh_token),
+        expires_in: Some(rotated.expires_at.timestamp() as u64),
         error: None,
     }))
 }
