@@ -68,6 +68,16 @@ pub(crate) enum CurvedCdtError {
     /// after dedup, contour self-intersections that we didn't catch
     /// in `PolygonInvalid`).
     CdtFailed(cdt::Error),
+    /// A hole crosses the branch cut of the unrolled chart and the outer
+    /// loop could not be re-cut around it, so no single-branch polygon set
+    /// exists for this face. The outer loop of a full-wrap lateral carries
+    /// its parametric seam as a REAL edge walked once at each end of the
+    /// period, which pins the chart's branch; a hole straddling that branch
+    /// overhangs the outer bbox by the same amount whichever whole period
+    /// [`run_boundary_projection`] shifts it onto. Distinct from
+    /// `PolygonInvalid` so the trace names the geometry rather than the
+    /// symptom: the hole is real, the chart cannot express it.
+    SeamStraddlingHole,
     /// The `cdt` crate panicked internally on a degenerate input (an
     /// `assert!` in its constraint-insertion walk, e.g. a contour
     /// vertex lying exactly on another fixed edge). Caught via
@@ -86,6 +96,11 @@ impl std::fmt::Display for CurvedCdtError {
             }
             CurvedCdtError::PolygonInvalid => write!(f, "projected polygon is invalid"),
             CurvedCdtError::CdtFailed(e) => write!(f, "cdt crate rejected input: {:?}", e),
+            CurvedCdtError::SeamStraddlingHole => write!(
+                f,
+                "an inner loop crosses the chart's branch cut and the outer \
+                 loop could not be re-cut around it"
+            ),
             CurvedCdtError::CdtPanicked => {
                 write!(f, "cdt crate panicked internally on degenerate input")
             }
@@ -392,12 +407,18 @@ fn validate_loop(
 
 /// Run Step 0 (boundary projection + validation) for a face.
 /// Returns the outer loop's projection, every inner loop's projection,
-/// and the combined UV bbox (union over outer + all inners).
+/// and the OUTER loop's UV bbox — every inner is validated as contained
+/// in it, so it is already the union.
 ///
 /// On `Ok`, all per-loop validity checks have passed:
 /// - outer has ≥ 3 samples, non-zero signed area;
 /// - every inner has ≥ 3 samples, non-zero signed area, and its
 ///   bbox is contained in the outer's bbox.
+///
+/// The outer returned is not always the outer loop's own projection: a face
+/// whose hole straddles the chart's branch cut comes back with the outer
+/// RE-CUT at a hole-free branch (see [`reproject_at_hole_free_branch`]). The
+/// bbox returned is always that of the outer returned.
 pub(crate) fn run_boundary_projection(
     face: &Face,
     model: &BRepModel,
@@ -413,7 +434,34 @@ pub(crate) fn run_boundary_projection(
     validate_loop(&outer, None)?;
     let outer_bbox = uv_bbox_of(&outer.points_uv).ok_or(CurvedCdtError::DegenerateLoop)?;
 
-    // --- Inner loops ----------------------------------------------------
+    match align_inner_loops(face, model, cache, surface, outer_bbox) {
+        Ok(inners) => Ok((outer, inners, outer_bbox)),
+        // SEAM-STRADDLING HOLE: the whole-period alignment below cannot seat a
+        // hole that crosses the chart's BRANCH CUT — every integer shift leaves
+        // the same overhang on one side or the other. Re-cut the branch into a
+        // hole-free gap and try once more; declining leaves the original error
+        // (and with it the caller's existing fallback) exactly as it was.
+        Err(err) => match reproject_at_hole_free_branch(
+            face, outer_loop, model, cache, surface, outer_bbox, &err,
+        ) {
+            Some(rebuilt) => rebuilt,
+            None => Err(err),
+        },
+    }
+}
+
+/// Project, chart-align and validate every inner loop of `face` against an
+/// outer loop whose UV bbox is `outer_bbox`.
+///
+/// Split out of [`run_boundary_projection`] verbatim so the same walk can be
+/// re-run against a re-cut outer chart without duplicating the alignment rule.
+fn align_inner_loops(
+    face: &Face,
+    model: &BRepModel,
+    cache: &EdgeSampleCache,
+    surface: &dyn Surface,
+    outer_bbox: UvBBox,
+) -> Result<Vec<ProjectedLoop>, CurvedCdtError> {
     let mut inners: Vec<ProjectedLoop> = Vec::with_capacity(face.inner_loops.len());
     for &inner_id in &face.inner_loops {
         let inner_loop = match model.loops.get(inner_id) {
@@ -465,7 +513,323 @@ pub(crate) fn run_boundary_projection(
         inners.push(inner);
     }
 
-    Ok((outer, inners, outer_bbox))
+    Ok(inners)
+}
+
+/// Fractional part of `u - delta` on the circle of circumference `period`.
+#[inline]
+fn branch_phase(u: f64, delta: f64, period: f64) -> f64 {
+    (u - delta).rem_euclid(period)
+}
+
+/// Shortest signed step `d` on a circle of circumference `period`.
+///
+/// Closed-form via `rem_euclid`, like [`branch_phase`] above: a subtract-in-a-
+/// loop form is O(|d| / period) on a wild input and does not terminate at all
+/// for a non-positive period. `period <= 0` is not reachable from the re-cut
+/// (which declines such a surface before calling this), so it is answered here
+/// as the identity rather than by a second refusal channel.
+#[inline]
+fn wrapped_delta(d: f64, period: f64) -> f64 {
+    if period <= 0.0 || !period.is_finite() || !d.is_finite() {
+        return d;
+    }
+    let half = 0.5 * period;
+    let wrapped = (d + half).rem_euclid(period) - half;
+    // `rem_euclid` maps exactly `-half` and `+half` to `-half`; keep the sign of
+    // the input there so a half-period step is not silently flipped.
+    if wrapped == -half && d > 0.0 {
+        half
+    } else {
+        wrapped
+    }
+}
+
+/// Second chance for a face whose inner-loop validation failed: re-cut the
+/// unrolled chart's branch so no hole crosses it, then re-run the alignment.
+///
+/// **Why the whole-period alignment above cannot do this.** A full-wrap lateral
+/// carries its parametric seam as a REAL pair of boundary edges -- the outer
+/// loop walks the same edge ids twice, once at `u = 0` and once at
+/// `u = period` -- so the projected outer polygon is a rectangle pinned to the
+/// branch at `u = 0` no matter where the walk starts. A hole crossing that
+/// branch projects to an interval straddling it, and shifting the hole by whole
+/// periods (the `#35` rule above) only moves the overhang from one side of the
+/// rectangle to the other. Measured on a cylinder `r=10 h=20` with a window cut
+/// across the seam: outer bbox `u` in `[0, 2pi]`, hole `u` in
+/// `[2pi - 0.3047, 2pi + 0.3047]` -- the same `0.3047` rad overhangs for every
+/// whole-period shift.
+///
+/// Returns `None` when this is not that situation, in which case the caller
+/// keeps its original error and its existing fallback untouched:
+/// * the failure was not a containment rejection, or
+/// * the surface is not periodic in `u`, or
+/// * the outer does not sweep a full period (there is no branch to move), or
+/// * no inner loop actually straddles the branch.
+///
+/// Returns `Some(Err(SeamStraddlingHole))` when it IS that situation and the
+/// re-cut could not be made: the geometry is named rather than passed off as a
+/// generic `PolygonInvalid`.
+fn reproject_at_hole_free_branch(
+    face: &Face,
+    outer_loop: &Loop,
+    model: &BRepModel,
+    cache: &EdgeSampleCache,
+    surface: &dyn Surface,
+    outer_bbox: UvBBox,
+    err: &CurvedCdtError,
+) -> Option<Result<(ProjectedLoop, Vec<ProjectedLoop>, UvBBox), CurvedCdtError>> {
+    if !matches!(err, CurvedCdtError::PolygonInvalid) {
+        return None;
+    }
+    let period = effective_period_u_tess(surface)?;
+    // A non-positive or non-finite period is not a period; every arithmetic
+    // step below (phase, wrap, gap search) is meaningless on one, so decline
+    // rather than compute on it.
+    if period <= 0.0 || !period.is_finite() {
+        return None;
+    }
+    let (ou_lo, ou_hi, _, _) = outer_bbox;
+    // The branch only exists where the chart wraps a whole period.
+    if ((ou_hi - ou_lo) - period).abs() > 1e-6 * period {
+        return None;
+    }
+
+    // Re-project the inners raw (no chart alignment): their own unwrapped
+    // extents are what decide where a hole-free branch can go.
+    let mut raw: Vec<ProjectedLoop> = Vec::with_capacity(face.inner_loops.len());
+    for &inner_id in &face.inner_loops {
+        let inner_loop = model.loops.get(inner_id)?;
+        raw.push(project_loop_to_uv(inner_loop, model, cache, surface).ok()?);
+    }
+    if raw.is_empty() {
+        return None;
+    }
+
+    // Does any hole genuinely straddle the branch? A hole narrower than the
+    // period that no whole-period shift can seat inside the outer's u-range is
+    // exactly the straddle; anything else is a different failure.
+    let mut straddles = false;
+    for inner in &raw {
+        let (iu_lo, iu_hi, _, _) = uv_bbox_of(&inner.points_uv)?;
+        if iu_hi - iu_lo >= period {
+            continue;
+        }
+        let k = ((0.5 * (ou_lo + ou_hi) - 0.5 * (iu_lo + iu_hi)) / period).round();
+        if iu_lo + k * period < ou_lo || iu_hi + k * period > ou_hi {
+            straddles = true;
+        }
+    }
+    if !straddles {
+        return None;
+    }
+
+    let Some(delta) = hole_free_branch_u(&raw, period) else {
+        return Some(Err(CurvedCdtError::SeamStraddlingHole));
+    };
+    let Some(outer) = rebuild_outer_at_branch(outer_loop, model, cache, surface, delta, period)
+    else {
+        return Some(Err(CurvedCdtError::SeamStraddlingHole));
+    };
+    if validate_loop(&outer, None).is_err() {
+        return Some(Err(CurvedCdtError::SeamStraddlingHole));
+    }
+    let Some(bbox) = uv_bbox_of(&outer.points_uv) else {
+        return Some(Err(CurvedCdtError::SeamStraddlingHole));
+    };
+    match align_inner_loops(face, model, cache, surface, bbox) {
+        Ok(inners) => Some(Ok((outer, inners, bbox))),
+        Err(_) => Some(Err(CurvedCdtError::SeamStraddlingHole)),
+    }
+}
+
+/// The `u` at which the chart's branch cut can be placed so that no inner loop
+/// crosses it: the centre of the widest hole-free gap around the period.
+///
+/// Sibling of `tessellation::surface::compute_skin_seam_shift`, which picks the
+/// wrap column of the structured skin-lateral grid by the same argument (that
+/// one normalises the period to 1; this one carries the surface's own). Returns
+/// `None` when the holes leave no gap at all.
+fn hole_free_branch_u(inners: &[ProjectedLoop], period: f64) -> Option<f64> {
+    // Margin so the branch never lands ON a hole rim.
+    let margin = 1e-3 * period;
+    let mut occupied: Vec<(f64, f64)> = Vec::new();
+    for inner in inners {
+        let (lo, hi, _, _) = uv_bbox_of(&inner.points_uv)?;
+        if hi - lo + 2.0 * margin >= period {
+            return None;
+        }
+        let a = (lo - margin).rem_euclid(period);
+        let b = (hi + margin).rem_euclid(period);
+        if a <= b {
+            occupied.push((a, b));
+        } else {
+            occupied.push((a, period));
+            occupied.push((0.0, b));
+        }
+    }
+    occupied.sort_by(|x, y| x.0.partial_cmp(&y.0).unwrap_or(std::cmp::Ordering::Equal));
+    let mut merged: Vec<(f64, f64)> = Vec::new();
+    for &(a, b) in &occupied {
+        if let Some(last) = merged.last_mut() {
+            if a <= last.1 {
+                last.1 = last.1.max(b);
+                continue;
+            }
+        }
+        merged.push((a, b));
+    }
+    let last_hi = merged.last()?.1;
+    let first_lo = merged[0].0;
+    let mut best_gap = (first_lo + period) - last_hi;
+    let mut best_mid = (0.5 * (last_hi + first_lo + period)).rem_euclid(period);
+    for w in merged.windows(2) {
+        let gap = w[1].0 - w[0].1;
+        if gap > best_gap {
+            best_gap = gap;
+            best_mid = 0.5 * (w[0].1 + w[1].0);
+        }
+    }
+    if best_gap <= 0.0 {
+        return None;
+    }
+    Some(best_mid)
+}
+
+/// Rebuild a full-wrap outer loop's UV projection with the chart's branch cut
+/// moved to `delta`.
+///
+/// The seam edges are the only edge ids the outer loop walks TWICE (once at each
+/// end of the period). Dropping them leaves the two rim chains; each is
+/// re-started at its sample nearest the new branch and unwrapped from there, so
+/// the polygon becomes the same rectangle re-cut at `delta` instead of at the
+/// seam. Every emitted 3D position is still a cached sample taken VERBATIM, in
+/// the chain's original traversal order, so the shared-edge coherence contract
+/// `project_loop_to_uv` documents holds unchanged; only chart coordinates move.
+/// The two chart columns that close the polygon run between the SAME two 3D
+/// samples (a chain's re-emitted start point closes it a whole period later), so
+/// they weld to each other exactly as the `u = 0` / `u = period` seam pair does
+/// today.
+///
+/// Declines (`None`) unless the loop is exactly that structure: at least one
+/// doubled edge id, the remaining edges forming exactly two cyclic runs, and
+/// each run sweeping one full period in `u`.
+fn rebuild_outer_at_branch(
+    outer_loop: &Loop,
+    model: &BRepModel,
+    cache: &EdgeSampleCache,
+    surface: &dyn Surface,
+    delta: f64,
+    period: f64,
+) -> Option<ProjectedLoop> {
+    let n = outer_loop.edges.len();
+    if n < 2 {
+        return None;
+    }
+    let is_seam: Vec<bool> = outer_loop
+        .edges
+        .iter()
+        .map(|e| outer_loop.edges.iter().filter(|o| *o == e).count() > 1)
+        .collect();
+    // Start the cyclic scan on a seam edge so the runs come out whole.
+    let start = is_seam.iter().position(|&b| b)?;
+    let mut runs: Vec<Vec<usize>> = Vec::new();
+    let mut current: Vec<usize> = Vec::new();
+    for k in 0..n {
+        let i = (start + k) % n;
+        if is_seam[i] {
+            if !current.is_empty() {
+                runs.push(std::mem::take(&mut current));
+            }
+        } else {
+            current.push(i);
+        }
+    }
+    if !current.is_empty() {
+        runs.push(current);
+    }
+    if runs.len() != 2 {
+        return None;
+    }
+
+    // Same positivity contract as `period`: a surface that advertises a
+    // non-positive v-period gets no v-unwrap rather than nonsense arithmetic.
+    let v_period = effective_period_v_tess(surface).filter(|p| *p > 0.0 && p.is_finite());
+    let mut points_3d: Vec<Point3> = Vec::new();
+    let mut points_uv: Vec<(f64, f64)> = Vec::new();
+
+    for run in &runs {
+        // Cached 3D of the chain, drop-last per edge exactly as
+        // `project_loop_to_uv` does -- the omitted endpoint of the run's final
+        // edge is the run's own first sample, which the re-cut re-emits.
+        let mut chain: Vec<Point3> = Vec::new();
+        for &i in run {
+            let samples = cache.get_or_compute(outer_loop.edges[i], model);
+            let m = samples.len();
+            if m < 2 {
+                return None;
+            }
+            if outer_loop.orientations.get(i).copied().unwrap_or(true) {
+                chain.extend_from_slice(&samples[..m - 1]);
+            } else {
+                chain.extend(samples[1..m].iter().rev().copied());
+            }
+        }
+        let m = chain.len();
+        if m < 3 {
+            return None;
+        }
+        let mut raw: Vec<(f64, f64)> = Vec::with_capacity(m);
+        for p in &chain {
+            raw.push(surface.closest_point(p, Tolerance::default()).ok()?);
+        }
+        // A chain that does not sweep exactly one period is not a rim of a
+        // full-wrap band, and re-cutting its branch would be meaningless.
+        let net: f64 = (0..m)
+            .map(|k| wrapped_delta(raw[(k + 1) % m].0 - raw[k].0, period))
+            .sum();
+        if (net.abs() - period).abs() > 1e-6 * period {
+            return None;
+        }
+        // Enter the chain where it crosses the new branch: an ascending chain
+        // starts just above `delta` and climbs a period; a descending one starts
+        // just below `delta + period` and falls a period. Either way the chain
+        // then spans the branch-to-branch interval exactly once.
+        let phase = |k: usize| branch_phase(raw[k].0, delta, period);
+        let cmp = |a: &usize, b: &usize| {
+            phase(*a)
+                .partial_cmp(&phase(*b))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        };
+        let pivot = if net > 0.0 {
+            (0..m).min_by(cmp)?
+        } else {
+            (0..m).max_by(cmp)?
+        };
+        let mut u = delta + phase(pivot);
+        let mut v = raw[pivot].1;
+        points_3d.push(chain[pivot]);
+        points_uv.push((u, v));
+        // `m` steps: the last returns to the pivot, re-emitted one period on,
+        // which is where the closing chart column stands.
+        for k in 1..=m {
+            let i = (pivot + k) % m;
+            let prev = (pivot + k - 1) % m;
+            u += wrapped_delta(raw[i].0 - raw[prev].0, period);
+            v = match v_period {
+                Some(pv) => v + wrapped_delta(raw[i].1 - raw[prev].1, pv),
+                None => raw[i].1,
+            };
+            points_3d.push(chain[i]);
+            points_uv.push((u, v));
+        }
+    }
+
+    Some(ProjectedLoop {
+        points_3d,
+        points_uv,
+        loop_type: outer_loop.loop_type,
+    })
 }
 
 /// Compute the "chart handedness" of a surface at the centre of an
@@ -2299,15 +2663,50 @@ mod tests {
     /// `format!` impl drifting out of sync with the enum.
     #[test]
     fn error_display_covers_all_variants() {
-        let cases: [CurvedCdtError; 3] = [
+        let cases: [CurvedCdtError; 5] = [
             CurvedCdtError::DegenerateLoop,
             CurvedCdtError::ProjectionFailed,
             CurvedCdtError::PolygonInvalid,
+            CurvedCdtError::SeamStraddlingHole,
+            CurvedCdtError::CdtPanicked,
         ];
         for e in &cases {
             let s = format!("{}", e);
             assert!(!s.is_empty(), "Display impl must not produce empty strings");
+            // A continued string literal keeps its source indentation unless the
+            // continuation is escaped; a run of spaces in the rendered message is
+            // that mistake reaching the log.
+            assert!(
+                !s.contains("  "),
+                "Display message carries a run of spaces from its source \
+                 indentation: {s:?}"
+            );
         }
+    }
+
+    /// `wrapped_delta` is closed-form and total.
+    ///
+    /// The first cut subtracted the period in a loop, which is
+    /// O(|d| / period) on a wild input and does not terminate at all on a
+    /// non-positive period — and `effective_period_v_tess` carries no
+    /// positivity guarantee, so a surface advertising `Some(0.0)` would have
+    /// hung the whole tessellation pass. Each case below hangs the old form.
+    #[test]
+    fn wrapped_delta_is_closed_form_and_total() {
+        // A non-positive or non-finite period: answer the input, never spin.
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(wrapped_delta(1.5, bad), 1.5, "period {bad} must not spin");
+        }
+        assert!(wrapped_delta(f64::NAN, 1.0).is_nan());
+        // A wild displacement resolves in constant time.
+        let p = std::f64::consts::TAU;
+        assert!((wrapped_delta(1.0e12 * p + 0.25, p) - 0.25).abs() < 1e-3);
+        assert!((wrapped_delta(-1.0e12 * p - 0.25, p) + 0.25).abs() < 1e-3);
+        // Ordinary steps are unchanged, and the half-period keeps its sign.
+        assert!((wrapped_delta(0.25, p) - 0.25).abs() < 1e-15);
+        assert!((wrapped_delta(p - 0.25, p) + 0.25).abs() < 1e-12);
+        assert!((wrapped_delta(0.5 * p, p) - 0.5 * p).abs() < 1e-12);
+        assert!((wrapped_delta(-0.5 * p, p) + 0.5 * p).abs() < 1e-12);
     }
 
     /// Mock surface whose declared normal is flipped relative to
@@ -2727,6 +3126,7 @@ mod tests {
                 CurvedCdtError::CdtFailed(_)
                 | CurvedCdtError::CdtPanicked
                 | CurvedCdtError::PolygonInvalid
+                | CurvedCdtError::SeamStraddlingHole
                 | CurvedCdtError::DegenerateLoop => {
                     // Expected: CDT crate rejected the self-
                     // intersecting input (or panicked on it, caught

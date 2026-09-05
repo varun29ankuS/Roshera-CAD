@@ -103,6 +103,45 @@ fn linear_steps_for_quality(length: f64, params: &TessellationParams) -> usize {
         .min(params.max_segments)
 }
 
+/// May a curved-CDT failure on a CYLINDER face be answered with the untrimmed
+/// analytic grid?
+///
+/// The grid covers the surface's whole intrinsic domain and reads no trim loop,
+/// so it is a truthful stand-in only when the thing that failed was the CHART,
+/// not the TRIM. Two failures, two answers:
+///
+/// * A rotated cylinder whose seam desynced from the cap circles trips
+///   `CdtFailed(PointOnFixedEdge)`; emitting nothing there drops the lateral
+///   and collapses the divergence-theorem volume to the cone value (~1/3).
+///   The grid is right: the wall is genuinely untrimmed, and a possible seam
+///   T-junction is far cheaper than a 3x mass error.
+/// * `SeamStraddlingHole` says the opposite: there IS a hole, the chart just
+///   cannot hold it. Gridding it emits the full untouched wall and reports a
+///   part with no window — a measurement presented as fact. Refused; the face
+///   is left absent so `manifold_report` and `certify_solid` see the shell
+///   open and say so.
+///
+/// Written as an exhaustive `match` with NO wildcard arm on purpose. A
+/// `!matches!(e, SeamStraddlingHole)` reads the same and is not the same: it
+/// puts every future variant on the grid side silently, which is how a new
+/// honest-refusal case would be answered with a wall that says the hole was
+/// never cut. With the arms spelled out, adding a variant to
+/// [`CurvedCdtError`](super::curved_cdt::CurvedCdtError) stops the build here
+/// and someone has to decide which side it belongs on.
+pub(crate) fn cylinder_err_may_take_untrimmed_grid(e: &super::curved_cdt::CurvedCdtError) -> bool {
+    use super::curved_cdt::CurvedCdtError as E;
+    match e {
+        // CHART failures: the trim is fine, the parametrisation is not.
+        E::DegenerateLoop
+        | E::ProjectionFailed
+        | E::PolygonInvalid
+        | E::CdtFailed(_)
+        | E::CdtPanicked => true,
+        // TRIM failure: the hole is real and the grid cannot express it.
+        E::SeamStraddlingHole => false,
+    }
+}
+
 /// Tessellate a face into triangles
 pub fn tessellate_face(
     face: &Face,
@@ -143,6 +182,35 @@ pub fn tessellate_face(
             } else if let Err(e) =
                 super::curved_cdt::tessellate_curved_cdt(surface, face, model, params, cache, mesh)
             {
+                if !cylinder_err_may_take_untrimmed_grid(&e) {
+                    // A hole that crosses the chart's branch cut which the
+                    // re-cut could not move (`SeamStraddlingHole`). The grid
+                    // below cannot express ANY hole — it would emit the full
+                    // untouched wall, which is the exact lie this task exists
+                    // to remove: a window that is in the B-Rep, absent from the
+                    // mesh, and invisible to every consumer downstream.
+                    //
+                    // Emit nothing for this face. The shell then has a hole the
+                    // size of the wall, `manifold_report` counts its boundary
+                    // edges, and `certify_solid`'s watertight dimension goes
+                    // false — the defect is LOUD instead of silent. That is the
+                    // honest-refusal trade: a missing wall a human can see
+                    // beats a solid wall that says the window was never cut.
+                    if std::env::var("ROSHERA_TESS_TRACE").is_ok() {
+                        eprintln!(
+                            "[tess] REFUSE cylinder face {:?}: {} -> no mesh emitted \
+                             (the untrimmed grid cannot express this hole)",
+                            face.id, e
+                        );
+                    }
+                    tracing::warn!(
+                        "curved_cdt refused cylinder face {:?}: {}; no mesh emitted, \
+                         the shell will read open",
+                        face.id,
+                        e
+                    );
+                    return;
+                }
                 // curved-CDT can fail on a transformed (e.g. rotated) cylinder:
                 // once the lateral seam no longer coincides with the cap
                 // circles' t=0, a projected boundary sample can land exactly on
@@ -9801,6 +9869,137 @@ pub(crate) fn weld_mesh_watertight_range(
             "weld_mesh_watertight_range: collapsed {welded} duplicate vertices, \
              G1-smoothed {g1_smoothed} canonical normals, removed {doubled_removed} \
              doubled-facet triangles (tol={weld_tolerance:e}, v_start={v_start})"
+        );
+    }
+}
+
+#[cfg(test)]
+mod cylinder_err_routing_tests {
+    //! The cylinder arm's grid-vs-refuse decision, exhaustively.
+    //!
+    //! `cylinder_err_may_take_untrimmed_grid` is the whole of Task 33's honest
+    //! refusal: the untrimmed grid reads no trim loop, so answering a
+    //! `SeamStraddlingHole` with it emits a wall that says the hole was never
+    //! cut. The predicate has ONE production call site — the `"Cylinder"` arm of
+    //! [`super::tessellate_face`].
+    //!
+    //! Two things keep a later variant off the grid side, and the first is not
+    //! a test: the predicate is an exhaustive `match` with no wildcard, so a new
+    //! `CurvedCdtError` variant is a COMPILE ERROR here. The table below then
+    //! pins the answer for each of the six variants that exist, so a wildcard
+    //! reintroduced later cannot pass silently either.
+    use super::cylinder_err_may_take_untrimmed_grid as may_grid;
+    use crate::tessellation::curved_cdt::CurvedCdtError;
+
+    #[test]
+    fn only_a_seam_straddling_hole_refuses_the_untrimmed_grid() {
+        assert!(
+            !may_grid(&CurvedCdtError::SeamStraddlingHole),
+            "a hole the chart cannot hold must NOT be answered with a grid that \
+             cannot express any hole"
+        );
+        // Every other variant is a CHART failure, not a TRIM failure: the grid
+        // is the truthful stand-in (the rotated-cylinder 3x volume guard).
+        // All five are listed; with the one above that is every variant of
+        // `CurvedCdtError`, so this table is complete as written and the
+        // predicate's own exhaustive match keeps it complete.
+        for e in [
+            CurvedCdtError::DegenerateLoop,
+            CurvedCdtError::ProjectionFailed,
+            CurvedCdtError::PolygonInvalid,
+            CurvedCdtError::CdtFailed(cdt::Error::EmptyInput),
+            CurvedCdtError::CdtPanicked,
+        ] {
+            assert!(
+                may_grid(&e),
+                "{e:?} is a chart failure and must keep the untrimmed-grid fallback"
+            );
+        }
+    }
+
+    /// Disconnection gate: the truth table above stays green if the `"Cylinder"`
+    /// arm stops CALLING the predicate, and so does every behaviour test in
+    /// `tests/tessellated_window.rs` — deleting the discriminating branch would
+    /// restore the silent hole-less grid with nothing turning red. This asserts
+    /// the PRODUCTION call site by source, which is the only handle a unit test
+    /// has on a match arm reached through a whole-solid tessellation.
+    ///
+    /// It pins three things, because any one alone is satisfiable by an edit
+    /// that reintroduces the defect: the predicate is called from the arm and
+    /// NEGATED; the refusal returns BEFORE the untrimmed grid runs; and the
+    /// predicate is the thing that names `SeamStraddlingHole`.
+    #[test]
+    fn the_cylinder_arm_routes_a_seam_straddling_hole_to_the_no_emit_branch() {
+        // Normalise line endings FIRST: this repo checks out with
+        // `core.autocrlf=true`, so a `\n` in any needle below would silently
+        // never match on a Windows working tree, and a source gate that cannot
+        // fail is worse than no gate at all.
+        let source = include_str!("surface.rs").replace("\r\n", "\n");
+        // Scan PRODUCTION source only — this test's own body is part of the
+        // file and would otherwise match its own needles.
+        let production = source
+            .split("\n#[cfg(test)]")
+            .next()
+            .expect("split always yields a first element");
+
+        // Definition + exactly one call site. Zero calls means the arm dropped
+        // the discriminator; more than one means a second, unreviewed consumer.
+        assert_eq!(
+            production
+                .matches("cylinder_err_may_take_untrimmed_grid(")
+                .count(),
+            2,
+            "cylinder_err_may_take_untrimmed_grid must be DEFINED once and CALLED \
+             from exactly one production site (the \"Cylinder\" arm)"
+        );
+
+        // The predicate is where the variant is named; without this the call
+        // site could be wired to a predicate that refuses nothing.
+        let predicate = production
+            .split("pub(crate) fn cylinder_err_may_take_untrimmed_grid(")
+            .nth(1)
+            .expect("the predicate must be defined in production source")
+            .split("\n}\n")
+            .next()
+            .expect("the predicate must have a body");
+        assert!(
+            predicate.contains("SeamStraddlingHole => false,"),
+            "the predicate must name SeamStraddlingHole and ANSWER false for it -              the call site could otherwise be wired to a predicate that refuses nothing"
+        );
+        assert!(
+            !predicate.contains("_ =>"),
+            "the predicate must stay an exhaustive match with no wildcard, so a new              CurvedCdtError variant is a compile error rather than a silent grid"
+        );
+
+        // The arm itself: from the `"Cylinder"` match arm to the next one.
+        let arm = production
+            .split("\"Cylinder\" => {")
+            .nth(1)
+            .expect("tessellate_face must still have a \"Cylinder\" match arm")
+            .split("\"Sphere\" =>")
+            .next()
+            .expect("the \"Cylinder\" arm must be followed by the \"Sphere\" arm");
+
+        let refuse = arm
+            .find("if !cylinder_err_may_take_untrimmed_grid(&e) {")
+            .expect(
+                "the \"Cylinder\" arm must ask, NEGATED, whether this failure may take \
+                 the untrimmed grid",
+            );
+        let no_emit = arm[refuse..]
+            .find("\n                    return;")
+            .map(|i| refuse + i)
+            .expect(
+                "the refusal branch must RETURN without emitting — a grid drawn after \
+                 the refusal is the defect, not the fix",
+            );
+        let grid = arm
+            .find("tessellate_surface_grid_untrimmed(")
+            .expect("the arm must still keep the untrimmed-grid fallback for every other error");
+        assert!(
+            refuse < no_emit && no_emit < grid,
+            "the refusal must be decided and returned BEFORE the untrimmed grid runs \
+             (refuse at {refuse}, return at {no_emit}, grid at {grid})"
         );
     }
 }
