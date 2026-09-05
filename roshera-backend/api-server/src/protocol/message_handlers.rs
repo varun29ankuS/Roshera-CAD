@@ -2040,8 +2040,9 @@ async fn handle_websocket_connection(socket: WebSocket, state: AppState) {
                                 require_ws_auth!(request_id);
                                 info!("Processing export command: {:?}", command);
 
-                                // Use the actual export engine
-                                let export_engine = state.export_engine.clone();
+                                // The STL/OBJ helpers reach the export engine
+                                // through `state`; the model read guard is
+                                // taken here so it spans the whole match.
                                 let model = state.model.read().await;
 
                                 let response = match command {
@@ -2054,106 +2055,13 @@ async fn handle_websocket_connection(socket: WebSocket, state: AppState) {
                                             object_ids.len(),
                                             format
                                         );
-
-                                        // Convert ObjectIds (UUIDs) to local solid IDs (u32)
-                                        let mut solid_ids = Vec::new();
-                                        for obj_id in &object_ids {
-                                            // ObjectId is just uuid::Uuid
-                                            // Convert UUID to local u32 ID for fast geometry operations
-                                            if let Some(local_id) = state.get_local_id(obj_id) {
-                                                solid_ids.push(local_id);
-                                            }
-                                        }
-
-                                        // Get solids from model
-                                        let mut solids_to_export = Vec::new();
-                                        for solid_id in solid_ids {
-                                            if let Some(solid) = model.get_solid(solid_id) {
-                                                solids_to_export.push(solid.clone());
-                                            }
-                                        }
-
-                                        if !solids_to_export.is_empty() {
-                                            // Generate filename with timestamp
-                                            let timestamp =
-                                                chrono::Utc::now().format("%Y%m%d_%H%M%S");
-                                            let filename = format!("export_{}.stl", timestamp);
-
-                                            // Tessellate solids to create mesh for export
-                                            let mut all_vertices = Vec::new();
-                                            let mut all_indices = Vec::new();
-                                            let mut vertex_offset = 0;
-
-                                            for solid in &solids_to_export {
-                                                // Tessellate each solid
-                                                if let Some(tessellated) =
-                                                    model.tessellate_solid(solid.id, 0.01)
-                                                {
-                                                    // Add vertices (already [f32; 3] arrays)
-                                                    for v in &tessellated.vertices {
-                                                        all_vertices.push(*v);
-                                                    }
-                                                    // Add indices with offset
-                                                    for idx in &tessellated.indices {
-                                                        all_indices
-                                                            .push(idx + vertex_offset as u32);
-                                                    }
-                                                    vertex_offset += tessellated.vertices.len();
-                                                }
-                                            }
-
-                                            // Create mesh for export - flatten vertices to Vec<f32>
-                                            let flat_vertices = all_vertices
-                                                .iter()
-                                                .flat_map(|v| vec![v[0], v[1], v[2]])
-                                                .collect();
-
-                                            let mesh = shared_types::Mesh {
-                                                vertices: flat_vertices,
-                                                indices: all_indices,
-                                                normals: vec![], // Would compute normals in production
-                                                uvs: None,
-                                                colors: None, // Optional field
-                                                face_map: None,
-                                            };
-
-                                            // Execute export
-                                            match export_engine.export_stl(&mesh, &filename).await {
-                                                Ok(result_path) => {
-                                                    info!(
-                                                        "Successfully exported to {}",
-                                                        result_path
-                                                    );
-                                                    ServerMessage::ExportComplete {
-                                                        result:
-                                                            super::protocol::ExportResult::STL {
-                                                                filename: result_path,
-                                                                size_bytes: 0, // Would get actual file size in production
-                                                            },
-                                                        request_id,
-                                                    }
-                                                }
-                                                Err(e) => {
-                                                    error!("STL export failed: {:?}", e);
-                                                    ServerMessage::Error {
-                                                        error_code: "EXPORT_FAILED".to_string(),
-                                                        message: format!(
-                                                            "Failed to export STL: {:?}",
-                                                            e
-                                                        ),
-                                                        details: None,
-                                                        request_id,
-                                                    }
-                                                }
-                                            }
-                                        } else {
-                                            ServerMessage::Error {
-                                                error_code: "NO_OBJECTS".to_string(),
-                                                message: "No valid objects to export".to_string(),
-                                                details: None,
-                                                request_id,
-                                            }
-                                        }
+                                        ws_export_stl_message(
+                                            &state,
+                                            &model,
+                                            &object_ids,
+                                            request_id,
+                                        )
+                                        .await
                                     }
                                     super::protocol::ExportWSCommand::ExportOBJ {
                                         object_ids,
@@ -2164,110 +2072,14 @@ async fn handle_websocket_connection(socket: WebSocket, state: AppState) {
                                             object_ids.len(),
                                             include_materials
                                         );
-
-                                        // Convert ObjectIds (UUIDs) to local solid IDs (u32)
-                                        let mut solid_ids = Vec::new();
-                                        for obj_id in &object_ids {
-                                            // ObjectId is just uuid::Uuid
-                                            // Convert UUID to local u32 ID for fast geometry operations
-                                            if let Some(local_id) = state.get_local_id(obj_id) {
-                                                solid_ids.push(local_id);
-                                            }
-                                        }
-
-                                        // Get solids from model
-                                        let mut solids_to_export = Vec::new();
-                                        for solid_id in solid_ids {
-                                            if let Some(solid) = model.get_solid(solid_id) {
-                                                solids_to_export.push(solid.clone());
-                                            }
-                                        }
-
-                                        if !solids_to_export.is_empty() {
-                                            let timestamp =
-                                                chrono::Utc::now().format("%Y%m%d_%H%M%S");
-                                            let obj_filename = format!("export_{}.obj", timestamp);
-                                            let mtl_filename = if include_materials {
-                                                Some(format!("export_{}.mtl", timestamp))
-                                            } else {
-                                                None
-                                            };
-
-                                            // Tessellate and create mesh for OBJ export
-                                            let mut all_vertices = Vec::new();
-                                            let mut all_indices = Vec::new();
-                                            let mut vertex_offset = 0;
-
-                                            for solid in &solids_to_export {
-                                                if let Some(tessellated) =
-                                                    model.tessellate_solid(solid.id, 0.01)
-                                                {
-                                                    for v in &tessellated.vertices {
-                                                        // Vertices are already [f32; 3] arrays
-                                                        all_vertices.push(*v);
-                                                    }
-                                                    for idx in &tessellated.indices {
-                                                        all_indices
-                                                            .push(idx + vertex_offset as u32);
-                                                    }
-                                                    vertex_offset += tessellated.vertices.len();
-                                                }
-                                            }
-                                            // Flatten vertices for OBJ export
-                                            let flat_vertices = all_vertices
-                                                .iter()
-                                                .flat_map(|v| vec![v[0], v[1], v[2]])
-                                                .collect();
-
-                                            let mesh = shared_types::Mesh {
-                                                vertices: flat_vertices,
-                                                indices: all_indices,
-                                                normals: vec![],
-                                                uvs: None,
-                                                colors: None,
-                                                face_map: None,
-                                            };
-
-                                            match export_engine
-                                                .export_obj(&mesh, &obj_filename)
-                                                .await
-                                            {
-                                                Ok(result_path) => {
-                                                    info!(
-                                                        "Successfully exported to OBJ: {}",
-                                                        result_path
-                                                    );
-                                                    ServerMessage::ExportComplete {
-                                                        result:
-                                                            super::protocol::ExportResult::OBJ {
-                                                                obj_file: result_path,
-                                                                mtl_file: mtl_filename,
-                                                                size_bytes: 0, // Would get actual file size
-                                                            },
-                                                        request_id,
-                                                    }
-                                                }
-                                                Err(e) => {
-                                                    error!("OBJ export failed: {:?}", e);
-                                                    ServerMessage::Error {
-                                                        error_code: "EXPORT_FAILED".to_string(),
-                                                        message: format!(
-                                                            "Failed to export OBJ: {:?}",
-                                                            e
-                                                        ),
-                                                        details: None,
-                                                        request_id,
-                                                    }
-                                                }
-                                            }
-                                        } else {
-                                            ServerMessage::Error {
-                                                error_code: "NO_OBJECTS".to_string(),
-                                                message: "No valid objects to export".to_string(),
-                                                details: None,
-                                                request_id,
-                                            }
-                                        }
+                                        ws_export_obj_message(
+                                            &state,
+                                            &model,
+                                            &object_ids,
+                                            include_materials,
+                                            request_id,
+                                        )
+                                        .await
                                     }
                                     super::protocol::ExportWSCommand::ExportROS {
                                         filename,
@@ -2857,6 +2669,199 @@ async fn handle_websocket_connection(socket: WebSocket, state: AppState) {
         "INFO",
         &format!("WebSocket connection closed for user {}", user_id),
     );
+}
+
+/// Resolve the WS export command's `object_ids` to the kernel-local solid
+/// ids that are actually present in the model.
+///
+/// Shared by the STL and OBJ helpers below so both gate — and both export
+/// — exactly the same set of solids. An id that maps to nothing, or maps
+/// to a solid the model no longer holds, is dropped here exactly as it
+/// was when this loop lived inline in each arm.
+fn ws_export_resolve_solids(
+    state: &AppState,
+    model: &BRepModel,
+    object_ids: &[shared_types::ObjectId],
+) -> Vec<SolidId> {
+    let mut resolved = Vec::with_capacity(object_ids.len());
+    for obj_id in object_ids {
+        // ObjectId is just uuid::Uuid — convert to the local u32 id the
+        // kernel indexes solids by.
+        if let Some(local_id) = state.get_local_id(obj_id) {
+            if model.get_solid(local_id).is_some() {
+                resolved.push(local_id);
+            }
+        }
+    }
+    resolved
+}
+
+/// Fan-tessellate every resolved solid and merge into one display mesh —
+/// the WS export path's own mesh builder, lifted verbatim out of the two
+/// arms so the emptiness gate below has a single value to judge.
+fn ws_export_merged_mesh(model: &BRepModel, solids: &[SolidId]) -> shared_types::Mesh {
+    let mut all_vertices: Vec<[f32; 3]> = Vec::new();
+    let mut all_indices: Vec<u32> = Vec::new();
+    let mut vertex_offset = 0usize;
+
+    for &solid_id in solids {
+        if let Some(tessellated) = model.tessellate_solid(solid_id, 0.01) {
+            // Vertices are already [f32; 3] arrays
+            for v in &tessellated.vertices {
+                all_vertices.push(*v);
+            }
+            for idx in &tessellated.indices {
+                all_indices.push(idx + vertex_offset as u32);
+            }
+            vertex_offset += tessellated.vertices.len();
+        }
+    }
+
+    let flat_vertices = all_vertices
+        .iter()
+        .flat_map(|v| vec![v[0], v[1], v[2]])
+        .collect();
+
+    shared_types::Mesh {
+        vertices: flat_vertices,
+        indices: all_indices,
+        normals: vec![], // Would compute normals in production
+        uvs: None,
+        colors: None, // Optional field
+        face_map: None,
+    }
+}
+
+/// The WebSocket `ExportSTL` command, as a value.
+///
+/// Extracted from the `ExportCommand` match arm so the export gate it now
+/// runs is reachable from a test: the arm itself sits behind a live socket
+/// and cannot be driven without one. `ws_export_arms_run_the_export_gate`
+/// pins the production call site.
+pub(crate) async fn ws_export_stl_message(
+    state: &AppState,
+    model: &BRepModel,
+    object_ids: &[shared_types::ObjectId],
+    request_id: Option<String>,
+) -> ServerMessage {
+    let solids_to_export = ws_export_resolve_solids(state, model, object_ids);
+    if solids_to_export.is_empty() {
+        return ServerMessage::Error {
+            error_code: "NO_OBJECTS".to_string(),
+            message: "No valid objects to export".to_string(),
+            details: None,
+            request_id,
+        };
+    }
+
+    // THE EXPORT GATE — the same function `POST /api/export` calls, not a
+    // copy of it. An STL on disk carries no ambient certificate, so this
+    // is the last point at which the kernel can still tell the truth about
+    // the solid it is about to become a file. `ExportSTL` carries no
+    // `acknowledge_unsound` field, so this transport refuses without an
+    // escape; the REST route takes the flag for repair flows.
+    if let Err(refusal) =
+        crate::handlers::export::export_soundness_gate(model, &solids_to_export, false)
+    {
+        return refusal.into_ws_error(request_id);
+    }
+
+    // Generate filename with timestamp
+    let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
+    let filename = format!("export_{}.stl", timestamp);
+
+    let mesh = ws_export_merged_mesh(model, &solids_to_export);
+    if let Err(refusal) = crate::handlers::export::refuse_empty_tessellation(mesh.indices.len()) {
+        return refusal.into_ws_error(request_id);
+    }
+
+    match state.export_engine.export_stl(&mesh, &filename).await {
+        Ok(result_path) => {
+            info!("Successfully exported to {}", result_path);
+            ServerMessage::ExportComplete {
+                result: super::protocol::ExportResult::STL {
+                    filename: result_path,
+                    size_bytes: 0, // Would get actual file size in production
+                },
+                request_id,
+            }
+        }
+        Err(e) => {
+            error!("STL export failed: {:?}", e);
+            ServerMessage::Error {
+                error_code: "EXPORT_FAILED".to_string(),
+                message: format!("Failed to export STL: {:?}", e),
+                details: None,
+                request_id,
+            }
+        }
+    }
+}
+
+/// The WebSocket `ExportOBJ` command, as a value. See
+/// [`ws_export_stl_message`] for why this is a function and not an inline
+/// match arm.
+pub(crate) async fn ws_export_obj_message(
+    state: &AppState,
+    model: &BRepModel,
+    object_ids: &[shared_types::ObjectId],
+    include_materials: bool,
+    request_id: Option<String>,
+) -> ServerMessage {
+    let solids_to_export = ws_export_resolve_solids(state, model, object_ids);
+    if solids_to_export.is_empty() {
+        return ServerMessage::Error {
+            error_code: "NO_OBJECTS".to_string(),
+            message: "No valid objects to export".to_string(),
+            details: None,
+            request_id,
+        };
+    }
+
+    // THE EXPORT GATE — see `ws_export_stl_message`. Both arms run the
+    // shared gate; a gate wired into one transport's STL arm and not its
+    // OBJ arm is the same hole in a smaller room.
+    if let Err(refusal) =
+        crate::handlers::export::export_soundness_gate(model, &solids_to_export, false)
+    {
+        return refusal.into_ws_error(request_id);
+    }
+
+    let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
+    let obj_filename = format!("export_{}.obj", timestamp);
+    let mtl_filename = if include_materials {
+        Some(format!("export_{}.mtl", timestamp))
+    } else {
+        None
+    };
+
+    let mesh = ws_export_merged_mesh(model, &solids_to_export);
+    if let Err(refusal) = crate::handlers::export::refuse_empty_tessellation(mesh.indices.len()) {
+        return refusal.into_ws_error(request_id);
+    }
+
+    match state.export_engine.export_obj(&mesh, &obj_filename).await {
+        Ok(result_path) => {
+            info!("Successfully exported to OBJ: {}", result_path);
+            ServerMessage::ExportComplete {
+                result: super::protocol::ExportResult::OBJ {
+                    obj_file: result_path,
+                    mtl_file: mtl_filename,
+                    size_bytes: 0, // Would get actual file size
+                },
+                request_id,
+            }
+        }
+        Err(e) => {
+            error!("OBJ export failed: {:?}", e);
+            ServerMessage::Error {
+                error_code: "EXPORT_FAILED".to_string(),
+                message: format!("Failed to export OBJ: {:?}", e),
+                details: None,
+                request_id,
+            }
+        }
+    }
 }
 
 async fn send_collaborators_update(
@@ -4019,5 +4024,306 @@ mod tests {
             Some(created),
             "the id the response reports must resolve to the solid the same frame created"
         );
+    }
+
+    // ── The WebSocket export must not walk around the unsound gate ──────
+    //
+    // `POST /api/export` has refused an unsound solid since item 8 of the
+    // S5 audit (`handlers/export.rs`, `export_unsound_gate_tests.rs`). The
+    // WS `ExportCommand` arms read no certificate at all: the documented
+    // unsound piston was refused over REST and written to disk over WS,
+    // and a solid whose display tessellation is empty produced an 84-byte
+    // STL plus `ExportComplete { size_bytes: 0 }`. These four pin the same
+    // gate on the WS transport, through the SAME function `export_mesh`
+    // calls — `handlers::export::export_soundness_gate` /
+    // `refuse_empty_tessellation` — so the two transports cannot drift.
+    //
+    // The arms themselves sit behind a live socket, so the tests drive
+    // `ws_export_stl_message` / `ws_export_obj_message` (the whole arm
+    // body, extracted) and `ws_export_arms_run_the_export_gate` pins the
+    // production call sites by source — the Task 7 discipline.
+
+    /// Read the `error_code` / `details` off a `ServerMessage::Error`,
+    /// failing loudly with the actual variant when the message is not a
+    /// refusal at all (which is exactly the RED state: an
+    /// `ExportComplete`).
+    fn expect_ws_error(message: &ServerMessage) -> (&str, serde_json::Value) {
+        match message {
+            ServerMessage::Error {
+                error_code,
+                details,
+                ..
+            } => (
+                error_code.as_str(),
+                details.clone().unwrap_or(serde_json::Value::Null),
+            ),
+            ServerMessage::ExportComplete { result, .. } => panic!(
+                "the export was NOT refused — the WS arm produced ExportComplete {:?}; \
+                 an unsound or empty solid must never reach a file on disk",
+                result
+            ),
+            other => panic!("expected a typed Error frame, got {:?}", other),
+        }
+    }
+
+    /// A verified-UNSOUND solid is refused over the WS STL arm, with the
+    /// SAME catalog code and gate name `POST /api/export` uses. The WS
+    /// `ExportSTL` message carries no `acknowledge_unsound` field, so this
+    /// transport has no escape at all — see `ws_export_stl_message`.
+    #[tokio::test]
+    async fn ws_export_refuses_unsound_solid_stl() {
+        let state = crate::router_integration_tests::make_test_state().await;
+        let (uuid, solid_id) = crate::export_unsound_gate_tests::unsound_verified_box(&state).await;
+
+        let message = {
+            let model = state.model.read().await;
+            ws_export_stl_message(&state, &model, &[uuid], Some("req-stl".to_string())).await
+        };
+
+        let (error_code, details) = expect_ws_error(&message);
+        assert_eq!(
+            error_code, "unsound_base",
+            "the WS refusal must carry the SAME stable error_code REST's \
+             export gate uses, not a WS-only vocabulary"
+        );
+        assert_eq!(
+            details.get("gate").and_then(|v| v.as_str()),
+            Some("unsound_base"),
+            "the WS refusal must carry the SAME gate name gates.ts reads; \
+             details were {details}"
+        );
+        assert_eq!(
+            details.get("solid_id").and_then(|v| v.as_u64()),
+            Some(solid_id as u64),
+            "the refusal must name the offending solid; details were {details}"
+        );
+    }
+
+    /// The gate's OTHER branch: a solid that has never been verified reads
+    /// `Stale`, not `Unsound`, and is refused under its own code. The
+    /// sibling REST suite pins both directions
+    /// (`export_unsound_gate_tests`); so does this one, or half of
+    /// `ExportRefusal::into_ws_error` would ship untested.
+    #[tokio::test]
+    async fn ws_export_refuses_unverified_solid() {
+        let state = crate::router_integration_tests::make_test_state().await;
+        let (uuid, solid_id) = crate::export_unsound_gate_tests::never_verified_box(&state).await;
+
+        let message = {
+            let model = state.model.read().await;
+            ws_export_stl_message(&state, &model, &[uuid], Some("req-stale".to_string())).await
+        };
+
+        let (error_code, details) = expect_ws_error(&message);
+        assert_eq!(
+            error_code, "unverified_solid",
+            "a never-verified solid is refused on its OWN branch — the \
+             unsound code must not stand in for the stale one"
+        );
+        assert_eq!(
+            details.get("solid_id").and_then(|v| v.as_u64()),
+            Some(solid_id as u64),
+            "the refusal must name the offending solid; details were {details}"
+        );
+    }
+
+    /// The OBJ arm is a second, independent call site — a gate wired into
+    /// one arm and not the other is exactly the hole this task closes.
+    #[tokio::test]
+    async fn ws_export_refuses_unsound_solid_obj() {
+        let state = crate::router_integration_tests::make_test_state().await;
+        let (uuid, solid_id) = crate::export_unsound_gate_tests::unsound_verified_box(&state).await;
+
+        let message = {
+            let model = state.model.read().await;
+            ws_export_obj_message(&state, &model, &[uuid], false, Some("req-obj".to_string())).await
+        };
+
+        let (error_code, details) = expect_ws_error(&message);
+        assert_eq!(error_code, "unsound_base");
+        assert_eq!(
+            details.get("gate").and_then(|v| v.as_str()),
+            Some("unsound_base")
+        );
+        assert_eq!(
+            details.get("solid_id").and_then(|v| v.as_u64()),
+            Some(solid_id as u64)
+        );
+    }
+
+    /// An empty tessellation is a typed refusal, never an 84-byte STL
+    /// reported as a successful export.
+    ///
+    /// The fixture is a SPHERE, and it is not contrived: `create_sphere_3d`
+    /// builds the sphere as a single face over a DEGENERATE (empty) loop —
+    /// "single face, no edges, no vertices", by its own comment — while
+    /// `BRepModel::tessellate_solid` (the fast display-mesh fan
+    /// triangulator the WS arms use, NOT the trimming pipeline the REST
+    /// export and the certificate run through) skips any face whose loop
+    /// carries fewer than three edges. So a sphere certifies SOUND and
+    /// tessellates to ZERO triangles on this path: it passes the soundness
+    /// gate and lands on the emptiness gate, which is the only way to reach
+    /// that branch honestly.
+    #[tokio::test]
+    async fn ws_export_refuses_empty_mesh() {
+        let state = crate::router_integration_tests::make_test_state().await;
+        let (status, body) = crate::durability_boot_tests::dispatch(
+            &state,
+            crate::durability_boot_tests::post(
+                "/api/geometry",
+                serde_json::json!({
+                    "shape_type": "sphere",
+                    "parameters": { "radius": 10.0 },
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::OK,
+            "sphere create must 200; body = {body}"
+        );
+        assert_eq!(
+            body.get("perception")
+                .and_then(|p| p.get("sound"))
+                .and_then(|s| s.as_bool()),
+            Some(true),
+            "fixture precondition: the sphere must certify SOUND, or this \
+             test measures the soundness gate instead of the emptiness \
+             gate; body = {body}"
+        );
+        let uuid = uuid::Uuid::parse_str(
+            body.get("object")
+                .and_then(|o| o.get("id"))
+                .and_then(|i| i.as_str())
+                .expect("object.id must be a string"),
+        )
+        .expect("object id must parse as a uuid");
+
+        let message = {
+            let model = state.model.read().await;
+            let solid_id = state.get_local_id(&uuid).expect("sphere must be mapped");
+            assert!(
+                model
+                    .tessellate_solid(solid_id, 0.01)
+                    .map(|m| m.indices.is_empty())
+                    .unwrap_or(true),
+                "fixture precondition: the sphere must tessellate to zero \
+                 triangles on the WS display path, or this test proves nothing"
+            );
+            ws_export_stl_message(&state, &model, &[uuid], Some("req-empty".to_string())).await
+        };
+
+        let (error_code, details) = expect_ws_error(&message);
+        assert_eq!(
+            error_code, "tessellation_empty",
+            "an empty mesh is a typed refusal, never an 84-byte STL reported \
+             as a successful export"
+        );
+        assert_eq!(
+            details.get("triangle_count").and_then(|v| v.as_u64()),
+            Some(0)
+        );
+    }
+
+    /// The control: the gate refuses defects, not exports. A verified-sound
+    /// box still exports over both WS arms.
+    #[tokio::test]
+    async fn ws_export_sound_solid_still_exports() {
+        let state = crate::router_integration_tests::make_test_state().await;
+        let (uuid, _solid_id) = crate::export_unsound_gate_tests::sound_verified_box(&state).await;
+
+        let (stl, obj) = {
+            let model = state.model.read().await;
+            let stl =
+                ws_export_stl_message(&state, &model, &[uuid], Some("req-ok-stl".to_string()))
+                    .await;
+            let obj = ws_export_obj_message(
+                &state,
+                &model,
+                &[uuid],
+                false,
+                Some("req-ok-obj".to_string()),
+            )
+            .await;
+            (stl, obj)
+        };
+
+        match &stl {
+            ServerMessage::ExportComplete { .. } => {}
+            other => panic!("a verified-sound solid must still export to STL; got {other:?}"),
+        }
+        match &obj {
+            ServerMessage::ExportComplete { .. } => {}
+            other => panic!("a verified-sound solid must still export to OBJ; got {other:?}"),
+        }
+    }
+
+    /// Disconnection gate: the behaviour tests above drive the two helper
+    /// functions, so they stay green if a future edit inlines an ungated
+    /// export back into either arm. This asserts the PRODUCTION call sites
+    /// by source — the only handle a unit test has on a match arm that sits
+    /// behind a live socket — and that each helper runs BOTH halves of the
+    /// shared gate `export_mesh` runs.
+    #[test]
+    fn ws_export_arms_run_the_export_gate() {
+        // Line endings are normalised FIRST: this repo checks out with
+        // `core.autocrlf=true`, so every `\n` in a needle below would
+        // silently never match on a Windows working tree — a source gate
+        // that cannot fail is worse than no gate at all. (Measured: the
+        // ordering assertions passed vacuously until this line existed.)
+        let source = include_str!("message_handlers.rs").replace("\r\n", "\n");
+        // Only PRODUCTION source is scanned — this test's own body is part
+        // of the file and would otherwise match its own needles.
+        let production = source
+            .split("\n#[cfg(test)]")
+            .next()
+            .expect("split always yields a first element");
+
+        // Each name appears exactly twice in production source: once at its
+        // definition, once at the match arm that dispatches to it. One
+        // occurrence means the arm inlined an export again.
+        assert_eq!(
+            production.matches("ws_export_stl_message(").count(),
+            2,
+            "the ExportSTL arm must dispatch through ws_export_stl_message"
+        );
+        assert_eq!(
+            production.matches("ws_export_obj_message(").count(),
+            2,
+            "the ExportOBJ arm must dispatch through ws_export_obj_message"
+        );
+
+        for (helper, exporter) in [
+            ("pub(crate) async fn ws_export_stl_message(", "export_stl("),
+            ("pub(crate) async fn ws_export_obj_message(", "export_obj("),
+        ] {
+            let body = production
+                .split(helper)
+                .nth(1)
+                .unwrap_or_else(|| panic!("{helper} must exist"))
+                .split("\n}\n")
+                .next()
+                .unwrap_or_else(|| panic!("{helper} must have a body"));
+            let soundness = body
+                .find("crate::handlers::export::export_soundness_gate(")
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{helper} must run the SHARED soundness gate — the same \
+                         function POST /api/export calls, never a private copy"
+                    )
+                });
+            let empty = body
+                .find("crate::handlers::export::refuse_empty_tessellation(")
+                .unwrap_or_else(|| panic!("{helper} must run the SHARED empty-tessellation gate"));
+            let write = body.find(exporter).unwrap_or_else(|| {
+                panic!("{helper} must still reach the export engine on the happy path")
+            });
+            assert!(
+                soundness < empty && empty < write,
+                "{helper} must gate soundness, then emptiness, BEFORE writing a \
+                 file — a gate after the write is not a gate"
+            );
+        }
     }
 }

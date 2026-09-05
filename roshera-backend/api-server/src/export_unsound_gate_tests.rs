@@ -64,7 +64,11 @@ use uuid::Uuid;
 
 /// A box that has NEVER been verified (`fast: true` skips the ambient
 /// full-cert box creation runs by default).
-async fn never_verified_box(state: &AppState) -> (Uuid, u32) {
+///
+/// `pub(crate)` for the same reason as [`sound_verified_box`]: the
+/// WebSocket export gate is tested against this exact solid, so both
+/// transports are measured against one notion of "stale".
+pub(crate) async fn never_verified_box(state: &AppState) -> (Uuid, u32) {
     let (status, body) = dispatch(
         state,
         post(
@@ -88,7 +92,12 @@ async fn never_verified_box(state: &AppState) -> (Uuid, u32) {
 
 /// A box verified SOUND at creation (no `fast: true` — the default full
 /// cert runs and marks the solid verified in the same call).
-async fn sound_verified_box(state: &AppState) -> (Uuid, u32) {
+///
+/// `pub(crate)` so the WebSocket export gate's tests
+/// (`protocol::message_handlers`) drive the SAME fixture this REST suite
+/// does — one transport must not be gated against a different notion of
+/// "sound" from the other.
+pub(crate) async fn sound_verified_box(state: &AppState) -> (Uuid, u32) {
     let (status, body) = dispatch(
         state,
         post(
@@ -119,7 +128,10 @@ async fn sound_verified_box(state: &AppState) -> (Uuid, u32) {
 /// A box verified UNSOUND: drifted construction geometry, then a genuine
 /// recompute via the default perception path so the live reading becomes
 /// `Unsound`, not `Stale` — see module doc.
-async fn unsound_verified_box(state: &AppState) -> (Uuid, u32) {
+///
+/// `pub(crate)` for the same reason as [`sound_verified_box`]: the
+/// WebSocket export gate is tested against this exact solid.
+pub(crate) async fn unsound_verified_box(state: &AppState) -> (Uuid, u32) {
     let (uuid, solid_id) = seed_box_with_drifted_construction(state, 10.0).await;
     let (status, body) = dispatch(
         state,

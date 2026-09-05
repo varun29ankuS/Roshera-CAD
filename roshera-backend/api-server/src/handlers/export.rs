@@ -17,10 +17,196 @@ use axum::{
 use export_engine::formats::ros::HistData;
 use export_engine::formats::timeline_chunk::BranchManifest;
 use geometry_engine::primitives::provenance::SoundnessReading;
+use geometry_engine::primitives::topology_builder::BRepModel;
 use geometry_engine::tessellation::{tessellate_solid, TessellationParams};
 use shared_types::*;
 use std::time::Instant;
 use uuid::Uuid;
+
+/// A refusal produced by THE export gate, before it has been rendered for
+/// a transport.
+///
+/// The gate below is the ONE implementation of the export honesty rule;
+/// this type is how its verdict reaches two wire formats without either
+/// one growing its own copy of the rule or its own vocabulary. Every
+/// variant is a hard stop: nothing here is a warning, and the only escape
+/// (`acknowledge_unsound`) is decided by the gate itself, never by the
+/// renderer.
+#[derive(Debug)]
+pub(crate) enum ExportRefusal {
+    /// The solid has been mutated (or never certified) since its last full
+    /// verification — the kernel has no CURRENT soundness answer for it.
+    /// No escape: `verify_part` is one cheap call.
+    Unverified {
+        /// The kernel solid id that failed the freshness gate.
+        solid_id: u32,
+    },
+    /// The solid WAS verified and the kernel's live verdict says it is not
+    /// sound. Carries the catalog error the REST surface already returns,
+    /// so the WS surface can lift the SAME code, prose, and `details` off
+    /// it rather than re-typing them.
+    Unsound(Box<ApiError>),
+    /// Every selected solid tessellated to zero triangles. An empty mesh
+    /// exported "successfully" is an 84-byte STL header presented as a
+    /// part — the emptiest possible approximation labelled as exact.
+    EmptyTessellation,
+}
+
+impl ExportRefusal {
+    /// Render for the REST surface. Reproduces, verbatim, the three
+    /// responses `export_mesh` returned before the gate was factored out:
+    /// 422 + the typed `ExportError` text for a stale solid, the catalog's
+    /// 409 `unsound_base` body for an unsound one, and 404 + prose for an
+    /// empty tessellation.
+    pub(crate) fn into_rest_response(self) -> Response {
+        match self {
+            ExportRefusal::Unverified { solid_id } => {
+                let err = ExportError::UnverifiedSolid { solid_id };
+                (StatusCode::UNPROCESSABLE_ENTITY, err.to_string()).into_response()
+            }
+            ExportRefusal::Unsound(err) => err.into_response(),
+            ExportRefusal::EmptyTessellation => (
+                StatusCode::NOT_FOUND,
+                "export: every selected solid tessellated to zero triangles".to_string(),
+            )
+                .into_response(),
+        }
+    }
+
+    /// Render for the WebSocket surface: the same refusal, as the typed
+    /// `ServerMessage::Error` frame the WS protocol carries.
+    ///
+    /// `error_code` and `details` are lifted off the catalog error rather
+    /// than re-typed, so the two transports cannot drift into different
+    /// names for the same refusal — an agent that pattern-matches
+    /// `unsound_base` over REST matches it over the socket too.
+    pub(crate) fn into_ws_error(
+        self,
+        request_id: Option<String>,
+    ) -> crate::protocol::protocol::ServerMessage {
+        use crate::protocol::protocol::ServerMessage;
+        match self {
+            ExportRefusal::Unverified { solid_id } => {
+                let err = ExportError::UnverifiedSolid { solid_id };
+                ServerMessage::Error {
+                    // The REST surface answers this branch with a plain
+                    // 422 and no catalog code, so there is no existing
+                    // stable identifier to reuse; this one names the typed
+                    // `ExportError` variant it renders.
+                    error_code: "unverified_solid".to_string(),
+                    message: err.to_string(),
+                    details: Some(serde_json::json!({ "solid_id": solid_id })),
+                    request_id,
+                }
+            }
+            ExportRefusal::Unsound(err) => ServerMessage::Error {
+                error_code: err.code.as_str().to_string(),
+                message: err.error.clone(),
+                details: err.details.clone(),
+                request_id,
+            },
+            ExportRefusal::EmptyTessellation => ServerMessage::Error {
+                error_code: crate::error_catalog::ErrorCode::TessellationEmpty
+                    .as_str()
+                    .to_string(),
+                message: "export: every selected solid tessellated to zero triangles".to_string(),
+                details: Some(serde_json::json!({ "triangle_count": 0 })),
+                request_id,
+            },
+        }
+    }
+}
+
+/// ★ **THE EXPORT SOUNDNESS GATE** — one implementation, every transport.
+///
+/// P1 ENFORCEMENT — HARD STOP, both halves. `soundness_reading` never
+/// recomputes (read-only, no write lock needed) — this is the surface
+/// named in its own doc comment ("every surface that reports or gates on
+/// soundness to an agent … export … must read through here, not through
+/// certify_solid") — so neither branch below can silently "fix" the
+/// verdict it exists to check.
+///
+/// 1. STALE (mutated, or never certified, since the last full
+///    verification): the typed `ExportError::UnverifiedSolid` is
+///    propagated verbatim, same honesty invariant as every other export
+///    failure on this path. NO bypass — `verify_part` is one cheap call.
+///
+/// 2. UNSOUND (item 8, S5 audit, 2026-08-15): a solid that WAS verified
+///    and the kernel's live verdict says is NOT sound. Gate 4's own
+///    rationale — "a PDF/DXF on disk carries NO ambient certificate, so
+///    unlike a kernel op there is no downstream truth-teller after this
+///    point" — applies verbatim to an STL/OBJ/STEP/ROS file, the artifact
+///    that actually reaches a machine, and was the hole the stale-only
+///    check above left open: a solid that had been explicitly verify_
+///    part'd and found unsound reads `Unsound`, not `Stale`, so a
+///    stale-only loop lets it through. This is an unsound-BASE question
+///    exactly like the 10 REST routes `refuse_unsound_base` covers, so it
+///    reuses that gate's own escape token and wire shape
+///    (`ApiError::unsound_base`, `gate: "unsound_base"`,
+///    `acknowledge_unsound: true`) rather than inventing a new
+///    vocabulary — NOT `refuse_unsound_base` itself, which takes a write
+///    lock and RECOMPUTES via `certify_solid` (exactly the
+///    silent-launder-by-asking this reading exists to avoid, and a second
+///    write-lock acquisition here would deadlock against the read guard
+///    every caller already holds for the whole tessellation pass).
+///    Scoped to this branch only — the escape never opens the Stale
+///    branch above.
+///
+/// **Both transports call THIS function** (audit 2026-09-03, task 8):
+/// `export_mesh` below, and the WebSocket `ExportSTL`/`ExportOBJ` arms via
+/// `protocol::message_handlers::ws_export_{stl,obj}_message`. The WS
+/// `ExportSTL`/`ExportOBJ` messages carry no `acknowledge_unsound` field,
+/// so that transport passes `false` and has no escape at all — a
+/// deliberate refusal-without-escape, not an oversight: an agent that
+/// needs the repair-flow escape has the REST route, which takes the flag
+/// explicitly.
+pub(crate) fn export_soundness_gate(
+    model: &BRepModel,
+    solids_to_export: &[u32],
+    acknowledge_unsound: bool,
+) -> Result<(), ExportRefusal> {
+    for &solid_id in solids_to_export {
+        match model.soundness_reading(solid_id) {
+            Some(reading) if reading.is_stale() => {
+                tracing::warn!(solid_id, "export refused: solid is stale (unverified)");
+                return Err(ExportRefusal::Unverified { solid_id });
+            }
+            Some(SoundnessReading::Unsound(_)) if !acknowledge_unsound => {
+                tracing::warn!(
+                    solid_id,
+                    "export refused: solid is unsound (no acknowledge_unsound)"
+                );
+                return Err(ExportRefusal::Unsound(Box::new(ApiError::unsound_base(
+                    "export",
+                    solid_id,
+                    crate::VERDICT_UNSOUND,
+                ))));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// The gate's second half: a mesh with no triangles is never a successful
+/// export.
+///
+/// Separate from [`export_soundness_gate`] only because it runs at a
+/// different moment — the soundness read happens BEFORE tessellation (so a
+/// defective solid is refused without paying for a mesh), this one AFTER.
+/// The predicate, the wording, and the refusal shape live here once; both
+/// transports call it, and both are pinned to calling it between their
+/// tessellation and their write
+/// (`message_handlers::tests::ws_export_arms_run_the_export_gate`).
+///
+/// `index_count` is the merged triangle INDEX count — three per triangle.
+pub(crate) fn refuse_empty_tessellation(index_count: usize) -> Result<(), ExportRefusal> {
+    if index_count == 0 {
+        tracing::error!("export: every selected solid tessellated to empty");
+        return Err(ExportRefusal::EmptyTessellation);
+    }
+    Ok(())
+}
 
 pub async fn export_mesh(
     State(state): State<AppState>,
@@ -122,57 +308,12 @@ pub async fn export_mesh(
             .into_response());
     }
 
-    // P1 ENFORCEMENT — HARD STOP, both halves. `soundness_reading` never
-    // recomputes (read-only, no write lock needed) — this is the surface
-    // named in its own doc comment ("every surface that reports or gates on
-    // soundness to an agent … export … must read through here, not through
-    // certify_solid") — so neither branch below can silently "fix" the
-    // verdict it exists to check.
-    //
-    // 1. STALE (mutated, or never certified, since the last full
-    //    verification): the typed `ExportError::UnverifiedSolid` is
-    //    propagated verbatim, same honesty invariant as every other export
-    //    failure on this path. NO bypass — `verify_part` is one cheap call.
-    //
-    // 2. UNSOUND (item 8, S5 audit, 2026-08-15): a solid that WAS verified
-    //    and the kernel's live verdict says is NOT sound. Gate 4's own
-    //    rationale — "a PDF/DXF on disk carries NO ambient certificate, so
-    //    unlike a kernel op there is no downstream truth-teller after this
-    //    point" — applies verbatim to an STL/OBJ/STEP/ROS file, the artifact
-    //    that actually reaches a machine, and was the hole the stale-only
-    //    check above left open: a solid that had been explicitly verify_
-    //    part'd and found unsound reads `Unsound`, not `Stale`, so the loop
-    //    above let it through. This is an unsound-BASE question exactly like
-    //    the 10 REST routes `refuse_unsound_base` covers, so it reuses that
-    //    gate's own escape token and wire shape (`ApiError::unsound_base`,
-    //    `gate: "unsound_base"`, `acknowledge_unsound: true`) rather than
-    //    inventing a new vocabulary — NOT `refuse_unsound_base` itself,
-    //    which takes a write lock and RECOMPUTES via `certify_solid`
-    //    (exactly the silent-launder-by-asking this reading exists to
-    //    avoid, and a second write-lock acquisition here would deadlock
-    //    against the read guard `model` already holds for the whole
-    //    tessellation pass below). Scoped to this branch only — the escape
-    //    never opens the Stale branch above.
-    for &solid_id in &solids_to_export {
-        match model.soundness_reading(solid_id) {
-            Some(reading) if reading.is_stale() => {
-                let err = ExportError::UnverifiedSolid { solid_id };
-                tracing::warn!(solid_id, "export refused: solid is stale (unverified)");
-                return Err((StatusCode::UNPROCESSABLE_ENTITY, err.to_string()).into_response());
-            }
-            Some(SoundnessReading::Unsound(_)) if !request.acknowledge_unsound => {
-                tracing::warn!(
-                    solid_id,
-                    "export refused: solid is unsound (no acknowledge_unsound)"
-                );
-                return Err(
-                    ApiError::unsound_base("export", solid_id, crate::VERDICT_UNSOUND)
-                        .into_response(),
-                );
-            }
-            _ => {}
-        }
-    }
+    // P1 ENFORCEMENT — HARD STOP, both halves. The rule, its two branches
+    // and the reasoning behind each live on `export_soundness_gate` above;
+    // the WebSocket export arms call that same function, so REST and WS
+    // cannot diverge on what an exportable solid is (audit 2026-09-03).
+    export_soundness_gate(&model, &solids_to_export, request.acknowledge_unsound)
+        .map_err(ExportRefusal::into_rest_response)?;
 
     // Tessellate every selected solid and merge into a single
     // `shared_types::Mesh`. We can't use `Mesh::merge_multiple` here —
@@ -226,14 +367,7 @@ pub async fn export_mesh(
         object_names.push(label);
     }
 
-    if merged_indices.is_empty() {
-        tracing::error!("export: every selected solid tessellated to empty");
-        return Err((
-            StatusCode::NOT_FOUND,
-            "export: every selected solid tessellated to zero triangles".to_string(),
-        )
-            .into_response());
-    }
+    refuse_empty_tessellation(merged_indices.len()).map_err(ExportRefusal::into_rest_response)?;
 
     let final_mesh = Mesh {
         vertices: merged_vertices,
