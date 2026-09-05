@@ -1796,14 +1796,17 @@ fn compute_chamfer_offsets(
     distance2: f64,
     miter_overrides: Option<&MiterOverrideMap>,
 ) -> OperationResult<ChamferData> {
-    let num_samples = 10;
-    let mut data = ChamferData {
-        offset_points1: Vec::new(),
-        offset_points2: Vec::new(),
-        parameters: Vec::new(),
-        normals1: Vec::new(),
-        normals2: Vec::new(),
-    };
+    // Sample count for the offset trails. Ten intervals (eleven points) is the
+    // historical figure and remains exact for a straight edge, whose trail is a
+    // segment however coarsely it is sampled. A CURVED trail is only as good as
+    // the interpolating rail built from these samples, so the curved branch
+    // below refines until that rail reproduces the trail within tolerance —
+    // see `REFINED_SAMPLE_CEILING`.
+    const BASE_SAMPLES: usize = 10;
+    /// Ceiling on the refinement doubling. 160 intervals resolve a full-turn
+    /// trail to well inside the distance tolerance; a trail that still cannot
+    /// be represented at that density is refused by name rather than shipped.
+    const REFINED_SAMPLE_CEILING: usize = 160;
 
     let curve = model
         .curves
@@ -1878,10 +1881,12 @@ fn compute_chamfer_offsets(
         -1.0
     };
 
-    for i in 0..=num_samples {
-        let t = i as f64 / num_samples as f64;
-        data.parameters.push(t);
-
+    // One station of both offset trails, at curve parameter `t`. Factored out
+    // of the sampling loop so the curved branch can re-sample at a finer
+    // density and can evaluate the TRUE trail between samples to measure the
+    // interpolating rail against it. The arithmetic is the pre-fix loop body
+    // verbatim, so a straight edge's samples are unchanged bit for bit.
+    let sample_at = |t: f64| -> OperationResult<(Point3, Point3, Vector3, Vector3)> {
         // Get point on edge
         let edge_point = curve.point_at(t).map_err(|e| {
             OperationError::NumericalError(format!("Edge evaluation failed: {:?}", e))
@@ -1916,12 +1921,129 @@ fn compute_chamfer_offsets(
             ))
         })?;
 
-        data.offset_points1
-            .push(edge_point + offset_dir1 * distance1);
-        data.offset_points2
-            .push(edge_point + offset_dir2 * distance2);
-        data.normals1.push(face_normal1);
-        data.normals2.push(face_normal2);
+        Ok((
+            edge_point + offset_dir1 * distance1,
+            edge_point + offset_dir2 * distance2,
+            face_normal1,
+            face_normal2,
+        ))
+    };
+
+    let fill = |intervals: usize| -> OperationResult<ChamferData> {
+        let mut filled = ChamferData {
+            offset_points1: Vec::with_capacity(intervals + 1),
+            offset_points2: Vec::with_capacity(intervals + 1),
+            parameters: Vec::with_capacity(intervals + 1),
+            normals1: Vec::with_capacity(intervals + 1),
+            normals2: Vec::with_capacity(intervals + 1),
+        };
+        for i in 0..=intervals {
+            let t = i as f64 / intervals as f64;
+            let (p1, p2, n1, n2) = sample_at(t)?;
+            filled.parameters.push(t);
+            filled.offset_points1.push(p1);
+            filled.offset_points2.push(p2);
+            filled.normals1.push(n1);
+            filled.normals2.push(n2);
+        }
+        Ok(filled)
+    };
+
+    let mut data = fill(BASE_SAMPLES)?;
+
+    let tolerance = crate::math::Tolerance::default().distance();
+
+    // A trail whose first and last samples COINCIDE is closed, and a closed
+    // trail has no chord: `rail_is_straight` cannot measure anything against a
+    // zero-length direction, and `build_rail_curve`'s straight branch would
+    // mint a zero-length `Line` as the face's carrier surface rail under an
+    // eleven-point boundary — the loop off its face at full scale, the very
+    // defect this operation exists to prevent, wearing the shape of a
+    // successful chamfer.
+    //
+    // This is reachable in production, not theoretical: `sample_at` walks the
+    // edge's CURVE over `t ∈ [0, 1]` without consulting `Edge::param_range`
+    // (a defect of its own, filed separately), so an OPEN arc trimmed out of a
+    // full `Circle` by a boolean is sampled all the way round and its offset
+    // trail closes. Refuse by name; a closed rim edge has its own pipeline
+    // (`create_closed_edge_chamfer`) and never arrives here.
+    for (side, points) in [(1, &data.offset_points1), (2, &data.offset_points2)] {
+        let (Some(first), Some(last)) = (points.first(), points.last()) else {
+            return Err(OperationError::InvalidGeometry(format!(
+                "Chamfer edge {edge_id}: offset trail {side} produced no samples"
+            )));
+        };
+        let chord = first.distance(last);
+        if chord <= tolerance {
+            return Err(OperationError::NotImplemented(format!(
+                "Chamfer edge {edge_id}: the offset trail on face {} closes on                  itself (its {} samples start and end {chord} apart, within the                  {tolerance} tolerance), so it has no chord to build a rail                  along. A closed trail means the edge's curve was traversed in                  full — a closed rim has its own pipeline; an open edge that                  reaches this state is a trimmed sub-arc whose parameter range                  was not honoured. Chamfering it is not implemented.",
+                if side == 1 { face1_id } else { face2_id },
+                points.len()
+            )));
+        }
+    }
+
+    // A straight edge's offset trails are segments: the interpolating rail
+    // through eleven collinear samples IS the segment, so nothing is gained by
+    // refining and the historical sample set is kept untouched.
+    //
+    // A CURVED trail is a different matter. The chamfer face's surface and its
+    // boundary are both built from these samples (`create_ruled_chamfer_surface`
+    // / `create_offset_curve`), so an under-sampled trail yields a rail that
+    // bows off the adjacent face it is supposed to trim — at eleven samples a
+    // 90° arc of r=10 misses its own cylinder by 3.9e-6 mm, which the kernel's
+    // result validation rejects, correctly. Refine until the rail reproduces
+    // the trail at the sample MIDPOINTS, or refuse.
+    //
+    // The midpoint residual is a PROXY, not a bound: it is where a cubic
+    // interpolant of a smooth trail is worst, but nothing here proves the true
+    // maximum lies at a midpoint, and on a trail with structure finer than the
+    // sample spacing it does not. Read the loop as "the rail agrees with the
+    // trail everywhere it is checked", not as a certified error bound.
+    let mut intervals = BASE_SAMPLES;
+    while !rail_is_straight(&data.offset_points1) || !rail_is_straight(&data.offset_points2) {
+        let mut worst = 0.0_f64;
+        for side in 0..2 {
+            let points = if side == 0 {
+                &data.offset_points1
+            } else {
+                &data.offset_points2
+            };
+            if rail_is_straight(points) {
+                continue;
+            }
+            let rail = interpolate_rail(points)?;
+            for i in 0..intervals {
+                // Uniform parameterisation: sample `i` sits at `u = i/n` on the
+                // rail, so a midpoint of the sample grid is a midpoint of the
+                // rail's own parameter domain.
+                let t = (i as f64 + 0.5) / intervals as f64;
+                let (p1, p2, _, _) = sample_at(t)?;
+                let truth = if side == 0 { p1 } else { p2 };
+                let fitted = rail.point_at(t).map_err(|e| {
+                    OperationError::NumericalError(format!(
+                        "Chamfer rail evaluation at t={t} failed: {:?}",
+                        e
+                    ))
+                })?;
+                worst = worst.max(truth.distance(&fitted));
+            }
+        }
+        if worst <= tolerance {
+            break;
+        }
+        if intervals >= REFINED_SAMPLE_CEILING {
+            return Err(OperationError::NotImplemented(format!(
+                "Chamfer edge {edge_id}: the curved offset trail is still {worst} \
+                 from its interpolating rail at {intervals} intervals (tolerance \
+                 {tolerance}). The chamfer face's surface and its boundary are \
+                 both that rail, so shipping it would mean a face whose loop is \
+                 not on it; edges this sharply curved relative to the setback are \
+                 not implemented."
+            )));
+        }
+        intervals *= 2;
+        data = fill(intervals)?;
     }
 
     // Chamfer-β — apply corner-miter overrides on the cap-side offset
@@ -1933,6 +2055,14 @@ fn compute_chamfer_offsets(
     // would leave the trim curve off the planar chamfer surface. Linear
     // re-interp keeps the trim curve flush with the surface.
     if let Some(map) = miter_overrides {
+        // Straightness is read from the RAW perpendicular-offset polylines,
+        // BEFORE any override moves an endpoint: a moved endpoint changes the
+        // chord the samples are measured against, so classifying afterwards
+        // could report a straight rail as curved (or the reverse) purely
+        // because of the override.
+        let rail1_was_straight = rail_is_straight(&data.offset_points1);
+        let rail2_was_straight = rail_is_straight(&data.offset_points2);
+
         // Curve parameter ↦ vertex mapping respects Edge::orientation,
         // mirroring `unit_dir_from_vertex` above.
         let v_at_t0 = if edge.orientation.is_forward() {
@@ -1988,7 +2118,21 @@ fn compute_chamfer_offsets(
         // (possibly-overridden) endpoints. Only touches the sequences
         // that had at least one endpoint overridden; unaffected edges
         // keep their raw perpendicular-offset polyline.
+        //
+        // The linear re-interp is only sound on a rail that was ALREADY
+        // straight: it replaces every interior sample with a point on the
+        // endpoint chord, which on a curved rail would discard the curvature
+        // the chamfer surface and its boundary are both built from — the exact
+        // flattening this operation now refuses everywhere else. A mitered
+        // corner on a curved edge needs the offset trail re-solved against the
+        // neighbour's chamfer plane, not chorded; until that exists the kernel
+        // refuses by name rather than shipping a flattened rail.
         if face1_overridden {
+            if !rail1_was_straight {
+                return Err(OperationError::NotImplemented(format!(
+                    "Chamfer edge {edge_id}: corner-miter override on the CURVED                      offset rail of face {face1_id}. Re-interpolating that rail                      between the mitered endpoints would flatten it to a chord                      and pull the chamfer boundary off its own surface; mitered                      corners on curved edges are not implemented."
+                )));
+            }
             let last = data.offset_points1.len() - 1;
             if last >= 2 {
                 let p0 = data.offset_points1[0];
@@ -2000,6 +2144,11 @@ fn compute_chamfer_offsets(
             }
         }
         if face2_overridden {
+            if !rail2_was_straight {
+                return Err(OperationError::NotImplemented(format!(
+                    "Chamfer edge {edge_id}: corner-miter override on the CURVED                      offset rail of face {face2_id}. Re-interpolating that rail                      between the mitered endpoints would flatten it to a chord                      and pull the chamfer boundary off its own surface; mitered                      corners on curved edges are not implemented."
+                )));
+            }
             let last = data.offset_points2.len() - 1;
             if last >= 2 {
                 let p0 = data.offset_points2[0];
@@ -2015,14 +2164,226 @@ fn compute_chamfer_offsets(
     Ok(data)
 }
 
-/// Create a RuledSurface for the chamfer face, interpolating between the two offset curves.
-/// Each offset curve is approximated as a Line between its endpoints.
-#[allow(clippy::expect_used)] // offset_points{1,2} non-empty: is_empty() guard above expect sites
+/// Does every sampled offset point lie on the chord between the first and the
+/// last one — i.e. is this rail a straight segment?
+///
+/// A chamfer rail is straight exactly when the chamfered edge is: every sample
+/// is the same rigid offset applied to a collinear point set, so the measured
+/// deviation on a box edge is at the rounding floor (~1e-16). A curved edge's
+/// rail leaves its chord by the offset trail's sagitta — a fraction of the
+/// radius, millimetres on any real part. There is no band between those two
+/// populations, so the kernel's distance tolerance separates them cleanly.
+///
+/// This is what keeps every straight-edge chamfer BIT-identical across the
+/// curved-rail fix: the straight branch of both consumers is the pre-fix code
+/// verbatim.
+///
+/// **There is a same-named sibling in
+/// [`super::chamfer_fillet_crossing`] (`chamfer_fillet_crossing.rs:196-213`)
+/// and the two are NOT interchangeable — do not consolidate them.** That one
+/// takes an explicit `tol`, skips fewer than three samples, and returns
+/// `false` on a degenerate chord, because its caller slides a rail endpoint
+/// along the rail's carrier LINE and must refuse when no line exists. This one
+/// answers "may the carrier be a `Line` at all", where a degenerate chord is a
+/// separate condition its caller rejects before asking (see the closed-trail
+/// refusal in [`compute_chamfer_offsets`]) — which is why the branch below is
+/// unreachable from production and exists only to keep this function total.
+fn rail_is_straight(points: &[Point3]) -> bool {
+    let (Some(first), Some(last)) = (points.first(), points.last()) else {
+        // Fewer than one point cannot bend; an empty rail is rejected by the
+        // callers on its own terms.
+        return true;
+    };
+    let chord = *last - *first;
+    let chord_len_sq = chord.dot(&chord);
+    if chord_len_sq <= 0.0 {
+        // Degenerate chord — a closed or point-like rail. Unreachable from the
+        // chamfer pipeline: `compute_chamfer_offsets` refuses a closed trail
+        // (`NotImplemented`) before any consumer classifies it, precisely
+        // because answering "straight" here would let `build_rail_curve` mint
+        // a zero-length `Line` as a face's carrier surface. Kept so the
+        // predicate is total for a direct caller, never as a live branch.
+        return true;
+    }
+    let tol = crate::math::Tolerance::default().distance();
+    points.iter().all(|p| {
+        let t = ((*p - *first).dot(&chord) / chord_len_sq).clamp(0.0, 1.0);
+        (*p - (*first + chord * t)).magnitude() <= tol
+    })
+}
+
+/// The interpolating NURBS through EVERY sampled offset point of one rail.
+///
+/// Degree 3 (dropping to `n − 1` when fewer than four samples survive), global
+/// interpolation (Piegl & Tiller A9.1 via
+/// [`crate::math::nurbs::interpolate_nurbs_curve`]) — not
+/// `NurbsCurve::fit_to_points`, which places the data points as CONTROL points
+/// and therefore only touches the endpoints.
+///
+/// **Uniform parameterisation, deliberately.** `compute_chamfer_offsets` samples
+/// the edge at uniform curve parameters `t = i/10` and offsets each of those
+/// samples onto both adjacent faces, so `offset_points1[i]` and
+/// `offset_points2[i]` are the two ends of the chamfer's cross-section at ONE
+/// edge station. Interpolating both rails at the same uniform parameters keeps
+/// them paired, so every ruling of [`RuledSurface`] is a real cross-section. A
+/// chord-length parameterisation would desynchronise the rails wherever they
+/// curve differently and skew the rulings.
+///
+/// Called from BOTH [`create_ruled_chamfer_surface`] (the face's carrier
+/// surface) and [`create_offset_curve`] (the face's boundary) on the same
+/// sample array, so the two agree bit for bit and the boundary lies on the
+/// surface by construction rather than by luck.
+fn interpolate_rail(points: &[Point3]) -> OperationResult<crate::primitives::curve::NurbsCurve> {
+    use crate::math::nurbs::{interpolate_nurbs_curve, ParameterizationType};
+
+    let degree = 3.min(points.len().saturating_sub(1));
+    let fitted =
+        interpolate_nurbs_curve(points, degree, ParameterizationType::Uniform).map_err(|e| {
+            OperationError::NotImplemented(format!(
+                "Chamfer of a curved edge whose {} sampled offset points admit no \
+                 degree-{degree} interpolating curve ({e}). The chamfer face's \
+                 surface and its boundary must be the SAME curve; the kernel \
+                 refuses rather than substituting a chord the boundary would then \
+                 float off.",
+                points.len()
+            ))
+        })?;
+
+    crate::primitives::curve::NurbsCurve::new(
+        fitted.degree,
+        fitted.control_points,
+        fitted.weights,
+        fitted.knots.to_vec(),
+    )
+    .map_err(|e| {
+        OperationError::NumericalError(format!("chamfer rail curve construction failed: {e:?}"))
+    })
+}
+
+/// Check the convention that the chamfer face's BOUNDARY curves and its
+/// carrier surface's RAILS are the same geometry.
+///
+/// Only the curved case is checkable by identity: there the boundary and the
+/// rail are both `interpolate_rail` over the same slice, so their control
+/// points must agree exactly (same inputs, same code, no tolerance involved).
+/// In the straight case the rail is a `Line` and the boundary is the
+/// `fit_to_points` curve over collinear samples — different representations of
+/// the same segment, so identity is the wrong question and the endpoints are
+/// compared instead.
+///
+/// Cost is a control-point walk (tens of points) once per chamfer face.
+fn verify_boundary_matches_rails(
+    model: &BRepModel,
+    surface_id: u32,
+    boundary1: u32,
+    boundary2: u32,
+) -> OperationResult<()> {
+    use crate::primitives::curve::NurbsCurve;
+    use crate::primitives::surface::RuledSurface;
+
+    let Some(surface) = model.surfaces.get(surface_id) else {
+        return Err(OperationError::InvalidGeometry(format!(
+            "Chamfer surface {surface_id} not found"
+        )));
+    };
+    // Only the ruled chamfer surface makes this claim; a caller that supplied
+    // some other carrier is outside this convention and is left alone.
+    let Some(ruled) = surface.as_any().downcast_ref::<RuledSurface>() else {
+        return Ok(());
+    };
+
+    for (side, rail, boundary_id) in [
+        (1u8, &ruled.curve1, boundary1),
+        (2u8, &ruled.curve2, boundary2),
+    ] {
+        let Some(rail_nurbs) = rail.as_any().downcast_ref::<NurbsCurve>() else {
+            // Straight rail: representations differ by design (see above).
+            continue;
+        };
+        let Some(boundary) = model.curves.get(boundary_id) else {
+            return Err(OperationError::InvalidGeometry(format!(
+                "Chamfer boundary curve {boundary_id} not found"
+            )));
+        };
+        let Some(boundary_nurbs) = boundary.as_any().downcast_ref::<NurbsCurve>() else {
+            return Err(OperationError::InvalidGeometry(format!(
+                "Chamfer face boundary {side} is a {} while its carrier rail is \
+                 an interpolated curve; the loop would not lie on the face",
+                boundary.type_name()
+            )));
+        };
+        if boundary_nurbs.degree != rail_nurbs.degree
+            || boundary_nurbs.control_points != rail_nurbs.control_points
+        {
+            // Name the FIRST disagreement. Equal counts with different
+            // positions is the likely shape — a boundary built by a different
+            // fit over the same samples — and a bare count comparison would
+            // read as though nothing were wrong.
+            let first_diff = boundary_nurbs
+                .control_points
+                .iter()
+                .zip(rail_nurbs.control_points.iter())
+                .position(|(b, r)| b != r);
+            let where_ = match first_diff {
+                Some(i) => format!(
+                    "; they first differ at control point {i}: boundary {:?} vs \
+                     rail {:?}",
+                    boundary_nurbs.control_points[i], rail_nurbs.control_points[i]
+                ),
+                None => String::new(),
+            };
+            return Err(OperationError::InvalidGeometry(format!(
+                "Chamfer face boundary {side} is not its own carrier rail: \
+                 boundary is degree {} over {} control points, rail is degree \
+                 {} over {}{where_}. The two must be the identical \
+                 interpolation of the identical offset samples, or the face's \
+                 loop does not lie on the face.",
+                boundary_nurbs.degree,
+                boundary_nurbs.control_points.len(),
+                rail_nurbs.degree,
+                rail_nurbs.control_points.len()
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+/// One rail of the chamfer surface, from its sampled offset points.
+///
+/// Straight rail → the endpoint [`Line`](crate::primitives::curve::Line), which
+/// is what every pre-fix chamfer built and what keeps straight-edge results
+/// bit-identical. Curved rail → the interpolating curve through every sample.
+fn build_rail_curve(points: &[Point3]) -> OperationResult<Box<dyn Curve>> {
+    use crate::primitives::curve::Line;
+
+    let first = *points.first().ok_or_else(|| {
+        OperationError::InvalidGeometry("Chamfer offset rail is empty".to_string())
+    })?;
+    let last = *points.last().ok_or_else(|| {
+        OperationError::InvalidGeometry("Chamfer offset rail is empty".to_string())
+    })?;
+
+    if rail_is_straight(points) {
+        Ok(Box::new(Line::new(first, last)))
+    } else {
+        Ok(Box::new(interpolate_rail(points)?))
+    }
+}
+
+/// Create a RuledSurface for the chamfer face, interpolating between the two
+/// offset curves.
+///
+/// Each rail is built by [`build_rail_curve`] from the SAME sample array
+/// [`create_offset_curve`] threads the face's boundary through. Before this,
+/// the rails were `Line::new(first, last)` unconditionally: on a curved edge
+/// that discarded the nine interior samples, and the boundary — fitted through
+/// all eleven — then bowed off its own carrier surface by the offset trail's
+/// sagitta (up to the edge's radius). The face's loop was not on the face.
 fn create_ruled_chamfer_surface(
     _model: &mut BRepModel,
     data: &ChamferData,
 ) -> OperationResult<Box<dyn Surface>> {
-    use crate::primitives::curve::Line;
     use crate::primitives::surface::RuledSurface;
 
     if data.offset_points1.is_empty() || data.offset_points2.is_empty() {
@@ -2031,24 +2392,8 @@ fn create_ruled_chamfer_surface(
         ));
     }
 
-    // Create boundary curves from offset point sequences.
-    // For straight edges (the common case), endpoints suffice.
-    // For curved edges, we use the endpoints of the sampled polyline —
-    // a proper B-spline fit could improve accuracy for highly curved edges.
-    let curve1: Box<dyn Curve> = Box::new(Line::new(
-        data.offset_points1[0],
-        *data
-            .offset_points1
-            .last()
-            .expect("offset_points1 non-empty: is_empty check above rejects empty"),
-    ));
-    let curve2: Box<dyn Curve> = Box::new(Line::new(
-        data.offset_points2[0],
-        *data
-            .offset_points2
-            .last()
-            .expect("offset_points2 non-empty: is_empty check above rejects empty"),
-    ));
+    let curve1 = build_rail_curve(&data.offset_points1)?;
+    let curve2 = build_rail_curve(&data.offset_points2)?;
 
     Ok(Box::new(RuledSurface::new(curve1, curve2)))
 }
@@ -2142,9 +2487,19 @@ fn create_chamfer_face(
         ));
     }
 
-    // Create offset edge curves
+    // Create offset edge curves — the face's BOUNDARY.
+    //
+    // Boundary/rail identity is held BY CONVENTION, not by construction: this
+    // function and `create_ruled_chamfer_surface` are separate calls that each
+    // run `interpolate_rail` over the same `data.offset_points*` slice and rely
+    // on it being deterministic. Nothing in the types enforces that the surface
+    // passed in as `surface_id` was built from the same samples — a future
+    // caller that recomputes, retrims or reorders them between the two calls
+    // would silently reopen exactly the defect this pairing closes (the loop
+    // off its own face). So the convention is checked, once, here.
     let offset_curve1 = create_offset_curve(model, &data.offset_points1)?;
     let offset_curve2 = create_offset_curve(model, &data.offset_points2)?;
+    verify_boundary_matches_rails(model, surface_id, offset_curve1, offset_curve2)?;
 
     // Capture last-point references once; validated non-empty above.
     let last1 = data
@@ -2327,13 +2682,23 @@ fn create_chamfer_face(
     Ok((face_id, surgery))
 }
 
-/// Create an offset curve through a sequence of sample points.
+/// Create an offset curve through a sequence of sample points — the chamfer
+/// face's BOUNDARY on one adjacent face.
 ///
-/// Two points → exact `Line`. Three or more points → degree-min(3, n-1)
-/// NURBS curve fit through the points (clamped uniform parameterisation).
-/// This preserves the curvature of the offset trail along non-planar
-/// chamfered edges, instead of collapsing to a straight chord that
-/// silently disconnects from the actual chamfer surface.
+/// Two points → exact `Line`.
+///
+/// Three or more, straight rail → the historical `fit_to_points` curve. On
+/// collinear samples that curve is exactly the segment, so it lies on the
+/// `Line` rail [`build_rail_curve`] gives the surface; leaving this branch
+/// untouched is what keeps every straight-edge chamfer bit-identical.
+///
+/// Three or more, curved rail → [`interpolate_rail`], the SAME curve
+/// [`create_ruled_chamfer_surface`] uses as that side's rail. Identical inputs,
+/// identical construction, so the boundary lies on the carrier surface exactly
+/// — where `fit_to_points` (data points as CONTROL points, hence
+/// approximating) left the boundary off the very surface it bounds: measured
+/// 4.1e-2 mm off a r=10 cylinder for a 90° arc at eleven samples, which the
+/// kernel's own result validation rejects.
 fn create_offset_curve(model: &mut BRepModel, points: &[Point3]) -> OperationResult<u32> {
     use crate::primitives::curve::{Line, NurbsCurve};
 
@@ -2355,8 +2720,14 @@ fn create_offset_curve(model: &mut BRepModel, points: &[Point3]) -> OperationRes
         return Ok(model.curves.add(Box::new(line)));
     }
 
-    // 3+ points: fit a clamped NURBS curve. Tolerance is informational for
-    // `fit_to_points`; we pass the kernel default.
+    // 3+ points on a CURVED rail: the interpolating curve, shared with the
+    // carrier surface's rail.
+    if !rail_is_straight(points) {
+        return Ok(model.curves.add(Box::new(interpolate_rail(points)?)));
+    }
+
+    // 3+ collinear points: fit a clamped NURBS curve. Tolerance is
+    // informational for `fit_to_points`; we pass the kernel default.
     let tolerance = crate::math::Tolerance::default();
     let nurbs = NurbsCurve::fit_to_points(points, 3, tolerance.distance())
         .map_err(|e| OperationError::NumericalError(format!("offset curve fit failed: {:?}", e)))?;
@@ -4585,6 +4956,464 @@ mod tests {
             "Midpoint x should be 5.0, got {}",
             pm.x
         );
+    }
+
+    /// The ruled chamfer surface must pass through EVERY sampled offset point,
+    /// not just the two endpoints.
+    ///
+    /// `test_ruled_chamfer_surface_creation` above cannot see this: its three
+    /// samples are collinear, so a chord through the endpoints hits them all.
+    /// This fixture is the real shape — eleven samples on a 90° arc, exactly
+    /// what `compute_chamfer_offsets` produces for a chamfered arc edge (it
+    /// takes `num_samples = 10`, hence eleven points, at uniform curve
+    /// parameters). Pre-fix, `point_at(0.5, 0.0)` returned the CHORD midpoint,
+    /// a full sagitta (2.6 mm on this r=9 trail) away from `offset_points1[5]`.
+    ///
+    /// The uniform parameterisation is what makes sample `i` land at `u = i/10`
+    /// on both rails, so the assertion sweeps every station rather than only
+    /// the middle one.
+    #[test]
+    fn ruled_chamfer_surface_passes_through_sampled_arc_points() {
+        use std::f64::consts::FRAC_PI_2;
+
+        const SAMPLES: usize = 11;
+        // Cap-side rail: the r=9 trail 1 mm inside an r=10 quarter rim at
+        // z = 20. Wall-side rail: the r=10 quarter rim itself, 1 mm down.
+        let ring = |radius: f64, z: f64| -> Vec<Point3> {
+            (0..SAMPLES)
+                .map(|i| {
+                    let a = FRAC_PI_2 * (i as f64 / (SAMPLES - 1) as f64);
+                    Point3::new(radius * a.cos(), radius * a.sin(), z)
+                })
+                .collect()
+        };
+        let offset_points1 = ring(9.0, 20.0);
+        let offset_points2 = ring(10.0, 19.0);
+
+        let mut model = BRepModel::new();
+        let data = ChamferData {
+            offset_points1: offset_points1.clone(),
+            offset_points2: offset_points2.clone(),
+            parameters: (0..SAMPLES)
+                .map(|i| i as f64 / (SAMPLES - 1) as f64)
+                .collect(),
+            normals1: vec![Vector3::new(0.0, 0.0, 1.0); SAMPLES],
+            normals2: vec![Vector3::new(1.0, 0.0, 0.0); SAMPLES],
+        };
+
+        let surface = match create_ruled_chamfer_surface(&mut model, &data) {
+            Ok(s) => s,
+            Err(e) => panic!("curved-rail chamfer surface must build: {e:?}"),
+        };
+        let tol = crate::math::Tolerance::default().distance();
+
+        // The headline: the middle sample, where a chord is furthest from the
+        // arc it replaced.
+        let mid = match surface.point_at(0.5, 0.0) {
+            Ok(p) => p,
+            Err(e) => panic!("surface evaluation at (0.5, 0.0) failed: {e:?}"),
+        };
+        let expected_mid = offset_points1[SAMPLES / 2];
+        assert!(
+            mid.distance(&expected_mid) <= tol,
+            "surface(u=0.5, v=0) must be offset_points1[5] {expected_mid:?}; got \
+             {mid:?} ({} away). A chord rail returns the chord midpoint, one \
+             sagitta off the arc.",
+            mid.distance(&expected_mid)
+        );
+
+        // Every station on both rails.
+        for i in 0..SAMPLES {
+            let u = i as f64 / (SAMPLES - 1) as f64;
+            let on_rail1 = match surface.point_at(u, 0.0) {
+                Ok(p) => p,
+                Err(e) => panic!("surface evaluation at (u={u}, v=0) failed: {e:?}"),
+            };
+            let on_rail2 = match surface.point_at(u, 1.0) {
+                Ok(p) => p,
+                Err(e) => panic!("surface evaluation at (u={u}, v=1) failed: {e:?}"),
+            };
+            assert!(
+                on_rail1.distance(&offset_points1[i]) <= tol,
+                "v=0 rail must pass through offset_points1[{i}] \
+                 {:?}; got {on_rail1:?}",
+                offset_points1[i]
+            );
+            assert!(
+                on_rail2.distance(&offset_points2[i]) <= tol,
+                "v=1 rail must pass through offset_points2[{i}] \
+                 {:?}; got {on_rail2:?}",
+                offset_points2[i]
+            );
+        }
+    }
+
+    /// A rail sampled on a straight edge must still be classified straight, so
+    /// `create_ruled_chamfer_surface` keeps `Line::new(first, last)` and every
+    /// straight-edge chamfer stays bit-identical.
+    #[test]
+    fn collinear_offset_samples_still_produce_a_line_rail() {
+        use crate::primitives::curve::Line;
+        use crate::primitives::surface::RuledSurface;
+
+        let straight: Vec<Point3> = (0..11).map(|i| Point3::new(i as f64, 0.0, 1.0)).collect();
+        let straight2: Vec<Point3> = (0..11).map(|i| Point3::new(i as f64, 1.0, 0.0)).collect();
+        assert!(
+            rail_is_straight(&straight),
+            "samples along a line must classify as a straight rail"
+        );
+
+        let mut model = BRepModel::new();
+        let data = ChamferData {
+            offset_points1: straight.clone(),
+            offset_points2: straight2.clone(),
+            parameters: (0..11).map(|i| i as f64 / 10.0).collect(),
+            normals1: vec![Vector3::new(0.0, 0.0, 1.0); 11],
+            normals2: vec![Vector3::new(0.0, 1.0, 0.0); 11],
+        };
+        let surface = match create_ruled_chamfer_surface(&mut model, &data) {
+            Ok(s) => s,
+            Err(e) => panic!("straight-rail chamfer surface must build: {e:?}"),
+        };
+        let ruled = match surface.as_any().downcast_ref::<RuledSurface>() {
+            Some(r) => r,
+            None => panic!("chamfer surface must be a RuledSurface"),
+        };
+        for (which, rail) in [(1u8, &ruled.curve1), (2u8, &ruled.curve2)] {
+            let line = match rail.as_any().downcast_ref::<Line>() {
+                Some(l) => l,
+                None => panic!(
+                    "rail {which} of a straight-edge chamfer must stay a Line, not \
+                     an interpolated curve — straight-edge results must not move"
+                ),
+            };
+            let src = if which == 1 { &straight } else { &straight2 };
+            assert_eq!(line.start, src[0], "rail {which} start");
+            assert_eq!(line.end, src[10], "rail {which} end");
+        }
+    }
+
+    /// The classifier must not call an arc straight. Without this, the fix
+    /// silently degrades to the pre-fix chord on any edge whose sagitta is
+    /// small but real.
+    #[test]
+    fn arc_samples_are_not_classified_straight() {
+        use std::f64::consts::FRAC_PI_2;
+        let arc: Vec<Point3> = (0..11)
+            .map(|i| {
+                let a = FRAC_PI_2 * (i as f64 / 10.0);
+                Point3::new(9.0 * a.cos(), 9.0 * a.sin(), 0.0)
+            })
+            .collect();
+        assert!(
+            !rail_is_straight(&arc),
+            "samples on a 90° arc of r=9 stand 2.6 mm off their chord — that is \
+             a curved rail"
+        );
+    }
+
+    /// A 90° pie slice (r=10) extruded 20 mm, and its top arc edge — the
+    /// smallest solid carrying an OPEN curved edge with a well-formed
+    /// four-face neighbourhood. Mirrors the fixture in
+    /// `tests/chamfer_curved_edge.rs`, kept here so these unit tests drive
+    /// `compute_chamfer_offsets` directly rather than through the whole op.
+    fn pie_slice_with_top_arc(model: &mut BRepModel) -> (SolidId, EdgeId) {
+        use crate::operations::{extrude_profile, ExtrudeOptions};
+        use crate::primitives::curve::{Arc, Line, ParameterRange};
+        use crate::primitives::edge::{Edge, EdgeOrientation};
+        use std::f64::consts::FRAC_PI_2;
+
+        const R: f64 = 10.0;
+        const H: f64 = 20.0;
+
+        let centre = model.vertices.add(0.0, 0.0, 0.0);
+        let start = model.vertices.add(R, 0.0, 0.0);
+        let end_p = Point3::new(R * FRAC_PI_2.cos(), R * FRAC_PI_2.sin(), 0.0);
+        let end = model.vertices.add(end_p.x, end_p.y, end_p.z);
+
+        let arc = match Arc::new(Point3::ORIGIN, Vector3::Z, R, 0.0, FRAC_PI_2) {
+            Ok(a) => a,
+            Err(e) => panic!("quarter arc: {e:?}"),
+        };
+        let arc_curve = model.curves.add(Box::new(arc));
+        let e_arc = model.edges.add(Edge::new(
+            0,
+            start,
+            end,
+            arc_curve,
+            EdgeOrientation::Forward,
+            ParameterRange::new(0.0, 1.0),
+        ));
+        let r1 = model.curves.add(Box::new(Line::new(end_p, Point3::ORIGIN)));
+        let e_r1 = model.edges.add(Edge::new(
+            0,
+            end,
+            centre,
+            r1,
+            EdgeOrientation::Forward,
+            ParameterRange::new(0.0, 1.0),
+        ));
+        let r2 = model.curves.add(Box::new(Line::new(
+            Point3::ORIGIN,
+            Point3::new(R, 0.0, 0.0),
+        )));
+        let e_r2 = model.edges.add(Edge::new(
+            0,
+            centre,
+            start,
+            r2,
+            EdgeOrientation::Forward,
+            ParameterRange::new(0.0, 1.0),
+        ));
+
+        let solid = match extrude_profile(
+            model,
+            vec![e_arc, e_r1, e_r2],
+            ExtrudeOptions {
+                direction: Vector3::Z,
+                distance: H,
+                ..Default::default()
+            },
+        ) {
+            Ok(s) => s,
+            Err(e) => panic!("extrude the pie slice: {e:?}"),
+        };
+
+        // The top arc: the one non-straight edge with both ends at z = H.
+        let mut found: Vec<EdgeId> = Vec::new();
+        for (eid, edge) in model.edges.iter() {
+            if edge.is_loop() {
+                continue;
+            }
+            let (Some(v0), Some(v1)) = (
+                model.vertices.get(edge.start_vertex),
+                model.vertices.get(edge.end_vertex),
+            ) else {
+                continue;
+            };
+            if (v0.position[2] - H).abs() > 1e-9 || (v1.position[2] - H).abs() > 1e-9 {
+                continue;
+            }
+            let is_curved = model
+                .curves
+                .get(edge.curve_id)
+                .is_some_and(|c| c.type_name() != "Line");
+            if is_curved {
+                found.push(eid);
+            }
+        }
+        assert_eq!(
+            found.len(),
+            1,
+            "the extruded pie slice must expose exactly one curved top edge; got {found:?}"
+        );
+        (solid, found[0])
+    }
+
+    /// A corner miter override on a CURVED offset rail must be refused, not
+    /// chorded.
+    ///
+    /// The miter path replaces one endpoint of a rail and then re-interpolates
+    /// every interior sample LINEARLY between the endpoints. On a straight rail
+    /// that is exact. On a curved one it is the chord flattening this whole
+    /// change exists to remove, applied after the fact — the boundary would
+    /// come back off its own face.
+    ///
+    /// The same call WITHOUT the override is asserted to succeed first, so the
+    /// refusal is attributable to the override and not to the edge.
+    #[test]
+    fn miter_override_on_a_curved_rail_is_refused() {
+        let mut model = BRepModel::new();
+        let (solid, arc) = pie_slice_with_top_arc(&mut model);
+        let (face1, face2) = match get_adjacent_faces(&model, solid, arc) {
+            Ok(f) => f,
+            Err(e) => panic!("adjacent faces of the top arc: {e:?}"),
+        };
+        let edge = match model.edges.get(arc) {
+            Some(e) => e.clone(),
+            None => panic!("top arc edge"),
+        };
+
+        // Control: the same edge, same distances, no overrides.
+        let clean = match compute_chamfer_offsets(&model, &edge, arc, face1, face2, 1.0, 1.0, None)
+        {
+            Ok(d) => d,
+            Err(e) => panic!("the curved edge itself must offset cleanly: {e:?}"),
+        };
+        assert!(
+            !rail_is_straight(&clean.offset_points1),
+            "precondition: face {face1}'s offset rail must be curved"
+        );
+
+        // A plausible mitered endpoint: the natural offset endpoint, nudged.
+        let v_at_t0 = if edge.orientation.is_forward() {
+            edge.start_vertex
+        } else {
+            edge.end_vertex
+        };
+        let mitered = clean.offset_points1[0] + Vector3::new(0.1, 0.0, 0.0);
+        let mut overrides: MiterOverrideMap = HashMap::new();
+        overrides.insert(
+            MiterKey {
+                edge: arc,
+                vertex: v_at_t0,
+                face: face1,
+            },
+            mitered,
+        );
+
+        match compute_chamfer_offsets(&model, &edge, arc, face1, face2, 1.0, 1.0, Some(&overrides))
+        {
+            Err(OperationError::NotImplemented(msg)) => {
+                assert!(
+                    msg.contains(&arc.to_string()) && msg.contains(&face1.to_string()),
+                    "the refusal must name the edge ({arc}) and the face ({face1}); got: {msg}"
+                );
+                assert!(
+                    msg.contains("CURVED"),
+                    "the refusal must say WHY it refuses; got: {msg}"
+                );
+            }
+            Err(other) => panic!(
+                "a miter override on a curved rail must refuse as NotImplemented; got {other:?}"
+            ),
+            Ok(data) => panic!(
+                "a miter override on a curved rail was ACCEPTED and the rail chorded: \
+                 {} samples, straight = {}",
+                data.offset_points1.len(),
+                rail_is_straight(&data.offset_points1)
+            ),
+        }
+    }
+
+    /// An offset trail that closes on itself must be refused, not handed to
+    /// the straight branch.
+    ///
+    /// `sample_at` walks the edge's CURVE over `t ∈ [0, 1]` and never consults
+    /// `Edge::param_range` (a separate defect), so an OPEN arc that a boolean
+    /// trimmed out of a full `Circle` is sampled all the way round and its
+    /// offset trail returns to its start.
+    ///
+    /// What happens next depends on rounding, and both outcomes are wrong.
+    /// With the ends EXACTLY coincident, `rail_is_straight` has no direction to
+    /// measure against, answers "straight", and `build_rail_curve` mints a
+    /// ZERO-LENGTH `Line` as the face's carrier rail under a full boundary.
+    /// With them a few ulps apart — what this fixture actually produces,
+    /// measured 2.2e-15 — the rail instead becomes a nearly-closed interpolant
+    /// spanning the WHOLE circle: a chamfer face for an edge the solid does not
+    /// have. Either way a wrong answer comes back wearing the shape of a
+    /// successful chamfer, which is what the refusal removes. The refusal is a
+    /// TOLERANCE test (`chord <= tolerance`), so it covers both.
+    #[test]
+    fn an_offset_trail_that_closes_on_itself_is_refused() {
+        use crate::math::Matrix4;
+        use crate::operations::{
+            boolean_operation, transform_solid, BooleanOp, BooleanOptions, TransformOptions,
+        };
+
+        const R: f64 = 10.0;
+        const H: f64 = 20.0;
+
+        let mut model = BRepModel::new();
+        let cyl = match TopologyBuilder::new(&mut model).create_cylinder_3d(
+            Point3::ORIGIN,
+            Vector3::Z,
+            R,
+            H,
+        ) {
+            Ok(crate::primitives::topology_builder::GeometryId::Solid(id)) => id,
+            other => panic!("cylinder: {other:?}"),
+        };
+        let cutter = match TopologyBuilder::new(&mut model).create_box_3d(33.0, 60.0, H + 10.0) {
+            Ok(crate::primitives::topology_builder::GeometryId::Solid(id)) => id,
+            other => panic!("cutter box: {other:?}"),
+        };
+        if let Err(e) = transform_solid(
+            &mut model,
+            cutter,
+            Matrix4::from_translation(&Vector3::new(23.5, 0.0, 0.5 * H)),
+            TransformOptions::default(),
+        ) {
+            panic!("translate cutter: {e:?}");
+        }
+        let cut = match boolean_operation(
+            &mut model,
+            cyl,
+            cutter,
+            BooleanOp::Difference,
+            BooleanOptions::default(),
+        ) {
+            Ok(s) => s,
+            Err(e) => panic!("chord difference: {e:?}"),
+        };
+
+        // An OPEN rim edge whose carrier is the full circle.
+        let mut target: Option<EdgeId> = None;
+        for (eid, edge) in model.edges.iter() {
+            if edge.is_loop() {
+                continue;
+            }
+            let (Some(v0), Some(v1)) = (
+                model.vertices.get(edge.start_vertex),
+                model.vertices.get(edge.end_vertex),
+            ) else {
+                continue;
+            };
+            if (v0.position[2] - H).abs() > 1e-9 || (v1.position[2] - H).abs() > 1e-9 {
+                continue;
+            }
+            if model
+                .curves
+                .get(edge.curve_id)
+                .is_some_and(|c| c.type_name() == "Circle")
+            {
+                target = Some(eid);
+                break;
+            }
+        }
+        let Some(target) = target else {
+            panic!("fixture must leave an open rim edge carried by a full Circle")
+        };
+        let edge = match model.edges.get(target) {
+            Some(e) => e.clone(),
+            None => panic!("target edge"),
+        };
+        assert!(
+            edge.param_range.start > 0.0 || edge.param_range.end < 1.0,
+            "precondition: the target must be a TRIMMED sub-arc of its circle; \
+             range is [{}, {}]",
+            edge.param_range.start,
+            edge.param_range.end
+        );
+        let (face1, face2) = match get_adjacent_faces(&model, cut, target) {
+            Ok(f) => f,
+            Err(e) => panic!("adjacent faces of the rim arc: {e:?}"),
+        };
+
+        match compute_chamfer_offsets(&model, &edge, target, face1, face2, 1.0, 1.0, None) {
+            Err(OperationError::NotImplemented(msg)) => {
+                assert!(
+                    msg.contains(&target.to_string()) && msg.contains("closes on"),
+                    "the refusal must name the edge ({target}) and the closed trail; got: {msg}"
+                );
+            }
+            Err(other) => {
+                panic!("a closed offset trail must refuse as NotImplemented; got {other:?}")
+            }
+            Ok(data) => {
+                let first = data.offset_points1[0];
+                let last = data.offset_points1[data.offset_points1.len() - 1];
+                panic!(
+                    "a closed offset trail was ACCEPTED: {} samples whose ends are \
+                     {} apart, classified straight = {}. The chamfer of a trimmed \
+                     sub-arc cannot be a rail that returns to its own start — that \
+                     face belongs to an edge the solid does not have.",
+                    data.offset_points1.len(),
+                    first.distance(&last),
+                    rail_is_straight(&data.offset_points1),
+                )
+            }
+        }
     }
 
     // -------------------------------------------------------------------
