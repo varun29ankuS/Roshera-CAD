@@ -153,6 +153,9 @@ pub fn offset_face(
             face.orientation,
         );
         let new_face_id = model.faces.add(offset_face);
+        // Measure the minted face's parametric domain from its own boundary
+        // loop - see `measure_and_set_face_uv_bounds`.
+        crate::tessellation::surface::measure_and_set_face_uv_bounds(model, new_face_id);
 
         Ok(new_face_id)
     })
@@ -2003,6 +2006,9 @@ fn create_interior_offset_faces(
         }
 
         let offset_face_id = model.faces.add(offset_face_obj);
+        // Measure the minted face's parametric domain from its own boundary
+        // loop - see `measure_and_set_face_uv_bounds`.
+        crate::tessellation::surface::measure_and_set_face_uv_bounds(model, offset_face_id);
         interior_faces.push(offset_face_id);
 
         // `create_offset_loop` already recorded every newly created offset
@@ -2499,7 +2505,11 @@ fn try_create_arc_ring_annular_wall(
 
     let mut wall_face = Face::new(0, cap_surface_id, outer_loop_id, orientation);
     wall_face.add_inner_loop(inner_loop_id);
-    Ok(Some(model.faces.add(wall_face)))
+    let face_id = model.faces.add(wall_face);
+    // Measure the minted face's parametric domain from its own boundary
+    // loop - see `measure_and_set_face_uv_bounds`.
+    crate::tessellation::surface::measure_and_set_face_uv_bounds(model, face_id);
+    Ok(Some(face_id))
 }
 
 /// Build the curved BAND wall over an OPEN curved rim arc (an imprinted bore-rim
@@ -2621,7 +2631,11 @@ fn create_arc_rim_wall(
         .unwrap_or(FaceOrientation::Forward);
 
     let wall_face = Face::new(0, surface_id, loop_id, orientation);
-    Ok(model.faces.add(wall_face))
+    let face_id = model.faces.add(wall_face);
+    // Measure the minted face's parametric domain from its own boundary
+    // loop - see `measure_and_set_face_uv_bounds`.
+    crate::tessellation::surface::measure_and_set_face_uv_bounds(model, face_id);
+    Ok(face_id)
 }
 
 /// True when a removed-face boundary edge cannot be spanned by a straight
@@ -2803,7 +2817,11 @@ fn create_curved_rim_wall(
 
         let mut wall_face = Face::new(0, cap_surface_id, outer_loop_id, orientation);
         wall_face.add_inner_loop(inner_loop_id);
-        return Ok(model.faces.add(wall_face));
+        let face_id = model.faces.add(wall_face);
+        // Measure the minted face's parametric domain from its own boundary
+        // loop - see `measure_and_set_face_uv_bounds`.
+        crate::tessellation::surface::measure_and_set_face_uv_bounds(model, face_id);
+        return Ok(face_id);
     }
 
     // ---- Ruled-band collar wall (off-plane offset rim, e.g. NURBS barrel). ----
@@ -3049,7 +3067,11 @@ fn create_ruled_band_wall(
 
     let mut wall_face = Face::new(0, surface_id, outer_loop_id, orientation);
     wall_face.add_inner_loop(inner_loop_id);
-    Ok(model.faces.add(wall_face))
+    let face_id = model.faces.add(wall_face);
+    // Measure the minted face's parametric domain from its own boundary
+    // loop - see `measure_and_set_face_uv_bounds`.
+    crate::tessellation::surface::measure_and_set_face_uv_bounds(model, face_id);
+    Ok(face_id)
 }
 
 /// Replace the curve on `offset_rim_edge_id` with a geometrically exact
@@ -3393,6 +3415,9 @@ fn create_wall_face(
     // Create face
     let face = Face::new(0, surface_id, loop_id, orientation);
     let face_id = model.faces.add(face);
+    // Measure the minted face's parametric domain from its own boundary
+    // loop - see `measure_and_set_face_uv_bounds`.
+    crate::tessellation::surface::measure_and_set_face_uv_bounds(model, face_id);
 
     Ok(face_id)
 }

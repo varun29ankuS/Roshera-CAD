@@ -651,7 +651,11 @@ fn transform_face_with_remap(
         new_face.add_inner_loop(inner_id);
     }
 
-    Ok(model.faces.add(new_face))
+    let face_id = model.faces.add(new_face);
+    // Measure the minted face's parametric domain from its own boundary
+    // loop - see `measure_and_set_face_uv_bounds`.
+    crate::tessellation::surface::measure_and_set_face_uv_bounds(model, face_id);
+    Ok(face_id)
 }
 
 /// Transform a loop, resolving its vertices and edges through `remap`.

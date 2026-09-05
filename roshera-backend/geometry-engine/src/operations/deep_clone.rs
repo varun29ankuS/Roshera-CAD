@@ -278,6 +278,24 @@ pub fn clone_faces(
             new_face.add_inner_loop(inner_loop);
         }
 
+        // A clone must carry what the kernel KNOWS about the original, and the
+        // parametric domain is knowledge, not derived state. `Face::new` writes
+        // the `[0, 1]²` placeholder and leaves the measured flag false, so
+        // without this a deep clone of a fully measured solid was a solid whose
+        // curved faces had all forgotten their own domain — every area,
+        // curvature and normal on the copy refusing where the original
+        // answered.
+        //
+        // COPIED, not re-measured: the clone's loops are vertex-for-vertex the
+        // originals (remapped ids over the same geometry), so re-projecting
+        // them could only reproduce the same numbers more expensively — and
+        // would silently DOWNGRADE a face whose domain came from somewhere the
+        // projection cannot reach (a surface's own declared domain on a
+        // seam-degenerate loop). An unmeasured original stays unmeasured.
+        if let Some([u0, u1, v0, v1]) = face.measured_uv_bounds() {
+            new_face.set_uv_bounds(u0, u1, v0, v1);
+        }
+
         let new_id = model.faces.add(new_face);
         context.face_map.insert(face_id, new_id);
         new_ids.push(new_id);

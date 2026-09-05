@@ -237,6 +237,9 @@ impl Primitive for SpherePrimitive {
             };
         let face = crate::primitives::face::Face::new(0, surface_id, loop_id, face_orientation);
         let face_id = model.faces.add(face);
+        // Measure the minted face's parametric domain from its own boundary
+        // loop - see `measure_and_set_face_uv_bounds`.
+        crate::tessellation::surface::measure_and_set_face_uv_bounds(model, face_id);
 
         // Shell and solid
         let mut shell = Shell::new(0, ShellType::Closed);

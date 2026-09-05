@@ -542,7 +542,11 @@ fn create_cubic_loft(
             let loop_id = model.loops.add(face_loop);
 
             let face = Face::new(0, surface_id, loop_id, orientation);
-            shell_faces.push(model.faces.add(face));
+            let face_id = model.faces.add(face);
+            // Measure the minted face's parametric domain from its own boundary
+            // loop - see `measure_and_set_face_uv_bounds`.
+            crate::tessellation::surface::measure_and_set_face_uv_bounds(model, face_id);
+            shell_faces.push(face_id);
         }
     }
 
@@ -999,6 +1003,9 @@ fn create_ruled_face(
         orientation,
     );
     let face_id = model.faces.add(face);
+    // Measure the minted face's parametric domain from its own boundary
+    // loop - see `measure_and_set_face_uv_bounds`.
+    crate::tessellation::surface::measure_and_set_face_uv_bounds(model, face_id);
 
     Ok(face_id)
 }
@@ -1193,6 +1200,9 @@ fn create_planar_face_from_edges(
         FaceOrientation::Forward,
     );
     let face_id = model.faces.add(face);
+    // Measure the minted face's parametric domain from its own boundary
+    // loop - see `measure_and_set_face_uv_bounds`.
+    crate::tessellation::surface::measure_and_set_face_uv_bounds(model, face_id);
 
     Ok(face_id)
 }
@@ -1398,7 +1408,13 @@ fn create_reversed_face(model: &mut BRepModel, face_id: &FaceId) -> OperationRes
         FaceOrientation::Backward => FaceOrientation::Forward,
     };
 
-    Ok(model.faces.add(reversed_face))
+    let face_id = model.faces.add(reversed_face);
+    // A CLONE, not a mint: `Face: Clone` already carries the source's measured
+    // domain, and the two faces share the same loops over the same surface, so
+    // there is nothing new to measure. Same rule as `deep_clone::clone_faces` -
+    // clones carry, mints measure. Reversing the orientation does not move a
+    // parametric extent.
+    Ok(face_id)
 }
 
 /// Build a loft end-cap from a densified correspondence RING (not the original
@@ -1445,9 +1461,12 @@ fn build_loft_cap(
     let surface = compute_planar_surface(model, &cap_edges)?;
     let orientation = orient_face_for_outward(surface.as_ref(), outward_target)?;
     let surface_id = model.surfaces.add(surface);
-    Ok(model
+    let face_id = model
         .faces
-        .add(Face::new(0, surface_id, loop_id, orientation)))
+        .add(Face::new(0, surface_id, loop_id, orientation));
+    // Measure the minted face's domain — see `measure_and_set_face_uv_bounds`.
+    crate::tessellation::surface::measure_and_set_face_uv_bounds(model, face_id);
+    Ok(face_id)
 }
 
 /// Remove the scratch profile faces (the loft INPUT) from the model after the

@@ -327,7 +327,11 @@ fn create_side_face_shared(
     let surface_id = model.surfaces.add(surface);
 
     let face = Face::new(0, surface_id, loop_id, orientation);
-    Ok(model.faces.add(face))
+    let face_id = model.faces.add(face);
+    // Measure the minted face's parametric domain from its own boundary
+    // loop - see `measure_and_set_face_uv_bounds`.
+    crate::tessellation::surface::measure_and_set_face_uv_bounds(model, face_id);
+    Ok(face_id)
 }
 
 /// Build the top cap face from the shared topology: translates the base
@@ -403,7 +407,11 @@ fn create_top_face_shared(
     for loop_id in inner_loop_ids {
         face.add_inner_loop(loop_id);
     }
-    Ok(model.faces.add(face))
+    let face_id = model.faces.add(face);
+    // Measure the minted face's parametric domain from its own boundary
+    // loop - see `measure_and_set_face_uv_bounds`.
+    crate::tessellation::surface::measure_and_set_face_uv_bounds(model, face_id);
+    Ok(face_id)
 }
 
 /// Post-condition for a CAPPED extrusion: the shell the operation just
@@ -2031,6 +2039,9 @@ pub fn create_face_from_profile(
         FaceOrientation::Forward,
     );
     let face_id = model.faces.add(face);
+    // Measure the minted face's parametric domain from its own boundary
+    // loop - see `measure_and_set_face_uv_bounds`.
+    crate::tessellation::surface::measure_and_set_face_uv_bounds(model, face_id);
 
     Ok(face_id)
 }
@@ -2749,6 +2760,9 @@ pub fn create_face_from_profile_with_plane(
 
     let face = Face::new(0, surface_id, loop_id, FaceOrientation::Forward);
     let face_id = model.faces.add(face);
+    // Measure the minted face's parametric domain from its own boundary
+    // loop - see `measure_and_set_face_uv_bounds`.
+    crate::tessellation::surface::measure_and_set_face_uv_bounds(model, face_id);
 
     Ok(face_id)
 }
@@ -3119,6 +3133,9 @@ fn create_quad_face(
         FaceOrientation::Forward,
     );
     let face_id = model.faces.add(face);
+    // Measure the minted face's parametric domain from its own boundary
+    // loop - see `measure_and_set_face_uv_bounds`.
+    crate::tessellation::surface::measure_and_set_face_uv_bounds(model, face_id);
 
     Ok(face_id)
 }
@@ -3161,6 +3178,9 @@ fn create_face_from_vertices(
         FaceOrientation::Forward,
     );
     let face_id = model.faces.add(face);
+    // Measure the minted face's parametric domain from its own boundary
+    // loop - see `measure_and_set_face_uv_bounds`.
+    crate::tessellation::surface::measure_and_set_face_uv_bounds(model, face_id);
 
     Ok(face_id)
 }

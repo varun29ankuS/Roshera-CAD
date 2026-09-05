@@ -1759,6 +1759,62 @@ impl Cylinder {
         Ok(cyl)
     }
 
+    /// Bring a raw `atan2` angle onto the branch nearest this cylinder's
+    /// angular trim, then clamp it to that trim.
+    ///
+    /// **The order is the whole point, and the old order was a live defect.**
+    /// It reduced with `while u > limits[1] { u -= 2*PI }` BEFORE clamping, so
+    /// an angle a rounding epsilon past `limits[1]` was pushed a whole period
+    /// BELOW the range and the trailing clamp then caught it at `limits[0]` —
+    /// the FAR end of the face.
+    ///
+    /// Measured on an extruded quarter-arc wall (`try_build_cylinder_from_arcs`
+    /// sets `angle_limits = [0, |sweep|]` and seam-aligns `ref_dir`): the
+    /// wall's closing vertical boundary edge sits at exactly `u = PI/2`, and
+    /// `ref_dir` for the 270-degree arc carries a `-1.8e-16` component, so the
+    /// angle came out `PI/2 + eps` and projected to **`u = 0.0`**. The face's
+    /// boundary polygon in (u, v) then had its right side collapsed onto its
+    /// left, the trim mask rejected every quadrature cell, and the wall
+    /// reported an area of exactly **0** while its `uv_bounds` — the bbox of
+    /// the same projection — were right. Three of four walls were fine; only
+    /// the one whose `ref_dir` rounded that way was not.
+    ///
+    /// Reducing onto the window CENTRED on the trim (rather than starting at
+    /// `limits[0]`) is what makes the clamp pick the genuinely nearer end: an
+    /// angle at `3*PI/2` against a `[0, PI/2]` trim is `PI/2` of arc from
+    /// `u = 0` and a full `PI` from `u = PI/2`, so it must clamp to `0`.
+    fn clamp_angle_to_trim(u: f64, limits: [f64; 2]) -> f64 {
+        Self::reduce_angle_to_trim_window(u, limits)
+            .max(limits[0])
+            .min(limits[1])
+    }
+
+    /// The reduction WITHOUT the clamp: bring `u` onto the period branch
+    /// nearest the trim and stop there, so an angle genuinely off the trimmed
+    /// arc keeps saying so.
+    ///
+    /// This is what [`Surface::exact_uv`] needs, for the same reason it leaves
+    /// `v` unclamped: a point handed to `exact_uv` already lies on the infinite
+    /// carrier surface, and reporting its TRUE parameters — even past the trim
+    /// — is what lets the caller's trim-membership test REJECT it. Clamping
+    /// silently relocates an off-arc point onto the arc's boundary, where a
+    /// winding-number test reads it as a genuine face hit.
+    ///
+    /// `closest_point` clamps on top of this, and should: it is asked for the
+    /// nearest point ON the trimmed patch, which is a boundary point when the
+    /// query is outside.
+    fn reduce_angle_to_trim_window(u: f64, limits: [f64; 2]) -> f64 {
+        let mid = 0.5 * (limits[0] + limits[1]);
+        let mut u = u;
+        while u < mid - consts::PI {
+            u += consts::TWO_PI;
+        }
+        while u >= mid + consts::PI {
+            u -= consts::TWO_PI;
+        }
+        u
+    }
+
     /// Create cylinder arc
     pub fn new_arc(
         origin: Point3,
@@ -1970,15 +2026,7 @@ impl Surface for Cylinder {
 
         // Normalize angle to parameter range
         let u = if let Some(limits) = self.angle_limits {
-            // Map to angle range
-            let mut u = u;
-            while u < limits[0] {
-                u += consts::TWO_PI;
-            }
-            while u > limits[1] {
-                u -= consts::TWO_PI;
-            }
-            u.max(limits[0]).min(limits[1])
+            Self::clamp_angle_to_trim(u, limits)
         } else {
             // Map to [0, 2π)
             if u < 0.0 {
@@ -2001,17 +2049,25 @@ impl Surface for Cylinder {
     /// onto the rim boundary where winding-number noise can misclassify it
     /// as a genuine face hit.
     ///
-    /// NOTE: the `angle_limits` branch below still clamps `u` exactly as
-    /// `closest_point` does — the identical class of bug, left UNFIXED
-    /// here because there is no evidence it is live: `angle_limits` is only
-    /// ever set `Some` by `Cylinder::new_arc`, and nothing in this crate
-    /// calls `new_arc` today (verified by grep; the only hit is a doc
-    /// comment in `dfm/analyzers/orientation.rs` describing a
-    /// hypothetical). Every real construction path
-    /// (`create_cylinder_topology` via `new_finite`, `Cylinder::transform`,
-    /// `offset`) carries `angle_limits: None` through unchanged. If a
-    /// partial-arc cylinder is ever wired up, this branch needs the same
-    /// unclamped treatment `v` got here.
+    /// NOTE: the `angle_limits` branch below shares `closest_point`'s angular
+    /// reduction, and both now go through [`Cylinder::clamp_angle_to_trim`].
+    ///
+    /// **The previous note here said there was "no evidence it is live"
+    /// because nothing calls `Cylinder::new_arc`. That reasoning was sound and
+    /// its conclusion was wrong: `new_arc` is not the only way the field is
+    /// set.** `operations::extrude::try_build_cylinder_from_arcs` writes
+    /// `angle_limits = [0, |sweep|]` onto a `new_finite` cylinder directly, so
+    /// every wall an extruded ARC produces is a partial-arc cylinder — and
+    /// `exact_uv` is reached on those from `queries::raycast` (three sites).
+    /// The clamp defect is fixed for both; see `clamp_angle_to_trim` for the
+    /// measurement that caught it.
+    ///
+    /// **And `u` now gets the same unclamped treatment `v` has**, which is the
+    /// property this method exists for: it reduces onto the branch nearest the
+    /// trim (`reduce_angle_to_trim_window`) and stops, so a point genuinely off
+    /// the trimmed arc reports a `u` outside the trim instead of being
+    /// relocated onto its boundary. `closest_point` still clamps, correctly —
+    /// it is asked for the nearest point ON the patch.
     fn exact_uv(&self, point: &Point3) -> MathResult<(f64, f64)> {
         let to_point = *point - self.origin;
         let v = to_point.dot(&self.axis);
@@ -2032,14 +2088,7 @@ impl Surface for Cylinder {
         let u = sin_u.atan2(cos_u);
 
         let u = if let Some(limits) = self.angle_limits {
-            let mut u = u;
-            while u < limits[0] {
-                u += consts::TWO_PI;
-            }
-            while u > limits[1] {
-                u -= consts::TWO_PI;
-            }
-            u.max(limits[0]).min(limits[1])
+            Self::reduce_angle_to_trim_window(u, limits)
         } else if u < 0.0 {
             u + consts::TWO_PI
         } else {
@@ -6170,6 +6219,77 @@ mod tests {
 
     fn default_tolerance() -> Tolerance {
         Tolerance::default()
+    }
+
+    // ===== Trimmed-cylinder angular reduction (task 32) =====
+    //
+    // `try_build_cylinder_from_arcs` gives every extruded ARC wall
+    // `angle_limits = [0, |sweep|]` with a seam-aligned `ref_dir`, so partial-
+    // arc cylinders ARE live and both of these paths run on them.
+
+    /// The defect, in one number. The old reduction ran
+    /// `while u > limits[1] { u -= 2*PI }` BEFORE the clamp, so an angle a
+    /// rounding epsilon past the top of the trim was pushed a whole period
+    /// below it and the trailing clamp caught it at the BOTTOM. Measured on an
+    /// extruded quarter-arc wall: the closing boundary edge at `u = PI/2 + eps`
+    /// projected to `0.0`, collapsing the face's (u, v) rectangle onto its own
+    /// left edge and reporting an area of exactly 0.
+    #[test]
+    fn an_epsilon_past_the_trim_clamps_to_the_near_end_not_the_far_one() {
+        let limits = [0.0, consts::FRAC_PI_2];
+        let eps_over = consts::FRAC_PI_2 + 4.0 * f64::EPSILON;
+        let got = Cylinder::clamp_angle_to_trim(eps_over, limits);
+        assert!(
+            (got - consts::FRAC_PI_2).abs() < 1e-12,
+            "PI/2 + eps must clamp to PI/2, got {got}"
+        );
+
+        // And a point genuinely on the far side still clamps to the genuinely
+        // NEARER end: 3*PI/2 is PI/2 of arc from u = 0 and a full PI from
+        // u = PI/2. Reducing onto the window centred on the trim is what makes
+        // this come out right; reducing from `limits[0]` would not.
+        let got = Cylinder::clamp_angle_to_trim(3.0 * consts::FRAC_PI_2, limits);
+        assert!(
+            got.abs() < 1e-12,
+            "3*PI/2 against [0, PI/2] must clamp to 0, got {got}"
+        );
+    }
+
+    /// `exact_uv` must NOT relocate an off-arc point onto the trim boundary.
+    ///
+    /// Its whole contract is that the point already lies on the infinite
+    /// carrier surface and its TRUE parameters are what let the caller's
+    /// trim-membership test reject it. `closest_point`, asked for the nearest
+    /// point ON the patch, correctly clamps the same input to the boundary —
+    /// asserted here as the contrast, so the two cannot silently converge.
+    #[test]
+    fn exact_uv_reports_an_off_arc_point_outside_the_trim_while_closest_point_clamps() {
+        let mut cyl = Cylinder::new_finite(Point3::ORIGIN, Vector3::Z, 5.0, 10.0).expect("cyl");
+        cyl.ref_dir = Vector3::X;
+        cyl.angle_limits = Some([0.0, consts::FRAC_PI_2]);
+
+        // A point on the carrier at u = PI (the -X side): squarely off a
+        // quarter-arc trim that covers only [0, PI/2].
+        let off = Point3::new(-5.0, 0.0, 4.0);
+
+        let (u_exact, v_exact) = cyl.exact_uv(&off).expect("exact_uv");
+        assert!(
+            u_exact > consts::FRAC_PI_2 + 1e-9,
+            "an off-arc point must report a u OUTSIDE the trim so the caller              can reject it, got {u_exact}"
+        );
+        assert!(
+            (u_exact - consts::PI).abs() < 1e-9,
+            "u should be PI, got {u_exact}"
+        );
+        assert!((v_exact - 4.0).abs() < 1e-9, "v is unclamped and true");
+
+        let (u_near, _) = cyl
+            .closest_point(&off, default_tolerance())
+            .expect("closest_point");
+        assert!(
+            (u_near - consts::FRAC_PI_2).abs() < 1e-9,
+            "closest_point is asked for the nearest point ON the patch, so it              clamps to the boundary, got {u_near}"
+        );
     }
 
     // ===== Fix 1 (exact-curves brief): dispatch_via_math_ssi consumers get

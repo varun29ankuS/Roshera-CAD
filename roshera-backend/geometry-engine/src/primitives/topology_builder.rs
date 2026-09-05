@@ -5773,6 +5773,9 @@ impl<'a> TopologyBuilder<'a> {
         let mut face = Face::new(0, surface_id, loop_id, FaceOrientation::Forward);
         face.outer_loop = loop_id;
         let face_id = self.model.faces.add(face);
+        // Measure the minted face's parametric domain from its own boundary
+        // loop - see `measure_and_set_face_uv_bounds`.
+        crate::tessellation::surface::measure_and_set_face_uv_bounds(self.model, face_id);
 
         // Record in timeline + forward to attached recorder.
         let operation = TimelineOperation::Create2D {
@@ -5889,6 +5892,11 @@ impl<'a> TopologyBuilder<'a> {
         face.outer_loop = loop_id;
         face.set_uv_bounds(u_min, u_max, v_min, v_max);
         let face_id = self.model.faces.add(face);
+        // The analytic domain above is already a measurement (the surface's own
+        // declared bounds, which a whole sphere provably covers). The shared
+        // measurement runs anyway so the two must AGREE: a sphere has a pole at
+        // each `v` endpoint, so it refuses here and the analytic bounds stand.
+        crate::tessellation::surface::measure_and_set_face_uv_bounds(self.model, face_id);
 
         // Create shell
         let mut shell = Shell::new(0, ShellType::Closed);
@@ -6625,7 +6633,11 @@ impl<'a> TopologyBuilder<'a> {
             // Create face
             let mut face = Face::new(0, surface_id, loop_id, FaceOrientation::Forward);
             face.outer_loop = loop_id;
-            faces[face_idx] = self.model.faces.add(face);
+            let face_id = self.model.faces.add(face);
+            // Measure the minted face's parametric domain from its own boundary
+            // loop - see `measure_and_set_face_uv_bounds`.
+            crate::tessellation::surface::measure_and_set_face_uv_bounds(self.model, face_id);
+            faces[face_idx] = face_id;
         }
 
         Ok(faces)
@@ -6841,6 +6853,15 @@ impl<'a> TopologyBuilder<'a> {
         lateral_face.outer_loop = lateral_loop_id;
         let lateral_face_id = self.model.faces.add(lateral_face);
 
+        // Measure each face's parametric domain from its own boundary loop.
+        // The lateral loop's own comment above states the domain this
+        // construction implies; the measurement must ARRIVE at it from the
+        // geometry, which `tests/minted_face_uv_bounds.rs` asserts. Nothing
+        // here hard-codes it.
+        crate::tessellation::surface::measure_and_set_face_uv_bounds(self.model, bottom_face_id);
+        crate::tessellation::surface::measure_and_set_face_uv_bounds(self.model, top_face_id);
+        crate::tessellation::surface::measure_and_set_face_uv_bounds(self.model, lateral_face_id);
+
         // ---- shell + solid. ----
         let mut shell = Shell::new(0, ShellType::Closed);
         shell.add_face(bottom_face_id);
@@ -7037,6 +7058,12 @@ impl<'a> TopologyBuilder<'a> {
             Face::new(0, lateral_surface_id, lateral_loop_id, lateral_orientation);
         lateral_face.outer_loop = lateral_loop_id;
         let lateral_face_id = self.model.faces.add(lateral_face);
+
+        // Measure the minted face's parametric domain from its own boundary
+        // loop - see `measure_and_set_face_uv_bounds`.
+        crate::tessellation::surface::measure_and_set_face_uv_bounds(self.model, bottom_face_id);
+        crate::tessellation::surface::measure_and_set_face_uv_bounds(self.model, top_face_id);
+        crate::tessellation::surface::measure_and_set_face_uv_bounds(self.model, lateral_face_id);
 
         // ---- shell + solid. ----
         let mut shell = Shell::new(0, ShellType::Closed);

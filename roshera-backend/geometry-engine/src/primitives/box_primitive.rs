@@ -543,7 +543,11 @@ impl Primitive for BoxPrimitive {
                 })?;
             let face =
                 crate::primitives::face::Face::new(0, surfaces[face_idx], loop_id, orientation);
-            faces.push(model.faces.add(face));
+            let face_id = model.faces.add(face);
+            // Measure the minted face's parametric domain from its own boundary
+            // loop - see `measure_and_set_face_uv_bounds`.
+            crate::tessellation::surface::measure_and_set_face_uv_bounds(model, face_id);
+            faces.push(face_id);
         }
 
         // Create shell from faces

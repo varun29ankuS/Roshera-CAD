@@ -335,6 +335,12 @@ impl Primitive for CylinderPrimitive {
         lateral_face.outer_loop = lateral_loop_id;
         let lateral_face_id = model.faces.add(lateral_face);
 
+        // Measure the minted face's parametric domain from its own boundary
+        // loop - see `measure_and_set_face_uv_bounds`.
+        crate::tessellation::surface::measure_and_set_face_uv_bounds(model, bottom_face_id);
+        crate::tessellation::surface::measure_and_set_face_uv_bounds(model, top_face_id);
+        crate::tessellation::surface::measure_and_set_face_uv_bounds(model, lateral_face_id);
+
         // ---- shell + solid. ----
         let mut shell = Shell::new(0, ShellType::Closed);
         shell.add_face(bottom_face_id);

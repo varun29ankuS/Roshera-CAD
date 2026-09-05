@@ -293,7 +293,11 @@ impl TorusPrimitive {
                 params.major_radius,
             )?;
             let face = Face::new(0, torus_surface_id, outer_loop_id, torus_orientation);
-            model.faces.add(face)
+            let face_id = model.faces.add(face);
+            // Measure the minted face's parametric domain from its own boundary
+            // loop - see `measure_and_set_face_uv_bounds`.
+            crate::tessellation::surface::measure_and_set_face_uv_bounds(model, face_id);
+            face_id
         } else {
             // Partial torus - create boundary edges
             let mut edges = Vec::new();
@@ -391,7 +395,11 @@ impl TorusPrimitive {
                 params.major_radius,
             )?;
             let face = Face::new(0, torus_surface_id, boundary_loop_id, torus_orientation);
-            model.faces.add(face)
+            let face_id = model.faces.add(face);
+            // Measure the minted face's parametric domain from its own boundary
+            // loop - see `measure_and_set_face_uv_bounds`.
+            crate::tessellation::surface::measure_and_set_face_uv_bounds(model, face_id);
+            face_id
         };
 
         // Create shell and solid

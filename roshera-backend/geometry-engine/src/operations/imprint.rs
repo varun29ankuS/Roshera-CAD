@@ -211,6 +211,9 @@ pub fn imprint_curves_on_face(
         // face-orientation fix.
         let new_face = Face::new(0, surface_id, loop_id, parent_orientation);
         let new_face_id = model.faces.add(new_face);
+        // Measure the minted face's parametric domain from its own boundary
+        // loop - see `measure_and_set_face_uv_bounds`.
+        crate::tessellation::surface::measure_and_set_face_uv_bounds(model, new_face_id);
         sub_faces.push(new_face_id);
     }
 

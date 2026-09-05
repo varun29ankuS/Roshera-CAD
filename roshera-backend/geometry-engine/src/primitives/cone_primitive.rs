@@ -310,7 +310,13 @@ impl ConePrimitive {
                 let cone_orientation =
                     orient_cone_lateral_outward(model, cone_surface_id, params.apex, params.axis)?;
                 let face = Face::new(0, cone_surface_id, loop_id, cone_orientation);
-                model.faces.add(face)
+                let face_id = model.faces.add(face);
+                // An APEX cone has a pole at the apex, so the measurement
+                // refuses here BY DESIGN and the face stays unmeasured: the
+                // boundary bbox would understate a domain that encloses the
+                // pole, and understating it is exactly the lie this guards.
+                crate::tessellation::surface::measure_and_set_face_uv_bounds(model, face_id);
+                face_id
             } else {
                 // Frustum - two circular edges
                 let bottom_circle = Arc::circle(bottom_center, params.axis, bottom_radius)?;
@@ -358,7 +364,11 @@ impl ConePrimitive {
                     orient_cone_lateral_outward(model, cone_surface_id, params.apex, params.axis)?;
                 let mut face = Face::new(0, cone_surface_id, outer_loop_id, cone_orientation);
                 face.add_inner_loop(inner_loop_id);
-                model.faces.add(face)
+                let face_id = model.faces.add(face);
+                // Measure the minted face's parametric domain from its own boundary
+                // loop - see `measure_and_set_face_uv_bounds`.
+                crate::tessellation::surface::measure_and_set_face_uv_bounds(model, face_id);
+                face_id
             }
         } else {
             // Sector cones (partial-sweep cones with start_angle/sweep_angle <
@@ -431,6 +441,8 @@ impl ConePrimitive {
             };
         let top_face = Face::new(0, top_plane_id, top_loop_id, top_orientation);
         let top_face_id = model.faces.add(top_face);
+        // Measure the cap's real parametric domain from its own boundary loop.
+        crate::tessellation::surface::measure_and_set_face_uv_bounds(model, top_face_id);
         faces.push(top_face_id);
 
         // Bottom cap face (if frustum)
@@ -489,6 +501,8 @@ impl ConePrimitive {
             };
             let bottom_face = Face::new(0, bottom_plane_id, bottom_loop_id, bottom_orientation);
             let bottom_face_id = model.faces.add(bottom_face);
+            // Measure the cap's real parametric domain from its own loop.
+            crate::tessellation::surface::measure_and_set_face_uv_bounds(model, bottom_face_id);
             faces.push(bottom_face_id);
         }
 

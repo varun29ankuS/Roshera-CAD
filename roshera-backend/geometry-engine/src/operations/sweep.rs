@@ -1235,7 +1235,11 @@ fn create_quad_face(
         orientation,
     );
 
-    Ok(model.faces.add(face))
+    let face_id = model.faces.add(face);
+    // Measure the minted face's parametric domain from its own boundary
+    // loop - see `measure_and_set_face_uv_bounds`.
+    crate::tessellation::surface::measure_and_set_face_uv_bounds(model, face_id);
+    Ok(face_id)
 }
 
 /// Create or find edge between vertices
@@ -1484,7 +1488,11 @@ fn create_profile_face(
         orientation,
     );
 
-    Ok(model.faces.add(face))
+    let face_id = model.faces.add(face);
+    // Measure the minted face's parametric domain from its own boundary
+    // loop - see `measure_and_set_face_uv_bounds`.
+    crate::tessellation::surface::measure_and_set_face_uv_bounds(model, face_id);
+    Ok(face_id)
 }
 
 /// Create reversed face
@@ -1502,7 +1510,13 @@ fn create_reversed_face(model: &mut BRepModel, face_id: FaceId) -> OperationResu
         FaceOrientation::Backward => FaceOrientation::Forward,
     };
 
-    Ok(model.faces.add(reversed))
+    let face_id = model.faces.add(reversed);
+    // A CLONE, not a mint: `Face: Clone` already carries the source's measured
+    // domain, and the two faces share the same loops over the same surface, so
+    // there is nothing new to measure. Same rule as `deep_clone::clone_faces` -
+    // clones carry, mints measure. Reversing the orientation does not move a
+    // parametric extent.
+    Ok(face_id)
 }
 
 /// Validate sweep inputs

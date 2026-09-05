@@ -566,6 +566,9 @@ fn create_blend_face(
         orientation,
     );
     let face_id = model.faces.add(face);
+    // Measure the minted face's parametric domain from its own boundary
+    // loop - see `measure_and_set_face_uv_bounds`.
+    crate::tessellation::surface::measure_and_set_face_uv_bounds(model, face_id);
 
     Ok(face_id)
 }

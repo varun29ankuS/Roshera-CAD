@@ -1546,6 +1546,33 @@ impl UvTrimMask {
             return Some(untrimmed);
         }
 
+        // A CUT SYSTEM, not a boundary: every edge traversed once each way, so
+        // the walk encloses nothing (a full torus's `a b a⁻¹ b⁻¹` fundamental
+        // polygon). The face is the whole surface, and its `uv_bounds` — which
+        // `measure_face_uv_domain` reads off the same structure — are that
+        // whole domain. The mask MUST agree with the bounds it is masking, or
+        // the two become independent readings free to disagree: measured, the
+        // even-odd test on that self-cancelling polygon threw away 6.9% of a
+        // torus (3675.7 mm² against the closed-form 3947.8).
+        //
+        // The domain rectangle stands in for the outer polygon rather than
+        // short-circuiting to `all_inside`, so that any inner loops are still
+        // subtracted from it.
+        //
+        // Read through `measured_uv_bounds()`, not the raw field: standing the
+        // domain rectangle in for the boundary is sound only if that rectangle
+        // IS the face's domain. On a face nobody measured it is the `[0, 1]²`
+        // placeholder, and substituting that would mask a one-by-one patch of
+        // an unrelated corner of the surface. Unmeasured, the projected polygon
+        // is left to speak for itself.
+        let outer = match (
+            crate::tessellation::surface::loop_is_a_pure_seam_system(outer_loop),
+            face.measured_uv_bounds(),
+        ) {
+            (true, Some([u0, u1, v0, v1])) => vec![(u0, v0), (u1, v0), (u1, v1), (u0, v1)],
+            _ => outer,
+        };
+
         // EVERY loop is projected independently, and `project_loop_uv_unwrapped`
         // starts each walk from `last: None` — so on a periodic surface each
         // loop lands on WHATEVER branch of the covering map its own first

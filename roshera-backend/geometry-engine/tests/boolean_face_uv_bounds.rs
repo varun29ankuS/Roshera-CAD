@@ -43,6 +43,7 @@ use geometry_engine::math::{Matrix4, Point3, Vector3};
 use geometry_engine::operations::{
     boolean_operation, transform_solid, BooleanOp, BooleanOptions, TransformOptions,
 };
+use geometry_engine::primitives::face::Face;
 use geometry_engine::primitives::solid::SolidId;
 use geometry_engine::primitives::topology_builder::{BRepModel, GeometryId, TopologyBuilder};
 use geometry_engine::queries::features::{feature_normal_cone, SupermaximalFeature};
@@ -176,6 +177,38 @@ fn tessellated_face_area(model: &BRepModel, solid: SolidId, fid: u32) -> f64 {
 
 fn rel_err(a: f64, b: f64) -> f64 {
     ((a - b) / b).abs()
+}
+
+/// Put a face back to what a CONSTRUCTOR alone produces: same surface, same
+/// loops, `uv_bounds` the `Face::new` placeholder, nothing measured.
+///
+/// Every test below that needs "a face whose domain nobody measured" used to
+/// take one for free from a primitive builder, because no primitive builder
+/// measured. Task 32 wired every production mint, so that source is gone - and
+/// leaning on it was these fixtures encoding the very defect they were written
+/// beside, which is why each carried a precondition assertion predicting this
+/// day out loud.
+///
+/// This is the honest replacement, and it depends on no mint at all:
+/// `Face::new` is handed an id, a surface and a loop, which cannot determine a
+/// domain, and `set_uv_bounds` - the only thing that flips the measured flag -
+/// is deliberately never called on it. There is no way to UNSET the flag by
+/// design, so re-minting the face is how the unmeasured state is expressed.
+fn unmeasure(model: &mut BRepModel, fid: u32) {
+    let face = model.faces.get(fid).expect("face to unmeasure").clone();
+    let mut fresh = Face::new(face.id, face.surface_id, face.outer_loop, face.orientation);
+    for inner in &face.inner_loops {
+        fresh.add_inner_loop(*inner);
+    }
+    *model.faces.get_mut(fid).expect("face to unmeasure") = fresh;
+    assert!(
+        !model
+            .faces
+            .get(fid)
+            .expect("face to unmeasure")
+            .uv_bounds_are_measured(),
+        "unmeasure() must leave the face carrying no measurement"
+    );
 }
 
 // ─── the fix: a boolean-minted curved face knows its own domain ──────────────
@@ -440,13 +473,12 @@ fn unmeasured_domain_refuses_rather_than_reporting_the_placeholder() {
     assert_eq!(walls.len(), 1, "one lateral face expected, got {walls:?}");
     let wall = walls[0];
 
+    unmeasure(&mut model, wall);
     assert_eq!(
         model.faces.get(wall).expect("wall face").uv_bounds,
         [0.0, 1.0, 0.0, 1.0],
-        "fixture precondition: the primitive builder must NOT have measured \
-         this face's domain — the field must still be the `Face::new` \
-         placeholder. If it ever carries real bounds, this test is testing \
-         nothing and needs a different unmeasured fixture"
+        "fixture precondition: the face under test carries the `Face::new` \
+         placeholder and no claim to it"
     );
 
     let report = model.query_face(wall).expect("wall face report");
@@ -580,15 +612,9 @@ fn select_reports_untestable_rather_than_claiming_no_match() {
 
     let walls = faces_of_kind(&model, cyl, "Cylinder");
     assert_eq!(walls.len(), 1, "one lateral expected, got {walls:?}");
-    assert!(
-        !model
-            .faces
-            .get(walls[0])
-            .expect("wall")
-            .uv_bounds_are_measured(),
-        "fixture precondition: the primitive lateral must be unmeasured, else \
-         there is nothing for the resolver to refuse over"
-    );
+    // The lateral must be unmeasured, else there is nothing for the resolver
+    // to refuse over.
+    unmeasure(&mut model, walls[0]);
 
     let q = FaceQuery::new(SurfaceKind::Cylindrical)
         .facing(Vector3::X)
@@ -635,14 +661,7 @@ fn normal_cone_widens_to_full_space_when_a_face_is_unmeasurable() {
     let cyl = cylinder(&mut model, CYL_R, CYL_H);
     let walls = faces_of_kind(&model, cyl, "Cylinder");
     assert_eq!(walls.len(), 1, "one lateral expected, got {walls:?}");
-    assert!(
-        !model
-            .faces
-            .get(walls[0])
-            .expect("wall")
-            .uv_bounds_are_measured(),
-        "fixture precondition: the primitive lateral must be unmeasured"
-    );
+    unmeasure(&mut model, walls[0]);
 
     // A pair of planar box faces whose cone genuinely CONSTRAINS — the control
     // that proves the assertion below is not vacuous.
@@ -906,15 +925,10 @@ fn unmeasured_planar_face_anchors_on_its_boundary_not_its_carrier_frame() {
 
     let planes = faces_of_kind(&model, bx, "Plane");
     assert_eq!(planes.len(), 6, "a box has six planar faces");
+    for &fid in &planes {
+        unmeasure(&mut model, fid);
+    }
     for fid in planes {
-        assert!(
-            !model
-                .faces
-                .get(fid)
-                .expect("box face")
-                .uv_bounds_are_measured(),
-            "fixture precondition: a primitive box face is unmeasured"
-        );
         let (mean, _, _) = boundary_stats(&model, fid);
         let subj = MeasureSubject::Face {
             solid: bx,

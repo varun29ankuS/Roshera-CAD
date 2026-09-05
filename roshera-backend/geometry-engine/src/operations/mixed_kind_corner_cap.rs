@@ -527,6 +527,9 @@ pub(crate) fn finalize_mixed_kind_cap_face(
         let mut face = Face::new(0, sub.surface_id, loop_id, sub.orientation);
         face.outer_loop = loop_id;
         let face_id = model.faces.add(face);
+        // Measure the minted face's parametric domain from its own boundary
+        // loop - see `measure_and_set_face_uv_bounds`.
+        crate::tessellation::surface::measure_and_set_face_uv_bounds(model, face_id);
 
         // Step 6 — register this sub-face on the outer shell.
         let shell = model.shells.get_mut(shell_id).ok_or_else(|| {

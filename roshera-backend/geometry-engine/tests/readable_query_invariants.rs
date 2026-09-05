@@ -314,35 +314,38 @@ fn face_principal_curvatures_match_analytic() {
         );
     }
 
-    // Cylinder r=0.5: caps are flat [0, 0]; the lateral REFUSES.
+    // Cylinder r=0.5: caps are flat [0, 0]; the lateral reports [-2, 0].
     //
-    // `create_cylinder_3d` never calls `set_uv_bounds`, so the lateral face
-    // still carries the `Face::new` `[0, 1]²` placeholder — the kernel does not
-    // know which patch of the cylinder this face is. This assertion used to
-    // read `[±2, 0]` from a probe at the placeholder's centre and pass, but it
-    // passed BY ACCIDENT: a cylinder's principal curvatures are the same at
-    // every point, so any probe point at all produces the right pair. The
-    // kernel was not measuring the face's midpoint, it was reporting a
-    // constant that happened to match. On a cone — where curvature varies
-    // along the axis — the identical code reports a number the face does not
-    // have anywhere.
+    // This assertion has now been through three states, and the middle one
+    // is the interesting one. It originally read [+-2, 0] and PASSED BY
+    // ACCIDENT: `create_cylinder_3d` never measured the lateral, so the
+    // probe ran at the `[0, 1]^2` placeholder's centre - but a cylinder's
+    // principal curvatures are the same at every point, so any probe point
+    // at all produces the right pair. The kernel was not sampling the
+    // face's midpoint; it was reporting a constant that happened to match.
+    // On a cone, where curvature varies along the axis, the identical code
+    // reports a number the face does not have anywhere. Task 12 therefore
+    // changed it to `is_none()` - honest, and it said in this comment that
+    // the day the primitive builder measured its own lateral, [+-2, 0]
+    // should come back.
     //
-    // The capability this once claimed to cover ("curvature on a curved face
-    // is correct") is now asserted in `tests/boolean_face_uv_bounds.rs` on a
-    // boolean-cut cone frustum, whose domain IS measured and whose curvature
-    // cannot be right by accident. Here, `None` is the honest answer, and the
-    // day the primitive builder measures its own lateral this assertion should
-    // become `[±2, 0]` again.
+    // Task 32 is that day. The value is the same as the first version and
+    // it now means something different: the probe point is the centre of a
+    // MEASURED domain, so the pair is read at a point the face actually
+    // contains. The independent guard against the accident returning is in
+    // `tests/boolean_face_uv_bounds.rs`, on a cone frustum whose curvature
+    // varies and so cannot be right by luck.
     let mut saw_lateral = false;
     for fid in faces_of(&model, cyl) {
         let r = model.query_face(fid).expect("cyl face report");
         if r.surface_type == "cylinder" {
             saw_lateral = true;
+            let [k1, k2] = r
+                .principal_curvatures
+                .expect("a measured lateral reports its curvature");
             assert!(
-                r.principal_curvatures.is_none(),
-                "cyl lateral {fid}: domain unmeasured, so curvature must be \
-                 withheld, got {:?}",
-                r.principal_curvatures
+                rel_close(k1.abs(), 2.0, 1e-6) && k2.abs() < 1e-9,
+                "cyl lateral {fid}: r=0.5 means [+-2, 0], got [{k1}, {k2}]"
             );
         } else {
             let [k1, k2] = r.principal_curvatures.expect("cyl cap curvatures");

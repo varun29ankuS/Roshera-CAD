@@ -566,10 +566,10 @@ fn collect_face_fragments(
     }
 
     // Real face UV extent comes from lifting the loop's 3D edges back
-    // into (u, v) via `surface.closest_point`. `face.uv_bounds` is a
-    // normalised [0, 1] placeholder for most analytic faces and cannot
-    // be trusted here; the tessellator already maintains the correct
-    // loop-lifted version in `get_face_parameter_bounds`.
+    // into (u, v) via `surface.closest_point`. Read from the loop rather than
+    // from `face.uv_bounds` so this path does not depend on whether the mint
+    // measured the domain; the tessellator already maintains the loop-lifted
+    // version in `get_face_parameter_bounds`.
     let (u_min, u_max, v_min, v_max) = get_face_parameter_bounds(face, model);
 
     // Pad the search rectangle slightly so curves that touch the face

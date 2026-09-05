@@ -382,7 +382,11 @@ fn draft_single_face(
                 create_drafted_loop(model, &face, neutral_curve, draft_direction, draft_angle)?;
             let loop_id = model.loops.add(drafted_loop);
             let drafted_face = Face::new(0, surface_id, loop_id, face.orientation);
-            Ok(model.faces.add(drafted_face))
+            let face_id = model.faces.add(drafted_face);
+            // Measure the minted face's parametric domain from its own boundary
+            // loop - see `measure_and_set_face_uv_bounds`.
+            crate::tessellation::surface::measure_and_set_face_uv_bounds(model, face_id);
+            Ok(face_id)
         }
         DraftType::Variable(angle_fn) => draft_single_face_variable(
             model,
@@ -1163,7 +1167,11 @@ fn draft_single_face_variable(
     let loop_id = model.loops.add(drafted_loop);
 
     let drafted_face = Face::new(0, surface_id, loop_id, face.orientation);
-    Ok(model.faces.add(drafted_face))
+    let face_id = model.faces.add(drafted_face);
+    // Measure the minted face's parametric domain from its own boundary
+    // loop - see `measure_and_set_face_uv_bounds`.
+    crate::tessellation::surface::measure_and_set_face_uv_bounds(model, face_id);
+    Ok(face_id)
 }
 
 /// Apply tangent draft: uses the intersection curve tangent at the parting line
@@ -1273,7 +1281,11 @@ fn draft_single_face_tangent(
     let loop_id = model.loops.add(drafted_loop);
 
     let drafted_face = Face::new(0, surface_id, loop_id, face.orientation);
-    Ok(model.faces.add(drafted_face))
+    let face_id = model.faces.add(drafted_face);
+    // Measure the minted face's parametric domain from its own boundary
+    // loop - see `measure_and_set_face_uv_bounds`.
+    crate::tessellation::surface::measure_and_set_face_uv_bounds(model, face_id);
+    Ok(face_id)
 }
 
 /// Apply stepped draft: partition the face at the given height thresholds and
@@ -1346,7 +1358,11 @@ fn draft_single_face_stepped(
     let loop_id = model.loops.add(drafted_loop);
 
     let drafted_face = Face::new(0, surface_id, loop_id, face.orientation);
-    Ok(model.faces.add(drafted_face))
+    let face_id = model.faces.add(drafted_face);
+    // Measure the minted face's parametric domain from its own boundary
+    // loop - see `measure_and_set_face_uv_bounds`.
+    crate::tessellation::surface::measure_and_set_face_uv_bounds(model, face_id);
+    Ok(face_id)
 }
 
 /// Compute the lateral offset for a point at a given height and draft angle.

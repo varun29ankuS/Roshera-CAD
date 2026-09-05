@@ -249,14 +249,23 @@ pub fn nurbs_loft(
             Face::new(0, lateral_surface_id, lateral_loop_id, lateral_orientation);
         lateral_face.outer_loop = lateral_loop_id;
         let lateral_face_id = model.faces.add(lateral_face);
+        // Measure the minted face's parametric domain from its own boundary
+        // loop - see `measure_and_set_face_uv_bounds`.
+        crate::tessellation::surface::measure_and_set_face_uv_bounds(model, lateral_face_id);
 
         let mut bottom_face = Face::new(0, bottom_surface_id, bottom_loop_id, bottom_orientation);
         bottom_face.outer_loop = bottom_loop_id;
         let bottom_face_id = model.faces.add(bottom_face);
+        // Measure the minted face's parametric domain from its own boundary
+        // loop - see `measure_and_set_face_uv_bounds`.
+        crate::tessellation::surface::measure_and_set_face_uv_bounds(model, bottom_face_id);
 
         let mut top_face = Face::new(0, top_surface_id, top_loop_id, top_orientation);
         top_face.outer_loop = top_loop_id;
         let top_face_id = model.faces.add(top_face);
+        // Measure the minted face's parametric domain from its own boundary
+        // loop - see `measure_and_set_face_uv_bounds`.
+        crate::tessellation::surface::measure_and_set_face_uv_bounds(model, top_face_id);
 
         // ---- shell + solid. ----
         let mut shell = Shell::new(0, ShellType::Closed);

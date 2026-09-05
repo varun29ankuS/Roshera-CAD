@@ -1338,7 +1338,11 @@ fn create_revolution(
             );
             let orientation = orient_face_for_outward(surface.as_ref(), outward_target)?;
             let surf_id = model.surfaces.add(surface);
-            shell_faces.push(model.faces.add(Face::new(0, surf_id, loop_id, orientation)));
+            let face_id = model.faces.add(Face::new(0, surf_id, loop_id, orientation));
+            // Measure the minted face's parametric domain from its own boundary
+            // loop - see `measure_and_set_face_uv_bounds`.
+            crate::tessellation::surface::measure_and_set_face_uv_bounds(model, face_id);
+            shell_faces.push(face_id);
         }
     }
 
@@ -1891,7 +1895,11 @@ fn build_analytic_bands(
             let mut f = Face::new(0, surf_id, lp_id, orient);
             f.outer_loop = lp_id;
             f.set_uv_bounds(u0, u1, v0, v1);
-            faces.push(model.faces.add(f));
+            let face_id = model.faces.add(f);
+            // Measure the minted face's parametric domain from its own boundary
+            // loop - see `measure_and_set_face_uv_bounds`.
+            crate::tessellation::surface::measure_and_set_face_uv_bounds(model, face_id);
+            faces.push(face_id);
             continue;
         }
         let (c0, r0, t0) = ring_geo[&s];
@@ -2070,7 +2078,11 @@ fn build_analytic_bands(
             let orient = orient_face_for_outward(surf, target)?;
             let mut f = Face::new(0, surf_id, lp_id, orient);
             f.outer_loop = lp_id;
-            faces.push(model.faces.add(f));
+            let face_id = model.faces.add(f);
+            // Measure the minted face's parametric domain from its own boundary
+            // loop - see `measure_and_set_face_uv_bounds`.
+            crate::tessellation::surface::measure_and_set_face_uv_bounds(model, face_id);
+            faces.push(face_id);
         } else if horizontal {
             // Plane cap at constant axial. A pole end → full DISC (outer circle
             // only); two finite radii → annular ring (outer rim + inner hole).
@@ -2099,7 +2111,11 @@ fn build_analytic_bands(
                 let inner_id = model.loops.add(inner);
                 f.add_inner_loop(inner_id);
             }
-            faces.push(model.faces.add(f));
+            let face_id = model.faces.add(f);
+            // Measure the minted face's parametric domain from its own boundary
+            // loop - see `measure_and_set_face_uv_bounds`.
+            crate::tessellation::surface::measure_and_set_face_uv_bounds(model, face_id);
+            faces.push(face_id);
         } else {
             // Periodic seam band: Cylinder (vertical edge) or Cone frustum
             // (sloped edge). Both share the seam meridian + rectangular loop.
@@ -2190,7 +2206,11 @@ fn build_analytic_bands(
             let orient = orient_face_for_outward(surf, target)?;
             let mut f = Face::new(0, surf_id, lp_id, orient);
             f.outer_loop = lp_id;
-            faces.push(model.faces.add(f));
+            let face_id = model.faces.add(f);
+            // Measure the minted face's parametric domain from its own boundary
+            // loop - see `measure_and_set_face_uv_bounds`.
+            crate::tessellation::surface::measure_and_set_face_uv_bounds(model, face_id);
+            faces.push(face_id);
         }
     }
 
@@ -2345,7 +2365,11 @@ fn build_revolution_cap(
     };
     let orientation = orient_face_for_outward(cap_surface.as_ref(), outward_target)?;
     let surf_id = model.surfaces.add(cap_surface);
-    Ok(model.faces.add(Face::new(0, surf_id, loop_id, orientation)))
+    let face_id = model.faces.add(Face::new(0, surf_id, loop_id, orientation));
+    // Measure the minted face's parametric domain from its own boundary
+    // loop - see `measure_and_set_face_uv_bounds`.
+    crate::tessellation::surface::measure_and_set_face_uv_bounds(model, face_id);
+    Ok(face_id)
 }
 
 /// Create a helical sweep — revolve with axial translation (pitch per revolution)
@@ -2506,7 +2530,11 @@ fn create_helical_sweep(
             let surf_id = model.surfaces.add(surf_box);
 
             let face = Face::new(0, surf_id, loop_id, orientation);
-            shell_faces.push(model.faces.add(face));
+            let face_id = model.faces.add(face);
+            // Measure the minted face's parametric domain from its own boundary
+            // loop - see `measure_and_set_face_uv_bounds`.
+            crate::tessellation::surface::measure_and_set_face_uv_bounds(model, face_id);
+            shell_faces.push(face_id);
         }
     }
 
@@ -2681,6 +2709,9 @@ fn create_revolution_segment_face(
         orientation,
     );
     let face_id = model.faces.add(face);
+    // Measure the minted face's parametric domain from its own boundary
+    // loop - see `measure_and_set_face_uv_bounds`.
+    crate::tessellation::surface::measure_and_set_face_uv_bounds(model, face_id);
 
     Ok(face_id)
 }
@@ -2913,6 +2944,9 @@ fn create_transformed_face(
 
     let new_face = Face::new(0, new_surface_id, new_loop_id, face.orientation);
     let new_face_id = model.faces.add(new_face);
+    // Measure the minted face's parametric domain from its own boundary
+    // loop - see `measure_and_set_face_uv_bounds`.
+    crate::tessellation::surface::measure_and_set_face_uv_bounds(model, new_face_id);
 
     Ok(new_face_id)
 }

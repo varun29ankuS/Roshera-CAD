@@ -145,6 +145,25 @@ enum FaceNormal {
     Missing,
 }
 
+/// What asking a face for its extremal SCORE produced.
+///
+/// The same three outcomes as [`FaceNormal`], for the same reason: a face the
+/// kernel declines to RANK and a face whose statistics failed to compute are
+/// different facts, and only the first makes the query undecidable. Folding
+/// both into `None` is what let a dropped candidate become a confident answer.
+enum FaceScore {
+    /// A real number, computed over a domain the kernel measured.
+    Known(f64),
+    /// The face exists and matched every filter, but its parametric domain was
+    /// never measured, so the area and centroid `FaceStats` would report
+    /// describe a different patch of the surface. It cannot be ranked, and it
+    /// cannot be excluded either — it is exactly the face that might have won.
+    Unmeasurable,
+    /// No such face, its statistics could not be computed, or this extremal has
+    /// no score for it. Not a candidate at all, and not an obstacle.
+    Missing,
+}
+
 /// Outward normal of a face at its parametric midpoint (constant for planes;
 /// representative for the kinds we filter on).
 fn face_outward_normal(model: &BRepModel, fid: FaceId) -> FaceNormal {
@@ -244,17 +263,34 @@ pub fn resolve_face(
         e => {
             // Compute each match's score with split field borrows.
             //
-            // A face that fails to score is still DROPPED here rather than
-            // carried as untestable — see the note in `face_score`. `None` from
-            // it today means "the stats computation errored", which is a
-            // different fact from "the domain is unknown", and conflating them
-            // would refuse queries that have always been answerable.
+            // A candidate the ranking cannot SCORE is carried in `unscorable`,
+            // never folded into the drop — the same rule the normal filter
+            // above follows, and for the same reason: the face that was
+            // dropped is exactly the one that might have won. An unmeasured
+            // face reaches here whenever the query names no direction (the
+            // normal filter is then skipped entirely) or names one a plane
+            // satisfies, and the kernel mints unmeasured faces BY DESIGN — an
+            // apex cone's lateral, an obliquely cut spherical cap. Ranking the
+            // rest and returning the runner-up as "the largest face" would be
+            // a confident answer over a candidate set that was never finished.
+            //
+            // `Missing` still drops, and that is not the same concession: it
+            // means the statistics errored or this extremal has no score for
+            // the face, neither of which is a claim about the geometry.
             let mut scored: Vec<(FaceId, f64)> = Vec::with_capacity(matches.len());
+            let mut unscorable: Vec<FaceId> = Vec::new();
             for &fid in &matches {
-                let s = face_score(model, fid, e);
-                if let Some(s) = s {
-                    scored.push((fid, s));
+                match face_score(model, fid, e) {
+                    FaceScore::Known(s) => scored.push((fid, s)),
+                    FaceScore::Unmeasurable => unscorable.push(fid),
+                    FaceScore::Missing => {}
                 }
+            }
+            if !unscorable.is_empty() {
+                return Err(SelectError::Unmeasurable {
+                    matched: scored.iter().map(|(f, _)| *f).collect(),
+                    unmeasurable: unscorable,
+                });
             }
             if scored.is_empty() {
                 return Err(SelectError::NotFound);
@@ -579,15 +615,33 @@ pub fn resolve_edge(
 }
 
 /// Score one face for the extremal pick, with the split field borrows
-/// `compute_stats` needs. Returns area, centroid·dir, the face's minimum radial
+/// `compute_stats` needs. Yields area, centroid·dir, the face's minimum radial
 /// distance to an axis, or the magnitude of its centroid's axial projection.
-fn face_score(model: &mut BRepModel, fid: FaceId, e: Extremal) -> Option<f64> {
+///
+/// Three-valued on purpose — see [`FaceScore`]. The caller must not fold
+/// `Unmeasurable` into a drop.
+fn face_score(model: &mut BRepModel, fid: FaceId, e: Extremal) -> FaceScore {
     // The two geometry-aware extremals SAMPLE the face surface, which needs an
     // immutable borrow of the model alongside the surface store — keep them off
     // the `compute_stats` split-borrow path.
+    //
+    // Neither is gated on the measured domain, and that is not an oversight:
+    // both work from the BOUNDARY samples (loop vertices + edge midpoints),
+    // never from a `uv_bounds` parametric grid, so an unmeasured domain does
+    // not reach their answer. See `face_min_radius_to_axis`.
     match e {
-        Extremal::MinRadiusStation(axis) => return face_min_radius_to_axis(model, fid, axis),
-        Extremal::AxialExtremalCap(axis) => return face_axial_extent_magnitude(model, fid, axis),
+        Extremal::MinRadiusStation(axis) => {
+            return match face_min_radius_to_axis(model, fid, axis) {
+                Some(s) => FaceScore::Known(s),
+                None => FaceScore::Missing,
+            }
+        }
+        Extremal::AxialExtremalCap(axis) => {
+            return match face_axial_extent_magnitude(model, fid, axis) {
+                Some(s) => FaceScore::Known(s),
+                None => FaceScore::Missing,
+            }
+        }
         _ => {}
     }
     // Distinct BRepModel fields → simultaneous &mut faces + &mut loops + & others
@@ -601,43 +655,50 @@ fn face_score(model: &mut BRepModel, fid: FaceId, e: Extremal) -> Option<f64> {
         surfaces,
         ..
     } = model;
-    let face = faces.get_mut(fid)?;
-    // ⚠ KNOWN, MEASURED, AND DELIBERATELY NOT GATED HERE.
+    let Some(face) = faces.get_mut(fid) else {
+        return FaceScore::Missing;
+    };
+    // `FaceStats` is computed over `Face::uv_bounds`, so on a face whose
+    // domain was never measured both the curved-surface area and the sampled
+    // centroid describe a different patch of the surface - one radian by one
+    // millimetre of a cylinder that spans 2*pi by its height. `LargestArea` /
+    // `SmallestArea` / `MostAlong` would then rank on a placeholder.
     //
-    // `FaceStats` is computed over `Face::uv_bounds`, so on a face whose domain
-    // was never measured both the curved-surface area and the sampled centroid
-    // describe a different patch of the surface — one radian by one millimetre
-    // of a cylinder that spans 2π by its height. `LargestArea` / `SmallestArea`
-    // / `MostAlong` therefore rank on a placeholder.
+    // Task 12 wrote this gate, ran it, and REVERTED it, because every curved
+    // face minted outside a boolean was unmeasured then: gating turned 5
+    // passing tests across `labels_gate` and `labels_assertion_gate` into
+    // refusals, since their nozzle fixture resolves throat and chamber by
+    // `SmallestArea` / `LargestArea` over two REVOLVED cylinder walls. It
+    // recorded the precondition for landing it: MEASURE those faces at their
+    // mint, after which the gate is a no-op and disables nothing.
     //
-    // Gating it on `Face::domain_is_known` was written, run, and reverted:
-    // every curved face minted outside a boolean is unmeasured today, so the
-    // gate refuses the whole descriptive-selection surface — measured, it turns
-    // 5 passing tests across `labels_gate` and `labels_assertion_gate` into
-    // refusals, because their nozzle fixture resolves throat and chamber by
-    // `SmallestArea` / `LargestArea` over two REVOLVED cylinder walls.
-    //
-    // Those rankings are right today only by accident: the placeholder area of
-    // a cylinder wall integrates to `r · 1 · 1 = r`, and the true area is
-    // `2π·r·h`, so the two orders agree exactly while the compared walls share a
-    // height (the nozzle's inner r=2 and outer r=4 both span z ∈ [0, 3]). Give
-    // them different heights and the ranking inverts silently.
-    //
-    // The honest close is to MEASURE those faces at their mint — the primitive
-    // and revolve builders — after which this gate is a no-op and can land
-    // without disabling anything. Gating first would trade a wrong answer for
-    // no answer across a whole product capability, in a change whose remit was
-    // the normal filter above.
-    let stats = face
-        .compute_stats(loops, vertices, edges, curves, surfaces)
-        .ok()?;
+    // Task 32 measured them - `revolve.rs` included - so the gate lands here.
+    // What it is worth: those rankings were right only by ACCIDENT. A
+    // cylinder wall's placeholder area integrates to `r * 1 * 1 = r` while
+    // the true area is `2*pi*r*h`, so the two orders agree exactly while the
+    // compared walls share a height (the nozzle's inner r=2 and outer r=4
+    // both span z in [0, 3]). Give them different heights and the ranking
+    // inverts, silently. An unmeasured face is now a face the kernel declines
+    // to RANK — and `Unmeasurable`, not `Missing`, because the caller must
+    // REFUSE the whole query over it rather than rank the others and hand back
+    // the runner-up. The kernel mints unmeasured faces by design (an apex
+    // cone's lateral, an obliquely cut spherical cap), so this is reachable,
+    // not hypothetical.
+    if !face.domain_is_known(surfaces) {
+        return FaceScore::Unmeasurable;
+    }
+    let Ok(stats) = face.compute_stats(loops, vertices, edges, curves, surfaces) else {
+        return FaceScore::Missing;
+    };
     match e {
-        Extremal::LargestArea | Extremal::SmallestArea => Some(stats.area),
+        Extremal::LargestArea | Extremal::SmallestArea => FaceScore::Known(stats.area),
         Extremal::MostAlong(d) => {
             let c = stats.centroid;
-            Some(c.x * d.x + c.y * d.y + c.z * d.z)
+            FaceScore::Known(c.x * d.x + c.y * d.y + c.z * d.z)
         }
-        Extremal::None | Extremal::MinRadiusStation(_) | Extremal::AxialExtremalCap(_) => None,
+        Extremal::None | Extremal::MinRadiusStation(_) | Extremal::AxialExtremalCap(_) => {
+            FaceScore::Missing
+        }
     }
 }
 
@@ -665,10 +726,11 @@ fn point_to_axis_distance(p: crate::math::Point3, axis: Axis) -> f64 {
 /// cone and the throat band meet at the same radius but only the band STATIONS
 /// there.
 ///
-/// Boundary samples are used (not a `uv_bounds` parametric grid) because an
-/// analytic face's `uv_bounds` is the normalized `[0,1]²` placeholder, not the
-/// trimmed extent — its loop edges carry the real geometry. `None` if the face
-/// has no resolvable boundary point.
+/// Boundary samples are used (not a `uv_bounds` parametric grid) because the
+/// loop edges carry the trimmed extent directly, with no dependence on whether
+/// the face's parametric domain was ever measured. That independence is why
+/// `face_score` does NOT gate these two extremals on `domain_is_known`.
+/// `None` if the face has no resolvable boundary point.
 fn face_min_radius_to_axis(model: &BRepModel, fid: FaceId, axis: Axis) -> Option<f64> {
     let face = model.faces.get(fid)?;
     let mut sum = 0.0_f64;
@@ -744,10 +806,20 @@ mod tests {
     /// Two coaxial cylinders in one model, one lateral measured and one not —
     /// the state the resolver must not paper over.
     ///
-    /// The kernel cannot build this from a single boolean today (every result
-    /// face is re-minted and measured) so the measured half is created by
-    /// declaring the bounds directly, which is exactly what a measuring mint
-    /// does. The point under test is the RESOLVER's contract, not the geometry.
+    /// **Neither half can be taken from a mint any more.** When this fixture
+    /// was written the primitive builder did not measure its lateral, so the
+    /// unmeasured half came free; task 32 wired every production mint, and a
+    /// plain cylinder's wall now carries a real domain. Relying on that was the
+    /// fixture encoding the defect it was written beside.
+    ///
+    /// So BOTH halves are declared here, each the way its own producer would:
+    /// the measured one through `set_uv_bounds` (what a measuring mint does),
+    /// the unmeasured one by replacing the stored face with a fresh
+    /// `Face::new` over the same surface and loops — a constructor handed an
+    /// id, a surface and a loop, which by construction cannot know the domain.
+    /// That is the state under test, and it is now independent of what any
+    /// mint happens to do. The point under test is the RESOLVER's contract,
+    /// not the geometry.
     fn two_cylinders_one_measured() -> (BRepModel, SolidId, FaceId, FaceId) {
         let mut model = BRepModel::new();
         let mk = |model: &mut BRepModel, z: f64| -> SolidId {
@@ -773,9 +845,24 @@ mod tests {
         let unmeasured = lateral_of(&model, b);
 
         // Give solid `a`'s lateral its true domain, the way a measuring mint
-        // would; leave `b`'s carrying the `Face::new` placeholder.
+        // would.
         if let Some(f) = model.faces.get_mut(measured) {
             f.set_uv_bounds(0.0, std::f64::consts::TAU, 0.0, 4.0);
+        }
+
+        // Put solid `b`'s lateral back to what a constructor alone produces:
+        // same surface, same loops, no measurement. `Face::new` is the only
+        // thing that can express "nobody measured this", because
+        // `set_uv_bounds` is the only thing that flips the flag and there is
+        // deliberately no way to unset it.
+        if let Some(f) = model.faces.get_mut(unmeasured) {
+            let fresh =
+                crate::primitives::face::Face::new(f.id, f.surface_id, f.outer_loop, f.orientation);
+            let inners = f.inner_loops.clone();
+            *f = fresh;
+            for inner in inners {
+                f.add_inner_loop(inner);
+            }
         }
 
         // One solid holding both laterals, so a single query sees them together.

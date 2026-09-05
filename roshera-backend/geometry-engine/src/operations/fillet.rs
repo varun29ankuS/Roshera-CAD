@@ -3161,6 +3161,9 @@ fn cylinder_rim_fillet(
     let mut blend_face = Face::new(0, torus_surface_id, blend_loop_id, blend_orientation);
     blend_face.outer_loop = blend_loop_id;
     let blend_face_id = model.faces.add(blend_face);
+    // Measure the minted face's parametric domain from its own boundary
+    // loop - see `measure_and_set_face_uv_bounds`.
+    crate::tessellation::surface::measure_and_set_face_uv_bounds(model, blend_face_id);
 
     // ---- step 9: cleanup. ----
     // The original rim edge and seam edge are no longer referenced by
@@ -3637,6 +3640,9 @@ fn cone_rim_fillet(
     let mut blend_face = Face::new(0, torus_surface_id, blend_loop_id, blend_orientation);
     blend_face.outer_loop = blend_loop_id;
     let blend_face_id = model.faces.add(blend_face);
+    // Measure the minted face's parametric domain from its own boundary
+    // loop - see `measure_and_set_face_uv_bounds`.
+    crate::tessellation::surface::measure_and_set_face_uv_bounds(model, blend_face_id);
 
     // ---- step 9: cleanup. ----
     model.edges.remove(rim_edge_id);
@@ -4732,6 +4738,9 @@ fn apply_apex_sphere_corner(
     let mut face = Face::new(0, surface_id, loop_id, orientation);
     face.outer_loop = loop_id;
     let face_id = model.faces.add(face);
+    // Measure the minted face's parametric domain from its own boundary
+    // loop - see `measure_and_set_face_uv_bounds`.
+    crate::tessellation::surface::measure_and_set_face_uv_bounds(model, face_id);
 
     let shell_id = model
         .solids
@@ -5105,6 +5114,9 @@ fn apply_triangular_nurbs_corner(
     let mut face = Face::new(0, surface_id, loop_id, orientation);
     face.outer_loop = loop_id;
     let face_id = model.faces.add(face);
+    // Measure the minted face's parametric domain from its own boundary
+    // loop - see `measure_and_set_face_uv_bounds`.
+    crate::tessellation::surface::measure_and_set_face_uv_bounds(model, face_id);
 
     let shell_id = model
         .solids
@@ -5644,6 +5656,9 @@ pub(crate) fn apply_mixed_corner_single_patch_cap(
     let mut face = Face::new(0, surface_id, loop_id, orientation);
     face.outer_loop = loop_id;
     let face_id = model.faces.add(face);
+    // Measure the minted face's parametric domain from its own boundary
+    // loop - see `measure_and_set_face_uv_bounds`.
+    crate::tessellation::surface::measure_and_set_face_uv_bounds(model, face_id);
 
     // Record the patch apex (collapsed `u = 1` corner) so the
     // tessellator's CF-γ.7 apex-fan path can mesh this degenerate-column
@@ -8285,7 +8300,11 @@ fn create_trimmed_fillet_face(
         .ok_or_else(|| OperationError::InvalidGeometry("Fillet surface not found".to_string()))?;
     let orientation = orient_face_for_outward(surface_ref, outward_target)?;
     let face = Face::new(0, surface_id, loop_id, orientation);
-    Ok((model.faces.add(face), surgery))
+    let face_id = model.faces.add(face);
+    // Measure the minted face's parametric domain from its own boundary
+    // loop - see `measure_and_set_face_uv_bounds`.
+    crate::tessellation::surface::measure_and_set_face_uv_bounds(model, face_id);
+    Ok((face_id, surgery))
 }
 
 /// Extract `(axis, axis_origin, radius)` from a freshly created

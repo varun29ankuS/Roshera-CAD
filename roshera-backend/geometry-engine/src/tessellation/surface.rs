@@ -8630,9 +8630,24 @@ pub(crate) fn measure_face_uv_domain(face: &Face, model: &BRepModel) -> Option<[
     let polygon =
         project_loop_uv_unwrapped(loop_data, &model.edges, &model.curves, surface, 10, true);
 
-    if polygon.len() < 3 {
-        // Seam-degenerate / empty outer loop: the face is the whole surface.
-        // Only a surface that declares a finite domain can say what that is.
+    if polygon.len() < 3 || loop_is_a_pure_seam_system(loop_data) {
+        // The face is the WHOLE surface, by one of two structural readings of
+        // its own boundary:
+        //
+        // * fewer than 3 projected samples — an empty or seam-degenerate outer
+        //   loop (a whole sphere carries an empty loop by construction);
+        // * every edge traversed once forward and once backward — the loop is
+        //   a CUT SYSTEM, not a boundary. It encloses no area in `(u, v)`; it
+        //   is the set of seams along which a closed surface was opened out
+        //   into a rectangle. A full torus's loop is exactly `a b a⁻¹ b⁻¹`,
+        //   the standard fundamental polygon, and this is the only reading of
+        //   it that is not a contradiction. A cylinder lateral does NOT
+        //   qualify and must not: its seam edge is doubled, but its two rim
+        //   circles are traversed once each, and those really do bound it.
+        //
+        // Either way the domain is the surface's own — which is a measurement
+        // (the face provably covers all of it), not a fallback. Only a surface
+        // that declares a finite domain can say what that is.
         let finite = [su0, su1, sv0, sv1].iter().all(|x| x.is_finite());
         if finite && su1 > su0 && sv1 > sv0 {
             return Some([su0, su1, sv0, sv1]);
@@ -8682,6 +8697,100 @@ pub(crate) fn measure_face_uv_domain(face: &Face, model: &BRepModel) -> Option<[
     }
 
     Some([u_min, u_min + u_span, v_min, v_min + v_span])
+}
+
+/// Is this loop a CUT SYSTEM rather than a boundary — every edge traversed
+/// once forward and once backward, so the walk encloses no area?
+///
+/// That is the signature of a closed surface opened out along its seams: a
+/// full torus's outer loop is `a b a⁻¹ b⁻¹`, the standard fundamental polygon,
+/// where `a` is the u-seam and `b` the v-seam. Read as an ordinary boundary it
+/// is a contradiction — the continuous `(u, v)` lift of that walk runs 1.25
+/// periods in `u` (measured: span 7.854 against a period of 6.283), which
+/// `measure_face_uv_domain` correctly refuses. Read as a cut system it says
+/// something exact: the face is the entire surface.
+///
+/// Deliberately strict. A single edge appearing once — a cylinder lateral's
+/// two rim circles, a frustum's — disqualifies the loop, because those edges
+/// really do bound the face and the surface's declared (often infinite) `v`
+/// domain is not the face's.
+pub(crate) fn loop_is_a_pure_seam_system(loop_data: &crate::primitives::r#loop::Loop) -> bool {
+    if loop_data.edges.is_empty() || loop_data.edges.len() != loop_data.orientations.len() {
+        return false;
+    }
+    let mut seen: HashMap<crate::primitives::edge::EdgeId, (usize, usize)> = HashMap::new();
+    for (&edge, &forward) in loop_data.edges.iter().zip(loop_data.orientations.iter()) {
+        let entry = seen.entry(edge).or_insert((0, 0));
+        if forward {
+            entry.0 += 1;
+        } else {
+            entry.1 += 1;
+        }
+    }
+    seen.values().all(|&(fwd, back)| fwd == 1 && back == 1)
+}
+
+/// **Measure a just-minted face's parametric domain from its own boundary and
+/// record it on the face.** The one call every production `Face::new` site
+/// makes after its loops are attached.
+///
+/// `Face::new` writes the `[0, 1]²` placeholder because a constructor handed an
+/// id, a surface and a loop cannot know the domain — the domain is a property
+/// of the loop's geometry projected onto the surface. Every consumer that reads
+/// `uv_bounds` as "where on the surface this face is" (the curved-area
+/// quadrature, `Face::compute_bbox_and_centroid`, the normal/curvature probes,
+/// `Shell::compute_stats`' volume-by-divergence) therefore had to refuse — or,
+/// before those refusals existed, silently answer for one radian by one
+/// millimetre of a cylinder wall spanning 2π by its full height.
+///
+/// **One helper, not a formula per operation.** A per-op analytic domain is a
+/// second statement of the same fact, free to drift from the loop the op
+/// actually built; measuring the loop cannot drift from it, because it *is*
+/// it. For the analytic primitives — whose domain is known at construction —
+/// the two must agree, and `tests/minted_face_uv_bounds.rs` asserts exactly
+/// that agreement (a cylinder lateral measures `[0, 2π] × [0, h]`) rather than
+/// letting either side be hard-coded.
+///
+/// Returns whether a domain was recorded. **`false` leaves the face exactly as
+/// it was**, which is the honest outcome in the cases
+/// [`measure_face_uv_domain`] refuses (a constant-latitude spherical cap, a
+/// surface with a pole inside its own `v` domain, a projection that cannot be
+/// bounded): the consumers then say the kernel does not know, and nothing
+/// guesses. It also means a site that *already* set an analytic domain keeps
+/// it when the loop cannot be read.
+///
+/// **It does NOT follow that adding the call is always safe.** On `Some` it
+/// OVERWRITES whatever bounds the site had, so calling it after a site that
+/// set an analytic domain asserts the two AGREE - a claim to be tested, not
+/// assumed, and `tests/minted_face_uv_bounds.rs` tests it for every primitive.
+/// Call it at a MINT. A face that was cloned already carries its source's
+/// domain through `Clone` and wants no second reading - see
+/// `deep_clone::clone_faces` and the two `create_reversed_face` sites.
+///
+/// Call it AFTER the face is in the store and its inner loops are attached:
+/// the measurement reads the outer loop alone (a hole lies inside the outer
+/// boundary and cannot extend the domain), but the face must be complete
+/// before anything reads it, and `Face::set_uv_bounds` invalidates the stats
+/// cache that an early read would have filled from the placeholder.
+pub(crate) fn measure_and_set_face_uv_bounds(
+    model: &mut BRepModel,
+    face_id: crate::primitives::face::FaceId,
+) -> bool {
+    let Some(measured) = model
+        .faces
+        .get(face_id)
+        .and_then(|f| measure_face_uv_domain(f, model))
+    else {
+        return false;
+    };
+    let [u0, u1, v0, v1] = measured;
+    match model.faces.get_mut(face_id) {
+        Some(face) => {
+            face.set_uv_bounds(u0, u1, v0, v1);
+            true
+        }
+        None => false,
+    }
 }
 
 /// Does the face's UV parameter domain coincide with its own UV bounding box?
@@ -10341,7 +10450,7 @@ mod tests {
 /// `tests/boolean_face_uv_bounds.rs::obliquely_cut_sphere_cap_refuses_rather_than_measuring_its_rim`.
 #[cfg(test)]
 mod uv_domain_measurement_tests {
-    use super::measure_face_uv_domain;
+    use super::{loop_is_a_pure_seam_system, measure_face_uv_domain};
     use crate::math::{Point3, Vector3};
     use crate::primitives::curve::Circle;
     use crate::primitives::curve::ParameterRange;
@@ -10519,5 +10628,43 @@ mod uv_domain_measurement_tests {
             None,
             "an unbounded cylinder declares no v extent to inherit"
         );
+    }
+
+    /// `loop_is_a_pure_seam_system` is what lets a whole torus be measured at
+    /// all, and it is a claim about the loop's COMBINATORICS, so both
+    /// directions have to be pinned. Nothing else in the file distinguishes
+    /// them: a cylinder lateral also traverses its seam twice.
+    #[test]
+    fn a_torus_fundamental_polygon_is_a_seam_system_and_a_cylinder_lateral_is_not() {
+        // A full torus's outer loop: `a b a^-1 b^-1`. Every edge once each way,
+        // so the walk encloses nothing and the face is the whole surface.
+        let mut torus_loop = Loop::new(0, LoopType::Outer);
+        torus_loop.add_edge(10, true); // a   (u-seam)
+        torus_loop.add_edge(11, true); // b   (v-seam)
+        torus_loop.add_edge(10, false); // a^-1
+        torus_loop.add_edge(11, false); // b^-1
+        assert!(
+            loop_is_a_pure_seam_system(&torus_loop),
+            "the standard fundamental polygon must read as a cut system"
+        );
+
+        // A cylinder lateral: the SEAM edge is doubled, but the two rim circles
+        // are traversed once each and really do bound the face. If this read as
+        // a cut system, every cylinder wall would inherit the carrier surface's
+        // declared (often infinite) v domain instead of its own height.
+        let mut cyl_loop = Loop::new(0, LoopType::Outer);
+        cyl_loop.add_edge(20, true); // bottom rim, once
+        cyl_loop.add_edge(21, true); // seam, forward
+        cyl_loop.add_edge(22, false); // top rim, once
+        cyl_loop.add_edge(21, false); // seam, backward
+        assert!(
+            !loop_is_a_pure_seam_system(&cyl_loop),
+            "a loop with singly-traversed rim edges bounds a real face and is              NOT a cut system"
+        );
+
+        // Degenerate guards: an empty loop bounds nothing but is answered by
+        // the `< 3 samples` branch, not this one.
+        let empty = Loop::new(0, LoopType::Outer);
+        assert!(!loop_is_a_pure_seam_system(&empty));
     }
 }

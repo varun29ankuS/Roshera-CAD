@@ -1758,6 +1758,9 @@ fn create_closed_edge_chamfer(
     let mut blend_face = Face::new(0, cone_surface_id, blend_loop_id, blend_orientation);
     blend_face.outer_loop = blend_loop_id;
     let blend_face_id = model.faces.add(blend_face);
+    // Measure the minted face's parametric domain from its own boundary
+    // loop - see `measure_and_set_face_uv_bounds`.
+    crate::tessellation::surface::measure_and_set_face_uv_bounds(model, blend_face_id);
 
     // ---------- step 11: cleanup. ----------
     // The original rim edge and old seam edge are no longer referenced
@@ -2285,6 +2288,9 @@ fn create_chamfer_face(
     let orientation = chamfer_face_orientation(surface_ref, n1, n2, edge_id, face1_id, face2_id)?;
     let face = Face::new(0, surface_id, loop_id, orientation);
     let face_id = model.faces.add(face);
+    // Measure the minted face's parametric domain from its own boundary
+    // loop - see `measure_and_set_face_uv_bounds`.
+    crate::tessellation::surface::measure_and_set_face_uv_bounds(model, face_id);
 
     let surgery = BlendEdgeSurgery {
         original_edge: edge_id,
@@ -3411,6 +3417,9 @@ fn apply_planar_chamfer_cap(
     let mut face = Face::new(0, surface_id, loop_id, orientation);
     face.outer_loop = loop_id;
     let face_id = model.faces.add(face);
+    // Measure the minted face's parametric domain from its own boundary
+    // loop - see `measure_and_set_face_uv_bounds`.
+    crate::tessellation::surface::measure_and_set_face_uv_bounds(model, face_id);
 
     let shell_id = model
         .solids
