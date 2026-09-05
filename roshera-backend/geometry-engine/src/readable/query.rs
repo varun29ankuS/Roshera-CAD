@@ -668,13 +668,17 @@ impl BRepModel {
         // Ordered |k1| ≥ |k2| so agents can pattern-match
         // flat / single-curved / double-curved without caring which
         // parametric direction carries the curvature.
+        // `None` when the face's parametric domain was never measured: the
+        // midpoint of the `Face::new` placeholder is not this face's midpoint,
+        // and reporting a curvature "at the face's parametric midpoint" from
+        // it would be describing a number the kernel cannot stand behind.
         let principal_curvatures = {
-            let [u_min, u_max, v_min, v_max] = face_clone.uv_bounds;
-            self.surfaces
-                .get(face_clone.surface_id)
-                .and_then(|s| {
-                    s.evaluate_full((u_min + u_max) * 0.5, (v_min + v_max) * 0.5)
-                        .ok()
+            face_clone
+                .probe_uv(&self.surfaces)
+                .and_then(|(u, v)| {
+                    self.surfaces
+                        .get(face_clone.surface_id)
+                        .and_then(|s| s.evaluate_full(u, v).ok())
                 })
                 .map(|sp| {
                     if sp.k1.abs() >= sp.k2.abs() {
@@ -687,10 +691,20 @@ impl BRepModel {
 
         // Compute area. `Face::area` requires &mut. Tolerance taken
         // from the face's own value.
+        //
+        // `None` when the face's parametric domain was never measured: the
+        // curved-surface integral runs over `uv_bounds`, so on a face still
+        // carrying the `Face::new` placeholder it integrates one radian by one
+        // millimetre of a wall that spans 2π by its full height. That number
+        // reaches an agent through this field wearing no mark, so it is
+        // withheld. `Face::area` itself still answers — its internal callers
+        // (shell volume, face fingerprints) have always read it as a size
+        // signal and refusing would fail a whole shell over one face.
         let tolerance = crate::math::tolerance::Tolerance::from_distance(face_clone.tolerance);
+        let domain_known = face_clone.domain_is_known(&self.surfaces);
         let face = self.faces.get_mut(face_id)?;
-        let area = face
-            .area(
+        let area = if domain_known {
+            face.area(
                 &mut self.loops,
                 &self.vertices,
                 &self.edges,
@@ -698,7 +712,10 @@ impl BRepModel {
                 &self.surfaces,
                 tolerance,
             )
-            .ok();
+            .ok()
+        } else {
+            None
+        };
 
         Some(FaceReport {
             id: face_id,

@@ -1395,8 +1395,49 @@ pub async fn select_face(
                 "candidates": candidates,
             })),
         ),
+        // Undecidable, not contested: one or more candidate faces could not be
+        // tested against the query at all (their parametric domain was never
+        // measured, so they have no representative normal, area or centroid).
+        // The kernel reports both sets rather than answering from the subset it
+        // could evaluate — the untestable face is the one that might have won.
+        Err(SelectError::Unmeasurable {
+            matched,
+            unmeasurable,
+        }) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "resolved": false, "error": "unmeasurable",
+                "message": UNMEASURABLE_FACES_MSG,
+                "matched": matched,
+                "unmeasurable": unmeasurable,
+            })),
+        ),
     }
 }
+
+/// Refusal text for a face selection the kernel could not decide.
+///
+/// A `const` built with `concat!` rather than a `\`-continued literal: a
+/// continued literal is a single token rustfmt is free to reflow onto one line
+/// WITHOUT removing the indentation it absorbed, which is how these messages
+/// acquired 29-to-37-space runs mid-sentence. `concat!` arms are separate
+/// tokens and survive formatting. `handlers::gdt` carries the same pattern.
+const UNMEASURABLE_FACES_MSG: &str = concat!(
+    "some candidate faces could not be evaluated against this description ",
+    "(their parametric domain is unmeasured), so the selection is undecidable"
+);
+
+/// As [`UNMEASURABLE_FACES_MSG`], for the entity-agnostic selector paths.
+const UNMEASURABLE_ENTITIES_MSG: &str = concat!(
+    "some candidate entities could not be evaluated against this description, ",
+    "so the selection is undecidable"
+);
+
+/// As [`UNMEASURABLE_FACES_MSG`], for the label selector.
+const UNMEASURABLE_SELECTOR_MSG: &str = concat!(
+    "some candidate entities could not be evaluated against this description ",
+    "(unmeasured parametric domain), so the selection is undecidable"
+);
 
 /// `POST /api/agent/parts/{id}/select-edge` — resolve an edge by DESCRIPTION, or
 /// REFUSE. Body: `{ "curve_kind": "line|arc|circle|nurbs|any", "blend":
@@ -1496,6 +1537,21 @@ pub async fn select_edge(
                 "resolved": false, "error": "ambiguous",
                 "message": "several edges match equally well — refine the description",
                 "candidates": candidates,
+            })),
+        ),
+        // Shared with `select_face` — see the note there. `resolve_edge` does
+        // not produce this today; the arm exists so it cannot be introduced
+        // there and silently fall through to a wrong status.
+        Err(SelectError::Unmeasurable {
+            matched,
+            unmeasurable,
+        }) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "resolved": false, "error": "unmeasurable",
+                "message": UNMEASURABLE_ENTITIES_MSG,
+                "matched": matched,
+                "unmeasurable": unmeasurable,
             })),
         ),
     }
@@ -1740,6 +1796,18 @@ fn resolve_selector(
                     "resolved": false, "error": "selector_ambiguous",
                     "message": "several entities match — refine the description",
                     "candidates": c,
+                })),
+            ),
+            SelectError::Unmeasurable {
+                matched,
+                unmeasurable,
+            } => (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({
+                    "resolved": false, "error": "selector_unmeasurable",
+                    "message": UNMEASURABLE_SELECTOR_MSG,
+                    "matched": matched,
+                    "unmeasurable": unmeasurable,
                 })),
             ),
         }
@@ -3548,5 +3616,33 @@ pub async fn measure(
                 "reason": reason,
             })),
         ),
+    }
+}
+
+#[cfg(test)]
+mod refusal_message_tests {
+    use super::{UNMEASURABLE_ENTITIES_MSG, UNMEASURABLE_FACES_MSG, UNMEASURABLE_SELECTOR_MSG};
+
+    /// Agent-facing refusal text must read as a sentence.
+    ///
+    /// These are the words an agent is handed when the kernel declines, and a
+    /// 30-space gap mid-sentence is the message telling on its own construction.
+    /// The trigger was a `\`-continued literal that `cargo fmt` reflowed onto
+    /// one line while keeping the source indentation, so this guards the FORM
+    /// (no run of two spaces) rather than the exact wording.
+    #[test]
+    fn refusal_messages_carry_no_whitespace_runs() {
+        for (name, msg) in [
+            ("UNMEASURABLE_FACES_MSG", UNMEASURABLE_FACES_MSG),
+            ("UNMEASURABLE_ENTITIES_MSG", UNMEASURABLE_ENTITIES_MSG),
+            ("UNMEASURABLE_SELECTOR_MSG", UNMEASURABLE_SELECTOR_MSG),
+        ] {
+            assert!(
+                !msg.contains("  "),
+                "{name} contains a run of spaces: {msg:?}"
+            );
+            assert!(!msg.is_empty(), "{name} is empty");
+            assert!(!msg.contains('\n'), "{name} contains a newline: {msg:?}");
+        }
     }
 }

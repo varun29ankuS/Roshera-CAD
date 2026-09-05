@@ -92,12 +92,28 @@ pub fn supermaximal_features(model: &BRepModel, solid_id: SolidId) -> Vec<Superm
 /// canonical surfaces, representative for free-form). For a smooth feature
 /// spanning curvature, [`PolyhedralCone::dilate`] widens this to cover the
 /// normal's variation.
+///
+/// **One unmeasurable face widens the cone to [`PolyhedralCone::full_space`].**
+/// This cone is an UPPER BOUND used to cull contact pairs: a direction outside
+/// it is a direction the feature provably cannot face. A face whose parametric
+/// domain was never measured (see
+/// [`crate::primitives::face::Face::domain_is_known`]) has no representative
+/// normal, so it constrains nothing — and a hull built from the remaining faces
+/// would be a SUBSET presented as the whole, which prunes pairs that can
+/// actually touch. Widening to the full space means the cull test never prunes
+/// this feature: slower, and the sound direction to fail in.
+///
+/// Silently dropping such a face is worse than either: `from_generators(&[])`
+/// returns the trivial `{0}` cone, so a feature whose faces ALL refuse would
+/// cull *everything*.
 pub fn feature_normal_cone(model: &BRepModel, feature: &SupermaximalFeature) -> PolyhedralCone {
-    let normals: Vec<Vector3> = feature
-        .faces
-        .iter()
-        .filter_map(|&f| face_outward_normal(model, f))
-        .collect();
+    let mut normals: Vec<Vector3> = Vec::with_capacity(feature.faces.len());
+    for &f in &feature.faces {
+        match face_outward_normal(model, f) {
+            Some(n) => normals.push(n),
+            None => return PolyhedralCone::full_space(),
+        }
+    }
     PolyhedralCone::from_generators(&normals)
 }
 
@@ -271,12 +287,10 @@ fn perp_dist(o1: Vector3, o2: Vector3, axis: Vector3) -> f64 {
 fn face_outward_normal(model: &BRepModel, face_id: FaceId) -> Option<Vector3> {
     let face = model.faces.get(face_id)?;
     let surface = model.surfaces.get(face.surface_id)?;
-    let [u0, u1, v0, v1] = face.uv_bounds;
-    let n = surface
-        .normal_at(0.5 * (u0 + u1), 0.5 * (v0 + v1))
-        .ok()?
-        .normalize()
-        .ok()?;
+    // Refuses on a curved face with an unmeasured domain: a cylinder's normal
+    // sweeps the full 2π, so the placeholder midpoint picks an arbitrary one.
+    let (u, v) = face.probe_uv(&model.surfaces)?;
+    let n = surface.normal_at(u, v).ok()?.normalize().ok()?;
     Some(n * face.orientation.sign())
 }
 

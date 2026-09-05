@@ -668,7 +668,12 @@ fn modify_face_surface(
             expected: "existing face".to_string(),
             received: format!("{}", face_id),
         })?;
-    face_mut.uv_bounds = [bounds.0 .0, bounds.0 .1, bounds.1 .0, bounds.1 .1];
+    // Through `set_uv_bounds`, not the field: the new surface's natural domain
+    // IS this face's domain (the face was rebuilt onto it), so the write must
+    // also record that these bounds are measured — a direct field assignment
+    // would leave the face reading as "domain unknown" and every curved-area
+    // and midpoint consumer would refuse on a face we had just measured.
+    face_mut.set_uv_bounds(bounds.0 .0, bounds.0 .1, bounds.1 .0, bounds.1 .1);
 
     Ok(())
 }

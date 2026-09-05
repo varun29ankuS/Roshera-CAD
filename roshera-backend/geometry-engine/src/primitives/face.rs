@@ -19,7 +19,7 @@ use crate::primitives::{
     curve::{CurveId, CurveStore},
     edge::{EdgeId, EdgeStore},
     r#loop::{LoopId, LoopStore},
-    surface::{SurfaceId, SurfaceStore, SurfaceType},
+    surface::{Surface, SurfaceId, SurfaceStore, SurfaceType},
     vertex::VertexStore,
 };
 use dashmap::DashMap;
@@ -200,6 +200,22 @@ pub struct Face {
     pub trim_curves: Vec<TrimCurve>,
     /// UV bounds [u_min, u_max, v_min, v_max]
     pub uv_bounds: [f64; 4],
+    /// Whether [`Face::uv_bounds`] was ever set from a real measurement of
+    /// this face's parametric domain, as opposed to carrying the `[0, 1]²`
+    /// placeholder [`Face::new`] writes.
+    ///
+    /// `Face::new` cannot know the domain — it is handed an id, a surface and
+    /// a loop, and the domain is a property of the loop's geometry projected
+    /// onto the surface. Every caller that *does* know it (an analytic
+    /// primitive builder, a re-parameterised surface swap, the boolean's
+    /// loop-projection measurement) announces that by going through
+    /// [`Face::set_uv_bounds`], which is the only thing that flips this flag.
+    ///
+    /// Consumers that read `uv_bounds` as "the face's parametric domain" —
+    /// the curved-surface area quadrature, the parametric-midpoint normal and
+    /// curvature probes — must refuse rather than report a number derived
+    /// from the placeholder. Read it through [`Face::measured_uv_bounds`].
+    uv_bounds_measured: bool,
     /// Face attributes
     pub attributes: FaceAttributes,
     /// Adjacent faces (for G1/G2 continuity)
@@ -227,6 +243,8 @@ impl Face {
             orientation,
             trim_curves: Vec::new(), // Unfortunately needed for struct
             uv_bounds: [0.0, 1.0, 0.0, 1.0],
+            // A placeholder, not a measurement — see `uv_bounds_measured`.
+            uv_bounds_measured: false,
             attributes: DEFAULT_FACE_ATTRIBUTES,
             adjacent_faces: HashMap::new(), // Unfortunately needed for struct
             cached_stats: None,
@@ -272,10 +290,92 @@ impl Face {
         self.invalidate_cache();
     }
 
-    /// Set UV bounds
+    /// Set UV bounds, recording that they are a measurement of this face's
+    /// real parametric domain rather than the `Face::new` placeholder.
+    ///
+    /// Only call this with bounds that were actually derived from the face's
+    /// geometry (its boundary loops projected to `(u, v)`, or the supporting
+    /// surface's own declared domain when the face provably covers all of it).
+    /// Passing a guess here is what [`Face::measured_uv_bounds`] exists to
+    /// prevent.
     pub fn set_uv_bounds(&mut self, u_min: f64, u_max: f64, v_min: f64, v_max: f64) {
         self.uv_bounds = [u_min, u_max, v_min, v_max];
+        self.uv_bounds_measured = true;
         self.invalidate_cache();
+    }
+
+    /// This face's parametric domain, or `None` when nobody ever measured it.
+    ///
+    /// `None` means the `uv_bounds` field is still the `[0, 1]²` placeholder
+    /// from [`Face::new`]: on a curved surface that is not a small error but a
+    /// different region of parameter space entirely (one radian by one
+    /// millimetre of a cylinder that spans 2π by its full height). Callers
+    /// that treat `uv_bounds` as the domain must refuse on `None` instead of
+    /// integrating, sampling or reporting over the placeholder.
+    #[inline]
+    pub fn measured_uv_bounds(&self) -> Option<[f64; 4]> {
+        if self.uv_bounds_measured {
+            Some(self.uv_bounds)
+        } else {
+            None
+        }
+    }
+
+    /// Whether [`Face::uv_bounds`] is a measurement of this face's domain.
+    #[inline]
+    pub fn uv_bounds_are_measured(&self) -> bool {
+        self.uv_bounds_measured
+    }
+
+    /// Can a quantity that depends on this face's parametric domain be
+    /// reported at all?
+    ///
+    /// True when the domain was measured, and true for a planar face — not
+    /// because planes are privileged, but because the quantities this gate
+    /// guards are the *same at every point* of a plane: its outward normal,
+    /// its principal curvatures (both zero), and its area, whose planar branch
+    /// works from the boundary loop and never touches `uv_bounds` at all. The
+    /// placeholder is not feeding those answers, so there is nothing to
+    /// misreport.
+    ///
+    /// The argument is about position-independence, not about surface type. It
+    /// does not extend to a cylinder, whose curvature is constant but whose
+    /// normal sweeps the full 2π and whose area IS the domain. **It also does
+    /// not extend to a representative POINT on the face** — a point is
+    /// position-dependent by definition, and the plane's own `(0.5, 0.5)` is a
+    /// spot in the carrier plane's frame that a trimmed fragment need not even
+    /// contain. Callers wanting a point must require
+    /// [`Face::measured_uv_bounds`] instead, or take an anchor measured from
+    /// the boundary.
+    ///
+    /// False means the kernel does not know where on the surface this face is,
+    /// and the agent-facing layers must say so rather than answer from
+    /// `[0, 1]²`.
+    pub fn domain_is_known(&self, surface_store: &SurfaceStore) -> bool {
+        if self.uv_bounds_measured {
+            return true;
+        }
+        surface_store
+            .get(self.surface_id)
+            .map(|s| matches!(s.surface_type(), SurfaceType::Plane))
+            .unwrap_or(false)
+    }
+
+    /// The `(u, v)` at which a *position-dependent* quantity — an outward
+    /// normal, a principal curvature, a representative point — may honestly
+    /// be probed on this face; `None` when no such point is known.
+    ///
+    /// With measured bounds this is their centre, which is what every caller
+    /// already documents itself as sampling ("the face's parameter-domain
+    /// centre"). Without them, `(0.5, 0.5)` is not the centre of anything —
+    /// it is the middle of the placeholder — so the probe refuses, except in
+    /// the position-independent case described on [`Face::domain_is_known`].
+    pub fn probe_uv(&self, surface_store: &SurfaceStore) -> Option<(f64, f64)> {
+        if !self.domain_is_known(surface_store) {
+            return None;
+        }
+        let [u0, u1, v0, v1] = self.uv_bounds;
+        Some((0.5 * (u0 + u1), 0.5 * (v0 + v1)))
     }
 
     /// Add adjacent face
@@ -437,6 +537,16 @@ impl Face {
     }
 
     /// Check if UV point is inside face boundaries (optimized)
+    ///
+    /// ⚠ The general branch below tests `(u, v, 0)` against the outer loop's
+    /// WORLD-space vertices — parametric coordinates against millimetres. It is
+    /// survivable only via the `edges.len() == 4` fast path, which answers from
+    /// `uv_bounds` alone and is right for the analytic primitives. The curved
+    /// area quadrature no longer uses this (see `UvTrimMask`); the remaining
+    /// callers — `Face::tessellate` (no production caller) and
+    /// `Face::contains_point`, which IS live at
+    /// `operations::project::point_in_face_bounds` — still carry the defect.
+    /// Fixing it is a separate change with its own blast radius.
     pub fn contains_uv_point(
         &self,
         u: f64,
@@ -721,7 +831,9 @@ impl Face {
         Some(BBox::new_validated(min, max).expand(pad))
     }
 
-    /// Compute accurate surface area using parametric integration
+    /// Compute accurate surface area using parametric integration.
+    ///
+    /// `vertex_store` is retained for the planar branch's loop statistics.
     fn compute_surface_area(
         &self,
         loop_store: &mut LoopStore,
@@ -830,6 +942,15 @@ impl Face {
             // grid lets us preserve the trim-mask resolution from the
             // earlier midpoint version while getting near-spectral
             // convergence inside untrimmed cells.
+            //
+            // NOTE ON THE DOMAIN. This integral is only as true as
+            // `uv_bounds`. A face whose domain was never measured still
+            // returns a number here — the internal consumers of
+            // `compute_stats` (shell volume by divergence, face fingerprints,
+            // small-face simplification) have always read it as a size signal
+            // and refusing would fail their whole shell over one face. The
+            // AGENT-facing paths refuse instead: see `Face::domain_is_known`
+            // and its callers in `readable::query` and `queries::measure`.
             const GL3_NODES: [f64; 3] = [-0.7745966692414834, 0.0, 0.7745966692414834];
             const GL3_WEIGHTS: [f64; 3] =
                 [0.5555555555555556, 0.8888888888888888, 0.5555555555555556];
@@ -843,6 +964,38 @@ impl Face {
 
             let mut area = 0.0;
 
+            // The trim mask, in the SAME space the integral runs in.
+            //
+            // `contains_uv_point`'s general path builds a test point
+            // `(u, v, 0)` and asks the outer loop — whose vertices are WORLD
+            // xyz — whether it contains it. On a plane with the identity-ish
+            // `[0, 1]²` frame that comparison is merely optimistic; on a
+            // cylinder it compares radians against millimetres, and every
+            // cell of a re-trimmed bore wall is rejected. The face then
+            // integrates to exactly 0.0 and reports it as an area. Its
+            // `edges.len() == 4` fast path is what has been hiding this: it
+            // answers from `uv_bounds` alone and is correct for the analytic
+            // primitives, whose laterals are four-edge rectangles in `(u, v)`
+            // — but a boolean splits those arcs, and an 8-edge fragment of the
+            // very same rectangle falls through to the broken branch.
+            //
+            // So project the loops to `(u, v)` — the projection the
+            // tessellator already trusts, at the same sampling the boolean's
+            // domain measurement used, so bounds and mask cannot disagree —
+            // and decide there. `contains_uv_point` itself is deliberately
+            // untouched: its other callers (`Face::tessellate`,
+            // `Face::contains_point`) inherit the same defect and are a
+            // separate change with a separate blast radius.
+            let uv_mask = UvTrimMask::build(self, loop_store, edge_store, curve_store, surface)
+                .ok_or_else(|| {
+                    MathError::InvalidParameter(format!(
+                        "face {} declares an inner loop that does not project to a \
+                         (u, v) boundary; its trimmed area cannot be integrated \
+                         without silently ignoring the hole",
+                        self.id
+                    ))
+                })?;
+
             for i in 0..n_u {
                 for j in 0..n_v {
                     let u_mid = self.uv_bounds[0] + (i as f64 + 0.5) * du;
@@ -853,14 +1006,7 @@ impl Face {
                     // trimming would require boundary subdivision; this
                     // matches the prior fidelity at the boundary while
                     // keeping interior cells exact to GL3.
-                    if !self.contains_uv_point(
-                        u_mid,
-                        v_mid,
-                        loop_store,
-                        vertex_store,
-                        edge_store,
-                        curve_store,
-                    )? {
+                    if !uv_mask.contains(u_mid, v_mid) {
                         continue;
                     }
 
@@ -1282,6 +1428,289 @@ impl Face {
             &CurveStore::new(),
         )
     }
+}
+
+/// A face's trim boundary expressed in `(u, v)` — the space the curved-surface
+/// area integral actually runs in.
+///
+/// **Why this exists.** [`Face::compute_surface_area`] integrates over
+/// `uv_bounds` and masks each cell by asking whether its centre is inside the
+/// face. The only mask available before this was [`Face::contains_uv_point`],
+/// whose general branch tests the parametric point `(u, v, 0)` against the
+/// outer loop's WORLD-space vertices — radians against millimetres on any
+/// curved surface. It was survivable only because of a fast path keyed on
+/// `outer_loop.edges.len() == 4`, which answers from `uv_bounds` alone and is
+/// correct for the analytic primitives (whose laterals really are four-edge
+/// rectangles in `(u, v)`). A boolean splits those arcs; an eight-edge
+/// fragment of the same rectangle falls through to the broken branch, every
+/// cell is rejected, and the face reports an area of exactly `0.0`.
+///
+/// The projection is `tessellation::surface::project_loop_uv_unwrapped` — the
+/// same one the tessellator and the boolean's domain measurement use, at the
+/// same sampling, so the mask and the bounds cannot disagree about where the
+/// face is.
+struct UvTrimMask {
+    /// Every point of the face's `uv_bounds` is inside. True for an untrimmed
+    /// face (seam-degenerate outer loop, e.g. a whole sphere) and for a face
+    /// whose outer loop fills its own `(u, v)` bounding box with no holes —
+    /// the rectangular case, which is what the old four-edge fast path was
+    /// approximating structurally.
+    all_inside: bool,
+    /// Outer boundary in `(u, v)`, empty when `all_inside`.
+    outer: Vec<(f64, f64)>,
+    /// Hole boundaries in `(u, v)`, empty when `all_inside`.
+    inners: Vec<HolePolygon>,
+    /// The supporting surface's periods, needed at QUERY time to lift a point
+    /// onto a hole's branch. `None` on a non-periodic axis.
+    u_period: Option<f64>,
+    v_period: Option<f64>,
+}
+
+/// A hole boundary in `(u, v)`, with the extent that bounds the search for its
+/// periodic lifts.
+struct HolePolygon {
+    poly: Vec<(f64, f64)>,
+    u_lo: f64,
+    u_hi: f64,
+    v_lo: f64,
+    v_hi: f64,
+}
+
+impl HolePolygon {
+    fn new(poly: Vec<(f64, f64)>) -> Self {
+        let mut u_lo = f64::INFINITY;
+        let mut u_hi = f64::NEG_INFINITY;
+        let mut v_lo = f64::INFINITY;
+        let mut v_hi = f64::NEG_INFINITY;
+        for &(u, v) in &poly {
+            u_lo = u_lo.min(u);
+            u_hi = u_hi.max(u);
+            v_lo = v_lo.min(v);
+            v_hi = v_hi.max(v);
+        }
+        Self {
+            poly,
+            u_lo,
+            u_hi,
+            v_lo,
+            v_hi,
+        }
+    }
+}
+
+impl UvTrimMask {
+    /// Sampling density for the boundary projection. Matches the density the
+    /// boolean's `measure_face_uv_domain` uses, deliberately: a mask built at
+    /// a different density could place a cell centre on the far side of a
+    /// boundary its own `uv_bounds` says is inside.
+    const INTERVALS: usize = 10;
+
+    /// `None` when the mask cannot be built soundly — see the inner-loop case
+    /// in the body. The caller must then refuse the area rather than integrate
+    /// over a boundary it knows is incomplete.
+    fn build(
+        face: &Face,
+        loop_store: &LoopStore,
+        edge_store: &EdgeStore,
+        curve_store: &CurveStore,
+        surface: &dyn Surface,
+    ) -> Option<Self> {
+        use crate::tessellation::surface::project_loop_uv_unwrapped;
+
+        let untrimmed = Self {
+            all_inside: true,
+            outer: Vec::new(),
+            inners: Vec::new(),
+            u_period: None,
+            v_period: None,
+        };
+
+        let Some(outer_loop) = loop_store.get(face.outer_loop) else {
+            // No resolvable boundary: the pre-existing behaviour of every
+            // caller here is to treat the face as covering its bounds, and
+            // there is nothing to trim against.
+            return Some(untrimmed);
+        };
+        let outer = project_loop_uv_unwrapped(
+            outer_loop,
+            edge_store,
+            curve_store,
+            surface,
+            Self::INTERVALS,
+            true,
+        );
+        if outer.len() < 3 {
+            // Seam-degenerate or empty outer loop — a sphere's single face,
+            // for instance. The face IS the surface domain. Same convention as
+            // `face_uv_domain_is_rectangular`.
+            return Some(untrimmed);
+        }
+
+        // EVERY loop is projected independently, and `project_loop_uv_unwrapped`
+        // starts each walk from `last: None` — so on a periodic surface each
+        // loop lands on WHATEVER branch of the covering map its own first
+        // sample happened to fall on. That is fine for the outer loop, which
+        // DEFINES the branch (the face's `uv_bounds` were measured from this
+        // same projection of it), and it is a real defect for a hole.
+        //
+        // Measured on a cylinder r=10 h=20 with a rectangular window cut
+        // through the wall across the seam: the wall's outer loop lifts to
+        // `[0, 2*pi]`, the hole to roughly `[-0.30, +0.30]`, so only the half
+        // with `u >= 0` ever meets the integration grid. The face reported
+        // 1231.5 mm^2 where the truth is 1207.9 — over by 25.1 mm^2, which is
+        // exactly HALF the 48.8 mm^2 window. Over-reporting, through
+        // `query_face` / `measure` / the claim verifier.
+        //
+        // Shifting each hole onto the outer loop's branch does NOT fix this,
+        // and was measured before being rejected: a straddling hole's centre
+        // sits at `u ~ 0`, `round((pi - 0) / 2pi) = round(0.5)` is 1 (Rust
+        // rounds half away from zero), so the hole moves to `[5.98, 6.59]` and
+        // loses the other half instead. No whole-period translation of a hole
+        // that straddles the seam fits inside a domain that does not.
+        //
+        // So leave every hole on its own branch and lift the QUERY at test
+        // time: a point is inside a hole if ANY of its periodic lifts lands in
+        // that hole's own extent and inside its polygon. A straddling hole is
+        // then subtracted on BOTH sides, and a hole that landed wholly on the
+        // wrong branch — the other real case — is reached by the same lift.
+        let inners: Vec<HolePolygon> = face
+            .inner_loops
+            .iter()
+            .filter_map(|&lid| loop_store.get(lid))
+            .map(|l| {
+                project_loop_uv_unwrapped(
+                    l,
+                    edge_store,
+                    curve_store,
+                    surface,
+                    Self::INTERVALS,
+                    true,
+                )
+            })
+            .map(HolePolygon::new)
+            .collect();
+
+        // A hole whose projection yields fewer than three points cannot be
+        // subtracted, and DROPPING it is the same class of defect as the branch
+        // bug above: the face integrates as though the hole were not there and
+        // over-reports, with nothing said.
+        //
+        // Note the asymmetry with the outer loop, which is deliberate. Fewer
+        // than three samples on the OUTER loop is a known, meaningful state — a
+        // seam-degenerate boundary, i.e. the face covers the whole surface —
+        // and it is answered above. Fewer than three on an INNER loop has no
+        // such reading: a hole that bounds nothing in `(u, v)` is either a
+        // degenerate loop or a projection that failed, and neither says how
+        // much area to remove. So: refuse.
+        if inners.iter().any(|h| h.poly.len() < 3) {
+            return None;
+        }
+
+        if inners.is_empty()
+            && polygon_fills_its_bbox_uv(&outer, crate::tessellation::surface::UV_RECT_FILL_SLACK)
+        {
+            return Some(untrimmed);
+        }
+
+        Some(Self {
+            all_inside: false,
+            outer,
+            inners,
+            u_period: surface.period_u(),
+            v_period: surface.period_v(),
+        })
+    }
+
+    /// Is this parameter point inside the face?
+    ///
+    /// The OUTER test needs no lifting: the query points come from the face's
+    /// own `uv_bounds`, measured from this same projection of this same outer
+    /// loop, so they are already on its branch by construction.
+    ///
+    /// Each HOLE is on its own branch (see `build`), so the query is lifted to
+    /// every branch that overlaps that hole's extent. On a non-periodic axis
+    /// `periodic_lifts` returns the point itself and this is bit-identical to a
+    /// plain test.
+    fn contains(&self, u: f64, v: f64) -> bool {
+        if self.all_inside {
+            return true;
+        }
+        if !point_in_polygon_uv(&self.outer, u, v) {
+            return false;
+        }
+        !self.inners.iter().any(|h| self.hole_contains(h, u, v))
+    }
+
+    /// Does any periodic lift of `(u, v)` fall inside this hole?
+    fn hole_contains(&self, hole: &HolePolygon, u: f64, v: f64) -> bool {
+        use crate::tessellation::surface::periodic_lifts;
+        let us = periodic_lifts(u, hole.u_lo, hole.u_hi, self.u_period);
+        if us.is_empty() {
+            return false;
+        }
+        let vs = periodic_lifts(v, hole.v_lo, hole.v_hi, self.v_period);
+        for &uu in &us {
+            for &vv in &vs {
+                if point_in_polygon_uv(&hole.poly, uu, vv) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+}
+
+/// Does a `(u, v)` polygon fill its own axis-aligned bounding box?
+///
+/// The rectangular-domain test: a loop that encloses its whole bbox trims
+/// nothing away, so every cell inside the bbox is inside the face.
+fn polygon_fills_its_bbox_uv(polygon: &[(f64, f64)], slack: f64) -> bool {
+    let mut u_min = f64::INFINITY;
+    let mut u_max = f64::NEG_INFINITY;
+    let mut v_min = f64::INFINITY;
+    let mut v_max = f64::NEG_INFINITY;
+    for &(u, v) in polygon {
+        u_min = u_min.min(u);
+        u_max = u_max.max(u);
+        v_min = v_min.min(v);
+        v_max = v_max.max(v);
+    }
+    let bbox_area = (u_max - u_min) * (v_max - v_min);
+    // A projection that collapsed to a line or a point carries no trim
+    // information, so treat it as untrimmed rather than as a boundary that
+    // excludes everything. Shared noise floor - see `UV_DEGENERATE_AREA_TOL`.
+    if !bbox_area.is_finite() || bbox_area <= crate::tessellation::surface::UV_DEGENERATE_AREA_TOL {
+        return true;
+    }
+    let mut sum = 0.0;
+    let n = polygon.len();
+    for i in 0..n {
+        let (x0, y0) = polygon[i];
+        let (x1, y1) = polygon[(i + 1) % n];
+        sum += x0 * y1 - x1 * y0;
+    }
+    (0.5 * sum).abs() >= bbox_area * (1.0 - slack)
+}
+
+/// Even-odd (crossing-number) point-in-polygon in `(u, v)`.
+fn point_in_polygon_uv(polygon: &[(f64, f64)], u: f64, v: f64) -> bool {
+    let n = polygon.len();
+    if n < 3 {
+        return false;
+    }
+    let mut inside = false;
+    let mut j = n - 1;
+    for i in 0..n {
+        let (ui, vi) = polygon[i];
+        let (uj, vj) = polygon[j];
+        // The straddle test guarantees `vj != vi`, so the division below is
+        // never by zero.
+        if (vi > v) != (vj > v) && u < (uj - ui) * (v - vi) / (vj - vi) + ui {
+            inside = !inside;
+        }
+        j = i;
+    }
+    inside
 }
 
 /// Face storage with spatial indexing
@@ -2063,4 +2492,119 @@ pub struct FaceValidation {
     pub is_valid: bool,
     pub errors: Vec<String>,
     pub warnings: Vec<String>,
+}
+
+#[cfg(test)]
+mod uv_trim_mask_tests {
+    use super::*;
+    use crate::math::{Point3, Vector3};
+    use crate::primitives::curve::{Circle, CurveStore, Line, ParameterRange};
+    use crate::primitives::edge::{Edge, EdgeOrientation, EdgeStore};
+    use crate::primitives::r#loop::{Loop, LoopStore, LoopType};
+    use crate::primitives::surface::Cylinder;
+    use crate::primitives::vertex::VertexStore;
+
+    const R: f64 = 10.0;
+    const H: f64 = 20.0;
+
+    /// The stores for a cylinder wall whose outer loop is a real seamed
+    /// rectangle in `(u, v)`: bottom circle, seam, top circle, seam.
+    fn wall_stores() -> (VertexStore, EdgeStore, CurveStore, LoopStore, LoopId) {
+        let mut vertices = VertexStore::with_capacity(4);
+        let mut edges = EdgeStore::new();
+        let mut curves = CurveStore::new();
+        let mut loops = LoopStore::new();
+
+        let vb = vertices.add_unchecked_with_tolerance(R, 0.0, 0.0, 1e-6);
+        let vt = vertices.add_unchecked_with_tolerance(R, 0.0, H, 1e-6);
+        let bottom = curves.add(Box::new(
+            Circle::new(Point3::ORIGIN, Vector3::Z, R).expect("bottom circle"),
+        ));
+        let top = curves.add(Box::new(
+            Circle::new(Point3::new(0.0, 0.0, H), Vector3::Z, R).expect("top circle"),
+        ));
+        let seam = curves.add(Box::new(Line::new(
+            Point3::new(R, 0.0, 0.0),
+            Point3::new(R, 0.0, H),
+        )));
+
+        let eb = edges.add(Edge::new(
+            0,
+            vb,
+            vb,
+            bottom,
+            EdgeOrientation::Forward,
+            ParameterRange::new(0.0, 1.0),
+        ));
+        let et = edges.add(Edge::new(
+            0,
+            vt,
+            vt,
+            top,
+            EdgeOrientation::Forward,
+            ParameterRange::new(0.0, 1.0),
+        ));
+        let es = edges.add(Edge::new(
+            0,
+            vb,
+            vt,
+            seam,
+            EdgeOrientation::Forward,
+            ParameterRange::new(0.0, 1.0),
+        ));
+
+        let mut outer = Loop::new(0, LoopType::Outer);
+        outer.add_edge(eb, true);
+        outer.add_edge(es, true);
+        outer.add_edge(et, false);
+        outer.add_edge(es, false);
+        let outer_id = loops.add(outer);
+        (vertices, edges, curves, loops, outer_id)
+    }
+
+    /// A hole the mask cannot project is a REFUSAL, not a silent drop.
+    ///
+    /// Same class as the branch defect, and it reaches the same field: if an
+    /// inner loop yields fewer than three `(u, v)` samples there is no boundary
+    /// to subtract, and dropping it makes the face integrate as though the hole
+    /// were never declared — an over-report with nothing said.
+    ///
+    /// Note the asymmetry with the OUTER loop, which is deliberate and
+    /// documented in `UvTrimMask::build`: fewer than three samples there is a
+    /// meaningful state (a seam-degenerate boundary, i.e. the face covers the
+    /// whole surface) and is answered. On an inner loop it has no reading at
+    /// all — a hole that bounds nothing is either degenerate or a projection
+    /// that failed, and neither says how much area to remove.
+    ///
+    /// Tested against `UvTrimMask::build` directly, NOT through `query_face`.
+    /// The first attempt attached an empty inner loop to a boolean-produced
+    /// wall and asserted the area refused — it did, but for an unrelated
+    /// reason: `Face::compute_stats` computes a perimeter over `all_loops()`
+    /// first and fails on the empty loop before the mask is ever built. That
+    /// test passed under a mutation that restored the silent drop, i.e. it
+    /// proved nothing. This one isolates the unit that changed.
+    #[test]
+    fn an_unprojectable_hole_refuses_the_mask() {
+        let (_v, edges, curves, mut loops, outer_id) = wall_stores();
+        let surface = Cylinder::new_finite(Point3::ORIGIN, Vector3::Z, R, H).expect("cylinder");
+
+        // Control: the same wall with NO holes builds a mask.
+        let plain = Face::new(0, 0, outer_id, FaceOrientation::Forward);
+        assert!(
+            UvTrimMask::build(&plain, &loops, &edges, &curves, &surface).is_some(),
+            "the wall alone must build a mask — otherwise the refusal below \
+             says nothing about the hole"
+        );
+
+        // An inner loop with no edges projects to nothing.
+        let empty_hole = loops.add(Loop::new(0, LoopType::Inner));
+        let mut holed = Face::new(0, 0, outer_id, FaceOrientation::Forward);
+        holed.add_inner_loop(empty_hole);
+
+        assert!(
+            UvTrimMask::build(&holed, &loops, &edges, &curves, &surface).is_none(),
+            "a hole that does not project to a (u, v) boundary must refuse the \
+             mask, not be dropped from it"
+        );
+    }
 }

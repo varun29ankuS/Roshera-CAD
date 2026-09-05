@@ -20890,6 +20890,34 @@ fn build_shells_from_faces(
                 }
             }
 
+            // Measure this fragment's real (u, v) domain from its OUTER
+            // boundary loop. `Face::new` writes the `[0, 1]²` placeholder,
+            // which on a retrimmed cylinder wall is one radian by one
+            // millimetre of a face that spans 2π by its full height — so the
+            // curved-area quadrature integrated the wrong patch and reported
+            // ~10 mm² for a 1257 mm² wall.
+            //
+            // Sequenced after the inner loops are attached only so the face is
+            // complete before anything reads it; `measure_face_uv_domain`
+            // itself reads the outer loop alone, because a hole lies inside the
+            // outer boundary and cannot extend the domain. The holes matter to
+            // the AREA (the quadrature's trim mask subtracts them) but not to
+            // its bounds.
+            //
+            // A face the measurement cannot bound (a constant-latitude
+            // spherical cap, a surface with a pole inside its own domain) is
+            // deliberately LEFT unmeasured: the consumers then refuse, which
+            // is the honest answer. Nothing here guesses.
+            let measured = model
+                .faces
+                .get(face_id)
+                .and_then(|f| crate::tessellation::surface::measure_face_uv_domain(f, model));
+            if let Some([u0, u1, v0, v1]) = measured {
+                if let Some(face_mut) = model.faces.get_mut(face_id) {
+                    face_mut.set_uv_bounds(u0, u1, v0, v1);
+                }
+            }
+
             face_lineage.push((
                 face_id,
                 split_face.original_face,

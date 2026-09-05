@@ -247,7 +247,13 @@ pub struct FaceReport {
     /// kernel can't classify.
     pub surface_type: String,
     /// Face area in squared working units. `None` when the kernel
-    /// cannot compute the area for a degenerate face.
+    /// cannot compute the area for a degenerate face, and `None` when the
+    /// face's parametric domain was never measured — the curved-surface
+    /// integral runs over `Face::uv_bounds`, so a face still carrying the
+    /// `Face::new` `[0, 1]²` placeholder would integrate a patch that is not
+    /// this face (one radian by one millimetre of a wall spanning 2π by its
+    /// full height). The kernel withholds that rather than publish it. See
+    /// `Face::domain_is_known`.
     pub area: Option<f64>,
     /// Edge ids of the outer-loop boundary, in loop order.
     pub edge_ids: Vec<u32>,
@@ -262,7 +268,11 @@ pub struct FaceReport {
     /// "double-curved" (sphere of radius r → `[±1/r, ±1/r]`) without a
     /// second round-trip. Sign follows the surface normal (positive =
     /// curving toward it). `None` when surface evaluation fails at the
-    /// midpoint (degenerate parameterization).
+    /// midpoint (degenerate parameterization), and `None` on a curved face
+    /// whose parametric domain was never measured — there is then no known
+    /// midpoint to evaluate at, and answering from the `[0, 1]²` placeholder
+    /// would describe a point the face may not contain. See
+    /// `Face::probe_uv`.
     pub principal_curvatures: Option<[f64; 2]>,
 }
 

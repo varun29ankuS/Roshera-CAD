@@ -109,15 +109,62 @@ pub enum SelectError {
     NotFound,
     /// Several faces matched equally well — the kernel refuses to guess which.
     Ambiguous(Vec<FaceId>),
+    /// One or more candidate faces could not be TESTED against the query, so
+    /// the resolution is undecidable rather than merely contested.
+    ///
+    /// A face whose parametric domain was never measured has no representative
+    /// outward normal and no trustworthy area or centroid (see
+    /// [`crate::primitives::face::Face::domain_is_known`]). Such a face can be
+    /// neither accepted nor rejected by a normal-direction filter or an
+    /// extremal ranking, and dropping it silently is the specific failure this
+    /// variant exists to prevent: with one match and one untestable candidate,
+    /// excluding the latter turns "I cannot tell" into a confident
+    /// `Ok(single)`.
+    ///
+    /// `matched` are the faces that passed every test; `unmeasurable` are the
+    /// ones no test could be applied to. Both are reported so a caller can name
+    /// the obstacle rather than retry blind.
+    Unmeasurable {
+        matched: Vec<FaceId>,
+        unmeasurable: Vec<FaceId>,
+    },
+}
+
+/// What asking a face for its outward normal produced.
+///
+/// Three outcomes, deliberately not two: "the face does not resolve" and "the
+/// face resolves but cannot be evaluated" are different facts, and only the
+/// second one makes a query undecidable.
+enum FaceNormal {
+    /// Measured at the face's own parameter-domain centre, normalized.
+    Known(Vector3),
+    /// The face exists, but its parametric domain was never measured, so no
+    /// point on it is known to sample — see `Face::probe_uv`.
+    Unmeasurable,
+    /// No such face, or its surface is missing: not a candidate at all.
+    Missing,
 }
 
 /// Outward normal of a face at its parametric midpoint (constant for planes;
 /// representative for the kinds we filter on).
-fn face_outward_normal(model: &BRepModel, fid: FaceId) -> Option<Vector3> {
-    let face = model.faces.get(fid)?;
-    let b = face.uv_bounds;
-    let (u, v) = (0.5 * (b[0] + b[1]), 0.5 * (b[2] + b[3]));
-    face.normal_at(u, v, &model.surfaces).ok()
+fn face_outward_normal(model: &BRepModel, fid: FaceId) -> FaceNormal {
+    let Some(face) = model.faces.get(fid) else {
+        return FaceNormal::Missing;
+    };
+    // `None` on a curved face with an unmeasured domain — see `Face::probe_uv`.
+    let Some((u, v)) = face.probe_uv(&model.surfaces) else {
+        return FaceNormal::Unmeasurable;
+    };
+    match face
+        .normal_at(u, v, &model.surfaces)
+        .ok()
+        .and_then(|n| n.normalize().ok())
+    {
+        Some(n) => FaceNormal::Known(n),
+        // The domain is known but the surface has no normal there (a degenerate
+        // parameterisation). Still untestable, not excludable.
+        None => FaceNormal::Unmeasurable,
+    }
 }
 
 fn face_kind_name(model: &BRepModel, fid: FaceId) -> Option<&'static str> {
@@ -147,7 +194,13 @@ pub fn resolve_face(
     let dir = q.normal_dir.and_then(|d| d.normalize().ok());
 
     // Filter by surface kind + normal direction (both immutable).
+    //
+    // A candidate the normal filter cannot TEST is carried in `unmeasurable`,
+    // never folded into `continue`. Excluding it would silently convert an
+    // undecidable query into a confident answer — the face that was dropped is
+    // exactly the one that might have matched.
     let mut matches: Vec<FaceId> = Vec::new();
+    let mut unmeasurable: Vec<FaceId> = Vec::new();
     for fid in solid_face_ids(model, solid) {
         let kind_ok = face_kind_name(model, fid)
             .map(|tn| q.kind.matches(tn))
@@ -156,16 +209,28 @@ pub fn resolve_face(
             continue;
         }
         if let Some(d) = dir {
-            match face_outward_normal(model, fid).and_then(|n| n.normalize().ok()) {
-                Some(n) if n.dot(&d) >= cos_tol => {}
-                _ => continue,
+            match face_outward_normal(model, fid) {
+                FaceNormal::Known(n) if n.dot(&d) >= cos_tol => {}
+                // Tested, and genuinely does not face that way.
+                FaceNormal::Known(_) => continue,
+                FaceNormal::Unmeasurable => {
+                    unmeasurable.push(fid);
+                    continue;
+                }
+                FaceNormal::Missing => continue,
             }
         }
         matches.push(fid);
     }
 
-    if matches.is_empty() {
+    if matches.is_empty() && unmeasurable.is_empty() {
         return Err(SelectError::NotFound);
+    }
+    if !unmeasurable.is_empty() {
+        return Err(SelectError::Unmeasurable {
+            matched: matches,
+            unmeasurable,
+        });
     }
 
     match q.extremal {
@@ -178,6 +243,12 @@ pub fn resolve_face(
         }
         e => {
             // Compute each match's score with split field borrows.
+            //
+            // A face that fails to score is still DROPPED here rather than
+            // carried as untestable — see the note in `face_score`. `None` from
+            // it today means "the stats computation errored", which is a
+            // different fact from "the domain is unknown", and conflating them
+            // would refuse queries that have always been answerable.
             let mut scored: Vec<(FaceId, f64)> = Vec::with_capacity(matches.len());
             for &fid in &matches {
                 let s = face_score(model, fid, e);
@@ -531,6 +602,32 @@ fn face_score(model: &mut BRepModel, fid: FaceId, e: Extremal) -> Option<f64> {
         ..
     } = model;
     let face = faces.get_mut(fid)?;
+    // ⚠ KNOWN, MEASURED, AND DELIBERATELY NOT GATED HERE.
+    //
+    // `FaceStats` is computed over `Face::uv_bounds`, so on a face whose domain
+    // was never measured both the curved-surface area and the sampled centroid
+    // describe a different patch of the surface — one radian by one millimetre
+    // of a cylinder that spans 2π by its height. `LargestArea` / `SmallestArea`
+    // / `MostAlong` therefore rank on a placeholder.
+    //
+    // Gating it on `Face::domain_is_known` was written, run, and reverted:
+    // every curved face minted outside a boolean is unmeasured today, so the
+    // gate refuses the whole descriptive-selection surface — measured, it turns
+    // 5 passing tests across `labels_gate` and `labels_assertion_gate` into
+    // refusals, because their nozzle fixture resolves throat and chamber by
+    // `SmallestArea` / `LargestArea` over two REVOLVED cylinder walls.
+    //
+    // Those rankings are right today only by accident: the placeholder area of
+    // a cylinder wall integrates to `r · 1 · 1 = r`, and the true area is
+    // `2π·r·h`, so the two orders agree exactly while the compared walls share a
+    // height (the nozzle's inner r=2 and outer r=4 both span z ∈ [0, 3]). Give
+    // them different heights and the ranking inverts silently.
+    //
+    // The honest close is to MEASURE those faces at their mint — the primitive
+    // and revolve builders — after which this gate is a no-op and can land
+    // without disabling anything. Gating first would trade a wrong answer for
+    // no answer across a whole product capability, in a change whose remit was
+    // the normal filter above.
     let stats = face
         .compute_stats(loops, vertices, edges, curves, surfaces)
         .ok()?;
@@ -636,4 +733,134 @@ fn face_axial_extent_magnitude(model: &mut BRepModel, fid: FaceId, axis: Axis) -
     let o = crate::math::Point3::new(axis.origin.x, axis.origin.y, axis.origin.z);
     let along = (centroid - o).dot(&d);
     Some(along.abs())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::math::{Point3, Vector3};
+    use crate::primitives::topology_builder::{GeometryId, TopologyBuilder};
+
+    /// Two coaxial cylinders in one model, one lateral measured and one not —
+    /// the state the resolver must not paper over.
+    ///
+    /// The kernel cannot build this from a single boolean today (every result
+    /// face is re-minted and measured) so the measured half is created by
+    /// declaring the bounds directly, which is exactly what a measuring mint
+    /// does. The point under test is the RESOLVER's contract, not the geometry.
+    fn two_cylinders_one_measured() -> (BRepModel, SolidId, FaceId, FaceId) {
+        let mut model = BRepModel::new();
+        let mk = |model: &mut BRepModel, z: f64| -> SolidId {
+            let mut b = TopologyBuilder::new(model);
+            match b
+                .create_cylinder_3d(Point3::new(0.0, 0.0, z), Vector3::Z, 5.0, 4.0)
+                .expect("cylinder")
+            {
+                GeometryId::Solid(id) => id,
+                other => panic!("expected solid, got {other:?}"),
+            }
+        };
+        let a = mk(&mut model, 0.0);
+        let b = mk(&mut model, 20.0);
+
+        let lateral_of = |model: &BRepModel, sid: SolidId| -> FaceId {
+            solid_face_ids(model, sid)
+                .into_iter()
+                .find(|&f| face_kind_name(model, f) == Some("Cylinder"))
+                .expect("each cylinder has a lateral")
+        };
+        let measured = lateral_of(&model, a);
+        let unmeasured = lateral_of(&model, b);
+
+        // Give solid `a`'s lateral its true domain, the way a measuring mint
+        // would; leave `b`'s carrying the `Face::new` placeholder.
+        if let Some(f) = model.faces.get_mut(measured) {
+            f.set_uv_bounds(0.0, std::f64::consts::TAU, 0.0, 4.0);
+        }
+
+        // One solid holding both laterals, so a single query sees them together.
+        let shell_id = {
+            let mut shell =
+                crate::primitives::shell::Shell::new(0, crate::primitives::shell::ShellType::Open);
+            shell.add_face(measured);
+            shell.add_face(unmeasured);
+            model.shells.add(shell)
+        };
+        let solid = model
+            .solids
+            .add(crate::primitives::solid::Solid::new(0, shell_id));
+        (model, solid, measured, unmeasured)
+    }
+
+    /// THE HAZARD: one testable match plus one untestable candidate must not
+    /// resolve. Folding the untestable one into `continue` leaves exactly one
+    /// match and answers `Ok(measured)` — a confident pick over a candidate set
+    /// the kernel never finished evaluating.
+    #[test]
+    fn one_untestable_candidate_makes_the_resolution_refuse_not_resolve() {
+        let (mut model, solid, measured, unmeasured) = two_cylinders_one_measured();
+
+        // Precondition: exactly one of the two is testable, so a swallow would
+        // leave a single match and look like a clean answer.
+        assert!(
+            matches!(face_outward_normal(&model, measured), FaceNormal::Known(_)),
+            "the measured lateral must be testable"
+        );
+        assert!(
+            matches!(
+                face_outward_normal(&model, unmeasured),
+                FaceNormal::Unmeasurable
+            ),
+            "the unmeasured lateral must be untestable"
+        );
+
+        // `facing(+X)`: the measured lateral's domain centre is u = pi, i.e. it
+        // faces -X, so it is legitimately excluded... but with a 180 degree
+        // tolerance every testable face matches, which is what puts a real
+        // match and an untestable candidate in the same query.
+        let mut q = FaceQuery::new(SurfaceKind::Cylindrical).facing(Vector3::X);
+        q.angle_tol_deg = 180.0;
+
+        match resolve_face(&mut model, solid, &q) {
+            Err(SelectError::Unmeasurable {
+                matched,
+                unmeasurable,
+            }) => {
+                assert_eq!(matched, vec![measured], "the testable match is reported");
+                assert_eq!(
+                    unmeasurable,
+                    vec![unmeasured],
+                    "the untestable candidate is named, not dropped"
+                );
+            }
+            other => {
+                panic!("one testable match + one untestable candidate must refuse, got {other:?}")
+            }
+        }
+    }
+
+    /// The same solid with the untestable face REMOVED resolves cleanly — so
+    /// the refusal above is caused by the untestable candidate and by nothing
+    /// else about the fixture.
+    #[test]
+    fn the_testable_candidate_alone_resolves() {
+        let (mut model, _solid, measured, _unmeasured) = two_cylinders_one_measured();
+        let shell_id = {
+            let mut shell =
+                crate::primitives::shell::Shell::new(0, crate::primitives::shell::ShellType::Open);
+            shell.add_face(measured);
+            model.shells.add(shell)
+        };
+        let solid = model
+            .solids
+            .add(crate::primitives::solid::Solid::new(0, shell_id));
+
+        let mut q = FaceQuery::new(SurfaceKind::Cylindrical).facing(Vector3::X);
+        q.angle_tol_deg = 180.0;
+        assert_eq!(
+            resolve_face(&mut model, solid, &q),
+            Ok(measured),
+            "a solid whose every candidate is testable still resolves"
+        );
+    }
 }

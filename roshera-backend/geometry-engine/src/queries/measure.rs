@@ -70,10 +70,11 @@ pub enum MeasureResult {
     ///
     /// The analytic kinds (`plane_plane`, `axis_axis`, `axis_plane`) are
     /// exact.  `"nearest"` is the LOCAL minimum found by alternating
-    /// projection from a deterministic seed (face a's UV mid-point) with
-    /// both footpoints verified inside their trims — for non-convex face
-    /// pairs with multiple closest-approach candidates it is not certified
-    /// to be the global nearest.
+    /// projection from a deterministic seed (face a's measured UV mid-point,
+    /// or the mean of its boundary vertices when its parametric domain was
+    /// never measured) with both footpoints verified inside their trims — for
+    /// non-convex face pairs with multiple closest-approach candidates it is
+    /// not certified to be the global nearest.
     Distance {
         value: f64,
         anchor: [f64; 3],
@@ -155,9 +156,31 @@ fn measure_one(model: &mut BRepModel, subj: MeasureSubject) -> Result<MeasureRes
     let MeasureSubject::Face { solid, face } = subj;
 
     let classified = surface_classify(model, solid, face)?;
-    let anchor = face_surface_midpoint(model, face)
+    // Anchor, in descending order of what the kernel actually knows:
+    //   1. the centre of the face's MEASURED parametric domain, evaluated on
+    //      the exact surface — a point on the face;
+    //   2. failing that, the mean of the face's own boundary vertices — still a
+    //      measurement, taken from the loop rather than from the surface, and
+    //      exactly what this field documents itself as ("an approximation of
+    //      the face centroid");
+    //   3. failing both, a typed refusal.
+    // The `[0, 0, 0]` this replaces was a fabricated point in world space with
+    // no relationship to the face, handed out under the name "anchor".
+    let anchor = match face_surface_midpoint(model, face)
+        .or_else(|| model.face_boundary_mean(face))
         .map(pt_to_arr)
-        .unwrap_or([0.0, 0.0, 0.0]);
+    {
+        Some(a) => a,
+        None => {
+            return Err(MeasureError::Unsupported {
+                reason: format!(
+                    "Face {face} resolved but has no locatable anchor: its parametric \
+                     domain was never measured and its boundary loop yielded no \
+                     vertices. Refused rather than anchored at the world origin."
+                ),
+            })
+        }
+    };
 
     // Area is only needed for the FaceInfo branches; a cylinder's diameter is
     // read straight off the surface and must not be refused because the area
@@ -165,12 +188,30 @@ fn measure_one(model: &mut BRepModel, subj: MeasureSubject) -> Result<MeasureRes
     // typed reason — never a fabricated 0.0 (a real zero-area face and a
     // failed computation must stay distinguishable).
     let area_or_refuse = |model: &mut BRepModel| -> Result<f64, MeasureError> {
+        // Two distinguishable refusals. An unmeasured parametric domain is not
+        // a degenerate trim loop — the loop may be perfectly sound and the
+        // integral simply has no domain to run over — and saying so would be
+        // its own small lie about why the kernel declined.
+        let unmeasured_domain = model
+            .faces
+            .get(face)
+            .map(|f| !f.uv_bounds_are_measured())
+            .unwrap_or(false);
         face_area(model, face).ok_or_else(|| MeasureError::Unsupported {
-            reason: format!(
-                "Face {face} resolved but its trimmed area could not be computed \
-                 (area integral failed on the supporting surface). \
-                 The face may have a degenerate trim loop."
-            ),
+            reason: if unmeasured_domain {
+                format!(
+                    "Face {face} resolved but its parametric domain was never measured \
+                     (uv_bounds still carry the construction placeholder), so its \
+                     curved-surface area has no domain to integrate over. \
+                     Refused rather than reported over the placeholder."
+                )
+            } else {
+                format!(
+                    "Face {face} resolved but its trimmed area could not be computed \
+                     (area integral failed on the supporting surface). \
+                     The face may have a degenerate trim loop."
+                )
+            },
         })
     };
 
@@ -420,12 +461,26 @@ fn measure_nearest(
 ) -> Result<MeasureResult, MeasureError> {
     use crate::queries::trim::closest_point_on_face;
 
-    // Seed: UV-midpoint of face a.
-    let seed_a = face_surface_midpoint(model, fa).ok_or_else(|| MeasureError::Unsupported {
-        reason: "Cannot compute a seed point for nearest-point iteration: \
-                 face a not found or its surface has no evaluable midpoint."
-            .to_string(),
-    })?;
+    // Seed: face a's measured UV midpoint, falling back to the mean of its own
+    // boundary vertices.
+    //
+    // The fallback is load-bearing, not decoration. `face_surface_midpoint` now
+    // requires MEASURED bounds, and every face minted outside a boolean —
+    // including every primitive box face — is unmeasured, so seeding from it
+    // alone would refuse nearest-distance on most of the kernel's geometry.
+    // A seed is not a measurement: alternating projection only needs a
+    // deterministic starting point near face a, and it reports the realized
+    // distance between two verified footpoints. `face_boundary_mean` is
+    // deterministic and derived from face a's own loop, so it is a legitimate
+    // seed where the midpoint is unknown.
+    let seed_a = face_surface_midpoint(model, fa)
+        .or_else(|| model.face_boundary_mean(fa))
+        .ok_or_else(|| MeasureError::Unsupported {
+            reason: "Cannot compute a seed point for nearest-point iteration: \
+                     face a not found, and neither its parametric midpoint nor \
+                     its boundary vertices could be resolved."
+                .to_string(),
+        })?;
 
     // Alternating projection (Cheney–Goldstein): project onto face b, then
     // back onto face a, until the realized distance stops improving.  Each
@@ -640,11 +695,20 @@ fn surface_classify(
 
 /// Compute the trimmed area of a face.
 ///
-/// Returns `None` when the face is not found or the area integral fails —
-/// NEVER a sentinel value, so a genuine zero-area face and a failed
-/// computation stay distinguishable.  Callers convert `None` into a typed
-/// `Unsupported` refusal rather than forwarding a fabricated number.
+/// Returns `None` when the face is not found, its parametric domain was never
+/// measured, or the area integral fails — NEVER a sentinel value, so a genuine
+/// zero-area face and a failed computation stay distinguishable.  Callers
+/// convert `None` into a typed `Unsupported` refusal rather than forwarding a
+/// fabricated number.
+///
+/// The unmeasured-domain case is the one that used to leak: the curved-surface
+/// integral runs over `uv_bounds`, and a face still carrying the `Face::new`
+/// `[0, 1]²` placeholder integrates a patch that is not the face.  See
+/// [`crate::primitives::face::Face::domain_is_known`].
 fn face_area(model: &mut BRepModel, face_id: FaceId) -> Option<f64> {
+    if !model.faces.get(face_id)?.domain_is_known(&model.surfaces) {
+        return None;
+    }
     // Read the face tolerance (immutable path).
     let tol = model
         .faces
@@ -675,10 +739,17 @@ fn face_area(model: &mut BRepModel, face_id: FaceId) -> Option<f64> {
 fn face_surface_midpoint(model: &BRepModel, face_id: FaceId) -> Option<Point3> {
     let face = model.faces.get(face_id)?;
     let surf = model.surfaces.get(face.surface_id)?;
-    let [u0, u1, v0, v1] = face.uv_bounds;
-    let u = 0.5 * (u0 + u1);
-    let v = 0.5 * (v0 + v1);
-    surf.evaluate_full(u, v).ok().map(|sp| sp.position)
+    // Requires MEASURED bounds — deliberately not `Face::probe_uv`, whose plane
+    // carve-out does not extend to this. A normal or a curvature is the same at
+    // every point of a plane; a POINT is not. On a boolean-produced planar
+    // fragment the placeholder's `(0.5, 0.5)` is a spot in the carrier plane's
+    // own frame that the fragment need not contain, and serving it as the
+    // face's anchor is exactly the kind of default-dressed-as-measurement this
+    // gate exists to stop.
+    let [u0, u1, v0, v1] = face.measured_uv_bounds()?;
+    surf.evaluate_full(0.5 * (u0 + u1), 0.5 * (v0 + v1))
+        .ok()
+        .map(|sp| sp.position)
 }
 
 #[inline]

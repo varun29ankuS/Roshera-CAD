@@ -639,7 +639,7 @@ pub fn is_bridging_facet(u0: f64, u1: f64, u2: f64, p: f64, face_u_span: f64) ->
 /// Measures rather than special-cases the sphere: step half a period in `u` and
 /// ask whether the surface went anywhere. Any surface with a degenerate `u` row
 /// is handled, including ones not yet written.
-fn u_is_degenerate_at(surface: &dyn Surface, v: f64, p: f64) -> bool {
+pub(crate) fn u_is_degenerate_at(surface: &dyn Surface, v: f64, p: f64) -> bool {
     let (Ok(a), Ok(b)) = (surface.point_at(0.0, v), surface.point_at(0.5 * p, v)) else {
         // A surface that cannot be evaluated here tells us nothing; treat the
         // parameterisation as sound rather than silently excusing the facet.

@@ -317,6 +317,15 @@ pub(crate) fn verdict_to_wire(
 ///
 /// This is the same resolution path used by `label_create` and
 /// `select_face`, applied to the GD&T designation/FCF endpoints.
+/// Refusal text for a selector the kernel could not decide.
+///
+/// `concat!`, not a `\`-continued literal — see the note on
+/// `handlers::agent::UNMEASURABLE_FACES_MSG`.
+pub(crate) const SELECTOR_UNMEASURABLE_MSG: &str = concat!(
+    "some candidate faces could not be evaluated against the selector ",
+    "(unmeasured parametric domain), so the selection is undecidable"
+);
+
 fn resolve_target_face(
     model: &mut geometry_engine::primitives::topology_builder::BRepModel,
     solid: SolidId,
@@ -401,6 +410,18 @@ fn resolve_target_face(
                         "error": "selector_ambiguous",
                         "message": "several faces match the selector — refine the description",
                         "candidates": c,
+                    })),
+                ),
+                SelectError::Unmeasurable {
+                    matched,
+                    unmeasurable,
+                } => (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(serde_json::json!({
+                        "error": "selector_unmeasurable",
+                        "message": SELECTOR_UNMEASURABLE_MSG,
+                        "matched": matched,
+                        "unmeasurable": unmeasurable,
                     })),
                 ),
             }
@@ -1264,6 +1285,18 @@ mod tests {
             matches!(err, GdtError::UnsupportedSurfaceKind { .. }),
             "must be UnsupportedSurfaceKind, got {err:?}"
         );
+    }
+
+    /// The selector refusal must read as a sentence — see the sibling test in
+    /// `handlers::agent`. Guards the FORM, not the wording: a `\`-continued
+    /// literal that `cargo fmt` reflows keeps its source indentation and lands
+    /// a 30-space gap in the middle of text an agent reads.
+    #[test]
+    fn selector_unmeasurable_message_carries_no_whitespace_runs() {
+        let msg = super::SELECTOR_UNMEASURABLE_MSG;
+        assert!(!msg.contains("  "), "message has a run of spaces: {msg:?}");
+        assert!(!msg.contains('\n'), "message has a newline: {msg:?}");
+        assert!(!msg.is_empty(), "message is empty");
     }
 
     // ── Unit tests: resolve_target_face selector parity with select_face ────

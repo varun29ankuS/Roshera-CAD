@@ -8490,7 +8490,8 @@ fn update_bounds_from_loop(
     // Bounds extremum scan: must include both endpoints of each edge
     // so a sphere's seam-edge sample at t=π hits v=π (otherwise v_max
     // would clamp to 10π/11, missing the north-pole region).
-    let polygon = project_loop_uv_unwrapped(loop_data, model, surface, 10, true);
+    let polygon =
+        project_loop_uv_unwrapped(loop_data, &model.edges, &model.curves, surface, 10, true);
     for (u, v) in polygon {
         *u_min = u_min.min(u);
         *u_max = u_max.max(u);
@@ -8533,7 +8534,154 @@ pub(crate) fn loop_polygon_uv(
         Some(s) => s,
         None => return Vec::new(),
     };
-    project_loop_uv_unwrapped(loop_data, model, surface, 20, false)
+    project_loop_uv_unwrapped(loop_data, &model.edges, &model.curves, surface, 20, false)
+}
+
+/// Noise floor for a `(u, v)` bounding-box area, shared by every consumer that
+/// asks "did this projection collapse to a line or a point?".
+///
+/// One home, three readers — `face_uv_domain_is_rectangular`,
+/// `measure_face_uv_domain`, and `primitives::face::UvTrimMask` — because they
+/// must agree: a projection one of them calls degenerate and another calls a
+/// boundary is a face whose measured domain and whose trim mask disagree about
+/// where it is.
+pub(crate) const UV_DEGENERATE_AREA_TOL: f64 = 1e-12;
+
+/// Relative slack when asking whether a `(u, v)` loop fills its own bounding
+/// box (i.e. whether the face is the full rectangle of its domain).
+///
+/// 0.1% absorbs projection and chord noise from sampling curved edges; a real
+/// boolean bite out of a face is orders of magnitude larger. Same one-home
+/// reasoning as [`UV_DEGENERATE_AREA_TOL`].
+pub(crate) const UV_RECT_FILL_SLACK: f64 = 1e-3;
+
+/// Measure a face's real `(u, v)` domain from its own outer boundary loop.
+///
+/// `None` — never a guess — whenever the domain cannot be established from the
+/// geometry present. The caller then leaves [`Face::uv_bounds`] unmeasured and
+/// every consumer refuses, which is the whole point: a wrong domain on a
+/// curved face is not a small error, it is a different patch of the surface.
+///
+/// **Method.** The outer loop is projected to `(u, v)` by
+/// [`project_loop_uv_unwrapped`] — the same projection
+/// [`face_uv_domain_is_rectangular`] already trusts — with `inclusive = true`
+/// so each edge contributes both endpoints (dropping them costs a full circle
+/// one sampling interval, i.e. reads a seamed cylinder wall as 90% of its
+/// domain). The projection unwraps continuously along the walk, so on a
+/// periodic parameter the extent is `max - min` of the *unwrapped* samples.
+///
+/// That is deliberately not the `p - largest_gap` form used by
+/// `harness::watertight::measure_face_u_spans`: that function is handed mesh
+/// vertices in arbitrary order, where the only recoverable quantity is the
+/// occupied extent. An ordered loop gives the same extent *with its position*,
+/// and `[u_min, u_max]` needs the position — a gap width alone cannot say
+/// which arc of the cylinder the fragment occupies.
+///
+/// **Refusals** (each a case where the projection provably cannot bound the
+/// domain, not a case that is merely awkward):
+/// * fewer than 3 projected samples (an empty or seam-degenerate outer loop):
+///   the face covers the whole surface, so the surface's own declared domain
+///   is the answer — but only when that domain is finite; an unbounded
+///   surface has none to give.
+/// * a collapsed `(u, v)` bbox (a constant-latitude rim, e.g. a spherical cap
+///   whose entire boundary is one circle): the boundary carries no extent in
+///   one parameter, and which side of it the face occupies is not in the loop.
+/// * a surface with a degenerate `u` row (a pole) inside its own `v` domain:
+///   the face's domain can *enclose* the pole while its boundary never
+///   reaches it, so the boundary's bbox is strictly inside the domain and
+///   would understate it. Measured by probing the surface, not by naming
+///   surface types — same test as the 08-22 mesh-quality pole guard.
+/// * an unwrapped span exceeding one period: the continuous lift disagrees
+///   with the surface's own periodicity, so the projection is not trustworthy
+///   here.
+pub(crate) fn measure_face_uv_domain(face: &Face, model: &BRepModel) -> Option<[f64; 4]> {
+    let surface = model.surfaces.get(face.surface_id)?;
+    let ((su0, su1), (sv0, sv1)) = surface.parameter_bounds();
+
+    // A pole anywhere in the surface's own v domain makes the boundary bbox an
+    // unsound bound on the face's domain — refuse before measuring.
+    //
+    // The probe runs only where the surface DECLARES a finite `v` endpoint,
+    // because that is the only place a pole can be pinned down: a sphere says
+    // `v in [0, pi]` and both ends are poles; a cone with `height_limits`
+    // excluding the apex says so and has none. A surface with no finite `v`
+    // endpoint (an unbounded plane, an unbounded cylinder) declares no place a
+    // pole could be, so there is nothing to probe and nothing to refuse — this
+    // is what lets a PLANAR boolean fragment be measured at all. Skipping is
+    // not an assumption: no finite endpoint means no candidate location.
+    let v_probes: Vec<f64> = [sv0, sv1].into_iter().filter(|v| v.is_finite()).collect();
+    if !v_probes.is_empty() {
+        // The probe steps half a period in `u` and asks whether the surface
+        // moved. Without a period, the surface's own declared `u` extent is the
+        // step; without either, the probe cannot be performed and the pole
+        // question cannot be answered, so refuse rather than assume.
+        let u_probe_period = surface
+            .period_u()
+            .filter(|p| p.is_finite() && *p > 0.0)
+            .or_else(|| (su1 - su0 > 0.0 && (su1 - su0).is_finite()).then_some(su1 - su0))?;
+        for v in v_probes {
+            if crate::harness::watertight::u_is_degenerate_at(surface, v, u_probe_period) {
+                return None;
+            }
+        }
+    }
+
+    let loop_data = model.loops.get(face.outer_loop)?;
+    let polygon =
+        project_loop_uv_unwrapped(loop_data, &model.edges, &model.curves, surface, 10, true);
+
+    if polygon.len() < 3 {
+        // Seam-degenerate / empty outer loop: the face is the whole surface.
+        // Only a surface that declares a finite domain can say what that is.
+        let finite = [su0, su1, sv0, sv1].iter().all(|x| x.is_finite());
+        if finite && su1 > su0 && sv1 > sv0 {
+            return Some([su0, su1, sv0, sv1]);
+        }
+        return None;
+    }
+
+    let mut u_min = f64::INFINITY;
+    let mut u_max = f64::NEG_INFINITY;
+    let mut v_min = f64::INFINITY;
+    let mut v_max = f64::NEG_INFINITY;
+    for &(u, v) in &polygon {
+        u_min = u_min.min(u);
+        u_max = u_max.max(u);
+        v_min = v_min.min(v);
+        v_max = v_max.max(v);
+    }
+    if !(u_min.is_finite() && u_max.is_finite() && v_min.is_finite() && v_max.is_finite()) {
+        return None;
+    }
+
+    let mut u_span = u_max - u_min;
+    let mut v_span = v_max - v_min;
+    // Below this the loop is a line or a point in parameter space and carries
+    // no extent in one direction; which side of it the face occupies is not in
+    // the loop. Shared with every other consumer of the same question.
+    if u_span <= 0.0 || v_span <= 0.0 || u_span * v_span <= UV_DEGENERATE_AREA_TOL {
+        return None;
+    }
+
+    // Snap a full-period sweep to exactly one period, and refuse a lift that
+    // ran past one — a loop spanning more than a period is not something any
+    // construction path in this kernel mints, so it means the unwrap is wrong.
+    for (period, span) in [
+        (surface.period_u(), &mut u_span),
+        (surface.period_v(), &mut v_span),
+    ] {
+        let Some(p) = period.filter(|p| p.is_finite() && *p > 0.0) else {
+            continue;
+        };
+        if *span > p * (1.0 + 1e-6) {
+            return None;
+        }
+        if *span >= p * (1.0 - 1e-6) {
+            *span = p;
+        }
+    }
+
+    Some([u_min, u_min + u_span, v_min, v_min + v_span])
 }
 
 /// Does the face's UV parameter domain coincide with its own UV bounding box?
@@ -8569,7 +8717,8 @@ pub(crate) fn face_uv_domain_is_rectangular(face: &Face, model: &BRepModel) -> b
         Some(l) => l,
         None => return true,
     };
-    let polygon = project_loop_uv_unwrapped(loop_data, model, surface, 10, false);
+    let polygon =
+        project_loop_uv_unwrapped(loop_data, &model.edges, &model.curves, surface, 10, false);
     if polygon.len() < 3 {
         return true; // seam-degenerate outer loop: face covers the full domain
     }
@@ -8584,12 +8733,11 @@ pub(crate) fn face_uv_domain_is_rectangular(face: &Face, model: &BRepModel) -> b
         v_max = v_max.max(v);
     }
     let bbox_area = (u_max - u_min) * (v_max - v_min);
-    const DEGENERATE_AREA_TOL: f64 = 1e-12;
-    if bbox_area <= DEGENERATE_AREA_TOL {
+    if bbox_area <= UV_DEGENERATE_AREA_TOL {
         return true; // collapsed to a line/point in UV: same as seam-degenerate
     }
     let area = polygon_signed_area_uv(&polygon).abs();
-    area >= bbox_area * (1.0 - 1e-3)
+    area >= bbox_area * (1.0 - UV_RECT_FILL_SLACK)
 }
 
 /// Check if a parameter point is inside face boundaries using winding number algorithm
@@ -8866,7 +9014,7 @@ fn get_loop_polygon_2d(
 ) -> Vec<(f64, f64)> {
     // Closed loop: drop trailing endpoint of each edge to avoid
     // duplicating the seam vertex with the next edge's start.
-    project_loop_uv_unwrapped(loop_data, model, surface, 20, false)
+    project_loop_uv_unwrapped(loop_data, &model.edges, &model.curves, surface, 20, false)
 }
 
 /// Project a B-Rep loop into the surface's `(u, v)` parameter space,
@@ -8893,9 +9041,15 @@ fn get_loop_polygon_2d(
 /// one, preserving the topological intent (the trace is the lift of
 /// the closed loop into the universal cover of the parameter domain).
 ///
+/// Takes the two stores it reads rather than the whole `BRepModel`, so callers
+/// that hold only `&EdgeStore` / `&CurveStore` — `Face::compute_surface_area`,
+/// which is a `Face` method and never sees a model — share this exact
+/// projection instead of growing a second copy that could drift from it.
+///
 /// # Arguments
 /// * `loop_data`        - The loop whose edges are sampled in order
-/// * `model`            - B-Rep model for edge / curve lookup
+/// * `edge_store`       - Edge lookup
+/// * `curve_store`      - Curve lookup
 /// * `surface`          - Owning surface; queried for periodicity
 /// * `intervals`        - Number of equal sub-intervals along each
 ///                        edge's parameter range
@@ -8909,9 +9063,10 @@ fn get_loop_polygon_2d(
 ///
 /// # Returns
 /// `(u, v)` polygon, possibly empty if no edges produced valid samples.
-fn project_loop_uv_unwrapped(
+pub(crate) fn project_loop_uv_unwrapped(
     loop_data: &crate::primitives::r#loop::Loop,
-    model: &BRepModel,
+    edge_store: &crate::primitives::edge::EdgeStore,
+    curve_store: &crate::primitives::curve::CurveStore,
     surface: &dyn Surface,
     intervals: usize,
     inclusive: bool,
@@ -8923,11 +9078,11 @@ fn project_loop_uv_unwrapped(
     let mut last: Option<(f64, f64)> = None;
 
     for (edge_idx, &edge_id) in loop_data.edges.iter().enumerate() {
-        let edge = match model.edges.get(edge_id) {
+        let edge = match edge_store.get(edge_id) {
             Some(e) => e,
             None => continue,
         };
-        let curve = match model.curves.get(edge.curve_id) {
+        let curve = match curve_store.get(edge.curve_id) {
             Some(c) => c,
             None => continue,
         };
@@ -9024,7 +9179,7 @@ const MAX_PERIODIC_LIFTS: usize = 8;
 /// An empty result means *no* lift of `q` lies within the polygon's extent
 /// in this parameter, i.e. the query is outside the loop for every branch of
 /// the covering map — a sound reject, not an inconclusive one.
-fn periodic_lifts(q: f64, lo: f64, hi: f64, period: Option<f64>) -> Vec<f64> {
+pub(crate) fn periodic_lifts(q: f64, lo: f64, hi: f64, period: Option<f64>) -> Vec<f64> {
     let period = match period {
         Some(p) if p.is_finite() && p > 0.0 => p,
         _ => return vec![q],
@@ -10171,5 +10326,198 @@ mod tests {
             Some(two_pi),
             None
         ));
+    }
+}
+
+/// Direct tests of [`measure_face_uv_domain`]'s refusal branches.
+///
+/// These live here, against the function, rather than in an integration test,
+/// because the branches short-circuit one another: the pole guard fires before
+/// the projection runs, so a sphere can never reach the collapsed-bbox test,
+/// and no construction path in this kernel mints a loop that walks a circle
+/// twice. Reaching them at all requires building the B-Rep configuration by
+/// hand. The PRODUCT-level statement of the pole guard — an obliquely cut
+/// spherical cap refusing its area — is in
+/// `tests/boolean_face_uv_bounds.rs::obliquely_cut_sphere_cap_refuses_rather_than_measuring_its_rim`.
+#[cfg(test)]
+mod uv_domain_measurement_tests {
+    use super::measure_face_uv_domain;
+    use crate::math::{Point3, Vector3};
+    use crate::primitives::curve::Circle;
+    use crate::primitives::curve::ParameterRange;
+    use crate::primitives::edge::{Edge, EdgeOrientation};
+    use crate::primitives::face::{Face, FaceOrientation};
+    use crate::primitives::r#loop::{Loop, LoopType};
+    use crate::primitives::surface::{Cylinder, Sphere};
+    use crate::primitives::topology_builder::BRepModel;
+
+    /// A face carrying `surface`, with the loop the caller builds.
+    fn face_on(surface_id: u32, loop_id: u32) -> Face {
+        Face::new(0, surface_id, loop_id, FaceOrientation::Forward)
+    }
+
+    /// One closed circular edge at height `z` on a radius-`r` cylinder about +Z.
+    fn circle_edge(model: &mut BRepModel, r: f64, z: f64) -> u32 {
+        let circle = Circle::new(Point3::new(0.0, 0.0, z), Vector3::Z, r).expect("circle");
+        let cid = model.curves.add(Box::new(circle));
+        let v = model.vertices.add_unchecked_with_tolerance(r, 0.0, z, 1e-6);
+        model.edges.add(Edge::new(
+            0,
+            v,
+            v,
+            cid,
+            EdgeOrientation::Forward,
+            ParameterRange::new(0.0, 1.0),
+        ))
+    }
+
+    /// POLE GUARD, and the proof that it is not merely conservative.
+    ///
+    /// A sphere is degenerate in `u` at both ends of its own `v` domain, so a
+    /// face can ENCLOSE a pole its boundary never reaches, and the boundary's
+    /// `(u, v)` bbox is then strictly inside the face's real domain.
+    ///
+    /// The fixture makes that undecidability concrete: ONE rim — a circle round
+    /// `+X`, at neither constant latitude nor across the seam, so it has honest
+    /// extent in both `u` and `v` and neither the collapsed-bbox nor the
+    /// over-period branch fires — bounds TWO different faces, the small cap
+    /// around `+X` and everything else on the sphere. Their domains differ;
+    /// their boundary loop is identical. Any function of the loop alone must
+    /// return the same value for both, so it cannot be right for both.
+    ///
+    /// The pole guard is what makes the kernel say so. Delete it and both faces
+    /// receive the SAME `Some([-0.64, 0.64, 0.93, 2.21])` — the rim's bbox,
+    /// correct for the small cap and a gross understatement for its complement,
+    /// with nothing to tell them apart.
+    #[test]
+    fn a_pole_in_the_v_domain_makes_one_rim_two_domains_and_is_not_measured() {
+        let mut model = BRepModel::new();
+        let sphere = Sphere::new(Point3::ORIGIN, 10.0).expect("sphere");
+        let sid = model.surfaces.add(Box::new(sphere));
+
+        // A circle of radius 6 in the plane x = 8 — on the r=10 sphere, and
+        // oblique to the polar axis.
+        let circle = Circle::new(Point3::new(8.0, 0.0, 0.0), Vector3::X, 6.0).expect("rim");
+        let cid = model.curves.add(Box::new(circle));
+        let v = model
+            .vertices
+            .add_unchecked_with_tolerance(8.0, 0.0, 6.0, 1e-6);
+        let e = model.edges.add(Edge::new(
+            0,
+            v,
+            v,
+            cid,
+            EdgeOrientation::Forward,
+            ParameterRange::new(0.0, 1.0),
+        ));
+        let mut lp = Loop::new(0, LoopType::Outer);
+        lp.add_edge(e, true);
+        let lid = model.loops.add(lp);
+
+        // Two faces, same loop, opposite sides of it.
+        let cap = face_on(sid, lid);
+        let mut complement = face_on(sid, lid);
+        complement.orientation = FaceOrientation::Backward;
+
+        assert_eq!(
+            measure_face_uv_domain(&cap, &model),
+            None,
+            "the cap's domain cannot be read off a rim that also bounds its \
+             complement"
+        );
+        assert_eq!(
+            measure_face_uv_domain(&complement, &model),
+            None,
+            "and neither can the complement's"
+        );
+    }
+
+    /// COLLAPSED BBOX. A cylinder has no pole, so this reaches the projection —
+    /// and a loop that is a single circle at constant height has zero extent in
+    /// `v`. Which side of that circle the face occupies is not in the loop, so
+    /// there is nothing to measure.
+    #[test]
+    fn a_boundary_with_no_extent_in_one_parameter_is_not_measured() {
+        let mut model = BRepModel::new();
+        let cyl = Cylinder::new_finite(Point3::ORIGIN, Vector3::Z, 10.0, 20.0).expect("cylinder");
+        let sid = model.surfaces.add(Box::new(cyl));
+        let e = circle_edge(&mut model, 10.0, 7.0);
+        let mut lp = Loop::new(0, LoopType::Outer);
+        lp.add_edge(e, true);
+        let lid = model.loops.add(lp);
+        let face = face_on(sid, lid);
+
+        assert_eq!(
+            measure_face_uv_domain(&face, &model),
+            None,
+            "a single constant-height circle spans no v at all"
+        );
+    }
+
+    /// SPAN > PERIOD. A loop that walks the same full circle twice unwraps to a
+    /// `u` extent of 4*pi on a surface whose period is 2*pi. No construction
+    /// path mints that, so it means the lift disagrees with the surface's own
+    /// periodicity and the projection cannot be trusted here.
+    #[test]
+    fn an_unwrapped_span_longer_than_one_period_is_not_measured() {
+        let mut model = BRepModel::new();
+        let cyl = Cylinder::new_finite(Point3::ORIGIN, Vector3::Z, 10.0, 20.0).expect("cylinder");
+        let sid = model.surfaces.add(Box::new(cyl));
+        let bottom = circle_edge(&mut model, 10.0, 0.0);
+        let top = circle_edge(&mut model, 10.0, 20.0);
+        let mut lp = Loop::new(0, LoopType::Outer);
+        // Two full sweeps in the same sense: 0 -> 2pi -> 4pi.
+        lp.add_edge(bottom, true);
+        lp.add_edge(top, true);
+        lp.add_edge(bottom, true);
+        lp.add_edge(top, true);
+        let lid = model.loops.add(lp);
+        let face = face_on(sid, lid);
+
+        assert_eq!(
+            measure_face_uv_domain(&face, &model),
+            None,
+            "a lift spanning more than one period is not a domain"
+        );
+    }
+
+    /// FEWER THAN 3 SAMPLES, surface bounded. An empty outer loop means the
+    /// face covers the whole surface, and a surface that declares a finite
+    /// domain can say what that is — this is a measurement (of the surface),
+    /// not a guess.
+    #[test]
+    fn an_empty_loop_on_a_bounded_surface_takes_the_surfaces_own_domain() {
+        let mut model = BRepModel::new();
+        let cyl = Cylinder::new_finite(Point3::ORIGIN, Vector3::Z, 10.0, 20.0).expect("cylinder");
+        let sid = model.surfaces.add(Box::new(cyl));
+        let lid = model.loops.add(Loop::new(0, LoopType::Outer));
+        let face = face_on(sid, lid);
+
+        let got = measure_face_uv_domain(&face, &model).expect("a bounded cylinder declares one");
+        assert!(
+            (got[0] - 0.0).abs() < 1e-12
+                && (got[1] - std::f64::consts::TAU).abs() < 1e-9
+                && (got[2] - 0.0).abs() < 1e-12
+                && (got[3] - 20.0).abs() < 1e-9,
+            "expected the cylinder's own [0, 2pi] x [0, 20], got {got:?}"
+        );
+    }
+
+    /// FEWER THAN 3 SAMPLES, surface UNBOUNDED. The same empty loop on a
+    /// cylinder with no height limits: the face covers a domain the surface
+    /// itself does not bound, so there is no answer to give.
+    #[test]
+    fn an_empty_loop_on_an_unbounded_surface_is_not_measured() {
+        let mut model = BRepModel::new();
+        let cyl = Cylinder::new(Point3::ORIGIN, Vector3::Z, 10.0).expect("cylinder");
+        let sid = model.surfaces.add(Box::new(cyl));
+        let lid = model.loops.add(Loop::new(0, LoopType::Outer));
+        let face = face_on(sid, lid);
+
+        assert_eq!(
+            measure_face_uv_domain(&face, &model),
+            None,
+            "an unbounded cylinder declares no v extent to inherit"
+        );
     }
 }
