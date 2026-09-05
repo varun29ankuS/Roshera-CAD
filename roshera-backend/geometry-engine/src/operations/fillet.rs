@@ -213,12 +213,75 @@ pub enum FilletType {
     /// - `Radius(Constant)` → `create_constant_radius_fillet`
     /// - `Radius(Linear)` → `create_variable_radius_fillet`
     /// - `Radius(Variable)` → `create_function_radius_fillet`
-    /// - `Chord` → `create_chord_fillet`
+    /// - `Chord` → the constant-radius path, at the radius
+    ///   `resolve_chord_radii` measured for that edge
     PerEdgeProfile(HashMap<EdgeId, EdgeFilletProfile>),
-    /// Radius function along edge parameter
-    Function(Box<dyn Fn(f64) -> f64>),
-    /// Chord length fillet
+    /// Radius function along edge parameter.
+    ///
+    /// Held as a shared `Arc` rather than a `Box` so [`Clone`] can
+    /// hand back *the same* radius schedule. A `Box` cannot be
+    /// cloned, and the historical workaround — substituting
+    /// `Constant(5.0)` — silently turned one fillet into a
+    /// different one; a kernel that cannot copy a request must say
+    /// so, not answer a question nobody asked. `Send + Sync` is
+    /// required so the whole [`FilletType`] stays `Send + Sync`
+    /// (closures over shared data are the only thing this variant
+    /// ever carries).
+    ///
+    /// The function is sampled at `FUNCTION_RADIUS_SAMPLES + 1`
+    /// stations over the edge parameter `t ∈ [0, 1]`
+    /// ([`sample_radius_function`]) before ANY gate runs, so the
+    /// half-neighbour-length bound and the F6-α curvature bound see
+    /// the radii the surgery will actually build.
+    Function(std::sync::Arc<dyn Fn(f64) -> f64 + Send + Sync>),
+    /// Chord length fillet.
+    ///
+    /// The chord is **not** a radius: a chord `c` across a dihedral
+    /// whose normal-turn angle is `θ` is the chord of a circle of
+    /// radius `c / (2 sin(θ/2))`. The conversion runs once per edge
+    /// in [`resolve_chord_radii`], before the blend graph and before
+    /// every gate; nothing downstream ever sees a raw chord length.
+    /// `θ` is measured at the edge midpoint, so the conversion is
+    /// exact on a constant-dihedral edge and a midpoint approximation
+    /// otherwise. A CONCAVE edge is refused by name rather than
+    /// converted — the sign convention there is undecided.
     Chord(f64),
+}
+
+/// Number of intervals the edge parameter is divided into when a
+/// [`FilletType::Function`] radius schedule is sampled — the rolling-
+/// ball construction in [`create_function_radius_fillet`] and the
+/// pre-flight gates MUST agree on this density, or a gate can pass a
+/// radius the surgery then builds (or refuse one it never would).
+/// `NUM_SAMPLES + 1` stations are produced, `t = i / NUM_SAMPLES`.
+const FUNCTION_RADIUS_SAMPLES: usize = 20;
+
+/// Sample a radius function over the full edge parameter range at the
+/// density the surgery loop uses. Returns `FUNCTION_RADIUS_SAMPLES + 1`
+/// values including both endpoints.
+///
+/// Non-finite and non-positive samples are returned VERBATIM — the
+/// caller decides whether that is a refusal (`validate_fillet_
+/// parameters` rejects `r <= 0`; `create_function_radius_fillet`
+/// rejects non-finite with the offending station). Filtering them
+/// here would hide the defect the gates exist to catch.
+fn sample_radius_function(radius_fn: &dyn Fn(f64) -> f64) -> Vec<f64> {
+    (0..=FUNCTION_RADIUS_SAMPLES)
+        .map(|i| radius_fn(i as f64 / FUNCTION_RADIUS_SAMPLES as f64))
+        .collect()
+}
+
+/// The largest FINITE sample of a radius function, or `0.0` when the
+/// schedule produces no finite value. Used by the gates that need a
+/// conservative upper bound (F6-α curvature, the over-height rim
+/// pre-filter). `0.0` degrades those gates to a no-op and leaves the
+/// rejection to `create_function_radius_fillet`, which names the
+/// offending station.
+fn max_finite_function_radius(radius_fn: &dyn Fn(f64) -> f64) -> f64 {
+    sample_radius_function(radius_fn)
+        .into_iter()
+        .filter(|r| r.is_finite())
+        .fold(0.0_f64, f64::max)
 }
 
 impl std::fmt::Debug for FilletType {
@@ -262,7 +325,11 @@ impl Clone for FilletType {
             FilletType::VariableStations(samples) => FilletType::VariableStations(samples.clone()),
             FilletType::PerEdgeConstant(map) => FilletType::PerEdgeConstant(map.clone()),
             FilletType::PerEdgeProfile(map) => FilletType::PerEdgeProfile(map.clone()),
-            FilletType::Function(_) => FilletType::Constant(5.0), // Fallback to constant
+            // The clone is the SAME schedule, not a stand-in for it:
+            // `Arc::clone` shares the caller's closure. The historical
+            // `Constant(5.0)` fallback answered a different question
+            // than the one asked and never said so.
+            FilletType::Function(f) => FilletType::Function(std::sync::Arc::clone(f)),
             FilletType::Chord(c) => FilletType::Chord(*c),
         }
     }
@@ -313,6 +380,51 @@ pub fn fillet_edges(
             .map(|e| resolve_coalesced(&coalesced, e))
             .filter(|&e| seen.insert(e))
             .collect();
+    }
+
+    // AUDIT 2026-09-03 — the chord → radius seam. Runs FIRST, before
+    // any pre-filter, gate, graph build or surgery, so that from this
+    // line on every fillet dimension in flight is a radius. See
+    // `resolve_chord_radii`. Empty (and free) for every fillet type
+    // that carries no chord. Propagation can widen the selection
+    // later, so the map is topped up once more after
+    // `propagate_edge_selection`.
+    let mut chord_radii: HashMap<EdgeId, f64> = HashMap::new();
+    {
+        let unmeasurable = resolve_chord_radii(
+            model,
+            solid_id,
+            &edges,
+            &options.fillet_type,
+            options.common.tolerance,
+            options.graceful_corner_skip,
+            &mut chord_radii,
+        )?;
+        if !unmeasurable.is_empty() {
+            let kept = edges.len() - unmeasurable.len();
+            if kept == 0 {
+                // Nothing convertible — refuse cleanly (the model is
+                // untouched here) naming an offending edge, rather
+                // than letting a chord masquerade as a radius through
+                // every gate below.
+                return Err(OperationError::InvalidGeometry(format!(
+                    "fillet: no chord length in the selection converts to a radius (edge {}): \
+                     the dihedral is tangent-flat or could not be measured.",
+                    unmeasurable[0]
+                )));
+            }
+            tracing::warn!(
+                target: "geometry_engine::blend",
+                "fillet (all-edges): skipping {} edge(s) {:?} whose dihedral does not convert \
+                 a chord length into a radius (tangent-flat / unmeasurable — a concave edge \
+                 is refused outright, never skipped); rounding {} of {} candidate edge(s)",
+                unmeasurable.len(),
+                unmeasurable,
+                kept,
+                edges.len(),
+            );
+            edges.retain(|e| !unmeasurable.contains(e));
+        }
     }
 
     // ALL-edges "round what it can" pre-filter (live-dogfood fix,
@@ -387,7 +499,7 @@ pub fn fillet_edges(
             .iter()
             .copied()
             .filter(|&e| {
-                let r = edge_representative_radius(&options, e);
+                let r = edge_representative_radius(&options, &chord_radii, e);
                 r > 0.0
                     && plane_cylinder_rim_available_height(model, e)
                         .is_some_and(|avail| r >= avail - margin)
@@ -400,7 +512,7 @@ pub fn fillet_edges(
                 // the concrete per-rim reason rather than a surgery crash.
                 let e = over_height[0];
                 let avail = plane_cylinder_rim_available_height(model, e).unwrap_or(0.0);
-                let r = edge_representative_radius(&options, e);
+                let r = edge_representative_radius(&options, &chord_radii, e);
                 return Err(OperationError::InvalidGeometry(format!(
                     "Fillet radius {r} too large for cylinder rim (edge {e}): exceeds \
                      available cylinder height ({avail}); the lateral surface would collapse."
@@ -442,7 +554,7 @@ pub fn fillet_edges(
                 plane_cap_bore_rim_fillet_overruns(
                     model,
                     e,
-                    edge_representative_radius(&options, e),
+                    edge_representative_radius(&options, &chord_radii, e),
                 )
             })
             .collect();
@@ -452,7 +564,7 @@ pub fn fillet_edges(
                 // Nothing roundable — refuse cleanly (model untouched here) with
                 // the concrete per-rim reason rather than a broken-mesh rollback.
                 let e = overrun[0];
-                let r = edge_representative_radius(&options, e);
+                let r = edge_representative_radius(&options, &chord_radii, e);
                 return Err(OperationError::InvalidGeometry(format!(
                     "Fillet radius {r} too large for bore rim (edge {e}): the rounded opening \
                      would overrun the cap-face boundary (collide with a nearby wall or hole)."
@@ -511,23 +623,35 @@ pub fn fillet_edges(
             // validator own the rejection.
             FilletType::PerEdgeConstant(map) => map.values().copied().fold(0.0_f64, f64::max),
             // F5-β.5.6/.7: per-edge profile's largest *sample* radius
-            // across every profile shape. `EdgeFilletProfile::
-            // max_radius_bound` normalises Radius(Constant/Linear/
-            // Variable) to its inner `BlendRadius::max_value` and
-            // reports 0.0 for `Chord` (chord can produce arbitrarily
-            // large radii at small dihedrals, so F6-α has no
-            // closed-form bound for it — same skip behaviour as
-            // top-level `FilletType::Chord`). Empty fold identity is
-            // 0.0 so an empty map degrades F6-α to a no-op and lets
+            // across every profile shape. `Radius(Constant/Linear/
+            // Variable)` normalises to its inner
+            // `BlendRadius::max_value` via `max_radius_bound`; a
+            // `Chord` entry reports the radius the seam measured for
+            // that edge (`max_radius_bound` cannot — it has no
+            // dihedral — which is why it returns 0.0 and is bypassed
+            // here). Empty fold identity is 0.0 so an empty map
+            // degrades F6-α to a no-op and lets
             // `validate_fillet_inputs` own the rejection.
             FilletType::PerEdgeProfile(map) => map
-                .values()
-                .map(|p| p.max_radius_bound())
+                .iter()
+                .map(|(eid, p)| match p {
+                    EdgeFilletProfile::Radius(_) => p.max_radius_bound(),
+                    EdgeFilletProfile::Chord(_) => resolved_chord_radius(&chord_radii, *eid),
+                })
                 .fold(0.0_f64, f64::max),
-            // `Function` and `Chord` paths don't have a closed-form
-            // upper bound here; F6-α leaves them to the existing
-            // downstream validation. Sampling them is F6-β.
-            FilletType::Function(_) | FilletType::Chord(_) => 0.0,
+            // AUDIT 2026-09-03: both of these used to report 0.0,
+            // which switched F6-α OFF for the two request shapes most
+            // likely to need it — a chord across a shallow dihedral
+            // produces an unboundedly LARGE radius, and a radius
+            // function is unconstrained by construction. The chord is
+            // now a measured radius; the function is sampled at the
+            // surgery's own density and gated on its largest sample,
+            // exactly as a constant of that size would be.
+            FilletType::Chord(_) => edges
+                .iter()
+                .map(|&e| resolved_chord_radius(&chord_radii, e))
+                .fold(0.0_f64, f64::max),
+            FilletType::Function(f) => max_finite_function_radius(f.as_ref()),
         };
 
         lifecycle::validate_can_apply(
@@ -653,10 +777,11 @@ pub fn fillet_edges(
                 // the half-edge-length bounds check. `Radius(Constant)`
                 // → one sample, `Radius(Linear)` → two endpoints,
                 // `Radius(Variable)` → every station radius, `Chord`
-                // → the raw chord value itself (a chord of length `c`
-                // connects two cap points at distance `c` apart along
-                // the spine, so `c <= half_edge_length` is the same
-                // conservative guard the scalar-radius arms apply).
+                // → the radius the seam measured for this edge (the
+                // raw chord value used to be fed here, which is a
+                // different quantity: on a 90° dihedral it overstates
+                // the radius by 41 %, on a shallow one it understates
+                // it without bound).
                 // Missing keys are rejected by `validate_fillet_inputs`
                 // upstream; the fallback to `options.radius` here is
                 // purely defensive — if validation passes, the key is
@@ -669,18 +794,33 @@ pub fn fillet_edges(
                     Some(EdgeFilletProfile::Radius(BlendRadius::Variable(samples))) => {
                         samples.iter().map(|&(_, r)| r).collect()
                     }
-                    Some(EdgeFilletProfile::Chord(c)) => vec![*c],
+                    Some(EdgeFilletProfile::Chord(_)) => {
+                        vec![resolved_chord_radius(&chord_radii, edge_id)]
+                    }
                     None => vec![options.radius],
                 },
-                // Function radii are validated per-sample inside the
-                // surgery loop; the placeholder of 1.0 only exercises the
-                // structural bounds here (edge length non-zero, edge
-                // exists).
-                FilletType::Function(_) => vec![1.0],
-                FilletType::Chord(c) => vec![*c],
+                // AUDIT 2026-09-03: the schedule is SAMPLED here, at
+                // the same density `create_function_radius_fillet`
+                // uses, and every sample is bounds-checked. The old
+                // `vec![1.0]` placeholder validated a radius nobody
+                // asked for — its comment claimed per-sample
+                // validation happened later, and it did not:
+                // `validate_fillet_parameters` has exactly one caller,
+                // this loop.
+                FilletType::Function(f) => sample_radius_function(f.as_ref()),
+                FilletType::Chord(_) => vec![resolved_chord_radius(&chord_radii, edge_id)],
             };
             let mut edge_ok = true;
             for radius in radii_to_check {
+                // A non-finite radius slips through every comparison
+                // in `validate_fillet_parameters` (`NaN <= 0.0` and
+                // `NaN > min_neighbour` are both false), so refuse it
+                // here rather than letting it reach surface assembly.
+                if !radius.is_finite() {
+                    first_reject.get_or_insert(OperationError::InvalidRadius(radius));
+                    edge_ok = false;
+                    break;
+                }
                 if let Err(e) =
                     validate_fillet_parameters(model, edge_id, radius, &options.common.tolerance)
                 {
@@ -753,13 +893,36 @@ pub fn fillet_edges(
                 if map.is_empty() {
                     0.0
                 } else {
-                    map.values()
-                        .map(|b| b.min_radius_bound())
+                    map.iter()
+                        .map(|(eid, p)| match p {
+                            EdgeFilletProfile::Radius(_) => p.min_radius_bound(),
+                            // The measured radius, not the `c/2`
+                            // lower bound: the seam has already
+                            // turned the chord into the exact value.
+                            EdgeFilletProfile::Chord(_) => {
+                                resolved_chord_radius(&chord_radii, *eid)
+                            }
+                        })
                         .fold(f64::INFINITY, f64::min)
                 }
             }
-            FilletType::Function(_) => 0.0, // Will validate per point
-            FilletType::Chord(c) => *c,
+            // AUDIT 2026-09-03: the smallest sample of the schedule,
+            // mirroring the `PerEdgeProfile` min-fold — a single
+            // non-positive station cannot be masked by a larger
+            // sibling, and every station has already been bounds-
+            // checked above. The old `0.0` ("will validate per point")
+            // fell straight into the `radius <= 0.0` rejection two
+            // lines below, so EVERY function fillet was refused with
+            // `InvalidRadius(0.0)`: the variant was unreachable from
+            // this entry point, and the refusal named a radius the
+            // caller never asked for.
+            FilletType::Function(f) => sample_radius_function(f.as_ref())
+                .into_iter()
+                .fold(f64::INFINITY, f64::min),
+            FilletType::Chord(_) => edges
+                .iter()
+                .map(|&e| resolved_chord_radius(&chord_radii, e))
+                .fold(f64::INFINITY, f64::min),
         };
 
         // Check radius validity
@@ -769,6 +932,43 @@ pub fn fillet_edges(
 
         // Propagate edge selection if requested
         let mut selected_edges = propagate_edge_selection(model, edges, options.propagation)?;
+
+        // Propagation (the DEFAULT is `Tangent`) can widen the
+        // selection beyond the edges the seam measured at entry. Top
+        // the map up for the newcomers — already-measured edges are
+        // skipped — so the graph below still never sees a chord.
+        {
+            let unmeasurable = resolve_chord_radii(
+                model,
+                solid_id,
+                &selected_edges,
+                &options.fillet_type,
+                options.common.tolerance,
+                options.graceful_corner_skip,
+                &mut chord_radii,
+            )?;
+            if !unmeasurable.is_empty() {
+                let kept = selected_edges.len() - unmeasurable.len();
+                if kept == 0 {
+                    return Err(OperationError::InvalidGeometry(format!(
+                        "fillet: no chord length in the propagated selection converts to a \
+                         radius (edge {}): the dihedral is tangent-flat or could not be \
+                         measured.",
+                        unmeasurable[0]
+                    )));
+                }
+                tracing::warn!(
+                    target: "geometry_engine::blend",
+                    "fillet (all-edges): skipping {} propagated edge(s) {:?} whose dihedral \
+                     does not convert a chord length into a radius; rounding {} of {}",
+                    unmeasurable.len(),
+                    unmeasurable,
+                    kept,
+                    selected_edges.len(),
+                );
+                selected_edges.retain(|e| !unmeasurable.contains(e));
+            }
+        }
 
         // F3-δ.4: build the F2-β blend graph for the full selection.
         // The graph carries per-edge convexity / dihedral / manifold-
@@ -783,7 +983,12 @@ pub fn fillet_edges(
         // F4/F5 corner-blending will activate.
         let blend_selection: Vec<(EdgeId, BlendRadius)> = selected_edges
             .iter()
-            .map(|&eid| (eid, fillet_type_to_blend_radius(&options.fillet_type, eid)))
+            .map(|&eid| {
+                (
+                    eid,
+                    fillet_type_to_blend_radius(&options.fillet_type, eid, &chord_radii),
+                )
+            })
             .collect();
         let mut blend_graph = blend_graph::build(model, &blend_selection)?;
 
@@ -907,7 +1112,12 @@ pub fn fillet_edges(
             selected_edges.retain(|e| keep_filletable.contains(e) || !filletable.contains(e));
             let blend_selection: Vec<(EdgeId, BlendRadius)> = selected_edges
                 .iter()
-                .map(|&eid| (eid, fillet_type_to_blend_radius(&options.fillet_type, eid)))
+                .map(|&eid| {
+                    (
+                        eid,
+                        fillet_type_to_blend_radius(&options.fillet_type, eid, &chord_radii),
+                    )
+                })
                 .collect();
             blend_graph = blend_graph::build(model, &blend_selection)?;
         }
@@ -1018,6 +1228,7 @@ pub fn fillet_edges(
                 &options,
                 &blend_graph,
                 &edge_face_map,
+                &chord_radii,
             )?;
             for (edge_id, face_id) in &chain_edge_faces {
                 edge_to_face.insert(*edge_id, *face_id);
@@ -1269,6 +1480,205 @@ pub fn fillet_edges(
     })
 }
 
+/// The chord length this fillet type asks for on `edge_id`, or `None`
+/// when the edge's profile is a radius schedule rather than a chord.
+fn edge_chord_length(fillet_type: &FilletType, edge_id: EdgeId) -> Option<f64> {
+    match fillet_type {
+        FilletType::Chord(c) => Some(*c),
+        FilletType::PerEdgeProfile(map) => match map.get(&edge_id) {
+            Some(EdgeFilletProfile::Chord(c)) => Some(*c),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// `true` when `fillet_type` carries a chord length anywhere.
+fn carries_chord(fillet_type: &FilletType) -> bool {
+    match fillet_type {
+        FilletType::Chord(_) => true,
+        FilletType::PerEdgeProfile(map) => map
+            .values()
+            .any(|p| matches!(p, EdgeFilletProfile::Chord(_))),
+        _ => false,
+    }
+}
+
+/// **The chord → radius seam.** Convert every chord length in
+/// `fillet_type` into a rolling-ball radius, once per edge, before
+/// anything downstream reads a radius.
+///
+/// A chord is not a radius. A chord of length `c` laid across an edge
+/// whose faces turn their normals through `θ` is the chord of a circle
+/// of radius
+///
+/// ```text
+///     r = c / (2 · sin(θ/2))
+/// ```
+///
+/// **`θ` is measured at the edge MIDPOINT (`t = 0.5`)**, by
+/// `compute_face_angle`. The conversion is therefore EXACT for an edge
+/// of constant dihedral - every planar-planar edge, every straight
+/// prism edge, the plane/cylinder rims this kernel blends - and is a
+/// midpoint approximation on an edge whose dihedral varies along its
+/// length. It is not "the true radius" in general, and this doc does
+/// not claim to be; it is the radius the requested chord implies at
+/// the midpoint, which is the only place the kernel measures.
+///
+/// — the same formula the old `create_chord_fillet` applied at surgery
+/// time, hoisted here so it runs *before* `blend_graph::build`,
+/// `compute_setbacks`, the F6-α curvature gate, the half-neighbour
+/// bound and the over-height / bore-overrun pre-filters. Every one of
+/// those consumed the raw chord as if it were a radius: on a 90° box
+/// edge that overstated the radius by 41 %, and on a shallow dihedral
+/// it *understated* it without bound (`θ → 0 ⇒ r → ∞`), which is
+/// precisely why the curvature gate was disabled for chords.
+///
+/// Fills `out` for every edge in `edges` that carries a chord and is
+/// not already present; edges whose profile is a radius schedule are
+/// left out (their radius needs no conversion).
+///
+/// **Errors / refusals.** Three distinct outcomes, deliberately not
+/// collapsed into one message:
+///
+/// * An edge that is not on `solid_id`'s boundary is skipped silently
+///   — the existing `grounded_edges` filter owns that rejection and
+///   names it properly.
+/// * An edge whose dihedral cannot be measured, or which is
+///   TANGENT-FLAT (`|sin(θ/2)| < tol.parallel_threshold()`, i.e. its
+///   face normals coincide), has no radius: under `graceful` it joins
+///   the drop list (mirroring the sibling all-edges pre-filters),
+///   otherwise it is a typed refusal naming the edge and the angle.
+/// * A CONCAVE edge (`sin(θ/2) < 0`) is refused UNCONDITIONALLY, in
+///   both modes and for both request shapes. See the gate below for
+///   why a capability gap may be skipped and a semantic gap may not.
+///
+/// The kernel never invents a radius for an edge whose geometry does
+/// not determine one, and never records a negative one.
+fn resolve_chord_radii(
+    model: &BRepModel,
+    solid_id: SolidId,
+    edges: &[EdgeId],
+    fillet_type: &FilletType,
+    tol: Tolerance,
+    graceful: bool,
+    out: &mut HashMap<EdgeId, f64>,
+) -> OperationResult<Vec<EdgeId>> {
+    if !carries_chord(fillet_type) {
+        return Ok(Vec::new());
+    }
+    let mut unmeasurable: Vec<EdgeId> = Vec::new();
+    for &edge_id in edges {
+        if out.contains_key(&edge_id) {
+            continue;
+        }
+        let Some(chord) = edge_chord_length(fillet_type, edge_id) else {
+            continue;
+        };
+        // Not on this solid's boundary — `grounded_edges` drops it and
+        // reports the concrete reason; converting it here would only
+        // shadow that with a chord-flavoured message.
+        let Ok((face1_id, face2_id)) = get_adjacent_faces(model, solid_id, edge_id) else {
+            continue;
+        };
+        let angle = match compute_face_angle(model, edge_id, face1_id, face2_id) {
+            Ok(a) => a,
+            Err(e) => {
+                if graceful {
+                    unmeasurable.push(edge_id);
+                    continue;
+                }
+                return Err(e);
+            }
+        };
+        // AUDIT-H1 tangent-flat gate, carried over from
+        // `create_chord_fillet`: `half_sin = sin(θ/2)`, compared in
+        // sin-space against the caller's angular tolerance
+        // (`parallel_threshold() = sin(angle())`), which stays
+        // numerically robust at small angles.
+        //
+        // The message it used to carry said "flat or reflex". It only
+        // ever caught FLAT: the test is `|sin(θ/2)| < tol`, true at
+        // θ ≈ 0 (face normals coincident) and at nothing else a real
+        // B-Rep produces. Reflex is the `half_sin < 0` branch below,
+        // which this string was quietly taking credit for.
+        let half_sin = (angle / 2.0).sin();
+        if half_sin.abs() < tol.parallel_threshold() {
+            if graceful {
+                unmeasurable.push(edge_id);
+                continue;
+            }
+            return Err(OperationError::InvalidGeometry(format!(
+                "fillet: edge {edge_id} is tangent-flat (dihedral {:.6} deg, |sin(theta/2)| \
+                 below the angular tolerance): its faces meet with coincident normals, so a \
+                 chord laid across it lies on no circle and determines no radius.",
+                angle.to_degrees()
+            )));
+        }
+        // CONCAVE CHORD: a NAMED REFUSAL, never a negative "radius".
+        //
+        // `robust_face_angle` returns a SIGNED normal-turn angle -
+        // positive convex, negative concave - so `c / (2 sin(theta/2))`
+        // comes out negative on a concave edge. That is not a small
+        // radius; it is not a radius. Which sign convention a concave
+        // chord should use has never been decided here, and a kernel
+        // that cannot answer must say so rather than pass a negative
+        // number downstream, where it re-disables the F6-alpha gate
+        // through `fold(0.0, f64::max)`, no-ops the rim pre-filters
+        // (they skip unless `r > 0.0`), and finally surfaces as
+        // `InvalidRadius(-0.707)` - a message telling the caller to
+        // shrink a radius they never supplied.
+        //
+        // Unconditional: NOT gated on `graceful`. The sibling
+        // pre-filters skip an edge whose CORNER the kernel cannot yet
+        // synthesise - a capability gap, where rounding the rest is
+        // still honest. This is a semantic gap: there is no radius at
+        // any size. Skipping it would round only the convex half of a
+        // `fillet all edges` chord request and report success, and it
+        // would make the two request shapes disagree again - the
+        // top-level `Chord` selection dropping the edge in the
+        // feasibility loop while `PerEdgeProfile` hard-refuses through
+        // its representative min-fold.
+        if half_sin < 0.0 {
+            // Assembled with `concat!`, not `\` line continuations.
+            // rustfmt reflows a continued literal onto ONE physical
+            // line and the continuation's leading indentation then
+            // survives INSIDE the string, so the refusal a caller
+            // reads carries an 18-space gap mid-sentence. That is not
+            // cosmetic: this message is the kernel's entire answer for
+            // this request, and it is what an agent parses. `concat!`
+            // has no continuation for rustfmt to fuse, so the runtime
+            // text cannot drift from the source again.
+            // `chord_fillet_on_concave_edge_refuses_by_name` asserts
+            // the message holds no double space.
+            return Err(OperationError::InvalidGeometry(format!(
+                concat!(
+                    "fillet: edge {edge_id} is concave (dihedral {degrees:.6} deg) and its ",
+                    "chord length {chord} determines no radius here: the chord sign ",
+                    "convention for concave edges is undecided in this kernel. Supply an ",
+                    "explicit radius for this edge instead of a chord."
+                ),
+                edge_id = edge_id,
+                degrees = angle.to_degrees(),
+                chord = chord,
+            )));
+        }
+        out.insert(edge_id, chord / (2.0 * half_sin));
+    }
+    Ok(unmeasurable)
+}
+
+/// This edge's converted chord radius, or `0.0` when the seam did not
+/// record one. Coverage is guaranteed for every chord-carrying edge
+/// that reaches this point ([`resolve_chord_radii`] runs on the
+/// original selection and again after propagation); the `0.0` fallback
+/// is defensive and propagates as an `InvalidRadius(0.0)` refusal
+/// rather than a fabricated radius — the same shape the
+/// `PerEdgeConstant` / `PerEdgeProfile` missing-key fallbacks use.
+fn resolved_chord_radius(chord_radii: &HashMap<EdgeId, f64>, edge_id: EdgeId) -> f64 {
+    chord_radii.get(&edge_id).copied().unwrap_or(0.0)
+}
+
 /// Create a fillet chain along connected edges.
 ///
 /// Returns the new fillet face IDs alongside the per-edge
@@ -1279,11 +1689,21 @@ pub fn fillet_edges(
 /// Translate a [`FilletType`] into the [`BlendRadius`] shape that
 /// [`blend_graph::build`] expects. F3-δ.4 wires the BlendGraph into
 /// the constant-radius spine path; non-constant types are passed
-/// through with their best-effort BlendRadius mapping so the graph
-/// classification (convexity / dihedral / manifold-kind) still
-/// covers every selected edge, even though the variable / function /
-/// chord paths don't yet consult the graph for setback retraction.
-fn fillet_type_to_blend_radius(fillet_type: &FilletType, edge_id: EdgeId) -> BlendRadius {
+/// through with their BlendRadius mapping so the graph classification
+/// (convexity / dihedral / manifold-kind) still covers every selected
+/// edge, even though the variable / function / chord paths don't yet
+/// consult the graph for setback retraction.
+///
+/// Every value handed to the graph is a RADIUS. `chord_radii` carries
+/// the per-edge conversions [`resolve_chord_radii`] measured before
+/// the graph was built, so a `Chord` profile arrives here already in
+/// radius units; a `Function` schedule is sampled at the surgery's own
+/// density rather than reported as a placeholder.
+fn fillet_type_to_blend_radius(
+    fillet_type: &FilletType,
+    edge_id: EdgeId,
+    chord_radii: &HashMap<EdgeId, f64>,
+) -> BlendRadius {
     match fillet_type {
         FilletType::Constant(r) => BlendRadius::Constant(*r),
         FilletType::Variable(r1, r2) => BlendRadius::Linear {
@@ -1305,27 +1725,33 @@ fn fillet_type_to_blend_radius(fillet_type: &FilletType, edge_id: EdgeId) -> Ble
         }
         // F5-β.5.6/.7: per-edge profile. For `Radius(_)` we forward
         // the inner `BlendRadius` so the graph classifies the edge
-        // by its actual schedule. `Chord(c)` has no closed-form
-        // radius without the local dihedral (unavailable at graph-
-        // build time), so we report `Constant(c)` as a placeholder
-        // — matching the existing top-level `FilletType::Chord(c)`
-        // behaviour. The actual chord → radius conversion runs
-        // later at surgery time inside `create_chord_fillet`.
+        // by its actual schedule. A `Chord` entry is reported as the
+        // TRUE radius `resolve_chord_radii` measured for this edge —
+        // the graph never sees a chord length.
         // Missing keys are rejected by `validate_fillet_inputs`
         // upstream; the fallback to `Constant(0.0)` here is
         // defensive and would propagate as an `InvalidRadius(0.0)`
         // downstream.
         FilletType::PerEdgeProfile(map) => match map.get(&edge_id) {
             Some(EdgeFilletProfile::Radius(b)) => b.clone(),
-            Some(EdgeFilletProfile::Chord(c)) => BlendRadius::Constant(*c),
+            Some(EdgeFilletProfile::Chord(_)) => {
+                BlendRadius::Constant(resolved_chord_radius(chord_radii, edge_id))
+            }
             None => BlendRadius::Constant(0.0),
         },
-        // The Function and Chord paths don't expose a closed-form
-        // sampling here; report Constant(1.0) as a placeholder so
-        // the edge is still classified into the graph. F4 will
-        // refine these when variable-radius fillets land.
-        FilletType::Function(_) => BlendRadius::Constant(1.0),
-        FilletType::Chord(c) => BlendRadius::Constant(*c),
+        // A radius function is sampled at the surgery's own density
+        // and folded to its LARGEST value: the graph uses this to
+        // classify the edge and to size corner setbacks, and a
+        // setback that under-reaches leaves the spine long enough to
+        // collide with its neighbour. Taking the max is the
+        // conservative direction. (`BlendRadius::Variable` is
+        // deliberately not used here: its stations are edge-parameter
+        // stations of the *selected* schedule, and F4 owns wiring a
+        // sampled function into the graph as a varying schedule.)
+        FilletType::Function(f) => BlendRadius::Constant(max_finite_function_radius(f.as_ref())),
+        // The chord was converted to a true radius at the seam
+        // (`resolve_chord_radii`) before this graph was built.
+        FilletType::Chord(_) => BlendRadius::Constant(resolved_chord_radius(chord_radii, edge_id)),
     }
 }
 
@@ -1707,6 +2133,11 @@ fn create_fillet_chain(
     options: &FilletOptions,
     blend_graph: &BlendGraph,
     edge_face_map: &HashMap<EdgeId, (FaceId, FaceId)>,
+    // Per-edge chord -> radius conversions measured at the
+    // `resolve_chord_radii` seam. A `Chord` profile is dispatched
+    // through the ordinary constant-radius surgery with the radius
+    // recorded here; the chord length itself never reaches surgery.
+    chord_radii: &HashMap<EdgeId, f64>,
 ) -> OperationResult<(Vec<(EdgeId, FaceId)>, Vec<BlendEdgeSurgery>)> {
     let mut edge_faces: Vec<(EdgeId, FaceId)> = Vec::new();
     let mut surgeries = Vec::new();
@@ -1769,7 +2200,7 @@ fn create_fillet_chain(
                     edge_id,
                     face1_id,
                     face2_id,
-                    &evaluator,
+                    evaluator.as_ref(),
                     blend_graph,
                     tol,
                 )?
@@ -1805,9 +2236,10 @@ fn create_fillet_chain(
                 // Radius(Linear) → legacy two-endpoint variable
                 // path; Radius(Variable) → piecewise-linear function
                 // path (same builder the VariableStations arm above
-                // uses); Chord → `create_chord_fillet` (the chord →
-                // radius conversion lives there and runs with the
-                // local dihedral). Coverage is guaranteed by
+                // uses); Chord → the constant-radius path at the
+                // radius `resolve_chord_radii` measured for that
+                // edge before the graph was built. Coverage is
+                // guaranteed by
                 // `validate_fillet_inputs`; the missing-key fallback
                 // surfaces as `InternalError` because at this point
                 // validation has passed.
@@ -1850,20 +2282,35 @@ fn create_fillet_chain(
                             edge_id,
                             face1_id,
                             face2_id,
-                            &evaluator,
+                            evaluator.as_ref(),
                             blend_graph,
                             tol,
                         )?
                     }
-                    EdgeFilletProfile::Chord(c) => create_chord_fillet(
-                        model,
-                        edge_id,
-                        face1_id,
-                        face2_id,
-                        *c,
-                        blend_graph,
-                        tol,
-                    )?,
+                    // The chord was turned into a radius once, at
+                    // the `resolve_chord_radii` seam, before the
+                    // blend graph existed; surgery is the ordinary
+                    // constant-radius path. A missing entry after
+                    // validation is a kernel-internal logic
+                    // violation, not a caller error — same shape as
+                    // the `PerEdgeConstant` arm above.
+                    EdgeFilletProfile::Chord(_) => {
+                        let r = chord_radii.get(&edge_id).copied().ok_or_else(|| {
+                            OperationError::InternalError(format!(
+                                "PerEdgeProfile: chord edge {} has no measured radius after the chord -> radius seam",
+                                edge_id
+                            ))
+                        })?;
+                        create_constant_radius_fillet(
+                            model,
+                            edge_id,
+                            face1_id,
+                            face2_id,
+                            r,
+                            blend_graph,
+                            tol,
+                        )?
+                    }
                 }
             }
             FilletType::Function(f) => create_function_radius_fillet(
@@ -1871,12 +2318,28 @@ fn create_fillet_chain(
                 edge_id,
                 face1_id,
                 face2_id,
-                f,
+                f.as_ref(),
                 blend_graph,
                 tol,
             )?,
-            FilletType::Chord(chord) => {
-                create_chord_fillet(model, edge_id, face1_id, face2_id, *chord, blend_graph, tol)?
+            // See the `EdgeFilletProfile::Chord` arm above: the
+            // conversion happened once, at the seam.
+            FilletType::Chord(_) => {
+                let r = chord_radii.get(&edge_id).copied().ok_or_else(|| {
+                    OperationError::InternalError(format!(
+                        "Chord: edge {} has no measured radius after the chord -> radius seam",
+                        edge_id
+                    ))
+                })?;
+                create_constant_radius_fillet(
+                    model,
+                    edge_id,
+                    face1_id,
+                    face2_id,
+                    r,
+                    blend_graph,
+                    tol,
+                )?
             }
         };
 
@@ -2394,18 +2857,31 @@ fn plane_cylinder_rim_available_height(model: &BRepModel, edge_id: EdgeId) -> Op
 /// the ALL-edges over-height rim pre-filter. Conservative (the largest radius
 /// the edge could see) so a rim is skipped whenever ANY station would collapse
 /// the wall; the common `Constant` case is exact.
-fn edge_representative_radius(options: &FilletOptions, edge_id: EdgeId) -> f64 {
+fn edge_representative_radius(
+    options: &FilletOptions,
+    chord_radii: &HashMap<EdgeId, f64>,
+    edge_id: EdgeId,
+) -> f64 {
     match &options.fillet_type {
         FilletType::Constant(r) => *r,
         FilletType::Variable(r1, r2) => r1.max(*r2),
         FilletType::VariableStations(s) => s.iter().map(|&(_, r)| r).fold(0.0_f64, f64::max),
         FilletType::PerEdgeConstant(m) => m.get(&edge_id).copied().unwrap_or(options.radius),
-        FilletType::PerEdgeProfile(m) => m
-            .get(&edge_id)
-            .map(|p| p.max_radius_bound())
-            .unwrap_or(options.radius),
-        FilletType::Chord(c) => *c,
-        FilletType::Function(_) => options.radius,
+        // A `Chord` entry's bound is the radius the seam measured for
+        // THIS edge, not the chord length and not the `max_radius_bound`
+        // 0.0 skip — a rim's wall-height budget is spent in radius
+        // units.
+        FilletType::PerEdgeProfile(m) => match m.get(&edge_id) {
+            Some(EdgeFilletProfile::Radius(b)) => b.max_value(),
+            Some(EdgeFilletProfile::Chord(_)) => resolved_chord_radius(chord_radii, edge_id),
+            None => options.radius,
+        },
+        FilletType::Chord(_) => resolved_chord_radius(chord_radii, edge_id),
+        // The largest radius the schedule actually asks for, sampled
+        // at the surgery's own density — `options.radius` is a
+        // convenience field the function path never reads, so using it
+        // here reported a bound unrelated to the request.
+        FilletType::Function(f) => max_finite_function_radius(f.as_ref()),
     }
 }
 
@@ -3771,17 +4247,16 @@ fn create_function_radius_fillet(
     edge_id: EdgeId,
     face1_id: FaceId,
     face2_id: FaceId,
-    radius_fn: &Box<dyn Fn(f64) -> f64>,
+    radius_fn: &dyn Fn(f64) -> f64,
     blend_graph: &BlendGraph,
     tol: Tolerance,
 ) -> OperationResult<(FaceId, Option<BlendEdgeSurgery>)> {
     // Validate the function over the full edge parameter at the same
     // density used by the rolling-ball construction — we don't want
     // to discover a non-finite radius midway through surface assembly.
-    const NUM_SAMPLES: usize = 20;
-    let mut radii = Vec::with_capacity(NUM_SAMPLES + 1);
-    for i in 0..=NUM_SAMPLES {
-        let t = i as f64 / NUM_SAMPLES as f64;
+    let mut radii = Vec::with_capacity(FUNCTION_RADIUS_SAMPLES + 1);
+    for i in 0..=FUNCTION_RADIUS_SAMPLES {
+        let t = i as f64 / FUNCTION_RADIUS_SAMPLES as f64;
         let r = radius_fn(t);
         if !r.is_finite() || r <= 0.0 {
             return Err(OperationError::InvalidGeometry(format!(
@@ -3987,33 +4462,6 @@ fn resample_radii_uniform(radii: &[f64], target_len: usize) -> Vec<f64> {
         out.push(radii[i] * (1.0 - frac) + radii[i_next] * frac);
     }
     out
-}
-
-/// Create a chord length fillet
-fn create_chord_fillet(
-    model: &mut BRepModel,
-    edge_id: EdgeId,
-    face1_id: FaceId,
-    face2_id: FaceId,
-    chord_length: f64,
-    blend_graph: &BlendGraph,
-    tol: Tolerance,
-) -> OperationResult<(FaceId, Option<BlendEdgeSurgery>)> {
-    // Compute radius from chord length and face angle
-    let angle = compute_face_angle(model, edge_id, face1_id, face2_id)?;
-    let half_sin = (angle / 2.0).sin();
-    // AUDIT-H1: flat/reflex gate. `half_sin = sin(angle/2)`; using
-    // `tol.parallel_threshold()` (= sin(angle())) keeps the comparison
-    // in sin-space where it's numerically robust at small angles, and
-    // honors the caller's angular tolerance configuration.
-    if half_sin.abs() < tol.parallel_threshold() {
-        return Err(OperationError::InvalidGeometry(
-            "Cannot fillet flat or reflex edge".into(),
-        ));
-    }
-    let radius = chord_length / (2.0 * half_sin);
-
-    create_constant_radius_fillet(model, edge_id, face1_id, face2_id, radius, blend_graph, tol)
 }
 
 /// Describes one filleted edge-blend surface adjacent to a vertex.
@@ -9918,8 +10366,9 @@ fn validate_fillet_inputs(
             // parameter names the offending edge. F5-β.5.7: Chord
             // gets its own finite/positive/tolerance gate using
             // the raw chord length (the radius derivation happens
-            // later at surgery time inside `create_chord_fillet`,
-            // but a non-positive chord is meaningless on its face).
+            // at the `resolve_chord_radii` seam, which needs the
+            // dihedral this validator does not measure, but a
+            // non-positive chord is meaningless on its face).
             for (&edge_id, profile) in map.iter() {
                 match profile {
                     EdgeFilletProfile::Radius(BlendRadius::Constant(r)) => {
@@ -10235,13 +10684,54 @@ mod tests {
         assert_eq!(opts.quality, FilletQuality::Standard);
     }
 
+    /// AUDIT 2026-09-03 — this test used to be
+    /// `fillet_type_function_clone_falls_back_to_constant_five`, and
+    /// it pinned a lie: cloning a `Function` produced
+    /// `Constant(5.0)`, a DIFFERENT fillet, with nothing anywhere
+    /// saying so. `FilletOptions` derives `Clone` and the recorder /
+    /// replay paths clone it, so the substitution was reachable.
+    /// A clone is now the same schedule (`Arc::clone`), sampled to
+    /// prove it — not merely the same variant.
     #[test]
-    fn fillet_type_function_clone_falls_back_to_constant_five() {
-        let f = FilletType::Function(Box::new(|t: f64| 1.0 + t));
+    fn cloned_function_fillet_is_the_same_fillet() {
+        let f = FilletType::Function(std::sync::Arc::new(|t: f64| 1.0 + t));
         let cloned = f.clone();
-        match cloned {
-            FilletType::Constant(r) => assert!((r - 5.0).abs() < 1e-12),
-            other => panic!("expected Constant fallback, got {other:?}"),
+        match (&f, &cloned) {
+            (FilletType::Function(orig), FilletType::Function(copy)) => {
+                for i in 0..=FUNCTION_RADIUS_SAMPLES {
+                    let t = i as f64 / FUNCTION_RADIUS_SAMPLES as f64;
+                    assert!(
+                        (copy(t) - orig(t)).abs() < 1e-12,
+                        "clone diverges from the original at t={t}: {} vs {}",
+                        copy(t),
+                        orig(t)
+                    );
+                    assert!(
+                        (copy(t) - (1.0 + t)).abs() < 1e-12,
+                        "clone is not the caller's schedule at t={t}: got {}",
+                        copy(t)
+                    );
+                }
+            }
+            (_, other) => panic!("clone changed variant: got {other:?}"),
+        }
+    }
+
+    /// `FilletOptions` is the shape the recorder and the timeline
+    /// replay clone. A cloned OPTIONS block must carry the same
+    /// radius schedule, not a substituted constant.
+    #[test]
+    fn cloned_fillet_options_preserve_the_radius_function() {
+        let opts = FilletOptions {
+            fillet_type: FilletType::Function(std::sync::Arc::new(|t: f64| 2.0 + 3.0 * t)),
+            ..Default::default()
+        };
+        match &opts.clone().fillet_type {
+            FilletType::Function(f) => {
+                assert!((f(0.0) - 2.0).abs() < 1e-12, "got {}", f(0.0));
+                assert!((f(1.0) - 5.0).abs() < 1e-12, "got {}", f(1.0));
+            }
+            other => panic!("expected Function, got {other:?}"),
         }
     }
 
@@ -10280,7 +10770,10 @@ mod tests {
     fn fillet_type_debug_format_includes_value() {
         let s = format!("{:?}", FilletType::Constant(2.0));
         assert!(s.contains("Constant"));
-        let s = format!("{:?}", FilletType::Function(Box::new(|_| 0.0)));
+        let s = format!(
+            "{:?}",
+            FilletType::Function(std::sync::Arc::new(|_: f64| 0.0))
+        );
         assert!(s.contains("Function"));
     }
 
@@ -10432,7 +10925,7 @@ mod tests {
     fn fillet_type_to_blend_radius_maps_variable_stations_to_variable() {
         let samples = vec![(0.0, 1.0), (0.5, 2.0), (1.0, 1.5)];
         let ft = FilletType::VariableStations(samples.clone());
-        match fillet_type_to_blend_radius(&ft, 0) {
+        match fillet_type_to_blend_radius(&ft, 0, &HashMap::new()) {
             BlendRadius::Variable(out) => assert_eq!(out, samples),
             other => panic!("expected BlendRadius::Variable, got {other:?}"),
         }
@@ -10443,11 +10936,11 @@ mod tests {
         // Regression pin: adding VariableStations / PerEdgeConstant
         // must not alter the existing Constant → Constant / Variable(2)
         // → Linear mappings used by every legacy fillet path.
-        match fillet_type_to_blend_radius(&FilletType::Constant(2.0), 0) {
+        match fillet_type_to_blend_radius(&FilletType::Constant(2.0), 0, &HashMap::new()) {
             BlendRadius::Constant(r) => assert!((r - 2.0).abs() < 1e-12),
             other => panic!("expected BlendRadius::Constant, got {other:?}"),
         }
-        match fillet_type_to_blend_radius(&FilletType::Variable(1.0, 3.0), 0) {
+        match fillet_type_to_blend_radius(&FilletType::Variable(1.0, 3.0), 0, &HashMap::new()) {
             BlendRadius::Linear { start, end } => {
                 assert!((start - 1.0).abs() < 1e-12);
                 assert!((end - 3.0).abs() < 1e-12);
@@ -12463,11 +12956,11 @@ mod tests {
         m.insert(7_u32 as EdgeId, 2.0);
         m.insert(13_u32 as EdgeId, 3.5);
         let ft = FilletType::PerEdgeConstant(m);
-        match fillet_type_to_blend_radius(&ft, 13) {
+        match fillet_type_to_blend_radius(&ft, 13, &HashMap::new()) {
             BlendRadius::Constant(r) => assert!((r - 3.5).abs() < 1e-12),
             other => panic!("expected BlendRadius::Constant(3.5), got {other:?}"),
         }
-        match fillet_type_to_blend_radius(&ft, 7) {
+        match fillet_type_to_blend_radius(&ft, 7, &HashMap::new()) {
             BlendRadius::Constant(r) => assert!((r - 2.0).abs() < 1e-12),
             other => panic!("expected BlendRadius::Constant(2.0), got {other:?}"),
         }
@@ -12483,7 +12976,7 @@ mod tests {
         let mut m = HashMap::new();
         m.insert(7_u32 as EdgeId, 2.0);
         let ft = FilletType::PerEdgeConstant(m);
-        match fillet_type_to_blend_radius(&ft, 99) {
+        match fillet_type_to_blend_radius(&ft, 99, &HashMap::new()) {
             BlendRadius::Constant(r) => assert!(r == 0.0),
             other => panic!("expected BlendRadius::Constant(0.0), got {other:?}"),
         }
@@ -12770,18 +13263,18 @@ mod tests {
         );
         let ft = FilletType::PerEdgeProfile(m);
         assert_eq!(
-            fillet_type_to_blend_radius(&ft, 7),
+            fillet_type_to_blend_radius(&ft, 7, &HashMap::new()),
             BlendRadius::Constant(2.0)
         );
         assert_eq!(
-            fillet_type_to_blend_radius(&ft, 13),
+            fillet_type_to_blend_radius(&ft, 13, &HashMap::new()),
             BlendRadius::Linear {
                 start: 0.5,
                 end: 1.5,
             }
         );
         assert_eq!(
-            fillet_type_to_blend_radius(&ft, 19),
+            fillet_type_to_blend_radius(&ft, 19, &HashMap::new()),
             BlendRadius::Variable(vec![(0.0, 0.3), (1.0, 0.8)])
         );
     }
@@ -12797,7 +13290,7 @@ mod tests {
         );
         let ft = FilletType::PerEdgeProfile(m);
         assert_eq!(
-            fillet_type_to_blend_radius(&ft, 99),
+            fillet_type_to_blend_radius(&ft, 99, &HashMap::new()),
             BlendRadius::Constant(0.0)
         );
     }
@@ -12931,14 +13424,37 @@ mod tests {
     }
 
     #[test]
-    fn fillet_type_to_blend_radius_per_edge_profile_chord_returns_constant() {
+    /// AUDIT 2026-09-03 — this test used to be
+    /// `..._chord_returns_constant` and asserted `Constant(0.6)` for
+    /// `Chord(0.6)`: it pinned the chord length being handed to the
+    /// blend graph as if it were a radius. The graph now receives the
+    /// radius the `resolve_chord_radii` seam measured, and receives
+    /// `Constant(0.0)` — a refusal that surfaces downstream as
+    /// `InvalidRadius(0.0)` — when no measurement was recorded.
+    fn fillet_type_to_blend_radius_per_edge_profile_chord_returns_measured_radius() {
         let mut m = HashMap::new();
         let chord_edge = 7_u32 as EdgeId;
         m.insert(chord_edge, EdgeFilletProfile::Chord(0.6));
         let ft = FilletType::PerEdgeProfile(m);
+
+        // A 90° dihedral: r = 0.6 / (2 sin 45°) = 0.6/√2.
+        let measured = 0.6 / 2.0_f64.sqrt();
+        let mut chord_radii = HashMap::new();
+        chord_radii.insert(chord_edge, measured);
         assert_eq!(
-            fillet_type_to_blend_radius(&ft, chord_edge),
-            BlendRadius::Constant(0.6)
+            fillet_type_to_blend_radius(&ft, chord_edge, &chord_radii),
+            BlendRadius::Constant(measured)
+        );
+        assert_ne!(
+            fillet_type_to_blend_radius(&ft, chord_edge, &chord_radii),
+            BlendRadius::Constant(0.6),
+            "the chord length must never reach the graph as a radius"
+        );
+
+        // No measurement: refuse with 0.0 rather than guess.
+        assert_eq!(
+            fillet_type_to_blend_radius(&ft, chord_edge, &HashMap::new()),
+            BlendRadius::Constant(0.0)
         );
     }
 
@@ -13152,7 +13668,7 @@ mod tests {
             let map: HashMap<EdgeId, f64> = edges.iter().map(|&e| (e, r)).collect();
             let ft = FilletType::PerEdgeConstant(map);
             for &e in &edges {
-                match fillet_type_to_blend_radius(&ft, e) {
+                match fillet_type_to_blend_radius(&ft, e, &HashMap::new()) {
                     BlendRadius::Constant(out) => prop_assert!(
                         (out - r).abs() < 1e-12,
                         "out={out} r={r}",
@@ -13458,7 +13974,7 @@ mod tests {
             let ft = FilletType::PerEdgeProfile(profile_map);
             for &e in &edges {
                 let expected = original.get(&e).cloned();
-                let got = fillet_type_to_blend_radius(&ft, e);
+                let got = fillet_type_to_blend_radius(&ft, e, &HashMap::new());
                 prop_assert_eq!(
                     expected.as_ref(),
                     Some(&got),
@@ -13558,12 +14074,17 @@ mod tests {
         }
 
         /// `EdgeFilletProfile::Chord(c).max_radius_bound()` is `0.0`
-        /// for any chord, matching the existing top-level
-        /// `FilletType::Chord(_) => 0.0` F6-α opt-out. The actual
-        /// radius produced by a chord at dihedral θ is
-        /// `c / (2 sin(θ/2))`, which is unbounded as θ → 0, so the
-        /// curvature gate cannot pre-screen chord requests and must
-        /// no-op them.
+        /// for any chord. The radius a chord produces at dihedral θ
+        /// is `c / (2 sin(θ/2))`, unbounded as θ → 0, and this type
+        /// carries no dihedral — so 0.0 here is a REFUSAL TO GUESS,
+        /// pinned as such.
+        ///
+        /// AUDIT 2026-09-03 — it is no longer an F6-α opt-out. The
+        /// curvature gate in `fillet_edges` bypasses this method for
+        /// `Chord` entries and reads the radius `resolve_chord_radii`
+        /// measured from the real edge instead, so chord requests ARE
+        /// pre-screened now. This property guards the method's own
+        /// contract, not the gate's behaviour.
         #[test]
         fn prop_edge_fillet_profile_chord_max_bound_is_zero_for_any_chord(
             c in 1e-9_f64..1e6_f64,
@@ -13726,28 +14247,46 @@ mod tests {
 
         /// For any per-edge chord entry, `fillet_type_to_blend_radius`
         /// returns `BlendRadius::Constant(c)` — the placeholder used
-        /// to feed `blend_graph::build`'s edge classification when no
-        /// closed-form radius is available without dihedral context.
+        /// to feed `blend_graph::build`'s edge classification.
         /// Required so chord edges still appear in the blend graph
         /// (and therefore in the surgery pipeline) on equal footing
         /// with constant-radius edges.
+        ///
+        /// AUDIT 2026-09-03 — the value is the RADIUS the
+        /// `resolve_chord_radii` seam measured for that edge, never
+        /// the chord length. The two differ by `2 sin(θ/2)`, which is
+        /// 1 only at a 60° dihedral; the old form of this property
+        /// asserted `Constant(c)` and so pinned the defect.
         #[test]
-        fn prop_fillet_type_to_blend_radius_chord_per_edge_returns_constant(
+        fn prop_fillet_type_to_blend_radius_chord_per_edge_returns_measured_radius(
             c in 1e-9_f64..1e6_f64,
+            theta in 0.05_f64..std::f64::consts::PI,
             eid in 0u32..1024,
         ) {
             let mut m = HashMap::new();
             m.insert(eid as EdgeId, EdgeFilletProfile::Chord(c));
             let ft = FilletType::PerEdgeProfile(m);
-            match fillet_type_to_blend_radius(&ft, eid as EdgeId) {
+            let expected = c / (2.0 * (theta / 2.0).sin());
+            let mut chord_radii = HashMap::new();
+            chord_radii.insert(eid as EdgeId, expected);
+            match fillet_type_to_blend_radius(&ft, eid as EdgeId, &chord_radii) {
                 BlendRadius::Constant(out) => prop_assert!(
-                    (out - c).abs() < 1e-12,
-                    "expected Constant({c}), got Constant({out})",
+                    (out - expected).abs() <= 1e-9 * expected.abs().max(1.0),
+                    "expected Constant({expected}), got Constant({out})",
                 ),
                 other => prop_assert!(
                     false,
-                    "expected Constant({c}), got {other:?}",
+                    "expected Constant({expected}), got {other:?}",
                 ),
+            }
+            // No measurement recorded => a refusal-shaped 0.0, never
+            // the chord length dressed up as a radius.
+            match fillet_type_to_blend_radius(&ft, eid as EdgeId, &HashMap::new()) {
+                BlendRadius::Constant(out) => prop_assert!(
+                    out == 0.0,
+                    "expected Constant(0.0) with no measurement, got Constant({out})",
+                ),
+                other => prop_assert!(false, "expected Constant(0.0), got {other:?}"),
             }
         }
 
@@ -14204,6 +14743,734 @@ mod tests {
         assert!(
             shell.faces.contains(&new_face_id),
             "new corner face must be registered on solid's outer shell"
+        );
+    }
+
+    // ===================================================================
+    // AUDIT 2026-09-03 — chord and function fillets fed as radii
+    // ===================================================================
+    //
+    // Three defects, one theme: a dimension that is NOT a radius was
+    // handed to every gate and to the blend graph as if it were one.
+    //
+    //   * `FilletType::Chord(c)` reached `blend_graph::build`,
+    //     `compute_setbacks` and the F6-α curvature gate as
+    //     `BlendRadius::Constant(c)`. The true rolling-ball radius is
+    //     `c / (2 sin(θ/2))` — for a 90° box edge that is `c/√2`
+    //     (41 % smaller), for a shallow 10° dihedral it is `5.7·c`.
+    //     The graph therefore retracted every corner setback by the
+    //     wrong distance, and the curvature gate was disabled outright
+    //     (`max_radius = 0.0`).
+    //   * `FilletType::Function(f)` was never sampled before the
+    //     gates: `vec![1.0]` went to `validate_fillet_parameters`,
+    //     `Constant(1.0)` to the graph, `0.0` to the curvature gate.
+    //   * `Clone` of a `Function` substituted `Constant(5.0)` — a
+    //     silently different fillet.
+    //
+    // -------------------------------------------------------------------
+
+    /// A cube of side `size`, centred on the origin.
+    fn build_cube(model: &mut BRepModel, size: f64) -> SolidId {
+        let mut builder = TopologyBuilder::new(model);
+        match builder.create_box_3d(size, size, size).expect("cube") {
+            GeometryId::Solid(id) => id,
+            other => panic!("expected solid, got {other:?}"),
+        }
+    }
+
+    /// The vertex at `(x, y, z)`; panics when absent.
+    fn vertex_at_position(model: &BRepModel, x: f64, y: f64, z: f64) -> VertexId {
+        for (id, vertex) in model.vertices.iter() {
+            let p = vertex.position;
+            if (p[0] - x).abs() < 1.0e-9 && (p[1] - y).abs() < 1.0e-9 && (p[2] - z).abs() < 1.0e-9 {
+                return id;
+            }
+        }
+        panic!("no vertex at ({x}, {y}, {z})");
+    }
+
+    /// Every edge incident to `vertex` (start or end).
+    fn edges_incident_to(model: &BRepModel, vertex: VertexId) -> Vec<EdgeId> {
+        model
+            .edges
+            .iter()
+            .filter(|(_, e)| e.start_vertex == vertex || e.end_vertex == vertex)
+            .map(|(id, _)| id)
+            .collect()
+    }
+
+    fn corner_fillet_options(fillet_type: FilletType, radius: f64) -> FilletOptions {
+        FilletOptions {
+            fillet_type,
+            radius,
+            propagation: PropagationMode::None,
+            ..Default::default()
+        }
+    }
+
+    /// Extrude the closed CCW polygon `ring` (at z = 0) along +Z.
+    fn extrude_polygon(model: &mut BRepModel, ring: &[(f64, f64)], height: f64) -> SolidId {
+        use crate::operations::extrude::{extrude_profile, ExtrudeOptions};
+        let verts: Vec<VertexId> = ring
+            .iter()
+            .map(|&(x, y)| model.vertices.add(x, y, 0.0))
+            .collect();
+        let mut edges = Vec::with_capacity(verts.len());
+        for i in 0..verts.len() {
+            let a = verts[i];
+            let b = verts[(i + 1) % verts.len()];
+            let pa = model.vertices.get(a).expect("vertex a").position;
+            let pb = model.vertices.get(b).expect("vertex b").position;
+            let line = Line::new(
+                Point3::new(pa[0], pa[1], pa[2]),
+                Point3::new(pb[0], pb[1], pb[2]),
+            );
+            let curve_id = model.curves.add(Box::new(line));
+            edges.push(model.edges.add(Edge::new_auto_range(
+                0,
+                a,
+                b,
+                curve_id,
+                EdgeOrientation::Forward,
+            )));
+        }
+        let opts = ExtrudeOptions {
+            direction: Vector3::Z,
+            distance: height,
+            cap_ends: true,
+            ..Default::default()
+        };
+        extrude_profile(model, edges, opts).expect("polygon extrusion succeeds")
+    }
+
+    /// The edge whose endpoints are `a` and `b` (either order).
+    fn edge_between(model: &BRepModel, a: Point3, b: Point3) -> EdgeId {
+        let at = |v: VertexId, p: Point3| {
+            model
+                .vertices
+                .get(v)
+                .map(|vx| {
+                    (vx.position[0] - p.x).abs() < 1.0e-6
+                        && (vx.position[1] - p.y).abs() < 1.0e-6
+                        && (vx.position[2] - p.z).abs() < 1.0e-6
+                })
+                .unwrap_or(false)
+        };
+        for (id, e) in model.edges.iter() {
+            if (at(e.start_vertex, a) && at(e.end_vertex, b))
+                || (at(e.start_vertex, b) && at(e.end_vertex, a))
+            {
+                return id;
+            }
+        }
+        panic!("no edge between {a:?} and {b:?}");
+    }
+
+    /// **The chord is not a radius, and the corner setback is where
+    /// that shows.**
+    ///
+    /// A prism whose vertical edge turns its face normals through
+    /// only 10°: a chord of 2 mm laid across that edge is the chord
+    /// of a circle of radius `2 / (2 sin 5°) = 11.47 mm` — 5.7× the
+    /// chord. `compute_setbacks` stamps `r · cos(θ_min/2)` at every
+    /// corner, where `θ_min` is the tightest angle between outgoing
+    /// blend tangents (90° here — the vertical edge meeting a
+    /// top-cap edge), so the setback must be
+    /// `11.47 · cos 45° = 8.113 mm`.
+    ///
+    /// Before the fix the graph was handed the chord LENGTH, so the
+    /// stamped setback was `2 · cos 45° = 1.414 mm` — the spine was
+    /// retracted less than a fifth of the distance its own rolling
+    /// ball occupies. The 5.7× separation between the two numbers is
+    /// why a shallow dihedral is the fixture: on a 90° box edge the
+    /// same defect is only a 41 % error.
+    #[test]
+    fn chord_fillet_setback_uses_true_radius() {
+        use std::f64::consts::PI;
+
+        const CHORD: f64 = 2.0;
+        const HEIGHT: f64 = 30.0;
+        let ten_deg = 10.0_f64.to_radians();
+
+        // Convex CCW pentagon whose vertex at (40, 0) turns the
+        // outline by exactly 10°; every other turn is 80° or 90°.
+        let apex = (40.0_f64, 0.0_f64);
+        let next = (apex.0 + 40.0 * ten_deg.cos(), apex.1 + 40.0 * ten_deg.sin());
+        let ring = [(0.0, 0.0), apex, next, (next.0, 60.0), (0.0, 60.0)];
+
+        let mut model = BRepModel::new();
+        let solid = extrude_polygon(&mut model, &ring, HEIGHT);
+
+        let apex_bottom = Point3::new(apex.0, apex.1, 0.0);
+        let apex_top = Point3::new(apex.0, apex.1, HEIGHT);
+        let next_top = Point3::new(next.0, next.1, HEIGHT);
+        let vertical = edge_between(&model, apex_bottom, apex_top);
+        let top = edge_between(&model, apex_top, next_top);
+
+        // (1) The fixture really is a 10° dihedral — measured, not
+        //     assumed, so the expected radius below is anchored to
+        //     the geometry that was built.
+        let (f1, f2) = get_adjacent_faces(&model, solid, vertical).expect("vertical edge faces");
+        let dihedral = compute_face_angle(&model, vertical, f1, f2).expect("dihedral");
+        assert!(
+            (dihedral.abs() - ten_deg).abs() < 1.0e-6,
+            "fixture must present a 10 degree dihedral; measured {} degrees",
+            dihedral.to_degrees()
+        );
+
+        // (2) The seam converts the chord with that dihedral.
+        let tol = Tolerance::default();
+        let fillet_type = FilletType::Chord(CHORD);
+        let mut chord_radii: HashMap<EdgeId, f64> = HashMap::new();
+        let dropped = resolve_chord_radii(
+            &model,
+            solid,
+            &[vertical, top],
+            &fillet_type,
+            tol,
+            false,
+            &mut chord_radii,
+        )
+        .expect("a measurable dihedral converts");
+        assert!(dropped.is_empty(), "nothing to drop: {dropped:?}");
+
+        let expected_vertical_radius = CHORD / (2.0 * (dihedral / 2.0).sin());
+        assert!(
+            (expected_vertical_radius.abs() - 11.473_713_4).abs() < 1.0e-6,
+            "c/(2 sin(theta/2)) for c=2, theta=10 degrees is 11.4737; got {expected_vertical_radius}"
+        );
+        let measured = chord_radii
+            .get(&vertical)
+            .copied()
+            .expect("the vertical edge is measured");
+        assert!(
+            (measured - expected_vertical_radius).abs() < 1.0e-9,
+            "seam radius {measured} != c/(2 sin(theta/2)) {expected_vertical_radius}"
+        );
+        assert!(
+            (measured.abs() - CHORD).abs() > 1.0,
+            "the seam must not hand the chord length ({CHORD}) on as a radius; got {measured}"
+        );
+
+        // (3) The graph is built from radii, and `compute_setbacks`
+        //     stamps `r * cos(theta_min/2)` with the TRUE radius.
+        let selection: Vec<(EdgeId, BlendRadius)> = [vertical, top]
+            .iter()
+            .map(|&eid| {
+                (
+                    eid,
+                    fillet_type_to_blend_radius(&fillet_type, eid, &chord_radii),
+                )
+            })
+            .collect();
+        let mut graph = blend_graph::build(&mut model, &selection).expect("blend graph builds");
+        blend_graph::compute_setbacks(&model, &mut graph).expect("setbacks compute");
+
+        // theta_min at the shared top vertex is 90 degrees: the
+        // vertical edge's outgoing tangent points down the prism, the
+        // top-cap edge's runs horizontally along the rim.
+        let expected_setback = expected_vertical_radius * (PI / 4.0).cos();
+        let be = graph.edges.get(&vertical).expect("vertical edge in graph");
+        let stamped = be
+            .start_setback
+            .or(be.end_setback)
+            .expect("the 90 degree corner stamps a setback on the vertical edge");
+        assert!(
+            (stamped - expected_setback).abs() < 1.0e-6,
+            "setback must be r*cos(theta_min/2) = {expected_setback} for the TRUE radius \
+             {expected_vertical_radius}; got {stamped}. A value near {} means the raw chord \
+             length reached the graph again.",
+            CHORD * (PI / 4.0).cos()
+        );
+    }
+
+    /// A chord `c` on a 90° box edge is the chord of a circle of
+    /// radius `c / (2 sin 45°) = c/√2`, so `Chord(c)` and
+    /// `Constant(c/√2)` must produce the SAME solid — same face
+    /// count, same volume. The discriminator is the three-edge
+    /// convex corner (F5-α apex sphere): the corner sphere's radius
+    /// and each spine's setback are read from the BlendGraph, which
+    /// is exactly where the raw chord used to be planted. On a
+    /// single isolated edge the graph radius never bites, so this
+    /// test deliberately selects all three edges of one corner.
+    #[test]
+    fn chord_fillet_on_box_edge_matches_equivalent_radius_fillet() {
+        const SIZE: f64 = 10.0;
+        const HALF: f64 = SIZE / 2.0;
+        const CHORD: f64 = 1.0;
+        let equivalent_radius = CHORD / 2.0_f64.sqrt();
+
+        let mut chord_model = BRepModel::new();
+        let chord_solid = build_cube(&mut chord_model, SIZE);
+        let chord_edges = edges_incident_to(
+            &chord_model,
+            vertex_at_position(&chord_model, HALF, HALF, HALF),
+        );
+        assert_eq!(chord_edges.len(), 3, "a box corner has three edges");
+        let chord_faces = fillet_edges(
+            &mut chord_model,
+            chord_solid,
+            chord_edges,
+            corner_fillet_options(FilletType::Chord(CHORD), CHORD),
+        )
+        .expect("chord fillet on a three-edge box corner succeeds");
+
+        let mut radius_model = BRepModel::new();
+        let radius_solid = build_cube(&mut radius_model, SIZE);
+        let radius_edges = edges_incident_to(
+            &radius_model,
+            vertex_at_position(&radius_model, HALF, HALF, HALF),
+        );
+        let radius_faces = fillet_edges(
+            &mut radius_model,
+            radius_solid,
+            radius_edges,
+            corner_fillet_options(FilletType::Constant(equivalent_radius), equivalent_radius),
+        )
+        .expect("equivalent-radius fillet on a three-edge box corner succeeds");
+
+        assert_eq!(
+            chord_faces.len(),
+            radius_faces.len(),
+            "Chord({CHORD}) must produce the same faces as Constant({equivalent_radius})"
+        );
+
+        let chord_volume = chord_model
+            .calculate_solid_volume(chord_solid)
+            .expect("chord solid volume");
+        let radius_volume = radius_model
+            .calculate_solid_volume(radius_solid)
+            .expect("radius solid volume");
+        assert!(
+            (chord_volume - radius_volume).abs() <= 1.0e-9 * radius_volume.abs().max(1.0),
+            "Chord({CHORD}) on a 90° edge must equal Constant({equivalent_radius}); \
+             got chord volume {chord_volume} vs radius volume {radius_volume} \
+             (difference {})",
+            chord_volume - radius_volume
+        );
+    }
+
+    /// The AGENT-REACHABLE chord shape, end to end.
+    ///
+    /// A per-edge chord from the wire
+    /// (`BlendRadiusDto::Chord` inside `per_edge_overrides`) never
+    /// becomes `FilletType::Chord` — `api-server`'s
+    /// `blend_radius_dto_to_edge_profile` and timeline-engine's
+    /// `build_fillet_type_from_overrides` both produce
+    /// `PerEdgeProfile({edge: EdgeFilletProfile::Chord(c)})`. That is
+    /// a DIFFERENT set of arms through the seam, the curvature gate,
+    /// the feasibility loop, the representative-radius fold, the graph
+    /// mapping and the surgery dispatch, and none of them is exercised
+    /// by the top-level `Chord` test above. If the seam failed to
+    /// populate the map for this shape, surgery would refuse with
+    /// `InternalError` and every agent per-edge chord request would
+    /// 500.
+    ///
+    /// All three configurations describe the same geometry on a 90°
+    /// corner (`c` and `c/√2` are the chord and radius of one circle),
+    /// so all three must produce the same solid.
+    #[test]
+    fn per_edge_profile_chord_dispatches_end_to_end_like_the_equivalent_radius() {
+        const SIZE: f64 = 10.0;
+        const HALF: f64 = SIZE / 2.0;
+        const CHORD: f64 = 1.0;
+        let equivalent_radius = CHORD / 2.0_f64.sqrt();
+
+        // Build the corner, fillet it under `make_type`, and report
+        // (produced face count, resulting solid volume).
+        let run = |make_type: &dyn Fn(&[EdgeId]) -> FilletType| -> (usize, f64) {
+            let mut model = BRepModel::new();
+            let solid = build_cube(&mut model, SIZE);
+            let edges = edges_incident_to(&model, vertex_at_position(&model, HALF, HALF, HALF));
+            assert_eq!(edges.len(), 3, "a box corner has three edges");
+            let faces = fillet_edges(
+                &mut model,
+                solid,
+                edges.clone(),
+                corner_fillet_options(make_type(&edges), equivalent_radius),
+            )
+            .expect("three-edge corner fillet succeeds");
+            let volume = model
+                .calculate_solid_volume(solid)
+                .expect("filleted solid volume");
+            (faces.len(), volume)
+        };
+
+        let reference = run(&|_| FilletType::Constant(equivalent_radius));
+        let all_chord = run(&|edges| {
+            FilletType::PerEdgeProfile(
+                edges
+                    .iter()
+                    .map(|&e| (e, EdgeFilletProfile::Chord(CHORD)))
+                    .collect(),
+            )
+        });
+        // A chord profile and a radius profile that describe the same
+        // circle, mixed in one selection — the case
+        // `PerEdgeProfile` exists for.
+        let mixed = run(&|edges| {
+            FilletType::PerEdgeProfile(
+                edges
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &e)| {
+                        let p = if i == 0 {
+                            EdgeFilletProfile::Radius(BlendRadius::Constant(equivalent_radius))
+                        } else {
+                            EdgeFilletProfile::Chord(CHORD)
+                        };
+                        (e, p)
+                    })
+                    .collect(),
+            )
+        });
+
+        for (label, got) in [("all-chord", all_chord), ("chord+radius mix", mixed)] {
+            assert_eq!(
+                got.0, reference.0,
+                "{label} PerEdgeProfile must produce the same faces as \
+                 Constant({equivalent_radius})"
+            );
+            assert!(
+                (got.1 - reference.1).abs() <= 1.0e-9 * reference.1.abs().max(1.0),
+                "{label} PerEdgeProfile with Chord({CHORD}) on 90° edges must equal \
+                 Constant({equivalent_radius}); got volume {} vs {} (difference {})",
+                got.1,
+                reference.1,
+                got.1 - reference.1
+            );
+        }
+    }
+
+    /// **A concave chord edge is a NAMED REFUSAL, not a negative
+    /// radius.**
+    ///
+    /// `compute_face_angle` returns a SIGNED normal-turn angle:
+    /// positive on a convex edge, negative on a concave one. The
+    /// chord formula `c / (2 sin(theta/2))` therefore yields a
+    /// NEGATIVE number on a concave edge - and a negative number is
+    /// not a small radius, it is not a radius at all. Which sign
+    /// convention a concave chord ought to use has never been
+    /// decided in this kernel, so the honest answer is to say so.
+    ///
+    /// Before this fix the negative value flowed on: it reached
+    /// `validate_fillet_parameters` and came back as
+    /// `InvalidRadius(-0.707)`, a message that invites the caller to
+    /// shrink a radius they never asked for; it re-disabled the
+    /// F6-alpha gate through `fold(0.0, f64::max)`; it no-op'd the
+    /// rim pre-filters, which skip on `r > 0.0`; and - worst - it
+    /// made the two request SHAPES disagree. A top-level `Chord`
+    /// selection quietly DROPPED the concave edge in the feasibility
+    /// loop under a "radius overran the available corner room" debug
+    /// line and rounded the rest, while the same geometry sent as
+    /// `PerEdgeProfile` hard-refused, because its representative
+    /// min-fold reads every map entry including the dropped one.
+    /// Both shapes must answer the same way; now both refuse, and
+    /// the refusal names the edge and the measured angle.
+    #[test]
+    fn chord_fillet_on_concave_edge_refuses_by_name() {
+        const LEG: f64 = 40.0;
+        const WALL: f64 = 15.0;
+        const HEIGHT: f64 = 30.0;
+        const CHORD: f64 = 1.0;
+
+        // L-bracket: CCW outline with exactly one reflex corner, at
+        // (WALL, WALL). Its vertical edge is concave.
+        let ring = [
+            (0.0, 0.0),
+            (LEG, 0.0),
+            (LEG, WALL),
+            (WALL, WALL),
+            (WALL, LEG),
+            (0.0, LEG),
+        ];
+        let inside_bottom = Point3::new(WALL, WALL, 0.0);
+        let inside_top = Point3::new(WALL, WALL, HEIGHT);
+        // A convex vertical edge on the same solid, for the
+        // partial-success check below.
+        let convex_bottom = Point3::new(LEG, 0.0, 0.0);
+        let convex_top = Point3::new(LEG, 0.0, HEIGHT);
+
+        // (1) The fixture really is concave - the sign convention this
+        //     refusal depends on is measured, not assumed.
+        {
+            let mut model = BRepModel::new();
+            let solid = extrude_polygon(&mut model, &ring, HEIGHT);
+            let concave = edge_between(&model, inside_bottom, inside_top);
+            let (f1, f2) = get_adjacent_faces(&model, solid, concave).expect("faces");
+            let theta = compute_face_angle(&model, concave, f1, f2).expect("dihedral");
+            assert!(
+                theta < 0.0,
+                "fixture must present a concave (negative signed) dihedral; measured {} degrees",
+                theta.to_degrees()
+            );
+            let convex = edge_between(&model, convex_bottom, convex_top);
+            let (g1, g2) = get_adjacent_faces(&model, solid, convex).expect("faces");
+            let phi = compute_face_angle(&model, convex, g1, g2).expect("dihedral");
+            assert!(
+                phi > 0.0,
+                "the control edge must be convex; measured {} degrees",
+                phi.to_degrees()
+            );
+        }
+
+        // (2) Both request shapes refuse, by name, for the concave
+        //     edge alone.
+        let shapes: [(&str, &dyn Fn(EdgeId) -> FilletType); 2] = [
+            ("top-level Chord", &|_e: EdgeId| FilletType::Chord(CHORD)),
+            ("PerEdgeProfile Chord", &|e: EdgeId| {
+                let mut m = HashMap::new();
+                m.insert(e, EdgeFilletProfile::Chord(CHORD));
+                FilletType::PerEdgeProfile(m)
+            }),
+        ];
+        for (label, make_type) in shapes {
+            let mut model = BRepModel::new();
+            let solid = extrude_polygon(&mut model, &ring, HEIGHT);
+            let concave = edge_between(&model, inside_bottom, inside_top);
+            let (f1, f2) = get_adjacent_faces(&model, solid, concave).expect("faces");
+            let theta = compute_face_angle(&model, concave, f1, f2).expect("dihedral");
+            let result = fillet_edges(
+                &mut model,
+                solid,
+                vec![concave],
+                corner_fillet_options(make_type(concave), CHORD),
+            );
+            match result {
+                Err(OperationError::InvalidGeometry(msg)) => {
+                    assert!(
+                        msg.contains("concave"),
+                        "{label}: the refusal must say the edge is concave; got {msg}"
+                    );
+                    assert!(
+                        msg.contains("undecided"),
+                        "{label}: the refusal must say the sign convention is undecided \
+                         rather than invent one; got {msg}"
+                    );
+                    assert!(
+                        msg.contains(&format!("{concave}")),
+                        "{label}: the refusal must name the offending edge {concave}; got {msg}"
+                    );
+                    // The MEASURED angle, formatted exactly as the
+                    // refusal formats it. Without this the message
+                    // could name a placeholder angle and still pass.
+                    let degrees = format!("{:.6}", theta.to_degrees());
+                    assert!(
+                        msg.contains(&degrees),
+                        "{label}: the refusal must report the measured dihedral {degrees} deg; \
+                         got {msg}"
+                    );
+                    // A `\`-continued literal that rustfmt reflows onto
+                    // one physical line keeps the continuation indent
+                    // INSIDE the string. The source then reads correct
+                    // and the runtime message reads broken - which is
+                    // exactly what happened here once. `concat!` is the
+                    // fix; this is the guard that it stays fixed.
+                    assert!(
+                        !msg.contains("  "),
+                        "{label}: the refusal must not carry fused continuation whitespace; \
+                         got {msg:?}"
+                    );
+                }
+                other => panic!("{label}: expected a named InvalidGeometry refusal, got {other:?}"),
+            }
+        }
+
+        // (3) A mixed selection must NOT partially succeed. This is
+        //     the divergence: the top-level shape used to round the
+        //     convex edge and drop the concave one behind a debug
+        //     line.
+        for (label, make_type) in shapes {
+            let mut model = BRepModel::new();
+            let solid = extrude_polygon(&mut model, &ring, HEIGHT);
+            let concave = edge_between(&model, inside_bottom, inside_top);
+            let convex = edge_between(&model, convex_bottom, convex_top);
+            let ft = match make_type(concave) {
+                FilletType::PerEdgeProfile(mut m) => {
+                    m.insert(convex, EdgeFilletProfile::Chord(CHORD));
+                    FilletType::PerEdgeProfile(m)
+                }
+                other => other,
+            };
+            let result = fillet_edges(
+                &mut model,
+                solid,
+                vec![concave, convex],
+                corner_fillet_options(ft, CHORD),
+            );
+            match result {
+                Err(OperationError::InvalidGeometry(msg)) => assert!(
+                    msg.contains("concave") && msg.contains("undecided"),
+                    "{label} (mixed): expected the concave refusal; got {msg}"
+                ),
+                other => panic!(
+                    "{label} (mixed): a concave chord edge must refuse the whole operation, \
+                     not be dropped so the convex sibling can round; got {other:?}"
+                ),
+            }
+        }
+    }
+
+    /// `Function(|_| 40.0)` on a 10 mm cube asks for a 40 mm radius
+    /// where the shortest neighbouring edge is 10 mm. It must be
+    /// refused with the OFFENDING radius — `InvalidRadius(40.0)`.
+    ///
+    /// The `40.0` in the assertion is load-bearing. Before the fix
+    /// the Function arm of the representative-radius match reported
+    /// `0.0` ("will validate per point" — it never did), so the very
+    /// next `radius <= 0.0` gate refused EVERY function fillet with
+    /// `InvalidRadius(0.0)`. A bare `is_err()` / `matches!(…,
+    /// InvalidRadius(_))` assertion passes on that bug: right verdict,
+    /// wrong reason, and it would keep passing with the sampling
+    /// removed again.
+    #[test]
+    fn function_fillet_exceeding_edge_length_refuses() {
+        const SIZE: f64 = 10.0;
+        const HALF: f64 = SIZE / 2.0;
+
+        let mut model = BRepModel::new();
+        let solid = build_cube(&mut model, SIZE);
+        let edge = edges_incident_to(&model, vertex_at_position(&model, HALF, HALF, HALF))[0];
+
+        let result = fillet_edges(
+            &mut model,
+            solid,
+            vec![edge],
+            corner_fillet_options(
+                FilletType::Function(std::sync::Arc::new(|_: f64| 40.0)),
+                40.0,
+            ),
+        );
+
+        match result {
+            Err(OperationError::InvalidRadius(r)) => assert!(
+                (r - 40.0).abs() < 1.0e-9,
+                "the refusal must name the sampled radius 40.0, not a placeholder; got {r}"
+            ),
+            other => panic!("expected InvalidRadius(40.0), got {other:?}"),
+        }
+    }
+
+    /// A GENUINELY VARYING schedule through the top-level `Function`
+    /// variant, at the `fillet_edges` entry point.
+    ///
+    /// `function_fillet_within_bounds_is_applied` uses `|_| 1.0`,
+    /// which `create_function_radius_fillet` recognises as constant
+    /// within 1 % and diverts to the cylindrical fast path - so it
+    /// proves the GATES let a function through and proves nothing
+    /// about the varying-radius surgery. `|t| 0.5 + t` spans 0.5 mm
+    /// to 1.5 mm (a 3x ratio, far outside the 1 % band), so it takes
+    /// the NURBS `VariableRadiusFillet` path.
+    ///
+    /// The invariant asserted is EQUIVALENCE: `Function(|t| 0.5 + t)`
+    /// and `VariableStations([(0, 0.5), (1, 1.5)])` are the same
+    /// request written two ways, so `fillet_edges` must answer them
+    /// identically - same branch, same message. `VariableStations`
+    /// has always been reachable; the top-level `Function` variant
+    /// was not, because the entry gate refused every function fillet
+    /// with `InvalidRadius(0.0)`. Asserting the two agree is what
+    /// pins the newly-opened path onto the existing one.
+    ///
+    /// **Both currently REFUSE**, and that is recorded here rather
+    /// than papered over: on a box edge the variable-radius surgery
+    /// produces a geometrically open solid and the kernel rolls it
+    /// back (`InvalidBRep`, "36 boundary mesh edge(s)"). Measured
+    /// through the pre-existing `VariableStations` variant on this
+    /// same fixture at both a 3x and a 1.22x radius span, so it is a
+    /// limitation of that surgery, not of this task's change.
+    /// `fillet_variable_radius_spine.rs` covers the spine SAMPLES,
+    /// not full closure through `fillet_edges` - which is why the
+    /// gap was invisible.
+    ///
+    /// The discriminating assertion is the last one: the function
+    /// must fail *in surgery*, not at the entry gate. Before the fix
+    /// it never got that far.
+    #[test]
+    fn varying_function_fillet_matches_the_equivalent_variable_stations() {
+        const SIZE: f64 = 10.0;
+        const HALF: f64 = SIZE / 2.0;
+
+        let run = |ft: FilletType| -> Result<(usize, f64), OperationError> {
+            let mut model = BRepModel::new();
+            let solid = build_cube(&mut model, SIZE);
+            let edge = edges_incident_to(&model, vertex_at_position(&model, HALF, HALF, HALF))[0];
+            let faces = fillet_edges(
+                &mut model,
+                solid,
+                vec![edge],
+                corner_fillet_options(ft, 1.0),
+            )?;
+            let volume = model
+                .calculate_solid_volume(solid)
+                .ok_or_else(|| OperationError::InvalidGeometry("no volume".into()))?;
+            Ok((faces.len(), volume))
+        };
+
+        let from_function = run(FilletType::Function(std::sync::Arc::new(|t: f64| 0.5 + t)));
+        let from_stations = run(FilletType::VariableStations(vec![(0.0, 0.5), (1.0, 1.5)]));
+
+        match (&from_function, &from_stations) {
+            (Ok(f), Ok(v)) => {
+                assert_eq!(
+                    f.0, v.0,
+                    "Function(|t| 0.5+t) and VariableStations([(0,0.5),(1,1.5)]) are the same \
+                     request; they must produce the same faces"
+                );
+                assert!(
+                    (f.1 - v.1).abs() <= 1.0e-9 * v.1.abs().max(1.0),
+                    "same request, same solid: volumes {} vs {}",
+                    f.1,
+                    v.1
+                );
+            }
+            (Err(a), Err(b)) => assert_eq!(
+                format!("{a:?}"),
+                format!("{b:?}"),
+                "the two spellings of one varying schedule must fail the same way"
+            ),
+            (a, b) => panic!(
+                "Function and VariableStations diverged on the same schedule: \
+                 function={a:?}, stations={b:?}"
+            ),
+        }
+
+        // The load-bearing assertion. `InvalidRadius` is the entry
+        // gate; anything else means the request cleared every gate
+        // and reached the varying-radius surgery, which is the whole
+        // point of this fix. A refusal from surgery is honest; a
+        // refusal from the gate would mean `Function` is still dead.
+        if let Err(e) = &from_function {
+            assert!(
+                !matches!(e, OperationError::InvalidRadius(_)),
+                "a varying function whose samples all fit must reach surgery, not be turned \
+                 away by the entry-point radius gate; got {e:?}"
+            );
+        }
+    }
+
+    /// The positive control for the test above: a function whose
+    /// samples all fit must be APPLIED, not refused. Without this,
+    /// `function_fillet_exceeding_edge_length_refuses` is satisfied
+    /// by a kernel that refuses every function fillet.
+    #[test]
+    fn function_fillet_within_bounds_is_applied() {
+        const SIZE: f64 = 10.0;
+        const HALF: f64 = SIZE / 2.0;
+
+        let mut model = BRepModel::new();
+        let solid = build_cube(&mut model, SIZE);
+        let edge = edges_incident_to(&model, vertex_at_position(&model, HALF, HALF, HALF))[0];
+
+        let faces = fillet_edges(
+            &mut model,
+            solid,
+            vec![edge],
+            corner_fillet_options(FilletType::Function(std::sync::Arc::new(|_: f64| 1.0)), 1.0),
+        )
+        .expect("a function fillet whose every sample fits must be applied");
+        assert!(
+            !faces.is_empty(),
+            "an applied fillet returns at least one new face"
         );
     }
 }

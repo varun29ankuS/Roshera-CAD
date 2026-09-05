@@ -399,10 +399,17 @@ pub(crate) fn build_fillet_type_from_overrides(
 /// [`EdgeFilletProfile`] shape used inside `PerEdgeProfile`. The
 /// three radius-schedule DTO variants wrap into
 /// `EdgeFilletProfile::Radius(BlendRadius::*)`; the F5-β.5.7
-/// `Chord` DTO maps to `EdgeFilletProfile::Chord` so the raw
-/// chord length survives intact to surgery time, where
-/// `create_chord_fillet` converts it to a per-edge radius with
-/// the local dihedral.
+/// `Chord` DTO maps to `EdgeFilletProfile::Chord`, which carries the
+/// raw chord length across the wire boundary unchanged.
+///
+/// The kernel converts it on ENTRY, not at surgery time: `fillet_edges`
+/// resolves every chord to a radius with the edge's measured dihedral
+/// (`resolve_chord_radii`) before the blend graph or any gate runs, and
+/// refuses by name when the edge is concave or tangent-flat. (Until
+/// 2026-09-03 the conversion lived in a `create_chord_fillet` helper
+/// called during surgery, so the raw chord reached the blend graph as
+/// if it were a radius; that helper no longer exists.) Nothing changes
+/// on this side of the boundary - the DTO still carries `c`.
 fn blend_radius_dto_to_edge_profile(dto: &BlendRadiusDto) -> EdgeFilletProfile {
     match dto {
         BlendRadiusDto::Constant(r) => EdgeFilletProfile::Radius(BlendRadius::Constant(*r)),
@@ -417,9 +424,21 @@ fn blend_radius_dto_to_edge_profile(dto: &BlendRadiusDto) -> EdgeFilletProfile {
     }
 }
 
-/// Compute the conservative upper-bound radius across the
-/// default profile and every per-edge override. Used to seed
-/// `FilletOptions.radius` (the F6-α curvature budget bound).
+/// Compute the conservative upper-bound dimension across the default
+/// profile and every per-edge override, and seed `FilletOptions.radius`
+/// with it.
+///
+/// **This is not the F6-α curvature budget.** That gate reads
+/// `FilletOptions.fillet_type` and derives its own per-edge bound -
+/// including, since 2026-09-03, the measured radius of every chord.
+/// `FilletOptions.radius` is the kernel's convenience scalar: the
+/// `Constant` fast path uses it, `validate_fillet_inputs` checks it
+/// exceeds tolerance, and every per-edge shape reads it ONLY as a
+/// defensive fallback for a map key that validation has already
+/// guaranteed present. A `Chord` override contributes its raw chord
+/// length to this fold, which is a dimension in the right units and
+/// the wrong quantity - harmless precisely because no gate downstream
+/// consumes it as a radius.
 pub(crate) fn max_radius_across(
     default_radius: &BlendRadiusDto,
     per_edge_overrides: &Option<HashMap<EntityId, BlendRadiusDto>>,

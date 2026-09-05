@@ -98,21 +98,26 @@ impl BlendRadius {
 pub enum EdgeFilletProfile {
     /// Radius schedule along the edge (Constant / Linear / Variable).
     Radius(BlendRadius),
-    /// Chord length. Local dihedral converts chord → radius at
-    /// surgery time inside `create_chord_fillet`; this variant
-    /// stays raw so the conversion is applied per-edge with the
-    /// actual edge geometry, not the global selection.
+    /// Chord length. The variant stays raw on the *request* so the
+    /// conversion can be applied per-edge with the actual edge
+    /// geometry rather than a global selection; `fillet_edges`
+    /// converts it to the true radius `c / (2 sin(θ/2))` at its
+    /// `resolve_chord_radii` seam, before any [`BlendGraph`] is
+    /// built. Nothing in this module is ever handed a chord.
     Chord(f64),
 }
 
 impl EdgeFilletProfile {
     /// Conservative *upper bound* on radius produced by this
-    /// profile. Used by the F6-α curvature gate. For `Chord`
-    /// we cannot bound the resulting radius without the local
-    /// dihedral (radius → ∞ as dihedral → 0), so we return 0.0
-    /// which makes the F6-α gate a no-op for chord profiles —
-    /// matching the existing top-level `FilletType::Chord(_)`
-    /// behaviour.
+    /// profile. For `Radius(_)` this is the schedule's
+    /// `max_value()`. For `Chord` no bound exists here — the radius
+    /// depends on the edge's dihedral (`r → ∞ as θ → 0`), which this
+    /// type does not carry — so it reports 0.0 and callers that need
+    /// a chord's bound read the measured radius from `fillet_edges`'
+    /// `resolve_chord_radii` map instead. Returning 0.0 is a refusal
+    /// to guess, not a licence to skip the gate; the F6-α curvature
+    /// gate in `fillet_edges` bypasses this method for `Chord`
+    /// entries for exactly that reason.
     pub fn max_radius_bound(&self) -> f64 {
         match self {
             EdgeFilletProfile::Radius(b) => b.max_value(),

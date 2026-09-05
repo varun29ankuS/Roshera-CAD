@@ -464,8 +464,9 @@ pub enum BlendRadiusDto {
     /// Explicit `(station, radius)` control points along `u ∈ [0, 1]`.
     Variable(Vec<(f64, f64)>),
     /// Chord-length fillet. The cap-to-cap chord distance `c` is
-    /// converted to a per-edge radius at surgery time using the local
-    /// dihedral; this DTO holds the raw `c` value. F5-β.5.7 adds this
+    /// converted to a per-edge radius by the kernel on entry to
+    /// `fillet_edges`, using the dihedral measured at each edge's
+    /// midpoint; this DTO holds the raw `c` value. F5-β.5.7 adds this
     /// variant so per-edge profile overrides can mix radius-schedule
     /// entries (`Constant` / `Linear` / `Variable`) with chord
     /// entries on a single fillet operation.
@@ -484,13 +485,18 @@ impl BlendRadiusDto {
             BlendRadiusDto::Variable(samples) => {
                 samples.iter().map(|&(_, r)| r).fold(0.0_f64, f64::max)
             }
-            // Chord's resulting radius depends on the local dihedral
-            // and cannot be bounded here without that context. Report
-            // the chord value itself as a placeholder — same shape as
-            // the kernel's `FilletType::Chord(c) => BlendRadius::
-            // Constant(*c)` mapping. Upstream gates that need a true
-            // radius bound (e.g. F6-α curvature check) skip chord
-            // entries; the chord positivity gate lives in `validate`.
+            // Chord's resulting radius depends on the edge's dihedral
+            // and cannot be bounded here without that context, so this
+            // reports the chord value itself.
+            //
+            // It is NOT a radius, and since 2026-09-03 nothing treats
+            // it as one. The kernel converts every chord to a radius at
+            // its `resolve_chord_radii` entry seam and gates on THAT
+            // (the F6-α curvature check included — it no longer skips
+            // chord entries). This value survives only as the seed for
+            // `FilletOptions.radius`, the convenience scalar the chord
+            // paths read solely as a missing-key fallback; the chord
+            // positivity gate lives in `validate`.
             BlendRadiusDto::Chord(c) => *c,
         }
     }

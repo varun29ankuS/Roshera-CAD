@@ -2857,13 +2857,15 @@ async fn fillet_edges_endpoint(
     //     failure leaves the solid partially filleted.
     // The DTO → `FilletType` translation is performed inside this
     // model-lock scope via `radii_parsed.to_fillet_type(i)` rather than
-    // up-front. Rationale: `FilletType::Function(Box<dyn Fn>)` is
-    // `!Send`, so a future that held a `Vec<FilletType>` across the
-    // `model_handle.write().await` above would fail the axum `Handler`
-    // bound. `BlendRadiusDto` is `Send + Sync`, so the parser's
-    // `profiles` field crosses the await safely; the translation to
-    // the kernel dispatch shape happens immediately before the kernel
-    // call, never across a yield point.
+    // up-front. Rationale: `BlendRadiusDto` is purely owned wire data,
+    // so the parser's `profiles` field is what the canonical-JSON and
+    // fast-path decisions read; the kernel dispatch shape is built
+    // immediately before the kernel call and never held across a yield
+    // point. (This was additionally FORCED until 2026-09-03, when
+    // `FilletType::Function` held a bare `Box<dyn Fn>` and made
+    // `FilletType` `!Send`; it is now `Arc<… + Send + Sync>`, so the
+    // ordering is a design choice rather than a trait-bound
+    // requirement.)
     {
         let mut model = model_handle.write().await;
         timeline_engine::recorder_bridge::ACK_UNSOUND_OVERRIDE.sync_scope(

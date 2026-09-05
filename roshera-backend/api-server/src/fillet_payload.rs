@@ -84,16 +84,20 @@ use timeline_engine::BlendRadiusDto;
 /// `edges` array on the request.
 ///
 /// # Why we hold `BlendRadiusDto`, not `FilletType`
-///
-/// `FilletType::Function(Box<dyn Fn(f64) -> f64>)` is `!Send + !Sync`,
-/// so any future that holds `Vec<FilletType>` across an `.await`
-/// fails the axum `Handler` trait bound. The kernel parser path only
-/// ever produces three concrete variants (`Constant`, `Linear`,
-/// `Variable(samples)`), which `BlendRadiusDto` represents
-/// exhaustively — and `BlendRadiusDto` is `Send + Sync` because it's
-/// purely owned data. Callers translate via
-/// [`to_fillet_type`](FilletRadii::to_fillet_type) inside the
-/// model-lock scope, immediately before the kernel call.
+/// `FilletType` carries a radius CLOSURE
+/// (`Function(Arc<dyn Fn(f64) -> f64 + Send + Sync>)`) that no wire
+/// format can round-trip, and the parser path only ever produces four
+/// concrete data variants (`Constant`, `Linear`, `Variable(samples)`,
+/// `Chord`), which `BlendRadiusDto` represents exhaustively. Holding
+/// the DTO keeps the parsed request purely owned data — serialisable,
+/// comparable, and canonicalisable into `canonical_per_edge` — while
+/// the kernel dispatch shape is built only where it is used. Callers
+/// translate via [`to_fillet_type`](FilletRadii::to_fillet_type)
+/// inside the model-lock scope, immediately before the kernel call.
+/// (Before 2026-09-03 the `Function` variant held a bare `Box<dyn
+/// Fn>`, making `FilletType` `!Send + !Sync` and the translation
+/// mandatory rather than merely correct; the `Arc<… + Send + Sync>`
+/// that made `Clone` honest also removed that hard constraint.)
 #[derive(Debug, Clone)]
 pub struct FilletRadii {
     /// One validated `BlendRadiusDto` per edge, parallel to `edges`.
@@ -255,10 +259,17 @@ impl FilletRadii {
 /// helper at `timeline-engine/src/operations/fillet.rs:404`: the
 /// three radius-schedule DTO variants wrap into
 /// `EdgeFilletProfile::Radius(BlendRadius::*)`; the `Chord` DTO
-/// maps to `EdgeFilletProfile::Chord` so the raw chord length
-/// survives intact to surgery time. Duplicated here to keep
+/// maps to `EdgeFilletProfile::Chord`, which carries the raw chord
+/// length across the wire boundary unchanged. Duplicated here to keep
 /// `fillet_payload` independent of timeline-engine internals —
 /// the function is a pure pattern match with no shared state.
+///
+/// The chord does NOT survive to surgery: `fillet_edges` converts it
+/// to a radius on entry, from the dihedral measured at the edge
+/// midpoint, before the blend graph or any gate runs, and refuses by
+/// name when the edge is concave or tangent-flat. A per-edge chord
+/// request can therefore now be rejected with `InvalidGeometry` /
+/// `RadiusExceedsCurvature` where it previously reached surgery.
 fn blend_radius_dto_to_edge_profile(dto: &BlendRadiusDto) -> EdgeFilletProfile {
     match dto {
         BlendRadiusDto::Constant(r) => EdgeFilletProfile::Radius(BlendRadius::Constant(*r)),
