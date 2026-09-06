@@ -64,7 +64,7 @@
 use crate::interference::{instance_convex_pieces, instance_isometry, instance_trimesh};
 use crate::joint::{set_joint, Joint};
 use crate::motion::{DriveParam, DriveRefusal};
-use crate::types::{Assembly, InstanceId};
+use crate::types::{Assembly, InstanceId, MateKind};
 use parry3d_f64::na::{Isometry3, Point3, Vector3};
 use parry3d_f64::query::{self, NonlinearRigidMotion};
 use parry3d_f64::shape::{ConvexPolyhedron, TriMesh};
@@ -105,6 +105,13 @@ pub enum SweepMethod {
     /// Parry nonlinear time-of-impact between consecutive samples
     /// (continuous — no tunneling), plus the sampled clearance profile.
     NonlinearToi { samples: usize },
+    /// NOTHING RAN. The fact carries a [`SweepRefusal`], so no method was
+    /// applied at all — and saying so is the point: a refused fact used to
+    /// report `NonlinearToi { samples: 0 }`, which names a method that
+    /// never executed. Zero samples of a continuous method is not a weak
+    /// measurement, it is the absence of one, and this is the value that
+    /// says which. Additive on the wire (`{"method":"not_run"}`).
+    NotRun,
 }
 
 /// Where a swept fact's motion came from.
@@ -117,6 +124,18 @@ pub enum SweepSource {
     /// A joint DERIVED from a mate's own free parameter — nothing is
     /// authored, so nothing can be authored wrong.
     DrivenMate { mate_index: u32, param: DriveParam },
+    /// A freedom a mate's KIND grants that no (θ, s) drive parameter can
+    /// name (`Planar`, `Ball`, `PinSlot` — see
+    /// [`MateKind::grants_undriveable_freedom`]). There is no driven
+    /// motion to attribute the fact to, so it is attributed to the mate
+    /// itself: the freedom is real, and it is why nothing was swept.
+    MateFreedom { mate_index: u32 },
+    /// A mate this wire cannot NAME: its declaration index does not fit
+    /// the `u32` every `mate_index` field on this surface is typed as.
+    /// Nothing about its motion can be reported except that the mate
+    /// exists and nothing swept it — which is still more than the silent
+    /// `continue` this replaces.
+    UnnameableMate { mate_index: usize },
 }
 
 /// A point on the driven motion — what makes an interference fact
@@ -163,7 +182,7 @@ pub struct InterferenceFact {
 /// pairwise check lands in `interference_unverified` rather than riding
 /// `no_static_interference`. The two facts are told apart by `refusal`
 /// itself, never by folding one into the other.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "refusal", rename_all = "snake_case")]
 pub enum SweepRefusal {
     /// A translational joint with no declared limits has unbounded travel:
@@ -171,6 +190,56 @@ pub enum SweepRefusal {
     /// the motion is uncertified — never an invented range, never a silent
     /// skip. (Rotation needs no limits: a full turn is compact.)
     UnboundedTravel { mate_index: u32, param: DriveParam },
+    /// The mate GRANTS a relative freedom the derived sweep cannot drive:
+    /// the kind's free motion is not spanned by the frame's (θ, s)
+    /// parameters, so there is no parameter to walk and no range to sweep
+    /// (`Planar`, `Ball`, `PinSlot` — the table is on
+    /// [`MateKind::grants_undriveable_freedom`]).
+    ///
+    /// This is the audit-2026-09-03 task-41 refusal. The freedom used to
+    /// be `continue`d over: never swept AND never named, so
+    /// `swept_clearance_ok` read `true` about motions no check had run
+    /// on. An undriveable freedom is not an absent one.
+    ///
+    /// Not to be confused with [`DriveRefusal::NotDriveable`], which
+    /// shares the name at a DIFFERENT level. That one answers a drive
+    /// REQUEST: "this enforced mate exposes no such scalar parameter",
+    /// per (mate, param). This one is a property of the KIND, before any
+    /// request: "no drive parameter of any kind names this freedom". A
+    /// mate can produce this refusal without anyone ever asking to drive
+    /// it — that is precisely why it exists.
+    NotDriveable { mate_index: u32, kind: MateKind },
+    /// A dimensional overlay (`Distance`, `Angle`, `Parallel`, `Tangent`)
+    /// holding a pair that NO enforced joint mate holds — so the pair's
+    /// remaining freedom is the whole picture and nothing sweeps it.
+    ///
+    /// The overlay itself grants no motion; it removes a scalar. The
+    /// refusal is about what is missing around it, which is why it is a
+    /// separate variant from [`Self::NotDriveable`]: the remedy is to
+    /// declare the joint that actually holds the pair, not to find a
+    /// driver for a freedom the taxonomy cannot express. An overlay
+    /// riding a real joint produces nothing — see
+    /// [`crate::types::Assembly::pair_freedom_is_accounted_for`].
+    OverlayWithoutJoint { mate_index: u32, kind: MateKind },
+    /// The mate's declaration index does not fit the `u32` this wire
+    /// types every `mate_index` as, so its freedom cannot even be
+    /// addressed — let alone swept. Structurally unreachable below
+    /// `u32::MAX` mates; recorded rather than skipped because a `continue`
+    /// here would be the same unrun-check-as-a-pass this task closed
+    /// everywhere else.
+    MateIndexUnrepresentable { mate_index: usize },
+    /// The sweep asked the drag surface to drive this parameter and the
+    /// drive REFUSED (unknown mate, an unenforced one, or joint
+    /// parameters that cannot be read at all) — so the range was never
+    /// walked.
+    ///
+    /// The refusal is carried verbatim rather than re-worded: the sweep
+    /// and the drag tell one story about why a joint could not be moved.
+    DriveRefused {
+        mate_index: u32,
+        param: DriveParam,
+        drive_refusal: DriveRefusal,
+    },
 }
 
 /// One certified statement about one motion.
@@ -208,7 +277,7 @@ pub struct SweptFact {
 /// and [`crate::mate_contact::UnverifiedMate`]: an unrun check is never
 /// folded into a pass, so a non-empty list of these is why the certificate's
 /// `swept_clearance_ok` reads `false`.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UnverifiedSweep {
     /// The motion that was not swept.
     pub source: SweepSource,
@@ -219,11 +288,17 @@ pub struct UnverifiedSweep {
 impl SweptFact {
     /// A refused sweep: nothing swept, so nothing proven — `clear: false`,
     /// with the reason carried.
+    ///
+    /// The method is [`SweepMethod::NotRun`], not `NonlinearToi { samples:
+    /// 0 }`. The old value named a method that never executed; zero
+    /// samples of a continuous method is the ABSENCE of a measurement, not
+    /// a weak one, and a fact that says so cannot be misread as a thin
+    /// sweep.
     fn refused(source: SweepSource, epsilon: f64, refusal: SweepRefusal) -> Self {
         Self {
             source,
             range: (0.0, 0.0),
-            method: SweepMethod::NonlinearToi { samples: 0 },
+            method: SweepMethod::NotRun,
             clear: false,
             min_certified_clearance: None,
             epsilon,
@@ -233,6 +308,27 @@ impl SweptFact {
             refusal: Some(refusal),
         }
     }
+}
+
+/// The mate's declaration index as this wire types it, or the FACT that
+/// says it cannot be named at all.
+///
+/// Split out of [`Assembly::derived_sweeps`]'s loop so the branch is
+/// reachable from a test: an index above `u32::MAX` needs four billion
+/// mates to reach through the assembly, and the certificate must still be
+/// honest about a mate it cannot address.
+///
+/// The `Err` is boxed because a `SweptFact` is a large value on an arm
+/// that is effectively never taken (`clippy::result_large_err`); the
+/// caller unboxes it straight into the fact list.
+fn nameable_index(mate_index: usize, epsilon: f64) -> Result<u32, Box<SweptFact>> {
+    u32::try_from(mate_index).map_err(|_| {
+        Box::new(SweptFact::refused(
+            SweepSource::UnnameableMate { mate_index },
+            epsilon,
+            SweepRefusal::MateIndexUnrepresentable { mate_index },
+        ))
+    })
 }
 
 /// The exact rigid SCREW carrying `from` to `to`, as a Parry nonlinear
@@ -856,6 +952,44 @@ impl Assembly {
     /// * translation with limits ⇒ the limit band; without ⇒ REFUSED,
     ///   because unbounded travel has no finite range to certify and
     ///   inventing one would be a lie.
+    ///
+    /// # Every freedom leaves a fact (audit 2026-09-03, task 41)
+    ///
+    /// A mate's freedom leaves this function in one of these shapes, and
+    /// no path silently returns nothing:
+    ///
+    /// * SWEPT — the (θ, s) drive walks the range and the fact carries the
+    ///   verdict;
+    /// * REFUSED because the range is not finite
+    ///   ([`SweepRefusal::UnboundedTravel`]) or the drive itself said no
+    ///   ([`SweepRefusal::DriveRefused`]);
+    /// * REFUSED because no drive parameter names the freedom at all
+    ///   ([`SweepRefusal::NotDriveable`] — `Planar`, `Ball`, `PinSlot`);
+    /// * REFUSED because a dimensional overlay is holding a pair no joint
+    ///   holds ([`SweepRefusal::OverlayWithoutJoint`]);
+    /// * REFUSED because the mate's index cannot be named on this wire
+    ///   ([`SweepRefusal::MateIndexUnrepresentable`]).
+    ///
+    /// Producing NO fact means, and only means, that the mate has no
+    /// freedom of its own for this function to speak about: a rigid kind
+    /// (`Fastened`, `Fixed`), a coupling (it relates OTHER mates'
+    /// parameters, and the motion it shapes is swept through the base
+    /// joint), an unenforced kind (`Cam`, `Path`, `Symmetric` — refused by
+    /// name in `mates_enforced`), or an overlay riding a joint that has
+    /// already accounted for the pair.
+    ///
+    /// # The one stated exception
+    ///
+    /// The legacy Face/Axis kinds — `Coincident` (3 DOF free) and
+    /// `Concentric` (2 DOF free) — DO carry freedom that this function
+    /// neither sweeps nor names. That is a **decision, stated**, not an
+    /// oversight of the contract above: the reasoning, and what it would
+    /// cost to reverse, are recorded on
+    /// [`MateKind::grants_undriveable_freedom`]. Until it is reversed,
+    /// `swept_clearance_ok` is silent about the motion of a pair held only
+    /// by a legacy mate.
+    ///
+    /// The full table is on [`MateKind::grants_undriveable_freedom`].
     pub(crate) fn derived_sweeps(&self, epsilon: f64) -> Vec<SweptFact> {
         use std::f64::consts::TAU;
         /// Samples per derived sweep. TOI covers the continuum BETWEEN
@@ -863,14 +997,58 @@ impl Assembly {
         /// and of the re-solve grid — not whether a hit is found.
         const DERIVED_SAMPLES: usize = 25;
 
+        // One pass, read by the overlay condition below; recomputing it per
+        // mate would make this quadratic for no gain.
+        let enforcement = self.mate_enforcement_report();
+
         let mut facts = Vec::new();
-        for mate_index in 0..self.mates.len() {
-            let Ok(index) = u32::try_from(mate_index) else {
-                continue;
+        for (mate_index, mate) in self.mates.iter().enumerate() {
+            let index = match nameable_index(mate_index, epsilon) {
+                Ok(index) => index,
+                Err(fact) => {
+                    facts.push(*fact);
+                    continue;
+                }
             };
+            // The freedom no drive parameter can name. Skipping it was the
+            // task-41 defect: unswept AND unnamed, so `swept_clearance_ok`
+            // spoke for a motion nothing had looked at.
+            if mate.kind.grants_undriveable_freedom() {
+                facts.push(SweptFact::refused(
+                    SweepSource::MateFreedom { mate_index: index },
+                    epsilon,
+                    SweepRefusal::NotDriveable {
+                        mate_index: index,
+                        kind: mate.kind,
+                    },
+                ));
+            } else if mate.kind.is_dimensional_overlay()
+                && !self.pair_freedom_is_accounted_for(mate_index, &enforcement)
+            {
+                // An overlay REMOVES a scalar; it never grants motion. That
+                // is only harmless while a joint holds the pair — and
+                // nothing requires one to. A lone enforced `Distance`
+                // leaves 5 DOF that nothing sweeps.
+                facts.push(SweptFact::refused(
+                    SweepSource::MateFreedom { mate_index: index },
+                    epsilon,
+                    SweepRefusal::OverlayWithoutJoint {
+                        mate_index: index,
+                        kind: mate.kind,
+                    },
+                ));
+            }
             for param in [DriveParam::Rotation, DriveParam::Translation] {
-                let Some(limits) = self.driveable_limits(index, param) else {
-                    continue; // not a driveable parameter of this kind
+                // The KIND decides whether this parameter is one of its
+                // freedoms; whether this MATE can actually be driven is
+                // the drag surface's answer, below, so the two can never
+                // disagree about a joint they both see.
+                let Some(limits) = mate.kind.drive_limits(param) else {
+                    // Not one of this kind's (θ, s) freedoms. Every kind
+                    // this fires for is accounted for above, or has no
+                    // freedom to account for, or is the stated legacy
+                    // exception — see this function's doc.
+                    continue;
                 };
                 let source = SweepSource::DrivenMate {
                     mate_index: index,
@@ -891,17 +1069,24 @@ impl Assembly {
                         continue;
                     }
                 };
-                // An `Err` here is a `DriveRefusal` from `prepare_drive`, and
-                // it cannot reach a SOUND certificate today: every mate whose
-                // drive setup refuses is also one `is_numerically_enforced()`
-                // rejects, so `mates_enforced` is already false and
-                // `is_sound()` already fails. That guard is a COINCIDENCE
-                // between two predicates, not a stated invariant — if the two
-                // sets ever diverge, this arm becomes the same unrun-check-
-                // folded-into-a-pass defect the refusal path above just fixed,
-                // and it needs its own `unverified_sweeps` entry.
-                if let Ok(fact) = self.sweep_driven(index, param, range, DERIVED_SAMPLES, epsilon) {
-                    facts.push(fact);
+                match self.sweep_driven(index, param, range, DERIVED_SAMPLES, epsilon) {
+                    Ok(fact) => facts.push(fact),
+                    // The drive refused, so the range was never walked.
+                    // This used to be dropped, defended by a COINCIDENCE:
+                    // every mate whose drive refuses also fails
+                    // `is_numerically_enforced`, so `mates_enforced` was
+                    // already false and the certificate already unsound.
+                    // A verdict must not rest on two predicates happening
+                    // to agree — the refusal now rides its own dimension.
+                    Err(drive_refusal) => facts.push(SweptFact::refused(
+                        source,
+                        epsilon,
+                        SweepRefusal::DriveRefused {
+                            mate_index: index,
+                            param,
+                            drive_refusal,
+                        },
+                    )),
                 }
             }
         }
@@ -1100,5 +1285,53 @@ mod tests {
                 "t={t}: the screw left the arc (radius {radius})"
             );
         }
+    }
+
+    /// The `u32::try_from` branch in `derived_sweeps` is not reachable
+    /// through the assembly (it needs four billion mates), so the honest
+    /// gate is on the helper the loop actually calls. `usize` is wider
+    /// than `u32` only on 64-bit targets, which is where this can arise.
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn a_mate_this_wire_cannot_name_still_leaves_a_fact() {
+        let too_wide = u32::MAX as usize + 1;
+        let Err(fact) = nameable_index(too_wide, 0.01) else {
+            assert!(false, "an index above u32::MAX cannot be named");
+            return;
+        };
+        let fact = *fact;
+        assert_eq!(
+            fact.source,
+            SweepSource::UnnameableMate {
+                mate_index: too_wide
+            }
+        );
+        assert_eq!(
+            fact.refusal,
+            Some(SweepRefusal::MateIndexUnrepresentable {
+                mate_index: too_wide
+            })
+        );
+        assert!(!fact.clear, "an unnamed mate was not swept: {fact:?}");
+        assert_eq!(
+            fact.method,
+            SweepMethod::NotRun,
+            "and no method ran on it: {fact:?}"
+        );
+        // Both new fields are `usize`, which is the one width on this wire
+        // that is not a `u32` — measure it rather than assume it.
+        let json = serde_json::to_string(&fact);
+        let Ok(json) = json else {
+            assert!(false, "the fact serialises: {json:?}");
+            return;
+        };
+        let parsed: Result<SweptFact, _> = serde_json::from_str(&json);
+        assert_eq!(
+            parsed.ok(),
+            Some(fact),
+            "and an unnameable mate's fact crosses the wire intact"
+        );
+        // The representable case is untouched.
+        assert_eq!(nameable_index(7, 0.01).ok(), Some(7));
     }
 }

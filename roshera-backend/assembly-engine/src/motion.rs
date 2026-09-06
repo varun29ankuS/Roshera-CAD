@@ -49,6 +49,7 @@
 //! Newton — Solà, Deray & Atchuthan, arXiv:1812.01537.
 
 use crate::jacobian::{residual_for_driven, wrap_to_pi, BodyBlock, DriveRow};
+use crate::mate_residual::MateEnforcementReport;
 use crate::solver::{
     gauss_newton_driven, production_jacobian, residual_norm, SolveReport, SOLVE_TOL,
 };
@@ -211,7 +212,7 @@ impl MateKind {
     ///
     /// Refusing is the point: a kind whose freedom (θ, s) cannot express
     /// must say so, never silently drive an approximation of it.
-    fn drive_limits(&self, param: DriveParam) -> Option<Option<(f64, f64)>> {
+    pub(crate) fn drive_limits(&self, param: DriveParam) -> Option<Option<(f64, f64)>> {
         match (self, param) {
             (MateKind::Revolute { limits }, DriveParam::Rotation) => Some(*limits),
             (MateKind::Slider { limits }, DriveParam::Translation) => Some(*limits),
@@ -221,6 +222,112 @@ impl MateKind {
             }
             _ => None,
         }
+    }
+
+    /// This kind GRANTS a relative freedom that [`Self::drive_limits`]
+    /// cannot express — so a derived sweep can never run over it, and the
+    /// certificate must NAME it rather than skip it (audit 2026-09-03,
+    /// task 41).
+    ///
+    /// # The freedom table
+    ///
+    /// Every kind falls in exactly one of four classes, and only the third
+    /// answers `true`:
+    ///
+    /// 1. **No freedom** — `Fastened`, `Fixed` (rank 6). A rigid mate has
+    ///    nothing to sweep, so it has nothing to leave unswept. This is
+    ///    the load-bearing exclusion: were it `true` here, every bolted
+    ///    assembly in the product would certify unsound.
+    /// 2. **Freedom spanned by (θ, s)** — `Revolute` {θ}, `Slider` {s},
+    ///    `Cylindrical` {θ, s}. The derived sweep DRIVES these; a range it
+    ///    cannot bound refuses as [`crate::sweep::SweepRefusal::
+    ///    UnboundedTravel`] and a drive the mate refuses refuses as
+    ///    `DriveRefused`. Either way the motion is accounted for.
+    /// 3. **Freedom NOT spanned by (θ, s)** — `Planar` {x, y, θ}, `Ball`
+    ///    {3 rotations}, `PinSlot` {pin spin, slot travel}. The kind
+    ///    grants motion the drive cannot express (see
+    ///    [`Self::undriveable_reason`] for each), so nothing is swept and
+    ///    nothing ever will be until a driver for that freedom exists.
+    ///    These are the entries this predicate exists to produce.
+    /// 4. **Grants no freedom of its own** — the couplings (`GearRatio`,
+    ///    `RackPinion`, `Screw`) remove a scalar from OTHER mates'
+    ///    parameters, and the motion they shape is swept through the base
+    ///    joint they couple. The honest-refuse set (`Cam`, `Path`,
+    ///    `Symmetric`) is not numerically enforced at all — it constrains
+    ///    nothing, and `mates_enforced` already refuses it by name.
+    /// 5. **CONDITIONAL — the dimensional overlays** (`Distance`, `Angle`,
+    ///    `Parallel`, `Tangent`). Each REMOVES one or two scalars rather
+    ///    than granting a motion, so an overlay riding a real joint needs
+    ///    no entry: the joint's own freedom is already swept or already
+    ///    listed. But nothing requires a joint to be there. An overlay is
+    ///    enforced over Frame/Frame features on its own
+    ///    (`mate_residual::features_match_kind`'s `_` arm), so a
+    ///    `Distance` mate declared ALONE between two parts is enforced,
+    ///    consumes rank 1, leaves 5 DOF, and is agent-reachable — and no
+    ///    predicate on the KIND can tell the two situations apart. The
+    ///    condition therefore lives on the ASSEMBLY, in
+    ///    [`crate::types::Assembly::pair_freedom_is_accounted_for`], and
+    ///    this predicate answers `false` for every overlay. See
+    ///    [`Self::is_dimensional_overlay`] and
+    ///    [`Self::accounts_for_pair_freedom`].
+    ///
+    /// The legacy Face/Axis kinds (`Coincident` rank 3, `Concentric` rank
+    /// 4) DO grant unswept freedom, and are excluded — **a decision,
+    /// stated, not an oversight**: they carry no connector frame, so no
+    /// driver for them can exist without a re-declaration as a frame-pair
+    /// joint, and listing them would make every legacy assembly
+    /// permanently unsound with no path out. That is a product decision,
+    /// not an audit fix, so the gap is named here rather than forgotten.
+    /// It is also why they are absent from
+    /// [`Self::accounts_for_pair_freedom`]: a pair held only by a legacy
+    /// kind has freedom that is neither swept nor listed, so it cannot
+    /// excuse an overlay riding on it either.
+    pub(crate) fn grants_undriveable_freedom(&self) -> bool {
+        matches!(
+            self,
+            MateKind::Planar | MateKind::Ball | MateKind::PinSlot { .. }
+        )
+    }
+
+    /// A DIMENSIONAL OVERLAY: a kind that constrains a scalar of the pair's
+    /// relative pose (a distance, an angle, a parallelism, a tangency)
+    /// rather than defining the joint that holds them. Class 5 of the
+    /// freedom table on [`Self::grants_undriveable_freedom`].
+    pub(crate) fn is_dimensional_overlay(&self) -> bool {
+        matches!(
+            self,
+            MateKind::Distance { .. }
+                | MateKind::Angle { .. }
+                | MateKind::Parallel
+                | MateKind::Tangent { .. }
+        )
+    }
+
+    /// This kind, holding a pair, leaves that pair's freedom ACCOUNTED FOR
+    /// — so an overlay declared on the same pair needs no entry of its own.
+    ///
+    /// Accounted for means one of exactly two things, and nothing else
+    /// qualifies:
+    ///
+    /// * there is no freedom (`Fastened`, `Fixed` — rank 6); or
+    /// * the freedom is either SWEPT (`Revolute`, `Slider`, `Cylindrical`)
+    ///   or LISTED as an unverified sweep (`Planar`, `Ball`, `PinSlot` —
+    ///   [`Self::grants_undriveable_freedom`]).
+    ///
+    /// The legacy `Coincident` / `Concentric` are deliberately NOT here:
+    /// their freedom is neither swept nor listed (the carve-out above), so
+    /// a pair held only by one of them accounts for nothing and an overlay
+    /// on it still refuses. The couplings are not here either — they hold
+    /// no pair, they relate other mates' parameters.
+    pub(crate) fn accounts_for_pair_freedom(&self) -> bool {
+        matches!(
+            self,
+            MateKind::Fastened
+                | MateKind::Fixed
+                | MateKind::Revolute { .. }
+                | MateKind::Slider { .. }
+                | MateKind::Cylindrical { .. }
+        ) || self.grants_undriveable_freedom()
     }
 
     /// Why this kind cannot expose `param` (the refusal's reason text).
@@ -304,29 +411,45 @@ pub(crate) fn turns_of_angle(unwrapped: f64) -> i32 {
 }
 
 impl Assembly {
-    /// The limits of mate `index`'s `param` freedom, or `None` when the
-    /// mate exposes no such driveable parameter (unknown, unenforced,
-    /// frameless, or a kind whose freedom (θ, s) cannot span — see
-    /// [`MateKind::drive_limits`]).
+    /// Is the freedom of the pair mate `mate_index` spans already
+    /// accounted for by some OTHER enforced mate on the same two
+    /// instances?
     ///
-    /// This is the single question "is this a joint parameter, and what
-    /// bounds it" — the derived-sweep builder reads joints out of the
-    /// mates through it, so the sweep surface and the drag surface can
-    /// never disagree about what is driveable.
-    pub(crate) fn driveable_limits(
+    /// This is the condition class 5 of the freedom table turns on (see
+    /// [`MateKind::grants_undriveable_freedom`]): a dimensional overlay
+    /// riding a real joint needs no unverified-sweep entry, because the
+    /// joint's freedom is already swept or already listed. An overlay
+    /// declared ALONE is the whole freedom picture for its pair, and
+    /// nothing sweeps it.
+    ///
+    /// Three requirements, each load-bearing:
+    ///
+    /// * **another** mate — an overlay cannot account for itself;
+    /// * the **same unordered pair** of instances — a joint elsewhere in
+    ///   the assembly says nothing about THIS pair's relative motion;
+    /// * that mate is **enforced** — an unenforced joint contributes no
+    ///   residual rows, so it holds nothing and accounts for nothing.
+    ///
+    /// `enforcement` is passed in rather than recomputed per mate: the
+    /// report is an O(mates) pass and the caller already builds one.
+    pub(crate) fn pair_freedom_is_accounted_for(
         &self,
-        index: u32,
-        param: DriveParam,
-    ) -> Option<Option<(f64, f64)>> {
-        let mate = self.mates.get(index as usize)?;
-        if !mate.kind.is_numerically_enforced() {
-            return None;
-        }
-        let limits = mate.kind.drive_limits(param)?;
-        // A joint whose frames cannot be resolved has no readable
-        // parameter, whatever its kind claims.
-        self.joint_parameters_of(index)?;
-        Some(limits)
+        mate_index: usize,
+        enforcement: &MateEnforcementReport,
+    ) -> bool {
+        let Some(mate) = self.mates.get(mate_index) else {
+            return false;
+        };
+        self.mates.iter().enumerate().any(|(other, candidate)| {
+            other != mate_index
+                && candidate.kind.accounts_for_pair_freedom()
+                && (candidate.a == mate.a && candidate.b == mate.b
+                    || candidate.a == mate.b && candidate.b == mate.a)
+                && enforcement
+                    .mates
+                    .get(other)
+                    .is_some_and(|verdict| verdict.enforced)
+        })
     }
 
     /// Read the driven parameter's CURRENT value — unwrapped for rotation,

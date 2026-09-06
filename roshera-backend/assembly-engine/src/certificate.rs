@@ -55,8 +55,10 @@ pub struct AssemblyCertificate {
     pub no_static_interference: bool,
     /// Every motion this assembly carries was actually SWEPT and stayed
     /// clear across its full range. `false` also when a motion was never
-    /// swept at all (a refused range — unbounded travel), not only when a
-    /// collision was found; see `unverified_sweeps`.
+    /// swept at all — a refused range (unbounded travel), a freedom no
+    /// drive parameter can name (`Planar` / `Ball` / `PinSlot`), or a
+    /// drive the mate itself refused — not only when a collision was
+    /// found; see `unverified_sweeps`.
     pub swept_clearance_ok: bool,
     /// Every mate's features sit on their parts' real geometry — no part is
     /// grounded through a constraint declared against an invented coordinate.
@@ -127,7 +129,8 @@ pub struct AssemblyCertificate {
     #[serde(default)]
     pub interference_unverified: Vec<UnverifiedInterferencePair>,
     // ── Audit 2026-09-03 (task 18) — also ADDITIVE: ────────────────
-    /// Motions whose range was never swept — a refusal (unbounded travel)
+    /// Motions whose range was never swept — a refusal (unbounded travel,
+    /// a freedom the (θ, s) drive cannot name, a drive the mate refused)
     /// means the check did not run. Non-empty here is why
     /// `swept_clearance_ok` reads `false`: an unswept range is not a clear
     /// one. Serde-defaults so pre-fix payloads parse.
@@ -254,7 +257,7 @@ impl Assembly {
         let unverified_sweeps: Vec<UnverifiedSweep> = sweeps
             .iter()
             .filter_map(|s| {
-                s.refusal.map(|refusal| UnverifiedSweep {
+                s.refusal.clone().map(|refusal| UnverifiedSweep {
                     source: s.source,
                     refusal,
                 })
