@@ -7,15 +7,20 @@
 //!
 //! 1. Collect all `"diameter"` + `"position"` dimension records for the
 //!    solid (from `extract_dimensions`).
-//! 2. Group by `(quantised_diameter_0.01mm, through_or_blind)`.  Two bores
-//!    with the same diameter AND the same through/blind status share a group
-//!    letter (A, B, C …).
+//! 2. Group by `(quantised_diameter_0.01mm, depth_class)`.  Two bores with the
+//!    same diameter AND the same depth class (through / blind / unmeasured)
+//!    share a group letter (A, B, C …).
 //! 3. Within each group, order instances by (X ascending, Y ascending) and
 //!    number them A1, A2, … for positional clarity.
 //! 4. Depth: compare the bore axial extent (from the `"length"` record with
 //!    the same face entities) to the overall part extent along that axis.
 //!    When the bore length equals the part extent within 0.01 mm the bore
 //!    is THRU; otherwise it is blind and the depth string is "↧ {depth}".
+//!    **When there is no `"length"` record the depth is UNMEASURED**: the row
+//!    reads "—" and `is_through` is false — the same honest-unknown glyph the
+//!    X / Y columns already use for a bore with no position record. A missing
+//!    measurement is never rounded up into a THRU claim; a machinist reads the
+//!    ink, and "THRU" on a bore nothing measured is the sheet lying.
 //! 5. X / Y values come from the `"position"` records' labels (already
 //!    unit-formatted by `extract_dimensions`) with the axis prefix stripped —
 //!    the table's X/Y column headers already name the axis.
@@ -62,6 +67,16 @@ pub fn tag_letter(index: usize) -> String {
     }
 }
 
+/// The glyph a hole-table cell shows when the kernel measured nothing for it.
+///
+/// One constant because two parties must agree on it: `build_hole_table` WRITES
+/// it into `depth_label`, and `sheet_certificate::hole_live_check` READS it to
+/// decide whether a row claims a depth at all. A row rendering this asserts
+/// nothing and cannot be stale; a row rendering anything else asserts something
+/// and must be able to prove it. Two copies of the literal would let those two
+/// judgements drift apart silently.
+pub const UNKNOWN_DEPTH_LABEL: &str = "\u{2014}";
+
 // ── HoleSite ──────────────────────────────────────────────────────────────────
 
 /// One bore site: the analytic data needed to populate a hole-table row.
@@ -83,10 +98,31 @@ pub struct HoleSite {
     pub y_mm: f64,
     /// Formatted diameter label ("Ø5.00", "Ø5.000in", …).
     pub dia_label: String,
-    /// Depth label: "THRU" or "↧ {depth}" (unit-formatted depth).
+    /// Depth label: "THRU", "↧ {depth}" (unit-formatted depth), or "—" when the
+    /// bore's depth was never measured.
     pub depth_label: String,
-    /// Whether the bore passes all the way through the part.
+    /// Whether the bore passes all the way through the part. False for a blind
+    /// bore AND for a bore whose depth is unmeasured — a through-claim requires
+    /// a measurement, never an absent one read as zero.
     pub is_through: bool,
+    /// The bore's measured axial depth in kernel mm, or `None` when the model
+    /// carries no `"length"` record for these faces.
+    ///
+    /// This is the MEASUREMENT behind `depth_label`/`is_through`, kept separate
+    /// from them for the same reason `world_centre` is kept separate from
+    /// `x_mm`/`y_mm`: the label is a display string a reader interprets, while
+    /// this is the number a live check re-measures against. It is an `Option`
+    /// so a missing measurement stays missing — the pre-Task-17 code folded the
+    /// absence into `0.0`, derived `is_through: false` from that zero, and then
+    /// labelled the row "THRU" through a "fallback for degenerate depth" arm,
+    /// so the struct and the ink disagreed on every unmeasured bore.
+    ///
+    /// `serde(default)` keeps previously serialised drawings loading; such a
+    /// sheet deserialises with `depth_mm: None`, and any THRU row on it is
+    /// reported `stale` by [`super::sheet_certificate::certify_drawing`] — the
+    /// sheet cannot prove its own claim and must be rebuilt to upgrade.
+    #[serde(default)]
+    pub depth_mm: Option<f64>,
     /// View-space centre of the bore in the axial view (used for tag callout).
     pub axial_centre: Option<[f64; 2]>,
     /// WORLD centre of the bore axis, when it could be established.
@@ -140,15 +176,22 @@ pub struct HoleSite {
 struct GroupKey {
     /// Diameter quantised to 0.01 mm (×100, round to i64).
     q_dia: i64,
-    /// Through = 0, Blind = 1 (through sorts first within the same diameter).
+    /// Through = 0, Blind = 1, depth unmeasured = 2 (through sorts first within
+    /// the same diameter). Unmeasured is its OWN class, not folded into blind:
+    /// a group letter is an assertion that its members are the same feature, and
+    /// "Ø5 blind 6 mm deep" and "Ø5, depth unknown" are not the same feature.
     depth_class: u8,
 }
 
 impl GroupKey {
-    fn new(diameter_mm: f64, is_through: bool) -> Self {
+    fn new(diameter_mm: f64, depth_mm: Option<f64>, is_through: bool) -> Self {
         GroupKey {
             q_dia: (diameter_mm * 100.0).round() as i64,
-            depth_class: if is_through { 0 } else { 1 },
+            depth_class: match (depth_mm, is_through) {
+                (Some(_), true) => 0,
+                (Some(_), false) => 1,
+                (None, _) => 2,
+            },
         }
     }
 }
@@ -213,6 +256,7 @@ pub fn build_hole_table(dims: &[DimensionRecord], part_extents: [f64; 3]) -> Vec
         x_label: String,
         y_label: String,
         is_through: bool,
+        depth_mm: Option<f64>,
         depth_label: String,
         face_entities: Vec<u32>,
         datum: Option<DatumDescriptor>,
@@ -239,17 +283,20 @@ pub fn build_hole_table(dims: &[DimensionRecord], part_extents: [f64; 3]) -> Vec
             2
         };
 
-        // Bore depth from length record.
-        let depth_mm = len_by_ent.get(ents).map(|lr| lr.value).unwrap_or(0.0);
+        // Bore depth from the length record. ABSENT when the model measured
+        // none — `extract_dimensions` omits the record for a face whose axial
+        // extent it could not establish, and that absence is the answer.
+        let depth_mm: Option<f64> = len_by_ent.get(ents).map(|lr| lr.value);
 
         // THRU: bore length == part extent along dominant axis (±0.01 mm).
+        // An unmeasured depth is never through: there is nothing to compare.
         let part_ext = part_extents[dominant];
-        let is_through = (depth_mm - part_ext).abs() <= 0.01;
+        let is_through = depth_mm.is_some_and(|d| (d - part_ext).abs() <= 0.01);
 
         // Depth label.
         let depth_label = if is_through {
             "THRU".to_string()
-        } else if depth_mm > 1e-9 {
+        } else if depth_mm.is_some_and(|d| d > 1e-9) {
             // Use the length record's label (already unit-formatted) minus the
             // "L " prefix, and prepend the blind-depth glyph.
             let raw_lbl = len_by_ent
@@ -259,7 +306,12 @@ pub fn build_hole_table(dims: &[DimensionRecord], part_extents: [f64; 3]) -> Vec
             let num_part = raw_lbl.strip_prefix("L ").unwrap_or(raw_lbl);
             format!("\u{21A7} {num_part}")
         } else {
-            "THRU".to_string() // fallback for degenerate depth
+            // No usable depth measurement. The pre-Task-17 code labelled this
+            // "THRU" as a "fallback for degenerate depth" — a claim the kernel
+            // never measured, stamped on the one column a machinist drills to.
+            // Refuse instead, with the same unknown glyph the X / Y columns
+            // below already use when no position record exists.
+            UNKNOWN_DEPTH_LABEL.to_string()
         };
 
         // Position labels and raw mm values.
@@ -306,7 +358,7 @@ pub fn build_hole_table(dims: &[DimensionRecord], part_extents: [f64; 3]) -> Vec
             .map(|(r, _)| (r.value, strip_axis(&r.label)))
             .unwrap_or((0.0, "—".to_string()));
 
-        let key = GroupKey::new(diameter_mm, is_through);
+        let key = GroupKey::new(diameter_mm, depth_mm, is_through);
         // Capture the bore's face entity ids from the diameter record.
         // These are propagated to HoleSite.face_entities so the dimension
         // placement filter can suppress tabled position dims.
@@ -326,6 +378,7 @@ pub fn build_hole_table(dims: &[DimensionRecord], part_extents: [f64; 3]) -> Vec
             x_label,
             y_label,
             is_through,
+            depth_mm,
             depth_label,
             face_entities,
             datum,
@@ -388,6 +441,7 @@ pub fn build_hole_table(dims: &[DimensionRecord], part_extents: [f64; 3]) -> Vec
             dia_label: s.dia_label.clone(),
             depth_label: s.depth_label.clone(),
             is_through: s.is_through,
+            depth_mm: s.depth_mm,
             axial_centre: None, // filled by the drawing layer
             world_centre: None, // filled by the drawing layer
             face_entities: s.face_entities.clone(),
@@ -574,6 +628,72 @@ mod tests {
         assert!((b.diameter_mm - 8.0).abs() < 0.01, "group B is Ø8");
         assert_eq!(a.depth_label, "THRU");
         assert_eq!(b.depth_label, "THRU");
+    }
+
+    /// HONESTY GATE (Task 17a): a bore whose DEPTH was never measured must not
+    /// be labelled `THRU`.
+    ///
+    /// `extract_dimensions` omits the `"length"` record for a cylindrical face
+    /// whose axial extent it could not establish (`length > 1e-9` guard) — an
+    /// honest absence. The pre-fix table turned that absence into `depth_mm =
+    /// 0.0`, computed `is_through = false` from it, and then labelled the row
+    /// `"THRU"` anyway through the `else` "fallback for degenerate depth" arm:
+    /// the struct said blind, the ink said through, and the machinist reads the
+    /// ink. The unknown-depth label is `"—"`, exactly as the unknown-position
+    /// columns in this same function already are.
+    ///
+    /// Mutation: restore `else { "THRU".to_string() }` → the `depth_label`
+    /// assertion goes RED.
+    #[test]
+    fn unmeasured_depth_is_not_labelled_thru() {
+        // Ø5 Z-axis bore with position records but NO length record.
+        let part_extents = [40.0, 40.0, 10.0];
+        let dims = vec![
+            dia_rec("d0", 5.0, [0.0, 0.0, 1.0], 1),
+            pos_rec("d1", 5.0, 0, 1),
+            pos_rec("d2", 5.0, 1, 1),
+        ];
+        let table = build_hole_table(&dims, part_extents);
+        assert_eq!(table.len(), 1, "one diameter record → one row");
+        let site = &table[0];
+        assert!(
+            site.depth_mm.is_none(),
+            "an unmeasured depth stays absent, never a 0.0 presented as a \
+             measurement: {site:?}"
+        );
+        assert!(
+            !site.is_through,
+            "nothing measured a through-depth, so nothing may claim one: {site:?}"
+        );
+        assert_eq!(
+            site.depth_label, "\u{2014}",
+            "an unmeasured depth renders the unknown glyph, not THRU: {site:?}"
+        );
+    }
+
+    /// A MEASURED blind depth still renders its arrow-glyph label, and a
+    /// measured through-depth still renders `THRU` — the honesty fix must not
+    /// swallow the two cases that ARE known. (Control for the test above: if
+    /// the fix simply stopped emitting THRU, this goes RED.)
+    #[test]
+    fn measured_depths_still_label_thru_and_blind() {
+        let part_extents = [40.0, 40.0, 10.0];
+        let dims = vec![
+            dia_rec("d0", 5.0, [0.0, 0.0, 1.0], 1),
+            len_rec("d1", 10.0, 1),
+            dia_rec("d2", 5.0, [0.0, 0.0, 1.0], 2),
+            len_rec("d3", 6.0, 2),
+        ];
+        let table = build_hole_table(&dims, part_extents);
+        let thru = table.iter().find(|s| s.is_through).expect("THRU row");
+        let blind = table
+            .iter()
+            .find(|s| !s.is_through && s.depth_mm.is_some())
+            .expect("blind row");
+        assert_eq!(thru.depth_label, "THRU");
+        assert_eq!(thru.depth_mm, Some(10.0));
+        assert!(blind.depth_label.starts_with('\u{21A7}'));
+        assert_eq!(blind.depth_mm, Some(6.0));
     }
 
     /// Six holes of the same Ø5 THRU → one group A, six instances A1..A6.

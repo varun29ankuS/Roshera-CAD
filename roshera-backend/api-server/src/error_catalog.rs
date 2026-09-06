@@ -1175,34 +1175,54 @@ impl ApiError {
 
     /// **Sheet-export gate — the sheet is unsound against the live
     /// model.** Mirrors `roshera-mcp/src/gates.ts::sheetExportGate`'s
-    /// stale/dangling branch. `stale` counts facts whose live-remeasured
-    /// value has drifted past the dimensioning oracle; `dangling` counts
-    /// facts whose referenced face no longer exists. No bypass — see the
-    /// variant doc.
-    pub fn sheet_unsound(drawing_id: uuid::Uuid, stale: usize, dangling: usize) -> Self {
+    /// stale/dangling/omitted branch. `stale` counts facts whose
+    /// live-remeasured value has drifted past the dimensioning oracle;
+    /// `dangling` counts facts whose referenced face no longer exists;
+    /// `omitted` counts features the MODEL carries that this sheet does not
+    /// show, with `omitted_facts` naming them. No bypass — see the variant doc.
+    ///
+    /// All three counts are in the message because the gate fires on all three.
+    /// Reporting only the first two produced a refusal reading "0 stale ... and
+    /// 0 dangling" on an omission-only sheet — a refusal that will not say what
+    /// it found, which is the very failure this catalog exists to prevent.
+    pub fn sheet_unsound(
+        drawing_id: uuid::Uuid,
+        stale: usize,
+        dangling: usize,
+        omitted: usize,
+        omitted_facts: &[String],
+    ) -> Self {
         Self::new(
             ErrorCode::SheetUnsound,
             format!(
-                "REFUSED: drawing {drawing_id} is UNSOUND against the live \
-                 model: {stale} stale fact(s) (the model moved since this \
-                 sheet was projected) and {dangling} dangling fact(s) (a \
-                 referenced face no longer exists). A sheet whose printed \
-                 dimensions disagree with the model would have a shop \
-                 machine the wrong part."
+                concat!(
+                    "REFUSED: drawing {} is UNSOUND against the live model: ",
+                    "{} stale fact(s) (the model moved since this sheet was ",
+                    "projected), {} dangling fact(s) (a referenced face no ",
+                    "longer exists) and {} omitted fact(s) (the model carries ",
+                    "a feature this sheet does not show). A sheet that ",
+                    "disagrees with the model — or silently leaves part of it ",
+                    "out — would have a shop machine the wrong part."
+                ),
+                drawing_id, stale, dangling, omitted
             ),
         )
-        .with_hint(
-            "Regenerate the sheet from the current model \
-             (POST /api/parts/{id}/drawing) and export the new drawing_id. \
-             There is no override: regeneration is one cheap call, and no \
-             flow legitimately ships a sheet that disagrees with the model \
-             it claims to describe.",
-        )
+        .with_hint(concat!(
+            "Regenerate the sheet from the current model ",
+            "(POST /api/parts/{id}/drawing) and export the new drawing_id. ",
+            "Regeneration is what fixes an omission too: the sheet builder ",
+            "tables every bore the model carries, so a feature missing here ",
+            "is present on a fresh sheet. There is no override: regeneration ",
+            "is one cheap call, and no flow legitimately ships a sheet that ",
+            "disagrees with the model it claims to describe."
+        ))
         .with_details(serde_json::json!({
             "gate": "sheet_unsound",
             "drawing_id": drawing_id,
             "stale": stale,
             "dangling": dangling,
+            "omitted": omitted,
+            "omitted_facts": omitted_facts,
         }))
     }
 
@@ -1214,29 +1234,44 @@ impl ApiError {
     /// "export the new drawing_id" — a remedy this route cannot follow,
     /// since it never registers a drawing at all. This version names the
     /// solid and points the remedy at re-issuing THIS route.
-    pub fn sheet_unsound_for_solid(solid_id: u32, stale: usize, dangling: usize) -> Self {
+    pub fn sheet_unsound_for_solid(
+        solid_id: u32,
+        stale: usize,
+        dangling: usize,
+        omitted: usize,
+        omitted_facts: &[String],
+    ) -> Self {
         Self::new(
             ErrorCode::SheetUnsound,
             format!(
-                "REFUSED: the one-call sheet for solid {solid_id} is UNSOUND \
-                 against the live model: {stale} stale fact(s) (the model \
-                 moved since this sheet was projected) and {dangling} \
-                 dangling fact(s) (a referenced face no longer exists). A \
-                 sheet whose printed dimensions disagree with the model \
-                 would have a shop machine the wrong part."
+                concat!(
+                    "REFUSED: the one-call sheet for solid {} is UNSOUND ",
+                    "against the live model: {} stale fact(s) (the model ",
+                    "moved since this sheet was projected), {} dangling ",
+                    "fact(s) (a referenced face no longer exists) and {} ",
+                    "omitted fact(s) (the model carries a feature this sheet ",
+                    "does not show). A sheet that disagrees with the model — ",
+                    "or silently leaves part of it out — would have a shop ",
+                    "machine the wrong part."
+                ),
+                solid_id, stale, dangling, omitted
             ),
         )
-        .with_hint(
-            "Re-issue GET /api/parts/{id}/drawing.svg against the current \
-             model. There is no override: regeneration is one cheap call, \
-             and no flow legitimately ships a sheet that disagrees with the \
-             model it claims to describe.",
-        )
+        .with_hint(concat!(
+            "Re-issue GET /api/parts/{id}/drawing.svg against the current ",
+            "model. Re-issuing is what fixes an omission too: the sheet ",
+            "builder tables every bore the model carries. There is no ",
+            "override: regeneration is one cheap call, and no flow ",
+            "legitimately ships a sheet that disagrees with the model it ",
+            "claims to describe."
+        ))
         .with_details(serde_json::json!({
             "gate": "sheet_unsound",
             "solid_id": solid_id,
             "stale": stale,
             "dangling": dangling,
+            "omitted": omitted,
+            "omitted_facts": omitted_facts,
         }))
     }
 
@@ -1814,7 +1849,7 @@ mod tests {
     /// the hint would name a non-existent remedy.
     #[test]
     fn sheet_unsound_for_solid_names_the_solid_not_a_nil_drawing() {
-        let e = ApiError::sheet_unsound_for_solid(42, 1, 2);
+        let e = ApiError::sheet_unsound_for_solid(42, 1, 2, 0, &[]);
         assert_eq!(e.code, ErrorCode::SheetUnsound);
         assert!(
             e.error.contains("solid 42"),

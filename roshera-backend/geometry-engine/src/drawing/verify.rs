@@ -218,13 +218,7 @@ pub fn verify_drawing(drawing: &Drawing) -> DrawingQualityReport {
         // A view whose only content is analytic circles/ellipses (Fix 2 can
         // move a rim's ink out of `polylines` entirely) is not empty — check
         // every shape class the projector can populate, not just polylines.
-        if v.polylines.is_empty()
-            && v.hidden_polylines.is_empty()
-            && v.circles.is_empty()
-            && v.hidden_circles.is_empty()
-            && v.ellipses.is_empty()
-            && v.hidden_ellipses.is_empty()
-        {
+        if !view_has_geometry(v) {
             issues.push(warning(
                 DrawingIssueKind::EmptyView,
                 format!("view '{name}' projected to no edges"),
@@ -784,8 +778,12 @@ fn check_undimensioned_views(drawing: &super::types::Drawing, issues: &mut Vec<D
             }
             _ => {}
         }
-        let has_geometry = !v.polylines.is_empty() || !v.hidden_polylines.is_empty();
-        if has_geometry && v.dimensions.is_empty() {
+        // "Shows geometry" is the same question `EmptyView` asks, so it takes
+        // the same six-class answer. Asking only about polylines made this
+        // check structurally blind to the one view whose ink is analytic — the
+        // axial view of a bored part, whose rims project to true `circles` —
+        // which is exactly the view a missing callout matters most on.
+        if view_has_geometry(v) && v.dimensions.is_empty() {
             issues.push(warning(
                 DrawingIssueKind::UndimensionedView,
                 format!(
@@ -796,6 +794,23 @@ fn check_undimensioned_views(drawing: &super::types::Drawing, issues: &mut Vec<D
             ));
         }
     }
+}
+
+/// True when the view carries ink in ANY of the six shape classes the projector
+/// can populate.
+///
+/// One definition, two callers (`EmptyView` and `UndimensionedView`), because
+/// they ask one question — "does this view show anything?" — and two hand-rolled
+/// copies of it had already drifted: the emptiness check enumerated all six
+/// classes while the undimensioned check tested `polylines` alone, so a
+/// circles-only view was simultaneously "not empty" and "shows no geometry".
+fn view_has_geometry(v: &super::types::ProjectedView) -> bool {
+    !v.polylines.is_empty()
+        || !v.hidden_polylines.is_empty()
+        || !v.circles.is_empty()
+        || !v.hidden_circles.is_empty()
+        || !v.ellipses.is_empty()
+        || !v.hidden_ellipses.is_empty()
 }
 
 /// The isometric cell overlays a shaded-solid raster with an HLR vector

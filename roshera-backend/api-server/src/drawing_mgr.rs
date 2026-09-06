@@ -1618,14 +1618,32 @@ async fn refuse_unsound_sheet(
             SheetSubject::Solid(solid_id) => ApiError::sheet_uncertified_for_solid(solid_id),
         })?;
 
-    if !cert.sound || cert.counts.stale > 0 || cert.counts.dangling > 0 {
+    if !cert.sound || cert.counts.stale > 0 || cert.counts.dangling > 0 || cert.counts.omitted > 0 {
+        // Name what was found. An omission-only refusal used to read
+        // "0 stale ... 0 dangling" — the gate fired on `!cert.sound` and then
+        // described only two of the three things that can make a sheet unsound.
+        let omitted_facts: Vec<String> = cert
+            .facts
+            .iter()
+            .filter(|f| f.live.verdict == geometry_engine::drawing::SheetVerdict::Omitted)
+            .map(|f| f.label.clone())
+            .take(8)
+            .collect();
         return Err(match subject {
-            SheetSubject::Drawing(id) => {
-                ApiError::sheet_unsound(id, cert.counts.stale, cert.counts.dangling)
-            }
-            SheetSubject::Solid(solid_id) => {
-                ApiError::sheet_unsound_for_solid(solid_id, cert.counts.stale, cert.counts.dangling)
-            }
+            SheetSubject::Drawing(id) => ApiError::sheet_unsound(
+                id,
+                cert.counts.stale,
+                cert.counts.dangling,
+                cert.counts.omitted,
+                &omitted_facts,
+            ),
+            SheetSubject::Solid(solid_id) => ApiError::sheet_unsound_for_solid(
+                solid_id,
+                cert.counts.stale,
+                cert.counts.dangling,
+                cert.counts.omitted,
+                &omitted_facts,
+            ),
         });
     }
 

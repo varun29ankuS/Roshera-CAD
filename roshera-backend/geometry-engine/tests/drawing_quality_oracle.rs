@@ -15,8 +15,8 @@ use geometry_engine::drawing::dxf::render_drawing_dxf;
 use geometry_engine::drawing::layout::{compute_layout, SheetItemKind};
 use geometry_engine::drawing::{
     build_hole_table, render_drawing_svg, section_slot_rule, standard_drawing_auto, verify_drawing,
-    CuttingPlaneLine, Drawing, DrawingIssueKind, Polyline2d, ProjectedView, ProjectedViewId,
-    ProjectionType, SectionSlotRule, SheetSize, ViewExtent, ViewSource,
+    CuttingPlaneLine, Drawing, DrawingIssue, DrawingIssueKind, Polyline2d, ProjectedView,
+    ProjectedViewId, ProjectionType, SectionSlotRule, SheetSize, ViewExtent, ViewSource,
 };
 use geometry_engine::math::{Point3, Vector3};
 use geometry_engine::operations::boolean::{boolean_operation, BooleanOp, BooleanOptions};
@@ -715,6 +715,59 @@ fn undimensioned_view_warns_but_passes() {
     );
 }
 
+/// DETECTOR PROOF (Task 17c) — `UndimensionedView` must test the SAME six shape
+/// classes the `EmptyView` check does.
+///
+/// `check_undimensioned_views` asked only `polylines`/`hidden_polylines`, so the
+/// one view whose ink is analytic — the axial view of a bored part, whose rims
+/// project to true `circles` (exact-curves Fix 2 moves that ink out of
+/// `polylines` entirely) — was structurally invisible to it: a view that shows
+/// geometry and carries no callout at all could never be flagged. The
+/// `EmptyView` check 580 lines earlier already enumerates all six classes; this
+/// is the same emptiness question and takes the same answer.
+///
+/// Mutation: restore the `polylines`-only predicate → RED.
+#[test]
+fn circles_only_view_without_dimensions_warns() {
+    use geometry_engine::drawing::types::ProjectedCircle;
+
+    let mut d = Drawing::new("UndimensionedCircles", SheetSize::A3);
+    let mut v = rect_view(
+        "TOP",
+        ProjectionType::Top,
+        [100.0, 150.0],
+        50.0,
+        40.0,
+        vec![], // deliberately no dimensions
+    );
+    // Analytic ink only: the rim circle, no polylines at all.
+    v.polylines.clear();
+    v.circles = vec![ProjectedCircle {
+        cx: 25.0,
+        cy: 20.0,
+        r: 18.0,
+        face_ids: vec![1],
+    }];
+    d.add_view(v);
+
+    let report = verify_drawing(&d);
+    assert!(
+        !report.has(DrawingIssueKind::EmptyView),
+        "a circles-only view is not empty — the six-class test already says so; issues={:?}",
+        report.issues
+    );
+    assert!(
+        report.has(DrawingIssueKind::UndimensionedView),
+        "a circles-only view with no callouts must warn like any other; issues={:?}",
+        report.issues
+    );
+    assert!(
+        report.passed,
+        "UndimensionedView is Warning-only — passed must stay true; issues={:?}",
+        report.issues
+    );
+}
+
 /// DETECTOR PROOF (permanent invariant): views so tightly packed that the
 /// collision-resolver exhausts all four fallback slots and still cannot
 /// separate the labels — `ViewLabelCollision` must fire.
@@ -1211,6 +1264,8 @@ fn hole_tag_forced_onto_dimension_text_fires_collision() {
         dia_label: "\u{00D8}5.00".to_string(),
         depth_label: "THRU".to_string(),
         is_through: true,
+        // A THRU row asserts a measured depth; the fixture's plate is 10 mm.
+        depth_mm: Some(10.0),
         // View-space centre (60, −30) → sheet (160, 177).
         axial_centre: Some([60.0, -30.0]),
         // These fixtures exercise hole-table RENDERING, not section-plane
@@ -1981,6 +2036,8 @@ fn hole_table_on_dimension_text_fires_collision() {
         dia_label: "\u{00D8}5.00".to_string(),
         depth_label: "THRU".to_string(),
         is_through: true,
+        // A THRU row asserts a measured depth; the fixture's plate is 10 mm.
+        depth_mm: Some(10.0),
         axial_centre: Some([10.0, 10.0]),
         // See the note on the fixture above: rendering, not plane choice.
         world_centre: None,
@@ -3512,4 +3569,128 @@ fn coaxial_datum_pair_does_not_collide() {
         "coaxial datum A/B must not collide; issues={:?}",
         report.issues
     );
+}
+
+/// HONESTY GATE (Task 17, fix round 1, CRITICAL 2) — the EXPLICIT-SCALE route
+/// must table its bores.
+///
+/// `standard_drawing_hlr` is production: `api-server/src/drawing_mgr.rs:1046`
+/// calls it whenever the caller supplies a `scale` (the `None` arm goes to
+/// `standard_drawing_auto`). It projected three HLR views and returned without
+/// ever calling `attach_hole_table_from_dims`, so `hole_sites` was always empty.
+/// Harmless while the certificate only audited ink; the moment it also audits
+/// what the model has and the sheet lacks (Task 17b), every bore on that route
+/// reads `omitted`, the sheet is unsound, and export refuses.
+///
+/// The fix is to table the bores, NOT to excuse sheets that have no table —
+/// scoping the omission check to sheets that already carry one would make total
+/// omission the pass condition, which is the defect inverted.
+///
+/// # The layout claim this test does and does not make
+///
+/// Soundness is asserted at two arbitrary scales; a table that only works at
+/// 1.0 is not fixed. Full layout cleanliness is asserted at the scales where
+/// the route's own fixed three-view A3 arrangement fits.
+///
+/// Measured, before asserting anything: `ViewOutsideFrame` appears at scale
+/// >= 2.0 on a plate with **no bore at all** — no hole table can exist on that
+/// sheet — so it is the pre-existing fixed-position layout overflowing an A3
+/// frame, not this change. Per scale, Error kinds (no-bore | bored-with-table):
+/// 1.0 `[] | []`; 1.5 `[] | []`; 2.0 `[ViewOutsideFrame] | [ViewOutsideFrame
+/// x2]`; 2.5 `[ViewOutsideFrame] | [ViewOutsideFrame x2]`. The bored sheet
+/// carries a second one because the bore adds callouts to a second view, which
+/// then also overflows — the same defect, not a table collision. At NO scale
+/// does the table produce a collision of its own, which is the claim this test
+/// pins. The frame overflow is reported as a separate finding, not silenced
+/// here and not fixed here.
+#[test]
+fn explicit_scale_hlr_sheet_tables_its_bores_and_certifies_sound() {
+    use geometry_engine::drawing::sheet_certificate::certify_drawing;
+    use geometry_engine::drawing::standard_drawing_hlr;
+    use geometry_engine::drawing::{Severity, SheetFactKind};
+
+    // 40x40x20 plate with one Ø10 through bore.
+    let mut m = BRepModel::new();
+    m.set_event_key(Some("hlr-bored-plate".to_string()));
+    let plate = match TopologyBuilder::new(&mut m).create_box_3d(40.0, 40.0, 20.0) {
+        Ok(GeometryId::Solid(s)) => s,
+        o => panic!("expected solid, got {o:?}"),
+    };
+    let bore = match TopologyBuilder::new(&mut m).create_cylinder_3d(
+        Point3::new(0.0, 0.0, -20.0),
+        Vector3::Z,
+        5.0,
+        80.0,
+    ) {
+        Ok(GeometryId::Solid(s)) => s,
+        o => panic!("expected solid, got {o:?}"),
+    };
+    let part = boolean_operation(
+        &mut m,
+        plate,
+        bore,
+        BooleanOp::Difference,
+        BooleanOptions::default(),
+    )
+    .expect("difference");
+    m.set_event_key(None);
+
+    // Scales where the route's fixed three-view arrangement fits an A3 frame.
+    let frame_fits = [1.0_f64, 1.5];
+
+    for scale in [1.0_f64, 1.5, 2.5] {
+        let d = standard_drawing_hlr(&m, part, uuid::Uuid::nil(), SheetSize::A3, scale)
+            .expect("hlr sheet");
+        assert!(
+            !d.hole_sites.is_empty(),
+            "scale {scale}: the explicit-scale route must table the bore it drew"
+        );
+
+        let cert = certify_drawing(&m, &d);
+        assert_eq!(
+            cert.counts.omitted,
+            0,
+            "scale {scale}: no bore may be omitted; omitted = {:?}",
+            cert.facts
+                .iter()
+                .filter(|f| f.kind == SheetFactKind::Omitted)
+                .map(|f| f.label.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            cert.sound,
+            "scale {scale}: a bored part on the explicit-scale route must certify sound; \
+             counts={:?} unsound={:?}",
+            cert.counts,
+            cert.unsound_facts()
+                .map(|f| (f.kind, f.label.as_str()))
+                .collect::<Vec<_>>()
+        );
+
+        // The table must not collide with anything, at ANY scale.
+        let table_errors: Vec<&DrawingIssue> = cert
+            .quality
+            .issues
+            .iter()
+            .filter(|i| i.severity == Severity::Error && i.message.contains("hole table"))
+            .collect();
+        assert!(
+            table_errors.is_empty(),
+            "scale {scale}: the hole table must not collide with the sheet: {table_errors:?}"
+        );
+
+        // Where the base arrangement fits the frame, the whole sheet is clean.
+        if frame_fits.contains(&scale) {
+            let errors: Vec<&DrawingIssue> = cert
+                .quality
+                .issues
+                .iter()
+                .filter(|i| i.severity == Severity::Error)
+                .collect();
+            assert!(
+                errors.is_empty(),
+                "scale {scale}: tabling the bore must not introduce layout Errors: {errors:?}"
+            );
+        }
+    }
 }

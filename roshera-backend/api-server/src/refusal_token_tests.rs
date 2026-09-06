@@ -152,7 +152,7 @@ fn sheet_uncertified_carries_the_refused_token() {
 
 #[test]
 fn sheet_unsound_carries_the_refused_token() {
-    let err = ApiError::sheet_unsound(uuid::Uuid::nil(), 1, 0);
+    let err = ApiError::sheet_unsound(uuid::Uuid::nil(), 1, 0, 0, &[]);
     assert!(
         carries_the_refused_token(&err.error),
         "error = {:?}",

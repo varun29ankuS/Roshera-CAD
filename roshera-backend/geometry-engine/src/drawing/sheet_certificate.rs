@@ -44,7 +44,7 @@ use crate::primitives::solid::SolidId;
 use crate::primitives::topology_builder::BRepModel;
 use crate::readable::{extract_dimensions, DatumDescriptor, DimensionRecord};
 
-use super::hole_table::HoleSite;
+use super::hole_table::{HoleSite, UNKNOWN_DEPTH_LABEL};
 use super::section_comprehension::{section_cut_through, SectionCutKind, SectionCutThrough};
 use super::types::{Drawing, ViewSource};
 use super::verify::{verify_drawing, DrawingQualityReport};
@@ -66,9 +66,22 @@ pub enum SheetVerdict {
     /// dimensioning oracle ([`CERT_DIM_ORACLE_MM`]), and the provenance
     /// resolves. The fact is TRUE of the current model.
     Consistent,
-    /// The referenced entity is still live but its value MOVED — the sheet ink
-    /// is stale relative to the current model. Carries both numbers so a reader
-    /// sees the drift.
+    /// The referenced entity is still live but the sheet's claim about it no
+    /// longer holds — the ink is stale relative to the current model. Carries
+    /// both numbers so a reader sees the drift, and those numbers always
+    /// describe the fact's OWN quantity (the one its `value` / `unit` / `label`
+    /// name). A fact can be stale for a claim that quantity does not carry — a
+    /// hole row whose diameter still matches but whose depth does not — and
+    /// then the verdict alone discloses it, with [`LiveCheck::detail`] naming
+    /// which claim in words. The numbers are never repurposed to a different
+    /// quantity mid-fact.
+    ///
+    /// Read `stale` as **"this sheet cannot be confirmed against the model"**,
+    /// not "this sheet is wrong". Both reach it: a bore genuinely re-drilled
+    /// (the ink IS wrong) and a pre-Task-17 row claiming THRU with no recorded
+    /// depth (the bore may well be through — nothing on the sheet can prove
+    /// it). The kernel refuses to certify either, and refuses equally to
+    /// guess which one it is looking at.
     Stale,
     /// The provenance no longer resolves: the PID does not map to a face
     /// (consumed by a boolean, or the model was cleared). Same semantics as
@@ -82,6 +95,11 @@ pub enum SheetVerdict {
     /// whose feature op does not yet mint PID lineage. Rebuild the sheet to
     /// upgrade — never a fabricated identity.
     Unprovenanced,
+    /// The MODEL carries this feature and the SHEET does not. The inverse of
+    /// every other verdict: those judge ink against the model, this judges the
+    /// model against the ink. A drawing that silently drops a bore is not a
+    /// faithful snapshot, so an omission makes the sheet unsound.
+    Omitted,
 }
 
 impl SheetVerdict {
@@ -93,6 +111,7 @@ impl SheetVerdict {
             SheetVerdict::Dangling => "dangling",
             SheetVerdict::RenderOnly => "render_only",
             SheetVerdict::Unprovenanced => "unprovenanced",
+            SheetVerdict::Omitted => "omitted",
         }
     }
 }
@@ -115,10 +134,17 @@ pub enum SheetFactKind {
     Note,
     /// Ink with no model referent (raster pictorial, hatch texture).
     RenderOnly,
+    /// NOT a sheet element: a live model feature the sheet has no counterpart
+    /// for. Emitted by the live-side walk in [`certify_drawing`] so a reader is
+    /// told what the drawing leaves out, not only whether what it shows is true.
+    Omitted,
 }
 
 /// The live re-measurement attached to a [`SheetFact`].
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+///
+/// Not `Copy`: [`Self::detail`] owns a `String`. Every consumer reads the
+/// scalar fields, so this costs nothing at the call sites.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LiveCheck {
     /// The value the kernel measured NOW from the referenced entity, in the
     /// fact's unit. `None` for non-numeric facts (FCF/datum/section) and for
@@ -128,6 +154,23 @@ pub struct LiveCheck {
     pub deviation: Option<f64>,
     /// The verdict.
     pub verdict: SheetVerdict,
+    /// WHICH claim the verdict is about, named, when `value` / `measured`
+    /// cannot say so on their own.
+    ///
+    /// A sheet element can ink more than one claim — a hole row carries a
+    /// diameter AND a depth — while a fact has exactly one numeric slot, which
+    /// belongs to the quantity its `value` / `unit` / `label` name. So a row
+    /// stale on its DEPTH reports `{value: 10.0, measured: 10.0, deviation:
+    /// 0.0, verdict: stale}`, which is correct in every field and still leaves
+    /// a reader asking "stale how? the diameter matches." This field answers
+    /// that in words — `"depth: sheet THRU, live unmeasured"` — instead of
+    /// forcing the numbers to carry a quantity they are not about.
+    ///
+    /// `None` when the verdict is already fully explained by the numbers (an
+    /// ordinary diameter drift) or carries no numbers at all. `serde(default)`
+    /// keeps pre-Task-17 certificates deserializing.
+    #[serde(default)]
+    pub detail: Option<String>,
 }
 
 /// One certified readable fact on the sheet: the stored value + its provenance +
@@ -171,6 +214,10 @@ pub struct VerdictCounts {
     pub dangling: usize,
     pub render_only: usize,
     pub unprovenanced: usize,
+    /// Live model features the sheet has no counterpart for.
+    /// `serde(default)` keeps pre-Task-17 certificates deserializing.
+    #[serde(default)]
+    pub omitted: usize,
 }
 
 impl VerdictCounts {
@@ -183,6 +230,7 @@ impl VerdictCounts {
                 SheetVerdict::Dangling => c.dangling += 1,
                 SheetVerdict::RenderOnly => c.render_only += 1,
                 SheetVerdict::Unprovenanced => c.unprovenanced += 1,
+                SheetVerdict::Omitted => c.omitted += 1,
             }
         }
         c
@@ -203,9 +251,26 @@ pub struct SheetReadbackCertificate {
     pub facts: Vec<SheetFact>,
     /// Per-verdict tallies.
     pub counts: VerdictCounts,
-    /// True when NO fact is `stale` or `dangling` — the sheet is a faithful
-    /// snapshot of the current model. (`render_only` / `unprovenanced` facts do
-    /// not make a sheet unsound: they are honest absences, not lies.)
+    /// True when NO fact is `stale`, `dangling` or `omitted` — the sheet is a
+    /// faithful snapshot of the current model in BOTH directions.
+    ///
+    /// Precisely, `sound` asserts all three of:
+    /// - every value the sheet inks still re-measures to what it says (no
+    ///   `stale`);
+    /// - every entity the sheet names still resolves in the live model (no
+    ///   `dangling`);
+    /// - every bore the live model carries has a counterpart on the sheet (no
+    ///   `omitted`).
+    ///
+    /// The third clause is what makes this a two-way claim. Until Task 17 the
+    /// certificate walked only the sheet's own collections, so it could say
+    /// "everything drawn here is true" and mean it, while the part had a hole
+    /// the drawing never mentioned — a sound-looking sheet that would be
+    /// machined wrong. Auditing only what is already inked cannot detect an
+    /// omission; the live-side walk in [`certify_drawing`] is what does.
+    ///
+    /// `render_only` / `unprovenanced` facts still do not make a sheet unsound:
+    /// they are honest absences, not lies.
     pub sound: bool,
     /// The layout-quality report (the existing 2D perception oracle), embedded
     /// so one certificate covers readability + truth.
@@ -220,12 +285,16 @@ pub struct SheetReadbackCertificate {
 }
 
 impl SheetReadbackCertificate {
-    /// Facts whose verdict is `stale` or `dangling` — the ones a reader must not
-    /// trust.
+    /// Facts whose verdict is `stale`, `dangling` or `omitted` — the ones a
+    /// reader must not trust the sheet on. Exactly the set `sound` is the
+    /// emptiness of, so the two can never disagree.
     pub fn unsound_facts(&self) -> impl Iterator<Item = &SheetFact> {
-        self.facts
-            .iter()
-            .filter(|f| matches!(f.live.verdict, SheetVerdict::Stale | SheetVerdict::Dangling))
+        self.facts.iter().filter(|f| {
+            matches!(
+                f.live.verdict,
+                SheetVerdict::Stale | SheetVerdict::Dangling | SheetVerdict::Omitted
+            )
+        })
     }
 }
 
@@ -247,12 +316,14 @@ fn dimension_live_check(
             measured: None,
             deviation: None,
             verdict: SheetVerdict::Unprovenanced,
+            detail: None,
         },
         Some(p) => match live_by_pid.get(p) {
             None => LiveCheck {
                 measured: None,
                 deviation: None,
                 verdict: SheetVerdict::Dangling,
+                detail: None,
             },
             Some(&live) => {
                 let dev = (live - sheet_value).abs();
@@ -265,24 +336,54 @@ fn dimension_live_check(
                     measured: Some(live),
                     deviation: Some(dev),
                     verdict,
+                    detail: None,
                 }
             }
         },
     }
 }
 
-/// Live-check a hole-table row by re-measuring the diameter of its bore faces
-/// against the analytic table (holes carry face ids, not a PID).
-fn hole_live_check(
-    face_entities: &[u32],
-    sheet_dia: f64,
-    live_dims: &[DimensionRecord],
-) -> LiveCheck {
+/// Live-check a hole-table row by re-measuring its bore faces against the
+/// analytic table (holes carry face ids, not a PID).
+///
+/// A hole row inks TWO claims — a diameter and a depth — and both are
+/// re-measured here. Checking only the diameter certified half a row and left
+/// the DEPTH column, the one a machinist drills to, unaudited.
+///
+/// `measured` / `deviation` on the returned check always describe the DIAMETER —
+/// the quantity this fact's `value`, `unit` and `label` are about. A row stale
+/// on its depth alone says so through the verdict; putting a depth in those
+/// slots would read as a re-drilled diameter and would break
+/// [`LiveCheck::deviation`]'s own `|measured - sheet_value|` contract.
+///
+/// A depth-driven `stale` names its finding in [`LiveCheck::detail`]
+/// (`"depth: sheet THRU, live unmeasured"`), because the numbers alone would
+/// read as a fully consistent row.
+///
+/// The depth rules, in order:
+/// - the row records a depth (`depth_mm`) and the model measures a different
+///   one → `stale`;
+/// - the row records a depth and the model measures NONE → `stale`: the ink
+///   asserts a length the kernel can no longer establish;
+/// - the row records no depth but its LABEL claims one → `stale`. This is the
+///   pre-Task-17 sheet, whether the label reads `THRU` (the old "fallback for
+///   degenerate depth") or `↧ 6.00`: a claim standing on no measurement at
+///   all. The predicate is the label rather than `is_through` precisely so the
+///   blind case is covered too — keying on the flag certified exactly the row
+///   whose ink asserts a number the struct cannot prove. Rebuilding the sheet
+///   upgrades it; nothing here fabricates the missing number;
+/// - the row records no depth and its label is [`UNKNOWN_DEPTH_LABEL`] →
+///   the depth is silent, so there is nothing to contradict. An honest absence
+///   is not a defect.
+fn hole_live_check(site: &HoleSite, live_dims: &[DimensionRecord]) -> LiveCheck {
+    let face_entities: &[u32] = &site.face_entities;
+    let sheet_dia = site.diameter_mm;
     if face_entities.is_empty() {
         return LiveCheck {
             measured: None,
             deviation: None,
             verdict: SheetVerdict::Unprovenanced,
+            detail: None,
         };
     }
     let live = live_dims
@@ -294,18 +395,68 @@ fn hole_live_check(
             measured: None,
             deviation: None,
             verdict: SheetVerdict::Dangling,
+            detail: None,
         },
         Some(v) => {
             let dev = (v - sheet_dia).abs();
-            let verdict = if dev <= CERT_DIM_ORACLE_MM {
-                SheetVerdict::Consistent
-            } else {
-                SheetVerdict::Stale
+            if dev > CERT_DIM_ORACLE_MM {
+                return LiveCheck {
+                    measured: Some(v),
+                    deviation: Some(dev),
+                    verdict: SheetVerdict::Stale,
+                    detail: None,
+                };
+            }
+            // The diameter holds; now the depth claim beside it.
+            let live_depth = live_dims
+                .iter()
+                .find(|d| {
+                    d.kind == "length" && d.entities.iter().any(|e| face_entities.contains(e))
+                })
+                .map(|d| d.value);
+            // A depth finding is disclosed by the VERDICT. `measured` and
+            // `deviation` keep describing the diameter — the quantity this
+            // fact's `value`, `unit` and `label` are about — because a reader
+            // handed {value: 10.0, measured: 20.0} on a row labelled "Ø10.00"
+            // would read a re-drilled diameter that nothing measured, and
+            // `deviation`'s contract (`|measured - sheet_value|`) would not
+            // even hold across the two quantities.
+            //
+            // What the row CLAIMS about depth is what its label says, not what
+            // `is_through` says: a pre-Task-17 sheet deserialises with
+            // `depth_mm: None` while its label still reads "↧ 6.00", and that
+            // row asserts six millimetres with nothing behind it just as surely
+            // as a bare THRU does. A row is silent only when it renders
+            // `UNKNOWN_DEPTH_LABEL`.
+            let live_str = match live_depth {
+                Some(l) => format!("{l:.2}"),
+                None => "unmeasured".to_string(),
             };
+            let depth_stale = match (site.depth_mm, live_depth) {
+                // Recorded depth vs a live one that moved.
+                (Some(sheet_depth), Some(l)) => (l - sheet_depth).abs() > CERT_DIM_ORACLE_MM,
+                // Ink records a depth the model no longer measures.
+                (Some(_), None) => true,
+                // No recorded depth: stale iff the label nonetheless claims one.
+                (None, _) => site.depth_label != UNKNOWN_DEPTH_LABEL,
+            };
+            if depth_stale {
+                let sheet_str = match site.depth_mm {
+                    Some(d) => format!("{d:.2}"),
+                    None => site.depth_label.clone(),
+                };
+                return LiveCheck {
+                    measured: Some(v),
+                    deviation: Some(dev),
+                    verdict: SheetVerdict::Stale,
+                    detail: Some(format!("depth: sheet {sheet_str}, live {live_str}")),
+                };
+            }
             LiveCheck {
                 measured: Some(v),
                 deviation: Some(dev),
-                verdict,
+                verdict: SheetVerdict::Consistent,
+                detail: None,
             }
         }
     }
@@ -321,6 +472,7 @@ fn pid_resolve_check(model: &BRepModel, feature_pid: &Option<String>) -> LiveChe
             measured: None,
             deviation: None,
             verdict: SheetVerdict::Unprovenanced,
+            detail: None,
         },
         Some(hex) => {
             let resolved = parse_pid(hex).and_then(|p| model.face_by_pid(p));
@@ -333,6 +485,7 @@ fn pid_resolve_check(model: &BRepModel, feature_pid: &Option<String>) -> LiveChe
                 measured: None,
                 deviation: None,
                 verdict,
+                detail: None,
             }
         }
     }
@@ -379,6 +532,7 @@ fn section_live_check(
             measured: None,
             deviation: None,
             verdict: SheetVerdict::Dangling,
+            detail: None,
         };
     }
     if cut_through.is_empty() {
@@ -386,6 +540,7 @@ fn section_live_check(
             measured: Some(0.0),
             deviation: None,
             verdict: SheetVerdict::Stale,
+            detail: None,
         };
     }
     // Re-drill detection: every tagged bore the plane crosses must still match
@@ -404,6 +559,7 @@ fn section_live_check(
                     measured: Some(live_dia),
                     deviation: Some((live_dia - site.diameter_mm).abs()),
                     verdict: SheetVerdict::Stale,
+                    detail: None,
                 };
             }
         }
@@ -412,7 +568,93 @@ fn section_live_check(
         measured: Some(cut_through.cuts.len() as f64),
         deviation: None,
         verdict: SheetVerdict::Consistent,
+        detail: None,
     }
+}
+
+/// Walk the LIVE model for bores the SHEET has no counterpart for, one
+/// [`SheetFactKind::Omitted`] fact each.
+///
+/// # Why this direction exists
+///
+/// Every other check in this module reads a sheet element and asks the model
+/// whether it is still true. That can only ever find WRONG ink; it is
+/// structurally blind to MISSING ink. A drawing that never tabled a bore has no
+/// row to check, `section_live_check` skips the untagged cut it produces
+/// (`let Some(tag) = &cut.hole_tag else { continue }`), and the certificate
+/// reports `sound: true` for a part that would be machined with a hole missing.
+/// A one-way certificate cannot certify completeness, and completeness is what
+/// a shop reader assumes when they are handed a sound sheet.
+///
+/// # Grouping and the bore qualifier
+///
+/// Omissions are grouped by the LIVE `"diameter"` dimension record, which is the
+/// same unit `attach_hole_table_from_dims` builds a row from: `dedupe_coincident`
+/// has already merged a seam-split bore wall's per-face records into one record
+/// naming every face, so one physical bore yields one omission rather than one
+/// per face. The bore qualifier is likewise the same
+/// [`crate::readable::bore_face_ids`] material-side rule the table uses, so a
+/// boss or the part's own OD — which also carry diameter records — is never
+/// reported as a missing hole.
+///
+/// This subsumes the section-side case: `section_comprehension::classify_face`
+/// draws `SectionCutKind::Bore` from that identical `bore_face_ids` set, and
+/// `extract_dimensions` walks the identical shell list, so every bore the
+/// section plane cuts has a diameter record here. Walking the records rather
+/// than the cuts reports the same bores AND the ones the plane happens to miss.
+fn omitted_bore_facts(
+    solid_id: Option<SolidId>,
+    model: &BRepModel,
+    drawing: &Drawing,
+    live_dims: &[DimensionRecord],
+) -> Vec<SheetFact> {
+    use std::collections::HashSet;
+
+    let Some(solid) = solid_id else {
+        return Vec::new();
+    };
+    let live_bores = crate::readable::bore_face_ids(model, solid);
+    if live_bores.is_empty() {
+        return Vec::new();
+    }
+    let tabled: HashSet<u32> = drawing
+        .hole_sites
+        .iter()
+        .flat_map(|h| h.face_entities.iter().copied())
+        .collect();
+
+    let mut out = Vec::new();
+    for d in live_dims {
+        if d.kind != "diameter" || d.entities.is_empty() {
+            continue;
+        }
+        // Bores only — a boss or the part silhouette is not a missing hole.
+        if !d.entities.iter().any(|e| live_bores.contains(e)) {
+            continue;
+        }
+        // The sheet already carries a row naming one of these faces.
+        if d.entities.iter().any(|e| tabled.contains(e)) {
+            continue;
+        }
+        out.push(SheetFact {
+            kind: SheetFactKind::Omitted,
+            owner_view: drawing.axial_view_idx,
+            label: format!("bore {} on the model has no hole-table row", d.label),
+            value: Some(d.value),
+            unit: d.unit.clone(),
+            pid: d.pid.clone(),
+            face_ids: d.entities.clone(),
+            datum: None,
+            tolerance: None,
+            live: LiveCheck {
+                measured: Some(d.value),
+                deviation: None,
+                verdict: SheetVerdict::Omitted,
+                detail: None,
+            },
+        });
+    }
+    out
 }
 
 /// Certify a drawing sheet against the LIVE model: build one [`SheetFact`] per
@@ -476,6 +718,7 @@ pub fn certify_drawing(model: &BRepModel, drawing: &Drawing) -> SheetReadbackCer
                     measured: None,
                     deviation: None,
                     verdict: SheetVerdict::RenderOnly,
+                    detail: None,
                 },
             });
         }
@@ -495,6 +738,7 @@ pub fn certify_drawing(model: &BRepModel, drawing: &Drawing) -> SheetReadbackCer
                     measured: None,
                     deviation: None,
                     verdict: SheetVerdict::RenderOnly,
+                    detail: None,
                 },
             });
         }
@@ -502,7 +746,7 @@ pub fn certify_drawing(model: &BRepModel, drawing: &Drawing) -> SheetReadbackCer
 
     // ── Hole-table rows ───────────────────────────────────────────────────────
     for hole in &drawing.hole_sites {
-        let live = hole_live_check(&hole.face_entities, hole.diameter_mm, &live_dims);
+        let live = hole_live_check(hole, &live_dims);
         facts.push(SheetFact {
             kind: SheetFactKind::Hole,
             owner_view: drawing.axial_view_idx,
@@ -563,6 +807,7 @@ pub fn certify_drawing(model: &BRepModel, drawing: &Drawing) -> SheetReadbackCer
                 measured: None,
                 deviation: None,
                 verdict: SheetVerdict::Dangling,
+                detail: None,
             },
         };
         facts.push(SheetFact {
@@ -579,6 +824,9 @@ pub fn certify_drawing(model: &BRepModel, drawing: &Drawing) -> SheetReadbackCer
         });
         section_cuts = ct;
     }
+
+    // ── LIVE-SIDE WALK: what the model has and the sheet does not ─────────────
+    facts.extend(omitted_bore_facts(solid_id, model, drawing, &live_dims));
 
     // ── Structured note: document unit + general tolerance ────────────────────
     {
@@ -609,12 +857,21 @@ pub fn certify_drawing(model: &BRepModel, drawing: &Drawing) -> SheetReadbackCer
                 } else {
                     SheetVerdict::Stale
                 },
+                detail: if unit_matches {
+                    None
+                } else {
+                    Some(format!(
+                        "document unit: sheet {:?}, model {:?}",
+                        drawing.document_unit,
+                        model.document_unit()
+                    ))
+                },
             },
         });
     }
 
     let counts = VerdictCounts::tally(&facts);
-    let sound = counts.stale == 0 && counts.dangling == 0;
+    let sound = counts.stale == 0 && counts.dangling == 0 && counts.omitted == 0;
     SheetReadbackCertificate {
         facts,
         counts,
@@ -1035,6 +1292,344 @@ mod tests {
         assert!(
             raster.value.is_none(),
             "a render-only fact carries no numeric answer"
+        );
+    }
+
+    // ── Task 17: depth honesty + the one-way certificate ──────────────────────
+
+    /// A hand-built hole row, so the depth live-check can be exercised against a
+    /// dimension table under test control.
+    fn hole_row(face_entities: Vec<u32>, dia: f64, depth_mm: Option<f64>, thru: bool) -> HoleSite {
+        HoleSite {
+            tag: "A1".to_string(),
+            group: "A".to_string(),
+            diameter_mm: dia,
+            x_label: "\u{2014}".to_string(),
+            y_label: "\u{2014}".to_string(),
+            x_mm: 0.0,
+            y_mm: 0.0,
+            dia_label: format!("\u{00D8}{dia:.2}"),
+            depth_label: if thru {
+                "THRU".to_string()
+            } else {
+                "\u{2014}".to_string()
+            },
+            is_through: thru,
+            depth_mm,
+            axial_centre: None,
+            world_centre: None,
+            face_entities,
+            datum: None,
+            tolerance: None,
+        }
+    }
+
+    fn rec(kind: &str, value: f64, fid: u32) -> DimensionRecord {
+        DimensionRecord {
+            id: format!("{kind}-{fid}"),
+            kind: kind.to_string(),
+            value,
+            unit: "mm".to_string(),
+            label: format!("{kind} {value:.2}"),
+            entities: vec![fid],
+            anchor: [0.0, 0.0, 0.0],
+            direction: [0.0, 0.0, 1.0],
+            axis: Some([0.0, 0.0, 1.0]),
+            pid: None,
+            datum: None,
+        }
+    }
+
+    /// HONESTY GATE (Task 17a): the live check re-measures DEPTH as well as
+    /// diameter. A row claiming THRU on a bore the model measures no depth for
+    /// is not `consistent` — the sheet asserts a fact the kernel cannot
+    /// corroborate, and the certificate must say so rather than pass the
+    /// diameter and stay silent about the claim beside it.
+    ///
+    /// Mutation: drop the depth arm from `hole_live_check` → every assertion
+    /// below that is not `Consistent` goes RED.
+    #[test]
+    fn hole_row_claiming_thru_on_an_unmeasured_bore_is_not_consistent() {
+        // The model measures the bore's DIAMETER but no length for it.
+        let live = vec![rec("diameter", 10.0, 7)];
+
+        let claims_thru = hole_row(vec![7], 10.0, None, true);
+        let check = hole_live_check(&claims_thru, &live);
+        assert_ne!(
+            check.verdict,
+            SheetVerdict::Consistent,
+            "a THRU claim with no measured depth is not a certified fact: {check:?}"
+        );
+        assert_eq!(
+            check.verdict,
+            SheetVerdict::Stale,
+            "the sheet's ink outruns the model — that is stale, not an absence: {check:?}"
+        );
+
+        // The honest sibling: the same bore rendered "\u{2014}" claims nothing,
+        // so nothing about it is stale.
+        let claims_nothing = hole_row(vec![7], 10.0, None, false);
+        assert_eq!(
+            hole_live_check(&claims_nothing, &live).verdict,
+            SheetVerdict::Consistent,
+            "an unmeasured depth honestly rendered as unknown asserts nothing"
+        );
+
+        // A row whose recorded depth still matches the model is consistent; one
+        // whose bore was re-drilled deeper is stale, carrying the new number.
+        let live_deep = vec![rec("diameter", 10.0, 7), rec("length", 20.0, 7)];
+        assert_eq!(
+            hole_live_check(&hole_row(vec![7], 10.0, Some(20.0), true), &live_deep).verdict,
+            SheetVerdict::Consistent,
+            "a corroborated THRU row is consistent"
+        );
+        let moved = hole_live_check(&hole_row(vec![7], 10.0, Some(6.0), false), &live_deep);
+        assert_eq!(
+            moved.verdict,
+            SheetVerdict::Stale,
+            "a blind row on a bore now 20 mm deep is stale ink: {moved:?}"
+        );
+        // The finding is the DEPTH, but this fact's numbers are the DIAMETER's:
+        // a reader handed measured=20.0 beside a label reading "Ø10.00" would
+        // conclude the bore was re-drilled, which nothing measured. The
+        // quantity a fact reports must be the quantity it names.
+        assert_eq!(
+            moved.measured,
+            Some(10.0),
+            "a stale row still reports its own quantity, the diameter: {moved:?}"
+        );
+        assert_eq!(
+            moved.deviation,
+            Some(0.0),
+            "and its deviation stays |measured - value| on that quantity: {moved:?}"
+        );
+    }
+
+    /// HONESTY GATE (Task 17, fix round 1, item 3): a depth-stale row must NAME
+    /// the claim that is stale.
+    ///
+    /// The numeric slots correctly describe the diameter, which still matches —
+    /// so on the numbers alone the fact reads `{value: 10.0, measured: 10.0,
+    /// deviation: 0.0, verdict: stale}`: every field right, and a reader left
+    /// asking "stale how?". `LiveCheck::detail` answers in words.
+    ///
+    /// Mutation: return `detail: None` from the depth arm → RED.
+    #[test]
+    fn a_depth_stale_row_names_which_claim_is_stale() {
+        let live = vec![rec("diameter", 10.0, 7), rec("length", 20.0, 7)];
+
+        // Recorded depth that moved.
+        let moved = hole_live_check(&hole_row(vec![7], 10.0, Some(6.0), false), &live);
+        let d = moved
+            .detail
+            .as_deref()
+            .expect("a depth-stale row names the finding");
+        assert!(
+            d.contains("depth") && d.contains("6.00") && d.contains("20.00"),
+            "the detail names the claim and both numbers: {d:?}"
+        );
+        assert!(!d.contains("  "), "no absorbed indentation: {d:?}");
+
+        // THRU claimed with nothing behind it, and no live depth either.
+        let bare = vec![rec("diameter", 10.0, 7)];
+        let thru = hole_live_check(&hole_row(vec![7], 10.0, None, true), &bare);
+        let t = thru
+            .detail
+            .as_deref()
+            .expect("a THRU claim names its finding");
+        assert!(
+            t.contains("depth") && t.contains("THRU") && t.contains("unmeasured"),
+            "the detail says the THRU claim has no live depth behind it: {t:?}"
+        );
+        assert!(!t.contains("  "), "no absorbed indentation: {t:?}");
+
+        // A consistent row asserts nothing extra to explain.
+        let ok = hole_live_check(&hole_row(vec![7], 10.0, Some(20.0), true), &live);
+        assert_eq!(ok.verdict, SheetVerdict::Consistent);
+        assert!(
+            ok.detail.is_none(),
+            "a consistent row has no finding to name: {ok:?}"
+        );
+    }
+
+    /// HONESTY GATE (Task 17, fix round 1, MINOR): a pre-Task-17 BLIND row is
+    /// checked too, not just a THRU one.
+    ///
+    /// An old sheet deserialises with `depth_mm: None` while its `depth_label`
+    /// still reads "↧ 6.00" — it claims a depth of six millimetres and carries
+    /// no measurement to back it. Keying the check on `is_through` alone
+    /// certified exactly that row `consistent`: the one class of row where the
+    /// ink asserts a number the struct cannot prove. The predicate is the
+    /// LABEL, not the flag — a row is silent only when it renders the unknown
+    /// glyph.
+    ///
+    /// Mutation: drop the `depth_label != UNKNOWN_DEPTH_LABEL` clause → RED.
+    #[test]
+    fn a_legacy_blind_row_with_no_recorded_depth_is_not_certified() {
+        let live = vec![rec("diameter", 10.0, 7), rec("length", 20.0, 7)];
+
+        // Pre-Task-17 blind row: label claims 6 mm, no `depth_mm` behind it.
+        let mut legacy = hole_row(vec![7], 10.0, None, false);
+        legacy.depth_label = "\u{21A7} 6.00".to_string();
+        let check = hole_live_check(&legacy, &live);
+        assert_eq!(
+            check.verdict,
+            SheetVerdict::Stale,
+            "a blind row claiming 6.00 with nothing behind it is not certified: {check:?}"
+        );
+        assert!(
+            check
+                .detail
+                .as_deref()
+                .is_some_and(|d| d.contains("6.00") && d.contains("depth")),
+            "and it names the unbacked claim: {check:?}"
+        );
+
+        // The honest sibling is unchanged: the unknown glyph claims nothing.
+        let silent = hole_row(vec![7], 10.0, None, false);
+        assert_eq!(silent.depth_label, UNKNOWN_DEPTH_LABEL);
+        assert_eq!(
+            hole_live_check(&silent, &live).verdict,
+            SheetVerdict::Consistent,
+            "a row rendering the unknown glyph asserts nothing to contradict"
+        );
+    }
+
+    /// Build a 40×40×20 plate with TWO Ø10 through bores at (±10, 0), both on
+    /// the line the section plane cuts along.
+    fn twin_bored_plate() -> (BRepModel, SolidId) {
+        use crate::operations::boolean::{boolean_operation, BooleanOp, BooleanOptions};
+        let mut m = BRepModel::new();
+        m.set_event_key(Some("twin-bore-plate".to_string()));
+        let mut part = sid(TopologyBuilder::new(&mut m)
+            .create_box_3d(40.0, 40.0, 20.0)
+            .expect("plate"));
+        for (i, x) in [-10.0_f64, 10.0].into_iter().enumerate() {
+            // One event key per drilling: two booleans under a SHARED key mint
+            // the same PID for two different result faces and the kernel's own
+            // `assign_boolean_face_pids` invariant refuses the pass.
+            m.set_event_key(Some(format!("twin-bore-{i}")));
+            let bore = sid(TopologyBuilder::new(&mut m)
+                .create_cylinder_3d(Point3::new(x, 0.0, -20.0), Vector3::Z, 5.0, 80.0)
+                .expect("bore"));
+            part = boolean_operation(
+                &mut m,
+                part,
+                bore,
+                BooleanOp::Difference,
+                BooleanOptions::default(),
+            )
+            .expect("difference");
+        }
+        m.set_event_key(None);
+        (m, part)
+    }
+
+    /// HONESTY GATE (Task 17b): the certificate walks the LIVE side too.
+    ///
+    /// `certify_drawing` used to iterate only the sheet's own collections, so a
+    /// feature the MODEL carries and the SHEET does not was invisible to it: the
+    /// section's cut-through would list the bore, `section_live_check` would hit
+    /// `let Some(tag) = &cut.hole_tag else { continue }`, and the certificate
+    /// returned `sound: true` for a drawing that omits a hole a machinist must
+    /// drill. A certificate that only ever audits what is already inked can
+    /// never report an omission.
+    ///
+    /// # Why the omission is made sheet-side, not model-side
+    ///
+    /// The literal "drill a second bore into the model afterwards" mutation
+    /// rebuilds the topology: every face id churns, so the sheet's EXISTING hole
+    /// rows dangle and its dimension PIDs go stale, and `sound` is already false
+    /// before this fix for reasons that have nothing to do with the omission.
+    /// That makes it useless as a gate. Dropping one row from a sheet whose
+    /// every other fact still resolves isolates exactly the defect: pre-fix this
+    /// certificate is `sound == true` with the bore standing untabled in its own
+    /// section cut.
+    ///
+    /// Mutation: delete the live-side omission walk from `certify_drawing` → the
+    /// `Omitted` fact and `!sound` assertions go RED.
+    #[test]
+    fn a_bore_the_sheet_omits_makes_the_certificate_unsound() {
+        use crate::drawing::dimensioning::standard_drawing_auto;
+
+        let (m, part) = twin_bored_plate();
+        let mut drawing = standard_drawing_auto(&m, part, uuid::Uuid::nil()).expect("sheet");
+        assert!(
+            drawing.hole_sites.len() >= 2,
+            "the fixture must table both bores: {:?}",
+            drawing.hole_sites
+        );
+
+        // Control: with both bores tabled the sheet is sound.
+        let cert0 = certify_drawing(&m, &drawing);
+        assert!(
+            cert0.sound,
+            "the complete sheet must certify sound: counts={:?} unsound={:?}",
+            cert0.counts,
+            cert0.unsound_facts().collect::<Vec<_>>()
+        );
+        assert_eq!(cert0.counts.omitted, 0, "nothing is omitted yet");
+
+        // Drop one row: the sheet now omits a bore the model carries.
+        let dropped = drawing.hole_sites.remove(0);
+        let cert = certify_drawing(&m, &drawing);
+
+        // The SECTION path is genuinely exercised: the plane still crosses the
+        // untabled bore, and its cut now carries no hole tag — the `continue`
+        // site this gate exists for.
+        let ct = cert
+            .section_cuts
+            .as_ref()
+            .expect("the fixture sheet carries a SECTION, so the certificate must carry its cuts");
+        let untagged = ct.cuts.iter().any(|c| {
+            c.kind == SectionCutKind::Bore
+                && c.hole_tag.is_none()
+                && c.face_ids.iter().any(|f| dropped.face_entities.contains(f))
+        });
+        assert!(
+            untagged,
+            "the dropped bore must appear in the section cut with no tag: {ct:?}"
+        );
+
+        let omitted: Vec<&SheetFact> = cert
+            .facts
+            .iter()
+            .filter(|f| f.kind == SheetFactKind::Omitted)
+            .collect();
+        assert!(
+            omitted.iter().any(|f| {
+                f.face_ids
+                    .iter()
+                    .any(|id| dropped.face_entities.contains(id))
+                    && f.value
+                        .map(|v| (v - dropped.diameter_mm).abs() <= CERT_DIM_ORACLE_MM)
+                        .unwrap_or(false)
+            }),
+            "an Omitted fact must name the untabled bore by face and diameter; \
+             dropped={dropped:?} omitted={omitted:?}"
+        );
+        for f in &omitted {
+            assert_eq!(f.live.verdict, SheetVerdict::Omitted);
+            assert!(
+                !f.label.contains("  "),
+                "no absorbed indentation in a user-facing label: {:?}",
+                f.label
+            );
+        }
+        assert!(
+            cert.counts.omitted > 0,
+            "omissions are counted: {:?}",
+            cert.counts
+        );
+        assert!(
+            !cert.sound,
+            "a sheet that omits a bore the model carries is NOT sound: {:?}",
+            cert.counts
+        );
+        assert!(
+            cert.unsound_facts()
+                .any(|f| f.kind == SheetFactKind::Omitted),
+            "the omission must reach the facts-a-reader-must-not-trust list"
         );
     }
 }

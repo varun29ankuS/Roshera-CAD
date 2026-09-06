@@ -956,28 +956,49 @@ async function sheetExportGate(args: any): Promise<any | null> {
   const counts = cert.counts ?? {};
   const stale = Number(counts.stale ?? 0);
   const dangling = Number(counts.dangling ?? 0);
-  if (cert.sound === false || stale > 0 || dangling > 0) {
+  // A sheet is unsound three ways, not two. `omitted` facts are features the
+  // MODEL carries that the sheet does not show — the certificate's live-side
+  // walk. Leaving them out of the filter produced an omission-only refusal
+  // whose reason read "0 stale ... 0 dangling" beside an EMPTY witness list:
+  // a refusal that will not say what it found.
+  const omitted = Number(counts.omitted ?? 0);
+  if (cert.sound === false || stale > 0 || dangling > 0 || omitted > 0) {
     const facts: any[] = Array.isArray(cert.facts) ? cert.facts : [];
+    const isUnsound = (v: unknown) =>
+      v === "stale" || v === "dangling" || v === "omitted";
     const offending = facts
-      .filter(
-        (f) => f?.live?.verdict === "stale" || f?.live?.verdict === "dangling",
-      )
+      .filter((f) => isUnsound(f?.live?.verdict))
       .slice(0, 8)
       .map((f) => `${f.label} [${f.live.verdict}]`);
+    // Name the missing features in the remedy: "regenerate" is the right
+    // instruction, but an agent acts on it far better knowing WHAT is absent.
+    const omittedLabels = facts
+      .filter((f) => f?.live?.verdict === "omitted")
+      .slice(0, 8)
+      .map((f) => String(f.label));
+    const omissionRemedy = omittedLabels.length
+      ? ` The sheet omits: ${omittedLabels.join("; ")} — regeneration tables ` +
+        "every bore the model carries, so a feature missing here is present " +
+        "on a fresh sheet."
+      : "";
     return gateRefusal({
       gate: "sheet_unsound",
       reason:
         `drawing ${drawingId} is UNSOUND against the live model: ${stale} ` +
-        `stale fact(s) (the model moved since this sheet was projected) and ` +
-        `${dangling} dangling fact(s) (a referenced face no longer exists). ` +
-        "A sheet whose printed dimensions disagree with the model would have " +
-        "a shop machine the wrong part.",
+        `stale fact(s) (the model moved since this sheet was projected), ` +
+        `${dangling} dangling fact(s) (a referenced face no longer exists) ` +
+        `and ${omitted} omitted fact(s) (the model carries a feature this ` +
+        "sheet does not show). A sheet that disagrees with the model — or " +
+        "silently leaves part of it out — would have a shop machine the " +
+        "wrong part.",
       unsound_facts: offending,
       how_to_proceed:
         "Regenerate the sheet from the current model with make_drawing (it " +
-        "returns a new drawing_id) and export that. There is no override: " +
-        "regeneration is one cheap call, and no flow legitimately ships a " +
-        "sheet that disagrees with the model it claims to describe.",
+        "returns a new drawing_id) and export that." +
+        omissionRemedy +
+        " There is no override: regeneration is one cheap call, and no flow " +
+        "legitimately ships a sheet that disagrees with the model it claims " +
+        "to describe.",
     });
   }
 

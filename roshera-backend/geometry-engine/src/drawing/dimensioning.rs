@@ -588,6 +588,26 @@ pub fn standard_drawing_hlr(
         )?);
     }
     dedup_dimensions_global(&mut drawing);
+
+    // ── Hole table (Task 17, fix round 1) ─────────────────────────────────────
+    // Same three lines `standard_drawing_auto` runs, for the same reason and in
+    // the same order (after the global dedup, so entity merging is stable, with
+    // the `bore_face_ids` material-side qualifier keeping the part's own OD out
+    // of the table).
+    //
+    // This route is not a lesser drawing: `drawing_mgr::part_drawing` sends
+    // every explicit-`scale` request here. Omitting the table made its sheets of
+    // bored parts silently incomplete — a shop reader is handed three views of a
+    // part with a hole and no schedule saying what to drill. That was invisible
+    // while the sheet certificate only audited the ink that IS present; once it
+    // also audits the model against the sheet (`certify_drawing`'s live-side
+    // walk) those bores read `omitted` and the sheet refuses at export, which is
+    // the certificate telling the truth about a sheet that was always
+    // incomplete. The fix is to table the bores, not to lower the bar.
+    let dims = extract_dimensions(model, solid_id);
+    let bore_faces = crate::readable::bore_face_ids(model, solid_id);
+    attach_hole_table_from_dims(&dims, &bore_faces, &mut drawing);
+
     Ok(drawing)
 }
 

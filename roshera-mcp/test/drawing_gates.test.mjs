@@ -338,6 +338,57 @@ check("drawing_export_sheet never defaults acknowledge_unsound onto a call that 
   assert.equal(lastPdfAckUnsound, null, "an omission must stay an omission on the export route too");
 });
 
+// ─── 3b. omission: the model carries a feature the sheet does not ───────────
+//
+// The gate fired on `sound === false` and then built its reason and its witness
+// list from `stale`/`dangling` only, so an omission-only certificate produced
+// "0 stale fact(s) and 0 dangling fact(s)" with an EMPTY unsound_facts array —
+// a refusal that will not say what it found, handed to an agent that must now
+// guess. Its how_to_proceed said "regenerate with make_drawing", which for an
+// omission is the right remedy but reads as a non-sequitur beside a reason
+// naming nothing.
+
+cert = {
+  sound: false,
+  counts: { consistent: 3, stale: 0, dangling: 0, omitted: 1 },
+  facts: [
+    { label: "25.00", live: { verdict: "consistent" } },
+    {
+      label: "bore ⌀10.00 on the model has no hole-table row",
+      live: { verdict: "omitted" },
+    },
+  ],
+  quality: { passed: true, sheet_utilization: 0.41, issues: [] },
+};
+
+const pdfCountBeforeOmission = counts.pdf;
+const o1 = await call("drawing_export_sheet", exportArgs);
+check("a sheet OMITTING a model feature is refused, and the refusal names it", () => {
+  assert.ok(isRefusal(o1, "sheet_unsound"));
+  assert.equal(counts.pdf, pdfCountBeforeOmission, "artifact endpoint never hit");
+  const j = firstJson(o1);
+  assert.match(j.reason, /1 omitted/, "the reason counts the omission");
+  assert.ok(
+    j.unsound_facts.length > 0,
+    "the omitted feature is a witness, not just a number",
+  );
+  assert.match(j.unsound_facts.join(" "), /bore/, "the witness identifies the bore");
+  assert.match(
+    j.how_to_proceed,
+    /bore/,
+    "the remedy names the feature that is missing, not just 'regenerate'",
+  );
+});
+
+const o2 = await call("drawing_export_sheet", {
+  ...exportArgs,
+  acknowledge_layout_issues: true,
+});
+check("acknowledge_layout_issues does NOT bypass an omission", () => {
+  assert.ok(isRefusal(o2, "sheet_unsound"));
+  assert.equal(counts.pdf, pdfCountBeforeOmission);
+});
+
 // ─── 4. unreadable certificate fails CLOSED ─────────────────────────────────
 
 // Captured rather than hardcoded: the property this check actually owns is

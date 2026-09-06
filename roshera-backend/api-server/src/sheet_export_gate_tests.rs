@@ -681,3 +681,156 @@ async fn junk_acknowledge_layout_issues_does_not_open_the_one_call_svg_bypass() 
         "junk acknowledge_layout_issues must never open the one-call svg bypass; body = {body}"
     );
 }
+
+// =====================================================================
+// 6. Omission — the sheet leaves out a bore the model carries
+// =====================================================================
+
+/// Build a 40x40x20 plate with one Ø10 through bore directly in the live
+/// model, and register its standard sheet.
+///
+/// The boolean is done in the kernel rather than through
+/// `POST /api/geometry/boolean` because that route sits behind
+/// `require_declared_intent`, and the subject under test is the CERTIFICATE,
+/// not the intent gate. Same spirit as `make_a_dimension_stale`: touch the
+/// one thing the fixture is about, through the shortest honest path.
+async fn bored_part_drawing(state: &AppState) -> (Uuid, u32) {
+    use geometry_engine::math::{Point3, Vector3};
+    use geometry_engine::operations::boolean::{boolean_operation, BooleanOp, BooleanOptions};
+    use geometry_engine::primitives::topology_builder::{GeometryId, TopologyBuilder};
+
+    let solid_id = {
+        let mut model = state.model.write().await;
+        model.set_event_key(Some("gate-bored-plate".to_string()));
+        let plate = match TopologyBuilder::new(&mut model).create_box_3d(40.0, 40.0, 20.0) {
+            Ok(GeometryId::Solid(s)) => s,
+            other => panic!("expected a solid plate, got {other:?}"),
+        };
+        let bore = match TopologyBuilder::new(&mut model).create_cylinder_3d(
+            Point3::new(0.0, 0.0, -20.0),
+            Vector3::Z,
+            5.0,
+            80.0,
+        ) {
+            Ok(GeometryId::Solid(s)) => s,
+            other => panic!("expected a solid bore, got {other:?}"),
+        };
+        let part = boolean_operation(
+            &mut model,
+            plate,
+            bore,
+            BooleanOp::Difference,
+            BooleanOptions::default(),
+        )
+        .expect("difference must succeed");
+        model.set_event_key(None);
+        part
+    };
+
+    let (status, body) = dispatch(
+        state,
+        post(&format!("/api/parts/{solid_id}/drawing"), json!({})),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "bored part drawing create must 200; body = {body}"
+    );
+    let drawing_id = Uuid::parse_str(body["id"].as_str().expect("drawing id string"))
+        .expect("drawing id must parse");
+    (drawing_id, solid_id)
+}
+
+/// Reach into the registered drawing and DROP a hole row, leaving the model
+/// untouched — the sheet now omits a bore the part carries. The exact mirror
+/// of `make_a_dimension_stale`: mutate the sheet, never the model, so the
+/// certificate has exactly one thing to find.
+async fn drop_a_hole_row(state: &AppState, drawing_id: Uuid) {
+    let handle = state
+        .drawings
+        .get(&drawing_id)
+        .expect("drawing must be registered before it can be mutated");
+    let mut guard = handle.write().await;
+    assert!(
+        !guard.hole_sites.is_empty(),
+        "fixture precondition: the bored plate's sheet must table its bore"
+    );
+    guard.hole_sites.remove(0);
+}
+
+/// THE GATE, omission branch. A sheet that omits a bore the model carries is
+/// refused — and the refusal SAYS SO.
+///
+/// Before this fix the gate fired correctly (`!cert.sound`) and then built its
+/// message from `stale` and `dangling` alone, so an omission-only refusal read
+/// "0 stale fact(s) ... and 0 dangling fact(s)": a refusal whose stated reason
+/// is empty, handed to an agent that must now guess what to change. In a
+/// product whose thesis is that the kernel cannot lie, a refusal that will not
+/// say what it found is the same defect one level up.
+///
+/// Mutation: drop `omitted` from the message → RED on the message assertion.
+#[tokio::test]
+async fn an_omitted_bore_is_refused_with_a_refusal_that_names_the_omission() {
+    for kind in ["pdf", "dxf", "svg"] {
+        let state = make_test_state().await;
+        let (drawing_id, _solid_id) = bored_part_drawing(&state).await;
+        drop_a_hole_row(&state, drawing_id).await;
+
+        let (status, body) =
+            dispatch(&state, get(&format!("/api/drawings/{drawing_id}/{kind}"))).await;
+        assert_sheet_refusal(
+            status,
+            &body,
+            drawing_id,
+            "sheet_unsound",
+            StatusCode::CONFLICT,
+            &format!("{kind} export of a sheet omitting a bore"),
+        );
+
+        // The counts must disclose the omission, not report an empty reason.
+        assert_eq!(
+            body["details"]["omitted"].as_u64(),
+            Some(1),
+            "{kind} refusal must report the omitted count; body = {body}"
+        );
+        assert_eq!(
+            body["details"]["stale"].as_u64(),
+            Some(0),
+            "{kind} fixture must be omission-ONLY; body = {body}"
+        );
+        assert_eq!(
+            body["details"]["dangling"].as_u64(),
+            Some(0),
+            "{kind} fixture must be omission-ONLY; body = {body}"
+        );
+
+        // The message must name what was found, in words a reader acts on.
+        // The catalog serialises the human message under "error".
+        let msg = body["error"].as_str().unwrap_or_default();
+        assert!(
+            msg.contains("1 omitted"),
+            "{kind} refusal message must name the omission; message = {msg}"
+        );
+        assert!(
+            !msg.contains("  "),
+            "no absorbed indentation in a user-facing message; message = {msg}"
+        );
+
+        // And it must hand over a WITNESS: which feature is missing.
+        let witness = body["details"]["omitted_facts"]
+            .as_array()
+            .unwrap_or(&Vec::new())
+            .clone();
+        assert!(
+            !witness.is_empty(),
+            "{kind} refusal must name the omitted feature, not just count it; body = {body}"
+        );
+        assert!(
+            witness
+                .iter()
+                .any(|w| w.as_str().unwrap_or_default().contains("bore")),
+            "{kind} witness must identify the bore; witness = {witness:?}"
+        );
+    }
+}
