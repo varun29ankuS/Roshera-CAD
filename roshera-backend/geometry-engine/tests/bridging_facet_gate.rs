@@ -50,6 +50,12 @@ const TAU: f64 = std::f64::consts::TAU;
 
 /// The three `u` values of the worst facet on the live piston's skirt, copied
 /// from a diagnostic dump of the real tessellation rather than constructed.
+// Reason: clippy::approx_constant sees FRAC_PI_2 in the first literal. Writing
+// the constant here would be a lie -- these are MEASURED values transcribed
+// from a dump, and one of them landing on pi/2 is the datum, not an
+// approximation of it. Substituting the constant would also silently repair a
+// future drift the file exists to detect.
+#[allow(clippy::approx_constant)]
 const MEASURED_U: [f64; 3] = [1.5707963267948966, 1.5751797782219734, 4.71238898038469];
 
 /// The premise this whole file rests on: the measured facet's coverage really

@@ -35,7 +35,13 @@
 //! defect (open-edge / non-manifold counts, `oriented`, which certificate
 //! dimension is false) and NEVER `panic!`s on a build failure — a failed op is
 //! itself a reportable datum, recorded as DID-NOT-BUILD (an honest reject is not
-//! a bug). This file SURFACES bugs; it does not gate them.
+//! a bug).
+//!
+//! Every test GATES its table (2026-09-06). It used to discard `render`'s count
+//! at every site, so it printed 33 FAILs across 95 cases while the runner
+//! printed `9 passed; 0 failed`. `gate()` now asserts BUILT-BUT-CORRUPT == 0
+//! (the defect count) and DID-NOT-BUILD == the pinned refusal count, so a
+//! finding fails a build instead of scrolling past.
 //!
 //! Run: cargo test -p geometry-engine --test blend_weld_stress -- --nocapture
 
@@ -213,9 +219,33 @@ fn judge(model: &mut BRepModel, solid: SolidId, result: Result<(), String>) -> V
     }
 }
 
+/// One rendered row.
+struct Row {
+    case: String,
+    pass: bool,
+    built: bool,
+    defect: String,
+}
+
+/// The verdict counts of one table. `fails == corrupt + refused` by
+/// construction: a non-PASS row either BUILT and failed an oracle (`corrupt`
+/// — a kernel DEFECT) or never built (`refused` — a typed rejection, which
+/// this harness's own `class_tag` calls "honest, not a bug").
+///
+/// Both halves are asserted by every test. `corrupt` is the defect gate; the
+/// `refused` pin is a two-way ratchet on the kernel's envelope — a case that
+/// starts building must be re-pinned once the oracles have judged it, and a
+/// case that regresses from BUILT to refusing turns the test red.
+struct Counts {
+    total: usize,
+    fails: usize,
+    corrupt: usize,
+    refused: usize,
+}
+
 /// Row accumulator so each test prints a clean PASS/FAIL table.
 struct Table {
-    rows: Vec<(String, bool, String)>,
+    rows: Vec<Row>,
 }
 
 impl Table {
@@ -224,31 +254,73 @@ impl Table {
     }
 
     fn add(&mut self, case: &str, v: &Verdict) {
-        self.rows.push((case.to_string(), v.pass(), v.defect()));
+        self.rows.push(Row {
+            case: case.to_string(),
+            pass: v.pass(),
+            built: v.built,
+            defect: v.defect(),
+        });
     }
 
-    /// Print the table and return the number of FAILs.
-    fn render(&self, title: &str) -> usize {
+    /// Print the table and return its counts.
+    fn render(&self, title: &str) -> Counts {
         eprintln!("\n================ {title} ================");
         eprintln!("{:<54} {:<6} {}", "CASE", "RESULT", "DEFECT");
         eprintln!("{}", "-".repeat(130));
         let mut fails = 0usize;
-        for (case, pass, defect) in &self.rows {
-            let tag = if *pass { "PASS" } else { "FAIL" };
-            if !*pass {
+        let mut corrupt = 0usize;
+        let mut refused = 0usize;
+        for row in &self.rows {
+            let tag = if row.pass { "PASS" } else { "FAIL" };
+            if !row.pass {
                 fails += 1;
+                if row.built {
+                    corrupt += 1;
+                } else {
+                    refused += 1;
+                }
             }
-            eprintln!("{case:<54} {tag:<6} {defect}");
+            eprintln!("{:<54} {tag:<6} {}", row.case, row.defect);
         }
         eprintln!("{}", "-".repeat(130));
         eprintln!(
-            "{title}: {} cases, {} PASS, {} FAIL",
+            "{title}: {} cases, {} PASS, {} FAIL ({} BUILT-BUT-CORRUPT, {} DID-NOT-BUILD)",
             self.rows.len(),
             self.rows.len() - fails,
-            fails
+            fails,
+            corrupt,
+            refused
         );
-        fails
+        Counts {
+            total: self.rows.len(),
+            fails,
+            corrupt,
+            refused,
+        }
     }
+}
+
+/// Turn a rendered table into the test's own verdict.
+///
+/// Until 2026-09-06 every one of these tests discarded `render`'s count
+/// (`let _ = fails;`) and reported green forever: the harness printed 33
+/// FAILs across 95 cases and the runner printed `9 passed; 0 failed`. A
+/// bug-hunt whose findings cannot fail a build is a report nobody reads.
+///
+/// `refused_pin` is the DID-NOT-BUILD count measured on 2026-09-06.
+#[track_caller]
+fn gate(c: &Counts, title: &str, refused_pin: usize) {
+    assert_eq!(
+        c.corrupt, 0,
+        "{title}: {} of {} case(s) BUILT and then failed an oracle; the table above names each defect",
+        c.corrupt, c.total
+    );
+    assert_eq!(
+        c.refused, refused_pin,
+        "{title}: {} of {} case(s) DID-NOT-BUILD, pinned at {}; the kernel's envelope moved - read the table and re-pin",
+        c.refused, c.total, refused_pin
+    );
+    debug_assert_eq!(c.fails, c.corrupt + c.refused);
 }
 
 // ---------------------------------------------------------------------------
@@ -589,12 +661,12 @@ fn blend_weld_sphere_union_cylinder() {
         }
     }
 
-    let fails = table.render("BLEND-WELD: sphere∪cylinder seam");
+    let counts = table.render("BLEND-WELD: sphere∪cylinder seam");
     eprintln!(
         "NOTE: a curved sphere↔cylinder SSI seam fillet/chamfer is a prime new-bug \
          candidate (general curved-CDT path; the cone-rim/bore-rim fixes were the same class)."
     );
-    let _ = fails;
+    gate(&counts, "BLEND-WELD sphere∪cylinder seam", 6);
 }
 
 // ===========================================================================
@@ -668,7 +740,8 @@ fn blend_weld_torus_edges() {
         }
     }
 
-    table.render("BLEND-WELD: torus edges");
+    let counts = table.render("BLEND-WELD: torus edges");
+    gate(&counts, "BLEND-WELD torus edges", 4);
 }
 
 // ===========================================================================
@@ -711,13 +784,13 @@ fn blend_weld_cone_edges() {
         }
     }
 
-    let fails = table.render("BLEND-WELD: cone edges (configs × radii)");
+    let counts = table.render("BLEND-WELD: cone edges (configs × radii)");
     eprintln!(
         "NOTE: cone-rim fillet was JUST FIXED (#89, 5d31f3d). Any FAIL on a cone-rim \
          fillet/chamfer with the BLEND-WELD signature is a candidate REGRESSION or a \
          new config the conforming mesher does not yet cover."
     );
-    let _ = fails;
+    gate(&counts, "BLEND-WELD cone edges", 18);
 }
 
 // ===========================================================================
@@ -785,7 +858,8 @@ fn blend_weld_cylinder_rims_and_lateral() {
         );
     }
 
-    table.render("BLEND-WELD: cylinder cap rims + lateral");
+    let counts = table.render("BLEND-WELD: cylinder cap rims + lateral");
+    gate(&counts, "BLEND-WELD cylinder cap rims + lateral", 1);
 }
 
 // ===========================================================================
@@ -862,13 +936,13 @@ fn blend_weld_annular_cap_rims() {
         }
     }
 
-    let fails = table.render("BLEND-WELD: annular-cap OUTER + BORE rims");
+    let counts = table.render("BLEND-WELD: annular-cap OUTER + BORE rims");
     eprintln!(
         "NOTE: bore-rim chamfer was JUST FIXED (1a03aff, cone-blend conforming weld). \
          Outer-rim fillet of an annular cap is the documented-FIXED #26 path. Any FAIL \
          here with the BLEND-WELD signature is a regression or an uncovered config."
     );
-    let _ = fails;
+    gate(&counts, "BLEND-WELD annular-cap OUTER + BORE rims", 0);
 }
 
 fn no_rim(table: &mut Table, label: &str) {
@@ -888,6 +962,7 @@ fn no_rim(table: &mut Table, label: &str) {
 // ===========================================================================
 
 #[test]
+#[ignore = "known red: 2 of 4 lofts build UNSOUND - circle25>square40>circle15 certifies mesh_q_clean=false, square20>circle8 certifies self_int_free=false and tess_clean=false (measured 2026-09-06); the 3rd FAIL is the Cubic loft honestly refusing with InvalidBRep(1999 OrientationErrors), pinned as a refusal"]
 fn broaden_loft_varied_sections() {
     let mut table = Table::new();
 
@@ -929,7 +1004,8 @@ fn broaden_loft_varied_sections() {
         table.add("loft circle12→20→6 (Cubic/smooth)", &v);
     }
 
-    table.render("BROADEN: loft varied cross-sections");
+    let counts = table.render("BROADEN: loft varied cross-sections");
+    gate(&counts, "BROADEN loft varied cross-sections", 1);
 }
 
 /// Loft `profiles`, judging the result solid only on success — a build failure
@@ -985,12 +1061,12 @@ fn broaden_shell_varied_thickness() {
         table.add(&format!("shell box20 (top open) t={t}"), &v);
     }
 
-    let fails = table.render("BROADEN: shell varied thickness");
+    let counts = table.render("BROADEN: shell varied thickness");
     eprintln!(
         "NOTE: very thin walls (t≤0.2 of a 20-box) are the self-intersection / \
          mesh-quality candidate — watch self_int_free / mesh_q_clean in the cert line."
     );
-    let _ = fails;
+    gate(&counts, "BROADEN shell varied thickness", 0);
 }
 
 /// The box's +Z face, located by surface normal.
@@ -1096,7 +1172,8 @@ fn broaden_sweep_and_revolve_blend() {
         }
     }
 
-    table.render("BROADEN: sweep + revolve-with-blend");
+    let counts = table.render("BROADEN: sweep + revolve-with-blend");
+    gate(&counts, "BROADEN sweep + revolve-with-blend", 1);
 }
 
 /// Closed CCW `w×h` rectangle in the XY plane (z = 0).
@@ -1174,9 +1251,9 @@ fn known_bug_intersecting_bores_reference() {
         }
     }
 
-    let fails = table.render("KNOWN-bug reference: #35 intersecting bores");
+    let counts = table.render("KNOWN-bug reference: #35 intersecting bores");
     eprintln!("NOTE: any FAIL here is the KNOWN #35 cyl-cyl saddle, NOT a blend-weld bug.");
-    let _ = fails;
+    gate(&counts, "KNOWN-bug reference: #35 intersecting bores", 0);
 }
 
 // Surface helper to keep imports honest (used by count-based assertions in

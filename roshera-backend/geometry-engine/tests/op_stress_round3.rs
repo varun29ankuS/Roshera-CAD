@@ -22,11 +22,19 @@
 //!   DID-NOT-BUILD     — op returned Err (honest reject or a build failure);
 //!                       the line carries the typed error string
 //!
-//! Nothing here weakens an existing harness: these are NEW cases. The battery is
-//! a hunt, so a CORRUPT verdict is REPORTED (printed + counted), not asserted —
-//! the run completes and prints the full table even when bugs are present. A
-//! single guard test at the end fails only if a case PANICKED (a hard crash),
-//! which is itself a finding.
+//! Nothing here weakens an existing harness: these are NEW cases. Every test
+//! prints its full set of verdict lines and a `CaseGate` guard judges them on
+//! the way out (2026-09-06) — no data is lost to the panic, and a corruption
+//! this hunt finds now fails a build. Before that the counts went to a static
+//! nothing gated on, so all 24 tests reported green whatever they found.
+//!
+//! BOTH counts are judged: BUILT-BUT-CORRUPT must be 0, and DID-NOT-BUILD must
+//! equal the per-test refusal count measured on 2026-09-06. A typed refusal is
+//! honest kernel behaviour, not a defect — but pinning it makes the kernel's
+//! refusal envelope a two-way ratchet, so a case that starts building and a
+//! case that regresses into refusing are both caught. `report_err` bumps a
+//! thread-local, so the attribution is per test and does not depend on parsing
+//! interleaved stdout.
 
 use std::f64::consts::{PI, TAU};
 use std::sync::Mutex;
@@ -57,6 +65,70 @@ static CORRUPT_COUNT: Mutex<usize> = Mutex::new(0);
 fn bump_corrupt() {
     if let Ok(mut g) = CORRUPT_COUNT.lock() {
         *g += 1;
+    }
+    CASE_CORRUPT.with(|c| c.set(c.get() + 1));
+}
+
+thread_local! {
+    /// BUILT-BUT-CORRUPT verdicts recorded by `report` on THIS test's thread.
+    /// libtest runs each `#[test]` on its own thread, so this is a per-test
+    /// count. `CaseGate::open` resets it at the top of every test anyway, so
+    /// the count can never inherit a value from anything that ran before it.
+    static CASE_CORRUPT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// DID-NOT-BUILD verdicts recorded by `report_err` on THIS test's thread.
+    static CASE_REFUSED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// One test's verdict gate: opened at the top of the body, closed on the way
+/// out -- however the test leaves.
+///
+/// Before 2026-09-06 every corrupt verdict this hunt found went into a static
+/// that only `zz_summary` PRINTED, so the runner reported green no matter what
+/// the harness had just discovered. `report` / `report_err` still print the
+/// full set of verdict lines first; the counts are judged after them, not at
+/// the first bad case, so no data is lost to the panic.
+///
+/// It is a `Drop` guard rather than a call at the end of the body because
+/// several of these tests `return` EARLY when a setup step refuses. A trailing
+/// call sits after those returns and is skipped -- so a CORRUPT verdict on an
+/// earlier step followed by a refusal on a later one exited GREEN. The guard
+/// cannot be skipped by any exit path.
+struct CaseGate {
+    test: &'static str,
+    /// The DID-NOT-BUILD count measured on 2026-09-06. Pinning it makes the
+    /// kernel's refusal envelope a two-way ratchet: a case that starts building
+    /// goes red (re-pin once the oracles have judged it), and a case that
+    /// regresses from BUILT to refusing goes red too.
+    refused_pin: usize,
+}
+
+impl CaseGate {
+    fn open(test: &'static str, refused_pin: usize) -> Self {
+        CASE_CORRUPT.with(|c| c.set(0));
+        CASE_REFUSED.with(|c| c.set(0));
+        CaseGate { test, refused_pin }
+    }
+}
+
+impl Drop for CaseGate {
+    fn drop(&mut self) {
+        // Already unwinding: asserting here would abort the process and bury
+        // the real failure. The test is failing either way.
+        if std::thread::panicking() {
+            return;
+        }
+        let corrupt = CASE_CORRUPT.with(|c| c.replace(0));
+        let refused = CASE_REFUSED.with(|c| c.replace(0));
+        assert_eq!(
+            corrupt, 0,
+            "{}: {corrupt} BUILT-BUT-CORRUPT verdict(s); the lines printed above name each defect",
+            self.test
+        );
+        assert_eq!(
+            refused, self.refused_pin,
+            "{}: {refused} DID-NOT-BUILD verdict(s), pinned at {}; the kernel's envelope moved - read the lines above and re-pin",
+            self.test, self.refused_pin
+        );
     }
 }
 
@@ -135,6 +207,7 @@ fn report(model: &mut BRepModel, solid: SolidId, case: &str) {
 
 /// For ops that may legitimately refuse: print DID-NOT-BUILD with the typed error.
 fn report_err(case: &str, err: &impl std::fmt::Debug) {
+    CASE_REFUSED.with(|c| c.set(c.get() + 1));
     println!("DID-NOT-BUILD      | {case} | err={err:?}");
 }
 
@@ -290,6 +363,7 @@ fn bool_opts() -> BooleanOptions {
 
 #[test]
 fn boolean_offset_rotated_boxes() {
+    let _gate = CaseGate::open("boolean_offset_rotated_boxes", 0);
     // Union / difference / intersection of an axis-aligned box with a box that is
     // both offset AND rotated 30° about Z (general-position imprint, no
     // coincident faces). The classic over-inclusion / rotated-input class.
@@ -314,6 +388,7 @@ fn boolean_offset_rotated_boxes() {
 
 #[test]
 fn boolean_box_cylinder_non_saddle() {
+    let _gate = CaseGate::open("boolean_box_cylinder_non_saddle", 0);
     // box ± cylinder, axis along Z, cylinder fully through the box top face
     // (a through-hole for difference; a boss-overlap for union). NOT the #35
     // cyl-cyl saddle — one operand is a box, so the SSI is plane×cylinder.
@@ -337,6 +412,7 @@ fn boolean_box_cylinder_non_saddle() {
 
 #[test]
 fn boolean_box_sphere() {
+    let _gate = CaseGate::open("boolean_box_sphere", 0);
     // box ± sphere, sphere centred on a box face (partial poke). plane×sphere SSI.
     for &op in &[
         BooleanOp::Difference,
@@ -357,6 +433,7 @@ fn boolean_box_sphere() {
 
 #[test]
 fn boolean_partial_overlap_boxes() {
+    let _gate = CaseGate::open("boolean_partial_overlap_boxes", 0);
     // Two axis-aligned boxes overlapping on one corner octant (general 3-axis
     // partial overlap, but axis-aligned so faces are parallel not coincident).
     for &op in &[
@@ -394,6 +471,7 @@ fn boolean_partial_overlap_boxes() {
 /// + certificate-sound, so a regression here fails the build (boolean is gated).
 #[test]
 fn boolean_corner_octant_difference_and_intersection_sound() {
+    let _gate = CaseGate::open("boolean_corner_octant_difference_and_intersection_sound", 0);
     for &op in &[BooleanOp::Difference, BooleanOp::Intersection] {
         let mut m = BRepModel::new();
         let a = box_solid(&mut m, 4.0, 4.0, 4.0);
@@ -435,6 +513,7 @@ fn boolean_corner_octant_difference_and_intersection_sound() {
 
 #[test]
 fn boolean_adjacent_face_touch_boxes() {
+    let _gate = CaseGate::open("boolean_adjacent_face_touch_boxes", 0);
     // Two boxes sharing exactly one coincident face (union of stacked blocks).
     // This is the known coincident-face class (#32-adjacent) — note if hit.
     for &op in &[BooleanOp::Union] {
@@ -457,6 +536,7 @@ fn boolean_adjacent_face_touch_boxes() {
 
 #[test]
 fn boolean_coincident_full_overlap() {
+    let _gate = CaseGate::open("boolean_coincident_full_overlap", 1);
     // Two identical coincident boxes: A∪A, A∩A, A∖A. A∖A should be the EMPTY
     // solid (honest EmptyResult); A∪A and A∩A should equal A. Tests idempotence
     // + the coincident-everywhere degenerate.
@@ -482,6 +562,7 @@ fn boolean_coincident_full_overlap() {
 
 #[test]
 fn boolean_disjoint_boxes() {
+    let _gate = CaseGate::open("boolean_disjoint_boxes", 1);
     // Disjoint boxes: union = two shells (multi-body), intersection = empty,
     // difference = A unchanged. Tests the empty/disjoint honest paths.
     for &op in &[
@@ -508,6 +589,7 @@ fn boolean_disjoint_boxes() {
 
 #[test]
 fn pattern_linear_boxes_each_and_union() {
+    let _gate = CaseGate::open("pattern_linear_boxes_each_and_union", 2);
     // Linear pattern of 4 boxes via deep_clone + offset, validate each instance,
     // then union the whole array and validate the combined result.
     let mut m = BRepModel::new();
@@ -534,6 +616,7 @@ fn pattern_linear_boxes_each_and_union() {
 
 #[test]
 fn pattern_circular_boxes_each_and_union() {
+    let _gate = CaseGate::open("pattern_circular_boxes_each_and_union", 0);
     // Circular pattern: 6 boxes around Z, each translated out +X then rotated
     // about the origin. Validate each instance and the union.
     let mut m = BRepModel::new();
@@ -559,6 +642,7 @@ fn pattern_circular_boxes_each_and_union() {
 
 #[test]
 fn transform_mirror_box() {
+    let _gate = CaseGate::open("transform_mirror_box", 0);
     // Mirror a box across a plane offset from it (so the mirror image is a
     // distinct solid). Validate the mirrored solid.
     let mut m = BRepModel::new();
@@ -575,6 +659,7 @@ fn transform_mirror_box() {
 
 #[test]
 fn transform_chained_rotate_translate_scale() {
+    let _gate = CaseGate::open("transform_chained_rotate_translate_scale", 0);
     // Chain: rotate 45° about an arbitrary axis, translate, then scale-about-point.
     // Validate after the chain (each transform validates its own result too).
     let mut m = BRepModel::new();
@@ -596,6 +681,7 @@ fn transform_chained_rotate_translate_scale() {
 
 #[test]
 fn draft_box_side_face() {
+    let _gate = CaseGate::open("draft_box_side_face", 0);
     // Draft the +X side face of a box about its mid-plane (the documented
     // in-place prismatic path). Re-stresses with validate_result OFF so the
     // cert/manifold checks are the ones doing the verification here.
@@ -619,6 +705,7 @@ fn draft_box_side_face() {
 
 #[test]
 fn offset_box_shell() {
+    let _gate = CaseGate::open("offset_box_shell", 0);
     // Offset (shell/hollow) a box: remove the top (+Z) face and hollow to a 1.0
     // wall. The classic shell self-intersection class lives here.
     let mut m = BRepModel::new();
@@ -646,6 +733,7 @@ fn offset_box_shell() {
 
 #[test]
 fn offset_box_shell_closed() {
+    let _gate = CaseGate::open("offset_box_shell_closed", 0);
     // Shell a box with NO removed faces (fully-enclosed hollow → cavity).
     let mut m = BRepModel::new();
     let solid = box_solid(&mut m, 10.0, 10.0, 10.0);
@@ -661,6 +749,7 @@ fn offset_box_shell_closed() {
 
 #[test]
 fn loft_three_circles() {
+    let _gate = CaseGate::open("loft_three_circles", 0);
     // 3 coaxial circles of decreasing radius (a smooth bulge → waist → tip).
     let mut m = BRepModel::new();
     let c0 = circle_profile(&mut m, Point3::new(0.0, 0.0, 0.0), 10.0);
@@ -680,7 +769,9 @@ fn loft_three_circles() {
 }
 
 #[test]
+#[ignore = "known red: loft square-circle-square with dissimilar sections BUILDS and is scoped-valid, but the welded mesh is NOT consistently oriented (be=0 nme=0 oriented=false) and certify_solid fails on oriented, self_intersection_free, tessellation and mesh_quality (measured 2026-09-06); same defect family as loft_four_sections"]
 fn loft_square_circle_square_dissimilar() {
+    let _gate = CaseGate::open("loft_square_circle_square_dissimilar", 0);
     // 3 sections alternating square→circle→square (dissimilar-shape correspondence).
     let mut m = BRepModel::new();
     let s0 = square_profile(&mut m, Point3::new(-5.0, -5.0, 0.0), 10.0);
@@ -700,7 +791,9 @@ fn loft_square_circle_square_dissimilar() {
 }
 
 #[test]
+#[ignore = "known red: loft of 4 alternating circle/square sections BUILDS and is scoped-valid, but the welded mesh is NOT consistently oriented (be=0 nme=0 oriented=false) and certify_solid fails on oriented, self_intersection_free, tessellation and mesh_quality (measured 2026-09-06); same defect family as loft_square_circle_square_dissimilar and blend_weld_stress::broaden_loft_varied_sections"]
 fn loft_four_sections() {
+    let _gate = CaseGate::open("loft_four_sections", 0);
     // 4 sections (circle→square→circle→square) — longer chain.
     let mut m = BRepModel::new();
     let c0 = circle_profile(&mut m, Point3::new(0.0, 0.0, 0.0), 8.0);
@@ -726,6 +819,7 @@ fn loft_four_sections() {
 
 #[test]
 fn revolve_partial_angles() {
+    let _gate = CaseGate::open("revolve_partial_angles", 1);
     for (deg, caps) in [
         (90.0f64, true),
         (180.0, true),
@@ -753,6 +847,7 @@ fn revolve_partial_angles() {
 
 #[test]
 fn revolve_full_no_caps() {
+    let _gate = CaseGate::open("revolve_full_no_caps", 0);
     let mut m = BRepModel::new();
     let edges = rect_xz(&mut m, 3.0, 6.0, 0.0, 4.0);
     let opts = RevolveOptions {
@@ -769,6 +864,7 @@ fn revolve_full_no_caps() {
 
 #[test]
 fn revolve_axis_touching_profile() {
+    let _gate = CaseGate::open("revolve_axis_touching_profile", 0);
     // Profile touching the axis (x0 = 0) → revolve makes a solid disc/cone, not a
     // tube. A degenerate-radius seam class.
     let mut m = BRepModel::new();
@@ -791,6 +887,7 @@ fn revolve_axis_touching_profile() {
 
 #[test]
 fn sweep_tapered_prism() {
+    let _gate = CaseGate::open("sweep_tapered_prism", 0);
     // Sweep a rectangle along +Z with a linear scale taper 1.0 → 0.5.
     let mut m = BRepModel::new();
     let profile = rect_xy(&mut m, 4.0, 4.0);
@@ -813,6 +910,7 @@ fn sweep_tapered_prism() {
 
 #[test]
 fn sweep_straight_prism_baseline() {
+    let _gate = CaseGate::open("sweep_straight_prism_baseline", 0);
     // Plain straight sweep (baseline; should be solidly BUILT+SOUND).
     let mut m = BRepModel::new();
     let profile = rect_xy(&mut m, 3.0, 2.0);
@@ -827,11 +925,13 @@ fn sweep_straight_prism_baseline() {
 
 // ===========================================================================
 // Guard: no case may PANIC. (A hard crash is itself a finding worth failing on.)
-// CORRUPT verdicts are reported, not asserted — this is a hunt.
+// CORRUPT verdicts are judged per test by the `CaseGate` guard; this summary
+// prints the cross-test tally, which is informational only.
 // ===========================================================================
 
 #[test]
 fn zz_summary() {
+    let _gate = CaseGate::open("zz_summary", 0);
     // Runs last alphabetically; prints the corrupt count seen so far in THIS
     // binary's run. (Each #[test] runs in the same process; ordering is not
     // guaranteed across threads, so this is informational only.)

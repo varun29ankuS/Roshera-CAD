@@ -27,10 +27,20 @@
 //! CORRUPT verdict names WHICH step introduced the defect (the first step whose
 //! verdict turns CORRUPT is the culprit).
 //!
-//! This is a HUNT: CORRUPT verdicts are REPORTED (printed + counted), not
-//! asserted, so the full table always prints even with bugs present. The only
-//! hard assertion is the final guard — it fails if any case PANICKED (a crash is
-//! itself a finding). These are all NEW cases; no existing harness is weakened.
+//! Every test prints its full set of verdict lines and a `CaseGate` guard
+//! judges them on the way out (2026-09-06), so no data is lost to the panic and
+//! a corruption this hunt finds fails a build. Before that the counts went to a
+//! static nothing gated on, and all 25 tests reported green whatever they
+//! found. The guard is a `Drop` impl because several tests `return` EARLY when
+//! a setup step refuses — a trailing call sits after those returns and is
+//! skipped.
+//!
+//! BOTH counts are judged: BUILT-BUT-CORRUPT must be 0, and DID-NOT-BUILD must
+//! equal the per-test refusal count measured on 2026-09-06. A typed refusal is
+//! honest kernel behaviour, not a defect — but pinning it makes the kernel's
+//! refusal envelope a two-way ratchet. `report_err` bumps a thread-local, so
+//! the attribution is per test and does not depend on parsing interleaved
+//! stdout. These are all NEW cases; no existing harness is weakened.
 
 #![allow(clippy::expect_used)]
 #![allow(clippy::unwrap_used)]
@@ -68,6 +78,70 @@ static PANIC_COUNT: Mutex<usize> = Mutex::new(0);
 fn bump_corrupt() {
     if let Ok(mut g) = CORRUPT_COUNT.lock() {
         *g += 1;
+    }
+    CASE_CORRUPT.with(|c| c.set(c.get() + 1));
+}
+
+thread_local! {
+    /// BUILT-BUT-CORRUPT verdicts recorded by `report` on THIS test's thread.
+    /// libtest runs each `#[test]` on its own thread, so this is a per-test
+    /// count. `CaseGate::open` resets it at the top of every test anyway, so
+    /// the count can never inherit a value from anything that ran before it.
+    static CASE_CORRUPT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// DID-NOT-BUILD verdicts recorded by `report_err` on THIS test's thread.
+    static CASE_REFUSED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// One test's verdict gate: opened at the top of the body, closed on the way
+/// out -- however the test leaves.
+///
+/// Before 2026-09-06 every corrupt verdict this hunt found went into a static
+/// that only `zz_summary` PRINTED, so the runner reported green no matter what
+/// the harness had just discovered. `report` / `report_err` still print the
+/// full set of verdict lines first; the counts are judged after them, not at
+/// the first bad case, so no data is lost to the panic.
+///
+/// It is a `Drop` guard rather than a call at the end of the body because
+/// several of these tests `return` EARLY when a setup step refuses. A trailing
+/// call sits after those returns and is skipped -- so a CORRUPT verdict on an
+/// earlier step followed by a refusal on a later one exited GREEN. The guard
+/// cannot be skipped by any exit path.
+struct CaseGate {
+    test: &'static str,
+    /// The DID-NOT-BUILD count measured on 2026-09-06. Pinning it makes the
+    /// kernel's refusal envelope a two-way ratchet: a case that starts building
+    /// goes red (re-pin once the oracles have judged it), and a case that
+    /// regresses from BUILT to refusing goes red too.
+    refused_pin: usize,
+}
+
+impl CaseGate {
+    fn open(test: &'static str, refused_pin: usize) -> Self {
+        CASE_CORRUPT.with(|c| c.set(0));
+        CASE_REFUSED.with(|c| c.set(0));
+        CaseGate { test, refused_pin }
+    }
+}
+
+impl Drop for CaseGate {
+    fn drop(&mut self) {
+        // Already unwinding: asserting here would abort the process and bury
+        // the real failure. The test is failing either way.
+        if std::thread::panicking() {
+            return;
+        }
+        let corrupt = CASE_CORRUPT.with(|c| c.replace(0));
+        let refused = CASE_REFUSED.with(|c| c.replace(0));
+        assert_eq!(
+            corrupt, 0,
+            "{}: {corrupt} BUILT-BUT-CORRUPT verdict(s); the lines printed above name each defect",
+            self.test
+        );
+        assert_eq!(
+            refused, self.refused_pin,
+            "{}: {refused} DID-NOT-BUILD verdict(s), pinned at {}; the kernel's envelope moved - read the lines above and re-pin",
+            self.test, self.refused_pin
+        );
     }
 }
 
@@ -146,6 +220,7 @@ fn report(model: &mut BRepModel, solid: SolidId, case: &str) {
 }
 
 fn report_err(case: &str, err: &impl std::fmt::Debug) {
+    CASE_REFUSED.with(|c| c.set(c.get() + 1));
     println!("DID-NOT-BUILD      | {case} | err={err:?}");
 }
 
@@ -387,6 +462,7 @@ fn plus_z_face(m: &BRepModel, solid: SolidId) -> Option<FaceId> {
 
 #[test]
 fn chain_box_fillet_chamfer() {
+    let _gate = CaseGate::open("chain_box_fillet_chamfer", 2);
     // box → fillet (top 4 edges, r=1.0) → chamfer (bottom 4 edges, d=1.0).
     // Distinct top/bottom edge sets so the two blends do not interact directly;
     // any corruption is from a step planting topology the next op mis-reads.
@@ -417,6 +493,7 @@ fn chain_box_fillet_chamfer() {
 
 #[test]
 fn chain_box_union_shell() {
+    let _gate = CaseGate::open("chain_box_union_shell", 0);
     // box ∪ box (corner-octant) → shell open-top wall=1.
     let mut m = BRepModel::new();
     let a = box_solid(&mut m, 8.0, 8.0, 8.0);
@@ -448,6 +525,7 @@ fn chain_box_union_shell() {
 
 #[test]
 fn chain_box_difference_shell() {
+    let _gate = CaseGate::open("chain_box_difference_shell", 0);
     // box ∖ cylinder (through-hole) → shell open-top wall=1.
     let mut m = BRepModel::new();
     let a = box_solid(&mut m, 12.0, 12.0, 12.0);
@@ -484,6 +562,7 @@ fn chain_box_difference_shell() {
 
 #[test]
 fn chain_box_boolean_fillet() {
+    let _gate = CaseGate::open("chain_box_boolean_fillet", 1);
     // box ∖ cylinder (through-hole) → fillet the top OUTER rim (4 straight edges).
     let mut m = BRepModel::new();
     let a = box_solid(&mut m, 12.0, 12.0, 12.0);
@@ -520,6 +599,7 @@ fn chain_box_boolean_fillet() {
 
 #[test]
 fn chain_extrude_fillet_boolean() {
+    let _gate = CaseGate::open("chain_extrude_fillet_boolean", 1);
     // extrude rect → fillet 4 top edges → union with a boss cylinder.
     let mut m = BRepModel::new();
     let outer = outer_rect_loop(&mut m, 0.0, 0.0, 20.0, 20.0);
@@ -556,6 +636,7 @@ fn chain_extrude_fillet_boolean() {
 
 #[test]
 fn chain_revolve_boolean_fillet() {
+    let _gate = CaseGate::open("chain_revolve_boolean_fillet", 0);
     // revolve a tube profile → difference a radial cylinder (cross-hole) → fillet
     // the resulting top rim. Stresses curved-base boolean then blend.
     let mut m = BRepModel::new();
@@ -641,6 +722,7 @@ fn chain_revolve_boolean_fillet() {
 
 #[test]
 fn chain_loft_shell() {
+    let _gate = CaseGate::open("chain_loft_shell", 0);
     // loft 3 coaxial circles → shell open-top wall=0.5.
     let mut m = BRepModel::new();
     let c0 = circle_profile(&mut m, Point3::new(0.0, 0.0, 0.0), 10.0);
@@ -674,6 +756,7 @@ fn chain_loft_shell() {
 
 #[test]
 fn chain_plate_with_holes_fillet() {
+    let _gate = CaseGate::open("chain_plate_with_holes_fillet", 1);
     // plate (20×12) with two square holes, extruded → fillet the 4 top OUTER
     // edges. Multi-loop topology survives a blend?
     let mut m = BRepModel::new();
@@ -730,6 +813,7 @@ fn chain_plate_with_holes_fillet() {
 
 #[test]
 fn degen_near_coincident_faces_union() {
+    let _gate = CaseGate::open("degen_near_coincident_faces_union", 0);
     // Two boxes whose facing planes are 1e-4 apart (a near-coincident, almost-
     // but-not-quite touching union). Stresses the imprint tolerance near the
     // coincident-face cliff without being exactly coincident.
@@ -757,6 +841,7 @@ fn degen_near_coincident_faces_union() {
 
 #[test]
 fn degen_near_tangent_fillet() {
+    let _gate = CaseGate::open("degen_near_tangent_fillet", 1);
     // Two fillets on adjacent top edges with r just below the half-face ceiling,
     // so the two round-overs become near-tangent along the shared top face.
     // Box 10×10×10: top face is 10×10; r=4.9 ⇒ opposite round-overs separated by
@@ -779,6 +864,7 @@ fn degen_near_tangent_fillet() {
 
 #[test]
 fn degen_tiny_fillet_on_long_edge() {
+    let _gate = CaseGate::open("degen_tiny_fillet_on_long_edge", 0);
     // r=0.01 fillet on a 20-unit edge (radius ≪ edge length). Sub-feature blend
     // — does the tessellator drop / over-collapse the tiny blend strip?
     let mut m = BRepModel::new();
@@ -807,6 +893,7 @@ fn degen_tiny_fillet_on_long_edge() {
 /// the same `manifold_report` + `certify_solid` the hunt uses).
 #[test]
 fn gate_tiny_fillet_on_long_edge_is_watertight() {
+    let _gate = CaseGate::open("gate_tiny_fillet_on_long_edge_is_watertight", 0);
     let mut m = BRepModel::new();
     let solid = box_solid(&mut m, 20.0, 20.0, 20.0);
     let top = straight_edges_at_z(&m, solid, 10.0, 1e-6);
@@ -837,6 +924,7 @@ fn gate_tiny_fillet_on_long_edge_is_watertight() {
 /// tolerance, so they tessellate their arc fully and the guard never fires.)
 #[test]
 fn gate_normal_fillet_radii_stay_watertight() {
+    let _gate = CaseGate::open("gate_normal_fillet_radii_stay_watertight", 0);
     for r in [0.2_f64, 1.0, 4.9] {
         let mut m = BRepModel::new();
         let solid = box_solid(&mut m, 20.0, 20.0, 20.0);
@@ -857,6 +945,7 @@ fn gate_normal_fillet_radii_stay_watertight() {
 
 #[test]
 fn degen_tiny_chamfer_on_long_edge() {
+    let _gate = CaseGate::open("degen_tiny_chamfer_on_long_edge", 0);
     let mut m = BRepModel::new();
     let solid = box_solid(&mut m, 20.0, 20.0, 20.0);
     let top = straight_edges_at_z(&m, solid, 10.0, 1e-6);
@@ -868,6 +957,7 @@ fn degen_tiny_chamfer_on_long_edge() {
 
 #[test]
 fn degen_extreme_aspect_box_fillet() {
+    let _gate = CaseGate::open("degen_extreme_aspect_box_fillet", 0);
     // 1000×1×1 sliver box → fillet a long top edge r=0.2. Extreme aspect ratio
     // stresses parametrization / tessellation density on a near-1D solid.
     let mut m = BRepModel::new();
@@ -906,6 +996,7 @@ fn degen_extreme_aspect_box_fillet() {
 
 #[test]
 fn degen_extreme_aspect_box_boolean() {
+    let _gate = CaseGate::open("degen_extreme_aspect_box_boolean", 0);
     // 1000×1×1 sliver ∖ cylinder through the thin dimension.
     let mut m = BRepModel::new();
     let a = box_solid(&mut m, 1000.0, 1.0, 1.0);
@@ -924,6 +1015,7 @@ fn degen_extreme_aspect_box_boolean() {
 
 #[test]
 fn degen_near_zero_thickness_shell() {
+    let _gate = CaseGate::open("degen_near_zero_thickness_shell", 0);
     // Shell a box to t=0.01 (near-zero wall). Self-intersection / collapse class.
     let mut m = BRepModel::new();
     let solid = box_solid(&mut m, 10.0, 10.0, 10.0);
@@ -938,6 +1030,7 @@ fn degen_near_zero_thickness_shell() {
 
 #[test]
 fn degen_thick_shell_self_overlap() {
+    let _gate = CaseGate::open("degen_thick_shell_self_overlap", 1);
     // Shell a box with a wall thicker than HALF the box (t=6 on a 10-box) — the
     // inner offset surfaces cross the centre and self-intersect. Should be a
     // refusal OR a flagged cert; a clean BUILT+SOUND here would be a false-pass.
@@ -962,6 +1055,7 @@ fn degen_thick_shell_self_overlap() {
 
 #[test]
 fn iter3_partial_revolve_no_caps() {
+    let _gate = CaseGate::open("iter3_partial_revolve_no_caps", 1);
     // 180° revolve with cap_ends=false ⇒ open ends. An open shell is NOT a closed
     // solid. EXPECTED: either an honest reject (legit — caps required for a solid)
     // OR a BUILT result that is correctly flagged non-watertight. A BUILT+SOUND
@@ -985,6 +1079,7 @@ fn iter3_partial_revolve_no_caps() {
 
 #[test]
 fn iter3_revolve_axis_touching_profile() {
+    let _gate = CaseGate::open("iter3_revolve_axis_touching_profile", 0);
     // Profile touching the axis (x0=0) ⇒ revolve makes a solid disc/cone with a
     // degenerate-radius seam at the axis. EXPECTED: BUILT+SOUND if the axis seam
     // is handled, else a flagged defect at the seam. A reject would be suspicious
@@ -1021,6 +1116,7 @@ fn iter3_revolve_axis_touching_profile() {
 /// a HARD assertion across several partial angles; the same oracles the hunt uses.
 #[test]
 fn gate_partial_revolve_axis_touching_is_watertight() {
+    let _gate = CaseGate::open("gate_partial_revolve_axis_touching_is_watertight", 0);
     for (label, angle, segs) in [
         ("90", std::f64::consts::FRAC_PI_2, 12_u32),
         ("180", PI, 24),
@@ -1082,6 +1178,7 @@ fn gate_partial_revolve_axis_touching_is_watertight() {
 /// disturb ordinary caps.
 #[test]
 fn gate_axis_touching_neighbours_stay_watertight() {
+    let _gate = CaseGate::open("gate_axis_touching_neighbours_stay_watertight", 0);
     // 360° axis-touching (a solid cylinder built from an axis-touching rect).
     {
         let mut m = BRepModel::new();
@@ -1139,6 +1236,7 @@ fn gate_axis_touching_neighbours_stay_watertight() {
 
 #[test]
 fn iter3_revolve_full_axis_touching() {
+    let _gate = CaseGate::open("iter3_revolve_full_axis_touching", 0);
     // Same but full 360° — the classic solid-of-revolution (e.g. a cone/dome).
     let mut m = BRepModel::new();
     let edges = rect_xz(&mut m, 0.0, 4.0, 0.0, 6.0);
@@ -1163,6 +1261,7 @@ fn iter3_revolve_full_axis_touching() {
 
 #[test]
 fn iter3_shell_fully_closed_cavity() {
+    let _gate = CaseGate::open("iter3_shell_fully_closed_cavity", 0);
     // Shell with NO removed faces ⇒ a fully-enclosed hollow cavity (a void inside
     // a solid). This is a valid 2-shell solid (outer + inner shell), but a naive
     // Euler check on a single shell rejects it (negative-genus-looking χ).
@@ -1181,15 +1280,16 @@ fn iter3_shell_fully_closed_cavity() {
 }
 
 // ===========================================================================
-// Guard — runs last alphabetically. The hunt REPORTS corrupt verdicts (counted,
-// not asserted). Only a hard PANIC fails the build, since a crash is a finding.
-// We catch panics per-case is not feasible here (ops borrow &mut model), so a
-// panic propagates and fails its own test — which the runner surfaces. This
-// summary just prints the corrupt tally.
+// Guard — runs last alphabetically. Every test judges its OWN counts via the
+// `CaseGate` guard (2026-09-06); this summary prints the cross-test
+// tally, which is informational only. Catching panics per case is not feasible
+// here (ops borrow &mut model), so a panic propagates and fails its own test —
+// which the runner surfaces.
 // ===========================================================================
 
 #[test]
 fn zz_summary() {
+    let _gate = CaseGate::open("zz_summary", 0);
     let n = CORRUPT_COUNT.lock().map(|g| *g).unwrap_or(0);
     let p = PANIC_COUNT.lock().map(|g| *g).unwrap_or(0);
     println!("---- op_chain_degenerate_stress corrupt-verdicts-so-far (informational): {n}; panics-recorded: {p}");

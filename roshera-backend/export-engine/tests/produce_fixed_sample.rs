@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! One-off: produce a FIXED sample STEP for FreeCAD/Parasolid/ACIS
 //! confirmation. Run explicitly:
 //!   cargo test -p export-engine --test produce_fixed_sample -- --ignored --nocapture

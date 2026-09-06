@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! Characterization + hardening fixtures for the general marching SSI
 //! (`math::surface_intersection`). These stress the marcher on freeform-style
 //! (purely numerical, no analytic QSIC path) configurations and assert

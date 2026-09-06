@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! Integration tests for the .ros v3.1 file format (slice 2).
 //!
 //! Slice 2 made HIST + PROV mandatory and GEOM optional. These tests

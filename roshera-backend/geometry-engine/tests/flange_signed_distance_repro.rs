@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! Kernel-layer reproduction attempt for TASK #5 — the live 08-09 report was
 //! `signed_distance` / `"inside"` returning a CONSTANT `-10.0` for EVERY
 //! probe point on a flange document, including points inside bolt holes

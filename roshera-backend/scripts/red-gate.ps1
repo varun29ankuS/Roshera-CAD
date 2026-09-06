@@ -18,6 +18,16 @@
     RATCHET RULE: when a test goes green, remove its line from KNOWN_REDS.md.
     Never add lines without a diagnosis doc.
 
+    JURISDICTION: red-gate.ps1 judges the RUNNING KNOWN_REDS.md entries (it sees
+    them FAIL); scripts/ignored-reds.ps1 judges the PARKED ones (`#[ignore]`d,
+    which can never fail).
+
+    PARKED entries: an allowlist entry whose test the runner reported as
+    `ignored` is printed as PARKED and does NOT count as a violation -- an
+    ignored test is never given the chance to FAIL, so its silence is not
+    evidence that it passes. Those are judged by scripts/ignored-reds.ps1,
+    which runs them with `--ignored` and fails when one PASSES.
+
 .PARAMETER Scoped
     Comma-separated list of test binary names to run instead of the full suite.
     Example: -Scoped cf_beta_property,cf_beta_replay_determinism
@@ -206,6 +216,15 @@ if ($currentBlock.Count -gt 0) { $blocks.Add($currentBlock.ToArray()) }
 
 $observedFails = @{}   # key = "binary::test", value = $true
 
+# Entries the runner reported as `ignored`. A red that is PARKED behind
+# `#[ignore = "..."]` never prints FAILED, so without this it looked to the
+# ratchet exactly like a test that had been FIXED -- and the gate demanded its
+# allowlist line be deleted (exit 2), which would have erased the only record
+# that the defect exists. A parked red is neither passing nor unpinned: it is
+# out of THIS gate's jurisdiction and inside `ignored-reds.ps1`'s, which runs
+# the ignored set with `--ignored` and fails when one of them PASSES.
+$observedIgnored = @{}   # key = "binary::test", value = $true
+
 # HONEST-REFUSAL GUARD: block↔binary pairing is positional, so a count
 # mismatch means attribution would be a guess. The gate must never judge
 # on guessed attribution (it mislabels which test broke and sends the
@@ -242,6 +261,13 @@ for ($bi = 0; $bi -lt $blocks.Count; $bi++) {
             continue
         }
 
+        # "test <name> ... ignored" -- a PARKED red, not a fixed one.
+        if ($trimLine -match "^test\s+(\S+)\s+\.\.\.\s+ignored") {
+            $observedIgnored["$binary::$($Matches[1])"] = $true
+            $inFailuresList = $false
+            continue
+        }
+
         # "failures:" block header -- secondary detection (proptest etc.)
         if ($trimLine -eq "failures:") {
             $inFailuresList = $true
@@ -268,7 +294,8 @@ for ($bi = 0; $bi -lt $blocks.Count; $bi++) {
 # -- Compare observed vs allowlist --------------------------------------------
 
 $newReds           = [string[]]@()  # in observedFails, not in allowlist
-$ratchetViolations = [string[]]@()  # in allowlist, not in observedFails (now passing)
+$ratchetViolations = [string[]]@()  # in allowlist, ran, and did NOT fail (now passing)
+$parked            = [string[]]@()  # in allowlist, reported `ignored` by the runner
 
 foreach ($key in $observedFails.Keys) {
     if (-not $allowlist.ContainsKey($key)) {
@@ -284,7 +311,14 @@ foreach ($key in $allowlist.Keys) {
         $inScope = $scopedBinaries -contains $binary
     }
     if ($inScope -and (-not $observedFails.ContainsKey($key))) {
-        $ratchetViolations += $key
+        # An entry the runner reported as `ignored` was never given the chance
+        # to fail, so "it did not fail" is not evidence it passes. Report it as
+        # PARKED and leave the verdict to ignored-reds.ps1.
+        if ($observedIgnored.ContainsKey($key)) {
+            $parked += $key
+        } else {
+            $ratchetViolations += $key
+        }
     }
 }
 
@@ -312,7 +346,17 @@ if ($newReds.Count -gt 0) {
     foreach ($k in ($newReds | Sort-Object)) {
         Write-Host "  $k" -ForegroundColor Red
     }
-    Write-Host "  -> Add a diagnosis doc to .superpowers/sdd/ and a KNOWN_REDS.md entry." -ForegroundColor Red
+    Write-Host "  -> Add a diagnosis doc to geometry-engine/docs/burndown-diag-<family>.md and a KNOWN_REDS.md entry." -ForegroundColor Red
+}
+
+if ($parked.Count -gt 0) {
+    Write-Host ""
+    Write-Host "PARKED -- $($parked.Count) allowlist entry/entries are #[ignore]d (not judged here):" -ForegroundColor Cyan
+    foreach ($k in ($parked | Sort-Object)) {
+        Write-Host "  $k" -ForegroundColor Cyan
+    }
+    Write-Host "  -> An ignored test cannot FAIL, so this gate cannot see it. Run" -ForegroundColor Cyan
+    Write-Host "     scripts/ignored-reds.ps1, which fails when a parked red PASSES." -ForegroundColor Cyan
 }
 
 if ($ratchetViolations.Count -gt 0) {
@@ -326,7 +370,13 @@ if ($ratchetViolations.Count -gt 0) {
 
 if ($newReds.Count -eq 0 -and $ratchetViolations.Count -eq 0) {
     Write-Host ""
-    Write-Host "GATE PASSED - failures match allowlist exactly." -ForegroundColor Green
+    if ($parked.Count -gt 0) {
+        # Never say "exactly" while entries went unjudged: the parked ones were
+        # skipped, not observed, and this line is the one a reader trusts.
+        Write-Host ("GATE PASSED - failures match allowlist; {0} PARKED entry/entries NOT judged here (run ignored-reds.ps1)." -f $parked.Count) -ForegroundColor Green
+    } else {
+        Write-Host "GATE PASSED - failures match allowlist exactly." -ForegroundColor Green
+    }
     exit 0
 }
 

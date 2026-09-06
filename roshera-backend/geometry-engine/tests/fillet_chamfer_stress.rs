@@ -24,6 +24,11 @@
 //! false) and never `panic!`s on a build failure — a failed op is itself a
 //! reportable datum, recorded as DID-NOT-BUILD.
 //!
+//! Every test GATES its table (2026-09-06). The counts used to be discarded at
+//! every site, so the harness could report FAILs forever while the runner
+//! printed `6 passed; 0 failed`. `gate()` asserts BUILT-BUT-CORRUPT == 0 and
+//! DID-NOT-BUILD == the pinned refusal count.
+//!
 //! Run: cargo test -p geometry-engine --test fillet_chamfer_stress -- --nocapture
 
 use geometry_engine::harness::watertight::{manifold_report, ManifoldReport};
@@ -190,39 +195,98 @@ fn judge(model: &mut BRepModel, solid: SolidId, result: Result<(), String>) -> V
     }
 }
 
+/// One rendered row.
+struct Row {
+    case: String,
+    pass: bool,
+    built: bool,
+    defect: String,
+}
+
+/// The verdict counts of one table. `fails == corrupt + refused` by
+/// construction: a non-PASS row either BUILT and then failed an oracle
+/// (`corrupt` -- a kernel DEFECT) or never built (`refused` -- a typed
+/// rejection, which is honest behaviour, not a bug).
+struct Counts {
+    total: usize,
+    fails: usize,
+    corrupt: usize,
+    refused: usize,
+}
+
 /// Row accumulator so each test prints a clean PASS/FAIL table.
 #[derive(Default)]
 struct Table {
-    rows: Vec<(String, bool, String)>,
+    rows: Vec<Row>,
 }
 
 impl Table {
     fn add(&mut self, case: &str, v: &Verdict) {
-        self.rows.push((case.to_string(), v.pass(), v.defect()));
+        self.rows.push(Row {
+            case: case.to_string(),
+            pass: v.pass(),
+            built: v.built,
+            defect: v.defect(),
+        });
     }
 
-    /// Print the table and return the number of FAILs.
-    fn render(&self, title: &str) -> usize {
+    /// Print the table and return its counts.
+    fn render(&self, title: &str) -> Counts {
         eprintln!("\n================ {title} ================");
         eprintln!("{:<48} {:<6} {}", "CASE", "RESULT", "DEFECT");
         eprintln!("{}", "-".repeat(110));
         let mut fails = 0usize;
-        for (case, pass, defect) in &self.rows {
-            let tag = if *pass { "PASS" } else { "FAIL" };
-            if !*pass {
+        let mut corrupt = 0usize;
+        let mut refused = 0usize;
+        for row in &self.rows {
+            let tag = if row.pass { "PASS" } else { "FAIL" };
+            if !row.pass {
                 fails += 1;
+                if row.built {
+                    corrupt += 1;
+                } else {
+                    refused += 1;
+                }
             }
-            eprintln!("{case:<48} {tag:<6} {defect}");
+            eprintln!("{:<48} {tag:<6} {}", row.case, row.defect);
         }
         eprintln!("{}", "-".repeat(110));
         eprintln!(
-            "{title}: {} cases, {} PASS, {} FAIL",
+            "{title}: {} cases, {} PASS, {} FAIL ({} BUILT-BUT-CORRUPT, {} DID-NOT-BUILD)",
             self.rows.len(),
             self.rows.len() - fails,
-            fails
+            fails,
+            corrupt,
+            refused
         );
-        fails
+        Counts {
+            total: self.rows.len(),
+            fails,
+            corrupt,
+            refused,
+        }
     }
+}
+
+/// Turn a rendered table into the test's own verdict.
+///
+/// Until 2026-09-06 these tests discarded `render`'s count (`let _ = fails;
+/// // hunt: report, do not gate.`) and so could never go red, whatever they
+/// found. `refused_pin` is the DID-NOT-BUILD count measured on 2026-09-06;
+/// pinning it makes the kernel's refusal envelope a two-way ratchet.
+#[track_caller]
+fn gate(c: &Counts, title: &str, refused_pin: usize) {
+    assert_eq!(
+        c.corrupt, 0,
+        "{title}: {} of {} case(s) BUILT and then failed an oracle; the table above names each defect",
+        c.corrupt, c.total
+    );
+    assert_eq!(
+        c.refused, refused_pin,
+        "{title}: {} of {} case(s) DID-NOT-BUILD, pinned at {}; the kernel's envelope moved - read the table and re-pin",
+        c.refused, c.total, refused_pin
+    );
+    debug_assert_eq!(c.fails, c.corrupt + c.refused);
 }
 
 // ---------------------------------------------------------------------------
@@ -398,12 +462,12 @@ fn fillet_all_12_edges_varied_radii() {
         let v = fillet_and_judge(&mut model, solid, edges, r);
         table.add(&format!("fillet 12-edge box10 r={r} (edges={n})"), &v);
     }
-    let fails = table.render("FILLET all-12-edges varied radii");
+    let counts = table.render("FILLET all-12-edges varied radii");
     eprintln!(
         "NOTE: large-r-relative-to-edge (r≥4.0 of a 10-box, where 2r approaches \
          the 10 face → adjacent round-overs collide) is the prime NEW-bug candidate."
     );
-    let _ = fails; // hunt: report, do not gate.
+    gate(&counts, "FILLET all-12-edges varied radii", 0);
 }
 
 // ===========================================================================
@@ -421,7 +485,8 @@ fn chamfer_all_12_edges_varied_distances() {
         let v = chamfer_and_judge(&mut model, solid, edges, d);
         table.add(&format!("chamfer 12-edge box10 d={d} (edges={n})"), &v);
     }
-    table.render("CHAMFER all-12-edges varied distances");
+    let counts = table.render("CHAMFER all-12-edges varied distances");
+    gate(&counts, "CHAMFER all-12-edges varied distances", 0);
 }
 
 // ===========================================================================
@@ -468,7 +533,8 @@ fn mixed_fillet_and_chamfer_one_box() {
         table.add("box10: 1C2F single corner (2 fillet + 1 chamfer)", &v);
     }
 
-    table.render("MIXED fillet+chamfer on one box (1C2F class)");
+    let counts = table.render("MIXED fillet+chamfer on one box (1C2F class)");
+    gate(&counts, "MIXED fillet+chamfer on one box (1C2F class)", 2);
 }
 
 // ===========================================================================
@@ -513,9 +579,9 @@ fn blend_crossing_blend() {
         table.add("box10: fillet edge0 THEN chamfer adjacent edge1 (#70)", &v);
     }
 
-    let fails = table.render("BLEND-CROSSING-BLEND (#70 class)");
+    let counts = table.render("BLEND-CROSSING-BLEND (#70 class)");
     eprintln!("NOTE: any FAIL here is candidate KNOWN #70 (chamfer-crosses-fillet).");
-    let _ = fails;
+    gate(&counts, "BLEND-CROSSING-BLEND (#70 class)", 1);
 }
 
 // ===========================================================================
@@ -641,7 +707,8 @@ fn blends_on_non_box_solids() {
         );
     }
 
-    table.render("BLENDS on NON-BOX solids");
+    let counts = table.render("BLENDS on NON-BOX solids");
+    gate(&counts, "BLENDS on NON-BOX solids", 1);
 }
 
 // ===========================================================================
@@ -693,7 +760,8 @@ fn extreme_corner_convergence() {
         );
     }
 
-    table.render("EXTREME corner convergence (3+ edges/vertex)");
+    let counts = table.render("EXTREME corner convergence (3+ edges/vertex)");
+    gate(&counts, "EXTREME corner convergence (3+ edges/vertex)", 0);
 }
 
 // ---------------------------------------------------------------------------

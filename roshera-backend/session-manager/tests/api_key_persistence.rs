@@ -1,3 +1,7 @@
+// Reason: integration-test crate -- panicking (unwrap/expect/assert) is the
+// test framework's failure mechanism; the workspace production deny stands.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 //! Auth Slice 3 (task #42) — API-key persistence across a restart.
 //!
 //! RED-first: before this slice, `AuthManager` held API keys only in an
