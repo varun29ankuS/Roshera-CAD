@@ -977,6 +977,15 @@ fn sample_loop_3d_polygon(
 /// triangulation by convexity, and emitting it in the polygon's CCW
 /// direction satisfies the caller's winding contract (CCW in the
 /// `u_axis × v_axis = normal` basis).
+///
+/// KNOWN GAP (pre-existing, filed as its own task): the same-sign turn
+/// test cannot tell a convex polygon from a SELF-INTERSECTING star. An
+/// unsplit pentagram turns the same way at every vertex with no
+/// collinear vertex anywhere, so it is accepted HERE — before `cdt` is
+/// ever consulted — and fanned into overlapping triangles that read
+/// closed while the area double-counts. `cdt_refusal_fallback`'s
+/// `PointOnFixedEdge` gate does NOT cover this: that gate only stops
+/// the fallback from widening this hole, it does not close it.
 fn fan_strictly_convex_polygon(
     pts2d: &[(f64, f64)],
     range: (usize, usize),
@@ -1022,6 +1031,115 @@ fn fan_strictly_convex_polygon(
         }
     }
     Some(tris)
+}
+
+/// Fan-triangulate `pts2d[range.0..range.1]` if it is a WEAKLY convex
+/// simple polygon -- convex, but allowed to carry collinear boundary
+/// vertices. `None` means the polygon is genuinely reflex (or too
+/// degenerate to fan) and there is nothing better to offer.
+///
+/// This is a LAST RESORT, reached only after `cdt::triangulate_contours`
+/// has already refused the contour; the alternative at that point is a
+/// face that emits zero triangles, i.e. a hole in the shell. The `cdt`
+/// crate rejects a contour whose vertex lies exactly ON another fixed
+/// edge (`PointOnFixedEdge`), which is precisely what a STRAIGHT edge
+/// densified to more than two samples produces: a run of exactly
+/// collinear points along one side of an otherwise ordinary polygon.
+/// `EdgeSampleCache` densifies a straight edge whenever an adjacent
+/// face's surface is curved ALONG it -- true of a varying-radius blend's
+/// rails, false of a constant-radius blend's -- so the trimmed planar
+/// neighbours of a varying fillet hit this and vanished from the mesh.
+///
+/// Like [`fan_strictly_convex_polygon`] this keeps EVERY vertex AND
+/// every boundary chord: the apex is chosen so that no fan triangle can
+/// come out degenerate, so every chord of the contour is an edge of some
+/// emitted triangle and no neighbouring face is left with a T-junction.
+/// Where that cannot be guaranteed the function declines (`None`) and
+/// the face emits nothing, which is honest; it never drops a chord.
+fn fan_weakly_convex_polygon(
+    pts2d: &[(f64, f64)],
+    range: (usize, usize),
+) -> Option<Vec<[usize; 3]>> {
+    let (s, e) = range;
+    let n = e - s;
+    if n < 3 || e > pts2d.len() {
+        return None;
+    }
+    // Same scale-relative degeneracy threshold as the strict fan, so the
+    // two agree on what "collinear" means.
+    let mut max_extent: f64 = 0.0;
+    for &(x, y) in &pts2d[s..e] {
+        max_extent = max_extent.max(x.abs()).max(y.abs());
+    }
+    let eps = 1e-12 * max_extent * max_extent;
+
+    let cross_at = |i: usize| -> f64 {
+        let (ax, ay) = pts2d[s + i];
+        let (bx, by) = pts2d[s + (i + 1) % n];
+        let (cx, cy) = pts2d[s + (i + 2) % n];
+        (bx - ax) * (cy - ay) - (by - ay) * (cx - ax)
+    };
+
+    // Weak convexity: every non-degenerate turn goes the same way.
+    let mut sign = 0.0f64;
+    for i in 0..n {
+        let cross = cross_at(i);
+        if cross.abs() <= eps {
+            continue; // collinear vertex -- allowed here, unlike the strict fan
+        }
+        if sign == 0.0 {
+            sign = cross.signum();
+        } else if cross.signum() != sign {
+            return None; // genuinely reflex -- a fan would leave the polygon
+        }
+    }
+    if sign == 0.0 {
+        return None; // every vertex collinear: zero area, nothing to emit
+    }
+
+    // Apex choice is load-bearing, and "strictly convex" is NOT the
+    // right test. The fan's first triangle is (apex, apex+1, apex+2)
+    // and its last is (apex, apex-2, apex-1); either is degenerate --
+    // and its boundary chord then covered by NO triangle, a T-junction
+    // reintroduced -- exactly when the apex sits at the END of a
+    // collinear run. So require the apex's two NEIGHBOURS to be
+    // non-collinear turns:
+    //
+    //   turn at (a - 1) = cross_at(a - 2) != 0   guards the last triangle
+    //   turn at (a + 1) = cross_at(a)     != 0   guards the first
+    //
+    // The apex itself MAY be collinear (turn at `a` is unconstrained):
+    // a fan from any point of a convex polygon covers it, and an apex
+    // interior to a run is never an endpoint of a dropped chord.
+    let turn_at = |v: usize| cross_at((v + n - 1) % n);
+    let apex_offset = (0..n)
+        .find(|&a| turn_at((a + n - 1) % n).abs() > eps && turn_at((a + 1) % n).abs() > eps)?;
+    let apex = s + apex_offset;
+
+    let mut tris = Vec::with_capacity(n - 2);
+    for k in 1..n - 1 {
+        let b = s + (apex_offset + k) % n;
+        let c = s + (apex_offset + k + 1) % n;
+        let (ax, ay) = pts2d[apex];
+        let (bx, by) = pts2d[b];
+        let (cx, cy) = pts2d[c];
+        let area2 = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
+        if area2.abs() <= eps {
+            // Unreachable for a weakly-convex polygon fanned from a safe
+            // apex: the apex is in no 3-point collinear run, so it lies
+            // on no other edge's supporting line. If it happens anyway
+            // the polygon is not what this function claims to handle --
+            // decline rather than DROP the chord, which would silently
+            // reintroduce the T-junction the apex rule exists to avoid.
+            return None;
+        }
+        if sign > 0.0 {
+            tris.push([apex, b, c]);
+        } else {
+            tris.push([apex, c, b]);
+        }
+    }
+    (!tris.is_empty()).then_some(tris)
 }
 
 pub(crate) fn triangulate_planar_polygon(
@@ -1109,18 +1227,67 @@ pub(crate) fn triangulate_planar_polygon(
         Ok(Ok(tris)) => tris.into_iter().map(|(a, b, c)| [a, b, c]).collect(),
         Ok(Err(e)) => {
             trace(&format!("failed: {e:?}"));
-            tracing::warn!(
-                "triangulate_planar_polygon: cdt failed ({:?}); emitting no triangles",
-                e
-            );
-            Vec::new()
+            // ONLY `PointOnFixedEdge` is recovered. That refusal means a
+            // vertex sits exactly on another of the contour's own edges
+            // -- a COLLINEAR run on an otherwise well-formed boundary,
+            // which is what the fan below is for and the class measured
+            // in task #37. Every other refusal describes a contour the
+            // fan would mis-read: `CrossingFixedEdge` in particular is a
+            // SELF-INTERSECTING boundary, and a star-shaped one passes
+            // the fan's same-sign turn test, so the fan would emit
+            // overlapping triangles that read CLOSED while the volume
+            // double-counts. An empty face and an honestly-refused solid
+            // beat a closed solid with the wrong volume.
+            //
+            // SCOPE, stated honestly: this gate keeps the FALLBACK from
+            // widening an existing hole -- it does not close it. A
+            // self-intersecting star with no collinear vertex never
+            // reaches here at all, because `fan_strictly_convex_polygon`
+            // above accepts it and returns before `cdt` is consulted.
+            // That is a pre-existing gap in the strict fan, filed as its
+            // own task; see its doc comment.
+            let recovered = matches!(e, cdt::Error::PointOnFixedEdge(_))
+                .then(|| cdt_refusal_fallback(&pts2d, outer_range, &inner_ranges))
+                .flatten();
+            recovered.unwrap_or_else(|| {
+                tracing::warn!(
+                    "triangulate_planar_polygon: cdt failed ({:?}); emitting no triangles",
+                    e
+                );
+                Vec::new()
+            })
         }
         Err(_) => {
             trace("panicked");
+            // A panic carries no error class, so nothing here can prove
+            // the contour is merely collinear rather than self-crossing.
+            // Unchanged from before the fallback existed.
             tracing::warn!("triangulate_planar_polygon: cdt panicked; emitting no triangles");
             Vec::new()
         }
     }
+}
+
+/// Last-resort triangulation for a hole-free contour `cdt` refused.
+///
+/// Reached ONLY for `cdt::Error::PointOnFixedEdge` (the caller gates
+/// on it): a contour carrying a vertex exactly on another of its own
+/// edges -- the shape a STRAIGHT B-Rep edge takes once
+/// `EdgeSampleCache` densifies it for a curved neighbour. The face's
+/// only other option is to emit nothing, which is a hole in the shell;
+/// a weakly-convex fan keeps every vertex and covers the polygon
+/// exactly. Holed contours are not attempted: a fan cannot express a
+/// hole, and covering one over would be worse than the honest empty
+/// face.
+fn cdt_refusal_fallback(
+    pts2d: &[(f64, f64)],
+    outer_range: (usize, usize),
+    inner_ranges: &[(usize, usize)],
+) -> Option<Vec<[usize; 3]>> {
+    if !inner_ranges.is_empty() {
+        return None;
+    }
+    fan_weakly_convex_polygon(pts2d, outer_range)
 }
 
 /// Triangulate a CONCENTRIC-CIRCLE ANNULUS (one outer ring + one inner ring) as a
@@ -8156,19 +8323,37 @@ fn tessellate_fillet_face(
         return;
     }
 
+    // Opposite boundaries whose canonical caches DISAGREE in length take
+    // the conforming stitch instead of the rectangular grid below. The
+    // grid can only carry one sample count per axis, so it resamples the
+    // shorter cache to the longer count -- which lands extra vertices in
+    // the MIDDLE of the neighbour's chords. Those are T-junctions the
+    // position weld cannot collapse, and the shell reads geometrically
+    // OPEN. A constant-radius blend's two caps are congruent and its two
+    // rails are the same length, so the caches match and this never
+    // fires; a VARYING radius makes the r0 cap shorter than the r1 cap
+    // (the cache's arc-length rule gives 17 samples against 32 for a
+    // 1 mm -> 2 mm blend on a 10 mm cube edge), which is why every
+    // varying-radius schedule failed the closure gate.
+    if trim1.len() != trim2.len() || cap_v0.len() != cap_v1.len() {
+        let stitched = tessellate_fillet_face_conforming(
+            face, model, surface, &trim1, &cap_v1, &trim2, &cap_v0, mesh,
+        );
+        if stitched {
+            return;
+        }
+    }
+
     // Grid resolution. Honouring the longer cache on each axis preserves
-    // every sample the cache decided was needed. When the trim caches
-    // agree in length (the common box-fillet / symmetric-blend case),
-    // no resampling occurs and every boundary sample lands on a cached
-    // point.
+    // every sample the cache decided was needed. Both caches on an axis
+    // agree in length by the guard above, so nothing is resampled and
+    // every boundary sample lands on a cached point.
     let u_steps = (trim1.len() - 1).max(trim2.len() - 1);
     let v_steps = (cap_v0.len() - 1).max(cap_v1.len() - 1);
 
-    // Locally resample the shorter sequence by linear interpolation.
-    // This does NOT mutate the cache; if a neighbour reads the canonical
-    // (un-resampled) cache for the same edge, its boundary samples
-    // diverge from ours only on the shorter side. In the common case
-    // they agree by construction.
+    // `resample_polyline_to_n` is the identity at equal length, which is
+    // the only case that reaches here on the conforming path; it still
+    // runs so the declined-stitch fallback keeps its historical shape.
     let trim1_r = resample_polyline_to_n(&trim1, u_steps + 1);
     let trim2_r = resample_polyline_to_n(&trim2, u_steps + 1);
     let cap_v0_r = resample_polyline_to_n(&cap_v0, v_steps + 1);
@@ -8261,6 +8446,249 @@ fn tessellate_fillet_face(
                     mesh.add_triangle(v1, v2, v3);
                 }
             }
+        }
+    }
+}
+
+/// Conforming mesher for a 4-sided fillet face whose two opposite
+/// boundary caches DISAGREE in sample count.
+///
+/// The rectangular grid in [`tessellate_fillet_face`] carries one sample
+/// count per axis, so it can only honour both boundaries of an axis when
+/// their canonical [`EdgeSampleCache`] sequences are the same length. A
+/// varying-radius blend breaks that: the `r0` cap arc is shorter than
+/// the `r1` cap arc, and the cache's arc-length rule gives them
+/// different counts. Resampling the shorter one to the longer count puts
+/// vertices in the interior of the neighbouring face's chords -- a
+/// T-junction per extra vertex, which the position weld cannot collapse,
+/// so the shell tessellates OPEN.
+///
+/// This path instead takes all four cached sequences VERBATIM and meshes
+/// the interior around them:
+///
+/// * an interior lattice `u_idx in 1..=U-1`, `v_idx in 1..=V-1` sampled
+///   from the surface (`U`/`V` are the per-axis maxima, floored at 3 so
+///   the lattice has at least two rows and columns), and
+/// * four bands stitching each cached boundary polyline to the interior
+///   lattice's matching side.
+///
+/// Consecutive bands share their corner edge exactly -- band A's last
+/// edge `(outer_corner, inner_corner)` IS band B's first -- so the four
+/// bands and the lattice close with no seam of their own.
+///
+/// Returns `false` (mesh untouched) when the loop's cached endpoints do
+/// not chain into the documented rectangle or an interior sample cannot
+/// be evaluated; the caller then keeps the historical grid.
+#[allow(clippy::too_many_arguments)]
+fn tessellate_fillet_face_conforming(
+    face: &Face,
+    model: &BRepModel,
+    surface: &dyn Surface,
+    trim1: &[Point3],
+    cap_v1: &[Point3],
+    trim2: &[Point3],
+    cap_v0: &[Point3],
+    mesh: &mut TriangleMesh,
+) -> bool {
+    // Loop-order contract (`operations/fillet.rs`):
+    //   corner(0,0) --trim1 fwd--> corner(U,0) --cap_v1 fwd--> corner(U,V)
+    //   corner(U,V) --trim2 rev--> corner(0,V) --cap_v0 fwd--> corner(0,0)
+    // Verified rather than assumed: a loop that does not chain would be
+    // stitched into a twisted band, which is worse than the open mesh
+    // this path exists to close.
+    let (Some(&c00), Some(&cu0)) = (trim1.first(), trim1.last()) else {
+        return false;
+    };
+    let (Some(&cu0b), Some(&cuv)) = (cap_v1.first(), cap_v1.last()) else {
+        return false;
+    };
+    let (Some(&c0v), Some(&cuvb)) = (trim2.first(), trim2.last()) else {
+        return false;
+    };
+    let (Some(&c0vb), Some(&c00b)) = (cap_v0.first(), cap_v0.last()) else {
+        return false;
+    };
+    // The caches are evaluations of curves that SHARE a vertex, so the
+    // agreement is evaluation noise, not a fit tolerance.
+    const CHAIN_TOL: f64 = 1.0e-9;
+    let chained = (cu0 - cu0b).magnitude() <= CHAIN_TOL
+        && (cuv - cuvb).magnitude() <= CHAIN_TOL
+        && (c0v - c0vb).magnitude() <= CHAIN_TOL
+        && (c00 - c00b).magnitude() <= CHAIN_TOL;
+    if !chained {
+        return false;
+    }
+
+    // Interior lattice density. Floored at 3 so `1..=U-1` and `1..=V-1`
+    // each hold at least two indices -- the four interior sides must be
+    // polylines, not single points, for the bands to be well-formed.
+    let u_steps = (trim1.len() - 1).max(trim2.len() - 1).max(3);
+    let v_steps = (cap_v0.len() - 1).max(cap_v1.len() - 1).max(3);
+    let ((u_min, u_max), (v_min, v_max)) = surface.parameter_bounds();
+    let u_at = |i: usize| u_min + (i as f64) * (u_max - u_min) / (u_steps as f64);
+    let v_at = |j: usize| v_min + (j as f64) * (v_max - v_min) / (v_steps as f64);
+
+    // Interior lattice, indexed [v_idx - 1][u_idx - 1].
+    //
+    // EVALUATE FIRST, PUSH SECOND. This function's contract is "returns
+    // false, mesh UNTOUCHED" -- the caller then runs the historical grid
+    // over the same face, so any vertex pushed before the decline would
+    // be left orphaned in the mesh (and, being unreferenced by any
+    // triangle, would silently shift every subsequent index). Positions
+    // are therefore collected into a local buffer and only turned into
+    // mesh vertices once every interior sample has succeeded.
+    let mut positions: Vec<Vec<(Point3, f64, f64)>> = Vec::with_capacity(v_steps - 1);
+    for j in 1..=v_steps - 1 {
+        let mut row = Vec::with_capacity(u_steps - 1);
+        for i in 1..=u_steps - 1 {
+            let (up, vp) = (u_at(i), v_at(j));
+            let Ok(position) = surface.point_at(up, vp) else {
+                return false; // nothing pushed yet -- mesh is untouched
+            };
+            row.push((position, up, vp));
+        }
+        positions.push(row);
+    }
+    let lattice: Vec<Vec<u32>> = positions
+        .into_iter()
+        .map(|row| {
+            row.into_iter()
+                .map(|(p, up, vp)| fillet_mesh_vertex(mesh, face, model, p, up, vp))
+                .collect()
+        })
+        .collect();
+    // Safe by the `max(3)` floor above: `u_steps`/`v_steps` are at least
+    // 3, so the lattice holds at least 2 rows of 2, and every caller
+    // below indexes within `1..=steps - 1`.
+    let at = |i: usize, j: usize| lattice[j - 1][i - 1];
+
+    // Boundary vertices, emitted from the cached samples verbatim. The
+    // (u, v) handed to the normal is the boundary's own lattice
+    // parameter -- it steers shading only; the POSITION is the cached
+    // point, which is what the neighbouring face welds against.
+    let boundary =
+        |mesh: &mut TriangleMesh, pts: &[Point3], along_u: bool, fixed: f64| -> Vec<u32> {
+            let last = (pts.len() - 1).max(1) as f64;
+            pts.iter()
+                .enumerate()
+                .map(|(k, &p)| {
+                    let t = (k as f64) / last;
+                    let (up, vp) = if along_u {
+                        (u_min + t * (u_max - u_min), fixed)
+                    } else {
+                        (fixed, v_min + t * (v_max - v_min))
+                    };
+                    fillet_mesh_vertex(mesh, face, model, p, up, vp)
+                })
+                .collect()
+        };
+    let o_a = boundary(mesh, trim1, true, v_min);
+    let o_b = boundary(mesh, cap_v1, false, u_max);
+    let o_c: Vec<u32> = boundary(mesh, trim2, true, v_max)
+        .into_iter()
+        .rev()
+        .collect();
+    let o_d = boundary(mesh, cap_v0, false, u_min);
+
+    // Interior sides, each running in the same direction as the outer
+    // side it faces, so `stitch_open_band` sees the interior on the LEFT.
+    let i_a: Vec<u32> = (1..=u_steps - 1).map(|i| at(i, 1)).collect();
+    let i_b: Vec<u32> = (1..=v_steps - 1).map(|j| at(u_steps - 1, j)).collect();
+    let i_c: Vec<u32> = (1..=u_steps - 1)
+        .rev()
+        .map(|i| at(i, v_steps - 1))
+        .collect();
+    let i_d: Vec<u32> = (1..=v_steps - 1).rev().map(|j| at(1, j)).collect();
+
+    // Winding. Identical reasoning to the grid path: the lattice-CCW
+    // order is kept iff the chart handedness agrees with the face
+    // orientation. Bands are emitted lattice-CCW by construction, so one
+    // decision winds the whole face.
+    let chart_sign = match surface.evaluate_full(0.5 * (u_min + u_max), 0.5 * (v_min + v_max)) {
+        Ok(sp) if sp.du.cross(&sp.dv).dot(&sp.normal) < 0.0 => -1i32,
+        _ => 1i32,
+    };
+    let keep = (chart_sign == 1) == face.orientation.is_forward();
+
+    stitch_open_band(&o_a, &i_a, keep, mesh);
+    stitch_open_band(&o_b, &i_b, keep, mesh);
+    stitch_open_band(&o_c, &i_c, keep, mesh);
+    stitch_open_band(&o_d, &i_d, keep, mesh);
+
+    for j in 1..v_steps - 1 {
+        for i in 1..u_steps - 1 {
+            let (a, b, c, d) = (at(i, j), at(i + 1, j), at(i, j + 1), at(i + 1, j + 1));
+            if keep {
+                mesh.add_triangle(a, b, c);
+                mesh.add_triangle(b, d, c);
+            } else {
+                mesh.add_triangle(a, c, b);
+                mesh.add_triangle(b, c, d);
+            }
+        }
+    }
+    true
+}
+
+/// Add one mesh vertex at `position`, taking its normal from the face's
+/// oriented surface normal at `(u, v)`.
+fn fillet_mesh_vertex(
+    mesh: &mut TriangleMesh,
+    face: &Face,
+    model: &BRepModel,
+    position: Point3,
+    u: f64,
+    v: f64,
+) -> u32 {
+    let normal = face.normal_at(u, v, &model.surfaces).unwrap_or(Vector3::Z);
+    mesh.add_vertex(MeshVertex {
+        position,
+        normal,
+        uv: Some((u, v)),
+    })
+}
+
+/// Triangulate the band between two OPEN polylines running in the same
+/// direction, with `inner` lying to the LEFT of `outer`'s travel.
+///
+/// The strip advances by NORMALISED index, so the two sides may hold any
+/// counts; the first triangle uses `outer[0]`/`inner[0]` and the last
+/// uses `outer[last]`/`inner[last]`, which is what makes consecutive
+/// bands share their corner edge exactly.
+///
+/// Emitted vertex order is lattice-CCW (`outer[i], outer[i+1], inner[j]`
+/// and `outer[i], inner[j+1], inner[j]`); `keep == false` reverses every
+/// triangle, matching the grid path's single band-wide winding decision.
+fn stitch_open_band(outer: &[u32], inner: &[u32], keep: bool, mesh: &mut TriangleMesh) {
+    let (p, q) = (outer.len(), inner.len());
+    if p < 2 || q < 2 {
+        return;
+    }
+    let (mut i, mut j) = (0usize, 0usize);
+    while i + 1 < p || j + 1 < q {
+        let advance_outer = if i + 1 >= p {
+            false
+        } else if j + 1 >= q {
+            true
+        } else {
+            // Whichever side is further behind in normalised progress
+            // advances, so neither runs ahead and the strip stays
+            // well-shaped for any count ratio.
+            (i as f64) / ((p - 1) as f64) <= (j as f64) / ((q - 1) as f64)
+        };
+        let (a, b, c) = if advance_outer {
+            let t = (outer[i], outer[i + 1], inner[j]);
+            i += 1;
+            t
+        } else {
+            let t = (outer[i], inner[j + 1], inner[j]);
+            j += 1;
+            t
+        };
+        if keep {
+            mesh.add_triangle(a, b, c);
+        } else {
+            mesh.add_triangle(a, c, b);
         }
     }
 }
@@ -10022,6 +10450,7 @@ mod tests {
     //! 0 triangles); they pass against the new bridged ear-clipping path.
     use super::*;
     use crate::math::Point3;
+    use std::collections::HashSet;
 
     /// Build a Z-up planar polygon: outer + optional CW holes.
     fn build_planar_loops(
@@ -10055,6 +10484,505 @@ mod tests {
                 ((b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)).abs() * 0.5
             })
             .sum()
+    }
+
+    /// The pentagram fixture: a SELF-INTERSECTING contour whose turns
+    /// all share a sign, with one collinear vertex so it reaches the
+    /// `cdt` path rather than being claimed by the strict fan.
+    ///
+    /// Measured: `cdt::triangulate_contours` -> `CrossingFixedEdge`,
+    /// `fan_strictly_convex_polygon` -> `None` (the split edge's
+    /// midpoint is collinear), `fan_weakly_convex_polygon` -> 4
+    /// triangles. Those three facts together are what make it the
+    /// discriminating fixture for the refusal gate.
+    fn self_intersecting_star() -> Vec<(f64, f64)> {
+        let mut tips: Vec<(f64, f64)> = Vec::new();
+        for k in 0..5 {
+            let a = std::f64::consts::PI / 2.0 + (k as f64) * 4.0 * std::f64::consts::PI / 5.0;
+            tips.push((a.cos(), a.sin()));
+        }
+        // Split the first edge at its midpoint: a collinear vertex, so
+        // the strict fan declines and the contour reaches `cdt`.
+        let mid = ((tips[0].0 + tips[1].0) / 2.0, (tips[0].1 + tips[1].1) / 2.0);
+        vec![tips[0], mid, tips[1], tips[2], tips[3], tips[4]]
+    }
+
+    /// A `cdt` refusal that is NOT `PointOnFixedEdge` must stay refused.
+    ///
+    /// `CrossingFixedEdge` means the boundary crosses itself. A
+    /// star-shaped self-intersecting contour still turns the same way at
+    /// every vertex, so `fan_weakly_convex_polygon` accepts it and emits
+    /// OVERLAPPING triangles - a face that reads CLOSED while its area
+    /// (and every volume integral over it) double-counts the overlap.
+    /// Before the refusal class was gated this fixture fanned to 4
+    /// triangles; an empty face and an honestly-refused solid are the
+    /// correct answer.
+    #[test]
+    fn a_self_intersecting_contour_is_refused_not_fanned() {
+        let star = self_intersecting_star();
+        let (vertices, boundaries) = build_planar_loops(&star, &[]);
+        let tris = triangulate_planar_polygon(&vertices, &boundaries, &Vector3::Z);
+        assert!(
+            tris.is_empty(),
+            concat!(
+                "a self-intersecting contour must emit NO triangles: the fan reads its ",
+                "consistent turning as convexity and covers the overlap twice, which ",
+                "closes the shell around a wrong volume. Got {} triangle(s)"
+            ),
+            tris.len()
+        );
+    }
+
+    /// The weak fan itself still accepts the star - that is precisely
+    /// why the caller must gate on the refusal CLASS rather than trying
+    /// to make the fan detect self-intersection. Pinning it here keeps
+    /// the division of labour explicit: the fan judges convexity, the
+    /// gate judges whether convexity is the right question.
+    #[test]
+    fn the_weak_fan_alone_cannot_tell_a_star_from_a_convex_polygon() {
+        let star = self_intersecting_star();
+        assert!(
+            fan_strictly_convex_polygon(&star, (0, star.len())).is_none(),
+            "the star carries a collinear vertex, so the strict fan must decline it"
+        );
+        assert!(
+            fan_weakly_convex_polygon(&star, (0, star.len())).is_some(),
+            concat!(
+                "the weak fan accepts the star (all turns share a sign); if this ever ",
+                "returns None the refusal gate above stops being the thing under test"
+            )
+        );
+    }
+
+    /// The 7-gon shape traced from a varying fillet's trimmed planar
+    /// neighbour (`ROSHERA_TESS_TRACE`, task #37), rotated by `rot`.
+    ///
+    /// Points 3,4,5,6,0 lie exactly on `x = y/10` - a five-point
+    /// COLLINEAR RUN, which is what the straight rail of a varying
+    /// blend becomes once `EdgeSampleCache` densifies it. Shoelace
+    /// area is 85.0, matching the face's measured area.
+    ///
+    /// These are the traced coordinates rounded to six decimals, so
+    /// they are a UNIT fixture for the fan, not a replay of the
+    /// production contour: `cdt` ACCEPTS these exact values (measured:
+    /// `Ok(5)` at every rotation) where it refused the production ones
+    /// with `PointOnFixedEdge(5)`, the last bits differing. The fan is
+    /// therefore exercised DIRECTLY below rather than through
+    /// `triangulate_planar_polygon`, which would never reach it here.
+    fn collinear_run_heptagon(rot: usize) -> Vec<(f64, f64)> {
+        let traced = [
+            (0.0, 0.0),
+            (-9.0, 0.0),
+            (-9.0, -10.0),
+            (-1.0, -10.0),
+            (-0.75, -7.5),
+            (-0.5, -5.0),
+            (-0.25, -2.5),
+        ];
+        (0..traced.len())
+            .map(|i| traced[(i + rot) % traced.len()])
+            .collect()
+    }
+
+    /// EVERY boundary chord must be an edge of some emitted triangle,
+    /// AT EVERY ROTATION of the same polygon.
+    ///
+    /// This is the promise the fan's doc makes and the reason it keeps
+    /// collinear vertices at all: a chord covered by no triangle is a
+    /// T-junction against whichever face shares that edge, which is the
+    /// exact defect the whole conforming-tessellation fix exists to
+    /// remove. Dropping a degenerate triangle silently breaks it, so the
+    /// apex must be chosen such that none can arise.
+    ///
+    /// Sweeping the rotation is what makes this bite. The polygon is the
+    /// same shape every time, so the answer must be too - but the apex
+    /// is picked by SCAN ORDER, and an apex rule that only demands a
+    /// strictly-convex apex lands on the END of the collinear run for
+    /// five of the seven rotations. Measured against that rule: rotations
+    /// 0 and 1 emit all 5 triangles and cover every chord, while
+    /// rotations 2 through 6 emit 2 triangles and leave 4 chords
+    /// uncovered. Testing one rotation is a coin flip; testing all seven
+    /// is the invariant.
+    #[test]
+    fn a_collinear_run_leaves_no_boundary_chord_uncovered_at_any_rotation() {
+        for rot in 0..7 {
+            let poly = collinear_run_heptagon(rot);
+            let n = poly.len();
+            let tris = fan_weakly_convex_polygon(&poly, (0, n))
+                .unwrap_or_else(|| panic!("rot={rot}: the heptagon is convex and must fan"));
+
+            let mut covered: HashSet<(usize, usize)> = HashSet::new();
+            for t in &tris {
+                for &(a, b) in &[(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                    covered.insert(if a < b { (a, b) } else { (b, a) });
+                }
+            }
+            for i in 0..n {
+                let (a, b) = (i, (i + 1) % n);
+                let key = if a < b { (a, b) } else { (b, a) };
+                assert!(
+                    covered.contains(&key),
+                    concat!(
+                        "rot={}: boundary chord {}->{} is covered by no triangle. The fan ",
+                        "apex landed at the end of the collinear run, so the triangle ",
+                        "spanning this chord came out degenerate and was dropped - a ",
+                        "T-junction against the neighbouring face"
+                    ),
+                    rot,
+                    a,
+                    b
+                );
+            }
+
+            // No overlap and no gap: the emitted area must equal the
+            // polygon's own, which is rotation-invariant at 85.0.
+            let vertices: Vec<Point3> = poly.iter().map(|&(x, y)| Point3::new(x, y, 0.0)).collect();
+            let area = total_tri_area_xy(&vertices, &tris);
+            assert!(
+                (area - 85.0).abs() <= 1.0e-9,
+                "rot={rot}: triangles must cover the heptagon exactly once; area {area} vs 85.0"
+            );
+        }
+    }
+
+    /// A planar surface that REFUSES to evaluate inside a chosen
+    /// parametric window, so `point_at` fails at an interior lattice
+    /// sample and nowhere else.
+    ///
+    /// `point_at`'s default impl goes through `evaluate_full`, so
+    /// failing there is enough. Everything else behaves like the unit
+    /// square in the z = 0 plane, which keeps the fixture's only
+    /// interesting property the failure itself.
+    #[derive(Debug, Clone)]
+    struct RefusingPlane {
+        /// `evaluate_full` errors when `u` is inside this open interval.
+        dead_u: (f64, f64),
+    }
+
+    impl Surface for RefusingPlane {
+        fn surface_type(&self) -> crate::primitives::surface::SurfaceType {
+            crate::primitives::surface::SurfaceType::Plane
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn clone_box(&self) -> Box<dyn Surface> {
+            Box::new(self.clone())
+        }
+        fn type_name(&self) -> &'static str {
+            // Deliberately NOT "Plane": `tessellate_face` dispatches on
+            // this string, and this fixture is only ever handed to
+            // `tessellate_fillet_face_conforming` directly.
+            "RefusingPlane"
+        }
+        // NONE of the six operations below is reached by the function
+        // under test, and none of them is MODELLED by this fixture.
+        // They therefore refuse rather than returning a
+        // plausible-looking value: `Box::new(self.clone())` would claim
+        // a transformed/offset plane is the SAME plane, and an empty
+        // intersection vector would claim two surfaces provably do not
+        // meet. A fixture that invents an answer tells exactly the lie
+        // the kernel refuses to. `unreachable!` is the honest form here
+        // -- reaching one means the test is exercising a path it does
+        // not describe, and the panic says so loudly.
+        fn transform(&self, _matrix: &crate::math::Matrix4) -> Box<dyn Surface> {
+            unreachable!("transform is not modelled by RefusingPlane")
+        }
+        fn closest_point(
+            &self,
+            _point: &Point3,
+            _tolerance: Tolerance,
+        ) -> crate::math::MathResult<(f64, f64)> {
+            Err(crate::math::MathError::InvalidParameter(
+                "RefusingPlane is a decline-path fixture; closest_point is not modelled"
+                    .to_string(),
+            ))
+        }
+        fn offset(&self, _distance: f64) -> Box<dyn Surface> {
+            unreachable!("offset is not modelled by RefusingPlane")
+        }
+        fn offset_exact(
+            &self,
+            _distance: f64,
+            _tolerance: Tolerance,
+        ) -> crate::math::MathResult<crate::primitives::surface::OffsetSurface> {
+            Err(crate::math::MathError::InvalidParameter(
+                "RefusingPlane is a decline-path fixture; offset_exact is not modelled".to_string(),
+            ))
+        }
+        fn offset_variable(
+            &self,
+            _distance_fn: Box<dyn Fn(f64, f64) -> f64 + Send + Sync>,
+            _tolerance: Tolerance,
+        ) -> crate::math::MathResult<Box<dyn Surface>> {
+            Err(crate::math::MathError::InvalidParameter(
+                "RefusingPlane is a decline-path fixture; offset_variable is not modelled"
+                    .to_string(),
+            ))
+        }
+        fn intersect(
+            &self,
+            _other: &dyn Surface,
+            _tolerance: Tolerance,
+        ) -> Vec<crate::primitives::surface::SurfaceIntersectionResult> {
+            unreachable!("intersect is not modelled by RefusingPlane")
+        }
+        fn evaluate_full(
+            &self,
+            u: f64,
+            v: f64,
+        ) -> crate::math::MathResult<crate::primitives::surface::SurfacePoint> {
+            if u > self.dead_u.0 && u < self.dead_u.1 {
+                return Err(crate::math::MathError::InvalidParameter(
+                    "RefusingPlane: deliberately unevaluable here".to_string(),
+                ));
+            }
+            Ok(crate::primitives::surface::SurfacePoint {
+                position: Point3::new(u, v, 0.0),
+                du: Vector3::X,
+                dv: Vector3::Y,
+                duu: Vector3::ZERO,
+                duv: Vector3::ZERO,
+                dvv: Vector3::ZERO,
+                normal: Vector3::Z,
+                k1: 0.0,
+                k2: 0.0,
+                dir1: Vector3::X,
+                dir2: Vector3::Y,
+            })
+        }
+        fn parameter_bounds(&self) -> ((f64, f64), (f64, f64)) {
+            ((0.0, 1.0), (0.0, 1.0))
+        }
+        fn is_closed_u(&self) -> bool {
+            false
+        }
+        fn is_closed_v(&self) -> bool {
+            false
+        }
+    }
+
+    /// The conforming stitch's contract is "returns false, mesh
+    /// UNTOUCHED". The caller then runs the historical grid over the
+    /// SAME face, so a vertex pushed before the decline would be left
+    /// orphaned in the mesh - referenced by no triangle, and shifting
+    /// every index the grid goes on to emit.
+    ///
+    /// The fixture is honest rather than mocked: a real `Surface` impl
+    /// that genuinely cannot evaluate in a band of its own domain, which
+    /// is the shape of a degenerate patch. The four boundary polylines
+    /// chain into the documented rectangle so the decline is reached at
+    /// the LATTICE step (the earlier chain check would leave the mesh
+    /// untouched under either implementation and so proves nothing).
+    #[test]
+    fn a_declined_conforming_stitch_leaves_the_mesh_untouched() {
+        let mut model = BRepModel::new();
+        // The band must kill a LATER interior sample, not the first.
+        // With these polylines the lattice is 3x3, so the interior
+        // columns sit at u = 1/3 and u = 2/3 and the rows at v = 1/3
+        // and v = 2/3; the scan is row-major. A band around 2/3 alone
+        // therefore lets (i=1, j=1) evaluate and refuses (i=2, j=1) --
+        // so a push-as-you-go implementation has ALREADY put one vertex
+        // in the mesh when it declines. A band that killed the first
+        // sample would pass under either implementation and prove
+        // nothing.
+        let surface_id = model
+            .surfaces
+            .add(Box::new(RefusingPlane { dead_u: (0.6, 0.7) }));
+        let face = Face::new(
+            0,
+            surface_id,
+            0,
+            crate::primitives::face::FaceOrientation::Forward,
+        );
+
+        // Corners of the unit square, in the loop order
+        // `tessellate_fillet_face_conforming` documents:
+        //   trim1 fwd (0,0)->(1,0), cap_v1 fwd (1,0)->(1,1),
+        //   trim2 fwd (0,1)->(1,1), cap_v0 fwd (0,1)->(0,0).
+        // Unequal counts on the cap axis, so the mismatch gate would
+        // route a real face here.
+        let c00 = Point3::new(0.0, 0.0, 0.0);
+        let c10 = Point3::new(1.0, 0.0, 0.0);
+        let c11 = Point3::new(1.0, 1.0, 0.0);
+        let c01 = Point3::new(0.0, 1.0, 0.0);
+        let trim1 = vec![c00, c10];
+        let trim2 = vec![c01, c11];
+        let cap_v1 = vec![c10, Point3::new(1.0, 0.5, 0.0), c11];
+        let cap_v0 = vec![c01, c00];
+
+        let mut mesh = TriangleMesh::new();
+        // Seed BOTH a vertex and a triangle. The caller shares one mesh
+        // across every face of the solid, so "untouched" means both
+        // counts are unchanged -- not that either is zero. Asserting
+        // `triangles.is_empty()` instead would pass on a mesh that had
+        // already been emptied, and would say nothing about a decline
+        // that appended.
+        for k in 0..3 {
+            mesh.add_vertex(MeshVertex {
+                position: Point3::new(9.0 + f64::from(k), 9.0, 9.0),
+                normal: Vector3::Z,
+                uv: None,
+            });
+        }
+        mesh.add_triangle(0, 1, 2);
+        mesh.face_map.push(u32::MAX);
+        let before_verts = mesh.vertices.len();
+        let before_tris = mesh.triangles.len();
+
+        let surface = model
+            .surfaces
+            .get(surface_id)
+            .expect("stub surface registered");
+        let stitched = tessellate_fillet_face_conforming(
+            &face, &model, surface, &trim1, &cap_v1, &trim2, &cap_v0, &mut mesh,
+        );
+
+        assert!(
+            !stitched,
+            "an interior sample that cannot be evaluated must DECLINE the conforming stitch"
+        );
+        assert_eq!(
+            mesh.vertices.len(),
+            before_verts,
+            concat!(
+                "declined stitch left {} vertex/vertices behind (was {}). The caller falls ",
+                "through to the historical grid over the same face, so these are orphans: ",
+                "referenced by no triangle and shifting every index emitted after them"
+            ),
+            mesh.vertices.len() - before_verts,
+            before_verts
+        );
+        assert_eq!(
+            mesh.triangles.len(),
+            before_tris,
+            concat!(
+                "declined stitch left {} triangle(s) behind (was {}). The grid path is ",
+                "about to cover this same face, so anything left here is double-covered ",
+                "geometry, not a hole"
+            ),
+            mesh.triangles.len() - before_tris,
+            before_tris
+        );
+    }
+
+    /// A square whose EVERY side is split at TWO interior points, so
+    /// every collinear run is 4 points long.
+    ///
+    /// This is the polygon that has NO safe apex, and `None` is the
+    /// CORRECT answer rather than a conservative one: a fan triangle
+    /// `(apex, apex+1, apex+2)` is degenerate exactly when `apex+1` is
+    /// interior to a run, and `(apex, apex-2, apex-1)` exactly when
+    /// `apex-1` is. Here every vertex has a run-INTERIOR neighbour --
+    /// the corners because the next point along each side is one, the
+    /// side points because their run-mate is -- so whichever vertex a
+    /// fan starts from, one of its end triangles collapses. No fan
+    /// triangulates this polygon without dropping a boundary chord, so
+    /// declining is the only honest answer available to a fan.
+    fn no_safe_apex_square() -> Vec<(f64, f64)> {
+        vec![
+            (0.0, 0.0),
+            (1.0, 0.0),
+            (2.0, 0.0),
+            (3.0, 0.0),
+            (3.0, 1.0),
+            (3.0, 2.0),
+            (3.0, 3.0),
+            (2.0, 3.0),
+            (1.0, 3.0),
+            (0.0, 3.0),
+            (0.0, 2.0),
+            (0.0, 1.0),
+        ]
+    }
+
+    /// No safe apex => decline, rather than fan and drop a chord.
+    ///
+    /// The alternative an unfixed apex rule takes is to emit the fan
+    /// anyway and `continue` past the degenerate triangles, which
+    /// returns `Some` with boundary chords covered by nothing - the
+    /// T-junction this whole path exists to avoid. Declining hands the
+    /// face back empty, which is visible and honest.
+    #[test]
+    fn a_polygon_with_no_safe_apex_is_declined() {
+        let poly = no_safe_apex_square();
+        assert!(
+            fan_weakly_convex_polygon(&poly, (0, poly.len())).is_none(),
+            concat!(
+                "every vertex of this square has a run-interior neighbour, so every fan ",
+                "apex degenerates one of its end triangles. Returning Some here means the ",
+                "fan emitted a triangulation missing at least one boundary chord"
+            )
+        );
+    }
+
+    /// A genuinely REFLEX contour is declined too. Weak convexity
+    /// tolerates collinear turns; it must not tolerate a turn that
+    /// reverses, because a fan from any vertex of a non-convex polygon
+    /// leaves the polygon.
+    #[test]
+    fn a_reflex_contour_is_declined() {
+        // L-shaped hexagon: the vertex at (1, 1) turns the other way.
+        let poly = vec![
+            (0.0, 0.0),
+            (2.0, 0.0),
+            (2.0, 1.0),
+            (1.0, 1.0),
+            (1.0, 2.0),
+            (0.0, 2.0),
+        ];
+        assert!(
+            fan_weakly_convex_polygon(&poly, (0, poly.len())).is_none(),
+            "an L-shaped hexagon is reflex at (1, 1); a fan would cover area outside it"
+        );
+    }
+
+    /// The counterpart that keeps the rule from being over-tightened: a
+    /// COLLINEAR vertex is a perfectly good apex, and a polygon whose
+    /// every CORNER is unsafe can still be fanned from one.
+    ///
+    /// A rectangle with two OPPOSITE sides densified by one midpoint
+    /// each has no safe CORNER - every corner is adjacent to a midpoint
+    /// whose turn is zero. It fans correctly all the same, from a
+    /// midpoint: the midpoint's own turn is zero but BOTH its
+    /// neighbours are corners, which is exactly what the rule asks. If
+    /// the apex requirement is ever tightened to "strictly convex AND
+    /// safe", this polygon starts declining for no reason and every
+    /// densified planar neighbour of a blend loses its mesh.
+    #[test]
+    fn a_collinear_vertex_is_a_legal_apex() {
+        let poly = vec![
+            (0.0, 0.0),
+            (1.0, 0.0), // midpoint of the bottom side
+            (2.0, 0.0),
+            (2.0, 1.0),
+            (1.0, 1.0), // midpoint of the top side
+            (0.0, 1.0),
+        ];
+        let n = poly.len();
+        let tris = fan_weakly_convex_polygon(&poly, (0, n))
+            .expect("a convex hexagon with two collinear vertices must fan from a midpoint");
+
+        let mut covered: HashSet<(usize, usize)> = HashSet::new();
+        for t in &tris {
+            for &(a, b) in &[(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+                covered.insert(if a < b { (a, b) } else { (b, a) });
+            }
+        }
+        for i in 0..n {
+            let (a, b) = (i, (i + 1) % n);
+            let key = if a < b { (a, b) } else { (b, a) };
+            assert!(
+                covered.contains(&key),
+                "boundary chord {a}->{b} is covered by no triangle"
+            );
+        }
+        let vertices: Vec<Point3> = poly.iter().map(|&(x, y)| Point3::new(x, y, 0.0)).collect();
+        let area = total_tri_area_xy(&vertices, &tris);
+        assert!(
+            (area - 2.0).abs() <= 1.0e-9,
+            "the 2x1 rectangle must be covered exactly once; area {area} vs 2.0"
+        );
     }
 
     /// Centroid of a triangle in 2D.

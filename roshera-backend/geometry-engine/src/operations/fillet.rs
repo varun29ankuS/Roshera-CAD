@@ -15371,20 +15371,23 @@ mod tests {
     /// with `InvalidRadius(0.0)`. Asserting the two agree is what
     /// pins the newly-opened path onto the existing one.
     ///
-    /// **Both currently REFUSE**, and that is recorded here rather
-    /// than papered over: on a box edge the variable-radius surgery
-    /// produces a geometrically open solid and the kernel rolls it
-    /// back (`InvalidBRep`, "36 boundary mesh edge(s)"). Measured
-    /// through the pre-existing `VariableStations` variant on this
-    /// same fixture at both a 3x and a 1.22x radius span, so it is a
-    /// limitation of that surgery, not of this task's change.
-    /// `fillet_variable_radius_spine.rs` covers the spine SAMPLES,
-    /// not full closure through `fillet_edges` - which is why the
-    /// gap was invisible.
+    /// Both used to REFUSE. On a box edge the varying-radius surgery
+    /// produced a combinatorially valid but geometrically OPEN solid
+    /// and the D-1 post-flight rolled it back (`InvalidBRep`,
+    /// "47 boundary mesh edge(s)"). That was a TESSELLATION defect,
+    /// not a surgery one: `tessellate_fillet_face` resampled whichever
+    /// cap cache was shorter up to the longer cap's count, landing
+    /// vertices in the middle of the neighbouring face's chords.
+    /// Task #37 replaced that with a conforming stitch, so this test
+    /// now asserts what it always wanted to: both spellings SUCCEED
+    /// and agree on the resulting solid.
     ///
-    /// The discriminating assertion is the last one: the function
-    /// must fail *in surgery*, not at the entry gate. Before the fix
-    /// it never got that far.
+    /// The volume is checked against the closed form for a cube with
+    /// one edge rounded by a linear ramp,
+    /// `V = L^3 - (1 - pi/4) * L * (r0^2 + r0 r1 + r1^2) / 3`, so a
+    /// silent collapse to either endpoint radius fails here rather
+    /// than passing. `fillet_variable_radius_closure.rs` carries the
+    /// same invariant for the non-`Function` spellings.
     #[test]
     fn varying_function_fillet_matches_the_equivalent_variable_stations() {
         const SIZE: f64 = 10.0;
@@ -15406,46 +15409,57 @@ mod tests {
             Ok((faces.len(), volume))
         };
 
-        let from_function = run(FilletType::Function(std::sync::Arc::new(|t: f64| 0.5 + t)));
-        let from_stations = run(FilletType::VariableStations(vec![(0.0, 0.5), (1.0, 1.5)]));
+        let from_function = run(FilletType::Function(std::sync::Arc::new(|t: f64| 0.5 + t)))
+            .unwrap_or_else(|e| {
+                panic!(
+                    concat!(
+                        "a varying Function fillet whose samples all fit must APPLY. ",
+                        "`InvalidRadius` would mean the entry gate turned it away and ",
+                        "`Function` is dead again; `InvalidBRep` would mean the varying-",
+                        "radius blend no longer closes. Got {:?}"
+                    ),
+                    e
+                )
+            });
+        let from_stations = run(FilletType::VariableStations(vec![(0.0, 0.5), (1.0, 1.5)]))
+            .unwrap_or_else(|e| {
+                panic!("the equivalent VariableStations schedule must apply too; got {e:?}")
+            });
 
-        match (&from_function, &from_stations) {
-            (Ok(f), Ok(v)) => {
-                assert_eq!(
-                    f.0, v.0,
-                    "Function(|t| 0.5+t) and VariableStations([(0,0.5),(1,1.5)]) are the same \
-                     request; they must produce the same faces"
-                );
-                assert!(
-                    (f.1 - v.1).abs() <= 1.0e-9 * v.1.abs().max(1.0),
-                    "same request, same solid: volumes {} vs {}",
-                    f.1,
-                    v.1
-                );
-            }
-            (Err(a), Err(b)) => assert_eq!(
-                format!("{a:?}"),
-                format!("{b:?}"),
-                "the two spellings of one varying schedule must fail the same way"
-            ),
-            (a, b) => panic!(
-                "Function and VariableStations diverged on the same schedule: \
-                 function={a:?}, stations={b:?}"
-            ),
-        }
+        assert_eq!(
+            from_function.0, from_stations.0,
+            concat!(
+                "Function(|t| 0.5+t) and VariableStations([(0,0.5),(1,1.5)]) are the same ",
+                "request; they must produce the same faces"
+            )
+        );
+        assert!(
+            (from_function.1 - from_stations.1).abs() <= 1.0e-9 * from_stations.1.abs().max(1.0),
+            "same request, same solid: volumes {} vs {}",
+            from_function.1,
+            from_stations.1
+        );
 
-        // The load-bearing assertion. `InvalidRadius` is the entry
-        // gate; anything else means the request cleared every gate
-        // and reached the varying-radius surgery, which is the whole
-        // point of this fix. A refusal from surgery is honest; a
-        // refusal from the gate would mean `Function` is still dead.
-        if let Err(e) = &from_function {
-            assert!(
-                !matches!(e, OperationError::InvalidRadius(_)),
-                "a varying function whose samples all fit must reach surgery, not be turned \
-                 away by the entry-point radius gate; got {e:?}"
-            );
-        }
+        // Closed form for a cube with one edge rounded by a linear
+        // 0.5 -> 1.5 ramp: V = L^3 - (1 - pi/4) * L * (r0^2 + r0 r1 +
+        // r1^2) / 3. Pinning the VALUE (not just the agreement) is what
+        // stops a silent collapse to a constant radius from passing:
+        // 0.5 constant gives 999.46 and 1.5 constant gives 995.17,
+        // both outside the 0.1 % band around 997.675.
+        let (r0, r1) = (0.5_f64, 1.5_f64);
+        let expected = SIZE.powi(3)
+            - (1.0 - std::f64::consts::PI / 4.0) * SIZE * (r0 * r0 + r0 * r1 + r1 * r1) / 3.0;
+        let rel = (from_function.1 - expected).abs() / expected;
+        assert!(
+            rel <= 1.0e-3,
+            concat!(
+                "a 0.5 mm -> 1.5 mm blend on a 10 mm cube edge encloses {:.5}; got {:.5} ",
+                "({:.4} % off, budget 0.1 %)"
+            ),
+            expected,
+            from_function.1,
+            rel * 100.0
+        );
     }
 
     /// The positive control for the test above: a function whose

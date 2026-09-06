@@ -186,24 +186,26 @@ async fn tagged_constant_round_trips_to_kernel_constant() {
 /// Pinning this body verbatim guarantees the wire never drifts from
 /// what the frontend emits.
 ///
-/// KERNEL CONTRACT UPDATE (D-1, dogfood-diag-api-blend): an
-/// unequal-end `Variable(1.0, 3.0)` fillet on a box edge produces a
-/// blend band that does not close against its neighbours — open at
-/// BOTH coarse (0.1) and display (0.001) chords, and the kernel
-/// certificate has ALWAYS reported it `watertight=false / sound=false`.
-/// Historically `fillet_edges` still returned `Ok`, so this harness
-/// pinned "kernel accepts" for a result the kernel's own certificate
-/// called unsound. The D-1 geometric-closure post-flight makes the op
-/// honest: it now REFUSES (typed, rolled back) instead of emitting the
-/// open solid. This test pins the full pipeline UNCHANGED up to the
-/// kernel call — the refusal text proves the `FilletType::Variable`
-/// surgery genuinely ran — plus the rollback contract.
+/// KERNEL CONTRACT (task #37): an unequal-end `Variable(1.0, 3.0)`
+/// fillet on a box edge now WELDS WATERTIGHT and the op is accepted.
 ///
-/// Banked follow-up (pre-existing kernel gap, NOT a D-1 regression):
-/// make the unequal-end variable band weld watertight, then flip the
-/// drive expectation back to `Ok` + face-count growth. The equal-end
-/// stations profile (`variable_profile_drives_kernel_variable_stations`)
-/// closes fine and keeps pinning the accepting path.
+/// It did not always. The blend band read open at both the coarse
+/// (0.1) and display (0.001) chords, so the D-1 closure post-flight
+/// refused it and this harness pinned that refusal — with the flip
+/// back to `Ok` + face-count growth banked in this comment for
+/// whoever closed the underlying gap. That is what task #37 did:
+/// `tessellate_fillet_face` was resampling the shorter of the two cap
+/// caches up to the longer cap's count, landing vertices in the middle
+/// of the neighbouring faces' chords (T-junctions the position weld
+/// cannot collapse). The two caps are only unequal when the radius
+/// VARIES, which is why the equal-end stations profile
+/// (`variable_profile_drives_kernel_variable_stations`) closed fine
+/// throughout and kept pinning the accepting path.
+///
+/// The banked expectation is now the assertion: the pipeline is
+/// pinned UNCHANGED up to the kernel call, the kernel ACCEPTS, and the
+/// shell gains faces — which is what proves the `FilletType::Variable`
+/// surgery genuinely ran rather than being skipped.
 #[tokio::test]
 async fn linear_profile_drives_kernel_variable_endpoints() {
     let (mut model, solid_id, edge) = box_first_edge(20.0, 20.0, 20.0);
@@ -235,32 +237,45 @@ async fn linear_profile_drives_kernel_variable_endpoints() {
     }
 
     // Drive the kernel: the wire-derived FilletType reaches the real
-    // variable-radius surgery, whose geometrically-open output the
-    // D-1 closure gate now refuses honestly instead of accepting.
+    // variable-radius surgery, which now produces a closed band the
+    // D-1 closure post-flight accepts.
     let opts = FilletOptions {
         fillet_type: radii.to_fillet_type(0),
         propagation: PropagationMode::None,
         ..FilletOptions::default()
     };
-    let err = fillet_edges(&mut model, solid_id, vec![edge], opts)
-        .expect_err("unequal-end variable fillet (open band) must be refused post-flight");
-    let msg = format!("{err:?}");
-    assert!(
-        msg.contains("geometrically OPEN"),
-        "refusal must be the geometric-closure gate (proving the Variable \
-         surgery ran and its output was honestly measured); got {msg}"
+    let faces = fillet_edges(&mut model, solid_id, vec![edge], opts).expect(concat!(
+        "an unequal-end variable fillet must be APPLIED: the blend band welds ",
+        "watertight against its neighbours since task #37, so the D-1 geometric-",
+        "closure post-flight has nothing left to refuse"
+    ));
+    assert_eq!(
+        faces.len(),
+        1,
+        "one filleted edge yields one blend face, got {}",
+        faces.len()
     );
 
-    // Rollback contract: the refused op must leave the box untouched.
+    // The shell must actually GROW — this is what proves the
+    // `FilletType::Variable` surgery ran rather than being skipped.
     let face_count_after = model
         .shells
         .get(model.solids.get(solid_id).unwrap().outer_shell)
         .unwrap()
         .faces
         .len();
-    assert_eq!(
-        face_count_before, face_count_after,
-        "refused fillet must roll back cleanly"
+    assert!(
+        face_count_after > face_count_before,
+        "applied fillet must add the blend face to the shell; {face_count_before} -> \
+         {face_count_after}"
+    );
+
+    // And the result must be SOUND, not merely accepted.
+    let cert = model.certify_solid(solid_id);
+    assert!(
+        cert.is_sound(),
+        "the applied variable fillet must certify sound; errors {:?}",
+        cert.errors
     );
 }
 
