@@ -25,7 +25,7 @@ mod common;
 
 use assembly_engine::{
     Assembly, DriveParam, EpsilonSpec, Instance, InstanceId, Joint, MateKind, Mechanism, Mesh,
-    SweepMethod, SweepSource,
+    SweepMethod, SweepRefusal, SweepSource,
 };
 use common::{frame, mate};
 use std::f64::consts::TAU;
@@ -342,8 +342,15 @@ fn derived_sweeps_respect_limits_and_stamp_interference() {
 fn unbounded_slider_travel_refuses_the_sweep_honestly() {
     // A slider with NO limits has unbounded travel — there is no finite
     // range to certify. The derived sweep must surface a TYPED refusal
-    // (never an invented range, never a silent skip) and the refusal does
-    // not fail soundness (mirrors mobility-reported-not-failed).
+    // (never an invented range, never a silent skip).
+    //
+    // This test used to assert that the refusal LEFT the certificate sound,
+    // on a reading of the mobility-reported-not-failed contract. The
+    // 2026-09-03 audit overturned that reading: mobility is a MEASURED
+    // property being reported instead of graded, whereas a refused sweep is
+    // a check that never ran. The honest siblings — `no_static_interference`
+    // and `all_in_contact` — both fail on an unrun check, and the swept
+    // dimension now does too.
     let mut assembly = Assembly::new(InstanceId(0));
     assembly.add_instance(instance_at(0, cuboid(1.0, 1.0, 1.0), [0.0, 0.0, 0.0]));
     assembly.add_instance(instance_at(1, cuboid(1.0, 1.0, 1.0), [0.0, 0.0, 2.0]));
@@ -374,8 +381,24 @@ fn unbounded_slider_travel_refuses_the_sweep_honestly() {
         "unbounded travel refuses typed: {fact:?}"
     );
     assert!(
-        cert.swept_clearance_ok,
-        "an honest refusal is reported, not failed (mobility precedent)"
+        !fact.clear,
+        "a range that was never swept is not a clear one: {fact:?}"
+    );
+    // The refusal is REPORTED (it stays in `sweeps`, and is named again in
+    // `unverified_sweeps`) and it BLOCKS the verdict — both, not either.
+    assert!(
+        cert.unverified_sweeps.iter().any(|u| u.refusal
+            == SweepRefusal::UnboundedTravel {
+                mate_index: 0,
+                param: DriveParam::Translation
+            }),
+        "the unswept motion is named: {:?}",
+        cert.unverified_sweeps
+    );
+    assert!(
+        !cert.swept_clearance_ok,
+        "an unrun check never rides a pass: {:?}",
+        cert.sweeps
     );
 }
 
@@ -475,4 +498,119 @@ fn driven_sweep_refuses_when_the_mechanism_cannot_follow() {
         fact.manifold_violation.is_some(),
         "the stuck mechanism is a TYPED manifold refusal: {fact:?}"
     );
+}
+
+// ── An UNSWEPT range is not a clear one (audit 2026-09-03, task 18a) ────
+
+/// The rail rig: a long ground rail, a slider block seated on it at the
+/// origin, and an obstacle block seated on the same rail 5 units along the
+/// slide axis and FASTENED there.
+///
+/// Every other certificate dimension is deliberately clean — both blocks
+/// are grounded, both touch the rail they are mated to, nothing overlaps —
+/// so the only dimension that can move the verdict is the swept one.
+fn slider_rail(limits: Option<(f64, f64)>) -> Assembly {
+    let mut assembly = Assembly::new(InstanceId(0));
+    // Ground rail: x in [-10, 10], top face at z = 1.
+    assembly.add_instance(instance_at(0, cuboid(10.0, 1.0, 1.0), [0.0, 0.0, 0.0]));
+    // Slider block seated on the rail at x = 0.
+    assembly.add_instance(instance_at(1, cuboid(1.0, 1.0, 1.0), [0.0, 0.0, 2.0]));
+    // Obstacle seated on the rail at x = 5 — 5 units along the slide axis.
+    assembly.add_instance(instance_at(2, cuboid(1.0, 1.0, 1.0), [5.0, 0.0, 2.0]));
+    // Slide along +x: the frame's z_axis IS the joint's free direction.
+    assembly.add_mate(mate(
+        MateKind::Slider { limits },
+        0,
+        frame([0.0, 0.0, 1.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]),
+        1,
+        frame([0.0, 0.0, -1.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]),
+    ));
+    assembly.add_mate(mate(
+        MateKind::Fastened,
+        0,
+        frame([5.0, 0.0, 1.0], [0.0, 0.0, 1.0], [1.0, 0.0, 0.0]),
+        2,
+        frame([0.0, 0.0, -1.0], [0.0, 0.0, 1.0], [1.0, 0.0, 0.0]),
+    ));
+    assembly
+}
+
+#[test]
+fn an_unbounded_slider_with_an_obstacle_on_its_path_is_not_sound() {
+    // The audit's case: `Slider { limits: None }` has unbounded travel, so
+    // the sweep is REFUSED — nothing was swept. An unswept range is not a
+    // clear one, and an obstacle sits 5 units down the slide.
+    let cert = slider_rail(None).certify_v2(
+        &[],
+        EpsilonSpec {
+            kernel_floor: 0.01,
+            requested: None,
+        },
+    );
+    // Every OTHER dimension is clean, so the verdict can only turn on the
+    // swept one — this names the dimension if a fixture drifts.
+    assert!(cert.mates_consistent, "{cert:?}");
+    assert!(cert.fully_grounded, "{cert:?}");
+    assert!(cert.no_static_interference, "{cert:?}");
+    assert!(cert.mates_in_contact, "{cert:?}");
+    assert!(cert.mates_anchored, "{cert:?}");
+    assert!(cert.mates_enforced, "{cert:?}");
+
+    let refused = cert.sweeps.first();
+    let Some(refused) = refused else {
+        assert!(false, "the unswept motion is VISIBLE: {:?}", cert.sweeps);
+        return;
+    };
+    assert!(
+        refused.refusal.is_some(),
+        "unbounded travel refuses typed: {refused:?}"
+    );
+    assert!(
+        !refused.clear,
+        "a range that was never swept is not a clear one: {refused:?}"
+    );
+    assert!(
+        cert.unverified_sweeps
+            .iter()
+            .any(|u| u.source == refused.source
+                && u.refusal
+                    == SweepRefusal::UnboundedTravel {
+                        mate_index: 0,
+                        param: DriveParam::Translation
+                    }),
+        "the certificate NAMES the motion it could not sweep: {:?}",
+        cert.unverified_sweeps
+    );
+    assert!(
+        !cert.swept_clearance_ok,
+        "an unswept motion cannot certify swept clearance: {:?}",
+        cert.sweeps
+    );
+    assert!(!cert.is_sound(), "{cert:?}");
+}
+
+#[test]
+fn a_bounded_slider_clear_of_the_obstacle_stays_sound() {
+    // Control: the SAME rig with declared limits that keep the block clear
+    // of the obstacle. The range is finite, it is actually swept, and the
+    // certificate is sound — the fix fails refusals, not travel.
+    let cert = slider_rail(Some((-2.0, 2.0))).certify_v2(
+        &[],
+        EpsilonSpec {
+            kernel_floor: 0.01,
+            requested: None,
+        },
+    );
+    let swept = cert.sweeps.first();
+    let Some(swept) = swept else {
+        assert!(false, "the bounded motion is swept: {:?}", cert.sweeps);
+        return;
+    };
+    assert!(
+        swept.refusal.is_none() && swept.clear,
+        "a bounded, clear stroke certifies: {swept:?}"
+    );
+    assert!(cert.unverified_sweeps.is_empty(), "{:?}", cert.sweeps);
+    assert!(cert.swept_clearance_ok, "{:?}", cert.sweeps);
+    assert!(cert.is_sound(), "{cert:?}");
 }

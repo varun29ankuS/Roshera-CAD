@@ -48,7 +48,9 @@ pub use interference::{
 };
 pub use jacobian::JacobianProbe;
 pub use joint::Joint;
-pub use mate_anchor::{MateAnchorReport, UnanchoredFeature};
+pub use mate_anchor::{
+    AnchorUnverifiedReason, MateAnchorReport, UnanchoredFeature, UnverifiedAnchor,
+};
 pub use mate_contact::{DisconnectedMate, MateContactReport, UnverifiedMate};
 pub use motion::{
     DragOutcome, DragScope, DriveParam, DriveRefusal, LimitFact, RankTransition, WindingFact,
@@ -58,6 +60,6 @@ pub use solve_input::{InputPose, SolveInput};
 pub use solver::{DofReport, Mobility, SolveReport, SolvedPose};
 pub use sweep::{
     swept_clearance, InterferenceFact, ManifoldViolation, MotionStamp, SweepMethod, SweepRefusal,
-    SweepSource, SweptClearance, SweptFact,
+    SweepSource, SweptClearance, SweptFact, UnverifiedSweep,
 };
 pub use types::{Assembly, FeatureRef, Instance, InstanceId, Mate, MateKind, Mesh};

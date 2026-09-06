@@ -153,9 +153,16 @@ pub struct InterferenceFact {
     pub at: MotionStamp,
 }
 
-/// Why a motion could not be certified. A refusal is not a failure: it
-/// says the range was never swept, and why — the mobility-reported-not-
-/// failed contract (spec §3.5).
+/// Why a motion could not be certified: it says the range was never swept,
+/// and why.
+///
+/// A refusal is not a COLLISION — nothing was found, because nothing was
+/// looked at. It is equally not a pass: an unswept range has not been
+/// proven clear, so a refused fact carries `clear: false` and the
+/// certificate lists it under `unverified_sweeps`, exactly as an unrun
+/// pairwise check lands in `interference_unverified` rather than riding
+/// `no_static_interference`. The two facts are told apart by `refusal`
+/// itself, never by folding one into the other.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "refusal", rename_all = "snake_case")]
 pub enum SweepRefusal {
@@ -173,9 +180,11 @@ pub struct SweptFact {
     /// The parameter range swept (meaningless when `refusal` is set).
     pub range: (f64, f64),
     pub method: SweepMethod,
-    /// Nothing was found in the swept range. A fact carrying a `refusal`
-    /// reports `clear: true` because nothing was swept — the refusal, not
-    /// this flag, is what says the motion is uncertified.
+    /// The range was swept and nothing was found in it. A fact carrying a
+    /// `refusal` reports `clear: false`: nothing was swept, so nothing was
+    /// proven, and an unswept range must never read as a clear one. The
+    /// `refusal` field is what tells "never checked" apart from "checked
+    /// and it collides".
     pub clear: bool,
     /// `min sampled distance − epsilon` over the motion; `None` when no
     /// pair had a measurable distance (a meshless instance cannot collide).
@@ -192,14 +201,30 @@ pub struct SweptFact {
     pub refusal: Option<SweepRefusal>,
 }
 
+/// A motion whose range was never swept — the check did not run, and this
+/// names which motion and why.
+///
+/// The honest sibling of [`crate::interference::UnverifiedInterferencePair`]
+/// and [`crate::mate_contact::UnverifiedMate`]: an unrun check is never
+/// folded into a pass, so a non-empty list of these is why the certificate's
+/// `swept_clearance_ok` reads `false`.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct UnverifiedSweep {
+    /// The motion that was not swept.
+    pub source: SweepSource,
+    /// Why it was not swept.
+    pub refusal: SweepRefusal,
+}
+
 impl SweptFact {
-    /// A refused sweep: nothing swept, nothing found, the reason carried.
+    /// A refused sweep: nothing swept, so nothing proven — `clear: false`,
+    /// with the reason carried.
     fn refused(source: SweepSource, epsilon: f64, refusal: SweepRefusal) -> Self {
         Self {
             source,
             range: (0.0, 0.0),
             method: SweepMethod::NonlinearToi { samples: 0 },
-            clear: true,
+            clear: false,
             min_certified_clearance: None,
             epsilon,
             first_contact: None,
@@ -866,6 +891,15 @@ impl Assembly {
                         continue;
                     }
                 };
+                // An `Err` here is a `DriveRefusal` from `prepare_drive`, and
+                // it cannot reach a SOUND certificate today: every mate whose
+                // drive setup refuses is also one `is_numerically_enforced()`
+                // rejects, so `mates_enforced` is already false and
+                // `is_sound()` already fails. That guard is a COINCIDENCE
+                // between two predicates, not a stated invariant — if the two
+                // sets ever diverge, this arm becomes the same unrun-check-
+                // folded-into-a-pass defect the refusal path above just fixed,
+                // and it needs its own `unverified_sweeps` entry.
                 if let Ok(fact) = self.sweep_driven(index, param, range, DERIVED_SAMPLES, epsilon) {
                     facts.push(fact);
                 }

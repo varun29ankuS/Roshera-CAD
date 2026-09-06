@@ -21,9 +21,10 @@ use crate::constrainedness::{
 use crate::decompose::{DecompositionStats, StructuralDofReport};
 use crate::interference::UnverifiedInterferencePair;
 use crate::joint::Joint;
+use crate::mate_anchor::UnverifiedAnchor;
 use crate::mate_contact::UnverifiedMate;
 use crate::solver::Mobility;
-use crate::sweep::SweptFact;
+use crate::sweep::{SweptFact, UnverifiedSweep};
 use crate::types::{Assembly, InstanceId};
 use serde::{Deserialize, Serialize};
 
@@ -52,10 +53,15 @@ pub struct AssemblyCertificate {
     /// checked — `false` when a pair was skipped (mesh missing/degenerate),
     /// not just when overlap was found. See `interference_unverified`.
     pub no_static_interference: bool,
-    /// Every supplied mechanism stays clear across its full range of motion.
+    /// Every motion this assembly carries was actually SWEPT and stayed
+    /// clear across its full range. `false` also when a motion was never
+    /// swept at all (a refused range — unbounded travel), not only when a
+    /// collision was found; see `unverified_sweeps`.
     pub swept_clearance_ok: bool,
     /// Every mate's features sit on their parts' real geometry — no part is
     /// grounded through a constraint declared against an invented coordinate.
+    /// `false` also when a feature's anchoring could not be measured at all
+    /// (the probe never ran); see `anchor_unverified`.
     pub mates_anchored: bool,
     /// Every mated pair actually touches — no part is joined to another only on
     /// paper, sitting coaxial-but-floating with a gap between them. `false`
@@ -120,6 +126,20 @@ pub struct AssemblyCertificate {
     /// reason. Serde-defaults so pre-fix payloads parse.
     #[serde(default)]
     pub interference_unverified: Vec<UnverifiedInterferencePair>,
+    // ── Audit 2026-09-03 (task 18) — also ADDITIVE: ────────────────
+    /// Motions whose range was never swept — a refusal (unbounded travel)
+    /// means the check did not run. Non-empty here is why
+    /// `swept_clearance_ok` reads `false`: an unswept range is not a clear
+    /// one. Serde-defaults so pre-fix payloads parse.
+    #[serde(default)]
+    pub unverified_sweeps: Vec<UnverifiedSweep>,
+    /// Mate features whose anchoring could not be measured at all (no mesh,
+    /// no such instance, a direction vector that is not a direction) — the
+    /// probe never ran. Non-empty here is why `mates_anchored` reads
+    /// `false`, for the same reason. Serde-defaults so pre-fix payloads
+    /// parse.
+    #[serde(default)]
+    pub anchor_unverified: Vec<UnverifiedAnchor>,
 }
 
 fn default_true() -> bool {
@@ -179,7 +199,8 @@ impl Assembly {
         let fully_grounded = self.grounding_report().fully_grounded();
         // Anchoring is pose-independent (features are local), so it reads the
         // assembly as declared — before the solve can paper over a fake joint.
-        let mates_anchored = self.mate_anchor_report(MATE_ANCHOR_TOL).all_anchored();
+        let anchor_report = self.mate_anchor_report(MATE_ANCHOR_TOL);
+        let mates_anchored = anchor_report.all_anchored();
         // Enforcement is declaration-level too: a refused mate contributes no
         // residual rows, so it is judged before any solve can hide it.
         let mates_enforced = self.mate_enforcement_report().all_enforced();
@@ -226,7 +247,20 @@ impl Assembly {
                 .iter()
                 .map(|m| solved.sweep_mechanism_checked(m, epsilon)),
         );
-        let swept_clearance_ok = sweeps.iter().all(|s| s.clear);
+        // A refused sweep never ran, so it is listed here rather than folded
+        // into the verdict — the same contract the interference and contact
+        // dimensions keep. The facts stay in `sweeps` (this is a projection,
+        // not a move): a caller reading the motion table still sees them.
+        let unverified_sweeps: Vec<UnverifiedSweep> = sweeps
+            .iter()
+            .filter_map(|s| {
+                s.refusal.map(|refusal| UnverifiedSweep {
+                    source: s.source,
+                    refusal,
+                })
+            })
+            .collect();
+        let swept_clearance_ok = sweeps.iter().all(|s| s.clear) && unverified_sweeps.is_empty();
 
         AssemblyCertificate {
             mates_consistent,
@@ -249,6 +283,8 @@ impl Assembly {
             sweeps,
             contact_unverified: contact_report.unverified,
             interference_unverified: interference_report.unverified,
+            unverified_sweeps,
+            anchor_unverified: anchor_report.unverified,
         }
     }
 }

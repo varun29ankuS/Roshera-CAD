@@ -16,6 +16,11 @@
 //! A feature that floats farther than `tol` off its part is reported, and the
 //! certificate is not sound. The kernel cannot be told a part connects to a
 //! coordinate that isn't there.
+//!
+//! A feature the probe cannot MEASURE at all — a part with no mesh to sit on,
+//! a direction vector that is not a direction — is reported too, separately,
+//! under `unverified`. It is not anchored and it is not unanchored: it was
+//! never checked, and an unchecked feature never rides a pass.
 
 use crate::types::{Assembly, FeatureRef, Instance, InstanceId};
 use parry3d_f64::na::{Point3, Vector3};
@@ -32,16 +37,52 @@ pub struct UnanchoredFeature {
     pub offset: f64,
 }
 
+/// Why a feature's anchoring could not be MEASURED at all — as opposed to
+/// being measured and found on (or off) the part. An unrun probe must never
+/// share a bucket with a verified anchoring; the kernel must say the check
+/// never ran.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AnchorUnverifiedReason {
+    /// The mate names an instance this assembly does not hold — there is no
+    /// part to probe against.
+    MissingInstance,
+    /// The part's mesh is missing or too small to form a surface, so there
+    /// is no geometry the feature could be shown to sit on.
+    MissingMesh,
+    /// The feature's direction vector is not a direction (zero, or below the
+    /// normalisation floor): the axis probe has no line to walk, so neither
+    /// the through-the-part nor the grazing test can run. A `Frame` whose
+    /// `z_axis` is degenerate lands here too — its axis half is unmeasurable,
+    /// so the frame as declared cannot be judged.
+    DegenerateAxis,
+}
+
+/// A mate feature whose anchoring could not be measured — never folded into
+/// "anchored"; the probe simply did not run. See [`AnchorUnverifiedReason`].
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct UnverifiedAnchor {
+    pub mate_index: usize,
+    pub part: InstanceId,
+    pub reason: AnchorUnverifiedReason,
+}
+
 /// The anchoring verdict for an assembly's mates.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MateAnchorReport {
     pub unanchored: Vec<UnanchoredFeature>,
+    /// Features the probe never actually ran on (see
+    /// [`AnchorUnverifiedReason`]). A non-empty list here means anchoring has
+    /// NOT been proven — `all_anchored` reflects that, the same way
+    /// `no_static_interference` and `all_in_contact` reflect theirs.
+    #[serde(default)]
+    pub unverified: Vec<UnverifiedAnchor>,
 }
 
 impl MateAnchorReport {
-    /// True when every mate feature is anchored to its part — no fabricated mate.
+    /// True when every mate feature is VERIFIED anchored to its part — no
+    /// fabricated mate, and no unrun probe silently riding along as a pass.
     pub fn all_anchored(&self) -> bool {
-        self.unanchored.is_empty()
+        self.unanchored.is_empty() && self.unverified.is_empty()
     }
 }
 
@@ -83,9 +124,13 @@ fn bbox_reach(instance: &Instance) -> f64 {
 
 impl Assembly {
     /// For every mate, how far each feature floats off its part. A feature is
-    /// anchored when its offset is `≤ tol`; the report lists the rest.
+    /// anchored when its offset is `≤ tol`; the report lists the rest. A
+    /// feature whose offset cannot be MEASURED at all (no such instance, no
+    /// mesh, a direction vector that is not a direction) is reported as
+    /// UNVERIFIED, never silently skipped into a pass.
     pub fn mate_anchor_report(&self, tol: f64) -> MateAnchorReport {
         let mut unanchored = Vec::new();
+        let mut unverified = Vec::new();
         for (idx, mate) in self.mates.iter().enumerate() {
             for (part, feature) in [(mate.a, &mate.feature_a), (mate.b, &mate.feature_b)] {
                 // The ground is the assembly's base frame — its features are
@@ -94,36 +139,56 @@ impl Assembly {
                 if part == self.ground {
                     continue;
                 }
-                if let Some(offset) = self.feature_offset(part, feature) {
-                    if offset > tol {
-                        unanchored.push(UnanchoredFeature {
-                            mate_index: idx,
-                            part,
-                            offset,
-                        });
+                match self.feature_offset(part, feature) {
+                    Ok(offset) => {
+                        if offset > tol {
+                            unanchored.push(UnanchoredFeature {
+                                mate_index: idx,
+                                part,
+                                offset,
+                            });
+                        }
                     }
+                    Err(reason) => unverified.push(UnverifiedAnchor {
+                        mate_index: idx,
+                        part,
+                        reason,
+                    }),
                 }
             }
         }
-        MateAnchorReport { unanchored }
+        MateAnchorReport {
+            unanchored,
+            unverified,
+        }
     }
 
     /// Distance a mate feature floats off its part's geometry (0 = on the part).
     /// Features and mesh are both in the part's LOCAL frame, so no pose is
     /// applied — the question is purely "does this feature sit on this part".
-    fn feature_offset(&self, part: InstanceId, feature: &FeatureRef) -> Option<f64> {
-        let instance = self.instance(part)?;
-        let mesh = trimesh(instance)?;
+    ///
+    /// `Err` means the probe could not RUN — the distinction the caller must
+    /// keep: an unmeasurable feature is not an anchored one.
+    fn feature_offset(
+        &self,
+        part: InstanceId,
+        feature: &FeatureRef,
+    ) -> Result<f64, AnchorUnverifiedReason> {
+        let instance = self
+            .instance(part)
+            .ok_or(AnchorUnverifiedReason::MissingInstance)?;
+        let mesh = trimesh(instance).ok_or(AnchorUnverifiedReason::MissingMesh)?;
         match feature {
             FeatureRef::Face { point, .. } => {
                 // A face point must lie on the part's surface.
                 let p = Point3::new(point[0], point[1], point[2]);
-                Some(mesh.distance_to_local_point(&p, false))
+                Ok(mesh.distance_to_local_point(&p, false))
             }
             FeatureRef::Axis { origin, direction } => {
                 let o = Point3::new(origin[0], origin[1], origin[2]);
-                let d =
-                    Vector3::new(direction[0], direction[1], direction[2]).try_normalize(1e-12)?;
+                let d = Vector3::new(direction[0], direction[1], direction[2])
+                    .try_normalize(1e-12)
+                    .ok_or(AnchorUnverifiedReason::DegenerateAxis)?;
                 let c = centroid(instance);
                 // (a) a SYMMETRY/bore axis passes through the centroid.
                 let foot = o + d * (c - o).dot(&d);
@@ -138,13 +203,20 @@ impl Assembly {
                     graze = graze.min(mesh.distance_to_local_point(&p, false));
                 }
                 // Anchored if EITHER holds; a fabricated axis satisfies neither.
-                Some(through.min(graze))
+                Ok(through.min(graze))
             }
             // A connector FRAME is anchored if either its origin sits on the
             // part (a planar-face frame — origin on the face) OR its z line
             // behaves like an anchored axis (a bore frame — origin ON the
             // axis, off the surface). Reuse both probes and take the best;
             // a fabricated frame satisfies neither.
+            //
+            // If the axis half cannot RUN — a `z_axis` that is not a
+            // direction — the frame as declared is unmeasurable and the
+            // error propagates. The already-measured `on_surface` is NOT
+            // silently substituted: a frame is its origin AND its axis, and
+            // answering half the question as though it were the whole one is
+            // the very fold this dimension exists to refuse.
             FeatureRef::Frame { origin, z_axis, .. } => {
                 let on_surface = {
                     let p = Point3::new(origin[0], origin[1], origin[2]);
@@ -157,7 +229,7 @@ impl Assembly {
                         direction: *z_axis,
                     },
                 )?;
-                Some(on_surface.min(as_axis))
+                Ok(on_surface.min(as_axis))
             }
         }
     }

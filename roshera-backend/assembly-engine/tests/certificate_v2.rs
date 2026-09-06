@@ -495,9 +495,16 @@ fn certificate_wire_change_is_additive() {
         "structural",
         "decomposition",
         "epsilon",
+        // Audit 2026-09-03 (task 18): the unrun-check lists, additive.
+        "unverified_sweeps",
+        "anchor_unverified",
     ] {
         assert!(json.get(new_field).is_some(), "{new_field} added");
     }
+    // And the pre-fix payload above still parses with them EMPTY — an
+    // additive field is one an old client can omit.
+    assert!(parsed.unverified_sweeps.is_empty());
+    assert!(parsed.anchor_unverified.is_empty());
     // And the legacy entry point still stands (kernel_floor = its ε).
     let legacy = assembly.certify(&[], 0.01);
     assert_eq!(legacy.epsilon.map(|e| e.effective), Some(0.01));
