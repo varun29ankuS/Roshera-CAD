@@ -37,6 +37,15 @@
 //! still green means the machine, not the code. Those structural
 //! assertions are the primary guard; these are the second, independent
 //! one.
+//!
+//! ONE budget remains wall-clock (`analyze_dofs`). The other -
+//! "`certify_sketch` pays for ONE rank scan, not two" - used to be a
+//! 900 ms ceiling and was measured failing at 1099-1476 ms under
+//! ambient load on an unchanged, correct kernel; it failed identically
+//! with the code under test short-circuited out, which is the
+//! definition of a test measuring the machine. It now COUNTS SCANS
+//! (`constraint_solver::rank_scan_count`), so it answers the question
+//! it was always asking and answers it the same way on any hardware.
 
 #![allow(clippy::float_cmp)]
 // Reason for `#![allow(clippy::expect_used)]` / `unwrap_used` /
@@ -50,22 +59,23 @@
 mod common;
 
 use common::{generate_plate, PlateSpec};
+use geometry_engine::sketch2d::constraint_solver::{rank_scan_count, reset_rank_scan_count};
 use geometry_engine::sketch2d::sketch_certificate::certify_sketch;
 use geometry_engine::sketch2d::sketch_solver::DofStatus;
 use std::time::Instant;
 
 /// Wall-clock ceiling for `analyze_dofs` on the 300-constraint plate.
 ///
-/// Measured: 16.8 ms. Whole-matrix scan + unconditional solve: 682 ms.
-/// 150 ms is ~9x the measurement and ~4.5x under the regression.
-const DOF_BUDGET_MS: f64 = 150.0;
-
-/// Wall-clock ceiling for `certify_sketch` on the same plate.
+/// Measured: 16.8 ms. The regressions this guards, on this fixture:
+/// ~305 ms (whole-matrix rank scan), ~403 ms (unconditional Newton
+/// solve), ~682 ms (both).
 ///
-/// Measured: 363 ms. The same certificate with a second, independent
-/// rank scan for its DOF snapshot: 1677 ms. 900 ms is ~2.5x the
-/// measurement and ~1.9x under the regression.
-const CERTIFY_BUDGET_MS: f64 = 900.0;
+/// Raised 150 -> 250 ms after a sibling budget in this file was seen
+/// failing on ambient load alone. 250 ms is ~15x the measurement and
+/// still UNDER the smallest regression it guards (305 ms), so the
+/// headroom costs the tripwire none of its teeth. It is a DEBUG-profile
+/// guard (see the module doc), not a performance claim.
+const DOF_BUDGET_MS: f64 = 250.0;
 
 /// Best of `runs`, so one scheduling hiccup cannot fail the gate.
 fn best_ms(runs: usize, mut f: impl FnMut()) -> f64 {
@@ -123,7 +133,15 @@ fn analyze_dofs_on_the_300_constraint_plate_stays_within_budget() {
 
 #[test]
 fn certify_sketch_pays_for_one_rank_scan_not_two() {
+    // DETERMINISTIC. The property is "certify_sketch runs the rank
+    // pass once and reads it twice" - a COUNT, not a duration. The old
+    // form asserted a 900 ms wall-clock ceiling and failed on a loaded
+    // machine at 1099-1476 ms with the kernel unchanged and correct;
+    // worse, it failed by the same margin with the code under test
+    // short-circuited out, so it was not measuring the code at all.
     let plate = generate_plate(&PlateSpec::LARGE);
+
+    // Warm-up, and the standing fact about the fixture.
     let cert = certify_sketch(&plate.sketch);
     assert!(
         cert.constrainedness.is_fully_constrained(),
@@ -131,21 +149,43 @@ fn certify_sketch_pays_for_one_rank_scan_not_two() {
         cert.constrainedness
     );
 
-    let ms = best_ms(2, || {
-        let _ = certify_sketch(&plate.sketch);
-    });
+    // What ONE diagnosis costs on THIS fixture - measured, never a
+    // literal. `rank_profile` runs one scan and then up to
+    // GENERIC_PERTURBATION_ROUNDS more, but only when the first scan
+    // finds a dependent row: the number is a property of the sketch,
+    // and hard-coding it would make this test fail the day a fixture
+    // changes for an unrelated reason.
+    reset_rank_scan_count();
+    let dof = plate.sketch.analyze_dofs();
+    let one_diagnosis = rank_scan_count();
+    assert_eq!(
+        dof.status,
+        DofStatus::FullyConstrained,
+        "the standalone analysis sees the same plate: {dof:?}"
+    );
     assert!(
-        ms < CERTIFY_BUDGET_MS,
+        one_diagnosis > 0,
+        "analyze_dofs must run the rank pass at all - the counter is wired to \
+         `rank_scan` / `perturbed_rank_scan`, and 0 here means it is not"
+    );
+
+    reset_rank_scan_count();
+    let _ = certify_sketch(&plate.sketch);
+    let certified = rank_scan_count();
+
+    assert_eq!(
+        certified, one_diagnosis,
         concat!(
-            "certify_sketch on {} constraints took {:.1} ms, budget {} ms ",
-            "(running the rank scan twice costs ~1677 ms here)"
+            "certify_sketch ranked the Jacobian {} times; one diagnosis of this ",
+            "plate is {} scans. The certificate's DOF snapshot must REUSE the ",
+            "diagnosis it already computed (analyze_dofs_with_diagnosis), not ",
+            "run a second, independent one - two scans can also disagree, which ",
+            "is the honesty half of the same contract."
         ),
-        plate.constraint_count,
-        ms,
-        CERTIFY_BUDGET_MS
+        certified, one_diagnosis
     );
     println!(
-        "certify_sketch({} constraints) = {ms:.3} ms",
+        "certify_sketch({} constraints) = {certified} rank scan(s), one diagnosis = {one_diagnosis}",
         plate.constraint_count
     );
 }

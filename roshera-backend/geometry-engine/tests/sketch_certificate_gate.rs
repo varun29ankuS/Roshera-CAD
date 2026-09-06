@@ -708,20 +708,34 @@ fn adversarial_collinear_and_perpendicular_conflict() {
     );
 }
 
-/// CALIBRATION: Collinear AND Parallel AGREE (collinear is a stronger parallel).
-/// Must NOT be flagged as a conflict.
+/// CALIBRATION: Collinear AND Parallel AGREE. Must NOT be flagged as a
+/// conflict.
+///
+/// The pairing changed with the constraint-shape gate: `Collinear` is
+/// defined over THREE POSITIONS, and the solver has never carried a
+/// residual for "two lines lie on one carrier" -- the old two-LINE
+/// form returned `vec![0.0]`, so this calibration used to pass because
+/// the constraint was inert, not because the two constraints agreed.
+/// Three collinear points ON l1 plus `Parallel(l1, l2)` is the same
+/// claim made with shapes the kernel defines: both hold, and neither
+/// may be reported as a conflict.
 #[test]
 fn adversarial_collinear_and_parallel_is_consistent() {
     let sketch = Sketch::new("coll-para".to_string(), SketchAnchor::xy());
     let a = sketch.add_point(Point2d::new(0.0, 0.0));
     let b = sketch.add_point(Point2d::new(10.0, 0.0));
+    let mid = sketch.add_point(Point2d::new(5.0, 0.0));
     let c = sketch.add_point(Point2d::new(0.0, 5.0));
     let d = sketch.add_point(Point2d::new(10.0, 5.0));
     let l1 = sketch.add_line(a, b).expect("l1");
     let l2 = sketch.add_line(c, d).expect("l2");
     sketch.add_constraint(Constraint::new_geometric(
         GeometricConstraint::Collinear,
-        vec![EntityRef::Line(l1), EntityRef::Line(l2)],
+        vec![
+            EntityRef::Point(a),
+            EntityRef::Point(b),
+            EntityRef::Point(mid),
+        ],
         ConstraintPriority::Required,
     ));
     sketch.add_constraint(Constraint::new_geometric(
@@ -732,7 +746,7 @@ fn adversarial_collinear_and_parallel_is_consistent() {
     let cert = certify_sketch(&sketch);
     assert!(
         cert.constraint_consistent,
-        "collinear implies parallel — they agree, not conflict: {cert:?}"
+        "collinear points on l1 and l1 parallel to l2 agree, not conflict: {cert:?}"
     );
 }
 

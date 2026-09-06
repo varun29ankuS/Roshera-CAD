@@ -761,8 +761,43 @@ pub async fn add_constraint(
         }
     }
 
-    let cid = sketch.add_constraint(constraint);
+    let cid = add_constraint_checked(&sketch, constraint)?;
     Ok(Json(ConstraintIdResponse { id: cid.0 }))
+}
+
+/// Add a constraint through the kernel's CHECKED door, translating a
+/// shape refusal into the wire error.
+///
+/// `Sketch::try_add_constraint` runs `Constraint::shape_is_defined` —
+/// the one definition of "shape" the solver's residual gate and
+/// `degrees_of_freedom_removed` also read — so a constraint whose
+/// arity or entity kinds the kernel defines no residual for is refused
+/// here instead of being stored and silently refused at every later
+/// solve. Extracted from the handler so the refusal is unit-testable
+/// without standing up axum, in the same style as the `entity_exists`
+/// guard above.
+fn add_constraint_checked(
+    sketch: &geometry_engine::sketch2d::Sketch,
+    constraint: Constraint,
+) -> Result<ConstraintId, ApiError> {
+    // The structured payload is built ONLY on the refusal branch, so
+    // the happy path — every well-formed constraint — pays for no
+    // formatting and no allocation.
+    if let Err(e) = constraint.validate_shape() {
+        let details = serde_json::json!({
+            "kind": "undefined_constraint_shape",
+            "constraint": format!("{:?}", constraint.constraint_type),
+            "expected": constraint.expected_shape(),
+            "got": constraint.entity_kind_names(),
+        });
+        return Err(ApiError::new(ErrorCode::InvalidParameter, e.to_string()).with_details(details));
+    }
+    // The kernel door is still the door of record: it re-runs the same
+    // check, so a shape that only the kernel refuses cannot slip past
+    // this branch untranslated.
+    sketch
+        .try_add_constraint(constraint)
+        .map_err(|e| ApiError::new(ErrorCode::InvalidParameter, e.to_string()))
 }
 
 /// `DELETE /api/csketch/{id}/constraint/{cid}` — remove a constraint.
@@ -4394,5 +4429,79 @@ mod tests {
         let api = op_error_to_api(err);
         let body = serde_json::to_value(&api).expect("serialises");
         assert_eq!(body["details"]["kind"], "unsupported");
+    }
+
+    #[tokio::test]
+    async fn add_constraint_rejects_a_shape_mismatch_naming_the_expected_shape() {
+        // The route validated only that the referenced entities EXIST.
+        // A `Parallel` between two circles passed that check, was
+        // stored, and then read as satisfied at every solve while the
+        // DOF tally debited an angle nothing pinned. The kernel's one
+        // definition of shape (`Constraint::shape_is_defined`) now runs
+        // at this door too, via `Sketch::try_add_constraint`.
+        let state = crate::router_integration_tests::make_test_state().await;
+        let sid = state.csketches.create();
+        let sketch = state.csketches.get(&sid).expect("sketch exists");
+        let c1 = sketch
+            .add_circle(Point2d::new(0.0, 0.0), 2.0)
+            .expect("circle 1");
+        let c2 = sketch
+            .add_circle(Point2d::new(9.0, 0.0), 3.0)
+            .expect("circle 2");
+        let bad = Constraint::new_geometric(
+            GeometricConstraint::Parallel,
+            vec![EntityRef::Circle(c1), EntityRef::Circle(c2)],
+            ConstraintPriority::Required,
+        );
+
+        let err = add_constraint(State(state.clone()), Path(sid.0), Json(bad))
+            .await
+            .err()
+            .expect("a shape mismatch must be refused, not stored");
+
+        assert_eq!(err.code, ErrorCode::InvalidParameter);
+        assert_eq!(err.code.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            err.error.contains("exactly 2 lines"),
+            "the refusal names the expected arity and kinds: {}",
+            err.error
+        );
+        assert!(
+            err.error.contains("circle, circle"),
+            "the refusal names what it was handed: {}",
+            err.error
+        );
+        assert!(
+            !err.error.contains("  "),
+            "no absorbed indentation in a wire message: {}",
+            err.error
+        );
+        assert_eq!(detail_kind(&err), "undefined_constraint_shape");
+        let details = err.details.as_ref().expect("structured details");
+        assert_eq!(details["expected"], "exactly 2 lines");
+        assert_eq!(
+            details["got"],
+            serde_json::json!(["circle", "circle"]),
+            "the supplied kinds are machine-readable, in wire order"
+        );
+
+        // The store is untouched: a refused constraint never entered.
+        assert!(
+            sketch.all_constraints().is_empty(),
+            "a bad constraint must not reach the store"
+        );
+
+        // …and the same route accepts the shape the kernel DOES define.
+        let p1 = sketch.add_point(Point2d::new(0.0, 0.0));
+        let p2 = sketch.add_point(Point2d::new(1.0, 1.0));
+        let good = Constraint::new_geometric(
+            GeometricConstraint::Coincident,
+            vec![EntityRef::Point(p1), EntityRef::Point(p2)],
+            ConstraintPriority::Required,
+        );
+        add_constraint(State(state), Path(sid.0), Json(good))
+            .await
+            .expect("a well-formed constraint still passes the door");
+        assert_eq!(sketch.all_constraints().len(), 1);
     }
 }

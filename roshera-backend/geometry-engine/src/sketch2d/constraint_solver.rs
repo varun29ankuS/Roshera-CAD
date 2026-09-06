@@ -28,6 +28,7 @@ use super::{
 use crate::math::tolerance::STRICT_TOLERANCE;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -204,6 +205,58 @@ impl BlockRank {
     pub fn deficiency(&self) -> usize {
         self.columns.saturating_sub(self.rank)
     }
+}
+
+thread_local! {
+    /// Rank-revealing Jacobian scans performed ON THIS THREAD since
+    /// the last [`reset_rank_scan_count`].
+    ///
+    /// THREAD-LOCAL, not a global: the test harness runs tests in
+    /// parallel threads inside one process, and a process-wide counter
+    /// would have one test's scans landing in another's measurement.
+    /// The scan itself is single-threaded (this module uses no rayon),
+    /// so a thread-local count is exact for the thread that asked.
+    static RANK_SCAN_COUNT: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Note that a rank scan just happened. One `fetch`-free `Cell` bump
+/// against a scan that builds a Jacobian and Gram-Schmidts it: not
+/// measurable, and it buys the only DETERMINISTIC way to assert that a
+/// caller ranks the Jacobian once rather than twice.
+fn note_rank_scan() {
+    RANK_SCAN_COUNT.with(|c| c.set(c.get() + 1));
+}
+
+/// Rank scans performed on the calling thread since the last
+/// [`reset_rank_scan_count`].
+///
+/// INSTRUMENTATION. `certify_sketch` builds a certificate whose DOF
+/// snapshot must be the SAME analysis `analyze_dofs` returns - one
+/// diagnosis, two readings - and the cost of getting that wrong is a
+/// second scan of the whole Jacobian. That used to be guarded by a
+/// wall-clock budget, which fails on a loaded machine and passes on a
+/// fast one whatever the code does. This counts the thing the guard is
+/// actually about.
+///
+/// A scan is counted when it is PERFORMED, including a perturbation
+/// round whose result is later discarded as non-finite - the question
+/// is what was paid for, not what was kept.
+///
+// gate: allow-ungated because this is test instrumentation with no
+// production consumer by design; its consumer is
+// `tests/sketch_dof_rank_scale.rs`. It is `pub` rather than
+// `pub(crate)` or `#[cfg(test)]` because an integration test compiles
+// against the lib WITHOUT `cfg(test)` and cannot see either.
+pub fn rank_scan_count() -> usize {
+    RANK_SCAN_COUNT.with(Cell::get)
+}
+
+/// Zero the calling thread's rank-scan counter.
+///
+// gate: allow-ungated because this is test instrumentation - see
+// [`rank_scan_count`].
+pub fn reset_rank_scan_count() {
+    RANK_SCAN_COUNT.with(|c| c.set(0));
 }
 
 /// The result of one rank-revealing scan of a Jacobian.
@@ -1490,7 +1543,17 @@ impl ConstraintSolver {
                 index,
                 dof_removed: c.degrees_of_freedom_removed(),
                 hard: super::dr_plan::is_hard_priority(c.priority),
-                enforced: c.constraint_type.is_numerically_enforced(),
+                // Shape-AWARE. `is_numerically_enforced` is a
+                // TYPE-level fact ("this kind has a residual at all");
+                // a constraint whose SHAPE the kernel does not define
+                // has no residual either, and `dr_plan::plan_component`
+                // must refuse to plan a component containing one for
+                // exactly the same reason it refuses an unenforced
+                // kind: no step could ever satisfy it, so a plan that
+                // claimed to place the component would be a lie.
+                // Without the second half a `Parallel(circle, circle)`
+                // was planned as though it pinned an angle.
+                enforced: c.constraint_type.is_numerically_enforced() && c.shape_is_defined(),
                 grounded: super::dr_plan::references_frame(&c.constraint_type),
                 vars: vars.into_iter().collect(),
             });
@@ -1927,6 +1990,23 @@ impl ConstraintSolver {
 
     /// Evaluate error for a single constraint
     fn evaluate_constraint_error(&self, constraint: &Constraint) -> Vec<f64> {
+        // THE SHAPE GATE. A constraint whose arity or entity kinds the
+        // kernel does not define gets the irreducible refusal residual
+        // in EVERY row it budgets — never a zero row, which reads
+        // exactly like "satisfied" to `get_violations`, to the
+        // convergence test, and to the certificate.
+        //
+        // One gate, driven from the ONE definition of shape
+        // (`Constraint::shape_is_defined`), rather than a refusal
+        // hand-written into each of ~12 classic arms: the row count
+        // comes from `constraint_error_count`, so the row-budget
+        // contract `compute_jacobian` depends on holds by
+        // construction. `degrees_of_freedom_removed` reads the same
+        // predicate and debits zero, so the refusal and the DOF tally
+        // cannot drift apart.
+        if !constraint.shape_is_defined() {
+            return vec![UNSUPPORTED_CONSTRAINT_RESIDUAL; self.constraint_error_count(constraint)];
+        }
         match &constraint.constraint_type {
             ConstraintType::Geometric(gc) => {
                 self.evaluate_geometric_constraint(gc, &constraint.entities)
@@ -1953,10 +2033,10 @@ impl ConstraintSolver {
                     ) {
                         vec![p1.x - p2.x, p1.y - p2.y]
                     } else {
-                        vec![0.0, 0.0]
+                        vec![UNSUPPORTED_CONSTRAINT_RESIDUAL; 2]
                     }
                 } else {
-                    vec![0.0, 0.0]
+                    vec![UNSUPPORTED_CONSTRAINT_RESIDUAL; 2]
                 }
             }
             GeometricConstraint::Parallel => {
@@ -1969,10 +2049,10 @@ impl ConstraintSolver {
                         // Cross product should be zero
                         vec![d1.cross(&d2)]
                     } else {
-                        vec![0.0]
+                        Self::unsupported_residual()
                     }
                 } else {
-                    vec![0.0]
+                    Self::unsupported_residual()
                 }
             }
             GeometricConstraint::Perpendicular => {
@@ -1985,10 +2065,10 @@ impl ConstraintSolver {
                         // Dot product should be zero
                         vec![d1.dot(&d2)]
                     } else {
-                        vec![0.0]
+                        Self::unsupported_residual()
                     }
                 } else {
-                    vec![0.0]
+                    Self::unsupported_residual()
                 }
             }
             GeometricConstraint::Horizontal => {
@@ -1997,10 +2077,10 @@ impl ConstraintSolver {
                     if let Some(dir) = self.get_line_direction(&entities[0]) {
                         vec![dir.y]
                     } else {
-                        vec![0.0]
+                        Self::unsupported_residual()
                     }
                 } else {
-                    vec![0.0]
+                    Self::unsupported_residual()
                 }
             }
             GeometricConstraint::Vertical => {
@@ -2009,10 +2089,10 @@ impl ConstraintSolver {
                     if let Some(dir) = self.get_line_direction(&entities[0]) {
                         vec![dir.x]
                     } else {
-                        vec![0.0]
+                        Self::unsupported_residual()
                     }
                 } else {
-                    vec![0.0]
+                    Self::unsupported_residual()
                 }
             }
             GeometricConstraint::Tangent => {
@@ -2020,7 +2100,7 @@ impl ConstraintSolver {
                 if entities.len() == 2 {
                     self.evaluate_tangent_constraint(&entities[0], &entities[1])
                 } else {
-                    vec![0.0]
+                    Self::unsupported_residual()
                 }
             }
             GeometricConstraint::Concentric => {
@@ -2032,10 +2112,10 @@ impl ConstraintSolver {
                     ) {
                         vec![c1.x - c2.x, c1.y - c2.y]
                     } else {
-                        vec![0.0, 0.0]
+                        vec![UNSUPPORTED_CONSTRAINT_RESIDUAL; 2]
                     }
                 } else {
-                    vec![0.0, 0.0]
+                    vec![UNSUPPORTED_CONSTRAINT_RESIDUAL; 2]
                 }
             }
             GeometricConstraint::Equal => {
@@ -2043,7 +2123,7 @@ impl ConstraintSolver {
                 if entities.len() == 2 {
                     self.evaluate_equal_constraint(&entities[0], &entities[1])
                 } else {
-                    vec![0.0]
+                    Self::unsupported_residual()
                 }
             }
             GeometricConstraint::Symmetric => {
@@ -2051,7 +2131,7 @@ impl ConstraintSolver {
                 if entities.len() == 3 {
                     self.evaluate_symmetric_constraint(&entities[0], &entities[1], &entities[2])
                 } else {
-                    vec![0.0, 0.0]
+                    vec![UNSUPPORTED_CONSTRAINT_RESIDUAL; 2]
                 }
             }
             GeometricConstraint::PointOnCurve => {
@@ -2059,7 +2139,7 @@ impl ConstraintSolver {
                 if entities.len() == 2 {
                     self.evaluate_point_on_curve(&entities[0], &entities[1])
                 } else {
-                    vec![0.0]
+                    Self::unsupported_residual()
                 }
             }
             GeometricConstraint::Midpoint => {
@@ -2067,7 +2147,7 @@ impl ConstraintSolver {
                 if entities.len() == 2 {
                     self.evaluate_midpoint_constraint(&entities[0], &entities[1])
                 } else {
-                    vec![0.0, 0.0]
+                    vec![UNSUPPORTED_CONSTRAINT_RESIDUAL; 2]
                 }
             }
             GeometricConstraint::Collinear => {
@@ -2075,7 +2155,7 @@ impl ConstraintSolver {
                 if entities.len() == 3 {
                     self.evaluate_collinear_constraint(&entities[0], &entities[1], &entities[2])
                 } else {
-                    vec![0.0]
+                    Self::unsupported_residual()
                 }
             }
             GeometricConstraint::SmoothTangent => {
@@ -2103,7 +2183,7 @@ impl ConstraintSolver {
                 if entities.len() >= 2 {
                     self.angle_residual(&entities[0], &entities[1], *target_angle)
                 } else {
-                    vec![0.0, 0.0]
+                    vec![UNSUPPORTED_CONSTRAINT_RESIDUAL; 2]
                 }
             }
             GeometricConstraint::EqualArea => {
@@ -2148,10 +2228,10 @@ impl ConstraintSolver {
                         vec![p.x - c.x, p.y - c.y]
                     } else {
                         // Keep the row budget (2) stable on failure.
-                        vec![0.0, 0.0]
+                        vec![UNSUPPORTED_CONSTRAINT_RESIDUAL; 2]
                     }
                 } else {
-                    vec![0.0, 0.0]
+                    vec![UNSUPPORTED_CONSTRAINT_RESIDUAL; 2]
                 }
             }
             // Offset-pair correspondence (SKETCH-DCM #45 Slice 6).
@@ -2188,10 +2268,10 @@ impl ConstraintSolver {
                         let current_dist = p1.distance_to(&p2);
                         vec![current_dist - target_dist]
                     } else {
-                        vec![0.0]
+                        Self::unsupported_residual()
                     }
                 } else {
-                    vec![0.0]
+                    Self::unsupported_residual()
                 }
             }
             DimensionalConstraint::Radius(target_radius) => {
@@ -2200,10 +2280,10 @@ impl ConstraintSolver {
                     if let Some(radius) = self.get_circle_radius(&entities[0]) {
                         vec![radius - target_radius]
                     } else {
-                        vec![0.0]
+                        Self::unsupported_residual()
                     }
                 } else {
-                    vec![0.0]
+                    Self::unsupported_residual()
                 }
             }
             DimensionalConstraint::XCoordinate(target_x) => {
@@ -2212,10 +2292,10 @@ impl ConstraintSolver {
                     if let Some(pos) = self.get_point_position(&entities[0]) {
                         vec![pos.x - target_x]
                     } else {
-                        vec![0.0]
+                        Self::unsupported_residual()
                     }
                 } else {
-                    vec![0.0]
+                    Self::unsupported_residual()
                 }
             }
             DimensionalConstraint::YCoordinate(target_y) => {
@@ -2224,10 +2304,10 @@ impl ConstraintSolver {
                     if let Some(pos) = self.get_point_position(&entities[0]) {
                         vec![pos.y - target_y]
                     } else {
-                        vec![0.0]
+                        Self::unsupported_residual()
                     }
                 } else {
-                    vec![0.0]
+                    Self::unsupported_residual()
                 }
             }
             DimensionalConstraint::Angle(target_angle) => {
@@ -2235,7 +2315,7 @@ impl ConstraintSolver {
                 if entities.len() >= 2 {
                     self.angle_residual(&entities[0], &entities[1], *target_angle)
                 } else {
-                    vec![0.0, 0.0]
+                    vec![UNSUPPORTED_CONSTRAINT_RESIDUAL; 2]
                 }
             }
             DimensionalConstraint::Length(target_len) => {
@@ -2244,10 +2324,10 @@ impl ConstraintSolver {
                     if let Some(len) = self.get_line_length(&entities[0]) {
                         vec![len - target_len]
                     } else {
-                        vec![0.0]
+                        Self::unsupported_residual()
                     }
                 } else {
-                    vec![0.0]
+                    Self::unsupported_residual()
                 }
             }
             DimensionalConstraint::Diameter(target_dia) => {
@@ -2256,10 +2336,10 @@ impl ConstraintSolver {
                     if let Some(radius) = self.get_circle_radius(&entities[0]) {
                         vec![2.0 * radius - target_dia]
                     } else {
-                        vec![0.0]
+                        Self::unsupported_residual()
                     }
                 } else {
-                    vec![0.0]
+                    Self::unsupported_residual()
                 }
             }
             DimensionalConstraint::Area(target_area) => {
@@ -2356,10 +2436,10 @@ impl ConstraintSolver {
                     if let Some(dir) = self.get_line_direction(&entities[0]) {
                         vec![dir.y - target_slope * dir.x]
                     } else {
-                        vec![0.0]
+                        Self::unsupported_residual()
                     }
                 } else {
-                    vec![0.0]
+                    Self::unsupported_residual()
                 }
             }
             DimensionalConstraint::AspectRatio(target_ratio) => {
@@ -2385,10 +2465,10 @@ impl ConstraintSolver {
                     if let Some(c) = self.entity_centroid(&entities[0]) {
                         vec![c.x - x, c.y - y]
                     } else {
-                        vec![0.0, 0.0]
+                        vec![UNSUPPORTED_CONSTRAINT_RESIDUAL; 2]
                     }
                 } else {
-                    vec![0.0, 0.0]
+                    vec![UNSUPPORTED_CONSTRAINT_RESIDUAL; 2]
                 }
             }
             // Offset-gap magnitude (SKETCH-DCM #45 Slice 6): pins the
@@ -2413,10 +2493,10 @@ impl ConstraintSolver {
                     ) {
                         vec![(bound - p1.distance_to(&p2)).max(0.0)]
                     } else {
-                        vec![0.0]
+                        Self::unsupported_residual()
                     }
                 } else {
-                    vec![0.0]
+                    Self::unsupported_residual()
                 }
             }
             DimensionalConstraint::MaxDistance(bound) => {
@@ -2427,10 +2507,10 @@ impl ConstraintSolver {
                     ) {
                         vec![(p1.distance_to(&p2) - bound).max(0.0)]
                     } else {
-                        vec![0.0]
+                        Self::unsupported_residual()
                     }
                 } else {
-                    vec![0.0]
+                    Self::unsupported_residual()
                 }
             }
             // Recognised but not yet enforceable with a real equation:
@@ -2444,27 +2524,44 @@ impl ConstraintSolver {
 
     /// Get point position from entity state.
     ///
-    /// For circles/arcs with a shared center or shared endpoints
-    /// (SKETCH-DCM #45 Slice 1) the "point position" of the entity is
-    /// its DERIVED center — preserving the legacy semantic where the
-    /// leading two parameters (the center) served as the entity's
-    /// point-like position for `Coincident` / `Distance` /
-    /// `XCoordinate` / `YCoordinate`.
+    /// Defined per KIND, and `None` for every kind that has no
+    /// position:
+    ///
+    /// * a POINT is its own position;
+    /// * a circle, arc, rectangle or ellipse contributes its CENTRE —
+    ///   the legacy semantic where the leading two parameters served
+    ///   as the entity's point-like position for `Coincident` /
+    ///   `Distance` / `XCoordinate` / `YCoordinate`, and which
+    ///   `sketch_ops::pattern_anchor` depends on when it ties a
+    ///   pattern anchor to a legacy circle's centre with `Coincident`.
+    ///   Shared-centre and endpoint-derived entities (SKETCH-DCM #45
+    ///   Slice 1) route through `get_circle_center`, which reads the
+    ///   shared point rather than a private copy;
+    /// * a LINE, SPLINE or POLYLINE has NO point-like position and
+    ///   returns `None`.
+    ///
+    /// That last arm is the fix. The old body read
+    /// `parameters[0..2]` off ANY entity that had two parameters and
+    /// fell back to `Point2d::ORIGIN` when it did not — so a
+    /// `Coincident` against a spline silently pinned the point to the
+    /// spline's first CONTROL POINT, and one against a derived
+    /// segment (which owns no parameters at all) pinned it to the
+    /// ORIGIN and then reported the constraint satisfied. Callers
+    /// treat `None` as a refusal, never as a default.
     fn get_point_position(&self, entity: &EntityRef) -> Option<Point2d> {
-        let is_derived_center_like = self
-            .entity_state
-            .get(entity)
-            .map(|s| s.derived_center.is_some() || s.derived_arc_endpoints.is_some());
-        match is_derived_center_like {
-            Some(true) => self.get_circle_center(entity),
-            Some(false) => self.entity_state.get(entity).map(|state| {
+        match entity {
+            EntityRef::Point(_) => self.entity_state.get(entity).and_then(|state| {
                 if state.parameters.len() >= 2 {
-                    Point2d::new(state.parameters[0], state.parameters[1])
+                    Some(Point2d::new(state.parameters[0], state.parameters[1]))
                 } else {
-                    Point2d::ORIGIN
+                    None
                 }
             }),
-            None => None,
+            EntityRef::Circle(_)
+            | EntityRef::Arc(_)
+            | EntityRef::Rectangle(_)
+            | EntityRef::Ellipse(_) => self.get_circle_center(entity),
+            EntityRef::Line(_) | EntityRef::Spline(_) | EntityRef::Polyline(_) => None,
         }
     }
 
@@ -2523,19 +2620,31 @@ impl ConstraintSolver {
         Some((center, radius, start_angle, end_angle))
     }
 
-    /// Get line direction from entity state
+    /// Get line direction from entity state.
+    ///
+    /// `None` for every non-LINE kind and for a malformed line state.
+    /// The old body accepted any entity and answered
+    /// `Vector2d::UNIT_X` whenever the parameter vector was shorter
+    /// than four — so `Parallel` on two circles compared UNIT_X with
+    /// UNIT_X, returned a zero cross product, and reported itself
+    /// satisfied while `degrees_of_freedom_removed` still debited an
+    /// angle. A direction that was never measured is not a direction;
+    /// callers treat `None` as a refusal.
     fn get_line_direction(&self, entity: &EntityRef) -> Option<Vector2d> {
+        if !matches!(entity, EntityRef::Line(_)) {
+            return None;
+        }
         if let Some((start, end)) = self.derived_segment_of(entity) {
             let a = self.get_point_position(&start)?;
             let b = self.get_point_position(&end)?;
             return Some(Vector2d::new(b.x - a.x, b.y - a.y));
         }
-        self.entity_state.get(entity).map(|state| {
+        self.entity_state.get(entity).and_then(|state| {
             if state.parameters.len() >= 4 {
                 // Parameters: point.x, point.y, dir.x, dir.y
-                Vector2d::new(state.parameters[2], state.parameters[3])
+                Some(Vector2d::new(state.parameters[2], state.parameters[3]))
             } else {
-                Vector2d::UNIT_X
+                None
             }
         })
     }
@@ -2579,7 +2688,10 @@ impl ConstraintSolver {
             self.get_line_direction(line1),
             self.get_line_direction(line2),
         ) else {
-            return vec![0.0, 0.0];
+            // No measured direction on one side — refuse across the
+            // full 2-row budget rather than emit a satisfied-looking
+            // zero pair.
+            return vec![UNSUPPORTED_CONSTRAINT_RESIDUAL; 2];
         };
         let n1 = d1.magnitude();
         let n2 = d2.magnitude();
@@ -3100,6 +3212,7 @@ impl ConstraintSolver {
     /// degenerate evaluation says nothing about the generic rank, so
     /// the round is thrown away rather than trusted.
     fn perturbed_rank_scan(&self, round: u64) -> Option<RankScan> {
+        note_rank_scan();
         let mut saved: Vec<(EntityRef, usize, f64)> = Vec::new();
         for entry in self.entity_state.iter() {
             let entity = *entry.key();
@@ -3164,6 +3277,7 @@ impl ConstraintSolver {
     /// classify, and `redundant` / `conflicts` are empty whatever the
     /// residuals say.
     pub(crate) fn rank_scan(&self) -> RankScan {
+        note_rank_scan();
         let (jacobian, column_owner) = self.jacobian_with_columns();
         let n_cols = jacobian.first().map(|r| r.len()).unwrap_or(0);
         let num_errors = jacobian.len();
@@ -3743,7 +3857,7 @@ impl ConstraintSolver {
 
             vec![perp_dist - radius]
         } else {
-            vec![0.0]
+            Self::unsupported_residual()
         }
     }
 
@@ -3887,7 +4001,7 @@ impl ConstraintSolver {
                 {
                     vec![len1 - len2]
                 } else {
-                    vec![0.0]
+                    Self::unsupported_residual()
                 }
             }
             (EntityRef::Circle(_), EntityRef::Circle(_))
@@ -3905,7 +4019,7 @@ impl ConstraintSolver {
                 ) {
                     vec![r1 - r2]
                 } else {
-                    vec![0.0]
+                    Self::unsupported_residual()
                 }
             }
             (EntityRef::Rectangle(_), EntityRef::Rectangle(_)) => {
@@ -3921,7 +4035,7 @@ impl ConstraintSolver {
                 ) {
                     vec![w1 - w2, h1 - h2]
                 } else {
-                    vec![0.0, 0.0]
+                    vec![UNSUPPORTED_CONSTRAINT_RESIDUAL; 2]
                 }
             }
             (EntityRef::Ellipse(_), EntityRef::Ellipse(_)) => {
@@ -3938,10 +4052,10 @@ impl ConstraintSolver {
                 ) {
                     vec![a1 - a2, b1 - b2]
                 } else {
-                    vec![0.0, 0.0]
+                    vec![UNSUPPORTED_CONSTRAINT_RESIDUAL; 2]
                 }
             }
-            _ => vec![0.0],
+            _ => Self::unsupported_residual(),
         }
     }
 
@@ -3975,14 +4089,14 @@ impl ConstraintSolver {
         let (Some(axis_point), Some(axis_dir)) =
             (self.get_line_point(axis), self.get_line_direction(axis))
         else {
-            return vec![0.0; 4];
+            return vec![UNSUPPORTED_CONSTRAINT_RESIDUAL; 4];
         };
         let Ok(axis_unit) = axis_dir.normalize() else {
-            return vec![0.0; 4];
+            return vec![UNSUPPORTED_CONSTRAINT_RESIDUAL; 4];
         };
         let axis_normal = Vector2d::new(-axis_unit.y, axis_unit.x);
         let (Some(ca), Some(cb)) = (self.get_circle_center(a), self.get_circle_center(b)) else {
-            return vec![0.0; 4];
+            return vec![UNSUPPORTED_CONSTRAINT_RESIDUAL; 4];
         };
         let d = Vector2d::from_points(&axis_point, &ca).dot(&axis_normal);
         let reflected = Point2d::new(
@@ -4044,7 +4158,7 @@ impl ConstraintSolver {
             // Symmetric against construction segment axes.
             let Ok(axis_unit) = axis_dir.normalize() else {
                 // Degenerate axis: no defined reflection, no pull.
-                return vec![0.0, 0.0];
+                return vec![UNSUPPORTED_CONSTRAINT_RESIDUAL; 2];
             };
             let axis_normal = Vector2d::new(-axis_unit.y, axis_unit.x); // Perpendicular to axis
 
@@ -4061,10 +4175,10 @@ impl ConstraintSolver {
 
                 vec![p2.x - reflected.x, p2.y - reflected.y]
             } else {
-                vec![0.0, 0.0]
+                vec![UNSUPPORTED_CONSTRAINT_RESIDUAL; 2]
             }
         } else {
-            vec![0.0, 0.0]
+            vec![UNSUPPORTED_CONSTRAINT_RESIDUAL; 2]
         }
     }
 
@@ -4087,7 +4201,7 @@ impl ConstraintSolver {
                     let to_point = Vector2d::from_points(&line_point, &p);
                     vec![to_point.cross(&line_dir)]
                 } else {
-                    vec![0.0]
+                    Self::unsupported_residual()
                 }
             }
             // Circle AND arc carriers (SKETCH-DCM #45 Slice 6 added
@@ -4105,7 +4219,7 @@ impl ConstraintSolver {
                     let dist = Vector2d::from_points(&center, &p).magnitude();
                     vec![dist - radius]
                 } else {
-                    vec![0.0]
+                    Self::unsupported_residual()
                 }
             }
             EntityRef::Spline(_) => {
@@ -4125,7 +4239,7 @@ impl ConstraintSolver {
                 // `spline2d::NurbsCurve2d::to_bspline` doc.
                 let p = match point {
                     Some(p) => p,
-                    None => return vec![0.0],
+                    None => return Self::unsupported_residual(),
                 };
                 // Foot precision matters (SKETCH-DCM #45 Slice 7): the
                 // coarse scan + damped refinement inside
@@ -4138,11 +4252,11 @@ impl ConstraintSolver {
                 let (foot, tangent_res) = {
                     let geometry = match self.get_spline2d(curve_entity) {
                         Some(g) => g,
-                        None => return vec![0.0],
+                        None => return Self::unsupported_residual(),
                     };
                     let (foot, u) = match spline_foot(&geometry, &p) {
                         Some(pair) => pair,
-                        None => return vec![0.0],
+                        None => return Self::unsupported_residual(),
                     };
                     let tangent = geometry.derivatives2(u).map(|(_, d1, _)| d1).map_err(|e| e);
                     (foot, tangent)
@@ -4176,11 +4290,11 @@ impl ConstraintSolver {
                 // limitation as a polyline geometrically has.
                 let p = match point {
                     Some(p) => p,
-                    None => return vec![0.0],
+                    None => return Self::unsupported_residual(),
                 };
                 let polyline = match self.get_polyline2d(curve_entity) {
                     Some(pl) => pl,
-                    None => return vec![0.0],
+                    None => return Self::unsupported_residual(),
                 };
                 let (foot, seg_idx, _t) = polyline.closest_point(&p);
                 let segment = match polyline.segment(seg_idx) {
@@ -4198,7 +4312,7 @@ impl ConstraintSolver {
                 }
                 vec![foot_to_p.cross(&seg_dir) / seg_len]
             }
-            _ => vec![0.0],
+            _ => Self::unsupported_residual(),
         }
     }
 
@@ -4326,7 +4440,7 @@ impl ConstraintSolver {
             let midpoint = line_start.midpoint(&line_end);
             vec![p.x - midpoint.x, p.y - midpoint.y]
         } else {
-            vec![0.0, 0.0]
+            vec![UNSUPPORTED_CONSTRAINT_RESIDUAL; 2]
         }
     }
 
@@ -4347,7 +4461,7 @@ impl ConstraintSolver {
             let v2 = Vector2d::from_points(&pt1, &pt3);
             vec![v1.cross(&v2)]
         } else {
-            vec![0.0]
+            Self::unsupported_residual()
         }
     }
 
@@ -4811,14 +4925,26 @@ impl ConstraintSolver {
         }
     }
 
+    /// Length of a line — `None` for every non-LINE kind AND for a
+    /// legacy (point, direction) line.
+    ///
+    /// Without the kind guard the old fallback handed a circle, a
+    /// spline or a point the fabricated length 100.0, which `Equal`
+    /// and `Length` then compared against a real target. The legacy
+    /// arm was the same fabrication one step further in: a
+    /// (point, direction) line is an UNBOUNDED carrier and has no
+    /// length, so `Some(100.0)` reported a measurement of a thing that
+    /// does not exist — and `Length(l) = 100` would have read as
+    /// satisfied. Only a shared-endpoint segment has a length; every
+    /// production line is one (`Sketch::add_line` takes two points).
     fn get_line_length(&self, entity: &EntityRef) -> Option<f64> {
-        if let Some((start, end)) = self.derived_segment_of(entity) {
-            let a = self.get_point_position(&start)?;
-            let b = self.get_point_position(&end)?;
-            return Some(a.distance_to(&b));
+        if !matches!(entity, EntityRef::Line(_)) {
+            return None;
         }
-        // Legacy (point, direction) lines carry no real length.
-        Some(100.0)
+        let (start, end) = self.derived_segment_of(entity)?;
+        let a = self.get_point_position(&start)?;
+        let b = self.get_point_position(&end)?;
+        Some(a.distance_to(&b))
     }
 
     /// Read the angular range stored on an arc's entity state.
@@ -5670,6 +5796,10 @@ mod tests {
 
     fn spline_ref() -> EntityRef {
         EntityRef::Spline(Spline2dId::new())
+    }
+
+    fn polyline_ref() -> EntityRef {
+        EntityRef::Polyline(crate::sketch2d::Polyline2dId::new())
     }
 
     /// Build the clamped-uniform B-spline state used by the
@@ -7173,24 +7303,34 @@ mod tests {
     }
 
     #[test]
-    fn coincident_wrong_arity_returns_zeros() {
+    fn coincident_wrong_arity_refuses() {
+        // REVERSED: this test used to pin `vec![0.0, 0.0]` — the
+        // arity fallback that read as "satisfied" while
+        // `degrees_of_freedom_removed` still debited 2 DOF. A
+        // coincidence over one entity is not a coincidence; it is a
+        // shape with no equation, and it now refuses.
         let s = ConstraintSolver::new();
         let p = point_ref();
         // Only one entity passed
         let errs = s.evaluate_geometric_constraint(&GeometricConstraint::Coincident, &[p]);
-        assert_eq!(errs, vec![0.0, 0.0]);
+        assert_eq!(
+            errs,
+            vec![UNSUPPORTED_CONSTRAINT_RESIDUAL; 2],
+            "an arity with no equation refuses across its row budget"
+        );
     }
 
     #[test]
-    fn parallel_missing_entity_returns_zero() {
-        // Both refs unknown to solver
+    fn parallel_missing_entity_refuses() {
+        // REVERSED, and this is the exact sentence the fix deleted:
+        // "the solver returns Vector2d::UNIT_X for missing line
+        // directions, so both directions match, cross product = 0".
+        // Two directions that were never measured are not parallel.
         let s = ConstraintSolver::new();
         let l1 = line_ref();
         let l2 = line_ref();
         let errs = s.evaluate_geometric_constraint(&GeometricConstraint::Parallel, &[l1, l2]);
-        // The solver returns Vector2d::UNIT_X for missing line directions,
-        // so both directions match → cross product = 0.
-        assert!(approx_eq(errs[0], 0.0, 1e-12));
+        assert!(approx_eq(errs[0], UNSUPPORTED_CONSTRAINT_RESIDUAL, 1e-12));
     }
 
     // ─────────────── D. Dimensional-constraint evaluators ─────────────
@@ -7238,22 +7378,33 @@ mod tests {
     }
 
     #[test]
-    fn distance_missing_entity_returns_zero() {
+    fn distance_missing_entity_refuses() {
+        // REVERSED: an unmeasurable distance used to read as EXACTLY
+        // the target (residual 0.0). A dimension nobody could measure
+        // is refused, never reported met.
         let s = ConstraintSolver::new();
         let a = point_ref();
         let b = point_ref();
         let errs =
             s.evaluate_dimensional_constraint(&DimensionalConstraint::Distance(5.0), &[a, b]);
-        assert_eq!(errs, vec![0.0]);
+        assert_eq!(errs, vec![UNSUPPORTED_CONSTRAINT_RESIDUAL]);
     }
 
     #[test]
-    fn radius_for_non_circle_entity_returns_zero() {
+    fn radius_for_non_circle_entity_refuses() {
+        // REVERSED: a point has no radius, and "no radius" used to
+        // read as "the radius is exactly the target".
         let mut s = ConstraintSolver::new();
         let p = point_ref();
         s.add_entity(p, EntityState::point(Point2d::ORIGIN, false));
         let errs = s.evaluate_dimensional_constraint(&DimensionalConstraint::Radius(1.0), &[p]);
-        assert_eq!(errs, vec![0.0]);
+        assert_eq!(errs, vec![UNSUPPORTED_CONSTRAINT_RESIDUAL]);
+        let con = Constraint::new_dimensional(
+            DimensionalConstraint::Radius(1.0),
+            vec![p],
+            ConstraintPriority::High,
+        );
+        assert_eq!(con.degrees_of_freedom_removed(), 0);
     }
 
     // ───────────────── E. Jacobian / numerical differentiation ────────
@@ -8119,15 +8270,17 @@ mod tests {
     }
 
     #[test]
-    fn missing_point_in_coincident_yields_zero_error() {
-        // entities[0] missing → get_point_position returns None → falls
-        // through to the `(None, _)` arm, which yields `vec![0.0, 0.0]`.
+    fn missing_point_in_coincident_refuses() {
+        // REVERSED: `entities[0]` missing, so `get_point_position`
+        // returns None and the `(None, _)` arm used to yield
+        // `vec![0.0, 0.0]` — "these two points are in the same place"
+        // about a point that is not in the solver at all.
         let mut s = ConstraintSolver::new();
         let a = point_ref();
         let b = point_ref();
         s.add_entity(b, EntityState::point(Point2d::new(1.0, 2.0), false));
         let errs = s.evaluate_geometric_constraint(&GeometricConstraint::Coincident, &[a, b]);
-        assert_eq!(errs, vec![0.0, 0.0]);
+        assert_eq!(errs, vec![UNSUPPORTED_CONSTRAINT_RESIDUAL; 2]);
     }
 
     #[test]
@@ -8748,5 +8901,926 @@ mod tests {
         };
         let _unstable = SolverStatus::Unstable;
         let _ct = ConstraintType::Geometric(GeometricConstraint::Coincident);
+    }
+
+    // ─────── RED: a MISMATCHED constraint is refused, never satisfied ───────
+    //
+    // ~12 classic arms answered an arity or entity-kind mismatch with
+    // `vec![0.0]` / `vec![0.0, 0.0]` — a residual indistinguishable from
+    // "satisfied" — while `degrees_of_freedom_removed` still debited.
+    // `Parallel` on two circles compared `UNIT_X` with `UNIT_X` (the
+    // default `get_line_direction` handed back for anything without four
+    // parameters) and read solved; `Coincident` against a spline pinned
+    // the point to the spline's first CONTROL POINT; `Coincident` against
+    // a derived segment pinned it to the ORIGIN. Each of these asserts
+    // the three halves of a refusal together: the residual is the
+    // irreducible `UNSUPPORTED_CONSTRAINT_RESIDUAL` in every budgeted
+    // row, the row budget still matches (or `compute_jacobian` indexes
+    // out of bounds), and the DOF debit is zero.
+
+    /// Every row is the irreducible refusal residual, and the row count
+    /// matches the budget `compute_jacobian` allocates from.
+    fn assert_refused(s: &ConstraintSolver, c: &Constraint) {
+        let rows = s.evaluate_constraint_error(c);
+        assert_eq!(
+            rows.len(),
+            s.constraint_error_count(c),
+            "refusal must fill the budgeted rows for {:?} on {:?}",
+            c.constraint_type,
+            c.entity_kind_names()
+        );
+        assert!(
+            !rows.is_empty()
+                && rows
+                    .iter()
+                    .all(|r| approx_eq(*r, UNSUPPORTED_CONSTRAINT_RESIDUAL, 1e-12)),
+            "every row must REFUSE for {:?} on {:?}, got {rows:?}",
+            c.constraint_type,
+            c.entity_kind_names()
+        );
+        assert_eq!(
+            c.degrees_of_freedom_removed(),
+            0,
+            "a refused constraint must debit no DOF for {:?} on {:?}",
+            c.constraint_type,
+            c.entity_kind_names()
+        );
+        assert!(
+            c.validate_shape().is_err(),
+            "the door must reject what the solver refuses: {:?} on {:?}",
+            c.constraint_type,
+            c.entity_kind_names()
+        );
+    }
+
+    #[test]
+    fn coincident_on_three_points_is_refused() {
+        let mut s = ConstraintSolver::new();
+        let (p1, p2, p3) = (point_ref(), point_ref(), point_ref());
+        s.add_entity(p1, EntityState::point(Point2d::new(0.0, 0.0), false));
+        s.add_entity(p2, EntityState::point(Point2d::new(4.0, 0.0), false));
+        s.add_entity(p3, EntityState::point(Point2d::new(0.0, 7.0), false));
+        // Coincident is a BINARY relation. A third entity is not "more
+        // coincidence" — the evaluator has no equation for it, and the
+        // old arity fallback returned (0, 0) while still debiting 2 DOF.
+        let c = Constraint::new_geometric(
+            GeometricConstraint::Coincident,
+            vec![p1, p2, p3],
+            ConstraintPriority::High,
+        );
+        assert_refused(&s, &c);
+    }
+
+    #[test]
+    fn collinear_of_two_lines_is_refused() {
+        let mut s = ConstraintSolver::new();
+        let (l1, l2) = (line_ref(), line_ref());
+        s.add_entity(
+            l1,
+            EntityState::line(Point2d::ORIGIN, Vector2d::new(1.0, 0.0), false, false),
+        );
+        s.add_entity(
+            l2,
+            EntityState::line(
+                Point2d::new(0.0, 3.0),
+                Vector2d::new(0.0, 1.0),
+                false,
+                false,
+            ),
+        );
+        // Collinear is defined over THREE positions. Two lines is neither
+        // the right arity nor the right kind; the old arm returned 0.0
+        // (satisfied) for a pair of perpendicular lines.
+        let c = Constraint::new_geometric(
+            GeometricConstraint::Collinear,
+            vec![l1, l2],
+            ConstraintPriority::High,
+        );
+        assert_refused(&s, &c);
+    }
+
+    #[test]
+    fn coincident_point_spline_is_refused_not_first_control_point() {
+        let mut s = ConstraintSolver::new();
+        let p = point_ref();
+        let sp = spline_ref();
+        // The point sits far from the spline's first control point
+        // (0, 0). The old `get_point_position` read `parameters[0..2]`
+        // off ANY entity, which for a spline is that control point — so
+        // the constraint reported a violation it would then "solve" by
+        // dragging the point onto a control point nobody named.
+        s.add_entity(p, EntityState::point(Point2d::new(9.0, 9.0), false));
+        s.add_entity(sp, sample_bspline_state());
+        let c = coincident(p, sp);
+        assert_refused(&s, &c);
+        assert!(
+            s.get_point_position(&sp).is_none(),
+            "a spline has no point-like position; its first control point is not one"
+        );
+    }
+
+    #[test]
+    fn coincident_point_line_is_refused_not_pinned_to_origin() {
+        let mut s = ConstraintSolver::new();
+        let p = point_ref();
+        let l = line_ref();
+        let (a, b) = (point_ref(), point_ref());
+        s.add_entity(a, EntityState::point(Point2d::new(1.0, 1.0), true));
+        s.add_entity(b, EntityState::point(Point2d::new(5.0, 1.0), true));
+        s.add_entity(p, EntityState::point(Point2d::new(9.0, 9.0), false));
+        // A derived segment owns NO parameters, so the old accessor's
+        // `Point2d::ORIGIN` fallback made "point coincident with line"
+        // mean "point at the origin" — a fabricated position, then
+        // reported satisfied once the point arrived there.
+        s.add_entity(l, EntityState::segment_between(a, b));
+        let c = coincident(p, l);
+        assert_refused(&s, &c);
+        assert!(
+            s.get_point_position(&l).is_none(),
+            "a line has no point-like position; the ORIGIN is not one"
+        );
+    }
+
+    #[test]
+    fn coincident_point_circle_means_centre_and_is_kept() {
+        // The DECISION, pinned: a circle (like an arc, rectangle and
+        // ellipse) HAS a defined position — its centre — and
+        // `Coincident` against one means "at the centre". This is not an
+        // accident of the parameter layout: `sketch_ops::pattern_anchor`
+        // mints exactly this pairing to tie a pattern anchor to a legacy
+        // circle's centre, and refusing it would break every pattern op
+        // on a circle without a shared centre point.
+        let mut s = ConstraintSolver::new();
+        let p = point_ref();
+        let c = circle_ref();
+        s.add_entity(p, EntityState::point(Point2d::new(9.0, 9.0), false));
+        s.add_entity(
+            c,
+            EntityState::circle(Point2d::new(2.0, 3.0), 1.5, true, true),
+        );
+        let con = coincident(p, c);
+        assert!(con.validate_shape().is_ok(), "point↔circle stays defined");
+        assert_eq!(con.degrees_of_freedom_removed(), 2);
+        let rows = s.evaluate_constraint_error(&con);
+        assert_eq!(
+            rows,
+            vec![9.0 - 2.0, 9.0 - 3.0],
+            "residual is to the CENTRE"
+        );
+        s.set_constraints(vec![con]);
+        let _ = s.solve();
+        let moved = s.get_point_position(&p).expect("point survives");
+        assert!(
+            approx_eq(moved.x, 2.0, 1e-6) && approx_eq(moved.y, 3.0, 1e-6),
+            "the point lands on the circle's centre, got {moved:?}"
+        );
+    }
+
+    #[test]
+    fn coincident_of_two_rectangles_is_refused_naming_concentric() {
+        // The narrowing that came with the centre semantic: a circle,
+        // arc, rectangle and ellipse all HAVE a centre, but only a
+        // point-plus-(point|circle|arc) reads as "these occupy the
+        // same point". Two centre-bearing entities is `Concentric`
+        // said badly - and for a rectangle/ellipse pair it is not even
+        // that. The refusal has to SAY so, or the caller just sees a
+        // door that will not open.
+        let mut s = ConstraintSolver::new();
+        let (r1, r2) = (rect_ref(), rect_ref());
+        s.add_entity(
+            r1,
+            EntityState::rectangle(Point2d::ORIGIN, 4.0, 2.0, 0.0, false, false, false, false),
+        );
+        s.add_entity(
+            r2,
+            EntityState::rectangle(
+                Point2d::new(9.0, 9.0),
+                6.0,
+                5.0,
+                0.0,
+                false,
+                false,
+                false,
+                false,
+            ),
+        );
+        let con = coincident(r1, r2);
+        assert_refused(&s, &con);
+        let msg = con
+            .validate_shape()
+            .expect_err("two rectangles are not a coincidence")
+            .to_string();
+        assert!(
+            msg.contains("Concentric"),
+            "the refusal names the constraint the caller wanted: {msg}"
+        );
+        assert!(
+            msg.contains("PointOnCurve"),
+            "and the other reading it could have meant: {msg}"
+        );
+        assert!(!msg.contains("  "), "no absorbed indentation: {msg}");
+    }
+
+    #[test]
+    fn coincident_of_two_circles_is_refused_use_concentric() {
+        let mut s = ConstraintSolver::new();
+        let (c1, c2) = (circle_ref(), circle_ref());
+        s.add_entity(
+            c1,
+            EntityState::circle(Point2d::new(0.0, 0.0), 2.0, false, false),
+        );
+        s.add_entity(
+            c2,
+            EntityState::circle(Point2d::new(5.0, 1.0), 3.0, false, false),
+        );
+        // Two circles CAN both report a centre, so this pairing used
+        // to evaluate - as an undeclared `Concentric`. Refused, and
+        // `Concentric` on the same pair still works.
+        assert_refused(&s, &coincident(c1, c2));
+        let concentric = Constraint::new_geometric(
+            GeometricConstraint::Concentric,
+            vec![c1, c2],
+            ConstraintPriority::High,
+        );
+        assert!(concentric.validate_shape().is_ok());
+        assert_eq!(s.evaluate_constraint_error(&concentric).len(), 2);
+    }
+
+    #[test]
+    fn curvature_at_a_point_on_a_polyline_is_refused_at_the_door() {
+        // THE DRIFT THIS TASK EXISTS TO CLOSE, found by the review of
+        // the first cut: `is_curve()` includes POLYLINE (it is a real
+        // `PointOnCurve` carrier), so the shape table blessed
+        // `Curvature([polyline, point])` - while
+        // `curvature_at_point_foot` has no polyline arm and can only
+        // refuse. The door accepted, the DOF tally debited 1, the
+        // evaluator refused: door, tally and solver disagreeing, which
+        // is exactly the defect the gate was built to make impossible.
+        // Both entity kinds are agent-reachable (`psketch_add_entity`
+        // polyline + `psketch_constrain`).
+        let mut s = ConstraintSolver::new();
+        let pl = polyline_ref();
+        let p = point_ref();
+        s.add_entity(
+            pl,
+            EntityState::polyline(
+                vec![
+                    Point2d::new(0.0, 0.0),
+                    Point2d::new(1.0, 0.0),
+                    Point2d::new(1.0, 1.0),
+                ],
+                false,
+                false,
+            ),
+        );
+        s.add_entity(p, EntityState::point(Point2d::new(0.5, 0.5), false));
+        let con = Constraint::new_dimensional(
+            DimensionalConstraint::Curvature(0.5),
+            vec![pl, p],
+            ConstraintPriority::High,
+        );
+        assert_refused(&s, &con);
+        // The carriers that DO have a curvature frame still pass.
+        for carrier in [spline_ref(), circle_ref(), arc_ref(), line_ref()] {
+            let ok = Constraint::new_dimensional(
+                DimensionalConstraint::Curvature(0.5),
+                vec![carrier, p],
+                ConstraintPriority::High,
+            );
+            assert!(
+                ok.validate_shape().is_ok(),
+                "{:?} carries a curvature frame and must stay defined",
+                carrier.kind_name()
+            );
+        }
+        // Same narrowing for the continuity kinds, whose join frame is
+        // read by the same `Line | Circle | Arc | Spline` set.
+        let g1 = Constraint::new_geometric(
+            GeometricConstraint::SmoothTangent,
+            vec![pl, line_ref()],
+            ConstraintPriority::High,
+        );
+        assert!(
+            g1.validate_shape().is_err(),
+            "a polyline has no tangent frame for G1 continuity"
+        );
+        // …and `PointOnCurve`, which the polyline evaluator DOES
+        // implement, is untouched.
+        let on_curve = Constraint::new_geometric(
+            GeometricConstraint::PointOnCurve,
+            vec![p, pl],
+            ConstraintPriority::High,
+        );
+        assert!(on_curve.validate_shape().is_ok());
+        assert_eq!(on_curve.degrees_of_freedom_removed(), 1);
+        assert!(
+            !approx_eq(
+                s.evaluate_constraint_error(&on_curve)[0],
+                UNSUPPORTED_CONSTRAINT_RESIDUAL,
+                1e-12
+            ),
+            "PointOnCurve against a polyline is a real residual"
+        );
+    }
+
+    #[test]
+    fn parallel_circles_is_refused() {
+        let mut s = ConstraintSolver::new();
+        let (c1, c2) = (circle_ref(), circle_ref());
+        s.add_entity(
+            c1,
+            EntityState::circle(Point2d::new(0.0, 0.0), 2.0, false, false),
+        );
+        s.add_entity(
+            c2,
+            EntityState::circle(Point2d::new(5.0, 1.0), 3.0, false, false),
+        );
+        // Two circles have no direction to be parallel. The old
+        // `get_line_direction` handed each of them `UNIT_X`, whose cross
+        // product is exactly 0.0 — the constraint reported itself
+        // satisfied on geometry it had never measured, and the DOF tally
+        // subtracted an angle nothing was holding.
+        let c = Constraint::new_geometric(
+            GeometricConstraint::Parallel,
+            vec![c1, c2],
+            ConstraintPriority::High,
+        );
+        assert_refused(&s, &c);
+        assert!(
+            s.get_line_direction(&c1).is_none(),
+            "a circle has no line direction to read"
+        );
+    }
+
+    #[test]
+    fn tangent_of_two_circles_is_refused() {
+        let mut s = ConstraintSolver::new();
+        let (c1, c2) = (circle_ref(), circle_ref());
+        s.add_entity(
+            c1,
+            EntityState::circle(Point2d::new(0.0, 0.0), 2.0, false, false),
+        );
+        s.add_entity(
+            c2,
+            EntityState::circle(Point2d::new(5.0, 1.0), 3.0, false, false),
+        );
+        // The tangency residual is |centre → line| − r: it needs a LINE.
+        // Circle-to-circle tangency has no equation here, and the old
+        // arm answered 0.0 for two circles that visibly do not touch.
+        let c = Constraint::new_geometric(
+            GeometricConstraint::Tangent,
+            vec![c1, c2],
+            ConstraintPriority::High,
+        );
+        assert_refused(&s, &c);
+    }
+
+    #[test]
+    fn horizontal_on_a_circle_is_refused() {
+        let mut s = ConstraintSolver::new();
+        let c = circle_ref();
+        s.add_entity(
+            c,
+            EntityState::circle(Point2d::new(0.0, 0.0), 2.0, false, false),
+        );
+        let con = Constraint::new_geometric(
+            GeometricConstraint::Horizontal,
+            vec![c],
+            ConstraintPriority::High,
+        );
+        // `UNIT_X.y` is 0.0, so a circle read as PERFECTLY horizontal.
+        assert_refused(&s, &con);
+    }
+
+    #[test]
+    fn equal_of_a_line_and_a_circle_is_refused() {
+        let mut s = ConstraintSolver::new();
+        let (l, c) = (line_ref(), circle_ref());
+        s.add_entity(
+            l,
+            EntityState::line(Point2d::ORIGIN, Vector2d::new(1.0, 0.0), false, false),
+        );
+        s.add_entity(
+            c,
+            EntityState::circle(Point2d::new(0.0, 0.0), 2.0, false, false),
+        );
+        // A length and a radius are not comparable dimensions. The old
+        // `_ => vec![0.0]` arm called them equal.
+        let con = Constraint::new_geometric(
+            GeometricConstraint::Equal,
+            vec![l, c],
+            ConstraintPriority::High,
+        );
+        assert_refused(&s, &con);
+    }
+
+    #[test]
+    fn distance_between_a_point_and_a_spline_is_refused() {
+        let mut s = ConstraintSolver::new();
+        let p = point_ref();
+        let sp = spline_ref();
+        s.add_entity(p, EntityState::point(Point2d::new(9.0, 9.0), false));
+        s.add_entity(sp, sample_bspline_state());
+        // Same fabrication as `Coincident`: the "distance to a spline"
+        // the old accessor measured was the distance to its first
+        // control point, reported as an exact dimension.
+        let con = distance(p, sp, 3.0);
+        assert_refused(&s, &con);
+    }
+
+    #[test]
+    fn equal_rectangles_budget_two_rows_and_two_dofs() {
+        // The row budget has always been 2 (width AND height); the DOF
+        // debit said 1, so a solved pair of rectangles read one DOF
+        // under-constrained forever. Solver-level half of
+        // `equal_rectangles_remove_two_dofs` in `sketch_solver`.
+        let mut s = ConstraintSolver::new();
+        let (r1, r2) = (rect_ref(), rect_ref());
+        s.add_entity(
+            r1,
+            EntityState::rectangle(Point2d::ORIGIN, 4.0, 2.0, 0.0, false, false, false, false),
+        );
+        s.add_entity(
+            r2,
+            EntityState::rectangle(
+                Point2d::new(9.0, 9.0),
+                6.0,
+                5.0,
+                0.0,
+                false,
+                false,
+                false,
+                false,
+            ),
+        );
+        let con = Constraint::new_geometric(
+            GeometricConstraint::Equal,
+            vec![r1, r2],
+            ConstraintPriority::High,
+        );
+        assert_eq!(s.constraint_error_count(&con), 2);
+        assert_eq!(s.evaluate_constraint_error(&con).len(), 2);
+        assert_eq!(
+            con.degrees_of_freedom_removed(),
+            2,
+            "a rectangle pair equates width AND height"
+        );
+        // The ellipse pairing is the same shape of claim.
+        let (e1, e2) = (ellipse_ref(), ellipse_ref());
+        s.add_entity(
+            e1,
+            EntityState::ellipse(Point2d::ORIGIN, 4.0, 2.0, 0.0, false, false, false, false),
+        );
+        s.add_entity(
+            e2,
+            EntityState::ellipse(
+                Point2d::new(9.0, 9.0),
+                6.0,
+                5.0,
+                0.0,
+                false,
+                false,
+                false,
+                false,
+            ),
+        );
+        let ell = Constraint::new_geometric(
+            GeometricConstraint::Equal,
+            vec![e1, e2],
+            ConstraintPriority::High,
+        );
+        assert_eq!(s.constraint_error_count(&ell), 2);
+        assert_eq!(ell.degrees_of_freedom_removed(), 2);
+        // …and the one-scalar pairings stay at one.
+        let (c1, c2) = (circle_ref(), circle_ref());
+        s.add_entity(c1, EntityState::circle(Point2d::ORIGIN, 2.0, false, false));
+        s.add_entity(
+            c2,
+            EntityState::circle(Point2d::new(9.0, 0.0), 3.0, false, false),
+        );
+        let round = Constraint::new_geometric(
+            GeometricConstraint::Equal,
+            vec![c1, c2],
+            ConstraintPriority::High,
+        );
+        assert_eq!(s.constraint_error_count(&round), 1);
+        assert_eq!(round.degrees_of_freedom_removed(), 1);
+    }
+
+    #[test]
+    fn dof_removed_agrees_with_error_count_for_every_kind_and_pairing() {
+        // The two functions are read by different consumers -
+        // `constraint_error_count` sizes the Jacobian,
+        // `degrees_of_freedom_removed` sizes the DOF verdict - and
+        // nothing made them agree. `Equal` on two rectangles budgeted 2
+        // rows and debited 1 DOF for as long as both existed.
+        //
+        // Four properties, over EVERY kind crossed with a battery of
+        // pairings (well-formed and mismatched alike):
+        //
+        //   (0)  the row budget equals the evaluated row count, or
+        //        `compute_jacobian` indexes out of bounds;
+        //   (i)  DOF removed EQUALS the row count, except for a short
+        //        list of kinds named below, each with its reason. `<=`
+        //        was too weak: it cannot see a constraint that budgets
+        //        two rows and debits one, which is the exact defect
+        //        this task fixed on `Equal`;
+        //   (ii) an undefined SHAPE debits zero DOF and refuses in
+        //        every row - the door, the DOF tally and the solver
+        //        reading one definition of shape;
+        //   (iii) a defined shape whose kind IS numerically enforced
+        //        produces a real residual, not a refusal - which is
+        //        what stops (ii) from being satisfied by a table that
+        //        refuses everything, and what caught the door blessing
+        //        `Curvature([polyline, point])` when
+        //        `curvature_at_point_foot` has no polyline arm.
+        let mut s = ConstraintSolver::new();
+        let (p1, p2, p3) = (point_ref(), point_ref(), point_ref());
+        let (l1, l2) = (line_ref(), line_ref());
+        let (l3, l4) = (line_ref(), line_ref());
+        let (c1, c2) = (circle_ref(), circle_ref());
+        let (a1, a2) = (arc_ref(), arc_ref());
+        let (r1, r2) = (rect_ref(), rect_ref());
+        let (el1, el2) = (ellipse_ref(), ellipse_ref());
+        let sp = spline_ref();
+        let pl = polyline_ref();
+        s.add_entity(p1, EntityState::point(Point2d::new(0.0, 0.0), false));
+        s.add_entity(p2, EntityState::point(Point2d::new(4.0, 0.0), false));
+        s.add_entity(p3, EntityState::point(Point2d::new(2.0, 3.0), false));
+
+        // Every line in the battery is a DERIVED SEGMENT, the shape
+        // production actually builds (`Sketch::add_line` takes two
+        // points). A legacy (point, direction) line has no length and
+        // no endpoints, so `Length`, `Equal` and `Offset` on one
+        // refuse - which would make property (iii) unreadable for
+        // three kinds at once.
+        //
+        // Deliberately off-lattice coordinates: a legitimate residual
+        // that lands on exactly `UNSUPPORTED_CONSTRAINT_RESIDUAL`
+        // (1.0) is indistinguishable from a refusal BY VALUE, and
+        // property (iii) would read a real measurement as a refusal.
+        // With the obvious fixture - directions (1, 0) and (1, 1) -
+        // the Parallel cross product IS 1.0, and with (1, 3) the
+        // Perpendicular dot product is.
+        let (l1a, l1b) = (point_ref(), point_ref());
+        let (l2a, l2b) = (point_ref(), point_ref());
+        s.add_entity(l1a, EntityState::point(Point2d::new(0.1, 0.2), false));
+        s.add_entity(l1b, EntityState::point(Point2d::new(1.4, 0.9), false)); // dir (1.3, 0.7)
+        s.add_entity(l2a, EntityState::point(Point2d::new(0.0, 5.0), false));
+        s.add_entity(l2b, EntityState::point(Point2d::new(0.9, 7.1), false)); // dir (0.9, 2.1)
+        s.add_entity(l1, EntityState::segment_between(l1a, l1b));
+        s.add_entity(l2, EntityState::segment_between(l2a, l2b));
+
+        // A JOINED pair: l3 ends where l4 begins, so the continuity
+        // kinds have a real join to measure and are NOT exempt from
+        // property (iii) on this cell. (Two full circles genuinely
+        // have no join - that exemption is state, not shape.)
+        let (j0, j1, j2) = (point_ref(), point_ref(), point_ref());
+        s.add_entity(j0, EntityState::point(Point2d::new(10.0, 0.0), false));
+        s.add_entity(j1, EntityState::point(Point2d::new(12.0, 1.0), false));
+        s.add_entity(j2, EntityState::point(Point2d::new(14.0, 3.0), false));
+        s.add_entity(l3, EntityState::segment_between(j0, j1));
+        s.add_entity(l4, EntityState::segment_between(j1, j2));
+
+        s.add_entity(
+            c1,
+            EntityState::circle(Point2d::new(1.1, 1.2), 2.3, false, false),
+        );
+        s.add_entity(
+            c2,
+            EntityState::circle(Point2d::new(6.3, 4.4), 3.7, false, false),
+        );
+        s.add_entity(
+            a1,
+            EntityState::arc(Point2d::new(5.2, 2.4), 2.9, 0.5, 2.0, false, false, false)
+                .with_arc_ccw(true),
+        );
+        s.add_entity(
+            a2,
+            EntityState::arc(Point2d::new(-5.1, 2.2), 4.3, 1.1, 2.6, false, false, false)
+                .with_arc_ccw(true),
+        );
+        s.add_entity(
+            r1,
+            EntityState::rectangle(Point2d::ORIGIN, 4.3, 2.7, 0.0, false, false, false, false),
+        );
+        s.add_entity(
+            r2,
+            EntityState::rectangle(
+                Point2d::new(9.2, 9.4),
+                6.9,
+                5.3,
+                0.0,
+                false,
+                false,
+                false,
+                false,
+            ),
+        );
+        s.add_entity(
+            el1,
+            EntityState::ellipse(Point2d::ORIGIN, 4.3, 2.7, 0.0, false, false, false, false),
+        );
+        s.add_entity(
+            el2,
+            EntityState::ellipse(
+                Point2d::new(9.2, 9.4),
+                6.9,
+                5.3,
+                0.0,
+                false,
+                false,
+                false,
+                false,
+            ),
+        );
+        s.add_entity(sp, sample_bspline_state());
+        s.add_entity(
+            pl,
+            EntityState::polyline(
+                vec![
+                    Point2d::new(20.0, 0.0),
+                    Point2d::new(21.3, 0.7),
+                    Point2d::new(22.1, 2.4),
+                ],
+                false,
+                false,
+            ),
+        );
+
+        use ConstraintPriority::High;
+        let kinds: Vec<ConstraintType> = vec![
+            ConstraintType::Geometric(GeometricConstraint::Coincident),
+            ConstraintType::Geometric(GeometricConstraint::Parallel),
+            ConstraintType::Geometric(GeometricConstraint::Perpendicular),
+            ConstraintType::Geometric(GeometricConstraint::Tangent),
+            ConstraintType::Geometric(GeometricConstraint::Concentric),
+            ConstraintType::Geometric(GeometricConstraint::Equal),
+            ConstraintType::Geometric(GeometricConstraint::Horizontal),
+            ConstraintType::Geometric(GeometricConstraint::Vertical),
+            ConstraintType::Geometric(GeometricConstraint::Symmetric),
+            ConstraintType::Geometric(GeometricConstraint::PointOnCurve),
+            ConstraintType::Geometric(GeometricConstraint::Midpoint),
+            ConstraintType::Geometric(GeometricConstraint::Collinear),
+            ConstraintType::Geometric(GeometricConstraint::SmoothTangent),
+            ConstraintType::Geometric(GeometricConstraint::CurvatureContinuity),
+            ConstraintType::Geometric(GeometricConstraint::EqualArea),
+            ConstraintType::Geometric(GeometricConstraint::EqualPerimeter),
+            ConstraintType::Geometric(GeometricConstraint::Centroid),
+            ConstraintType::Geometric(GeometricConstraint::IntersectionAngle(1.0)),
+            ConstraintType::Geometric(GeometricConstraint::Offset),
+            ConstraintType::Geometric(GeometricConstraint::MultiTangent),
+            ConstraintType::Geometric(GeometricConstraint::CurvatureExtremum),
+            ConstraintType::Geometric(GeometricConstraint::ContactConstraint),
+            ConstraintType::Dimensional(DimensionalConstraint::Distance(4.0)),
+            ConstraintType::Dimensional(DimensionalConstraint::Angle(1.0)),
+            ConstraintType::Dimensional(DimensionalConstraint::Radius(2.0)),
+            ConstraintType::Dimensional(DimensionalConstraint::Diameter(4.0)),
+            ConstraintType::Dimensional(DimensionalConstraint::Length(4.0)),
+            ConstraintType::Dimensional(DimensionalConstraint::XCoordinate(0.0)),
+            ConstraintType::Dimensional(DimensionalConstraint::YCoordinate(0.0)),
+            ConstraintType::Dimensional(DimensionalConstraint::Area(4.0)),
+            ConstraintType::Dimensional(DimensionalConstraint::Perimeter(8.0)),
+            ConstraintType::Dimensional(DimensionalConstraint::ArcLength(3.0)),
+            ConstraintType::Dimensional(DimensionalConstraint::Curvature(0.5)),
+            ConstraintType::Dimensional(DimensionalConstraint::Slope(1.0)),
+            ConstraintType::Dimensional(DimensionalConstraint::AspectRatio(2.0)),
+            ConstraintType::Dimensional(DimensionalConstraint::CenterOfMass { x: 1.0, y: 1.0 }),
+            ConstraintType::Dimensional(DimensionalConstraint::OffsetDistance(2.0)),
+            ConstraintType::Dimensional(DimensionalConstraint::MinDistance(1.0)),
+            ConstraintType::Dimensional(DimensionalConstraint::MaxDistance(9.0)),
+            ConstraintType::Dimensional(DimensionalConstraint::MomentOfInertia(1.0)),
+        ];
+        // TRIPWIRE: 22 `GeometricConstraint` variants + 18
+        // `DimensionalConstraint` variants. A new kind that is not
+        // added to this list is a kind whose shape table nobody
+        // checked, which is how `Curvature([polyline, point])` got in.
+        assert_eq!(
+            kinds.len(),
+            40,
+            "a constraint kind was added without a cell in this battery"
+        );
+
+        let pairings: Vec<Vec<EntityRef>> = vec![
+            vec![p1],
+            vec![l1],
+            vec![c1],
+            vec![a1],
+            vec![r1],
+            vec![el1],
+            vec![sp],
+            vec![pl],
+            vec![p1, p2],
+            vec![p1, l1],
+            vec![p1, c1],
+            vec![p1, sp],
+            vec![p1, pl],
+            vec![l1, l2],
+            vec![l3, l4],
+            vec![l1, c1],
+            vec![c1, l1],
+            vec![c1, c2],
+            vec![a1, a2],
+            vec![c1, a1],
+            vec![r1, r2],
+            vec![el1, el2],
+            vec![r1, c1],
+            vec![sp, p1],
+            // The `[curve, point]` family, one cell per carrier kind:
+            // the polyline cell is the one that caught the door
+            // blessing a curvature residual that does not exist.
+            vec![pl, p1],
+            vec![l1, p1],
+            vec![c1, p1],
+            vec![a1, p1],
+            vec![p1, p2, p3],
+            vec![p1, p2, l1],
+            vec![a1, a2, l1],
+            vec![l1, l2, p1],
+            vec![c1, c2, p1],
+            vec![a1, p1, p2],
+            vec![l1, c1, c2],
+            vec![p1, p2, p3, l1],
+        ];
+
+        for kind in &kinds {
+            for entities in &pairings {
+                let con = match *kind {
+                    ConstraintType::Geometric(g) => {
+                        Constraint::new_geometric(g, entities.clone(), High)
+                    }
+                    ConstraintType::Dimensional(d) => {
+                        Constraint::new_dimensional(d, entities.clone(), High)
+                    }
+                };
+                let rows = s.evaluate_constraint_error(&con);
+                let budget = s.constraint_error_count(&con);
+                let dof = con.degrees_of_freedom_removed();
+                let label = format!("{kind:?} on {:?}", con.entity_kind_names());
+                // (0) the row-budget contract `compute_jacobian`
+                // depends on.
+                assert_eq!(rows.len(), budget, "row budget vs rows for {label}");
+                let all_refused = rows
+                    .iter()
+                    .all(|r| approx_eq(*r, UNSUPPORTED_CONSTRAINT_RESIDUAL, 1e-12));
+                if !con.shape_is_defined() {
+                    // (ii)
+                    assert_eq!(dof, 0, "{label} is undefined but debits {dof} DOF");
+                    assert!(all_refused, "{label} is undefined but does not refuse");
+                    assert!(
+                        con.validate_shape().is_err(),
+                        "{label} is undefined but the door accepts it"
+                    );
+                    continue;
+                }
+
+                // (i) EQUALITY of DOF removed and rows, except for
+                // these kinds - each exempt for a named reason, and
+                // each pinned to the exact DOF it may claim instead.
+                let rank_deficient: Option<usize> = match con.constraint_type {
+                    // The angle residual is a 2-vector unit-difference
+                    // (`angle_residual`): both rows encode the ONE
+                    // relation the constraint states, so it is rank 1
+                    // at the solution and removes 1 DOF from 2 rows.
+                    ConstraintType::Dimensional(DimensionalConstraint::Angle(_))
+                    | ConstraintType::Geometric(GeometricConstraint::IntersectionAngle(_)) => {
+                        Some(1)
+                    }
+                    // A one-sided bound is INACTIVE when satisfied and
+                    // never pins a parameter to a value: 1 row, 0 DOF,
+                    // by design (the D-Cubed convention).
+                    ConstraintType::Dimensional(
+                        DimensionalConstraint::MinDistance(_)
+                        | DimensionalConstraint::MaxDistance(_),
+                    ) => Some(0),
+                    // Recognised kinds with no residual at all. They
+                    // emit a refuse row so a solve can never claim
+                    // them satisfied, and remove 0 DOF so a tally can
+                    // never claim them constraining.
+                    ConstraintType::Geometric(GeometricConstraint::ContactConstraint)
+                    | ConstraintType::Dimensional(DimensionalConstraint::MomentOfInertia(_)) => {
+                        Some(0)
+                    }
+                    _ => None,
+                };
+                match rank_deficient {
+                    Some(expected_dof) => assert_eq!(
+                        dof, expected_dof,
+                        "{label} is a named rank-deficient kind and must remove exactly \
+                         {expected_dof} DOF"
+                    ),
+                    None => assert_eq!(
+                        dof,
+                        rows.len(),
+                        "{label} must remove exactly one DOF per residual row"
+                    ),
+                }
+
+                // (iii) - the enforced kinds must actually measure.
+                //
+                // G1/G2 continuity is the one pair of kinds whose
+                // support is a STATE question as well as a shape one:
+                // two curves of the right kinds may still have no JOIN
+                // to be continuous across (two full circles own no
+                // endpoints), and `continuity_pair` refuses that at
+                // evaluation time. The `[l3, l4]` cell is a genuinely
+                // joined pair, so those kinds are still measured here.
+                let joined_pair = con.entities.as_slice() == [l3, l4];
+                let join_dependent = matches!(
+                    con.constraint_type,
+                    ConstraintType::Geometric(
+                        GeometricConstraint::SmoothTangent
+                            | GeometricConstraint::CurvatureContinuity
+                    )
+                ) && !joined_pair;
+                if con.constraint_type.is_numerically_enforced() && !join_dependent {
+                    assert!(
+                        !all_refused,
+                        "{label} is a DEFINED shape but refuses in every row"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_shape_refused_constraint_is_not_enforced_so_no_plan_claims_it() {
+        // `dr_plan::plan_component` refuses to plan a component that
+        // carries an UNENFORCED constraint, because no placement step
+        // could ever satisfy one - a plan that claimed to place the
+        // component would be a lie. `is_numerically_enforced` answers
+        // that at the TYPE level only, so a `Parallel` between two
+        // circles - a kind that IS enforced, in a shape that is not -
+        // was handed to the planner as though it pinned an angle.
+        // `PlanConstraint::enforced` now reads both.
+        let mut s = ConstraintSolver::new();
+        let (c1, c2) = (circle_ref(), circle_ref());
+        let (l1, l2) = (line_ref(), line_ref());
+        s.add_entity(
+            c1,
+            EntityState::circle(Point2d::new(0.0, 0.0), 2.0, false, false),
+        );
+        s.add_entity(
+            c2,
+            EntityState::circle(Point2d::new(9.0, 1.0), 3.0, false, false),
+        );
+        s.add_entity(
+            l1,
+            EntityState::line(Point2d::ORIGIN, Vector2d::new(1.3, 0.7), false, false),
+        );
+        s.add_entity(
+            l2,
+            EntityState::line(
+                Point2d::new(0.0, 5.0),
+                Vector2d::new(0.9, 2.1),
+                false,
+                false,
+            ),
+        );
+
+        let bad = Constraint::new_geometric(
+            GeometricConstraint::Parallel,
+            vec![c1, c2],
+            ConstraintPriority::High,
+        );
+        s.set_constraints(vec![bad]);
+        let (entities, constraints) = s.extract_plan_inputs().expect("plan inputs");
+        assert_eq!(constraints.len(), 1);
+        assert!(
+            !constraints[0].enforced,
+            "a shape the kernel defines no residual for is not enforceable"
+        );
+        assert!(
+            super::super::dr_plan::plan_component(&entities, &constraints).is_none(),
+            "and no component carrying it may be planned"
+        );
+
+        // The same kind, in a shape the kernel DOES define, is still
+        // enforced - the guard narrows nothing it should not.
+        let good = Constraint::new_geometric(
+            GeometricConstraint::Parallel,
+            vec![l1, l2],
+            ConstraintPriority::High,
+        );
+        s.set_constraints(vec![good]);
+        let (_, constraints) = s.extract_plan_inputs().expect("plan inputs");
+        assert!(constraints[0].enforced, "Parallel on two lines is enforced");
+    }
+
+    #[test]
+    fn undefined_shape_refusal_names_the_expected_arity_and_kinds() {
+        let con = Constraint::new_geometric(
+            GeometricConstraint::Parallel,
+            vec![circle_ref(), circle_ref()],
+            ConstraintPriority::High,
+        );
+        let err = con.validate_shape().expect_err("two circles are not lines");
+        let msg = err.to_string();
+        assert!(msg.contains("exactly 2 lines"), "expectation named: {msg}");
+        assert!(msg.contains("circle, circle"), "kinds named: {msg}");
+        assert!(
+            !msg.contains("  "),
+            "no absorbed indentation in a user-facing message: {msg}"
+        );
     }
 }

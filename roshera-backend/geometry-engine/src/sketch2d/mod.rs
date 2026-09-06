@@ -164,6 +164,22 @@ pub enum Sketch2dError {
 
     #[error("Invalid operation: {operation} - {reason}")]
     InvalidOperation { operation: String, reason: String },
+
+    /// A constraint whose ENTITY SHAPE — arity and entity kinds — is
+    /// not one the kernel defines a residual for. Refused at the door
+    /// (`Sketch::try_add_constraint`, the csketch route) rather than
+    /// stored: the solver would only ever answer it with the
+    /// irreducible refusal residual, and before that refusal existed
+    /// it answered with a zero row that read exactly like "satisfied".
+    #[error("Constraint shape not defined: {constraint} takes {expected}, got [{got}]")]
+    UndefinedConstraintShape {
+        /// The constraint type, formatted.
+        constraint: String,
+        /// The arity and kinds this constraint kind accepts.
+        expected: String,
+        /// The entity kinds supplied, in wire order.
+        got: String,
+    },
 }
 
 pub type Sketch2dResult<T> = Result<T, Sketch2dError>;

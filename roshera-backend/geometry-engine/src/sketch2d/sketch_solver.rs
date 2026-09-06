@@ -523,6 +523,26 @@ pub struct DofReport {
     /// follow-up slice.
     #[serde(default)]
     pub conflicts: Vec<ConstraintId>,
+    /// Constraints the kernel REFUSED because their entity shape --
+    /// arity and entity kinds -- is not one it defines a residual for
+    /// (`Constraint::shape_is_defined`).
+    ///
+    /// Their own bucket, deliberately, and they are removed from
+    /// `conflicts` and `redundant` before this report is returned. A
+    /// refused constraint DOES produce a linearly dependent row (its
+    /// residual is the constant `UNSUPPORTED_CONSTRAINT_RESIDUAL`,
+    /// whose gradient is zero at every configuration), so the rank
+    /// pass classifies it as a conflict -- and a caller reading
+    /// `conflicts` goes hunting for the contradicting PARTNER
+    /// constraint that does not exist. The contradiction is not
+    /// between two constraints; it is between one constraint and the
+    /// kernel's vocabulary. Nothing here is repaired by deleting some
+    /// other constraint: the fix is to restate this one, or delete it.
+    ///
+    /// Non-empty means the DOF verdict is over a sketch carrying a
+    /// demand the kernel cannot enforce, however the verdict reads.
+    #[serde(default)]
+    pub unsupported: Vec<ConstraintId>,
     /// The constraint system is SINGULAR at the sketch's current
     /// configuration: its Jacobian has lower rank here than it has at
     /// a generic configuration.
@@ -1052,8 +1072,35 @@ pub(crate) fn analyze_dofs_with_diagnosis(
         Some(d) if entities_skipped.is_empty() => d.clone(),
         _ => diagnose_constraints(sketch, &skipped_set),
     };
-    let conflict_set: std::collections::HashSet<ConstraintId> =
-        diagnosis.conflicts.iter().copied().collect();
+    // Constraints refused for their SHAPE get their own bucket and are
+    // taken out of the rank pass's two lists. Their zero-gradient row
+    // IS dependent, so the pass is right to flag it -- but reporting a
+    // shape refusal as a "conflict" sends the reader looking for a
+    // contradicting partner constraint that does not exist. See
+    // `DofReport::unsupported`. They are equally excluded from
+    // `comp_conflicting` below: a refusal must not be counted as
+    // over-constraint excess, which would put a NUMBER on a conflict
+    // set that has no second member.
+    let unsupported: Vec<ConstraintId> = supported_constraints
+        .iter()
+        .filter(|c| !c.shape_is_defined())
+        .map(|c| c.id)
+        .collect();
+    let unsupported_set: std::collections::HashSet<ConstraintId> =
+        unsupported.iter().copied().collect();
+    let redundant: Vec<ConstraintId> = diagnosis
+        .redundant
+        .iter()
+        .copied()
+        .filter(|id| !unsupported_set.contains(id))
+        .collect();
+    let conflicts: Vec<ConstraintId> = diagnosis
+        .conflicts
+        .iter()
+        .copied()
+        .filter(|id| !unsupported_set.contains(id))
+        .collect();
+    let conflict_set: std::collections::HashSet<ConstraintId> = conflicts.iter().copied().collect();
     // Per-constraint lookup of (block index, that block's DEFICIENCY):
     // how many of the block's parameters no independent constraint row
     // pins. The block INDEX is carried so a component spanning more
@@ -1207,8 +1254,9 @@ pub(crate) fn analyze_dofs_with_diagnosis(
         entities_skipped,
         singular_configuration: diagnosis.singular_configuration(),
         unverified_components,
-        redundant: diagnosis.redundant,
-        conflicts: diagnosis.conflicts,
+        redundant,
+        conflicts,
+        unsupported,
     }
 }
 
@@ -2520,17 +2568,38 @@ mod tests {
     }
 
     #[test]
-    fn coincident_constraint_aligns_two_rectangle_centers() {
-        // Pin one rectangle's center to (0, 0) via dimensional
-        // constraints, then constrain a second rectangle to be
-        // coincident with it. The bridge's `get_point_position`
-        // helper treats rectangle params[0..2] as the centre, so
-        // Coincident over two rectangles must collapse their
-        // centres to the same point.
+    fn coincident_of_two_rectangles_is_refused_not_centre_aligned() {
+        // REVERSED. This test used to assert that `Coincident` over
+        // two rectangles collapses their CENTRES, on the strength of
+        // `get_point_position` reading `parameters[0..2]` off any
+        // entity. The centre semantic survives -- but only for the
+        // pairing that earns it: a POINT plus a point, circle or arc
+        // (which is what `sketch_ops::pattern_anchor` mints). Two
+        // centre-bearing entities is `Concentric` said badly, and the
+        // door now says so instead of quietly reinterpreting it.
         let sketch = fresh_sketch();
         let pinned = sketch
             .add_rectangle(Point2d::new(0.0, 0.0), Point2d::new(1.0, 1.0))
             .expect("a");
+        let free = sketch
+            .add_rectangle(Point2d::new(4.0, 5.0), Point2d::new(6.0, 7.0))
+            .expect("b");
+        let con = Constraint::new_geometric(
+            GeometricConstraint::Coincident,
+            vec![EntityRef::Rectangle(pinned), EntityRef::Rectangle(free)],
+            ConstraintPriority::High,
+        );
+        let msg = con
+            .validate_shape()
+            .expect_err("two rectangles are not a coincidence")
+            .to_string();
+        assert!(msg.contains("Concentric"), "names the alternative: {msg}");
+        assert!(!msg.contains("  "), "no absorbed indentation: {msg}");
+        assert_eq!(con.degrees_of_freedom_removed(), 0);
+
+        // Concentric IS defined for that pair, and still collapses the
+        // two centres -- the behaviour this test was protecting has a
+        // home, it is just no longer spelled `Coincident`.
         sketch.add_constraint(Constraint::new_dimensional(
             DimensionalConstraint::XCoordinate(0.0),
             vec![EntityRef::Rectangle(pinned)],
@@ -2541,22 +2610,22 @@ mod tests {
             vec![EntityRef::Rectangle(pinned)],
             ConstraintPriority::Required,
         ));
-        let free = sketch
-            .add_rectangle(Point2d::new(4.0, 5.0), Point2d::new(6.0, 7.0))
-            .expect("b");
         sketch.add_constraint(Constraint::new_geometric(
-            GeometricConstraint::Coincident,
+            GeometricConstraint::Concentric,
             vec![EntityRef::Rectangle(pinned), EntityRef::Rectangle(free)],
             ConstraintPriority::High,
         ));
-
         let report = solve(&sketch).expect("solve");
         assert!(report.converged(), "status was {:?}", report.status);
-
-        let entry = sketch.rectangles().get(&free).expect("rect");
-        let r = &entry.value().rectangle;
-        assert!(r.center.x.abs() < 1e-8, "center.x was {}", r.center.x);
-        assert!(r.center.y.abs() < 1e-8, "center.y was {}", r.center.y);
+        let centre = sketch
+            .rectangles()
+            .get(&free)
+            .map(|e| e.value().rectangle.center)
+            .expect("rect survives");
+        assert!(
+            centre.x.abs() < 1e-6 && centre.y.abs() < 1e-6,
+            "Concentric collapses the centres, got {centre:?}"
+        );
     }
 
     #[test]
@@ -4386,5 +4455,125 @@ mod tests {
                 "line {line_id:?} geometry detached from its points: {seg:?} vs ({a:?}, {b:?})"
             );
         }
+    }
+
+    // ── RED: a mismatched constraint must not buy DOFs (Task 16) ──
+
+    #[test]
+    fn equal_rectangles_remove_two_dofs() {
+        // Two free rectangles own 5 DOF each (cx, cy, w, h, rotation)
+        // = 10. `Equal` on the pair equates width AND height — two
+        // independent rows, and `constraint_error_count` has always
+        // budgeted 2 — so 8 DOF remain. `degrees_of_freedom_removed`
+        // said 1, which left the pair permanently reading 9: one
+        // phantom DOF that no constraint could ever close, because the
+        // constraint that closed it was only being counted once.
+        let sketch = fresh_sketch();
+        let a = sketch
+            .add_rectangle(Point2d::new(0.0, 0.0), Point2d::new(4.0, 2.0))
+            .expect("rect a");
+        let b = sketch
+            .add_rectangle(Point2d::new(10.0, 10.0), Point2d::new(16.0, 15.0))
+            .expect("rect b");
+        sketch.add_constraint(Constraint::new_geometric(
+            GeometricConstraint::Equal,
+            vec![EntityRef::Rectangle(a), EntityRef::Rectangle(b)],
+            ConstraintPriority::Required,
+        ));
+        let report = analyze_dofs(&sketch);
+        assert_eq!(report.total_free_dofs, 10, "two free rectangles");
+        assert_eq!(
+            report.constraint_dofs_removed, 2,
+            "width AND height, matching the 2-row residual"
+        );
+        assert_eq!(report.remaining_dofs(), Some(8));
+    }
+
+    #[test]
+    fn a_refused_constraint_lands_in_the_unsupported_bucket_not_the_conflicts() {
+        // The Task-15 interaction, measured rather than reasoned
+        // about. A fully pinned point (X and Y) plus one constraint
+        // whose SHAPE the kernel does not define: the refused
+        // constraint contributes a CONSTANT residual row with a zero
+        // gradient, so the rank pass must see it as dependent and name
+        // it a conflict — and the verdict must not read
+        // `FullyConstrained` on the strength of a constraint that
+        // pins nothing.
+        let sketch = fresh_sketch();
+        let p = sketch.add_point(Point2d::new(3.0, 4.0));
+        let c = sketch
+            .add_circle(Point2d::new(0.0, 0.0), 2.0)
+            .expect("circle");
+        sketch.add_constraint(Constraint::new_dimensional(
+            DimensionalConstraint::XCoordinate(3.0),
+            vec![EntityRef::Point(p)],
+            ConstraintPriority::Required,
+        ));
+        sketch.add_constraint(Constraint::new_dimensional(
+            DimensionalConstraint::YCoordinate(4.0),
+            vec![EntityRef::Point(p)],
+            ConstraintPriority::Required,
+        ));
+        // Horizontal takes exactly one LINE. A circle has no direction.
+        let bad = Constraint::new_geometric(
+            GeometricConstraint::Horizontal,
+            vec![EntityRef::Circle(c)],
+            ConstraintPriority::Required,
+        );
+        let bad_id = bad.id;
+        assert!(
+            bad.validate_shape().is_err(),
+            "the checked door refuses this shape"
+        );
+        // Deliberately through the UNCHECKED door: this test is about
+        // what the report says when such a constraint is already in
+        // the store.
+        sketch.add_constraint(bad);
+
+        let report = analyze_dofs(&sketch);
+        // THE load-bearing assertion: the refused constraint bought no
+        // DOF. Only the two coordinate dimensions debit.
+        assert_eq!(
+            report.constraint_dofs_removed, 2,
+            "a refused constraint must debit nothing; only X and Y did"
+        );
+        assert!(
+            !report.is_fully_constrained(),
+            "the circle's 3 DOF are untouched: {:?}",
+            report.status
+        );
+        // It is named, and named as what it IS. The rank pass does see
+        // a dependent row (a constant residual has a zero gradient at
+        // every configuration), but reporting that as a CONFLICT sends
+        // the reader hunting for a contradicting partner constraint
+        // that does not exist.
+        assert!(
+            report.unsupported.contains(&bad_id),
+            "the refusal belongs in its own bucket: unsupported {:?}",
+            report.unsupported
+        );
+        assert!(
+            !report.conflicts.contains(&bad_id),
+            "and NOT among the conflict witnesses: conflicts {:?}",
+            report.conflicts
+        );
+        assert!(
+            !report.redundant.contains(&bad_id),
+            "nor among the safe-to-delete duplicates: redundant {:?}",
+            report.redundant
+        );
+        // The raw rank pass still flags the row - the bucketing is
+        // this function's reading of it, not a change to the pass.
+        let diagnosis = diagnose_constraints(&sketch, &std::collections::HashSet::new());
+        assert!(
+            diagnosis.conflicts.contains(&bad_id),
+            "the row IS dependent: conflicts {:?}",
+            diagnosis.conflicts
+        );
+        assert!(
+            !diagnosis.singular_configuration(),
+            "a refusal is not a singular CONFIGURATION - moving the geometry \
+             cannot make an undefined shape enforceable"
+        );
     }
 }

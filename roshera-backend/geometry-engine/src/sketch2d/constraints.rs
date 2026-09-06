@@ -75,10 +75,128 @@ impl fmt::Display for EntityRef {
     }
 }
 
+impl EntityRef {
+    /// The wire/diagnostic name of this entity's KIND — used by the
+    /// constraint-shape refusals so a rejection can say what it was
+    /// handed, not just what it wanted.
+    pub fn kind_name(&self) -> &'static str {
+        match self {
+            EntityRef::Point(_) => "point",
+            EntityRef::Line(_) => "line",
+            EntityRef::Arc(_) => "arc",
+            EntityRef::Circle(_) => "circle",
+            EntityRef::Rectangle(_) => "rectangle",
+            EntityRef::Ellipse(_) => "ellipse",
+            EntityRef::Spline(_) => "spline",
+            EntityRef::Polyline(_) => "polyline",
+        }
+    }
+
+    /// Does this kind carry a defined POINT-LIKE position?
+    ///
+    /// A point IS its position; a circle, arc, rectangle or ellipse
+    /// contributes its CENTRE (the legacy semantic the solver's
+    /// `get_point_position` implements and `sketch_ops::pattern_anchor`
+    /// depends on when it ties a pattern anchor to a legacy circle's
+    /// centre with `Coincident`). A line, spline or polyline has NO
+    /// such position — its leading parameters are an anchor point, a
+    /// first control point or a first vertex, and reading them as
+    /// "the entity's position" is the fabrication this predicate
+    /// exists to stop.
+    pub fn has_point_position(&self) -> bool {
+        matches!(
+            self,
+            EntityRef::Point(_)
+                | EntityRef::Circle(_)
+                | EntityRef::Arc(_)
+                | EntityRef::Rectangle(_)
+                | EntityRef::Ellipse(_)
+        )
+    }
+
+    /// Kinds `Coincident` accepts: a point, or a circle/arc standing
+    /// for its CENTRE. Rectangles and ellipses are excluded even
+    /// though they have a centre -- see the `Coincident` arm of
+    /// [`Constraint::shape_is_defined`].
+    pub fn is_coincidence_anchor(&self) -> bool {
+        matches!(
+            self,
+            EntityRef::Point(_) | EntityRef::Circle(_) | EntityRef::Arc(_)
+        )
+    }
+
+    /// Does this kind carry a defined CENTRE? (Everything
+    /// point-like except a bare point.)
+    pub fn has_centre(&self) -> bool {
+        matches!(
+            self,
+            EntityRef::Circle(_)
+                | EntityRef::Arc(_)
+                | EntityRef::Rectangle(_)
+                | EntityRef::Ellipse(_)
+        )
+    }
+
+    /// Circular kinds: a centre plus a radius.
+    pub fn is_round(&self) -> bool {
+        matches!(self, EntityRef::Circle(_) | EntityRef::Arc(_))
+    }
+
+    /// Kinds that carry a CARRIER a point can be projected onto —
+    /// the `PointOnCurve` / continuity carriers.
+    pub fn is_curve(&self) -> bool {
+        matches!(
+            self,
+            EntityRef::Line(_)
+                | EntityRef::Circle(_)
+                | EntityRef::Arc(_)
+                | EntityRef::Spline(_)
+                | EntityRef::Polyline(_)
+        )
+    }
+
+    /// Kinds that carry a TANGENT and a CURVATURE the solver can
+    /// actually read: `curve_join_frame` (G1/G2 continuity) and
+    /// `curvature_at_point_foot` (curvature at a point's foot) both
+    /// match exactly `Line | Circle | Arc | Spline`.
+    ///
+    /// This is deliberately NARROWER than [`Self::is_curve`], which
+    /// includes POLYLINE. A polyline is a legitimate `PointOnCurve`
+    /// carrier (the evaluator projects onto its closest segment) but
+    /// has no tangent frame here, so blessing it for continuity or
+    /// curvature would re-open the exact drift this shape table
+    /// closes: the door accepts, the DOF tally debits, and the
+    /// evaluator refuses.
+    pub fn has_tangent_frame(&self) -> bool {
+        matches!(
+            self,
+            EntityRef::Line(_) | EntityRef::Circle(_) | EntityRef::Arc(_) | EntityRef::Spline(_)
+        )
+    }
+
+    /// Kinds the solver can integrate an AREA and a PERIMETER over
+    /// (`entity_area` / `entity_perimeter`).
+    pub fn has_area(&self) -> bool {
+        matches!(
+            self,
+            EntityRef::Circle(_) | EntityRef::Rectangle(_) | EntityRef::Ellipse(_)
+        )
+    }
+}
+
 /// Geometric constraint types
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum GeometricConstraint {
-    /// Two points are coincident
+    /// Two entities occupy the same POINT.
+    ///
+    /// At least one must be a point; the other may be a point, a
+    /// circle or an arc, and for a circle or arc the constrained
+    /// position is its CENTRE - not a point on its curve. To put a
+    /// point ON a curve use [`GeometricConstraint::PointOnCurve`]; to
+    /// make two circles or arcs share a centre use
+    /// [`GeometricConstraint::Concentric`]. Both of those pairings are
+    /// REFUSED here rather than quietly reinterpreted -- see
+    /// [`Constraint::shape_is_defined`].
     Coincident,
     /// Two lines are parallel
     Parallel,
@@ -377,8 +495,341 @@ impl Constraint {
         self.entities.contains(entity)
     }
 
+    /// Is this constraint's ENTITY SHAPE — its arity AND its entity
+    /// kinds — one the kernel actually DEFINES?
+    ///
+    /// This is the ONE definition of "shape", used at every seam:
+    ///
+    /// * [`Constraint::degrees_of_freedom_removed`] debits ZERO for an
+    ///   undefined shape, so a mismatched constraint can never buy a
+    ///   `FullyConstrained` verdict;
+    /// * the solver's `evaluate_constraint_error` emits the irreducible
+    ///   refusal residual (`UNSUPPORTED_CONSTRAINT_RESIDUAL`) in every
+    ///   budgeted row for an undefined shape, so a solve can never
+    ///   report one satisfied;
+    /// * `Sketch::try_add_constraint` and the
+    ///   `POST /api/csketch/{id}/constraint` route reject one at the
+    ///   door with a typed error naming the expected arity and kinds.
+    ///
+    /// Before this existed, ~12 classic arms answered a kind or arity
+    /// mismatch with `vec![0.0]` — a residual that reads EXACTLY like
+    /// "satisfied" — while the DOF tally still debited. `Parallel` on
+    /// two circles read solved and removed a DOF nothing was pinning.
+    ///
+    /// Two kinds are deliberately shape-AGNOSTIC here:
+    /// `ContactConstraint` and `MomentOfInertia` are recognised but
+    /// carry no residual at all
+    /// ([`ConstraintType::is_numerically_enforced`] is false for them),
+    /// so there is no shape that would make them enforceable and none
+    /// worth rejecting at the door.
+    pub fn shape_is_defined(&self) -> bool {
+        let e = self.entities.as_slice();
+        match &self.constraint_type {
+            ConstraintType::Geometric(g) => match g {
+                // A POINT plus a point-like entity, and at least one
+                // of the two must be an actual POINT.
+                //
+                // Coincidence against a circle or arc means its
+                // CENTRE, which is what `sketch_ops::pattern_anchor`
+                // mints to tie a pattern anchor to a legacy circle.
+                // Two centre-bearing entities is NOT that relation:
+                // `Coincident(circle, circle)` is `Concentric` said
+                // badly, and a rectangle or ellipse has no
+                // point-and-centre reading anybody asked for. Both are
+                // refused, and `expected_shape` names the constraint
+                // the caller wanted.
+                GeometricConstraint::Coincident => match e {
+                    [a, b] => {
+                        a.is_coincidence_anchor()
+                            && b.is_coincidence_anchor()
+                            && (matches!(a, EntityRef::Point(_))
+                                || matches!(b, EntityRef::Point(_)))
+                    }
+                    _ => false,
+                },
+                GeometricConstraint::Parallel | GeometricConstraint::Perpendicular => {
+                    matches!(e, [EntityRef::Line(_), EntityRef::Line(_)])
+                }
+                GeometricConstraint::Horizontal | GeometricConstraint::Vertical => {
+                    matches!(e, [EntityRef::Line(_)])
+                }
+                // Line-to-curve tangency only: the residual is the
+                // distance from a centre to a line, compared against a
+                // radius, so it needs exactly one line and one round
+                // curve. Curve-to-curve tangency has no residual here.
+                GeometricConstraint::Tangent => {
+                    matches!(e, [EntityRef::Line(_), b] if b.is_round())
+                        || matches!(e, [a, EntityRef::Line(_)] if a.is_round())
+                }
+                GeometricConstraint::Concentric => {
+                    matches!(e, [a, b] if a.has_centre() && b.has_centre())
+                }
+                // Per-PAIRING: equal lengths (line pair), equal radii
+                // (round pair, mixed circle/arc included), equal width
+                // AND height (rectangle pair), equal semi-axes (ellipse
+                // pair). Anything else has no comparable dimension.
+                // Kept in lock-step with the solver's
+                // `evaluate_equal_constraint` and its row budget.
+                GeometricConstraint::Equal => match e {
+                    [EntityRef::Line(_), EntityRef::Line(_)] => true,
+                    [EntityRef::Rectangle(_), EntityRef::Rectangle(_)] => true,
+                    [EntityRef::Ellipse(_), EntityRef::Ellipse(_)] => true,
+                    [a, b] => a.is_round() && b.is_round(),
+                    _ => false,
+                },
+                // Reflection needs a LINE axis; the arc pair takes the
+                // 4-row arm, every other point-like pair the 2-row one.
+                GeometricConstraint::Symmetric => {
+                    matches!(e, [a, b, EntityRef::Line(_)]
+                        if a.has_point_position() && b.has_point_position())
+                }
+                GeometricConstraint::PointOnCurve => {
+                    matches!(e, [a, b] if a.has_point_position() && b.is_curve())
+                }
+                GeometricConstraint::Midpoint => {
+                    matches!(e, [a, EntityRef::Line(_)] if a.has_point_position())
+                }
+                GeometricConstraint::Collinear => {
+                    matches!(e, [a, b, c]
+                        if a.has_point_position()
+                            && b.has_point_position()
+                            && c.has_point_position())
+                }
+                // G1/G2 continuity: two curves, optionally with the
+                // join point named explicitly. Whether the two curves
+                // actually MEET is state, not shape — `continuity_pair`
+                // refuses that at evaluation time.
+                GeometricConstraint::SmoothTangent | GeometricConstraint::CurvatureContinuity => {
+                    matches!(e, [a, b] if a.has_tangent_frame() && b.has_tangent_frame())
+                        || matches!(e, [a, b, EntityRef::Point(_)]
+                            if a.has_tangent_frame() && b.has_tangent_frame())
+                }
+                GeometricConstraint::EqualArea | GeometricConstraint::EqualPerimeter => {
+                    matches!(e, [a, b] if a.has_area() && b.has_area())
+                }
+                GeometricConstraint::Centroid => {
+                    matches!(e, [a, b] if a.has_point_position() && b.has_centre())
+                }
+                // `[line1, line2]`, optionally with the intersection
+                // point that locates where they meet.
+                GeometricConstraint::IntersectionAngle(_) => {
+                    matches!(e, [EntityRef::Line(_), EntityRef::Line(_)])
+                        || matches!(
+                            e,
+                            [EntityRef::Line(_), EntityRef::Line(_), EntityRef::Point(_)]
+                        )
+                }
+                GeometricConstraint::Offset => {
+                    matches!(e, [EntityRef::Line(_), EntityRef::Line(_)])
+                        || matches!(e, [a, b] if a.is_round() && b.is_round())
+                }
+                GeometricConstraint::MultiTangent => {
+                    matches!(e, [EntityRef::Line(_), rest @ ..]
+                        if !rest.is_empty() && rest.iter().all(|c| c.is_round()))
+                }
+                GeometricConstraint::CurvatureExtremum => {
+                    matches!(e, [EntityRef::Spline(_), EntityRef::Point(_)])
+                }
+                // No residual for any shape — see the doc above.
+                GeometricConstraint::ContactConstraint => true,
+            },
+            ConstraintType::Dimensional(d) => match d {
+                DimensionalConstraint::Distance(_)
+                | DimensionalConstraint::MinDistance(_)
+                | DimensionalConstraint::MaxDistance(_) => {
+                    matches!(e, [a, b] if a.has_point_position() && b.has_point_position())
+                }
+                DimensionalConstraint::Angle(_) => {
+                    matches!(e, [EntityRef::Line(_), EntityRef::Line(_)])
+                        || matches!(
+                            e,
+                            [EntityRef::Line(_), EntityRef::Line(_), EntityRef::Point(_)]
+                        )
+                }
+                DimensionalConstraint::Radius(_) | DimensionalConstraint::Diameter(_) => {
+                    matches!(e, [a] if a.is_round())
+                }
+                DimensionalConstraint::Length(_) | DimensionalConstraint::Slope(_) => {
+                    matches!(e, [EntityRef::Line(_)])
+                }
+                DimensionalConstraint::XCoordinate(_) | DimensionalConstraint::YCoordinate(_) => {
+                    matches!(e, [a] if a.has_point_position())
+                }
+                DimensionalConstraint::Area(_) | DimensionalConstraint::Perimeter(_) => {
+                    matches!(e, [a] if a.has_area())
+                }
+                // `[curve]` = the whole swept length (arc or circle);
+                // `[arc, p, q]` = the length between two points' feet.
+                DimensionalConstraint::ArcLength(_) => {
+                    matches!(e, [a] if a.is_round())
+                        || matches!(
+                            e,
+                            [EntityRef::Arc(_), EntityRef::Point(_), EntityRef::Point(_)]
+                        )
+                }
+                // `[curve]` = constant curvature (round curve, or a
+                // line's zero); `[curve, point]` = curvature at the
+                // point's foot, which is also the spline path.
+                // `[curve]` = constant curvature (round curve, or a
+                // line's zero); `[curve, point]` = curvature at the
+                // point's foot. The second arm is `has_tangent_frame`,
+                // NOT `is_curve`: `curvature_at_point_foot` has no
+                // POLYLINE branch, and blessing one here would let the
+                // door accept and debit a DOF for a residual the
+                // evaluator can only refuse.
+                DimensionalConstraint::Curvature(_) => {
+                    matches!(e, [a] if a.is_round() || matches!(a, EntityRef::Line(_)))
+                        || matches!(e, [a, EntityRef::Point(_)] if a.has_tangent_frame())
+                }
+                DimensionalConstraint::AspectRatio(_) => {
+                    matches!(e, [EntityRef::Rectangle(_)] | [EntityRef::Ellipse(_)])
+                }
+                // NOTE: `entity_centroid` IS `get_circle_center`, so
+                // for an ARC this pins the arc's CENTRE, not the
+                // centroid of a lamina bounded by the arc. That is the
+                // kernel's standing definition (a circle, rectangle
+                // and ellipse agree with the true centroid; an open
+                // arc does not have one), recorded here so the shape
+                // table is not read as a stronger claim than the
+                // evaluator makes.
+                DimensionalConstraint::CenterOfMass { .. } => {
+                    matches!(e, [a] if a.has_centre())
+                }
+                DimensionalConstraint::OffsetDistance(_) => {
+                    matches!(e, [EntityRef::Line(_), EntityRef::Line(_)])
+                        || matches!(e, [a, b] if a.is_round() && b.is_round())
+                }
+                // No residual for any shape — see the doc above.
+                DimensionalConstraint::MomentOfInertia(_) => true,
+            },
+        }
+    }
+
+    /// The arity and kinds [`Constraint::shape_is_defined`] accepts,
+    /// phrased for the human (or agent) whose constraint was just
+    /// refused. One line, no runs of spaces — it is quoted verbatim
+    /// into the REST error body.
+    pub fn expected_shape(&self) -> &'static str {
+        match &self.constraint_type {
+            ConstraintType::Geometric(g) => match g {
+                GeometricConstraint::Coincident => concat!(
+                    "exactly 2 entities, at least one a point, the other a point, circle or arc ",
+                    "(a circle or arc means its CENTRE); for two circles or arcs use Concentric, ",
+                    "for a point ON a curve use PointOnCurve"
+                ),
+                GeometricConstraint::Parallel | GeometricConstraint::Perpendicular => {
+                    "exactly 2 lines"
+                }
+                GeometricConstraint::Horizontal | GeometricConstraint::Vertical => "exactly 1 line",
+                GeometricConstraint::Tangent => "exactly 2 entities: 1 line and 1 circle or arc",
+                GeometricConstraint::Concentric => {
+                    "exactly 2 entities with a centre (circle, arc, rectangle, ellipse)"
+                }
+                GeometricConstraint::Equal => concat!(
+                    "exactly 2 entities of comparable dimension: 2 lines, ",
+                    "2 circles or arcs, 2 rectangles, or 2 ellipses"
+                ),
+                GeometricConstraint::Symmetric => {
+                    "exactly 3 entities: 2 with a position and a line axis"
+                }
+                GeometricConstraint::PointOnCurve => concat!(
+                    "exactly 2 entities: 1 with a position and 1 curve ",
+                    "(line, circle, arc, spline, polyline)"
+                ),
+                GeometricConstraint::Midpoint => "exactly 2 entities: 1 with a position and 1 line",
+                GeometricConstraint::Collinear => "exactly 3 entities, each with a position",
+                GeometricConstraint::SmoothTangent | GeometricConstraint::CurvatureContinuity => {
+                    "2 lines, circles, arcs or splines, optionally followed by the join point"
+                }
+                GeometricConstraint::EqualArea | GeometricConstraint::EqualPerimeter => {
+                    "exactly 2 entities enclosing an area (circle, rectangle, ellipse)"
+                }
+                GeometricConstraint::Centroid => {
+                    "exactly 2 entities: 1 with a position and 1 with a centre"
+                }
+                GeometricConstraint::IntersectionAngle(_) => {
+                    "2 lines, optionally followed by the intersection point"
+                }
+                GeometricConstraint::Offset => "exactly 2 lines, or 2 circles or arcs",
+                GeometricConstraint::MultiTangent => "1 line followed by 1 or more circles or arcs",
+                GeometricConstraint::CurvatureExtremum => "exactly 1 spline and 1 point",
+                GeometricConstraint::ContactConstraint => "any entities",
+            },
+            ConstraintType::Dimensional(d) => match d {
+                DimensionalConstraint::Distance(_)
+                | DimensionalConstraint::MinDistance(_)
+                | DimensionalConstraint::MaxDistance(_) => {
+                    "exactly 2 entities with a position (point, circle, arc, rectangle, ellipse)"
+                }
+                DimensionalConstraint::Angle(_) => {
+                    "2 lines, optionally followed by the intersection point"
+                }
+                DimensionalConstraint::Radius(_) | DimensionalConstraint::Diameter(_) => {
+                    "exactly 1 circle or arc"
+                }
+                DimensionalConstraint::Length(_) | DimensionalConstraint::Slope(_) => {
+                    "exactly 1 line"
+                }
+                DimensionalConstraint::XCoordinate(_) | DimensionalConstraint::YCoordinate(_) => {
+                    "exactly 1 entity with a position"
+                }
+                DimensionalConstraint::Area(_) | DimensionalConstraint::Perimeter(_) => {
+                    "exactly 1 entity enclosing an area (circle, rectangle, ellipse)"
+                }
+                DimensionalConstraint::ArcLength(_) => {
+                    "1 circle or arc, or 1 arc followed by 2 points"
+                }
+                DimensionalConstraint::Curvature(_) => concat!(
+                    "1 line, circle or arc, or 1 line, circle, arc or spline ",
+                    "followed by 1 point"
+                ),
+                DimensionalConstraint::AspectRatio(_) => "exactly 1 rectangle or ellipse",
+                DimensionalConstraint::CenterOfMass { .. } => "exactly 1 entity with a centre",
+                DimensionalConstraint::OffsetDistance(_) => "exactly 2 lines, or 2 circles or arcs",
+                DimensionalConstraint::MomentOfInertia(_) => "any entities",
+            },
+        }
+    }
+
+    /// The kinds this constraint was actually handed, in wire order.
+    pub fn entity_kind_names(&self) -> Vec<&'static str> {
+        self.entities.iter().map(EntityRef::kind_name).collect()
+    }
+
+    /// Refuse a constraint whose shape the kernel does not define,
+    /// naming the expected arity and kinds alongside the kinds
+    /// supplied.
+    ///
+    /// Called at the doors — `Sketch::try_add_constraint` and the
+    /// csketch route — so a constraint the solver could only ever
+    /// refuse never enters the store in the first place.
+    pub fn validate_shape(&self) -> super::Sketch2dResult<()> {
+        if self.shape_is_defined() {
+            return Ok(());
+        }
+        Err(super::Sketch2dError::UndefinedConstraintShape {
+            constraint: format!("{:?}", self.constraint_type),
+            expected: self.expected_shape().to_string(),
+            got: self.entity_kind_names().join(", "),
+        })
+    }
+
     /// Get the number of degrees of freedom this constraint removes
     pub fn degrees_of_freedom_removed(&self) -> usize {
+        // A shape the kernel does not define removes NOTHING. The
+        // solver refuses it with an irreducible residual
+        // (`UNSUPPORTED_CONSTRAINT_RESIDUAL`) rather than a zero row,
+        // so debiting a DOF here would hand a mismatched constraint —
+        // `Parallel` on two circles, `Coincident` on three points —
+        // the freedom it never pins, and let a per-component tally
+        // fold to `FullyConstrained` on the strength of it. This is
+        // the same per-shape rule `Offset`, `MultiTangent` and
+        // `CurvatureExtremum` already carried in their own arms,
+        // lifted to every kind and driven from ONE definition of
+        // shape ([`Constraint::shape_is_defined`]).
+        if !self.shape_is_defined() {
+            return 0;
+        }
         match &self.constraint_type {
             ConstraintType::Geometric(g) => match g {
                 GeometricConstraint::Coincident => 2,    // Removes X and Y
@@ -386,9 +837,21 @@ impl Constraint {
                 GeometricConstraint::Perpendicular => 1, // Removes angle
                 GeometricConstraint::Tangent => 1,       // Removes one DOF
                 GeometricConstraint::Concentric => 2,    // Removes center position
-                GeometricConstraint::Equal => 1,         // Removes one dimension
-                GeometricConstraint::Horizontal => 1,    // Removes Y variation
-                GeometricConstraint::Vertical => 1,      // Removes X variation
+                // PER-PAIRING, in lock-step with the solver's
+                // `evaluate_equal_constraint` and `constraint_error_count`:
+                // a rectangle pair equates width AND height, an
+                // ellipse pair both semi-axes — two independent rows,
+                // two DOF. A line pair (length) and a round pair
+                // (radius) equate one scalar. Reading 1 for the
+                // rectangle/ellipse pairings left every sketch that
+                // used one permanently 1 DOF under-constrained.
+                GeometricConstraint::Equal => match self.entities.as_slice() {
+                    [EntityRef::Rectangle(_), EntityRef::Rectangle(_)]
+                    | [EntityRef::Ellipse(_), EntityRef::Ellipse(_)] => 2,
+                    _ => 1,
+                },
+                GeometricConstraint::Horizontal => 1, // Removes Y variation
+                GeometricConstraint::Vertical => 1,   // Removes X variation
                 // Symmetric: 2 (reflected position) generically; an
                 // ARC PAIR removes 4 (reflected center + reflected
                 // traversal-normalized angles — SKETCH-DCM #45

@@ -511,9 +511,19 @@ fn drag_preserves_entity_id_after_call() {
 fn analyze_dofs_counts_polyline_constraints_after_c5() {
     // After slice C-5, polylines are first-class solver entities;
     // constraints touching them no longer go through the skip path.
-    // A 3-vertex polyline contributes 2 × 3 = 6 free DOFs; adding
-    // a Coincident(Point, Polyline) constraint removes 2 DOFs (xy
-    // coincidence). 2 (point) + 6 (polyline) - 2 (coincident) = 6.
+    // A 3-vertex polyline contributes 2 x 3 = 6 free DOFs; adding
+    // PointOnCurve(Point, Polyline) removes 1 (the point keeps one
+    // freedom, ALONG the polyline). 2 (point) + 6 (polyline) - 1 = 7.
+    //
+    // The vehicle was Coincident(Point, Polyline) until the
+    // constraint-shape gate landed. That pairing had no residual: the
+    // old `get_point_position` read `parameters[0..2]` off any entity,
+    // which for a polyline is its FIRST VERTEX, so "coincident with a
+    // polyline" silently meant "coincident with vertex 0" -- a
+    // relation nobody asked for, reported satisfied once reached.
+    // PointOnCurve IS implemented for polylines (signed perpendicular
+    // distance to the closest segment), so it exercises the same
+    // no-skip path while asserting something the solver can honour.
     let sketch = fresh();
     let p = sketch.add_point(Point2d::new(0.0, 0.0));
     let poly = sketch
@@ -527,7 +537,7 @@ fn analyze_dofs_counts_polyline_constraints_after_c5() {
         )
         .expect("polyline");
     sketch.add_constraint(Constraint::new_geometric(
-        GeometricConstraint::Coincident,
+        GeometricConstraint::PointOnCurve,
         vec![EntityRef::Point(p), EntityRef::Polyline(poly)],
         ConstraintPriority::High,
     ));
@@ -538,8 +548,8 @@ fn analyze_dofs_counts_polyline_constraints_after_c5() {
     assert_eq!(dof.constraints_analysed, 1);
     // 2 (point) + 6 (polyline) = 8 free DOFs.
     assert_eq!(dof.total_free_dofs, 8);
-    // Coincident removes 2 DOFs (X and Y).
-    assert_eq!(dof.constraint_dofs_removed, 2);
+    // PointOnCurve removes 1 DOF (the perpendicular offset).
+    assert_eq!(dof.constraint_dofs_removed, 1);
     assert!(dof.is_under_constrained());
-    assert_eq!(dof.remaining_dofs(), Some(6));
+    assert_eq!(dof.remaining_dofs(), Some(7));
 }

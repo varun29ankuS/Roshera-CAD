@@ -334,6 +334,14 @@ pub struct DofSnapshot {
     /// not report zero.
     #[serde(default)]
     pub unverified_components: Vec<usize>,
+    /// Constraints refused for their entity SHAPE, copied from
+    /// [`super::sketch_solver::DofReport::unsupported`]. Kept separate
+    /// from the conflict witnesses for the reason given there: the
+    /// contradiction is between the constraint and the kernel's
+    /// vocabulary, not between two constraints, so there is no partner
+    /// to delete. Additive (`#[serde(default)]`).
+    #[serde(default)]
+    pub unsupported: Vec<ConstraintId>,
 }
 
 /// How the solver's decomposition layers saw the sketch
@@ -651,6 +659,7 @@ pub fn certify_sketch(sketch: &Sketch) -> SketchValidityCertificate {
             components: dof.components,
             singular_configuration: dof.singular_configuration,
             unverified_components: dof.unverified_components,
+            unsupported: dof.unsupported,
         },
         decomposition: system.decomposition,
         constraint_facts: system.constraint_facts,

@@ -883,6 +883,27 @@ impl Sketch {
 
     // Constraint operations
 
+    /// Add a constraint to the sketch, refusing one whose ENTITY SHAPE
+    /// — its arity and entity kinds — the kernel does not define.
+    ///
+    /// This is the checked door. It runs the ONE shape definition,
+    /// [`Constraint::shape_is_defined`], and returns
+    /// [`Sketch2dError::UndefinedConstraintShape`] naming the expected
+    /// arity and kinds, so a `Parallel` on two circles or a
+    /// `Coincident` on three points never reaches the store — the
+    /// solver would answer it with the irreducible refusal residual
+    /// and the DOF tally with zero, which is honest but only tells the
+    /// caller at solve time.
+    ///
+    /// The `POST /api/csketch/{id}/constraint` route calls this, so
+    /// the wire surface and the kernel share one definition of shape.
+    /// [`Sketch::add_constraint`] remains the unchecked internal door
+    /// used by the ops layer, which mints only defined shapes.
+    pub fn try_add_constraint(&self, constraint: Constraint) -> Sketch2dResult<ConstraintId> {
+        constraint.validate_shape()?;
+        Ok(self.add_constraint(constraint))
+    }
+
     /// Add a constraint to the sketch
     pub fn add_constraint(&self, constraint: Constraint) -> ConstraintId {
         // Update constraint counts for affected entities
