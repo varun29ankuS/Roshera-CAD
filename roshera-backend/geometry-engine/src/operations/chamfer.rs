@@ -1848,10 +1848,17 @@ fn compute_chamfer_offsets(
     // consistent primitive face this reproduces `edge.orientation.sign() *
     // loop_sign` exactly (byte-identical convex path); on a boolean-Difference
     // tool face it corrects it.
-    let mid_point = curve.point_at(0.5).map_err(|e| {
+    // The edge's OWN midpoint, not the carrier curve's: `edge_to_curve_parameter`
+    // maps the edge's normalised parameter onto `Edge::param_range` (and reverses
+    // it for a `Backward` edge). On an edge that is its own curve over [0, 1] this
+    // is `0.5` unchanged; on a rim arc trimmed out of a full `Circle` by a boolean
+    // it is the middle of the ARC, which is the only point where the face normals
+    // and the loop-membership test below have anything to read.
+    let mid_curve_param = edge.edge_to_curve_parameter(0.5);
+    let mid_point = curve.point_at(mid_curve_param).map_err(|e| {
         OperationError::NumericalError(format!("Edge midpoint evaluation failed: {:?}", e))
     })?;
-    let raw_mid_tangent = curve.tangent_at(0.5).map_err(|e| {
+    let raw_mid_tangent = curve.tangent_at(mid_curve_param).map_err(|e| {
         OperationError::NumericalError(format!("Edge midpoint tangent failed: {:?}", e))
     })?;
     let mid_normal1 = face_normal_at_point(model, face1_id, &mid_point)?;
@@ -1887,14 +1894,26 @@ fn compute_chamfer_offsets(
     // interpolating rail against it. The arithmetic is the pre-fix loop body
     // verbatim, so a straight edge's samples are unchanged bit for bit.
     let sample_at = |t: f64| -> OperationResult<(Point3, Point3, Vector3, Vector3)> {
+        // `t` is the EDGE's normalised parameter; the curve underneath may carry
+        // far more than this edge. `edge_to_curve_parameter` maps [0, 1] onto
+        // `Edge::param_range`, reversing it for a `Backward` edge, so the walk
+        // covers the edge and nothing but the edge. Sampling `curve.point_at(t)`
+        // directly (as this did) walks a boolean-trimmed rim arc's WHOLE circle
+        // and builds a chamfer for material the edge does not span.
+        //
+        // The frame stays the raw CURVE tangent: `face1_loop_sign` /
+        // `face2_loop_sign` were resolved against that same frame at the edge
+        // midpoint above, so the composition is unchanged.
+        let curve_param = edge.edge_to_curve_parameter(t);
+
         // Get point on edge
-        let edge_point = curve.point_at(t).map_err(|e| {
+        let edge_point = curve.point_at(curve_param).map_err(|e| {
             OperationError::NumericalError(format!("Edge evaluation failed: {:?}", e))
         })?;
 
         // Get edge tangent at this parameter
         let edge_tangent = curve
-            .tangent_at(t)
+            .tangent_at(curve_param)
             .map_err(|e| OperationError::NumericalError(format!("Edge tangent failed: {:?}", e)))?;
 
         // Get face normals at edge point
@@ -1961,12 +1980,14 @@ fn compute_chamfer_offsets(
     // defect this operation exists to prevent, wearing the shape of a
     // successful chamfer.
     //
-    // This is reachable in production, not theoretical: `sample_at` walks the
-    // edge's CURVE over `t ∈ [0, 1]` without consulting `Edge::param_range`
-    // (a defect of its own, filed separately), so an OPEN arc trimmed out of a
-    // full `Circle` by a boolean is sampled all the way round and its offset
-    // trail closes. Refuse by name; a closed rim edge has its own pipeline
-    // (`create_closed_edge_chamfer`) and never arrives here.
+    // `sample_at` now walks `Edge::param_range`, so an offset trail can only
+    // close when the edge's own two ends land within tolerance of each other.
+    // The kernel does not know WHY that happened — a seam-less rim walked over
+    // its curve's whole period is one way, but such a rim normally routes to
+    // `create_closed_edge_chamfer` long before reaching here, so a degenerate
+    // or sub-tolerance-short edge is at least as likely. Report the
+    // MEASUREMENT (sample count, chord, tolerance) and name both readings
+    // rather than asserting a cause the measurement does not establish.
     for (side, points) in [(1, &data.offset_points1), (2, &data.offset_points2)] {
         let (Some(first), Some(last)) = (points.first(), points.last()) else {
             return Err(OperationError::InvalidGeometry(format!(
@@ -1976,9 +1997,23 @@ fn compute_chamfer_offsets(
         let chord = first.distance(last);
         if chord <= tolerance {
             return Err(OperationError::NotImplemented(format!(
-                "Chamfer edge {edge_id}: the offset trail on face {} closes on                  itself (its {} samples start and end {chord} apart, within the                  {tolerance} tolerance), so it has no chord to build a rail                  along. A closed trail means the edge's curve was traversed in                  full — a closed rim has its own pipeline; an open edge that                  reaches this state is a trimmed sub-arc whose parameter range                  was not honoured. Chamfering it is not implemented.",
+                concat!(
+                    "Chamfer edge {}: the offset trail on face {} closes on itself, ",
+                    "so it has no chord to build a rail along. Measured: {} samples, ",
+                    "whose first and last stand {} apart, at or under the {} distance ",
+                    "tolerance. Two readings fit that measurement and this operation ",
+                    "cannot tell them apart: the edge may span its curve's whole ",
+                    "period (a seam-less closed rim, which normally routes to the ",
+                    "closed-edge pipeline before reaching here), or it may be ",
+                    "degenerate — shorter than the tolerance, or carrying a corrupt ",
+                    "parameter range. Chamfering it through the open-edge path is not ",
+                    "implemented."
+                ),
+                edge_id,
                 if side == 1 { face1_id } else { face2_id },
-                points.len()
+                points.len(),
+                chord,
+                tolerance
             )));
         }
     }
@@ -2063,18 +2098,16 @@ fn compute_chamfer_offsets(
         let rail1_was_straight = rail_is_straight(&data.offset_points1);
         let rail2_was_straight = rail_is_straight(&data.offset_points2);
 
-        // Curve parameter ↦ vertex mapping respects Edge::orientation,
-        // mirroring `unit_dir_from_vertex` above.
-        let v_at_t0 = if edge.orientation.is_forward() {
-            edge.start_vertex
-        } else {
-            edge.end_vertex
-        };
-        let v_at_t1 = if edge.orientation.is_forward() {
-            edge.end_vertex
-        } else {
-            edge.start_vertex
-        };
+        // Sample index 0 is the EDGE's parameter t = 0, which is its
+        // `start_vertex` by definition — `edge_to_curve_parameter` already
+        // absorbed `Edge::orientation` when the trails were filled, so no
+        // second orientation test belongs here. (Before the trails honoured
+        // `param_range`, index 0 was the CURVE's t = 0 and this mapping had to
+        // undo the orientation; on a `Backward` edge it then disagreed with
+        // `create_chamfer_face`, which pairs `offset_points*[0]` with
+        // `edge.start_vertex` unconditionally.)
+        let v_at_t0 = edge.start_vertex;
+        let v_at_t1 = edge.end_vertex;
 
         let mut face1_overridden = false;
         let mut face2_overridden = false;
@@ -2130,7 +2163,14 @@ fn compute_chamfer_offsets(
         if face1_overridden {
             if !rail1_was_straight {
                 return Err(OperationError::NotImplemented(format!(
-                    "Chamfer edge {edge_id}: corner-miter override on the CURVED                      offset rail of face {face1_id}. Re-interpolating that rail                      between the mitered endpoints would flatten it to a chord                      and pull the chamfer boundary off its own surface; mitered                      corners on curved edges are not implemented."
+                    concat!(
+                        "Chamfer edge {}: corner-miter override on the CURVED offset ",
+                        "rail of face {}. Re-interpolating that rail between the ",
+                        "mitered endpoints would flatten it to a chord and pull the ",
+                        "chamfer boundary off its own surface; mitered corners on ",
+                        "curved edges are not implemented."
+                    ),
+                    edge_id, face1_id
                 )));
             }
             let last = data.offset_points1.len() - 1;
@@ -2146,7 +2186,14 @@ fn compute_chamfer_offsets(
         if face2_overridden {
             if !rail2_was_straight {
                 return Err(OperationError::NotImplemented(format!(
-                    "Chamfer edge {edge_id}: corner-miter override on the CURVED                      offset rail of face {face2_id}. Re-interpolating that rail                      between the mitered endpoints would flatten it to a chord                      and pull the chamfer boundary off its own surface; mitered                      corners on curved edges are not implemented."
+                    concat!(
+                        "Chamfer edge {}: corner-miter override on the CURVED offset ",
+                        "rail of face {}. Re-interpolating that rail between the ",
+                        "mitered endpoints would flatten it to a chord and pull the ",
+                        "chamfer boundary off its own surface; mitered corners on ",
+                        "curved edges are not implemented."
+                    ),
+                    edge_id, face2_id
                 )));
             }
             let last = data.offset_points2.len() - 1;
@@ -3390,23 +3437,38 @@ fn unit_dir_from_vertex(
         OperationError::InvalidGeometry(format!("Curve for edge {edge_id} missing"))
     })?;
 
-    // With Forward orientation curve.point_at(0) is at start_vertex;
-    // with Backward at end_vertex.
-    let v_at_curve_t0 = if edge.orientation.is_forward() {
-        edge.start_vertex
-    } else {
-        edge.end_vertex
-    };
-    let (t_at_v, into_edge_sign) = if v_id == v_at_curve_t0 {
+    // Work in the EDGE's parameter: t = 0 is `start_vertex`, t = 1 is
+    // `end_vertex`, by definition. `edge_to_curve_parameter` maps that onto
+    // `Edge::param_range` (reversing it for a `Backward` edge), so a rim arc
+    // trimmed out of a full `Circle` is read at its OWN ends rather than at the
+    // circle's parametric origin. Reading `curve.tangent_at(0.0 / 1.0)`, as this
+    // did, returned the tangent at a point the edge does not contain whenever
+    // the range was a strict sub-range.
+    let (t_at_v, into_edge_sign) = if v_id == edge.start_vertex {
         (0.0_f64, 1.0_f64)
     } else {
         (1.0_f64, -1.0_f64)
     };
+    let curve_param = edge.edge_to_curve_parameter(t_at_v);
 
-    let tangent = curve.tangent_at(t_at_v).map_err(|e| {
+    // The curve's tangent points along INCREASING curve parameter. The edge
+    // walks that axis forwards or backwards depending on its orientation and on
+    // whether its range is stored reversed, so compose both signs to get the
+    // direction of increasing EDGE parameter.
+    let walk_sign = if edge.orientation.is_forward() {
+        1.0_f64
+    } else {
+        -1.0_f64
+    } * if edge.param_range.span() >= 0.0 {
+        1.0_f64
+    } else {
+        -1.0_f64
+    };
+
+    let tangent = curve.tangent_at(curve_param).map_err(|e| {
         OperationError::NumericalError(format!("Tangent at vertex failed: {:?}", e))
     })?;
-    let dir = tangent * into_edge_sign;
+    let dir = tangent * walk_sign * into_edge_sign;
     dir.normalize()
         .map_err(|e| OperationError::NumericalError(format!("Edge direction degenerate: {:?}", e)))
 }
@@ -4130,22 +4192,39 @@ fn propagate_by_continuity(
     Ok(selected.into_iter().collect())
 }
 
-/// Curve tangent of `edge` evaluated at the curve parameter
-/// corresponding to vertex `v`. Returns `None` if the curve cannot be
-/// evaluated.
+/// Curve tangent of `edge` at vertex `v`, oriented along the edge's own walk
+/// direction (increasing edge parameter). Returns `None` if the curve cannot
+/// be evaluated.
+///
+/// The vertex ↦ parameter mapping goes through
+/// [`Edge::edge_to_curve_parameter`], the same route
+/// [`unit_dir_from_vertex`] takes, so the two helpers always read the SAME
+/// end of the edge. Reading `param_range.start` for `start_vertex` (as this
+/// did) is only right on a `Forward` edge: a `Backward` edge's `start_vertex`
+/// sits at `param_range.end`, so the old mapping evaluated the tangent at the
+/// far end of the edge — the trailing `* -1.0` corrects the DIRECTION, never
+/// the point, and on a curved sub-range those are different tangents
+/// entirely.
 fn edge_tangent_at_vertex(model: &BRepModel, edge: &Edge, v: VertexId) -> Option<Vector3> {
     let curve = model.curves.get(edge.curve_id)?;
-    let t = if v == edge.start_vertex {
-        edge.param_range.start
+    let t_edge = if v == edge.start_vertex { 0.0 } else { 1.0 };
+    let tan = curve
+        .tangent_at(edge.edge_to_curve_parameter(t_edge))
+        .ok()?;
+    // The curve's tangent points along INCREASING curve parameter; the edge
+    // walks that axis forwards or backwards depending on its orientation and
+    // on whether its range is stored reversed. Same composition as
+    // `unit_dir_from_vertex`.
+    let walk_sign = if edge.orientation.is_forward() {
+        1.0
     } else {
-        edge.param_range.end
+        -1.0
+    } * if edge.param_range.span() >= 0.0 {
+        1.0
+    } else {
+        -1.0
     };
-    let tan = curve.tangent_at(t).ok()?;
-    if matches!(edge.orientation, EdgeOrientation::Backward) {
-        Some(tan * -1.0)
-    } else {
-        Some(tan)
-    }
+    Some(tan * walk_sign)
 }
 
 /// Get adjacent faces for an edge by scanning all faces in the solid's shells
@@ -4246,9 +4325,15 @@ fn compute_face_angle(
         .curves
         .get(edge.curve_id)
         .ok_or_else(|| OperationError::InvalidGeometry("Curve not found".to_string()))?;
-    let mid_point = curve.point_at(0.5).map_err(|e| {
-        OperationError::NumericalError(format!("Edge midpoint evaluation failed: {:?}", e))
-    })?;
+    // The EDGE's midpoint. `curve.point_at(0.5)` is the midpoint of the carrier
+    // curve, which for a boolean-trimmed rim arc is a point the solid may not
+    // even contain — and the face normals below are then read off geometry that
+    // is not on this edge.
+    let mid_point = curve
+        .point_at(edge.edge_to_curve_parameter(0.5))
+        .map_err(|e| {
+            OperationError::NumericalError(format!("Edge midpoint evaluation failed: {:?}", e))
+        })?;
 
     // Face-oriented outward normals (the helper already applies
     // FaceOrientation::Backward → negate, so this is the canonical
@@ -5273,6 +5358,10 @@ mod tests {
                     msg.contains("CURVED"),
                     "the refusal must say WHY it refuses; got: {msg}"
                 );
+                assert!(
+                    !msg.contains("  "),
+                    "the refusal must not ship runs of absorbed indentation; got: {msg}"
+                );
             }
             Err(other) => panic!(
                 "a miter override on a curved rail must refuse as NotImplemented; got {other:?}"
@@ -5287,23 +5376,28 @@ mod tests {
     }
 
     /// An offset trail that closes on itself must be refused, not handed to
-    /// the straight branch.
+    /// the straight branch — and a boolean-trimmed sub-arc must no longer
+    /// produce one.
     ///
-    /// `sample_at` walks the edge's CURVE over `t ∈ [0, 1]` and never consults
-    /// `Edge::param_range` (a separate defect), so an OPEN arc that a boolean
-    /// trimmed out of a full `Circle` is sampled all the way round and its
-    /// offset trail returns to its start.
+    /// The fixture is a cylinder with a chord cut off it by a boolean, whose
+    /// surviving top rim is an OPEN edge still carried by the full `Circle`.
+    /// Two things are asserted on it, in order:
     ///
-    /// What happens next depends on rounding, and both outcomes are wrong.
-    /// With the ends EXACTLY coincident, `rail_is_straight` has no direction to
-    /// measure against, answers "straight", and `build_rail_curve` mints a
-    /// ZERO-LENGTH `Line` as the face's carrier rail under a full boundary.
-    /// With them a few ulps apart — what this fixture actually produces,
-    /// measured 2.2e-15 — the rail instead becomes a nearly-closed interpolant
-    /// spanning the WHOLE circle: a chamfer face for an edge the solid does not
-    /// have. Either way a wrong answer comes back wearing the shape of a
-    /// successful chamfer, which is what the refusal removes. The refusal is a
-    /// TOLERANCE test (`chord <= tolerance`), so it covers both.
+    /// 1. **The sub-arc offsets, and its trail does NOT close.** `sample_at`
+    ///    walks `Edge::param_range`, so the trail spans the arc the solid
+    ///    actually has. Before that fix the walk went all the way round the
+    ///    circle and the trail returned to its own start — measured 2.2e-15
+    ///    apart — which is what drove this refusal on an edge that had done
+    ///    nothing wrong.
+    /// 2. **An edge that genuinely spans its curve's full period still
+    ///    refuses.** The same edge, cloned with `param_range` widened to
+    ///    `[0, 1]`, is a seam-less closed rim arriving at the open-edge path.
+    ///    Its trail has no chord: `rail_is_straight` has no direction to
+    ///    measure against, answers "straight", and `build_rail_curve` would
+    ///    mint a ZERO-LENGTH `Line` as the carrier rail under a full boundary
+    ///    — a wrong answer wearing the shape of a successful chamfer. Closed
+    ///    rims have their own pipeline (`create_closed_edge_chamfer`); this
+    ///    path refuses by name.
     #[test]
     fn an_offset_trail_that_closes_on_itself_is_refused() {
         use crate::math::Matrix4;
@@ -5390,11 +5484,62 @@ mod tests {
             Err(e) => panic!("adjacent faces of the rim arc: {e:?}"),
         };
 
-        match compute_chamfer_offsets(&model, &edge, target, face1, face2, 1.0, 1.0, None) {
+        // 1. The trimmed sub-arc offsets, and its trail is OPEN.
+        let open =
+            match compute_chamfer_offsets(&model, &edge, target, face1, face2, 1.0, 1.0, None) {
+                Ok(d) => d,
+                Err(e) => panic!(
+                    "the boolean-trimmed rim sub-arc must offset over its OWN parameter \
+                 range, not refuse; got {e:?}"
+                ),
+            };
+        let first = open.offset_points1[0];
+        let last = open.offset_points1[open.offset_points1.len() - 1];
+        assert!(
+            first.distance(&last) > 1.0,
+            "the sub-arc's offset trail must span the arc the solid HAS, so its \
+             ends stand apart; they are {} apart over {} samples. A trail that \
+             returns to its own start means the walk went round the whole circle.",
+            first.distance(&last),
+            open.offset_points1.len()
+        );
+
+        // 2. The SAME edge widened to its curve's full period still refuses.
+        let mut closed = edge.clone();
+        closed.param_range = crate::primitives::curve::ParameterRange::new(0.0, 1.0);
+        closed.invalidate_length_cache();
+
+        match compute_chamfer_offsets(&model, &closed, target, face1, face2, 1.0, 1.0, None) {
             Err(OperationError::NotImplemented(msg)) => {
                 assert!(
                     msg.contains(&target.to_string()) && msg.contains("closes on"),
                     "the refusal must name the edge ({target}) and the closed trail; got: {msg}"
+                );
+                // The refusal's job is to report what was MEASURED, not to
+                // assert a cause: the sample count, the chord it measured and
+                // the tolerance it compared against must all be in the text.
+                let tol = crate::math::Tolerance::default().distance();
+                assert!(
+                    msg.contains("11 samples"),
+                    "the refusal must report the sample count it measured; got: {msg}"
+                );
+                assert!(
+                    msg.contains(&tol.to_string()) && msg.contains("tolerance"),
+                    "the refusal must report the tolerance it compared against \
+                     ({tol}); got: {msg}"
+                );
+                assert!(
+                    msg.contains(" apart"),
+                    "the refusal must report the chord it measured; got: {msg}"
+                );
+                assert!(
+                    msg.contains("degenerate"),
+                    "the refusal must offer the degenerate-edge reading alongside \
+                     the closed-rim one, not assert a single cause; got: {msg}"
+                );
+                assert!(
+                    !msg.contains("  "),
+                    "the refusal must not ship runs of absorbed indentation; got: {msg}"
                 );
             }
             Err(other) => {
@@ -5405,15 +5550,408 @@ mod tests {
                 let last = data.offset_points1[data.offset_points1.len() - 1];
                 panic!(
                     "a closed offset trail was ACCEPTED: {} samples whose ends are \
-                     {} apart, classified straight = {}. The chamfer of a trimmed \
-                     sub-arc cannot be a rail that returns to its own start — that \
-                     face belongs to an edge the solid does not have.",
+                     {} apart, classified straight = {}. A rail that returns to its \
+                     own start carries no chord to build a carrier surface along.",
                     data.offset_points1.len(),
                     first.distance(&last),
                     rail_is_straight(&data.offset_points1),
                 )
             }
         }
+    }
+
+    /// Re-express the pie slice's top arc as a SUB-RANGE of a full circle,
+    /// exactly as a boolean-trimmed rim edge is carried, and hand back the
+    /// quarter's angular span.
+    ///
+    /// The point set does not move: the edge keeps its vertices, its faces and
+    /// its surfaces, and every point it evaluates. Only the PARAMETERISATION
+    /// changes — from an `Arc` that is its own curve over `[0, 1]` to a
+    /// `Circle` walked over `param_range` `[0, 0.25]`. That is the single
+    /// variable under test, so anything that changes in the chamfer is caused
+    /// by the parameterisation and by nothing else.
+    ///
+    /// The swap is VERIFIED, not asserted by construction: the rebuilt
+    /// (curve, range, orientation) triple is measured against the edge's own
+    /// `evaluate` at eleven stations before the fixture is handed out. A
+    /// fixture that silently re-shaped the edge would fail here rather than
+    /// mint a green test on different geometry.
+    fn retarget_top_arc_onto_a_full_circle(
+        model: &mut BRepModel,
+        arc_id: EdgeId,
+        height: f64,
+        radius: f64,
+    ) -> (f64, f64) {
+        use crate::primitives::curve::{Circle, ParameterRange};
+
+        let before: Vec<Point3> = (0..=10)
+            .map(|i| {
+                let t = i as f64 / 10.0;
+                match model.edges.get(arc_id) {
+                    Some(e) => match e.evaluate(t, &model.curves) {
+                        Ok(p) => p,
+                        Err(err) => panic!("edge {arc_id} evaluate at t={t}: {err:?}"),
+                    },
+                    None => panic!("edge {arc_id} missing"),
+                }
+            })
+            .collect();
+
+        let circle = match Circle::new(Point3::new(0.0, 0.0, height), Vector3::Z, radius) {
+            Ok(c) => c,
+            Err(e) => panic!("full circle: {e:?}"),
+        };
+        let circle_id = model.curves.add(Box::new(circle));
+
+        let Some(edge) = model.edges.get_mut(arc_id) else {
+            panic!("edge {arc_id} missing")
+        };
+        edge.curve_id = circle_id;
+        edge.orientation = EdgeOrientation::Forward;
+        edge.param_range = ParameterRange::new(0.0, 0.25);
+        edge.invalidate_length_cache();
+
+        for (i, expected) in before.iter().enumerate() {
+            let t = i as f64 / 10.0;
+            let got = match model.edges.get(arc_id) {
+                Some(e) => match e.evaluate(t, &model.curves) {
+                    Ok(p) => p,
+                    Err(err) => panic!("re-expressed edge evaluate at t={t}: {err:?}"),
+                },
+                None => panic!("edge {arc_id} missing"),
+            };
+            assert!(
+                got.distance(expected) < 1e-12,
+                "the re-expressed edge must trace the SAME points: at t={t} it \
+                 gives {got:?}, the original gave {expected:?}"
+            );
+        }
+
+        (0.0, std::f64::consts::FRAC_PI_2)
+    }
+
+    /// Angle of `p` about the +Z axis, normalised to `[0, 2π)`.
+    fn polar_angle(p: &Point3) -> f64 {
+        let a = p.y.atan2(p.x);
+        if a < 0.0 {
+            a + std::f64::consts::TAU
+        } else {
+            a
+        }
+    }
+
+    /// **The offset trails must stay inside the edge's parameter range.**
+    ///
+    /// `compute_chamfer_offsets` samples `t = i/n` and used to hand that
+    /// straight to the edge's CURVE. For an edge that is its own curve over
+    /// `[0, 1]` those agree; for a rim arc trimmed out of a full `Circle` by a
+    /// boolean — the ordinary case — `t` walks the WHOLE circle and the
+    /// chamfer is built for material the edge does not span.
+    ///
+    /// The fixture is the pie slice whose top arc has been re-expressed as
+    /// `param_range = [0, 0.25]` on a full circle. Same solid, same points,
+    /// same faces; only the parameterisation differs, and the chamfer must not
+    /// notice.
+    #[test]
+    fn chamfer_offsets_stay_inside_the_edges_parameter_range() {
+        const R: f64 = 10.0;
+        const H: f64 = 20.0;
+
+        let mut model = BRepModel::new();
+        let (solid, arc) = pie_slice_with_top_arc(&mut model);
+
+        // The reference answer, from the edge that IS its own curve.
+        let (face1, face2) = match get_adjacent_faces(&model, solid, arc) {
+            Ok(f) => f,
+            Err(e) => panic!("adjacent faces of the top arc: {e:?}"),
+        };
+        let arc_edge = match model.edges.get(arc) {
+            Some(e) => e.clone(),
+            None => panic!("top arc edge"),
+        };
+        let reference =
+            match compute_chamfer_offsets(&model, &arc_edge, arc, face1, face2, 1.0, 1.0, None) {
+                Ok(d) => d,
+                Err(e) => panic!("the arc-carried edge must offset cleanly: {e:?}"),
+            };
+
+        let (span_start, span_end) = retarget_top_arc_onto_a_full_circle(&mut model, arc, H, R);
+        let trimmed = match model.edges.get(arc) {
+            Some(e) => e.clone(),
+            None => panic!("top arc edge"),
+        };
+        assert!(
+            model
+                .curves
+                .get(trimmed.curve_id)
+                .is_some_and(|c| c.type_name() == "Circle"),
+            "precondition: the target must now be carried by a FULL circle"
+        );
+        assert!(
+            trimmed.param_range.start < trimmed.param_range.end,
+            "precondition: a non-wrapping sub-range; got [{}, {}]",
+            trimmed.param_range.start,
+            trimmed.param_range.end
+        );
+
+        let data =
+            match compute_chamfer_offsets(&model, &trimmed, arc, face1, face2, 1.0, 1.0, None) {
+                Ok(d) => d,
+                Err(e) => panic!(
+                    "the SAME edge, re-expressed as a sub-range of its circle, must \
+                     offset the same way; got {e:?}"
+                ),
+            };
+
+        // 1. Every sample of both trails lies inside the edge's angular span.
+        let tol = 1e-9;
+        for (side, points) in [(1, &data.offset_points1), (2, &data.offset_points2)] {
+            for (i, p) in points.iter().enumerate() {
+                let a = polar_angle(p);
+                assert!(
+                    a >= span_start - tol && a <= span_end + tol,
+                    "offset trail {side} sample {i} sits at {a:.4} rad, outside the \
+                     edge's span [{span_start:.4}, {span_end:.4}] rad. The edge spans \
+                     a QUARTER of its circle; sampling the curve over [0, 1] walks \
+                     all four."
+                );
+            }
+        }
+
+        // 2. Same count, and the same points, as the arc-carried edge: a
+        //    re-parameterisation is not allowed to move the chamfer at all.
+        assert_eq!(
+            data.offset_points1.len(),
+            reference.offset_points1.len(),
+            "re-expressing the edge must not change the sample count"
+        );
+        for (i, (got, want)) in data
+            .offset_points1
+            .iter()
+            .zip(reference.offset_points1.iter())
+            .enumerate()
+        {
+            assert!(
+                got.distance(want) < 1e-9,
+                "offset trail 1 sample {i}: {got:?} from the circle-carried edge, \
+                 {want:?} from the arc-carried one"
+            );
+        }
+        for (i, (got, want)) in data
+            .offset_points2
+            .iter()
+            .zip(reference.offset_points2.iter())
+            .enumerate()
+        {
+            assert!(
+                got.distance(want) < 1e-9,
+                "offset trail 2 sample {i}: {got:?} from the circle-carried edge, \
+                 {want:?} from the arc-carried one"
+            );
+        }
+    }
+
+    /// **The two sibling edge-walkers must read the EDGE, not its carrier.**
+    ///
+    /// `unit_dir_from_vertex` took `curve.tangent_at(0.0 / 1.0)` and
+    /// `compute_face_angle` took `curve.point_at(0.5)`. Neither is
+    /// `i as f64 / n`-shaped, so neither turned up in the sampling grep, but
+    /// both are the same defect: on an edge that is a strict sub-range of its
+    /// curve they read a parameter the edge does not contain. Here the
+    /// re-expressed quarter's `t = 1` end sits at circle parameter 0.25 while
+    /// the carrier's own `t = 1` is a full turn away, back at the start point,
+    /// and its midpoint is diametrically opposite the arc.
+    ///
+    /// The arc-carried edge supplies the reference answers, so nothing here is
+    /// a hand-computed expectation - except the two that are, and those are
+    /// stated as geometry: the into-edge direction at a CCW quarter's far end
+    /// is `+x`, and a convex 90 degree cap/wall edge has an interior angle of
+    /// `pi/2`.
+    #[test]
+    fn sibling_edge_walkers_read_the_edges_own_parameter_range() {
+        const R: f64 = 10.0;
+        const H: f64 = 20.0;
+
+        let mut model = BRepModel::new();
+        let (solid, arc) = pie_slice_with_top_arc(&mut model);
+        let edge = match model.edges.get(arc) {
+            Some(e) => e.clone(),
+            None => panic!("top arc edge"),
+        };
+        let (face1, face2) = match get_adjacent_faces(&model, solid, arc) {
+            Ok(f) => f,
+            Err(e) => panic!("adjacent faces of the top arc: {e:?}"),
+        };
+
+        let dir_start_ref = match unit_dir_from_vertex(&model, arc, edge.start_vertex) {
+            Ok(d) => d,
+            Err(e) => panic!("into-edge direction at the start vertex: {e:?}"),
+        };
+        let dir_end_ref = match unit_dir_from_vertex(&model, arc, edge.end_vertex) {
+            Ok(d) => d,
+            Err(e) => panic!("into-edge direction at the end vertex: {e:?}"),
+        };
+        let angle_ref = match compute_face_angle(&model, arc, face1, face2) {
+            Ok(a) => a,
+            Err(e) => panic!("face angle of the arc-carried edge: {e:?}"),
+        };
+
+        // The reference answers are the geometry, not just each other: the
+        // quarter runs counter-clockwise from (R, 0) to (0, R), so walking INTO
+        // it from its far end heads towards +x.
+        assert!(
+            (dir_end_ref - Vector3::new(1.0, 0.0, 0.0)).magnitude() < 1e-9,
+            "into-edge direction at the quarter's far end must be +x; got {dir_end_ref:?}"
+        );
+        assert!(
+            (angle_ref - std::f64::consts::FRAC_PI_2).abs() < 1e-9,
+            "a convex 90 degree cap/wall edge has interior angle pi/2; got {angle_ref}"
+        );
+
+        let _ = retarget_top_arc_onto_a_full_circle(&mut model, arc, H, R);
+
+        let dir_start = match unit_dir_from_vertex(&model, arc, edge.start_vertex) {
+            Ok(d) => d,
+            Err(e) => panic!("into-edge direction at the start vertex: {e:?}"),
+        };
+        let dir_end = match unit_dir_from_vertex(&model, arc, edge.end_vertex) {
+            Ok(d) => d,
+            Err(e) => panic!("into-edge direction at the end vertex: {e:?}"),
+        };
+        let angle = match compute_face_angle(&model, arc, face1, face2) {
+            Ok(a) => a,
+            Err(e) => panic!("face angle of the circle-carried edge: {e:?}"),
+        };
+
+        assert!(
+            (dir_start - dir_start_ref).magnitude() < 1e-9,
+            "into-edge direction at the START vertex must not depend on how the \
+             edge is parameterised: {dir_start:?} from the circle-carried edge, \
+             {dir_start_ref:?} from the arc-carried one"
+        );
+        assert!(
+            (dir_end - dir_end_ref).magnitude() < 1e-9,
+            "into-edge direction at the END vertex must not depend on how the \
+             edge is parameterised: {dir_end:?} from the circle-carried edge, \
+             {dir_end_ref:?} from the arc-carried one. The carrier's t = 1 is a \
+             full turn on from the edge's own end."
+        );
+        assert!(
+            (angle - angle_ref).abs() < 1e-9,
+            "the dihedral must be measured at the EDGE's midpoint: {angle} from \
+             the circle-carried edge, {angle_ref} from the arc-carried one"
+        );
+    }
+
+    /// **The two vertex-tangent helpers must read the SAME end of the edge.**
+    ///
+    /// `unit_dir_from_vertex` and `edge_tangent_at_vertex` sit thirty lines
+    /// apart and answer the same question in different words: what does the
+    /// curve do at this edge's vertex. `edge_tangent_at_vertex` mapped
+    /// `start_vertex` to `param_range.start`, which is only the start of the
+    /// WALK on a `Forward` edge - a `Backward` edge begins at
+    /// `param_range.end`. Its trailing `* -1.0` corrects the direction and
+    /// never the evaluation point, so on a curved sub-range it reported the
+    /// tangent at the far end of the arc.
+    ///
+    /// The fixture is the smallest thing that can tell the difference: one
+    /// `Backward` edge over `[0, 0.25]` of a full circle, running from the
+    /// 90-degree point to the 0-degree point. The two ends have PERPENDICULAR
+    /// tangents (+/-x at 90 degrees, +/-y at 0 degrees), so reading the wrong
+    /// end is not a sign error that a dot product can absorb - it is a right
+    /// angle. The fixture verifies its own traversal before asserting
+    /// anything.
+    #[test]
+    fn the_vertex_tangent_helpers_read_the_same_end_of_a_backward_edge() {
+        use crate::primitives::curve::{Circle, ParameterRange};
+
+        const R: f64 = 10.0;
+
+        let mut model = BRepModel::new();
+        let circle = match Circle::new(Point3::ORIGIN, Vector3::Z, R) {
+            Ok(c) => c,
+            Err(e) => panic!("full circle: {e:?}"),
+        };
+        let circle_id = model.curves.add(Box::new(circle));
+
+        // t = 0 is the 90-degree point, t = 1 the 0-degree point: with
+        // `Backward`, `edge_to_curve_parameter(t)` = `denormalize(1 - t)` =
+        // `0.25 * (1 - t)`.
+        let v90 = model.vertices.add(0.0, R, 0.0);
+        let v0 = model.vertices.add(R, 0.0, 0.0);
+        let eid = model.edges.add(Edge::new(
+            0,
+            v90,
+            v0,
+            circle_id,
+            EdgeOrientation::Backward,
+            ParameterRange::new(0.0, 0.25),
+        ));
+        let edge = match model.edges.get(eid) {
+            Some(e) => e.clone(),
+            None => panic!("edge {eid}"),
+        };
+
+        // The fixture verifies its own traversal: t = 0 must BE the start
+        // vertex and t = 1 the end vertex, or the assertions below would be
+        // measuring a differently-shaped edge.
+        for (t, want) in [
+            (0.0, Point3::new(0.0, R, 0.0)),
+            (1.0, Point3::new(R, 0.0, 0.0)),
+        ] {
+            let got = match edge.evaluate(t, &model.curves) {
+                Ok(p) => p,
+                Err(e) => panic!("edge evaluate at t={t}: {e:?}"),
+            };
+            assert!(
+                got.distance(&want) < 1e-12,
+                "precondition: the edge must run from its start vertex at t = 0 to \
+                 its end vertex at t = 1; at t={t} it gives {got:?}, wanted {want:?}"
+            );
+        }
+
+        for (label, v) in [("start", edge.start_vertex), ("end", edge.end_vertex)] {
+            let walk = match edge_tangent_at_vertex(&model, &edge, v) {
+                Some(t) => t,
+                None => panic!("edge_tangent_at_vertex at the {label} vertex"),
+            };
+            let into = match unit_dir_from_vertex(&model, eid, v) {
+                Ok(d) => d,
+                Err(e) => panic!("unit_dir_from_vertex at the {label} vertex: {e:?}"),
+            };
+            let cos = match (walk.normalize(), into.normalize()) {
+                (Ok(a), Ok(b)) => a.dot(&b),
+                _ => panic!("degenerate tangent at the {label} vertex"),
+            };
+            assert!(
+                cos.abs() > 1.0 - 1e-9,
+                "the two helpers must evaluate at the SAME end of the edge: at the \
+                 {label} vertex `edge_tangent_at_vertex` gives {walk:?} and \
+                 `unit_dir_from_vertex` gives {into:?}, which stand at cos = {cos} \
+                 to each other. This edge's two ends have perpendicular tangents, \
+                 so a cos near zero means one of them read the wrong end."
+            );
+        }
+
+        // And the values themselves, as geometry: walking this edge means
+        // leaving the 90-degree point towards +x and arriving at the
+        // 0-degree point travelling towards -y.
+        let walk_start = match edge_tangent_at_vertex(&model, &edge, edge.start_vertex) {
+            Some(t) => t,
+            None => panic!("walk tangent at the start vertex"),
+        };
+        let walk_end = match edge_tangent_at_vertex(&model, &edge, edge.end_vertex) {
+            Some(t) => t,
+            None => panic!("walk tangent at the end vertex"),
+        };
+        assert!(
+            (walk_start - Vector3::new(1.0, 0.0, 0.0)).magnitude() < 1e-9,
+            "the walk direction at the 90-degree end is +x; got {walk_start:?}"
+        );
+        assert!(
+            (walk_end - Vector3::new(0.0, -1.0, 0.0)).magnitude() < 1e-9,
+            "the walk direction at the 0-degree end is -y; got {walk_end:?}"
+        );
     }
 
     // -------------------------------------------------------------------

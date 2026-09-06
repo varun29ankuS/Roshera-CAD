@@ -162,13 +162,13 @@ pub(crate) fn plan_fillet_crossings(
         return Ok(Vec::new());
     }
 
-    // Curve-parameter → vertex mapping respects `Edge::orientation`,
-    // mirroring the miter-override convention in `compute_chamfer_offsets`.
-    let (v_at_t0, v_at_t1) = if edge.orientation.is_forward() {
-        (edge.start_vertex, edge.end_vertex)
-    } else {
-        (edge.end_vertex, edge.start_vertex)
-    };
+    // `offsets1[0]` / `offsets2[0]` are the EDGE's parameter t = 0, which is its
+    // `start_vertex` by definition: `compute_chamfer_offsets` fills the trails
+    // through `Edge::edge_to_curve_parameter`, which has already absorbed
+    // `Edge::orientation`. Re-applying the orientation here would swap the two
+    // endpoints on a `Backward` edge, and `create_chamfer_face` pairs
+    // `offset_points*[0]` with `edge.start_vertex` unconditionally.
+    let (v_at_t0, v_at_t1) = (edge.start_vertex, edge.end_vertex);
 
     let mut plans = Vec::new();
     for (v, at_t1_end) in [(v_at_t0, false), (v_at_t1, true)] {

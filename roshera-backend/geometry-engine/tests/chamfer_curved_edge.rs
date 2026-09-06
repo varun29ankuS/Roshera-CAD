@@ -22,12 +22,16 @@
 //! properties are load-bearing, each established by measuring the pre-fix
 //! kernel against the alternatives:
 //!
-//! * **The arc is its own curve over `[0, 1]`.** `compute_chamfer_offsets`
-//!   samples `t = i/10` on the EDGE'S CURVE without consulting
-//!   `Edge::param_range`, so a boolean-trimmed rim arc (a sub-range of a full
-//!   `Circle`) would have its offsets computed all the way round the circle —
-//!   a separate, deeper defect that would mask this one. An extruded profile
-//!   arc carries its own trimmed curve, so the sampling is honest here.
+//! * **The arc is its own curve over `[0, 1]`.** When this file was written,
+//!   `compute_chamfer_offsets` sampled `t = i/10` on the EDGE'S CURVE without
+//!   consulting `Edge::param_range`, so a boolean-trimmed rim arc (a sub-range
+//!   of a full `Circle`) had its offsets computed all the way round the circle
+//!   — a separate, deeper defect that would have masked this one. An extruded
+//!   profile arc carries its own trimmed curve, so the sampling was honest
+//!   here regardless. That defect is now closed, and
+//!   [`chamfer_of_a_boolean_trimmed_rim_arc_stays_within_its_parameter_range`]
+//!   below is the fixture it made impossible; this one stays as the control
+//!   that isolates the chord-rail finding from it.
 //! * **The arc meets its neighbours transversally** (at 90°, the radii). A
 //!   fillet-derived arc joins its neighbour TANGENTIALLY, and the neighbour
 //!   retrim then pushes a shared vertex off the third face's plane — again a
@@ -50,6 +54,12 @@
 //!   straight edge must come out of the fix with the same geometry it had
 //!   before: Line rails, an eleven-point degree-3 boundary fit, and the
 //!   analytic volume to the bit.
+//! * [`chamfer_of_a_boolean_trimmed_rim_arc_stays_within_its_parameter_range`]
+//!   — the same 90° sector, but cut out of a whole cylinder by two boolean
+//!   differences, so its rim is a strict sub-range of the cylinder's full
+//!   `Circle`. Before `compute_chamfer_offsets` honoured `Edge::param_range`
+//!   the offset trail went round the whole circle and closed on itself, and
+//!   the operation refused.
 
 use std::f64::consts::FRAC_PI_2;
 
@@ -540,5 +550,252 @@ fn box_edge_chamfer_leaves_the_straight_path_untouched() {
         "straight-edge chamfer volume moved: got {volume} (bits {:#018x}), \
          expected bits {EXPECTED_BITS:#018x}",
         volume.to_bits()
+    );
+}
+
+// ─── the boolean-derived rim arc ─────────────────────────────────────────────
+
+/// A quarter cylinder cut out of a whole one by two box differences, and its
+/// top rim arc.
+///
+/// This is the fixture Task 13 could not build. It is geometrically the pie
+/// slice above — r = 10, h = 20, a 90° sector — but it is *arrived at* the way
+/// a real part is: `create_cylinder_3d` then `Difference`. That changes one
+/// thing and one thing only, and it is the thing under test: the surviving rim
+/// edge is still carried by the cylinder's FULL `Circle` and spans a strict
+/// sub-range of it (`param_range` ≈ `[0.25, 0.5]`), where the extruded profile
+/// arc was its own curve over `[0, 1]`.
+///
+/// Two cuts, not one. A single box removes at most a half-plane's worth of the
+/// disc, and the half-disc cap that leaves is a TWO-edge loop, which
+/// `splice_face_along_edge` refuses ("blend surgery needs ≥3") — a pre-existing
+/// limitation, recorded in Task 13's concerns, that has nothing to do with
+/// parameter ranges and would mask this test. The second cut brings the cap
+/// loop to `arc + line + line`.
+///
+/// The first cut also removes the cylinder's seam at θ = 0, so the rim comes
+/// out as ONE open arc rather than two arcs meeting tangentially at a surviving
+/// seam vertex — the other pre-existing limitation Task 13 named.
+fn quarter_cylinder_by_difference(model: &mut BRepModel) -> (SolidId, EdgeId) {
+    use geometry_engine::math::Matrix4;
+    use geometry_engine::operations::{
+        boolean_operation, transform_solid, BooleanOp, BooleanOptions, TransformOptions,
+    };
+
+    let cyl = match TopologyBuilder::new(model)
+        .create_cylinder_3d(Point3::ORIGIN, Vector3::Z, SLICE_R, SLICE_H)
+        .expect("create_cylinder_3d")
+    {
+        GeometryId::Solid(id) => id,
+        other => panic!("expected solid, got {other:?}"),
+    };
+
+    //  splits each rim into three arcs, at 0deg, 120deg and
+    // 240deg. Left alone, the [90deg, 180deg] sector below would inherit the
+    // 120deg split and come out as TWO rim arcs meeting at a degree-2 vertex —
+    // a tangential neighbour with no third face, which is a different
+    // pre-existing limitation (Task 13, concern 2) and would mask this one.
+    // Spinning the cylinder 50deg first moves the splits to -50deg, 70deg and
+    // 190deg, all outside the surviving sector, so one arc survives whole.
+    transform_solid(
+        model,
+        cyl,
+        Matrix4::rotation_z(-50.0_f64.to_radians()),
+        TransformOptions::default(),
+    )
+    .expect("spin the cylinder off its rim splits");
+
+    // Cut 1 — everything with x > 0 (takes the seam at θ = 0 with it).
+    let cut_x = make_box(model, 40.0, 60.0, SLICE_H + 10.0);
+    transform_solid(
+        model,
+        cut_x,
+        Matrix4::from_translation(&Vector3::new(20.0, 0.0, 0.5 * SLICE_H)),
+        TransformOptions::default(),
+    )
+    .expect("translate the +x cutter");
+    let half = boolean_operation(
+        model,
+        cyl,
+        cut_x,
+        BooleanOp::Difference,
+        BooleanOptions::default(),
+    )
+    .expect("difference away the +x half");
+
+    // Cut 2 — everything with y < 0. What survives is the θ ∈ [90°, 180°]
+    // quarter.
+    let cut_y = make_box(model, 60.0, 40.0, SLICE_H + 10.0);
+    transform_solid(
+        model,
+        cut_y,
+        Matrix4::from_translation(&Vector3::new(0.0, -20.0, 0.5 * SLICE_H)),
+        TransformOptions::default(),
+    )
+    .expect("translate the -y cutter");
+    let quarter = boolean_operation(
+        model,
+        half,
+        cut_y,
+        BooleanOp::Difference,
+        BooleanOptions::default(),
+    )
+    .expect("difference away the -y half");
+
+    // The top rim: the one non-straight edge of the quarter with both ends at
+    // z = SLICE_H.
+    let mut found: Vec<EdgeId> = Vec::new();
+    for eid in solid_edges(model, quarter) {
+        let Some(edge) = model.edges.get(eid) else {
+            continue;
+        };
+        if edge.is_loop() {
+            continue;
+        }
+        let (Some(v0), Some(v1)) = (
+            model.vertices.get(edge.start_vertex),
+            model.vertices.get(edge.end_vertex),
+        ) else {
+            continue;
+        };
+        if (v0.position[2] - SLICE_H).abs() > 1e-9 || (v1.position[2] - SLICE_H).abs() > 1e-9 {
+            continue;
+        }
+        if model
+            .curves
+            .get(edge.curve_id)
+            .is_some_and(|c| c.type_name() != "Line")
+        {
+            found.push(eid);
+        }
+    }
+    assert_eq!(
+        found.len(),
+        1,
+        "the quarter cylinder must expose exactly one curved top rim edge; got {found:?}"
+    );
+    (quarter, found[0])
+}
+
+/// Angle of `p` about the +Z axis, normalised to `[0, 2π)`.
+fn polar_angle(p: &Point3) -> f64 {
+    let a = p.y.atan2(p.x);
+    if a < 0.0 {
+        a + std::f64::consts::TAU
+    } else {
+        a
+    }
+}
+
+/// **A boolean-trimmed rim arc chamfers over its own parameter range.**
+///
+/// `compute_chamfer_offsets` sampled `t = i/n` on the edge's CURVE. On this
+/// fixture that curve is the cylinder's whole circle while the edge is a
+/// quarter of it, so every offset trail was computed all the way round —
+/// through material the solid does not have, past two faces that do not exist
+/// there. The chamfer face built from those samples belongs to an edge nobody
+/// asked about.
+///
+/// Three things are asserted, in increasing strength:
+///
+/// 1. the fixture really is the defect's shape (a `Circle`-carried edge over a
+///    strict sub-range);
+/// 2. the chamfer succeeds under production defaults and certifies sound;
+/// 3. every point of the minted bevel's boundary lies inside the ARC's angular
+///    span. That last one is the finding itself: a chamfer built off the whole
+///    circle puts boundary points at angles the edge never reaches.
+#[test]
+fn chamfer_of_a_boolean_trimmed_rim_arc_stays_within_its_parameter_range() {
+    let mut model = BRepModel::new();
+    let (solid, rim) = quarter_cylinder_by_difference(&mut model);
+
+    // --- 1. the fixture is the defect's shape ---
+    let edge = model.edges.get(rim).expect("rim edge").clone();
+    assert_eq!(
+        model
+            .curves
+            .get(edge.curve_id)
+            .expect("rim curve")
+            .type_name(),
+        "Circle",
+        "precondition: a boolean-trimmed rim is carried by the cylinder's FULL \
+         circle, which is what makes the parameter range load-bearing"
+    );
+    let (r0, r1) = (edge.param_range.start, edge.param_range.end);
+    assert!(
+        r0 < r1 && (r1 - r0) < 0.99,
+        "precondition: the rim must span a strict, non-wrapping SUB-range of its \
+         circle; got [{r0}, {r1}]"
+    );
+
+    // The arc's own angular span, measured from the edge, not assumed.
+    let ends: Vec<Point3> = (0..=1)
+        .map(|i| {
+            edge.evaluate(i as f64, &model.curves)
+                .expect("rim endpoint")
+        })
+        .collect();
+    let (mut span_lo, mut span_hi) = (polar_angle(&ends[0]), polar_angle(&ends[1]));
+    if span_lo > span_hi {
+        std::mem::swap(&mut span_lo, &mut span_hi);
+    }
+    assert!(
+        (span_hi - span_lo - FRAC_PI_2).abs() < 1e-6,
+        "the two box cuts must leave a 90° rim arc; measured {} rad from {span_lo} \
+         to {span_hi}",
+        span_hi - span_lo
+    );
+
+    // --- 2. the chamfer succeeds and certifies ---
+    let faces = chamfer_edges(&mut model, solid, vec![rim], chamfer_opts(SETBACK))
+        .expect("chamfering a boolean-trimmed rim arc must succeed under production defaults");
+    let bevel = faces[0];
+
+    let cert = model.certify_solid(solid);
+    assert!(
+        cert.is_sound(),
+        "the chamfered quarter cylinder must certify sound: watertight={} euler={} \
+         boundary_edges={} nonmanifold={} selfint_free={} brep_valid={} errors={:?}",
+        cert.watertight,
+        cert.euler_characteristic,
+        cert.boundary_edges,
+        cert.nonmanifold_edges,
+        cert.self_intersection_free,
+        cert.brep_valid,
+        cert.errors,
+    );
+
+    // --- 3. the bevel lives inside the arc's span ---
+    //
+    // Both offset directions are perpendicular to the rim: radially inward on
+    // the top cap, straight down on the wall. Neither turns about +Z, so every
+    // point of the bevel — its two trim curves and its two end caps — must
+    // stand at an angle the rim itself reaches.
+    let face = model.faces.get(bevel).expect("bevel face").clone();
+    let loop_ids: Vec<u32> = [face.outer_loop]
+        .into_iter()
+        .chain(face.inner_loops.iter().copied())
+        .collect();
+    let tol = 1e-6;
+    let mut checked = 0usize;
+    for lid in loop_ids {
+        let lp = model.loops.get(lid).expect("bevel loop").clone();
+        for eid in lp.edges {
+            for (i, p) in sample_edge(&model, eid, 24).iter().enumerate() {
+                let a = polar_angle(p);
+                assert!(
+                    a >= span_lo - tol && a <= span_hi + tol,
+                    "bevel boundary edge {eid} sample {i} at {p:?} stands at {a:.6} \
+                     rad, outside the rim arc's span [{span_lo:.6}, {span_hi:.6}]. \
+                     The chamfer was built for material the edge does not span."
+                );
+                checked += 1;
+            }
+        }
+    }
+    assert!(
+        checked >= 100,
+        "the residence sweep must actually sample the bevel's boundary; only \
+         {checked} points were checked"
     );
 }
