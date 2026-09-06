@@ -101,6 +101,361 @@ pub struct ConstraintDiagnosis {
     pub jacobian_rank: usize,
     /// Total number of residual rows analysed.
     pub jacobian_rows: usize,
+    /// Rank of the Jacobian at a GENERIC configuration -- the rank the
+    /// constraint system has almost everywhere, as opposed to
+    /// `jacobian_rank`, which is its rank at the configuration the
+    /// sketch is actually in.
+    ///
+    /// The two differ only when the current configuration is a
+    /// measure-zero special case of the system: a circle tangent to
+    /// the line whose distance pins it, a semicircular arc whose
+    /// radius is stationary in its own sagitta (`R = h/2 + c^2/(8h)`,
+    /// so `dR/dh = 1/2 - c^2/(8h^2)`, zero at `h = c/2`). At such a
+    /// point the linearisation loses rank while the shape stays
+    /// uniquely determined. Dependence is judged at generic position,
+    /// so a constraint that is dependent only at THIS configuration is
+    /// never reported redundant; `jacobian_rank < generic_rank` is
+    /// what says the configuration is singular.
+    pub generic_rank: usize,
+    /// Number of block-diagonal blocks the rank scan ran over.
+    ///
+    /// The Jacobian of a sketch with several disconnected constraint
+    /// components is block-diagonal: a constraint's residual depends
+    /// only on its own entities' parameters, so its central-difference
+    /// row is EXACTLY zero (`(e - e) / 2h`) in every column owned by a
+    /// foreign component. Orthogonalising a row against a basis vector
+    /// with disjoint support subtracts exactly nothing, so scanning the
+    /// blocks separately returns bit-for-bit the same independence
+    /// verdict as one whole-matrix scan while replacing an
+    /// `O(rows^2 * cols)` pass with the sum of the blocks' own.
+    ///
+    /// `1` means the sketch is one connected component (or that the
+    /// scan fell back to the whole matrix). Present so the block path
+    /// is observable: a regression to the whole-matrix scan changes
+    /// this number and nothing else.
+    pub jacobian_blocks: usize,
+    /// Per-block rank against parameter count, at the configuration
+    /// the verdict was taken at (generic when one was sampled).
+    /// `BlockRank::deficiency` is what decides whether a component is
+    /// fully constrained -- see [`BlockRank`].
+    pub block_ranks: Vec<BlockRank>,
+}
+
+impl ConstraintDiagnosis {
+    /// Does the constraint system lose rank at the sketch's own
+    /// configuration relative to a generic one?
+    ///
+    /// True means the shape may still be uniquely determined while the
+    /// first-order system is singular here -- the reading that matters
+    /// alongside a fully-constrained verdict.
+    pub fn singular_configuration(&self) -> bool {
+        self.generic_rank > self.jacobian_rank
+    }
+}
+
+/// One block of a block-diagonal Jacobian: the rows it owns and the
+/// columns those rows can be non-zero in. Rows and columns are both
+/// ascending, so a blocked scan visits rows in the same relative
+/// order a whole-matrix scan would.
+#[derive(Debug, Clone)]
+struct JacobianBlock {
+    rows: Vec<usize>,
+    cols: Vec<usize>,
+}
+
+/// Entity-to-component and component-to-constraint indices for one
+/// solver state, used to scope both differentiation and the rank scan.
+#[derive(Debug, Clone)]
+struct ComponentScopes {
+    entity_component: HashMap<EntityRef, usize>,
+    component_constraints: Vec<Vec<usize>>,
+}
+
+impl ComponentScopes {
+    /// The constraint indices whose residuals can move when one of
+    /// `entity`'s parameters moves.
+    fn scope_of(&self, entity: &EntityRef) -> Option<&[usize]> {
+        let index = self.entity_component.get(entity)?;
+        self.component_constraints.get(*index).map(|v| v.as_slice())
+    }
+}
+
+/// One block's rank against its own parameter count.
+///
+/// `columns - rank` is the block's DEFICIENCY: the number of
+/// directions in its parameters that no independent constraint row
+/// pins. It is the only honest reading of "is this component fully
+/// constrained": a system can carry redundant equations (more rows
+/// than parameters, some of them dependent) and still pin every
+/// parameter, and counting flagged constraints instead of measuring
+/// the deficiency mistakes the first for the second.
+#[derive(Debug, Clone)]
+pub struct BlockRank {
+    /// The constraints whose rows this block owns, first-seen order.
+    pub constraints: Vec<ConstraintId>,
+    /// Free parameters this block's rows can act on.
+    pub columns: usize,
+    /// Independent rows found among this block's rows.
+    pub rank: usize,
+}
+
+impl BlockRank {
+    /// Parameters this block leaves unpinned.
+    pub fn deficiency(&self) -> usize {
+        self.columns.saturating_sub(self.rank)
+    }
+}
+
+/// The result of one rank-revealing scan of a Jacobian.
+#[derive(Debug, Clone)]
+pub(crate) struct RankScan {
+    /// Per row: did it contribute a new direction to its block's basis?
+    pub row_independent: Vec<bool>,
+    /// Numerical rank -- the sum of the blocks' basis sizes.
+    pub rank: usize,
+    /// Rows scanned.
+    pub rows: usize,
+    /// The constraint that owned each scanned row, in the row order
+    /// the scan actually saw.
+    ///
+    /// Retained because a scan and its consumer can straddle a
+    /// `solve()`, and `solve()` sorts `self.constraints` by priority
+    /// IN PLACE. Re-deriving the owners afterwards pairs
+    /// `row_independent[i]` with whatever constraint occupies row `i`
+    /// in the NEW order -- which, on a mixed-priority sketch whose
+    /// constraints emit different row counts, is a different
+    /// constraint. That names the wrong constraint redundant, or
+    /// silently names none at all.
+    pub row_owners: Vec<ConstraintId>,
+    /// Per-block rank against parameter count.
+    pub block_ranks: Vec<BlockRank>,
+}
+
+impl RankScan {
+    /// Blocks scanned.
+    pub fn blocks(&self) -> usize {
+        self.block_ranks.len()
+    }
+}
+
+impl RankScan {
+    /// Is any row linearly dependent on the rows before it?
+    ///
+    /// `rank == rows` (NOT `rank == free DOFs`) is the question that
+    /// decides whether there is anything to classify: a point with two
+    /// `XCoordinate` constraints has 2 rows and rank 1, so it has a
+    /// dependent row even though its rank is also below its 2 free
+    /// DOFs; a fully dimensioned 300-constraint plate has 300 rows and
+    /// rank 300, so there is nothing to diagnose and no reason to pay
+    /// for a solve.
+    pub fn has_dependent_rows(&self) -> bool {
+        self.rank < self.rows
+    }
+}
+
+/// A rank scan at the sketch's configuration, plus (when the first
+/// scan found a dependent row) a scan at a generic configuration.
+///
+/// `generic` is `None` when every row was independent where the sketch
+/// stands: a full-rank system cannot gain rank under perturbation, so
+/// the generic rank equals the actual one and there is nothing to
+/// classify. Skipping the perturbation there is what keeps the common
+/// case cheap.
+#[derive(Debug, Clone)]
+pub(crate) struct RankProfile {
+    actual: RankScan,
+    /// The generic-position scan, when one was taken and usable.
+    ///
+    /// `None` covers two cases, and both are conservative in the same
+    /// direction: no perturbation was needed (the actual scan was
+    /// already full row rank), or every perturbation round produced a
+    /// non-finite Jacobian and was thrown away. Falling back to the
+    /// actual scan can only UNDER-report singularity -- it never
+    /// invents one -- and the fallback is visible in the result as
+    /// `generic_rank == jacobian_rank`.
+    generic: Option<RankScan>,
+}
+
+impl RankProfile {
+    /// The scan whose per-row flags decide dependence -- the generic
+    /// one when it was run, otherwise the actual one.
+    fn dependence(&self) -> &RankScan {
+        self.generic.as_ref().unwrap_or(&self.actual)
+    }
+
+    /// Rank at the sketch's own configuration.
+    pub fn actual_rank(&self) -> usize {
+        self.actual.rank
+    }
+
+    /// Rank at a generic configuration.
+    pub fn generic_rank(&self) -> usize {
+        self.generic.as_ref().map_or(self.actual.rank, |g| g.rank)
+    }
+
+    /// Is there a generically dependent row to classify? False means
+    /// `redundant` and `conflicts` are both empty whatever the
+    /// residuals say, so a caller need not solve to find out.
+    pub fn has_dependent_rows(&self) -> bool {
+        self.dependence().has_dependent_rows()
+    }
+}
+
+/// Restores a solver's free parameters to the values it captured, on
+/// drop.
+///
+/// The generic-position scan displaces every free parameter, builds a
+/// Jacobian and puts them back. Putting them back in a `Drop` rather
+/// than at the end of the function means an unwind between the two
+/// cannot leave the solver holding displaced geometry that a later
+/// call would silently read as the sketch's own.
+struct ParameterRestore<'a> {
+    solver: &'a ConstraintSolver,
+    saved: Vec<(EntityRef, usize, f64)>,
+}
+
+impl Drop for ParameterRestore<'_> {
+    fn drop(&mut self) {
+        for (entity, index, value) in &self.saved {
+            self.solver.perturb_parameter(entity, *index, *value);
+        }
+    }
+}
+
+/// SplitMix64 -- a deterministic, toolchain-independent bit mixer.
+/// Used to give every free parameter its own reproducible
+/// displacement; `DefaultHasher` is explicitly not stable across Rust
+/// releases and would make "deterministic" mean "until the next
+/// toolchain bump".
+fn splitmix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = x;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// The uuid behind an entity reference, folded to 64 bits.
+///
+/// Stable across processes and toolchains (`DefaultHasher` is neither),
+/// so the displacement a given parameter receives is reproducible for a
+/// PERSISTED sketch -- one whose entity uuids are loaded rather than
+/// minted. A sketch rebuilt from scratch mints fresh uuids and so draws
+/// a different generic point; that is harmless, because the rank at a
+/// generic point is the same at almost every generic point, and it is
+/// why the reproducibility claim is scoped to persisted ids rather than
+/// to "the same sketch".
+fn entity_seed(entity: &EntityRef) -> u64 {
+    let raw: u128 = match entity {
+        EntityRef::Point(id) => id.0.as_u128(),
+        EntityRef::Line(id) => id.0.as_u128(),
+        EntityRef::Arc(id) => id.0.as_u128(),
+        EntityRef::Circle(id) => id.0.as_u128(),
+        EntityRef::Rectangle(id) => id.0.as_u128(),
+        EntityRef::Ellipse(id) => id.0.as_u128(),
+        EntityRef::Spline(id) => id.0.as_u128(),
+        EntityRef::Polyline(id) => id.0.as_u128(),
+    };
+    ((raw >> 64) as u64) ^ (raw as u64)
+}
+
+/// Size of the generic-position displacement, as
+/// `GENERIC_PERTURBATION * (1 + |value|)`.
+///
+/// Large enough that a first-order-stationary derivative reappears
+/// well clear of the rank threshold (a semicircular cap of chord 10
+/// perturbed by 1e-3 has `dR/dh` of order 2e-4, six orders above the
+/// 1e-9 floor), small enough that no ordinary sketch is displaced into
+/// a different configuration.
+///
+/// The `1 +` makes it ABSOLUTE-FLOORED, not extent-scaled: a parameter
+/// at 0 still moves by 1e-3, and one at 1000 moves by ~1. It is scaled
+/// to the PARAMETER, never to the sketch's overall extent, so a sketch
+/// modelled in micrometres gets the same 1e-3 floor as one modelled in
+/// metres. That floor is what keeps the displaced derivative clear of
+/// finite-difference noise; if a future sketch works at a scale where
+/// 1e-3 is itself a large move, this constant is the knob.
+const GENERIC_PERTURBATION: f64 = 1e-3;
+
+/// Perturbation rounds attempted for the generic-position rank. Two
+/// independent draws, best rank wins: one draw is generic with
+/// probability one, but a second costs little and removes the
+/// possibility that a single unlucky draw understates the rank.
+const GENERIC_PERTURBATION_ROUNDS: u64 = 2;
+
+/// Run modified Gram-Schmidt over each block independently.
+///
+/// Splitting the scan is an identity, not an approximation -- see
+/// [`ConstraintDiagnosis::jacobian_blocks`]. Passing a single block
+/// covering every row and column reproduces the whole-matrix scan
+/// exactly, which is how the equivalence is tested.
+fn scan_blocks(
+    jacobian: &[Vec<f64>],
+    n_cols: usize,
+    blocks: &[JacobianBlock],
+    row_owners: &[ConstraintId],
+) -> RankScan {
+    let rows = jacobian.len();
+    let mut row_independent = vec![false; rows];
+    let mut rank = 0usize;
+    let mut block_ranks: Vec<BlockRank> = Vec::with_capacity(blocks.len());
+    for block in blocks {
+        let mut basis: Vec<Vec<f64>> = Vec::new();
+        let mut owners: Vec<ConstraintId> = Vec::new();
+        for &i in &block.rows {
+            if let Some(&owner) = row_owners.get(i) {
+                if !owners.contains(&owner) {
+                    owners.push(owner);
+                }
+            }
+            let Some(row) = jacobian.get(i) else {
+                continue;
+            };
+            if row.len() != n_cols {
+                // Defensive: jagged rows shouldn't happen because
+                // `compute_jacobian` allocates a uniform matrix, but
+                // we degrade gracefully rather than panic.
+                continue;
+            }
+            // Project out the span of the existing basis.
+            let mut residual: Vec<f64> = block.cols.iter().map(|&c| row[c]).collect();
+            for b in &basis {
+                let dot: f64 = residual.iter().zip(b.iter()).map(|(r, v)| r * v).sum();
+                for (rk, vk) in residual.iter_mut().zip(b.iter()) {
+                    *rk -= dot * vk;
+                }
+            }
+            let norm: f64 = residual.iter().map(|x| x * x).sum::<f64>().sqrt();
+            let row_norm: f64 = block
+                .cols
+                .iter()
+                .map(|&c| row[c] * row[c])
+                .sum::<f64>()
+                .sqrt();
+            let scale = row_norm.max(1.0);
+            if norm > STRICT_TOLERANCE.distance() * scale {
+                // Independent -- normalise and add to the basis.
+                for rk in residual.iter_mut() {
+                    *rk /= norm;
+                }
+                basis.push(residual);
+                row_independent[i] = true;
+            }
+        }
+        rank += basis.len();
+        block_ranks.push(BlockRank {
+            constraints: owners,
+            columns: block.cols.len(),
+            rank: basis.len(),
+        });
+    }
+    RankScan {
+        row_independent,
+        rank,
+        rows,
+        row_owners: row_owners.to_vec(),
+        block_ranks,
+    }
 }
 
 /// Structural participation diagnostics for the most recent
@@ -1524,14 +1879,7 @@ impl ConstraintSolver {
     fn count_degrees_of_freedom(&self) -> usize {
         self.entity_state
             .iter()
-            .map(|entry| {
-                entry
-                    .value()
-                    .fixed_mask
-                    .iter()
-                    .filter(|&&fixed| !fixed)
-                    .count()
-            })
+            .map(|entry| entry.value().free_param_count())
             .sum()
     }
 
@@ -2443,14 +2791,37 @@ impl ConstraintSolver {
 
     /// Compute Jacobian matrix
     fn compute_jacobian(&self) -> Vec<Vec<f64>> {
-        let num_errors = self
-            .constraints
-            .iter()
-            .map(|c| self.constraint_error_count(c))
-            .sum();
-        let num_params = self.count_degrees_of_freedom();
+        self.jacobian_with_columns().0
+    }
 
-        let mut jacobian = vec![vec![0.0; num_params]; num_errors];
+    /// The numerical Jacobian plus, per column, the entity that owns
+    /// the free parameter that column differentiates against.
+    ///
+    /// The column map is what makes the block-diagonal rank scan
+    /// possible: a block's columns are exactly the columns owned by
+    /// its component's entities.
+    ///
+    /// Differentiation is SCOPED. Perturbing one parameter can only
+    /// move the residuals of constraints in that parameter's own
+    /// connected component -- every other constraint reads none of the
+    /// perturbed entity's state, so its central difference is exactly
+    /// `(e - e) / 2h = 0`. Evaluating only the component's constraints
+    /// therefore writes the same matrix while replacing
+    /// `params x rows` residual evaluations with the sum of the
+    /// components' own. The scoped path is taken only when every
+    /// evaluator returns exactly the residual count
+    /// `constraint_error_count` declares for it; when any constraint
+    /// disagrees the row layout below is not the one
+    /// `compute_constraint_errors` produces, so the whole-system path
+    /// runs instead and the matrix stays byte-identical to what it
+    /// always was.
+    fn jacobian_with_columns(&self) -> (Vec<Vec<f64>>, Vec<EntityRef>) {
+        let mut row_start: Vec<usize> = Vec::with_capacity(self.constraints.len());
+        let mut num_errors = 0usize;
+        for c in &self.constraints {
+            row_start.push(num_errors);
+            num_errors += self.constraint_error_count(c);
+        }
 
         // Numerical differentiation for now
         let h = 1e-8;
@@ -2461,32 +2832,169 @@ impl ConstraintSolver {
         // same shard would deadlock; this two-pass split is the safe pattern.
         let mut free_params: Vec<(EntityRef, usize, f64)> = Vec::new();
         for entry in self.entity_state.iter() {
-            let entity = entry.key();
-            let state = entry.value();
-            for (i, &fixed) in state.fixed_mask.iter().enumerate() {
-                if !fixed {
-                    free_params.push((entity.clone(), i, state.parameters[i]));
+            let entity = *entry.key();
+            for (i, value) in entry.value().free_params() {
+                free_params.push((entity, i, value));
+            }
+        }
+        let num_params = free_params.len();
+        let column_owner: Vec<EntityRef> = free_params.iter().map(|(e, _, _)| *e).collect();
+        let mut jacobian = vec![vec![0.0; num_params]; num_errors];
+
+        let scopes = self.differentiation_scopes();
+
+        for (param_index, (entity, i, original)) in free_params.iter().enumerate() {
+            let scope: &[usize] = match scopes.as_ref().and_then(|s| s.scope_of(entity)) {
+                Some(indices) => indices,
+                None => {
+                    // Whole-system fallback: identical to the
+                    // pre-scoping behaviour.
+                    self.perturb_parameter(entity, *i, original + h);
+                    let errors_plus = self.compute_constraint_errors();
+                    self.perturb_parameter(entity, *i, original - h);
+                    let errors_minus = self.compute_constraint_errors();
+                    self.perturb_parameter(entity, *i, *original);
+                    for (j, (ep, em)) in errors_plus.iter().zip(errors_minus.iter()).enumerate() {
+                        if let Some(cell) = jacobian.get_mut(j).and_then(|r| r.get_mut(param_index))
+                        {
+                            *cell = (ep - em) / (2.0 * h);
+                        }
+                    }
+                    continue;
+                }
+            };
+
+            self.perturb_parameter(entity, *i, original + h);
+            let plus: Vec<Vec<f64>> = scope
+                .iter()
+                .filter_map(|&k| self.constraints.get(k))
+                .map(|c| self.evaluate_constraint_error(c))
+                .collect();
+            self.perturb_parameter(entity, *i, original - h);
+            let minus: Vec<Vec<f64>> = scope
+                .iter()
+                .filter_map(|&k| self.constraints.get(k))
+                .map(|c| self.evaluate_constraint_error(c))
+                .collect();
+            self.perturb_parameter(entity, *i, *original);
+
+            for (n, &k) in scope.iter().enumerate() {
+                let (Some(base), Some(ep_rows), Some(em_rows)) =
+                    (row_start.get(k), plus.get(n), minus.get(n))
+                else {
+                    continue;
+                };
+                for (j, (ep, em)) in ep_rows.iter().zip(em_rows.iter()).enumerate() {
+                    if let Some(cell) = jacobian
+                        .get_mut(base + j)
+                        .and_then(|r| r.get_mut(param_index))
+                    {
+                        *cell = (ep - em) / (2.0 * h);
+                    }
                 }
             }
         }
 
-        for (param_index, (entity, i, original)) in free_params.into_iter().enumerate() {
-            // Central difference
-            self.perturb_parameter(&entity, i, original + h);
-            let errors_plus = self.compute_constraint_errors();
+        (jacobian, column_owner)
+    }
 
-            self.perturb_parameter(&entity, i, original - h);
-            let errors_minus = self.compute_constraint_errors();
-
-            // Restore original
-            self.perturb_parameter(&entity, i, original);
-
-            for (j, (ep, em)) in errors_plus.iter().zip(errors_minus.iter()).enumerate() {
-                jacobian[j][param_index] = (ep - em) / (2.0 * h);
+    /// Group entities and constraints into connected components, or
+    /// `None` when the grouping cannot be trusted to describe the
+    /// Jacobian's sparsity.
+    ///
+    /// `None` is returned when any evaluator's residual count differs
+    /// from the `constraint_error_count` the row layout is built from
+    /// -- the callers then fall back to the whole-system path rather
+    /// than write rows at positions the flat error vector does not use.
+    fn differentiation_scopes(&self) -> Option<ComponentScopes> {
+        for c in &self.constraints {
+            if self.evaluate_constraint_error(c).len() != self.constraint_error_count(c) {
+                return None;
             }
         }
+        let components = self.split_components();
+        let mut entity_component: HashMap<EntityRef, usize> = HashMap::new();
+        let mut component_constraints: Vec<Vec<usize>> = vec![Vec::new(); components.len()];
+        for (index, component) in components.iter().enumerate() {
+            for e in &component.entities {
+                entity_component.insert(*e, index);
+            }
+            if let Some(slot) = component_constraints.get_mut(index) {
+                slot.extend(component.constraint_indices.iter().copied());
+            }
+        }
+        // Every constraint must land in exactly one component; if the
+        // decomposition ever leaves one out, the whole-system path is
+        // the honest answer.
+        let placed: usize = component_constraints.iter().map(|c| c.len()).sum();
+        if placed != self.constraints.len() {
+            return None;
+        }
+        Some(ComponentScopes {
+            entity_component,
+            component_constraints,
+        })
+    }
 
-        jacobian
+    /// Build the block-diagonal partition of the Jacobian: one block
+    /// per CONSTRAINED connected component, owning that component's
+    /// residual rows and its entities' parameter columns.
+    ///
+    /// A component with entities but no constraints owns no rows and
+    /// therefore no block -- the block count is the number of
+    /// constraint-bearing components, not the number of components.
+    /// Falls back to a single whole-matrix block whenever the partition
+    /// cannot be built.
+    fn structural_blocks(
+        &self,
+        scopes: &ComponentScopes,
+        column_owner: &[EntityRef],
+        num_errors: usize,
+    ) -> Vec<JacobianBlock> {
+        let count = scopes.component_constraints.len();
+        let mut rows: Vec<Vec<usize>> = vec![Vec::new(); count];
+        let mut constraint_component: Vec<Option<usize>> = vec![None; self.constraints.len()];
+        for (index, indices) in scopes.component_constraints.iter().enumerate() {
+            for &k in indices {
+                if let Some(slot) = constraint_component.get_mut(k) {
+                    *slot = Some(index);
+                }
+            }
+        }
+        let mut row = 0usize;
+        for (k, c) in self.constraints.iter().enumerate() {
+            let n = self.constraint_error_count(c);
+            let Some(Some(index)) = constraint_component.get(k).copied() else {
+                return vec![Self::whole_matrix_block(num_errors, column_owner.len())];
+            };
+            for _ in 0..n {
+                if let Some(slot) = rows.get_mut(index) {
+                    slot.push(row);
+                }
+                row += 1;
+            }
+        }
+        let mut cols: Vec<Vec<usize>> = vec![Vec::new(); count];
+        for (j, owner) in column_owner.iter().enumerate() {
+            let Some(&index) = scopes.entity_component.get(owner) else {
+                return vec![Self::whole_matrix_block(num_errors, column_owner.len())];
+            };
+            if let Some(slot) = cols.get_mut(index) {
+                slot.push(j);
+            }
+        }
+        rows.into_iter()
+            .zip(cols)
+            .filter(|(r, _)| !r.is_empty())
+            .map(|(rows, cols)| JacobianBlock { rows, cols })
+            .collect()
+    }
+
+    fn whole_matrix_block(num_errors: usize, num_params: usize) -> JacobianBlock {
+        JacobianBlock {
+            rows: (0..num_errors).collect(),
+            cols: (0..num_params).collect(),
+        }
     }
 
     /// Perturb a parameter for numerical differentiation
@@ -2531,89 +3039,208 @@ impl ConstraintSolver {
     ///    - residual ≤ `self.tolerance` → `redundant`
     ///    - residual >  `self.tolerance` → `conflicts`
     ///
-    /// Does **not** mutate solver parameters; calls
-    /// `compute_constraint_errors` after the Gram-Schmidt pass so the
-    /// residual classification reflects the *current* parameter
+    /// Leaves solver parameters as it found them, but does TRANSIENTLY
+    /// write them: when the first scan finds a dependent row, the
+    /// generic-position pass displaces every free parameter, ranks, and
+    /// restores. The restore is an RAII guard
+    /// ([`ParameterRestore`]), so it also runs if the scan unwinds.
+    /// The consequence for callers is that this method is NOT
+    /// re-entrant against a concurrent reader of the same solver's
+    /// `entity_state`: a reader observing mid-scan sees displaced
+    /// geometry. Every caller in this crate owns a private diagnostic
+    /// solver built for the call, so none is exposed.
+    ///
+    /// Calls `compute_constraint_errors` after the Gram-Schmidt pass so
+    /// the residual classification reflects the *current* parameter
     /// state. Callers that want the residuals to reflect a converged
     /// solution should run `solve()` before `diagnose()`.
     pub fn diagnose(&self) -> ConstraintDiagnosis {
-        let jacobian = self.compute_jacobian();
-        let row_owners = self.jacobian_row_owners();
+        let profile = self.rank_profile();
+        self.diagnose_from(&profile)
+    }
+
+    /// Rank the constraint system at the sketch's own configuration
+    /// and, when that scan finds a dependent row, again at a generic
+    /// configuration.
+    ///
+    /// Dependence decided at generic position is what separates "this
+    /// constraint says nothing new" from "this constraint's gradient
+    /// happens to vanish where the sketch is standing". A full-rank
+    /// actual scan cannot gain rank under perturbation, so the
+    /// perturbation is skipped there and the profile carries the
+    /// actual scan alone.
+    pub(crate) fn rank_profile(&self) -> RankProfile {
+        let actual = self.rank_scan();
+        if !actual.has_dependent_rows() {
+            return RankProfile {
+                actual,
+                generic: None,
+            };
+        }
+        let mut best: Option<RankScan> = None;
+        for round in 0..GENERIC_PERTURBATION_ROUNDS {
+            if let Some(scan) = self.perturbed_rank_scan(round) {
+                if best.as_ref().is_none_or(|b| scan.rank > b.rank) {
+                    best = Some(scan);
+                }
+            }
+        }
+        // A perturbation can only ever reveal rank the configuration
+        // was hiding, so a sample that ranks BELOW the actual scan is
+        // noise and is discarded with it.
+        let generic = best.filter(|scan| scan.rank >= actual.rank);
+        RankProfile { actual, generic }
+    }
+
+    /// Rank the Jacobian at a deterministic displacement of every free
+    /// parameter, restoring the state before returning.
+    ///
+    /// `None` when the displaced geometry produced a non-finite
+    /// Jacobian entry -- a perturbation that walks a sketch into a
+    /// degenerate evaluation says nothing about the generic rank, so
+    /// the round is thrown away rather than trusted.
+    fn perturbed_rank_scan(&self, round: u64) -> Option<RankScan> {
+        let mut saved: Vec<(EntityRef, usize, f64)> = Vec::new();
+        for entry in self.entity_state.iter() {
+            let entity = *entry.key();
+            for (i, value) in entry.value().free_params() {
+                saved.push((entity, i, value));
+            }
+        }
+        // From here on the restore is owned by `Drop`, so it runs on
+        // every exit from this function -- early return AND unwind.
+        let restore = ParameterRestore {
+            solver: self,
+            saved,
+        };
+        for (entity, i, value) in &restore.saved {
+            let seed = splitmix64(
+                entity_seed(entity)
+                    ^ (*i as u64).wrapping_mul(0x0000_0100_0000_01B3)
+                    ^ round.wrapping_mul(0x0000_5EED_0000_0001),
+            );
+            // Map the mixed bits onto [-1, 1), then scale by the
+            // parameter's own magnitude so a coordinate of 1000 and a
+            // sagitta of 0.01 are both nudged proportionally.
+            let unit = ((seed >> 11) as f64) / ((1u64 << 53) as f64) * 2.0 - 1.0;
+            let delta = unit * GENERIC_PERTURBATION * (1.0 + value.abs());
+            self.perturb_parameter(entity, *i, value + delta);
+        }
+
+        let scanned = {
+            let (jacobian, column_owner) = self.jacobian_with_columns();
+            if jacobian
+                .iter()
+                .any(|row| row.iter().any(|v| !v.is_finite()))
+            {
+                None
+            } else {
+                let n_cols = jacobian.first().map(|r| r.len()).unwrap_or(0);
+                let num_errors = jacobian.len();
+                let blocks = match self.differentiation_scopes() {
+                    Some(scopes) => self.structural_blocks(&scopes, &column_owner, num_errors),
+                    None => vec![Self::whole_matrix_block(num_errors, n_cols)],
+                };
+                Some(scan_blocks(
+                    &jacobian,
+                    n_cols,
+                    &blocks,
+                    &self.jacobian_row_owners(),
+                ))
+            }
+        };
+
+        drop(restore);
+        scanned
+    }
+
+    /// Run the rank-revealing scan of the Jacobian at the solver's
+    /// CURRENT parameter state, block by block.
+    ///
+    /// Separated from [`ConstraintSolver::diagnose`] so a caller can
+    /// ask "is anything linearly dependent here?" before deciding
+    /// whether the residual classification is worth a Newton solve --
+    /// a sketch whose rank equals its row count has nothing to
+    /// classify, and `redundant` / `conflicts` are empty whatever the
+    /// residuals say.
+    pub(crate) fn rank_scan(&self) -> RankScan {
+        let (jacobian, column_owner) = self.jacobian_with_columns();
+        let n_cols = jacobian.first().map(|r| r.len()).unwrap_or(0);
+        let num_errors = jacobian.len();
+        if num_errors == 0 {
+            return RankScan {
+                row_independent: Vec::new(),
+                rank: 0,
+                rows: 0,
+                row_owners: Vec::new(),
+                block_ranks: Vec::new(),
+            };
+        }
+        let blocks = match self.differentiation_scopes() {
+            Some(scopes) => self.structural_blocks(&scopes, &column_owner, num_errors),
+            None => vec![Self::whole_matrix_block(num_errors, n_cols)],
+        };
+        scan_blocks(&jacobian, n_cols, &blocks, &self.jacobian_row_owners())
+    }
+
+    /// Split the dependent rows of a completed [`RankScan`] into
+    /// redundant and conflicting constraints using the CURRENT
+    /// residuals.
+    ///
+    /// Callers that need a residual-accurate split run `solve()`
+    /// between the scan and this call: the scan describes the
+    /// configuration the sketch is in, the split describes whether a
+    /// dependent constraint can be satisfied at all.
+    pub(crate) fn diagnose_from(&self, profile: &RankProfile) -> ConstraintDiagnosis {
+        let scan = profile.dependence();
+        // Independence is read against the owners the SCAN saw;
+        // residuals against the owners the solver has NOW. The two can
+        // differ: a caller may solve between the scan and this call,
+        // and `solve()` sorts `self.constraints` by priority in place.
+        // Zipping the scan's flags against a freshly derived owner map
+        // is the bug this split exists to prevent.
+        let scan_owners = &scan.row_owners;
+        let residual_owners = self.jacobian_row_owners();
         let residuals = self.compute_constraint_errors();
-        let jacobian_rows = jacobian.len();
-        if jacobian_rows == 0 || row_owners.is_empty() {
+        if scan.rows == 0 || scan_owners.is_empty() {
             return ConstraintDiagnosis {
                 redundant: Vec::new(),
                 conflicts: Vec::new(),
-                jacobian_rank: 0,
-                jacobian_rows,
+                jacobian_rank: profile.actual_rank(),
+                generic_rank: profile.generic_rank(),
+                jacobian_rows: scan.rows,
+                jacobian_blocks: scan.blocks(),
+                block_ranks: scan.block_ranks.clone(),
             };
         }
-
-        // Modified Gram-Schmidt rank analysis. `basis` holds the
-        // accepted (orthonormal) row vectors; `row_independent[i]`
-        // tracks whether row `i` contributed to the basis.
-        let n_cols = jacobian[0].len();
-        let mut basis: Vec<Vec<f64>> = Vec::new();
-        let mut row_independent = vec![false; jacobian_rows];
-
-        for (i, row) in jacobian.iter().enumerate() {
-            if row.len() != n_cols {
-                // Defensive: jagged rows shouldn't happen because
-                // `compute_jacobian` allocates a uniform matrix, but
-                // we degrade gracefully rather than panic.
-                continue;
-            }
-            // Project out the span of the existing basis.
-            let mut residual = row.clone();
-            for b in &basis {
-                let dot: f64 = residual.iter().zip(b.iter()).map(|(r, v)| r * v).sum();
-                for (rk, vk) in residual.iter_mut().zip(b.iter()) {
-                    *rk -= dot * vk;
-                }
-            }
-            let norm: f64 = residual.iter().map(|x| x * x).sum::<f64>().sqrt();
-            let row_norm: f64 = row.iter().map(|x| x * x).sum::<f64>().sqrt();
-            let scale = row_norm.max(1.0);
-            if norm > STRICT_TOLERANCE.distance() * scale {
-                // Independent — normalise and add to the basis.
-                for rk in residual.iter_mut() {
-                    *rk /= norm;
-                }
-                basis.push(residual);
-                row_independent[i] = true;
-            }
-        }
-
-        let jacobian_rank = basis.len();
 
         // Group by owning constraint id, preserving first-seen order
         // so the returned vectors are deterministic for any given
         // constraint ordering.
         let mut order: Vec<ConstraintId> = Vec::new();
         let mut all_dependent: HashMap<ConstraintId, bool> = HashMap::new();
-        let mut residual_sq: HashMap<ConstraintId, f64> = HashMap::new();
-        for (i, &owner) in row_owners.iter().enumerate() {
+        for (i, &owner) in scan_owners.iter().enumerate() {
             if !all_dependent.contains_key(&owner) {
                 order.push(owner);
                 all_dependent.insert(owner, true);
-                residual_sq.insert(owner, 0.0);
             }
-            if row_independent[i] {
+            if scan.row_independent.get(i).copied().unwrap_or(false) {
                 if let Some(v) = all_dependent.get_mut(&owner) {
                     *v = false;
                 }
             }
+        }
+        let mut residual_sq: HashMap<ConstraintId, f64> = HashMap::new();
+        for (i, &owner) in residual_owners.iter().enumerate() {
+            let acc = residual_sq.entry(owner).or_insert(0.0);
             if let Some(r) = residuals.get(i) {
-                if let Some(acc) = residual_sq.get_mut(&owner) {
-                    *acc += r * r;
-                }
+                *acc += r * r;
             }
         }
 
         // One-sided inequalities (SKETCH-DCM #45 Slice 6): a SATISFIED
-        // inequality is inactive — its residual and gradient are
-        // identically zero — so the rank scan always sees a dependent
+        // inequality is inactive -- its residual and gradient are
+        // identically zero -- so the rank scan always sees a dependent
         // zero row. That is not redundancy (the standing bound still
         // carries information); skip classification for inactive
         // inequalities. A VIOLATED dependent inequality (e.g. between
@@ -2643,8 +3270,11 @@ impl ConstraintSolver {
         ConstraintDiagnosis {
             redundant,
             conflicts,
-            jacobian_rank,
-            jacobian_rows,
+            jacobian_rank: profile.actual_rank(),
+            generic_rank: profile.generic_rank(),
+            jacobian_rows: scan.rows,
+            jacobian_blocks: scan.blocks(),
+            block_ranks: scan.block_ranks.clone(),
         }
     }
 
@@ -2923,11 +3553,19 @@ impl ConstraintSolver {
             let entity = *entry.key();
             let mut state = entry.value().clone();
 
-            for (i, &fixed) in state.fixed_mask.iter().enumerate() {
-                if !fixed {
-                    state.parameters[i] += damping * delta[param_index];
-                    param_index += 1;
+            // Walk the SAME iterator `jacobian_with_columns` built the
+            // column layout from, so `param_index` and the delta's
+            // entries describe the same parameters by construction --
+            // no second enumeration to drift, and no guard needed
+            // because the index came from the vector it indexes.
+            let free: Vec<usize> = state.free_params().map(|(i, _)| i).collect();
+            for i in free {
+                if let (Some(cell), Some(step)) =
+                    (state.parameters.get_mut(i), delta.get(param_index))
+                {
+                    *cell += damping * step;
                 }
+                param_index += 1;
             }
 
             updates.push((entity, state));
@@ -4400,7 +5038,37 @@ fn priority_weight(p: ConstraintPriority) -> f64 {
 impl EntityState {
     /// Number of free (non-fixed) parameters.
     fn free_param_count(&self) -> usize {
-        self.fixed_mask.iter().filter(|&&fixed| !fixed).count()
+        self.free_params().count()
+    }
+
+    /// The `(index, value)` pairs of this state's FREE parameters.
+    ///
+    /// THE single definition of "which parameters the solver may move".
+    /// Three places need that set and every one of them must produce
+    /// the SAME set in the SAME order, because the Jacobian's columns,
+    /// the Newton delta's entries and the DOF count are all indexed by
+    /// position within it: `jacobian_with_columns` allocates one column
+    /// per pair, `apply_updates` consumes one delta entry per pair, and
+    /// `free_param_count` reports how many there are. Three separate
+    /// enumerations of `fixed_mask` agree only as long as nothing about
+    /// them drifts; one shared iterator agrees by construction.
+    ///
+    /// It zips `parameters` against `fixed_mask` rather than indexing
+    /// one by the other's length. A state whose two vectors ever
+    /// disagreed would yield only the pairs they agree on -- fewer
+    /// parameters than intended, but the SAME fewer everywhere, so the
+    /// column layout and the delta layout still describe each other.
+    /// Indexing instead is what allowed a length mismatch to drop a
+    /// Jacobian column while the delta walk kept counting, skewing
+    /// every parameter after it onto its neighbour's update.
+    fn free_params(&self) -> impl Iterator<Item = (usize, f64)> + '_ {
+        self.parameters
+            .iter()
+            .copied()
+            .zip(self.fixed_mask.iter().copied())
+            .enumerate()
+            .filter(|(_, (_, fixed))| !*fixed)
+            .map(|(index, (value, _))| (index, value))
     }
 
     /// Clone with every parameter frozen — placed geometry inside a
@@ -6679,6 +7347,392 @@ mod tests {
         assert_eq!(owners[0], id1);
         assert_eq!(owners[1], id1);
         assert_eq!(owners[2], id2);
+    }
+
+    /// A rank scan and its consumer can straddle a `solve()`, and
+    /// `solve()` sorts `self.constraints` by priority IN PLACE. If
+    /// `diagnose_from` re-derives the row owners afterwards, it pairs
+    /// `row_independent[i]` with whatever constraint occupies row `i`
+    /// in the NEW order.
+    ///
+    /// Uniform-priority sketches survive that (the sort is stable, so
+    /// nothing moves), which is why it hides. Here the priorities are
+    /// mixed and the row counts differ:
+    ///
+    ///   scan order  [B(High, 1 row), C(High, 1 row), D(Required, 2 rows)]
+    ///               rows: B=0, C=1, D=2,3  -- row 1 (C) is dependent
+    ///   after solve [D(Required, 2 rows), B(High), C(High)]
+    ///               rows: D=0,1, B=2, C=3  -- row 1 is now D's SECOND
+    ///
+    /// D's first row is independent, so D is not flagged; B and C now
+    /// read independent rows. The duplicate vanishes from the report
+    /// entirely and the certificate says the sketch has no redundancy.
+    #[test]
+    fn diagnose_pairs_independence_with_the_row_order_the_scan_saw() {
+        let mut s = ConstraintSolver::new();
+        let p = point_ref();
+        let q = point_ref();
+        s.add_entity(p, EntityState::point(Point2d::new(1.0, 1.0), false));
+        s.add_entity(q, EntityState::point(Point2d::new(2.0, 2.0), false));
+
+        let b = Constraint::new_dimensional(
+            DimensionalConstraint::XCoordinate(0.0),
+            vec![p],
+            ConstraintPriority::High,
+        );
+        let c = Constraint::new_dimensional(
+            DimensionalConstraint::XCoordinate(0.0),
+            vec![p],
+            ConstraintPriority::High,
+        );
+        let d = Constraint::new_geometric(
+            GeometricConstraint::Coincident,
+            vec![p, q],
+            ConstraintPriority::Required,
+        );
+        let (b_id, c_id, d_id) = (b.id, c.id, d.id);
+        // Set the scan order explicitly -- `set_constraints` keeps it.
+        s.set_constraints(vec![b, c, d]);
+
+        let owners = s.jacobian_row_owners();
+        assert_eq!(
+            owners,
+            vec![b_id, c_id, d_id, d_id],
+            "scan-order row layout: B, C, then Coincident's two rows"
+        );
+
+        let profile = s.rank_profile();
+        assert!(
+            profile.has_dependent_rows(),
+            "the duplicate XCoordinate makes row 1 dependent"
+        );
+
+        // The caller solves between the scan and the classification --
+        // exactly what `analyze_dofs` and `certify_sketch` both do.
+        let _ = s.solve();
+        assert_eq!(
+            s.jacobian_row_owners(),
+            vec![d_id, d_id, b_id, c_id],
+            "solve() re-sorted by priority: Required first"
+        );
+
+        let diagnosis = s.diagnose_from(&profile);
+        assert!(
+            diagnosis.conflicts.is_empty(),
+            "the three constraints are consistent: {:?}",
+            diagnosis.conflicts
+        );
+        assert_eq!(
+            diagnosis.redundant,
+            vec![c_id],
+            concat!(
+                "the second XCoordinate is the redundant one; pairing the ",
+                "scan's flags against the POST-solve owner map loses it: {:?}"
+            ),
+            diagnosis
+        );
+    }
+
+    // ── One definition of "free parameter" ────────────────────────
+
+    /// Every `EntityState` constructor must produce a parameter vector
+    /// and a fixed-mask of the SAME length. They are written as two
+    /// parallel literals, so nothing but this test stops them drifting
+    /// apart in a future constructor.
+    #[test]
+    fn every_entity_state_constructor_pairs_each_parameter_with_a_mask_entry() {
+        let states: Vec<(&str, EntityState)> = vec![
+            ("point", EntityState::point(Point2d::new(1.0, 2.0), false)),
+            (
+                "line",
+                EntityState::line(Point2d::ORIGIN, Vector2d::new(1.0, 0.0), false, false),
+            ),
+            (
+                "segment_between",
+                EntityState::segment_between(point_ref(), point_ref()),
+            ),
+            (
+                "arc_between",
+                EntityState::arc_between(point_ref(), point_ref(), 0.5),
+            ),
+            (
+                "arc_centered",
+                EntityState::arc_centered(point_ref(), 5.0, 0.0, 1.0),
+            ),
+            (
+                "circle_centered",
+                EntityState::circle_centered(point_ref(), 5.0),
+            ),
+            (
+                "circle",
+                EntityState::circle(Point2d::ORIGIN, 5.0, false, false),
+            ),
+            (
+                "arc",
+                EntityState::arc(Point2d::ORIGIN, 5.0, 0.0, 1.0, true, false, false),
+            ),
+        ];
+        for (name, state) in states {
+            assert_eq!(
+                state.parameters.len(),
+                state.fixed_mask.len(),
+                "{name}: one mask entry per parameter"
+            );
+        }
+    }
+
+    /// The Jacobian's columns, the Newton delta's entries and the DOF
+    /// count are all indexed by position within ONE set: the state's
+    /// free parameters. If the three sites enumerate that set
+    /// separately, a state whose `fixed_mask` outruns its `parameters`
+    /// makes them disagree -- the Jacobian drops a column while the
+    /// delta walk keeps counting, and every parameter after it takes
+    /// its neighbour's update. The counts must agree even on a
+    /// malformed state, because agreeing is what keeps the two layouts
+    /// describing each other.
+    #[test]
+    fn a_malformed_state_cannot_skew_the_parameter_layouts() {
+        let mut malformed = EntityState::point(Point2d::new(3.0, 4.0), false);
+        // Two mask entries, one parameter.
+        malformed.parameters.pop();
+        assert_eq!(malformed.parameters.len(), 1);
+        assert_eq!(malformed.fixed_mask.len(), 2);
+        assert_eq!(
+            malformed.free_param_count(),
+            1,
+            "a mask entry with no parameter is not a free parameter"
+        );
+
+        let mut s = ConstraintSolver::new();
+        let p = point_ref();
+        let q = point_ref();
+        s.add_entity(p, malformed);
+        s.add_entity(q, EntityState::point(Point2d::new(1.0, 1.0), false));
+        s.set_constraints(vec![distance(p, q, 2.0)]);
+
+        let columns = s.compute_jacobian().first().map(|r| r.len()).unwrap_or(0);
+        assert_eq!(
+            columns,
+            s.count_degrees_of_freedom(),
+            concat!(
+                "the Jacobian must allocate exactly one column per counted ",
+                "free parameter, or the Newton delta indexes the wrong ones"
+            )
+        );
+        assert_eq!(columns, 3, "1 usable parameter on p + 2 on q");
+    }
+
+    // ── Block-diagonal rank scan ────────────────────────────────────
+
+    /// Three point pairs that share no entity and no constraint. The
+    /// Jacobian is block-diagonal with three blocks, and the scan must
+    /// run over three, not over one 6x12 matrix.
+    fn three_disconnected_pairs() -> ConstraintSolver {
+        let mut s = ConstraintSolver::new();
+        let mut constraints = Vec::new();
+        for k in 0..3 {
+            let a = point_ref();
+            let b = point_ref();
+            let x = 100.0 * f64::from(k);
+            s.add_entity(a, EntityState::point(Point2d::new(x, 0.0), false));
+            s.add_entity(b, EntityState::point(Point2d::new(x + 3.0, 4.0), false));
+            constraints.push(distance(a, b, 5.0));
+            constraints.push(Constraint::new_dimensional(
+                DimensionalConstraint::XCoordinate(x),
+                vec![a],
+                ConstraintPriority::Required,
+            ));
+        }
+        s.set_constraints(constraints);
+        s
+    }
+
+    #[test]
+    fn rank_scan_runs_one_block_per_disconnected_component() {
+        let s = three_disconnected_pairs();
+        let d = s.diagnose();
+        assert_eq!(
+            d.jacobian_blocks, 3,
+            "three disconnected pairs are three Jacobian blocks: {d:?}"
+        );
+        assert_eq!(d.jacobian_rows, 6, "3 x (Distance 1 + XCoordinate 1)");
+        assert_eq!(d.jacobian_rank, 6, "every row is independent here");
+        assert!(d.redundant.is_empty());
+        assert!(d.conflicts.is_empty());
+    }
+
+    #[test]
+    fn rank_scan_reports_one_block_for_a_connected_sketch() {
+        // Mirror of the test above: one shared point couples both
+        // constraints, so there is exactly one block. Without this the
+        // block count could be "number of constraints" and still pass
+        // the disconnected case.
+        let mut s = ConstraintSolver::new();
+        let a = point_ref();
+        let b = point_ref();
+        s.add_entity(a, EntityState::point(Point2d::ORIGIN, false));
+        s.add_entity(b, EntityState::point(Point2d::new(3.0, 4.0), false));
+        s.set_constraints(vec![
+            distance(a, b, 5.0),
+            Constraint::new_dimensional(
+                DimensionalConstraint::XCoordinate(0.0),
+                vec![a],
+                ConstraintPriority::Required,
+            ),
+        ]);
+        let d = s.diagnose();
+        assert_eq!(
+            d.jacobian_blocks, 1,
+            "a shared point couples the constraints into one block: {d:?}"
+        );
+    }
+
+    /// The blocked scan is an IDENTITY, not an approximation: rows of
+    /// different components have exactly-zero entries in each other's
+    /// columns, so orthogonalising across blocks subtracts exactly
+    /// nothing. Assert it bit for bit -- same per-row independence
+    /// flags, same rank -- against the whole-matrix scan the blocked
+    /// one replaced.
+    #[test]
+    fn blocked_scan_is_bitwise_identical_to_the_whole_matrix_scan() {
+        let fixtures: Vec<(&str, ConstraintSolver)> = vec![
+            ("three disconnected pairs", three_disconnected_pairs()),
+            ("duplicate x", {
+                let mut s = ConstraintSolver::new();
+                let p = point_ref();
+                s.add_entity(p, EntityState::point(Point2d::ORIGIN, false));
+                s.set_constraints(vec![
+                    Constraint::new_dimensional(
+                        DimensionalConstraint::XCoordinate(0.0),
+                        vec![p],
+                        ConstraintPriority::Required,
+                    ),
+                    Constraint::new_dimensional(
+                        DimensionalConstraint::XCoordinate(0.0),
+                        vec![p],
+                        ConstraintPriority::Required,
+                    ),
+                ]);
+                s
+            }),
+            ("contradictory x", {
+                let mut s = ConstraintSolver::new();
+                let p = point_ref();
+                s.add_entity(p, EntityState::point(Point2d::ORIGIN, false));
+                s.set_constraints(vec![
+                    Constraint::new_dimensional(
+                        DimensionalConstraint::XCoordinate(5.0),
+                        vec![p],
+                        ConstraintPriority::Required,
+                    ),
+                    Constraint::new_dimensional(
+                        DimensionalConstraint::XCoordinate(7.0),
+                        vec![p],
+                        ConstraintPriority::Required,
+                    ),
+                ]);
+                s
+            }),
+            ("coincident pair", {
+                let mut s = ConstraintSolver::new();
+                let a = point_ref();
+                let b = point_ref();
+                s.add_entity(a, EntityState::point(Point2d::ORIGIN, false));
+                s.add_entity(b, EntityState::point(Point2d::new(1.0, 2.0), false));
+                s.set_constraints(vec![coincident(a, b), distance(a, b, 0.0)]);
+                s
+            }),
+        ];
+
+        for (name, solver) in fixtures {
+            let (jacobian, column_owner) = solver.jacobian_with_columns();
+            let n_cols = jacobian.first().map(|r| r.len()).unwrap_or(0);
+            let rows = jacobian.len();
+            let scopes = solver
+                .differentiation_scopes()
+                .expect("every fixture evaluator matches its declared row count");
+            let blocks = solver.structural_blocks(&scopes, &column_owner, rows);
+            assert!(
+                !blocks.is_empty(),
+                "{name}: at least one block for a non-empty system"
+            );
+            let owners = solver.jacobian_row_owners();
+            let blocked = scan_blocks(&jacobian, n_cols, &blocks, &owners);
+            let whole = scan_blocks(
+                &jacobian,
+                n_cols,
+                &[ConstraintSolver::whole_matrix_block(rows, n_cols)],
+                &owners,
+            );
+            assert_eq!(
+                blocked.row_independent, whole.row_independent,
+                "{name}: blocking must not change ANY row's verdict"
+            );
+            assert_eq!(
+                blocked.rank, whole.rank,
+                "{name}: blocking must not change the rank"
+            );
+            // The proof obligation the equivalence rests on: every row
+            // is exactly 0.0 outside its own block's columns.
+            for block in &blocks {
+                let own: std::collections::HashSet<usize> = block.cols.iter().copied().collect();
+                for &i in &block.rows {
+                    let row = jacobian.get(i).expect("row in range");
+                    for (j, v) in row.iter().enumerate() {
+                        if !own.contains(&j) {
+                            assert_eq!(
+                                *v, 0.0,
+                                "{name}: row {i} must be exactly zero in foreign column {j}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rank_scan_reports_a_dependent_row_by_row_count_not_dof_count() {
+        // `has_dependent_rows` must compare rank to ROWS. A point with
+        // two XCoordinate constraints has 2 rows, rank 1 and 2 free
+        // DOFs: comparing rank to free DOFs would also say "dependent"
+        // here, but it says "dependent" for every under-constrained
+        // sketch too -- and those have nothing to classify.
+        let mut under = ConstraintSolver::new();
+        let p = point_ref();
+        under.add_entity(p, EntityState::point(Point2d::ORIGIN, false));
+        under.set_constraints(vec![Constraint::new_dimensional(
+            DimensionalConstraint::XCoordinate(0.0),
+            vec![p],
+            ConstraintPriority::Required,
+        )]);
+        let scan = under.rank_scan();
+        assert_eq!(scan.rows, 1);
+        assert_eq!(scan.rank, 1);
+        assert!(
+            !scan.has_dependent_rows(),
+            "one independent row over two free DOFs has nothing to classify"
+        );
+
+        let mut duplicate = ConstraintSolver::new();
+        let q = point_ref();
+        duplicate.add_entity(q, EntityState::point(Point2d::ORIGIN, false));
+        duplicate.set_constraints(vec![
+            Constraint::new_dimensional(
+                DimensionalConstraint::XCoordinate(0.0),
+                vec![q],
+                ConstraintPriority::Required,
+            ),
+            Constraint::new_dimensional(
+                DimensionalConstraint::XCoordinate(0.0),
+                vec![q],
+                ConstraintPriority::Required,
+            ),
+        ]);
+        let scan = duplicate.rank_scan();
+        assert_eq!(scan.rows, 2);
+        assert_eq!(scan.rank, 1);
+        assert!(scan.has_dependent_rows(), "the second row is dependent");
     }
 
     #[test]

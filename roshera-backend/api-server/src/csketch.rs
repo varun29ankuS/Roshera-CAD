@@ -1075,8 +1075,16 @@ pub async fn drag(
     Ok(Json(report))
 }
 
-/// `GET /api/csketch/{id}/dof` — structural DOF analysis without
-/// running the solver.
+/// `GET /api/csketch/{id}/dof` — DOF analysis: the structural tally,
+/// adjudicated by the Jacobian's numerical rank.
+///
+/// Not solver-free. A tally cannot tell "two DOFs removed" from "one
+/// DOF removed twice", so the rank pass runs on every request and holds
+/// the veto over a `FullyConstrained` verdict. It is measured: ~17 ms
+/// on a 300-constraint plate in an unoptimised build (see
+/// `geometry-engine/tests/sketch_dof_rank_scale.rs`). The payload also
+/// carries `singular_configuration` — determined geometry standing
+/// where its own linearisation loses rank.
 pub async fn dof(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,

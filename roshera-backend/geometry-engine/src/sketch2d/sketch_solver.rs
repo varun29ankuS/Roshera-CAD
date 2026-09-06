@@ -57,7 +57,7 @@
 use super::arc2d::ParametricArc2d;
 use super::circle2d::ParametricCircle2d;
 use super::constraint_solver::{
-    ConstraintSolver, EntityState, EntityUpdate, SolverResult, SolverStatus,
+    ConstraintDiagnosis, ConstraintSolver, EntityState, EntityUpdate, SolverResult, SolverStatus,
 };
 use super::constraints::{ConstraintId, EntityRef};
 use super::ellipse2d::{Ellipse2d, ParametricEllipse2d};
@@ -500,11 +500,11 @@ pub struct DofReport {
     /// tolerance. Safe-to-remove duplicates: the system still has a
     /// solution, but this constraint contributes no new information.
     ///
-    /// Populated when the structural verdict is not
-    /// `FullyConstrained` (i.e. one of `OverConstrained` /
-    /// `UnderConstrained`). For `FullyConstrained` sketches the
-    /// numerical analysis is skipped because the structural count
-    /// already proves there is no redundancy.
+    /// Always populated: the rank pass runs on every call. It used to
+    /// be skipped whenever every component's structural tally
+    /// balanced — which is exactly the case the tally cannot
+    /// adjudicate, because a DOF removed twice and two DOFs removed
+    /// count the same.
     ///
     /// Order is deterministic for any given constraint ordering: the
     /// list reflects the first time each redundant constraint was
@@ -523,6 +523,44 @@ pub struct DofReport {
     /// follow-up slice.
     #[serde(default)]
     pub conflicts: Vec<ConstraintId>,
+    /// The constraint system is SINGULAR at the sketch's current
+    /// configuration: its Jacobian has lower rank here than it has at
+    /// a generic configuration.
+    ///
+    /// The shape can still be uniquely determined -- that is exactly
+    /// what makes this worth reporting rather than downgrading the
+    /// verdict. A slot's semicircular cap pins its own radius only to
+    /// SECOND order (`R = h/2 + c^2/(8h)` gives `dR/dh = 1/2 -
+    /// c^2/(8h^2)`, which is zero at `h = c/2`); a circle tangent to
+    /// the line that pins it is the same story. The sketch is
+    /// `FullyConstrained` and this flag is `true`: determined, but
+    /// standing on a point where the linearised system cannot see it,
+    /// so a solver stepping from here has no first-order restoring
+    /// direction and a downstream Newton pass may crawl.
+    ///
+    /// `false` on every ordinary sketch, including every
+    /// under-constrained one.
+    #[serde(default)]
+    pub singular_configuration: bool,
+    /// Indices into `components` whose rank could NOT be read, because
+    /// one of their constraints was absent from the rank pass's block
+    /// map.
+    ///
+    /// That means the two decompositions disagreed -- the sketch-side
+    /// `decompose::connected_components` this function folds over, and
+    /// the solver-side `ConstraintSolver::split_components` the rank
+    /// scan blocks by. Both derive their coupling from the same
+    /// classifiers, so it should be unreachable; it is reported rather
+    /// than defaulted because "we could not measure it" and "we
+    /// measured zero" are different answers, and only one of them may
+    /// be called fully constrained.
+    ///
+    /// A listed component is never reported `FullyConstrained`. Its
+    /// status falls back to `UnderConstrained` over its whole free-DOF
+    /// count -- the maximally conservative reading, since no DOF can be
+    /// certified as removed by an independent row.
+    #[serde(default)]
+    pub unverified_components: Vec<usize>,
 }
 
 impl DofReport {
@@ -684,14 +722,71 @@ pub fn solve_drag_with_options(
     solve_internal(sketch, options, extra)
 }
 
-/// Analyse the sketch's structural degrees of freedom without
-/// running Newton-Raphson.
+/// Analyse the sketch's degrees of freedom.
 ///
 /// Returns a [`DofReport`] containing the same DOF accounting the
-/// solver does in its over/under-constrained detector, but computed
-/// in O(entities + constraints) so the UI can react to constraint
-/// additions in real time. Does not mutate the sketch.
+/// solver does in its over/under-constrained detector, adjudicated by
+/// the Jacobian's numerical rank.
+///
+/// Two passes run on every call:
+///
+/// 1. a structural tally, O(entities + constraints), that sums
+///    `degrees_of_freedom_removed()` per connected component; and
+/// 2. the rank pass ([`diagnose_constraints`]) — an isolated
+///    Newton solve plus a modified Gram-Schmidt scan of the Jacobian,
+///    which is where `redundant` / `conflicts` come from and which
+///    holds the veto over a `FullyConstrained` verdict (the tally
+///    alone cannot tell "two DOFs removed" from "one DOF removed
+///    twice").
+///
+/// The rank pass costs more than the tally, and three things keep the
+/// gap bounded: the scan runs per block (the components below own
+/// disjoint parameters, so the Jacobian is block-diagonal and a
+/// per-block scan is bit-identical to a whole-matrix one),
+/// differentiation is scoped to the perturbed parameter's own
+/// component, and the Newton solve runs only when a dependent row
+/// exists to classify. Measured (unoptimised build, best of five) on
+/// the dimensioned plate in `tests/common/mod.rs`, the largest sketch
+/// fixture in the suite — tally-only against the whole function:
+///
+/// | constraints | tally only | this function |
+/// |-------------|------------|---------------|
+/// | 30          | 0.11 ms    | 0.77 ms       |
+/// | 100         | 0.22 ms    | 2.24 ms       |
+/// | 300         | 0.60 ms    | 16.4 ms       |
+///
+/// `GET /api/csketch/{id}/dof` and `psketch_dof` pay that on every
+/// call. It is paid deliberately: a fast verdict that cannot tell a
+/// solved sketch from a contradictory one is not a verdict. The
+/// remaining term at 300 constraints is the NUMERICAL Jacobian
+/// (`params x rows` residual evaluations per component); analytic
+/// gradients are the only route below it. The budgets that guard these
+/// numbers live in `tests/sketch_dof_rank_scale.rs`.
+///
+/// Does not mutate the sketch.
 pub fn analyze_dofs(sketch: &Sketch) -> DofReport {
+    analyze_dofs_with_diagnosis(sketch, None)
+}
+
+/// [`analyze_dofs`], optionally reusing a [`ConstraintDiagnosis`] the
+/// caller already computed.
+///
+/// `certify_sketch` runs the rank pass anyway, for its per-constraint
+/// roles and conflict witnesses; handing that result in here is what
+/// stops one certificate from paying for two identical scans of the
+/// same Jacobian -- and, more importantly, is what makes
+/// `cert.dof.status` and `cert.redundant_constraints` two readings of
+/// ONE diagnosis instead of two that can disagree.
+///
+/// The supplied diagnosis is used only when the analysis skips no
+/// entity. `collect_unsupported` returns an empty list today, so the
+/// two solvers are the same solver over the same constraint set; the
+/// guard is there so that stops being an assumption the moment a kind
+/// becomes unsupported again.
+pub(crate) fn analyze_dofs_with_diagnosis(
+    sketch: &Sketch,
+    supplied: Option<&ConstraintDiagnosis>,
+) -> DofReport {
     use std::cmp::Ordering;
     use std::collections::HashMap;
 
@@ -925,7 +1020,60 @@ pub fn analyze_dofs(sketch: &Sketch) -> DofReport {
     let graph_components =
         super::decompose::connected_components(&nodes, &shared_ref_edges, &constraint_entities);
 
+    // The numerical rank pass runs UNCONDITIONALLY.
+    //
+    // A per-component DOF tally is a COUNT: it adds
+    // `degrees_of_freedom_removed()` per constraint and compares the
+    // sum to the component's free DOFs. It cannot tell "two DOFs
+    // removed" from "one DOF removed twice" — a free point carrying
+    // `XCoordinate(0.0)` TWICE reads 2 removed vs 2 free and folds to
+    // `FullyConstrained` while y is untouched; the same point carrying
+    // `XCoordinate(5.0)` + `XCoordinate(7.0)` reads identically on a
+    // system with no solution at all. Skipping the diagnosis exactly
+    // when the tally balances therefore skipped it in the one case the
+    // tally cannot adjudicate. Only the Jacobian's rank can: it counts
+    // INDEPENDENT rows, which is what "constrained" actually means.
+    //
+    // The earlier `has_invisible` gate (a constraint removing zero
+    // structural DOF — a refused MomentOfInertia / unsupported-shape
+    // Offset, or a violated one-sided inequality between fixed
+    // geometry — is invisible to the count and must never hide behind
+    // a balanced one) is subsumed: an always-on pass needs no such
+    // trigger, and the zero-DOF constraint's verdict now reaches
+    // `status`, not just the lists.
+    //
+    // The diagnostic builds an isolated `ConstraintSolver` populated
+    // from the sketch's *current* entity state (which may or may not
+    // be a converged solution). The solver's own DashMap is the only
+    // mutable surface; the sketch is never written back. This keeps
+    // `analyze_dofs` side-effect-free, matching its documented
+    // contract.
+    let diagnosis = match supplied {
+        Some(d) if entities_skipped.is_empty() => d.clone(),
+        _ => diagnose_constraints(sketch, &skipped_set),
+    };
+    let conflict_set: std::collections::HashSet<ConstraintId> =
+        diagnosis.conflicts.iter().copied().collect();
+    // Per-constraint lookup of (block index, that block's DEFICIENCY):
+    // how many of the block's parameters no independent constraint row
+    // pins. The block INDEX is carried so a component spanning more
+    // than one block sums each block exactly once -- blocks own
+    // disjoint parameters, so their deficiencies add, and reading only
+    // the first would under-report in the one direction a
+    // `FullyConstrained` verdict must never be permissive about.
+    let deficiency_of: HashMap<ConstraintId, (usize, usize)> = diagnosis
+        .block_ranks
+        .iter()
+        .enumerate()
+        .flat_map(|(index, b)| {
+            b.constraints
+                .iter()
+                .map(move |id| (*id, (index, b.deficiency())))
+        })
+        .collect();
+
     let mut components: Vec<ComponentDof> = Vec::with_capacity(graph_components.len());
+    let mut unverified_components: Vec<usize> = Vec::new();
     let mut any_over = false;
     let mut any_under = false;
     let mut over_excess: usize = 0;
@@ -936,13 +1084,39 @@ pub fn analyze_dofs(sketch: &Sketch) -> DofReport {
             .iter()
             .map(|e| free_dofs_by_entity.get(e).copied().unwrap_or(0))
             .sum();
-        let comp_dofs_removed: usize = component
+        // One pass over the component's own constraints: the
+        // structural tally, the conflicts the rank pass found among
+        // them, and the deficiency its block reported.
+        let mut comp_dofs_removed: usize = 0;
+        let mut comp_conflicting: usize = 0;
+        let mut comp_deficiency: usize = 0;
+        let mut counted_blocks: Vec<usize> = Vec::new();
+        let mut unverified = false;
+        for c in component
             .constraint_indices
             .iter()
             .filter_map(|&i| supported_constraints.get(i))
-            .map(|c| c.degrees_of_freedom_removed())
-            .sum();
-        let comp_status = match comp_dofs_removed.cmp(&comp_free_dofs) {
+        {
+            comp_dofs_removed += c.degrees_of_freedom_removed();
+            if conflict_set.contains(&c.id) {
+                comp_conflicting += 1;
+            }
+            match deficiency_of.get(&c.id) {
+                Some(&(block, deficiency)) => {
+                    if !counted_blocks.contains(&block) {
+                        counted_blocks.push(block);
+                        comp_deficiency += deficiency;
+                    }
+                }
+                // This component owns a constraint the rank pass never
+                // blocked. Its deficiency is UNKNOWN, not zero.
+                None => unverified = true,
+            }
+        }
+        if unverified {
+            unverified_components.push(index);
+        }
+        let structural = match comp_dofs_removed.cmp(&comp_free_dofs) {
             Ordering::Equal => DofStatus::FullyConstrained,
             Ordering::Less => DofStatus::UnderConstrained {
                 dofs: comp_free_dofs - comp_dofs_removed,
@@ -950,6 +1124,40 @@ pub fn analyze_dofs(sketch: &Sketch) -> DofReport {
             Ordering::Greater => DofStatus::OverConstrained {
                 conflicting_constraints: comp_dofs_removed - comp_free_dofs,
             },
+        };
+        // `FullyConstrained` is the one verdict the count may only
+        // make with the rank pass's consent. The count asserts that as
+        // many DOFs were removed as exist; only the rank says whether
+        // they were removed by INDEPENDENT rows. The measure is the
+        // block's DEFICIENCY (parameters minus rank), NOT the presence
+        // of a redundant constraint: a system can carry redundant
+        // EQUATIONS — more rows than parameters, some of them
+        // dependent — and still pin every parameter, which is the
+        // ordinary state of a patterned sketch whose instances repeat
+        // an `Equal`. Counting flagged constraints instead mistakes a
+        // spare equation for a free direction.
+        //
+        // Over outranks under here for the same reason it does in the
+        // fold below — an unsatisfiable subset is a soundness
+        // problem, slack is an incompleteness problem. The other two
+        // verdicts are left as the structural count made them: they
+        // already report the sketch as incomplete or surplus, and
+        // re-deriving their magnitude would change numbers this slice
+        // was not asked to change.
+        let comp_status = match structural {
+            DofStatus::FullyConstrained if comp_conflicting > 0 => DofStatus::OverConstrained {
+                conflicting_constraints: comp_conflicting,
+            },
+            // Unmeasured is not measured-zero. A component whose rank
+            // the pass could not read is refused the verdict outright
+            // and falls back to claiming nothing was pinned.
+            DofStatus::FullyConstrained if unverified => DofStatus::UnderConstrained {
+                dofs: comp_free_dofs,
+            },
+            DofStatus::FullyConstrained if comp_deficiency > 0 => DofStatus::UnderConstrained {
+                dofs: comp_deficiency,
+            },
+            other => other,
         };
         match comp_status {
             DofStatus::OverConstrained {
@@ -988,55 +1196,6 @@ pub fn analyze_dofs(sketch: &Sketch) -> DofReport {
         DofStatus::FullyConstrained
     };
 
-    // Numerical diagnostic pass: when a component's OWN verdict says
-    // it is anything other than `FullyConstrained`, classify each
-    // constraint as essential / redundant / conflicting using the
-    // Jacobian's rank profile. The pass is skipped only when EVERY
-    // component is `FullyConstrained` — SKETCH-DCM #45 slice H4.
-    //
-    // Pre-H4 this checked the GLOBAL `status` alone, reasoning that a
-    // balanced global count "precludes both redundancy and conflict".
-    // That reasoning is FALSE across components: two disjoint
-    // components — one +1 over-constrained, one -1 under-constrained —
-    // sum to a balanced global count while the over-constrained one
-    // still has a real conflict to diagnose. Checking every
-    // component's own verdict is what closes that gap; the fold above
-    // already prevents `status` itself from hiding it, but the
-    // diagnostic skip must not regress to checking the folded scalar
-    // alone (which today, post-fold, happens to imply the same
-    // condition — but the per-component check is the one that stays
-    // correct if that implication ever stops holding).
-    //
-    // The diagnostic builds an isolated `ConstraintSolver` populated
-    // from the sketch's *current* entity state (which may or may not
-    // be a converged solution). The solver's own DashMap is the only
-    // mutable surface; the sketch is never written back. This keeps
-    // `analyze_dofs` side-effect-free, matching its documented
-    // contract.
-    // A constraint that removes ZERO structural DOF is invisible to
-    // the count above, so on its own it can leave a sketch looking
-    // structurally `FullyConstrained` while a constraint is being
-    // refused (MomentOfInertia, an unsupported-shape Offset/
-    // MultiTangent) or violated without recourse (a one-sided
-    // inequality between fixed geometry — SKETCH-DCM #45 Slice 6).
-    // Detect any structurally-invisible constraint on supported
-    // entities and force the numerical diagnosis to run — refuse
-    // residuals and irreducible violations then surface as conflicts,
-    // so the verdict never hides behind a balanced DOF count. This
-    // subsumes the previous `is_numerically_enforced` check (every
-    // refuse kind removes zero DOF).
-    let has_invisible = all_constraints.iter().any(|c| {
-        c.degrees_of_freedom_removed() == 0 && !c.entities.iter().any(|e| skipped_set.contains(e))
-    });
-    let all_components_fully_constrained = components
-        .iter()
-        .all(|c| matches!(c.status, DofStatus::FullyConstrained));
-    let (redundant, conflicts) = if all_components_fully_constrained && !has_invisible {
-        (Vec::new(), Vec::new())
-    } else {
-        diagnose_constraints(sketch, &skipped_set)
-    };
-
     DofReport {
         total_free_dofs,
         constraint_dofs_removed,
@@ -1046,8 +1205,10 @@ pub fn analyze_dofs(sketch: &Sketch) -> DofReport {
         constraints_analysed,
         constraints_skipped,
         entities_skipped,
-        redundant,
-        conflicts,
+        singular_configuration: diagnosis.singular_configuration(),
+        unverified_components,
+        redundant: diagnosis.redundant,
+        conflicts: diagnosis.conflicts,
     }
 }
 
@@ -1057,12 +1218,12 @@ pub fn analyze_dofs(sketch: &Sketch) -> DofReport {
 /// solver — the rest contribute neither rows nor verdict so the
 /// classification stays consistent with the DOF accounting above.
 ///
-/// Returns `(redundant, conflicts)` constraint id lists per
-/// `ConstraintDiagnosis::redundant` / `::conflicts` semantics.
+/// Returns the solver's [`ConstraintDiagnosis`] — the redundant and
+/// conflicting id lists plus the Jacobian's rank and row count.
 fn diagnose_constraints(
     sketch: &Sketch,
     skipped_set: &std::collections::HashSet<EntityRef>,
-) -> (Vec<ConstraintId>, Vec<ConstraintId>) {
+) -> ConstraintDiagnosis {
     let mut solver = ConstraintSolver::new();
     populate_solver(sketch, &solver);
 
@@ -1074,7 +1235,7 @@ fn diagnose_constraints(
         diagnosable.push(c.clone());
     }
     if diagnosable.is_empty() {
-        return (Vec::new(), Vec::new());
+        return ConstraintDiagnosis::default();
     }
     // `sketch.all_constraints()` iterates a `DashMap` and is therefore
     // unordered. The diagnosis is order-dependent (the first row in
@@ -1085,28 +1246,33 @@ fn diagnose_constraints(
     diagnosable.sort_by_key(|c| c.id.0);
     solver.set_constraints(diagnosable);
 
-    // Run Newton-Raphson before `diagnose()` so the residual readings
-    // reflect the post-solve state, not the entities' freshly-loaded
-    // initial positions. Without this, a constraint that happens to
-    // be satisfied by the initial guess (residual = 0) is classified
-    // as *redundant* even when it is part of an inconsistent set —
-    // e.g. three `XCoordinate` constraints with values {3, 7, 9} on
-    // a point initially at x=3. The order of constraint processing
-    // (deterministic, by `id` sort above) then picks which row is
-    // the "essential" representative; running `solve()` first pushes
-    // the point to the regularised least-squares minimum so every
-    // dependent row carries a non-zero residual and the conflict
-    // classifier produces the same count regardless of which uuid
-    // sorts first. Matches the `diagnose()` contract:
-    // "callers that need a residual-accurate solution should run
-    // solve() before diagnose()".
+    // Rank the system FIRST, at the sketch's own configuration — that
+    // is the configuration the report describes, and the scan is what
+    // decides whether the rest of the work is needed at all.
+    let profile = solver.rank_profile();
+
+    // Newton-Raphson runs only when the scan found a generically
+    // dependent row. It is needed for those: a constraint that happens
+    // to be satisfied by the initial guess (residual = 0) would be
+    // classified *redundant* even when it belongs to an inconsistent
+    // set — three `XCoordinate` constraints with values {3, 7, 9} on a
+    // point initially at x=3. Solving first pushes the point to the
+    // regularised least-squares minimum, so every dependent row
+    // carries a non-zero residual and the conflict classifier produces
+    // the same count regardless of which uuid sorts first.
     //
-    // The solver mutates only its internal `entity_state`; the
-    // sketch is never written back, so `analyze_dofs` stays
-    // side-effect-free.
-    let _ = solver.solve();
-    let diagnosis = solver.diagnose();
-    (diagnosis.redundant, diagnosis.conflicts)
+    // When nothing is dependent there is nothing to split by residual:
+    // `redundant` and `conflicts` are empty whatever the geometry says,
+    // and the solve is pure cost. That is the common case (a correctly
+    // dimensioned sketch), and skipping it there is the single largest
+    // saving in this function.
+    //
+    // The solver mutates only its internal `entity_state`; the sketch
+    // is never written back, so `analyze_dofs` stays side-effect-free.
+    if profile.has_dependent_rows() {
+        let _ = solver.solve();
+    }
+    solver.diagnose_from(&profile)
 }
 
 // ── Internal: shared solve path + drag-constraint synthesis ────────
@@ -3060,7 +3226,8 @@ mod tests {
         ));
         let report = analyze_dofs(&sketch);
         assert!(report.is_fully_constrained());
-        // Fully-constrained sketches skip the numerical pass.
+        // The rank pass runs here too and agrees with the count:
+        // two independent rows over two free DOFs.
         assert!(report.redundant.is_empty());
         assert!(report.conflicts.is_empty());
     }
@@ -3325,6 +3492,16 @@ mod tests {
         // `components` must itself be `FullyConstrained`. Two
         // disconnected, individually-balanced components (a pinned
         // point + a fully dimensioned 2-point pair).
+        //
+        // b sits directly right of a=(1,2), so the circle about a is
+        // TANGENT to the line x=6: the pair is uniquely determined and
+        // the Jacobian is nonetheless rank 3 of 4 there. The rank pass
+        // judges dependence at GENERIC position, which is why that
+        // costs the component nothing -- the verdict stays
+        // `FullyConstrained` -- and the tangency is reported through
+        // `singular_configuration` instead. Asserted below, so a
+        // regression that judges dependence at the sketch's own
+        // configuration turns this canary red.
         let sketch = fresh_sketch();
         let p = sketch.add_point(Point2d::new(3.0, 4.0));
         sketch.add_constraint(Constraint::new_dimensional(
@@ -3363,6 +3540,14 @@ mod tests {
 
         let report = analyze_dofs(&sketch);
         assert!(report.is_fully_constrained(), "got {:?}", report.status);
+        assert!(
+            report.redundant.is_empty() && report.conflicts.is_empty(),
+            "a tangency is not a redundancy: {report:?}"
+        );
+        assert!(
+            report.singular_configuration,
+            "the tangent pair must be reported singular, not silently fully constrained: {report:?}"
+        );
         assert_eq!(report.components.len(), 2, "got {:?}", report.components);
         for c in &report.components {
             assert_eq!(
@@ -3423,6 +3608,552 @@ mod tests {
             report.status
         );
         assert_eq!(report.components.len(), 2, "got {:?}", report.components);
+    }
+
+    // ── Rank pass runs unconditionally ─────────────────────────────
+    //
+    // A per-component tally that BALANCES is not proof of rank: two
+    // identical constraints remove the same DOF twice, and the count
+    // cannot tell "2 removed" from "1 removed twice". Skipping the
+    // numerical pass exactly when the tally balances is therefore the
+    // one case where the count's blind spot goes unexamined.
+
+    #[test]
+    fn duplicate_coordinate_constraints_are_not_fully_constrained() {
+        // One free point (2 DOF) + XCoordinate(0.0) TWICE. The tally
+        // balances (2 removed vs 2 free) and every component is
+        // "FullyConstrained" by count — while y is untouched and one
+        // of the two X rows is linearly dependent on the other.
+        let sketch = fresh_sketch();
+        let p = sketch.add_point(Point2d::new(0.0, 0.0));
+        for _ in 0..2 {
+            sketch.add_constraint(Constraint::new_dimensional(
+                DimensionalConstraint::XCoordinate(0.0),
+                vec![EntityRef::Point(p)],
+                ConstraintPriority::Required,
+            ));
+        }
+
+        let report = analyze_dofs(&sketch);
+        assert_eq!(
+            report.total_free_dofs, 2,
+            "one free point carries 2 DOF: {report:?}"
+        );
+        assert_eq!(
+            report.constraint_dofs_removed, 2,
+            "the structural tally balances — that is the trap: {report:?}"
+        );
+        assert_eq!(
+            report.redundant.len(),
+            1,
+            concat!(
+                "the second XCoordinate row is linearly dependent and ",
+                "satisfied — exactly one redundant constraint, got {:?}"
+            ),
+            report.redundant
+        );
+        assert!(
+            report.conflicts.is_empty(),
+            "two IDENTICAL values cannot conflict, got {:?}",
+            report.conflicts
+        );
+        assert_eq!(
+            report.status,
+            DofStatus::UnderConstrained { dofs: 1 },
+            concat!(
+                "y is free — the balanced count must not report ",
+                "FullyConstrained, got {:?}"
+            ),
+            report.status
+        );
+        for c in &report.components {
+            assert_ne!(
+                c.status,
+                DofStatus::FullyConstrained,
+                concat!(
+                    "the component owning the duplicate must not read fully ",
+                    "constrained either: {:?}"
+                ),
+                report.components
+            );
+        }
+    }
+
+    #[test]
+    fn contradictory_coordinate_constraints_report_a_conflict() {
+        // One free point + XCoordinate(5.0) + XCoordinate(7.0). The
+        // tally balances identically to the duplicate case above, but
+        // the dependent row's residual cannot be driven to zero — the
+        // system is inconsistent, and a balanced count must never
+        // present it as fully constrained.
+        let sketch = fresh_sketch();
+        let p = sketch.add_point(Point2d::new(0.0, 0.0));
+        for v in [5.0, 7.0] {
+            sketch.add_constraint(Constraint::new_dimensional(
+                DimensionalConstraint::XCoordinate(v),
+                vec![EntityRef::Point(p)],
+                ConstraintPriority::Required,
+            ));
+        }
+
+        let report = analyze_dofs(&sketch);
+        assert_eq!(report.total_free_dofs, 2, "{report:?}");
+        assert_eq!(
+            report.constraint_dofs_removed, 2,
+            "the structural tally balances — that is the trap: {report:?}"
+        );
+        assert_eq!(
+            report.conflicts.len(),
+            1,
+            concat!(
+                "x cannot be both 5 and 7 — the dependent row is a ",
+                "conflict, got {:?}"
+            ),
+            report.conflicts
+        );
+        assert!(
+            report.redundant.is_empty(),
+            "a violated dependent row is a conflict, not redundancy, got {:?}",
+            report.redundant
+        );
+        assert!(
+            !report.is_fully_constrained(),
+            "a contradictory system is never fully constrained, got {:?}",
+            report.status
+        );
+        assert_eq!(
+            report.status,
+            DofStatus::OverConstrained {
+                conflicting_constraints: 1
+            },
+            "over outranks under in the fold, got {:?}",
+            report.status
+        );
+    }
+
+    #[test]
+    fn genuinely_fully_constrained_triangle_stays_fully_constrained() {
+        // CONTROL for the two REDs above: a non-degenerate triangle
+        // pinned by 4 coordinate constraints + 2 distances. 6 free
+        // DOF, 6 removed, and the Jacobian really is rank 6 — the
+        // unconditional rank pass must confirm the count, not
+        // contradict it, and both diagnosis lists must stay empty.
+        //
+        // The apex is deliberately OFF the a–b carrier line: a
+        // colinear apex makes both distance gradients parallel, which
+        // is rank-deficient at the solution even though the solution
+        // is unique.
+        let sketch = fresh_sketch();
+        let a = sketch.add_point(Point2d::new(0.0, 0.0));
+        let b = sketch.add_point(Point2d::new(4.0, 0.0));
+        let c = sketch.add_point(Point2d::new(1.0, 3.0));
+        let pin = |v, e| {
+            sketch.add_constraint(Constraint::new_dimensional(
+                v,
+                e,
+                ConstraintPriority::Required,
+            ));
+        };
+        pin(
+            DimensionalConstraint::XCoordinate(0.0),
+            vec![EntityRef::Point(a)],
+        );
+        pin(
+            DimensionalConstraint::YCoordinate(0.0),
+            vec![EntityRef::Point(a)],
+        );
+        pin(
+            DimensionalConstraint::XCoordinate(4.0),
+            vec![EntityRef::Point(b)],
+        );
+        pin(
+            DimensionalConstraint::YCoordinate(0.0),
+            vec![EntityRef::Point(b)],
+        );
+        pin(
+            DimensionalConstraint::Distance(10.0f64.sqrt()),
+            vec![EntityRef::Point(a), EntityRef::Point(c)],
+        );
+        pin(
+            DimensionalConstraint::Distance(18.0f64.sqrt()),
+            vec![EntityRef::Point(b), EntityRef::Point(c)],
+        );
+
+        let report = analyze_dofs(&sketch);
+        assert_eq!(report.total_free_dofs, 6, "{report:?}");
+        assert_eq!(report.constraint_dofs_removed, 6, "{report:?}");
+        assert!(
+            report.redundant.is_empty(),
+            "a rank-6 system has nothing redundant, got {:?}",
+            report.redundant
+        );
+        assert!(
+            report.conflicts.is_empty(),
+            "a consistent system has no conflicts, got {:?}",
+            report.conflicts
+        );
+        assert_eq!(
+            report.status,
+            DofStatus::FullyConstrained,
+            "the control must survive the unconditional rank pass, got {:?}",
+            report.status
+        );
+    }
+
+    // ── Singular configurations ────────────────────────────────
+    //
+    // Some geometry is uniquely determined by constraints whose
+    // gradients vanish where it stands. Reporting that as
+    // under-constrained would be false; reporting it as plainly
+    // fully constrained would hide that a solver stepping from here
+    // has no first-order restoring direction. Both facts ship.
+
+    /// Two points 5 apart, one pinned, the other pinned in x only --
+    /// with b directly right of a, so the circle about a is TANGENT to
+    /// the line x=6. `b.y` is determined (only y=2 satisfies both) and
+    /// the Distance row's gradient in `b.y` is exactly zero.
+    fn tangent_pair_sketch() -> Sketch {
+        let sketch = fresh_sketch();
+        let a = sketch.add_point(Point2d::new(1.0, 2.0));
+        let b = sketch.add_point(Point2d::new(6.0, 2.0));
+        let mut pin = |v, e| {
+            sketch.add_constraint(Constraint::new_dimensional(
+                v,
+                e,
+                ConstraintPriority::Required,
+            ));
+        };
+        pin(
+            DimensionalConstraint::Distance(5.0),
+            vec![EntityRef::Point(a), EntityRef::Point(b)],
+        );
+        pin(
+            DimensionalConstraint::XCoordinate(1.0),
+            vec![EntityRef::Point(a)],
+        );
+        pin(
+            DimensionalConstraint::YCoordinate(2.0),
+            vec![EntityRef::Point(a)],
+        );
+        pin(
+            DimensionalConstraint::XCoordinate(6.0),
+            vec![EntityRef::Point(b)],
+        );
+        drop(pin);
+        sketch
+    }
+
+    #[test]
+    fn a_tangent_configuration_is_fully_constrained_and_flagged_singular() {
+        let sketch = tangent_pair_sketch();
+        let report = analyze_dofs(&sketch);
+        assert_eq!(
+            report.status,
+            DofStatus::FullyConstrained,
+            concat!(
+                "the pair is uniquely determined \u{2014} a vanishing gradient is ",
+                "not a free DOF: {:?}"
+            ),
+            report
+        );
+        assert!(
+            report.redundant.is_empty(),
+            "dependence is judged at generic position, got {:?}",
+            report.redundant
+        );
+        assert!(
+            report.conflicts.is_empty(),
+            "the pair is satisfiable, got {:?}",
+            report.conflicts
+        );
+        assert!(
+            report.singular_configuration,
+            concat!(
+                "the Jacobian is rank 3 of 4 here \u{2014} that must be reported, ",
+                "not swallowed: {:?}"
+            ),
+            report
+        );
+    }
+
+    #[test]
+    fn an_ordinary_fully_constrained_sketch_is_not_flagged_singular() {
+        // MIRROR of the test above, same constraints, same 3-4-5
+        // distance -- only b moved off the tangent point. Without this
+        // pair a `singular_configuration` hard-wired to `true` would
+        // pass the tangent test.
+        let sketch = fresh_sketch();
+        let a = sketch.add_point(Point2d::new(1.0, 2.0));
+        let b = sketch.add_point(Point2d::new(4.0, 6.0));
+        let mut pin = |v, e| {
+            sketch.add_constraint(Constraint::new_dimensional(
+                v,
+                e,
+                ConstraintPriority::Required,
+            ));
+        };
+        pin(
+            DimensionalConstraint::Distance(5.0),
+            vec![EntityRef::Point(a), EntityRef::Point(b)],
+        );
+        pin(
+            DimensionalConstraint::XCoordinate(1.0),
+            vec![EntityRef::Point(a)],
+        );
+        pin(
+            DimensionalConstraint::YCoordinate(2.0),
+            vec![EntityRef::Point(a)],
+        );
+        pin(
+            DimensionalConstraint::XCoordinate(4.0),
+            vec![EntityRef::Point(b)],
+        );
+        drop(pin);
+
+        let report = analyze_dofs(&sketch);
+        assert_eq!(report.status, DofStatus::FullyConstrained, "{report:?}");
+        assert!(
+            !report.singular_configuration,
+            "a generic configuration is not singular: {report:?}"
+        );
+    }
+
+    #[test]
+    fn a_structurally_duplicated_constraint_stays_redundant_at_generic_position() {
+        // The guard on the guard: judging dependence at generic
+        // position must NOT rescue a genuine duplicate. Two identical
+        // `XCoordinate` rows are dependent at every configuration, so
+        // the perturbation changes nothing and the verdict stands.
+        let sketch = fresh_sketch();
+        let p = sketch.add_point(Point2d::new(0.0, 0.0));
+        for _ in 0..2 {
+            sketch.add_constraint(Constraint::new_dimensional(
+                DimensionalConstraint::XCoordinate(0.0),
+                vec![EntityRef::Point(p)],
+                ConstraintPriority::Required,
+            ));
+        }
+        let report = analyze_dofs(&sketch);
+        assert_eq!(report.redundant.len(), 1, "{report:?}");
+        assert_eq!(
+            report.status,
+            DofStatus::UnderConstrained { dofs: 1 },
+            "{report:?}"
+        );
+        assert!(
+            !report.singular_configuration,
+            concat!(
+                "a duplicate is dependent everywhere \u{2014} the actual and ",
+                "generic ranks agree: {:?}"
+            ),
+            report
+        );
+    }
+
+    #[test]
+    fn redundant_equations_do_not_make_a_component_under_constrained() {
+        // A patterned sketch carries MORE residual rows than it has
+        // parameters: every instance repeats the source's `Equal`, and
+        // the web that places the instances already implies it. Those
+        // spare rows are linearly dependent and genuinely redundant --
+        // and the sketch is still fully constrained, because every
+        // parameter is pinned by an INDEPENDENT row.
+        //
+        // The measure is therefore the rank DEFICIENCY (parameters
+        // minus rank), not the presence of a redundant constraint. An
+        // earlier cut of this gate downgraded any balanced component
+        // that owned a flagged constraint, and turned this ring --
+        // three quarter-arcs on a fixed hub, fully dimensioned -- into
+        // `UnderConstrained{2}`.
+        let sketch = fresh_sketch();
+        let hub = sketch.add_point(Point2d::new(0.0, 0.0));
+        if let Some(mut e) = sketch.points().get_mut(&hub) {
+            e.value_mut().fix();
+        } else {
+            panic!("hub missing");
+        }
+        let e1 = sketch.add_point(Point2d::new(10.0, 0.0));
+        let e2 = sketch.add_point(Point2d::new(0.0, 10.0));
+        let src = sketch
+            .add_arc(e1, e2, 10.0, true, false)
+            .expect("source arc");
+        let mut pin = |v, e| {
+            sketch.add_constraint(Constraint::new_dimensional(
+                v,
+                e,
+                ConstraintPriority::Required,
+            ));
+        };
+        pin(
+            DimensionalConstraint::XCoordinate(10.0),
+            vec![EntityRef::Point(e1)],
+        );
+        pin(
+            DimensionalConstraint::YCoordinate(0.0),
+            vec![EntityRef::Point(e1)],
+        );
+        pin(
+            DimensionalConstraint::XCoordinate(0.0),
+            vec![EntityRef::Point(e2)],
+        );
+        pin(
+            DimensionalConstraint::YCoordinate(10.0),
+            vec![EntityRef::Point(e2)],
+        );
+        pin(
+            DimensionalConstraint::Radius(10.0),
+            vec![EntityRef::Arc(src)],
+        );
+        drop(pin);
+        super::super::sketch_ops::circular_pattern(
+            &sketch,
+            &[EntityRef::Arc(src)],
+            &hub,
+            3,
+            std::f64::consts::FRAC_PI_2,
+        )
+        .expect("arc-source pattern");
+
+        let report = analyze_dofs(&sketch);
+        assert_eq!(
+            report.total_free_dofs, report.constraint_dofs_removed,
+            "the structural tally balances: {report:?}"
+        );
+        assert_eq!(
+            report.status,
+            DofStatus::FullyConstrained,
+            concat!(
+                "a spare equation is not a free direction \u{2014} every parameter ",
+                "is pinned by an independent row: {:?}"
+            ),
+            report
+        );
+        // The fixture must actually carry dependent rows, or it proves
+        // nothing. Assert that on the RANK, not on `redundant.len()`:
+        // constraint ids are random uuids and the rows are scanned in
+        // id order, so which constraint of a dependent set ends up
+        // flagged varies between processes (a set landing on a 2-row
+        // `Coincident` leaves it unflagged, since a constraint is
+        // flagged only when ALL its rows are dependent). Rows-over-rank
+        // is the same fact without the lottery.
+        let diagnosis = build_diagnostic_solver(&sketch, sketch.all_constraints()).diagnose();
+        assert!(
+            diagnosis.jacobian_rows > diagnosis.jacobian_rank,
+            concat!(
+                "the fixture must carry dependent rows, or it proves ",
+                "nothing: {:?}"
+            ),
+            diagnosis
+        );
+        assert!(
+            report.conflicts.is_empty(),
+            "the ring is satisfiable: {:?}",
+            report.conflicts
+        );
+    }
+
+    #[test]
+    fn the_two_decompositions_partition_constraints_identically() {
+        // `analyze_dofs` folds over the SKETCH-side components
+        // (`decompose::connected_components`) and reads each one's rank
+        // deficiency off a SOLVER-side block
+        // (`ConstraintSolver::split_components`), matched through
+        // constraint ids. The two are separate code paths over the same
+        // classifiers. If they ever disagreed, a component would read a
+        // neighbour's deficiency and a `FullyConstrained` verdict would
+        // rest on the wrong block.
+        //
+        // Assert the partitions agree at scale: 20 disconnected pinned
+        // pairs, a 10-point dimension chain, and one entirely
+        // unconstrained point (which is a component with no
+        // constraints, so it owns NO block -- the counts must account
+        // for that asymmetry rather than assume 1:1).
+        let sketch = fresh_sketch();
+        let mut pin = |v, e| {
+            sketch.add_constraint(Constraint::new_dimensional(
+                v,
+                e,
+                ConstraintPriority::Required,
+            ));
+        };
+        for k in 0..20 {
+            let x = 100.0 * f64::from(k);
+            let a = sketch.add_point(Point2d::new(x, 0.0));
+            let b = sketch.add_point(Point2d::new(x + 3.0, 4.0));
+            pin(
+                DimensionalConstraint::Distance(5.0),
+                vec![EntityRef::Point(a), EntityRef::Point(b)],
+            );
+            pin(
+                DimensionalConstraint::XCoordinate(x),
+                vec![EntityRef::Point(a)],
+            );
+        }
+        let mut previous: Option<crate::sketch2d::Point2dId> = None;
+        for k in 0..10 {
+            let id = sketch.add_point(Point2d::new(-10.0 * f64::from(k), -50.0));
+            if let Some(prev) = previous {
+                pin(
+                    DimensionalConstraint::Distance(10.0),
+                    vec![EntityRef::Point(prev), EntityRef::Point(id)],
+                );
+            }
+            pin(
+                DimensionalConstraint::YCoordinate(-50.0),
+                vec![EntityRef::Point(id)],
+            );
+            previous = Some(id);
+        }
+        sketch.add_point(Point2d::new(999.0, 999.0));
+        drop(pin);
+
+        let report = analyze_dofs(&sketch);
+        let diagnosis = build_diagnostic_solver(&sketch, sketch.all_constraints()).diagnose();
+
+        let constrained_components = report
+            .components
+            .iter()
+            .filter(|c| c.constraints > 0)
+            .count();
+        assert_eq!(
+            report.components.len(),
+            constrained_components + 1,
+            "exactly one component (the loose point) owns no constraint: {:?}",
+            report.components
+        );
+        assert_eq!(
+            constrained_components, diagnosis.jacobian_blocks,
+            concat!(
+                "every constraint-bearing sketch component must be exactly one ",
+                "solver block: {} components vs {} blocks"
+            ),
+            constrained_components, diagnosis.jacobian_blocks
+        );
+        assert!(
+            report.unverified_components.is_empty(),
+            "every component's rank must be readable: {:?}",
+            report.unverified_components
+        );
+        // And the whole constraint set is accounted for exactly once
+        // across the blocks -- no constraint in two, none in none.
+        let mut blocked: Vec<ConstraintId> = diagnosis
+            .block_ranks
+            .iter()
+            .flat_map(|b| b.constraints.iter().copied())
+            .collect();
+        let total = blocked.len();
+        blocked.sort_by_key(|c| c.0);
+        blocked.dedup();
+        assert_eq!(
+            blocked.len(),
+            total,
+            "no constraint may appear in two blocks"
+        );
+        assert_eq!(
+            total,
+            sketch.all_constraints().len(),
+            "every constraint must appear in exactly one block"
+        );
     }
 
     // ── B-2 hardening: dragging a fixed point is rejected ──────────

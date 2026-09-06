@@ -630,6 +630,24 @@ fn red_offset_slot_keeps_tangent_joins_and_grows_arc_radii() {
         DofStatus::FullyConstrained,
         "slot offset must be fully maintained: {dof:?}"
     );
+    // A slot cap is a SEMICIRCLE by definition: its chord is a
+    // diameter, and for an arc parameterised by chord c and sagitta h,
+    // R = h/2 + c^2/(8h), so dR/dh = 1/2 - c^2/(8h^2) -- exactly zero
+    // at h = c/2. The Radius dimension pins the cap only to SECOND
+    // order, so the Jacobian is rank-deficient here while the shape
+    // stays uniquely determined. The verdict is taken at generic
+    // position (hence FullyConstrained, and no redundancy: a vanishing
+    // gradient is not a duplicate constraint) and the degeneracy is
+    // reported separately.
+    assert!(
+        dof.singular_configuration,
+        "semicircular caps make this configuration first-order singular: {dof:?}"
+    );
+    assert!(
+        dof.redundant.is_empty(),
+        "the Radius dimensions are not redundant, only stationary: {:?}",
+        dof.redundant
+    );
     let report = s.solve_constraints().expect("solve");
     assert!(report.violations.is_empty(), "{:?}", report.violations);
 

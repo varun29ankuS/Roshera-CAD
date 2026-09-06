@@ -289,9 +289,17 @@ export interface DofReport {
    * Constraint ids the diagnose pass classified as linearly
    * dependent on an earlier row AND whose post-solve residual is
    * within tolerance — i.e. duplicates of an already-satisfied
-   * constraint. Removing them does not change the solution. Empty
-   * when the structural verdict is `fully_constrained` (the rank
-   * pass is O(rows²·cols) and is skipped on the fast path).
+   * constraint. Removing them does not change the solution.
+   *
+   * ALWAYS populated. The rank pass used to be skipped whenever the
+   * structural verdict was `fully_constrained`, which was exactly the
+   * case a DOF tally cannot adjudicate — it cannot tell "two DOFs
+   * removed" from "one DOF removed twice" — so a duplicated
+   * constraint reported `fully_constrained` with an empty list. It now
+   * runs on every request; dependence is judged at a generic
+   * configuration, so a constraint whose gradient merely vanishes
+   * where the sketch happens to stand is NOT listed here (see
+   * `singular_configuration`).
    *
    * Slice H, added 2026-05-12.
    */
@@ -304,6 +312,27 @@ export interface DofReport {
    * same point). Removing them removes the inconsistency.
    */
   conflicts: string[]
+  /**
+   * The constraint system is SINGULAR where the sketch currently
+   * stands: its Jacobian has lower rank here than at a generic
+   * configuration. The shape can still be uniquely determined — a
+   * slot's semicircular cap pins its own radius only to second order,
+   * a circle tangent to the line that pins it is the same story — so
+   * this never downgrades `status`. Treat it as "determined, but a
+   * drag or re-solve from here has no first-order restoring
+   * direction": expect a slow or wandering solve, and nudge the
+   * geometry before relying on one. `false` on ordinary sketches.
+   */
+  singular_configuration?: boolean
+  /**
+   * Indices into the per-component breakdown whose rank the backend
+   * could not read, because the two decompositions it cross-checks
+   * disagreed. Should always be empty; a non-empty list means those
+   * components are reported `under_constrained` because "we could not
+   * measure it" is not "we measured zero", and their DOF numbers are
+   * a floor rather than a measurement.
+   */
+  unverified_components?: number[]
 }
 
 /** Output of `POST /api/csketch/{id}/solve` and `/drag`. */

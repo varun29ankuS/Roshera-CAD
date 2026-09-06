@@ -50,6 +50,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 
+use super::constraint_solver::ConstraintDiagnosis;
 use super::constraints::{Constraint, ConstraintId, ConstraintType, EntityRef};
 use super::sketch_solver::{ComponentDof, DofStatus};
 use super::sketch_topology::{ProfileType, SketchTopology};
@@ -319,6 +320,20 @@ pub struct DofSnapshot {
     /// (`#[serde(default)]`) — empty on pre-H4 payloads.
     #[serde(default)]
     pub components: Vec<ComponentDof>,
+    /// The constraint system is singular at the sketch's current
+    /// configuration, copied from
+    /// [`super::sketch_solver::DofReport::singular_configuration`] --
+    /// determined geometry standing on a point where its own
+    /// linearisation loses rank. Never a downgrade of `status`; the
+    /// verdict is taken at generic position.
+    #[serde(default)]
+    pub singular_configuration: bool,
+    /// Components whose rank the pass could not read, copied from
+    /// [`super::sketch_solver::DofReport::unverified_components`]. A
+    /// certificate that could not measure a component says so; it does
+    /// not report zero.
+    #[serde(default)]
+    pub unverified_components: Vec<usize>,
 }
 
 /// How the solver's decomposition layers saw the sketch
@@ -508,6 +523,12 @@ struct SystemAnalysis {
     numeric_conflicts: usize,
     redundant: usize,
     static_pairs: Vec<(ConstraintId, ConstraintId)>,
+    /// The rank diagnosis this analysis ran, handed on to
+    /// `analyze_dofs` so the certificate's DOF snapshot and its
+    /// per-constraint roles are two readings of ONE scan rather than
+    /// two scans that can disagree -- and so the certificate pays for
+    /// the Jacobian once.
+    diagnosis: ConstraintDiagnosis,
 }
 
 /// Certify a sketch: run DOF analysis, validation, topology, and the isolated
@@ -515,13 +536,17 @@ struct SystemAnalysis {
 /// witnesses), then package the kernel's verdict. Pure (`&Sketch`) — no
 /// mutation, no solve side effect (the diagnostic solver owns its own state).
 pub fn certify_sketch(sketch: &Sketch) -> SketchValidityCertificate {
-    let dof = sketch.analyze_dofs();
+    // The system analysis runs FIRST: it owns the rank diagnosis, and
+    // the DOF report is derived from that same diagnosis rather than
+    // computing a second one. Two scans of one Jacobian is not merely
+    // wasted work -- it is two verdicts that can disagree inside a
+    // single certificate.
+    let system = analyze_constraint_system(sketch);
+    let dof = super::sketch_solver::analyze_dofs_with_diagnosis(sketch, Some(&system.diagnosis));
     let validation = SketchValidator::new().validate(sketch);
     let profile = SketchTopology::analyze(sketch, &sketch.tolerance)
         .map(|t| t.profile_type())
         .unwrap_or(ProfileType::Open);
-
-    let system = analyze_constraint_system(sketch);
 
     let numeric_conflicts = system.numeric_conflicts;
     let redundant = system.redundant;
@@ -624,6 +649,8 @@ pub fn certify_sketch(sketch: &Sketch) -> SketchValidityCertificate {
             constraint_dofs_removed: dof.constraint_dofs_removed,
             status: dof.status,
             components: dof.components,
+            singular_configuration: dof.singular_configuration,
+            unverified_components: dof.unverified_components,
         },
         decomposition: system.decomposition,
         constraint_facts: system.constraint_facts,
@@ -718,6 +745,13 @@ fn continuity_facts(sketch: &Sketch) -> Vec<ContinuityFact> {
 fn analyze_constraint_system(sketch: &Sketch) -> SystemAnalysis {
     let mut solver =
         super::sketch_solver::build_diagnostic_solver(sketch, sketch.all_constraints());
+    // Rank the system where the SKETCH stands, before Newton moves the
+    // diagnostic solver's copy: `singular_configuration` is a statement
+    // about the sketch's own configuration, and taking the scan after
+    // the solve would make it a statement about wherever the solve
+    // landed. Matches `analyze_dofs`'s own ordering exactly, which is
+    // what lets the two share one diagnosis.
+    let rank_profile = solver.rank_profile();
     let _ = solver.solve();
 
     let residual_pairs = solver.residuals_by_constraint();
@@ -729,7 +763,7 @@ fn analyze_constraint_system(sketch: &Sketch) -> SystemAnalysis {
         .sum::<f64>()
         .sqrt();
 
-    let diagnosis = solver.diagnose();
+    let diagnosis = solver.diagnose_from(&rank_profile);
     let probes = solver.component_probes();
 
     let mut static_pairs = sketch.find_constraint_conflicts();
@@ -910,6 +944,7 @@ fn analyze_constraint_system(sketch: &Sketch) -> SystemAnalysis {
         numeric_conflicts,
         redundant,
         static_pairs,
+        diagnosis,
     }
 }
 
@@ -1090,6 +1125,182 @@ fn qx(
 mod tests {
     use super::*;
     use crate::sketch2d::{Point2d, Sketch, SketchAnchor};
+
+    /// `cert.dof` is a straight copy of `analyze_dofs`'s verdict, so a
+    /// balanced-but-rank-deficient sketch used to reach the MCP surface
+    /// (`psketch_dof`) labelled `FullyConstrained`. `certify_sketch`
+    /// already ran the rank pass unconditionally for its per-constraint
+    /// roles — `redundant_constraints` was 1 while `dof.status` said
+    /// fully constrained IN THE SAME CERTIFICATE. The two must agree.
+    #[test]
+    fn certificate_dof_status_agrees_with_its_own_rank_diagnosis() {
+        use crate::sketch2d::constraints::{
+            Constraint, ConstraintPriority, DimensionalConstraint, EntityRef,
+        };
+        use crate::sketch2d::sketch_solver::DofStatus;
+
+        let sketch = Sketch::new("duplicate-x".to_string(), SketchAnchor::xy());
+        let p = sketch.add_point(Point2d::new(0.0, 0.0));
+        for _ in 0..2 {
+            sketch.add_constraint(Constraint::new_dimensional(
+                DimensionalConstraint::XCoordinate(0.0),
+                vec![EntityRef::Point(p)],
+                ConstraintPriority::Required,
+            ));
+        }
+
+        let cert = certify_sketch(&sketch);
+        assert_eq!(
+            cert.redundant_constraints, 1,
+            "the rank pass certify_sketch already runs finds one duplicate: {cert:?}"
+        );
+        assert_eq!(
+            cert.dof.status,
+            DofStatus::UnderConstrained { dofs: 1 },
+            concat!(
+                "the DOF snapshot must not contradict the certificate's own ",
+                "redundancy count: {:?}"
+            ),
+            cert.dof
+        );
+        assert!(
+            !cert.constrainedness.is_fully_constrained(),
+            "y is free — not fully constrained: {:?}",
+            cert.constrainedness
+        );
+    }
+
+    /// A determined shape standing on a singular configuration must
+    /// reach the certificate as BOTH facts: `FullyConstrained` (the
+    /// verdict, taken at generic position) and
+    /// `singular_configuration` (the numeric fact about where the
+    /// sketch stands). Neither may be silently dropped, and the
+    /// tangency must not be reported as a redundant constraint.
+    #[test]
+    fn certificate_reports_a_singular_configuration_without_downgrading_the_verdict() {
+        use crate::sketch2d::constraints::{
+            Constraint, ConstraintPriority, DimensionalConstraint, EntityRef,
+        };
+
+        let sketch = Sketch::new("tangent".to_string(), SketchAnchor::xy());
+        let a = sketch.add_point(Point2d::new(1.0, 2.0));
+        // b directly right of a: the circle about a is tangent to x=6,
+        // so b.y is determined and the Distance gradient in b.y is 0.
+        let b = sketch.add_point(Point2d::new(6.0, 2.0));
+        for (dc, entities) in [
+            (
+                DimensionalConstraint::Distance(5.0),
+                vec![EntityRef::Point(a), EntityRef::Point(b)],
+            ),
+            (
+                DimensionalConstraint::XCoordinate(1.0),
+                vec![EntityRef::Point(a)],
+            ),
+            (
+                DimensionalConstraint::YCoordinate(2.0),
+                vec![EntityRef::Point(a)],
+            ),
+            (
+                DimensionalConstraint::XCoordinate(6.0),
+                vec![EntityRef::Point(b)],
+            ),
+        ] {
+            sketch.add_constraint(Constraint::new_dimensional(
+                dc,
+                entities,
+                ConstraintPriority::Required,
+            ));
+        }
+
+        let cert = certify_sketch(&sketch);
+        assert!(
+            cert.constrainedness.is_fully_constrained(),
+            "a determined pair is fully constrained: {:?}",
+            cert.constrainedness
+        );
+        assert_eq!(
+            cert.redundant_constraints, 0,
+            "a vanishing gradient is not a redundant constraint: {cert:?}"
+        );
+        assert!(
+            cert.dof.singular_configuration,
+            "the certificate must carry the singularity: {:?}",
+            cert.dof
+        );
+    }
+
+    /// The certificate's DOF snapshot and its per-constraint roles are
+    /// two readings of ONE rank diagnosis. Assert they cannot drift:
+    /// the snapshot must equal what `analyze_dofs` reports on its own,
+    /// field for field, on a singular sketch and on a redundant one.
+    #[test]
+    fn certificate_dof_snapshot_matches_a_standalone_dof_analysis() {
+        use crate::sketch2d::constraints::{
+            Constraint, ConstraintPriority, DimensionalConstraint, EntityRef,
+        };
+
+        // (1) tangent pair -- singular, fully constrained.
+        let tangent = Sketch::new("tangent".to_string(), SketchAnchor::xy());
+        let a = tangent.add_point(Point2d::new(1.0, 2.0));
+        let b = tangent.add_point(Point2d::new(6.0, 2.0));
+        for (dc, entities) in [
+            (
+                DimensionalConstraint::Distance(5.0),
+                vec![EntityRef::Point(a), EntityRef::Point(b)],
+            ),
+            (
+                DimensionalConstraint::XCoordinate(1.0),
+                vec![EntityRef::Point(a)],
+            ),
+            (
+                DimensionalConstraint::YCoordinate(2.0),
+                vec![EntityRef::Point(a)],
+            ),
+            (
+                DimensionalConstraint::XCoordinate(6.0),
+                vec![EntityRef::Point(b)],
+            ),
+        ] {
+            tangent.add_constraint(Constraint::new_dimensional(
+                dc,
+                entities,
+                ConstraintPriority::Required,
+            ));
+        }
+
+        // (2) duplicate x -- redundant, under-constrained.
+        let duplicate = Sketch::new("duplicate".to_string(), SketchAnchor::xy());
+        let p = duplicate.add_point(Point2d::new(0.0, 0.0));
+        for _ in 0..2 {
+            duplicate.add_constraint(Constraint::new_dimensional(
+                DimensionalConstraint::XCoordinate(0.0),
+                vec![EntityRef::Point(p)],
+                ConstraintPriority::Required,
+            ));
+        }
+
+        for sketch in [&tangent, &duplicate] {
+            let standalone = sketch.analyze_dofs();
+            let cert = certify_sketch(sketch);
+            assert_eq!(
+                cert.dof.status, standalone.status,
+                "shared diagnosis, one status: {cert:?}"
+            );
+            assert_eq!(
+                cert.dof.singular_configuration, standalone.singular_configuration,
+                "shared diagnosis, one singularity verdict: {cert:?}"
+            );
+            assert_eq!(
+                cert.dof.components, standalone.components,
+                "shared diagnosis, one component fold: {cert:?}"
+            );
+            assert_eq!(
+                cert.redundant_constraints,
+                standalone.redundant.len(),
+                "shared diagnosis, one redundancy count: {cert:?}"
+            );
+        }
+    }
 
     /// A clean, unconstrained triangle: three points joined by three lines.
     /// It is geometrically valid and does not self-intersect, so the kernel
