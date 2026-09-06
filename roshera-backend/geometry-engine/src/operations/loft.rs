@@ -76,7 +76,13 @@ pub enum LoftType {
     Linear,
     /// Smooth cubic interpolation
     Cubic,
-    /// Minimize twist between profiles
+    /// Minimize twist between profiles.
+    ///
+    /// Since `register_correspondence` runs ahead of the loft-type dispatch,
+    /// EVERY type minimises twist; this variant is redundant by construction
+    /// and produces a body bit-identical to [`LoftType::Linear`]. It is kept
+    /// because it is a published intent and callers name it. See
+    /// `create_minimal_twist_loft`.
     MinimalTwist,
     /// Follow guide curves exactly
     Guided,
@@ -133,12 +139,40 @@ fn loft_profiles_body(
     // (single self-closing edges yield only 1 vertex; mixing those with
     // polygonal profiles would otherwise fail IncompatibleProfiles). The
     // target is chord-sag driven — see `densify_correspondence`.
+    // Kept so the registration gate below can tell a correspondence that
+    // SURVIVED densification from one densification silently replaced.
+    let pre_densify = correspondence.clone();
     let correspondence = densify_correspondence(
         model,
         &face_profiles,
         correspondence,
         options.common.tolerance,
     )?;
+    // Decide WHICH sample on one ring pairs with which on the next. Without
+    // this the pairing is whatever index each profile's own loop happened to
+    // start at — see `register_correspondence`.
+    //
+    // The one correspondence that must NOT be re-registered is one the CALLER
+    // supplied and that reached this point intact: that is the caller's own
+    // assertion about the pairing, including a deliberate twist, and the loft
+    // has no standing to overrule it.
+    //
+    // "Intact" has to be measured, not assumed. `densify_correspondence`
+    // resamples EVERY profile from its own outer loop whenever any ring's
+    // length differs from the chord-sag target, which throws a supplied
+    // correspondence away and rebuilds the very index-k-to-index-k pairing this
+    // step exists to repair. A gate on `options.vertex_correspondence.is_some()`
+    // alone therefore skips registration for exactly the caller whose pairing
+    // was already discarded — honouring a correspondence that no longer exists.
+    // So the gate compares the rings before and after densification and only
+    // stands down when they are the same rings.
+    let supplied_survived_densify =
+        options.vertex_correspondence.is_some() && correspondence == pre_densify;
+    let correspondence = if supplied_survived_densify {
+        correspondence
+    } else {
+        register_correspondence(model, correspondence)?
+    };
 
     // Create lofted solid based on type
     let solid_id = match options.loft_type {
@@ -579,25 +613,35 @@ fn create_cubic_loft(
     Ok(model.solids.add(solid))
 }
 
-/// Create a minimal twist loft
+/// Create a minimal twist loft.
 ///
-/// Minimises accumulated torsion between consecutive profiles by solving for
-/// the optimal cyclic index rotation at each profile boundary. For each pair
-/// of adjacent profiles, the correspondence is rotated by the offset that
-/// minimises the sum of squared Euclidean distances between corresponding
-/// vertices. The optimised correspondence is then passed to the linear loft
-/// builder, yielding a solid that avoids spurious twisting artefacts without
-/// requiring guide curves.
+/// Minimising accumulated torsion between consecutive profiles used to live
+/// HERE, as a per-pair search for the cyclic index rotation minimising the sum
+/// of squared Euclidean distances between corresponding vertices. That search
+/// has MOVED to [`register_correspondence`], which `loft_profiles_body` runs
+/// before the loft-type dispatch — so every loft type is now built on a
+/// registered correspondence, not just this one. The move is the fix for the
+/// defect where a `Linear` loft between a circle and a square ruled index `k`
+/// to index `k` across two unrelated index origins and built a twisted band.
 ///
-/// # Algorithm
-/// For each pair of adjacent profiles (A, B) with n vertices each:
-///   - Test all n cyclic rotations of B's vertex ordering.
-///   - Pick the rotation r* = argmin_r Σ ||A[i] − B[(i+r) mod n]||².
-///   - Apply r* to produce the re-indexed correspondence for B.
-///   - Pass the globally re-indexed correspondences to `create_linear_loft`.
+/// What that leaves here is a delegation, and deliberately so. The registration
+/// this function used to perform has already happened by the time it is called:
+/// [`register_correspondence`] minimises the SAME objective over a strictly
+/// larger candidate set (the `n` cyclic shifts this used, plus each of them
+/// composed with a reversal of traversal sense), with the same
+/// chain-to-the-previous-ring rule and the same strict `<` tie-break toward the
+/// unreversed, lowest-shift candidate. A second shift-only search over an
+/// already-registered correspondence can therefore only re-find rotation 0. It
+/// was removed rather than left running, and the property that made the removal
+/// safe is pinned by
+/// `tests/loft_orientation.rs::minimal_twist_loft_is_bit_identical_to_linear`,
+/// which asserts that `MinimalTwist` and `Linear` produce bit-identical bodies
+/// (face count, every vertex position, volume) on a dissimilar, index-offset
+/// pair — the input on which a registered and an unregistered loft differ most.
 ///
-/// # Complexity
-/// O(P · n²) where P = profile count, n = vertices per profile.
+/// The variant is kept because it is part of the public [`LoftType`] surface and
+/// names a real intent ("minimise twist"); the kernel now honours that intent
+/// for every loft type instead of only when it is asked for.
 fn create_minimal_twist_loft(
     model: &mut BRepModel,
     profiles: Vec<FaceId>,
@@ -611,72 +655,11 @@ fn create_minimal_twist_loft(
         ));
     }
 
-    // Helper: fetch position for a vertex ID
-    let vertex_pos = |model: &BRepModel, vid: VertexId| -> OperationResult<Point3> {
-        let pos = model
-            .vertices
-            .get(vid)
-            .ok_or_else(|| {
-                OperationError::InvalidGeometry(
-                    "Vertex not found in twist optimisation".to_string(),
-                )
-            })?
-            .position;
-        Ok(Point3::new(pos[0], pos[1], pos[2]))
-    };
-
-    // Build the optimised correspondence by fixing profile 0 and solving for each
-    // subsequent profile's rotation relative to the previous one.
-    let mut optimised: Vec<Vec<VertexId>> = Vec::with_capacity(num_profiles);
-    optimised.push(correspondence[0].clone());
-
-    for pi in 1..num_profiles {
-        let prev = &optimised[pi - 1];
-        let curr = &correspondence[pi];
-        let n = prev.len();
-
-        if curr.len() != n {
-            return Err(OperationError::IncompatibleProfiles);
-        }
-
-        // Collect positions of the previous ring
-        let prev_positions: Vec<Point3> = prev
-            .iter()
-            .map(|&vid| vertex_pos(model, vid))
-            .collect::<OperationResult<Vec<_>>>()?;
-
-        // Collect positions of the current ring
-        let curr_positions: Vec<Point3> = curr
-            .iter()
-            .map(|&vid| vertex_pos(model, vid))
-            .collect::<OperationResult<Vec<_>>>()?;
-
-        // Test all n cyclic rotations and pick the one with minimum total distance²
-        let mut best_rotation = 0usize;
-        let mut best_cost = f64::INFINITY;
-
-        for rotation in 0..n {
-            let cost: f64 = (0..n)
-                .map(|i| {
-                    let p = prev_positions[i];
-                    let c = curr_positions[(i + rotation) % n];
-                    let d = p - c;
-                    d.dot(&d)
-                })
-                .sum();
-            if cost < best_cost {
-                best_cost = cost;
-                best_rotation = rotation;
-            }
-        }
-
-        // Apply the optimal rotation to re-index the current profile's vertex list
-        let rotated: Vec<VertexId> = (0..n).map(|i| curr[(i + best_rotation) % n]).collect();
-        optimised.push(rotated);
-    }
-
-    // Delegate to the linear loft builder with the twist-optimised correspondence
-    create_linear_loft(model, profiles, optimised, options)
+    // The rings arrive registered (see the doc comment above): the twist search
+    // that used to run here has moved upstream of the loft-type dispatch, where
+    // it serves every type. Build from the same registered correspondence the
+    // linear path does.
+    create_linear_loft(model, profiles, correspondence, options)
 }
 
 /// Create a guided loft following guide curves
@@ -1807,6 +1790,128 @@ fn densify_correspondence(
     Ok(out)
 }
 
+/// Register each ring against the one before it, so that index `k` of ring
+/// `i` names the sample that ring `i-1`'s index `k` should actually be ruled
+/// to.
+///
+/// # Why the rings are not already registered
+///
+/// [`establish_correspondence`] reads each profile's ring off that profile's
+/// OWN outer loop, and [`densify_correspondence`] resamples each ring starting
+/// from that loop's first edge. Nothing relates one ring's index origin to the
+/// next's, so the pairing consumed by every loft path is "index `k` to index
+/// `k`" between two rings whose index origins are unrelated:
+///
+/// * a circle profile built from a self-closing `Circle` edge starts at the
+///   curve's seam (`+X` from the centre, angle 0);
+/// * a square profile starts at whichever corner the caller listed first —
+///   at 225° for a centred square listed from its `(-h, -h)` corner.
+///
+/// The result is a lateral band twisted by the difference. Its rulings cross,
+/// its quads fold, and the per-quad radial-outward test that picks each ruled
+/// face's `FaceOrientation` flips sign from quad to quad — producing a welded
+/// mesh that CLOSES yet is not consistently wound, and a certificate that reads
+/// unsound. Two congruent squares whose edge lists start one corner apart lofted
+/// to a body of volume `2/3 · side² · height` — sound, closed, oriented, and the
+/// wrong shape.
+///
+/// # The rule
+///
+/// For each consecutive pair the registration searches the full set of
+/// relabelings that preserve the ring's cyclic adjacency — the dihedral group:
+/// `n` cyclic shifts, each with and without a reversal of traversal sense — and
+/// keeps the one minimising the total squared rail length
+/// `Σ_k |p_i[σ(k)] − p_{i-1}[k]|²`. That objective is the kernel's established
+/// one: it is exactly what [`create_minimal_twist_loft`] already minimises over
+/// the shifts alone, promoted here so every loft type is built on a registered
+/// correspondence rather than only the one type that asked for it.
+///
+/// Including the reversal is what lets a section authored clockwise loft to one
+/// authored counter-clockwise: no cyclic shift can ever align rings of opposite
+/// sense, and before this the kernel built the resulting Möbius-like band
+/// anyway. Reversal is a relabeling of the ring's storage order only — the
+/// resulting band's faces and the caps are oriented from geometry
+/// ([`orient_face_for_outward`] against a target derived from the ring
+/// centroids), so a registered-by-reversal ring yields the same outward-facing
+/// solid, not an inverted one.
+///
+/// Ties are broken toward the unreversed candidate and then the lowest shift,
+/// so the result is deterministic and a replay re-derives it.
+///
+/// # Errors
+///
+/// [`OperationError::IncompatibleProfiles`] when two rings reaching this point
+/// differ in length — the loft has no honest way to pair `n` samples with `m`,
+/// and `densify_correspondence` is what is supposed to have equalised them.
+fn register_correspondence(
+    model: &BRepModel,
+    correspondence: Vec<Vec<VertexId>>,
+) -> OperationResult<Vec<Vec<VertexId>>> {
+    if correspondence.len() < 2 {
+        return Ok(correspondence);
+    }
+
+    let ring_positions = |ring: &[VertexId]| -> OperationResult<Vec<Vector3>> {
+        ring.iter().map(|&v| vertex_position(model, v)).collect()
+    };
+
+    // `correspondence[0]` is in bounds: the length was checked above.
+    let mut prev_positions = ring_positions(&correspondence[0])?;
+    let mut out: Vec<Vec<VertexId>> = Vec::with_capacity(correspondence.len());
+    out.push(correspondence[0].clone());
+
+    for ring in correspondence.into_iter().skip(1) {
+        let n = prev_positions.len();
+        if ring.len() != n {
+            return Err(OperationError::IncompatibleProfiles);
+        }
+        if n == 0 {
+            return Err(OperationError::IncompatibleProfiles);
+        }
+        let positions = ring_positions(&ring)?;
+
+        // σ(k) over the dihedral group: shift, optionally reversing sense.
+        // `reverse` maps index j to (n − j) mod n, which is the same cyclic
+        // set traversed the other way round.
+        let sigma = |k: usize, shift: usize, reversed: bool| -> usize {
+            let j = (k + shift) % n;
+            if reversed {
+                (n - j) % n
+            } else {
+                j
+            }
+        };
+
+        let mut best_shift = 0usize;
+        let mut best_reversed = false;
+        let mut best_cost = f64::INFINITY;
+        for &reversed in &[false, true] {
+            for shift in 0..n {
+                let mut cost = 0.0;
+                for k in 0..n {
+                    let d = positions[sigma(k, shift, reversed)] - prev_positions[k];
+                    cost += d.magnitude_squared();
+                }
+                if cost < best_cost {
+                    best_cost = cost;
+                    best_shift = shift;
+                    best_reversed = reversed;
+                }
+            }
+        }
+
+        let registered: Vec<VertexId> = (0..n)
+            .map(|k| ring[sigma(k, best_shift, best_reversed)])
+            .collect();
+        prev_positions = (0..n)
+            .map(|k| positions[sigma(k, best_shift, best_reversed)])
+            .collect();
+        out.push(registered);
+    }
+
+    Ok(out)
+}
+
 fn establish_correspondence(
     model: &BRepModel,
     profiles: &[FaceId],
@@ -2274,6 +2379,145 @@ mod tests {
         assert_eq!(corr.len(), 2);
         assert_eq!(corr[0].len(), 4);
         assert_eq!(corr[1].len(), 4);
+    }
+
+    // -------------------------------------------------------------------
+    // register_correspondence
+    // -------------------------------------------------------------------
+
+    /// A closed ring of `n` vertices on a circle of radius `r` at height `z`,
+    /// starting at angle `start` and advancing in the sense given by `sense`
+    /// (+1 counter-clockwise, -1 clockwise seen from +Z).
+    fn ring_on_circle(
+        model: &mut BRepModel,
+        n: usize,
+        r: f64,
+        z: f64,
+        start: f64,
+        sense: f64,
+    ) -> Vec<VertexId> {
+        (0..n)
+            .map(|i| {
+                let a = start + sense * (i as f64) * std::f64::consts::TAU / (n as f64);
+                model.vertices.add(r * a.cos(), r * a.sin(), z)
+            })
+            .collect()
+    }
+
+    fn ring_xy(model: &BRepModel, ring: &[VertexId]) -> Vec<(f64, f64)> {
+        ring.iter()
+            .map(|&v| {
+                let p = model.vertices.get(v).expect("ring vertex").position;
+                (p[0], p[1])
+            })
+            .collect()
+    }
+
+    #[test]
+    fn register_correspondence_shifts_a_ring_whose_index_origin_differs() {
+        // Same octagon at two heights; the upper ring's storage starts three
+        // samples round. Registration must undo exactly that offset, so every
+        // rail becomes vertical and each registered sample sits directly above
+        // its partner.
+        let mut model = BRepModel::new();
+        let lower = ring_on_circle(&mut model, 8, 10.0, 0.0, 0.0, 1.0);
+        let quarter = 3.0 * std::f64::consts::TAU / 8.0;
+        let upper = ring_on_circle(&mut model, 8, 10.0, 5.0, quarter, 1.0);
+
+        let registered =
+            register_correspondence(&model, vec![lower.clone(), upper]).expect("registration");
+
+        assert_eq!(registered.len(), 2);
+        assert_eq!(registered[0], lower);
+        let a = ring_xy(&model, &registered[0]);
+        let b = ring_xy(&model, &registered[1]);
+        for (i, ((ax, ay), (bx, by))) in a.iter().zip(b.iter()).enumerate() {
+            assert!(
+                (ax - bx).abs() < 1e-9 && (ay - by).abs() < 1e-9,
+                "rail {i} is not vertical after registration: ({ax}, {ay}) vs ({bx}, {by})"
+            );
+        }
+    }
+
+    #[test]
+    fn register_correspondence_reverses_an_opposite_winding_ring() {
+        // The upper ring is the SAME octagon traversed the other way round. No
+        // cyclic shift can align two rings of opposite sense -- only a reversal
+        // can -- and before registration the kernel ruled them anyway, building
+        // a band twisted through a full turn.
+        let mut model = BRepModel::new();
+        let lower = ring_on_circle(&mut model, 8, 10.0, 0.0, 0.0, 1.0);
+        let upper = ring_on_circle(&mut model, 8, 10.0, 5.0, 0.0, -1.0);
+
+        let registered =
+            register_correspondence(&model, vec![lower.clone(), upper]).expect("registration");
+
+        let a = ring_xy(&model, &registered[0]);
+        let b = ring_xy(&model, &registered[1]);
+        for (i, ((ax, ay), (bx, by))) in a.iter().zip(b.iter()).enumerate() {
+            assert!(
+                (ax - bx).abs() < 1e-9 && (ay - by).abs() < 1e-9,
+                "rail {i} is not vertical after registration: ({ax}, {ay}) vs ({bx}, {by})"
+            );
+        }
+    }
+
+    #[test]
+    fn register_correspondence_keeps_an_already_aligned_ring_untouched() {
+        // Registration must be a no-op when the rings already correspond --
+        // otherwise it would re-index every loft the kernel already built
+        // correctly. Ties resolve to the unreversed, zero-shift candidate.
+        let mut model = BRepModel::new();
+        let lower = ring_on_circle(&mut model, 8, 10.0, 0.0, 0.0, 1.0);
+        let upper = ring_on_circle(&mut model, 8, 6.0, 5.0, 0.0, 1.0);
+
+        let registered = register_correspondence(&model, vec![lower.clone(), upper.clone()])
+            .expect("registration");
+
+        assert_eq!(registered[0], lower);
+        assert_eq!(registered[1], upper);
+    }
+
+    #[test]
+    fn register_correspondence_rejects_rings_of_different_lengths() {
+        // Densification is what equalises ring sizes; reaching registration
+        // with unequal rings means there is no honest pairing to pick, so the
+        // loft refuses rather than pairing the first min(n, m) and dropping
+        // the rest.
+        let mut model = BRepModel::new();
+        let lower = ring_on_circle(&mut model, 8, 10.0, 0.0, 0.0, 1.0);
+        let upper = ring_on_circle(&mut model, 6, 10.0, 5.0, 0.0, 1.0);
+
+        let err = register_correspondence(&model, vec![lower, upper])
+            .expect_err("unequal rings must refuse");
+        assert!(
+            matches!(err, OperationError::IncompatibleProfiles),
+            "expected IncompatibleProfiles, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn register_correspondence_chains_each_ring_to_the_previous_one() {
+        // Ring i is registered against ring i-1, not against ring 0, so a loft
+        // that turns steadily through its sections tracks the turn instead of
+        // accumulating the whole of it in the last pair.
+        let mut model = BRepModel::new();
+        let step = std::f64::consts::TAU / 8.0;
+        let r0 = ring_on_circle(&mut model, 8, 10.0, 0.0, 0.0, 1.0);
+        let r1 = ring_on_circle(&mut model, 8, 10.0, 5.0, step, 1.0);
+        let r2 = ring_on_circle(&mut model, 8, 10.0, 10.0, 2.0 * step, 1.0);
+
+        let registered = register_correspondence(&model, vec![r0, r1, r2]).expect("registration");
+
+        assert_eq!(registered.len(), 3);
+        let a = ring_xy(&model, &registered[0]);
+        let c = ring_xy(&model, &registered[2]);
+        for (i, ((ax, ay), (cx, cy))) in a.iter().zip(c.iter()).enumerate() {
+            assert!(
+                (ax - cx).abs() < 1e-9 && (ay - cy).abs() < 1e-9,
+                "rail {i} of the first-to-last pair drifted: ({ax}, {ay}) vs ({cx}, {cy})"
+            );
+        }
     }
 
     // -------------------------------------------------------------------

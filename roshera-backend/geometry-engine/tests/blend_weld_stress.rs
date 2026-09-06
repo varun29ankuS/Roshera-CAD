@@ -962,7 +962,6 @@ fn no_rim(table: &mut Table, label: &str) {
 // ===========================================================================
 
 #[test]
-#[ignore = "known red: 2 of 4 lofts build UNSOUND - circle25>square40>circle15 certifies mesh_q_clean=false, square20>circle8 certifies self_int_free=false and tess_clean=false (measured 2026-09-06); the 3rd FAIL is the Cubic loft honestly refusing with InvalidBRep(1999 OrientationErrors), pinned as a refusal"]
 fn broaden_loft_varied_sections() {
     let mut table = Table::new();
 

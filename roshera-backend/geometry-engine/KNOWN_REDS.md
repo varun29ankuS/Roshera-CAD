@@ -30,13 +30,13 @@
 
 
 # The 2026-07-07 red-burndown campaign emptied this file: all 30 pre-existing
-# reds were fixed at root. The three entries below are the first since, added
-# 2026-09-06 when the loft/blend stress harnesses stopped discarding their own
-# verdict counts and the defects they had been printing (and passing on) since
-# they were written became red tests. They are one defect family, diagnosed in
-# geometry-engine/docs/burndown-diag-loft-family.md. Any future entry requires a
-# diagnosis doc per the ratchet rule above.
-
-blend_weld_stress::broaden_loft_varied_sections  # diag: geometry-engine/docs/burndown-diag-loft-family.md -- PARKED (#[ignore]d): 2 of 4 lofts BUILD and certify UNSOUND
-op_stress_round3::loft_four_sections  # diag: geometry-engine/docs/burndown-diag-loft-family.md -- PARKED (#[ignore]d): builds, scoped-valid, welded mesh NOT oriented, cert unsound
-op_stress_round3::loft_square_circle_square_dissimilar  # diag: geometry-engine/docs/burndown-diag-loft-family.md -- PARKED (#[ignore]d): builds, scoped-valid, welded mesh NOT oriented, cert unsound
+# reds were fixed at root. Three entries were added 2026-09-06 (the loft family:
+# blend_weld_stress::broaden_loft_varied_sections,
+# op_stress_round3::loft_four_sections and
+# op_stress_round3::loft_square_circle_square_dissimilar) and REMOVED 2026-09-07
+# when the defect was fixed at root -- loft now registers each vertex ring
+# against the one before it, so a section pair whose loops start at different
+# places no longer lofts through a twisted band. See
+# geometry-engine/docs/burndown-diag-loft-family.md for the diagnosis and the
+# closing measurement. This file is empty of entries again; any new one requires
+# a diagnosis doc per the ratchet rule above.

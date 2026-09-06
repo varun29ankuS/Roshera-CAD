@@ -82,3 +82,50 @@ Remove an entry from `KNOWN_REDS.md` **and** its `#[ignore]` when its test
 passes with the assertions in place. `ignored-reds.ps1` exits 1 the moment one
 of them starts passing, which is the mechanism that stops a fixed red from
 staying parked.
+
+## Closed by
+
+**2026-09-07 — all three entries removed from `KNOWN_REDS.md` and all three
+`#[ignore]`s removed.** Fixed at root in `geometry-engine/src/operations/loft.rs`
+by `register_correspondence`, a new step in `loft_profiles_body` between
+`densify_correspondence` and the loft-type dispatch.
+
+The root cause named above ("a section-correspondence / ruling-alignment problem
+in the loft's profile matching") is confirmed and is specifically an **index
+origin** problem, not a vertex-count one. `establish_correspondence` reads each
+profile's ring off that profile's own outer loop and `densify_correspondence`
+resamples it from that loop's first edge, so index `k` of one ring was ruled to
+index `k` of the next with nothing relating the two index origins. A circle
+profile starts at its curve seam (angle 0); a centred square listed from its
+`(-h, -h)` corner starts at 225°. Every failing case interpolated between a
+circle and a square, which is exactly the pair whose origins disagree — and
+`loft_three_circles` passed because three circles built the same way all start
+at angle 0 by accident, not by construction.
+
+`register_correspondence` searches, for each consecutive ring pair, the full
+dihedral group of adjacency-preserving relabelings (`n` cyclic shifts, each with
+and without a reversal of sense) and keeps the one minimising total squared rail
+length — the objective `create_minimal_twist_loft` already minimised over shifts
+alone, promoted so every loft type is built on a registered correspondence.
+
+Measured after the fix (same commands as above):
+
+| test | case | measurement |
+|---|---|---|
+| `op_stress_round3::loft_four_sections` | loft 4 sections, circle/square alternating | `BUILT+SOUND` |
+| `op_stress_round3::loft_square_circle_square_dissimilar` | loft square-circle-square dissimilar | `BUILT+SOUND` |
+| `blend_weld_stress::broaden_loft_varied_sections` | `loft circle25 -> square40 -> circle15` | `PASS` |
+| `blend_weld_stress::broaden_loft_varied_sections` | `loft square20 -> circle8` | `PASS` |
+
+The related refusal recorded above — the Cubic `circle12 -> 20 -> 6` loft — is
+**unchanged**: it still returns the same `InvalidBRep`/`OrientationError`, still
+counts as the test's one pinned refusal, and needed no re-pin. Registration is a
+no-op for it (three circles, one seam angle, best shift 0), which is the evidence
+that its `OrientationError` is a DIFFERENT defect from this family and not the
+same one seen from the other side, as the entry above had guessed.
+
+The regression is pinned going forward by `geometry-engine/tests/loft_orientation.rs`,
+which lofts two congruent squares whose edge lists start one corner apart (the
+correct answer is a box of volume `side^2 * height` exactly; before the fix the
+kernel built a sound, closed, ORIENTED body of 2/3 that volume — the wrong shape
+reported honestly) and a triangle to a square (the smallest dissimilar pair).

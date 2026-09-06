@@ -769,7 +769,6 @@ fn loft_three_circles() {
 }
 
 #[test]
-#[ignore = "known red: loft square-circle-square with dissimilar sections BUILDS and is scoped-valid, but the welded mesh is NOT consistently oriented (be=0 nme=0 oriented=false) and certify_solid fails on oriented, self_intersection_free, tessellation and mesh_quality (measured 2026-09-06); same defect family as loft_four_sections"]
 fn loft_square_circle_square_dissimilar() {
     let _gate = CaseGate::open("loft_square_circle_square_dissimilar", 0);
     // 3 sections alternating square→circle→square (dissimilar-shape correspondence).
@@ -791,7 +790,6 @@ fn loft_square_circle_square_dissimilar() {
 }
 
 #[test]
-#[ignore = "known red: loft of 4 alternating circle/square sections BUILDS and is scoped-valid, but the welded mesh is NOT consistently oriented (be=0 nme=0 oriented=false) and certify_solid fails on oriented, self_intersection_free, tessellation and mesh_quality (measured 2026-09-06); same defect family as loft_square_circle_square_dissimilar and blend_weld_stress::broaden_loft_varied_sections"]
 fn loft_four_sections() {
     let _gate = CaseGate::open("loft_four_sections", 0);
     // 4 sections (circle→square→circle→square) — longer chain.
