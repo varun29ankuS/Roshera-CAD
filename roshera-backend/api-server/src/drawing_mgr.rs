@@ -1029,12 +1029,12 @@ async fn build_standard_drawing_off_lock(
     solid_id: SolidId,
     part_uuid: Uuid,
     scale: Option<f64>,
-) -> Result<Drawing, StatusCode> {
+) -> Result<Drawing, SheetBuildError> {
     // Brief read lock: validate the solid exists, snapshot, release.
     let snap = {
         let model = model_handle.read().await;
         if model.solids.get(solid_id).is_none() {
-            return Err(StatusCode::NOT_FOUND);
+            return Err(SheetBuildError::SolidNotFound);
         }
         ModelSnapshot::take(&model)
     };
@@ -1044,13 +1044,126 @@ async fn build_standard_drawing_off_lock(
         snap.restore(&mut owned);
         match scale {
             Some(scale) => standard_drawing_hlr(&owned, solid_id, part_uuid, SheetSize::A3, scale)
-                .map_err(|_| StatusCode::UNPROCESSABLE_ENTITY),
+                .map_err(SheetBuildError::from_kernel),
             None => standard_drawing_auto(&owned, solid_id, part_uuid)
-                .map_err(|_| StatusCode::UNPROCESSABLE_ENTITY),
+                .map_err(SheetBuildError::from_kernel),
         }
     })
     .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+    .map_err(|_| SheetBuildError::TaskFailed)?
+}
+
+/// Why [`build_standard_drawing_off_lock`] could not produce a sheet.
+///
+/// It returned a bare [`StatusCode`] until Task 40 gave the kernel something to
+/// SAY: `standard_drawing_hlr` now measures whether the caller's `?scale=` fits
+/// the sheet and refuses with
+/// `ProjectionError::ScaleDoesNotFitSheet`, naming the scale, the sheet and the
+/// overflow in millimetres. A status code cannot carry that sentence, so the
+/// caller was handed `500 kernel_error`, marked RETRYABLE, for a condition that
+/// is deterministic, caller-caused, and will fail identically on every retry —
+/// the client told to try again at a scale that can never fit. This enum keeps
+/// the refusal's own words so the route can answer with them.
+#[derive(Debug)]
+enum SheetBuildError {
+    /// The solid id does not resolve in the live model.
+    SolidNotFound,
+    /// The caller's `?scale=` is not a usable ratio at all — NaN, infinite,
+    /// zero or negative. Kept DISTINCT from [`Self::ScaleDoesNotFit`]: that one
+    /// carries a measured overflow the caller can act on, this one has no
+    /// overflow to measure, and reporting a zero would be inventing a number.
+    InvalidScale { message: String, scale: f64 },
+    /// The caller's `?scale=` fits no arrangement on the sheet. `message` is the
+    /// kernel's own refusal sentence; the four numbers behind it travel
+    /// alongside it so an agent never has to parse the prose to get them.
+    ScaleDoesNotFit {
+        message: String,
+        scale: f64,
+        sheet: String,
+        overflow_x_mm: f64,
+        overflow_y_mm: f64,
+    },
+    /// Any other kernel failure while projecting the sheet.
+    Kernel,
+    /// The blocking task itself failed (panicked or was cancelled).
+    TaskFailed,
+}
+
+impl SheetBuildError {
+    /// Classify a kernel projection error, keeping the two caller-facing
+    /// refusals distinct from each other and from a genuine server-side fault.
+    fn from_kernel(e: geometry_engine::drawing::ProjectionError) -> Self {
+        use geometry_engine::drawing::ProjectionError as PE;
+        let message = e.to_string();
+        match e {
+            PE::InvalidScale { scale, .. } => Self::InvalidScale { message, scale },
+            PE::ScaleDoesNotFitSheet {
+                scale,
+                sheet,
+                overflow_x_mm,
+                overflow_y_mm,
+            } => Self::ScaleDoesNotFit {
+                message,
+                scale,
+                sheet,
+                overflow_x_mm,
+                overflow_y_mm,
+            },
+            _ => Self::Kernel,
+        }
+    }
+
+    /// The typed API refusal for this failure, on a route that has a
+    /// `solid_id` to name.
+    fn into_api_error(self, solid_id: SolidId) -> ApiError {
+        match self {
+            // `InvalidParameter` (400, non-retryable) rather than
+            // `KernelError` (500, retryable): the kernel did not fault, the
+            // caller supplied a `scale` it cannot draw at. Both refusals put
+            // their numbers in `details` as TYPED fields as well as in the
+            // sentence — an agent that has to regex a human message to recover
+            // the overflow is being handed prose where it asked for a
+            // measurement.
+            Self::InvalidScale { message, scale } => {
+                ApiError::new(ErrorCode::InvalidParameter, message)
+                    .with_details(serde_json::json!({
+                        "parameter": "scale",
+                        // A string, not a number: NaN and the infinities have
+                        // no JSON number form, and emitting `null` for them
+                        // would erase the very value being refused.
+                        "value": format!("{scale}"),
+                    }))
+                    .with_hint(
+                        "`scale` must be a finite number greater than zero (e.g. 2 for 2:1), \
+                         or omit it to let the sheet size and fill scale be chosen automatically.",
+                    )
+            }
+            Self::ScaleDoesNotFit {
+                message,
+                scale,
+                sheet,
+                overflow_x_mm,
+                overflow_y_mm,
+            } => ApiError::new(ErrorCode::InvalidParameter, message)
+                .with_details(serde_json::json!({
+                    "parameter": "scale",
+                    "scale": scale,
+                    "sheet": sheet,
+                    "overflow_x_mm": overflow_x_mm,
+                    "overflow_y_mm": overflow_y_mm,
+                }))
+                .with_hint("Request a smaller scale, or omit `scale` to let the sheet size and fill scale be chosen automatically."),
+            Self::SolidNotFound => ApiError::solid_not_found(solid_id),
+            Self::Kernel => ApiError::new(
+                ErrorCode::KernelError,
+                format!("drawing generation failed for solid {solid_id}"),
+            ),
+            Self::TaskFailed => ApiError::new(
+                ErrorCode::Internal,
+                "drawing generation task failed".to_string(),
+            ),
+        }
+    }
 }
 
 async fn drawing_svg_for_solid(
@@ -1080,17 +1193,7 @@ async fn drawing_svg_for_solid(
     let drawing =
         build_standard_drawing_off_lock(model_handle.clone(), solid_id, part_uuid, q.scale)
             .await
-            .map_err(|code| match code {
-                StatusCode::NOT_FOUND => ApiError::solid_not_found(solid_id),
-                StatusCode::UNPROCESSABLE_ENTITY => ApiError::new(
-                    ErrorCode::KernelError,
-                    format!("drawing generation failed for solid {solid_id}"),
-                ),
-                _ => ApiError::new(
-                    ErrorCode::Internal,
-                    "drawing generation task failed".to_string(),
-                ),
-            })?;
+            .map_err(|e| e.into_api_error(solid_id))?;
 
     // Gate 4, server-side (H1, 2026-08-15 whole-branch review): this route
     // hands out the SAME third-angle sheet with HLR + auto dimensions that
@@ -1247,9 +1350,21 @@ async fn create_part_drawing_inner(
     // A manual `?scale=` override falls back to the fixed-A3 path for callers
     // that want an exact ratio. Built OFF the model lock on a blocking thread so
     // a heavy sheet never starves the runtime (see `build_standard_drawing_off_lock`).
+    // A `?scale=` the sheet cannot fit is a caller-facing REFUSAL with words of
+    // its own (Task 40), so it is answered as a typed `ApiError` body — the
+    // "only the NEW refusal is a genuine ApiError body" carve-out this
+    // function's doc already names. Every pre-existing failure keeps its exact
+    // wire shape.
     let mut drawing = build_standard_drawing_off_lock(model_handle, solid_id, part_uuid, q.scale)
         .await
-        .map_err(|code| code.into_response())?;
+        .map_err(|e| match e {
+            SheetBuildError::ScaleDoesNotFit { .. } | SheetBuildError::InvalidScale { .. } => {
+                e.into_api_error(solid_id).into_response()
+            }
+            SheetBuildError::SolidNotFound => StatusCode::NOT_FOUND.into_response(),
+            SheetBuildError::Kernel => StatusCode::UNPROCESSABLE_ENTITY.into_response(),
+            SheetBuildError::TaskFailed => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        })?;
 
     // Name the sheet after the originating part when the caller didn't
     // supply one. The drawing title block renders this name, so a
@@ -2484,7 +2599,123 @@ mod tests {
         let err = build_standard_drawing_off_lock(handle, 9999, Uuid::nil(), None)
             .await
             .expect_err("unknown solid must be rejected");
-        assert_eq!(err, StatusCode::NOT_FOUND);
+        assert!(
+            matches!(err, SheetBuildError::SolidNotFound),
+            "unknown solid must be classified SolidNotFound, got {err:?}"
+        );
+        assert_eq!(
+            err.into_api_error(9999).code.status(),
+            StatusCode::NOT_FOUND,
+            "SolidNotFound must still answer 404 on the wire"
+        );
+    }
+
+    /// Task 40 — a `?scale=` that fits no arrangement on the fixed A3 sheet is
+    /// a CALLER error, not a kernel fault: `400 invalid_parameter`,
+    /// NON-retryable, carrying the kernel's own sentence (the scale, the sheet
+    /// and the overflow in mm). It answered `500 kernel_error` marked
+    /// RETRYABLE until this classification landed — telling the client to try
+    /// again at a scale that can never fit.
+    #[tokio::test]
+    async fn off_lock_drawing_unfittable_scale_is_a_caller_error_not_a_kernel_fault() {
+        let (model, sid) = build_box_model(25.0, 25.0, 25.0);
+        let handle = Arc::new(RwLock::new(model));
+        let err = build_standard_drawing_off_lock(handle, sid, Uuid::nil(), Some(1000.0))
+            .await
+            .expect_err("1000:1 fits no arrangement on A3");
+        let message = match &err {
+            SheetBuildError::ScaleDoesNotFit {
+                message,
+                scale,
+                sheet,
+                overflow_x_mm,
+                overflow_y_mm,
+            } => {
+                // The four numbers survive the classification as NUMBERS, not
+                // only inside the sentence. A 25 mm box on A3: usable area
+                // 368 x 211, fit height 203; unit spans 25 everywhere, so the
+                // group is 1000*50 + 30 = 50030 wide, 1000*50 + 32 = 50032 tall.
+                assert_eq!(*scale, 1000.0, "classified scale");
+                assert_eq!(sheet, "A3", "classified sheet");
+                assert_eq!(*overflow_x_mm, 49662.0, "classified overflow_x_mm");
+                assert_eq!(*overflow_y_mm, 49829.0, "classified overflow_y_mm");
+                message.clone()
+            }
+            other => panic!("expected ScaleDoesNotFit, got {other:?}"),
+        };
+        assert!(
+            message.contains("1000") && message.contains("A3") && message.contains("mm"),
+            "the refusal must name the scale, the sheet and the overflow; got {message:?}"
+        );
+        assert!(
+            !message.contains("  "),
+            "refusal message carries absorbed indentation: {message:?}"
+        );
+
+        let api = err.into_api_error(sid);
+        assert_eq!(api.code, ErrorCode::InvalidParameter);
+        assert_eq!(api.code.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            !api.code.retryable(),
+            "an unfittable scale fails identically on every retry"
+        );
+        assert!(
+            api.error.contains("1000") && api.error.contains("A3"),
+            "the kernel's refusal must survive to the wire; got {:?}",
+            api.error
+        );
+        // ... and so do the measurements, as typed fields.
+        let details = api.details.expect("the refusal must carry typed details");
+        assert_eq!(details["parameter"], serde_json::json!("scale"));
+        assert_eq!(details["scale"], serde_json::json!(1000.0));
+        assert_eq!(details["sheet"], serde_json::json!("A3"));
+        assert_eq!(details["overflow_x_mm"], serde_json::json!(49662.0));
+        assert_eq!(details["overflow_y_mm"], serde_json::json!(49829.0));
+    }
+
+    /// Task 40 fix round 1 — a `?scale=` that is not a RATIO is classified
+    /// apart from one that merely does not fit, and never falls through to
+    /// `500 kernel_error retryable`.
+    ///
+    /// The two refusals must not be merged: an unfittable scale has a measured
+    /// overflow the caller can act on; NaN has none, and reporting a zero
+    /// overrun for it would be a number nobody measured.
+    #[tokio::test]
+    async fn off_lock_drawing_non_ratio_scale_is_classified_apart_from_a_fit_failure() {
+        for raw in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 0.0, -4.0] {
+            let (model, sid) = build_box_model(25.0, 25.0, 25.0);
+            let handle = Arc::new(RwLock::new(model));
+            let err = build_standard_drawing_off_lock(handle, sid, Uuid::nil(), Some(raw))
+                .await
+                .expect_err("a non-ratio scale must be refused");
+            let message = match &err {
+                SheetBuildError::InvalidScale { message, scale } => {
+                    assert_eq!(
+                        scale.is_nan(),
+                        raw.is_nan(),
+                        "scale {raw}: the classification must carry back the value it refused"
+                    );
+                    message.clone()
+                }
+                other => panic!("scale {raw}: expected InvalidScale, got {other:?}"),
+            };
+            assert!(
+                !message.contains("mm"),
+                "scale {raw}: a non-ratio has no overflow to report; got {message:?}"
+            );
+
+            let api = err.into_api_error(sid);
+            assert_eq!(api.code, ErrorCode::InvalidParameter, "scale {raw}");
+            assert_eq!(api.code.status(), StatusCode::BAD_REQUEST, "scale {raw}");
+            assert!(!api.code.retryable(), "scale {raw}");
+            let details = api.details.expect("typed details");
+            assert_eq!(details["parameter"], serde_json::json!("scale"));
+            assert!(
+                details["value"].is_string(),
+                "scale {raw}: NaN and the infinities have no JSON number form, so the \
+                 refused value must survive as a string rather than becoming null; got {details}"
+            );
+        }
     }
 
     // ── One-call part drawing — registry insert path ────────────────

@@ -38,6 +38,61 @@ pub enum ProjectionError {
     MissingCurve(crate::primitives::curve::CurveId, EdgeId),
     #[error("curve evaluation failed at t={t}: {reason}")]
     CurveEvalFailed { t: f64, reason: String },
+    /// A caller-DICTATED drawing scale that cannot be drawn at, for a reason
+    /// that is not "it overruns the sheet by N mm".
+    ///
+    /// This is a DIFFERENT refusal from [`Self::ScaleDoesNotFitSheet`], and
+    /// deliberately so: "3:1 overruns A3 by 9 mm" is a measurement the caller
+    /// can act on, while "NaN:1" has no overflow to measure — reporting it as a
+    /// fit failure with a zero overrun would be inventing a number.
+    ///
+    /// It is a REFUSAL rather than a clamp because every silent repair here is
+    /// a lie of a different shape. Measured on the unguarded route, a 40 mm
+    /// plate on A3:
+    ///
+    /// * `NaN` — three views placed at `[NaN, NaN]`, and `verify_drawing`
+    ///   reports **zero** issues, because every comparison against NaN is
+    ///   false. A sheet that renders nothing, certified clean.
+    /// * `-inf` — the same NaN positions, likewise certified clean.
+    /// * `0.0` — every view collapses to a point; again certified clean,
+    ///   because a zero-area footprint is inside any frame.
+    /// * `-4.0` — views MIRRORED through their own centres and laid out
+    ///   right-to-left, drawn as a real sheet.
+    ///
+    /// The first three are the dangerous ones: the quality gate cannot see
+    /// them, so nothing downstream would have caught them either.
+    ///
+    /// # Two causes, one refusal
+    ///
+    /// `reason` says which, because they are not the same mistake:
+    ///
+    /// * the scale is not a finite positive number at all (the list above);
+    /// * the scale IS finite and positive, but so large that the arrangement
+    ///   it produces has no finite size — `1e308` passes the first check and
+    ///   then `1e308 * 80` is `inf`. That one still cannot be reported as a
+    ///   fit failure: the overflow would print as "inf mm" and, over JSON,
+    ///   `serde_json` renders a non-finite `f64` as `null` — a refusal whose
+    ///   measurement field is empty. An unmeasurable overrun is not a
+    ///   measurement, so it is refused here instead.
+    #[error("scale {scale} is not a usable drawing ratio: {reason}")]
+    InvalidScale { scale: f64, reason: &'static str },
+    /// A caller-DICTATED drawing scale that no placement fits on the requested
+    /// sheet.
+    ///
+    /// The explicit-scale sheet route (`dimensioning::standard_drawing_hlr`)
+    /// places its views from the SCALED extents, so it knows before it draws a
+    /// single edge whether the third-angle group clears the drawing area. When
+    /// it does not, the honest answer is this error naming the scale, the sheet
+    /// and the measured overflow — not a sheet whose views hang off the frame,
+    /// and not a silently substituted scale the title block would then
+    /// misreport.
+    #[error("scale {scale}:1 does not fit sheet {sheet}: the view arrangement overruns the drawing area by {overflow_x_mm:.1} mm horizontally and {overflow_y_mm:.1} mm vertically")]
+    ScaleDoesNotFitSheet {
+        scale: f64,
+        sheet: String,
+        overflow_x_mm: f64,
+        overflow_y_mm: f64,
+    },
 }
 
 /// How many samples to draw along a non-linear curve segment. The

@@ -542,10 +542,31 @@ async fn the_rust_gate_and_gates_ts_name_the_same_gates_and_escape() {
 //
 // Forcing a quality-Error finding needs a different trick than
 // `make_a_dimension_stale` (there is no registered `Drawing` to reach into
-// before the request runs): `?scale=1000` on a 10mm box overflows the fixed
-// A3 sheet by three orders of magnitude, which reliably trips
-// `ViewOutsideFrame` (Error-severity, geometry-engine/src/drawing/
-// verify.rs:47,253-258) regardless of the exact layout thresholds.
+// before the request runs). It used to be `?scale=1000` on a 10mm box, which
+// overflowed the fixed A3 sheet by three orders of magnitude and reliably
+// tripped `ViewOutsideFrame` (Error-severity, geometry-engine/src/drawing/
+// verify.rs:47,253-258).
+//
+// Task 40 closed that trick at the source: the explicit-scale route now
+// computes its placement from the SCALED extents and REFUSES a scale no
+// arrangement fits, so it cannot produce an off-frame sheet for the quality
+// gate to catch.
+//
+// ONE trick still works, and it was deliberately NOT taken: a bored plate at
+// `?scale=<= 0.01` yields `RedundantDimension` (Error-severity). It stops
+// working above 0.05, which is the tell — the check quantizes SHEET-space
+// positions, so at a small enough scale two GENUINELY DISTINCT dimensions
+// collapse onto the same quantized interval and are reported as one repeated
+// callout. That is a verifier false positive, not a drawing defect. Building
+// this suite's fixture on it would pin the false positive in place and make
+// fixing it look like a regression.
+//
+// No other lever is known: the remaining Error kinds (dimension-on-geometry,
+// label and GD&T collisions) have no HTTP handle, and the two sheets this
+// route can build (`standard_drawing_auto`, and `standard_drawing_hlr` at a
+// scale that fits) are laid out clean by construction. The gate itself is
+// unchanged and still live; what is gone is the HTTP RED for it on THIS route.
+// Recorded rather than papered over.
 
 /// The one-call-route sibling of [`assert_sheet_refusal`] (M5, 2026-08-16
 /// residuals). This route registers no [`Drawing`](geometry_engine::drawing::Drawing),
@@ -554,6 +575,15 @@ async fn the_rust_gate_and_gates_ts_name_the_same_gates_and_escape() {
 /// no value must be OMITTED, never defaulted to a nil UUID. Both halves are
 /// checked: the solid is named, and `drawing_id` is genuinely absent from
 /// `details`, not merely unequal to the caller's expectation.
+// Reason: retained without a caller. Its two callers asserted the one-call
+// `sheet_quality` refusal, which Task 40 made unforcible over HTTP (see the
+// note above). The shape it encodes is still the contract every one-call gate
+// refusal must satisfy, `error_catalog.rs`'s
+// `sheet_uncertified_for_solid_names_the_solid_not_a_nil_drawing` cites the
+// note beside it by name, and deleting both would erase the reachability
+// analysis that explains why the pin is missing. Re-wired the moment a
+// one-call gate refusal becomes reachable again.
+#[allow(dead_code)]
 fn assert_one_call_sheet_refusal(
     status: StatusCode,
     body: &serde_json::Value,
@@ -590,10 +620,31 @@ fn assert_one_call_sheet_refusal(
     );
 }
 
-/// A quality-failing one-call sheet (forced by an absurd `?scale=`) is
-/// refused on both routes, without acknowledgement.
+/// An unfittable `?scale=` is refused by the KERNEL, before the export gate
+/// ever sees a sheet — and the refusal is not the layout-quality one.
+///
+/// This test used to assert `gate: "sheet_quality"` at 409: `?scale=1000` on a
+/// 10 mm box overflowed the fixed A3 sheet by three orders of magnitude, the
+/// route built the off-frame sheet anyway, and the export gate caught it.
+/// Task 40 removed that possibility at the source — `standard_drawing_hlr` now
+/// computes its placement from the SCALED extents and returns
+/// `ProjectionError::ScaleDoesNotFitSheet` rather than emitting views that hang
+/// off the frame — so there is no longer a sheet for the quality gate to
+/// judge. The bytes are still refused; they are refused EARLIER and for a
+/// truer reason.
+///
+/// The refusal is `400 invalid_parameter`, NON-retryable, and carries the
+/// kernel's own sentence: the kernel did not fault, the caller asked for a
+/// scale that does not fit, and it will not fit on any retry. `details.gate` is
+/// absent — no export gate ran, because there was no sheet to grade.
+///
+/// The four measurements behind the sentence are asserted as TYPED fields in
+/// `details`, not merely as substrings of the prose. A client that has to regex
+/// a human-readable message to recover the overflow has been handed prose where
+/// it asked for a measurement — and this is the route whose primary caller is
+/// an agent.
 #[tokio::test]
-async fn a_quality_failing_one_call_svg_is_refused_without_acknowledgement() {
+async fn an_unfittable_scale_is_refused_before_the_one_call_svg_quality_gate() {
     for label in ["id", "uuid"] {
         let state = make_test_state().await;
         let (id, uuid) = create_box_full(&state).await;
@@ -603,23 +654,247 @@ async fn a_quality_failing_one_call_svg_is_refused_without_acknowledgement() {
             format!("/api/parts/uuid/{uuid}/drawing.svg?scale=1000")
         };
         let (status, body) = dispatch(&state, get(&path)).await;
-        assert_one_call_sheet_refusal(
+        assert_eq!(
             status,
-            &body,
-            id,
-            "sheet_quality",
-            StatusCode::CONFLICT,
-            &format!("one-call svg ({label}) with a forced quality failure"),
+            StatusCode::BAD_REQUEST,
+            "one-call svg ({label}): an unfittable scale is a CALLER error refused by the kernel, not a sheet to draw; body = {body}"
+        );
+        assert_eq!(
+            body["success"].as_bool(),
+            Some(false),
+            "one-call svg ({label}) refusal must carry success:false; body = {body}"
+        );
+        assert_eq!(
+            body["retryable"].as_bool(),
+            Some(false),
+            "one-call svg ({label}): an unfittable scale fails identically on every retry; body = {body}"
+        );
+        assert_ne!(
+            body["details"]["gate"].as_str(),
+            Some("sheet_quality"),
+            "one-call svg ({label}) must refuse at the kernel, not by grading an off-frame sheet the kernel should never have produced; body = {body}"
+        );
+        let message = body["error"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("1000") && message.contains("A3") && message.contains("mm"),
+            "one-call svg ({label}): the kernel's refusal must reach the client naming the scale, the sheet and the overflow; body = {body}"
+        );
+        assert!(
+            !message.contains("  "),
+            "one-call svg ({label}): refusal message carries absorbed indentation; body = {body}"
+        );
+
+        // The measurements, as typed fields — not as prose an agent must parse.
+        let d = &body["details"];
+        assert_eq!(
+            d["parameter"].as_str(),
+            Some("scale"),
+            "one-call svg ({label}): the refusal must name WHICH parameter it refuses; body = {body}"
+        );
+        assert_eq!(
+            d["scale"].as_f64(),
+            Some(1000.0),
+            "one-call svg ({label}): details.scale; body = {body}"
+        );
+        assert_eq!(
+            d["sheet"].as_str(),
+            Some("A3"),
+            "one-call svg ({label}): details.sheet; body = {body}"
+        );
+        // A 10 mm box on A3: usable area 368 x 211 mm, fit height 211 - 8 = 203.
+        // Unit spans are 10 in every column/row, so at 1000:1 the group is
+        // 1000*20 + 30 = 20030 wide and 1000*20 + 32 = 20032 tall.
+        assert_eq!(
+            d["overflow_x_mm"].as_f64(),
+            Some(19662.0),
+            "one-call svg ({label}): details.overflow_x_mm = 20030 - 368; body = {body}"
+        );
+        assert_eq!(
+            d["overflow_y_mm"].as_f64(),
+            Some(19829.0),
+            "one-call svg ({label}): details.overflow_y_mm = 20032 - 203; body = {body}"
         );
     }
 }
 
-/// `acknowledge_layout_issues=true` DOES let the same quality-failing
-/// one-call sheet export, on both routes — the documented
-/// draft-for-human-review escape, exactly as it does for the registered
-/// routes.
+/// A `?scale=` that is not a RATIO at all — NaN, infinite, zero, negative — is
+/// refused as a caller error too, and never drawn.
+///
+/// Measured before the guard existed, on the kernel route: `NaN`, `-inf` and
+/// `0` each produced a sheet that `verify_drawing` certified CLEAN (every
+/// comparison against NaN is false; a zero-area footprint is inside every
+/// frame), and `-4` produced a mirrored, right-to-left sheet. Over HTTP those
+/// became `200 image/svg+xml` — a drawing of nothing, served as a drawing.
+///
+/// `details.value` is a STRING, deliberately: NaN and the infinities have no
+/// JSON number form, and emitting `null` for them would erase the very value
+/// being refused.
 #[tokio::test]
-async fn acknowledge_layout_issues_true_lets_the_one_call_svg_draft_export_proceed() {
+async fn a_scale_that_is_not_a_ratio_is_refused_on_the_one_call_svg() {
+    for raw in ["NaN", "0", "-4", "inf", "-inf"] {
+        let state = make_test_state().await;
+        let (id, _uuid) = create_box_full(&state).await;
+        let (status, body) = dispatch(
+            &state,
+            get(&format!("/api/parts/{id}/drawing.svg?scale={raw}")),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "?scale={raw} must be refused as a caller error, never drawn; body = {body}"
+        );
+        assert_eq!(
+            body["error_code"].as_str(),
+            Some("invalid_parameter"),
+            "?scale={raw}: the kernel did not fault, the caller did; body = {body}"
+        );
+        assert_eq!(
+            body["retryable"].as_bool(),
+            Some(false),
+            "?scale={raw} fails identically on every retry; body = {body}"
+        );
+        assert_eq!(
+            body["details"]["parameter"].as_str(),
+            Some("scale"),
+            "?scale={raw}: the refusal must name WHICH parameter it refuses; body = {body}"
+        );
+        assert!(
+            body["details"]["value"].is_string(),
+            "?scale={raw}: the refused value must survive as a string, not become null; body = {body}"
+        );
+        let message = body["error"].as_str().unwrap_or_default();
+        assert!(
+            !message.contains("mm"),
+            "?scale={raw}: a non-ratio has no overflow, so the refusal must not report one; body = {body}"
+        );
+        assert!(
+            !message.contains("  "),
+            "?scale={raw}: refusal message carries absorbed indentation; body = {body}"
+        );
+    }
+}
+
+/// The REGISTERED route refuses a bad `?scale=` too, in the same shape.
+///
+/// `POST /api/parts/{id}/drawing` takes the same `PartDrawingQuery` and the
+/// same `build_standard_drawing_off_lock`, but reaches it through
+/// `create_part_drawing_inner`, whose error mapping is a SEPARATE `match` arm
+/// (`drawing_mgr.rs`) from the one the `.svg` route uses. Nothing exercised it
+/// with a `scale`: every `scale=` test in this crate hit `/drawing.svg`, so
+/// changing that arm to 422 — or dropping the `InvalidScale` case from it —
+/// broke no test at all.
+///
+/// This route is the one that used to succeed most damagingly: a 200 here
+/// REGISTERED the off-sheet drawing, so the bad sheet outlived the request and
+/// could be exported later.
+#[tokio::test]
+async fn a_bad_scale_is_refused_on_the_registered_part_drawing_route() {
+    // (query, is-a-fit-failure) — one of each class, so a mapping that handles
+    // only one of the two typed refusals cannot pass.
+    for (raw, unfittable) in [("1000", true), ("NaN", false)] {
+        let state = make_test_state().await;
+        let (id, _uuid) = create_box_full(&state).await;
+        let (status, body) = dispatch(
+            &state,
+            post(&format!("/api/parts/{id}/drawing?scale={raw}"), json!({})),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "POST drawing ?scale={raw} must refuse as a caller error, and must NOT register a sheet; body = {body}"
+        );
+        assert_eq!(
+            body["error_code"].as_str(),
+            Some("invalid_parameter"),
+            "POST drawing ?scale={raw}: the kernel did not fault, the caller did; body = {body}"
+        );
+        assert_eq!(
+            body["success"].as_bool(),
+            Some(false),
+            "POST drawing ?scale={raw}; body = {body}"
+        );
+        assert_eq!(
+            body["retryable"].as_bool(),
+            Some(false),
+            "POST drawing ?scale={raw} fails identically on every retry; body = {body}"
+        );
+        assert_eq!(
+            body["details"]["parameter"].as_str(),
+            Some("scale"),
+            "POST drawing ?scale={raw}: typed details must reach this route too; body = {body}"
+        );
+        if unfittable {
+            // A 10 mm box on A3: usable area 368 x 211, fit height 203; unit
+            // spans 10 everywhere, so at 1000:1 the group is 20030 x 20032.
+            assert_eq!(
+                body["details"]["overflow_x_mm"].as_f64(),
+                Some(19662.0),
+                "POST drawing ?scale={raw}: details.overflow_x_mm; body = {body}"
+            );
+            assert_eq!(
+                body["details"]["overflow_y_mm"].as_f64(),
+                Some(19829.0),
+                "POST drawing ?scale={raw}: details.overflow_y_mm; body = {body}"
+            );
+        } else {
+            assert!(
+                body["details"]["value"].is_string(),
+                "POST drawing ?scale={raw}: the refused value must survive as a string; body = {body}"
+            );
+        }
+
+        // Nothing was registered: the refusal is not a sheet with a bad body.
+        // `list_drawings` returns a bare JSON array, and the array is REQUIRED
+        // to be found — a shape change must fail this test loudly rather than
+        // let `unwrap_or(0)` report an empty registry that was never read.
+        let registered = |v: &serde_json::Value| -> usize {
+            v.as_array()
+                .unwrap_or_else(|| panic!("GET /api/drawings must return an array; got {v}"))
+                .len()
+        };
+        let (status, list) = dispatch(&state, get("/api/drawings")).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "drawing list must 200; body = {list}"
+        );
+        assert_eq!(
+            registered(&list),
+            0,
+            "POST drawing ?scale={raw}: a refused sheet must never be registered; list = {list}"
+        );
+
+        // Positive control, so the assertion above cannot pass because the
+        // registry is simply never populated on this path: the SAME request
+        // without the bad scale registers exactly one sheet.
+        let (status, ok_body) =
+            dispatch(&state, post(&format!("/api/parts/{id}/drawing"), json!({}))).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "control: the same POST without a scale must succeed; body = {ok_body}"
+        );
+        let (_, list) = dispatch(&state, get("/api/drawings")).await;
+        assert_eq!(
+            registered(&list),
+            1,
+            "control: a successful POST must register exactly one sheet, which is what makes the zero above meaningful; list = {list}"
+        );
+    }
+}
+
+/// `acknowledge_layout_issues=true` CANNOT resurrect an unfittable scale.
+///
+/// The escape waives a layout VERDICT on a sheet that exists ("I have looked at
+/// the collisions, ship the draft"). It is not a licence to draw a sheet that
+/// cannot be drawn: no arrangement of a 10 mm box at 1000:1 fits an A3 frame,
+/// so there is no draft to acknowledge. Before Task 40 this same request
+/// returned 200 with three views hanging off the sheet — which is precisely the
+/// silent-wrong-answer the escape was never meant to authorise.
+#[tokio::test]
+async fn acknowledge_layout_issues_cannot_resurrect_an_unfittable_one_call_scale() {
     for label in ["id", "uuid"] {
         let state = make_test_state().await;
         let (id, uuid) = create_box_full(&state).await;
@@ -631,8 +906,8 @@ async fn acknowledge_layout_issues_true_lets_the_one_call_svg_draft_export_proce
         let (status, body) = dispatch(&state, get(&path)).await;
         assert_eq!(
             status,
-            StatusCode::OK,
-            "one-call svg ({label}) with acknowledge_layout_issues=true must proceed; body = {body}"
+            StatusCode::BAD_REQUEST,
+            "one-call svg ({label}): acknowledging layout issues must not make an unfittable scale fittable; body = {body}"
         );
     }
 }
@@ -664,6 +939,13 @@ async fn a_sound_passing_one_call_svg_is_never_refused() {
 /// `junk_acknowledge_layout_issues_value_does_not_open_the_bypass` pins for
 /// the registered routes, `Query<PartDrawingQuery>`'s `bool` deserialization
 /// rejecting non-boolean junk before the handler runs.
+///
+/// The request carries NO `?scale=`, deliberately. It used to carry
+/// `scale=1000`, which since Task 40 the kernel refuses outright — the
+/// response would then be non-200 whatever the junk parameter did, and this
+/// test would pass without ever exercising the thing it names. On a sheet that
+/// would otherwise export cleanly, `!= OK` means the junk was rejected and
+/// nothing else.
 #[tokio::test]
 async fn junk_acknowledge_layout_issues_does_not_open_the_one_call_svg_bypass() {
     let state = make_test_state().await;
@@ -671,7 +953,7 @@ async fn junk_acknowledge_layout_issues_does_not_open_the_one_call_svg_bypass() 
     let (status, body) = dispatch(
         &state,
         get(&format!(
-            "/api/parts/{id}/drawing.svg?scale=1000&acknowledge_layout_issues=1"
+            "/api/parts/{id}/drawing.svg?acknowledge_layout_issues=1"
         )),
     )
     .await;

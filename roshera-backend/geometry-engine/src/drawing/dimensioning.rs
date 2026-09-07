@@ -521,6 +521,18 @@ pub fn dedup_dimensions_global(drawing: &mut super::types::Drawing) {
 /// result renders directly via `render_drawing_svg` / `render_drawing_dxf`.
 /// This is the "automatic drawing" verb: solid in, dimensioned drawing out, no
 /// human placement.
+///
+/// **Known defect, not fixed (Task 40).** The three view positions below are
+/// HARDCODED for a 1:1 sheet and there is no fit check, so this function has
+/// exactly the defect Task 40 closed in [`standard_drawing_hlr`]: at scale >= 2
+/// it lays the views out as if the part were drawn 1:1 and runs them off the
+/// drawing frame, and it accepts a `scale` that is NaN, zero or negative. It
+/// was left alone because it has NO production caller — only
+/// `drawing/layout.rs`'s test module, `tests/drawing_centerlines.rs` and
+/// `tests/drawing_hlr.rs`, all at 1.0 — so moving its geometry would churn
+/// three test fixtures for no product gain. Anything that wires this to a
+/// caller-supplied scale must port `standard_drawing_hlr`'s guard and
+/// `place_four_view` call first.
 pub fn standard_drawing(
     model: &BRepModel,
     solid_id: SolidId,
@@ -561,6 +573,28 @@ pub fn standard_drawing(
 /// drawing — an opaque part, not a see-through wireframe. The extent is kept
 /// from the full wireframe so layout is unchanged. Sound: every visible/hidden
 /// verdict is an exact ray↔surface test, never a rasterised z-buffer.
+///
+/// # Placement is computed, not assumed (Task 40)
+///
+/// This is the route `api-server/src/drawing_mgr.rs:1046` takes whenever a
+/// caller supplies a `scale`. It used to stamp three HARDCODED sheet positions
+/// (`[80,110] / [80,210] / [210,110]`) chosen for a 1:1 sheet and never look at
+/// what the requested scale did to the views' footprints, so a 40 mm plate
+/// asked for at 2:1 on A3 was laid out as if it were drawn 1:1 and ran off the
+/// drawing frame — `verify_drawing` reported `ViewOutsideFrame`, and unless the
+/// caller happened to run the quality gate the sheet shipped anyway.
+///
+/// Placement now comes from [`place_four_view`] at the REQUESTED scale — the
+/// same function [`standard_drawing_auto`] reaches through
+/// [`layout_four_view`], so there is exactly one placement algorithm on this
+/// sheet, not two that can drift apart. There is no isometric on this route, so
+/// the top-right quadrant is fed a zero extent and simply stays empty.
+///
+/// When the group does not fit, the sheet is REFUSED with
+/// [`ProjectionError::ScaleDoesNotFitSheet`] naming the scale, the sheet and
+/// the overflow in mm. Refusal — not a quietly reduced scale, which the title
+/// block would then misreport as the scale that was asked for, and not an
+/// off-sheet view left for the export gate to catch.
 pub fn standard_drawing_hlr(
     model: &BRepModel,
     solid_id: SolidId,
@@ -576,13 +610,69 @@ pub fn standard_drawing_hlr(
         part_id: part_uuid,
         solid_id,
     };
-    let layout = [
-        (ProjectionType::Front, "FRONT", [80.0, 110.0]),
-        (ProjectionType::Top, "TOP", [80.0, 210.0]),
-        (ProjectionType::Right, "RIGHT", [210.0, 110.0]),
+    // A scale that is not a RATIO is refused before anything is projected.
+    // This guard is not defensive padding — every degenerate value was measured
+    // producing a sheet the quality gate certified CLEAN: NaN and -inf place
+    // every view at `[NaN, NaN]` (every comparison against NaN is false, so no
+    // rect is ever "outside" anything), and 0.0 collapses each view to a point
+    // (a zero-area footprint is inside every frame). `verify_drawing` cannot
+    // see any of them, so this is the only place they can be caught. See
+    // [`ProjectionError::InvalidScale`] for the measurements.
+    if !scale.is_finite() || scale <= 0.0 {
+        return Err(super::projection::ProjectionError::InvalidScale {
+            scale,
+            reason: "it must be a finite number greater than zero",
+        });
+    }
+
+    let specs = [
+        (ProjectionType::Front, "FRONT"),
+        (ProjectionType::Top, "TOP"),
+        (ProjectionType::Right, "RIGHT"),
     ];
     let min_span = 0.5_f64;
-    for (proj, name, pos) in layout {
+
+    // Pass 1 — unit-scale extents, exactly as `standard_drawing_auto` does it.
+    // `ProjectedView::extent` is model-space (`project_solid_view` folds the
+    // UNSCALED projected points), so one cheap projection per view yields the
+    // footprint at any scale; the placement multiplies by `scale`. Projection
+    // only — the HLR raytrace is the expensive half and it runs once, in pass 2.
+    let mut extents = [super::types::ViewExtent::default(); 3];
+    for (slot, (proj, name)) in extents.iter_mut().zip(specs) {
+        let v = super::projection::project_solid_view(model, source, proj, name, [0.0, 0.0], 1.0)?;
+        *slot = v.extent;
+    }
+    let [fe, te, re] = extents;
+    // No isometric cell on this route: a zero extent (`ViewExtent::default`)
+    // leaves the right column and top row sized by the real views and the
+    // top-right quadrant empty.
+    let no_iso = super::types::ViewExtent::default();
+    let placement = place_four_view(&sheet, fe, te, re, no_iso, scale);
+    // A finite, positive scale can still be too large to MEASURE against: at
+    // `1e308` the guard above passes and `1e308 * 80` is `inf`, so the overrun
+    // is not a number. Reporting that as a fit failure would print "by inf mm"
+    // and — over JSON, where `serde_json` renders a non-finite `f64` as `null`
+    // — hand a client a refusal whose measurement field is empty. An
+    // unmeasurable overrun is not a measurement, so it joins the other unusable
+    // scales rather than pretending to be a fit verdict.
+    if !placement.overflow_is_measurable() {
+        return Err(super::projection::ProjectionError::InvalidScale {
+            scale,
+            reason: "the view arrangement it produces has no finite size on this sheet",
+        });
+    }
+    if !placement.fits() {
+        return Err(super::projection::ProjectionError::ScaleDoesNotFitSheet {
+            scale,
+            sheet: sheet.label(),
+            overflow_x_mm: placement.overflow_x_mm,
+            overflow_y_mm: placement.overflow_y_mm,
+        });
+    }
+
+    // Pass 2 — build the placed, scaled views. `positions` is `[front, top,
+    // right, iso]`; zipping against the three specs drops the unused iso slot.
+    for ((proj, name), pos) in specs.into_iter().zip(placement.positions) {
         drawing.add_view(build_hlr_view(
             model, solid_id, source, proj, name, pos, scale, min_span,
         )?);
@@ -887,38 +977,100 @@ fn layout_four_view(
     re: super::types::ViewExtent,
     ie: super::types::ViewExtent,
 ) -> (f64, [[f64; 2]; 4]) {
+    let scale = fill_scale_four_view(sheet, fe, te, re, ie);
+    (
+        scale,
+        place_four_view(sheet, fe, te, re, ie, scale).positions,
+    )
+}
+
+// Reserve dimension room on the left + bottom + between columns, and
+// the title-block band along the bottom, then center the group.
+const PAD_LEFT: f64 = 22.0;
+const PAD_BOTTOM: f64 = 18.0;
+// VGAP must clear the upper view's BELOW dimension band (~22 mm) plus the
+// lower view's title (~6 mm); HGAP clears the right column's LEFT dims.
+const VGAP: f64 = 32.0;
+const HGAP: f64 = 30.0;
+
+/// How much SHORTER than [`four_view_area`]'s height the view group must be
+/// for the bottom row's dimension band to stay clear of the title block.
+///
+/// `verify_drawing` expands a dimensioned view's footprint by
+/// [`super::verify::DIM_MARGIN_MM`] BELOW its geometry (the standoff +
+/// stacking + text that `svg::render_dimensions` actually draws there), but
+/// the layout's bottom pad only reserves `PAD_BOTTOM` above the title-block
+/// band — a 4 mm shortfall. The group is CENTRED in the area, so exactly HALF
+/// of whatever vertical slack is left lands below it; the group must therefore
+/// clear the area by TWICE the shortfall.
+///
+/// This is why the automatic route never tripped over it: its `0.9` fill
+/// factor leaves it 10% of slack, which swallows 8 mm on every sheet size. A
+/// route whose scale is DICTATED has no such slack, and a 10 mm box at 8.75:1
+/// on A3 was measured landing its FRONT/RIGHT dimension band on the title
+/// block while the raw group still "fitted" — `ViewOverlapsTitleBlock`, which
+/// is exactly the class of lie this task exists to stop.
+///
+/// Left/right need no equivalent because `PAD_LEFT` already EQUALS
+/// `DIM_MARGIN_MM`, so `g_w <= avail_w` is sufficient there.
+const BOTTOM_DIM_SHORTFALL: f64 = 2.0 * (super::verify::DIM_MARGIN_MM - PAD_BOTTOM);
+
+/// The usable drawing area for the 2×2 arrangement — `(x0, y0, width,
+/// height)` in sheet mm — with the frame margins, the left/bottom dimension
+/// pads and the title-block band already deducted.
+///
+/// Single source of truth for both the fill-scale computation
+/// ([`fill_scale_four_view`]) and the explicit-scale fit check
+/// ([`place_four_view`]), so a scale that is REPORTED as fitting and a group
+/// that is PLACED as fitting can never be measured against different areas.
+fn four_view_area(sheet: &super::types::SheetSize) -> (f64, f64, f64, f64) {
     let w = sheet.width();
     let h = sheet.height();
     let (ml, mr, mt, mb) = super::svg::frame_margins(sheet);
     let (_tb_w, tb_h) = super::svg::title_block_size(sheet);
 
-    // Reserve dimension room on the left + bottom + between columns, and
-    // the title-block band along the bottom, then center the group.
-    const PAD_LEFT: f64 = 22.0;
-    const PAD_BOTTOM: f64 = 18.0;
-    // VGAP must clear the upper view's BELOW dimension band (~22 mm) plus the
-    // lower view's title (~6 mm); HGAP clears the right column's LEFT dims.
-    const VGAP: f64 = 32.0;
-    const HGAP: f64 = 30.0;
-
     let avail_x0 = ml + PAD_LEFT;
     let avail_x1 = w - mr;
     let avail_y0 = mt;
     let avail_y1 = h - mb - tb_h - PAD_BOTTOM;
-    let avail_w = (avail_x1 - avail_x0).max(10.0);
-    let avail_h = (avail_y1 - avail_y0).max(10.0);
+    (
+        avail_x0,
+        avail_y0,
+        (avail_x1 - avail_x0).max(10.0),
+        (avail_y1 - avail_y0).max(10.0),
+    )
+}
 
+/// Unit-scale column and row spans of the 2×2 arrangement:
+/// `(left_w, right_w, top_h, bot_h)`.
+///
+/// Left column = max(Front, Top) width; right column = max(Right, Iso).
+/// Top row height = max(Top, Iso); bottom row = max(Front, Right).
+fn four_view_spans(
+    fe: super::types::ViewExtent,
+    te: super::types::ViewExtent,
+    re: super::types::ViewExtent,
+    ie: super::types::ViewExtent,
+) -> (f64, f64, f64, f64) {
     let (fw, fh) = (fe.width(), fe.height());
     let (tw, th) = (te.width(), te.height());
     let (rw, rh) = (re.width(), re.height());
     let (iw, ih) = (ie.width(), ie.height());
+    (fw.max(tw), rw.max(iw), th.max(ih), fh.max(rh))
+}
 
-    // Left column = max(Front, Top) width; right column = max(Right, Iso).
-    // Top row height = max(Top, Iso); bottom row = max(Front, Right).
-    let left_w = fw.max(tw);
-    let right_w = rw.max(iw);
-    let top_h = th.max(ih);
-    let bot_h = fh.max(rh);
+/// The FILL scale: the largest ladder scale at which the 2×2 arrangement
+/// still leaves a 10% breathing margin inside [`four_view_area`]. Used by the
+/// automatic route, which is free to choose the scale.
+fn fill_scale_four_view(
+    sheet: &super::types::SheetSize,
+    fe: super::types::ViewExtent,
+    te: super::types::ViewExtent,
+    re: super::types::ViewExtent,
+    ie: super::types::ViewExtent,
+) -> f64 {
+    let (_avail_x0, _avail_y0, avail_w, avail_h) = four_view_area(sheet);
+    let (left_w, right_w, top_h, bot_h) = four_view_spans(fe, te, re, ie);
 
     let unit_w = (left_w + right_w).max(1e-6);
     let unit_h = (top_h + bot_h).max(1e-6);
@@ -928,7 +1080,76 @@ fn layout_four_view(
     if !scale.is_finite() || scale <= 0.0 {
         scale = 1.0;
     }
-    scale = snap_scale(scale);
+    snap_scale(scale)
+}
+
+/// Where the four views sit at a GIVEN scale, and by how much the group
+/// overruns the usable drawing area.
+struct FourViewPlacement {
+    /// `[front, top, right, iso]` sheet positions in mm.
+    positions: [[f64; 2]; 4],
+    /// Millimetres by which the group is wider than [`four_view_area`]'s
+    /// width; `0.0` when it fits.
+    overflow_x_mm: f64,
+    /// Millimetres by which the group is taller than [`four_view_area`]'s
+    /// height; `0.0` when it fits.
+    overflow_y_mm: f64,
+}
+
+impl FourViewPlacement {
+    /// True when the arrangement is entirely inside the usable drawing area.
+    ///
+    /// Deliberately `<= 0.0` rather than `!(> 0.0)`: a NaN overrun is not a
+    /// fit. See [`overrun`] for why a NaN can reach here at all.
+    fn fits(&self) -> bool {
+        self.overflow_x_mm <= 0.0 && self.overflow_y_mm <= 0.0
+    }
+
+    /// True when both overruns are real numbers a caller could act on.
+    ///
+    /// `fits()` already answers "no" for a NaN or infinite overrun, but "no"
+    /// is not the whole answer: the caller must not then REPORT that overrun
+    /// as a measured overflow. This separates "it overruns by 462 mm" from
+    /// "the overrun is not a number", which are different things to tell a
+    /// client and are refused with different typed errors.
+    fn overflow_is_measurable(&self) -> bool {
+        self.overflow_x_mm.is_finite() && self.overflow_y_mm.is_finite()
+    }
+}
+
+/// Place the four views CENTERED in the drawing area at the supplied scale:
+///
+/// ```text
+///   TOP    ISO
+///   FRONT  RIGHT
+/// ```
+///
+/// Top is directly above Front (shared centre-x), Right is level with
+/// Front (shared centre-y) — proper third angle — and the isometric
+/// pictorial fills the otherwise-empty top-right quadrant. Each view is
+/// centred in its grid cell; the group is centred in the drawing area
+/// with room reserved for dimensions.
+///
+/// A route that OWNS its scale ([`standard_drawing_auto`]) reaches this
+/// through [`layout_four_view`], which picks the fill scale first. A route
+/// whose scale is DICTATED by the caller ([`standard_drawing_hlr`]) calls it
+/// directly and reads [`FourViewPlacement::fits`] — the overflow is the
+/// measured refusal reason, not a guess.
+///
+/// A three-view route passes a ZERO extent for `ie`: `max` then leaves the
+/// right column and top row sized by the real views, and the top-right
+/// quadrant simply stays empty.
+fn place_four_view(
+    sheet: &super::types::SheetSize,
+    fe: super::types::ViewExtent,
+    te: super::types::ViewExtent,
+    re: super::types::ViewExtent,
+    ie: super::types::ViewExtent,
+    scale: f64,
+) -> FourViewPlacement {
+    let h = sheet.height();
+    let (avail_x0, avail_y0, avail_w, avail_h) = four_view_area(sheet);
+    let (left_w, right_w, top_h, bot_h) = four_view_spans(fe, te, re, ie);
 
     let lw = left_w * scale;
     let rwc = right_w * scale;
@@ -954,15 +1175,34 @@ fn layout_four_view(
         // sheet_y_top = (h − pos.y) − max_y·s.
         [xtl - e.min_x * scale, h - ytl - e.max_y * scale]
     };
-    (
-        scale,
-        [
+    FourViewPlacement {
+        positions: [
             place(left_cx, bot_cy, fe),  // FRONT  (bottom-left)
             place(left_cx, top_cy, te),  // TOP    (top-left)
             place(right_cx, bot_cy, re), // RIGHT  (bottom-right)
             place(right_cx, top_cy, ie), // ISO    (top-right)
         ],
-    )
+        overflow_x_mm: overrun(g_w, avail_w),
+        overflow_y_mm: overrun(g_h, avail_h - BOTTOM_DIM_SHORTFALL),
+    }
+}
+
+/// By how much `need` exceeds `have`, in mm; `0.0` when it fits.
+///
+/// NOT `(need - have).max(0.0)`: `f64::max` returns the OTHER operand when one
+/// is NaN, so a NaN difference would be laundered into `0.0` — "it fits" — and
+/// [`FourViewPlacement::fits`] would wave a NaN sheet through. A NaN difference
+/// is not a fit, it is an unanswerable question, so it propagates and `fits()`
+/// (whose `<= 0.0` is false for NaN) refuses. `standard_drawing_hlr` rejects
+/// non-finite scales before it ever gets here; this keeps the arithmetic itself
+/// from being the weak link if a future caller does not.
+fn overrun(need: f64, have: f64) -> f64 {
+    let d = need - have;
+    if d > 0.0 || d.is_nan() {
+        d
+    } else {
+        0.0
+    }
 }
 
 /// Fully automatic standard drawing: picks the sheet size and fill scale
@@ -2756,6 +2996,83 @@ mod tests {
             GeometryId::Solid(s) => s,
             o => panic!("expected solid, got {o:?}"),
         }
+    }
+
+    /// [`overrun`] must NOT be `(need - have).max(0.0)`.
+    ///
+    /// `f64::max` returns the OTHER operand when one is NaN, so `.max(0.0)`
+    /// turns a NaN difference into `0.0` — "it fits" — and
+    /// [`FourViewPlacement::fits`] then waves through a sheet whose every view
+    /// sits at `[NaN, NaN]`. That sheet renders nothing and `verify_drawing`
+    /// certifies it CLEAN (every comparison against NaN is false), so this
+    /// arithmetic is the last place the lie can be caught.
+    ///
+    /// Pinned HERE, in the private module, rather than through the public
+    /// route: `standard_drawing_hlr` rejects non-finite scales before
+    /// `place_four_view` is reached, so no integration test can drive a NaN
+    /// into this function. Without this unit test, reverting `overrun` to
+    /// `.max(0.0)` broke nothing.
+    #[test]
+    fn overrun_does_not_launder_a_nan_into_a_fit() {
+        assert!(
+            overrun(f64::NAN, 100.0).is_nan(),
+            "a NaN difference must propagate, not become 0.0"
+        );
+        assert!(
+            overrun(100.0, f64::NAN).is_nan(),
+            "a NaN available-area must propagate too"
+        );
+        // The ordinary arithmetic is unchanged.
+        assert_eq!(overrun(830.0, 368.0), 462.0, "a real overrun is reported");
+        assert_eq!(overrun(100.0, 368.0), 0.0, "fitting reports zero, not -268");
+        assert_eq!(
+            overrun(368.0, 368.0),
+            0.0,
+            "exactly filling is not an overrun"
+        );
+        assert_eq!(
+            overrun(f64::INFINITY, 368.0),
+            f64::INFINITY,
+            "an infinite overrun stays infinite, to be classified by the caller"
+        );
+    }
+
+    /// `fits()` is one-sided on purpose, and `overflow_is_measurable` is the
+    /// other half of the answer.
+    ///
+    /// A NaN overrun is NOT a fit (`NaN <= 0.0` is false), and it is not a
+    /// measurement either — the caller must refuse it as an unusable scale
+    /// rather than report it as an overflow of NaN mm.
+    #[test]
+    fn a_placement_with_a_non_finite_overrun_neither_fits_nor_measures() {
+        let p = |x: f64, y: f64| FourViewPlacement {
+            positions: [[0.0, 0.0]; 4],
+            overflow_x_mm: x,
+            overflow_y_mm: y,
+        };
+        for (x, y) in [
+            (f64::NAN, 0.0),
+            (0.0, f64::NAN),
+            (f64::INFINITY, 0.0),
+            (0.0, f64::INFINITY),
+        ] {
+            let placement = p(x, y);
+            assert!(
+                !placement.fits(),
+                "overflow ({x}, {y}) must never read as a fit"
+            );
+            assert!(
+                !placement.overflow_is_measurable(),
+                "overflow ({x}, {y}) must never read as a measurement"
+            );
+        }
+        assert!(p(0.0, 0.0).fits(), "a zero overrun fits");
+        assert!(p(0.0, 0.0).overflow_is_measurable());
+        assert!(!p(1.0, 0.0).fits(), "a real overrun does not fit");
+        assert!(
+            p(1.0, 0.0).overflow_is_measurable(),
+            "a real overrun IS a measurement, and must be reported as one"
+        );
     }
 
     fn has(dims: &[Dimension2d], kind: &str, value: f64) -> bool {

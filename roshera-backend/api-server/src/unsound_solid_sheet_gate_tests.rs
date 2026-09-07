@@ -943,25 +943,70 @@ async fn the_one_call_svg_export_using_acknowledge_unsound_also_stamps_the_canon
 async fn acknowledge_layout_issues_alone_does_not_stamp_the_acknowledge_unsound_facet() {
     let state = make_test_state().await;
     let (_uuid, solid_id) = sound_verified_box(&state).await;
-    // `?scale=1000` on a 10mm box overflows the fixed A3 sheet by three
-    // orders of magnitude, reliably tripping the layout-quality Error
-    // branch (`ViewOutsideFrame`) without touching solid soundness — the
-    // same trick `sheet_export_gate_tests::quality_failing_drawing` uses.
-    // `create_part_drawing_inner` does not itself refuse on quality (only
-    // export does), so registration still 200s.
+    // Register the ORDINARY sheet (no `?scale=`), then push one view off the
+    // frame through the registered handle.
+    //
+    // This used to force the layout-quality Error with `?scale=1000` on a
+    // 10 mm box, which overflowed the fixed A3 sheet by three orders of
+    // magnitude. Task 40 closed that trick at the source: the explicit-scale
+    // route now computes its placement from the SCALED extents and REFUSES a
+    // scale no arrangement fits (`ProjectionError::ScaleDoesNotFitSheet`), so
+    // `?scale=1000` never produces a registered drawing at all. Moving the
+    // view afterwards reaches the same branch by the same shape
+    // `make_a_dimension_stale` uses — and a view POSITION is not a
+    // certificate fact, so the sheet stays SOUND while `verify_drawing`
+    // reports `ViewOutsideFrame`, which is exactly the quality-only isolation
+    // this test needs.
     let drawing_id = {
         let (status, body) = dispatch(
             &state,
-            post(
-                &format!("/api/parts/{solid_id}/drawing?scale=1000"),
-                json!({}),
-            ),
+            post(&format!("/api/parts/{solid_id}/drawing"), json!({})),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "body = {body}");
         Uuid::parse_str(body["id"].as_str().expect("drawing id string"))
             .expect("drawing id must parse")
     };
+    {
+        let handle = state
+            .drawings
+            .get(&drawing_id)
+            .expect("drawing must be registered before it can be mutated");
+        let mut guard = handle.write().await;
+        let view = guard
+            .views
+            .first_mut()
+            .expect("fixture precondition: the standard box sheet must carry at least one view");
+        view.position_mm = [10_000.0, 0.0];
+    }
+    // The fixture's own preconditions, asserted rather than assumed: the
+    // sheet must now FAIL quality and still certify SOUND. A fixture that
+    // silently stopped failing quality would let this test pass vacuously.
+    {
+        let (status, cert) = dispatch(
+            &state,
+            get(&format!("/api/drawings/{drawing_id}/certificate")),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "certificate GET must 200; body = {cert}"
+        );
+        assert_eq!(
+            cert["quality"]["passed"].as_bool(),
+            Some(false),
+            "fixture precondition: a view moved off the frame must fail the \
+             layout-quality check; cert = {cert}"
+        );
+        assert_eq!(
+            cert["sound"].as_bool(),
+            Some(true),
+            "fixture precondition: a view POSITION is not a certificate fact, \
+             so the sheet must still certify SOUND — this fixture isolates the \
+             quality-only branch; cert = {cert}"
+        );
+    }
 
     let (status, body) = dispatch(
         &state,

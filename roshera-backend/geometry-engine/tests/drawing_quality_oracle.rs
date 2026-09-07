@@ -3588,21 +3588,26 @@ fn coaxial_datum_pair_does_not_collide() {
 ///
 /// # The layout claim this test does and does not make
 ///
-/// Soundness is asserted at two arbitrary scales; a table that only works at
-/// 1.0 is not fixed. Full layout cleanliness is asserted at the scales where
-/// the route's own fixed three-view A3 arrangement fits.
+/// Soundness is asserted at every scale; a table that only works at 1.0 is not
+/// fixed. The claim this test pins is that the TABLE never collides — the
+/// frame overflow that used to sit alongside it was a separate defect with a
+/// separate fix.
 ///
-/// Measured, before asserting anything: `ViewOutsideFrame` appears at scale
-/// >= 2.0 on a plate with **no bore at all** — no hole table can exist on that
-/// sheet — so it is the pre-existing fixed-position layout overflowing an A3
-/// frame, not this change. Per scale, Error kinds (no-bore | bored-with-table):
-/// 1.0 `[] | []`; 1.5 `[] | []`; 2.0 `[ViewOutsideFrame] | [ViewOutsideFrame
-/// x2]`; 2.5 `[ViewOutsideFrame] | [ViewOutsideFrame x2]`. The bored sheet
-/// carries a second one because the bore adds callouts to a second view, which
-/// then also overflows — the same defect, not a table collision. At NO scale
-/// does the table produce a collision of its own, which is the claim this test
-/// pins. The frame overflow is reported as a separate finding, not silenced
-/// here and not fixed here.
+/// Measured here in Task 17, before asserting anything: `ViewOutsideFrame`
+/// appeared at scale >= 2.0 on a plate with **no bore at all** — no hole table
+/// can exist on that sheet — so it was the route's fixed 1:1 view positions
+/// overflowing an A3 frame, not this change. Per scale, Error kinds (no-bore |
+/// bored-with-table): 1.0 `[] | []`; 1.5 `[] | []`; 2.0 `[ViewOutsideFrame] |
+/// [ViewOutsideFrame x2]`; 2.5 `[ViewOutsideFrame] | [ViewOutsideFrame x2]`.
+///
+/// **Task 40 closed that finding**: `standard_drawing_hlr` now places its views
+/// from the SCALED extents through the automatic route's own `place_four_view`,
+/// and refuses (`ProjectionError::ScaleDoesNotFitSheet`) when no placement
+/// fits. `frame_fits` therefore covers every scale this test draws — the
+/// arrangement is fitted per scale, not stamped at 1:1 — and the sweep is the
+/// standing guard that tabling a bore never re-introduces a layout Error on a
+/// sheet the route agreed to draw. The fit predicate itself is swept in
+/// `tests/drawing_explicit_scale_fit.rs`.
 #[test]
 fn explicit_scale_hlr_sheet_tables_its_bores_and_certifies_sound() {
     use geometry_engine::drawing::sheet_certificate::certify_drawing;
@@ -3635,8 +3640,9 @@ fn explicit_scale_hlr_sheet_tables_its_bores_and_certifies_sound() {
     .expect("difference");
     m.set_event_key(None);
 
-    // Scales where the route's fixed three-view arrangement fits an A3 frame.
-    let frame_fits = [1.0_f64, 1.5];
+    // Every scale drawn below fits, since Task 40: the route fits its own
+    // arrangement per scale and refuses outright when it cannot.
+    let frame_fits = [1.0_f64, 1.5, 2.5];
 
     for scale in [1.0_f64, 1.5, 2.5] {
         let d = standard_drawing_hlr(&m, part, uuid::Uuid::nil(), SheetSize::A3, scale)
