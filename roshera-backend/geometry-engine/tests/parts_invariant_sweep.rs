@@ -1791,10 +1791,16 @@ fn emit_l_bracket_png() {
 /// thread that bumps a shared stage counter after each op; the main thread waits
 /// with a timeout and, on timeout, reports the last completed stage so the
 /// hanging op is `stage+1`. (Subprocess-isolation philosophy, thread+atomic+
-/// timeout variant; the leaked worker dies at process exit.) #[ignore]: may run
-/// the full timeout and spin a core meanwhile.
+/// timeout variant; the leaked worker dies at process exit.)
+///
+/// `#[ignore]` REMOVED (Task 45). The ignore cited "~120s", but 120s is the HANG
+/// TIMEOUT, not the runtime: on the green path the 13-stage build completes and
+/// the test returns in **1.73s** (measured at `780dfcab`, `--ignored
+/// --nocapture`), printing "completed all 13 stages in <120s — no hang". The
+/// worker is only leaked on a TRUE hang, which is the failure this guards. Since
+/// this is the only #86 guard in the tree, parking it for a cost that is not
+/// being paid left the regression unwatched; it now runs in the standing suite.
 #[test]
-#[ignore = "BOOL #86 hang isolation — bounded ~120s, leaks the worker on a true hang"]
 fn bool86_hang_isolation() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{mpsc, Arc};

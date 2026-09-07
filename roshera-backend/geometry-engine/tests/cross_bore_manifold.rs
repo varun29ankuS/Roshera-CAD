@@ -158,18 +158,29 @@ fn axial_bore_through_a_cylinder_is_manifold() {
     );
 }
 
-/// RED, held with its real assertion.
+/// WAS RED, held with its real assertion: a cross-drilled bore through a
+/// cylinder returned a NON-MANIFOLD solid (watertight and brep_valid, manifold
+/// false) at every radius measured — curved cyl-cyl SSI, same family as the
+/// PIPE-TEE case in `agent_build_eval.rs`; surfaced 2026-08-21 by an agent build.
 ///
-/// Delete the `#[ignore]` when the curved cylinder-cylinder intersection
-/// produces sound topology. Do NOT weaken the assertion to get a green run:
-/// a cross-drilled hole is an everyday machining feature, and a kernel that
-/// returns non-manifold geometry for it has a capability gap that a softened
-/// test would hide rather than close.
+/// FIXED by `b6604a31` ("kernel: the Steiner collapse was right about walls and
+/// wrong about walls with holes"): the CDT no longer joins one bore breakout
+/// straight to the antipodal one on a lateral carrying interior loops. Measured
+/// in a detached worktree with this exact assertion: RED at `9121f7e7` with
+/// `nonmanifold_edges = 110` (tris 5840), GREEN at `b6604a31` with
+/// `nonmanifold_edges = 0` (tris 24118).
+///
+/// `9121f7e7` is NOT `b6604a31`'s parent — `95afeeda` is, with five UI/MCP/
+/// timeline commits in between. The RED run stands for the parent anyway because
+/// `git diff --stat 9121f7e7 95afeeda -- geometry-engine/` is EMPTY: the crate is
+/// byte-identical across those five, so the kernel measured at `9121f7e7` IS the
+/// kernel at `95afeeda`. The assertion was never edited after `03f2d678` pinned
+/// it, so the pass is a kernel change, not a weakened fixture. `#[ignore]`
+/// removed (Task 45).
+///
+/// The mesh QUALITY red for the same feature family is separate and still
+/// parked: see `cross_bore_mesh_wings.rs`.
 #[test]
-#[ignore = "cross-drilled bore through a cylinder returns a NON-MANIFOLD solid \
-            (watertight and brep_valid, manifold false) at every radius \
-            measured — curved cyl-cyl SSI, same family as the PIPE-TEE case in \
-            agent_build_eval.rs; surfaced 2026-08-21 by an agent build"]
 fn cross_bore_through_a_cylinder_is_manifold() {
     let r = bore_and_measure(
         Vector3::new(0.0, 1.0, 0.0),
@@ -188,13 +199,23 @@ fn cross_bore_through_a_cylinder_is_manifold() {
     );
 }
 
-/// The failure does not depend on the bore being large or small, which is what
-/// rules out a tolerance-sized coincidence and points at the intersection
-/// itself. Held RED alongside its sibling for the same reason.
+/// The failure did not depend on the bore being large or small, which is what
+/// ruled out a tolerance-sized coincidence and pointed at the intersection
+/// itself. Was held RED alongside its sibling for the same reason.
+///
+/// FIXED by `b6604a31`, with its sibling. Measured in a detached worktree: RED at
+/// `9121f7e7` on the very first radius (`nonmanifold_edges = 66` at r5, tris
+/// 5788), GREEN at `b6604a31` across r5/r12/r25 (0 nonmanifold edges, tris
+/// 24814/24118/20254). See the sibling above for why a RED at `9121f7e7` is a RED
+/// at `b6604a31`'s actual parent `95afeeda`. `#[ignore]` removed (Task 45).
+///
+/// RENAMED (Task 45) from `cross_bore_is_non_manifold_at_every_radius`. That name
+/// recorded the defect the fixture was written to pin, but the body asserts — as
+/// it always did — the manifoldness the defect denied. Once the ignore came off,
+/// a green test named for the defect was a name that lies, so the name now says
+/// what the assertion checks. The history is here instead.
 #[test]
-#[ignore = "same cross-bore defect measured across radii 5, 12 and 25 — held \
-            with the sibling cross_bore_through_a_cylinder_is_manifold"]
-fn cross_bore_is_non_manifold_at_every_radius() {
+fn cross_bore_is_manifold_at_every_radius() {
     for radius in [5.0_f64, 12.0, 25.0] {
         let r = bore_and_measure(
             Vector3::new(0.0, 1.0, 0.0),

@@ -659,6 +659,9 @@ fn audit_seed(seed: u64) -> Vec<Finding> {
 /// --nocapture`. `GAP_FINDER_SEEDS=200` for a deeper run; coarse chord throughout
 /// (HARNESS-1000 lesson: tessellation/booleans dominate cost). Each seed costs
 /// ~3 chain builds (1 audited + 2 for the replay-determinism comparison).
+// The ignore is opt-in COST (hanging seeds leave detached workers saturating a
+// core), not a parked defect. The always-on gate is gap_finder_smoke below.
+// ignored-reds: not-a-red -- a FINDER: it reports violations and never fails on them
 #[test]
 #[ignore = "FINDER (opt-in): adversarial mix includes known curved-boolean hang regimes; run explicitly"]
 fn gap_finder_sweep() {

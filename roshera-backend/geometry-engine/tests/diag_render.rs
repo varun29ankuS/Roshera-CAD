@@ -41,6 +41,8 @@ fn cone(model: &mut BRepModel, bc: [f64; 3], rb: f64, rt: f64, h: f64) -> SolidI
     }
 }
 
+// "failing" names the cells this test photographs, not a defect it pins.
+// ignored-reds: not-a-red -- writes PNGs for a human to look at, nothing is asserted
 #[test]
 #[ignore = "diagnostic — renders failing cone cells to render_out/ (run with --ignored --nocapture)"]
 #[allow(clippy::expect_used)]

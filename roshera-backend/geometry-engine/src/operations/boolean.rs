@@ -26903,8 +26903,14 @@ must be dropped; a 1·tol band rejects it and lets it double the rim"
     /// `#[ignore]`d: it is a white-box arrangement probe, run manually for
     /// evidence, not part of the standing gate (which the end-to-end fixtures
     /// own once GREEN).
+    // The reason below deliberately does NOT describe a red state. It used to say
+    // "end-to-end RED until A+B", which is true of the END-TO-END #35 fixtures
+    // (diff_intersecting_bores_35, diff_skew_tilted_bores_35) and not of this
+    // probe -- and ignored-reds.ps1 rightly enumerated this site on that word.
+    // Naming another test's red here is what was wrong; the wording is fixed at
+    // the source rather than blinded with a not-a-red escape.
     #[test]
-    #[ignore = "#35 Slice-1 C+D intermediate probe (end-to-end RED until A+B)"]
+    #[ignore = "#35 Slice-1 C+D white-box probe; the end-to-end fixtures own the gate"]
     fn saddle_crossing_vertices_shared_35() {
         use crate::primitives::curve::Ellipse;
         let mut m = BRepModel::new();

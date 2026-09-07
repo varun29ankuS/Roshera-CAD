@@ -506,6 +506,9 @@ fn diag_offset() -> f64 {
         .unwrap_or(10.0)
 }
 
+// "leak" names the subject this dump reports on, not a defect it pins. Its two
+// siblings below are the same kind of dump and dodge the heuristic by wording.
+// ignored-reds: not-a-red -- on-demand diagnostic dump, nothing is asserted
 #[test]
 #[ignore = "diagnostic: z-histogram of the difference leak (ROSHERA_F7_OFFSET)"]
 fn f7_leak_zhistogram_offset_10() {

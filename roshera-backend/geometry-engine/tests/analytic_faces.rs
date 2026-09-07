@@ -213,11 +213,17 @@ fn cylinder_is_three_analytic_faces_24() {
     }
 }
 
+/// WAS a pinned finding (task #11 blind-spot): an extreme-aspect cylinder
+/// (r0.5 x h200, 400:1) was a VALID B-Rep that tessellated with 2 nonmanifold
+/// mesh edges at the seam — a tessellation blind spot, not a B-Rep defect.
+///
+/// FIXED by `3013be9c` ("FIX #65: remove doubled facets in weld pass → fine mesh
+/// watertight"). Measured in a detached worktree with this exact assertion: RED
+/// at the parent `c898d649` with `(boundary, nonmanifold) = (0, 2)` @defl 0.025,
+/// GREEN at `3013be9c`. The assertion is byte-identical to the one it was pinned
+/// with (`8d2b3b56` only added the file-top clippy allow), so the pass is a
+/// kernel change, not a weakened fixture. `#[ignore]` removed (Task 45).
 #[test]
-#[ignore = "FINDING (task #11 blind-spot): extreme-aspect cylinder (r0.5 x h200, \
-            400:1) is a VALID B-Rep (validate_solid_scoped ok) but tessellates \
-            with 2 nonmanifold mesh edges at the seam — a tessellation blind \
-            spot, not a B-Rep defect. Pinned for the blind-spot audit."]
 fn extreme_aspect_cylinder_mesh_nonmanifold_finding() {
     let mut m = BRepModel::new();
     let e = circle_edge(&mut m, Point3::ZERO, Vector3::Z, 0.5);
