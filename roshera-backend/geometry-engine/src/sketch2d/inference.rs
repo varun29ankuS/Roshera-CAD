@@ -24,13 +24,29 @@
 //!
 //! # Inference rules (D-1-b scope)
 //!
+//! Every proposal is a constraint the kernel DEFINES a shape for, so
+//! one the constraint door ([`Sketch::try_add_constraint`]) accepts —
+//! and it is about the feature that was actually hit. A snap the user
+//! can see must not produce a proposal that cannot be applied, and
+//! must never quietly stand for a different piece of geometry:
+//! `Coincident` against a circle or arc means its CENTRE, so an
+//! ARC-ENDPOINT snap proposing one used to pull the point to the
+//! middle of the arc. Where the kernel can name no relation that
+//! places a point at the snapped feature (a rectangle's corner, an
+//! ellipse's quadrant) nothing is proposed — see
+//! [`discrete_snap_relation`] for the whole table.
+//!
 //! For a [`DraftEntity::Line`]:
-//! - **Coincident**: either endpoint snaps to a Point / LineEndpoint
-//!   / ArcEndpoint / RectangleCorner. The constraint pairs the
-//!   draft endpoint with the snap target.
-//! - **PointOnCurve**: either endpoint snaps to `OnLine` / `OnArc`
-//!   / `OnEllipse`. Excludes `OnCircle` when the line is tangent
-//!   (see next rule).
+//! - **Coincident**: either endpoint snaps to a feature the sketch
+//!   owns as a POINT — a free point, or the endpoint of a segment or
+//!   arc built through [`Sketch::add_line`] / [`Sketch::add_arc`] —
+//!   or to a circle's / arc's CENTRE.
+//! - **Midpoint**: either endpoint snaps to a line's midpoint.
+//! - **PointOnCurve**: either endpoint snaps to `OnLine` / `OnArc` /
+//!   `OnCircle`, or to a discrete position on a round curve the
+//!   kernel cannot name more precisely (a quadrant, an arc midpoint,
+//!   the endpoint of an arc built from raw geometry). Excludes
+//!   `OnCircle` when the line is tangent (see next rule).
 //! - **Tangent**: the line endpoint snapped to `OnCircle` / `OnArc`
 //!   AND the line direction is ≈ perpendicular to the radius vector
 //!   from the snapped point to the circle/arc centre.
@@ -41,15 +57,18 @@
 //!   perpendicular.
 //!
 //! For a [`DraftEntity::Circle`]:
-//! - **Coincident** (centre): centre snaps to a vertex feature.
 //! - **Concentric**: centre snaps to another `CircleCenter` /
 //!   `ArcCenter` / `EllipseCenter`.
+//! - **Coincident / Midpoint / PointOnCurve** (centre): centre snaps
+//!   to a discrete feature, by the same table as a line endpoint.
 //! - **Equal** (radius): radius differs from an existing circle's /
 //!   arc's radius by less than `equal_radius_tol`.
 //!
 //! For a [`DraftEntity::Point`]:
-//! - **Coincident**: snaps to any discrete feature.
-//! - **PointOnCurve**: snaps to any on-curve feature.
+//! - **Coincident / Midpoint / PointOnCurve**: snaps to a discrete
+//!   feature, by the same table.
+//! - **PointOnCurve**: snaps to an on-curve feature of a line, circle
+//!   or arc.
 //!
 //! # What this module does NOT do
 //!
@@ -308,20 +327,22 @@ fn propose_for_endpoint(
     };
 
     if snap.kind.is_discrete() {
-        out.push(ProposedConstraint {
-            constraint: GeometricConstraint::Coincident,
-            draft_slot: slot,
-            target: Some(snap.entity),
-            confidence: 1.0,
-            reason: "snapped to existing vertex",
-        });
+        if let Some((constraint, target, reason)) = discrete_snap_relation(&snap) {
+            out.push(ProposedConstraint {
+                constraint,
+                draft_slot: slot,
+                target: Some(target),
+                confidence: 1.0,
+                reason,
+            });
+        }
         return;
     }
 
     // On-curve snap. For lines we may want Tangent instead of
     // PointOnCurve when the line direction is perpendicular to the
     // radius vector at the snap.
-    if is_line_endpoint {
+    if is_line_endpoint && snap.entity.is_round() {
         if let Some(circle_center) = circle_or_arc_center_for(sketch, snap.entity) {
             // Radius vector from centre to snap point.
             let rx = snap.point.x - circle_center.x;
@@ -348,13 +369,18 @@ fn propose_for_endpoint(
         }
     }
 
-    out.push(ProposedConstraint {
-        constraint: GeometricConstraint::PointOnCurve,
-        draft_slot: slot,
-        target: Some(snap.entity),
-        confidence: 1.0,
-        reason: "snapped onto curve",
-    });
+    // An ELLIPSE is not a `PointOnCurve` carrier — the kernel defines
+    // no residual projecting a point onto one — so an `OnEllipse` snap
+    // proposes nothing rather than a constraint the door refuses.
+    if snap.entity.is_curve() {
+        out.push(ProposedConstraint {
+            constraint: GeometricConstraint::PointOnCurve,
+            draft_slot: slot,
+            target: Some(snap.entity),
+            confidence: 1.0,
+            reason: "snapped onto curve",
+        });
+    }
 }
 
 // ── Circle ────────────────────────────────────────────────────────
@@ -381,13 +407,19 @@ fn infer_for_circle(
                 });
             }
             _ if snap.kind.is_discrete() => {
-                out.push(ProposedConstraint {
-                    constraint: GeometricConstraint::Coincident,
-                    draft_slot: DraftSlot::CircleCenter,
-                    target: Some(snap.entity),
-                    confidence: 1.0,
-                    reason: "centre snapped to vertex",
-                });
+                // The reason comes from the relation, not from a fixed
+                // "centre snapped to vertex": once a centre hit can be
+                // a Midpoint or a PointOnCurve, a hard-coded reason is
+                // a tooltip describing a constraint that is not there.
+                if let Some((constraint, target, reason)) = discrete_snap_relation(&snap) {
+                    out.push(ProposedConstraint {
+                        constraint,
+                        draft_slot: DraftSlot::CircleCenter,
+                        target: Some(target),
+                        confidence: 1.0,
+                        reason,
+                    });
+                }
             }
             _ => {}
         }
@@ -434,14 +466,18 @@ fn infer_for_point(
     let mut out = Vec::new();
     if let Some(snap) = sketch.best_snap(position, tol.snap_radius) {
         if snap.kind.is_discrete() {
-            out.push(ProposedConstraint {
-                constraint: GeometricConstraint::Coincident,
-                draft_slot: DraftSlot::PointSelf,
-                target: Some(snap.entity),
-                confidence: 1.0,
-                reason: "snapped to existing vertex",
-            });
-        } else {
+            if let Some((constraint, target, reason)) = discrete_snap_relation(&snap) {
+                out.push(ProposedConstraint {
+                    constraint,
+                    draft_slot: DraftSlot::PointSelf,
+                    target: Some(target),
+                    confidence: 1.0,
+                    reason,
+                });
+            }
+        } else if snap.entity.is_curve() {
+            // See `propose_for_endpoint`: an ellipse carries no
+            // `PointOnCurve` residual, so nothing is proposed for it.
             out.push(ProposedConstraint {
                 constraint: GeometricConstraint::PointOnCurve,
                 draft_slot: DraftSlot::PointSelf,
@@ -455,6 +491,102 @@ fn infer_for_point(
 }
 
 // ── Helpers ───────────────────────────────────────────────────────
+
+/// The relation a DISCRETE snap actually stands for: the constraint
+/// kind, the entity it pairs the draft with, and the UI reason.
+///
+/// Every discrete snap used to become `Coincident(draft, snap.entity)`.
+/// That is only true when the snapped feature IS the entity named —
+/// a free point, or a segment/arc endpoint the sketch owns as a point
+/// (see [`SnapCandidate::entity`]). For everything else it was one of
+/// two failures:
+///
+/// * a shape the constraint door does not define, so the proposal the
+///   user could see could never be applied — `Coincident(point, line)`
+///   for a MIDPOINT hit, `Coincident(point, rectangle)` for a corner;
+/// * a shape the door DOES define that means something else. A circle
+///   or an arc in a `Coincident` means its CENTRE, so an
+///   ARC-ENDPOINT snap on a legacy arc proposed, and the solver
+///   applied, a pull to the middle of the arc.
+///
+/// The mapping, by what the feature IS:
+///
+/// * an entity the sketch owns → `Coincident` with it;
+/// * a line's MIDPOINT → `Midpoint(draft, line)`, the relation that
+///   names a midpoint;
+/// * a CENTRE of a circle or arc → `Coincident`, whose circle/arc
+///   reading is exactly "its centre";
+/// * a position ON a circle or arc that the kernel cannot name any
+///   more precisely — a quadrant, an arc midpoint, an endpoint of an
+///   arc built from raw geometry — → `PointOnCurve`. Weaker than the
+///   snap, never wrong: the point is held on the curve it was snapped
+///   to, and left where it already sits along it;
+/// * a rectangle's or an ellipse's corner, edge midpoint, centre or
+///   quadrant → NOTHING. The kernel defines no constraint that places
+///   a point there (`Coincident` excludes both kinds, and neither is a
+///   `PointOnCurve` carrier), and inventing one that the door would
+///   refuse is worse than proposing nothing.
+///
+/// # The two last rules are a CHOICE, and they are the same choice
+///
+/// Neither `PointOnCurve` nor silence is forced by the geometry; both
+/// are the answer to "the kernel cannot say what the user pointed at —
+/// now what?", and the rule is: **say the strongest TRUE thing the
+/// kernel defines, and if there is none, say nothing.**
+///
+/// For a feature ON a `PointOnCurve` carrier (line, circle, arc,
+/// spline, polyline) there IS a weaker true statement — the point lies
+/// on that curve — so it is proposed, and the `reason` says the
+/// relation was weakened and why, so the UI is not passing a
+/// `PointOnCurve` off as the quadrant snap the user saw. For a
+/// rectangle corner or an ellipse quadrant there is no weaker true
+/// statement the kernel carries a residual for, so nothing is
+/// proposed. The rejected alternatives were: propose the refused shape
+/// anyway and let the door 400 it (a proposal the user can see and
+/// cannot apply), or invent a `Coincident` against the owning entity
+/// (a lie for a quadrant, and the exact defect this function exists to
+/// remove).
+fn discrete_snap_relation(
+    snap: &SnapCandidate,
+) -> Option<(GeometricConstraint, EntityRef, &'static str)> {
+    if matches!(snap.entity, EntityRef::Point(_)) {
+        return Some((
+            GeometricConstraint::Coincident,
+            snap.entity,
+            "snapped to existing vertex",
+        ));
+    }
+    match snap.kind {
+        SnapKind::LineMidpoint => Some((
+            GeometricConstraint::Midpoint,
+            snap.entity,
+            "snapped to the midpoint of an existing line",
+        )),
+        SnapKind::CircleCenter | SnapKind::ArcCenter => Some((
+            GeometricConstraint::Coincident,
+            snap.entity,
+            "snapped to the centre of an existing curve",
+        )),
+        kind @ (SnapKind::LineEndpoint
+        | SnapKind::ArcEndpoint
+        | SnapKind::ArcMidpoint
+        | SnapKind::CircleQuadrant) => Some((
+            GeometricConstraint::PointOnCurve,
+            snap.entity,
+            // The reason names the feature that was hit AND says the
+            // relation is weaker than the snap, so a tooltip never
+            // passes a "held on the curve" off as "pinned to the
+            // quadrant you clicked".
+            match kind {
+                SnapKind::LineEndpoint | SnapKind::ArcEndpoint => {
+                    "endpoint snap held on the curve: it owns no point entity there"
+                }
+                _ => "quadrant/midpoint snap held on the curve: the kernel names no such point",
+            },
+        )),
+        _ => None,
+    }
+}
 
 /// Unit direction `(ux, uy)` of a [`LineGeometry`], or `None` for
 /// degenerate (zero-length) segments.
@@ -492,13 +624,6 @@ fn confidence_from_misalign(misalign: f64, tol: f64) -> f64 {
         return 1.0;
     }
     (1.0 - (misalign / tol)).clamp(0.0, 1.0)
-}
-
-// Snap candidates exposed for callers that want to render snap glyphs
-// independently of inference; thin re-export.
-#[allow(dead_code)]
-fn _carries_snap_types(c: &SnapCandidate) -> SnapKind {
-    c.kind
 }
 
 #[cfg(test)]
@@ -711,19 +836,41 @@ mod tests {
     fn line_ending_on_circle_not_perpendicular_infers_point_on_curve() {
         let s = fresh();
         let cid = s.add_circle(Point2d::ORIGIN, 5.0).expect("circle");
-        // Snap end to the +X quadrant via the OnCircle/quadrant snap,
-        // but the line points diagonally — not tangent.
+        // Two DIFFERENT slots fire here, and the slot is the whole
+        // point of the test — it previously asserted only "some
+        // proposal is Coincident with this circle" and passed on the
+        // START's centre snap while the END, the endpoint it names,
+        // was proposing something else entirely.
+        //
+        //   start (-1, -1) is 1.41 from the centre, inside the default
+        //     5-unit radius → CircleCenter, and `Coincident` against a
+        //     circle IS its centre, so that one is right;
+        //   end (5, 0) is the +X QUADRANT (discrete, priority 1, so it
+        //     outranks the OnCircle foot at the same distance) → a
+        //     position on the circle the kernel cannot name, so
+        //     `PointOnCurve`.
+        //
+        // Neither is Tangent: the line runs diagonally into the
+        // quadrant, not perpendicular to the radius there.
         let draft = DraftEntity::Line {
             start: Point2d::new(-1.0, -1.0),
             end: Point2d::new(5.0, 0.0),
         };
         let out = infer_constraints(&s, &draft, InferenceTolerance::defaults());
-        // Coincident with the quadrant target (CircleQuadrant is
-        // discrete priority 1) is what fires here, NOT Tangent.
-        assert!(out
-            .iter()
-            .any(|p| p.constraint == GeometricConstraint::Coincident
-                && p.target == Some(EntityRef::Circle(cid))));
+        assert!(
+            out.iter()
+                .any(|p| p.constraint == GeometricConstraint::Coincident
+                    && p.draft_slot == DraftSlot::LineStart
+                    && p.target == Some(EntityRef::Circle(cid))),
+            "start snapped the CENTRE: {out:?}"
+        );
+        assert!(
+            out.iter()
+                .any(|p| p.constraint == GeometricConstraint::PointOnCurve
+                    && p.draft_slot == DraftSlot::LineEnd
+                    && p.target == Some(EntityRef::Circle(cid))),
+            "end snapped the QUADRANT, which is a position on the circle, not its centre: {out:?}"
+        );
         assert!(!out
             .iter()
             .any(|p| p.constraint == GeometricConstraint::Tangent));
@@ -784,25 +931,46 @@ mod tests {
     fn draft_point_on_existing_line_infers_point_on_curve() {
         let s = fresh();
         let p0 = s.add_point(Point2d::new(0.0, 0.0));
-        let p1 = s.add_point(Point2d::new(10.0, 0.0));
+        let p1 = s.add_point(Point2d::new(30.0, 0.0));
         let lid = s.add_line(p0, p1).expect("line");
-        // Cursor at (5, 0.05) — just off the line, well within the
-        // default 5-unit snap radius. Note: it must not snap to the
-        // free point p0/p1 (distance ~5 each).
+        // Cursor at (5, 0.05) — just off the line's INTERIOR. Both
+        // endpoints (5.0002 and 25) and the midpoint (10) sit outside
+        // the default 5-unit snap radius, so the only feature in reach
+        // is the perpendicular foot; an endpoint or midpoint hit means
+        // something more specific than "on this line".
         let draft = DraftEntity::Point {
             position: Point2d::new(5.0, 0.05),
         };
         let out = infer_constraints(&s, &draft, InferenceTolerance::defaults());
-        // LineMidpoint (discrete) is at distance 0.05; OnLine is also
-        // 0.05 but priority 2 — so the discrete one wins and we get
-        // Coincident with the line. Either Coincident or PointOnCurve
-        // is a valid intent inference here; we assert at least one of
-        // the two fires.
         assert!(out
             .iter()
-            .any(|p| (p.constraint == GeometricConstraint::PointOnCurve
-                || p.constraint == GeometricConstraint::Coincident)
+            .any(|p| p.constraint == GeometricConstraint::PointOnCurve
                 && p.target == Some(EntityRef::Line(lid))));
+    }
+
+    /// A MIDPOINT hit is the `Midpoint` relation, not a coincidence
+    /// with the whole line — `Coincident(point, line)` is a shape the
+    /// constraint door does not define, so the proposal this used to
+    /// emit could be seen and never applied.
+    #[test]
+    fn draft_point_on_line_midpoint_infers_midpoint() {
+        let s = fresh();
+        let p0 = s.add_point(Point2d::new(0.0, 0.0));
+        let p1 = s.add_point(Point2d::new(30.0, 0.0));
+        let lid = s.add_line(p0, p1).expect("line");
+        // Both endpoints are 15 away, outside the default 5-unit snap
+        // radius; the midpoint at (15, 0) is 0.05 away and wins.
+        let draft = DraftEntity::Point {
+            position: Point2d::new(15.0, 0.05),
+        };
+        let out = infer_constraints(&s, &draft, InferenceTolerance::defaults());
+        assert!(out
+            .iter()
+            .any(|p| p.constraint == GeometricConstraint::Midpoint
+                && p.target == Some(EntityRef::Line(lid))));
+        assert!(!out
+            .iter()
+            .any(|p| p.constraint == GeometricConstraint::Coincident));
     }
 
     #[test]

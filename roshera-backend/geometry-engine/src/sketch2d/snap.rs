@@ -42,8 +42,9 @@ use serde::{Deserialize, Serialize};
 
 use super::constraints::EntityRef;
 use super::line2d::LineGeometry;
-use super::point2d::Point2d;
+use super::point2d::{Point2d, Point2dId};
 use super::sketch::Sketch;
+use super::Tolerance2d;
 
 /// Kind of feature a [`SnapCandidate`] points at.
 ///
@@ -129,7 +130,21 @@ impl SnapKind {
 /// One candidate result from [`Sketch::find_snap_candidates`].
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct SnapCandidate {
-    /// Owning entity in the sketch.
+    /// The sketch entity this candidate NAMES.
+    ///
+    /// When the snapped feature IS an entity the sketch owns, that
+    /// entity: a free point, and the endpoint of a segment or arc
+    /// built through [`Sketch::add_line`] / [`Sketch::add_arc`], which
+    /// remember the `Point2dId`s their endpoints derive from
+    /// (shared-variable model). Otherwise the entity the feature
+    /// belongs to — a midpoint, a centre and a quadrant are positions
+    /// ON a curve, not entities, so the curve stands for them.
+    ///
+    /// Naming the feature is what lets the constraint the caller
+    /// builds be ABOUT the feature. `Coincident(point, line)` is a
+    /// shape the door refuses, and `Coincident(point, arc)` means the
+    /// arc's CENTRE — an endpoint snap that emitted either was
+    /// talking about something the user never pointed at.
     pub entity: EntityRef,
     /// The 2D location the cursor would snap to.
     pub point: Point2d,
@@ -147,6 +162,58 @@ impl SnapCandidate {
     pub fn sort_key(&self) -> (u8, f64) {
         (self.kind.priority(), self.distance)
     }
+}
+
+/// The sketch's OWN point entity for a derived curve's endpoint, when
+/// it has one that AGREES with the position being snapped to.
+///
+/// A segment or arc built through [`Sketch::add_line`] /
+/// [`Sketch::add_arc`] remembers the two `Point2dId`s its endpoints
+/// derive from — the shared-variable model, where the curve cannot
+/// disagree with its endpoints. Naming that point is what lets an
+/// endpoint snap turn into `Coincident(point, point)`, a shape the
+/// constraint door defines and the solver lands exactly on the
+/// endpoint.
+///
+/// Returns `None` — and the caller keeps the owning curve — when:
+///
+/// * the curve carries no endpoint points (`add_infinite_line`, an
+///   arc from three points or from centre + angles: legacy private
+///   geometry);
+/// * the remembered point has been deleted. [`Sketch::delete_point`]
+///   does not cascade into curves that reference it, so the id can
+///   outlive the point, and handing it out would be a dangling
+///   entity reference;
+/// * the remembered point has drifted from the curve's own geometry.
+///   Naming it there would promise a solve lands the constraint at a
+///   position this snap never reported.
+///
+/// The drift test is `Tolerance2d::default().distance` (1e-10), the
+/// kernel's own definition of "coincident", and it is ABSOLUTE, not
+/// relative to the sketch's scale. On geometry whose coordinates run
+/// to 1e6 the double-precision round-trip through
+/// `Arc2d::from_endpoints_radius` can exceed it, and the endpoint then
+/// degrades to the owning curve — a weaker snap relation, never a
+/// wrong one. Scaling this with the coordinate magnitude would need a
+/// tolerance threaded from the caller, which
+/// [`Sketch::find_snap_candidates`] does not take today.
+///
+/// `at` is matched against the candidate points rather than assumed
+/// positional: `Arc2d::from_endpoints_radius` may order the arc's
+/// parametric start and end either way round depending on the
+/// `ccw` / `large_arc` flags, so which stored id belongs to
+/// `start_point()` is not fixed.
+fn owned_endpoint_entity(
+    sketch: &Sketch,
+    endpoints: Option<(Point2dId, Point2dId)>,
+    at: Point2d,
+) -> Option<EntityRef> {
+    let (first, second) = endpoints?;
+    let tol = Tolerance2d::default().distance;
+    [first, second].into_iter().find_map(|pid| {
+        let position = sketch.get_point(&pid)?;
+        (position.distance_to(&at) <= tol).then_some(EntityRef::Point(pid))
+    })
 }
 
 impl Sketch {
@@ -187,6 +254,27 @@ impl Sketch {
                     });
                 }
             };
+        // Same, for the ENDPOINT of a derived curve. Resolving the
+        // endpoint's own point entity costs up to two `DashMap` gets,
+        // and this runs on every cursor move over every curve in the
+        // sketch — so the range test comes FIRST and the lookup only
+        // happens for a candidate that is actually being returned.
+        let push_endpoint_if_close = |out: &mut Vec<SnapCandidate>,
+                                      owner: EntityRef,
+                                      endpoints: Option<(Point2dId, Point2dId)>,
+                                      point: Point2d,
+                                      kind: SnapKind| {
+            let distance = cursor.distance_to(&point);
+            if distance > radius {
+                return;
+            }
+            out.push(SnapCandidate {
+                entity: owned_endpoint_entity(self, endpoints, point).unwrap_or(owner),
+                point,
+                distance,
+                kind,
+            });
+        };
 
         // Free points.
         for entry in self.points().iter() {
@@ -203,10 +291,27 @@ impl Sketch {
         for entry in self.lines().iter() {
             let id = *entry.key();
             let entity = EntityRef::Line(id);
+            let endpoints = entry.value().endpoints;
             match &entry.value().geometry {
                 LineGeometry::Segment(seg) => {
-                    push_if_close(&mut out, entity, seg.start, SnapKind::LineEndpoint);
-                    push_if_close(&mut out, entity, seg.end, SnapKind::LineEndpoint);
+                    // An ENDPOINT is an entity of its own in the
+                    // shared-variable model; the midpoint and the
+                    // perpendicular foot are not, so the line stands
+                    // for those.
+                    push_endpoint_if_close(
+                        &mut out,
+                        entity,
+                        endpoints,
+                        seg.start,
+                        SnapKind::LineEndpoint,
+                    );
+                    push_endpoint_if_close(
+                        &mut out,
+                        entity,
+                        endpoints,
+                        seg.end,
+                        SnapKind::LineEndpoint,
+                    );
                     push_if_close(&mut out, entity, seg.midpoint(), SnapKind::LineMidpoint);
                     push_if_close(
                         &mut out,
@@ -277,10 +382,12 @@ impl Sketch {
         for entry in self.arcs().iter() {
             let id = *entry.key();
             let entity = EntityRef::Arc(id);
+            let endpoints = entry.value().endpoints;
             let a = &entry.value().arc;
             push_if_close(&mut out, entity, a.center, SnapKind::ArcCenter);
-            push_if_close(&mut out, entity, a.start_point(), SnapKind::ArcEndpoint);
-            push_if_close(&mut out, entity, a.end_point(), SnapKind::ArcEndpoint);
+            let (start, end) = (a.start_point(), a.end_point());
+            push_endpoint_if_close(&mut out, entity, endpoints, start, SnapKind::ArcEndpoint);
+            push_endpoint_if_close(&mut out, entity, endpoints, end, SnapKind::ArcEndpoint);
             push_if_close(&mut out, entity, a.midpoint(), SnapKind::ArcMidpoint);
             push_if_close(&mut out, entity, a.closest_point(&cursor), SnapKind::OnArc);
         }
