@@ -685,17 +685,24 @@ pub fn build_solver(
 ///
 /// Infallible sibling of [`build_solver`]: no caller-supplied options
 /// to validate. The certificate uses it twice — once over the full
-/// constraint set (sorted by id, matching [`analyze_dofs`]'s
-/// deterministic-diagnosis convention) and once per QuickXplain oracle
-/// call over a candidate subset. Solving the returned instance never
-/// writes back to the sketch.
+/// constraint set and once per QuickXplain oracle call over a
+/// candidate subset. Solving the returned instance never writes back
+/// to the sketch.
+///
+/// Rows are ordered by [`Constraint::sequence`] — the constraint's
+/// insertion order in its sketch — matching [`analyze_dofs`]'s
+/// deterministic-diagnosis convention. The sort is STABLE and the key
+/// is the sequence ALONE: constraints that never entered a store share
+/// `UNSEQUENCED`, and for those the caller's own vector order survives
+/// intact rather than being replaced by a uuid order the caller cannot
+/// predict.
 pub(crate) fn build_diagnostic_solver(
     sketch: &Sketch,
     mut constraints: Vec<super::constraints::Constraint>,
 ) -> ConstraintSolver {
     let mut solver = ConstraintSolver::new();
     populate_solver(sketch, &solver);
-    constraints.sort_by_key(|c| c.id.0);
+    constraints.sort_by_key(|c| c.sequence);
     solver.set_constraints(constraints);
     solver
 }
@@ -1285,13 +1292,21 @@ fn diagnose_constraints(
     if diagnosable.is_empty() {
         return ConstraintDiagnosis::default();
     }
-    // `sketch.all_constraints()` iterates a `DashMap` and is therefore
-    // unordered. The diagnosis is order-dependent (the first row in
-    // a linearly-dependent set is the "essential" one; the rest are
-    // flagged). Sort by id so the verdict is deterministic across
-    // calls — the UI can otherwise see the same sketch produce
-    // different redundancy lists on consecutive `/dof` requests.
-    diagnosable.sort_by_key(|c| c.id.0);
+    // The diagnosis is order-dependent: the FIRST row of a linearly
+    // dependent set is the "essential" one and the rest are flagged.
+    // So the row order is the answer, and it has to be a key two
+    // PROCESSES agree on, not merely two calls. `ConstraintId` is a
+    // random v4 uuid: sorting by it was stable within a run and
+    // arbitrary between runs, so the same sketch named a different
+    // redundant constraint on the next start — a certificate whose
+    // witness moves is not a certificate. `Constraint::sequence` is
+    // the sketch's own insertion order, which two processes building
+    // the sketch the same way both reproduce.
+    //
+    // `sketch.all_constraints()` already returns this order; the sort
+    // is kept so the invariant holds locally and does not depend on a
+    // caller's choice of accessor.
+    diagnosable.sort_by_key(|c| c.sequence);
     solver.set_constraints(diagnosable);
 
     // Rank the system FIRST, at the sketch's own configuration — that
@@ -1307,7 +1322,8 @@ fn diagnose_constraints(
     // point initially at x=3. Solving first pushes the point to the
     // regularised least-squares minimum, so every dependent row
     // carries a non-zero residual and the conflict classifier produces
-    // the same count regardless of which uuid sorts first.
+    // the same count regardless of which row the caller inserted
+    // first.
     //
     // When nothing is dependent there is nothing to split by residual:
     // `redundant` and `conflicts` are empty whatever the geometry says,

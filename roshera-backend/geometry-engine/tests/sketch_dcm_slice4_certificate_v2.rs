@@ -520,13 +520,30 @@ fn certificate_serializes_and_orders_deterministically() {
     assert_eq!(first, second, "certify must be deterministic");
 
     // Deterministic ordering contracts: entity statuses ascend by
-    // entity, constraint facts ascend by constraint id.
+    // entity, constraint facts ascend by INSERTION SEQUENCE.
+    //
+    // The facts used to be asserted ascending by `id.0`, and that was
+    // the weaker contract: a `ConstraintId` is a random v4 uuid, so an
+    // id order is fixed within one process and arbitrary between two —
+    // the same sketch serialised its facts in a different order on the
+    // next run, and the rank pass reading those rows named a different
+    // constraint redundant with it. The sketch's own insertion order
+    // is the key two processes reproduce; see `Constraint::sequence`.
     let cert = certify_sketch(&sketch);
     for pair in cert.entity_statuses.windows(2) {
         assert!(pair[0].entity < pair[1].entity, "statuses must ascend");
     }
+    let sequence_of: std::collections::HashMap<ConstraintId, u64> = sketch
+        .all_constraints()
+        .iter()
+        .map(|c| (c.id, c.sequence))
+        .collect();
     for pair in cert.constraint_facts.windows(2) {
-        assert!(pair[0].id.0 < pair[1].id.0, "facts must ascend by id");
+        let (a, b) = (
+            sequence_of.get(&pair[0].id).copied().unwrap_or(u64::MAX),
+            sequence_of.get(&pair[1].id).copied().unwrap_or(u64::MAX),
+        );
+        assert!(a < b, "facts must ascend by insertion sequence");
     }
     // The wire payload carries the v2 sections.
     assert!(first.get("entity_statuses").is_some());

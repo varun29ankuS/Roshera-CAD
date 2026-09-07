@@ -455,7 +455,40 @@ pub struct Constraint {
     pub status: ConstraintStatus,
     /// User-defined name (optional)
     pub name: Option<String>,
+    /// Insertion sequence within the owning [`ConstraintStore`], and
+    /// the ONE stable key every diagnosis row order is built on.
+    ///
+    /// [`ConstraintId`] is a random v4 uuid. Sorting rows by it is
+    /// deterministic within a process and ARBITRARY between two, so
+    /// the rank pass -- which keeps the first row of a linearly
+    /// dependent set and flags the rest -- named different constraints
+    /// "redundant" on the same sketch from one run to the next. A
+    /// certificate whose witness changes between runs is not a
+    /// certificate. Insertion order is the key two processes building
+    /// the same sketch the same way can actually agree on.
+    ///
+    /// [`ConstraintStore::add_constraint`] is the SOLE assigner: it
+    /// overwrites whatever this field carried, so a value arriving
+    /// over the wire (the `POST /api/csketch/{id}/constraint` body is
+    /// a whole `Constraint`) is never trusted and can never be forged.
+    /// [`UNSEQUENCED`] is what the constructors leave here, and it is
+    /// what a constraint that never entered a store keeps.
+    #[serde(default)]
+    pub sequence: u64,
 }
+
+/// The `sequence` a [`Constraint`] carries before a
+/// [`ConstraintStore`] has assigned one -- and the `serde` default, so
+/// a payload minted before the field existed deserialises into it
+/// rather than failing.
+///
+/// Stores hand out sequences from 1, so this value is unreachable by
+/// assignment. Constraints that never enter a store (the solver's
+/// synthesised drag pulls, a caller feeding
+/// `ConstraintSolver::set_constraints` directly) all share it; row
+/// order for those is the caller's own vector order, which the stable
+/// sort preserves.
+pub const UNSEQUENCED: u64 = 0;
 
 impl Constraint {
     /// Create a new geometric constraint
@@ -471,6 +504,7 @@ impl Constraint {
             priority,
             status: ConstraintStatus::Satisfied,
             name: None,
+            sequence: UNSEQUENCED,
         }
     }
 
@@ -487,6 +521,7 @@ impl Constraint {
             priority,
             status: ConstraintStatus::Satisfied,
             name: None,
+            sequence: UNSEQUENCED,
         }
     }
 
@@ -1041,6 +1076,15 @@ pub struct ConstraintStore {
     entity_constraints: Arc<DashMap<EntityRef, Vec<ConstraintId>>>,
     /// Constraint groups for related constraints
     constraint_groups: Arc<DashMap<String, Vec<ConstraintId>>>,
+    /// Next insertion sequence to hand out. See [`Constraint::sequence`].
+    ///
+    /// Starts at 1 so [`UNSEQUENCED`] stays unreachable by assignment,
+    /// and is NEVER rewound — not by [`ConstraintStore::remove_constraint`]
+    /// and not by [`ConstraintStore::clear`]. A rewind would let a
+    /// later constraint inherit an earlier one's key and reorder the
+    /// diagnosis rows behind the caller's back, which is the exact
+    /// failure the sequence exists to end.
+    next_sequence: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl ConstraintStore {
@@ -1050,11 +1094,21 @@ impl ConstraintStore {
             constraints: Arc::new(DashMap::new()),
             entity_constraints: Arc::new(DashMap::new()),
             constraint_groups: Arc::new(DashMap::new()),
+            next_sequence: Arc::new(std::sync::atomic::AtomicU64::new(1)),
         }
     }
 
-    /// Add a constraint
-    pub fn add_constraint(&self, constraint: Constraint) -> ConstraintId {
+    /// Add a constraint, stamping it with its insertion sequence.
+    ///
+    /// The stamp OVERWRITES whatever `constraint.sequence` carried:
+    /// this store is the sole authority on its own row order, so a
+    /// value that arrived over the wire, or was copied along with a
+    /// constraint cloned out of another sketch, can never displace a
+    /// constraint that is already here. See [`Constraint::sequence`].
+    pub fn add_constraint(&self, mut constraint: Constraint) -> ConstraintId {
+        constraint.sequence = self
+            .next_sequence
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let id = constraint.id;
 
         // Update entity index
@@ -1135,15 +1189,33 @@ impl ConstraintStore {
         Ok(entry.clone())
     }
 
-    /// Get all constraints
+    /// Get all constraints, in INSERTION ORDER.
+    ///
+    /// The underlying `DashMap` iterates in shard/hash order, which is
+    /// a function of the constraints' random uuids and is therefore
+    /// arbitrary between processes. Every downstream row order is
+    /// built from this vector — the rank pass's Jacobian, the
+    /// certificate's `constraint_facts`, `DofReport::unsupported`, the
+    /// Newton solve itself — so ordering it here is what makes all of
+    /// them reproducible. See [`Constraint::sequence`].
     pub fn all_constraints(&self) -> Vec<Constraint> {
-        self.constraints
+        let mut out: Vec<Constraint> = self
+            .constraints
             .iter()
             .map(|entry| entry.value().clone())
-            .collect()
+            .collect();
+        out.sort_by_key(|c| c.sequence);
+        out
     }
 
-    /// Get constraints by type
+    /// Get constraints by type.
+    ///
+    /// The LAST accessor on this store that still returns raw `DashMap`
+    /// order (see [`ConstraintStore::all_constraints`] for why that is
+    /// arbitrary between processes). It feeds none of the diagnosis or
+    /// certificate surfaces, so it was left alone deliberately rather
+    /// than overlooked; order it by [`Constraint::sequence`] the moment
+    /// a caller needs a reproducible list out of it.
     pub fn get_by_type(&self, constraint_type: ConstraintType) -> Vec<Constraint> {
         self.constraints
             .iter()
@@ -1155,13 +1227,21 @@ impl ConstraintStore {
     /// Check for conflicts between constraints
     pub fn find_conflicts(&self) -> Vec<(ConstraintId, ConstraintId)> {
         let mut conflicts = Vec::new();
-        let all_constraints: Vec<_> = self.constraints.iter().collect();
+        // ONE insertion-ordered snapshot drives every pass below, and
+        // every pass is order-sensitive — not only the pairwise scan.
+        // The union-find `witness` map records WHICH Coincident stands
+        // for a chain; `x_by_root` / `y_by_root` record WHICH
+        // coordinate constraint a later one is measured against. Read
+        // straight off the `DashMap` those were decided by uuid hash
+        // order, so the partner a conflict named changed between
+        // processes. See [`Constraint::sequence`].
+        let all_constraints = self.all_constraints();
 
         // Check for conflicts between pairs of constraints
         for i in 0..all_constraints.len() {
             for j in (i + 1)..all_constraints.len() {
-                let constraint1 = all_constraints[i].value();
-                let constraint2 = all_constraints[j].value();
+                let constraint1 = &all_constraints[i];
+                let constraint2 = &all_constraints[j];
 
                 if self.constraints_conflict(constraint1, constraint2) {
                     conflicts.push((constraint1.id, constraint2.id));
@@ -1178,8 +1258,7 @@ impl ConstraintStore {
             std::collections::HashMap::new();
         let mut witness: std::collections::HashMap<Point2dId, ConstraintId> =
             std::collections::HashMap::new();
-        for entry in self.constraints.iter() {
-            let con = entry.value();
+        for con in &all_constraints {
             if let ConstraintType::Geometric(GeometricConstraint::Coincident) = &con.constraint_type
             {
                 if let [EntityRef::Point(a), EntityRef::Point(b)] = con.entities.as_slice() {
@@ -1195,8 +1274,7 @@ impl ConstraintStore {
             }
         }
         if !parent.is_empty() {
-            for entry in self.constraints.iter() {
-                let con = entry.value();
+            for con in &all_constraints {
                 if let ConstraintType::Dimensional(DimensionalConstraint::Distance(v)) =
                     &con.constraint_type
                 {
@@ -1226,8 +1304,7 @@ impl ConstraintStore {
                 std::collections::HashMap::new();
             let mut y_by_root: std::collections::HashMap<Point2dId, (f64, ConstraintId)> =
                 std::collections::HashMap::new();
-            for entry in self.constraints.iter() {
-                let con = entry.value();
+            for con in &all_constraints {
                 let coord = match &con.constraint_type {
                     ConstraintType::Dimensional(DimensionalConstraint::XCoordinate(v)) => {
                         Some((true, *v))
@@ -1262,6 +1339,33 @@ impl ConstraintStore {
                 }
             }
         }
+
+        // One order for the list, one order inside every pair. The
+        // three passes above push in three different conventions —
+        // pairwise pushes (earlier, later), the chained-distance pass
+        // pushes (the Distance, its coincidence witness), the
+        // coordinate pass pushes (the newcomer, the incumbent) — so
+        // the pair itself is normalised here rather than at each push:
+        // the earlier-inserted member is always `.0`. Both consumers
+        // (`certify_sketch`'s `static_pairs`, `sketch_validation`'s
+        // `analysis.conflicts`) only ever list these, so nothing reads
+        // a positional meaning out of the pair.
+        let sequence_of: std::collections::HashMap<ConstraintId, u64> =
+            all_constraints.iter().map(|c| (c.id, c.sequence)).collect();
+        let seq = |id: &ConstraintId| sequence_of.get(id).copied().unwrap_or(u64::MAX);
+        for pair in conflicts.iter_mut() {
+            if seq(&pair.1) < seq(&pair.0) {
+                std::mem::swap(&mut pair.0, &mut pair.1);
+            }
+        }
+        conflicts.sort_by_key(|(a, b)| (seq(a), seq(b)));
+        // Normalisation makes duplicates EXACT, so they can finally be
+        // removed: a same-point `x(p)=0` + `x(p)=5` reaches both the
+        // pairwise scan and the coordinate-coherence pass, which used
+        // to emit `(a, b)` and `(b, a)` — two entries the reader had to
+        // recognise as one contradiction. Sorted-then-`dedup` is exact
+        // here because equal pairs are adjacent after the sort above.
+        conflicts.dedup();
 
         conflicts
     }
@@ -1514,7 +1618,12 @@ impl ConstraintStore {
         c1.entities == c2.entities
     }
 
-    /// Clear all constraints
+    /// Clear all constraints.
+    ///
+    /// The insertion counter is deliberately NOT rewound — see
+    /// `next_sequence`. Sequences stay globally increasing for the
+    /// life of the store, so a constraint added after a clear always
+    /// sorts after one added before it, and no key is ever reused.
     pub fn clear(&self) {
         self.constraints.clear();
         self.entity_constraints.clear();
@@ -1541,6 +1650,7 @@ impl ConstraintStore {
             priority,
             status: ConstraintStatus::Satisfied,
             name: Some("Symmetric about line".to_string()),
+            sequence: UNSEQUENCED,
         };
 
         let constraint_id = constraint.id;
@@ -1563,6 +1673,7 @@ impl ConstraintStore {
             priority,
             status: ConstraintStatus::Satisfied,
             name: Some("G1 continuity between curves".to_string()),
+            sequence: UNSEQUENCED,
         };
 
         let constraint_id = constraint.id;
@@ -1585,6 +1696,7 @@ impl ConstraintStore {
             priority,
             status: ConstraintStatus::Satisfied,
             name: Some("G2 continuity between curves".to_string()),
+            sequence: UNSEQUENCED,
         };
 
         let constraint_id = constraint.id;
@@ -1609,6 +1721,7 @@ impl ConstraintStore {
             priority,
             status: ConstraintStatus::Satisfied,
             name: Some("Multi-tangent constraint".to_string()),
+            sequence: UNSEQUENCED,
         };
 
         let constraint_id = constraint.id;
@@ -1630,6 +1743,7 @@ impl ConstraintStore {
             priority,
             status: ConstraintStatus::Satisfied,
             name: Some(format!("Area = {}", target_area)),
+            sequence: UNSEQUENCED,
         };
 
         let constraint_id = constraint.id;
@@ -1653,6 +1767,7 @@ impl ConstraintStore {
             priority,
             status: ConstraintStatus::Satisfied,
             name: Some(format!("Perimeter = {}", target_perimeter)),
+            sequence: UNSEQUENCED,
         };
 
         let constraint_id = constraint.id;
@@ -1676,6 +1791,7 @@ impl ConstraintStore {
             priority,
             status: ConstraintStatus::Satisfied,
             name: Some(format!("Aspect ratio = {}", aspect_ratio)),
+            sequence: UNSEQUENCED,
         };
 
         let constraint_id = constraint.id;
@@ -1700,6 +1816,7 @@ impl ConstraintStore {
             priority,
             status: ConstraintStatus::Satisfied,
             name: Some(format!("Offset distance = {}", offset_distance)),
+            sequence: UNSEQUENCED,
         };
 
         let constraint_id = constraint.id;
@@ -1725,6 +1842,7 @@ impl ConstraintStore {
             priority,
             status: ConstraintStatus::Satisfied,
             name: Some(format!("Intersection angle = {} rad", angle)),
+            sequence: UNSEQUENCED,
         };
 
         let constraint_id = constraint.id;

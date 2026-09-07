@@ -43,9 +43,14 @@
 //!   [`DofSnapshot`], [`DecompositionStats`]).
 //!
 //! All v2 analysis runs on an ISOLATED diagnostic solver — certifying never
-//! mutates the sketch. Output ordering is deterministic for a given sketch:
-//! entity statuses ascend by entity, constraint facts and witness members
-//! ascend by constraint id, witnesses ascend by their first member.
+//! mutates the sketch. Output ordering is deterministic for a given sketch AND
+//! reproducible across processes: entity statuses ascend by entity, constraint
+//! facts and witness members ascend by [`super::constraints::Constraint`]'s
+//! insertion `sequence`, witnesses ascend by their first member. The key is
+//! insertion order and not the constraint id, because a `ConstraintId` is a
+//! random v4 uuid — an id sort is stable within one run and arbitrary between
+//! two, and a certificate whose witness changes between runs is not a
+//! certificate.
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -680,7 +685,7 @@ fn continuity_facts(sketch: &Sketch) -> Vec<ContinuityFact> {
     use super::constraints::{DimensionalConstraint, GeometricConstraint};
 
     let mut constraints = sketch.all_constraints();
-    constraints.sort_by_key(|c| c.id.0);
+    constraints.sort_by_key(|c| c.sequence);
     let has_continuity = constraints.iter().any(|c| {
         matches!(
             c.constraint_type,
@@ -775,8 +780,25 @@ fn analyze_constraint_system(sketch: &Sketch) -> SystemAnalysis {
     let diagnosis = solver.diagnose_from(&rank_profile);
     let probes = solver.component_probes();
 
+    // Per-constraint facts, in the order the constraints were ADDED.
+    // `ConstraintId` is a random v4 uuid, so an id sort put the same
+    // sketch's facts in a different order on every process; the
+    // insertion sequence is the key two processes agree on. See
+    // `Constraint::sequence`.
+    let mut all_constraints = sketch.all_constraints();
+    all_constraints.sort_by_key(|c| c.sequence);
+    let constraint_by_id: HashMap<uuid::Uuid, Constraint> = all_constraints
+        .iter()
+        .map(|c| (c.id.0, c.clone()))
+        .collect();
+    // The one insertion-order lookup every id-keyed sort below uses.
+    // `u64::MAX` is unreachable for a stored constraint and only ever
+    // parks an id the store no longer holds at the end of its list.
+    let sequence_of =
+        |id: &ConstraintId| -> u64 { constraint_by_id.get(&id.0).map_or(u64::MAX, |c| c.sequence) };
+
     let mut static_pairs = sketch.find_constraint_conflicts();
-    static_pairs.sort_by_key(|(a, b)| (a.0, b.0));
+    static_pairs.sort_by_key(|(a, b)| (sequence_of(a), sequence_of(b)));
 
     // Role classification sources.
     let conflicting_role: Vec<uuid::Uuid> = diagnosis
@@ -787,13 +809,6 @@ fn analyze_constraint_system(sketch: &Sketch) -> SystemAnalysis {
         .collect();
     let redundant_role: Vec<uuid::Uuid> = diagnosis.redundant.iter().map(|c| c.0).collect();
 
-    // Per-constraint facts, ascending by id.
-    let mut all_constraints = sketch.all_constraints();
-    all_constraints.sort_by_key(|c| c.id.0);
-    let constraint_by_id: HashMap<uuid::Uuid, Constraint> = all_constraints
-        .iter()
-        .map(|c| (c.id.0, c.clone()))
-        .collect();
     let constraint_facts: Vec<ConstraintFact> = all_constraints
         .iter()
         .map(|c| {
@@ -835,7 +850,11 @@ fn analyze_constraint_system(sketch: &Sketch) -> SystemAnalysis {
             .iter()
             .filter_map(|id| constraint_by_id.get(&id.0).cloned())
             .collect();
-        candidates.sort_by_key(|c| c.id.0);
+        // Candidate ORDER decides which minimal conflict core
+        // QuickXplain returns, so this is a witness-content key, not a
+        // listing key: sorted by uuid, the same sketch could hand back
+        // a different (still minimal) core each process.
+        candidates.sort_by_key(|c| c.sequence);
         if let Some(witness) =
             derive_numeric_witness(&mut oracle, &candidates, &diagnosed_here, &residual_of)
         {
@@ -850,7 +869,10 @@ fn analyze_constraint_system(sketch: &Sketch) -> SystemAnalysis {
     // numeric pass misses on degenerate geometry.
     for (a, b) in &static_pairs {
         let mut members = vec![*a, *b];
-        members.sort_by_key(|id| id.0);
+        // Keyed IDENTICALLY to `witness_members`/`residual_members`
+        // below — the dedupe zips this vector against an existing
+        // witness's members, so the two orders must be the same one.
+        members.sort_by_key(sequence_of);
         let duplicate = witnesses.iter().any(|w| {
             w.constraints.len() == members.len()
                 && w.constraints
@@ -868,7 +890,7 @@ fn analyze_constraint_system(sketch: &Sketch) -> SystemAnalysis {
             oracle_calls: 0,
         });
     }
-    witnesses.sort_by_key(|w| w.constraints.first().map(|c| c.id.0));
+    witnesses.sort_by_key(|w| w.constraints.first().map(|c| sequence_of(&c.id)));
 
     // Conflict-set membership per entity (`via`): union of witness
     // members referencing the entity, falling back to the raw
@@ -890,7 +912,7 @@ fn analyze_constraint_system(sketch: &Sketch) -> SystemAnalysis {
         charge(*cid);
     }
     for vias in via_map.values_mut() {
-        vias.sort_by_key(|id| id.0);
+        vias.sort_by_key(sequence_of);
         vias.dedup();
     }
 
@@ -957,7 +979,10 @@ fn analyze_constraint_system(sketch: &Sketch) -> SystemAnalysis {
     }
 }
 
-/// Build witness members (ascending by id) with their residuals.
+/// Build witness members with their residuals, PRESERVING the order of
+/// `ids`. Callers hand this an insertion-ordered vector; keeping that
+/// order is what lets the static-pair dedupe zip two member lists
+/// against each other.
 fn witness_members(
     ids: &[ConstraintId],
     constraint_by_id: &HashMap<uuid::Uuid, Constraint>,
@@ -992,7 +1017,13 @@ fn derive_numeric_witness(
 ) -> Option<ConflictWitness> {
     let calls_before = oracle.calls;
     let residual_members = |set: &[Constraint]| -> Vec<WitnessConstraint> {
-        let mut members: Vec<WitnessConstraint> = set
+        // Ordered by insertion sequence, matching `witness_members` —
+        // the static-pair dedupe zips one list against the other, so
+        // the two must share one key. `WitnessConstraint` carries no
+        // sequence of its own, so the sort happens on the constraints.
+        let mut ordered: Vec<&Constraint> = set.iter().collect();
+        ordered.sort_by_key(|c| c.sequence);
+        let members: Vec<WitnessConstraint> = ordered
             .iter()
             .map(|c| WitnessConstraint {
                 id: c.id,
@@ -1000,7 +1031,6 @@ fn derive_numeric_witness(
                 residual: residual_of.get(&c.id.0).copied().unwrap_or(0.0),
             })
             .collect();
-        members.sort_by_key(|m| m.id.0);
         members
     };
 
@@ -1020,8 +1050,10 @@ fn derive_numeric_witness(
             }),
         },
         Ok(true) => {
-            let mut ids: Vec<ConstraintId> = diagnosed.to_vec();
-            ids.sort_by_key(|id| id.0);
+            // A membership set, not a listing: `members` below takes
+            // its order from `candidates`, which is already insertion-
+            // ordered.
+            let ids: Vec<ConstraintId> = diagnosed.to_vec();
             let members: Vec<Constraint> = candidates
                 .iter()
                 .filter(|c| ids.contains(&c.id))
@@ -1085,8 +1117,12 @@ impl WitnessOracle<'_> {
 /// QUICKXPLAIN (Junker 2004: "QUICKXPLAIN: Preferred Explanations and
 /// Relaxations for Over-Constrained Problems", AAAI-04, pp. 167-172):
 /// divide-and-conquer extraction of a preferred MINIMAL conflict from
-/// `candidates` (preference = ascending constraint id, the caller's
-/// sort), given that `background ∪ candidates` is inconsistent and
+/// `candidates` (preference = the caller's sort, which is ascending
+/// [`super::constraints::Constraint::sequence`] — the order the
+/// constraints were ADDED to the sketch, not their random uuids; a
+/// preference order decides WHICH minimal core is returned, so it has
+/// to be a key two processes reproduce), given that
+/// `background ∪ candidates` is inconsistent and
 /// `background` alone is consistent. O(k·log(n/k)) oracle calls for a
 /// size-k core among n candidates.
 fn quickxplain(
