@@ -125,6 +125,19 @@ pub struct ManifoldReport {
     /// V − E + F over the welded mesh. For `c` disjoint genus-0 shells this is
     /// `2c`; a single closed genus-0 solid is `2`.
     pub euler_characteristic: i64,
+    /// Vertices the TESSELLATOR's weld could not address
+    /// (`TriangleMesh::weld_refusals`), so it left them un-welded.
+    ///
+    /// This analysis re-welds by quantised position and would therefore read
+    /// such a split pair as merged — the certificate would report a closed
+    /// surface over a mesh whose own weld never ran on those vertices. The
+    /// count is carried here so `closed` can refuse instead. It is CONSERVATIVE
+    /// on purpose: a refused vertex no triangle references cannot open a seam,
+    /// and this still declines to certify closure. Refusing a mesh the weld
+    /// could not fully address is the honest verdict; claiming closure from a
+    /// re-weld the exported mesh does not have is not.
+    pub refused_weld_vertices: usize,
+    /// No boundary edge AND no vertex the tessellator's weld had to refuse.
     pub closed: bool,
     pub manifold: bool,
     pub oriented: bool,
@@ -250,6 +263,12 @@ pub fn manifold_report_mesh(mesh: &TriangleMesh, weld_eps: f64) -> Option<Manifo
     let f_count = live_triangles as i64;
     let euler_characteristic = v_count - e_count + f_count;
 
+    // The tessellator's own weld reports what it could not address. This
+    // analysis cannot rediscover that from the arrays - its `weld_key` lattice
+    // re-merges exactly the pairs the weld declined to - so the count is read
+    // from the mesh and gates the closure verdict.
+    let refused_weld_vertices = mesh.weld_refusals.total();
+
     Some(ManifoldReport {
         triangles: mesh.triangles.len(),
         degenerate_triangles,
@@ -260,7 +279,8 @@ pub fn manifold_report_mesh(mesh: &TriangleMesh, weld_eps: f64) -> Option<Manifo
         inconsistent_directed_edges,
         components,
         euler_characteristic,
-        closed: boundary_edges == 0,
+        refused_weld_vertices,
+        closed: boundary_edges == 0 && refused_weld_vertices == 0,
         manifold: nonmanifold_edges == 0,
         oriented: inconsistent_directed_edges == 0,
     })
@@ -979,6 +999,76 @@ mod tests {
 
     fn last_solid(model: &BRepModel) -> SolidId {
         model.solids.iter().last().map(|(id, _)| id).expect("solid")
+    }
+
+    /// A mesh whose weld could not address every vertex must NOT be certified
+    /// closed, even when this analysis's own re-weld finds no boundary edge.
+    ///
+    /// The two halves of the test are the same tetrahedron. Without the
+    /// refused vertex it certifies closed; with it, `boundary_edges` is STILL
+    /// zero - the refused vertex is orphaned, it cannot open a seam - and the
+    /// verdict must flip anyway, because the mesh carries vertices the weld's
+    /// contract never covered and this analysis re-welds by position, which is
+    /// not the weld the exported mesh has.
+    #[test]
+    fn a_mesh_with_refused_weld_vertices_is_not_certified_closed() {
+        use crate::math::vector3::Point3;
+        use crate::tessellation::{surface, MeshVertex, TriangleMesh};
+
+        fn tetrahedron() -> TriangleMesh {
+            let mut mesh = TriangleMesh::new();
+            for p in [
+                Point3::new(0.0, 0.0, 0.0),
+                Point3::new(1.0, 0.0, 0.0),
+                Point3::new(0.0, 1.0, 0.0),
+                Point3::new(0.0, 0.0, 1.0),
+            ] {
+                mesh.add_vertex(MeshVertex {
+                    position: p,
+                    normal: Vector3::Z,
+                    uv: None,
+                });
+            }
+            for [i, j, k] in [[0, 2, 1], [0, 1, 3], [0, 3, 2], [1, 2, 3]] {
+                mesh.add_triangle(i, j, k);
+            }
+            mesh
+        }
+
+        let mut clean = tetrahedron();
+        surface::weld_mesh_watertight(&mut clean, 1e-6);
+        let clean_report = manifold_report_mesh(&clean, 1e-6).expect("tetra report");
+        assert_eq!(clean_report.boundary_edges, 0, "a tetrahedron is closed");
+        assert_eq!(clean_report.refused_weld_vertices, 0);
+        assert!(
+            clean_report.closed,
+            "the control must certify closed: {clean_report:?}"
+        );
+
+        let mut refused = tetrahedron();
+        refused.add_vertex(MeshVertex {
+            position: Point3::new(f64::NAN, 0.0, 0.0),
+            normal: Vector3::Z,
+            uv: None,
+        });
+        surface::weld_mesh_watertight(&mut refused, 1e-6);
+        let report = manifold_report_mesh(&refused, 1e-6).expect("refused report");
+        assert_eq!(
+            report.refused_weld_vertices, 1,
+            "the report must carry the tessellator's refusal count"
+        );
+        assert_eq!(
+            report.boundary_edges, 0,
+            "the connectivity itself is unchanged - the flip must come from the count"
+        );
+        assert!(
+            !report.closed,
+            "a mesh the weld could not fully address must not be certified closed: {report:?}"
+        );
+        assert!(
+            !report.is_valid_solid(),
+            "and it must not pass as a valid solid boundary"
+        );
     }
 
     #[test]

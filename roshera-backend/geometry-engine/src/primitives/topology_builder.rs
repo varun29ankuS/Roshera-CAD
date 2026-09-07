@@ -3064,18 +3064,26 @@ impl BRepModel {
         // flipped-normal / non-oriented surface (the `nurbs_loft` "B2a" class).
         // `manifold_report` already computes the directed-edge consistency; extract
         // it so `is_sound()` can AND it in.
-        let (watertight, manifold, oriented, euler, be, nm, ide) =
+        let (watertight, manifold, oriented, euler, be, rf, nm, ide) =
             match crate::harness::watertight::manifold_report(self, solid_id, 0.1, 1e-6) {
                 Some(r) => (
-                    r.boundary_edges == 0,
+                    // `r.closed`, not `r.boundary_edges == 0`: the report's
+                    // closure verdict also declines when the tessellator's weld
+                    // could not ADDRESS some vertices, which this analysis's own
+                    // re-weld by position would otherwise paper over. `be` below
+                    // stays the raw boundary-edge count, and `rf` carries the
+                    // refusal count so the unsound REASON can name it instead of
+                    // reporting a bare "0 boundary mesh edge(s)".
+                    r.closed,
                     r.nonmanifold_edges == 0,
                     r.oriented,
                     r.euler_characteristic,
                     r.boundary_edges,
+                    r.refused_weld_vertices,
                     r.nonmanifold_edges,
                     r.inconsistent_directed_edges,
                 ),
-                None => (false, false, false, 0, 0, 0, 0),
+                None => (false, false, false, 0, 0, 0, 0, 0),
             };
         // Self-intersection at a COARSE chord (gross self-overlap is visible at
         // low density; keeps the O(n²) pair scan cheap for this on-demand check).
@@ -3153,8 +3161,12 @@ impl BRepModel {
         // WHY it is unsound.
         if !watertight {
             errors.push(format!(
-                "cert: watertight=false — {be} boundary mesh edge(s) at coarse-chord \
-                 tessellation (mesh χ = {euler})"
+                concat!(
+                    "cert: watertight=false — {} boundary mesh edge(s) and {} vertices ",
+                    "the weld could not address, at coarse-chord tessellation ",
+                    "(mesh χ = {})"
+                ),
+                be, rf, euler
             ));
         }
         if !manifold {

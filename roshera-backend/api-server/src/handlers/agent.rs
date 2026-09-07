@@ -2351,7 +2351,15 @@ pub async fn part_perception(
             let s = b.size();
             [s.x, s.y, s.z]
         });
-        let mesh_watertight = report.boundary_edges == 0 && report.nonmanifold_edges == 0;
+        // `report.closed`, not a zero test on the raw boundary-edge count
+        // (spelling it here would trip this file's own source gate): the
+        // kernel's closure verdict also declines when the weld could not
+        // ADDRESS some vertices (`ManifoldReport::refused_weld_vertices`),
+        // which this report's own re-weld by position would otherwise hide.
+        // `report.manifold` is `nonmanifold_edges == 0` by definition, so the
+        // manifold half is unchanged. The raw counts still ship below as
+        // `open_edges`/`nonmanifold_edges` — facts, not verdicts.
+        let mesh_watertight = report.closed && report.manifold;
         let verdict = if !valid {
             "BROKEN — B-Rep invalid (a real topological defect)".to_string()
         } else if mesh_watertight {
@@ -3616,6 +3624,91 @@ pub async fn measure(
                 "reason": reason,
             })),
         ),
+    }
+}
+
+#[cfg(test)]
+mod watertight_verdict_source_gate {
+    //! A closure verdict in this file must come from the kernel's `closed`
+    //! field, never from the raw `boundary_edges` count.
+    //!
+    //! Why a source scan and not a behavioural test: the difference between
+    //! the two only shows on a mesh whose weld REFUSED vertices it could not
+    //! address, and no B-Rep solid reachable from an HTTP handler tessellates
+    //! to one (it takes a NaN coordinate or a part wider than 7.2e10 mm). The
+    //! divergence is therefore unobservable at this layer, and the only thing
+    //! that can hold the line is the shape of the code.
+    //!
+    //! FALSE-NEGATIVE SURFACE, stated plainly. This is a literal substring
+    //! scan over ONE file's production half, so it does NOT catch:
+    //!   * the same defect in any other api-server file;
+    //!   * a verdict routed through a local (`let be = report.boundary_edges;`
+    //!     then `if be == 0`), which no pattern below matches;
+    //!   * a comparison split across a line break, or spelled some way not in
+    //!     the list (`> 0` negated, `.eq(&0)`, `matches!`);
+    //!   * a verdict built from `open_edges` after the count is serialised.
+    //! It catches the one spelling that was actually there and the obvious
+    //! rewrites of it, and it is one grep to widen. The positive assertion
+    //! below is what stops the whole verdict simply being deleted instead.
+    //!
+    //! In the other direction it over-fires: a substring scan cannot tell code
+    //! from a comment, so writing a forbidden spelling in prose trips it. That
+    //! happened immediately - the comment at the verdict site had to be worded
+    //! around it - and it is the harmless direction for a gate to err in.
+    //!
+    //! The production half is everything before this file's first
+    //! `#[cfg(test)]`, so the patterns quoted in this module do not match
+    //! themselves.
+
+    /// Spellings of "closure from the raw boundary-edge count" that must not
+    /// appear in production code in this file.
+    const FORBIDDEN: &[&str] = &[
+        "boundary_edges == 0",
+        "boundary_edges==0",
+        "0 == report.boundary_edges",
+        "boundary_edges < 1",
+        "boundary_edges.eq(&0)",
+    ];
+
+    /// The honest expression the `?fast=1` verdict must be built from.
+    const REQUIRED: &str = "report.closed && report.manifold";
+
+    fn production_half() -> &'static str {
+        let src = include_str!("agent.rs");
+        // `next()` on a `Split` always yields the leading segment; the fallback
+        // is the WHOLE file, so a surprise here over-scans (this module's own
+        // pattern list would then trip the test) rather than passing vacuously.
+        src.split("\n#[cfg(test)]").next().unwrap_or(src)
+    }
+
+    #[test]
+    fn no_verdict_derives_closure_from_the_raw_boundary_edge_count() {
+        let prod = production_half();
+        for pattern in FORBIDDEN {
+            assert!(
+                !prod.contains(pattern),
+                concat!(
+                    "handlers/agent.rs derives a closure verdict from the raw ",
+                    "boundary-edge count ({:?}). Use ManifoldReport::closed, which ",
+                    "also declines when the tessellator's weld refused vertices it ",
+                    "could not address."
+                ),
+                pattern
+            );
+        }
+    }
+
+    #[test]
+    fn the_fast_path_verdict_is_still_present_and_reads_closed() {
+        let prod = production_half();
+        assert!(
+            prod.contains(REQUIRED),
+            concat!(
+                "the ?fast=1 mesh-watertight verdict must read ",
+                "`report.closed && report.manifold`; deleting it is not a way to ",
+                "pass the scan above"
+            )
+        );
     }
 }
 

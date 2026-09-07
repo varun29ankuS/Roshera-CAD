@@ -15,7 +15,7 @@ pub mod surface;
 // Re-export main types
 pub use adaptive::AdaptiveTessellator;
 pub use curve::{tessellate_curve, tessellate_edge};
-pub use mesh::{MeshVertex, ThreeJsMesh, TriangleMesh};
+pub use mesh::{MeshVertex, ThreeJsMesh, TriangleMesh, WeldRefusals};
 pub use surface::{tessellate_face, tessellate_surface};
 
 use crate::primitives::{builder::BRepModel, shell::Shell, solid::Solid};
@@ -668,6 +668,99 @@ mod watertight_tests {
             2,
             "shared edge ({a1},{a2}) should be referenced by exactly 2 triangles \
              after welding; got counts = {counts:?}"
+        );
+    }
+
+    /// The refusal path, at the production entry point rather than at
+    /// `weld_cell`: a mesh that mixes a vertex the grid cannot address with a
+    /// genuinely coincident pair must weld the pair, keep the un-addressable
+    /// vertex as its own canonical, and COUNT it - on the returned report and
+    /// on the mesh, which is the only channel a downstream certificate has.
+    #[test]
+    fn weld_mesh_watertight_counts_refused_vertices_and_still_welds_the_rest() {
+        use crate::math::Vector3;
+        let mut mesh = TriangleMesh::new();
+        // The weldable pair: two faces sharing edge (a1,a2), emitted twice.
+        let a0 = mesh.add_vertex(MeshVertex {
+            position: Point3::new(0.0, 0.0, 0.0),
+            normal: Vector3::Z,
+            uv: None,
+        });
+        let a1 = mesh.add_vertex(MeshVertex {
+            position: Point3::new(1.0, 0.0, 0.0),
+            normal: Vector3::Z,
+            uv: None,
+        });
+        let a2 = mesh.add_vertex(MeshVertex {
+            position: Point3::new(0.0, 1.0, 0.0),
+            normal: Vector3::Z,
+            uv: None,
+        });
+        let b0 = mesh.add_vertex(MeshVertex {
+            position: Point3::new(1.0, 0.0, 0.0),
+            normal: Vector3::Z,
+            uv: None,
+        });
+        let b1 = mesh.add_vertex(MeshVertex {
+            position: Point3::new(0.0, 1.0, 0.0),
+            normal: Vector3::Z,
+            uv: None,
+        });
+        let b2 = mesh.add_vertex(MeshVertex {
+            position: Point3::new(1.0, 1.0, 0.0),
+            normal: Vector3::Z,
+            uv: None,
+        });
+        // The un-addressable vertex: a NaN coordinate has no cell at all. Its
+        // triangle's other two corners are distinct and finite, so nothing
+        // else about this triangle can drop it.
+        let nan = mesh.add_vertex(MeshVertex {
+            position: Point3::new(f64::NAN, 0.0, 0.0),
+            normal: Vector3::Z,
+            uv: None,
+        });
+        let c1 = mesh.add_vertex(MeshVertex {
+            position: Point3::new(5.0, 0.0, 0.0),
+            normal: Vector3::Z,
+            uv: None,
+        });
+        let c2 = mesh.add_vertex(MeshVertex {
+            position: Point3::new(5.0, 1.0, 0.0),
+            normal: Vector3::Z,
+            uv: None,
+        });
+        mesh.add_triangle(a0, a1, a2);
+        mesh.add_triangle(b0, b1, b2);
+        mesh.add_triangle(nan, c1, c2);
+
+        let report = surface::weld_mesh_watertight(&mut mesh, 1e-6);
+
+        assert_eq!(
+            report.refusals.non_finite, 1,
+            "the NaN vertex must be COUNTED as refused, not silently skipped"
+        );
+        assert_eq!(report.refusals.unaddressable, 0);
+        assert_eq!(
+            mesh.weld_refusals, report.refusals,
+            "the counts must ride out on the mesh - the certificate reads them there"
+        );
+        assert_eq!(
+            report.welded, 2,
+            "the coincident pair must still weld: {report:?}"
+        );
+
+        assert_eq!(mesh.triangles.len(), 3, "no triangle should be dropped");
+        assert!(
+            mesh.triangles
+                .iter()
+                .any(|t| t.contains(&a1) && t.contains(&a2) && t.contains(&b2)),
+            "face B's triangle must collapse onto the welded {a1}/{a2}: {:?}",
+            mesh.triangles
+        );
+        assert!(
+            mesh.triangles.iter().any(|t| t.contains(&nan)),
+            "the refused vertex stays its own canonical: {:?}",
+            mesh.triangles
         );
     }
 

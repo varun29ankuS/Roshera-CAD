@@ -17,6 +17,37 @@ pub struct MeshVertex {
     pub uv: Option<(f64, f64)>,
 }
 
+/// Vertices the watertight weld could not place in its spatial-hash grid,
+/// by reason, accumulated over every weld pass that ran on this mesh.
+///
+/// The weld merges 3D-coincident boundary samples into one index; a vertex it
+/// cannot ADDRESS is left un-welded, so any seam through it stays split. That
+/// is the conservative direction (a weld never invents a merge), but it means
+/// the mesh's index topology is weaker than the weld's contract claims, and no
+/// downstream consumer can see that from the vertex and triangle arrays alone
+/// - a certificate re-welding by position would read the split pair as merged
+/// and report a closed surface. Carrying the counts on the mesh is what lets a
+/// certificate say so instead. Zero on every mesh the weld fully addressed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WeldRefusals {
+    /// Vertices carrying a NaN or infinite coordinate.
+    pub non_finite: usize,
+    /// Finite vertices whose grid cell index left the addressable band.
+    pub unaddressable: usize,
+}
+
+impl WeldRefusals {
+    /// Total refused vertices, whatever the reason.
+    pub fn total(&self) -> usize {
+        self.non_finite + self.unaddressable
+    }
+
+    /// Did the weld fail to address anything?
+    pub fn any(&self) -> bool {
+        self.total() > 0
+    }
+}
+
 /// Triangle mesh representation
 #[derive(Debug, Clone)]
 pub struct TriangleMesh {
@@ -25,6 +56,12 @@ pub struct TriangleMesh {
     /// Maps each triangle index to the B-Rep FaceId it was tessellated from.
     /// Length equals `triangles.len()`. Used for face picking in the viewport.
     pub face_map: Vec<u32>,
+    /// Vertices the weld could not address, summed over every weld pass that
+    /// has run on this mesh. `tessellate_shell` welds each shell once over a
+    /// disjoint vertex range, so the sum counts each vertex at most once;
+    /// welding the same range twice (a test can) would double-count, which is
+    /// why this is a running total and not a set.
+    pub weld_refusals: WeldRefusals,
 }
 
 impl TriangleMesh {
@@ -33,6 +70,7 @@ impl TriangleMesh {
             vertices: Vec::new(),
             triangles: Vec::new(),
             face_map: Vec::new(),
+            weld_refusals: WeldRefusals::default(),
         }
     }
 

@@ -9,6 +9,7 @@
 
 use super::adaptive::compute_plane_axes;
 use super::edge_cache::{compute_curve_sample_count, EdgeSampleCache};
+use super::mesh::WeldRefusals;
 use super::{AdaptiveTessellator, MeshVertex, TessellationParams, TriangleMesh};
 use crate::math::{MathError, MathResult, Point3, Tolerance, Vector3};
 use crate::primitives::face::Face;
@@ -9984,11 +9985,86 @@ pub fn tessellate_surface(
 ///
 /// `weld_tolerance` should match the kernel's geometric tolerance for
 /// the model — typically `1e-6` for mm-scale parts, looser for
-/// metre-scale assemblies. The grid cell size is chosen as
-/// `weld_tolerance.max(1e-9) * 1e3` so that a 1×1×1 cell comfortably
-/// brackets any pair within tolerance even at the cell edges.
-pub(crate) fn weld_mesh_watertight(mesh: &mut TriangleMesh, weld_tolerance: f64) {
-    weld_mesh_watertight_range(mesh, weld_tolerance, 0, 0);
+/// metre-scale assemblies. The grid cell size is
+/// `weld_tolerance.max(1e-9) * 2.0` (see the NO-HANGS note in
+/// `weld_mesh_watertight_range`): a small multiple of the tolerance, so a
+/// within-tolerance pair is at most one cell apart per axis and the 3×3×3
+/// scan is guaranteed to see it, while the buckets stay sparse enough for
+/// the weld to be genuinely O(n).
+pub(crate) fn weld_mesh_watertight(mesh: &mut TriangleMesh, weld_tolerance: f64) -> WeldReport {
+    weld_mesh_watertight_range(mesh, weld_tolerance, 0, 0)
+}
+
+/// What one weld pass did: how much it merged, and what it could not address.
+///
+/// The refusals are the half a caller cannot recover from the mesh arrays.
+/// They are also accumulated onto [`TriangleMesh::weld_refusals`] so a
+/// consumer several frames away (the watertight certificate) can read them
+/// without the weld needing an error channel it has no caller for.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct WeldReport {
+    /// Vertices collapsed onto an earlier canonical index.
+    pub welded: usize,
+    /// Vertices the grid could not address, by reason.
+    pub refusals: WeldRefusals,
+}
+
+/// Why a vertex could not be given a cell in the weld's spatial-hash grid.
+///
+/// The grid is an ACCELERATION structure, not the weld predicate: the merge
+/// itself is decided by the distance and normal tests. So a vertex the grid
+/// cannot address can never be welded WRONGLY - it can only fail to be
+/// welded at all. Naming the two ways addressing fails keeps that outcome
+/// reportable instead of silent (and keeps the `match` exhaustive, so a
+/// third failure mode added later is a compile error here).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WeldCellRefusal {
+    /// A coordinate is NaN or infinite, so it has no position on the grid.
+    NonFinite,
+    /// The coordinate is finite but its cell index falls outside the
+    /// addressable band (see [`WELD_CELL_ABS_MAX`]).
+    Unaddressable,
+}
+
+/// Largest magnitude a weld-grid cell index may take: 2^53.
+///
+/// Above 2^53 an `f64` can no longer represent consecutive integers, so the
+/// neighbourhood scan's `cell ± 1` would land back on `cell` and the
+/// "a within-tolerance pair is at most one cell apart" guarantee that makes
+/// the 3×3×3 scan complete would stop meaning anything. Staying at or under
+/// it also makes `cell ± 1` exact in `i64` by construction, which is what
+/// keeps the scan's arithmetic from overflowing.
+///
+/// The band is not a practical restriction. At the production cell size
+/// (`MESH_WELD_CAP * 2 = 8e-6`) it spans ±7.2e10 mm, and even at the finest
+/// possible cell (the `1e-9` tolerance floor doubled, 2e-9) it spans
+/// ±1.8e7 mm — 18 km of part. Only a coordinate that is already numerical
+/// garbage can leave it.
+const WELD_CELL_ABS_MAX: f64 = 9_007_199_254_740_992.0;
+
+/// Grid cell of a vertex position, or a typed refusal when the grid cannot
+/// address it.
+///
+/// `as i64` on an `f64` SATURATES rather than wrapping, which is precisely
+/// the failure this guards: a saturated index is a WRONG cell that looks
+/// like a valid one, and `cell + 1` on a saturated index is an overflow.
+/// Both the finiteness and the band are therefore checked on the float
+/// BEFORE the cast, so the returned index is always an exact integer with
+/// room for the neighbourhood scan's ±1 on either side.
+fn weld_cell(p: Point3, inv_grid: f64) -> Result<(i64, i64, i64), WeldCellRefusal> {
+    let axis = |v: f64| -> Result<i64, WeldCellRefusal> {
+        if !v.is_finite() {
+            return Err(WeldCellRefusal::NonFinite);
+        }
+        // The product can still overflow to infinity for a finite but huge
+        // coordinate, so it is re-checked rather than assumed finite.
+        let cell = (v * inv_grid).floor();
+        if !cell.is_finite() || cell.abs() > WELD_CELL_ABS_MAX {
+            return Err(WeldCellRefusal::Unaddressable);
+        }
+        Ok(cell as i64)
+    };
+    Ok((axis(p.x)?, axis(p.y)?, axis(p.z)?))
 }
 
 /// Range-restricted variant of [`weld_mesh_watertight`] used by
@@ -9999,16 +10075,19 @@ pub(crate) fn weld_mesh_watertight(mesh: &mut TriangleMesh, weld_tolerance: f64)
 /// `>= t_start`. Cross-shell coincidences (e.g. between an outer shell
 /// and an inner void shell) are intentionally left un-welded — they
 /// represent topologically-distinct boundaries.
+///
+/// Returns what the pass did, and accumulates the refused-vertex counts onto
+/// `mesh.weld_refusals` so the verdict travels with the mesh.
 pub(crate) fn weld_mesh_watertight_range(
     mesh: &mut TriangleMesh,
     weld_tolerance: f64,
     v_start: usize,
     t_start: usize,
-) {
+) -> WeldReport {
     let n = mesh.vertices.len();
     let m = mesh.triangles.len();
     if v_start >= n || t_start >= m {
-        return;
+        return WeldReport::default();
     }
 
     // Cell size ≈ the weld tolerance. The dedup only needs coincident
@@ -10035,25 +10114,42 @@ pub(crate) fn weld_mesh_watertight_range(
     let inv_grid = 1.0 / grid_size;
     let tol_sq = safe_tol * safe_tol;
 
-    let to_cell = |p: Point3| -> (i32, i32, i32) {
-        // Defensive non-finite handling: treat NaN/inf positions as
-        // their own bucket so they don't poison the dedup pass.
-        if !p.x.is_finite() || !p.y.is_finite() || !p.z.is_finite() {
-            return (i32::MIN, i32::MIN, i32::MIN);
-        }
-        (
-            (p.x * inv_grid).floor() as i32,
-            (p.y * inv_grid).floor() as i32,
-            (p.z * inv_grid).floor() as i32,
-        )
-    };
+    // A vertex the grid cannot address (NaN/inf, or a coordinate so large
+    // its cell index leaves the exactly-representable band) is NOT inserted
+    // and NOT scanned: it stays its own canonical, i.e. un-welded. That is
+    // the conservative direction — the weld may miss a merge it could not
+    // address, it can never invent one — and it matches what the previous
+    // NaN sentinel bucket achieved for the non-finite case (the distance
+    // test against a NaN position is always false), without that bucket's
+    // `i32::MIN - 1` overflow. The counts are reported below so an
+    // under-welded mesh announces itself instead of passing silently.
+    let mut refusals = WeldRefusals::default();
 
-    let mut spatial_hash: HashMap<(i32, i32, i32), Vec<u32>> = HashMap::with_capacity(n - v_start);
+    let mut spatial_hash: HashMap<(i64, i64, i64), Vec<u32>> = HashMap::with_capacity(n - v_start);
     for i in v_start..n {
-        spatial_hash
-            .entry(to_cell(mesh.vertices[i].position))
-            .or_default()
-            .push(i as u32);
+        match weld_cell(mesh.vertices[i].position, inv_grid) {
+            Ok(cell) => spatial_hash.entry(cell).or_default().push(i as u32),
+            Err(WeldCellRefusal::NonFinite) => refusals.non_finite += 1,
+            Err(WeldCellRefusal::Unaddressable) => refusals.unaddressable += 1,
+        }
+    }
+    // The counts ride out on the mesh as well as in the return value: the one
+    // production caller is a statement, and the consumer that has to act on
+    // them (the watertight certificate) only ever sees the mesh.
+    mesh.weld_refusals.non_finite += refusals.non_finite;
+    mesh.weld_refusals.unaddressable += refusals.unaddressable;
+    if refusals.any() {
+        tracing::warn!(
+            concat!(
+                "weld_mesh_watertight_range: {} non-finite and {} out-of-band vertices ",
+                "could not be addressed by the weld grid (cell size {:e}, v_start={}); ",
+                "they are left un-welded, so any seam through them stays open"
+            ),
+            refusals.non_finite,
+            refusals.unaddressable,
+            grid_size,
+            v_start
+        );
     }
 
     // Two coincident samples weld into one mesh vertex only when their
@@ -10087,29 +10183,35 @@ pub(crate) fn weld_mesh_watertight_range(
     for i in v_start..n {
         let pos = mesh.vertices[i].position;
         let ni = mesh.vertices[i].normal;
-        let (cx, cy, cz) = to_cell(pos);
 
         // Scan the 3×3×3 neighbourhood. Stop at the first vertex with
         // a strictly-smaller original index (still inside the welding
         // range — `cand >= v_start`) that is within tolerance AND whose
         // normal agrees (smooth seam) — we keep the lowest such index as
         // canonical, a deterministic mapping regardless of insertion order.
+        //
+        // `weld_cell` guarantees |cell| ≤ 2^53 on every axis, so the ±1
+        // below is exact and in range for `i64` — the scan cannot overflow.
+        // An un-addressable vertex has no cell to scan around and keeps
+        // itself as canonical.
         let mut canonical = i as u32;
-        'scan: for dx in -1..=1 {
-            for dy in -1..=1 {
-                for dz in -1..=1 {
-                    if let Some(bucket) = spatial_hash.get(&(cx + dx, cy + dy, cz + dz)) {
-                        for &cand in bucket {
-                            if (cand as usize) < v_start || cand >= i as u32 {
-                                continue;
-                            }
-                            let dp = mesh.vertices[cand as usize].position - pos;
-                            if dp.dot(&dp) <= tol_sq
-                                && ni.dot(&mesh.vertices[cand as usize].normal)
-                                    >= WELD_NORMAL_DOT_MIN
-                            {
-                                canonical = remap[cand as usize];
-                                break 'scan;
+        if let Ok((cx, cy, cz)) = weld_cell(pos, inv_grid) {
+            'scan: for dx in -1..=1i64 {
+                for dy in -1..=1i64 {
+                    for dz in -1..=1i64 {
+                        if let Some(bucket) = spatial_hash.get(&(cx + dx, cy + dy, cz + dz)) {
+                            for &cand in bucket {
+                                if (cand as usize) < v_start || cand >= i as u32 {
+                                    continue;
+                                }
+                                let dp = mesh.vertices[cand as usize].position - pos;
+                                if dp.dot(&dp) <= tol_sq
+                                    && ni.dot(&mesh.vertices[cand as usize].normal)
+                                        >= WELD_NORMAL_DOT_MIN
+                                {
+                                    canonical = remap[cand as usize];
+                                    break 'scan;
+                                }
                             }
                         }
                     }
@@ -10297,6 +10399,96 @@ pub(crate) fn weld_mesh_watertight_range(
             "weld_mesh_watertight_range: collapsed {welded} duplicate vertices, \
              G1-smoothed {g1_smoothed} canonical normals, removed {doubled_removed} \
              doubled-facet triangles (tol={weld_tolerance:e}, v_start={v_start})"
+        );
+    }
+
+    WeldReport {
+        welded: welded as usize,
+        refusals,
+    }
+}
+
+#[cfg(test)]
+mod weld_cell_addressing_tests {
+    //! The weld grid's addressing contract, one case per outcome.
+    //!
+    //! `weld_cell` is the whole of the fix for the saturating `as i32` cast
+    //! that made a large part - or a caller-supplied chord tolerance of zero -
+    //! panic on `cell + 1` under debug overflow checks (and read a wrapped,
+    //! wrong bucket in release). Its ONE production call site is
+    //! [`super::weld_mesh_watertight_range`], which uses it twice: to fill the
+    //! spatial hash and to scan the 3x3x3 neighbourhood around a cell.
+    //!
+    //! The refusal enum is matched exhaustively at that call site, so a new
+    //! variant is a compile error there; the cases below then pin the answer
+    //! for each of the two that exist, plus the ordinary in-band answer whose
+    //! exact value is the one `i32` could not hold.
+    use super::{weld_cell, WeldCellRefusal, WELD_CELL_ABS_MAX};
+    use crate::math::Point3;
+
+    /// The zero-chord repro's numbers: a 10 mm box corner at 5 mm against the
+    /// weld's `1e-9` tolerance floor (cell 2e-9, so `inv_grid` 5e8). The cell
+    /// index is 2.5e9 - past `i32::MAX` (2147483647), which is where the old
+    /// cast saturated and `cell + 1` overflowed. It is an ordinary in-band
+    /// index for the grid, and must be returned exactly.
+    #[test]
+    fn a_cell_index_past_i32_is_addressed_exactly() {
+        let cell = weld_cell(Point3::new(5.0, -5.0, 0.0), 5.0e8);
+        assert_eq!(
+            cell,
+            Ok((2_500_000_000, -2_500_000_000, 0)),
+            "a cell index beyond i32 range must be exact, not saturated"
+        );
+    }
+
+    /// Floor semantics are unchanged by the widening: a negative coordinate
+    /// still lands in the cell BELOW zero, not truncated toward it.
+    #[test]
+    fn cells_still_floor_toward_negative_infinity() {
+        assert_eq!(
+            weld_cell(Point3::new(-0.3, -1.0, 0.7), 1.0),
+            Ok((-1, -1, 0))
+        );
+    }
+
+    /// A NaN or infinite coordinate has no position on the grid at all.
+    #[test]
+    fn non_finite_coordinates_are_refused_by_kind() {
+        assert_eq!(
+            weld_cell(Point3::new(f64::NAN, 0.0, 0.0), 1.0),
+            Err(WeldCellRefusal::NonFinite)
+        );
+        assert_eq!(
+            weld_cell(Point3::new(0.0, 0.0, f64::INFINITY), 1.0),
+            Err(WeldCellRefusal::NonFinite)
+        );
+    }
+
+    /// A finite coordinate whose SCALED index overflows to infinity, and one
+    /// that merely leaves the exactly-representable band, are both refused as
+    /// un-addressable rather than saturated onto a wrong cell.
+    #[test]
+    fn out_of_band_coordinates_are_refused_not_saturated() {
+        assert_eq!(
+            weld_cell(Point3::new(1.0e300, 0.0, 0.0), 5.0e8),
+            Err(WeldCellRefusal::Unaddressable),
+            "a scaled index that overflows to infinity must be refused"
+        );
+        assert_eq!(
+            weld_cell(Point3::new(0.0, WELD_CELL_ABS_MAX * 2.0, 0.0), 1.0),
+            Err(WeldCellRefusal::Unaddressable),
+            "an index past 2^53 must be refused"
+        );
+    }
+
+    /// The band edge itself is addressable — the boundary is inclusive, so the
+    /// band is not silently one cell narrower than it is documented to be.
+    /// `cell ± 1` there is 2^53 ± 1, exact in `i64` and nowhere near its range.
+    #[test]
+    fn the_band_edge_is_still_addressable() {
+        assert_eq!(
+            weld_cell(Point3::new(WELD_CELL_ABS_MAX, -WELD_CELL_ABS_MAX, 0.0), 1.0),
+            Ok((9_007_199_254_740_992, -9_007_199_254_740_992, 0))
         );
     }
 }

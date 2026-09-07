@@ -10523,20 +10523,47 @@ pub(super) fn validate_blend_geometric_closure(
     op_label: &str,
 ) -> OperationResult<()> {
     match crate::harness::watertight::manifold_report(model, solid_id, 0.1, 1e-6) {
-        Some(r) if r.boundary_edges == 0 => Ok(()),
-        Some(r) => Err(OperationError::InvalidBRep(format!(
-            "{op_label} solid {} is combinatorially valid but geometrically OPEN: \
-             {} boundary mesh edge(s) at coarse-chord tessellation (mesh χ = {}). \
-             The blend surgery produced self-crossing or gapped trim geometry; \
-             the operation is refused and rolled back",
-            solid_id, r.boundary_edges, r.euler_characteristic
-        ))),
+        Some(r) => blend_closure_verdict(&r, op_label, solid_id),
         None => Err(OperationError::InvalidBRep(format!(
             "{op_label} solid {} tessellates to an empty mesh — the blend result \
              has no renderable geometry; the operation is refused and rolled back",
             solid_id
         ))),
     }
+}
+
+/// The closure decision itself, split out from the tessellation so it can be
+/// driven from a report a test builds directly.
+///
+/// It has ONE production call site, [`validate_blend_geometric_closure`] above.
+/// Gating on `closed` rather than on `boundary_edges` is what makes the
+/// post-flight agree with the certificate: `ManifoldReport::closed` is false
+/// both when the mesh leaks AND when the tessellator's weld could not address
+/// some vertices, and a blend that produced the latter must be rolled back
+/// rather than handed back. Both counts are named in the refusal so a
+/// refusal-only failure never reports "0 boundary mesh edge(s)" as its reason.
+fn blend_closure_verdict(
+    report: &crate::harness::watertight::ManifoldReport,
+    op_label: &str,
+    solid_id: SolidId,
+) -> OperationResult<()> {
+    if report.closed {
+        return Ok(());
+    }
+    Err(OperationError::InvalidBRep(format!(
+        concat!(
+            "{} solid {} is combinatorially valid but geometrically OPEN: ",
+            "{} boundary mesh edge(s) and {} vertices the weld could not address, ",
+            "at coarse-chord tessellation (mesh χ = {}). The blend surgery ",
+            "produced self-crossing or gapped trim geometry, or samples the weld ",
+            "grid cannot index; the operation is refused and rolled back"
+        ),
+        op_label,
+        solid_id,
+        report.boundary_edges,
+        report.refused_weld_vertices,
+        report.euler_characteristic
+    )))
 }
 
 /// Validate fillet parameters
@@ -10637,6 +10664,103 @@ fn validate_fillet_parameters(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod blend_closure_verdict_tests {
+    //! The blend post-flight's closure decision, one case per outcome.
+    //!
+    //! `blend_closure_verdict` has ONE production call site,
+    //! [`super::validate_blend_geometric_closure`], which is the post-flight
+    //! every fillet and chamfer runs before handing a solid back. The decision
+    //! is split out from the tessellation precisely so the refusal-only case is
+    //! constructible: no B-Rep solid tessellates to a mesh with refused weld
+    //! vertices (it takes a NaN coordinate or a part wider than 7.2e10 mm), so
+    //! driving the gate through `validate_blend_geometric_closure` could never
+    //! reach that arm. Building the report directly does.
+    use super::blend_closure_verdict;
+    use crate::harness::watertight::ManifoldReport;
+
+    /// A report that is closed and clean apart from the fields a case sets.
+    fn clean_report() -> ManifoldReport {
+        ManifoldReport {
+            triangles: 4,
+            degenerate_triangles: 0,
+            welded_vertices: 4,
+            undirected_edges: 6,
+            boundary_edges: 0,
+            nonmanifold_edges: 0,
+            inconsistent_directed_edges: 0,
+            components: 1,
+            euler_characteristic: 2,
+            refused_weld_vertices: 0,
+            closed: true,
+            manifold: true,
+            oriented: true,
+        }
+    }
+
+    #[test]
+    fn a_closed_report_passes_the_post_flight() {
+        assert!(
+            blend_closure_verdict(&clean_report(), "filleted", 1).is_ok(),
+            "a closed blend result must be handed back"
+        );
+    }
+
+    /// The arm this task added: no boundary edge at all, but the weld could not
+    /// address a vertex, so the mesh's index topology is weaker than the count
+    /// suggests. The blend must be REFUSED, and the reason must name the
+    /// refusal - reporting "0 boundary mesh edge(s)" and nothing else would be
+    /// an unactionable verdict.
+    #[test]
+    fn a_refusal_only_report_is_refused_and_says_why() {
+        let report = ManifoldReport {
+            refused_weld_vertices: 1,
+            closed: false,
+            ..clean_report()
+        };
+        let err = blend_closure_verdict(&report, "filleted", 7);
+        let msg = match err {
+            Ok(()) => String::new(),
+            Err(e) => format!("{e}"),
+        };
+        assert!(
+            !msg.is_empty(),
+            "a report the weld could not fully address must be refused, not passed"
+        );
+        assert!(
+            msg.contains("0 boundary mesh edge(s) and 1 vertices the weld could not address"),
+            "the refusal must name the refused count beside the edge count: {msg}"
+        );
+        assert!(
+            !msg.contains("  "),
+            "the refusal must not carry a run of spaces: {msg}"
+        );
+    }
+
+    /// The pre-existing arm still reads the same way.
+    #[test]
+    fn an_open_report_is_refused_naming_the_boundary_edges() {
+        let report = ManifoldReport {
+            boundary_edges: 47,
+            closed: false,
+            ..clean_report()
+        };
+        let msg = match blend_closure_verdict(&report, "chamfered", 3) {
+            Ok(()) => String::new(),
+            Err(e) => format!("{e}"),
+        };
+        assert!(
+            msg.contains("47 boundary mesh edge(s)"),
+            "an open mesh must still be named by its boundary count: {msg}"
+        );
+        assert!(
+            msg.contains("chamfered"),
+            "the op label must survive: {msg}"
+        );
+        assert!(!msg.contains("  "), "no run of spaces: {msg}");
+    }
 }
 
 #[cfg(test)]
