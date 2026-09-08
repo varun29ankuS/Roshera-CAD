@@ -509,9 +509,14 @@ fn unmeasured_domain_refuses_rather_than_reporting_the_placeholder() {
 /// **48.8 mm²** window. That the error is precisely half the hole is what
 /// identifies the cause as the branch, not as quadrature coarseness.
 ///
-/// **The oracle is analytic, not the mesh.** The tessellator does not cut this
-/// hole at all (the same face meshes to 1256.4 mm², the full untouched wall),
-/// so the mesh cannot witness a hole here — see the report.
+/// **The oracle is analytic, not the mesh.** The mesh has never been able to
+/// witness this hole. Before Task 33 the tessellator did not cut it at all
+/// (the same face meshed to 1256.4 mm², the full untouched wall); Task 33's
+/// branch re-cut brought it to 1207.7; Task 34 then corrected the B-Rep so the
+/// window is part of the wall's OUTER loop, which the re-cut no longer applies
+/// to and the curved CDT does not yet mesh correctly (measured 1477.5 mm²,
+/// `tessellated_window` red — see the Task 34 report). None of that touches
+/// this test: the area below is quadrature over the face's own domain.
 #[test]
 fn seam_straddling_hole_is_subtracted_on_both_sides() {
     const WIN_HALF_Y: f64 = 3.0;
@@ -556,12 +561,23 @@ fn seam_straddling_hole_is_subtracted_on_both_sides() {
     assert_eq!(walls.len(), 1, "one wall face expected, got {walls:?}");
     let wall = walls[0];
 
-    // Fixture precondition: the window really is a HOLE in this face, not a
-    // split. Without an inner loop this test exercises nothing.
+    // Fixture precondition: the window really is a VOID in this one face, not
+    // a split into several. Task 34 corrected the topology the boolean emits
+    // here -- a window that STRADDLES the seam is absorbed into the wall's
+    // OUTER loop (the outer boundary detours around it and the in-window seam
+    // segment drops out), so it is no longer an inner loop. The face is still
+    // one full-wrap wall carrying one window-sized void, which is exactly what
+    // the analytic area oracle below measures; only where the void's boundary
+    // is recorded changed.
+    assert_eq!(
+        walls.len(),
+        1,
+        "the window must not split the wall into several faces"
+    );
     assert_eq!(
         model.faces.get(wall).expect("wall face").inner_loops.len(),
-        1,
-        "the window must appear as one inner loop on the wall"
+        0,
+        "a seam-straddling window is absorbed into the wall's outer loop"
     );
 
     // Analytic truth: full wall minus the window's own patch. The window's

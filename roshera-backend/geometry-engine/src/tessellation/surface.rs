@@ -212,6 +212,42 @@ pub fn tessellate_face(
                     );
                     return;
                 }
+                // SECOND REFUSAL (Task 34b): the error is a chart failure, but
+                // this face's OUTER loop NOTCHES the chart's periodic border --
+                // it detours inward from the seam at a height inside the band,
+                // which is a seam-straddling window absorbed into the outer loop
+                // (Task 34). The untrimmed grid below reads no trim loop at all,
+                // so it would re-cover exactly that removed material. Measured:
+                // three windows cut one boolean at a time, pre-34b tessellator,
+                // `CdtFailed(CrossingFixedEdge)` -> grid -> the wall meshes
+                // 1256.4304 mm2, the FULL untouched wall, with three windows
+                // cut. Refuse instead: no mesh, the shell reads open,
+                // `manifold_report` counts the boundary edges and
+                // `certify_solid` says so.
+                if super::curved_cdt::outer_trim_notches_the_chart_border(
+                    face, model, cache, surface,
+                ) {
+                    if std::env::var("ROSHERA_TESS_TRACE").is_ok() {
+                        eprintln!(
+                            concat!(
+                                "[tess] REFUSE cylinder face {:?}: {} -> no mesh emitted ",
+                                "(the outer trim notches the chart's periodic border; an ",
+                                "untrimmed grid would re-cover the removed material)"
+                            ),
+                            face.id, e
+                        );
+                    }
+                    tracing::warn!(
+                        concat!(
+                            "curved_cdt failed for cylinder face {:?}: {}; its outer trim ",
+                            "notches the chart's periodic border, so no mesh is emitted and ",
+                            "the shell will read open rather than re-covering removed material"
+                        ),
+                        face.id,
+                        e
+                    );
+                    return;
+                }
                 // curved-CDT can fail on a transformed (e.g. rotated) cylinder:
                 // once the lateral seam no longer coincides with the cap
                 // circles' t=0, a projected boundary sample can land exactly on
@@ -10675,6 +10711,76 @@ mod cylinder_err_routing_tests {
             refuse < no_emit && no_emit < grid,
             "the refusal must be decided and returned BEFORE the untrimmed grid runs \
              (refuse at {refuse}, return at {no_emit}, grid at {grid})"
+        );
+    }
+
+    /// Disconnection gate for Task 34b's SECOND refusal.
+    ///
+    /// `outer_trim_notches_the_chart_border` answers a different question from
+    /// the error truth-table above: the error may be an ordinary chart failure
+    /// and the untrimmed grid still be a lie, because this face's outer loop
+    /// detours around removed material (a seam-straddling window absorbed into
+    /// it by Task 34) and the grid meshes the whole rectangle.
+    ///
+    /// The behaviour is pinned end-to-end by
+    /// `tests/tessellated_window.rs::successive_window_cuts_never_mesh_material_that_was_removed`
+    /// (deleting the branch makes that wall mesh 1256.7329 mm2 -- MORE than the
+    /// untouched wall -- with three windows cut through it). This gate is the
+    /// second half: it pins that the arm still CALLS the predicate and returns
+    /// before the grid, which a behaviour test alone cannot state, exactly as
+    /// the Task 33 gate above does for its own refusal.
+    #[test]
+    fn the_cylinder_arm_refuses_the_grid_when_the_outer_trim_notches_the_border() {
+        let source = include_str!("surface.rs").replace("\r\n", "\n");
+        let production = source
+            .split("\n#[cfg(test)]")
+            .next()
+            .expect("split always yields a first element");
+
+        assert_eq!(
+            production
+                .matches("outer_trim_notches_the_chart_border(")
+                .count(),
+            1,
+            concat!(
+                "outer_trim_notches_the_chart_border must be CALLED from exactly one ",
+                "production site (the \"Cylinder\" arm); it is defined in curved_cdt.rs"
+            )
+        );
+
+        let arm = production
+            .split("\"Cylinder\" => {")
+            .nth(1)
+            .expect("tessellate_face must still have a \"Cylinder\" match arm")
+            .split("\"Sphere\" =>")
+            .next()
+            .expect("the \"Cylinder\" arm must be followed by the \"Sphere\" arm");
+
+        let refuse = arm
+            .find("if super::curved_cdt::outer_trim_notches_the_chart_border(")
+            .expect(concat!(
+                "the \"Cylinder\" arm must ask whether the outer trim notches the chart ",
+                "border before it draws an untrimmed grid"
+            ));
+        let no_emit = arm[refuse..]
+            .find("\n                    return;")
+            .map(|i| refuse + i)
+            .expect(concat!(
+                "the second refusal must RETURN without emitting -- a grid drawn after ",
+                "the refusal re-covers the removed material, which is the defect"
+            ));
+        let grid = arm
+            .find("tessellate_surface_grid_untrimmed(")
+            .expect("the arm must still keep the untrimmed-grid fallback for an un-notched chart");
+        assert!(
+            refuse < no_emit && no_emit < grid,
+            concat!(
+                "the notch refusal must be decided and returned BEFORE the ",
+                "untrimmed grid runs (refuse at {}, return at {}, grid at {})"
+            ),
+            refuse,
+            no_emit,
+            grid
         );
     }
 }

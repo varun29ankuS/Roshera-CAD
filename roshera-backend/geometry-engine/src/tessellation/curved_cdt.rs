@@ -450,6 +450,82 @@ pub(crate) fn run_boundary_projection(
     }
 }
 
+/// Does the outer trim loop NOTCH the chart's periodic border -- i.e. does it
+/// detour inward from `u_lo` / `u_hi` at a height strictly inside the band?
+///
+/// This is the exact signature of a seam-straddling window absorbed into a
+/// cylinder lateral's OUTER loop (Task 34): the window's two half-chains sit on
+/// the two periodic branches, so the projected polygon is the chart rectangle
+/// with a bite taken out of EACH vertical edge, and the bite's corners are
+/// boundary vertices that lie ON `u_lo` / `u_hi` at a `v` in the band interior.
+///
+/// Two independent signals must agree, because each alone has a false positive:
+///
+/// * **A vertex on the u-border at an interior height.** An untouched full-wrap
+///   lateral has border vertices only where its two seam columns meet the rims,
+///   i.e. at `v_lo` and `v_hi`, so it scores zero. A seam column sampled at
+///   intermediate heights would score above zero without any bite, which is why
+///   this is not sufficient on its own.
+/// * **Less area than the bounding rectangle.** The bite removes 3.9% on the
+///   Task 34 fixture. Measured false positive: a filleted block's blend band
+///   (`fillet_post_boolean`, face 11) projects with a MONOTONE unwrap spanning
+///   `u in [-10.933, 1.571]` -- about two periods -- so its bbox is twice the
+///   band's true width and its area reads exactly half the rectangle
+///   (37.699112 = 2*pi*6) with no bite anywhere. Hence the border test above.
+///
+/// Returns `false` (grid permitted) when the outer loop cannot be projected: an
+/// unprojectable outer IS the chart failure the untrimmed-grid fallback exists
+/// for, and inventing a refusal there would drop walls this kernel meshes today
+/// (the #24 rotated-cylinder guard, where a dropped lateral collapses the
+/// divergence-theorem volume to a third of the truth).
+pub(crate) fn outer_trim_notches_the_chart_border(
+    face: &Face,
+    model: &BRepModel,
+    cache: &EdgeSampleCache,
+    surface: &dyn Surface,
+) -> bool {
+    let Some(outer_loop) = model.loops.get(face.outer_loop) else {
+        return false;
+    };
+    match project_loop_to_uv(outer_loop, model, cache, surface) {
+        Ok(p) => polygon_notches_its_bbox_border(&p.points_uv),
+        Err(_) => false,
+    }
+}
+
+/// The pure test behind [`outer_trim_notches_the_chart_border`], so the rule can
+/// be exercised without a `BRepModel`.
+fn polygon_notches_its_bbox_border(polygon: &[(f64, f64)]) -> bool {
+    let Some((u_lo, u_hi, v_lo, v_hi)) = uv_bbox_of(polygon) else {
+        return false;
+    };
+    let u_span = u_hi - u_lo;
+    let v_span = v_hi - v_lo;
+    let rect = u_span * v_span;
+    if !rect.is_finite() || rect <= 0.0 {
+        // A degenerate chart carries no statement either way; leave the
+        // caller's existing behaviour alone rather than inventing a verdict.
+        return false;
+    }
+    // Signal 1: the polygon encloses less than its bounding rectangle. The
+    // relative tolerance is generous by six orders of magnitude for the
+    // intended false case -- an untouched full-wrap lateral's rims sit at
+    // exactly `v_lo` / `v_hi` and its seam columns at exactly `u_lo` / `u_hi`,
+    // so the shoelace sum reproduces the rectangle to float noise.
+    if polygon_signed_area_uv(polygon).abs() >= rect * (1.0 - 1e-6) {
+        return false;
+    }
+    // Signal 2: some vertex sits ON a vertical border at a height strictly
+    // inside the band -- the bite's corner.
+    let eps_u = u_span * 1e-6;
+    let eps_v = v_span * 1e-6;
+    polygon.iter().any(|&(u, v)| {
+        ((u - u_lo).abs() < eps_u || (u - u_hi).abs() < eps_u)
+            && v > v_lo + eps_v
+            && v < v_hi - eps_v
+    })
+}
+
 /// Project, chart-align and validate every inner loop of `face` against an
 /// outer loop whose UV bbox is `outer_bbox`.
 ///
@@ -1228,7 +1304,41 @@ fn generate_steiner_candidates(
     // already served by that row (worst local aspect ~4, versus the
     // ~98 bridge the trim rows exist to prevent), so skip it. Quarter
     // cell matches the constraint-edge keepout philosophy above.
-    let v_row_keepout = 0.25 * v_cell;
+    //
+    // MEASURE THE RIBBON IN 3D, NOT IN v (Task 34b). "Already served, worst
+    // local aspect ~4" is a statement about the ribbon between the trim height
+    // and the grid row: it is `dv` tall and one u-column wide, so its 3D aspect
+    // is `u_cell_3d / dv_3d`, and the height at which it stops being degenerate
+    // is `0.25 * u_cell * du_mag / dv_mag`. A quarter of a v-cell is the same
+    // number only while the two cells are 3D-comparable — which the
+    // DEVELOPABLE COLLAPSE above deliberately breaks: it sets `nv =
+    // min_segments`, so on a r10 h20 wall a quarter cell became 1.667 mm of
+    // height and swallowed the trim rows the boundary genuinely needed.
+    // Measured: a seam-straddling window absorbed into the wall's OUTER loop
+    // (Task 34) puts boundary vertices at v = 6 and v = 14 with grid rows at
+    // 6.667 and 13.333; both were skipped as "already served", the CDT then had
+    // no interior point at the window's own heights and fanned the window's
+    // corner vertices across the whole period — chart-valid triangles (the
+    // chart triangulation's area was exactly the polygon's, 120.788624) that
+    // lift to 3D blades spanning up to 2.02 rad, 87.6 deg off the true normal,
+    // and sum to 1477.55 mm2 against a 1207.89 mm2 wall.
+    // Taking the MIN of the two thresholds is never WORSE than the old rule:
+    // the threshold can only shrink, so no height the old rule admitted is
+    // newly rejected, and a face whose grid is not collapsed (u and v cells
+    // 3D-comparable) is untouched. It is NOT literally "only ever adds rows",
+    // and two limits are worth naming rather than discovering later. First, the
+    // TRIM-ROW BUDGET below thins a dense height set to an evenly spaced
+    // subset, so a larger admitted set can re-select DIFFERENT heights. Second,
+    // `du_mag` is sampled at the chart CENTRE, so on a cone it is the MEAN
+    // radius: at the narrow end the true `u_cell_3d` is smaller than this
+    // estimate, the keepout is correspondingly too large, and a trim height
+    // there can still be skipped exactly as before.
+    let u_cell_in_v = if dv_mag > 1e-12 && du_mag.is_finite() {
+        u_cell * du_mag / dv_mag
+    } else {
+        v_cell
+    };
+    let v_row_keepout = (0.25 * v_cell).min(0.25 * u_cell_in_v);
     let near_grid_row = |v: f64| -> bool {
         let rel = (v - v_lo) / v_span * (nv as f64);
         (rel - rel.round()).abs() * v_cell < v_row_keepout
@@ -3605,6 +3715,186 @@ mod tests {
             }
             Err(_) => { /* CDT rejected the 5° corner — also terminating. */ }
         }
+    }
+
+    /// The rectangle test that decides whether an untrimmed grid means the
+    /// same region as the face's own trim.
+    #[test]
+    fn only_a_bite_out_of_the_periodic_border_counts_as_a_notch() {
+        let rect = [(0.0, 0.0), (6.0, 0.0), (6.0, 20.0), (0.0, 20.0)];
+        assert!(
+            !polygon_notches_its_bbox_border(&rect),
+            "the rectangle IS its bbox; an untrimmed grid over it meshes the same region"
+        );
+        // A rectangle sampled along its sides (the shape a real projected
+        // full-band lateral takes) is still the rectangle.
+        let mut sampled: Vec<(f64, f64)> = Vec::new();
+        for i in 0..60 {
+            sampled.push((6.0 * f64::from(i) / 60.0, 0.0));
+        }
+        sampled.push((6.0, 0.0));
+        sampled.push((6.0, 20.0));
+        for i in 0..60 {
+            sampled.push((6.0 - 6.0 * f64::from(i) / 60.0, 20.0));
+        }
+        sampled.push((0.0, 20.0));
+        assert!(
+            !polygon_notches_its_bbox_border(&sampled),
+            "sampling the straight sides must not move the area"
+        );
+        // The Task 34 detoured wall in miniature: a bite out of EACH vertical
+        // side, the shape a seam-straddling window absorbed into the outer
+        // loop projects to.
+        let bitten = [
+            (0.0, 0.0),
+            (6.0, 0.0),
+            (6.0, 6.0),
+            (5.7, 6.0),
+            (5.7, 14.0),
+            (6.0, 14.0),
+            (6.0, 20.0),
+            (0.0, 20.0),
+            (0.0, 14.0),
+            (0.3, 14.0),
+            (0.3, 6.0),
+            (0.0, 6.0),
+        ];
+        assert!(
+            polygon_notches_its_bbox_border(&bitten),
+            concat!(
+                "a polygon that detours around removed material does NOT fill its bbox, ",
+                "so an untrimmed grid over that bbox re-covers the material"
+            )
+        );
+        // MEASURED FALSE POSITIVE of the area signal alone: a filleted block's
+        // blend band (`fillet_post_boolean`, face 11) projects with a monotone
+        // unwrap across about two periods, so its bbox is twice the band's true
+        // width and its area is half the rectangle -- with no bite anywhere.
+        // Refusing it dropped the band and left the filleted solid with 200
+        // boundary mesh edges. The border signal is what separates the two.
+        let period = std::f64::consts::TAU;
+        let sheared = [
+            (0.0, 0.0),
+            (period, 0.0),
+            (2.0 * period, 6.0),
+            (period, 6.0),
+        ];
+        assert!(
+            (polygon_signed_area_uv(&sheared).abs() - 0.5 * (2.0 * period) * 6.0).abs() < 1e-9,
+            "fixture: the sheared band must read half its bbox, like the measured face 11"
+        );
+        assert!(
+            !polygon_notches_its_bbox_border(&sheared),
+            concat!(
+                "a band whose chart unwrap spans more than one period is not notched -- ",
+                "no vertex sits on a vertical border at an interior height"
+            )
+        );
+        // ...and the border signal alone is not sufficient either: an extra
+        // collinear sample partway up a seam column touches the border at an
+        // interior height while the polygon still fills its rectangle.
+        let resampled_seam = [
+            (0.0, 0.0),
+            (6.0, 0.0),
+            (6.0, 10.0),
+            (6.0, 20.0),
+            (0.0, 20.0),
+            (0.0, 10.0),
+        ];
+        assert!(
+            !polygon_notches_its_bbox_border(&resampled_seam),
+            concat!(
+                "a seam column sampled at an intermediate height is not a notch -- ",
+                "the polygon still encloses its whole bounding rectangle"
+            )
+        );
+    }
+
+    /// The predicate on real kernel output: a pristine cylinder wall does NOT
+    /// notch its chart border; the same wall after a seam-straddling window is
+    /// cut DOES.
+    ///
+    /// This is the production input the refusal in `surface.rs`'s `"Cylinder"`
+    /// arm exists for, asserted directly. The refusal's own behaviour is pinned
+    /// end-to-end by
+    /// `tests/tessellated_window.rs::successive_window_cuts_never_mesh_material_that_was_removed`,
+    /// where a third window cut into the same wall makes the curved CDT fail
+    /// and the grid would otherwise re-cover all three; this test pins the
+    /// discriminator on the simplest face that carries it.
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn a_seam_straddling_window_notches_the_walls_chart_border() {
+        use crate::math::{Matrix4, Vector3 as V3};
+        use crate::operations::{
+            boolean_operation, transform_solid, BooleanOp, BooleanOptions, TransformOptions,
+        };
+        use crate::primitives::topology_builder::{GeometryId, TopologyBuilder};
+
+        let wall_of = |model: &BRepModel, solid| -> u32 {
+            let s = model.solids.get(solid).expect("solid");
+            let shell = model.shells.get(s.outer_shell).expect("shell");
+            *shell
+                .faces
+                .iter()
+                .find(|&&fid| {
+                    model
+                        .faces
+                        .get(fid)
+                        .and_then(|f| model.surfaces.get(f.surface_id))
+                        .is_some_and(|s| s.type_name() == "Cylinder")
+                })
+                .expect("the solid must keep a cylinder lateral")
+        };
+
+        let mut model = BRepModel::new();
+        let made =
+            TopologyBuilder::new(&mut model).create_cylinder_3d(Point3::ORIGIN, V3::Z, 10.0, 20.0);
+        let Ok(GeometryId::Solid(cyl)) = made else {
+            unreachable!("create_cylinder_3d must yield a solid, got {made:?}")
+        };
+        let cache = EdgeSampleCache::new(&TessellationParams::default());
+        let pristine = wall_of(&model, cyl);
+        let f = model.faces.get(pristine).expect("wall").clone();
+        let s = model.surfaces.get(f.surface_id).expect("surface");
+        assert!(
+            !outer_trim_notches_the_chart_border(&f, &model, &cache, s),
+            "an untouched full-wrap lateral IS its chart rectangle"
+        );
+
+        let made_win = TopologyBuilder::new(&mut model).create_box_3d(30.0, 6.0, 8.0);
+        let Ok(GeometryId::Solid(win)) = made_win else {
+            unreachable!("create_box_3d must yield a solid, got {made_win:?}")
+        };
+        transform_solid(
+            &mut model,
+            win,
+            Matrix4::from_translation(&V3::new(15.0, 0.0, 10.0)),
+            TransformOptions::default(),
+        )
+        .expect("translate the window");
+        let cut = boolean_operation(
+            &mut model,
+            cyl,
+            win,
+            BooleanOp::Difference,
+            BooleanOptions::default(),
+        )
+        .expect("difference");
+        let cache2 = EdgeSampleCache::new(&TessellationParams::default());
+        let wall = wall_of(&model, cut);
+        let fw = model.faces.get(wall).expect("wall").clone();
+        assert!(
+            fw.inner_loops.is_empty(),
+            "fixture precondition: the straddling window is absorbed into the OUTER loop"
+        );
+        let sw = model.surfaces.get(fw.surface_id).expect("surface");
+        assert!(
+            outer_trim_notches_the_chart_border(&fw, &model, &cache2, sw),
+            concat!(
+                "the detoured wall is 3.9% short of its chart rectangle -- an untrimmed ",
+                "grid over that rectangle re-covers the window"
+            )
+        );
     }
 
     // Silence unused-import warnings for symbols Phase C+ will use.

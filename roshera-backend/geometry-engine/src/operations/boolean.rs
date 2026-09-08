@@ -7107,6 +7107,431 @@ fn split_cone_face_by_circles(
     Some(faces)
 }
 
+/// The (theta, v) chart frame of a cylinder lateral face.
+///
+/// Every cylinder-lateral splitter here needs the same three things: an axis
+/// frame perpendicular to the axis (built with ONE shared seed rule, so two
+/// handlers can never disagree about which theta is zero), the face's axial
+/// extent, and the tolerances derived from it. Bundling them is what lets
+/// [`detour_outer_around_seam_straddlers`] serve both the quartic-oval handler
+/// and the box-cut window handler from a single implementation.
+#[derive(Debug, Clone, Copy)]
+struct CylLateralChart {
+    origin: Point3,
+    axis: Vector3,
+    u1: Vector3,
+    u2: Vector3,
+    radius: f64,
+    /// Axial coordinate of the face's low / high rim, measured from `origin`.
+    v_lo: f64,
+    v_hi: f64,
+    /// Axial span below which an edge counts as a constant-height rim arc.
+    v_tol: f64,
+    /// Angular half-width of the seam guard band: `TAU_COINCIDE` at `radius`.
+    band_ang: f64,
+}
+
+impl CylLateralChart {
+    fn of_surface(model: &BRepModel, surface_id: SurfaceId) -> Option<Self> {
+        use crate::primitives::surface::Cylinder;
+        let surface = model.surfaces.get(surface_id)?;
+        let cyl = surface.as_any().downcast_ref::<Cylinder>()?;
+        let [v_lo, v_hi] = cyl.height_limits?;
+        let height = (v_hi - v_lo).abs();
+        if height <= 0.0 {
+            return None;
+        }
+        // theta frame perpendicular to the axis (the sibling splitters' rule).
+        let seed = if cyl.axis.x.abs() < 0.9 {
+            Vector3::new(1.0, 0.0, 0.0)
+        } else {
+            Vector3::new(0.0, 1.0, 0.0)
+        };
+        let u1 = cyl.axis.cross(&seed).normalize().ok()?;
+        let u2 = cyl.axis.cross(&u1);
+        Some(Self {
+            origin: cyl.origin,
+            axis: cyl.axis,
+            u1,
+            u2,
+            radius: cyl.radius,
+            v_lo,
+            v_hi,
+            v_tol: (height * 1.0e-3).max(1.0e-6),
+            band_ang: crate::math::authority::TAU_COINCIDE / cyl.radius.max(1.0e-9),
+        })
+    }
+
+    fn theta_of_point(&self, p: Point3) -> f64 {
+        let d = p - self.origin;
+        d.dot(&self.u2)
+            .atan2(d.dot(&self.u1))
+            .rem_euclid(2.0 * std::f64::consts::PI)
+    }
+
+    fn theta_of_vertex(&self, model: &BRepModel, vid: VertexId) -> Option<f64> {
+        let p = model.vertices.get_position(vid)?;
+        Some(self.theta_of_point(Point3::new(p[0], p[1], p[2])))
+    }
+
+    fn axial_of_vertex(&self, model: &BRepModel, vid: VertexId) -> Option<f64> {
+        let p = model.vertices.get_position(vid)?;
+        Some((Point3::new(p[0], p[1], p[2]) - self.origin).dot(&self.axis))
+    }
+}
+
+/// Signed angular offset wrapped into (-pi, pi].
+fn wrap_to_pm_pi(mut d: f64) -> f64 {
+    let two_pi = 2.0 * std::f64::consts::PI;
+    while d > std::f64::consts::PI {
+        d -= two_pi;
+    }
+    while d < -std::f64::consts::PI {
+        d += two_pi;
+    }
+    d
+}
+
+/// The post-arrangement `Boundary` edges of a cylinder lateral, split into the
+/// axial SEAM segments (both endpoints at one theta) and the RIM arcs
+/// (constant v). `foreign` marks any Boundary edge that is neither -- a
+/// slanted cut the detour builder does not own.
+struct CylLateralBoundary {
+    /// `(edge, lower vertex, upper vertex, v_lo, v_hi)`, sorted by `v_lo`.
+    seam_segments: Vec<(EdgeId, VertexId, VertexId, f64, f64)>,
+    /// `(edge, start, end, level)`, sorted by edge id.
+    rim_edges: Vec<(EdgeId, VertexId, VertexId, f64)>,
+    foreign: bool,
+}
+
+fn classify_cyl_lateral_boundary(
+    model: &BRepModel,
+    chart: &CylLateralChart,
+    graph: &IntersectionGraph,
+) -> Option<CylLateralBoundary> {
+    let mut out = CylLateralBoundary {
+        seam_segments: Vec::new(),
+        rim_edges: Vec::new(),
+        foreign: false,
+    };
+    for (&eid, ge) in graph.edges.iter() {
+        if ge.edge_type != EdgeType::Boundary {
+            continue;
+        }
+        let e = model.edges.get(eid)?;
+        let (va, vb) = (
+            chart.axial_of_vertex(model, e.start_vertex)?,
+            chart.axial_of_vertex(model, e.end_vertex)?,
+        );
+        if (va - vb).abs() <= chart.v_tol {
+            out.rim_edges
+                .push((eid, e.start_vertex, e.end_vertex, 0.5 * (va + vb)));
+            continue;
+        }
+        let (ta, tb) = (
+            chart.theta_of_vertex(model, e.start_vertex)?,
+            chart.theta_of_vertex(model, e.end_vertex)?,
+        );
+        if wrap_to_pm_pi(ta - tb).abs() <= 1.0e-6 {
+            if va <= vb {
+                out.seam_segments
+                    .push((eid, e.start_vertex, e.end_vertex, va, vb));
+            } else {
+                out.seam_segments
+                    .push((eid, e.end_vertex, e.start_vertex, vb, va));
+            }
+        } else {
+            out.foreign = true; // slanted boundary — not a plain lateral
+        }
+    }
+    // `graph.edges` is hash-ordered (random per process) and the walks below
+    // seed from `first`/`last`, so sort here rather than letting the traversal
+    // depend on iteration order (#82).
+    out.seam_segments
+        .sort_by(|a, b| a.3.partial_cmp(&b.3).unwrap_or(std::cmp::Ordering::Equal));
+    out.rim_edges.sort_by_key(|r| r.0);
+    Some(out)
+}
+
+/// Build the DETOURED outer loop of a cylinder lateral whose removed region
+/// STRADDLES the parametric seam.
+///
+/// A full-wrap lateral is an annulus that the B-Rep turns into a disc by
+/// carrying the seam as a real edge the outer loop walks TWICE, once per
+/// period end. A hole clear of the seam is an ordinary inner loop; a hole that
+/// straddles it cannot be, because the seam segment between the hole's two
+/// crossing vertices runs through the void. Leaving that segment in the outer
+/// loop is the kernel-observed face-21 state: the unrolled chart polygon is
+/// invalid, curved-CDT refuses it, and the cylinder arm falls back to an
+/// untrimmed grid that covers the hole.
+///
+/// The resolution that leaves the cap faces (which pin the seam's rim
+/// vertices) untouched is a detour:
+///
+/// ```text
+///   bottom rim, a full circle in +theta from the seam corner
+///   -> seam ASCENT, splicing each straddler's seam-NEGATIVE half-chain
+///      (theta just below the seam <=> the chart-inside of the 2pi border)
+///   -> top rim, a full circle in -theta
+///   -> seam DESCENT, splicing the seam-POSITIVE half-chains
+/// ```
+///
+/// The in-window seam segments are never reached and drop out; each straddling
+/// hole becomes part of the outer boundary (so it is NOT returned as an inner
+/// loop), and the chart polygon is simple.
+///
+/// Returns `None` -- the caller falls back to the generic DCEL rather than
+/// emit topology it cannot justify -- when the boundary is not a clean
+/// rims-plus-seam lateral, when a straddler does not present exactly two
+/// seam-crossing vertices, when its two half-chains do not separate cleanly
+/// onto opposite sides of the seam, or when a rim or seam walk fails to close.
+fn detour_outer_around_seam_straddlers(
+    model: &BRepModel,
+    chart: &CylLateralChart,
+    bnd: &CylLateralBoundary,
+    straddling_loops: &[Vec<(EdgeId, bool)>],
+) -> Option<Vec<(EdgeId, bool)>> {
+    let two_pi = 2.0 * std::f64::consts::PI;
+
+    // Detour construction needs a clean lateral boundary: rims + one seam.
+    if bnd.foreign || bnd.seam_segments.is_empty() || bnd.rim_edges.is_empty() {
+        return None;
+    }
+    if straddling_loops.is_empty() {
+        return None;
+    }
+    let theta_seam = chart.theta_of_vertex(model, bnd.seam_segments[0].1)?;
+
+    // Split each straddling loop at its two seam vertices into a seam-negative
+    // and a seam-positive half-chain, each keyed by its (lower, upper)
+    // crossing vertices for the seam walks below.
+    struct HalfChain {
+        lower: VertexId,
+        upper: VertexId,
+        /// Edges ordered lower -> upper.
+        edges: Vec<(EdgeId, bool)>,
+    }
+    let mut neg_chains: Vec<HalfChain> = Vec::new();
+    let mut pos_chains: Vec<HalfChain> = Vec::new();
+    for lp in straddling_loops {
+        // Walk the cyclic loop, recording each traversal vertex.
+        let mut verts: Vec<VertexId> = Vec::with_capacity(lp.len());
+        for &(eid, fwd) in lp {
+            let e = model.edges.get(eid)?;
+            verts.push(if fwd { e.start_vertex } else { e.end_vertex });
+        }
+        // Seam vertices = walk vertices angularly ON the seam.
+        let on_seam: Vec<usize> = (0..verts.len())
+            .filter(|&i| {
+                chart
+                    .theta_of_vertex(model, verts[i])
+                    .map(|t| wrap_to_pm_pi(t - theta_seam).abs() <= chart.band_ang)
+                    .unwrap_or(false)
+            })
+            .collect();
+        if on_seam.len() != 2 {
+            return None; // crossing vertices not materialised — refuse (DCEL)
+        }
+        let (i0, i1) = (on_seam[0], on_seam[1]);
+        let n = lp.len();
+        // Chain A: walk indices i0..i1; chain B: i1..i0 (cyclic).
+        let chain_of = |from: usize, to: usize| -> Vec<(EdgeId, bool)> {
+            let mut c = Vec::new();
+            let mut k = from;
+            while k != to {
+                c.push(lp[k]);
+                k = (k + 1) % n;
+            }
+            c
+        };
+        let build = |from: usize, to: usize| -> Option<(HalfChain, f64)> {
+            let edges = chain_of(from, to);
+            // Side sign from sampled arc interiors (must be consistent).
+            let mut side_acc = 0.0_f64;
+            for &(eid, fwd) in &edges {
+                let e = model.edges.get(eid)?;
+                let curve = model.curves.get(e.curve_id)?;
+                let (t0, t1) = if fwd {
+                    (e.param_range.start, e.param_range.end)
+                } else {
+                    (e.param_range.end, e.param_range.start)
+                };
+                for k in 1..8usize {
+                    let t = t0 + (t1 - t0) * (k as f64) / 8.0;
+                    let p = curve.point_at(t).ok()?;
+                    let off = wrap_to_pm_pi(chart.theta_of_point(p) - theta_seam);
+                    if off.abs() > chart.band_ang {
+                        side_acc += off.signum();
+                    }
+                }
+            }
+            let (sv, ev) = (verts[from], verts[to]);
+            let (va, vb_) = (
+                chart.axial_of_vertex(model, sv)?,
+                chart.axial_of_vertex(model, ev)?,
+            );
+            let hc = if va <= vb_ {
+                HalfChain {
+                    lower: sv,
+                    upper: ev,
+                    edges,
+                }
+            } else {
+                // Reverse to lower -> upper order.
+                let edges_rev: Vec<(EdgeId, bool)> =
+                    edges.iter().rev().map(|&(e, f)| (e, !f)).collect();
+                HalfChain {
+                    lower: ev,
+                    upper: sv,
+                    edges: edges_rev,
+                }
+            };
+            Some((hc, side_acc))
+        };
+        let (chain_a, side_a) = build(i0, i1)?;
+        let (chain_b, side_b) = build(i1, i0)?;
+        if side_a * side_b >= 0.0 {
+            return None; // sides not cleanly separated — refuse (DCEL)
+        }
+        if side_a < 0.0 {
+            neg_chains.push(chain_a);
+            pos_chains.push(chain_b);
+        } else {
+            neg_chains.push(chain_b);
+            pos_chains.push(chain_a);
+        }
+    }
+
+    // Rim cycles: cluster rim edges into bottom/top by level, then walk a full
+    // circle from the seam corner (+theta on the bottom, -theta on the top) so
+    // the unrolled chart lays bottom 0->2pi / top 2pi->0 with the ascent at the
+    // 2pi border and the descent at 0 (matching the half-chain side split).
+    let vb0 = bnd.seam_segments.first().map(|s| s.1)?;
+    let vt0 = bnd.seam_segments.last().map(|s| s.2)?;
+    let mid_level = 0.5 * (chart.v_lo + chart.v_hi);
+    let mut bottom_adj: HashMap<VertexId, Vec<(VertexId, EdgeId)>> = HashMap::new();
+    let mut top_adj: HashMap<VertexId, Vec<(VertexId, EdgeId)>> = HashMap::new();
+    for &(eid, sv, ev, level) in &bnd.rim_edges {
+        let adj = if level < mid_level {
+            &mut bottom_adj
+        } else {
+            &mut top_adj
+        };
+        adj.entry(sv).or_default().push((ev, eid));
+        adj.entry(ev).or_default().push((sv, eid));
+    }
+    let oriented = |eid: EdgeId, from: VertexId| -> Option<(EdgeId, bool)> {
+        let e = model.edges.get(eid)?;
+        if e.start_vertex == from {
+            Some((eid, true))
+        } else if e.end_vertex == from {
+            Some((eid, false))
+        } else {
+            None
+        }
+    };
+    // Walk a full rim circle from `start` back to `start`, choosing at each
+    // step the neighbour with the smallest positive theta-gap in `dir`
+    // (+1 CCW, -1 CW).
+    let walk_rim_cycle = |start: VertexId,
+                          adj: &HashMap<VertexId, Vec<(VertexId, EdgeId)>>,
+                          dir: f64|
+     -> Option<Vec<(EdgeId, bool)>> {
+        let mut out: Vec<(EdgeId, bool)> = Vec::new();
+        let mut cur = start;
+        let mut prev: Option<VertexId> = None;
+        let limit = adj.len() + 4;
+        loop {
+            let cur_th = chart.theta_of_vertex(model, cur)?;
+            let neighbours = adj.get(&cur)?;
+            let mut best: Option<(f64, VertexId, EdgeId)> = None;
+            for &(nb, eid) in neighbours.iter() {
+                if Some(nb) == prev && neighbours.len() > 1 {
+                    continue;
+                }
+                let gap = (dir * (chart.theta_of_vertex(model, nb)? - cur_th)).rem_euclid(two_pi);
+                let gap = if gap <= 1.0e-9 { two_pi } else { gap };
+                if best.map_or(true, |(g, _, _)| gap < g) {
+                    best = Some((gap, nb, eid));
+                }
+            }
+            let (_, nb, eid) = best?;
+            out.push(oriented(eid, cur)?);
+            prev = Some(cur);
+            cur = nb;
+            if cur == start {
+                return Some(out);
+            }
+            if out.len() > limit {
+                return None;
+            }
+        }
+    };
+    let bottom_cycle = walk_rim_cycle(vb0, &bottom_adj, 1.0)?;
+    let top_cycle = walk_rim_cycle(vt0, &top_adj, -1.0)?;
+
+    // Seam ascent (vb0 -> vt0) splicing negative half-chains; descent
+    // (vt0 -> vb0) splicing positive ones. At every junction exactly one
+    // upward/downward continuation exists (the T-junction pre-split ends each
+    // seam segment exactly at a window crossing vertex); in-window seam
+    // segments are never reached and drop out.
+    let climb = |start: VertexId,
+                 end: VertexId,
+                 upward: bool,
+                 chains: &[HalfChain]|
+     -> Option<Vec<(EdgeId, bool)>> {
+        let mut out: Vec<(EdgeId, bool)> = Vec::new();
+        let mut cur = start;
+        let limit = bnd.seam_segments.len() + chains.len() + 4;
+        let mut steps = 0usize;
+        while cur != end {
+            steps += 1;
+            if steps > limit {
+                return None;
+            }
+            // Window half-chain first (it owns the crossing vertex).
+            if let Some(hc) = chains.iter().find(|hc| {
+                if upward {
+                    hc.lower == cur
+                } else {
+                    hc.upper == cur
+                }
+            }) {
+                if upward {
+                    out.extend(hc.edges.iter().copied());
+                    cur = hc.upper;
+                } else {
+                    out.extend(hc.edges.iter().rev().map(|&(e, f)| (e, !f)));
+                    cur = hc.lower;
+                }
+                continue;
+            }
+            let seg =
+                bnd.seam_segments
+                    .iter()
+                    .find(|s| if upward { s.1 == cur } else { s.2 == cur })?;
+            if upward {
+                out.push(oriented(seg.0, seg.1)?);
+                cur = seg.2;
+            } else {
+                out.push(oriented(seg.0, seg.2)?);
+                cur = seg.1;
+            }
+        }
+        Some(out)
+    };
+    let ascent = climb(vb0, vt0, true, &neg_chains)?;
+    let descent = climb(vt0, vb0, false, &pos_chains)?;
+
+    let mut outer: Vec<(EdgeId, bool)> =
+        Vec::with_capacity(bottom_cycle.len() + ascent.len() + top_cycle.len() + descent.len());
+    outer.extend(bottom_cycle);
+    outer.extend(ascent);
+    outer.extend(top_cycle);
+    outer.extend(descent);
+    Some(outer)
+}
+
 /// Cylinder analogue of the sphere/cone curved-Boolean fast paths, for the
 /// OFF-AXIS poke: the lateral is cut by a closed "window" loop — cap arcs at
 /// constant height joined by vertical wall lines — that does NOT span the full
@@ -7259,6 +7684,55 @@ fn split_cylinder_lateral_by_window(
     };
     let window_loop = order_loop(&split_eids)?;
 
+    // Does the window STRADDLE the parametric seam? A window clear of the seam
+    // is an ordinary inner hole and the complement below keeps the original
+    // lateral boundary verbatim. One that CROSSES the seam cannot be: the seam
+    // segment between its two crossing vertices runs through removed material,
+    // so handing the complement the untouched boundary leaves that segment in
+    // the outer loop -- walked twice, once per period end -- with the window
+    // touching it at both ends. Detour around it instead, by the same
+    // construction `split_cylinder_lateral_by_interior_ovals` already applies
+    // to a cross bore whose breakout straddles the seam.
+    let chart = CylLateralChart::of_surface(model, surface_id)?;
+    let bnd = classify_cyl_lateral_boundary(model, &chart, graph)?;
+    let seam_crossings = match bnd.seam_segments.first() {
+        None => 0,
+        Some(&(_, lo_vid, _, _, _)) => {
+            let theta_seam = chart.theta_of_vertex(model, lo_vid)?;
+            window_loop
+                .iter()
+                .filter_map(|&(eid, fwd)| {
+                    let e = model.edges.get(eid)?;
+                    chart.theta_of_vertex(model, if fwd { e.start_vertex } else { e.end_vertex })
+                })
+                .filter(|&t| wrap_to_pm_pi(t - theta_seam).abs() <= chart.band_ang)
+                .count()
+        }
+    };
+    // A straddler the detour builder cannot resolve returns None from here, so
+    // the caller falls through to the DCEL rather than emit a boundary with a
+    // seam edge inside the void.
+    let (complement_outer, complement_holes) = if seam_crossings == 0 {
+        (boundary_edges.to_vec(), vec![window_loop.clone()])
+    } else {
+        (
+            detour_outer_around_seam_straddlers(
+                model,
+                &chart,
+                &bnd,
+                std::slice::from_ref(&window_loop),
+            )?,
+            Vec::new(),
+        )
+    };
+    if pipeline_trace_enabled() {
+        eprintln!(
+            "[bool]   cyl window: seam_crossings={seam_crossings} complement outer={} edges, {} hole(s)",
+            complement_outer.len(),
+            complement_holes.len()
+        );
+    }
+
     // Interior reference for the window patch. The enclosed generator is the
     // one the cap ARCS bulge toward — their geometric midpoints sit on the far
     // (enclosed) side, while the wall-line endpoints all sit on the cutting
@@ -7318,17 +7792,19 @@ fn split_cylinder_lateral_by_window(
             interior_point: Some(mid_point),
             inner_loops: Vec::new(),
         },
-        // The complement: full original lateral boundary with the window as a
-        // hole. CDT meshes lateral-minus-window; bands stay welded to the caps.
+        // The complement: the lateral boundary carrying the window as a hole
+        // (or, when the window straddles the seam, the detoured boundary that
+        // absorbs it). CDT meshes lateral-minus-window; the end bands stay
+        // welded to the caps through the shared rim edges.
         SplitFace {
             was_split: true,
             original_face: face_id,
             surface: surface_id,
-            boundary_edges: boundary_edges.to_vec(),
+            boundary_edges: complement_outer,
             classification: FaceClassification::OnBoundary,
             from_solid: origin_solid,
             interior_point: Some(band_point),
-            inner_loops: vec![window_loop],
+            inner_loops: complement_holes,
         },
     ])
 }
@@ -8209,28 +8685,22 @@ fn split_cylinder_lateral_by_interior_ovals(
     boundary_edges: &[(EdgeId, bool)],
 ) -> Option<Vec<SplitFace>> {
     use crate::primitives::qsic_curve::QsicCurve;
-    use crate::primitives::surface::Cylinder;
 
-    let surface = model.surfaces.get(surface_id)?;
-    let cyl = surface.as_any().downcast_ref::<Cylinder>()?;
-    let axis = cyl.axis;
-    let origin = cyl.origin;
-    let radius = cyl.radius;
-    let [face_v_lo, face_v_hi] = cyl.height_limits?;
-    let height = (face_v_hi - face_v_lo).abs();
-    if height <= 0.0 {
-        return None;
-    }
-    let v_tol = (height * 1.0e-3).max(1.0e-6);
-
-    // θ frame ⟂ axis (identical seed rule to the sibling splitters).
-    let seed = if axis.x.abs() < 0.9 {
-        Vector3::new(1.0, 0.0, 0.0)
-    } else {
-        Vector3::new(0.0, 1.0, 0.0)
-    };
-    let u1 = axis.cross(&seed).normalize().ok()?;
-    let u2 = axis.cross(&u1);
+    // One shared chart: same seed rule, same v_tol, same seam guard band as
+    // `split_cylinder_lateral_by_window`, so the two handlers cannot disagree
+    // about where θ = 0 is when they call the same detour builder.
+    let chart = CylLateralChart::of_surface(model, surface_id)?;
+    let CylLateralChart {
+        origin,
+        axis,
+        u1,
+        u2,
+        radius,
+        v_lo: face_v_lo,
+        v_hi: face_v_hi,
+        v_tol,
+        band_ang,
+    } = chart;
     let two_pi = 2.0 * std::f64::consts::PI;
 
     // EVERY Splitting edge must be a quartic arc (windows only — any other
@@ -8403,60 +8873,18 @@ fn split_cylinder_lateral_by_interior_ovals(
     // — the in-window seam segments drop out naturally (the walk routes
     // around them), and only NON-straddling windows remain inner holes. The
     // chart polygon is then simple and curved-CDT meshes it natively.
-    let theta_of_vid = |vid: VertexId| -> Option<f64> {
-        let p = model.vertices.get_position(vid)?;
-        let d = Point3::new(p[0], p[1], p[2]) - origin;
-        Some(d.dot(&u2).atan2(d.dot(&u1)).rem_euclid(two_pi))
-    };
-    let axial_of_vid = |vid: VertexId| -> Option<f64> {
-        let p = model.vertices.get_position(vid)?;
-        Some((Point3::new(p[0], p[1], p[2]) - origin).dot(&axis))
-    };
-    let wrap_pm_pi = |mut d: f64| -> f64 {
-        while d > std::f64::consts::PI {
-            d -= two_pi;
-        }
-        while d < -std::f64::consts::PI {
-            d += two_pi;
-        }
-        d
-    };
 
     // Classify the graph's (post-T-junction-split) Boundary edges.
-    let mut seam_segments: Vec<(EdgeId, VertexId, VertexId, f64, f64)> = Vec::new(); // lo→hi
-    let mut rim_edges: Vec<(EdgeId, VertexId, VertexId, f64)> = Vec::new(); // (…, level)
-    let mut boundary_foreign = false;
-    for (&eid, ge) in graph.edges.iter() {
-        if ge.edge_type != EdgeType::Boundary {
-            continue;
-        }
-        let e = model.edges.get(eid)?;
-        let (va, vb_) = (axial_of_vid(e.start_vertex)?, axial_of_vid(e.end_vertex)?);
-        if (va - vb_).abs() <= v_tol {
-            rim_edges.push((eid, e.start_vertex, e.end_vertex, 0.5 * (va + vb_)));
-        } else {
-            let (ta, tb) = (theta_of_vid(e.start_vertex)?, theta_of_vid(e.end_vertex)?);
-            if wrap_pm_pi(ta - tb).abs() <= 1.0e-6 {
-                if va <= vb_ {
-                    seam_segments.push((eid, e.start_vertex, e.end_vertex, va, vb_));
-                } else {
-                    seam_segments.push((eid, e.end_vertex, e.start_vertex, vb_, va));
-                }
-            } else {
-                boundary_foreign = true; // slanted boundary — not a plain lateral
-            }
-        }
-    }
+    let bnd = classify_cyl_lateral_boundary(model, &chart, graph)?;
 
     // Which windows straddle the seam? Guard band: a window EDGE passing
     // within τ_coincide of the seam is a grazing configuration this handler
     // refuses (→ DCEL) rather than guessing.
-    let band_ang = crate::math::authority::TAU_COINCIDE / radius.max(1.0e-9);
     let mut straddlers: Vec<usize> = Vec::new();
-    if !seam_segments.is_empty() {
-        let theta_seam = theta_of_vid(seam_segments[0].1)?;
+    if let Some(&(_, seam_lo_vid, _, _, _)) = bnd.seam_segments.first() {
+        let theta_seam = chart.theta_of_vertex(model, seam_lo_vid)?;
         for (i, w) in windows.iter().enumerate() {
-            let dist = wrap_pm_pi(theta_seam - w.theta_center).abs();
+            let dist = wrap_to_pm_pi(theta_seam - w.theta_center).abs();
             if dist < w.theta_halfwidth - band_ang {
                 straddlers.push(i);
             } else if dist <= w.theta_halfwidth + band_ang {
@@ -8512,238 +8940,13 @@ fn split_cylinder_lateral_by_interior_ovals(
         return Some(faces);
     }
 
-    // Detour construction needs a clean lateral boundary: rims + one seam.
-    if boundary_foreign || seam_segments.is_empty() || rim_edges.is_empty() {
-        return None;
-    }
-    let theta_seam = theta_of_vid(seam_segments[0].1)?;
-
-    // Split each straddling window's cyclic loop at its two seam vertices
-    // into a seam-negative and a seam-positive half-chain, each keyed by its
-    // (lower, upper) crossing vertices for the seam walks below.
-    struct HalfChain {
-        lower: VertexId,
-        upper: VertexId,
-        /// Edges ordered lower → upper.
-        edges: Vec<(EdgeId, bool)>,
-    }
-    let mut neg_chains: Vec<HalfChain> = Vec::new();
-    let mut pos_chains: Vec<HalfChain> = Vec::new();
-    for &wi in &straddlers {
-        let lp = &windows[wi].lp;
-        // Walk the cyclic loop, recording each traversal vertex.
-        let mut verts: Vec<VertexId> = Vec::with_capacity(lp.len());
-        for &(eid, fwd) in lp {
-            let e = model.edges.get(eid)?;
-            verts.push(if fwd { e.start_vertex } else { e.end_vertex });
-        }
-        // Seam vertices = walk vertices angularly ON the seam.
-        let on_seam: Vec<usize> = (0..verts.len())
-            .filter(|&i| {
-                theta_of_vid(verts[i])
-                    .map(|t| wrap_pm_pi(t - theta_seam).abs() <= band_ang)
-                    .unwrap_or(false)
-            })
-            .collect();
-        if on_seam.len() != 2 {
-            return None; // crossing vertices not materialised — refuse (DCEL)
-        }
-        let (i0, i1) = (on_seam[0], on_seam[1]);
-        let n = lp.len();
-        // Chain A: walk indices i0..i1; chain B: i1..i0 (cyclic).
-        let chain_of = |from: usize, to: usize| -> Vec<(EdgeId, bool)> {
-            let mut c = Vec::new();
-            let mut k = from;
-            while k != to {
-                c.push(lp[k]);
-                k = (k + 1) % n;
-            }
-            c
-        };
-        let build = |from: usize, to: usize| -> Option<(HalfChain, f64)> {
-            let edges = chain_of(from, to);
-            // Side sign from sampled arc interiors (must be consistent).
-            let mut side_acc = 0.0_f64;
-            for &(eid, fwd) in &edges {
-                let e = model.edges.get(eid)?;
-                let curve = model.curves.get(e.curve_id)?;
-                let (t0, t1) = if fwd {
-                    (e.param_range.start, e.param_range.end)
-                } else {
-                    (e.param_range.end, e.param_range.start)
-                };
-                for k in 1..8usize {
-                    let t = t0 + (t1 - t0) * (k as f64) / 8.0;
-                    let p = curve.point_at(t).ok()?;
-                    let d = p - origin;
-                    let th = d.dot(&u2).atan2(d.dot(&u1)).rem_euclid(two_pi);
-                    let off = wrap_pm_pi(th - theta_seam);
-                    if off.abs() > band_ang {
-                        side_acc += off.signum();
-                    }
-                }
-            }
-            let (sv, ev) = (verts[from], verts[to]);
-            let (va, vb_) = (axial_of_vid(sv)?, axial_of_vid(ev)?);
-            let hc = if va <= vb_ {
-                HalfChain {
-                    lower: sv,
-                    upper: ev,
-                    edges,
-                }
-            } else {
-                // Reverse to lower → upper order.
-                let edges_rev: Vec<(EdgeId, bool)> =
-                    edges.iter().rev().map(|&(e, f)| (e, !f)).collect();
-                HalfChain {
-                    lower: ev,
-                    upper: sv,
-                    edges: edges_rev,
-                }
-            };
-            Some((hc, side_acc))
-        };
-        let (chain_a, side_a) = build(i0, i1)?;
-        let (chain_b, side_b) = build(i1, i0)?;
-        if side_a * side_b >= 0.0 {
-            return None; // sides not cleanly separated — refuse (DCEL)
-        }
-        if side_a < 0.0 {
-            neg_chains.push(chain_a);
-            pos_chains.push(chain_b);
-        } else {
-            neg_chains.push(chain_b);
-            pos_chains.push(chain_a);
-        }
-    }
-
-    // Rim cycles: cluster rim edges into bottom/top by level, then walk a
-    // full circle from the seam corner (+θ on the bottom, −θ on the top) so
-    // the unrolled chart lays bottom 0→2π / top 2π→0 with the ascent at the
-    // 2π border and the descent at 0 (matching the half-chain side split).
-    seam_segments.sort_by(|a, b| a.3.partial_cmp(&b.3).unwrap_or(std::cmp::Ordering::Equal));
-    let vb0 = seam_segments.first().map(|s| s.1)?;
-    let vt0 = seam_segments.last().map(|s| s.2)?;
-    let mid_level = 0.5 * (face_v_lo + face_v_hi);
-    let mut bottom_adj: HashMap<VertexId, Vec<(VertexId, EdgeId)>> = HashMap::new();
-    let mut top_adj: HashMap<VertexId, Vec<(VertexId, EdgeId)>> = HashMap::new();
-    for &(eid, sv, ev, level) in &rim_edges {
-        let adj = if level < mid_level {
-            &mut bottom_adj
-        } else {
-            &mut top_adj
-        };
-        adj.entry(sv).or_default().push((ev, eid));
-        adj.entry(ev).or_default().push((sv, eid));
-    }
-    let oriented = |eid: EdgeId, from: VertexId| -> Option<(EdgeId, bool)> {
-        let e = model.edges.get(eid)?;
-        if e.start_vertex == from {
-            Some((eid, true))
-        } else if e.end_vertex == from {
-            Some((eid, false))
-        } else {
-            None
-        }
-    };
-    // Walk a full rim circle from `start` back to `start`, choosing at each
-    // step the neighbour with the smallest positive θ-gap in `dir` (+1 CCW,
-    // −1 CW).
-    let walk_rim_cycle = |start: VertexId,
-                          adj: &HashMap<VertexId, Vec<(VertexId, EdgeId)>>,
-                          dir: f64|
-     -> Option<Vec<(EdgeId, bool)>> {
-        let mut out: Vec<(EdgeId, bool)> = Vec::new();
-        let mut cur = start;
-        let mut prev: Option<VertexId> = None;
-        let limit = adj.len() + 4;
-        loop {
-            let cur_th = theta_of_vid(cur)?;
-            let neighbours = adj.get(&cur)?;
-            let mut best: Option<(f64, VertexId, EdgeId)> = None;
-            for &(nb, eid) in neighbours.iter() {
-                if Some(nb) == prev && neighbours.len() > 1 {
-                    continue;
-                }
-                let gap = (dir * (theta_of_vid(nb)? - cur_th)).rem_euclid(two_pi);
-                let gap = if gap <= 1.0e-9 { two_pi } else { gap };
-                if best.map_or(true, |(g, _, _)| gap < g) {
-                    best = Some((gap, nb, eid));
-                }
-            }
-            let (_, nb, eid) = best?;
-            out.push(oriented(eid, cur)?);
-            prev = Some(cur);
-            cur = nb;
-            if cur == start {
-                return Some(out);
-            }
-            if out.len() > limit {
-                return None;
-            }
-        }
-    };
-    let bottom_cycle = walk_rim_cycle(vb0, &bottom_adj, 1.0)?;
-    let top_cycle = walk_rim_cycle(vt0, &top_adj, -1.0)?;
-
-    // Seam ascent (vb0 → vt0) splicing negative half-chains; descent
-    // (vt0 → vb0) splicing positive ones. At every junction exactly one
-    // upward/downward continuation exists (the T-junction pre-split ends
-    // each seam segment exactly at a window crossing vertex); in-window
-    // seam segments are never reached and drop out.
-    let climb = |start: VertexId,
-                 end: VertexId,
-                 upward: bool,
-                 chains: &[HalfChain]|
-     -> Option<Vec<(EdgeId, bool)>> {
-        let mut out: Vec<(EdgeId, bool)> = Vec::new();
-        let mut cur = start;
-        let limit = seam_segments.len() + chains.len() + 4;
-        let mut steps = 0usize;
-        while cur != end {
-            steps += 1;
-            if steps > limit {
-                return None;
-            }
-            // Window half-chain first (it owns the crossing vertex).
-            if let Some(hc) = chains.iter().find(|hc| {
-                if upward {
-                    hc.lower == cur
-                } else {
-                    hc.upper == cur
-                }
-            }) {
-                if upward {
-                    out.extend(hc.edges.iter().copied());
-                    cur = hc.upper;
-                } else {
-                    out.extend(hc.edges.iter().rev().map(|&(e, f)| (e, !f)));
-                    cur = hc.lower;
-                }
-                continue;
-            }
-            let seg = seam_segments
-                .iter()
-                .find(|s| if upward { s.1 == cur } else { s.2 == cur })?;
-            if upward {
-                out.push(oriented(seg.0, seg.1)?);
-                cur = seg.2;
-            } else {
-                out.push(oriented(seg.0, seg.2)?);
-                cur = seg.1;
-            }
-        }
-        Some(out)
-    };
-    let ascent = climb(vb0, vt0, true, &neg_chains)?;
-    let descent = climb(vt0, vb0, false, &pos_chains)?;
-
-    let mut outer: Vec<(EdgeId, bool)> =
-        Vec::with_capacity(bottom_cycle.len() + ascent.len() + top_cycle.len() + descent.len());
-    outer.extend(bottom_cycle);
-    outer.extend(ascent);
-    outer.extend(top_cycle);
-    outer.extend(descent);
+    // Every straddling window is absorbed into the outer boundary by the
+    // shared detour builder; the in-window seam segments drop out of the walk.
+    let straddling_loops: Vec<Vec<(EdgeId, bool)>> = straddlers
+        .iter()
+        .filter_map(|&i| windows.get(i).map(|w| w.lp.clone()))
+        .collect();
+    let outer = detour_outer_around_seam_straddlers(model, &chart, &bnd, &straddling_loops)?;
 
     let inner_hole_loops: Vec<Vec<(EdgeId, bool)>> = windows
         .iter()

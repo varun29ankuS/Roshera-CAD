@@ -176,10 +176,25 @@ fn cut_wall(model: &mut BRepModel, seam: bool) -> (SolidId, u32) {
     let walls = faces_of_kind(model, cut, "Cylinder");
     assert_eq!(walls.len(), 1, "one wall face expected, got {walls:?}");
     let wall = walls[0];
+    // Fixture precondition -- and, for the seam arm, the re-cut gate.
+    //
+    // Task 34 corrected the B-Rep the boolean emits here: a window that
+    // STRADDLES the seam is absorbed into the wall's OUTER loop (the outer
+    // boundary detours around it and the in-window seam segment drops out), so
+    // it is no longer an inner loop. A window clear of the seam still is one.
+    //
+    // Zero inner loops is also exactly what makes the branch RE-CUT below
+    // unreachable for the seam case: that arm is entered only on an `Err` from
+    // `align_inner_loops`, whose only failure sources are the projection and
+    // validation of an INNER loop, and a face with none returns `Ok(vec![])`.
+    // Same argument as
+    // `a_hole_free_cylinder_meshes_identically_and_never_reaches_the_re_cut`,
+    // stated here on the cut wall instead of the untouched cylinder.
+    let expected_inner = usize::from(!seam);
     assert_eq!(
         model.faces.get(wall).expect("wall").inner_loops.len(),
-        1,
-        "fixture precondition: the window must appear as ONE inner loop"
+        expected_inner,
+        "fixture precondition: a seam-straddling window is absorbed into the outer loop (0 inner loops); an off-seam one stays ONE inner loop"
     );
     (cut, wall)
 }
@@ -555,5 +570,248 @@ fn a_cross_bore_breaking_out_on_the_seam_cuts_both_its_holes() {
         near.is_empty(),
         "a ray down the bore axis hit the near wall {} time(s) at t = {near:?}",
         near.len()
+    );
+}
+
+// --- successive cuts: the mesh must never claim material that was removed ---
+
+/// A window box aimed along `(dx, dy)`, centred at height `z`, `h` mm tall.
+///
+/// Same shape as [`seam_window`] / [`off_seam_window`], parameterised so a
+/// sequence of cuts can be driven around the wall at chosen heights.
+fn window_at(model: &mut BRepModel, dx: f64, dy: f64, z: f64, h: f64) -> SolidId {
+    let (lx, ly) = if dx.abs() > 0.5 {
+        (30.0, 2.0 * WIN_HALF)
+    } else {
+        (2.0 * WIN_HALF, 30.0)
+    };
+    let id = match TopologyBuilder::new(model).create_box_3d(lx, ly, h) {
+        Ok(GeometryId::Solid(id)) => id,
+        other => panic!("expected solid, got {other:?}"),
+    };
+    transform_solid(
+        model,
+        id,
+        Matrix4::from_translation(&Vector3::new(dx * 15.0, dy * 15.0, z)),
+        TransformOptions::default(),
+    )
+    .expect("translate window");
+    id
+}
+
+/// **The wall's mesh must never report more area than the material that
+/// survives -- and when the tessellator cannot mesh what survives, it must
+/// emit NOTHING rather than the untouched wall.**
+///
+/// Cutting windows one boolean at a time compounds the trim on a single face:
+/// the first (seam-straddling) window becomes an OUTER-loop detour (Task 34),
+/// and the second arrives as an inner loop on top of it. Measured at
+/// `f4eaa2e8` AS COMMITTED -- neither the Task 34 boolean fix nor Task 34b's
+/// tessellator change -- with three windows 90 degrees apart at z = 3, 7, 11:
+///
+/// ```text
+///   cut 1: wall meshes 1238.1582 mm2                                 correct
+///   cut 2: curved_cdt CdtFailed(CrossingFixedEdge) -> UNTRIMMED grid
+///          wall meshes 1256.4304 mm2 -- the FULL untouched wall       A LIE
+///   cut 3: same, 1256.4304 mm2                                        A LIE
+/// ```
+///
+/// With the Task 34 boolean fix and 34b: cut 1 meshes 1238.1911, cut 2 meshes
+/// 1219.8815 (both windows present, certificate sound), and cut 3 -- which the
+/// CDT still cannot seat -- REFUSES (`PointOnFixedEdge`, no mesh emitted) so
+/// the wall is absent, the shell reads open and `certify_solid` says so.
+/// Absent is recoverable; "the full wall, three windows cut" is not.
+///
+/// **The cut-3 half of this test is CONTINGENT, and a future fix must not
+/// silently hollow it out.** Cut 3 refuses only because the main Steiner grid
+/// keeps candidates off every INNER polygon edge but not off the OUTER one
+/// (`curved_cdt.rs`, the `near_inner_edge` keepout and the bbox-boundary skip),
+/// so a detoured outer loop still collides and the CDT reports
+/// `PointOnFixedEdge`. Closing that gap with a `near_outer_edge` keepout would
+/// make cut 3 MESH -- at which point this test still passes, but it no longer
+/// exercises the refusal at all. Whoever lands that fix owes this suite a
+/// replacement fixture that still reaches the refusal, or the refusal returns
+/// to being pinned by its source gate alone.
+///
+/// The ceiling below is the load-bearing assertion and it is deliberately
+/// generous (10% of the removed area) -- it is not measuring meshing accuracy,
+/// it is refusing to accept a wall that claims removed material. Cuts 1 and 2
+/// additionally pin that the wall is genuinely THERE, so "refuse everything" is
+/// not a way to pass this test.
+#[test]
+fn successive_window_cuts_never_mesh_material_that_was_removed() {
+    let full = 2.0 * std::f64::consts::PI * CYL_R * CYL_H;
+    // Chord half-angle of a |y| <= 3 box through a r=10 wall, times a 3 mm
+    // window height: the lateral area one window removes.
+    let win = 2.0 * CYL_R * (WIN_HALF / CYL_R).asin() * 3.0;
+
+    let mut model = BRepModel::new();
+    let mut cur = cylinder(&mut model, CYL_R, CYL_H);
+    for (k, &(dx, dy, z)) in [(1.0, 0.0, 3.0), (0.0, 1.0, 7.0), (-1.0, 0.0, 11.0)]
+        .iter()
+        .enumerate()
+    {
+        let tool = window_at(&mut model, dx, dy, z, 3.0);
+        cur = boolean_operation(
+            &mut model,
+            cur,
+            tool,
+            BooleanOp::Difference,
+            BooleanOptions::default(),
+        )
+        .expect("difference");
+        let cuts = (k + 1) as f64;
+        let (area, tris) = outer_wall_area(&model, cur);
+        println!(
+            "cut {}: wall_tris={tris} wall_area={area:.4} ceiling={:.4} full={full:.4}",
+            k + 1,
+            full - 0.9 * cuts * win
+        );
+        assert!(
+            area <= full - 0.9 * cuts * win,
+            concat!(
+                "after {} window cut(s) the wall meshes {:.4} mm2, which is more than the ",
+                "{:.4} mm2 that can survive -- the mesh is claiming material the booleans ",
+                "removed (the untrimmed-grid fallback re-covering the windows)"
+            ),
+            k + 1,
+            area,
+            full - 0.9 * cuts * win
+        );
+        if k < 2 {
+            let expect = full - cuts * win;
+            assert!(
+                (area - expect).abs() <= 0.01 * expect,
+                concat!(
+                    "after {} window cut(s) the wall must still be MESHED, within 1% of ",
+                    "{:.4} mm2; got {:.4} mm2 (0 means the tessellator refused a face it ",
+                    "used to be able to mesh -- a refusal is not a licence to drop walls)"
+                ),
+                k + 1,
+                expect,
+                area
+            );
+        }
+    }
+}
+
+/// **Task 35, pinned RED and `#[ignore]`d: a second window cut at the SAME
+/// height is not removed, and the FIRST window's lateral patch is re-emitted
+/// as its own face.**
+///
+/// `#[ignore]` because the fix is a boolean change (the face-drop
+/// classification in `split_cylinder_lateral_by_window`'s complement/patch
+/// pair) that Task 34b was explicitly scoped out of. Run it with
+/// `cargo test -p geometry-engine --test tessellated_window -- --ignored
+/// --nocapture a_second_window`. It replaces the throwaway probe binary Task
+/// 34b used to measure this, so the numbers in that report stay reproducible.
+///
+/// Measured after cut 2 (+X at u=0 then +Y at u=pi/2, both z in [6,14]):
+///
+/// ```text
+///   WITH the Task 34 boolean fix:  face23 1448 tris 1207.7484 (theta -180..180)
+///                                  face24  364 tris   48.7506 (theta ~0, the +X patch)
+///   WITHOUT it (f4eaa2e8 as committed, 34b tessellator only):
+///                                  face23 1448 tris 1207.7484
+///                                  face24   62 tris   24.3753  (theta ~ +8.7)
+///                                  face25   62 tris   24.3753  (theta ~ -8.7)
+///   both:  total 1256.4990 = the FULL wall;  boundary_edges=12
+///          nonmanifold=126;  certify_solid().is_sound() == false
+/// ```
+///
+/// The two 24.3753 faces are the ONE +X patch halved by the seam at `u = 0`,
+/// which is why only the seam-straddling window splits in two; the +Y window
+/// at `u = pi/2` has no seam to halve it. So the re-emitted material is the
+/// FIRST window's, and the +Y window was never cut at all -- which is what the
+/// two ray assertions below separate. The kernel does not lie about the
+/// result: the certificate reads unsound.
+#[test]
+#[ignore = "pinned RED (Task 35): a second same-height window is not cut, and the first window's patch is re-emitted as its own face"]
+fn a_second_window_at_the_same_height_is_cut_and_the_first_is_not_re_emitted() {
+    let full = 2.0 * std::f64::consts::PI * CYL_R * CYL_H;
+    let win = 2.0 * CYL_R * (WIN_HALF / CYL_R).asin() * (WIN_Z_HI - WIN_Z_LO);
+    let z_mid = 0.5 * (WIN_Z_LO + WIN_Z_HI);
+    let h = WIN_Z_HI - WIN_Z_LO;
+
+    let mut model = BRepModel::new();
+    let mut cur = cylinder(&mut model, CYL_R, CYL_H);
+    for &(dx, dy) in &[(1.0, 0.0), (0.0, 1.0)] {
+        let tool = window_at(&mut model, dx, dy, z_mid, h);
+        cur = boolean_operation(
+            &mut model,
+            cur,
+            tool,
+            BooleanOp::Difference,
+            BooleanOptions::default(),
+        )
+        .expect("difference");
+    }
+
+    // Per-face breakdown, with the mean angular position that identifies WHICH
+    // window a face's material belongs to.
+    for fid in faces_of_kind(&model, cur, "Cylinder") {
+        let tris = wall_triangles(&model, cur, fid);
+        let inner = model.faces.get(fid).expect("face").inner_loops.len();
+        let (mut sx, mut sy) = (0.0f64, 0.0f64);
+        for t in &tris {
+            let cx = (t[0].x + t[1].x + t[2].x) / 3.0;
+            let cy = (t[0].y + t[1].y + t[2].y) / 3.0;
+            let a = cy.atan2(cx);
+            sx += a.cos();
+            sy += a.sin();
+        }
+        // Circular mean and resultant length. A full-wrap wall averages to
+        // theta ~ 0 with resultant ~ 0 (its directions cancel); a narrow patch
+        // has resultant ~ 1 and its mean theta NAMES the window whose material
+        // it is (0 deg = +X, 90 deg = +Y).
+        let n = tris.len().max(1) as f64;
+        println!(
+            "face{fid}: inner_loops={inner} tris={} area={:.4} mean_theta={:.1}deg resultant={:.3}",
+            tris.len(),
+            area_of(&tris),
+            sy.atan2(sx).to_degrees(),
+            (sx * sx + sy * sy).sqrt() / n
+        );
+    }
+    let (area, tris) = outer_wall_area(&model, cur);
+    let report = manifold_report(&model, cur, 0.02, 1e-6).expect("the cut solid must mesh");
+    let cert = model.certify_solid(cur);
+    println!(
+        "TOTAL wall_tris={tris} wall_area={area:.4} full={full:.4} expected={:.4}",
+        full - 2.0 * win
+    );
+    println!(
+        "boundary_edges={} nonmanifold={} cert_sound={}",
+        report.boundary_edges,
+        report.nonmanifold_edges,
+        cert.is_sound()
+    );
+
+    // The +Y window was never cut: a ray down its axis still hits the wall.
+    for &(dx, dy) in &[(1.0, 0.0), (0.0, 1.0)] {
+        let origin = Point3::new(dx * 40.0, dy * 40.0, z_mid);
+        let dir = Vector3::new(-dx, -dy, 0.0);
+        let hits: Vec<f64> = faces_of_kind(&model, cur, "Cylinder")
+            .into_iter()
+            .flat_map(|fid| wall_triangles(&model, cur, fid))
+            .filter_map(|t| ray_hits(&t, origin, dir))
+            .filter(|&t| t < 40.0)
+            .collect();
+        assert!(
+            hits.is_empty(),
+            concat!(
+                "a ray through the window at direction ({}, {}) hit the wall {} time(s) at ",
+                "t = {:?} -- that window's material is still in the mesh"
+            ),
+            dx,
+            dy,
+            hits.len(),
+            hits
+        );
+    }
+    assert!(
+        (area - (full - 2.0 * win)).abs() <= 0.01 * (full - 2.0 * win),
+        "two windows cut: wall meshes {area:.4} mm2, expected {:.4} mm2",
+        full - 2.0 * win
     );
 }
