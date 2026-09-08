@@ -412,8 +412,12 @@ pub fn boolean_operation(
             }
         }
 
-        // Step 2: Split faces along intersection curves
-        let split_faces =
+        // Step 2: Split faces along intersection curves. The second return is
+        // Task 47's tangential-contact witness: `Some` when one operand face
+        // pair's own intersection came back as a DOUBLED curve, which is the
+        // signature of a non-transversal (tangential) contact. It is consumed
+        // after the result is built, at `tangential_contact` below.
+        let (split_faces, tangential_contacts) =
             split_faces_along_curves(model, &intersections, solid_a, solid_b, &options)?;
         pipeline_trace(format_args!(
             "stage=split_faces_along_curves fragments={}",
@@ -732,6 +736,40 @@ pub fn boolean_operation(
                 PrunedKind::Shell | PrunedKind::Solid => None,
             })
             .collect();
+
+        // TANGENTIAL-CONTACT post-condition (Task 47). Step 2 witnesses a
+        // DOUBLED intersection curve inside one face pair — the algebraic
+        // signature of operands that TOUCH along a locus instead of crossing
+        // it. A tangency is not by itself a failure: the same box and post,
+        // with the post contained in the box's z-extent, unions and intersects
+        // SOUND (euler=2), because there the contact is interior and the single
+        // cut the #32 Phase B dedup leaves behind is the right answer. It goes
+        // wrong only when the tangent locus reaches a free boundary, where the
+        // solid pinches — the protruding post of the Task 45 fixture, unsound
+        // under union AND intersection.
+        //
+        // Whether a given tangency is benign is therefore a fact about the
+        // BUILT RESULT, and the kernel already computes that fact. So the
+        // witness does not refuse; it scopes WHERE the certificate is allowed
+        // to. Read here, after the operand husks are retired and the orphan
+        // prune has run, so the certificate is the same one the caller would
+        // see, and before `record_operation`, so a refusal emits no event.
+        //
+        // Deliberately NOT a general "refuse every unsound boolean" gate: with
+        // no tangency witness nothing is consulted, so the #27 chained-union
+        // family and the other tracked Ok-but-unsound lanes keep returning what
+        // they return and stay measurable. `with_rollback` restores both
+        // operands on the `Err` path, so a refused tangential boolean leaves
+        // the model exactly as it found it.
+        if !tangential_contacts.is_empty() {
+            let certificate = model.certify_solid(result_solid);
+            if !certificate.is_sound() {
+                return Err(OperationError::InvalidBRep(tangential_contact_refusal(
+                    &tangential_contacts,
+                    &certificate,
+                )));
+            }
+        }
 
         // Record the successful operation for attached recorders, now that
         // both the operand retirement and the orphan-prune sweep have
@@ -5089,7 +5127,78 @@ fn split_faces_along_curves(
     solid_a: SolidId,
     solid_b: SolidId,
     options: &BooleanOptions,
-) -> OperationResult<Vec<SplitFace>> {
+) -> OperationResult<(Vec<SplitFace>, Vec<TangentialContact>)> {
+    // TANGENTIAL-CONTACT WITNESS (Task 47). The scan reads `intersections`, the
+    // IMMUTABLE input slice, which the routing loop and the #32 Phase B dedup
+    // below only ever COPY curve ids out of — neither mutates it. So the witness
+    // sees each pair's own solution set as the SSI produced it, whatever the
+    // dedup later does to the per-target-face cut lists. Its position ahead of
+    // the loop is for reading order, not for correctness.
+    //
+    // A doubled intersection curve WITHIN ONE face pair is the algebraic
+    // signature of a DOUBLE ROOT: the two surfaces touch along that locus
+    // without crossing it. `create_cylinder_parallel_intersection_lines` makes
+    // this literal — at exact tangency `chord_half_angle = acos(d/r) = acos(1)
+    // = 0`, so `offset1 == offset2` and the two chord generators collapse onto
+    // the same line.
+    //
+    // The discriminator against the #32 Phase B duplicate below is the SOURCE
+    // PAIR, and it is exact: #32's duplicate circle is routed onto the shared
+    // cutter face by TWO DIFFERENT face pairs (each coplanar source fragment
+    // meets the same cutter rim, curves 36 ≡ 37 from pairs (frag1, cutter) and
+    // (frag2, cutter)); a tangency is TWO COINCIDENT CURVES FROM A SINGLE PAIR.
+    // Phase B's per-target-face dedup cannot tell them apart, so it collapses
+    // the doubled tangent generator to a single cut — and the arrangement then
+    // produces one oversized component that the polyhedral `< 4 faces` guard in
+    // `build_shells_from_faces` never inspects. That is how a typed refusal
+    // became `Ok` carrying an open, non-manifold shell.
+    //
+    // This is a WITNESS, NOT a refusal, because the collapse is not always
+    // wrong. Measured on the same box and post: a CONTAINED tangent post (the
+    // post wholly inside the box's z-extent) unions and intersects SOUND
+    // (euler=2) — the tangency is interior contact and the single cut is the
+    // right answer — while the PROTRUDING post of the Task 45 fixture goes
+    // unsound under both union and intersection, because there the tangent
+    // locus reaches a free boundary and the solid pinches. Whether a tangency
+    // is benign is a fact about the built result, so the witness only SCOPES
+    // where `boolean_operation` is allowed to consult the certificate; the
+    // certificate makes the call. Refusing here on the witness alone would
+    // regress those two sound configurations.
+    //
+    // Only the proper-crossing meet curves are scanned. The per-face coplanar
+    // imprint cuts (`coplanar_curves_a` / `_b`) are boundary segments of the
+    // OPPOSITE face, not roots of a surface-surface system, so a repeat there
+    // carries no tangency meaning.
+    //
+    // Pairs whose tangent locus falls outside either trimmed face never reach
+    // here: the doubled generator is clipped away by `clip_line_to_planar_face`
+    // upstream and the pair arrives with zero or one curve, so a cylinder
+    // merely tangent to a wall's INFINITE plane, away from the face, produces
+    // no witness. Skipped entirely under `allow_non_manifold`, exactly as the
+    // sibling shell guard in `build_shells_from_faces` is: a caller who has
+    // opted into non-manifold output gets the open shell it asked for.
+    //
+    // EVERY tangent pair is collected, not just the first. The Task 45 fixture is
+    // tangent at TWO loci (the -x wall and the -y wall), and a refusal that named
+    // one of them would under-report the geometry the caller has to fix.
+    let mut tangential_contacts: Vec<TangentialContact> = Vec::new();
+    if !options.allow_non_manifold {
+        let tangency_tol = options.common.tolerance.distance();
+        for intersection in intersections {
+            if let Some((first, second)) =
+                tangential_double_curve(model, intersection, tangency_tol)
+            {
+                tangential_contacts.push(TangentialContact {
+                    face_a: intersection.face_a_id,
+                    face_b: intersection.face_b_id,
+                    first,
+                    second,
+                    tolerance: tangency_tol,
+                });
+            }
+        }
+    }
+
     let mut split_faces = Vec::new();
     let mut face_curves: HashMap<FaceId, (SolidId, Vec<CurveId>)> = HashMap::new();
 
@@ -5364,7 +5473,7 @@ fn split_faces_along_curves(
         surface_type_histogram(model, &split_faces),
     );
 
-    Ok(split_faces)
+    Ok((split_faces, tangential_contacts))
 }
 
 /// Push every face of `solid` that is not in `intersected` into `out` as a
@@ -10222,6 +10331,175 @@ fn curves_geometrically_coincident(model: &BRepModel, a: CurveId, b: CurveId, to
     let forward = (0..n).all(|i| dist2(&pa[i], &pb[i]) < tol2);
     let reversed = (0..n).all(|i| dist2(&pa[i], &pb[n - 1 - i]) < tol2);
     forward || reversed
+}
+
+/// A TANGENTIAL contact found between two operand faces (Task 47): the pair,
+/// and the two coincident branches of its doubled intersection curve that
+/// witness the double root.
+///
+/// Carried out of `split_faces_along_curves` rather than acted on there. A
+/// tangency is not by itself a failure — a contained tangent post unions and
+/// intersects soundly — so this only tells `boolean_operation` that the result
+/// is one whose certificate must be believed before it is returned.
+#[derive(Debug, Clone, Copy)]
+struct TangentialContact {
+    face_a: FaceId,
+    face_b: FaceId,
+    first: CurveId,
+    second: CurveId,
+    /// The distance tolerance the coincidence was measured at, reported in the
+    /// refusal so the caller can see how tight the finding is.
+    tolerance: f64,
+}
+
+/// The `is_sound()` conjuncts this certificate FAILS, each named as it is
+/// written on the certificate (Task 47).
+///
+/// `ValidityCertificate::is_sound` is a conjunction of NINE terms; every one of
+/// them is reachable, so a refusal that quotes a hardcoded subset can print
+/// `true`s beside the word UNSOUND and leave the real failure unnamed. This
+/// walks all nine and reports only what actually failed. `euler_characteristic`
+/// is deliberately absent: it is a readout, not a conjunct, and a caller reading
+/// it in a failure list would take it for one. Never empty at a call site
+/// guarded by `!is_sound()`, but a defensive marker covers the impossible case
+/// rather than emitting an empty parenthesis.
+fn unsound_dimensions(
+    certificate: &crate::primitives::provenance::ValidityCertificate,
+) -> Vec<String> {
+    let mut failed: Vec<String> = Vec::new();
+    if !certificate.brep_valid {
+        failed.push("brep_valid=false".to_string());
+    }
+    if !certificate.watertight {
+        failed.push("watertight=false".to_string());
+    }
+    if !certificate.manifold {
+        failed.push("manifold=false".to_string());
+    }
+    if !certificate.oriented {
+        failed.push("oriented=false".to_string());
+    }
+    if !certificate.self_intersection_free {
+        failed.push("self_intersection_free=false".to_string());
+    }
+    if !certificate.construction_consistent.is_sound() {
+        failed.push(format!(
+            "construction_consistent={}",
+            certificate.construction_consistent.label(),
+        ));
+    }
+    if !certificate.eyes_consistent.is_sound() {
+        failed.push(format!(
+            "eyes_consistent={}",
+            certificate.eyes_consistent.label(),
+        ));
+    }
+    if !certificate.tessellation.clean {
+        failed.push("tessellation.clean=false".to_string());
+    }
+    if !certificate.mesh_quality.clean {
+        failed.push("mesh_quality.clean=false".to_string());
+    }
+    if failed.is_empty() {
+        failed.push("no is_sound conjunct failed".to_string());
+    }
+    failed
+}
+
+/// The refusal text for a tangential contact whose result certified unsound
+/// (Task 47). Extracted from the call site so the SHAPE of the message can be
+/// unit-tested against synthetic certificates: the message asserts things about
+/// the geometry, and an assertion its own evidence contradicts is the class of
+/// lie this kernel exists to not tell.
+fn tangential_contact_refusal(
+    contacts: &[TangentialContact],
+    certificate: &crate::primitives::provenance::ValidityCertificate,
+) -> String {
+    let witnesses: Vec<String> = contacts
+        .iter()
+        .map(|c| {
+            format!(
+                "faces {} and {} (curves {} and {})",
+                c.face_a, c.face_b, c.first, c.second
+            )
+        })
+        .collect();
+    let tolerance = contacts.first().map(|c| c.tolerance).unwrap_or(0.0);
+    let mut sentences: Vec<String> = Vec::new();
+    sentences.push(format!(
+        concat!(
+            "boolean_operation: {} operand face pair(s) meet TANGENTIALLY, not ",
+            "transversally: each one's own surface-surface intersection came back as a ",
+            "doubled curve, the signature of a double root. Witnesses, coincident to ",
+            "within {:.3e}: {}."
+        ),
+        contacts.len(),
+        tolerance,
+        witnesses.join("; "),
+    ));
+    sentences.push(format!(
+        "The solid built from that contact certifies UNSOUND ({}).",
+        unsound_dimensions(certificate).join(" "),
+    ));
+    // The manifold-boundary reading is a CAUSAL claim, so it is stated only when
+    // the evidence carries it: a tangency that closes a manifold, watertight
+    // shell and fails on, say, mesh quality is a different defect, and asserting
+    // a pinch there would be a claim the certificate beside it contradicts.
+    if !certificate.manifold || !certificate.watertight {
+        sentences.push(
+            concat!(
+                "The operands touch along a locus the result cannot represent as a ",
+                "manifold boundary."
+            )
+            .to_string(),
+        );
+    }
+    sentences.push(
+        concat!(
+            "Refused rather than returned (set allow_non_manifold=true to accept the ",
+            "shell as built)"
+        )
+        .to_string(),
+    );
+    sentences.join(" ")
+}
+
+/// Tangency witness for ONE face pair (Task 47): the first two of the pair's
+/// own meet curves that are geometrically coincident, if any.
+///
+/// A surface-surface system whose solution set carries a curve with
+/// MULTIPLICITY TWO is a tangential (non-transversal) contact — the operands
+/// touch along the locus instead of crossing it. The kernel's analytic
+/// producers emit that multiplicity literally as two coincident curves: the
+/// plane-cylinder parallel branch computes `chord_half_angle = acos(d/r)`,
+/// which is `0` at exact tangency, so both chord generators land on the same
+/// line (`create_cylinder_parallel_intersection_lines`).
+///
+/// The scan is deliberately PER PAIR. Two coincident curves reaching the same
+/// TARGET FACE from two DIFFERENT pairs is the ordinary #32 straddling-rim
+/// routing duplicate, which `split_faces_along_curves`'s Phase B dedup
+/// correctly collapses; only a repeat inside one pair's own solution set means
+/// tangency. Coplanar imprint cuts are excluded for the same reason — they are
+/// boundary segments of the opposite face, not roots of a surface system.
+///
+/// `tol` is the boolean's own distance tolerance, threaded from
+/// `options.common.tolerance`, and the coincidence test is the shared
+/// [`curves_geometrically_coincident`] 5-sample scheme, so two genuinely
+/// distinct chord generators separated by at least `tol` are never read as a
+/// tangency.
+fn tangential_double_curve(
+    model: &BRepModel,
+    fi: &FaceIntersection,
+    tol: f64,
+) -> Option<(CurveId, CurveId)> {
+    for (i, first) in fi.curves.iter().enumerate() {
+        for second in fi.curves.iter().skip(i + 1) {
+            if curves_geometrically_coincident(model, first.curve_id, second.curve_id, tol) {
+                return Some((first.curve_id, second.curve_id));
+            }
+        }
+    }
+    None
 }
 
 fn drop_pair_curves_in_preexisting_holes(model: &BRepModel, fi: &mut FaceIntersection) {
@@ -21429,6 +21707,109 @@ mod tests {
     use crate::math::{Point3, Tolerance, Vector3};
     use crate::primitives::surface::{Cylinder, Plane, Sphere};
     use crate::primitives::topology_builder::{BRepModel, TopologyBuilder};
+
+    /// Task 47 -- the tangency refusal must name the dimensions that ACTUALLY
+    /// failed, not a fixed five.
+    ///
+    /// `ValidityCertificate::is_sound()` is a conjunction of NINE terms
+    /// (brep_valid, watertight, manifold, oriented, self_intersection_free,
+    /// construction_consistent, eyes_consistent, tessellation.clean,
+    /// mesh_quality.clean). A refusal that quotes only four of them plus the
+    /// Euler number -- which is NOT one of the conjuncts -- can print five
+    /// `true`s next to the word UNSOUND and then assert a cause ("cannot
+    /// represent as a manifold boundary") that its own evidence contradicts.
+    /// That is exactly the class of statement this kernel exists not to make.
+    ///
+    /// The synthetic certificate here fails on ONE conjunct the old message
+    /// never quoted, so it is RED against a fixed-five formatter and green only
+    /// against one that reports the real failure set.
+    #[test]
+    fn tangency_refusal_names_only_the_conjuncts_that_failed() {
+        let contacts = [TangentialContact {
+            face_a: 2,
+            face_b: 8,
+            first: 17,
+            second: 18,
+            tolerance: 1e-6,
+        }];
+        let mut cert = crate::primitives::provenance::ValidityCertificate::fully_sound_for_test();
+        cert.mesh_quality.clean = false;
+        assert!(!cert.is_sound(), "fixture must be unsound to be refusable");
+
+        let msg = tangential_contact_refusal(&contacts, &cert);
+
+        assert!(
+            msg.contains("mesh_quality.clean=false"),
+            "the failing conjunct must be named: {msg}"
+        );
+        for sound_term in [
+            "brep_valid=false",
+            "watertight=false",
+            "manifold=false",
+            "oriented=false",
+            "self_intersection_free=false",
+        ] {
+            assert!(
+                !msg.contains(sound_term),
+                "must not report {sound_term} on a certificate where it is true: {msg}"
+            );
+        }
+        assert!(
+            !msg.contains("manifold boundary"),
+            "the manifold-boundary cause must not be asserted when manifold and watertight both hold: {msg}"
+        );
+        assert!(!msg.contains("  "), "doubled spaces in message: {msg}");
+        assert!(msg.is_ascii(), "message must be ASCII: {msg}");
+    }
+
+    /// The other side of the same rule: when the manifold/watertight dimensions
+    /// ARE the ones that failed -- the Task 45 fixture's real certificate -- the
+    /// refusal names them, states the manifold-boundary cause it has earned, and
+    /// names EVERY witness pair rather than the first.
+    #[test]
+    fn tangency_refusal_states_the_cause_it_earned_and_names_every_witness() {
+        let contacts = [
+            TangentialContact {
+                face_a: 2,
+                face_b: 8,
+                first: 17,
+                second: 18,
+                tolerance: 1e-6,
+            },
+            TangentialContact {
+                face_a: 4,
+                face_b: 8,
+                first: 19,
+                second: 20,
+                tolerance: 1e-6,
+            },
+        ];
+        let mut cert = crate::primitives::provenance::ValidityCertificate::fully_sound_for_test();
+        cert.brep_valid = false;
+        cert.watertight = false;
+        cert.manifold = false;
+        cert.oriented = false;
+
+        let msg = tangential_contact_refusal(&contacts, &cert);
+
+        assert!(msg.contains("TANGENTIALLY"), "{msg}");
+        assert!(msg.contains("brep_valid=false"), "{msg}");
+        assert!(msg.contains("manifold=false"), "{msg}");
+        assert!(
+            msg.contains("manifold boundary"),
+            "the cause IS earned here and must be stated: {msg}"
+        );
+        assert!(
+            !msg.contains("mesh_quality.clean=false"),
+            "must not report a conjunct that holds: {msg}"
+        );
+        assert!(
+            msg.contains("faces 2 and 8") && msg.contains("faces 4 and 8"),
+            "both tangent loci must be named, not just the first: {msg}"
+        );
+        assert!(!msg.contains("  "), "doubled spaces in message: {msg}");
+        assert!(msg.is_ascii(), "message must be ASCII: {msg}");
+    }
     /// Task #55 — the boolean's general SSI marcher must reach a large feature.
     ///
     /// The deleted duplicate marcher stepped a fixed `tolerance × 10` chord with
