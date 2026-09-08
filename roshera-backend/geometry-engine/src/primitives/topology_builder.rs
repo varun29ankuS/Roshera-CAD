@@ -27,6 +27,21 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
+/// Chord tolerance the CERTIFICATE tessellates at when it computes the
+/// `oriented` / `watertight` / `manifold` mesh dimensions
+/// ([`BRepModel::compute_certificate_with_labels`]).
+///
+/// Shared rather than duplicated as a literal: `operations::loft`'s post-mint
+/// mesh-orientation check calls `manifold_report` with these same two numbers
+/// so that a loft can never mint a solid whose certificate would then read
+/// `oriented = false`. That equality is the whole point of the check, and it
+/// held only by coincidence while each site carried its own literal.
+pub(crate) const CERTIFICATE_MESH_CHORD: f64 = 0.1;
+
+/// Weld epsilon the certificate's mesh dimensions use. See
+/// [`CERTIFICATE_MESH_CHORD`] for why it is shared.
+pub(crate) const CERTIFICATE_MESH_WELD_EPS: f64 = 1e-6;
+
 /// Verify a computed mass-properties result against the PHYSICAL contract of a
 /// real rigid body, returning `Err(reason)` with a machine-readable cause when
 /// any check fails so the caller can REFUSE (rather than emit a lie).
@@ -3065,7 +3080,12 @@ impl BRepModel {
         // `manifold_report` already computes the directed-edge consistency; extract
         // it so `is_sound()` can AND it in.
         let (watertight, manifold, oriented, euler, be, rf, nm, ide) =
-            match crate::harness::watertight::manifold_report(self, solid_id, 0.1, 1e-6) {
+            match crate::harness::watertight::manifold_report(
+                self,
+                solid_id,
+                CERTIFICATE_MESH_CHORD,
+                CERTIFICATE_MESH_WELD_EPS,
+            ) {
                 Some(r) => (
                     // `r.closed`, not `r.boundary_edges == 0`: the report's
                     // closure verdict also declines when the tessellator's weld

@@ -174,14 +174,40 @@ fn loft_profiles_body(
         register_correspondence(model, correspondence)?
     };
 
+    // A closed loft's SEAM band — ring N-1 back onto ring 0 — is the one band
+    // the chain above never registers; see `register_seam_relabeling`. It is
+    // computed here, beside the chain, and only when the chain ran: a caller
+    // whose correspondence survived densification is asserting the whole
+    // pairing, seam included.
+    //
+    // Not computed for `LoftType::Cubic`: that path builds no seam band at all
+    // (it rules consecutive interpolated rings and never wraps -- see the
+    // `create_cubic_loft` doc), so it would discard the answer. Its `?` would
+    // still be live, and a typed refusal raised on behalf of a band that is
+    // never built would fail a closed cubic loft that used to build.
+    let seam_relabeling: Option<Vec<usize>> = if options.closed
+        && !supplied_survived_densify
+        && !matches!(options.loft_type, LoftType::Cubic)
+        && correspondence.len() >= 3
+    {
+        Some(register_seam_relabeling(model, &correspondence)?)
+    } else {
+        None
+    };
+    let seam = seam_relabeling.as_deref();
+
     // Create lofted solid based on type
     let solid_id = match options.loft_type {
-        LoftType::Linear => create_linear_loft(model, face_profiles, correspondence, &options)?,
+        LoftType::Linear => {
+            create_linear_loft(model, face_profiles, correspondence, seam, &options)?
+        }
         LoftType::Cubic => create_cubic_loft(model, face_profiles, correspondence, &options)?,
         LoftType::MinimalTwist => {
-            create_minimal_twist_loft(model, face_profiles, correspondence, &options)?
+            create_minimal_twist_loft(model, face_profiles, correspondence, seam, &options)?
         }
-        LoftType::Guided => create_guided_loft(model, face_profiles, correspondence, &options)?,
+        LoftType::Guided => {
+            create_guided_loft(model, face_profiles, correspondence, seam, &options)?
+        }
     };
 
     // Drop the scratch profile faces (and any of their edges not shared with
@@ -274,6 +300,7 @@ fn create_linear_loft(
     model: &mut BRepModel,
     profiles: Vec<FaceId>,
     correspondence: Vec<Vec<VertexId>>,
+    seam_relabeling: Option<&[usize]>,
     options: &LoftOptions,
 ) -> OperationResult<SolidId> {
     let mut shell_faces = Vec::new();
@@ -291,18 +318,32 @@ fn create_linear_loft(
         shell_faces.push(bottom_cap);
     }
 
-    // Create lateral faces between adjacent profiles
-    let profile_pairs: Vec<(usize, usize)> = if options.closed {
-        (0..num_profiles)
-            .map(|i| (i, (i + 1) % num_profiles))
-            .collect()
-    } else {
-        (0..num_profiles - 1).map(|i| (i, i + 1)).collect()
+    // Create lateral faces between adjacent profiles. The seam band of a closed
+    // loft pairs ring N-1 with ring 0 under the seam relabeling rather than with
+    // ring 0's own storage order — see `register_seam_relabeling`.
+    let seam_ring: Vec<VertexId> = match seam_relabeling {
+        Some(sigma) if options.closed && sigma.len() == correspondence[0].len() => {
+            sigma.iter().map(|&k| correspondence[0][k]).collect()
+        }
+        _ => correspondence[0].clone(),
     };
+    let mut bands: Vec<(&[VertexId], &[VertexId])> = (0..num_profiles - 1)
+        .map(|i| {
+            (
+                correspondence[i].as_slice(),
+                correspondence[i + 1].as_slice(),
+            )
+        })
+        .collect();
+    if options.closed {
+        bands.push((
+            correspondence[num_profiles - 1].as_slice(),
+            seam_ring.as_slice(),
+        ));
+    }
 
-    for (i, j) in profile_pairs {
-        let lateral_faces =
-            create_ruled_surfaces_between_profiles(model, &correspondence[i], &correspondence[j])?;
+    for (ring_a, ring_b) in bands {
+        let lateral_faces = create_ruled_surfaces_between_profiles(model, ring_a, ring_b)?;
         shell_faces.extend(lateral_faces);
     }
 
@@ -498,10 +539,11 @@ fn create_cubic_loft(
         let r0 = &rings[ri];
         let r1 = &rings[ri + 1];
         let n = r0.len();
-        // Per-ring-pair midline anchor for radial-outward computation.
-        let centroid_r0 = ring_centroid(model, r0)?;
-        let centroid_r1 = ring_centroid(model, r1)?;
-        let axis_mid = (centroid_r0 + centroid_r1) * 0.5;
+        // One outward decision for this band, from the slab's signed volume —
+        // the same invariant `create_ruled_surfaces_between_profiles` uses.
+        // The cubic path mints its own `RuledSurface` faces rather than going
+        // through that function, so it asks for the sign directly.
+        let band_sign = band_outward_sign(model, r0, r1)?;
 
         for vi in 0..n {
             let v00 = r0[vi];
@@ -545,19 +587,10 @@ fn create_cubic_loft(
             ));
             let surface = RuledSurface::new(c1, c2);
 
-            // Outward target: radial from the loft midline at this quad.
-            let quad_centroid = (p00 + p10 + p01 + p11) * 0.25;
-            let radial = quad_centroid - axis_mid;
-            let outward_target = if radial.magnitude_squared() > 1e-20 {
-                radial
-            } else {
-                let fallback = (p10 - p00).cross(&(p01 - p00));
-                if fallback.magnitude_squared() > 1e-20 {
-                    fallback
-                } else {
-                    Vector3::Z
-                }
-            };
+            // Outward target: this quad's own traversal normal, turned outward
+            // by the band's sign. The traversal is v00 -> v10 -> v11 -> v01,
+            // which is the loop chained below.
+            let outward_target = quad_outward_target(band_sign, p00, p10, p11, p01);
             let surface_box: Box<dyn Surface> = Box::new(surface);
             let orientation = orient_face_for_outward(surface_box.as_ref(), outward_target)?;
             let surface_id = model.surfaces.add(surface_box);
@@ -646,6 +679,7 @@ fn create_minimal_twist_loft(
     model: &mut BRepModel,
     profiles: Vec<FaceId>,
     correspondence: Vec<Vec<VertexId>>,
+    seam_relabeling: Option<&[usize]>,
     options: &LoftOptions,
 ) -> OperationResult<SolidId> {
     let num_profiles = correspondence.len();
@@ -659,7 +693,7 @@ fn create_minimal_twist_loft(
     // that used to run here has moved upstream of the loft-type dispatch, where
     // it serves every type. Build from the same registered correspondence the
     // linear path does.
-    create_linear_loft(model, profiles, correspondence, options)
+    create_linear_loft(model, profiles, correspondence, seam_relabeling, options)
 }
 
 /// Create a guided loft following guide curves
@@ -685,6 +719,7 @@ fn create_guided_loft(
     model: &mut BRepModel,
     profiles: Vec<FaceId>,
     correspondence: Vec<Vec<VertexId>>,
+    seam_relabeling: Option<&[usize]>,
     options: &LoftOptions,
 ) -> OperationResult<SolidId> {
     if options.guide_curves.is_empty() {
@@ -808,20 +843,33 @@ fn create_guided_loft(
         shell_faces.push(bottom_cap);
     }
 
-    let profile_pairs: Vec<(usize, usize)> = if options.closed {
-        (0..num_profiles)
-            .map(|i| (i, (i + 1) % num_profiles))
-            .collect()
-    } else {
-        (0..num_profiles - 1).map(|i| (i, i + 1)).collect()
+    // The seam band of a closed loft pairs ring N-1 with ring 0 under the seam
+    // relabeling — applied here to the GUIDE-SNAPPED ring 0, which is why
+    // `register_seam_relabeling` hands back a permutation rather than a ring.
+    let seam_ring: Vec<VertexId> = match seam_relabeling {
+        Some(sigma) if options.closed && sigma.len() == snapped_correspondence[0].len() => sigma
+            .iter()
+            .map(|&k| snapped_correspondence[0][k])
+            .collect(),
+        _ => snapped_correspondence[0].clone(),
     };
+    let mut bands: Vec<(&[VertexId], &[VertexId])> = (0..num_profiles - 1)
+        .map(|i| {
+            (
+                snapped_correspondence[i].as_slice(),
+                snapped_correspondence[i + 1].as_slice(),
+            )
+        })
+        .collect();
+    if options.closed {
+        bands.push((
+            snapped_correspondence[num_profiles - 1].as_slice(),
+            seam_ring.as_slice(),
+        ));
+    }
 
-    for (i, j) in profile_pairs {
-        let lateral_faces = create_ruled_surfaces_between_profiles(
-            model,
-            &snapped_correspondence[i],
-            &snapped_correspondence[j],
-        )?;
+    for (ring_a, ring_b) in bands {
+        let lateral_faces = create_ruled_surfaces_between_profiles(model, ring_a, ring_b)?;
         shell_faces.extend(lateral_faces);
     }
 
@@ -857,12 +905,10 @@ fn create_guided_loft(
 
 /// Create ruled surfaces between two profiles.
 ///
-/// Each lateral quad face's outward target is computed as the radial
-/// direction from the loft midline (mean of the two profile centroids)
-/// to the quad's own centroid. If the radial component is degenerate
-/// (the quad straddles the midline, < 1e-20 magnitude) we fall back to
-/// the diagonal cross-product of the quad as a sensible local outward
-/// approximation, and finally to `Vector3::Z` only if both are zero.
+/// Each lateral quad face's outward target is its OWN boundary traversal
+/// normal, turned outward by the one sign [`band_outward_sign`] derives for the
+/// whole band from the slab's signed volume. See that function for why the
+/// per-quad radial test this replaced was wrong for a non-convex section.
 fn create_ruled_surfaces_between_profiles(
     model: &mut BRepModel,
     vertices1: &[VertexId],
@@ -875,11 +921,9 @@ fn create_ruled_surfaces_between_profiles(
     let mut faces = Vec::new();
     let n = vertices1.len();
 
-    // Compute each ring's centroid; their midpoint is the loft midline
-    // anchor used for radial-outward computation per quad.
-    let centroid1 = ring_centroid(model, vertices1)?;
-    let centroid2 = ring_centroid(model, vertices2)?;
-    let axis_mid = (centroid1 + centroid2) * 0.5;
+    // One decision for the band: does its quad traversal face out of the slab
+    // the two rings enclose, or into it? Refuses typed on a degenerate slab.
+    let sign = band_outward_sign(model, vertices1, vertices2)?;
 
     // Create a face between each pair of corresponding edges
     for i in 0..n {
@@ -892,24 +936,165 @@ fn create_ruled_surfaces_between_profiles(
         let p2 = vertex_position(model, v1_end)?;
         let p3 = vertex_position(model, v2_start)?;
         let p4 = vertex_position(model, v2_end)?;
-        let quad_centroid = (p1 + p2 + p3 + p4) * 0.25;
-        let radial = quad_centroid - axis_mid;
-        let outward_target = if radial.magnitude_squared() > 1e-20 {
-            radial
-        } else {
-            let fallback = (p2 - p1).cross(&(p3 - p1));
-            if fallback.magnitude_squared() > 1e-20 {
-                fallback
-            } else {
-                Vector3::Z
-            }
-        };
+
+        let outward_target = quad_outward_target(sign, p1, p2, p4, p3);
 
         let face_id = create_ruled_face(model, v1_start, v1_end, v2_start, v2_end, outward_target)?;
         faces.push(face_id);
     }
 
     Ok(faces)
+}
+
+/// The outward direction for one lateral quad, given its band's `sign`.
+///
+/// `a → b → c → d` is the quad's boundary traversal, the same order
+/// [`create_ruled_face`] chains its loop in. The quad's own vector area
+/// (Newell's sum `Σ p_k × p_{k+1}`, twice the vector area and invariant under
+/// translation) is the LOCAL outward normal of that traversal for any simple
+/// section, convex or not — an L's notch edge faces away from the ring centroid
+/// and Newell says so, which is exactly what the radial test could not.
+/// Multiplying by the band's sign turns the traversal's sense into the outward
+/// sense once for the whole band.
+///
+/// A quad whose four corners are collinear or coincident has no vector area at
+/// all; it falls back to the quad's diagonal cross-product, and to `Vector3::Z`
+/// only when that is zero too. Such a face is a knife edge with no defined
+/// normal — it contributes nothing to the mesh (the tessellator drops its
+/// degenerate triangles) and the fallback exists so a single degenerate sample
+/// on an otherwise sound ring does not fail the whole loft.
+fn quad_outward_target(sign: f64, a: Vector3, b: Vector3, c: Vector3, d: Vector3) -> Vector3 {
+    let corners = [a, b, c, d];
+    let mut newell = Vector3::ZERO;
+    for k in 0..4 {
+        newell += corners[k].cross(&corners[(k + 1) % 4]);
+    }
+    if newell.magnitude_squared() > 1e-20 {
+        return newell * sign;
+    }
+    let diagonal = (b - a).cross(&(d - a));
+    if diagonal.magnitude_squared() > 1e-20 {
+        diagonal * sign
+    } else {
+        Vector3::Z
+    }
+}
+
+/// The sign that turns a lateral band's own boundary traversal into its OUTWARD
+/// direction — decided ONCE for the whole band, from the signed volume of the
+/// slab its two rings enclose.
+///
+/// # What this replaced, and why that was wrong
+///
+/// Every lateral quad used to pick its `FaceOrientation` from
+/// `dot(surface_normal, quad_centroid − axis_mid)`, with `axis_mid` the
+/// midpoint of the two RING CENTROIDS. A ring centroid is the mean of the ring's
+/// samples, and for a NON-CONVEX section that point need not lie inside the
+/// material: on a thin L it falls in the notch. The quads along the two notch
+/// edges then face away from it and the radial test flags them opposite to every
+/// other quad in the same band, while the band's loop chaining is uniform by
+/// construction — quad `k` traverses the shared rail one way and quad `k+1`
+/// traverses it the other — so a coherent band needs every one of its faces to
+/// carry the SAME flag. Mixed flags mean adjacent faces disagree about which way
+/// is out: at best a typed refusal from the B-Rep orientation check, at worst
+/// (when the band also folds, so the surface normal flips with the flag and
+/// masks it) a welded mesh that closes without being consistently wound.
+///
+/// The centroid is a heuristic. The slab's signed volume is an invariant.
+///
+/// # The formula
+///
+/// Close the slab with its two rings as caps and triangulate it in the band's
+/// own traversal sense: lateral quad `k` fans from `p[k]` as
+/// `(p[k], p[k+1], q[k+1])` and `(p[k], q[k+1], q[k])`; ring `q` fans forward
+/// from `q[0]`; ring `p` fans REVERSED from `p[0]`. Taking every point relative
+/// to the slab centroid `c`, the enclosed signed volume is
+///
+/// `V = (1/6) · Σ_T (A − c) · ((B − c) × (C − c))`
+///
+/// which is positive exactly when that triangulation — and with it the band's
+/// quad traversal — faces out of the slab, and negative when it faces in. The
+/// fan of a non-convex ring self-overlaps and the formula is still exact: the
+/// overlapping contributions cancel by sign, the same reason the shoelace
+/// formula holds for any simple polygon, convex or not.
+///
+/// # Degenerate case
+///
+/// `S` is the same sum with every term taken positive — the scale `V` is judged
+/// against, which makes the test dimensionless instead of a bare `1e-12` on a
+/// cubic quantity. Two refusals, both
+/// [`OperationError::IncompatibleProfiles`]:
+///
+/// * `S` is zero or non-finite — the slab has no extent at all (coincident
+///   rings, a ring of coincident samples).
+/// * `|V| ≤ 1e-9 · S` — the terms cancel to noise. A zero-thickness or
+///   self-intersecting slab encloses as much "outside" as "inside", and which
+///   way is out is precisely the question being asked.
+///
+/// Refusing is the point. A coin toss here mints a solid whose faces point the
+/// wrong way and says nothing about it.
+///
+/// # The one class this cannot witness
+///
+/// A band twisted by MORE than half a sample step is self-intersecting: its
+/// slab has genuine interior on both sides of the crossing and the signed
+/// volume is a difference of two real regions, so its sign is a fact about
+/// which region is bigger, not about which side of a face is outside. The rule
+/// still answers, and the answer is not a witness. (The radial test it replaced
+/// was no better there -- it was wrong on the same inputs, for a worse reason
+/// -- and the honest guard against that class is the vertex REGISTRATION that
+/// runs upstream, plus `validate_lofted_solid`'s mesh check downstream. Neither
+/// is this function's job.)
+fn band_outward_sign(
+    model: &BRepModel,
+    ring_a: &[VertexId],
+    ring_b: &[VertexId],
+) -> OperationResult<f64> {
+    let n = ring_a.len();
+    if n < 3 || ring_b.len() != n {
+        return Err(OperationError::IncompatibleProfiles);
+    }
+
+    let mut p = Vec::with_capacity(n);
+    let mut q = Vec::with_capacity(n);
+    for k in 0..n {
+        p.push(vertex_position(model, ring_a[k])?);
+        q.push(vertex_position(model, ring_b[k])?);
+    }
+
+    let mut centroid = Vector3::ZERO;
+    for k in 0..n {
+        centroid = centroid + p[k] + q[k];
+    }
+    let centroid = centroid * (1.0 / (2 * n) as f64);
+
+    let mut signed = 0.0f64;
+    let mut scale = 0.0f64;
+    let mut tetra = |a: Vector3, b: Vector3, c: Vector3| {
+        let term = (a - centroid).dot(&(b - centroid).cross(&(c - centroid)));
+        signed += term;
+        scale += term.abs();
+    };
+
+    for k in 0..n {
+        let k1 = (k + 1) % n;
+        tetra(p[k], p[k1], q[k1]);
+        tetra(p[k], q[k1], q[k]);
+    }
+    for k in 1..n - 1 {
+        tetra(q[0], q[k], q[k + 1]);
+        tetra(p[0], p[k + 1], p[k]);
+    }
+
+    let volume = signed / 6.0;
+    let scale = scale / 6.0;
+    if !scale.is_finite() || scale <= 0.0 {
+        return Err(OperationError::IncompatibleProfiles);
+    }
+    if !volume.is_finite() || volume.abs() <= 1e-9 * scale {
+        return Err(OperationError::IncompatibleProfiles);
+    }
+    Ok(volume.signum())
 }
 
 /// Compute the centroid of a vertex ring as the mean of vertex positions.
@@ -1861,55 +2046,110 @@ fn register_correspondence(
     out.push(correspondence[0].clone());
 
     for ring in correspondence.into_iter().skip(1) {
-        let n = prev_positions.len();
-        if ring.len() != n {
-            return Err(OperationError::IncompatibleProfiles);
-        }
-        if n == 0 {
-            return Err(OperationError::IncompatibleProfiles);
-        }
         let positions = ring_positions(&ring)?;
-
-        // σ(k) over the dihedral group: shift, optionally reversing sense.
-        // `reverse` maps index j to (n − j) mod n, which is the same cyclic
-        // set traversed the other way round.
-        let sigma = |k: usize, shift: usize, reversed: bool| -> usize {
-            let j = (k + shift) % n;
-            if reversed {
-                (n - j) % n
-            } else {
-                j
-            }
-        };
-
-        let mut best_shift = 0usize;
-        let mut best_reversed = false;
-        let mut best_cost = f64::INFINITY;
-        for &reversed in &[false, true] {
-            for shift in 0..n {
-                let mut cost = 0.0;
-                for k in 0..n {
-                    let d = positions[sigma(k, shift, reversed)] - prev_positions[k];
-                    cost += d.magnitude_squared();
-                }
-                if cost < best_cost {
-                    best_cost = cost;
-                    best_shift = shift;
-                    best_reversed = reversed;
-                }
-            }
-        }
-
-        let registered: Vec<VertexId> = (0..n)
-            .map(|k| ring[sigma(k, best_shift, best_reversed)])
-            .collect();
-        prev_positions = (0..n)
-            .map(|k| positions[sigma(k, best_shift, best_reversed)])
-            .collect();
+        let permutation = best_relabeling(&prev_positions, &positions)?;
+        let n = permutation.len();
+        let registered: Vec<VertexId> = (0..n).map(|k| ring[permutation[k]]).collect();
+        prev_positions = (0..n).map(|k| positions[permutation[k]]).collect();
         out.push(registered);
     }
 
     Ok(out)
+}
+
+/// The relabeling `σ` of a ring that best matches it to `reference`: the member
+/// of the ring's dihedral group (`n` cyclic shifts, each with and without a
+/// reversal of traversal sense) minimising the total squared rail length
+/// `Σ_k |ring[σ(k)] − reference[k]|²`. Returned as the index vector `σ`, so a
+/// caller can apply the same relabeling to whichever ring storage it holds.
+///
+/// Ties break toward the unreversed candidate and then the lowest shift, so the
+/// answer is deterministic and a timeline replay re-derives it.
+///
+/// # Errors
+///
+/// [`OperationError::IncompatibleProfiles`] when the two rings differ in length
+/// or are empty — there is no honest way to pair `n` samples with `m`.
+fn best_relabeling(reference: &[Vector3], ring: &[Vector3]) -> OperationResult<Vec<usize>> {
+    let n = reference.len();
+    if n == 0 || ring.len() != n {
+        return Err(OperationError::IncompatibleProfiles);
+    }
+
+    // σ(k) over the dihedral group: shift, optionally reversing sense.
+    // `reverse` maps index j to (n − j) mod n, which is the same cyclic
+    // set traversed the other way round.
+    let sigma = |k: usize, shift: usize, reversed: bool| -> usize {
+        let j = (k + shift) % n;
+        if reversed {
+            (n - j) % n
+        } else {
+            j
+        }
+    };
+
+    let mut best_shift = 0usize;
+    let mut best_reversed = false;
+    let mut best_cost = f64::INFINITY;
+    for &reversed in &[false, true] {
+        for shift in 0..n {
+            let mut cost = 0.0;
+            for k in 0..n {
+                let d = ring[sigma(k, shift, reversed)] - reference[k];
+                cost += d.magnitude_squared();
+            }
+            if cost < best_cost {
+                best_cost = cost;
+                best_shift = shift;
+                best_reversed = reversed;
+            }
+        }
+    }
+
+    Ok((0..n)
+        .map(|k| sigma(k, best_shift, best_reversed))
+        .collect())
+}
+
+/// The relabeling that registers ring `0` against the LAST ring, for the seam
+/// band of a closed loft.
+///
+/// [`register_correspondence`] chains ring `i` to ring `i−1` and leaves ring `0`
+/// as the anchor. With `closed: true` the loft then adds one more band that the
+/// chain never saw: ring `N−1` against ring `0`, in ring 0's own storage order.
+/// Whatever relabeling the chain accumulated on its way round is spent at that
+/// seam, so a closed loft could be clean in every band but the one that closes
+/// it — and that band twists silently, since a twisted band is still a band.
+///
+/// The seam is registered through the SAME search the chain uses, against ring
+/// `N−1`'s registered positions. The result is returned as a permutation rather
+/// than as ring 0's vertices because each loft type holds its own ring 0
+/// storage: the linear path uses the correspondence directly, the guided path
+/// uses its guide-snapped copy, and both must apply the identical relabeling.
+///
+/// Ring 0 keeps its own indexing everywhere else — the seam relabeling is used
+/// for the seam band alone — because ring 0's storage is what band `(0, 1)` was
+/// registered against. Re-indexing it globally would only move the discontinuity
+/// to the other end.
+///
+/// # Errors
+///
+/// [`OperationError::IncompatibleProfiles`] when fewer than three rings reach
+/// here (with two rings the "seam" is the same band again) or when the two rings
+/// differ in length.
+fn register_seam_relabeling(
+    model: &BRepModel,
+    correspondence: &[Vec<VertexId>],
+) -> OperationResult<Vec<usize>> {
+    if correspondence.len() < 3 {
+        return Err(OperationError::IncompatibleProfiles);
+    }
+    let ring_positions = |ring: &[VertexId]| -> OperationResult<Vec<Vector3>> {
+        ring.iter().map(|&v| vertex_position(model, v)).collect()
+    };
+    let last = ring_positions(&correspondence[correspondence.len() - 1])?;
+    let first = ring_positions(&correspondence[0])?;
+    best_relabeling(&last, &first)
 }
 
 fn establish_correspondence(
@@ -2008,7 +2248,32 @@ fn validate_loft_inputs(
     Ok(())
 }
 
-/// Validate the lofted solid by running the full B-Rep validation suite.
+/// Validate the lofted solid: the scoped B-Rep suite, then the mesh's own
+/// orientation.
+///
+/// # Why the B-Rep suite is not enough
+///
+/// [`crate::primitives::validation::check_face_orientations`] compares two
+/// manifold-adjacent faces' outward walks across their shared edge. That test is
+/// blind in exactly the case this operation can produce: when a lateral band
+/// FOLDS, the ruled surface's own normal flips with the fold, so a face whose
+/// flag is wrong can still walk its shared edges opposite to both neighbours and
+/// the shell passes. The three loft reds parked before Task 42 all had that
+/// signature — `validate_solid_scoped` at `Standard` reported VALID while the
+/// welded mesh reported `oriented == false`, i.e. two triangles winding the same
+/// way across a shared edge. A solid that mints under those conditions exports
+/// with inverted normals and integrates to a mass-properties answer of the wrong
+/// sign, and nothing on the way out says so.
+///
+/// So the loft also asks the mesh. `manifold_report` is called with the SAME
+/// parameters [`crate::primitives::topology_builder::BRepModel::certify_solid`]
+/// uses for its `oriented` dimension -- literally the same, via the shared
+/// [`crate::primitives::topology_builder::CERTIFICATE_MESH_CHORD`] and
+/// [`crate::primitives::topology_builder::CERTIFICATE_MESH_WELD_EPS`], so the
+/// agreement is structural and not a coincidence of two matching literals.
+/// This check and the certificate therefore cannot disagree: whatever would
+/// have come back as `cert.oriented == false` is refused here instead of
+/// minted, and the set of solids that are both minted and sound is unchanged.
 fn validate_lofted_solid(model: &BRepModel, solid_id: SolidId) -> OperationResult<()> {
     if model.solids.get(solid_id).is_none() {
         return Err(OperationError::InvalidBRep("Solid not found".to_string()));
@@ -2034,7 +2299,30 @@ fn validate_lofted_solid(model: &BRepModel, solid_id: SolidId) -> OperationResul
             summary
         )));
     }
-    Ok(())
+    match crate::harness::watertight::manifold_report(
+        model,
+        solid_id,
+        crate::primitives::topology_builder::CERTIFICATE_MESH_CHORD,
+        crate::primitives::topology_builder::CERTIFICATE_MESH_WELD_EPS,
+    ) {
+        Some(report) if report.oriented => Ok(()),
+        Some(report) => Err(OperationError::InvalidBRep(format!(
+            concat!(
+                "Lofted solid is not a consistently oriented mesh: ",
+                "{} of {} mesh edge(s) are traversed the same way by both of ",
+                "their triangles, so adjacent faces disagree about which side ",
+                "is outside"
+            ),
+            report.inconsistent_directed_edges, report.undirected_edges
+        ))),
+        None => Err(OperationError::InvalidBRep(
+            concat!(
+                "Lofted solid tessellates to no triangles, so its mesh ",
+                "orientation cannot be verified"
+            )
+            .to_string(),
+        )),
+    }
 }
 
 /// Compute a planar surface from a closed boundary of edges.
@@ -2274,6 +2562,30 @@ mod tests {
 
     #[test]
     fn create_ruled_surfaces_creates_n_faces_for_n_corresponding_vertices() {
+        // A real ring pair: a unit square at two heights. (This fixture used to
+        // pass four COLLINEAR points as each ring, which encloses no slab at
+        // all; that input is now a typed refusal and has its own test below.)
+        let mut model = BRepModel::new();
+        let square = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)];
+        let v_bottom: Vec<VertexId> = square
+            .iter()
+            .map(|&(x, y)| model.vertices.add(x, y, 0.0))
+            .collect();
+        let v_top: Vec<VertexId> = square
+            .iter()
+            .map(|&(x, y)| model.vertices.add(x, y, 1.0))
+            .collect();
+        let faces = create_ruled_surfaces_between_profiles(&mut model, &v_bottom, &v_top)
+            .expect("surfaces");
+        assert_eq!(faces.len(), 4);
+    }
+
+    #[test]
+    fn create_ruled_surfaces_refuses_a_slab_with_no_inside() {
+        // Four collinear samples at each height: the "band" is a flat sheet,
+        // the slab it would enclose has zero volume, and there is no outward
+        // direction to give its faces. Refuse instead of minting a band whose
+        // normals are a coin toss.
         let mut model = BRepModel::new();
         let v_bottom: Vec<VertexId> = (0..4)
             .map(|i| model.vertices.add(i as f64, 0.0, 0.0))
@@ -2281,9 +2593,12 @@ mod tests {
         let v_top: Vec<VertexId> = (0..4)
             .map(|i| model.vertices.add(i as f64, 0.0, 1.0))
             .collect();
-        let faces = create_ruled_surfaces_between_profiles(&mut model, &v_bottom, &v_top)
-            .expect("surfaces");
-        assert_eq!(faces.len(), 4);
+        let err = create_ruled_surfaces_between_profiles(&mut model, &v_bottom, &v_top)
+            .expect_err("a slab with no inside must refuse");
+        assert!(
+            matches!(err, OperationError::IncompatibleProfiles),
+            "{err:?}"
+        );
     }
 
     // -------------------------------------------------------------------
@@ -2523,6 +2838,198 @@ mod tests {
     // -------------------------------------------------------------------
     // densify_correspondence
     // -------------------------------------------------------------------
+
+    /// A ring of `n` vertices at height `z` along the L-section
+    /// `(0,0) (24,0) (24,2) (2,2) (2,14) (0,14)`, in the order listed.
+    /// The L is the smallest section whose vertex-mean centroid —
+    /// `(52/6, 32/6) = (8.667, 5.333)` for these six corners — lies OUTSIDE the
+    /// material, in the notch (`x > 2` and `y > 2`).
+    fn l_ring(model: &mut BRepModel, z: f64) -> Vec<VertexId> {
+        [
+            (0.0, 0.0),
+            (24.0, 0.0),
+            (24.0, 2.0),
+            (2.0, 2.0),
+            (2.0, 14.0),
+            (0.0, 14.0),
+        ]
+        .iter()
+        .map(|&(x, y)| model.vertices.add(x, y, z))
+        .collect()
+    }
+
+    #[test]
+    fn band_outward_sign_is_positive_when_the_traversal_faces_out() {
+        // Two octagons, the upper one directly above: the band's traversal
+        // p[k] -> p[k+1] -> q[k+1] -> q[k] runs counter-clockwise about the
+        // outward normal, so the slab it encloses has positive volume.
+        let mut model = BRepModel::new();
+        let lower = ring_on_circle(&mut model, 8, 10.0, 0.0, 0.0, 1.0);
+        let upper = ring_on_circle(&mut model, 8, 10.0, 5.0, 0.0, 1.0);
+        let sign = band_outward_sign(&model, &lower, &upper).expect("band sign");
+        assert_eq!(sign, 1.0);
+    }
+
+    #[test]
+    fn band_outward_sign_flips_with_the_rings_traversal_sense() {
+        // The same two octagons listed clockwise. Nothing about the SOLID has
+        // changed, only the storage order — so the band's traversal now faces
+        // into the slab and the sign must say so.
+        let mut model = BRepModel::new();
+        let lower = ring_on_circle(&mut model, 8, 10.0, 0.0, 0.0, -1.0);
+        let upper = ring_on_circle(&mut model, 8, 10.0, 5.0, 0.0, -1.0);
+        let sign = band_outward_sign(&model, &lower, &upper).expect("band sign");
+        assert_eq!(sign, -1.0);
+    }
+
+    #[test]
+    fn band_outward_sign_is_right_where_the_radial_test_is_wrong() {
+        // The L-prism. The band sign is the invariant: +1, one answer for the
+        // whole band. The radial test the sign replaced disagrees with the
+        // local outward direction on the notch quads — this asserts BOTH, so
+        // the fixture cannot pass by the two rules happening to agree.
+        let mut model = BRepModel::new();
+        let lower = l_ring(&mut model, 0.0);
+        let upper = l_ring(&mut model, 12.0);
+        let sign = band_outward_sign(&model, &lower, &upper).expect("band sign");
+        assert_eq!(sign, 1.0);
+
+        let n = lower.len();
+        let centroid = |ring: &[VertexId]| -> Vector3 {
+            let mut c = Vector3::ZERO;
+            for &v in ring {
+                c += vertex_position(&model, v).unwrap_or(Vector3::ZERO);
+            }
+            c * (1.0 / ring.len() as f64)
+        };
+        let axis_mid = (centroid(&lower) + centroid(&upper)) * 0.5;
+        let mut radial_disagreements = 0usize;
+        for i in 0..n {
+            let p1 = vertex_position(&model, lower[i]).expect("p1");
+            let p2 = vertex_position(&model, lower[(i + 1) % n]).expect("p2");
+            let p3 = vertex_position(&model, upper[i]).expect("p3");
+            let p4 = vertex_position(&model, upper[(i + 1) % n]).expect("p4");
+            let outward = quad_outward_target(sign, p1, p2, p4, p3);
+            let quad_centroid = (p1 + p2 + p3 + p4) * 0.25;
+            if (quad_centroid - axis_mid).dot(&outward) < 0.0 {
+                radial_disagreements += 1;
+            }
+        }
+        assert_eq!(
+            radial_disagreements, 2,
+            "the two notch quads are exactly where the radial test and the slab sign part company"
+        );
+    }
+
+    #[test]
+    fn band_outward_sign_refuses_coincident_rings() {
+        // A slab with no thickness: its lateral quads are degenerate and its
+        // two caps cancel exactly, so the enclosed volume is zero and which way
+        // is out has no answer. Refuse rather than pick.
+        let mut model = BRepModel::new();
+        let ring = ring_on_circle(&mut model, 8, 10.0, 0.0, 0.0, 1.0);
+        let twin = ring_on_circle(&mut model, 8, 10.0, 0.0, 0.0, 1.0);
+        let err =
+            band_outward_sign(&model, &ring, &twin).expect_err("coincident rings must refuse");
+        assert!(
+            matches!(err, OperationError::IncompatibleProfiles),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn band_outward_sign_refuses_rings_of_different_lengths() {
+        let mut model = BRepModel::new();
+        let eight = ring_on_circle(&mut model, 8, 10.0, 0.0, 0.0, 1.0);
+        let six = ring_on_circle(&mut model, 6, 10.0, 5.0, 0.0, 1.0);
+        let err = band_outward_sign(&model, &eight, &six).expect_err("length mismatch must refuse");
+        assert!(
+            matches!(err, OperationError::IncompatibleProfiles),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn quad_outward_target_follows_the_band_sign() {
+        // A unit quad on the y = 0 plane, traversed a -> b -> c -> d. Its own
+        // traversal normal is -Y; the band sign is what decides whether that is
+        // out of the material or into it.
+        let a = Vector3::new(0.0, 0.0, 0.0);
+        let b = Vector3::new(1.0, 0.0, 0.0);
+        let c = Vector3::new(1.0, 0.0, 1.0);
+        let d = Vector3::new(0.0, 0.0, 1.0);
+        let out = quad_outward_target(1.0, a, b, c, d);
+        assert!(
+            out.y < 0.0 && out.x.abs() < 1e-12 && out.z.abs() < 1e-12,
+            "{out:?}"
+        );
+        let flipped = quad_outward_target(-1.0, a, b, c, d);
+        assert!(flipped.y > 0.0, "{flipped:?}");
+    }
+
+    #[test]
+    fn quad_outward_target_falls_back_for_a_quad_with_no_area() {
+        // Four collinear corners: no vector area, no diagonal, no defined
+        // normal. The fallback is deterministic rather than absent.
+        let a = Vector3::new(0.0, 0.0, 0.0);
+        let b = Vector3::new(1.0, 0.0, 0.0);
+        let c = Vector3::new(2.0, 0.0, 0.0);
+        let d = Vector3::new(3.0, 0.0, 0.0);
+        assert_eq!(quad_outward_target(1.0, a, b, c, d), Vector3::Z);
+    }
+
+    #[test]
+    fn register_seam_relabeling_aligns_the_last_ring_to_the_first() {
+        // Three octagon rings. The chain leaves ring 0 as the anchor, and here
+        // the LAST ring's storage sits two samples round from ring 0's — the
+        // holonomy a closed loft spends at its seam. The seam relabeling has to
+        // undo exactly that, and it is a permutation OF RING 0 (the ring the
+        // seam band pairs against the last one).
+        let mut model = BRepModel::new();
+        let step = 2.0 * std::f64::consts::TAU / 8.0;
+        let ring0 = ring_on_circle(&mut model, 8, 10.0, 0.0, 0.0, 1.0);
+        let ring1 = ring_on_circle(&mut model, 8, 10.0, 5.0, 0.0, 1.0);
+        let ring2 = ring_on_circle(&mut model, 8, 10.0, 10.0, step, 1.0);
+
+        let sigma = register_seam_relabeling(&model, &[ring0.clone(), ring1, ring2.clone()])
+            .expect("seam relabeling");
+
+        assert_eq!(sigma.len(), 8);
+        assert_ne!(
+            sigma,
+            (0..8).collect::<Vec<usize>>(),
+            "ring 0's own indexing is exactly what the seam must NOT keep here"
+        );
+        // Every seam rail is now the shortest one available: ring 2's sample k
+        // pairs with the ring 0 sample directly below it.
+        for k in 0..8 {
+            let a = vertex_position(&model, ring2[k]).expect("ring2 sample");
+            let b = vertex_position(&model, ring0[sigma[k]]).expect("ring0 sample");
+            assert!(
+                (a.x - b.x).abs() < 1e-9 && (a.y - b.y).abs() < 1e-9,
+                "seam rail {k} is not vertical: ({}, {}) vs ({}, {})",
+                a.x,
+                a.y,
+                b.x,
+                b.y
+            );
+        }
+    }
+
+    #[test]
+    fn register_seam_relabeling_refuses_fewer_than_three_rings() {
+        // With two rings the "seam" is the band that already exists, and
+        // registering ring 0 against ring 1 would build it a second time.
+        let mut model = BRepModel::new();
+        let ring0 = ring_on_circle(&mut model, 8, 10.0, 0.0, 0.0, 1.0);
+        let ring1 = ring_on_circle(&mut model, 8, 10.0, 5.0, 0.0, 1.0);
+        let err = register_seam_relabeling(&model, &[ring0, ring1])
+            .expect_err("two rings have no seam of their own");
+        assert!(
+            matches!(err, OperationError::IncompatibleProfiles),
+            "{err:?}"
+        );
+    }
 
     #[test]
     fn densify_correspondence_passes_through_when_already_uniform() {

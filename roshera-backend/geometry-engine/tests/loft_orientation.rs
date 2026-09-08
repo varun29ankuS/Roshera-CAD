@@ -24,7 +24,21 @@
 //! OPPOSITE traversal sense have no shift that aligns them at all, and the
 //! kernel ruled them together regardless.
 //!
-//! Five fixtures pin it:
+//! A section that is NOT CONVEX breaks a second rule, and for a different
+//! reason. Each lateral quad used to pick its `FaceOrientation` from the radial
+//! direction out of the midpoint of the two RING CENTROIDS, and a ring centroid
+//! is the mean of the ring samples -- a point that need not lie inside the
+//! material at all. On a thin L it lands in the notch, so the quads along the
+//! two notch edges face away from it and get flagged opposite to every other
+//! quad in their own band. The band is coherent only when every one of its faces
+//! carries the same flag, so this either refuses on the way out or, when the
+//! band also folds and the surface normal flips with it, mints a mesh that
+//! closes without being consistently wound. Orientation is now taken from the
+//! signed volume of the slab between the two rings -- an invariant, one decision
+//! per band -- and `validate_lofted_solid` asks the welded mesh before the loft
+//! returns.
+//!
+//! Nine fixtures pin it:
 //!
 //! * `loft_index_offset_squares_builds_an_exact_box` — the same square at two
 //!   heights, the upper one's edge list started one corner later. The correct
@@ -49,11 +63,26 @@
 //!   safe to delete `create_minimal_twist_loft`'s own shift search, now that
 //!   `register_correspondence` minimises the same objective over a strictly
 //!   larger candidate set ahead of the loft-type dispatch.
+//! * `loft_l_section_to_a_congruent_l_section_builds_the_exact_prism` — a
+//!   NON-CONVEX section against itself. Congruent sections make the answer
+//!   exact again (`V = area · height`) and registration a no-op, so the case
+//!   measures band orientation and nothing else.
+//! * `loft_l_section_whose_cap_the_mesh_cannot_orient_is_refused_not_minted` —
+//!   the same prism from counter-clockwise sections. Its band flags are right
+//!   and its cap tessellation is torn, and the loft refuses instead of handing
+//!   out a body whose certificate would read `oriented=false`.
+//! * `loft_l_section_to_a_square_is_closed_oriented_and_sound` — a non-convex
+//!   section against a dissimilar convex one: registration and band orientation
+//!   have to hold at the same time.
+//! * `closed_loft_of_rotated_squares_has_the_analytic_ring_volume` — the only
+//!   `closed: true` loft in the repo. Every ruled patch of it is planar, so the
+//!   body is a polyhedral annulus whose volume is `4·N·R·a²·sin(2π/N)`, and the
+//!   seam band that closes ring `N-1` back onto ring `0` is inside that number.
 
 use geometry_engine::harness::watertight::manifold_report;
 use geometry_engine::math::{Point3, Tolerance};
 use geometry_engine::operations::loft::LoftType;
-use geometry_engine::operations::{loft_profiles, LoftOptions};
+use geometry_engine::operations::{loft_profiles, CommonOptions, LoftOptions};
 use geometry_engine::primitives::curve::Line;
 use geometry_engine::primitives::edge::{Edge, EdgeId, EdgeOrientation};
 use geometry_engine::primitives::solid::SolidId;
@@ -629,5 +658,563 @@ fn minimal_twist_loft_is_bit_identical_to_linear() {
         "volumes are not bit-identical: Linear {} vs MinimalTwist {}",
         f64::from_bits(linear.2),
         f64::from_bits(twist.2)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Non-convex sections: the per-quad radial heuristic
+// ---------------------------------------------------------------------------
+
+/// Thickness of the L-section's two arms.
+const L_THICK: f64 = 2.0;
+/// Length of the L-section's arm along X.
+const L_ARM_X: f64 = 24.0;
+/// Length of the L-section's arm along Y. Different from `L_ARM_X` on purpose:
+/// an L with equal arms is its own mirror image across `y = x`, and a ring that
+/// maps onto itself under a reversal of traversal sense is a degenerate input to
+/// `register_correspondence`'s min-rail search (see the report's findings). This
+/// fixture is about band ORIENTATION and has no business also standing on that.
+const L_ARM_Y: f64 = 14.0;
+
+/// A thin L-shaped (NON-CONVEX) section at height `z`, counter-clockwise seen
+/// from +Z.
+///
+/// The reflex corner at `(L_THICK, L_THICK)` is the whole point: the ring
+/// centroid -- the mean of the ring samples, which is what
+/// `create_ruled_surfaces_between_profiles` anchored its radial test to -- falls
+/// in the NOTCH, outside the material. The two notch edges (`y = L_THICK` and
+/// `x = L_THICK`) therefore face AWAY from it, and the radial test picks the
+/// opposite flag for those quads than for the outer ones.
+fn l_corners(z: f64) -> Vec<Point3> {
+    vec![
+        Point3::new(0.0, 0.0, z),
+        Point3::new(L_ARM_X, 0.0, z),
+        Point3::new(L_ARM_X, L_THICK, z),
+        Point3::new(L_THICK, L_THICK, z),
+        Point3::new(L_THICK, L_ARM_Y, z),
+        Point3::new(0.0, L_ARM_Y, z),
+    ]
+}
+
+/// The same L-section listed CLOCKWISE.
+fn l_corners_cw(z: f64) -> Vec<Point3> {
+    let mut c = l_corners(z);
+    c.reverse();
+    c
+}
+
+/// Area of the L-section: the bounding rectangle less the notch rectangle.
+fn l_area() -> f64 {
+    L_ARM_X * L_ARM_Y - (L_ARM_X - L_THICK) * (L_ARM_Y - L_THICK)
+}
+
+/// Every LATERAL face of a two-section loft: its loop vertex positions and the
+/// face's ORIENTED outward normal -- the surface's intrinsic normal at the
+/// parametric midpoint times the face's orientation sign, which is the exact
+/// product `orient_face_for_outward` decides and the tessellator winds
+/// triangles to. Cap faces (every vertex at one height) are skipped.
+fn lateral_faces(model: &BRepModel, solid: SolidId) -> Vec<(Vec<Point3>, Point3)> {
+    let mut out = Vec::new();
+    let Some(s) = model.solids.get(solid) else {
+        return out;
+    };
+    let Some(shell) = model.shells.get(s.outer_shell) else {
+        return out;
+    };
+    for &fid in &shell.faces {
+        let Some(face) = model.faces.get(fid) else {
+            continue;
+        };
+        let Some(lp) = model.loops.get(face.outer_loop) else {
+            continue;
+        };
+        let Ok(vids) = lp.vertices(&model.edges) else {
+            continue;
+        };
+        let pts: Vec<Point3> = vids
+            .iter()
+            .filter_map(|&v| model.vertices.get(v))
+            .map(|v| Point3::from(v.position))
+            .collect();
+        if pts.len() != vids.len() || pts.len() < 3 {
+            continue;
+        }
+        let zmin = pts.iter().map(|p| p.z).fold(f64::INFINITY, f64::min);
+        let zmax = pts.iter().map(|p| p.z).fold(f64::NEG_INFINITY, f64::max);
+        if zmax - zmin < 1e-9 {
+            continue;
+        }
+        let Some(surface) = model.surfaces.get(face.surface_id) else {
+            continue;
+        };
+        let ((u0, u1), (v0, v1)) = surface.parameter_bounds();
+        let Ok(n) = surface.normal_at(0.5 * (u0 + u1), 0.5 * (v0 + v1)) else {
+            continue;
+        };
+        out.push((pts, n * face.orientation.sign()));
+    }
+    out
+}
+
+/// The mean of the solid's distinct vertices at height `z` -- the same quantity
+/// `ring_centroid` computes for a loft ring, read back off the built solid.
+fn ring_centroid_at(model: &BRepModel, solid: SolidId, z: f64) -> Point3 {
+    let mut ids: Vec<u32> = shell_edges(model, solid)
+        .iter()
+        .filter_map(|&e| model.edges.get(e))
+        .flat_map(|e| [e.start_vertex, e.end_vertex])
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    let pts: Vec<Point3> = ids
+        .iter()
+        .filter_map(|&v| model.vertices.get(v))
+        .map(|v| Point3::from(v.position))
+        .filter(|p| (p.z - z).abs() < 1e-6)
+        .collect();
+    assert!(!pts.is_empty(), "no ring vertices at z={z}");
+    let n = pts.len() as f64;
+    pts.iter().fold(Point3::ORIGIN, |a, p| a + *p) * (1.0 / n)
+}
+
+/// How many of the loft's lateral faces carry a flag the per-quad RADIAL
+/// heuristic would NOT have picked, out of how many lateral faces there are.
+///
+/// The heuristic is `dot(oriented_normal, quad_centroid - axis_mid) >= 0` with
+/// `axis_mid` the midpoint of the two ring centroids -- exactly the reference
+/// `create_ruled_surfaces_between_profiles` anchored to. A disagreement count
+/// of zero means the fixture cannot discriminate: whatever the shipped code
+/// decided, the heuristic would have decided the same, and the case proves
+/// nothing about band orientation.
+fn radial_heuristic_disagreements(
+    model: &BRepModel,
+    solid: SolidId,
+    z0: f64,
+    z1: f64,
+) -> (usize, usize, Point3) {
+    let axis_mid = (ring_centroid_at(model, solid, z0) + ring_centroid_at(model, solid, z1)) * 0.5;
+    let faces = lateral_faces(model, solid);
+    let total = faces.len();
+    let disagreeing = faces
+        .iter()
+        .filter(|(pts, outward)| {
+            let n = pts.len() as f64;
+            let centroid = pts.iter().fold(Point3::ORIGIN, |a, p| a + *p) * (1.0 / n);
+            (centroid - axis_mid).dot(outward) < 0.0
+        })
+        .count();
+    (disagreeing, total, axis_mid)
+}
+
+/// A thin L-section lofted to a CONGRUENT L-section directly above it.
+///
+/// The isolating fixture for band orientation, and the counterpart of
+/// `loft_index_offset_squares_builds_an_exact_box` for a NON-CONVEX section:
+/// congruent sections listed the same way make the correct answer exact -- the
+/// body is the L-prism and its volume is `area * height` with no discretisation
+/// term, because every ring sample lands on a straight section edge and a chord
+/// reproduces a line exactly. Registration is a no-op on this input (the rings
+/// are identical up to their height, so shift 0 unreversed is the strict
+/// minimum), which is what leaves band ORIENTATION as the only thing the case
+/// can fail on.
+///
+/// What a convex section cannot show and this does: the radial-outward test
+/// that used to pick each lateral quad `FaceOrientation` was anchored at the
+/// midpoint of the two RING CENTROIDS, and for an L that point sits in the notch
+/// -- outside the material. The quads on the two notch edges face away from it,
+/// so the radial test flagged them opposite to every other quad in the same
+/// band, and a band whose faces disagree about which way is out cannot mint.
+///
+/// The section is listed CLOCKWISE, and that is load-bearing: the
+/// counter-clockwise listing of the same L builds the same correctly oriented
+/// B-Rep and then TEARS in the tessellator non-convex planar cap, which is a
+/// different defect in a different subsystem. It has its own test immediately
+/// below, so this one can measure band orientation without also standing on it.
+#[test]
+fn loft_l_section_to_a_congruent_l_section_builds_the_exact_prism() {
+    const HEIGHT: f64 = 12.0;
+
+    let mut m = BRepModel::new();
+    let p0 = polygon_profile(&mut m, &l_corners_cw(0.0));
+    let p1 = polygon_profile(&mut m, &l_corners_cw(HEIGHT));
+
+    let solid = loft_profiles(&mut m, vec![p0, p1], loft_solid_opts())
+        .expect("loft of two congruent L-sections must build");
+
+    let (disagreeing, total, axis_mid) = radial_heuristic_disagreements(&m, solid, 0.0, HEIGHT);
+    eprintln!(
+        "L->congruent L: {disagreeing} of {total} lateral flags differ from the radial heuristic anchored at ({:.3}, {:.3}, {:.3})",
+        axis_mid.x, axis_mid.y, axis_mid.z
+    );
+
+    let v = oracle(&mut m, solid);
+    assert_closed_oriented_and_sound(&v, "L->congruent L");
+
+    let expected = l_area() * HEIGHT;
+    let rel = (v.volume - expected).abs() / expected;
+    assert!(
+        rel < 1e-3,
+        "L->congruent L: volume {:.6} is {:.4}% off the exact prism {expected:.6}",
+        v.volume,
+        rel * 100.0
+    );
+
+    // The fixture must actually discriminate: if every lateral face agrees with
+    // the radial heuristic, this case would pass just as well against the code
+    // it exists to condemn.
+    assert!(
+        disagreeing > 0,
+        "L->congruent L: all {total} lateral flags agree with the radial heuristic, so this fixture proves nothing"
+    );
+}
+
+/// The same L-prism, its sections listed COUNTER-CLOCKWISE: every lateral flag
+/// is still right, the mesh still cannot be oriented, and the loft REFUSES.
+///
+/// A section authored direction is a statement about the edge list, not about
+/// the solid (`loft_opposite_winding_squares_builds_the_same_exact_box` pins
+/// that for a square), so this input asks for the same 864-unit prism as the
+/// case above. It does not get it -- and the reason is not the band. This test
+/// measures both halves of that sentence:
+///
+/// * built with `validate_result` off, EVERY lateral face oriented outward
+///   normal agrees with its own boundary-traversal normal, which is the property
+///   the band-orientation fix is for. The notch faces included.
+/// * built normally, the operation returns a typed error naming the mesh
+///   orientation. The tessellator tears this L-shaped cap -- the last measured
+///   symptom was 6 boundary edges and 2 inconsistently-directed edges, every one
+///   of them on the cap face, while its 8 vertices and its B-Rep loop are intact
+///   -- and a solid whose mesh cannot be oriented is exactly what the post-check
+///   exists to keep from minting. Refusing is the honest answer; the alternative
+///   is a certificate that reads `oriented=false` on a body the kernel handed
+///   out anyway.
+///
+/// When the cap tessellation is fixed, this test goes red by BUILDING, and its
+/// replacement is the same assertions as the case above.
+#[test]
+fn loft_l_section_whose_cap_the_mesh_cannot_orient_is_refused_not_minted() {
+    const HEIGHT: f64 = 12.0;
+
+    // Half one: the band flags are right.
+    let mut m = BRepModel::new();
+    let p0 = polygon_profile(&mut m, &l_corners(0.0));
+    let p1 = polygon_profile(&mut m, &l_corners(HEIGHT));
+    let unvalidated = LoftOptions {
+        create_solid: true,
+        common: CommonOptions {
+            validate_result: false,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let solid = loft_profiles(&mut m, vec![p0, p1], unvalidated)
+        .expect("the unvalidated L-section loft must still build");
+
+    let faces = lateral_faces(&m, solid);
+    assert!(
+        faces.len() >= 8,
+        "expected at least 8 lateral faces, got {}",
+        faces.len()
+    );
+    for (pts, outward) in &faces {
+        let mut traversal = Point3::ORIGIN;
+        for k in 0..pts.len() {
+            traversal += pts[k].cross(&pts[(k + 1) % pts.len()]);
+        }
+        assert!(
+            traversal.dot(outward) > 0.0,
+            "a lateral outward normal ({:.3},{:.3},{:.3}) opposes its own traversal normal ({:.3},{:.3},{:.3})",
+            outward.x,
+            outward.y,
+            outward.z,
+            traversal.x,
+            traversal.y,
+            traversal.z
+        );
+    }
+    let (disagreeing, total, axis_mid) = radial_heuristic_disagreements(&m, solid, 0.0, HEIGHT);
+    eprintln!(
+        "L->L counter-clockwise: {disagreeing} of {total} lateral flags differ from the radial heuristic anchored at ({:.3}, {:.3}, {:.3})",
+        axis_mid.x, axis_mid.y, axis_mid.z
+    );
+    assert!(
+        disagreeing > 0,
+        "L->L counter-clockwise: all {total} lateral flags agree with the radial heuristic, so this fixture proves nothing"
+    );
+
+    // Half two: the validated loft refuses rather than minting it.
+    let mut m2 = BRepModel::new();
+    let q0 = polygon_profile(&mut m2, &l_corners(0.0));
+    let q1 = polygon_profile(&mut m2, &l_corners(HEIGHT));
+    let err = loft_profiles(&mut m2, vec![q0, q1], loft_solid_opts())
+        .expect_err("a loft whose mesh cannot be oriented must not mint");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("not a consistently oriented mesh"),
+        "the refusal must name the mesh orientation, got: {msg}"
+    );
+    assert!(!msg.contains("  "), "refusal has a double space: {msg}");
+}
+
+/// A thin L-section lofted to the rectangle that bounds it.
+///
+/// The brief's case: dissimilar sections, one of them non-convex. Both the
+/// registration Task 42 added and the band orientation this task adds have to
+/// hold at once -- the rings differ in size (6 corners against 4) AND the
+/// bottom ring's centroid falls outside its own material.
+#[test]
+fn loft_l_section_to_a_square_is_closed_oriented_and_sound() {
+    const HEIGHT: f64 = 12.0;
+
+    let mut m = BRepModel::new();
+    let p0 = polygon_profile(&mut m, &l_corners(0.0));
+    let p1 = polygon_profile(
+        &mut m,
+        &[
+            Point3::new(0.0, 0.0, HEIGHT),
+            Point3::new(L_ARM_X, 0.0, HEIGHT),
+            Point3::new(L_ARM_X, L_ARM_Y, HEIGHT),
+            Point3::new(0.0, L_ARM_Y, HEIGHT),
+        ],
+    );
+
+    let solid = loft_profiles(&mut m, vec![p0, p1], loft_solid_opts())
+        .expect("loft of an L-section to a square must build");
+
+    let (disagreeing, total, axis_mid) = radial_heuristic_disagreements(&m, solid, 0.0, HEIGHT);
+    eprintln!(
+        "L->square: {disagreeing} of {total} lateral flags differ from the radial heuristic anchored at ({:.3}, {:.3}, {:.3})",
+        axis_mid.x, axis_mid.y, axis_mid.z
+    );
+
+    let v = oracle(&mut m, solid);
+    assert_closed_oriented_and_sound(&v, "L->square");
+
+    assert!(
+        disagreeing > 0,
+        "L->square: all {total} lateral flags agree with the radial heuristic, so this fixture proves nothing"
+    );
+}
+
+/// A CLOSED loft: `N` congruent squares standing in radial planes around the
+/// Z axis, each listed from a different corner.
+///
+/// `closed: true` adds the SEAM band, ring `N-1` against ring `0`, and ring 0
+/// is the anchor registration never re-indexes. Nothing else in the repo builds
+/// a closed loft, and this one's volume is exactly computable: every ruled patch
+/// of the body is PLANAR (the top and bottom patches lie in `z = +a` and
+/// `z = -a`; the inner and outer wall patches each span two parallel vertical
+/// lines), so the solid is the polyhedral annulus between two regular `N`-gons
+/// of circumradius `R + a` and `R - a`, extruded through `2a`:
+///
+/// `V = 2a * (N/2) * sin(2*pi/N) * ((R+a)^2 - (R-a)^2) = 4*N*R*a^2*sin(2*pi/N)`.
+#[test]
+fn closed_loft_of_rotated_squares_has_the_analytic_ring_volume() {
+    const N: usize = 8;
+    const R: f64 = 10.0;
+    const A: f64 = 2.0;
+
+    let mut m = BRepModel::new();
+    let mut profiles = Vec::with_capacity(N);
+    for k in 0..N {
+        let theta = std::f64::consts::TAU * (k as f64) / (N as f64);
+        let (c, s) = (theta.cos(), theta.sin());
+        // Local (radial, z) corners of the square section, counter-clockwise in
+        // the section plane; started at corner `k % 4` so the sections do not
+        // share an index origin.
+        let local = [(R - A, -A), (R + A, -A), (R + A, A), (R - A, A)];
+        let corners: Vec<Point3> = (0..4)
+            .map(|i| {
+                let (rho, z) = local[(i + k) % 4];
+                Point3::new(rho * c, rho * s, z)
+            })
+            .collect();
+        profiles.push(polygon_profile(&mut m, &corners));
+    }
+
+    let opts = LoftOptions {
+        create_solid: true,
+        closed: true,
+        ..Default::default()
+    };
+    let solid = loft_profiles(&mut m, profiles, opts).expect("closed loft of squares must build");
+
+    let v = oracle(&mut m, solid);
+    assert_closed_oriented_and_sound(&v, "closed loft of rotated squares");
+
+    let expected = 4.0 * (N as f64) * R * A * A * (std::f64::consts::TAU / (N as f64)).sin();
+    let rel = (v.volume - expected).abs() / expected;
+    assert!(
+        rel < 1e-3,
+        "closed loft of rotated squares: volume {:.6} is {:.4}% off the analytic ring {expected:.6}",
+        v.volume,
+        rel * 100.0
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The seam band of a closed loft
+// ---------------------------------------------------------------------------
+
+/// Vertices of `solid` lying in the radial half-plane at azimuth `theta`,
+/// as `(vertex id, position)`.
+fn radial_plane_vertices(model: &BRepModel, solid: SolidId, theta: f64) -> Vec<(u32, Point3)> {
+    let mut ids: Vec<u32> = shell_edges(model, solid)
+        .iter()
+        .filter_map(|&e| model.edges.get(e))
+        .flat_map(|e| [e.start_vertex, e.end_vertex])
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    ids.iter()
+        .filter_map(|&v| model.vertices.get(v).map(|p| (v, Point3::from(p.position))))
+        .filter(|(_, p)| {
+            let mut d = p.y.atan2(p.x) - theta;
+            while d > std::f64::consts::PI {
+                d -= std::f64::consts::TAU;
+            }
+            while d < -std::f64::consts::PI {
+                d += std::f64::consts::TAU;
+            }
+            d.abs() < 1e-9
+        })
+        .collect()
+}
+
+/// A CLOSED loft whose correspondence has HOLONOMY: the turn the chain
+/// accumulates around the ring lands entirely on the seam band.
+///
+/// `N` congruent squares stand in radial planes about Z at `2*pi*k/N`, and
+/// section `k` is additionally rotated `(90/N) degrees * k` IN ITS OWN PLANE.
+/// Every consecutive pair therefore sits `90/N = 11.25` degrees apart, which the
+/// registration chain resolves at shift 0 -- it has nothing to undo. By ring
+/// `N-1` the accumulated in-plane turn is `7 * 11.25 = 78.75` degrees, and the
+/// SEAM band pairs that ring against ring 0 at 0 degrees. A square is symmetric
+/// under a quarter turn, so the honest seam pairing is the one that treats
+/// `78.75` as `90 - 11.25`: it shifts by one quarter turn of the ring's samples
+/// and leaves each seam rail 11.25 degrees short. Ring 0's OWN indexing -- what
+/// the seam band used before this task -- pairs at `78.75` degrees and builds a
+/// band twisted by seven eighths of a quarter turn.
+///
+/// This is the production witness for the seam relabeling: nothing else in the
+/// suite produces a non-identity seam permutation (the closed ring of
+/// `closed_loft_of_rotated_squares_has_the_analytic_ring_volume` has no
+/// holonomy, so its seam permutation is the identity and is its own inverse --
+/// which is why applying the relabeling backwards cannot be caught there).
+///
+/// The seam assertion is independent of the loft's pairing rule: it measures
+/// the in-plane angle each built seam rail spans between ring `N-1` and ring 0
+/// and bounds it below the next available shift, from the fixture's own
+/// geometry. A seam twisted by 78.75 degrees violates that by a wide margin,
+/// and the check never consults `best_relabeling`.
+#[test]
+fn closed_loft_of_a_twisted_ring_registers_its_seam_band() {
+    const N: usize = 8;
+    const R: f64 = 10.0;
+    const A: f64 = 2.0;
+
+    let rho = A * std::f64::consts::SQRT_2;
+    let twist = std::f64::consts::FRAC_PI_2 / (N as f64);
+    let section = |k: usize| -> Vec<Point3> {
+        let theta = std::f64::consts::TAU * (k as f64) / (N as f64);
+        (0..4)
+            .map(|j| {
+                let phi = std::f64::consts::FRAC_PI_4
+                    + (j as f64) * std::f64::consts::FRAC_PI_2
+                    + (k as f64) * twist;
+                let (u, v) = (rho * phi.cos(), rho * phi.sin());
+                Point3::new((R + u) * theta.cos(), (R + u) * theta.sin(), v)
+            })
+            .collect()
+    };
+
+    let mut m = BRepModel::new();
+    let profiles: Vec<Vec<EdgeId>> = (0..N)
+        .map(|k| polygon_profile(&mut m, &section(k)))
+        .collect();
+
+    let opts = LoftOptions {
+        create_solid: true,
+        closed: true,
+        ..Default::default()
+    };
+    let solid = loft_profiles(&mut m, profiles, opts).expect("closed twisted-ring loft must build");
+
+    let v = oracle(&mut m, solid);
+    assert_closed_oriented_and_sound(&v, "closed twisted ring");
+
+    // The seam band: ring N-1 against ring 0.
+    let last_theta = std::f64::consts::TAU * ((N - 1) as f64) / (N as f64);
+    let ring_last = radial_plane_vertices(&m, solid, last_theta);
+    let ring_first = radial_plane_vertices(&m, solid, 0.0);
+    assert!(
+        ring_last.len() >= 4 && ring_last.len() == ring_first.len(),
+        "seam rings read back as {} and {} samples",
+        ring_last.len(),
+        ring_first.len()
+    );
+
+    // Every seam rail must join two samples whose IN-PLANE offset angles agree
+    // to within the residual turn. Each ring's 8 densified samples sit at
+    // in-plane angles 45 degrees apart (4 corners at 45 + 90j, 4 edge midpoints
+    // at 90j), so a seam pairing shifted by `s` samples leaves a residual of
+    // `78.75 - 45*s` degrees: 78.75 at shift 0 (ring 0's own indexing, what the
+    // seam band used before this task), 33.75 at shift 1, and -11.25 at shift 2,
+    // which is the honest one. The bound below sits between 11.25 and 33.75, so
+    // it admits only the honest pairing, and it is computed from the fixture's
+    // own geometry rather than from anything the loft did.
+    const RESIDUAL_BOUND_DEG: f64 = 20.0;
+    let in_plane_angle = |p: Point3| -> f64 {
+        let radius = (p.x * p.x + p.y * p.y).sqrt();
+        p.z.atan2(radius - R)
+    };
+    let wrap_deg = |a: f64| -> f64 {
+        let mut d = a.to_degrees() % 360.0;
+        while d > 180.0 {
+            d -= 360.0;
+        }
+        while d < -180.0 {
+            d += 360.0;
+        }
+        d
+    };
+
+    let last_ids: std::collections::HashMap<u32, Point3> = ring_last.iter().copied().collect();
+    let first_ids: std::collections::HashMap<u32, Point3> = ring_first.iter().copied().collect();
+    let mut residuals: Vec<f64> = Vec::new();
+    let mut worst_rail = 0.0f64;
+    for &eid in &shell_edges(&m, solid) {
+        let Some(e) = m.edges.get(eid) else { continue };
+        let (a, b) = (e.start_vertex, e.end_vertex);
+        let pair = match (last_ids.get(&a), first_ids.get(&b)) {
+            (Some(&pa), Some(&pb)) => Some((pa, pb)),
+            _ => match (last_ids.get(&b), first_ids.get(&a)) {
+                (Some(&pa), Some(&pb)) => Some((pa, pb)),
+                _ => None,
+            },
+        };
+        let Some((pa, pb)) = pair else { continue };
+        residuals.push(wrap_deg(in_plane_angle(pa) - in_plane_angle(pb)));
+        worst_rail = worst_rail.max((pa - pb).magnitude());
+    }
+    let worst_residual = residuals.iter().fold(0.0f64, |w, r| w.max(r.abs()));
+    // Printed BEFORE the assertions, so a failing build reports its numbers too.
+    eprintln!(
+        "closed twisted ring: {} seam rails, worst in-plane residual {worst_residual:.3} deg, longest rail {worst_rail:.3}, volume {:.6}",
+        residuals.len(),
+        v.volume
+    );
+    for residual in &residuals {
+        assert!(
+            residual.abs() <= RESIDUAL_BOUND_DEG,
+            "seam rail joins in-plane angles {residual:.3} degrees apart, past the {RESIDUAL_BOUND_DEG} degree bound: the seam band carries the ring's accumulated turn"
+        );
+    }
+    let rails = residuals.len();
+    assert_eq!(
+        rails,
+        ring_last.len(),
+        "every ring-{} sample must carry exactly one seam rail",
+        N - 1
     );
 }
