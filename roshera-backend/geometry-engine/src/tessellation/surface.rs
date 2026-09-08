@@ -979,14 +979,20 @@ fn sample_loop_3d_polygon(
 /// direction satisfies the caller's winding contract (CCW in the
 /// `u_axis × v_axis = normal` basis).
 ///
-/// KNOWN GAP (pre-existing, filed as its own task): the same-sign turn
-/// test cannot tell a convex polygon from a SELF-INTERSECTING star. An
+/// "Simple" in the first line is CHECKED, not assumed. Same-sign turns
+/// alone cannot tell a convex polygon from a SELF-INTERSECTING star: an
 /// unsplit pentagram turns the same way at every vertex with no
-/// collinear vertex anywhere, so it is accepted HERE — before `cdt` is
-/// ever consulted — and fanned into overlapping triangles that read
-/// closed while the area double-counts. `cdt_refusal_fallback`'s
-/// `PointOnFixedEdge` gate does NOT cover this: that gate only stops
-/// the fallback from widening this hole, it does not close it.
+/// collinear vertex anywhere, so it passed that test and was fanned into
+/// overlapping triangles that read closed while covering 2.4798x the
+/// area the star region encloses once (unsigned triangle area; the
+/// SIGNED total is 1.3090x, the two disagreeing because one fan triangle
+/// comes out wound against the other two — no partition of a region can).
+/// `cdt_refusal_fallback`'s `PointOnFixedEdge` gate never covered this —
+/// it only stopped the fallback from widening the hole. The
+/// convex-position loop below closes it: such a contour is refused here
+/// and reaches `cdt`, which names it (`CrossingFixedEdge`) and refuses
+/// it in turn, so the face emits nothing and the shell reports open
+/// rather than closed around the wrong volume.
 fn fan_strictly_convex_polygon(
     pts2d: &[(f64, f64)],
     range: (usize, usize),
@@ -1018,6 +1024,54 @@ fn fan_strictly_convex_polygon(
             sign = cross.signum();
         } else if cross.signum() != sign {
             return None; // reflex vertex — CDT path
+        }
+    }
+
+    // CONVEX POSITION — the test that makes "simple" true rather than
+    // assumed. Same-sign turns are LOCAL: they constrain consecutive
+    // edge pairs and say nothing about edges that are far apart in the
+    // contour, so a star polygon (every turn the same way, five
+    // crossings) passed the loop above and was fanned into overlapping
+    // triangles. Here every vertex must lie strictly on the INNER side
+    // of every edge's supporting line.
+    //
+    // Why that is a proof and not a heuristic. Each edge with all other
+    // vertices strictly to one side is an edge of the vertex set's
+    // convex hull; two contour edges cannot be the same hull edge
+    // without a repeated vertex, which lands exactly ON a line and is
+    // refused here; so the contour's n edges are n distinct hull edges
+    // and each vertex carries exactly its two hull edges — the contour
+    // IS the hull cycle, traversed once. Equivalently: turning number
+    // ±1, the discriminator a self-intersecting star fails (its turning
+    // number is ±2). A turning-number test by summed angles would need
+    // `atan2` and a tolerance on 2π that is not derived from the
+    // contour; this needs neither — only the same cross product and the
+    // same scale-relative `eps` the turn test above already uses.
+    //
+    // It cannot refuse a genuine convex polygon that the turn test
+    // accepted: for a convex polygon the vertex nearest an edge's line
+    // is one of its two neighbours (distance to the line is unimodal
+    // along the hull cycle), and both of those crosses ARE turn crosses
+    // the loop above already required to exceed `eps`. Measured margins
+    // over `eps` for a regular n-gon: 5e11x at n=4, 2.4e8x at n=64,
+    // 9e2x at n=4096 — the subtraction order differs by ulps, which at
+    // those margins cannot change a verdict.
+    //
+    // O(n²) sign tests. The contours that reach this fast path are face
+    // loops — quad walls and 64-gon caps — where n² is a few thousand
+    // flops, far below the CDT setup this path exists to avoid.
+    for i in 0..n {
+        let (ax, ay) = pts2d[s + i];
+        let (bx, by) = pts2d[s + (i + 1) % n];
+        for j in 0..n {
+            if j == i || j == (i + 1) % n {
+                continue; // the edge's own endpoints lie on it by definition
+            }
+            let (cx, cy) = pts2d[s + j];
+            let cross = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
+            if cross * sign <= eps {
+                return None; // self-intersecting, or a vertex on an edge — CDT path
+            }
         }
     }
 
@@ -1240,13 +1294,14 @@ pub(crate) fn triangulate_planar_polygon(
             // double-counts. An empty face and an honestly-refused solid
             // beat a closed solid with the wrong volume.
             //
-            // SCOPE, stated honestly: this gate keeps the FALLBACK from
-            // widening an existing hole -- it does not close it. A
-            // self-intersecting star with no collinear vertex never
-            // reaches here at all, because `fan_strictly_convex_polygon`
-            // above accepts it and returns before `cdt` is consulted.
-            // That is a pre-existing gap in the strict fan, filed as its
-            // own task; see its doc comment.
+            // SCOPE: this gate keeps the FALLBACK from widening the
+            // hole; the strict fan's convex-position test is what closes
+            // it. A self-intersecting star with no collinear vertex used
+            // to be claimed by `fan_strictly_convex_polygon` above and
+            // never reached `cdt` at all; that fan now refuses it, so it
+            // arrives here as `CrossingFixedEdge` and this gate declines
+            // to recover it. Both halves are needed: the fan must not
+            // claim the contour, and the fallback must not re-claim it.
             let recovered = matches!(e, cdt::Error::PointOnFixedEdge(_))
                 .then(|| cdt_refusal_fallback(&pts2d, outer_range, &inner_ranges))
                 .flatten();
@@ -10743,6 +10798,190 @@ mod tests {
                 "the weak fan accepts the star (all turns share a sign); if this ever ",
                 "returns None the refusal gate above stops being the thing under test"
             )
+        );
+    }
+
+    /// The pentagram as the tessellator actually meets it: FIVE tips and
+    /// nothing else.
+    ///
+    /// [`self_intersecting_star`] above carries a midpoint on its first
+    /// edge, so the strict fan refuses it through the COLLINEARITY branch
+    /// and the contour never exercises any judgement about crossing. This
+    /// fixture is the one that does: every turn cross is +2.1266270,
+    /// twelve orders of magnitude above the fan's degeneracy epsilon
+    /// (1e-12 x extent^2 = 1e-12 here), no two consecutive edges are
+    /// collinear, no turn reverses sign - and the contour still crosses
+    /// itself five times. Same-sign turns are LOCAL convexity; they say
+    /// nothing about non-adjacent edges.
+    fn unsplit_pentagram() -> Vec<(f64, f64)> {
+        (0..5)
+            .map(|k| {
+                let a = std::f64::consts::PI / 2.0 + (k as f64) * 4.0 * std::f64::consts::PI / 5.0;
+                (a.cos(), a.sin())
+            })
+            .collect()
+    }
+
+    /// The SAME star drawn as a SIMPLE polygon: ten vertices alternating
+    /// the tip radius 1 with the inner radius `cos(2pi/5)/cos(pi/5)`, the
+    /// pentagram's own edge crossings. Its shoelace area is the area the
+    /// star region covers ONCE, which is the total any honest
+    /// triangulation of that region must come to.
+    fn pentagram_outline_decagon() -> Vec<(f64, f64)> {
+        let inner = (2.0 * std::f64::consts::PI / 5.0).cos() / (std::f64::consts::PI / 5.0).cos();
+        (0..10)
+            .map(|k| {
+                let a = std::f64::consts::PI / 2.0 + (k as f64) * std::f64::consts::PI / 5.0;
+                let r = if k % 2 == 0 { 1.0 } else { inner };
+                (r * a.cos(), r * a.sin())
+            })
+            .collect()
+    }
+
+    /// Unsigned shoelace area of a closed 2D contour.
+    fn shoelace_area(pts: &[(f64, f64)]) -> f64 {
+        let n = pts.len();
+        let mut acc = 0.0;
+        for i in 0..n {
+            let (ax, ay) = pts[i];
+            let (bx, by) = pts[(i + 1) % n];
+            acc += ax * by - bx * ay;
+        }
+        (acc * 0.5).abs()
+    }
+
+    /// SIGNED sum of triangle areas (2D, ignoring z) - the companion to
+    /// [`total_tri_area_xy`], which sums magnitudes.
+    ///
+    /// The pair is the measurement: for a valid triangulation of a
+    /// simple region the two agree up to sign, because every triangle
+    /// winds the same way. Where they DISAGREE at least one triangle is
+    /// wound against the rest, which no partition of a region can be.
+    fn signed_tri_area_xy(vertices: &[Point3], tris: &[[usize; 3]]) -> f64 {
+        tris.iter()
+            .map(|t| {
+                let a = vertices[t[0]];
+                let b = vertices[t[1]];
+                let c = vertices[t[2]];
+                ((b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x)) * 0.5
+            })
+            .sum()
+    }
+
+    /// The strict fan must not read a self-intersecting star as convex.
+    ///
+    /// Same-sign turns are a LOCAL test; the pentagram passes all five of
+    /// them and is fanned into three OVERLAPPING triangles. The failure
+    /// message measures the lie WITHOUT asserting a mechanism the numbers
+    /// do not show: the unsigned area the fan lays down against the area
+    /// the region encloses once, and the signed total beside it. Measured
+    /// on the fixture: 2.783791 unsigned (2.4798x) against 1.469463
+    /// signed (1.3090x), the gap being triangle `[0, 2, 3]`, whose cross
+    /// is -1.314328 where the other two are +2.126627.
+    #[test]
+    fn the_strict_fan_refuses_an_unsplit_pentagram() {
+        let star = unsplit_pentagram();
+        let (vertices, _) = build_planar_loops(&star, &[]);
+        let fanned = fan_strictly_convex_polygon(&star, (0, star.len()));
+        let (count, ink, signed) = match &fanned {
+            Some(tris) => (
+                tris.len(),
+                total_tri_area_xy(&vertices, tris),
+                signed_tri_area_xy(&vertices, tris),
+            ),
+            None => (0, 0.0, 0.0),
+        };
+        let once = shoelace_area(&pentagram_outline_decagon());
+        assert!(
+            fanned.is_none(),
+            concat!(
+                "the strict fan must refuse a contour that crosses itself: it fanned {} ",
+                "triangle(s) laying down {:.6} of UNSIGNED triangle area over a region ",
+                "that encloses {:.6} once ({:.4}x), while their SIGNED total is only ",
+                "{:.6} ({:.4}x) - the two disagree, so at least one triangle is wound ",
+                "against the rest and the fan is no partition of any region"
+            ),
+            count,
+            ink,
+            once,
+            ink / once,
+            signed,
+            signed / once
+        );
+    }
+
+    /// End to end at the production entry point: a self-intersecting
+    /// contour must emit NOTHING rather than a fan that covers the plane
+    /// more than once.
+    ///
+    /// Zero triangles leaves the face's boundary edges unmatched, so
+    /// `manifold_report` reports `closed: false` and the solid is refused
+    /// - the honest answer. A fan of three overlapping triangles instead
+    /// reads CLOSED over 2.4798x the unsigned area the region encloses.
+    #[test]
+    fn an_unsplit_pentagram_face_emits_no_triangles() {
+        let star = unsplit_pentagram();
+        let (vertices, boundaries) = build_planar_loops(&star, &[]);
+        let tris = triangulate_planar_polygon(&vertices, &boundaries, &Vector3::Z);
+        let ink = total_tri_area_xy(&vertices, &tris);
+        let signed = signed_tri_area_xy(&vertices, &tris);
+        let once = shoelace_area(&pentagram_outline_decagon());
+        assert!(
+            tris.is_empty(),
+            concat!(
+                "a self-intersecting face must emit no triangles: got {} laying down ",
+                "{:.6} of UNSIGNED triangle area where the region encloses {:.6} once ",
+                "({:.4}x), signed total {:.6} ({:.4}x) - one triangle wound against the ",
+                "rest. A closed shell over the wrong area is the one answer the kernel ",
+                "must never give"
+            ),
+            tris.len(),
+            ink,
+            once,
+            ink / once,
+            signed,
+            signed / once
+        );
+    }
+
+    /// The convex fast path is byte-identical, pinned at the production
+    /// entry point.
+    ///
+    /// The self-intersection gate may only ADD refusals. These three are
+    /// the workhorse contours - an extruded quad wall either way round
+    /// and a sketched circle's 64-gon cap - pinned as exact index lists
+    /// in exact order, so any change to the fan's output (or a gate that
+    /// refuses a genuine convex polygon) is a failure here.
+    #[test]
+    fn the_convex_fan_output_is_unchanged() {
+        let ccw = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)];
+        let (v, b) = build_planar_loops(&ccw, &[]);
+        assert_eq!(
+            triangulate_planar_polygon(&v, &b, &Vector3::Z),
+            vec![[0, 1, 2], [0, 2, 3]],
+            "a CCW unit square must still fan from vertex 0 in order"
+        );
+
+        let cw = [(0.0, 0.0), (0.0, 1.0), (1.0, 1.0), (1.0, 0.0)];
+        let (v, b) = build_planar_loops(&cw, &[]);
+        assert_eq!(
+            triangulate_planar_polygon(&v, &b, &Vector3::Z),
+            vec![[0, 2, 1], [0, 3, 2]],
+            "a CW unit square must still fan reversed, in order"
+        );
+
+        let cap: Vec<(f64, f64)> = (0..64)
+            .map(|k| {
+                let a = (k as f64) * 2.0 * std::f64::consts::PI / 64.0;
+                (a.cos(), a.sin())
+            })
+            .collect();
+        let (v, b) = build_planar_loops(&cap, &[]);
+        let expected: Vec<[usize; 3]> = (1..63).map(|i| [0, i, i + 1]).collect();
+        assert_eq!(
+            triangulate_planar_polygon(&v, &b, &Vector3::Z),
+            expected,
+            "a 64-gon circle cap must still fan from vertex 0 in order"
         );
     }
 
