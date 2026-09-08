@@ -483,15 +483,17 @@ fn features_no_constraint_can_place_a_point_at_propose_nothing() {
     );
 
     // The ellipse BOUNDARY: an on-curve hit, and an ellipse is not a
-    // `PointOnCurve` carrier. Equal semi-axes because
-    // `Ellipse2d::closest_point` diverges otherwise -- see the
-    // fixture note on the draft-line ellipse test.
+    // `PointOnCurve` carrier. The semi-axes are genuinely UNEQUAL --
+    // when this test was written `Ellipse2d::closest_point` diverged
+    // for anything but a circle and the fixture had to use 4x4 to reach
+    // the on-curve path at all; Task 49 fixed the solver, so the
+    // fixture now exercises the real elliptical case.
     let round = fresh();
     round
-        .add_ellipse(Point2d::new(0.0, 0.0), 4.0, 4.0, 0.0)
+        .add_ellipse(Point2d::new(0.0, 0.0), 6.0, 3.0, 0.0)
         .expect("ellipse");
-    let r = 4.0 * std::f64::consts::FRAC_1_SQRT_2 * 1.01;
-    let on_boundary = Point2d::new(r, r);
+    let k = std::f64::consts::FRAC_1_SQRT_2 * 1.01;
+    let on_boundary = Point2d::new(6.0 * k, 3.0 * k);
     assert!(
         round
             .best_snap(on_boundary, 0.5)
@@ -522,24 +524,26 @@ fn features_no_constraint_can_place_a_point_at_propose_nothing() {
 /// `PointOnCurve(point, ellipse)` came out instead, and an ellipse is
 /// not a `PointOnCurve` carrier either.
 ///
-/// The fixture's semi-axes are EQUAL. `Ellipse2d::closest_point`
-/// diverges for a genuinely elliptical one (see the report: 0 of 2880
-/// probe positions around a 6x3 ellipse produce an `OnEllipse`
-/// candidate within 0.5), so an unequal-axis fixture would test
-/// nothing. With equal axes the Newton iteration's first guess is
-/// already the answer and breaks immediately, which is what makes the
-/// on-curve path reachable at all.
+/// The fixture's semi-axes were EQUAL when this was written, because
+/// `Ellipse2d::closest_point` diverged for a genuinely elliptical one
+/// (16 of 2880 probe positions around a 6x3 ellipse produced an
+/// `OnEllipse` candidate within 0.5, and those 16 are only the four
+/// axis crossings, where the iteration exits before its first step) and
+/// an unequal-axis fixture would
+/// have tested nothing. Task 49 replaced that iteration with a
+/// bracketed bisection, so the fixture is a real 6x3 ellipse and the
+/// on-curve path is reached the way a user reaches it.
 #[test]
 fn draft_line_endpoint_on_an_ellipse_proposes_nothing_about_the_ellipse() {
     let sketch = fresh();
     sketch
-        .add_ellipse(Point2d::new(0.0, 0.0), 4.0, 4.0, 0.0)
+        .add_ellipse(Point2d::new(0.0, 0.0), 6.0, 3.0, 0.0)
         .expect("ellipse");
 
-    // t = pi/4, 1% outside: away from every quadrant (3.08 off the
+    // t = pi/4, 1% outside: away from every quadrant (2.74 off the
     // nearest), so the hit is ON-CURVE and not a discrete feature.
-    let r = 4.0 * std::f64::consts::FRAC_1_SQRT_2 * 1.01;
-    let start = Point2d::new(r, r);
+    let k = std::f64::consts::FRAC_1_SQRT_2 * 1.01;
+    let start = Point2d::new(6.0 * k, 3.0 * k);
     assert!(
         sketch
             .best_snap(start, 0.5)

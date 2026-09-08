@@ -449,12 +449,21 @@ impl Sketch {
                 Point2d::new(e.center.x - minor_offset.0, e.center.y - minor_offset.1),
                 SnapKind::EllipseQuadrant,
             );
-            push_if_close(
-                &mut out,
-                entity,
-                e.closest_point(&cursor),
-                SnapKind::OnEllipse,
-            );
+            // `closest_point` refuses rather than approximating: a
+            // non-finite cursor, or an ellipse whose public axes have
+            // been left non-positive, has no foot to report. This
+            // function's contract is a list of candidates, not a
+            // Result — the api-server route
+            // (`api-server/src/csketch.rs` `snap`, POST
+            // `/api/csketch/{id}/snap`) hands the Vec straight to the
+            // client — so a refusal is expressed
+            // by offering NO on-boundary candidate. That withholds a
+            // snap; it never invents one. The discrete ellipse
+            // features above are unaffected, exactly as they are for
+            // every other entity kind under a non-finite cursor.
+            if let Ok(foot) = e.closest_point(&cursor) {
+                push_if_close(&mut out, entity, foot, SnapKind::OnEllipse);
+            }
         }
 
         out.sort_by(|a, b| {

@@ -249,9 +249,114 @@ impl Ellipse2d {
         (value - 1.0).abs() < tolerance.distance / self.semi_minor.min(self.semi_major)
     }
 
-    /// Find the closest point on the ellipse to a given point
-    pub fn closest_point(&self, point: &Point2d) -> Point2d {
-        // Transform point to local coordinates
+    /// Find the closest point on the ellipse to a given point.
+    ///
+    /// Returns the foot of the perpendicular from `point` — the point
+    /// of the ellipse's boundary that minimises the distance — or a
+    /// typed error. It never returns an approximation it cannot
+    /// justify.
+    ///
+    /// # Method
+    ///
+    /// Eberly's reduction (*Distance from a Point to an Ellipse, an
+    /// Ellipsoid, or a Hyperellipsoid*, Geometric Tools). The point is
+    /// taken into the ellipse's local frame and reflected into the
+    /// closed first quadrant, where the minimiser is unique. Writing
+    /// `z0 = y0/e0`, `z1 = y1/e1`, `r0 = (e0/e1)^2 >= 1` and
+    /// `n0 = r0*z0`, the foot is `(r0*y0/((w - 1) + r0), y1/w)` for the
+    /// unique root `w` of
+    ///
+    /// ```text
+    /// F(w) = (n0/((w - 1) + r0))^2 + (z1/w)^2 - 1
+    /// ```
+    ///
+    /// (`w` is Eberly's `s + 1`; see `bisect_ratio_root` for why the
+    /// shifted variable is the one that survives rounding.) `F` is
+    /// continuous and strictly decreasing on `w > 0`, from `+inf` at the
+    /// origin to `-1` at infinity, so a root exists and is unique. It is
+    /// bracketed below by `w = z1`, where the second term is exactly
+    /// zero and `F = (n0/((z1 - 1) + r0))^2 >= 0`, and above by `w = 1`
+    /// when the point is inside (`F(1) = z0^2 + z1^2 - 1 < 0`) or
+    /// `w = sqrt(n0^2 + z1^2)` when it is not. Each end is then WIDENED
+    /// until its sign is measured rather than assumed, so the bracket is
+    /// a fact before the first halving. Bisection halves it every step
+    /// and stops when the midpoint coincides with an endpoint — i.e.
+    /// when the two are adjacent doubles — so the root is located
+    /// to the last representable bit OF THAT BRACKET. What the returned
+    /// FOOT is worth is settled separately, by the on-curve residual
+    /// check in `closest_point`, which is what makes the answer
+    /// certified rather than merely converged. The step count is
+    /// bounded by the
+    /// exponent span of `f64` (`CLOSEST_POINT_MAX_BISECTIONS`), never by
+    /// a guess. Real geometry closes the bracket in about sixty steps.
+    ///
+    /// A previous implementation ran Newton's method on
+    /// `f(t) = (P - E(t)) . E'(t)` with `+|E'|^2 + (P - E) . E''` for
+    /// `f'(t)`; the derivative is `-|E'|^2 + (P - E) . E''`, so every
+    /// step walked away from the root and the result was a point on the
+    /// far side of the curve. `tests/sketch2d_ellipse_closest_point.rs`
+    /// pins both the sign and the answer.
+    ///
+    /// # Ambiguity
+    ///
+    /// A whole SEGMENT of inputs has more than one true minimiser, and
+    /// all of them are answered with a documented choice rather than an
+    /// error, because every candidate is genuinely closest — nothing is
+    /// approximated:
+    ///
+    /// * every point of the closed major-axis segment from the centre
+    ///   out to the evolute cusp `(a^2 - b^2)/a` has TWO minimisers,
+    ///   mirrored across that axis: `(a*r, +b*sqrt(1 - r^2))` and its
+    ///   negative. The `+` one is returned. The centre (`r = 0`) is the
+    ///   familiar end of that segment — the two minor-axis vertices,
+    ///   `+minor` returned;
+    /// * the centre of a circular ellipse (`a == b`) is equidistant
+    ///   from the whole boundary — not two points but all of them; the
+    ///   point at parameter `0` is returned, matching
+    ///   [`Circle2d::closest_point`].
+    ///
+    /// # Errors
+    ///
+    /// * [`Sketch2dError::InvalidParameter`] — `point` is not finite.
+    /// * [`Sketch2dError::DegenerateGeometry`] — an axis is not finite
+    ///   and positive, or the centre or rotation is not finite. The
+    ///   fields are public, so this is reachable without the
+    ///   constructor.
+    /// * [`Sketch2dError::NumericalError`] — the bracket does not
+    ///   straddle the root, or bisection did not close it within
+    ///   `CLOSEST_POINT_MAX_BISECTIONS` steps. The message names the
+    ///   bracket, the step count and the residual.
+    pub fn closest_point(&self, point: &Point2d) -> Sketch2dResult<Point2d> {
+        if !point.x.is_finite() || !point.y.is_finite() {
+            return Err(Sketch2dError::InvalidParameter {
+                parameter: "point".to_string(),
+                value: format!("({}, {})", point.x, point.y),
+                constraint: "finite".to_string(),
+            });
+        }
+        if !self.semi_major.is_finite()
+            || !self.semi_minor.is_finite()
+            || self.semi_major <= 0.0
+            || self.semi_minor <= 0.0
+        {
+            return Err(Sketch2dError::DegenerateGeometry {
+                entity: "Ellipse2d".to_string(),
+                reason: format!(
+                    "semi-axes ({}, {}) must both be finite and positive",
+                    self.semi_major, self.semi_minor
+                ),
+            });
+        }
+        if !self.center.x.is_finite() || !self.center.y.is_finite() || !self.rotation.is_finite() {
+            return Err(Sketch2dError::DegenerateGeometry {
+                entity: "Ellipse2d".to_string(),
+                reason: format!(
+                    "centre ({}, {}) and rotation {} must be finite",
+                    self.center.x, self.center.y, self.rotation
+                ),
+            });
+        }
+
         let dx = point.x - self.center.x;
         let dy = point.y - self.center.y;
 
@@ -261,38 +366,75 @@ impl Ellipse2d {
         let x_local = dx * cos_r + dy * sin_r;
         let y_local = -dx * sin_r + dy * cos_r;
 
-        // Use Newton's method to find closest point
-        // Initial guess based on angle to point
-        let mut t = y_local.atan2(x_local);
+        // The reduction needs the LONGER axis first. `Ellipse2d::new`
+        // keeps `semi_major >= semi_minor`, but the fields are public
+        // and `ParametricEllipse2d::transform` scales the two
+        // independently — a non-uniform scale can leave `semi_minor`
+        // the longer one. Sort the roles here, swap the answer back
+        // below.
+        let axes_swapped = self.semi_minor > self.semi_major;
+        let (e0, e1) = if axes_swapped {
+            (self.semi_minor, self.semi_major)
+        } else {
+            (self.semi_major, self.semi_minor)
+        };
+        let (u, v) = if axes_swapped {
+            (y_local, x_local)
+        } else {
+            (x_local, y_local)
+        };
 
-        // Newton iterations
-        for _ in 0..10 {
-            let cos_t = t.cos();
-            let sin_t = t.sin();
+        // The ellipse is symmetric about both local axes, so solving in
+        // the closed first quadrant and restoring the point's own signs
+        // gives the foot in the original quadrant.
+        let (q0, q1) = closest_point_first_quadrant(e0, e1, u.abs(), v.abs())?;
 
-            let px = self.semi_major * cos_t;
-            let py = self.semi_minor * sin_t;
-
-            let dx = x_local - px;
-            let dy = y_local - py;
-
-            let dpx = -self.semi_major * sin_t;
-            let dpy = self.semi_minor * cos_t;
-
-            let ddpx = -self.semi_major * cos_t;
-            let ddpy = -self.semi_minor * sin_t;
-
-            let f = dx * dpx + dy * dpy;
-            let df = dpx * dpx + dpy * dpy + dx * ddpx + dy * ddpy;
-
-            if f.abs() < 1e-10 {
-                break;
-            }
-
-            t -= f / df;
+        // Certify the foot before handing it out. The bracket proves a
+        // SIGN change; it does not prove that the arithmetic which
+        // produced its endpoints stayed inside the representable range,
+        // and two inputs make that difference visible:
+        //
+        // * a cursor far enough out that `sqrt(n0^2 + z1^2)` overflows
+        //   gives an upper end of `+inf`. `F(inf) = -1 <= 0` passes the
+        //   sign test, the first midpoint IS that endpoint, and the
+        //   bisection "converges" to infinity -- returning the ellipse's
+        //   CENTRE, whose implicit residual is -1. Measured at
+        //   (1e200, 1e200) on a 6x3 ellipse; (1e154, 1e154) is fine;
+        //   an aspect ratio of 1e140 turns it into a NaN foot.
+        // * subnormal coordinates fail the other way, landing a foot
+        //   measurably off the curve (0.006 at 1e-320).
+        //
+        // Both are caught by the only question that decides whether the
+        // answer is an answer: is the point about to be returned ON the
+        // ellipse? The bracket's own finiteness is refused separately in
+        // `bisect_ratio_root`; this is the check that does not depend on
+        // having anticipated the overflow path.
+        let on_curve = (q0 / e0) * (q0 / e0) + (q1 / e1) * (q1 / e1) - 1.0;
+        if !on_curve.is_finite() || on_curve.abs() > CLOSEST_POINT_ON_CURVE_TOLERANCE {
+            return Err(Sketch2dError::NumericalError {
+                description: format!(
+                    concat!(
+                        "closest point on ellipse: the computed foot ({}, {}) in the ",
+                        "ellipse frame is not on the ellipse -- implicit residual {}, ",
+                        "tolerance {}"
+                    ),
+                    q0, q1, on_curve, CLOSEST_POINT_ON_CURVE_TOLERANCE
+                ),
+            });
         }
 
-        self.evaluate(t)
+        let signed0 = if u < 0.0 { -q0 } else { q0 };
+        let signed1 = if v < 0.0 { -q1 } else { q1 };
+        let (foot_x, foot_y) = if axes_swapped {
+            (signed1, signed0)
+        } else {
+            (signed0, signed1)
+        };
+
+        Ok(Point2d::new(
+            self.center.x + foot_x * cos_r - foot_y * sin_r,
+            self.center.y + foot_x * sin_r + foot_y * cos_r,
+        ))
     }
 
     /// Convert to a circle if semi-major equals semi-minor
@@ -399,6 +541,236 @@ impl Ellipse2d {
         }
         normalized
     }
+}
+
+/// Bisection budget for [`Ellipse2d::closest_point`].
+///
+/// Bisection halves the bracket every step and stops when the midpoint
+/// coincides with an endpoint, so the step count is bounded by the
+/// number of times the widest representable interval can be halved
+/// before its ends become adjacent doubles: `log2(f64::MAX /
+/// f64::MIN_POSITIVE subnormal) = 1024 + 1074 = 2098`. The budget
+/// stands just above that, so exhausting it is impossible for a
+/// bracket the solver actually builds and the error below is a guard,
+/// not a rounding policy. Brackets that arise from real geometry close
+/// in about sixty steps.
+const CLOSEST_POINT_MAX_BISECTIONS: usize = 2100;
+
+/// How far off the ellipse a computed foot may sit before
+/// [`Ellipse2d::closest_point`] refuses it, as the dimensionless
+/// implicit residual `(x/a)^2 + (y/b)^2 - 1`.
+///
+/// Every foot the solver returns for an input inside the representable
+/// range measures under `1e-12` -- asserted over 200 cursors on four
+/// ellipses, including a 160:1 sliver, in
+/// `tests/sketch2d_ellipse_closest_point.rs`. The refusal threshold
+/// sits three orders looser so that rounding never costs a caller a
+/// legitimate answer, while still catching the two failure modes that
+/// motivated it: an overflowed bracket (residual -1, the centre) and
+/// subnormal coordinates (residual ~4e-3).
+const CLOSEST_POINT_ON_CURVE_TOLERANCE: f64 = 1e-9;
+
+/// The foot of the perpendicular for a point already reduced to the
+/// closed first quadrant of an axis-aligned ellipse with `e0 >= e1 > 0`
+/// and `y0, y1 >= 0`.
+///
+/// The three arms are Eberly's: an interior/exterior point off both
+/// axes needs the bisection; a point on the minor axis has the minor
+/// vertex as its foot; a point on the major axis has one either side of
+/// the evolute cusp at `(e0^2 - e1^2)/e0`.
+fn closest_point_first_quadrant(e0: f64, e1: f64, y0: f64, y1: f64) -> Sketch2dResult<(f64, f64)> {
+    if y1 > 0.0 {
+        if y0 > 0.0 {
+            let z0 = y0 / e0;
+            let z1 = y1 / e1;
+            let g = z0 * z0 + z1 * z1 - 1.0;
+            let r0 = (e0 / e1) * (e0 / e1);
+            let w = bisect_ratio_root(r0, z0, z1, g)?;
+            Ok((r0 * y0 / ((w - 1.0) + r0), y1 / w))
+        } else {
+            // On the minor axis: the foot is the minor vertex. For the
+            // centre of a proper ellipse this is one of the two true
+            // minimisers — the documented choice.
+            Ok((0.0, e1))
+        }
+    } else {
+        // On the major axis. Inside the evolute cusp the foot leaves
+        // the axis; outside it (and for every circular ellipse, where
+        // `denom` is zero and the comparison is false) it is the major
+        // vertex — the same choice `Circle2d::closest_point` makes for
+        // a point at the centre.
+        let numer = e0 * y0;
+        let denom = e0 * e0 - e1 * e1;
+        if numer < denom {
+            let ratio = numer / denom;
+            // `1 - ratio^2` is non-negative for `ratio < 1`, which the
+            // branch guarantees; the clamp only absorbs rounding at the
+            // cusp itself.
+            Ok((e0 * ratio, e1 * (1.0 - ratio * ratio).max(0.0).sqrt()))
+        } else {
+            Ok((e0, 0.0))
+        }
+    }
+}
+
+/// The refusal a bracket that is not usable earns: the interval, the
+/// number of widenings actually performed, and both residuals AS THEY
+/// STAND AT THE EXIT, so a reader can see which end failed and by how
+/// much. The count is the live one -- a budget-shaped constant here
+/// would report 2100 for the zero-widening exits and hide which path
+/// refused.
+fn bracket_error(
+    lower: f64,
+    upper: f64,
+    f_lower: f64,
+    f_upper: f64,
+    widenings: usize,
+) -> Sketch2dError {
+    Sketch2dError::NumericalError {
+        description: format!(
+            concat!(
+                "closest point on ellipse: the bracket [{}, {}] is not usable ",
+                "after {} widenings (F = {} and {}, wanted a finite interval ",
+                "with F >= 0 and <= 0)"
+            ),
+            lower, upper, widenings, f_lower, f_upper
+        ),
+    }
+}
+
+/// The unique root of
+/// `F(w) = (r0*z0/((w - 1) + r0))^2 + (z1/w)^2 - 1` on `w > 0`, by
+/// bisection over a bracket the function itself is made to certify.
+///
+/// `w` is Eberly's `s + 1`. Solving in `w` rather than `s` is not
+/// cosmetic: the lower end of the bracket is `w = z1`, where the second
+/// term is `(z1/z1)^2 - 1`, exactly zero in IEEE arithmetic, so `F` is
+/// provably non-negative there. Written in `s` the same endpoint is
+/// `z1 - 1` and the term becomes `(z1/((z1 - 1) + 1))^2 - 1`, whose
+/// denominator loses the cancellation: for `z1 = 0.05` it evaluates to
+/// -2e-15 and a straddle test on the true sign refuses a perfectly
+/// ordinary point. Measured, on the 160:1 sliver in
+/// `tests/sketch2d_ellipse_closest_point.rs`.
+///
+/// `g` is `F(1)` (Eberly's `F(0)`), i.e. `z0^2 + z1^2 - 1`: negative
+/// inside the ellipse, positive outside, zero on it.
+fn bisect_ratio_root(r0: f64, z0: f64, z1: f64, g: f64) -> Sketch2dResult<f64> {
+    let n0 = r0 * z0;
+    // `(w - 1) + r0` is grouped so that `w = 1` reproduces `n0/r0`,
+    // which is `z0` to within a ulp — `(r0*z0)/r0 != z0` for about an
+    // eighth of all pairs — making `F(1) = g` exact to a ulp rather
+    // than merely close. The widening walk below absorbs that last bit.
+    let residual = |w: f64| {
+        let ratio0 = n0 / ((w - 1.0) + r0);
+        let ratio1 = z1 / w;
+        ratio0 * ratio0 + ratio1 * ratio1 - 1.0
+    };
+
+    // `F` falls monotonically from `+inf` at `w -> 0+` to `-1` as
+    // `w -> inf`, so widening either end can only move it towards the
+    // sign that end needs. Rather than trusting the closed forms to
+    // round the right way, walk each end until the sign is a MEASURED
+    // fact. Both loops are no-ops for every well-formed input; they
+    // terminate for the same reason the root exists, and a budget that
+    // runs out is a non-finite input, reported below.
+    let mut lower = z1;
+    let mut upper = if g < 0.0 {
+        1.0
+    } else {
+        (n0 * n0 + z1 * z1).sqrt()
+    };
+
+    // Finiteness first, and BEFORE the sign walk. `sqrt(n0^2 + z1^2)`
+    // overflows for a cursor around 1e155 out from a 6x3 ellipse, and
+    // `+inf` passes every sign test there is: `F(inf) = -1 <= 0`, so
+    // the walk breaks immediately, and the first bisection midpoint
+    // `0.5*(lower + inf)` IS `inf`, which equals the endpoint and
+    // "converges". The bracket is only a certificate if it is an
+    // interval.
+    let mut widenings = 0usize;
+    if !lower.is_finite() || !upper.is_finite() || lower <= 0.0 {
+        return Err(bracket_error(
+            lower,
+            upper,
+            residual(lower),
+            residual(upper),
+            widenings,
+        ));
+    }
+
+    loop {
+        if residual(lower) >= 0.0 {
+            break;
+        }
+        lower *= 0.5;
+        widenings += 1;
+        if widenings > CLOSEST_POINT_MAX_BISECTIONS || lower <= 0.0 {
+            return Err(bracket_error(
+                lower,
+                upper,
+                residual(lower),
+                residual(upper),
+                widenings,
+            ));
+        }
+    }
+    loop {
+        if residual(upper) <= 0.0 {
+            break;
+        }
+        upper *= 2.0;
+        widenings += 1;
+        if widenings > CLOSEST_POINT_MAX_BISECTIONS || !upper.is_finite() {
+            return Err(bracket_error(
+                lower,
+                upper,
+                residual(lower),
+                residual(upper),
+                widenings,
+            ));
+        }
+    }
+    if lower > upper {
+        return Err(bracket_error(
+            lower,
+            upper,
+            residual(lower),
+            residual(upper),
+            widenings,
+        ));
+    }
+
+    for _ in 0..CLOSEST_POINT_MAX_BISECTIONS {
+        let mid = 0.5 * (lower + upper);
+        // Reason: the bracket has closed to adjacent doubles, which is
+        // the exact termination this loop is built around; a tolerance
+        // here would stop it early and hand back a coarser root.
+        if mid == lower || mid == upper {
+            return Ok(mid);
+        }
+        let f_mid = residual(mid);
+        if f_mid > 0.0 {
+            lower = mid;
+        } else if f_mid < 0.0 {
+            upper = mid;
+        } else {
+            return Ok(mid);
+        }
+    }
+
+    let mid = 0.5 * (lower + upper);
+    Err(Sketch2dError::NumericalError {
+        description: format!(
+            concat!(
+                "closest point on ellipse: bisection did not close the bracket ",
+                "[{}, {}] in {} steps (residual {})"
+            ),
+            lower,
+            upper,
+            CLOSEST_POINT_MAX_BISECTIONS,
+            residual(mid)
+        ),
+    })
 }
 
 /// A parametric ellipse entity with constraint tracking
