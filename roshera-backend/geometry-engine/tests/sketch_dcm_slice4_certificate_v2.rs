@@ -519,19 +519,25 @@ fn certificate_serializes_and_orders_deterministically() {
     let second = serde_json::to_value(certify_sketch(&sketch)).expect("serialise");
     assert_eq!(first, second, "certify must be deterministic");
 
-    // Deterministic ordering contracts: entity statuses ascend by
-    // entity, constraint facts ascend by INSERTION SEQUENCE.
+    // Deterministic ordering contracts: BOTH entity statuses and
+    // constraint facts ascend by INSERTION SEQUENCE.
     //
-    // The facts used to be asserted ascending by `id.0`, and that was
-    // the weaker contract: a `ConstraintId` is a random v4 uuid, so an
-    // id order is fixed within one process and arbitrary between two —
-    // the same sketch serialised its facts in a different order on the
+    // Each half used to be asserted ascending by its id — `id.0` for
+    // the facts (Task 38), `EntityRef` for the statuses (Task 48) —
+    // and both were the weaker contract for the same reason: a
+    // `ConstraintId` and an `EntityRef` are random v4 uuids, so an id
+    // order is fixed within one process and arbitrary between two. The
+    // same sketch serialised its facts in a different order on the
     // next run, and the rank pass reading those rows named a different
     // constraint redundant with it. The sketch's own insertion order
-    // is the key two processes reproduce; see `Constraint::sequence`.
+    // is the key two processes reproduce; see `Constraint::sequence`
+    // and `Sketch::entity_sequence`.
     let cert = certify_sketch(&sketch);
     for pair in cert.entity_statuses.windows(2) {
-        assert!(pair[0].entity < pair[1].entity, "statuses must ascend");
+        assert!(
+            sketch.entity_sequence(&pair[0].entity) < sketch.entity_sequence(&pair[1].entity),
+            "statuses must ascend by the sketch's entity insertion sequence"
+        );
     }
     let sequence_of: std::collections::HashMap<ConstraintId, u64> = sketch
         .all_constraints()

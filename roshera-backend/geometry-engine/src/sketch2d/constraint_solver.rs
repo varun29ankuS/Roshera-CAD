@@ -30,6 +30,7 @@ use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// Solver status
@@ -152,6 +153,23 @@ impl ConstraintDiagnosis {
     pub fn singular_configuration(&self) -> bool {
         self.generic_rank > self.jacobian_rank
     }
+}
+
+/// One free parameter of a solver, as
+/// [`ConstraintSolver::ordered_free_params`] yields it: one Jacobian
+/// column, one Newton delta entry, one generic-position displacement.
+#[derive(Debug, Clone, Copy)]
+struct FreeParameter {
+    /// The entity that owns the parameter.
+    entity: EntityRef,
+    /// Position within that entity's `parameters` vector.
+    index: usize,
+    /// The parameter's value when the walk was taken.
+    value: f64,
+    /// The owning entity's [`EntityState::sequence`] -- the sort key,
+    /// carried so the walk needs no second lookup and so a consumer can
+    /// seed a reproducible displacement from it.
+    sequence: u64,
 }
 
 /// One block of a block-diagonal Jacobian: the rows it owns and the
@@ -364,13 +382,14 @@ impl RankProfile {
 /// call would silently read as the sketch's own.
 struct ParameterRestore<'a> {
     solver: &'a ConstraintSolver,
-    saved: Vec<(EntityRef, usize, f64)>,
+    saved: Vec<FreeParameter>,
 }
 
 impl Drop for ParameterRestore<'_> {
     fn drop(&mut self) {
-        for (entity, index, value) in &self.saved {
-            self.solver.perturb_parameter(entity, *index, *value);
+        for param in &self.saved {
+            self.solver
+                .perturb_parameter(&param.entity, param.index, param.value);
         }
     }
 }
@@ -388,16 +407,43 @@ fn splitmix64(mut x: u64) -> u64 {
     z ^ (z >> 31)
 }
 
+/// The seed a free parameter's generic-position displacement is drawn
+/// from.
+///
+/// Keyed on the owning entity's [`EntityState::sequence`] -- its
+/// insertion order within the solver -- so two processes that build
+/// the same sketch in the same order displace it identically. It used
+/// to be keyed on [`entity_seed`], the entity's random v4 uuid folded
+/// to 64 bits, which is stable across processes only for a PERSISTED
+/// sketch whose ids are loaded rather than minted. That scoping was
+/// the whole gap: `perturbed_rank_scan` runs exactly when the first
+/// scan found a dependent row, i.e. on every sketch the certificate
+/// actually has something to diagnose, so the generic-position verdict
+/// on those sketches was drawn from a different point in every process.
+///
+/// A state that never entered a solver through
+/// [`ConstraintSolver::add_entity`] carries
+/// [`UNSEQUENCED_ENTITY_STATE`] and falls back to the uuid. Two such
+/// states would otherwise share a seed and receive CORRELATED
+/// displacements, which is the one way this function could understate
+/// a rank; the fallback keeps them independent at the cost of the
+/// cross-process guarantee, which such a state never had. No path in
+/// this crate produces one -- every solver is filled by `add_entity`
+/// or by clones of states that were.
+fn parameter_seed(param: &FreeParameter) -> u64 {
+    if param.sequence == UNSEQUENCED_ENTITY_STATE {
+        entity_seed(&param.entity)
+    } else {
+        splitmix64(param.sequence)
+    }
+}
+
 /// The uuid behind an entity reference, folded to 64 bits.
 ///
 /// Stable across processes and toolchains (`DefaultHasher` is neither),
-/// so the displacement a given parameter receives is reproducible for a
-/// PERSISTED sketch -- one whose entity uuids are loaded rather than
-/// minted. A sketch rebuilt from scratch mints fresh uuids and so draws
-/// a different generic point; that is harmless, because the rank at a
-/// generic point is the same at almost every generic point, and it is
-/// why the reproducibility claim is scoped to persisted ids rather than
-/// to "the same sketch".
+/// but only for a PERSISTED sketch -- one whose entity uuids are loaded
+/// rather than minted. The fallback half of [`parameter_seed`]; see
+/// there for why it is no longer the primary key.
 fn entity_seed(entity: &EntityRef) -> u64 {
     let raw: u128 = match entity {
         EntityRef::Point(id) => id.0.as_u128(),
@@ -619,6 +665,17 @@ pub struct ConstraintSolver {
     /// Participation diagnostics for the most recent [`Self::solve`]
     /// call. See [`SolveStats`].
     last_stats: SolveStats,
+    /// Next value [`Self::add_entity`] stamps onto an
+    /// [`EntityState::sequence`] (Task 48).
+    ///
+    /// Starts at 1 so [`UNSEQUENCED_ENTITY_STATE`] is unreachable by
+    /// assignment, and is NEVER rewound: re-adding an entity takes a
+    /// fresh value rather than inheriting the retired one, so no later
+    /// entity can slip into an earlier one's place in the column
+    /// order. An `Arc<AtomicU64>` rather than a plain field because
+    /// `add_entity` takes `&self` -- the whole solver is built through
+    /// shared references.
+    next_entity_sequence: Arc<AtomicU64>,
 }
 
 /// Outcome of one run of the damped Newton-Raphson core (whole-system
@@ -799,7 +856,34 @@ pub struct EntityState {
     /// bit via [`EntityState::with_arc_ccw`]. Meaningless for
     /// non-arc kinds.
     arc_ccw: bool,
+    /// Insertion order of this entity within its owning solver
+    /// (Task 48) -- the key every walk over the solver's entity map
+    /// sorts by, and therefore the order of the Jacobian's COLUMNS.
+    ///
+    /// Stamped by [`ConstraintSolver::add_entity`] and by nothing
+    /// else. A state RIDES its sequence into a sub-solver: every
+    /// component solve, DR-plan step and probe copies parent states in
+    /// with a direct map insert rather than `add_entity`, so a
+    /// sub-solver's ordered walk reproduces the parent's relative
+    /// order without a counter of its own. That is why the sequence
+    /// lives in the state instead of a side map on the solver, and it
+    /// is also why the two paths cannot collide: a solver is filled
+    /// EITHER by `add_entity` (stamping 1..n) OR by parent clones
+    /// (carrying the parent's already-distinct values), never both.
+    ///
+    /// [`UNSEQUENCED_ENTITY_STATE`] on every constructor -- a freshly
+    /// built state has no order until a solver gives it one.
+    sequence: u64,
 }
+
+/// The sequence of an [`EntityState`] that never entered a solver
+/// through [`ConstraintSolver::add_entity`].
+///
+/// Zero, and unreachable by assignment: the solver's counter starts at
+/// 1 and is never rewound. It is the value every `EntityState`
+/// constructor leaves behind, so a state examined before registration
+/// reports "no order yet" rather than claiming position zero.
+const UNSEQUENCED_ENTITY_STATE: u64 = 0;
 
 /// Decode the flat `[x0, y0, x1, y1, …]` spline-control-point pack
 /// from an `EntityState::parameters` slice. Returns `None` if the
@@ -869,6 +953,7 @@ impl ConstraintSolver {
             decomposition_enabled: true,
             dr_plan_enabled: true,
             last_stats: SolveStats::default(),
+            next_entity_sequence: Arc::new(AtomicU64::new(1)),
         }
     }
 
@@ -938,8 +1023,17 @@ impl ConstraintSolver {
         self.last_stats
     }
 
-    /// Add an entity to the solver
-    pub fn add_entity(&self, entity: EntityRef, initial_state: EntityState) {
+    /// Add an entity to the solver, stamping it with the next
+    /// insertion sequence.
+    ///
+    /// The sequence is what orders this solver's Jacobian columns (see
+    /// the private `ordered_free_params`, the single walk every column
+    /// consumer shares), and this method is its SOLE
+    /// assigner: whatever `initial_state` arrived carrying is
+    /// overwritten, so a state cloned out of another solver cannot
+    /// displace an entity already registered here.
+    pub fn add_entity(&self, entity: EntityRef, mut initial_state: EntityState) {
+        initial_state.sequence = self.next_entity_sequence.fetch_add(1, Ordering::Relaxed);
         self.entity_state.insert(entity, initial_state);
     }
 
@@ -1522,7 +1616,25 @@ impl ConstraintSolver {
                 cluster_capable: matches!(entity, EntityRef::Point(_)) && free == 2,
             });
         }
-        entities.sort_by_key(|pe| pe.entity);
+        // Insertion order, not `EntityRef` order (Task 48): the
+        // planner processes the entity list as given, so an
+        // `EntityRef` sort would hand the DR-planner a fresh order --
+        // and therefore a fresh step sequence and a fresh Newton
+        // iterate -- in every process. `sequence_of` reads the state
+        // the entity was just collected from, so the lookup cannot
+        // miss; the `UNSEQUENCED_ENTITY_STATE` tie-break falls back to
+        // the entity for states no `add_entity` ever stamped.
+        let sequence_of = |entity: &EntityRef| {
+            self.entity_state
+                .get(entity)
+                .map(|s| s.sequence)
+                .unwrap_or(UNSEQUENCED_ENTITY_STATE)
+        };
+        entities.sort_by(|a, b| {
+            sequence_of(&a.entity)
+                .cmp(&sequence_of(&b.entity))
+                .then_with(|| a.entity.cmp(&b.entity))
+        });
 
         let mut constraints = Vec::with_capacity(self.constraints.len());
         for (index, c) in self.constraints.iter().enumerate() {
@@ -2901,6 +3013,68 @@ impl ConstraintSolver {
         vec![UNSUPPORTED_CONSTRAINT_RESIDUAL]
     }
 
+    /// THE ordered walk over this solver's free parameters (Task 48).
+    ///
+    /// One column of the Jacobian per entry, in this order, and every
+    /// consumer of that layout reads the SAME vector: the differentiation
+    /// loop in [`Self::jacobian_with_columns`], the generic-position
+    /// displacement in [`Self::perturbed_rank_scan`], and the Newton
+    /// delta in [`Self::apply_updates`]. One function, not three
+    /// enumerations that agree only as long as nothing about them
+    /// drifts -- the same argument [`EntityState::free_params`] makes
+    /// one level down, applied to the entities instead of to one
+    /// entity's parameters.
+    ///
+    /// # Why the order is not the map's
+    ///
+    /// `entity_state` is a `DashMap` keyed on `EntityRef`, i.e. on a
+    /// random v4 uuid, so its walk order is a hash order: stable within
+    /// one run, arbitrary between two. Columns are not a listing key.
+    /// [`scan_blocks`] projects each row onto the accumulated basis
+    /// with a dot product summed IN COLUMN ORDER, and floating-point
+    /// addition is not associative, so a permuted order moves the
+    /// residual norm in its last bits and can carry a near-threshold
+    /// row across the rank tolerance. The Newton step solves
+    /// `JT.J dx = -JT.e` by Gaussian elimination with partial pivoting,
+    /// and `JT.J` under a column permutation `P` is `P^T (JT.J) P`,
+    /// whose pivot sequence -- and rounding -- is a different one. Both
+    /// make the same sketch land on different bits in the next process,
+    /// which is stronger than the certificate is allowed to promise.
+    ///
+    /// The key is [`EntityState::sequence`], the entity's insertion
+    /// order within this solver. `(sequence, entity, index)` is the
+    /// full key: the entity tie-breaks states that share a sequence,
+    /// which is only reachable for states never passed through
+    /// [`Self::add_entity`], and the parameter index orders one
+    /// entity's own columns exactly as `free_params` yields them.
+    ///
+    /// Also a guard-release point: the returned descriptors are a
+    /// SNAPSHOT, so the map's read guards are gone before a caller
+    /// hands `get_mut` down to `perturb_parameter`. Holding an `iter()`
+    /// guard across a `get_mut` on the same shard would deadlock.
+    fn ordered_free_params(&self) -> Vec<FreeParameter> {
+        let mut params: Vec<FreeParameter> = Vec::new();
+        for entry in self.entity_state.iter() {
+            let entity = *entry.key();
+            let sequence = entry.value().sequence;
+            for (index, value) in entry.value().free_params() {
+                params.push(FreeParameter {
+                    entity,
+                    index,
+                    value,
+                    sequence,
+                });
+            }
+        }
+        params.sort_by(|a, b| {
+            a.sequence
+                .cmp(&b.sequence)
+                .then_with(|| a.entity.cmp(&b.entity))
+                .then_with(|| a.index.cmp(&b.index))
+        });
+        params
+    }
+
     /// Compute Jacobian matrix
     fn compute_jacobian(&self) -> Vec<Vec<f64>> {
         self.jacobian_with_columns().0
@@ -2938,24 +3112,15 @@ impl ConstraintSolver {
         // Numerical differentiation for now
         let h = 1e-8;
 
-        // Snapshot free-parameter descriptors so the DashMap iterator's read
-        // guard is released before we hand mutating get_mut calls down to
-        // perturb_parameter. Holding the iter() guard across get_mut on the
-        // same shard would deadlock; this two-pass split is the safe pattern.
-        let mut free_params: Vec<(EntityRef, usize, f64)> = Vec::new();
-        for entry in self.entity_state.iter() {
-            let entity = *entry.key();
-            for (i, value) in entry.value().free_params() {
-                free_params.push((entity, i, value));
-            }
-        }
+        let free_params = self.ordered_free_params();
         let num_params = free_params.len();
-        let column_owner: Vec<EntityRef> = free_params.iter().map(|(e, _, _)| *e).collect();
+        let column_owner: Vec<EntityRef> = free_params.iter().map(|p| p.entity).collect();
         let mut jacobian = vec![vec![0.0; num_params]; num_errors];
 
         let scopes = self.differentiation_scopes();
 
-        for (param_index, (entity, i, original)) in free_params.iter().enumerate() {
+        for (param_index, param) in free_params.iter().enumerate() {
+            let (entity, i, original) = (&param.entity, &param.index, &param.value);
             let scope: &[usize] = match scopes.as_ref().and_then(|s| s.scope_of(entity)) {
                 Some(indices) => indices,
                 None => {
@@ -3213,31 +3378,24 @@ impl ConstraintSolver {
     /// the round is thrown away rather than trusted.
     fn perturbed_rank_scan(&self, round: u64) -> Option<RankScan> {
         note_rank_scan();
-        let mut saved: Vec<(EntityRef, usize, f64)> = Vec::new();
-        for entry in self.entity_state.iter() {
-            let entity = *entry.key();
-            for (i, value) in entry.value().free_params() {
-                saved.push((entity, i, value));
-            }
-        }
         // From here on the restore is owned by `Drop`, so it runs on
         // every exit from this function -- early return AND unwind.
         let restore = ParameterRestore {
             solver: self,
-            saved,
+            saved: self.ordered_free_params(),
         };
-        for (entity, i, value) in &restore.saved {
+        for param in &restore.saved {
             let seed = splitmix64(
-                entity_seed(entity)
-                    ^ (*i as u64).wrapping_mul(0x0000_0100_0000_01B3)
+                parameter_seed(param)
+                    ^ (param.index as u64).wrapping_mul(0x0000_0100_0000_01B3)
                     ^ round.wrapping_mul(0x0000_5EED_0000_0001),
             );
             // Map the mixed bits onto [-1, 1), then scale by the
             // parameter's own magnitude so a coordinate of 1000 and a
             // sagitta of 0.01 are both nudged proportionally.
             let unit = ((seed >> 11) as f64) / ((1u64 << 53) as f64) * 2.0 - 1.0;
-            let delta = unit * GENERIC_PERTURBATION * (1.0 + value.abs());
-            self.perturb_parameter(entity, *i, value + delta);
+            let delta = unit * GENERIC_PERTURBATION * (1.0 + param.value.abs());
+            self.perturb_parameter(&param.entity, param.index, param.value + delta);
         }
 
         let scanned = {
@@ -3657,37 +3815,31 @@ impl ConstraintSolver {
         Ok(x)
     }
 
-    /// Apply parameter updates
+    /// Apply parameter updates.
+    ///
+    /// `delta[k]` belongs to the parameter that owns Jacobian column
+    /// `k`, so this consumes [`Self::ordered_free_params`] -- the same
+    /// vector `jacobian_with_columns` laid the columns out from, not a
+    /// second enumeration that could drift from it. Walking any other
+    /// order applies each entity's step to a neighbour's parameter.
+    ///
+    /// Writes through `get_mut` per parameter (the `perturb_parameter`
+    /// pattern) rather than cloning and re-inserting whole states: the
+    /// snapshot already released the map's read guards, and the
+    /// parameters written are pairwise distinct, so the write order
+    /// cannot matter even though the read order does.
     fn apply_updates(&self, delta: &[f64], damping: f64) {
-        let mut param_index = 0;
-        let mut updates = Vec::new();
-
-        // Collect updates first
-        for entry in self.entity_state.iter() {
-            let entity = *entry.key();
-            let mut state = entry.value().clone();
-
-            // Walk the SAME iterator `jacobian_with_columns` built the
-            // column layout from, so `param_index` and the delta's
-            // entries describe the same parameters by construction --
-            // no second enumeration to drift, and no guard needed
-            // because the index came from the vector it indexes.
-            let free: Vec<usize> = state.free_params().map(|(i, _)| i).collect();
-            for i in free {
-                if let (Some(cell), Some(step)) =
-                    (state.parameters.get_mut(i), delta.get(param_index))
-                {
+        for (param_index, param) in self.ordered_free_params().iter().enumerate() {
+            let Some(step) = delta.get(param_index) else {
+                // A short delta leaves the remaining parameters where
+                // they are, exactly as the previous positional walk did.
+                continue;
+            };
+            if let Some(mut state) = self.entity_state.get_mut(&param.entity) {
+                if let Some(cell) = state.parameters.get_mut(param.index) {
                     *cell += damping * step;
                 }
-                param_index += 1;
             }
-
-            updates.push((entity, state));
-        }
-
-        // Apply updates
-        for (entity, state) in updates {
-            self.entity_state.insert(entity, state);
         }
     }
 
@@ -5179,6 +5331,12 @@ impl EntityState {
     /// enumerations of `fixed_mask` agree only as long as nothing about
     /// them drifts; one shared iterator agrees by construction.
     ///
+    /// This orders ONE entity's parameters.
+    /// [`ConstraintSolver::ordered_free_params`] is the same argument
+    /// one level up -- it orders the ENTITIES, and for the same reason:
+    /// the column layout must be a function of the sketch, not of the
+    /// entity map's hash order over random uuids.
+    ///
     /// It zips `parameters` against `fixed_mask` rather than indexing
     /// one by the other's length. A state whose two vectors ever
     /// disagreed would yield only the pairs they agree on -- fewer
@@ -5267,6 +5425,7 @@ impl EntityState {
             derived_center: None,
             derived_spline_cps: Some(control_points),
             arc_ccw: true,
+            sequence: UNSEQUENCED_ENTITY_STATE,
         }
     }
 
@@ -5282,6 +5441,7 @@ impl EntityState {
             derived_center: None,
             derived_spline_cps: None,
             arc_ccw: true,
+            sequence: UNSEQUENCED_ENTITY_STATE,
         }
     }
 
@@ -5297,6 +5457,7 @@ impl EntityState {
             derived_center: None,
             derived_spline_cps: None,
             arc_ccw: true,
+            sequence: UNSEQUENCED_ENTITY_STATE,
         }
     }
 
@@ -5315,6 +5476,7 @@ impl EntityState {
             derived_center: None,
             derived_spline_cps: None,
             arc_ccw: true,
+            sequence: UNSEQUENCED_ENTITY_STATE,
         }
     }
 
@@ -5376,6 +5538,7 @@ impl EntityState {
             derived_center: None,
             derived_spline_cps: None,
             arc_ccw: true,
+            sequence: UNSEQUENCED_ENTITY_STATE,
         }
     }
 
@@ -5398,6 +5561,7 @@ impl EntityState {
             derived_center: Some(center),
             derived_spline_cps: None,
             arc_ccw: true,
+            sequence: UNSEQUENCED_ENTITY_STATE,
         }
     }
 
@@ -5418,6 +5582,7 @@ impl EntityState {
             derived_center: Some(center),
             derived_spline_cps: None,
             arc_ccw: true,
+            sequence: UNSEQUENCED_ENTITY_STATE,
         }
     }
 
@@ -5433,6 +5598,7 @@ impl EntityState {
             derived_center: None,
             derived_spline_cps: None,
             arc_ccw: true,
+            sequence: UNSEQUENCED_ENTITY_STATE,
         }
     }
 
@@ -5479,6 +5645,7 @@ impl EntityState {
             derived_center: None,
             derived_spline_cps: None,
             arc_ccw: true,
+            sequence: UNSEQUENCED_ENTITY_STATE,
         }
     }
 
@@ -5526,6 +5693,7 @@ impl EntityState {
             derived_center: None,
             derived_spline_cps: None,
             arc_ccw: true,
+            sequence: UNSEQUENCED_ENTITY_STATE,
         }
     }
 
@@ -5582,6 +5750,7 @@ impl EntityState {
             derived_center: None,
             derived_spline_cps: None,
             arc_ccw: true,
+            sequence: UNSEQUENCED_ENTITY_STATE,
         }
     }
 
@@ -5640,6 +5809,7 @@ impl EntityState {
             derived_center: None,
             derived_spline_cps: None,
             arc_ccw: true,
+            sequence: UNSEQUENCED_ENTITY_STATE,
         }
     }
 
@@ -5687,6 +5857,7 @@ impl EntityState {
             derived_center: None,
             derived_spline_cps: None,
             arc_ccw: true,
+            sequence: UNSEQUENCED_ENTITY_STATE,
         }
     }
 
@@ -5729,6 +5900,7 @@ impl EntityState {
             derived_center: None,
             derived_spline_cps: None,
             arc_ccw: true,
+            sequence: UNSEQUENCED_ENTITY_STATE,
         }
     }
 }
@@ -8146,6 +8318,167 @@ mod tests {
         assert_eq!(entry.parameters[1], 1.0); // point.y untouched
         assert!(approx_eq(entry.parameters[2], 10.0, 1e-12));
         assert!(approx_eq(entry.parameters[3], 20.0, 1e-12));
+    }
+
+    // ────────── G2. Column order (Task 48) ──────────
+
+    /// Independent solvers built per column-order test.
+    ///
+    /// Every round mints fresh entity uuids, so a walk keyed on the
+    /// uuid answers differently each time; a walk keyed on insertion
+    /// answers identically. 24 rounds make an accidental agreement of
+    /// a 6-entity permutation a `(1/720)^24` event.
+    const COLUMN_ORDER_ROUNDS: usize = 24;
+
+    /// Six free points, added in a fixed order, with the insertion
+    /// order returned alongside the solver.
+    ///
+    /// Points only: every parameter is free and each contributes
+    /// exactly two, so the expected column layout is the insertion
+    /// order doubled and nothing about the fixture can hide a
+    /// permutation.
+    fn six_points_in_insertion_order() -> (ConstraintSolver, Vec<EntityRef>) {
+        let s = ConstraintSolver::new();
+        let mut inserted = Vec::new();
+        for k in 0..6u32 {
+            let p = point_ref();
+            s.add_entity(
+                p,
+                EntityState::point(Point2d::new(f64::from(k), f64::from(k) * 2.0), false),
+            );
+            inserted.push(p);
+        }
+        (s, inserted)
+    }
+
+    #[test]
+    fn the_jacobian_columns_are_enumerated_in_entity_insertion_order() {
+        let mut divergent = 0usize;
+        let mut answers: Vec<Vec<usize>> = Vec::new();
+        for _ in 0..COLUMN_ORDER_ROUNDS {
+            let (solver, inserted) = six_points_in_insertion_order();
+            let (_, column_owner) = solver.jacobian_with_columns();
+            // Each point owns two consecutive columns, so the expected
+            // owner sequence is the insertion order with every entry
+            // repeated once.
+            let expected: Vec<EntityRef> = inserted.iter().flat_map(|e| [*e, *e]).collect();
+            let got: Vec<usize> = column_owner
+                .iter()
+                .map(|e| {
+                    inserted
+                        .iter()
+                        .position(|i| i == e)
+                        .expect("every column owner is an inserted entity")
+                })
+                .collect();
+            if column_owner != expected {
+                divergent += 1;
+            }
+            answers.push(got);
+        }
+        assert_eq!(
+            divergent, 0,
+            concat!(
+                "the Jacobian's COLUMNS must follow entity insertion order, not the ",
+                "entity map's hash order over random uuids: the Gram-Schmidt ",
+                "dependency test sums over columns, so a column permutation changes ",
+                "the summation order and can flip a near-threshold rank verdict ",
+                "between two processes. Expected [0,0,1,1,2,2,3,3,4,4,5,5] every ",
+                "round; got {:?}"
+            ),
+            answers
+        );
+    }
+
+    #[test]
+    fn the_generic_displacement_is_drawn_from_the_sequence_not_the_uuid() {
+        // Two entities with DIFFERENT uuids at the SAME insertion
+        // position must draw the same generic point: that is what makes
+        // the generic-position rank verdict reproducible for a sketch
+        // rebuilt from scratch rather than only for a persisted one.
+        let a = FreeParameter {
+            entity: point_ref(),
+            index: 0,
+            value: 1.0,
+            sequence: 7,
+        };
+        let b = FreeParameter {
+            entity: point_ref(),
+            index: 0,
+            value: 1.0,
+            sequence: 7,
+        };
+        assert_ne!(a.entity, b.entity, "the two fixtures must differ by uuid");
+        assert_eq!(
+            parameter_seed(&a),
+            parameter_seed(&b),
+            concat!(
+                "the generic-position displacement must be a function of the entity's ",
+                "INSERTION SEQUENCE. Keyed on the uuid it is reproducible only for a ",
+                "persisted sketch, and `perturbed_rank_scan` runs on exactly the ",
+                "sketches the certificate has something to diagnose"
+            )
+        );
+        // Distinct positions must still draw independently, or the
+        // displacement would be correlated across parameters and could
+        // hide rank rather than reveal it.
+        let c = FreeParameter { sequence: 8, ..a };
+        assert_ne!(
+            parameter_seed(&a),
+            parameter_seed(&c),
+            "two insertion positions must draw independent displacements"
+        );
+        // A state that never entered a solver has no sequence to key
+        // on and falls back to the uuid, which keeps two such states
+        // independent of each other.
+        let u = FreeParameter {
+            sequence: UNSEQUENCED_ENTITY_STATE,
+            ..a
+        };
+        let v = FreeParameter {
+            sequence: UNSEQUENCED_ENTITY_STATE,
+            ..b
+        };
+        assert_ne!(
+            parameter_seed(&u),
+            parameter_seed(&v),
+            "unsequenced states must not share a displacement"
+        );
+    }
+
+    #[test]
+    fn apply_updates_consumes_the_delta_in_the_jacobian_column_order() {
+        let mut divergent = 0usize;
+        let mut answers: Vec<Vec<f64>> = Vec::new();
+        for _ in 0..COLUMN_ORDER_ROUNDS {
+            let (solver, inserted) = six_points_in_insertion_order();
+            // A distinct, position-revealing step per column: whatever
+            // lands on a parameter names the column it came from.
+            let delta: Vec<f64> = (1..=12).map(f64::from).collect();
+            solver.apply_updates(&delta, 1.0);
+            let mut got = Vec::new();
+            for (k, e) in inserted.iter().enumerate() {
+                let entry = solver.entity_state.get(e).expect("entity present");
+                // Point k started at (k, 2k); the step it received is
+                // the difference.
+                got.push(entry.parameters[0] - k as f64);
+                got.push(entry.parameters[1] - k as f64 * 2.0);
+            }
+            if got != delta {
+                divergent += 1;
+            }
+            answers.push(got);
+        }
+        assert_eq!(
+            divergent, 0,
+            concat!(
+                "the Newton delta must be consumed in the SAME order the Jacobian ",
+                "laid its columns out -- entity insertion order. A delta walked in a ",
+                "different order applies each entity's step to a neighbour's ",
+                "parameter. Expected [1..12] every round; got {:?}"
+            ),
+            answers
+        );
     }
 
     // ─────────────────── H. Violation reporting ───────────────────────

@@ -44,13 +44,56 @@
 //!
 //! All v2 analysis runs on an ISOLATED diagnostic solver — certifying never
 //! mutates the sketch. Output ordering is deterministic for a given sketch AND
-//! reproducible across processes: entity statuses ascend by entity, constraint
+//! reproducible across processes: entity statuses ascend by the sketch's
+//! entity insertion sequence ([`super::Sketch::entity_sequence`]), constraint
 //! facts and witness members ascend by [`super::constraints::Constraint`]'s
 //! insertion `sequence`, witnesses ascend by their first member. The key is
-//! insertion order and not the constraint id, because a `ConstraintId` is a
-//! random v4 uuid — an id sort is stable within one run and arbitrary between
-//! two, and a certificate whose witness changes between runs is not a
-//! certificate.
+//! insertion order and never the id, because a `ConstraintId` and an
+//! `EntityRef` are both random v4 uuids — an id sort is stable within one run
+//! and arbitrary between two, and a certificate whose witness changes between
+//! runs is not a certificate.
+//!
+//! The same argument reaches past the listing keys into the NUMBERS (Task 48).
+//! The solver's Jacobian columns follow the entity insertion sequence as well,
+//! because the rank-revealing Gram-Schmidt sums its projection over the columns
+//! and the Newton step's elimination pivots on `JᵀJ`: a column order drawn from
+//! a uuid hash moved both in their last bits, so a near-threshold dependency
+//! verdict — and the solved geometry the residual classification reads — could
+//! differ between two processes certifying the same sketch.
+//!
+//! RESIDUALS, so this doc does not over-promise. Two `EntityRef` orderings one
+//! layer below this module still reach SERIALIZED FIELDS, and one of them
+//! reaches a DOF number, not merely a listing:
+//!
+//! - **Component indices are uuid-derived VALUES, not just a listing order.**
+//!   `decompose::connected_components` emits components in ascending order of
+//!   their smallest `EntityRef`, and that index is stamped into every entry:
+//!   [`EntityStatus::component`] and
+//!   [`super::sketch_solver::ComponentDof::component`] both carry it, so two
+//!   processes can label the same entity `component: 0` and `component: 1`. The
+//!   PARTITION is the same either way — which entities share a component never
+//!   changes — but the number naming it does. The per-block ranks the DOF
+//!   snapshot is built from are listed in the same order.
+//! - **`constrainment.free_dofs` on an UNDER-CONSTRAINED entity can differ
+//!   between processes.** `dr_plan::analyze_constrainment` walks the loose
+//!   entities in ascending `EntityRef` order (`dr_plan.rs:742`) and charges a
+//!   constraint shared by two loose entities to the LATER one in that walk — its
+//!   own doc states the order-dependence, because a relative constraint on a
+//!   floating pair has no unique per-entity owner. `fact.free_dofs` lands
+//!   verbatim in [`EntityConstrainment::UnderConstrained`], so two free points
+//!   carrying one `Distance` and nothing anchored report `free_dofs` 2 and 1 —
+//!   and which point gets which follows the uuid draw. The COMPONENT total is
+//!   invariant (the per-entity sum always equals the component's residual DOF
+//!   count), so no verdict, rank, witness or component-level DOF count moves;
+//!   only the attribution between two loose entities does.
+//! - The same `EntityRef` ordering inside the DR-planner decides the CLUSTER
+//!   NUMBERING carried in [`EntityStatus::cluster`] (`dr_plan.rs:544`, `:720`)
+//!   and the plan step order behind a planned component's solved geometry.
+//!
+//! All three are deterministic within one run and not reproducible across two.
+//! Fixing them means keying `decompose` and `dr_plan` on the entity insertion
+//! sequence rather than on `EntityRef`; that is a separate change with its own
+//! RED, because it moves certificate VALUES.
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -201,8 +244,15 @@ pub enum EntityConstrainment {
 pub struct EntityStatus {
     /// The entity.
     pub entity: EntityRef,
-    /// Index of the connected component owning the entity (components
-    /// ascend by their smallest entity — deterministic).
+    /// Index of the connected component owning the entity.
+    ///
+    /// Components ascend by their smallest `EntityRef`, which is a random v4
+    /// uuid, so this number is deterministic WITHIN one process and not
+    /// reproducible between two: the same entity can be `component: 0` on one
+    /// run and `component: 1` on the next. What never changes is the PARTITION —
+    /// two entities share a component, or they do not, identically on every run.
+    /// Read it as "these entries belong together", never as a stable label. See
+    /// the module doc's residual list.
     pub component: usize,
     /// When the DR-plan placed the entity via a rigid-cluster step,
     /// the 0-based cluster index within its component.
@@ -937,7 +987,20 @@ fn analyze_constraint_system(sketch: &Sketch) -> SystemAnalysis {
             });
         }
     }
-    entity_statuses.sort_by(|a, b| a.entity.cmp(&b.entity));
+    // Entity INSERTION order, not `EntityRef` order (Task 48). An
+    // `EntityRef` sort ascends by a random v4 uuid: deterministic
+    // within one run, arbitrary between two, which is precisely the
+    // property this module's doc promises it does not have. The
+    // sketch's own insertion sequence is the key two processes can
+    // agree on. The sort is stable and the entity tie-breaks, so a
+    // status for an entity the sketch never stamped (none today)
+    // lands at the end in a fixed order rather than at the front.
+    entity_statuses.sort_by(|a, b| {
+        sketch
+            .entity_sequence(&a.entity)
+            .cmp(&sketch.entity_sequence(&b.entity))
+            .then_with(|| a.entity.cmp(&b.entity))
+    });
 
     let planned_components = probes.iter().filter(|p| p.complete_plan).count();
     let decomposition = DecompositionStats {

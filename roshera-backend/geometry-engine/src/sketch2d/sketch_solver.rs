@@ -1554,18 +1554,42 @@ fn spline_shared_control_points(
     Some(ids.clone())
 }
 
-/// Register every supported entity with the solver.
+/// Register every supported entity with the solver, IN THE ORDER THE
+/// SKETCH RECEIVED THEM.
 ///
 /// Returns the count of entities registered. Points, lines, circles,
 /// and arcs are supported; other kinds are skipped (see
 /// [`collect_unsupported`]).
+///
+/// # Why the order is part of the contract (Task 48)
+///
+/// [`ConstraintSolver::add_entity`] stamps each entity with the
+/// solver's own insertion sequence, and that sequence is what orders
+/// the Jacobian's COLUMNS. Columns are not a listing key: the
+/// rank-revealing Gram-Schmidt sums its projection over them, and the
+/// Newton step's elimination pivots on `JT.J`, so a permuted column
+/// order changes both in the last bits. Registering in the walk order
+/// of the sketch's eight uuid-keyed `DashMap`s would therefore hand
+/// the solver a fresh column layout on every process, which is exactly
+/// the reproducibility the certificate claims.
+///
+/// So the per-kind arms below COLLECT rather than register, and the
+/// single registration pass at the end sorts what they collected by
+/// [`Sketch::entity_sequence`] before calling `add_entity`. The
+/// collection order is still the maps' hash order; that sort is what
+/// removes it. It is stable and keyed on the sketch sequence alone, so
+/// entities the sketch never stamped (none today -- every insertion
+/// site stamps) would land together at the end in map order rather
+/// than displacing a stamped entity.
 fn populate_solver(sketch: &Sketch, solver: &ConstraintSolver) -> usize {
     let mut registered = 0usize;
+    let mut pending: Vec<(EntityRef, EntityState)> = Vec::new();
+    let mut register = |entity: EntityRef, state: EntityState| pending.push((entity, state));
 
     for entry in sketch.points().iter() {
         let id = *entry.key();
         let p: &ParametricPoint2d = entry.value();
-        solver.add_entity(
+        register(
             EntityRef::Point(id),
             EntityState::point(p.position, p.is_fixed),
         );
@@ -1586,7 +1610,7 @@ fn populate_solver(sketch: &Sketch, solver: &ConstraintSolver) -> usize {
             (&line.geometry, line.endpoints)
         {
             if sketch.points().contains_key(&start_id) && sketch.points().contains_key(&end_id) {
-                solver.add_entity(
+                register(
                     EntityRef::Line(id),
                     EntityState::segment_between(
                         EntityRef::Point(start_id),
@@ -1601,7 +1625,7 @@ fn populate_solver(sketch: &Sketch, solver: &ConstraintSolver) -> usize {
         // Lines have no per-DOF fix flags today; pass `false` so the
         // solver treats all four params as free unless an explicit
         // dimensional/positional constraint pins them.
-        solver.add_entity(
+        register(
             EntityRef::Line(id),
             EntityState::line(point, direction, false, false),
         );
@@ -1620,14 +1644,14 @@ fn populate_solver(sketch: &Sketch, solver: &ConstraintSolver) -> usize {
         // center point was deleted degrades to the legacy 3-parameter
         // path.
         if let Some(center_id) = circle_shared_center(sketch, circle) {
-            solver.add_entity(
+            register(
                 EntityRef::Circle(id),
                 EntityState::circle_centered(EntityRef::Point(center_id), circle.circle.radius),
             );
             registered += 1;
             continue;
         }
-        solver.add_entity(
+        register(
             EntityRef::Circle(id),
             EntityState::circle(circle.circle.center, circle.circle.radius, false, false),
         );
@@ -1651,7 +1675,7 @@ fn populate_solver(sketch: &Sketch, solver: &ConstraintSolver) -> usize {
                 end,
                 center_offset,
             } => {
-                solver.add_entity(
+                register(
                     EntityRef::Arc(id),
                     EntityState::arc_between(
                         EntityRef::Point(start),
@@ -1662,7 +1686,7 @@ fn populate_solver(sketch: &Sketch, solver: &ConstraintSolver) -> usize {
                 );
             }
             ArcSolverMode::SharedCenter { center } => {
-                solver.add_entity(
+                register(
                     EntityRef::Arc(id),
                     EntityState::arc_centered(
                         EntityRef::Point(center),
@@ -1678,7 +1702,7 @@ fn populate_solver(sketch: &Sketch, solver: &ConstraintSolver) -> usize {
                 // for every group so the solver treats
                 // center/radius/angles as free unless a dimensional
                 // or positional constraint pins them.
-                solver.add_entity(
+                register(
                     EntityRef::Arc(id),
                     EntityState::arc(
                         arc.arc.center,
@@ -1704,7 +1728,7 @@ fn populate_solver(sketch: &Sketch, solver: &ConstraintSolver) -> usize {
         // / arc convention. All five DOFs (center.x, center.y, width,
         // height, rotation) start free; explicit dimensional or
         // positional constraints can pin them downstream.
-        solver.add_entity(
+        register(
             EntityRef::Rectangle(id),
             EntityState::rectangle(
                 rect.rectangle.center,
@@ -1732,7 +1756,7 @@ fn populate_solver(sketch: &Sketch, solver: &ConstraintSolver) -> usize {
         // enforced only on write-back through `Ellipse2d::new`, not
         // inside the solver — keeping the two axes independent
         // floats during iteration keeps the Jacobian well-conditioned.
-        solver.add_entity(
+        register(
             EntityRef::Ellipse(id),
             EntityState::ellipse(
                 ellipse.ellipse.center,
@@ -1768,7 +1792,7 @@ fn populate_solver(sketch: &Sketch, solver: &ConstraintSolver) -> usize {
                     Some(nurbs.weights.clone()),
                 ),
             };
-            solver.add_entity(
+            register(
                 EntityRef::Spline(id),
                 EntityState::spline_shared(
                     degree,
@@ -1803,7 +1827,7 @@ fn populate_solver(sketch: &Sketch, solver: &ConstraintSolver) -> usize {
                 false,
             ),
         };
-        solver.add_entity(EntityRef::Spline(id), state);
+        register(EntityRef::Spline(id), state);
         registered += 1;
     }
 
@@ -1822,8 +1846,17 @@ fn populate_solver(sketch: &Sketch, solver: &ConstraintSolver) -> usize {
             polyline.polyline.is_closed,
             false,
         );
-        solver.add_entity(EntityRef::Polyline(id), state);
+        register(EntityRef::Polyline(id), state);
         registered += 1;
+    }
+
+    // The one registration pass. `register` above is a pure collector,
+    // so this sort is the ONLY thing that decides the solver's entity
+    // sequence -- and therefore its Jacobian column layout. The
+    // collector's borrow of `pending` ends at its last call above.
+    pending.sort_by_key(|(entity, _)| sketch.entity_sequence(entity));
+    for (entity, state) in pending {
+        solver.add_entity(entity, state);
     }
 
     registered

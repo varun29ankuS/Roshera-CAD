@@ -210,7 +210,48 @@ pub struct Sketch {
     /// ops shipped without lineage; the 2D ops must not repeat that
     /// debt). Cleaned up by the delete paths.
     provenance: Arc<DashMap<EntityRef, super::sketch_ops::EntityProvenance>>,
+
+    /// Insertion order of every entity in this sketch (Task 48).
+    ///
+    /// The eight entity maps above are `DashMap`s keyed on random v4
+    /// uuids, so walking them yields a hash order that is stable within
+    /// one run and arbitrary between two. That order used to reach the
+    /// solver: [`super::sketch_solver::populate_solver`] registered
+    /// entities in it, and the solver laid its Jacobian COLUMNS out in
+    /// the order it was given. Columns are not a listing key -- the
+    /// rank-revealing Gram-Schmidt sums its projection over them and
+    /// the Newton step pivots on `JT.J` -- so the same sketch, built
+    /// the same way, landed on different bits in the next process.
+    ///
+    /// This map is that missing order: a per-sketch counter stamped at
+    /// every entity insertion, exactly as `ConstraintStore` stamps
+    /// [`super::constraints::Constraint::sequence`] for rows. Two
+    /// processes that build the same sketch in the same order agree on
+    /// it; a uuid sort can never promise that.
+    ///
+    /// The entity maps stay the source of truth for WHICH entities
+    /// exist; consumers walk one of those and read the order out of
+    /// here through [`Self::entity_sequence`], so a stale entry could
+    /// at worst waste a word -- and the delete paths remove it anyway.
+    entity_sequence: Arc<DashMap<EntityRef, u64>>,
+    /// Next value [`Self::stamp_entity_sequence`] hands out.
+    ///
+    /// NEVER rewound -- not by a delete, not by [`Self::clear_all`].
+    /// Rewinding would let a later entity inherit an earlier entity's
+    /// key, which is the one way a monotone counter can reproduce the
+    /// ambiguity it exists to remove. Starts at 1 so
+    /// [`UNSEQUENCED_ENTITY`] is unreachable by assignment.
+    next_entity_sequence: Arc<std::sync::atomic::AtomicU64>,
 }
+
+/// The sequence reported for an entity this sketch never stamped.
+///
+/// `u64::MAX` rather than 0: an unknown entity sorts to the END of an
+/// ordered walk instead of displacing the first real one. It is a
+/// saturation value, not a sentinel anyone branches on -- every
+/// consumer reads sequences for entities it just found in this
+/// sketch's own maps, and every insertion site stamps.
+pub const UNSEQUENCED_ENTITY: u64 = u64::MAX;
 
 impl Sketch {
     /// Create a new sketch with the given anchor. The anchor's
@@ -235,7 +276,36 @@ impl Sketch {
             spatial_index: Arc::new(DashMap::new()),
             grid_size: 10.0, // Default 10mm grid
             provenance: Arc::new(DashMap::new()),
+            entity_sequence: Arc::new(DashMap::new()),
+            next_entity_sequence: Arc::new(std::sync::atomic::AtomicU64::new(1)),
         }
+    }
+
+    // Entity insertion order (Task 48)
+
+    /// Stamp an entity with the next insertion sequence.
+    ///
+    /// Called from every site that inserts into one of the eight
+    /// entity maps, and from nowhere else -- this sketch is the sole
+    /// authority on the order, so a sequence can never arrive from
+    /// outside and displace an entity already present. Re-stamping an
+    /// entity that already has a sequence is not possible either: ids
+    /// are fresh v4 uuids, and the counter is never rewound, so a
+    /// deleted entity's sequence is retired with it.
+    fn stamp_entity_sequence(&self, entity: EntityRef) {
+        let next = self
+            .next_entity_sequence
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.entity_sequence.insert(entity, next);
+    }
+
+    /// The insertion sequence of an entity, or [`UNSEQUENCED_ENTITY`]
+    /// for one this sketch never stamped.
+    pub fn entity_sequence(&self, entity: &EntityRef) -> u64 {
+        self.entity_sequence
+            .get(entity)
+            .map(|e| *e.value())
+            .unwrap_or(UNSEQUENCED_ENTITY)
     }
 
     // Provenance lineage (SKETCH-DCM #45 Slice 6)
@@ -284,6 +354,7 @@ impl Sketch {
 
         self.update_spatial_index_point(id, &point);
         self.points.insert(id, param_point);
+        self.stamp_entity_sequence(EntityRef::Point(id));
 
         id
     }
@@ -346,6 +417,7 @@ impl Sketch {
         self.update_spatial_index(EntityRef::Line(id), min, max);
 
         self.lines.insert(id, param_line);
+        self.stamp_entity_sequence(EntityRef::Line(id));
 
         Ok(id)
     }
@@ -367,6 +439,7 @@ impl Sketch {
         self.update_spatial_index(EntityRef::Line(id), min, max);
 
         self.lines.insert(id, param_line);
+        self.stamp_entity_sequence(EntityRef::Line(id));
 
         Ok(id)
     }
@@ -388,6 +461,7 @@ impl Sketch {
         self.update_spatial_index(EntityRef::Arc(id), min, max);
 
         self.arcs.insert(id, param_arc);
+        self.stamp_entity_sequence(EntityRef::Arc(id));
 
         Ok(id)
     }
@@ -438,6 +512,7 @@ impl Sketch {
         self.update_spatial_index(EntityRef::Arc(id), min, max);
 
         self.arcs.insert(id, param_arc);
+        self.stamp_entity_sequence(EntityRef::Arc(id));
 
         Ok(id)
     }
@@ -473,6 +548,7 @@ impl Sketch {
         self.update_spatial_index(EntityRef::Arc(id), min, max);
 
         self.arcs.insert(id, param_arc);
+        self.stamp_entity_sequence(EntityRef::Arc(id));
 
         Ok(id)
     }
@@ -528,6 +604,7 @@ impl Sketch {
         self.update_spatial_index(EntityRef::Arc(id), min, max);
 
         self.arcs.insert(id, param_arc);
+        self.stamp_entity_sequence(EntityRef::Arc(id));
 
         Ok(id)
     }
@@ -544,6 +621,7 @@ impl Sketch {
         self.update_spatial_index(EntityRef::Circle(id), min, max);
 
         self.circles.insert(id, param_circle);
+        self.stamp_entity_sequence(EntityRef::Circle(id));
 
         Ok(id)
     }
@@ -578,6 +656,7 @@ impl Sketch {
         self.update_spatial_index(EntityRef::Circle(id), min, max);
 
         self.circles.insert(id, param_circle);
+        self.stamp_entity_sequence(EntityRef::Circle(id));
 
         Ok(id)
     }
@@ -597,6 +676,7 @@ impl Sketch {
         self.update_spatial_index(EntityRef::Circle(id), min, max);
 
         self.circles.insert(id, param_circle);
+        self.stamp_entity_sequence(EntityRef::Circle(id));
 
         Ok(id)
     }
@@ -617,6 +697,7 @@ impl Sketch {
         self.update_spatial_index(EntityRef::Rectangle(id), min, max);
 
         self.rectangles.insert(id, param_rect);
+        self.stamp_entity_sequence(EntityRef::Rectangle(id));
 
         Ok(id)
     }
@@ -637,6 +718,7 @@ impl Sketch {
         self.update_spatial_index(EntityRef::Rectangle(id), min, max);
 
         self.rectangles.insert(id, param_rect);
+        self.stamp_entity_sequence(EntityRef::Rectangle(id));
 
         Ok(id)
     }
@@ -659,6 +741,7 @@ impl Sketch {
         self.update_spatial_index(EntityRef::Ellipse(id), min, max);
 
         self.ellipses.insert(id, param_ellipse);
+        self.stamp_entity_sequence(EntityRef::Ellipse(id));
 
         Ok(id)
     }
@@ -681,6 +764,7 @@ impl Sketch {
         self.update_spatial_index(EntityRef::Spline(id), min, max);
 
         self.splines.insert(id, param_spline);
+        self.stamp_entity_sequence(EntityRef::Spline(id));
 
         Ok(id)
     }
@@ -707,6 +791,7 @@ impl Sketch {
         self.update_spatial_index(EntityRef::Spline(id), min, max);
 
         self.splines.insert(id, param_spline);
+        self.stamp_entity_sequence(EntityRef::Spline(id));
 
         Ok(id)
     }
@@ -736,6 +821,7 @@ impl Sketch {
         let (min, max) = param_spline.bounding_box();
         self.update_spatial_index(EntityRef::Spline(id), min, max);
         self.splines.insert(id, param_spline);
+        self.stamp_entity_sequence(EntityRef::Spline(id));
         Ok(id)
     }
 
@@ -771,6 +857,7 @@ impl Sketch {
         let (min, max) = param_spline.bounding_box();
         self.update_spatial_index(EntityRef::Spline(id), min, max);
         self.splines.insert(id, param_spline);
+        self.stamp_entity_sequence(EntityRef::Spline(id));
         Ok(id)
     }
 
@@ -815,6 +902,7 @@ impl Sketch {
         self.update_spatial_index(EntityRef::Polyline(id), min, max);
 
         self.polylines.insert(id, param_polyline);
+        self.stamp_entity_sequence(EntityRef::Polyline(id));
 
         Ok(id)
     }
@@ -1218,6 +1306,11 @@ impl Sketch {
         // Drop any op-lineage record (SKETCH-DCM #45 Slice 6) — a
         // dangling provenance entry would claim lineage for a dead id.
         self.provenance.remove(&entity_ref);
+        // Retire the insertion sequence with the id (Task 48). The
+        // counter is NOT rewound: the next entity takes a fresh value,
+        // so no later entity can inherit this one's place in the
+        // column order.
+        self.entity_sequence.remove(&entity_ref);
 
         // Remove the point
         self.points.remove(id);
@@ -1246,6 +1339,11 @@ impl Sketch {
         // Drop any op-lineage record (SKETCH-DCM #45 Slice 6) — a
         // dangling provenance entry would claim lineage for a dead id.
         self.provenance.remove(&entity_ref);
+        // Retire the insertion sequence with the id (Task 48). The
+        // counter is NOT rewound: the next entity takes a fresh value,
+        // so no later entity can inherit this one's place in the
+        // column order.
+        self.entity_sequence.remove(&entity_ref);
 
         // Remove the line
         self.lines.remove(id);
@@ -1274,6 +1372,11 @@ impl Sketch {
         // Drop any op-lineage record (SKETCH-DCM #45 Slice 6) — a
         // dangling provenance entry would claim lineage for a dead id.
         self.provenance.remove(&entity_ref);
+        // Retire the insertion sequence with the id (Task 48). The
+        // counter is NOT rewound: the next entity takes a fresh value,
+        // so no later entity can inherit this one's place in the
+        // column order.
+        self.entity_sequence.remove(&entity_ref);
 
         // Remove the arc
         self.arcs.remove(id);
@@ -1302,6 +1405,11 @@ impl Sketch {
         // Drop any op-lineage record (SKETCH-DCM #45 Slice 6) — a
         // dangling provenance entry would claim lineage for a dead id.
         self.provenance.remove(&entity_ref);
+        // Retire the insertion sequence with the id (Task 48). The
+        // counter is NOT rewound: the next entity takes a fresh value,
+        // so no later entity can inherit this one's place in the
+        // column order.
+        self.entity_sequence.remove(&entity_ref);
 
         // Remove the circle
         self.circles.remove(id);
@@ -1330,6 +1438,11 @@ impl Sketch {
         // Drop any op-lineage record (SKETCH-DCM #45 Slice 6) — a
         // dangling provenance entry would claim lineage for a dead id.
         self.provenance.remove(&entity_ref);
+        // Retire the insertion sequence with the id (Task 48). The
+        // counter is NOT rewound: the next entity takes a fresh value,
+        // so no later entity can inherit this one's place in the
+        // column order.
+        self.entity_sequence.remove(&entity_ref);
 
         // Remove the rectangle
         self.rectangles.remove(id);
@@ -1358,6 +1471,11 @@ impl Sketch {
         // Drop any op-lineage record (SKETCH-DCM #45 Slice 6) — a
         // dangling provenance entry would claim lineage for a dead id.
         self.provenance.remove(&entity_ref);
+        // Retire the insertion sequence with the id (Task 48). The
+        // counter is NOT rewound: the next entity takes a fresh value,
+        // so no later entity can inherit this one's place in the
+        // column order.
+        self.entity_sequence.remove(&entity_ref);
 
         // Remove the ellipse
         self.ellipses.remove(id);
@@ -1386,6 +1504,11 @@ impl Sketch {
         // Drop any op-lineage record (SKETCH-DCM #45 Slice 6) — a
         // dangling provenance entry would claim lineage for a dead id.
         self.provenance.remove(&entity_ref);
+        // Retire the insertion sequence with the id (Task 48). The
+        // counter is NOT rewound: the next entity takes a fresh value,
+        // so no later entity can inherit this one's place in the
+        // column order.
+        self.entity_sequence.remove(&entity_ref);
 
         // Remove the spline
         self.splines.remove(id);
@@ -1414,6 +1537,11 @@ impl Sketch {
         // Drop any op-lineage record (SKETCH-DCM #45 Slice 6) — a
         // dangling provenance entry would claim lineage for a dead id.
         self.provenance.remove(&entity_ref);
+        // Retire the insertion sequence with the id (Task 48). The
+        // counter is NOT rewound: the next entity takes a fresh value,
+        // so no later entity can inherit this one's place in the
+        // column order.
+        self.entity_sequence.remove(&entity_ref);
 
         // Remove the polyline
         self.polylines.remove(id);
@@ -1497,6 +1625,9 @@ impl Sketch {
         self.splines.clear();
         self.polylines.clear();
         self.provenance.clear();
+        // The insertion-order map empties with the entities, but the
+        // counter keeps climbing — see `next_entity_sequence`.
+        self.entity_sequence.clear();
 
         // Clear spatial index
         self.spatial_index.clear();
@@ -1969,5 +2100,90 @@ mod sketch_anchor_tests {
         assert_eq!(sketch.anchor.datum_id, top.id);
         assert!(sketch.anchor.has_datum());
         assert_eq!(sketch.anchor.frame, top.frame());
+    }
+}
+
+#[cfg(test)]
+mod entity_sequence_tests {
+    //! The sketch stamps every entity with its insertion order
+    //! (Task 48). That sequence is what orders the solver's Jacobian
+    //! COLUMNS and the certificate's entity statuses, so it has to be
+    //! assigned at EVERY insertion site and retired -- never reused --
+    //! at every delete.
+    #![allow(clippy::expect_used)]
+
+    use super::*;
+
+    #[test]
+    fn every_entity_kind_is_stamped_in_the_order_it_was_added() {
+        let sketch = Sketch::new("stamped".to_string(), SketchAnchor::xy());
+        let mut order: Vec<EntityRef> = Vec::new();
+        let a = sketch.add_point(Point2d::new(0.0, 0.0));
+        order.push(EntityRef::Point(a));
+        let b = sketch.add_point(Point2d::new(10.0, 0.0));
+        order.push(EntityRef::Point(b));
+        let line = sketch.add_line(a, b).expect("segment a-b");
+        order.push(EntityRef::Line(line));
+        let circle = sketch
+            .add_circle(Point2d::new(3.0, 3.0), 2.0)
+            .expect("a positive radius is a valid circle");
+        order.push(EntityRef::Circle(circle));
+        let rect = sketch
+            .add_rectangle(Point2d::new(0.0, 8.0), Point2d::new(4.0, 10.0))
+            .expect("two distinct corners are a valid rectangle");
+        order.push(EntityRef::Rectangle(rect));
+        let ellipse = sketch
+            .add_ellipse(Point2d::new(9.0, 9.0), 3.0, 1.5, 0.0)
+            .expect("semi_major >= semi_minor > 0 is a valid ellipse");
+        order.push(EntityRef::Ellipse(ellipse));
+
+        let sequences: Vec<u64> = order.iter().map(|e| sketch.entity_sequence(e)).collect();
+        for (position, sequence) in sequences.iter().enumerate() {
+            assert_ne!(
+                *sequence, UNSEQUENCED_ENTITY,
+                concat!(
+                    "every insertion site must stamp: an unstamped entity sorts to the ",
+                    "end of the column order instead of into its own place. Position {} ",
+                    "of {:?}"
+                ),
+                position, sequences
+            );
+        }
+        let mut ascending = sequences.clone();
+        ascending.sort_unstable();
+        assert_eq!(
+            sequences, ascending,
+            concat!(
+                "the sequences must ascend in ADD order across every entity kind -- the ",
+                "eight entity maps are walked separately, so a per-kind counter would ",
+                "interleave kinds instead of preserving the order the sketch was built ",
+                "in: {:?}"
+            ),
+            sequences
+        );
+    }
+
+    #[test]
+    fn a_deleted_entitys_sequence_is_retired_not_reused() {
+        let sketch = Sketch::new("retired".to_string(), SketchAnchor::xy());
+        let first = sketch.add_point(Point2d::new(0.0, 0.0));
+        let taken = sketch.entity_sequence(&EntityRef::Point(first));
+        sketch
+            .delete_point(&first)
+            .expect("the point this test just added is deletable");
+        assert_eq!(
+            sketch.entity_sequence(&EntityRef::Point(first)),
+            UNSEQUENCED_ENTITY,
+            "a deleted entity keeps no place in the column order"
+        );
+        let second = sketch.add_point(Point2d::new(1.0, 1.0));
+        assert!(
+            sketch.entity_sequence(&EntityRef::Point(second)) > taken,
+            concat!(
+                "the counter is never rewound: rewinding would let a later entity ",
+                "inherit an earlier one's place in the column order, which is the one ",
+                "way a monotone counter can reproduce the ambiguity it removes"
+            )
+        );
     }
 }
