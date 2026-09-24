@@ -30,6 +30,7 @@
 import { z } from "zod";
 import type { ToolHost } from "../registry.js";
 import { ok } from "../core.js";
+import { typedErrorResult } from "../gates.js";
 import { PACK_CHUNKS, PLAYBOOK_CHUNKS } from "./kb_data.js";
 import { referenceLookup, REFERENCE_KEYS } from "./kb_reference.js";
 
@@ -221,7 +222,7 @@ export function registerKbTools(server: ToolHost): void {
         const text = PACK_CHUNKS[k];
         const meta = PACK_META[k];
         if (text === undefined || meta === undefined) {
-          return ok({
+          return typedErrorResult({
             kind, key: k, refused: true,
             reason: `unknown process pack '${k}' — the KB covers exactly the 8 processes listed; anything else is a sourcing question, not a guess`,
             valid_keys: Object.keys(PACK_CHUNKS),
@@ -244,7 +245,7 @@ export function registerKbTools(server: ToolHost): void {
         const text = PLAYBOOK_CHUNKS[k];
         const meta = PLAYBOOK_META[k];
         if (text === undefined || meta === undefined) {
-          return ok({
+          return typedErrorResult({
             kind, key: k, refused: true,
             reason: `unknown feature playbook '${k}' — the KB covers exactly the 8 feature types listed`,
             valid_keys: Object.keys(PLAYBOOK_CHUNKS),
@@ -273,7 +274,9 @@ export function registerKbTools(server: ToolHost): void {
             }),
       };
       payload.token_estimate = tokensOf(JSON.stringify(payload));
-      return ok(payload);
+      // A refused reference lookup is a failed call (no value was given):
+      // the same error shape as the pack/playbook refusals above.
+      return "refused" in result ? typedErrorResult(payload) : ok(payload);
     },
   );
 }

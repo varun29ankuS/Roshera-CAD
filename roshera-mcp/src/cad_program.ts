@@ -22,6 +22,7 @@ import { z } from "zod";
 import { ToolHost, ToolTable } from "./registry.js";
 import { validateOp, UnknownToolError, rankTools } from "./metatools.js";
 import { ok } from "./core.js";
+import { typedErrorResult } from "./gates.js";
 import { McpError } from "@modelcontextprotocol/sdk/types.js";
 
 /** Max ops per program (spec S4.1, slice-1 cap). */
@@ -248,8 +249,9 @@ export function registerCadProgram(host: ToolHost, table: ToolTable): void {
     "Run up to 50 tool ops as ONE certified program through the SAME handlers " +
       "individual calls use. ALL ops are schema-validated up front — any bad op " +
       "refuses the WHOLE program (per-op report, nothing runs). Execution is " +
-      "sequential and STOPS at the first failure, returning a LEDGER {completed, " +
-      "total, ops:[{index, tool, ok, certificate|error}]} — the certificate is " +
+      "sequential and STOPS at the first failure as an ERROR: LEDGER " +
+      "{completed, total, ops:[{index, tool, ok, certificate|error}]}; the " +
+      "certificate is " +
       "each op's own soundness verdict. NO rollback: backend state = the " +
       "completed prefix exactly; undo is your explicit next call. Ops may not be " +
       "meta/composition tools, nor clear_parts/delete_part unless " +
@@ -465,8 +467,10 @@ export function registerCadProgram(host: ToolHost, table: ToolTable): void {
           break;
         }
         if (result?.isError === true) {
-          // Typed backend refusal / timeout / network error surfaced by the
-          // handler as an error result — stop here (stop-on-first-error).
+          // Typed refusal / unsound halt / timeout / network error surfaced
+          // by the handler as an error result — stop here (stop-on-first-
+          // error). Refusals and halts are error results by convention
+          // (gates.ts `typedErrorResult`), so this one rule catches them.
           ledger.push({ index: i, tool, ok: false, error: errorTextOf(result) });
           stoppedAt = i;
           break;
@@ -486,7 +490,7 @@ export function registerCadProgram(host: ToolHost, table: ToolTable): void {
           "never attempted. State matches the ledger exactly — undo/truncate is your " +
           "explicit next call.";
 
-      return ok({
+      const report = {
         ok: allOk,
         name: name ?? null,
         completed,
@@ -494,7 +498,12 @@ export function registerCadProgram(host: ToolHost, table: ToolTable): void {
         stopped_at: stoppedAt,
         ops: ledger,
         note,
-      });
+      };
+      // A stopped program did not do what was asked: it is a FAILURE the
+      // client sees (error result, ledger in structuredContent), the same way
+      // a refused op or a validation stop is — never an MCP success whose only
+      // tell is `ok:false` buried in the body.
+      return allOk ? ok(report) : typedErrorResult(report);
     },
   );
 }

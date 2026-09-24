@@ -19,6 +19,7 @@ import {
   cross3,
   unit3,
 } from "../core.js";
+import { typedErrorResult } from "../gates.js";
 
 /**
  * Shared schema field for every op that stacks work onto an existing solid.
@@ -285,9 +286,9 @@ export function registerModifyTools(server: ToolHost) {
     "BATCH boolean: apply MANY tool solids against one base sequentially in a " +
       "single MCP call — the backend still runs ONE boolean mutation + ONE " +
       "certification PER tool (N tools = N backend ops; the saving is MCP " +
-      "turns, not kernel work). The batch HALTS at the first unsound step and " +
-      "names the tool that did it. The base keeps its uuid; consumed tools " +
-      "are gone.",
+      "turns, not kernel work). The batch HALTS at the first unsound step (an " +
+      "ERROR) and names the tool that did it. The base keeps its uuid; " +
+      "consumed tools are gone.",
     {
       op: z.enum(["union", "difference"]).describe("operation applied at each step"),
       base: z.string().uuid().describe("object_uuid of the base solid (kept)"),
@@ -318,7 +319,9 @@ export function registerModifyTools(server: ToolHost) {
           lastId = await newestPartId();
           const p = await perceive(lastId);
           if (p && p.sound !== true) {
-            return ok({
+            // A HALT: the call did not do what was asked, but steps 1..i+1
+            // are applied — an error result that still names the live prefix.
+            return typedErrorResult({
               object_uuid: base,
               part_id: lastId,
               completed: i + 1,
@@ -353,7 +356,8 @@ export function registerModifyTools(server: ToolHost) {
       "pass through [0,0,0]), else cx,cy on `plane`; bores run along `axis` " +
       "(default plane normal) — size `depth`/`z_offset` to OVERSHOOT both faces. " +
       "REFUSES overlapping adjacent holes up front (chord spacing must exceed " +
-      "2·hole_r). Certified per hole; halts on the first unsound step. ONE MCP " +
+      "2·hole_r). Certified per hole; halts on the first unsound hole with an " +
+      "ERROR result {halted, holes_completed}; earlier holes stay. ONE MCP " +
       "call, but the backend runs TWO mutations + a certification PER hole " +
       "(cylinder then subtract — `count` holes = 2·count backend ops).",
     {
@@ -481,7 +485,9 @@ export function registerModifyTools(server: ToolHost) {
           lastId = await newestPartId();
           const pv = await perceive(lastId);
           if (pv && pv.sound !== true) {
-            return ok({
+            // A HALT: holes 1..k+1 are drilled and live — an error result
+            // that still names the applied prefix.
+            return typedErrorResult({
               object_uuid: object,
               part_id: lastId,
               holes_completed: k + 1,

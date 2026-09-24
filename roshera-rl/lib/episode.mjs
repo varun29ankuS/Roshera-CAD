@@ -153,7 +153,17 @@ export function verifyClaimActuallyMeasured(args, data) {
  *
  *   - a call that was refused or errored (`ok: false`) built nothing, so it
  *     is skipped entirely — matching gates.ts's own `result?.isError !== true`
- *     guard around this whole branch;
+ *     guard around this whole branch — with TWO exceptions (Task 71), both
+ *     error results that left geometry behind, both marked on the step
+ *     entry from the RESULT (never the tool name — `invoke` wraps either
+ *     verbatim):
+ *       · `halted: true` — an unsound HALT (boolean_many / drill_pattern,
+ *         `structuredContent.halted`) counts as unverified work, mirroring
+ *         gates.ts's `isHaltResult` tally;
+ *       · `stoppedProgram: true` — a cad_program that reached execution and
+ *         stopped (its result carries `stopped_at` / an `ops` ledger) is the
+ *         same STATED ABSENCE as a successful composite call below. Only the
+ *         validation-stage refusal (nothing ran) stays a skip;
  *   - `timeline_checkpoint` or `clear_timeline` (successful) CLEAR the
  *     tally: a checkpoint that closed successfully already passed gate 6
  *     itself (verified, or explicitly `skip_verification`'d ON THE RECORD),
@@ -202,8 +212,30 @@ export function unverifiedMutatingWork(stepLog) {
   const entries = Array.isArray(stepLog) ? stepLog : [];
   for (const s of entries) {
     if (s == null || typeof s !== "object") continue;
-    if (s.ok !== true) continue; // refused/errored — built nothing to verify
     const tool = s.tool;
+    if (s.ok !== true) {
+      // Task 71: two error results DID leave work behind.
+      if (s.stoppedProgram === true) {
+        // A composite program that reached execution and stopped: its
+        // prefix — and possibly the stopped op itself (a halt, or a throw
+        // after mutating) — ran through gates.ts individually, unlogged here.
+        return {
+          absent:
+            `the step log contains a '${typeof tool === "string" ? tool : "composite"}' ` +
+            "program that stopped during execution — the ops it ran before " +
+            "(and possibly at) the stop are not logged as separate entries " +
+            "here, so unverified-mutation tracking cannot be reconstructed " +
+            "from this step log",
+        };
+      }
+      if (s.halted === true) {
+        // A HALT (gates.ts `isHaltResult`): the applied prefix is live
+        // geometry, tallied exactly as gates.ts tallies it.
+        tools.add(typeof tool === "string" ? tool : "halted");
+        count += 1;
+      }
+      continue; // otherwise refused/errored — built nothing to verify
+    }
     if (typeof tool !== "string") continue;
     if (COMPOSITE_DISPATCH.has(tool)) {
       return {
@@ -600,9 +632,23 @@ export async function runEpisode({
     // is the only tool this matters for, so the key is simply absent
     // (`undefined`) for every other tool, which `unverifiedMutatingWork`
     // above treats identically to `false` — the conservative default.
+    //
+    // Task 71 — two error results still built something, and both are read
+    // off the RESULT, not the tool name: a HALT (`structured.halted`, gates.ts
+    // `typedErrorResult`) and a program STOPPED during execution (an error
+    // whose body carries cad_program's `stopped_at` / `ops` ledger; the
+    // validation-stage refusal carries neither — nothing ran).
+    const failed = result?.is_error === true;
+    const halted = failed && typeof result?.structured?.halted === "string";
+    const d = result?.data;
+    const stoppedProgram =
+      failed && d !== null && typeof d === "object" &&
+      ("stopped_at" in d || Array.isArray(d.ops));
     stepLog.push({
       tool: action.tool,
-      ok: result?.is_error !== true,
+      ok: !failed,
+      ...(halted ? { halted: true } : {}),
+      ...(stoppedProgram ? { stoppedProgram: true } : {}),
       ...(action.tool === "verify_claim"
         ? { claimMeasured: verifyClaimActuallyMeasured(action.args, result?.data) }
         : {}),

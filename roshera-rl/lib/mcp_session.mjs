@@ -28,12 +28,24 @@
  *      The text is PROSE, so `JSON.parse` throws on it. `structuredContent`
  *      is present only when the backend body was catalog-shaped
  *      (`error_code` present — core.ts:413-430).
- *   3. GATE REFUSAL — `gates.ts:121-131 gateRefusal(payload)`:
+ *   3. GATE REFUSAL — `gates.ts gateRefusal(payload)`:
  *        { content: [{ type:"text", text: JSON.stringify({refused:true, …}) }],
  *          isError: true }
- *   4. TIMELINE REFUSAL — `tools/timeline.ts:26-35 refusalOrFail(e)`:
- *        `ok({ refused: <PARSED BACKEND BODY> })` — `refused` is an OBJECT,
- *        not `true`, and the result carries NO `isError`.
+ *   4. TYPED ERROR RESULT — `gates.ts typedErrorResult(payload)`:
+ *        { content: [{ type:"text", text: JSON.stringify(payload) }],
+ *          isError: true, structuredContent: payload }
+ *      Three payload kinds (Task 71, audit 2026-09-03):
+ *        - a REFUSAL, nothing changed: `{ refused: <PARSED BACKEND BODY> }`
+ *          from the timeline tools' `refusalOrFail` (`refused` is an OBJECT,
+ *          not `true`), or `{ refused: true, reason, … }` from kb_lookup /
+ *          ask_choice;
+ *        - a HALT, a prefix WAS applied: `{ halted: "<why>", … }` from
+ *          boolean_many / drill_pattern — live geometry, unverified work;
+ *        - a STOPPED PROGRAM: cad_program's ledger `{ ok:false, stopped_at,
+ *          ops:[…], … }` — the ops before the stop (and possibly the stopped
+ *          op itself) ran. Its validation-stage refusal (`stage:
+ *          "validation"`, `executed: 0`) is instead `ok()` + `isError` with
+ *          no `structuredContent`, and nothing ran.
  *
  * `readToolResult` below normalises all four into ONE envelope and is
  * deliberately a PURE function so it can be tested against results copied
@@ -69,10 +81,14 @@ import { fileURLToPath } from "node:url";
  * surfaces to each other.
  *
  * The three cases it covers, and why each exists:
- *  - `refused === true` — kb_lookup and every gate in gates.ts,
- *  - `refused` is an OBJECT — the timeline tools' `ok({refused: <body>})`,
- *  - an `isError` result whose text carries the kernel's REFUSED marker —
- *    drill_pattern's spacing guard and backend typed refusals.
+ *  - `refused === true` — kb_lookup, ask_choice and every gate in gates.ts,
+ *  - `refused` is an OBJECT — the timeline tools' typed backend refusal body,
+ *  - a NON-JSON `isError` result whose text carries the kernel's REFUSED
+ *    marker — drill_pattern's spacing guard and backend typed refusals via
+ *    `fail()`.
+ * A JSON payload is judged by its typed `refused` field ALONE (`return null`
+ * otherwise): a stopped cad_program ledger quotes inner errors, including a
+ * `REFUSED:`, while its own prefix really ran.
  *
  * Returns the parsed gate name when one exists, `{gate: null}` for a refusal
  * that names no gate, and `null` for a non-refusal.
@@ -90,6 +106,7 @@ function typedRefusalOf(result) {
         const gate = data.gate;
         return { gate: typeof gate === "string" ? gate : null };
       }
+      return null;
     }
   } catch {
     // not JSON — fall through to the marker check

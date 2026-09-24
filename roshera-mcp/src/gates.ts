@@ -156,11 +156,49 @@ function gateRefusal(payload: Record<string, unknown>) {
 }
 
 /**
+ * The ONE shape for a tool call that did not do what was asked but has a
+ * typed answer to give: an error result (`isError: true`) whose text is the
+ * JSON payload and whose `structuredContent` is the same object. Two kinds
+ * use it:
+ *  - a REFUSAL (`refused: true` or `refused: <backend body>`): nothing
+ *    changed — kb_lookup, ask_choice, the timeline tools' typed backend
+ *    refusals;
+ *  - a HALT (`halted: "<why>"`): a multi-step mutating tool stopped at an
+ *    unsound step AFTER applying a prefix — boolean_many, drill_pattern. The
+ *    prefix is live geometry; `recordDispatchOutcome` counts it as work.
+ * `isError` is what makes cad_program stop at the op and makes every client
+ * see a failure; a success-shaped refusal was ledgered ok:true and the next
+ * op built on a model the agent believed had changed.
+ */
+export function typedErrorResult(payload: Record<string, unknown>) {
+  return {
+    content: [
+      { type: "text" as const, text: JSON.stringify(payload, null, 2) },
+    ],
+    isError: true as const,
+    structuredContent: payload,
+  };
+}
+
+/** True for a `typedErrorResult` HALT: state changed before the stop. */
+function isHaltResult(result: any): boolean {
+  return (
+    result?.isError === true &&
+    typeof result?.structuredContent?.halted === "string"
+  );
+}
+
+/**
  * Detect a typed refusal in ANY tool result, whatever path produced it:
- *  - a JSON payload whose top-level `refused` is `true` (kb_lookup, the gates
- *    here) or an object (the timeline tools' `ok({refused: <backend body>})`),
- *  - an error result whose text carries the kernel's REFUSED marker
- *    (drill_pattern's spacing guard, backend typed refusals).
+ *  - a JSON payload whose top-level `refused` is `true` (kb_lookup,
+ *    ask_choice, the gates here) or an object (the timeline tools' typed
+ *    backend refusal body),
+ *  - a NON-JSON error result whose text carries the kernel's REFUSED marker
+ *    (drill_pattern's spacing guard, backend typed refusals via `fail()`).
+ * A JSON payload is judged by its typed `refused` field alone, never by a
+ * substring: a stopped cad_program ledger or a halt can quote an inner
+ * "REFUSED" while its own prefix really executed, and caching it would answer
+ * the identical re-issue "refused" without running anything.
  * Returns the parsed gate name when one exists (cache policy needs it), an
  * empty object for a refusal with no gate, or null for a non-refusal.
  */
@@ -179,6 +217,7 @@ function typedRefusalOf(result: any): { gate?: string } | null {
         const gate = (data as any).gate;
         return { gate: typeof gate === "string" ? gate : undefined };
       }
+      return null;
     }
   } catch {
     // not JSON — fall through to the marker check
@@ -1401,5 +1440,11 @@ export function recordDispatchOutcome(
       intentUnverified.tools.add(tool);
       intentUnverified.count += 1;
     }
+  } else if (isHaltResult(result) && MUTATES_SOLIDS.has(tool) && openIntent !== null) {
+    // A HALT is an error result, but the prefix it applied before stopping is
+    // live (and unsound) geometry — exactly the work gate 6 exists to make
+    // the caller look at before the intent closes.
+    intentUnverified.tools.add(tool);
+    intentUnverified.count += 1;
   }
 }

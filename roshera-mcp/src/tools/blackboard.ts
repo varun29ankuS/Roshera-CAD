@@ -27,6 +27,7 @@
 import type { ToolHost } from "../registry.js";
 import { z } from "zod";
 import { api, ok, fail } from "../core.js";
+import { typedErrorResult } from "../gates.js";
 
 /** Wire shape of one Blackboard line (mirrors the frontend store). */
 interface BlackboardLine {
@@ -225,7 +226,7 @@ export function registerBlackboardTools(server: ToolHost) {
     async ({ question, options }) => {
       const reason = askChoiceRefusal(question, options);
       if (reason !== null) {
-        return ok({ refused: true, reason });
+        return typedErrorResult({ refused: true, reason });
       }
       return ok({
         fence: buildChoicesFence(question, options),

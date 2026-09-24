@@ -6,7 +6,7 @@ import type { ToolHost } from "../registry.js";
 import { z } from "zod";
 import { randomUUID } from "node:crypto";
 import { api, ok, fail, ApiError } from "../core.js";
-import type { GateDecision } from "../gates.js";
+import { typedErrorResult, type GateDecision } from "../gates.js";
 
 /**
  * One stable session id per MCP process: the backend's undo/redo walk a
@@ -19,15 +19,17 @@ const AGENT_SESSION_ID = randomUUID();
 /**
  * A mould / bind endpoint returns a TYPED refusal (409/422/404) when the edit
  * is not honourable — a broken-downstream feature, an unknown parameter name,
- * an unbindable target. That is an honest ANSWER, not a tool failure: surface
- * the parsed verdict as an `ok()` result so the agent sees exactly why the
- * edit was refused (never a silent bad model). Genuine transport errors still
- * fall through to `fail()`.
+ * an unbindable target. The edit did NOT happen, so it is a failed call: an
+ * error result (`typedErrorResult`) carrying the parsed verdict as
+ * `refused`, in the text and in `structuredContent`, so the agent sees
+ * exactly why — and cad_program stops at it instead of building the next op
+ * on a model that never changed. Genuine transport errors still fall through
+ * to `fail()`.
  */
 function refusalOrFail(e: unknown) {
   if (e instanceof ApiError && [404, 409, 422].includes(e.status)) {
     try {
-      return ok({ refused: JSON.parse(e.body) });
+      return typedErrorResult({ refused: JSON.parse(e.body) });
     } catch {
       /* body not JSON — fall through */
     }

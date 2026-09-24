@@ -225,6 +225,32 @@ check("the refusal detector still matches gates.ts", () => {
   );
   const mirror = readFileSync(join(HERE, "..", "lib", "mcp_session.mjs"), "utf8");
   assert.ok(mirror.includes(CANONICAL), "the mirror must carry the canonical test verbatim");
+
+  // Task 71: a JSON payload is judged by its typed `refused` field ALONE —
+  // `return null` right after the typed-field test, before the `REFUSED`
+  // substring marker is ever consulted. Both copies must carry it, or a
+  // stopped cad_program ledger quoting an inner `REFUSED:` is a refusal in
+  // one package and not the other.
+  const jsonBranchReturnsNull = (src, label) => {
+    const at = src.indexOf(CANONICAL);
+    assert.ok(at >= 0, `${label}: canonical refusal test missing`);
+    const tail = src.slice(at, src.indexOf("} catch", at));
+    assert.match(tail, /\}\s*return null;\s*\}\s*$/,
+      `${label}: the JSON branch must end in \`return null\` (a JSON payload without a typed \`refused\` is not a refusal)`);
+  };
+  jsonBranchReturnsNull(gates, "gates.ts");
+  jsonBranchReturnsNull(mirror, "lib/mcp_session.mjs");
+});
+
+check("a JSON error result with no typed `refused` is NOT a refusal, even if it quotes REFUSED (Task 71)", () => {
+  const ledger = { ok: false, stopped_at: 1, ops: [{ index: 1, tool: "drill_pattern", ok: false, error: "ERROR: REFUSED: 12 holes … intersect" }] };
+  const env = readToolResult({
+    content: [{ type: "text", text: JSON.stringify(ledger, null, 2) }],
+    isError: true,
+    structuredContent: ledger,
+  });
+  assert.equal(env.refusal, null);
+  assert.equal(env.is_error, true);
 });
 
 // ── spawn-time seams ────────────────────────────────────────────────────

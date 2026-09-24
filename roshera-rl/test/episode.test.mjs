@@ -729,8 +729,33 @@ check("unverifiedMutatingWork: workbench is NOT composite dispatch (H1) — it m
     "a workbench call after a real mutation must leave the tally exactly as it was — the H1 defect was this reading {absent: ...} instead");
 });
 
-check("unverifiedMutatingWork: a REFUSED/errored composite dispatch built nothing — same rule as any other refused call", () => {
+check("unverifiedMutatingWork: a composite dispatch refused BEFORE execution (validation stage) built nothing — same rule as any other refused call", () => {
+  // A step logged ok:false with no `stoppedProgram` mark is a program that
+  // never reached execution (cad_program's validation-stage refusal,
+  // `stage: "validation"`, `executed: 0`) — the one zero-work failure.
   assert.deepEqual(unverifiedMutatingWork([{ tool: "cad_program", ok: false }]), { count: 0, tools: [] });
+});
+
+check("unverifiedMutatingWork: a composite dispatch that STOPPED during execution is a stated absence, even though it is an error result (Task 71)", () => {
+  const r = unverifiedMutatingWork([
+    { tool: "create_cylinder", ok: true },
+    { tool: "cad_program", ok: false, stoppedProgram: true },
+  ]);
+  assert.equal(typeof r.absent, "string",
+    "a stopped program's prefix (and even op 0 itself, a halt or a throw after mutating) may have built geometry");
+  assert.equal(r.count, undefined);
+});
+
+check("unverifiedMutatingWork: a HALTED step is unverified work though it is an error result — keyed on the halt, not the tool name (Task 71)", () => {
+  assert.deepEqual(
+    unverifiedMutatingWork([{ tool: "boolean_many", ok: false, halted: true }]),
+    { count: 1, tools: ["boolean_many"] },
+  );
+  // an ordinary failure of the same tool built nothing — unchanged
+  assert.deepEqual(
+    unverifiedMutatingWork([{ tool: "boolean_many", ok: false }]),
+    { count: 0, tools: [] },
+  );
 });
 
 check("unverifiedMutatingWork: a composite dispatch that ran cleanly BEFORE it, and normal calls after it, still cannot be trusted — the absence sticks", () => {
@@ -931,6 +956,91 @@ check("M2 CLOSED: an episode ending on a successful cad_program dispatch reports
     "the review's concrete case: ten mutations inside one cad_program call must not tally {count: 0}",
   );
   assert.equal(terminal.unverified_mutations.count, undefined);
+});
+
+// ─── Task 71 (audit 2026-09-03): refusals and halts are ERROR results ───────
+//
+// roshera-mcp now returns an unsound halt (boolean_many / drill_pattern) and a
+// stopped cad_program as `isError: true`, with the JSON payload as text and
+// the same object in `structuredContent` (gates.ts `typedErrorResult`). Both
+// left live geometry behind. The step log must still see that work: a halt
+// counts (as gates.ts's own `isHaltResult` tally does), and a program that
+// reached execution cannot be reconstructed — never the fabricated
+// `{count: 0}` a bare `ok: false` would read as. These fixtures copy the
+// `typedErrorResult` shape verbatim.
+
+/** gates.ts `typedErrorResult(payload)` → envelope. */
+const typedError = (payload) => readToolResult({
+  content: [{ type: "text", text: JSON.stringify(payload, null, 2) }],
+  isError: true,
+  structuredContent: payload,
+});
+/** modify.ts boolean_many's halt payload. */
+const HALTED = typedError({
+  object_uuid: "3f2b8c1e-77aa-4a9f-8b21-9f0f2a6d5e10", part_id: 9, completed: 1, of: 2,
+  halted: "step 1 (8a1f0c2e-1111-4222-8333-444444444444) left the base UNSOUND — UNSOUND ✗ failed: watertight | ⚠ 4 open edges — run verify_part for the full certificate + diagnostic render",
+});
+/** cad_program's stopped ledger — stopped at `at`, `completed` ops before it. */
+const programStopped = (at) => typedError({
+  ok: false, name: null, completed: at, total: 3, stopped_at: at,
+  ops: [
+    ...Array.from({ length: at }, (_, i) => ({ index: i, tool: "create_box", ok: true, certificate: "SOUND ✓" })),
+    { index: at, tool: "boolean_many", ok: false, error: HALTED.text },
+  ],
+  note: `Stopped at op ${at} (boolean_many). No rollback: the first ${at} op(s) are applied and live.`,
+});
+/** cad_program's validation-stage refusal: nothing ran (cad_program.ts phase 1). */
+const PROGRAM_INVALID = readToolResult({
+  content: [{ type: "text", text: JSON.stringify({
+    ok: false, stage: "validation", name: null, total: 1, executed: 0,
+    errors: [{ index: 0, tool: "create_box", reason: "height: Required" }],
+    note: "No ops were executed — validation failed up front.",
+  }, null, 2) }],
+  isError: true,
+});
+
+const HALT_TASK = defineTask({
+  id: "t-halt", prompt: "p", toolAllowlist: ["boolean_many", "cad_program"],
+  claims: [{
+    name: "volume", expr: "v",
+    bindings: [{ var: "v", measure: { kind: "volume", part: "solid:0" } }],
+    expected: 117809.724509617, tolerance: 117.8,
+  }],
+  stepBudget: 3, tokenBudget: 1000, split: "train",
+});
+
+async function terminalAfter(file, tool, result) {
+  const path = join(dir, file);
+  await runEpisode({
+    task: HALT_TASK,
+    policy: scriptedPolicy([{ tool, args: {} }]),
+    seed: 1, baseUrl, authHeader: {}, trajectoryPath: path, kernelSha: "abc",
+    spawn: fakeSpawn(() => result),
+  });
+  return readTrajectory(path).terminal;
+}
+
+check("Task 71: an episode ending on a HALTED boolean_many counts it as unverified work, never {count: 0}", async () => {
+  const t = await terminalAfter("t71-halt.jsonl", "boolean_many", HALTED);
+  assert.deepEqual(t.unverified_mutations, { count: 1, tools: ["boolean_many"] },
+    "the halted prefix is live unsound geometry nobody looked at");
+});
+
+check("Task 71: an episode ending on a cad_program STOPPED at op 0 is a stated absence (op 0 may have mutated before stopping)", async () => {
+  const t = await terminalAfter("t71-stop0.jsonl", "cad_program", programStopped(0));
+  assert.equal(typeof t.unverified_mutations.absent, "string");
+  assert.equal(t.unverified_mutations.count, undefined);
+});
+
+check("Task 71: an episode ending on a cad_program STOPPED at op 1 is a stated absence", async () => {
+  const t = await terminalAfter("t71-stop1.jsonl", "cad_program", programStopped(1));
+  assert.equal(typeof t.unverified_mutations.absent, "string");
+  assert.equal(t.unverified_mutations.count, undefined);
+});
+
+check("Task 71: a cad_program refused at VALIDATION ran nothing — {count: 0}, not an absence", async () => {
+  const t = await terminalAfter("t71-invalid.jsonl", "cad_program", PROGRAM_INVALID);
+  assert.deepEqual(t.unverified_mutations, { count: 0, tools: [] });
 });
 
 // ─── the copy of gates.ts's MUTATES_SOLIDS is PINNED, not merely disclosed ───
