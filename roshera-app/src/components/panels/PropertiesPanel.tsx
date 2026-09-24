@@ -401,7 +401,7 @@ function TransformEditor({ objectId }: { objectId: string }) {
   if (!obj) return null
 
   function handleChange(
-    field: 'position' | 'rotation' | 'scale',
+    field: 'position' | 'rotation',
     axis: 0 | 1 | 2,
     value: string,
   ) {
@@ -438,10 +438,12 @@ function TransformEditor({ objectId }: { objectId: string }) {
           }}
           suffix="°"
         />
+        {/* Display only: the kernel has no scale operation, so a scale
+            typed here would resize the part on screen with nothing behind
+            it (and every later gizmo drag of it would be refused). */}
         <TransformRow
           label="Scl"
           values={obj.scale}
-          onChange={(axis, val) => handleChange('scale', axis, val)}
         />
       </div>
     </div>
@@ -456,7 +458,8 @@ function TransformRow({
 }: {
   label: string
   values: [number, number, number]
-  onChange: (axis: 0 | 1 | 2, value: string) => void
+  /** Absent: the row is display-only. */
+  onChange?: (axis: 0 | 1 | 2, value: string) => void
   suffix?: string
 }) {
   const colors = ['text-red-400', 'text-green-400', 'text-blue-400']
@@ -476,7 +479,8 @@ function TransformRow({
             type="number"
             step={label === 'Scl' ? 0.1 : 1}
             value={values[i].toFixed(label === 'Scl' ? 2 : 1)}
-            onChange={(e) => onChange(i, e.target.value)}
+            readOnly={!onChange}
+            onChange={onChange ? (e) => onChange(i, e.target.value) : undefined}
             className="w-full min-w-0 bg-transparent text-[11px] font-mono outline-none text-foreground"
           />
           {suffix && <span className="text-[11px] text-muted-foreground shrink-0">{suffix}</span>}

@@ -48,7 +48,10 @@ export interface SubElementSelection {
 }
 
 // ─── Transform tools ─────────────────────────────────────────────────
-export type TransformTool = 'select' | 'translate' | 'rotate' | 'scale'
+// No 'scale': a gizmo drag commits through `POST /api/geometry/transform`,
+// which has translation and rotation only. A scale tool would move the part
+// on screen with nothing in the kernel behind it.
+export type TransformTool = 'select' | 'translate' | 'rotate'
 export type TransformSpace = 'world' | 'local'
 export type SnapMode = 'none' | 'grid' | 'vertex' | 'edge' | 'face'
 

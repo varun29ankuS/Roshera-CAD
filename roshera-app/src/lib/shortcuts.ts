@@ -158,12 +158,6 @@ export function useKeyboardShortcuts() {
             state.setActiveTool('rotate')
           }
           break
-        case 's':
-          if (!ctrl) {
-            e.preventDefault()
-            state.setActiveTool('scale')
-          }
-          break
 
         // Selection modes
         case '1':

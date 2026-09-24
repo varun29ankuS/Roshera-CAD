@@ -17,7 +17,15 @@
  * re-hydrates from the now-current document in one pass.
  */
 
+import { refusalMessage, tryReadJson } from './backend-refusal'
+
 const API_BASE = `${import.meta.env.VITE_API_URL || ''}/api`
+
+/** An Error carrying the backend's own refusal text, not just the status. */
+async function refusal(context: string, resp: Response): Promise<Error> {
+  const body = await tryReadJson(resp)
+  return new Error(`${context}: ${refusalMessage(body, resp.status)}`)
+}
 
 export interface DocumentInfo {
   id: string
@@ -69,7 +77,7 @@ export async function createDocument(name?: string): Promise<DocumentInfo> {
     body: JSON.stringify(name ? { name } : {}),
   })
   if (!resp.ok) {
-    throw new Error(`createDocument: ${resp.status}`)
+    throw await refusal('creating the document', resp)
   }
   const data = (await resp.json()) as DocumentWire
   return fromWire(data)
@@ -104,7 +112,7 @@ export async function openDocument(id: string): Promise<void> {
     method: 'POST',
   })
   if (!resp.ok) {
-    throw new Error(`openDocument: ${resp.status}`)
+    throw await refusal('opening the document', resp)
   }
 }
 

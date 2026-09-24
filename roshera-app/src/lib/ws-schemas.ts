@@ -218,12 +218,11 @@ export const serverMessageSchema = z.discriminatedUnion('type', [
     type: z.literal('SessionUpdate'),
     payload: z.object({ session_id: z.string() }),
   }),
-  // Heartbeat reply. Backend echoes the original `timestamp` (and may
-  // add diagnostic fields), but the bridge does not consume the
-  // payload — RTT is timed at the client. Accept any payload shape.
+  // Heartbeat reply, `ServerMessage::Pong { timestamp }` — content under
+  // `data`. The bridge does not consume it (RTT is timed at the client).
   z.object({
     type: z.literal('Pong'),
-    payload: z.unknown().optional(),
+    data: z.object({ timestamp: z.number() }).optional(),
   }),
   z.object({
     type: z.literal('SubElementResult'),
@@ -232,9 +231,29 @@ export const serverMessageSchema = z.discriminatedUnion('type', [
       elements: z.array(subElementSchema),
     }),
   }),
+  // Two emitters, two shapes, one discriminant:
+  //  - `ServerMessage::Error` (every protocol refusal: PARSE_ERROR,
+  //    auth_required, rate_limited, auth_handshake_timeout, command
+  //    failures) serializes with `content = "data"`:
+  //      { "type": "Error", "data": { "error_code", "message",
+  //        "details"?, "request_id"? } }
+  //  - the SubElementPick picker builds its frame by hand
+  //    (`message_handlers.rs::subelement_error`):
+  //      { "type": "Error", "payload": { "message" } }
+  // Requiring `payload` alone dropped every protocol refusal at this
+  // boundary. Both are optional so a frame is never dropped for its shape;
+  // `serverErrorText` reads whichever is present.
   z.object({
     type: z.literal('Error'),
-    payload: z.object({ message: z.string() }),
+    data: z
+      .object({
+        error_code: z.string(),
+        message: z.string(),
+        details: z.unknown().optional(),
+        request_id: z.string().optional(),
+      })
+      .optional(),
+    payload: z.object({ message: z.string() }).optional(),
   }),
   // Sketch lifecycle frames. Backend pushes one after every mutating
   // REST call so peers stay in lock-step with the authoring client.
@@ -327,6 +346,13 @@ export const serverMessageSchema = z.discriminatedUnion('type', [
 
 /** The sole `ServerMessage` type the frontend is allowed to consume. */
 export type ServerMessage = z.infer<typeof serverMessageSchema>
+
+/** The user-facing text of a server `Error` frame, whichever shape it came in. */
+export function serverErrorText(msg: Extract<ServerMessage, { type: 'Error' }>): string {
+  if (msg.data) return `${msg.data.message} (${msg.data.error_code})`
+  if (msg.payload) return msg.payload.message
+  return 'the server reported an error without a message'
+}
 
 /**
  * Validate a JSON-parsed value against `serverMessageSchema`. Returns

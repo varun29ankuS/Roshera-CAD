@@ -28,8 +28,9 @@ import { useSceneStore, CAMERA_PRESETS } from '@/stores/scene-store'
 import { useWSStore } from '@/stores/ws-store'
 import { useThemeStore } from '@/stores/theme-store'
 import { useBlackboardStore } from '@/stores/blackboard-store'
-import { wsClient } from '@/lib/ws-client'
 import { exportSceneAs } from '@/lib/export-api'
+import { newDocument } from '@/lib/documents-api'
+import { runNewProject } from '@/lib/new-project'
 import { refusalMessage, tryReadJson } from '@/lib/backend-refusal'
 
 const API_BASE = import.meta.env.VITE_API_URL || ''
@@ -206,9 +207,16 @@ export function CommandPalette() {
       group: 'File',
       hint: 'Ctrl+N',
       keywords: ['clear', 'reset', 'fresh'],
+      // Same action as File → New in the TopBar: a new backend document.
+      // The scene is left alone until the backend has switched documents
+      // (the page then reloads onto it); a refusal keeps it and says why.
       run: () => {
-        clearScene()
-        wsClient.send({ type: 'Command', payload: { cmd: 'NewProject' } })
+        if (!window.confirm('Start a new, empty document? Your current document is saved.')) {
+          return
+        }
+        void runNewProject(newDocument, (line) =>
+          useBlackboardStore.getState().addLine(line, 'system'),
+        )
       },
     })
     cmds.push({
@@ -316,7 +324,6 @@ export function CommandPalette() {
       ['select', 'V'],
       ['translate', 'G'],
       ['rotate', 'R'],
-      ['scale', 'S'],
     ] as const) {
       cmds.push({
         id: `tool.${tool}`,

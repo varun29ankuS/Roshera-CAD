@@ -15,7 +15,8 @@ import type {
   MeshData,
   AnalyticalGeometry as ProtocolAnalyticalGeometry,
 } from './protocol'
-import type { ServerMessage } from './ws-schemas'
+import { serverErrorText, type ServerMessage } from './ws-schemas'
+import { mergeObjectCreated } from './object-upsert'
 import { Quaternion, Euler } from 'three'
 
 // ─── Type conversion: backend → frontend ────────────────────────────
@@ -348,22 +349,20 @@ function handleServerMessage(msg: ServerMessage) {
         `tris=${obj.mesh.indices.length / 3}`,
         `faceIds=${obj.mesh.faceIds?.length ?? 0}`,
       )
-      // In-place upsert (e.g., face-extrude that mutates the host solid
-      // and rebroadcasts on the same UUID): preserve the user-visible
-      // name. Backend handlers that mutate-in-place currently emit a
-      // generated name like "FaceExtrude {solid_id}", which would
-      // otherwise clobber whatever the user named the host ("Box 0",
-      // "Bracket A", …). Object identity is the UUID, not the name —
-      // when we already know the object, only the geometry is new.
-      const existing = getEffectiveExisting(obj.id)
-      if (existing) {
-        obj.name = existing.name
-      }
-      // Auto-frame the viewport on the new object so the user always
-      // sees what they just made — backend may place it off-screen
-      // (e.g., booleans land at world origin, extrudes shift along the
-      // face normal). CameraController consumes & clears this flag.
-      queueUpsert(obj, true, dimensionEchoMessage(proto))
+      // In-place upsert (a transform, a face-extrude that mutates the host
+      // solid and rebroadcasts on the same UUID): only the geometry and the
+      // pose are new. The frame's generated name ("Transformed",
+      // "FaceExtrude {solid_id}") and default material must not clobber the
+      // user's name and the part's colour, and the part must not be
+      // announced as new — flying the camera to it after a drag takes the
+      // view out from under the user's hand. A genuinely new part IS framed
+      // so the user sees what was made (booleans land at the world origin,
+      // extrudes shift along the face normal); CameraController consumes
+      // and clears that flag.
+      const merged = mergeObjectCreated(obj, getEffectiveExisting(obj.id), () =>
+        dimensionEchoMessage(proto),
+      )
+      queueUpsert(merged.obj, merged.announceAsNew, merged.echoMessage)
       break
     }
 
@@ -465,7 +464,10 @@ function handleServerMessage(msg: ServerMessage) {
     }
 
     case 'Error': {
-      console.error('[WS] Server error:', msg.payload.message)
+      // A refusal the user cannot see reads as "the click did nothing".
+      const text = serverErrorText(msg)
+      console.error('[WS] Server error:', text)
+      useBlackboardStore.getState().addLine(`Server refused: ${text}`, 'system')
       break
     }
 

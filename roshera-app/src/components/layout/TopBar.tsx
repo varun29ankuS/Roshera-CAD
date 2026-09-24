@@ -23,6 +23,7 @@ import { exportSceneAs } from '@/lib/export-api'
 import { useBlackboardStore } from '@/stores/blackboard-store'
 import { getDocumentUnit } from '@/lib/units-api'
 import { newDocument } from '@/lib/documents-api'
+import { runNewProject } from '@/lib/new-project'
 import { useDocumentStore } from '@/stores/document-store'
 import { refusalMessage, tryReadJson } from '@/lib/backend-refusal'
 import { UnitSelector } from '@/components/layout/UnitSelector'
@@ -156,10 +157,9 @@ export function TopBar() {
     if (!window.confirm('Start a new, empty document? Your current document is saved.')) {
       return
     }
-    newDocument().catch((err) => {
-      console.error('[TopBar] newDocument failed:', err)
-      useBlackboardStore.getState().addLine('New document failed: backend unreachable.', 'system')
-    })
+    void runNewProject(newDocument, (line) =>
+      useBlackboardStore.getState().addLine(line, 'system'),
+    )
   }, [])
 
   const handleDelete = useCallback(() => {
