@@ -580,14 +580,30 @@ fn get_solid_entities(model: &BRepModel, solid_id: SolidId) -> OperationResult<S
         .get(solid_id)
         .ok_or_else(|| OperationError::InvalidGeometry("Solid not found".to_string()))?;
 
-    let shell = model
-        .shells
-        .get(solid.outer_shell)
-        .ok_or_else(|| OperationError::InvalidGeometry("Shell not found".to_string()))?;
-
+    // Walk EVERY shell of the solid — the outer boundary, its voids
+    // (`inner_shells`) and its disjoint peer bodies (`peer_shells`) — via the
+    // canonical `Solid::all_shells` accessor, the same walk
+    // `fix_mirrored_orientations` uses. Walking only `outer_shell` left voids
+    // and peer bodies behind on every rigid motion, mirror, datum anchoring
+    // and timeline replay: the outer hull moved, the rest stayed put, and the
+    // solid was torn. A face listed by more than one shell is collected once,
+    // so its surface is transformed exactly once.
     let mut vertices = HashSet::new();
     let mut edges = HashSet::new();
-    let faces = shell.faces.clone();
+    let mut faces: Vec<FaceId> = Vec::new();
+    let mut seen_faces: HashSet<FaceId> = HashSet::new();
+    for shell_id in solid.all_shells() {
+        let shell = model.shells.get(shell_id).ok_or_else(|| {
+            OperationError::InvalidGeometry(format!(
+                "Shell {shell_id} of solid {solid_id} not found"
+            ))
+        })?;
+        for &face_id in &shell.faces {
+            if seen_faces.insert(face_id) {
+                faces.push(face_id);
+            }
+        }
+    }
 
     // Collect every edge / vertex reachable through *all* loops of every
     // face — both the outer boundary and any interior (hole) loops. The
@@ -1672,6 +1688,63 @@ mod tests {
                 entities.edges.contains(&e),
                 "inner-loop edge {e} missing from collected solid entities"
             );
+        }
+    }
+
+    #[test]
+    fn get_solid_entities_collects_a_face_shared_by_two_shells_once() {
+        // Task 65: the walk now covers every shell. A face listed by two
+        // shells of the same solid must be collected once, or its surface
+        // would be transformed twice (a translate applied twice).
+        use crate::primitives::shell::{Shell, ShellType};
+
+        let (mut model, sid) = unit_box();
+        let outer = model.solids.get(sid).expect("solid").outer_shell;
+        let outer_faces = model.shells.get(outer).expect("shell").faces.clone();
+        let shared = *outer_faces.first().expect("box has faces");
+
+        let mut peer = Shell::new(0, ShellType::Closed);
+        peer.add_face(shared);
+        let peer_id = model.shells.add(peer);
+        model
+            .solids
+            .get_mut(sid)
+            .expect("solid")
+            .add_peer_shell(peer_id);
+
+        let entities = get_solid_entities(&model, sid).expect("get_solid_entities");
+        assert_eq!(
+            entities.faces.len(),
+            outer_faces.len(),
+            "a face shared by two shells must be collected exactly once: {:?}",
+            entities.faces
+        );
+        assert_eq!(
+            entities.faces.iter().filter(|&&f| f == shared).count(),
+            1,
+            "shared face {shared} collected more than once"
+        );
+    }
+
+    #[test]
+    fn get_solid_entities_refuses_a_dangling_shell_reference() {
+        // A solid naming a shell the store does not hold is corrupt; the
+        // walk must refuse rather than transform part of the solid.
+        let (mut model, sid) = unit_box();
+        model
+            .solids
+            .get_mut(sid)
+            .expect("solid")
+            .add_peer_shell(999_999);
+        let err = get_solid_entities(&model, sid)
+            .err()
+            .expect("a dangling shell id must be refused");
+        match err {
+            OperationError::InvalidGeometry(msg) => {
+                assert!(msg.contains("999999"), "message names the shell: {msg}");
+                assert!(!msg.contains("  "), "no double spaces: {msg}");
+            }
+            other => panic!("expected InvalidGeometry, got {other:?}"),
         }
     }
 
