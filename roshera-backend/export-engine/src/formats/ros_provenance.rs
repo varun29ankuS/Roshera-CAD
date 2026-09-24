@@ -235,6 +235,7 @@ pub fn command_type_for_kind(kind: &str) -> CommandType {
 
         // Rigid-motion / placement changes.
         "transform_solid"
+        | "mirror"
         | "transform_faces"
         | "transform_edges"
         | "datum_set_transform"

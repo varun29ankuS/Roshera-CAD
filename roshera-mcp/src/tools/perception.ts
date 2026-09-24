@@ -207,6 +207,10 @@ export function registerPerceptionTools(server: ToolHost) {
                   brep_valid: valid,
                   brep_watertight: (cert?.watertight ?? p.watertight) === true,
                   manifold: cert?.manifold ?? null,
+                  // Every shell faces out of the material; the witness names
+                  // any shell enclosing volume of the wrong sign for its role.
+                  shells_outward: cert?.shells_outward ?? null,
+                  misoriented_shells: cert?.misoriented_shells ?? null,
                   self_intersection_free: cert?.self_intersection_free ?? null,
                   tessellation_clean: cert?.tessellation_clean ?? null,
                   mesh_quality_clean: cert?.mesh_quality_clean ?? null,

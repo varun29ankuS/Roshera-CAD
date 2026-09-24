@@ -30,7 +30,7 @@ import { eulerGenus, fmtNum } from './format'
  * face coverage" — a private mapping this codebase's own rule (never ship
  * a lookalike a reader has to be taught) forbids. Every other invariant is
  * an abstract B-Rep/topology term with no real-world icon at all, so all
- * eight keep short text labels rather than inventing glyphs for them.
+ * nine keep short text labels rather than inventing glyphs for them.
  */
 const INVARIANTS: ReadonlyArray<{
   key: keyof SoundnessCardData & string
@@ -43,6 +43,7 @@ const INVARIANTS: ReadonlyArray<{
   { key: 'brep_valid', label: 'B-Rep', long: 'B-Rep valid' },
   { key: 'watertight', label: 'watertight', long: 'watertight', glyph: Droplet },
   { key: 'manifold', label: 'manifold', long: 'manifold' },
+  { key: 'shells_outward', label: 'outward', long: 'every shell faces out of the material' },
   { key: 'self_intersection_free', label: 'no self-int.', long: 'self-intersection-free' },
   { key: 'construction_consistent', label: 'construction', long: 'construction consistent' },
   { key: 'labels_consistent', label: 'labels', long: 'labels consistent' },

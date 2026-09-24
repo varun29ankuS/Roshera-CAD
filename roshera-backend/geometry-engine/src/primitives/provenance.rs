@@ -501,6 +501,52 @@ impl MeshQuality {
     }
 }
 
+/// Which boundary a shell is within its solid — and therefore which sign the
+/// volume it encloses must have when its faces point out of the material.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellRole {
+    /// The solid's outer boundary: encloses positive volume.
+    Outer,
+    /// A cavity (`Solid::inner_shells`): its faces point INTO the cavity, away
+    /// from the material, so it encloses negative volume.
+    Void,
+    /// A disjoint sibling body (`Solid::peer_shells`): encloses positive volume.
+    Peer,
+}
+
+impl ShellRole {
+    /// Short agent-facing label.
+    pub fn label(&self) -> &'static str {
+        match self {
+            ShellRole::Outer => "outer",
+            ShellRole::Void => "void",
+            ShellRole::Peer => "peer",
+        }
+    }
+
+    /// The sign (`+1` / `-1`) of the volume this shell encloses when every one
+    /// of its faces points out of the material.
+    pub fn expected_volume_sign(&self) -> f64 {
+        match self {
+            ShellRole::Outer | ShellRole::Peer => 1.0,
+            ShellRole::Void => -1.0,
+        }
+    }
+}
+
+/// Witness behind `shells_outward == false`: a shell whose enclosed signed
+/// volume has the wrong sign for its role — a body turned inside-out, a void
+/// whose faces point into the material, or a correctly-oriented cavity filed
+/// under the wrong role (a void recorded as a peer body).
+#[derive(Debug, Clone, PartialEq)]
+pub struct MisorientedShell {
+    pub shell_id: u32,
+    pub role: ShellRole,
+    /// Signed volume the shell's tessellation encloses (divergence theorem over
+    /// its own triangles), in model units³.
+    pub signed_volume: f64,
+}
+
 /// The kernel's COMPUTED verdict on a solid — never written by the caller.
 /// `is_sound()` is the honest "this is a real, closed, manufacturable solid"
 /// gate: a valid B-Rep that is watertight and manifold.
@@ -526,6 +572,17 @@ pub struct ValidityCertificate {
     /// Directed mesh edges traversed by more than one triangle — the count behind
     /// `oriented == false`. `0` on a correctly-oriented closed mesh.
     pub inconsistent_directed_edges: usize,
+    /// Every shell faces out of the material: the outer shell and each peer
+    /// body enclose POSITIVE signed volume, each void NEGATIVE. `oriented` is
+    /// a LOCAL check (neighbouring triangles agree with each other), so a shell
+    /// turned inside-out as a whole — every face reversed together — passes it,
+    /// and passes watertight, manifold and the tessellation checks too; the sign
+    /// of the enclosed volume is the global fact that exposes it. ANDed into
+    /// `is_sound()`. `false` also when the solid does not tessellate at all.
+    pub shells_outward: bool,
+    /// The shells behind `shells_outward == false`, each with its role and the
+    /// signed volume it encloses. Empty when `shells_outward`.
+    pub misoriented_shells: Vec<MisorientedShell>,
     /// No two non-adjacent faces cross (geometrically non-self-overlapping). A
     /// solid can be valid + watertight yet self-intersect (#70-class); this is
     /// the only check that catches it.
@@ -588,6 +645,7 @@ impl ValidityCertificate {
             && self.watertight
             && self.manifold
             && self.oriented
+            && self.shells_outward
             && self.self_intersection_free
             && self.construction_consistent.is_sound()
             && self.eyes_consistent.is_sound()
@@ -614,7 +672,7 @@ impl GroundTruth {
             .map(|p| p.created_by.label())
             .unwrap_or_else(|| "unrecorded".into());
         format!(
-            "solid {} — origin={} designed={} sound={} (brep_valid={} watertight={} manifold={} oriented={} euler={} construction={} labels={} tess_clean={} normal_agreement={:.3} degenerate={})",
+            "solid {} — origin={} designed={} sound={} (brep_valid={} watertight={} manifold={} oriented={} shells_outward={} euler={} construction={} labels={} tess_clean={} normal_agreement={:.3} degenerate={})",
             self.solid_id,
             origin,
             self.provenance
@@ -626,6 +684,7 @@ impl GroundTruth {
             self.certificate.watertight,
             self.certificate.manifold,
             self.certificate.oriented,
+            self.certificate.shells_outward,
             self.certificate.euler_characteristic,
             self.certificate.construction_consistent.label(),
             self.certificate.labels_consistent.label(),
@@ -782,6 +841,8 @@ impl ValidityCertificate {
             watertight: true,
             manifold: true,
             oriented: true,
+            shells_outward: true,
+            misoriented_shells: vec![],
             self_intersection_free: true,
             construction_consistent: ConstructionConsistency::NotApplicable,
             labels_consistent: LabelsConsistency::NotApplicable,

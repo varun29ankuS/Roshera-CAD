@@ -1164,7 +1164,7 @@ fn perception_json(
 /// (truth endpoint) paths can never drift in what they report.
 ///
 /// `sound` here is the FULL verdict (`is_sound()` — brep_valid ∧ watertight ∧
-/// manifold ∧ self-intersection-free ∧ construction-consistent ∧
+/// manifold ∧ oriented ∧ shells-outward ∧ self-intersection-free ∧ construction-consistent ∧
 /// tessellation-clean ∧ mesh-quality-clean), not the shallow B-Rep-only flag the
 /// lightweight perception reports.
 pub(crate) fn certificate_json(
@@ -1183,6 +1183,12 @@ pub(crate) fn certificate_json(
         "boundary_edges":          c.boundary_edges,
         "nonmanifold_edges":       c.nonmanifold_edges,
         "inconsistent_directed_edges": c.inconsistent_directed_edges,
+        "shells_outward":          c.shells_outward,
+        "misoriented_shells": c.misoriented_shells.iter().map(|m| serde_json::json!({
+            "shell_id":      m.shell_id,
+            "role":          m.role.label(),
+            "signed_volume": m.signed_volume,
+        })).collect::<Vec<_>>(),
         "construction_consistent": c.construction_consistent.label(),
         "labels_consistent":       c.labels_consistent.label(),
         "tessellation_clean":      tess.clean,

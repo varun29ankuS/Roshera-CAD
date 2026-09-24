@@ -1158,6 +1158,38 @@ impl Plane {
     }
 }
 
+/// The reference direction a surface of revolution — Cylinder, Cone, Sphere,
+/// Torus, whose angular frame is `(ref_dir, axis × ref_dir)` — stores after
+/// `matrix`, given the transformed `axis` and `ref_dir` and the surface's own
+/// u-window `[a, b]` (its `parameter_bounds`; `[0, 2π]` when untrimmed).
+///
+/// The frame is right-handed by construction. An orientation-reversing matrix
+/// (det < 0) maps `axis × ref_dir` to the NEGATIVE of `(L·axis) × (L·ref_dir)`,
+/// so keeping `L·ref_dir` would trace the image with u negated,
+/// `S'(u) = L·S(−u)`, and the stored window `[a, b]` would no longer cover it.
+/// Rotating the reference direction by the window's own span `c = a + b`
+/// (`ref'' = cos c·x' − sin c·y'`, with `x' = L·ref_dir`,
+/// `y' = L·axis × x'`) gives `S''(u) = L·S(c − u)`: the window `[a, b]` maps
+/// ONTO ITSELF, so the stored trim is left exactly as it was and stays in the
+/// range every `closest_point` of these surfaces reports. A full turn
+/// (`c = 2π`) is the identity rotation. Face `uv_bounds` inside the window
+/// follow the same `u ↦ c − u` (`operations::transform`).
+pub(crate) fn reflected_ref_dir(
+    axis: Vector3,
+    ref_dir: Vector3,
+    u_window: (f64, f64),
+    matrix: &Matrix4,
+) -> Vector3 {
+    if matrix.determinant() >= 0.0 {
+        return ref_dir;
+    }
+    let c = u_window.0 + u_window.1;
+    let y = axis.cross(&ref_dir);
+    (ref_dir * c.cos() - y * c.sin())
+        .normalize()
+        .unwrap_or(ref_dir)
+}
+
 impl Surface for Plane {
     fn surface_type(&self) -> SurfaceType {
         SurfaceType::Plane
@@ -1957,9 +1989,14 @@ impl Surface for Cylinder {
                 origin: new_origin,
                 axis: new_axis_normalized,
                 radius: new_radius,
-                ref_dir: new_ref_normalized,
+                ref_dir: reflected_ref_dir(
+                    new_axis_normalized,
+                    new_ref_normalized,
+                    self.parameter_bounds().0,
+                    matrix,
+                ),
                 height_limits: new_height_limits,
-                angle_limits: self.angle_limits, // Angles remain unchanged
+                angle_limits: self.angle_limits,
             })
         } else {
             // Non-uniform scaling deforms a cylinder into a general
@@ -2782,6 +2819,10 @@ impl Surface for Sphere {
         // Note: This assumes uniform scaling
         let scale = transform.transform_vector(&Vector3::X).magnitude();
 
+        // Longitude runs about `north_dir` (y = north × ref): keep the stored
+        // u-window by rotating the reference meridian (`reflected_ref_dir`).
+        let ref_dir = reflected_ref_dir(north_dir, ref_dir, self.parameter_bounds().0, transform);
+
         Box::new(Sphere {
             center,
             radius: self.radius * scale,
@@ -3332,6 +3373,8 @@ impl Surface for Cone {
             Ok(dir) => dir,
             Err(_) => self.ref_dir, // Keep original if normalization fails
         };
+
+        let ref_dir = reflected_ref_dir(axis, ref_dir, self.parameter_bounds().0, matrix);
 
         Box::new(Cone {
             apex,
@@ -4056,7 +4099,7 @@ impl Surface for Torus {
             axis,
             major_radius: self.major_radius * scale,
             minor_radius: self.minor_radius * scale,
-            ref_dir,
+            ref_dir: reflected_ref_dir(axis, ref_dir, self.parameter_bounds().0, transform),
             param_limits: self.param_limits,
         })
     }
@@ -5629,7 +5672,16 @@ impl Surface for SurfaceOfRevolution {
 
     fn transform(&self, matrix: &Matrix4) -> Box<dyn Surface> {
         let new_origin = matrix.transform_point(&self.axis_origin);
-        let new_axis = matrix.transform_vector(&self.axis_direction);
+        // The swept direction is (axis × radial). An orientation-reversing
+        // matrix maps it to −(L·axis × L·radial), which would sweep the
+        // profile the other way round. Storing −L·axis keeps the sweep equal
+        // to the image, S'(u, v) = L·S(u, v): heights are measured along the
+        // stored axis on both sides, so they stay consistent.
+        let new_axis = if matrix.determinant() < 0.0 {
+            -matrix.transform_vector(&self.axis_direction)
+        } else {
+            matrix.transform_vector(&self.axis_direction)
+        };
         let new_curve = self.profile_curve.transform(matrix);
         Box::new(SurfaceOfRevolution {
             axis_origin: new_origin,

@@ -34,7 +34,7 @@
  *   `ConflictView`, `ConflictWitnessView`, `MergeStatisticsView`).
  * - `roshera:soundness`→ the perception/certificate projection the MCP layer
  *   already builds (roshera-mcp/src/core.ts: `sound`, `brep_valid`,
- *   `watertight`, `manifold`, `self_intersection_free`,
+ *   `watertight`, `manifold`, `shells_outward`, `self_intersection_free`,
  *   `construction_consistent`, `labels_consistent`, `tessellation_clean`,
  *   `mesh_quality_clean`, `euler_characteristic`, `eyes_consistent`,
  *   `open_edges`, `nonmanifold_edges`, `face_count`, `volume`, `errors`) —
@@ -398,6 +398,8 @@ export const soundnessCardSchema = z.object({
   brep_valid: triState,
   watertight: triState,
   manifold: triState,
+  /** Every shell faces out of the material (bodies enclose positive volume, voids negative). */
+  shells_outward: triState,
   self_intersection_free: triState,
   construction_consistent: triState,
   labels_consistent: triState,

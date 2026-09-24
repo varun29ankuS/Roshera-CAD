@@ -4,7 +4,7 @@ use geometry_engine::operations::boolean::{boolean_operation, BooleanOp, Boolean
 use geometry_engine::operations::offset::{
     offset_solid, IntersectionHandling, OffsetOptions, OffsetType,
 };
-use geometry_engine::operations::transform::{transform_solid, TransformOptions};
+use geometry_engine::operations::transform::{mirror, transform_solid, TransformOptions};
 use geometry_engine::primitives::face::FaceId;
 /// Command executor that bridges AI commands to geometry engine
 ///
@@ -357,26 +357,45 @@ impl CommandExecutor {
     ) -> Result<GeometryId, ExecutorError> {
         let solid_id = self.get_solid_id(&object)?;
 
+        // A mirror goes through the kernel `mirror` — one recorded "mirror"
+        // event and the per-face orientation restore — never through a bare
+        // reflection matrix. A scale whose factors reverse orientation
+        // (negative determinant) IS a reflection; it is refused here with the
+        // remedy named rather than executed as an unrecorded mirror.
+        if let shared_types::geometry_commands::Transform::Scale { factors } = &xform {
+            let determinant = factors[0] as f64 * factors[1] as f64 * factors[2] as f64;
+            if determinant < 0.0 {
+                return Err(ExecutorError::InvalidParameters(format!(
+                    concat!(
+                        "scale factors {:?} reverse orientation (their product is ",
+                        "negative): that is a reflection; issue a mirror transform ",
+                        "about the intended plane instead"
+                    ),
+                    factors
+                )));
+            }
+        }
+
         let model_clone = Arc::clone(&self.model);
         tokio::task::spawn_blocking(move || {
             let matrix = match xform {
-                shared_types::geometry_commands::Transform::Translate { offset } => Ok(
-                    Matrix4::translation(offset[0] as f64, offset[1] as f64, offset[2] as f64),
-                ),
+                shared_types::geometry_commands::Transform::Translate { offset } => {
+                    Matrix4::translation(offset[0] as f64, offset[1] as f64, offset[2] as f64)
+                }
                 shared_types::geometry_commands::Transform::Rotate {
                     axis,
                     angle_radians,
                 } => {
                     let axis_vec = Vector3::new(axis[0] as f64, axis[1] as f64, axis[2] as f64);
                     Matrix4::from_axis_angle(&axis_vec, angle_radians)
-                        .map_err(|e| ExecutorError::GeometryError(format!("{:?}", e)))
+                        .map_err(|e| ExecutorError::GeometryError(format!("{:?}", e)))?
                 }
                 shared_types::geometry_commands::Transform::Scale { factors } => {
-                    Ok(Matrix4::from_scale(&Vector3::new(
+                    Matrix4::from_scale(&Vector3::new(
                         factors[0] as f64,
                         factors[1] as f64,
                         factors[2] as f64,
-                    )))
+                    ))
                 }
                 shared_types::geometry_commands::Transform::Mirror {
                     plane_normal,
@@ -392,10 +411,18 @@ impl CommandExecutor {
                         plane_point[1] as f64,
                         plane_point[2] as f64,
                     );
-                    Matrix4::mirror(point, normal)
-                        .map_err(|e| ExecutorError::GeometryError(format!("{:?}", e)))
+                    let mut model = model_clone.blocking_write();
+                    mirror(
+                        &mut model,
+                        vec![solid_id],
+                        point,
+                        normal,
+                        TransformOptions::default(),
+                    )
+                    .map_err(|e| ExecutorError::GeometryError(format!("{:?}", e)))?;
+                    return Ok::<(), ExecutorError>(());
                 }
-            }?;
+            };
 
             let mut model = model_clone.blocking_write();
             transform_solid(&mut model, solid_id, matrix, TransformOptions::default())
@@ -602,6 +629,141 @@ mod tests {
             })
             .await;
         assert!(matches!(result, Err(ExecutorError::ObjectNotFound(_))));
+    }
+
+    /// Signed volume enclosed by the solid's tessellation — positive only when
+    /// every face points out of the material.
+    async fn signed_volume(executor: &CommandExecutor, id: &GeometryId) -> f64 {
+        let solid_id = executor.get_solid_id(id).expect("known object");
+        let model = executor.model.read().await;
+        let solid = model.solids.get(solid_id).expect("solid exists");
+        let mesh = geometry_engine::tessellation::tessellate_solid(
+            &solid,
+            &model,
+            &geometry_engine::tessellation::TessellationParams::default(),
+        );
+        let mut six = 0.0;
+        for tri in &mesh.triangles {
+            let p0 = mesh.vertices[tri[0] as usize].position.to_vec();
+            let p1 = mesh.vertices[tri[1] as usize].position.to_vec();
+            let p2 = mesh.vertices[tri[2] as usize].position.to_vec();
+            six += p0.dot(&p1.cross(&p2));
+        }
+        six / 6.0
+    }
+
+    async fn box_10x6x4(executor: &mut CommandExecutor) -> GeometryId {
+        executor
+            .execute(Command::CreateBox {
+                width: 10.0,
+                height: 6.0,
+                depth: 4.0,
+            })
+            .await
+            .expect("box creation should succeed")
+    }
+
+    /// Captures the kind of every operation the kernel records.
+    #[derive(Debug, Default)]
+    struct KindRecorder {
+        kinds: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl geometry_engine::operations::recorder::OperationRecorder for KindRecorder {
+        fn record(
+            &self,
+            op: geometry_engine::operations::recorder::RecordedOperation,
+        ) -> Result<(), geometry_engine::operations::recorder::RecorderError> {
+            self.kinds.lock().expect("recorder mutex").push(op.kind);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_mirror_runs_the_kernel_mirror_and_stays_outward() {
+        let mut executor = CommandExecutor::new();
+        let id = box_10x6x4(&mut executor).await;
+        let before = signed_volume(&executor, &id).await;
+        assert!(
+            before > 0.0,
+            "fixture: a fresh box is outward, V = {before}"
+        );
+        let recorder = Arc::new(KindRecorder::default());
+        let _ = executor
+            .model
+            .write()
+            .await
+            .attach_recorder(Some(recorder.clone()
+                as Arc<dyn geometry_engine::operations::recorder::OperationRecorder>));
+
+        executor
+            .execute(Command::Transform {
+                object: id.clone(),
+                transform: shared_types::geometry_commands::Transform::Mirror {
+                    plane_normal: [1.0, 0.0, 0.0],
+                    plane_point: [7.0, 0.0, 0.0],
+                },
+            })
+            .await
+            .expect("mirroring a box must succeed");
+
+        assert_eq!(
+            *recorder.kinds.lock().expect("recorder mutex"),
+            vec!["mirror".to_string()],
+            "an executor mirror must be the kernel mirror: one recorded \"mirror\" event"
+        );
+        let after = signed_volume(&executor, &id).await;
+        assert!(
+            (after - before).abs() < 1e-6 * before,
+            "a mirrored box must stay outward-oriented with the same volume: V {before} -> {after}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_orientation_reversing_scale_is_refused() {
+        let mut executor = CommandExecutor::new();
+        let id = box_10x6x4(&mut executor).await;
+        let before = signed_volume(&executor, &id).await;
+
+        let refused = executor
+            .execute(Command::Transform {
+                object: id.clone(),
+                transform: shared_types::geometry_commands::Transform::Scale {
+                    factors: [-1.0, 1.0, 1.0],
+                },
+            })
+            .await;
+        match refused {
+            Err(ExecutorError::InvalidParameters(msg)) => {
+                assert!(
+                    msg.contains("mirror"),
+                    "the refusal names the remedy: {msg}"
+                );
+                assert!(!msg.contains("  "), "no whitespace runs: {msg:?}");
+            }
+            other => panic!("a determinant-negative scale must be refused, got {other:?}"),
+        }
+        let untouched = signed_volume(&executor, &id).await;
+        assert!(
+            (untouched - before).abs() < 1e-9 * before.abs(),
+            "a refused scale must not touch the solid: V {before} -> {untouched}"
+        );
+
+        // Two negative factors are a 180° rotation (determinant +1): allowed.
+        executor
+            .execute(Command::Transform {
+                object: id.clone(),
+                transform: shared_types::geometry_commands::Transform::Scale {
+                    factors: [-1.0, -1.0, 1.0],
+                },
+            })
+            .await
+            .expect("a determinant-positive scale must run");
+        let rotated = signed_volume(&executor, &id).await;
+        assert!(
+            (rotated - before).abs() < 1e-6 * before,
+            "a 180-degree turn keeps the box outward: V {before} -> {rotated}"
+        );
     }
 
     #[tokio::test]

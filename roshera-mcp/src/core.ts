@@ -387,8 +387,9 @@ let lastEmbeddedPerception: { id: number | null; perception: any } | null = null
  * usable verdict at all (a server too old to perceive) — then the caller falls
  * back to the live GET /perception fetch (which is itself cheap by default).
  *
- * The expensive certificate dimensions (manifold, self_intersection_free,
- * tessellation/mesh-quality) are present ONLY when a full `cert` was embedded;
+ * The expensive certificate dimensions (manifold, shells_outward,
+ * self_intersection_free, tessellation/mesh-quality) are present ONLY when a
+ * full `cert` was embedded;
  * otherwise they are reported `null`, signalling "not computed on the hot path —
  * call verify_part / ground_truth to certify". They are never fabricated.
  */
@@ -409,6 +410,10 @@ function perceptionFromBody(r: any): any {
     // Full-cert-only dimensions: null when no cert was embedded (cheap path) —
     // explicitly "not certified on the hot path", never a fabricated verdict.
     manifold: cert?.manifold ?? null,
+    // Every shell faces out of the material (bodies enclose positive volume,
+    // voids negative); the witness names each shell that does not.
+    shells_outward: cert?.shells_outward ?? null,
+    misoriented_shells: cert?.misoriented_shells ?? null,
     self_intersection_free: cert?.self_intersection_free ?? null,
     construction_consistent: cert?.construction_consistent ?? null,
     labels_consistent: cert?.labels_consistent ?? null,
@@ -891,6 +896,8 @@ export async function perceive(partId: number | null): Promise<any> {
       brep_valid: brepValid,
       watertight,
       manifold: cert?.manifold ?? null,
+      shells_outward: cert?.shells_outward ?? null,
+      misoriented_shells: cert?.misoriented_shells ?? null,
       self_intersection_free: cert?.self_intersection_free ?? null,
       construction_consistent: cert?.construction_consistent ?? null,
       labels_consistent: cert?.labels_consistent ?? null,
@@ -1012,6 +1019,7 @@ export function compactVerdict(p: any): string {
     ["brep_valid", "brep"],
     ["watertight", "watertight"],
     ["manifold", "manifold"],
+    ["shells_outward", "shells-outward"],
     ["self_intersection_free", "no-self-intersect"],
     ["tessellation_clean", "tess"],
     ["mesh_quality_clean", "mesh-quality"],

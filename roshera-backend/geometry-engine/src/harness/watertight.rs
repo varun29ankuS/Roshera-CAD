@@ -315,6 +315,113 @@ pub fn manifold_report(
     manifold_report_mesh(&mesh, weld_eps)
 }
 
+/// [`manifold_report`] plus the per-shell orientation witnesses, from ONE
+/// tessellation at the same parameters (`chord` with `default()`'s segment
+/// ceiling). The certificate uses this so the new global-orientation conjunct
+/// costs no second tessellation. `None` when the solid is missing or
+/// tessellates to nothing — exactly when `manifold_report` is `None`.
+pub fn manifold_and_shell_orientation_report(
+    model: &BRepModel,
+    solid: SolidId,
+    chord: f64,
+    weld_eps: f64,
+) -> Option<(
+    ManifoldReport,
+    Vec<crate::primitives::provenance::MisorientedShell>,
+)> {
+    let solid_ref = model.solids.get(solid)?;
+    let params = TessellationParams {
+        chord_tolerance: chord,
+        ..TessellationParams::default()
+    };
+    let mesh = tessellate_solid(solid_ref, model, &params);
+    let report = manifold_report_mesh(&mesh, weld_eps)?;
+    let witnesses = misoriented_shells(model, solid, &mesh);
+    Some((report, witnesses))
+}
+
+/// The shells of `solid` whose tessellation encloses signed volume of the wrong
+/// sign for their role: an outer shell or peer body must enclose POSITIVE
+/// volume, a void NEGATIVE (its faces point into the cavity, away from the
+/// material).
+///
+/// `mesh` must be `solid`'s own tessellation; its `face_map` attributes each
+/// triangle to the face it came from, and each face to the first shell of
+/// [`crate::primitives::solid::Solid::all_shells`] (outer, voids, peers) that
+/// lists it — a face listed by two shells counts once, for the first.
+///
+/// Each shell's divergence sum is taken about one of its own vertices, so a
+/// shell far from the origin does not drown its volume in cancellation, and a
+/// shell is witnessed only when its signed volume opposes the expected sign by
+/// more than `1e-6` of the shell's total unsigned tetrahedron volume — a sign
+/// no rounding can produce. A shell enclosing (numerically) nothing is left to
+/// the closure/degeneracy conjuncts rather than guessed at here.
+pub fn misoriented_shells(
+    model: &BRepModel,
+    solid: SolidId,
+    mesh: &TriangleMesh,
+) -> Vec<crate::primitives::provenance::MisorientedShell> {
+    use crate::primitives::provenance::{MisorientedShell, ShellRole};
+
+    let Some(solid_ref) = model.solids.get(solid) else {
+        return Vec::new();
+    };
+    let mut shells: Vec<(u32, ShellRole)> = vec![(solid_ref.outer_shell, ShellRole::Outer)];
+    shells.extend(solid_ref.inner_shells.iter().map(|&s| (s, ShellRole::Void)));
+    shells.extend(solid_ref.peer_shells.iter().map(|&s| (s, ShellRole::Peer)));
+
+    let mut shell_of_face: HashMap<u32, usize> = HashMap::new();
+    for (index, &(shell_id, _)) in shells.iter().enumerate() {
+        if let Some(shell) = model.shells.get(shell_id) {
+            for &face_id in &shell.faces {
+                shell_of_face.entry(face_id).or_insert(index);
+            }
+        }
+    }
+
+    // Per shell: reference vertex, 6·signed volume, 6·unsigned tetra volume.
+    let mut sums: Vec<Option<(crate::math::Vector3, f64, f64)>> = vec![None; shells.len()];
+    for (t, tri) in mesh.triangles.iter().enumerate() {
+        let Some(&index) = mesh.face_map.get(t).and_then(|f| shell_of_face.get(f)) else {
+            continue;
+        };
+        let (Some(a), Some(b), Some(c)) = (
+            mesh.vertices.get(tri[0] as usize),
+            mesh.vertices.get(tri[1] as usize),
+            mesh.vertices.get(tri[2] as usize),
+        ) else {
+            continue;
+        };
+        let (p0, p1, p2) = (
+            a.position.to_vec(),
+            b.position.to_vec(),
+            c.position.to_vec(),
+        );
+        let Some(slot) = sums.get_mut(index) else {
+            continue;
+        };
+        let entry = slot.get_or_insert((p0, 0.0, 0.0));
+        let r = entry.0;
+        let six = (p0 - r).dot(&(p1 - r).cross(&(p2 - r)));
+        entry.1 += six;
+        entry.2 += six.abs();
+    }
+
+    shells
+        .iter()
+        .zip(sums)
+        .filter_map(|(&(shell_id, role), sum)| {
+            let (_, six_signed, six_unsigned) = sum?;
+            let wrong_way = six_signed * role.expected_volume_sign() < -1e-6 * six_unsigned;
+            wrong_way.then_some(MisorientedShell {
+                shell_id,
+                role,
+                signed_volume: six_signed / 6.0,
+            })
+        })
+        .collect()
+}
+
 /// Diagnostic: the 3D segments of every BOUNDARY edge (an undirected mesh edge
 /// incident to exactly one live triangle) in `solid`'s tessellation. Localizes
 /// WHERE a non-watertight result leaks — clustered segments reveal a specific

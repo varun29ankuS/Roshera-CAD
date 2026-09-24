@@ -34,7 +34,7 @@
 //!   rectangle}_2d`, `create_{box,sphere,cylinder,cone,plane}_3d`
 //! - **Direct ops**: `extrude_face`, `revolve_face`,
 //!   `boolean_{union,intersection,difference}`, `fillet_edges`,
-//!   `chamfer_edges`, `transform_{solid,faces,edges}`, `delete_solid`
+//!   `chamfer_edges`, `transform_{solid,faces,edges}`, `mirror`, `delete_solid`
 //!   (cascade solid removal — the durability #39 Slice-1.1 arm; a delete of an
 //!   already-absent solid is an idempotent no-op)
 //! - **Self-contained revolve** (durability #39 Slice-1.2): `revolve_typed`
@@ -75,7 +75,7 @@ use geometry_engine::operations::{
     loft::{loft_profiles, LoftOptions, LoftType},
     revolve::{revolve_face, RevolveOptions},
     sweep::{sweep_profile, SweepOptions, SweepQuality, SweepType},
-    transform::{transform_edges, transform_faces, transform_solid, TransformOptions},
+    transform::{mirror, transform_edges, transform_faces, transform_solid, TransformOptions},
 };
 use geometry_engine::primitives::edge::EdgeId;
 use geometry_engine::primitives::face::FaceId;
@@ -1407,12 +1407,64 @@ fn dispatch_generic(
             Ok(())
         }
 
+        // Legacy mirrors: before the kernel `mirror` recorded its own event it
+        // persisted the bare reflection as a "transform_solid" whose matrix has
+        // a NEGATIVE determinant. The kernel `transform_solid` now restores each
+        // face's orientation itself whenever the determinant is negative (the
+        // same per-face restore `mirror` runs), so such an event replays as a
+        // correct mirror, not with its loops wound backwards. (It does NOT
+        // reproduce what the live call returned then: the old mirror flipped
+        // every face and so returned its analytic faces inside-out.) Every other
+        // producer of a negative-determinant transform (an anchored primitive
+        // on a left-handed datum frame, the executor's negative scale before it
+        // was refused) needs that same restore to be a valid solid, so none of
+        // them is replayed wrongly by it.
+        //
+        // `update_parameterization` is replayed as recorded; an event written
+        // before the field existed replays with `TransformOptions::default()`'s
+        // `true`, which is what every such event was recorded with.
         "transform_solid" => {
             let solid_raw = num_field(inner, "solid_id", kind)? as u64;
             let solid = remap_id(solid_raw, id_remap) as SolidId;
             let transform = matrix4_field(inner, "transform", kind)?;
-            transform_solid(model, solid, transform, TransformOptions::default())
-                .map_err(|e| kernel_err(kind, &e))?;
+            let options = TransformOptions {
+                update_parameterization: recorded_update_parameterization(inner),
+                ..TransformOptions::default()
+            };
+            transform_solid(model, solid, transform, options).map_err(|e| kernel_err(kind, &e))?;
+            Ok(())
+        }
+
+        // A mirror is ONE recorded event carrying the plane; replay re-runs the
+        // kernel `mirror` (reflection + per-face orientation restore) from it,
+        // so the replayed solid is the one the live call returned.
+        "mirror" => {
+            let solid_raw = num_field(inner, "solid_id", kind)? as u64;
+            let solid = remap_id(solid_raw, id_remap) as SolidId;
+            let plane_origin = vec3_field(inner, "plane_origin").ok_or_else(|| {
+                ReplayError::InvalidParameters {
+                    kind: kind.to_string(),
+                    reason: "missing or malformed `plane_origin` [x, y, z]".to_string(),
+                }
+            })?;
+            let plane_normal = vec3_field(inner, "plane_normal").ok_or_else(|| {
+                ReplayError::InvalidParameters {
+                    kind: kind.to_string(),
+                    reason: "missing or malformed `plane_normal` [x, y, z]".to_string(),
+                }
+            })?;
+            let options = TransformOptions {
+                update_parameterization: recorded_update_parameterization(inner),
+                ..TransformOptions::default()
+            };
+            mirror(
+                model,
+                vec![solid],
+                Point3::new(plane_origin.x, plane_origin.y, plane_origin.z),
+                plane_normal,
+                options,
+            )
+            .map_err(|e| kernel_err(kind, &e))?;
             Ok(())
         }
 
@@ -1949,6 +2001,15 @@ fn vec3_field(v: &Value, name: &str) -> Option<Vector3> {
         arr[1].as_f64()?,
         arr[2].as_f64()?,
     ))
+}
+
+/// The recorded `update_parameterization` of a transform/mirror event. Absent
+/// (an event written before the field was recorded) → `true`, the
+/// `TransformOptions::default()` every such event was recorded with.
+fn recorded_update_parameterization(v: &Value) -> bool {
+    v.get("update_parameterization")
+        .and_then(|x| x.as_bool())
+        .unwrap_or(true)
 }
 
 fn matrix4_field(v: &Value, name: &str, kind: &str) -> Result<Matrix4, ReplayError> {

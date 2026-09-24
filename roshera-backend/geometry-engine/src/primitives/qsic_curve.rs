@@ -736,15 +736,39 @@ impl Curve for QsicCurve {
                 // θ-chart the angle offset must follow the old b_ref's image.
                 match carrier_frame(&b_axis) {
                     Ok((b_ref, b_ref2)) => {
-                        let angle0 = match self.chart {
+                        // The reseeded frame is right-handed about the image
+                        // axis. An orientation-reversing matrix (det < 0)
+                        // maps the old right-handed frame to a LEFT-handed
+                        // one, so in the new frame the image of carrier angle
+                        // θ sits at `off − θ`, not `off + θ`. The chart angle
+                        // is therefore negated (sweep included) so the curve
+                        // traces the image at the SAME parameter,
+                        // p'(t) = L·p(t). The axial coordinate s is measured
+                        // along L·b_axis on both sides, so the resolvent
+                        // branch is unchanged. For the φ-chart, θ(φ) =
+                        // θ_m + 2·asin(k·sin φ) with θ_m recomputed above in
+                        // the new frame: negating φ negates the asin term and
+                        // leaves s(φ) = s_center + w·cos φ unchanged.
+                        let reflects = matrix.determinant() < 0.0;
+                        let (angle0, sweep) = match self.chart {
                             Chart::Theta { .. } => {
                                 // Where does the OLD θ=0 direction land in
                                 // the new frame?
                                 let old_ref_img = matrix.transform_vector(&self.b_ref);
                                 let off = old_ref_img.dot(&b_ref2).atan2(old_ref_img.dot(&b_ref));
-                                self.angle0 + off
+                                if reflects {
+                                    (off - self.angle0, -self.sweep)
+                                } else {
+                                    (self.angle0 + off, self.sweep)
+                                }
                             }
-                            Chart::SphereBite { .. } => self.angle0,
+                            Chart::SphereBite { .. } => {
+                                if reflects {
+                                    (-self.angle0, -self.sweep)
+                                } else {
+                                    (self.angle0, self.sweep)
+                                }
+                            }
                         };
                         Box::new(Self {
                             resolved,
@@ -755,7 +779,7 @@ impl Curve for QsicCurve {
                             b_ref2,
                             chart,
                             angle0,
-                            sweep: self.sweep,
+                            sweep,
                         })
                     }
                     Err(_) => Box::new(self.clone()),

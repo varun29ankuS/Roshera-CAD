@@ -3079,32 +3079,43 @@ impl BRepModel {
         // flipped-normal / non-oriented surface (the `nurbs_loft` "B2a" class).
         // `manifold_report` already computes the directed-edge consistency; extract
         // it so `is_sound()` can AND it in.
-        let (watertight, manifold, oriented, euler, be, rf, nm, ide) =
-            match crate::harness::watertight::manifold_report(
+        //
+        // `shells_outward` is the GLOBAL orientation check `oriented` cannot be:
+        // a shell turned inside-out as a whole keeps every triangle consistent
+        // with its neighbours. It rides on the SAME certification mesh (one
+        // tessellation feeds both reports).
+        let (report, misoriented_shells) =
+            match crate::harness::watertight::manifold_and_shell_orientation_report(
                 self,
                 solid_id,
                 CERTIFICATE_MESH_CHORD,
                 CERTIFICATE_MESH_WELD_EPS,
             ) {
-                Some(r) => (
-                    // `r.closed`, not `r.boundary_edges == 0`: the report's
-                    // closure verdict also declines when the tessellator's weld
-                    // could not ADDRESS some vertices, which this analysis's own
-                    // re-weld by position would otherwise paper over. `be` below
-                    // stays the raw boundary-edge count, and `rf` carries the
-                    // refusal count so the unsound REASON can name it instead of
-                    // reporting a bare "0 boundary mesh edge(s)".
-                    r.closed,
-                    r.nonmanifold_edges == 0,
-                    r.oriented,
-                    r.euler_characteristic,
-                    r.boundary_edges,
-                    r.refused_weld_vertices,
-                    r.nonmanifold_edges,
-                    r.inconsistent_directed_edges,
-                ),
-                None => (false, false, false, 0, 0, 0, 0, 0),
+                Some((r, w)) => (Some(r), w),
+                None => (None, Vec::new()),
             };
+        let shells_measured = report.is_some();
+        let shells_outward = shells_measured && misoriented_shells.is_empty();
+        let (watertight, manifold, oriented, euler, be, rf, nm, ide) = match report {
+            Some(r) => (
+                // `r.closed`, not `r.boundary_edges == 0`: the report's
+                // closure verdict also declines when the tessellator's weld
+                // could not ADDRESS some vertices, which this analysis's own
+                // re-weld by position would otherwise paper over. `be` below
+                // stays the raw boundary-edge count, and `rf` carries the
+                // refusal count so the unsound REASON can name it instead of
+                // reporting a bare "0 boundary mesh edge(s)".
+                r.closed,
+                r.nonmanifold_edges == 0,
+                r.oriented,
+                r.euler_characteristic,
+                r.boundary_edges,
+                r.refused_weld_vertices,
+                r.nonmanifold_edges,
+                r.inconsistent_directed_edges,
+            ),
+            None => (false, false, false, 0, 0, 0, 0, 0),
+        };
         // Self-intersection at a COARSE chord (gross self-overlap is visible at
         // low density; keeps the O(n²) pair scan cheap for this on-demand check).
         let self_intersection_free =
@@ -3200,6 +3211,39 @@ impl BRepModel {
                  (same-winding triangle pair across a shared edge)"
             ));
         }
+        if !shells_measured {
+            errors.push(
+                concat!(
+                    "cert: shells_outward=false — the solid does not tessellate, so the ",
+                    "volume its shells enclose could not be measured"
+                )
+                .to_string(),
+            );
+        }
+        if !misoriented_shells.is_empty() {
+            let witnesses = misoriented_shells
+                .iter()
+                .map(|m| {
+                    format!(
+                        "{} shell {} encloses {:.6}",
+                        m.role.label(),
+                        m.shell_id,
+                        m.signed_volume
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            errors.push(format!(
+                concat!(
+                    "cert: shells_outward=false — {} shell(s) enclose signed volume of ",
+                    "the wrong sign for their role (a body must enclose positive volume, ",
+                    "a void negative; a body turned inside-out, or a void filed as a ",
+                    "peer body): {}"
+                ),
+                misoriented_shells.len(),
+                witnesses
+            ));
+        }
         if !self_intersection_free {
             errors.push(
                 "cert: self_intersection_free=false — coarse-chord mesh self-intersection \
@@ -3283,6 +3327,8 @@ impl BRepModel {
             manifold,
             oriented,
             inconsistent_directed_edges: ide,
+            shells_outward,
+            misoriented_shells,
             euler_characteristic: euler,
             boundary_edges: be,
             nonmanifold_edges: nm,

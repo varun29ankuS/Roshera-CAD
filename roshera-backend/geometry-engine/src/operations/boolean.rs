@@ -19807,9 +19807,10 @@ fn reconstruct_topology(
     // inverts the part.
     //
     // So the outer shell is now picked by measured extent and each remaining
-    // shell's status is PROVED: is its centroid inside the outer shell
-    // (generalized winding number over the outer shell's own tessellation — the
-    // same classifier `classify_point_gwn` uses for face selection)?
+    // shell's status is PROVED from points ON that shell and the sign of the
+    // volume it encloses (see `classify_non_outer_shell`; generalized winding
+    // number over the outer shell's own tessellation — the same classifier
+    // `classify_point_gwn` uses for face selection).
     //
     // A shell that is NOT enclosed is a disjoint PEER BODY, not a void, and it
     // is filed as one: `Solid::peer_shells`, the same-orientation sibling slot.
@@ -19842,7 +19843,12 @@ fn reconstruct_topology(
         // always supported.
         let probes: Vec<(ShellId, Option<ShellProbe>)> = shells
             .iter()
-            .map(|&s| (s, ShellProbe::of(model, s)))
+            .map(|&s| {
+                (
+                    s,
+                    ShellProbe::of(model, s, &crate::tessellation::TessellationParams::coarse()),
+                )
+            })
             .collect();
 
         // Largest mesh-bbox volume wins; a tie (or an unmeasurable shell)
@@ -19866,26 +19872,27 @@ fn reconstruct_topology(
             .map(|p| p.triangles.as_slice())
             .unwrap_or(&[]);
 
-        // Every non-outer shell is SORTED by its proved status: enclosed by the
-        // outer shell ⇒ a genuine VOID; not enclosed ⇒ a disjoint PEER BODY.
-        // Both are retained — dropping a peer would delete real material (a
-        // severed plate would come back as one half) — but they now go to
-        // different slots on `Solid`, so mass-props, the boundary-face count
-        // and the mesh path finally agree about the same result.
+        // Every non-outer shell is SORTED by its proved status (see
+        // `classify_non_outer_shell`): a cavity is a VOID, a separate lump of
+        // material is a PEER BODY. Both are retained — dropping a peer would
+        // delete real material (a severed plate would come back as one half) —
+        // and they go to different slots on `Solid`, so mass-props, the
+        // boundary-face count and the mesh path agree about the same result.
         let mut voids: Vec<ShellId> = Vec::new();
         let mut peers: Vec<ShellId> = Vec::new();
         for (shell_id, probe) in probes.iter() {
             if *shell_id == outer_shell {
                 continue;
             }
-            let enclosed = probe
-                .as_ref()
-                .map(|p| point_is_inside_mesh(&p.centroid, outer_tris))
-                .unwrap_or(false);
-            if enclosed {
-                voids.push(*shell_id);
-            } else {
-                peers.push(*shell_id);
+            match classify_non_outer_shell(
+                model,
+                *shell_id,
+                probe.as_ref(),
+                outer_shell,
+                outer_tris,
+            )? {
+                ShellStatus::Void => voids.push(*shell_id),
+                ShellStatus::Peer => peers.push(*shell_id),
             }
         }
         (outer_shell, voids, peers)
@@ -19929,8 +19936,9 @@ fn reconstruct_topology(
 }
 
 /// A shell measured through its own COARSE tessellation: the triangles used to
-/// answer "does this shell enclose that point?", plus the centroid and bbox
-/// volume used to rank candidate outer shells.
+/// answer "does this shell enclose that point?" (and to supply probe points ON
+/// the shell), the signed volume they enclose, and the bbox volume used to rank
+/// candidate outer shells.
 ///
 /// Measuring through the MESH, not the loop vertices, is deliberate. A sphere
 /// void is a SINGLE closed-seam face whose loop carries no corner geometry, so
@@ -19939,29 +19947,37 @@ fn reconstruct_topology(
 /// pipeline has always produced correctly.
 struct ShellProbe {
     triangles: Vec<[Point3; 3]>,
-    centroid: Point3,
+    /// Signed volume the shell's facets enclose (divergence theorem about one
+    /// of its own vertices): positive when its faces point outward, negative
+    /// for a cavity whose faces point into it.
+    signed_volume: f64,
     bbox_volume: f64,
 }
 
 impl ShellProbe {
     /// `None` when the shell is missing or tessellates to nothing — a state
-    /// from which no enclosure claim can be made, so the caller counts the
-    /// shell as a free body and the operation refuses rather than asserting a
-    /// void it cannot back.
-    fn of(model: &BRepModel, shell_id: ShellId) -> Option<Self> {
+    /// from which no enclosure claim can be made, so the caller files the
+    /// shell as a peer body (not proven enclosed) rather than asserting a void
+    /// it cannot back.
+    fn of(
+        model: &BRepModel,
+        shell_id: ShellId,
+        params: &crate::tessellation::TessellationParams,
+    ) -> Option<Self> {
         use crate::tessellation::edge_cache::EdgeSampleCache;
-        use crate::tessellation::{tessellate_shell, TessellationParams, TriangleMesh};
+        use crate::tessellation::{tessellate_shell, TriangleMesh};
 
         let shell = model.shells.get(shell_id)?;
-        // COARSE, for the same reason `solid_gwn_triangles` is coarse: the only
-        // consumers are a winding-number SIGN and an extent ranking, neither of
-        // which is sensitive to facet density for points that are not within
-        // faceting error of the surface — and the only probe points here are
-        // other shells' centroids.
-        let params = TessellationParams::coarse();
-        let cache = EdgeSampleCache::new(&params);
+        // The first probe of every shell is COARSE, for the same reason
+        // `solid_gwn_triangles` is coarse: the only consumers are a winding-
+        // number SIGN and an extent ranking, neither of which is sensitive to
+        // facet density for points that are not within faceting error of the
+        // surface. Points that ARE within that error (a void close to a
+        // curved wall) are re-judged by `classify_non_outer_shell` against a
+        // finer probe of the outer shell.
+        let cache = EdgeSampleCache::new(params);
         let mut mesh = TriangleMesh::new();
-        tessellate_shell(shell, model, &params, &cache, &mut mesh);
+        tessellate_shell(shell, model, params, &cache, &mut mesh);
 
         let triangles: Vec<[Point3; 3]> = mesh
             .triangles
@@ -19978,13 +19994,11 @@ impl ShellProbe {
             return None;
         }
 
-        let mut sum = Vector3::new(0.0, 0.0, 0.0);
         let mut lo = [f64::INFINITY; 3];
         let mut hi = [f64::NEG_INFINITY; 3];
         let mut n = 0.0_f64;
         for tri in &triangles {
             for p in tri {
-                sum = sum + p.to_vec();
                 n += 1.0;
                 for (k, c) in [p.x, p.y, p.z].into_iter().enumerate() {
                     lo[k] = lo[k].min(c);
@@ -20000,28 +20014,187 @@ impl ShellProbe {
         let bbox_volume = (0..3)
             .map(|k| (hi[k] - lo[k]).max(f64::MIN_POSITIVE))
             .product();
+        let reference = triangles[0][0].to_vec();
+        let six_volume: f64 = triangles
+            .iter()
+            .map(|t| {
+                let (a, b, c) = (
+                    t[0].to_vec() - reference,
+                    t[1].to_vec() - reference,
+                    t[2].to_vec() - reference,
+                );
+                a.dot(&b.cross(&c))
+            })
+            .sum();
         Some(ShellProbe {
             triangles,
-            centroid: Point3::from(sum / n),
+            signed_volume: six_volume / 6.0,
             bbox_volume,
         })
     }
 }
 
-/// Is `probe` strictly inside the closed surface `tris` bounds? Generalized
-/// winding number — the same classifier [`classify_point_gwn`] uses for face
-/// selection. An empty mesh, or a winding in the low-confidence band, answers
-/// `false`: "not PROVEN enclosed", which routes to the typed refusal rather
-/// than to a void claim the kernel cannot back.
-fn point_is_inside_mesh(probe: &Point3, tris: &[[Point3; 3]]) -> bool {
-    use crate::math::winding_number::{classify_by_winding, WindingClassification};
-    if tris.is_empty() {
-        return false;
+/// What a non-outer shell of a boolean result is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShellStatus {
+    /// A cavity inside the material (`Solid::inner_shells`).
+    Void,
+    /// A separate lump of material (`Solid::peer_shells`).
+    Peer,
+}
+
+/// Most probe points taken from one candidate shell.
+const SHELL_PROBE_SAMPLES: usize = 16;
+
+/// Classify a non-outer shell of a boolean result as a void or a peer body.
+///
+/// Two measured facts decide it, and neither is the shell's centroid:
+///
+/// * **Is the shell enclosed by the outer shell?** Tested at points ON the
+///   candidate shell (centroids of its own coarse facets), each classified by
+///   the generalized winding number over a mesh of the outer shell. The
+///   shells of a boolean result are disjoint closed surfaces, so every point
+///   of the candidate is on the same side of the outer boundary. The centroid
+///   is not a point of the shell: a toroidal cavity inside a ring has its
+///   centroid on the ring's axis, in the hole, OUTSIDE the material, and the
+///   old centroid test filed that cavity as a second body.
+/// * **Which way does the shell face?** The signed volume it encloses. A
+///   void's faces point into the cavity, away from the material, so it
+///   encloses negative volume; a body encloses positive volume.
+///
+/// Enclosed and negative is a void. Positive is a peer body, enclosed or not:
+/// a lump of material floating inside a cavity is inside the outer shell yet is
+/// material, which the old test filed as a void.
+///
+/// **A mesh is only as good as its chord error.** A coarse outer mesh sits
+/// inside a convex wall by its sagitta (about 0.6 for an R = 50 wall at 20
+/// segments), so a void closer to that wall than the sagitta has sample
+/// points the coarse mesh reads as OUTSIDE. Every verdict that could be such
+/// a misreading — samples that disagree, no confident sample, or an inward-
+/// facing shell read as outside all material — is therefore re-judged against
+/// progressively finer meshes of the outer shell (`coarse`, then `default`,
+/// then `fine`). Only a verdict that survives the finest mesh is refused.
+///
+/// A shell with no probe (missing, or tessellating to nothing) keeps the
+/// long-standing reading: not proven enclosed, so a peer body.
+fn classify_non_outer_shell(
+    model: &BRepModel,
+    shell_id: ShellId,
+    probe: Option<&ShellProbe>,
+    outer_shell: ShellId,
+    coarse_outer_tris: &[[Point3; 3]],
+) -> OperationResult<ShellStatus> {
+    use crate::tessellation::TessellationParams;
+
+    let Some(probe) = probe else {
+        return Ok(ShellStatus::Peer);
+    };
+    if coarse_outer_tris.is_empty() {
+        return Ok(ShellStatus::Peer);
     }
-    matches!(
-        classify_by_winding(probe, tris),
-        WindingClassification::Inside
-    )
+
+    let volume = probe.signed_volume;
+    if !volume.is_finite() || volume.abs() <= 1e-9 * probe.bbox_volume {
+        return Err(OperationError::InvalidBRep(format!(
+            concat!(
+                "boolean result shell {} encloses no measurable volume ",
+                "(signed {:e}); whether it is a void or a separate body cannot ",
+                "be decided"
+            ),
+            shell_id, volume
+        )));
+    }
+
+    let stride = (probe.triangles.len() / SHELL_PROBE_SAMPLES).max(1);
+    let samples: Vec<Point3> = probe
+        .triangles
+        .iter()
+        .step_by(stride)
+        .map(|tri| {
+            Point3::new(
+                (tri[0].x + tri[1].x + tri[2].x) / 3.0,
+                (tri[0].y + tri[1].y + tri[2].y) / 3.0,
+                (tri[0].z + tri[1].z + tri[2].z) / 3.0,
+            )
+        })
+        .collect();
+
+    // The coarse mesh is already in hand; the finer ones are built only when
+    // the coarse verdict is one a chord error could have produced.
+    let mut last_undecided = String::new();
+    for tier in 0..3 {
+        let finer;
+        let outer_tris: &[[Point3; 3]] = match tier {
+            0 => coarse_outer_tris,
+            _ => {
+                let params = if tier == 1 {
+                    TessellationParams::default()
+                } else {
+                    TessellationParams::fine()
+                };
+                finer = ShellProbe::of(model, outer_shell, &params);
+                match finer.as_ref() {
+                    Some(p) => p.triangles.as_slice(),
+                    None => continue,
+                }
+            }
+        };
+        match judge_shell_against(shell_id, &samples, volume, outer_tris) {
+            ShellVerdict::Decided(status) => return Ok(status),
+            ShellVerdict::Undecided(reason) => last_undecided = reason,
+        }
+    }
+    Err(OperationError::InvalidBRep(format!(
+        concat!(
+            "boolean result shell {}: {}, even against the finest mesh of the ",
+            "outer shell; it is neither provably a void nor a separate body"
+        ),
+        shell_id, last_undecided
+    )))
+}
+
+/// One mesh's verdict on a candidate shell.
+enum ShellVerdict {
+    Decided(ShellStatus),
+    /// A verdict a chord error of `outer_tris` could have produced; the
+    /// reason, for the refusal if no finer mesh settles it.
+    Undecided(String),
+}
+
+fn judge_shell_against(
+    shell_id: ShellId,
+    samples: &[Point3],
+    volume: f64,
+    outer_tris: &[[Point3; 3]],
+) -> ShellVerdict {
+    use crate::math::winding_number::{classify_by_winding, WindingClassification};
+
+    let (mut inside, mut outside) = (0usize, 0usize);
+    for point in samples {
+        match classify_by_winding(point, outer_tris) {
+            WindingClassification::Inside => inside += 1,
+            WindingClassification::Outside => outside += 1,
+            WindingClassification::LowConfidence { .. } => {}
+        }
+    }
+    if inside > 0 && outside > 0 {
+        return ShellVerdict::Undecided(format!(
+            "{inside} sample point(s) read inside the outer shell and {outside} outside it"
+        ));
+    }
+    if inside == 0 && outside == 0 {
+        return ShellVerdict::Undecided(
+            "every sample point lies within the winding-number confidence band".to_string(),
+        );
+    }
+    let enclosed = inside > 0;
+    match (enclosed, volume < 0.0) {
+        (true, true) => ShellVerdict::Decided(ShellStatus::Void),
+        (_, false) => ShellVerdict::Decided(ShellStatus::Peer),
+        (false, true) => ShellVerdict::Undecided(format!(
+            "shell {shell_id} faces inward (encloses {volume:.6}) but reads outside the outer shell"
+        )),
+    }
 }
 
 /// Number of polyline samples used per (possibly curved) edge when measuring a

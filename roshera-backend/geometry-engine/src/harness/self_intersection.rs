@@ -16,6 +16,7 @@
 use crate::math::{Point3, Vector3};
 use crate::primitives::solid::SolidId;
 use crate::primitives::topology_builder::BRepModel;
+use crate::tessellation::edge_cache::EdgeSampleCache;
 use crate::tessellation::mesh::TriangleMesh;
 use crate::tessellation::{tessellate_solid, TessellationParams};
 use std::collections::HashMap;
@@ -99,8 +100,17 @@ fn aabb_disjoint(a: &([f64; 3], [f64; 3]), b: &([f64; 3], [f64; 3])) -> bool {
 /// (topological neighbours) are excluded — they touch, not cross. Returns
 /// `false` for meshes with fewer than 2 triangles.
 pub fn mesh_self_intersects_mesh(mesh: &TriangleMesh) -> bool {
-    if mesh.triangles.len() < 2 {
-        return false;
+    !crossing_pairs(mesh, 1).is_empty()
+}
+
+/// The crossing triangle pairs of `mesh` (indices into `mesh.triangles`),
+/// stopping once `cap` have been found. The analysis behind
+/// [`mesh_self_intersects_mesh`].
+fn crossing_pairs(mesh: &TriangleMesh, cap: usize) -> Vec<(usize, usize)> {
+    let mut found: Vec<(usize, usize)> = Vec::new();
+    let mut seen: std::collections::HashSet<(usize, usize)> = std::collections::HashSet::new();
+    if mesh.triangles.len() < 2 || cap == 0 {
+        return found;
     }
 
     // Weld vertices by quantised position so adjacent triangles share canonical
@@ -252,12 +262,18 @@ pub fn mesh_self_intersects_mesh(mesh: &TriangleMesh) -> bool {
                     continue;
                 }
                 if triangles_intersect(tris[i], tris[j]) {
-                    return true;
+                    let pair = (i.min(j), i.max(j));
+                    if seen.insert(pair) {
+                        found.push(pair);
+                        if found.len() >= cap {
+                            return found;
+                        }
+                    }
                 }
             }
         }
     }
-    false
+    found
 }
 
 /// `true` if the solid's tessellated mesh self-intersects at chord `chord`.
@@ -269,9 +285,10 @@ pub fn mesh_self_intersects_mesh(mesh: &TriangleMesh) -> bool {
 /// produces. Use a COARSE chord for a fast certificate check — self-overlap is
 /// a gross geometric fault, visible at low density.
 ///
-/// The analysis logic lives in [`mesh_self_intersects_mesh`]; this wrapper
-/// tessellates (using [`TessellationParams::audit`] to bound the triangle
-/// count) then delegates.
+/// A coarse crossing is then CONFIRMED on the faces that produced it
+/// ([`confirm_crossings`]) before it is reported, so a chord artifact between
+/// two disjoint surfaces closer than their facets' sag is not called a
+/// self-intersection — and nothing else can overturn the coarse verdict.
 pub fn mesh_self_intersects(model: &BRepModel, solid: SolidId, chord: f64) -> bool {
     let solid_ref = match model.solids.get(solid) {
         Some(s) => s,
@@ -291,12 +308,242 @@ pub fn mesh_self_intersects(model: &BRepModel, solid: SolidId, chord: f64) -> bo
         ..TessellationParams::audit()
     };
     let mesh = tessellate_solid(solid_ref, model, &params);
-    mesh_self_intersects_mesh(&mesh)
+    let pairs = crossing_pairs(&mesh, CONFIRM_PAIR_CAP);
+    if pairs.is_empty() {
+        return false;
+    }
+    let finer = TessellationParams {
+        chord_tolerance: chord / 16.0,
+        max_angle_deviation: params.max_angle_deviation / 4.0,
+        max_segments: params.max_segments * 4,
+        ..params
+    };
+    confirm_crossings(model, &mesh, &pairs, &finer, &|face_id, p, cache, out| {
+        if let Some(face) = model.faces.get(face_id) {
+            crate::tessellation::surface::tessellate_face(face, model, p, cache, out);
+        }
+    })
+}
+
+/// Most coarse crossing pairs collected for the confirmation step.
+const CONFIRM_PAIR_CAP: usize = 4096;
+/// Most distinct faces a confirmation re-tessellates; a crossing spread over
+/// more faces is kept as reported.
+const CONFIRM_FACE_BUDGET: usize = 16;
+/// Most triangles the finer re-tessellation of the involved faces may yield;
+/// over budget the coarse verdict is kept.
+const CONFIRM_TRIANGLE_BUDGET: usize = 200_000;
+
+/// Re-test a coarse "self-intersecting" verdict on EXACTLY the faces whose
+/// triangles crossed (`pairs`, indices into `coarse`), re-tessellated at the
+/// finer `params` by `tessellate` (one face at a time into a shared mesh, so
+/// their common edges share samples and weld). Returns the confirmed verdict.
+///
+/// A crossing between two disjoint surfaces closer to each other than their
+/// facets' sagitta (a void 0.1 inside the curved wall of an R = 50 drum,
+/// where a 24-segment wall sags about 0.43) is a CHORD ARTIFACT: at a finer
+/// chord those faces no longer cross. A genuine self-intersection crosses at
+/// every density. The coarse verdict is overturned ONLY when the finer mesh
+/// of every involved face exists and those faces no longer cross; it stands
+/// when the pair list reached [`CONFIRM_PAIR_CAP`] (crossings beyond it were
+/// never examined), when the crossing involves more than
+/// [`CONFIRM_FACE_BUDGET`] faces, when
+/// the finer mesh exceeds [`CONFIRM_TRIANGLE_BUDGET`] triangles, when any
+/// involved face is missing or re-tessellates to nothing, or when the finer
+/// mesh still crosses.
+fn confirm_crossings(
+    model: &BRepModel,
+    coarse: &TriangleMesh,
+    pairs: &[(usize, usize)],
+    params: &TessellationParams,
+    tessellate: &dyn Fn(u32, &TessellationParams, &EdgeSampleCache, &mut TriangleMesh),
+) -> bool {
+    // A list that reached the collection cap is TRUNCATED: crossings beyond
+    // it were never examined and their faces never re-tested, so clearing the
+    // examined ones proves nothing about the rest. The coarse verdict stands.
+    if pairs.len() >= CONFIRM_PAIR_CAP {
+        return true;
+    }
+    let mut faces: Vec<u32> = Vec::new();
+    for &(i, j) in pairs {
+        for t in [i, j] {
+            match coarse.face_map.get(t) {
+                Some(&f) => {
+                    if !faces.contains(&f) {
+                        faces.push(f);
+                    }
+                }
+                // A crossing triangle that cannot be attributed to a face
+                // cannot be re-tested: the coarse verdict stands.
+                None => return true,
+            }
+        }
+        if faces.len() > CONFIRM_FACE_BUDGET {
+            return true;
+        }
+    }
+    faces.sort_unstable();
+
+    let cache = EdgeSampleCache::new(params);
+    let mut finer = TriangleMesh::new();
+    for &face_id in &faces {
+        if model.faces.get(face_id).is_none() {
+            return true;
+        }
+        let before = finer.triangles.len();
+        tessellate(face_id, params, &cache, &mut finer);
+        let after = finer.triangles.len();
+        if after == before {
+            // The finer mesh lost a face the coarse crossing involved: it
+            // cannot vouch for that face, so it cannot overturn the verdict.
+            return true;
+        }
+        for _ in before..after {
+            finer.face_map.push(face_id);
+        }
+        if after > CONFIRM_TRIANGLE_BUDGET {
+            return true;
+        }
+    }
+    mesh_self_intersects_mesh(&finer)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::math::Matrix4;
+    use crate::operations::{transform_solid, TransformOptions};
+    use crate::primitives::topology_builder::{GeometryId, TopologyBuilder};
+
+    /// One solid whose two bodies GENUINELY overlap: box A (10³ at the origin)
+    /// with box B (10³ centred at (5, 3.7, 2.3)) attached as a peer body. Returns
+    /// the model, the solid and box B's face ids.
+    fn overlapping_bodies() -> (BRepModel, SolidId, Vec<u32>) {
+        let mut model = BRepModel::new();
+        let mk = |m: &mut BRepModel| match TopologyBuilder::new(m).create_box_3d(10.0, 10.0, 10.0) {
+            Ok(GeometryId::Solid(id)) => id,
+            other => panic!("expected a solid, got {other:?}"),
+        };
+        let a = mk(&mut model);
+        let b = mk(&mut model);
+        transform_solid(
+            &mut model,
+            b,
+            Matrix4::from_translation(&Vector3::new(5.0, 3.7, 2.3)),
+            TransformOptions::default(),
+        )
+        .expect("place box B");
+        let b_shell = model.solids.get(b).expect("solid b").outer_shell;
+        let b_faces = model.shells.get(b_shell).expect("shell").faces.clone();
+        model
+            .solids
+            .get_mut(a)
+            .expect("solid a")
+            .add_peer_shell(b_shell);
+        (model, a, b_faces)
+    }
+
+    fn coarse_mesh_and_pairs(
+        model: &BRepModel,
+        id: SolidId,
+    ) -> (TriangleMesh, Vec<(usize, usize)>) {
+        let solid = model.solids.get(id).expect("solid");
+        let params = TessellationParams {
+            chord_tolerance: 0.5,
+            ..TessellationParams::audit()
+        };
+        let mesh = tessellate_solid(solid, model, &params);
+        let pairs = crossing_pairs(&mesh, CONFIRM_PAIR_CAP);
+        (mesh, pairs)
+    }
+
+    /// A pair list that reached the collection cap may be truncated: the
+    /// crossings beyond it were never examined. Even when every listed pair
+    /// re-tests clean (here: triangles of a plain box, which cross nothing),
+    /// the coarse verdict must stand.
+    #[test]
+    fn a_truncated_crossing_list_is_never_confirmed_away() {
+        let mut model = BRepModel::new();
+        let id = match TopologyBuilder::new(&mut model).create_box_3d(10.0, 10.0, 10.0) {
+            Ok(GeometryId::Solid(id)) => id,
+            other => panic!("expected a solid, got {other:?}"),
+        };
+        let solid = model.solids.get(id).expect("solid");
+        let coarse = tessellate_solid(
+            solid,
+            &model,
+            &TessellationParams {
+                chord_tolerance: 0.5,
+                ..TessellationParams::audit()
+            },
+        );
+        assert!(coarse.triangles.len() >= 2, "fixture: a tessellated box");
+        let finer = TessellationParams {
+            chord_tolerance: 0.5 / 16.0,
+            ..TessellationParams::audit()
+        };
+        let tess = |face_id: u32,
+                    p: &TessellationParams,
+                    cache: &EdgeSampleCache,
+                    out: &mut TriangleMesh| {
+            if let Some(face) = model.faces.get(face_id) {
+                crate::tessellation::surface::tessellate_face(face, &model, p, cache, out);
+            }
+        };
+        // Control: below the cap, clean faces DO overturn the verdict.
+        assert!(
+            !confirm_crossings(&model, &coarse, &[(0, 1)], &finer, &tess),
+            "fixture: a box's faces re-test clean"
+        );
+        let at_cap = vec![(0usize, 1usize); CONFIRM_PAIR_CAP];
+        assert!(
+            confirm_crossings(&model, &coarse, &at_cap, &finer, &tess),
+            "a crossing list at the cap is truncated and must not be confirmed away"
+        );
+    }
+
+    #[test]
+    fn a_genuine_overlap_survives_the_confirmation() {
+        let (model, id, _) = overlapping_bodies();
+        assert!(
+            mesh_self_intersects(&model, id, 0.5),
+            "two overlapping bodies self-intersect at every density"
+        );
+    }
+
+    /// The confirmation may only overturn the coarse verdict with a finer mesh
+    /// of EVERY face the coarse crossing involved. Here the finer tessellation
+    /// of box B's faces is withheld (as a face the finer tessellator declines
+    /// would be): the finer mesh then holds box A alone, crosses nothing, and
+    /// must NOT be read as "self-intersection free".
+    #[test]
+    fn a_crossing_stands_when_the_finer_mesh_loses_an_involved_face() {
+        let (model, id, b_faces) = overlapping_bodies();
+        let (coarse, pairs) = coarse_mesh_and_pairs(&model, id);
+        assert!(!pairs.is_empty(), "fixture: the coarse mesh crosses");
+        let finer = TessellationParams {
+            chord_tolerance: 0.5 / 16.0,
+            ..TessellationParams::audit()
+        };
+        let verdict = confirm_crossings(
+            &model,
+            &coarse,
+            &pairs,
+            &finer,
+            &|face_id, p, cache, out| {
+                if b_faces.contains(&face_id) {
+                    return;
+                }
+                if let Some(face) = model.faces.get(face_id) {
+                    crate::tessellation::surface::tessellate_face(face, &model, p, cache, out);
+                }
+            },
+        );
+        assert!(
+            verdict,
+            "a crossing whose finer re-test lost an involved face must stand"
+        );
+    }
 
     #[test]
     fn detects_crossing_triangles_and_clears_disjoint() {

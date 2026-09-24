@@ -1078,6 +1078,46 @@ impl Arc {
 
         let new_normal_unit = new_normal.normalize().ok()?;
         let new_radius = self.radius * scale_x;
+
+        if matrix.determinant() < 0.0 {
+            // The in-plane frame is (x_axis, normal × x_axis), right-handed
+            // by construction. An orientation-reversing matrix maps
+            // normal × x_axis to the NEGATIVE of (L·normal) × (L·x_axis), so
+            // an arc rebuilt on (L·normal, L·x_axis) would trace the image
+            // with its angle negated, p'(θ) = L·p(−θ): every circle walked
+            // the other way round, every partial arc on the wrong side of its
+            // own vertices.
+            //
+            // The normal stays L·normal — the direction every consumer that
+            // relates a rim to its cap plane, bore axis or cutting plane
+            // compares against (measured: storing −L·normal broke booleans on
+            // mirrored parts) — and the reference direction is rotated by the
+            // arc's own span c = 2·start + sweep: x'' = cos c·x' − sin c·y',
+            // with x' = L·x_axis and y' = L·normal × x'. Then
+            // p''(θ) = L·p(c − θ), so the stored `start_angle` and a POSITIVE
+            // `sweep_angle` are unchanged and the arc traces the image of the
+            // original REVERSED in its parameter, p''(t) = L·p(1 − t). The
+            // parameter range is mirrored with it; the transform that owns the
+            // edges (`operations::transform`) detects the reversal and flips
+            // each edge's orientation and range, so every EDGE still walks
+            // from its start vertex to its end vertex.
+            let x_prime = new_x_axis.normalize().ok()?;
+            let y_prime = new_normal_unit.cross(&x_prime);
+            let c = 2.0 * self.start_angle + self.sweep_angle;
+            let x_rotated = x_prime * c.cos() - y_prime * c.sin();
+            let mut arc = Arc::with_x_axis(
+                new_center,
+                new_normal_unit,
+                x_rotated,
+                new_radius,
+                self.start_angle,
+                self.sweep_angle,
+            )
+            .ok()?;
+            arc.range = ParameterRange::new(1.0 - self.range.end, 1.0 - self.range.start);
+            return Some(arc);
+        }
+
         // Preserve the transformed in-plane reference so the arc's
         // parametrisation tracks the rigid motion; `with_x_axis`
         // re-orthogonalises against the new normal and falls back to the

@@ -57,6 +57,11 @@ pub struct SolidCertChecks {
     pub manifold: bool,
     /// Consistently wound, correctly-oriented closed surface.
     pub oriented: bool,
+    /// Every shell faces out of the material: bodies enclose positive signed
+    /// volume, voids negative. `None` only on a certificate stored before the
+    /// conjunct existed — an honest "not checked", never a fabricated `true`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shells_outward: Option<bool>,
     /// No two non-adjacent faces cross.
     pub self_intersection_free: bool,
 }
@@ -174,6 +179,7 @@ impl EventCertificate {
                 watertight: cert.watertight,
                 manifold: cert.manifold,
                 oriented: cert.oriented,
+                shells_outward: Some(cert.shells_outward),
                 self_intersection_free: cert.self_intersection_free,
             }),
             ..Self::empty()
@@ -202,6 +208,7 @@ impl EventCertificate {
                 watertight: rec.watertight,
                 manifold: rec.manifold,
                 oriented: rec.oriented,
+                shells_outward: rec.shells_outward,
                 self_intersection_free: rec.self_intersection_free,
             }),
             ..Self::empty()
@@ -299,6 +306,8 @@ mod tests {
             nonmanifold_edges: 0,
             oriented: true,
             inconsistent_directed_edges: 0,
+            shells_outward: true,
+            misoriented_shells: vec![],
             self_intersection_free: true,
             construction_consistent: ConstructionConsistency::NotApplicable,
             labels_consistent: LabelsConsistency::NotApplicable,
@@ -340,8 +349,37 @@ mod tests {
         assert_eq!(checks.watertight, cert.watertight);
         assert_eq!(checks.manifold, cert.manifold);
         assert_eq!(checks.oriented, cert.oriented);
+        assert_eq!(checks.shells_outward, Some(cert.shells_outward));
         assert_eq!(checks.self_intersection_free, cert.self_intersection_free);
         assert!(!ec.skipped);
+    }
+
+    /// A shell turned the wrong way out is carried into the stored checks,
+    /// not hidden behind the other (all-true) conjuncts.
+    #[test]
+    fn an_inside_out_shell_reaches_the_stored_checks() {
+        let mut cert = sound_cert();
+        cert.shells_outward = false;
+        assert!(!cert.is_sound(), "guard: the cert is unsound");
+        let ec = EventCertificate::from_solid_certificate(&cert, Some(1.0), Some(6));
+        assert_eq!(ec.is_sound, Some(false));
+        assert_eq!(ec.checks.map(|c| c.shells_outward), Some(Some(false)));
+    }
+
+    /// A certificate stored before the conjunct existed reads back as "not
+    /// checked" (`None`), never as a fabricated `true`.
+    #[test]
+    fn a_stored_certificate_without_the_conjunct_reads_back_as_unchecked() {
+        let legacy = serde_json::json!({
+            "brep_valid": true,
+            "watertight": true,
+            "manifold": true,
+            "oriented": true,
+            "self_intersection_free": true
+        });
+        let checks: SolidCertChecks =
+            serde_json::from_value(legacy).expect("legacy checks deserialize");
+        assert_eq!(checks.shells_outward, None);
     }
 
     #[test]

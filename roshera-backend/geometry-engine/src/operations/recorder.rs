@@ -116,6 +116,12 @@ pub struct RecordedSolidCertificate {
     pub manifold: bool,
     /// Consistently wound, correctly-oriented closed surface.
     pub oriented: bool,
+    /// Every shell faces out of the material: bodies enclose positive signed
+    /// volume, voids negative (`ValidityCertificate::shells_outward`). `None`
+    /// only on a record written before the conjunct existed — never a
+    /// fabricated `true`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shells_outward: Option<bool>,
     /// No two non-adjacent faces cross.
     pub self_intersection_free: bool,
     /// Signed volume in model units³, when available.
@@ -147,6 +153,7 @@ impl RecordedSolidCertificate {
             watertight: cert.watertight,
             manifold: cert.manifold,
             oriented: cert.oriented,
+            shells_outward: Some(cert.shells_outward),
             self_intersection_free: cert.self_intersection_free,
             volume,
             face_count,
@@ -1266,6 +1273,8 @@ mod tests {
             nonmanifold_edges: 0,
             oriented: true,
             inconsistent_directed_edges: 0,
+            shells_outward: true,
+            misoriented_shells: vec![],
             self_intersection_free: true,
             construction_consistent: ConstructionConsistency::NotApplicable,
             labels_consistent: LabelsConsistency::NotApplicable,
@@ -1310,6 +1319,7 @@ mod tests {
         assert_eq!(rec.watertight, cert.watertight);
         assert_eq!(rec.manifold, cert.manifold);
         assert_eq!(rec.oriented, cert.oriented);
+        assert_eq!(rec.shells_outward, Some(cert.shells_outward));
         assert_eq!(rec.self_intersection_free, cert.self_intersection_free);
         assert_eq!(rec.volume, Some(1000.0));
         assert_eq!(rec.face_count, Some(6));

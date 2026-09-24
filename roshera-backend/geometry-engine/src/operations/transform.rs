@@ -56,23 +56,87 @@ pub fn transform_solid(
         lifecycle::validate_can_apply(model, OpSpec::Generic)?;
     }
     lifecycle::with_rollback(model, move |model| {
-        transform_solid_body(model, solid_id, transform, options)
+        apply_transform_in_place(model, solid_id, &transform, &options)?;
+
+        // Record the operation for timeline / event-sourcing consumers.
+        model.set_solid_provenance(
+            solid_id,
+            crate::primitives::provenance::OperationKind::Transform,
+            vec![solid_id],
+        );
+        model.record_operation(
+            crate::operations::recorder::RecordedOperation::new("transform_solid")
+                .with_parameters(serde_json::json!({
+                    "solid_id": solid_id,
+                    "transform": transform,
+                    "update_parameterization": options.update_parameterization,
+                }))
+                .with_input_solids([solid_id as u64])
+                .with_output_solids([solid_id as u64]),
+        );
+
+        Ok(TransformResult {
+            transformed_ids: vec![solid_id],
+            transform,
+        })
     })
 }
 
-fn transform_solid_body(
+/// Move every entity of `solid_id` through `transform`, in place, WITHOUT
+/// recording. The one body shared by [`transform_solid`] (which records
+/// `"transform_solid"`) and [`mirror`] (which records `"mirror"`), so a mirror
+/// is exactly one event on the timeline.
+///
+/// An orientation-reversing matrix (negative determinant — a reflection, or a
+/// reflection composed with a rigid motion or a scale) turns the image of every
+/// loop the other way round, so the kernel's two orientation conventions have
+/// to be restored face by face (see [`restore_orientation_after_reflection`]).
+/// That needs the transformed surfaces, so an orientation-reversing transform
+/// with `update_parameterization == false` is refused rather than returned
+/// with its faces left to chance.
+fn apply_transform_in_place(
     model: &mut BRepModel,
     solid_id: SolidId,
-    transform: Matrix4,
-    options: TransformOptions,
-) -> OperationResult<TransformResult> {
+    transform: &Matrix4,
+    options: &TransformOptions,
+) -> OperationResult<()> {
     // Validate inputs
-    validate_transform_inputs(model, &transform)?;
+    validate_transform_inputs(model, transform)?;
+    let reverses_orientation = transform.determinant() < 0.0;
+    if reverses_orientation && !options.update_parameterization {
+        return Err(OperationError::InvalidGeometry(
+            concat!(
+                "an orientation-reversing transform (negative determinant) must ",
+                "carry the surfaces with it to restore each face's orientation; ",
+                "update_parameterization = false would leave them behind"
+            )
+            .to_string(),
+        ));
+    }
 
     let solid = solid_id;
 
     // Get all entities in solid
     let mut entities = get_solid_entities(model, solid)?;
+
+    // Before anything moves: one point and surface normal per face, the
+    // witnesses the post-reflection orientation decision is made from.
+    let normal_samples = if reverses_orientation {
+        sample_face_normals(model, &entities)?
+    } else {
+        Vec::new()
+    };
+    // ...and the geometry the reflected curves and surfaces must reproduce.
+    let carried = if reverses_orientation {
+        Some(sample_carried_geometry(model, &entities))
+    } else {
+        None
+    };
+    let uv_reflections = if reverses_orientation {
+        measured_uv_reflections(model, &entities.faces)
+    } else {
+        Vec::new()
+    };
 
     // Detach this solid's vertices from any other solid that happens to
     // share them. `VertexStore::add_or_find` is the canonical primitive-
@@ -87,14 +151,20 @@ fn transform_solid_body(
     isolate_shared_topology(model, solid, &mut entities)?;
 
     // Transform vertices
-    transform_vertices(model, &entities.vertices, &transform)?;
+    transform_vertices(model, &entities.vertices, transform)?;
 
     // Transform curves
-    transform_curves(model, &entities.edges, &transform)?;
+    transform_curves(model, &entities.edges, transform)?;
 
     // Transform surfaces
     if options.update_parameterization {
-        transform_surfaces(model, &entities.faces, &transform)?;
+        transform_surfaces(model, &entities.faces, transform)?;
+    }
+
+    if let Some(carried) = &carried {
+        reflect_measured_uv_bounds(model, &uv_reflections);
+        verify_reflection_carried_geometry(model, carried, transform)?;
+        restore_orientation_after_reflection(model, &normal_samples, transform)?;
     }
 
     // FIX 1 — carry construction geometry with the solid. A sketch-derived
@@ -108,7 +178,7 @@ fn transform_solid_body(
     // are untouched. Identity / persistent ids are unaffected — this only
     // moves stored world points, it does not re-key the sidecar.
     if let Some(existing) = model.solid_construction.get(&solid) {
-        let moved = existing.transformed(&transform);
+        let moved = existing.transformed(transform);
         model.solid_construction.insert(solid, moved);
     }
 
@@ -127,27 +197,7 @@ fn transform_solid_body(
         solid.invalidate_mass_props_cache();
     }
 
-    // Record the operation for timeline / event-sourcing consumers.
-    model.set_solid_provenance(
-        solid,
-        crate::primitives::provenance::OperationKind::Transform,
-        vec![solid_id],
-    );
-    model.record_operation(
-        crate::operations::recorder::RecordedOperation::new("transform_solid")
-            .with_parameters(serde_json::json!({
-                "solid_id": solid_id,
-                "transform": transform,
-                "update_parameterization": options.update_parameterization,
-            }))
-            .with_input_solids([solid_id as u64])
-            .with_output_solids([solid as u64]),
-    );
-
-    Ok(TransformResult {
-        transformed_ids: vec![solid],
-        transform,
-    })
+    Ok(())
 }
 
 /// Apply transformation to faces
@@ -330,7 +380,16 @@ pub fn scale(
     transform_solid(model, first, transform, options)
 }
 
-/// Mirror entities
+/// Mirror a solid through the plane at `plane_origin` with normal
+/// `plane_normal`.
+///
+/// ONE recorded operation, of kind `"mirror"` (`solid_id`, `plane_origin`,
+/// `plane_normal`, `update_parameterization`), recorded after the reflection
+/// AND the per-face orientation restore, so the certificate that rides on the
+/// event is of the solid this call returns. The reflection itself goes through
+/// the non-recording body `transform_solid` shares, so no intermediate
+/// `"transform_solid"` event reaches the timeline; replay re-runs this function
+/// from the recorded plane.
 pub fn mirror(
     model: &mut BRepModel,
     entity_ids: Vec<u32>,
@@ -346,19 +405,30 @@ pub fn mirror(
         OperationError::InvalidGeometry("mirror requires an entity id".to_string())
     })?;
     lifecycle::with_rollback(model, move |model| {
-        // Build mirror matrix
         let transform = Matrix4::mirror(plane_origin, plane_normal)?;
+        apply_transform_in_place(model, first, &transform, &options)?;
 
-        // Dispatch based on entity type. The inner `transform_solid`
-        // takes its own snapshot; we accept the nested-snapshot cost
-        // for transactional correctness across the combined
-        // mirror+orient-fix path.
-        let result = transform_solid(model, first, transform, options)?;
+        model.set_solid_provenance(
+            first,
+            crate::primitives::provenance::OperationKind::Transform,
+            vec![first],
+        );
+        model.record_operation(
+            crate::operations::recorder::RecordedOperation::new("mirror")
+                .with_parameters(serde_json::json!({
+                    "solid_id": first,
+                    "plane_origin": [plane_origin.x, plane_origin.y, plane_origin.z],
+                    "plane_normal": [plane_normal.x, plane_normal.y, plane_normal.z],
+                    "update_parameterization": options.update_parameterization,
+                }))
+                .with_input_solids([first as u64])
+                .with_output_solids([first as u64]),
+        );
 
-        // Mirroring reverses orientation, need to fix
-        fix_mirrored_orientations(model, result.transformed_ids[0])?;
-
-        Ok(result)
+        Ok(TransformResult {
+            transformed_ids: vec![first],
+            transform,
+        })
     })
 }
 
@@ -413,17 +483,104 @@ fn transform_curves(
     curve_ids.sort_unstable();
     curve_ids.dedup();
 
+    // An orientation-reversing transform may return a curve that traces the
+    // image REVERSED in its parameter (an `Arc`/`Circle` keeps `L·normal`
+    // and mirrors its range; see `Arc::transformed_arc`). Such curves are
+    // detected by measurement and their edges re-pointed below.
+    let reflects = transform.determinant() < 0.0;
+    let mut reversed: HashMap<crate::primitives::curve::CurveId, f64> = HashMap::new();
+
     for curve_id in curve_ids {
         // Swap the curve in-place for its transformed image. Since `Curve::transform`
         // returns a fresh `Box<dyn Curve>`, we can replace the slot directly without
         // invalidating edge references (edges keep pointing to the same CurveId).
         if let Some(slot) = model.curves.get_mut(curve_id) {
             let transformed = slot.transform(transform);
+            if reflects {
+                if let Some(span) = reversed_parameter_span(&**slot, &*transformed, transform) {
+                    reversed.insert(curve_id, span);
+                }
+            }
             *slot = transformed;
         }
     }
 
+    // An edge on a parameter-reversed curve is REVERSED with it, the way a
+    // freshly built part carries it: its curve range mirrors to [s − b, s − a],
+    // its start and end vertices swap, and its orientation relative to the
+    // curve stays as it was — so the edge still runs along its curve's
+    // parameter (the tessellator and every sampler read the curve-forward
+    // samples as start → end), and `Edge::evaluate(t)` is the image of the
+    // original at `1 − t`. Every loop use of such an edge inverts its sense,
+    // so each loop still walks the same image path.
+    if !reversed.is_empty() {
+        let mut reversed_edges: HashSet<EdgeId> = HashSet::new();
+        for &edge_id in edge_ids {
+            // A caller's list may repeat an id; each edge is reversed ONCE
+            // (a second swap would undo the first while its curve stays
+            // reversed and its loop uses stay inverted).
+            if reversed_edges.contains(&edge_id) {
+                continue;
+            }
+            if let Some(edge) = model.edges.get_mut(edge_id) {
+                if let Some(&span) = reversed.get(&edge.curve_id) {
+                    let (a, b) = (edge.param_range.start, edge.param_range.end);
+                    edge.param_range =
+                        crate::primitives::curve::ParameterRange::new(span - b, span - a);
+                    std::mem::swap(&mut edge.start_vertex, &mut edge.end_vertex);
+                    reversed_edges.insert(edge_id);
+                }
+            }
+        }
+        let loop_ids: Vec<crate::primitives::r#loop::LoopId> = model
+            .loops
+            .iter()
+            .filter(|(_, lp)| lp.edges.iter().any(|e| reversed_edges.contains(e)))
+            .map(|(id, _)| id)
+            .collect();
+        for lid in loop_ids {
+            if let Some(lp) = model.loops.get_mut(lid) {
+                for i in 0..lp.edges.len() {
+                    if reversed_edges.contains(&lp.edges[i]) {
+                        if let Some(o) = lp.orientations.get_mut(i) {
+                            *o = !*o;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     Ok(())
+}
+
+/// If `new` (the image of `old` under the orientation-reversing `transform`)
+/// traces that image REVERSED in its parameter — `new(s − t) = L·old(t)` —
+/// return the mirror constant `s`; `None` when it traces it at the same
+/// parameter (or neither, which the reflection guard then refuses).
+fn reversed_parameter_span(
+    old: &dyn crate::primitives::curve::Curve,
+    new: &dyn crate::primitives::curve::Curve,
+    transform: &Matrix4,
+) -> Option<f64> {
+    let r_old = old.parameter_range();
+    let r_new = new.parameter_range();
+    let span = 0.5 * (r_old.start + r_old.end + r_new.start + r_new.end);
+    let mut same = true;
+    let mut rev = true;
+    for f in CARRIED_CURVE_FRACTIONS {
+        let t = r_old.start + f * (r_old.end - r_old.start);
+        let Ok(p) = old.point_at(t) else {
+            return None;
+        };
+        let image = transform.transform_point(&p);
+        let tol = carried_tolerance(&image);
+        same &= new.point_at(t).is_ok_and(|q| q.distance(&image) <= tol);
+        rev &= new
+            .point_at(span - t)
+            .is_ok_and(|q| q.distance(&image) <= tol);
+    }
+    (rev && !same).then_some(span)
 }
 
 /// Transform surfaces
@@ -582,8 +739,7 @@ fn get_solid_entities(model: &BRepModel, solid_id: SolidId) -> OperationResult<S
 
     // Walk EVERY shell of the solid — the outer boundary, its voids
     // (`inner_shells`) and its disjoint peer bodies (`peer_shells`) — via the
-    // canonical `Solid::all_shells` accessor, the same walk
-    // `fix_mirrored_orientations` uses. Walking only `outer_shell` left voids
+    // canonical `Solid::all_shells` accessor. Walking only `outer_shell` left voids
     // and peer bodies behind on every rigid motion, mirror, datum anchoring
     // and timeline replay: the outer hull moved, the rest stayed put, and the
     // solid was torn. A face listed by more than one shell is collected once,
@@ -670,68 +826,533 @@ fn get_faces_entities(model: &BRepModel, face_ids: &[FaceId]) -> OperationResult
     })
 }
 
-/// Fix face / edge orientations after mirroring.
-///
-/// A reflection has determinant −1 and reverses the handedness of every
-/// loop in the solid. Without flipping orientations, every face's
-/// outward normal points inward and the solid is inside-out — booleans,
-/// volume integration, and tessellation all silently produce the wrong
-/// result. This walks every face in every shell of the solid, flips
-/// each face's `FaceOrientation`, and flips every edge orientation
-/// inside the face's outer + inner loops so the loop traversal still
-/// agrees with the reversed face normal.
-fn fix_mirrored_orientations(model: &mut BRepModel, solid_id: SolidId) -> OperationResult<()> {
-    let solid = model
-        .solids
-        .get(solid_id)
-        .ok_or_else(|| OperationError::InvalidGeometry("Solid not found".to_string()))?
-        .clone();
+/// Pre-transform samples of every curve and face of a solid, taken so an
+/// orientation-reversing transform can be checked against them afterwards.
+struct CarriedGeometry {
+    /// `(edge, edge parameter, point)` at [`CARRIED_CURVE_FRACTIONS`] of each
+    /// edge, walked from its start vertex to its end vertex
+    /// (`Edge::evaluate`).
+    curve_samples: Vec<(EdgeId, f64, Point3)>,
+    /// `(face, point)`: boundary samples that lay ON the face's (trimmed)
+    /// surface before the transform. Samples that did not are not recorded —
+    /// a pre-existing gap is not this transform's to report.
+    ///
+    /// The flag records whether the sample's `closest_point` u also lay
+    /// inside the face's stored u-window (surface trim and measured
+    /// `uv_bounds`) before the transform; where it did, it must after.
+    face_samples: Vec<(FaceId, Point3, bool)>,
+}
 
-    let shell_ids = solid.all_shells();
+/// Where along each edge's parameter range the reflected curve is checked.
+const CARRIED_CURVE_FRACTIONS: [f64; 5] = [0.0, 0.23, 0.5, 0.71, 1.0];
 
-    // Collect all face IDs first so we can mutate faces without holding
-    // an immutable borrow on shells.
-    let mut face_ids: Vec<FaceId> = Vec::new();
-    for shell_id in &shell_ids {
-        if let Some(shell) = model.shells.get(*shell_id) {
-            face_ids.extend(shell.faces.iter().copied());
+/// Distance within which a sample counts as reproduced / on its surface.
+fn carried_tolerance(p: &Point3) -> f64 {
+    1e-6 * (1.0 + p.to_vec().magnitude())
+}
+
+/// Record [`CarriedGeometry`] for `entities`.
+fn sample_carried_geometry(model: &BRepModel, entities: &SolidEntities) -> CarriedGeometry {
+    let tolerance = crate::math::Tolerance::default();
+    let mut curve_samples = Vec::new();
+    for &edge_id in &entities.edges {
+        let Some(edge) = model.edges.get(edge_id) else {
+            continue;
+        };
+        // Asymmetric fractions: a curve traced with its parameter negated
+        // agrees with the image at the ends and the middle of a full period
+        // (θ = 0, π, 2π), so symmetric samples alone would not see it.
+        for f in CARRIED_CURVE_FRACTIONS {
+            if let Ok(p) = edge.evaluate(f, &model.curves) {
+                curve_samples.push((edge_id, f, p));
+            }
         }
     }
 
-    // Collect loop IDs per face before mutating.
-    let mut face_loops: Vec<(FaceId, Vec<crate::primitives::r#loop::LoopId>)> = Vec::new();
-    for &fid in &face_ids {
-        if let Some(face) = model.faces.get(fid) {
-            let mut loops = vec![face.outer_loop];
-            loops.extend(face.inner_loops.iter().copied());
-            face_loops.push((fid, loops));
-        }
-    }
-
-    // Flip face orientations.
-    for &fid in &face_ids {
-        if let Some(face) = model.faces.get_mut(fid) {
-            face.orientation = face.orientation.flipped();
-        }
-    }
-
-    // Flip edge orientations inside each loop. Reverse the edge ordering
-    // too so that loop traversal still emits a consistent (head→tail)
-    // walk under the new face normal. Loop stores edges and orientations
-    // as parallel vectors — both must be reversed in lockstep, then each
-    // orientation flag inverted.
-    for (_fid, loops) in face_loops {
+    let mut face_samples = Vec::new();
+    for &face_id in &entities.faces {
+        let Some(face) = model.faces.get(face_id) else {
+            continue;
+        };
+        let Some(surface) = model.surfaces.get(face.surface_id) else {
+            continue;
+        };
+        let mut loops = vec![face.outer_loop];
+        loops.extend(face.inner_loops.iter().copied());
         for lid in loops {
-            if let Some(loop_entity) = model.loops.get_mut(lid) {
+            let Some(lp) = model.loops.get(lid) else {
+                continue;
+            };
+            for &edge_id in &lp.edges {
+                let Some(edge) = model.edges.get(edge_id) else {
+                    continue;
+                };
+                let Some(curve) = model.curves.get(edge.curve_id) else {
+                    continue;
+                };
+                let mid = 0.5 * (edge.param_range.start + edge.param_range.end);
+                let Ok(p) = curve.point_at(mid) else {
+                    continue;
+                };
+                let Ok((u, v)) = surface.closest_point(&p, tolerance) else {
+                    continue;
+                };
+                let on_surface = surface
+                    .point_at(u, v)
+                    .is_ok_and(|q| q.distance(&p) <= carried_tolerance(&p));
+                if on_surface {
+                    face_samples.push((face_id, p, u_in_face_window(surface, face, u)));
+                }
+            }
+        }
+    }
+    CarriedGeometry {
+        curve_samples,
+        face_samples,
+    }
+}
+
+/// Angular slack when testing a closest-point u against a stored window.
+const U_WINDOW_SLACK: f64 = 1e-6;
+
+/// Does `u` (as `closest_point` reports it) lie inside the face's stored
+/// u-window: the surface's own u-trim (`parameter_bounds`) and, when measured,
+/// the face's `uv_bounds`? Consumers such as the line–patch limits in
+/// `operations::intersect` and `Face::contains_uv_point` compare exactly
+/// these two numbers.
+fn u_in_face_window(
+    surface: &dyn crate::primitives::surface::Surface,
+    face: &crate::primitives::face::Face,
+    u: f64,
+) -> bool {
+    // A window spanning a full period contains every angle, whatever its
+    // numeric offset; only a PARTIAL window is compared number for number,
+    // which is what the consumers do.
+    let within = |u: f64, lo: f64, hi: f64| {
+        !lo.is_finite()
+            || !hi.is_finite()
+            || hi - lo >= std::f64::consts::TAU - U_WINDOW_SLACK
+            || (u >= lo - U_WINDOW_SLACK && u <= hi + U_WINDOW_SLACK)
+    };
+    let ((a, b), _) = surface.parameter_bounds();
+    let in_bounds = face
+        .measured_uv_bounds()
+        .is_none_or(|[u0, u1, _, _]| within(u, u0, u1));
+    within(u, a, b) && in_bounds
+}
+
+/// After an orientation-reversing transform, prove the curves and surfaces
+/// carried their parameterisation with it before anything is re-oriented.
+///
+/// The per-face restore ([`restore_orientation_after_reflection`]) reverses
+/// loops or flips face flags on the premise that every transformed curve
+/// traces the image of the original at the same parameter,
+/// `p'(t) = L·p(t)`, and every transformed surface still contains the image
+/// of its trimmed patch. A curve or surface kind whose `transform` does not
+/// honour that — measured here, not assumed — would leave edges that no
+/// longer end at their vertices, or faces whose trim no longer covers their
+/// boundary. That is refused, naming the curve or face, rather than returned.
+fn verify_reflection_carried_geometry(
+    model: &BRepModel,
+    carried: &CarriedGeometry,
+    transform: &Matrix4,
+) -> OperationResult<()> {
+    let tolerance = crate::math::Tolerance::default();
+    // Group the samples per edge: an edge traces the image either at the same
+    // edge parameter or — when its curve came back parameter-reversed and
+    // the edge was reversed with it (`transform_curves`) — at `1 − t`.
+    // Either is the image; a mixture, or neither, is not.
+    let mut per_edge: HashMap<EdgeId, Vec<(f64, Point3)>> = HashMap::new();
+    for &(edge_id, t, before) in &carried.curve_samples {
+        per_edge.entry(edge_id).or_default().push((t, before));
+    }
+    let mut edge_ids: Vec<EdgeId> = per_edge.keys().copied().collect();
+    edge_ids.sort_unstable();
+    for edge_id in edge_ids {
+        let samples = per_edge.get(&edge_id).map(Vec::as_slice).unwrap_or(&[]);
+        let edge = model
+            .edges
+            .get(edge_id)
+            .ok_or_else(|| OperationError::InvalidGeometry(format!("edge {edge_id} not found")))?;
+        let curve = model.curves.get(edge.curve_id).ok_or_else(|| {
+            OperationError::InvalidGeometry(format!(
+                "curve {} of edge {edge_id} not found",
+                edge.curve_id
+            ))
+        })?;
+        let worst = |reverse: bool| -> (f64, f64) {
+            let mut worst = (0.0_f64, 0.0_f64);
+            for &(t, before) in samples {
+                let expected = transform.transform_point(&before);
+                let at = if reverse { 1.0 - t } else { t };
+                let miss = edge
+                    .evaluate(at, &model.curves)
+                    .map(|p| p.distance(&expected) / carried_tolerance(&expected))
+                    .unwrap_or(f64::INFINITY);
+                if !(miss <= worst.1) {
+                    worst = (t, miss);
+                }
+            }
+            worst
+        };
+        let (t_fwd, fwd) = worst(false);
+        let (_, rev) = worst(true);
+        if !(fwd <= 1.0 || rev <= 1.0) {
+            return Err(OperationError::NumericalError(format!(
+                concat!(
+                    "edge {} ({}): the orientation-reversing transform does not ",
+                    "carry this edge — at edge parameter {} it lands {:.3e} ",
+                    "tolerances from the image of the original point"
+                ),
+                edge_id,
+                curve.type_name(),
+                t_fwd,
+                fwd.min(rev)
+            )));
+        }
+    }
+    for &(face_id, before, in_window_before) in &carried.face_samples {
+        let expected = transform.transform_point(&before);
+        let surface_id = model
+            .faces
+            .get(face_id)
+            .map(|f| f.surface_id)
+            .ok_or_else(|| OperationError::InvalidGeometry(format!("face {face_id} not found")))?;
+        let surface = model.surfaces.get(surface_id).ok_or_else(|| {
+            OperationError::InvalidGeometry(format!(
+                "surface {surface_id} of face {face_id} not found"
+            ))
+        })?;
+        let uv = surface.closest_point(&expected, tolerance);
+        let landed = uv
+            .as_ref()
+            .ok()
+            .and_then(|&(u, v)| surface.point_at(u, v).ok());
+        let miss = landed
+            .map(|q| q.distance(&expected))
+            .unwrap_or(f64::INFINITY);
+        if in_window_before {
+            let face = model.faces.get(face_id).ok_or_else(|| {
+                OperationError::InvalidGeometry(format!("face {face_id} not found"))
+            })?;
+            if let Ok((u, _)) = uv {
+                if !u_in_face_window(surface, face, u) {
+                    return Err(OperationError::NumericalError(format!(
+                        concat!(
+                            "face {} ({}): after the orientation-reversing transform ",
+                            "the surface parameter of a boundary point, u = {:.6}, ",
+                            "falls outside the face's stored u-window; consumers ",
+                            "comparing closest-point parameters with the window ",
+                            "would reject the face"
+                        ),
+                        face_id,
+                        surface.type_name(),
+                        u
+                    )));
+                }
+            }
+        }
+        if !(miss <= carried_tolerance(&expected)) {
+            return Err(OperationError::NumericalError(format!(
+                concat!(
+                    "face {} ({}): after the orientation-reversing transform its ",
+                    "surface no longer covers the image of its own boundary (a ",
+                    "boundary point lands {:.3e} away)"
+                ),
+                face_id,
+                surface.type_name(),
+                miss
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The measured parametric domains a reflection must carry: for each face
+/// on a Cylinder, Cone, Sphere or Torus whose `uv_bounds` were measured, the
+/// face and the span `c = a + b` of its surface's u-window `[a, b]`, read
+/// BEFORE the transform.
+///
+/// Those four surfaces keep their stored u-window through a reflection by
+/// rotating their reference direction (`primitives::surface::
+/// reflected_ref_dir`), which makes the reflected surface trace
+/// `S''(u) = L·S(c − u)`. A face's u-range `[u0, u1]` inside that window
+/// therefore becomes `[c − u1, c − u0]`: unchanged when the face covers the
+/// whole window (the common case), and still inside
+/// the window — the range the surface's `closest_point` reports — otherwise.
+/// Every other surface kind carries its parameters unchanged.
+fn measured_uv_reflections(model: &BRepModel, faces: &[FaceId]) -> Vec<(FaceId, f64)> {
+    use crate::primitives::surface::SurfaceType;
+    let mut out = Vec::new();
+    for &face_id in faces {
+        let Some(face) = model.faces.get(face_id) else {
+            continue;
+        };
+        // A full-period u-range maps onto itself under the reflection
+        // (u ↦ c − u is a bijection of the circle); it is left exactly as
+        // measured.
+        match face.measured_uv_bounds() {
+            None => continue,
+            Some([u0, u1, _, _]) if ((u1 - u0) - std::f64::consts::TAU).abs() <= 1e-9 => continue,
+            Some(_) => {}
+        }
+        let Some(surface) = model.surfaces.get(face.surface_id) else {
+            continue;
+        };
+        if matches!(
+            surface.surface_type(),
+            SurfaceType::Cylinder | SurfaceType::Cone | SurfaceType::Sphere | SurfaceType::Torus
+        ) {
+            let ((a, b), _) = surface.parameter_bounds();
+            out.push((face_id, a + b));
+        }
+    }
+    out
+}
+
+/// Apply [`measured_uv_reflections`] after the surfaces moved.
+fn reflect_measured_uv_bounds(model: &mut BRepModel, reflections: &[(FaceId, f64)]) {
+    for &(face_id, c) in reflections {
+        if let Some(face) = model.faces.get_mut(face_id) {
+            if let Some([u0, u1, v0, v1]) = face.measured_uv_bounds() {
+                face.set_uv_bounds(c - u1, c - u0, v0, v1);
+            }
+        }
+    }
+}
+
+/// One face's pre-transform orientation witness: a point on the face's
+/// boundary, lying on its surface, and the surface's own (un-oriented) normal
+/// there.
+struct FaceNormalSample {
+    face: FaceId,
+    surface: crate::primitives::surface::SurfaceId,
+    point: Point3,
+    normal: Vector3,
+}
+
+/// Record one [`FaceNormalSample`] per face of `entities`, BEFORE the transform
+/// moves anything.
+///
+/// Candidates are the parametric midpoints of the face's outer-loop edges, then
+/// the loop's vertices — points that lie on the face's surface by construction.
+/// The first candidate where the surface has a well-defined normal wins, which
+/// steps off a sphere's pole or a cone's apex. A face with no such candidate is
+/// refused: its orientation after the reflection could only be guessed.
+fn sample_face_normals(
+    model: &BRepModel,
+    entities: &SolidEntities,
+) -> OperationResult<Vec<FaceNormalSample>> {
+    let tolerance = crate::math::Tolerance::default();
+    let mut samples = Vec::with_capacity(entities.faces.len());
+    for &face_id in &entities.faces {
+        let face = model
+            .faces
+            .get(face_id)
+            .ok_or_else(|| OperationError::InvalidGeometry(format!("face {face_id} not found")))?;
+        let surface_id = face.surface_id;
+        let surface = model.surfaces.get(surface_id).ok_or_else(|| {
+            OperationError::InvalidGeometry(format!(
+                "surface {surface_id} of face {face_id} not found"
+            ))
+        })?;
+        let lp = model.loops.get(face.outer_loop).ok_or_else(|| {
+            OperationError::InvalidGeometry(format!(
+                "outer loop {} of face {face_id} not found",
+                face.outer_loop
+            ))
+        })?;
+
+        let mut candidates: Vec<Point3> = Vec::new();
+        for &edge_id in &lp.edges {
+            let Some(edge) = model.edges.get(edge_id) else {
+                continue;
+            };
+            let Some(curve) = model.curves.get(edge.curve_id) else {
+                continue;
+            };
+            let mid = 0.5 * (edge.param_range.start + edge.param_range.end);
+            if let Ok(p) = curve.point_at(mid) {
+                candidates.push(p);
+            }
+        }
+        for &edge_id in &lp.edges {
+            if let Some(edge) = model.edges.get(edge_id) {
+                if let Some(p) = model.vertices.get_position(edge.start_vertex) {
+                    candidates.push(Point3::new(p[0], p[1], p[2]));
+                }
+            }
+        }
+
+        let regular = |normal: &Vector3| {
+            let len = normal.magnitude();
+            len.is_finite() && len > 0.5
+        };
+        let on_boundary = candidates.into_iter().find_map(|point| {
+            let (u, v) = surface.closest_point(&point, tolerance).ok()?;
+            let normal = surface.normal_at(u, v).ok()?;
+            regular(&normal).then_some(FaceNormalSample {
+                face: face_id,
+                surface: surface_id,
+                point,
+                normal,
+            })
+        });
+        // A face whose boundary sits entirely on singular points of its
+        // surface (a sphere bounded by its pole-to-pole seam) falls back to
+        // interior parameters of the carrier surface. Whether a transformed
+        // surface keeps or flips its normal is a property of the whole
+        // connected surface, so any regular point of it decides the face.
+        let sample = on_boundary.or_else(|| {
+            let ((u0, u1), (v0, v1)) = surface.parameter_bounds();
+            if ![u0, u1, v0, v1].iter().all(|x| x.is_finite()) {
+                return None;
+            }
+            [0.5, 0.3, 0.7, 0.15, 0.85]
+                .iter()
+                .flat_map(|&a| [0.5, 0.3, 0.7].iter().map(move |&b| (a, b)))
+                .find_map(|(a, b)| {
+                    let (u, v) = (u0 + a * (u1 - u0), v0 + b * (v1 - v0));
+                    let point = surface.point_at(u, v).ok()?;
+                    let normal = surface.normal_at(u, v).ok()?;
+                    regular(&normal).then_some(FaceNormalSample {
+                        face: face_id,
+                        surface: surface_id,
+                        point,
+                        normal,
+                    })
+                })
+        });
+        let sample = sample.ok_or_else(|| {
+            OperationError::NumericalError(format!(
+                concat!(
+                    "face {} has no boundary point with a well-defined surface ",
+                    "normal; its orientation after an orientation-reversing ",
+                    "transform cannot be decided"
+                ),
+                face_id
+            ))
+        })?;
+        samples.push(sample);
+    }
+    Ok(samples)
+}
+
+/// Restore the kernel's orientation conventions on every face after an
+/// orientation-reversing transform (negative determinant).
+///
+/// The kernel carries two conventions (measured in
+/// `tests/coedge_orientation_invariant.rs`): a loop's STORED walk runs
+/// counter-clockwise about its surface's own normal, and `FaceOrientation`
+/// maps that surface normal to the outward normal. A reflection maps the
+/// outward normal of the original to the outward normal of the image (a normal
+/// transforms by the inverse transpose), but it turns every loop's image the
+/// other way round. Which of the two flags must change depends on how the
+/// transformed SURFACE carries its normal, and that differs by surface kind:
+///
+/// * a surface whose normal is stored and transformed as a vector (plane,
+///   cylinder, cone, sphere, torus) keeps pointing outward — its loops are
+///   reversed and `FaceOrientation` is kept;
+/// * a surface whose normal is the cross product of its parametric derivatives
+///   (NURBS) flips with the handedness — its `FaceOrientation` is flipped and
+///   its loops, already counter-clockwise about the flipped normal, are kept.
+///
+/// Flipping everything, as this function's predecessor did, turned every
+/// analytic face inward (a mirrored box, cylinder or sphere came back
+/// inside-out); flipping nothing left the NURBS faces inward. The decision is
+/// therefore made per face and geometrically: the transformed surface's normal
+/// at the image of the face's sample point is compared with the inverse-
+/// transpose image of the sampled normal. A comparison that is neither clearly
+/// aligned nor clearly opposed is refused, never guessed.
+fn restore_orientation_after_reflection(
+    model: &mut BRepModel,
+    samples: &[FaceNormalSample],
+    transform: &Matrix4,
+) -> OperationResult<()> {
+    let tolerance = crate::math::Tolerance::default();
+    for sample in samples {
+        let expected = transform.transform_normal(&sample.normal).map_err(|e| {
+            OperationError::NumericalError(format!(
+                "face {}: the sampled normal does not transform: {e:?}",
+                sample.face
+            ))
+        })?;
+        let image = transform.transform_point(&sample.point);
+        let carried = {
+            let surface = model.surfaces.get(sample.surface).ok_or_else(|| {
+                OperationError::InvalidGeometry(format!(
+                    "surface {} of face {} not found",
+                    sample.surface, sample.face
+                ))
+            })?;
+            let (u, v) = surface.closest_point(&image, tolerance).map_err(|e| {
+                OperationError::NumericalError(format!(
+                    concat!(
+                        "face {}: the transformed surface does not locate the ",
+                        "image of its sample point: {:?}"
+                    ),
+                    sample.face, e
+                ))
+            })?;
+            surface.normal_at(u, v).map_err(|e| {
+                OperationError::NumericalError(format!(
+                    concat!(
+                        "face {}: the transformed surface has no normal at the ",
+                        "image of its sample point: {:?}"
+                    ),
+                    sample.face, e
+                ))
+            })?
+        };
+        let agreement = carried.dot(&expected) / carried.magnitude().max(f64::MIN_POSITIVE);
+        if !agreement.is_finite() || agreement.abs() < 0.5 {
+            return Err(OperationError::NumericalError(format!(
+                concat!(
+                    "face {}: after the orientation-reversing transform its ",
+                    "surface normal is neither aligned with nor opposed to the ",
+                    "transformed original (cosine {:.3}); its orientation cannot ",
+                    "be decided"
+                ),
+                sample.face, agreement
+            )));
+        }
+
+        if agreement > 0.0 {
+            // The surface carried its normal outward: turn the loops back to
+            // counter-clockwise about it, keep the face flag.
+            let loops = {
+                let face = model.faces.get(sample.face).ok_or_else(|| {
+                    OperationError::InvalidGeometry(format!("face {} not found", sample.face))
+                })?;
+                let mut loops = vec![face.outer_loop];
+                loops.extend(face.inner_loops.iter().copied());
+                loops
+            };
+            for lid in loops {
+                let loop_entity = model.loops.get_mut(lid).ok_or_else(|| {
+                    OperationError::InvalidGeometry(format!(
+                        "loop {lid} of face {} not found",
+                        sample.face
+                    ))
+                })?;
+                // Edges and their use-senses are parallel vectors: reverse both
+                // in lockstep, then invert each sense.
                 loop_entity.edges.reverse();
                 loop_entity.orientations.reverse();
                 for o in loop_entity.orientations.iter_mut() {
                     *o = !*o;
                 }
             }
+        } else {
+            // The surface normal flipped with the handedness: flip the face
+            // flag back to outward; the loops already run counter-clockwise
+            // about the flipped surface normal.
+            let face = model.faces.get_mut(sample.face).ok_or_else(|| {
+                OperationError::InvalidGeometry(format!("face {} not found", sample.face))
+            })?;
+            face.orientation = face.orientation.flipped();
         }
     }
-
     Ok(())
 }
 
@@ -1252,7 +1873,9 @@ mod tests {
                 validate_result: false,
                 ..CommonOptions::default()
             },
-            update_parameterization: false,
+            // A mirror carries the surfaces with the vertices (it has to, to
+            // restore each face's orientation).
+            update_parameterization: true,
         };
         let _ = mirror(&mut model, vec![sid], Point3::ORIGIN, Vector3::Z, opts).expect("mirror");
         let after = collect_positions(&model);
@@ -1274,7 +1897,9 @@ mod tests {
                 validate_result: false,
                 ..CommonOptions::default()
             },
-            update_parameterization: false,
+            // A mirror carries the surfaces with the vertices (it has to, to
+            // restore each face's orientation).
+            update_parameterization: true,
         };
         let _ = mirror(&mut model, vec![sid], Point3::ORIGIN, Vector3::X, opts).expect("mirror");
         let after = collect_positions(&model);
@@ -1295,7 +1920,9 @@ mod tests {
                 validate_result: false,
                 ..CommonOptions::default()
             },
-            update_parameterization: false,
+            // A mirror carries the surfaces with the vertices (it has to, to
+            // restore each face's orientation).
+            update_parameterization: true,
         };
         let _ = mirror(&mut model, vec![sid], Point3::ORIGIN, Vector3::Y, opts).expect("mirror");
         let after = collect_positions(&model);
@@ -1307,33 +1934,105 @@ mod tests {
         }
     }
 
+    /// A box's faces are planes, whose normal is stored and transformed as a
+    /// vector: the reflected plane already points out of the reflected box.
+    /// The mirror must therefore KEEP every face flag and reverse every loop
+    /// (the image of a counter-clockwise walk runs clockwise). The previous
+    /// behaviour — flip every face flag too — is what turned a mirrored box
+    /// inside-out; this test pinned that defect as `mirror_flips_face_orientations`.
     #[test]
-    fn mirror_flips_face_orientations() {
+    fn mirror_keeps_plane_face_flags_and_reverses_their_loops() {
         let (mut model, sid) = unit_box();
-        // Capture face orientations before mirror.
         let solid_before = model.solids.get(sid).expect("solid").clone();
-        let shell_before = model
+        let faces: Vec<FaceId> = model
             .shells
             .get(solid_before.outer_shell)
             .expect("shell")
-            .clone();
-        let before_orients: Vec<_> = shell_before
             .faces
+            .clone();
+        let before: Vec<_> = faces
             .iter()
-            .filter_map(|fid| model.faces.get(*fid).map(|f| (*fid, f.orientation)))
+            .map(|&fid| {
+                let f = model.faces.get(fid).expect("face");
+                let lp = model.loops.get(f.outer_loop).expect("loop");
+                (
+                    fid,
+                    f.orientation,
+                    lp.edges.clone(),
+                    lp.orientations.clone(),
+                )
+            })
             .collect();
+        let _ = mirror(
+            &mut model,
+            vec![sid],
+            Point3::ORIGIN,
+            Vector3::Z,
+            TransformOptions::default(),
+        )
+        .expect("mirror");
+        for (fid, orient, edges, senses) in before {
+            let f = model.faces.get(fid).expect("face");
+            assert_eq!(f.orientation, orient, "face {fid}: a plane keeps its flag");
+            let lp = model.loops.get(f.outer_loop).expect("loop");
+            let mut rev_edges = edges.clone();
+            rev_edges.reverse();
+            let rev_senses: Vec<bool> = senses.iter().rev().map(|s| !s).collect();
+            assert_eq!(lp.edges, rev_edges, "face {fid}: loop edges reversed");
+            assert_eq!(
+                lp.orientations, rev_senses,
+                "face {fid}: loop senses inverted"
+            );
+        }
+    }
+
+    #[test]
+    fn orientation_reversing_transform_without_surfaces_is_refused() {
+        let (mut model, sid) = unit_box();
+        let before = collect_positions(&model);
         let opts = TransformOptions {
-            common: CommonOptions {
-                validate_result: false,
-                ..CommonOptions::default()
-            },
+            common: CommonOptions::default(),
             update_parameterization: false,
         };
-        let _ = mirror(&mut model, vec![sid], Point3::ORIGIN, Vector3::Z, opts).expect("mirror");
-        for (fid, orig) in before_orients {
-            let new = model.faces.get(fid).expect("face").orientation;
-            assert_eq!(new, orig.flipped());
+        let res = mirror(&mut model, vec![sid], Point3::ORIGIN, Vector3::Z, opts);
+        match res {
+            Err(OperationError::InvalidGeometry(msg)) => {
+                assert!(msg.contains("update_parameterization"), "{msg}");
+                assert!(!msg.contains("  "), "no whitespace runs: {msg:?}");
+            }
+            other => panic!("expected a typed refusal, got {other:?}"),
         }
+        let after = collect_positions(&model);
+        for (a, b) in before.iter().zip(after.iter()) {
+            assert!(approx_pos(*a, *b), "a refused mirror moves nothing");
+        }
+    }
+
+    #[test]
+    fn mirror_records_exactly_one_mirror_event_after_the_orientation_fix() {
+        let (mut model, sid) = unit_box();
+        let rec: Arc<CaptureRecorder> = Arc::new(CaptureRecorder::default());
+        model.attach_recorder(Some(rec.clone() as Arc<dyn OperationRecorder>));
+        let _ = mirror(
+            &mut model,
+            vec![sid],
+            Point3::new(3.0, 0.0, 0.0),
+            Vector3::X,
+            TransformOptions::default(),
+        )
+        .expect("mirror");
+        let kinds = captured_kinds(&rec);
+        assert_eq!(
+            kinds,
+            vec!["mirror".to_string()],
+            "one mirror must record exactly one event, of kind \"mirror\""
+        );
+        let events = rec.events.lock().expect("mutex");
+        let params = &events[0].parameters;
+        assert_eq!(params["solid_id"], serde_json::json!(sid));
+        assert_eq!(params["plane_origin"], serde_json::json!([3.0, 0.0, 0.0]));
+        assert_eq!(params["plane_normal"], serde_json::json!([1.0, 0.0, 0.0]));
+        assert_eq!(params["update_parameterization"], serde_json::json!(true));
     }
 
     // ────────── H. transform_solid public API ──────────
