@@ -1,10 +1,12 @@
 // Slice 2 — MCP scale architecture: meta-tools + minimal default surface.
 //
-// Node-runnable WITHOUT a live backend. Exercises the compiled dist/ directly
-// (build first: `npm run build`). Four groups, matching the S2 spec:
+// Node-runnable WITHOUT a live backend. Exercises the gate build in test/.build
+// (build first: `npm run test:gates:build` — compiled from src/ on every gate
+// run, never the deployable dist/, which is only as fresh as its last manual
+// `npm run build`). Four groups, matching the S2 spec:
 //   (a) validation parity  — invoke(create_box, bad) === direct-call error;
 //                            invoke(create_box, good) produces the identical POST.
-//   (b) surface flip       — minimal exposes exactly 31; full exposes 108.
+//   (b) surface flip       — minimal exposes exactly 31; full exposes 109.
 //                            (S3/S4 added 2 core tools: workbench + cad_program;
 //                             the "blackboard" commit added blackboard_add_entry;
 //                             DFM S7 added 1 analysis tool: dfm_check.)
@@ -27,9 +29,9 @@ import {
   META_SURFACE,
   exposedNamesFor,
   billFor,
-} from "../dist/surface.js";
-import { rankTools } from "../dist/metatools.js";
-import { fnv1a64hex, canonicalJson } from "../dist/registry.js";
+} from "./.build/surface.js";
+import { rankTools } from "./.build/metatools.js";
+import { fnv1a64hex, canonicalJson } from "./.build/registry.js";
 
 let failures = 0;
 const fail = (m) => {
@@ -89,7 +91,7 @@ console.log("(d) HASH: TS FNV-1a-64 reproduces canonical reference vectors");
 }
 
 // ── (b) Surface flip (pure) ──────────────────────────────────────────────────
-console.log("(b) SURFACE: minimal exposes 31, full exposes 108");
+console.log("(b) SURFACE: minimal exposes 31, full exposes 109");
 const table = buildTable();
 {
   // S3/S4 added 2 core composition tools (workbench + cad_program): 90 kernel
@@ -111,9 +113,14 @@ const table = buildTable();
   // exposes GET /api/timeline/recipe/{branch_or_document} — a proven build
   // retrieved as a re-parameterizable plan; full table + timeline bench,
   // never minimal (a recipe is consulted per part CLASS, not per operation,
-  // so it does not earn resident surface): 106 + 2 + 3 = 111.
-  if (table.size === 111) pass("table holds 111 tools (106 kernel + 2 composition + 3 meta)");
-  else fail(`table size ${table.size}, expected 111`);
+  // so it does not earn resident surface): 106 + 2 + 3 = 111. part_rename
+  // (a3ab6b9e, 2026-08-22) exposes POST /api/parts/uuid/{uuid}/name — the
+  // only way to name a boolean's RESULT, which otherwise inherits its base's
+  // name; full table + core bench, never minimal (measured: the minimal bill
+  // did not move at a3ab6b9e): 107 + 2 + 3 = 112. This pin sat stale at 111
+  // for a month because no gate ran this file.
+  if (table.size === 112) pass("table holds 112 tools (107 kernel + 2 composition + 3 meta)");
+  else fail(`table size ${table.size}, expected 112`);
 
   // NOTE: this block's pinned counts (core=18, minimal=21) reflect a PRE-
   // EXISTING drift discovered while rebuilding dist/ for DFM S7, not a count
@@ -140,8 +147,8 @@ const table = buildTable();
   else fail(`meta list is ${META_SURFACE.length}, expected 3`);
 
   const full = exposedNamesFor(table, "full");
-  if (full.length === 108) pass("full surface exposes exactly 108 tools (meta excluded)");
-  else fail(`full surface exposes ${full.length}, expected 108`);
+  if (full.length === 109) pass("full surface exposes exactly 109 tools (meta excluded)");
+  else fail(`full surface exposes ${full.length}, expected 109`);
   if (!full.some((n) => META_SURFACE.includes(n)))
     pass("full surface omits the meta-tools (they are the minimal-surface mechanism)");
   else fail("full surface unexpectedly includes meta-tools");
@@ -165,6 +172,11 @@ const table = buildTable();
   // measured to comfortably clear the gate that actually ships, and this test
   // is raised to match that number rather than invent a second, disagreeing
   // ceiling.
+  // Measured 2026-09-24: 7970 — +58 timeline_checkpoint (e0548c88, the
+  // verification-scope gate's wording) and +115 blackboard_add_entry
+  // (a29d241c, the KaTeX notation the Blackboard renders). 30 tokens of
+  // headroom remain under 8000; the next resident-description growth must
+  // pay for itself or re-open the budget decision.
   const minimalBill = billFor(table, MINIMAL_SURFACE);
   const fullBill = billFor(table, table.names());
   console.log(`      token bill: minimal=${minimalBill}, full=${fullBill}`);
@@ -205,6 +217,21 @@ console.log("(c) FIND_TOOL: intent queries surface the right tools top-3");
   const none = rankTools(table, "zzqxwv nonsense gibberish", undefined, 5);
   if (none.length === 0) pass("unmatchable query ranks to empty (honest zero-hit)");
   else fail(`unmatchable query returned ${none.length} results: ${none.map((r) => r.name)}`);
+
+  // A bare number is a value, not an intent: a query of dimensions alone must
+  // match nothing. Before metatools.ts dropped digit-only tokens, "20" landed
+  // on blackboard_add_entry's worked example ("48\cos 20^\circ") with a rare
+  // word's IDF and outranked create_cone for "tapered spigot 20 at the base…".
+  const numbersOnly = rankTools(table, "20 12 200", undefined, 5);
+  if (numbersOnly.length === 0) pass("a query of bare numbers ranks to empty (values are not intents)");
+  else fail(`bare-number query '20 12 200' matched ${numbersOnly.map((r) => r.name)} — digits are ranking as intent`);
+
+  // …but a STANDARD's number is an intent: "ISO 2768" names the general-
+  // tolerance table kb_lookup serves. Dropping bare digits must not strip the
+  // number off its standard (it did: make_drawing ranked #1 on "iso" alone).
+  const isoTop = rankTools(table, "ISO 2768", undefined, 5).map((r) => r.name);
+  if (isoTop[0] === "kb_lookup") pass(`'ISO 2768' ranks kb_lookup #1 (a standard's number is kept) [${isoTop}]`);
+  else fail(`'ISO 2768' top-5 = [${isoTop}] — kb_lookup must be #1; the standard's number was lost`);
 
   const findTool = table.get("find_tool");
   const emptyRes = await findTool.handler({ query: "zzqxwv nonsense gibberish" });

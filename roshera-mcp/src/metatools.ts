@@ -157,6 +157,11 @@ const PHRASES: Array<[RegExp, string]> = [
   [/\bdegrees[\s-]of[\s-]freedom\b/g, " dof "],
   [/\blead[\s-]?ins?\b/g, " chamfer "],
   [/\bbill[\s-]of[\s-]materials\b/g, " bom "],
+  // A standard's number IS its identity: "ISO 2768" / "EN 1092-1" / "DIN 912"
+  // must survive the bare-number drop in `tokenize`, so the prefix is glued
+  // to its number ("iso2768") — a mixed token that is kept and matches the
+  // same glued form in a description.
+  [/\b(iso|din|en|astm|ansi|asme|bs|jis)[\s-]?(\d+)\b/g, " $1$2 "],
 ];
 
 const STOPWORDS = new Set([
@@ -171,13 +176,28 @@ const STOPWORDS = new Set([
   "they", "them", "these", "those", "there", "here",
 ]);
 
-/** Lowercase, rewrite known phrases, split, drop stopwords, stem. */
+/**
+ * A token made only of digits is a VALUE, never an intent. In a query it is a
+ * dimension the caller will pass as an argument ("a ball 20 across", "bore
+ * from 8 to 10"); in a description it is a worked example's number
+ * (blackboard_add_entry's "48\cos 20^\circ"). Matching one against the other
+ * ranks tools by coincident arithmetic: a rare number in one description
+ * carries a high IDF, so "tapered spigot 20 at the base…" put
+ * blackboard_add_entry above create_cone on the digit "20" alone (+31.4).
+ * Mixed tokens ("m6", "dn50", "h7") keep their letters and still match, and a
+ * standard's number is glued to its prefix by PHRASES first ("ISO 2768" →
+ * "iso2768"), so it is never mistaken for a bare value.
+ */
+const PURE_NUMBER = /^[0-9]+$/;
+
+/** Lowercase, rewrite known phrases, split, drop stopwords and bare numbers, stem. */
 function tokenize(text: string): string[] {
   let t = text.toLowerCase();
   for (const [re, canon] of PHRASES) t = t.replace(re, canon);
   return t
     .split(/[^a-z0-9]+/)
-    .filter((w) => w.length >= 2 && !STOPWORDS.has(w)) // 1-char tokens ("w", "x") are pure noise
+    // 1-char tokens ("w", "x") are pure noise; bare numbers are values (above).
+    .filter((w) => w.length >= 2 && !STOPWORDS.has(w) && !PURE_NUMBER.test(w))
     .map(stem);
 }
 

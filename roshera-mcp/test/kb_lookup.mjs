@@ -20,7 +20,8 @@
 //   (2) TIER 2 — playbook chunks + tool_sequence names all resolve in the table.
 //   (f) FUNNEL — find_tool discovers kb_lookup by intent; invoke dispatches it.
 //
-// Run: node test/kb_lookup.mjs   (exit 0 = pass, non-zero = fail)
+// Run: npm run test:gates:build && node test/kb_lookup.mjs   (exit 0 = pass)
+// Reads test/.build (compiled from src/ by the gate build), never dist/.
 
 import fs from "node:fs";
 import path from "node:path";
@@ -32,8 +33,8 @@ import {
   MINIMAL_SURFACE,
   exposedNamesFor,
   billFor,
-} from "../dist/surface.js";
-import { rankTools } from "../dist/metatools.js";
+} from "./.build/surface.js";
+import { rankTools } from "./.build/metatools.js";
 
 let failures = 0;
 const fail = (m) => {
@@ -123,11 +124,20 @@ console.log("(s) SURFACE: kb_lookup in the FULL table only; minimal bill unmoved
   // kb_lookup's own zero-marginal-cost claim is untouched by this move either
   // -- it remains in neither CORE_SURFACE nor META_SURFACE, so the whole delta
   // is attributable to psketch_* residency, not to kb_lookup.
+  // Pin moved 7797 -> 7970 (2026-09-24, audit Task 93). This file was in no
+  // gate, so it sat red for six weeks. Bisected commit by commit over every
+  // roshera-mcp/src change since 2f249826, per-tool bill diffed: +58
+  // timeline_checkpoint at e0548c88 (its description now states the
+  // verification-scope gate that refuses a checkpoint over unverified work)
+  // and +115 blackboard_add_entry at a29d241c (the description now teaches the
+  // KaTeX notation the Blackboard renders, with a worked line). Both are
+  // deliberate description growth on resident tools; neither touches
+  // kb_lookup, which is still in neither CORE_SURFACE nor META_SURFACE.
   const minimalBill = billFor(table, MINIMAL_SURFACE);
-  if (minimalBill === 7797)
-    pass(`minimal bill ${minimalBill} == pin 7797 (kb_lookup's zero marginal cost holds)`);
+  if (minimalBill === 7970)
+    pass(`minimal bill ${minimalBill} == pin 7970 (kb_lookup's zero marginal cost holds)`);
   else
-    fail(`minimal bill ${minimalBill} != 7797 — something moved the resident surface`);
+    fail(`minimal bill ${minimalBill} != 7970 — something moved the resident surface`);
 }
 
 // ── (p) PROVENANCE ──────────────────────────────────────────────────────────

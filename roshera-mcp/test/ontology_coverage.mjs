@@ -12,8 +12,8 @@
 // set of tools that took the fallback path, and every member must be on the
 // allowlist below (each with a structural justification) or this gate fails.
 //
-// Node-runnable WITHOUT a live backend; exercises the compiled dist/ directly
-// (build first: `npm run build`).
+// Node-runnable WITHOUT a live backend; exercises the gate build in test/.build
+// (build first: `npm run test:gates:build`; never the deployable dist/).
 //
 //   (o0) census            — tools-per-bench counts + total, printed so drift
 //        is visible as a number, not only as pass/fail
@@ -42,9 +42,9 @@
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
-import { buildTable, META_SURFACE } from "../dist/surface.js";
-import { metaFor, explicitBenchTable } from "../dist/registry.js";
-import { SWITCHABLE_BENCHES } from "../dist/workbench.js";
+import { buildTable, META_SURFACE } from "./.build/surface.js";
+import { metaFor, explicitBenchTable } from "./.build/registry.js";
+import { SWITCHABLE_BENCHES } from "./.build/workbench.js";
 
 let failures = 0;
 const fail = (m) => {
@@ -169,7 +169,8 @@ console.log("(o3) ratchet floor (encodes observed reality, never aspiration)");
 // from 109 by document_rename, "core" — PATCH /api/documents/{id}). A shrink
 // below the floor means tools were removed without this gate hearing about it;
 // growth passes and should then RAISE the floor to the new measurement.
-const FLOOR_TOTAL = 111;
+// Raised 111 → 112 (2026-09-24, audit Task 93): part_rename (a3ab6b9e, "core").
+const FLOOR_TOTAL = 112;
 if (names.length >= FLOOR_TOTAL)
   pass(`registry size ${names.length} ≥ floor ${FLOOR_TOTAL}`);
 else
@@ -217,11 +218,17 @@ console.log("(o5) MCP↔backend bench parity (parsed from agent_registry.rs, no 
   // backend row either. Its row was added and this entry removed — and the
   // both-directions hygiene check is what forced the removal rather than
   // letting a now-false allowlist entry linger.
-  const BACKEND_ABSENT = {
-    workbench: "composition tool (bench-switch controller) — MCP-side only, not a kernel op",
-    cad_program: "composition tool (batch dispatcher) — MCP-side only, not a kernel op",
-    ask_choice: "notebook/choice-card builder — MCP-side only, not a kernel op",
-  };
+  //
+  // The same hygiene check then caught the last three entries: workbench,
+  // cad_program and ask_choice were allowlisted here as "MCP-side only", and
+  // b4231410 (2026-08-21) gave all three backend rows (Core, Core, Labels —
+  // the benches BENCH_OF already gives them) when the Rust-side coverage test
+  // began reading BENCH_OF instead of a hand-kept copy. This file was in no
+  // gate, so it stayed red for a month naming them. The allowlist is now
+  // empty: every MCP-classified tool has a backend row and is bench-compared
+  // below. A new MCP-only tool must either get a row or be listed here with
+  // a reason — the uncovered-name check below fails until one is done.
+  const BACKEND_ABSENT = {};
 
   const backendPath = path.join(
     path.dirname(fileURLToPath(import.meta.url)),
@@ -308,6 +315,11 @@ console.log("(o5) MCP↔backend bench parity (parsed from agent_registry.rs, no 
       fail(
         `'${n}' is classified '${explicit[n]}' in BENCH_OF but has no row in agent_registry.rs, and is not ` +
           `on the BACKEND_ABSENT allowlist — either add it to the backend table or allowlist it here with a reason`,
+      );
+    if (uncoveredMcpOnly.length === 0)
+      pass(
+        `every one of the ${mcpNames.size} MCP-classified tools has a backend row ` +
+          `or a BACKEND_ABSENT reason (${Object.keys(BACKEND_ABSENT).length} allowlisted)`,
       );
 
     // Every backend-parsed name must have SOME MCP classification (the

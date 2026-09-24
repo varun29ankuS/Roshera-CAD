@@ -319,6 +319,10 @@ jobs:
         filters: |
           mcp:
             - 'roshera-mcp/**'
+            # ontology_coverage.mjs (test:drift) parses this file for the
+            # MCP<->backend bench-parity check. b4231410 changed ONLY this
+            # file and turned that test red, unseen by an mcp-only filter.
+            - 'roshera-backend/api-server/src/agent_registry.rs'
 
     - name: Setup Node.js
       if: steps.filter.outputs.mcp == 'true'
@@ -341,11 +345,21 @@ jobs:
         npm run build
       working-directory: ./roshera-mcp
 
-    - name: Run green MCP tests
+    - name: Run MCP drift tests
       if: steps.filter.outputs.mcp == 'true'
-      # scale_s2.mjs guards the S2 scale invariants (surface flip 18/90,
-      # meta-tool validation parity, find_tool ranking, TS<->Rust FNV-1a-64
-      # registry hash) against the built dist — fully offline, no backend.
+      # `npm run test:drift` compiles src/ to test/.build and runs the four
+      # suites that pin the tool SURFACE — fully offline, no backend:
+      #   scale_s2.mjs          S2 invariants (table/minimal/full counts,
+      #                         meta-tool validation parity, find_tool ranking,
+      #                         TS<->Rust FNV-1a-64 registry hash, bill < 8000)
+      #   kb_lookup.mjs         the exact resident token bill + kb_lookup's
+      #                         reference/provenance contract
+      #   find_tool_heldout.mjs held-out find_tool recall ratchet floors
+      #   ontology_coverage.mjs every tool benched, and MCP<->backend bench
+      #                         parity against agent_registry.rs
+      # Only scale_s2 ran here before, against dist/; the other three were in
+      # no gate and all four sat red for weeks (audit Task 93). They read
+      # test/.build, not dist/, so they measure the source being merged.
       #
       # test/auto_feedback.mjs is EXCLUDED on purpose: its STATIC half greps a
       # monolithic src/index.ts for per-tool server.tool() blocks + okp() /
@@ -353,7 +367,7 @@ jobs:
       # of index.ts into per-domain tools/*.ts modules behind the ToolTable, so
       # those assertions are stale/red. It is tracked separately from this gate;
       # wiring it in here would fail CI on a known-stale test, not a regression.
-      run: node test/scale_s2.mjs
+      run: npm run test:drift
       working-directory: ./roshera-mcp
 
     - name: Run constraint-gate suites
