@@ -2451,11 +2451,124 @@ async fn create_geometry_fast_flag_returns_only_lightweight_perception() {
         perception.get("cert").is_none(),
         "`fast` must NOT run the full certificate; perception = {perception}"
     );
+    // The display-mesh counts are still MEASURED on this path — under names
+    // that say which mesh they were measured on, never under the certificate's
+    // own `open_edges` key (which the seed used to fill with a fabricated 0).
     assert!(
-        perception.get("open_edges").is_some(),
-        "the lightweight perception must still report mesh counts; \
-         perception = {perception}"
+        perception["display_mesh_open_edges"].is_u64()
+            && perception["display_mesh_nonmanifold_edges"].is_u64(),
+        "the lightweight perception must still report the measured display-mesh \
+         counts; perception = {perception}"
     );
+}
+
+/// Keys that state a certificate verdict (or a count the certificate owns). A
+/// response whose full certificate did not run must carry NONE of them — not
+/// `sound: true` from B-Rep validity alone, not `open_edges: 0` for an edge
+/// count nobody took.
+const CERT_ONLY_KEYS: &[&str] = &[
+    "sound",
+    "valid",
+    "watertight",
+    "open_edges",
+    "nonmanifold_edges",
+    "manifold",
+    "oriented",
+    "self_intersection_free",
+    "cert",
+];
+
+/// The shape a `fast: true` mutating response's perception block must have:
+/// the B-Rep check it really ran, an explicit `certificate: "not_run"`
+/// marker, a verdict that SAYS no soundness verdict was reached, and no key
+/// from [`CERT_ONLY_KEYS`].
+fn assert_perception_claims_no_uncomputed_verdict(perception: &Value) {
+    for key in CERT_ONLY_KEYS {
+        assert!(
+            perception.get(*key).is_none(),
+            "the full certificate did not run, so `{key}` must be absent (a \
+             value there is a verdict or a count nobody computed); \
+             perception = {perception}"
+        );
+    }
+    assert_eq!(
+        perception["certificate"].as_str(),
+        Some("not_run"),
+        "a response that skipped the certificate must say so; perception = {perception}"
+    );
+    assert_eq!(
+        perception["brep_valid"].as_bool(),
+        Some(true),
+        "the B-Rep check DID run and must still be reported; perception = {perception}"
+    );
+    let verdict = perception["verdict"]
+        .as_str()
+        .expect("the not-run perception must still carry a verdict string");
+    assert!(
+        verdict.contains("certificate NOT run") && !verdict.starts_with("OK"),
+        "the verdict must state that no soundness verdict was reached; verdict = {verdict:?}"
+    );
+    assert!(
+        !verdict.contains("  "),
+        "verdict text must not carry absorbed indentation; verdict = {verdict:?}"
+    );
+}
+
+/// RED-first (audit 2026-09-03, Task 67): a `fast: true` CREATE response
+/// never carries `"sound": true` (or any certificate-owned key) — the seed
+/// used to write `sound`/`watertight` from B-Rep validity and `open_edges: 0`
+/// without measuring, under the certificate's own field names.
+#[tokio::test]
+async fn fast_create_response_claims_no_verdict_it_did_not_compute() {
+    let state = make_test_state().await;
+    let (status, body) = dispatch(&state, create_box_post(10.0, true)).await;
+    assert_eq!(status, StatusCode::OK, "box create must 200; body = {body}");
+    assert_perception_claims_no_uncomputed_verdict(&body["perception"]);
+}
+
+/// RED-first (Task 67): the same for a `fast: true` BOOLEAN — the exact call
+/// `boolean_many` / `drill_pattern` made per step, whose embedded seed the MCP
+/// per-step halt gate then read as a certified verdict.
+#[tokio::test]
+async fn fast_boolean_response_claims_no_verdict_it_did_not_compute() {
+    let state = make_test_state().await;
+    let (bs, bbody) = dispatch(
+        &state,
+        json_post(
+            "/api/geometry/box",
+            json!({"width": 20.0, "depth": 20.0, "height": 20.0}),
+        ),
+    )
+    .await;
+    assert_eq!(bs, StatusCode::OK, "box create must 200; body = {bbody}");
+    let box_uuid = bbody["object"]["id"].as_str().expect("box id").to_string();
+    let (cs, cbody) = dispatch(
+        &state,
+        json_post(
+            "/api/geometry/cylinder",
+            json!({"center": [0.0, 0.0, -30.0], "axis": [0.0, 0.0, 1.0],
+                   "radius": 3.0, "height": 80.0, "fast": true}),
+        ),
+    )
+    .await;
+    assert_eq!(
+        cs,
+        StatusCode::OK,
+        "cylinder create must 200; body = {cbody}"
+    );
+    assert_perception_claims_no_uncomputed_verdict(&cbody["perception"]);
+    let cyl_uuid = cbody["object"]["id"].as_str().expect("cyl id").to_string();
+    let (os, obody) = dispatch(
+        &state,
+        json_post(
+            "/api/geometry/boolean",
+            json!({"operation": "difference", "object_a": box_uuid,
+                   "object_b": cyl_uuid, "fast": true}),
+        ),
+    )
+    .await;
+    assert_eq!(os, StatusCode::OK, "boolean must 200; body = {obody}");
+    assert_perception_claims_no_uncomputed_verdict(&obody["perception"]);
 }
 
 /// Seed a sound `size`-box solid whose linked CONSTRUCTION geometry has DRIFTED
@@ -2615,12 +2728,33 @@ async fn part_perception_endpoint_full_by_default_lightweight_with_fast() {
         body.get("cert").is_none(),
         "?fast=1 must NOT run the full certificate; body = {body}"
     );
-    // Lightweight `sound` is the B-Rep-only flag (valid → true), proving the
-    // fast path is genuinely the cheaper, shallower verdict.
+    // The fast path reports the B-Rep check it ran under its own name and NO
+    // `sound` key: B-Rep validity is not the soundness verdict (Task 67 — this
+    // assertion used to pin `sound: true` on a box whose full certificate says
+    // UNSOUND, the lie itself).
+    assert!(
+        body.get("sound").is_none(),
+        "?fast=1 must not state a soundness verdict it did not compute; body = {body}"
+    );
     assert_eq!(
-        body["sound"].as_bool(),
+        body["brep_valid"].as_bool(),
         Some(true),
-        "fast path reports the shallow B-Rep verdict (valid box → true); body = {body}"
+        "fast path reports the B-Rep check it ran (valid box → true); body = {body}"
+    );
+    assert_eq!(
+        body["certificate"].as_str(),
+        Some("not_run"),
+        "fast path must mark the certificate as not run; body = {body}"
+    );
+    // The same not-run contract as a `fast: true` mutating response: no key
+    // the certificate owns — the export-mesh measurements travel under names
+    // that say which mesh they were taken on.
+    assert_perception_claims_no_uncomputed_verdict(&body);
+    assert!(
+        body["export_mesh_open_edges"].is_u64()
+            && body["export_mesh_nonmanifold_edges"].is_u64()
+            && body["export_mesh_watertight"].is_boolean(),
+        "?fast=1 must still report its measured export-mesh facts; body = {body}"
     );
 }
 
@@ -5084,13 +5218,17 @@ async fn fast_perception_reports_never_verified_as_an_honest_state_not_a_refusal
         Some(false),
         "a never-verified solid must read back verified:false; body = {body}"
     );
-    // The fast path's `sound` keeps its existing B-Rep-validity meaning —
-    // a fresh box IS a valid B-Rep even though no full certificate has run.
+    // A fresh box IS a valid B-Rep, and that is reported as `brep_valid` —
+    // never as `sound`, which on a never-verified solid would be a verdict
+    // no certificate reached (Task 67).
+    assert!(
+        body.get("sound").is_none(),
+        "fast path must not state a soundness verdict; body = {body}"
+    );
     assert_eq!(
-        body["sound"].as_bool(),
+        body["brep_valid"].as_bool(),
         Some(true),
-        "fast-path `sound` must not be repurposed by the staleness fields; \
-         body = {body}"
+        "fast path reports the B-Rep check it ran; body = {body}"
     );
 
     // After the explicit full verification (`?full=1` / default, what
@@ -9747,9 +9885,9 @@ async fn fidelity_survives_the_fast_certificate_opt_out() {
     .await;
     assert_eq!(status, StatusCode::OK, "fast loft must 200; body = {body}");
     // `fast: true` skips the FULL-certificate block — `cert` (the per-check
-    // breakdown `certified_response` inlines) is what disappears. The cheap
-    // perception block's own `sound`/`verdict` are always present, so `cert` is
-    // the honest marker that the expensive path really was skipped.
+    // breakdown `certified_response` inlines) is what disappears, together
+    // with every other certificate-owned key; `cert` is the marker checked
+    // here that the expensive path really was skipped.
     assert!(
         body["perception"]
             .as_object()

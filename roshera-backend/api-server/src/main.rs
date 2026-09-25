@@ -1079,18 +1079,23 @@ fn mesh_open_nonmanifold(mesh: &geometry_engine::tessellation::TriangleMesh) -> 
     (open, nm)
 }
 
-/// FEEDBACK-AS-DEFAULT: the LIGHTWEIGHT perception SEED — open/nonmanifold off
-/// the mesh in hand, valid B-Rep (`validate_solid_scoped`), provenance, and
-/// world dims (`solid_world_bbox`). The inner core every mutating endpoint
-/// embeds. Its `sound`/`watertight`/`verdict` fields are PROVISIONAL — the
-/// DEFAULT path ([`certified_response`]) ALWAYS overwrites them with the FULL
-/// kernel certificate (`is_sound()`), so the kernel can never hand back a solid
-/// without its full soundness verdict. This seed is never returned on its own.
+/// FEEDBACK-AS-DEFAULT: the LIGHTWEIGHT perception SEED — B-Rep validity
+/// (`validate_solid_scoped`, reported as `brep_valid`), provenance, and world
+/// dims (`solid_world_bbox`). The inner core every mutating endpoint embeds.
+///
+/// It states NO verdict and no edge count: B-Rep validity is ONE conjunct of
+/// soundness, not soundness, and an edge count is a measurement. The seed IS
+/// returned on its own — [`certified_response`] with `full == false` (the
+/// `"fast": true` opt-out) — so every verdict-bearing key is added by the
+/// caller from what it actually computed: [`insert_full_certificate`] when the
+/// certificate ran, [`insert_certificate_not_run`] when it did not.
+///
+/// Returns the seed and the B-Rep validity it measured (the reconcile
+/// fingerprint's second input).
 fn perception_json(
     model: &geometry_engine::primitives::topology_builder::BRepModel,
     solid_id: geometry_engine::primitives::solid::SolidId,
-    mesh: &geometry_engine::tessellation::TriangleMesh,
-) -> serde_json::Value {
+) -> (serde_json::Value, bool) {
     let valid = geometry_engine::primitives::validation::validate_solid_scoped(
         model,
         solid_id,
@@ -1102,32 +1107,6 @@ fn perception_json(
         let s = b.size();
         vec![s.x, s.y, s.z]
     });
-    // SOUND + WATERTIGHT verdict (feedback-as-default): the authoritative answer to
-    // "is this a real, closed, manufacturable solid?" is the EXACT B-Rep validity
-    // (`validate_solid_scoped`, Standard level — which already enforces shell
-    // closure AND correctly tolerates periodic seams, so cylinders/tori pass).
-    // This is mesh-INDEPENDENT, so `watertight` is reported off the B-Rep, not off
-    // the tessellation. That decoupling is what lets the live broadcast use the
-    // coarse `display()` mesh for speed without ever flashing a false
-    // "not watertight": a sound solid is closed by definition (open=0, nm=0).
-    //
-    // The display mesh is consulted ONLY for the export-quality hint in the verdict
-    // string (does the coarse preview have T-junctions?) — never for the soundness
-    // signal. A valid solid whose tessellation has T-junctions is NOT broken (the
-    // unsound-eye trap, KNOWN_BUGS #65 / EYE-SOUND).
-    let (mesh_open, mesh_nm) = mesh_open_nonmanifold(mesh);
-    let mesh_clean = mesh_open == 0 && mesh_nm == 0;
-    let verdict = if !valid {
-        "BROKEN — B-Rep invalid (a real topological defect)"
-    } else if mesh_clean {
-        "OK — valid closed solid; display mesh watertight"
-    } else {
-        "OK — valid closed solid; display mesh coarsened for live view (artifacts are not defects)"
-    };
-    // `watertight`/`open_edges`/`nonmanifold_edges` report the B-Rep TRUTH: a sound
-    // solid is closed (0/0). When unsound, surface the display-mesh counts as a
-    // best-effort diagnostic of where the boundary opened up.
-    let (open, nm) = if valid { (0, 0) } else { (mesh_open, mesh_nm) };
     // PILLAR 1 — ground-truth provenance on every build response: WHAT operation
     // made this solid and whether it is a designed surface vs a bare primitive
     // stand-in. Cheap O(1) sidecar lookup (no extra tessellation). The full
@@ -1140,22 +1119,87 @@ fn perception_json(
             "inputs":     p.inputs,
         })
     });
-    serde_json::json!({
-        "sound":             valid,
-        "valid":             valid,
+    let seed = serde_json::json!({
         // B-Rep topology validity, reported explicitly so a caller (and the MCP
         // `import_step` surface) always has the mesh-independent half even on
-        // the lightweight seed. When the full certificate runs (`certified_response`
-        // with `full`), `sound`/`watertight` are overwritten with the TRUE mesh
-        // verdict while `brep_valid` stays this topology-only flag.
+        // the lightweight seed. When the full certificate runs it is
+        // overwritten with the certificate's own `brep_valid` (the same check).
         "brep_valid":        valid,
-        "verdict":           verdict,
-        "watertight":        valid,
-        "open_edges":        open,
-        "nonmanifold_edges": nm,
         "dims":              dims,
         "provenance":        provenance,
-    })
+    });
+    (seed, valid)
+}
+
+/// The FULL-certificate half of a mutating op's perception block: the
+/// authoritative `sound` (`is_sound()`), each conjunct under its own name, the
+/// certificate's own measured edge counts, and the per-check breakdown under
+/// `cert`. `valid` is the seed's B-Rep validity, kept under its historical key
+/// on this path only — it rides BESIDE `sound`, which is the verdict.
+fn insert_full_certificate(
+    map: &mut serde_json::Map<String, serde_json::Value>,
+    cert: &geometry_engine::primitives::provenance::ValidityCertificate,
+    valid: bool,
+) {
+    let sound = cert.is_sound();
+    map.insert("sound".into(), serde_json::json!(sound));
+    map.insert("valid".into(), serde_json::json!(valid));
+    map.insert("brep_valid".into(), serde_json::json!(cert.brep_valid));
+    map.insert("watertight".into(), serde_json::json!(cert.watertight));
+    map.insert("manifold".into(), serde_json::json!(cert.manifold));
+    map.insert("oriented".into(), serde_json::json!(cert.oriented));
+    map.insert(
+        "self_intersection_free".into(),
+        serde_json::json!(cert.self_intersection_free),
+    );
+    // The certificate's OWN measured counts (its certification-chord mesh).
+    // These used to come from the seed, which wrote `(0, 0)` for any B-Rep-
+    // valid solid without measuring — so a solid the certificate found open
+    // reported `open_edges: 0` beside `watertight: false`.
+    map.insert("open_edges".into(), serde_json::json!(cert.boundary_edges));
+    map.insert(
+        "nonmanifold_edges".into(),
+        serde_json::json!(cert.nonmanifold_edges),
+    );
+    let verdict = if sound {
+        VERDICT_SOUND
+    } else {
+        VERDICT_UNSOUND
+    };
+    map.insert("verdict".into(), serde_json::json!(verdict));
+    map.insert("cert".into(), certificate_json(cert));
+}
+
+/// The NOT-RUN half: what a `"fast": true` response says instead of a verdict.
+///
+/// No `sound`, `watertight`, `valid`, `open_edges` or `nonmanifold_edges` key —
+/// absent, because nothing computed them (a reader that falls back from `sound`
+/// to `valid` finds neither). An explicit `certificate: "not_run"` marker, a
+/// verdict string that says no soundness verdict was reached, and the
+/// display-mesh counts that WERE measured, under names that say which mesh they
+/// were measured on (the coarse live-view tessellation, whose T-junctions are
+/// not defects — KNOWN_BUGS #65 / EYE-SOUND).
+fn insert_certificate_not_run(
+    map: &mut serde_json::Map<String, serde_json::Value>,
+    valid: bool,
+    mesh: &geometry_engine::tessellation::TriangleMesh,
+) {
+    let (mesh_open, mesh_nm) = mesh_open_nonmanifold(mesh);
+    map.insert("certificate".into(), serde_json::json!(CERTIFICATE_NOT_RUN));
+    let verdict = if valid {
+        VERDICT_CERT_NOT_RUN
+    } else {
+        VERDICT_BREP_INVALID_CERT_NOT_RUN
+    };
+    map.insert("verdict".into(), serde_json::json!(verdict));
+    map.insert(
+        "display_mesh_open_edges".into(),
+        serde_json::json!(mesh_open),
+    );
+    map.insert(
+        "display_mesh_nonmanifold_edges".into(),
+        serde_json::json!(mesh_nm),
+    );
 }
 
 /// Serialize a computed [`ValidityCertificate`](geometry_engine::primitives::provenance::ValidityCertificate)
@@ -1381,6 +1425,22 @@ fn attach_fidelity(
 pub const VERDICT_SOUND: &str = "SOUND — full kernel certificate clean (closed, manifold, self-intersection-free, mesh-quality-clean)";
 /// See [`VERDICT_SOUND`].
 pub const VERDICT_UNSOUND: &str = "UNSOUND — full kernel certificate flags a defect (see cert)";
+/// The verdict string of a response whose full certificate did NOT run (the
+/// `"fast": true` / `?fast=1` opt-out) over a B-Rep-valid solid: it names the
+/// absence of a verdict instead of reading as one.
+pub const VERDICT_CERT_NOT_RUN: &str = concat!(
+    "NO VERDICT — full kernel certificate NOT run (fast opt-out); B-Rep validity ",
+    "is one conjunct of soundness, not soundness. Call verify_part for the verdict"
+);
+/// The not-run verdict over a B-Rep-INVALID solid: the one conjunct that was
+/// checked failed, which is stated; the certificate still did not run.
+pub const VERDICT_BREP_INVALID_CERT_NOT_RUN: &str = concat!(
+    "BROKEN — B-Rep invalid (a real topological defect); full kernel ",
+    "certificate NOT run (fast opt-out)"
+);
+/// Value of the `certificate` marker on a perception block whose full
+/// certificate did not run.
+pub const CERTIFICATE_NOT_RUN: &str = "not_run";
 
 /// ★ **THE UNSOUND-BASE GATE.** Refuse a mutating operation whose base solid
 /// is unsound by the kernel's LIVE verdict.
@@ -1494,9 +1554,14 @@ pub(crate) async fn refuse_unsound_base(
 /// is free. `certificate_json` carries the per-check breakdown so a caller can
 /// see exactly WHAT was verified.
 ///
-/// `full` (the `"verify": true` body flag) additionally inlines the full cert
-/// JSON breakdown under `cert`; the top-level `sound`/`watertight`/`verdict` are
-/// the authoritative full-certificate answer in BOTH modes.
+/// `full` is `true` unless the body opted out with `"fast": true`
+/// ([`body_verify_flag`]). When `true`, the top-level `sound`/`watertight`/
+/// `verdict` are the full-certificate answer and `cert` carries the breakdown.
+/// When `false`, the certificate did NOT run and the block carries NO verdict
+/// key at all — `certificate: "not_run"`, `brep_valid`, a verdict string that
+/// says no verdict was reached, and display-mesh counts under their own names
+/// ([`insert_certificate_not_run`]). It never states `sound` from B-Rep
+/// validity alone.
 ///
 /// Takes `&mut model` because `certify_solid` warms the per-face centroid cache
 /// (D4 label selectors) and `calculate_solid_volume` warms the mass-props cache;
@@ -1525,7 +1590,7 @@ fn certified_response(
     full: bool,
     durability: Option<durability::DurabilityStatus>,
 ) -> serde_json::Value {
-    let mut base = perception_json(model, solid_id, mesh);
+    let (mut base, valid) = perception_json(model, solid_id);
 
     // CHEAP structural facts (O(n)): the agent's fast "what is this" signal.
     // `calculate_solid_volume` hits the per-solid mass-props cache; `face_count`
@@ -1544,7 +1609,7 @@ fn certified_response(
     // Task 9 must match.
     let fingerprint = perception_fingerprint(
         solid_id,
-        base.get("valid").and_then(|v| v.as_bool()).unwrap_or(false),
+        valid,
         face_count.unwrap_or(0) as u64,
         volume.unwrap_or(0.0),
     );
@@ -1556,28 +1621,15 @@ fn certified_response(
     // part (release) is acceptable on the hot path; the O(n) spatial-hash
     // self-intersection pass no longer hangs. Callers that genuinely need lower
     // latency opt OUT via `"fast": true` in the request body, which skips this
-    // block and returns only the lightweight perception block.
+    // block: the response then carries the seed plus an explicit NOT-RUN
+    // marker and NO verdict key (see `insert_certificate_not_run`).
     if full {
         let cert = model.certify_solid(solid_id);
-        let sound = cert.is_sound();
         if let serde_json::Value::Object(map) = &mut base {
-            map.insert("sound".into(), serde_json::json!(sound));
-            map.insert("brep_valid".into(), serde_json::json!(cert.brep_valid));
-            map.insert("watertight".into(), serde_json::json!(cert.watertight));
-            map.insert("manifold".into(), serde_json::json!(cert.manifold));
-            map.insert("oriented".into(), serde_json::json!(cert.oriented));
-            map.insert(
-                "self_intersection_free".into(),
-                serde_json::json!(cert.self_intersection_free),
-            );
-            let verdict = if sound {
-                VERDICT_SOUND
-            } else {
-                VERDICT_UNSOUND
-            };
-            map.insert("verdict".into(), serde_json::json!(verdict));
-            map.insert("cert".into(), certificate_json(&cert));
+            insert_full_certificate(map, &cert, valid);
         }
+    } else if let serde_json::Value::Object(map) = &mut base {
+        insert_certificate_not_run(map, valid, mesh);
     }
 
     // Document-level durability disclosure — BESIDE the part-level `sound`/
@@ -9476,6 +9528,90 @@ mod tests {
             "bare box must produce not_applicable; got {:?}",
             v["eyes_consistent"]
         );
+    }
+
+    /// Task 67 — on the full-certificate path the top-level `open_edges` /
+    /// `nonmanifold_edges` are the CERTIFICATE's measured counts. The seed
+    /// used to write `(0, 0)` for any B-Rep-valid solid and the full path never
+    /// overwrote them, so an OPEN certificate over a B-Rep-valid solid read
+    /// `open_edges: 0` beside `watertight: false`. A real box certificate with
+    /// its counts set to that shape is the fixture (no live kernel op produces
+    /// B-Rep-valid-but-open on demand).
+    #[test]
+    fn full_certificate_edge_counts_are_the_certificates_own() {
+        use geometry_engine::primitives::topology_builder::{
+            BRepModel, GeometryId, TopologyBuilder,
+        };
+        let mut m = BRepModel::new();
+        let gid = TopologyBuilder::new(&mut m)
+            .create_box_3d(10.0, 10.0, 10.0)
+            .expect("box build must succeed");
+        let sid = match gid {
+            GeometryId::Solid(s) => s,
+            o => panic!("expected solid, got {o:?}"),
+        };
+        let mut cert = m.certify_solid(sid);
+        assert!(
+            cert.brep_valid,
+            "fixture precondition: the box B-Rep is valid"
+        );
+        cert.watertight = false;
+        cert.boundary_edges = 7;
+        cert.nonmanifold_edges = 3;
+
+        let (mut seed, valid) = perception_json(&m, sid);
+        assert!(
+            valid,
+            "fixture precondition: the seed measured a valid B-Rep"
+        );
+        let map = seed.as_object_mut().expect("the seed is a JSON object");
+        insert_full_certificate(map, &cert, valid);
+
+        assert_eq!(seed["open_edges"], serde_json::json!(7), "seed = {seed}");
+        assert_eq!(
+            seed["nonmanifold_edges"],
+            serde_json::json!(3),
+            "seed = {seed}"
+        );
+        assert_eq!(
+            seed["watertight"],
+            serde_json::json!(false),
+            "seed = {seed}"
+        );
+        assert_eq!(seed["sound"], serde_json::json!(false), "seed = {seed}");
+    }
+
+    /// Task 67 — the seed alone states no verdict and no edge count: every
+    /// such key is added by the caller from what it computed.
+    #[test]
+    fn perception_seed_states_no_verdict() {
+        use geometry_engine::primitives::topology_builder::{
+            BRepModel, GeometryId, TopologyBuilder,
+        };
+        let mut m = BRepModel::new();
+        let gid = TopologyBuilder::new(&mut m)
+            .create_box_3d(10.0, 10.0, 10.0)
+            .expect("box build must succeed");
+        let sid = match gid {
+            GeometryId::Solid(s) => s,
+            o => panic!("expected solid, got {o:?}"),
+        };
+        let (seed, valid) = perception_json(&m, sid);
+        assert!(valid);
+        for key in [
+            "sound",
+            "valid",
+            "watertight",
+            "open_edges",
+            "nonmanifold_edges",
+            "verdict",
+        ] {
+            assert!(
+                seed.get(key).is_none(),
+                "seed must not carry `{key}`; seed = {seed}"
+            );
+        }
+        assert_eq!(seed["brep_valid"], serde_json::json!(true), "seed = {seed}");
     }
 
     // Task 8 — perception_fingerprint is mesh-independent and field-sensitive.

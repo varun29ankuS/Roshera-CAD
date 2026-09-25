@@ -250,18 +250,21 @@ export async function api(
   }
   const parsed = text.length ? JSON.parse(text) : null;
   // EMBEDDED-PERCEPTION REUSE (no redundant round-trip / no double cert). Every
-  // mutating geometry endpoint already embeds its CHEAP perception verdict
-  // (brep_valid, watertight/open_edges, dims, volume, face_count — and the FULL
-  // `cert` only on the explicit `verify:true` opt-in path). Stash it so the
-  // following perceive() reuses THIS verdict instead of firing a second
-  // GET /perception. We only stash for mutating verbs; GETs (including
-  // /perception itself) never overwrite the stash.
+  // mutating geometry endpoint embeds a perception block: by DEFAULT the FULL
+  // certificate (`sound` + `cert`), and on the `fast: true` opt-out only the
+  // seed (`brep_valid`, `certificate: "not_run"`, NO verdict). Stash it so the
+  // following perceive() reuses a CERTIFIED verdict instead of firing a second
+  // GET /perception — and knows when the block was NOT a certificate, so it
+  // fetches one instead. A body carrying a perception block always replaces
+  // the stash (so a stale verdict for the same id cannot outlive a newer
+  // uncertified op); GETs and perception-less POSTs never touch it.
   if (method !== "GET" && parsed && typeof parsed === "object") {
     const embedded = perceptionFromBody(parsed);
     if (embedded !== undefined) {
       lastEmbeddedPerception = {
         id: parsed.solid_id ?? parsed.id ?? null,
-        perception: embedded,
+        perception: embedded.perception,
+        certified: embedded.certified,
       };
     }
   }
@@ -373,40 +376,53 @@ export function formatVolume(mm3: number): string {
  * `perceive()` consumes this in preference to re-fetching /perception, so the
  * agent sees the SAME verdict the REST op computed — never a redundant re-fetch.
  */
-let lastEmbeddedPerception: { id: number | null; perception: any } | null = null;
+let lastEmbeddedPerception: {
+  id: number | null;
+  perception: any;
+  /** True only when the block carried the FULL certificate (`cert`). */
+  certified: boolean;
+} | null = null;
 
 /**
- * Project a raw mutating response into the shape `perceive()` returns, reusing
- * the verdict the endpoint already embedded.
+ * Project a raw mutating response into the shape `perceive()` returns, and say
+ * whether it is a CERTIFIED verdict.
  *
- * The DEFAULT (sub-second) op response carries the CHEAP verdict inline
- * (`sound`/`valid`, `watertight`, `open_edges`, `dims`, `volume`, `face_count`)
- * and NO `cert`. The explicit `verify:true` opt-in additionally embeds the FULL
- * `cert`. We build a perception from whichever is present, preferring the full
- * cert's fields when it is. Returns `undefined` only when the response carries no
- * usable verdict at all (a server too old to perceive) — then the caller falls
- * back to the live GET /perception fetch (which is itself cheap by default).
+ * It is certified only when the full `cert` rode with it — which the DEFAULT
+ * op response always carries (`certified_response` in api-server main.rs). A
+ * block without `cert` is the `fast: true` seed: B-Rep validity is one
+ * conjunct of soundness, not soundness, so such a block has NO verdict here
+ * (`sound: null`), whatever its keys say — an older server wrote `sound` from
+ * B-Rep validity alone on exactly that path. perceive() then fetches the real
+ * certificate instead of reusing this block. Returns `undefined` when the
+ * response carries no perception block at all.
  *
  * The expensive certificate dimensions (manifold, shells_outward,
  * self_intersection_free, tessellation/mesh-quality) are present ONLY when a
- * full `cert` was embedded;
- * otherwise they are reported `null`, signalling "not computed on the hot path —
- * call verify_part / ground_truth to certify". They are never fabricated.
+ * full `cert` was embedded; otherwise they are reported `null` ("not
+ * computed"). They are never fabricated.
  */
-function perceptionFromBody(r: any): any {
+function perceptionFromBody(r: any): { perception: any; certified: boolean } | undefined {
   if (!r || typeof r !== "object") return undefined;
   const cert = r.cert ?? r.perception?.cert ?? null;
   const soundRaw = r.sound ?? r.perception?.sound;
-  const validRaw = r.valid ?? r.perception?.valid;
-  // Nothing to reuse — let perceive() fetch /perception.
-  if (cert === null && soundRaw === undefined && validRaw === undefined) {
+  const brepRaw = r.brep_valid ?? r.perception?.brep_valid ?? r.valid ?? r.perception?.valid;
+  const marker = r.certificate ?? r.perception?.certificate;
+  // No perception block at all — nothing to stash.
+  if (cert === null && soundRaw === undefined && brepRaw === undefined && marker === undefined) {
     return undefined;
   }
-  const sound = (soundRaw ?? validRaw) === true;
-  return {
+  const certified = cert !== null && typeof cert === "object" && marker !== "not_run";
+  // Certified: the embedded full verdict (the top-level `sound` IS `cert.sound`
+  // on that path). Uncertified: no verdict — never promoted from B-Rep validity.
+  const sound = certified ? (soundRaw ?? cert.sound) === true : null;
+  // Edge counts and watertightness from an uncertified block are not read: an
+  // older server wrote `open_edges: 0` / `watertight` there without measuring.
+  const fromCertified = (v: unknown) => (certified ? v : undefined);
+  const perception = {
     sound,
-    brep_valid: cert?.brep_valid ?? validRaw ?? null,
-    watertight: cert?.watertight ?? r.watertight ?? r.perception?.watertight ?? null,
+    brep_valid: cert?.brep_valid ?? brepRaw ?? null,
+    watertight:
+      cert?.watertight ?? fromCertified(r.watertight ?? r.perception?.watertight) ?? null,
     // Full-cert-only dimensions: null when no cert was embedded (cheap path) —
     // explicitly "not certified on the hot path", never a fabricated verdict.
     manifold: cert?.manifold ?? null,
@@ -423,9 +439,12 @@ function perceptionFromBody(r: any): any {
     // Dual-eye gate — null on cheap hot path (cert not run), real tri-state when
     // full cert is embedded (verify:true opt-in). Never fabricated.
     eyes_consistent: cert?.eyes_consistent ?? null,
-    open_edges: r.open_edges ?? r.perception?.open_edges ?? cert?.boundary_edges ?? null,
+    open_edges:
+      fromCertified(r.open_edges ?? r.perception?.open_edges) ?? cert?.boundary_edges ?? null,
     nonmanifold_edges:
-      r.nonmanifold_edges ?? r.perception?.nonmanifold_edges ?? cert?.nonmanifold_edges ?? null,
+      fromCertified(r.nonmanifold_edges ?? r.perception?.nonmanifold_edges) ??
+      cert?.nonmanifold_edges ??
+      null,
     dims: r.dims ?? r.perception?.dims ?? null,
     // Cheap structural facts the op now returns inline; backfilled by perceive()
     // from a light part GET only if absent.
@@ -460,10 +479,28 @@ function perceptionFromBody(r: any): any {
     // that deliberately omitted it (main.rs:1276-1279), would be the silent
     // pass this disclosure exists to end.
     fidelity: r.fidelity ?? r.perception?.fidelity ?? undefined,
-    verdict:
-      (r.verdict ?? r.perception?.verdict) ??
-      (sound ? "OK — valid closed solid (cheap verdict; verify_part to certify)" : "UNSOUND — see verify_part"),
+    verdict: certified
+      ? ((r.verdict ?? r.perception?.verdict) ??
+        (sound ? "SOUND — full kernel certificate clean" : "UNSOUND — see verify_part"))
+      : NO_VERDICT_TEXT,
   };
+  return { certified, perception };
+}
+
+/** The verdict text of a perception that carries no certified verdict. */
+const NO_VERDICT_TEXT =
+  "NO VERDICT — the full kernel certificate did not run for this result; verify_part to certify";
+
+/**
+ * The soundness verdict a perception-shaped body states, and nothing more:
+ * its `sound` when that is a boolean; `false` when it states no `sound` but
+ * its B-Rep check FAILED (an invalid B-Rep cannot be sound); otherwise `null`
+ * — no verdict. A valid B-Rep is never promoted to `sound: true`.
+ */
+export function statedSoundness(p: any): boolean | null {
+  if (typeof p?.sound === "boolean") return p.sound;
+  if (p?.brep_valid === false || p?.valid === false) return false;
+  return null;
 }
 
 export function ok(data: unknown) {
@@ -835,20 +872,25 @@ export async function perceive(partId: number | null): Promise<any> {
     lastPerceiveUnavailableReason = "ambient perception disabled (ROSHERA_MCP_AUTOVERIFY=0)";
     return undefined;
   }
+  // The op's own embedded block, when it describes this part. The stash matches
+  // when its id equals partId, or when the op did not report a solid_id
+  // (id === null) — then this single in-flight perception is unambiguously for
+  // the part just touched. Consumed either way.
+  const stashed =
+    lastEmbeddedPerception &&
+    (lastEmbeddedPerception.id === partId || lastEmbeddedPerception.id === null)
+      ? lastEmbeddedPerception
+      : null;
+  if (stashed) lastEmbeddedPerception = null;
   try {
-    // FAST PATH (no double certification): the mutating op that produced this
-    // part ALREADY ran the full certificate and embedded it in its response,
-    // which api() stashed. Reuse it verbatim — the `sound`/`cert` surfaced here
-    // are byte-identical to what the REST op computed. We never re-run
-    // certify_solid. The stash matches when its id equals partId, or when the
-    // op did not report a solid_id (id === null) — in which case this single
-    // in-flight perception is unambiguously for the part we just touched.
-    if (
-      lastEmbeddedPerception &&
-      (lastEmbeddedPerception.id === partId || lastEmbeddedPerception.id === null)
-    ) {
-      const p = lastEmbeddedPerception.perception;
-      lastEmbeddedPerception = null;
+    // REUSE PATH (no double certification) — ONLY when the op's response
+    // carried the FULL certificate (the default; `stashed.certified`). Then the
+    // `sound`/`cert` surfaced here are byte-identical to what the REST op
+    // computed, and certify_solid is not re-run. A `fast: true` response
+    // carried no certificate, so it is NOT reused as a verdict: control falls
+    // through to the GET below, which runs the real one.
+    if (stashed && stashed.certified) {
+      const p = stashed.perception;
       // Backfill face_count/volume only when the embedded perception didn't
       // already carry them (the cheap O(n) verdict now does). ONE light part GET
       // (read lock, no cert), short timeout — never blocks the op.
@@ -867,12 +909,12 @@ export async function perceive(partId: number | null): Promise<any> {
       }
       return p;
     }
-    // FALLBACK CHEAP-VERDICT channel: GET /perception (default) is the CHEAP,
-    // sub-second verdict — B-Rep validity + coarse mesh counts + dims, no O(n²)
-    // certificate. `cert` is absent here (it's the explicit verify_part /
-    // ground_truth path now), so manifold / self-intersection / mesh-quality
-    // report `null` = "not certified on the hot path". Short timeout: a slow
-    // perception is omitted, never blocks the op.
+    // FALLBACK channel: GET /perception, which by DEFAULT runs the FULL
+    // certificate (memoised per solid). `sound` is taken only as the response
+    // states it (`statedSoundness`) — never promoted from `valid`. Short
+    // timeout: a slow perception returns `undefined` with a stated reason, and
+    // callers that gate on a verdict treat that as NO verdict (a halt), never
+    // as a pass.
     const p = await api(
       "GET",
       `/api/agent/parts/${partId}/perception`,
@@ -886,10 +928,10 @@ export async function perceive(partId: number | null): Promise<any> {
       PERCEPTION_TIMEOUT_MS,
     ).catch(() => null);
     const cert = p?.cert ?? null;
-    // `sound` is the full verdict when a cert is present (only via ?full), else
-    // the cheap B-Rep validity flag.
-    const sound = (p?.sound ?? p?.valid) === true;
-    const brepValid = cert?.brep_valid ?? p?.valid ?? null;
+    // `sound` is the verdict the response STATES; a response that states none
+    // is no verdict (`null`), never the B-Rep validity flag.
+    const sound = statedSoundness(p);
+    const brepValid = cert?.brep_valid ?? p?.brep_valid ?? p?.valid ?? null;
     const watertight = cert?.watertight ?? p?.watertight ?? null;
     const result: Record<string, unknown> = {
       sound,
@@ -920,23 +962,26 @@ export async function perceive(partId: number | null): Promise<any> {
       // (api-server/src/main.rs) now embeds `durability` under
       // `body.perception.durability` on a quarantined document, which
       // `perceptionFromBody`'s `r.perception?.durability` picks up.
-      durability: p?.durability ?? undefined,
+      // When the op's own response was an UNCERTIFIED block (`fast: true`),
+      // the verdict comes from this GET but the disclosures that block DID
+      // carry are not dropped: `durability`/`fidelity` ride on the op's own
+      // response (the read side has no fidelity producer), so they are carried
+      // over verbatim when this GET did not state them itself.
+      durability: p?.durability ?? stashed?.perception?.durability ?? undefined,
       // FIDELITY on the FALLBACK channel, for the same reason `durability` is
       // read on both paths: ONE perception shape, whichever fetch produced it.
-      // Stated honestly — today this can only ever be `undefined` here, because
       // `GET /api/agent/parts/{id}/perception` has no fidelity producer at all
-      // (the string `fidelity` does not occur anywhere in
-      // api-server/src/handlers/; the block is attached ONLY to a mutating op's
-      // own response, main.rs:4237/4456/5361/6026, which the FAST PATH above
-      // reuses). It is read here so that a read-side disclosure, if one is ever
-      // added, is not silently dropped a second time — never defaulted, so an
-      // absent block stays absent.
-      fidelity: p?.fidelity ?? undefined,
+      // (the block is attached ONLY to a mutating op's own response), so on
+      // this channel it is the uncertified op block's, carried over above —
+      // never defaulted, so an absent block stays absent.
+      fidelity: p?.fidelity ?? stashed?.perception?.fidelity ?? undefined,
       verdict:
         p?.verdict ??
-        (sound
-          ? "OK — valid closed solid (cheap verdict; verify_part to certify)"
-          : "UNSOUND — see verify_part"),
+        (sound === true
+          ? "SOUND — full kernel certificate clean"
+          : sound === false
+            ? "UNSOUND — see verify_part"
+            : NO_VERDICT_TEXT),
     };
     // X-ray is OFF the ambient hot path (n³ SDF) — opt in with
     // ROSHERA_AMBIENT_PERCEPTION=xray, or use the explicit occupancy_view tool.
@@ -1044,6 +1089,12 @@ export function compactVerdict(p: any): string {
     ? `⚠ DOCUMENT QUARANTINED (${p.durability.reason ?? "history incomplete — see p.durability"}) | `
     : "";
   const fidelityNote = fidelityPrefix(p?.fidelity);
+  // NO verdict is neither SOUND nor UNSOUND: a perception that states no
+  // `sound` (the certificate did not run) says so, naming any conjunct that
+  // was checked and FAILED — an invalid B-Rep still reads as a failure.
+  if (p?.sound == null && failed.length === 0) {
+    return `${durabilityNote}${fidelityNote}NO VERDICT — certificate not run for this result (verify_part to certify)${tail}`;
+  }
   if (p?.sound === true && failed.length === 0) {
     const verified = DIMS.filter(([k]) => p?.[k] === true).map(([, n]) => n);
     const suffix = unverified.length

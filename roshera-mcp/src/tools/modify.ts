@@ -42,6 +42,18 @@ export const ACK_UNSOUND = z
       "verdict is unsound (otherwise refused)",
   );
 
+/**
+ * Why a batch step halted, given what `perceive()` returned for it: a
+ * certified UNSOUND verdict, or NO verdict at all — perception unavailable
+ * (`perceptionField` names the stated reason: timeout, network error,
+ * autoverify disabled) or a response that stated no `sound`. Only a certified
+ * `sound: true` lets a batch continue.
+ */
+function stepHaltReason(p: any, noun: "base" | "part"): string {
+  if (p?.sound === false) return `left the ${noun} UNSOUND — ${compactVerdict(p)}`;
+  return `could not be certified, so the batch stopped here — ${perceptionField(p)}`;
+}
+
 export function registerModifyTools(server: ToolHost) {
   server.tool(
     "delete_part",
@@ -303,8 +315,11 @@ export function registerModifyTools(server: ToolHost) {
       try {
         let lastId: number | null = null;
         for (let i = 0; i < tools.length; i++) {
-          // fast:true skips the endpoint's own full cert — the perceive() below
-          // is the single certification gate per step (was 2× cert work/step).
+          // NO `fast: true`: the step's own response carries the FULL
+          // certificate, which the perceive() below reuses from the stash —
+          // ONE certification per step, under the op's own timeout. (With
+          // `fast: true` the response carried only the seed, and the gate read
+          // B-Rep validity as the verdict.)
           // acknowledge_unsound is forwarded on EVERY step: the backend gate
           // runs per-call on /api/geometry/boolean and gates BOTH operands, so
           // an acknowledged repair must carry the flag on each step, not just
@@ -313,20 +328,21 @@ export function registerModifyTools(server: ToolHost) {
             operation: op,
             object_a: base,
             object_b: tools[i],
-            fast: true,
             ...(acknowledge_unsound ? { acknowledge_unsound: true } : {}),
           });
           lastId = await newestPartId();
           const p = await perceive(lastId);
-          if (p && p.sound !== true) {
+          if (!p || p.sound !== true) {
             // A HALT: the call did not do what was asked, but steps 1..i+1
             // are applied — an error result that still names the live prefix.
+            // A step with NO verdict (perception unavailable, or a response
+            // that stated none) halts too: an uncertified step is not a pass.
             return typedErrorResult({
               object_uuid: base,
               part_id: lastId,
               completed: i + 1,
               of: tools.length,
-              halted: `step ${i + 1} (${tools[i]}) left the base UNSOUND — ${compactVerdict(p)}`,
+              halted: `step ${i + 1} (${tools[i]}) ${stepHaltReason(p, "base")}`,
             });
           }
         }
@@ -463,7 +479,8 @@ export function registerModifyTools(server: ToolHost) {
         }
         let lastId: number | null = null;
         for (let k = 0; k < bores.length; k++) {
-          // fast:true — perceive() below is the single per-hole cert gate.
+          // NO `fast: true`: the response carries the FULL certificate, which
+          // perceive() below reuses — the single per-hole cert gate.
           // A bore that misses the target surfaces the backend's typed
           // boolean_disjoint refusal — re-throw it naming WHICH hole missed
           // and where it was placed, so the agent can fix center/axis.
@@ -472,7 +489,6 @@ export function registerModifyTools(server: ToolHost) {
               operation: "difference",
               object_a: object,
               object_b: bores[k],
-              fast: true,
               ...(acknowledge_unsound ? { acknowledge_unsound: true } : {}),
             });
           } catch (e) {
@@ -484,15 +500,15 @@ export function registerModifyTools(server: ToolHost) {
           }
           lastId = await newestPartId();
           const pv = await perceive(lastId);
-          if (pv && pv.sound !== true) {
+          if (!pv || pv.sound !== true) {
             // A HALT: holes 1..k+1 are drilled and live — an error result
-            // that still names the applied prefix.
+            // that still names the applied prefix. No verdict halts too.
             return typedErrorResult({
               object_uuid: object,
               part_id: lastId,
               holes_completed: k + 1,
               of: count,
-              halted: `hole ${k + 1} left the part UNSOUND — ${compactVerdict(pv)}`,
+              halted: `hole ${k + 1} ${stepHaltReason(pv, "part")}`,
             });
           }
         }

@@ -119,8 +119,16 @@ export function makeClient(timeoutMs = 120000) {
       const cert = p?.cert ?? null;
       return {
         solid_id: id,
-        sound: (p?.sound ?? p?.valid) === true,
-        brep_valid: cert?.brep_valid ?? p?.valid ?? null,
+        // The verdict the response STATES: its `sound`, or `false` for a
+        // failed B-Rep check. A valid B-Rep alone is never read as sound
+        // (it is one conjunct of soundness); no stated verdict is `null`.
+        sound:
+          typeof p?.sound === "boolean"
+            ? p.sound
+            : p?.brep_valid === false || p?.valid === false
+              ? false
+              : null,
+        brep_valid: cert?.brep_valid ?? p?.brep_valid ?? p?.valid ?? null,
         watertight: cert?.watertight ?? p?.watertight ?? null,
         manifold: cert?.manifold ?? null,
         self_intersection_free: cert?.self_intersection_free ?? null,

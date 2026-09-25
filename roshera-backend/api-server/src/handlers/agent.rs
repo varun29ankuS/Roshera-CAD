@@ -2242,23 +2242,34 @@ pub async fn part_coverage(
 
 // ───────────────────── perception (feedback-as-default) ─────────────
 
-/// A part's self-reported soundness — watertight + valid + dims — queryable for
-/// ANY existing solid, not just at mutation time. Feedback-as-default: the agent
-/// (and the panel) can read current truth on demand without re-running the op.
+/// The `?fast=1` (certificate-NOT-run) perception of a part — B-Rep validity,
+/// export-mesh counts and dims — queryable for ANY existing solid without the
+/// full certificate.
+///
+/// It carries NO `sound` field: B-Rep validity is one conjunct of soundness,
+/// not soundness, and this path never runs the certificate that decides it
+/// (`certificate: "not_run"`). The verdict lives on the default path.
 #[derive(Debug, Clone, Serialize)]
 pub struct PartPerception {
     pub solid_id: u32,
-    /// AUTHORITATIVE verdict: the exact B-Rep validity (mesh-independent). This —
-    /// not `watertight` — is the sound answer to "is this a real solid?".
-    pub sound: bool,
-    /// Human/agent-readable one-liner derived from `sound` + the mesh check.
+    /// Always [`crate::CERTIFICATE_NOT_RUN`]: the marker that no soundness
+    /// verdict was computed for this response.
+    pub certificate: &'static str,
+    /// The exact B-Rep validity (`validate_solid_scoped`, Standard) — the one
+    /// check this path ran. Not the soundness verdict.
+    pub brep_valid: bool,
+    /// Human/agent-readable one-liner: says the certificate did not run, and
+    /// what the B-Rep check found.
     pub verdict: String,
-    /// Export-mesh watertightness (display/STL quality) — a valid solid can show
-    /// `false` here from tessellation T-junctions without being broken.
-    pub watertight: bool,
-    pub open_edges: usize,
-    pub nonmanifold_edges: usize,
-    pub valid: bool,
+    /// Export-mesh watertightness (display/STL quality), measured on the
+    /// export tessellation — a valid solid can show `false` here from
+    /// tessellation T-junctions without being broken. Named for the mesh it
+    /// was measured on, never the certificate's own `watertight`.
+    pub export_mesh_watertight: bool,
+    /// Export-mesh boundary / non-manifold edge counts, measured — likewise
+    /// never under the certificate's `open_edges` / `nonmanifold_edges`.
+    pub export_mesh_open_edges: usize,
+    pub export_mesh_nonmanifold_edges: usize,
     /// [L, W, H] world extents, or null if degenerate.
     pub dims: Option<[f64; 3]>,
 }
@@ -2358,19 +2369,20 @@ pub async fn part_perception(
         // which this report's own re-weld by position would otherwise hide.
         // `report.manifold` is `nonmanifold_edges == 0` by definition, so the
         // manifold half is unchanged. The raw counts still ship below as
-        // `open_edges`/`nonmanifold_edges` — facts, not verdicts.
+        // `export_mesh_open_edges`/`export_mesh_nonmanifold_edges` — facts,
+        // not verdicts.
         let mesh_watertight = report.closed && report.manifold;
-        let verdict = if !valid {
-            "BROKEN — B-Rep invalid (a real topological defect)".to_string()
-        } else if mesh_watertight {
-            "OK — valid closed solid; export mesh watertight".to_string()
+        // No soundness verdict is reached on this path — the string says so
+        // rather than reading "OK" off B-Rep validity (the shared constants
+        // are the ones a `"fast": true` mutating response carries).
+        let verdict = if valid {
+            crate::VERDICT_CERT_NOT_RUN.to_string()
         } else {
-            "OK — valid B-Rep; export mesh has tessellation artifacts only (not a defect)"
-                .to_string()
+            crate::VERDICT_BREP_INVALID_CERT_NOT_RUN.to_string()
         };
         // P1 (never-recomputing) staleness read — the read lock held here
-        // is enough; `soundness_reading` takes `&self`. `valid`/`watertight`
-        // above are live B-Rep/mesh facts, not the P1-gated certificate, so
+        // is enough; `soundness_reading` takes `&self`. `brep_valid` and the
+        // export-mesh facts above are live B-Rep/mesh facts, not the P1-gated certificate, so
         // they are reported regardless of `verified`.
         let reading = model
             .soundness_reading(sid)
@@ -2381,12 +2393,12 @@ pub async fn part_perception(
         // get the reconcile report.
         let mut perception_val = serde_json::to_value(PartPerception {
             solid_id: id,
-            sound: valid,
+            certificate: crate::CERTIFICATE_NOT_RUN,
+            brep_valid: valid,
             verdict,
-            watertight: mesh_watertight,
-            open_edges: report.boundary_edges,
-            nonmanifold_edges: report.nonmanifold_edges,
-            valid,
+            export_mesh_watertight: mesh_watertight,
+            export_mesh_open_edges: report.boundary_edges,
+            export_mesh_nonmanifold_edges: report.nonmanifold_edges,
             dims,
         })
         .unwrap_or_else(|_| serde_json::json!({}));
@@ -2395,10 +2407,9 @@ pub async fn part_perception(
                 "reconcile".to_string(),
                 serde_json::json!({ "status": "pending" }),
             );
-            // Additive: `verified`/`status` never replace the existing
-            // `sound` field's meaning (B-Rep validity, on this fast path) —
-            // they name whether that reading has a fresh full certificate
-            // behind it at all.
+            // `verified`/`status` name whether a fresh full certificate for
+            // this solid exists in the kernel's memo at all (this path never
+            // computes one, and states no `sound` of its own).
             map.insert(
                 "verified".to_string(),
                 serde_json::json!(!reading.is_stale()),

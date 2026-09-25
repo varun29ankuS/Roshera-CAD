@@ -131,7 +131,7 @@
  *      the caller who complied).
  */
 
-import { api, PERCEPTION_TIMEOUT_MS } from "./core.js";
+import { api, PERCEPTION_TIMEOUT_MS, statedSoundness } from "./core.js";
 import { canonicalJson, fnv1a64hex } from "./registry.js";
 
 // ─── Typed refusal shape ────────────────────────────────────────────────────
@@ -710,8 +710,8 @@ async function partIdForUuid(
 /**
  * The part's LIVE cheap verdict.
  *
- * `verdict: null` covers both "unreadable shape" (the response carried
- * neither `sound` nor `valid` as a boolean — never fabricated into one) and
+ * `verdict: null` covers both "no stated verdict" (the response carried no
+ * boolean `sound` and no failed B-Rep check — never fabricated into one) and
  * is otherwise unchanged from before this item: that branch is not the S4
  * citation (`liveVerdict throws → null`, gates.ts:507-509 in the audit) and
  * is left exactly as it behaved previously — silent proceed, no marker.
@@ -733,8 +733,11 @@ async function liveVerdict(
       undefined,
       PERCEPTION_TIMEOUT_MS,
     );
-    const flag = p?.sound ?? p?.valid;
-    if (typeof flag !== "boolean") return { verdict: null };
+    // The verdict the response STATES (`statedSoundness`): its `sound`, or
+    // `false` for a failed B-Rep check — a valid B-Rep alone is never read as
+    // `sound: true` (it is one conjunct of soundness, not soundness).
+    const flag = statedSoundness(p);
+    if (flag === null) return { verdict: null };
     return {
       verdict: {
         sound: flag,

@@ -174,11 +174,17 @@ const FIDELITY_FAILED = {
   note: "fidelity compares the REQUEST to the RESULT.",
 };
 
-/** The cheap verdict `certified_response` embeds (main.rs:1058-1145). */
+/**
+ * The DEFAULT block `certified_response` embeds: the full-certificate verdict,
+ * which always rides with its `cert` breakdown. (A block WITHOUT `cert` is the
+ * `fast: true` seed, which carries no verdict and is not reused as one — the
+ * fidelity carry-over on that path is proven in batch_step_certification.)
+ */
 const basePerception = () => ({
   sound: true,
   valid: true,
   watertight: true,
+  cert: { sound: true, brep_valid: true, watertight: true },
   open_edges: 0,
   nonmanifold_edges: 0,
   face_count: 3,
