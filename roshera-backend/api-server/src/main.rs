@@ -30,6 +30,8 @@ mod blackboard;
 #[cfg(test)]
 mod blend_failed_harness;
 mod bounded_exec;
+#[cfg(test)]
+mod branch_switch_tests;
 mod branches;
 mod csketch;
 mod documents;

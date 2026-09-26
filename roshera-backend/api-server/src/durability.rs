@@ -31,8 +31,8 @@ use std::sync::Arc;
 use serde::Serialize;
 use session_manager::{BranchRecord, DatabasePersistence, TimelineEventData};
 use timeline_engine::{
-    certify_rebuild, raw_topology_references, rebuild_model_from_events, recorded_solid_inputs,
-    recorded_solid_outputs, Author, BranchId, BranchState, EventSink, Operation, TimelineEvent,
+    certify_rebuild, rebuild_model_from_events, recorded_solid_outputs, Author, BranchId,
+    BranchState, EventSink, Operation, TimelineEvent,
 };
 use tokio::sync::RwLock;
 use uuid::Uuid;
@@ -868,9 +868,10 @@ async fn boot_replay_inner(state: &AppState) -> DurabilityStatus {
             let (kind, reason) = hole_cause(*seq, &corrupt, &orphans);
             (*seq, kind.to_string(), reason)
         });
-    // The id-space guard. At runtime every branch runs in ONE live model
-    // (switching branches does not rebuild it), so kernel face/edge ids are
-    // allocated in the order of the WHOLE interleaved log. Replaying only the
+    // The id-space guard. Documents recorded before a branch switch rebuilt
+    // the live model ran every branch in ONE model, so their kernel face/edge
+    // ids were allocated in the order of the WHOLE interleaved log, and the
+    // log cannot tell those documents from later ones. Replaying only the
     // live branch's history reallocates them without the other branches'
     // operations, so an event that addresses a face or edge by its raw
     // recorded id (no persistent id) AFTER any event outside this history
@@ -894,81 +895,29 @@ async fn boot_replay_inner(state: &AppState) -> DurabilityStatus {
                 .unwrap_or(live_branch);
             (seq, branch)
         });
-    let interleave_break = first_foreign.and_then(|(foreign_seq, foreign_branch)| {
-        live_events
-            .iter()
-            .filter(|e| e.sequence_number > foreign_seq)
-            .find_map(|e| {
-                let refs = raw_topology_references(e);
-                (!refs.is_empty()).then(|| {
-                    (
-                        e.sequence_number,
-                        "interleaved_foreign_history".to_string(),
-                        format!(
-                            concat!(
-                                "event at sequence {} addresses {} by its raw recorded kernel ",
-                                "id, but branch {} recorded sequence {} into the same runtime ",
-                                "model before it; replaying this branch alone shifts kernel ",
-                                "ids, so the reference cannot be reproduced and is refused"
-                            ),
-                            e.sequence_number,
-                            refs.join(", "),
-                            foreign_branch,
-                            foreign_seq
-                        ),
-                    )
-                })
-            })
-    });
-    // The solid guard. Replay resolves a recorded solid id through its remap,
-    // which holds only solids some EARLIER replayed event produced; any other
-    // id falls back to the raw number and binds whatever solid now carries it
-    // (measured: a main boolean against a side branch's cylinder subtracted a
-    // main cube instead). So an event whose recorded solid input is not an
-    // output of an earlier event in THIS history is a typed boundary — in any
-    // log, interleaved or not: an input the history never produced cannot be
-    // reproduced from it.
-    let solid_break = {
-        let mut produced: HashSet<u64> = HashSet::new();
-        let mut found = None;
-        for event in &live_events {
-            let missing = recorded_solid_inputs(event)
-                .into_iter()
-                .find(|id| !produced.contains(id));
-            if let Some(solid) = missing {
-                let producer = by_seq
-                    .values()
-                    .filter(|p| p.sequence_number < event.sequence_number)
-                    .filter(|p| recorded_solid_outputs(p).contains(&solid))
-                    .max_by_key(|p| p.sequence_number);
-                let origin = match producer {
-                    Some(p) => format!(
-                        "it was produced by sequence {} on branch {}, outside this history",
-                        p.sequence_number, p.metadata.branch_id
-                    ),
-                    None => "no persisted event produced it".to_string(),
-                };
-                found = Some((
-                    event.sequence_number,
-                    "foreign_solid_input".to_string(),
-                    format!(
-                        concat!(
-                            "event at sequence {} takes solid:{} as input, but no earlier ",
-                            "event in this branch's history produced it ({}); replay would ",
-                            "bind whatever solid carries that number, so it is refused"
-                        ),
-                        event.sequence_number, solid, origin
-                    ),
-                ));
-                break;
-            }
-            produced.extend(recorded_solid_outputs(event));
-        }
-        found
-    };
+    // The solid guard (inside the same shared check): replay resolves a
+    // recorded solid id through its remap, which holds only solids some
+    // EARLIER replayed event produced; any other id falls back to the raw
+    // number and binds whatever solid now carries it (measured: a main boolean
+    // against a side branch's cylinder subtracted a main cube instead). So an
+    // event whose recorded solid input is not an output of an earlier event in
+    // THIS history is a typed boundary — in any log, interleaved or not.
+    //
+    // Both guards live in `timeline_engine::subset_replay_boundary`, which the
+    // runtime subset replays (branch switch, undo/redo) call too.
+    let subset_break =
+        timeline_engine::subset_replay_boundary(&live_events, first_foreign, |solid, before| {
+            by_seq
+                .values()
+                .filter(|p| p.sequence_number < before)
+                .filter(|p| recorded_solid_outputs(p).contains(&solid))
+                .max_by_key(|p| p.sequence_number)
+                .map(|p| (p.sequence_number, p.metadata.branch_id))
+        })
+        .map(|b| (b.sequence, b.kind, b.reason));
     // `!is_sound` alone is NOT a boundary — a log of only 2D/sketch ops
     // legitimately produces no solids yet is not corrupt.
-    let boundary = [replay_break, hole_break, interleave_break, solid_break]
+    let boundary = [replay_break, hole_break, subset_break]
         .into_iter()
         .flatten()
         .min_by_key(|b| b.0);

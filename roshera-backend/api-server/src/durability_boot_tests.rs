@@ -3069,7 +3069,7 @@ async fn branch_create_refuses_when_the_recorder_drain_fails() {
 // events EACH branch holds and what the live model contains.
 // =====================================================================
 
-async fn create_cube(state: &AppState, edge: f64) {
+pub(crate) async fn create_cube(state: &AppState, edge: f64) {
     let (s, body) = dispatch(
         state,
         post(
@@ -3082,7 +3082,7 @@ async fn create_cube(state: &AppState, edge: f64) {
 }
 
 /// A cylinder well clear of the cubes, so it never interacts with them.
-async fn create_side_cylinder(state: &AppState) {
+pub(crate) async fn create_side_cylinder(state: &AppState) {
     let (s, body) = dispatch(
         state,
         post(
@@ -3098,7 +3098,7 @@ async fn create_side_cylinder(state: &AppState) {
     );
 }
 
-async fn settle(state: &AppState) {
+pub(crate) async fn settle(state: &AppState) {
     state
         .timeline_recorder
         .flush()
@@ -3106,7 +3106,7 @@ async fn settle(state: &AppState) {
         .expect("recorder flush must succeed");
 }
 
-async fn fork_from_main(state: &AppState, name: &str) -> timeline_engine::BranchId {
+pub(crate) async fn fork_from_main(state: &AppState, name: &str) -> timeline_engine::BranchId {
     settle(state).await;
     let (s, body) = dispatch(state, post("/api/branches", json!({ "name": name }))).await;
     assert_eq!(
@@ -3132,7 +3132,10 @@ async fn activate_branch(state: &AppState, branch: &str) {
 
 /// `(sequence_number, event id)` of every event in a branch's history, in
 /// sequence order — the branch's `branch_events` index, read directly.
-async fn branch_history(state: &AppState, branch: timeline_engine::BranchId) -> Vec<(u64, String)> {
+pub(crate) async fn branch_history(
+    state: &AppState,
+    branch: timeline_engine::BranchId,
+) -> Vec<(u64, String)> {
     settle(state).await;
     let timeline = state.timeline.read().await;
     timeline
@@ -3161,7 +3164,7 @@ async fn assert_timeline_valid(state: &AppState) {
     }
 }
 
-async fn live_volumes(state: &AppState) -> Vec<f64> {
+pub(crate) async fn live_volumes(state: &AppState) -> Vec<f64> {
     let uuids: Vec<Uuid> = state.uuid_to_local.iter().map(|e| *e.key()).collect();
     let mut volumes = Vec::new();
     for uuid in uuids {
@@ -3794,7 +3797,7 @@ async fn abandon_persistence_failure_is_a_typed_5xx_and_leaves_the_branch_active
 // =====================================================================
 
 /// The id of a live solid's +Z planar face, read off the exact B-Rep.
-async fn top_face_of(state: &AppState, solid_id: u32) -> u32 {
+pub(crate) async fn top_face_of(state: &AppState, solid_id: u32) -> u32 {
     let model = state.model.read().await;
     let solid = model.solids.get(solid_id).expect("solid must exist");
     let shell = model.shells.get(solid.outer_shell).expect("outer shell");
@@ -3927,7 +3930,7 @@ async fn face_pull_without_a_side_branch_replays_exactly_and_stays_active() {
 }
 
 /// POST a create route and return the created part's public uuid.
-async fn create_part(state: &AppState, uri: &str, payload: Value) -> String {
+pub(crate) async fn create_part(state: &AppState, uri: &str, payload: Value) -> String {
     let (s, body) = dispatch(state, post(uri, payload)).await;
     assert_eq!(s, StatusCode::OK, "{uri} must succeed; body = {body}");
     body["object"]["id"]

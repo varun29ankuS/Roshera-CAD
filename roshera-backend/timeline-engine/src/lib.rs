@@ -72,8 +72,9 @@ pub use recorder_bridge::{
 };
 pub use replay::{
     apply_event, raw_topology_references, rebuild_model_from_events, recorded_solid_inputs,
-    recorded_solid_outputs, rederive_part_drawing, DrawingRederive, DrawingStore, ReplayError,
-    ReplayFailure, ReplayOutcome,
+    recorded_solid_outputs, rederive_part_drawing, subset_replay_boundary, DrawingRederive,
+    DrawingStore, ReplayBoundary, ReplayError, ReplayFailure, ReplayOutcome, FOREIGN_SOLID_INPUT,
+    INTERLEAVED_FOREIGN_HISTORY,
 };
 pub use timeline::Timeline;
 pub use types::*;

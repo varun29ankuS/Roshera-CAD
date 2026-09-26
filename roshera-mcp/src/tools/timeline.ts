@@ -321,11 +321,19 @@ export function registerTimelineTools(server: ToolHost) {
           description,
         });
         let recording_on_branch = false;
+        // The switch's own answer is passed through verbatim: it says what
+        // the switch did NOT do (`live_model: "not_rebuilt"`), which the
+        // agent must see rather than infer from `recording_on_branch`.
+        let switched: unknown = undefined;
         if (activate && branch?.id) {
-          await api("POST", "/api/branches/active", { branch_id: branch.id });
+          switched = await api("POST", "/api/branches/active", { branch_id: branch.id });
           recording_on_branch = true;
         }
-        return ok({ branch, recording_on_branch });
+        return ok(
+          switched === undefined
+            ? { branch, recording_on_branch }
+            : { branch, recording_on_branch, switch: switched },
+        );
       } catch (e) {
         return refusalOrFail(e);
       }

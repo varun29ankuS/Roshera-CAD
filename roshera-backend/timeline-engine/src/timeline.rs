@@ -57,6 +57,20 @@ use std::sync::{
 };
 use uuid;
 
+/// What one `truncate_branch` removes (see `Timeline::truncate_plan`).
+struct TruncatePlan {
+    /// The truncated branch.
+    branch: BranchId,
+    /// `(key, id)` pairs dropped from `branch`.
+    removed: Vec<(EventIndex, EventId)>,
+    /// Active children forked from `branch` at or after the cut: they lose
+    /// the same keys and are abandoned.
+    cascaded: Vec<BranchId>,
+    /// Dropped events no remaining index references: they leave the global
+    /// event table.
+    purged: HashSet<EventId>,
+}
+
 /// Main Timeline structure - the heart of the event-sourced system
 pub struct Timeline {
     /// Configuration
@@ -814,6 +828,175 @@ impl Timeline {
         events.sort_by_key(|e| e.sequence_number);
 
         Ok(events)
+    }
+
+    /// The first event of `replayed` — a slice of `branch_id`'s history in
+    /// ascending sequence order (the whole history, or an undo prefix of it)
+    /// — that a replay of that history alone cannot reproduce, per
+    /// [`crate::replay::subset_replay_boundary`]; `None` when it replays
+    /// faithfully.
+    ///
+    /// Every branch of this timeline ran in ONE runtime model, so the
+    /// "foreign" events are every event this timeline holds outside
+    /// `branch_id`'s index (its fork prefix and merged-in events are its
+    /// own). The runtime twin of the durability boot guard, which derives the
+    /// same two inputs from the persisted rows.
+    pub fn replay_boundary(
+        &self,
+        branch_id: &BranchId,
+        replayed: &[TimelineEvent],
+    ) -> TimelineResult<Option<crate::replay::ReplayBoundary>> {
+        let in_history: HashSet<EventId> = self
+            .branch_events
+            .get(branch_id)
+            .ok_or(TimelineError::BranchNotFound(*branch_id))?
+            .iter()
+            .map(|entry| *entry.value())
+            .collect();
+        Ok(self.boundary_over(&in_history, replayed, &HashSet::new()))
+    }
+
+    /// [`Self::replay_boundary`] for a history whose events are
+    /// `in_history`, with the events in `absent` treated as gone from the
+    /// timeline (neither foreign nor producers).
+    fn boundary_over(
+        &self,
+        in_history: &HashSet<EventId>,
+        replayed: &[TimelineEvent],
+        absent: &HashSet<EventId>,
+    ) -> Option<crate::replay::ReplayBoundary> {
+        let first_foreign = self
+            .events
+            .iter()
+            .filter(|entry| !in_history.contains(entry.key()) && !absent.contains(entry.key()))
+            .map(|entry| (entry.sequence_number, entry.metadata.branch_id))
+            .min_by_key(|(seq, _)| *seq);
+        let producer_outside = |solid: u64, before: u64| {
+            self.events
+                .iter()
+                .filter(|entry| !absent.contains(entry.key()))
+                .filter(|entry| entry.sequence_number < before)
+                .filter(|entry| crate::replay::recorded_solid_outputs(entry).contains(&solid))
+                .map(|entry| (entry.sequence_number, entry.metadata.branch_id))
+                .max_by_key(|(seq, _)| *seq)
+        };
+        crate::replay::subset_replay_boundary(replayed, first_foreign, producer_outside)
+    }
+
+    /// What `truncate_branch(branch_id, cut_index, _)` removes, computed
+    /// once, before any mutation, by the ONE set of rules both the real
+    /// truncate ([`Self::truncate_branch`]) and its simulation
+    /// ([`Self::replay_boundary_after_truncate`]) apply — so the two cannot
+    /// drift:
+    ///
+    /// * `branch_id` loses every key at or after `cut_index`;
+    /// * so does every Active child forked from it at or after `cut_index`
+    ///   (its inherited copies are scrubbed; the child is then abandoned);
+    /// * a dropped event that no index still references once those keys are
+    ///   gone leaves the global event table (a sibling's or descendant's
+    ///   copy keeps it).
+    fn truncate_plan(
+        &self,
+        branch_id: BranchId,
+        cut_index: EventIndex,
+    ) -> TimelineResult<TruncatePlan> {
+        let removed: Vec<(EventIndex, EventId)> = self
+            .branch_events
+            .get(&branch_id)
+            .ok_or(TimelineError::BranchNotFound(branch_id))?
+            .iter()
+            .filter(|entry| *entry.key() >= cut_index)
+            .map(|entry| (*entry.key(), *entry.value()))
+            .collect();
+        // Anything forked from `branch_id` at or after `cut_index` had its
+        // anchor pulled out from under it.
+        let cascaded: Vec<BranchId> = self
+            .branches
+            .iter()
+            .filter(|entry| {
+                let b = entry.value();
+                b.parent == Some(branch_id)
+                    && b.fork_point.event_index >= cut_index
+                    && matches!(b.state, BranchState::Active)
+            })
+            .map(|entry| *entry.key())
+            .collect();
+        let mut plan = TruncatePlan {
+            branch: branch_id,
+            removed,
+            cascaded,
+            purged: HashSet::new(),
+        };
+        // Keys first, then per-branch reads: never read the map while an
+        // iterator holds one of its shards.
+        let branches: Vec<BranchId> = self.branch_events.iter().map(|e| *e.key()).collect();
+        let still_referenced: HashSet<EventId> = branches
+            .iter()
+            .flat_map(|branch| self.post_truncate_index(&plan, branch))
+            .map(|(_, id)| id)
+            .collect();
+        plan.purged = plan
+            .removed
+            .iter()
+            .map(|(_, id)| *id)
+            .filter(|id| !still_referenced.contains(id))
+            .collect();
+        Ok(plan)
+    }
+
+    /// `branch`'s index, ascending, as it will be once `plan` is applied.
+    fn post_truncate_index(
+        &self,
+        plan: &TruncatePlan,
+        branch: &BranchId,
+    ) -> Vec<(EventIndex, EventId)> {
+        let scrubbed = *branch == plan.branch || plan.cascaded.contains(branch);
+        let removed_keys: HashSet<EventIndex> = plan.removed.iter().map(|(k, _)| *k).collect();
+        let mut index: Vec<(EventIndex, EventId)> = self
+            .branch_events
+            .get(branch)
+            .map(|m| {
+                m.iter()
+                    .map(|entry| (*entry.key(), *entry.value()))
+                    .filter(|(k, _)| !(scrubbed && removed_keys.contains(k)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        index.sort_unstable_by_key(|(k, _)| *k);
+        index
+    }
+
+    /// What [`Self::replay_boundary`] would report, AFTER
+    /// [`Self::truncate_branch`]`(truncated, cut_index, _)`, for the first
+    /// `replay_limit` events of `replay_branch` (a session pointer; the
+    /// truncate clamps it to the branch's new length) — computed without
+    /// mutating anything, from the same [`TruncatePlan`] the truncate
+    /// applies.
+    ///
+    /// A truncate cannot be undone (it purges events and abandons cascaded
+    /// children), so a caller that will rebuild the live model from a
+    /// session's history after the truncate runs this FIRST and refuses the
+    /// truncate when the rebuild would be refused.
+    pub fn replay_boundary_after_truncate(
+        &self,
+        truncated: BranchId,
+        cut_index: EventIndex,
+        replay_branch: BranchId,
+        replay_limit: u64,
+    ) -> TimelineResult<Option<crate::replay::ReplayBoundary>> {
+        let plan = self.truncate_plan(truncated, cut_index)?;
+        let history = self.post_truncate_index(&plan, &replay_branch);
+        let in_history: HashSet<EventId> = history.iter().map(|(_, id)| *id).collect();
+        let limit = usize::try_from(replay_limit)
+            .unwrap_or(usize::MAX)
+            .min(history.len());
+        let mut replayed: Vec<TimelineEvent> = history
+            .iter()
+            .filter_map(|(_, id)| self.events.get(id).map(|e| e.clone()))
+            .collect();
+        replayed.sort_by_key(|e| e.sequence_number);
+        replayed.truncate(limit);
+        Ok(self.boundary_over(&in_history, &replayed, &plan.purged))
     }
 
     /// Create a new branch
@@ -2003,35 +2186,13 @@ impl Timeline {
             }
         }
 
-        let to_remove: Vec<(EventIndex, EventId)> = {
-            let branch_events = self
-                .branch_events
-                .get(&branch_id)
-                .ok_or(TimelineError::BranchNotFound(branch_id))?;
-            branch_events
-                .iter()
-                .filter(|entry| *entry.key() >= cut_index)
-                .map(|entry| (*entry.key(), *entry.value()))
-                .collect()
-        };
-
-        // Cascade detection — collect first (no mutation), then act.
-        // Anything forked from `branch_id` at or after `cut_index` had
-        // its anchor pulled out from under it.
-        let cascaded_children: Vec<BranchId> = self
-            .branches
-            .iter()
-            .filter(|entry| {
-                let b = entry.value();
-                b.parent == Some(branch_id)
-                    && b.fork_point.event_index >= cut_index
-                    && matches!(b.state, BranchState::Active)
-            })
-            .map(|entry| *entry.key())
-            .collect();
+        // What to remove — the ONE plan the pre-flight simulation reads too.
+        let plan = self.truncate_plan(branch_id, cut_index)?;
+        let to_remove = &plan.removed;
+        let cascaded_children = &plan.cascaded;
 
         if let Some(branch_events) = self.branch_events.get(&branch_id) {
-            for (idx, _) in &to_remove {
+            for (idx, _) in to_remove {
                 branch_events.remove(idx);
             }
         }
@@ -2041,35 +2202,25 @@ impl Timeline {
         // the inherited prefix is invalid.) We mutate before flipping
         // state so a concurrent reader who manages to dodge the state
         // flip still doesn't see deleted events on the child.
-        for child in &cascaded_children {
+        for child in cascaded_children {
             if let Some(child_events) = self.branch_events.get(child) {
-                for (idx, _) in &to_remove {
+                for (idx, _) in to_remove {
                     child_events.remove(idx);
                 }
             }
         }
 
         // Purge from the GLOBAL event table only events that NO branch index
-        // still references. Inherited events are SHARED across branches —
-        // `create_branch` copies the parent's `branch_events` entries, so the
-        // same EventId appears in the parent's and every descendant's index —
-        // hence a truncate on one branch must not delete an event a sibling or
-        // ancestor still points at. The previous code removed every dropped
-        // event unconditionally; the surviving references then dangled and
-        // `validate()` caught "branch … references missing event id …". The
-        // per-branch indices for `branch_id` and its cascaded children were
-        // already scrubbed above, so a remaining reference is a genuinely
-        // shared event that must stay.
-        let mut purged: std::collections::HashSet<EventId> = std::collections::HashSet::new();
-        for (_, event_id) in &to_remove {
-            let still_referenced = self
-                .branch_events
-                .iter()
-                .any(|be| be.value().iter().any(|e| *e.value() == *event_id));
-            if !still_referenced {
-                self.events.remove(event_id);
-                purged.insert(*event_id);
-            }
+        // still references (the plan's purge set). Inherited events are
+        // SHARED across branches — `create_branch` copies the parent's
+        // `branch_events` entries, so the same EventId appears in the
+        // parent's and every descendant's index — hence a truncate on one
+        // branch must not delete an event a sibling or ancestor still points
+        // at (the surviving references would dangle and `validate()` would
+        // catch "branch … references missing event id …").
+        let purged = &plan.purged;
+        for event_id in purged {
+            self.events.remove(event_id);
         }
 
         if !purged.is_empty() {
@@ -2081,7 +2232,7 @@ impl Timeline {
         // Mark cascaded children abandoned. We do this last so concurrent
         // readers either see (active, intact prefix) or (abandoned,
         // truncated prefix) — never (active, truncated prefix).
-        for child in &cascaded_children {
+        for child in cascaded_children {
             if let Some(mut entry) = self.branches.get_mut(child) {
                 entry.state = BranchState::Abandoned {
                     reason: format!(
@@ -2105,7 +2256,7 @@ impl Timeline {
         let truncated_len = new_len_for(&branch_id);
         let mut child_lens: std::collections::HashMap<BranchId, u64> =
             std::collections::HashMap::new();
-        for c in &cascaded_children {
+        for c in cascaded_children {
             child_lens.insert(*c, new_len_for(c));
         }
         for mut entry in self.session_positions.iter_mut() {
@@ -4265,5 +4416,211 @@ mod tests {
         timeline
             .validate()
             .expect("rejected truncate must not corrupt state");
+    }
+
+    // ---------------------------------------------------------------
+    // Task 100 round 3 — the pre-flight simulation of a truncate
+    // (`replay_boundary_after_truncate`) must say exactly what running the
+    // truncate and then `replay_boundary` over the clamped pointer says.
+    // ---------------------------------------------------------------
+
+    /// The branches and sequence numbers of [`truncate_equivalence_fixture`].
+    struct TruncateFixture {
+        timeline: Timeline,
+        side: BranchId,
+        forked_before: BranchId,
+        forked_after: BranchId,
+        side_box_seq: u64,
+        main_pull_seq: u64,
+    }
+
+    async fn seq_of(timeline: &Timeline, id: EventId) -> u64 {
+        timeline.get_event(id).unwrap().sequence_number
+    }
+
+    async fn fork(timeline: &Timeline, name: &str, parent: BranchId) -> BranchId {
+        timeline
+            .create_branch(
+                name.to_string(),
+                parent,
+                None,
+                Author::System,
+                crate::BranchPurpose::UserExploration {
+                    description: name.to_string(),
+                },
+            )
+            .await
+            .unwrap()
+    }
+
+    /// main: box (`solid:0`) → fork `forked_before` and `side` → side: box
+    /// (`solid:1`, the event foreign to main) → optionally fork `holder`
+    /// from side and abandon it (an inactive branch still holding a copy of
+    /// the side box) → main: a raw face reference (`transform_faces`
+    /// `face:3`) AFTER the side box — the interleaved region → fork
+    /// `forked_after` from main → `forked_before`: its own raw face
+    /// reference.
+    async fn truncate_equivalence_fixture(with_holder: bool) -> TruncateFixture {
+        let timeline = Timeline::new(TimelineConfig::default());
+        let main = BranchId::main();
+        timeline
+            .add_operation(
+                generic_op("create_box_3d", &[], &["solid:0"]),
+                Author::System,
+                main,
+            )
+            .await
+            .unwrap();
+        let forked_before = fork(&timeline, "forked-before", main).await;
+        let side = fork(&timeline, "side", main).await;
+        let side_box = timeline
+            .add_operation(
+                generic_op("create_box_3d", &[], &["solid:1"]),
+                Author::System,
+                side,
+            )
+            .await
+            .unwrap();
+        if with_holder {
+            let holder = fork(&timeline, "holder", side).await;
+            timeline
+                .abandon_branch(holder, "keeps a copy".to_string(), false)
+                .unwrap();
+        }
+        let main_pull = timeline
+            .add_operation(
+                generic_op("transform_faces", &["face:3"], &["solid:0"]),
+                Author::System,
+                main,
+            )
+            .await
+            .unwrap();
+        let forked_after = fork(&timeline, "forked-after", main).await;
+        timeline
+            .add_operation(
+                generic_op("transform_faces", &["face:4"], &["solid:0"]),
+                Author::System,
+                forked_before,
+            )
+            .await
+            .unwrap();
+        let side_box_seq = seq_of(&timeline, side_box).await;
+        let main_pull_seq = seq_of(&timeline, main_pull).await;
+        TruncateFixture {
+            timeline,
+            side,
+            forked_before,
+            forked_after,
+            side_box_seq,
+            main_pull_seq,
+        }
+    }
+
+    /// `(sequence, kind)` of a boundary — the reason names random branch
+    /// ids, which differ between two fixtures built alike.
+    fn shape(b: Option<crate::replay::ReplayBoundary>) -> Option<(u64, String)> {
+        b.map(|b| (b.sequence, b.kind))
+    }
+
+    /// Simulated vs real for one case. `pick` selects the truncated branch,
+    /// the cut and the replayed branch from a fixture; the replay pointer is
+    /// the replayed branch's length BEFORE the truncate (so a truncate that
+    /// shortens it must clamp it). Returns (simulated, real, before).
+    async fn simulated_and_real(
+        with_holder: bool,
+        pick: fn(&TruncateFixture) -> (BranchId, u64, BranchId),
+    ) -> (
+        Option<(u64, String)>,
+        Option<(u64, String)>,
+        Option<(u64, String)>,
+    ) {
+        let f = truncate_equivalence_fixture(with_holder).await;
+        let (truncated, cut, replayed) = pick(&f);
+        let full = f.timeline.get_branch_events(&replayed, None, None).unwrap();
+        let before = shape(f.timeline.replay_boundary(&replayed, &full).unwrap());
+        let pointer = full.len() as u64;
+        let simulated = shape(
+            f.timeline
+                .replay_boundary_after_truncate(truncated, cut, replayed, pointer)
+                .unwrap(),
+        );
+
+        let g = truncate_equivalence_fixture(with_holder).await;
+        let (truncated, cut, replayed) = pick(&g);
+        let session = uuid::Uuid::new_v4();
+        g.timeline
+            .update_session_position(SessionId::new(session.to_string()), replayed, pointer)
+            .unwrap();
+        g.timeline.truncate_branch(truncated, cut, true).unwrap();
+        let clamped = g
+            .timeline
+            .get_session_position(session)
+            .unwrap()
+            .event_index;
+        let mut prefix = g.timeline.get_branch_events(&replayed, None, None).unwrap();
+        prefix.truncate(clamped as usize);
+        let real = shape(g.timeline.replay_boundary(&replayed, &prefix).unwrap());
+        (simulated, real, before)
+    }
+
+    /// Cascade + clamp: truncating main at its raw face reference removes it
+    /// from the Active child forked after it too (the child's pointer, 2, is
+    /// clamped to its new length, 1). Before the truncate the child's
+    /// replay is refused; after it, it is not.
+    #[tokio::test]
+    async fn truncate_simulation_matches_truncate_for_a_child_forked_after_the_cut() {
+        let (simulated, real, before) = simulated_and_real(false, |f| {
+            (BranchId::main(), f.main_pull_seq, f.forked_after)
+        })
+        .await;
+        assert!(
+            before.is_some(),
+            "the child's replay is refused before the truncate"
+        );
+        assert_eq!(real, None, "the cascade scrubs the child's copy");
+        assert_eq!(simulated, real);
+    }
+
+    /// No cascade for a child forked BEFORE the cut: it keeps its own raw
+    /// face reference, still after the side box, so it is refused both ways.
+    #[tokio::test]
+    async fn truncate_simulation_matches_truncate_for_a_child_forked_before_the_cut() {
+        let (simulated, real, before) = simulated_and_real(false, |f| {
+            (BranchId::main(), f.main_pull_seq, f.forked_before)
+        })
+        .await;
+        assert!(before.is_some());
+        assert!(
+            real.is_some(),
+            "no cascade: the child's own history is kept"
+        );
+        assert_eq!(simulated, real);
+    }
+
+    /// Purge: truncating the side branch at its box, with nothing else
+    /// holding a copy, removes the box from the timeline — main's raw face
+    /// reference no longer follows a foreign event, so main replays.
+    #[tokio::test]
+    async fn truncate_simulation_matches_truncate_when_the_dropped_event_is_purged() {
+        let (simulated, real, before) =
+            simulated_and_real(false, |f| (f.side, f.side_box_seq, BranchId::main())).await;
+        assert!(
+            before.is_some(),
+            "main is refused while the side box exists"
+        );
+        assert_eq!(real, None, "the purged side box is no longer foreign");
+        assert_eq!(simulated, real);
+    }
+
+    /// Kept: an abandoned branch still holds a copy of the side box, so the
+    /// truncate does not purge it; it stays foreign and main is still
+    /// refused.
+    #[tokio::test]
+    async fn truncate_simulation_matches_truncate_when_another_branch_keeps_the_dropped_event() {
+        let (simulated, real, before) =
+            simulated_and_real(true, |f| (f.side, f.side_box_seq, BranchId::main())).await;
+        assert!(before.is_some());
+        assert!(real.is_some(), "a kept copy stays foreign");
+        assert_eq!(simulated, real);
     }
 }

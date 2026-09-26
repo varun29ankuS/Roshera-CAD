@@ -139,13 +139,12 @@ pub struct BranchView {
 
 /// `POST /api/branches/active` body.
 ///
-/// Switches which branch the kernel's `OperationRecorder` writes
-/// subsequent operations to. The active branch is process-global —
-/// there is exactly one "current branch" at any moment, by design,
-/// matching the single live `BRepModel` the kernel holds. Per-branch
-/// model isolation (copy-on-write snapshots / replay-on-read) is a
-/// separate concern; this endpoint is the minimum needed so that the
-/// timeline strip and the kernel agree on where new events land.
+/// Switches which branch the kernel's `OperationRecorder` writes subsequent
+/// operations to ([`switch_live_branch`]). The live `BRepModel` is NOT
+/// rebuilt from that branch's history (see [`LIVE_MODEL_NOT_REBUILT`]).
+/// The active branch is process-global — there is exactly one "current
+/// branch" at any moment, matching the single live `BRepModel` the kernel
+/// holds.
 #[derive(Debug, Deserialize)]
 pub struct SetActiveBranchBody {
     /// `"main"` or a UUIDv4 string. Must reference a branch that
@@ -153,11 +152,18 @@ pub struct SetActiveBranchBody {
     pub branch_id: String,
 }
 
-/// `POST /api/branches/active` response — echoes the now-active branch
-/// id so the client can confirm the swap landed.
+/// `POST /api/branches/active` response — echoes the now-active branch id
+/// so the client can confirm the swap landed, and states what the switch
+/// did NOT do to the live model.
 #[derive(Debug, Serialize)]
 pub struct ActiveBranchView {
+    /// The branch recording now targets.
     pub branch_id: String,
+    /// The branch recording targeted before the switch.
+    pub previous_branch_id: String,
+    /// Always [`LIVE_MODEL_NOT_REBUILT`]: the live model still holds what it
+    /// held before the switch.
+    pub live_model: &'static str,
 }
 
 /// `POST /api/branches/{id}/merge` body.
@@ -872,64 +878,118 @@ fn branch_keys(
         .unwrap_or_default()
 }
 
-/// `POST /api/branches/active` — set the kernel's recording branch.
+/// The `live_model` value every branch switch reports: the switch moved
+/// RECORDING only. The live model is not rebuilt from the target branch's
+/// history, so it still holds whatever it held before — ops run after the
+/// switch run against that model and are recorded on the target branch.
 ///
-/// Validates that the branch exists AND is Active — a merged, abandoned or
-/// completed branch can take no events, so pointing the recorder there
-/// would lose every later op (typed 409 `branch_not_active`) — drains the
-/// recorder, then swaps its target. Ops recorded before the swap keep the
-/// branch they were recorded on; ops recorded after it land on the new
-/// one.
+/// Rebuilding on switch is Task 100b, which needs Task 79's document-stable
+/// solid ids first: every
+/// rebuild allocates kernel solid ids from zero, so two branches would
+/// record different solids under the same id, and a three-way merge of
+/// such branches reports false conflicts and leaves a history whose replay
+/// binds the wrong solid.
+pub const LIVE_MODEL_NOT_REBUILT: &str = "not_rebuilt";
+
+/// What a completed [`switch_live_branch`] did.
+#[derive(Debug, Clone)]
+pub struct BranchSwitch {
+    /// The branch recording targeted before.
+    pub from: BranchId,
+    /// The branch recording targets now.
+    pub to: BranchId,
+}
+
+/// The existence + Active check a switch makes (Task 69): a merged,
+/// abandoned or completed branch can take no events, so recording cannot
+/// move there.
+fn switchable(
+    timeline: &timeline_engine::Timeline,
+    target: BranchId,
+    recording: BranchId,
+) -> Result<(), ApiError> {
+    let branch = timeline.get_branch(&target).ok_or_else(|| {
+        ApiError::new(
+            ErrorCode::BranchNotFound,
+            format!("branch {target} not found"),
+        )
+        .with_details(serde_json::json!({ "branch_id": target.to_string() }))
+    })?;
+    if matches!(branch.state, BranchState::Active) {
+        return Ok(());
+    }
+    let label = state_label(&branch.state);
+    Err(ApiError::new(
+        ErrorCode::BranchNotActive,
+        format!(
+            concat!(
+                "branch {} is {} and can take no events, so recording cannot move ",
+                "there; recording stays on {}"
+            ),
+            target, label, recording
+        ),
+    )
+    .with_hint(concat!(
+        "Switch to an Active branch (GET /api/branches lists each branch's state), ",
+        "or fork a new branch from this one's parent to keep exploring."
+    ))
+    .with_details(serde_json::json!({
+        "branch_id": target.to_string(),
+        "state": label,
+        "recording_branch": recording.to_string(),
+    })))
+}
+
+/// Move the recording branch to `target` — the ONE switch every route
+/// performs (`POST /api/branches/active`,
+/// `POST /api/timeline/branch/switch/{id}`, the WS `SwitchBranch`).
+///
+/// Drains the recorder (an op lost earlier is reported and the switch is
+/// not made over it), then — under one timeline read guard, so a merge
+/// (which takes the write lock) cannot retire the branch in between —
+/// refuses a missing or non-Active target, typed, and retargets the
+/// recorder. Ops recorded before the swap keep the branch they were
+/// recorded on; ops recorded after it land on the new one.
+///
+/// It does NOT rebuild the live model from `target`'s history
+/// ([`LIVE_MODEL_NOT_REBUILT`]; Task 100b, after Task 79); every route says so in its
+/// response.
+pub async fn switch_live_branch(
+    state: &AppState,
+    target: BranchId,
+) -> Result<BranchSwitch, ApiError> {
+    // Land everything recorded on the outgoing branch first; an op lost
+    // earlier is reported here and the switch is not made over it.
+    drain_before_retarget(state, "branch switch").await?;
+    let from = {
+        let timeline = state.timeline.read().await;
+        let from = state.timeline_recorder.branch_id();
+        switchable(&timeline, target, from)?;
+        state.timeline_recorder.set_branch_id(target);
+        from
+    };
+    tracing::info!(
+        target: "branches",
+        from = %from,
+        to = %target,
+        live_model = LIVE_MODEL_NOT_REBUILT,
+        "active recording branch switched"
+    );
+    Ok(BranchSwitch { from, to: target })
+}
+
+/// `POST /api/branches/active` — set the kernel's recording branch
+/// ([`switch_live_branch`]); the live model is not rebuilt.
 pub async fn set_active_branch(
     State(state): State<AppState>,
     Json(body): Json<SetActiveBranchBody>,
 ) -> Result<Json<ActiveBranchView>, ApiError> {
     let bid = parse_branch_id(&body.branch_id)?;
-    // Land everything recorded on the outgoing branch first; an op lost
-    // earlier is reported here and the switch is not made over it.
-    drain_before_retarget(&state, "branch switch").await?;
-    {
-        // The state check and the swap happen under one read guard, so a
-        // merge (which takes the write lock) cannot retire the branch in
-        // between.
-        let timeline = state.timeline.read().await;
-        let branch = timeline.get_branch(&bid).ok_or_else(|| {
-            ApiError::new(ErrorCode::BranchNotFound, format!("branch {bid} not found"))
-                .with_details(serde_json::json!({ "branch_id": bid.to_string() }))
-        })?;
-        if !matches!(branch.state, BranchState::Active) {
-            let label = state_label(&branch.state);
-            return Err(ApiError::new(
-                ErrorCode::BranchNotActive,
-                format!(
-                    concat!(
-                        "branch {} is {} and can take no events, so recording cannot move ",
-                        "there; recording stays on {}"
-                    ),
-                    bid,
-                    label,
-                    state.timeline_recorder.branch_id()
-                ),
-            )
-            .with_hint(concat!(
-                "Switch to an Active branch (GET /api/branches lists each branch's state), ",
-                "or fork a new branch from this one's parent to keep exploring."
-            ))
-            .with_details(serde_json::json!({
-                "branch_id": bid.to_string(),
-                "state": label,
-                "recording_branch": state.timeline_recorder.branch_id().to_string(),
-            })));
-        }
-        state.timeline_recorder.set_branch_id(bid);
-    }
-    tracing::info!(
-        target: "branches",
-        branch_id = %bid,
-        "active recording branch switched"
-    );
+    let switched = switch_live_branch(&state, bid).await?;
     Ok(Json(ActiveBranchView {
-        branch_id: bid.to_string(),
+        branch_id: switched.to.to_string(),
+        previous_branch_id: switched.from.to_string(),
+        live_model: LIVE_MODEL_NOT_REBUILT,
     }))
 }
 

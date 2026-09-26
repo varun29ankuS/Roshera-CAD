@@ -2378,6 +2378,124 @@ pub fn recorded_solid_outputs(event: &TimelineEvent) -> Vec<u64> {
         .unwrap_or_default()
 }
 
+/// [`ReplayBoundary::kind`] of an event that addresses a face or edge by its
+/// raw recorded kernel id after an event outside the replayed history ran in
+/// the same runtime model.
+pub const INTERLEAVED_FOREIGN_HISTORY: &str = "interleaved_foreign_history";
+
+/// [`ReplayBoundary::kind`] of an event whose recorded solid input no earlier
+/// event of the replayed history produced.
+pub const FOREIGN_SOLID_INPUT: &str = "foreign_solid_input";
+
+/// The first event of a history that a replay of that history ALONE cannot
+/// reproduce faithfully: its sequence number, a stable kind
+/// ([`INTERLEAVED_FOREIGN_HISTORY`] / [`FOREIGN_SOLID_INPUT`]) and a reason
+/// naming the reference that cannot be bound.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ReplayBoundary {
+    /// Sequence number of the refused event.
+    pub sequence: u64,
+    /// Stable machine-readable kind.
+    pub kind: String,
+    /// Plain-language reason naming the unbindable reference.
+    pub reason: String,
+}
+
+/// Where the first event of a subset replay sits that its history alone
+/// cannot reproduce — or `None` when every event of `history` binds only
+/// what `history` itself produced.
+///
+/// A replay resolves recorded ids through ONE `id_remap` that holds only the
+/// solids earlier replayed events produced; every other reference takes the
+/// raw recorded number and binds whatever the rebuilt model now carries
+/// under it. Two cases are therefore refused instead of replayed wrong:
+///
+/// * [`INTERLEAVED_FOREIGN_HISTORY`] — an event that addresses a face or edge
+///   by its raw recorded id ([`raw_topology_references`]) AFTER
+///   `first_foreign`, the earliest event outside this history that ran in
+///   the same runtime model. That event allocated kernel ids the replay will
+///   not allocate, so the raw number now names a different face.
+/// * [`FOREIGN_SOLID_INPUT`] — an event whose recorded solid input
+///   ([`recorded_solid_inputs`]) no earlier event of `history` produced
+///   ([`recorded_solid_outputs`]). `producer_outside(solid, before)` names
+///   the latest event below sequence `before` that did produce it, when one
+///   exists outside the history.
+///
+/// `history` must be in ascending sequence order. Both the durability boot
+/// replay and the runtime subset replays (branch switch, undo/redo) call
+/// this, so every replay of a subset of what the recording model executed
+/// refuses the same events for the same reasons.
+pub fn subset_replay_boundary<F>(
+    history: &[TimelineEvent],
+    first_foreign: Option<(u64, crate::types::BranchId)>,
+    producer_outside: F,
+) -> Option<ReplayBoundary>
+where
+    F: Fn(u64, u64) -> Option<(u64, crate::types::BranchId)>,
+{
+    let interleave_break = first_foreign.and_then(|(foreign_seq, foreign_branch)| {
+        history
+            .iter()
+            .filter(|e| e.sequence_number > foreign_seq)
+            .find_map(|e| {
+                let refs = raw_topology_references(e);
+                (!refs.is_empty()).then(|| ReplayBoundary {
+                    sequence: e.sequence_number,
+                    kind: INTERLEAVED_FOREIGN_HISTORY.to_string(),
+                    reason: format!(
+                        concat!(
+                            "event at sequence {} addresses {} by its raw recorded kernel ",
+                            "id, but branch {} recorded sequence {} into the same runtime ",
+                            "model before it; replaying this branch alone shifts kernel ",
+                            "ids, so the reference cannot be reproduced and is refused"
+                        ),
+                        e.sequence_number,
+                        refs.join(", "),
+                        foreign_branch,
+                        foreign_seq
+                    ),
+                })
+            })
+    });
+    let solid_break = {
+        let mut produced: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        let mut found = None;
+        for event in history {
+            let missing = recorded_solid_inputs(event)
+                .into_iter()
+                .find(|id| !produced.contains(id));
+            if let Some(solid) = missing {
+                let origin = match producer_outside(solid, event.sequence_number) {
+                    Some((seq, branch)) => format!(
+                        "it was produced by sequence {} on branch {}, outside this history",
+                        seq, branch
+                    ),
+                    None => "no persisted event produced it".to_string(),
+                };
+                found = Some(ReplayBoundary {
+                    sequence: event.sequence_number,
+                    kind: FOREIGN_SOLID_INPUT.to_string(),
+                    reason: format!(
+                        concat!(
+                            "event at sequence {} takes solid:{} as input, but no earlier ",
+                            "event in this branch's history produced it ({}); replay would ",
+                            "bind whatever solid carries that number, so it is refused"
+                        ),
+                        event.sequence_number, solid, origin
+                    ),
+                });
+                break;
+            }
+            produced.extend(recorded_solid_outputs(event));
+        }
+        found
+    };
+    [interleave_break, solid_break]
+        .into_iter()
+        .flatten()
+        .min_by_key(|b| b.sequence)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

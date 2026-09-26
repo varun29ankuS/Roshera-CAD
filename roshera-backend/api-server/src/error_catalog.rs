@@ -344,6 +344,21 @@ pub enum ErrorCode {
     /// same refusal. `details` carries `branch_id` and `state`; recording
     /// stays where it was.
     BranchNotActive,
+    /// An undo/redo (REST `POST /api/timeline/undo|redo`, the WS `Undo` /
+    /// `Redo`) would rebuild the live model from a history that replay
+    /// cannot reproduce faithfully — an event addresses a face/edge by a raw
+    /// kernel id allocated while another branch's events ran in the same
+    /// model (`interleaved_foreign_history`), or takes a solid its history
+    /// never produced (`foreign_solid_input`) — or the session undoing is
+    /// positioned on a branch the live model is not recording
+    /// (`session_on_other_branch`). Rebuilding anyway would serve a model the
+    /// history does not describe, so NOTHING moved: the live model, the uuid
+    /// registry, the session position and the recording branch are as they
+    /// were. Mapped to HTTP 409, non-retryable — the same request against the
+    /// same history earns the same refusal. `details` carries `branch_id`,
+    /// `sequence` (the refused event, or null), `kind`, `reason` and
+    /// `recording_branch`.
+    BranchReplayRefused,
 
     // ── Document layer ──────────────────────────────────────────
     /// `POST /api/documents/{id}/open` (or any other document-scoped
@@ -530,6 +545,7 @@ impl ErrorCode {
             | ErrorCode::BranchInvalidState
             | ErrorCode::BranchMergeConflict
             | ErrorCode::BranchNotActive
+            | ErrorCode::BranchReplayRefused
             | ErrorCode::SketchConstraintConflict
             | ErrorCode::DocumentDeleteRefusedActive
             | ErrorCode::DocumentDeleteRefusedLast
@@ -620,6 +636,7 @@ impl ErrorCode {
             | ErrorCode::BranchInvalidState
             | ErrorCode::BranchMergeConflict
             | ErrorCode::BranchNotActive
+            | ErrorCode::BranchReplayRefused
             | ErrorCode::DocumentNotFound
             | ErrorCode::DocumentDeleteRefusedActive
             | ErrorCode::DocumentDeleteRefusedLast
@@ -726,6 +743,7 @@ impl ErrorCode {
             ErrorCode::BranchInvalidState => "branch_invalid_state",
             ErrorCode::BranchMergeConflict => "branch_merge_conflict",
             ErrorCode::BranchNotActive => "branch_not_active",
+            ErrorCode::BranchReplayRefused => "branch_replay_refused",
             ErrorCode::DocumentNotFound => "document_not_found",
             ErrorCode::DocumentDeleteRefusedActive => "document_delete_refused_active",
             ErrorCode::DocumentDeleteRefusedLast => "document_delete_refused_last",
@@ -783,6 +801,7 @@ impl ErrorCode {
             ErrorCode::BranchInvalidState,
             ErrorCode::BranchMergeConflict,
             ErrorCode::BranchNotActive,
+            ErrorCode::BranchReplayRefused,
             ErrorCode::DocumentNotFound,
             ErrorCode::DocumentDeleteRefusedActive,
             ErrorCode::DocumentDeleteRefusedLast,

@@ -453,6 +453,11 @@ pub enum TimelineUpdate {
     BranchSwitched {
         from: String,
         to: String,
+        /// What the switch did to the live model — always
+        /// `crate::branches::LIVE_MODEL_NOT_REBUILT` (`"not_rebuilt"`):
+        /// recording moved, the live model was not rebuilt from `to`'s
+        /// history (Task 100b, after Task 79).
+        live_model: String,
     },
 }
 

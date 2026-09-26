@@ -263,20 +263,20 @@ async fn ensure_session_position_at_head(
     if timeline.get_session_position(session_uuid).is_some() {
         return Ok(());
     }
-    // Count of events in main = head pointer (one past the last applied
-    // event). Errors here are non-fatal — an empty branch is a valid
-    // state and means `event_index = 0`, which short-circuits undo
-    // cleanly via `NoMoreUndo`.
+    // A new session starts at the head of the branch the live model holds
+    // and records onto — never a hardcoded `main`: after a branch switch,
+    // an undo planted on main would replay main into the live model while
+    // recording stayed on the switched-to branch. Count of events = head
+    // pointer (one past the last applied event). Errors here are non-fatal
+    // — an empty branch is a valid state and means `event_index = 0`,
+    // which short-circuits undo cleanly via `NoMoreUndo`.
+    let branch = state.timeline_recorder.branch_id();
     let head_count = timeline
-        .get_branch_events(&BranchId::main(), None, None)
+        .get_branch_events(&branch, None, None)
         .map(|events| events.len() as u64)
         .unwrap_or(0);
     timeline
-        .update_session_position(
-            SessionId::new(session_uuid.to_string()),
-            BranchId::main(),
-            head_count,
-        )
+        .update_session_position(SessionId::new(session_uuid.to_string()), branch, head_count)
         .map_err(|e| format!("update session position: {}", e))
 }
 
@@ -349,63 +349,218 @@ pub async fn latest_event_id_on_active_branch(state: &AppState) -> Option<Uuid> 
         .map(|e| e.id.0)
 }
 
-async fn replay_session_to_model(
+/// Why a replay of a branch history into the live model was not performed.
+/// In every case the live model, the uuid registry and the recorder target
+/// are left exactly as they were.
+#[derive(Debug)]
+pub enum ReplayRefusal {
+    /// An event of the history cannot be reproduced by replaying that
+    /// history alone (`timeline_engine::subset_replay_boundary`).
+    Boundary {
+        branch: BranchId,
+        boundary: timeline_engine::ReplayBoundary,
+    },
+    /// The ledger moved while the history was being rebuilt off to the side:
+    /// an operation recorded meanwhile ran against the live model, and
+    /// swapping the rebuild in would drop it from the model while its event
+    /// stays in the ledger. Nothing is swapped. Retrying reads the history
+    /// as it now is.
+    HistoryMoved {
+        branch: BranchId,
+        read_at: u64,
+        now: u64,
+    },
+    /// The history could not be read (no session position, unknown branch).
+    Unavailable(String),
+}
+
+impl std::fmt::Display for ReplayRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReplayRefusal::Boundary { boundary, .. } => write!(f, "{}", boundary.reason),
+            ReplayRefusal::HistoryMoved { .. } | ReplayRefusal::Unavailable(_) => {
+                match self.typed_parts() {
+                    Some((_, _, _, reason)) => write!(f, "{reason}"),
+                    None => match self {
+                        ReplayRefusal::Unavailable(e) => write!(f, "{e}"),
+                        _ => Ok(()),
+                    },
+                }
+            }
+        }
+    }
+}
+
+impl ReplayRefusal {
+    /// `(branch, sequence, kind, reason)` of a refusal that carries a typed
+    /// `branch_replay_refused` answer; `None` for [`Self::Unavailable`].
+    pub fn typed_parts(&self) -> Option<(BranchId, Option<u64>, String, String)> {
+        match self {
+            ReplayRefusal::Boundary { branch, boundary } => Some((
+                *branch,
+                Some(boundary.sequence),
+                boundary.kind.clone(),
+                boundary.reason.clone(),
+            )),
+            ReplayRefusal::HistoryMoved {
+                branch,
+                read_at,
+                now,
+            } => Some((
+                *branch,
+                None,
+                "history_moved".to_string(),
+                format!(
+                    concat!(
+                        "the ledger moved from sequence {} to {} while the history was ",
+                        "being rebuilt, so the rebuild no longer describes it and was ",
+                        "not swapped in; retrying reads the history as it now is"
+                    ),
+                    read_at, now
+                ),
+            )),
+            ReplayRefusal::Unavailable(_) => None,
+        }
+    }
+
+    /// The typed answer: `branch_replay_refused` for a refusal with
+    /// [`Self::typed_parts`], `internal_error` otherwise.
+    pub fn to_api_error(&self, recording_branch: BranchId) -> ApiError {
+        match self.typed_parts() {
+            Some((branch, sequence, kind, reason)) => {
+                branch_replay_refused(branch, sequence, &kind, &reason, recording_branch)
+            }
+            None => ApiError::new(
+                ErrorCode::Internal,
+                format!("the live model could not be rebuilt: {self}"),
+            ),
+        }
+    }
+}
+
+/// The typed refusal of a replay that would not rebuild the model the
+/// history describes. `reason` names the event and the reference; the live
+/// model and recording stay where they were.
+pub fn branch_replay_refused(
+    branch: BranchId,
+    sequence: Option<u64>,
+    kind: &str,
+    reason: &str,
+    recording_branch: BranchId,
+) -> ApiError {
+    ApiError::new(
+        ErrorCode::BranchReplayRefused,
+        format!(
+            concat!(
+                "branch {} cannot be rebuilt into the live model: {}; the live model ",
+                "and recording stay on {}"
+            ),
+            branch, reason, recording_branch
+        ),
+    )
+    .with_hint(concat!(
+        "The history is intact; only its replay is refused. Read it with ",
+        "GET /api/timeline/history/{branch}, or keep working on the branch the ",
+        "live model is on."
+    ))
+    .with_details(serde_json::json!({
+        "branch_id": branch.to_string(),
+        "sequence": sequence,
+        "kind": kind,
+        "reason": reason,
+        "recording_branch": recording_branch.to_string(),
+    }))
+}
+
+/// A model rebuilt from a branch history, not yet live.
+struct PreparedReplay {
+    /// The branch whose history was replayed.
+    branch: BranchId,
+    /// The rebuilt candidate (the shared recorder attached).
+    model: BRepModel,
+    /// The replay's outcome.
+    outcome: ReplayOutcome,
+    /// The history's events past the replayed prefix (an undo cursor).
+    skipped: Vec<TimelineEvent>,
+    /// The timeline's next sequence number when the history was read. The
+    /// swap is refused if it has moved by then.
+    read_at: u64,
+}
+
+/// Rebuild the first `limit` events of `branch`'s history into a FRESH
+/// model, off the live one — after refusing, typed, a history whose replay
+/// would bind a reference that history never produced
+/// (`Timeline::replay_boundary`: Task 68's boot guards, at runtime). Mutates
+/// nothing: the live model, registry and recorder are untouched whatever it
+/// returns.
+async fn prepare_branch_replay(
     state: &AppState,
-    session_uuid: Uuid,
-) -> Result<ReplayOutcome, String> {
-    // 1. Snapshot the session's position + fetch the events to replay
-    //    **and the events being skipped** (sequence_number ≥ cutoff).
-    //    Both are held under a single read lock so position, replay
-    //    set, and skip set are mutually consistent.
-    //
-    //    Skipped events matter for slice-2 of the Ctrl-Z fix: each
-    //    consuming op (boolean, delete, face-extrude replace) has
-    //    tombstoned its consumed `(kernel_id, uuid)` bindings against
-    //    its own `EventId` (see `AppState::tombstone_consumed_uuids`).
-    //    Walking the skip set yields the resurrection table — original
-    //    UUIDs to restore for solids that come back when the consuming
-    //    op is rolled past.
-    //
-    //    `event_index` is the *count of applied events*, so it equals
-    //    the number of events to fetch from the branch root. Events are
-    //    sorted by `sequence_number` because `get_branch_events`
-    //    iterates a `DashMap` whose ordering is non-deterministic —
-    //    replay correctness depends on monotonically increasing
-    //    sequence application.
-    // Drain in-flight recorder ops before snapshotting branch events.
-    // Replay correctness depends on seeing every kernel op that's been
-    // recorded; an undrained MPSC means we'd rebuild the model against
-    // an incomplete event prefix.
-    let _ = state.timeline_recorder.settle().await;
-    let (branch_id, events, skipped) = {
+    branch: BranchId,
+    limit: usize,
+) -> Result<PreparedReplay, ReplayRefusal> {
+    let (events, skipped, read_at) = {
         let timeline = state.timeline.read().await;
-        let position = timeline
-            .get_session_position(session_uuid)
-            .ok_or_else(|| "session has no timeline position".to_string())?;
-        let limit = position.event_index as usize;
-        let mut all_events = timeline
-            .get_branch_events(&position.branch_id, None, None)
-            .map_err(|e| format!("failed to fetch branch events: {}", e))?;
-        all_events.sort_by_key(|e| e.sequence_number);
-        let skipped: Vec<TimelineEvent> = all_events.split_off(limit.min(all_events.len()));
-        (position.branch_id, all_events, skipped)
+        let mut all = timeline
+            .get_branch_events(&branch, None, None)
+            .map_err(|e| {
+                ReplayRefusal::Unavailable(format!("failed to fetch branch events: {e}"))
+            })?;
+        // `event_index` is a count of applied events; replay order is the
+        // sequence order (`get_branch_events` sorts, kept explicit here).
+        all.sort_by_key(|e| e.sequence_number);
+        let skipped = all.split_off(limit.min(all.len()));
+        let boundary = timeline.replay_boundary(&branch, &all).map_err(|e| {
+            ReplayRefusal::Unavailable(format!("failed to read branch history: {e}"))
+        })?;
+        if let Some(boundary) = boundary {
+            return Err(ReplayRefusal::Boundary { branch, boundary });
+        }
+        (all, skipped, timeline.next_sequence_number())
     };
 
-    // 2. Snapshot pre-replay UUID ↔ kernel-id mapping.
-    //
-    //    The kernel's `SolidId` counter is deterministic — re-running
-    //    the same event prefix in the same order produces the same
-    //    kernel-id assignments. So a kernel id that survives the undo
-    //    (i.e. that exists in both the pre- and post-replay models)
-    //    points at the **same logical solid** before and after, and we
-    //    can reuse its UUID across the rebuild.
-    //
-    //    Reusing the UUID matters for the user: it preserves selection,
-    //    transform-gizmo state, outliner ordering, browser names, and
-    //    AI references. Pre-fix, every undo wiped every UUID and minted
-    //    fresh ones — every solid in the scene appeared to be renamed
-    //    and recreated, which is **not** the "step back one event"
-    //    semantics a user expects from Ctrl-Z.
+    // The SHARED recorder (the Arc `set_branch_id` retargets) — a fresh
+    // `TimelineRecorder` would route every later op to whatever branch it
+    // was built with. `rebuild_model_from_events` detaches it for the
+    // replay and reattaches it before returning.
+    let mut model = BRepModel::new();
+    let recorder: Arc<dyn OperationRecorder> = state.timeline_recorder.clone();
+    model.attach_recorder(Some(recorder));
+    let outcome = rebuild_model_from_events(&mut model, &events);
+    Ok(PreparedReplay {
+        branch,
+        model,
+        outcome,
+        skipped,
+        read_at,
+    })
+}
+
+/// Make a prepared rebuild the live model: swap it in under the caller's
+/// model write guard, reconcile the instanced assemblies and the public uuid
+/// registry, and broadcast the scene change so every viewer re-syncs.
+///
+/// The rebuild replays (a prefix of) the history the live model already
+/// holds, so a kernel id that survives names the same solid (the
+/// deterministic counter re-runs the same prefix identically) and keeps its
+/// uuid; a solid a rolled-past event consumed gets its tombstoned uuid back;
+/// anything else is minted. A uuid whose solid is gone leaves the registry
+/// and is broadcast `ObjectDeleted`; a kept uuid is `ObjectUpdated` (the
+/// viewer keeps selection / gizmo / outliner state); a new one is
+/// `ObjectCreated`.
+async fn commit_prepared_replay(
+    state: &AppState,
+    model_guard: &mut BRepModel,
+    prepared: PreparedReplay,
+) -> ReplayOutcome {
+    let PreparedReplay {
+        branch,
+        model,
+        outcome,
+        skipped,
+        read_at: _,
+    } = prepared;
+
+    // Snapshot the pre-replay uuid ↔ kernel-id registry.
     let pre_replay_kernel_to_uuid: HashMap<u32, Uuid> = {
         let mut map = HashMap::new();
         for uuid in state.snapshot_registered_uuids() {
@@ -416,53 +571,16 @@ async fn replay_session_to_model(
         map
     };
 
-    // 3. Replace the live model with a fresh one and reattach the
-    //    shared recorder so post-replay kernel ops continue to be
-    //    timeline-recorded against the *current* active branch.
-    //
-    //    CRITICAL: reuse `state.timeline_recorder` (the same Arc that
-    //    `set_active_branch` mutates via `set_branch_id`). Constructing
-    //    a fresh `TimelineRecorder` here would detach the active-branch
-    //    handle and silently route every subsequent kernel op to
-    //    whatever branch this fresh recorder was hardcoded with —
-    //    which was the source of "post-undo/redo/truncate ops land on
-    //    main instead of the user's active branch".
-    let mut model_guard = state.model.write().await;
-    *model_guard = BRepModel::new();
-    let recorder: Arc<dyn OperationRecorder> = state.timeline_recorder.clone();
-    model_guard.attach_recorder(Some(recorder));
+    *model_guard = model;
 
-    // 4. Replay. `rebuild_model_from_events` detaches the recorder for
-    //    the duration of the replay and reattaches it before returning.
-    let outcome = rebuild_model_from_events(&mut *model_guard, &events);
-    tracing::info!(
-        target: "timeline.replay",
-        session = %session_uuid,
-        branch = %branch_id,
-        events_applied = outcome.events_applied,
-        events_skipped = outcome.events_skipped,
-        assemblies_rebuilt = outcome.assemblies.len(),
-        "BRepModel reconciled with session timeline position"
-    );
-
-    // 4b. Assemblies are event-sourced too (kinematic-assembly campaign,
-    //     Slice 1): the replayed `assembly.*` events rebuilt the
-    //     instanced-assembly documents into `outcome.assemblies`. The live
-    //     registry is reconciled to exactly that state — the event log is
-    //     the source of truth for assemblies just as it is for the model.
+    // Assemblies are event-sourced too: the replayed `assembly.*` events
+    // rebuilt exactly the documents the history describes.
     state
         .instanced_assemblies
         .replace_all(outcome.assemblies.assemblies.clone());
 
-    // 5. Build the resurrection table from skipped events' tombstones.
-    //
-    //    `state.consumed_uuids` is keyed by the consuming event's raw
-    //    `Uuid`. For every event we just rolled past (`skipped`), look
-    //    up its tombstoned `(kernel_id → uuid)` bindings. Earlier
-    //    skipped events win on conflict (`entry().or_insert()`) so the
-    //    binding from the *first* op that consumed a given kernel id
-    //    survives — that's the binding that was active in the pre-undo
-    //    timeline at the moment of consumption.
+    // Resurrection table from the rolled-past events' tombstones; earlier
+    // skipped events win (the binding active at the moment of consumption).
     let mut resurrection_table: HashMap<u32, Uuid> = HashMap::new();
     for ev in &skipped {
         if let Some(bindings) = state.consumed_uuids_for_event(&ev.id.0) {
@@ -471,21 +589,6 @@ async fn replay_session_to_model(
             }
         }
     }
-
-    // 6. Resolve the post-replay UUID assignment.
-    //
-    //    For each surviving kernel solid:
-    //      (a) reuse the pre-replay UUID if one was registered against
-    //          the same kernel id (the common case — solid existed
-    //          before and survived the rollback),
-    //      (b) else resurrect from the tombstone table (the operand-
-    //          resurrection case — boolean/delete consumed this kernel
-    //          id and was rolled past, restoring its original UUID),
-    //      (c) else mint a fresh `Uuid::new_v4()` (genuinely new state
-    //          the user has never seen — rare; would happen only if
-    //          a replay produced a kernel id that was never registered
-    //          and never tombstoned, which the deterministic counter
-    //          shouldn't allow but the path stays robust).
     let mut post_replay_kernel_to_uuid: HashMap<u32, Uuid> = HashMap::new();
     for (solid_id, _solid) in model_guard.solids.iter() {
         let uuid = pre_replay_kernel_to_uuid
@@ -501,28 +604,16 @@ async fn replay_session_to_model(
     let post_uuids: std::collections::HashSet<Uuid> =
         post_replay_kernel_to_uuid.values().copied().collect();
 
-    // 6. Stage 1 — broadcast `ObjectDeleted` only for UUIDs that did
-    //    not survive (i.e. solids the undone op had produced). Every
-    //    other UUID stays alive.
+    // Stage 1 — uuids whose solid is not in the rebuilt model.
     for uuid in pre_uuids.difference(&post_uuids) {
         state.unregister_id_mapping(uuid);
         crate::broadcast_object_deleted(&uuid.to_string());
     }
 
-    // 7. Stage 2 — register every surviving UUID against its
-    //    (potentially renumbered) kernel id, then broadcast.
-    //
-    //    Kept UUIDs (pre ∩ post): emit `ObjectUpdated` so the frontend
-    //    bridge merges the rebuilt mesh into the existing object slot
-    //    without dropping selection / transform-gizmo / outliner state.
-    //
-    //    Fresh UUIDs (post − pre): emit `ObjectCreated`. The
-    //    analytic-geometry envelope is intentionally empty here — the
-    //    kernel does not track which primitive produced each surviving
-    //    solid after replay (e.g. boolean output), so we ship the mesh
-    //    as a generic `"mesh"` and let the frontend's `convertCADObject`
-    //    fall through to the mesh path. The solid still renders,
-    //    selects, and exports correctly.
+    // Stage 2 — register every surviving uuid against its (possibly
+    // renumbered) kernel id, then broadcast. The analytic-geometry envelope
+    // is empty — the kernel does not track which primitive produced a
+    // replayed solid — so the mesh ships as a generic `"mesh"`.
     let tess_params = geometry_engine::tessellation::TessellationParams::default();
     for (solid_id, solid) in model_guard.solids.iter() {
         let uuid = match post_replay_kernel_to_uuid.get(&solid_id) {
@@ -530,7 +621,7 @@ async fn replay_session_to_model(
             None => continue,
         };
         let mesh =
-            geometry_engine::tessellation::tessellate_solid(solid, &model_guard, &tess_params);
+            geometry_engine::tessellation::tessellate_solid(solid, model_guard, &tess_params);
         let (vertices, indices, normals, face_ids) = crate::flatten_tri_mesh(&mesh);
         let name = solid.name.as_deref().unwrap_or("Solid").to_string();
 
@@ -568,7 +659,168 @@ async fn replay_session_to_model(
         }
     }
 
-    Ok(outcome)
+    tracing::info!(
+        target: "timeline.replay",
+        branch = %branch,
+        events_applied = outcome.events_applied,
+        events_skipped = outcome.events_skipped,
+        assemblies_rebuilt = outcome.assemblies.len(),
+        "live BRepModel reconciled with the session's timeline position"
+    );
+    outcome
+}
+
+/// Reconcile the live model with `session_uuid`'s timeline position: rebuild
+/// its branch's history up to the position pointer (undo/redo, replay,
+/// truncate, clear, mould) OFF the live model and make that the live model —
+/// or refuse, typed, leaving the model, registry and recorder exactly as
+/// they were. (Before, the live model was emptied before the replay ran.)
+///
+/// # Lock ordering
+///
+/// Callers MUST drop any `state.timeline` write guard first: this reads the
+/// timeline, then takes the model write lock for the swap.
+async fn replay_session_to_model(
+    state: &AppState,
+    session_uuid: Uuid,
+) -> Result<ReplayOutcome, ReplayRefusal> {
+    // Drain in-flight recorder ops: the replay must see every kernel op
+    // recorded so far, not an undrained prefix.
+    let _ = state.timeline_recorder.settle().await;
+    let (branch_id, limit) = {
+        let timeline = state.timeline.read().await;
+        let position = timeline.get_session_position(session_uuid).ok_or_else(|| {
+            ReplayRefusal::Unavailable("session has no timeline position".to_string())
+        })?;
+        (position.branch_id, position.event_index as usize)
+    };
+    let prepared = prepare_branch_replay(state, branch_id, limit).await?;
+    #[cfg(test)]
+    replay_race_hook::pause(session_uuid).await;
+    let mut model_guard = state.model.write().await;
+    // The rebuild ran without the model lock. Under it now, no kernel op can
+    // run; land whatever ops ran meanwhile and see whether the ledger moved.
+    // If it did, those ops are in the live model and the ledger but not in
+    // the rebuild: swapping it in would silently drop them from the model.
+    let _ = state.timeline_recorder.settle().await;
+    let now = state.timeline.read().await.next_sequence_number();
+    if now != prepared.read_at {
+        return Err(ReplayRefusal::HistoryMoved {
+            branch: branch_id,
+            read_at: prepared.read_at,
+            now,
+        });
+    }
+    Ok(commit_prepared_replay(state, &mut model_guard, prepared).await)
+}
+
+/// Test-only gate between the off-lock rebuild and the swap of
+/// [`replay_session_to_model`], keyed by session so parallel tests never
+/// meet each other's gate: a test drives an interleaving (an op landing
+/// during the rebuild) deterministically instead of racing for it.
+#[cfg(test)]
+pub(crate) mod replay_race_hook {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+    use tokio::sync::Notify;
+    use uuid::Uuid;
+
+    /// `(rebuilt, proceed)`: the replay signals `rebuilt` once its rebuild
+    /// is done, then waits for `proceed` before taking the model lock.
+    type Gate = (Arc<Notify>, Arc<Notify>);
+
+    fn gates() -> &'static Mutex<HashMap<Uuid, Gate>> {
+        static GATES: OnceLock<Mutex<HashMap<Uuid, Gate>>> = OnceLock::new();
+        GATES.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    /// Arm the gate for the next replay of `session`.
+    pub(crate) fn install(session: Uuid) -> Gate {
+        let gate: Gate = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+        if let Ok(mut map) = gates().lock() {
+            map.insert(session, gate.clone());
+        }
+        gate
+    }
+
+    pub(super) async fn pause(session: Uuid) {
+        let gate = gates().lock().ok().and_then(|mut map| map.remove(&session));
+        if let Some((rebuilt, proceed)) = gate {
+            rebuilt.notify_one();
+            proceed.notified().await;
+        }
+    }
+}
+
+/// Refuse, BEFORE a ledger mutation that cannot be undone (truncate, clear),
+/// a mutation after which `session_uuid`'s replay would be refused: run the
+/// shared guard over exactly the history `replay_session_to_model` will
+/// replay once `truncated` has lost every key at or after `cut_index` (the
+/// session's own branch and pointer, which need not be `truncated`).
+async fn truncate_preflight(
+    state: &AppState,
+    session_uuid: Uuid,
+    truncated: BranchId,
+    cut_index: u64,
+) -> Result<(), ApiError> {
+    let recording = state.timeline_recorder.branch_id();
+    let timeline = state.timeline.read().await;
+    let position = timeline.get_session_position(session_uuid).ok_or_else(|| {
+        ApiError::new(
+            ErrorCode::Internal,
+            format!("session {session_uuid} has no timeline position"),
+        )
+    })?;
+    let boundary = timeline
+        .replay_boundary_after_truncate(
+            truncated,
+            cut_index,
+            position.branch_id,
+            position.event_index,
+        )
+        .map_err(|e| {
+            ApiError::new(
+                ErrorCode::Internal,
+                format!("the history to replay could not be read: {e}"),
+            )
+        })?;
+    match boundary {
+        Some(b) => Err(branch_replay_refused(
+            position.branch_id,
+            Some(b.sequence),
+            &b.kind,
+            &b.reason,
+            recording,
+        )),
+        None => Ok(()),
+    }
+}
+
+/// The body of a ledger mutation whose live-model rebuild then failed: the
+/// ledger DID change, the live model did not follow it, so the answer is
+/// never `success:true`. 409 with the typed refusal when the replay was
+/// refused, 500 otherwise.
+fn mutated_but_not_reconciled(
+    state: &AppState,
+    refusal: &ReplayRefusal,
+    mutation: serde_json::Value,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let error = refusal
+        .to_api_error(state.timeline_recorder.branch_id())
+        .with_hint(concat!(
+            "The ledger DID change and the live model did not follow it. ",
+            "POST /api/timeline/replay with the same session_id rebuilds the live ",
+            "model from the ledger as it now is."
+        ));
+    let status = error.code.status();
+    let mut body = serde_json::to_value(&error).unwrap_or_else(|_| serde_json::json!({}));
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("success".to_string(), serde_json::json!(false));
+        obj.insert("ledger_changed".to_string(), serde_json::json!(true));
+        obj.insert("model_reconciled".to_string(), serde_json::json!(false));
+        obj.insert("mutation".to_string(), mutation);
+    }
+    (status, Json(body))
 }
 
 /// Initialize timeline (replaces initialize_version_control)
@@ -754,23 +1006,25 @@ pub async fn create_branch(
     }))
 }
 
-/// Switch to a branch
+/// `POST /api/timeline/branch/switch/{branch_id}` — a thin wrapper over the
+/// one branch switch ([`crate::branches::switch_live_branch`]) that
+/// `POST /api/branches/active` and the WS `SwitchBranch` perform: recording
+/// moves to the branch, or the switch is refused, typed (`branch_not_found`,
+/// `branch_not_active`), with nothing moved. `branch_id` is `main` or a
+/// branch UUID. The live model is NOT rebuilt from the branch's history
+/// (`live_model: "not_rebuilt"`, see
+/// [`crate::branches::LIVE_MODEL_NOT_REBUILT`]; Task 100b, after Task 79).
 pub async fn switch_branch(
     State(state): State<AppState>,
     Path(branch_id): Path<String>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
-    let bid = BranchId(Uuid::parse_str(&branch_id).map_err(|_| StatusCode::BAD_REQUEST)?);
-
-    // Update the timeline's active branch
-    let mut timeline = state.timeline.write().await;
-    timeline
-        .switch_branch(bid)
-        .await
-        .map_err(|_| StatusCode::NOT_FOUND)?;
-
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let bid = resolve_branch_ref_typed(&branch_id)?;
+    let switched = crate::branches::switch_live_branch(&state, bid).await?;
     Ok(Json(serde_json::json!({
         "success": true,
         "branch_id": branch_id,
+        "previous_branch_id": switched.from.to_string(),
+        "live_model": crate::branches::LIVE_MODEL_NOT_REBUILT,
     })))
 }
 
@@ -2131,6 +2385,67 @@ pub async fn mould_parameter(
     let mut candidate_events = events.clone();
     candidate_events.push(mould_event.clone());
 
+    // ── Pre-flight: the append cannot be undone ───────────────────────
+    // Refuse — nothing appended — when a replay the mould depends on would be
+    // refused by the shared guard (Task 68's boundaries): the candidate
+    // history (it feeds the reported objects and certificate, and is what
+    // the live session replays), and, for an explicit UI session, that
+    // session's own branch and pointer (which need not be `branch_id`). An
+    // explicit session with no position yet is planted AFTER the append at
+    // the recording branch's head, so its replay is that branch's whole
+    // history (the candidate history when that branch is `branch_id`).
+    let preflight = {
+        let timeline = state.timeline.read().await;
+        let unreadable = |e: TimelineError| {
+            let error = ApiError::new(
+                ErrorCode::Internal,
+                format!("the history the mould replays could not be read: {e}"),
+            );
+            (
+                error.code.status(),
+                Json(serde_json::to_value(&error).unwrap_or_default()),
+            )
+        };
+        let mut found = match timeline.replay_boundary(&branch_id, &candidate_events) {
+            Ok(b) => b.map(|b| (branch_id, b)),
+            Err(e) => return Ok(unreadable(e)),
+        };
+        if found.is_none() && !session_is_live {
+            let (replay_branch, limit) = match timeline.get_session_position(session_uuid) {
+                Some(position) => (
+                    position.branch_id,
+                    usize::try_from(position.event_index).unwrap_or(usize::MAX),
+                ),
+                None => (state.timeline_recorder.branch_id(), usize::MAX),
+            };
+            if replay_branch != branch_id || limit < candidate_events.len() {
+                let mut history = timeline
+                    .get_branch_events(&replay_branch, None, None)
+                    .unwrap_or_default();
+                history.sort_by_key(|e| e.sequence_number);
+                history.truncate(limit);
+                found = match timeline.replay_boundary(&replay_branch, &history) {
+                    Ok(b) => b.map(|b| (replay_branch, b)),
+                    Err(e) => return Ok(unreadable(e)),
+                };
+            }
+        }
+        found
+    };
+    if let Some((refused_branch, boundary)) = preflight {
+        let refusal = branch_replay_refused(
+            refused_branch,
+            Some(boundary.sequence),
+            &boundary.kind,
+            &boundary.reason,
+            state.timeline_recorder.branch_id(),
+        );
+        return Ok((
+            refusal.code.status(),
+            Json(serde_json::to_value(&refusal).unwrap_or_default()),
+        ));
+    }
+
     let (_base_model, base_cert) = certify_rebuild(&events, None);
     // #32: `certify_rebuild_with_drawings` also RE-DERIVES every
     // `drawing.create_from_part` sheet from the moulded geometry (option a) —
@@ -2206,23 +2521,26 @@ pub async fn mould_parameter(
         error!(target: "timeline.mould", session = %session_uuid, error = %err, "session seed failed");
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
-    let reconcile = replay_session_to_model(&state, session_uuid).await;
-    // Broken (Failed/Dangling/Blocked) feature count from the certificate — the
-    // fallback when the live reconcile replay itself errors.
-    let cand_broken = cand_cert
-        .verdicts
-        .iter()
-        .filter(|v| v.status.is_break())
-        .count();
-    let (events_applied, events_skipped, reconciled) = match &reconcile {
-        Ok(o) => (o.events_applied, o.events_skipped, true),
+    // The override is appended; if the live model cannot follow it, the
+    // answer says so and is never "MouldApplied" over a model that does not
+    // hold the reported objects.
+    let (events_applied, events_skipped) = match replay_session_to_model(&state, session_uuid).await
+    {
+        Ok(o) => (o.events_applied, o.events_skipped),
         Err(err) => {
             error!(target: "timeline.mould", session = %session_uuid, error = %err, "live reconcile failed");
-            (
-                cand_cert.verdicts.len().saturating_sub(cand_broken),
-                cand_broken,
-                false,
-            )
+            return Ok(mutated_but_not_reconciled(
+                &state,
+                &err,
+                serde_json::json!({
+                    "operation": "mould",
+                    "override_event_id": mould_event.id.to_string(),
+                    "override_sequence": appended_seq,
+                    "target_sequence": target_sequence,
+                    "parameter": parameter,
+                    "value": request.value,
+                }),
+            ));
         }
     };
 
@@ -2243,7 +2561,7 @@ pub async fn mould_parameter(
     // part-scoping input at all, replaying the CURRENTLY ACTIVE document's
     // own branch/timeline (`state.timeline`), so a drawing surfacing here
     // for the first time can only ever be that document's own.
-    if reconciled {
+    {
         let mould_document_id = state.active_document.read().await.clone();
         state.drawings.reconcile_from_replay(
             cand_drawings.drawings,
@@ -2284,7 +2602,7 @@ pub async fn mould_parameter(
             "events_applied": events_applied,
             "events_skipped": events_skipped,
             "is_sound": cand_sound,
-            "model_reconciled": reconciled,
+            "model_reconciled": true,
             // Append-only: the targeted event is never mutated — this mould is a
             // separate, appended correcting event.
             "original_event_preserved": true,
@@ -3397,6 +3715,41 @@ pub enum UndoRedoError {
     /// An invariant that should never fail did (e.g. the event `undo`/
     /// `redo` just returned the id of could not be read back).
     Internal(String),
+    /// The undo/redo would rebuild the live model from a history that
+    /// replay cannot reproduce faithfully (`kind`:
+    /// `interleaved_foreign_history` / `foreign_solid_input`), or from a
+    /// branch the live model is not recording (`session_on_other_branch`).
+    /// Nothing moved: the model, the registry and the session's position
+    /// are as they were.
+    ReplayRefused {
+        branch: BranchId,
+        sequence: Option<u64>,
+        kind: String,
+        reason: String,
+        recording_branch: BranchId,
+    },
+}
+
+impl UndoRedoError {
+    /// The typed `branch_replay_refused` body of a [`Self::ReplayRefused`].
+    pub fn replay_refusal(&self) -> Option<ApiError> {
+        match self {
+            UndoRedoError::ReplayRefused {
+                branch,
+                sequence,
+                kind,
+                reason,
+                recording_branch,
+            } => Some(branch_replay_refused(
+                *branch,
+                *sequence,
+                kind,
+                reason,
+                *recording_branch,
+            )),
+            _ => None,
+        }
+    }
 }
 
 impl std::fmt::Display for UndoRedoError {
@@ -3405,6 +3758,7 @@ impl std::fmt::Display for UndoRedoError {
             UndoRedoError::SessionSeed(e) => write!(f, "failed to seed session position: {e}"),
             UndoRedoError::Timeline(e) => write!(f, "{e}"),
             UndoRedoError::Internal(e) => write!(f, "internal error: {e}"),
+            UndoRedoError::ReplayRefused { reason, .. } => write!(f, "{reason}"),
         }
     }
 }
@@ -3423,6 +3777,7 @@ pub async fn perform_undo(
     ensure_session_position_at_head(state, session_uuid)
         .await
         .map_err(UndoRedoError::SessionSeed)?;
+    let before = session_on_recording_branch(state, session_uuid).await?;
 
     // `Timeline::undo` takes `&self` and only mutates `Arc<DashMap>` interior
     // state, so a *read* lock on the outer `RwLock<Timeline>` is sufficient
@@ -3433,7 +3788,7 @@ pub async fn perform_undo(
     }
     .map_err(UndoRedoError::Timeline)?;
 
-    finish_undo_redo(state, session_uuid, event_id, "undo").await
+    finish_undo_redo(state, session_uuid, event_id, "undo", before).await
 }
 
 /// Redo the most recently undone operation on `session_uuid`'s current
@@ -3447,6 +3802,7 @@ pub async fn perform_redo(
     ensure_session_position_at_head(state, session_uuid)
         .await
         .map_err(UndoRedoError::SessionSeed)?;
+    let before = session_on_recording_branch(state, session_uuid).await?;
 
     // Read lock is sufficient: `Timeline::redo` takes `&self` and mutates
     // only `Arc<DashMap>` interior state. Mirrors the undo path.
@@ -3456,7 +3812,39 @@ pub async fn perform_redo(
     }
     .map_err(UndoRedoError::Timeline)?;
 
-    finish_undo_redo(state, session_uuid, event_id, "redo").await
+    finish_undo_redo(state, session_uuid, event_id, "redo", before).await
+}
+
+/// The session's position before an undo/redo moves it — refusing, typed,
+/// a session positioned on a branch other than the one the live model
+/// holds and records onto: rebuilding the live model from that branch
+/// while recording stays elsewhere is exactly the drift a branch switch
+/// exists to prevent.
+async fn session_on_recording_branch(
+    state: &AppState,
+    session_uuid: Uuid,
+) -> Result<(BranchId, u64), UndoRedoError> {
+    let recording = state.timeline_recorder.branch_id();
+    let timeline = state.timeline.read().await;
+    let position = timeline
+        .get_session_position(session_uuid)
+        .ok_or(UndoRedoError::Timeline(TimelineError::SessionNotFound))?;
+    if position.branch_id != recording {
+        return Err(UndoRedoError::ReplayRefused {
+            branch: position.branch_id,
+            sequence: None,
+            kind: "session_on_other_branch".to_string(),
+            reason: format!(
+                concat!(
+                    "session {} is positioned on branch {}, but the live model holds and ",
+                    "records branch {}; switch to branch {} first"
+                ),
+                session_uuid, position.branch_id, recording, position.branch_id
+            ),
+            recording_branch: recording,
+        });
+    }
+    Ok((position.branch_id, position.event_index))
 }
 
 /// Shared tail of [`perform_undo`] / [`perform_redo`]: snapshot the
@@ -3468,6 +3856,7 @@ async fn finish_undo_redo(
     session_uuid: Uuid,
     event_id: EventId,
     op_label: &str,
+    before: (BranchId, u64),
 ) -> Result<UndoRedoOutcome, UndoRedoError> {
     // Snapshot the event details we need for the response under a short
     // read lock so the timeline lock is released before we reconcile the
@@ -3505,6 +3894,41 @@ async fn finish_undo_redo(
     // session's new pointer.
     let replay_outcome = match replay_session_to_model(state, session_uuid).await {
         Ok(outcome) => Some(outcome),
+        Err(refusal @ (ReplayRefusal::Boundary { .. } | ReplayRefusal::HistoryMoved { .. })) => {
+            let (branch, sequence, kind, reason) = refusal.typed_parts().unwrap_or((
+                before.0,
+                None,
+                String::new(),
+                refusal.to_string(),
+            ));
+            // Nothing was rebuilt; put the session's pointer back where it
+            // was so the timeline and the untouched live model agree.
+            let (before_branch, before_index) = before;
+            let restored = {
+                let timeline = state.timeline.read().await;
+                timeline.update_session_position(
+                    SessionId::new(session_uuid.to_string()),
+                    before_branch,
+                    before_index,
+                )
+            };
+            if let Err(e) = restored {
+                return Err(UndoRedoError::Internal(format!(
+                    concat!(
+                        "{} was refused ({}) and the session position could not be put ",
+                        "back: {}"
+                    ),
+                    op_label, reason, e
+                )));
+            }
+            return Err(UndoRedoError::ReplayRefused {
+                branch,
+                sequence,
+                kind,
+                reason,
+                recording_branch: state.timeline_recorder.branch_id(),
+            });
+        }
         Err(err) => {
             tracing::error!(
                 target: "timeline.undo_redo",
@@ -3597,6 +4021,18 @@ pub async fn undo_operation(
                 "error_code": "UNDO_ERROR"
             })))
         }
+        Err(err @ UndoRedoError::ReplayRefused { .. }) => {
+            let refusal = err
+                .replay_refusal()
+                .unwrap_or_else(|| ApiError::new(ErrorCode::BranchReplayRefused, err.to_string()));
+            Ok(Json(serde_json::json!({
+                "success": false,
+                "message": refusal.error,
+                "error_code": refusal.code.as_str(),
+                "hint": refusal.hint,
+                "details": refusal.details,
+            })))
+        }
         Err(UndoRedoError::SessionSeed(err)) => {
             tracing::error!(
                 target: "timeline.undo",
@@ -3659,7 +4095,7 @@ pub enum TruncateModeDto {
 pub async fn truncate_history(
     State(state): State<AppState>,
     Json(request): Json<TruncateHistoryRequest>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> Result<(StatusCode, Json<serde_json::Value>), StatusCode> {
     let session_uuid = Uuid::parse_str(&request.session_id).map_err(|_| StatusCode::BAD_REQUEST)?;
     let event_id =
         EventId(Uuid::parse_str(&request.event_id).map_err(|_| StatusCode::BAD_REQUEST)?);
@@ -3694,6 +4130,32 @@ pub async fn truncate_history(
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     }
 
+    // The protected-branch refusal is the more fundamental one: answer it
+    // (as `truncate_branch` does) before asking whether a rebuild would be
+    // refused.
+    let protected = {
+        let timeline = state.timeline.read().await;
+        timeline.get_branch(&branch_id).is_some_and(|b| b.protected)
+    };
+    if protected {
+        tracing::error!(
+            target: "timeline.truncate",
+            branch = %branch_id,
+            "branch is protected; truncate requires force"
+        );
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    // A truncate cannot be undone. Refuse it — nothing changed — when the
+    // live-model rebuild that must follow it would be refused.
+    if let Err(refusal) = truncate_preflight(&state, session_uuid, branch_id, cut_index).await {
+        let status = refusal.code.status();
+        return Ok((
+            status,
+            Json(serde_json::to_value(&refusal).unwrap_or_default()),
+        ));
+    }
+
     // Drop events from the branch. `Timeline::truncate_branch` clamps
     // any session pointer past `cut_index` down to the new head, so the
     // following replay sees a consistent (position, branch_events) pair.
@@ -3720,15 +4182,23 @@ pub async fn truncate_history(
     // Rebuild the live model from the surviving event prefix and push
     // ObjectDeleted/Created frames so every connected client refreshes.
     let replay_outcome = match replay_session_to_model(&state, session_uuid).await {
-        Ok(outcome) => Some(outcome),
+        Ok(outcome) => outcome,
         Err(err) => {
             tracing::error!(
                 target: "timeline.truncate",
                 session = %session_uuid,
                 error = %err,
-                "model replay after truncate failed; clients may see stale geometry"
+                "model replay after truncate failed; the live model is stale"
             );
-            None
+            return Ok(mutated_but_not_reconciled(
+                &state,
+                &err,
+                serde_json::json!({
+                    "operation": "truncate",
+                    "events_removed": removed,
+                    "cut_index": cut_index,
+                }),
+            ));
         }
     };
 
@@ -3746,19 +4216,17 @@ pub async fn truncate_history(
         )
         .await;
 
-    let (events_applied, events_skipped) = replay_outcome
-        .as_ref()
-        .map(|o| (o.events_applied, o.events_skipped))
-        .unwrap_or((0, 0));
-
-    Ok(Json(serde_json::json!({
-        "success": true,
-        "events_removed": removed,
-        "model_reconciled": replay_outcome.is_some(),
-        "events_applied": events_applied,
-        "events_skipped": events_skipped,
-        "cut_index": cut_index,
-    })))
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "success": true,
+            "events_removed": removed,
+            "model_reconciled": true,
+            "events_applied": replay_outcome.events_applied,
+            "events_skipped": replay_outcome.events_skipped,
+            "cut_index": cut_index,
+        })),
+    ))
 }
 
 /// Request to clear a branch's history outright.
@@ -3787,7 +4255,7 @@ pub struct ClearHistoryRequest {
 pub async fn clear_history(
     State(state): State<AppState>,
     Json(request): Json<ClearHistoryRequest>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+) -> Result<(StatusCode, Json<serde_json::Value>), StatusCode> {
     let session_uuid = Uuid::parse_str(&request.session_id).map_err(|_| StatusCode::BAD_REQUEST)?;
     let branch_id = match request.branch_id.as_deref() {
         Some(b) => resolve_branch_ref(b)?,
@@ -3804,6 +4272,17 @@ pub async fn clear_history(
             "failed to seed session position; clear aborted"
         );
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    // A clear cannot be undone. Refuse it — nothing changed — when the
+    // live-model rebuild that must follow it would be refused (the session
+    // may sit on another branch, whose history the rebuild replays).
+    if let Err(refusal) = truncate_preflight(&state, session_uuid, branch_id, 0).await {
+        let status = refusal.code.status();
+        return Ok((
+            status,
+            Json(serde_json::to_value(&refusal).unwrap_or_default()),
+        ));
     }
 
     // Drop every event on the branch. `force = true` — this endpoint is
@@ -3824,18 +4303,23 @@ pub async fn clear_history(
 
     // Rebuild the live model from the now-empty prefix and push
     // ObjectDeleted frames so every connected client refreshes to empty.
-    let replay_outcome = match replay_session_to_model(&state, session_uuid).await {
-        Ok(outcome) => Some(outcome),
-        Err(err) => {
-            tracing::error!(
-                target: "timeline.clear",
-                session = %session_uuid,
-                error = %err,
-                "model replay after clear failed; clients may see stale geometry"
-            );
-            None
-        }
-    };
+    if let Err(err) = replay_session_to_model(&state, session_uuid).await {
+        tracing::error!(
+            target: "timeline.clear",
+            session = %session_uuid,
+            error = %err,
+            "model replay after clear failed; the live model is stale"
+        );
+        return Ok(mutated_but_not_reconciled(
+            &state,
+            &err,
+            serde_json::json!({
+                "operation": "clear",
+                "events_removed": removed,
+                "branch_id": branch_id.to_string(),
+            }),
+        ));
+    }
 
     let _ = state
         .session_manager
@@ -3851,12 +4335,15 @@ pub async fn clear_history(
         )
         .await;
 
-    Ok(Json(serde_json::json!({
-        "success": true,
-        "events_removed": removed,
-        "model_reconciled": replay_outcome.is_some(),
-        "branch_id": branch_id.to_string(),
-    })))
+    Ok((
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "success": true,
+            "events_removed": removed,
+            "model_reconciled": true,
+            "branch_id": branch_id.to_string(),
+        })),
+    ))
 }
 
 /// Redo the last undone operation.
@@ -3905,6 +4392,18 @@ pub async fn redo_operation(
                 "success": false,
                 "message": format!("Redo operation failed: {}", e),
                 "error_code": "REDO_ERROR"
+            })))
+        }
+        Err(err @ UndoRedoError::ReplayRefused { .. }) => {
+            let refusal = err
+                .replay_refusal()
+                .unwrap_or_else(|| ApiError::new(ErrorCode::BranchReplayRefused, err.to_string()));
+            Ok(Json(serde_json::json!({
+                "success": false,
+                "message": refusal.error,
+                "error_code": refusal.code.as_str(),
+                "hint": refusal.hint,
+                "details": refusal.details,
             })))
         }
         Err(UndoRedoError::SessionSeed(err)) => {

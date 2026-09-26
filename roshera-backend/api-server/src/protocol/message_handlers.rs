@@ -58,6 +58,7 @@ fn ws_undo_redo_error_code(err: &crate::handlers::timeline::UndoRedoError) -> &'
         UndoRedoError::Timeline(_) => "UNDO_REDO_ERROR",
         UndoRedoError::SessionSeed(_) => "SESSION_SEED_FAILED",
         UndoRedoError::Internal(_) => "INTERNAL_ERROR",
+        UndoRedoError::ReplayRefused { .. } => "branch_replay_refused",
     }
 }
 
@@ -1499,7 +1500,7 @@ async fn handle_websocket_connection(socket: WebSocket, state: AppState) {
                                         } else {
                                             let session_uuid =
                                                 crate::handlers::timeline::live_session_id(
-                                                    &timeline_engine::BranchId::main(),
+                                                    &state.timeline_recorder.branch_id(),
                                                 );
                                             match crate::handlers::timeline::perform_undo(
                                                 &state,
@@ -1525,7 +1526,9 @@ async fn handle_websocket_connection(socket: WebSocket, state: AppState) {
                                                         error_code: ws_undo_redo_error_code(&err)
                                                             .to_string(),
                                                         message: err.to_string(),
-                                                        details: None,
+                                                        details: err
+                                                            .replay_refusal()
+                                                            .and_then(|r| r.details),
                                                         request_id,
                                                     }
                                                 }
@@ -1551,7 +1554,7 @@ async fn handle_websocket_connection(socket: WebSocket, state: AppState) {
                                         } else {
                                             let session_uuid =
                                                 crate::handlers::timeline::live_session_id(
-                                                    &timeline_engine::BranchId::main(),
+                                                    &state.timeline_recorder.branch_id(),
                                                 );
                                             match crate::handlers::timeline::perform_redo(
                                                 &state,
@@ -1577,7 +1580,9 @@ async fn handle_websocket_connection(socket: WebSocket, state: AppState) {
                                                         error_code: ws_undo_redo_error_code(&err)
                                                             .to_string(),
                                                         message: err.to_string(),
-                                                        details: None,
+                                                        details: err
+                                                            .replay_refusal()
+                                                            .and_then(|r| r.details),
                                                         request_id,
                                                     }
                                                 }
@@ -1772,21 +1777,17 @@ async fn handle_websocket_connection(socket: WebSocket, state: AppState) {
                                                 // the swap — never the hardcoded "main"
                                                 // the stub used to fabricate regardless
                                                 // of which branch was actually active.
-                                                let from_bid = state.timeline_recorder.branch_id();
-                                                let switch_result = crate::branches::set_active_branch(
-                                                    axum::extract::State(state.clone()),
-                                                    axum::extract::Json(
-                                                        crate::branches::SetActiveBranchBody {
-                                                            branch_id: target_bid.to_string(),
-                                                        },
-                                                    ),
-                                                )
-                                                .await;
+                                                // `from` is the branch the switch itself moved
+                                                // recording off — read under the switch's own
+                                                // guard, never before it.
+                                                let switch_result =
+                                                    crate::branches::switch_live_branch(&state, target_bid)
+                                                        .await;
                                                 match switch_result {
-                                                    Ok(_) => {
+                                                    Ok(switched) => {
                                                         let from =
                                                             crate::handlers::timeline::branch_label(
-                                                                from_bid,
+                                                                switched.from,
                                                             );
                                                         let to =
                                                             crate::handlers::timeline::branch_label(
@@ -1801,6 +1802,8 @@ async fn handle_websocket_connection(socket: WebSocket, state: AppState) {
                                                                 super::protocol::TimelineUpdate::BranchSwitched {
                                                                     from,
                                                                     to,
+                                                                    live_model: crate::branches::LIVE_MODEL_NOT_REBUILT
+                                                                        .to_string(),
                                                                 },
                                                         }
                                                     }
