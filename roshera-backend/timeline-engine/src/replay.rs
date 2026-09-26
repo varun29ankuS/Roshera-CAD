@@ -2248,6 +2248,136 @@ fn bind_blend_edges(
     Ok(out)
 }
 
+/// The faces and edges an event's replay resolves by their RAW recorded
+/// runtime id — as `face:<id>` / `edge:<id>` strings, in recorded order.
+///
+/// Replay threads ONE `id_remap` through a rebuild, and only solids are ever
+/// stamped into it (`stamp_outputs` pairs the first output). A face or edge
+/// reference therefore always takes `remap_id`'s fallback — the raw id the
+/// kernel handed out when the event was first recorded — unless it carries a
+/// durable persistent-id (fillet/chamfer edges with a recorded `edge_pids`
+/// entry, which [`bind_blend_edges`] binds by PID instead). That fallback is
+/// exact only when the replay allocates kernel ids in exactly the order the
+/// recording model did. A caller replaying a SUBSET of what the recording
+/// model executed (one branch of an interleaved multi-branch log) uses this to
+/// refuse such an event instead of letting it bind a different face.
+///
+/// This mirrors the dispatch arms that resolve faces/edges through
+/// `remap_id`: `extrude_face`, `revolve_face`, `transform_faces`,
+/// `transform_edges`, `fillet_edges` / `chamfer_edges` (PID-less edges only),
+/// `sweep_profile` and `loft_profiles` — the [`RAW_FACE_EDGE_ARMS`] list. The
+/// structural test `raw_reference_mirrors_match_the_dispatch_arms` fails when
+/// a dispatch arm gains a face/edge remap without being listed there.
+pub fn raw_topology_references(event: &TimelineEvent) -> Vec<String> {
+    let Operation::Generic {
+        command_type,
+        parameters,
+    } = &event.operation
+    else {
+        return Vec::new();
+    };
+    if !RAW_FACE_EDGE_ARMS.contains(&command_type.as_str()) {
+        return Vec::new();
+    }
+    let inner = parameters.get("params").unwrap_or(parameters);
+    let inputs: Vec<&Value> = parameters
+        .get("inputs")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().collect())
+        .unwrap_or_default();
+    let refs_of = |kind: &str, list: &[&Value]| -> Vec<String> {
+        list.iter()
+            .filter_map(|v| parse_entity_ref(v, kind))
+            .map(|id| format!("{kind}:{id}"))
+            .collect()
+    };
+    match command_type.as_str() {
+        "extrude_face" | "revolve_face" => inner
+            .get("face_id")
+            .and_then(|v| v.as_f64())
+            .map(|id| vec![format!("face:{}", id as u64)])
+            .unwrap_or_default(),
+        "transform_faces" => refs_of("face", &inputs),
+        "transform_edges" | "sweep_profile" | "loft_profiles" => refs_of("edge", &inputs),
+        "fillet_edges" | "chamfer_edges" => {
+            let pids = parse_recorded_edge_pids(inner);
+            inputs
+                .iter()
+                .skip(1)
+                .filter_map(|v| parse_entity_ref(v, "edge"))
+                .enumerate()
+                .filter(|(i, _)| pids.get(*i).copied().flatten().is_none())
+                .map(|(_, id)| format!("edge:{id}"))
+                .collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// The `dispatch_generic` arms that resolve a face or edge through
+/// `remap_id` — exactly the kinds [`raw_topology_references`] handles. The
+/// structural drift gate `raw_reference_mirrors_match_the_dispatch_arms`
+/// compares this list with the arms of `dispatch_generic` that cast a
+/// remapped id `as FaceId` / `as EdgeId`.
+pub const RAW_FACE_EDGE_ARMS: &[&str] = &[
+    "extrude_face",
+    "revolve_face",
+    "transform_faces",
+    "transform_edges",
+    "sweep_profile",
+    "loft_profiles",
+    "fillet_edges",
+    "chamfer_edges",
+];
+
+/// The `params` keys under which `dispatch_generic` arms (and
+/// [`rederive_part_drawing`]) read a recorded SOLID id. The structural drift
+/// gate checks every `num_field(inner, "<key>", kind)? as u64` read in an arm
+/// that casts `as SolidId` against this list (plus `face_id`, a face).
+pub const SOLID_PARAM_KEYS: &[&str] = &["solid_a", "solid_b", "solid_id", "source_solid_id"];
+
+/// The recorded solid ids an event's replay takes as INPUT: every
+/// [`SOLID_PARAM_KEYS`] value in its `params`, and every `solid:<id>` in its
+/// recorded `inputs`. Replay resolves each through `id_remap`, which holds
+/// only solids some EARLIER replayed event produced; any other id takes the
+/// raw fallback and binds whatever solid now carries that number. A caller
+/// replaying a history uses this with [`recorded_solid_outputs`] to refuse an
+/// event whose solid input that history never produced.
+pub fn recorded_solid_inputs(event: &TimelineEvent) -> Vec<u64> {
+    let Operation::Generic { parameters, .. } = &event.operation else {
+        return Vec::new();
+    };
+    let inner = parameters.get("params").unwrap_or(parameters);
+    let mut ids: Vec<u64> = SOLID_PARAM_KEYS
+        .iter()
+        .filter_map(|key| inner.get(*key).and_then(|v| v.as_f64()))
+        .map(|id| id as u64)
+        .collect();
+    if let Some(inputs) = parameters.get("inputs").and_then(|v| v.as_array()) {
+        ids.extend(inputs.iter().filter_map(|v| parse_entity_ref(v, "solid")));
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+/// The recorded solid ids an event PRODUCED — every `solid:<id>` in its
+/// recorded `outputs` (the ids `stamp_outputs` maps on replay).
+pub fn recorded_solid_outputs(event: &TimelineEvent) -> Vec<u64> {
+    let Operation::Generic { parameters, .. } = &event.operation else {
+        return Vec::new();
+    };
+    parameters
+        .get("outputs")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| parse_entity_ref(v, "solid"))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3864,5 +3994,173 @@ mod tests {
             (replayed - task14_reference_volume(0.5)).abs() < 1e-9,
             "radius-only replay must apply 0.5; got {replayed}"
         );
+    }
+
+    /// `raw_topology_references` names exactly the face/edge references the
+    /// dispatch arms resolve by raw recorded id: an extruded face, every
+    /// transformed face, and only the blend edges WITHOUT a recorded PID.
+    #[test]
+    fn raw_topology_references_names_raw_face_and_pidless_edge_refs() {
+        let extrude = mk_event(
+            "extrude_face",
+            serde_json::json!({ "params": { "face_id": 10, "distance": 3.0 }, "inputs": [], "outputs": [] }),
+        );
+        assert_eq!(
+            raw_topology_references(&extrude),
+            vec!["face:10".to_string()]
+        );
+
+        let faces = mk_event(
+            "transform_faces",
+            serde_json::json!({ "params": {}, "inputs": ["face:4", "face:7"], "outputs": [] }),
+        );
+        assert_eq!(
+            raw_topology_references(&faces),
+            vec!["face:4".to_string(), "face:7".to_string()]
+        );
+
+        let fillet = mk_event(
+            "fillet_edges",
+            serde_json::json!({
+                "params": { "edge_pids": ["12345", null] },
+                "inputs": ["solid:0", "edge:3", "edge:9"],
+                "outputs": []
+            }),
+        );
+        assert_eq!(
+            raw_topology_references(&fillet),
+            vec!["edge:9".to_string()],
+            "an edge with a recorded PID is bound by PID, not by raw id"
+        );
+
+        let create = mk_event(
+            "create_box_3d",
+            serde_json::json!({ "params": {}, "inputs": [], "outputs": ["solid:0"] }),
+        );
+        assert!(raw_topology_references(&create).is_empty());
+    }
+
+    /// Every kind in `RAW_FACE_EDGE_ARMS` is actually handled by the mirror:
+    /// a synthetic event carrying a face id and PID-less edge/face inputs
+    /// yields at least one raw reference for each.
+    #[test]
+    fn every_listed_face_edge_arm_is_handled_by_the_mirror() {
+        for kind in RAW_FACE_EDGE_ARMS {
+            let event = mk_event(
+                kind,
+                serde_json::json!({
+                    "params": { "face_id": 1 },
+                    "inputs": ["solid:0", "face:1", "edge:1", "edge:2"],
+                    "outputs": []
+                }),
+            );
+            assert!(
+                !raw_topology_references(&event).is_empty(),
+                "{kind} is listed as a raw face/edge arm but the mirror names nothing for it"
+            );
+        }
+    }
+
+    /// Solid inputs come from the `SOLID_PARAM_KEYS` params and the recorded
+    /// `solid:` inputs; outputs from the recorded `solid:` outputs.
+    #[test]
+    fn recorded_solid_inputs_and_outputs_read_the_recorded_channels() {
+        let boolean = mk_event(
+            "boolean_difference",
+            serde_json::json!({
+                "params": { "solid_a": 0, "solid_b": 1 },
+                "inputs": ["solid:0", "solid:1"],
+                "outputs": ["solid:3"]
+            }),
+        );
+        assert_eq!(recorded_solid_inputs(&boolean), vec![0, 1]);
+        assert_eq!(recorded_solid_outputs(&boolean), vec![3]);
+        let clone = mk_event(
+            "deep_clone_solid",
+            serde_json::json!({
+                "params": { "source_solid_id": 4 },
+                "inputs": [],
+                "outputs": ["solid:5"]
+            }),
+        );
+        assert_eq!(recorded_solid_inputs(&clone), vec![4]);
+        assert_eq!(recorded_solid_outputs(&clone), vec![5]);
+    }
+
+    /// Structural drift gate for the raw-reference mirrors. `dispatch_generic`
+    /// is split into its match arms (headers at the arm indentation, so
+    /// nested matches and line-wrapping do not matter):
+    /// - the arms that cast a remapped id `as FaceId` / `as EdgeId` must be
+    ///   exactly `RAW_FACE_EDGE_ARMS`;
+    /// - every `num_field(inner, "<key>", kind)? as u64` read in an arm that
+    ///   casts `as SolidId` must be a `SOLID_PARAM_KEYS` key (or `face_id`).
+    ///
+    /// A new face/edge remap arm, or a solid read under a new key, fails here
+    /// until the mirror covers it — otherwise a subset replay could bind it
+    /// silently.
+    #[test]
+    fn raw_reference_mirrors_match_the_dispatch_arms() {
+        let source = include_str!("replay.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap_or_default();
+        let start = production
+            .find("fn dispatch_generic(")
+            .expect("dispatch_generic must exist");
+        let body = &production[start..];
+        let end = body[1..].find("\nfn ").map(|i| i + 1).unwrap_or(body.len());
+        let body = &body[..end];
+
+        let mut arms: Vec<(Vec<String>, String)> = Vec::new();
+        for line in body.lines() {
+            let is_header = line.starts_with("        \"") && line.contains("=>");
+            if is_header {
+                let header = line.split("=>").next().unwrap_or_default();
+                let names: Vec<String> = header
+                    .split('"')
+                    .enumerate()
+                    .filter(|(i, _)| i % 2 == 1)
+                    .map(|(_, s)| s.to_string())
+                    .collect();
+                arms.push((names, String::new()));
+            }
+            if let Some((_, text)) = arms.last_mut() {
+                text.push(' ');
+                text.push_str(line.trim());
+            }
+        }
+        assert!(
+            arms.len() > 20,
+            "dispatch_generic arms must parse; got {}",
+            arms.len()
+        );
+
+        let mut face_edge: Vec<String> = arms
+            .iter()
+            .filter(|(_, text)| {
+                text.contains("remap_id(")
+                    && (text.contains("as FaceId") || text.contains("as EdgeId"))
+            })
+            .flat_map(|(names, _)| names.clone())
+            .collect();
+        face_edge.sort();
+        let mut listed: Vec<String> = RAW_FACE_EDGE_ARMS.iter().map(|s| s.to_string()).collect();
+        listed.sort();
+        assert_eq!(
+            face_edge, listed,
+            "the face/edge remap arms of dispatch_generic must equal RAW_FACE_EDGE_ARMS"
+        );
+
+        for (names, text) in arms.iter().filter(|(_, t)| t.contains("as SolidId")) {
+            for piece in text.split("num_field(inner, \"").skip(1) {
+                let Some((key, rest)) = piece.split_once('"') else {
+                    continue;
+                };
+                if rest.trim_start().starts_with(", kind)? as u64") {
+                    assert!(
+                        SOLID_PARAM_KEYS.contains(&key) || key == "face_id",
+                        "arm {names:?} reads a recorded id under `{key}`, not in SOLID_PARAM_KEYS"
+                    );
+                }
+            }
+        }
     }
 }

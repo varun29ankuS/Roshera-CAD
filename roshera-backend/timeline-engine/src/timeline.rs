@@ -961,7 +961,11 @@ impl Timeline {
     /// restored separately by [`rehydrate_events`](Self::rehydrate_events); this
     /// only re-establishes the branch's existence and fork point so those events
     /// have a home. `main` always exists (created by [`Timeline::new`]) and is
-    /// never overwritten. A restored branch is reinstated `Active`.
+    /// never overwritten. A restored branch is reinstated `Active`; a persisted
+    /// `Merged` / `Abandoned` state is applied afterwards by
+    /// [`restore_branch_state`](Self::restore_branch_state), and the history
+    /// entries its own events do not cover (the fork prefix, merged-in
+    /// events) by [`rehydrate_branch_entries`](Self::rehydrate_branch_entries).
     ///
     /// `created_by` is the branch's PERSISTED author, restored verbatim so a
     /// reboot does not heal-away authorship (events already round-trip their
@@ -1058,6 +1062,120 @@ impl Timeline {
                 Ok(_) => break,
                 Err(actual) => cur = actual,
             }
+        }
+        Ok(())
+    }
+
+    /// Durability boot restore: add entries to a branch's history index for
+    /// events that are ALREADY in the timeline (restored by
+    /// [`rehydrate_events`](Self::rehydrate_events) under their origin
+    /// branch).
+    ///
+    /// `rehydrate_events` files each event only under the branch that
+    /// recorded it. The in-memory rules give a branch more than that: a fork
+    /// copies the parent's prefix into the child's index
+    /// ([`create_branch`](Self::create_branch)), and a merge inserts the
+    /// source's events into the target's index
+    /// ([`merge_branches`](Self::merge_branches)). This is how a restored
+    /// branch gets those entries back, under their original sequence numbers.
+    ///
+    /// Validate first, mutate later: the branch must exist and every
+    /// `(sequence, event id)` pair must name an event present in the timeline
+    /// under exactly that sequence number. On any mismatch nothing is inserted
+    /// and the first mismatch is returned — a restored history never points at
+    /// an event the timeline does not hold.
+    pub fn rehydrate_branch_entries(
+        &self,
+        branch_id: BranchId,
+        entries: &[(EventIndex, EventId)],
+    ) -> TimelineResult<()> {
+        if !self.branches.contains_key(&branch_id) {
+            return Err(TimelineError::BranchNotFound(branch_id));
+        }
+        for (sequence, event_id) in entries {
+            let recorded = self
+                .events
+                .get(event_id)
+                .map(|event| event.sequence_number)
+                .ok_or(TimelineError::EventNotFound(*event_id))?;
+            if recorded != *sequence {
+                return Err(TimelineError::Internal(format!(
+                    "event {event_id} is recorded at sequence {recorded}, not {sequence}; \
+                     refusing to file it in branch {branch_id} under the wrong position"
+                )));
+            }
+        }
+        let index = self
+            .branch_events
+            .get(&branch_id)
+            .ok_or(TimelineError::BranchNotFound(branch_id))?;
+        for (sequence, event_id) in entries {
+            index.insert(*sequence, *event_id);
+        }
+        Ok(())
+    }
+
+    /// Reinstate a branch's lifecycle state from the durable store.
+    ///
+    /// Two callers, one meaning — "the store is the truth for this state":
+    /// boot, where [`rehydrate_branch`](Self::rehydrate_branch) creates every
+    /// branch `Active` and this applies the persisted `Merged` / `Abandoned`
+    /// state (including `main`'s, which `rehydrate_branch` never touches);
+    /// and a refused transition, where the in-memory flip is undone because
+    /// its durable write failed and the store still holds the old state.
+    pub fn restore_branch_state(
+        &self,
+        branch_id: BranchId,
+        state: BranchState,
+    ) -> TimelineResult<()> {
+        let mut branch = self
+            .branches
+            .get_mut(&branch_id)
+            .ok_or(TimelineError::BranchNotFound(branch_id))?;
+        branch.state = state;
+        Ok(())
+    }
+
+    /// Undo a merge whose durable write failed: remove exactly the entries the
+    /// merge inserted into `target` and return `source` to `Active`.
+    ///
+    /// `inserted` must be the keys the merge ADDED (target-after minus
+    /// target-before), never the source's whole history — entries the target
+    /// already held stay. Refuses, without touching anything, unless `source`
+    /// is currently `Merged` into `target`: reverting a merge that did not
+    /// happen would re-open a branch some other transition closed.
+    pub fn revert_merge(
+        &self,
+        source: BranchId,
+        target: BranchId,
+        inserted: &[EventIndex],
+    ) -> TimelineResult<()> {
+        {
+            let branch = self
+                .branches
+                .get(&source)
+                .ok_or(TimelineError::BranchNotFound(source))?;
+            match &branch.state {
+                BranchState::Merged { into, .. } if *into == target => {}
+                other => {
+                    return Err(TimelineError::InvalidOperation(format!(
+                        "branch {source} is not merged into {target} (state={other:?}); \
+                         refusing to revert a merge that did not happen"
+                    )));
+                }
+            }
+        }
+        {
+            let index = self
+                .branch_events
+                .get(&target)
+                .ok_or(TimelineError::BranchNotFound(target))?;
+            for sequence in inserted {
+                index.remove(sequence);
+            }
+        }
+        if let Some(mut branch) = self.branches.get_mut(&source) {
+            branch.state = BranchState::Active;
         }
         Ok(())
     }
@@ -3962,6 +4080,126 @@ mod tests {
         assert!(!timeline.is_branch_active(&side));
         // Unknown branch — also not active.
         assert!(!timeline.is_branch_active(&BranchId::new()));
+    }
+
+    fn box_op() -> Operation {
+        Operation::CreatePrimitive {
+            primitive_type: crate::PrimitiveType::Box,
+            parameters: serde_json::json!({"width": 10, "height": 10, "depth": 10}),
+        }
+    }
+
+    /// `revert_merge` undoes exactly the entries a merge inserted and
+    /// re-opens the source — and refuses, touching nothing, when the source
+    /// is not merged into that target (a revert of a merge that did not
+    /// happen would re-open a branch some other transition closed).
+    #[tokio::test]
+    async fn revert_merge_undoes_only_a_real_merge() {
+        let timeline = Timeline::new(TimelineConfig::default());
+        timeline
+            .add_operation(box_op(), Author::System, BranchId::main())
+            .await
+            .unwrap();
+        let side = timeline
+            .create_branch(
+                "side".to_string(),
+                BranchId::main(),
+                None,
+                Author::System,
+                crate::BranchPurpose::UserExploration {
+                    description: "t".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        timeline
+            .add_operation(box_op(), Author::System, side)
+            .await
+            .unwrap();
+
+        let refused = timeline
+            .revert_merge(side, BranchId::main(), &[1])
+            .expect_err("an Active source was never merged; the revert must refuse");
+        assert!(matches!(refused, TimelineError::InvalidOperation(_)));
+        assert!(timeline.is_branch_active(&side));
+
+        let before = timeline
+            .branch_event_keys_sorted(&BranchId::main())
+            .unwrap();
+        timeline
+            .merge_branches(side, BranchId::main(), MergeStrategy::FastForward)
+            .await
+            .unwrap();
+        let after = timeline
+            .branch_event_keys_sorted(&BranchId::main())
+            .unwrap();
+        let inserted: Vec<EventIndex> = after
+            .iter()
+            .filter(|k| !before.contains(k))
+            .copied()
+            .collect();
+        assert_eq!(
+            inserted,
+            vec![1],
+            "the fast-forward inserted the side event"
+        );
+
+        timeline
+            .revert_merge(side, BranchId::main(), &inserted)
+            .unwrap();
+        assert_eq!(
+            timeline
+                .branch_event_keys_sorted(&BranchId::main())
+                .unwrap(),
+            before,
+            "the revert removes exactly the inserted entries"
+        );
+        assert!(
+            timeline.is_branch_active(&side),
+            "the source is Active again"
+        );
+        timeline
+            .validate()
+            .expect("a reverted merge leaves a valid timeline");
+    }
+
+    /// `rehydrate_branch_entries` validates every entry before inserting
+    /// any: an entry naming an event under the wrong sequence is refused and
+    /// the index is left exactly as it was.
+    #[tokio::test]
+    async fn rehydrate_branch_entries_refuses_a_mismatched_entry_without_inserting() {
+        let timeline = Timeline::new(TimelineConfig::default());
+        let first = timeline
+            .add_operation(box_op(), Author::System, BranchId::main())
+            .await
+            .unwrap();
+        let side = timeline
+            .create_branch(
+                "side".to_string(),
+                BranchId::main(),
+                None,
+                Author::System,
+                crate::BranchPurpose::UserExploration {
+                    description: "t".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        timeline.branch_events.insert(side, DashMap::new());
+
+        let err = timeline
+            .rehydrate_branch_entries(side, &[(0, first), (7, first)])
+            .expect_err("sequence 7 does not hold that event");
+        assert!(matches!(err, TimelineError::Internal(_)));
+        assert!(
+            timeline.branch_event_keys_sorted(&side).unwrap().is_empty(),
+            "a refused restore inserts nothing, not even the valid entry"
+        );
+
+        timeline
+            .rehydrate_branch_entries(side, &[(0, first)])
+            .unwrap();
+        assert_eq!(timeline.branch_event_keys_sorted(&side).unwrap(), vec![0]);
     }
 
     /// A protected branch (`main`) must refuse `abandon_branch` when

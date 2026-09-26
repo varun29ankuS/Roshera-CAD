@@ -25,13 +25,14 @@
 //! Slice 1 ships with NO snapshots — boot is a full replay of the log. A slow
 //! boot on a large document is acceptable for the alpha (spec §4.2).
 
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use serde::Serialize;
 use session_manager::{BranchRecord, DatabasePersistence, TimelineEventData};
 use timeline_engine::{
-    certify_rebuild, rebuild_model_from_events, Author, BranchId, EventSink, Operation,
-    TimelineEvent,
+    certify_rebuild, raw_topology_references, rebuild_model_from_events, recorded_solid_inputs,
+    recorded_solid_outputs, Author, BranchId, BranchState, EventSink, Operation, TimelineEvent,
 };
 use tokio::sync::RwLock;
 use uuid::Uuid;
@@ -75,15 +76,31 @@ pub enum DurabilityStatus {
     /// Durability on, but the log is empty — a fresh install booted blank,
     /// exactly like the pre-durability server.
     Empty,
-    /// The full log replayed cleanly; the served model is the whole document.
+    /// The live branch's whole history replayed cleanly; the served model is
+    /// that branch's document. The live model is replayed from exactly ONE
+    /// branch — the branch the recorder targets after boot (`main`); every
+    /// other branch's history is restored into the timeline, not replayed.
     Active {
-        /// Number of events replayed into the model.
+        /// Number of events replayed into the live model (the live branch's
+        /// history).
         events_replayed: usize,
+        /// Number of persisted events restored into the timeline across
+        /// every branch (the live branch's history plus every other
+        /// branch's own events).
+        events_restored: usize,
+        /// Defects in branches OTHER than the live one (a corrupt row, an
+        /// event whose branch has no record, a history entry no persisted
+        /// event holds). They do not touch the served model, so they do not
+        /// quarantine it — but each is named here rather than dropped.
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        branch_faults: Vec<BranchFault>,
     },
-    /// The log contains an event the current kernel cannot faithfully replay.
-    /// The clean prefix up to `first_break_sequence` is served; everything at
-    /// and after it is refused. This is the #44 silent-lie guard applied to
-    /// persistence.
+    /// The live branch's history contains an event the current kernel cannot
+    /// faithfully replay. The clean prefix up to `first_break_sequence` is
+    /// served; everything at and after it is refused. This is the #44
+    /// silent-lie guard applied to persistence. Only the live branch's own
+    /// history can quarantine it: an event on a side branch was never going
+    /// to be replayed into the live model.
     Quarantined {
         /// The sequence number of the first event that could not be replayed
         /// (an unknown kind, a failed feature, or a corrupt row).
@@ -95,8 +112,12 @@ pub enum DurabilityStatus {
         reason: String,
         /// Events served (the clean prefix).
         events_served: usize,
-        /// Total events found in the log (prefix + quarantined tail).
+        /// Total events in the live branch's history (prefix + quarantined
+        /// tail).
         events_total: usize,
+        /// Defects in branches other than the live one (see `Active`).
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        branch_faults: Vec<BranchFault>,
     },
     /// The log could not be read at all (a database read error at boot). The
     /// server is up but serves a blank model; the durability layer is not
@@ -105,6 +126,27 @@ pub enum DurabilityStatus {
         /// The read error.
         reason: String,
     },
+}
+
+/// One named defect in a branch that is not the live one, found at boot.
+///
+/// A side branch is not replayed, so its defects cannot quarantine the live
+/// model — but a history that silently lost an event is exactly the lie this
+/// layer refuses, so each one is reported on `/api/durability/status`.
+#[derive(Debug, Clone, Serialize)]
+pub struct BranchFault {
+    /// The branch whose restored history is affected.
+    pub branch_id: String,
+    /// The sequence number concerned, when the fault is about one event.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sequence: Option<u64>,
+    /// Machine-readable kind: `corrupt_event_row`, `unknown_origin_branch`,
+    /// `missing_event`, `refused_by_live_quarantine`, `missing_parent_branch`,
+    /// `branch_parent_cycle`, `unreadable_branch_record`,
+    /// `merge_membership_missing`, or `restore_failed`.
+    pub kind: &'static str,
+    /// Human-readable reason.
+    pub reason: String,
 }
 
 /// A shared, mutable durability status handle carried in `AppState`.
@@ -144,6 +186,16 @@ pub enum DurabilityError {
         /// The store's own error, preserved verbatim.
         source: session_manager::SessionError,
     },
+    /// The record to write describes something no longer in the live
+    /// timeline (a branch removed between its transition and the write), so
+    /// there is nothing true to persist.
+    #[error("{record} {id} is not in the live timeline; its state cannot be written")]
+    Missing {
+        /// The record kind ("branch").
+        record: &'static str,
+        /// The id that could not be found.
+        id: String,
+    },
 }
 
 impl DurabilityError {
@@ -151,9 +203,9 @@ impl DurabilityError {
     /// `"branch"`. Surfaced in the typed `ApiError`'s `details.record`.
     pub fn record(&self) -> &'static str {
         match self {
-            DurabilityError::Serialize { record, .. } | DurabilityError::Store { record, .. } => {
-                record
-            }
+            DurabilityError::Serialize { record, .. }
+            | DurabilityError::Store { record, .. }
+            | DurabilityError::Missing { record, .. } => record,
         }
     }
 
@@ -162,6 +214,7 @@ impl DurabilityError {
         match self {
             DurabilityError::Serialize { source, .. } => source.to_string(),
             DurabilityError::Store { source, .. } => source.to_string(),
+            DurabilityError::Missing { .. } => self.to_string(),
         }
     }
 }
@@ -180,6 +233,31 @@ impl DurabilityError {
 pub fn quarantine_disclosure(status: &DurabilityStatus) -> Option<&DurabilityStatus> {
     match status {
         DurabilityStatus::Quarantined { .. } => Some(status),
+        _ => None,
+    }
+}
+
+/// Disclosure for ONE branch's history read (`GET /timeline/history/{branch}`).
+///
+/// Everything [`quarantine_disclosure`] discloses, plus: a document whose live
+/// branch replayed cleanly but whose `branch_faults` name THIS branch — a
+/// corrupt row, an orphan, a missing or refused entry in its history. That
+/// branch's restored history is missing an event, and a read of it must say
+/// so rather than present the remainder as complete. `None` otherwise, so a
+/// clean branch's read is byte-for-byte unchanged.
+pub fn history_disclosure<'a>(
+    status: &'a DurabilityStatus,
+    branch: &BranchId,
+) -> Option<&'a DurabilityStatus> {
+    match status {
+        DurabilityStatus::Quarantined { .. } => Some(status),
+        DurabilityStatus::Active { branch_faults, .. } => {
+            let branch = branch.to_string();
+            branch_faults
+                .iter()
+                .any(|fault| fault.branch_id == branch)
+                .then_some(status)
+        }
         _ => None,
     }
 }
@@ -336,26 +414,152 @@ pub async fn persist_branch(
         return Ok(());
     }
     let document_id = write_document(state).await;
+    // The index the fork gave the child — the in-memory rule's OUTPUT, read
+    // back rather than re-derived. A boot-time `parent entries <= fork`
+    // formula is not the same thing: a later merge into the parent inserts
+    // events under their original (older) sequence numbers, which that
+    // formula would hand to a child that never had them.
+    let inherited: Option<Vec<u64>> = {
+        let timeline = state.timeline.read().await;
+        timeline.get_branch_events_map(&branch_id).map(|index| {
+            let mut keys: Vec<u64> = index.iter().map(|entry| *entry.key()).collect();
+            keys.sort_unstable();
+            keys
+        })
+    };
+    let mut data = serde_json::Map::new();
+    data.insert(
+        DATA_CREATED_BY.to_string(),
+        serde_json::to_value(&created_by).map_err(|source| DurabilityError::Serialize {
+            record: "branch",
+            source,
+        })?,
+    );
+    if let Some(inherited) = inherited {
+        data.insert(DATA_INHERITED.to_string(), serde_json::json!(inherited));
+    }
     let record = BranchRecord {
         session_id: document_id,
         branch_id: branch_id.to_string(),
         parent_branch_id: parent.map(|p| p.to_string()),
         fork_sequence,
         name,
-        data: serde_json::json!({ "created_by": created_by }),
+        data: serde_json::Value::Object(data),
     };
-    state.database.save_branch(&record).await.map_err(|e| {
+    save_branch_record(state, &record, branch_id).await
+}
+
+/// Keys of a `durable_branches` row's `data` blob. Every key is optional on
+/// read: a row written before a key existed restores that field's OLD
+/// behaviour, never a guessed upgrade.
+///
+/// - `created_by` — the branch's author. Absent: `Author::System`.
+/// - `inherited_sequences` — the branch's history index as the fork left
+///   it. Absent (rows written before this key): the fork rule, the parent's
+///   entries `<= fork_sequence` counted WITHOUT persisted merges — such a
+///   row forked before any merge was persisted, so every persisted merge
+///   into its parent came after its fork.
+/// - `state` — the serialized `BranchState`. Absent: `Active`.
+/// - `merged_sequences` — on a `Merged { into }` branch, the sequence
+///   numbers the merge inserted into `into`'s history. Lives on the SOURCE
+///   row: a branch merges at most once (it is no longer `Active` after), so
+///   the state flip and its membership effect land in ONE upsert, and a
+///   target (usually `main`) needs no row of its own.
+///
+/// A truncation (Task 74) extends this same blob: a per-branch cut, with the
+/// cascade-abandon of children written through [`persist_branch_transition`].
+const DATA_CREATED_BY: &str = "created_by";
+const DATA_INHERITED: &str = "inherited_sequences";
+const DATA_STATE: &str = "state";
+const DATA_MERGED: &str = "merged_sequences";
+
+async fn save_branch_record(
+    state: &AppState,
+    record: &BranchRecord,
+    branch_id: BranchId,
+) -> Result<(), DurabilityError> {
+    state.database.save_branch(record).await.map_err(|e| {
         tracing::error!(
             target: "durability",
             branch = %branch_id,
             error = %e,
-            "durability: failed to persist branch metadata"
+            "durability: failed to persist branch record"
         );
         DurabilityError::Store {
             record: "branch",
             source: e,
         }
     })
+}
+
+/// Persist a branch's lifecycle transition — a merge (`Merged { into }` plus
+/// the sequences the merge inserted into `into`) or an abandon — so a restart
+/// restores it instead of reviving the branch `Active`.
+///
+/// Called AFTER the in-memory transition, with the same discipline as
+/// [`persist_branch`]: a failure is the RETURNED [`DurabilityError`] and the
+/// caller rolls the in-memory transition back and refuses. The row is
+/// rebuilt from the live `Branch` (the upsert replaces the whole row) and
+/// every data key the existing row already carries is kept — so the
+/// `inherited_sequences` a create wrote survive the transition. `main` gets a
+/// row here the first time it transitions itself.
+pub async fn persist_branch_transition(
+    state: &AppState,
+    branch_id: BranchId,
+    merged_sequences: Option<Vec<u64>>,
+) -> Result<(), DurabilityError> {
+    if !durability_enabled() {
+        return Ok(());
+    }
+    let document_id = write_document(state).await;
+    let branch = {
+        let timeline = state.timeline.read().await;
+        timeline.get_branch(&branch_id)
+    }
+    .ok_or_else(|| DurabilityError::Missing {
+        record: "branch",
+        id: branch_id.to_string(),
+    })?;
+    let existing = state
+        .database
+        .load_branches(&document_id)
+        .await
+        .map_err(|source| DurabilityError::Store {
+            record: "branch",
+            source,
+        })?
+        .into_iter()
+        .find(|row| row.branch_id == branch_id.to_string());
+    let mut data = match existing.map(|row| row.data) {
+        Some(serde_json::Value::Object(map)) => map,
+        _ => serde_json::Map::new(),
+    };
+    let to_value = |value: serde_json::Result<serde_json::Value>| {
+        value.map_err(|source| DurabilityError::Serialize {
+            record: "branch",
+            source,
+        })
+    };
+    data.insert(
+        DATA_CREATED_BY.to_string(),
+        to_value(serde_json::to_value(&branch.metadata.created_by))?,
+    );
+    data.insert(
+        DATA_STATE.to_string(),
+        to_value(serde_json::to_value(&branch.state))?,
+    );
+    if let Some(merged) = merged_sequences {
+        data.insert(DATA_MERGED.to_string(), serde_json::json!(merged));
+    }
+    let record = BranchRecord {
+        session_id: document_id,
+        branch_id: branch_id.to_string(),
+        parent_branch_id: branch.parent.map(|p| p.to_string()),
+        fork_sequence: branch.fork_point.event_index as i64,
+        name: branch.name.clone(),
+        data: serde_json::Value::Object(data),
+    };
+    save_branch_record(state, &record, branch_id).await
 }
 
 /// Persist a named checkpoint so the declared-intent layer survives a restart
@@ -504,12 +708,37 @@ async fn boot_replay_inner(state: &AppState) -> DurabilityStatus {
     // switch is not a new code path, just a different value in this cell.
     let document_id = state.active_document.read().await.clone();
 
-    // 1. Restore branch metadata first, so non-`main` events have a home
-    //    during rehydration. Failure here is non-fatal (main always exists).
+    // The live model is replayed from exactly ONE branch's history: the
+    // branch the recorder targets once boot returns. Every boot and every
+    // document open records onto `main` (`documents::activate` resets the
+    // recorder there too), so that branch is `main` — pinned HERE, beside the
+    // replay that depends on it, rather than assumed from whoever built the
+    // recorder. Replaying any other set into the model would hand the next
+    // recorded operation a model its branch's history does not describe.
+    let live_branch = BranchId::main();
+    state.timeline_recorder.set_branch_id(live_branch);
+
+    // 1. Restore branch records first (identity, parentage, state), so every
+    //    event has a home during rehydration. Failure to READ them is
+    //    non-fatal (main always exists) — every non-`main` event then has no
+    //    branch and is reported as a fault below, never silently dropped.
+    let mut faults: Vec<BranchFault> = Vec::new();
+    let mut plans: HashMap<BranchId, BranchPlan> = HashMap::new();
+    plans.insert(
+        live_branch,
+        BranchPlan {
+            parent: None,
+            fork_sequence: 0,
+            inherited: None,
+            merged: None,
+        },
+    );
     match state.database.load_branches(&document_id).await {
         Ok(records) => {
             for record in records {
-                restore_branch(state, record).await;
+                if let Some((id, plan)) = restore_branch(state, record, &mut faults).await {
+                    plans.insert(id, plan);
+                }
             }
         }
         Err(e) => {
@@ -544,111 +773,322 @@ async fn boot_replay_inner(state: &AppState) -> DurabilityStatus {
     }
 
     // 3. Deserialize each row's blob back into a full TimelineEvent. A row that
-    //    cannot be deserialized is a corrupt/incompatible record — remember the
-    //    earliest such sequence so it becomes a quarantine boundary.
-    let mut events: Vec<TimelineEvent> = Vec::with_capacity(rows.len());
-    let mut first_corrupt_seq: Option<u64> = None;
+    //    cannot be deserialized is a corrupt/incompatible record: it is kept as
+    //    a HOLE at its sequence, attributed to the branch its `branch_id`
+    //    column names. A row with no readable branch is attributed to the
+    //    live branch — it cannot be proven NOT to be the live model's, so it
+    //    quarantines it rather than being waved through.
+    let mut by_seq: HashMap<u64, TimelineEvent> = HashMap::with_capacity(rows.len());
+    let mut corrupt: HashMap<u64, BranchId> = HashMap::new();
+    let mut orphans: HashMap<u64, BranchId> = HashMap::new();
+    let mut own: HashMap<BranchId, BTreeSet<u64>> = HashMap::new();
     for row in &rows {
+        let seq = row.sequence_number.max(0) as u64;
         match serde_json::from_value::<TimelineEvent>(row.data.clone()) {
-            Ok(event) => events.push(event),
+            Ok(event) => {
+                let origin = event.metadata.branch_id;
+                if plans.contains_key(&origin) {
+                    own.entry(origin).or_default().insert(seq);
+                    by_seq.insert(seq, event);
+                } else {
+                    orphans.insert(seq, origin);
+                    faults.push(branch_fault(
+                        origin,
+                        Some(seq),
+                        "unknown_origin_branch",
+                        format!(
+                            concat!(
+                                "event at sequence {} was recorded on branch {}, which has ",
+                                "no durable branch record; it cannot be placed in any history"
+                            ),
+                            seq, origin
+                        ),
+                    ));
+                }
+            }
             Err(e) => {
-                let seq = row.sequence_number.max(0) as u64;
+                let attributed = row
+                    .branch_id
+                    .as_deref()
+                    .and_then(|b| Uuid::parse_str(b).ok())
+                    .map(BranchId)
+                    .unwrap_or(live_branch);
                 tracing::error!(
                     target: "durability",
                     sequence = seq,
+                    branch = %attributed,
                     error = %e,
-                    "durability: corrupt event row (cannot deserialize) — quarantine boundary"
+                    "durability: corrupt event row (cannot deserialize)"
                 );
-                first_corrupt_seq = Some(first_corrupt_seq.map_or(seq, |s| s.min(seq)));
+                corrupt.insert(seq, attributed);
+                if plans.contains_key(&attributed) {
+                    own.entry(attributed).or_default().insert(seq);
+                } else {
+                    faults.push(branch_fault(
+                        attributed,
+                        Some(seq),
+                        "corrupt_event_row",
+                        format!(
+                            concat!(
+                                "row at sequence {} could not be deserialized and names ",
+                                "branch {}, which has no durable branch record"
+                            ),
+                            seq, attributed
+                        ),
+                    ));
+                }
             }
         }
     }
-    events.sort_by_key(|e| e.sequence_number);
 
-    // 4. Quarantine check: certify a full replay (soundness re-measured from
-    //    the resulting B-Rep, never asserted) and locate the first break.
-    let (_probe, cert) = certify_rebuild(&events, None);
-    let first_break = cert.first_break();
-    let break_seq = first_break.map(|v| v.sequence);
-    let break_kind = first_break.map(|v| v.kind.clone());
-    let break_reason = first_break.map(|v| format!("{:?}", v.status));
+    // 4. Every branch's history, by the in-memory rules: the index the fork
+    //    left it (persisted, or the fork rule for rows that predate that),
+    //    its own events, and the sequences merges inserted into it.
+    let histories = branch_histories(&plans, &own, &mut faults);
+    let empty = BTreeSet::new();
+    let live_history = histories.get(&live_branch).unwrap_or(&empty);
 
-    // The quarantine boundary is the earliest of (first replay break, first
-    // corrupt row). `!is_sound` alone is NOT a boundary — a log of only 2D/
-    // sketch ops legitimately produces no solids yet is not corrupt.
-    let boundary = match (break_seq, first_corrupt_seq) {
-        (Some(a), Some(b)) => Some(a.min(b)),
-        (Some(a), None) => Some(a),
-        (None, Some(b)) => Some(b),
-        (None, None) => None,
-    };
-
-    // 5. Select the served set — the clean prefix on quarantine, else all.
-    let (chosen, status): (Vec<TimelineEvent>, DurabilityStatus) = match boundary {
-        Some(bound) => {
-            let prefix: Vec<TimelineEvent> = events
-                .iter()
-                .filter(|e| e.sequence_number < bound)
-                .cloned()
-                .collect();
-            let kind = break_kind.unwrap_or_else(|| "corrupt_event_row".to_string());
-            let reason = break_reason.unwrap_or_else(|| {
-                "event row could not be deserialized (corrupt or from an incompatible build)"
-                    .to_string()
-            });
-            tracing::error!(
-                target: "durability",
-                first_break_sequence = bound,
-                first_break_kind = %kind,
-                events_served = prefix.len(),
-                events_total = rows.len(),
-                document = %document_id,
-                "durability: QUARANTINE — the log contains an event this kernel cannot faithfully \
-                 replay; serving the clean prefix and refusing the tail. is_sound={}",
-                cert.is_sound()
-            );
-            (
-                prefix.clone(),
-                DurabilityStatus::Quarantined {
-                    first_break_sequence: bound,
-                    first_break_kind: kind,
-                    reason,
-                    events_served: prefix.len(),
-                    events_total: rows.len(),
-                },
-            )
+    // 5. Quarantine check over the LIVE branch's history only: certify a
+    //    replay of exactly that history (soundness re-measured from the
+    //    resulting B-Rep, never asserted) and find its first break — the first
+    //    replay failure, or the first sequence the history names that no
+    //    restorable event holds (a corrupt row, an orphan, a missing row).
+    let live_events: Vec<TimelineEvent> = live_history
+        .iter()
+        .filter_map(|seq| by_seq.get(seq).cloned())
+        .collect();
+    let (_probe, cert) = certify_rebuild(&live_events, None);
+    let replay_break = cert
+        .first_break()
+        .map(|v| (v.sequence, v.kind.clone(), format!("{:?}", v.status)));
+    let hole_break = live_history
+        .iter()
+        .find(|seq| !by_seq.contains_key(seq))
+        .map(|seq| {
+            let (kind, reason) = hole_cause(*seq, &corrupt, &orphans);
+            (*seq, kind.to_string(), reason)
+        });
+    // The id-space guard. At runtime every branch runs in ONE live model
+    // (switching branches does not rebuild it), so kernel face/edge ids are
+    // allocated in the order of the WHOLE interleaved log. Replaying only the
+    // live branch's history reallocates them without the other branches'
+    // operations, so an event that addresses a face or edge by its raw
+    // recorded id (no persistent id) AFTER any event outside this history
+    // would bind whatever face now carries that number — a wrong feature
+    // served as sound. Such an event cannot be reproduced in isolation: it is
+    // a typed boundary. PID-carrying edges bind by PID and are unaffected; a
+    // document that never interleaved branches is unaffected. Solids are
+    // remapped ONLY when their producing event is replayed — the solid guard
+    // below covers the rest.
+    let first_foreign: Option<(u64, BranchId)> = rows
+        .iter()
+        .map(|row| row.sequence_number.max(0) as u64)
+        .filter(|seq| !live_history.contains(seq))
+        .min()
+        .map(|seq| {
+            let branch = by_seq
+                .get(&seq)
+                .map(|e| e.metadata.branch_id)
+                .or_else(|| corrupt.get(&seq).copied())
+                .or_else(|| orphans.get(&seq).copied())
+                .unwrap_or(live_branch);
+            (seq, branch)
+        });
+    let interleave_break = first_foreign.and_then(|(foreign_seq, foreign_branch)| {
+        live_events
+            .iter()
+            .filter(|e| e.sequence_number > foreign_seq)
+            .find_map(|e| {
+                let refs = raw_topology_references(e);
+                (!refs.is_empty()).then(|| {
+                    (
+                        e.sequence_number,
+                        "interleaved_foreign_history".to_string(),
+                        format!(
+                            concat!(
+                                "event at sequence {} addresses {} by its raw recorded kernel ",
+                                "id, but branch {} recorded sequence {} into the same runtime ",
+                                "model before it; replaying this branch alone shifts kernel ",
+                                "ids, so the reference cannot be reproduced and is refused"
+                            ),
+                            e.sequence_number,
+                            refs.join(", "),
+                            foreign_branch,
+                            foreign_seq
+                        ),
+                    )
+                })
+            })
+    });
+    // The solid guard. Replay resolves a recorded solid id through its remap,
+    // which holds only solids some EARLIER replayed event produced; any other
+    // id falls back to the raw number and binds whatever solid now carries it
+    // (measured: a main boolean against a side branch's cylinder subtracted a
+    // main cube instead). So an event whose recorded solid input is not an
+    // output of an earlier event in THIS history is a typed boundary — in any
+    // log, interleaved or not: an input the history never produced cannot be
+    // reproduced from it.
+    let solid_break = {
+        let mut produced: HashSet<u64> = HashSet::new();
+        let mut found = None;
+        for event in &live_events {
+            let missing = recorded_solid_inputs(event)
+                .into_iter()
+                .find(|id| !produced.contains(id));
+            if let Some(solid) = missing {
+                let producer = by_seq
+                    .values()
+                    .filter(|p| p.sequence_number < event.sequence_number)
+                    .filter(|p| recorded_solid_outputs(p).contains(&solid))
+                    .max_by_key(|p| p.sequence_number);
+                let origin = match producer {
+                    Some(p) => format!(
+                        "it was produced by sequence {} on branch {}, outside this history",
+                        p.sequence_number, p.metadata.branch_id
+                    ),
+                    None => "no persisted event produced it".to_string(),
+                };
+                found = Some((
+                    event.sequence_number,
+                    "foreign_solid_input".to_string(),
+                    format!(
+                        concat!(
+                            "event at sequence {} takes solid:{} as input, but no earlier ",
+                            "event in this branch's history produced it ({}); replay would ",
+                            "bind whatever solid carries that number, so it is refused"
+                        ),
+                        event.sequence_number, solid, origin
+                    ),
+                ));
+                break;
+            }
+            produced.extend(recorded_solid_outputs(event));
         }
-        None => {
-            tracing::info!(
-                target: "durability",
-                events = events.len(),
-                is_sound = cert.is_sound(),
-                "durability: event log replayed cleanly — full document restored"
-            );
-            (
-                events.clone(),
-                DurabilityStatus::Active {
-                    events_replayed: events.len(),
-                },
-            )
-        }
+        found
     };
+    // `!is_sound` alone is NOT a boundary — a log of only 2D/sketch ops
+    // legitimately produces no solids yet is not corrupt.
+    let boundary = [replay_break, hole_break, interleave_break, solid_break]
+        .into_iter()
+        .flatten()
+        .min_by_key(|b| b.0);
+    let boundary_seq = boundary.as_ref().map(|b| b.0);
+    let refused_by_live = |seq: u64| boundary_seq.is_some_and(|bound| seq >= bound);
 
-    // 6. Rehydrate the timeline with the chosen events, preserving their
-    //    original ids/sequences/timestamps (so the history endpoint returns
-    //    byte-identical events after a restart).
+    // 6. The served set: the live history's clean prefix.
+    let served: Vec<TimelineEvent> = live_events
+        .iter()
+        .filter(|e| !refused_by_live(e.sequence_number))
+        .cloned()
+        .collect();
+
+    // 7. Rehydrate the timeline, preserving every event's original
+    //    id/sequence/timestamp (so the history endpoint returns byte-identical
+    //    events after a restart). Every restorable event is restored EXCEPT
+    //    the live branch's own refused tail — the refusal is not served as
+    //    history either. Each event is filed under the branch that recorded
+    //    it; every other entry a branch's history holds (its fork prefix, its
+    //    merged-in events) is then added to that branch's index.
+    let mut restored: Vec<TimelineEvent> = by_seq
+        .values()
+        .filter(|e| !(e.metadata.branch_id == live_branch && refused_by_live(e.sequence_number)))
+        .cloned()
+        .collect();
+    restored.sort_by_key(|e| e.sequence_number);
+    let restored_ids: HashMap<u64, (timeline_engine::EventId, BranchId)> = restored
+        .iter()
+        .map(|e| (e.sequence_number, (e.id, e.metadata.branch_id)))
+        .collect();
     {
         let timeline = state.timeline.read().await;
-        if let Err(e) = timeline.rehydrate_events(chosen.clone()) {
+        if let Err(e) = timeline.rehydrate_events(restored.clone()) {
             tracing::error!(
                 target: "durability",
                 error = %e,
                 "durability: timeline rehydration failed — history may be incomplete"
             );
         }
+        for (branch, history) in &histories {
+            let mut entries = Vec::new();
+            for &seq in history {
+                if *branch == live_branch && refused_by_live(seq) {
+                    continue;
+                }
+                match restored_ids.get(&seq) {
+                    Some((id, origin)) if origin != branch => entries.push((seq, *id)),
+                    Some(_) => {}
+                    None if *branch == live_branch => {}
+                    None => {
+                        let (kind, reason) = if by_seq.contains_key(&seq) {
+                            (
+                                "refused_by_live_quarantine",
+                                format!(
+                                    concat!(
+                                        "event at sequence {} belongs to the live branch's ",
+                                        "quarantined tail and is refused on every branch"
+                                    ),
+                                    seq
+                                ),
+                            )
+                        } else {
+                            hole_cause(seq, &corrupt, &orphans)
+                        };
+                        faults.push(branch_fault(*branch, Some(seq), kind, reason));
+                    }
+                }
+            }
+            if let Err(e) = timeline.rehydrate_branch_entries(*branch, &entries) {
+                faults.push(branch_fault(
+                    *branch,
+                    None,
+                    "restore_failed",
+                    format!("the branch's history entries could not be restored: {e}"),
+                ));
+            }
+        }
     }
+    faults.sort_by(|a, b| (a.sequence, &a.branch_id).cmp(&(b.sequence, &b.branch_id)));
 
-    // 7. Replay the chosen events into the live model, then rebuild the
+    let status = match boundary {
+        Some((bound, kind, reason)) => {
+            tracing::error!(
+                target: "durability",
+                first_break_sequence = bound,
+                first_break_kind = %kind,
+                events_served = served.len(),
+                events_total = live_history.len(),
+                branch_faults = faults.len(),
+                document = %document_id,
+                "durability: QUARANTINE — the live branch's history contains an event this kernel cannot faithfully replay; serving the clean prefix and refusing the tail. is_sound={}",
+                cert.is_sound()
+            );
+            DurabilityStatus::Quarantined {
+                first_break_sequence: bound,
+                first_break_kind: kind,
+                reason,
+                events_served: served.len(),
+                events_total: live_history.len(),
+                branch_faults: faults,
+            }
+        }
+        None => {
+            tracing::info!(
+                target: "durability",
+                events_replayed = served.len(),
+                events_restored = restored.len(),
+                branch_faults = faults.len(),
+                is_sound = cert.is_sound(),
+                "durability: live branch replayed cleanly — every branch's history restored"
+            );
+            DurabilityStatus::Active {
+                events_replayed: served.len(),
+                events_restored: restored.len(),
+                branch_faults: faults,
+            }
+        }
+    };
+
+    // 8. Replay the served events into the live model, then rebuild the
     //    uuid↔solid registry so every restored solid is addressable by uuid.
     //    `rebuild_model_from_events` detaches/reattaches the recorder for the
     //    duration, so this replay does not re-record (or re-persist) anything.
@@ -656,7 +1096,7 @@ async fn boot_replay_inner(state: &AppState) -> DurabilityStatus {
     //    the Slice-3 side-channel restore below.
     let id_remap = {
         let mut model = state.model.write().await;
-        let outcome = rebuild_model_from_events(&mut model, &chosen);
+        let outcome = rebuild_model_from_events(&mut model, &served);
         tracing::info!(
             target: "durability",
             applied = outcome.events_applied,
@@ -677,7 +1117,7 @@ async fn boot_replay_inner(state: &AppState) -> DurabilityStatus {
         outcome.id_remap
     };
 
-    // 8. DURABILITY Slice 3 (#39, spec §2.3): re-attach the unrecorded-mutation
+    // 9. DURABILITY Slice 3 (#39, spec §2.3): re-attach the unrecorded-mutation
     //    side channels that live OUTSIDE the B-Rep model — part colours
     //    (`set_color` events → `AppState.solid_colors`) and the editable revolve
     //    meridian (`revolve_meridian` events → `AppState.solid_profiles`). Names
@@ -686,7 +1126,7 @@ async fn boot_replay_inner(state: &AppState) -> DurabilityStatus {
     //    that geometry replay does not touch, so they are re-derived from their
     //    durable events here and re-keyed onto the rebuilt solids through the
     //    replay `id_remap`.
-    restore_side_channels(state, &chosen, &id_remap).await;
+    restore_side_channels(state, &served, &id_remap).await;
 
     status
 }
@@ -792,8 +1232,205 @@ fn parse_profile(v: &serde_json::Value) -> Option<Vec<[f64; 2]>> {
     }
 }
 
-/// Reinstate a persisted branch into the live timeline at boot.
-async fn restore_branch(state: &AppState, record: BranchRecord) {
+/// What boot learned from one durable branch record: everything the in-memory
+/// rules need to rebuild that branch's history index.
+struct BranchPlan {
+    /// The parent branch, for the fork rule.
+    parent: Option<BranchId>,
+    /// The parent sequence the branch forked at, for the fork rule.
+    fork_sequence: u64,
+    /// The index the fork left the branch (`inherited_sequences`). `None` for
+    /// a row written before that key existed: the fork rule rebuilds it.
+    inherited: Option<Vec<u64>>,
+    /// On a `Merged { into }` branch: `into` and the sequences the merge
+    /// inserted into `into`'s history.
+    merged: Option<(BranchId, Vec<u64>)>,
+}
+
+/// Name a side-branch defect: logged loudly AND returned for the status.
+fn branch_fault(
+    branch: BranchId,
+    sequence: Option<u64>,
+    kind: &'static str,
+    reason: String,
+) -> BranchFault {
+    tracing::error!(
+        target: "durability",
+        branch = %branch,
+        sequence = ?sequence,
+        kind,
+        reason = %reason,
+        "durability: branch history fault"
+    );
+    BranchFault {
+        branch_id: branch.to_string(),
+        sequence,
+        kind,
+        reason,
+    }
+}
+
+/// Why a history names a sequence no restorable event holds.
+fn hole_cause(
+    seq: u64,
+    corrupt: &HashMap<u64, BranchId>,
+    orphans: &HashMap<u64, BranchId>,
+) -> (&'static str, String) {
+    if corrupt.contains_key(&seq) {
+        (
+            "corrupt_event_row",
+            "event row could not be deserialized (corrupt or from an incompatible build)"
+                .to_string(),
+        )
+    } else if let Some(origin) = orphans.get(&seq) {
+        (
+            "unknown_origin_branch",
+            format!(
+                concat!(
+                    "event at sequence {} was recorded on branch {}, which has no ",
+                    "durable branch record"
+                ),
+                seq, origin
+            ),
+        )
+    } else {
+        (
+            "missing_event",
+            format!(
+                concat!(
+                    "the branch's durable history names sequence {}, but no persisted ",
+                    "event holds it"
+                ),
+                seq
+            ),
+        )
+    }
+}
+
+/// Every branch's history (the set of sequence numbers its index holds),
+/// rebuilt with the in-memory rules:
+///
+/// - the fork: the persisted `inherited_sequences`, or — for a row that
+///   predates them — the fork rule over the parent (see below);
+/// - its own events (including corrupt rows attributed to it, as holes);
+/// - every sequence a merge inserted into it (`merged_sequences` on the
+///   merged SOURCE's row).
+///
+/// The fork rule for a row without `inherited_sequences` takes the parent's
+/// history entries `<= fork_sequence` computed WITHOUT merged-in sequences
+/// (recursively up the chain). Such a row was written before merges were
+/// persisted, so every persisted merge into its parent happened AFTER its
+/// fork: counting one would hand the child events it never had (a merge
+/// inserts events under their original, older sequence numbers).
+///
+/// Parents are resolved before children (memoised recursion over the parent
+/// chain); a parent with no record, or a parent cycle, is a named fault and
+/// contributes no prefix.
+fn branch_histories(
+    plans: &HashMap<BranchId, BranchPlan>,
+    own: &HashMap<BranchId, BTreeSet<u64>>,
+    faults: &mut Vec<BranchFault>,
+) -> HashMap<BranchId, BTreeSet<u64>> {
+    let mut merged_in: HashMap<BranchId, BTreeSet<u64>> = HashMap::new();
+    for plan in plans.values() {
+        if let Some((into, sequences)) = &plan.merged {
+            merged_in
+                .entry(*into)
+                .or_default()
+                .extend(sequences.iter().copied());
+        }
+    }
+    let mut walk = HistoryWalk {
+        plans,
+        own,
+        merged_in: &merged_in,
+        memo: HashMap::new(),
+        faults,
+    };
+    let mut histories = HashMap::with_capacity(plans.len());
+    for id in plans.keys() {
+        let mut visiting = HashSet::new();
+        let history = walk.history_of(*id, true, &mut visiting);
+        histories.insert(*id, history);
+    }
+    histories
+}
+
+/// The memoised state of one [`branch_histories`] walk.
+struct HistoryWalk<'a> {
+    plans: &'a HashMap<BranchId, BranchPlan>,
+    own: &'a HashMap<BranchId, BTreeSet<u64>>,
+    merged_in: &'a HashMap<BranchId, BTreeSet<u64>>,
+    /// Keyed by (branch, whether merged-in sequences are counted).
+    memo: HashMap<(BranchId, bool), BTreeSet<u64>>,
+    faults: &'a mut Vec<BranchFault>,
+}
+
+impl HistoryWalk<'_> {
+    fn history_of(
+        &mut self,
+        id: BranchId,
+        with_merges: bool,
+        visiting: &mut HashSet<(BranchId, bool)>,
+    ) -> BTreeSet<u64> {
+        if let Some(done) = self.memo.get(&(id, with_merges)) {
+            return done.clone();
+        }
+        if !visiting.insert((id, with_merges)) {
+            self.faults.push(branch_fault(
+                id,
+                None,
+                "branch_parent_cycle",
+                "the branch's durable parent chain loops back to itself".to_string(),
+            ));
+            return BTreeSet::new();
+        }
+        let mut history = BTreeSet::new();
+        if let Some(plan) = self.plans.get(&id) {
+            match (&plan.inherited, plan.parent) {
+                (Some(inherited), _) => history.extend(inherited.iter().copied()),
+                (None, Some(parent)) if self.plans.contains_key(&parent) => {
+                    let parent_history = self.history_of(parent, false, visiting);
+                    history.extend(parent_history.range(..=plan.fork_sequence).copied());
+                }
+                (None, Some(parent)) => self.faults.push(branch_fault(
+                    id,
+                    None,
+                    "missing_parent_branch",
+                    format!(
+                        concat!(
+                            "the branch forked from {}, which has no durable record; ",
+                            "its inherited prefix cannot be rebuilt"
+                        ),
+                        parent
+                    ),
+                )),
+                (None, None) => {}
+            }
+        }
+        if let Some(sequences) = self.own.get(&id) {
+            history.extend(sequences.iter().copied());
+        }
+        if with_merges {
+            if let Some(sequences) = self.merged_in.get(&id) {
+                history.extend(sequences.iter().copied());
+            }
+        }
+        visiting.remove(&(id, with_merges));
+        self.memo.insert((id, with_merges), history.clone());
+        history
+    }
+}
+
+/// Reinstate a persisted branch into the live timeline at boot: identity,
+/// parentage, fork point, author, and lifecycle state. Returns the branch's
+/// id and its history plan, or `None` for a record whose id is unreadable
+/// (reported as a fault).
+async fn restore_branch(
+    state: &AppState,
+    record: BranchRecord,
+    faults: &mut Vec<BranchFault>,
+) -> Option<(BranchId, BranchPlan)> {
     let id = match Uuid::parse_str(&record.branch_id) {
         Ok(u) => BranchId(u),
         Err(e) => {
@@ -803,7 +1440,13 @@ async fn restore_branch(state: &AppState, record: BranchRecord) {
                 error = %e,
                 "durability: persisted branch id is not a valid uuid — skipping"
             );
-            return;
+            faults.push(BranchFault {
+                branch_id: record.branch_id.clone(),
+                sequence: None,
+                kind: "unreadable_branch_record",
+                reason: format!("the persisted branch id is not a valid uuid: {e}"),
+            });
+            return None;
         }
     };
     let parent = record
@@ -817,14 +1460,109 @@ async fn restore_branch(state: &AppState, record: BranchRecord) {
     // the value every pre-field record was rehydrated with.
     let created_by: Option<Author> = record
         .data
-        .get("created_by")
+        .get(DATA_CREATED_BY)
         .and_then(|v| serde_json::from_value(v.clone()).ok());
+    // Absent: the row predates state persistence — `Active`, as every such
+    // row always restored. Present but unreadable: named, and restored
+    // `Active` (the old behaviour) rather than guessed.
+    let branch_state = match record.data.get(DATA_STATE) {
+        None => BranchState::Active,
+        Some(v) => match serde_json::from_value::<BranchState>(v.clone()) {
+            Ok(s) => s,
+            Err(e) => {
+                faults.push(branch_fault(
+                    id,
+                    None,
+                    "unreadable_branch_record",
+                    format!(
+                        "the persisted branch state could not be read, restored as active: {e}"
+                    ),
+                ));
+                BranchState::Active
+            }
+        },
+    };
+    let inherited = match record.data.get(DATA_INHERITED) {
+        None => None,
+        Some(v) => match serde_json::from_value::<Vec<u64>>(v.clone()) {
+            Ok(seqs) => Some(seqs),
+            Err(e) => {
+                faults.push(branch_fault(
+                    id,
+                    None,
+                    "unreadable_branch_record",
+                    format!(
+                        concat!(
+                            "the persisted inherited history could not be read, rebuilt ",
+                            "with the fork rule: {}"
+                        ),
+                        e
+                    ),
+                ));
+                None
+            }
+        },
+    };
+    let merged = match &branch_state {
+        BranchState::Merged { into, .. } => {
+            match record
+                .data
+                .get(DATA_MERGED)
+                .map(|v| serde_json::from_value::<Vec<u64>>(v.clone()))
+            {
+                Some(Ok(seqs)) => Some((*into, seqs)),
+                Some(Err(e)) => {
+                    faults.push(branch_fault(
+                        *into,
+                        None,
+                        "merge_membership_missing",
+                        format!(
+                            concat!(
+                                "branch {} was merged into this branch, but the merged ",
+                                "sequences could not be read: {}"
+                            ),
+                            id, e
+                        ),
+                    ));
+                    None
+                }
+                None => {
+                    faults.push(branch_fault(
+                        *into,
+                        None,
+                        "merge_membership_missing",
+                        format!(
+                            concat!(
+                                "branch {} was merged into this branch, but its row ",
+                                "records no merged sequences"
+                            ),
+                            id
+                        ),
+                    ));
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
+    let fork_sequence = record.fork_sequence.max(0) as u64;
     let timeline = state.timeline.read().await;
-    timeline.rehydrate_branch(
+    timeline.rehydrate_branch(id, record.name.clone(), parent, fork_sequence, created_by);
+    if let Err(e) = timeline.restore_branch_state(id, branch_state) {
+        faults.push(branch_fault(
+            id,
+            None,
+            "restore_failed",
+            format!("the persisted branch state could not be applied: {e}"),
+        ));
+    }
+    Some((
         id,
-        record.name.clone(),
-        parent,
-        record.fork_sequence.max(0) as u64,
-        created_by,
-    );
+        BranchPlan {
+            parent,
+            fork_sequence,
+            inherited,
+            merged,
+        },
+    ))
 }

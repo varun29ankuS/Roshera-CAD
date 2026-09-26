@@ -457,8 +457,16 @@ pub async fn import_ros_document(
     let status = activate(&state, &record.id).await;
 
     let events_len = events.len();
+    // Clean = the live branch replayed without a break (`Active`), EVERY
+    // imported event was restored into some branch's history, and no branch
+    // history reported a fault. `events_replayed` counts only the live
+    // branch's history, so it is the wrong total for a multi-branch file.
     let replayed_clean = match &status {
-        durability::DurabilityStatus::Active { events_replayed } => *events_replayed == events_len,
+        durability::DurabilityStatus::Active {
+            events_restored,
+            branch_faults,
+            ..
+        } => *events_restored == events_len && branch_faults.is_empty(),
         durability::DurabilityStatus::Empty => events_len == 0,
         _ => false,
     };

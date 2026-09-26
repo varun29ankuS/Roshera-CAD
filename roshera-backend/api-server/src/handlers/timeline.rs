@@ -855,7 +855,11 @@ pub struct HistoryQuery {
 /// full clean replay). On a quarantined document (the served events are only
 /// the clean prefix of the persisted log; a break exists further on) the
 /// response instead becomes `{"events": [...], "durability": <DurabilityStatus>}`
-/// so the missing tail is disclosed rather than silently absent — the same
+/// so the missing tail is disclosed rather than silently absent. The same
+/// wrapped shape is served when the document replayed cleanly but THIS
+/// branch's restored history carries a boot fault (`branch_faults`, e.g. a
+/// corrupt row on a side branch) — its history is then missing an event. The
+/// same
 /// honest boot outcome `/api/durability/status` and `manifest.durability`
 /// (the evidence pack) already report, carried onto this agent-facing read.
 /// Every existing consumer (the frontend panels, `tool-registry-api.ts`,
@@ -903,7 +907,10 @@ pub async fn get_history(
         })
         .collect();
 
-    let payload = match crate::durability::quarantine_disclosure(&durability_status) {
+    // A quarantined document, or a branch whose restored history lost an
+    // event (a `branch_faults` entry naming THIS branch), is disclosed on
+    // this read — the history served is then not the whole history.
+    let payload = match crate::durability::history_disclosure(&durability_status, &branch_id) {
         Some(status) => {
             let events =
                 serde_json::to_value(&summaries).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;

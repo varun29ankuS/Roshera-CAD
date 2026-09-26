@@ -705,14 +705,77 @@ pub async fn delete_branch(
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     let bid = parse_branch_id(&id)?;
-    let timeline = state.timeline.read().await;
     // `force = false` — HTTP DELETE never overrides protection. Admin
     // tooling that needs to retire main goes through a separate code
-    // path with its own confirmation surface.
-    timeline
-        .abandon_branch(bid, "abandoned via DELETE /api/branches".to_string(), false)
-        .map_err(map_timeline_err)?;
+    // path with its own confirmation surface. The guard is scoped: the
+    // durable write below reads the timeline again, and holding this read
+    // across it would queue behind any waiting writer.
+    {
+        let timeline = state.timeline.read().await;
+        timeline
+            .abandon_branch(bid, "abandoned via DELETE /api/branches".to_string(), false)
+            .map_err(map_timeline_err)?;
+    }
+    // The abandon must survive a restart, or the next boot revives the
+    // branch `Active`. A failed write is a typed refusal with the abandon
+    // ROLLED BACK (the branch was `Active` — `abandon_branch` admits no
+    // other state), never a 204 over a state that exists only in memory.
+    if let Err(e) = crate::durability::persist_branch_transition(&state, bid, None).await {
+        let reverted = {
+            let timeline = state.timeline.read().await;
+            timeline.restore_branch_state(bid, BranchState::Active)
+        };
+        return Err(match reverted {
+            Ok(()) => {
+                ApiError::durability_persist_failed("branch abandon", "store_write", e.reason())
+            }
+            Err(revert_error) => rollback_failed("branch abandon", &e, &revert_error),
+        });
+    }
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// A durable write failed AND the in-memory transition could not be undone.
+/// The `durability_persist_failed` code promises `rolled_back: true` (no such
+/// state exists after the refusal), which is false here — so this is an
+/// `internal` error naming both failures, not that code with the promise
+/// broken.
+fn rollback_failed(
+    record: &str,
+    persist_error: &crate::durability::DurabilityError,
+    revert_error: &TimelineError,
+) -> ApiError {
+    ApiError::new(
+        ErrorCode::Internal,
+        format!(
+            concat!(
+                "the {} was not made durable (store_write: {}) and could NOT be rolled ",
+                "back ({}); the in-memory state no longer matches the durable store"
+            ),
+            record,
+            persist_error.reason(),
+            revert_error
+        ),
+    )
+    .with_details(serde_json::json!({
+        "record": record,
+        "stage": "store_write",
+        "reason": persist_error.reason(),
+        "rolled_back": false,
+        "rollback_error": revert_error.to_string(),
+    }))
+}
+
+/// The sequence keys of a branch's history index (empty for an unknown
+/// branch — the merge that follows reports that itself).
+fn branch_keys(
+    timeline: &timeline_engine::Timeline,
+    branch: &BranchId,
+) -> std::collections::BTreeSet<u64> {
+    timeline
+        .get_branch_events_map(branch)
+        .map(|index| index.iter().map(|entry| *entry.key()).collect())
+        .unwrap_or_default()
 }
 
 /// `POST /api/branches/active` — set the kernel's recording branch.
@@ -886,9 +949,20 @@ pub async fn perform_merge(
     // nothing in flight).
     let _ = state.timeline_recorder.flush().await;
 
-    let result = {
+    // The merge's membership effect — which entries it INSERTED into the
+    // target — is read as target-after minus target-before inside the same
+    // write guard, so nothing (the recorder drain takes a read lock) can
+    // interleave with it. Entries the target already held are not the
+    // merge's, and neither persisting nor reverting may touch them.
+    let (result, inserted) = {
         let timeline = state.timeline.write().await;
-        timeline.merge_branches(source, target, strategy).await
+        let before = branch_keys(&timeline, &target);
+        let result = timeline.merge_branches(source, target, strategy).await;
+        let inserted: Vec<u64> = branch_keys(&timeline, &target)
+            .difference(&before)
+            .copied()
+            .collect();
+        (result, inserted)
     };
 
     let result = match result {
@@ -924,6 +998,31 @@ pub async fn perform_merge(
         }
         Err(other) => return Err(map_timeline_err(other)),
     };
+
+    // A successful merge flipped the source to `Merged { into: target }` and
+    // (unless already up to date) inserted `inserted` into the target. Both
+    // must survive a restart, or the next boot revives the source `Active`
+    // and hands the merged events back to it alone. A failed write is a
+    // typed refusal with the merge ROLLED BACK — never a 200 over a merge
+    // that exists only in memory. A conflicted merge changed nothing, so
+    // there is nothing to persist.
+    if result.success {
+        if let Err(e) =
+            crate::durability::persist_branch_transition(state, source, Some(inserted.clone()))
+                .await
+        {
+            let reverted = {
+                let timeline = state.timeline.write().await;
+                timeline.revert_merge(source, target, &inserted)
+            };
+            return Err(match reverted {
+                Ok(()) => {
+                    ApiError::durability_persist_failed("branch merge", "store_write", e.reason())
+                }
+                Err(revert_error) => rollback_failed("branch merge", &e, &revert_error),
+            });
+        }
+    }
 
     // Conflicts are reported through `MergeView.success` / `.conflicts`,
     // NOT as an `Err` — this is the REST endpoint's existing, deliberate

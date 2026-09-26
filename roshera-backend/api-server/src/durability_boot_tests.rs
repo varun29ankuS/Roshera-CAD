@@ -3053,3 +3053,1108 @@ async fn branch_create_refuses_when_the_recorder_drain_fails() {
         "the branch set must be unchanged by a refused create; listing = {listing}"
     );
 }
+
+// =====================================================================
+// Task 68 — a restart replayed every branch into one model.
+//
+// Boot loaded `timeline_events` with no branch filter, certified the whole
+// log as ONE history and replayed it into the single live model — so a
+// cylinder built on a side branch came back on `main`. A branch's history
+// (its `branch_events` index) is derived in memory from three rules — the
+// fork copies the parent's prefix, a merge inserts the source's events into
+// the target, a merge/abandon flips the branch state — and none of them was
+// durable: a restored child lost its inherited prefix, merged events went
+// back to their source only, and merged/abandoned branches came back
+// `Active`. These tests restart over the same SQLite file and check which
+// events EACH branch holds and what the live model contains.
+// =====================================================================
+
+async fn create_cube(state: &AppState, edge: f64) {
+    let (s, body) = dispatch(
+        state,
+        post(
+            "/api/geometry/box",
+            json!({ "width": edge, "depth": edge, "height": edge }),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "box create must succeed; body = {body}");
+}
+
+/// A cylinder well clear of the cubes, so it never interacts with them.
+async fn create_side_cylinder(state: &AppState) {
+    let (s, body) = dispatch(
+        state,
+        post(
+            "/api/geometry/cylinder",
+            json!({ "center": [100.0, 0.0, 0.0], "axis": [0.0, 0.0, 1.0], "radius": 2.0, "height": 8.0 }),
+        ),
+    )
+    .await;
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "cylinder create must succeed; body = {body}"
+    );
+}
+
+async fn settle(state: &AppState) {
+    state
+        .timeline_recorder
+        .flush()
+        .await
+        .expect("recorder flush must succeed");
+}
+
+async fn fork_from_main(state: &AppState, name: &str) -> timeline_engine::BranchId {
+    settle(state).await;
+    let (s, body) = dispatch(state, post("/api/branches", json!({ "name": name }))).await;
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "branch create must succeed; body = {body}"
+    );
+    let id = body["id"]
+        .as_str()
+        .expect("branch create must return the new id");
+    timeline_engine::BranchId(Uuid::parse_str(id).expect("branch id must be a uuid"))
+}
+
+async fn activate_branch(state: &AppState, branch: &str) {
+    settle(state).await;
+    let (s, body) = dispatch(
+        state,
+        post("/api/branches/active", json!({ "branch_id": branch })),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "activate must succeed; body = {body}");
+}
+
+/// `(sequence_number, event id)` of every event in a branch's history, in
+/// sequence order — the branch's `branch_events` index, read directly.
+async fn branch_history(state: &AppState, branch: timeline_engine::BranchId) -> Vec<(u64, String)> {
+    settle(state).await;
+    let timeline = state.timeline.read().await;
+    timeline
+        .get_branch_events(&branch, None, None)
+        .expect("branch must exist")
+        .into_iter()
+        .map(|e| (e.sequence_number, e.id.to_string()))
+        .collect()
+}
+
+async fn branch_state(
+    state: &AppState,
+    branch: timeline_engine::BranchId,
+) -> timeline_engine::BranchState {
+    let timeline = state.timeline.read().await;
+    timeline
+        .get_branch(&branch)
+        .expect("branch must exist after restart")
+        .state
+}
+
+async fn assert_timeline_valid(state: &AppState) {
+    let timeline = state.timeline.read().await;
+    if let Err(e) = timeline.validate() {
+        panic!("the restored timeline must satisfy its own invariants: {e}");
+    }
+}
+
+async fn live_volumes(state: &AppState) -> Vec<f64> {
+    let uuids: Vec<Uuid> = state.uuid_to_local.iter().map(|e| *e.key()).collect();
+    let mut volumes = Vec::new();
+    for uuid in uuids {
+        let (s, body) = dispatch(state, get(&format!("/api/agent/parts/uuid/{uuid}/mass"))).await;
+        assert_eq!(s, StatusCode::OK, "mass must resolve; body = {body}");
+        let v = body["volume"]
+            .as_f64()
+            .or_else(|| body["volume"]["value"].as_f64())
+            .expect("mass must carry a volume");
+        volumes.push(v);
+    }
+    volumes.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    volumes
+}
+
+/// (a) main: cube → fork B → B: cylinder → back on main → restart. The live
+/// model is main's: ONE solid, the cube. Main's history is exactly its own;
+/// B's history is the inherited cube prefix plus its cylinder.
+#[tokio::test]
+async fn restart_restores_each_branch_history_and_replays_only_main() {
+    let path = temp_db_path();
+
+    let (main_before, side_before, side) = {
+        let state = build_state(open_db(&path).await, true).await;
+        create_cube(&state, 10.0).await;
+        let side = fork_from_main(&state, "side-cylinder").await;
+        activate_branch(&state, &side.to_string()).await;
+        create_side_cylinder(&state).await;
+        activate_branch(&state, "main").await;
+        let main_h = branch_history(&state, timeline_engine::BranchId::main()).await;
+        let side_h = branch_history(&state, side).await;
+        assert!(!main_h.is_empty(), "sanity: main holds the cube's events");
+        assert!(
+            side_h.len() > main_h.len() && side_h.starts_with(&main_h),
+            "sanity: the side branch holds main's cube prefix plus its own cylinder; \
+             main = {main_h:?}, side = {side_h:?}"
+        );
+        (main_h, side_h, side)
+    };
+
+    let state2 = build_state(open_db(&path).await, true).await;
+
+    assert_eq!(
+        state2.model.read().await.solids.len(),
+        1,
+        "the live model must be main's history only — the side branch's cylinder \
+         must not be replayed into it"
+    );
+    let volumes = live_volumes(&state2).await;
+    assert_eq!(volumes.len(), 1, "one addressable part; got {volumes:?}");
+    assert!(
+        (volumes[0] - 1000.0).abs() < 1e-6,
+        "the one live solid must be main's 10-cube, not the side cylinder; got {volumes:?}"
+    );
+    assert_eq!(
+        branch_history(&state2, timeline_engine::BranchId::main()).await,
+        main_before,
+        "main's history must be exactly what it held before the restart"
+    );
+    assert_eq!(
+        branch_history(&state2, side).await,
+        side_before,
+        "the side branch must come back with its inherited prefix AND its own events"
+    );
+    assert_eq!(
+        state2.timeline_recorder.branch_id(),
+        timeline_engine::BranchId::main(),
+        "the recorder must target the branch the live model was replayed from"
+    );
+    let (s, body) = dispatch(&state2, get("/api/durability/status")).await;
+    assert_eq!(s, StatusCode::OK, "status 200; body = {body}");
+    assert_eq!(body["status"]["state"], "active", "body = {body}");
+    assert_eq!(
+        body["status"]["events_replayed"],
+        json!(main_before.len()),
+        "events_replayed counts the live branch's history, not every row; body = {body}"
+    );
+    assert_eq!(
+        body["status"]["events_restored"],
+        json!(side_before.len()),
+        "every persisted event (main's + the side branch's own) is restored into the \
+         timeline; body = {body}"
+    );
+    assert_timeline_valid(&state2).await;
+}
+
+/// (a2) The fork rule is not a boot-time formula: a three-way merge inserts
+/// the source's events under their ORIGINAL (older) sequence numbers, so a
+/// branch forked from main BEFORE that merge must not "inherit" them after a
+/// restart just because their sequence numbers sit below its fork point.
+#[tokio::test]
+async fn a_branch_forked_before_a_merge_does_not_inherit_the_merged_events_after_restart() {
+    let path = temp_db_path();
+
+    let (main_before, late_before, explore) = {
+        let state = build_state(open_db(&path).await, true).await;
+        create_cube(&state, 10.0).await;
+        let explore = fork_from_main(&state, "explore-c").await;
+        activate_branch(&state, &explore.to_string()).await;
+        create_side_cylinder(&state).await;
+        activate_branch(&state, "main").await;
+        create_cube(&state, 4.0).await;
+        let late = fork_from_main(&state, "late-b").await;
+        let late_h = branch_history(&state, late).await;
+
+        let (s, body) = dispatch(
+            &state,
+            post(
+                &format!("/api/branches/{explore}/merge"),
+                json!({ "strategy": "three-way" }),
+            ),
+        )
+        .await;
+        assert_eq!(
+            s,
+            StatusCode::OK,
+            "three-way merge must apply; body = {body}"
+        );
+        assert_eq!(body["success"], true, "clean merge expected; body = {body}");
+
+        let main_h = branch_history(&state, timeline_engine::BranchId::main()).await;
+        let explore_h = branch_history(&state, explore).await;
+        let explore_only: Vec<&(u64, String)> =
+            explore_h.iter().filter(|e| !late_h.contains(e)).collect();
+        assert!(
+            !explore_only.is_empty() && explore_only.iter().all(|e| main_h.contains(e)),
+            "sanity: main now holds the explore branch's cylinder events"
+        );
+        let fork_seq = late_h.last().map(|e| e.0).unwrap_or(0);
+        assert!(
+            explore_only.iter().all(|e| e.0 < fork_seq),
+            "sanity: the merged events sit BELOW the late branch's fork point — the case \
+             a boot-time `parent entries <= fork` rule gets wrong"
+        );
+        (main_h, late_h, explore)
+    };
+
+    let state2 = build_state(open_db(&path).await, true).await;
+    let late = {
+        let timeline = state2.timeline.read().await;
+        timeline
+            .get_all_branches()
+            .into_iter()
+            .find(|b| b.name == "late-b")
+            .map(|b| b.id)
+            .expect("the late branch must be restored")
+    };
+    assert_eq!(
+        branch_history(&state2, late).await,
+        late_before,
+        "a branch forked before the merge must come back WITHOUT the merged events"
+    );
+    assert_eq!(
+        branch_history(&state2, timeline_engine::BranchId::main()).await,
+        main_before,
+        "main must come back WITH the merged events"
+    );
+    assert!(
+        matches!(
+            branch_state(&state2, explore).await,
+            timeline_engine::BranchState::Merged { into, .. } if into == timeline_engine::BranchId::main()
+        ),
+        "the merged branch must come back Merged into main"
+    );
+    assert_eq!(
+        state2.model.read().await.solids.len(),
+        3,
+        "main's live model: the 10-cube, the merged cylinder, the 4-cube"
+    );
+    assert_timeline_valid(&state2).await;
+}
+
+/// (b) B fast-forward merged into main → restart → main's history holds the
+/// merged events, the live model has both solids, and B is `Merged`.
+#[tokio::test]
+async fn merged_branch_and_its_merged_events_survive_restart() {
+    let path = temp_db_path();
+
+    let (main_before, side) = {
+        let state = build_state(open_db(&path).await, true).await;
+        create_cube(&state, 10.0).await;
+        let side = fork_from_main(&state, "ff-side").await;
+        activate_branch(&state, &side.to_string()).await;
+        create_side_cylinder(&state).await;
+        activate_branch(&state, "main").await;
+        let (s, body) = dispatch(
+            &state,
+            post(&format!("/api/branches/{side}/merge"), json!({})),
+        )
+        .await;
+        assert_eq!(
+            s,
+            StatusCode::OK,
+            "fast-forward merge must apply; body = {body}"
+        );
+        assert_eq!(body["success"], true, "body = {body}");
+        let main_h = branch_history(&state, timeline_engine::BranchId::main()).await;
+        assert_eq!(
+            main_h,
+            branch_history(&state, side).await,
+            "sanity: after a fast-forward main holds exactly the side branch's history"
+        );
+        (main_h, side)
+    };
+
+    let state2 = build_state(open_db(&path).await, true).await;
+    assert_eq!(
+        branch_history(&state2, timeline_engine::BranchId::main()).await,
+        main_before,
+        "main's history must keep the merged-in events across a restart"
+    );
+    assert!(
+        matches!(
+            branch_state(&state2, side).await,
+            timeline_engine::BranchState::Merged { into, .. } if into == timeline_engine::BranchId::main()
+        ),
+        "the merged branch must come back Merged into main, not Active"
+    );
+    assert_eq!(
+        state2.model.read().await.solids.len(),
+        2,
+        "main's live model holds the cube and the merged cylinder"
+    );
+    assert_timeline_valid(&state2).await;
+}
+
+/// (c) An abandoned branch restores `Abandoned`, with its reason.
+#[tokio::test]
+async fn abandoned_branch_survives_restart_abandoned() {
+    let path = temp_db_path();
+
+    let side = {
+        let state = build_state(open_db(&path).await, true).await;
+        create_cube(&state, 10.0).await;
+        let side = fork_from_main(&state, "doomed").await;
+        let (s, body) = dispatch(&state, del(&format!("/api/branches/{side}"))).await;
+        assert_eq!(
+            s,
+            StatusCode::NO_CONTENT,
+            "abandon must succeed; body = {body}"
+        );
+        side
+    };
+
+    let state2 = build_state(open_db(&path).await, true).await;
+    match branch_state(&state2, side).await {
+        timeline_engine::BranchState::Abandoned { reason } => assert_eq!(
+            reason, "abandoned via DELETE /api/branches",
+            "the abandon reason must round-trip"
+        ),
+        other => panic!("the abandoned branch must come back Abandoned; got {other:?}"),
+    }
+    assert_timeline_valid(&state2).await;
+}
+
+/// Seed: cube on main, fork B, cylinder on B, back to main. Returns B and
+/// main's pre-restart history.
+async fn seed_main_and_side(path: &str) -> (timeline_engine::BranchId, Vec<(u64, String)>) {
+    let state = build_state(open_db(path).await, true).await;
+    create_cube(&state, 10.0).await;
+    let side = fork_from_main(&state, "side").await;
+    activate_branch(&state, &side.to_string()).await;
+    create_side_cylinder(&state).await;
+    activate_branch(&state, "main").await;
+    let main_h = branch_history(&state, timeline_engine::BranchId::main()).await;
+    (side, main_h)
+}
+
+/// The highest-sequence persisted row — the side branch's last cylinder event.
+async fn last_row_of(path: &str, branch: timeline_engine::BranchId) -> TimelineEventData {
+    let db = open_db(path).await;
+    let mut rows = db
+        .load_all_timeline_events(durability::DURABILITY_SESSION_ID)
+        .await
+        .expect("load persisted events");
+    let last = rows.pop().expect("persisted rows");
+    assert_eq!(
+        last.branch_id.as_deref(),
+        Some(branch.to_string().as_str()),
+        "fixture precondition: the last persisted row is the side branch's"
+    );
+    last
+}
+
+/// (d) A side-branch event the kernel cannot replay does NOT quarantine
+/// main: main's history was never going to replay it.
+#[tokio::test]
+async fn side_branch_unreplayable_event_does_not_quarantine_main() {
+    let path = temp_db_path();
+    let (side, main_before) = seed_main_and_side(&path).await;
+
+    let injected_id = {
+        let template = last_row_of(&path, side).await;
+        let seq = template.sequence_number + 1;
+        let new_id = Uuid::new_v4().to_string();
+        let mut blob = template.data.clone();
+        blob["operation"] = serde_json::to_value(timeline_engine::Operation::Generic {
+            command_type: "quarantine_probe_unknown_op".to_string(),
+            parameters: json!({}),
+        })
+        .expect("op serializes");
+        blob["sequence_number"] = json!(seq);
+        blob["id"] = json!(new_id);
+        let injected = TimelineEventData {
+            id: new_id.clone(),
+            session_id: template.session_id.clone(),
+            event_type: "quarantine_probe_unknown_op".to_string(),
+            user_id: template.user_id.clone(),
+            timestamp: template.timestamp,
+            data: blob,
+            branch_id: template.branch_id.clone(),
+            sequence_number: seq,
+        };
+        open_db(&path)
+            .await
+            .save_timeline_event(durability::DURABILITY_SESSION_ID, &injected)
+            .await
+            .expect("inject unknown side-branch event");
+        new_id
+    };
+
+    let state2 = build_state(open_db(&path).await, true).await;
+    let (s, body) = dispatch(&state2, get("/api/durability/status")).await;
+    assert_eq!(s, StatusCode::OK, "status 200; body = {body}");
+    assert_eq!(
+        body["quarantined"], false,
+        "an event on a side branch must not quarantine main; body = {body}"
+    );
+    assert_eq!(body["status"]["state"], "active", "body = {body}");
+    assert_eq!(
+        state2.model.read().await.solids.len(),
+        1,
+        "main's cube only"
+    );
+    assert_eq!(
+        branch_history(&state2, timeline_engine::BranchId::main()).await,
+        main_before,
+        "main's history is untouched by the side branch's unreplayable event"
+    );
+    assert!(
+        branch_history(&state2, side)
+            .await
+            .iter()
+            .any(|(_, id)| *id == injected_id),
+        "the side branch keeps its own (unreplayed) event in its history"
+    );
+}
+
+/// (d2) A CORRUPT row on a side branch is not a main quarantine either — but
+/// it is not a silent drop: it is reported as a typed fault naming the branch
+/// and the sequence.
+#[tokio::test]
+async fn side_branch_corrupt_row_is_a_typed_fault_not_a_main_quarantine() {
+    let path = temp_db_path();
+    let (side, main_before) = seed_main_and_side(&path).await;
+
+    let seq = {
+        let template = last_row_of(&path, side).await;
+        let seq = template.sequence_number + 1;
+        let corrupt = TimelineEventData {
+            id: Uuid::new_v4().to_string(),
+            session_id: template.session_id.clone(),
+            event_type: "corrupt".to_string(),
+            user_id: template.user_id.clone(),
+            timestamp: template.timestamp,
+            data: json!({ "not": "a timeline event" }),
+            branch_id: template.branch_id.clone(),
+            sequence_number: seq,
+        };
+        open_db(&path)
+            .await
+            .save_timeline_event(durability::DURABILITY_SESSION_ID, &corrupt)
+            .await
+            .expect("inject corrupt side-branch row");
+        seq
+    };
+
+    let state2 = build_state(open_db(&path).await, true).await;
+    let (s, body) = dispatch(&state2, get("/api/durability/status")).await;
+    assert_eq!(s, StatusCode::OK, "status 200; body = {body}");
+    assert_eq!(
+        body["quarantined"], false,
+        "a corrupt side-branch row must not quarantine main; body = {body}"
+    );
+    let faults = body["status"]["branch_faults"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        faults
+            .iter()
+            .any(|f| f["branch_id"] == side.to_string().as_str()
+                && f["sequence"] == json!(seq)
+                && f["kind"] == "corrupt_event_row"),
+        "the corrupt row must be reported as a typed fault on its branch; body = {body}"
+    );
+    for f in &faults {
+        let reason = f["reason"].as_str().unwrap_or_default();
+        assert!(
+            !reason.is_empty(),
+            "every fault names its reason; fault = {f}"
+        );
+        assert!(
+            !reason.contains("  "),
+            "no run of spaces in a reason; fault = {f}"
+        );
+    }
+    assert_eq!(
+        branch_history(&state2, timeline_engine::BranchId::main()).await,
+        main_before
+    );
+}
+
+/// Rewrite a branch's durable row into the pre-Task-68 shape: `created_by`
+/// only — no state, no inherited index, no merge membership.
+async fn rewrite_as_legacy_row(path: &str, branch: timeline_engine::BranchId) {
+    let db = open_db(path).await;
+    let mut rows = db
+        .load_branches(durability::DURABILITY_SESSION_ID)
+        .await
+        .expect("load branch rows");
+    let mut row = rows
+        .drain(..)
+        .find(|r| r.branch_id == branch.to_string())
+        .expect("the branch row");
+    row.data = json!({ "created_by": row.data["created_by"].clone() });
+    db.save_branch(&row).await.expect("rewrite as a legacy row");
+}
+
+/// Old rows (written before branch state/membership were persisted) carry
+/// only `created_by`: they restore `Active` and rebuild the inherited prefix
+/// with the fork rule over the parent's history.
+#[tokio::test]
+async fn legacy_branch_row_restores_active_with_the_fork_rule_prefix() {
+    let path = temp_db_path();
+
+    let (side, side_before) = {
+        let state = build_state(open_db(&path).await, true).await;
+        create_cube(&state, 10.0).await;
+        let side = fork_from_main(&state, "legacy").await;
+        activate_branch(&state, &side.to_string()).await;
+        create_side_cylinder(&state).await;
+        activate_branch(&state, "main").await;
+        (side, branch_history(&state, side).await)
+    };
+
+    rewrite_as_legacy_row(&path, side).await;
+
+    let state2 = build_state(open_db(&path).await, true).await;
+    assert!(
+        matches!(
+            branch_state(&state2, side).await,
+            timeline_engine::BranchState::Active
+        ),
+        "a legacy row carries no state: it restores Active, as before"
+    );
+    assert_eq!(
+        branch_history(&state2, side).await,
+        side_before,
+        "a legacy row's history is the parent prefix (fork rule) plus its own events"
+    );
+    assert_timeline_valid(&state2).await;
+}
+
+/// The fork rule for a legacy row must not count merges persisted AFTER the
+/// upgrade. A legacy branch B forked from main; a still-active branch C
+/// holds an event whose sequence sits below B's fork point; after the
+/// upgrade C is merged into main. That merge inserts C's event into main
+/// under its original sequence — so a fork rule over main's FULL history
+/// would hand it to B on the next boot, although B never had it.
+#[tokio::test]
+async fn legacy_branch_does_not_inherit_a_merge_persisted_after_the_upgrade() {
+    let path = temp_db_path();
+
+    // Boot 1: C (with a cylinder) and main (with a second cube) diverge; B
+    // forks from main after both. B's row is then made a legacy row.
+    let (explore, late, late_before) = {
+        let state = build_state(open_db(&path).await, true).await;
+        create_cube(&state, 10.0).await;
+        let explore = fork_from_main(&state, "explore-c").await;
+        activate_branch(&state, &explore.to_string()).await;
+        create_side_cylinder(&state).await;
+        activate_branch(&state, "main").await;
+        create_cube(&state, 4.0).await;
+        let late = fork_from_main(&state, "legacy-late").await;
+        let late_h = branch_history(&state, late).await;
+        (explore, late, late_h)
+    };
+    rewrite_as_legacy_row(&path, late).await;
+
+    // Boot 2 (after the "upgrade"): merge C into main. This persists the
+    // merge's membership on C's row.
+    {
+        let state = build_state(open_db(&path).await, true).await;
+        assert_eq!(
+            branch_history(&state, late).await,
+            late_before,
+            "sanity: before any persisted merge the fork rule restores B exactly"
+        );
+        let (s, body) = dispatch(
+            &state,
+            post(
+                &format!("/api/branches/{explore}/merge"),
+                json!({ "strategy": "three-way" }),
+            ),
+        )
+        .await;
+        assert_eq!(
+            s,
+            StatusCode::OK,
+            "three-way merge must apply; body = {body}"
+        );
+        assert_eq!(body["success"], true, "clean merge expected; body = {body}");
+        let explore_only: Vec<(u64, String)> = branch_history(&state, explore)
+            .await
+            .into_iter()
+            .filter(|e| !late_before.contains(e))
+            .collect();
+        let fork_seq = late_before.last().map(|e| e.0).unwrap_or(0);
+        assert!(
+            !explore_only.is_empty() && explore_only.iter().all(|e| e.0 < fork_seq),
+            "sanity: the merged events sit below B's fork point"
+        );
+    }
+
+    // Boot 3: B's history is still exactly what it held.
+    let state3 = build_state(open_db(&path).await, true).await;
+    assert_eq!(
+        branch_history(&state3, late).await,
+        late_before,
+        "a legacy branch must not inherit events merged into its parent after it forked"
+    );
+    assert_timeline_valid(&state3).await;
+}
+
+/// Task 6 discipline on the merge lane: a merge whose durable write fails is
+/// a typed 5xx and the in-memory merge is ROLLED BACK — main's history is
+/// untouched and the source is Active again — and nothing reaches the store.
+#[tokio::test]
+async fn merge_persistence_failure_is_a_typed_5xx_and_rolls_the_merge_back() {
+    let path = temp_db_path();
+    let (side, main_before) = seed_main_and_side(&path).await;
+
+    {
+        let state = build_state_with_failing_saves(&path).await;
+        let (status, body) = dispatch(
+            &state,
+            post(&format!("/api/branches/{side}/merge"), json!({})),
+        )
+        .await;
+        assert!(
+            status.is_server_error(),
+            "a merge whose durable write FAILED must not be reported as applied — \
+             expected a 5xx, got {status}; body = {body}"
+        );
+        assert_eq!(
+            body["error_code"], DURABILITY_PERSIST_FAILED,
+            "body = {body}"
+        );
+        assert!(
+            body["details"]["reason"]
+                .as_str()
+                .map(|r| r.contains(INJECTED_STORE_FAILURE))
+                .unwrap_or(false),
+            "the refusal must name the real store failure; body = {body}"
+        );
+        assert_eq!(
+            branch_history(&state, timeline_engine::BranchId::main()).await,
+            main_before,
+            "the rolled-back merge must leave main's history exactly as it was"
+        );
+        assert!(
+            matches!(
+                branch_state(&state, side).await,
+                timeline_engine::BranchState::Active
+            ),
+            "the rolled-back merge must leave the source Active"
+        );
+        assert_timeline_valid(&state).await;
+    }
+
+    let state3 = build_state(open_db(&path).await, true).await;
+    assert_eq!(
+        branch_history(&state3, timeline_engine::BranchId::main()).await,
+        main_before
+    );
+    assert!(matches!(
+        branch_state(&state3, side).await,
+        timeline_engine::BranchState::Active
+    ));
+}
+
+/// Task 6 discipline on the abandon lane.
+#[tokio::test]
+async fn abandon_persistence_failure_is_a_typed_5xx_and_leaves_the_branch_active() {
+    let path = temp_db_path();
+    let (side, _) = seed_main_and_side(&path).await;
+
+    {
+        let state = build_state_with_failing_saves(&path).await;
+        let (status, body) = dispatch(&state, del(&format!("/api/branches/{side}"))).await;
+        assert!(
+            status.is_server_error(),
+            "an abandon whose durable write FAILED must not answer 204 — got {status}; \
+             body = {body}"
+        );
+        assert_eq!(
+            body["error_code"], DURABILITY_PERSIST_FAILED,
+            "body = {body}"
+        );
+        assert!(
+            matches!(
+                branch_state(&state, side).await,
+                timeline_engine::BranchState::Active
+            ),
+            "the rolled-back abandon must leave the branch Active"
+        );
+    }
+
+    let state3 = build_state(open_db(&path).await, true).await;
+    assert!(matches!(
+        branch_state(&state3, side).await,
+        timeline_engine::BranchState::Active
+    ));
+}
+
+// =====================================================================
+// Task 68 round 1 — the id-space guard, the inherited index, and the
+// per-branch history disclosure.
+// =====================================================================
+
+/// The id of a live solid's +Z planar face, read off the exact B-Rep.
+async fn top_face_of(state: &AppState, solid_id: u32) -> u32 {
+    let model = state.model.read().await;
+    let solid = model.solids.get(solid_id).expect("solid must exist");
+    let shell = model.shells.get(solid.outer_shell).expect("outer shell");
+    for &face_id in &shell.faces {
+        let face = model.faces.get(face_id).expect("face");
+        let surface = model.surfaces.get(face.surface_id).expect("surface");
+        if let Ok(n) = surface.normal_at(0.5, 0.5) {
+            if (n.z - 1.0).abs() < 1e-9 && n.x.abs() < 1e-9 && n.y.abs() < 1e-9 {
+                return face_id;
+            }
+        }
+    }
+    panic!("solid {solid_id} has no +Z face");
+}
+
+/// main: 10-cube → (optionally: fork B, a cylinder on B, back to main) →
+/// 4-cube → pull the 4-cube's +Z face by 3 (4x4x7 = 112). Returns the
+/// sequence number of the face-extrude event.
+async fn seed_face_pull(path: &str, with_side_branch: bool) -> u64 {
+    let state = build_state(open_db(path).await, true).await;
+    create_cube(&state, 10.0).await;
+    if with_side_branch {
+        let side = fork_from_main(&state, "side-cylinder").await;
+        activate_branch(&state, &side.to_string()).await;
+        create_side_cylinder(&state).await;
+        activate_branch(&state, "main").await;
+    }
+    let (s, body) = dispatch(
+        &state,
+        post(
+            "/api/geometry/box",
+            json!({ "width": 4.0, "depth": 4.0, "height": 4.0 }),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "4-cube create; body = {body}");
+    let uuid = body["object"]["id"]
+        .as_str()
+        .expect("box response must carry object.id")
+        .to_string();
+    let solid_id = state
+        .get_local_id(&Uuid::parse_str(&uuid).expect("uuid"))
+        .expect("the 4-cube must be registered");
+    let top = top_face_of(&state, solid_id).await;
+    let (s, body) = dispatch(
+        &state,
+        post(
+            "/api/geometry/face/extrude",
+            json!({ "object_uuid": uuid, "face_id": top, "distance": 3.0 }),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "face/extrude must apply; body = {body}");
+    let volumes = live_volumes(&state).await;
+    assert!(
+        volumes.iter().any(|v| (v - 112.0).abs() < 1e-6),
+        "sanity: the pulled 4-cube is 4x4x7 = 112 before the restart; got {volumes:?}"
+    );
+    branch_history(&state, timeline_engine::BranchId::main())
+        .await
+        .last()
+        .map(|e| e.0)
+        .expect("main holds the extrude")
+}
+
+/// C1 — the reviewer's probe, permanent. Runtime kernel ids are allocated
+/// across the WHOLE interleaved log (every branch runs in one live model), so
+/// replaying main alone shifts them, and an extrude that names its face by the
+/// raw recorded id would pull a DIFFERENT face of the 4-cube (measured: a
+/// volume of 80.0 served as `active`). After a restart the document must NOT
+/// serve that: the extrude is a typed quarantine boundary naming the id-space
+/// shift, and the clean prefix (the two cubes) is served.
+#[tokio::test]
+async fn interleaved_side_branch_makes_a_raw_face_reference_a_typed_quarantine() {
+    let path = temp_db_path();
+    let extrude_seq = seed_face_pull(&path, true).await;
+
+    let state2 = build_state(open_db(&path).await, true).await;
+    let volumes = live_volumes(&state2).await;
+    assert!(
+        !volumes.iter().any(|v| (v - 80.0).abs() < 1e-6),
+        "the extrude must never bind the wrong face (volume 80) after a restart; got {volumes:?}"
+    );
+    let (s, body) = dispatch(&state2, get("/api/durability/status")).await;
+    assert_eq!(s, StatusCode::OK, "status 200; body = {body}");
+    assert_eq!(
+        body["quarantined"], true,
+        "a raw face reference after an interleaved side-branch event cannot be reproduced from main alone; body = {body}"
+    );
+    assert_eq!(
+        body["status"]["first_break_kind"], "interleaved_foreign_history",
+        "body = {body}"
+    );
+    assert_eq!(
+        body["status"]["first_break_sequence"],
+        json!(extrude_seq),
+        "the boundary is the extrude itself; body = {body}"
+    );
+    let reason = body["status"]["reason"].as_str().unwrap_or_default();
+    assert!(
+        reason.contains("face:") && !reason.contains("  "),
+        "the reason names the raw face reference, single-spaced; reason = {reason:?}"
+    );
+    assert!(
+        volumes.len() == 2
+            && (volumes[0] - 64.0).abs() < 1e-6
+            && (volumes[1] - 1000.0).abs() < 1e-6,
+        "the clean prefix — both cubes, unpulled — is what is served; got {volumes:?}"
+    );
+}
+
+/// C1 control: the identical script with no side branch replays in the order
+/// the ids were allocated, so the extrude reproduces exactly (112) and the
+/// document is active.
+#[tokio::test]
+async fn face_pull_without_a_side_branch_replays_exactly_and_stays_active() {
+    let path = temp_db_path();
+    let _ = seed_face_pull(&path, false).await;
+
+    let state2 = build_state(open_db(&path).await, true).await;
+    let (s, body) = dispatch(&state2, get("/api/durability/status")).await;
+    assert_eq!(s, StatusCode::OK, "status 200; body = {body}");
+    assert_eq!(body["status"]["state"], "active", "body = {body}");
+    let volumes = live_volumes(&state2).await;
+    assert_eq!(volumes.len(), 2, "two parts; got {volumes:?}");
+    assert!(
+        (volumes[0] - 112.0).abs() < 1e-6 && (volumes[1] - 1000.0).abs() < 1e-6,
+        "the pulled 4-cube (112) and the 10-cube (1000) replay exactly; got {volumes:?}"
+    );
+}
+
+/// POST a create route and return the created part's public uuid.
+async fn create_part(state: &AppState, uri: &str, payload: Value) -> String {
+    let (s, body) = dispatch(state, post(uri, payload)).await;
+    assert_eq!(s, StatusCode::OK, "{uri} must succeed; body = {body}");
+    body["object"]["id"]
+        .as_str()
+        .expect("create response must carry object.id")
+        .to_string()
+}
+
+/// main: 10-cube A → (optionally on a side branch B) a cylinder through A →
+/// back on main a 4-cube → on main `difference(A, cylinder)`. Returns the
+/// sequence number of the boolean's first event.
+async fn seed_cross_branch_boolean(path: &str, cylinder_on_side_branch: bool) -> u64 {
+    let state = build_state(open_db(path).await, true).await;
+    let cube = create_part(
+        &state,
+        "/api/geometry/box",
+        json!({ "width": 10.0, "depth": 10.0, "height": 10.0 }),
+    )
+    .await;
+    let cylinder_payload = json!({ "center": [0.0, 0.0, -5.0], "axis": [0.0, 0.0, 1.0], "radius": 2.0, "height": 20.0 });
+    let cylinder = if cylinder_on_side_branch {
+        let side = fork_from_main(&state, "side-cylinder").await;
+        activate_branch(&state, &side.to_string()).await;
+        let c = create_part(&state, "/api/geometry/cylinder", cylinder_payload).await;
+        activate_branch(&state, "main").await;
+        c
+    } else {
+        create_part(&state, "/api/geometry/cylinder", cylinder_payload).await
+    };
+    let _small = create_part(
+        &state,
+        "/api/geometry/box",
+        json!({ "width": 4.0, "depth": 4.0, "height": 4.0 }),
+    )
+    .await;
+    let before = branch_history(&state, timeline_engine::BranchId::main()).await;
+    let (s, body) = dispatch(
+        &state,
+        post(
+            "/api/geometry/boolean",
+            json!({ "operation": "difference", "object_a": cube, "object_b": cylinder }),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "difference must apply; body = {body}");
+    let volumes = live_volumes(&state).await;
+    assert!(
+        volumes.iter().any(|v| (v - 874.35).abs() < 0.01),
+        "sanity: the bored cube is ~874.35 before the restart; got {volumes:?}"
+    );
+    branch_history(&state, timeline_engine::BranchId::main())
+        .await
+        .into_iter()
+        .find(|e| !before.contains(e))
+        .map(|e| e.0)
+        .expect("the boolean recorded an event on main")
+}
+
+/// C1 via SOLIDS — the reviewer's round-1 probe, permanent. The cylinder is
+/// built on a side branch, so main's history never produces it; replaying
+/// main alone, the boolean's `solid_b` falls back to the raw id — the 4-cube's
+/// number in a main-only replay — and subtracted the 4-cube (measured: one
+/// solid of 936.0, served `active`). The boolean must instead be a typed
+/// `foreign_solid_input` boundary, never a silent 936.
+#[tokio::test]
+async fn a_main_boolean_on_a_side_branch_solid_is_a_typed_quarantine() {
+    let path = temp_db_path();
+    let boolean_seq = seed_cross_branch_boolean(&path, true).await;
+
+    let state2 = build_state(open_db(&path).await, true).await;
+    let volumes = live_volumes(&state2).await;
+    assert!(
+        !volumes.iter().any(|v| (v - 936.0).abs() < 0.01),
+        "the boolean must never subtract the wrong solid (936) after a restart; got {volumes:?}"
+    );
+    let (s, body) = dispatch(&state2, get("/api/durability/status")).await;
+    assert_eq!(s, StatusCode::OK, "status 200; body = {body}");
+    assert_eq!(body["quarantined"], true, "body = {body}");
+    assert_eq!(
+        body["status"]["first_break_kind"], "foreign_solid_input",
+        "body = {body}"
+    );
+    assert_eq!(
+        body["status"]["first_break_sequence"],
+        json!(boolean_seq),
+        "the boundary is the boolean itself; body = {body}"
+    );
+    let reason = body["status"]["reason"].as_str().unwrap_or_default();
+    assert!(
+        reason.contains("solid:")
+            && reason.contains("outside this history")
+            && !reason.contains("  "),
+        "the reason names the solid and its producer, single-spaced; reason = {reason:?}"
+    );
+    assert!(
+        volumes.len() == 2
+            && (volumes[0] - 64.0).abs() < 1e-6
+            && (volumes[1] - 1000.0).abs() < 1e-6,
+        "the clean prefix — both cubes, unbored — is what is served; got {volumes:?}"
+    );
+}
+
+/// Control: the same boolean with the cylinder built on main replays exactly
+/// (874.35 and the 4-cube) and stays active.
+#[tokio::test]
+async fn a_main_boolean_on_a_main_solid_replays_exactly_and_stays_active() {
+    let path = temp_db_path();
+    let _ = seed_cross_branch_boolean(&path, false).await;
+
+    let state2 = build_state(open_db(&path).await, true).await;
+    let (s, body) = dispatch(&state2, get("/api/durability/status")).await;
+    assert_eq!(s, StatusCode::OK, "status 200; body = {body}");
+    assert_eq!(body["status"]["state"], "active", "body = {body}");
+    let volumes = live_volumes(&state2).await;
+    assert!(
+        volumes.len() == 2
+            && (volumes[0] - 64.0).abs() < 1e-6
+            && (volumes[1] - 874.35).abs() < 0.01,
+        "the 4-cube and the bored cube replay exactly; got {volumes:?}"
+    );
+}
+
+/// I1 — the case `inherited_sequences` exists for: a branch forked AFTER a
+/// merge into its parent holds the merged-in events under their original
+/// (older) sequence numbers. The merge-free fork rule cannot rebuild that, so
+/// only the persisted index can. Abandoning the branch rewrites its whole row,
+/// so this also pins that a transition keeps the row's other keys.
+#[tokio::test]
+async fn a_branch_forked_after_a_merge_keeps_the_merged_events_across_abandon_and_restart() {
+    let path = temp_db_path();
+
+    let (child, child_before) = {
+        let state = build_state(open_db(&path).await, true).await;
+        create_cube(&state, 10.0).await;
+        let side = fork_from_main(&state, "merged-side").await;
+        activate_branch(&state, &side.to_string()).await;
+        create_side_cylinder(&state).await;
+        activate_branch(&state, "main").await;
+        let (s, body) = dispatch(
+            &state,
+            post(&format!("/api/branches/{side}/merge"), json!({})),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "merge must apply; body = {body}");
+        let merged: Vec<(u64, String)> = branch_history(&state, side).await;
+        let child = fork_from_main(&state, "after-merge").await;
+        let child_h = branch_history(&state, child).await;
+        assert!(
+            merged.iter().all(|e| child_h.contains(e)),
+            "sanity: the child inherits the merged-in events"
+        );
+        let (s, body) = dispatch(&state, del(&format!("/api/branches/{child}"))).await;
+        assert_eq!(
+            s,
+            StatusCode::NO_CONTENT,
+            "abandon must succeed; body = {body}"
+        );
+        (child, child_h)
+    };
+
+    let state2 = build_state(open_db(&path).await, true).await;
+    assert_eq!(
+        branch_history(&state2, child).await,
+        child_before,
+        "the child must come back holding the merged-in events it inherited"
+    );
+    assert!(
+        matches!(
+            branch_state(&state2, child).await,
+            timeline_engine::BranchState::Abandoned { .. }
+        ),
+        "the child must come back Abandoned"
+    );
+    assert_timeline_valid(&state2).await;
+}
+
+/// I2 — a side branch whose restored history lost an event (a corrupt row)
+/// must say so on ITS OWN history read, not only on the status endpoint: the
+/// read is wrapped `{events, durability}` naming the fault. Main's read, whose
+/// history is whole, stays the bare array.
+#[tokio::test]
+async fn a_faulted_side_branch_history_read_discloses_its_fault() {
+    let path = temp_db_path();
+    let (side, _) = seed_main_and_side(&path).await;
+    let seq = {
+        let template = last_row_of(&path, side).await;
+        let seq = template.sequence_number + 1;
+        let corrupt = TimelineEventData {
+            id: Uuid::new_v4().to_string(),
+            session_id: template.session_id.clone(),
+            event_type: "corrupt".to_string(),
+            user_id: template.user_id.clone(),
+            timestamp: template.timestamp,
+            data: json!({ "not": "a timeline event" }),
+            branch_id: template.branch_id.clone(),
+            sequence_number: seq,
+        };
+        open_db(&path)
+            .await
+            .save_timeline_event(durability::DURABILITY_SESSION_ID, &corrupt)
+            .await
+            .expect("inject corrupt side-branch row");
+        seq
+    };
+
+    let state2 = build_state(open_db(&path).await, true).await;
+    let (s, body) = dispatch(&state2, get(&format!("/api/timeline/history/{side}"))).await;
+    assert_eq!(s, StatusCode::OK, "history 200; body = {body}");
+    assert!(
+        body["events"].is_array(),
+        "a faulted branch's history must be wrapped with its disclosure; body = {body}"
+    );
+    let faults = body["durability"]["branch_faults"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        faults
+            .iter()
+            .any(|f| f["branch_id"] == side.to_string().as_str() && f["sequence"] == json!(seq)),
+        "the disclosure names this branch's lost event; body = {body}"
+    );
+
+    let (s, body) = dispatch(&state2, get("/api/timeline/history/main")).await;
+    assert_eq!(s, StatusCode::OK, "history 200; body = {body}");
+    assert!(
+        body.is_array(),
+        "main's history is whole, so its read stays the bare array; body = {body}"
+    );
+}
