@@ -38,7 +38,7 @@ use geometry_engine::operations::recorder::{
     IntentFacet, OperationRecorder, Origin, OriginBasis, OriginFacet, RecordedOperation,
     RecorderError,
 };
-use parking_lot::RwLock as PlRwLock;
+use parking_lot::{Mutex as PlMutex, RwLock as PlRwLock};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot, RwLock};
 
@@ -57,9 +57,10 @@ use crate::types::{Author, BranchId, Operation, TimelineEvent};
 /// defines it and knows nothing about the concrete database. The api-server
 /// supplies an implementation that bridges to `session-manager`'s
 /// `DatabasePersistence`, so no `timeline-engine → session-manager` dependency is
-/// introduced. A `persist` error is logged loudly by the worker and never
-/// crashes it — the in-memory timeline is still correct; only durability of that
-/// one event is at risk (surfaced honestly, never silently).
+/// introduced. A `persist` error never crashes the worker — the in-memory
+/// timeline is still correct; only durability of that one event is at risk —
+/// and it is recorded as a [`RecordFailure`] that reaches the next
+/// [`TimelineRecorder::flush`] / [`TimelineRecorder::take_failures`] caller.
 ///
 /// # Why `document` is a parameter and not something the sink looks up
 ///
@@ -87,6 +88,173 @@ pub trait EventSink: Send + Sync {
 /// bound is a system-health signal, not a normal-path event.
 pub const RECORDER_CHANNEL_CAPACITY: usize = 16_384;
 
+/// Upper bound on failures held between drains. A recorder nobody drains
+/// (no mutating response, no flushing route) must not grow without bound;
+/// failures past this cap are COUNTED ([`RecordFailures::unlisted`]), never
+/// silently forgotten.
+pub(crate) const MAX_PENDING_RECORD_FAILURES: usize = 256;
+
+/// Where between `record()` and the durable store an operation was lost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordFailureStage {
+    /// A staged (`with_rollback`) op could not be handed to the drain
+    /// worker when its window committed — it never reached the timeline.
+    Enqueue,
+    /// The timeline refused the append (e.g. the target branch is no longer
+    /// Active) — the op is in NO branch's history.
+    Append,
+    /// The event is in the in-memory timeline but the durable store refused
+    /// it — it is lost at the next restart.
+    Persist,
+}
+
+/// One operation that `record()` accepted but that did not end up where the
+/// caller was told it would: in the timeline and on disk.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RecordFailure {
+    /// Where it was lost.
+    pub stage: RecordFailureStage,
+    /// The kernel op kind (`RecordedOperation::kind`).
+    pub kind: String,
+    /// The branch the op was recorded against (captured at `record()` time).
+    pub branch: BranchId,
+    /// The event's sequence number, when one was assigned or reserved.
+    pub sequence: Option<u64>,
+    /// The document the recording request named, if it named one.
+    pub document: Option<String>,
+    /// Who recorded the op (captured at `record()` time). The failure list
+    /// is recorder-wide, so the caller a failure is reported to may not be
+    /// the one that lost the op — this, with `channel`, lets it tell.
+    pub author: Author,
+    /// Which channel the op arrived on (the op's `roshera.origin` facet;
+    /// `not_determined` when it carries none). With auth off every REST op
+    /// records as `System`, so this is what separates, e.g., a human's
+    /// WebSocket viewport from an agent's REST calls.
+    pub channel: Origin,
+    /// The underlying error, verbatim.
+    pub error: String,
+}
+
+/// The origin channel stamped on a record, or the honest
+/// `NotDetermined` when it carries none (or an unreadable one).
+fn channel_of(record: &RecordedOperation) -> Origin {
+    record
+        .facets
+        .origin()
+        .and_then(Result::ok)
+        .map(|facet| facet.channel)
+        .unwrap_or(Origin::NotDetermined)
+}
+
+/// Short, stable label for an author in failure prose.
+fn author_label(author: &Author) -> String {
+    match author {
+        Author::User { id, .. } => format!("user {id}"),
+        Author::AIAgent { id, .. } => format!("agent {id}"),
+        Author::System => "system".to_string(),
+    }
+}
+
+/// Wire name of a channel in failure prose (the serde name).
+fn channel_label(channel: Origin) -> &'static str {
+    match channel {
+        Origin::Mcp => "mcp",
+        Origin::Rest => "rest",
+        Origin::Websocket => "websocket",
+        Origin::ViewportBridge => "viewport_bridge",
+        Origin::Replay => "replay",
+        Origin::NotDetermined => "not_determined",
+    }
+}
+
+/// Failures taken from the recorder in one drain.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RecordFailures {
+    /// The failures, oldest first, at most `MAX_PENDING_RECORD_FAILURES` (256).
+    pub failures: Vec<RecordFailure>,
+    /// Failures that occurred past the cap and are counted, not listed.
+    pub unlisted: u64,
+}
+
+impl RecordFailures {
+    /// `true` when nothing was lost since the last drain.
+    pub fn is_empty(&self) -> bool {
+        self.failures.is_empty() && self.unlisted == 0
+    }
+
+    /// Total failures, listed and unlisted.
+    pub fn total(&self) -> u64 {
+        self.failures.len() as u64 + self.unlisted
+    }
+
+    fn push(&mut self, failure: RecordFailure) {
+        if self.failures.len() < MAX_PENDING_RECORD_FAILURES {
+            self.failures.push(failure);
+        } else {
+            self.unlisted = self.unlisted.saturating_add(1);
+        }
+    }
+}
+
+impl std::fmt::Display for RecordFailures {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            concat!(
+                "{} operation(s) recorded on this server did not reach the timeline or ",
+                "the durable store, possibly by another client (see each one's author ",
+                "and channel)"
+            ),
+            self.total()
+        )?;
+        for failure in &self.failures {
+            let stage = match failure.stage {
+                RecordFailureStage::Enqueue => "enqueue",
+                RecordFailureStage::Append => "append",
+                RecordFailureStage::Persist => "persist",
+            };
+            write!(
+                f,
+                "; '{}' on branch {} recorded by {} over {} ({}: {})",
+                failure.kind,
+                failure.branch,
+                author_label(&failure.author),
+                channel_label(failure.channel),
+                stage,
+                failure.error
+            )?;
+        }
+        if self.unlisted > 0 {
+            write!(f, "; and {} more not listed", self.unlisted)?;
+        }
+        Ok(())
+    }
+}
+
+/// Why [`TimelineRecorder::flush`] could not report a clean drain.
+#[derive(Debug, Clone)]
+pub enum FlushError {
+    /// The drain worker is gone; nothing in flight can land.
+    Unavailable(RecorderError),
+    /// The drain completed, but operations `record()` had already accepted
+    /// were lost on the way (see each [`RecordFailure`]). Taken by this
+    /// flush: the caller that receives them is the one that must surface
+    /// them.
+    RecordingFailed(RecordFailures),
+}
+
+impl std::fmt::Display for FlushError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FlushError::Unavailable(e) => write!(f, "{e}"),
+            FlushError::RecordingFailed(failures) => write!(f, "{failures}"),
+        }
+    }
+}
+
+impl std::error::Error for FlushError {}
+
 /// Internal command type for the recorder worker. The kernel only ever
 /// sends `Op`; `Flush` is reserved for the api-server to drain in-flight
 /// events before observing timeline head (e.g. so a freshly-clicked
@@ -101,6 +269,12 @@ enum RecorderCmd {
         /// by the worker so attribution is exact even when ops from
         /// differently-authored request tasks interleave in the channel.
         author: Author,
+        /// The branch that was the recorder's target at `record()` time —
+        /// the branch that was active when the kernel mutated. Read by the
+        /// worker at PROCESSING time instead, an op queued before a switch
+        /// landed on the branch switched TO; queued before a merge retired
+        /// its branch, it was refused and dropped.
+        branch: BranchId,
         /// Document snapshotted at `record()` time from [`DOCUMENT_OVERRIDE`],
         /// carried for exactly the reason `author` is: the worker persists on
         /// a DIFFERENT task, where the task-local of whatever request happens
@@ -112,7 +286,14 @@ enum RecorderCmd {
         /// always did.
         document: Option<String>,
     },
-    Flush(oneshot::Sender<()>),
+    /// FIFO barrier. `take_failures: true` ([`TimelineRecorder::flush`])
+    /// answers with every failure recorded so far and clears them;
+    /// `false` ([`TimelineRecorder::settle`]) answers empty and leaves them
+    /// pending for a caller that will surface them.
+    Flush {
+        take_failures: bool,
+        reply: oneshot::Sender<RecordFailures>,
+    },
 }
 
 tokio::task_local! {
@@ -330,13 +511,19 @@ pub type SharedTimeline = Arc<RwLock<Timeline>>;
 pub struct TimelineRecorder {
     tx: mpsc::Sender<RecorderCmd>,
     author: Author,
-    /// The branch every event is appended to. Wrapped in an
+    /// The branch new events are recorded against. Wrapped in an
     /// `Arc<parking_lot::RwLock>` so the api-server can swap it in
     /// response to `POST /api/branches/active` without rebuilding the
-    /// recorder or restarting the worker. The worker reads the current
-    /// value once per event, so a swap takes effect on the very next
-    /// kernel operation.
+    /// recorder or restarting the worker. Read by `record()` and carried
+    /// with the op, so a swap affects the next op RECORDED — never one
+    /// already queued.
     branch_id: Arc<PlRwLock<BranchId>>,
+    /// Operations `record()` accepted that were then lost (refused append,
+    /// refused persist, failed staged hand-off). Written by the drain
+    /// worker; taken by [`flush`](Self::flush) and
+    /// [`take_failures`](Self::take_failures) so each reaches exactly one
+    /// caller that surfaces it.
+    failures: Arc<PlMutex<RecordFailures>>,
     /// Transactional staging buffer for events recorded inside a
     /// `with_rollback` window. While `depth > 0`, `record()` pushes
     /// into `buffer` instead of forwarding to the worker. On
@@ -381,6 +568,15 @@ impl std::fmt::Debug for TimelineRecorder {
     }
 }
 
+/// One staged record with everything snapshotted at `record()` time.
+#[derive(Debug)]
+struct StagedOp {
+    record: RecordedOperation,
+    author: Author,
+    branch: BranchId,
+    document: Option<String>,
+}
+
 /// Per-recorder transactional staging state. Cloned `TimelineRecorder`
 /// handles share this state via `Arc`, so a `with_rollback` wrapping a
 /// composite operation across recorder clones still buffers coherently.
@@ -391,12 +587,12 @@ struct StagingState {
     /// `with_rollback`). Only when depth returns to zero do we
     /// flush or discard the buffer.
     depth: u32,
-    /// Events recorded while `depth > 0`, each paired with the author
-    /// AND the document snapshotted at `record()` time (the commit drain
-    /// may run on a different task than the records, so resolving either
-    /// at drain time would lose the per-request override). Drained to the
-    /// MPSC on commit; cleared on abort.
-    buffer: Vec<(RecordedOperation, Author, Option<String>)>,
+    /// Events recorded while `depth > 0`, each paired with the author,
+    /// the target branch AND the document snapshotted at `record()` time
+    /// (the commit drain may run on a different task, and after a branch
+    /// switch, so resolving any of them at drain time would misattribute).
+    /// Drained to the MPSC on commit; cleared on abort.
+    buffer: Vec<StagedOp>,
     /// Nesting depth for `begin_discard_scope`/`end_discard_scope` — a
     /// SEPARATE counter from `depth`. A `begin_pending` scope may still
     /// commit (its buffered events reach the timeline), so records inside
@@ -493,7 +689,8 @@ impl TimelineRecorder {
         // field docs) BEFORE the handle below is moved into the worker task.
         let recorder_timeline = Arc::clone(&timeline);
 
-        let worker_branch = Arc::clone(&branch_id);
+        let failures = Arc::new(PlMutex::new(RecordFailures::default()));
+        let worker_failures = Arc::clone(&failures);
         let worker_timeline = timeline;
         let worker_sink = sink.clone();
         tokio::spawn(async move {
@@ -502,9 +699,14 @@ impl TimelineRecorder {
                     RecorderCmd::Op {
                         record,
                         author,
+                        branch: target,
                         document,
                     } => {
                         let op = to_timeline_operation(&record);
+                        // Attribution for a failure report, taken before
+                        // `author` moves into the append.
+                        let failure_author = author.clone();
+                        let failure_channel = channel_of(&record);
                         // Project the kernel proof the recording handler
                         // attached at record time into the per-event
                         // certificate the event will carry. Absent stays
@@ -515,10 +717,8 @@ impl TimelineRecorder {
                             .solid_certificate
                             .as_ref()
                             .map(crate::event_certificate::EventCertificate::from_recorded_solid);
-                        // Snapshot the active branch *per event* so a swap via
-                        // `set_branch_id` takes effect on the next op without
-                        // restarting the worker.
-                        let target = *worker_branch.read();
+                        // `target` is the branch captured at `record()` time
+                        // (see `RecorderCmd::Op::branch`), never re-read here.
                         let guard = worker_timeline.read().await;
                         // Root-pid reservation handoff (see
                         // `topology_builder::next_root_seed` /
@@ -579,6 +779,20 @@ impl TimelineRecorder {
                                                  in-memory timeline is correct but this \
                                                  event is NOT on disk"
                                             );
+                                            // The log is for the operator; the
+                                            // failure list is what reaches the
+                                            // caller (next flush / next
+                                            // mutating response).
+                                            worker_failures.lock().push(RecordFailure {
+                                                stage: RecordFailureStage::Persist,
+                                                kind: record.kind.clone(),
+                                                branch: target,
+                                                sequence: Some(event.sequence_number),
+                                                document,
+                                                author: failure_author,
+                                                channel: failure_channel,
+                                                error: err,
+                                            });
                                         }
                                     }
                                 }
@@ -590,18 +804,50 @@ impl TimelineRecorder {
                                     error = %err,
                                     "timeline.add_operation failed — event dropped"
                                 );
+                                // `record()` answered Ok long ago; this list is
+                                // the only way the op's loss reaches a caller.
+                                worker_failures.lock().push(RecordFailure {
+                                    stage: RecordFailureStage::Append,
+                                    kind: record.kind.clone(),
+                                    branch: target,
+                                    sequence: record.reserved_sequence,
+                                    document,
+                                    author: failure_author,
+                                    channel: failure_channel,
+                                    error: err.to_string(),
+                                });
                             }
                         }
                     }
-                    RecorderCmd::Flush(resp) => {
+                    RecorderCmd::Flush {
+                        take_failures,
+                        reply,
+                    } => {
                         // FIFO ordering on the MPSC guarantees that every
                         // `Op` enqueued before this `Flush` has already
-                        // been drained and applied above. Signalling now
-                        // lets the caller observe a fully-up-to-date
-                        // timeline head. We ignore send failures: the
-                        // caller's oneshot rx may have been dropped if
-                        // they timed out, which is safe to swallow.
-                        let _ = resp.send(());
+                        // been drained and applied above — including any
+                        // failure it recorded. Taking the failures HERE,
+                        // on the worker, is what makes "every failure of
+                        // an op enqueued before this flush" exact.
+                        let answer = if take_failures {
+                            std::mem::take(&mut *worker_failures.lock())
+                        } else {
+                            RecordFailures::default()
+                        };
+                        if let Err(unsent) = reply.send(answer) {
+                            // The caller stopped waiting (its future was
+                            // dropped). Failures it would have received go
+                            // back on the list for the next caller rather
+                            // than vanishing with the dropped receiver.
+                            let mut pending = worker_failures.lock();
+                            let later = std::mem::take(&mut *pending);
+                            let mut restored = unsent;
+                            for failure in later.failures {
+                                restored.push(failure);
+                            }
+                            restored.unlisted = restored.unlisted.saturating_add(later.unlisted);
+                            *pending = restored;
+                        }
                     }
                 }
             }
@@ -615,6 +861,7 @@ impl TimelineRecorder {
             tx,
             author,
             branch_id,
+            failures,
             staging: Arc::new(PlRwLock::new(StagingState::default())),
             sink,
             timeline: recorder_timeline,
@@ -625,16 +872,18 @@ impl TimelineRecorder {
     /// Push a record into the MPSC channel without consulting the
     /// staging buffer. Shared between the immediate-record path and
     /// the `commit_pending` drain path.
-    fn try_send_op(
-        &self,
-        operation: RecordedOperation,
-        author: Author,
-        document: Option<String>,
-    ) -> Result<(), RecorderError> {
+    fn try_send_op(&self, staged: StagedOp) -> Result<(), RecorderError> {
+        let StagedOp {
+            record,
+            author,
+            branch,
+            document,
+        } = staged;
         self.tx
             .try_send(RecorderCmd::Op {
-                record: operation,
+                record,
                 author,
+                branch,
                 document,
             })
             .map_err(|e| match e {
@@ -658,17 +907,79 @@ impl TimelineRecorder {
         *self.branch_id.read()
     }
 
-    /// Switch the active branch. Subsequent kernel operations will be
-    /// recorded against `branch_id`. In-flight events that have already
-    /// been queued (but not yet drained by the worker) will use the new
-    /// branch — there is exactly one "active branch" for this recorder
-    /// at any moment, by design.
+    /// Switch the active branch. Kernel operations RECORDED after this call
+    /// are recorded against `branch_id`. Events already recorded — queued
+    /// in the channel or staged in a `with_rollback` window — keep the
+    /// branch that was active when they were recorded (see
+    /// `RecorderCmd::Op::branch`): an op belongs to the branch the kernel
+    /// mutated under, not to whichever branch is active when the worker
+    /// reaches it.
     pub fn set_branch_id(&self, branch_id: BranchId) {
         *self.branch_id.write() = branch_id;
     }
 
+    /// Switch the active branch to `branch_id` only if it is currently
+    /// `expected`, atomically (one write lock). Returns whether it switched.
+    /// For undoing a retarget: a switch someone else made in between is
+    /// left alone rather than overwritten.
+    pub fn set_branch_id_if(&self, expected: BranchId, branch_id: BranchId) -> bool {
+        let mut current = self.branch_id.write();
+        if *current == expected {
+            *current = branch_id;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Take every failure recorded since the last take, without waiting
+    /// for the worker. Synchronous (never blocks on the channel), so a
+    /// response builder that cannot `.await` can still disclose what was
+    /// lost. Only failures of ops the worker has ALREADY processed are
+    /// here; ops still queued report on a later take.
+    // gate: allow-ungated because consumed by `certified_response` in api-server/src/main.rs (the disconnection gate reads main.rs as test code below its line-19 `#[cfg(test)] mod`)
+    pub fn take_failures(&self) -> RecordFailures {
+        std::mem::take(&mut *self.failures.lock())
+    }
+
+    /// Like [`flush`](Self::flush), a FIFO barrier — but it leaves any
+    /// failures PENDING instead of taking them. For a caller that needs
+    /// the drain (to read a complete head) but does not surface failures
+    /// itself: taking them there would make them vanish, so they wait for
+    /// the next `flush()` or [`take_failures`](Self::take_failures) that
+    /// reports them.
+    pub async fn settle(&self) -> Result<(), RecorderError> {
+        self.barrier(false).await.map(|_| ())
+    }
+
+    async fn barrier(&self, take_failures: bool) -> Result<RecordFailures, RecorderError> {
+        let (reply, resp_rx) = oneshot::channel();
+        // Block-on-send is correct here; we want the sentinel to actually
+        // land even under backpressure rather than erroring out spuriously.
+        self.tx
+            .send(RecorderCmd::Flush {
+                take_failures,
+                reply,
+            })
+            .await
+            .map_err(|e| {
+                RecorderError::Unavailable(format!("TimelineRecorder worker has shut down: {}", e))
+            })?;
+        resp_rx.await.map_err(|e| {
+            RecorderError::Unavailable(format!("TimelineRecorder flush response lost: {}", e))
+        })
+    }
+
     /// Block until every `Op` enqueued *before* this call has been
-    /// applied to the timeline.
+    /// applied to the timeline, and report every operation that was lost
+    /// on the way.
+    ///
+    /// `Ok(())` means the drain completed AND nothing `record()` accepted
+    /// since the last report was lost. `Err(FlushError::RecordingFailed)`
+    /// carries the lost operations and TAKES them: the caller that receives
+    /// them must surface them (refuse, or disclose), because no later
+    /// caller will see them again. A caller that only needs the barrier
+    /// uses [`settle`](Self::settle).
     ///
     /// The kernel's `record()` is fire-and-forget — it pushes into the
     /// MPSC channel and returns immediately, leaving a background worker
@@ -684,21 +995,13 @@ impl TimelineRecorder {
     /// oneshot. FIFO ordering on the MPSC guarantees every prior `Op`
     /// has already been applied by the worker before it dequeues the
     /// sentinel.
-    pub async fn flush(&self) -> Result<(), RecorderError> {
-        let (resp_tx, resp_rx) = oneshot::channel();
-        // `flush` is async — block-on-send is correct here; we want the
-        // sentinel to actually land even under backpressure rather than
-        // erroring out spuriously.
-        self.tx
-            .send(RecorderCmd::Flush(resp_tx))
-            .await
-            .map_err(|e| {
-                RecorderError::Unavailable(format!("TimelineRecorder worker has shut down: {}", e))
-            })?;
-        resp_rx.await.map_err(|e| {
-            RecorderError::Unavailable(format!("TimelineRecorder flush response lost: {}", e))
-        })?;
-        Ok(())
+    pub async fn flush(&self) -> Result<(), FlushError> {
+        let failures = self.barrier(true).await.map_err(FlushError::Unavailable)?;
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(FlushError::RecordingFailed(failures))
+        }
     }
 }
 
@@ -721,6 +1024,11 @@ impl OperationRecorder for TimelineRecorder {
         // this purely additive for the viewport, the WebSocket surface and
         // every REST client that sends no binding header.
         let document = DOCUMENT_OVERRIDE.try_with(Clone::clone).ok();
+        // Capture the target branch NOW, for the same reason: the branch an
+        // op belongs to is the one that was active when the kernel mutated.
+        // Read on the worker instead, a switch (or a merge retiring the
+        // branch) between this call and the drain moves or drops the op.
+        let branch = *self.branch_id.read();
         // Stamp the request's open intent NOW, on the recording task, for
         // exactly the reason the author is resolved here and not on the
         // drain worker: the worker runs on a different task, where the
@@ -856,7 +1164,12 @@ impl OperationRecorder for TimelineRecorder {
                 }
             }
             if state.depth > 0 {
-                state.buffer.push((operation, author, document));
+                state.buffer.push(StagedOp {
+                    record: operation,
+                    author,
+                    branch,
+                    document,
+                });
                 return Ok(());
             }
         }
@@ -865,9 +1178,35 @@ impl OperationRecorder for TimelineRecorder {
         // Sync entry point — must never block. `try_send` returns
         // `Full` if the bounded channel is saturated (drainer falling
         // behind) and `Closed` if the worker has exited. Both surface
-        // as `Unavailable` so the kernel's `record_operation` helper
-        // logs loudly and continues; silent event loss is forbidden.
-        self.try_send_op(operation, author, document)
+        // as `Unavailable`. The kernel's `record_operation` helper only logs
+        // that `Err` (the geometry op is already complete and its response
+        // will say so), so the loss ALSO goes on the failure list — the
+        // same list the drain worker writes — where the next mutating
+        // response or flushing route reports it.
+        let kind = operation.kind.clone();
+        let sequence = operation.reserved_sequence;
+        let channel = channel_of(&operation);
+        let failure_author = author.clone();
+        let failure_document = document.clone();
+        let sent = self.try_send_op(StagedOp {
+            record: operation,
+            author,
+            branch,
+            document,
+        });
+        if let Err(err) = &sent {
+            self.failures.lock().push(RecordFailure {
+                stage: RecordFailureStage::Enqueue,
+                kind,
+                branch,
+                sequence,
+                document: failure_document,
+                author: failure_author,
+                channel,
+                error: err.to_string(),
+            });
+        }
+        sent
     }
 
     fn begin_pending(&self) {
@@ -899,13 +1238,32 @@ impl OperationRecorder for TimelineRecorder {
                 Vec::new()
             }
         };
-        for (op, author, document) in drained {
-            if let Err(err) = self.try_send_op(op, author, document) {
+        for staged in drained {
+            // `record()` answered Ok for this op when it was staged, so a
+            // failed hand-off here is a lost op the caller was never told
+            // about: it goes on the failure list, not only in the log.
+            let kind = staged.record.kind.clone();
+            let branch = staged.branch;
+            let sequence = staged.record.reserved_sequence;
+            let document = staged.document.clone();
+            let author = staged.author.clone();
+            let channel = channel_of(&staged.record);
+            if let Err(err) = self.try_send_op(staged) {
                 tracing::warn!(
                     target: "timeline.recorder_bridge",
                     error = %err,
                     "failed to forward staged op on commit"
                 );
+                self.failures.lock().push(RecordFailure {
+                    stage: RecordFailureStage::Enqueue,
+                    kind,
+                    branch,
+                    sequence,
+                    document,
+                    author,
+                    channel,
+                    error: err.to_string(),
+                });
             }
         }
     }
@@ -2757,5 +3115,313 @@ mod tests {
                  itself"
             );
         }
+    }
+
+    // =================================================================
+    // RECORD-TIME BRANCH + FAILURES THAT REACH THE CALLER (Task 69)
+    // =================================================================
+
+    /// Kinds of every event on `branch`, in sequence order.
+    async fn kinds_on(timeline: &SharedTimeline, branch: &BranchId) -> Vec<String> {
+        let mut events = timeline
+            .read()
+            .await
+            .get_branch_events(branch, None, None)
+            .unwrap_or_default();
+        events.sort_by_key(|e| e.sequence_number);
+        events
+            .into_iter()
+            .map(|e| match e.operation {
+                Operation::Generic { command_type, .. } => command_type,
+                other => format!("{other:?}"),
+            })
+            .collect()
+    }
+
+    /// A timeline with one event on main and a side branch forked after it.
+    async fn timeline_with_side_branch() -> (SharedTimeline, BranchId) {
+        let timeline: SharedTimeline =
+            Arc::new(RwLock::new(Timeline::new(TimelineConfig::default())));
+        let seed = TimelineRecorder::new(Arc::clone(&timeline), Author::System, BranchId::main());
+        seed.record(RecordedOperation::new("seed-on-main"))
+            .expect("record the seed op");
+        seed.flush().await.expect("the seed op lands");
+        drop(seed);
+        let side = timeline
+            .read()
+            .await
+            .create_branch(
+                "side".to_string(),
+                BranchId::main(),
+                None,
+                Author::System,
+                crate::BranchPurpose::UserExploration {
+                    description: "task 69 fixture".to_string(),
+                },
+            )
+            .await
+            .expect("fork the side branch");
+        (timeline, side)
+    }
+
+    /// (c) An op is recorded on the branch that was active WHEN THE KERNEL
+    /// MUTATED, not on whatever branch is active when the drain worker gets
+    /// to it. The worker is pinned behind the timeline write lock so the op
+    /// is provably still queued when the recorder is retargeted — the swap
+    /// goes through `set_branch_id` directly, bypassing any flush a route
+    /// might do first.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_queued_op_lands_on_the_branch_active_when_it_was_recorded() {
+        let (timeline, side) = timeline_with_side_branch().await;
+        let recorder =
+            TimelineRecorder::new(Arc::clone(&timeline), Author::System, BranchId::main());
+
+        let write_guard = timeline.write().await;
+        recorder
+            .record(RecordedOperation::new("op-recorded-on-main"))
+            .expect("record while main is active");
+        recorder.set_branch_id(side);
+        drop(write_guard);
+        recorder.flush().await.expect("the queued op lands cleanly");
+
+        assert!(
+            kinds_on(&timeline, &BranchId::main())
+                .await
+                .contains(&"op-recorded-on-main".to_string()),
+            "the op was recorded while main was active, so it belongs to main"
+        );
+        assert!(
+            !kinds_on(&timeline, &side)
+                .await
+                .contains(&"op-recorded-on-main".to_string()),
+            "a retarget after the op was recorded must not move the op"
+        );
+    }
+
+    /// (c) Same rule for a staged (`with_rollback`) record: the branch is the
+    /// one active at `record()`, not the one active at `commit_pending`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_staged_op_lands_on_the_branch_active_when_it_was_recorded() {
+        let (timeline, side) = timeline_with_side_branch().await;
+        let recorder =
+            TimelineRecorder::new(Arc::clone(&timeline), Author::System, BranchId::main());
+
+        recorder.begin_pending();
+        recorder
+            .record(RecordedOperation::new("staged-on-main"))
+            .expect("record inside the staging window");
+        recorder.set_branch_id(side);
+        recorder.commit_pending();
+        recorder.flush().await.expect("the staged op lands cleanly");
+
+        assert!(
+            kinds_on(&timeline, &BranchId::main())
+                .await
+                .contains(&"staged-on-main".to_string()),
+            "a staged op belongs to the branch active when it was recorded"
+        );
+        assert!(!kinds_on(&timeline, &side)
+            .await
+            .contains(&"staged-on-main".to_string()));
+    }
+
+    /// (d) An append the timeline refuses — the target branch was retired
+    /// behind the recorder's back — must reach the next `flush()` as an
+    /// error. `record()` answered Ok long before; a warn-only log was the
+    /// only trace of the dropped op.
+    #[tokio::test]
+    async fn an_append_refused_by_a_retired_branch_reaches_the_next_flush() {
+        let (timeline, side) = timeline_with_side_branch().await;
+        let recorder = TimelineRecorder::new(Arc::clone(&timeline), Author::System, side);
+        timeline
+            .read()
+            .await
+            .abandon_branch(side, "retired behind the recorder".to_string(), false)
+            .expect("abandon the side branch");
+
+        recorder
+            .record(RecordedOperation::new("op-on-a-dead-branch"))
+            .expect("record() itself cannot know yet");
+        let flushed = recorder.flush().await;
+        assert!(
+            flushed.is_err(),
+            "the dropped op must reach the caller that flushes; got {flushed:?}"
+        );
+        match flushed {
+            Err(FlushError::RecordingFailed(failures)) => {
+                assert_eq!(failures.failures.len(), 1, "{failures:?}");
+                assert_eq!(failures.unlisted, 0);
+                let failure = &failures.failures[0];
+                assert_eq!(failure.stage, RecordFailureStage::Append);
+                assert_eq!(failure.kind, "op-on-a-dead-branch");
+                assert_eq!(failure.branch, side);
+                assert!(!failure.error.is_empty());
+            }
+            other => panic!("expected the dropped op itself, got {other:?}"),
+        }
+        assert!(!kinds_on(&timeline, &side)
+            .await
+            .contains(&"op-on-a-dead-branch".to_string()));
+        // Taken by the flush that reported it: reported once, not forever.
+        assert!(
+            recorder.flush().await.is_ok(),
+            "a reported failure must not be re-reported to every later caller"
+        );
+    }
+
+    /// `settle()` is the barrier for callers that do not surface failures:
+    /// it must LEAVE them pending, so the next reporting caller still sees
+    /// them — a discarding caller that consumed them would be a silent drop.
+    #[tokio::test]
+    async fn settle_leaves_failures_for_the_caller_that_reports_them() {
+        let (timeline, side) = timeline_with_side_branch().await;
+        let recorder = TimelineRecorder::new(Arc::clone(&timeline), Author::System, side);
+        timeline
+            .read()
+            .await
+            .abandon_branch(side, "retired behind the recorder".to_string(), false)
+            .expect("abandon the side branch");
+        recorder
+            .record(RecordedOperation::new("op-on-a-dead-branch"))
+            .expect("record() itself cannot know yet");
+
+        recorder
+            .settle()
+            .await
+            .expect("the barrier itself completes");
+        let taken = recorder.take_failures();
+        assert_eq!(
+            taken.failures.len(),
+            1,
+            "settle must not consume the failure; take_failures must return it"
+        );
+        assert!(recorder.take_failures().is_empty(), "taken exactly once");
+    }
+
+    /// The rollback primitive: undo a retarget only if nobody switched in
+    /// between — a deliberate switch is never overwritten.
+    #[tokio::test]
+    async fn set_branch_id_if_switches_only_from_the_expected_branch() {
+        let (timeline, side) = timeline_with_side_branch().await;
+        let recorder = TimelineRecorder::new(Arc::clone(&timeline), Author::System, side);
+        assert!(
+            !recorder.set_branch_id_if(BranchId::main(), side),
+            "recording is on the side branch, not main: nothing to undo"
+        );
+        assert_eq!(recorder.branch_id(), side);
+        recorder.set_branch_id(BranchId::main());
+        assert!(recorder.set_branch_id_if(BranchId::main(), side));
+        assert_eq!(recorder.branch_id(), side);
+    }
+
+    /// `record()`'s OWN hand-off can fail (channel saturated, worker gone).
+    /// It returns `Err` to the kernel, whose `record_operation` only logs —
+    /// so the op's loss must also go on the failure list, where the next
+    /// mutating response or flushing route reports it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_refused_hand_off_in_record_reaches_the_failure_list() {
+        let timeline: SharedTimeline =
+            Arc::new(RwLock::new(Timeline::new(TimelineConfig::default())));
+        let recorder = TimelineRecorder::with_capacity(
+            Arc::clone(&timeline),
+            Author::System,
+            BranchId::main(),
+            1,
+        );
+        let mut refused_kind = None;
+        for i in 0..256 {
+            let kind = format!("flood-{i}");
+            if recorder.record(RecordedOperation::new(&kind)).is_err() {
+                refused_kind = Some(kind);
+                break;
+            }
+        }
+        let refused_kind =
+            refused_kind.expect("capacity 1 and no worker yield must saturate the channel");
+        let taken = recorder.take_failures();
+        let named: Vec<&str> = taken.failures.iter().map(|f| f.kind.as_str()).collect();
+        assert!(
+            named.contains(&refused_kind.as_str()),
+            "the op record() could not hand off must be on the failure list; got {named:?}"
+        );
+    }
+
+    /// A list nobody drains is capped, and what falls past the cap is
+    /// COUNTED — never silently forgotten.
+    #[test]
+    fn failures_past_the_cap_are_counted_not_forgotten() {
+        let mut failures = RecordFailures::default();
+        for i in 0..(MAX_PENDING_RECORD_FAILURES + 3) {
+            failures.push(RecordFailure {
+                stage: RecordFailureStage::Append,
+                kind: format!("op-{i}"),
+                branch: BranchId::main(),
+                sequence: None,
+                document: None,
+                author: Author::System,
+                channel: Origin::NotDetermined,
+                error: "refused".to_string(),
+            });
+        }
+        assert_eq!(failures.failures.len(), MAX_PENDING_RECORD_FAILURES);
+        assert_eq!(failures.unlisted, 3);
+        assert_eq!(failures.total(), MAX_PENDING_RECORD_FAILURES as u64 + 3);
+        let text = failures.to_string();
+        assert!(text.contains("and 3 more not listed"), "{text}");
+        assert!(!text.contains("  "), "{text:?}");
+    }
+
+    /// An [`EventSink`] whose every write fails.
+    struct RefusingSink;
+
+    #[async_trait::async_trait]
+    impl EventSink for RefusingSink {
+        async fn persist(
+            &self,
+            _event: &TimelineEvent,
+            _document: Option<&str>,
+        ) -> Result<(), String> {
+            Err("injected persist failure".to_string())
+        }
+    }
+
+    /// (d) A persist failure — the event is in memory but NOT on disk — must
+    /// reach the next `flush()` too; an `error!` log was its only trace.
+    #[tokio::test]
+    async fn a_persist_failure_reaches_the_next_flush() {
+        let timeline: SharedTimeline =
+            Arc::new(RwLock::new(Timeline::new(TimelineConfig::default())));
+        let recorder = TimelineRecorder::new_with_sink(
+            Arc::clone(&timeline),
+            Author::System,
+            BranchId::main(),
+            Arc::new(RefusingSink),
+        );
+        recorder
+            .record(RecordedOperation::new("op-not-on-disk"))
+            .expect("record succeeds");
+        let flushed = recorder.flush().await;
+        assert!(
+            flushed.is_err(),
+            "an event that is not on disk must reach the caller that flushes; got {flushed:?}"
+        );
+        match flushed {
+            Err(FlushError::RecordingFailed(failures)) => {
+                let failure = &failures.failures[0];
+                assert_eq!(failure.stage, RecordFailureStage::Persist);
+                assert_eq!(failure.kind, "op-not-on-disk");
+                assert!(
+                    failure.sequence.is_some(),
+                    "the event is in memory, so it has a sequence the caller can name"
+                );
+                assert_eq!(failure.error, "injected persist failure");
+            }
+            other => panic!("expected the persist failure, got {other:?}"),
+        }
+        assert_eq!(
+            kinds_on(&timeline, &BranchId::main()).await,
+            vec!["op-not-on-disk".to_string()],
+            "a persist failure leaves the in-memory event in place"
+        );
     }
 }

@@ -261,6 +261,27 @@ export async function api(
   if (method !== "GET" && parsed && typeof parsed === "object") {
     const embedded = perceptionFromBody(parsed);
     if (embedded !== undefined) {
+      // A lost-operation report rides on exactly ONE response (the backend
+      // takes it when it reports it). A multi-call tool (cad_program,
+      // boolean_many, drill_pattern, …) replaces this stash several times
+      // before its single perceive(), so an unconsumed report is CARRIED onto
+      // the replacement instead of being overwritten — perceive() consumes the
+      // stash, so nothing is reported twice.
+      const prev = lastEmbeddedPerception?.perception;
+      if (Array.isArray(prev?.recording_failures) && prev.recording_failures.length > 0) {
+        const mine = embedded.perception.recording_failures;
+        embedded.perception.recording_failures = [
+          ...prev.recording_failures,
+          ...(Array.isArray(mine) ? mine : []),
+        ];
+      }
+      if (typeof prev?.recording_failures_unlisted === "number") {
+        embedded.perception.recording_failures_unlisted =
+          prev.recording_failures_unlisted +
+          (typeof embedded.perception.recording_failures_unlisted === "number"
+            ? embedded.perception.recording_failures_unlisted
+            : 0);
+      }
       lastEmbeddedPerception = {
         id: parsed.solid_id ?? parsed.id ?? null,
         perception: embedded.perception,
@@ -461,6 +482,16 @@ function perceptionFromBody(r: any): { perception: any; certified: boolean } | u
     // quarantined document, so `r` being the raw mutating body (not just a
     // `/perception`-shaped response) already carries it here.
     durability: r.durability ?? r.perception?.durability ?? undefined,
+    // RECORDING disclosure — operations an EARLIER call's kernel op recorded
+    // that were then LOST (refused append: their branch was retired; refused
+    // persist: in memory only). The api-server reports each loss exactly once,
+    // on the next mutating response (`certified_response`, main.rs), so
+    // dropping the key here would make the loss reach no agent at all.
+    // Passed through verbatim; absent means nothing was lost.
+    recording_failures:
+      r.recording_failures ?? r.perception?.recording_failures ?? undefined,
+    recording_failures_unlisted:
+      r.recording_failures_unlisted ?? r.perception?.recording_failures_unlisted ?? undefined,
     // FIDELITY — "is the geometry you asked for the geometry you got?", carried
     // through VERBATIM. The kernel measures it and the api-server attaches the
     // block to the mutating op's OWN response at `body.perception.fidelity`
@@ -975,6 +1006,11 @@ export async function perceive(partId: number | null): Promise<any> {
       // this channel it is the uncertified op block's, carried over above —
       // never defaulted, so an absent block stays absent.
       fidelity: p?.fidelity ?? stashed?.perception?.fidelity ?? undefined,
+      // Lost-operation disclosure: only a mutating op's own response carries
+      // it (reported once), so on this channel it is the op block's.
+      recording_failures: stashed?.perception?.recording_failures ?? undefined,
+      recording_failures_unlisted:
+        stashed?.perception?.recording_failures_unlisted ?? undefined,
       verdict:
         p?.verdict ??
         (sound === true
@@ -1085,9 +1121,23 @@ export function compactVerdict(p: any): string {
   // slice of this document's recorded history could not be replayed and was
   // refused, not silently served). See `p.durability` for the full state
   // (first_break_kind/reason/events_served/events_total).
-  const durabilityNote = p?.durability
-    ? `⚠ DOCUMENT QUARANTINED (${p.durability.reason ?? "history incomplete — see p.durability"}) | `
-    : "";
+  // Operations recorded on this server that were then lost (reported once,
+  // on this response) — same loud, beside-the-verdict placement. The
+  // backend's list is server-wide, so they may be ANOTHER client's (the
+  // human's viewport, another agent): the note never presumes they were
+  // this agent's own; each entry's author/channel says whose they were.
+  const lostCount =
+    (Array.isArray(p?.recording_failures) ? p.recording_failures.length : 0) +
+    (typeof p?.recording_failures_unlisted === "number" ? p.recording_failures_unlisted : 0);
+  const recordingNote =
+    lostCount > 0
+      ? `⚠ ${lostCount} OPERATION(S) NOT RECORDED on this server, possibly by another client — check p.recording_failures[].author/channel and re-issue only your own | `
+      : "";
+  const durabilityNote =
+    recordingNote +
+    (p?.durability
+      ? `⚠ DOCUMENT QUARANTINED (${p.durability.reason ?? "history incomplete — see p.durability"}) | `
+      : "");
   const fidelityNote = fidelityPrefix(p?.fidelity);
   // NO verdict is neither SOUND nor UNSOUND: a perception that states no
   // `sound` (the certificate did not run) says so, naming any conjunct that

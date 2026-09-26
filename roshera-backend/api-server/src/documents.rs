@@ -618,7 +618,10 @@ pub async fn activate(state: &AppState, document_id: &str) -> durability::Durabi
     //    persisted under the OUTGOING document's id. A flush error means
     //    the worker is down — in-flight events cannot land anywhere, so
     //    proceeding is safe; the failure is still named, never swallowed.
-    if let Err(e) = state.timeline_recorder.flush().await {
+    //    `settle`, not `flush`: ops the outgoing document LOST are not
+    //    reported by a document switch, so taking them here would make
+    //    them vanish; they stay pending for the next reporting caller.
+    if let Err(e) = state.timeline_recorder.settle().await {
         tracing::warn!(
             target: "documents",
             error = %e,

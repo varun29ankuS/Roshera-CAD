@@ -1667,6 +1667,30 @@ fn certified_response(
         }
     }
 
+    // Recording disclosure — operations an EARLIER request's `record()`
+    // accepted that were then lost (refused append: their branch was
+    // retired; refused persist: in memory only). A mutating REST op does not
+    // flush, so without this the loss reached no caller at all — only a log
+    // line. Taken here (each loss is reported once) and only when non-empty,
+    // so the common response is byte-for-byte unchanged. THIS op's own
+    // record is usually still queued; if it is lost, a later response (or
+    // the next flushing route) reports it.
+    if let serde_json::Value::Object(map) = &mut base {
+        let lost = state.timeline_recorder.take_failures();
+        if !lost.is_empty() {
+            map.insert(
+                "recording_failures".to_string(),
+                serde_json::json!(lost.failures),
+            );
+            if lost.unlisted > 0 {
+                map.insert(
+                    "recording_failures_unlisted".to_string(),
+                    serde_json::json!(lost.unlisted),
+                );
+            }
+        }
+    }
+
     // Advisory dual-eye reconcile, OFF this write lock (fire-and-forget; skips
     // if already cached/in-flight or the concurrency cap is reached).
     reconcile_task::spawn_reconcile(

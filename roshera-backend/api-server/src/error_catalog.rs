@@ -334,6 +334,16 @@ pub enum ErrorCode {
     /// non-fast-forward without a strategy, etc.). Non-retryable
     /// without a strategy change or manual conflict resolution.
     BranchMergeConflict,
+    /// `POST /api/branches/active` named a branch that is merged,
+    /// abandoned, or completed. Such a branch can take no events, so the
+    /// recorder must never be pointed at it: every op recorded afterwards
+    /// would be refused by the timeline and lost, while the op's own
+    /// response had already said it succeeded. Mapped to HTTP 409 (the
+    /// request is well-formed; the branch's STATE forbids it) and
+    /// non-retryable — the same switch against the same branch earns the
+    /// same refusal. `details` carries `branch_id` and `state`; recording
+    /// stays where it was.
+    BranchNotActive,
 
     // ── Document layer ──────────────────────────────────────────
     /// `POST /api/documents/{id}/open` (or any other document-scoped
@@ -471,6 +481,27 @@ pub enum ErrorCode {
     /// starts from a clean state rather than duplicating a half-made
     /// record.
     DurabilityPersistFailed,
+    /// The recorder drain this request depends on completed, but it
+    /// reported operations that an EARLIER request's `record()` accepted —
+    /// on this server, by ANY client: the failure list is recorder-wide —
+    /// and that were then lost: refused by the timeline (their branch was
+    /// no longer Active — they are in no branch's history) or refused by
+    /// the durable store (in memory, lost at the next restart). Proceeding
+    /// would act on a history that silently lacks them, so the request is
+    /// refused and performed NOTHING.
+    ///
+    /// `details.recording_failures` lists each lost op (`stage` —
+    /// `enqueue` | `append` | `persist` — `kind`, `branch`, `sequence`,
+    /// `document`, `author`, `channel`, `error` verbatim);
+    /// `details.recording_failures_unlisted` counts any past the listing
+    /// cap. The report is delivered once, to whichever caller drains
+    /// first — which need not be the client that lost the op, so `author`
+    /// and `channel` are what tell a caller its own losses apart.
+    ///
+    /// Mapped to HTTP 500 and RETRYABLE: the failures are reported by this
+    /// refusal and not again, so the identical request, retried, proceeds
+    /// over the history as it now actually is.
+    RecordingFailed,
 
     // ── Catch-alls ────────────────────────────────────────────────
     /// Unspecified server-side fault. Always retryable.
@@ -498,6 +529,7 @@ impl ErrorCode {
             | ErrorCode::TransactionNotActive
             | ErrorCode::BranchInvalidState
             | ErrorCode::BranchMergeConflict
+            | ErrorCode::BranchNotActive
             | ErrorCode::SketchConstraintConflict
             | ErrorCode::DocumentDeleteRefusedActive
             | ErrorCode::DocumentDeleteRefusedLast
@@ -531,6 +563,7 @@ impl ErrorCode {
             | ErrorCode::IdempotencyResponseTooLarge
             | ErrorCode::IdempotencyReplayFailed
             | ErrorCode::DurabilityPersistFailed
+            | ErrorCode::RecordingFailed
             | ErrorCode::Internal => StatusCode::INTERNAL_SERVER_ERROR,
 
             ErrorCode::AiNotConfigured
@@ -586,6 +619,7 @@ impl ErrorCode {
             | ErrorCode::BranchNotFound
             | ErrorCode::BranchInvalidState
             | ErrorCode::BranchMergeConflict
+            | ErrorCode::BranchNotActive
             | ErrorCode::DocumentNotFound
             | ErrorCode::DocumentDeleteRefusedActive
             | ErrorCode::DocumentDeleteRefusedLast
@@ -648,6 +682,9 @@ impl ErrorCode {
             // in-memory insert back — so a retry starts clean rather
             // than duplicating a half-made record.
             | ErrorCode::DurabilityPersistFailed
+            // Reported once, by the refusal itself: a retry proceeds over
+            // the history as it now actually is.
+            | ErrorCode::RecordingFailed
             | ErrorCode::Internal => true,
         }
     }
@@ -688,6 +725,7 @@ impl ErrorCode {
             ErrorCode::BranchNotFound => "branch_not_found",
             ErrorCode::BranchInvalidState => "branch_invalid_state",
             ErrorCode::BranchMergeConflict => "branch_merge_conflict",
+            ErrorCode::BranchNotActive => "branch_not_active",
             ErrorCode::DocumentNotFound => "document_not_found",
             ErrorCode::DocumentDeleteRefusedActive => "document_delete_refused_active",
             ErrorCode::DocumentDeleteRefusedLast => "document_delete_refused_last",
@@ -704,6 +742,7 @@ impl ErrorCode {
             ErrorCode::PermissionDenied => "permission_denied",
             ErrorCode::MethodNotAllowed => "method_not_allowed",
             ErrorCode::DurabilityPersistFailed => "durability_persist_failed",
+            ErrorCode::RecordingFailed => "recording_failed",
             ErrorCode::Internal => "internal_error",
         }
     }
@@ -743,6 +782,7 @@ impl ErrorCode {
             ErrorCode::BranchNotFound,
             ErrorCode::BranchInvalidState,
             ErrorCode::BranchMergeConflict,
+            ErrorCode::BranchNotActive,
             ErrorCode::DocumentNotFound,
             ErrorCode::DocumentDeleteRefusedActive,
             ErrorCode::DocumentDeleteRefusedLast,
@@ -759,6 +799,7 @@ impl ErrorCode {
             ErrorCode::PermissionDenied,
             ErrorCode::MethodNotAllowed,
             ErrorCode::DurabilityPersistFailed,
+            ErrorCode::RecordingFailed,
             ErrorCode::Internal,
         ]
     }
@@ -932,6 +973,46 @@ impl ApiError {
             "reason": reason,
             "rolled_back": true,
         }))
+    }
+
+    /// A recorder flush this request depends on did not come back clean.
+    ///
+    /// `action` names what was refused ("checkpoint", "branch",
+    /// "branch switch", …). A dead drain worker keeps the pre-existing
+    /// answer ([`Self::durability_persist_failed`] at stage
+    /// `recorder_flush`); lost operations become
+    /// [`ErrorCode::RecordingFailed`] carrying every one of them, because
+    /// this refusal is the only place the caller will ever hear of them
+    /// ([`timeline_engine::TimelineRecorder::flush`] takes them).
+    pub fn recorder_flush_failed(action: &str, error: timeline_engine::FlushError) -> Self {
+        match error {
+            timeline_engine::FlushError::Unavailable(e) => {
+                Self::durability_persist_failed(action, "recorder_flush", e)
+            }
+            timeline_engine::FlushError::RecordingFailed(failures) => Self::new(
+                ErrorCode::RecordingFailed,
+                format!(
+                    concat!(
+                        "the {} was not performed: {}. Proceeding would act on a history ",
+                        "that silently lacks them."
+                    ),
+                    action, failures
+                ),
+            )
+            .with_hint(concat!(
+                "Each lost operation is listed in details.recording_failures with its author ",
+                "and channel. The list covers the whole server, so it includes operations ",
+                "possibly by another client: re-issue only operations you issued yourself ",
+                "(onto an Active branch), then retry this request. The loss is reported once, ",
+                "here."
+            ))
+            .with_details(serde_json::json!({
+                "action": action,
+                "performed": false,
+                "recording_failures": failures.failures,
+                "recording_failures_unlisted": failures.unlisted,
+            })),
+        }
     }
 
     /// Kernel-side failure with the kernel's own error string attached.

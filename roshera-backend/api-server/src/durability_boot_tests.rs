@@ -3400,8 +3400,8 @@ async fn abandoned_branch_survives_restart_abandoned() {
         let (s, body) = dispatch(&state, del(&format!("/api/branches/{side}"))).await;
         assert_eq!(
             s,
-            StatusCode::NO_CONTENT,
-            "abandon must succeed; body = {body}"
+            StatusCode::OK,
+            "abandon must succeed (200 with where recording now goes); body = {body}"
         );
         side
     };
@@ -4082,8 +4082,8 @@ async fn a_branch_forked_after_a_merge_keeps_the_merged_events_across_abandon_an
         let (s, body) = dispatch(&state, del(&format!("/api/branches/{child}"))).await;
         assert_eq!(
             s,
-            StatusCode::NO_CONTENT,
-            "abandon must succeed; body = {body}"
+            StatusCode::OK,
+            "abandon must succeed (200 with where recording now goes); body = {body}"
         );
         (child, child_h)
     };
@@ -4157,4 +4157,317 @@ async fn a_faulted_side_branch_history_read_discloses_its_fault() {
         body.is_array(),
         "main's history is whole, so its read stays the bare array; body = {body}"
     );
+}
+
+// =====================================================================
+// Task 69 — an operation is recorded on a live branch, or the caller hears
+// that it was not.
+//
+// The recorder appends every kernel op to ONE target branch. Nothing kept
+// that target alive: `POST /api/branches/active` accepted a merged or
+// abandoned branch, and neither a merge nor an abandon moved the recorder
+// off the branch it retired. The next op's append was then refused by the
+// timeline, logged as "event dropped", and never reported — `create_box`
+// had already answered 200.
+// =====================================================================
+
+/// The catalog code a switch onto a retired branch must carry. A literal,
+/// for the reason `DURABILITY_PERSIST_FAILED` is one.
+const BRANCH_NOT_ACTIVE: &str = "branch_not_active";
+
+/// (a) The recorder must never be pointed at a branch that can take no
+/// events: a merged branch (and an abandoned one) is refused with a typed
+/// 409, and the recorder stays where it was.
+#[tokio::test]
+async fn activating_a_retired_branch_is_a_typed_409_and_moves_nothing() {
+    let path = temp_db_path();
+    let state = build_state(open_db(&path).await, true).await;
+    create_cube(&state, 10.0).await;
+    let merged = fork_from_main(&state, "merged-away").await;
+    activate_branch(&state, &merged.to_string()).await;
+    create_side_cylinder(&state).await;
+    activate_branch(&state, "main").await;
+    let (s, body) = dispatch(
+        &state,
+        post(&format!("/api/branches/{merged}/merge"), json!({})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "merge must apply; body = {body}");
+
+    let abandoned = fork_from_main(&state, "given-up").await;
+    let (s, body) = dispatch(&state, del(&format!("/api/branches/{abandoned}"))).await;
+    assert!(s.is_success(), "abandon must succeed; body = {body}");
+
+    for (retired, label) in [(merged, "merged"), (abandoned, "abandoned")] {
+        let (s, body) = dispatch(
+            &state,
+            post(
+                "/api/branches/active",
+                json!({ "branch_id": retired.to_string() }),
+            ),
+        )
+        .await;
+        assert_eq!(
+            s,
+            StatusCode::CONFLICT,
+            "a {label} branch can take no events, so recording cannot move there; body = {body}"
+        );
+        assert_eq!(body["error_code"], BRANCH_NOT_ACTIVE, "body = {body}");
+        assert_eq!(body["details"]["branch_id"], retired.to_string().as_str());
+        assert_eq!(body["details"]["state"], label, "body = {body}");
+        let msg = body["error"].as_str().unwrap_or_default();
+        assert!(!msg.contains("  "), "no absorbed indentation: {msg:?}");
+        assert_eq!(
+            state.timeline_recorder.branch_id(),
+            timeline_engine::BranchId::main(),
+            "a refused switch leaves recording where it was"
+        );
+    }
+}
+
+/// (b) Merging the branch that is being recorded onto: the next op must be
+/// recorded on the merge target — never answered 200 with no event anywhere.
+#[tokio::test]
+async fn merging_the_recording_branch_moves_recording_to_the_target() {
+    let path = temp_db_path();
+    let state = build_state(open_db(&path).await, true).await;
+    create_cube(&state, 10.0).await;
+    let side = fork_from_main(&state, "merge-while-recording").await;
+    activate_branch(&state, &side.to_string()).await;
+    create_side_cylinder(&state).await;
+
+    settle(&state).await;
+    let (s, merge_body) = dispatch(
+        &state,
+        post(&format!("/api/branches/{side}/merge"), json!({})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "merge must apply; body = {merge_body}");
+
+    let main = timeline_engine::BranchId::main();
+    let before = branch_history(&state, main).await;
+    create_cube(&state, 20.0).await;
+    let after = branch_history(&state, main).await;
+    assert!(
+        after.len() > before.len(),
+        concat!(
+            "the op after the merge must be recorded on the merge target; main held ",
+            "{} events before it and {} after"
+        ),
+        before.len(),
+        after.len()
+    );
+    assert_eq!(
+        merge_body["recording_branch"],
+        main.to_string().as_str(),
+        "the merge response must say where recording now goes; body = {merge_body}"
+    );
+    assert_eq!(state.timeline_recorder.branch_id(), main);
+}
+
+/// (b) Abandoning the branch that is being recorded onto moves recording
+/// to main, and the response says so.
+#[tokio::test]
+async fn abandoning_the_recording_branch_moves_recording_to_main() {
+    let path = temp_db_path();
+    let state = build_state(open_db(&path).await, true).await;
+    create_cube(&state, 10.0).await;
+    let side = fork_from_main(&state, "abandon-while-recording").await;
+    activate_branch(&state, &side.to_string()).await;
+    create_side_cylinder(&state).await;
+
+    settle(&state).await;
+    let (s, abandon_body) = dispatch(&state, del(&format!("/api/branches/{side}"))).await;
+    assert!(
+        s.is_success(),
+        "abandon must succeed; body = {abandon_body}"
+    );
+
+    let main = timeline_engine::BranchId::main();
+    let before = branch_history(&state, main).await;
+    create_cube(&state, 20.0).await;
+    let after = branch_history(&state, main).await;
+    assert!(
+        after.len() > before.len(),
+        concat!(
+            "the op after the abandon must be recorded on main; main held {} events ",
+            "before it and {} after"
+        ),
+        before.len(),
+        after.len()
+    );
+    assert_eq!(s, StatusCode::OK, "the abandon answers with a body now");
+    assert_eq!(
+        abandon_body["recording_branch"],
+        main.to_string().as_str(),
+        "the abandon response must say where recording now goes; body = {abandon_body}"
+    );
+    assert_eq!(abandon_body["state"], "abandoned", "body = {abandon_body}");
+}
+
+/// (b) + Task 68: a merge whose durable write fails is rolled back — and the
+/// recorder retarget rolls back with it, so recording stays on the source
+/// that is Active again.
+#[tokio::test]
+async fn a_merge_whose_persist_fails_leaves_recording_on_the_source() {
+    let path = temp_db_path();
+    let (side, _) = seed_main_and_side(&path).await;
+
+    let state = build_state_with_failing_saves(&path).await;
+    activate_branch(&state, &side.to_string()).await;
+    let (status, body) = dispatch(
+        &state,
+        post(&format!("/api/branches/{side}/merge"), json!({})),
+    )
+    .await;
+    assert!(status.is_server_error(), "body = {body}");
+    assert_eq!(
+        state.timeline_recorder.branch_id(),
+        side,
+        "the merge was rolled back, so recording must stay on the (Active) source"
+    );
+}
+
+/// Same for the abandon lane.
+#[tokio::test]
+async fn an_abandon_whose_persist_fails_leaves_recording_on_the_branch() {
+    let path = temp_db_path();
+    let (side, _) = seed_main_and_side(&path).await;
+
+    let state = build_state_with_failing_saves(&path).await;
+    activate_branch(&state, &side.to_string()).await;
+    let (status, body) = dispatch(&state, del(&format!("/api/branches/{side}"))).await;
+    assert!(status.is_server_error(), "body = {body}");
+    assert_eq!(
+        state.timeline_recorder.branch_id(),
+        side,
+        "the abandon was rolled back, so recording must stay on the (Active) branch"
+    );
+}
+
+/// Retire the recorder's branch BEHIND its back (straight on the timeline,
+/// not through a route that would move the recorder) and record one op into
+/// it: the one production path left to a dropped append.
+async fn drop_one_op(state: &AppState) -> timeline_engine::BranchId {
+    create_cube(state, 10.0).await;
+    let side = fork_from_main(state, "retired-behind-the-recorder").await;
+    activate_branch(state, &side.to_string()).await;
+    state
+        .timeline
+        .read()
+        .await
+        .abandon_branch(side, "retired behind the recorder".to_string(), false)
+        .expect("abandon on the timeline directly");
+    create_cube(state, 20.0).await;
+    side
+}
+
+/// (d) A mutating REST op does not flush, so an op dropped by the drain
+/// worker must ride on the NEXT mutating op's response — the way the
+/// durability disclosure already rides there — never only in a log.
+#[tokio::test]
+async fn a_dropped_op_is_disclosed_on_the_next_mutating_response() {
+    let path = temp_db_path();
+    let state = build_state(open_db(&path).await, true).await;
+    let side = drop_one_op(&state).await;
+    // Let the worker reach the dropped op without consuming its failure.
+    state
+        .timeline_recorder
+        .settle()
+        .await
+        .expect("the barrier itself completes");
+
+    let (s, body) = dispatch(
+        &state,
+        post(
+            "/api/geometry/box",
+            json!({ "width": 5.0, "depth": 5.0, "height": 5.0 }),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body = {body}");
+    let failures = body["perception"]["recording_failures"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        !failures.is_empty(),
+        "the op dropped before this one must be disclosed here; body = {body}"
+    );
+    assert_eq!(failures[0]["stage"], "append", "body = {body}");
+    assert_eq!(failures[0]["branch"], side.to_string().as_str());
+    assert!(failures[0]["error"].is_string(), "body = {body}");
+    // The list is recorder-wide, so the recipient may not be the client that
+    // lost the op: each failure says WHO recorded it and OVER WHICH channel,
+    // so a caller can tell its own losses from another client's.
+    assert!(
+        !failures[0]["author"].is_null(),
+        "a failure must name the author that recorded the op; body = {body}"
+    );
+    assert_eq!(
+        failures[0]["channel"], "rest",
+        "the dropped op was recorded over REST; body = {body}"
+    );
+}
+
+/// (d) A route that flushes must not proceed as if a dropped op had landed:
+/// the checkpoint's event range would omit work its caller issued. It
+/// refuses, naming the dropped op.
+#[tokio::test]
+async fn a_checkpoint_after_a_dropped_op_refuses_and_names_it() {
+    let path = temp_db_path();
+    let state = build_state(open_db(&path).await, true).await;
+    let side = drop_one_op(&state).await;
+
+    let (status, body) = dispatch(
+        &state,
+        post(
+            "/api/timeline/checkpoint",
+            json!({ "name": REAL_INTENT_NAME }),
+        ),
+    )
+    .await;
+    assert!(
+        status.is_server_error(),
+        "a checkpoint over a range that silently lost an op must refuse; got {status}; body = {body}"
+    );
+    let failures = body["details"]["recording_failures"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    assert!(!failures.is_empty(), "body = {body}");
+    assert!(
+        failures
+            .iter()
+            .all(|f| f["branch"] == side.to_string().as_str() && f["stage"] == "append"),
+        "every named failure is the op dropped onto the retired branch; body = {body}"
+    );
+    assert_eq!(body["error_code"], "recording_failed", "body = {body}");
+    assert_eq!(body["details"]["performed"], false, "body = {body}");
+    let msg = body["error"].as_str().unwrap_or_default();
+    assert!(msg.contains("not performed"), "{msg}");
+    assert!(!msg.contains("  "), "no absorbed indentation: {msg:?}");
+    // The failure list is recorder-wide: the text must not presume the lost
+    // ops were this caller's own (an agent told to "re-issue the ones you
+    // still need" would re-create another client's geometry).
+    let hint = body["hint"].as_str().unwrap_or_default();
+    for text in [msg, hint] {
+        assert!(
+            text.contains("possibly by another client"),
+            "the text must say whose ops these may be: {text:?}"
+        );
+        assert!(!text.contains("ones you still need"), "{text:?}");
+        assert!(!text.contains("  "), "no absorbed indentation: {text:?}");
+    }
+
+    // Reported once, by that refusal: the retry proceeds.
+    let (status, body) = dispatch(
+        &state,
+        post(
+            "/api/timeline/checkpoint",
+            json!({ "name": REAL_INTENT_NAME }),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "body = {body}");
 }

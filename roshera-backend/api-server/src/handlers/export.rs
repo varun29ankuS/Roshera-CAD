@@ -225,7 +225,7 @@ pub async fn export_mesh(
         // in-flight recorder ops first so the file reflects every
         // kernel operation issued so far, then read branch events and
         // sort by sequence number (DashMap iteration is unordered).
-        let _ = state.timeline_recorder.flush().await;
+        let _ = state.timeline_recorder.settle().await;
         let timeline = state.timeline.read().await;
         let branches: Vec<BranchManifest> = timeline
             .get_all_branches()

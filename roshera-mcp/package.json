@@ -15,7 +15,7 @@
     "test:ontology": "npm run test:gates:build && node test/ontology_coverage.mjs",
     "test:drift": "npm run test:gates:build && node test/scale_s2.mjs && node test/kb_lookup.mjs && node test/find_tool_heldout.mjs && node test/ontology_coverage.mjs",
     "test:gates:build": "tsc -p tsconfig.json --outDir test/.build",
-    "test:gates": "npm run test:gates:build && node test/constraint_gates.test.mjs && node test/drawing_gates.test.mjs && node test/single_point_gate.test.mjs && node test/verification_scope_gate.test.mjs && node test/shells_outward_verdict.test.mjs && node test/refusal_stops_program.test.mjs && node test/batch_step_certification.test.mjs",
+    "test:gates": "npm run test:gates:build && node test/constraint_gates.test.mjs && node test/drawing_gates.test.mjs && node test/single_point_gate.test.mjs && node test/verification_scope_gate.test.mjs && node test/shells_outward_verdict.test.mjs && node test/refusal_stops_program.test.mjs && node test/batch_step_certification.test.mjs && node test/recording_failures_disclosure.test.mjs",
     "test:gates:live": "npm run test:gates:build && node test/constraint_gates_live.mjs"
   },
   "dependencies": {

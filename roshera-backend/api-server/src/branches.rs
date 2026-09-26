@@ -251,6 +251,25 @@ pub struct MergeView {
     pub conflicts: Vec<ConflictView>,
     /// The kernel's own merge statistics, verbatim.
     pub statistics: MergeStatisticsView,
+    /// The branch the recorder records new operations onto after this
+    /// merge. When the merged source WAS the recording branch it can take
+    /// no more events, so recording moves to the merge target and this
+    /// says so; otherwise it is wherever recording already was.
+    pub recording_branch: String,
+}
+
+/// `DELETE /api/branches/{id}` response.
+#[derive(Debug, Serialize)]
+pub struct AbandonView {
+    /// The abandoned branch.
+    pub branch_id: String,
+    /// Always `"abandoned"` — the state the branch is now in.
+    pub state: &'static str,
+    /// The branch the recorder records new operations onto after this
+    /// abandon. When the abandoned branch WAS the recording branch,
+    /// recording moves to `main` and this says so; otherwise it is
+    /// wherever recording already was.
+    pub recording_branch: String,
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────
@@ -603,11 +622,7 @@ pub async fn create_branch(
     // fork point durably — a confident, unrecoverable lie about where
     // the branch diverged. Refuse before anything is created.
     if let Err(e) = state.timeline_recorder.flush().await {
-        return Err(ApiError::durability_persist_failed(
-            "branch",
-            "recorder_flush",
-            e,
-        ));
+        return Err(ApiError::recorder_flush_failed("branch", e));
     }
 
     // Acquire the timeline write lock for the smallest possible window:
@@ -700,11 +715,20 @@ pub async fn get_branch(
 /// is already abandoned / merged / completed with the same 409. The
 /// branch's events stay in the timeline for forensics; only its
 /// `state` flips to `Abandoned { reason }`.
+///
+/// When the abandoned branch is the one the recorder records onto,
+/// recording moves to `main` (an abandoned branch can take no events —
+/// every later op would be refused and lost); the response's
+/// `recording_branch` says where recording now goes.
 pub async fn delete_branch(
     State(state): State<AppState>,
     Path(id): Path<String>,
-) -> Result<StatusCode, ApiError> {
+) -> Result<Json<AbandonView>, ApiError> {
     let bid = parse_branch_id(&id)?;
+    // Land every op already recorded onto this branch BEFORE it stops
+    // accepting events; one that was lost earlier is reported here, and
+    // nothing is abandoned over it.
+    drain_before_retarget(&state, "branch abandon").await?;
     // `force = false` — HTTP DELETE never overrides protection. Admin
     // tooling that needs to retire main goes through a separate code
     // path with its own confirmation surface. The guard is scoped: the
@@ -716,15 +740,24 @@ pub async fn delete_branch(
             .abandon_branch(bid, "abandoned via DELETE /api/branches".to_string(), false)
             .map_err(map_timeline_err)?;
     }
+    // Retarget AFTER the abandon, never before: moving first would record
+    // any op that lands in between onto main while its caller built on
+    // this branch. An op that captures this branch in the gap is refused
+    // by the timeline and reported (next flush / next mutating response).
+    let moved_recording = retire_recording_branch(&state, bid, BranchId::main());
     // The abandon must survive a restart, or the next boot revives the
     // branch `Active`. A failed write is a typed refusal with the abandon
     // ROLLED BACK (the branch was `Active` — `abandon_branch` admits no
-    // other state), never a 204 over a state that exists only in memory.
+    // other state) — the recorder retarget with it — never a success over
+    // a state that exists only in memory.
     if let Err(e) = crate::durability::persist_branch_transition(&state, bid, None).await {
         let reverted = {
             let timeline = state.timeline.read().await;
             timeline.restore_branch_state(bid, BranchState::Active)
         };
+        if reverted.is_ok() && moved_recording {
+            restore_recording_branch(&state, BranchId::main(), bid);
+        }
         return Err(match reverted {
             Ok(()) => {
                 ApiError::durability_persist_failed("branch abandon", "store_write", e.reason())
@@ -732,7 +765,68 @@ pub async fn delete_branch(
             Err(revert_error) => rollback_failed("branch abandon", &e, &revert_error),
         });
     }
-    Ok(StatusCode::NO_CONTENT)
+    Ok(Json(AbandonView {
+        branch_id: bid.to_string(),
+        state: "abandoned",
+        recording_branch: state.timeline_recorder.branch_id().to_string(),
+    }))
+}
+
+/// Drain the recorder before a request that moves or retires the recording
+/// branch. Ops lost earlier are REPORTED here — the request is refused
+/// with every one of them ([`ApiError::recorder_flush_failed`]) — because
+/// `flush` takes them and no later caller would see them. A dead drain
+/// worker is not a refusal: nothing is in flight to misplace, and these
+/// routes proceeded without a drain before one was added.
+async fn drain_before_retarget(state: &AppState, action: &str) -> Result<(), ApiError> {
+    match state.timeline_recorder.flush().await {
+        Ok(()) => Ok(()),
+        Err(timeline_engine::FlushError::Unavailable(e)) => {
+            tracing::warn!(
+                target: "branches",
+                action,
+                error = %e,
+                "recorder drain unavailable (worker down — nothing in flight); proceeding"
+            );
+            Ok(())
+        }
+        Err(e) => Err(ApiError::recorder_flush_failed(action, e)),
+    }
+}
+
+/// Undo [`retire_recording_branch`] after the retirement was rolled back —
+/// only while the recorder is still on `successor`. A switch that landed in
+/// between (someone chose a different branch on purpose) is left alone
+/// rather than overwritten.
+fn restore_recording_branch(state: &AppState, successor: BranchId, restored: BranchId) {
+    if !state
+        .timeline_recorder
+        .set_branch_id_if(successor, restored)
+    {
+        tracing::info!(
+            target: "branches",
+            restored = %restored,
+            recording_branch = %state.timeline_recorder.branch_id(),
+            "retirement rolled back; recording was switched elsewhere meanwhile, left there"
+        );
+    }
+}
+
+/// Move the recorder off `retired` onto `successor` — only when `retired`
+/// is the branch it records onto. Returns whether it moved, so a caller
+/// that rolls the retirement back can move it back.
+fn retire_recording_branch(state: &AppState, retired: BranchId, successor: BranchId) -> bool {
+    if state.timeline_recorder.branch_id() != retired {
+        return false;
+    }
+    state.timeline_recorder.set_branch_id(successor);
+    tracing::info!(
+        target: "branches",
+        retired = %retired,
+        recording_branch = %successor,
+        "recording branch retired; recording moved"
+    );
+    true
 }
 
 /// A durable write failed AND the in-memory transition could not be undone.
@@ -780,28 +874,55 @@ fn branch_keys(
 
 /// `POST /api/branches/active` — set the kernel's recording branch.
 ///
-/// Validates that the branch exists, then swaps the
-/// `TimelineRecorder`'s target. Subsequent kernel ops are recorded
-/// against the new branch on the very next call; in-flight events
-/// already queued in the recorder's MPSC channel will also use the
-/// new branch (there is exactly one active branch per recorder, by
-/// design).
+/// Validates that the branch exists AND is Active — a merged, abandoned or
+/// completed branch can take no events, so pointing the recorder there
+/// would lose every later op (typed 409 `branch_not_active`) — drains the
+/// recorder, then swaps its target. Ops recorded before the swap keep the
+/// branch they were recorded on; ops recorded after it land on the new
+/// one.
 pub async fn set_active_branch(
     State(state): State<AppState>,
     Json(body): Json<SetActiveBranchBody>,
 ) -> Result<Json<ActiveBranchView>, ApiError> {
     let bid = parse_branch_id(&body.branch_id)?;
+    // Land everything recorded on the outgoing branch first; an op lost
+    // earlier is reported here and the switch is not made over it.
+    drain_before_retarget(&state, "branch switch").await?;
     {
+        // The state check and the swap happen under one read guard, so a
+        // merge (which takes the write lock) cannot retire the branch in
+        // between.
         let timeline = state.timeline.read().await;
-        if timeline.get_branch(&bid).is_none() {
+        let branch = timeline.get_branch(&bid).ok_or_else(|| {
+            ApiError::new(ErrorCode::BranchNotFound, format!("branch {bid} not found"))
+                .with_details(serde_json::json!({ "branch_id": bid.to_string() }))
+        })?;
+        if !matches!(branch.state, BranchState::Active) {
+            let label = state_label(&branch.state);
             return Err(ApiError::new(
-                ErrorCode::BranchNotFound,
-                format!("branch {bid} not found"),
+                ErrorCode::BranchNotActive,
+                format!(
+                    concat!(
+                        "branch {} is {} and can take no events, so recording cannot move ",
+                        "there; recording stays on {}"
+                    ),
+                    bid,
+                    label,
+                    state.timeline_recorder.branch_id()
+                ),
             )
-            .with_details(serde_json::json!({ "branch_id": bid.to_string() })));
+            .with_hint(concat!(
+                "Switch to an Active branch (GET /api/branches lists each branch's state), ",
+                "or fork a new branch from this one's parent to keep exploring."
+            ))
+            .with_details(serde_json::json!({
+                "branch_id": bid.to_string(),
+                "state": label,
+                "recording_branch": state.timeline_recorder.branch_id().to_string(),
+            })));
         }
+        state.timeline_recorder.set_branch_id(bid);
     }
-    state.timeline_recorder.set_branch_id(bid);
     tracing::info!(
         target: "branches",
         branch_id = %bid,
@@ -944,10 +1065,12 @@ pub async fn perform_merge(
 
     // Drain in-flight kernel events first — same barrier POST
     // /api/branches uses. The recorder is fire-and-forget; without the
-    // flush a merge issued right after a geometry op would compare
-    // stale branch heads. Failure is non-fatal (worker may be down =
-    // nothing in flight).
-    let _ = state.timeline_recorder.flush().await;
+    // flush a merge issued right after a geometry op would compare stale
+    // branch heads, and an op still queued for the source would be
+    // refused once the merge retires it. Ops lost earlier are a refusal:
+    // nothing is merged over a history that silently lacks work its caller
+    // issued. A dead worker stays non-fatal, as it always was here.
+    drain_before_retarget(state, "branch merge").await?;
 
     // The merge's membership effect — which entries it INSERTED into the
     // target — is read as target-after minus target-before inside the same
@@ -1007,6 +1130,13 @@ pub async fn perform_merge(
     // that exists only in memory. A conflicted merge changed nothing, so
     // there is nothing to persist.
     if result.success {
+        // The merged source can take no more events: if it was the
+        // recording branch, recording moves to the target NOW — after the
+        // merge, never before (an op landing in between would be recorded
+        // on the target while its caller built on the source). An op that
+        // captured the source in the gap is refused and REPORTED (next
+        // flush / next mutating response), never silently dropped.
+        let moved_recording = retire_recording_branch(state, source, target);
         if let Err(e) =
             crate::durability::persist_branch_transition(state, source, Some(inserted.clone()))
                 .await
@@ -1015,6 +1145,11 @@ pub async fn perform_merge(
                 let timeline = state.timeline.write().await;
                 timeline.revert_merge(source, target, &inserted)
             };
+            // The retarget is part of the merge and rolls back with it:
+            // the source is Active again, so recording returns to it.
+            if reverted.is_ok() && moved_recording {
+                restore_recording_branch(state, target, source);
+            }
             return Err(match reverted {
                 Ok(()) => {
                     ApiError::durability_persist_failed("branch merge", "store_write", e.reason())
@@ -1045,6 +1180,7 @@ pub async fn perform_merge(
             entities_affected: result.statistics.entities_affected,
             duration_ms: result.statistics.duration_ms,
         },
+        recording_branch: state.timeline_recorder.branch_id().to_string(),
     })
 }
 
@@ -1104,7 +1240,7 @@ pub async fn preview_conflicts(
 
     // Same drain barrier as the merge itself: the preview must see the
     // branches' actual heads, not a stale prefix.
-    let _ = state.timeline_recorder.flush().await;
+    let _ = state.timeline_recorder.settle().await;
 
     let preview = {
         let timeline = state.timeline.read().await;

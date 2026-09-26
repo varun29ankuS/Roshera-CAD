@@ -234,7 +234,7 @@ async fn force_session_position_at_head(
     session_uuid: Uuid,
     branch: &BranchId,
 ) -> Result<(), String> {
-    let _ = state.timeline_recorder.flush().await;
+    let _ = state.timeline_recorder.settle().await;
     let timeline = state.timeline.read().await;
     let head_count = timeline
         .get_branch_events(branch, None, None)
@@ -258,7 +258,7 @@ async fn ensure_session_position_at_head(
     // may not yet have been applied, so `head_count` undershoots and
     // the planted position lands behind the actual head — the very
     // next undo would then no-op or replay against a stale prefix.
-    let _ = state.timeline_recorder.flush().await;
+    let _ = state.timeline_recorder.settle().await;
     let timeline = state.timeline.read().await;
     if timeline.get_session_position(session_uuid).is_some() {
         return Ok(());
@@ -333,7 +333,11 @@ async fn ensure_session_position_at_head(
 /// kernel op on a fresh branch, and means the consuming op itself
 /// hasn't materialised; the caller should treat that as a no-op).
 pub async fn latest_event_id_on_active_branch(state: &AppState) -> Option<Uuid> {
-    if state.timeline_recorder.flush().await.is_err() {
+    // `settle`, not `flush`: this helper answers "which event did the op
+    // just recorded become", it does not surface lost ops — taking them
+    // here would make them vanish. They stay pending for the response
+    // drain / the next reporting flush.
+    if state.timeline_recorder.settle().await.is_err() {
         return None;
     }
     let branch_id = state.timeline_recorder.branch_id();
@@ -372,7 +376,7 @@ async fn replay_session_to_model(
     // Replay correctness depends on seeing every kernel op that's been
     // recorded; an undrained MPSC means we'd rebuild the model against
     // an incomplete event prefix.
-    let _ = state.timeline_recorder.flush().await;
+    let _ = state.timeline_recorder.settle().await;
     let (branch_id, events, skipped) = {
         let timeline = state.timeline.read().await;
         let position = timeline
@@ -672,11 +676,7 @@ pub async fn create_branch(
     // branch's real fork point. A failed drain is therefore a refusal,
     // not a discarded `Result`.
     if let Err(e) = state.timeline_recorder.flush().await {
-        return Err(ApiError::durability_persist_failed(
-            "branch",
-            "recorder_flush",
-            e,
-        ));
+        return Err(ApiError::recorder_flush_failed("branch", e));
     }
 
     // Acquire the timeline write lock for the smallest possible window:
@@ -874,7 +874,7 @@ pub async fn get_history(
     // background worker happened to drain by the time the request
     // arrived. Without this the Timeline panel can render empty
     // immediately after creating a primitive.
-    let _ = state.timeline_recorder.flush().await;
+    let _ = state.timeline_recorder.settle().await;
     // Read once, guard dropped before any further `.await` below.
     let durability_status = state.durability_status.read().await.clone();
     let timeline = state.timeline.read().await;
@@ -1054,7 +1054,7 @@ pub async fn get_feature_tree(
     State(state): State<AppState>,
     Path(branch_id): Path<String>,
 ) -> Result<Json<Vec<FeatureNode>>, StatusCode> {
-    let _ = state.timeline_recorder.flush().await;
+    let _ = state.timeline_recorder.settle().await;
     let timeline = state.timeline.read().await;
     let branch_id = resolve_branch_ref(&branch_id)?;
 
@@ -1421,7 +1421,7 @@ pub async fn get_dependency_graph(
     Path(branch_id): Path<String>,
     Query(query): Query<DependencyGraphQuery>,
 ) -> Result<Json<DependencyGraphResponse>, StatusCode> {
-    let _ = state.timeline_recorder.flush().await;
+    let _ = state.timeline_recorder.settle().await;
     let timeline = state.timeline.read().await;
     let branch_id = resolve_branch_ref(&branch_id)?;
 
@@ -1872,7 +1872,7 @@ pub async fn get_lineage_graph(
 ) -> Result<Json<LineageMapResponse>, (StatusCode, Json<serde_json::Value>)> {
     // Drain in-flight recorder ops so the map reflects every kernel call
     // the client has issued (same reason `get_history` flushes).
-    let _ = state.timeline_recorder.flush().await;
+    let _ = state.timeline_recorder.settle().await;
     let timeline = state.timeline.read().await;
     let resolved = resolve_branch_ref(&branch_id).map_err(|status| {
         (
@@ -2030,7 +2030,7 @@ pub async fn mould_parameter(
         resolve_reconcile_session(request.session_id.as_deref(), &branch_id)?;
 
     // Snapshot the branch log (drained), sorted by sequence.
-    let _ = state.timeline_recorder.flush().await;
+    let _ = state.timeline_recorder.settle().await;
     let events = {
         let timeline = state.timeline.read().await;
         let mut all = timeline
@@ -2308,7 +2308,7 @@ pub async fn get_rebuild_certificate(
     State(state): State<AppState>,
     Path(branch_id): Path<String>,
 ) -> Result<Json<RebuildCertificate>, StatusCode> {
-    let _ = state.timeline_recorder.flush().await;
+    let _ = state.timeline_recorder.settle().await;
     let branch_id = resolve_branch_ref(&branch_id)?;
     let events = {
         let timeline = state.timeline.read().await;
@@ -2534,7 +2534,7 @@ pub async fn get_evidence_pack(
     // Drain in-flight recorder ops so the pack reflects every recorded
     // operation the client has issued, not just those the background
     // worker happened to have drained by the time this request arrived.
-    let _ = state.timeline_recorder.flush().await;
+    let _ = state.timeline_recorder.settle().await;
 
     // Recorded history, in sequence order (the immutable event log).
     let events = {
@@ -2736,7 +2736,7 @@ pub struct TimelineSessionInfo {
 pub async fn list_timeline_sessions(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
-    let _ = state.timeline_recorder.flush().await;
+    let _ = state.timeline_recorder.settle().await;
     let timeline = state.timeline.read().await;
 
     let mut sessions: Vec<TimelineSessionInfo> = Vec::new();
@@ -2828,7 +2828,7 @@ pub async fn bind_parameter_name(
     let target_uuid =
         Uuid::parse_str(&request.target_event_id).map_err(|_| StatusCode::BAD_REQUEST)?;
 
-    let _ = state.timeline_recorder.flush().await;
+    let _ = state.timeline_recorder.settle().await;
     let (target_sequence, params_ok) = {
         let timeline = state.timeline.read().await;
         let events = timeline
@@ -3026,11 +3026,7 @@ pub async fn create_checkpoint(
     // omits in-flight work labels the timeline with a lie, and the
     // caller cannot tell.
     if let Err(e) = state.timeline_recorder.flush().await {
-        return Err(ApiError::durability_persist_failed(
-            "checkpoint",
-            "recorder_flush",
-            e,
-        ));
+        return Err(ApiError::recorder_flush_failed("checkpoint", e));
     }
 
     let created = {
@@ -4519,7 +4515,7 @@ pub async fn get_recipe(
     // Drain in-flight recorder ops so a recipe of the live branch reflects
     // every operation the client has issued, not just those the background
     // worker happened to have drained.
-    let _ = state.timeline_recorder.flush().await;
+    let _ = state.timeline_recorder.settle().await;
 
     // 1. A live branch ref that actually exists wins — the freshest truth,
     //    and the same read `dependency-graph/{branch}` performs.
@@ -4900,7 +4896,7 @@ pub async fn scrub_timeline(
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     // Drain in-flight recorder ops so "as of event N" is exact even
     // for events recorded microseconds ago.
-    let _ = state.timeline_recorder.flush().await;
+    let _ = state.timeline_recorder.settle().await;
 
     let (total, events) = {
         let timeline = state.timeline.read().await;
