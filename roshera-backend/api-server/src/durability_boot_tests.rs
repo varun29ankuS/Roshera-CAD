@@ -2430,14 +2430,32 @@ async fn acknowledge_unsound_survives_in_the_raw_persisted_event_blob() {
 const INJECTED_STORE_FAILURE: &str = "injected store failure: disk quota exceeded";
 
 /// A `DatabasePersistence` that delegates everything to a real database
-/// except `save_checkpoint` and `save_branch`, which always fail.
+/// except `save_checkpoint` and `save_branch` ([`FailingSaves::wrap`]), or
+/// except `discard_redo_tail` ([`FailingSaves::failing_discard`]), which
+/// always fail.
 struct FailingSaves {
     inner: Db,
+    /// `save_checkpoint` / `save_branch` fail.
+    fail_saves: bool,
+    /// `discard_redo_tail` fails.
+    fail_discard: bool,
 }
 
 impl FailingSaves {
     fn wrap(inner: Db) -> Arc<Self> {
-        Arc::new(Self { inner })
+        Arc::new(Self {
+            inner,
+            fail_saves: true,
+            fail_discard: false,
+        })
+    }
+
+    fn failing_discard(inner: Db) -> Arc<Self> {
+        Arc::new(Self {
+            inner,
+            fail_saves: false,
+            fail_discard: true,
+        })
     }
 
     fn refuse() -> session_manager::SessionError {
@@ -2449,18 +2467,24 @@ impl FailingSaves {
 
 #[async_trait::async_trait]
 impl DatabasePersistence for FailingSaves {
-    // ---- The two writes under test: always fail ----
+    // ---- The writes under test: fail when configured to ----
     async fn save_checkpoint(
         &self,
-        _checkpoint: &session_manager::CheckpointRecord,
+        checkpoint: &session_manager::CheckpointRecord,
     ) -> Result<(), session_manager::SessionError> {
-        Err(Self::refuse())
+        if self.fail_saves {
+            return Err(Self::refuse());
+        }
+        self.inner.save_checkpoint(checkpoint).await
     }
     async fn save_branch(
         &self,
-        _branch: &session_manager::BranchRecord,
+        branch: &session_manager::BranchRecord,
     ) -> Result<(), session_manager::SessionError> {
-        Err(Self::refuse())
+        if self.fail_saves {
+            return Err(Self::refuse());
+        }
+        self.inner.save_branch(branch).await
     }
 
     // ---- Everything else: verbatim delegation ----
@@ -2625,6 +2649,22 @@ impl DatabasePersistence for FailingSaves {
         session_id: &str,
     ) -> Result<Vec<session_manager::BranchRecord>, session_manager::SessionError> {
         self.inner.load_branches(session_id).await
+    }
+    // A redo-tail discard is its own transaction, not a `save_branch`: it
+    // fails only on a `failing_discard` double.
+    async fn discard_redo_tail(
+        &self,
+        session_id: &str,
+        purged_sequences: &[i64],
+        branches: &[session_manager::BranchRecord],
+        event: &TimelineEventData,
+    ) -> Result<(), session_manager::SessionError> {
+        if self.fail_discard {
+            return Err(Self::refuse());
+        }
+        self.inner
+            .discard_redo_tail(session_id, purged_sequences, branches, event)
+            .await
     }
     async fn load_checkpoints(
         &self,
@@ -4973,5 +5013,374 @@ async fn reanchored_part_survives_restart_in_place() {
     assert_eq!(
         anchor_after, anchor_before,
         "the rebuilt part must carry the live anchor"
+    );
+}
+
+// =====================================================================
+// Task 104 — undo survives a restart; a new operation discards the redo tail
+// for good.
+//
+// Undo/redo moved a session pointer and nothing wrote it down, so the next
+// full replay — boot — replayed the whole branch and brought the undone
+// operations back. The document's applied head (per document + branch) is now
+// durable state: boot replays up to it and keeps the rest as the redo tail,
+// and a new operation after an undo removes that tail from memory AND from the
+// store, so it cannot come back either.
+// =====================================================================
+
+/// Undo or redo through the REST route with `session`.
+async fn undo_redo(state: &AppState, verb: &str, session: Uuid) -> Value {
+    settle(state).await;
+    let (s, body) = dispatch(
+        state,
+        post(
+            &format!("/api/timeline/{verb}"),
+            json!({ "session_id": session.to_string() }),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{verb} must answer; body = {body}");
+    body
+}
+
+/// The live volumes, rounded to 1e-6 so a comparison is exact.
+async fn rounded_volumes(state: &AppState) -> Vec<f64> {
+    live_volumes(state)
+        .await
+        .into_iter()
+        .map(|v| (v * 1e6).round() / 1e6)
+        .collect()
+}
+
+/// The event kinds persisted for the default document, in sequence order —
+/// read straight out of the SQLite file (the raw artifact), not the timeline.
+async fn persisted_kinds(path: &str) -> Vec<String> {
+    open_db(path)
+        .await
+        .load_all_timeline_events(durability::DURABILITY_SESSION_ID)
+        .await
+        .expect("the event log must be readable")
+        .into_iter()
+        .map(|row| row.event_type)
+        .collect()
+}
+
+/// A 10-cube, then a side cylinder; returns the volumes with both applied.
+async fn seed_cube_then_cylinder(state: &AppState) -> Vec<f64> {
+    create_cube(state, 10.0).await;
+    create_side_cylinder(state).await;
+    settle(state).await;
+    let volumes = rounded_volumes(state).await;
+    assert_eq!(volumes.len(), 2, "sanity: cube + cylinder; got {volumes:?}");
+    volumes
+}
+
+/// The recorded kinds of main's history, in sequence order.
+async fn main_history_kinds(state: &AppState) -> Vec<String> {
+    settle(state).await;
+    let timeline = state.timeline.read().await;
+    timeline
+        .get_branch_events(&timeline_engine::BranchId::main(), None, None)
+        .expect("main exists")
+        .into_iter()
+        .map(|e| match e.operation {
+            timeline_engine::Operation::Generic { command_type, .. } => command_type,
+            other => format!("{other:?}"),
+        })
+        .collect()
+}
+
+/// (a) cube, cylinder, undo, restart → ONE solid, the cube; redo after the
+/// restart → both. The undone cylinder is neither replayed nor lost.
+#[tokio::test]
+async fn an_undo_survives_a_restart_and_the_undone_operation_is_still_redoable() {
+    let path = temp_db_path();
+    let (both, history) = {
+        let state = build_state(open_db(&path).await, true).await;
+        let both = seed_cube_then_cylinder(&state).await;
+        let history = main_history_kinds(&state).await;
+        assert_eq!(
+            history.last().map(String::as_str),
+            Some("create_cylinder_3d"),
+            "sanity: the cylinder is the last operation; history = {history:?}"
+        );
+        let body = undo_redo(&state, "undo", Uuid::new_v4()).await;
+        assert_eq!(body["success"], true, "undo must succeed; body = {body}");
+        assert_eq!(
+            rounded_volumes(&state).await,
+            vec![1000.0],
+            "sanity: the undo leaves the cube alone in the live model"
+        );
+        (both, history)
+    };
+
+    let state2 = build_state(open_db(&path).await, true).await;
+    assert_eq!(
+        rounded_volumes(&state2).await,
+        vec![1000.0],
+        "after the restart the undone cylinder must stay undone"
+    );
+    let (s, status) = dispatch(&state2, get("/api/durability/status")).await;
+    assert_eq!(s, StatusCode::OK, "status 200; body = {status}");
+    assert_eq!(status["status"]["state"], "active", "body = {status}");
+    assert_eq!(
+        status["status"]["events_replayed"],
+        json!(history.len() - 1),
+        "only the applied prefix is replayed; body = {status}"
+    );
+    assert_eq!(
+        main_history_kinds(&state2).await,
+        history,
+        "the undone cylinder stays in main's history as the redo tail"
+    );
+
+    let body = undo_redo(&state2, "redo", Uuid::new_v4()).await;
+    assert_eq!(
+        body["success"], true,
+        "the undone operation must still be redoable after the restart; body = {body}"
+    );
+    assert_eq!(
+        rounded_volumes(&state2).await,
+        both,
+        "redo after the restart brings the cylinder back"
+    );
+    assert_timeline_valid(&state2).await;
+
+    // The redo is durable too: a second restart serves both.
+    drop(state2);
+    let state3 = build_state(open_db(&path).await, true).await;
+    assert_eq!(
+        rounded_volumes(&state3).await,
+        both,
+        "a redo back to the end must not be undone again by the next restart"
+    );
+}
+
+/// (b) cube, cylinder, undo, NEW cube, restart → cube + new cube; the
+/// cylinder is gone for good: not replayed, not redoable, not in the store.
+#[tokio::test]
+async fn a_new_operation_after_an_undo_discards_the_redo_tail_for_good() {
+    let path = temp_db_path();
+    let expected = {
+        let state = build_state(open_db(&path).await, true).await;
+        seed_cube_then_cylinder(&state).await;
+        let body = undo_redo(&state, "undo", Uuid::new_v4()).await;
+        assert_eq!(body["success"], true, "undo must succeed; body = {body}");
+        create_cube(&state, 3.0).await;
+        settle(&state).await;
+        let live = rounded_volumes(&state).await;
+        assert_eq!(live, vec![27.0, 1000.0], "sanity: cube + new cube live");
+        let history = main_history_kinds(&state).await;
+        assert!(
+            !history.iter().any(|k| k.contains("cylinder")),
+            "the new operation must drop the cylinder from main's history: {history:?}"
+        );
+        let body = undo_redo(&state, "redo", Uuid::new_v4()).await;
+        assert_eq!(
+            body["success"], false,
+            "nothing to redo once a new operation followed the undo; body = {body}"
+        );
+        live
+    };
+
+    let kinds = persisted_kinds(&path).await;
+    assert!(
+        !kinds.iter().any(|k| k.contains("cylinder")),
+        "the discarded cylinder's row must be gone from the store; rows = {kinds:?}"
+    );
+
+    let state2 = build_state(open_db(&path).await, true).await;
+    assert_eq!(
+        rounded_volumes(&state2).await,
+        expected,
+        "after the restart: the cube and the new cube, and no cylinder"
+    );
+    let body = undo_redo(&state2, "redo", Uuid::new_v4()).await;
+    assert_eq!(
+        body["success"], false,
+        "the discarded cylinder must not be redoable after the restart; body = {body}"
+    );
+    assert_eq!(
+        rounded_volumes(&state2).await,
+        expected,
+        "a refused redo changes nothing"
+    );
+    let (s, status) = dispatch(&state2, get("/api/durability/status")).await;
+    assert_eq!(s, StatusCode::OK, "status 200; body = {status}");
+    assert_eq!(status["status"]["state"], "active", "body = {status}");
+    assert_timeline_valid(&state2).await;
+}
+
+/// (c) An undo whose new position cannot be written durably is a typed
+/// refusal, and nothing moved: the live model, the session's position, the
+/// document's applied head — and, after a restart, the served document.
+#[tokio::test]
+async fn an_undo_whose_position_cannot_be_persisted_is_typed_and_moves_nothing() {
+    let path = temp_db_path();
+    let session = Uuid::new_v4();
+    let both = {
+        let state = build_state_with_failing_saves(&path).await;
+        let both = seed_cube_then_cylinder(&state).await;
+        let len = branch_history(&state, timeline_engine::BranchId::main())
+            .await
+            .len() as u64;
+        let body = undo_redo(&state, "undo", session).await;
+        assert_eq!(
+            body["success"], false,
+            "the undo must refuse; body = {body}"
+        );
+        assert_eq!(
+            body["error_code"], DURABILITY_PERSIST_FAILED,
+            "typed; body = {body}"
+        );
+        assert_eq!(body["details"]["rolled_back"], true, "body = {body}");
+        assert!(
+            body["details"]["reason"]
+                .as_str()
+                .is_some_and(|r| r.contains(INJECTED_STORE_FAILURE)),
+            "the store's own cause, verbatim; body = {body}"
+        );
+        let message = body["message"].as_str().expect("a message");
+        assert!(!message.contains("  "), "no double spaces: {message}");
+        assert_eq!(
+            rounded_volumes(&state).await,
+            both,
+            "the live model must be untouched"
+        );
+        let timeline = state.timeline.read().await;
+        assert_eq!(
+            timeline
+                .get_session_position(session)
+                .expect("the session is positioned")
+                .event_index,
+            len,
+            "the session's position must be where it was"
+        );
+        assert_eq!(
+            timeline.applied_head(&timeline_engine::BranchId::main()),
+            None,
+            "the document's applied head must be where it was (the whole branch)"
+        );
+        both
+    };
+
+    let state2 = build_state(open_db(&path).await, true).await;
+    assert_eq!(
+        rounded_volumes(&state2).await,
+        both,
+        "the refused undo must not reach the next boot either"
+    );
+}
+
+/// (d) The redo-tail discard failed to reach the store (reported), and the
+/// store still says "applied through the cube". Operations recorded after it
+/// persist normally — and a restart must SERVE them, not treat them as part of
+/// a redo tail. The stale tail is dropped, the correction is named, and it is
+/// written down so a later undo's head write cannot bring the tail back.
+#[tokio::test]
+async fn a_discard_that_never_reached_the_store_cannot_hide_later_operations() {
+    let path = temp_db_path();
+    {
+        let state = build_state(FailingSaves::failing_discard(open_db(&path).await), true).await;
+        seed_cube_then_cylinder(&state).await;
+        let body = undo_redo(&state, "undo", Uuid::new_v4()).await;
+        assert_eq!(body["success"], true, "undo must succeed; body = {body}");
+        // A one-event operation, so its lost row leaves no half-recorded
+        // operation behind for the replay guards to (rightly) refuse.
+        create_side_cylinder(&state).await;
+        match state.timeline_recorder.flush().await {
+            Err(timeline_engine::FlushError::RecordingFailed(lost)) => {
+                assert!(
+                    lost.failures
+                        .iter()
+                        .any(|f| f.stage == timeline_engine::RecordFailureStage::Persist),
+                    "the failed discard is reported as a persist failure: {lost:?}"
+                );
+                assert!(
+                    lost.failures.iter().any(|f| f
+                        .error
+                        .contains("redo-tail discard this operation made in memory")
+                        && f.error.contains("did NOT reach disk")
+                        && !f.error.contains("  ")),
+                    "the failure must say the discard did not reach disk either: {lost:?}"
+                );
+            }
+            other => panic!("the failed discard must reach the flush; got {other:?}"),
+        }
+        create_cube(&state, 4.0).await;
+        settle(&state).await;
+        assert_eq!(
+            rounded_volumes(&state).await.len(),
+            3,
+            "sanity: live, every operation after the undo holds"
+        );
+    }
+
+    let state2 = build_state(open_db(&path).await, true).await;
+    assert_eq!(
+        rounded_volumes(&state2).await,
+        vec![64.0, 1000.0],
+        "the operation persisted after the failed discard must be served (the one whose row was refused is lost, and was reported)"
+    );
+    assert!(
+        !main_history_kinds(&state2)
+            .await
+            .iter()
+            .any(|k| k.contains("cylinder")),
+        "the discarded cylinder must not come back into main's history"
+    );
+    let body = undo_redo(&state2, "redo", Uuid::new_v4()).await;
+    assert_eq!(
+        body["success"], false,
+        "the discarded cylinder must not be redoable; body = {body}"
+    );
+    let (s, status) = dispatch(&state2, get("/api/durability/status")).await;
+    assert_eq!(s, StatusCode::OK, "status 200; body = {status}");
+    assert!(
+        status["status"]["branch_faults"]
+            .as_array()
+            .is_some_and(|faults| faults
+                .iter()
+                .any(|f| f["kind"] == "redo_tail_discard_recovered")),
+        "the correction must be named; body = {status}"
+    );
+    let row = open_db(&path)
+        .await
+        .load_branches(durability::DURABILITY_SESSION_ID)
+        .await
+        .expect("branch rows readable")
+        .into_iter()
+        .find(|row| row.branch_id == timeline_engine::BranchId::main().to_string())
+        .expect("main has a row (the undo wrote its head)");
+    assert!(
+        row.data.get("applied_head").is_none(),
+        "the recovered correction clears the stale head in the store; row = {:?}",
+        row.data
+    );
+    assert!(
+        row.data
+            .get("discarded_sequences")
+            .and_then(Value::as_array)
+            .is_some_and(|d| !d.is_empty()),
+        "the recovered correction records the discarded tail in the store; row = {:?}",
+        row.data
+    );
+
+    // A later undo writes a new head; the old tail must not come back with it.
+    let body = undo_redo(&state2, "undo", Uuid::new_v4()).await;
+    assert_eq!(body["success"], true, "undo must succeed; body = {body}");
+    drop(state2);
+    let state3 = build_state(open_db(&path).await, true).await;
+    assert!(
+        !main_history_kinds(&state3)
+            .await
+            .iter()
+            .any(|k| k.contains("cylinder")),
+        "a later head write must not bring the discarded cylinder back"
+    );
+    assert_eq!(
+        rounded_volumes(&state3).await,
+        vec![64.0, 1000.0],
+        "no cylinder after the next restart either"
     );
 }

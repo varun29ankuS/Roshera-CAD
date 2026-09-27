@@ -59,6 +59,7 @@ fn ws_undo_redo_error_code(err: &crate::handlers::timeline::UndoRedoError) -> &'
         UndoRedoError::SessionSeed(_) => "SESSION_SEED_FAILED",
         UndoRedoError::Internal(_) => "INTERNAL_ERROR",
         UndoRedoError::ReplayRefused { .. } => "branch_replay_refused",
+        UndoRedoError::Persist { .. } => "durability_persist_failed",
     }
 }
 
@@ -1527,7 +1528,7 @@ async fn handle_websocket_connection(socket: WebSocket, state: AppState) {
                                                             .to_string(),
                                                         message: err.to_string(),
                                                         details: err
-                                                            .replay_refusal()
+                                                            .typed_error()
                                                             .and_then(|r| r.details),
                                                         request_id,
                                                     }
@@ -1581,7 +1582,7 @@ async fn handle_websocket_connection(socket: WebSocket, state: AppState) {
                                                             .to_string(),
                                                         message: err.to_string(),
                                                         details: err
-                                                            .replay_refusal()
+                                                            .typed_error()
                                                             .and_then(|r| r.details),
                                                         request_id,
                                                     }

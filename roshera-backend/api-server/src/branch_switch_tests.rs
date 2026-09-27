@@ -27,6 +27,7 @@ use crate::durability_boot_tests::{
     fork_from_main, get, live_volumes, open_db, post, settle, temp_db_path, top_face_of,
 };
 use crate::{build_router, AppState};
+use session_manager::DatabasePersistence;
 
 use axum::http::StatusCode;
 use futures::{SinkExt, StreamExt};
@@ -887,17 +888,46 @@ async fn a_mould_whose_rebuild_would_be_refused_appends_nothing() {
 // Round 2 — an op that lands during the off-lock rebuild is never lost
 // =====================================================================
 
+/// The durable row of `main` for the default document, if it has one.
+async fn main_row(path: &str) -> Option<serde_json::Map<String, Value>> {
+    open_db(path)
+        .await
+        .load_branches(crate::durability::DURABILITY_SESSION_ID)
+        .await
+        .expect("branch rows readable")
+        .into_iter()
+        .find(|row| row.branch_id == BranchId::main().to_string())
+        .and_then(|row| row.data.as_object().cloned())
+}
+
+/// Every volume the kernel measures, rounded for exact comparison.
+async fn rounded(state: &AppState) -> Vec<f64> {
+    live_volumes(state)
+        .await
+        .into_iter()
+        .map(|v| (v * 1e6).round() / 1e6)
+        .collect()
+}
+
 /// An undo rebuilds its prefix off the model lock. A cube created WHILE
 /// that rebuild runs (driven deterministically through the test gate) is in
 /// the live model and the ledger but not in the rebuild; swapping the
 /// rebuild in would drop it. The undo is refused (`history_moved`) and the
 /// cube stays live and addressable.
+///
+/// Task 104: and the refusal is TRUE — nothing moved. The undone operation
+/// is still in the ledger (the undo's applied head never became visible to
+/// the concurrent append, so it discarded nothing), the document's applied
+/// head is what it was before the undo (none), the durable row carries no
+/// head and no discard, and a restart serves exactly the live model.
 #[tokio::test]
 async fn an_op_landing_during_an_undo_rebuild_is_never_dropped() {
-    let state = fresh_state().await;
+    let path = temp_db_path();
+    let state = build_state(open_db(&path).await, true).await;
     create_cube(&state, 10.0).await;
     create_cube(&state, 3.0).await;
     settle(&state).await;
+    let history_before = branch_history(&state, BranchId::main()).await;
     let session = Uuid::new_v4();
     let (rebuilt, proceed) = crate::handlers::timeline::replay_race_hook::install(session);
 
@@ -935,6 +965,278 @@ async fn an_op_landing_during_an_undo_rebuild_is_never_dropped() {
             .await
             .is_some_and(|v| close(v, 8.0)),
         "the cube created during the rebuild must stay live and addressable"
+    );
+
+    let history_after = branch_history(&state, BranchId::main()).await;
+    assert!(
+        history_before.iter().all(|e| history_after.contains(e)),
+        "the refused undo must leave every event in the ledger; before = {history_before:?}, after = {history_after:?}"
+    );
+    assert_eq!(
+        history_after.len(),
+        history_before.len() + 2,
+        "plus the concurrent cube's two events; after = {history_after:?}"
+    );
+    assert_eq!(
+        state.timeline.read().await.applied_head(&BranchId::main()),
+        None,
+        "the applied head must be what it was before the undo"
+    );
+    let row = main_row(&path).await.unwrap_or_default();
+    assert!(
+        row.get("applied_head").is_none() && row.get("discarded_sequences").is_none(),
+        "the durable row must carry no head and no discard; row = {row:?}"
+    );
+    let live = rounded(&state).await;
+    drop(state);
+    let restarted = build_state(open_db(&path).await, true).await;
+    assert_eq!(
+        rounded(&restarted).await,
+        live,
+        "a restart must serve exactly the live model"
+    );
+}
+
+/// The redo twin. A cube created while a redo rebuilds is a NEW operation
+/// after the undo: by the editor model it discards the redo tail — the
+/// undone operation — for good, exactly as it would have without the redo in
+/// flight. The redo is refused (`history_moved`), and afterwards the ledger,
+/// the document's applied head, the durable row and a restart all describe
+/// the live model: the undone operation gone, the concurrent cube kept.
+#[tokio::test]
+async fn an_op_landing_during_a_redo_rebuild_is_never_dropped() {
+    let path = temp_db_path();
+    let state = build_state(open_db(&path).await, true).await;
+    create_cube(&state, 10.0).await;
+    create_cube(&state, 3.0).await;
+    settle(&state).await;
+    let (s, body) = dispatch(
+        &state,
+        post(
+            "/api/timeline/undo",
+            json!({ "session_id": Uuid::new_v4().to_string() }),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "body = {body}");
+    assert_eq!(
+        body["success"], true,
+        "the undo must succeed; body = {body}"
+    );
+    settle(&state).await;
+    let history_before = branch_history(&state, BranchId::main()).await;
+    let undone = history_before.last().cloned().expect("a history");
+
+    let session = Uuid::new_v4();
+    let (rebuilt, proceed) = crate::handlers::timeline::replay_race_hook::install(session);
+    let redo_state = state.clone();
+    let redo = tokio::spawn(async move {
+        dispatch(
+            &redo_state,
+            post(
+                "/api/timeline/redo",
+                json!({ "session_id": session.to_string() }),
+            ),
+        )
+        .await
+    });
+    rebuilt.notified().await;
+    let landed = create_part(
+        &state,
+        "/api/geometry/box",
+        json!({ "width": 2.0, "depth": 2.0, "height": 2.0 }),
+    )
+    .await;
+    proceed.notify_one();
+    let (s, body) = redo.await.expect("the redo task must finish");
+
+    assert_eq!(s, StatusCode::OK, "redo answers in-band; body = {body}");
+    assert_eq!(
+        body["success"], false,
+        "the redo must not swap; body = {body}"
+    );
+    assert_eq!(body["details"]["kind"], "history_moved", "body = {body}");
+    assert!(
+        volume_of(&state, &landed)
+            .await
+            .is_some_and(|v| close(v, 8.0)),
+        "the cube created during the rebuild must stay live and addressable"
+    );
+    let history_after = branch_history(&state, BranchId::main()).await;
+    assert!(
+        !history_after.contains(&undone),
+        "the new operation discards the undone one; after = {history_after:?}"
+    );
+    assert_eq!(
+        history_after.len(),
+        history_before.len() + 1,
+        "minus the undone event, plus the concurrent cube's two; after = {history_after:?}"
+    );
+    assert_eq!(
+        state.timeline.read().await.applied_head(&BranchId::main()),
+        None,
+        "no redo tail is left: the whole ledger is applied"
+    );
+    let row = main_row(&path).await.unwrap_or_default();
+    assert!(
+        row.get("applied_head").is_none(),
+        "the durable row must carry no stale head; row = {row:?}"
+    );
+    let live = rounded(&state).await;
+    drop(state);
+    let restarted = build_state(open_db(&path).await, true).await;
+    assert_eq!(
+        rounded(&restarted).await,
+        live,
+        "a restart must serve exactly the live model"
+    );
+}
+
+/// The window BEFORE the rebuild reads the history: an op that lands after
+/// the undo decided (moved its pointer) but before the rebuild read the
+/// ledger would be read into the history, fall outside the undo's prefix, and
+/// be silently dropped from the live model by the swap — its caller told it
+/// succeeded. The undo decides from a ledger mark taken with the decision, so
+/// that op also yields `history_moved`, and nothing moved.
+#[tokio::test]
+async fn an_op_landing_between_an_undo_decision_and_its_rebuild_is_never_dropped() {
+    let path = temp_db_path();
+    let state = build_state(open_db(&path).await, true).await;
+    create_cube(&state, 10.0).await;
+    create_cube(&state, 3.0).await;
+    settle(&state).await;
+    let history_before = branch_history(&state, BranchId::main()).await;
+    let session = Uuid::new_v4();
+    let (decided, proceed) = crate::handlers::timeline::replay_race_hook::install_decided(session);
+
+    let undo_state = state.clone();
+    let undo = tokio::spawn(async move {
+        dispatch(
+            &undo_state,
+            post(
+                "/api/timeline/undo",
+                json!({ "session_id": session.to_string() }),
+            ),
+        )
+        .await
+    });
+    decided.notified().await;
+    let landed = create_part(
+        &state,
+        "/api/geometry/box",
+        json!({ "width": 2.0, "depth": 2.0, "height": 2.0 }),
+    )
+    .await;
+    settle(&state).await;
+    proceed.notify_one();
+    let (s, body) = undo.await.expect("the undo task must finish");
+
+    assert_eq!(s, StatusCode::OK, "undo answers in-band; body = {body}");
+    assert_eq!(
+        body["success"], false,
+        "the undo must not swap; body = {body}"
+    );
+    assert_eq!(body["details"]["kind"], "history_moved", "body = {body}");
+    assert!(
+        volume_of(&state, &landed)
+            .await
+            .is_some_and(|v| close(v, 8.0)),
+        "the cube created after the decision must stay live and addressable"
+    );
+    let history_after = branch_history(&state, BranchId::main()).await;
+    assert!(
+        history_before.iter().all(|e| history_after.contains(e)),
+        "every event stays in the ledger; after = {history_after:?}"
+    );
+    assert_eq!(
+        state.timeline.read().await.applied_head(&BranchId::main()),
+        None,
+        "the applied head never moved"
+    );
+    let row = main_row(&path).await.unwrap_or_default();
+    assert!(
+        row.get("applied_head").is_none() && row.get("discarded_sequences").is_none(),
+        "row = {row:?}"
+    );
+}
+
+/// Task 104 round 2 — a `/timeline/record` append (it takes the timeline
+/// WRITE lock, not the model lock, so the model guard does not exclude it)
+/// that lands right after the undo's ledger check. The check and the head
+/// set happen under ONE timeline guard, so the append either lands before
+/// the check (the undo is refused, typed) or after the head is set — and
+/// then, as any new operation after an undo, it discards the redo tail. It
+/// is never filed INTO the redo tail as if it had been undone.
+#[tokio::test]
+async fn an_append_after_the_undo_check_is_never_filed_into_the_redo_tail() {
+    let path = temp_db_path();
+    let state = build_state(open_db(&path).await, true).await;
+    create_cube(&state, 10.0).await;
+    create_side_cylinder(&state).await;
+    settle(&state).await;
+    let record_session = Uuid::new_v4();
+    state
+        .timeline
+        .read()
+        .await
+        .update_session_position(
+            timeline_engine::SessionId::new(record_session.to_string()),
+            BranchId::main(),
+            0,
+        )
+        .expect("plant the record session on main");
+    let session = Uuid::new_v4();
+    let (checked, proceed) = crate::handlers::timeline::replay_race_hook::install_checked(session);
+
+    let undo_state = state.clone();
+    let undo = tokio::spawn(async move {
+        dispatch(
+            &undo_state,
+            post(
+                "/api/timeline/undo",
+                json!({ "session_id": session.to_string() }),
+            ),
+        )
+        .await
+    });
+    checked.notified().await;
+    let (s, body) = dispatch(
+        &state,
+        post(
+            "/api/timeline/record",
+            json!({
+                "session_id": record_session.to_string(),
+                "operation": {
+                    "type": "CreatePrimitive",
+                    "primitive_type": "box",
+                    "parameters": {"width": 1.0, "depth": 1.0, "height": 1.0},
+                },
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "the record must land; body = {body}");
+    let recorded = body["event_id"]
+        .as_str()
+        .expect("the record returns its event id")
+        .to_string();
+    proceed.notify_one();
+    let (s, undo_body) = undo.await.expect("the undo task must finish");
+    assert_eq!(s, StatusCode::OK, "body = {undo_body}");
+    assert!(
+        undo_body["success"] == true || undo_body["error_code"].is_string(),
+        "the undo commits or is refused, typed; body = {undo_body}"
+    );
+
+    let history = branch_history(&state, BranchId::main()).await;
+    let position = history
+        .iter()
+        .position(|(_, id)| *id == recorded)
+        .expect("the recorded operation is in main's history");
+    let head = state.timeline.read().await.applied_head(&BranchId::main());
+    assert!(
+        head.is_none_or(|count| (position as u64) < count),
+        "the recorded operation must not sit in the redo tail: head = {head:?}, its index = {position}, history = {history:?}"
     );
 }
 

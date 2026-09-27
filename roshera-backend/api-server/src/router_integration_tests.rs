@@ -10004,6 +10004,15 @@ impl timeline_engine::EventSink for FacetCapturingSink {
             .push((event.clone(), document.map(str::to_owned)));
         Ok(())
     }
+
+    async fn persist_discarding(
+        &self,
+        event: &timeline_engine::TimelineEvent,
+        _discard: &timeline_engine::RedoTailDiscard,
+        document: Option<&str>,
+    ) -> Result<(), String> {
+        self.persist(event, document).await
+    }
 }
 
 /// THE RED for the facet-loss defect. `boolean_operation` runs its kernel

@@ -42,7 +42,7 @@ use parking_lot::{Mutex as PlMutex, RwLock as PlRwLock};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot, RwLock};
 
-use crate::timeline::Timeline;
+use crate::timeline::{RedoTailDiscard, Timeline};
 use crate::types::{Author, BranchId, Operation, TimelineEvent};
 
 /// Durability sink for the recorded event log.
@@ -80,6 +80,24 @@ use crate::types::{Author, BranchId, Operation, TimelineEvent};
 #[async_trait::async_trait]
 pub trait EventSink: Send + Sync {
     async fn persist(&self, event: &TimelineEvent, document: Option<&str>) -> Result<(), String>;
+
+    /// Persist `event` together with the redo tail its append discarded
+    /// ([`RedoTailDiscard`]): the rows of the purged events leave the store,
+    /// the affected branch records say what their histories lost, and the new
+    /// event lands — ALL in one write, or none of it. A partial write would
+    /// leave a store whose next boot serves neither the old document nor the
+    /// new one. `Err` means the store still holds the document as it was
+    /// before this operation (the undone operations still redoable, the new
+    /// one absent); the drain worker reports it like any persist failure.
+    ///
+    /// Required (no default): a sink that ignored the discard would let the
+    /// undone operations come back at the next restart.
+    async fn persist_discarding(
+        &self,
+        event: &TimelineEvent,
+        discard: &RedoTailDiscard,
+        document: Option<&str>,
+    ) -> Result<(), String>;
 }
 
 /// Bounded channel capacity for the recorder MPSC. Sized to absorb the
@@ -731,26 +749,20 @@ impl TimelineRecorder {
                         // pids were seeded from, reproducing the very defect
                         // this seam exists to close, just moved one level
                         // down.
-                        let append_result = match record.reserved_sequence {
-                            Some(seq) => {
-                                guard
-                                    .add_operation_reserved_certified(
-                                        op,
-                                        author,
-                                        target,
-                                        seq,
-                                        certificate,
-                                    )
-                                    .await
-                            }
-                            None => {
-                                guard
-                                    .add_operation_certified(op, author, target, certificate)
-                                    .await
-                            }
-                        };
+                        //
+                        // An append onto a branch with a redo tail discards
+                        // that tail (`Timeline::append_recorded`); the discard
+                        // comes back here so it is made durable in the SAME
+                        // write as the event.
+                        let append_result = guard.append_recorded(
+                            op,
+                            author,
+                            target,
+                            record.reserved_sequence,
+                            certificate.as_ref(),
+                        );
                         match append_result {
-                            Ok(event_id) => {
+                            Ok((event_id, discarded)) => {
                                 // Durability write-through. The event now carries
                                 // its burned `sequence_number`; persist it before
                                 // moving on. We clone it out and drop the timeline
@@ -767,9 +779,36 @@ impl TimelineRecorder {
                                         // worker task, not the one that
                                         // recorded. `None` leaves the sink on
                                         // its ambient fallback, unchanged.
-                                        if let Err(err) =
-                                            sink.persist(&event, document.as_deref()).await
-                                        {
+                                        let written = match discarded.as_ref() {
+                                            Some(discard) => {
+                                                sink.persist_discarding(
+                                                    &event,
+                                                    discard,
+                                                    document.as_deref(),
+                                                )
+                                                .await
+                                            }
+                                            None => sink.persist(&event, document.as_deref()).await,
+                                        };
+                                        if let Err(err) = written {
+                                            // A failed discard write leaves the
+                                            // store holding the redo tail and the
+                                            // stale head; say so, not just that
+                                            // this one event is missing.
+                                            let err = match discarded.as_ref() {
+                                                Some(discard) => format!(
+                                                    concat!(
+                                                        "{} (the redo-tail discard this ",
+                                                        "operation made in memory, sequences ",
+                                                        "{:?}, did NOT reach disk either: the ",
+                                                        "store still holds that tail and its ",
+                                                        "applied head until a restart ",
+                                                        "reconciles them)"
+                                                    ),
+                                                    err, discard.removed_sequences
+                                                ),
+                                                None => err,
+                                            };
                                             tracing::error!(
                                                 target: "timeline.recorder_bridge",
                                                 kind = %record.kind,
@@ -2857,6 +2896,15 @@ mod tests {
                 .push((kind, document.map(str::to_owned)));
             Ok(())
         }
+
+        async fn persist_discarding(
+            &self,
+            event: &TimelineEvent,
+            _discard: &crate::timeline::RedoTailDiscard,
+            document: Option<&str>,
+        ) -> Result<(), String> {
+            self.persist(event, document).await
+        }
     }
 
     /// Poll until the sink has seen `n` events, or give up.
@@ -3379,6 +3427,15 @@ mod tests {
         async fn persist(
             &self,
             _event: &TimelineEvent,
+            _document: Option<&str>,
+        ) -> Result<(), String> {
+            Err("injected persist failure".to_string())
+        }
+
+        async fn persist_discarding(
+            &self,
+            _event: &TimelineEvent,
+            _discard: &crate::timeline::RedoTailDiscard,
             _document: Option<&str>,
         ) -> Result<(), String> {
             Err("injected persist failure".to_string())

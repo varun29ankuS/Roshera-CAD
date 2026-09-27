@@ -71,6 +71,29 @@ struct TruncatePlan {
     purged: HashSet<EventId>,
 }
 
+/// A redo tail an append discarded for good (see
+/// [`Timeline::set_applied_head`]): what the in-memory discard removed, in
+/// the terms a durable store needs to remove the same thing.
+///
+/// Built from the same [`TruncatePlan`] a truncate applies, so the discard
+/// and a truncate at the same cut remove exactly the same things.
+#[derive(Debug, Clone)]
+pub struct RedoTailDiscard {
+    /// The branch whose redo tail was discarded (after the discard: its
+    /// applied head is its full history again).
+    pub branch: Branch,
+    /// The sequence numbers dropped from `branch`'s history — and from the
+    /// history of every branch in `cascaded` — ascending.
+    pub removed_sequences: Vec<u64>,
+    /// The sequence numbers of the dropped events no history references any
+    /// more: they left the timeline's event table.
+    pub purged_sequences: Vec<u64>,
+    /// Active branches forked from `branch` inside the discarded tail: their
+    /// fork anchor is gone, so they lost the same entries and are now
+    /// abandoned (snapshots taken after the abandonment).
+    pub cascaded: Vec<Branch>,
+}
+
 /// Main Timeline structure - the heart of the event-sourced system
 pub struct Timeline {
     /// Configuration
@@ -99,6 +122,12 @@ pub struct Timeline {
 
     /// Active operations being executed
     pub(crate) active_operations: Arc<DashMap<EventId, OperationState>>,
+
+    /// The applied head of every branch that has a redo tail: the count of
+    /// its history (in sequence order) the document currently holds applied.
+    /// A branch with no entry holds its whole history applied. See
+    /// [`Timeline::set_applied_head`].
+    pub(crate) applied_heads: Arc<DashMap<BranchId, EventIndex>>,
 }
 
 /// Session position in timeline
@@ -174,6 +203,7 @@ impl Timeline {
             entity_events: Arc::new(DashMap::new()),
             session_positions: Arc::new(DashMap::new()),
             active_operations: Arc::new(DashMap::new()),
+            applied_heads: Arc::new(DashMap::new()),
         }
     }
 
@@ -244,6 +274,7 @@ impl Timeline {
         // Reserve `None` — the sequence number is burned internally *after*
         // validation, so a rejected append leaves no gap in the sequence space.
         self.append_internal(operation, author, branch_id, None, None)
+            .map(|(event_id, _)| event_id)
     }
 
     /// [`add_operation`](Self::add_operation) plus a per-event certificate —
@@ -265,6 +296,7 @@ impl Timeline {
         certificate: Option<crate::event_certificate::EventCertificate>,
     ) -> TimelineResult<EventId> {
         self.append_internal(operation, author, branch_id, None, certificate.as_ref())
+            .map(|(event_id, _)| event_id)
     }
 
     /// Atomically reserve the next sequence number (the write-half of the
@@ -307,6 +339,7 @@ impl Timeline {
         sequence_number: u64,
     ) -> TimelineResult<EventId> {
         self.append_internal(operation, author, branch_id, Some(sequence_number), None)
+            .map(|(event_id, _)| event_id)
     }
 
     /// [`add_operation_reserved`](Self::add_operation_reserved) plus a
@@ -338,6 +371,26 @@ impl Timeline {
             Some(sequence_number),
             certificate.as_ref(),
         )
+        .map(|(event_id, _)| event_id)
+    }
+
+    /// The recorder bridge's append: [`add_operation_certified`] /
+    /// [`add_operation_reserved_certified`] (by `reserved`) that also hands
+    /// back the redo tail the append discarded, if the branch had one — the
+    /// drain worker must make that discard durable together with the new
+    /// event (see [`crate::EventSink::persist_discarding`]).
+    ///
+    /// [`add_operation_certified`]: Self::add_operation_certified
+    /// [`add_operation_reserved_certified`]: Self::add_operation_reserved_certified
+    pub(crate) fn append_recorded(
+        &self,
+        operation: Operation,
+        author: Author,
+        branch_id: BranchId,
+        reserved: Option<u64>,
+        certificate: Option<&crate::event_certificate::EventCertificate>,
+    ) -> TimelineResult<(EventId, Option<RedoTailDiscard>)> {
+        self.append_internal(operation, author, branch_id, reserved, certificate)
     }
 
     /// Clone of the raw sequence-counter handle, for a caller that needs to
@@ -362,6 +415,13 @@ impl Timeline {
     /// visible (the `add_operation_certified` contract); `None` stores no
     /// certificate. No `.await` occurs — every store is interior-mutable —
     /// so the async wrappers delegate here synchronously.
+    ///
+    /// A NEW operation on a branch with a redo tail (an applied head short of
+    /// its history, see [`Self::set_applied_head`]) discards that tail for
+    /// good before the event is inserted — the standard editor model: once
+    /// you do something new after an undo, the undone operations cannot be
+    /// redone. The discard is returned so a durable caller can remove the
+    /// same thing from the store.
     fn append_internal(
         &self,
         operation: Operation,
@@ -369,7 +429,7 @@ impl Timeline {
         branch_id: BranchId,
         reserved: Option<u64>,
         certificate: Option<&crate::event_certificate::EventCertificate>,
-    ) -> TimelineResult<EventId> {
+    ) -> TimelineResult<(EventId, Option<RedoTailDiscard>)> {
         // ---- Validation phase (no mutation) ---------------------------
         let branch_ref = self
             .branches
@@ -407,6 +467,10 @@ impl Timeline {
         let (inputs, outputs) = self.lineage_channels(&operation)?;
 
         // ---- Mutation phase -------------------------------------------
+        // A redo tail cannot outlive a new operation: drop it first, by the
+        // same plan a truncate at the tail's first entry applies.
+        let discarded = self.discard_redo_tail(branch_id)?;
+
         // Allocate the sequence number only after validation. This means
         // a rejected append no longer creates a gap in the global
         // sequence space, which keeps `validate()`'s contiguity check
@@ -472,7 +536,7 @@ impl Timeline {
         self.active_operations
             .insert(event_id, OperationState::Validating);
 
-        Ok(event_id)
+        Ok((event_id, discarded))
     }
 
     /// Add one event to the entity→events index.
@@ -1134,6 +1198,182 @@ impl Timeline {
         Ok(())
     }
 
+    /// The applied head of `branch_id` when it has a redo tail: the count of
+    /// its history, in sequence order, the document holds applied (the
+    /// events past it were undone and can be redone). `None` when the whole
+    /// history is applied — every branch's state until an undo moves it.
+    pub fn applied_head(&self, branch_id: &BranchId) -> Option<EventIndex> {
+        self.applied_heads.get(branch_id).map(|head| *head)
+    }
+
+    /// The count of `branch_id`'s history the document holds applied: its
+    /// [applied head](Self::applied_head), or the whole history when it has
+    /// no redo tail. A session that starts working on the branch starts
+    /// here, never past it.
+    pub fn applied_count(&self, branch_id: &BranchId) -> TimelineResult<EventIndex> {
+        let len = self
+            .branch_events
+            .get(branch_id)
+            .ok_or(TimelineError::BranchNotFound(*branch_id))?
+            .len() as u64;
+        Ok(self
+            .applied_head(branch_id)
+            .map_or(len, |head| head.min(len)))
+    }
+
+    /// Set the applied head of `branch_id` to `count` (the same count sense
+    /// as a session position). The applied head is per branch, not per
+    /// session: the document has ONE live model, and undo/redo move what it
+    /// holds. `count` equal to the history's length clears the redo tail.
+    ///
+    /// While a branch has a redo tail, the next operation appended to it
+    /// discards that tail for good (see [`Self::add_operation`]).
+    ///
+    /// Errors: `BranchNotFound`; `InvalidOperation` when `count` exceeds the
+    /// branch's history (nothing is changed).
+    pub fn set_applied_head(&self, branch_id: BranchId, count: EventIndex) -> TimelineResult<()> {
+        let len = self
+            .branch_events
+            .get(&branch_id)
+            .ok_or(TimelineError::BranchNotFound(branch_id))?
+            .len() as u64;
+        if count > len {
+            return Err(TimelineError::InvalidOperation(format!(
+                "applied head {} exceeds branch length {} on {}",
+                count, len, branch_id
+            )));
+        }
+        if count == len {
+            self.applied_heads.remove(&branch_id);
+        } else {
+            self.applied_heads.insert(branch_id, count);
+        }
+        Ok(())
+    }
+
+    /// `branch_id`'s applied head as a STATE that survives later appends:
+    /// `None` — no redo tail (the whole history is applied); `Some(None)` —
+    /// nothing applied; `Some(Some(seq))` — applied through sequence `seq`.
+    /// Restore it with [`Self::restore_applied_head_state`], never with a
+    /// count read before the history changed.
+    pub fn applied_head_state(&self, branch_id: &BranchId) -> TimelineResult<Option<Option<u64>>> {
+        match self.applied_head(branch_id) {
+            None => Ok(None),
+            Some(count) => self.applied_head_sequence(branch_id, count).map(Some),
+        }
+    }
+
+    /// Put back an applied head read with [`Self::applied_head_state`]:
+    /// `None` clears it; otherwise the head covers exactly the history
+    /// entries at or below the recorded sequence, counted against the
+    /// history as it is NOW.
+    pub fn restore_applied_head_state(
+        &self,
+        branch_id: BranchId,
+        state: Option<Option<u64>>,
+    ) -> TimelineResult<()> {
+        match state {
+            None => {
+                self.branch_event_keys_sorted(&branch_id)?;
+                self.applied_heads.remove(&branch_id);
+                Ok(())
+            }
+            Some(last) => {
+                let keys = self.branch_event_keys_sorted(&branch_id)?;
+                let count = match last {
+                    None => 0,
+                    Some(seq) => keys.iter().filter(|key| **key <= seq).count() as u64,
+                };
+                self.set_applied_head(branch_id, count)
+            }
+        }
+    }
+
+    /// A mark that moves whenever the ledger does: the next sequence number
+    /// (burned by every append and every reservation) and the number of
+    /// events held (which also moves when a reserved sequence lands or a
+    /// discard purges). A caller that decides from the ledger and acts later
+    /// compares marks to know nothing landed in between.
+    pub fn ledger_mark(&self) -> (u64, usize) {
+        (self.next_sequence_number(), self.events.len())
+    }
+
+    /// The sequence number of the last event applied when `count` events of
+    /// `branch_id`'s history (in sequence order) are applied — `None` for
+    /// `count == 0`. This is how an applied head is written down durably: a
+    /// sequence number names the same event however the history's count
+    /// later shifts.
+    ///
+    /// Errors: `BranchNotFound`; `InvalidOperation` when `count` exceeds the
+    /// branch's history.
+    pub fn applied_head_sequence(
+        &self,
+        branch_id: &BranchId,
+        count: EventIndex,
+    ) -> TimelineResult<Option<u64>> {
+        let keys = self.branch_event_keys_sorted(branch_id)?;
+        match (count as usize).checked_sub(1) {
+            None => Ok(None),
+            Some(last) => keys.get(last).copied().map(Some).ok_or_else(|| {
+                TimelineError::InvalidOperation(format!(
+                    "applied head {} exceeds branch length {} on {}",
+                    count,
+                    keys.len(),
+                    branch_id
+                ))
+            }),
+        }
+    }
+
+    /// Discard `branch_id`'s redo tail for good, if it has one — called by
+    /// the append path before a new event lands. The tail is removed by the
+    /// plan a truncate at the tail's first entry applies
+    /// ([`Self::truncate_plan`]): the branch loses those entries, a child
+    /// forked inside the tail loses them too and is abandoned, and an event
+    /// no history references any more leaves the event table. `main`'s
+    /// protection guards a caller-requested truncate; it does not keep an
+    /// undone operation alive past a new one.
+    fn discard_redo_tail(&self, branch_id: BranchId) -> TimelineResult<Option<RedoTailDiscard>> {
+        let Some(count) = self.applied_head(&branch_id) else {
+            return Ok(None);
+        };
+        let keys = self.branch_event_keys_sorted(&branch_id)?;
+        let Some(&cut) = keys.get(count as usize) else {
+            // The head reaches the history's end: there is no tail.
+            self.applied_heads.remove(&branch_id);
+            return Ok(None);
+        };
+        let plan = self.truncate_plan(branch_id, cut)?;
+        self.apply_truncate_plan(&plan, cut);
+        // The head stopped short of the end; it is gone with its tail.
+        self.applied_heads.remove(&branch_id);
+        let mut removed_sequences: Vec<u64> = plan.removed.iter().map(|(key, _)| *key).collect();
+        removed_sequences.sort_unstable();
+        let mut purged_sequences: Vec<u64> = plan
+            .removed
+            .iter()
+            .filter(|(_, id)| plan.purged.contains(id))
+            .map(|(key, _)| *key)
+            .collect();
+        purged_sequences.sort_unstable();
+        let branch = self
+            .branches
+            .get(&branch_id)
+            .map(|b| b.clone())
+            .ok_or(TimelineError::BranchNotFound(branch_id))?;
+        let cascaded = plan
+            .cascaded
+            .iter()
+            .filter_map(|child| self.branches.get(child).map(|b| b.clone()))
+            .collect();
+        Ok(Some(RedoTailDiscard {
+            branch,
+            removed_sequences,
+            purged_sequences,
+            cascaded,
+        }))
+    }
+
     /// Get an event by ID
     pub fn get_event(&self, event_id: EventId) -> Option<TimelineEvent> {
         self.events.get(&event_id).map(|entry| entry.clone())
@@ -1294,6 +1534,29 @@ impl Timeline {
             .ok_or(TimelineError::BranchNotFound(branch_id))?;
         for (sequence, event_id) in entries {
             index.insert(*sequence, *event_id);
+        }
+        Ok(())
+    }
+
+    /// Durability boot restore: remove `sequences` from `branch_id`'s history
+    /// index — the entries [`rehydrate_events`](Self::rehydrate_events) filed
+    /// under the branch that recorded them although that branch's durable
+    /// history discarded them (a redo tail a later operation dropped, whose
+    /// event another branch still holds). The events stay in the timeline for
+    /// the branches that hold them.
+    ///
+    /// Errors: `BranchNotFound` (nothing removed).
+    pub fn remove_branch_entries(
+        &self,
+        branch_id: BranchId,
+        sequences: &[EventIndex],
+    ) -> TimelineResult<()> {
+        let index = self
+            .branch_events
+            .get(&branch_id)
+            .ok_or(TimelineError::BranchNotFound(branch_id))?;
+        for sequence in sequences {
+            index.remove(sequence);
         }
         Ok(())
     }
@@ -2188,6 +2451,15 @@ impl Timeline {
 
         // What to remove — the ONE plan the pre-flight simulation reads too.
         let plan = self.truncate_plan(branch_id, cut_index)?;
+        self.apply_truncate_plan(&plan, cut_index);
+        Ok(plan.removed.len())
+    }
+
+    /// Apply a [`TruncatePlan`] computed for a cut at `cut_index` — the
+    /// mutation half of [`Self::truncate_branch`], shared with the redo-tail
+    /// discard of an append ([`Self::discard_redo_tail`]).
+    fn apply_truncate_plan(&self, plan: &TruncatePlan, cut_index: EventIndex) {
+        let branch_id = plan.branch;
         let to_remove = &plan.removed;
         let cascaded_children = &plan.cascaded;
 
@@ -2272,7 +2544,14 @@ impl Timeline {
             }
         }
 
-        Ok(to_remove.len())
+        // The applied heads follow the same clamp; a head that now reaches
+        // its branch's end is no redo tail any more.
+        let mut heads = vec![(branch_id, truncated_len)];
+        heads.extend(child_lens.iter().map(|(b, len)| (*b, *len)));
+        for (branch, len) in heads {
+            self.applied_heads
+                .remove_if(&branch, |_, head| *head >= len);
+        }
     }
 
     /// List all branches in the timeline
@@ -3209,6 +3488,108 @@ mod tests {
                 .event_index,
             2
         );
+    }
+
+    /// Task 104: an append onto a branch whose applied head stops short of
+    /// its history discards the redo tail for good — even on protected
+    /// `main` — hands the discard back for the durable store, and leaves no
+    /// head behind. A child forked inside the tail is cascaded like a
+    /// truncate's.
+    #[tokio::test]
+    async fn an_append_past_an_applied_head_discards_the_redo_tail() {
+        let timeline = Timeline::new(TimelineConfig::default());
+        let main = BranchId::main();
+        let e0 = timeline
+            .append_recorded(dummy_create_op(), Author::System, main, None, None)
+            .unwrap()
+            .0;
+        let e1 = timeline
+            .append_recorded(dummy_create_op(), Author::System, main, None, None)
+            .unwrap()
+            .0;
+        let child = timeline
+            .create_branch(
+                "inside-the-tail".to_string(),
+                main,
+                None,
+                Author::System,
+                crate::BranchPurpose::UserExploration {
+                    description: "forked after e1".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        timeline.set_applied_head(main, 1).unwrap();
+        assert_eq!(timeline.applied_head(&main), Some(1));
+        assert_eq!(timeline.applied_count(&main).unwrap(), 1);
+
+        let (e2, discarded) = timeline
+            .append_recorded(dummy_create_op(), Author::System, main, None, None)
+            .unwrap();
+        let discard = discarded.expect("the append must discard the redo tail");
+        let e1_seq = 1;
+        assert_eq!(discard.branch.id, main);
+        assert_eq!(discard.removed_sequences, vec![e1_seq]);
+        assert_eq!(
+            discard.purged_sequences,
+            vec![e1_seq],
+            "the cascaded child loses e1 too, so nothing references it any more"
+        );
+        assert!(timeline.get_event(e1).is_none(), "e1 left the event table");
+        assert_eq!(
+            discard.cascaded.iter().map(|b| b.id).collect::<Vec<_>>(),
+            vec![child]
+        );
+        assert!(matches!(
+            discard.cascaded[0].state,
+            BranchState::Abandoned { .. }
+        ));
+        let history: Vec<EventId> = timeline
+            .get_branch_events(&main, None, None)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.id)
+            .collect();
+        assert_eq!(history, vec![e0, e2], "e1 is gone from main for good");
+        assert!(!history.contains(&e1));
+        assert_eq!(timeline.applied_head(&main), None, "no redo tail is left");
+
+        // With no head, an append discards nothing.
+        let (_, none) = timeline
+            .append_recorded(dummy_create_op(), Author::System, main, None, None)
+            .unwrap();
+        assert!(none.is_none());
+        timeline.validate().unwrap();
+    }
+
+    /// Task 104: a head at the end of the history is no redo tail; a head past
+    /// it is refused; `applied_head_sequence` names the last applied event.
+    #[tokio::test]
+    async fn applied_head_bounds_and_its_sequence() {
+        let timeline = Timeline::new(TimelineConfig::default());
+        let main = BranchId::main();
+        for _ in 0..3 {
+            timeline
+                .add_operation(dummy_create_op(), Author::System, main)
+                .await
+                .unwrap();
+        }
+        assert!(timeline.set_applied_head(main, 4).is_err());
+        assert_eq!(timeline.applied_head(&main), None);
+        timeline.set_applied_head(main, 0).unwrap();
+        assert_eq!(timeline.applied_head(&main), Some(0));
+        assert_eq!(timeline.applied_head_sequence(&main, 0).unwrap(), None);
+        assert_eq!(timeline.applied_head_sequence(&main, 2).unwrap(), Some(1));
+        timeline.set_applied_head(main, 3).unwrap();
+        assert_eq!(
+            timeline.applied_head(&main),
+            None,
+            "a head at the end clears the tail"
+        );
+        // A truncate clamps a head the same way it clamps a session.
+        timeline.set_applied_head(main, 2).unwrap();
+        timeline.truncate_branch(main, 1, true).unwrap();
+        assert_eq!(timeline.applied_head(&main), None);
     }
 
     /// Undo on a forked child branch must work even when the child's

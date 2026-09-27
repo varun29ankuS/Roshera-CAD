@@ -319,6 +319,24 @@ pub trait DatabasePersistence: Send + Sync {
     async fn save_branch(&self, branch: &BranchRecord) -> Result<(), SessionError>;
     async fn load_branches(&self, session_id: &str) -> Result<Vec<BranchRecord>, SessionError>;
 
+    /// Durability: a new operation discarded a redo tail (operations that
+    /// were undone and could still be redone). In ONE transaction: delete the
+    /// `timeline_events` rows of document `session_id` at `purged_sequences`
+    /// (events no branch history references any more), upsert every record
+    /// in `branches` exactly as [`save_branch`](Self::save_branch) does (the
+    /// branch records that now say what their histories lost), and insert
+    /// `event` — the operation that discarded the tail — exactly as
+    /// [`save_timeline_event`](Self::save_timeline_event) does, under
+    /// `session_id`. All of it lands or none of it does: on `Err` the store
+    /// still holds the document as it was before the operation.
+    async fn discard_redo_tail(
+        &self,
+        session_id: &str,
+        purged_sequences: &[i64],
+        branches: &[BranchRecord],
+        event: &TimelineEventData,
+    ) -> Result<(), SessionError>;
+
     // Durability: named checkpoints (declared design intents). The event log
     // survived a restart while the checkpoints labelling it did not — the
     // named-intent layer was the LEAST durable part of an event-sourced
@@ -1696,6 +1714,74 @@ impl DatabasePersistence for PostgresDatabase {
         Ok(rows.into_iter().map(row_to_branch_record).collect())
     }
 
+    async fn discard_redo_tail(
+        &self,
+        session_id: &str,
+        purged_sequences: &[i64],
+        branches: &[BranchRecord],
+        event: &TimelineEventData,
+    ) -> Result<(), SessionError> {
+        let fail = |stage: &str, e: sqlx::Error| SessionError::PersistenceError {
+            reason: format!("Failed to discard the redo tail ({stage}): {e}"),
+        };
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| fail("begin transaction", e))?;
+        for sequence in purged_sequences {
+            sqlx::query(
+                "DELETE FROM timeline_events WHERE session_id = $1 AND sequence_number = $2",
+            )
+            .bind(session_id)
+            .bind(sequence)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| fail("delete discarded event", e))?;
+        }
+        for branch in branches {
+            sqlx::query(
+                r#"
+                INSERT INTO durable_branches (session_id, branch_id, parent_branch_id, fork_sequence, name, data)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                ON CONFLICT (session_id, branch_id) DO UPDATE
+                    SET parent_branch_id = EXCLUDED.parent_branch_id,
+                        fork_sequence = EXCLUDED.fork_sequence,
+                        name = EXCLUDED.name,
+                        data = EXCLUDED.data
+                "#,
+            )
+            .bind(&branch.session_id)
+            .bind(&branch.branch_id)
+            .bind(&branch.parent_branch_id)
+            .bind(branch.fork_sequence)
+            .bind(&branch.name)
+            .bind(&branch.data)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| fail("save branch", e))?;
+        }
+        sqlx::query(
+            r#"
+            INSERT INTO timeline_events (id, session_id, event_type, user_id, timestamp, data, branch_id, sequence_number)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            "#,
+        )
+        .bind(&event.id)
+        .bind(session_id)
+        .bind(&event.event_type)
+        .bind(&event.user_id)
+        .bind(event.timestamp)
+        .bind(&event.data)
+        .bind(&event.branch_id)
+        .bind(event.sequence_number)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| fail("save timeline event", e))?;
+        tx.commit().await.map_err(|e| fail("commit", e))?;
+        Ok(())
+    }
+
     async fn save_checkpoint(&self, checkpoint: &CheckpointRecord) -> Result<(), SessionError> {
         sqlx::query(
             r#"
@@ -3070,6 +3156,74 @@ impl DatabasePersistence for SqliteDatabase {
         Ok(rows.into_iter().map(sqlite_row_to_branch_record).collect())
     }
 
+    async fn discard_redo_tail(
+        &self,
+        session_id: &str,
+        purged_sequences: &[i64],
+        branches: &[BranchRecord],
+        event: &TimelineEventData,
+    ) -> Result<(), SessionError> {
+        let fail = |stage: &str, e: sqlx::Error| SessionError::PersistenceError {
+            reason: format!("Failed to discard the redo tail ({stage}): {e}"),
+        };
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| fail("begin transaction", e))?;
+        for sequence in purged_sequences {
+            sqlx::query(
+                "DELETE FROM timeline_events WHERE session_id = ?1 AND sequence_number = ?2",
+            )
+            .bind(session_id)
+            .bind(sequence)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| fail("delete discarded event", e))?;
+        }
+        for branch in branches {
+            sqlx::query(
+                r#"
+                INSERT INTO durable_branches (session_id, branch_id, parent_branch_id, fork_sequence, name, data)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                ON CONFLICT (session_id, branch_id) DO UPDATE
+                    SET parent_branch_id = excluded.parent_branch_id,
+                        fork_sequence = excluded.fork_sequence,
+                        name = excluded.name,
+                        data = excluded.data
+                "#,
+            )
+            .bind(&branch.session_id)
+            .bind(&branch.branch_id)
+            .bind(&branch.parent_branch_id)
+            .bind(branch.fork_sequence)
+            .bind(&branch.name)
+            .bind(&branch.data)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| fail("save branch", e))?;
+        }
+        sqlx::query(
+            r#"
+            INSERT INTO timeline_events (id, session_id, event_type, user_id, timestamp, data, branch_id, sequence_number)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            "#,
+        )
+        .bind(&event.id)
+        .bind(session_id)
+        .bind(&event.event_type)
+        .bind(&event.user_id)
+        .bind(event.timestamp)
+        .bind(&event.data)
+        .bind(&event.branch_id)
+        .bind(event.sequence_number)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| fail("save timeline event", e))?;
+        tx.commit().await.map_err(|e| fail("commit", e))?;
+        Ok(())
+    }
+
     async fn save_checkpoint(&self, checkpoint: &CheckpointRecord) -> Result<(), SessionError> {
         sqlx::query(
             r#"
@@ -3778,6 +3932,90 @@ mod tests {
             !source.contains(catch_all),
             "a catch-all `{catch_all}` arm is back in database.rs: an unreadable role cell must \
              reach role_from_str and become a typed decode error, not a substituted Viewer"
+        );
+    }
+
+    fn fixture_event(id: &str, sequence: i64) -> TimelineEventData {
+        TimelineEventData {
+            id: id.to_string(),
+            session_id: "doc-tail".to_string(),
+            event_type: "create_box_3d".to_string(),
+            user_id: "system".to_string(),
+            timestamp: Utc::now(),
+            data: serde_json::json!({ "seq": sequence }),
+            branch_id: Some("main-branch".to_string()),
+            sequence_number: sequence,
+        }
+    }
+
+    fn fixture_branch() -> BranchRecord {
+        BranchRecord {
+            session_id: "doc-tail".to_string(),
+            branch_id: "main-branch".to_string(),
+            parent_branch_id: None,
+            fork_sequence: 0,
+            name: "main".to_string(),
+            data: serde_json::json!({ "discarded_sequences": [1] }),
+        }
+    }
+
+    async fn sequences(db: &SqliteDatabase) -> Vec<i64> {
+        db.load_all_timeline_events("doc-tail")
+            .await
+            .expect("load must succeed")
+            .into_iter()
+            .map(|row| row.sequence_number)
+            .collect()
+    }
+
+    /// Task 104: a redo-tail discard is ONE transaction. When its last write
+    /// (the new event) fails, the delete and the branch upsert before it are
+    /// rolled back: the store still holds the document as it was.
+    #[tokio::test]
+    async fn discard_redo_tail_is_all_or_nothing() {
+        let (_dir, path) = temp_db_path("discard_tail.db");
+        let db = open_sqlite(&path).await;
+        db.save_timeline_event("doc-tail", &fixture_event("e0", 0))
+            .await
+            .expect("seed e0");
+        db.save_timeline_event("doc-tail", &fixture_event("e1", 1))
+            .await
+            .expect("seed e1");
+
+        // The new event reuses e0's primary key, so its insert fails LAST.
+        let refused = db
+            .discard_redo_tail(
+                "doc-tail",
+                &[1],
+                &[fixture_branch()],
+                &fixture_event("e0", 2),
+            )
+            .await;
+        assert!(refused.is_err(), "a duplicate event id must fail the write");
+        assert_eq!(
+            sequences(&db).await,
+            vec![0, 1],
+            "the discarded row must still be there: the delete rolled back"
+        );
+        assert!(
+            db.load_branches("doc-tail").await.expect("load").is_empty(),
+            "the branch upsert must have rolled back too"
+        );
+
+        db.discard_redo_tail(
+            "doc-tail",
+            &[1],
+            &[fixture_branch()],
+            &fixture_event("e2", 2),
+        )
+        .await
+        .expect("the discard must succeed");
+        assert_eq!(sequences(&db).await, vec![0, 2], "e1 gone, e2 landed");
+        let branches = db.load_branches("doc-tail").await.expect("load");
+        assert_eq!(branches.len(), 1);
+        assert_eq!(
+            branches[0].data,
+            serde_json::json!({ "discarded_sequences": [1] })
         );
     }
 }

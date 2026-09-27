@@ -266,18 +266,216 @@ async fn ensure_session_position_at_head(
     // A new session starts at the head of the branch the live model holds
     // and records onto — never a hardcoded `main`: after a branch switch,
     // an undo planted on main would replay main into the live model while
-    // recording stayed on the switched-to branch. Count of events = head
-    // pointer (one past the last applied event). Errors here are non-fatal
-    // — an empty branch is a valid state and means `event_index = 0`,
-    // which short-circuits undo cleanly via `NoMoreUndo`.
+    // recording stayed on the switched-to branch. The head is the branch's
+    // APPLIED head (`Timeline::applied_count`): the count of events the
+    // document holds applied — the whole branch unless an undo left a redo
+    // tail, in which case the session starts where the document is, not past
+    // operations the user undid. Errors here are non-fatal — an empty branch
+    // is a valid state and means `event_index = 0`, which short-circuits undo
+    // cleanly via `NoMoreUndo`.
     let branch = state.timeline_recorder.branch_id();
-    let head_count = timeline
-        .get_branch_events(&branch, None, None)
-        .map(|events| events.len() as u64)
-        .unwrap_or(0);
+    let head_count = timeline.applied_count(&branch).unwrap_or(0);
     timeline
         .update_session_position(SessionId::new(session_uuid.to_string()), branch, head_count)
         .map_err(|e| format!("update session position: {}", e))
+}
+
+/// Before an undo/redo: put `session_uuid` at the document's applied head on
+/// the recording branch. The document has ONE live model, so what undo and
+/// redo move is the document's applied head, not a private cursor: a session
+/// whose pointer fell behind (operations recorded since it last moved, or an
+/// undo made through another session) would otherwise undo the wrong
+/// operation. A session with no position is planted there; a session
+/// positioned on ANOTHER branch is left alone, so
+/// [`session_on_recording_branch`] can refuse it, typed.
+///
+/// Returns the ledger's mark (`Timeline::ledger_mark`) read under the same
+/// guard, after the recorder drained: the undo/redo decides from the ledger
+/// as it is HERE, so its swap is refused (`history_moved`) if anything lands
+/// between this point and the swap — including the window before the
+/// rebuild reads the history.
+async fn sync_session_to_applied_head(
+    state: &AppState,
+    session_uuid: Uuid,
+) -> Result<(u64, usize), String> {
+    let _ = state.timeline_recorder.settle().await;
+    let recording = state.timeline_recorder.branch_id();
+    let timeline = state.timeline.read().await;
+    let mark = timeline.ledger_mark();
+    if let Some(position) = timeline.get_session_position(session_uuid) {
+        if position.branch_id != recording {
+            return Ok(mark);
+        }
+    }
+    let applied = timeline
+        .applied_count(&recording)
+        .map_err(|e| format!("read the applied head: {e}"))?;
+    timeline
+        .update_session_position(SessionId::new(session_uuid.to_string()), recording, applied)
+        .map_err(|e| format!("update session position: {e}"))?;
+    Ok(mark)
+}
+
+/// Under ONE timeline guard: prove the ledger is still at `mark`, then set
+/// `branch`'s applied head to `count` and read what to write down (the head
+/// by sequence and the end of its redo tail). Returns `Ok(None)` when the
+/// ledger moved (nothing set), `Ok(Some((durable, set_at)))` otherwise —
+/// `set_at` being the ledger mark right after the set.
+///
+/// One guard, no second acquisition in between: moulds and
+/// `/timeline/record` append under the timeline WRITE lock without the model
+/// lock, so a check and a set under two separate guards leave a window a
+/// queued writer is served in (tokio's `RwLock` is fair) — its operation
+/// would be appended past the check and then filed INTO the redo tail as if
+/// undone. With one guard such an append lands before the check (the
+/// undo/redo is refused, `history_moved`) or after the set (a new operation
+/// after the undo: it discards the redo tail, the editor model).
+///
+/// Called by [`replay_undo_redo`] ONLY under the model write guard,
+/// immediately before the durable write and the swap: no kernel operation
+/// runs while that guard is held, so no recorded append can act on the head
+/// before the rebuild is committed.
+async fn check_and_set_applied_head(
+    state: &AppState,
+    branch: BranchId,
+    count: u64,
+    mark: (u64, usize),
+) -> Result<Option<(Option<crate::durability::DurableHead>, (u64, usize))>, UndoRedoError> {
+    let timeline = state.timeline.read().await;
+    if timeline.ledger_mark() != mark {
+        return Ok(None);
+    }
+    timeline
+        .set_applied_head(branch, count)
+        .map_err(UndoRedoError::Timeline)?;
+    let durable = match timeline.applied_head(&branch) {
+        None => None,
+        Some(head) => Some(crate::durability::DurableHead {
+            last_applied: timeline
+                .applied_head_sequence(&branch, head)
+                .map_err(UndoRedoError::Timeline)?,
+            tail_end: timeline
+                .get_branch_head(&branch)
+                .map_err(UndoRedoError::Timeline)?,
+        }),
+    };
+    Ok(Some((durable, timeline.ledger_mark())))
+}
+
+/// Why [`replay_undo_redo`] did not make the undo/redo live.
+enum UndoReplayError {
+    /// The rebuild was refused (or could not be read); nothing moved.
+    Refused(ReplayRefusal),
+    /// The new applied head could not be written durably; nothing moved (the
+    /// in-memory head was put back to its prior state).
+    Head(UndoRedoError),
+}
+
+/// Rebuild the live model for the position an undo/redo just moved
+/// `session_uuid` to, and make that position the document's applied head —
+/// both, or neither.
+///
+/// `mark` is the ledger's mark at the moment the undo/redo decided
+/// ([`sync_session_to_applied_head`]). Under the model write guard, after the
+/// recorder drained, the ledger must still be at `mark`: an operation that
+/// landed anywhere since the decision — before the rebuild read the history
+/// or while it ran — is in the live model and the ledger but not in the
+/// rebuild, so the swap is refused (`history_moved`). Only then is the head
+/// written, in memory and durably, and the rebuild swapped in. A store
+/// failure puts the head back to `prior_head` (a state, by sequence) and
+/// swaps nothing. Because the head becomes visible only here, a concurrent
+/// append during the rebuild never sees it and discards nothing: a refusal
+/// really leaves the history intact.
+async fn replay_undo_redo(
+    state: &AppState,
+    session_uuid: Uuid,
+    mark: (u64, usize),
+    prior_head: Option<Option<u64>>,
+    op_label: &'static str,
+) -> Result<ReplayOutcome, UndoReplayError> {
+    let _ = state.timeline_recorder.settle().await;
+    let (branch_id, limit) = {
+        let timeline = state.timeline.read().await;
+        let position = timeline.get_session_position(session_uuid).ok_or_else(|| {
+            UndoReplayError::Refused(ReplayRefusal::Unavailable(
+                "session has no timeline position".to_string(),
+            ))
+        })?;
+        (position.branch_id, position.event_index)
+    };
+    let prepared = prepare_branch_replay(state, branch_id, limit as usize)
+        .await
+        .map_err(UndoReplayError::Refused)?;
+    #[cfg(test)]
+    replay_race_hook::pause(session_uuid).await;
+    let mut model_guard = state.model.write().await;
+    let _ = state.timeline_recorder.settle().await;
+    let Some((durable, set_at)) = check_and_set_applied_head(state, branch_id, limit, mark)
+        .await
+        .map_err(UndoReplayError::Head)?
+    else {
+        let now = state.timeline.read().await.ledger_mark();
+        return Err(UndoReplayError::Refused(ReplayRefusal::HistoryMoved {
+            branch: branch_id,
+            read_at: mark.0,
+            now: now.0,
+        }));
+    };
+    #[cfg(test)]
+    replay_race_hook::pause_checked(session_uuid).await;
+    // The durable write awaits I/O, so it runs outside the timeline guard;
+    // the in-memory head set above is what every concurrent appender sees
+    // meanwhile.
+    if let Err(e) = crate::durability::persist_applied_head(state, branch_id, durable).await {
+        let err = UndoRedoError::Persist {
+            op: op_label,
+            reason: e.reason(),
+        };
+        let restored = {
+            let timeline = state.timeline.read().await;
+            if timeline.ledger_mark() == set_at {
+                timeline
+                    .restore_applied_head_state(branch_id, prior_head)
+                    .map_err(|e| e.to_string())
+            } else {
+                // A mould or `/timeline/record` append landed after the set
+                // and already acted on the head (it discarded the redo tail):
+                // the ledger changed, so this is not "rolled back".
+                Err(concat!(
+                    "an operation recorded meanwhile already discarded the redo tail, so ",
+                    "the ledger changed"
+                )
+                .to_string())
+            }
+        };
+        return Err(UndoReplayError::Head(match restored {
+            Ok(()) => err,
+            Err(e) => UndoRedoError::Internal(format!(
+                concat!(
+                    "the {} could not be recorded ({}) and the applied head could not be ",
+                    "put back: {}"
+                ),
+                op_label, err, e
+            )),
+        }));
+    }
+    Ok(commit_prepared_replay(state, &mut model_guard, prepared).await)
+}
+
+/// After a refused undo/redo: put `session_uuid` back at the document's
+/// applied head (which the refusal never moved).
+async fn resync_session(
+    state: &AppState,
+    session_uuid: Uuid,
+    branch: BranchId,
+) -> Result<(), String> {
+    let timeline = state.timeline.read().await;
+    let applied = timeline
+        .applied_count(&branch)
+        .map_err(|e| format!("read the applied head: {e}"))?;
+    timeline
+        .update_session_position(SessionId::new(session_uuid.to_string()), branch, applied)
+        .map_err(|e| format!("update session position: {e}"))
 }
 
 /// Reconcile the live `BRepModel` with the session's current timeline
@@ -741,6 +939,64 @@ pub(crate) mod replay_race_hook {
             map.insert(session, gate.clone());
         }
         gate
+    }
+
+    /// The gates between an undo/redo's DECISION (the pointer move) and its
+    /// rebuild reading the history — a separate map, so a test can drive an
+    /// op into that window alone.
+    fn decided_gates() -> &'static Mutex<HashMap<Uuid, Gate>> {
+        static GATES: OnceLock<Mutex<HashMap<Uuid, Gate>>> = OnceLock::new();
+        GATES.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    /// Arm the decision gate for the next undo/redo of `session`:
+    /// `(decided, proceed)`.
+    pub(crate) fn install_decided(session: Uuid) -> Gate {
+        let gate: Gate = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+        if let Ok(mut map) = decided_gates().lock() {
+            map.insert(session, gate.clone());
+        }
+        gate
+    }
+
+    /// The gates between an undo/redo's ledger check and the moment its
+    /// applied head is set — the window a timeline-write-lock appender (a
+    /// mould, `/timeline/record`) must never slip into.
+    fn checked_gates() -> &'static Mutex<HashMap<Uuid, Gate>> {
+        static GATES: OnceLock<Mutex<HashMap<Uuid, Gate>>> = OnceLock::new();
+        GATES.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    /// Arm the check gate for the next undo/redo of `session`:
+    /// `(checked, proceed)`.
+    pub(crate) fn install_checked(session: Uuid) -> Gate {
+        let gate: Gate = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+        if let Ok(mut map) = checked_gates().lock() {
+            map.insert(session, gate.clone());
+        }
+        gate
+    }
+
+    pub(super) async fn pause_checked(session: Uuid) {
+        let gate = checked_gates()
+            .lock()
+            .ok()
+            .and_then(|mut map| map.remove(&session));
+        if let Some((checked, proceed)) = gate {
+            checked.notify_one();
+            proceed.notified().await;
+        }
+    }
+
+    pub(super) async fn pause_decided(session: Uuid) {
+        let gate = decided_gates()
+            .lock()
+            .ok()
+            .and_then(|mut map| map.remove(&session));
+        if let Some((decided, proceed)) = gate {
+            decided.notify_one();
+            proceed.notified().await;
+        }
     }
 
     pub(super) async fn pause(session: Uuid) {
@@ -3728,11 +3984,18 @@ pub enum UndoRedoError {
         reason: String,
         recording_branch: BranchId,
     },
+    /// The new applied head could not be written to durable storage, so the
+    /// undo/redo was not performed: the session's position and the
+    /// document's applied head were put back and the live model was never
+    /// touched (an undo held only in memory would come undone at the next
+    /// restart). `reason` is the store's own error.
+    Persist { op: &'static str, reason: String },
 }
 
 impl UndoRedoError {
-    /// The typed `branch_replay_refused` body of a [`Self::ReplayRefused`].
-    pub fn replay_refusal(&self) -> Option<ApiError> {
+    /// The typed body of a [`Self::ReplayRefused`] (`branch_replay_refused`)
+    /// or a [`Self::Persist`] (`durability_persist_failed`, `rolled_back`).
+    pub fn typed_error(&self) -> Option<ApiError> {
         match self {
             UndoRedoError::ReplayRefused {
                 branch,
@@ -3747,6 +4010,11 @@ impl UndoRedoError {
                 reason,
                 *recording_branch,
             )),
+            UndoRedoError::Persist { reason, .. } => Some(ApiError::durability_persist_failed(
+                "document position",
+                "store_write",
+                reason,
+            )),
             _ => None,
         }
     }
@@ -3759,6 +4027,9 @@ impl std::fmt::Display for UndoRedoError {
             UndoRedoError::Timeline(e) => write!(f, "{e}"),
             UndoRedoError::Internal(e) => write!(f, "internal error: {e}"),
             UndoRedoError::ReplayRefused { reason, .. } => write!(f, "{reason}"),
+            UndoRedoError::Persist { op, reason } => {
+                write!(f, "the {op} was not made durable: {reason}")
+            }
         }
     }
 }
@@ -3770,14 +4041,18 @@ pub async fn perform_undo(
     session_uuid: Uuid,
 ) -> Result<UndoRedoOutcome, UndoRedoError> {
     // The recorder bridge appends every kernel op under `Author::System`
-    // and never updates `session_positions`, so a freshly-connected
-    // session has no pointer to undo from. Plant one at the current
-    // head of `main` before delegating; subsequent undo/redo calls then
-    // walk the pointer the way `Timeline::undo` expects.
-    ensure_session_position_at_head(state, session_uuid)
+    // and never updates `session_positions`, so a session's pointer is
+    // absent (freshly connected) or behind (ops recorded since it moved).
+    // Put it at the document's applied head before delegating.
+    let mark = sync_session_to_applied_head(state, session_uuid)
         .await
         .map_err(UndoRedoError::SessionSeed)?;
     let before = session_on_recording_branch(state, session_uuid).await?;
+    let prior_head = {
+        let timeline = state.timeline.read().await;
+        timeline.applied_head_state(&before.0)
+    }
+    .map_err(UndoRedoError::Timeline)?;
 
     // `Timeline::undo` takes `&self` and only mutates `Arc<DashMap>` interior
     // state, so a *read* lock on the outer `RwLock<Timeline>` is sufficient
@@ -3787,8 +4062,19 @@ pub async fn perform_undo(
         timeline.undo(session_uuid).await
     }
     .map_err(UndoRedoError::Timeline)?;
+    #[cfg(test)]
+    replay_race_hook::pause_decided(session_uuid).await;
 
-    finish_undo_redo(state, session_uuid, event_id, "undo", before).await
+    finish_undo_redo(
+        state,
+        session_uuid,
+        event_id,
+        "undo",
+        before,
+        mark,
+        prior_head,
+    )
+    .await
 }
 
 /// Redo the most recently undone operation on `session_uuid`'s current
@@ -3797,12 +4083,18 @@ pub async fn perform_redo(
     state: &AppState,
     session_uuid: Uuid,
 ) -> Result<UndoRedoOutcome, UndoRedoError> {
-    // Same first-time seeding as the undo path — without a session
-    // position, redo would always fail with `SessionNotFound`.
-    ensure_session_position_at_head(state, session_uuid)
+    // Same seeding as the undo path — without a session position at the
+    // document's applied head, redo would fail with `SessionNotFound` or
+    // redo from the wrong place.
+    let mark = sync_session_to_applied_head(state, session_uuid)
         .await
         .map_err(UndoRedoError::SessionSeed)?;
     let before = session_on_recording_branch(state, session_uuid).await?;
+    let prior_head = {
+        let timeline = state.timeline.read().await;
+        timeline.applied_head_state(&before.0)
+    }
+    .map_err(UndoRedoError::Timeline)?;
 
     // Read lock is sufficient: `Timeline::redo` takes `&self` and mutates
     // only `Arc<DashMap>` interior state. Mirrors the undo path.
@@ -3811,8 +4103,19 @@ pub async fn perform_redo(
         timeline.redo(session_uuid).await
     }
     .map_err(UndoRedoError::Timeline)?;
+    #[cfg(test)]
+    replay_race_hook::pause_decided(session_uuid).await;
 
-    finish_undo_redo(state, session_uuid, event_id, "redo", before).await
+    finish_undo_redo(
+        state,
+        session_uuid,
+        event_id,
+        "redo",
+        before,
+        mark,
+        prior_head,
+    )
+    .await
 }
 
 /// The session's position before an undo/redo moves it — refusing, typed,
@@ -3855,8 +4158,10 @@ async fn finish_undo_redo(
     state: &AppState,
     session_uuid: Uuid,
     event_id: EventId,
-    op_label: &str,
+    op_label: &'static str,
     before: (BranchId, u64),
+    mark: (u64, usize),
+    prior_head: Option<Option<u64>>,
 ) -> Result<UndoRedoOutcome, UndoRedoError> {
     // Snapshot the event details we need for the response under a short
     // read lock so the timeline lock is released before we reconcile the
@@ -3889,57 +4194,65 @@ async fn finish_undo_redo(
         (affected, operation_kind(&event.operation))
     };
 
-    // Reconcile the live BRepModel with the new timeline position. Drives
-    // the model back to exactly the state implied by the events up to the
-    // session's new pointer.
-    let replay_outcome = match replay_session_to_model(state, session_uuid).await {
-        Ok(outcome) => Some(outcome),
-        Err(refusal @ (ReplayRefusal::Boundary { .. } | ReplayRefusal::HistoryMoved { .. })) => {
-            let (branch, sequence, kind, reason) = refusal.typed_parts().unwrap_or((
-                before.0,
-                None,
-                String::new(),
-                refusal.to_string(),
-            ));
-            // Nothing was rebuilt; put the session's pointer back where it
-            // was so the timeline and the untouched live model agree.
-            let (before_branch, before_index) = before;
-            let restored = {
-                let timeline = state.timeline.read().await;
-                timeline.update_session_position(
-                    SessionId::new(session_uuid.to_string()),
+    // Reconcile the live BRepModel with the new timeline position and make
+    // that position the document's applied head — both, or neither
+    // (`replay_undo_redo`). On any refusal the head never moved, so the
+    // session is simply put back at it.
+    let (before_branch, _) = before;
+    let refused = |reason: String, e: String| {
+        UndoRedoError::Internal(format!(
+            concat!(
+                "{} was refused ({}) and the session position could not be put ",
+                "back: {}"
+            ),
+            op_label, reason, e
+        ))
+    };
+    let replay_outcome =
+        match replay_undo_redo(state, session_uuid, mark, prior_head, op_label).await {
+            Ok(outcome) => outcome,
+            Err(UndoReplayError::Head(err)) => {
+                if let Err(e) = resync_session(state, session_uuid, before_branch).await {
+                    return Err(refused(err.to_string(), e));
+                }
+                return Err(err);
+            }
+            Err(UndoReplayError::Refused(
+                refusal @ (ReplayRefusal::Boundary { .. } | ReplayRefusal::HistoryMoved { .. }),
+            )) => {
+                let (branch, sequence, kind, reason) = refusal.typed_parts().unwrap_or((
                     before_branch,
-                    before_index,
-                )
-            };
-            if let Err(e) = restored {
+                    None,
+                    String::new(),
+                    refusal.to_string(),
+                ));
+                if let Err(e) = resync_session(state, session_uuid, before_branch).await {
+                    return Err(refused(reason, e));
+                }
+                return Err(UndoRedoError::ReplayRefused {
+                    branch,
+                    sequence,
+                    kind,
+                    reason,
+                    recording_branch: state.timeline_recorder.branch_id(),
+                });
+            }
+            Err(UndoReplayError::Refused(err)) => {
+                tracing::error!(
+                    target: "timeline.undo_redo",
+                    session = %session_uuid,
+                    op = op_label,
+                    error = %err,
+                    "model replay could not run; nothing moved"
+                );
+                if let Err(e) = resync_session(state, session_uuid, before_branch).await {
+                    return Err(refused(err.to_string(), e));
+                }
                 return Err(UndoRedoError::Internal(format!(
-                    concat!(
-                        "{} was refused ({}) and the session position could not be put ",
-                        "back: {}"
-                    ),
-                    op_label, reason, e
+                    "{op_label}: the live model could not be rebuilt, nothing moved: {err}"
                 )));
             }
-            return Err(UndoRedoError::ReplayRefused {
-                branch,
-                sequence,
-                kind,
-                reason,
-                recording_branch: state.timeline_recorder.branch_id(),
-            });
-        }
-        Err(err) => {
-            tracing::error!(
-                target: "timeline.undo_redo",
-                session = %session_uuid,
-                op = op_label,
-                error = %err,
-                "model replay failed; clients may see stale geometry"
-            );
-            None
-        }
-    };
+        };
 
     // Broadcast to connected clients. `session_uuid.to_string()` matches
     // the pre-extraction call site exactly — the caller there always
@@ -3958,16 +4271,14 @@ async fn finish_undo_redo(
         )
         .await;
 
-    let (events_applied, events_skipped) = replay_outcome
-        .as_ref()
-        .map(|o| (o.events_applied, o.events_skipped))
-        .unwrap_or((0, 0));
+    let (events_applied, events_skipped) =
+        (replay_outcome.events_applied, replay_outcome.events_skipped);
 
     Ok(UndoRedoOutcome {
         event_id,
         entities_affected,
         operation_type: operation_type_str,
-        model_reconciled: replay_outcome.is_some(),
+        model_reconciled: true,
         events_applied,
         events_skipped,
     })
@@ -4021,10 +4332,10 @@ pub async fn undo_operation(
                 "error_code": "UNDO_ERROR"
             })))
         }
-        Err(err @ UndoRedoError::ReplayRefused { .. }) => {
+        Err(err @ (UndoRedoError::ReplayRefused { .. } | UndoRedoError::Persist { .. })) => {
             let refusal = err
-                .replay_refusal()
-                .unwrap_or_else(|| ApiError::new(ErrorCode::BranchReplayRefused, err.to_string()));
+                .typed_error()
+                .unwrap_or_else(|| ApiError::new(ErrorCode::Internal, err.to_string()));
             Ok(Json(serde_json::json!({
                 "success": false,
                 "message": refusal.error,
@@ -4394,10 +4705,10 @@ pub async fn redo_operation(
                 "error_code": "REDO_ERROR"
             })))
         }
-        Err(err @ UndoRedoError::ReplayRefused { .. }) => {
+        Err(err @ (UndoRedoError::ReplayRefused { .. } | UndoRedoError::Persist { .. })) => {
             let refusal = err
-                .replay_refusal()
-                .unwrap_or_else(|| ApiError::new(ErrorCode::BranchReplayRefused, err.to_string()));
+                .typed_error()
+                .unwrap_or_else(|| ApiError::new(ErrorCode::Internal, err.to_string()));
             Ok(Json(serde_json::json!({
                 "success": false,
                 "message": refusal.error,

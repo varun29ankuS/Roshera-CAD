@@ -76,7 +76,7 @@ pub use replay::{
     DrawingStore, ReplayBoundary, ReplayError, ReplayFailure, ReplayOutcome, FOREIGN_SOLID_INPUT,
     INTERLEAVED_FOREIGN_HISTORY,
 };
-pub use timeline::Timeline;
+pub use timeline::{RedoTailDiscard, Timeline};
 pub use types::*;
 
 /// Timeline engine configuration

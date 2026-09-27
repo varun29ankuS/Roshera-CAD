@@ -31,8 +31,8 @@ use std::sync::Arc;
 use serde::Serialize;
 use session_manager::{BranchRecord, DatabasePersistence, TimelineEventData};
 use timeline_engine::{
-    certify_rebuild, rebuild_model_from_events, recorded_solid_outputs, Author, BranchId,
-    BranchState, EventSink, Operation, TimelineEvent,
+    certify_rebuild, rebuild_model_from_events, recorded_solid_outputs, Author, Branch, BranchId,
+    BranchState, EventSink, Operation, RedoTailDiscard, TimelineEvent,
 };
 use tokio::sync::RwLock;
 use uuid::Uuid;
@@ -143,7 +143,9 @@ pub struct BranchFault {
     /// Machine-readable kind: `corrupt_event_row`, `unknown_origin_branch`,
     /// `missing_event`, `refused_by_live_quarantine`, `missing_parent_branch`,
     /// `branch_parent_cycle`, `unreadable_branch_record`,
-    /// `merge_membership_missing`, or `restore_failed`.
+    /// `merge_membership_missing`, `restore_failed`, or
+    /// `redo_tail_discard_recovered` (a correction boot applied — possibly to
+    /// the live branch — rather than a defect in what is served).
     pub kind: &'static str,
     /// Human-readable reason.
     pub reason: String,
@@ -362,6 +364,101 @@ impl EventSink for DatabaseEventSink {
             .await
             .map_err(|e| format!("save_timeline_event failed: {e}"))
     }
+
+    /// The event AND the redo tail its append discarded, in one transaction
+    /// (`DatabasePersistence::discard_redo_tail`): the purged events' rows
+    /// leave the store, the truncated branch's row loses its applied head and
+    /// records the sequences its history lost (`discarded_sequences`, which
+    /// boot subtracts), every cascaded child's row says it is abandoned and
+    /// what it lost, and the event lands. On `Err` the store still holds the
+    /// document as it was before the operation.
+    async fn persist_discarding(
+        &self,
+        event: &TimelineEvent,
+        discard: &RedoTailDiscard,
+        document: Option<&str>,
+    ) -> Result<(), String> {
+        let document_id = match document {
+            Some(bound) => bound.to_string(),
+            None => self.active_document.read().await.clone(),
+        };
+        let data = to_event_data(event, &document_id)?;
+        let existing: HashMap<String, serde_json::Value> = self
+            .database
+            .load_branches(&document_id)
+            .await
+            .map_err(|e| format!("the branch records could not be read: {e}"))?
+            .into_iter()
+            .map(|row| (row.branch_id, row.data))
+            .collect();
+        let mut records = Vec::with_capacity(1 + discard.cascaded.len());
+        for branch in std::iter::once(&discard.branch).chain(discard.cascaded.iter()) {
+            records.push(discarded_branch_record(
+                &document_id,
+                branch,
+                existing.get(&branch.id.to_string()),
+                &discard.removed_sequences,
+            )?);
+        }
+        let purged: Vec<i64> = discard
+            .purged_sequences
+            .iter()
+            .map(|seq| *seq as i64)
+            .collect();
+        self.database
+            .discard_redo_tail(&document_id, &purged, &records, &data)
+            .await
+            .map_err(|e| format!("discard_redo_tail failed: {e}"))
+    }
+}
+
+/// The `durable_branches` row of a branch a redo-tail discard changed: the
+/// live branch's identity and state, every data key the existing row already
+/// carries, the removed sequences added to `discarded_sequences`, and no
+/// applied head (the truncated branch's tail is gone; a cascaded child is
+/// abandoned).
+fn discarded_branch_record(
+    document_id: &str,
+    branch: &Branch,
+    existing: Option<&serde_json::Value>,
+    removed: &[u64],
+) -> Result<BranchRecord, String> {
+    let mut data = match existing {
+        Some(serde_json::Value::Object(map)) => map.clone(),
+        _ => serde_json::Map::new(),
+    };
+    let to_value = |value: serde_json::Result<serde_json::Value>| {
+        value.map_err(|e| format!("the branch record could not be serialized: {e}"))
+    };
+    data.insert(
+        DATA_CREATED_BY.to_string(),
+        to_value(serde_json::to_value(&branch.metadata.created_by))?,
+    );
+    data.insert(
+        DATA_STATE.to_string(),
+        to_value(serde_json::to_value(&branch.state))?,
+    );
+    let mut discarded: BTreeSet<u64> = match data.get(DATA_DISCARDED) {
+        None => BTreeSet::new(),
+        Some(v) => serde_json::from_value::<Vec<u64>>(v.clone())
+            .map_err(|e| format!("the persisted discarded sequences could not be read: {e}"))?
+            .into_iter()
+            .collect(),
+    };
+    discarded.extend(removed.iter().copied());
+    data.insert(
+        DATA_DISCARDED.to_string(),
+        serde_json::json!(discarded.into_iter().collect::<Vec<u64>>()),
+    );
+    data.remove(DATA_APPLIED_HEAD);
+    Ok(BranchRecord {
+        session_id: document_id.to_string(),
+        branch_id: branch.id.to_string(),
+        parent_branch_id: branch.parent.map(|p| p.to_string()),
+        fork_sequence: branch.fork_point.event_index as i64,
+        name: branch.name.clone(),
+        data: serde_json::Value::Object(data),
+    })
 }
 
 /// The document a write-behind from the REQUEST TASK belongs under.
@@ -466,12 +563,46 @@ pub async fn persist_branch(
 ///   the state flip and its membership effect land in ONE upsert, and a
 ///   target (usually `main`) needs no row of its own.
 ///
-/// A truncation (Task 74) extends this same blob: a per-branch cut, with the
-/// cascade-abandon of children written through [`persist_branch_transition`].
+/// - `applied_head` — `{"last_applied_sequence": <u64 | null>,
+///   "tail_end": <u64>}`: the branch has a redo tail; the document holds
+///   applied exactly the history entries at or below `last_applied_sequence`
+///   (`null`: none), and the entries above it up to `tail_end` (the branch's
+///   last entry when the head was written) can be redone. A history entry
+///   ABOVE `tail_end` proves an operation was appended after the undo, which
+///   discarded that tail even though the discard never reached this row (a
+///   failed discard write, a non-durable append such as a mould, or a head
+///   write that landed after the discard's): boot then drops the tail, serves
+///   the later operations, names the correction and writes it down (see
+///   `reconcile_stale_heads`). Absent (every row written before this key,
+///   and every branch with no redo tail): the whole history is applied — the
+///   old behaviour.
+/// - `discarded_sequences` — sequences a redo-tail discard (a new operation
+///   after an undo) dropped from this branch's history for good; boot
+///   subtracts them from whatever the other keys put in it. Absent: none.
+///
+/// A caller-requested truncation (Task 74) is still memory-only; the redo-tail
+/// discard is the one truncation written down here (see
+/// [`DatabaseEventSink`]'s `persist_discarding`).
 const DATA_CREATED_BY: &str = "created_by";
 const DATA_INHERITED: &str = "inherited_sequences";
 const DATA_STATE: &str = "state";
 const DATA_MERGED: &str = "merged_sequences";
+const DATA_APPLIED_HEAD: &str = "applied_head";
+const DATA_DISCARDED: &str = "discarded_sequences";
+/// The fields of an `applied_head` value.
+const APPLIED_HEAD_LAST: &str = "last_applied_sequence";
+const APPLIED_HEAD_TAIL_END: &str = "tail_end";
+
+/// A branch's applied head as it is written down: the last applied sequence
+/// (`None`: nothing applied) and the branch's last entry at the time — the
+/// end of the redo tail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DurableHead {
+    /// The sequence of the last applied event; `None` when none is applied.
+    pub last_applied: Option<u64>,
+    /// The sequence of the branch's last entry when the head was written.
+    pub tail_end: u64,
+}
 
 async fn save_branch_record(
     state: &AppState,
@@ -550,6 +681,89 @@ pub async fn persist_branch_transition(
     );
     if let Some(merged) = merged_sequences {
         data.insert(DATA_MERGED.to_string(), serde_json::json!(merged));
+    }
+    let record = BranchRecord {
+        session_id: document_id,
+        branch_id: branch_id.to_string(),
+        parent_branch_id: branch.parent.map(|p| p.to_string()),
+        fork_sequence: branch.fork_point.event_index as i64,
+        name: branch.name.clone(),
+        data: serde_json::Value::Object(data),
+    };
+    save_branch_record(state, &record, branch_id).await
+}
+
+/// Persist `branch_id`'s applied head — what an undo or redo just moved — so
+/// a restart serves the document exactly as the user left it: undone
+/// operations stay undone, and stay redoable.
+///
+/// `head`: `None` clears the head (the whole history is applied: no redo
+/// tail, the row reads like a row written before heads existed); `Some` —
+/// the [`DurableHead`]. Written as sequence numbers, not a count: a sequence
+/// names the same event however the history's count later shifts.
+///
+/// Same discipline as [`persist_branch_transition`]: the row is rebuilt from
+/// the live `Branch`, every data key the existing row carries is kept, and a
+/// failure is the RETURNED [`DurabilityError`] — the caller moves the head
+/// back and refuses. `Ok(())` when durability is switched off.
+pub async fn persist_applied_head(
+    state: &AppState,
+    branch_id: BranchId,
+    head: Option<DurableHead>,
+) -> Result<(), DurabilityError> {
+    if !durability_enabled() {
+        return Ok(());
+    }
+    let document_id = write_document(state).await;
+    let branch = {
+        let timeline = state.timeline.read().await;
+        timeline.get_branch(&branch_id)
+    }
+    .ok_or_else(|| DurabilityError::Missing {
+        record: "branch",
+        id: branch_id.to_string(),
+    })?;
+    let existing = state
+        .database
+        .load_branches(&document_id)
+        .await
+        .map_err(|source| DurabilityError::Store {
+            record: "branch",
+            source,
+        })?
+        .into_iter()
+        .find(|row| row.branch_id == branch_id.to_string());
+    let mut data = match existing.map(|row| row.data) {
+        Some(serde_json::Value::Object(map)) => map,
+        _ => serde_json::Map::new(),
+    };
+    let to_value = |value: serde_json::Result<serde_json::Value>| {
+        value.map_err(|source| DurabilityError::Serialize {
+            record: "branch",
+            source,
+        })
+    };
+    data.insert(
+        DATA_CREATED_BY.to_string(),
+        to_value(serde_json::to_value(&branch.metadata.created_by))?,
+    );
+    data.insert(
+        DATA_STATE.to_string(),
+        to_value(serde_json::to_value(&branch.state))?,
+    );
+    match head {
+        None => {
+            data.remove(DATA_APPLIED_HEAD);
+        }
+        Some(head) => {
+            data.insert(
+                DATA_APPLIED_HEAD.to_string(),
+                serde_json::json!({
+                    APPLIED_HEAD_LAST: head.last_applied,
+                    APPLIED_HEAD_TAIL_END: head.tail_end,
+                }),
+            );
+        }
     }
     let record = BranchRecord {
         session_id: document_id,
@@ -731,6 +945,9 @@ async fn boot_replay_inner(state: &AppState) -> DurabilityStatus {
             fork_sequence: 0,
             inherited: None,
             merged: None,
+            applied_head: None,
+            tail_end: None,
+            discarded: BTreeSet::new(),
         },
     );
     match state.database.load_branches(&document_id).await {
@@ -844,7 +1061,11 @@ async fn boot_replay_inner(state: &AppState) -> DurabilityStatus {
     // 4. Every branch's history, by the in-memory rules: the index the fork
     //    left it (persisted, or the fork rule for rows that predate that),
     //    its own events, and the sequences merges inserted into it.
-    let histories = branch_histories(&plans, &own, &mut faults);
+    let mut histories = branch_histories(&plans, &own, &mut faults);
+    // 4b. A persisted head whose redo tail an operation after it already
+    //     discarded — but whose discard never reached the store — must not
+    //     hide that operation (see `reconcile_stale_heads`).
+    reconcile_stale_heads(state, &document_id, &mut plans, &mut histories, &mut faults).await;
     let empty = BTreeSet::new();
     let live_history = histories.get(&live_branch).unwrap_or(&empty);
 
@@ -924,10 +1145,15 @@ async fn boot_replay_inner(state: &AppState) -> DurabilityStatus {
     let boundary_seq = boundary.as_ref().map(|b| b.0);
     let refused_by_live = |seq: u64| boundary_seq.is_some_and(|bound| seq >= bound);
 
-    // 6. The served set: the live history's clean prefix.
+    // 6. The served set: the live history's clean prefix, up to the live
+    //    branch's persisted applied head — operations the user undid before
+    //    the restart stay undone. The boundary above is still checked over
+    //    the WHOLE history, so a break inside the redo tail is disclosed.
+    let live_head = plans.get(&live_branch).and_then(|plan| plan.applied_head);
     let served: Vec<TimelineEvent> = live_events
         .iter()
         .filter(|e| !refused_by_live(e.sequence_number))
+        .filter(|e| within_applied_head(live_head, e.sequence_number))
         .cloned()
         .collect();
 
@@ -938,9 +1164,13 @@ async fn boot_replay_inner(state: &AppState) -> DurabilityStatus {
     //    history either. Each event is filed under the branch that recorded
     //    it; every other entry a branch's history holds (its fork prefix, its
     //    merged-in events) is then added to that branch's index.
+    // An event no history holds any more (a redo tail discarded before the
+    // restart, whose row outlived it) is not restored at all.
+    let held: HashSet<u64> = histories.values().flatten().copied().collect();
     let mut restored: Vec<TimelineEvent> = by_seq
         .values()
         .filter(|e| !(e.metadata.branch_id == live_branch && refused_by_live(e.sequence_number)))
+        .filter(|e| held.contains(&e.sequence_number))
         .cloned()
         .collect();
     restored.sort_by_key(|e| e.sequence_number);
@@ -992,6 +1222,52 @@ async fn boot_replay_inner(state: &AppState) -> DurabilityStatus {
                     None,
                     "restore_failed",
                     format!("the branch's history entries could not be restored: {e}"),
+                ));
+            }
+        }
+        // `rehydrate_events` filed every event under the branch that recorded
+        // it; an event that branch's history discarded (and another branch
+        // still holds) leaves its index again.
+        for (branch, history) in &histories {
+            let unfiled: Vec<u64> = restored_ids
+                .iter()
+                .filter(|(seq, (_, origin))| origin == branch && !history.contains(seq))
+                .map(|(seq, _)| *seq)
+                .collect();
+            if unfiled.is_empty() {
+                continue;
+            }
+            if let Err(e) = timeline.remove_branch_entries(*branch, &unfiled) {
+                faults.push(branch_fault(
+                    *branch,
+                    None,
+                    "restore_failed",
+                    format!("the branch's discarded entries could not be removed: {e}"),
+                ));
+            }
+        }
+        // Each branch's applied head, counted against the index as RESTORED
+        // (a quarantined tail is not in it): the entries at or below the
+        // persisted sequence are applied, the rest are the redo tail.
+        for (branch, plan) in &plans {
+            let Some(head) = plan.applied_head else {
+                continue;
+            };
+            let count = timeline
+                .get_branch_events_map(branch)
+                .map(|index| {
+                    index
+                        .iter()
+                        .filter(|entry| within_applied_head(Some(head), *entry.key()))
+                        .count() as u64
+                })
+                .unwrap_or(0);
+            if let Err(e) = timeline.set_applied_head(*branch, count) {
+                faults.push(branch_fault(
+                    *branch,
+                    None,
+                    "restore_failed",
+                    format!("the branch's applied head could not be restored: {e}"),
                 ));
             }
         }
@@ -1181,6 +1457,133 @@ fn parse_profile(v: &serde_json::Value) -> Option<Vec<[f64; 2]>> {
     }
 }
 
+/// Drop the redo tail of every branch whose persisted head an operation after
+/// it already discarded.
+///
+/// A head is written with the branch's last entry at the time (`tail_end`).
+/// Sequences only grow, so a history entry ABOVE `tail_end` is an operation
+/// appended after the head was written — and an append discards the redo
+/// tail. When that discard never reached the store (its write failed and was
+/// reported; the append that made it was not durable, like a mould; or the
+/// head's own write landed after the discard's), the row still says "applied
+/// through X", and boot would serve only the prefix — hiding every later
+/// operation, whose callers were told it succeeded. Instead: the entries in
+/// (X, `tail_end`] leave the branch's history, the head is cleared, the
+/// correction is named as a `redo_tail_discard_recovered` fault, and it is
+/// written down (`discarded_sequences` extended, `applied_head` removed) so
+/// the next head write cannot bring the old tail back. A failed write is a
+/// named `restore_failed` fault; the in-memory correction stands either way.
+async fn reconcile_stale_heads(
+    state: &AppState,
+    document_id: &str,
+    plans: &mut HashMap<BranchId, BranchPlan>,
+    histories: &mut HashMap<BranchId, BTreeSet<u64>>,
+    faults: &mut Vec<BranchFault>,
+) {
+    let mut corrections: Vec<(BranchId, Vec<u64>)> = Vec::new();
+    for (branch, plan) in plans.iter_mut() {
+        let (Some(head), Some(tail_end)) = (plan.applied_head, plan.tail_end) else {
+            continue;
+        };
+        let Some(history) = histories.get_mut(branch) else {
+            continue;
+        };
+        if history.range(tail_end.saturating_add(1)..).next().is_none() {
+            continue;
+        }
+        let tail: Vec<u64> = history
+            .iter()
+            .copied()
+            .filter(|seq| !within_applied_head(Some(head), *seq) && *seq <= tail_end)
+            .collect();
+        history.retain(|seq| !tail.contains(seq));
+        plan.applied_head = None;
+        plan.tail_end = None;
+        plan.discarded.extend(tail.iter().copied());
+        faults.push(branch_fault(
+            *branch,
+            None,
+            "redo_tail_discard_recovered",
+            format!(
+                concat!(
+                    "operations were recorded after the undo that left the redo tail {:?}, ",
+                    "so that tail was discarded, but the discard never reached the store; ",
+                    "the tail is dropped and every later operation is served"
+                ),
+                tail
+            ),
+        ));
+        corrections.push((*branch, tail));
+    }
+    if corrections.is_empty() {
+        return;
+    }
+    let rows = match state.database.load_branches(document_id).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            for (branch, _) in &corrections {
+                faults.push(branch_fault(
+                    *branch,
+                    None,
+                    "restore_failed",
+                    format!("the recovered redo-tail discard could not be written down: {e}"),
+                ));
+            }
+            return;
+        }
+    };
+    for (branch, tail) in corrections {
+        let Some(mut row) = rows
+            .iter()
+            .find(|row| row.branch_id == branch.to_string())
+            .cloned()
+        else {
+            continue;
+        };
+        let written = match row.data.as_object_mut() {
+            Some(data) => {
+                let mut discarded: BTreeSet<u64> = data
+                    .get(DATA_DISCARDED)
+                    .and_then(|v| serde_json::from_value::<Vec<u64>>(v.clone()).ok())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect();
+                discarded.extend(tail);
+                data.insert(
+                    DATA_DISCARDED.to_string(),
+                    serde_json::json!(discarded.into_iter().collect::<Vec<u64>>()),
+                );
+                data.remove(DATA_APPLIED_HEAD);
+                state
+                    .database
+                    .save_branch(&row)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+            None => Err("the branch record's data is not an object".to_string()),
+        };
+        if let Err(e) = written {
+            faults.push(branch_fault(
+                branch,
+                None,
+                "restore_failed",
+                format!("the recovered redo-tail discard could not be written down: {e}"),
+            ));
+        }
+    }
+}
+
+/// Whether the history entry at `sequence` is applied under a persisted
+/// applied head (`None`: no head — the whole history is applied;
+/// `Some(None)`: nothing is; `Some(Some(last))`: everything through `last`).
+fn within_applied_head(head: Option<Option<u64>>, sequence: u64) -> bool {
+    match head {
+        None => true,
+        Some(None) => false,
+        Some(Some(last)) => sequence <= last,
+    }
+}
+
 /// What boot learned from one durable branch record: everything the in-memory
 /// rules need to rebuild that branch's history index.
 struct BranchPlan {
@@ -1194,6 +1597,16 @@ struct BranchPlan {
     /// On a `Merged { into }` branch: `into` and the sequences the merge
     /// inserted into `into`'s history.
     merged: Option<(BranchId, Vec<u64>)>,
+    /// The persisted applied head (`applied_head`): `None` — no redo tail,
+    /// the whole history is applied; `Some(None)` — nothing is applied;
+    /// `Some(Some(last))` — applied through sequence `last`.
+    applied_head: Option<Option<u64>>,
+    /// The head's `tail_end` — the branch's last entry when it was written.
+    /// `None` when the row carries no head (or a head without one).
+    tail_end: Option<u64>,
+    /// Sequences a redo-tail discard dropped from this branch's history for
+    /// good (`discarded_sequences`), subtracted from it at boot.
+    discarded: BTreeSet<u64>,
 }
 
 /// Name a side-branch defect: logged loudly AND returned for the status.
@@ -1365,6 +1778,11 @@ impl HistoryWalk<'_> {
                 history.extend(sequences.iter().copied());
             }
         }
+        // A redo-tail discard removed these for good, whichever rule above
+        // put them in.
+        if let Some(plan) = self.plans.get(&id) {
+            history.retain(|seq| !plan.discarded.contains(seq));
+        }
         visiting.remove(&(id, with_merges));
         self.memo.insert((id, with_merges), history.clone());
         history
@@ -1494,6 +1912,74 @@ async fn restore_branch(
         }
         _ => None,
     };
+    // Absent: no redo tail (every row written before heads existed). Present
+    // but unreadable: named, and the whole history applied — the old
+    // behaviour — rather than a guessed position.
+    let applied_head = match record.data.get(DATA_APPLIED_HEAD) {
+        None => None,
+        Some(v) => match v
+            .get(APPLIED_HEAD_LAST)
+            .map(|last| serde_json::from_value::<Option<u64>>(last.clone()))
+        {
+            Some(Ok(last)) => Some(last),
+            Some(Err(e)) => {
+                faults.push(branch_fault(
+                    id,
+                    None,
+                    "unreadable_branch_record",
+                    format!(
+                        concat!(
+                            "the persisted applied head could not be read, the whole ",
+                            "history is applied: {}"
+                        ),
+                        e
+                    ),
+                ));
+                None
+            }
+            None => {
+                faults.push(branch_fault(
+                    id,
+                    None,
+                    "unreadable_branch_record",
+                    format!(
+                        concat!(
+                            "the persisted applied head names no {}, the whole history ",
+                            "is applied"
+                        ),
+                        APPLIED_HEAD_LAST
+                    ),
+                ));
+                None
+            }
+        },
+    };
+    let tail_end = record
+        .data
+        .get(DATA_APPLIED_HEAD)
+        .and_then(|v| v.get(APPLIED_HEAD_TAIL_END))
+        .and_then(serde_json::Value::as_u64);
+    let discarded: BTreeSet<u64> = match record.data.get(DATA_DISCARDED) {
+        None => BTreeSet::new(),
+        Some(v) => match serde_json::from_value::<Vec<u64>>(v.clone()) {
+            Ok(seqs) => seqs.into_iter().collect(),
+            Err(e) => {
+                faults.push(branch_fault(
+                    id,
+                    None,
+                    "unreadable_branch_record",
+                    format!(
+                        concat!(
+                            "the persisted discarded sequences could not be read, none ",
+                            "are subtracted: {}"
+                        ),
+                        e
+                    ),
+                ));
+                BTreeSet::new()
+            }
+        },
+    };
     let fork_sequence = record.fork_sequence.max(0) as u64;
     let timeline = state.timeline.read().await;
     timeline.rehydrate_branch(id, record.name.clone(), parent, fork_sequence, created_by);
@@ -1512,6 +1998,9 @@ async fn restore_branch(
             fork_sequence,
             inherited,
             merged,
+            applied_head,
+            tail_end,
+            discarded,
         },
     ))
 }
