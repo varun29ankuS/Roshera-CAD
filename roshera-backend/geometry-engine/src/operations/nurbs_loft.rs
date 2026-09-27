@@ -103,6 +103,10 @@ pub fn nurbs_loft(
     // ---- the skinned lateral surface (periodic in U, clamped in V). ----
     let surf: NurbsSurface = skin_surface_periodic_u(&sections, degree_v)
         .map_err(|e| OperationError::NumericalError(format!("nurbs_loft skin: {e}")))?;
+    let section_points: Vec<Vec<[f64; 3]>> = sections
+        .iter()
+        .map(|ring| ring.iter().map(|p| [p.x, p.y, p.z]).collect())
+        .collect();
 
     lifecycle::with_rollback(model, move |model| {
         let tol = Tolerance::default();
@@ -292,6 +296,8 @@ pub fn nurbs_loft(
             }
         }
 
+        // `section_points` carries the rings themselves: the loft consumes no
+        // model entity, so the rings ARE the recipe a replay rebuilds from.
         model.record_operation(
             crate::operations::recorder::RecordedOperation::new("nurbs_loft")
                 .with_parameters(serde_json::json!({
@@ -299,6 +305,7 @@ pub fn nurbs_loft(
                     "ring_points": ring_len,
                     "degree_u": 3, // periodic-cubic U
                     "degree_v": degree_v,
+                    "section_points": section_points,
                 }))
                 .with_output_solids([solid_id as u64]),
         );

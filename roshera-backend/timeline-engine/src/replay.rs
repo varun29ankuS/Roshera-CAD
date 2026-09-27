@@ -44,6 +44,13 @@
 //!   legacy `revolve_face` event, whose `face_id` names a never-recorded
 //!   internal profile face, is fail-loud: it dangles (quarantines) rather than
 //!   revolve a coincidentally-numbered live face.
+//! - **Self-contained creators** (Task 101): `extrude_polygon` (the polygon
+//!   `POST /api/geometry/extrude` records in place of its transient profile
+//!   face), `nurbs_loft` (its recorded `section_points`), `create_torus_3d`;
+//!   plus `offset_solid` (shell), the `datum_*` family and `solid_reanchor`
+//!   (anchor metadata only — its move is the preceding `transform_solid`).
+//!   The test `every_recorded_kind_has_a_replay_arm` fails when production
+//!   code records a kind with no arm here.
 //! - **Lossy-record ops**: `sweep_profile` and `loft_profiles` are
 //!   skipped with a structured error because the kernel currently records
 //!   profile *edges*, not the parent profile *face* — which is what the
@@ -957,6 +964,31 @@ fn dispatch_generic(
             stamp_outputs(geometry_id_to_u64(id), &recorded_outputs, id_remap);
             Ok(())
         }
+        // `POST /api/geometry` (`shape_type: "torus"`) and the WS create
+        // record the torus through `record_and_push`; the axis is recorded
+        // already normalised, so the replayed torus is the live one.
+        "create_torus_3d" => {
+            let params = extract_create_params(inner, "Create3D")?;
+            let cx = num_field(params, "center_x", kind)?;
+            let cy = num_field(params, "center_y", kind)?;
+            let cz = num_field(params, "center_z", kind)?;
+            let ax = num_field(params, "axis_x", kind)?;
+            let ay = num_field(params, "axis_y", kind)?;
+            let az = num_field(params, "axis_z", kind)?;
+            let major = num_field(params, "major_radius", kind)?;
+            let minor = num_field(params, "minor_radius", kind)?;
+            let mut builder = TopologyBuilder::new(model);
+            let id = builder
+                .create_torus_3d(
+                    Point3::new(cx, cy, cz),
+                    Vector3::new(ax, ay, az),
+                    major,
+                    minor,
+                )
+                .map_err(|e| kernel_err(kind, &e))?;
+            stamp_outputs(geometry_id_to_u64(id), &recorded_outputs, id_remap);
+            Ok(())
+        }
         "create_plane_3d" => {
             let params = extract_create_params(inner, "Create3D")?;
             let ox = num_field(params, "origin_x", kind)?;
@@ -1238,6 +1270,304 @@ fn dispatch_generic(
                     reason: "missing/malformed sketch_revolve payload".to_string(),
                 }),
             }
+        }
+
+        // `POST /api/geometry/extrude`: the polygon itself, recorded by the
+        // handler in place of the kernel's `extrude_face` on the transient
+        // profile face. Rebuilt through the same kernel entry the handler
+        // calls. (Events that route recorded before it did are `extrude_face`
+        // on that transient face, which no replay can resolve.)
+        "extrude_polygon" => {
+            let profile: Vec<Point3> = inner
+                .get("profile")
+                .cloned()
+                .and_then(|v| serde_json::from_value::<Vec<[f64; 3]>>(v).ok())
+                .map(|pts| pts.iter().map(|p| Point3::new(p[0], p[1], p[2])).collect())
+                .ok_or_else(|| ReplayError::InvalidParameters {
+                    kind: kind.to_string(),
+                    reason: "missing/malformed `profile` [[x, y, z], ...]".to_string(),
+                })?;
+            let direction =
+                vec3_field(inner, "direction").ok_or_else(|| ReplayError::InvalidParameters {
+                    kind: kind.to_string(),
+                    reason: "missing or malformed `direction` [x, y, z]".to_string(),
+                })?;
+            let distance = num_field(inner, "distance", kind)?;
+            let options = ExtrudeOptions {
+                direction,
+                distance,
+                ..ExtrudeOptions::default()
+            };
+            let new_solid = geometry_engine::operations::extrude::extrude_polygon(
+                model,
+                &profile,
+                options,
+                geometry_engine::math::Tolerance::default(),
+            )
+            .map_err(|e| kernel_err(kind, &e))?;
+            stamp_outputs(new_solid as u64, &recorded_outputs, id_remap);
+            Ok(())
+        }
+
+        // `POST /api/geometry/nurbs_loft`: the loft consumes no model entity,
+        // so its recorded section rings ARE the recipe. A loft recorded before
+        // the rings were (`section_points` absent) cannot be rebuilt and is
+        // refused naming the field — never re-skinned through guessed rings.
+        "nurbs_loft" => {
+            let rings =
+                inner
+                    .get("section_points")
+                    .ok_or_else(|| ReplayError::InvalidParameters {
+                        kind: kind.to_string(),
+                        reason: concat!(
+                            "missing `section_points`: this loft was recorded before its ",
+                            "section rings were, so it cannot be rebuilt"
+                        )
+                        .to_string(),
+                    })?;
+            let sections: Vec<Vec<Point3>> =
+                serde_json::from_value::<Vec<Vec<[f64; 3]>>>(rings.clone())
+                    .map_err(|e| ReplayError::InvalidParameters {
+                        kind: kind.to_string(),
+                        reason: format!("malformed `section_points`: {e}"),
+                    })?
+                    .iter()
+                    .map(|ring| ring.iter().map(|p| Point3::new(p[0], p[1], p[2])).collect())
+                    .collect();
+            let degree = |key: &str| -> Result<usize, ReplayError> {
+                inner
+                    .get(key)
+                    .and_then(|v| v.as_u64())
+                    .map(|d| d as usize)
+                    .ok_or_else(|| ReplayError::InvalidParameters {
+                        kind: kind.to_string(),
+                        reason: format!("missing or non-integer `{key}`"),
+                    })
+            };
+            let options = geometry_engine::operations::nurbs_loft::NurbsLoftOptions {
+                degree_u: degree("degree_u")?,
+                degree_v: degree("degree_v")?,
+                ..Default::default()
+            };
+            let new_solid =
+                geometry_engine::operations::nurbs_loft::nurbs_loft(model, sections, options)
+                    .map_err(|e| kernel_err(kind, &e))?;
+            stamp_outputs(new_solid as u64, &recorded_outputs, id_remap);
+            Ok(())
+        }
+
+        // `POST /api/geometry/shell` (and the AI executor's shell): hollow a
+        // solid, opening `faces_to_remove`. The recorded list is the opening
+        // AFTER the kernel's coplanar expansion, which re-expands to itself.
+        // Faces are resolved by their raw recorded id (faces never enter the
+        // remap), exact on a full replay; a subset replay refuses this event
+        // through `raw_topology_references` instead. `intersection_handling`
+        // absent (recorded before the field was) is `Trim`: every production
+        // caller of `offset_solid` has always passed `Trim`.
+        "offset_solid" => {
+            use geometry_engine::operations::offset::{
+                offset_solid, IntersectionHandling, OffsetOptions, OffsetType,
+            };
+            let solid_raw = num_field(inner, "solid_id", kind)? as u64;
+            let solid = remap_id(solid_raw, id_remap) as SolidId;
+            let thickness = num_field(inner, "thickness", kind)?;
+            let max_deviation = num_field(inner, "max_deviation", kind)?;
+            let faces: Vec<FaceId> = inner
+                .get("faces_to_remove")
+                .and_then(|v| v.as_array())
+                .ok_or_else(|| ReplayError::InvalidParameters {
+                    kind: kind.to_string(),
+                    reason: "missing `faces_to_remove`".to_string(),
+                })?
+                .iter()
+                .map(|v| {
+                    v.as_u64()
+                        .map(|id| remap_id(id, id_remap) as FaceId)
+                        .ok_or_else(|| ReplayError::InvalidParameters {
+                            kind: kind.to_string(),
+                            reason: format!("`faces_to_remove` entry {v} is not a face id"),
+                        })
+                })
+                .collect::<Result<_, _>>()?;
+            let intersection_handling = match inner.get("intersection_handling").map(|v| v.as_str())
+            {
+                None => IntersectionHandling::Trim,
+                Some(Some("Trim")) => IntersectionHandling::Trim,
+                Some(Some("Keep")) => IntersectionHandling::Keep,
+                Some(Some("Fail")) => IntersectionHandling::Fail,
+                Some(other) => {
+                    return Err(ReplayError::InvalidParameters {
+                        kind: kind.to_string(),
+                        reason: format!("unknown `intersection_handling` {other:?}"),
+                    });
+                }
+            };
+            let options = OffsetOptions {
+                offset_type: OffsetType::Distance(thickness),
+                intersection_handling,
+                max_deviation,
+                ..OffsetOptions::default()
+            };
+            let new_solid = offset_solid(model, solid, thickness, faces, options)
+                .map_err(|e| kernel_err(kind, &e))?;
+            stamp_outputs(new_solid as u64, &recorded_outputs, id_remap);
+            Ok(())
+        }
+
+        // ----------------------------------------------------------------
+        // Datums (`/api/datums*`). Datums live in the model, and anchors and
+        // derived datums read them, so each event re-runs its mediator. The
+        // store hands out ids in creation order, so a faithful replay
+        // re-issues the recorded id; a different id means the replayed
+        // history is not the recorded one and is refused, never renumbered.
+        // ----------------------------------------------------------------
+        "datum_create" => {
+            use geometry_engine::primitives::datum::AxisDirection;
+            let recorded_id = datum_id_field(inner, "datum_id", kind)?;
+            let name = str_field(inner, "name", kind)?.to_string();
+            let created = match str_field(inner, "kind", kind)? {
+                "plane" => {
+                    let rows = rows4_field(inner, "transform", kind)?;
+                    model.create_datum_plane(name, Matrix4::from_rows_array(rows))
+                }
+                "axis" => {
+                    let origin = vec3_field(inner, "origin").ok_or_else(|| {
+                        ReplayError::InvalidParameters {
+                            kind: kind.to_string(),
+                            reason: "missing or malformed `origin` [x, y, z]".to_string(),
+                        }
+                    })?;
+                    let direction = match str_field(inner, "direction", kind)? {
+                        "x" => AxisDirection::X,
+                        "y" => AxisDirection::Y,
+                        "z" => AxisDirection::Z,
+                        other => {
+                            return Err(ReplayError::InvalidParameters {
+                                kind: kind.to_string(),
+                                reason: format!(
+                                    "axis direction `{other}` carries no recorded vector"
+                                ),
+                            });
+                        }
+                    };
+                    model.create_datum_axis(
+                        name,
+                        Point3::new(origin.x, origin.y, origin.z),
+                        direction,
+                    )
+                }
+                "point" => {
+                    let p = vec3_field(inner, "position").ok_or_else(|| {
+                        ReplayError::InvalidParameters {
+                            kind: kind.to_string(),
+                            reason: "missing or malformed `position` [x, y, z]".to_string(),
+                        }
+                    })?;
+                    model.create_datum_point(name, Point3::new(p.x, p.y, p.z))
+                }
+                other => {
+                    return Err(ReplayError::InvalidParameters {
+                        kind: kind.to_string(),
+                        reason: format!("unknown datum kind `{other}`"),
+                    });
+                }
+            }
+            .map_err(|e| kernel_err(kind, &e))?;
+            same_datum_id(kind, recorded_id, created)
+        }
+        // A derived datum re-evaluates its recorded recipe against the
+        // rebuilt model (the recipe, not the baked frame, is the durable
+        // fact). Its vertex/edge/face references are raw recorded ids — see
+        // `raw_topology_references`.
+        "datum_create_derived" => {
+            let recorded_id = datum_id_field(inner, "datum_id", kind)?;
+            let name = str_field(inner, "name", kind)?.to_string();
+            let source: geometry_engine::primitives::datum::DatumSource = inner
+                .get("source")
+                .cloned()
+                .and_then(|v| serde_json::from_value(v).ok())
+                .ok_or_else(|| ReplayError::InvalidParameters {
+                    kind: kind.to_string(),
+                    reason: "missing or malformed `source` recipe".to_string(),
+                })?;
+            let created = model
+                .create_derived_datum(name, source)
+                .map_err(|e| kernel_err(kind, &e))?;
+            same_datum_id(kind, recorded_id, created)
+        }
+        "datum_rename" => {
+            let id = datum_id_field(inner, "datum_id", kind)?;
+            let name = str_field(inner, "name", kind)?.to_string();
+            model
+                .rename_datum(id, name)
+                .map(|_| ())
+                .map_err(|e| kernel_err(kind, &e))
+        }
+        "datum_set_transform" => {
+            let id = datum_id_field(inner, "datum_id", kind)?;
+            let rows = rows4_field(inner, "transform", kind)?;
+            model
+                .set_datum_transform(id, Matrix4::from_rows_array(rows))
+                .map(|_| ())
+                .map_err(|e| kernel_err(kind, &e))
+        }
+        "datum_set_visibility" => {
+            let id = datum_id_field(inner, "datum_id", kind)?;
+            let visible = inner
+                .get("visible")
+                .and_then(|v| v.as_bool())
+                .ok_or_else(|| ReplayError::InvalidParameters {
+                    kind: kind.to_string(),
+                    reason: "missing or non-boolean `visible`".to_string(),
+                })?;
+            model
+                .set_datum_visibility(id, visible)
+                .map(|_| ())
+                .ok_or_else(|| ReplayError::DanglingReference {
+                    kind: kind.to_string(),
+                    entity: format!("datum:{id}"),
+                })
+        }
+        "datum_delete" => {
+            let id = datum_id_field(inner, "datum_id", kind)?;
+            model
+                .delete_datum(id)
+                .map(|_| ())
+                .map_err(|e| kernel_err(kind, &e))
+        }
+
+        // `POST /api/agent/parts/{id}/reanchor`: the geometry move is the
+        // `transform_solid` event `anchor_solid` recorded just before this
+        // one, so this arm restores ONLY the anchor (datum + applied local
+        // frame) — re-running `reanchor_solid` would move the solid twice. An
+        // event recorded before `local_transform` was is refused naming it:
+        // the preserved local frame it relied on is not recoverable.
+        "solid_reanchor" => {
+            let solid_raw = num_field(inner, "solid_id", kind)? as u64;
+            let solid = remap_id(solid_raw, id_remap) as SolidId;
+            let datum = datum_id_field(inner, "new_datum_id", kind)?;
+            if inner.get("local_transform").is_none() {
+                return Err(ReplayError::InvalidParameters {
+                    kind: kind.to_string(),
+                    reason: concat!(
+                        "missing `local_transform`: this re-anchor was recorded before ",
+                        "the applied local frame was, so the anchor cannot be restored"
+                    )
+                    .to_string(),
+                });
+            }
+            let rows = rows4_field(inner, "local_transform", kind)?;
+            if model.datums.get(datum).is_none() {
+                return Err(ReplayError::DanglingReference {
+                    kind: kind.to_string(),
+                    entity: format!("datum:{datum}"),
+                });
+            }
+            model
+                .set_solid_anchor(solid, datum, Matrix4::from_rows_array(rows))
+                .map_err(|e| kernel_err(kind, &e))?;
+            stamp_outputs(solid as u64, &recorded_outputs, id_remap);
+            Ok(())
         }
 
         "boolean_union" | "boolean_intersection" | "boolean_difference" => {
@@ -1902,6 +2232,24 @@ fn dispatch_generic(
             Ok(())
         }
 
+        // The WS `ExecuteOperation` command appends the client's description
+        // of an operation to main as `timeline_operation` and executes
+        // NOTHING against the kernel — the handler only writes the event. Its
+        // model effect is therefore nil by construction, and replaying it as
+        // anything but a validated no-op would build geometry the live model
+        // never had. Classified here (like the csketch design-history
+        // records) so it does not fall to `UnknownKind` and refuse every
+        // undo/redo/replay of main that covers it.
+        "timeline_operation" => {
+            if !inner.is_object() {
+                return Err(ReplayError::InvalidParameters {
+                    kind: kind.to_string(),
+                    reason: "payload is not an object".to_string(),
+                });
+            }
+            Ok(())
+        }
+
         // DURABILITY Slice 3 (#39, spec §2.3) — durable part display name.
         // `rename_part_by_uuid` and `persist_display_name` append a `set_name`
         // event: `inputs[0]` = `solid:<id>` (the named solid), `params.name` =
@@ -1989,6 +2337,52 @@ fn num_field(v: &Value, name: &str, kind: &str) -> Result<f64, ReplayError> {
             kind: kind.to_string(),
             reason: format!("missing or non-numeric field `{}`", name),
         })
+}
+
+fn str_field<'a>(v: &'a Value, name: &str, kind: &str) -> Result<&'a str, ReplayError> {
+    v.get(name)
+        .and_then(|x| x.as_str())
+        .ok_or_else(|| ReplayError::InvalidParameters {
+            kind: kind.to_string(),
+            reason: format!("missing or non-string field `{}`", name),
+        })
+}
+
+/// A recorded datum id (`u32` in the store).
+fn datum_id_field(v: &Value, name: &str, kind: &str) -> Result<u32, ReplayError> {
+    v.get(name)
+        .and_then(|x| x.as_u64())
+        .and_then(|id| u32::try_from(id).ok())
+        .ok_or_else(|| ReplayError::InvalidParameters {
+            kind: kind.to_string(),
+            reason: format!("missing or invalid datum id `{}`", name),
+        })
+}
+
+/// A recorded row-major 4x4 matrix (`[[f64; 4]; 4]`).
+fn rows4_field(v: &Value, name: &str, kind: &str) -> Result<[[f64; 4]; 4], ReplayError> {
+    v.get(name)
+        .cloned()
+        .and_then(|x| serde_json::from_value(x).ok())
+        .ok_or_else(|| ReplayError::InvalidParameters {
+            kind: kind.to_string(),
+            reason: format!("missing or malformed row-major 4x4 `{}`", name),
+        })
+}
+
+/// A replayed datum creation must re-issue the id the live creation got;
+/// anything else means the replayed history is not the recorded one.
+fn same_datum_id(kind: &str, recorded: u32, replayed: u32) -> Result<(), ReplayError> {
+    if recorded == replayed {
+        Ok(())
+    } else {
+        Err(ReplayError::KernelError {
+            kind: kind.to_string(),
+            message: format!(
+                "replay issued datum id {replayed} where the recorded history issued {recorded}"
+            ),
+        })
+    }
 }
 
 fn vec3_field(v: &Value, name: &str) -> Option<Vector3> {
@@ -2265,9 +2659,12 @@ fn bind_blend_edges(
 /// This mirrors the dispatch arms that resolve faces/edges through
 /// `remap_id`: `extrude_face`, `revolve_face`, `transform_faces`,
 /// `transform_edges`, `fillet_edges` / `chamfer_edges` (PID-less edges only),
-/// `sweep_profile` and `loft_profiles` — the [`RAW_FACE_EDGE_ARMS`] list. The
+/// `sweep_profile`, `loft_profiles` and `offset_solid` (its opened faces), plus
+/// `datum_create_derived`, whose recorded `DatumSource` recipe names vertices,
+/// edges and faces by raw id — the [`RAW_FACE_EDGE_ARMS`] list. The
 /// structural test `raw_reference_mirrors_match_the_dispatch_arms` fails when
-/// a dispatch arm gains a face/edge remap without being listed there.
+/// a dispatch arm gains a face/edge remap (or a recipe read) without being
+/// listed there.
 pub fn raw_topology_references(event: &TimelineEvent) -> Vec<String> {
     let Operation::Generic {
         command_type,
@@ -2297,8 +2694,12 @@ pub fn raw_topology_references(event: &TimelineEvent) -> Vec<String> {
             .and_then(|v| v.as_f64())
             .map(|id| vec![format!("face:{}", id as u64)])
             .unwrap_or_default(),
-        "transform_faces" => refs_of("face", &inputs),
+        "transform_faces" | "offset_solid" => refs_of("face", &inputs),
         "transform_edges" | "sweep_profile" | "loft_profiles" => refs_of("edge", &inputs),
+        "datum_create_derived" => ["vertex", "edge", "face"]
+            .iter()
+            .flat_map(|k| refs_of(k, &inputs))
+            .collect(),
         "fillet_edges" | "chamfer_edges" => {
             let pids = parse_recorded_edge_pids(inner);
             inputs
@@ -2328,6 +2729,8 @@ pub const RAW_FACE_EDGE_ARMS: &[&str] = &[
     "loft_profiles",
     "fillet_edges",
     "chamfer_edges",
+    "offset_solid",
+    "datum_create_derived",
 ];
 
 /// The `params` keys under which `dispatch_generic` arms (and
@@ -4177,6 +4580,22 @@ mod tests {
                 "{kind} is listed as a raw face/edge arm but the mirror names nothing for it"
             );
         }
+
+        // A derived datum's recipe may name only vertices (three-point
+        // plane); those raw ids shift under an interleaved history too.
+        let derived = mk_event(
+            "datum_create_derived",
+            serde_json::json!({
+                "params": { "source": { "kind": "three_points", "p0": 4, "p1": 5, "p2": 6 } },
+                "inputs": ["vertex:4", "vertex:5", "vertex:6"],
+                "outputs": ["datum:7"]
+            }),
+        );
+        assert_eq!(
+            raw_topology_references(&derived),
+            vec!["vertex:4", "vertex:5", "vertex:6"],
+            "a derived datum's vertex references are raw references"
+        );
     }
 
     /// Solid inputs come from the `SOLID_PARAM_KEYS` params and the recorded
@@ -4208,8 +4627,9 @@ mod tests {
     /// Structural drift gate for the raw-reference mirrors. `dispatch_generic`
     /// is split into its match arms (headers at the arm indentation, so
     /// nested matches and line-wrapping do not matter):
-    /// - the arms that cast a remapped id `as FaceId` / `as EdgeId` must be
-    ///   exactly `RAW_FACE_EDGE_ARMS`;
+    /// - the arms that cast a remapped id `as FaceId` / `as EdgeId`, or read
+    ///   a `DatumSource` recipe (raw vertex/edge/face ids), must be exactly
+    ///   `RAW_FACE_EDGE_ARMS`;
     /// - every `num_field(inner, "<key>", kind)? as u64` read in an arm that
     ///   casts `as SolidId` must be a `SOLID_PARAM_KEYS` key (or `face_id`).
     ///
@@ -4254,8 +4674,9 @@ mod tests {
         let mut face_edge: Vec<String> = arms
             .iter()
             .filter(|(_, text)| {
-                text.contains("remap_id(")
-                    && (text.contains("as FaceId") || text.contains("as EdgeId"))
+                (text.contains("remap_id(")
+                    && (text.contains("as FaceId") || text.contains("as EdgeId")))
+                    || text.contains("DatumSource")
             })
             .flat_map(|(names, _)| names.clone())
             .collect();
@@ -4278,6 +4699,679 @@ mod tests {
                         "arm {names:?} reads a recorded id under `{key}`, not in SOLID_PARAM_KEYS"
                     );
                 }
+            }
+        }
+    }
+
+    fn replay_error(model: &mut BRepModel, event: &TimelineEvent) -> String {
+        let mut remap = HashMap::new();
+        match apply_event(model, &mut AssemblyStore::default(), event, &mut remap) {
+            Ok(()) => panic!("the event must be refused, not replayed"),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    /// A `nurbs_loft` recorded before its rings were (the record carried only
+    /// the section COUNT) cannot be rebuilt: it is refused naming the missing
+    /// field, never re-skinned through guessed rings.
+    #[test]
+    fn nurbs_loft_without_section_points_is_refused_naming_the_field() {
+        let mut model = BRepModel::new();
+        let old = mk_event(
+            "nurbs_loft",
+            serde_json::json!({
+                "params": { "sections": 3, "ring_points": 12, "degree_u": 3, "degree_v": 3 },
+                "inputs": [],
+                "outputs": ["solid:0"]
+            }),
+        );
+        let msg = replay_error(&mut model, &old);
+        assert!(msg.contains("missing `section_points`"), "{msg}");
+        assert!(!msg.contains("  "), "no absorbed indentation: {msg:?}");
+        assert!(
+            model.solids.is_empty(),
+            "nothing is built for a refused loft"
+        );
+    }
+
+    /// A `solid_reanchor` recorded before the applied local frame was cannot
+    /// restore the anchor it made (the preserved frame it relied on is not
+    /// recoverable); it is refused naming the field.
+    #[test]
+    fn solid_reanchor_without_local_transform_is_refused_naming_the_field() {
+        let mut model = BRepModel::new();
+        let outcome = rebuild_model_from_events(&mut model, &[box_event(4.0, 0)]);
+        assert_eq!(outcome.events_skipped, 0);
+        let old = mk_event(
+            "solid_reanchor",
+            serde_json::json!({
+                "params": {
+                    "solid_id": 0, "previous_datum_id": 0, "new_datum_id": 1,
+                    "local_transform_supplied": false
+                },
+                "inputs": ["solid:0", "datum:1"],
+                "outputs": ["solid:0"]
+            }),
+        );
+        let msg = replay_error(&mut model, &old);
+        assert!(msg.contains("missing `local_transform`"), "{msg}");
+        assert!(!msg.contains("  "), "no absorbed indentation: {msg:?}");
+    }
+
+    /// A derived datum re-evaluates its recorded recipe against the rebuilt
+    /// model and lands at the recorded id.
+    #[test]
+    fn derived_datum_replays_its_recipe_at_the_recorded_id() {
+        let mut model = BRepModel::new();
+        let outcome = rebuild_model_from_events(&mut model, &[box_event(4.0, 0)]);
+        assert_eq!(outcome.events_skipped, 0);
+        let (vertex, position) = model
+            .vertices
+            .iter()
+            .map(|(id, v)| (id, v.position))
+            .next()
+            .expect("the box has vertices");
+        let next_id = model.datums.len() as u64;
+        let derived = mk_event(
+            "datum_create_derived",
+            serde_json::json!({
+                "params": {
+                    "datum_id": next_id,
+                    "name": "Corner",
+                    "source": { "kind": "vertex_point", "vertex": vertex }
+                },
+                "inputs": [format!("vertex:{vertex}")],
+                "outputs": [format!("datum:{next_id}")]
+            }),
+        );
+        let outcome = rebuild_model_from_events(&mut model, &[derived]);
+        assert_eq!(outcome.events_skipped, 0, "{:?}", outcome.first_failure);
+        let datum = model
+            .datums
+            .get(next_id as u32)
+            .expect("the derived datum is rebuilt at its recorded id");
+        assert_eq!(datum.name, "Corner");
+        assert_eq!(
+            [datum.origin.x, datum.origin.y, datum.origin.z],
+            position,
+            "the recipe is re-evaluated against the rebuilt vertex"
+        );
+    }
+
+    /// A datum creation that the replay would issue under a different id than
+    /// the recorded one is refused: the replayed history is not the recorded
+    /// one, and renumbering would re-point every later reference.
+    #[test]
+    fn datum_create_under_a_different_id_is_refused() {
+        let mut model = BRepModel::new();
+        let recorded = model.datums.len() as u64 + 2;
+        let ev = mk_event(
+            "datum_create",
+            serde_json::json!({
+                "params": {
+                    "datum_id": recorded, "kind": "point", "name": "Probe",
+                    "position": [1.0, 2.0, 3.0]
+                },
+                "inputs": [],
+                "outputs": [format!("datum:{recorded}")]
+            }),
+        );
+        let msg = replay_error(&mut model, &ev);
+        assert!(
+            msg.contains(&format!("where the recorded history issued {recorded}")),
+            "{msg}"
+        );
+    }
+
+    /// `src` with every comment removed and every `#[cfg(test)]`-gated item
+    /// (a `mod x;` declaration, or a braced module / fn) cut out, so only
+    /// production code is scanned. A file carrying `#![cfg(test)]` is test
+    /// code in its entirety and yields nothing.
+    fn production_code(src: &str) -> String {
+        let chars: Vec<char> = src.replace("\r\n", "\n").chars().collect();
+        let mut code = String::with_capacity(src.len());
+        let mut i = 0usize;
+        while i < chars.len() {
+            let c = chars[i];
+            let next = chars.get(i + 1).copied();
+            if c == '\'' {
+                // A char literal (`'"'`, `'\''`, `'{'`) is copied whole so its
+                // content cannot open a string or a comment; a lifetime is
+                // copied as the single quote it starts with.
+                let len = if next == Some('\\') {
+                    chars
+                        .get(i + 3..)
+                        .and_then(|tail| tail.iter().position(|&ch| ch == '\''))
+                        .map_or(1, |p| p + 4)
+                } else if chars.get(i + 2) == Some(&'\'') {
+                    3
+                } else {
+                    1
+                };
+                code.extend(&chars[i..(i + len).min(chars.len())]);
+                i += len;
+                continue;
+            }
+            if c == '"' {
+                let preceding_hashes = code.chars().rev().take_while(|&ch| ch == '#').count();
+                let raw = code.chars().rev().nth(preceding_hashes) == Some('r');
+                let hashes = if raw { preceding_hashes } else { 0 };
+                code.push(c);
+                i += 1;
+                while i < chars.len() {
+                    let ch = chars[i];
+                    code.push(ch);
+                    i += 1;
+                    if !raw && ch == '\\' {
+                        if let Some(&escaped) = chars.get(i) {
+                            code.push(escaped);
+                            i += 1;
+                        }
+                        continue;
+                    }
+                    if ch == '"'
+                        && chars[i..]
+                            .iter()
+                            .take(hashes)
+                            .filter(|&&h| h == '#')
+                            .count()
+                            == hashes
+                    {
+                        break;
+                    }
+                }
+                continue;
+            }
+            if c == '/' && next == Some('/') {
+                while i < chars.len() && chars[i] != '\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            if c == '/' && next == Some('*') {
+                let mut depth = 0usize;
+                while i < chars.len() {
+                    if chars[i] == '/' && chars.get(i + 1) == Some(&'*') {
+                        depth += 1;
+                        i += 2;
+                    } else if chars[i] == '*' && chars.get(i + 1) == Some(&'/') {
+                        depth -= 1;
+                        i += 2;
+                        if depth == 0 {
+                            break;
+                        }
+                    } else {
+                        i += 1;
+                    }
+                }
+                continue;
+            }
+            code.push(c);
+            i += 1;
+        }
+        if code.contains("#![cfg(test)]") {
+            return String::new();
+        }
+        let mut from = 0usize;
+        while let Some(rel) = code[from..].find("#[cfg(test)]") {
+            let at = from + rel;
+            // Only an attribute opening its own line gates an item; the
+            // same text inside a string literal does not.
+            let line_start = code[..at].rfind('\n').map_or(0, |i| i + 1);
+            if !code[line_start..at].trim().is_empty() {
+                from = at + 1;
+                continue;
+            }
+            from = at;
+            let after = at + "#[cfg(test)]".len();
+            let rest = &code[after..];
+            let semi = rest.find(';');
+            let brace = rest.find('{');
+            let end = match (semi, brace) {
+                (Some(s), Some(b)) if s < b => after + s + 1,
+                (Some(s), None) => after + s + 1,
+                (_, Some(b)) => after + b + matching_brace(&rest[b..]) + 1,
+                (None, None) => code.len(),
+            };
+            code.replace_range(at..end.min(code.len()), "");
+        }
+        code
+    }
+
+    /// Byte offset of the `}` closing the `{` that `text` starts with,
+    /// skipping string, raw-string and char literals.
+    fn matching_brace(text: &str) -> usize {
+        let bytes = text.as_bytes();
+        let mut depth = 0i64;
+        let mut i = 0usize;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return i;
+                    }
+                }
+                b'"' => {
+                    let raw_hashes = {
+                        let mut j = i;
+                        let mut hashes = 0usize;
+                        while j > 0 && bytes[j - 1] == b'#' {
+                            hashes += 1;
+                            j -= 1;
+                        }
+                        (j > 0 && bytes[j - 1] == b'r').then_some(hashes)
+                    };
+                    i += 1;
+                    match raw_hashes {
+                        Some(hashes) => {
+                            let close = format!("\"{}", "#".repeat(hashes));
+                            i += text[i..].find(&close).unwrap_or(text.len() - i) + close.len();
+                            continue;
+                        }
+                        None => {
+                            while i < bytes.len() && bytes[i] != b'"' {
+                                if bytes[i] == b'\\' {
+                                    i += 1;
+                                }
+                                i += 1;
+                            }
+                        }
+                    }
+                }
+                b'\'' => {
+                    if bytes.get(i + 1) == Some(&b'\\') {
+                        i += 3;
+                        while i < bytes.len() && bytes[i] != b'\'' {
+                            i += 1;
+                        }
+                    } else if bytes.get(i + 2) == Some(&b'\'') {
+                        i += 2;
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        text.len().saturating_sub(1)
+    }
+
+    fn collect_rust_sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_rust_sources(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// Every kind named by a quoted string at the arm indentation of
+    /// `dispatch_generic` (single and `|`-joined multi-line headers).
+    fn dispatch_generic_arm_kinds() -> std::collections::BTreeSet<String> {
+        let source = include_str!("replay.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap_or_default();
+        let start = production
+            .find("fn dispatch_generic(")
+            .expect("dispatch_generic must exist");
+        let body = &production[start..];
+        let end = body[1..].find("\nfn ").map(|i| i + 1).unwrap_or(body.len());
+        let mut kinds = std::collections::BTreeSet::new();
+        for line in body[..end].lines() {
+            let Some(rest) = line.strip_prefix("        ") else {
+                continue;
+            };
+            if !(rest.starts_with('"') || rest.starts_with("| \"")) {
+                continue;
+            }
+            let header = rest.split("=>").next().unwrap_or_default();
+            for (i, piece) in header.split('"').enumerate() {
+                if i % 2 == 1 {
+                    kinds.insert(piece.to_string());
+                }
+            }
+        }
+        kinds
+    }
+
+    /// Kinds that are recorded but deliberately have no replay arm, as
+    /// `(kind, reason, scope, needles)`. The needles are the production calls
+    /// that would make the kind reachable; the gate asserts that no scanned
+    /// production file whose path contains `scope` (outside the file that
+    /// defines the called fn) contains one, so an exemption dies the moment a
+    /// route can emit the kind.
+    const RECORDED_WITHOUT_ARM: &[(&str, &str, &str, &[&str])] = &[
+        (
+            "imprint_curves_on_face",
+            "no production caller; its record names transient curve ids, not curve geometry",
+            "/src/",
+            &["imprint_curves_on_face("],
+        ),
+        (
+            "delete_vertex_cascade",
+            "no production caller outside the kernel's own tests",
+            "/src/",
+            &[".delete_vertex_cascade("],
+        ),
+        (
+            "delete_edge_cascade",
+            "no production caller outside the kernel's own tests",
+            "/src/",
+            &[".delete_edge_cascade("],
+        ),
+        (
+            "delete_face_cascade",
+            "no production caller outside the kernel's own tests",
+            "/src/",
+            &[".delete_face_cascade("],
+        ),
+        (
+            "delete_loop_cascade",
+            "no production caller outside the kernel's own tests",
+            "/src/",
+            &[".delete_loop_cascade("],
+        ),
+        (
+            "update_parameters",
+            "no production caller; TopologyBuilder::update_parameters is unreached",
+            "/src/",
+            &[".update_parameters("],
+        ),
+        (
+            "Export",
+            SESSION_COMMAND_PROCESSOR,
+            "api-server/src/",
+            SESSION_COMMAND_PROCESSOR_ENTRIES,
+        ),
+        (
+            "ChangeView",
+            SESSION_COMMAND_PROCESSOR,
+            "api-server/src/",
+            SESSION_COMMAND_PROCESSOR_ENTRIES,
+        ),
+        (
+            "SessionControl",
+            SESSION_COMMAND_PROCESSOR,
+            "api-server/src/",
+            SESSION_COMMAND_PROCESSOR_ENTRIES,
+        ),
+        (
+            "Analyze",
+            SESSION_COMMAND_PROCESSOR,
+            "api-server/src/",
+            SESSION_COMMAND_PROCESSOR_ENTRIES,
+        ),
+    ];
+
+    /// The session-manager `CommandProcessor` pushes these kinds (and
+    /// non-`Generic` operation variants) straight onto the timeline. The
+    /// server never drives it: no api-server code calls into the processor
+    /// or the `FullIntegrationExecutor` that wraps it, and the
+    /// `handlers::session` undo/redo handlers that reach it are not routed.
+    const SESSION_COMMAND_PROCESSOR: &str = concat!(
+        "session-manager CommandProcessor kind; no api-server route drives the ",
+        "processor, so the server never records it"
+    );
+    const SESSION_COMMAND_PROCESSOR_ENTRIES: &[&str] = &[
+        ".process_command(",
+        ".process_command_with_ot(",
+        "process_command_with_timeline(",
+        "command_processor()",
+        "full_integration_executor.",
+        "session::undo_operation",
+        "session::redo_operation",
+        "handlers::undo_operation",
+        "handlers::redo_operation",
+    ];
+
+    /// Replay-coverage gate: every operation kind production code RECORDS
+    /// has a `dispatch_generic` arm, or sits on [`RECORDED_WITHOUT_ARM`]
+    /// with a justification the gate re-verifies. A kind without an arm
+    /// falls to `UnknownKind`, which quarantines a document at boot and
+    /// refuses its undo/redo — a part built with it does not survive a
+    /// restart.
+    ///
+    /// Recorded kinds are read from the production sources of every crate
+    /// that drives the kernel (geometry-engine, api-server, ai-integration,
+    /// session-manager, export-engine, assembly-engine):
+    /// - every literal `RecordedOperation::new("<kind>")` (dotted kinds are
+    ///   document events classified by `fallback_error`, not geometry);
+    /// - the primitive kinds `record_and_push` derives from a
+    ///   `primitive_type: "<p>"` literal (`create_<p>_2d` / `create_<p>_3d`);
+    /// - the kinds each known dynamic site (`RecordedOperation::new(<ident>)`)
+    ///   emits. A dynamic site not listed here fails the gate.
+    #[test]
+    fn every_recorded_kind_has_a_replay_arm() {
+        use std::collections::BTreeSet;
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        // Every workspace crate that drives the kernel in production.
+        let roots = [
+            manifest.join("../geometry-engine/src"),
+            manifest.join("../api-server/src"),
+            manifest.join("../ai-integration/src"),
+            manifest.join("../session-manager/src"),
+            manifest.join("../export-engine/src"),
+            manifest.join("../assembly-engine/src"),
+            manifest.join("../timeline-engine/src"),
+            manifest.join("../ros-format/src"),
+            manifest.join("../verdict-harness/src"),
+        ];
+        let mut files = Vec::new();
+        for root in &roots {
+            collect_rust_sources(root, &mut files);
+        }
+        assert!(
+            files.len() > 50,
+            "source scan found only {} files",
+            files.len()
+        );
+        let sources: Vec<(String, String)> = files
+            .iter()
+            .filter_map(|p| {
+                let text = std::fs::read_to_string(p).ok()?;
+                let name = p.to_string_lossy().replace('\\', "/");
+                Some((name, production_code(&text)))
+            })
+            .collect();
+
+        fn literals_of(text: &str) -> Vec<String> {
+            text.split('"')
+                .enumerate()
+                .filter(|(i, _)| i % 2 == 1)
+                .map(|(_, s)| s.to_string())
+                .collect()
+        }
+        fn is_kind_literal(s: &str) -> bool {
+            !s.is_empty()
+                && s.chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        }
+        // (file suffix, identifier, extractor naming the kinds the site can
+        // emit, read from that file's production code).
+        let dynamic_sites: &[(&str, &str, fn(&str) -> Vec<String>)] = &[
+            // `let op_kind = match operation { BooleanOp::X => "boolean_x" … }`.
+            ("operations/boolean.rs", "op_kind", |code| {
+                literals_of(code)
+                    .into_iter()
+                    .filter(|s| s.starts_with("boolean_") && is_kind_literal(s))
+                    .collect()
+            }),
+            // `record_cascade("delete_<entity>_cascade", …)`; the sibling
+            // `record_and_push` site is read from `primitive_type` below.
+            ("primitives/topology_builder.rs", "kind", |code| {
+                literals_of(code)
+                    .into_iter()
+                    .filter(|s| s.starts_with("delete_") && s.ends_with("_cascade"))
+                    .collect()
+            }),
+            // `record_csketch_op(state, "<kind>", …)` call sites.
+            ("api-server/src/csketch.rs", "kind", |code| {
+                code.split("record_csketch_op(")
+                    .skip(1)
+                    .filter_map(|call| {
+                        let args = call.split(')').next().unwrap_or_default();
+                        literals_of(args).into_iter().next()
+                    })
+                    .filter(|s| is_kind_literal(s))
+                    .collect()
+            }),
+        ];
+
+        let mut recorded: BTreeSet<String> = BTreeSet::new();
+        let mut dynamic_seen: BTreeSet<String> = BTreeSet::new();
+        let mut sites = 0usize;
+        let mut generic_sites = 0usize;
+        for (name, code) in &sources {
+            for piece in code.split("RecordedOperation::new(").skip(1) {
+                sites += 1;
+                let arg = piece.trim_start();
+                if let Some(rest) = arg.strip_prefix('"') {
+                    let kind = rest.split('"').next().unwrap_or_default();
+                    if !kind.contains('.') {
+                        recorded.insert(kind.to_string());
+                    }
+                    continue;
+                }
+                let ident: String = arg
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                let site = dynamic_sites
+                    .iter()
+                    .find(|(suffix, id, _)| name.ends_with(suffix) && *id == ident);
+                let Some((suffix, id, extract)) = site else {
+                    panic!(
+                        concat!(
+                            "{name}: `RecordedOperation::new({ident})` is a dynamic recording ",
+                            "site this gate does not know; list the kinds it can emit in ",
+                            "`dynamic_sites`"
+                        ),
+                        name = name,
+                        ident = ident
+                    );
+                };
+                dynamic_seen.insert(format!("{suffix}:{id}"));
+                recorded.extend(extract(code));
+            }
+            // Events pushed straight onto the timeline as
+            // `Operation::Generic { command_type: "<kind>", .. }` (the WS
+            // `ExecuteOperation` route, the session-manager command
+            // processor) never pass through a `RecordedOperation`.
+            for piece in code.split("Generic {").skip(1) {
+                let head = piece.split_once('}').map_or(piece, |(h, _)| h);
+                if let Some(kind) = head
+                    .split("command_type: \"")
+                    .nth(1)
+                    .and_then(|k| k.split('"').next())
+                {
+                    generic_sites += 1;
+                    if !kind.contains('.') {
+                        recorded.insert(kind.to_string());
+                    }
+                }
+            }
+            if name.ends_with("primitives/topology_builder.rs") {
+                for (variant, dim) in [("Create2D", "2d"), ("Create3D", "3d")] {
+                    for piece in code
+                        .split(&format!("TimelineOperation::{variant} {{"))
+                        .skip(1)
+                    {
+                        let head = piece.split_once('}').map_or(piece, |(h, _)| h);
+                        if let Some(p) = head
+                            .split("primitive_type: \"")
+                            .nth(1)
+                            .and_then(|p| p.split('"').next())
+                        {
+                            recorded.insert(format!("create_{p}_{dim}"));
+                        }
+                    }
+                }
+                for variant in ["Extrude", "Revolve", "Boolean"] {
+                    for piece in code
+                        .split(&format!("TimelineOperation::{variant} {{"))
+                        .skip(1)
+                    {
+                        let is_pattern = piece
+                            .split_once('}')
+                            .is_some_and(|(_, after)| after.trim_start().starts_with("=>"));
+                        assert!(
+                            is_pattern,
+                            concat!(
+                                "TimelineOperation::{variant} is constructed in production; ",
+                                "record_and_push records it under a kind this gate must check"
+                            ),
+                            variant = variant
+                        );
+                    }
+                }
+                if code.contains("TimelineOperation::UpdateParameters {\n") {
+                    recorded.insert("update_parameters".to_string());
+                }
+            }
+        }
+        assert!(sites >= 60, "scanner found only {sites} recording sites");
+        assert!(
+            generic_sites >= 1,
+            "scanner found no `Generic {{ command_type: \"..\" }}` site; the scan is broken"
+        );
+        let expected_dynamic: BTreeSet<String> = dynamic_sites
+            .iter()
+            .map(|(s, i, _)| format!("{s}:{i}"))
+            .collect();
+        assert_eq!(
+            dynamic_seen, expected_dynamic,
+            "every listed dynamic site must still exist"
+        );
+        for kind in ["create_box_3d", "boolean_union", "csketch_trim", "set_name"] {
+            assert!(
+                recorded.contains(kind),
+                "scan missed `{kind}`: {recorded:?}"
+            );
+        }
+
+        let arms = dispatch_generic_arm_kinds();
+        let exempt: BTreeSet<&str> = RECORDED_WITHOUT_ARM.iter().map(|(k, _, _, _)| *k).collect();
+        let missing: Vec<&String> = recorded
+            .iter()
+            .filter(|k| !arms.contains(*k) && !exempt.contains(k.as_str()))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            concat!(
+                "recorded kinds with no replay arm (a part built with one does not ",
+                "survive a restart): {missing:?}"
+            ),
+            missing = missing
+        );
+
+        for (kind, reason, scope, needles) in RECORDED_WITHOUT_ARM {
+            assert!(
+                recorded.contains(*kind),
+                "`{kind}` is exempt ({reason}) but nothing records it any more; drop the entry"
+            );
+            assert!(
+                !arms.contains(*kind),
+                "`{kind}` has a replay arm; drop its exemption"
+            );
+            for needle in needles.iter() {
+                let callers: Vec<&String> = sources
+                    .iter()
+                    .filter(|(name, code)| {
+                        name.contains(scope)
+                            && code.contains(needle)
+                            && !code.contains(&format!("fn {}", needle.trim_start_matches('.')))
+                    })
+                    .map(|(name, _)| name)
+                    .collect();
+                assert!(
+                    callers.is_empty(),
+                    "`{kind}` is exempt ({reason}) but production code calls `{needle}`: {callers:?}"
+                );
             }
         }
     }

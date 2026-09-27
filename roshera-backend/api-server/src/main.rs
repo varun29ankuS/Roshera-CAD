@@ -3992,9 +3992,8 @@ async fn create_extrude(
 ) -> Result<Json<serde_json::Value>, error_catalog::ApiError> {
     use error_catalog::{ApiError, ErrorCode};
     use geometry_engine::math::Tolerance;
-    use geometry_engine::operations::extrude::{extrude_profile, ExtrudeOptions};
-    use geometry_engine::primitives::curve::{Line, ParameterRange};
-    use geometry_engine::primitives::edge::{Edge, EdgeOrientation};
+    use geometry_engine::operations::extrude::{extrude_polygon, ExtrudeOptions};
+    use geometry_engine::operations::OperationError;
     use geometry_engine::tessellation::{tessellate_solid, TessellationParams};
     use std::time::Instant;
 
@@ -4077,54 +4076,61 @@ async fn create_extrude(
 
     let tolerance = Tolerance::default();
 
-    // Build profile edges + run extrude under a single write lock so a
-    // concurrent request can't observe a half-built sketch.
-    let result_solid_id = {
+    // Build the profile + extrude under a single write lock so a concurrent
+    // request can't observe a half-built sketch. The kernel's own
+    // `extrude_face` record names the transient profile face this build
+    // creates — a face no replay can rebuild — so it is suppressed, and the
+    // self-contained `extrude_polygon` event below (the polygon itself) is
+    // what the timeline keeps. Replay rebuilds it through the same
+    // `extrude_polygon` kernel entry.
+    let suppress = crate::csketch::RecorderSuppressGuard::new(&state.timeline_recorder);
+    let build_result = {
         let mut model = model_handle.write().await;
-
-        let mut profile_edges = Vec::with_capacity(points.len());
-        for i in 0..points.len() {
-            let p_start = points[i];
-            let p_end = points[(i + 1) % points.len()];
-            let v_start =
-                model
-                    .vertices
-                    .add_or_find(p_start.x, p_start.y, p_start.z, tolerance.distance());
-            let v_end = model
-                .vertices
-                .add_or_find(p_end.x, p_end.y, p_end.z, tolerance.distance());
-            if v_start == v_end {
-                return Err(ApiError::new(
-                    ErrorCode::InvalidParameter,
-                    format!(
-                        "profile[{i}] and profile[{}] collapse to the same vertex \
-                         under tolerance {}",
-                        (i + 1) % points.len(),
-                        tolerance.distance()
-                    ),
-                ));
-            }
-            let line = Line::new(p_start, p_end);
-            let curve_id = model.curves.add(Box::new(line));
-            let edge = Edge::new(
-                0,
-                v_start,
-                v_end,
-                curve_id,
-                EdgeOrientation::Forward,
-                ParameterRange::new(0.0, 1.0),
-            );
-            let edge_id = model.edges.add(edge);
-            profile_edges.push(edge_id);
-        }
-
         let options = ExtrudeOptions {
             direction,
             distance,
             ..ExtrudeOptions::default()
         };
-        extrude_profile(&mut model, profile_edges, options).map_err(ApiError::kernel_error)?
+        extrude_polygon(&mut model, &points, options, tolerance).map_err(|e| match e {
+            OperationError::InvalidInput {
+                parameter,
+                received,
+                ..
+            } if parameter == "profile" => ApiError::new(ErrorCode::InvalidParameter, received),
+            other => ApiError::kernel_error(other),
+        })
     };
+    drop(suppress);
+    let result_solid_id = build_result?;
+
+    // Per-event certificate, as `extrude_csketch` does: certify the solid
+    // this op produced before the consolidated event is recorded, so the
+    // proof rides on the event.
+    let solid_certificate = {
+        let mut model = model_handle.write().await;
+        let validity = model.certify_solid(result_solid_id);
+        let volume = model.calculate_solid_volume(result_solid_id);
+        let face_count = model.solid_outer_face_count(result_solid_id);
+        geometry_engine::operations::recorder::RecordedSolidCertificate::from_validity(
+            &validity, volume, face_count,
+        )
+    };
+    {
+        use geometry_engine::operations::recorder::OperationRecorder as _;
+        let profile_json: Vec<[f64; 3]> = points.iter().map(|p| [p.x, p.y, p.z]).collect();
+        let record =
+            geometry_engine::operations::recorder::RecordedOperation::new("extrude_polygon")
+                .with_parameters(serde_json::json!({
+                    "profile": profile_json,
+                    "direction": [direction.x, direction.y, direction.z],
+                    "distance": distance,
+                }))
+                .with_output_solids([result_solid_id as u64])
+                .with_solid_certificate(solid_certificate);
+        if let Err(e) = state.timeline_recorder.record(record) {
+            tracing::warn!("extrude_polygon event not recorded: {e}");
+        }
+    }
 
     let (tri_mesh, tessellation_ms) = {
         let model = model_handle.read().await;

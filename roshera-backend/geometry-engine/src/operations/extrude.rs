@@ -1620,6 +1620,66 @@ pub fn extrude_profile(
     })
 }
 
+/// Extrude a closed world-space polygon (the loop closes implicitly from the
+/// last point back to the first) into a solid.
+///
+/// Each polygon corner becomes a vertex via `add_or_find` under `tolerance`,
+/// each side a `Line` edge, and the loop is extruded by [`extrude_profile`].
+/// This is the single implementation behind `POST /api/geometry/extrude` and
+/// the timeline's `extrude_polygon` replay arm: the handler records the
+/// polygon itself (the profile face this builds is transient and never
+/// recorded), and replay rebuilds it here, so live and replay cannot drift.
+///
+/// Two consecutive corners that collapse to one vertex under `tolerance` are
+/// refused as [`OperationError::InvalidInput`] on `profile`, and every store
+/// mutation is rolled back.
+pub fn extrude_polygon(
+    model: &mut BRepModel,
+    profile: &[Point3],
+    options: ExtrudeOptions,
+    tolerance: crate::math::Tolerance,
+) -> OperationResult<SolidId> {
+    use crate::primitives::curve::Line;
+
+    let points = profile.to_vec();
+    lifecycle::with_rollback(model, move |model| {
+        let mut profile_edges = Vec::with_capacity(points.len());
+        for i in 0..points.len() {
+            let p_start = points[i];
+            let p_end = points[(i + 1) % points.len()];
+            let v_start =
+                model
+                    .vertices
+                    .add_or_find(p_start.x, p_start.y, p_start.z, tolerance.distance());
+            let v_end = model
+                .vertices
+                .add_or_find(p_end.x, p_end.y, p_end.z, tolerance.distance());
+            if v_start == v_end {
+                return Err(OperationError::InvalidInput {
+                    parameter: "profile".to_string(),
+                    expected: "consecutive points that stay distinct vertices".to_string(),
+                    received: format!(
+                        "profile[{i}] and profile[{}] collapse to the same vertex under tolerance {}",
+                        (i + 1) % points.len(),
+                        tolerance.distance()
+                    ),
+                });
+            }
+            let curve_id = model.curves.add(Box::new(Line::new(p_start, p_end)));
+            let edge = Edge::new(
+                0,
+                v_start,
+                v_end,
+                curve_id,
+                EdgeOrientation::Forward,
+                ParameterRange::new(0.0, 1.0),
+            );
+            profile_edges.push(model.edges.add(edge));
+        }
+        extrude_profile(model, profile_edges, options)
+    })
+}
+
 /// Create a straight line edge between two vertices
 fn create_straight_edge(
     model: &mut BRepModel,

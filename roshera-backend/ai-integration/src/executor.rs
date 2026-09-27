@@ -451,9 +451,9 @@ impl CommandExecutor {
     ///   re-validates the resulting solid; CPU-heavy enough to keep off
     ///   the async runtime.
     /// - **Why a fresh GeometryId**: `offset_solid` adds a new hollow solid
-    ///   to the model; the original solid is left in place but is no
-    ///   longer referenced by the executor's id_map (mirroring the
-    ///   boolean op's "result is a new entity" convention).
+    ///   to the model and retires the source solid's record (the boolean's
+    ///   husk rule), mirroring the boolean op's "result is a new entity"
+    ///   convention.
     /// - **Performance**: O(faces) for surface offset + O(rim edges) for
     ///   wall construction; sub-100 ms for typical primitives.
     async fn shell(

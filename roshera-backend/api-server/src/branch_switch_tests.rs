@@ -1108,3 +1108,121 @@ async fn a_truncate_on_the_protected_trunk_is_refused_as_protected_first() {
         history_before
     );
 }
+
+// =====================================================================
+// Task 101 round 1 — a WS `ExecuteOperation` does not poison main's replay
+// =====================================================================
+
+/// WS `TimelineCommand { ExecuteOperation }` appends the client's
+/// description of an operation to main as a `timeline_operation` event and
+/// executes nothing against the kernel. That kind had no replay arm, so every
+/// undo/redo/replay of main that covered it was refused
+/// (`branch_replay_refused`, unknown operation kind). Replay now classifies it
+/// as the model no-op it is: the undo past a later cube succeeds and leaves
+/// exactly the first cube.
+#[tokio::test]
+async fn a_ws_execute_operation_does_not_block_undo_on_main() {
+    let state = fresh_state().await;
+    let (addr, server) = serve(state.clone()).await;
+    create_cube(&state, 2.0).await;
+    settle(&state).await;
+
+    let url = format!("ws://{addr}/ws");
+    let (mut socket, _resp) = tokio_tungstenite::connect_async(&url)
+        .await
+        .expect("WebSocket upgrade must succeed");
+    let request_id = format!("exec-{}", Uuid::new_v4());
+    let frame = json!({
+        "type": "TimelineCommand",
+        "data": {
+            "command": {
+                "cmd": "ExecuteOperation",
+                "operation": { "operation_type": "Delete", "entities": ["solid:0"] }
+            },
+            "request_id": request_id,
+        }
+    });
+    socket
+        .send(WsMessage::Text(frame.to_string().into()))
+        .await
+        .expect("must send ExecuteOperation");
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    let reply = loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "no ExecuteOperation reply within the deadline"
+        );
+        match tokio::time::timeout(remaining, socket.next()).await {
+            Ok(Some(Ok(WsMessage::Text(t)))) => {
+                let Ok(v) = serde_json::from_str::<Value>(&t) else {
+                    continue;
+                };
+                let kind = v["type"].as_str().unwrap_or_default();
+                if kind == "TimelineUpdate" || kind == "Error" {
+                    break v;
+                }
+            }
+            Ok(Some(Ok(_))) => continue,
+            other => panic!("WebSocket closed before the reply: {other:?}"),
+        }
+    };
+    assert_eq!(reply["type"], "TimelineUpdate", "reply = {reply}");
+    let recorded = branch_history(&state, BranchId::main()).await.len();
+    {
+        let timeline = state.timeline.read().await;
+        let kinds: Vec<String> = timeline
+            .get_branch_events(&BranchId::main(), None, None)
+            .expect("main history")
+            .into_iter()
+            .filter_map(|e| match e.operation {
+                timeline_engine::Operation::Generic { command_type, .. } => Some(command_type),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            kinds.iter().any(|k| k == "timeline_operation"),
+            "the WS op must be on main: {kinds:?}"
+        );
+    }
+
+    create_cube(&state, 3.0).await;
+    settle(&state).await;
+    assert!(branch_history(&state, BranchId::main()).await.len() > recorded);
+    // Undo event by event until the 3-cube's creation is undone; every
+    // step replays main's prefix, which covers the WS event.
+    let session = crate::handlers::timeline::live_session_id(&BranchId::main());
+    let mut undone = Vec::new();
+    while !undone.iter().any(|k: &String| k == "create_box_3d") {
+        assert!(
+            undone.len() < 6,
+            "undid {undone:?} without reaching the cube"
+        );
+        let (s, body) = dispatch(
+            &state,
+            post(
+                "/api/timeline/undo",
+                json!({ "session_id": session.to_string() }),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "body = {body}");
+        assert_eq!(
+            body["success"], true,
+            "the undo's replay covers the WS event and must not be refused; body = {body}"
+        );
+        assert_eq!(body["events_skipped"], 0, "body = {body}");
+        undone.push(
+            body["operation_type"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+        );
+    }
+    assert!(
+        same_volumes(&live_volumes(&state).await, &[8.0]),
+        "undo removes the 3-cube and leaves the 2-cube: {:?}",
+        live_volumes(&state).await
+    );
+    server.abort();
+}

@@ -364,6 +364,39 @@ fn offset_solid_body(
         validate_shell_solid(model, hollow_id)?;
     }
 
+    // Retire the source `Solid` record — the boolean's husk rule. The hollow
+    // is a fresh `Solid` whose shell re-references the source's kept exterior
+    // faces; the source record left in the store is a second body the shell
+    // route treats as replaced (it re-points the source's uuid to the hollow),
+    // yet it still lists as a part and, on a replay-only boot, is handed a
+    // uuid of its own — a phantom box inside the hollow. (The AI executor
+    // keeps its id-map entry for the source; a later command naming it now
+    // gets "solid not found" instead of silently operating on the husk.)
+    // The orphan sweep then drops the source's husk shell and the opened
+    // faces only it reached; faces the hollow re-references are retained.
+    let mut deleted_solids: Vec<u64> = Vec::with_capacity(1);
+    if hollow_id != solid_id {
+        model.solids.remove(solid_id);
+        deleted_solids.push(solid_id as u64);
+    }
+    let pruned = crate::operations::delete::prune_boolean_orphan_topology(model)?;
+    let pruned_refs: Vec<String> = {
+        use crate::operations::delete::EntityType as PrunedKind;
+        use crate::operations::recorder::{
+            entity_ref, ENTITY_EDGE, ENTITY_FACE, ENTITY_LOOP, ENTITY_VERTEX,
+        };
+        pruned
+            .into_iter()
+            .filter_map(|(kind, id)| match kind {
+                PrunedKind::Face => Some(entity_ref(ENTITY_FACE, id as u64)),
+                PrunedKind::Loop => Some(entity_ref(ENTITY_LOOP, id as u64)),
+                PrunedKind::Edge => Some(entity_ref(ENTITY_EDGE, id as u64)),
+                PrunedKind::Vertex => Some(entity_ref(ENTITY_VERTEX, id as u64)),
+                PrunedKind::Shell | PrunedKind::Solid => None,
+            })
+            .collect()
+    };
+
     // Record for attached recorders so the timeline can replay shell
     // operations alongside extrudes / booleans / fillets.
     model.record_operation(
@@ -373,10 +406,13 @@ fn offset_solid_body(
                 "thickness": thickness,
                 "faces_to_remove": faces_to_remove,
                 "max_deviation": options.max_deviation,
+                "intersection_handling": format!("{:?}", options.intersection_handling),
             }))
             .with_input_solids([solid_id as u64])
             .with_input_faces(faces_to_remove.iter().map(|&f| f as u64))
-            .with_output_solids([hollow_id as u64]),
+            .with_output_solids([hollow_id as u64])
+            .with_deleted_solids(deleted_solids)
+            .with_deleted_refs(pruned_refs),
     );
 
     Ok(hollow_id)

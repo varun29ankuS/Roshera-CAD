@@ -4474,3 +4474,504 @@ async fn a_checkpoint_after_a_dropped_op_refuses_and_names_it() {
     .await;
     assert_eq!(status, StatusCode::CREATED, "body = {body}");
 }
+
+// =====================================================================
+// (k) EVERY LIVE OPERATION REPLAYS AFTER A RESTART (Task 101)
+//
+// Each test builds a document through the live routes, flushes, reboots over
+// the SAME database, and demands a FULL replay (`active`, every event
+// replayed) that rebuilds the SAME model: solid count, tessellation, exact
+// kernel volumes, and — where the op is a placement or a datum — the frames
+// themselves, because volume and face count are blind to where a solid sits.
+// RED at BASE (352c8bc0): each kind had no replay arm, or (the polygon
+// extrude) recorded an `extrude_face` on a transient profile face, so the
+// document quarantined at the creating op.
+// =====================================================================
+
+/// Exact kernel volume of every live solid, in solid-id order.
+async fn kernel_volumes(state: &AppState) -> Vec<f64> {
+    let mut model = state.model.write().await;
+    let ids: Vec<u32> = model.solids.iter().map(|(id, _)| id).collect();
+    ids.into_iter()
+        .map(|id| model.calculate_solid_volume(id).unwrap_or(f64::NAN))
+        .collect()
+}
+
+/// Flush the recorder and return the persisted event count.
+async fn flush_and_count(state: &AppState) -> i64 {
+    state
+        .timeline_recorder
+        .flush()
+        .await
+        .expect("recorder flush must succeed");
+    state
+        .database
+        .get_event_count(durability::DURABILITY_SESSION_ID)
+        .await
+        .expect("event count must query")
+}
+
+/// A datum as `(id, name, visible, row-major frame)`.
+type DatumFrame = (u32, String, bool, [[f64; 4]; 4]);
+
+/// Every datum in the store, in id order.
+async fn datum_frames(state: &AppState) -> Vec<DatumFrame> {
+    let model = state.model.read().await;
+    let mut datums: Vec<DatumFrame> = model
+        .datums
+        .snapshot()
+        .into_iter()
+        .map(|d| {
+            let rows = geometry_engine::primitives::datum::DatumSource::pack_matrix(d.transform);
+            (d.id, d.name, d.visible, rows)
+        })
+        .collect();
+    datums.sort_by_key(|d| d.0);
+    datums
+}
+
+/// Assert two volume lists are equal to 1e-9 relative (float round-trip of the
+/// recorded parameters is the only admissible difference).
+fn assert_volumes_match(before: &[f64], after: &[f64]) {
+    assert_eq!(
+        before.len(),
+        after.len(),
+        "solid count differs: before = {before:?}, after = {after:?}"
+    );
+    for (b, a) in before.iter().zip(after) {
+        assert!(
+            b.is_finite() && ((a - b) / b).abs() <= 1e-9,
+            "kernel volume must be reproduced: before = {before:?}, after = {after:?}"
+        );
+    }
+}
+
+/// `POST /api/geometry` with `shape_type: "torus"` records `create_torus_3d`,
+/// which had no replay arm: RED at BASE quarantined at the torus with
+/// `unknown operation kind: create_torus_3d`.
+#[tokio::test]
+async fn torus_document_survives_restart() {
+    let path = temp_db_path();
+    let (total, fp_before, volumes_before) = {
+        let state = build_state(open_db(&path).await, true).await;
+        let (s, body) = dispatch(
+            &state,
+            post(
+                "/api/geometry",
+                json!({
+                    "shape_type": "torus",
+                    "parameters": { "major_radius": 6.0, "minor_radius": 1.5 }
+                }),
+            ),
+        )
+        .await;
+        assert!(s.is_success(), "torus create must succeed; body = {body}");
+        (
+            flush_and_count(&state).await,
+            geom_fingerprint(&state).await,
+            kernel_volumes(&state).await,
+        )
+    };
+    let state2 = build_state(open_db(&path).await, true).await;
+    assert_full_replay(&state2, total, 1, fp_before).await;
+    assert_volumes_match(&volumes_before, &kernel_volumes(&state2).await);
+}
+
+/// `POST /api/geometry/shell` records `offset_solid` (no replay arm at BASE:
+/// `unknown operation kind: offset_solid`). The opened face is resolved by its
+/// raw recorded id, exact on a full replay.
+#[tokio::test]
+async fn shell_document_survives_restart() {
+    let path = temp_db_path();
+    let (total, fp_before, volumes_before, solids) = {
+        let state = build_state(open_db(&path).await, true).await;
+        let (s, body) = dispatch(
+            &state,
+            post(
+                "/api/geometry/box",
+                json!({ "width": 10.0, "depth": 10.0, "height": 10.0 }),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "box create must succeed; body = {body}");
+        let uuid = body["object"]["id"].as_str().expect("box uuid").to_string();
+        let solid = body["solid_id"].as_u64().expect("box solid_id") as u32;
+        let top = {
+            let model = state.model.read().await;
+            let shell = model
+                .shells
+                .get(model.solids.get(solid).expect("box solid").outer_shell)
+                .expect("box shell");
+            shell
+                .faces
+                .iter()
+                .copied()
+                .find(|&f| {
+                    let face = model.faces.get(f).expect("face");
+                    model
+                        .surfaces
+                        .get(face.surface_id)
+                        .and_then(|s| s.normal_at(0.5, 0.5).ok())
+                        .is_some_and(|n| n.z > 0.999)
+                })
+                .expect("the box has a +Z face")
+        };
+        let (s, body) = dispatch(
+            &state,
+            post(
+                "/api/geometry/shell",
+                json!({ "object": uuid, "thickness": 1.0, "faces_to_remove": [top] }),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "shell must succeed; body = {body}");
+        let solids = state.model.read().await.solids.len();
+        assert_eq!(
+            (solids, state.uuid_to_local.len()),
+            (1, 1),
+            "the hollow REPLACES the box: one solid in the model, one registered part"
+        );
+        (
+            flush_and_count(&state).await,
+            geom_fingerprint(&state).await,
+            kernel_volumes(&state).await,
+            solids,
+        )
+    };
+    let state2 = build_state(open_db(&path).await, true).await;
+    assert_full_replay(&state2, total, solids, fp_before).await;
+    assert_eq!(
+        state2.uuid_to_local.len(),
+        1,
+        "the source box must not come back as a second registered part inside the hollow"
+    );
+    assert_volumes_match(&volumes_before, &kernel_volumes(&state2).await);
+}
+
+/// `POST /api/geometry/nurbs_loft` records `nurbs_loft`. At BASE it had no arm
+/// (`unknown operation kind: nurbs_loft`) and its record carried only the
+/// section COUNT; it now carries the rings (`section_points`).
+#[tokio::test]
+async fn nurbs_loft_document_survives_restart() {
+    let path = temp_db_path();
+    let ring = |z: f64, r: f64| -> Vec<[f64; 3]> {
+        (0..12)
+            .map(|i| {
+                let a = i as f64 * std::f64::consts::TAU / 12.0;
+                [r * a.cos(), r * a.sin(), z]
+            })
+            .collect()
+    };
+    let (total, fp_before, volumes_before) = {
+        let state = build_state(open_db(&path).await, true).await;
+        let (s, body) = dispatch(
+            &state,
+            post(
+                "/api/geometry/nurbs_loft",
+                json!({
+                    "sections": [ring(0.0, 3.0), ring(2.5, 2.0), ring(5.0, 3.0)],
+                    "degree_u": 3,
+                    "degree_v": 3,
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "nurbs_loft must succeed; body = {body}");
+        (
+            flush_and_count(&state).await,
+            geom_fingerprint(&state).await,
+            kernel_volumes(&state).await,
+        )
+    };
+    let state2 = build_state(open_db(&path).await, true).await;
+    assert_full_replay(&state2, total, 1, fp_before).await;
+    assert_volumes_match(&volumes_before, &kernel_volumes(&state2).await);
+}
+
+/// `POST /api/geometry/extrude` (the one-shot polygon extrude). At BASE it
+/// recorded only the kernel's `extrude_face` on the TRANSIENT profile face it
+/// built, so the reboot quarantined at it. It now records the polygon
+/// (`extrude_polygon`). A fillet on one of the prism's base-loop edges follows,
+/// named by the persistent id the suppressed build minted, so the solid id and
+/// that edge identity must both bind after the restart.
+#[tokio::test]
+async fn polygon_extrude_document_survives_restart_and_later_ops_bind() {
+    let path = temp_db_path();
+    let (total, fp_before, volumes_before, edge_pid) = {
+        let state = build_state(open_db(&path).await, true).await;
+        let (s, body) = dispatch(
+            &state,
+            post(
+                "/api/geometry/extrude",
+                json!({
+                    "profile": [[0.0, 0.0, 0.0], [6.0, 0.0, 0.0], [6.0, 4.0, 0.0], [0.0, 4.0, 0.0]],
+                    "distance": 5.0,
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "extrude must succeed; body = {body}");
+        let uuid = body["object"]["id"]
+            .as_str()
+            .expect("prism uuid")
+            .to_string();
+        // A BASE-loop (z = 0) edge: the fresh extrusion mints persistent ids
+        // for its base-loop edges (`extrude_edge_pid`), so the fillet records
+        // this edge by PID and replay must re-derive the same PID through the
+        // suppressed build's root-seed reservation.
+        let base_edge = {
+            let model = state.model.read().await;
+            let at_top = |v| {
+                model
+                    .vertices
+                    .get_position(v)
+                    .is_some_and(|p| p[2].abs() < 1e-9)
+            };
+            let edge = model
+                .edges
+                .iter()
+                .find(|(_, e)| at_top(e.start_vertex) && at_top(e.end_vertex))
+                .map(|(id, _)| id)
+                .expect("the prism has a base edge");
+            edge
+        };
+        let edge_pid = state
+            .model
+            .read()
+            .await
+            .edge_pid(base_edge)
+            .expect("the extrusion mints a persistent id for its base-loop edges");
+        let (s, body) = dispatch(
+            &state,
+            post(
+                "/api/geometry/fillet",
+                json!({ "object": uuid, "edges": [base_edge], "radius": 0.5 }),
+            ),
+        )
+        .await;
+        assert_eq!(
+            s,
+            StatusCode::OK,
+            "base-edge fillet must succeed; body = {body}"
+        );
+        (
+            flush_and_count(&state).await,
+            geom_fingerprint(&state).await,
+            kernel_volumes(&state).await,
+            edge_pid,
+        )
+    };
+    let state2 = build_state(open_db(&path).await, true).await;
+    assert_full_replay(&state2, total, 1, fp_before).await;
+    assert_volumes_match(&volumes_before, &kernel_volumes(&state2).await);
+    // The persisted fillet names the edge by that persistent id, and replay
+    // binds a PID-carrying edge by PID or refuses it as a dangling reference
+    // (`bind_blend_edges`). The clean full replay above therefore proves the
+    // replayed `extrude_polygon` re-derived the PID the live, suppressed build
+    // minted — not merely that a raw edge id lined up.
+    let recorded_pids: Vec<Value> = {
+        let timeline = state2.timeline.read().await;
+        timeline
+            .get_branch_events(&timeline_engine::BranchId::main(), None, None)
+            .expect("main history must exist")
+            .into_iter()
+            .filter_map(|e| match e.operation {
+                timeline_engine::Operation::Generic {
+                    command_type,
+                    parameters,
+                } if command_type == "fillet_edges" => {
+                    parameters["params"]["edge_pids"].as_array().cloned()
+                }
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    };
+    assert_eq!(
+        recorded_pids,
+        vec![json!(edge_pid.as_u128().to_string())],
+        "the fillet must have recorded the base edge's persistent id"
+    );
+}
+
+/// The polygon extrude's refusal of a profile whose consecutive corners
+/// collapse keeps its wire contract: 400 `invalid_parameter`, the same message.
+#[tokio::test]
+async fn polygon_extrude_collapsed_corner_is_still_a_400() {
+    let state = build_state(open_db(&temp_db_path()).await, true).await;
+    let (s, body) = dispatch(
+        &state,
+        post(
+            "/api/geometry/extrude",
+            json!({
+                "profile": [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [6.0, 4.0, 0.0], [0.0, 4.0, 0.0]],
+                "distance": 5.0,
+            }),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "body = {body}");
+    assert_eq!(body["error_code"], "invalid_parameter", "body = {body}");
+    let msg = body["error"].as_str().unwrap_or_default();
+    assert!(
+        msg.starts_with("profile[0] and profile[1] collapse to the same vertex under tolerance"),
+        "{msg:?}"
+    );
+    assert!(!msg.contains("  "), "no absorbed indentation: {msg:?}");
+    assert_eq!(
+        state.model.read().await.vertices.len(),
+        0,
+        "the refused polygon's vertices are rolled back, not left as orphans"
+    );
+}
+
+/// `/api/datums` create (plane, axis, point), rename, transform, a default's
+/// visibility, and delete record `datum_*` kinds that had no replay arm (RED at
+/// BASE: `unknown operation kind: datum_create`). The rebuilt store must hold
+/// the same datums — ids, names, visibility and FRAMES.
+#[tokio::test]
+async fn datum_history_survives_restart() {
+    let path = temp_db_path();
+    let (total, datums_before) = {
+        let state = build_state(open_db(&path).await, true).await;
+        let translate = |x: f64, y: f64, z: f64| {
+            json!([
+                [1.0, 0.0, 0.0, x],
+                [0.0, 1.0, 0.0, y],
+                [0.0, 0.0, 1.0, z],
+                [0.0, 0.0, 0.0, 1.0]
+            ])
+        };
+        let mut ids = Vec::new();
+        for payload in [
+            json!({ "kind": "plane", "name": "Deck", "transform": translate(0.0, 0.0, 12.0) }),
+            json!({ "kind": "axis", "name": "Spindle", "origin": [3.0, 1.0, 0.0], "direction": "y" }),
+            json!({ "kind": "point", "name": "Probe", "position": [1.0, 2.0, 3.0] }),
+        ] {
+            let (s, body) = dispatch(&state, post("/api/datums", payload)).await;
+            assert_eq!(s, StatusCode::CREATED, "datum create; body = {body}");
+            ids.push(body["datum"]["id"].as_u64().expect("datum id"));
+        }
+        let (s, body) = dispatch(
+            &state,
+            patch(
+                &format!("/api/datums/{}", ids[0]),
+                json!({ "name": "Upper deck", "transform": translate(1.0, -2.0, 15.0) }),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "datum update; body = {body}");
+        let (s, body) = dispatch(
+            &state,
+            patch("/api/datums/0/visibility", json!({ "visible": false })),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "default datum visibility; body = {body}");
+        let (s, body) = dispatch(&state, del(&format!("/api/datums/{}", ids[2]))).await;
+        assert_eq!(s, StatusCode::OK, "datum delete; body = {body}");
+        (flush_and_count(&state).await, datum_frames(&state).await)
+    };
+    let state2 = build_state(open_db(&path).await, true).await;
+    let (s, body) = dispatch(&state2, get("/api/durability/status")).await;
+    assert_eq!(s, StatusCode::OK, "body = {body}");
+    assert_eq!(body["quarantined"], false, "body = {body}");
+    assert_eq!(body["status"]["state"], "active", "body = {body}");
+    assert_eq!(
+        body["status"]["events_replayed"],
+        json!(total),
+        "body = {body}"
+    );
+    assert_eq!(
+        datum_frames(&state2).await,
+        datums_before,
+        "the rebuilt datum store must equal the live one"
+    );
+}
+
+/// `POST /api/agent/parts/{id}/reanchor` records the `transform_solid` that
+/// moves the part, then `solid_reanchor` (no replay arm at BASE: `unknown
+/// operation kind: solid_reanchor`). The rebuilt part must sit where the live
+/// one sat (a replay that moved it twice would not) and carry the same anchor.
+#[tokio::test]
+async fn reanchored_part_survives_restart_in_place() {
+    type Anchor = (u32, [[f64; 4]; 4]);
+    let path = temp_db_path();
+    let (total, fp_before, where_before, anchor_before, solid): (_, _, [f64; 3], Anchor, u32) = {
+        let state = build_state(open_db(&path).await, true).await;
+        let (s, body) = dispatch(
+            &state,
+            post(
+                "/api/datums",
+                json!({
+                    "kind": "plane",
+                    "name": "Mount",
+                    "transform": [[1.0, 0.0, 0.0, 20.0], [0.0, 1.0, 0.0, 0.0],
+                                  [0.0, 0.0, 1.0, 5.0], [0.0, 0.0, 0.0, 1.0]]
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::CREATED, "datum create; body = {body}");
+        let datum = body["datum"]["id"].as_u64().expect("datum id");
+        let (s, body) = dispatch(
+            &state,
+            post(
+                "/api/geometry/box",
+                json!({ "width": 4.0, "depth": 4.0, "height": 4.0 }),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "box create; body = {body}");
+        let solid = body["solid_id"].as_u64().expect("box solid_id") as u32;
+        let (s, body) = dispatch(
+            &state,
+            post(
+                &format!("/api/agent/parts/{solid}/reanchor"),
+                json!({
+                    "new_datum_id": datum,
+                    "local_transform": [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 3.0],
+                                        [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]]
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "reanchor; body = {body}");
+        let (centre, anchor) = {
+            let model = state.model.read().await;
+            let centre = model.solid_world_bbox(solid).expect("bbox").center();
+            let anchor = model.solids.get(solid).expect("solid").anchor.clone();
+            (centre, anchor)
+        };
+        (
+            flush_and_count(&state).await,
+            geom_fingerprint(&state).await,
+            [centre.x, centre.y, centre.z],
+            (
+                anchor.datum_id,
+                geometry_engine::primitives::datum::DatumSource::pack_matrix(
+                    anchor.local_transform,
+                ),
+            ),
+            solid,
+        )
+    };
+    let state2 = build_state(open_db(&path).await, true).await;
+    assert_full_replay(&state2, total, 1, fp_before).await;
+    let model = state2.model.read().await;
+    let centre = model.solid_world_bbox(solid).expect("bbox").center();
+    for (a, b) in [centre.x, centre.y, centre.z].iter().zip(where_before) {
+        assert!(
+            (a - b).abs() < 1e-9,
+            "the part must sit where it sat live: before = {where_before:?}, after = {centre:?}"
+        );
+    }
+    let anchor = model.solids.get(solid).expect("solid").anchor.clone();
+    let anchor_after: Anchor = (
+        anchor.datum_id,
+        geometry_engine::primitives::datum::DatumSource::pack_matrix(anchor.local_transform),
+    );
+    assert_eq!(
+        anchor_after, anchor_before,
+        "the rebuilt part must carry the live anchor"
+    );
+}

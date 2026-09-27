@@ -3814,6 +3814,46 @@ impl BRepModel {
         Ok(removed)
     }
 
+    /// Write a solid's anchor (datum + local frame) WITHOUT moving its
+    /// geometry, keeping the datum propagation graph and the location
+    /// cache in sync. The metadata half of `TopologyBuilder::anchor_solid`,
+    /// which calls it after applying the transform; timeline replay calls it
+    /// alone for a `solid_reanchor` event, whose geometry move is already
+    /// the separately recorded `transform_solid` event before it.
+    pub fn set_solid_anchor(
+        &mut self,
+        solid_id: SolidId,
+        datum_id: crate::primitives::datum::DatumId,
+        local_transform: Matrix4,
+    ) -> Result<(), PrimitiveError> {
+        let solid =
+            self.solids
+                .get_mut(solid_id)
+                .ok_or_else(|| PrimitiveError::InvalidParameters {
+                    parameter: "solid_id".to_string(),
+                    value: solid_id.to_string(),
+                    constraint: "must reference an existing solid".to_string(),
+                })?;
+        let prev_datum = solid.anchor.datum_id;
+        solid.anchor = crate::primitives::solid::SolidAnchor {
+            datum_id,
+            local_transform,
+        };
+        // Slice 5: keep the propagation graph in sync. Drop the old
+        // anchor edge (if any) and register the new one so future
+        // datum moves invalidate this solid's cached descriptor.
+        if prev_datum != datum_id {
+            self.datum_graph
+                .unregister_solid_anchor(solid_id, prev_datum);
+        }
+        self.datum_graph.register_solid_anchor(solid_id, datum_id);
+        // Anchor reassignment alters the descriptor's
+        // `anchor_datum_name` and `center_in_anchor_frame`, plus the
+        // geometry may just have been transformed — flush the cache.
+        self.location_cache.invalidate(solid_id);
+        Ok(())
+    }
+
     /// Re-anchor a solid to a different datum, optionally with a new
     /// local-frame offset. Records `solid_reanchor`.
     ///
@@ -3862,6 +3902,11 @@ impl BRepModel {
         let mut builder = TopologyBuilder::new(self);
         builder.anchor_solid(solid_id, new_datum_id, local)?;
 
+        // `local_transform` is the local frame actually applied (supplied or
+        // preserved). The geometry move itself is the `transform_solid` event
+        // `anchor_solid` recorded just before this one; a replay of this event
+        // restores the anchor from these two fields without moving the solid
+        // again.
         self.record_operation(
             crate::operations::recorder::RecordedOperation::new("solid_reanchor")
                 .with_parameters(serde_json::json!({
@@ -3869,6 +3914,7 @@ impl BRepModel {
                     "previous_datum_id": prev_datum_id,
                     "new_datum_id": new_datum_id,
                     "local_transform_supplied": new_local_transform.is_some(),
+                    "local_transform": matrix4_to_row_major(&local),
                 }))
                 .with_input_solids([solid_id as u64])
                 .with_input_datums([new_datum_id as u64])
@@ -6231,35 +6277,8 @@ impl<'a> TopologyBuilder<'a> {
             })?;
         }
 
-        let solid = self.model.solids.get_mut(solid_id).ok_or_else(|| {
-            PrimitiveError::InvalidParameters {
-                parameter: "solid_id".to_string(),
-                value: solid_id.to_string(),
-                constraint: "must reference an existing solid".to_string(),
-            }
-        })?;
-        let prev_datum = solid.anchor.datum_id;
-        solid.anchor = crate::primitives::solid::SolidAnchor {
-            datum_id,
-            local_transform,
-        };
-        // Slice 5: keep the propagation graph in sync. Drop the old
-        // anchor edge (if any) and register the new one so future
-        // datum moves invalidate this solid's cached descriptor.
-        if prev_datum != datum_id {
-            self.model
-                .datum_graph
-                .unregister_solid_anchor(solid_id, prev_datum);
-        }
         self.model
-            .datum_graph
-            .register_solid_anchor(solid_id, datum_id);
-        // Anchor reassignment alters the descriptor's
-        // `anchor_datum_name` and `center_in_anchor_frame`, plus the
-        // geometry was just transformed — flush the cache.
-        self.model.location_cache.invalidate(solid_id);
-
-        Ok(())
+            .set_solid_anchor(solid_id, datum_id, local_transform)
     }
 
     /// Create a 3D box anchored to a datum.
