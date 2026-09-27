@@ -23,6 +23,7 @@ mod assembly_instances;
 mod assembly_mates;
 mod assembly_mgr;
 mod auth_middleware;
+mod auth_revocation_tests;
 mod auth_slice1_tests;
 mod auth_slice4_tests;
 mod auth_slice5_tests;
@@ -9714,6 +9715,82 @@ mod tests {
     }
 }
 
+/// What [`restore_durable_auth`] brought back from the store at boot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DurableAuthRestore {
+    /// API keys restored (`None` when they could not be loaded — logged,
+    /// and those keys fail closed: they simply do not authenticate).
+    pub(crate) api_keys: Option<usize>,
+    /// Token revocations restored.
+    pub(crate) revocations: usize,
+}
+
+/// Boot-time auth durability: attach the database as the `AuthManager`'s
+/// durable store and restore what it holds. The one function production
+/// boot (`main`) and the restart tests both call, so the tests exercise
+/// the boot path rather than a copy of it.
+///
+/// The two restores fail differently, on purpose:
+///
+/// - API keys that cannot be loaded fail CLOSED — a key that is not in
+///   memory does not authenticate — so that is logged and boot continues
+///   (auth Slice 3's behaviour, unchanged).
+/// - A revocation list that cannot be loaded would fail OPEN: serving with
+///   it empty silently un-does every logout and re-arms every spent refresh
+///   token. That is an `Err`, and `main` refuses to boot on it (Task 72).
+pub(crate) async fn restore_durable_auth(
+    state: &AppState,
+) -> Result<DurableAuthRestore, session_manager::SessionError> {
+    let auth_manager = state.session_manager.auth_manager();
+    auth_manager.attach_api_key_store(state.database.clone());
+    let api_keys = match auth_manager.load_persisted_api_keys().await {
+        Ok(restored) => {
+            tracing::info!(
+                target: "auth",
+                restored,
+                "auth: restored {restored} persisted API key(s) at boot"
+            );
+            Some(restored)
+        }
+        Err(e) => {
+            tracing::error!(
+                target: "auth",
+                error = %e,
+                "{}",
+                concat!(
+                    "auth: failed to restore persisted API keys at boot — ",
+                    "previously provisioned keys may not authenticate until reprovisioned"
+                )
+            );
+            None
+        }
+    };
+    let revocations = match auth_manager.load_persisted_revocations().await {
+        Ok(restored) => restored,
+        Err(e) => {
+            tracing::error!(
+                target: "auth",
+                error = %e,
+                "{}",
+                concat!(
+                    "auth: failed to restore token revocations at boot — refusing to serve, ",
+                    "since an empty list would re-admit every logged-out or spent token"
+                )
+            );
+            return Err(e);
+        }
+    };
+    tracing::info!(
+        target: "auth",
+        revocations,
+        "auth: restored {revocations} token revocation(s) at boot"
+    );
+    Ok(DurableAuthRestore {
+        api_keys,
+        revocations,
+    })
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Load `roshera-backend/.env` into the process environment (gitignored —
@@ -10149,26 +10226,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // event log: `ROSHERA_DURABILITY=off` keeps the instance a fully-volatile
     // scratch server. Restored keys carry their real `active` flag, so a
     // revoked key stays denied across the restart.
+    //
+    // Task 72: the same store carries token revocations; a revocation list
+    // that cannot be restored stops the boot (see `restore_durable_auth`).
     if durability::durability_enabled() {
-        let auth_manager = state.session_manager.auth_manager();
-        auth_manager.attach_api_key_store(state.database.clone());
-        match auth_manager.load_persisted_api_keys().await {
-            Ok(restored) => {
-                tracing::info!(
-                    target: "auth",
-                    restored,
-                    "auth: restored {restored} persisted API key(s) at boot"
-                );
-            }
-            Err(e) => {
-                tracing::error!(
-                    target: "auth",
-                    error = %e,
-                    "auth: failed to restore persisted API keys at boot — \
-                     previously provisioned keys may not authenticate until reprovisioned"
-                );
-            }
-        }
+        restore_durable_auth(&state).await?;
     }
 
     // Background sweeper for expired transactions. The TX_TTL inside

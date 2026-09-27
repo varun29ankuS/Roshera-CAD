@@ -3,13 +3,13 @@
 //! This module provides JWT-based authentication, API key management,
 //! and security features for the CAD system.
 
-use crate::database::DatabasePersistence;
+use crate::database::{DatabasePersistence, RevokedTokenRecord};
 use argon2::{
     password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
     Argon2,
 };
 use chrono::{DateTime, Duration, Utc};
-use dashmap::DashMap;
+use dashmap::{mapref::entry::Entry, DashMap};
 use hmac::{Hmac, Mac};
 use jwt::{SignWithKey, VerifyWithKey};
 use serde::{Deserialize, Serialize};
@@ -28,7 +28,8 @@ type HmacSha256 = Hmac<Sha256>;
 /// once and referenced from all three sites that depend on it: minting
 /// ([`AuthManager::create_token`]), the access gate
 /// ([`AuthManager::verify_token`]), and the refresh gate
-/// ([`AuthManager::verify_refresh_token`]).
+/// (`AuthManager::decode_refresh_token`, used by
+/// [`AuthManager::rotate_refresh_token`]).
 const REFRESH_AUDIENCE: &str = "refresh";
 
 /// The kind of principal a credential was minted for.
@@ -212,19 +213,30 @@ pub enum SecurityEvent {
     },
 }
 
-/// The refresh token minted alongside one access token.
+/// Domain separator for [`refresh_jti_for`], so the derived id can never
+/// coincide with a hash of the same bytes taken for any other purpose.
+const REFRESH_JTI_DOMAIN: &[u8] = b"roshera/refresh-jti/v1\0";
+
+/// The `jti` of the refresh token minted alongside the access token whose
+/// `jti` is `access_jti`.
 ///
-/// `expires_at` is the REFRESH token's expiry, not the access token's.
-/// The two differ by orders of magnitude (1 hour vs. 7 days by default),
-/// and the longer one is what governs how long this link must survive:
-/// dropping it when the access token expired would silently make the
-/// still-valid refresh token unrevocable for the rest of its life.
-#[derive(Debug, Clone)]
-struct RefreshLink {
-    /// `jti` of the refresh token.
-    jti: String,
-    /// When that refresh token stops being valid on its own.
-    expires_at: DateTime<Utc>,
+/// Logout holds only the ACCESS token, yet must revoke the refresh token
+/// minted with it, or "log out" ends one hour of access and leaves seven
+/// days of renewal rights. That access → refresh edge used to be an
+/// in-memory map, and a map dies with the process: after a restart, logging
+/// out with a still-valid access token left its refresh token alive (Task
+/// 72). Persisting the map would put a database write on every login, and
+/// would still miss tokens another instance minted. Deriving the edge
+/// needs neither — every instance, before and after any restart, computes
+/// the same refresh `jti` from the access `jti` it is handed.
+///
+/// A `jti` is an identifier, not a secret: knowing one grants nothing,
+/// because every token is still checked against the signing key.
+fn refresh_jti_for(access_jti: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(REFRESH_JTI_DOMAIN);
+    hasher.update(access_jti.as_bytes());
+    format!("{:x}", hasher.finalize())
 }
 
 /// Authentication manager
@@ -239,21 +251,19 @@ pub struct AuthManager {
     two_factor: Arc<DashMap<String, TwoFactorAuth>>,
     /// Security events
     security_events: Arc<DashMap<String, Vec<SecurityEvent>>>,
-    /// Revoked tokens
+    /// Revoked token `jti` → when it was revoked.
+    ///
+    /// The in-process single point of truth for "is this token revoked?",
+    /// and — through [`DashMap::entry`] — for "has this refresh token been
+    /// spent?". When a durable store is attached every entry is written
+    /// through to it first (see [`AuthManager::revoke_token`] and
+    /// [`AuthManager::rotate_refresh_token`]) and the list is restored from
+    /// it at boot ([`AuthManager::load_persisted_revocations`]), so a
+    /// restart no longer empties it.
+    ///
+    /// The refresh token minted with an access token is reached through
+    /// [`refresh_jti_for`], not through a stored link.
     revoked_tokens: Arc<DashMap<String, DateTime<Utc>>>,
-    /// Access `jti` → the `jti` of the refresh token minted with it.
-    ///
-    /// Logout revokes the access `jti` because that is the only id the
-    /// logout handler holds — the refresh token is never presented at
-    /// logout. Without this link, revoking the access token left its
-    /// refresh token valid for the remaining seven days, so "log out"
-    /// ended one hour of access and none of the renewal rights.
-    ///
-    /// The refresh claims already carry `custom.parent_jti` pointing the
-    /// other way (refresh → access); that direction is useless here,
-    /// since revocation starts from the access side and never sees the
-    /// refresh token's bytes. This map is the forward edge.
-    refresh_jtis: Arc<DashMap<String, RefreshLink>>,
     /// Failed login attempts
     failed_attempts: Arc<DashMap<String, Vec<DateTime<Utc>>>>,
     /// Rate limiting tracking
@@ -266,7 +276,12 @@ pub struct AuthManager {
     /// instead of dying with the in-memory `api_keys` map. When absent
     /// (unit tests, no database, or `ROSHERA_DURABILITY=off`) the manager
     /// is purely in-memory, exactly as before this slice.
-    api_key_store: OnceLock<Arc<dyn DatabasePersistence>>,
+    ///
+    /// Token revocations ride the same store (Task 72): with it attached,
+    /// logout and refresh rotation record their revocations durably before
+    /// reporting success, and [`AuthManager::load_persisted_revocations`]
+    /// restores them at boot.
+    durable_store: OnceLock<Arc<dyn DatabasePersistence>>,
     /// Configuration
     config: AuthConfig,
 }
@@ -520,10 +535,9 @@ impl AuthManager {
             two_factor: Arc::new(DashMap::new()),
             security_events: Arc::new(DashMap::new()),
             revoked_tokens: Arc::new(DashMap::new()),
-            refresh_jtis: Arc::new(DashMap::new()),
             failed_attempts: Arc::new(DashMap::new()),
             rate_limits: Arc::new(DashMap::new()),
-            api_key_store: OnceLock::new(),
+            durable_store: OnceLock::new(),
             config,
         })
     }
@@ -611,6 +625,26 @@ impl AuthManager {
         roles: Vec<String>,
         principal: PrincipalKind,
     ) -> Result<SessionToken, SessionError> {
+        let session_token = self.mint_token(user_id, email, roles, principal)?;
+        self.record_issued(&session_token);
+        Ok(session_token)
+    }
+
+    /// Sign a fresh access + refresh pair WITHOUT recording it anywhere.
+    ///
+    /// Split out of [`AuthManager::create_token`] for
+    /// [`AuthManager::rotate_refresh_token`], which must mint the new pair
+    /// before it spends the presented token (so a failed mint never costs
+    /// the caller a working credential) yet must leave no trace of a pair it
+    /// then declines to hand out because it lost the race to spend that
+    /// token.
+    fn mint_token(
+        &self,
+        user_id: &str,
+        email: Option<String>,
+        roles: Vec<String>,
+        principal: PrincipalKind,
+    ) -> Result<SessionToken, SessionError> {
         let now = Utc::now();
         let token_id = Uuid::new_v4().to_string();
 
@@ -653,10 +687,13 @@ impl AuthManager {
         // No new exposure: a JWT payload is base64, not encrypted, but the
         // access token minted in the same breath already carries these
         // exact claims to the same holder.
-        let refresh_id = Uuid::new_v4().to_string();
+        //
+        // The refresh `jti` is DERIVED from the access `jti` (see
+        // `refresh_jti_for`): that is the edge logout walks, and it has to
+        // hold in every process that will ever see the access token.
         let refresh_claims = TokenClaims {
             sub: user_id.to_string(),
-            jti: refresh_id.clone(),
+            jti: refresh_jti_for(&token_id),
             iat: now.timestamp(),
             exp: (now + Duration::seconds(self.config.refresh_expiry_seconds)).timestamp(),
             nbf: now.timestamp(),
@@ -674,37 +711,86 @@ impl AuthManager {
                 reason: format!("Failed to create refresh token: {}", e),
             })?;
 
-        let session_token = SessionToken {
-            id: token_id.clone(),
+        Ok(SessionToken {
+            id: token_id,
             user_id: user_id.to_string(),
-            token: token.clone(),
+            token,
             refresh_token: Some(refresh_token),
             created_at: now,
             expires_at: now + Duration::seconds(self.config.token_expiry_seconds),
             last_activity: now,
             ip_address: None,
             user_agent: None,
-        };
+        })
+    }
 
-        // Store token, and the access → refresh link that lets
-        // `revoke_token` reach the refresh credential it was minted with.
-        self.tokens.insert(token_id.clone(), session_token.clone());
-        self.refresh_jtis.insert(
-            token_id.clone(),
-            RefreshLink {
-                jti: refresh_id,
-                expires_at: now + Duration::seconds(self.config.refresh_expiry_seconds),
-            },
-        );
-
-        // Log security event
+    /// Record a minted pair as issued: cache it for the idle-timeout clock
+    /// and log its creation. The second half of
+    /// [`AuthManager::create_token`].
+    fn record_issued(&self, session_token: &SessionToken) {
+        self.tokens
+            .insert(session_token.id.clone(), session_token.clone());
         self.log_security_event(SecurityEvent::TokenCreated {
-            user_id: user_id.to_string(),
-            token_id,
+            user_id: session_token.user_id.clone(),
+            token_id: session_token.id.clone(),
             token_type: "access".to_string(),
         });
+    }
 
-        Ok(session_token)
+    /// When a revocation recorded at `revoked_at` may be forgotten.
+    ///
+    /// A revocation must outlive the credential it revokes, so the horizon
+    /// is DERIVED from the lifetimes this manager actually mints — never a
+    /// literal. `max` over both lifetimes: nothing forces an operator to
+    /// configure the refresh token as the longer-lived of the two, and the
+    /// horizon must cover whichever credential outlives the other. Clamped
+    /// at zero so a nonsensical negative config cannot put the horizon in
+    /// the past and forget every revocation on the spot.
+    ///
+    /// [`AuthManager::cleanup_expired`] prunes the in-memory list on this
+    /// horizon, and the durable rows carry `revoked_at` + this horizon as
+    /// their expiry, so the two forget a revocation at the same moment.
+    fn revocation_horizon(&self) -> Duration {
+        Duration::seconds(
+            self.config
+                .refresh_expiry_seconds
+                .max(self.config.token_expiry_seconds)
+                .max(0),
+        )
+    }
+
+    /// Write `jtis` through to the durable store, all or nothing, when one
+    /// is attached. Returns one flag per `jti` (`true` when this call
+    /// recorded it, `false` when it was already on file), or `None` when no
+    /// store is attached and the manager is purely in-memory.
+    ///
+    /// Each row expires at `revoked_at` + [`AuthManager::revocation_horizon`]
+    /// — the moment `cleanup_expired` would forget it in memory — or at
+    /// `expiry_floor_ms` when that is later. The floor is the revoked
+    /// credential's own `exp` when the caller knows it (rotation does), so
+    /// a row can never lapse before its token does, even if the configured
+    /// lifetimes were shortened after the token was minted.
+    async fn persist_revocations(
+        &self,
+        jtis: &[&str],
+        revoked_at: DateTime<Utc>,
+        expiry_floor_ms: Option<i64>,
+    ) -> Result<Option<Vec<bool>>, SessionError> {
+        let store = match self.durable_store.get() {
+            Some(store) => store,
+            None => return Ok(None),
+        };
+        let horizon_ms = (revoked_at + self.revocation_horizon()).timestamp_millis();
+        let expires_at_ms = expiry_floor_ms.map_or(horizon_ms, |floor| floor.max(horizon_ms));
+        let records: Vec<RevokedTokenRecord> = jtis
+            .iter()
+            .map(|jti| RevokedTokenRecord {
+                jti: (*jti).to_string(),
+                revoked_at_ms: revoked_at.timestamp_millis(),
+                expires_at_ms,
+            })
+            .collect();
+        store.record_token_revocations(&records).await.map(Some)
     }
 
     /// Verify JWT token.
@@ -796,7 +882,7 @@ impl AuthManager {
     ///    operator put in `ROSHERA_AUTH_AUDIENCE`. Rule 1 alone would let
     ///    an operator who listed `refresh` in that env var re-open the
     ///    hole from configuration; a refresh token is admitted by
-    ///    [`AuthManager::verify_refresh_token`] and by nothing else, and
+    ///    [`AuthManager::rotate_refresh_token`] and by nothing else, and
     ///    that is not the operator's to negotiate.
     ///
     /// The `jwt` crate this module signs with (`jwt 0.16`) verifies the
@@ -810,25 +896,25 @@ impl AuthManager {
             && !aud.iter().any(|a| a == REFRESH_AUDIENCE)
     }
 
-    /// Verify a refresh token, for the token-refresh path ONLY
-    /// (`api-server/src/handlers/auth.rs::refresh_token`).
+    /// The refresh gate's first two checks: signature, then audience.
     ///
-    /// This is the only function that accepts a refresh credential, and
-    /// it accepts nothing else: `aud` must be exactly
-    /// `[`[`REFRESH_AUDIENCE`]`]`, so an access token presented at
-    /// `/api/auth/refresh` is refused rather than rolled forward into a
-    /// fresh hour of access indefinitely.
+    /// `aud` must be exactly `[`[`REFRESH_AUDIENCE`]`]`, so an access token
+    /// presented at `/api/auth/refresh` is refused rather than rolled
+    /// forward into a fresh hour of access indefinitely. This is the only
+    /// function that admits a refresh credential, and it admits nothing
+    /// else; [`AuthManager::rotate_refresh_token`] is its production caller.
     ///
-    /// Checks: signature → audience → revocation → absolute expiry.
+    /// Revocation is deliberately NOT checked here: for rotation the
+    /// revocation check IS the atomic claim, and a separate `contains_key`
+    /// ahead of it would be a check-then-act of its own.
     ///
     /// No idle-timeout check and no `last_activity` write, unlike
     /// [`AuthManager::verify_token`]: a refresh token has no
     /// `SessionToken` entry of its own (only the access `jti` is cached),
     /// so there is no activity clock to consult or advance. Its
-    /// revocation is reached through the access → refresh link recorded
-    /// by [`AuthManager::create_token`] and walked by
-    /// [`AuthManager::revoke_token`].
-    pub fn verify_refresh_token(&self, token: &str) -> Result<TokenClaims, SessionError> {
+    /// revocation is reached from the access `jti` through
+    /// [`refresh_jti_for`], which [`AuthManager::revoke_token`] walks.
+    fn decode_refresh_token(&self, token: &str) -> Result<TokenClaims, SessionError> {
         let claims: TokenClaims = token
             .verify_with_key(&*self.jwt_secret)
             .map_err(|_e| SessionError::AccessDenied)?;
@@ -837,14 +923,14 @@ impl AuthManager {
             return Err(SessionError::AccessDenied);
         }
 
-        if self.revoked_tokens.contains_key(&claims.jti) {
-            return Err(SessionError::AccessDenied);
-        }
+        Ok(claims)
+    }
 
+    /// The absolute-expiry check of the refresh gate.
+    fn refresh_unexpired(claims: TokenClaims) -> Result<TokenClaims, SessionError> {
         if claims.exp < Utc::now().timestamp() {
             return Err(SessionError::Expired { id: claims.jti });
         }
-
         Ok(claims)
     }
 
@@ -880,30 +966,86 @@ impl AuthManager {
     /// whoever authorized the credential. The cost is honest and worth
     /// naming: a role revoked mid-session is not observed until the
     /// refresh token itself expires, since nothing re-reads the store.
-    pub fn rotate_refresh_token(&self, refresh_token: &str) -> Result<SessionToken, SessionError> {
-        let claims = self.verify_refresh_token(refresh_token)?;
+    ///
+    /// **Exactly one exchange of a token succeeds** (Task 72). Verifying and
+    /// then retiring used to be check-then-insert, so two concurrent
+    /// refreshes presenting the same token both passed the check and both
+    /// came back with a fresh pair. Spending is now one atomic claim, in two
+    /// places:
+    ///
+    /// - *In process*, [`DashMap::entry`] on `revoked_tokens` is the single
+    ///   point of truth: the first claimant inserts, every later one finds
+    ///   the slot occupied and is refused [`SessionError::AccessDenied`]
+    ///   without touching the store.
+    /// - *Across instances* sharing a database, each has its own in-memory
+    ///   list, so the store arbitrates: the claim is written insert-if-absent
+    ///   on the `jti` primary key, and an instance told the row was already
+    ///   there lost the race to another instance and is refused the same
+    ///   way.
+    ///
+    /// **A spend that is not durable is not a spend.** If the store cannot
+    /// record it, the in-memory claim is withdrawn and the store's error is
+    /// returned: the caller still holds a working token and may retry, and a
+    /// restart cannot resurrect a token this method reported spent.
+    ///
+    /// A loser is refused, but the token family is NOT revoked: nothing links
+    /// a refresh token to its descendants, and a client that double-submits
+    /// one renewal would be logged out by it.
+    pub async fn rotate_refresh_token(
+        &self,
+        refresh_token: &str,
+    ) -> Result<SessionToken, SessionError> {
+        // Signature, audience and expiry here; revocation is the claim below.
+        let claims = Self::refresh_unexpired(self.decode_refresh_token(refresh_token)?)?;
 
-        let rotated =
-            self.create_token(&claims.sub, claims.email, claims.roles, claims.principal)?;
+        // Mint first, record nothing yet: a failed mint leaves the presented
+        // token unspent, and a pair minted by a claimant that then loses is
+        // simply dropped — never cached, logged, or handed out.
+        let rotated = self.mint_token(&claims.sub, claims.email, claims.roles, claims.principal)?;
 
-        // Retire the spent token. `revoked_tokens` is the same list
-        // `verify_refresh_token` consults, so a replay is refused there.
-        self.revoked_tokens.insert(claims.jti.clone(), Utc::now());
+        // Claim the token in process. The entry guard is released at the end
+        // of this statement, before any await.
+        let spent_at = Utc::now();
+        let claimed = match self.revoked_tokens.entry(claims.jti.clone()) {
+            Entry::Occupied(_) => false,
+            Entry::Vacant(slot) => {
+                slot.insert(spent_at);
+                true
+            }
+        };
+        if !claimed {
+            return Err(SessionError::AccessDenied);
+        }
+
+        // Claim it durably — the only claim another instance can see.
+        match self
+            .persist_revocations(
+                &[claims.jti.as_str()],
+                spent_at,
+                Some(claims.exp.saturating_mul(1000)),
+            )
+            .await
+        {
+            Ok(None) => {}
+            Ok(Some(written)) if written.as_slice() == [true] => {}
+            // Another instance spent it first. The in-memory entry stays: it
+            // is true.
+            Ok(Some(_)) => return Err(SessionError::AccessDenied),
+            Err(e) => {
+                // Withdraw only OUR claim. A logout that revoked this token
+                // meanwhile wrote its own timestamp over it and keeps it.
+                self.revoked_tokens
+                    .remove_if(&claims.jti, |_, at| *at == spent_at);
+                return Err(e);
+            }
+        }
+
+        self.record_issued(&rotated);
         self.log_security_event(SecurityEvent::TokenRevoked {
             user_id: claims.sub.clone(),
             token_id: claims.jti.clone(),
             reason: "refresh_token_rotated".to_string(),
         });
-
-        // Drop the spent token's own access → refresh link. Without this
-        // every renewal left one behind, and the map grew for the life of
-        // the session rather than the life of a credential. The refresh
-        // claims carry their access token's id in `parent_jti`; a token
-        // that somehow lacks it simply leaves the entry to `cleanup_expired`
-        // rather than guessing at a key to delete.
-        if let Some(parent_jti) = claims.custom.get("parent_jti").and_then(|v| v.as_str()) {
-            self.refresh_jtis.remove(parent_jti);
-        }
 
         Ok(rotated)
     }
@@ -912,16 +1054,44 @@ impl AuthManager {
     ///
     /// `token_id` is an access `jti` — that is what logout has in hand.
     /// The refresh token minted with it is revoked in the same call, via
-    /// the link recorded by [`AuthManager::create_token`]: leaving it
-    /// alive would mean "log out" ended one hour of access while the
-    /// seven-day right to mint fresh access tokens survived.
+    /// [`refresh_jti_for`]: leaving it alive would mean "log out" ended one
+    /// hour of access while the seven-day right to mint fresh access tokens
+    /// survived.
+    ///
+    /// **Durable before done** (Task 72). With a store attached, both
+    /// revocations are written through to it — together, all or nothing —
+    /// BEFORE anything changes in memory. If that write fails the error is
+    /// returned and nothing has changed: both tokens are still valid, and
+    /// the caller must not be told it logged out. A logout that held only in
+    /// memory would silently un-do itself at the next restart.
+    ///
+    /// **Reach across instances.** The refresh token is refused on EVERY
+    /// instance sharing the store at once, because each rotation claims its
+    /// token through the store. The ACCESS token is refused at once only on
+    /// this instance; [`AuthManager::verify_token`] reads memory alone, so
+    /// another instance may keep honouring it for at most
+    /// `token_expiry_seconds` (3600 s by default) or until its next boot
+    /// restores the row, whichever comes first.
     ///
     /// Both revocations are logged. Two credentials stopped being valid,
     /// and an audit log that recorded one of them would be understating
     /// what happened.
-    pub fn revoke_token(&self, token_id: &str, reason: &str, revoked_by: &str) {
+    pub async fn revoke_token(
+        &self,
+        token_id: &str,
+        reason: &str,
+        revoked_by: &str,
+    ) -> Result<(), SessionError> {
         let now = Utc::now();
+        let refresh_jti = refresh_jti_for(token_id);
+
+        // Already-revoked is fine here (the flags are not consulted): a
+        // repeated logout revokes nothing new and is not an error.
+        self.persist_revocations(&[token_id, refresh_jti.as_str()], now, None)
+            .await?;
+
         self.revoked_tokens.insert(token_id.to_string(), now);
+        self.revoked_tokens.insert(refresh_jti.clone(), now);
         self.tokens.remove(token_id);
 
         self.log_security_event(SecurityEvent::TokenRevoked {
@@ -929,15 +1099,61 @@ impl AuthManager {
             token_id: token_id.to_string(),
             reason: reason.to_string(),
         });
+        self.log_security_event(SecurityEvent::TokenRevoked {
+            user_id: revoked_by.to_string(),
+            token_id: refresh_jti,
+            reason: format!("{} (refresh token of {})", reason, token_id),
+        });
 
-        if let Some((_, link)) = self.refresh_jtis.remove(token_id) {
-            self.revoked_tokens.insert(link.jti.clone(), now);
-            self.log_security_event(SecurityEvent::TokenRevoked {
-                user_id: revoked_by.to_string(),
-                token_id: link.jti,
-                reason: format!("{} (refresh token of {})", reason, token_id),
-            });
+        Ok(())
+    }
+
+    /// Restore the durable revocation list into memory at boot (Task 72).
+    ///
+    /// Call once, after [`AuthManager::attach_api_key_store`] and before the
+    /// server serves traffic. Rows whose credential can no longer verify on
+    /// its own are pruned from the store first and never loaded. Returns the
+    /// number of revocations restored; `Ok(0)` when no store is attached.
+    ///
+    /// A failure here must stop the boot, not be logged past: serving with
+    /// an empty list would silently un-do every logout and re-arm every
+    /// spent refresh token. A failed PRUNE is only housekeeping — the load
+    /// filters on expiry itself — so it is logged and the load proceeds.
+    pub async fn load_persisted_revocations(&self) -> Result<usize, SessionError> {
+        let store = match self.durable_store.get() {
+            Some(store) => store,
+            None => return Ok(0),
+        };
+        let now_ms = Utc::now().timestamp_millis();
+        if let Err(e) = store.prune_token_revocations(now_ms).await {
+            tracing::warn!(
+                target: "auth",
+                error = %e,
+                "auth: could not prune lapsed token revocations; loading the live ones regardless"
+            );
         }
+        let rows = store.load_token_revocations(now_ms).await?;
+        let restored = rows.len();
+        for row in rows {
+            let revoked_at =
+                DateTime::<Utc>::from_timestamp_millis(row.revoked_at_ms).ok_or_else(|| {
+                    SessionError::PersistenceError {
+                        reason: format!(
+                            "revoked_tokens row for {} has an unrepresentable revoked_at ({} ms)",
+                            row.jti, row.revoked_at_ms
+                        ),
+                    }
+                })?;
+            self.revoked_tokens
+                .entry(row.jti)
+                .and_modify(|at| {
+                    if revoked_at > *at {
+                        *at = revoked_at;
+                    }
+                })
+                .or_insert(revoked_at);
+        }
+        Ok(restored)
     }
 
     /// Create API key
@@ -1006,7 +1222,7 @@ impl AuthManager {
     /// panicking, since the lint policy denies `panic!` and a startup
     /// misconfiguration must not take the process down.
     pub fn attach_api_key_store(&self, store: Arc<dyn DatabasePersistence>) {
-        if self.api_key_store.set(store).is_err() {
+        if self.durable_store.set(store).is_err() {
             tracing::warn!(
                 target: "auth",
                 "attach_api_key_store called twice — keeping the first store, ignoring the second"
@@ -1040,7 +1256,7 @@ impl AuthManager {
         let (raw_key, api_key) =
             self.create_api_key(user_id, name, permissions, expires_in_days, principal)?;
 
-        if let Some(store) = self.api_key_store.get() {
+        if let Some(store) = self.durable_store.get() {
             if let Err(e) = store.save_api_key(&api_key).await {
                 // Roll back the in-memory insert: a key that could not be
                 // persisted must not be honoured, or it would work until the
@@ -1068,7 +1284,7 @@ impl AuthManager {
     /// keys carry their real `active` flag, so a revoked key stays denied
     /// after a restart.
     pub async fn load_persisted_api_keys(&self) -> Result<usize, SessionError> {
-        let store = match self.api_key_store.get() {
+        let store = match self.durable_store.get() {
             Some(store) => store,
             None => return Ok(0),
         };
@@ -1123,7 +1339,7 @@ impl AuthManager {
             entry.value().clone()
         };
 
-        if let Some(store) = self.api_key_store.get() {
+        if let Some(store) = self.durable_store.get() {
             if let Err(e) = store.save_api_key(&revoked).await {
                 if let Some(mut entry) = self.api_keys.get_mut(key_id) {
                     entry.value_mut().active = true;
@@ -1392,17 +1608,10 @@ impl AuthManager {
         // Remove expired tokens
         self.tokens.retain(|_, token| token.expires_at > now);
 
-        // Drop access → refresh links only once the REFRESH token itself
-        // has expired. Keying this on the access token's expiry (an hour,
-        // by default) would leave six days of still-valid refresh tokens
-        // that `revoke_token` could no longer reach.
-        self.refresh_jtis.retain(|_, link| link.expires_at > now);
-
         // Remove old revoked tokens.
         //
-        // A revocation must outlive the credential it revokes, so the
-        // horizon is DERIVED from the lifetimes this manager actually
-        // mints — never a literal. It was `Duration::days(7)`, which
+        // The horizon is `revocation_horizon()`, derived from the lifetimes
+        // this manager actually mints. It was `Duration::days(7)`, which
         // matched the *default* refresh lifetime exactly and was
         // therefore right by coincidence rather than by construction:
         // `refresh_expiry_seconds` is operator-configurable
@@ -1410,20 +1619,7 @@ impl AuthManager {
         // var is documented to accept, a revoked refresh token had its
         // revocation pruned on day 8 and began verifying again — a logout
         // that silently un-did itself six days later.
-        //
-        // `max` over both lifetimes rather than `refresh_expiry_seconds`
-        // alone: nothing forces an operator to configure the refresh
-        // token as the longer-lived of the two, and the horizon must
-        // cover whichever credential outlives the other. Clamped at zero
-        // so a nonsensical negative config cannot push the cutoff into
-        // the future and prune every revocation on the spot.
-        let revocation_horizon = Duration::seconds(
-            self.config
-                .refresh_expiry_seconds
-                .max(self.config.token_expiry_seconds)
-                .max(0),
-        );
-        let cutoff = now - revocation_horizon;
+        let cutoff = now - self.revocation_horizon();
         self.revoked_tokens
             .retain(|_, revoked_at| *revoked_at > cutoff);
 
@@ -1543,6 +1739,30 @@ impl AuthManager {
 mod tests {
     use super::*;
 
+    impl AuthManager {
+        /// Check a refresh token WITHOUT spending it: signature → audience →
+        /// revocation → absolute expiry. Test-only.
+        ///
+        /// Production never asks "is this refresh token valid?" without also
+        /// spending it: the one production path that accepts a refresh
+        /// credential is [`AuthManager::rotate_refresh_token`], whose atomic
+        /// claim is its revocation check. A public non-spending check would be
+        /// a capability wired to nothing, so this exists only for the unit
+        /// tests in this module, as the oracle for "is it revoked in memory?".
+        pub(crate) fn verify_refresh_token(
+            &self,
+            token: &str,
+        ) -> Result<TokenClaims, SessionError> {
+            let claims = self.decode_refresh_token(token)?;
+
+            if self.revoked_tokens.contains_key(&claims.jti) {
+                return Err(SessionError::AccessDenied);
+            }
+
+            Self::refresh_unexpired(claims)
+        }
+    }
+
     #[test]
     fn test_password_hashing() {
         let auth = AuthManager::new(AuthConfig::default(), "test-secret").unwrap();
@@ -1554,8 +1774,8 @@ mod tests {
         assert!(!auth.verify_password("wrong-password", &hash).unwrap());
     }
 
-    #[test]
-    fn test_jwt_tokens() {
+    #[tokio::test]
+    async fn test_jwt_tokens() {
         let auth = AuthManager::new(AuthConfig::default(), "test-secret").unwrap();
 
         let token = auth
@@ -1572,7 +1792,9 @@ mod tests {
         assert_eq!(claims.email, Some("user@example.com".to_string()));
 
         // Revoke token
-        auth.revoke_token(&token.id, "test", "admin");
+        auth.revoke_token(&token.id, "test", "admin")
+            .await
+            .expect("an in-memory revocation cannot fail");
 
         // Should fail now
         assert!(auth.verify_token(&token.token).is_err());
@@ -1740,8 +1962,8 @@ mod tests {
     /// also revoke the refresh token minted with it, or logging out
     /// leaves the caller holding a credential that mints fresh access
     /// tokens for another seven days.
-    #[test]
-    fn logout_revokes_the_refresh_token() {
+    #[tokio::test]
+    async fn logout_revokes_the_refresh_token() {
         let auth = AuthManager::new(AuthConfig::default(), "test-secret").unwrap();
 
         let session_token = auth
@@ -1763,7 +1985,9 @@ mod tests {
         );
 
         // Exactly what `handlers::auth::logout` does: revoke the access jti.
-        auth.revoke_token(&session_token.id, "user_logout", "user-logout");
+        auth.revoke_token(&session_token.id, "user_logout", "user-logout")
+            .await
+            .expect("an in-memory revocation cannot fail");
 
         match auth.verify_refresh_token(&refresh_token) {
             Err(SessionError::AccessDenied) => {}
@@ -1823,8 +2047,8 @@ mod tests {
     /// it just stopped saying who it was. Nothing failed loudly, which is
     /// exactly why it survived: the token verifies, and the identity it
     /// carries is simply blank.
-    #[test]
-    fn rotated_access_token_keeps_email_and_roles() {
+    #[tokio::test]
+    async fn rotated_access_token_keeps_email_and_roles() {
         let auth = AuthManager::new(AuthConfig::default(), "test-secret").unwrap();
         let email = Some("engineer@example.com".to_string());
         let roles = vec!["engineer".to_string(), "reviewer".to_string()];
@@ -1844,6 +2068,7 @@ mod tests {
 
         let rotated = auth
             .rotate_refresh_token(&r1)
+            .await
             .expect("a valid refresh token must rotate");
         let claims = auth
             .verify_token(&rotated.token)
@@ -1866,8 +2091,8 @@ mod tests {
     /// out revoked a token nobody had, leaving R1 alive for its whole
     /// seven days. Every session older than one access-token lifetime was
     /// in that state.
-    #[test]
-    fn logout_after_a_refresh_revokes_the_token_the_client_actually_holds() {
+    #[tokio::test]
+    async fn logout_after_a_refresh_revokes_the_token_the_client_actually_holds() {
         let auth = AuthManager::new(AuthConfig::default(), "test-secret").unwrap();
 
         let first = auth
@@ -1887,6 +2112,7 @@ mod tests {
         // `handlers::auth::refresh_token` does.
         let second = auth
             .rotate_refresh_token(&r1)
+            .await
             .expect("a valid refresh token must rotate");
         let r2 = second
             .refresh_token
@@ -1894,7 +2120,9 @@ mod tests {
             .expect("rotation must hand back a replacement refresh token");
 
         // The client logs out with the access token it now holds.
-        auth.revoke_token(&second.id, "user_logout", "user-rotate");
+        auth.revoke_token(&second.id, "user_logout", "user-rotate")
+            .await
+            .expect("an in-memory revocation cannot fail");
 
         // R2 is the token the client ACTUALLY holds after renewing, and it
         // is the assertion with teeth: only `revoke_token`'s A2 → R2 link
@@ -1927,8 +2155,8 @@ mod tests {
     /// exchange would let a captured one be replayed for the rest of its
     /// lifetime, minting a fresh hour of access each time — the stolen
     /// credential outliving the session it was stolen from.
-    #[test]
-    fn a_refresh_token_cannot_be_spent_twice() {
+    #[tokio::test]
+    async fn a_refresh_token_cannot_be_spent_twice() {
         let auth = AuthManager::new(AuthConfig::default(), "test-secret").unwrap();
 
         let first = auth
@@ -1946,6 +2174,7 @@ mod tests {
 
         let second = auth
             .rotate_refresh_token(&r1)
+            .await
             .expect("the first exchange must succeed");
         assert!(
             second.refresh_token.is_some(),
@@ -1953,7 +2182,7 @@ mod tests {
              client is left unable to renew",
         );
 
-        match auth.rotate_refresh_token(&r1) {
+        match auth.rotate_refresh_token(&r1).await {
             Err(SessionError::AccessDenied) => {}
             other => panic!(
                 "a refresh token must not be spendable a second time, got {:?}",
@@ -2000,7 +2229,9 @@ mod tests {
             .clone()
             .expect("create_token must always mint a refresh token");
 
-        auth.revoke_token(&session_token.id, "user_logout", "user-retention");
+        auth.revoke_token(&session_token.id, "user_logout", "user-retention")
+            .await
+            .expect("an in-memory revocation cannot fail");
         assert!(
             auth.verify_refresh_token(&refresh_token).is_err(),
             "sanity: the refresh token must be revoked the moment logout runs",

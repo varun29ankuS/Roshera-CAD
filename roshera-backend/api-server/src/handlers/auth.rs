@@ -13,6 +13,18 @@ use serde::{Deserialize, Serialize};
 use session_manager::{PrincipalKind, SessionError};
 use tracing::{error, info, warn};
 
+/// What a logout the store could not record tells its caller (Task 72).
+pub(crate) const LOGOUT_NOT_DURABLE_MESSAGE: &str = concat!(
+    "The server could not confirm the logout was recorded, ",
+    "so the session may still be active. Retry the logout."
+);
+
+/// What a refresh the store could not record tells its caller (Task 72).
+pub(crate) const REFRESH_NOT_DURABLE_MESSAGE: &str = concat!(
+    "The server could not confirm the refresh was recorded, so no new token was issued. ",
+    "The refresh token you sent may still be valid; retry with it."
+);
+
 /// Response payload for the logout endpoint.
 #[derive(Debug, Serialize)]
 pub struct LogoutResponse {
@@ -457,11 +469,13 @@ pub async fn change_password(
 ///
 /// The supplied refresh token must be a valid, unexpired JWT signed by this server.
 /// The `sub` claim in the refresh token is used to identify the user for whom
-/// a new access token is issued. The refresh token itself is validated via
-/// `AuthManager::verify_refresh_token` so revoked or expired refresh tokens are
-/// rejected — and so is an ACCESS token presented here, which `verify_token`
-/// would have accepted, letting a stolen one-hour credential be rolled forward
-/// indefinitely. That function is the only one that accepts a refresh token.
+/// a new access token is issued. The refresh token itself is validated and
+/// spent by `AuthManager::rotate_refresh_token` — signature, audience
+/// (`aud == ["refresh"]` exactly), expiry, then an atomic single-use claim —
+/// so revoked, spent or expired refresh tokens are rejected, and so is an
+/// ACCESS token presented here, which `verify_token` would have accepted,
+/// letting a stolen one-hour credential be rolled forward indefinitely.
+/// Rotation is the only path that accepts a refresh token.
 pub async fn refresh_token(
     State(state): State<AppState>,
     Json(payload): Json<RefreshRequest>,
@@ -475,8 +489,28 @@ pub async fn refresh_token(
     // access + refresh pair, and retire the presented one. A bare UUID, a
     // tampered token, an access token, or an already-spent refresh token
     // is rejected here.
-    let rotated = match auth_manager.rotate_refresh_token(&payload.refresh_token) {
+    let rotated = match auth_manager
+        .rotate_refresh_token(&payload.refresh_token)
+        .await
+    {
         Ok(t) => t,
+        // The store could not record the spend. The presented token was NOT
+        // spent and is still good; "invalid or expired" would tell the
+        // client to throw away a working credential.
+        Err(SessionError::PersistenceError { reason }) => {
+            error!("Token refresh NOT performed — spend not recorded: {reason}");
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(RefreshResponse {
+                    success: false,
+                    token: None,
+                    refresh_token: None,
+                    expires_in: None,
+                    error: Some(REFRESH_NOT_DURABLE_MESSAGE.to_string()),
+                }),
+            )
+                .into());
+        }
         Err(e) => {
             warn!("Token refresh rejected — invalid token: {:?}", e);
             return Ok(Json(RefreshResponse {
@@ -570,7 +604,29 @@ pub async fn logout(
         }
     };
 
-    auth_manager.revoke_token(&claims.jti, "user_logout", &claims.sub);
+    // Durable before done: `revoke_token` records both revocations in the
+    // store before it changes anything in memory. If the store refused, the
+    // session is still fully active, and saying "logged out" would be a lie
+    // that a restart would expose — so the caller hears that it did not
+    // happen, with a code distinct from "your token was already invalid".
+    if let Err(e) = auth_manager
+        .revoke_token(&claims.jti, "user_logout", &claims.sub)
+        .await
+    {
+        error!(
+            "Logout NOT recorded for user {} (token {}): {}",
+            claims.sub, claims.jti, e
+        );
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(LogoutResponse {
+                success: false,
+                message: LOGOUT_NOT_DURABLE_MESSAGE.to_string(),
+                error: Some("LOGOUT_NOT_RECORDED".to_string()),
+            }),
+        )
+            .into());
+    }
     info!(
         "Logout successful — token {} revoked for user {}",
         claims.jti, claims.sub

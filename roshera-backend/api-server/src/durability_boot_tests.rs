@@ -2615,6 +2615,24 @@ impl DatabasePersistence for FailingSaves {
     ) -> Result<Vec<session_manager::ApiKey>, session_manager::SessionError> {
         self.inner.load_all_api_keys().await
     }
+    async fn record_token_revocations(
+        &self,
+        revocations: &[session_manager::RevokedTokenRecord],
+    ) -> Result<Vec<bool>, session_manager::SessionError> {
+        self.inner.record_token_revocations(revocations).await
+    }
+    async fn load_token_revocations(
+        &self,
+        now_ms: i64,
+    ) -> Result<Vec<session_manager::RevokedTokenRecord>, session_manager::SessionError> {
+        self.inner.load_token_revocations(now_ms).await
+    }
+    async fn prune_token_revocations(
+        &self,
+        now_ms: i64,
+    ) -> Result<u64, session_manager::SessionError> {
+        self.inner.prune_token_revocations(now_ms).await
+    }
     async fn save_timeline_event(
         &self,
         session_id: &str,

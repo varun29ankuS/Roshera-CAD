@@ -292,6 +292,34 @@ pub trait DatabasePersistence: Send + Sync {
     /// stays revoked across a restart rather than silently reviving.
     async fn load_all_api_keys(&self) -> Result<Vec<ApiKey>, SessionError>;
 
+    /// Durable token revocation (Task 72): record every revocation in
+    /// `revocations` in ONE transaction, each as insert-if-absent on `jti`.
+    ///
+    /// Returns one flag per input record, in order: `true` when THIS call
+    /// wrote the row, `false` when that `jti` was already on file (the
+    /// existing row is left exactly as it was). That flag is how two server
+    /// instances sharing a database agree on which of them spent a refresh
+    /// token: the primary key admits exactly one writer.
+    ///
+    /// All or nothing: on `Err` none of this call's rows is stored, so a
+    /// logout that revokes an access token and its refresh token together
+    /// can never land half-done.
+    async fn record_token_revocations(
+        &self,
+        revocations: &[RevokedTokenRecord],
+    ) -> Result<Vec<bool>, SessionError>;
+    /// Every recorded revocation whose `expires_at_ms` is strictly after
+    /// `now_ms` — the boot-restore read path
+    /// ([`crate::auth::AuthManager::load_persisted_revocations`]).
+    async fn load_token_revocations(
+        &self,
+        now_ms: i64,
+    ) -> Result<Vec<RevokedTokenRecord>, SessionError>;
+    /// Delete every revocation whose `expires_at_ms` is at or before
+    /// `now_ms` (its credential can no longer verify on its own); returns
+    /// the number of rows deleted.
+    async fn prune_token_revocations(&self, now_ms: i64) -> Result<u64, SessionError>;
+
     // Timeline operations
     async fn save_timeline_event(
         &self,
@@ -504,6 +532,65 @@ pub struct DocumentRecord {
     /// the document's actual events lives in the events themselves.
     pub created_by: String,
 }
+
+/// One durable token revocation — a row of `revoked_tokens` (Task 72).
+///
+/// Both timestamps are milliseconds since the Unix epoch, stored as a plain
+/// 64-bit integer in BOTH backends, so SQLite and PostgreSQL cannot disagree
+/// about how a time is encoded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RevokedTokenRecord {
+    /// `jti` of the revoked credential (an access or a refresh token).
+    pub jti: String,
+    /// When it was revoked.
+    pub revoked_at_ms: i64,
+    /// When the row may be forgotten: no earlier than the moment the revoked
+    /// credential stops verifying on its own `exp`. Until then, forgetting
+    /// the row would bring the credential back to life.
+    pub expires_at_ms: i64,
+}
+
+/// Decode a `revoked_tokens` row. Generic over the backend so SQLite and
+/// PostgreSQL read the row through ONE mapping; an unreadable cell is a typed
+/// error, never a default — a revocation read back as something else is a
+/// revocation lost.
+fn row_to_revoked_token<R>(row: &R) -> Result<RevokedTokenRecord, SessionError>
+where
+    R: Row,
+    for<'r> String: sqlx::Decode<'r, <R as Row>::Database>,
+    String: sqlx::Type<<R as Row>::Database>,
+    for<'r> i64: sqlx::Decode<'r, <R as Row>::Database>,
+    i64: sqlx::Type<<R as Row>::Database>,
+    &'static str: sqlx::ColumnIndex<R>,
+{
+    let unreadable = |field: &str, e: sqlx::Error| SessionError::PersistenceError {
+        reason: format!("Failed to decode revoked_tokens.{field}: {e}"),
+    };
+    Ok(RevokedTokenRecord {
+        jti: row.try_get("jti").map_err(|e| unreadable("jti", e))?,
+        revoked_at_ms: row
+            .try_get("revoked_at")
+            .map_err(|e| unreadable("revoked_at", e))?,
+        expires_at_ms: row
+            .try_get("expires_at")
+            .map_err(|e| unreadable("expires_at", e))?,
+    })
+}
+
+/// The `revoked_tokens` table, identical in both backends: `jti` is the
+/// primary key, which is what makes insert-if-absent an atomic "was this
+/// token already revoked?" across every instance sharing the database.
+const CREATE_REVOKED_TOKENS_TABLE: &str = concat!(
+    "CREATE TABLE IF NOT EXISTS revoked_tokens (",
+    "jti VARCHAR(255) PRIMARY KEY, ",
+    "revoked_at BIGINT NOT NULL, ",
+    "expires_at BIGINT NOT NULL",
+    ")"
+);
+
+/// Index for the boot-time prune and load, both of which filter on expiry.
+const CREATE_REVOKED_TOKENS_EXPIRES_INDEX: &str =
+    "CREATE INDEX IF NOT EXISTS idx_revoked_tokens_expires ON revoked_tokens(expires_at)";
 
 /// PostgreSQL implementation
 pub struct PostgresDatabase {
@@ -842,6 +929,20 @@ impl PostgresDatabase {
         .map_err(|e| SessionError::PersistenceError {
             reason: format!("Failed to create documents table: {}", e),
         })?;
+
+        // Durable token revocations (Task 72) — same DDL as SQLite.
+        sqlx::query(CREATE_REVOKED_TOKENS_TABLE)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| SessionError::PersistenceError {
+                reason: format!("Failed to create revoked_tokens table: {}", e),
+            })?;
+        sqlx::query(CREATE_REVOKED_TOKENS_EXPIRES_INDEX)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| SessionError::PersistenceError {
+                reason: format!("Failed to create revoked_tokens expiry index: {}", e),
+            })?;
 
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_timeline_session_seq ON timeline_events(session_id, sequence_number)")
             .execute(&self.pool)
@@ -1586,6 +1687,64 @@ impl DatabasePersistence for PostgresDatabase {
             })?;
 
         Ok(rows.into_iter().map(row_to_api_key_pg).collect())
+    }
+
+    async fn record_token_revocations(
+        &self,
+        revocations: &[RevokedTokenRecord],
+    ) -> Result<Vec<bool>, SessionError> {
+        let fail = |stage: &str, e: sqlx::Error| SessionError::PersistenceError {
+            reason: format!("Failed to record token revocations ({stage}): {e}"),
+        };
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| fail("begin transaction", e))?;
+        let mut written = Vec::with_capacity(revocations.len());
+        for revocation in revocations {
+            let result = sqlx::query(concat!(
+                "INSERT INTO revoked_tokens (jti, revoked_at, expires_at) ",
+                "VALUES ($1, $2, $3) ON CONFLICT (jti) DO NOTHING"
+            ))
+            .bind(&revocation.jti)
+            .bind(revocation.revoked_at_ms)
+            .bind(revocation.expires_at_ms)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| fail("insert", e))?;
+            written.push(result.rows_affected() == 1);
+        }
+        tx.commit().await.map_err(|e| fail("commit", e))?;
+        Ok(written)
+    }
+
+    async fn load_token_revocations(
+        &self,
+        now_ms: i64,
+    ) -> Result<Vec<RevokedTokenRecord>, SessionError> {
+        let rows = sqlx::query(concat!(
+            "SELECT jti, revoked_at, expires_at FROM revoked_tokens ",
+            "WHERE expires_at > $1 ORDER BY revoked_at ASC"
+        ))
+        .bind(now_ms)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| SessionError::PersistenceError {
+            reason: format!("Failed to load token revocations: {}", e),
+        })?;
+        rows.iter().map(row_to_revoked_token).collect()
+    }
+
+    async fn prune_token_revocations(&self, now_ms: i64) -> Result<u64, SessionError> {
+        let result = sqlx::query("DELETE FROM revoked_tokens WHERE expires_at <= $1")
+            .bind(now_ms)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| SessionError::PersistenceError {
+                reason: format!("Failed to prune token revocations: {}", e),
+            })?;
+        Ok(result.rows_affected())
     }
 
     async fn save_timeline_event(
@@ -2346,6 +2505,22 @@ impl SqliteDatabase {
             reason: format!("Failed to create documents table: {}", e),
         })?;
 
+        // Durable token revocations (Task 72) — same DDL as PostgreSQL. The
+        // index is propagated, not `.ok()`-ed like the ones below: a
+        // revocation store that half-migrated is not one to serve logouts on.
+        sqlx::query(CREATE_REVOKED_TOKENS_TABLE)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| SessionError::PersistenceError {
+                reason: format!("Failed to create revoked_tokens table: {}", e),
+            })?;
+        sqlx::query(CREATE_REVOKED_TOKENS_EXPIRES_INDEX)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| SessionError::PersistenceError {
+                reason: format!("Failed to create revoked_tokens expiry index: {}", e),
+            })?;
+
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_timeline_events_seq ON timeline_events(session_id, sequence_number)")
             .execute(&self.pool)
             .await
@@ -3028,6 +3203,64 @@ impl DatabasePersistence for SqliteDatabase {
             })?;
 
         Ok(rows.into_iter().map(row_to_api_key_sqlite).collect())
+    }
+
+    async fn record_token_revocations(
+        &self,
+        revocations: &[RevokedTokenRecord],
+    ) -> Result<Vec<bool>, SessionError> {
+        let fail = |stage: &str, e: sqlx::Error| SessionError::PersistenceError {
+            reason: format!("Failed to record token revocations ({stage}): {e}"),
+        };
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| fail("begin transaction", e))?;
+        let mut written = Vec::with_capacity(revocations.len());
+        for revocation in revocations {
+            let result = sqlx::query(concat!(
+                "INSERT INTO revoked_tokens (jti, revoked_at, expires_at) ",
+                "VALUES (?1, ?2, ?3) ON CONFLICT (jti) DO NOTHING"
+            ))
+            .bind(&revocation.jti)
+            .bind(revocation.revoked_at_ms)
+            .bind(revocation.expires_at_ms)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| fail("insert", e))?;
+            written.push(result.rows_affected() == 1);
+        }
+        tx.commit().await.map_err(|e| fail("commit", e))?;
+        Ok(written)
+    }
+
+    async fn load_token_revocations(
+        &self,
+        now_ms: i64,
+    ) -> Result<Vec<RevokedTokenRecord>, SessionError> {
+        let rows = sqlx::query(concat!(
+            "SELECT jti, revoked_at, expires_at FROM revoked_tokens ",
+            "WHERE expires_at > ?1 ORDER BY revoked_at ASC"
+        ))
+        .bind(now_ms)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| SessionError::PersistenceError {
+            reason: format!("Failed to load token revocations: {}", e),
+        })?;
+        rows.iter().map(row_to_revoked_token).collect()
+    }
+
+    async fn prune_token_revocations(&self, now_ms: i64) -> Result<u64, SessionError> {
+        let result = sqlx::query("DELETE FROM revoked_tokens WHERE expires_at <= ?1")
+            .bind(now_ms)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| SessionError::PersistenceError {
+                reason: format!("Failed to prune token revocations: {}", e),
+            })?;
+        Ok(result.rows_affected())
     }
 
     async fn save_timeline_event(
