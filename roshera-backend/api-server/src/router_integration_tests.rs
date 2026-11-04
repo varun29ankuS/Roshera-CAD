@@ -7903,7 +7903,7 @@ async fn seed_conflicting_divergence(state: &AppState) -> (String, String) {
         state,
         json_post(
             "/api/geometry/box",
-            json!({"width": 10.0, "depth": 10.0, "height": 10.0}),
+            json!({"width": 10.0, "depth": 10.0, "height": 10.0, "name": "Divergence seed block"}),
         ),
     )
     .await;
@@ -8242,7 +8242,7 @@ async fn timeline_history_supports_start_and_limit_paging() {
             &state,
             json_post(
                 "/api/geometry/box",
-                json!({"width": 10.0 + i as f64, "depth": 10.0, "height": 10.0}),
+                json!({"width": 10.0 + i as f64, "depth": 10.0, "height": 10.0, "name": format!("Paging block {i}")}),
             ),
         )
         .await;
@@ -8977,7 +8977,7 @@ async fn seed_recipe_document(state: &AppState) -> String {
         state,
         json_post(
             "/api/geometry/cylinder",
-            json!({"center": [0.0, 0.0, 0.0], "axis": [0.0, 0.0, 1.0], "radius": 41.25, "height": 20.0}),
+            json!({"center": [0.0, 0.0, 0.0], "axis": [0.0, 0.0, 1.0], "radius": 41.25, "height": 20.0, "name": "Flange body"}),
         ),
     )
     .await;

@@ -93,7 +93,7 @@ async fn create_box(state: &AppState, w: f64, d: f64, h: f64) {
             Method::POST,
             "/api/geometry/box",
             None,
-            Some(json!({ "width": w, "depth": d, "height": h })),
+            Some(json!({ "width": w, "depth": d, "height": h, "name": "Evidence seed block" })),
         ),
     )
     .await;
