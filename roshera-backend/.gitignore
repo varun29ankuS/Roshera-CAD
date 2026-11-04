@@ -1,6 +1,8 @@
 # Build artifacts
 /target
-Cargo.lock
+# Cargo.lock IS committed (2026-11-04): Roshera ships binaries, and an
+# uncommitted lock let CI resolve a breaking patch release (process-wrap
+# 9.1.1) that no local build had ever seen.
 
 # Environment files
 .env.local
