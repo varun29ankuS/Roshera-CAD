@@ -7,6 +7,7 @@
  */
 
 import { z } from "zod";
+import { randomUUID } from "node:crypto";
 // Import cycle note: gates.ts imports `api` from this module; both imports
 // are only dereferenced at call time (never during module evaluation) and
 // both are hoisted function declarations, so the ESM cycle is benign.
@@ -31,6 +32,9 @@ const API_KEY = process.env.ROSHERA_API_KEY;
 export const AUTH_HEADERS: Record<string, string> = API_KEY
   ? { Authorization: `ApiKey ${API_KEY}` }
   : {};
+
+/** This MCP process's agent-session id (see `scopeHeaders`). */
+const AGENT_SESSION_ID = randomUUID();
 
 // ─── HTTP helpers ──────────────────────────────────────────────────────
 
@@ -210,6 +214,10 @@ export function scopeHeaders(): Record<string, string> {
     // every kernel op from this request as Author::AIAgent("Claude"),
     // so agent-built features show amber Ⓒ in the Timeline strip.
     "X-Roshera-Agent": "Claude",
+    // One id per MCP process. The server keeps per-agent rule state —
+    // gate 6's built-but-unverified tally (api-server verification_scope) —
+    // keyed by it, so one agent's unchecked work never blocks another's.
+    "X-Roshera-Agent-Session": AGENT_SESSION_ID,
     // Intent provenance: the open checkpoint phrase, when one exists.
     ...intentHeaders(),
     // Session→document binding: the birth-document id, when bound.

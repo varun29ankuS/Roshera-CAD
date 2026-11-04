@@ -128,6 +128,14 @@ pub enum ErrorCode {
     /// `roshera-mcp/src/gates.ts::intentGateRefusal`'s own `gate` field —
     /// the SAME gate name, reached from the REST surface instead of MCP.
     IntentRequired,
+    /// An agent opened the next checkpoint — closing the open intent — while
+    /// geometry it built under that intent was never verified (no full
+    /// certificate read, no claim that measured geometry) and it did not pass
+    /// `skip_verification: true`. Gate 6 of `roshera-agent-policy.md`,
+    /// enforced server-side since 2026-11-04; `details.gate =
+    /// "verification_scope"` matches `roshera-mcp/src/gates.ts`'s own gate
+    /// name. Same 422, non-retryable family as `IntentRequired`.
+    VerificationRequired,
 
     // ── Kernel surface ────────────────────────────────────────────
     /// The kernel rejected the operation (topology, tolerance, etc.).
@@ -563,9 +571,9 @@ impl ErrorCode {
             // the canonical 422. Kept distinct from 400 so a client can
             // tell "your JSON is malformed" from "your name carries no
             // intent".
-            ErrorCode::CheckpointNameRejected | ErrorCode::IntentRequired => {
-                StatusCode::UNPROCESSABLE_ENTITY
-            }
+            ErrorCode::CheckpointNameRejected
+            | ErrorCode::IntentRequired
+            | ErrorCode::VerificationRequired => StatusCode::UNPROCESSABLE_ENTITY,
 
             ErrorCode::SolidNotFound
             | ErrorCode::PartNotFound
@@ -622,6 +630,7 @@ impl ErrorCode {
             | ErrorCode::InvalidJson
             | ErrorCode::CheckpointNameRejected
             | ErrorCode::IntentRequired
+            | ErrorCode::VerificationRequired
             | ErrorCode::BlendFailed
             | ErrorCode::BooleanDisjoint
             | ErrorCode::SolidNotFound
@@ -718,6 +727,7 @@ impl ErrorCode {
             ErrorCode::InvalidJson => "invalid_json",
             ErrorCode::CheckpointNameRejected => "checkpoint_name_rejected",
             ErrorCode::IntentRequired => "intent_required",
+            ErrorCode::VerificationRequired => "verification_required",
             ErrorCode::KernelError => "kernel_error",
             ErrorCode::BlendFailed => "blend_failed",
             ErrorCode::BooleanDisjoint => "boolean_disjoint",
@@ -776,6 +786,7 @@ impl ErrorCode {
             ErrorCode::InvalidJson,
             ErrorCode::CheckpointNameRejected,
             ErrorCode::IntentRequired,
+            ErrorCode::VerificationRequired,
             ErrorCode::KernelError,
             ErrorCode::BlendFailed,
             ErrorCode::BooleanDisjoint,
@@ -1501,12 +1512,12 @@ impl ApiError {
         Self::new(
             ErrorCode::IntentRequired,
             format!(
-                "REFUSED: '{operation}' would mutate the model, but no \
-                 design intent was declared (X-Roshera-Intent) — this \
-                 server is running with intent-required mode ON \
-                 (ROSHERA_REQUIRE_INTENT=1), so a mutation with no \
-                 attached engineering decision is refused rather than \
-                 recorded anonymously."
+                "REFUSED: '{operation}' would change geometry, but no \
+                 design intent was declared (X-Roshera-Intent). Agents must \
+                 declare what they are building before they build it \
+                 (roshera-agent-policy.md), so a change with no attached \
+                 engineering decision is refused rather than recorded \
+                 anonymously."
             ),
         )
         .with_hint(
@@ -1518,6 +1529,36 @@ impl ApiError {
         .with_details(serde_json::json!({
             "gate": "intent",
             "operation": operation,
+        }))
+    }
+
+    /// **Verification scope** (gate 6, server-side since 2026-11-04). An agent
+    /// opened the next checkpoint while `unverified_count` geometry changes it
+    /// made under the open intent were never checked. `built` names them
+    /// (method + route) so the agent knows exactly what to verify. Mirrors
+    /// `roshera-mcp/src/gates.ts::verificationScopeRefusal`'s `gate` name.
+    pub fn verification_required(built: &[String], unverified_count: usize, next: &str) -> Self {
+        Self::new(
+            ErrorCode::VerificationRequired,
+            format!(
+                "REFUSED: opening '{next}' would close the current intent, but \
+                 {unverified_count} geometry change(s) made under it were never \
+                 verified ({}). Check what you built before you move on.",
+                built.join(", ")
+            ),
+        )
+        .with_hint(
+            "Verify the result — a full certificate read (verify_part, i.e. GET \
+             /api/agent/parts/{id}/perception?full=1) or a claim that measures \
+             the geometry (verify_claim) — then re-issue this checkpoint. If the \
+             geometry is scratch (e.g. a cutter about to be subtracted), pass \
+             skip_verification: true to close it unverified on the record.",
+        )
+        .with_details(serde_json::json!({
+            "gate": "verification_scope",
+            "built": built,
+            "unverified_count": unverified_count,
+            "next": next,
         }))
     }
 

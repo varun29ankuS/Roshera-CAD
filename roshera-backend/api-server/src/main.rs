@@ -77,6 +77,8 @@ mod transactions;
 mod unsound_base_gate_tests;
 #[cfg(test)]
 mod unsound_solid_sheet_gate_tests;
+mod verification_scope;
+mod verification_scope_tests;
 mod viewport_bridge;
 mod ws_identity_tests;
 // Using core geometry-engine directly
@@ -256,6 +258,11 @@ pub struct AppState {
     /// (absent-is-legal, `documents.rs:56-78`'s explicit design decision;
     /// flipping this is an explicit opt-in, never a default).
     intent_posture: IntentPosture,
+
+    /// Gate 6 (2026-11-04): per-agent-session tally of geometry changes not
+    /// yet verified — written by `require_declared_intent`, read and settled
+    /// by `verification_scope::verification_scope_layer`.
+    verification_ledger: Arc<verification_scope::VerificationLedger>,
 
     // Timeline and collaboration
     timeline: Arc<RwLock<Timeline>>,
@@ -10118,6 +10125,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         permission_manager,
         auth_posture: auth_middleware::AuthPosture::from_env(),
         intent_posture: IntentPosture::from_env(),
+        verification_ledger: Arc::new(verification_scope::VerificationLedger::new()),
         cache_manager,
         timeline,
         timeline_recorder: timeline_recorder.clone(),
@@ -10313,7 +10321,11 @@ pub(crate) fn build_router(state: AppState) -> Router {
     // `route_layer(from_fn_with_state(intent_posture, require_declared_
     // intent))`. Read once here rather than per-route so every route
     // provably shares the exact same resolved posture.
-    let intent_posture = state.intent_posture;
+    let intent_gate = IntentGate {
+        posture: state.intent_posture,
+        ledger: state.verification_ledger.clone(),
+    };
+    let verification_ledger = state.verification_ledger.clone();
     let mut app = Router::new()
         // Root and health
         .route("/", get(root))
@@ -10394,7 +10406,7 @@ pub(crate) fn build_router(state: AppState) -> Router {
                     auth_middleware::require_create_geometry,
                 ))
                 .route_layer(axum::middleware::from_fn_with_state(
-                    intent_posture,
+                    intent_gate.clone(),
                     require_declared_intent,
                 )),
         )
@@ -10408,7 +10420,7 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route(
             "/api/geometry/{id}",
             get(get_geometry).delete(delete_geometry).route_layer(
-                axum::middleware::from_fn_with_state(intent_posture, require_declared_intent),
+                axum::middleware::from_fn_with_state(intent_gate.clone(), require_declared_intent),
             ),
         )
         .route(
@@ -10418,7 +10430,7 @@ pub(crate) fn build_router(state: AppState) -> Router {
                     auth_middleware::require_modify_geometry,
                 ))
                 .route_layer(axum::middleware::from_fn_with_state(
-                    intent_posture,
+                    intent_gate.clone(),
                     require_declared_intent,
                 )),
         )
@@ -10430,7 +10442,7 @@ pub(crate) fn build_router(state: AppState) -> Router {
                     auth_middleware::require_create_geometry,
                 ))
                 .route_layer(axum::middleware::from_fn_with_state(
-                    intent_posture,
+                    intent_gate.clone(),
                     require_declared_intent,
                 )),
         )
@@ -10441,7 +10453,7 @@ pub(crate) fn build_router(state: AppState) -> Router {
                     auth_middleware::require_create_geometry,
                 ))
                 .route_layer(axum::middleware::from_fn_with_state(
-                    intent_posture,
+                    intent_gate.clone(),
                     require_declared_intent,
                 )),
         )
@@ -10452,7 +10464,7 @@ pub(crate) fn build_router(state: AppState) -> Router {
                     auth_middleware::require_create_geometry,
                 ))
                 .route_layer(axum::middleware::from_fn_with_state(
-                    intent_posture,
+                    intent_gate.clone(),
                     require_declared_intent,
                 )),
         )
@@ -10463,7 +10475,7 @@ pub(crate) fn build_router(state: AppState) -> Router {
                     auth_middleware::require_create_geometry,
                 ))
                 .route_layer(axum::middleware::from_fn_with_state(
-                    intent_posture,
+                    intent_gate.clone(),
                     require_declared_intent,
                 )),
         )
@@ -10474,7 +10486,7 @@ pub(crate) fn build_router(state: AppState) -> Router {
                     auth_middleware::require_create_geometry,
                 ))
                 .route_layer(axum::middleware::from_fn_with_state(
-                    intent_posture,
+                    intent_gate.clone(),
                     require_declared_intent,
                 )),
         )
@@ -10485,7 +10497,7 @@ pub(crate) fn build_router(state: AppState) -> Router {
                     auth_middleware::require_create_geometry,
                 ))
                 .route_layer(axum::middleware::from_fn_with_state(
-                    intent_posture,
+                    intent_gate.clone(),
                     require_declared_intent,
                 )),
         )
@@ -10496,7 +10508,7 @@ pub(crate) fn build_router(state: AppState) -> Router {
                     auth_middleware::require_create_geometry,
                 ))
                 .route_layer(axum::middleware::from_fn_with_state(
-                    intent_posture,
+                    intent_gate.clone(),
                     require_declared_intent,
                 ))
                 // #34: real CAD STEP exports run 10-500MB inline `content`;
@@ -10515,7 +10527,7 @@ pub(crate) fn build_router(state: AppState) -> Router {
                     auth_middleware::require_create_geometry,
                 ))
                 .route_layer(axum::middleware::from_fn_with_state(
-                    intent_posture,
+                    intent_gate.clone(),
                     require_declared_intent,
                 )),
         )
@@ -10526,7 +10538,7 @@ pub(crate) fn build_router(state: AppState) -> Router {
                     auth_middleware::require_modify_geometry,
                 ))
                 .route_layer(axum::middleware::from_fn_with_state(
-                    intent_posture,
+                    intent_gate.clone(),
                     require_declared_intent,
                 )),
         )
@@ -10541,7 +10553,7 @@ pub(crate) fn build_router(state: AppState) -> Router {
                     auth_middleware::require_modify_geometry,
                 ))
                 .route_layer(axum::middleware::from_fn_with_state(
-                    intent_posture,
+                    intent_gate.clone(),
                     require_declared_intent,
                 )),
         )
@@ -10552,7 +10564,7 @@ pub(crate) fn build_router(state: AppState) -> Router {
                     auth_middleware::require_modify_geometry,
                 ))
                 .route_layer(axum::middleware::from_fn_with_state(
-                    intent_posture,
+                    intent_gate.clone(),
                     require_declared_intent,
                 )),
         )
@@ -10563,7 +10575,7 @@ pub(crate) fn build_router(state: AppState) -> Router {
                     auth_middleware::require_modify_geometry,
                 ))
                 .route_layer(axum::middleware::from_fn_with_state(
-                    intent_posture,
+                    intent_gate.clone(),
                     require_declared_intent,
                 )),
         )
@@ -10574,7 +10586,7 @@ pub(crate) fn build_router(state: AppState) -> Router {
                     auth_middleware::require_modify_geometry,
                 ))
                 .route_layer(axum::middleware::from_fn_with_state(
-                    intent_posture,
+                    intent_gate.clone(),
                     require_declared_intent,
                 )),
         )
@@ -10585,7 +10597,7 @@ pub(crate) fn build_router(state: AppState) -> Router {
                     auth_middleware::require_modify_geometry,
                 ))
                 .route_layer(axum::middleware::from_fn_with_state(
-                    intent_posture,
+                    intent_gate.clone(),
                     require_declared_intent,
                 )),
         )
@@ -10596,7 +10608,7 @@ pub(crate) fn build_router(state: AppState) -> Router {
                     auth_middleware::require_modify_geometry,
                 ))
                 .route_layer(axum::middleware::from_fn_with_state(
-                    intent_posture,
+                    intent_gate.clone(),
                     require_declared_intent,
                 )),
         )
@@ -10607,7 +10619,7 @@ pub(crate) fn build_router(state: AppState) -> Router {
                     auth_middleware::require_modify_geometry,
                 ))
                 .route_layer(axum::middleware::from_fn_with_state(
-                    intent_posture,
+                    intent_gate.clone(),
                     require_declared_intent,
                 )),
         )
@@ -10662,7 +10674,7 @@ pub(crate) fn build_router(state: AppState) -> Router {
                     auth_middleware::require_create_geometry,
                 ))
                 .route_layer(axum::middleware::from_fn_with_state(
-                    intent_posture,
+                    intent_gate.clone(),
                     require_declared_intent,
                 )),
         )
@@ -10673,7 +10685,7 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route(
             "/api/sketch/{id}/extrude_cut",
             post(sketch::extrude_cut_sketch).route_layer(axum::middleware::from_fn_with_state(
-                intent_posture,
+                intent_gate.clone(),
                 require_declared_intent,
             )),
         )
@@ -10684,7 +10696,7 @@ pub(crate) fn build_router(state: AppState) -> Router {
                     auth_middleware::require_create_geometry,
                 ))
                 .route_layer(axum::middleware::from_fn_with_state(
-                    intent_posture,
+                    intent_gate.clone(),
                     require_declared_intent,
                 )),
         )
@@ -10762,7 +10774,7 @@ pub(crate) fn build_router(state: AppState) -> Router {
                     auth_middleware::require_create_geometry,
                 ))
                 .route_layer(axum::middleware::from_fn_with_state(
-                    intent_posture,
+                    intent_gate.clone(),
                     require_declared_intent,
                 )),
         )
@@ -10773,7 +10785,7 @@ pub(crate) fn build_router(state: AppState) -> Router {
                     auth_middleware::require_create_geometry,
                 ))
                 .route_layer(axum::middleware::from_fn_with_state(
-                    intent_posture,
+                    intent_gate.clone(),
                     require_declared_intent,
                 )),
         )
@@ -11471,7 +11483,12 @@ pub(crate) fn build_router(state: AppState) -> Router {
         // verdict (409). Also targets by stable parameter NAME (Slice 3).
         .route(
             "/api/timeline/mould",
-            post(crate::handlers::timeline::mould_parameter),
+            // A parameter edit re-derives geometry: building, under the same
+            // intent rule and gate-6 bookkeeping as every other change (the
+            // MCP gate has always counted `timeline_mould` as one).
+            post(crate::handlers::timeline::mould_parameter).route_layer(
+                axum::middleware::from_fn_with_state(intent_gate.clone(), require_declared_intent),
+            ),
         )
         // #64 Slice 3: bind a stable NAME to a recorded (event, parameter) so a
         // mould can target it by name. Appended `param.name` event, latest-wins.
@@ -11691,6 +11708,13 @@ pub(crate) fn build_router(state: AppState) -> Router {
         // `agent_author_layer`, for the *why* instead of the *who* — see
         // that middleware's doc. Scoped per request task, never shared.
         .layer(axum::middleware::from_fn(agent_intent_layer))
+        // Gate 6, server-side: an agent session that built geometry must
+        // verify it (or skip explicitly) before its next checkpoint closes
+        // the intent. See `verification_scope`.
+        .layer(axum::middleware::from_fn_with_state(
+            verification_ledger,
+            verification_scope::verification_scope_layer,
+        ))
         // Origin provenance: which CHANNEL initiated the operation (mcp /
         // rest / websocket / …), the `roshera.origin` counterpart of
         // `agent_intent_layer`'s `roshera.intent`. Unlike intent, this
@@ -11942,8 +11966,52 @@ impl IntentPosture {
 /// would work too, but reading the header directly keeps this layer legible
 /// on its own, with no ordering dependency on a sibling layer to reason
 /// about.
+/// State for [`require_declared_intent`]: the resolved posture plus the
+/// verification ledger it records successful agent changes into (gate 6 —
+/// see `verification_scope`). One value per router, cloned per route.
+#[derive(Clone)]
+pub(crate) struct IntentGate {
+    posture: IntentPosture,
+    ledger: Arc<verification_scope::VerificationLedger>,
+}
+
 async fn require_declared_intent(
-    axum::extract::State(posture): axum::extract::State<IntentPosture>,
+    axum::extract::State(gate): axum::extract::State<IntentGate>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let response = check_declared_intent(gate.posture, request, next, &gate.ledger).await;
+    response
+}
+
+/// The intent check proper, plus gate-6 bookkeeping: a SUCCESSFUL change by
+/// an agent session on one of these routes is unchecked work until that
+/// session verifies it (`verification_scope`). Recorded here because this
+/// layer already sits on exactly the geometry-changing routes — so "what
+/// counts as building" has one definition, not two that can drift apart.
+async fn check_declared_intent(
+    posture: IntentPosture,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+    ledger: &verification_scope::VerificationLedger,
+) -> axum::response::Response {
+    let session = verification_scope::agent_session_key(request.headers());
+    let builds = !matches!(
+        *request.method(),
+        axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::OPTIONS
+    ) && !request.uri().path().ends_with("/preview");
+    let what = format!("{} {}", request.method(), request.uri().path());
+    let response = gate_on_declared_intent(posture, request, next).await;
+    if let (Some(key), true) = (session, builds) {
+        if response.status().is_success() {
+            ledger.record_built(&key, what);
+        }
+    }
+    response
+}
+
+async fn gate_on_declared_intent(
+    posture: IntentPosture,
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {

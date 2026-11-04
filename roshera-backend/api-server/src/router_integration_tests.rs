@@ -227,6 +227,9 @@ pub(crate) async fn make_test_state_with_database(
         // mode existed. `intent_required_mode_tests` builds its own state
         // with `IntentPosture::Required` explicitly where it needs it.
         intent_posture: crate::IntentPosture::Optional,
+        verification_ledger: std::sync::Arc::new(
+            crate::verification_scope::VerificationLedger::new(),
+        ),
         cache_manager,
         timeline,
         timeline_recorder: timeline_recorder.clone(),

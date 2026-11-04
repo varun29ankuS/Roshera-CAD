@@ -127,6 +127,25 @@ check("select_edge carries scope; a resolved 200 is a success", async () => {
   assert.notEqual(r.isError, true, "a resolved selection is a success");
 });
 
+check("every call carries one stable agent-session id, unique to this process", async () => {
+  // The server keeps gate-6 state (built-but-unverified work) per agent
+  // session; without this id every MCP process would share one tally.
+  const ids = new Set(
+    [...seen.values()].map((h) => h["x-roshera-agent-session"]).filter(Boolean),
+  );
+  assert.equal(ids.size, 1, `one session id across all calls, got ${[...ids]}`);
+  const [id] = ids;
+  assert.match(id, /^[0-9a-f-]{36}$/, `a UUID, got ${id}`);
+  const other = await import(
+    `${pathToFileURL(join(HERE, ".build", "core.js")).href}?second=${Date.now()}`
+  );
+  assert.notEqual(
+    other.scopeHeaders()["X-Roshera-Agent-Session"],
+    id,
+    "a second MCP process must not share this one's session",
+  );
+});
+
 check("saveBinary carries part and document", async () => {
   answers.set("GET /api/export/probe", [200, Buffer.from("solid x\nendsolid x\n")]);
   await core.saveBinary("/api/export/probe", join(tmpdir(), `roshera_probe_${Date.now()}.stl`));

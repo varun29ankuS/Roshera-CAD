@@ -77,7 +77,9 @@ medium, so an unqualified hole is 9.0 mm on an M8, and a joint that needs closer
 has to ask for it.
 
 Every mutating call already carries its one-line verdict; run verify_part after any
-boolean, blend sequence, or multi-feature build, and before any done-claim. sound==false
+boolean, blend sequence, or multi-feature build, and before any done-claim (ENFORCED:
+the server refuses your next checkpoint while geometry you built under the open one is
+unverified, unless you pass skip_verification: true). sound==false
 is a full stop -- diagnose, repair, or roll back; stacking onto an unsound base is
 refused unless you explicitly acknowledge a repair flow. A typed refusal
 (UnverifiableReason, REFUSED:, Inconclusive) is a stable fact, not a retry target --

@@ -125,7 +125,7 @@ Every layer of an agent harness either **asks** (steering — an instruction a m
 
 The header comment in `gates.ts` states each gate's reasoning, including where each deliberately fails open or closed and why.
 
-The intent rule also holds on the server itself: any request from an agent (one carrying `X-Roshera-Agent`) that creates, modifies, imports or deletes geometry without a declared intent is refused with the same typed refusal, whichever host or channel the agent came through. Requests from people using the app are not asked. The remaining gates are being moved server-side the same way.
+The intent rule also holds on the server itself: any request from an agent (one carrying `X-Roshera-Agent`) that creates, modifies, imports or deletes geometry without a declared intent is refused with the same typed refusal, whichever host or channel the agent came through. Requests from people using the app are not asked. The verification-scope rule (gate 6) is enforced the same way, per agent session: the server refuses an agent's next checkpoint while geometry it built under the open one is unverified, unless it passes `skip_verification: true`. The remaining gates are being moved server-side next.
 
 ## roshera-rl — the episode loop
 
