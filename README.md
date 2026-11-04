@@ -81,9 +81,11 @@ roshera-backend/       Rust workspace (10 crates)
   export-engine/       STL, OBJ, STEP (AP242 export + import, round-trip tested), encrypted .ros (AES-256-GCM)
   ros-format/          Native .ros serialization
   verdict-harness/     Multi-agent verdict/consensus harness
-  api-server/          Axum REST + WebSocket API
+  api-server/          Axum REST + WebSocket API (embeds the agent harness)
   shared-types/        Common type definitions
+  vendor/goose/        Agent harness — goose, vendored as Roshera's own code (Apache-2.0, see VENDORED.md)
 
+roshera-agent-policy.md  The rules every agent works under, delivered to agents as AGENTS.md
 roshera-app/           React + Three.js + TypeScript browser client
 roshera-mcp/           MCP server exposing the kernel to agents (incl. the six-gate constraint layer)
 roshera-eval/          Certificate-scored agent evaluation scenarios (18)
@@ -123,6 +125,8 @@ Every layer of an agent harness either **asks** (steering — an instruction a m
 
 The header comment in `gates.ts` states each gate's reasoning, including where each deliberately fails open or closed and why.
 
+The intent rule also holds on the server itself: any request from an agent (one carrying `X-Roshera-Agent`) that creates, modifies, imports or deletes geometry without a declared intent is refused with the same typed refusal, whichever host or channel the agent came through. Requests from people using the app are not asked. The remaining gates are being moved server-side the same way.
+
 ## roshera-rl — the episode loop
 
 `roshera-rl/` runs parallel, isolated, certificate-scored episodes over the real MCP tool surface and writes JSONL trajectory records. It is an **episode loop with certificate-based rewards whose task corpus and model policies are not yet built** — not an RL environment you could train an agent in today, and its own [README](roshera-rl/README.md) carries a "What this does not prove" section holding it to the same standard as this one.
@@ -161,8 +165,8 @@ What follows is honest about what's tested versus what's implemented but rough. 
 | **Agent surface** | MCP minimal surface + meta-tool funnel | Works; 31 default tools (18 core verbs + the 10-tool `psketch_*` sketching family + `find_tool`/`describe_tool`/`invoke`), the ~90-tool long tail reachable via `invoke` at fixed cost with identical schema validation. Six typed dispatch gates at the one choke point every call path crosses (see [The constraint layer](#the-constraint-layer)). `blackboard_add_entry` (agent→human notebook) is in the default surface |
 | **Assembly** | Instances, mates, SE(3) solve, interference | Gauss-Newton SE(3) solver with an analytic Jacobian, DOF/mobility analysis, interactive drag, and a dozen-plus mate/joint kinds (Cam/Path/Symmetric are typed but not numerically enforced). Certified interference: static overlap (EPA-backed, enclosure-aware) plus continuous nonlinear time-of-impact swept clearance via Parry — `min_clearance = raw_min_clearance − ε`, a conservative lower bound, with a typed refusal when a pair's distance is unsupported |
 | **Export** | STL, OBJ, encrypted .ros | Works |
-| | STEP (AP242) | Export and import implemented (tiered writer + parser); primitive and blended-flange round-trips assert topology, validity, and soundness are preserved |
-| **AI** | Claude + OpenAI providers | Works |
+| | STEP (AP242) | Export and import implemented (tiered writer + parser); primitive and blended-flange round-trips assert topology, validity, and soundness are preserved. On third-party files, single parts import and draw; assembly placement (`NEXT_ASSEMBLY_USAGE_OCCURRENCE` transforms) is not read yet, so a multi-part assembly arrives as its parts at their own origins |
+| **AI** | Claude + OpenAI providers | Works. The agent surface also connects through OpenRouter, xAI, Mistral, GLM, Kimi, DeepSeek and Sarvam (API keys only — no local models) |
 | | Vision pipeline | Implemented |
 | | Natural language command parsing | Works for common commands |
 | **Infrastructure** | Timeline (event-sourced history) | Works. `EventCertificate` projection is defined and honestly reported (per-op-class-honest), but no producer records it on the timeline yet — the evidence-pack reports it as absent rather than inventing one |
