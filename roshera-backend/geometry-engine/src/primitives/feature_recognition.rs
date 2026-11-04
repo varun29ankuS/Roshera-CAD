@@ -23,6 +23,14 @@ pub enum RecognizedFeature {
         depth: f64,
         face_id: u32,
     },
+    /// A proven bore (concave cylindrical wall) whose THRU-vs-blind depth
+    /// could not be derived exactly — e.g. a wall bounded by NURBS edges.
+    /// Reported as a hole with no depth claim rather than guessed.
+    Hole {
+        diameter: f64,
+        axis: [f64; 3],
+        face_id: u32,
+    },
     Fillet {
         radius: f64,
         face_ids: Vec<u32>,
@@ -50,6 +58,7 @@ impl RecognizedFeature {
         match self {
             RecognizedFeature::ThroughHole { face_id, .. }
             | RecognizedFeature::BlindHole { face_id, .. }
+            | RecognizedFeature::Hole { face_id, .. }
             | RecognizedFeature::CylindricalBoss { face_id, .. }
             | RecognizedFeature::SphericalFeature { face_id, .. } => vec![*face_id],
             RecognizedFeature::Fillet { face_ids, .. }
@@ -75,6 +84,9 @@ impl RecognizedFeature {
             RecognizedFeature::BlindHole {
                 diameter, depth, ..
             } => format!("blind hole ⌀{:.1}mm, {:.1}mm deep", diameter, depth),
+            RecognizedFeature::Hole { diameter, .. } => {
+                format!("hole ⌀{:.1}mm (depth not provable)", diameter)
+            }
             RecognizedFeature::Fillet {
                 radius, face_ids, ..
             } => format!("fillet R{:.1}mm ({} faces)", radius, face_ids.len()),
@@ -95,6 +107,7 @@ impl RecognizedFeature {
         match self {
             RecognizedFeature::ThroughHole { .. } => "through_hole",
             RecognizedFeature::BlindHole { .. } => "blind_hole",
+            RecognizedFeature::Hole { .. } => "hole",
             RecognizedFeature::Fillet { .. } => "fillet",
             RecognizedFeature::Chamfer { .. } => "chamfer",
             RecognizedFeature::CylindricalBoss { .. } => "boss",
@@ -106,12 +119,15 @@ impl RecognizedFeature {
 /// Recognize features in a solid by analyzing its B-Rep topology.
 ///
 /// Detection strategy:
-/// - **Through-holes**: Cylindrical faces whose boundary edges are shared with two
-///   distinct planar faces (the caps), where the cylindrical face spans the full height.
+/// - **Holes**: concave cylindrical walls by the material-side rule
+///   ([`crate::readable::bore_face_ids`]); THRU vs blind (and blind depth) from
+///   [`crate::dfm::analyzers::bore_metrics`]; a bore whose depth cannot be
+///   proven is [`RecognizedFeature::Hole`].
+/// - **Bosses**: convex cylindrical walls (outward normal away from the axis).
 /// - **Fillets**: Toroidal faces (constant-radius blend between adjacent faces).
-/// - **Chamfers**: Narrow planar faces at angles between two larger faces.
-/// - **Bosses**: Cylindrical faces with one open end facing outward.
 /// - **Spherical features**: Spherical face segments.
+///
+/// Chamfers are not detected (no variant is ever emitted by this function).
 pub fn recognize_features(solid_id: u32, model: &BRepModel) -> Vec<RecognizedFeature> {
     let mut features = Vec::new();
 
@@ -120,8 +136,6 @@ pub fn recognize_features(solid_id: u32, model: &BRepModel) -> Vec<RecognizedFea
         None => return features,
     };
 
-    // Collect all faces with their surface types
-    let mut face_surface_types: HashMap<u32, SurfaceType> = HashMap::new();
     let mut cylindrical_faces: Vec<(u32, f64, [f64; 3])> = Vec::new(); // (face_id, radius, axis)
     let mut toroidal_faces: Vec<(u32, f64)> = Vec::new(); // (face_id, minor_radius)
     let mut spherical_faces: Vec<(u32, f64)> = Vec::new(); // (face_id, radius)
@@ -143,10 +157,7 @@ pub fn recognize_features(solid_id: u32, model: &BRepModel) -> Vec<RecognizedFea
                 None => continue,
             };
 
-            let stype = surface.surface_type();
-            face_surface_types.insert(face_id, stype);
-
-            match stype {
+            match surface.surface_type() {
                 SurfaceType::Cylinder => {
                     if let Some(cyl) = surface.as_any().downcast_ref::<Cylinder>() {
                         cylindrical_faces.push((
@@ -171,46 +182,42 @@ pub fn recognize_features(solid_id: u32, model: &BRepModel) -> Vec<RecognizedFea
         }
     }
 
-    // --- Detect through-holes ---
-    // A cylindrical face is a through-hole if it has inner loops
-    // in adjacent planar faces (the face is a concave cylindrical surface).
-    // Simpler heuristic: cylindrical face where both boundary loops connect
-    // to planar faces.
+    // --- Holes vs bosses ---
+    // Hole-vs-boss is the kernel's material-side rule (`bore_face_ids`: a
+    // cylinder whose outward normal points toward its axis is a cavity wall),
+    // and THRU-vs-blind is `dfm::bore_metrics`' proven comparison of the wall's
+    // trimmed extent against the solid's own extent on the same axis. A bore
+    // whose depth cannot be proven exactly is reported as `Hole` — never
+    // guessed into THRU or blind.
+    let bore_faces = crate::readable::bore_face_ids(model, solid_id);
+    let bore_records = crate::dfm::analyzers::bore_metrics(model, solid_id)
+        .map(|outcome| outcome.bores)
+        .unwrap_or_default();
     for &(face_id, radius, axis) in &cylindrical_faces {
-        let face = match model.faces.get(face_id) {
-            Some(f) => f,
-            None => continue,
-        };
-
-        // Check adjacent faces via the face's adjacency map
-        let adjacent_planar_count = face
-            .adjacent_faces
-            .values()
-            .filter(|&&adj_id| face_surface_types.get(&adj_id).copied() == Some(SurfaceType::Plane))
-            .count();
-
-        // A through-hole cylindrical face typically touches 2 planar faces (top/bottom caps)
-        if adjacent_planar_count >= 2 {
-            features.push(RecognizedFeature::ThroughHole {
-                diameter: radius * 2.0,
-                axis,
-                face_id,
-            });
-        } else if adjacent_planar_count == 1 {
-            // Blind hole: cylindrical face touching one planar face + one bottom face
-            // Estimate depth from bounding box of the cylindrical face's vertices
-            let depth = estimate_face_extent(face_id, &axis, model);
-            features.push(RecognizedFeature::BlindHole {
-                diameter: radius * 2.0,
-                depth,
-                face_id,
-            });
+        let diameter = radius * 2.0;
+        if bore_faces.contains(&face_id) {
+            match bore_records.iter().find(|r| r.face == face_id) {
+                Some(rec) if rec.is_through => features.push(RecognizedFeature::ThroughHole {
+                    diameter,
+                    axis,
+                    face_id,
+                }),
+                Some(rec) => features.push(RecognizedFeature::BlindHole {
+                    diameter,
+                    depth: rec.depth.value,
+                    face_id,
+                }),
+                None => features.push(RecognizedFeature::Hole {
+                    diameter,
+                    axis,
+                    face_id,
+                }),
+            }
         } else {
-            // Cylindrical boss or other feature
             let height = estimate_face_extent(face_id, &axis, model);
             if height > 1e-6 {
                 features.push(RecognizedFeature::CylindricalBoss {
-                    diameter: radius * 2.0,
+                    diameter,
                     height,
                     face_id,
                 });
@@ -371,6 +378,88 @@ mod tests {
         assert!(desc.contains("fillet"));
         assert!(desc.contains("2.5"));
         assert!(desc.contains("3 faces"));
+    }
+}
+
+/// Hole-vs-boss and THRU-vs-blind must follow the kernel's material-side rule
+/// (`readable::bore_face_ids`) and its proven bore metrics (`dfm::bore_metrics`),
+/// not face-adjacency counts: `Face::adjacent_faces` is never populated outside
+/// tests, so the old heuristic labelled every cylinder a boss.
+#[cfg(test)]
+mod material_side_tests {
+    use super::*;
+    use crate::dfm::analyzers::bore::fixtures::{plate_with_blind_bore, plate_with_through_bore};
+
+    #[test]
+    fn through_bore_in_plate_is_a_through_hole_not_a_boss() {
+        let (model, solid_id, bore_face) = plate_with_through_bore(20.0, 20.0, 10.0, 3.0);
+        let features = recognize_features(solid_id, &model);
+
+        let on_bore: Vec<_> = features
+            .iter()
+            .filter(|f| f.face_ids().contains(&bore_face))
+            .collect();
+        assert_eq!(
+            on_bore.len(),
+            1,
+            "one feature on the bore wall: {features:?}"
+        );
+        match on_bore[0] {
+            RecognizedFeature::ThroughHole { diameter, .. } => {
+                assert!((diameter - 6.0).abs() < 1e-9, "diameter {diameter}")
+            }
+            other => panic!("bore wall must be a through-hole, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn blind_bore_in_plate_is_a_blind_hole_with_its_depth() {
+        let (model, solid_id, bore_face) = plate_with_blind_bore(20.0, 20.0, 10.0, 3.0, 4.0);
+        let features = recognize_features(solid_id, &model);
+
+        let on_bore: Vec<_> = features
+            .iter()
+            .filter(|f| f.face_ids().contains(&bore_face))
+            .collect();
+        assert_eq!(
+            on_bore.len(),
+            1,
+            "one feature on the bore wall: {features:?}"
+        );
+        match on_bore[0] {
+            RecognizedFeature::BlindHole {
+                diameter, depth, ..
+            } => {
+                assert!((diameter - 6.0).abs() < 1e-9, "diameter {diameter}");
+                assert!((depth - 4.0).abs() < 1e-9, "depth {depth}");
+            }
+            other => panic!("bore wall must be a blind hole, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn solid_cylinder_outer_wall_is_a_boss_not_a_hole() {
+        use crate::primitives::cylinder_primitive::{CylinderParameters, CylinderPrimitive};
+        use crate::primitives::primitive_traits::Primitive;
+        let mut model = BRepModel::new();
+        let params = CylinderParameters::new(10.0, 30.0).unwrap();
+        let solid_id = CylinderPrimitive::create(params, &mut model).unwrap();
+
+        let features = recognize_features(solid_id, &model);
+        assert!(
+            features.iter().any(|f| matches!(
+                f,
+                RecognizedFeature::CylindricalBoss { diameter, .. } if (diameter - 20.0).abs() < 1e-9
+            )),
+            "outer wall must be a Ø20 boss: {features:?}"
+        );
+        assert!(
+            !features.iter().any(|f| matches!(
+                f,
+                RecognizedFeature::ThroughHole { .. } | RecognizedFeature::BlindHole { .. }
+            )),
+            "a solid cylinder has no holes: {features:?}"
+        );
     }
 }
 

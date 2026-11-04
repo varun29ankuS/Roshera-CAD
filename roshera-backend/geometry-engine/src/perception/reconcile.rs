@@ -89,6 +89,7 @@ fn expected_surface(feature: &RecognizedFeature) -> SurfaceType {
         // A hole and a cylindrical boss are both cylindrical walls.
         RecognizedFeature::ThroughHole { .. }
         | RecognizedFeature::BlindHole { .. }
+        | RecognizedFeature::Hole { .. }
         | RecognizedFeature::CylindricalBoss { .. } => SurfaceType::Cylinder,
         // A constant-radius fillet blend is toroidal.
         RecognizedFeature::Fillet { .. } => SurfaceType::Torus,
