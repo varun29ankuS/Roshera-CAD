@@ -201,3 +201,9 @@ roshera-mcp/test/.build/
 # Ground plan: the page is generated, the generator is what is version-controlled
 scripts/ground-plan/ground-plan.html
 scripts/ground-plan/plan.json
+
+# Scratch output from demo/render tests (2026-11-04): underscore-prefixed
+# files are test outputs, never sources. Tests write them to the temp dir.
+/_*.png
+roshera-backend/geometry-engine/_*.png
+roshera-backend/geometry-engine/_*.json

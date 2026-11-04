@@ -112,7 +112,7 @@ fn nurbs_car_body_is_a_valid_watertight_solid() {
 
 /// Emit the car-body sections as the `/api/geometry/nurbs_loft` request payload
 /// (run explicitly) so it can be POSTed to the live server to show in the
-/// frontend viewport. Writes `_car_body.json` to the crate dir.
+/// frontend viewport. Writes `_car_body.json` to the system temp dir.
 #[test]
 #[ignore = "writes the live POST payload; run explicitly"]
 fn emit_car_body_json() {
@@ -127,7 +127,9 @@ fn emit_car_body_json() {
         "degree_v": 3,
         "name": "NURBS Car Body"
     });
-    let dir = env!("CARGO_MANIFEST_DIR");
+    // The system temp dir, never the source tree: these are outputs.
+    let dir = std::env::temp_dir();
+    let dir = dir.display();
     std::fs::write(
         format!("{dir}/_car_body.json"),
         serde_json::to_string(&payload).expect("json"),
@@ -138,7 +140,7 @@ fn emit_car_body_json() {
 
 /// Render shaded views of the NURBS car body to PNG (run explicitly:
 /// `cargo test --test nurbs_car_body render_car_body_views -- --ignored`).
-/// Writes to the crate dir so an agent can read them back.
+/// Writes to the system temp dir (printed at the end) so an agent can read them back.
 #[test]
 #[ignore = "writes PNGs; run explicitly to view the car body"]
 fn render_car_body_views() {
@@ -151,7 +153,9 @@ fn render_car_body_views() {
         tessellation: TessellationParams::default(),
         ..Default::default()
     };
-    let dir = env!("CARGO_MANIFEST_DIR");
+    // The system temp dir, never the source tree: these are outputs.
+    let dir = std::env::temp_dir();
+    let dir = dir.display();
     // Side (profile, looking +Y): the recognizable silhouette.
     let side =
         render_solid_dir(&m, s, Vector3::new(0.0, 1.0, 0.0), Vector3::Z, &opts).expect("side");
