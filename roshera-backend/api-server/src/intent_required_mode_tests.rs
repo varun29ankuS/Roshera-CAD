@@ -34,16 +34,21 @@ use axum::http::StatusCode;
 use serde_json::json;
 use uuid::Uuid;
 
-/// Create a plain box and return its object UUID.
+/// Create a plain box and return its object UUID. Declares an intent so the
+/// fixture is valid under every posture — creation is gated too (in
+/// `Required`, and for agents in `AgentRequests`).
 async fn create_box(state: &AppState) -> Uuid {
-    let (status, body) = dispatch(
-        state,
-        post(
-            "/api/geometry/box",
-            json!({ "width": 10.0, "depth": 10.0, "height": 10.0 }),
-        ),
-    )
-    .await;
+    let mut req = post(
+        "/api/geometry/box",
+        json!({ "width": 10.0, "depth": 10.0, "height": 10.0 }),
+    );
+    req.headers_mut().insert(
+        "x-roshera-intent",
+        "test fixture block 10 mm"
+            .parse()
+            .expect("header value must parse"),
+    );
+    let (status, body) = dispatch(state, req).await;
     assert_eq!(status, StatusCode::OK, "box create must 200; body = {body}");
     Uuid::parse_str(body["object"]["id"].as_str().expect("box uuid string"))
         .expect("box uuid must parse")
@@ -273,6 +278,63 @@ async fn agent_requests_lets_an_agent_mutation_with_intent_through() {
         status,
         StatusCode::OK,
         "declared intent passes; body = {body}"
+    );
+}
+
+/// Creation and deletion are building too: the MCP gate has always asked
+/// for intent on create_*/revolve/loft/import/sketch-extrude/delete, while
+/// the server gated only modifications of existing solids.
+#[tokio::test]
+async fn agent_requests_refuses_an_agent_create_with_no_intent() {
+    let state = agent_requests_state().await;
+    let (status, body) = dispatch(
+        &state,
+        as_agent(post(
+            "/api/geometry/box",
+            json!({ "width": 5.0, "depth": 5.0, "height": 5.0 }),
+        )),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "an agent creating a solid with no declared intent must be refused; body = {body}"
+    );
+    assert_eq!(
+        body["error_code"].as_str(),
+        Some("intent_required"),
+        "body = {body}"
+    );
+}
+
+#[tokio::test]
+async fn agent_requests_refuses_an_agent_delete_but_never_a_read() {
+    let state = agent_requests_state().await;
+    let object = create_box(&state).await;
+    let uri = format!("/api/geometry/{object}");
+
+    let read = axum::http::Request::builder()
+        .method(axum::http::Method::GET)
+        .uri(&uri)
+        .body(axum::body::Body::empty())
+        .expect("request must build");
+    let (status, body) = dispatch(&state, as_agent(read)).await;
+    assert_ne!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "reading a solid never needs a declared intent; body = {body}"
+    );
+
+    let delete = axum::http::Request::builder()
+        .method(axum::http::Method::DELETE)
+        .uri(&uri)
+        .body(axum::body::Body::empty())
+        .expect("request must build");
+    let (status, body) = dispatch(&state, as_agent(delete)).await;
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "an agent deleting a solid with no declared intent must be refused; body = {body}"
     );
 }
 

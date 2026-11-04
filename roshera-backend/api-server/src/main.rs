@@ -10389,9 +10389,14 @@ pub(crate) fn build_router(state: AppState) -> Router {
         // adding a new mutation forces an explicit policy decision.
         .route(
             "/api/geometry",
-            post(create_geometry).route_layer(axum::middleware::from_fn(
-                auth_middleware::require_create_geometry,
-            )),
+            post(create_geometry)
+                .route_layer(axum::middleware::from_fn(
+                    auth_middleware::require_create_geometry,
+                ))
+                .route_layer(axum::middleware::from_fn_with_state(
+                    intent_posture,
+                    require_declared_intent,
+                )),
         )
         // NB: `/api/geometry/{id}` carries an inline
         // `Permission::DeleteGeometry` check inside `delete_geometry`
@@ -10402,7 +10407,9 @@ pub(crate) fn build_router(state: AppState) -> Router {
         // AuthInfo populated by `auth_middleware`.
         .route(
             "/api/geometry/{id}",
-            get(get_geometry).delete(delete_geometry),
+            get(get_geometry).delete(delete_geometry).route_layer(
+                axum::middleware::from_fn_with_state(intent_posture, require_declared_intent),
+            ),
         )
         .route(
             "/api/geometry/boolean",
@@ -10418,45 +10425,79 @@ pub(crate) fn build_router(state: AppState) -> Router {
         .route("/api/assembly/verify", post(assembly_verify))
         .route(
             "/api/geometry/extrude",
-            post(create_extrude).route_layer(axum::middleware::from_fn(
-                auth_middleware::require_create_geometry,
-            )),
+            post(create_extrude)
+                .route_layer(axum::middleware::from_fn(
+                    auth_middleware::require_create_geometry,
+                ))
+                .route_layer(axum::middleware::from_fn_with_state(
+                    intent_posture,
+                    require_declared_intent,
+                )),
         )
         .route(
             "/api/geometry/box",
-            post(create_box_primitive).route_layer(axum::middleware::from_fn(
-                auth_middleware::require_create_geometry,
-            )),
+            post(create_box_primitive)
+                .route_layer(axum::middleware::from_fn(
+                    auth_middleware::require_create_geometry,
+                ))
+                .route_layer(axum::middleware::from_fn_with_state(
+                    intent_posture,
+                    require_declared_intent,
+                )),
         )
         .route(
             "/api/geometry/cylinder",
-            post(create_cylinder_primitive).route_layer(axum::middleware::from_fn(
-                auth_middleware::require_create_geometry,
-            )),
+            post(create_cylinder_primitive)
+                .route_layer(axum::middleware::from_fn(
+                    auth_middleware::require_create_geometry,
+                ))
+                .route_layer(axum::middleware::from_fn_with_state(
+                    intent_posture,
+                    require_declared_intent,
+                )),
         )
         .route(
             "/api/geometry/cone",
-            post(create_cone_primitive).route_layer(axum::middleware::from_fn(
-                auth_middleware::require_create_geometry,
-            )),
+            post(create_cone_primitive)
+                .route_layer(axum::middleware::from_fn(
+                    auth_middleware::require_create_geometry,
+                ))
+                .route_layer(axum::middleware::from_fn_with_state(
+                    intent_posture,
+                    require_declared_intent,
+                )),
         )
         .route(
             "/api/geometry/revolve",
-            post(create_revolve_primitive).route_layer(axum::middleware::from_fn(
-                auth_middleware::require_create_geometry,
-            )),
+            post(create_revolve_primitive)
+                .route_layer(axum::middleware::from_fn(
+                    auth_middleware::require_create_geometry,
+                ))
+                .route_layer(axum::middleware::from_fn_with_state(
+                    intent_posture,
+                    require_declared_intent,
+                )),
         )
         .route(
             "/api/geometry/nurbs_loft",
-            post(create_nurbs_loft_primitive).route_layer(axum::middleware::from_fn(
-                auth_middleware::require_create_geometry,
-            )),
+            post(create_nurbs_loft_primitive)
+                .route_layer(axum::middleware::from_fn(
+                    auth_middleware::require_create_geometry,
+                ))
+                .route_layer(axum::middleware::from_fn_with_state(
+                    intent_posture,
+                    require_declared_intent,
+                )),
         )
         .route(
             "/api/geometry/import_step",
             post(import_step_geometry)
                 .route_layer(axum::middleware::from_fn(
                     auth_middleware::require_create_geometry,
+                ))
+                .route_layer(axum::middleware::from_fn_with_state(
+                    intent_posture,
+                    require_declared_intent,
                 ))
                 // #34: real CAD STEP exports run 10-500MB inline `content`;
                 // axum's implicit default (2MB, via `DefaultBodyLimit`) is
@@ -10469,9 +10510,14 @@ pub(crate) fn build_router(state: AppState) -> Router {
             // the server reads the bytes), so the 2MB default body limit is
             // ample for its small JSON payload.
             "/api/geometry/import_ros",
-            post(import_ros_geometry).route_layer(axum::middleware::from_fn(
-                auth_middleware::require_create_geometry,
-            )),
+            post(import_ros_geometry)
+                .route_layer(axum::middleware::from_fn(
+                    auth_middleware::require_create_geometry,
+                ))
+                .route_layer(axum::middleware::from_fn_with_state(
+                    intent_posture,
+                    require_declared_intent,
+                )),
         )
         .route(
             "/api/geometry/face/extrude",
@@ -10611,9 +10657,14 @@ pub(crate) fn build_router(state: AppState) -> Router {
         // per-route layer tests scope.
         .route(
             "/api/sketch/{id}/extrude",
-            post(sketch::extrude_sketch).route_layer(axum::middleware::from_fn(
-                auth_middleware::require_create_geometry,
-            )),
+            post(sketch::extrude_sketch)
+                .route_layer(axum::middleware::from_fn(
+                    auth_middleware::require_create_geometry,
+                ))
+                .route_layer(axum::middleware::from_fn_with_state(
+                    intent_posture,
+                    require_declared_intent,
+                )),
         )
         // `extrude_cut` keeps the intent gate and NOT the create gate: it
         // removes material from an existing solid rather than introducing
@@ -10628,9 +10679,14 @@ pub(crate) fn build_router(state: AppState) -> Router {
         )
         .route(
             "/api/sketch/{id}/revolve",
-            post(sketch::revolve_sketch).route_layer(axum::middleware::from_fn(
-                auth_middleware::require_create_geometry,
-            )),
+            post(sketch::revolve_sketch)
+                .route_layer(axum::middleware::from_fn(
+                    auth_middleware::require_create_geometry,
+                ))
+                .route_layer(axum::middleware::from_fn_with_state(
+                    intent_posture,
+                    require_declared_intent,
+                )),
         )
         .route("/api/sketch/plane-from-face", post(sketch::plane_from_face))
         // Region preview — server-authoritative outer/hole topology
@@ -10701,15 +10757,25 @@ pub(crate) fn build_router(state: AppState) -> Router {
         // and introduce a new solid.
         .route(
             "/api/csketch/{id}/extrude",
-            post(csketch::extrude_csketch).route_layer(axum::middleware::from_fn(
-                auth_middleware::require_create_geometry,
-            )),
+            post(csketch::extrude_csketch)
+                .route_layer(axum::middleware::from_fn(
+                    auth_middleware::require_create_geometry,
+                ))
+                .route_layer(axum::middleware::from_fn_with_state(
+                    intent_posture,
+                    require_declared_intent,
+                )),
         )
         .route(
             "/api/csketch/{id}/revolve",
-            post(csketch::revolve_csketch).route_layer(axum::middleware::from_fn(
-                auth_middleware::require_create_geometry,
-            )),
+            post(csketch::revolve_csketch)
+                .route_layer(axum::middleware::from_fn(
+                    auth_middleware::require_create_geometry,
+                ))
+                .route_layer(axum::middleware::from_fn_with_state(
+                    intent_posture,
+                    require_declared_intent,
+                )),
         )
         .route(
             "/api/csketch/{id}/constraint",
@@ -11881,6 +11947,15 @@ async fn require_declared_intent(
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
+    // Reads never need a declared intent — building does. Some routes share
+    // a path between a read and a mutation (`GET`/`DELETE /api/geometry/
+    // {id}`), so the verb is checked here rather than by route.
+    if matches!(
+        *request.method(),
+        axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::OPTIONS
+    ) {
+        return next.run(request).await;
+    }
     let applies = match posture {
         IntentPosture::Optional => false,
         IntentPosture::Required => true,

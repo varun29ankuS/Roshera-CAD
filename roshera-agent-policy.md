@@ -30,7 +30,9 @@ program before anything runs; but a failure MID-run stops there with no rollback
 completed prefix is really applied. Read where the ledger stopped before you build on it --
 the model in front of you is the prefix, not what you asked for.
 
-Declare intent before you build: mutating calls are refused until a feature's
+Declare intent before you build (ENFORCED: the server refuses any agent change to
+geometry -- create, modify, import or delete -- that carries no declared intent):
+mutating calls are refused until a feature's
 timeline_checkpoint is open, and the checkpoint writes the matching notebook line itself.
 Name the INTENT in engineering language -- "bolt circle 8 x D18 on D160 B.C.", never
 "step 3" -- what a drawing would name: the feature, its governing dimensions, and where
