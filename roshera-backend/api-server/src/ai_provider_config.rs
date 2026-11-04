@@ -702,6 +702,7 @@ pub fn repin_goose_to_claude_code(claude_cli_path: &Path) -> Result<(), String> 
     let config = goose::config::Config::global();
     goose::config::set_active_provider(config, "claude-code", "default")
         .map_err(|e| format!("failed to pin goose's active_provider to claude-code: {e}"))?;
+    apply_fast_model_override(config, "claude-code", "default")?;
     config
         .set_param("CLAUDE_CODE_COMMAND", claude_cli_path.display().to_string())
         .map_err(|e| format!("failed to set CLAUDE_CODE_COMMAND: {e}"))?;
@@ -1060,6 +1061,42 @@ fn goose_declarative_provider_for(
     }
 }
 
+/// The `GOOSE_FAST_MODEL` override to write when goose is pinned to
+/// `goose_provider_name` with main model `model`, or `None` to clear it and
+/// keep goose's own per-provider default.
+///
+/// goose runs lightweight work (session naming, compaction) on a provider's
+/// declared "fast model". OpenRouter's declared default is a paid model
+/// (`google/gemini-2.5-flash`), so on a key without credits every new
+/// session paid a 402 and then retried on the main model (measured live
+/// 2026-11-04). The chosen model is the one this key can actually serve.
+pub fn fast_model_override_for<'m>(goose_provider_name: &str, model: &'m str) -> Option<&'m str> {
+    match goose_provider_name {
+        "openrouter" => Some(model),
+        _ => None,
+    }
+}
+
+/// Write (or clear) goose's `GOOSE_FAST_MODEL` for a fresh provider pin, so
+/// an override set for one provider can never leak into the next.
+fn apply_fast_model_override(
+    config: &goose::config::Config,
+    goose_provider_name: &str,
+    model: &str,
+) -> Result<(), String> {
+    match fast_model_override_for(goose_provider_name, model) {
+        Some(fast) => config
+            .set_param("GOOSE_FAST_MODEL", fast)
+            .map_err(|e| format!("failed to set GOOSE_FAST_MODEL: {e}")),
+        // Absent already is the goal state, so a delete of a missing key is
+        // not an error worth refusing the pin over.
+        None => {
+            let _ = config.delete("GOOSE_FAST_MODEL");
+            Ok(())
+        }
+    }
+}
+
 /// Pin goose's `active_provider` to the declarative/native provider
 /// backing `roshera_provider_id`, supplying its API key via the exact
 /// env var that provider's own credential resolution reads (see the
@@ -1122,6 +1159,7 @@ pub fn repin_goose_to_declarative_provider(
     goose::config::set_active_provider(config, goose_provider_name, resolved_model).map_err(
         |e| format!("failed to pin goose's active_provider to {goose_provider_name}: {e}"),
     )?;
+    apply_fast_model_override(config, goose_provider_name, resolved_model)?;
     Ok(())
 }
 
@@ -2476,6 +2514,36 @@ mod tests {
     /// OpenRouter reaches goose's NATIVE `openrouter` provider, which reads
     /// `OPENROUTER_API_KEY` (goose `providers/openrouter.rs`). No default
     /// model: OpenRouter's catalogue changes daily, so the caller names one.
+    /// goose's openrouter provider declares `google/gemini-2.5-flash` as its
+    /// default "fast model" (session naming, compaction). On a key without
+    /// credits that request fails 402 on every new session and goose then
+    /// retries on the main model — a wasted paid attempt plus a second slow
+    /// request, measured live 2026-11-04. Pinning the fast model to the
+    /// chosen model removes both. Every other provider keeps goose's own
+    /// default, and a stale override must never leak across a repin.
+    #[test]
+    fn fast_model_override_pins_openrouter_to_the_chosen_model_only() {
+        assert_eq!(
+            fast_model_override_for("openrouter", "nvidia/nemotron-3-ultra-550b-a55b:free"),
+            Some("nvidia/nemotron-3-ultra-550b-a55b:free")
+        );
+        for other in [
+            "anthropic",
+            "openai",
+            "xai",
+            "moonshot",
+            "zhipu",
+            "sarvam",
+            "claude-code",
+        ] {
+            assert_eq!(
+                fast_model_override_for(other, "some-model"),
+                None,
+                "{other}"
+            );
+        }
+    }
+
     #[test]
     fn goose_declarative_provider_for_maps_openrouter_to_goose_native_openrouter() {
         assert_eq!(
