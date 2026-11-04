@@ -103,7 +103,12 @@ png = "0.17"
 #   exist in this binary regardless of any config file (the registry lookup
 #   fails closed). See api-server/src/goose_acp.rs for the rest of the
 #   lockdown story.
-goose = { git = "https://github.com/block/goose.git", rev = "022c17c3946b506b031fc828543cb9e6650dbfd5", default-features = false }
+#
+# VENDORED (2026-11-04): goose is now part of Roshera — its source lives in
+# `roshera-backend/vendor/goose` (copied from upstream rev 022c17c3, Apache-2.0,
+# see vendor/goose/VENDORED.md). The harness is ours to change; every rule
+# above still applies to the vendored copy.
+goose = { path = "../vendor/goose/crates/goose", default-features = false }
 [dev-dependencies]
 tower = { version = "0.5.2", features = ["util"] }
 hyper = "1.0"

@@ -11,6 +11,9 @@ members = [
     "verdict-harness",
     "assembly-engine"
 ]
+# vendor/goose is its own nested workspace (its crates inherit settings from
+# vendor/goose/Cargo.toml); api-server reaches it by path, it is never a member.
+exclude = ["vendor"]
 resolver = "2"
 
 
