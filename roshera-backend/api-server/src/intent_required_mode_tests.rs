@@ -195,6 +195,106 @@ async fn required_mode_does_not_gate_a_read_only_route() {
 }
 
 // =====================================================================
+// 2b. AgentRequests — the production default since 2026-11-04. The rule
+//     "declare intent before you build" is Roshera's (roshera-agent-
+//     policy.md), not one host's: it was enforced only inside roshera-mcp,
+//     so any agent reaching REST directly skipped it. Every agent client
+//     identifies itself with `X-Roshera-Agent`; humans (app, viewport) do
+//     not, and stay unaffected.
+// =====================================================================
+
+async fn agent_requests_state() -> AppState {
+    let mut state = make_test_state().await;
+    state.intent_posture = IntentPosture::AgentRequests;
+    state
+}
+
+fn as_agent(
+    mut req: axum::http::Request<axum::body::Body>,
+) -> axum::http::Request<axum::body::Body> {
+    req.headers_mut().insert(
+        "x-roshera-agent",
+        "some-model".parse().expect("header value must parse"),
+    );
+    req
+}
+
+#[tokio::test]
+async fn agent_requests_refuses_an_agent_mutation_with_no_intent() {
+    let state = agent_requests_state().await;
+    let object = create_box(&state).await;
+
+    let (status, body) = dispatch(&state, as_agent(transform_request(object, None))).await;
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "an agent mutation with no declared intent must be refused; body = {body}"
+    );
+    assert_eq!(
+        body["error_code"].as_str(),
+        Some("intent_required"),
+        "body = {body}"
+    );
+    assert_eq!(
+        body["details"]["gate"].as_str(),
+        Some("intent"),
+        "body = {body}"
+    );
+}
+
+#[tokio::test]
+async fn agent_requests_lets_a_human_mutation_through_without_intent() {
+    let state = agent_requests_state().await;
+    let object = create_box(&state).await;
+
+    let (status, body) = dispatch(&state, transform_request(object, None)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a request with no agent header is a human (app/viewport) and must not \
+         be asked for intent; body = {body}"
+    );
+}
+
+#[tokio::test]
+async fn agent_requests_lets_an_agent_mutation_with_intent_through() {
+    let state = agent_requests_state().await;
+    let object = create_box(&state).await;
+
+    let (status, body) = dispatch(
+        &state,
+        as_agent(transform_request(
+            object,
+            Some("move the bracket 1 mm along X"),
+        )),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "declared intent passes; body = {body}"
+    );
+}
+
+#[test]
+fn intent_posture_defaults_to_agent_requests_and_off_is_explicit() {
+    assert_eq!(
+        IntentPosture::from_env_with(|_| None),
+        IntentPosture::AgentRequests,
+        "with no setting, agent requests must be held to the intent rule"
+    );
+    for value in ["0", "false", "off", "OFF"] {
+        assert_eq!(
+            IntentPosture::from_env_with(
+                |k| (k == "ROSHERA_REQUIRE_INTENT").then(|| value.to_string())
+            ),
+            IntentPosture::Optional,
+            "ROSHERA_REQUIRE_INTENT={value} must switch the rule off explicitly"
+        );
+    }
+}
+
+// =====================================================================
 // 3. `IntentPosture::from_env` activation itself — every test above
 //    injects the posture by field mutation, which proves the ENFORCEMENT
 //    but not the ACTIVATION: a typo'd env var name inside `from_env_with`
@@ -206,11 +306,11 @@ async fn required_mode_does_not_gate_a_read_only_route() {
 
 #[test]
 fn intent_posture_from_env_reads_roshera_require_intent() {
-    // Empty environment → Optional (default OFF).
+    // Empty environment → AgentRequests (the 2026-11-04 default; see 2b).
     assert_eq!(
         IntentPosture::from_env_with(|_| None),
-        IntentPosture::Optional,
-        "a server with no ROSHERA_* variables must default to Optional"
+        IntentPosture::AgentRequests,
+        "a server with no ROSHERA_* variables must default to AgentRequests"
     );
 
     // The opt-in fires only on its own variable, set truthy.
@@ -224,21 +324,23 @@ fn intent_posture_from_env_reads_roshera_require_intent() {
         );
     }
 
-    // A merely-present or falsey value is not an opt-in.
-    for value in ["0", "false", "", "yes", "no"] {
+    // An unrecognised value is not an opt-in to Required, and not an
+    // opt-OUT either — only an explicit falsey value switches the rule off
+    // (asserted in `intent_posture_defaults_to_agent_requests_and_off_is_explicit`).
+    for value in ["", "yes", "no"] {
         assert_eq!(
             IntentPosture::from_env_with(
                 |k| (k == "ROSHERA_REQUIRE_INTENT").then(|| value.to_string())
             ),
-            IntentPosture::Optional,
-            "ROSHERA_REQUIRE_INTENT={value:?} must NOT enable Required"
+            IntentPosture::AgentRequests,
+            "ROSHERA_REQUIRE_INTENT={value:?} must leave the default in place"
         );
     }
 
     // An unrelated variable must not move the posture.
     assert_eq!(
         IntentPosture::from_env_with(|k| (k == "ROSHERA_DEV_INSECURE").then(|| "1".to_string())),
-        IntentPosture::Optional,
-        "an unrelated env var must not enable intent-required mode"
+        IntentPosture::AgentRequests,
+        "an unrelated env var must not move the posture"
     );
 }

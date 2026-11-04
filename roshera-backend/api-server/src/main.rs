@@ -11810,11 +11810,20 @@ fn decode_intent_header(raw: &str) -> Option<String> {
 /// gated route's `route_layer` from there.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IntentPosture {
-    /// Default. A mutating call with no intent header runs exactly as it
-    /// always has — zero behavioural change, proven byte-identical by
-    /// `intent_required_mode_tests::default_off_is_byte_identical_to_
-    /// today`.
+    /// `ROSHERA_REQUIRE_INTENT=0` / `false` / `off` — the rule is switched
+    /// off: a mutating call with no intent header runs exactly as it did
+    /// before this gate existed (proven by `intent_required_mode_tests::
+    /// default_off_*`, which pin this variant on the test state).
     Optional,
+    /// DEFAULT since 2026-11-04. "Declare intent before you build" is a rule
+    /// of Roshera's agent policy (`roshera-agent-policy.md`), so it is
+    /// enforced here for every AGENT request — one carrying `X-Roshera-
+    /// Agent`, which every agent client sends — whatever host or channel the
+    /// agent came through. Before, only `roshera-mcp`'s client-side gate
+    /// held it, so an agent reaching REST directly skipped it. Requests
+    /// without the agent header (the app, the viewport) are humans and are
+    /// not asked.
+    AgentRequests,
     /// `ROSHERA_REQUIRE_INTENT=1` (or `true`, case-insensitive). A
     /// mutating call on one of the ten gate-3 routes with no declared
     /// intent is refused, typed (`ApiError::intent_required`), before the
@@ -11837,13 +11846,14 @@ impl IntentPosture {
     where
         F: Fn(&str) -> Option<String>,
     {
-        let truthy = get("ROSHERA_REQUIRE_INTENT")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
-        if truthy {
-            IntentPosture::Required
-        } else {
-            IntentPosture::Optional
+        match get("ROSHERA_REQUIRE_INTENT").as_deref().map(str::trim) {
+            Some(v) if v == "1" || v.eq_ignore_ascii_case("true") => IntentPosture::Required,
+            Some(v)
+                if v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off") =>
+            {
+                IntentPosture::Optional
+            }
+            _ => IntentPosture::AgentRequests,
         }
     }
 }
@@ -11871,7 +11881,16 @@ async fn require_declared_intent(
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    if posture != IntentPosture::Required {
+    let applies = match posture {
+        IntentPosture::Optional => false,
+        IntentPosture::Required => true,
+        IntentPosture::AgentRequests => request
+            .headers()
+            .get("x-roshera-agent")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| !v.trim().is_empty()),
+    };
+    if !applies {
         return next.run(request).await;
     }
     let declared = request
