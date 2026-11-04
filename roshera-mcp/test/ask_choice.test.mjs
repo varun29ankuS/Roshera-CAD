@@ -209,7 +209,7 @@ const appCardsSrc = readFileSync(
   join(HERE, "..", "..", "roshera-app", "src", "lib", "blackboard-cards.ts"),
   "utf8",
 );
-const goosehints = readFileSync(join(HERE, "..", "..", ".goosehints"), "utf8");
+const goosehints = readFileSync(join(HERE, "..", "..", "roshera-agent-policy.md"), "utf8");
 
 function frontendCardTruth() {
   const prefixMatch = /const CARD_FENCE_PREFIX\s*=\s*'([^']+)'/.exec(appCardsSrc);
@@ -236,15 +236,15 @@ check("buildChoicesFence emits the exact kind the frontend renders", () => {
   );
 });
 
-check(".goosehints 'Kinds:' paragraph names exactly the frontend's kinds", () => {
+check("roshera-agent-policy.md 'Kinds:' paragraph names exactly the frontend's kinds", () => {
   const { kinds } = frontendCardTruth();
   const para = /Kinds:([\s\S]*?)\r?\n\r?\n/.exec(goosehints);
-  assert.ok(para, "'Kinds:' paragraph not found in .goosehints");
+  assert.ok(para, "'Kinds:' paragraph not found in roshera-agent-policy.md");
   const stated = [...new Set([...para[1].matchAll(/`([a-z_]+)`/g)].map((m) => m[1]))];
   assert.deepEqual(
     stated.sort(),
     [...kinds].sort(),
-    ".goosehints tells the agent a different kind set than the frontend renders — " +
+    "the agent policy tells the agent a different kind set than the frontend renders — " +
       "update the 'Kinds:' paragraph and CARD_KINDS together",
   );
 });

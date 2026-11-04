@@ -114,8 +114,10 @@ const PINNED_PROVIDER: &str = "anthropic";
 /// which model is "the default".
 const PINNED_MODEL: &str = shared_types::DEFAULT_CLAUDE_MODEL;
 
-/// The agent policy, embedded at compile time from the ONE committed
-/// source (`.goosehints` at the repo root — voice, proportionality,
+/// ROSHERA's agent policy, embedded at compile time from the ONE committed
+/// source (`roshera-agent-policy.md` at the repo root; it was `.goosehints`
+/// until 2026-11-04 — renamed because the policy belongs to Roshera, not
+/// to the host that happens to load it — voice, proportionality,
 /// verdict-forwarding, clickable-choices, the `kb_lookup` non-negotiables,
 /// and everything else the agent is told). `CARGO_MANIFEST_DIR` is this
 /// crate's own directory (`roshera-backend/api-server`), fixed at compile
@@ -129,8 +131,10 @@ const PINNED_MODEL: &str = shared_types::DEFAULT_CLAUDE_MODEL;
 /// never reached the agent, with nothing structural to notice the gap.
 /// `include_str!` makes that class of defect unwritable — there is
 /// exactly one file anyone edits, and the binary carries its content.
-const GOOSEHINTS_POLICY: &str =
-    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../.goosehints"));
+const ROSHERA_AGENT_POLICY: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../roshera-agent-policy.md"
+));
 
 /// The meta-permission extension, disabled before everything else: its
 /// tools (`manage_extensions`, `search_available_extensions`) exist to
@@ -209,8 +213,8 @@ pub(crate) enum GooseAcpError {
         #[source]
         source: std::io::Error,
     },
-    #[error("failed to write the agent policy (.goosehints) into '{path}': {source}")]
-    GoosehintsWrite {
+    #[error("failed to write the Roshera agent policy (AGENTS.md) at '{path}': {source}")]
+    AgentPolicyWrite {
         path: String,
         #[source]
         source: std::io::Error,
@@ -384,9 +388,9 @@ fn write_sarvam_custom_provider_definition() -> Result<(), GooseAcpError> {
     Ok(())
 }
 
-/// The directory goose treats as a session's `cwd` — where `.goosehints`
+/// The directory goose treats as a session's `cwd` — where the agent policy (`AGENTS.md`)
 /// must live for [`goose::hints::load_hint_files`] to find it (see the
-/// `goosehints_policy_reaches_the_system_prompt` test's doc comment for the
+/// `roshera_agent_policy_reaches_the_system_prompt` test's doc comment for the
 /// exact call chain: `PromptManager::builder().with_hints(working_dir)`,
 /// `working_dir` == session `cwd`).
 ///
@@ -422,23 +426,40 @@ fn agent_workspace_dir() -> Result<PathBuf, GooseAcpError> {
     })
 }
 
-/// Write the embedded [`GOOSEHINTS_POLICY`] into the agent workspace,
+/// Write the embedded [`ROSHERA_AGENT_POLICY`] into the agent workspace,
 /// unconditionally overwriting whatever is already at
-/// `<workspace>/.goosehints`. This must be the ONLY writer of that path in
+/// `<workspace>/AGENTS.md`. This must be the ONLY writer of that path in
 /// this repo — the hand-copy it replaces (four hours stale when the drift
 /// was caught) is exactly the failure mode "written unconditionally on
 /// every boot" forecloses, the same convention
 /// [`write_sarvam_custom_provider_definition`] already documents for the
 /// same reason: "written if missing" can still go stale, "written every
 /// boot from the one embedded source" cannot.
-fn write_goosehints_policy_into_workspace(
+///
+/// Delivered as `AGENTS.md` — the host-neutral context-file name goose loads
+/// by default (`goose::hints::get_context_filenames`, alongside its own
+/// `.goosehints`) and that other agent hosts read too. A `.goosehints` left
+/// in the workspace from before the rename is removed, so the agent never
+/// reads two copies of the policy, one of them stale.
+fn write_roshera_agent_policy_into_workspace(
     workspace_dir: &std::path::Path,
 ) -> Result<(), GooseAcpError> {
-    let path = workspace_dir.join(goose::hints::GOOSE_HINTS_FILENAME);
-    std::fs::write(&path, GOOSEHINTS_POLICY).map_err(|source| GooseAcpError::GoosehintsWrite {
-        path: path.display().to_string(),
-        source,
-    })
+    let path = workspace_dir.join(goose::hints::AGENTS_MD_FILENAME);
+    std::fs::write(&path, ROSHERA_AGENT_POLICY).map_err(|source| {
+        GooseAcpError::AgentPolicyWrite {
+            path: path.display().to_string(),
+            source,
+        }
+    })?;
+    let stale = workspace_dir.join(goose::hints::GOOSE_HINTS_FILENAME);
+    match std::fs::remove_file(&stale) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(GooseAcpError::AgentPolicyWrite {
+            path: stale.display().to_string(),
+            source,
+        }),
+    }
 }
 
 /// `GET /api/acp/config` — the ACP session working directory the backend
@@ -446,7 +467,7 @@ fn write_goosehints_policy_into_workspace(
 /// independently hardcode a copy (`VITE_ACP_CWD` is an explicit override
 /// only now, never the default — see [`agent_workspace_dir`]'s doc for the
 /// defect this closes). Calls the exact same function [`initialize`] uses
-/// to know where to write `.goosehints`, so there is structurally one
+/// to know where to write the agent policy, so there is structurally one
 /// value, not two kept in sync by convention.
 ///
 /// Requires no permission beyond the standard `Authorization` credential
@@ -721,14 +742,14 @@ pub(crate) fn initialize(
     // selection is a separate, not-yet-generalized gap).
     write_sarvam_custom_provider_definition()?;
 
-    // Refresh the agent workspace's `.goosehints` from the one embedded
+    // Refresh the agent workspace's policy (AGENTS.md) from the one embedded
     // source on every boot — see `agent_workspace_dir` and
-    // `write_goosehints_policy_into_workspace` for why this must be
+    // `write_roshera_agent_policy_into_workspace` for why this must be
     // unconditional and the workspace path's frontend/backend coupling.
     // Independent of GOOSE_PATH_ROOT/Config::global() (pure filesystem),
     // so its ordering relative to the provider pin below does not matter.
     let agent_workspace = agent_workspace_dir()?;
-    write_goosehints_policy_into_workspace(&agent_workspace)?;
+    write_roshera_agent_policy_into_workspace(&agent_workspace)?;
 
     let config = goose::config::Config::global();
     match provider_pin {
@@ -1723,10 +1744,10 @@ mod tests {
 
         // THE proving assertion for the policy-drift fix: after a real
         // `initialize()` boot, the workspace file goose's `with_hints`
-        // actually loads (see `goosehints_policy_reaches_the_system_prompt`
+        // actually loads (see `roshera_agent_policy_reaches_the_system_prompt`
         // for the exact load path) must be byte-identical to the ONE
         // embedded source — never absent, never a stale hand-copy.
-        let workspace_hints_path = agent_workspace.join(goose::hints::GOOSE_HINTS_FILENAME);
+        let workspace_hints_path = agent_workspace.join(goose::hints::AGENTS_MD_FILENAME);
         let workspace_hints = std::fs::read_to_string(&workspace_hints_path).unwrap_or_else(|e| {
             panic!(
                 "initialize() must write {} into the agent workspace: {e}",
@@ -1734,8 +1755,8 @@ mod tests {
             )
         });
         assert_eq!(
-            workspace_hints, GOOSEHINTS_POLICY,
-            "the workspace .goosehints must match the embedded policy exactly \
+            workspace_hints, ROSHERA_AGENT_POLICY,
+            "the workspace AGENTS.md must match the embedded policy exactly \
              after initialize() — a mismatch here means the workspace file \
              is stale or was hand-edited, exactly the defect this write \
              exists to make impossible"
@@ -2016,7 +2037,7 @@ mod tests {
     /// test above) is harmless regardless of run order — unlike
     /// `GOOSE_ROOT`/`initialize()`, which must stay singly-owned.
     /// THE proving test that the policy actually reaches a session's system
-    /// prompt — not merely that `.goosehints` exists on disk.
+    /// prompt — not merely that `AGENTS.md` exists on disk.
     ///
     /// goose builds the system prompt on every reply with
     /// `PromptManager::builder().with_hints(working_dir).build()`
@@ -2038,8 +2059,8 @@ mod tests {
     /// the exact mechanism behind the original defect: it was not merely
     /// "the wrong cwd", the committed file was structurally out of reach
     /// from any cwd under `roshera-backend/`, hand-copy or not. Embedding
-    /// [`GOOSEHINTS_POLICY`] at compile time and writing it into the
-    /// workspace ([`write_goosehints_policy_into_workspace`]) is what
+    /// [`ROSHERA_AGENT_POLICY`] at compile time and writing it into the
+    /// workspace ([`write_roshera_agent_policy_into_workspace`]) is what
     /// closes this, not a path change — the git-boundary short-circuit
     /// makes a path change alone insufficient.
     ///
@@ -2049,13 +2070,13 @@ mod tests {
     /// for `@file` imports named *inside* a hints file's content; the
     /// hints file itself is loaded by a bare `Path::is_file()` check with
     /// no ignore filtering. Confirmed by reading `hints/load_hints.rs`
-    /// directly. `GOOSEHINTS_POLICY` contains no `@import` lines, so this
+    /// directly. `ROSHERA_AGENT_POLICY` contains no `@import` lines, so this
     /// does not apply here regardless.)
     ///
     /// This test proves the mechanism goose actually uses — "whatever is
-    /// written at `<cwd>/.goosehints` reaches the system prompt" — against
+    /// written at `<cwd>/AGENTS.md` reaches the system prompt" — against
     /// an isolated temp directory seeded with exactly what
-    /// [`write_goosehints_policy_into_workspace`] writes, rather than
+    /// [`write_roshera_agent_policy_into_workspace`] writes, rather than
     /// against the real repo tree (which would be a second, unnecessary
     /// toucher of shared filesystem state across parallel tests).
     /// `goose_lockdown_leaves_exactly_roshera_reachable` is the test that
@@ -2070,25 +2091,72 @@ mod tests {
     /// `GOOSE_HINTS_FILENAME` are pure filesystem reads with no `Config`
     /// dependency, so this test is safe to run alongside every other test
     /// in this file under the default parallel test runner, with no claim.
+    /// The policy is ROSHERA's, not goose's: it is delivered as `AGENTS.md`
+    /// (the host-neutral context file goose loads by default, alongside its
+    /// own `.goosehints`), and a `.goosehints` left over from before the
+    /// rename is removed so the agent never reads the policy twice or reads
+    /// a stale copy.
     #[test]
-    fn goosehints_policy_reaches_the_system_prompt() {
+    fn roshera_agent_policy_is_written_as_agents_md_and_replaces_a_stale_goosehints() {
         let workspace =
-            std::env::temp_dir().join(format!("roshera-goosehints-proof-{}", uuid::Uuid::new_v4()));
+            std::env::temp_dir().join(format!("roshera-policy-proof-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&workspace).expect("temp workspace dir must be creatable");
-        let hints_path = workspace.join(goose::hints::GOOSE_HINTS_FILENAME);
-        std::fs::write(&hints_path, GOOSEHINTS_POLICY)
+        let stale = workspace.join(goose::hints::GOOSE_HINTS_FILENAME);
+        std::fs::write(&stale, "stale policy from before the rename")
+            .expect("seeding a stale .goosehints must succeed");
+
+        write_roshera_agent_policy_into_workspace(&workspace)
+            .expect("writing the policy into the workspace must succeed");
+
+        let written = std::fs::read_to_string(workspace.join(goose::hints::AGENTS_MD_FILENAME))
+            .expect("AGENTS.md must exist after the write");
+        assert_eq!(
+            written, ROSHERA_AGENT_POLICY,
+            "AGENTS.md is the embedded policy"
+        );
+        assert!(!stale.exists(), "a stale .goosehints must be removed");
+
+        let gitignore = goose::hints::build_gitignore(&workspace);
+        let hints = goose::hints::load_hint_files(
+            &workspace,
+            &[
+                goose::hints::GOOSE_HINTS_FILENAME.to_string(),
+                goose::hints::AGENTS_MD_FILENAME.to_string(),
+            ],
+            &gitignore,
+        );
+        assert_eq!(
+            hints
+                .matches("You are a mechanical design agent on the Roshera kernel")
+                .count(),
+            1,
+            "goose's default context files must yield the policy exactly once: {hints}"
+        );
+        assert!(
+            !hints.contains("stale policy"),
+            "the stale copy must not load"
+        );
+    }
+
+    #[test]
+    fn roshera_agent_policy_reaches_the_system_prompt() {
+        let workspace =
+            std::env::temp_dir().join(format!("roshera-policy-load-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&workspace).expect("temp workspace dir must be creatable");
+        let hints_path = workspace.join(goose::hints::AGENTS_MD_FILENAME);
+        std::fs::write(&hints_path, ROSHERA_AGENT_POLICY)
             .expect("seeding the temp workspace with the embedded policy must succeed");
 
         let gitignore = goose::hints::build_gitignore(&workspace);
         let hints = goose::hints::load_hint_files(
             &workspace,
-            &[goose::hints::GOOSE_HINTS_FILENAME.to_string()],
+            &[goose::hints::AGENTS_MD_FILENAME.to_string()],
             &gitignore,
         );
 
         assert!(
             hints.contains("You are a mechanical design agent on the Roshera kernel"),
-            "the real .goosehints content did not come back through goose's \
+            "the real agent-policy content did not come back through goose's \
              own load_hint_files — the policy would not reach a session's \
              system prompt. Got: {hints}"
         );
@@ -2387,7 +2455,7 @@ mod tests {
     /// frontend copy is now gone — `acp-client.ts` asks [`get_acp_config`]
     /// for the path instead — so the only thing left to prove on this
     /// side is that the endpoint actually serves the SAME directory
-    /// [`initialize`] resolves and writes `.goosehints` into, not some
+    /// [`initialize`] resolves and writes the agent policy into, not some
     /// independently-recomputed value that happens to look similar.
     ///
     /// Holds [`process_env_test_lock`] across BOTH reads below, because
@@ -2429,7 +2497,7 @@ mod tests {
             Some(expected.to_string_lossy().as_ref()),
             "the endpoint's cwd must be byte-identical to what \
              agent_workspace_dir() (and therefore initialize()'s \
-             .goosehints write) resolves — any divergence here means a \
+             agent-policy write) resolves — any divergence here means a \
              second, independent computation of this path has crept back in"
         );
         assert!(
