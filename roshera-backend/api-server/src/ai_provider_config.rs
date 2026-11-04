@@ -1051,6 +1051,11 @@ fn goose_declarative_provider_for(
         // live — is exactly how a phantom model got into this repo's
         // config before. So DeepSeek's default model stays `None`.
         "deepseek" => Some(("custom_deepseek", "DEEPSEEK_API_KEY", None)),
+        // goose implements OpenRouter NATIVELY (`providers/openrouter.rs`,
+        // name "openrouter", key OPENROUTER_API_KEY). No default model:
+        // OpenRouter's catalogue (including its `:free` tier) changes
+        // daily, so the caller must name one.
+        "openrouter" => Some(("openrouter", "OPENROUTER_API_KEY", None)),
         _ => None,
     }
 }
@@ -2465,6 +2470,17 @@ mod tests {
             goose_declarative_provider_for("kimi"),
             Some(("moonshot", "MOONSHOT_API_KEY", None)),
             "Roshera's 'kimi' id must map to goose's own 'moonshot' provider name"
+        );
+    }
+
+    /// OpenRouter reaches goose's NATIVE `openrouter` provider, which reads
+    /// `OPENROUTER_API_KEY` (goose `providers/openrouter.rs`). No default
+    /// model: OpenRouter's catalogue changes daily, so the caller names one.
+    #[test]
+    fn goose_declarative_provider_for_maps_openrouter_to_goose_native_openrouter() {
+        assert_eq!(
+            goose_declarative_provider_for("openrouter"),
+            Some(("openrouter", "OPENROUTER_API_KEY", None))
         );
     }
 

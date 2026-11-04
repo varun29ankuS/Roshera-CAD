@@ -311,6 +311,27 @@ pub const PROVIDER_ALLOWLIST: &[AllowlistedProvider] = &[
         }],
     },
     AllowlistedProvider {
+        id: "openrouter",
+        display_name: "OpenRouter",
+        reason: "OpenRouter's hosted model catalogue (many vendors, including \
+                 a free tier), over its OpenAI-compatible API. \
+                 Operator/user-configured only.",
+        modes: &[ModeEntry {
+            mode: CredentialMode::ApiKey,
+            spawns_local_process: false,
+            wiring: WiringStatus::Wired,
+            reason: "Static OpenRouter API key over HTTPS Bearer auth \
+                     (OPENROUTER_API_KEY). Wires the agent (/acp) surface only, \
+                     via goose's native `openrouter` provider; see xai's entry \
+                     for the repin mechanism, identical here. The caller must \
+                     name a model (no default — the catalogue changes daily). \
+                     REST routes (/api/ai/command) have no native Roshera \
+                     LLMProvider for OpenRouter and stay unavailable through \
+                     this key. The key is accepted unverified; an invalid key \
+                     surfaces at first use.",
+        }],
+    },
+    AllowlistedProvider {
         id: "deepseek",
         display_name: "DeepSeek",
         reason: "DeepSeek's hosted models, OpenAI-compatible Chat \
@@ -645,6 +666,10 @@ mod tests {
         // declarative JSON, reached via a rename mapping (deepseek ->
         // custom_deepseek), same tier as xai/mistral/glm/kimi.
         ("deepseek", CredentialMode::ApiKey),
+        // goose's native `openrouter` provider (providers/openrouter.rs),
+        // reading OPENROUTER_API_KEY — mapped in
+        // api-server ai_provider_config::goose_declarative_provider_for.
+        ("openrouter", CredentialMode::ApiKey),
     ];
 
     #[test]
