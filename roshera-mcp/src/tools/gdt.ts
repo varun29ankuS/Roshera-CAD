@@ -10,7 +10,7 @@
 
 import type { ToolHost } from "../registry.js";
 import { z } from "zod";
-import { api, ok, fail, BASE, ApiError, AUTH_HEADERS } from "../core.js";
+import { api, ok, fail, BASE, ApiError, scopeHeaders } from "../core.js";
 
 // ─── Compact-verdict helpers ───────────────────────────────────────────
 
@@ -178,11 +178,7 @@ export function registerGdtTools(server: ToolHost): void {
           `${BASE}/api/agent/parts/${part_id}/datums`,
           {
             method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              "X-Roshera-Agent": "Claude",
-              ...AUTH_HEADERS,
-            },
+            headers: { "Content-Type": "application/json", ...scopeHeaders() },
             body: JSON.stringify({
               label,
               face_id: face_id ?? null,
@@ -277,11 +273,7 @@ export function registerGdtTools(server: ToolHost): void {
           `${BASE}/api/agent/parts/${part_id}/fcf`,
           {
             method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              "X-Roshera-Agent": "Claude",
-              ...AUTH_HEADERS,
-            },
+            headers: { "Content-Type": "application/json", ...scopeHeaders() },
             body: JSON.stringify({
               characteristic,
               tolerance_mm,

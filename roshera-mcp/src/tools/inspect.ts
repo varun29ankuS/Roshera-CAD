@@ -2,7 +2,16 @@
 
 import type { ToolHost } from "../registry.js";
 import { z } from "zod";
-import { api, ok, fail, BASE, ApiError, setDocumentUnitCache, AUTH_HEADERS } from "../core.js";
+import {
+  api,
+  ok,
+  fail,
+  BASE,
+  ApiError,
+  setDocumentUnitCache,
+  scopeHeaders,
+  readRefusable,
+} from "../core.js";
 
 export function registerInspectTools(server: ToolHost) {
   server.tool(
@@ -258,11 +267,12 @@ export function registerInspectTools(server: ToolHost) {
     },
     async ({ part_id, kind, normal_dir, extremal, along, angle_tol_deg }) => {
       try {
-        // Read the body regardless of status: 404 (not_found) / 409 (ambiguous)
-        // are the kernel's meaningful REFUSALS, not transport errors.
+        // 404 (not_found) / 409 (ambiguous) are the kernel's meaningful
+        // REFUSALS: returned as an ERROR carrying the full body (the candidate
+        // list included), never success-shaped (readRefusable).
         const res = await fetch(`${BASE}/api/agent/parts/${part_id}/select-face`, {
           method: "POST",
-          headers: { "Content-Type": "application/json", ...AUTH_HEADERS },
+          headers: { "Content-Type": "application/json", ...scopeHeaders() },
           body: JSON.stringify({
             kind,
             normal_dir: normal_dir ?? null,
@@ -271,8 +281,7 @@ export function registerInspectTools(server: ToolHost) {
             angle_tol_deg,
           }),
         });
-        const j = await res.json();
-        return ok(j);
+        return ok(await readRefusable(res, `select_face on part ${part_id}`));
       } catch (e) {
         return fail(e);
       }
@@ -315,7 +324,7 @@ export function registerInspectTools(server: ToolHost) {
       try {
         const res = await fetch(`${BASE}/api/agent/parts/${part_id}/select-edge`, {
           method: "POST",
-          headers: { "Content-Type": "application/json", ...AUTH_HEADERS },
+          headers: { "Content-Type": "application/json", ...scopeHeaders() },
           body: JSON.stringify({
             curve_kind,
             blend,
@@ -326,7 +335,7 @@ export function registerInspectTools(server: ToolHost) {
             angle_tol_deg,
           }),
         });
-        return ok(await res.json());
+        return ok(await readRefusable(res, `select_edge on part ${part_id}`));
       } catch (e) {
         return fail(e);
       }

@@ -6,7 +6,7 @@
 
 import type { ToolHost } from "../registry.js";
 import { z } from "zod";
-import { api, ok, fail, BASE, AUTH_HEADERS } from "../core.js";
+import { api, ok, fail, BASE, scopeHeaders, readRefusable } from "../core.js";
 
 export function registerLabelTools(server: ToolHost) {
   server.tool(
@@ -53,10 +53,11 @@ export function registerLabelTools(server: ToolHost) {
           }
         }
         // Raw fetch: 400/404/409 are meaningful REFUSALS (empty name / not-found
-        // / ambiguous selector), surfaced as structured JSON, not transport errors.
+        // / ambiguous selector) — returned as an ERROR carrying the full body,
+        // never success-shaped (readRefusable).
         const res = await fetch(`${BASE}/api/agent/parts/${part_id}/labels`, {
           method: "POST",
-          headers: { "Content-Type": "application/json", "X-Roshera-Agent": "Claude", ...AUTH_HEADERS },
+          headers: { "Content-Type": "application/json", ...scopeHeaders() },
           body: JSON.stringify({
             name,
             kind,
@@ -67,7 +68,7 @@ export function registerLabelTools(server: ToolHost) {
             description: description ?? null,
           }),
         });
-        return ok(await res.json());
+        return ok(await readRefusable(res, `POST /api/agent/parts/${part_id}/labels`));
       } catch (e) {
         return fail(e);
       }
@@ -100,9 +101,9 @@ export function registerLabelTools(server: ToolHost) {
       try {
         const res = await fetch(
           `${BASE}/api/agent/parts/${part_id}/labels/${encodeURIComponent(name)}/resolve`,
-          { headers: { "X-Roshera-Agent": "Claude", ...AUTH_HEADERS } },
+          { headers: scopeHeaders() },
         );
-        return ok(await res.json());
+        return ok(await readRefusable(res, `label_resolve ${name}`));
       } catch (e) {
         return fail(e);
       }

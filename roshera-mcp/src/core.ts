@@ -195,6 +195,48 @@ function partHeaders(): Record<string, string> {
   return boundPart === null ? {} : { "X-Roshera-Part-Id": boundPart };
 }
 
+/**
+ * The session's scope for ONE backend call — the single source every request
+ * uses, `api()` and the raw-fetch paths alike. A raw `fetch` that builds its
+ * own headers drops the part pin (and resolves against the backend's legacy
+ * global model), the document pin and the intent attribution; that is how
+ * gdt_datum / gdt_fcf / labels / select_* / saveBinary worked before
+ * 2026-11-04. Raw fetch is still right where a refusal BODY is the answer —
+ * it just takes its headers from here.
+ */
+export function scopeHeaders(): Record<string, string> {
+  return {
+    // Timeline attribution: the backend's agent_author_layer records
+    // every kernel op from this request as Author::AIAgent("Claude"),
+    // so agent-built features show amber Ⓒ in the Timeline strip.
+    "X-Roshera-Agent": "Claude",
+    // Intent provenance: the open checkpoint phrase, when one exists.
+    ...intentHeaders(),
+    // Session→document binding: the birth-document id, when bound.
+    ...documentHeaders(),
+    // Session→part binding: the part document whose BRepModel this
+    // process owns, when pinned. Absent → the backend's legacy model.
+    ...partHeaders(),
+    // Credential (empty object when ROSHERA_API_KEY is unset).
+    ...AUTH_HEADERS,
+  };
+}
+
+/**
+ * Read a raw-fetch response whose non-2xx body is a meaningful REFUSAL
+ * (ambiguous selection, unknown label, missing name). A 2xx is the parsed
+ * body; anything else is an `ApiError` carrying the full body text, so the
+ * refusal reaches the agent as an error — never success-shaped — with its
+ * detail (e.g. the candidate list) intact.
+ */
+export async function readRefusable(res: Response, what: string): Promise<any> {
+  const text = await res.text();
+  if (!res.ok) {
+    throw new ApiError(`${what} → ${res.status}: ${text}`, res.status, text);
+  }
+  return text.length ? JSON.parse(text) : null;
+}
+
 export async function api(
   method: "GET" | "POST" | "PATCH" | "DELETE",
   path: string,
@@ -206,19 +248,7 @@ export async function api(
     res = await fetch(`${BASE}${path}`, {
       method,
       headers: {
-        // Timeline attribution: the backend's agent_author_layer records
-        // every kernel op from this request as Author::AIAgent("Claude"),
-        // so agent-built features show amber Ⓒ in the Timeline strip.
-        "X-Roshera-Agent": "Claude",
-        // Intent provenance: the open checkpoint phrase, when one exists.
-        ...intentHeaders(),
-        // Session→document binding: the birth-document id, when bound.
-        ...documentHeaders(),
-        // Session→part binding: the part document whose BRepModel this
-        // process owns, when pinned. Absent → the backend's legacy model.
-        ...partHeaders(),
-        // Credential (empty object when ROSHERA_API_KEY is unset).
-        ...AUTH_HEADERS,
+        ...scopeHeaders(),
         ...(body !== undefined ? { "Content-Type": "application/json" } : {}),
       },
       body: body !== undefined ? JSON.stringify(body) : undefined,
@@ -837,7 +867,7 @@ export async function allEdgeIds(partId: number): Promise<number[]> {
   // rest of the session works in its own.
   const res = await fetch(`${BASE}/api/agent/parts/${partId}/select-edge`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", ...partHeaders(), ...AUTH_HEADERS },
+    headers: { "Content-Type": "application/json", ...scopeHeaders() },
     body: JSON.stringify({ curve_kind: "any", blend: "any", extremal: "none" }),
   });
   const j: any = await res.json().catch(() => null);
@@ -1428,7 +1458,7 @@ export const unit3 = (a: number[]) => {
 
 /** Save raw bytes fetched from a backend path to an absolute file on disk. */
 export async function saveBinary(urlPath: string, savePath: string): Promise<number> {
-  const res = await fetch(`${BASE}${urlPath}`, { headers: { ...AUTH_HEADERS } });
+  const res = await fetch(`${BASE}${urlPath}`, { headers: scopeHeaders() });
   if (!res.ok) {
     throw new Error(`GET ${urlPath} → ${res.status}`);
   }
