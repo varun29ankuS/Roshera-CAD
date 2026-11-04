@@ -1088,11 +1088,12 @@ mod tests {
 
     #[tokio::test]
     async fn put_provider_refuses_unallowlisted_provider_by_name() {
-        let payload = request("ollama", "api_key");
+        let forbidden = "ollama"; // policy-guard: refusal-test
+        let payload = request(forbidden, "api_key");
         let err = validate_request(&payload).await.unwrap_err();
         assert_eq!(err.code, ErrorCode::AiProviderRefused);
         let details = err.details.expect("refusal must carry details");
-        assert_eq!(details["refusal"]["NotAllowlisted"]["requested"], "ollama");
+        assert_eq!(details["refusal"]["NotAllowlisted"]["requested"], forbidden);
     }
 
     #[tokio::test]

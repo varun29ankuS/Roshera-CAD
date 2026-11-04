@@ -78,18 +78,45 @@ jobs:
       run: |
         set -e
         PATTERN='\b(ollama|llama|whisper|candle)\b'
-        # Scope: Rust sources, Cargo manifests, and config files under roshera-backend/.
-        # Exclude generated indexes, docs, and legacy markdown.
+        # Scope: Roshera's OWN Rust sources, Cargo manifests, and config files
+        # under roshera-backend/. Excluded:
+        #   - vendor/  — third-party source (vendored goose, Apache-2.0). It
+        #     contains local-model code behind features Roshera never enables;
+        #     what is actually BUILT is checked by the next step instead.
+        #   - target/  — build output.
+        #   - comment lines, and lines marked `policy-guard: refusal-test` —
+        #     tests that name a forbidden provider precisely to assert it is
+        #     REFUSED (the allowlist's own negative tests).
         MATCHES=$(grep -RInE "$PATTERN" \
           --include='*.rs' --include='*.toml' --include='*.yaml' --include='*.yml' \
+          --exclude-dir=vendor --exclude-dir=target \
           roshera-backend/ \
           | grep -viE '^[^:]+:[^:]+:\s*(//|#).*' \
+          | grep -v 'policy-guard: refusal-test' \
           || true)
         if [ -n "$MATCHES" ]; then
           echo "::error::Forbidden local-model identifiers found (API-only policy):"
           echo "$MATCHES"
           exit 1
         fi
+
+    - name: Enforce API-only policy on the build graph (no local-inference crates)
+      # The text guard above cannot see what is COMPILED. This one can: no
+      # local model runtime may appear anywhere in the workspace's resolved
+      # dependency tree — including through the vendored goose, whose
+      # `local-inference` / `cuda` / `vulkan` / `mlx` features must stay off.
+      working-directory: ./roshera-backend
+      run: |
+        set -e
+        FOUND=$(cargo tree --workspace -e normal,build --prefix none \
+          | grep -iE '^(candle-[a-z-]+|llama-cpp[a-z0-9-]*|whisper[a-z0-9-]*|tract-[a-z-]+|ort|ort-sys|goose-local-inference) ' \
+          | sort -u || true)
+        if [ -n "$FOUND" ]; then
+          echo "::error::Local-inference crates in the build graph (API-only policy):"
+          echo "$FOUND"
+          exit 1
+        fi
+        echo "build graph clean: no local-inference crates"
 
     - name: Check formatting
       run: cargo fmt --all -- --check

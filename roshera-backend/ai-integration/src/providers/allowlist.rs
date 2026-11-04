@@ -488,7 +488,7 @@ mod tests {
             "amp-acp",
             "gemini-cli",
             "cursor-agent",
-            "ollama",
+            "ollama", // policy-guard: refusal-test (asserts this is REFUSED)
             "local-inference",
         ] {
             let result = resolve(forbidden);
@@ -578,9 +578,10 @@ mod tests {
 
     #[test]
     fn refusals_serialize_with_named_fields() {
-        let refusal = resolve("ollama").unwrap_err();
+        let forbidden = "ollama"; // policy-guard: refusal-test
+        let refusal = resolve(forbidden).unwrap_err();
         let json = serde_json::to_value(&refusal).expect("refusal serializes");
-        assert_eq!(json["NotAllowlisted"]["requested"], "ollama");
+        assert_eq!(json["NotAllowlisted"]["requested"], forbidden);
     }
 
     /// Every entry's reason text is shown to the user (settings dialog,
