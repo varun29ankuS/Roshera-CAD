@@ -17,5 +17,11 @@ on 2026-11-04 so the harness is Roshera's own code to change.
   must see the source of an optional dependency to resolve it. Its feature
   (`local-inference`) stays off — Roshera is API-only (see
   `api-server/Cargo.toml`'s rules on the `goose` dependency).
+- **Modifications by Roshera** (Apache-2.0 §4(b) — changed files are noted):
+  - 2026-11-04 `crates/goose/Cargo.toml`: `process-wrap` pinned to `=9.1.0`,
+    the version this rev's own `Cargo.lock` resolved. 9.1.1 moved
+    `ProcessSession` behind a new `process-session` feature and broke the
+    unix-only path in `agents/platform_extensions/developer/shell.rs` (seen in
+    CI on Linux; Windows never compiles that path).
 - **Nested workspace:** `roshera-backend/Cargo.toml` excludes `vendor/`; the
   vendored crates inherit their settings from this directory's `Cargo.toml`.

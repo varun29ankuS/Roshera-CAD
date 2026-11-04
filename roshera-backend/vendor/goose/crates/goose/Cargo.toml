@@ -207,7 +207,10 @@ shell-words = { workspace = true }
 goose-acp-macros = { path = "../goose-acp-macros", default-features = false }
 tower-http = { workspace = true, features = ["cors"] }
 tracing-appender = { workspace = true }
-process-wrap = { version = "9", default-features = false, features = ["std"] }
+# Roshera (2026-11-04): pinned to the version this goose rev was built against.
+# process-wrap 9.1.1 moved `ProcessSession` behind a new `process-session`
+# feature, breaking the unix path in agents/platform_extensions/developer/shell.rs.
+process-wrap = { version = "=9.1.0", default-features = false, features = ["std"] }
 nostr = { version = "0.44", default-features = false, features = ["nip44", "std"], optional = true }
 nostr-sdk = { version = "0.44", default-features = false, features = ["nip44"], optional = true }
 rustls = { workspace = true, optional = true }
