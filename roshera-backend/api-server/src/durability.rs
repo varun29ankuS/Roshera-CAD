@@ -999,8 +999,16 @@ async fn boot_replay_inner(state: &AppState) -> DurabilityStatus {
     let mut corrupt: HashMap<u64, BranchId> = HashMap::new();
     let mut orphans: HashMap<u64, BranchId> = HashMap::new();
     let mut own: HashMap<BranchId, BTreeSet<u64>> = HashMap::new();
+    // Sequences held by more than one stored row. Each sequence is minted once
+    // by a global counter, so a second row is a store fault; which row is the
+    // real history cannot be decided from read order, so it is never guessed.
+    let mut seen_seqs: HashSet<u64> = HashSet::with_capacity(rows.len());
+    let mut duplicate_seqs: BTreeSet<u64> = BTreeSet::new();
     for row in &rows {
         let seq = row.sequence_number.max(0) as u64;
+        if !seen_seqs.insert(seq) {
+            duplicate_seqs.insert(seq);
+        }
         match serde_json::from_value::<TimelineEvent>(row.data.clone()) {
             Ok(event) => {
                 let origin = event.metadata.branch_id;
@@ -1136,9 +1144,41 @@ async fn boot_replay_inner(state: &AppState) -> DurabilityStatus {
                 .map(|p| (p.sequence_number, p.metadata.branch_id))
         })
         .map(|b| (b.sequence, b.kind, b.reason));
+    // A duplicated sequence inside the live history is the earliest-ranked
+    // cause at its sequence (listed first so `min_by_key` keeps it on a tie):
+    // the event replayed there is whichever row was read last, so any replay
+    // verdict about it is a verdict about a guess.
+    let duplicate_break = live_history
+        .iter()
+        .find(|seq| duplicate_seqs.contains(seq))
+        .map(|seq| {
+            (
+                *seq,
+                "duplicate_sequence".to_string(),
+                format!(
+                    concat!(
+                        "sequence {} is held by more than one stored event row; which ",
+                        "row is this history cannot be determined"
+                    ),
+                    seq
+                ),
+            )
+        });
+    for &seq in duplicate_seqs.iter().filter(|s| !live_history.contains(s)) {
+        let branch = by_seq
+            .get(&seq)
+            .map(|e| e.metadata.branch_id)
+            .unwrap_or(live_branch);
+        faults.push(branch_fault(
+            branch,
+            Some(seq),
+            "duplicate_sequence",
+            format!("sequence {seq} is held by more than one stored event row"),
+        ));
+    }
     // `!is_sound` alone is NOT a boundary — a log of only 2D/sketch ops
     // legitimately produces no solids yet is not corrupt.
-    let boundary = [replay_break, hole_break, subset_break]
+    let boundary = [duplicate_break, replay_break, hole_break, subset_break]
         .into_iter()
         .flatten()
         .min_by_key(|b| b.0);
@@ -1186,6 +1226,12 @@ async fn boot_replay_inner(state: &AppState) -> DurabilityStatus {
                 error = %e,
                 "durability: timeline rehydration failed — history may be incomplete"
             );
+        }
+        // Number the next operation after EVERY stored row, not just the
+        // restored ones: a quarantined tail, corrupt rows and orphans are not
+        // rehydrated but still occupy their sequences in the store.
+        if let Some(max_stored) = rows.iter().map(|r| r.sequence_number.max(0) as u64).max() {
+            timeline.ensure_next_sequence_at_least(max_stored.saturating_add(1));
         }
         for (branch, history) in &histories {
             let mut entries = Vec::new();

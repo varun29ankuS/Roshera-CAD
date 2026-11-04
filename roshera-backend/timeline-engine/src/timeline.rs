@@ -1474,19 +1474,29 @@ impl Timeline {
         }
 
         // Advance the counter past every restored sequence (monotonic CAS).
+        self.ensure_next_sequence_at_least(next_seq);
+        Ok(())
+    }
+
+    /// Advance the sequence counter so the next appended event is numbered at
+    /// least `next` (monotonic: never moves the counter backwards).
+    ///
+    /// Durability boot calls this with one past the highest sequence held by
+    /// ANY stored row — including a quarantined tail, corrupt rows and rows
+    /// from unknown branches, none of which are rehydrated. Advancing only past
+    /// the restored events would number the next operation inside the stored
+    /// tail and persist a second row under an existing sequence.
+    pub fn ensure_next_sequence_at_least(&self, next: u64) {
         let mut cur = self.event_counter.load(Ordering::SeqCst);
-        while cur < next_seq {
-            match self.event_counter.compare_exchange(
-                cur,
-                next_seq,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            ) {
+        while cur < next {
+            match self
+                .event_counter
+                .compare_exchange(cur, next, Ordering::SeqCst, Ordering::SeqCst)
+            {
                 Ok(_) => break,
                 Err(actual) => cur = actual,
             }
         }
-        Ok(())
     }
 
     /// Durability boot restore: add entries to a branch's history index for

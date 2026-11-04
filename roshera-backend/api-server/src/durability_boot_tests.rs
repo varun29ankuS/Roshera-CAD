@@ -5402,3 +5402,174 @@ async fn a_discard_that_never_reached_the_store_cannot_hide_later_operations() {
         "no cylinder after the next restart either"
     );
 }
+
+// =====================================================================
+// Sequence-number integrity across a quarantined boot (2026-11-04)
+// =====================================================================
+//
+// Live defect: a quarantined boot rehydrates only the served prefix, so the
+// timeline counter resumed at the first quarantined sequence and the next
+// operation was persisted UNDER A SEQUENCE THE STORE ALREADY HOLDS. The boot
+// loader then folded duplicate rows into a map keyed by sequence (last row
+// wins, arbitrary order), assembling a history from several sessions and
+// quarantining at the collision — which re-armed the counter at the same
+// number. Measured on the dev database: 154 sequences duplicated, up to 10x.
+
+/// Persist a copy of `template` under `seq` with a fresh id and `command_type`.
+async fn inject_event_row(db: &Db, template: &TimelineEventData, seq: i64, command_type: &str) {
+    let op = timeline_engine::Operation::Generic {
+        command_type: command_type.to_string(),
+        parameters: json!({}),
+    };
+    let new_id = Uuid::new_v4().to_string();
+    let mut blob = template.data.clone();
+    blob["operation"] = serde_json::to_value(&op).expect("op serializes");
+    blob["sequence_number"] = json!(seq);
+    blob["id"] = json!(new_id);
+    let row = TimelineEventData {
+        id: new_id,
+        session_id: template.session_id.clone(),
+        event_type: command_type.to_string(),
+        user_id: template.user_id.clone(),
+        timestamp: template.timestamp,
+        data: blob,
+        branch_id: template.branch_id.clone(),
+        sequence_number: seq,
+    };
+    db.save_timeline_event(durability::DURABILITY_SESSION_ID, &row)
+        .await
+        .expect("inject event row");
+}
+
+async fn seed_one_box(path: &str) {
+    let state = build_state(open_db(path).await, true).await;
+    let (s, body) = dispatch(
+        &state,
+        post(
+            "/api/geometry/box",
+            json!({ "width": 6.0, "depth": 6.0, "height": 6.0 }),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "box create must succeed; body = {body}");
+    state
+        .timeline_recorder
+        .flush()
+        .await
+        .expect("flush must succeed");
+}
+
+#[tokio::test]
+async fn an_operation_after_a_quarantined_boot_never_reuses_a_stored_sequence() {
+    let path = temp_db_path();
+    seed_one_box(&path).await;
+
+    // An unreplayable event, then a clean-looking one behind it: the whole
+    // tail from the first is quarantined on the next boot.
+    let stored_max = {
+        let db = open_db(&path).await;
+        let events = db
+            .load_all_timeline_events(durability::DURABILITY_SESSION_ID)
+            .await
+            .expect("load persisted events");
+        let template = events.last().expect("box events").clone();
+        let max = template.sequence_number;
+        inject_event_row(&db, &template, max + 1, "quarantine_probe_unknown_op").await;
+        inject_event_row(&db, &template, max + 2, "quarantine_probe_unknown_op").await;
+        max + 2
+    };
+
+    // Boot 2 (quarantined), then a new operation.
+    {
+        let state = build_state(open_db(&path).await, true).await;
+        assert!(
+            matches!(
+                *state.durability_status.read().await,
+                durability::DurabilityStatus::Quarantined { .. }
+            ),
+            "precondition: the injected tail quarantines"
+        );
+        let (s, body) = dispatch(
+            &state,
+            post(
+                "/api/geometry/box",
+                json!({ "width": 2.0, "depth": 2.0, "height": 2.0 }),
+            ),
+        )
+        .await;
+        assert_eq!(
+            s,
+            StatusCode::OK,
+            "post-quarantine box must succeed; body = {body}"
+        );
+        state
+            .timeline_recorder
+            .flush()
+            .await
+            .expect("flush must succeed");
+    }
+
+    let db = open_db(&path).await;
+    let events = db
+        .load_all_timeline_events(durability::DURABILITY_SESSION_ID)
+        .await
+        .expect("reload events");
+    let mut seen = std::collections::HashMap::new();
+    for e in &events {
+        if let Some(prev) = seen.insert(e.sequence_number, e.event_type.clone()) {
+            panic!(
+                "sequence {} persisted twice ({prev} and {}) — a new operation reused a \
+                 sequence the store already held",
+                e.sequence_number, e.event_type
+            );
+        }
+    }
+    let new_min = events
+        .iter()
+        .filter(|e| e.event_type != "quarantine_probe_unknown_op")
+        .map(|e| e.sequence_number)
+        .filter(|s| *s > stored_max - 2)
+        .min()
+        .expect("the post-quarantine box was persisted");
+    assert!(
+        new_min > stored_max,
+        "the new operation must be numbered after every stored sequence \
+         (stored max {stored_max}, new op at {new_min})"
+    );
+}
+
+#[tokio::test]
+async fn duplicate_sequence_rows_are_a_typed_quarantine_never_a_silent_pick() {
+    let path = temp_db_path();
+    seed_one_box(&path).await;
+
+    let dup_seq = {
+        let db = open_db(&path).await;
+        let events = db
+            .load_all_timeline_events(durability::DURABILITY_SESSION_ID)
+            .await
+            .expect("load persisted events");
+        let template = events.last().expect("box events").clone();
+        let seq = template.sequence_number;
+        // A second, different row claiming the SAME sequence as a real event.
+        inject_event_row(&db, &template, seq, "duplicate_probe_op").await;
+        seq
+    };
+
+    let state = build_state(open_db(&path).await, true).await;
+    let (s, body) = dispatch(&state, get("/api/durability/status")).await;
+    assert_eq!(s, StatusCode::OK, "status must return 200; body = {body}");
+    assert_eq!(
+        body["status"]["state"], "quarantined",
+        "two rows at one sequence must quarantine, not be resolved by read order; body = {body}"
+    );
+    assert_eq!(
+        body["status"]["first_break_kind"], "duplicate_sequence",
+        "the quarantine must name the duplicate; body = {body}"
+    );
+    assert_eq!(
+        body["status"]["first_break_sequence"].as_i64(),
+        Some(dup_seq),
+        "the break is at the duplicated sequence; body = {body}"
+    );
+}
