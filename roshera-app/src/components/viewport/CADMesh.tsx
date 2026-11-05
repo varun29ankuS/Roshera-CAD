@@ -49,7 +49,7 @@ interface CADMeshProps {
 // 0.4–0.65 s main-thread freezes. Props are the object (a stable reference
 // until that part changes) and two booleans, so a hover now re-renders only
 // the two meshes whose `isHovered` flipped.
-export const CADMesh = memo(function CADMesh({ object, isHovered }: CADMeshProps) {
+export const CADMesh = memo(function CADMesh({ object, isSelected, isHovered }: CADMeshProps) {
   const meshRef = useRef<THREE.Mesh>(null!)
   const selectObject = useSceneStore((s) => s.selectObject)
   const setHovered = useSceneStore((s) => s.setHovered)
@@ -74,12 +74,14 @@ export const CADMesh = memo(function CADMesh({ object, isHovered }: CADMeshProps
   const sketchActive = useSceneStore((s) => s.sketch.active)
   const sectionView = useSceneStore((s) => s.sectionView)
 
-  const { defaultEdgeHex, accentEdgeHex } = useMemo(() => {
+  const { defaultEdgeHex, accentEdgeHex, selectedEdgeHex } = useMemo(() => {
     const tick = resolveCssVar('--cad-tick')
     const accent = resolveCssVar('--cad-selected')
+    const selected = resolveCssVar('--cad-edge-selected')
     return {
       defaultEdgeHex: `#${tick.color.getHexString()}`,
       accentEdgeHex: `#${accent.color.getHexString()}`,
+      selectedEdgeHex: `#${selected.color.getHexString()}`,
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [theme])
@@ -385,11 +387,29 @@ export const CADMesh = memo(function CADMesh({ object, isHovered }: CADMeshProps
   // and that frame is requested: the canvas renders on demand.
   const edgesRef = useRef<ComponentRef<typeof Edges>>(null)
   const invalidate = useThree((s) => s.invalidate)
-  const edgeHex = isHovered ? accentEdgeHex : edgeSettings.color || defaultEdgeHex
+  // Selected parts carry the selection yellow on their own edges too, so a
+  // selection reads even where the outline pass is hidden behind other parts.
+  // OBJECT selection only: a face / edge / vertex pick also puts the part in
+  // `selectedIds`, and tinting the whole part would drown the picked element
+  // (which `SubElementHighlight` paints).
+  const wholePartSelected = isSelected && selectionMode === 'object'
+  const edgeHex = wholePartSelected
+    ? selectedEdgeHex
+    : isHovered
+      ? accentEdgeHex
+      : edgeSettings.color || defaultEdgeHex
   useEffect(() => {
     edgesRef.current?.material?.color?.set(edgeHex)
     invalidate()
   }, [edgeHex, invalidate])
+
+  // And a faint yellow glow on the surface: a selected part must stand out
+  // in a dense assembly at a glance, not only along its silhouette.
+  useEffect(() => {
+    material.emissive.set(wholePartSelected ? selectedEdgeHex : '#000000')
+    material.emissiveIntensity = wholePartSelected ? 0.35 : 0
+    invalidate()
+  }, [material, wholePartSelected, selectedEdgeHex, invalidate])
 
   return (
     <mesh
@@ -417,13 +437,10 @@ export const CADMesh = memo(function CADMesh({ object, isHovered }: CADMeshProps
         // measured 1.3–2.1 s main-thread freezes hovering the large parts of
         // the 327-part robot-arm import (2026-11-05).
         //
-        // Selection visuals are intentionally NOT painted into the
-        // wireframe — the post-process `SelectionOutline` silhouette
-        // (whole-object) and `SubElementHighlight` overlay (picked
-        // face/edge/vertex) are the canonical feedback surfaces. Painting
-        // the wireframe red on `isSelected` would tint every edge of the
-        // mesh in sub-element mode (sub-element picks also set `selectedIds`
-        // so the object-scope outline can paint).
+        // A WHOLE-PART selection (object mode) paints these edges yellow too
+        // (`wholePartSelected` above) — the outline alone was too easy to miss
+        // on dark parts. A face / edge / vertex pick does NOT: those also set
+        // `selectedIds`, and `SubElementHighlight` paints the picked element.
         <Edges
           ref={edgesRef}
           threshold={edgeSettings.threshold}

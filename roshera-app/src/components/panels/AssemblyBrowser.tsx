@@ -251,13 +251,24 @@ const PartRow = memo(function PartRow({
       className={cn(
         'group flex cursor-pointer select-none items-center gap-1 pr-1 transition-colors',
         selected
-          ? 'bg-primary/15 text-primary'
+          ? 'text-foreground'
           : hovered
             ? 'bg-accent/60 text-foreground'
             : 'text-foreground/70 hover:bg-accent/50 hover:text-foreground',
       )}
-      // Leaves sit one fold-arrow's width right of their parent's arrow.
-      style={{ paddingLeft: depth * INDENT_PX + INDENT_PX }}
+      // Leaves sit one fold-arrow's width right of their parent's arrow. A
+      // selected row wears the SAME yellow as the selected part in the
+      // viewport (`--cad-edge-selected`): a wash plus a bar on the left edge,
+      // so the pairing between row and part reads at a glance in both themes.
+      style={{
+        paddingLeft: depth * INDENT_PX + INDENT_PX,
+        ...(selected
+          ? {
+              backgroundColor: 'color-mix(in oklch, var(--cad-edge-selected) 22%, transparent)',
+              boxShadow: 'inset 3px 0 0 var(--cad-edge-selected)',
+            }
+          : {}),
+      }}
       onMouseEnter={() => setHovered(id)}
       onMouseLeave={() => setHovered(null)}
       onClick={(e) => selectObject(id, e.shiftKey || e.ctrlKey || e.metaKey)}

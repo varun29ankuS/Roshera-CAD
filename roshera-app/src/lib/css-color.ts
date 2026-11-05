@@ -53,7 +53,8 @@ function getCanvasCtx(): CanvasRenderingContext2D | null {
   const cv = document.createElement('canvas')
   cv.width = 1
   cv.height = 1
-  const ctx = cv.getContext('2d')
+  // Read back on every themed colour lookup (see `rasteriseToSrgb`).
+  const ctx = cv.getContext('2d', { willReadFrequently: true })
   if (!ctx) return null
   canvasCtx = ctx
   return ctx
@@ -67,6 +68,38 @@ function normaliseToSrgb(value: string): string {
   ctx.fillStyle = '#000'
   ctx.fillStyle = value
   return String(ctx.fillStyle)
+}
+
+/**
+ * Rasterise one pixel in `value` and read the sRGB bytes back — the one
+ * conversion every browser must perform, whatever syntax it chooses to KEEP
+ * a colour in. Current Chrome returns `oklch(...)` from both
+ * `getComputedStyle().color` AND the canvas `fillStyle` getter, so the
+ * string paths above both failed to parse and every themed viewport colour
+ * (selection yellow, edges, grid) silently fell back to grey `#888888` —
+ * found 2026-11-05: a selected part was painted grey-on-grey. `null` when
+ * the browser rejects `value` outright.
+ */
+function rasteriseToSrgb(value: string): ResolvedColor | null {
+  const ctx = getCanvasCtx()
+  if (!ctx) return null
+  // A rejected assignment leaves the previous fillStyle; use a sentinel the
+  // input can never legitimately produce so a rejection is detectable.
+  ctx.fillStyle = 'rgba(1, 2, 3, 0.5)'
+  const sentinel = String(ctx.fillStyle)
+  ctx.fillStyle = value
+  if (String(ctx.fillStyle) === sentinel && value.replace(/\s/g, '') !== 'rgba(1,2,3,0.5)') {
+    return null
+  }
+  ctx.clearRect(0, 0, 1, 1)
+  ctx.fillRect(0, 0, 1, 1)
+  const [r, g, b, a] = ctx.getImageData(0, 0, 1, 1).data
+  if (a === 0) {
+    return { color: new THREE.Color(0, 0, 0), alpha: 0 }
+  }
+  // getImageData returns un-premultiplied bytes for a single opaque-or-not
+  // pixel drawn over a cleared (transparent) canvas.
+  return { color: new THREE.Color(r / 255, g / 255, b / 255), alpha: a / 255 }
 }
 
 /**
@@ -86,7 +119,15 @@ export function resolveCssVar(varName: string): ResolvedColor {
   if (!raw) return FALLBACK
 
   const computed = getComputedStyle(probe).color
-  return parseRgbString(normaliseToSrgb(computed))
+  return toResolved(computed)
+}
+
+/** String parse first (cheap); pixel readback when the browser kept the
+ *  colour in a form the parser cannot read (oklch, lab, color(), ...). */
+function toResolved(computed: string): ResolvedColor {
+  const parsed = parseRgbString(normaliseToSrgb(computed))
+  if (parsed !== FALLBACK) return parsed
+  return rasteriseToSrgb(computed) ?? FALLBACK
 }
 
 /**
@@ -101,7 +142,7 @@ export function parseCssColor(value: string): ResolvedColor {
   probe.style.color = value
   const computed = getComputedStyle(probe).color
   if (!computed) return FALLBACK
-  return parseRgbString(normaliseToSrgb(computed))
+  return toResolved(computed)
 }
 
 function parseRgbString(value: string): ResolvedColor {

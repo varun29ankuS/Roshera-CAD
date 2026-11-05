@@ -1,4 +1,5 @@
-import { useMemo } from 'react'
+import { useEffect, useMemo } from 'react'
+import { useThree } from '@react-three/fiber'
 import { EffectComposer, Outline } from '@react-three/postprocessing'
 import { useSceneStore } from '@/stores/scene-store'
 import { useThemeStore } from '@/stores/theme-store'
@@ -36,7 +37,17 @@ export function SelectionOutline() {
     return meshes
   }, [hoveredId, treeHoverIds, selectedIds, meshRefs])
 
-  // Selected silhouettes render in pastel red (`--cad-edge-selected`)
+  // The canvas renders on demand. The outline passes take their selection
+  // through postprocessing's own effect objects, not through R3F props, so a
+  // selection change requests no frame by itself: a clicked part showed no
+  // outline until something else (a hover) happened to render. Ask for the
+  // frame that shows it.
+  const invalidate = useThree((s) => s.invalidate)
+  useEffect(() => {
+    invalidate()
+  }, [selectedMeshes, hoveredMeshes, invalidate])
+
+  // Selected silhouettes render in yellow (`--cad-edge-selected`)
   // so a clicked solid is unambiguously distinguished from a hovered or
   // unselected one. Hover stays on neutral ink for low-key feedback.
   // Hidden edges stay on the tick token so they read as "occluded"
@@ -82,11 +93,13 @@ export function SelectionOutline() {
       <Outline
         selection={showSelect ? selectedMeshes : []}
         blendFunction={BlendFunction.ALPHA}
-        edgeStrength={3}
+        // Thick and bright: a selection must read at a glance against dark
+        // parts in a dense assembly (strength 3 / SMALL was easy to miss).
+        edgeStrength={8}
         pulseSpeed={0}
         visibleEdgeColor={palette.selectVisible}
         hiddenEdgeColor={palette.selectHidden}
-        kernelSize={KernelSize.SMALL}
+        kernelSize={KernelSize.MEDIUM}
         blur
         xRay={false}
       />
