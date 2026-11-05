@@ -386,7 +386,10 @@ impl EntityHandler for ConicalSurfaceHandler {
                     };
                 }
             };
-        let semi_angle =
+        // `semi_angle` is a PLANE_ANGLE_MEASURE in the file's angle unit:
+        // convert to the kernel's radians BEFORE any check. SolidWorks (and
+        // others) write degrees; reading `45.` as radians rejected every cone.
+        let raw_semi_angle =
             match params::as_real(&fields[3], names::CONICAL_SURFACE, instance, "semi_angle") {
                 Ok(a) => a,
                 Err(e) => {
@@ -396,6 +399,7 @@ impl EntityHandler for ConicalSurfaceHandler {
                     };
                 }
             };
+        let semi_angle = raw_semi_angle * ctx.unit.angle_radians_per_source;
         if raw_radius < 0.0 {
             push_warn(
                 ctx,
@@ -412,7 +416,10 @@ impl EntityHandler for ConicalSurfaceHandler {
                 ctx,
                 names::CONICAL_SURFACE,
                 instance,
-                format!("semi_angle {semi_angle} not in (0, π/2)"),
+                format!(
+                    "semi_angle {raw_semi_angle} (= {semi_angle} rad in this file's angle unit) \
+                     not in (0, π/2)"
+                ),
             );
             return HandlerOutcome::Failed {
                 message: "semi_angle out of range".into(),
@@ -698,6 +705,46 @@ mod tests {
             "CONICAL_SURFACE #10 should appear in caches.surfaces; report: {:#?}",
             report.warnings
         );
+    }
+
+    /// A file that declares its plane angles in DEGREES (SolidWorks writes
+    /// `CONVERSION_BASED_UNIT('degree', ...)`) gives `semi_angle` in degrees.
+    /// It used to be read as radians: 45 → rejected as outside (0, π/2), so
+    /// every cone face failed and whole parts with a chamfer (every cap screw
+    /// in the robot-arm assembly: 252 part uses) never imported.
+    #[test]
+    fn conical_surface_semi_angle_follows_the_files_angle_unit() {
+        let body = format!(
+            "#11=(LENGTH_UNIT() NAMED_UNIT(*) SI_UNIT(.MILLI.,.METRE.));\n\
+             #12=(NAMED_UNIT(*) PLANE_ANGLE_UNIT() SI_UNIT($,.RADIAN.));\n\
+             #15=(NAMED_UNIT(*) PLANE_ANGLE_UNIT() CONVERSION_BASED_UNIT('DEGREE',#16));\n\
+             #16=PLANE_ANGLE_MEASURE_WITH_UNIT(PLANE_ANGLE_MEASURE(0.017453292519943295),#12);\n\
+             #17=(NAMED_UNIT(*) SI_UNIT($,.STERADIAN.) SOLID_ANGLE_UNIT());\n\
+             #18=(GEOMETRIC_REPRESENTATION_CONTEXT(3) \
+                  GLOBAL_UNIT_ASSIGNED_CONTEXT((#11,#15,#17)) \
+                  REPRESENTATION_CONTEXT('c','3D'));\n\
+             {WORLD_PLACEMENT}\
+             #10 = CONICAL_SURFACE('c',#4,4.0,45.);\n"
+        );
+        let (model, report, caches) = run(&body);
+        let sid = caches.surfaces.get(&10).copied().unwrap_or_else(|| {
+            panic!(
+                "a 45° cone in a degree file must import; warnings: {:#?}",
+                report.warnings
+            )
+        });
+        let cone = model
+            .surfaces
+            .get(sid)
+            .and_then(|s| s.as_any().downcast_ref::<Cone>())
+            .expect("a Cone");
+        assert!(
+            (cone.half_angle - std::f64::consts::FRAC_PI_4).abs() < 1e-12,
+            "45° → π/4 rad, got {}",
+            cone.half_angle
+        );
+        // apex offset = r / tan(45°) = 4 below the placement origin.
+        assert!((cone.apex.z + 4.0).abs() < 1e-9, "apex z = {}", cone.apex.z);
     }
 
     #[test]
