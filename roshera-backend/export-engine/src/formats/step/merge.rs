@@ -270,6 +270,119 @@ mod tests {
         assert_eq!(target.solids.len(), 2, "two independent cubes spliced");
     }
 
+    fn cube_step_text() -> String {
+        format!(
+            "ISO-10303-21;\nHEADER;\nFILE_DESCRIPTION(('t'),'2;1');\n\
+             FILE_NAME('t.step','2026-01-01T00:00:00',(''),(''),'','','');\n\
+             FILE_SCHEMA(('AP242_MANAGED_MODEL_BASED_3D_ENGINEERING_MIM_LF'));\n\
+             ENDSEC;\nDATA;\n{}\nENDSEC;\nEND-ISO-10303-21;\n",
+            unit_cube_with_root()
+        )
+    }
+
+    fn all_face_ids(model: &BRepModel, sid: SolidId) -> Vec<FaceId> {
+        let solid = model.solids.get(sid).expect("solid");
+        model
+            .shells
+            .get(solid.outer_shell)
+            .expect("shell")
+            .faces
+            .clone()
+    }
+
+    /// An imported face must carry a persistent id derived from the FILE and
+    /// its STEP entity number — so the same file re-imported names the same
+    /// faces — and the solid must be tagged as imported, never left untagged.
+    /// Without face PIDs, `gdt_datum` refuses every imported face.
+    #[test]
+    fn import_gives_every_face_and_the_solid_a_stable_pid_and_import_provenance() {
+        use crate::formats::step::import_step_text_with_report;
+        let text = cube_step_text();
+        let (a, _) = import_step_text_with_report(&text, "a").unwrap();
+        let (b, _) = import_step_text_with_report(&text, "b").unwrap();
+        let sa = a.solids.iter().map(|(id, _)| id).next().unwrap();
+        let sb = b.solids.iter().map(|(id, _)| id).next().unwrap();
+
+        let pids_a: Vec<_> = all_face_ids(&a, sa)
+            .iter()
+            .map(|f| a.face_pid(*f))
+            .collect();
+        let pids_b: Vec<_> = all_face_ids(&b, sb)
+            .iter()
+            .map(|f| b.face_pid(*f))
+            .collect();
+        assert_eq!(pids_a.len(), 6);
+        assert!(
+            pids_a.iter().all(Option::is_some),
+            "every face has a PID: {pids_a:?}"
+        );
+        let distinct: std::collections::HashSet<_> = pids_a.iter().collect();
+        assert_eq!(distinct.len(), 6, "face PIDs are distinct");
+        assert_eq!(pids_a, pids_b, "same file → same face PIDs");
+        assert!(a.solid_pid(sa).is_some(), "solid has a PID");
+        assert_eq!(
+            a.solid_pid(sa),
+            b.solid_pid(sb),
+            "same file → same solid PID"
+        );
+        assert_eq!(
+            a.solid_provenance(sa).map(|p| p.created_by.label()),
+            Some("imported:step".to_string()),
+            "imported solid is tagged as imported"
+        );
+    }
+
+    /// The splice into the session model must keep the imported identity —
+    /// PIDs and provenance — not silently drop them.
+    #[test]
+    fn merge_carries_face_and_solid_pids_and_provenance() {
+        use crate::formats::step::import_step_text_with_report;
+        let (src, _) = import_step_text_with_report(&cube_step_text(), "t").unwrap();
+        let src_sid = src.solids.iter().map(|(id, _)| id).next().unwrap();
+        let src_pids: std::collections::HashSet<_> = all_face_ids(&src, src_sid)
+            .iter()
+            .filter_map(|f| src.face_pid(*f))
+            .collect();
+        assert_eq!(src_pids.len(), 6, "precondition: imported faces carry PIDs");
+
+        let mut target = BRepModel::new();
+        let merged = merge_solids_into(&mut target, &src);
+        let dst_pids: std::collections::HashSet<_> = all_face_ids(&target, merged[0])
+            .iter()
+            .filter_map(|f| target.face_pid(*f))
+            .collect();
+        assert_eq!(dst_pids, src_pids, "merged faces keep their PIDs");
+        assert_eq!(target.solid_pid(merged[0]), src.solid_pid(src_sid));
+        assert_eq!(
+            target
+                .solid_provenance(merged[0])
+                .map(|p| p.created_by.label()),
+            Some("imported:step".to_string())
+        );
+    }
+
+    /// Importing the same file twice must not alias two live faces to one PID:
+    /// every face PID in the session resolves back to exactly its own face.
+    #[test]
+    fn merging_the_same_import_twice_keeps_every_pid_unique_and_resolvable() {
+        use crate::formats::step::import_step_text_with_report;
+        let (src, _) = import_step_text_with_report(&cube_step_text(), "t").unwrap();
+        let mut target = BRepModel::new();
+        let first = merge_solids_into(&mut target, &src);
+        let second = merge_solids_into(&mut target, &src);
+
+        let mut seen = std::collections::HashSet::new();
+        for sid in first.iter().chain(second.iter()) {
+            for f in all_face_ids(&target, *sid) {
+                let pid = target.face_pid(f).expect("merged face has a PID");
+                assert!(seen.insert(pid), "PID {pid:?} assigned to two faces");
+                assert_eq!(target.face_by_pid(pid), Some(f), "PID resolves to its face");
+            }
+        }
+        assert_eq!(seen.len(), 12);
+        assert_ne!(target.solid_pid(first[0]), target.solid_pid(second[0]));
+    }
+
     fn unit_cube_with_root() -> String {
         let mut s = String::new();
         s += "#1=CARTESIAN_POINT('',(0.,0.,0.));#2=CARTESIAN_POINT('',(1.,0.,0.));";
