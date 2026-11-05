@@ -1,4 +1,4 @@
-import { memo, useRef, useMemo, useCallback, useEffect } from 'react'
+import { memo, useRef, useMemo, useCallback, useEffect, type ComponentRef } from 'react'
 import { Edges } from '@react-three/drei'
 import { useSceneStore, type CADObject } from '@/stores/scene-store'
 import { useThemeStore } from '@/stores/theme-store'
@@ -8,7 +8,7 @@ import { resolveCssVar } from '@/lib/css-color'
 import { wsClient } from '@/lib/ws-client'
 import { isRaycastSuppressed } from './orbit-raycast-gate'
 import * as THREE from 'three'
-import type { ThreeEvent } from '@react-three/fiber'
+import { useThree, type ThreeEvent } from '@react-three/fiber'
 
 const ASM_OBJ_PREFIX = 'asm-comp:'
 
@@ -379,6 +379,18 @@ export const CADMesh = memo(function CADMesh({ object, isHovered }: CADMeshProps
     [],
   )
 
+  // Edge colour follows hover WITHOUT remounting `<Edges>` (a remount
+  // recomputes the part's whole EdgesGeometry). Written straight onto the
+  // existing line material so the colour reaches the GPU on the next frame,
+  // and that frame is requested: the canvas renders on demand.
+  const edgesRef = useRef<ComponentRef<typeof Edges>>(null)
+  const invalidate = useThree((s) => s.invalidate)
+  const edgeHex = isHovered ? accentEdgeHex : edgeSettings.color || defaultEdgeHex
+  useEffect(() => {
+    edgesRef.current?.material?.color?.set(edgeHex)
+    invalidate()
+  }, [edgeHex, invalidate])
+
   return (
     <mesh
       ref={meshRef}
@@ -398,11 +410,12 @@ export const CADMesh = memo(function CADMesh({ object, isHovered }: CADMeshProps
       userData={{ cadObjectId: object.id }}
     >
       {edgeSettings.visible && (
-        // `<Edges>` builds a drei LineSegments at construction and does
-        // not always re-flow `color` prop changes onto its material on
-        // the next frame — visible when toggling hover on an already-
-        // mounted mesh. Keying on the visual state forces a clean remount
-        // so the chosen colour reaches the GPU immediately.
+        // Hover recolours the edges IN PLACE (see the effect above). This
+        // used to be `key={isHovered ? 'hov' : 'def'}`, which remounted the
+        // drei `<Edges>` on every hover change and threw away its cached
+        // EdgesGeometry, so each hover recomputed every edge of the part —
+        // measured 1.3–2.1 s main-thread freezes hovering the large parts of
+        // the 327-part robot-arm import (2026-11-05).
         //
         // Selection visuals are intentionally NOT painted into the
         // wireframe — the post-process `SelectionOutline` silhouette
@@ -412,9 +425,9 @@ export const CADMesh = memo(function CADMesh({ object, isHovered }: CADMeshProps
         // mesh in sub-element mode (sub-element picks also set `selectedIds`
         // so the object-scope outline can paint).
         <Edges
-          key={isHovered ? 'hov' : 'def'}
+          ref={edgesRef}
           threshold={edgeSettings.threshold}
-          color={isHovered ? accentEdgeHex : edgeSettings.color || defaultEdgeHex}
+          color={edgeHex}
           lineWidth={edgeSettings.lineWidth}
         />
       )}
