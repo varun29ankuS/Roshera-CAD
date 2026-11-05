@@ -429,10 +429,14 @@ fn parse_cmd_shim_for_direct_exe(cmd_path: &Path) -> Option<PathBuf> {
         if !quoted.to_ascii_lowercase().ends_with(".exe") {
             continue;
         }
-        let relative = quoted
+        // npm writes `.cmd` shims with `\` separators. Joining that string
+        // as-is only works where `\` IS a separator; split on both and join
+        // component by component so the path resolves on every OS.
+        let candidate = quoted
             .trim_start_matches("%dp0%")
-            .trim_start_matches(['\\', '/']);
-        let candidate = dp0.join(relative);
+            .split(['\\', '/'])
+            .filter(|c| !c.is_empty())
+            .fold(dp0.to_path_buf(), |path, component| path.join(component));
         if candidate.is_file() {
             return Some(candidate);
         }

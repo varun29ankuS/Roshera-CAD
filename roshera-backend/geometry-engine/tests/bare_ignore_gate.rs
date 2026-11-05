@@ -15,8 +15,9 @@
 //!
 //! Walks every `*.rs` file in the Cargo workspace (found by walking up from
 //! `CARGO_MANIFEST_DIR` to the directory containing the workspace
-//! `Cargo.toml`), skipping `target/` build output and this gate's own file
-//! (see the self-exclusion note on [`NEEDLE`]).
+//! `Cargo.toml`), skipping `target/` build output, vendored third-party
+//! source under `vendor/`, and this gate's own file (see the self-exclusion
+//! note on [`NEEDLE`]).
 //!
 //! For each remaining file, each line is checked (this is a **line-based**
 //! check, not a real Rust parser — it does not understand block comments
@@ -113,6 +114,11 @@ fn find_bare_ignores() -> Vec<BareIgnore> {
 
     let mut rs_files = Vec::new();
     collect_rs_files(&workspace_root, &mut rs_files);
+    // Third-party source vendored under `vendor/` (goose, Apache-2.0, since
+    // 2026-11-04) follows its upstream's conventions, not this policy, and
+    // is not part of the KNOWN_REDS gate this rule protects.
+    let vendor_dir = workspace_root.join("vendor");
+    rs_files.retain(|p| !p.starts_with(&vendor_dir));
 
     let needle = needle();
     let mut hits = Vec::new();

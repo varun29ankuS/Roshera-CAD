@@ -130,6 +130,20 @@ jobs:
       run: cargo clippy --all-targets --workspace
       working-directory: ./roshera-backend
 
+    # api-server's goose tests boot the real harness, which spawns
+    # roshera-mcp/dist/index.js — so the MCP server must be built before the
+    # Rust tests run (they refuse with McpEntryMissing otherwise).
+    - name: Setup Node.js (for roshera-mcp dist)
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+        cache: 'npm'
+        cache-dependency-path: roshera-mcp/package-lock.json
+
+    - name: Build roshera-mcp dist
+      run: npm ci && npm run build
+      working-directory: ./roshera-mcp
+
     - name: Install cargo-nextest
       uses: taiki-e/install-action@v2
       with:
