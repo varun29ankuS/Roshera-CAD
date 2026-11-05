@@ -1,4 +1,4 @@
-import { useRef, useMemo, useCallback, useEffect } from 'react'
+import { memo, useRef, useMemo, useCallback, useEffect } from 'react'
 import { Edges } from '@react-three/drei'
 import { useSceneStore, type CADObject } from '@/stores/scene-store'
 import { useThemeStore } from '@/stores/theme-store'
@@ -42,7 +42,14 @@ interface CADMeshProps {
   isHovered: boolean
 }
 
-export function CADMesh({ object, isHovered }: CADMeshProps) {
+// Memoized: `SceneObjects` re-renders on every hover / selection change, and
+// without this EVERY mesh re-ran its hooks and its `<Edges>` with it. Measured
+// on a 327-part imported assembly (2026-11-05): a pointer sweep across the
+// model re-rendered all 327 meshes per hovered part — 51% of React's work and
+// 0.4–0.65 s main-thread freezes. Props are the object (a stable reference
+// until that part changes) and two booleans, so a hover now re-renders only
+// the two meshes whose `isHovered` flipped.
+export const CADMesh = memo(function CADMesh({ object, isHovered }: CADMeshProps) {
   const meshRef = useRef<THREE.Mesh>(null!)
   const selectObject = useSceneStore((s) => s.selectObject)
   const setHovered = useSceneStore((s) => s.setHovered)
@@ -413,4 +420,4 @@ export function CADMesh({ object, isHovered }: CADMeshProps) {
       )}
     </mesh>
   )
-}
+})
