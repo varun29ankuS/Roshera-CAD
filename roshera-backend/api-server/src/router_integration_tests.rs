@@ -5481,6 +5481,63 @@ async fn import_step_route_lands_faces_with_pids_and_import_provenance() {
     }
 }
 
+/// An imported ASSEMBLY reaches the browser as an assembly: every part keeps
+/// its real name (not `<base> N`), and both the import response and the
+/// reload snapshot carry where it sits — the assembly path, the part it is a
+/// use of, which use, and the source file — plus the snapshot's soundness
+/// verdict, so the model tree can draw the product structure.
+#[tokio::test]
+async fn import_step_route_carries_assembly_structure_to_the_browser() {
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../export-engine/tests/fixtures/two_cube_assembly.step");
+    let state = make_test_state().await;
+    let request = import_step_post(json!({
+        "path": fixture.to_string_lossy().to_string(),
+        "name": "fixture",
+    }));
+    let (status, body) = dispatch(&state, request).await;
+    assert_eq!(status, StatusCode::OK, "import must succeed; body = {body}");
+
+    let objects = body["objects"].as_array().expect("objects");
+    assert_eq!(objects.len(), 2, "two uses → two parts; body = {body}");
+    let mut uses: Vec<String> = Vec::new();
+    for o in objects {
+        let name = o["name"].as_str().unwrap_or_default();
+        assert!(
+            name.starts_with("cube"),
+            "the part keeps its STEP name, not the import label: {name}"
+        );
+        let asm = &o["assembly"];
+        assert_eq!(asm["path"], json!(["asm"]), "assembly path: {o}");
+        assert_eq!(asm["part"], "cube");
+        assert_eq!(
+            asm["source"], "two_cube_assembly.step",
+            "source is the file name"
+        );
+        uses.push(asm["occurrence"].as_str().unwrap_or_default().to_string());
+    }
+    uses.sort();
+    assert_eq!(uses, vec!["i1".to_string(), "i2".to_string()]);
+
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri("/api/scene/snapshot")
+        .body(Body::empty())
+        .expect("static request must build");
+    let (status, snap) = dispatch(&state, request).await;
+    assert_eq!(status, StatusCode::OK);
+    let snap_objects = snap["objects"].as_array().expect("snapshot objects");
+    assert_eq!(snap_objects.len(), 2);
+    for o in snap_objects {
+        assert_eq!(
+            o["assembly"]["path"],
+            json!(["asm"]),
+            "snapshot carries it: {o}"
+        );
+        assert_eq!(o["sound"], true, "the import certified each part: {o}");
+    }
+}
+
 /// #34: `path` pointing at a file that does not exist must fail with a
 /// typed, actionable `invalid_parameter` error — never a panic, never a
 /// silent no-op.

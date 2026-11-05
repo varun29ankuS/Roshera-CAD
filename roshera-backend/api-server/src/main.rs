@@ -5686,13 +5686,26 @@ async fn import_step_geometry(
         .get("name")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
+    // What the parts came from, as a reader would name it: the file's name
+    // when the server read a path, else a caller-supplied `filename` (a
+    // browser drag-drop sends content plus the dropped file's name).
+    let source_label = path_field
+        .and_then(|p| std::path::Path::new(p).file_name())
+        .map(|f| f.to_string_lossy().to_string())
+        .or_else(|| {
+            payload
+                .get("filename")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| "pasted STEP".to_string());
 
     // Reconstruct into a fresh model + honest report. This is a pure CPU
     // pass (parse → dispatch → validate) once `content` is in memory —
     // the only file I/O is the optional `path` read above.
     let (imported, report) = state
         .export_engine
-        .import_step_content(&content, "api:/api/geometry/import_step")
+        .import_step_content(&content, &source_label)
         .map_err(|e| {
             ApiError::new(
                 ErrorCode::InvalidParameter,
@@ -5775,26 +5788,31 @@ async fn register_imported_solids(
         let id_str = object_uuid.to_string();
         state.register_id_mapping(object_uuid, solid_id);
 
-        let name = match base_name {
-            Some(b) if new_solid_ids.len() == 1 => b.to_string(),
-            Some(b) => format!("{b} {}", i + 1),
-            None => format!("Imported {solid_id}"),
+        // A part an assembly placed keeps the name the FILE gave it (its
+        // product, plus the use when it repeats): `<base> N` threw the whole
+        // product structure away. Single-body imports keep the caller's label.
+        let (kernel_name, occurrence) = {
+            let model = model_handle.read().await;
+            (
+                model
+                    .solids
+                    .get(solid_id)
+                    .and_then(|s| s.name.clone())
+                    .filter(|n| !n.trim().is_empty()),
+                model.solid_occurrence(solid_id).cloned(),
+            )
+        };
+        let name = match (&occurrence, kernel_name, base_name) {
+            (Some(_), Some(k), _) => k,
+            (_, _, Some(b)) if new_solid_ids.len() == 1 => b.to_string(),
+            (_, _, Some(b)) => format!("{b} {}", i + 1),
+            (_, _, None) => format!("Imported {solid_id}"),
         };
         persist_display_name(state, model_handle, solid_id, &name).await;
         let parameters = serde_json::json!({ "source": source, "index": i });
-        broadcast_object_created(
-            &id_str,
-            &name,
-            solid_id,
-            object_type,
-            &parameters,
-            &vertices,
-            &indices,
-            &normals,
-            &face_ids,
-            [0.0, 0.0, 0.0],
-        );
 
+        // Certify BEFORE broadcasting so the viewport's tree gets the verdict
+        // with the part, not on some later refresh.
         let perception = {
             let mut model = model_handle.write().await;
             certified_response(
@@ -5807,11 +5825,28 @@ async fn register_imported_solids(
                 durability.clone(),
             )
         };
+        let sound = perception.get("sound").and_then(|v| v.as_bool());
+        let extra = serde_json::json!({ "assembly": occurrence, "sound": sound });
+        broadcast_object_created_with(
+            &id_str,
+            &name,
+            solid_id,
+            object_type,
+            &parameters,
+            &vertices,
+            &indices,
+            &normals,
+            &face_ids,
+            [0.0, 0.0, 0.0],
+            &extra,
+        );
         objects.push(serde_json::json!({
             "id":         id_str,
             "name":       name,
             "solid_id":   solid_id,
             "objectType": object_type,
+            "assembly":   occurrence,
+            "sound":      sound,
             "perception": perception,
             "mesh": {
                 "vertices": vertices,
@@ -7581,6 +7616,11 @@ async fn scene_snapshot(
             // on page load.
             "visible": true,
             "locked":  false,
+            // Where the part sits in an imported assembly (null for a part
+            // no assembly placed), and its cached soundness verdict (null =
+            // not certified since it last changed; never computed here).
+            "assembly": model.solid_occurrence(solid_id),
+            "sound":    model.cached_soundness(solid_id),
         }));
     }
 
@@ -8664,9 +8704,41 @@ pub(crate) fn broadcast_object_created(
     face_ids: &[u32],
     position: [f32; 3],
 ) {
+    broadcast_object_created_with(
+        object_id,
+        name,
+        solid_id,
+        primitive_type,
+        parameters,
+        vertices,
+        indices,
+        normals,
+        face_ids,
+        position,
+        &serde_json::Value::Null,
+    );
+}
+
+/// [`broadcast_object_created`] plus `extra` payload fields (an object whose
+/// keys are merged into the frame's payload, e.g. an imported part's
+/// `assembly` placement and `sound` verdict). `Null` adds nothing.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn broadcast_object_created_with(
+    object_id: &str,
+    name: &str,
+    solid_id: u32,
+    primitive_type: &str,
+    parameters: &serde_json::Value,
+    vertices: &[f32],
+    indices: &[u32],
+    normals: &[f32],
+    face_ids: &[u32],
+    position: [f32; 3],
+    extra: &serde_json::Value,
+) {
     let now = chrono::Utc::now().timestamp_millis();
     let (bbox_min, bbox_max, center) = compute_bbox_and_center(vertices);
-    let frame = serde_json::json!({
+    let mut frame = serde_json::json!({
         "type": "ObjectCreated",
         "payload": {
             "id": object_id,
@@ -8708,6 +8780,14 @@ pub(crate) fn broadcast_object_created(
             "modified_at": now,
         }
     });
+    if let (Some(extra), Some(payload)) = (
+        extra.as_object(),
+        frame.get_mut("payload").and_then(|p| p.as_object_mut()),
+    ) {
+        for (k, v) in extra {
+            payload.insert(k.clone(), v.clone());
+        }
+    }
     if let Ok(text) = serde_json::to_string(&frame) {
         let _ = GEOMETRY_BROADCASTER.send(text);
     }

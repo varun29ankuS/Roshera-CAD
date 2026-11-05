@@ -642,6 +642,12 @@ pub struct BRepModel {
     /// `operations::transform`; read by `certify_solid`.
     pub solid_construction:
         std::collections::HashMap<SolidId, crate::primitives::provenance::ConstructionGeometry>,
+    /// Per-solid place in an imported assembly (the STEP product tree): set by
+    /// the importer for every solid an assembly placed, carried by the session
+    /// merge, read by the model browser. Sidecar like `solid_provenance`;
+    /// cleared with the geometry (solid ids restart after `clear_geometry`).
+    pub solid_occurrence:
+        std::collections::HashMap<SolidId, crate::primitives::provenance::AssemblyOccurrence>,
     /// Document length unit (GD&T Phase 1): the unit lengths/diameters are
     /// *labelled and formatted* in on drawings and agent-facing readouts. The
     /// kernel's native modelling unit is the millimetre (1 kernel unit = 1 mm)
@@ -747,6 +753,7 @@ impl BRepModel {
             root_counter: 0,
             solid_provenance: std::collections::HashMap::new(),
             solid_construction: std::collections::HashMap::new(),
+            solid_occurrence: std::collections::HashMap::new(),
             document_unit: crate::units::LengthUnit::default(),
             gdt: crate::gdt::sidecar::GdtSidecar::new(),
             drf: std::collections::HashMap::new(),
@@ -887,6 +894,8 @@ impl BRepModel {
         // clear it so a recycled solid id can't inherit a stale orphan
         // sketch and certify falsely Inconsistent.
         self.solid_construction.clear();
+        // Assembly occurrences name solids by id; ids restart after a clear.
+        self.solid_occurrence.clear();
         // Labels are bound to the topology (entity labels) / the part (section
         // labels) being discarded.
         self.labels.clear();
@@ -2823,6 +2832,34 @@ impl BRepModel {
             solid_id,
             crate::primitives::provenance::SolidProvenance::new(created_by, inputs),
         );
+    }
+
+    /// The soundness verdict of the solid's LAST certificate, if one is cached
+    /// and still valid — never computes one. For read-only listings (a scene
+    /// snapshot of hundreds of parts) that must not trigger certification;
+    /// `None` means "not certified since it last changed", not "unsound".
+    pub fn cached_soundness(&self, solid_id: SolidId) -> Option<bool> {
+        self.solids
+            .get(solid_id)?
+            .cached_certificate()
+            .map(|c| c.is_sound())
+    }
+
+    /// Record where a solid sits in an imported assembly.
+    pub fn set_solid_occurrence(
+        &mut self,
+        solid_id: SolidId,
+        occurrence: crate::primitives::provenance::AssemblyOccurrence,
+    ) {
+        self.solid_occurrence.insert(solid_id, occurrence);
+    }
+
+    /// Where a solid sits in an imported assembly, if it came from one.
+    pub fn solid_occurrence(
+        &self,
+        solid_id: SolidId,
+    ) -> Option<&crate::primitives::provenance::AssemblyOccurrence> {
+        self.solid_occurrence.get(&solid_id)
     }
 
     /// The kernel's recorded provenance for a solid, if any.

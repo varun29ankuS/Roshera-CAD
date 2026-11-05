@@ -435,6 +435,81 @@ fn each_use_of_a_part_gets_its_own_stable_pids() {
     assert_eq!(pa, pb, "same file → same PIDs");
 }
 
+/// Every placed solid remembers WHERE it sits in the file's assembly — the
+/// chain of assemblies above it, the part it is a use of, and which use —
+/// so a browser can draw the real product tree instead of a flat list.
+#[test]
+fn placed_solids_record_their_assembly_occurrence() {
+    let (model, _) = ExportEngine::new()
+        .import_step_content(&envelope(&two_instance_assembly()), "asm.step")
+        .unwrap();
+    let mut seen: Vec<(Vec<String>, String, Option<String>)> = model
+        .solids
+        .iter()
+        .map(|(sid, _)| {
+            let occ = model
+                .solid_occurrence(sid)
+                .unwrap_or_else(|| panic!("solid {sid} has no assembly occurrence"));
+            assert_eq!(occ.source, "asm.step", "source file is recorded");
+            (occ.path.clone(), occ.part.clone(), occ.occurrence.clone())
+        })
+        .collect();
+    seen.sort();
+    assert_eq!(
+        seen,
+        vec![
+            (
+                vec!["asm".to_string()],
+                "cube".to_string(),
+                Some("i1".to_string())
+            ),
+            (
+                vec!["asm".to_string()],
+                "cube".to_string(),
+                Some("i2".to_string())
+            ),
+        ]
+    );
+}
+
+/// Nested: the cube sits under `top` → `sub`, in that order.
+#[test]
+fn a_nested_use_records_the_full_assembly_path() {
+    let mut s = cube_product();
+    s += "#600=CARTESIAN_POINT('',(100.,0.,0.));#601=CARTESIAN_POINT('',(0.,5.,0.));";
+    s += "#602=AXIS2_PLACEMENT_3D('top->sub',#600,#23,#21);";
+    s += "#603=AXIS2_PLACEMENT_3D('sub->cube',#601,#23,#21);";
+    s += &assembly_product("sub", 610, "#204,#603");
+    s += &assembly_product("top", 620, "#204,#602");
+    s += &occurrence(700, 622, 612, 625, 615, 602, 204, false);
+    s += &occurrence(710, 612, 405, 615, 301, 603, 204, false);
+    let (model, _) = ExportEngine::new()
+        .import_step_content(&envelope(&s), "nested.stp")
+        .unwrap();
+    let (sid, _) = model.solids.iter().next().unwrap();
+    let occ = model.solid_occurrence(sid).expect("occurrence");
+    assert_eq!(occ.path, vec!["top".to_string(), "sub".to_string()]);
+    assert_eq!(occ.part, "cube");
+}
+
+/// The occurrence travels into the live session with the solid.
+#[test]
+fn merge_carries_the_assembly_occurrence() {
+    let (src, _) = ExportEngine::new()
+        .import_step_content(&envelope(&two_instance_assembly()), "asm.step")
+        .unwrap();
+    let mut target = BRepModel::new();
+    let merged = export_engine::formats::step::merge_solids_into(&mut target, &src);
+    assert_eq!(merged.len(), 2);
+    for sid in merged {
+        let occ = target
+            .solid_occurrence(sid)
+            .unwrap_or_else(|| panic!("merged solid {sid} lost its occurrence"));
+        assert_eq!(occ.path, vec!["asm".to_string()]);
+        assert_eq!(occ.part, "cube");
+    }
+}
+
 #[test]
 fn placement_entities_are_no_longer_reported_unsupported() {
     let (_, report) = ExportEngine::new()

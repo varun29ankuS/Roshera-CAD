@@ -141,7 +141,14 @@ pub fn import_step_text_with_report(
     // and face its identity — PIDs keyed by this file's CONTENT and the STEP
     // entity each came from, and `imported:step` provenance.
     let file_root = geometry_engine::primitives::persistent_id::PersistentId::root(text.as_bytes());
-    let mut model = assembly_placement::finalize(model, &caches, &registry, &mut report, file_root);
+    let mut model = assembly_placement::finalize(
+        model,
+        &caches,
+        &registry,
+        &mut report,
+        file_root,
+        source_hint,
+    );
 
     // Validation gate (IMP5). A solid that materialises topologically is
     // not yet trustworthy — STEP files in the wild deliver self-

@@ -47,7 +47,7 @@ use geometry_engine::operations::transform::{transform_solid, TransformOptions};
 use geometry_engine::primitives::{
     face::FaceId,
     persistent_id::{PersistentId, Role},
-    provenance::OperationKind,
+    provenance::{AssemblyOccurrence, OperationKind},
     solid::SolidId,
     topology_builder::BRepModel,
 };
@@ -96,6 +96,7 @@ pub(crate) fn finalize(
     registry: &EntityRegistry,
     report: &mut ImportReport,
     file_root: PersistentId,
+    source: &str,
 ) -> BRepModel {
     let ids = Ids {
         file_root,
@@ -151,6 +152,9 @@ pub(crate) fn finalize(
             }
             let faces: Vec<(FaceId, FaceId)> = face_map.iter().map(|(s, d)| (*d, *s)).collect();
             stamp(&mut out, sid, part_solid, &faces, &inst.path, &ids);
+            if let Some(occ) = occurrence_of(inst, base_name.as_deref(), ids.product, source) {
+                out.set_solid_occurrence(sid, occ);
+            }
         }
     }
     // Bodies no product claims (free solids, orphans) come across unchanged.
@@ -501,6 +505,38 @@ fn reference(p: Option<&Parameter>) -> Option<u64> {
         Parameter::Ref(ruststep::ast::Name::Entity(n)) => Some(*n),
         _ => None,
     }
+}
+
+/// Where one placed use sits in the product tree: the assembly names from
+/// the top down to its direct parent, its part name, and its occurrence
+/// name. `None` for a top-level product's own solids (no assembly placed
+/// them) or a part with no name to report.
+fn occurrence_of(
+    inst: &Instance,
+    part_name: Option<&str>,
+    ps: &ProductStructure,
+    source: &str,
+) -> Option<AssemblyOccurrence> {
+    let first = inst.path.first()?;
+    let top = ps.occurrences.get(first)?.parent;
+    let mut path = vec![product_name(ps, top).unwrap_or_else(|| format!("#{top}"))];
+    // Every use but the last places a sub-assembly: its child is the next
+    // level down. The last use places this part itself.
+    for nauo in &inst.path[..inst.path.len() - 1] {
+        let child = ps.occurrences.get(nauo)?.child;
+        path.push(product_name(ps, child).unwrap_or_else(|| format!("#{child}")));
+    }
+    let last = ps.occurrences.get(inst.path.last()?)?;
+    let occurrence = [&last.name, &last.id]
+        .into_iter()
+        .find(|s| !s.trim().is_empty())
+        .cloned();
+    Some(AssemblyOccurrence {
+        source: source.to_string(),
+        path,
+        part: part_name?.to_string(),
+        occurrence,
+    })
 }
 
 /// The `PRODUCT` name behind a `PRODUCT_DEFINITION`.

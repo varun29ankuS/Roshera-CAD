@@ -106,6 +106,9 @@ fn carry_identity(
         let created_by = prov.created_by.clone();
         dst.set_solid_provenance(dst_sid, created_by, Vec::new());
     }
+    if let Some(occ) = src.solid_occurrence(src_sid) {
+        dst.set_solid_occurrence(dst_sid, occ.clone());
+    }
     let solid_pid = src.solid_pid(src_sid);
     let faces: Vec<(FaceId, PersistentId)> = solid_faces(src, src_sid)
         .into_iter()

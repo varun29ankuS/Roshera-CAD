@@ -85,6 +85,25 @@ impl OperationKind {
     }
 }
 
+/// Where an imported solid sits in its source file's product structure: the
+/// assemblies above it (top first), the part it is a use of, and which use.
+/// What a model browser needs to draw the real assembly tree instead of a
+/// flat list of bodies. Recorded by the STEP importer for every solid an
+/// assembly placed; absent for solids that belong to no assembly.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AssemblyOccurrence {
+    /// The file the assembly came from (the import's source label).
+    pub source: String,
+    /// Assembly names from the top assembly down to this solid's direct
+    /// parent. Empty for a part placed at the top level.
+    pub path: Vec<String>,
+    /// The part (STEP `PRODUCT`) this solid is a use of.
+    pub part: String,
+    /// This use's own name (the occurrence's name, e.g. `Bolt:3`), when the
+    /// file gives one.
+    pub occurrence: Option<String>,
+}
+
 /// Provenance attached to a solid: the operation that created it and the input
 /// solids it consumed (empty for primitives / fresh creations).
 #[derive(Debug, Clone, PartialEq)]
