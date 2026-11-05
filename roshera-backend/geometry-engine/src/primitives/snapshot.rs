@@ -114,6 +114,8 @@ pub struct ModelSnapshot {
     /// Assembly-occurrence sidecar: keyed by solid id like the geometry it
     /// describes, so a rolled-back op restores the two together.
     solid_occurrence: HashMap<SolidId, crate::primitives::provenance::AssemblyOccurrence>,
+    /// Missing-part sidecar, restored with the occurrences it sits beside.
+    missing_occurrences: Vec<(crate::primitives::provenance::AssemblyOccurrence, String)>,
     /// Label sidecar (names → entities/sections). Keyed by persistent id (also
     /// snapshotted), so a rolled-back op that named a feature is undone with the
     /// geometry — same contract as the GD&T sidecar.
@@ -159,6 +161,7 @@ impl ModelSnapshot {
             drf: model.drf.clone(),
             solid_construction: model.solid_construction.clone(),
             solid_occurrence: model.solid_occurrence.clone(),
+            missing_occurrences: model.missing_occurrences.clone(),
             labels: model.labels.clone(),
         }
     }
@@ -195,6 +198,7 @@ impl ModelSnapshot {
         model.drf = self.drf;
         model.solid_construction = self.solid_construction;
         model.solid_occurrence = self.solid_occurrence;
+        model.missing_occurrences = self.missing_occurrences;
         model.labels = self.labels;
     }
 }

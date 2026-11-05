@@ -34,23 +34,30 @@ export interface TreeInput {
   name: string
   sound?: boolean | null
   assembly?: AssemblyOccurrence | null
+  /** Set for a use whose geometry did NOT import: the reason. Such an entry
+   *  has no mesh; it is a row so the gap is visible, nothing more. */
+  missing?: string
 }
 
 interface Tally {
   /** Stable key, unique across the whole tree. */
   key: string
   name: string
-  /** Every part id beneath this node. */
+  /** Every part id beneath this node that EXISTS (has a mesh). */
   partIds: string[]
   partCount: number
   soundCount: number
   unsoundCount: number
+  /** Uses beneath this node whose geometry did not import. */
+  missingCount: number
 }
 
 export interface PartNode extends Tally {
   kind: 'part'
   id: string
   sound: boolean | null
+  /** Why this use did not import (absent for parts that did). */
+  missing?: string
 }
 
 export interface GroupNode extends Tally {
@@ -149,6 +156,21 @@ function container(
 }
 
 function partNode(obj: TreeInput, name: string): PartNode {
+  if (obj.missing !== undefined) {
+    return {
+      kind: 'part',
+      key: obj.id,
+      id: obj.id,
+      name,
+      sound: null,
+      missing: obj.missing,
+      partIds: [],
+      partCount: 0,
+      soundCount: 0,
+      unsoundCount: 0,
+      missingCount: 1,
+    }
+  }
   const sound = obj.sound ?? null
   return {
     kind: 'part',
@@ -160,6 +182,7 @@ function partNode(obj: TreeInput, name: string): PartNode {
     partCount: 1,
     soundCount: sound === true ? 1 : 0,
     unsoundCount: sound === false ? 1 : 0,
+    missingCount: 0,
   }
 }
 
@@ -167,10 +190,12 @@ function roll(nodes: Tally[]): Omit<Tally, 'key' | 'name'> {
   const partIds: string[] = []
   let soundCount = 0
   let unsoundCount = 0
+  let missingCount = 0
   for (const n of nodes) {
     for (const id of n.partIds) partIds.push(id)
     soundCount += n.soundCount
     unsoundCount += n.unsoundCount
+    missingCount += n.missingCount
   }
-  return { partIds, partCount: partIds.length, soundCount, unsoundCount }
+  return { partIds, partCount: partIds.length, soundCount, unsoundCount, missingCount }
 }

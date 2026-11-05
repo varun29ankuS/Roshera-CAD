@@ -125,6 +125,23 @@ pub(crate) fn finalize(
     let mut placed: HashSet<SolidId> = HashSet::new();
     for inst in &instances {
         let base_name = product_name(ids.product, inst.definition);
+        if inst.solids.is_empty() {
+            // A use whose part produced no solid: record it as missing (with
+            // where it sits) so the browser shows the gap.
+            let part = base_name
+                .clone()
+                .unwrap_or_else(|| format!("#{}", inst.definition));
+            if let Some(occ) = occurrence_of(inst, Some(&part), ids.product, source) {
+                out.record_missing_occurrence(
+                    occ,
+                    "the part's geometry did not import: no solid was built from it \
+                     (the import report's warnings name the entities that failed)"
+                        .to_string(),
+                );
+                report.missing_parts += 1;
+            }
+            continue;
+        }
         for (k, &part_solid) in inst.solids.iter().enumerate() {
             placed.insert(part_solid);
             let name = instance_name(
@@ -383,7 +400,12 @@ fn walk(
     report: &mut ImportReport,
 ) {
     let solids = solids_of(definition);
-    if !solids.is_empty() {
+    let uses = children.get(&definition);
+    // A LEAF use (a part, not a sub-assembly) whose geometry produced no
+    // solid is kept as an instance with no solids: `finalize` records it as
+    // missing instead of letting it vanish without a trace.
+    let missing_leaf = solids.is_empty() && uses.is_none() && !path.is_empty();
+    if !solids.is_empty() || missing_leaf {
         out.push(Instance {
             definition,
             solids,
@@ -391,7 +413,7 @@ fn walk(
             path: path.clone(),
         });
     }
-    let Some(uses) = children.get(&definition) else {
+    let Some(uses) = uses else {
         return;
     };
     for &nauo in uses {

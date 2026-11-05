@@ -138,3 +138,20 @@ test('every node carries the ids of all parts beneath it (for hover / hide)', ()
   const base = roots[0].children.find((n) => n.name === 'base')
   assert.deepEqual([...base.partIds].sort(), ['a', 'b'])
 })
+
+test('a part that did not import is a row of its own, counted apart from sound/unsound', () => {
+  const { roots } = buildAssemblyTree([
+    part('a', 'plate', ['arm', 'base'], null, true),
+    { id: 'missing:1', name: 'cone_cover', missing: 'geometry did not import',
+      assembly: { source: 'arm.stp', path: ['arm', 'base'], part: 'cone_cover', occurrence: 'cone_cover:1' } },
+  ])
+  const base = roots[0].children.find((n) => n.name === 'base')
+  const ghost = base.children.find((n) => n.name === 'cone_cover')
+  assert.equal(ghost.kind, 'part')
+  assert.equal(ghost.missing, 'geometry did not import')
+  assert.equal(base.missingCount, 1)
+  assert.equal(roots[0].missingCount, 1)
+  // A missing part has no mesh: it is not one of the ids a row can light up.
+  assert.deepEqual(base.partIds, ['a'])
+  assert.equal(base.partCount, 1, 'parts that exist')
+})

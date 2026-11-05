@@ -507,6 +507,51 @@ fn product_names_are_decoded_from_step_string_escapes() {
     assert_eq!(occ.path, vec!["Połączenie gwintowe2".to_string()]);
 }
 
+/// A part the assembly USES but whose geometry produced no solid (its faces
+/// failed to import) must not vanish silently: it is recorded as missing,
+/// with where it sits and why, so the browser can list what is absent.
+/// (The robot-arm probe: 58 MANIFOLD_SOLID_BREPs failed and those parts were
+/// in neither the tree nor the viewport.)
+#[test]
+fn a_used_part_with_no_geometry_is_reported_missing() {
+    let mut s = cube_product();
+    // `ghost` is a product whose shape representation holds no solid.
+    s += "#801=PRODUCT('ghost','ghost','',(#402));";
+    s += "#803=PRODUCT_DEFINITION_FORMATION('','',#801);";
+    s += "#805=PRODUCT_DEFINITION('design','',#803,#404);";
+    s += "#806=PRODUCT_DEFINITION_SHAPE('','',#805);";
+    s += "#830=SHAPE_REPRESENTATION('ghost',(#204),#205);";
+    s += "#807=SHAPE_DEFINITION_REPRESENTATION(#806,#830);";
+    s += &assembly_product("asm", 620, "#204");
+    s += &occurrence(700, 622, 405, 625, 301, 204, 204, false);
+    s += &occurrence(710, 622, 805, 625, 830, 204, 204, false);
+    let (model, report) = ExportEngine::new()
+        .import_step_content(&envelope(&s), "ghost.stp")
+        .unwrap();
+    assert_eq!(model.solids.len(), 1, "the cube still imports");
+    let missing = model.missing_occurrences();
+    assert_eq!(missing.len(), 1, "the ghost use is recorded: {missing:?}");
+    let (occ, reason) = &missing[0];
+    assert_eq!(occ.part, "ghost");
+    assert_eq!(occ.path, vec!["asm".to_string()]);
+    assert_eq!(occ.source, "ghost.stp");
+    assert!(!reason.is_empty(), "a reason is given");
+    assert!(
+        report.missing_parts == 1,
+        "the report counts it too: {}",
+        report.missing_parts
+    );
+
+    // And it travels into the session.
+    let mut target = BRepModel::new();
+    export_engine::formats::step::merge_solids_into(&mut target, &model);
+    assert_eq!(
+        target.missing_occurrences().len(),
+        1,
+        "merge carries missing parts"
+    );
+}
+
 /// The occurrence travels into the live session with the solid.
 #[test]
 fn merge_carries_the_assembly_occurrence() {

@@ -582,7 +582,10 @@ async function resyncSceneFromServer(): Promise<void> {
         )
       return
     }
-    const snap = (await res.json()) as { objects?: ProtocolCADObject[] }
+    const snap = (await res.json()) as {
+      objects?: ProtocolCADObject[]
+      missing?: { assembly: NonNullable<ProtocolCADObject['assembly']>; reason: string }[]
+    }
     // Convert FIRST, then clear+swap. If a malformed object throws mid-convert,
     // it throws BEFORE we touch the live scene — so a bad snapshot can never
     // blank the viewport. (The old clear-then-build order, paired with an
@@ -594,6 +597,8 @@ async function resyncSceneFromServer(): Promise<void> {
     pendingOps.clear()
     scene.clearScene()
     scene.applyObjectBatch({ upserts: converted, deletes: [] })
+    // Imported parts that built no solid: listed by the browser as absent.
+    scene.setMissingParts(snap.missing ?? [])
     sketchesHydrated = false
     hydrateSketchesOnce()
     console.info(

@@ -648,6 +648,11 @@ pub struct BRepModel {
     /// cleared with the geometry (solid ids restart after `clear_geometry`).
     pub solid_occurrence:
         std::collections::HashMap<SolidId, crate::primitives::provenance::AssemblyOccurrence>,
+    /// Uses of an imported assembly's parts that produced NO solid (their
+    /// geometry failed to import), with the reason. Not solids, so they have
+    /// no id: kept so the browser can list what is ABSENT instead of letting
+    /// it vanish silently. Cleared with the geometry.
+    pub missing_occurrences: Vec<(crate::primitives::provenance::AssemblyOccurrence, String)>,
     /// Document length unit (GD&T Phase 1): the unit lengths/diameters are
     /// *labelled and formatted* in on drawings and agent-facing readouts. The
     /// kernel's native modelling unit is the millimetre (1 kernel unit = 1 mm)
@@ -754,6 +759,7 @@ impl BRepModel {
             solid_provenance: std::collections::HashMap::new(),
             solid_construction: std::collections::HashMap::new(),
             solid_occurrence: std::collections::HashMap::new(),
+            missing_occurrences: Vec::new(),
             document_unit: crate::units::LengthUnit::default(),
             gdt: crate::gdt::sidecar::GdtSidecar::new(),
             drf: std::collections::HashMap::new(),
@@ -896,6 +902,7 @@ impl BRepModel {
         self.solid_construction.clear();
         // Assembly occurrences name solids by id; ids restart after a clear.
         self.solid_occurrence.clear();
+        self.missing_occurrences.clear();
         // Labels are bound to the topology (entity labels) / the part (section
         // labels) being discarded.
         self.labels.clear();
@@ -2852,6 +2859,22 @@ impl BRepModel {
         occurrence: crate::primitives::provenance::AssemblyOccurrence,
     ) {
         self.solid_occurrence.insert(solid_id, occurrence);
+    }
+
+    /// Record a use of an imported part that produced no solid, and why.
+    pub fn record_missing_occurrence(
+        &mut self,
+        occurrence: crate::primitives::provenance::AssemblyOccurrence,
+        reason: String,
+    ) {
+        self.missing_occurrences.push((occurrence, reason));
+    }
+
+    /// Every recorded use of an imported part that produced no solid.
+    pub fn missing_occurrences(
+        &self,
+    ) -> &[(crate::primitives::provenance::AssemblyOccurrence, String)] {
+        &self.missing_occurrences
     }
 
     /// Where a solid sits in an imported assembly, if it came from one.

@@ -932,15 +932,24 @@ export function ModelTree({
   // Imported assemblies get their own PRODUCT TREE (file → sub-assemblies →
   // parts, repeats folded to ×N). Their parts are drawn there and nowhere
   // else, so they are filtered out of the flat sections below.
+  const missingParts = useSceneStore((s) => s.missingParts)
   const assemblyTree = useMemo(
     () =>
-      buildAssemblyTree(
-        objectOrder.flatMap((id) => {
+      buildAssemblyTree([
+        ...objectOrder.flatMap((id) => {
           const o = objects.get(id)
           return o ? [{ id: o.id, name: o.name, sound: o.sound, assembly: o.assembly }] : []
         }),
-      ),
-    [objects, objectOrder],
+        // Uses whose geometry did not import: rows with no mesh, so the gap
+        // shows where it is instead of the part silently not existing.
+        ...missingParts.map((m, i) => ({
+          id: `missing:${i}:${m.assembly.source}:${m.assembly.part}`,
+          name: m.assembly.occurrence ?? m.assembly.part,
+          assembly: m.assembly,
+          missing: m.reason,
+        })),
+      ]),
+    [objects, objectOrder, missingParts],
   )
   const inAssembly = (id: string) => objects.get(id)?.assembly !== undefined
   const localNodes = sceneToNodes(objects, objectOrder).filter((n) => !inAssembly(n.id))

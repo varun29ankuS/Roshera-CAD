@@ -608,6 +608,12 @@ interface SceneState {
    * hover — from the viewport or its own row — stays on `hoveredId`.
    */
   treeHoverIds: readonly string[]
+  /**
+   * Uses of imported parts whose geometry did NOT import (from the scene
+   * snapshot). No mesh, nothing to draw — the browser lists them so what is
+   * absent is visible, with the reason.
+   */
+  missingParts: readonly { assembly: AssemblyOccurrence; reason: string }[]
   selectionMode: SelectionMode
   subElementSelections: SubElementSelection[]
   hoveredSubElement: SubElementSelection | null
@@ -791,6 +797,7 @@ interface SceneState {
   deselectAll: () => void
   setHovered: (id: string | null) => void
   setTreeHover: (ids: readonly string[]) => void
+  setMissingParts: (parts: readonly { assembly: AssemblyOccurrence; reason: string }[]) => void
   setSelectionMode: (mode: SelectionMode) => void
   addSubElementSelection: (sel: SubElementSelection) => void
   clearSubElementSelections: () => void
@@ -1098,6 +1105,7 @@ const sceneCreator: StateCreator<
     selectedIds: new Set(),
     hoveredId: null,
     treeHoverIds: [],
+    missingParts: [],
     selectionMode: 'object',
     subElementSelections: [],
     hoveredSubElement: null,
@@ -1407,6 +1415,7 @@ const sceneCreator: StateCreator<
 
     setHovered: (id) => set({ hoveredId: id }),
     setTreeHover: (ids) => set({ treeHoverIds: ids }),
+    setMissingParts: (parts) => set({ missingParts: parts }),
 
     setSelectionMode: (mode) =>
       set({ selectionMode: mode, subElementSelections: [], hoveredSubElement: null }),

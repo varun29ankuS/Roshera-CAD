@@ -397,6 +397,40 @@ async fn seed_box(state: &AppState, size: f64) -> (Uuid, SolidId, [EdgeId; 3]) {
     (uuid, solid_id, corner_edges)
 }
 
+/// Parts an imported assembly USES but could not build reach the browser:
+/// the snapshot lists each with where it sits and why, so the tree can show
+/// what is absent instead of the part vanishing without a trace.
+#[tokio::test]
+async fn scene_snapshot_lists_parts_that_did_not_import() {
+    let state = make_test_state().await;
+    {
+        let mut model = state.model.write().await;
+        model.record_missing_occurrence(
+            geometry_engine::primitives::provenance::AssemblyOccurrence {
+                source: "arm.stp".into(),
+                path: vec!["arm".into(), "base".into()],
+                part: "cone_cover".into(),
+                occurrence: Some("cone_cover:1".into()),
+            },
+            "the part's geometry did not import".into(),
+        );
+    }
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri("/api/scene/snapshot")
+        .body(Body::empty())
+        .expect("static request must build");
+    let (status, snap) = dispatch(&state, request).await;
+    assert_eq!(status, StatusCode::OK);
+    let missing = snap["missing"]
+        .as_array()
+        .expect("snapshot lists missing parts");
+    assert_eq!(missing.len(), 1, "{snap}");
+    assert_eq!(missing[0]["assembly"]["part"], "cone_cover");
+    assert_eq!(missing[0]["assembly"]["path"], json!(["arm", "base"]));
+    assert_eq!(missing[0]["reason"], "the part's geometry did not import");
+}
+
 /// A part coloured before a reload must come back in its colour from the
 /// SNAPSHOT alone — the one path a (re)connecting client hydrates from. The
 /// colour used to ride only on a connect-time `ObjectColor` replay frame.

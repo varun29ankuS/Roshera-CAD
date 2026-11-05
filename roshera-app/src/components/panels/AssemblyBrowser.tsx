@@ -77,6 +77,9 @@ interface BranchProps {
 }
 
 function Branch({ node, depth, parentName, folds, onToggle, onPartContextMenu }: BranchProps) {
+  if (node.kind === 'part' && node.missing !== undefined) {
+    return <MissingRow node={node} depth={depth} parentName={parentName} />
+  }
   if (node.kind === 'part') {
     return (
       <PartRow node={node} depth={depth} parentName={parentName} onContextMenu={onPartContextMenu} />
@@ -208,6 +211,14 @@ const ContainerRow = memo(function ContainerRow({
           {node.partCount}
         </span>
       )}
+      {node.missingCount > 0 && (
+        <span
+          className="shrink-0 text-destructive"
+          title={`${node.missingCount} part use(s) beneath did not import — they are not in the viewport`}
+        >
+          {node.missingCount} missing
+        </span>
+      )}
       <Verdict sound={node.soundCount} unsound={node.unsoundCount} total={node.partCount} />
       <button
         type="button"
@@ -301,6 +312,34 @@ const PartRow = memo(function PartRow({
     </div>
   )
 })
+
+/** A use whose geometry did not import: no mesh, so no hover / select /
+ *  visibility — just the gap, where it sits, and why (tooltip). */
+function MissingRow({
+  node,
+  depth,
+  parentName,
+}: {
+  node: PartNode
+  depth: number
+  parentName?: string
+}) {
+  return (
+    <div
+      role="treeitem"
+      aria-disabled
+      className="flex select-none items-center gap-1 pr-1 text-destructive/80"
+      style={{ paddingLeft: depth * INDENT_PX + INDENT_PX }}
+      title={`Not imported: ${node.missing}`}
+    >
+      <span className="shrink-0">◇</span>
+      <span className="flex min-w-0 flex-1 line-through decoration-destructive/50">
+        <Name name={node.name} parent={parentName} />
+      </span>
+      <span className="shrink-0 text-[11px]">not imported</span>
+    </div>
+  )
+}
 
 /** ✓ when every part beneath is sound; an amber ⚠N when N are not; a dim ·
  *  when nothing beneath has been certified yet. The warning is deliberately

@@ -61,6 +61,11 @@ pub fn merge_solids_into(dst: &mut BRepModel, src: &BRepModel) -> Vec<SolidId> {
             out.push(new_sid);
         }
     }
+    // Parts the import could not build travel with the ones it could, so the
+    // session still knows they are absent.
+    for (occ, reason) in src.missing_occurrences() {
+        dst.record_missing_occurrence(occ.clone(), reason.clone());
+    }
     out
 }
 

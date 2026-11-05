@@ -253,6 +253,13 @@ pub struct ImportReport {
     /// AP242 files where every solid belongs to exactly one root.
     #[serde(default)]
     pub solids_in_roots: usize,
+    /// Uses of an assembly's parts that produced NO solid — the part's
+    /// geometry failed to import. Each is recorded on the model
+    /// (`BRepModel::missing_occurrences`) with where it sits and why, so it
+    /// shows as absent instead of vanishing. A non-zero count makes `ok`
+    /// false: the assembly did not come in whole.
+    #[serde(default)]
+    pub missing_parts: usize,
     /// Kernel-validation verdict per imported solid, folded into
     /// [`Self::ok`]. A solid that materialises topologically but fails
     /// `validate_solid_scoped` (self-intersection, non-manifold edges,

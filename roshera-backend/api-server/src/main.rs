@@ -7642,7 +7642,15 @@ async fn scene_snapshot(
         }));
     }
 
-    Json(serde_json::json!({ "objects": objects }))
+    // Uses of imported parts that built no solid: not objects (nothing to
+    // draw), listed so the browser shows what is ABSENT and why.
+    let missing: Vec<serde_json::Value> = model
+        .missing_occurrences()
+        .iter()
+        .map(|(occ, reason)| serde_json::json!({ "assembly": occ, "reason": reason }))
+        .collect();
+
+    Json(serde_json::json!({ "objects": objects, "missing": missing }))
 }
 
 /// `POST /api/parts/uuid/{uuid}/name` — rename a part, durably.

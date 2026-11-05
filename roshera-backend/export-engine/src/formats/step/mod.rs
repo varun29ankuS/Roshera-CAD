@@ -194,7 +194,10 @@ pub fn import_step_text_with_report(
     // the full certificate. Honest partial: a file that yields a sound
     // solid plus an unsound husk reports `ok = false` with the husk
     // flagged (and its failing dimension named) in `report.validation`.
-    report.ok = resolved > 0 && !model.solids.is_empty() && all_solids_sound;
+    // ...and every part the assembly uses actually came in: a use whose
+    // geometry built no solid is recorded as missing and fails `ok`.
+    report.ok =
+        resolved > 0 && !model.solids.is_empty() && all_solids_sound && report.missing_parts == 0;
     Ok((model, report))
 }
 
