@@ -58,7 +58,7 @@ jobs:
       # now fails the job.
       env:
         CARGO_PROFILE_BENCH_DEBUG: "false"
-      run: cargo bench -p geometry-engine -p assembly-engine --benches
+      run: cargo bench -p geometry-engine -p assembly-engine --bench '*'
       working-directory: ./roshera-backend
 
   memory-profile:

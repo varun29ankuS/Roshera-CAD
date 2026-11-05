@@ -35,7 +35,13 @@ jobs:
     # finished, so the cache never SAVED and every run stayed cold. This higher
     # cap lets one cold run complete and warm the cache; warm runs finish in
     # ~10-15 min (revisit/lower this once green is observed).
-    timeout-minutes: 60
+    #
+    # 90 min (2026-11-05): the first run with every test executing in full
+    # (7ce295a4) passed 8778/8778, but nextest alone took 49 min (the four
+    # curved-boolean acceptance tests given a 25-min leash in
+    # .config/nextest.toml, plus the exact-predicate oracles at ~4.5 min) and
+    # the 60-min cap cancelled the job during the doctest pass that follows.
+    timeout-minutes: 90
 
     steps:
     - uses: actions/checkout@v4
@@ -554,7 +560,7 @@ jobs:
         CARGO_PROFILE_BENCH_DEBUG: "false"
       run: |
         set -o pipefail
-        cargo bench -p geometry-engine -p assembly-engine --benches -- --output-format bencher | tee bench-results.txt
+        cargo bench -p geometry-engine -p assembly-engine --bench '*' -- --output-format bencher | tee bench-results.txt
       working-directory: ./roshera-backend
 
   performance:
