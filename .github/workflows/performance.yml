@@ -16,6 +16,19 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
+    - name: Free disk space
+      # A cold (cache-miss) release build of the whole workspace plus every
+      # bench binary overruns the runner's ~14 GB root disk, and the runner is
+      # killed mid-build (exit 143, "received a shutdown signal") — first seen
+      # when committing Cargo.lock changed this job's cache key. Same cleanup
+      # the Test Suite job uses.
+      run: |
+        sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+          /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+          /usr/local/lib/node_modules 2>/dev/null || true
+        sudo docker image prune -af 2>/dev/null || true
+        df -h /
+
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
 
