@@ -92,6 +92,19 @@ export const cadObjectSchema = z.object({
   metadata: z.record(z.string(), z.unknown()),
   created_at: z.number(),
   modified_at: z.number(),
+  // An imported part's place in its file's assembly, and the kernel's
+  // soundness verdict. Declared here because zod STRIPS undeclared keys —
+  // left out, the live push would silently lose both.
+  assembly: z
+    .object({
+      source: z.string(),
+      path: z.array(z.string()),
+      part: z.string(),
+      occurrence: z.string().nullable(),
+    })
+    .nullable()
+    .optional(),
+  sound: z.boolean().nullable().optional(),
 })
 
 const subElementSchema = z.object({

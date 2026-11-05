@@ -160,9 +160,11 @@ fn read(
         let field = params::field(fields, index, entity, instance)?;
         params::as_entity_ref(field, entity, instance, path)
     };
+    // Names are shown to people and agents: decode the §6.4.3 escapes
+    // exporters use for every non-ASCII character.
     let text = |index: usize| -> String {
         match fields.get(index) {
-            Some(Parameter::String(s)) => s.clone(),
+            Some(Parameter::String(s)) => params::decode_step_string(s),
             _ => String::new(),
         }
     };

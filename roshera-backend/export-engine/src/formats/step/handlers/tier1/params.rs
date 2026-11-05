@@ -154,6 +154,113 @@ pub fn as_string(
     }
 }
 
+/// Decode the ISO 10303-21 §6.4.3 control directives in a STEP string:
+///
+/// - `\X2\hhhh…\X0\` — UTF-16 code units, 4 hex digits each
+/// - `\X4\hhhhhhhh…\X0\` — Unicode code points, 8 hex digits each
+/// - `\X\hh` — one ISO 8859-1 byte
+/// - `\S\c` — `c` with its high bit set (ISO 8859-1 upper half)
+/// - `\P?\` — code-page selector (ISO 8859 page; Latin-1 is assumed, the
+///   directive itself is dropped)
+/// - `\\` — a literal backslash
+///
+/// Exporters write every non-ASCII name this way (`Po\X2\01420105\X0\czenie`
+/// is "Połączenie"). A malformed directive is kept VERBATIM — the name stays
+/// readable as written rather than silently losing characters.
+pub fn decode_step_string(raw: &str) -> String {
+    if !raw.contains('\\') {
+        return raw.to_string();
+    }
+    let chars: Vec<char> = raw.chars().collect();
+    let mut out = String::with_capacity(raw.len());
+    let mut i = 0;
+    let hex_at = |from: usize, n: usize| -> Option<u32> {
+        let s: String = chars.get(from..from + n)?.iter().collect();
+        u32::from_str_radix(&s, 16).ok()
+    };
+    let starts = |from: usize, pat: &str| -> bool {
+        pat.chars()
+            .enumerate()
+            .all(|(k, c)| chars.get(from + k) == Some(&c))
+    };
+    while i < chars.len() {
+        if chars[i] != '\\' {
+            out.push(chars[i]);
+            i += 1;
+            continue;
+        }
+        // `\X2\` / `\X4\`: a run of fixed-width hex units up to `\X0\`.
+        let wide = if starts(i, "\\X2\\") {
+            Some(4)
+        } else if starts(i, "\\X4\\") {
+            Some(8)
+        } else {
+            None
+        };
+        if let Some(width) = wide {
+            let body = i + 4;
+            let end = (body..chars.len()).find(|&k| starts(k, "\\X0\\"));
+            let decoded = end.and_then(|end| {
+                let run = end - body;
+                if run % width != 0 {
+                    return None;
+                }
+                let units: Option<Vec<u32>> = (0..run / width)
+                    .map(|u| hex_at(body + u * width, width))
+                    .collect();
+                let units = units?;
+                let text = if width == 4 {
+                    let u16s: Vec<u16> = units.iter().map(|&u| u as u16).collect();
+                    String::from_utf16(&u16s).ok()?
+                } else {
+                    units
+                        .iter()
+                        .map(|&u| char::from_u32(u))
+                        .collect::<Option<String>>()?
+                };
+                Some((text, end + 4))
+            });
+            match decoded {
+                Some((text, next)) => {
+                    out.push_str(&text);
+                    i = next;
+                }
+                None => {
+                    out.push('\\');
+                    i += 1;
+                }
+            }
+            continue;
+        }
+        if starts(i, "\\X\\") {
+            if let Some(c) = hex_at(i + 3, 2).and_then(char::from_u32) {
+                out.push(c);
+                i += 5;
+                continue;
+            }
+        } else if starts(i, "\\S\\") {
+            if let Some(c) = chars
+                .get(i + 3)
+                .and_then(|&c| char::from_u32(c as u32 + 128))
+            {
+                out.push(c);
+                i += 4;
+                continue;
+            }
+        } else if starts(i, "\\\\") {
+            out.push('\\');
+            i += 2;
+            continue;
+        } else if starts(i, "\\P") && chars.get(i + 3) == Some(&'\\') {
+            i += 4;
+            continue;
+        }
+        out.push('\\');
+        i += 1;
+    }
+    out
+}
+
 /// Extract an `Integer`.
 pub fn as_integer(
     param: &Parameter,
@@ -367,6 +474,28 @@ mod tests {
         assert_eq!(err.entity, "TEST");
         assert_eq!(err.instance, 7);
         assert!(err.found.starts_with("Real"));
+    }
+
+    /// ISO 10303-21 §6.4.3 string escapes, as real exporters write them
+    /// (the robot-arm file names its threaded joints `Po\X2\01420105\X0\czenie`
+    /// = "Połączenie").
+    #[test]
+    fn decode_step_string_handles_the_iso_10303_21_escapes() {
+        assert_eq!(
+            decode_step_string(r"Po\X2\01420105\X0\czenie"),
+            "Połączenie"
+        );
+        assert_eq!(decode_step_string(r"\X4\0001F600\X0\ ok"), "😀 ok");
+        assert_eq!(decode_step_string(r"caf\X\E9"), "café");
+        assert_eq!(
+            decode_step_string(r"\S\i"),
+            "é",
+            "\\S\\ lifts the next char by 128"
+        );
+        assert_eq!(decode_step_string(r"a\\b"), r"a\b", "an escaped backslash");
+        assert_eq!(decode_step_string("plain name"), "plain name");
+        // A malformed escape is kept verbatim, never dropped or guessed.
+        assert_eq!(decode_step_string(r"bad\X2\01G4\X0\"), r"bad\X2\01G4\X0\");
     }
 
     #[test]

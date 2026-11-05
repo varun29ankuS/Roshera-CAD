@@ -66,3 +66,15 @@ test('a genuinely new part is framed, echoed, and takes the server material', ()
   assert.equal(r.echoMessage, 'Created **Transformed**')
   assert.equal(r.obj, incoming)
 })
+
+test('an in-place change keeps where the part sits in its assembly', () => {
+  const placed = { ...existing, assembly: { source: 'arm.stp', path: ['arm', 'base'], part: 'pin', occurrence: 'pin:3' } }
+  const r = mergeObjectCreated(obj({}), placed, () => null)
+  assert.deepEqual(r.obj.assembly, placed.assembly)
+})
+
+test('an in-place change drops a stale soundness verdict unless the frame carries a new one', () => {
+  const certified = { ...existing, sound: true }
+  assert.equal(mergeObjectCreated(obj({}), certified, () => null).obj.sound, undefined)
+  assert.equal(mergeObjectCreated(obj({ sound: false }), certified, () => null).obj.sound, false)
+})

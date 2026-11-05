@@ -66,6 +66,15 @@ export interface CADObject {
   metadata: Record<string, unknown>
   created_at: number
   modified_at: number
+  /** Imported part's place in its file's assembly (null/absent otherwise). */
+  assembly?: {
+    source: string
+    path: string[]
+    part: string
+    occurrence: string | null
+  } | null
+  /** Kernel soundness verdict; null/absent = not certified since last change. */
+  sound?: boolean | null
 }
 
 // ─── API request/response types ──────────────────────────────────────

@@ -9,6 +9,7 @@ import type { Mesh } from 'three'
 export function SelectionOutline() {
   const selectedIds = useSceneStore((s) => s.selectedIds)
   const hoveredId = useSceneStore((s) => s.hoveredId)
+  const treeHoverIds = useSceneStore((s) => s.treeHoverIds)
   const meshRefs = useSceneStore((s) => s.meshRefs)
   const theme = useThemeStore((s) => s.theme)
 
@@ -21,11 +22,19 @@ export function SelectionOutline() {
     return meshes
   }, [selectedIds, meshRefs])
 
+  // The hovered part, plus every part of a browser GROUP row under the
+  // pointer (a sub-assembly, a `×N` group) — selected parts keep their
+  // selection outline instead.
   const hoveredMeshes = useMemo(() => {
-    if (!hoveredId || selectedIds.has(hoveredId)) return []
-    const mesh = meshRefs.get(hoveredId)
-    return mesh ? [mesh] : []
-  }, [hoveredId, selectedIds, meshRefs])
+    const meshes: Mesh[] = []
+    const ids = hoveredId ? [hoveredId, ...treeHoverIds] : treeHoverIds
+    for (const id of ids) {
+      if (selectedIds.has(id)) continue
+      const mesh = meshRefs.get(id)
+      if (mesh) meshes.push(mesh)
+    }
+    return meshes
+  }, [hoveredId, treeHoverIds, selectedIds, meshRefs])
 
   // Selected silhouettes render in pastel red (`--cad-edge-selected`)
   // so a clicked solid is unambiguously distinguished from a hovered or

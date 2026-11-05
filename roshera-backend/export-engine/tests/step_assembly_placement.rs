@@ -492,6 +492,21 @@ fn a_nested_use_records_the_full_assembly_path() {
     assert_eq!(occ.part, "cube");
 }
 
+/// Product names arrive decoded: the robot-arm file names its threaded
+/// joints `Po\X2\01420105\X0\czenie gwintowe2` ("Połączenie gwintowe2").
+#[test]
+fn product_names_are_decoded_from_step_string_escapes() {
+    let mut s = cube_product();
+    s += &assembly_product(r"Po\X2\01420105\X0\czenie gwintowe2", 620, "#204");
+    s += &occurrence(700, 622, 405, 625, 301, 204, 204, false);
+    let (model, _) = ExportEngine::new()
+        .import_step_content(&envelope(&s), "joint.stp")
+        .unwrap();
+    let (sid, _) = model.solids.iter().next().unwrap();
+    let occ = model.solid_occurrence(sid).expect("occurrence");
+    assert_eq!(occ.path, vec!["Połączenie gwintowe2".to_string()]);
+}
+
 /// The occurrence travels into the live session with the solid.
 #[test]
 fn merge_carries_the_assembly_occurrence() {

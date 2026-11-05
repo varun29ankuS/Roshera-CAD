@@ -156,6 +156,8 @@ function convertCADObject(proto: ProtocolCADObject): CADObject {
     visible: proto.visible ?? true,
     locked: proto.locked ?? false,
     parentId: proto.parent,
+    assembly: proto.assembly ?? undefined,
+    sound: proto.sound ?? undefined,
   }
 }
 

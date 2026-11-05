@@ -1,6 +1,7 @@
 import { create, type StateCreator } from 'zustand'
 import { subscribeWithSelector } from 'zustand/middleware'
 import type * as THREE from 'three'
+import type { AssemblyOccurrence } from '@/lib/assembly-tree'
 import {
   sketchApi,
   type ServerSketchSession,
@@ -111,6 +112,12 @@ export interface CADObject {
   visible: boolean
   locked: boolean
   parentId?: string
+  /** Where an imported part sits in its file's assembly (absent for parts
+   *  no assembly placed). Drives the browser's product tree. */
+  assembly?: AssemblyOccurrence
+  /** The kernel's last soundness verdict; absent = not certified since the
+   *  part last changed (never "assumed sound"). */
+  sound?: boolean
 }
 
 // ─── Camera projection ───────────────────────────────────────────────
@@ -595,6 +602,12 @@ interface SceneState {
   // Selection
   selectedIds: Set<string>
   hoveredId: string | null
+  /**
+   * Parts lit by hovering a GROUP row in the model browser (a sub-assembly,
+   * a `×N` part group): the viewport outlines all of them. A single part's
+   * hover — from the viewport or its own row — stays on `hoveredId`.
+   */
+  treeHoverIds: readonly string[]
   selectionMode: SelectionMode
   subElementSelections: SubElementSelection[]
   hoveredSubElement: SubElementSelection | null
@@ -772,8 +785,12 @@ interface SceneState {
   clearScene: () => void
 
   selectObject: (id: string, additive: boolean) => void
+  /** Select a set of parts at once (a sub-assembly row, a `×N` group);
+   *  `additive` adds them to the current selection. One store update. */
+  selectObjects: (ids: readonly string[], additive: boolean) => void
   deselectAll: () => void
   setHovered: (id: string | null) => void
+  setTreeHover: (ids: readonly string[]) => void
   setSelectionMode: (mode: SelectionMode) => void
   addSubElementSelection: (sel: SubElementSelection) => void
   clearSubElementSelections: () => void
@@ -1080,6 +1097,7 @@ const sceneCreator: StateCreator<
     objectOrder: [],
     selectedIds: new Set(),
     hoveredId: null,
+    treeHoverIds: [],
     selectionMode: 'object',
     subElementSelections: [],
     hoveredSubElement: null,
@@ -1374,10 +1392,21 @@ const sceneCreator: StateCreator<
         return { selectedIds, subElementSelections: [] }
       }),
 
+    selectObjects: (ids, additive) =>
+      set((state) => {
+        if (state.selectionMode !== 'object') {
+          return state
+        }
+        const selectedIds = new Set(additive ? state.selectedIds : [])
+        for (const id of ids) selectedIds.add(id)
+        return { selectedIds, subElementSelections: [] }
+      }),
+
     deselectAll: () =>
       set({ selectedIds: new Set(), subElementSelections: [] }),
 
     setHovered: (id) => set({ hoveredId: id }),
+    setTreeHover: (ids) => set({ treeHoverIds: ids }),
 
     setSelectionMode: (mode) =>
       set({ selectionMode: mode, subElementSelections: [], hoveredSubElement: null }),

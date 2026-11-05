@@ -16,6 +16,8 @@ import { ScrollArea } from '@/components/ui/scroll-area'
 import { cn } from '@/lib/utils'
 import { CreateDatumDialog } from '@/components/panels/CreateDatumDialog'
 import { FeatureTreeBody } from '@/components/panels/FeatureTree'
+import { AssemblyBrowser } from '@/components/panels/AssemblyBrowser'
+import { buildAssemblyTree } from '@/lib/assembly-tree'
 
 const API_BASE = import.meta.env.VITE_API_URL || ''
 
@@ -927,10 +929,26 @@ export function ModelTree({
   //   3. Standalone sketches — sessions that haven't been extruded
   //      yet. Once extrusion runs they migrate under the resulting
   //      body automatically on the next render.
-  const localNodes = sceneToNodes(objects, objectOrder)
+  // Imported assemblies get their own PRODUCT TREE (file → sub-assemblies →
+  // parts, repeats folded to ×N). Their parts are drawn there and nowhere
+  // else, so they are filtered out of the flat sections below.
+  const assemblyTree = useMemo(
+    () =>
+      buildAssemblyTree(
+        objectOrder.flatMap((id) => {
+          const o = objects.get(id)
+          return o ? [{ id: o.id, name: o.name, sound: o.sound, assembly: o.assembly }] : []
+        }),
+      ),
+    [objects, objectOrder],
+  )
+  const inAssembly = (id: string) => objects.get(id)?.assembly !== undefined
+  const localNodes = sceneToNodes(objects, objectOrder).filter((n) => !inAssembly(n.id))
   const allSketchNodes = sketchesToNodes(serverSketches, hiddenSketchIds)
   const baseObjectNodes =
-    backendNodes && backendNodes.length > 0 ? backendNodes : localNodes
+    backendNodes && backendNodes.length > 0
+      ? backendNodes.filter((n) => !inAssembly(n.id))
+      : localNodes
   const datumNodes = datumsToNodes(datums)
 
   // Split sketches into "owned" (parent body exists in the scene) and
@@ -1170,13 +1188,21 @@ export function ModelTree({
       </div>
       {expanded && mode === 'browser' && (
         <ScrollArea id="browser-tree" className="flex-1 min-h-0">
-          {treeNodes.length === 0 ? (
+          {treeNodes.length === 0 && assemblyTree.roots.length === 0 ? (
             <div className="p-3 text-[12px] text-muted-foreground/60 text-center font-mono">
               ∅ empty document — add a primitive from the toolbar,
               sketch on a plane, or drop a STEP file
             </div>
           ) : (
             <div className="py-1 px-1">
+              {assemblyTree.roots.length > 0 && (
+                <AssemblyBrowser
+                  roots={assemblyTree.roots}
+                  onPartContextMenu={(e, id, name) =>
+                    handleNodeContextMenu(e, { id, name, type: 'part', symbol: '◆' })
+                  }
+                />
+              )}
               {[
                 { key: null as SolidClass | null, label: null, nodes: datumNodes },
                 ...sections.map((s: Section) => ({ key: s.key as SolidClass | null, label: s.label as string | null, nodes: s.nodes })),

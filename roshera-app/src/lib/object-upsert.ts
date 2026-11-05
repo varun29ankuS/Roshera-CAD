@@ -39,6 +39,11 @@ export function mergeObjectCreated(
       visible: existing.visible,
       locked: existing.locked,
       parentId: existing.parentId,
+      // Where the part sits in its assembly does not change when its geometry
+      // does; an update frame that omits it must not erase it. `sound` is
+      // deliberately NOT carried over: new geometry makes the old verdict
+      // stale, so it is whatever this frame says (absent = not yet known).
+      assembly: incoming.assembly ?? existing.assembly,
     },
     announceAsNew: false,
     echoMessage: null,
