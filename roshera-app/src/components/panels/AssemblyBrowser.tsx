@@ -223,7 +223,9 @@ const ContainerRow = memo(function ContainerRow({
       <button
         type="button"
         onClick={toggleVisible}
+        disabled={ids.length === 0}
         className={cn(
+          ids.length === 0 && 'invisible',
           'w-3 shrink-0 text-center opacity-0 transition-opacity group-hover:opacity-100',
           anyVisible ? 'text-foreground/60 hover:text-foreground' : 'text-orange-500 opacity-100',
         )}
@@ -347,6 +349,11 @@ function MissingRow({
  *  `✗7` read as "×7" (seven copies) or "7 missing", when it meant "7 parts
  *  rendered but not sound". */
 function Verdict({ sound, unsound, total }: { sound: number; unsound: number; total: number }) {
+  // Nothing beneath exists (every use failed to import): there is nothing to
+  // call sound — an empty ✓ would claim a verdict about parts that are absent.
+  if (total === 0) {
+    return <span className="w-9 shrink-0" />
+  }
   if (unsound > 0) {
     return (
       <span
