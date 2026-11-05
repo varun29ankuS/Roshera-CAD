@@ -47,12 +47,18 @@ jobs:
         sudo apt-get install -y pkg-config
 
     - name: Run criterion benchmarks
-      run: |
-        if cargo bench --workspace --no-run 2>/dev/null; then
-          cargo bench --workspace
-        else
-          echo "No benchmarks found, skipping"
-        fi
+      # The bench targets live in geometry-engine and assembly-engine
+      # (ai-integration's needs the mock-providers feature, and none are
+      # registered elsewhere). `--workspace` also compiled api-server and the
+      # vendored goose in release with full debuginfo, and the runner was
+      # killed mid-build (exit 143). The old `--no-run 2>/dev/null || echo
+      # "No benchmarks found"` guard hid that a build failure is a failure:
+      # until 2026-11-04 every green run of this job was that silent skip
+      # (the lib build failed on Linux), not a benchmark run. A failed build
+      # now fails the job.
+      env:
+        CARGO_PROFILE_BENCH_DEBUG: "false"
+      run: cargo bench -p geometry-engine -p assembly-engine --benches
       working-directory: ./roshera-backend
 
   memory-profile:
