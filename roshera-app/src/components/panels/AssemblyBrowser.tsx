@@ -302,25 +302,35 @@ const PartRow = memo(function PartRow({
   )
 })
 
-/** Tick / cross, not prose: ✓ when every part beneath is sound, ✗N when any
- *  is not, a dim · when nothing beneath has been certified yet. */
+/** ✓ when every part beneath is sound; an amber ⚠N when N are not; a dim ·
+ *  when nothing beneath has been certified yet. The warning is deliberately
+ *  a different SHAPE and colour from the `×N` use-count beside it — a red
+ *  `✗7` read as "×7" (seven copies) or "7 missing", when it meant "7 parts
+ *  rendered but not sound". */
 function Verdict({ sound, unsound, total }: { sound: number; unsound: number; total: number }) {
   if (unsound > 0) {
     return (
-      <span className="w-8 shrink-0 text-right text-destructive" title={`${unsound} of ${total} not sound`}>
-        ✗{total > 1 ? unsound : ''}
+      <span
+        className="w-9 shrink-0 text-right text-amber-500"
+        title={
+          total > 1
+            ? `${unsound} of ${total} parts not sound (they render, but fail the kernel's check — usually faces that did not import)`
+            : 'not sound (renders, but fails the kernel check — usually faces that did not import)'
+        }
+      >
+        ⚠{total > 1 ? unsound : ''}
       </span>
     )
   }
   if (sound === total) {
     return (
-      <span className="w-8 shrink-0 text-right text-emerald-600 dark:text-emerald-400" title="sound">
+      <span className="w-9 shrink-0 text-right text-emerald-600 dark:text-emerald-400" title="sound">
         ✓
       </span>
     )
   }
   return (
-    <span className="w-8 shrink-0 text-right text-muted-foreground/40" title="not certified yet">
+    <span className="w-9 shrink-0 text-right text-muted-foreground/40" title="not certified yet">
       ·
     </span>
   )
