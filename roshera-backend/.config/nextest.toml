@@ -21,3 +21,16 @@ slow-timeout = { period = "60s", terminate-after = 5 }
 [[profile.default.overrides]]
 filter = 'test(torus_boolean_is_deterministic)'
 slow-timeout = { period = "120s", terminate-after = 5 }
+
+# #35 / #7 curved-boolean ACCEPTANCE tests: each builds the cross-bore or
+# sphere-bite solid and then checks its volume against a dense-mesh oracle,
+# which at opt-level 0 is minutes of honest work, not a hang. Measured
+# locally 2026-11-05 (debug, no debuginfo): diff_intersecting_unequal_bores_35
+# 312 s; diff_skew_perp_bores_35 + unequal_bores_near_tangent_35 1056 s run
+# as a pair; diff_cyl_offaxis_sphere_bite_seam_7 569 s. All PASS. Under the
+# 5-min backstop all four were killed on their first full CI run. A 25-min
+# leash (300 s warn x 5) keeps them on every push without weakening the
+# oracle bars; the 5-min backstop still applies to everything else.
+[[profile.default.overrides]]
+filter = 'test(diff_intersecting_unequal_bores_35) | test(diff_skew_perp_bores_35) | test(unequal_bores_near_tangent_35) | test(diff_cyl_offaxis_sphere_bite_seam_7)'
+slow-timeout = { period = "300s", terminate-after = 5 }
