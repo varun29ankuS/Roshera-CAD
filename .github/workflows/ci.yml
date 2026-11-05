@@ -572,10 +572,20 @@ jobs:
       run: |
         sudo apt-get update
         sudo apt-get install -y pkg-config
-    
+
+    - name: Free disk space
+      # Two release builds of geometry-engine (base + head) on a cold cache;
+      # same cleanup the Test Suite and benchmark jobs use.
+      run: |
+        sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+          /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+          /usr/local/lib/node_modules 2>/dev/null || true
+        sudo docker image prune -af 2>/dev/null || true
+        df -h /
+
     - name: Install Rust
       uses: dtolnay/rust-toolchain@stable
-    
+
     - name: Cache cargo dependencies
       uses: actions/cache@v3
       with:
@@ -584,34 +594,42 @@ jobs:
           ~/.cargo/git
           target
         key: ${{ runner.os }}-perf-${{ hashFiles('**/Cargo.lock') }}
-    
+
     - name: Install critcmp
-      run: cargo install critcmp
-    
-    - name: Run benchmark baseline
+      run: cargo install critcmp --locked
+
+    # Report-only: the job fails when a benchmark fails to BUILD or RUN, and
+    # prints the base-vs-PR comparison; it does not fail on a slowdown.
+    #
+    # Previously each step wrapped the build in `--no-run 2>/dev/null || echo
+    # "No benchmarks found"` (a build failure became a green skip), and the
+    # comparison was gated on `target/criterion/main`, a directory Criterion
+    # never creates (baselines live per benchmark, under
+    # target/criterion/<group>/<bench>/main), so critcmp never ran.
+    - name: Run benchmark baseline (PR base)
+      env:
+        CARGO_PROFILE_BENCH_DEBUG: "false"
       run: |
         git checkout ${{ github.event.pull_request.base.sha }}
-        # Check if benchmark exists before running
-        if cargo bench --bench geometry_bench --no-run 2>/dev/null; then
-          cargo bench --bench geometry_bench -- --save-baseline main --output-format bencher | tee bench-results.json
+        if [ -f geometry-engine/benches/geometry_bench.rs ]; then
+          cargo bench -p geometry-engine --bench geometry_bench -- --save-baseline main
         else
-          echo "No benchmarks found in base branch"
-          echo '{"results": []}' > bench-results.json
+          # A base commit from before the bench existed: there is honestly
+          # nothing to compare against. Say so; the PR run still has to build.
+          echo "::notice::PR base has no geometry_bench; comparison will be skipped"
         fi
       working-directory: ./roshera-backend
-    
-    - name: Run benchmark comparison
+
+    - name: Run benchmark comparison (PR head)
+      env:
+        CARGO_PROFILE_BENCH_DEBUG: "false"
       run: |
         git checkout ${{ github.event.pull_request.head.sha }}
-        # Check if benchmark exists before running
-        if cargo bench --bench geometry_bench --no-run 2>/dev/null; then
-          cargo bench --bench geometry_bench -- --save-baseline pr --output-format bencher | tee bench-results.json
-          if [ -d target/criterion/main ]; then
-            critcmp main pr || echo "Benchmark comparison skipped"
-          fi
+        cargo bench -p geometry-engine --bench geometry_bench -- --save-baseline pr
+        if find target/criterion -mindepth 2 -type d -name main 2>/dev/null | grep -q .; then
+          critcmp main pr
         else
-          echo "No benchmarks found in PR branch"
-          echo '{"results": []}' > bench-results.json
+          echo "::notice::no base baseline saved; comparison skipped"
         fi
       working-directory: ./roshera-backend
 
