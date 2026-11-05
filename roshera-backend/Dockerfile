@@ -14,10 +14,13 @@
 # ---------------------------------------------------------------------------
 # Build stage
 # ---------------------------------------------------------------------------
-# Edition 2021 across the workspace (api-server/Cargo.toml: edition = "2021");
-# a current stable toolchain on bookworm keeps the builder glibc aligned with
-# the bookworm-slim runtime below.
-FROM rust:1.84-bookworm AS builder
+# Roshera's own crates are edition 2021, but api-server links the vendored
+# goose (vendor/goose, rust-version = "1.94.1"), whose dependencies include
+# edition-2024 crates (agent-client-protocol-derive): Cargo 1.84 refuses to
+# parse them ("feature `edition2024` is required"). The builder therefore
+# matches goose's declared minimum. Bookworm keeps the builder glibc aligned
+# with the bookworm-slim runtime below.
+FROM rust:1.94.1-bookworm AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config \
