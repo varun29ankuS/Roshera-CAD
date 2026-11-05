@@ -7576,6 +7576,11 @@ async fn scene_snapshot(
                 "rotation":    [0.0, 0.0, 0.0, 1.0],
                 "scale":       [1.0, 1.0, 1.0],
             },
+            // Same state the live `ObjectCreated` push declares. The client
+            // reads these verbatim: omitting them hydrated every part HIDDEN
+            // on page load.
+            "visible": true,
+            "locked":  false,
         }));
     }
 

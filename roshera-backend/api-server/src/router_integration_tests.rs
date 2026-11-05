@@ -6841,6 +6841,47 @@ async fn snapshot_names(state: &AppState) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Every object a (re)connecting client hydrates from `/api/scene/snapshot`
+/// must say it is VISIBLE (and unlocked), exactly like the live
+/// `ObjectCreated` push. The snapshot used to omit both fields; the viewport
+/// reads `visible` verbatim, so every part loaded on page open (e.g. the 327
+/// placed parts of an imported assembly) came in hidden.
+#[tokio::test]
+async fn scene_snapshot_objects_are_visible_and_unlocked() {
+    let state = make_test_state().await;
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/api/geometry/cylinder")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({
+                "center": [0.0, 0.0, 0.0],
+                "axis":   [0.0, 0.0, 1.0],
+                "radius": 5.0,
+                "height": 10.0,
+                "name":   "pin",
+            })
+            .to_string(),
+        ))
+        .expect("request must build");
+    let (status, body) = dispatch(&state, request).await;
+    assert_eq!(status, StatusCode::OK, "create must succeed; body = {body}");
+
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri("/api/scene/snapshot")
+        .body(Body::empty())
+        .expect("static request must build");
+    let (status, snap) = dispatch(&state, request).await;
+    assert_eq!(status, StatusCode::OK, "snapshot must serve; body = {snap}");
+    let objects = snap["objects"].as_array().expect("objects array");
+    assert!(!objects.is_empty(), "the created part is in the snapshot");
+    for o in objects {
+        assert_eq!(o["visible"], true, "snapshot object must be visible: {o}");
+        assert_eq!(o["locked"], false, "snapshot object must be unlocked: {o}");
+    }
+}
+
 /// A display name given at create must be written into the kernel solid
 /// (`Solid::name`), not just carried on the WS push: `/api/scene/snapshot`
 /// derives names from the kernel and previously fell back to `solid_{id}`,

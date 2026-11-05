@@ -151,8 +151,10 @@ function convertCADObject(proto: ProtocolCADObject): CADObject {
     position,
     rotation,
     scale,
-    visible: proto.visible,
-    locked: proto.locked,
+    // A payload that does not SAY a part is hidden must not hide it: an
+    // omitted flag once hydrated every part of a page load invisible.
+    visible: proto.visible ?? true,
+    locked: proto.locked ?? false,
     parentId: proto.parent,
   }
 }
