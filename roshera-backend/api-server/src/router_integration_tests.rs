@@ -397,62 +397,33 @@ async fn seed_box(state: &AppState, size: f64) -> (Uuid, SolidId, [EdgeId; 3]) {
     (uuid, solid_id, corner_edges)
 }
 
-/// F4a — a reconnecting client's scene resync ships each object as a
-/// colourless `ObjectCreated`; the registry colour was dropped, so a part
-/// coloured before a reload came back grey. `current_scene_frames` must now
-/// re-emit the registered colour as an `ObjectColor` frame so the live path
-/// (which already works) repaints it.
+/// A part coloured before a reload must come back in its colour from the
+/// SNAPSHOT alone — the one path a (re)connecting client hydrates from. The
+/// colour used to ride only on a connect-time `ObjectColor` replay frame.
 #[tokio::test]
-async fn scene_resync_replays_registered_colour() {
+async fn scene_snapshot_carries_the_registered_colour() {
     let state = make_test_state().await;
     let (uuid, solid_id, _edges) = seed_box(&state, 10.0).await;
-    state.solid_colors.insert(solid_id, [200, 80, 60]);
+    state.solid_colors.insert(solid_id, [255, 0, 51]);
 
-    let frames = crate::current_scene_frames(&state).await;
-    assert!(
-        frames.iter().any(|f| {
-            f.contains("\"type\":\"ObjectColor\"")
-                && f.contains(&uuid.to_string())
-                && f.contains("200")
-        }),
-        "F4a: scene-resync frames must include an ObjectColor for the coloured \
-         solid so it isn't grey after reload; got {} frame(s): {}",
-        frames.len(),
-        frames.join(" | ")
-    );
-}
-
-/// The connect-time scene replay ships every part again as `ObjectCreated`,
-/// and the client MERGES those into the parts its snapshot already loaded.
-/// They must carry what the snapshot carries — the part's assembly place and
-/// its cached soundness verdict — or the merge erases both: measured on the
-/// robot-arm import, 301 replay frames after load left the browser tree
-/// showing "not certified" for parts the server had certified.
-#[tokio::test]
-async fn scene_resync_frames_carry_assembly_and_soundness() {
-    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../export-engine/tests/fixtures/two_cube_assembly.step");
-    let state = make_test_state().await;
-    let request = import_step_post(json!({ "path": fixture.to_string_lossy().to_string() }));
-    let (status, body) = dispatch(&state, request).await;
-    assert_eq!(status, StatusCode::OK, "import must succeed; body = {body}");
-
-    let frames = crate::current_scene_frames(&state).await;
-    let created: Vec<Value> = frames
-        .iter()
-        .filter_map(|f| serde_json::from_str::<Value>(f).ok())
-        .filter(|v| v["type"] == "ObjectCreated")
-        .collect();
-    assert_eq!(created.len(), 2, "one replay frame per part");
-    for f in created {
-        let p = &f["payload"];
-        assert_eq!(
-            p["assembly"]["path"],
-            json!(["asm"]),
-            "replay carries assembly: {p}"
-        );
-        assert_eq!(p["sound"], true, "replay carries the cached verdict");
-    }
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri("/api/scene/snapshot")
+        .body(Body::empty())
+        .expect("static request must build");
+    let (status, snap) = dispatch(&state, request).await;
+    assert_eq!(status, StatusCode::OK);
+    let obj = snap["objects"]
+        .as_array()
+        .and_then(|a| a.iter().find(|o| o["id"] == uuid.to_string()))
+        .unwrap_or_else(|| panic!("coloured part missing from snapshot: {snap}"));
+    let rgba = obj["material"]["diffuse_color"]
+        .as_array()
+        .unwrap_or_else(|| panic!("snapshot object carries no material colour: {obj}"));
+    let channel = |i: usize| rgba[i].as_f64().unwrap_or(-1.0);
+    assert!((channel(0) - 1.0).abs() < 1e-9, "red 255 → 1.0: {obj}");
+    assert!(channel(1).abs() < 1e-9, "green 0 → 0.0");
+    assert!((channel(2) - 0.2).abs() < 1e-9, "blue 51 → 0.2");
 }
 
 /// Seed a `size × size × size` box and return three *mutually

@@ -7621,6 +7621,24 @@ async fn scene_snapshot(
             // not certified since it last changed; never computed here).
             "assembly": model.solid_occurrence(solid_id),
             "sound":    model.cached_soundness(solid_id),
+            // The part's registered colour (`set_part_color`), so the
+            // snapshot alone restores it — it is the one path a
+            // (re)connecting client hydrates from. Absent → client default.
+            "material": state.solid_colors.get(&solid_id).map(|c| {
+                let [r, g, b] = *c;
+                serde_json::json!({
+                    "diffuse_color": [
+                        f64::from(r) / 255.0,
+                        f64::from(g) / 255.0,
+                        f64::from(b) / 255.0,
+                        1.0,
+                    ],
+                    "metallic":  0.1,
+                    "roughness": 0.8,
+                    "emission":  [0.0, 0.0, 0.0],
+                    "name":      "registered",
+                })
+            }),
         }));
     }
 
@@ -8488,131 +8506,6 @@ fn compute_bbox_and_center(vertices: &[f32]) -> ([f32; 3], [f32; 3], [f32; 3]) {
         (min[2] + max[2]) * 0.5,
     ];
     (min, max, center)
-}
-
-/// Build the wire `ObjectCreated` JSON for a single (`uuid`, kernel
-/// solid) pair, ready to ship over WebSocket. Frame shape is identical
-/// to what `broadcast_object_created` emits — same key set, same
-/// snake_case naming — so the frontend's `cadObjectSchema` parses it
-/// without divergence.
-///
-/// Used by `current_scene_frames` to repaint a freshly-connected
-/// client's viewport / ModelTree with the geometry that already lives
-/// in the kernel. Returns `None` when tessellation yields zero
-/// triangles (degenerate solid that wouldn't render anyway).
-fn build_object_created_frame(
-    uuid: uuid::Uuid,
-    solid_id: u32,
-    solid: &geometry_engine::primitives::solid::Solid,
-    model: &geometry_engine::primitives::topology_builder::BRepModel,
-) -> Option<String> {
-    use geometry_engine::tessellation::{tessellate_solid, TessellationParams};
-    let mesh = tessellate_solid(solid, model, &TessellationParams::default());
-    if mesh.triangles.is_empty() {
-        return None;
-    }
-    let (vertices, indices, normals, face_ids) = flatten_tri_mesh(&mesh);
-    let (bbox_min, bbox_max, center) = compute_bbox_and_center(&vertices);
-    let name = solid
-        .name
-        .clone()
-        .unwrap_or_else(|| format!("Solid {}", solid_id));
-    let now = chrono::Utc::now().timestamp_millis();
-    let frame = serde_json::json!({
-        "type": "ObjectCreated",
-        "payload": {
-            "id": uuid.to_string(),
-            "name": name,
-            "mesh": {
-                "vertices": vertices,
-                "indices":  indices,
-                "normals":  normals,
-                "face_ids": face_ids,
-            },
-            "analytical_geometry": {
-                "solid_id":       solid_id,
-                "primitive_type": "mesh",
-                "parameters":     serde_json::Value::Null,
-                "properties": {
-                    "volume":         0.0,
-                    "surface_area":   0.0,
-                    "bounding_box":   { "min": bbox_min, "max": bbox_max },
-                    "center_of_mass": center,
-                }
-            },
-            "transform": {
-                "translation": [0.0_f32, 0.0, 0.0],
-                "rotation":    [0.0, 0.0, 0.0, 1.0],
-                "scale":       [1.0, 1.0, 1.0],
-            },
-            "material": {
-                "diffuse_color": [0.7, 0.7, 0.75, 1.0],
-                "metallic":      0.1,
-                "roughness":     0.8,
-                "emission":      [0.0, 0.0, 0.0],
-                "name":          "default",
-            },
-            "visible":     true,
-            "locked":      false,
-            "children":    [],
-            "metadata":    {},
-            "created_at":  now,
-            "modified_at": now,
-            // Same as `/api/scene/snapshot`: the client merges these replay
-            // frames into parts it already loaded, so a field left out here
-            // is a field erased there.
-            "assembly":    model.solid_occurrence(solid_id),
-            "sound":       model.cached_soundness(solid_id),
-        }
-    });
-    serde_json::to_string(&frame).ok()
-}
-
-/// Serialize the current kernel scene as a vector of `ObjectCreated`
-/// JSON frames, one per registered (uuid, solid_id) pair. Sent to
-/// freshly-connecting WebSocket clients so a frontend reload repaints
-/// the existing scene instead of staring at an empty viewport.
-///
-/// Walks `state.local_to_uuid` rather than `model.solids` so we only
-/// emit frames for solids that have a public UUID — kernel-internal
-/// scratch solids (none today, but a hedge against future use) stay
-/// invisible to the wire.
-pub(crate) async fn current_scene_frames(state: &AppState) -> Vec<String> {
-    // NOTE: WS on-connect helper — no ActiveModel header available, stays on
-    // legacy default model until WS handshake learns to thread X-Roshera-Part-Id.
-    let legacy_model = &state.model;
-    let model = legacy_model.read().await;
-    let mut frames = Vec::new();
-    for entry in state.local_to_uuid.iter() {
-        let solid_id = *entry.key();
-        let uuid = *entry.value();
-        let Some(solid) = model.solids.get(solid_id) else {
-            continue;
-        };
-        if let Some(text) = build_object_created_frame(uuid, solid_id, solid, &model) {
-            frames.push(text);
-            // F4a — the ObjectCreated frame carries the default material; the
-            // registry colour lives separately (set_part_color → solid_colors)
-            // and is normally applied by a live ObjectColor broadcast. On a
-            // reconnect/resync that broadcast is in the past, so re-emit it here
-            // — otherwise a part coloured before a reload comes back grey. Reuses
-            // the proven ObjectColor path (frontend `setObjectColor`); no-op when
-            // the solid has no registered colour.
-            if let Some(color) = state.solid_colors.get(&solid_id) {
-                let color_frame = serde_json::json!({
-                    "type": "ObjectColor",
-                    "payload": {
-                        "object_id": uuid.to_string(),
-                        "color": *color,
-                    }
-                });
-                if let Ok(color_text) = serde_json::to_string(&color_frame) {
-                    frames.push(color_text);
-                }
-            }
-        }
-    }
-    frames
 }
 
 /// Build an `ObjectCreated` frame matching `roshera-app/src/lib/ws-schemas.ts`
