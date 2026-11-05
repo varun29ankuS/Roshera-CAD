@@ -1,0 +1,15 @@
+# Build-context filter for roshera-backend/Dockerfile (BuildKit reads
+# <Dockerfile>.dockerignore in preference to the context's .dockerignore).
+#
+# The context is the REPO ROOT, because api-server compiles in
+# roshera-agent-policy.md from there (goose_acp.rs: include_str! of
+# CARGO_MANIFEST_DIR/../../roshera-agent-policy.md). This is an ALLOWLIST:
+# only the backend workspace and that one file are sent, never roshera-app,
+# node_modules or a local target/ (which has reached 85 GB).
+*
+!roshera-agent-policy.md
+!roshera-backend/
+roshera-backend/target/
+roshera-backend/**/target/
+roshera-backend/exports/
+roshera-backend/**/*.log

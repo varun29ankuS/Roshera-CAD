@@ -2,7 +2,11 @@ version: '3.8'
 
 services:
   api-server:
-    build: .
+    build:
+      # Repo root: the image compiles in roshera-agent-policy.md from there
+      # (Dockerfile.dockerignore next to the Dockerfile limits what is sent).
+      context: ..
+      dockerfile: roshera-backend/Dockerfile
     ports:
       - "3000:3000"
       - "9090:9090"

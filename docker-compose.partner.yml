@@ -38,8 +38,10 @@ services:
 
   backend:
     build:
-      context: ./roshera-backend
-      dockerfile: Dockerfile
+      # Repo root: the image compiles in roshera-agent-policy.md from there
+      # (roshera-backend/Dockerfile.dockerignore limits what is sent).
+      context: .
+      dockerfile: roshera-backend/Dockerfile
     image: ghcr.io/varun29ankus/roshera-cad:latest
     restart: unless-stopped
     depends_on:

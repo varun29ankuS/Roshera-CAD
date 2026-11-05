@@ -677,7 +677,9 @@ jobs:
     - name: Build and push backend image
       uses: docker/build-push-action@v6
       with:
-        context: ./roshera-backend
+        # Repo root: the image compiles in roshera-agent-policy.md from there.
+        # roshera-backend/Dockerfile.dockerignore limits what is sent.
+        context: .
         file: ./roshera-backend/Dockerfile
         push: true
         tags: |

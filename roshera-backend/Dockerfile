@@ -36,7 +36,13 @@ WORKDIR /usr/src/roshera
 # assembly-engine — the previous Dockerfile still listed a non-existent
 # rag-engine), and a stale manifest list silently breaks the cache layer.
 # BuildKit cache mounts below give us dependency caching without that fragility.
-COPY . .
+#
+# Build context = the REPO ROOT (filtered to these two paths by
+# Dockerfile.dockerignore): api-server compiles in the agent policy with
+# include_str!("<api-server>/../../roshera-agent-policy.md"), i.e. one level
+# above the workspace, so the policy lands at /usr/src.
+COPY roshera-backend/ .
+COPY roshera-agent-policy.md /usr/src/roshera-agent-policy.md
 
 # Build only the server binary (and exactly its dependency graph) in release.
 # --mount=type=cache keeps the cargo registry and the target dir warm across
