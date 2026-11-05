@@ -179,6 +179,15 @@ export function CADViewport() {
         // flags become no-ops. (A cheap baked contact shadow can be added later
         // if grounding is wanted — without the per-frame multi-mesh shadow pass.)
         shadows={false}
+        // Render on demand, not every frame. The default `'always'` loop
+        // re-walked every mesh, its edge outline and the selection-outline
+        // pass ~60×/s even with nothing moving — measured on the 327-part
+        // robot-arm import (2026-11-05): main thread 96% busy while idle.
+        // React prop changes, OrbitControls (incl. damping) and drei's
+        // TransformControls request frames themselves; code that moves the
+        // camera outside React calls `invalidate()` (CameraController's fly-to,
+        // shortcuts' focusSelected).
+        frameloop="demand"
         dpr={[1, 2]}
         gl={{ antialias: true, alpha: true, powerPreference: 'high-performance' }}
         onCreated={handleCreated}

@@ -83,6 +83,11 @@ export function CameraController() {
   const controlsRef = useRef<OrbitControlsRef>(null)
   const animRef = useRef<CameraAnimation | null>(null)
   const { camera } = useThree()
+  // The canvas renders on demand (CADViewport `frameloop="demand"`): the
+  // fly-to animation below runs inside `useFrame`, which only fires on a
+  // requested frame, so starting one must request the first frame and each
+  // animated frame must request the next.
+  const invalidate = useThree((s) => s.invalidate)
   const perspRef = useRef<THREE.PerspectiveCamera>(null)
   const orthoRef = useRef<THREE.OrthographicCamera>(null)
 
@@ -164,6 +169,8 @@ export function CameraController() {
       }
     }
     controls.update()
+    invalidate()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [projection])
 
   useEffect(() => {
@@ -184,9 +191,10 @@ export function CameraController() {
       endUp: new THREE.Vector3(...pendingPreset.up),
       progress: 0,
     }
+    invalidate()
 
     clearPending()
-  }, [pendingPreset, camera, clearPending])
+  }, [pendingPreset, camera, clearPending, invalidate])
 
   // Sketch-plane look-at. Every CAD sketcher orients the view normal-to the
   // active sketch plane on entry so the 2D profile is face-on and EDITABLE —
@@ -236,7 +244,8 @@ export function CameraController() {
       endUp: up,
       progress: 0,
     }
-  }, [sketchActive, sketchPlane, sceneBounds, camera])
+    invalidate()
+  }, [sketchActive, sketchPlane, sceneBounds, camera, invalidate])
 
   // Auto-frame newly-created objects. ws-bridge sets this whenever a
   // brand-new object id appears in the scene (ObjectCreated, or a
@@ -329,8 +338,9 @@ export function CameraController() {
       endUp: camera.up.clone(),
       progress: 0,
     }
+    invalidate()
     setPendingFrameObject(null)
-  }, [pendingFrameObjectId, camera, setPendingFrameObject])
+  }, [pendingFrameObjectId, camera, setPendingFrameObject, invalidate])
 
   useFrame((_, delta) => {
     // Scene-adaptive clip planes, every frame. far must reach past the whole
@@ -374,6 +384,8 @@ export function CameraController() {
 
     if (t >= 1) {
       animRef.current = null
+    } else {
+      invalidate()
     }
   })
 

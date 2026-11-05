@@ -1,4 +1,5 @@
 import { useEffect } from 'react'
+import { invalidate } from '@react-three/fiber'
 import { useSceneStore } from '@/stores/scene-store'
 import { useWSStore } from '@/stores/ws-store'
 import { useCommandPaletteStore } from '@/stores/command-palette-store'
@@ -80,6 +81,9 @@ function focusSelected() {
   camera.position.copy(center).sub(direction.multiplyScalar(dist))
   camera.lookAt(center)
   camera.updateProjectionMatrix()
+  // The canvas renders on demand; a camera moved outside React must ask
+  // for the frame that shows it.
+  invalidate()
 }
 
 export function useKeyboardShortcuts() {
