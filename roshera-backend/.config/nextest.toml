@@ -29,8 +29,45 @@ slow-timeout = { period = "120s", terminate-after = 5 }
 # 312 s; diff_skew_perp_bores_35 + unequal_bores_near_tangent_35 1056 s run
 # as a pair; diff_cyl_offaxis_sphere_bite_seam_7 569 s. All PASS. Under the
 # 5-min backstop all four were killed on their first full CI run. A 25-min
-# leash (300 s warn x 5) keeps them on every push without weakening the
-# oracle bars; the 5-min backstop still applies to everything else.
+# leash (300 s warn x 5) runs them without weakening the oracle bars; the
+# 5-min backstop still applies to everything else. On CI they run in the
+# fortnightly full suite, not on every push (see [profile.ci] below).
 [[profile.default.overrides]]
 filter = 'test(diff_intersecting_unequal_bores_35) | test(diff_skew_perp_bores_35) | test(unequal_bores_near_tangent_35) | test(diff_cyl_offaxis_sphere_bite_seam_7)'
 slow-timeout = { period = "300s", terminate-after = 5 }
+
+# Per-push CI profile (`cargo nextest run --profile ci`, used by ci.yml):
+# everything EXCEPT the heavy tests below, which run in the FORTNIGHTLY full
+# suite (.github/workflows/full-test-suite.yml, default profile, every test).
+# Varun 2026-11-05: heavy kernel tests run fortnightly, not on every push.
+#
+# The list is every test that took >= 120 s in the first complete CI run
+# (7ce295a4, 2026-11-05; 8778/8778 passed, nextest 49 min). Tests run in
+# parallel, so the per-push wall time is set by the slowest single test: the
+# four bore/sphere booleans alone took 10-16 min each. Trade-off, stated
+# plainly: a regression in one of these is caught up to two weeks late, or
+# sooner by running the full-suite workflow by hand (workflow_dispatch).
+#
+# Locally nothing changes: `cargo test` and the default nextest profile run
+# every test. Adding a test here is a decision to test it less often — note
+# its measured CI time beside it.
+[profile.ci]
+default-filter = '''
+not (
+    test(=operations::boolean::tests::diff_skew_perp_bores_35)
+  | test(=operations::boolean::tests::diff_intersecting_unequal_bores_35)
+  | test(=operations::boolean::tests::unequal_bores_near_tangent_35)
+  | test(=diff_cyl_offaxis_sphere_bite_seam_7)
+  | test(=signed_area_2d_matches_exact_rational_oracle_on_adversarial_inputs)
+  | test(=orient3d_matches_exact_rational_oracle_on_adversarial_inputs)
+  | test(=insphere_matches_exact_rational_oracle_on_adversarial_inputs)
+  | test(=orient2d_matches_exact_rational_oracle_on_adversarial_inputs)
+  | test(=audio_processor_advanced::tests::test_noise_isolation)
+  | test(=curved_boolean_on_rotated_primitive_terminates)
+  | test(=replay::tests::mould_drill_diameter_rederives_downstream_and_preserves_references)
+  | test(=diff_box_boss_offaxis_sphere_7)
+  | test(=broaden_loft_varied_sections)
+)
+'''
+# Measured CI times (s), same order: 984 862 820 582 267 255 193 143 191 179
+# 160 132 126.

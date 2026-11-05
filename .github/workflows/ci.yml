@@ -36,11 +36,11 @@ jobs:
     # cap lets one cold run complete and warm the cache; warm runs finish in
     # ~10-15 min (revisit/lower this once green is observed).
     #
-    # 90 min (2026-11-05): the first run with every test executing in full
-    # (7ce295a4) passed 8778/8778, but nextest alone took 49 min (the four
-    # curved-boolean acceptance tests given a 25-min leash in
-    # .config/nextest.toml, plus the exact-predicate oracles at ~4.5 min) and
-    # the 60-min cap cancelled the job during the doctest pass that follows.
+    # 2026-11-05: the first run with every test executing in full (7ce295a4)
+    # passed 8778/8778 but nextest alone took 49 min, and the 60-min cap
+    # cancelled the doctests after it. The 13 heavy tests now run fortnightly
+    # (full-test-suite.yml) instead of here; 90 min stays as headroom for a
+    # cold-cache build.
     timeout-minutes: 90
 
     steps:
@@ -169,7 +169,9 @@ jobs:
         # with everything else again. The slow-timeout in .config/nextest.toml
         # remains as a backstop for any future hang.) Doctests last (nextest
         # does not run them).
-        cargo nextest run --workspace --no-fail-fast
+        # `--profile ci` leaves out the heavy kernel tests (each >= 2 min on
+        # CI); they run in the fortnightly full suite, full-test-suite.yml.
+        cargo nextest run --workspace --no-fail-fast --profile ci
         cargo test --workspace --doc --no-fail-fast
       working-directory: ./roshera-backend
 

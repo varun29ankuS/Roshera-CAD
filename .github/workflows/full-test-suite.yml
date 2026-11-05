@@ -1,0 +1,84 @@
+name: Full Test Suite (fortnightly)
+
+# Every test, including the heavy kernel tests the per-push CI leaves out
+# (the `[profile.ci]` default-filter in roshera-backend/.config/nextest.toml:
+# the cross-bore / sphere-bite boolean acceptance tests, the exact-predicate
+# oracles and the rest that take >= 2 min each on CI).
+#
+# Varun 2026-11-05: heavy tests run fortnightly. GitHub cron cannot express
+# "every 14 days", so this runs on the 1st and 15th of each month — at most
+# 16 days apart. Run it by hand (Actions → Full Test Suite → Run workflow)
+# before a release or after touching booleans, predicates or replay.
+
+on:
+  schedule:
+    - cron: '0 3 1,15 * *'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # Same build settings as ci.yml's Test Suite, so its cargo cache is reused.
+  CARGO_PROFILE_DEV_DEBUG: "false"
+  CARGO_PROFILE_TEST_DEBUG: "false"
+
+jobs:
+  full-suite:
+    name: Full Test Suite (all tests)
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
+    # The complete run measured 49 min of nextest on a warm build (7ce295a4);
+    # a cold build adds 30-40 min.
+    timeout-minutes: 150
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Free disk space
+      run: |
+        sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+          /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+          /usr/local/lib/node_modules 2>/dev/null || true
+        sudo docker image prune -af 2>/dev/null || true
+        df -h /
+
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y pkg-config mold
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Cache cargo dependencies
+      uses: actions/cache@v3
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+    # api-server's goose tests spawn roshera-mcp/dist/index.js.
+    - name: Setup Node.js (for roshera-mcp dist)
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+        cache: 'npm'
+        cache-dependency-path: roshera-mcp/package-lock.json
+
+    - name: Build roshera-mcp dist
+      run: npm ci && npm run build
+      working-directory: ./roshera-mcp
+
+    - name: Install cargo-nextest
+      uses: taiki-e/install-action@v2
+      with:
+        tool: nextest
+
+    - name: Run every test (nextest, default profile)
+      # The default profile has no default-filter, so nothing is left out;
+      # its per-test slow-timeout overrides give the heavy tests their leash.
+      run: cargo nextest run --workspace --no-fail-fast
+      working-directory: ./roshera-backend
