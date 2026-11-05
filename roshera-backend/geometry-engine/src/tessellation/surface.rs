@@ -5090,15 +5090,9 @@ fn tessellate_torus_two_circle_band(
         let Some(l) = model.loops.get(lid) else {
             return false;
         };
-        if l.edges.len() != 1 {
-            return false;
-        }
-        let Some(e) = model.edges.get(l.edges[0]) else {
-            return false;
-        };
-        if e.start_vertex != e.end_vertex {
-            return false;
-        }
+        // One closed circle edge (STEP) or a chain of arcs of one circle (a
+        // boolean pre-splits its cut circles): either way the samples must go
+        // once round the axis on a single latitude circle, checked below.
         let ring = loop_rim_samples(l, model, cache);
         if ring.len() < 3 {
             return false;
@@ -5113,6 +5107,21 @@ fn tessellate_torus_two_circle_band(
             if on_tube.abs() > tol || (a - a0).abs() > tol || (rho - rho0).abs() > tol {
                 return false;
             }
+        }
+        let Ok(e1) = r0.normalize() else {
+            return false;
+        };
+        let e2 = axis.cross(&e1);
+        let turn: f64 = (0..ring.len())
+            .map(|i| {
+                let (_, ra) = frame(ring[i]);
+                let (_, rb) = frame(ring[(i + 1) % ring.len()]);
+                let d = rb.dot(&e2).atan2(rb.dot(&e1)) - ra.dot(&e2).atan2(ra.dot(&e1));
+                (d + std::f64::consts::PI).rem_euclid(std::f64::consts::TAU) - std::f64::consts::PI
+            })
+            .sum();
+        if (turn.abs() - std::f64::consts::TAU).abs() > 1e-3 {
+            return false;
         }
         rims.push(ring);
     }

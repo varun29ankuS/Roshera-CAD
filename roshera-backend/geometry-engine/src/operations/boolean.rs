@@ -1902,6 +1902,13 @@ fn analytic_surface_intersection_curves(
         // leaving the freeform face un-split and the boolean rejecting the
         // result. Routing the plane case here is the fix for #17.
         (Planar, Other) | (Other, Planar) => {
+            // A torus classifies as `Other`, so plane∘torus lands HERE, never in
+            // the `plane_torus_intersection` arm below. The axis-perpendicular
+            // section has an exact closed form (two latitude circles); every
+            // other plane∘torus keeps the general plane tracer.
+            if let Some(circles) = plane_torus_latitude_circles(surface_a, surface_b, tolerance)? {
+                return Ok(Some(circles));
+            }
             plane_general_intersection(surface_a, surface_b, tolerance).map(Some)
         }
         _ => {
@@ -4600,6 +4607,82 @@ fn compute_circle_cone_parameters(
     Ok(params)
 }
 
+/// A planar surface PERPENDICULAR to a torus's axis, at height `h`: the
+/// section is exactly two coaxial latitude circles of the tube, radii
+/// `R ± √(r² − h²)`. Emitted as exact `Circle`s — the torus latitude splitter
+/// keys on the `Circle` downcast, and a marched NURBS fit is what left the
+/// torus face mis-split (an unsound torus-minus-slab). A tangent plane
+/// (`|h| = r`) or a clear one (`|h| > r`) cuts nothing: `Some(vec![])`.
+/// `None` when the pair is not (planar, torus) or the plane is not
+/// perpendicular — the caller's existing path then applies unchanged.
+fn plane_torus_latitude_circles(
+    surface_a: &dyn Surface,
+    surface_b: &dyn Surface,
+    tolerance: &Tolerance,
+) -> OperationResult<Option<Vec<SurfaceIntersectionCurve>>> {
+    use crate::primitives::curve::Circle;
+    use crate::primitives::surface::Torus;
+
+    let (plane, torus, torus_is_b) = if let Some(t) = surface_b.as_any().downcast_ref::<Torus>() {
+        (surface_a, t, true)
+    } else if let Some(t) = surface_a.as_any().downcast_ref::<Torus>() {
+        (surface_b, t, false)
+    } else {
+        return Ok(None);
+    };
+    if !plane.is_planar(*tolerance) {
+        return Ok(None);
+    }
+    let pe = plane.evaluate_full(0.0, 0.0)?;
+    let (n, p0) = (pe.normal, pe.position);
+    let Ok(axis) = torus.axis.normalize() else {
+        return Ok(None);
+    };
+    if n.cross(&axis).magnitude() > tolerance.parallel_threshold() {
+        return Ok(None);
+    }
+    let (c, big_r, small_r) = (torus.center, torus.major_radius, torus.minor_radius);
+    let h = (p0 - c).dot(&axis);
+    if h.abs() >= small_r - tolerance.distance() {
+        return Ok(Some(vec![]));
+    }
+    let half = (small_r * small_r - h * h).sqrt();
+    let centre = c + axis * h;
+    let mut out = Vec::with_capacity(2);
+    for radius in [big_r + half, big_r - half] {
+        let circle = Circle::new(centre, axis, radius)?;
+        let params_plane = compute_circle_plane_parameters(&circle, p0, n)?;
+        let params_torus = compute_circle_torus_parameters(&circle, torus)?;
+        let (params_a, params_b) = if torus_is_b {
+            (params_plane, params_torus)
+        } else {
+            (params_torus, params_plane)
+        };
+        out.push(SurfaceIntersectionCurve {
+            curve: Box::new(circle),
+            on_surface_a: create_parametric_curve(&params_a),
+            on_surface_b: create_parametric_curve(&params_b),
+            crossings: Vec::new(),
+        });
+    }
+    Ok(Some(out))
+}
+
+/// UV samples of a latitude circle on a torus, via the torus's `closest_point`.
+fn compute_circle_torus_parameters(
+    circle: &crate::primitives::curve::Circle,
+    torus: &crate::primitives::surface::Torus,
+) -> OperationResult<Vec<(f64, f64)>> {
+    let mut params = Vec::new();
+    const NUM_SAMPLES: usize = 32;
+    for i in 0..NUM_SAMPLES {
+        let angle = 2.0 * std::f64::consts::PI * (i as f64) / (NUM_SAMPLES as f64);
+        let point = circle.evaluate(angle)?;
+        params.push(torus.closest_point(&point.position, Tolerance::default())?);
+    }
+    Ok(params)
+}
+
 /// Find initial intersection points between surfaces
 /// Plane–torus intersection, sampled analytically (the marcher hangs on the
 /// torus oval — no iteration cap, never closes). For a plane PARALLEL to the
@@ -4632,6 +4715,10 @@ fn plane_torus_intersection(
     let c = torus.center;
     let axis = torus.axis;
     let (big_r, small_r) = (torus.major_radius, torus.minor_radius);
+
+    if let Some(circles) = plane_torus_latitude_circles(surface_a, surface_b, tolerance)? {
+        return Ok(circles);
+    }
 
     if n.dot(&axis).abs() > tolerance.parallel_threshold() {
         return march_surface_intersection(surface_a, surface_b, tolerance);
@@ -9310,6 +9397,250 @@ fn split_torus_face_by_ovals(
     Some(faces)
 }
 
+/// Torus face cut ONLY by latitude circles (from axis-perpendicular planes):
+/// the circles, sorted by tube angle `v` round the tube, cut it into seamless
+/// BANDS, one between each consecutive pair (cyclically). Each band is bounded
+/// by its two circles alone — the torus's own seam edges (meridian + equator)
+/// are interior to some band and drop out, which is why the DCEL walker (which
+/// works in the doubly-periodic `(u, v)` chart, where an iso-v circle has zero
+/// area) cannot assemble these faces.
+///
+/// Loop senses follow the face-on-the-LEFT rule seen from the face's outward
+/// side: at a rim, `n × t` points into the band. The two bands meeting at a
+/// circle therefore walk it in opposite directions, and the band mesher reads
+/// which tube arc each band covers from exactly this rule. Interior points sit
+/// at each band's mid tube angle. `None` unless every cut is a latitude circle
+/// of this (untrimmed) torus and there are at least two of them.
+fn split_torus_face_by_latitude_circles(
+    model: &BRepModel,
+    surface_id: SurfaceId,
+    face_id: FaceId,
+    origin_solid: SolidId,
+    graph: &IntersectionGraph,
+    cut_curves: &[CurveId],
+) -> Option<Vec<SplitFace>> {
+    use crate::primitives::curve::Circle;
+    use crate::primitives::surface::Torus;
+
+    let surface = model.surfaces.get(surface_id)?;
+    let torus = surface.as_any().downcast_ref::<Torus>()?;
+    if torus.param_limits.is_some() {
+        return None;
+    }
+    let axis = torus.axis.normalize().ok()?;
+    let (c, big_r, small_r) = (torus.center, torus.major_radius, torus.minor_radius);
+    let tol = crate::math::Tolerance::default()
+        .distance()
+        .max(1e-9 * (big_r + small_r));
+    let osign = model.faces.get(face_id)?.orientation.sign();
+    let tau = std::f64::consts::TAU;
+
+    let decline = |why: &str| {
+        if pipeline_trace_enabled() {
+            eprintln!("[bool]   torus latitude split declined: face={face_id:?}: {why}");
+        }
+    };
+    // A latitude circle of this torus: (height h, radius ρ, tube angle v).
+    let latitude = |cid: CurveId| -> Option<(f64, f64, f64)> {
+        let circle = model.curves.get(cid)?.as_any().downcast_ref::<Circle>()?;
+        if circle.normal().cross(&axis).magnitude() > 1e-9 {
+            return None;
+        }
+        let w = circle.center() - c;
+        let h = w.dot(&axis);
+        let rho = circle.radius();
+        if (w - axis * h).magnitude() > tol
+            || (((rho - big_r).powi(2) + h * h).sqrt() - small_r).abs() > tol
+        {
+            return None;
+        }
+        Some((h, rho, h.atan2(rho - big_r).rem_euclid(tau)))
+    };
+
+    // Only the WHOLE primitive torus face: no holes, and its boundary carries
+    // the meridian seam (a circle in a plane containing the axis). A band left
+    // by an earlier cut has no meridian, and banding it cyclically would
+    // invent a region outside the face.
+    let face = model.faces.get(face_id)?;
+    let has_meridian = face.inner_loops.is_empty()
+        && model.loops.get(face.outer_loop).is_some_and(|l| {
+            l.edges.iter().any(|&eid| {
+                model
+                    .edges
+                    .get(eid)
+                    .and_then(|e| model.curves.get(e.curve_id))
+                    .and_then(|cv| cv.as_any().downcast_ref::<Circle>().map(|ci| ci.normal()))
+                    .is_some_and(|nrm| nrm.dot(&axis).abs() < 1e-9)
+            })
+        });
+    if !has_meridian {
+        decline("not the whole torus face (no meridian seam, or holes)");
+        return None;
+    }
+
+    // Every CUT edge must lie on a latitude circle.
+    for ge in graph.edges.values() {
+        if ge.edge_type != EdgeType::Splitting {
+            continue;
+        }
+        let edge = model.edges.get(ge.edge_id)?;
+        if latitude(edge.curve_id).is_none() {
+            decline("a cut that is not a latitude circle");
+            return None;
+        }
+    }
+
+    // One band delimiter per cut curve, made of its own cut edges. A cut that
+    // left NO cut edge here was merged into a coincident boundary edge — a cut
+    // exactly through the torus's equator seam. The two copies of that circle
+    // (the seam on the torus, the cut on the other operand) are split at
+    // different points and do not weld, so banding with the seam's edges
+    // yields an open, unsound solid. Decline instead: the boolean then refuses
+    // with a typed error rather than returning a wrong solid.
+    let mut by_curve: std::collections::BTreeMap<CurveId, (f64, Vec<EdgeId>)> =
+        std::collections::BTreeMap::new();
+    for &cid in cut_curves {
+        let Some((_, _, v)) = latitude(cid) else {
+            decline("a cut curve that is not a latitude circle");
+            return None;
+        };
+        let eids: Vec<EdgeId> = graph
+            .edges
+            .values()
+            .filter(|ge| {
+                ge.edge_type == EdgeType::Splitting
+                    && model
+                        .edges
+                        .get(ge.edge_id)
+                        .is_some_and(|e| e.curve_id == cid)
+            })
+            .map(|ge| ge.edge_id)
+            .collect();
+        if eids.is_empty() {
+            decline("a cut circle coincides with the torus's equator seam (not supported)");
+            return None;
+        }
+        by_curve.insert(cid, (v, eids));
+    }
+    if by_curve.len() < 2 {
+        decline("fewer than two latitude cuts (one latitude circle cannot separate a torus)");
+        return None;
+    }
+
+    // Chain one circle's arcs into a closed loop.
+    let chain = |eids: &[EdgeId]| -> Option<Vec<(EdgeId, bool)>> {
+        let mut remaining: Vec<EdgeId> = eids.to_vec();
+        let first = remaining.remove(0);
+        let e0 = model.edges.get(first)?;
+        let start = e0.start_vertex;
+        let mut cur = e0.end_vertex;
+        let mut out = vec![(first, true)];
+        while !remaining.is_empty() {
+            let (i, fwd, next) = remaining.iter().enumerate().find_map(|(i, &eid)| {
+                let e = model.edges.get(eid)?;
+                if e.start_vertex == cur {
+                    Some((i, true, e.end_vertex))
+                } else if e.end_vertex == cur {
+                    Some((i, false, e.start_vertex))
+                } else {
+                    None
+                }
+            })?;
+            out.push((remaining.remove(i), fwd));
+            cur = next;
+        }
+        (cur == start).then_some(out)
+    };
+
+    let radial_unit = |p: Point3| {
+        let w = p - c;
+        (w - axis * w.dot(&axis)).normalize().ok()
+    };
+    let start_point = |(eid, fwd): (EdgeId, bool)| -> Option<Point3> {
+        let e = model.edges.get(eid)?;
+        let vid = if fwd { e.start_vertex } else { e.end_vertex };
+        let p = model.vertices.get_position(vid)?;
+        Some(Point3::new(p[0], p[1], p[2]))
+    };
+    // Orient a circle's loop so the band lies on its LEFT, the band leaving
+    // the circle toward increasing tube angle when `increasing`.
+    let orient = |lp: &[(EdgeId, bool)], increasing: bool| -> Option<Vec<(EdgeId, bool)>> {
+        let pts: Vec<Point3> = lp
+            .iter()
+            .map(|&oe| start_point(oe))
+            .collect::<Option<_>>()?;
+        if pts.len() < 3 {
+            return None;
+        }
+        let sense: f64 = (0..pts.len())
+            .map(|k| {
+                let a = pts[k] - c;
+                let b = pts[(k + 1) % pts.len()] - c;
+                let ra = a - axis * a.dot(&axis);
+                let rb = b - axis * b.dot(&axis);
+                ra.cross(&rb).dot(&axis)
+            })
+            .sum();
+        let p = pts[0];
+        let e = radial_unit(p)?;
+        let w = p - c;
+        let v = w
+            .dot(&axis)
+            .atan2((w - axis * w.dot(&axis)).magnitude() - big_r);
+        let normal = (p - (c + e * big_r)).normalize().ok()? * osign;
+        let along_v = e * (-v.sin()) + axis * v.cos();
+        let into = if increasing { along_v } else { along_v * -1.0 };
+        let need_ccw = normal.cross(&axis.cross(&e)).dot(&into) > 0.0;
+        if (sense > 0.0) == need_ccw {
+            Some(lp.to_vec())
+        } else {
+            Some(lp.iter().rev().map(|&(eid, f)| (eid, !f)).collect())
+        }
+    };
+
+    let Some(mut circles) = by_curve
+        .values()
+        .map(|(v, eids)| chain(eids).map(|lp| (*v, lp)))
+        .collect::<Option<Vec<(f64, Vec<(EdgeId, bool)>)>>>()
+    else {
+        decline("a cut circle's arcs do not chain into one closed loop");
+        return None;
+    };
+    circles.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    // Two cuts on one latitude would make a zero-width band: not this path.
+    for k in 0..circles.len() {
+        let next = circles[(k + 1) % circles.len()].0;
+        if (next - circles[k].0).rem_euclid(tau) < 1e-9 {
+            return None;
+        }
+    }
+
+    let e_ref = {
+        let r = torus.ref_dir - axis * torus.ref_dir.dot(&axis);
+        r.normalize().ok()?
+    };
+    let n = circles.len();
+    let mut faces = Vec::with_capacity(n);
+    for k in 0..n {
+        let (v_start, ref start_loop) = circles[k];
+        let (v_end, ref end_loop) = circles[(k + 1) % n];
+        let span = (v_end - v_start).rem_euclid(tau);
+        let v_mid = v_start + 0.5 * span;
+        let interior = c + e_ref * (big_r + small_r * v_mid.cos()) + axis * (small_r * v_mid.sin());
+        faces.push(SplitFace {
+            was_split: true,
+            original_face: face_id,
+            surface: surface_id,
+            boundary_edges: orient(start_loop, true)?,
+            classification: FaceClassification::OnBoundary,
+            from_solid: origin_solid,
+            interior_point: Some(interior),
+            inner_loops: vec![orient(end_loop, false)?],
+        });
+    }
+    Some(faces)
+}
+
 /// Whether a face's surface is an ANALYTIC primitive (plane / cylinder /
 /// sphere / cone / torus). Non-analytic surfaces (NURBS, B-spline, ruled,
 /// surface-of-revolution, offset) intersect via approximate marching, so two
@@ -10010,6 +10341,26 @@ fn split_face_by_curves(
         return Ok(cyl_faces);
     }
 
+    // Torus cut by axis-PERPENDICULAR planes: every cut is a latitude circle
+    // of the tube → seamless bands between consecutive circles round the
+    // tube. Must run before the oval splitter, which takes any cut curve.
+    if let Some(torus_faces) = split_torus_face_by_latitude_circles(
+        model,
+        surface_id,
+        face_id,
+        origin_solid,
+        &graph,
+        curves,
+    ) {
+        if pipeline_trace_enabled() {
+            eprintln!(
+                "[bool]   torus latitude split: face={face_id:?} → {} fragments",
+                torus_faces.len()
+            );
+        }
+        return Ok(torus_faces);
+    }
+
     // Torus rim-poke: torus cut by closed ovals near its outer equator →
     // explicit bumps + main body (commutator boundary, ovals as holes).
     if let Some(torus_faces) = split_torus_face_by_ovals(
@@ -10251,6 +10602,19 @@ fn split_face_by_curves(
         face_id,
         &graph,
     );
+    // The PLANAR counterpart, which also nests islands inside islands (a
+    // plane through a torus cuts two concentric circles: the annulus between
+    // them is the large disk with the small one as its hole). A fragment that
+    // gains a hole here drops its precomputed interior point so the hole-aware
+    // `face_with_hole_interior_point` picks one in its material.
+    let gained_planar_holes = attach_nested_planar_island_loops(
+        &loops,
+        &mut attached_holes,
+        model,
+        surface_id,
+        face_id,
+        &graph,
+    );
 
     // Detect cycle nesting and compute corrected interior points for any
     // "annular" faces whose naive centroid would land inside an enclosed
@@ -10300,7 +10664,11 @@ fn split_face_by_curves(
             continue;
         }
         let mut split_face = create_split_face(surface_id, loop_edges, face_id, origin_solid)?;
-        split_face.interior_point = interior_points.get(idx).copied().flatten();
+        split_face.interior_point = if gained_planar_holes.get(idx).copied().unwrap_or(false) {
+            None
+        } else {
+            interior_points.get(idx).copied().flatten()
+        };
         if let Some(holes) = attached_holes.get(idx) {
             split_face.inner_loops.extend(holes.iter().cloned());
         }
@@ -11391,6 +11759,154 @@ fn partition_outer_and_pre_existing_hole_cycles(
     let outer_loops: Vec<Vec<(EdgeId, bool)>> =
         outer_indices.iter().map(|&i| loops[i].clone()).collect();
     (outer_loops, attachments)
+}
+
+/// PLANAR island-in-island nesting: attach an island cycle (all edges are
+/// cuts, wholly inside the face) that lies inside ANOTHER island to that
+/// island as an inner loop — the smallest island strictly larger than it that
+/// contains a point ON its boundary. A plane through a torus imprints two
+/// concentric circles; the arrangement walks the large and small disks as
+/// overlapping hole-free cycles, and without this the ANNULUS between them
+/// (large disk minus small disk) never exists. Islands directly in the face
+/// body are left to the established runtime hole-attachment. Containment is
+/// tested with a boundary point, never the centroid — the large circle's
+/// centre lies inside the small circle.
+///
+/// Returns, per loop, whether it gained a hole here. Gated to planar host
+/// faces that the freeform pass does not already handle.
+fn attach_nested_planar_island_loops(
+    loops: &[Vec<(EdgeId, bool)>],
+    attached_holes: &mut [Vec<Vec<(EdgeId, bool)>>],
+    model: &BRepModel,
+    surface_id: SurfaceId,
+    face_id: FaceId,
+    graph: &IntersectionGraph,
+) -> Vec<bool> {
+    let n = loops.len();
+    let mut gained = vec![false; n];
+    if n < 2 || face_is_nonanalytic(model, face_id) {
+        return gained;
+    }
+    let Some(surface) = model.surfaces.get(surface_id) else {
+        return gained;
+    };
+    let tol = Tolerance::default();
+    if !surface.is_planar(tol) {
+        return gained;
+    }
+    let is_island: Vec<bool> = loops
+        .iter()
+        .map(|cycle| {
+            !cycle.is_empty()
+                && cycle.iter().all(|&(eid, _)| {
+                    graph
+                        .edges
+                        .get(&eid)
+                        .map(|ge| ge.edge_type == EdgeType::Splitting)
+                        .unwrap_or(false)
+                })
+        })
+        .collect();
+    if !is_island.iter().any(|&b| b) {
+        return gained;
+    }
+    let Ok(frame) = surface.evaluate_full(0.0, 0.0) else {
+        return gained;
+    };
+    let origin = frame.position;
+    let normal = frame.normal;
+    let seed = if normal.x.abs() < 0.9 {
+        Vector3::new(1.0, 0.0, 0.0)
+    } else {
+        Vector3::new(0.0, 1.0, 0.0)
+    };
+    let Ok(e1) = normal.cross(&seed).normalize() else {
+        return gained;
+    };
+    let e2 = normal.cross(&e1);
+    let project = |p: Point3| {
+        let d = p - origin;
+        (d.dot(&e1), d.dot(&e2))
+    };
+    let densify = |cycle: &[(EdgeId, bool)]| -> Vec<(f64, f64)> {
+        const SAMPLES: usize = 8;
+        let mut poly = Vec::with_capacity(cycle.len() * SAMPLES);
+        for &(eid, fwd) in cycle {
+            let Some(edge) = model.edges.get(eid) else {
+                continue;
+            };
+            let Some(curve) = model.curves.get(edge.curve_id) else {
+                continue;
+            };
+            let (a, b) = (edge.param_range.start, edge.param_range.end);
+            for k in 0..SAMPLES {
+                let f = k as f64 / SAMPLES as f64;
+                let t = if fwd {
+                    a + (b - a) * f
+                } else {
+                    b - (b - a) * f
+                };
+                if let Ok(p) = curve.point_at(t) {
+                    poly.push(project(p));
+                }
+            }
+        }
+        poly
+    };
+    let polys: Vec<Vec<(f64, f64)>> = loops.iter().map(|c| densify(c)).collect();
+    let area = |poly: &[(f64, f64)]| -> f64 {
+        let mut a2 = 0.0;
+        for i in 0..poly.len() {
+            let (ax, ay) = poly[i];
+            let (bx, by) = poly[(i + 1) % poly.len()];
+            a2 += ax * by - bx * ay;
+        }
+        0.5 * a2.abs()
+    };
+    let areas: Vec<f64> = polys.iter().map(|p| area(p)).collect();
+
+    for h in 0..n {
+        if !is_island[h] || polys[h].len() < 3 {
+            continue;
+        }
+        let probe = polys[h][0];
+        let mut chosen: Option<usize> = None;
+        for o in 0..n {
+            // Only an island INSIDE ANOTHER ISLAND: an island directly in the
+            // face body is attached later by the established runtime
+            // hole-attachment (`merge_same_origin_fragments`); attaching it
+            // here too double-attaches it (measured: coaxial boss/bore unions
+            // in boolean_straddling_rim / boolean_bracket_robustness went
+            // unsound).
+            if o == h || !is_island[o] || polys[o].len() < 3 || areas[o] <= areas[h] {
+                continue;
+            }
+            if !point_in_polygon_2d(probe.0, probe.1, &polys[o]) {
+                continue;
+            }
+            if chosen.is_none_or(|c| areas[o] < areas[c]) {
+                chosen = Some(o);
+            }
+        }
+        let Some(o) = chosen else {
+            continue;
+        };
+        let reversed: Vec<(EdgeId, bool)> =
+            loops[h].iter().rev().map(|(e, fwd)| (*e, !*fwd)).collect();
+        let ids: HashSet<EdgeId> = reversed.iter().map(|&(e, _)| e).collect();
+        let dup = attached_holes.get(o).is_some_and(|hs| {
+            hs.iter().any(|existing| {
+                existing.len() == reversed.len() && existing.iter().all(|&(e, _)| ids.contains(&e))
+            })
+        });
+        if !dup {
+            if let Some(slot) = attached_holes.get_mut(o) {
+                slot.push(reversed);
+                gained[o] = true;
+            }
+        }
+    }
+    gained
 }
 
 /// Attach NEW interior island cut-loops to their containing fragment as inner
