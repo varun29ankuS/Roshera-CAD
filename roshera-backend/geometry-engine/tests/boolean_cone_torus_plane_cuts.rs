@@ -15,6 +15,13 @@
 //! volume checks pin WHICH tube arc each band covers (a wrong arc is still
 //! watertight). A cut exactly through the equator seam is refused (typed).
 //!
+//! CONE APEX CAP — a cone cut by planes parallel to its axis (a drill point
+//! inside a square socket). Before 2026-11-05: Ok with 5 planes and NO cone
+//! face (unsound). The planar arrangement never walks the region round the
+//! apex (not a closed polygon in the cone's chart) — now recovered from the
+//! cut edges only one walked region uses — and the hyperbola sections were
+//! cubic fits 5.3e-3 off the cone — now exact rational quadratic NURBS.
+//!
 //! Each solid must certify sound where it is built AND after rigid placements:
 //! a move is an isometry and cannot honestly change soundness.
 
@@ -127,6 +134,43 @@ fn inventory(model: &BRepModel, s: SolidId) -> Vec<(String, usize, usize)> {
             Some((ty, outer, f.inner_loops.len()))
         })
         .collect()
+}
+
+/// cone(base r8 at z=0, apex z=10) ∩ square prism 6×6: the cone survives only
+/// as the cap above the four curves where the prism walls cut it — the apex
+/// inside, one 4-edge loop round the axis (the robot-arm drill point, square).
+/// Before 2026-11-05: 5 planes, NO cone face, brep_valid=false — the planar
+/// arrangement never walks the region round the apex, and the traced
+/// hyperbolas were cubic fits 5.3e-3 off the cone.
+#[test]
+fn cone_cut_by_a_square_prism_keeps_a_sound_apex_cap() {
+    let mut m = BRepModel::new();
+    let cone = sid(TopologyBuilder::new(&mut m)
+        .create_cone_3d(Point3::ORIGIN, Vector3::Z, 8.0, 0.0, 10.0)
+        .expect("cone"));
+    let prism = sid(TopologyBuilder::new(&mut m)
+        .create_box_3d(6.0, 6.0, 30.0)
+        .expect("prism"));
+    let res = boolean_operation(
+        &mut m,
+        cone,
+        prism,
+        BooleanOp::Intersection,
+        BooleanOptions::default(),
+    )
+    .expect("cone ∩ square prism");
+    assert!(
+        has_face(&m, res, "Cone", |outer, inner| outer >= 2 && inner == 0),
+        "the result must carry the cone CAP (multi-edge outer loop, no holes); faces: {:?}; cert: {:?}",
+        inventory(&m, res),
+        m.certify_solid(res)
+    );
+    // Exact: height 10(1 − r/8) over the square [−3, 3]², so
+    // V = 360 − (10/8)·∬r dA with ∬r dA = 4·3³·(√2 + ln(1 + √2))/3.
+    let sqrt2 = std::f64::consts::SQRT_2;
+    let int_r = 4.0 * 27.0 * (sqrt2 + (1.0 + sqrt2).ln()) / 3.0;
+    assert_volume(&mut m, res, 360.0 - 1.25 * int_r, "cone ∩ square prism");
+    assert_sound_built_and_placed(&mut m, res, "cone ∩ square prism");
 }
 
 /// torus(R10, r3, axis Z) minus everything above z = 1: the torus face left

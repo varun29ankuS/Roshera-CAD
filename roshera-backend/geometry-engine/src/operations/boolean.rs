@@ -4450,6 +4450,135 @@ fn plane_cone_intersection(
     }])
 }
 
+/// The hyperbola arc `base + s·m̂ + v(s)·axis`, `v(s) = √(d² + s²)/k`, for
+/// `s ∈ [s0, s1]`, as an EXACT piecewise rational quadratic NURBS.
+///
+/// Each span `[sa, sb]` is one conic piece. Its control points are the two
+/// ends and the meeting point of their tangents. Its middle weight comes from
+/// the shoulder point, where the line from the chord midpoint to that tangent
+/// point crosses the hyperbola, at fraction `λ`: `w = λ/(1 − λ)`, because the
+/// piece passes through `M + λ(P1 − M)` at its mid-parameter.
+///
+/// MULTI-SPAN on purpose: one span over a long arc has a large weight and a
+/// very uneven parameter speed, so evenly-spaced parameter samples crowd at
+/// the shoulder and leave the ends sparse. Measured on cone minus square
+/// prism: the side strips meshed with 0.38° slivers, failing mesh quality.
+/// Short spans keep every weight near 1; the vertex `s = 0` is always a span
+/// break. Spans join with doubled knots; parameter range [0, 1].
+fn hyperbola_arc_nurbs(
+    base: Point3,
+    m_hat: Vector3,
+    axis: Vector3,
+    d: f64,
+    k: f64,
+    s0: f64,
+    s1: f64,
+) -> OperationResult<crate::primitives::curve::NurbsCurve> {
+    let bad = |what: &str| OperationError::NumericalError(format!("hyperbola arc: {what}"));
+    if !(k > 0.0) || !(s1 > s0) || !(d > 0.0) {
+        return Err(bad("degenerate input"));
+    }
+    let v = |s: f64| (d * d + s * s).sqrt() / k;
+    let slope = |s: f64| s / (k * k * v(s));
+    let (k2, d2) = (k * k, d * d);
+
+    // One conic piece: (tangent-meeting point (s, v), middle weight).
+    let piece = |sa: f64, sb: f64| -> OperationResult<((f64, f64), f64)> {
+        let (va, vb) = (v(sa), v(sb));
+        let (ta, tb) = (slope(sa), slope(sb));
+        // v'(s) is strictly increasing, so the end tangents always meet.
+        let sp = (vb - va + ta * sa - tb * sb) / (ta - tb);
+        let vp = va + ta * (sp - sa);
+        let (ms, mv) = (0.5 * (sa + sb), 0.5 * (va + vb));
+        let (ds, dv) = (sp - ms, vp - mv);
+        let a = k2 * dv * dv - ds * ds;
+        let b = 2.0 * (k2 * mv * dv - ms * ds);
+        let c = k2 * mv * mv - ms * ms - d2;
+        let roots: Vec<f64> = if a.abs() < 1e-15 {
+            vec![-c / b]
+        } else {
+            let disc = b * b - 4.0 * a * c;
+            if disc < 0.0 {
+                return Err(bad("no shoulder point"));
+            }
+            let q = disc.sqrt();
+            vec![(-b - q) / (2.0 * a), (-b + q) / (2.0 * a)]
+        };
+        let lambda = roots
+            .into_iter()
+            .find(|l| *l > 0.0 && *l < 1.0)
+            .ok_or_else(|| bad("shoulder outside the control triangle"))?;
+        Ok(((sp, vp), lambda / (1.0 - lambda)))
+    };
+
+    // Span breaks at EQUAL ARC LENGTH (the vertex s = 0 always a break), so
+    // the curve parameter tracks arc length span to span: the edge cache
+    // samples uniformly in t, and equal-s spans left the rim ends — where the
+    // branch is steepest — under-sampled relative to their length.
+    let arc = |a: f64, b: f64| -> f64 {
+        // Simpson over √(1 + v'(s)²), 16 panels.
+        const N: usize = 16;
+        let f = |s: f64| (1.0 + slope(s).powi(2)).sqrt();
+        let h = (b - a) / N as f64;
+        let mut acc = f(a) + f(b);
+        for i in 1..N {
+            acc += f(a + h * i as f64) * if i % 2 == 1 { 4.0 } else { 2.0 };
+        }
+        acc * h / 3.0
+    };
+    let mut sides: Vec<(f64, f64)> = Vec::with_capacity(2);
+    if s0 < 0.0 && s1 > 0.0 {
+        sides.push((s0, 0.0));
+        sides.push((0.0, s1));
+    } else {
+        sides.push((s0, s1));
+    }
+    let mut breaks: Vec<f64> = vec![s0];
+    for (a, b) in sides {
+        let total = arc(a, b);
+        let n = ((total / (0.5 * d)).ceil() as usize).clamp(1, 32);
+        // Invert the arc length by bisection for each interior break.
+        for i in 1..n {
+            let target = total * (i as f64 / n as f64);
+            let (mut lo, mut hi) = (a, b);
+            for _ in 0..60 {
+                let mid = 0.5 * (lo + hi);
+                if arc(a, mid) < target {
+                    lo = mid;
+                } else {
+                    hi = mid;
+                }
+            }
+            breaks.push(0.5 * (lo + hi));
+        }
+        breaks.push(b);
+    }
+
+    let at = |s: f64, vv: f64| base + m_hat * s + axis * vv;
+    let spans = breaks.len() - 1;
+    let mut cps = Vec::with_capacity(2 * spans + 1);
+    let mut weights = Vec::with_capacity(2 * spans + 1);
+    let mut knots = vec![0.0, 0.0, 0.0];
+    cps.push(at(s0, v(s0)));
+    weights.push(1.0);
+    for i in 0..spans {
+        let (sa, sb) = (breaks[i], breaks[i + 1]);
+        let ((sp, vp), w) = piece(sa, sb)?;
+        cps.push(at(sp, vp));
+        weights.push(w);
+        cps.push(at(sb, v(sb)));
+        weights.push(1.0);
+        let t = (i + 1) as f64 / spans as f64;
+        if i + 1 < spans {
+            knots.push(t);
+            knots.push(t);
+        }
+    }
+    knots.extend([1.0, 1.0, 1.0]);
+    crate::primitives::curve::NurbsCurve::new(2, cps, weights, knots)
+        .map_err(|e| bad(&e.to_string()))
+}
+
 /// Plane–cone intersection for a plane PARALLEL to the cone axis, sampled
 /// analytically. In the apex frame with x̂ = the plane normal projected ⊥
 /// axis (signed toward the plane) and m̂ = axis × x̂, a cone point is
@@ -4552,6 +4681,9 @@ fn plane_cone_parallel_intersection(
         return Ok(vec![]);
     }
 
+    // The branch vertex lies on the near rim: the plane is tangent to it.
+    let rim_tangent = (v_vertex - v_lo).abs() <= slack.max(1e-9 * v_hi.abs());
+
     // Trace one hyperbola arc over signed lateral range [s_start, s_end].
     let trace_arc = |s_start: f64, s_end: f64| -> OperationResult<SurfaceIntersectionCurve> {
         const N: usize = 48;
@@ -4568,7 +4700,32 @@ fn plane_cone_parallel_intersection(
                 params_b: pb,
             });
         }
-        let curve = fit_curve_to_points(&points, tolerance)?;
+        // EXACT, not fitted: the section is a conic, which a rational quadratic
+        // NURBS represents exactly. A cubic fit through these samples sat up to
+        // 5.3e-3 off the cone (measured on cone ∩ square prism), failing the
+        // edge-on-face check and leaving the boolean unsound.
+        //
+        // ONE exception, kept on the previous fitted curve: the branch vertex
+        // exactly ON the near rim (the plane tangent to that rim circle). The
+        // exact curve then touches the rim tangentially mid-edge; curved-CDT
+        // fails `PointOnFixedEdge` and the face falls to the untrimmed grid
+        // (measured: diag_cone_radial::cone_poke_past_gate, union volume
+        // −7%). Splitting the arc at the touch point broke the ∩ case instead.
+        // Until the mesher handles a cut tangent to a rim, that configuration
+        // keeps its prior behaviour unchanged.
+        let curve: Box<dyn Curve> = if rim_tangent {
+            fit_curve_to_points(&points, tolerance)?
+        } else {
+            Box::new(hyperbola_arc_nurbs(
+                cone.apex + x_hat * dd,
+                m_hat,
+                cone.axis,
+                dd,
+                k,
+                s_start,
+                s_end,
+            )?)
+        };
         let params_a: Vec<(f64, f64)> = points.iter().map(|p| p.params_a).collect();
         let params_b: Vec<(f64, f64)> = points.iter().map(|p| p.params_b).collect();
         Ok(SurfaceIntersectionCurve {
@@ -10486,7 +10643,7 @@ fn split_face_by_curves(
     // exactly as long as `extract_regions` runs, so that `model` is free
     // for the split-face creation loop below.
     let arrangement = super::face_arrangement::build_arrangement(&graph, model, surface_id)?;
-    let loops = {
+    let mut loops = {
         let surface =
             model
                 .surfaces
@@ -10508,6 +10665,18 @@ fn split_face_by_curves(
             let eids: Vec<EdgeId> = lp.iter().map(|(e, _)| *e).collect();
             eprintln!("[bool]       loop[{}] edges={:?}", i, eids);
         }
+    }
+    // An apex cone's tip CAP — the region inside a cut loop that winds round
+    // the apex — is not a closed polygon in the cone's (θ, v) chart, so the
+    // arrangement never walks it. Recover it from the cut edges only one
+    // walked region uses, and give it an interior point on the cone.
+    let apex_cap = recover_cone_apex_cap(&loops, model, surface_id, face_id, &graph);
+    if let Some((cap, _)) = &apex_cap {
+        if pipeline_trace_enabled() {
+            let eids: Vec<EdgeId> = cap.iter().map(|(e, _)| *e).collect();
+            eprintln!("[bool]       recovered cone apex cap loop edges={eids:?}");
+        }
+        loops.push(cap.clone());
     }
 
     // Post-arrangement 0-loop fallback (#44 coincident-weld floor).
@@ -10621,7 +10790,14 @@ fn split_face_by_curves(
     // sibling cycle. For simply-connected faces (no nested siblings) the
     // pre-computed point is left as None and the caller falls back to the
     // boundary-midpoint centroid.
-    let interior_points = compute_split_face_interior_points(&loops, model, surface_id);
+    let mut interior_points = compute_split_face_interior_points(&loops, model, surface_id);
+    if let Some((cap, point)) = &apex_cap {
+        if let Some(i) = loops.iter().position(|l| l == cap) {
+            if let Some(slot) = interior_points.get_mut(i) {
+                *slot = Some(*point);
+            }
+        }
+    }
 
     // Void-fragment drop (#35 overlapping-loop superset). When a coplanar
     // imprint outline from the OTHER operand CROSSES a pre-existing inner loop
@@ -11759,6 +11935,147 @@ fn partition_outer_and_pre_existing_hole_cycles(
     let outer_loops: Vec<Vec<(EdgeId, bool)>> =
         outer_indices.iter().map(|&i| loops[i].clone()).collect();
     (outer_loops, attachments)
+}
+
+/// Recover the TIP CAP of an apex cone face from a planar arrangement that
+/// could not walk it.
+///
+/// A cone face holding its apex (the primitive apex cone: one closed base-rim
+/// edge, no holes) cut by curves that close round the axis — e.g. the four
+/// hyperbolas of a square prism's walls, a drill point inside a socket — has a
+/// cap region around the apex. In the cone's `(θ, v)` chart that region's
+/// boundary is not a closed polygon (the apex is a singular line), so
+/// `extract_regions` walks every OTHER region and drops the cap. Every
+/// interior cut edge borders two regions; the cut edges only ONE walked region
+/// uses are exactly the cap's boundary. Chained in the opposite direction to
+/// that one use (each shared edge is walked oppositely by its two faces), they
+/// give the cap loop.
+///
+/// Accepted only when they chain into ONE closed loop that winds once round
+/// the axis (so the apex is inside it). The interior point is on the cone,
+/// half-way from the apex to the loop's nearest point along one ruling.
+/// Returns the loop and that point, or `None` (nothing recovered).
+fn recover_cone_apex_cap(
+    loops: &[Vec<(EdgeId, bool)>],
+    model: &BRepModel,
+    surface_id: SurfaceId,
+    face_id: FaceId,
+    graph: &IntersectionGraph,
+) -> Option<(Vec<(EdgeId, bool)>, Point3)> {
+    use crate::primitives::surface::Cone;
+
+    let cone = model
+        .surfaces
+        .get(surface_id)?
+        .as_any()
+        .downcast_ref::<Cone>()?;
+    // The face must hold its apex: one closed base-rim edge, no holes.
+    let face = model.faces.get(face_id)?;
+    if !face.inner_loops.is_empty() {
+        return None;
+    }
+    let outer = model.loops.get(face.outer_loop)?;
+    if outer.edges.len() != 1 {
+        return None;
+    }
+    let rim = model.edges.get(outer.edges[0])?;
+    if rim.start_vertex != rim.end_vertex {
+        return None;
+    }
+    let axis = cone.axis.normalize().ok()?;
+    let apex = cone.apex;
+
+    // Cut edges used by exactly one walked region, reversed.
+    let mut uses: HashMap<EdgeId, Vec<bool>> = HashMap::new();
+    for lp in loops {
+        for &(eid, fwd) in lp {
+            uses.entry(eid).or_default().push(fwd);
+        }
+    }
+    let mut once: Vec<(EdgeId, bool)> = Vec::new();
+    for ge in graph.edges.values() {
+        if ge.edge_type != EdgeType::Splitting {
+            continue;
+        }
+        match uses.get(&ge.edge_id).map(|v| v.as_slice()) {
+            Some([fwd]) => once.push((ge.edge_id, !*fwd)),
+            _ => {}
+        }
+    }
+    if once.len() < 2 {
+        return None;
+    }
+
+    // Chain them by oriented endpoints into one closed loop.
+    let ends = |(eid, fwd): (EdgeId, bool)| -> Option<(VertexId, VertexId)> {
+        let e = model.edges.get(eid)?;
+        Some(if fwd {
+            (e.start_vertex, e.end_vertex)
+        } else {
+            (e.end_vertex, e.start_vertex)
+        })
+    };
+    let mut remaining = once;
+    let first = remaining.remove(0);
+    let (start, mut cur) = ends(first)?;
+    let mut cap = vec![first];
+    while cur != start {
+        let i = remaining
+            .iter()
+            .position(|&oe| ends(oe).is_some_and(|(s, _)| s == cur))?;
+        let oe = remaining.remove(i);
+        cur = ends(oe)?.1;
+        cap.push(oe);
+    }
+    if !remaining.is_empty() {
+        return None;
+    }
+
+    // Sample the loop (edge starts + mid-points), check it winds once round
+    // the axis, and find its nearest approach to the apex along the axis.
+    let mut pts: Vec<Point3> = Vec::with_capacity(cap.len() * 2);
+    for &(eid, fwd) in &cap {
+        let e = model.edges.get(eid)?;
+        let curve = model.curves.get(e.curve_id)?;
+        let (a, b) = (e.param_range.start, e.param_range.end);
+        let (t0, tm) = if fwd {
+            (a, 0.5 * (a + b))
+        } else {
+            (b, 0.5 * (a + b))
+        };
+        pts.push(curve.point_at(t0).ok()?);
+        pts.push(curve.point_at(tm).ok()?);
+    }
+    let radial = |p: Point3| {
+        let w = p - apex;
+        w - axis * w.dot(&axis)
+    };
+    let e1 = radial(pts[0]).normalize().ok()?;
+    let e2 = axis.cross(&e1);
+    let ang = |p: Point3| {
+        let r = radial(p);
+        r.dot(&e2).atan2(r.dot(&e1))
+    };
+    let tau = std::f64::consts::TAU;
+    let winding: f64 = (0..pts.len())
+        .map(|i| {
+            let d = ang(pts[(i + 1) % pts.len()]) - ang(pts[i]);
+            (d + std::f64::consts::PI).rem_euclid(tau) - std::f64::consts::PI
+        })
+        .sum();
+    if (winding.abs() - tau).abs() > 1e-3 {
+        return None;
+    }
+    let v_min = pts
+        .iter()
+        .map(|p| (*p - apex).dot(&axis))
+        .fold(f64::INFINITY, f64::min);
+    if !(v_min > 0.0) {
+        return None;
+    }
+    let v = 0.5 * v_min;
+    let interior = apex + axis * v + e1 * (v * cone.half_angle.tan());
+    Some((cap, interior))
 }
 
 /// PLANAR island-in-island nesting: attach an island cycle (all edges are
