@@ -8558,6 +8558,11 @@ fn build_object_created_frame(
             "metadata":    {},
             "created_at":  now,
             "modified_at": now,
+            // Same as `/api/scene/snapshot`: the client merges these replay
+            // frames into parts it already loaded, so a field left out here
+            // is a field erased there.
+            "assembly":    model.solid_occurrence(solid_id),
+            "sound":       model.cached_soundness(solid_id),
         }
     });
     serde_json::to_string(&frame).ok()

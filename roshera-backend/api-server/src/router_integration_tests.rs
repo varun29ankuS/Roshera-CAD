@@ -422,6 +422,39 @@ async fn scene_resync_replays_registered_colour() {
     );
 }
 
+/// The connect-time scene replay ships every part again as `ObjectCreated`,
+/// and the client MERGES those into the parts its snapshot already loaded.
+/// They must carry what the snapshot carries — the part's assembly place and
+/// its cached soundness verdict — or the merge erases both: measured on the
+/// robot-arm import, 301 replay frames after load left the browser tree
+/// showing "not certified" for parts the server had certified.
+#[tokio::test]
+async fn scene_resync_frames_carry_assembly_and_soundness() {
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../export-engine/tests/fixtures/two_cube_assembly.step");
+    let state = make_test_state().await;
+    let request = import_step_post(json!({ "path": fixture.to_string_lossy().to_string() }));
+    let (status, body) = dispatch(&state, request).await;
+    assert_eq!(status, StatusCode::OK, "import must succeed; body = {body}");
+
+    let frames = crate::current_scene_frames(&state).await;
+    let created: Vec<Value> = frames
+        .iter()
+        .filter_map(|f| serde_json::from_str::<Value>(f).ok())
+        .filter(|v| v["type"] == "ObjectCreated")
+        .collect();
+    assert_eq!(created.len(), 2, "one replay frame per part");
+    for f in created {
+        let p = &f["payload"];
+        assert_eq!(
+            p["assembly"]["path"],
+            json!(["asm"]),
+            "replay carries assembly: {p}"
+        );
+        assert_eq!(p["sound"], true, "replay carries the cached verdict");
+    }
+}
+
 /// Seed a `size × size × size` box and return three *mutually
 /// vertex-disjoint* edges from it (no two share an endpoint).
 ///
