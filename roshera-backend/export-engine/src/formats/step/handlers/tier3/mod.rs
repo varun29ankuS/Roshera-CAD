@@ -34,6 +34,7 @@
 use crate::formats::step::dispatch::EntityDispatch;
 
 pub mod assembly;
+pub mod product;
 pub mod shells;
 pub mod solid;
 
@@ -42,4 +43,5 @@ pub fn register(dispatch: &mut EntityDispatch) {
     shells::register(dispatch);
     solid::register(dispatch);
     assembly::register(dispatch);
+    product::register(dispatch);
 }

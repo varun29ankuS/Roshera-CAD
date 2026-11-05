@@ -88,6 +88,8 @@ output/
 *.stl
 *.step
 *.stp
+# ...except committed test fixtures: real parts that reproduce import defects.
+!roshera-backend/export-engine/tests/fixtures/*.step
 *.iges
 *.igs
 *.obj

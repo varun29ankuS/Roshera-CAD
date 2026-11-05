@@ -5434,6 +5434,53 @@ async fn import_step_path_reads_file_serverside() {
     );
 }
 
+/// Production call site for imported identity: a solid spliced into the
+/// live model by `/api/geometry/import_step` must arrive with a persistent
+/// id on every face and on the solid, and `imported:step` provenance —
+/// otherwise `gdt_datum` / feature-control frames / mates refuse or
+/// degrade on every imported face (they all key on the face PID).
+#[tokio::test]
+async fn import_step_route_lands_faces_with_pids_and_import_provenance() {
+    let mut fresh_model = BRepModel::new();
+    {
+        let mut builder = TopologyBuilder::new(&mut fresh_model);
+        builder
+            .create_box_3d(10.0, 10.0, 10.0)
+            .expect("box primitive must build for positive size");
+    }
+    let mut tmp_path = std::env::temp_dir();
+    tmp_path.push(format!("roshera_import_pid_test_{}.step", Uuid::new_v4()));
+    export_engine::formats::step::export_brep_to_step(&fresh_model, &tmp_path)
+        .await
+        .expect("STEP export of a single box must succeed");
+
+    let state = make_test_state().await;
+    let request = import_step_post(json!({
+        "path": tmp_path.to_string_lossy().to_string(),
+    }));
+    let (status, body) = dispatch(&state, request).await;
+    let _ = std::fs::remove_file(&tmp_path);
+    assert_eq!(status, StatusCode::OK, "import must succeed; body = {body}");
+
+    let model = state.model.read().await;
+    assert_eq!(model.solids.len(), 1, "fresh session holds only the import");
+    let (sid, solid) = model.solids.iter().next().expect("imported solid");
+    assert!(model.solid_pid(sid).is_some(), "imported solid has a PID");
+    assert_eq!(
+        model.solid_provenance(sid).map(|p| p.created_by.label()),
+        Some("imported:step".to_string()),
+        "imported solid is tagged as imported"
+    );
+    let faces = &model.shells.get(solid.outer_shell).expect("shell").faces;
+    assert_eq!(faces.len(), 6, "a box has six faces");
+    for &f in faces {
+        let pid = model
+            .face_pid(f)
+            .unwrap_or_else(|| panic!("imported face {f} has no PID"));
+        assert_eq!(model.face_by_pid(pid), Some(f), "face PID resolves");
+    }
+}
+
 /// #34: `path` pointing at a file that does not exist must fail with a
 /// typed, actionable `invalid_parameter` error — never a panic, never a
 /// silent no-op.

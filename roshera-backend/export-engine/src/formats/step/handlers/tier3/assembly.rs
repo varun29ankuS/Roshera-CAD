@@ -290,8 +290,9 @@ fn resolve_axis2_frame(
 }
 
 /// Homogeneous frame matrix from an orthonormal placement: columns are
-/// the x / y / z axes and the origin.
-fn frame_matrix(p: &Axis2Placement) -> Matrix4 {
+/// the x / y / z axes and the origin. Shared with the product-structure
+/// placement pass (`formats::step::assembly_placement`).
+pub(crate) fn frame_matrix(p: &Axis2Placement) -> Matrix4 {
     Matrix4::from_cols(
         Vector3::new(p.x[0], p.x[1], p.x[2]),
         Vector3::new(p.y[0], p.y[1], p.y[2]),

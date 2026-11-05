@@ -33,6 +33,7 @@
 //! No silent fallback to a hand-rolled parser. Imports that produce
 //! no geometry produce an honest [`ImportReport`] explaining why.
 
+mod assembly_placement;
 pub mod context;
 pub mod diagnostics;
 pub mod dispatch;
@@ -125,15 +126,22 @@ pub fn import_step_text_with_report(
     let mut dispatch = EntityDispatch::new();
     handlers::register_all(&mut dispatch);
 
-    let (resolved, roots_with_solids, total_root_solids) = {
+    let (resolved, roots_with_solids, total_root_solids, caches) = {
         let mut ctx = ImportContext::new(&mut model, &mut report);
         let resolved = dispatch.run_all(&registry, &mut ctx);
         let roots_with_solids = ctx.caches.roots.values().filter(|v| !v.is_empty()).count();
         let total_root_solids: usize = ctx.caches.roots.values().map(|v| v.len()).sum();
-        (resolved, roots_with_solids, total_root_solids)
+        let caches = std::mem::take(&mut ctx.caches);
+        (resolved, roots_with_solids, total_root_solids, caches)
     };
     report.roots_resolved = roots_with_solids;
     report.solids_in_roots = total_root_solids;
+
+    // Place assembly instances from the product tree, then give every solid
+    // and face its identity — PIDs keyed by this file's CONTENT and the STEP
+    // entity each came from, and `imported:step` provenance.
+    let file_root = geometry_engine::primitives::persistent_id::PersistentId::root(text.as_bytes());
+    let mut model = assembly_placement::finalize(model, &caches, &registry, &mut report, file_root);
 
     // Validation gate (IMP5). A solid that materialises topologically is
     // not yet trustworthy — STEP files in the wild deliver self-

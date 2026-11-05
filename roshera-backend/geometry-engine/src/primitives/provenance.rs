@@ -33,6 +33,11 @@ pub enum OperationKind {
     Chamfer,
     Shell,
     Transform,
+    /// Read from an exchange file (`"step"`, `"ros"`, …), not modelled in this
+    /// kernel. Neither a primitive stand-in nor a feature Roshera designed: the
+    /// geometry is someone else's, so `is_designed()` is false and the label
+    /// says where it came from (`imported:step`).
+    Imported(String),
     /// Created by an operation not yet wired to record provenance — honestly
     /// "unknown", never silently assumed designed.
     Other(String),
@@ -74,6 +79,7 @@ impl OperationKind {
             OperationKind::Chamfer => "chamfer".into(),
             OperationKind::Shell => "shell".into(),
             OperationKind::Transform => "transform".into(),
+            OperationKind::Imported(format) => format!("imported:{format}"),
             OperationKind::Other(s) => format!("other:{s}"),
         }
     }

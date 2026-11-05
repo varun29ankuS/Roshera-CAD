@@ -20,6 +20,7 @@ use std::collections::HashMap;
 use geometry_engine::primitives::{
     edge::{Edge, EdgeId},
     face::{Face, FaceId},
+    persistent_id::{PersistentId, Role},
     r#loop::{Loop, LoopId},
     shell::{Shell, ShellId},
     solid::{Solid, SolidId},
@@ -41,16 +42,127 @@ struct Remap {
 
 /// Merge every solid of `src` into `dst`, returning the new (target)
 /// solid ids in source order.
+///
+/// Identity travels with the geometry: each merged solid keeps its source
+/// provenance, and its solid and face [`PersistentId`]s are carried over, so
+/// a datum or label bound to an imported face's PID still resolves after the
+/// splice. When a PID is already live in `dst` (the same file imported
+/// twice), the whole copy is re-keyed with one deterministic derivation —
+/// `derive(pid, "import:copy", PatternInstance { index: k })`, `k` the first
+/// index free for the solid AND every one of its faces — so no two live
+/// faces ever share a PID and every PID resolves to exactly its own face.
 pub fn merge_solids_into(dst: &mut BRepModel, src: &BRepModel) -> Vec<SolidId> {
     let mut remap = Remap::default();
     let mut out = Vec::new();
     let solid_ids: Vec<SolidId> = src.solids.iter().map(|(id, _)| id).collect();
     for sid in solid_ids {
-        if let Some(new_sid) = merge_one_solid(dst, src, sid, &mut remap) {
+        if let Some(new_sid) = merge_one_solid(dst, src, sid, &mut remap, None) {
+            carry_identity(dst, src, sid, new_sid, &remap.faces);
             out.push(new_sid);
         }
     }
     out
+}
+
+/// Copy one solid of `src` into `dst` as an INDEPENDENT body (its own
+/// vertices, curves, surfaces and topology — nothing shared with any other
+/// copy), optionally renamed. Returns the new solid id and the source →
+/// target face map. Used by the assembly-placement pass, where one part
+/// placed N times needs N bodies that can each be moved.
+pub(crate) fn copy_solid(
+    dst: &mut BRepModel,
+    src: &BRepModel,
+    src_solid: SolidId,
+    name: Option<String>,
+) -> Option<(SolidId, HashMap<FaceId, FaceId>)> {
+    let mut remap = Remap::default();
+    let new_sid = merge_one_solid(dst, src, src_solid, &mut remap, name)?;
+    Some((new_sid, remap.faces))
+}
+
+/// Every face of a solid: outer shell, voids, and peer bodies, in shell
+/// order (deterministic for a given model).
+pub(crate) fn solid_faces(model: &BRepModel, sid: SolidId) -> Vec<FaceId> {
+    let Some(solid) = model.solids.get(sid) else {
+        return Vec::new();
+    };
+    std::iter::once(solid.outer_shell)
+        .chain(solid.inner_shells.iter().copied())
+        .chain(solid.peer_shells.iter().copied())
+        .filter_map(|sh| model.shells.get(sh))
+        .flat_map(|sh| sh.faces.iter().copied())
+        .collect()
+}
+
+/// Carry `src_sid`'s provenance and PIDs onto its merged copy `dst_sid`.
+fn carry_identity(
+    dst: &mut BRepModel,
+    src: &BRepModel,
+    src_sid: SolidId,
+    dst_sid: SolidId,
+    face_map: &HashMap<FaceId, FaceId>,
+) {
+    if let Some(prov) = src.solid_provenance(src_sid) {
+        let created_by = prov.created_by.clone();
+        dst.set_solid_provenance(dst_sid, created_by, Vec::new());
+    }
+    let solid_pid = src.solid_pid(src_sid);
+    let faces: Vec<(FaceId, PersistentId)> = solid_faces(src, src_sid)
+        .into_iter()
+        .filter_map(|f| Some((*face_map.get(&f)?, src.face_pid(f)?)))
+        .collect();
+    if solid_pid.is_none() && faces.is_empty() {
+        return;
+    }
+    let k = first_free_copy_index(dst, solid_pid, &faces);
+    if let Some(pid) = solid_pid {
+        dst.set_solid_pid(dst_sid, copy_pid(pid, k));
+    }
+    for (face, pid) in faces {
+        dst.set_face_pid(face, copy_pid(pid, k));
+    }
+}
+
+/// The PID of the `k`-th copy: `k == 0` is the original PID itself.
+fn copy_pid(pid: PersistentId, k: u32) -> PersistentId {
+    if k == 0 {
+        return pid;
+    }
+    PersistentId::derive(
+        &[pid],
+        "import:copy",
+        &Role::PatternInstance {
+            source_pid: pid,
+            index: k,
+        },
+    )
+}
+
+/// Smallest `k` for which the solid PID and every face PID are unused by a
+/// LIVE entity of `dst` (a stale inverse-map entry for a deleted face does
+/// not count as taken).
+fn first_free_copy_index(
+    dst: &BRepModel,
+    solid_pid: Option<PersistentId>,
+    faces: &[(FaceId, PersistentId)],
+) -> u32 {
+    let face_taken = |p: PersistentId| {
+        dst.face_by_pid(p)
+            .is_some_and(|f| dst.faces.get(f).is_some())
+    };
+    let solid_taken = |p: PersistentId| {
+        dst.solid_by_pid(p)
+            .is_some_and(|s| dst.solids.get(s).is_some())
+    };
+    let mut k = 0u32;
+    loop {
+        let clash = solid_pid.is_some_and(|p| solid_taken(copy_pid(p, k)))
+            || faces.iter().any(|(_, p)| face_taken(copy_pid(*p, k)));
+        if !clash || k == u32::MAX {
+            return k;
+        }
+        k += 1;
+    }
 }
 
 fn merge_one_solid(
@@ -58,14 +170,14 @@ fn merge_one_solid(
     src: &BRepModel,
     src_solid: SolidId,
     remap: &mut Remap,
+    name: Option<String>,
 ) -> Option<SolidId> {
     let solid = src.solids.get(src_solid)?.clone();
     let outer = remap_shell(dst, src, solid.outer_shell, remap)?;
     let mut new_solid = Solid::new(0, outer);
-    if !solid.name.clone().unwrap_or_default().is_empty() {
-        if let Some(name) = solid.name.clone() {
-            new_solid.name = Some(name);
-        }
+    let name = name.or_else(|| solid.name.clone());
+    if let Some(name) = name.filter(|n| !n.is_empty()) {
+        new_solid.name = Some(name);
     }
     for void in &solid.inner_shells {
         if let Some(s) = remap_shell(dst, src, *void, remap) {

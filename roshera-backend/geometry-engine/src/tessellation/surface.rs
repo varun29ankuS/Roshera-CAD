@@ -175,6 +175,11 @@ pub fn tessellate_face(
             // meshed by curved-CDT (neither loop closes in the (θ,z) chart). Stitch
             // the two cached rims directly; declined for every other cylinder face.
             if tessellate_cylinder_saddle_annulus(face, model, cache, mesh) {
+            } else if tessellate_cylinder_full_band(face, model, surface, cache, mesh) {
+                // A full wall bounded by two coaxial closed circles and NO seam
+                // edge (how SolidWorks / most STEP writers emit a plain bore or
+                // pin): stitched rim-to-rim, conforming to the caps by
+                // construction, independent of where the chart's seam falls.
             } else if tessellate_cylinder_edge_band_conforming(face, model, surface, cache, mesh) {
                 // #42: imported straight-edge fillet quarter-band — stitched
                 // conforming to the trim loop's cached arcs/rails (curved-CDT
@@ -7830,6 +7835,123 @@ fn tessellate_cylinder_edge_band_conforming(
         emit_outward_triangle(mesh, r0[i], r0[i + 1], r1[i + 1]);
         emit_outward_triangle(mesh, r0[i], r1[i + 1], r1[i]);
     }
+    true
+}
+
+/// A FULL cylinder wall whose boundary is exactly two closed circles coaxial
+/// with the cylinder — no seam edge. STEP writers (SolidWorks, most others)
+/// emit every plain bore, pin and shim wall this way; Roshera's own
+/// cylinders carry a seam and never reach here.
+///
+/// The general path cannot mesh this face reliably: its (θ, z) chart has no
+/// seam in the trim, so curved-CDT reads both rims as one invalid polygon
+/// and the untrimmed grid fallback samples the wall on the CHART's angles,
+/// not the rims'. Those coincide only when the circles' parameter origin
+/// happens to lie on the chart lattice — measured on the robot-arm DIN 988
+/// shims: sound at the part's own origin, 200–400 open mesh edges once the
+/// assembly rotated it by anything but a multiple of 3.6°.
+///
+/// A cylinder is ruled along its axis, so stitching the two cached rim rings
+/// directly is exact and watertight by construction: every vertex is a rim
+/// sample shared bit-for-bit with the adjoining cap faces.
+fn tessellate_cylinder_full_band(
+    face: &Face,
+    model: &BRepModel,
+    surface: &dyn Surface,
+    cache: &EdgeSampleCache,
+    mesh: &mut TriangleMesh,
+) -> bool {
+    use crate::primitives::surface::Cylinder;
+    let Some(cyl) = surface.as_any().downcast_ref::<Cylinder>() else {
+        return false;
+    };
+    if cyl.angle_limits.is_some() || face.inner_loops.len() != 1 {
+        return false;
+    }
+    let Ok(axis) = cyl.axis.normalize() else {
+        return false;
+    };
+    let tol = Tolerance::default().distance().max(1e-9 * cyl.radius.abs());
+    let radial = |p: Point3| {
+        let w = p - cyl.origin;
+        w - axis * w.dot(&axis)
+    };
+    let mut rims: Vec<Vec<Point3>> = Vec::with_capacity(2);
+    for lid in [face.outer_loop, face.inner_loops[0]] {
+        let Some(l) = model.loops.get(lid) else {
+            return false;
+        };
+        // One closed edge per loop: a full rim, not an arc chain.
+        if l.edges.len() != 1 {
+            return false;
+        }
+        let Some(e) = model.edges.get(l.edges[0]) else {
+            return false;
+        };
+        if e.start_vertex != e.end_vertex {
+            return false;
+        }
+        // The rim must be a circle around THIS cylinder's axis.
+        let Some((center, normal)) = loop_cut_circle(l, model) else {
+            return false;
+        };
+        if normal.cross(&axis).magnitude() > 1e-6 || radial(center).magnitude() > tol {
+            return false;
+        }
+        let ring = loop_rim_samples(l, model, cache);
+        if ring.len() < 3
+            || ring
+                .iter()
+                .any(|&p| (radial(p).magnitude() - cyl.radius).abs() > tol.max(1e-6 * cyl.radius))
+        {
+            return false;
+        }
+        rims.push(ring);
+    }
+
+    // Walk both rims the same way round the axis so the stitch pairs them
+    // coherently (`stitch_rings` aligns the start by nearest point).
+    let e1 = radial(rims[0][0]).normalize().unwrap_or(Vector3::X);
+    let e2 = axis.cross(&e1);
+    let wrap = |mut d: f64| {
+        while d > std::f64::consts::PI {
+            d -= std::f64::consts::TAU;
+        }
+        while d < -std::f64::consts::PI {
+            d += std::f64::consts::TAU;
+        }
+        d
+    };
+    let sense = |r: &[Point3]| -> f64 {
+        let ang = |p: Point3| {
+            let w = radial(p);
+            w.dot(&e2).atan2(w.dot(&e1))
+        };
+        (0..r.len())
+            .map(|i| wrap(ang(r[(i + 1) % r.len()]) - ang(r[i])))
+            .sum::<f64>()
+    };
+    if sense(&rims[0]) * sense(&rims[1]) < 0.0 {
+        rims[1].reverse();
+    }
+
+    let osign = face.orientation.sign();
+    let outward = |p: Point3| radial(p) * osign;
+    let row = |mesh: &mut TriangleMesh, ring: &[Point3]| -> Vec<(Point3, u32)> {
+        ring.iter()
+            .map(|&p| {
+                let id = mesh.add_vertex(MeshVertex {
+                    position: p,
+                    normal: outward(p).normalize().unwrap_or(axis),
+                    uv: None,
+                });
+                (p, id)
+            })
+            .collect()
+    };
+    let r0 = row(mesh, &rims[0]);
+    let r1 = row(mesh, &rims[1]);
+    stitch_rings(&r0, &r1, &outward, mesh);
     true
 }
 

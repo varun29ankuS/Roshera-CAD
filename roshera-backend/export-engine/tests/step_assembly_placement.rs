@@ -210,6 +210,231 @@ fn placed_instances_carry_the_part_name() {
     );
 }
 
+/// Product scaffolding for a part `cube` (PD #405, rep #301) — shared by the
+/// nested and reversed fixtures below.
+fn cube_product() -> String {
+    let mut s = unit_cube_part();
+    s += "#400=APPLICATION_CONTEXT('mechanical design');";
+    s += "#402=PRODUCT_CONTEXT('',#400,'mechanical');";
+    s += "#404=PRODUCT_DEFINITION_CONTEXT('part definition',#400,'design');";
+    s += "#401=PRODUCT('cube','cube','',(#402));";
+    s += "#403=PRODUCT_DEFINITION_FORMATION('','',#401);";
+    s += "#405=PRODUCT_DEFINITION('design','',#403,#404);";
+    s += "#406=PRODUCT_DEFINITION_SHAPE('','',#405);";
+    s += "#407=SHAPE_DEFINITION_REPRESENTATION(#406,#301);";
+    s
+}
+
+/// A product `name` with PD `#pd`, shape rep `#rep` holding `items`.
+fn assembly_product(name: &str, base: u64, items: &str) -> String {
+    let (prod, pdf, pd, pds, sdr, rep) = (base, base + 1, base + 2, base + 3, base + 4, base + 5);
+    format!(
+        "#{prod}=PRODUCT('{name}','{name}','',(#402));\
+         #{pdf}=PRODUCT_DEFINITION_FORMATION('','',#{prod});\
+         #{pd}=PRODUCT_DEFINITION('design','',#{pdf},#404);\
+         #{pds}=PRODUCT_DEFINITION_SHAPE('','',#{pd});\
+         #{rep}=SHAPE_REPRESENTATION('{name}',({items}),#205);\
+         #{sdr}=SHAPE_DEFINITION_REPRESENTATION(#{pds},#{rep});"
+    )
+}
+
+/// One use of child PD `child` (rep `child_rep`, frame `child_item`) inside
+/// parent PD `parent` (rep `parent_rep`, frame `parent_item`). `reversed`
+/// writes the relationship parent-first, as some exporters do.
+#[allow(clippy::too_many_arguments)]
+fn occurrence(
+    base: u64,
+    parent: u64,
+    child: u64,
+    parent_rep: u64,
+    child_rep: u64,
+    parent_item: u64,
+    child_item: u64,
+    reversed: bool,
+) -> String {
+    let (nauo, pds, idt, rr, cdsr) = (base, base + 1, base + 2, base + 3, base + 4);
+    let (rep_1, rep_2, item_1, item_2) = if reversed {
+        (parent_rep, child_rep, parent_item, child_item)
+    } else {
+        (child_rep, parent_rep, child_item, parent_item)
+    };
+    format!(
+        "#{nauo}=NEXT_ASSEMBLY_USAGE_OCCURRENCE('{nauo}','u{nauo}','',#{parent},#{child},$);\
+         #{pds}=PRODUCT_DEFINITION_SHAPE('','',#{nauo});\
+         #{idt}=ITEM_DEFINED_TRANSFORMATION('','',#{item_1},#{item_2});\
+         #{rr}=(REPRESENTATION_RELATIONSHIP('','',#{rep_1},#{rep_2})\
+         REPRESENTATION_RELATIONSHIP_WITH_TRANSFORMATION(#{idt})\
+         SHAPE_REPRESENTATION_RELATIONSHIP());\
+         #{cdsr}=CONTEXT_DEPENDENT_SHAPE_REPRESENTATION(#{rr},#{pds});"
+    )
+}
+
+/// `top` places sub-assembly `sub` at (100,0,0); `sub` places `cube` at
+/// (0,5,0). The cube must land at (100,5,0): placements compose down the
+/// tree, they do not just apply the last one.
+#[test]
+fn nested_sub_assembly_placements_compose() {
+    let mut s = cube_product();
+    s += "#600=CARTESIAN_POINT('',(100.,0.,0.));#601=CARTESIAN_POINT('',(0.,5.,0.));";
+    s += "#602=AXIS2_PLACEMENT_3D('top->sub',#600,#23,#21);";
+    s += "#603=AXIS2_PLACEMENT_3D('sub->cube',#601,#23,#21);";
+    // sub (PD #612, rep #615) holds its origin + the cube's target frame.
+    s += &assembly_product("sub", 610, "#204,#603");
+    // top (PD #622, rep #625) holds its origin + the sub's target frame.
+    s += &assembly_product("top", 620, "#204,#602");
+    s += &occurrence(700, 622, 612, 625, 615, 602, 204, false);
+    s += &occurrence(710, 612, 405, 615, 301, 603, 204, false);
+    let (model, report) = ExportEngine::new()
+        .import_step_content(&envelope(&s), "nested")
+        .unwrap();
+    assert_eq!(
+        model.solids.len(),
+        1,
+        "one use → one solid: {:?}",
+        report.warnings
+    );
+    let (sid, _) = model.solids.iter().next().unwrap();
+    let (lo, hi) = solid_bbox(&model, sid);
+    assert!(
+        close(lo, [100.0, 5.0, 0.0]) && close(hi, [101.0, 6.0, 1.0]),
+        "cube must sit at (100,5,0) after BOTH placements: lo={lo:?} hi={hi:?}"
+    );
+}
+
+/// The same placement written parent-first (rep_1 = parent) must land the
+/// part in the same place: which side is the child is read from the product
+/// tree, not assumed from field order.
+#[test]
+fn reversed_representation_relationship_places_the_same() {
+    let mut s = cube_product();
+    s += "#600=CARTESIAN_POINT('',(7.,0.,0.));";
+    s += "#602=AXIS2_PLACEMENT_3D('asm->cube',#600,#23,#21);";
+    s += &assembly_product("asm", 620, "#204,#602");
+    s += &occurrence(700, 622, 405, 625, 301, 602, 204, true);
+    let (model, report) = ExportEngine::new()
+        .import_step_content(&envelope(&s), "reversed")
+        .unwrap();
+    assert_eq!(model.solids.len(), 1, "{:?}", report.warnings);
+    let (sid, _) = model.solids.iter().next().unwrap();
+    let (lo, hi) = solid_bbox(&model, sid);
+    assert!(
+        close(lo, [7.0, 0.0, 0.0]) && close(hi, [8.0, 1.0, 1.0]),
+        "parent-first relationship must still move the cube to x=7: lo={lo:?} hi={hi:?}"
+    );
+}
+
+/// The SolidWorks layout (the robot-arm probe file): the part's product
+/// points at a placement-only `SHAPE_REPRESENTATION` (#330), which a plain
+/// `SHAPE_REPRESENTATION_RELATIONSHIP` links to the B-Rep representation
+/// (#301) holding the solid; the occurrence's placement relates the two
+/// placement-only reps. The solid must still be found through the link and
+/// placed — twice.
+#[test]
+fn a_part_whose_brep_is_linked_by_a_shape_representation_relationship_is_placed() {
+    let mut s = unit_cube_part();
+    s += "#400=APPLICATION_CONTEXT('mechanical design');";
+    s += "#402=PRODUCT_CONTEXT('',#400,'mechanical');";
+    s += "#404=PRODUCT_DEFINITION_CONTEXT('part definition',#400,'design');";
+    s += "#401=PRODUCT('cube','cube','',(#402));";
+    s += "#403=PRODUCT_DEFINITION_FORMATION('','',#401);";
+    s += "#405=PRODUCT_DEFINITION('design','',#403,#404);";
+    s += "#406=PRODUCT_DEFINITION_SHAPE('','',#405);";
+    // Placement-only part rep, linked to the B-Rep rep #301.
+    s += "#330=SHAPE_REPRESENTATION('cube',(#204),#205);";
+    s += "#407=SHAPE_DEFINITION_REPRESENTATION(#406,#330);";
+    s += "#331=SHAPE_REPRESENTATION_RELATIONSHIP('','',#330,#301);";
+    s += "#430=CARTESIAN_POINT('',(10.,0.,0.));#431=CARTESIAN_POINT('',(0.,20.,0.));";
+    s += "#421=AXIS2_PLACEMENT_3D('i1',#430,#23,#21);";
+    s += "#422=AXIS2_PLACEMENT_3D('i2',#431,#23,#21);";
+    s += &assembly_product("asm", 620, "#204,#421,#422");
+    s += &occurrence(700, 622, 405, 625, 330, 421, 204, false);
+    s += &occurrence(710, 622, 405, 625, 330, 422, 204, false);
+    let (model, report) = ExportEngine::new()
+        .import_step_content(&envelope(&s), "linked")
+        .unwrap();
+    assert_eq!(
+        model.solids.len(),
+        2,
+        "two uses of the linked part → two solids: {:?}",
+        report.warnings
+    );
+    let boxes: Vec<_> = model
+        .solids
+        .iter()
+        .map(|(sid, _)| solid_bbox(&model, sid))
+        .collect();
+    for origin in [[10.0, 0.0, 0.0], [0.0, 20.0, 0.0]] {
+        assert!(
+            boxes.iter().any(|(lo, _)| close(*lo, origin)),
+            "a cube must sit at {origin:?}: {boxes:?}"
+        );
+    }
+    assert!(
+        !report
+            .counts
+            .unsupported
+            .contains_key("SHAPE_REPRESENTATION_RELATIONSHIP"),
+        "the link is read, not dropped: {:?}",
+        report.counts.unsupported
+    );
+}
+
+/// An occurrence whose placement is missing is not silently guessed: the
+/// part is still imported (at its parent's origin) and the report says so,
+/// naming the occurrence.
+#[test]
+fn an_occurrence_without_a_placement_is_reported() {
+    let mut s = cube_product();
+    s += &assembly_product("asm", 620, "#204");
+    s += "#700=NEXT_ASSEMBLY_USAGE_OCCURRENCE('700','u700','',#622,#405,$);";
+    let (model, report) = ExportEngine::new()
+        .import_step_content(&envelope(&s), "unplaced")
+        .unwrap();
+    assert_eq!(model.solids.len(), 1);
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|w| w.instance == Some(700) && w.message.contains("no usable placement")),
+        "missing placement must be reported against #700: {:?}",
+        report.warnings
+    );
+}
+
+/// Two uses of one part are two bodies with DISJOINT face PIDs, and the
+/// whole import is reproducible: same file → same PIDs.
+#[test]
+fn each_use_of_a_part_gets_its_own_stable_pids() {
+    let text = envelope(&two_instance_assembly());
+    let pids = |model: &BRepModel| -> Vec<std::collections::BTreeSet<u128>> {
+        let mut per_solid: Vec<_> = model
+            .solids
+            .iter()
+            .map(|(sid, s)| {
+                let shell = model.shells.get(s.outer_shell).unwrap();
+                let set: std::collections::BTreeSet<u128> = shell
+                    .faces
+                    .iter()
+                    .map(|f| model.face_pid(*f).expect("face PID").as_u128())
+                    .collect();
+                assert_eq!(set.len(), 6, "solid {sid}: six distinct face PIDs");
+                set
+            })
+            .collect();
+        per_solid.sort();
+        per_solid
+    };
+    let (a, _) = ExportEngine::new().import_step_content(&text, "a").unwrap();
+    let (b, _) = ExportEngine::new().import_step_content(&text, "b").unwrap();
+    let (pa, pb) = (pids(&a), pids(&b));
+    assert_eq!(pa.len(), 2);
+    assert!(
+        pa[0].is_disjoint(&pa[1]),
+        "two uses of the cube must not share face PIDs"
+    );
+    assert_eq!(pa, pb, "same file → same PIDs");
+}
+
 #[test]
 fn placement_entities_are_no_longer_reported_unsupported() {
     let (_, report) = ExportEngine::new()

@@ -164,6 +164,11 @@ fn main() {
             v.map(|v| v.error_count.to_string()).unwrap_or_else(|| "?".into()),
             feats.len(),
         );
+        if let Some(v) = v.filter(|v| !v.sound) {
+            for e in v.errors.iter().take(2) {
+                println!("    ERR {}", e.chars().take(300).collect::<String>());
+            }
+        }
         let _ = std::io::stdout().flush();
     }
     println!(

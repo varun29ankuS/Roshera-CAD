@@ -182,6 +182,60 @@ pub struct ResolutionCaches {
     /// Source `#N` → `CIRCLE` geometry (placement + radius). Same
     /// rationale as [`Self::step_lines`].
     pub step_circles: HashMap<u64, StepCircleGeom>,
+    /// The product structure (parts, assembly occurrences, placements),
+    /// read by the tier-3 product handlers and consumed after dispatch by
+    /// the assembly-placement pass (`super::assembly_placement`).
+    pub product: ProductStructure,
+}
+
+/// One `NEXT_ASSEMBLY_USAGE_OCCURRENCE`: `parent` uses `child` once.
+#[derive(Debug, Clone)]
+pub struct Occurrence {
+    /// The occurrence's `id` attribute (e.g. `'NAUO12'`).
+    pub id: String,
+    /// The occurrence's `name` attribute — exporters put the instance name
+    /// here (`'Bolt:3'`).
+    pub name: String,
+    /// `relating_product_definition`: the assembly.
+    pub parent: u64,
+    /// `related_product_definition`: the component it places.
+    pub child: u64,
+}
+
+/// The STEP product structure, keyed by source `#N`:
+///
+/// ```text
+/// PRODUCT ← PRODUCT_DEFINITION_FORMATION ← PRODUCT_DEFINITION (PD)
+/// PD ← PRODUCT_DEFINITION_SHAPE (PDS) ← SHAPE_DEFINITION_REPRESENTATION → rep
+/// NEXT_ASSEMBLY_USAGE_OCCURRENCE(parent PD, child PD) ← PDS
+///   ← CONTEXT_DEPENDENT_SHAPE_REPRESENTATION(rep relationship w/ transform, PDS)
+/// ```
+#[derive(Debug, Default)]
+pub struct ProductStructure {
+    /// `PRODUCT` → its display name (`name`, falling back to `id`).
+    pub products: HashMap<u64, String>,
+    /// `PRODUCT_DEFINITION_FORMATION` → the `PRODUCT` it versions.
+    pub formations: HashMap<u64, u64>,
+    /// `PRODUCT_DEFINITION` → its `PRODUCT_DEFINITION_FORMATION`.
+    pub definitions: HashMap<u64, u64>,
+    /// `PRODUCT_DEFINITION_SHAPE` → what it is the shape of (a
+    /// `PRODUCT_DEFINITION`, or a `NEXT_ASSEMBLY_USAGE_OCCURRENCE`).
+    pub definition_shapes: HashMap<u64, u64>,
+    /// `SHAPE_DEFINITION_REPRESENTATION` pairs `(PDS, representation)`.
+    pub shape_representations: Vec<(u64, u64)>,
+    /// `NEXT_ASSEMBLY_USAGE_OCCURRENCE` → the occurrence.
+    pub occurrences: HashMap<u64, Occurrence>,
+    /// `ITEM_DEFINED_TRANSFORMATION` → `(transform_item_1, transform_item_2)`.
+    pub transformations: HashMap<u64, (u64, u64)>,
+    /// `CONTEXT_DEPENDENT_SHAPE_REPRESENTATION` pairs
+    /// `(representation_relation, represented_product_relation PDS)`.
+    pub placements: Vec<(u64, u64)>,
+    /// Plain (untransformed) `SHAPE_REPRESENTATION_RELATIONSHIP` /
+    /// `REPRESENTATION_RELATIONSHIP` pairs `(rep_1, rep_2)`: two
+    /// representations of the SAME shape. SolidWorks-style files hang a
+    /// part's product on a placement-only representation and link it to the
+    /// B-Rep representation this way.
+    pub rep_links: Vec<(u64, u64)>,
 }
 
 /// Sentinel inserted into [`ResolutionCaches`] keys by the lazy
