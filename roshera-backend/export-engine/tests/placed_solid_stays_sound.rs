@@ -332,6 +332,68 @@ fn the_robot_arm_shim_stays_sound_when_placed() {
     assert_moved_by(&mut model, sid, m, "robot-arm S6x12 shim");
 }
 
+/// A chamfer band as SolidWorks writes it: a cone face bounded by TWO closed
+/// circles (outer + inner loop, no seam edge), angle in degrees. Every
+/// DIN 912 cap screw / DIN 555 nut in the robot arm has one. The cone mesher
+/// read "outer loop has one edge" as a pointed (apex) cone and fanned the
+/// face to an apex that is not on it: 200+ open mesh edges, unsound.
+#[test]
+fn a_two_circle_chamfer_band_meshes_watertight_and_stays_sound_placed() {
+    let text = include_str!("fixtures/chamfer_frustum_two_circles.step");
+    let (mut model, report) = export_engine::ExportEngine::new()
+        .import_step_content(text, "chamfer_frustum_two_circles")
+        .expect("import");
+    let sid = model.solids.iter().map(|(id, _)| id).next().expect("solid");
+    let cert = model.certify_solid(sid);
+    assert!(
+        report.ok && cert.is_sound(),
+        "the frustum imports sound (watertight={} oriented={}): {:?} / {:?}",
+        cert.watertight,
+        cert.oriented,
+        cert.errors,
+        report.warnings
+    );
+    assert_moved_by(
+        &mut model,
+        sid,
+        placement([0.3, 0.4, 0.866_025_403_784_438_6], 1.1, [40.0, -15.0, 7.0]),
+        "two-circle chamfer frustum",
+    );
+}
+
+/// The REAL robot-arm `DIN 912 - M6 x 25` socket-head cap screw (cut out of
+/// the assembly file with its product chain and units). The bottom of its
+/// hex socket is a 120° drill-point cone whose single loop is the six curves
+/// where the hex walls meet it: it winds once round the cone's axis with the
+/// apex INSIDE the face. Curved-CDT cannot chart a loop around the apex
+/// (`CrossingFixedEdge`), and the untrimmed-grid fallback then meshed the
+/// whole uncut cone, leaving the socket walls with nothing to meet: 362 open
+/// mesh edges, unsound. 252 fastener uses in the arm were this part family.
+#[test]
+fn the_robot_arm_cap_screw_imports_sound_and_stays_sound_placed() {
+    let text = include_str!("fixtures/din912_m6x25_cap_screw.step");
+    let (mut model, report) = export_engine::ExportEngine::new()
+        .import_step_content(text, "din912_m6x25_cap_screw")
+        .expect("import");
+    let sid = model.solids.iter().map(|(id, _)| id).next().expect("solid");
+    let cert = model.certify_solid(sid);
+    assert!(
+        cert.is_sound(),
+        "the cap screw imports sound (watertight={} oriented={} self-x-free={}): {:?} / {:?}",
+        cert.watertight,
+        cert.oriented,
+        cert.self_intersection_free,
+        cert.errors,
+        report.warnings
+    );
+    assert_moved_by(
+        &mut model,
+        sid,
+        placement([0.3, 0.4, 0.866_025_403_784_438_6], 1.1, [40.0, -15.0, 7.0]),
+        "DIN 912 M6x25 cap screw",
+    );
+}
+
 #[test]
 fn a_placed_tube_stays_sound() {
     assert_placement_keeps_soundness(tube, "tube");

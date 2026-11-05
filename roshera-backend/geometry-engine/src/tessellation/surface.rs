@@ -329,7 +329,10 @@ pub fn tessellate_face(
             // Trimmed torus (boolean rim-poke main body / bump) → conforming
             // grid+stitch mesher; untrimmed full torus falls through to the fast
             // structured grid.
-            if tessellate_blend_torus_conforming(face, model, surface, cache, params, mesh) {
+            if tessellate_torus_two_circle_band(face, model, surface, cache, params, mesh) {
+                // A fillet/round as STEP writers emit it: one closed major
+                // circle as the outer loop, one as the inner, no seam.
+            } else if tessellate_blend_torus_conforming(face, model, surface, cache, params, mesh) {
             } else if !tessellate_toroidal_trimmed(face, model, surface, cache, params, mesh) {
                 tessellate_toroidal_face(face, model, params, cache, mesh);
             }
@@ -3942,6 +3945,13 @@ fn tessellate_conical_face(
         return;
     }
 
+    // An apex CAP trimmed by a multi-edge loop that winds once round the axis
+    // (a drill point cut by a hex socket): fanned from the apex along the
+    // cone's rulings to the cached boundary, conforming to every neighbour.
+    if tessellate_cone_apex_cap(face, model, surface, cache, params, mesh) {
+        return;
+    }
+
     // Get parameter bounds from face loops
     let (u_min, u_max, v_min, v_max) = get_face_parameter_bounds(face, model);
 
@@ -4034,6 +4044,191 @@ fn tessellate_conical_face(
             );
         }
     }
+}
+
+/// A cone face that CONTAINS its apex and is bounded by one multi-edge loop
+/// winding once round the axis — e.g. the 120° drill point at the bottom of
+/// a hex socket, trimmed by the six curves where the hex walls meet it.
+///
+/// Curved-CDT cannot mesh it: in the cone's `(θ, v)` chart the apex is a
+/// singular line and a loop round it is not a closed polygon
+/// (`CrossingFixedEdge`); the untrimmed-grid fallback then covers the whole
+/// uncut cone and the neighbouring walls have nothing to meet.
+///
+/// A cone is ruled through its apex, so every point `apex + t·(b − apex)` for
+/// a boundary sample `b` lies exactly on the surface. The face is meshed as
+/// rings along those rulings, the outermost ring being the cached boundary
+/// samples themselves — shared bit-for-bit with the adjoining faces, so the
+/// face welds watertight by construction. Declines (returns `false`) for
+/// anything else: inner loops, angular limits, a single-edge loop (the plain
+/// apex cone has its own path), a boundary off the cone or across nappes, or
+/// a loop that does not go once round the axis (the apex would not be inside).
+fn tessellate_cone_apex_cap(
+    face: &Face,
+    model: &BRepModel,
+    surface: &dyn Surface,
+    cache: &EdgeSampleCache,
+    params: &TessellationParams,
+    mesh: &mut TriangleMesh,
+) -> bool {
+    use crate::primitives::surface::Cone;
+    let Some(cone) = surface.as_any().downcast_ref::<Cone>() else {
+        return false;
+    };
+    if !face.inner_loops.is_empty() || cone.angle_limits.is_some() {
+        return false;
+    }
+    let Some(lp) = model.loops.get(face.outer_loop) else {
+        return false;
+    };
+    if lp.edges.len() < 2 {
+        return false;
+    }
+    let Ok(axis) = cone.axis.normalize() else {
+        return false;
+    };
+    let rim = loop_rim_samples(lp, model, cache);
+    if rim.len() < 3 {
+        return false;
+    }
+    let apex = cone.apex;
+    let (sin_a, cos_a) = cone.half_angle.sin_cos();
+    let tan_a = cone.half_angle.tan();
+    let scale = rim
+        .iter()
+        .map(|p| (*p - apex).magnitude())
+        .fold(0.0_f64, f64::max);
+    if !(scale > 0.0) {
+        return false;
+    }
+    let tol = Tolerance::default().distance().max(1e-6 * scale);
+    let radial = |p: Point3| {
+        let w = p - apex;
+        w - axis * w.dot(&axis)
+    };
+
+    // Every boundary sample on the cone, all on ONE nappe, none at the apex.
+    let mut nappe = 0.0_f64;
+    for &p in &rim {
+        let along = (p - apex).dot(&axis);
+        if along.abs() <= tol {
+            return false;
+        }
+        if (radial(p).magnitude() - along.abs() * tan_a).abs() > tol {
+            return false;
+        }
+        if nappe == 0.0 {
+            nappe = along.signum();
+        } else if along.signum() != nappe {
+            return false;
+        }
+    }
+
+    // The loop goes ONCE round the axis: a bounded face with no inner loop
+    // and such a boundary is the cap that holds the apex.
+    let Ok(e1) = radial(rim[0]).normalize() else {
+        return false;
+    };
+    let e2 = axis.cross(&e1);
+    let ang = |p: Point3| {
+        let w = radial(p);
+        w.dot(&e2).atan2(w.dot(&e1))
+    };
+    let wrap = |mut d: f64| {
+        while d > std::f64::consts::PI {
+            d -= std::f64::consts::TAU;
+        }
+        while d < -std::f64::consts::PI {
+            d += std::f64::consts::TAU;
+        }
+        d
+    };
+    let winding: f64 = (0..rim.len())
+        .map(|i| wrap(ang(rim[(i + 1) % rim.len()]) - ang(rim[i])))
+        .sum();
+    if (winding.abs() - std::f64::consts::TAU).abs() > 1e-3 {
+        return false;
+    }
+
+    // Normal sense: the geometric "away from the cone's inside" normal,
+    // signed to match the surface's own normal and the face orientation.
+    let away = |p: Point3| -> Vector3 {
+        let r = radial(p).normalize().unwrap_or(e1);
+        r * cos_a - axis * (nappe * sin_a)
+    };
+    let surface_sign = match surface
+        .closest_point(&rim[0], Tolerance::default())
+        .and_then(|(u, v)| surface.normal_at(u, v))
+    {
+        Ok(n) if n.dot(&away(rim[0])).abs() > 1e-9 => n.dot(&away(rim[0])).signum(),
+        _ => return false,
+    };
+    let sigma = surface_sign * face.orientation.sign();
+    let normal_at = |p: Point3| away(p) * sigma;
+
+    // Rings along the rulings; ring `levels` is the boundary itself.
+    let levels = linear_steps_for_quality(scale, params).clamp(1, 16);
+    let apex_id = mesh.add_vertex(MeshVertex {
+        position: apex,
+        normal: axis * (-nappe * sigma),
+        uv: None,
+    });
+    let mut rings: Vec<Vec<u32>> = Vec::with_capacity(levels);
+    for k in 1..=levels {
+        let t = k as f64 / levels as f64;
+        let ring = rim
+            .iter()
+            .map(|&b| {
+                let p = if k == levels {
+                    b
+                } else {
+                    apex + (b - apex) * t
+                };
+                mesh.add_vertex(MeshVertex {
+                    position: p,
+                    normal: normal_at(b),
+                    uv: None,
+                })
+            })
+            .collect();
+        rings.push(ring);
+    }
+
+    // Emit in one natural order, then wind the whole face by ONE decision
+    // (per-triangle flips are unstable on slivers near the apex).
+    let n = rim.len();
+    let mut tris: Vec<[u32; 3]> = Vec::with_capacity(n * (2 * levels - 1));
+    for i in 0..n {
+        let j = (i + 1) % n;
+        tris.push([apex_id, rings[0][i], rings[0][j]]);
+        for k in 0..levels - 1 {
+            let (lo, hi) = (&rings[k], &rings[k + 1]);
+            tris.push([lo[i], hi[i], hi[j]]);
+            tris.push([lo[i], hi[j], lo[j]]);
+        }
+    }
+    let agreement: f64 = tris
+        .iter()
+        .map(|&[a, b, c]| {
+            let pa = mesh.vertices[a as usize].position;
+            let pb = mesh.vertices[b as usize].position;
+            let pc = mesh.vertices[c as usize].position;
+            let centroid = Point3::new(
+                (pa.x + pb.x + pc.x) / 3.0,
+                (pa.y + pb.y + pc.y) / 3.0,
+                (pa.z + pb.z + pc.z) / 3.0,
+            );
+            (pb - pa).cross(&(pc - pa)).dot(&normal_at(centroid))
+        })
+        .sum();
+    for [a, b, c] in tris {
+        if agreement >= 0.0 {
+            mesh.add_triangle(a, b, c);
+        } else {
+            mesh.add_triangle(a, c, b);
+        }
+    }
+    true
 }
 
 /// Tessellate cone with apex handling
@@ -4831,6 +5026,198 @@ fn tessellate_blend_cone_conforming(
     let lower = add_ring(&ring_a, mesh);
     let upper = add_ring(&ring_b, mesh);
     stitch_blend_rings(&lower, &upper, mesh);
+    true
+}
+
+/// A torus band bounded by exactly two closed MAJOR circles — one the outer
+/// loop, one the inner — with no seam edge. This is how SolidWorks (and most
+/// STEP writers) emit every fillet or round on a circular edge.
+///
+/// The band covers one of the TWO arcs of the tube's cross-section that join
+/// the rims. The parameter-bounds grid could not tell them apart (the tube
+/// angle is periodic) and meshed the wrong one for some faces: measured on the
+/// robot-arm DIN 912 head round, the 270° complement instead of the 90° round
+/// — still meeting both rims, so watertight, but bulging into the part and
+/// wound against both neighbours (`oriented == false`).
+///
+/// The face's own boundary decides: the face lies to the LEFT of each loop,
+/// walked in its oriented direction, seen from the face's outward side. At a
+/// rim sample, `n × t` points into the face; its component along the tube
+/// direction says which way the band leaves that rim. Both rims must agree
+/// (leave toward each other) or the mesher declines. Rows are taken from the
+/// cached rim samples verbatim (bit-identical to the neighbours') with
+/// interior rows on the exact torus, stitched band-wide.
+fn tessellate_torus_two_circle_band(
+    face: &Face,
+    model: &BRepModel,
+    surface: &dyn Surface,
+    cache: &EdgeSampleCache,
+    params: &TessellationParams,
+    mesh: &mut TriangleMesh,
+) -> bool {
+    use crate::primitives::surface::Torus;
+    let Some(torus) = surface.as_any().downcast_ref::<Torus>() else {
+        return false;
+    };
+    if torus.param_limits.is_some() || face.inner_loops.len() != 1 {
+        return false;
+    }
+    let Ok(axis) = torus.axis.normalize() else {
+        return false;
+    };
+    let (center, big_r, small_r) = (torus.center, torus.major_radius, torus.minor_radius);
+    if !(small_r > 0.0) || !(big_r > small_r) {
+        return false;
+    }
+    let tol = Tolerance::default()
+        .distance()
+        .max(1e-6 * (big_r + small_r));
+
+    // (axial, radial) of a point in the torus frame, and its tube angle v.
+    let frame = |p: Point3| {
+        let w = p - center;
+        let a = w.dot(&axis);
+        let rad = w - axis * a;
+        (a, rad)
+    };
+    let tube_angle = |p: Point3| {
+        let (a, rad) = frame(p);
+        a.atan2(rad.magnitude() - big_r)
+    };
+
+    let mut rims: Vec<Vec<Point3>> = Vec::with_capacity(2);
+    for lid in [face.outer_loop, face.inner_loops[0]] {
+        let Some(l) = model.loops.get(lid) else {
+            return false;
+        };
+        if l.edges.len() != 1 {
+            return false;
+        }
+        let Some(e) = model.edges.get(l.edges[0]) else {
+            return false;
+        };
+        if e.start_vertex != e.end_vertex {
+            return false;
+        }
+        let ring = loop_rim_samples(l, model, cache);
+        if ring.len() < 3 {
+            return false;
+        }
+        // On the torus, and a MAJOR circle: constant axial height and radius.
+        let (a0, r0) = frame(ring[0]);
+        let rho0 = r0.magnitude();
+        for &p in &ring {
+            let (a, rad) = frame(p);
+            let rho = rad.magnitude();
+            let on_tube = ((rho - big_r).powi(2) + a * a).sqrt() - small_r;
+            if on_tube.abs() > tol || (a - a0).abs() > tol || (rho - rho0).abs() > tol {
+                return false;
+            }
+        }
+        rims.push(ring);
+    }
+
+    let osign = face.orientation.sign();
+    // True torus normal (away from the tube's core circle), oriented by the face.
+    let outward = |p: Point3| -> Vector3 {
+        let (_, rad) = frame(p);
+        let core = center + rad.normalize().unwrap_or(torus.ref_dir) * big_r;
+        (p - core).normalize().unwrap_or(axis) * osign
+    };
+    // Unit direction of increasing tube angle at p.
+    let along_v = |p: Point3| -> Vector3 {
+        let (_, rad) = frame(p);
+        let e = rad.normalize().unwrap_or(torus.ref_dir);
+        let v = tube_angle(p);
+        e * (-v.sin()) + axis * v.cos()
+    };
+    // Which way (±1 in v) the face leaves a rim, from the left-of-loop rule.
+    let leaves = |ring: &[Point3]| -> Option<f64> {
+        let mut acc = 0.0;
+        for i in 0..ring.len() {
+            let (p, q) = (ring[i], ring[(i + 1) % ring.len()]);
+            let t = q - p;
+            acc += outward(p).cross(&t).dot(&along_v(p));
+        }
+        (acc.abs() > 1e-12).then(|| acc.signum())
+    };
+    let (Some(dir_a), Some(dir_b)) = (leaves(&rims[0]), leaves(&rims[1])) else {
+        return false;
+    };
+    let va = tube_angle(rims[0][0]);
+    let vb = tube_angle(rims[1][0]);
+    // Signed arc from rim A to rim B going the way the face leaves A.
+    let tau = std::f64::consts::TAU;
+    let mut delta = (vb - va).rem_euclid(tau);
+    if dir_a < 0.0 {
+        delta -= tau;
+    }
+    // The face must leave B back toward A: the opposite sense.
+    if dir_b == dir_a || delta.abs() < 1e-9 || (delta.abs() - tau).abs() < 1e-9 {
+        return false;
+    }
+
+    // Walk both rims the same way round the axis so rows pair coherently.
+    let e1 = frame(rims[0][0]).1.normalize().unwrap_or(torus.ref_dir);
+    let e2 = axis.cross(&e1);
+    let theta = |p: Point3| {
+        let (_, rad) = frame(p);
+        rad.dot(&e2).atan2(rad.dot(&e1))
+    };
+    let wrap = |mut d: f64| {
+        while d > std::f64::consts::PI {
+            d -= tau;
+        }
+        while d < -std::f64::consts::PI {
+            d += tau;
+        }
+        d
+    };
+    let sense = |r: &[Point3]| -> f64 {
+        (0..r.len())
+            .map(|i| wrap(theta(r[(i + 1) % r.len()]) - theta(r[i])))
+            .sum::<f64>()
+    };
+    if sense(&rims[0]) * sense(&rims[1]) < 0.0 {
+        rims[1].reverse();
+    }
+
+    // Interior rows on the exact torus at the larger rim's angles.
+    let steps = arc_steps_for_quality(delta.abs(), small_r, params).max(1);
+    let reference = if rims[0].len() >= rims[1].len() {
+        rims[0].clone()
+    } else {
+        rims[1].clone()
+    };
+    let row_ids = |mesh: &mut TriangleMesh, pts: &[Point3]| -> Vec<(Point3, u32)> {
+        pts.iter()
+            .map(|&p| {
+                let id = mesh.add_vertex(MeshVertex {
+                    position: p,
+                    normal: outward(p),
+                    uv: None,
+                });
+                (p, id)
+            })
+            .collect()
+    };
+    let mut rows: Vec<Vec<(Point3, u32)>> = Vec::with_capacity(steps + 1);
+    rows.push(row_ids(mesh, &rims[0]));
+    for k in 1..steps {
+        let v = va + delta * (k as f64 / steps as f64);
+        let pts: Vec<Point3> = reference
+            .iter()
+            .map(|&p| {
+                let e = frame(p).1.normalize().unwrap_or(torus.ref_dir);
+                center + e * (big_r + small_r * v.cos()) + axis * (small_r * v.sin())
+            })
+            .collect();
+        rows.push(row_ids(mesh, &pts));
+    }
+    rows.push(row_ids(mesh, &rims[1]));
+    for k in 0..rows.len() - 1 {
+        stitch_rings(&rows[k], &rows[k + 1], &outward, mesh);
+    }
     true
 }
 
