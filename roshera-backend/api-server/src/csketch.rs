@@ -442,6 +442,48 @@ fn not_found(id: SketchId) -> ApiError {
 }
 
 /// Resolve a sketch id from the manager or yield a 404-shaped `ApiError`.
+/// SK-C1: extrude and revolve build the sketch AS STORED — they never solve.
+/// Refuse when the stored geometry violates any of its own constraints, naming
+/// each violated constraint with its residual, and saying whether a solve
+/// would fix it (`solvable`). Building the stored geometry anyway would hand
+/// the agent a solid its own sketch says is wrong.
+fn refuse_unsatisfied_sketch(sketch: &Sketch) -> Result<(), ApiError> {
+    let cert = sketch.certify();
+    if cert.constraints_satisfied {
+        return Ok(());
+    }
+    let violated: Vec<serde_json::Value> = cert
+        .constraint_facts
+        .iter()
+        .filter(|f| !f.satisfied)
+        .map(|f| {
+            serde_json::json!({
+                "constraint": f.id,
+                "constraint_type": f.constraint_type,
+                "residual": f.residual,
+            })
+        })
+        .collect();
+    Err(ApiError::new(
+        ErrorCode::InvalidParameter,
+        format!(
+            "the sketch as stored violates {} of its constraints — {}; the stored geometry is \
+             what would be built",
+            violated.len(),
+            if cert.solvable {
+                "solve it first (POST /api/csketch/{id}/solve, MCP psketch_solve)"
+            } else {
+                "and a solve cannot satisfy them (see the certificate's witnesses)"
+            }
+        ),
+    )
+    .with_details(serde_json::json!({
+        "gate": "sketch_constraints_unsatisfied",
+        "solvable": cert.solvable,
+        "violated": violated,
+    })))
+}
+
 fn require_sketch(state: &AppState, id: Uuid) -> Result<Arc<Sketch>, ApiError> {
     let sid = SketchId(id);
     state.csketches.get(&sid).ok_or_else(|| not_found(sid))
@@ -2129,6 +2171,7 @@ pub async fn extrude_csketch(
     validate_extrude_direction(&direction, &plane.normal())?;
 
     let sketch = require_sketch(&state, id)?;
+    refuse_unsatisfied_sketch(&sketch)?;
     let tol2d = Tolerance2d::default();
     let topology = SketchTopology::analyze(&sketch, &tol2d)
         .map_err(|e| ApiError::new(ErrorCode::InvalidParameter, e.to_string()))?;
@@ -2681,6 +2724,7 @@ pub async fn revolve_csketch(
     validate_wire_plane(&plane)?;
 
     let sketch = require_sketch(&state, id)?;
+    refuse_unsatisfied_sketch(&sketch)?;
     let tol2d = Tolerance2d::default();
     let topology = SketchTopology::analyze(&sketch, &tol2d)
         .map_err(|e| ApiError::new(ErrorCode::InvalidParameter, e.to_string()))?;

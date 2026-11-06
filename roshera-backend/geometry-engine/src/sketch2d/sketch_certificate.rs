@@ -431,8 +431,15 @@ pub struct CertificateSummary {
     pub free_dofs: usize,
     /// Safe-to-remove dependent constraints.
     pub redundant_constraints: usize,
-    /// Constraints whose post-solve residual exceeds tolerance.
+    /// Constraints the STORED sketch violates (residual above tolerance on
+    /// the un-solved geometry).
     pub violated_constraints: usize,
+    /// [`SketchValidityCertificate::constraints_satisfied`].
+    #[serde(default)]
+    pub constraints_satisfied: bool,
+    /// [`SketchValidityCertificate::solvable`].
+    #[serde(default)]
+    pub solvable: bool,
     /// Entities rigidly constructed from the datum.
     pub fully_constrained_entities: usize,
     /// Entities that can still move.
@@ -479,8 +486,22 @@ pub struct SketchValidityCertificate {
     pub entities_valid: bool,
     /// Human-readable issues backing a non-sound verdict.
     pub issues: Vec<String>,
-    /// Diagnostic-solve verdict (v2).
+    /// Diagnostic-solve verdict (v2): what a solve from the stored geometry
+    /// REACHES. It describes solvability, not the stored sketch — see
+    /// [`Self::constraints_satisfied`] for that.
     pub solver: SolverVerdict,
+    /// Every constraint is satisfied by the sketch AS STORED (each
+    /// [`ConstraintFact`] is measured on the un-solved geometry). An unsolved
+    /// sketch whose drawn geometry violates its own constraints is `false`
+    /// here even when it is solvable — it is the stored geometry that
+    /// extrude/revolve build.
+    #[serde(default)]
+    pub constraints_satisfied: bool,
+    /// A solve from the stored geometry reaches a configuration satisfying
+    /// every constraint, with no conflict. Reported separately from
+    /// `constraints_satisfied`: "can be solved" is not "is solved".
+    #[serde(default)]
+    pub solvable: bool,
     /// Structural DOF tallies (v2).
     pub dof: DofSnapshot,
     /// Component / cluster decomposition stats (v2).
@@ -559,6 +580,8 @@ impl SketchValidityCertificate {
                 .iter()
                 .filter(|f| !f.satisfied)
                 .count(),
+            constraints_satisfied: self.constraints_satisfied,
+            solvable: self.solvable,
             fully_constrained_entities: fully,
             under_constrained_entities: under,
             over_constrained_entities: over,
@@ -579,6 +602,8 @@ impl SketchValidityCertificate {
 /// solve — consumed by [`certify_sketch`].
 struct SystemAnalysis {
     solver: SolverVerdict,
+    constraints_satisfied: bool,
+    solvable: bool,
     decomposition: DecompositionStats,
     constraint_facts: Vec<ConstraintFact>,
     entity_statuses: Vec<EntityStatus>,
@@ -707,6 +732,8 @@ pub fn certify_sketch(sketch: &Sketch) -> SketchValidityCertificate {
         entities_valid,
         issues,
         solver: system.solver,
+        constraints_satisfied: system.constraints_satisfied,
+        solvable: system.solvable,
         dof: DofSnapshot {
             total_free_dofs: dof.total_free_dofs,
             constraint_dofs_removed: dof.constraint_dofs_removed,
@@ -816,12 +843,23 @@ fn analyze_constraint_system(sketch: &Sketch) -> SystemAnalysis {
     // landed. Matches `analyze_dofs`'s own ordering exactly, which is
     // what lets the two share one diagnosis.
     let rank_profile = solver.rank_profile();
-    let _ = solver.solve();
-
-    let residual_pairs = solver.residuals_by_constraint();
+    // Residuals of the sketch AS STORED, read before the solve moves the
+    // copy: every per-constraint fact (and every witness member's residual)
+    // is a statement about the geometry extrude/revolve will build. This was
+    // read AFTER the solve, so an unsolved sketch violating its own
+    // constraints certified "satisfied, residual 0" (SK-C1).
+    let stored_pairs = solver.residuals_by_constraint();
     let residual_of: HashMap<uuid::Uuid, f64> =
-        residual_pairs.iter().map(|(id, r)| (id.0, *r)).collect();
-    let final_error = residual_pairs
+        stored_pairs.iter().map(|(id, r)| (id.0, *r)).collect();
+    let constraints_satisfied = stored_pairs
+        .iter()
+        .all(|(_, r)| *r <= CERT_SATISFIED_TOLERANCE);
+
+    // The re-solve answers a different question — is the system SOLVABLE
+    // from here — and only feeds the solver verdict.
+    let _ = solver.solve();
+    let final_error = solver
+        .residuals_by_constraint()
         .iter()
         .map(|(_, r)| r * r)
         .sum::<f64>()
@@ -1028,9 +1066,12 @@ fn analyze_constraint_system(sketch: &Sketch) -> SystemAnalysis {
     } else {
         SolverVerdict::Diverged { final_error }
     };
+    let solvable = conflicts_total == 0 && final_error <= CERT_SATISFIED_TOLERANCE;
 
     SystemAnalysis {
         solver: solver_verdict,
+        constraints_satisfied,
+        solvable,
         decomposition,
         constraint_facts,
         entity_statuses,

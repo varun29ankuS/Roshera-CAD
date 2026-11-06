@@ -397,6 +397,59 @@ async fn seed_box(state: &AppState, size: f64) -> (Uuid, SolidId, [EdgeId; 3]) {
     (uuid, solid_id, corner_edges)
 }
 
+/// SK-C1: extrude builds the sketch AS STORED, so it must refuse a sketch whose
+/// stored geometry violates its own constraints. A 10×7 rectangle carrying
+/// `Length(40)` on its bottom edge, never solved, used to extrude 10×7 while
+/// its certificate (measured on a re-solved copy) read "satisfied".
+#[tokio::test]
+async fn csketch_extrude_refuses_a_sketch_that_violates_its_constraints() {
+    use geometry_engine::sketch2d::{
+        Constraint, ConstraintPriority, DimensionalConstraint, EntityRef, Point2d,
+    };
+    let state = make_test_state().await;
+    let sid = state.csketches.create();
+    let sketch = state.csketches.get(&sid).expect("sketch exists");
+    let a = sketch.add_point(Point2d::new(0.0, 0.0));
+    let b = sketch.add_point(Point2d::new(10.0, 0.0));
+    let c = sketch.add_point(Point2d::new(10.0, 7.0));
+    let d = sketch.add_point(Point2d::new(0.0, 7.0));
+    let bottom = sketch.add_line(a, b).expect("a-b");
+    sketch.add_line(b, c).expect("b-c");
+    sketch.add_line(c, d).expect("c-d");
+    sketch.add_line(d, a).expect("d-a");
+    let length = sketch.add_constraint(Constraint::new_dimensional(
+        DimensionalConstraint::Length(40.0),
+        vec![EntityRef::Line(bottom)],
+        ConstraintPriority::Required,
+    ));
+
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/api/csketch/{}/extrude", sid.0))
+        .header("content-type", "application/json")
+        .body(Body::from(json!({ "distance": 5.0 }).to_string()))
+        .expect("static request must build");
+    let (status, body) = dispatch(&state, request).await;
+    assert!(
+        !status.is_success(),
+        "an unsolved sketch violating Length(40) must not extrude: {status} {body}"
+    );
+    assert_eq!(
+        body["details"]["gate"], "sketch_constraints_unsatisfied",
+        "{body}"
+    );
+    assert_eq!(body["details"]["solvable"], true, "{body}");
+    let violated = body["details"]["violated"]
+        .as_array()
+        .expect("the violated constraints are named");
+    assert_eq!(violated.len(), 1, "{body}");
+    assert_eq!(violated[0]["constraint"], json!(length), "{body}");
+    assert!(
+        (violated[0]["residual"].as_f64().unwrap_or(0.0) - 30.0).abs() < 1e-6,
+        "{body}"
+    );
+}
+
 /// Parts an imported assembly USES but could not build reach the browser:
 /// the snapshot lists each with where it sits and why, so the tree can show
 /// what is absent instead of the part vanishing without a trace.

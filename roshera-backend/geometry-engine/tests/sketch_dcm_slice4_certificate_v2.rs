@@ -333,9 +333,20 @@ fn fully_dimensioned_slot_reports_every_entity_fully_constrained() {
             vec![EntityRef::Arc(arc)],
         ));
     }
+    // The arcs are DRAWN at radius 5 and dimensioned 6: the stored sketch
+    // violates its own Radius constraints until it is solved. The
+    // certificate describes the sketch as stored (SK-C1) — before that it
+    // reported the re-solved copy, which is how this test passed unsolved.
+    let unsolved = certify_sketch(&slot.sketch);
+    assert!(
+        !unsolved.constraints_satisfied && unsolved.solvable,
+        "drawn at r5 and dimensioned r6: unsatisfied as stored, solvable: {unsolved:?}"
+    );
+    slot.sketch.solve_constraints().expect("the slot solves");
 
     let cert = certify_sketch(&slot.sketch);
     assert!(cert.is_sound(), "dimensioned slot is sound: {cert:?}");
+    assert!(cert.constraints_satisfied, "solved: {cert:?}");
     assert_eq!(
         cert.constrainedness,
         SketchConstrainedness::FullyConstrained

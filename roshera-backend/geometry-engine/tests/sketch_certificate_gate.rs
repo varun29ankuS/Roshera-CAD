@@ -151,6 +151,55 @@ fn mutually_inconsistent_dimensions_are_caught() {
     );
 }
 
+/// SK-C1: the certificate describes the sketch AS STORED. A 10×7 rectangle
+/// carrying `Length(40)` on its bottom edge, never solved, does not satisfy
+/// that constraint — the stored edge is 10 long. The certificate used to
+/// solve a private copy and report the residuals of wherever THAT landed, so
+/// it read "satisfied, residual 0", while extrude built the stored 10×7.
+#[test]
+fn certificate_facts_describe_the_stored_sketch_not_a_resolved_copy() {
+    let sketch = Sketch::new("unsolved".to_string(), SketchAnchor::xy());
+    let a = sketch.add_point(Point2d::new(0.0, 0.0));
+    let b = sketch.add_point(Point2d::new(10.0, 0.0));
+    let c = sketch.add_point(Point2d::new(10.0, 7.0));
+    let d = sketch.add_point(Point2d::new(0.0, 7.0));
+    let bottom = sketch.add_line(a, b).expect("a-b");
+    sketch.add_line(b, c).expect("b-c");
+    sketch.add_line(c, d).expect("c-d");
+    sketch.add_line(d, a).expect("d-a");
+    let length = sketch.add_constraint(Constraint::new_dimensional(
+        DimensionalConstraint::Length(40.0),
+        vec![EntityRef::Line(bottom)],
+        ConstraintPriority::Required,
+    ));
+
+    let cert = certify_sketch(&sketch);
+
+    let fact = cert
+        .constraint_facts
+        .iter()
+        .find(|f| f.id == length)
+        .expect("a fact for the Length constraint");
+    assert!(
+        !fact.satisfied,
+        "the stored bottom edge is 10 long, not 40: the fact must be UNSATISFIED: {fact:?}"
+    );
+    assert!(
+        (fact.residual - 30.0).abs() < 1e-6,
+        "the residual is the STORED one (|10 - 40| = 30), got {}",
+        fact.residual
+    );
+    assert!(
+        !cert.constraints_satisfied,
+        "the stored sketch does not meet its constraints: {cert:?}"
+    );
+    // The sketch IS solvable: the re-solve is reported, separately.
+    assert!(
+        cert.solvable,
+        "a lone Length on a free rectangle is solvable: {cert:?}"
+    );
+}
+
 /// CALIBRATION: soundness must gate ONLY on real defects (inconsistency,
 /// degeneracy, self-intersection) — never on DOF freedom. A clean,
 /// under-constrained sketch (the common case while drawing) must stay SOUND, or
