@@ -23,6 +23,7 @@ Severity: **C** the kernel can report sound/solved/inside when it is not ·
 | ✓ | Conformal development chart for cylinder/cone meshing; SSI seeding in true lengths; SSI corrector at degenerate parametrisations | d1d27277 |
 | ✓ | SDF + `classify_point` sign from the angle-weighted pseudonormal (torus/NURBS/ruled were never counted by ray parity) | 6824778f |
 | ✓ | SK-C1 certificate describes the sketch as stored (`constraints_satisfied`, `solvable`); extrude/revolve refuse an unsatisfied sketch | 484d96a7 |
+| ✓ | SK-C2 `is_sound` requires every constraint satisfied as stored; `try_add_constraint` refuses impossible dimension values; first `Diverged` test | 9065f627 |
 
 ## Architecture — agent first, human alongside (Varun 2026-11-06)
 
@@ -131,7 +132,7 @@ with the kernel items (one kernel + one UX), so neither side waits weeks.
    extrudes 10×7. Fix: facts from an UN-solved copy (the `continuity_facts`
    pattern, line 756); the re-solve reported separately as "solvable"; extrude
    and revolve refuse (typed) when stored residuals exceed tolerance.
-2. **SK-C2 `is_sound` ignores satisfaction.** `is_sound()` (line 505) is
+2. ✓ **SK-C2 `is_sound` ignores satisfaction.** `is_sound()` (line 505) is
    consistent ∧ valid ∧ no self-intersection; a full-rank infeasible system
    (triangle sides 1, 1, 5) reads sound. Fix: add "every constraint satisfied
    on the stored sketch"; validate dimension values at
