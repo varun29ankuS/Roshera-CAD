@@ -1113,6 +1113,17 @@ fn perception_json(
         geometry_engine::primitives::validation::ValidationLevel::Standard,
     )
     .is_valid;
+    (perception_seed(model, solid_id, valid), valid)
+}
+
+/// The perception seed for a solid whose B-Rep validity is already known
+/// (e.g. from a certificate just computed): [`perception_json`] without its
+/// own whole-model validation sweep.
+fn perception_seed(
+    model: &geometry_engine::primitives::topology_builder::BRepModel,
+    solid_id: geometry_engine::primitives::solid::SolidId,
+    valid: bool,
+) -> serde_json::Value {
     let dims = model.solid_world_bbox(solid_id).map(|b| {
         let s = b.size();
         vec![s.x, s.y, s.z]
@@ -1138,7 +1149,7 @@ fn perception_json(
         "dims":              dims,
         "provenance":        provenance,
     });
-    (seed, valid)
+    seed
 }
 
 /// The FULL-certificate half of a mutating op's perception block: the
@@ -1600,7 +1611,30 @@ fn certified_response(
     full: bool,
     durability: Option<durability::DurabilityStatus>,
 ) -> serde_json::Value {
-    let (mut base, valid) = perception_json(model, solid_id);
+    certified_response_given(
+        model, model_arc, state, solid_id, mesh, full, durability, None,
+    )
+}
+
+/// [`certified_response`] for a caller that already knows the solid's B-Rep
+/// validity (`known_brep_valid`), so the seed skips its own whole-model
+/// validation sweep. The batch import path passes its certificate's
+/// `brep_valid` — the same check the seed would run.
+#[allow(clippy::too_many_arguments)]
+fn certified_response_given(
+    model: &mut geometry_engine::primitives::topology_builder::BRepModel,
+    model_arc: &reconcile_task::ModelHandle,
+    state: &AppState,
+    solid_id: geometry_engine::primitives::solid::SolidId,
+    mesh: &geometry_engine::tessellation::TriangleMesh,
+    full: bool,
+    durability: Option<durability::DurabilityStatus>,
+    known_brep_valid: Option<bool>,
+) -> serde_json::Value {
+    let (mut base, valid) = match known_brep_valid {
+        Some(valid) => (perception_seed(model, solid_id, valid), valid),
+        None => perception_json(model, solid_id),
+    };
 
     // CHEAP structural facts (O(n)): the agent's fast "what is this" signal.
     // `calculate_solid_volume` hits the per-solid mass-props cache; `face_count`
@@ -5703,15 +5737,23 @@ async fn import_step_geometry(
     // Reconstruct into a fresh model + honest report. This is a pure CPU
     // pass (parse → dispatch → validate) once `content` is in memory —
     // the only file I/O is the optional `path` read above.
-    let (imported, report) = state
-        .export_engine
-        .import_step_content(&content, &source_label)
-        .map_err(|e| {
-            ApiError::new(
-                ErrorCode::InvalidParameter,
-                format!("STEP import failed: {e:?}"),
-            )
-        })?;
+    //
+    // Minutes of CPU on a large assembly, so it runs on the blocking pool,
+    // not an async worker. A request dropped here lands nothing: the model
+    // is untouched until the splice below.
+    let engine = state.export_engine.clone();
+    let (imported, report) =
+        tokio::task::spawn_blocking(move || engine.import_step_content(&content, &source_label))
+            .await
+            .map_err(|e| {
+                ApiError::new(ErrorCode::Internal, format!("STEP import task failed: {e}"))
+            })?
+            .map_err(|e| {
+                ApiError::new(
+                    ErrorCode::InvalidParameter,
+                    format!("STEP import failed: {e:?}"),
+                )
+            })?;
 
     if imported.solids.is_empty() {
         return Err(ApiError::new(
@@ -5723,23 +5765,18 @@ async fn import_step_geometry(
         ));
     }
 
-    // Splice the reconstructed solids into the live session model,
-    // remapping ids so they don't collide with existing parts.
-    let new_solid_ids: Vec<u32> = {
-        let mut model = model_handle.write().await;
-        export_engine::formats::step::merge_solids_into(&mut model, &imported)
-    };
-
-    // Register + broadcast each new solid exactly like a primitive create.
-    let objects = register_imported_solids(
+    // Splice the reconstructed solids into the live session model
+    // (remapping ids so they don't collide with existing parts), then
+    // register + broadcast each one exactly like a primitive create.
+    let objects = splice_imported_model(
         &state,
         &model_handle,
-        &new_solid_ids,
-        base_name.as_deref(),
+        imported,
+        base_name,
         "import_step",
         "step_import",
     )
-    .await;
+    .await?;
 
     Ok(Json(serde_json::json!({
         "success": report.ok,
@@ -5748,17 +5785,67 @@ async fn import_step_geometry(
     })))
 }
 
+/// IMP-1: merge an imported model into the live session and register every
+/// solid it brings, as ONE unit that a dropped request cannot cut in half.
+///
+/// The work runs in a detached task the request only awaits: when a client
+/// hangs up (axum drops the handler future), the task still finishes, so
+/// the model never holds solids the scene does not show. Before this, a
+/// robot-arm import cut at the client's timeout left 33 of 572 parts
+/// registered while the model held all of them. A server crash mid-import
+/// is a durability question, not this one.
+async fn splice_imported_model(
+    state: &AppState,
+    model_handle: &reconcile_task::ModelHandle,
+    imported: geometry_engine::primitives::topology_builder::BRepModel,
+    base_name: Option<String>,
+    object_type: &'static str,
+    source: &'static str,
+) -> Result<Vec<serde_json::Value>, error_catalog::ApiError> {
+    let state = state.clone();
+    let model_handle = model_handle.clone();
+    tokio::spawn(async move {
+        let new_solid_ids: Vec<u32> = {
+            let mut model = model_handle.write().await;
+            export_engine::formats::step::merge_solids_into(&mut model, &imported)
+        };
+        register_imported_solids(
+            &state,
+            &model_handle,
+            &new_solid_ids,
+            base_name.as_deref(),
+            object_type,
+            source,
+        )
+        .await
+    })
+    .await
+    .map_err(|e| {
+        error_catalog::ApiError::new(
+            error_catalog::ErrorCode::Internal,
+            format!("import splice task failed: {e}"),
+        )
+    })
+}
+
 /// Splice-registration shared by the geometry import routes
-/// (`/api/geometry/import_step`, `/api/geometry/import_ros`): tessellate
-/// each freshly merged solid, mint + register an object UUID, persist the
-/// display name, broadcast to viewport clients exactly like a `create_*`
-/// primitive, and FORCE the full certificate (ignore any fast/verify
-/// preference). An imported file is UNTRUSTED external input — the exact
-/// case where the lightweight seed's "valid B-Rep ⟹ watertight" shortcut
-/// lies (a re-imported blend rim can be B-Rep-valid yet tessellate open).
-/// Running `certify_solid` here makes the per-object
-/// `perception.sound`/`watertight`/`brep_valid` the TRUE mesh verdict.
-/// One loop, two callers — the import paths cannot drift.
+/// (`/api/geometry/import_step`, `/api/geometry/import_ros`): name each
+/// freshly merged solid, FULL-certify the batch (ignore any fast/verify
+/// preference), tessellate, mint + register an object UUID, and broadcast
+/// to viewport clients exactly like a `create_*` primitive. An imported
+/// file is UNTRUSTED external input — the exact case where the lightweight
+/// seed's "valid B-Rep ⟹ watertight" shortcut lies (a re-imported blend rim
+/// can be B-Rep-valid yet tessellate open). The certificate makes the
+/// per-object `perception.sound`/`watertight`/`brep_valid` the TRUE mesh
+/// verdict. One loop, two callers — the import paths cannot drift.
+///
+/// IMP-2: the batch is certified with ONE model-wide validation sweep
+/// (`certify_solids`), on the blocking pool under one write lock, instead of
+/// one sweep per part under a lock per part (quadratic in the part count).
+/// The response carries each part's id, name, placement and verdict — not
+/// its mesh: neither client reads it, and 572 meshes held as JSON values
+/// ran the server out of memory. Meshes reach viewers through the
+/// broadcast and the scene snapshot.
 async fn register_imported_solids(
     state: &AppState,
     model_handle: &reconcile_task::ModelHandle,
@@ -5767,69 +5854,113 @@ async fn register_imported_solids(
     object_type: &str,
     source: &str,
 ) -> Vec<serde_json::Value> {
-    use geometry_engine::tessellation::{tessellate_solid, TessellationParams};
+    use geometry_engine::tessellation::{tessellate_solids, TessellationParams};
 
     // Read once for the whole splice — the document's durability status
-    // cannot change mid-request — and clone per solid below (`DurabilityStatus`
-    // is cheap: at most a few strings/ints).
+    // cannot change mid-request.
     let durability = durability::disclosure(state).await;
-    let mut objects = Vec::with_capacity(new_solid_ids.len());
-    for (i, &solid_id) in new_solid_ids.iter().enumerate() {
-        let tri_mesh = {
-            let model = model_handle.read().await;
-            match model.solids.get(solid_id) {
-                Some(solid) => tessellate_solid(solid, &model, &TessellationParams::default()),
-                None => continue,
+
+    // Names FIRST, in one lock. A part an assembly placed keeps the name the
+    // FILE gave it (its product, plus the use when it repeats); single-body
+    // imports keep the caller's label. Writing a name is a mutable touch that
+    // clears the solid's cached certificate, so naming after certifying would
+    // leave every part uncertified in the snapshot. Same writes as
+    // `persist_display_name`, batched.
+    let named = {
+        let mut model = model_handle.write().await;
+        let mut named = Vec::with_capacity(new_solid_ids.len());
+        for (i, &solid_id) in new_solid_ids.iter().enumerate() {
+            let Some(solid) = model.solids.get(solid_id) else {
+                continue;
+            };
+            let kernel_name = solid.name.clone().filter(|n| !n.trim().is_empty());
+            let occurrence = model.solid_occurrence(solid_id).cloned();
+            let name = match (&occurrence, kernel_name, base_name) {
+                (Some(_), Some(k), _) => k,
+                (_, _, Some(b)) if new_solid_ids.len() == 1 => b.to_string(),
+                (_, _, Some(b)) => format!("{b} {}", i + 1),
+                (_, _, None) => format!("Imported {solid_id}"),
+            };
+            if let Some(solid) = model.solids.get_mut(solid_id) {
+                solid.name = Some(name.clone());
             }
+            named.push((solid_id, i, name, occurrence));
+        }
+        named
+    };
+    for (solid_id, _, name, _) in &named {
+        record_set_name(state, *solid_id, name);
+    }
+
+    // The heavy half — volumes, one batch certificate, display meshes, the
+    // perception blocks — on the blocking pool under ONE write lock.
+    let ids: Vec<u32> = named.iter().map(|(id, ..)| *id).collect();
+    let mut guard = model_handle.clone().write_owned().await;
+    let heavy_state = state.clone();
+    let heavy_handle = model_handle.clone();
+    let heavy_durability = durability.clone();
+    let heavy = tokio::task::spawn_blocking(move || {
+        let model = &mut *guard;
+        // Mass properties first: installing that cache is a mutable touch
+        // that would clear a certificate computed before it.
+        for &id in &ids {
+            let _ = model.calculate_solid_volume(id);
+        }
+        let certs = model.certify_solids(&ids);
+        let certified: Vec<u32> = certs.iter().map(|(id, _)| *id).collect();
+        let mut meshes: std::collections::HashMap<u32, _> =
+            tessellate_solids(model, &certified, &TessellationParams::default())
+                .into_iter()
+                .collect();
+        let mut out = Vec::with_capacity(certs.len());
+        for (id, cert) in certs {
+            let Some(tri_mesh) = meshes.remove(&id) else {
+                continue;
+            };
+            let perception = certified_response_given(
+                model,
+                &heavy_handle,
+                &heavy_state,
+                id,
+                &tri_mesh,
+                true,
+                heavy_durability.clone(),
+                Some(cert.brep_valid),
+            );
+            out.push((id, tri_mesh, perception));
+        }
+        out
+    })
+    .await;
+    let heavy = match heavy {
+        Ok(heavy) => heavy,
+        Err(e) => {
+            tracing::error!(
+                target: "import",
+                error = %e,
+                "import registration task failed; {} merged solids are not registered",
+                new_solid_ids.len()
+            );
+            return Vec::new();
+        }
+    };
+
+    let mut objects = Vec::with_capacity(heavy.len());
+    for (solid_id, tri_mesh, perception) in heavy {
+        let Some((_, i, name, occurrence)) = named.iter().find(|(id, ..)| *id == solid_id) else {
+            continue;
         };
         let (vertices, indices, normals, face_ids) = flatten_tri_mesh(&tri_mesh);
-
+        drop(tri_mesh);
         let object_uuid = Uuid::new_v4();
         let id_str = object_uuid.to_string();
         state.register_id_mapping(object_uuid, solid_id);
-
-        // A part an assembly placed keeps the name the FILE gave it (its
-        // product, plus the use when it repeats): `<base> N` threw the whole
-        // product structure away. Single-body imports keep the caller's label.
-        let (kernel_name, occurrence) = {
-            let model = model_handle.read().await;
-            (
-                model
-                    .solids
-                    .get(solid_id)
-                    .and_then(|s| s.name.clone())
-                    .filter(|n| !n.trim().is_empty()),
-                model.solid_occurrence(solid_id).cloned(),
-            )
-        };
-        let name = match (&occurrence, kernel_name, base_name) {
-            (Some(_), Some(k), _) => k,
-            (_, _, Some(b)) if new_solid_ids.len() == 1 => b.to_string(),
-            (_, _, Some(b)) => format!("{b} {}", i + 1),
-            (_, _, None) => format!("Imported {solid_id}"),
-        };
-        persist_display_name(state, model_handle, solid_id, &name).await;
         let parameters = serde_json::json!({ "source": source, "index": i });
-
-        // Certify BEFORE broadcasting so the viewport's tree gets the verdict
-        // with the part, not on some later refresh.
-        let perception = {
-            let mut model = model_handle.write().await;
-            certified_response(
-                &mut model,
-                model_handle,
-                state,
-                solid_id,
-                &tri_mesh,
-                true,
-                durability.clone(),
-            )
-        };
         let sound = perception.get("sound").and_then(|v| v.as_bool());
         let extra = serde_json::json!({ "assembly": occurrence, "sound": sound });
         broadcast_object_created_with(
             &id_str,
-            &name,
+            name,
             solid_id,
             object_type,
             &parameters,
@@ -5848,12 +5979,6 @@ async fn register_imported_solids(
             "assembly":   occurrence,
             "sound":      sound,
             "perception": perception,
-            "mesh": {
-                "vertices": vertices,
-                "indices":  indices,
-                "normals":  normals,
-                "face_ids": face_ids,
-            },
             "position": [0.0_f32, 0.0, 0.0],
             "rotation": [0.0_f32, 0.0, 0.0],
             "scale":    [1.0_f32, 1.0, 1.0],
@@ -6070,20 +6195,15 @@ async fn import_ros_geometry(
     // collide with existing parts. `merge_solids_into` is the generic
     // BRepModel→BRepModel splice (it lives in `formats::step` because the
     // STEP route grew it first; nothing about it is STEP-specific).
-    let new_solid_ids: Vec<u32> = {
-        let mut model = model_handle.write().await;
-        export_engine::formats::step::merge_solids_into(&mut model, &imported)
-    };
-
-    let objects = register_imported_solids(
+    let objects = splice_imported_model(
         &state,
         &model_handle,
-        &new_solid_ids,
-        base_name.as_deref(),
+        imported,
+        base_name,
         "import_ros",
         "ros_import",
     )
-    .await;
+    .await?;
 
     // Honesty: `success` reports the certificates' verdict, not merely
     // "the file parsed" — a .ros file carries no ImportReport, so the
@@ -7573,21 +7693,56 @@ async fn scene_snapshot(
     State(state): State<AppState>,
     ActiveModel(model_handle): ActiveModel,
 ) -> Json<serde_json::Value> {
-    use geometry_engine::tessellation::{tessellate_solid, TessellationParams};
+    // Meshing every part is the expensive part of a snapshot (hundreds of
+    // parts after an assembly import), so it runs on the blocking pool, in
+    // parallel, never on an async worker.
+    let model = model_handle.clone().read_owned().await;
+    let local_to_uuid = state.local_to_uuid.clone();
+    let solid_colors = state.solid_colors.clone();
+    let built = tokio::task::spawn_blocking(move || {
+        scene_snapshot_body(&model, &local_to_uuid, &solid_colors)
+    })
+    .await;
+    match built {
+        Ok(body) => Json(body),
+        Err(e) => {
+            tracing::error!(target: "snapshot", error = %e, "scene snapshot task failed");
+            Json(serde_json::json!({ "objects": [], "missing": [], "error": "snapshot failed" }))
+        }
+    }
+}
 
-    let model = model_handle.read().await;
-    let params = TessellationParams::default();
-    let mut objects: Vec<serde_json::Value> = Vec::new();
+/// The scene snapshot's body: every registered part with its mesh, placement,
+/// verdict and colour, plus the imported uses that built no solid.
+fn scene_snapshot_body(
+    model: &geometry_engine::primitives::topology_builder::BRepModel,
+    local_to_uuid: &DashMap<u32, uuid::Uuid>,
+    solid_colors: &DashMap<u32, [u8; 3]>,
+) -> serde_json::Value {
+    use geometry_engine::tessellation::{tessellate_solids, TessellationParams};
 
-    for (solid_id, solid) in model.solids.iter() {
-        let Some(uuid) = state
-            .local_to_uuid
-            .get(&solid_id)
-            .map(|entry| *entry.value())
+    let registered: Vec<(u32, uuid::Uuid)> = model
+        .solids
+        .iter()
+        .filter_map(|(solid_id, _)| {
+            local_to_uuid
+                .get(&solid_id)
+                .map(|entry| (solid_id, *entry.value()))
+        })
+        .collect();
+    let ids: Vec<u32> = registered.iter().map(|(id, _)| *id).collect();
+    let mut meshes: std::collections::HashMap<u32, _> =
+        tessellate_solids(model, &ids, &TessellationParams::default())
+            .into_iter()
+            .collect();
+    let mut objects: Vec<serde_json::Value> = Vec::with_capacity(registered.len());
+
+    for (solid_id, uuid) in registered {
+        let (Some(solid), Some(mesh)) = (model.solids.get(solid_id), meshes.remove(&solid_id))
         else {
             continue;
         };
-        let mesh = tessellate_solid(solid, &model, &params).to_threejs();
+        let mesh = mesh.to_threejs();
         let name = solid
             .name
             .clone()
@@ -7624,7 +7779,7 @@ async fn scene_snapshot(
             // The part's registered colour (`set_part_color`), so the
             // snapshot alone restores it — it is the one path a
             // (re)connecting client hydrates from. Absent → client default.
-            "material": state.solid_colors.get(&solid_id).map(|c| {
+            "material": solid_colors.get(&solid_id).map(|c| {
                 let [r, g, b] = *c;
                 serde_json::json!({
                     "diffuse_color": [
@@ -7650,7 +7805,7 @@ async fn scene_snapshot(
         .map(|(occ, reason)| serde_json::json!({ "assembly": occ, "reason": reason }))
         .collect();
 
-    Json(serde_json::json!({ "objects": objects, "missing": missing }))
+    serde_json::json!({ "objects": objects, "missing": missing })
 }
 
 /// `POST /api/parts/uuid/{uuid}/name` — rename a part, durably.

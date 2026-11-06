@@ -5572,6 +5572,89 @@ async fn import_step_route_lands_faces_with_pids_and_import_provenance() {
     }
 }
 
+/// IMP-1: an import lands whole or not at all. The route merges every solid
+/// into the live model and then registers each one (UUID, name, verdict,
+/// broadcast). When the client hung up partway — a 10-minute robot-arm
+/// import cut at the client's timeout — axum dropped the handler future at
+/// its next `.await` and the scene showed 33 of 572 parts while the model
+/// held all of them.
+///
+/// This holds the durability-status lock (which the registration pass reads)
+/// so the request stalls after its merge, drops the request the way a
+/// disconnect does, releases the lock, and requires every solid the model
+/// holds to end up registered.
+#[tokio::test]
+async fn import_step_survives_the_client_hanging_up_midway() {
+    let mut fresh_model = BRepModel::new();
+    {
+        let mut builder = TopologyBuilder::new(&mut fresh_model);
+        builder
+            .create_box_3d(10.0, 10.0, 10.0)
+            .expect("first box must build");
+        builder
+            .create_box_3d(4.0, 6.0, 8.0)
+            .expect("second box must build");
+    }
+    let mut tmp_path = std::env::temp_dir();
+    tmp_path.push(format!(
+        "roshera_import_hangup_test_{}.step",
+        Uuid::new_v4()
+    ));
+    export_engine::formats::step::export_brep_to_step(&fresh_model, &tmp_path)
+        .await
+        .expect("STEP export of two boxes must succeed");
+
+    let state = make_test_state().await;
+    let gate = state.durability_status.write().await;
+    let request = import_step_post(json!({
+        "path": tmp_path.to_string_lossy().to_string(),
+    }));
+    let mut in_flight = Box::pin(build_router(state.clone()).oneshot(request));
+
+    // Drive the request until its merge has landed (or a deadline passes),
+    // then hang up.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let poll = tokio::time::timeout(std::time::Duration::from_millis(20), &mut in_flight).await;
+        assert!(
+            poll.is_err(),
+            "the request must still be waiting on the held lock, not finished"
+        );
+        if state.model.read().await.solids.len() >= 2 || std::time::Instant::now() > deadline {
+            break;
+        }
+    }
+    drop(in_flight);
+    drop(gate);
+
+    // Whatever the model now holds must reach the scene.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let (held, registered) = loop {
+        let ids: Vec<u32> = state
+            .model
+            .read()
+            .await
+            .solids
+            .iter()
+            .map(|(id, _)| id)
+            .collect();
+        let registered = ids
+            .iter()
+            .filter(|id| state.local_to_uuid.contains_key(id))
+            .count();
+        if (registered == ids.len() && !ids.is_empty()) || std::time::Instant::now() > deadline {
+            break (ids.len(), registered);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
+    let _ = std::fs::remove_file(&tmp_path);
+    assert_eq!(held, 2, "both boxes are imported");
+    assert_eq!(
+        registered, held,
+        "every solid the model holds is registered in the scene after a hang-up"
+    );
+}
+
 /// An imported ASSEMBLY reaches the browser as an assembly: every part keeps
 /// its real name (not `<base> N`), and both the import response and the
 /// reload snapshot carry where it sits — the assembly path, the part it is a
@@ -10512,5 +10595,62 @@ async fn boolean_route_with_no_headers_records_no_facets_across_the_spawn_blocki
          fabricated document id and never a silent fallback to the ambient \
          active document baked in at this boundary; captured document = \
          {document:?}"
+    );
+}
+
+/// IMP-2: the import response carries each part's id, name and verdict, not
+/// its mesh. Neither client reads the mesh (the browser re-reads the scene
+/// snapshot; the MCP tool reads ids and perception), and 572 meshes held as
+/// JSON values ran the server out of memory on the robot arm.
+#[tokio::test]
+async fn import_step_response_carries_verdicts_not_meshes() {
+    let mut fresh_model = BRepModel::new();
+    {
+        let mut builder = TopologyBuilder::new(&mut fresh_model);
+        builder
+            .create_box_3d(10.0, 10.0, 10.0)
+            .expect("box primitive must build for positive size");
+    }
+    let mut tmp_path = std::env::temp_dir();
+    tmp_path.push(format!(
+        "roshera_import_nomesh_test_{}.step",
+        Uuid::new_v4()
+    ));
+    export_engine::formats::step::export_brep_to_step(&fresh_model, &tmp_path)
+        .await
+        .expect("STEP export of a single box must succeed");
+
+    let state = make_test_state().await;
+    let request = import_step_post(json!({
+        "path": tmp_path.to_string_lossy().to_string(),
+    }));
+    let (status, body) = dispatch(&state, request).await;
+    let _ = std::fs::remove_file(&tmp_path);
+    assert_eq!(status, StatusCode::OK, "import must succeed; body = {body}");
+
+    let objects = body["objects"].as_array().expect("objects");
+    assert_eq!(objects.len(), 1);
+    let o = &objects[0];
+    assert!(o["id"].is_string() && o["solid_id"].is_u64(), "ids: {o}");
+    assert_eq!(o["sound"], json!(true), "a box imports sound: {o}");
+    assert_eq!(o["perception"]["sound"], json!(true), "perception: {o}");
+    assert!(
+        o.get("mesh").is_none(),
+        "the response must not carry the part's mesh"
+    );
+    let snap = dispatch(
+        &state,
+        Request::builder()
+            .method(Method::GET)
+            .uri("/api/scene/snapshot")
+            .body(Body::empty())
+            .expect("static request must build"),
+    )
+    .await
+    .1;
+    assert_eq!(
+        snap["objects"][0]["sound"],
+        json!(true),
+        "the snapshot reads the cached verdict (names were set before certifying)"
     );
 }
