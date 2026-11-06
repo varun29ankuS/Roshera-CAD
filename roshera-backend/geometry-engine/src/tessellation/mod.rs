@@ -242,6 +242,42 @@ fn solid_extent(solid: &Solid, model: &BRepModel) -> f64 {
     (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt().max(1e-6)
 }
 
+/// Most worker threads [`tessellate_solids`] uses. Each worker holds one
+/// solid's mesh while it builds, so this bounds peak memory as well as CPU.
+const TESSELLATE_BATCH_THREADS: usize = 4;
+
+/// [`tessellate_solid`] for many solids, in parallel on a small bounded
+/// pool — the display meshes of an imported assembly or a scene snapshot,
+/// which are independent per solid. Each mesh is exactly the one
+/// `tessellate_solid` builds alone. Ids not in the model are skipped; the
+/// rest come back in input order.
+pub fn tessellate_solids(
+    model: &BRepModel,
+    solid_ids: &[crate::primitives::solid::SolidId],
+    params: &TessellationParams,
+) -> Vec<(crate::primitives::solid::SolidId, TriangleMesh)> {
+    let work = || {
+        use rayon::prelude::*;
+        solid_ids
+            .par_iter()
+            .filter_map(|&id| {
+                model
+                    .solids
+                    .get(id)
+                    .map(|solid| (id, tessellate_solid(solid, model, params)))
+            })
+            .collect::<Vec<_>>()
+    };
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .clamp(1, TESSELLATE_BATCH_THREADS);
+    match rayon::ThreadPoolBuilder::new().num_threads(threads).build() {
+        Ok(pool) => pool.install(work),
+        Err(_) => work(),
+    }
+}
+
 pub fn tessellate_solid(
     solid: &Solid,
     model: &BRepModel,

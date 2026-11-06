@@ -42,6 +42,11 @@ pub(crate) const CERTIFICATE_MESH_CHORD: f64 = 0.1;
 /// [`CERTIFICATE_MESH_CHORD`] for why it is shared.
 pub(crate) const CERTIFICATE_MESH_WELD_EPS: f64 = 1e-6;
 
+/// Most worker threads [`BRepModel::certify_solids`] uses for the per-solid
+/// half of a batch. Each worker holds one solid's certification meshes, so
+/// this bounds the batch's peak memory as well as its CPU share.
+const CERTIFY_BATCH_THREADS: usize = 4;
+
 /// Verify a computed mass-properties result against the PHYSICAL contract of a
 /// real rigid body, returning `Err(reason)` with a machine-readable cause when
 /// any check fails so the caller can REFUSE (rather than emit a lie).
@@ -3130,9 +3135,25 @@ impl BRepModel {
         solid_id: SolidId,
         labels_consistent: crate::primitives::provenance::LabelsConsistency,
     ) -> crate::primitives::provenance::ValidityCertificate {
-        use crate::primitives::provenance::ValidityCertificate;
         use crate::primitives::validation::{validate_solid_scoped, ValidationLevel};
         let v = validate_solid_scoped(self, solid_id, self.tolerance, ValidationLevel::Standard);
+        let debris = crate::primitives::validation::count_orphan_faces(self);
+        self.compute_certificate_from_validation(solid_id, labels_consistent, &v.errors, debris)
+    }
+
+    /// The certificate body, given the solid's scoped B-Rep validation
+    /// errors and the model's orphan-face count. Both are model-wide sweeps,
+    /// so a batch ([`Self::certify_solids`]) computes them once and hands
+    /// each solid its share; the single-solid path computes them here.
+    fn compute_certificate_from_validation(
+        &self,
+        solid_id: SolidId,
+        labels_consistent: crate::primitives::provenance::LabelsConsistency,
+        brep_errors: &[crate::primitives::validation::ValidationError],
+        model_debris_orphan_faces: usize,
+    ) -> crate::primitives::provenance::ValidityCertificate {
+        use crate::primitives::provenance::ValidityCertificate;
+        let brep_valid = brep_errors.is_empty();
         // `oriented` / `inconsistent_directed_edges` close a LIVE hole: a mesh can
         // be watertight (no boundary edges) and manifold (no 3+-fan edges) yet
         // still have two triangles winding the SAME way across a shared edge — a
@@ -3196,7 +3217,7 @@ impl BRepModel {
         // a bore (the "wing"), a far-off-surface normal, etc.
         let mesh_quality = crate::harness::watertight::mesh_quality(self, solid_id)
             .unwrap_or_else(crate::primitives::provenance::MeshQuality::empty);
-        let mut errors: Vec<String> = v.errors.iter().map(|e| format!("{e:?}")).collect();
+        let mut errors: Vec<String> = brep_errors.iter().map(|e| format!("{e:?}")).collect();
         // Dual-eye render-free cross-check (Truth↔Semantic): recognized features
         // must reference live faces. Gates is_sound via EyesConsistency.
         // Phase 1: collect shell ids without holding the solid Ref across the
@@ -3360,12 +3381,12 @@ impl BRepModel {
                 mesh_quality.boundary_crossing_facets,
             ));
         }
-        // MODEL-level debris accounting — orphan faces owned by no solid. NOT
+        // `model_debris_orphan_faces` (passed in) is MODEL-level debris
+        // accounting — orphan faces owned by no solid. NOT
         // this part's fault and NOT ANDed into `is_sound()`; surfaced as its
         // own honest signal so unattributed topology stays loudly visible
         // instead of poisoning every part's `brep_valid` (the mis-attribution
         // fixed in `validate_solid_scoped`).
-        let model_debris_orphan_faces = crate::primitives::validation::count_orphan_faces(self);
         // MULTI-BODY DISCLOSURE. A boolean can legitimately return several
         // disjoint lumps (a union of operands that never touched, a difference
         // that severs a plate). That result is not wrong — the MC/grid oracles
@@ -3382,7 +3403,7 @@ impl BRepModel {
             .unwrap_or(0);
         ValidityCertificate {
             peer_count,
-            brep_valid: v.is_valid,
+            brep_valid,
             watertight,
             manifold,
             oriented,
@@ -3421,6 +3442,92 @@ impl BRepModel {
             Some(cert) => cert,
             None => self.compute_certificate(solid_id),
         }
+    }
+
+    /// [`Self::certify_solid`] for many solids at once — the certificate
+    /// each would get alone, for one model-wide validation sweep and one
+    /// orphan scan instead of one of each per solid. Certifying an imported
+    /// assembly part by part re-validated the whole model per part
+    /// (quadratic: ~0.76 s × 572 parts on the robot arm, debug).
+    ///
+    /// Same cache contract as [`Self::certificate`]: a solid with a live
+    /// cached certificate is returned from the cache; every recomputed one
+    /// is stored and marked verified. Ids not in the model are skipped, so
+    /// the result pairs each certified id with its certificate, in input
+    /// order.
+    pub fn certify_solids(
+        &mut self,
+        solid_ids: &[SolidId],
+    ) -> Vec<(SolidId, crate::primitives::provenance::ValidityCertificate)> {
+        use crate::primitives::validation::{scoped_errors_by_solid, ValidationLevel};
+        let present: Vec<SolidId> = solid_ids
+            .iter()
+            .copied()
+            .filter(|&id| self.solids.get(id).is_some())
+            .collect();
+        let cold: Vec<SolidId> = present
+            .iter()
+            .copied()
+            .filter(|&id| {
+                self.solids
+                    .get(id)
+                    .map(|s| s.cached_certificate().is_none())
+                    .unwrap_or(false)
+            })
+            .collect();
+        let debris = crate::primitives::validation::count_orphan_faces(self);
+        if !cold.is_empty() {
+            let labels = self.labels_consistency();
+            let errors =
+                scoped_errors_by_solid(self, &cold, self.tolerance, ValidationLevel::Standard);
+            // The per-solid half (its own meshes and checks) is independent
+            // per solid, so it runs in parallel on a small pool: bounded so a
+            // batch of large parts cannot hold more than a few meshes at once.
+            let this: &Self = self;
+            let work = || {
+                use rayon::prelude::*;
+                cold.par_iter()
+                    .zip(errors.par_iter())
+                    .map(|(&id, brep_errors)| {
+                        let cert = this.compute_certificate_from_validation(
+                            id,
+                            labels,
+                            brep_errors,
+                            debris,
+                        );
+                        (id, cert)
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let threads = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+                .clamp(1, CERTIFY_BATCH_THREADS);
+            let computed = match rayon::ThreadPoolBuilder::new().num_threads(threads).build() {
+                Ok(pool) => pool.install(work),
+                Err(_) => work(),
+            };
+            for (id, computed) in computed {
+                if let Some(solid) = self.solids.get(id) {
+                    solid.store_certificate(computed.clone());
+                    solid.mark_verified(computed);
+                }
+            }
+        }
+        let mut out = Vec::with_capacity(present.len());
+        for id in present {
+            let cached = self.solids.get(id).and_then(|s| s.cached_certificate());
+            match cached {
+                Some(mut cert) => {
+                    cert.model_debris_orphan_faces = debris;
+                    out.push((id, cert));
+                }
+                // A cache cleared since the batch pass (a mutable touch while
+                // computing labels) is recomputed alone, never dropped.
+                None => out.push((id, self.certify_solid(id))),
+            }
+        }
+        out
     }
 
     /// The kernel's ground-truth answer for a solid: provenance + computed

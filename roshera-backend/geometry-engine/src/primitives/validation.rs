@@ -1410,7 +1410,48 @@ pub fn validate_solid_scoped(
     let mut result = validate_model_enhanced(model, tolerance, level);
     let face_owner = face_owner_map(model);
     let shell_owner = shell_owner_map(model);
-    result.errors.retain(|e| match e.location() {
+    result
+        .errors
+        .retain(|e| error_belongs_to(e, solid_id, &face_owner, &shell_owner));
+    result.is_valid = result.errors.is_empty();
+    result
+}
+
+/// [`validate_solid_scoped`]'s error list for each of `solid_ids`, from ONE
+/// whole-model sweep instead of one sweep per solid. Entry `i` holds exactly
+/// the errors `validate_solid_scoped(model, solid_ids[i], ..).errors` holds
+/// (same sweep, same attribution rule), so certifying N solids of an
+/// imported assembly costs one model validation, not N.
+pub fn scoped_errors_by_solid(
+    model: &BRepModel,
+    solid_ids: &[SolidId],
+    tolerance: Tolerance,
+    level: ValidationLevel,
+) -> Vec<Vec<ValidationError>> {
+    let result = validate_model_enhanced(model, tolerance, level);
+    let face_owner = face_owner_map(model);
+    let shell_owner = shell_owner_map(model);
+    solid_ids
+        .iter()
+        .map(|&sid| {
+            result
+                .errors
+                .iter()
+                .filter(|e| error_belongs_to(e, sid, &face_owner, &shell_owner))
+                .cloned()
+                .collect()
+        })
+        .collect()
+}
+
+/// The ONE attribution rule for a scoped verdict.
+fn error_belongs_to(
+    e: &ValidationError,
+    solid_id: SolidId,
+    face_owner: &std::collections::HashMap<FaceId, SolidId>,
+    shell_owner: &std::collections::HashMap<ShellId, SolidId>,
+) -> bool {
+    match e.location() {
         // No location at all → a genuinely model-global variant
         // (`MissingEntity` / `ManufacturingError` / …). Keep for every
         // part's verdict (unchanged behaviour).
@@ -1424,10 +1465,8 @@ pub fn validate_solid_scoped(
         // debris is NOT hidden: it is accounted once at model scope via
         // [`count_orphan_faces`] and surfaced on the certificate as
         // `model_debris_orphan_faces`.
-        Some(_) => resolve_error_owner(e, &face_owner, &shell_owner) == Some(solid_id),
-    });
-    result.is_valid = result.errors.is_empty();
-    result
+        Some(_) => resolve_error_owner(e, face_owner, shell_owner) == Some(solid_id),
+    }
 }
 
 /// Build a `FaceId → owning SolidId` map by walking every live solid's shells.

@@ -165,10 +165,11 @@ pub fn import_step_text_with_report(
     // (`brep_valid`, `watertight`, `manifold`, `oriented`) alongside the
     // full `sound` headline — so the caller sees exactly which solid(s)
     // failed and why, and can never read a false green.
+    // One batch: a single model-wide validation sweep for every solid, not
+    // one sweep per solid (quadratic on an assembly of hundreds of parts).
     let solid_ids: Vec<_> = model.solids.iter().map(|(sid, _)| sid).collect();
     let mut all_solids_sound = true;
-    for solid_id in solid_ids {
-        let cert = model.certify_solid(solid_id);
+    for (solid_id, cert) in model.certify_solids(&solid_ids) {
         let sound = cert.is_sound();
         if !sound {
             all_solids_sound = false;
