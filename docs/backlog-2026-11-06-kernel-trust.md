@@ -22,6 +22,103 @@ Severity: **C** the kernel can report sound/solved/inside when it is not ·
 | ✓ | Boolean: cone cut by axis-parallel planes keeps its apex cap | be104e74 |
 | ✓ | Conformal development chart for cylinder/cone meshing; SSI seeding in true lengths; SSI corrector at degenerate parametrisations | d1d27277 |
 | ✓ | SDF + `classify_point` sign from the angle-weighted pseudonormal (torus/NURBS/ruled were never counted by ray parity) | 6824778f |
+| ✓ | SK-C1 certificate describes the sketch as stored (`constraints_satisfied`, `solvable`); extrude/revolve refuse an unsatisfied sketch | 484d96a7 |
+
+## Architecture — agent first, human alongside (Varun 2026-11-06)
+
+The principle: the agent is the primary user, a human works in the same
+document at the same time, and neither may be surprised by the other. Checked
+for the sketch subsystem on 2026-11-06 (facts verified in code); the same
+checks are owed for every other subsystem (ARCH-7).
+
+- **ARCH-1 Sketch edits are not events.** Only `sketch_extrude`,
+  `sketch_revolve` and `csketch_construction` are recorded
+  (`api-server/src/csketch.rs` 1778, 2293, 2814), with `Author::System`
+  (3089). Adding entities/constraints, editing dimensions and solving never
+  reach the timeline: no undo, no replay, no "who constrained what". Every
+  sketch mutation becomes a timeline event carrying its author (agent / human
+  identity) and intent, and the sketch is rebuilt by replay like the solid.
+- **ARCH-2 No live sync.** Sketch mutations are not broadcast (only the solids
+  they produce). Publish sketch deltas (entity / constraint / solve / dragged)
+  over the WebSocket so the human's SketchPanel and the agent see each other's
+  edits as they happen; the agent subscribes to the sketches it works on.
+- **ARCH-3 No revision.** A sketch has no revision counter, so a certificate
+  or an extrude is not pinned to what was certified. Add a monotonic revision;
+  every response carries it; the certificate records it; extrude/revolve take
+  `expected_revision` and refuse (typed, with the current revision and what
+  changed) when the sketch moved underneath.
+- **ARCH-4 One solve model for both users.** Agents batch edits then solve;
+  humans expect always-solved dragging. Make "solved" a stamp on a revision
+  (`solved_revision`): the UI solves live on every human edit; an agent may
+  batch inside a transaction and solve once; extrude refuses a sketch whose
+  stored geometry does not satisfy its constraints (SK-C1) or accepts
+  `solve_first: true` and returns the solve's delta (what moved, how far).
+- **ARCH-5 One response envelope for every sketch mutation:** the result,
+  the compact certificate (sound / satisfied / solvable / DOF / violated),
+  the revision, the delta, and machine-readable next actions — so the agent
+  never has to re-query to know where it stands (`psketch_solve` drops
+  `violations` and the certificate today: SK-C4).
+- **ARCH-6 Intent and authority on sketch routes.** csketch mutations carry no
+  `X-Roshera-Intent`; bring them under the same intent and
+  verification-scope gates as the solid routes, and record a human override of
+  an agent's constraint as such.
+- **ARCH-7 The same five checks (events, live sync, revision, response
+  envelope, intent) for every other subsystem:** solids/booleans, assemblies
+  and mates, GD&T and dimensions, drawings, STEP import. Produce a per-
+  subsystem table and file the gaps here.
+
+Scheduling: ARCH-1..ARCH-5 go BEFORE the sketch parity block (Days 9–12) —
+new constraint types land on an event-sourced, revisioned, live-synced sketch
+instead of being bolted onto today's island. SK-C1..C4 come first regardless:
+they are correctness, and they do not conflict with the redesign.
+
+## UI / UX — the human alongside the agent (Varun 2026-11-06)
+
+Standing rules (memory, Varun ×7): the VIEWPORT IS THE WORK — every panel a
+transparent, closable overlay on the canvas, no blur, headers hug, 11 px
+floor, numbers in the status bar; UI = time-to-recognition (cards and
+tick/cross, not paragraphs); screenshot first, then propose.
+
+- **UX-0 Audit first.** Screenshot every surface (viewport, tree, sketch mode,
+  drawing sheet, agent panel, timeline, refusals) on the robot arm and a
+  sketch-built part; list what a CAD user cannot find, cannot read at a
+  glance, or cannot undo. The items below are what is already known; the
+  audit adds and re-ranks.
+- **UX-1 See the agent work.** Live: what it is doing now, which entity it is
+  touching (highlighted in the viewport), the intent it declared, each
+  refusal it hit and how it recovered — a human must be able to follow and
+  interrupt without reading logs.
+- **UX-2 Human edits are first-class.** Drag a sketch point / edit a
+  dimension / move a part and the agent sees it (ARCH-2), the timeline
+  records it with the human as author (ARCH-1), and a human override of an
+  agent decision is marked as one.
+- **UX-3 Sketch mode at Onshape/SolidWorks level:** live solve while
+  dragging, DOF colouring (under / fully / over / conflicting, from the
+  certificate), constraint glyphs on the geometry, dimensions editable in
+  place, the conflict witness highlighted when the sketch over-constrains,
+  inference snaps shown before they commit.
+- **UX-4 Trust states, everywhere, at a glance:** sound / unsound / not
+  imported / unsolved / unverified as one consistent glyph + colour language
+  (tree, viewport, drawing, agent panel), each clickable through to the
+  certificate's reason in plain words.
+- **UX-5 Undo / redo across everything** (Ctrl+Z / Ctrl+Y over solids,
+  sketches, imports, GD&T — depends on ARCH-1 for sketches and on imports
+  being timeline events).
+- **UX-6 Assembly tree completion:** resizable rail, per-part history under
+  Roshera-built parts, isolate / hide-others / show-all, search, the "not
+  imported" and "unsound" rows explained on hover (merges UI-1).
+- **UX-7 Speed a human feels:** scene load from the mesh cache (STEP-1),
+  instancing (STEP-2), progressive load of large assemblies, no frame over
+  50 ms on the 572-part arm.
+- **UX-8 Errors a human can act on:** every refusal shown as a card (what
+  was refused, why, the one-click fix where there is one — e.g. "solve the
+  sketch first"), never a silent no-op ("Create Drawing" failing today).
+- **UX-9 Drawings in the UI:** sheet view with zoom/pan, live update when the
+  part changes, export buttons, the drawing's own certificate (scenario 19
+  checks) visible.
+
+Scheduling: UX-0 runs alongside Day 2; UX items then interleave one per day
+with the kernel items (one kernel + one UX), so neither side waits weeks.
 
 ## The queue (two a day)
 
