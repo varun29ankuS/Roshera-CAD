@@ -15,25 +15,29 @@
 //! an isosurface, probe for clearance, or difference between timeline states to
 //! see where material moved.
 
-use super::point::nearest_on_solid;
-use super::raycast::raycast_all;
+use super::point::{inside_by_parity, inside_by_pseudonormal, nearest_boundary};
 use crate::math::{Point3, Vector3};
 use crate::primitives::face::FaceId;
 use crate::primitives::solid::SolidId;
 use crate::primitives::topology_builder::BRepModel;
 
-/// Generic ray direction for parity: irrational-ish so it never grazes an
-/// axis-aligned face or seam (those are measure-zero), keeping crossings exact.
-const PARITY_DIR: Vector3 = Vector3::new(0.5212, 0.3389, 0.7831);
-
 /// Signed distance from `p` to the solid boundary: negative inside the
 /// material, positive outside, ~0 on the surface. Returns the nearest face too,
 /// so the value stays recoverable to `(face, world-xyz)`. `None` only when the
 /// solid has no reachable boundary face.
+///
+/// The SIGN comes from the angle-weighted pseudonormal at the nearest
+/// boundary point (see [`super::point::boundary_pseudonormal`]) — exact for
+/// every surface type. It came from ray parity, whose ray solver intersects
+/// only Plane / Sphere / Cylinder / Cone, so a torus, NURBS or ruled face was
+/// never counted and the sign was wrong on those solids (a point 3 deep in a
+/// torus read +3). Parity is only the fallback where no pseudonormal exists.
 pub fn signed_distance(model: &BRepModel, solid_id: SolidId, p: Point3) -> Option<(f64, FaceId)> {
-    let (face_id, _, d) = nearest_on_solid(model, solid_id, p)?;
-    let inside = raycast_all(model, solid_id, p, PARITY_DIR).len() % 2 == 1;
-    Some((if inside { -d } else { d }, face_id))
+    let nearest = nearest_boundary(model, solid_id, p)?;
+    let inside = inside_by_pseudonormal(model, solid_id, p, &nearest)
+        .unwrap_or_else(|| inside_by_parity(model, solid_id, p));
+    let d = nearest.distance;
+    Some((if inside { -d } else { d }, nearest.face))
 }
 
 /// One leaf of an adaptively-refined signed-distance sampling: an axis-aligned

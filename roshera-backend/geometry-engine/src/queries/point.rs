@@ -10,9 +10,11 @@
 
 use super::raycast::raycast_all;
 use crate::math::{Point3, Vector3};
+use crate::primitives::edge::EdgeId;
 use crate::primitives::face::FaceId;
 use crate::primitives::solid::SolidId;
 use crate::primitives::topology_builder::BRepModel;
+use crate::primitives::vertex::VertexId;
 
 /// Where a point sits relative to a solid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,12 +37,48 @@ pub fn nearest_on_solid(
     solid_id: SolidId,
     p: Point3,
 ) -> Option<(FaceId, Point3, f64)> {
+    nearest_boundary(model, solid_id, p).map(|n| (n.face, n.point, n.distance))
+}
+
+/// Which boundary feature a nearest point lies on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NearestFeature {
+    /// The interior of a face.
+    Face,
+    /// The interior of a trim edge.
+    Edge(EdgeId),
+    /// A vertex (an edge's endpoint).
+    Vertex(VertexId),
+}
+
+/// The closest boundary point of a solid to a query point, with the feature
+/// it lies on (so the side can be decided from the boundary's own normals).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct NearestBoundary {
+    /// A face owning the nearest point (the face itself, or the first face
+    /// walking the nearest edge / vertex) — keeps the answer recoverable.
+    pub face: FaceId,
+    /// The nearest boundary point.
+    pub point: Point3,
+    /// Its distance from the query point.
+    pub distance: f64,
+    /// Face interior, edge or vertex.
+    pub feature: NearestFeature,
+}
+
+/// [`nearest_on_solid`] with the nearest FEATURE reported (face interior,
+/// edge, or vertex) — what the pseudonormal sign test needs.
+pub fn nearest_boundary(
+    model: &BRepModel,
+    solid_id: SolidId,
+    p: Point3,
+) -> Option<NearestBoundary> {
     let solid = model.solids.get(solid_id)?;
     let mut shells = vec![solid.outer_shell];
     shells.extend_from_slice(&solid.inner_shells);
     shells.extend_from_slice(&solid.peer_shells);
 
-    let mut best: Option<(FaceId, Point3, f64)> = None;
+    let mut best: Option<NearestBoundary> = None;
     // Edges to try after the face pass, each attributed to the first face that
     // walks it (deterministic: shell/face/loop order is deterministic), so an
     // edge-nearest answer stays recoverable to a real face.
@@ -85,8 +123,13 @@ pub fn nearest_on_solid(
                 Err(_) => continue,
             };
             let d = (p - sp).magnitude();
-            if best.map(|b| d < b.2).unwrap_or(true) {
-                best = Some((face_id, sp, d));
+            if best.map(|b| d < b.distance).unwrap_or(true) {
+                best = Some(NearestBoundary {
+                    face: face_id,
+                    point: sp,
+                    distance: d,
+                    feature: NearestFeature::Face,
+                });
             }
         }
     }
@@ -118,31 +161,193 @@ pub fn nearest_on_solid(
                 Err(_) => continue,
             };
             let d = (p - cp).magnitude();
-            if best.map(|b| d < b.2).unwrap_or(true) {
-                best = Some((face_id, cp, d));
+            if best.map(|b| d < b.distance).unwrap_or(true) {
+                // A parameter at the edge's range end is its vertex.
+                let feature = if t == edge.param_range.start {
+                    NearestFeature::Vertex(edge.start_vertex)
+                } else if t == edge.param_range.end {
+                    NearestFeature::Vertex(edge.end_vertex)
+                } else {
+                    NearestFeature::Edge(eid)
+                };
+                best = Some(NearestBoundary {
+                    face: face_id,
+                    point: cp,
+                    distance: d,
+                    feature,
+                });
             }
         }
     }
     best
 }
 
+/// The boundary's ANGLE-WEIGHTED PSEUDONORMAL at a nearest point (Bærentzen &
+/// Aanæs, "Signed distance computation using the angle weighted
+/// pseudonormal", IEEE TVCG 2005): the outward face normal on a face
+/// interior; the sum of the adjacent faces' unit outward normals on an edge;
+/// the sum of the incident faces' normals weighted by each face's corner
+/// angle at a vertex. Its defining property: for ANY point `p` whose nearest
+/// boundary point is `q`, `(p − q) · n(q)` is negative exactly when `p` is
+/// inside — the side follows from the boundary's own geometry, for every
+/// surface type, with no ray. `None` when no normal can be evaluated there.
+pub fn boundary_pseudonormal(
+    model: &BRepModel,
+    solid_id: SolidId,
+    nearest: &NearestBoundary,
+) -> Option<Vector3> {
+    let q = nearest.point;
+    let tol = model.tolerance();
+    // Outward unit normal of `face_id` at the boundary point `q`.
+    let outward = |face_id: FaceId| -> Option<Vector3> {
+        let face = model.faces.get(face_id)?;
+        let surface = model.surfaces.get(face.surface_id)?;
+        let (u, v) = surface.closest_point(&q, tol).ok()?;
+        (surface.normal_at(u, v).ok()? * face.orientation.sign())
+            .normalize()
+            .ok()
+    };
+    // Every face of the solid with the loop-edge lists it walks.
+    let solid = model.solids.get(solid_id)?;
+    let mut shells = vec![solid.outer_shell];
+    shells.extend_from_slice(&solid.inner_shells);
+    shells.extend_from_slice(&solid.peer_shells);
+    let faces_walking = |pred: &dyn Fn(EdgeId) -> bool| -> Vec<(FaceId, Vec<(EdgeId, bool)>)> {
+        let mut out = Vec::new();
+        for &sh in &shells {
+            let Some(shell) = model.shells.get(sh) else {
+                continue;
+            };
+            for &fid in &shell.faces {
+                let Some(face) = model.faces.get(fid) else {
+                    continue;
+                };
+                let mut uses: Vec<(EdgeId, bool)> = Vec::new();
+                for lid in std::iter::once(face.outer_loop).chain(face.inner_loops.iter().copied())
+                {
+                    if let Some(lp) = model.loops.get(lid) {
+                        for (k, &eid) in lp.edges.iter().enumerate() {
+                            if pred(eid) {
+                                uses.push((eid, lp.orientations.get(k).copied().unwrap_or(true)));
+                            }
+                        }
+                    }
+                }
+                if !uses.is_empty() {
+                    out.push((fid, uses));
+                }
+            }
+        }
+        out
+    };
+
+    let sum = match nearest.feature {
+        NearestFeature::Face => outward(nearest.face)?,
+        NearestFeature::Edge(eid) => {
+            let mut n = Vector3::ZERO;
+            for (fid, uses) in faces_walking(&|e| e == eid) {
+                // A seam edge is walked twice by the same face: count it once
+                // per use, the same direction either way.
+                if let Some(nf) = outward(fid) {
+                    n = n + nf * uses.len() as f64;
+                }
+            }
+            n
+        }
+        NearestFeature::Vertex(vid) => {
+            let incident = |e: EdgeId| {
+                model
+                    .edges
+                    .get(e)
+                    .is_some_and(|ed| ed.start_vertex == vid || ed.end_vertex == vid)
+            };
+            let mut n = Vector3::ZERO;
+            for (fid, uses) in faces_walking(&incident) {
+                let Some(nf) = outward(fid) else {
+                    continue;
+                };
+                // Corner angle of this face at the vertex: between its two
+                // incident edges' tangents leaving the vertex, in the face's
+                // tangent plane. Any other configuration (a single closed
+                // edge, a seam vertex) weights the face equally.
+                let leaving = |eid: EdgeId| -> Option<Vector3> {
+                    let ed = model.edges.get(eid)?;
+                    let curve = model.curves.get(ed.curve_id)?;
+                    let at_start = ed.start_vertex == vid;
+                    let t = if at_start {
+                        ed.param_range.start
+                    } else {
+                        ed.param_range.end
+                    };
+                    let d1 = curve.evaluate(t).ok()?.derivative1;
+                    let d = if at_start { d1 } else { d1 * -1.0 };
+                    (d - nf * d.dot(&nf)).normalize().ok()
+                };
+                let weight = if uses.len() == 2 {
+                    match (leaving(uses[0].0), leaving(uses[1].0)) {
+                        (Some(a), Some(b)) => a.dot(&b).clamp(-1.0, 1.0).acos(),
+                        _ => 1.0,
+                    }
+                } else {
+                    1.0
+                };
+                n = n + nf * weight;
+            }
+            n
+        }
+    };
+    sum.normalize().ok()
+}
+
+/// `Some(true)` when `p` is inside the solid, decided by the pseudonormal at
+/// its nearest boundary point; `None` when that cannot be evaluated (the
+/// caller then falls back to ray parity).
+pub(crate) fn inside_by_pseudonormal(
+    model: &BRepModel,
+    solid_id: SolidId,
+    p: Point3,
+    nearest: &NearestBoundary,
+) -> Option<bool> {
+    let n = boundary_pseudonormal(model, solid_id, nearest)?;
+    let s = (p - nearest.point).dot(&n);
+    // A side test needs a side: exactly on the tangent plane (a point ON the
+    // boundary, or numerically so) is not decided here.
+    (s.abs() > 1e-12 * nearest.distance.max(1.0)).then_some(s < 0.0)
+}
+
 /// Classify `p`: `On` if within `tol` of the boundary, else `Inside`/`Outside`
-/// by exact ray-parity (odd crossings = inside). The ray direction is a generic
-/// irrational-ish vector so it never grazes an axis-aligned face/seam (those are
-/// measure-zero), keeping the crossing count exact.
+/// by the PSEUDONORMAL at its nearest boundary point
+/// ([`boundary_pseudonormal`]) — exact for every surface type.
+///
+/// It used ray parity alone, and the ray solver intersects only Plane,
+/// Sphere, Cylinder and Cone: a ray through a torus (a fillet round a circular
+/// edge), a NURBS face or a ruled wall (an extruded sketch arc) was not
+/// counted, so those solids classified wrong (measured: a point 3 deep inside
+/// a torus read Outside). Parity remains only as the fallback where no
+/// pseudonormal can be evaluated.
 pub fn classify_point(model: &BRepModel, solid_id: SolidId, p: Point3, tol: f64) -> PointClass {
-    if let Some((_, _, d)) = nearest_on_solid(model, solid_id, p) {
-        if d <= tol {
+    let nearest = nearest_boundary(model, solid_id, p);
+    if let Some(n) = &nearest {
+        if n.distance <= tol {
             return PointClass::On;
         }
     }
-    let dir = Vector3::new(0.5212, 0.3389, 0.7831);
-    let crossings = raycast_all(model, solid_id, p, dir).len();
-    if crossings % 2 == 1 {
+    let inside = nearest
+        .and_then(|n| inside_by_pseudonormal(model, solid_id, p, &n))
+        .unwrap_or_else(|| inside_by_parity(model, solid_id, p));
+    if inside {
         PointClass::Inside
     } else {
         PointClass::Outside
     }
+}
+
+/// Ray parity (odd crossings = inside) along a generic direction — the
+/// fallback side test. Correct only when every face crossed is one the ray
+/// solver intersects (Plane / Sphere / Cylinder / Cone).
+pub(crate) fn inside_by_parity(model: &BRepModel, solid_id: SolidId, p: Point3) -> bool {
+    let dir = Vector3::new(0.5212, 0.3389, 0.7831);
+    raycast_all(model, solid_id, p, dir).len() % 2 == 1
 }
 
 #[cfg(test)]
